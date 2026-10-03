@@ -120,10 +120,18 @@ LAST_PUBLISH_ERR=""      # temp log from the last failed publish attempt
 
 # Crates with `publish = false` in their Cargo.toml (cargo skips them;
 # listed here for tier-coverage validation only).
+#
+# This is a hand-copy of what the manifests already say, so it drifts: rlx-js
+# joined the workspace with `publish = false` and was never added here, and the
+# symptom was a confusing "TIERS missing workspace crates: rlx-js" — a demand
+# for a tier for a crate cargo will never publish. `validate_tier_coverage`
+# now diffs this list against `cargo metadata` and fails loudly on divergence,
+# so the next addition cannot reproduce that.
 SKIPPED=(
     pyrlx
     rlx-cortexm-trainer
     rlx-corpus
+    rlx-js
     rlx-megakernel
 )
 
@@ -270,6 +278,32 @@ validate_tier_coverage() {
     if ! command -v jq >/dev/null 2>&1; then
         yellow "jq not found — skipping tier coverage check (install jq to enable)."
         return 0
+    fi
+
+    # Guard the hand-copy above against the manifests. `publish = false` is the
+    # ground truth; `SKIPPED` only restates it, and a restatement that nobody
+    # checks is a restatement that drifts. Compare the two sorted sets and say
+    # exactly which way they disagree, because the downstream symptom ("TIERS
+    # missing workspace crates") points at the wrong file entirely.
+    local derived_unpub listed_unpub
+    derived_unpub=$(
+        cargo metadata --no-deps --format-version 1 2>/dev/null \
+            | jq -r '.workspace_members[] as $m | .packages[]
+                     | select(.id == $m)
+                     | select(.publish != null and (.publish | length == 0))
+                     | .name' \
+            | sort
+    )
+    listed_unpub=$(printf '%s\n' "${SKIPPED[@]}" | sort)
+    if [[ "$derived_unpub" != "$listed_unpub" ]]; then
+        red "SKIPPED is out of sync with the manifests' \`publish = false\` set:"
+        while IFS= read -r n; do
+            [[ -n "$n" ]] && red "  + $n  has publish = false but is not in SKIPPED"
+        done < <(comm -23 <(printf '%s\n' "$derived_unpub") <(printf '%s\n' "$listed_unpub"))
+        while IFS= read -r n; do
+            [[ -n "$n" ]] && red "  - $n  is in SKIPPED but is publishable"
+        done < <(comm -13 <(printf '%s\n' "$derived_unpub") <(printf '%s\n' "$listed_unpub"))
+        exit 1
     fi
 
     while IFS= read -r name; do
