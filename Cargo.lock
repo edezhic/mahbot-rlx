@@ -4485,6 +4485,8 @@ dependencies = [
 [[package]]
 name = "quickrs-core"
 version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1ad39be05a90c210e06e0ce7eba4332aa7757d0d0a177ce214e84448ba38a33"
 dependencies = [
  "hashbrown 0.17.0",
  "libm",

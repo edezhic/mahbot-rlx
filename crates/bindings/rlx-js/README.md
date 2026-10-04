@@ -487,8 +487,8 @@ own, for embedders adding globals of their own.
 
 ## Building
 
-`quickrs-core` is a path dep on the sibling `../quickjs-rs` checkout, not
-crates.io — the engine and this binding move together.
+`quickrs-core` is pinned to an exact crates.io version rather than a path dep —
+the engine and this binding move together, so an engine bump is deliberate.
 
 ```bash
 just test-js                       # or: cargo test -p rlx-js

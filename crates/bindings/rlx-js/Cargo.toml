@@ -51,10 +51,9 @@ weights = ["dep:rlx-pkg", "dep:rlx-mlx-io", "dep:rlx-dduf", "dep:rlx-nemo"]
 graph-json = ["rlx-ir/serialize", "dep:serde_json"]
 
 [dependencies]
-# Pure-Rust QuickJS-ng. Taken from the sibling checkout rather than crates.io:
-# the engine and this binding are moving together, and a path dep means a fix
-# on either side is one `cargo build` away. Mirrors how rlx-models pins rlx.
-quickrs-core = { path = "../../../../quickjs-rs/crates/quickrs-core", version = "0.16", default-features = false, features = ["std"] }
+# Pure-Rust QuickJS-ng, pinned to an exact crates.io version: the engine and
+# this binding move together, so an engine bump is deliberate.
+quickrs-core = { version = "=0.16.2", default-features = false, features = ["std"] }
 
 rlx-ir      = { workspace = true }
 rlx-opt     = { workspace = true }
