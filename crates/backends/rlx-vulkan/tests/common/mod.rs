@@ -25,9 +25,9 @@ thread_local! {
 /// `VulkanDevice` locks submission (`submit_lock`) but not the allocation,
 /// descriptor-set and pipeline paths around it, and Rust runs the tests in a
 /// binary on parallel threads by default. Measured on Apple Silicon (MoltenVK):
-/// `cargo test -p rlx-vulkan --release` crashed **4 of 10 runs** with SIGTRAP /
-/// SIGABRT during setup — before any test printed — and **0 of 10** with
-/// `--test-threads=1`. Because it dies in setup the target varies run to run,
+/// `cargo test -p rlx-vulkan --release --features backend-tests` crashed **4 of
+/// 10 runs** with SIGTRAP / SIGABRT during setup — before any test printed — and
+/// **0 of 10** with `--test-threads=1`. Because it dies in setup the target varies run to run,
 /// which is why it reads as an unrelated failure each time and never
 /// reproduces when a single target is run on its own.
 ///

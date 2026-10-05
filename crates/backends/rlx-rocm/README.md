@@ -171,7 +171,8 @@ just test-hip-cpu-validate
 
 ```sh
 cargo build -p rlx-rocm --release          # compile-check on any host
-cargo test  -p rlx-rocm --release          # basic + unit tests
+# `--features backend-tests`: ROCm test targets are not in the default run.
+cargo test  -p rlx-rocm --features backend-tests --release  # basic + unit tests
 ```
 
 ## License

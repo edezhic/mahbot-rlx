@@ -4,8 +4,8 @@
 //! Host (default) vs `native-mxfp` — both produce finite mxfp4 DequantMatMul.
 //!
 //! ```text
-//! cargo test -p rlx-mlx --test mxfp_path
-//! cargo test -p rlx-mlx --features native-mxfp --test mxfp_path
+//! cargo test -p rlx-mlx --features backend-tests --test mxfp_path
+//! cargo test -p rlx-mlx --features native-mxfp,backend-tests --test mxfp_path
 //! ```
 
 #![cfg(rlx_mlx_host)]

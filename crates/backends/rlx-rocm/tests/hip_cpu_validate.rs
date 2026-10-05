@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Full HIP-CPU validation for rlx-rocm (mirrors rlx-cuda). Only compiled with
-//! `cargo test -p rlx-rocm --features hip-cpu-validate`.
+//! `cargo test -p rlx-rocm --features hip-cpu-validate,backend-tests`.
 //!
 //! These tests numerically validate that `.cu` kernels produce correct
 //! output when executed on CPU via HIP-CPU inside the linux-gnu Docker

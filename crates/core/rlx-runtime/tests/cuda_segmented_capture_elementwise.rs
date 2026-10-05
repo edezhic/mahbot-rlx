@@ -12,7 +12,7 @@
 //!
 //!   RLX_CUDA_SEGMENTED_CAPTURE=1 RLX_CUDA_SEGMENTED_CAPTURE_ENGAGE=1 \
 //!   RLX_CUDA_EXEC_MODE=graph RLX_CUDA_CAPTURE_DEBUG=1 \
-//!     cargo test -p rlx-runtime --features cuda \
+//!     cargo test -p rlx-runtime --features cuda,backend-tests \
 //!       --test cuda_segmented_capture_elementwise -- --nocapture
 //!
 //! Off the flags it is a plain eager correctness test; no-ops without CUDA.

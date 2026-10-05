@@ -3625,8 +3625,13 @@ impl WgpuExecutable {
                     let mm = scale(*m) as usize;
                     let kk = *k as usize;
                     let nn = *n as usize;
-                    // Scratch-free windowed GEMV for Q4_K / Q6_K / Q1_0.
+                    // Scratch-free windowed kernels for Q4_K / Q6_K / Q1_0.
                     // - m==1 (decode): always OK for supported schemes.
+                    // - Q4_K / Q6_K + m>1: row-grouped GEMM (one pass over each
+                    //   packed weight tile per group of rows) inside gemv_rows;
+                    //   that path N-chunks the weight window itself, so a weight
+                    //   parked in the weight buffer or wider than the binding
+                    //   limit still takes it.
                     // - Q1_0 + m>1: tiled GEMM (or per-row GEMV) inside gemv_rows.
                     // - Other schemes + m>1: per-row GEMV only when k is an
                     //   integer number of GGUF blocks — flat pack is block-linear
@@ -3669,6 +3674,7 @@ impl WgpuExecutable {
                             *out_byte_off as usize,
                         );
                     } else {
+                        crate::gguf_gpu::note_route(crate::gguf_gpu::DequantMatmulRoute::Host);
                         crate::gguf_host::run_dequant_matmul_gguf(
                             &self.arena,
                             &dev.device,

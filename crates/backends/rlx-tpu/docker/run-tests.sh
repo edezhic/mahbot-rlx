@@ -5,29 +5,33 @@
 # Validation entry point inside the Docker container.
 #
 # Runs in three layers:
-#   1. `cargo test -p rlx-tpu --release` — host-agnostic unit/check
-#      + (when LIBTPU_PATH is set, which it is in this image) the
+#   1. `cargo test -p rlx-tpu --release --features backend-tests` — host-agnostic
+#      unit/check + (when LIBTPU_PATH is set, which it is in this image) the
 #      pjrt_roundtrip + pjrt_bench tests against the real plugin.
-#   2. `cargo test -p rlx-runtime --features cpu,tpu` —
+#   2. `cargo test -p rlx-runtime --features cpu,tpu,backend-tests` —
 #      compile-cache integration test that exercises Device::Tpu
 #      through Session.
 #   3. `validate_hlo.py` — round-trips emitted HLO bytes through
 #      jax.lib.xla_extension.HloModule for parse validity.
+#
+# `backend-tests`: TPU is not one of the three default test paths (CPU / Metal /
+# wgpu), so its test targets — and the tpu_* targets in rlx-runtime — are not in
+# the default test selection and each layer has to ask for them.
 
 set -euo pipefail
 
 cd /work
 
 echo "═══════════════════════════════════════════════════════"
-echo "[1/3] cargo test -p rlx-tpu --release"
+echo "[1/3] cargo test -p rlx-tpu --release --features backend-tests"
 echo "═══════════════════════════════════════════════════════"
-cargo test -p rlx-tpu --release -- --nocapture --test-threads=1
+cargo test -p rlx-tpu --release --features backend-tests -- --nocapture --test-threads=1
 
 echo
 echo "═══════════════════════════════════════════════════════"
-echo "[2/3] cargo test -p rlx-runtime --features cpu,tpu"
+echo "[2/3] cargo test -p rlx-runtime --features cpu,tpu,backend-tests"
 echo "═══════════════════════════════════════════════════════"
-cargo test -p rlx-runtime --release --features cpu,tpu \
+cargo test -p rlx-runtime --release --features cpu,tpu,backend-tests \
     --test tpu_compile_cache -- --nocapture --test-threads=1
 
 echo

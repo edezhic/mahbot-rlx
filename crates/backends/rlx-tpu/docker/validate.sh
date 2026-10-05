@@ -75,16 +75,21 @@ if [[ "$NUMERICAL" -eq 1 ]]; then
     #      under both AlwaysF32 and the TPU-default AutoMixedBf16
     #      policies. Catches IR-level dtype/shape regressions that
     #      single-op tests miss.
+    #
+    # `backend-tests`: TPU is not one of the three default test paths (CPU /
+    # Metal / wgpu), so its test targets are not in the default test selection
+    # and every step below has to ask for them explicitly — without it
+    # `cargo test -p rlx-tpu` runs only lib unit tests.
     DEFAULT_CMD=(bash -c "
         set -e
-        cargo test -p rlx-tpu --release -- --test-threads=1 --nocapture
-        cargo test -p rlx-runtime --release --features cpu,tpu \
+        cargo test -p rlx-tpu --release --features backend-tests -- --test-threads=1 --nocapture
+        cargo test -p rlx-runtime --release --features cpu,tpu,backend-tests \
             --test tpu_compile_cache -- --test-threads=1 --nocapture
-        cargo test -p rlx-runtime --release --features cpu,tpu \
+        cargo test -p rlx-runtime --release --features cpu,tpu,backend-tests \
             --test tpu_real_model_parity -- --test-threads=1 --nocapture
-        cargo test -p rlx-runtime --release --features cpu,tpu \
+        cargo test -p rlx-runtime --release --features cpu,tpu,backend-tests \
             --test tpu_cpu_speed -- --test-threads=1 --nocapture
-        cargo test -p rlx-runtime --release --features cpu,tpu \
+        cargo test -p rlx-runtime --release --features cpu,tpu,backend-tests \
             --test cpu_perf_diag -- --test-threads=1 --nocapture
     ")
 else

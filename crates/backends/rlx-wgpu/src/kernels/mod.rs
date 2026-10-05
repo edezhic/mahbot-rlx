@@ -148,6 +148,7 @@ pub const DEQUANT_MATMUL_MLX_WGSL: &str = include_str!("dequant_matmul_mlx.wgsl"
 pub const DEQUANT_GGUF_WGSL: &str = include_str!("dequant_gguf.wgsl");
 pub const DEQUANT_GEMV_GGUF_WGSL: &str = include_str!("dequant_gemv_gguf.wgsl");
 pub const DEQUANT_GEMM_Q1_0_WGSL: &str = include_str!("dequant_gemm_q1_0.wgsl");
+pub const DEQUANT_GEMM_GGUF_WGSL: &str = include_str!("dequant_gemm_gguf.wgsl");
 pub const FUSED_RESIDUAL_LN_WGSL: &str = include_str!("fused_residual_ln.wgsl");
 pub const FUSED_RESIDUAL_LN_TEE_WGSL: &str = include_str!("fused_residual_ln_tee.wgsl");
 pub const FUSED_RESIDUAL_RMS_NORM_WGSL: &str = include_str!("fused_residual_rms_norm.wgsl");
@@ -1508,6 +1509,24 @@ pub struct DequantGemmQ10Params {
     pub _p1: u32,
 }
 
+/// Layout for the fused multi-row K-quant GEMM (`dequant_gemm_gguf.wgsl`).
+/// 32 bytes. `m` is the full row count (the out slab is `[m, ncols]`);
+/// `ncols` is only this dispatch's column chunk, and the weight window starts
+/// at column 0 of that chunk. The last three words are padding: a uniform
+/// binding size must be a multiple of 16 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct DequantGemmGgufParams {
+    pub m: u32,
+    pub k: u32,
+    pub ncols: u32,
+    pub x_vec4_off: u32,
+    pub w_byte_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+}
+
 /// Layout for DequantMatMul. 48 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -2611,6 +2630,8 @@ static DEQUANT_MATMUL_MLX: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GGUF: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMV_GGUF: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q1_0: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMM_Q4K: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMM_Q6K: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_BT: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN_TEE: OnceLock<Kernel> = OnceLock::new();
@@ -3975,6 +3996,28 @@ pub fn dequant_gemm_q1_0_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu dequant_gemm_q1_0",
             DEQUANT_GEMM_Q1_0_WGSL,
             "dequant_gemm_q1_0",
+        )
+    })
+}
+/// Multi-row Q4_K GEMM (`m > 1`): one thread per column covers 8 rows.
+pub fn dequant_gemm_q4k_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMM_Q4K.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemm_q4k",
+            DEQUANT_GEMM_GGUF_WGSL,
+            "dequant_gemm_q4k",
+        )
+    })
+}
+/// Multi-row Q6_K GEMM (`m > 1`): one thread per column covers 8 rows.
+pub fn dequant_gemm_q6k_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMM_Q6K.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemm_q6k",
+            DEQUANT_GEMM_GGUF_WGSL,
+            "dequant_gemm_q6k",
         )
     })
 }

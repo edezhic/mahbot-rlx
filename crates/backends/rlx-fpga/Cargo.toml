@@ -16,6 +16,8 @@ documentation.workspace = true
 # Verilog generation is pure Rust; no Python, no `.sv` templates on disk.
 
 [features]
+# Other backends' test targets: off by default, `cargo test -p rlx-fpga --features backend-tests`.
+backend-tests = []
 default = ["std"]
 std = []
 
@@ -46,3 +48,35 @@ workspace = true
 features       = ["std"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "emit_check"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ic_parallel"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "io_config"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ir_pipeline"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "parallelism"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pipelined_mac"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ternary"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "tuning"
+required-features = ["backend-tests"]

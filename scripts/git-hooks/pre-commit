@@ -65,21 +65,39 @@ ROOT_PKG_LIST="$(printf '%s' "$ROOT_PKGS" | sed '/^$/d')"
 ROOT_PKG_COUNT="$(printf '%s\n' "$ROOT_PKG_LIST" | grep -c . || true)"
 
 echo "[pre-commit] clippy -D warnings (${ROOT_PKG_LIST:-workspace})"
+# `backend-tests` is what builds the gated test targets (see the `test` recipe
+# in the root Justfile). cargo accepts the flag only when a selected package
+# declares it, so derive those package names from the manifests — a hand-kept
+# list would silently stop linting newly gated targets. The names come from each
+# manifest's own `[package] name`, not its directory: the two need not match.
+# The workspace-wide branches below pass the flag unconditionally, since the
+# virtual workspace root accepts it.
+GATED="$(
+  git ls-files -- '*Cargo.toml' | while IFS= read -r m; do
+    grep -qE 'required-features *=.*backend-tests' "$m" || continue
+    awk -F'"' '/^\[package\]/{p=1} p && /^name *=/{print $2; exit}' "$m"
+  done
+)"
+
 if [[ "$ROOT_PKG_COUNT" -eq 0 ]]; then
   # Lint the whole workspace only when nothing mapped to a package at all; if all
   # staged Rust lives in nested workspaces there is nothing to lint here.
   if [[ -z "$NESTED_PKGS" ]]; then
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --all-targets --features backend-tests -- -D warnings
   fi
 elif [[ "$ROOT_PKG_COUNT" -gt 12 ]]; then
-  cargo clippy --all-targets -- -D warnings
+  cargo clippy --all-targets --features backend-tests -- -D warnings
 else
   ARGS=()
+  FEAT=""
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
     ARGS+=(-p "$p")
+    if grep -qxF "$p" <<<"$GATED"; then
+      FEAT="--features backend-tests"
+    fi
   done <<<"$ROOT_PKG_LIST"
-  cargo clippy "${ARGS[@]}" --all-targets -- -D warnings
+  cargo clippy "${ARGS[@]}" $FEAT --all-targets -- -D warnings
 fi
 
 if [[ -n "$NESTED_PKGS" ]]; then

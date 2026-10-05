@@ -167,18 +167,18 @@ cargo test -p rlx-compile --lib metal_default_unfuse
 cargo test -p rlx-runtime --features cpu,metal,gpu,mlx --test fk_prologue_parity
 cargo test -p rlx-runtime --features cpu,metal --test fk_prologue_parity fk_batch_session_default_matches_cpu_metal
 cargo test -p rlx-runtime --features cpu,tpu --test fk_prologue_parity fk_batch_session_pipeline_keeps_native_region_tpu
-cargo test -p rlx-tpu --test fk_pipeline
-cargo test -p rlx-tpu --test hlo_match batch_elementwise_region elementwise_region_resize_prologue
+cargo test -p rlx-tpu --features backend-tests --test fk_pipeline
+cargo test -p rlx-tpu --features backend-tests --test hlo_match batch_elementwise_region elementwise_region_resize_prologue
 cargo test -p rlx-metal --test mps_graph_batch_region_lower
 cargo test -p rlx-metal --test mps_graph_prologue_region_lower
-cargo test -p rlx-mlx --test basic batch_elementwise_region_matches_atomic
+cargo test -p rlx-mlx --features backend-tests --test basic batch_elementwise_region_matches_atomic
 ```
 
 HIP-CPU batch kernel validate (Docker/linux-gnu only; clones into `rlx-cuda/docker/vendor/HIP-CPU`):
 
 ```sh
 just test-hip-cpu-validate
-# or inside the image: cargo test -p rlx-cuda --features hip-cpu-validate batch_elementwise_region
+# or inside the image: cargo test -p rlx-cuda --features hip-cpu-validate,backend-tests batch_elementwise_region
 ```
 
 ## MPSGraph vs native thunks (Metal)

@@ -228,7 +228,8 @@ fn cuda_scaled_matmul_f4e3m0_multitile() {
 }
 
 /// Throughput of the tiled decode GEMM at a GEMM-heavy size. `#[ignore]`d — run
-/// explicitly: `... --test cuda_scaled_custom decode_bench -- --ignored --nocapture`.
+/// explicitly: `cargo test -p rlx-cuda --features backend-tests \
+/// --test cuda_scaled_custom decode_bench -- --ignored --nocapture`.
 #[test]
 #[ignore = "throughput benchmark; run with --ignored --nocapture (needs a CUDA GPU)"]
 fn cuda_scaled_matmul_decode_bench() {

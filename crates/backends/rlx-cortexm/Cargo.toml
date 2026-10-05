@@ -16,6 +16,8 @@ documentation.workspace = true
 # reference kernels used by tests and host-side validation; firmware
 # builds simply omit it.
 [features]
+# Other backends' test targets: off by default, `cargo test -p rlx-cortexm --features backend-tests`.
+backend-tests = []
 default = ["std"]
 std = []
 
@@ -37,3 +39,19 @@ workspace = true
 [package.metadata.docs.rs]
 features     = ["std"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[test]]
+name = "mnist_debug"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mnist_e2e"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mnist_validate"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "parity"
+required-features = ["backend-tests"]

@@ -5,9 +5,12 @@
 
 //! GPU GGUF dequant + wgpu matmul for `Op::DequantMatMul`.
 //!
-//! Preferred path: scratch-free windowed GEMV ([`run_dequant_matmul_gguf_gemv_rows`])
-//! for Q4_K / Q6_K / Q1_0 (decode `m=1` and prefill `m>1`). Older scratch+`matmul_bt`
-//! path still exists for schemes without a GEMV kernel.
+//! Preferred path: scratch-free windowed kernels for Q4_K / Q6_K / Q1_0
+//! (decode `m=1` and prefill `m>1`). For `m > 1` Q4_K / Q6_K uses the
+//! row-grouped GEMM (`encode_dequant_matmul_gguf_gemm_grouped`): one pass over
+//! each packed weight tile per group of 8 rows, instead of the per-row GEMV's
+//! one full pass over the weight per row. Older scratch+`matmul_bt` path still
+//! exists for schemes without a fused kernel.
 //!
 //! **Host fallback:** [`crate::gguf_host`] when the scheme is unsupported on GPU
 //! and no dequant scratch was reserved.
@@ -15,18 +18,23 @@
 //! **Grouped MoE:** [`run_dequant_grouped_matmul_gguf_gpu`] when scratch fits;
 //! otherwise [`crate::gguf_host::run_dequant_grouped_matmul_gguf`].
 //!
+//! **Which route a call took:** [`route_counts`].
+//!
 //! **Limits:** arena byte offsets are u32; IQ-family branches mirror Metal/CUDA
 //! but are not covered by dedicated WGPU parity tests yet.
 //!
 //! Full matrix: [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rlx_ir::{Graph, Op};
 
 use crate::buffer::Arena;
 use crate::gguf_host::scheme_from_id;
 use crate::kernels::{
-    DequantGemmQ10Params, DequantGemvGgufParams, DequantGgufParams, Kernel, MatmulParams,
-    dequant_gemm_q1_0_kernel, dequant_gemv_gguf_kernel, dequant_gguf_kernel, matmul_bt_kernel,
+    DequantGemmGgufParams, DequantGemmQ10Params, DequantGemvGgufParams, DequantGgufParams, Kernel,
+    MatmulParams, dequant_gemm_q1_0_kernel, dequant_gemm_q4k_kernel, dequant_gemm_q6k_kernel,
+    dequant_gemv_gguf_kernel, dequant_gguf_kernel, matmul_bt_kernel,
 };
 
 /// Schemes the fused decode GEMV ([`run_dequant_matmul_gguf_gemv`]) handles
@@ -37,6 +45,89 @@ use crate::kernels::{
 /// scratch that blew wgpu's storage-buffer binding limit.
 pub fn gemv_supports_scheme(scheme_id: u32) -> bool {
     matches!(scheme_id, 0 | 2 | 24)
+}
+
+/// Route a batched packed GGUF multiply can take.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DequantMatmulRoute {
+    /// Row-grouped fused GEMM: each packed weight tile is read once per group
+    /// of 8 rows (Q4_K / Q6_K, `m > 1`).
+    Grouped,
+    /// One fused GEMV dispatch per output row (decode `m == 1`, or a fallback).
+    PerRow,
+    /// Tiled Q1_0 GEMM (one-bit scheme, `m > 1`).
+    Q1_0Gemm,
+    /// Device dequant into f32 scratch, then `matmul_bt`.
+    Scratch,
+    /// The whole multiply on the host (CPU dequant).
+    Host,
+}
+
+/// Per-route tallies, one field per route.
+#[derive(Debug, Clone, Copy)]
+pub struct DequantMatmulRoutes {
+    pub grouped: u64,
+    pub per_row: u64,
+    pub q1_0_gemm: u64,
+    pub scratch: u64,
+    pub host: u64,
+}
+
+/// One counter per route. Named rather than an array indexed by the enum's
+/// discriminant: `counter` below is an exhaustive `match`, so a new variant has to
+/// name its counter — forgetting one is a compile error, not an index past the
+/// last element.
+static ROUTE_GROUPED: AtomicU64 = AtomicU64::new(0);
+static ROUTE_PER_ROW: AtomicU64 = AtomicU64::new(0);
+static ROUTE_Q1_0_GEMM: AtomicU64 = AtomicU64::new(0);
+static ROUTE_SCRATCH: AtomicU64 = AtomicU64::new(0);
+static ROUTE_HOST: AtomicU64 = AtomicU64::new(0);
+
+impl DequantMatmulRoute {
+    fn counter(self) -> &'static AtomicU64 {
+        match self {
+            DequantMatmulRoute::Grouped => &ROUTE_GROUPED,
+            DequantMatmulRoute::PerRow => &ROUTE_PER_ROW,
+            DequantMatmulRoute::Q1_0Gemm => &ROUTE_Q1_0_GEMM,
+            DequantMatmulRoute::Scratch => &ROUTE_SCRATCH,
+            DequantMatmulRoute::Host => &ROUTE_HOST,
+        }
+    }
+}
+
+/// How many packed GGUF multiplies this process has routed each way.
+///
+/// The engine's dispatch report is claim-based: a backend that lists
+/// `OpKind::DequantMatMul` in `SUPPORTED_OPS` is reported as native however the
+/// op actually ran, including when it is dequantized on the host. This is the
+/// wgpu-local answer — read it after a run (or reset it first to bracket a
+/// single call).
+pub fn route_counts() -> DequantMatmulRoutes {
+    let n = |r: DequantMatmulRoute| r.counter().load(Ordering::Relaxed);
+    DequantMatmulRoutes {
+        grouped: n(DequantMatmulRoute::Grouped),
+        per_row: n(DequantMatmulRoute::PerRow),
+        q1_0_gemm: n(DequantMatmulRoute::Q1_0Gemm),
+        scratch: n(DequantMatmulRoute::Scratch),
+        host: n(DequantMatmulRoute::Host),
+    }
+}
+
+/// Zero [`route_counts`] (tests bracketing a single call).
+pub fn reset_route_counts() {
+    for r in [
+        DequantMatmulRoute::Grouped,
+        DequantMatmulRoute::PerRow,
+        DequantMatmulRoute::Q1_0Gemm,
+        DequantMatmulRoute::Scratch,
+        DequantMatmulRoute::Host,
+    ] {
+        r.counter().store(0, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn note_route(route: DequantMatmulRoute) {
+    route.counter().fetch_add(1, Ordering::Relaxed);
 }
 
 /// Scheme ids the WGSL `dequant_gguf` kernel actually has a branch for.
@@ -68,12 +159,14 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
             let n = node.shape.dim(node.shape.rank() - 1).unwrap_static();
             let total = node.shape.num_elements().unwrap();
             let m = total / n.max(1);
-            // Q4_K/Q6_K GGUF matmuls run scratch-free via the windowed GEMV path
-            // (`run_dequant_matmul_gguf_gemv`), looped over rows for m>1. Skipping
-            // them here keeps the arena from reserving the (multi-GiB) dequant
-            // scratch — the LM-head slab (~0.6 GiB for a 0.6B model) is what pushed
-            // the arena over wgpu's 2 GiB storage-buffer binding limit and made the
-            // prefill dequant bind fail (Validation Error: binding range > limit).
+            // Q4_K/Q6_K/Q1_0 GGUF matmuls run scratch-free: Q4_K/Q6_K through
+            // the windowed kernels in this module (one GEMV per row at m=1,
+            // row-grouped GEMM above that), Q1_0 through its tiled GEMM.
+            // Skipping them here keeps the arena from reserving the (multi-GiB)
+            // dequant scratch — the LM-head slab (~0.6 GiB for a 0.6B model) is
+            // what pushed the arena over wgpu's 2 GiB storage-buffer binding
+            // limit and made the prefill dequant bind fail (Validation Error:
+            // binding range > limit).
             if gemv_supports_scheme(crate::gguf_host::gguf_scheme_id(*scheme)) {
                 continue;
             }
@@ -252,6 +345,7 @@ pub fn run_dequant_matmul_gguf_gpu(
     // Windowed GEMV covers the sharded / split-weight case; this scratch+matmul_bt
     // path still assumes one contiguous arena bind.
     if arena.is_sharded() || crate::buffer::is_weight_off(w_byte_off) {
+        note_route(DequantMatmulRoute::Host);
         crate::gguf_host::run_dequant_matmul_gguf(
             arena,
             device,
@@ -266,7 +360,8 @@ pub fn run_dequant_matmul_gguf_gpu(
         );
         return;
     }
-    // Q4_K/Q6_K/Q1_0: scratch-free windowed GEMV (batched rows → one submit).
+    // Q4_K/Q6_K/Q1_0: scratch-free windowed kernels (batched rows → one submit),
+    // row-grouped for m>1 Q4_K/Q6_K.
     if gemv_supports_scheme(scheme_id) {
         run_dequant_matmul_gguf_gemv_rows(
             arena,
@@ -286,6 +381,7 @@ pub fn run_dequant_matmul_gguf_gpu(
     // No WGSL branch for this scheme → host dequant. Without this the kernel
     // would run, match nothing, and leave the scratch untouched (= zeros).
     if !kernel_supports_scheme(scheme_id) {
+        note_route(DequantMatmulRoute::Host);
         crate::gguf_host::run_dequant_matmul_gguf(
             arena,
             device,
@@ -301,6 +397,7 @@ pub fn run_dequant_matmul_gguf_gpu(
         return;
     }
 
+    note_route(DequantMatmulRoute::Scratch);
     let scheme = scheme_from_id(scheme_id);
     let block_elems = scheme.gguf_block_size() as usize;
     let num_blocks = (k * n) / block_elems.max(1);
@@ -341,6 +438,22 @@ struct OutPool(wgpu::Buffer, u64);
 #[cfg(target_arch = "wasm32")]
 unsafe impl Send for OutPool {}
 
+/// Bytes held by the pooled output slab above — the one device buffer the
+/// windowed GGUF kernels use that the arena plan does not know about, so a
+/// memory report counts it rather than understating real usage.
+static OUT_POOL_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Device bytes resident in the pooled GEMM/GEMV output slab (0 until the first
+/// burst of bundled multiplies). Grows to the largest slab requested; never
+/// released, like the rest of the backend's process-global scratch.
+///
+/// This is the accurate surface for that figure: the slab is allocated lazily by
+/// the first batched packed multiply, so the compile-time
+/// `RLX_WGPU_ARENA_REPORT` line has nothing to print for it.
+pub fn pooled_out_buf_bytes() -> u64 {
+    OUT_POOL_BYTES.load(Ordering::Relaxed)
+}
+
 fn with_pooled_out_buf<R>(
     device: &wgpu::Device,
     need_bytes: u64,
@@ -362,17 +475,17 @@ fn with_pooled_out_buf<R>(
             mapped_at_creation: false,
         });
         *slot = Some(OutPool(buf, need));
+        OUT_POOL_BYTES.store(need, Ordering::Relaxed);
     }
     let OutPool(buf, _) = slot.as_ref().expect("out pool");
     f(buf)
 }
 
-/// Encode fused GGUF DequantMatMul into `enc` (no `queue.submit`).
-///
-/// Used by the main wgpu run loop so Q1_0 GEMMs share one submission with
-/// surrounding GPU ops instead of flushing ~1× per weight matrix.
-/// Uniforms are unique per dispatch (`queue.write_buffer` is not ordered
-/// inside an encoder the way copies are).
+/// Encode fused GGUF DequantMatMul into `enc` (no `queue.submit`), leaving the
+/// submission to the caller. Scheme and shape pick the route: the Q1_0 and
+/// row-grouped K-quant GEMMs first, then the per-row GEMV loop. Uniforms are
+/// unique per dispatch (`queue.write_buffer` is not ordered inside an encoder
+/// the way copies are).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_dequant_matmul_gguf_into(
     arena: &Arena,
@@ -406,6 +519,31 @@ pub fn encode_dequant_matmul_gguf_into(
             out_byte_off,
         )
     {
+        note_route(DequantMatmulRoute::Q1_0Gemm);
+        return;
+    }
+    // Q4_K / Q6_K batched: one row-grouped GEMM per weight tile, instead of the
+    // per-row loop below re-streaming the whole packed weight per row. Which
+    // schemes it has an entry point for is decided inside, before any size math.
+    // Falling back is driven by what can be *encoded* (X window), never by the
+    // weight window merely exceeding the binding limit — that case is N-chunked
+    // inside.
+    if m > 1
+        && encode_dequant_matmul_gguf_gemm_grouped(
+            arena,
+            device,
+            queue,
+            enc,
+            m,
+            k,
+            n,
+            scheme_id,
+            x_byte_off,
+            w_byte_off,
+            out_byte_off,
+        )
+    {
+        note_route(DequantMatmulRoute::Grouped);
         return;
     }
     for row in 0..m {
@@ -422,10 +560,13 @@ pub fn encode_dequant_matmul_gguf_into(
             out_byte_off + row * n * 4,
         );
     }
+    note_route(DequantMatmulRoute::PerRow);
 }
 
 /// Fused decode/prefill path: `Y[m,n] = X[m,k] @ W^T` with packed GGUF `W`.
 ///
+/// * Q4_K / Q6_K + `m > 1` → row-grouped tiled GEMM — one pass over each packed
+///   weight tile per group of 8 rows (unless X spans shards).
 /// * Q1_0 + `m > 1` → tiled GEMM (Metal `q1_0_mm_f32` parity) — one dispatch,
 ///   unless `RLX_WGPU_Q1_0_GEMM_DISABLE=1` or X spans shards.
 /// * Otherwise → per-row GEMV encoded into one command buffer (one submit).
@@ -590,6 +731,266 @@ fn encode_dequant_matmul_gguf_gemm_q1_0(
     true
 }
 
+/// Binding-size budget for the two windowed paths that chunk around it — the
+/// per-row GEMV encoder and the multi-row GEMM: the device's storage-binding
+/// limit, lowered to `RLX_WGPU_MAX_BIND_MB` when set — which artificially caps
+/// it to exercise the N-chunked window paths on GPUs whose real limit is large
+/// (validation/testing). Only a lowering: a value above the device limit must
+/// not produce a binding the device rejects outright. The Q1_0 tiled GEMM reads
+/// the device limit directly and ignores this cap.
+fn gguf_max_bind(device: &wgpu::Device) -> u64 {
+    let device_max = device.limits().max_storage_buffer_binding_size;
+    rlx_ir::env::var("RLX_WGPU_MAX_BIND_MB")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|mb| (mb * 1024 * 1024).min(device_max))
+        .unwrap_or(device_max)
+}
+
+/// Packed-weight bytes that fit under `max_bind`: leaves room for the window's
+/// align-down base slack (< [`STORAGE_ALIGN`]) and its 16-byte round-up. Both
+/// the row-grouped GEMM's column chunking and the per-row GEMV's row chunking
+/// are sized from this, so they cannot drift apart.
+fn gguf_window_budget(max_bind: u64) -> u64 {
+    max_bind.saturating_sub(STORAGE_ALIGN + 16)
+}
+
+/// Largest output slab the grouped path will ask the pool for.
+///
+/// The slab exists only to make one dispatch's output bindable, so the binding
+/// limit already bounds it — but the pool is process-global and never released,
+/// and `m * ncols * 4` at a few thousand rows against a 200k-wide head is
+/// gigabytes of scratch the per-row path it replaces never held (that path writes
+/// row by row straight into the arena). So cap the slab and chunk columns
+/// further: a larger `m` then costs more chunks, not more memory. 256 MiB keeps
+/// the widest served shape (276 rows x 202048 columns = 213 MiB) in one chunk.
+const OUT_SLAB_CAP: u64 = 256 << 20;
+
+/// Fused multi-row GGUF K-quant GEMM for Q4_K / Q6_K into `enc` (no submit).
+///
+/// One pass over each packed weight tile per group of `TM = 8` rows, instead of
+/// the per-row GEMV's one full pass over the whole weight per row. `n` is split
+/// into column chunks that fit `max_storage_buffer_binding_size` (and the
+/// weight buffer's shard), so a weight parked in [`Arena::weight_buffer`] — or
+/// one whose window is larger than the binding limit — still takes this path.
+///
+/// The output slab is `[m, ncols]` bound whole, so `ncols` is bounded by the
+/// binding limit *and* by [`OUT_SLAB_CAP`] — what keeps the wide-`n`,
+/// `m`-in-the-hundreds LM-head shape bindable and its scratch bounded. The slab
+/// comes from the same pooled buffer the Q1_0 GEMM uses
+/// ([`with_pooled_out_buf`]), so it is allocated once for the widest shape seen
+/// rather than per call, and it is reported by
+/// [`pooled_out_buf_bytes`].
+///
+/// Returns `false` when the tiled kernel cannot be encoded for this call: the
+/// scheme has no entry point, X spans shards, its window exceeds the binding
+/// limit, or `k` is not a whole number of blocks — all decided before anything is
+/// encoded, including the per-chunk window fit (only the first chunk can decline,
+/// every later one reads less and ends inside the weight region). The caller then
+/// uses the per-row GEMV, which rewrites the same `m*n*4` output bytes row by row,
+/// so the fallback is correct.
+#[allow(clippy::too_many_arguments)]
+fn encode_dequant_matmul_gguf_gemm_grouped(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    enc: &mut wgpu::CommandEncoder,
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme_id: u32,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    out_byte_off: usize,
+) -> bool {
+    debug_assert!(
+        m > 1,
+        "m == 1 goes through encode_dequant_matmul_gguf_gemv_one"
+    );
+    // The schemes this kernel set covers (Q4_K 0, Q6_K 2), decided before any
+    // size math — so a third K-quant is one arm here, and no other scheme reaches
+    // the block-size check below. The `_` arm declines the call rather than waving
+    // the scheme through: an id that fell back to the Q6_K entry point would decode
+    // wrong values, not fail.
+    let dk = match scheme_id {
+        0 => dequant_gemm_q4k_kernel(device),
+        2 => dequant_gemm_q6k_kernel(device),
+        _ => return false,
+    };
+    let scheme = scheme_from_id(scheme_id);
+    let block_elems = scheme.gguf_block_size() as usize; // 256
+    let block_bytes = scheme.gguf_block_bytes() as usize; // 144 (Q4_K) | 210 (Q6_K)
+    // The entries above hardcode this geometry; if a scheme's block layout ever
+    // stops matching it, fall back rather than stride the kernel wrongly.
+    if block_elems != 256 || !(block_bytes == 144 || block_bytes == 210) {
+        return false;
+    }
+    if !k.is_multiple_of(block_elems) || n == 0 {
+        return false;
+    }
+    let row_bytes = (k / block_elems) * block_bytes; // packed weight bytes per column
+
+    // X: all m rows are read through one window, so they must share a shard.
+    let x0 = x_byte_off as u64;
+    let x_base = (x0 / STORAGE_ALIGN) * STORAGE_ALIGN;
+    let (x_buf, x_local) = arena.resolve_act(x_base as usize);
+    let x_local = x_local as u64;
+    let x_need = x0 + (m * k * 4) as u64 - x_base;
+    let x_size = (x_need.div_ceil(16) * 16).min(x_buf.size().saturating_sub(x_local));
+    if x_size < x_need {
+        return false;
+    }
+
+    let max_bind = gguf_max_bind(device);
+    if x_size > max_bind {
+        return false;
+    }
+    // The kernel reads X as `vec4`, so the window base and the row stride must
+    // be 16-byte aligned. Always true for a planned F32 activation (16-byte
+    // arena alignment, k a multiple of 256); a 4-byte-aligned view falls back.
+    if !(x0 - x_base).is_multiple_of(16) {
+        return false;
+    }
+    let x_vec4_off = ((x0 - x_base) / 16) as u32;
+
+    // Columns per chunk, from both budgets: the bound weight window and the
+    // whole-bound output slab (m * ncols * 4). Bounding the slab rather than
+    // only the weight is what keeps a wide-n, large-m head inside the limit.
+    if (m as u64) * 4 > max_bind {
+        return false; // no column chunk's slab could be bound
+    }
+    let by_bind = (gguf_window_budget(max_bind) / row_bytes.max(1) as u64).max(1);
+    let by_out = (OUT_SLAB_CAP.min(max_bind).saturating_sub(16) / (m as u64 * 4)).max(1);
+    let n_chunk_max = (n as u64).min(by_bind).min(by_out).max(1) as usize;
+
+    // Slab bytes for one chunk: `m * ncols * 4` out of the pooled output buffer,
+    // which is process-global and only grows. It is scratch the arena plan does
+    // not account for (`dequant_gguf_scratch_bytes` reports 0 for these schemes);
+    // `pooled_out_buf_bytes` is the accurate report of it.
+    let out_slab = (m * n_chunk_max * 4) as u64;
+
+    let mut ok = true;
+    with_pooled_out_buf(device, out_slab, |out_buf| {
+        let mut n0 = 0usize;
+        while n0 < n {
+            let (w_buf, w_raw) = arena.resolve_w(w_byte_off + n0 * row_bytes);
+            let w_buf_size = w_buf.size();
+            let w0 = w_raw as u64;
+            let w_base = (w0 / STORAGE_ALIGN) * STORAGE_ALIGN;
+            let n_chunk = (n - n0).min(n_chunk_max).max(1);
+
+            // The window the chunk reads — every packed weight byte it touches.
+            // That one quantity is compared against both limits, rather than the
+            // 4-byte-rounded binding size below: both limits are multiples of 4
+            // (the binding limit is; so is the weight buffer's end, whose size is
+            // rounded up, and so is every packed weight's own byte count, since
+            // `write_buffer` rejects an unaligned copy), so the two comparisons
+            // agree — and a row size that is not a multiple of 4 (Q6_K rows are
+            // 210·B bytes) can never make a window that fits look like one that
+            // does not. `by_bind` sizes `n_chunk` inside the same budget, so only
+            // a first chunk whose row is wider than the whole budget — which no
+            // chunking here or in the per-row GEMV can fix — declines here, before
+            // anything is encoded; every later chunk reads less than the first and
+            // ends inside the weight region, so none of them can bail. (A parked
+            // weight never spans buffers: `from_plan_split` spills any single
+            // weight that does not fit one weight buffer into the act arena, so
+            // `resolve_w` yields the whole weight region.)
+            let need = (w0 - w_base) + (n_chunk * row_bytes) as u64;
+            if need > max_bind.min(w_buf_size.saturating_sub(w_base)) {
+                ok = false;
+                return;
+            }
+            let w_size = need.div_ceil(4) * 4;
+
+            let p = DequantGemmGgufParams {
+                m: m as u32,
+                k: k as u32,
+                ncols: n_chunk as u32,
+                x_vec4_off,
+                w_byte_off: (w0 - w_base) as u32,
+                _p0: 0,
+                _p1: 0,
+                _p2: 0,
+            };
+            let u = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rlx-wgpu dequant_gemm_gguf uniform"),
+                size: std::mem::size_of::<DequantGemmGgufParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rlx-wgpu dequant_gemm_gguf bg"),
+                layout: &dk.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: x_buf,
+                            offset: x_local,
+                            size: wgpu::BufferSize::new(x_size),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: u.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: w_buf,
+                            offset: w_base,
+                            size: wgpu::BufferSize::new(w_size),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        // Only this chunk's slab, not the whole pooled buffer:
+                        // the pool is process-global and may be larger than the
+                        // binding limit of the device in play.
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: out_buf,
+                            offset: 0,
+                            size: wgpu::BufferSize::new(out_slab),
+                        }),
+                    },
+                ],
+            });
+
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rlx-wgpu dequant_gemm_gguf pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&dk.pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups((n_chunk as u32).div_ceil(64), (m as u32).div_ceil(8), 1);
+            }
+
+            // Slab rows are [m, n_chunk]; this chunk owns arena columns
+            // [n0, n0 + n_chunk).
+            let row_out = (n_chunk * 4) as u64;
+            let (dst0, dst0_off) = arena.resolve_act(out_byte_off);
+            if n_chunk == n && dst0_off as u64 + (m * n * 4) as u64 <= dst0.size() {
+                enc.copy_buffer_to_buffer(out_buf, 0, dst0, dst0_off as u64, (m * n * 4) as u64);
+            } else {
+                for r in 0..m {
+                    let (dst, dst_off) = arena.resolve_act(out_byte_off + r * n * 4 + n0 * 4);
+                    enc.copy_buffer_to_buffer(
+                        out_buf,
+                        (r * n_chunk * 4) as u64,
+                        dst,
+                        dst_off as u64,
+                        row_out,
+                    );
+                }
+            }
+            n0 += n_chunk;
+        }
+    });
+    ok
+}
+
 /// Fused decode GEMV: `y[1,n] = x[1,k] @ W^T` with `W` GGUF-packed `[n,k]`,
 /// dequantizing each weight block on the fly (no f32 scratch).
 ///
@@ -667,19 +1068,14 @@ fn encode_dequant_matmul_gguf_gemv_one(
     // (matches the shader's `j * nbk * blk` indexing).
     let row_bytes = (w_total_bytes / n.max(1)) as u64;
 
-    // `RLX_WGPU_MAX_BIND_MB` artificially caps the binding size to exercise the
-    // split path on GPUs whose real limit is large (validation/testing).
-    let max_bind = rlx_ir::env::var("RLX_WGPU_MAX_BIND_MB")
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|mb| mb * 1024 * 1024)
-        .unwrap_or(device.limits().max_storage_buffer_binding_size);
+    let max_bind = gguf_max_bind(device);
     assert!(
         x_size <= max_bind,
         "rlx-wgpu gguf gemv: x window {x_size} > max_bind {max_bind}"
     );
-    // Rows per chunk so the bound weight window — including the align-down base
-    // slack (< STORAGE_ALIGN) and the 16-byte round-up — stays within max_bind.
-    let budget = max_bind.saturating_sub(STORAGE_ALIGN + 16).max(row_bytes);
+    // Rows per chunk from the window budget; at least one, so a single row
+    // wider than the whole budget still makes progress.
+    let budget = gguf_window_budget(max_bind).max(row_bytes);
     let rows_per_chunk = ((budget / row_bytes.max(1)) as usize).max(1);
 
     let out_bytes = ((n * 4).max(4) as u64).div_ceil(16) * 16;

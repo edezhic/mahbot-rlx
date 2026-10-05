@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
+# Other backends' test targets: off by default, `cargo test -p rlx-vulkan --features backend-tests`.
+backend-tests = []
 default = []
 # Emit Vulkan validation layers when `VK_INSTANCE_LAYERS` is unset (debug aid).
 validation = []
@@ -95,3 +97,59 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "complex_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "device_present"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gpu_handle_residency"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "indexing_nd_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_dequant_matmul_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "q_matmul_packed_store"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rng_philox_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scaled_grouped_matmul_vulkan"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scaled_lowp_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "schedule_emit_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "smoke"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "spd_host_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "static_weight_pack_rebind"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "vulkan_scaled_custom"
+required-features = ["backend-tests"]

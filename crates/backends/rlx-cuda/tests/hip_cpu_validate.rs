@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Tests for the HIP-CPU validation path. Only compiled with
-//! `cargo test -p rlx-cuda --features hip-cpu-validate`.
+//! `cargo test -p rlx-cuda --features hip-cpu-validate,backend-tests`.
 //!
 //! These tests numerically validate that `.cu` kernels produce correct
 //! output when executed on CPU via HIP-CPU inside the linux-gnu Docker

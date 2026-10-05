@@ -792,7 +792,9 @@ def run_run(args) -> int:
         if (Path(cuda) / "bin").is_dir():
             env["PATH"] = f"{Path(cuda) / 'bin'}:{env.get('PATH', '')}"
 
-    cargo = ["cargo", "test", "-p", pkg]
+    # The kernel-dump tests are gated behind `backend-tests`; without it this
+    # runs lib unit tests only and captures no kernels.
+    cargo = ["cargo", "test", "-p", pkg, "--features", "backend-tests"]
     if args.release:
         cargo.append("--release")
     if args.test_args:

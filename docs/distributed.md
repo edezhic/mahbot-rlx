@@ -272,7 +272,7 @@ a relative-error tolerance as **SUSPECT**.
 
 Run it on each node; a green report means the fleet's cross-backend drift is
 bounded round-off, a red one names the backend + output to chase (drill in with
-`RLX_PARITY_DEVICE=cuda cargo test -p rlx-runtime --test cuda_backprop_parity`).
+`RLX_PARITY_DEVICE=cuda cargo test -p rlx-runtime --features backend-tests --test cuda_backprop_parity`).
 
 ## Running across real machines
 

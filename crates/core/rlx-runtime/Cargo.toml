@@ -14,6 +14,8 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [features]
+# Other backends' test targets: off by default, `cargo test -p rlx-runtime --features backend-tests`.
+backend-tests = []
 default = ["cpu", "model-io"]
 
 # On-disk model containers: `.rlxp` packages, MLX weight dirs / `.npz`, and
@@ -334,3 +336,131 @@ required-features = ["cpu"]
 features     = ["cpu", "gpu"]
 rustdoc-args = ["--cfg", "docsrs"]
 all-features = false
+
+[[test]]
+name = "cuda_backprop_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cuda_capture_probe"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cuda_conv_bias_act_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cuda_fft"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cuda_gpu_custom_op"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cuda_ops3d_backprop_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cuda_param_hoist"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cuda_segmented_capture_elementwise"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "egpu_seam"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gru_rnn_mlx"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_attention_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_compile_lir"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_depthwise_convtranspose"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_fft"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_im2col_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_sparse_ops"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_sparse_ops_v2"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "qnn_dequant_matmul"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "qnn_hexagon_matmul"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "qnn_int4_matmul"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "qnn_int8_matmul"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rocm_gpu_custom_op"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rocm_op_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rnn_mlx_f16"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "tpu_compile_cache"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "tpu_cpu_speed"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "tpu_gguf_quant_param_bindings"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "tpu_gguf_session"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "tpu_real_model_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "vulkan_dequant_grouped_matmul"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "vulkan_dequant_moe_weights"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "vulkan_parity"
+required-features = ["backend-tests"]

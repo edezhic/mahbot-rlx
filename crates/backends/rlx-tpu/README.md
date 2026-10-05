@@ -176,7 +176,9 @@ Four test harnesses, in increasing order of weight:
 
 ```sh
 # 1. Host-agnostic — prost decode + HLO builder + lowering walker.
-cargo test -p rlx-tpu                        # 2 unit + 12 hlo_decode
+# (`--features backend-tests`: rlx-tpu is not one of the default test paths, so
+# its test targets are not in the default `cargo test` run.)
+cargo test -p rlx-tpu --features backend-tests # 2 unit + 12 hlo_decode
                                               # + 32 hlo_match + 4 check
                                               # = 50 tests
 
@@ -200,7 +202,7 @@ cargo test -p rlx-tpu                        # 2 unit + 12 hlo_decode
 
 # 4. On a real GCP TPU VM — set LIBTPU_PATH; the same round-trip
 # suite from (3) executes against silicon.
-LIBTPU_PATH=/path/to/libtpu.so cargo test -p rlx-tpu
+LIBTPU_PATH=/path/to/libtpu.so cargo test -p rlx-tpu --features backend-tests
 ```
 
 ## Off-TPU numerical validation: what's in `--build-plugin`
@@ -214,8 +216,8 @@ result is the same shape as `libtpu.so` and dlopen-able through
 numerical harness skip straight to cargo test.
 
 `docker/Dockerfile.numerical` extends this with Rust + cargo and
-runs `cargo test -p rlx-tpu --release` so the whole flow exercises
-real PJRT compile + execute. The 4 roundtrip tests
+runs `cargo test -p rlx-tpu --release --features backend-tests` so the whole
+flow exercises real PJRT compile + execute. The 4 roundtrip tests
 (`add_two_vectors`, `matmul_2d`, `activations_relu_sigmoid`,
 `layernorm_minus1`) compare against in-test references with strict
 tolerances.

@@ -85,7 +85,7 @@ bench n="500" bits="8":
         --weight-bits {{bits}} \
         --val-set {{n}} \
         --out rlx-cortexm/src/model_weights.rs
-    cd .. && cargo test -p rlx-cortexm --release \
+    cd .. && cargo test -p rlx-cortexm --release --features backend-tests \
         int8_accuracy_close_to_fp32 -- --nocapture
     @echo "── on-device sweep (will skip if no dongle at 0x16c0:0x27dd) ──"
     @python3 -c "from serial.tools import list_ports; \
@@ -105,7 +105,7 @@ bench-bits n="500":
         cd .. && cargo run -p rlx-cortexm-trainer --release -- \
             --epochs 2 --weight-bits $B --val-set {{n}} \
             --out rlx-cortexm/src/model_weights.rs 2>&1 | grep -E "wrote|calibration"; \
-        cd .. && cargo test -p rlx-cortexm --release \
+        cd .. && cargo test -p rlx-cortexm --release --features backend-tests \
             int8_accuracy_close_to_fp32 -- --nocapture 2>&1 | grep INT8 || true; \
     done
 
@@ -120,8 +120,10 @@ size: build-fw
 # ── Test ──────────────────────────────────────────────────────────
 
 # Host-side tests: parity, single-image e2e, 500-image bulk validation.
+# The targets are gated behind the `backend-tests` feature (they are not in a
+# plain `cargo test` run) — see Cargo.toml.
 test:
-    cargo test -p rlx-cortexm
+    cargo test -p rlx-cortexm --features backend-tests
 
 # ── Flash + run ───────────────────────────────────────────────────
 

@@ -88,9 +88,10 @@ fn matmul_2x3_3x2() {
 /// Matmul throughput micro-benchmark, scalar vs tiled (pick the kernel with
 /// `RLX_VULKAN_MATMUL=scalar|tiled`; default `auto` = tiled on native drivers).
 /// `#[ignore]`d so it never runs in the normal suite — invoke explicitly:
-/// `RLX_VULKAN_MATMUL=tiled cargo test -p rlx-vulkan --test smoke bench_matmul \
-///  -- --ignored --nocapture`. Per-call overhead (input upload + fence) is
-/// included and identical for both kernels, so the A/B ratio is fair.
+/// `RLX_VULKAN_MATMUL=tiled cargo test -p rlx-vulkan --features backend-tests \
+///  --test smoke bench_matmul -- --ignored --nocapture`. Per-call overhead
+/// (input upload + fence) is included and identical for both kernels, so the
+/// A/B ratio is fair.
 #[test]
 #[ignore = "scalar-vs-tiled matmul benchmark; run with --ignored --nocapture (needs a Vulkan device)"]
 fn bench_matmul() {

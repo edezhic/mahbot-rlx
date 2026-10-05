@@ -61,8 +61,8 @@ opt into the CUDA backend (`--features cuda` or `RLX_MLX_CUDA=1`). See
 Runtime backend inside MLX (CPU OpenBLAS vs CUDA GPU):
 
 ```sh
-RLX_MLX_DEVICE=cpu  cargo test -p rlx-mlx --test basic   # default build
-RLX_MLX_DEVICE=gpu  cargo test -p rlx-mlx --features cuda --test basic
+RLX_MLX_DEVICE=cpu  cargo test -p rlx-mlx --features backend-tests --test basic   # default build
+RLX_MLX_DEVICE=gpu  cargo test -p rlx-mlx --features cuda,backend-tests --test basic
 ```
 
 Via WSL rig:
@@ -82,7 +82,7 @@ Full Linux/WSL guide and **`rlx-mlx` CPU vs `rlx-cpu` matmul benchmarks**:
 
 ```sh
 cargo build -p rlx-mlx --release
-cargo test  -p rlx-mlx --release
+cargo test  -p rlx-mlx --features backend-tests --release
 ```
 
 Through `rlx-runtime`:

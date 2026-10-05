@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
+# Other backends' test targets: off by default, `cargo test -p rlx-mlx --features backend-tests`.
+backend-tests = []
 default = []
 cuda = ["rlx-mlx-sys/cuda"]
 # Opt-in: lower `MlxMxfp4` / `MlxMxfp8` `DequantMatMul` via MLX C++
@@ -49,3 +51,83 @@ default-target = "aarch64-apple-darwin"
 targets        = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 rustdoc-args   = ["--cfg", "docsrs", "--cfg", "rlx_mlx_host"]
 all-features  = false
+
+[[test]]
+name = "autodiff_conv_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "autodiff_fakequant_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "autodiff_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "autodiff_pool_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "basic"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "batched_lu_solve"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cast_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_compile_mode_repro"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dense_solve"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "device_present"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "full_coverage_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gated_delta_net_backward_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gather_after_fused_rmsnorm_reshape"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "kv_row_inplace"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_native"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_rope_backward_partial"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "multi_compiled_graphs"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mxfp_path"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ops3d_bwd_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "q1_0_ondevice_parity"
+required-features = ["backend-tests"]

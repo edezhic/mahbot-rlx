@@ -16,7 +16,7 @@ full export configuration and `HwTarget` matrix.
 ## Quick start
 
 ```sh
-cargo test  -p rlx-fpga --release
+cargo test  -p rlx-fpga --features backend-tests --release
 cargo run   -p rlx-fpga --release --bin rlx-fpga-emit -- --hw generic
 cargo run   -p rlx-fpga --release --example export_mnist
 just fpga-emit

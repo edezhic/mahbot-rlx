@@ -39,7 +39,10 @@ fi
 # harness pulls in macOS-only dev-deps, rlx-metal / rlx-mlx.)
 echo
 echo "==> rlx-vulkan device-backed compute validation"
-cargo test -p rlx-vulkan -- --nocapture
+# --features backend-tests: rlx-vulkan's test targets are not in the default
+# test selection (CPU / Metal / wgpu). Without it this line runs zero tests and
+# the PASSED banner below is a false green.
+cargo test -p rlx-vulkan --features backend-tests -- --nocapture
 
 echo
 echo "==> VULKAN LINUX VALIDATION PASSED"

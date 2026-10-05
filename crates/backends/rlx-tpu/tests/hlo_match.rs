@@ -16,8 +16,8 @@
 //! `logistic` step, attention dropping the `iota` causal-mask
 //! synthesis) without needing a live PJRT plugin. The Docker harness
 //! goes further and round-trips the bytes through XLA's deserializer
-//! for proto validity, but the pure-Rust path here runs on every
-//! `cargo test -p rlx-tpu`.
+//! for proto validity, while the pure-Rust path here is gated behind
+//! `backend-tests` (`cargo test -p rlx-tpu --features backend-tests`).
 
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::{DType, Graph, Shape};

@@ -423,6 +423,10 @@ pub(crate) fn compile_static_inner(
         let mut agg: Vec<_> = by_op.into_iter().collect();
         agg.sort_by_key(|(_, (_, b))| std::cmp::Reverse(*b));
         let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        // Not printed here: the pooled output slab is a device buffer `plan` does
+        // not own, allocated lazily by the first batched packed multiply.
+        // `gguf_gpu::pooled_out_buf_bytes()` reports it, read after a run, so a
+        // memory figure taken then cannot understate device usage.
         eprintln!(
             "[rlx-wgpu] arena {:.2} GiB over {} slots; distinct-slot sum {:.2} GiB",
             gib(plan.arena_size),

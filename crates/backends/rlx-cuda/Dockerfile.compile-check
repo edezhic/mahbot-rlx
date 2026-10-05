@@ -47,6 +47,8 @@ RUN cargo build -p rlx-cuda --release 2>&1 | tail -20
 
 # Optional: run the basic tests. They no-op without a GPU but verify
 # the test harness compiles and the unit-test path links.
-RUN cargo test -p rlx-cuda --release --no-run 2>&1 | tail -10
+# `--features backend-tests`: rlx-cuda's test targets are not in the default
+# selection, so without it this would compile the lib unit tests only.
+RUN cargo test -p rlx-cuda --release --features backend-tests --no-run 2>&1 | tail -10
 
 CMD ["echo", "rlx-cuda compile check passed"]

@@ -40,7 +40,8 @@
 # Default flow:
 #
 #   1. Pre-flight: cargo fmt --check, cargo clippy -- -D warnings,
-#      cargo test --workspace --release. Aborts if any fails.
+#      cargo test --workspace --release --features backend-tests. Aborts if any
+#      fails.
 #   2. Confirm prompt (skip with --yes).
 #   3. Per tier, publish each crate sequentially. After each crate:
 #        a. wait for the sparse index to report the new version
@@ -694,14 +695,20 @@ if (( ! NO_GATE )); then
     bold "[1/3] cargo fmt --check"
     cargo fmt --all -- --check
 
-    bold "[2/3] cargo clippy --workspace --all-targets -- -D warnings"
-    cargo clippy --workspace --all-targets -- -D warnings
+    bold "[2/3] cargo clippy --workspace --all-targets --features backend-tests -- -D warnings"
+    # `backend-tests`: the default test selection covers CPU / Metal / wgpu;
+    # a release gate wants every target.
+    cargo clippy --workspace --all-targets --features backend-tests -- -D warnings
 
     # --no-fail-fast: cargo stops at the first failing *binary* otherwise, so a
     # single early break hides every later crate's result. A release gate wants
     # the whole picture in one run; the non-zero exit still aborts the publish.
-    bold "[3/3] cargo test --workspace --release --no-fail-fast"
-    cargo test --workspace --release --no-fail-fast
+    #
+    # --features backend-tests: the default test selection covers CPU / Metal /
+    # wgpu; a release gate wants everything, so ask for the other backends' test
+    # targets back.
+    bold "[3/3] cargo test --workspace --release --no-fail-fast --features backend-tests"
+    cargo test --workspace --release --no-fail-fast --features backend-tests
     green "Pre-flight gates passed."
 fi
 

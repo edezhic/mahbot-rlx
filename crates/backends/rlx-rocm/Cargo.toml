@@ -42,6 +42,8 @@ path = "src/lib.rs"
 # Kernel sources live in `rlx-gpu-kernels`. This harness reuses
 # rlx-cuda's `cpp/cpu_dispatch.cpp` and HIP-CPU at `rlx-cuda/docker/vendor/HIP-CPU`.
 [features]
+# Other backends' test targets: off by default, `cargo test -p rlx-rocm --features backend-tests`.
+backend-tests = []
 default = []
 native-splat = []
 hip-cpu-validate = ["dep:cc"]
@@ -68,3 +70,55 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "basic"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "complex_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dense_solve_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "device_present"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "hip_cpu_validate"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "moe_hot_cold_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rocm_attention_backward_head_dim"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rocm_fft_q_ingraph"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rocm_rope_partial"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scaled_grouped_matmul_rocm"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "spd_host_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "static_weight_pack_planning"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "static_weight_pack_rebind"
+required-features = ["backend-tests"]

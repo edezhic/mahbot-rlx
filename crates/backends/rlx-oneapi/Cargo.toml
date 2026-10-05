@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
+# Other backends' test targets: off by default, `cargo test -p rlx-oneapi --features backend-tests`.
+backend-tests = []
 default = []
 # Generate a tiled matmul entry point FROM a typed `KernelSchedule` (see
 # `kernel_schedule_emit`). Off by default and UNMEASURED: compiling the result
@@ -71,3 +73,15 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "complex_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "smoke"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "spd_host_parity"
+required-features = ["backend-tests"]

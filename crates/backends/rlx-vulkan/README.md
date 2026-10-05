@@ -137,7 +137,7 @@ Run the parity suite locally with a Vulkan driver present:
 # macOS (MoltenVK via Homebrew: vulkan-loader + molten-vk)
 VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json \
 DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib \
-cargo test -p rlx-runtime --features vulkan --test vulkan_parity -- --test-threads=1
+cargo test -p rlx-runtime --features vulkan,backend-tests --test vulkan_parity -- --test-threads=1
 ```
 
 ## Usage

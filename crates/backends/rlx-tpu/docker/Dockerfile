@@ -2,10 +2,10 @@
 #
 # Validates two things, neither of which need TPU hardware:
 #
-#   1. **Linux build cleanliness** — `cargo test -p rlx-tpu` runs the
-#      host-agnostic suite (proto encoder, HLO builder, lowering walker,
-#      check graphs). The PJRT round-trip tests skip cleanly without
-#      LIBTPU_PATH.
+#   1. **Linux build cleanliness** — `cargo test -p rlx-tpu --features
+#      backend-tests` runs the host-agnostic suite (proto encoder, HLO
+#      builder, lowering walker, check graphs). The PJRT round-trip tests
+#      skip cleanly without LIBTPU_PATH.
 #
 #   2. **HLO structural validity** — `validate_hlo.py` deserializes the
 #      `HloModuleProto` bytes our lowering emits via JAX's `xla_extension`

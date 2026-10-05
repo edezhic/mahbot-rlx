@@ -77,6 +77,8 @@ path = "src/lib.rs"
 # this feature is on; the resulting object file is linked into the
 # crate and called via Rust FFI.
 [features]
+# Other backends' test targets: off by default, `cargo test -p rlx-cuda --features backend-tests`.
+backend-tests = []
 default = []
 native-splat = []
 # Route pow-2 f32 GPU FFT through NVIDIA cuFFT instead of the native butterfly
@@ -121,3 +123,95 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "basic"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "bucketed_decode_attn_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "complex_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv3d_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cuda_attention_backward_head_dim"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cuda_fft_q_ingraph"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cuda_scaled_custom"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dense_solve_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "device_present"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "hip_cpu_validate"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "interpolate3d_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "launch_arity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_dequant_matmul_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "moe_hot_cold_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mxfp4x2_decode_cuda"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mxfp4x2_matmul_cuda"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ops3d_bwd_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ops3d_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scaled_grouped_matmul_cuda"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "set_param_under_capture"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "shared_params_vmem"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "spd_host_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "static_weight_pack_rebind"
+required-features = ["backend-tests"]

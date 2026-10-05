@@ -24,4 +24,4 @@ RUN echo /usr/local/lib > /etc/ld.so.conf.d/pjrt.conf && ldconfig
 ENV LIBTPU_PATH=/usr/local/lib/libpjrt_c_cpu.so
 
 WORKDIR /work
-CMD ["cargo", "test", "-p", "rlx-tpu", "--release", "--", "--test-threads=1", "--nocapture"]
+CMD ["cargo", "test", "-p", "rlx-tpu", "--release", "--features", "backend-tests", "--", "--test-threads=1", "--nocapture"]

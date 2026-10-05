@@ -89,6 +89,48 @@ fn wgpu_gguf_dequant_matmul_prefill_matches_cpu() {
             2048,
             1e-2,
         ),
+        // Batched prefill sizes: the row-grouped GEMM covers 2..~276 rows, and
+        // m=96 is the top of the model-body range Metal caps its fused GEMM at.
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            16,
+            256,
+            640,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            96,
+            256,
+            640,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            96,
+            512,
+            1024,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ6K,
+            rlx_gguf::GgmlType::Q6K,
+            96,
+            256,
+            640,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ6K,
+            rlx_gguf::GgmlType::Q6K,
+            16,
+            512,
+            1024,
+            1e-2,
+        ),
         (
             QuantScheme::GgufQ6K,
             rlx_gguf::GgmlType::Q6K,

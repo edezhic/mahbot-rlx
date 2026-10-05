@@ -560,7 +560,7 @@ core model-agnostic.
 ```sh
 cargo build --release                         # cpu only
 cargo build --release --features metal,mlx    # apple silicon GPU
-cargo test  --release --workspace             # full workspace suite
+cargo test  --release --workspace --features backend-tests   # full workspace suite
 ```
 
 For Apple Silicon, MLX is a git submodule under `rlx-mlx-sys`:
@@ -650,7 +650,8 @@ until the kind moves from **common-ir** to **native**.
 
 ## Development workflow
 
-- **Fast local gate**: `just ci` (build, workspace tests, lint, pyrlx pytest).
+- **Fast local gate**: `just ci` (build, workspace tests at the default
+  selection — CPU / Metal / wgpu — lint, pyrlx pytest).
 - **Always gate benches on throttle.** `scripts/check-throttle.sh` refuses
   to proceed under thermal pressure (`pmset -g therm`). Silent 10×
   slowdowns are a real failure mode on Macs. `--warn` mode for CI;

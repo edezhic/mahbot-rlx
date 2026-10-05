@@ -145,7 +145,7 @@ Full guide: [`docs/backend-selection.md`](../../../docs/backend-selection.md).
 ```sh
 cargo build -p rlx-runtime --features cpu                       # CPU only
 cargo build -p rlx-runtime --features cpu,metal                 # +Metal
-cargo test  -p rlx-runtime --release
+cargo test  -p rlx-runtime --release --features backend-tests
 ```
 
 ## Gotchas

@@ -1106,7 +1106,14 @@ impl Arena {
                 let mut shards = Vec::with_capacity(n_shards);
                 for i in 0..n_shards {
                     let begin = i * weight_shard_cap;
-                    let this = (weight_cursor - begin).min(weight_shard_cap).max(4);
+                    // Rounded to 4 bytes: a weight window can end exactly at the
+                    // buffer end, and a storage binding must be a multiple of 4
+                    // bytes — an odd tail would make the last window of a weight
+                    // that fits unbindable, declining the grouped path for it.
+                    let this = (weight_cursor - begin)
+                        .min(weight_shard_cap)
+                        .max(4)
+                        .next_multiple_of(4);
                     shards.push(device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("rlx-wgpu weight buffer (packed quant)"),
                         size: this as u64,

@@ -14,7 +14,8 @@ review and ground rules.
 
 ```sh
 just build          # workspace build
-just test           # cargo test (workspace; Darwin caps -j for shared GPU)
+just test           # cargo test of the CPU / Metal / wgpu paths (Darwin caps -j)
+                    # other backends: add `--features backend-tests` to cargo test
 just test-gpu       # Metal/MLX/wgpu/Vulkan (+ apple/cuda/rocm runtime) on host
 
 just lint           # clippy (-D warnings)
@@ -72,7 +73,7 @@ Exhaustive `RLX_*` inventory: [`docs/rlx-env-vars.md`](rlx-env-vars.md)
 ```sh
 just test-rocm                    # compile check + parity tests (skip without HIP)
 just test-hip-cpu-validate        # HIP-CPU kernel tests in Docker (linux-gnu only)
-cargo test -p rlx-runtime --features cpu,rocm --test rocm_op_parity
+cargo test -p rlx-runtime --features cpu,rocm,backend-tests --test rocm_op_parity
 ```
 
 Pinned host I/O: `RLX_ROCM_PINNED_IO=1` (default on in graph exec mode, mirrors CUDA).
@@ -125,7 +126,7 @@ Resize prologue and batch region fusion: [`fk-fusion.md`](fk-fusion.md). Parity 
 cargo test -p rlx-runtime --features cpu,metal,gpu,tpu --test fk_prologue_parity
 cargo test -p rlx-fusion fk_
 cargo test -p rlx-compile --lib fusion_pipeline::tests
-cargo test -p rlx-tpu --test fk_pipeline --test hlo_match batch_elementwise
+cargo test -p rlx-tpu --features backend-tests --test fk_pipeline --test hlo_match batch_elementwise
 cargo test -p rlx-metal --test mps_graph_batch_region_lower
 cd crates/pyrlx && python3 -m pytest tests/test_fk_batch_native.py tests/test_fk_batch_primitive.py -q
 ```

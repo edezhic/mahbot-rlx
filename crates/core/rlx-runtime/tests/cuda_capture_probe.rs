@@ -15,7 +15,8 @@
 //! CUDA rig with `--nocapture` to read the diagnostic.
 //!
 //!   RLX_CUDA_EXEC_MODE=graph RLX_CUDA_CAPTURE_DEBUG=1 \
-//!     cargo test -p rlx-runtime --features cuda --test cuda_capture_probe -- --nocapture
+//!     cargo test -p rlx-runtime --features cuda,backend-tests \
+//!     --test cuda_capture_probe -- --nocapture
 
 use rlx_ir::op::{Activation, MaskKind};
 use rlx_ir::{DType, Graph, Shape};
@@ -220,7 +221,7 @@ fn cuda_segmentation_opportunity_probe() {
 /// capture-safe). This is rlx's main graph-mode feature that silently ran eager
 /// on the uncapturable null stream; the non-null-stream + disable_event_tracking
 /// fix makes it actually capture. Run:
-///   RLX_CUDA_EXEC_MODE=graph cargo test -p rlx-runtime --features cuda \
+///   RLX_CUDA_EXEC_MODE=graph cargo test -p rlx-runtime --features cuda,backend-tests \
 ///     --test cuda_capture_probe cuda_whole_graph_capture -- --nocapture
 #[test]
 fn cuda_whole_graph_capture_matches_cpu() {

@@ -92,7 +92,7 @@ For host-side parity tests: enable the `std` feature.
 Host-side (kernels + model parity, no toolchain needed):
 
 ```sh
-cargo test -p rlx-cortexm --release
+cargo test -p rlx-cortexm --features backend-tests --release
 ```
 
 Five parity tests + single-image e2e + 500-image bulk validation

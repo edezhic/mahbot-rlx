@@ -94,7 +94,8 @@ as wgpu / Vulkan.
 ```sh
 # Compiles everywhere (no kernels embedded off an Intel host):
 cargo build -p rlx-oneapi
-cargo test  -p rlx-oneapi            # CPU-reference compute, green on macOS
+# `--features backend-tests`: oneAPI test targets are not in the default run.
+cargo test  -p rlx-oneapi --features backend-tests  # CPU-reference compute, green on macOS
 
 # On an Intel oneAPI host (Linux) with `ocloc`:
 RLX_ONEAPI_BUILD_KERNELS=1 cargo build -p rlx-oneapi

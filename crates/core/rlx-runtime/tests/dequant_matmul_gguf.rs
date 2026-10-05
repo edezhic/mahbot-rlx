@@ -369,8 +369,9 @@ fn dequant_matmul_q4k_metal_matches_cpu() {
 
 /// Decode-shaped (`m == 1`) GGUF GEMV on wgpu: exercises the fused
 /// `dequant_gemv_gguf` kernel (windowed bindings, no f32 scratch) for the two
-/// schemes Llama Q4_K_M uses. Multi-row matmul `m>1` keeps the scratch path;
-/// this targets the native decode GEMV added for `Device::Gpu`.
+/// schemes Llama Q4_K_M uses. Multi-row `m > 1` Q4_K / Q6_K takes the
+/// row-grouped `dequant_gemm_gguf` kernels instead (one pass over each packed
+/// weight tile per group of 8 rows); this targets the m=1 decode GEMV.
 #[cfg(feature = "gpu")]
 fn run_gguf_gemv_case(scheme: QuantScheme, k: usize, n: usize) {
     use half::f16;

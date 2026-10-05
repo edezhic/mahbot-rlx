@@ -7,9 +7,10 @@ you pass one through.
 
 What it runs (`run-validation.sh`):
 1. `vulkaninfo --summary` — show the selected Vulkan device.
-2. `cargo test -p rlx-vulkan` — backend unit smoke tests.
-3. `cargo test -p rlx-runtime --features vulkan --test vulkan_parity` — the
-   Vulkan ↔ CPU cross-backend parity suite (matmul, softmax, norms, RoPE,
+2. `cargo test -p rlx-vulkan --features backend-tests` — backend unit smoke
+   tests (`backend-tests`: Vulkan targets are not in the default run).
+3. `cargo test -p rlx-runtime --features vulkan,backend-tests --test vulkan_parity`
+   — the Vulkan ↔ CPU cross-backend parity suite (matmul, softmax, norms, RoPE,
    attention, gather, transpose, reduce, elementwise).
 
 The source tree is **mounted**, not copied, so the image is tiny and always

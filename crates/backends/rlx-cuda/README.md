@@ -52,10 +52,10 @@ first FFI call. On Mac there's no libcuda, so:
    crate links against cudarc's stub bindings; libcuda is only
    resolved at runtime.
 
-2. **`cargo test -p rlx-cuda --release`** — runs the basic tests. Each
-   test checks `is_available()` first; on Mac that returns false (the
-   libcuda load fails inside cudarc and we catch the panic), so
-   tests no-op cleanly.
+2. **`cargo test -p rlx-cuda --features backend-tests --release`** — runs
+   the basic tests. Each test checks `is_available()` first; on Mac that
+   returns false (the libcuda load fails inside cudarc and we catch the
+   panic), so tests no-op cleanly.
 
 3. **`./rlx-cuda/check-compile.sh`** — builds the crate inside an
    `nvidia/cuda:12.6.0-devel-ubuntu22.04` Docker image. Validates that
@@ -326,7 +326,7 @@ across graph capture/replay.
 
 ```sh
 cargo build -p rlx-cuda --release          # compile-check on any host
-cargo test  -p rlx-cuda --release          # 3 basic tests; no-op on Mac
+cargo test  -p rlx-cuda --features backend-tests --release  # all tests; no-op on Mac
 ./rlx-cuda/check-compile.sh                # docker compile validation
 ```
 

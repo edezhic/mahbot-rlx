@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
+# Other backends' test targets: off by default, `cargo test -p rlx-coreml --features backend-tests`.
+backend-tests = []
 default = []
 # On-device training / backward. Compiles the native MIL backward kernels
 # (mil/mod.rs) and the MLUpdateTask training-session path. Off by default so
@@ -58,3 +60,87 @@ workspace = true
 default-target = "aarch64-apple-darwin"
 targets        = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 rustdoc-args   = ["--cfg", "docsrs"]
+
+[[test]]
+name = "coreml_attention"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_attention_custom_mask"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_backward"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_backward_coverage"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_gru_rnn"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_input_name"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_lstm"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_ops"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_ops2"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_quant"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_rnn_f16"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_session"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_smoke"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_ssm"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_tier23"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_update"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "full_coverage_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mil_lower"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mil_p15"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mil_tier1"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "reshape_narrow_gather"
+required-features = ["backend-tests"]

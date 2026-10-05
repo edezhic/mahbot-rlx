@@ -49,7 +49,7 @@ python3 …/kinspect.py run --target rocm       # force ROCm (on the AMD rig)
 python3 …/kinspect.py run --release conv3d    # release + a cargo test filter
 
 # analyze an existing dump without rebuilding
-RLX_DUMP_KERNELS=/tmp/kd cargo test -p rlx-rocm -- --test-threads=1
+RLX_DUMP_KERNELS=/tmp/kd cargo test -p rlx-rocm --features backend-tests -- --test-threads=1
 python3 …/kinspect.py analyze /tmp/kd
 
 # before/after a kernel edit (works for both backends)

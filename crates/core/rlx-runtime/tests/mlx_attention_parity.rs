@@ -14,8 +14,9 @@
 //! `mlx_matches_cpu` after bumping `rlx` to confirm end-to-end.
 //!
 //! ```text
-//! cargo test -p rlx-runtime --features cpu,mlx --test mlx_attention_parity -- --nocapture
-//! MLX_ATTN_PARITY_SEQ=4096 cargo test -p rlx-runtime --features cpu,mlx \
+//! cargo test -p rlx-runtime --features cpu,mlx,backend-tests \
+//!     --test mlx_attention_parity -- --nocapture
+//! MLX_ATTN_PARITY_SEQ=4096 cargo test -p rlx-runtime --features cpu,mlx,backend-tests \
 //!     --test mlx_attention_parity cpu_vs_mlx_brainjepa_predictor_stack --release -- --nocapture
 //! ```
 
