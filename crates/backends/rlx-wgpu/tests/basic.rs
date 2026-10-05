@@ -1748,10 +1748,16 @@ fn dot_general_canonical_matches_matmul() {
 }
 
 #[test]
-fn sample_argmax_picks_dominant_logit() {
+fn sample_draws_dominant_logit_on_peaked_logits() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    // Peaked logits cannot tell a draw from an argmax: both land on token 2.
+    // This pins determinism of the default-config draw path on degenerate
+    // input, not the difference between drawing and taking the max — that
+    // difference needs near-uniform logits and multiple rows, and is pinned for
+    // this backend by `rlx-runtime/tests/sample_parity.rs::
+    // sample_default_config_is_a_genuine_draw_wgpu`.
     let mut g = Graph::new("samp");
     let logits = g.input("l", Shape::new(&[1, 5], DType::F32));
     let id = g.add_node(
@@ -3301,10 +3307,10 @@ fn sample_threefry_seed_is_deterministic_and_distributes() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
-    // Force the Sample kernel path (not the greedy argmax fast-path)
-    // by passing top_p < 1 — that's what gates the Threefry dispatch.
-    // Uniform logits + temperature=1 + top_p<1 still includes every
-    // token in the nucleus so the multinomial draw covers all tokens.
+    // Exercise the nucleus filter: top_p = 0.999 (with uniform logits) keeps
+    // essentially every token, so the multinomial draw covers all of them.
+    // (top_p == 1.0 draws too now — temperature 1.0 is no longer gated to the
+    // argmax fast path — but the filter is what this test is about.)
     let n = 8;
     let batch = 64;
     let mut g = Graph::new("samp-threefry");
@@ -3405,6 +3411,77 @@ fn sample_top_p_zero_collapses_to_argmax() {
     ]; // top-1 = 3
     let r = exe.run(&[("x", &xs)]);
     assert_eq!(r[0], vec![0.0, 3.0]);
+}
+
+/// The default-config sample kernel used to write its temperature-scaled
+/// probabilities into its own logits slot, so a second consumer of the same
+/// logits saw corrupted values (a softmax over them came back as
+/// softmax-of-probabilities, ~1e-1 off). The other consumer here — the softmax
+/// — is created *after* the sample node, so it runs afterwards.
+///
+/// The draw semantics of the neutral configuration are covered for wgpu
+/// alongside CPU and Metal by `rlx-runtime/tests/sample_parity.rs`, but those
+/// arms sit behind `feature = "gpu"` and only build when some other workspace
+/// member asks for it — so the kernel-level assertion stays here, where
+/// `cargo test -p rlx-wgpu` always runs it.
+#[test]
+fn sample_leaves_its_logits_intact_for_other_consumers() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let (b, v) = (4usize, 256usize);
+    let xs: Vec<f32> = (0..b * v)
+        .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+        .collect();
+    let maxdiff = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    };
+
+    // Both graphs declare the raw logits as an output, so the tensor the
+    // sample read can be compared directly. The sample's own output stays
+    // declared too, or DCE would drop the node under test.
+    let build = |with_sample: bool| -> Graph {
+        let mut g = Graph::new("sample-shared");
+        let logits = g.input("logits", Shape::new(&[b, v], DType::F32));
+        let y = with_sample.then(|| {
+            g.add_node(
+                Op::Sample {
+                    top_k: 0,
+                    top_p: 1.0,
+                    temperature: 1.0,
+                    seed: 0x5EED,
+                },
+                vec![logits],
+                Shape::new(&[b], DType::F32),
+            )
+        });
+        let sm = g.softmax(logits, 1, Shape::new(&[b, v], DType::F32));
+        let mut outs = vec![logits, sm];
+        outs.extend(y);
+        g.set_outputs(outs);
+        g
+    };
+
+    let mut shared = WgpuExecutable::compile(build(true));
+    let mut reference = WgpuExecutable::compile(build(false));
+    let sh = shared.run(&[("logits", &xs)]);
+    let rf = reference.run(&[("logits", &xs)]);
+
+    // The corruption this guards against is ~1e-1, four orders of magnitude
+    // above the tolerance.
+    assert!(
+        close(&sh[0], &xs, 1e-5),
+        "sample clobbered the logits it read: max|Δ| = {:e}",
+        maxdiff(&sh[0], &xs),
+    );
+    assert!(
+        close(&sh[1], &rf[1], 1e-5),
+        "the other consumer of the logits saw changed values: max|Δ| = {:e}",
+        maxdiff(&sh[1], &rf[1]),
+    );
 }
 
 #[test]

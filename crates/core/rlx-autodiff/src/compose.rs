@@ -224,7 +224,7 @@ fn is_cse_eligible(op: &Op) -> bool {
     !matches!(
         op,
         Op::Input { .. } | Op::Param { .. } | Op::Scan { .. } | Op::ScanBackward { .. }
-    )
+    ) && !op.is_nondeterministic()
 }
 
 /// Scalar-zero graph: `output = 0` with a single input `wrt_name`.
@@ -504,5 +504,25 @@ mod tests {
             .expect("expand");
         let expand_in = g.node(expand.inputs[0]);
         assert_eq!(expand_in.shape.dims(), &[Dim::Static(3), Dim::Static(1)]);
+    }
+
+    /// `cse` here has its own eligibility rule, separate from the one in
+    /// `rlx-compile` — a nondeterministic op must be shared by neither.
+    #[test]
+    fn keeps_nondeterministic_draws() {
+        let f = DType::F32;
+        let mut g = Graph::new("draws");
+        let logits = g.input("logits", Shape::new(&[1, 8], f));
+        let s0 = g.sample(logits, 0, 1.0, 1.0, 7, Shape::new(&[1], f));
+        let s1 = g.sample(logits, 0, 1.0, 1.0, 7, Shape::new(&[1], f));
+        g.set_outputs(vec![s0, s1]);
+
+        let out = cse(g);
+        let draws = out
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Sample { .. }))
+            .count();
+        assert_eq!(draws, 2, "cse merged two nondeterministic Sample nodes");
     }
 }

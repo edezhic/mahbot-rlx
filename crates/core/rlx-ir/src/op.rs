@@ -1679,19 +1679,26 @@ pub enum Op {
     /// One f32-encoded sampled token id per batch row (output
     /// shape `[batch]`).
     ///
-    /// `temperature == 1.0` matches a plain argmax-of-softmax;
-    /// lower → sharper, higher → flatter. `top_k == 0` disables.
-    /// `top_p == 1.0` disables. `seed` is the Philox seed; pass 0
-    /// for "use process-global counter" (still deterministic
-    /// given the call order).
+    /// The `logits` operand is **read-only**: this op must never write
+    /// through it, because other consumers of the same tensor observe
+    /// whatever it leaves behind.
+    ///
+    /// `temperature == 1.0` is neutral and performs a genuine draw;
+    /// lower → sharper, higher → flatter. A backend may lower to argmax
+    /// only under the project's greedy rule — `temperature <= 0.0` or
+    /// `top_k == 1` — every other configuration must draw, so the seed
+    /// is never inert. `top_k == 0` disables, `top_p == 1.0` disables.
+    /// `seed` seeds the draw; `0` is passed through to each backend's own
+    /// constant default seed (not a process-global counter), so draws
+    /// stay deterministic.
     /// Borrowed from MAX's nn/sampling.mojo.
     /// Latency-critical: never materializes the full softmax
     /// distribution on the host.
     Sample {
         top_k: usize,     // 0 = disabled
         top_p: f32,       // 1.0 = disabled
-        temperature: f32, // 1.0 = neutral
-        seed: u64,        // 0 = use thread-local counter
+        temperature: f32, // 1.0 = neutral (draws)
+        seed: u64,        // 0 = backend's constant default seed
     },
 
     /// ONNX `RandomNormalLike` / `RandomNormal`: zero or one shape-template

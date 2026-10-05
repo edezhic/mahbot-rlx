@@ -4,8 +4,10 @@
 
 // Multinomial sampling kernel with optional top-k / top-p / temperature.
 // Threefry-2×32-20 RNG + JAX-style key derivation + Gumbel-max categorical
-// sampling. Mirrors rlx-wgpu's sample.wgsl exactly so picks are
-// algorithmically equivalent across backends.
+// sampling. Algorithm and picks match rlx-wgpu's sample.wgsl exactly; the
+// only difference is that rlx-wgpu now stages intermediates in a scratch slot
+// and leaves its logits read-only, while this shared CUDA/ROCm kernel still
+// writes them into the logits slot.
 //
 // One thread per batch row; serial inside each row.
 

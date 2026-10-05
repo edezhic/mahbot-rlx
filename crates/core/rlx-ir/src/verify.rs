@@ -117,6 +117,12 @@ pub fn verify(graph: &Graph) -> Vec<VerifyError> {
         }
     }
 
+    // Leaf names are the binding key, and binding resolves exactly one node per
+    // name, so a duplicate is fatal: the unmatched declaration is never fed and
+    // silently reads zeros. Run it through `verify` so nothing that verifies
+    // clean can later bind to the wrong node.
+    errors.extend(verify_unique_leaf_names(graph));
+
     errors
 }
 
@@ -129,11 +135,10 @@ pub fn verify(graph: &Graph) -> Vec<VerifyError> {
 /// error, just a wrong answer. A genuinely shared weight is *one* node with
 /// several consumers, so duplicate names only arise from a graph-rewrite bug.
 ///
-/// Deliberately **not** part of [`verify`], which is asserted on every fusion
-/// pass in debug builds: graphs in the wild can still trip this, and each needs
-/// its own look before it can be made fatal.
-///
-/// Every instance found so far has been a real bug:
+/// Part of [`verify`], so a duplicate name is a hard verification failure: the
+/// duplicate never reaches binding. The check used to be advisory because
+/// graphs in the wild still tripped it; every instance found so far has been a
+/// real bug, which is why it now fails the build rather than inviting a look:
 ///
 /// * `Rewriter::copy_node` emitted hoisted nodes twice — the one this check was
 ///   written for — which silently zeroed gradient terms in every backward graph
@@ -143,13 +148,15 @@ pub fn verify(graph: &Graph) -> Vec<VerifyError> {
 ///   as forward-over-reverse not composing; it was a name collision. **Fixed** —
 ///   the outer tangent is now `tangent_<name>_2`.
 /// * Qwen3.5 prefill graphs declare `last_token_idx` twice: once at flow level
-///   as F32, once inside the `GatherLastToken` block as I32. **Open**, in
-///   `rlx-models` (`rlx-qwen35/tests/last_token_idx_gather.rs`, `#[ignore]`d
-///   with the full diagnosis). Currently harmless only because the unbound node
-///   feeds a redundant second gather along an axis the first already collapsed
-///   to extent 1, where index 0 is the only legal index — nothing guarantees
-///   which of two same-named nodes gets bound, and the other way round every
-///   `last_logits_only` prefill would return the *first* token's logits.
+///   as F32, once inside the `GatherLastToken` block as I32. That graph now
+///   _fails to compile_ instead of being harmless by luck — the `#[ignore]`d
+///   diagnosis in `rlx-models` (`rlx-qwen35/tests/last_token_idx_gather.rs`)
+///   names the declaration that has to go. It used to pass only because the
+///   unbound node feeds a redundant second gather along an axis the first
+///   already collapsed to extent 1, where index 0 is the only legal index —
+///   nothing guaranteed which of two same-named nodes got bound, and the other
+///   way round every `last_logits_only` prefill returned the *first* token's
+///   logits.
 pub fn verify_unique_leaf_names(graph: &Graph) -> Vec<VerifyError> {
     let mut errors = Vec::new();
     let mut seen: std::collections::HashMap<&str, NodeId> = std::collections::HashMap::new();
@@ -1311,5 +1318,39 @@ mod tests {
         let mm = g.matmul(x, w, Shape::new(&[4, 384], DType::F32));
         g.set_outputs(vec![mm]);
         assert!(verify_all(&g).is_empty());
+    }
+
+    /// Binding is by name and reaches a single node, so a second `Op::Input`
+    /// declaring the same name would silently read zeros. `verify_all` must
+    /// report it — it is part of `verify` now, not an advisory side check.
+    #[test]
+    fn duplicate_input_names_are_reported() {
+        let mut g = Graph::new("dup-input");
+        let a = g.input("x", Shape::new(&[2], DType::F32));
+        let b = g.input("x", Shape::new(&[2], DType::F32));
+        // Consume both so neither is a dead declaration.
+        let sum = g.binary(crate::op::BinaryOp::Add, a, b, Shape::new(&[2], DType::F32));
+        g.set_outputs(vec![sum]);
+
+        let errors = verify_all(&g);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("duplicate"), "{errors:?}");
+        assert!(errors[0].message.contains("Input"), "{errors:?}");
+    }
+
+    /// Same for `Op::Param`: `set_param("w", …)` resolves one node, so the
+    /// duplicate is never fed.
+    #[test]
+    fn duplicate_param_names_are_reported() {
+        let mut g = Graph::new("dup-param");
+        let a = g.param("w", Shape::new(&[2], DType::F32));
+        let b = g.param("w", Shape::new(&[2], DType::F32));
+        let sum = g.binary(crate::op::BinaryOp::Add, a, b, Shape::new(&[2], DType::F32));
+        g.set_outputs(vec![sum]);
+
+        let errors = verify_all(&g);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("duplicate"), "{errors:?}");
+        assert!(errors[0].message.contains("Param"), "{errors:?}");
     }
 }

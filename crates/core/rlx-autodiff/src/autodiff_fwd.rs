@@ -102,9 +102,11 @@ pub fn jvp_with_tangent_names(forward: &Graph, tangent_for: &[NodeId]) -> (Graph
     //
     // The mirror above copied `forward`'s own leaves, so that name may already
     // be taken; `hvp` emits `tangent_<name>`, which makes `jvp(hvp(f))` collide
-    // every time. A duplicate leaf name is not an error anywhere — binding
-    // resolves by name to one node, so the second one silently reads zeros —
-    // hence the derivative would come back zero rather than wrong-looking.
+    // every time. That collision is a hard compile failure now (`verify`, and
+    // `CompilePipeline` before any pass); it used to compile, and because
+    // binding resolves by name to one node the second declaration was never
+    // fed — it read zeros, so the derivative came back zero rather than
+    // wrong-looking.
     let mut taken: std::collections::HashSet<String> = forward
         .nodes()
         .iter()

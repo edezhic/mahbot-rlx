@@ -1871,7 +1871,7 @@ pub struct SampleParams {
     pub temp_bits: u32,
     pub seed_lo: u32,
     pub seed_hi: u32,
-    pub _p0: u32,
+    pub scratch_off: u32,
     pub _p1: u32,
     pub _p2: u32,
 }

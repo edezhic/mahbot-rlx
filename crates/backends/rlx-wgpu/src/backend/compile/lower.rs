@@ -480,9 +480,8 @@ pub(crate) fn compile_static_inner(
     } else {
         0
     };
-    // Pre-walk to compute the max scratch any single op needs.
-    // Currently only `Op::LayerNormBackwardGamma` uses scratch
-    // (`num_workgroups * H * 4` bytes for the partial-sums buffer).
+    // Pre-walk to compute the max scratch any single op needs — see
+    // `compute_scratch_bytes` for the ops that claim a slice of the tail.
     let base_scratch_bytes = compute_scratch_bytes(&graph);
     // Reserve tail scratch for the im2col `col` matrix only when the opt-in
     // im2col+GEMM conv path is enabled (the default tiled/direct convs need
@@ -5220,15 +5219,28 @@ pub(crate) fn compile_static_inner(
                 let inner = in_shape[in_shape.len() - 1].unwrap_static() as u32;
                 let total: u32 = in_shape.iter().map(|d| d.unwrap_static() as u32).product();
                 let outer = total / inner.max(1);
-                // Greedy fast-path: temperature == 1.0 with no top_k/top_p
-                // is an argmax — same numeric result, much cheaper kernel.
-                let is_greedy =
-                    *top_k == 0 && (*top_p - 1.0).abs() < 1e-6 && (*temperature - 1.0).abs() < 1e-6;
+                // Greedy: the project's rule is `temperature <= 0` or `top_k == 1`.
+                // Those lower to a deterministic argmax (ties → lowest index);
+                // temperature == 1.0 is a real draw, NOT greedy.
+                let is_greedy = *temperature <= 0.0 || *top_k == 1;
+                // Sample indexes the arena with absolute offsets (logits, scratch, output)
+                // but binds only its output window, so it is only correct when the whole
+                // arena binds at base 0. Refuse loudly rather than read outside the window
+                // and return a plausible wrong token.
+                if !arena_binds_whole_at_zero(&dev.device, &arena) {
+                    panic!(
+                        "rlx-wgpu: Op::Sample needs the whole arena bound at base 0 \
+                         (arena {} bytes vs storage binding limit {}); its logits/scratch \
+                         offsets cannot be resolved in a sharded/split arena",
+                        arena.size,
+                        dev.device.limits().max_storage_buffer_binding_size
+                    );
+                }
                 if is_greedy {
                     let p = ArgmaxParams {
                         outer,
                         inner,
-                        in_off: (arena.offset(in_id) / 4) as u32,
+                        in_off: arena_local_off_f32(&arena, in_id, 0),
                         out_off: (arena.offset(node.id) / 4) as u32,
                         _p0: 0,
                         _p1: 0,
@@ -5245,14 +5257,15 @@ pub(crate) fn compile_static_inner(
                     let p = SampleParams {
                         outer,
                         inner,
-                        in_off: (arena.offset(in_id) / 4) as u32,
+                        in_off: arena_local_off_f32(&arena, in_id, 0),
                         out_off: (arena.offset(node.id) / 4) as u32,
                         top_k: *top_k as u32,
                         top_p_bits: top_p.to_bits(),
                         temp_bits: temperature.to_bits(),
                         seed_lo: *seed as u32,
                         seed_hi: (*seed >> 32) as u32,
-                        _p0: 0,
+                        // Per-row working area in the arena tail; sized by `compute_scratch_bytes`.
+                        scratch_off: (arena.scratch_off / 4) as u32,
                         _p1: 0,
                         _p2: 0,
                     };

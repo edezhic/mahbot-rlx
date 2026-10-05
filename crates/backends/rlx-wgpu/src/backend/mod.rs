@@ -20,8 +20,9 @@ use crate::buffer::{Arena, ReadbackStaging, TinyReadbackStaging};
 use crate::device::wgpu_device;
 use crate::kernels::{GatherParams, Kernel, gather_split_kernel, matmul_coop_f16_vulkan_kernel};
 /// Compute the maximum tail-scratch bytes any single op needs across
-/// the graph. Currently only `Op::LayerNormBackwardGamma` uses scratch
-/// — it stores `num_workgroups * H` f32 partial sums.
+/// the graph: `Op::LayerNormBackwardGamma`'s partial sums, norm staging,
+/// and `Op::Sample`'s per-row working area (it reads its logits and must
+/// not overwrite them).
 fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
     const ROWS_PER_WG: u32 = 16;
     let mut max_bytes = 0usize;
@@ -64,6 +65,18 @@ fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
             let bytes = (num_workgroups as usize) * h * 4;
             if bytes > max_bytes {
                 max_bytes = bytes;
+            }
+        }
+        // The sampling kernel needs a per-row working area and must not
+        // write its logits, so its intermediates live in the scratch zone.
+        if let rlx_ir::Op::Sample { .. } = &node.op {
+            if let Some(elems) = graph.node(node.inputs[0]).shape.num_elements()
+                && elems != 0
+            {
+                let bytes = elems * 4;
+                if bytes > max_bytes {
+                    max_bytes = bytes;
+                }
             }
         }
     }

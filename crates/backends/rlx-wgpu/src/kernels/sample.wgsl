@@ -7,16 +7,17 @@
 // 32k–50k — fast enough on a single SIMD lane for batch=1 inference).
 //
 // Algorithm:
-//   1. Scale logits by 1/temperature in place; track row max.
-//   2. Convert to probabilities (exp(x - max) / sum_exp). Probs land in
-//      the input slot — we clobber it. Sample's input is consumed.
+//   1. Scale logits by 1/temperature into the scratch slot; track row max.
+//   2. Convert to probabilities (exp(x - max) / sum_exp) in the scratch
+//      slot. The logits are read-only, as on CPU and Metal: nothing here
+//      clobbers the input, so every other consumer of the same logits
+//      still sees the original values.
 //   3. If top_k > 0 OR top_p < 1: do a serial selection-sort of the
 //      probabilities; for each pick mark as "selected" by storing the
 //      probability as a negative value. Stop when we've collected k
 //      tokens *and* cumulative ≥ top_p.
 //   4. Renormalize the selected set; zero the rest.
-//   5. Sample by cumsum + uniform-threshold using a per-row LCG seeded
-//      by `seed XOR row`.
+//   5. Sample by Gumbel-max over Threefry-2×32-20 noise (see below).
 
 struct Params {
     outer: u32,
@@ -28,7 +29,7 @@ struct Params {
     temp_bits: u32,    // bitcast<f32>
     seed_lo: u32,
     seed_hi: u32,
-    _p0: u32, _p1: u32, _p2: u32,
+    scratch_off: u32, _p1: u32, _p2: u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
@@ -112,27 +113,29 @@ fn sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
     let row = gid.x + gid.y * ngs.x * 64u;
     if (row >= params.outer) { return; }
     let base = params.in_off + row * params.inner;
+    let sbase = params.scratch_off + row * params.inner;
     let temp = bitcast<f32>(params.temp_bits);
     let top_p = bitcast<f32>(params.top_p_bits);
     let inv_temp = 1.0 / max(temp, 1e-6);
 
-    // 1. Apply temperature; track row max.
+    // 1. Apply temperature into scratch; track row max. The logits at
+    //    `base` stay read-only.
     var m: f32 = NEG_INF;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
         let v = arena[base + i] * inv_temp;
-        arena[base + i] = v;
+        arena[sbase + i] = v;
         m = max(m, v);
     }
-    // 2. exp / sum → probabilities.
+    // 2. exp / sum → probabilities (scratch slot).
     var sum_e: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-        let e = exp(arena[base + i] - m);
-        arena[base + i] = e;
+        let e = exp(arena[sbase + i] - m);
+        arena[sbase + i] = e;
         sum_e = sum_e + e;
     }
     let inv_sum = 1.0 / sum_e;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-        arena[base + i] = arena[base + i] * inv_sum;
+        arena[sbase + i] = arena[sbase + i] * inv_sum;
     }
 
     // 3. Top-K / Top-P filter via selection.
@@ -148,7 +151,7 @@ fn sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
             var best_i: u32 = 0u;
             var found: bool = false;
             for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-                let v = arena[base + i];
+                let v = arena[sbase + i];
                 if (v >= 0.0 && v > best_v) {
                     best_v = v;
                     best_i = i;
@@ -157,7 +160,7 @@ fn sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
             }
             if (!found) { break; }
             // Mark as selected by negating + sentinel offset.
-            arena[base + best_i] = -best_v - SENTINEL_EPS;
+            arena[sbase + best_i] = -best_v - SENTINEL_EPS;
             cum = cum + best_v;
             picked_count = picked_count + 1u;
             // Stop early if top-p satisfied AND we picked at least 1.
@@ -166,18 +169,18 @@ fn sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
         // Restore selected; zero unselected; sum for renormalization.
         var new_sum: f32 = 0.0;
         for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-            let v = arena[base + i];
+            let v = arena[sbase + i];
             if (v < 0.0) {
                 let restored = -v - SENTINEL_EPS;
-                arena[base + i] = restored;
+                arena[sbase + i] = restored;
                 new_sum = new_sum + restored;
             } else {
-                arena[base + i] = 0.0;
+                arena[sbase + i] = 0.0;
             }
         }
         let inv_new = 1.0 / max(new_sum, 1e-12);
         for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-            arena[base + i] = arena[base + i] * inv_new;
+            arena[sbase + i] = arena[sbase + i] * inv_new;
         }
     }
 
@@ -199,7 +202,7 @@ fn sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
     var best_score: f32 = NEG_INF;
     var picked: u32 = 0u;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-        let p = arena[base + i];
+        let p = arena[sbase + i];
         if (p <= 0.0) { continue; }   // filtered by top_k / top_p
         let ctr = vec2<u32>(row, i);
         let rng2 = threefry2x32_20(ctr, key);

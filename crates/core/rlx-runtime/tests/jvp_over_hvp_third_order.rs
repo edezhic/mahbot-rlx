@@ -5,11 +5,11 @@
 //! `jvp(hvp(f))` — forward-over-forward-over-reverse for a third derivative.
 //!
 //! `hvp` *is* a `jvp`, so its result already declares `tangent_<name>`. The
-//! outer `jvp` then declared a second leaf of that name, and a duplicate leaf
-//! name is not an error anywhere in the stack: binding resolves by name to a
-//! single node, so the second declaration was never bound, read zeros, and the
-//! third derivative came back exactly zero. `rlx_ir::verify_unique_leaf_names`
-//! is what surfaced it.
+//! outer `jvp` then declared a second leaf of that name, which compiled at the
+//! time: binding resolves by name to a single node, so the second declaration
+//! was never bound, read zeros, and the third derivative came back exactly
+//! zero. Such a graph is a hard compile failure now;
+//! `rlx_ir::verify_unique_leaf_names` is what surfaced it.
 //!
 //! The check is a scalar-per-element polynomial where every order is known in
 //! closed form, and it asserts the *second* order too — a fix that broke the

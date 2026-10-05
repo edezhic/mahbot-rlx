@@ -319,7 +319,10 @@ impl CompilePipeline {
     }
 
     /// Run fusion + cleanup passes on MIR, returning fusion diagnostics.
+    ///
+    /// Refuses duplicate leaf names first, before any pass can prune them.
     pub fn optimize_with_report(&self, mir: MirModule) -> (MirModule, FusionReport) {
+        Self::assert_unique_leaf_names(&mir);
         let need_fusion_diff = self.assert_fusion_clean || self.fusion_report;
         let before = need_fusion_diff.then(|| mir.as_graph().clone());
         // CUDA fuses conv+bias into `FusedConvBiasAct` (and folds convs into FK
@@ -440,7 +443,34 @@ impl CompilePipeline {
         self.plan_lir(MirModule::from_graph(bound))
     }
 
+    /// Refuse a graph whose leaf names are not unique.
+    ///
+    /// **Not debug-gated.** `set_param` / `run` bind by name and reach a single
+    /// node, so the second declaration is never fed: it reads zeros and every
+    /// value flowing through it vanishes — no error, just a wrong answer — and
+    /// the check is O(nodes). It runs before the passes as well as in
+    /// [`Self::finish`]: a duplicate nothing consumes would otherwise be pruned
+    /// by DCE before `finish` ever sees it, and a pass could introduce one after
+    /// the first check.
+    fn assert_unique_leaf_names(mir: &MirModule) {
+        let dup = rlx_ir::verify_unique_leaf_names(mir.as_graph());
+        if dup.is_empty() {
+            return;
+        }
+        let msg = dup
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        panic!(
+            "graph '{}' declares duplicate leaf names; binding is by name so only \
+             one declaration would ever be fed:\n  {msg}",
+            mir.name()
+        );
+    }
+
     fn finish(&self, mir: MirModule, fusion: FusionReport) -> CompileResult {
+        Self::assert_unique_leaf_names(&mir);
         debug_assert_graph!(mir.as_graph(), "pre-lir");
         if self.assert_fusion_clean && !fusion.missed.is_empty() {
             panic!(

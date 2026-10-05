@@ -22,6 +22,11 @@
 //! or `Op::Param`s can share a shape yet denote different values, so leaves are
 //! always kept distinct. Merging is bit-exact — the surviving node has identical
 //! op/inputs/shape, hence identical output.
+//!
+//! Nondeterministic ops ([`OpCaps::NONDETERMINISTIC`](rlx_ir::capability::OpCaps::NONDETERMINISTIC)
+//! — `Sample`, `RngNormal`, `RngUniform`) are never merged even when two copies
+//! are configured identically: each is an independent draw, and the capability
+//! table promises they are never CSE'd.
 
 use rlx_fusion::pass::Pass;
 use rlx_ir::{Graph, NodeId};
@@ -56,8 +61,11 @@ impl Pass for CommonSubexpressionElimination {
             let new_inputs: Vec<NodeId> = node.inputs.iter().map(|id| id_map[id]).collect();
 
             // Leaves (Input/Param/Constant/… — no inputs) are never merged: a shared
-            // shape does not make two inputs the same value.
-            if !new_inputs.is_empty() {
+            // shape does not make two inputs the same value. Nondeterministic ops are
+            // never merged either: two identically-configured draws are still two draws,
+            // and the capability table promises they are never CSE'd. Both fall through
+            // to the `else` branch below, which copies the node unconditionally.
+            if !new_inputs.is_empty() && !node.op.is_nondeterministic() {
                 let key = rlx_ir::node_value_key(&node.op, &new_inputs, &node.shape);
                 let existing = buckets.get(&key).and_then(|candidates| {
                     candidates.iter().copied().find(|&cand| {
@@ -144,6 +152,25 @@ mod tests {
         let out = CommonSubexpressionElimination.run(g);
         // a, b, add all survive.
         assert_eq!(out.nodes().len(), 3);
+    }
+
+    #[test]
+    fn keeps_nondeterministic_nodes() {
+        // Two identically-configured draws are still two independent draws, and
+        // `OpCaps::NONDETERMINISTIC` promises they are never CSE'd.
+        let mut g = Graph::new("draws");
+        let logits = g.input("logits", f32s(&[1, 8]));
+        let s0 = g.sample(logits, 0, 1.0, 1.0, 7, f32s(&[1]));
+        let s1 = g.sample(logits, 0, 1.0, 1.0, 7, f32s(&[1]));
+        g.set_outputs(vec![s0, s1]);
+
+        let out = CommonSubexpressionElimination.run(g);
+        let draws = out
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Sample { .. }))
+            .count();
+        assert_eq!(draws, 2, "CSE merged two nondeterministic Sample nodes");
     }
 }
 

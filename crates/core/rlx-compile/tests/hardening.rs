@@ -4,6 +4,7 @@
 // Integration tests — compiler hardening (pipeline snapshots + rewrite).
 
 use rlx_compile::{CompilePipeline, FusionTarget, inspect_pipeline, rewrite_for_backend};
+use rlx_ir::op::BinaryOp;
 use rlx_ir::{DType, Graph, GraphModule, Op, OpKind, Shape, verify::verify_all};
 
 fn f32_shape(d: &[usize]) -> Shape {
@@ -84,4 +85,39 @@ fn rewrite_unfuses_for_strict_backend() {
             .iter()
             .any(|n| matches!(n.op, Op::FusedMatMulBiasAct { .. }))
     );
+}
+
+/// A duplicate `Op::Input` name is fatal on the release path too: the pipeline
+/// checks it unconditionally, not only under `debug_assertions`. Both
+/// declarations are consumed, i.e. this is the *live* duplicate — the one whose
+/// second copy would otherwise be fed to nothing.
+///
+/// `expected = "duplicate"` rather than `"duplicate leaf names"` because in a
+/// debug build the HIR verifier can fire first (it reads `verify`, which now
+/// includes `verify_unique_leaf_names`) with `duplicate Input name …` rather
+/// than the pipeline's `… declares duplicate leaf names …`. Both refuse, and
+/// this pins the refusal in either profile.
+#[test]
+#[should_panic(expected = "duplicate")]
+fn duplicate_input_name_is_refused_by_the_pipeline() {
+    let mut g = Graph::new("dup-input");
+    let a = g.input("x", f32_shape(&[2]));
+    let b = g.input("x", f32_shape(&[2]));
+    let sum = g.binary(BinaryOp::Add, a, b, f32_shape(&[2]));
+    g.set_outputs(vec![sum]);
+    CompilePipeline::new(FusionTarget::Cpu).compile_graph(g);
+}
+
+/// The dead half of the same rule: the second declaration is consumed by
+/// nothing, so DCE would prune it and a post-pass check would never see it.
+/// The refusal has to happen before the passes, and this is what pins that.
+#[test]
+#[should_panic(expected = "duplicate")]
+fn duplicate_dead_leaf_name_is_refused_by_the_pipeline() {
+    let mut g = Graph::new("dup-dead");
+    let x = g.input("x", f32_shape(&[2]));
+    let _unused = g.input("x", f32_shape(&[2]));
+    let y = g.activation(rlx_ir::op::Activation::Relu, x, f32_shape(&[2]));
+    g.set_outputs(vec![y]);
+    CompilePipeline::new(FusionTarget::Cpu).compile_graph(g);
 }

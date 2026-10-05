@@ -121,7 +121,8 @@ impl Graph {
     }
 
     /// Fused sample: logits → token id (one f32-encoded id per row).
-    /// `output_shape` should be `[batch]` (one id per logit row).
+    /// `output_shape` should be `[batch]` (one id per logit row). The
+    /// `logits` operand is read-only.
     pub fn sample(
         &mut self,
         logits: NodeId,
