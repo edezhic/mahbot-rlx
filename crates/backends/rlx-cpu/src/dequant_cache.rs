@@ -250,14 +250,22 @@ static THRASH_PURGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// so entries are evicted before they are ever reused and every lookup pays a
 /// full re-dequant.
 ///
-/// True once cumulative evictions exceed the budget itself, i.e. we have churned
-/// more than one whole cache — a model whose f32 form fits never trips this.
+/// True once cumulative evictions exceed a quarter of the budget — a model whose
+/// f32 form fits never evicts at all, so this cannot misfire on one.
 ///
-/// Callers use it to route around the cache. Measured on Muse-Glimmer-30B
-/// UD-Q4_K_XL (27.85B params ⇒ ~111 GB of f32 against a 15 GB budget): a
-/// decode-shaped `m = 1` forward took 43.1 s cached-and-thrashing vs 0.76 s on
-/// the fused int8 path — 57x. Repeat passes showed 43.1 / 43.2 / 43.5 s, i.e.
-/// the cache never paid for itself at all.
+/// Callers use it to skip the cache, and neither needs the threshold to be exact
+/// — both only need "thrashing" to separate a working set that fits from one that
+/// does not. `prefer_cached_blas` diverts the routes whose fused arm leaves the
+/// numerics alone, where the fused route does the same total dequant work without
+/// the bookkeeping. `gguf_weight_f32` skips insertion, where the slab would be
+/// evicted before reuse and all that would be paid for is a write lock and an
+/// eviction scan.
+///
+/// A quarter was picked on Muse-Glimmer-30B UD-Q4_K_XL (27.85B params ⇒ ~111 GB
+/// of f32 against a 15 GB budget), where detecting sooner cut TTFT. The `m = 1`
+/// diversion that measurement was taken on is gone — its fused arm quantized the
+/// activation — so treat the figure as provenance for the constant rather than as
+/// a measurement of today's routes.
 pub fn cache_thrashing() -> bool {
     match max_cache_bytes() {
         // Trip at a QUARTER of the budget rather than a full one. Everything
@@ -401,10 +409,11 @@ pub fn gguf_weight_f32(
     let bytes = std::mem::size_of_val(&dense[..]);
     let arc: Arc<[f32]> = Arc::from(dense.into_boxed_slice());
     // Once thrashing, inserting is strictly negative-value: the slab is evicted
-    // before it can be reused, and we pay a write-lock plus an eviction scan on
-    // every miss. Hand the caller its dequant and skip the bookkeeping. The
-    // GEMV path avoids this entirely (see `prefer_cached_blas`); this keeps GEMM
-    // prefill, which still wants dequant+BLAS, from paying cache overhead too.
+    // before it can be reused, and all that would be paid for is a write lock and
+    // an eviction scan on every miss. Hand the caller its dequant and skip the
+    // bookkeeping. `prefer_cached_blas` routes around this cache for the same
+    // reason; the one route it keeps here — a Q4_K single-row GEMV — re-dequantizes
+    // per call either way.
     if cache_thrashing() {
         // First time we notice, drop everything already cached: those slabs will
         // never be reused (that is what thrashing means) and they are holding the

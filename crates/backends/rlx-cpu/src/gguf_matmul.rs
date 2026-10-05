@@ -291,9 +291,9 @@ const CACHED_BLAS_MIN_WEIGHT_ELEMS: usize = 32 * 32;
 /// path and flips occasional near-tie greedy tokens — rlx keeps decode on f32
 /// for fidelity (and decode↔prefill parity) by default. Set
 /// `RLX_Q4K_FUSED_MIN_N=4096` (or another crossover) to trade that for speed.
-/// Route Q4_K decode GEMVs through the exact f32-activation kernel instead of
-/// the Q8_K one (`RLX_Q4K_EXACT_GEMV=1`). Costs ALU, keeps decode numerics
-/// independent of whether the f32 dequant cache happened to fit.
+/// Route Q4_K decode GEMVs through the exact f32-activation kernel
+/// ([`q4k_exact_gemv_rows`]) instead of the Q8_K one (`RLX_Q4K_EXACT_GEMV=1`).
+/// Costs ALU: ~0.6x the cached-f32-BLAS route, ~2–2.8x the cache-off one.
 fn q4k_exact_gemv() -> bool {
     rlx_ir::env::flag("RLX_Q4K_EXACT_GEMV")
 }
@@ -304,27 +304,27 @@ fn q4k_fused_decode_min_n() -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// Whether the fused `m == 1` arm quantizes the activation, i.e. whether
+/// diverting a single-row GEMV to it for speed would change the answer. Only
+/// Q4_K's arm does (to Q8_K); every other scheme runs
+/// `gguf_matmul_bt_m1_rows_generic` over f32 activations.
+fn fused_m1_quantizes_activation(scheme: QuantScheme) -> bool {
+    scheme == QuantScheme::GgufQ4K
+}
+
 #[inline]
-fn prefer_cached_blas(k: usize, n: usize, m: usize) -> bool {
+fn prefer_cached_blas(k: usize, n: usize, m: usize, scheme: QuantScheme) -> bool {
     if gguf_matmul_use_legacy() {
         return false;
     }
-    // GEMV (decode) against a THRASHING dequant cache is the worst case: the
-    // slab is evicted before it is reused, so every token re-dequantizes the
-    // whole model AND churns allocations, while the fused int8 kernel reads the
-    // packed bytes in place. Measured on Muse-Glimmer-30B UD-Q4_K_XL (f32 form
-    // ~111 GB vs a 15 GB budget): 43.1 s/token cached vs 0.76 s fused — 57x.
-    //
-    // Only `m == 1` is diverted. For `m > 1` the cached path amortizes ONE
-    // dequant across all rows and hands the work to BLAS, which still wins even
-    // while thrashing (5-token prefill: 61 s cached vs 111 s fused). A model
-    // whose f32 form fits the budget never evicts, so `cache_thrashing()` stays
-    // false and this is inert.
-    // Extended to m > 1 as well: with the row-parallel generic GEMM below, the
-    // fused path no longer loses to BLAS once "cached" means re-dequantizing the
-    // whole model on every call plus allocator churn. Both do the same total
-    // dequant work; only the fused one skips the cache bookkeeping.
-    if crate::dequant_cache::cache_thrashing() {
+    // Cache pressure skips the cache for every route whose fused arm leaves the
+    // numerics alone — `m > 1`'s generic GEMM, and every single-row scheme but
+    // Q4_K. There the two routes do the same total dequant work and the fused one
+    // skips the bookkeeping. Q4_K's GEMV keeps the cached route whatever the
+    // budget does: `cache_thrashing()` is monotone process state that never
+    // reverts, and its fused arm would quantize the activation.
+    if crate::dequant_cache::cache_thrashing() && (m > 1 || !fused_m1_quantizes_activation(scheme))
+    {
         return false;
     }
     m > 1 || k.saturating_mul(n) >= CACHED_BLAS_MIN_WEIGHT_ELEMS
@@ -367,6 +367,18 @@ pub fn gguf_matmul_bt_cached(
     scheme: QuantScheme,
     _w_off: usize,
 ) {
+    assert_eq!(x.len(), m * k);
+    assert_eq!(out.len(), m * n);
+    // No linked BLAS: the portable gemm is slower than the fused kernel, so the
+    // fused path is the right default here — and the same schemes are admitted to
+    // it as in the BLAS build. Only a single-row scheme whose fused arm quantizes
+    // the activation (`fused_m1_quantizes_activation`) needs a substitute, and it
+    // gets the exact packed kernel rather than a materialized copy: no f32 slab,
+    // no dequant cache, no Q8_K activation. Shape decides that, never the budget.
+    if m == 1 && fused_m1_quantizes_activation(scheme) && k.is_multiple_of(QK_K) {
+        q4k_exact_gemv_rows(x, w_bytes, out, k);
+        return;
+    }
     gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
 }
 
@@ -415,7 +427,7 @@ pub fn gguf_matmul_bt_dispatch_at(
         gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
         return;
     }
-    if prefer_cached_blas(k, n, m) {
+    if prefer_cached_blas(k, n, m, scheme) {
         gguf_matmul_bt_cached(x, w_bytes, out, m, k, n, scheme, w_off);
     } else {
         gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
@@ -981,53 +993,14 @@ fn gguf_matmul_bt_m1_parallel(
             let blocks_per_row = k / QK_K;
             let row_bytes = blocks_per_row * rlx_gguf::Q4K_BLOCK_BYTES;
             debug_assert_eq!(n * row_bytes, w_bytes.len().min(n * row_bytes));
-            // Exact arm: dequantize each super-block to f32 on the fly and dot
-            // against the *unquantized* activation. Fills the gap between the
-            // two pre-existing options — cached-f32-BLAS is exact but
-            // materializes the whole matrix as f32 (8.6x the checkpoint on
-            // LFM2.5-2.6B), while the Q8_K path reads packed bytes in place but
-            // perturbs the activation. This one reads packed bytes in place and
-            // keeps the activation in f32, trading ALU for both.
-            //
-            // It matters most where the f32 cache does *not* fit: without it,
-            // memory pressure silently downgrades decode numerics, because
-            // `prefer_cached_blas` diverts `m == 1` to the Q8_K kernel as soon
-            // as `cache_thrashing()` trips.
-            //
-            // Measured on LFM2 (arms alternated in one process, min-of-4),
-            // against the two exact options that already existed:
-            //
-            // | exact path | 350M | 2.6B |
-            // |---|---|---|
-            // | cached-f32-BLAS      | 36.0 tok/s | 9.0 tok/s |
-            // | `RLX_DEQUANT_CACHE=0`|  12.0      | 1.8       |
-            // | this kernel          |  23.8      | 5.1       |
-            //
-            // So it does not beat the f32 cache when the cache fits — it is
-            // 2.8x the throughput of the only other exact option when it does
-            // not. `decode_parity_live` passes on 350M and 2.6B with this arm
-            // enabled, and fails with the Q8_K arm.
-            //
-            // NOT established: its effect on RSS. Routing is adaptive
-            // (`cache_thrashing()` is accumulated runtime state), so per-arm
-            // peak-RSS measurements are path-dependent and did not hold still
-            // across flag combinations — including one standing oddity that
-            // reproduces without this kernel, where lowering
-            // `RLX_Q4K_FUSED_MIN_N` from 2048 to 1 *raised* 2.6B RSS from
-            // 5.17 GB to 14.46 GB when it should have lowered it.
+            // A Q4_K decode GEMV reaches this branch only on a tile wide enough
+            // and a pool threaded enough for `gguf_matmul_bt_ex` to choose it, and
+            // only when the fused path is taken on purpose: `RLX_Q4K_FUSED_MIN_N`,
+            // `RLX_GGUF_MATMUL_LEGACY`, or a caller that calls `gguf_matmul_bt`
+            // directly instead of going through the dispatch. There
+            // `RLX_Q4K_EXACT_GEMV` picks the exact kernel over the Q8_K one.
             if q4k_exact_gemv() {
-                let bb = rlx_gguf::Q4K_BLOCK_BYTES;
-                out.par_iter_mut().enumerate().for_each(|(j, slot)| {
-                    let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
-                    let mut acc = 0f32;
-                    for b in 0..blocks_per_row {
-                        acc += rlx_gguf::q4_k_dot_f32(
-                            &row[b * bb..(b + 1) * bb],
-                            &x_row[b * QK_K..(b + 1) * QK_K],
-                        );
-                    }
-                    *slot = acc;
-                });
+                q4k_exact_gemv_rows(x_row, w_bytes, out, k);
                 return;
             }
             let mut x_q8 = vec![0u8; blocks_per_row * rlx_gguf::Q8K_BLOCK_BYTES];
@@ -1103,6 +1076,65 @@ fn gguf_matmul_bt_m1_parallel(
                 },
             );
         out.copy_from_slice(&partial);
+    }
+}
+
+/// One Q4_K row of an exact decode GEMV: each super-block dequantized on the fly
+/// and dotted against the *unquantized* activation.
+#[inline]
+fn q4k_exact_row_dot(x_row: &[f32], row: &[u8], blocks_per_row: usize) -> f32 {
+    let bb = rlx_gguf::Q4K_BLOCK_BYTES;
+    let mut acc = 0f32;
+    for b in 0..blocks_per_row {
+        acc += rlx_gguf::q4_k_dot_f32(&row[b * bb..(b + 1) * bb], &x_row[b * QK_K..(b + 1) * QK_K]);
+    }
+    acc
+}
+
+/// Exact Q4_K decode GEMV (`m == 1`, `k` a multiple of [`QK_K`]) — row-parallel,
+/// packed bytes read in place, activation kept in f32.
+///
+/// Fills the gap between the two pre-existing options: cached-f32-BLAS is exact
+/// but materializes the whole matrix as f32 (8.6x the checkpoint on
+/// LFM2.5-2.6B), while the Q8_K path reads packed bytes in place but perturbs the
+/// activation. This one trades ALU for both.
+///
+/// Measured on LFM2 (arms alternated in one process, min-of-4), against the two
+/// exact options that already existed:
+///
+/// | exact path | 350M | 2.6B |
+/// |---|---|---|
+/// | cached-f32-BLAS      | 36.0 tok/s | 9.0 tok/s |
+/// | `RLX_DEQUANT_CACHE=0`|  12.0      | 1.8       |
+/// | this kernel          |  23.8      | 5.1       |
+///
+/// So it does not beat the f32 cache when the cache fits — it is 2.8x the
+/// throughput of the only other exact option when it does not. `decode_parity_live`
+/// passes on 350M and 2.6B with this arm enabled, and fails with the Q8_K arm.
+///
+/// NOT established: its effect on RSS. Routing is adaptive (`cache_thrashing()` is
+/// accumulated runtime state), so per-arm peak-RSS measurements are path-dependent
+/// and did not hold still across flag combinations — including one standing oddity
+/// that reproduces without this kernel, where lowering `RLX_Q4K_FUSED_MIN_N` from
+/// 2048 to 1 *raised* 2.6B RSS from 5.17 GB to 14.46 GB when it should have
+/// lowered it.
+fn q4k_exact_gemv_rows(x_row: &[f32], w_bytes: &[u8], out: &mut [f32], k: usize) {
+    let blocks_per_row = k / QK_K;
+    let row_bytes = blocks_per_row * rlx_gguf::Q4K_BLOCK_BYTES;
+    debug_assert!(w_bytes.len() >= out.len() * row_bytes);
+    let row = |j: usize| &w_bytes[j * row_bytes..(j + 1) * row_bytes];
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        out.par_iter_mut()
+            .enumerate()
+            .for_each(|(j, slot)| *slot = q4k_exact_row_dot(x_row, row(j), blocks_per_row));
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        for (j, slot) in out.iter_mut().enumerate() {
+            *slot = q4k_exact_row_dot(x_row, row(j), blocks_per_row);
+        }
     }
 }
 
@@ -1609,13 +1641,11 @@ mod tests {
         let exact = run(true);
         rlx_ir::env::unset("RLX_Q4K_EXACT_GEMV");
 
-        // Reference: dequantize the packed weights to f32 and dot them in f64.
-        // Deliberately NOT `gguf_matmul_bt_cached` — that is only a dequant+BLAS
-        // reference when a BLAS is linked; under `not(rlx_cpu_blas)` it forwards
-        // straight to `gguf_matmul_bt`, i.e. to the q8 arm being measured, so
-        // `e_q8` came out exactly 0 and the comparison could never hold. An
-        // independent f64 oracle is the right reference in either build, and it
-        // is a stricter one even where BLAS exists.
+        // Reference: dequantize the packed weights to f32 and dot them in f64 —
+        // an independent oracle, and the same one in BLAS and no-BLAS builds.
+        // Deliberately NOT `gguf_matmul_bt_cached`: it shares its dequant with
+        // the exact arm, so it cannot catch a dequant error, and it carries no
+        // accuracy claim of its own — which is the whole question here.
         clear_dequant_cache();
         let w_f32 = crate::dequant_cache::gguf_weight_f32(0, &packed, k, n, QuantScheme::GgufQ4K);
         let reference: Vec<f32> = (0..n)
