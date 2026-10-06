@@ -776,12 +776,17 @@ impl Arena {
                 || rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS")
                 || !crate::device::coop_discrete_backend());
         let f16_buffer = if want_f16 {
-            let f16_size = if size <= max_binding && shard_size == 0 {
-                f16_shadow_arena_size(&plan)
-            } else {
-                // Sharded / huge arenas: keep a single-window f16 mirror.
-                max_binding.min(shard_cap.max(max_binding))
-            };
+            // Never larger than the f16 image of the plan itself. The mirror is
+            // addressed by logical offset / 2, so a plan-sized buffer holds every
+            // range a binding can legitimately ask for, and `f16_shadow_bind_range`
+            // clamps whatever a caller asks for to the buffer it actually got.
+            //
+            // A fixed single-window mirror at the device's binding limit (about
+            // 4 GiB on Metal) allocated that much on *every* compile, so a run
+            // that striped the graph — any small `RLX_WGPU_SHARD_CAP_MIB` turns
+            // every graph into stripes — wired multiple GiB per compile, starved
+            // the machine of memory and took the OS down with a watchdog panic.
+            let f16_size = f16_shadow_arena_size(&plan).min(max_binding);
             Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rlx-wgpu arena f16"),
                 size: f16_size.max(256) as u64,
