@@ -10,6 +10,7 @@
 use std::time::Instant;
 
 #[test]
+#[ignore = "measurement, not a correctness check; run with --ignored --nocapture for the us/dispatch numbers"]
 fn coop16_vs_f32_matmul_perf() {
     let dev = match rlx_wgpu::device::wgpu_device() {
         Some(d) => d,

@@ -1608,10 +1608,12 @@ mod tests {
     /// cached BLAS than the Q8_K arm does — that is its whole reason to exist.
     /// Asserting it is *tighter than* the Q8_K arm, rather than a fixed epsilon,
     /// keeps the test meaningful if either kernel is retuned.
+    ///
+    /// Sets the process-global `RLX_Q4K_EXACT_GEMV` override, which
+    /// `cached_blas_matches_fused_q4k_decode` in this binary may observe.
     #[test]
     fn exact_q4k_decode_gemv_beats_the_q8k_arm_on_accuracy() {
-        use crate::dequant_cache::{cache_tests_lock, clear_dequant_cache};
-        let _serial = cache_tests_lock();
+        use crate::dequant_cache::clear_dequant_cache;
         let k = 512;
         let n = 96;
         // Heavy-tailed weights and activations: Q8_K's per-256-block absmax
@@ -1682,8 +1684,7 @@ mod tests {
 
     #[test]
     fn cached_blas_matches_fused_q4k_decode() {
-        use crate::dequant_cache::{cache_tests_lock, clear_dequant_cache};
-        let _serial = cache_tests_lock();
+        use crate::dequant_cache::clear_dequant_cache;
         clear_dequant_cache();
         let k = 256;
         let n = 64;
@@ -1781,8 +1782,7 @@ mod tests {
     #[test]
     #[ignore = "manual kernel timing"]
     fn q4k_int8_vs_cached_blas() {
-        use crate::dequant_cache::{cache_tests_lock, clear_dequant_cache};
-        let _serial = cache_tests_lock();
+        use crate::dequant_cache::clear_dequant_cache;
         use std::time::Instant;
         let time = |label: &str, f: &mut dyn FnMut()| {
             for _ in 0..3 {
@@ -1825,8 +1825,7 @@ mod tests {
 
     #[test]
     fn dispatch_matches_legacy_q8k_prefill() {
-        use crate::dequant_cache::{cache_tests_lock, clear_dequant_cache};
-        let _serial = cache_tests_lock();
+        use crate::dequant_cache::clear_dequant_cache;
         clear_dequant_cache();
         let k = 256;
         let n = 4;

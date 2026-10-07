@@ -16,7 +16,7 @@
 //! ~400 MB of weight traffic. Reported figure is the **min** over iterations —
 //! the uncontended cost, which is what a kernel change moves.
 //!
-//! Run: `cargo test -p rlx-metal --test gemv_bandwidth -- --nocapture`
+//! Run: `cargo test -p rlx-metal --test gemv_bandwidth -- --ignored --nocapture`
 
 #![cfg(target_os = "macos")]
 
@@ -97,6 +97,7 @@ fn bench(label: &str, n: usize, ggml: rlx_gguf::GgmlType, scheme: QuantScheme) {
 }
 
 #[test]
+#[ignore = "measurement, not a correctness check; run with --ignored --nocapture for the GB/s numbers"]
 fn packed_gemv_achieved_bandwidth() {
     println!("\nDecode GEMV bandwidth, m=1, K={K}  (M4 Pro peak ~273 GB/s)");
     for n in [N_WIDE, N_NARROW] {

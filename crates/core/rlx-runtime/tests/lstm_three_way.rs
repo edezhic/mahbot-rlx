@@ -13,6 +13,11 @@
 //! enable both backends at once:
 //!
 //!     cargo test -p rlx-runtime --test lstm_three_way --features metal,gpu -- --nocapture
+//!     cargo test -p rlx-runtime --test lstm_three_way --features metal,gpu -- --ignored --nocapture
+//!
+//! The first runs the tests that stay in the default run — they print a verdict
+//! and assert nothing; the second adds the three `#[ignore]`d print-only
+//! diagnostics in this file.
 
 #![cfg(any(feature = "metal", feature = "gpu", feature = "cuda", feature = "rocm"))]
 
@@ -48,6 +53,7 @@ fn fill(n: usize, seed: u64, scale: f32) -> Vec<f32> {
 /// correctly.
 #[cfg(all(feature = "metal", feature = "gpu"))]
 #[test]
+#[ignore = "diagnostic: prints whether wgpu breaks the CPU-vs-Metal tie; asserts nothing — run with --ignored --nocapture"]
 fn a_third_backend_breaks_the_cpu_vs_metal_tie() {
     let _gpu = common::serialize_gpu();
     if common::skip_unless_available(Device::Metal, "metal") {
@@ -158,6 +164,7 @@ fn reference_f64(s: usize, h: usize, x: &[f32]) -> Vec<f32> {
 
 #[cfg(feature = "metal")]
 #[test]
+#[ignore = "diagnostic: prints which of CPU/Metal the f64 reference agrees with; asserts nothing — run with --ignored --nocapture"]
 fn an_independent_f64_reference_says_who_is_right() {
     let _gpu = common::serialize_gpu();
     if common::skip_unless_available(Device::Metal, "metal") {
@@ -196,6 +203,7 @@ fn an_independent_f64_reference_says_who_is_right() {
 /// signature.
 #[cfg(feature = "metal")]
 #[test]
+#[ignore = "diagnostic: prints whether GRU/RNN share the wide-hidden LSTM defect; asserts nothing — run with --ignored --nocapture"]
 fn gru_and_rnn_are_checked_for_the_same_wide_hidden_defect() {
     let _gpu = common::serialize_gpu();
     if common::skip_unless_available(Device::Metal, "metal") {
