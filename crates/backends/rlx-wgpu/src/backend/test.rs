@@ -93,4 +93,38 @@ impl WgpuExecutable {
     pub fn test_step_names(&self) -> Vec<&'static str> {
         self.schedule.iter().map(step_name).collect()
     }
+
+    /// Test hook: the windowed bind path an absolute-offset arm uses, against this
+    /// executable's own arena. It panics exactly as the real path does, so a test can
+    /// pin the net under `lower::should_host_at_ceiling` for a geometry the routing
+    /// rule exists to keep such arms away from. That test pins a shrunken ceiling —
+    /// a process-global switch — so it runs in its own file/process, not next to the
+    /// process-global device here.
+    ///
+    /// The `kernel` argument only supplies a bind-group layout to refuse against; the
+    /// callers pass `cumsum_kernel` for that reason and the graph they built computes
+    /// something else entirely.
+    #[doc(hidden)]
+    pub fn test_windowed_bind_for_nodes(
+        &self,
+        device: &wgpu::Device,
+        kernel: &Kernel,
+        ids: &[NodeId],
+    ) -> wgpu::BindGroup {
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rlx-wgpu test windowed bind"),
+            size: 256,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        bind_op_window(device, kernel, &self.arena, ids, &params)
+    }
+
+    /// Test hook: the `(base, size)` window `bind_op_window` would bind for `ids`,
+    /// so a test can pin the base it starts at rather than infer it from the
+    /// refusal message.
+    #[doc(hidden)]
+    pub fn test_window_for_nodes(&self, device: &wgpu::Device, ids: &[NodeId]) -> (u64, u64) {
+        arena_window_for_nodes(device, &self.arena, ids)
+    }
 }

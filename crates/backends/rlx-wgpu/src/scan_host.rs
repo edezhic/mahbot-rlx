@@ -31,6 +31,74 @@ pub fn run_host_op(arena: &Arena, device: &wgpu::Device, queue: &wgpu::Queue, de
     run_host_op_with_cache(arena, device, queue, desc, None);
 }
 
+/// The bound every operand read of the generic host route is checked against, at the
+/// one runner the route stages through.
+///
+/// Every host step carries its operands as `(offset, shape)`, and the read
+/// `rlx_gpu_host` makes of each is [`crate::buffer::unstageable_reason`]'s question,
+/// asked with the bytes the arena's record holds for that operand's storage: the plan's
+/// slot where a *parameter's* storage is in the activation arena, the weight buffer's own
+/// sizing where it is parked. An operand that is not a parameter's storage — an
+/// activation — is left alone: its slot holds one f32 lane per element by construction.
+///
+/// This is one of the two places "the read never runs past the operand" is held, and the
+/// one for the sites that reach the route without a plan-time check
+/// (`lower::assert_host_route_stageable` runs only for the ops the ceiling rule hands
+/// over): an op with no GPU kernel, a non-contiguous reduce, a non-last-axis softmax. The
+/// other is [`assert_read_fits`], which covers the structural hosts.
+///
+/// [`run_scan`] and [`run_indexing`] are covered by neither, by design rather than by
+/// oversight: `rlx_gpu_host` stages each as one span over every operand, and
+/// `run_indexing` may mirror the whole arena. No case has been established in which a
+/// parameter narrower than four bytes per element reaches either.
+fn assert_host_reads_fit(arena: &Arena, op: rlx_ir::OpKind, inputs: &[(usize, rlx_ir::Shape)]) {
+    let operands = inputs
+        .iter()
+        .map(|(off, shape)| ((), *off, shape.dtype(), shape.num_elements().unwrap_or(0)));
+    if let Some(((), off, dtype, reason)) =
+        crate::buffer::first_unstageable_operand(arena, operands)
+    {
+        crate::buffer::refuse_unstageable_operand(
+            op,
+            &format!("at {off:#x}, {}", crate::buffer::operand_location(off)),
+            Some(dtype),
+            reason,
+        );
+    }
+}
+
+/// The same question asked by a structural host step (Expand / Narrow / Transpose /
+/// Concat), which reads one f32 lane per element but knows only its operands' byte
+/// offsets and element counts — not their declared encodings ([`assert_host_reads_fit`]'s
+/// `Shape`s come from a `HostOpDesc` these steps do not carry).
+///
+/// So this is the slot half of [`crate::buffer::unstageable_reason`] alone: `4 * elems`
+/// bytes against what the arena's record holds at `off`, which is exactly the read these
+/// steps make and exactly the flat plan's native slot for a two-byte parameter. The
+/// encoding half — a raw `U8`/`I8`/`BF16` parameter, or one declared wider than a lane —
+/// these steps cannot ask, because a descriptor here carries no operand encoding; where
+/// such an operand reaches a route that does carry its shape,
+/// `lower::assert_host_route_stageable` and [`assert_host_reads_fit`] refuse it, and none
+/// has been established at a structural step.
+///
+/// What they *cannot ask* is not what they may *name*: the refusal reads the operand's
+/// declared encoding out of the same record the bound came from
+/// ([`crate::buffer::ParamStorage::dtype`]) rather than from a stand-in, and stays silent
+/// about the encoding where the record cannot attribute one to that offset.
+fn assert_read_fits(arena: &Arena, op: rlx_ir::OpKind, off: usize, elems: usize) {
+    let Some(storage) = arena.param_storage_at(off) else {
+        return;
+    };
+    if elems.saturating_mul(4) > storage.bytes {
+        crate::buffer::refuse_unstageable_operand(
+            op,
+            &format!("at {off:#x}, {}", crate::buffer::operand_location(off)),
+            storage.dtype,
+            crate::buffer::Unstageable::SlotTooNarrow,
+        );
+    }
+}
+
 pub fn run_host_op_with_cache(
     arena: &Arena,
     device: &wgpu::Device,
@@ -38,6 +106,7 @@ pub fn run_host_op_with_cache(
     desc: &HostOpDesc,
     cache: Option<&mut HostTensorCache>,
 ) {
+    assert_host_reads_fit(arena, desc.op.kind(), &desc.inputs);
     let mut a = WgpuArena {
         arena,
         device,
@@ -240,6 +309,7 @@ pub fn run_concat_host_pieces_cached(
         Vec::new()
     };
     for (i, &(src_off, axis_len, numel)) in inputs.iter().enumerate() {
+        assert_read_fits(arena, rlx_ir::OpKind::Concat, src_off, numel as usize);
         let copy_per_row = (axis_len as usize).saturating_mul(inner);
         let dst_col_off = (starts[i] as usize).saturating_mul(inner);
         let src = if use_cache {
@@ -354,6 +424,7 @@ pub fn run_expand_host_cached(
         // arena untouched, which is what an empty output means.
         return;
     }
+    assert_read_fits(arena, rlx_ir::OpKind::Expand, in_byte_off, in_elems);
     let mut a = WgpuArena {
         arena,
         device,
@@ -430,6 +501,7 @@ pub fn run_transpose_host_cached(
     let out_elems = out_dims
         .iter()
         .fold(1usize, |n, &d| n.saturating_mul(d as usize));
+    assert_read_fits(arena, rlx_ir::OpKind::Transpose, in_byte_off, in_elems);
     let mut a = WgpuArena {
         arena,
         device,
@@ -504,6 +576,12 @@ pub fn run_narrow_host_cached(
     assert!(start.saturating_add(axis_out_size) <= axis_in_size);
     let in_row = axis_in_size.saturating_mul(inner);
     let out_row = axis_out_size.saturating_mul(inner);
+    assert_read_fits(
+        arena,
+        rlx_ir::OpKind::Narrow,
+        in_byte_off,
+        outer.saturating_mul(in_row),
+    );
     let mut a = WgpuArena {
         arena,
         device,

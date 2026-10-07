@@ -12,8 +12,8 @@
 //! Everything here is an IN-ARENA weight: the executable only moves a param into
 //! the separate packed-weight buffer when the *plan* exceeds the device binding
 //! limit (4 GiB of packed weights on this hardware), which no small test reaches —
-//! `RLX_WGPU_ALL_PARAMS_WEIGHT=1` is consulted inside that split, so it does not
-//! force it. `gguf_gemm_parked_weight.rs` drives the split arena directly instead.
+//! `RLX_WGPU_ALL_PARAMS_WEIGHT=1` would force the split, but nothing in this file
+//! sets it. `gguf_gemm_parked_weight.rs` drives the split arena directly instead.
 //! The `RLX_WGPU_MAX_BIND_MB` cases below drive the window/chunk arithmetic: a
 //! weight *window* over the binding limit must be N-chunked, and no chunk window
 //! may be sized from the weight's position relative to offset 0.

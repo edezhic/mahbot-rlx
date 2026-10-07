@@ -103,6 +103,25 @@ fn f16_shadow_arena_size(plan: &MemoryPlan) -> usize {
 /// 64 on discrete wgpu so long-wave plans do not snap into multi-×4 GiB OOM).
 pub const SHARD_STAGE_RESERVE: usize = 768 * 1024 * 1024;
 
+/// Upper bound on how many stripes one arena may be split into.
+///
+/// Striping exists to get past `max_buffer_size`, so an adapter on its real
+/// limits produces a handful of stripes — `size / max_buffer_size`. The lever
+/// that makes the striping path testable, `RLX_WGPU_SHARD_CAP_MIB`, can instead
+/// ask for thousands: a 4 GiB arena at a 1 MiB cap is 4096 buffers. That geometry
+/// does not make the graph run — it multiplies bind windows, staging copies and
+/// shader compilations until the host cannot keep up. Measured on one host: the
+/// watchdog hung five times in a day while this backend's suite was run under a
+/// few-MiB cap plus the sharding levers, every crash report showing that suite's
+/// test binary alive with several Metal shader compilers.
+///
+/// So the count is bounded at the decision point, before the buffers it bounds
+/// are created — the activation arena's own, and the parked weight buffer's (the
+/// latter after the activation arena exists, but before any weight buffer does).
+/// Tens of stripes stay usable (a 4 MiB cap on a 76 MiB arena is 19); a cap that
+/// would explode the geometry is refused loudly and cheaply instead.
+pub const MAX_SHARDS: usize = 64;
+
 /// Effective stage reserve (see [`SHARD_STAGE_RESERVE`]).
 pub fn shard_stage_reserve() -> usize {
     if let Some(raw) = rlx_ir::env::var("RLX_WGPU_SHARD_STAGE_MIB") {
@@ -129,6 +148,10 @@ pub fn shard_stage_reserve() -> usize {
 ///
 /// Clamped to the device limit: this can only make shards SMALLER, so it can
 /// never be used to exceed what the adapter actually supports.
+///
+/// How far it may be lowered is bounded by [`MAX_SHARDS`]: a cap that would split
+/// an arena into more stripes than that is refused at plan time — before the
+/// buffers it bounds are created — rather than realized.
 pub fn effective_shard_cap(device: &wgpu::Device) -> usize {
     let device_cap = ((device.limits().max_buffer_size as usize) / 256) * 256;
     if let Some(raw) = rlx_ir::env::var("RLX_WGPU_SHARD_CAP_MIB")
@@ -138,6 +161,427 @@ pub fn effective_shard_cap(device: &wgpu::Device) -> usize {
         return forced.min(device_cap).max(256);
     }
     device_cap
+}
+
+/// Whether the informational sharding diagnostics should print.
+///
+/// `RLX_WGPU_QUIET_SHARD` suppresses only these logs — never the warning that an
+/// opt-in striping decision produced a knowingly wrong configuration
+/// ([`Arena::refuse_or_warn_about_sharding`]), which is emitted every time, and
+/// never [`bound_stripes`], which is a refusal.
+///
+/// Its own description — the registry summary in `rlx_ir`'s
+/// `env_registry_data.inc.rs` and the `docs/rlx-env-vars.md` generated from it —
+/// still reads as though it could silence that warning. Those two are gated together
+/// by `check-rlx-env-vars`, so the correction lives here rather than there.
+fn shard_log() -> bool {
+    !rlx_ir::env::flag("RLX_WGPU_QUIET_SHARD")
+        && (rlx_ir::env::flag("RLX_WGPU_DEBUG") || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG"))
+}
+
+/// Buffers a `size`-byte region is split into at `cap` — the arithmetic every
+/// allocation branch, and the parked weight buffer, shares.
+///
+/// Pure by design, so the bound ([`MAX_SHARDS`], applied by the callers where the
+/// buffers it bounds do not exist yet) is decidable without a device and the
+/// geometry table is testable where no GPU is involved.
+fn shard_count(size: usize, cap: usize) -> usize {
+    size.div_ceil(cap.max(1))
+}
+
+/// Bound the stripe count of a `size`-byte region about to be split at `cap`, and
+/// return that count. Past [`MAX_SHARDS`] it refuses loudly instead, naming the
+/// region, the count, the cap and the lever that reached it: the geometry that took
+/// a host down here does not make the graph fit, it multiplies buffers, bind
+/// windows, staging copies and kernel compilations until the machine cannot keep up.
+///
+/// Both callers apply it at their decision point, before creating the buffers it
+/// bounds — the activation arena's own, and the parked weight buffer's. It is never
+/// applied to a virtual bind-stripe geometry, which allocates one buffer.
+///
+/// Deliberately not gated on `RLX_WGPU_ALLOW_SHARD`: that opt-in downgrades the
+/// *wrongness* warning to continue-and-warn, and it must not also downgrade a
+/// bound into "compile until the machine gives up".
+fn bound_stripes(what: &str, size: usize, cap: usize) -> usize {
+    let shards = shard_count(size, cap);
+    if shards <= MAX_SHARDS {
+        return shards;
+    }
+    let size_mib = size as f64 / (1024.0 * 1024.0);
+    let cap_mib = cap as f64 / (1024.0 * 1024.0);
+    panic!(
+        "rlx-wgpu: REFUSED (pathological stripe geometry): {what} is {size_mib:.1} MiB and would \
+         be striped into {shards} buffers of {cap_mib:.2} MiB — over the {MAX_SHARDS}-stripe \
+         bound.\n\
+         \x20 A cap this small does not make the graph fit; it multiplies buffers, bind windows, \
+         staging copies and kernel compilations until the machine cannot keep up.\n\
+         \x20 The cap is RLX_WGPU_SHARD_CAP_MIB where that lever set one, and the adapter's own \
+         max_buffer_size otherwise: raise or unset the lever if it is the cap, or keep the largest \
+         intermediate under it."
+    );
+}
+
+/// The allocated-buffer geometry of a logical arena at these caps, with the
+/// stripe bound ([`MAX_SHARDS`]) already applied.
+///
+/// Pure — no device — so the decision is testable where no GPU is involved, and
+/// it is the *one* place the activation arena's bound is asked. Asking it of
+/// [`ArenaStripes::Physical`] only is the point: that is the only geometry that
+/// allocates more than one buffer. A virtual bind-stripe geometry is one buffer
+/// however many bind-sized windows its size spans, so counting the bind
+/// dimension there would refuse a working arena on an adapter whose
+/// `max_buffer_size` exceeds 64× its storage-bind limit.
+#[derive(Debug, PartialEq, Eq)]
+enum ArenaStripes {
+    /// One buffer, addressed whole (`shard_size == 0`) or in bind-sized windows.
+    One { shard_size: usize },
+    /// `shards` buffers of `shard_cap` bytes each.
+    Physical { shards: usize },
+}
+
+fn arena_stripes(what: &str, size: usize, shard_cap: usize, bind_shard_cap: usize) -> ArenaStripes {
+    if size > shard_cap {
+        ArenaStripes::Physical {
+            shards: bound_stripes(what, size, shard_cap),
+        }
+    } else if size > bind_shard_cap {
+        ArenaStripes::One {
+            shard_size: bind_shard_cap,
+        }
+    } else {
+        ArenaStripes::One { shard_size: 0 }
+    }
+}
+
+/// Bytes one parameter occupies in the parked weight buffer: packed U8/I8 keep
+/// their own byte per element, every other encoding is widened to one f32 lane
+/// there. One function, because `from_plan_split` places the parameters and the
+/// stageability rule asks about the slot they got.
+pub(crate) fn weight_param_bytes(dt: rlx_ir::DType, ne: usize) -> usize {
+    if matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
+        ne * dt.size_bytes()
+    } else {
+        ne * 4
+    }
+}
+
+/// The slot the plan assigned each node — the bytes a staged read of that node's
+/// operand has to fit.
+///
+/// Its own function because [`Arena::lens`] cannot answer it: `lens` starts as these
+/// numbers and is then overwritten with each node's *actual* byte length
+/// (`Arena::set_actual_len`) once the arena exists — `elems * 4` for the widened
+/// encodings, `elems * size_bytes()` for complex tensors.
+fn plan_node_slots(plan: &MemoryPlan) -> HashMap<NodeId, usize> {
+    plan.assignments
+        .iter()
+        .map(|(id, a)| (*id, a.size))
+        .collect()
+}
+
+/// The node whose bytes `node`'s arena offset falls in — the planner's own view chain
+/// (`rlx_compile::memory`'s `resolve_view_root`), so the record and the plan cannot
+/// disagree about which storage a view lives in.
+///
+/// [`rlx_compile::memory::is_pure_view`] is that chain without `KvAppend`, which it
+/// excludes because the backend must still *write* the appended row. The append still
+/// aliases `cache` (input 0) at offset 0, so a view above one reads the cache's bytes and
+/// has to be bounded by them.
+fn storage_root<'a>(graph: &'a Graph, node: &'a rlx_ir::Node) -> &'a rlx_ir::Node {
+    let mut root = node;
+    while rlx_compile::memory::is_pure_view(graph, root)
+        || matches!(root.op, rlx_ir::Op::KvAppend { .. })
+    {
+        root = graph.node(root.inputs[0]);
+    }
+    root
+}
+
+/// Whether `id`'s bytes are a parameter's: an `Op::Param`, or a node living in one's
+/// storage ([`storage_root`]). Asked where the arena's own answer is not enough — see
+/// [`first_unrecorded_parameter`].
+pub(crate) fn is_parameter_storage(graph: &Graph, id: NodeId) -> bool {
+    matches!(
+        storage_root(graph, graph.node(id)).op,
+        rlx_ir::Op::Param { .. }
+    )
+}
+
+/// The first operand that is a parameter's storage — by the graph — for which `record`
+/// has nothing to say, or `None` when it answers for every one of them.
+///
+/// The plan-time check asks this of the arena's record, and refuses what it finds: an
+/// arena that was never recorded answers `None` for *every* offset, and there an operand
+/// would read as an activation and be measured against nothing. Refusing is the safe
+/// default for a decision the arena cannot answer, and it is the one this function makes
+/// where the shared walk ([`first_unstageable_operand`]) cannot: it has the graph, and the
+/// walk has only the offsets.
+///
+/// Pure — the graph the check already holds and the arena's map — so it is pinned without
+/// a device: `an_unrecorded_parameter_is_not_an_activation`.
+pub(crate) fn first_unrecorded_parameter(
+    graph: &Graph,
+    record: &HashMap<usize, ParamStorage>,
+    operands: &[(NodeId, usize)],
+) -> Option<(NodeId, usize)> {
+    operands
+        .iter()
+        .copied()
+        .find(|&(id, off)| !record.contains_key(&off) && is_parameter_storage(graph, id))
+}
+
+/// What a *parameter's* storage holds from a byte offset on: the bytes a staged read of
+/// an operand there has to fit, and the encoding that parameter was declared with, where
+/// the record can attribute one to that offset.
+///
+/// The encoding is here because the structural host steps carry element counts rather
+/// than shapes (`scan_host::assert_read_fits`), so the refusal they raise cannot read the
+/// operand's declared encoding off the operand itself — it names the parameter's real one
+/// from this record, which is the same declaration the bytes were sized from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ParamStorage {
+    /// Bytes available at the offset, to the end of the parameter's storage. Where two
+    /// parameters' storages reach one offset, this is the tighter of the two — the safe
+    /// direction for a read whose owner the key cannot say.
+    pub bytes: usize,
+    /// The declared `DType` of the parameter whose storage the entry bounds, or `None`
+    /// where the offset is claimed by two parameters' storages at once. The record is
+    /// keyed by offset alone, so it cannot say which of them a read there belongs to, and
+    /// an entry that cannot attribute an encoding names none rather than the co-located
+    /// parameter's.
+    pub dtype: Option<rlx_ir::DType>,
+}
+
+/// `(byte offset, what a parameter's storage holds there)` for every offset where such
+/// storage starts, by the rule [`Arena::record_param_storage`] documents.
+///
+/// Pure — a graph and the three maps the arena holds — so the rule can be pinned without
+/// a device: `a_shrinking_view_does_not_lower_the_parameters_bound` and
+/// `an_offset_two_parameters_reach_names_no_encoding`.
+fn param_storage_bounds(
+    graph: &Graph,
+    offsets: &HashMap<NodeId, usize>,
+    weight_offsets: &HashMap<NodeId, usize>,
+    plan_slots: &HashMap<NodeId, usize>,
+) -> Vec<(usize, ParamStorage)> {
+    // Where a node's bytes are: the activation arena, or — tagged — the weight buffer,
+    // which is the same choice `Arena::offset` makes.
+    let storage = |id: NodeId| -> Option<usize> {
+        weight_offsets
+            .get(&id)
+            .map(|w| w | WEIGHT_BUF_TAG)
+            .or_else(|| offsets.get(&id).copied())
+    };
+    let mut bounds: HashMap<usize, ParamStorage> = HashMap::new();
+    // The parameter that first claimed each offset: a second, different one at the same
+    // key — a view placed past its own root's slot lands on another parameter's start —
+    // means the entry can no longer say whose storage a read at that offset reads.
+    let mut owners: HashMap<usize, NodeId> = HashMap::new();
+    for node in graph.nodes() {
+        let root = storage_root(graph, node);
+        if !matches!(root.op, rlx_ir::Op::Param { .. }) {
+            continue;
+        }
+        // A node the plan did not place (an elided transpose, say) has no storage.
+        let (Some(off), Some(root_off)) = (storage(node.id), storage(root.id)) else {
+            continue;
+        };
+        // What the parameter's storage holds from `off` on: a parked one is sized by the
+        // weight buffer's own rule ([`weight_param_bytes`], the function that placed it),
+        // one in the activation arena by the plan's slot. No slot on record asks with 0,
+        // the safe default: nothing fits a zero-byte slot, so such an operand is refused
+        // rather than assumed wide.
+        let slot = if is_weight_off(root_off) {
+            let ne = root.shape.num_elements().unwrap_or(0).max(1);
+            weight_param_bytes(root.shape.dtype(), ne)
+        } else {
+            plan_slots.get(&root.id).copied().unwrap_or(0)
+        };
+        let bound = ParamStorage {
+            bytes: slot.saturating_sub(off.saturating_sub(root_off)),
+            dtype: Some(root.shape.dtype()),
+        };
+        match bounds.get_mut(&off) {
+            Some(b) => {
+                if owners.get(&off).is_some_and(|&id| id != root.id) {
+                    b.dtype = None;
+                }
+                if bound.bytes < b.bytes {
+                    b.bytes = bound.bytes;
+                    // Only while the key still has one claimant: once two parameters have
+                    // reached it, the silence about the encoding is final.
+                    if b.dtype.is_some() {
+                        b.dtype = bound.dtype;
+                    }
+                }
+            }
+            None => {
+                owners.insert(off, root.id);
+                bounds.insert(off, bound);
+            }
+        }
+    }
+    bounds.into_iter().collect()
+}
+
+/// Why the generic host route cannot stage a parameter operand — one variant per way the
+/// bytes it reads and the bytes the parameter was given can disagree, plus the one way
+/// the question cannot be answered at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unstageable {
+    /// `set_param_typed` has no arm for the encoding, so the arena never receives
+    /// the parameter and every lane the route reads is unwritten.
+    NoUploadArm,
+    /// The upload's raw arm keeps the operand's own bytes — one or two per element —
+    /// while the route reads four.
+    StoredRaw,
+    /// The upload widens the operand to one f32 lane per element, while the route
+    /// sizes its read from a declared element wider than that lane.
+    DeclaredWiderThanALane,
+    /// The slot the plan gave the operand is narrower than the four bytes per
+    /// element the route reads.
+    SlotTooNarrow,
+    /// The arena holds no record of where this parameter's storage starts, so there is
+    /// nothing to measure the read against — it was built without
+    /// [`Arena::record_param_storage`].
+    NoRecord,
+}
+
+impl Unstageable {
+    /// The clause the refusal prints for it.
+    fn sentence(self) -> &'static str {
+        match self {
+            Self::NoUploadArm => {
+                "the typed upload has no arm for this encoding, so the arena never receives it"
+            }
+            Self::StoredRaw => {
+                "the upload stores it raw, at the encoding's own bytes per element, while the \
+                 staging reads four bytes per element"
+            }
+            Self::DeclaredWiderThanALane => {
+                "the upload stores one f32 lane per element, while the staging reads the declared \
+                 wider element"
+            }
+            Self::SlotTooNarrow => {
+                "the slot it was given is narrower than the four bytes per element the staging \
+                 reads"
+            }
+            Self::NoRecord => {
+                "the arena holds no record of where this parameter's storage starts, so its read \
+                 cannot be bounded"
+            }
+        }
+    }
+}
+
+/// Why the generic host route cannot stage a parameter operand of `dt` with `ne`
+/// elements whose storage the arena's record says holds `slot_bytes` from its offset on,
+/// or `None` when it can.
+///
+/// That route transfers `max(ceil(size_bytes / 4), ne)` f32 lanes per operand
+/// (`rlx_gpu_host::run_host_op_packed_cached` sizes the read from the declared
+/// shape), so a parameter is stageable exactly where the bytes it reads really are
+/// one f32 lane per element — in what the typed upload stored, and in the storage it was
+/// given. An operand with no elements is no read at all and is never refused.
+///
+/// `slot_bytes` is what the storage itself was given, and it is the number the two-byte
+/// encodings turn on: the flat plan sizes a non-F32 `Param` at its native width
+/// (`rlx_compile`'s `node_slot_bytes`), while `from_plan_split` — the plan the
+/// geometries this rule is about use — gives every parameter it places in the
+/// activation arena four bytes per element (the ones it parks are sized by the weight
+/// buffer's own rule, [`weight_param_bytes`], and the encodings where those two
+/// disagree — packed `U8`/`I8` — are decided by the dtype arms below, before the slot is
+/// read). It is not `Arena::lens`, which `compile_static_inner` overwrites with the
+/// node's actual byte length: the callers ask the arena's record instead
+/// (`Arena::param_storage_at` — see [`plan_node_slots`] for the numbers it holds).
+///
+/// Which encodings the upload stores as one lane is `set_param_typed` in
+/// `crates/core/rlx-runtime/src/backend/wgpu_backend.rs`: this crate sits below it
+/// and cannot call it, so a change there has to be mirrored here.
+/// `tests/ceiling_stageable.rs` runs a parked parameter through that arm end to end.
+pub(crate) fn unstageable_reason(
+    dt: rlx_ir::DType,
+    ne: usize,
+    slot_bytes: usize,
+) -> Option<Unstageable> {
+    use rlx_ir::DType::*;
+    // The transfer, in bytes, as `rlx_gpu_host` sizes it. Zero elements is a
+    // zero-byte read, which nothing can be read past.
+    let read = 4 * (dt.size_bytes().saturating_mul(ne)).div_ceil(4).max(ne);
+    if read == 0 {
+        return None;
+    }
+    // Exhaustive on purpose: a new encoding has to be decided here rather than fall
+    // through to a verdict nobody checked.
+    match dt {
+        // One f32 lane per element, and a declared element no wider than that lane.
+        F32 | I32 | U32 | F16 | Bool => {}
+        F64 | I64 => return Some(Unstageable::DeclaredWiderThanALane),
+        U8 | I8 | BF16 => return Some(Unstageable::StoredRaw),
+        I16 | C64 | C128 => return Some(Unstageable::NoUploadArm),
+    }
+    (slot_bytes < read).then_some(Unstageable::SlotTooNarrow)
+}
+
+/// The first operand among `operands` the generic host route cannot stage, with the
+/// reason — `operands` yields `(payload, byte offset, dtype, elements)`, and both the
+/// payload and the offset come back so the caller can name the offender in its own terms
+/// (a node id at plan time; nothing at all at run time, where the offset is the name).
+/// `None` when every read fits, and for every operand whose storage is not a parameter's:
+/// an activation's slot holds one f32 lane per element by construction.
+///
+/// The one walk both checkers use, asking one bound: the arena's record of where a
+/// parameter's storage is and how much of it is there ([`Arena::param_storage_at`], filled
+/// by `Arena::record_param_storage`) — so the plan-time check
+/// (`lower::assert_host_route_stageable`) and the check at the route's staging point
+/// (`scan_host::assert_host_reads_fit`) cannot drift apart.
+pub(crate) fn first_unstageable_operand<T>(
+    arena: &Arena,
+    operands: impl IntoIterator<Item = (T, usize, rlx_ir::DType, usize)>,
+) -> Option<(T, usize, rlx_ir::DType, Unstageable)> {
+    operands.into_iter().find_map(|(payload, off, dt, ne)| {
+        let slot = arena.param_storage_at(off)?.bytes;
+        Some((payload, off, dt, unstageable_reason(dt, ne, slot)?))
+    })
+}
+
+/// Where an operand's storage lives, for a refusal message.
+pub(crate) fn operand_location(off: usize) -> &'static str {
+    if is_weight_off(off) {
+        "parked in the weight buffer"
+    } else {
+        "in the activation arena"
+    }
+}
+
+/// The one refusal for a parameter operand the host route must not stage —
+/// [`unstageable_reason`], from the plan-time check and the runtime backstop alike.
+/// `operand` names it as that caller can, and `dtype` is its declared encoding where the
+/// caller knows one. `None` says the arena's record cannot attribute an encoding to that
+/// offset (two parameters' storages reach it), and the message then leaves the encoding
+/// out rather than stating the co-located parameter's.
+pub(crate) fn refuse_unstageable_operand(
+    op: rlx_ir::OpKind,
+    operand: &str,
+    dtype: Option<rlx_ir::DType>,
+    reason: Unstageable,
+) -> ! {
+    let Some(dtype) = dtype else {
+        panic!(
+            "rlx-wgpu: REFUSED (operand not stageable as f32): {op:?} reads {operand} — {}. Two \
+             parameters' storages share this offset, so which encoding bounds the read is not \
+             attributable; move the graph to a backend that can address them apart.",
+            reason.sentence(),
+        );
+    };
+    let width = dtype.size_bytes();
+    panic!(
+        "rlx-wgpu: REFUSED (operand not stageable as f32): {op:?} reads {operand} ({dtype:?}, \
+         {width} {} per element) — {}. Avoid this encoding for the parameter, or move the graph \
+         to a backend that can address it.",
+        if width == 1 { "byte" } else { "bytes" },
+        reason.sentence(),
+    );
 }
 
 /// Re-place unique buffer slots so no slot crosses a shard boundary.
@@ -408,6 +852,21 @@ pub struct Arena {
     pub weight_shard_size: usize,
     /// Per-node byte offset into the logical weight buffer (quant / parked).
     pub weight_offsets: HashMap<NodeId, usize>,
+    /// Per-node, the slot the plan assigned ([`plan_node_slots`]) — the bytes a
+    /// staged read of that node's operand has to fit. Distinct from [`Self::lens`],
+    /// which `compile_static_inner` overwrites with the node's *actual* byte length
+    /// (`elems * 4`) as soon as the arena exists.
+    ///
+    /// Recorded at construction rather than recomputed by
+    /// [`Self::record_param_storage`]'s caller: these are the slots of the plan the
+    /// arena was laid out under — after `from_plan`'s physical snap, which re-places and
+    /// re-sizes slots — which the caller's plan is not once a snap has happened.
+    pub(crate) plan_slots: HashMap<NodeId, usize>,
+    /// Per byte offset, what a *parameter's* storage holds from that offset on, in
+    /// either region — the activation arena's plan slots, the parked weight buffer's own
+    /// sizing. What [`Self::param_storage_at`] answers, filled by
+    /// [`Self::record_param_storage`].
+    pub(crate) param_slots: HashMap<usize, ParamStorage>,
 }
 
 /// How to bind a storage window onto an [`Arena`] (possibly sharded).
@@ -531,28 +990,36 @@ impl Arena {
     /// the host staging stitches per-shard reads correctly, so the mitigation
     /// is real but plainly incomplete.
     ///
+    /// Since then the *addressing-honesty* class is covered: an op whose
+    /// lowering hands the arena to its kernel by absolute offset is hosted below
+    /// the per-binding ceiling (`supported_ops::addresses_arena_by_absolute_offset`
+    /// + `should_host_at_ceiling`), so it computes correctly instead of reading a
+    /// re-based window. Physical striping itself remains an unsupported opt-in
+    /// that still produces wrong results elsewhere — the mitigation is partial,
+    /// not a licence to stripe.
+    ///
     /// `RLX_WGPU_ALLOW_SHARD=1` restores the old warn-and-continue for anyone
-    /// whose graph happens to survive it.
+    /// whose graph happens to survive it. It cannot reach an unbounded stripe
+    /// count either: [`MAX_SHARDS`] is checked before this is called, so the
+    /// geometry is already bounded when the opt-in is consulted.
     fn refuse_or_warn_about_sharding(logical: usize, shards: usize, cap: usize) {
-        use std::sync::atomic::{AtomicBool, Ordering};
         if !rlx_ir::env::flag("RLX_WGPU_ALLOW_SHARD") {
             panic!(
-                "rlx-wgpu: the activation arena needs {:.2} GiB and would be striped across \
-                 {shards} buffers of {:.2} GiB.\n\
+                "rlx-wgpu: REFUSED (striped activation arena): the arena needs {:.2} GiB and \
+                 would be striped across {shards} buffers of {:.2} GiB.\n\
                  \x20 Striped arenas produce WRONG RESULTS on this backend, silently — on \
                  SynthStrip at 192^3 every output voxel was wrong (97.8% of scale) while the \
                  run reported success.\n\
                  \x20 Keep the largest intermediate small enough to avoid striping, use \
                  another backend, or set RLX_WGPU_ALLOW_SHARD=1 to get the old \
-                 warn-and-continue behaviour.",
+                 warn-and-continue behaviour (unsupported — it warns on every use).",
                 logical as f64 / (1u64 << 30) as f64,
                 cap as f64 / (1u64 << 30) as f64,
             );
         }
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if WARNED.swap(true, Ordering::Relaxed) || rlx_ir::env::flag("RLX_WGPU_QUIET_SHARD") {
-            return;
-        }
+        // Every use, not once per process: this opt-in is not a supported route,
+        // and the resulting numbers are wrong. A diagnostic that a caller can see
+        // once and then forget — or silence entirely — is not a diagnostic.
         eprintln!(
             "rlx-wgpu warning: the activation arena needs {:.2} GiB and is being striped \
              across {shards} buffers of {:.2} GiB.\n\
@@ -560,9 +1027,10 @@ impl Arena {
              3-D convolution stack whose output tensor was 864 MiB came back at correlation \
              0.17 against a reference runtime, while the same graph at 666 MiB — which fits \
              without striping — was exact. Reserve size made no difference.\n\
+             \x20 This opt-in (RLX_WGPU_ALLOW_SHARD) is NOT a supported route and cannot be \
+             silenced; this warning is emitted on every striping decision.\n\
              \x20 Check any result from this graph against `cpu`, or keep the largest \
-             intermediate small enough to avoid striping. Silence this with \
-             RLX_WGPU_QUIET_SHARD=1.",
+             intermediate small enough to avoid striping.",
             logical as f64 / (1u64 << 30) as f64,
             cap as f64 / (1u64 << 30) as f64,
         );
@@ -601,10 +1069,7 @@ impl Arena {
                 let mut trial = compact.clone();
                 snap_plan_to_shards_ex(&mut trial, shard_cap, reserve);
                 if trial.arena_size <= shard_cap {
-                    if reserve < default_reserve
-                        && (rlx_ir::env::flag("RLX_WGPU_DEBUG")
-                            || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG"))
-                    {
+                    if reserve < default_reserve && shard_log() {
                         eprintln!(
                             "[rlx-wgpu] physical snap with {:.0} MiB stage reserve \
                              (default {:.0} MiB) → {:.3} GiB arena (fits max_buf)",
@@ -646,10 +1111,7 @@ impl Arena {
                 snap_plan_to_shards_ex(&mut trial, bind_shard_cap, reserve);
                 if trial.arena_size <= shard_cap || reserve <= 1024 * 1024 {
                     if trial.arena_size <= shard_cap {
-                        if reserve < default_reserve
-                            && (rlx_ir::env::flag("RLX_WGPU_DEBUG")
-                                || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG"))
-                        {
+                        if reserve < default_reserve && shard_log() {
                             eprintln!(
                                 "[rlx-wgpu] bind-stripe snap with {:.0} MiB stage reserve \
                                  (default {:.0} MiB) → {:.3} GiB arena (fits max_buf)",
@@ -659,9 +1121,7 @@ impl Arena {
                             );
                         }
                         plan = trial;
-                    } else if rlx_ir::env::flag("RLX_WGPU_DEBUG")
-                        || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG")
-                    {
+                    } else if shard_log() {
                         eprintln!(
                             "[rlx-wgpu] bind-stripe snap still {:.3} GiB (> shard_cap) at \
                              {:.0} MiB reserve; keeping compact {:.3} GiB layout",
@@ -688,74 +1148,75 @@ impl Arena {
             size = plan.arena_size.max(1);
         }
 
-        let (buffer, extra_shards, shard_size) = if size <= shard_cap {
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("rlx-wgpu arena"),
-                size: size as u64,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_SRC
-                    | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let virt = if size > bind_shard_cap {
-                if rlx_ir::env::flag("RLX_WGPU_DEBUG") || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG") {
-                    let n = size.div_ceil(bind_shard_cap);
-                    eprintln!(
-                        "[rlx-wgpu] virtual-sharded arena: physical={:.3} GiB → {n} × {:.3} GiB bind stripes",
-                        size as f64 / (1u64 << 30) as f64,
-                        bind_shard_cap as f64 / (1u64 << 30) as f64,
-                    );
-                }
-                bind_shard_cap
-            } else {
-                0usize
-            };
-            (buffer, Vec::new(), virt)
-        } else {
-            // Reject tensors that cannot fit in one shard.
-            for (id, a) in &plan.assignments {
-                if a.size > shard_cap {
-                    panic!(
-                        "rlx-wgpu: node {id:?} slot {} bytes exceeds shard cap {} \
-                         (max_buffer_size); shrink max_seq or split the graph",
-                        a.size, shard_cap
-                    );
-                }
-                let end = a.offset.saturating_add(a.size.max(1));
-                if a.offset / shard_cap != (end - 1) / shard_cap {
-                    panic!(
-                        "rlx-wgpu: node {id:?} @{}+{} spans a {}-byte shard boundary after snap",
-                        a.offset, a.size, shard_cap
-                    );
-                }
-            }
-            let n_shards = size.div_ceil(shard_cap);
-            // Loud by default. Striping is where this backend has been measured
-            // to return wrong numbers without saying so, and a diagnostic behind
-            // a flag nobody sets is no diagnostic at all.
-            Self::refuse_or_warn_about_sharding(size, n_shards, shard_cap);
-            if rlx_ir::env::flag("RLX_WGPU_DEBUG") || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG") {
-                eprintln!(
-                    "[rlx-wgpu] sharded arena: logical={:.3} GiB → {n_shards} × {:.3} GiB shards",
-                    size as f64 / (1u64 << 30) as f64,
-                    shard_cap as f64 / (1u64 << 30) as f64,
-                );
-            }
-            let mut shards = Vec::with_capacity(n_shards);
-            for i in 0..n_shards {
-                let begin = i * shard_cap;
-                let this = (size - begin).min(shard_cap).max(256);
-                shards.push(device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("rlx-wgpu arena shard"),
-                    size: this as u64,
+        // Which geometry this size allocates, decided by one pure function so the
+        // stripe bound can only ever be asked of a *physical* geometry (see
+        // `arena_stripes`).
+        let layout = arena_stripes("the activation arena", size, shard_cap, bind_shard_cap);
+        let (buffer, extra_shards, shard_size) = match layout {
+            ArenaStripes::One { shard_size } => {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("rlx-wgpu arena"),
+                    size: size as u64,
                     usage: wgpu::BufferUsages::STORAGE
                         | wgpu::BufferUsages::COPY_SRC
                         | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
-                }));
+                });
+                if shard_size > 0 && shard_log() {
+                    let n = shard_count(size, shard_size);
+                    eprintln!(
+                        "[rlx-wgpu] virtual-sharded arena: physical={:.3} GiB → {n} × {:.3} GiB bind stripes",
+                        size as f64 / (1u64 << 30) as f64,
+                        shard_size as f64 / (1u64 << 30) as f64,
+                    );
+                }
+                (buffer, Vec::new(), shard_size)
             }
-            let buffer = shards.remove(0);
-            (buffer, shards, shard_cap)
+            ArenaStripes::Physical { shards: n_shards } => {
+                // Reject tensors that cannot fit in one shard.
+                for (id, a) in &plan.assignments {
+                    if a.size > shard_cap {
+                        panic!(
+                            "rlx-wgpu: node {id:?} slot {} bytes exceeds shard cap {} \
+                         (max_buffer_size); shrink max_seq or split the graph",
+                            a.size, shard_cap
+                        );
+                    }
+                    let end = a.offset.saturating_add(a.size.max(1));
+                    if a.offset / shard_cap != (end - 1) / shard_cap {
+                        panic!(
+                            "rlx-wgpu: node {id:?} @{}+{} spans a {}-byte shard boundary after snap",
+                            a.offset, a.size, shard_cap
+                        );
+                    }
+                }
+                // Loud by default. Striping is where this backend has been measured
+                // to return wrong numbers without saying so, and a diagnostic behind
+                // a flag nobody sets is no diagnostic at all.
+                Self::refuse_or_warn_about_sharding(size, n_shards, shard_cap);
+                if shard_log() {
+                    eprintln!(
+                        "[rlx-wgpu] sharded arena: logical={:.3} GiB → {n_shards} × {:.3} GiB shards",
+                        size as f64 / (1u64 << 30) as f64,
+                        shard_cap as f64 / (1u64 << 30) as f64,
+                    );
+                }
+                let mut shards = Vec::with_capacity(n_shards);
+                for i in 0..n_shards {
+                    let begin = i * shard_cap;
+                    let this = (size - begin).min(shard_cap).max(256);
+                    shards.push(device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("rlx-wgpu arena shard"),
+                        size: this as u64,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_SRC
+                            | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+                }
+                let buffer = shards.remove(0);
+                (buffer, shards, shard_cap)
+            }
         };
 
         // Mirror f16 shadow buffer: half the byte size since each f32
@@ -802,6 +1263,7 @@ impl Arena {
             offsets.insert(*id, a.offset);
             lens.insert(*id, a.size);
         }
+        let plan_slots = plan_node_slots(&plan);
         Self {
             buffer,
             extra_shards,
@@ -818,6 +1280,8 @@ impl Arena {
             weight_extra_shards: Vec::new(),
             weight_shard_size: 0,
             weight_offsets: HashMap::new(),
+            plan_slots,
+            param_slots: HashMap::new(),
         }
     }
 
@@ -868,13 +1332,7 @@ impl Arena {
             if matches!(&node.op, Op::Param { .. }) {
                 let ne = node.shape.num_elements().unwrap_or(0).max(1);
                 let dt = node.shape.dtype();
-                param_bytes_est = param_bytes_est.saturating_add(
-                    if matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
-                        ne * dt.size_bytes()
-                    } else {
-                        ne * 4
-                    },
-                );
+                param_bytes_est = param_bytes_est.saturating_add(weight_param_bytes(dt, ne));
             }
         }
         let park_all_params = rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
@@ -905,11 +1363,7 @@ impl Arena {
             let ne = node.shape.num_elements().unwrap_or(0).max(1);
             let dt = node.shape.dtype();
             let is_param = matches!(&node.op, Op::Param { .. });
-            let nbytes = if matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8) {
-                ne * dt.size_bytes()
-            } else {
-                ne * 4
-            };
+            let nbytes = weight_param_bytes(dt, ne);
             let name = match &node.op {
                 Op::Param { name } => name.clone(),
                 _ => String::new(),
@@ -1062,10 +1516,13 @@ impl Arena {
         }
         let mut arena = Self::from_plan_with_scratch(device, &new_plan, scratch_bytes);
         if weight_cursor > 0 {
-            let n_shards = weight_cursor.div_ceil(weight_shard_cap);
-            if (rlx_ir::env::flag("RLX_WGPU_DEBUG") || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG"))
-                && n_shards > 1
-            {
+            // Same bound as the activation arena, through the same helper (see
+            // MAX_SHARDS): the weight buffer stripes on the same lever, and a
+            // shrunken cap turns a model's weights into the same unbounded geometry.
+            // The activation arena's buffers exist by now; this one's do not.
+            let n_shards =
+                bound_stripes("the parked weight buffer", weight_cursor, weight_shard_cap);
+            if shard_log() && n_shards > 1 {
                 eprintln!(
                     "[rlx-wgpu] sharded weight buffer: logical={:.3} GiB → {n_shards} × {:.3} GiB",
                     weight_cursor as f64 / (1u64 << 30) as f64,
@@ -1084,9 +1541,7 @@ impl Arena {
                             && shared.shard_size == shard_size
                             && shared.extras.len() + 1 == n_shards =>
                     {
-                        if rlx_ir::env::flag("RLX_WGPU_DEBUG")
-                            || rlx_ir::env::flag("RLX_WGPU_SHARD_LOG")
-                        {
+                        if shard_log() {
                             eprintln!(
                                 "[rlx-wgpu] reusing shared weight buffer ({:.3} GiB)",
                                 weight_cursor as f64 / (1u64 << 30) as f64,
@@ -1147,6 +1602,9 @@ impl Arena {
             }
             arena.weight_offsets = weight_offsets;
         }
+        // This planner has the graph, so it records the parameter-storage bounds
+        // itself; `compile_static_inner` does it for the unsplit arena, which does not.
+        arena.record_param_storage(graph);
         arena
     }
 
@@ -1168,6 +1626,25 @@ impl Arena {
     /// The whole logical arena size, for diagnostics.
     pub fn logical_size(&self) -> usize {
         self.size
+    }
+
+    /// Can a kernel that addresses this arena by ABSOLUTE offset be dispatched?
+    ///
+    /// The arena is one logical address space presented to a shader as a single
+    /// `arena` binding. A kernel that carries absolute offsets in its uniforms is
+    /// correct only when the shared bind helpers bind the whole arena at base 0,
+    /// and only while every word offset it must carry fits the `u32` its uniform
+    /// declares. Through a re-based window an absolute offset reads and writes the
+    /// wrong slots, and an offset past `u32::MAX` words would be truncated — both
+    /// silently, because WGSL makes an out-of-range access a dynamic error whose
+    /// permitted outcomes (return 0 or another in-bounds value, drop the store,
+    /// discard the dispatch) never include telling the caller. This is the one
+    /// coarse condition the routing rule asks; it deliberately does not look at
+    /// any single op's window base.
+    pub fn binds_whole_at_base_zero(&self, max_storage_binding: u64) -> bool {
+        !self.is_sharded()
+            && (self.size as u64) <= max_storage_binding
+            && (self.size / 4) <= u32::MAX as usize
     }
 
     /// Which stripe a logical activation offset falls in.
@@ -1547,6 +2024,57 @@ impl Arena {
     /// Total bytes of the packed-bf16 weight side-buffer (`None` if unused).
     pub fn bf16_weight_buffer_bytes(&self) -> Option<u64> {
         self.bf16_weight_buffer.as_ref().map(|b| b.size())
+    }
+
+    /// Record, per byte offset, what a *parameter's* storage holds from there on: the bytes
+    /// [`Self::param_storage_at`] answers with — what the host route's staged read of an
+    /// operand there has to fit — and the encoding it names for that operand.
+    ///
+    /// A view is recorded too, bounded by the storage it actually reads: the planner
+    /// aliases a view onto its root, so what is available at the view's offset is the
+    /// root's storage from there on — not the view's *own* slot, which says only how much
+    /// that node needs and would bound the whole parameter wherever a shrinking view
+    /// shares its offset. The flat plan sizes a view's own slot as if it were an
+    /// activation while the parameter underneath it keeps its native width, so the
+    /// root's remainder is the only number that tells the truth here.
+    ///
+    /// Where two parameters' storages reach one offset — a view the plan placed past its
+    /// own root's slot lands on the next parameter's start — the entry keeps the tighter
+    /// bound, the safe direction, and carries no encoding: the key is the offset alone, so
+    /// it cannot say which of the two a read there belongs to.
+    ///
+    /// Both regions are recorded — the activation arena's plan slots, and the parked
+    /// weight buffer's own sizing ([`weight_param_bytes`], the function that placed
+    /// them) — so a parked operand and an in-arena one are measured the same way.
+    ///
+    /// Callers: `from_plan_split` (it has the graph, which the plan does not carry) and
+    /// `compile_static_inner`, for the arena `from_plan_with_scratch` builds — that
+    /// constructor never sees a graph. Either way an arena is recorded once, and every
+    /// arena the compile path builds carries the record.
+    pub(crate) fn record_param_storage(&mut self, graph: &Graph) {
+        self.param_slots.extend(param_storage_bounds(
+            graph,
+            &self.offsets,
+            &self.weight_offsets,
+            &self.plan_slots,
+        ));
+    }
+
+    /// What a *parameter's* storage holds from `off` on — its bytes, and the encoding that
+    /// parameter was declared with — or `None` when no parameter's storage starts there: an
+    /// activation's slot holds one f32 lane per element by construction, so a staged read of
+    /// it always fits and needs no bound.
+    ///
+    /// The encoding is `None` as well where two parameters' storages reach the offset and the
+    /// record cannot say which of them a read there reads ([`ParamStorage::dtype`]).
+    ///
+    /// `None` is also what an arena that was never recorded answers, and that reads as
+    /// "no parameter here": the recording is an obligation of whoever builds the arena
+    /// ([`Self::record_param_storage`]), and both constructions the compile path uses
+    /// honour it. The plan-time check does not lean on that silence — a `Param` operand
+    /// with no record is refused rather than read (`lower::assert_host_route_stageable`).
+    pub(crate) fn param_storage_at(&self, off: usize) -> Option<ParamStorage> {
+        self.param_slots.get(&off).copied()
     }
 
     /// Register `id` (a BF16 `Op::MatMul` weight Param) to live PACKED in the
@@ -2215,5 +2743,319 @@ mod tests {
             schedule: vec![],
         };
         assert_eq!(f16_shadow_arena_size(&plan), 24);
+    }
+}
+
+/// The stripe bound ([`MAX_SHARDS`]). Pure arithmetic — no device, no shader, no
+/// allocation — which is the point: the geometry that took this host down has to
+/// be refusable, and inspectable, without running it.
+#[cfg(test)]
+mod stripe_bound_tests {
+    use super::*;
+
+    const MIB: usize = 1024 * 1024;
+    const GIB: usize = 1024 * MIB;
+
+    fn refusal_of(size: usize, cap: usize) -> String {
+        let caught = std::panic::catch_unwind(|| bound_stripes("the activation arena", size, cap));
+        let payload = caught.expect_err("this geometry must be refused");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// `(arena bytes, shard cap, stripes)`. The first rows are the killing lever — a
+    /// few-MiB cap over a real workload's arena, which is what the bound exists to
+    /// stop; the last ones are the deliberate small caps this backend's tests pin and
+    /// which must keep working.
+    const CASES: &[(usize, usize, usize)] = &[
+        (4 * GIB, MIB, 4096),
+        (4 * GIB, 4 * MIB, 1024),
+        (76 * MIB, MIB, 76),
+        (76 * MIB, 4 * MIB, 19),
+        (256 * MIB, 4 * MIB, 64),
+        (MIB, 4 * MIB, 1),
+    ];
+
+    #[test]
+    fn a_cap_that_explodes_the_geometry_is_refused_and_a_sane_one_is_not() {
+        for &(size, cap, expected) in CASES {
+            if expected > MAX_SHARDS {
+                let msg = refusal_of(size, cap);
+                // Catchable and self-describing: a caller can tell this apart from a
+                // process death, and the message names the case and the geometry.
+                for needle in [
+                    "rlx-wgpu: REFUSED (pathological stripe geometry)",
+                    "the activation arena",
+                    &format!("{expected} buffers"),
+                ] {
+                    assert!(
+                        msg.contains(needle),
+                        "refusal must mention {needle:?}: {msg}"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    bound_stripes("the activation arena", size, cap),
+                    expected,
+                    "{size} bytes at a {cap}-byte cap must stay usable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_buffer_geometry_is_never_refused_over_the_bind_dimension() {
+        // An adapter whose `max_buffer_size` exceeds 64× its storage-bind limit:
+        // here an 8 GiB shard cap against a 64 MiB bind limit. A 6 GiB arena is
+        // ONE allocated buffer, but spans 96 bind-sized windows. Counting the bind
+        // dimension would exceed `MAX_SHARDS` and refuse a geometry that allocates
+        // a single buffer — the wrong dimension — so the bound must be asked of
+        // the physical geometry only.
+        let (size, shard_cap, bind_cap) = (6 * GIB, 8 * GIB, 64 * MIB);
+        assert!(
+            shard_count(size, bind_cap) > MAX_SHARDS,
+            "this check only means anything while the wrong dimension would exceed the bound"
+        );
+        assert_eq!(
+            arena_stripes("the activation arena", size, shard_cap, bind_cap),
+            ArenaStripes::One {
+                shard_size: bind_cap
+            },
+            "a single-buffer geometry must never be refused, however many bind windows it spans"
+        );
+    }
+}
+
+/// The verdict of [`unstageable_reason`] for every encoding a parameter can have, in
+/// both slots one can be given: a native one (what the flat plan gives a non-F32
+/// `Param`) and a widened one — the four bytes per element the split plan gives a
+/// parameter in the arena, and the weight buffer gives every parameter that is not
+/// packed.
+///
+/// Pure — no device — and fed by hand, so it pins the verdict table and nothing else:
+/// it does not go through the recording (`plan_node_slots` answers the flat plan's own
+/// slots directly), so what a *real* arena records is pinned where the rule runs —
+/// `tests/host_route_operand_fit.rs` (an in-arena `F16` parameter refused, its view
+/// refused, an `F32` control computed) and `tests/ceiling_stageable.rs` (a parked `F16`
+/// parameter staged and computed, a parked packed `U8` refused).
+#[cfg(test)]
+mod operand_stageability_tests {
+    use super::*;
+    use rlx_ir::{DType, GraphExt};
+
+    const NE: usize = 256;
+
+    /// One record entry: `bytes` available there, declared with `dtype`.
+    fn stored(bytes: usize, dtype: DType) -> ParamStorage {
+        ParamStorage {
+            bytes,
+            dtype: Some(dtype),
+        }
+    }
+
+    /// An arena's parameter-storage record over `(offset, bytes)` pairs, declared `F32` —
+    /// the encoding is irrelevant to what these tests ask of it.
+    fn record(pairs: &[(usize, usize)]) -> HashMap<usize, ParamStorage> {
+        pairs
+            .iter()
+            .map(|&(off, bytes)| (off, stored(bytes, DType::F32)))
+            .collect()
+    }
+
+    /// `(dtype, does its slot hold four bytes per element, verdict)`.
+    const CASES: &[(DType, bool, Option<Unstageable>)] = &[
+        // A four-byte element's native slot is already one f32 lane wide, so these
+        // three get one row: both slots come out the same size for them.
+        (DType::F32, false, None),
+        (DType::I32, false, None),
+        (DType::U32, false, None),
+        // Widened to one lane on upload: stageable exactly where the slot holds one.
+        (DType::F16, true, None),
+        (DType::F16, false, Some(Unstageable::SlotTooNarrow)),
+        (DType::Bool, true, None),
+        (DType::Bool, false, Some(Unstageable::SlotTooNarrow)),
+        // The upload's raw arms: four bytes read per stored byte / pair.
+        (DType::U8, true, Some(Unstageable::StoredRaw)),
+        (DType::U8, false, Some(Unstageable::StoredRaw)),
+        (DType::I8, false, Some(Unstageable::StoredRaw)),
+        (DType::BF16, true, Some(Unstageable::StoredRaw)),
+        (DType::BF16, false, Some(Unstageable::StoredRaw)),
+        // Widened to one lane on upload, read as the declared two.
+        (DType::F64, true, Some(Unstageable::DeclaredWiderThanALane)),
+        (DType::F64, false, Some(Unstageable::DeclaredWiderThanALane)),
+        (DType::I64, true, Some(Unstageable::DeclaredWiderThanALane)),
+        // No upload arm: nothing to stage, in any slot.
+        (DType::I16, true, Some(Unstageable::NoUploadArm)),
+        (DType::C64, true, Some(Unstageable::NoUploadArm)),
+        (DType::C128, false, Some(Unstageable::NoUploadArm)),
+    ];
+
+    #[test]
+    fn stageability_is_one_f32_lane_per_element() {
+        for &(dt, wide_slot, want) in CASES {
+            let slot = if wide_slot {
+                NE * 4
+            } else {
+                dt.size_bytes() * NE
+            };
+            assert_eq!(
+                unstageable_reason(dt, NE, slot),
+                want,
+                "{dt:?} in a {slot} B slot"
+            );
+        }
+    }
+
+    /// A zero-element operand is no read at all — whatever its encoding, and whatever
+    /// slot it got. Refusing one would be refusing a case the route computes, which is
+    /// why the read is what decides: the zero-byte read returns before the encoding is
+    /// consulted, so no dtype and no slot can refuse it.
+    #[test]
+    fn no_elements_is_no_read() {
+        for dt in [DType::F64, DType::U8, DType::F16, DType::C128, DType::I16] {
+            assert_eq!(unstageable_reason(dt, 0, 0), None, "{dt:?}");
+        }
+    }
+
+    /// A shrinking view shares its root's offset, and the bound recorded there is what
+    /// the *storage* holds from that offset on — the root's slot — not the view's own
+    /// slot. Capping by the view's own slot would refuse a whole-parameter read that
+    /// shares the offset, which the route computes correctly.
+    ///
+    /// The `KvAppend` row is the other half of the same question: the append writes a row
+    /// but its output still aliases `cache` (input 0), so a view above one reads the
+    /// cache's bytes and has to be bounded by them. `is_pure_view` alone stops the walk
+    /// at the append, and the row fails if it does.
+    #[test]
+    fn a_shrinking_view_does_not_lower_the_parameters_bound() {
+        let mut g = Graph::new("param-view-bounds");
+        // `F16`, so the encoding an entry records is one a stand-in would not carry.
+        let p = g.param("p", rlx_ir::Shape::new(&[8], DType::F16));
+        let same = g.narrow_(p, 0, 0, 2); // aliased at the parameter's own offset
+        let inside = g.narrow_(p, 0, 2, 1); // ... and two elements further in
+        let row = g.input("row", rlx_ir::Shape::new(&[1], DType::F32));
+        let kv = g.add_node(
+            rlx_ir::Op::KvAppend { axis: 0, pos: 1 },
+            vec![p, row],
+            rlx_ir::Shape::new(&[2], DType::F32),
+        );
+        let after = g.narrow_(kv, 0, 1, 1); // reads the appended element, at p + 4 B
+        g.set_outputs(vec![same, inside, after]);
+        let nothing: HashMap<NodeId, usize> = HashMap::new();
+        let offsets = HashMap::from([
+            (p, 256usize),
+            (same, 256),
+            (inside, 264),
+            (kv, 256),
+            (after, 260),
+        ]);
+        let slots = HashMap::from([(p, 32usize), (same, 8), (inside, 4), (kv, 8), (after, 4)]);
+        let mut bounds = param_storage_bounds(&g, &offsets, &nothing, &slots);
+        bounds.sort_by_key(|&(off, _)| off);
+        assert_eq!(
+            bounds,
+            [
+                (256, stored(32, DType::F16)),
+                (260, stored(28, DType::F16)),
+                (264, stored(24, DType::F16)),
+            ],
+            "the parameter's own slot bounds its storage from each view's offset on, and every \
+             entry records the root's declaration (F16) rather than the F32 a stand-in would \
+             give"
+        );
+    }
+
+    /// Two parameters' storages can reach one offset — a view the plan placed past its own
+    /// root's slot lands on the next parameter's start. The key is the offset alone, so
+    /// the entry keeps the tighter of the two bounds and stops naming an encoding, rather
+    /// than stating the encoding of whichever parameter it happened to keep.
+    #[test]
+    fn an_offset_two_parameters_reach_names_no_encoding() {
+        let mut g = Graph::new("two-params-one-offset");
+        // The split plan gives an in-arena parameter `ne * 4` bytes, so this `F64`
+        // parameter's view at element 4 is planned 32 bytes in — exactly where `b` starts.
+        let a = g.param("a", rlx_ir::Shape::new(&[8], DType::F64));
+        let view = g.narrow_(a, 0, 4, 2);
+        let b = g.param("b", rlx_ir::Shape::new(&[8], DType::F32));
+        g.set_outputs(vec![view, b]);
+        let nothing: HashMap<NodeId, usize> = HashMap::new();
+        let offsets = HashMap::from([(a, 0usize), (view, 32), (b, 32)]);
+        let slots = HashMap::from([(a, 32usize), (b, 32)]);
+        let mut bounds = param_storage_bounds(&g, &offsets, &nothing, &slots);
+        bounds.sort_by_key(|&(off, _)| off);
+        assert_eq!(
+            bounds,
+            [
+                (0, stored(32, DType::F64)),
+                (
+                    32,
+                    ParamStorage {
+                        bytes: 0,
+                        dtype: None
+                    }
+                ),
+            ],
+            "the shared offset keeps the tighter bound and names no encoding, since which \
+             parameter a read there belongs to is not in the key"
+        );
+    }
+
+    /// The safe default at the plan-time check: a parameter operand the arena's record
+    /// cannot answer for is refused, not read as an activation. `None` where it answers —
+    /// and for an operand that is an activation's own bytes, whatever the record says.
+    #[test]
+    fn an_unrecorded_parameter_is_not_an_activation() {
+        let mut g = Graph::new("unrecorded-param");
+        let p = g.param("p", rlx_ir::Shape::new(&[8], DType::F32));
+        let view = g.narrow_(p, 0, 2, 4);
+        let x = g.input("x", rlx_ir::Shape::new(&[8], DType::F32));
+        g.set_outputs(vec![view, x]);
+        let operands = [(p, 256usize), (view, 264), (x, 512)];
+
+        // An arena that was never recorded: both parameter operands are unanswerable, the
+        // activation is not a parameter's storage at all.
+        let nothing = HashMap::new();
+        assert_eq!(
+            first_unrecorded_parameter(&g, &nothing, &operands),
+            Some((p, 256))
+        );
+        // A complete record answers for the parameter and for the view over it.
+        let recorded = record(&[(256, 32), (264, 24)]);
+        assert_eq!(first_unrecorded_parameter(&g, &recorded, &operands), None);
+        // A record that stops at the parameter: the view is a parameter's storage too,
+        // and one the record misses is refused rather than assumed to be an activation.
+        let partial = record(&[(256, 32)]);
+        assert_eq!(
+            first_unrecorded_parameter(&g, &partial, &operands),
+            Some((view, 264))
+        );
+    }
+
+    /// The slot the flat plan gives a two-byte `Param` is its native width, while the
+    /// activation of the same dtype is widened — the fact the in-arena `F16`/`Bool`
+    /// verdict rests on (`node_slot_bytes` in `rlx-compile`). Read through
+    /// [`plan_node_slots`], the function the arena records its slots from, so this fails
+    /// if that rule changes; what a *real* arena makes of the recording is pinned where
+    /// the rule asks it, in `tests/host_route_operand_fit.rs`.
+    #[test]
+    fn flat_plan_slots_a_two_byte_parameter_native() {
+        let mut g = Graph::new("flat-plan-slots");
+        let p = g.param("p", rlx_ir::Shape::new(&[NE], DType::F16));
+        let x = g.input("x", rlx_ir::Shape::new(&[NE], DType::F16));
+        g.set_outputs(vec![p, x]);
+        let slots = plan_node_slots(&rlx_compile::memory::plan_memory_f32_uniform(&g, 16));
+        assert_eq!(
+            (slots[&p], slots[&x]),
+            (NE * 2, NE * 4),
+            "the flat plan sizes a non-F32 Param native and widens activations"
+        );
+        assert_eq!(
+            unstageable_reason(DType::F16, NE, slots[&p]),
+            Some(Unstageable::SlotTooNarrow),
+            "an F16 parameter in that slot is what the rule refuses in the act arena"
+        );
     }
 }

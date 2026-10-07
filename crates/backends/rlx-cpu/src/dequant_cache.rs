@@ -448,12 +448,29 @@ pub fn clear_dequant_cache() {
     }
 }
 
+/// Serializes the unit tests that clear, or assert through, the process-global
+/// cache.
+///
+/// `clear_dequant_cache()` is process-wide, so a test that pins a hit
+/// (`gguf_weight_f32` twice on one key) races every test that clears between its
+/// two lookups — the second lookup then misses and reads as a broken key rather
+/// than as interference. A clear is the only way one of these tests can lose its
+/// entry: eviction and the thrash verdict both need a multi-GB overrun of the
+/// budget, which test-sized slabs never approach. Every test that clears the
+/// cache, or asserts through it, holds this.
+#[cfg(test)]
+pub(crate) fn cache_tests_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn gguf_dequant_cache_hits_on_second_lookup() {
+        let _serial = cache_tests_lock();
         clear_dequant_cache();
         const QK_K: usize = 256;
         let mut packed = Vec::new();
@@ -488,6 +505,7 @@ mod tests {
 
     #[test]
     fn gguf_dequant_cache_q4_1_q5_hits() {
+        let _serial = cache_tests_lock();
         clear_dequant_cache();
         let w: Vec<f32> = (0..512).map(|i| (i as f32 * 0.01).sin()).collect();
         for (scheme, ggml) in [

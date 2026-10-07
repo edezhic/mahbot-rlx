@@ -18,11 +18,48 @@ no FFI, no submodules.
 - **`buffer.rs` / `Arena`** — logical activation arena with per-node offsets
   from `rlx-opt::memory::plan_memory_aligned`. When the plan exceeds wgpu
   `max_buffer_size` (~4 GiB), the arena is **striped** across multiple ≤4 GiB
-  buffers (`extra_shards`); each stripe keeps a 64 MiB stage reserve so
-  cross-shard operand copies do not clobber live activations. f32 host I/O
-  via `queue.write_buffer` / pooled MAP_READ staging readback
+  buffers (`extra_shards`); each stripe keeps a stage reserve
+  (`SHARD_STAGE_RESERVE`: a 768 MiB constant, which `RLX_WGPU_SHARD_STAGE_MIB`
+  can only lower) so cross-shard operand copies do not clobber live activations.
+  A stripe's usable region is its size minus that reserve (with a 256-byte floor),
+  and the snap that fits a compact plan into one buffer may halve the reserve
+  while it tries.
+  f32 host I/O via `queue.write_buffer` / pooled MAP_READ staging readback
   (`ReadbackStaging`, `read_f32_many_pooled`). Env: `RLX_WGPU_SHARD_LOG=1`.
   Packed quant weights may live in a separate `weight_buffer` (`from_plan_split`).
+  Physical striping is **unsupported and opt-in only** (`RLX_WGPU_ALLOW_SHARD=1`,
+  which warns uncutably on every striping decision), and the stripe count is
+  bounded (`MAX_SHARDS`): a shrunken `RLX_WGPU_SHARD_CAP_MIB` that would split an
+  arena into more stripes than that is refused loudly at plan time, before the buffers
+  it bounds are created, instead of compiling its way through the machine. The
+  engine does keep one class honest under it: an op whose kernel carries absolute
+  arena offsets (`supported_ops::addresses_arena_by_absolute_offset`) is hosted by
+  `should_host_at_ceiling` whenever the memory it addresses cannot bind at base 0
+  — the activation arena, or a parameter parked in the separate weight buffer —
+  and `WgpuExecutable::ceiling_hosted_steps()` reports that route. Two carry: a
+  carry-bearing `Lstm`/`Gru`/`Rnn` on the narrow kernel is refused loudly instead,
+  because the host route cannot write its state back into an input, while the wider
+  form keeps its own whole-arena host step — which is refused too, for a parameter
+  parked in the weight buffer or an arena past the step's 32-bit byte offsets; and
+  on an adapter that parks every parameter (`from_plan_split` under a small
+  `max_buffer_size`, or `RLX_WGPU_ALL_PARAMS_WEIGHT`), a listed op that reads a
+  parameter hosts on every run, ceiling or not — unless that parameter is one the
+  host route cannot stage (not one f32 lane per element, in what the upload stored or
+  in the slot it was given: `buffer::unstageable_reason`), which is refused
+  loudly, naming the operand and where it lives — and so is the *other* host route, the
+  structural steps (`Expand`/`Narrow`/`Transpose`/`Concat`, `scan_host::assert_read_fits`),
+  whose descriptors carry element counts rather than shapes: they ask the slot half alone,
+  though the refusal they raise still names the operand's declared encoding, read from the
+  arena's parameter record — and names none where the record cannot attribute one, since
+  the record is keyed by offset. Three arms ask that question
+  themselves instead: `Op::DequantMatMul`'s quantized sub-path refuses a packed
+  weight rather than staging it (its GGUF and Int8 sub-paths keep their own route, but
+  every other scheme's step reads the weight through the f32-lane staging), and
+  `Op::Fft`/`Op::FftQ` refuse a parked operand, which neither their GPU nor their host
+  step can address. An absolute-offset arm
+  that is not classified there and binds through the windowed path is refused at
+  bind time instead of read through a re-based window. `RLX_WGPU_SHARD_GPU=1`
+  cannot undo any of it.
 - **`kernels/matmul.wgsl`** — fp32 matmul, one workgroup per 8×8 output
   tile. Functional, not optimized.
 - **`kernels/mod.rs`** — `OnceLock`-cached pipeline + bind-group layout.
@@ -46,8 +83,9 @@ no FFI, no submodules.
   compute pass with a **per-stage uniform pool** (each stage binds its own
   slot; a *shared* uniform would alias across stages because `write_buffer`
   lands before the pass runs). Batch (`outer`) spills across the y/z grid dims
-  past wgpu's 65535 per-dimension cap. Non-pow2 / **sharded arenas** use
-  `fft_host.rs` (host sync); f64 / C64 are rejected — the wgpu arena is f32-only.
+  past wgpu's 65535 per-dimension cap. Non-pow2, **sharded** arenas and arenas past
+  the storage-binding limit use `fft_host.rs` (host sync); f64 / C64 are rejected —
+  the wgpu arena is f32-only.
   `RLX_BENCH_DISPATCH_ONLY=1` skips output readback for micro-benchmarks.
   `RLX_DISPATCH_REPORT=1` logs `fft_gpu` vs `fft_host` step counts.
 

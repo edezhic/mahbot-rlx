@@ -31,7 +31,8 @@ fn force_small_shards() {
     unsafe {
         std::env::set_var("RLX_WGPU_SHARD_CAP_MIB", TEST_SHARD_MIB.to_string());
         std::env::set_var("RLX_WGPU_SHARD_STAGE_MIB", TEST_STAGE_MIB.to_string());
-        // The striping warning is expected here; keep the output readable.
+        // Only the informational sharding logs are silenced. The opt-in warning
+        // is not quietable by design, so each striping decision still prints one.
         std::env::set_var("RLX_WGPU_QUIET_SHARD", "1");
         // Striping is refused by default now — it produces wrong results
         // silently. These tests are about the striping machinery itself, so
@@ -125,4 +126,47 @@ fn bind_spec_stays_inside_one_shard() {
     let spec2 = arena.bind_spec_for_nodes(device, &[NodeId(1)]);
     assert_eq!(spec2.rebase, (off1 / shard_cap * shard_cap) as u64);
     assert_eq!(spec2.local_base, 0);
+}
+
+/// The coarse condition behind the per-binding-ceiling routing rule
+/// (`should_host_at_ceiling` → `supported_ops::addresses_arena_by_absolute_offset`):
+/// a kernel carrying absolute arena offsets is dispatchable only when the whole
+/// arena binds at base zero, and only while its word offsets fit the `u32` the
+/// uniform declares.
+#[test]
+fn binds_whole_at_base_zero_covers_striping_limit_and_u32_words() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    force_small_shards();
+    let wgpu = rlx_wgpu::device::wgpu_device().expect("wgpu device");
+    let device = &wgpu.device;
+    let shard_cap = effective_shard_cap(device);
+
+    // Striped: never bindable whole at base zero, whatever the limit says.
+    let striped = Arena::from_plan(
+        device,
+        &fake_plan(shard_cap * 2, &[(0, 0, shard_cap - 4096)]),
+    );
+    assert!(striped.is_sharded());
+    assert!(!striped.binds_whole_at_base_zero(u64::MAX));
+
+    // Unsharded: the caller-supplied limit decides, so an arena over the
+    // device's real per-binding ceiling is testable without allocating it.
+    let plan = fake_plan(4096, &[(0, 0, 4096)]);
+    let mut arena = Arena::from_plan(device, &plan);
+    assert!(!arena.is_sharded());
+    assert!(arena.binds_whole_at_base_zero(4096));
+    assert!(!arena.binds_whole_at_base_zero(2048));
+
+    // Word offsets: `size` is only read here, so a synthetic size past
+    // `u32::MAX` words probes the truncation branch with no 16 GiB allocation.
+    // (`checked_*` because only a 64-bit `usize` can express that size at all.)
+    if let Some(beyond_u32_words) = (u32::MAX as usize)
+        .checked_add(1)
+        .and_then(|words| words.checked_mul(4))
+    {
+        arena.size = beyond_u32_words;
+        assert!(!arena.binds_whole_at_base_zero(u64::MAX));
+    }
 }

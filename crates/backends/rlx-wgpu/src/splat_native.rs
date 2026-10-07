@@ -2,6 +2,15 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Native wgpu Gaussian splat forward (RLX-owned WGSL).
+//!
+//! Binds the arena as an `as_entire_binding()` window and carries the
+//! destination as an absolute word offset, so it is correct only for an
+//! unsharded arena that one storage binding covers. On a *virtually* striped
+//! arena the over-limit bind is refused loudly by wgpu validation; on a
+//! physically striped one (`RLX_WGPU_ALLOW_SHARD=1`, whose warn-and-continue
+//! says on every use that the graph's numbers are wrong) shard 0 is bound and
+//! the render lands in the wrong place. This path is therefore not part of the
+//! supported route.
 
 #![cfg(feature = "native-splat")]
 

@@ -396,6 +396,11 @@ pub struct WgpuExecutable {
     /// `extend_static_weight_pack_liveness`).
     static_once_steps: HashSet<usize>,
     static_once_done: bool,
+    /// Steps the per-binding-ceiling rule routed to the host route. Non-zero
+    /// means the graph's arena exceeded the device's per-binding limit and at
+    /// least one absolute-addressing op was computed on the host instead of
+    /// through a re-based window. See `lower::should_host_at_ceiling`.
+    ceiling_hosted: usize,
 }
 
 mod compile;
@@ -461,6 +466,7 @@ impl WgpuExecutable {
         self.dequant_scratch_off = fresh.dequant_scratch_off;
         self.gdn_scratch_off = fresh.gdn_scratch_off;
         self.schedule = fresh.schedule;
+        self.ceiling_hosted = fresh.ceiling_hosted;
         self.input_offsets = fresh.input_offsets;
         self.param_offsets = fresh.param_offsets;
         self.uniforms = fresh.uniforms;
@@ -524,6 +530,8 @@ impl WgpuExecutable {
             weight_extra_shards: Vec::new(),
             weight_shard_size: 0,
             weight_offsets: HashMap::new(),
+            plan_slots: HashMap::new(),
+            param_slots: HashMap::new(),
         };
         Self {
             graph: graph.clone(),
@@ -564,11 +572,22 @@ impl WgpuExecutable {
             rng,
             static_once_steps: HashSet::new(),
             static_once_done: false,
+            ceiling_hosted: 0,
         }
     }
 
     pub(crate) fn all_safe_for_active(&self) -> bool {
         self.schedule.iter().all(|s| s.safe_for_active_extent())
+    }
+
+    /// Steps the per-binding-ceiling rule routed to the host route. Non-zero means
+    /// the graph's arena exceeded the device's per-binding limit (or a parameter
+    /// was parked in the weight buffer) and at least one absolute-addressing op
+    /// was computed on the host instead of through a re-based window. Exposed so a
+    /// caller (and the regression test) can observe the route rather than infer it
+    /// from timing.
+    pub fn ceiling_hosted_steps(&self) -> usize {
+        self.ceiling_hosted
     }
 
     /// Debug helper: run forward, then read every node slot back and
@@ -1029,28 +1048,30 @@ fn require_equal_shapes(graph: &Graph, ids: &[NodeId], op_name: &str) {
     }
 }
 
-/// Bind the entire arena in one storage buffer range when it fits the device limit.
 /// Can a kernel that addresses the arena with ABSOLUTE offsets be bound?
+///
+/// The shared coarse condition behind the per-binding-ceiling routing rule
+/// ([`crate::supported_ops::addresses_arena_by_absolute_offset`] +
+/// `lower::should_host_at_ceiling`): it is a thin device-limit wrapper over
+/// [`Arena::binds_whole_at_base_zero`](crate::buffer::Arena::binds_whole_at_base_zero),
+/// which also rejects an arena whose word offsets would not fit the `u32` a
+/// uniform declares. The rule hosts on its own for an op with a parked parameter
+/// operand, which this predicate does not see (see `lower::should_host_at_ceiling`).
 ///
 /// `bind_op_output_window` rebases the binding onto a window around the op's
 /// operands when the arena is sharded or larger than one storage binding, and an
 /// absolute offset is meaningless against a rebased window — it would read and
 /// write the wrong slots, silently. Kernels that carry absolute offsets (the
 /// `scaled_lowp` / `quant_i8` / `q_matmul` / `q_conv2d` family, matching the
-/// `ScaledGroupedMatMul` convention) must ask this first and keep the CPU host
-/// route when it says no.
+/// `ScaledGroupedMatMul` convention) ask this first and keep the CPU host route
+/// when it says no.
 ///
-/// **Not exercised by the test suite, and not for lack of trying.** The sharded
-/// branch is unreachable on wgpu — `buffer.rs` hard-panics on a striped arena
-/// before any of this runs, deliberately (striping produced silently wrong
-/// SynthStrip output). The other branch needs an arena larger than the device's
-/// real `max_storage_buffer_binding_size`, and `RLX_WGPU_MAX_BIND_MB` only caps
-/// the GGUF path, not this helper. So this is correct by construction — it asks
-/// exactly the question `bind_op_output_window` answers — rather than by
-/// measurement. Worth a synthetic cap on the limit if that regime ever matters.
+/// **Exercised.** A dedicated test drives the striping branch through a small
+/// `RLX_WGPU_SHARD_CAP_MIB` with `RLX_WGPU_ALLOW_SHARD=1`, and the same predicate
+/// is asked with a caller-supplied (hence synthetic) device limit, so both
+/// answers are reachable without a multi-gigabyte allocation.
 pub(crate) fn arena_binds_whole_at_zero(dev: &wgpu::Device, arena: &Arena) -> bool {
-    arena_whole_arena_bind(arena, dev.limits().max_storage_buffer_binding_size)
-        .is_some_and(|(base, _)| base == 0)
+    arena.binds_whole_at_base_zero(dev.limits().max_storage_buffer_binding_size)
 }
 
 fn arena_whole_arena_bind(arena: &Arena, max_binding: u64) -> Option<(u64, u64)> {
@@ -2131,9 +2152,16 @@ fn bind_two(
     })
 }
 
-/// Windowed arena bind. When `operand_ids` is non-empty and their span with
-/// `out_id` exceeds the binding limit, falls back to output-only window
-/// (callers should stage operands and rebase offsets).
+/// Windowed arena bind around the op's output. The window base is **not** returned,
+/// so no caller can rebase its offsets against it: every caller builds uniforms from
+/// absolute `arena.offset(id)` and is correct only while the whole arena is bound at
+/// base zero — and only for operands that live in this arena at all, since
+/// `arena_window_for_nodes` drops weight-tagged operands from the window. This is the
+/// net under `lower::should_host_at_ceiling`: an absolute-offset arm that is not
+/// classified there (or whose guard was dropped) is refused loudly by `bind_op_window`
+/// rather than producing a plausible wrong answer. A caller that genuinely needs a
+/// re-based window uses `arena_window_for_nodes` + `bind_arena_window`, which hand it
+/// the base.
 fn bind_op_output_window(
     device: &wgpu::Device,
     kernel: &Kernel,
@@ -2157,6 +2185,30 @@ fn bind_op_window(
     } else {
         arena_window_for_nodes(device, arena, &[ids[0]])
     };
+    // This path derives the window from the op's own nodes and does **not**
+    // return its base, so no caller can rebase offsets against it: every caller
+    // builds uniforms from absolute `arena.offset(id)`. The net under the routing
+    // rule (see `bind_op_output_window`). It asks the *whole* coarse condition,
+    // not just `base == 0`: a window can start at zero and still cover only one
+    // stripe, or only this op's own span, and an unlisted absolute-offset arm
+    // reading a higher offset would then be neither refused nor correct. When the
+    // condition holds, `arena_window_for_nodes` returns the whole arena (its
+    // `arena_whole_arena_bind` branch ignores the ids), so every arm that
+    // legitimately binds here already satisfies it — including the guarded ones,
+    // which host whenever it is false. WGSL makes an out-of-range access a dynamic
+    // error whose permitted outcomes (return 0 or another in-bounds value, drop the
+    // store, discard the dispatch) never include telling the caller, so there is no
+    // version of this that fails safe on its own.
+    assert!(
+        base == 0 && arena.binds_whole_at_base_zero(max_binding),
+        "rlx-wgpu: REFUSED (arena not bindable whole): the window for {ids:?} starts at {base} \
+         (size {size}) of an arena of {} bytes, but this bind path cannot rebase a kernel's \
+         ABSOLUTE offsets — only the whole arena bound at base zero is correct. Classify the op \
+         that owns {ids:?} in `supported_ops::addresses_arena_by_absolute_offset` so \
+         `lower::should_host_at_ceiling` routes it, or bind through the base-returning window \
+         helpers.",
+        arena.size,
+    );
     bind_arena_window(device, kernel, arena, base, size, params)
 }
 

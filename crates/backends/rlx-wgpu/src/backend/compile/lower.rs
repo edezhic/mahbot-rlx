@@ -295,6 +295,12 @@ fn should_pack_host_op(
     // "return zeros". So the straddle test runs BEFORE that opt-out and hosting
     // wins — the host path reads whole tensors and is stripe-agnostic, so the
     // answer is right and only this one op pays.
+    //
+    // The complementary case — an op whose operands and result all share one
+    // stripe, but whose kernel addresses the arena by ABSOLUTE offset — is not a
+    // straddle and is not caught here: `should_host_at_ceiling` runs before this
+    // whole function and hosts it whenever the arena cannot be bound whole at
+    // base zero, also ahead of the `RLX_WGPU_SHARD_GPU` opt-out.
     if arena.is_sharded() && op_straddles_shards(arena, node, graph) {
         return true;
     }
@@ -332,6 +338,228 @@ fn should_pack_host_op(
         return wgpu_prefer_host_fallback(arena) || crate::device::coop_discrete_backend();
     }
     false
+}
+
+/// The per-binding-ceiling rule: one rule, decided at plan time.
+///
+/// An op whose kernel carries absolute arena offsets — the family (and the two
+/// measured failures) in `supported_ops::addresses_arena_by_absolute_offset` — is
+/// computed by the engine's host route instead whenever the memory it addresses
+/// cannot be bound whole at base zero. The host route addresses memory by absolute
+/// byte range (resolving weight-buffer tags) and is window-agnostic, so the answer is
+/// right and only these ops pay — except a carry-bearing `Lstm`/`Gru`/`Rnn`, which
+/// `supported_ops::carry_lowering` splits in two: the narrow kernel's variant is refused
+/// (the host step carries a single output offset and cannot write state back into an
+/// input), and the wider one keeps its own whole-arena host step, which the rule
+/// leaves alone only while no operand is parked and the arena stays inside that
+/// step's 32-bit byte offsets.
+///
+/// This runs BEFORE every other routing rule, so `RLX_WGPU_SHARD_GPU` and the
+/// discrete/structural host preferences cannot undo it, and an op that is not on that
+/// list is untouched. An op that IS on the list but has no host route — or is a
+/// carry-bearing `Lstm`/`Gru`/`Rnn` whose geometry its own host step cannot take — is
+/// refused loudly, naming the op.
+///
+/// Two geometries decide it, both read off the arena rather than off any op's
+/// window base. The activation arena must bind whole at base zero
+/// (`Arena::binds_whole_at_base_zero`). Separately, an operand parked in the
+/// weight buffer settles the case on its own: `Arena::offset` reports such a
+/// parameter as a `WEIGHT_BUF_TAG`-tagged offset, and these arms pass it into a
+/// `u32` uniform of a kernel bound to the ACT arena, where the tag vanishes in
+/// the cast and the kernel reads a plausible activation instead of the
+/// parameter. Resolving a parked parameter needs `Arena::resolve_w`, staging
+/// (`arena_off_in_window_or_stage`) or a separate binding, and no arm on this
+/// list uses any of them — `arena_window_for_nodes` skips tagged operands for
+/// exactly that reason. A parameter the host route cannot stage — one whose read is
+/// not one f32 lane per element, in what the upload stored or in the slot its plan
+/// gave it ([`crate::buffer::unstageable_reason`]) — is refused instead
+/// ([`assert_host_route_stageable`]), wherever that parameter lives.
+///
+/// The price of that second geometry: on an adapter that parks every parameter
+/// (`from_plan_split` under a small `max_buffer_size`, or
+/// `RLX_WGPU_ALL_PARAMS_WEIGHT`), a listed op that reads a parameter hosts on
+/// every run, ceiling or not — except for a parameter the route cannot stage,
+/// which [`assert_host_route_stageable`] refuses instead.
+fn should_host_at_ceiling(
+    dev: &wgpu::Device,
+    arena: &Arena,
+    graph: &Graph,
+    node: &rlx_ir::Node,
+) -> bool {
+    let limit = dev.limits().max_storage_buffer_binding_size;
+    let parked_operand = any_parked_operand(arena, node);
+    if !parked_operand && arena.binds_whole_at_base_zero(limit) {
+        return false;
+    }
+    // What the messages below name as unbindable: the parked region, or the arena.
+    let unbindable = || {
+        if parked_operand {
+            parked_operand_report(arena)
+        } else {
+            geometry_report(arena, limit)
+        }
+    };
+    let op = &node.op;
+    if !crate::supported_ops::addresses_arena_by_absolute_offset(op) {
+        return false;
+    }
+    match crate::supported_ops::carry_lowering(op) {
+        crate::supported_ops::CarryLowering::WindowedKernel => panic!(
+            "rlx-wgpu: REFUSED (carry state): {:?} writes its final state back into a state input \
+             buffer, but the host route carries only one output offset, so the state would silently \
+             never advance; this op's own kernel addresses the arena by absolute offset, so it cannot \
+             be computed correctly here ({}). Avoid striping this graph, or move it to a backend that \
+             can.",
+            op.kind(),
+            unbindable()
+        ),
+        // Wider than the narrow kernel's bound: the op keeps its own whole-arena host
+        // step. That step mirrors the ACTIVATION arena only and carries 32-bit byte
+        // offsets, so a parked operand (whose weight-buffer tag is truncated away in
+        // the cast, leaving it read from the mirror) and an arena past `u32::MAX`
+        // bytes (which truncates every offset) both compute the recurrence silently
+        // wrong — and the generic host route cannot take over, because it cannot
+        // write the state back into an input. Refuse rather than return a wrong state.
+        crate::supported_ops::CarryLowering::WholeArenaHostStep => {
+            assert!(
+                !parked_operand && arena.size <= u32::MAX as usize,
+                "rlx-wgpu: REFUSED (wide carry RNN): {:?} keeps its own whole-arena host step, \
+                 which mirrors the activation arena with 32-bit byte offsets — neither a \
+                 parameter parked in the weight buffer nor an arena over 2^32 bytes can be \
+                 computed through it, and the generic host route cannot write its state back \
+                 into an input ({}). Avoid parking this operand or shrinking the arena, or move \
+                 the graph to a backend that can.",
+                op.kind(),
+                unbindable()
+            );
+            return false;
+        }
+        crate::supported_ops::CarryLowering::NotCarrying => {}
+    }
+    if crate::supported_ops::has_generic_cpu_route(op.kind()) {
+        assert_host_route_stageable(graph, arena, node);
+        if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+            eprintln!(
+                "[rlx-wgpu] ceiling: hosting {:?} ({})",
+                op.kind(),
+                unbindable()
+            );
+        }
+        // Reported once per process, like the stripe-straddle note: this is the
+        // safe route, but a caller comparing timings must be able to see that
+        // some of the graph left the GPU because of the ceiling rather than
+        // guess it. `WgpuExecutable::ceiling_hosted_steps()` counts every case.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[rlx-wgpu] note: hosting {:?} — the memory it addresses cannot be bound whole \
+                 at base zero, or lives in the parked weight buffer ({}), so a kernel whose \
+                 offsets are ABSOLUTE would read the wrong slots; it is computed on the host \
+                 instead. Reported once per process; `ceiling_hosted_steps()` counts every case.",
+                op.kind(),
+                unbindable()
+            );
+        }
+        return true;
+    }
+    panic!(
+        "rlx-wgpu: REFUSED (per-binding ceiling): {:?} addresses memory by absolute offset that \
+         cannot be bound whole at base zero ({}), and no host route is known to compute it — it \
+         cannot be computed correctly here. Avoid striping this graph, or move it to a backend \
+         that can.",
+        op.kind(),
+        unbindable()
+    );
+}
+
+/// Does any operand of `node` live in the separate weight buffer?
+fn any_parked_operand(arena: &Arena, node: &rlx_ir::Node) -> bool {
+    node.inputs
+        .iter()
+        .any(|&i| crate::buffer::is_weight_off(arena.offset(i)))
+}
+
+/// Refuse a listed op whose *parameter* operand the generic host route cannot stage.
+///
+/// That route reads every operand as one f32 lane per element, so a parameter is
+/// stageable only where its storage and the slot it was given really are that
+/// ([`crate::buffer::unstageable_reason`] is the condition,
+/// [`crate::buffer::refuse_unstageable_operand`] the message).
+/// [`crate::buffer::first_unstageable_operand`] is that walk, shared with
+/// `crate::scan_host::assert_host_reads_fit`, which asks the same question of every
+/// operand the host route stages; an operand the arena has no parameter record for reads
+/// as an activation there, and an activation holds one f32 lane per element, so reading
+/// it always fits.
+///
+/// The graph is what makes this site stronger than that walk: an operand that *is* a
+/// parameter's storage (`crate::buffer::is_parameter_storage`) with no record for its
+/// offset is refused rather than read as an activation — the arena was built without
+/// `Arena::record_param_storage`, and an unanswerable decision takes the safe default.
+fn assert_host_route_stageable(graph: &Graph, arena: &Arena, node: &rlx_ir::Node) {
+    let operands = node.inputs.iter().map(|&id| {
+        let shape = &graph.node(id).shape;
+        (
+            id,
+            arena.offset(id),
+            shape.dtype(),
+            shape.num_elements().unwrap_or(0),
+        )
+    });
+    if let Some((id, off, dtype, reason)) =
+        crate::buffer::first_unstageable_operand(arena, operands)
+    {
+        crate::buffer::refuse_unstageable_operand(
+            node.op.kind(),
+            &format!("{id:?} {}", crate::buffer::operand_location(off)),
+            Some(dtype),
+            reason,
+        );
+    }
+    // A parameter operand the arena holds no record for cannot be judged at all — its
+    // silence reads as "activation". Refusing is the safe default for a decision the
+    // arena cannot answer: the graph is here and the arena's record is not, which is the
+    // one combination `Arena::param_storage_at` documents as an obligation of the builder.
+    let operands: Vec<_> = node
+        .inputs
+        .iter()
+        .map(|&id| (id, arena.offset(id)))
+        .collect();
+    if let Some((id, off)) =
+        crate::buffer::first_unrecorded_parameter(graph, &arena.param_slots, &operands)
+    {
+        crate::buffer::refuse_unstageable_operand(
+            node.op.kind(),
+            &format!("{id:?} {}", crate::buffer::operand_location(off)),
+            Some(graph.node(id).shape.dtype()),
+            crate::buffer::Unstageable::NoRecord,
+        );
+    }
+}
+
+/// The addressed geometry, for the ceiling rule's messages: which arena could not
+/// be bound whole, and why.
+fn geometry_report(arena: &Arena, limit: u64) -> String {
+    if arena.is_sharded() {
+        format!(
+            "activation arena {} B is striped, per-binding limit {limit} B",
+            arena.size
+        )
+    } else {
+        format!(
+            "activation arena {} B vs storage binding limit {limit} B",
+            arena.size
+        )
+    }
+}
+
+/// [`geometry_report`]'s other half, for the arms that refuse because a *parameter
+/// operand* is parked: the separate region is what they cannot address, whatever the
+/// activation arena's own geometry.
+fn parked_operand_report(arena: &Arena) -> String {
+    format!(
+        "a parameter operand is parked in the weight buffer (activation arena {} B)",
+        arena.size
+    )
 }
 
 /// Whether `Op::GroupNorm` must fall back to the whole-arena host step.
@@ -526,10 +754,22 @@ pub(crate) fn compile_static_inner(
     // window (not only when it exceeds max_buffer_size). On Metal we raise
     // max_buffer_size to ~40 GiB so F5 fits in one buffer, but Param→Reshape
     // views still need the split pass or they stay zeroed and DiT collapses.
-    let mut arena = if (plan.arena_size + scratch_bytes) as u64 > max_bind {
+    // `RLX_WGPU_ALL_PARAMS_WEIGHT` is what makes that planner park EVERY parameter,
+    // as its name says; without the flag reaching this decision, the parked-operand
+    // half of `should_host_at_ceiling` would only be reachable on adapters whose plan
+    // happens to exceed the bind window.
+    let mut arena = if rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
+        || (plan.arena_size + scratch_bytes) as u64 > max_bind
+    {
+        // This constructor has the graph, so it records the parameter-storage bounds
+        // itself, from the compact plan it re-plans and places the parameters under.
         Arena::from_plan_split(&dev.device, &plan, &graph, scratch_bytes)
     } else {
-        Arena::from_plan_with_scratch(&dev.device, &plan, scratch_bytes)
+        // This one never sees a graph, so its record is taken here: one recording per
+        // arena, both plans covered.
+        let mut flat = Arena::from_plan_with_scratch(&dev.device, &plan, scratch_bytes);
+        flat.record_param_storage(&graph);
+        flat
     };
     let _ = max_buf;
     // Override slot lengths with the actual elem*4 byte counts so
@@ -949,6 +1189,10 @@ pub(crate) fn compile_static_inner(
     // Which node each emitted step belongs to. Recorded at the *top* of the next
     // iteration so the many `continue`s in the match below cannot skip it.
     let mut step_nodes: Vec<NodeId> = Vec::new();
+    // Steps the per-binding-ceiling rule routed to the host route (see
+    // `should_host_at_ceiling`); surfaced on `WgpuExecutable` so the route is
+    // observable rather than inferred.
+    let mut ceiling_hosted: usize = 0;
     let mut prev_node: Option<NodeId> = None;
     for node in graph.nodes() {
         if let Some(prev) = prev_node {
@@ -957,6 +1201,16 @@ pub(crate) fn compile_static_inner(
             }
         }
         prev_node = Some(node.id);
+        // ── The per-binding-ceiling rule (one rule, closed by default) ────────
+        // Before every other routing rule, for the reason its own doc gives; see
+        // `should_host_at_ceiling` and `supported_ops::addresses_arena_by_absolute_offset`.
+        if should_host_at_ceiling(&dev.device, &arena, &graph, node) {
+            ceiling_hosted += 1;
+            schedule.push(Step::HostOp {
+                desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+            });
+            continue;
+        }
         // Helpers — capture device + arena into closures isn't
         // ergonomic in the loop, so inline the bind-group build
         // when each step is emitted below.
@@ -5223,19 +5477,10 @@ pub(crate) fn compile_static_inner(
                 // Those lower to a deterministic argmax (ties → lowest index);
                 // temperature == 1.0 is a real draw, NOT greedy.
                 let is_greedy = *temperature <= 0.0 || *top_k == 1;
-                // Sample indexes the arena with absolute offsets (logits, scratch, output)
-                // but binds only its output window, so it is only correct when the whole
-                // arena binds at base 0. Refuse loudly rather than read outside the window
-                // and return a plausible wrong token.
-                if !arena_binds_whole_at_zero(&dev.device, &arena) {
-                    panic!(
-                        "rlx-wgpu: Op::Sample needs the whole arena bound at base 0 \
-                         (arena {} bytes vs storage binding limit {}); its logits/scratch \
-                         offsets cannot be resolved in a sharded/split arena",
-                        arena.size,
-                        dev.device.limits().max_storage_buffer_binding_size
-                    );
-                }
+                // Reached only when the whole arena binds at base zero: this arm
+                // indexes the arena with absolute offsets (logits, scratch, output)
+                // but binds only its output window, so `should_host_at_ceiling` has
+                // already routed the op to the host route otherwise.
                 if is_greedy {
                     let p = ArgmaxParams {
                         outer,
@@ -6108,9 +6353,45 @@ pub(crate) fn compile_static_inner(
                     "rlx-wgpu Op::Fft: only f32 is supported on the wgpu backend \
                      (the arena is f32-uniform); got {dtype:?}. Run f64/c64 FFT on CPU."
                 );
+                // The GPU step binds the whole physical buffer and carries absolute
+                // WORD offsets (`offset/4`), so it is correct only when the whole
+                // arena binds at base zero — the same question the
+                // per-binding-ceiling rule asks. Anything else keeps its own host
+                // step below, which stages the span by byte range and stitches
+                // across stripes. Decided first, because which step runs decides
+                // what the arena size has to satisfy.
                 let use_gpu = rlx_ir::fft::gpu_fft_native_eligible(dtype, meta.n_complex)
                     && meta.n_complex >= 2
-                    && !arena.is_sharded();
+                    && arena.binds_whole_at_base_zero(
+                        dev.device.limits().max_storage_buffer_binding_size,
+                    );
+                // A parameter operand parked in the separate weight buffer cannot
+                // be addressed here at all: `Step::FftGpu` and `Step::FftHost` both
+                // carry offsets that drop the `WEIGHT_BUF_TAG`, so the transform
+                // reads the activation arena instead. No in-tree graph feeds `Fft`
+                // a parameter — this is structural — so refuse loudly rather than
+                // leave a route that would read the wrong buffer silently.
+                assert!(
+                    !any_parked_operand(&arena, node),
+                    "rlx-wgpu: REFUSED (parked FFT operand): Op::Fft reads {in_id:?} parked in the \
+                     weight buffer ({}); both its device step and its host step carry offsets that \
+                     drop the parked tag. Avoid parking this operand, or move the graph to a \
+                     backend that can address it.",
+                    parked_operand_report(&arena)
+                );
+                // `FftHost` carries absolute BYTE offsets in `u32`, so the host route
+                // — the one this falls back to whenever the device step is not
+                // eligible — cannot address an arena past that range. The device
+                // step needs no such bound: its word offsets fit whenever it is
+                // eligible at all (`binds_whole_at_base_zero` already requires
+                // `size / 4` to fit a `u32`).
+                assert!(
+                    use_gpu || arena.size <= u32::MAX as usize,
+                    "rlx-wgpu: REFUSED (FFT arena too large): Op::Fft's host step carries 32-bit \
+                     byte offsets and this arena is {} bytes, so its offsets would truncate. \
+                     Shrink the arena, or run the transform on a backend that can address it.",
+                    arena.size
+                );
                 let scale = norm.output_scale(meta.n_complex, *inverse) as f32;
                 if use_gpu {
                     schedule.push(Step::FftGpu {
@@ -6146,7 +6427,23 @@ pub(crate) fn compile_static_inner(
                 // converts rather than reinterpreting; reading these slots as
                 // raw i32 yields float bit patterns. The conversion is exact
                 // to 2^24 and panics past it rather than dropping low bits.
+                //
+                // `Step::FftQHost` carries those byte offsets in `u32` and resolves
+                // no weight-buffer tag, so it is the same class of geometry the
+                // `Op::Fft` arm above refuses: a parameter parked in the weight
+                // buffer (its tag dropped by the cast) or an arena past the 32-bit
+                // byte range (every offset truncated) reads and writes the wrong
+                // slots. There is no other route for `FftQ`, so refuse loudly.
                 let in_id = node.inputs[0];
+                assert!(
+                    !any_parked_operand(&arena, node) && arena.size <= u32::MAX as usize,
+                    "rlx-wgpu: REFUSED (FftQ geometry): Op::FftQ's only route carries 32-bit byte \
+                     offsets and resolves no parked tag, so a parameter parked in the weight \
+                     buffer or an arena over 2^32 bytes (arena {} B, parked={}) would read the \
+                     wrong slots. Avoid parking this operand or shrink the arena.",
+                    arena.size,
+                    any_parked_operand(&arena, node)
+                );
                 let in_shape = graph.node(in_id).shape.clone();
                 let meta = rlx_ir::fft::fft_meta(&in_shape);
                 schedule.push(Step::FftQHost {
@@ -6318,7 +6615,7 @@ pub(crate) fn compile_static_inner(
                 let seq = in_dims[1].unwrap_static() as u32;
                 let input_size = in_dims[2].unwrap_static() as u32;
                 let hidden = *hidden_size as u32;
-                if hidden <= 256 {
+                if hidden <= crate::supported_ops::NARROW_RNN_HIDDEN_MAX {
                     // One dispatch per (layer, direction); intermediate layer
                     // outputs ping-pong through the in-arena scratch pair. Bit-
                     // for-bit mirror of `execute_gru_f32` (weight packing).
@@ -6421,7 +6718,7 @@ pub(crate) fn compile_static_inner(
                 let seq = in_dims[1].unwrap_static() as u32;
                 let input_size = in_dims[2].unwrap_static() as u32;
                 let hidden = *hidden_size as u32;
-                if hidden <= 256 {
+                if hidden <= crate::supported_ops::NARROW_RNN_HIDDEN_MAX {
                     // One dispatch per (layer, direction); intermediate layer
                     // outputs ping-pong through the in-arena scratch pair. Bit-
                     // for-bit mirror of `execute_rnn_f32` (single merged bias).
@@ -6755,7 +7052,7 @@ pub(crate) fn compile_static_inner(
                 // is back to the real limit on every adapter. Checked against an
                 // independent f64 reference in
                 // `rlx-runtime/tests/lstm_three_way.rs`.
-                if hidden <= 256 {
+                if hidden <= crate::supported_ops::NARROW_RNN_HIDDEN_MAX {
                     // One dispatch per (layer, direction); intermediate layer
                     // outputs ping-pong through the in-arena scratch pair. Bit-
                     // for-bit mirror of `execute_lstm_f32` (gate order i,f,g,o;
@@ -9223,7 +9520,34 @@ pub(crate) fn compile_static_inner(
                     };
                     let pw_off = arena.offset(pw_id) as u32;
                     let out_off = arena.offset(node.id) as u32;
-                    if n as usize >= crate::umap_knn_host::UMAP_KNN_GPU_MIN_N {
+                    // `pw_off` is `arena.offset(pw_id) as u32`, so a pairwise matrix
+                    // supplied as a Param and parked in the separate weight buffer
+                    // loses the `WEIGHT_BUF_TAG` in the cast and is read as a
+                    // plausible activation. `Step::UmapKnn` reads it by ABSOLUTE
+                    // word offset and `Step::UmapKnnHost` by a bare byte offset, so
+                    // neither sub-path can express a parked operand — refuse, like
+                    // `Op::DequantMatMul`'s in-arm guard.
+                    if crate::buffer::is_weight_off(arena.offset(pw_id)) {
+                        panic!(
+                            "rlx-wgpu: REFUSED (umap.knn parked operand): the pairwise matrix is \
+                             parked in the weight buffer ({}), and both sub-paths address it by a \
+                             bare offset that drops the weight tag — it would be read as a \
+                             plausible activation. Avoid parking this operand, or move the graph to \
+                             a backend that can.",
+                            parked_operand_report(&arena)
+                        );
+                    }
+                    // `Step::UmapKnn` reads `pw`/`out` by ABSOLUTE word offset
+                    // through the output window, so it is only correct when the
+                    // whole arena binds at base zero. The host step addresses the
+                    // arena by byte offset and is window-agnostic — the same
+                    // coarse condition the per-binding-ceiling rule asks, applied
+                    // here because this is a `Op::Custom` sub-path the rule's
+                    // family list does not cover.
+                    let whole_at_zero = arena.binds_whole_at_base_zero(
+                        dev.device.limits().max_storage_buffer_binding_size,
+                    );
+                    if n as usize >= crate::umap_knn_host::UMAP_KNN_GPU_MIN_N && whole_at_zero {
                         let p = UmapKnnParams {
                             n,
                             k,
@@ -10296,19 +10620,37 @@ pub(crate) fn compile_static_inner(
                     let scale_id = node.inputs[2];
                     let zp_id = node.inputs[3];
                     // The GPU WGSL kernel binds the packed weight as a storage
-                    // buffer. A weight parked in the separate `weight_buffer`
-                    // (only large models — >~1 GiB — spill there) is read wrong
-                    // at large offsets: a driver-level defect (zeros past a
-                    // fuzzy ~2-3 GiB cliff, exhaustively ruled non-binding in the
-                    // llama-lm-head investigation). Host those — correct and
-                    // proven — while small models keep their in-arena GPU path.
-                    // Also host anything genuinely past the binding limit
-                    // (discrete Vulkan/DX12, where max_bind is 2 GiB).
+                    // buffer, so a weight past the binding limit (discrete
+                    // Vulkan/DX12, where max_bind is 2 GiB) must host. A weight
+                    // parked in the separate `weight_buffer` used to be its own
+                    // disjunct here — a driver-level defect reads those wrong at
+                    // large offsets (zeros past a fuzzy ~2-3 GiB cliff, exhaustively
+                    // ruled non-binding in the llama-lm-head investigation) — and is
+                    // now covered by `parked_operand` below, which asks every
+                    // operand rather than the weight alone. Small in-arena models
+                    // keep the GPU path.
                     let max_bind = dev.device.limits().max_storage_buffer_binding_size as usize;
                     let w_off_tagged = arena.offset(w_id);
-                    let weight_host = crate::buffer::is_weight_off(w_off_tagged)
-                        || crate::buffer::raw_weight_off(w_off_tagged) >= max_bind;
-                    if rlx_gpu_host::mlx_dequant_gpu_disabled() || weight_host {
+                    let weight_host = crate::buffer::raw_weight_off(w_off_tagged) >= max_bind;
+                    // `DequantMatmulMlxParams` carries absolute word offsets and
+                    // the kernel applies them to an output window, so the GPU
+                    // branch is correct only below the per-binding ceiling and only
+                    // while every operand is addressed from the act arena — the
+                    // same two geometry questions `should_host_at_ceiling` asks,
+                    // applied here because `Op::DequantMatMul` is not on that
+                    // rule's list (its GGUF and Int8 sub-paths are host steps and
+                    // must keep that route). `any_parked_operand` covers `scale`
+                    // and `zp` as well as the weight: their offsets are derived the
+                    // same way and lose their parked provenance in the same `u32`
+                    // cast, so the weight-only `weight_host` test alone would read
+                    // them from the activation arena silently.
+                    let whole_at_zero = arena.binds_whole_at_base_zero(max_bind as u64);
+                    let parked_operand = any_parked_operand(&arena, node);
+                    if rlx_gpu_host::mlx_dequant_gpu_disabled()
+                        || weight_host
+                        || parked_operand
+                        || !whole_at_zero
+                    {
                         schedule.push(Step::DequantMatmulMlxHost {
                             m,
                             k,
@@ -10354,26 +10696,51 @@ pub(crate) fn compile_static_inner(
                     };
                     let scale_id = node.inputs[2];
                     let zp_id = node.inputs[3];
-                    let p = DequantMatmulParams {
-                        m,
-                        k,
-                        n,
-                        block_size,
-                        scheme_id,
-                        x_off: (arena.offset(x_id) / 4) as u32,
-                        w_off: (arena.offset(w_id) / 4) as u32,
-                        scale_off: (arena.offset(scale_id) / 4) as u32,
-                        zp_off: (arena.offset(zp_id) / 4) as u32,
-                        out_off: (arena.offset(node.id) / 4) as u32,
-                        _p0: 0,
-                        _p1: 0,
-                    };
-                    schedule.push(Step::DequantMatmul { params: p });
-                    let dk = dequant_matmul_kernel(&dev.device);
-                    let u = emit_uniform(std::mem::size_of::<DequantMatmulParams>());
-                    let bg = bind_op_output_window(&dev.device, dk, &arena, node.id, &u);
-                    uniforms.push(u);
-                    bind_groups.push(bg);
+                    // `DequantMatmulParams` carries absolute word offsets the
+                    // kernel applies to an output window, so the GPU step needs
+                    // the same two geometry questions the MLX arm above asks —
+                    // asked here because `Op::DequantMatMul` is not on the ceiling
+                    // rule's list (its GGUF and Int8 sub-paths are host steps and
+                    // keep that route). `any_parked_operand` covers `scale` and
+                    // `zp` as well as the weight: their offsets lose the parked
+                    // tag in the same `u32` cast, so a weight-only test would read
+                    // them from the activation arena silently.
+                    if !arena.binds_whole_at_base_zero(
+                        dev.device.limits().max_storage_buffer_binding_size,
+                    ) || any_parked_operand(&arena, node)
+                    {
+                        // A parked *packed* weight (the usual case for this arm)
+                        // cannot be staged by the generic host route, which sizes
+                        // every operand as f32; `assert_host_route_stageable`
+                        // refuses it loudly instead of reading four times its
+                        // length, past the operand and possibly past the weight
+                        // buffer.
+                        assert_host_route_stageable(&graph, &arena, node);
+                        schedule.push(Step::HostOp {
+                            desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+                        });
+                    } else {
+                        let p = DequantMatmulParams {
+                            m,
+                            k,
+                            n,
+                            block_size,
+                            scheme_id,
+                            x_off: (arena.offset(x_id) / 4) as u32,
+                            w_off: (arena.offset(w_id) / 4) as u32,
+                            scale_off: (arena.offset(scale_id) / 4) as u32,
+                            zp_off: (arena.offset(zp_id) / 4) as u32,
+                            out_off: (arena.offset(node.id) / 4) as u32,
+                            _p0: 0,
+                            _p1: 0,
+                        };
+                        schedule.push(Step::DequantMatmul { params: p });
+                        let dk = dequant_matmul_kernel(&dev.device);
+                        let u = emit_uniform(std::mem::size_of::<DequantMatmulParams>());
+                        let bg = bind_op_output_window(&dev.device, dk, &arena, node.id, &u);
+                        uniforms.push(u);
+                        bind_groups.push(bg);
+                    }
                 }
             }
             Op::RmsNormBackwardInput { eps, .. }
@@ -10865,9 +11232,20 @@ pub(crate) fn compile_static_inner(
         }
         let arena_mb = arena.size as f64 / (1u64 << 20) as f64;
         eprintln!(
-            "[rlx-wgpu] schedule: {} steps, arena={arena_mb:.1} MiB, fft_gpu={fft_gpu}, fft_host={fft_host}",
+            "[rlx-wgpu] schedule: {} steps, arena={arena_mb:.1} MiB, fft_gpu={fft_gpu}, \
+             fft_host={fft_host}, ceiling_hosted={ceiling_hosted}",
             schedule.len()
         );
+        if ceiling_hosted > 0 {
+            eprintln!(
+                "    per-binding ceiling: {ceiling_hosted} step(s) computed on the host — the \
+                 memory they address could not be bound whole at base zero (an arena over the \
+                 device's max storage-buffer binding, a striped arena, or a parameter parked in \
+                 the weight buffer), so absolute-addressing ops were hosted instead of reading \
+                 the wrong slots. Keep the arena under the per-binding limit and its parameters \
+                 in it (do not set RLX_WGPU_ALLOW_SHARD)."
+            );
+        }
         for (n, c) in &counts {
             eprintln!("    {c:>4} × {n}");
         }
@@ -10919,6 +11297,7 @@ pub(crate) fn compile_static_inner(
         rng,
         static_once_steps,
         static_once_done: false,
+        ceiling_hosted,
     }
 }
 
