@@ -791,15 +791,11 @@ fn extend_custom_op_input_liveness(
     // as a normal-step consumer and considers the input free for reuse after
     // that step. Without this extension, attention output (last read by the
     // o_proj DequantMatMul) gets clobbered between attention's GPU dispatch
-    // and the host o_proj flush, producing exact-zero downstream values
-    // (task #50). The fix is conservative — extends only the direct
-    // activation input (operand 0), not the whole ancestor chain — because
-    // weights (operand 1+) are always Params and already pinned.
-    // GATE: only needed when a dequant matmul can hit the deferred-host flush.
-    // A backend that runs ALL dequant matmuls on-GPU passes
-    // `dequant_host_fallback=false`; skipping this restores slot reuse (the
-    // chain-walk otherwise pins nearly every activation in a packed prefill to
-    // the graph end — qwen3.5 8K packed prefill: 61.9 GB pinned vs ~4 GB reused).
+    // and the host o_proj flush, producing exact-zero downstream values.
+    // Seeded at operand 0 only — the weight operands (1+) are Params, pinned
+    // anyway — while the walk behind that seed covers the whole transitive
+    // ancestor chain, which is why this is costly on a packed decode graph. Only
+    // a deferred read needs the pin; `rlx-wgpu` derives it off.
     // Same hazard, different ops: `rlx-wgpu` lowers Expand / Concat / Transpose
     // / Narrow to *host* steps on a discrete Vulkan/DX12 backend
     // (`wgpu_prefer_structure_host`), and those outputs "live only in the mirror
@@ -985,11 +981,10 @@ pub struct MemoryPlanOptions {
     pub pin_output_ancestors: bool,
     /// When true (default), pin every `DequantMatMul`/`DequantGroupedMatMul`
     /// activation input (operand 0) live-to-end — guards the deferred-host dequant
-    /// path (task #50: the host o_proj flush reads an activation a later GPU op
-    /// would otherwise have reused → exact-zero downstream). A backend that runs
-    /// ALL dequant matmuls on-GPU (no host flush) sets this false to restore slot
-    /// reuse: without it, packed prefills pin nearly every activation to the graph
-    /// end (qwen3.5 8K packed prefill: 61.9 GB pinned vs ~4 GB reused).
+    /// path (a host o_proj flush reads an activation a later GPU op would otherwise
+    /// have reused → exact-zero downstream). Only a deferred read needs it, so a
+    /// backend whose packed multiplies all read inside their own step sets this
+    /// false and plans through [`plan_memory_with_dequant_guard`].
     pub dequant_host_fallback: bool,
     /// When true, do not reserve arena for transposes the backend will fold into
     /// GEMM trans-flags — see [`is_elidable_folded_transpose`].
@@ -1152,6 +1147,13 @@ pub fn plan_memory_aligned(graph: &Graph, alignment: usize) -> MemoryPlan {
     )
 }
 
+/// The output-ancestor pin [`plan_memory_f32_uniform`] derives — host indexing plus
+/// the `RLX_PIN_OUTPUT_ANCESTORS` override that planner alone honours.
+fn f32_uniform_output_ancestor_pin(graph: &Graph) -> bool {
+    graph_has_host_indexing(graph)
+        || rlx_ir::env::var("RLX_PIN_OUTPUT_ANCESTORS").as_deref() == Some("1")
+}
+
 /// Liveness-aware planning with every slot sized as `num_elements * 4`
 /// bytes (wgpu / uniform-f32 arenas). Reuses dead tensor slots so large
 /// `[n, n]` pairwise graphs stay under WebGPU's 128 MiB binding cap.
@@ -1161,8 +1163,7 @@ pub fn plan_memory_aligned(graph: &Graph, alignment: usize) -> MemoryPlan {
 /// reuse slots that a mid-schedule CPU indexing thunk still needs to read,
 /// which drifts long ODE chains (F5 DiT on a sharded >4 GiB arena).
 pub fn plan_memory_f32_uniform(graph: &Graph, alignment: usize) -> MemoryPlan {
-    let pin = graph_has_host_indexing(graph)
-        || rlx_ir::env::var("RLX_PIN_OUTPUT_ANCESTORS").as_deref() == Some("1");
+    let pin = f32_uniform_output_ancestor_pin(graph);
     let opts = MemoryPlanOptions {
         // Default off: deep feed-forward vocoders (HiFi-GAN) need reuse to
         // stay under wgpu's 4 GiB single-buffer / binding limits.
@@ -1259,6 +1260,44 @@ pub fn plan_memory_with_policy(
     plan_memory_aligned_inner(graph, alignment, opts, None, policy)
 }
 
+/// Which named planner a [`plan_memory_with_dequant_guard`] call stands in for: the
+/// variant fixes the width policy, parameter allocation and output-ancestor pin.
+#[derive(Debug, Clone, Copy)]
+pub enum GuardedPlanner {
+    F32Uniform,
+    F32UniformNoParams,
+    Native,
+    Hybrid,
+}
+
+impl GuardedPlanner {
+    /// The planner's options, apart from the dequant guard the caller derives.
+    fn options(self, graph: &Graph, dequant_host_read_deferred: bool) -> MemoryPlanOptions {
+        MemoryPlanOptions {
+            allocate_params: !matches!(self, GuardedPlanner::F32UniformNoParams),
+            pin_output_ancestors: match self {
+                GuardedPlanner::F32Uniform => f32_uniform_output_ancestor_pin(graph),
+                GuardedPlanner::F32UniformNoParams
+                | GuardedPlanner::Native
+                | GuardedPlanner::Hybrid => graph_has_host_indexing(graph),
+            },
+            dequant_host_fallback: dequant_host_read_deferred,
+            ..MemoryPlanOptions::default()
+        }
+    }
+
+    /// The width policy of the planner this stands in for.
+    fn width(self) -> ArenaWidthPolicy {
+        match self {
+            GuardedPlanner::F32Uniform | GuardedPlanner::F32UniformNoParams => {
+                ArenaWidthPolicy::F32Uniform
+            }
+            GuardedPlanner::Native => ArenaWidthPolicy::Native,
+            GuardedPlanner::Hybrid => ArenaWidthPolicy::Hybrid,
+        }
+    }
+}
+
 /// Same as [`plan_memory_f32_uniform`] but leaves `Op::Param` nodes UNassigned
 /// (`allocate_params: false`) so the caller can park large packed weights in a
 /// separate buffer. Used by wgpu to keep the activation arena under the 4 GiB
@@ -1271,6 +1310,23 @@ pub fn plan_memory_f32_uniform_no_params(graph: &Graph, alignment: usize) -> Mem
         ..MemoryPlanOptions::default()
     };
     plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::F32Uniform)
+}
+
+/// [`GuardedPlanner`]'s planners with the deferred-host `DequantMatMul` guard
+/// supplied by the caller rather than inherited from the conservative
+/// [`MemoryPlanOptions::dequant_host_fallback`] default.
+pub fn plan_memory_with_dequant_guard(
+    graph: &Graph,
+    alignment: usize,
+    planner: GuardedPlanner,
+    dequant_host_read_deferred: bool,
+) -> MemoryPlan {
+    plan_memory_with_options_policy(
+        graph,
+        alignment,
+        planner.options(graph, dequant_host_read_deferred),
+        planner.width(),
+    )
 }
 
 /// True when the graph indexes with a **data-dependent** index tensor.

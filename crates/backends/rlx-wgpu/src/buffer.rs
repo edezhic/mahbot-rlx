@@ -12,6 +12,7 @@
 //! level (unlike Metal where `StorageModeShared` matters). On Apple
 //! Silicon wgpu's Metal backend gives us unified memory automatically.
 
+use crate::gguf_gpu::dequant_route_defers_host_read;
 use rlx_ir::{Graph, NodeId};
 use rlx_opt::memory::MemoryPlan;
 use std::collections::{HashMap, HashSet};
@@ -919,11 +920,17 @@ fn note_structural_hosting() {
     rlx_compile::memory::set_pin_host_structure(hosts_structural_ops());
 }
 
-/// Plan memory using f32-sized slots regardless of declared IR dtype,
-/// with liveness-aware slot reuse (see `rlx_compile::memory::plan_memory_f32_uniform`).
+/// Plan memory using f32-sized slots regardless of declared IR dtype, with
+/// liveness-aware slot reuse — `plan_memory_f32_uniform`'s decisions, with the
+/// deferred-host dequant guard derived here (`dequant_route_defers_host_read`).
 pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
     note_structural_hosting();
-    rlx_compile::memory::plan_memory_f32_uniform(graph, align)
+    rlx_compile::memory::plan_memory_with_dequant_guard(
+        graph,
+        align,
+        rlx_compile::memory::GuardedPlanner::F32Uniform,
+        dequant_route_defers_host_read(),
+    )
 }
 
 /// Native-width sibling of [`plan_f32_uniform`] — every slot at its true dtype
@@ -931,7 +938,12 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
 /// all run native dtypes; do NOT use when bool/int activations widen to f32.
 pub fn plan_native(graph: &Graph, align: usize) -> MemoryPlan {
     note_structural_hosting();
-    rlx_compile::memory::plan_memory_native(graph, align)
+    rlx_compile::memory::plan_memory_with_dequant_guard(
+        graph,
+        align,
+        rlx_compile::memory::GuardedPlanner::Native,
+        dequant_route_defers_host_read(),
+    )
 }
 
 /// Hybrid sibling of [`plan_f32_uniform`] — packs `Param` weights + F16/BF16
@@ -940,7 +952,12 @@ pub fn plan_native(graph: &Graph, align: usize) -> MemoryPlan {
 /// halve those slots while bool/int activations stay f32-safe.
 pub fn plan_hybrid(graph: &Graph, align: usize) -> MemoryPlan {
     note_structural_hosting();
-    rlx_compile::memory::plan_memory_hybrid(graph, align)
+    rlx_compile::memory::plan_memory_with_dequant_guard(
+        graph,
+        align,
+        rlx_compile::memory::GuardedPlanner::Hybrid,
+        dequant_route_defers_host_read(),
+    )
 }
 
 impl Arena {
@@ -1307,7 +1324,12 @@ impl Arena {
         // does NOT shrink the arena (the planner aliases the persistent packed
         // weights onto low offsets and leaves an activation at the high offset),
         // so we re-plan without params to actually compact it.
-        let mut new_plan = rlx_compile::memory::plan_memory_f32_uniform_no_params(graph, 16);
+        let mut new_plan = rlx_compile::memory::plan_memory_with_dequant_guard(
+            graph,
+            16,
+            rlx_compile::memory::GuardedPlanner::F32UniformNoParams,
+            dequant_route_defers_host_read(),
+        );
         let walign = 256usize; // storage-buffer offset alignment for windowed binds
         let a = 16usize;
         let mut weight_offsets: HashMap<NodeId, usize> = HashMap::new();

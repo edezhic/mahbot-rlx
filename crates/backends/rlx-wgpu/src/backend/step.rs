@@ -1677,3 +1677,90 @@ pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The premise [`crate::gguf_gpu::dequant_route_defers_host_read`] states at the
+    /// plan site: `step_is_tail_host` is this backend's only deferral of a host
+    /// *read* — the host tensor cache defers uploads, the other direction — and no
+    /// packed step is one. The table below is hand-maintained (a new packed step
+    /// variant belongs in it) and is the one part the compiler cannot complete.
+    #[test]
+    fn no_packed_multiply_step_is_deferred_to_the_host_tail() {
+        let int4 = rlx_ir::quant::QuantScheme::Int4Block { block_size: 32 };
+        let packed: [Step; 7] = [
+            Step::DequantMatmul {
+                params: bytemuck::Zeroable::zeroed(),
+            },
+            Step::DequantMatmulMlx {
+                params: bytemuck::Zeroable::zeroed(),
+            },
+            Step::DequantMatmulGguf {
+                m: 1,
+                k: 1,
+                n: 1,
+                scheme_id: 0,
+                x_byte_off: 0,
+                w_byte_off: 0,
+                out_byte_off: 0,
+            },
+            Step::DequantMatmulInt8Host {
+                m: 1,
+                k: 1,
+                n: 1,
+                block_size: 32,
+                is_asymmetric: false,
+                x_byte_off: 0,
+                w_byte_off: 0,
+                scale_byte_off: 0,
+                zp_byte_off: 0,
+                out_byte_off: 0,
+            },
+            Step::DequantMatmulMlxHost {
+                m: 1,
+                k: 1,
+                n: 1,
+                scheme: int4,
+                x_byte_off: 0,
+                w_byte_off: 0,
+                scale_byte_off: 0,
+                zp_byte_off: 0,
+                out_byte_off: 0,
+            },
+            Step::DequantGroupedMatmulGguf {
+                m: 1,
+                k: 1,
+                n: 1,
+                num_experts: 1,
+                scheme_id: 0,
+                x_byte_off: 0,
+                w_byte_off: 0,
+                idx_byte_off: 0,
+                out_byte_off: 0,
+            },
+            Step::DequantGroupedMatmulMlxHost {
+                m: 1,
+                k: 1,
+                n: 1,
+                num_experts: 1,
+                scheme: int4,
+                x_byte_off: 0,
+                w_byte_off: 0,
+                scale_byte_off: 0,
+                zp_byte_off: 0,
+                idx_byte_off: 0,
+                out_byte_off: 0,
+                scale_bf16: false,
+            },
+        ];
+        for step in &packed {
+            assert!(
+                !step_is_tail_host(step),
+                "{} is a packed multiply this backend would defer past its own step",
+                step_name(step)
+            );
+        }
+    }
+}

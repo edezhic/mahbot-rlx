@@ -16,14 +16,13 @@ no FFI, no submodules.
   via `pollster::block_on` so the rest of the backend matches the
   rlx-cpu / rlx-metal / rlx-mlx synchronous shape.
 - **`buffer.rs` / `Arena`** — logical activation arena with per-node offsets
-  from `rlx-opt::memory::plan_memory_aligned`. When the plan exceeds wgpu
-  `max_buffer_size` (~4 GiB), the arena is **striped** across multiple ≤4 GiB
-  buffers (`extra_shards`); each stripe keeps a stage reserve
-  (`SHARD_STAGE_RESERVE`: a 768 MiB constant, which `RLX_WGPU_SHARD_STAGE_MIB`
-  can only lower) so cross-shard operand copies do not clobber live activations.
-  A stripe's usable region is its size minus that reserve (with a 256-byte floor),
-  and the snap that fits a compact plan into one buffer may halve the reserve
-  while it tries.
+  from `plan_f32_uniform`. When the plan exceeds wgpu `max_buffer_size`
+  (~4 GiB), the arena is **striped** across multiple ≤4 GiB buffers
+  (`extra_shards`); each stripe keeps a stage reserve (`SHARD_STAGE_RESERVE`: a
+  768 MiB constant, which `RLX_WGPU_SHARD_STAGE_MIB` can only lower) so
+  cross-shard operand copies do not clobber live activations. A stripe's usable
+  region is its size minus that reserve (with a 256-byte floor), and the snap
+  that fits a compact plan into one buffer may halve the reserve while it tries.
   f32 host I/O via `queue.write_buffer` / pooled MAP_READ staging readback
   (`ReadbackStaging`, `read_f32_many_pooled`). Env: `RLX_WGPU_SHARD_LOG=1`.
   Packed quant weights may live in a separate `weight_buffer` (`from_plan_split`).

@@ -88,8 +88,16 @@ pub fn plan_arena_bytes(graph: &Graph, device: Device) -> Option<usize> {
                 crate::backend::rocm_backend::prepare_rocm_exec_graph(graph.clone(), &opts, false);
             Some(rlx_rocm::arena::plan_f32_uniform(&g, 16).arena_size)
         }
-        // Everything else plans through `rlx-compile`. Align 128 matches what
-        // the Metal and wgpu paths ask for; the CPU path is not arena-limited.
+        // Everything else plans through `rlx-compile`. Align 128 keeps the largest
+        // of Metal's 128, wgpu's 16 and the pipeline's 64 — a single conservative
+        // estimate; the CPU path is not arena-limited.
+        //
+        // CARVE-OUT, deliberate: `MemoryPlanOptions::inference()` keeps
+        // `dequant_host_fallback` on even for `rlx-wgpu`, whose own planner derives
+        // it off (`gguf_gpu::dequant_route_defers_host_read`), so a packed graph is
+        // over-reported here. `fit_batch` is the only consumer, and it must answer
+        // for `Device::Gpu` whether or not `rlx-wgpu` is compiled in, without
+        // picking an optimistic batch size.
         _ => Some(
             rlx_compile::memory::plan_memory_with_options(
                 graph,

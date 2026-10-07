@@ -84,6 +84,16 @@ static ROUTE_SCRATCH: AtomicU64 = AtomicU64::new(0);
 static ROUTE_HOST: AtomicU64 = AtomicU64::new(0);
 
 impl DequantMatmulRoute {
+    /// Every variant, for the union below and for [`reset_route_counts`] — the one
+    /// list the compiler does not check (`counter`/`defers_host_read` are exhaustive).
+    const ALL: [Self; 5] = [
+        Self::Grouped,
+        Self::PerRow,
+        Self::Q1_0Gemm,
+        Self::Scratch,
+        Self::Host,
+    ];
+
     fn counter(self) -> &'static AtomicU64 {
         match self {
             DequantMatmulRoute::Grouped => &ROUTE_GROUPED,
@@ -93,6 +103,34 @@ impl DequantMatmulRoute {
             DequantMatmulRoute::Host => &ROUTE_HOST,
         }
     }
+
+    /// Whether this route defers its operand read past its own step.
+    fn defers_host_read(self) -> bool {
+        match self {
+            // Device-resident: the operand is read inside the route's own step.
+            DequantMatmulRoute::Grouped
+            | DequantMatmulRoute::PerRow
+            | DequantMatmulRoute::Q1_0Gemm
+            | DequantMatmulRoute::Scratch => false,
+            // The `gguf_host` fallback of `Step::DequantMatmulGguf`, a
+            // `step_runs_on_host` step: it drains, reads, computes and writes
+            // back inside its own step. Nothing is pending at the next step.
+            DequantMatmulRoute::Host => false,
+        }
+    }
+}
+
+/// Whether **any** packed multiply this backend can run reads an operand after its
+/// own step, i.e. the hazard pinned by
+/// [`rlx_compile::MemoryPlanOptions::dequant_host_fallback`].
+///
+/// Derived from the per-route classification over `DequantMatmulRoute::ALL`, so a
+/// new route answers next to the route table. Packed steps outside that table are
+/// covered by the `no_packed_multiply_step_is_deferred_to_the_host_tail` test in
+/// `backend::step`; Metal needs the pin, since `flush_deferred_host` defers its
+/// dequant flush.
+pub fn dequant_route_defers_host_read() -> bool {
+    DequantMatmulRoute::ALL.iter().any(|r| r.defers_host_read())
 }
 
 /// How many packed GGUF multiplies this process has routed each way.
@@ -115,13 +153,7 @@ pub fn route_counts() -> DequantMatmulRoutes {
 
 /// Zero [`route_counts`] (tests bracketing a single call).
 pub fn reset_route_counts() {
-    for r in [
-        DequantMatmulRoute::Grouped,
-        DequantMatmulRoute::PerRow,
-        DequantMatmulRoute::Q1_0Gemm,
-        DequantMatmulRoute::Scratch,
-        DequantMatmulRoute::Host,
-    ] {
+    for r in DequantMatmulRoute::ALL {
         r.counter().store(0, Ordering::Relaxed);
     }
 }

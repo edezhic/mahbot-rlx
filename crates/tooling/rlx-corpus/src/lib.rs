@@ -43,8 +43,9 @@ use std::collections::BTreeSet;
 
 use rlx_ir::{DType, Graph, GraphExt, Op, Shape};
 use rlx_opt::rlx_compile::memory::{
-    MemoryPlan, MemoryPlanOptions, plan_memory, plan_memory_aligned, plan_memory_f32_uniform,
-    plan_memory_native, plan_memory_with_options,
+    GuardedPlanner, MemoryPlan, MemoryPlanOptions, plan_memory, plan_memory_aligned,
+    plan_memory_f32_uniform, plan_memory_native, plan_memory_with_dequant_guard,
+    plan_memory_with_options,
 };
 use rlx_opt::rlx_compile::plan_check::check_plan;
 
@@ -132,6 +133,15 @@ fn planners() -> Vec<Planner> {
         o.dequant_host_fallback = false;
         plan_memory_with_options(g, 64, o)
     }
+    // The two configurations `rlx-wgpu` plans with, mirroring
+    // `rlx_wgpu::buffer::plan_f32_uniform` and the `Arena::from_plan_split` re-plan:
+    // align 16, f32-uniform, guard derived off. No other entry here covers wgpu's.
+    fn wgpu_dequant_unpinned(g: &Graph) -> MemoryPlan {
+        plan_memory_with_dequant_guard(g, 16, GuardedPlanner::F32Uniform, false)
+    }
+    fn wgpu_dequant_unpinned_no_params(g: &Graph) -> MemoryPlan {
+        plan_memory_with_dequant_guard(g, 16, GuardedPlanner::F32UniformNoParams, false)
+    }
     vec![
         ("default", plan_memory),
         ("aligned256", |g| plan_memory_aligned(g, 256)),
@@ -139,6 +149,11 @@ fn planners() -> Vec<Planner> {
         ("f32_uniform", |g| plan_memory_f32_uniform(g, 64)),
         ("in_order", in_order),
         ("no_dequant_pin", no_dequant_pin),
+        ("wgpu_dequant_unpinned", wgpu_dequant_unpinned),
+        (
+            "wgpu_dequant_unpinned_no_params",
+            wgpu_dequant_unpinned_no_params,
+        ),
     ]
 }
 

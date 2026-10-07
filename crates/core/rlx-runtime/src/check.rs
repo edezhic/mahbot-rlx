@@ -677,6 +677,11 @@ fn compute_budget(
     const ALIGN: usize = 64;
     let plan = match policy {
         ArenaWidthPolicy::Native => plan_memory_aligned(graph, ALIGN),
+        // CARVE-OUT, deliberate: the conservative `dequant_host_fallback` stays on,
+        // so a packed graph is over-reported here, where `rlx-wgpu` derives the guard
+        // off (`rlx_wgpu::gguf_gpu::dequant_route_defers_host_read`). The budget axis
+        // is compared across architectures at one fixed policy, so it follows no
+        // single backend's route table.
         ArenaWidthPolicy::F32Uniform => plan_memory_f32_uniform(graph, ALIGN),
         ArenaWidthPolicy::Hybrid => plan_memory_hybrid(graph, ALIGN),
         ArenaWidthPolicy::NativeHalfWidened => {
