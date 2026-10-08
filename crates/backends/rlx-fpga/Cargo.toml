@@ -16,7 +16,7 @@ documentation.workspace = true
 # Verilog generation is pure Rust; no Python, no `.sv` templates on disk.
 
 [features]
-# Other backends' test targets: off by default, `cargo test -p rlx-fpga --features backend-tests`.
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-fpga --features backend-tests`.
 backend-tests = []
 default = ["std"]
 std = []
@@ -40,6 +40,8 @@ path = "src/lib.rs"
 [[bin]]
 name = "rlx-fpga-emit"
 path = "src/bin/emit.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [lints]
 workspace = true

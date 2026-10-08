@@ -11,7 +11,7 @@
 //! forward), this test proves the generated derivative matches the CPU oracle
 //! on every backend that claims the op.
 //!
-//!   cargo test -p rlx-runtime --features metal --test activation_backward_parity
+//!   cargo test -p rlx-runtime --features metal,backend-tests --test activation_backward_parity
 //! On the rig: `--features cuda,vulkan,gpu`.
 
 #![cfg(feature = "cpu")]

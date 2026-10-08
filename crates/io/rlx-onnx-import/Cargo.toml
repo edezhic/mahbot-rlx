@@ -29,11 +29,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-onnx-import --features backend-tests`.
+backend-tests = []
 runtime = ["dep:rlx-runtime", "dep:rlx-cpu"]
 
 [[bin]]
 name = "rlx-onnx-import-report"
 path = "src/bin/report.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "bundle-compile"
@@ -52,3 +56,23 @@ tempfile = "3"
 features       = ["runtime"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "codegen_compile"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv1d_nclw"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_ncl_typical_length"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "layout"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "resize_nearest_height"
+required-features = ["backend-tests"]

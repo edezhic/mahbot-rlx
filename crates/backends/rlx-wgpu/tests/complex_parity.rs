@@ -424,8 +424,8 @@ fn expand_complex_materialized() {
 // NOTE: the sharded/>4 GiB host-fallback paths (`ConcatHost`/`ConcatHostPieces`
 // and the split-binding embedding `GatherSplit`) are also lane-aware. They only
 // trigger on huge arenas, so validate them on a small tensor by forcing the path:
-//   RLX_WGPU_CONCAT_HOST=1  cargo test -p rlx-wgpu --test complex_parity concat_complex
-//   RLX_WGPU_GATHER_SPLIT=1 cargo test -p rlx-wgpu --test complex_parity gather_complex
+//   RLX_WGPU_CONCAT_HOST=1  cargo test -p rlx-wgpu --test complex_parity concat_complex --features backend-tests
+//   RLX_WGPU_GATHER_SPLIT=1 cargo test -p rlx-wgpu --test complex_parity gather_complex --features backend-tests
 // Both pass on Metal (host copies scale `inner`/`numel`/`dim` by lanes).
 
 // ── Gate 6: OTHER element-indexed movement ops must be lane-aware too ───────

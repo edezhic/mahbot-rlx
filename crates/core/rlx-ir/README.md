@@ -86,7 +86,8 @@ let module = g.module();
 
 ```sh
 cargo build -p rlx-ir
-cargo test  -p rlx-ir       # 11 unit tests
+cargo test  -p rlx-ir       # lib unit tests
+cargo test  -p rlx-ir --features backend-tests   # arity + lowp + kernel-schedule suites
 ```
 
 ## Status

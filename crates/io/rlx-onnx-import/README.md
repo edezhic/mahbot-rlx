@@ -21,7 +21,7 @@ for quant fusion rewrites (`ImportOptions::quant_bundle()`).
 ## Tests
 
 ```bash
-cargo test -p rlx-onnx-import
+cargo test -p rlx-onnx-import --features backend-tests
 ```
 
 Optional raw ONNX tests: set `RLX_ONNX_TEST_MODEL` to a `.onnx` path.

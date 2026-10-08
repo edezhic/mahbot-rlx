@@ -307,6 +307,10 @@ pub use rlx_runtime::{
     export_tinyconv_mnist,
 };
 
+/// Effective CPU worker-pool width — see `rlx_runtime::cpu_pool_width`.
+#[cfg(feature = "cpu")]
+pub use rlx_runtime::cpu_pool_width;
+
 // ── Grouped namespaces ──────────────────────────────────────────
 
 /// Quantization metadata — schemes the IR carries per-tensor, plus

@@ -41,7 +41,7 @@ if [[ ${#TESTS[@]} -eq 0 ]]; then
 fi
 
 echo "leak-check: building test binaries…"
-cargo test --release -p rlx-metal --no-run -q 2>/dev/null
+cargo test --release -p rlx-metal --features backend-tests --no-run -q 2>/dev/null
 
 status=0
 for t in "${TESTS[@]}"; do

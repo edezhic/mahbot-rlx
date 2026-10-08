@@ -24,6 +24,8 @@ documentation.workspace = true
 # the system linker search path. macOS is unaffected and continues to
 # use Accelerate.
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-cpu --features backend-tests`.
+backend-tests = []
 default = ["blas"]
 blas = []
 blas-mkl = ["blas"]
@@ -122,3 +124,43 @@ workspace = true
 features       = ["splat"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "bench_execute_hotloop"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_conv3d"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_fft_q"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fft_q_parallel_is_exact"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_single_row_cache_pressure"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_single_row_route_perf"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gpu_indexing_plan_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pool_ceil_mode_overhang"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "region_cast_semantics"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rope_style_fusion"
+required-features = ["backend-tests"]

@@ -54,10 +54,12 @@ picks between them.
 
 - **Local gate:** `just ci` is the full build, workspace tests, `fmt-check`,
   lint, and pyrlx pytest suite — but its workspace test step is the **default
-  selection** (CPU / Metal / wgpu; `just test`), so the other backends' targets
-  run only through the recipes that name them (`test-rocm`,
-  `test-third-order-gpu`). It spans the GPU / ROCm / wasm matrix, so run the
-  subset your hardware supports (see [What CI expects](#what-ci-expects)).
+  selection**, a fast smoke gate: every crate's unit tests plus the pool-width
+  checks. The heavy integration suites do real device/graph work and are opt-in
+  with `--features backend-tests`, through the recipes that name them
+  (`test-gpu`, `test-rocm`, `test-third-order-gpu`). It spans the GPU / ROCm /
+  wasm matrix, so run the subset your hardware supports (see
+  [What CI expects](#what-ci-expects)).
 - **Format & lint:** `just fmt` / `just lint` (clippy with `-D warnings`). The
   pre-commit hook and `just ci` run these for you.
 - **Static graph check:** `cargo rlx check` folds shape/dtype verification,
@@ -90,11 +92,12 @@ research op — use the stable seams in
 - New backend work needs a **cross-backend parity test** against the CPU
   reference — a numeric match, not a shape-or-compile check. Prefer meaningful
   parity/integration coverage over trivial asserts.
-- `just test` runs the default test selection (CPU / Metal / wgpu; the other
-  backends' targets are opt-in with `--features backend-tests`). `just test-gpu`
-  adds the host GPU backends and runtime feature tests. Backend-specific recipes
-  (`just test-mlx`, `just test-rocm`, `just test-fpga`, …) live in the
-  [`Justfile`](Justfile).
+- `just test` runs the default selection: every crate's unit tests plus the
+  pool-width checks. The heavy integration suites are opt-in with
+  `--features backend-tests`; `just test-gpu` adds the host GPU backends and
+  runtime feature tests, and the backend-specific recipes (`just test-mlx`,
+  `just test-rocm`, `just test-fpga`, …) pass that gate for the targets they
+  name. They all live in the [`Justfile`](Justfile).
 
 ## Before you start
 

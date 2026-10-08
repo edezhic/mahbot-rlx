@@ -6,14 +6,12 @@
 //!
 //! Instead of hardcoded thresholds scattered across thunk.rs, all dispatch
 //! decisions are routed through this cost model. The model considers:
-//! - Hardware: cache sizes, core count, AMX availability, NEON throughput
+//! - Hardware: cache sizes, AMX availability, NEON throughput
 //! - Workload: matrix dimensions, batch size, sequence length
 //! - Strategy: BLAS vs NEON, parallel vs sequential, fused vs individual
 //!
-//! The model is calibrated at compile time (platform-specific constants)
-//! and refined at runtime (detected hardware + optional autotune).
-
-use crate::config::RuntimeConfig;
+//! The model is per-arch compile-time constants — nothing is probed at runtime;
+//! the worker width it divides by is the pool's width in effect.
 
 /// Estimated cost in nanoseconds for a kernel execution strategy.
 #[derive(Debug, Clone, Copy)]
@@ -25,7 +23,7 @@ impl Cost {
     }
 }
 
-/// Hardware model — derived from RuntimeConfig + platform detection.
+/// Hardware model — platform-calibrated constants, nothing probed at runtime.
 pub struct HwModel {
     /// NEON throughput: FLOP/s for element-wise (FMA chains)
     pub neon_flops: f64,
@@ -41,13 +39,11 @@ pub struct HwModel {
     pub l2_bytes: usize,
     /// Memory bandwidth (L2 → registers) in bytes/ns
     pub mem_bw: f64,
-    /// Number of worker threads
-    pub num_threads: usize,
 }
 
 impl HwModel {
-    /// Build from runtime config and platform defaults.
-    pub fn from_config(cfg: &RuntimeConfig) -> Self {
+    /// The constants for this target: chosen by `cfg`, nothing measured.
+    pub const fn platform() -> Self {
         // Platform-calibrated constants
         #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
         let model = HwModel {
@@ -55,10 +51,9 @@ impl HwModel {
             blas_flops: 1000e9,          // ~1 TFLOP/s AMX peak (effective varies with tile fill)
             blas_overhead_ns: 500.0,     // ~0.5µs per cblas_sgemm call
             par_for_overhead_ns: 5000.0, // ~5µs spin-wait dispatch
-            l1_bytes: 65536,             // 64KB L1d (refined by sysctl at runtime)
+            l1_bytes: 65536,             // 64KB L1d
             l2_bytes: 4 * 1024 * 1024,   // 4MB L2 per core
             mem_bw: 50.0,                // ~50 GB/s = 50 B/ns
-            num_threads: cfg.pool_workers + 1,
         };
 
         #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
@@ -70,7 +65,6 @@ impl HwModel {
             l1_bytes: 32768,
             l2_bytes: 1024 * 1024,
             mem_bw: 30.0,
-            num_threads: cfg.pool_workers + 1,
         };
 
         model
@@ -91,7 +85,7 @@ impl HwModel {
     /// Returns true when parallelism benefit exceeds dispatch overhead.
     pub fn prefer_parallel(&self, total_elements: usize, cost_per_element_ns: f64) -> bool {
         let seq_time = total_elements as f64 * cost_per_element_ns;
-        let par_time = seq_time / self.num_threads as f64 + self.par_for_overhead_ns;
+        let par_time = seq_time / crate::pool::num_threads() as f64 + self.par_for_overhead_ns;
         par_time < seq_time
     }
 
@@ -110,7 +104,7 @@ impl HwModel {
         let neon_per_head = per_head_flops / self.neon_flops;
 
         // With par_for, BLAS heads run in parallel
-        let blas_total = blas_per_head * total_heads as f64 / self.num_threads as f64
+        let blas_total = blas_per_head * total_heads as f64 / crate::pool::num_threads() as f64
             + self.par_for_overhead_ns * 1e-9;
         let neon_total = neon_per_head * total_heads as f64; // sequential
 
@@ -137,9 +131,11 @@ impl HwModel {
     }
 }
 
+/// `HwModel::platform` is `cfg`-chosen constants with nothing probed at runtime,
+/// so there is no lazy cell behind this.
+static MODEL: HwModel = HwModel::platform();
+
 /// Global hardware model singleton.
 pub fn hw_model() -> &'static HwModel {
-    use std::sync::OnceLock;
-    static MODEL: OnceLock<HwModel> = OnceLock::new();
-    MODEL.get_or_init(|| HwModel::from_config(RuntimeConfig::global()))
+    &MODEL
 }

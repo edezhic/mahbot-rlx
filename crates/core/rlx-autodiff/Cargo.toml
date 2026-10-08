@@ -20,12 +20,14 @@ half = "2"
 thiserror = "2"
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-autodiff --features backend-tests`.
+backend-tests = []
 default = []
 # Accelerator passthroughs for the TEST binaries. The gather-backward rank-1 bug
 # was present verbatim in all five backends, so the regression test for it has
 # to be runnable somewhere other than CPU; without these the dev-dependency on
 # `rlx` is pinned to `cpu` and the test can only ever prove the CPU path.
-#   RLX_FORCE_DEVICE=metal cargo test -p rlx-autodiff --features metal --test indexing_grad
+#   RLX_FORCE_DEVICE=metal cargo test -p rlx-autodiff --features metal,backend-tests --test indexing_grad
 metal = ["rlx/metal"]
 mlx = ["rlx/mlx"]
 gpu = ["rlx/gpu"]
@@ -44,3 +46,163 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "activation_batch_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "atan2_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "attention_causal_vjp_fd"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "batch_norm_inference_grad"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cholesky_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "constant_payload_matches_dtype"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv3d_im2col_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv3d_native_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_transpose2d_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cumulative_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "depthwise_conv1d_vjp_fd"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "det_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fuse_splat_smoke"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fused_shared_input_matmul_grad"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gated_delta_net_backward_decompose"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gated_delta_net_fused_backward"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gated_delta_net_vjp_fd"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "indexing_grad"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "multi_axis_reduce_wrt_grad"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pad_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pool3d_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "prepare_output_stability"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "qr"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rms_norm_rank_vjp_fd"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "roll_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rope_vjp_fd"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scaled_matmul_grad"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scaled_quant_vjp_field_invariance"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scatter_add_axis_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scatter_nd_grad"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "slice_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "sort_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "spline_activation_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "split_vjp_equivalence"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "structural_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "svd"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "synth_matmul_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "trisolve_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "vjp_field_consistency"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wrt_output_vjp"
+required-features = ["backend-tests"]

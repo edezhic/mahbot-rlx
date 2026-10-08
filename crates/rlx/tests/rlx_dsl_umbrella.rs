@@ -9,7 +9,7 @@
 //! direct one.
 //!
 //! Needs the `tensor` DSL and the `cpu` backend; the umbrella defaults to no
-//! features, so run with `cargo test -p rlx --features cpu,tensor`.
+//! features, so run with `cargo test -p rlx --features cpu,tensor,backend-tests`.
 #![cfg(all(feature = "tensor", feature = "cpu"))]
 
 #[test]

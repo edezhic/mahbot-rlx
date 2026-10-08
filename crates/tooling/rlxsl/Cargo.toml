@@ -30,3 +30,7 @@ naga = { version = "29", features = ["wgsl-in", "glsl-in"] }
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[lib]
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false

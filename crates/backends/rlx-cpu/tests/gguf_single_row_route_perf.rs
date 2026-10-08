@@ -9,7 +9,7 @@
 //! `#[ignore]`d. Gate it on `just throttle` first, then:
 //!
 //! ```text
-//! cargo test -p rlx-cpu --release --test gguf_single_row_route_perf \
+//! cargo test -p rlx-cpu --release --test gguf_single_row_route_perf --features backend-tests \
 //!     -- --ignored --nocapture
 //! ```
 //!

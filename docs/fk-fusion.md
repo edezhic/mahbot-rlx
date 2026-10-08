@@ -164,13 +164,13 @@ opts.fusion_opts.decompose_fusion_regions = false;
 ```sh
 cargo test -p rlx-fusion gpu_unfuse_preserves_prologue_region
 cargo test -p rlx-compile --lib metal_default_unfuse
-cargo test -p rlx-runtime --features cpu,metal,gpu,mlx --test fk_prologue_parity
-cargo test -p rlx-runtime --features cpu,metal --test fk_prologue_parity fk_batch_session_default_matches_cpu_metal
-cargo test -p rlx-runtime --features cpu,tpu --test fk_prologue_parity fk_batch_session_pipeline_keeps_native_region_tpu
+cargo test -p rlx-runtime --features cpu,metal,gpu,mlx,backend-tests --test fk_prologue_parity
+cargo test -p rlx-runtime --features cpu,metal,backend-tests --test fk_prologue_parity fk_batch_session_default_matches_cpu_metal
+cargo test -p rlx-runtime --features cpu,tpu,backend-tests --test fk_prologue_parity fk_batch_session_pipeline_keeps_native_region_tpu
 cargo test -p rlx-tpu --features backend-tests --test fk_pipeline
 cargo test -p rlx-tpu --features backend-tests --test hlo_match batch_elementwise_region elementwise_region_resize_prologue
-cargo test -p rlx-metal --test mps_graph_batch_region_lower
-cargo test -p rlx-metal --test mps_graph_prologue_region_lower
+cargo test -p rlx-metal --features backend-tests --test mps_graph_batch_region_lower
+cargo test -p rlx-metal --features backend-tests --test mps_graph_prologue_region_lower
 cargo test -p rlx-mlx --features backend-tests --test basic batch_elementwise_region_matches_atomic
 ```
 

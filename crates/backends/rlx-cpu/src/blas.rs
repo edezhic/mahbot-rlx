@@ -3002,6 +3002,16 @@ pub fn sgemm_auto(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: us
 }
 
 /// Enough FLOPs + a wide enough split axis to pay for Rayon hand-off.
+///
+/// On Apple Silicon the single-call Accelerate GEMM already saturates the AMX
+/// units (~1.5 TFLOP/s f32 measured on the reference host), so splitting a GEMM
+/// whose operands fit the caches is hand-off cost with nothing to win: measured
+/// 1.1–2.6× *slower* than the one call from (64,192,768) up to (4096,4096,4096),
+/// at every width. What the split does buy is memory-level parallelism on a
+/// *streaming* GEMM — a skinny `m` against a B panel far larger than the P
+/// cluster's L2 (16 MiB here) — where it measured 1.3–2.0× faster, e.g.
+/// (64,16384,1024) 3.7 ms → 2.5 ms. So Apple is gated on that regime; other
+/// hosts keep the historical rule untouched.
 #[inline]
 fn prefer_par_sgemm(m: usize, k: usize, n: usize) -> bool {
     let workers = crate::pool::num_threads();
@@ -3013,15 +3023,33 @@ fn prefer_par_sgemm(m: usize, k: usize, n: usize) -> bool {
         return false;
     }
     // Split the wider output axis; need ≥8 cols/rows per worker.
-    m.max(n) >= workers.saturating_mul(8)
+    if m.max(n) < workers.saturating_mul(8) {
+        return false;
+    }
+    if cfg!(all(target_arch = "aarch64", target_vendor = "apple")) {
+        // Streaming only: a skinny `m` with a B panel that spills the P-cluster
+        // caches. Parity sits at ~32 MiB of panel and the win grows with it
+        // (1.3–2.0× past 64 MiB); at 16 MiB the split is marginal, and below
+        // that — or at `m ≥ 256`, where the output rows are filled from cache —
+        // it loses (up to 1.6×), so this gate errs wide.
+        return m <= PAR_SGEMM_STREAM_MAX_M && k.saturating_mul(n) >= PAR_SGEMM_STREAM_PANEL;
+    }
+    true
 }
+
+/// Streaming-split gates for [`prefer_par_sgemm`] on Apple Silicon: the ask must
+/// be skinny (`m`), and the B panel (`k × n`) must be large enough to spill the
+/// P cluster's caches — 8 M f32 elements ≈ 32 MiB, against a 16 MiB L2.
+const PAR_SGEMM_STREAM_MAX_M: usize = 128;
+const PAR_SGEMM_STREAM_PANEL: usize = 8 << 20;
 
 /// Parallel sgemm: split across Rayon workers, each calling single-threaded
 /// CBLAS (see [`limit_inner_threads`]).
 ///
-/// For large square-ish GEMMs (DiT FFN: m≈1k, n≈2–3k, k≈1k) a 2-D tile grid
-/// beats pure column/row splits — each worker only streams an A-panel and a
-/// B-panel instead of re-reading the full shared operand.
+/// A wide-`m` GEMM `prefer_par_sgemm` admits is split as a 2-D tile grid (DiT
+/// FFN shape); otherwise the wider output axis is split — columns when `n >= m`,
+/// rows otherwise. Apple Silicon admits only the skinny-`m` streaming regime, so
+/// it never reaches the grid.
 pub fn par_sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     alias_check("par_sgemm", a, b, c, m, k, n);
     let workers = crate::pool::num_threads();
@@ -3034,7 +3062,10 @@ pub fn par_sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
     let c_addr = c.as_mut_ptr() as usize;
     let flops = (m as u64).saturating_mul(k as u64).saturating_mul(n as u64);
 
-    // 2-D tiling when both output axes are wide enough for a grid.
+    // 2-D tiling when both output axes are wide enough for a grid. Not reachable
+    // on Apple Silicon, where `prefer_par_sgemm` admits only a skinny `m` (a
+    // wide-`m` split measured slower than the single call), but live on every
+    // other host — Intel Macs included.
     if m >= 256 && n >= 256 && flops >= 200_000_000 {
         let tiles_m = ((workers as f64).sqrt().round() as usize).clamp(2, 8);
         let tiles_n = (workers / tiles_m).max(2);
@@ -3261,8 +3292,10 @@ pub fn par_sgemm_accumulate(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: us
 #[cfg(feature = "parity-gemm")]
 fn sgemm_via_gemm_crate(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     use gemm::{Parallelism, gemm};
-    let cfg = crate::config::RuntimeConfig::global();
-    let workers = cfg.pool_workers + 1;
+    // `Parallelism::Rayon` is a split count over the shared pool, so ask for
+    // the pool's real width (`pool_workers + 1` counted the calling thread,
+    // which Rayon does not add to the pool).
+    let workers = crate::pool::num_threads();
     let par = if workers > 1 {
         Parallelism::Rayon(workers)
     } else {
@@ -3644,12 +3677,13 @@ fn saxpy_bf16(scale: f32, b: &[u16], acc: &mut [f32]) {
 /// `[N]` partial, then reduces. NOTE: on Apple the f32 path runs on the AMX
 /// coprocessor (Accelerate) and still wins; this helps non-AMX CPUs + is the
 /// reference the GPU/ANE backends' native BF16 matmuls match. Precision-approximate.
+/// Runs inline when the pool width is 1 (no usable pool — see [`crate::pool`]).
 pub fn sgemm_bf16_rhs(a: &[f32], b: &[u16], c: &mut [f32], m: usize, k: usize, n: usize) {
     use rayon::prelude::*;
-    if m == 1 {
-        let nthreads = rayon::current_num_threads().max(1);
-        let kchunk = k.div_ceil(nthreads).max(1);
-        let partials: Vec<Vec<f32>> = (0..nthreads)
+    let threads = crate::pool::num_threads();
+    if m == 1 && threads > 1 {
+        let kchunk = k.div_ceil(threads).max(1);
+        let partials: Vec<Vec<f32>> = (0..threads)
             .into_par_iter()
             .map(|t| {
                 let (k0, k1) = ((t * kchunk).min(k), ((t + 1) * kchunk).min(k));
@@ -3663,13 +3697,26 @@ pub fn sgemm_bf16_rhs(a: &[f32], b: &[u16], c: &mut [f32], m: usize, k: usize, n
         c.par_iter_mut().enumerate().for_each(|(j, cj)| {
             *cj = partials.iter().map(|p| p[j]).sum();
         });
+        return;
+    }
+    // One output row from `A`'s scalar and `B`'s row — the `m == 1` shape is a
+    // single chunk. Width 1 means no usable pool (a foreign `build_global`
+    // failure leaves Rayon's registry unset, where every Rayon call panics), so
+    // the same rows run inline, as [`crate::pool::par_for`] does.
+    let row = |i: usize, crow: &mut [f32]| {
+        crow.iter_mut().for_each(|v| *v = 0.0);
+        for kk in 0..k {
+            saxpy_bf16(a[i * k + kk], &b[kk * n..kk * n + n], crow);
+        }
+    };
+    if threads > 1 {
+        c.par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(i, crow)| row(i, crow));
     } else {
-        c.par_chunks_mut(n).enumerate().for_each(|(i, crow)| {
-            crow.iter_mut().for_each(|v| *v = 0.0);
-            for kk in 0..k {
-                saxpy_bf16(a[i * k + kk], &b[kk * n..kk * n + n], crow);
-            }
-        });
+        c.chunks_mut(n)
+            .enumerate()
+            .for_each(|(i, crow)| row(i, crow));
     }
 }
 
@@ -3688,12 +3735,13 @@ fn saxpy_f16(scale: f32, b: &[u16], acc: &mut [f32]) {
 /// f32; `B` is dequant-on-the-fly with f32 accumulate (so bit-parity with an f32
 /// GEMM over the same f16-valued weights). Fixes generic `Op::MatMul` reading an
 /// F16 weight as f32 garbage (there was only a BF16 path before).
+/// Runs inline when the pool width is 1 (no usable pool — see [`crate::pool`]).
 pub fn sgemm_f16_rhs(a: &[f32], b: &[u16], c: &mut [f32], m: usize, k: usize, n: usize) {
     use rayon::prelude::*;
-    if m == 1 {
-        let nthreads = rayon::current_num_threads().max(1);
-        let kchunk = k.div_ceil(nthreads).max(1);
-        let partials: Vec<Vec<f32>> = (0..nthreads)
+    let threads = crate::pool::num_threads();
+    if m == 1 && threads > 1 {
+        let kchunk = k.div_ceil(threads).max(1);
+        let partials: Vec<Vec<f32>> = (0..threads)
             .into_par_iter()
             .map(|t| {
                 let (k0, k1) = ((t * kchunk).min(k), ((t + 1) * kchunk).min(k));
@@ -3707,13 +3755,23 @@ pub fn sgemm_f16_rhs(a: &[f32], b: &[u16], c: &mut [f32], m: usize, k: usize, n:
         c.par_iter_mut().enumerate().for_each(|(j, cj)| {
             *cj = partials.iter().map(|p| p[j]).sum();
         });
+        return;
+    }
+    // See [`sgemm_bf16_rhs`]: one row per chunk, inline at width 1.
+    let row = |i: usize, crow: &mut [f32]| {
+        crow.iter_mut().for_each(|v| *v = 0.0);
+        for kk in 0..k {
+            saxpy_f16(a[i * k + kk], &b[kk * n..kk * n + n], crow);
+        }
+    };
+    if threads > 1 {
+        c.par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(i, crow)| row(i, crow));
     } else {
-        c.par_chunks_mut(n).enumerate().for_each(|(i, crow)| {
-            crow.iter_mut().for_each(|v| *v = 0.0);
-            for kk in 0..k {
-                saxpy_f16(a[i * k + kk], &b[kk * n..kk * n + n], crow);
-            }
-        });
+        c.chunks_mut(n)
+            .enumerate()
+            .for_each(|(i, crow)| row(i, crow));
     }
 }
 

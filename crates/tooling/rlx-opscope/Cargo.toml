@@ -35,74 +35,110 @@ rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.17", default-fea
 [[bin]]
 name = "opscope-bytes"
 path = "src/bin/bytes.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-sweep"
 path = "src/bin/sweep.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-mine"
 path = "src/bin/mine.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-motifs"
 path = "src/bin/motifs.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-seq"
 path = "src/bin/seq.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-mnist"
 path = "src/bin/mnist.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-flow"
 path = "src/bin/flow.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-graph"
 path = "src/bin/graph.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-shapes"
 path = "src/bin/shapes.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-infer"
 path = "src/bin/infer.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-probe"
 path = "src/bin/probe.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-plan"
 path = "src/bin/plan.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-llm"
 path = "src/bin/llm.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-optimize"
 path = "src/bin/optimize.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-replay"
 path = "src/bin/replay.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-parity"
 path = "src/bin/parity.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-guarded"
 path = "src/bin/guarded.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-live"
 path = "src/bin/live.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [[bin]]
 name = "opscope-kernels"

@@ -77,7 +77,7 @@ path = "src/lib.rs"
 # this feature is on; the resulting object file is linked into the
 # crate and called via Rust FFI.
 [features]
-# Other backends' test targets: off by default, `cargo test -p rlx-cuda --features backend-tests`.
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-cuda --features backend-tests`.
 backend-tests = []
 default = []
 native-splat = []

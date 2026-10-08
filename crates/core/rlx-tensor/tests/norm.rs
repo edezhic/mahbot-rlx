@@ -5,7 +5,7 @@
 //! LLM normalization + rotary-embedding ops, validated end-to-end:
 //! `rms_norm`/`layer_norm` against their naive decompositions, and `rope`
 //! against the GPT-NeoX rotation (identity + a hand-computed angle).
-//! Run: `cargo test -p rlx-tensor --features eval`.
+//! Run: `cargo test -p rlx-tensor --features eval,backend-tests`.
 #![cfg(feature = "eval")]
 
 use rlx_tensor::Tensor;

@@ -7,8 +7,8 @@
 //! Each `check_*` builds one filter's graph, runs it on the CPU backend and on
 //! a GPU backend, and asserts the outputs match. The per-backend `mod`s below
 //! instantiate them for every backend compiled in. Run e.g.:
-//!   cargo test -p rlx-runtime --features metal --test gpu_filters_parity
-//!   cargo test -p rlx-runtime --features gpu   --test gpu_filters_parity
+//!   cargo test -p rlx-runtime --features metal,backend-tests --test gpu_filters_parity
+//!   cargo test -p rlx-runtime --features gpu,backend-tests   --test gpu_filters_parity
 //!
 //! `fir_conv1d` / `conv_reverb` / `iir_as_fir` are pure `Op::Fft` + elementwise
 //! compositions (native everywhere); `iirfilt` lowers via `Op::Scan` (native on

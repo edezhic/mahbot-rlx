@@ -18,7 +18,7 @@
 //! Reports rather than asserts a specific threshold — the point is the number,
 //! and the pass/fail guard lives in `lstm_cpu_parity`.
 //!
-//!     cargo test -p rlx-metal --test lstm_nan_threshold -- --ignored --nocapture
+//!     cargo test -p rlx-metal --test lstm_nan_threshold --features backend-tests -- --ignored --nocapture
 
 // `!(maxd < tol)` rather than `maxd >= tol`, deliberately: every comparison
 // against NaN is false, so the `>=` form reports a NaN run as PASSING. This file

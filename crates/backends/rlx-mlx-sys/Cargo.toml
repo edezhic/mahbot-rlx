@@ -15,6 +15,10 @@ documentation.workspace = true
 links                  = "mlx"
 
 [lib]
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false
 # Empty Rust surface; native code is linked via build.rs. Dependents use
 # `rlx_mlx_sys::ffi` or their own `extern "C"` against the shim symbols.
 path = "src/lib.rs"

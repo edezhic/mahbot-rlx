@@ -4,7 +4,7 @@
 
 //! Compile-cache behavior. Each `#[test]` runs on its own thread, so the
 //! thread-local cache starts empty. Run:
-//! `cargo test -p rlx-tensor --features transforms,eval`.
+//! `cargo test -p rlx-tensor --features transforms,eval,backend-tests`.
 #![cfg(all(feature = "eval", feature = "transforms"))]
 
 use rlx_tensor::{Func, Tensor, cache_stats, clear_cache, shape};

@@ -14,7 +14,7 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
-# Other backends' test targets: off by default, `cargo test -p rlx-mlx --features backend-tests`.
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-mlx --features backend-tests`.
 backend-tests = []
 default = []
 cuda = ["rlx-mlx-sys/cuda"]

@@ -11,7 +11,7 @@
 // Gated `#[ignore]` because it shells out to `cargo` (first run compiles the
 // rlx crates into a throwaway target dir, which is slow). Run on demand:
 //
-//     cargo test -p rlx-onnx-import --test codegen_compile -- --ignored --nocapture
+//     cargo test -p rlx-onnx-import --test codegen_compile --features backend-tests -- --ignored --nocapture
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

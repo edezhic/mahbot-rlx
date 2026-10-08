@@ -13,6 +13,8 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-linalg --features backend-tests`.
+backend-tests = []
 default = ["cpu"]
 
 # CPU execution: pulls in rlx-cpu's CpuKernel registry + LAPACK
@@ -30,3 +32,11 @@ workspace = true
 features       = ["cpu"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "algos_layout"
+required-features = ["backend-tests"]
+
+[lib]
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false

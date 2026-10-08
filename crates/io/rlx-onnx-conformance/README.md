@@ -18,7 +18,7 @@ grows. Not a user-facing inference crate; workspace / CI validation only.
 ## Run tests
 
 ```bash
-cargo test -p rlx-onnx-conformance
+cargo test -p rlx-onnx-conformance --features backend-tests
 ```
 
 ## Coverage dashboard

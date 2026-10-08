@@ -40,7 +40,7 @@ Usually via [`rlx-opt`](../rlx-opt/README.md) or [`rlx`](https://docs.rs/rlx).
 ## Build / test
 
 ```sh
-cargo test -p rlx-compile
+cargo test -p rlx-compile --features backend-tests
 ```
 
 ## License

@@ -5,7 +5,7 @@
 //! MLP capstone: learn XOR with a 2-layer tanh network. Exercises deep
 //! autodiff (stacked matmuls + nonlinearity, gradients to four param tensors)
 //! and Adam. Deterministic init — no RNG, fully reproducible. Run:
-//! `cargo test -p rlx-tensor --features optim`.
+//! `cargo test -p rlx-tensor --features optim,backend-tests`.
 #![cfg(feature = "optim")]
 
 use rlx_tensor::{Adam, Func, shape};

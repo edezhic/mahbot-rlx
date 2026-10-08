@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // RLX — perf gate for the execute_thunks hot-loop refactor.
-// Run in RELEASE: cargo test -p rlx-cpu --release --test bench_execute_hotloop -- --nocapture
+// Run in RELEASE: cargo test -p rlx-cpu --release --test bench_execute_hotloop --features backend-tests -- --nocapture
 //
 // Times execute_thunks over a many-thunk matmul→relu chain. Reports the MIN
 // per-iter time over many batches (least noisy). Compare before/after the
@@ -28,7 +28,7 @@ fn build_chain(layers: usize, d: usize, seq: usize) -> Graph {
 }
 
 #[test]
-#[ignore = "perf gate — run explicitly: cargo test -p rlx-cpu --release --test bench_execute_hotloop -- --ignored --nocapture"]
+#[ignore = "perf gate — run explicitly: cargo test -p rlx-cpu --release --test bench_execute_hotloop --features backend-tests -- --ignored --nocapture"]
 fn bench_execute_thunks_hotloop() {
     let g = build_chain(64, 128, 16);
     let plan = rlx_opt::memory::plan_memory(&g);

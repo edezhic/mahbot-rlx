@@ -6,7 +6,7 @@
 //! selects the path, so run it twice and compare the printed ms/iter:
 //!
 //!   # fused (default)
-//!   cargo test -p rlx-runtime --features cpu,cuda --test bench_conv_bias_act \
+//!   cargo test -p rlx-runtime --features cpu,cuda,backend-tests --test bench_conv_bias_act \
 //!     -- --ignored --nocapture
 //!   # unfused baseline
 //!   RLX_DISABLE_CONV_BIAS_ACT_FUSION=1 cargo test ... -- --ignored --nocapture

@@ -19,7 +19,7 @@
 //!
 //! Each case runs in its own process, because a segfault ends the run:
 //!
-//!     cargo test -p rlx-metal --test sdpa_canonicalize_crash -- --nocapture
+//!     cargo test -p rlx-metal --test sdpa_canonicalize_crash --features backend-tests -- --nocapture
 
 use std::process::Command;
 

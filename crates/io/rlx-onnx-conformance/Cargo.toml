@@ -44,7 +44,29 @@ workspace = true
 [[bin]]
 name = "rlx-onnx-coverage"
 path = "src/bin/coverage_dashboard.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-onnx-conformance --features backend-tests`.
+backend-tests = []
+
+[[test]]
+name = "dit_adaln_lowering"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gqa_layernorm_lowering"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rng_ort_parity"
+required-features = ["backend-tests"]
+
+[lib]
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false

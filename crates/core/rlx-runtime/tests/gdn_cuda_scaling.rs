@@ -6,10 +6,10 @@
 // kernel with the SHELL env RLX_CUDA_KDA_CHUNK=1 (read at kernel launch), e.g.:
 //   # correctness (runs by default)
 //   RLX_TEST_DEVICE=cuda RLX_CUDA_KDA_CHUNK=1 cargo test -p rlx-runtime --release \
-//     --features cuda --test gdn_cuda_scaling gdn_correctness -- --nocapture
+//     --features cuda,backend-tests --test gdn_cuda_scaling gdn_correctness -- --nocapture
 //   # timing
 //   RLX_TEST_DEVICE=cuda [RLX_CUDA_KDA_CHUNK=1] cargo test -p rlx-runtime --release \
-//     --features cuda --test gdn_cuda_scaling gdn_native_scaling -- --ignored --nocapture
+//     --features cuda,backend-tests --test gdn_cuda_scaling gdn_native_scaling -- --ignored --nocapture
 #![cfg(any(feature = "cpu", feature = "cuda"))]
 
 use rlx_ir::{DType, Graph, Shape};

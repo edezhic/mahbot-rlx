@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-optim --features backend-tests`.
+backend-tests = []
 default = []
 # Optional std::collections::HashMap-backed runner wrapper (matches the
 # pattern used by the rlx-umap host trainer). Off by default so the
@@ -35,3 +37,15 @@ workspace = true
 features       = ["runner", "parallel"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "muon_synth_kan"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "quadratic"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "stiefel"
+required-features = ["backend-tests"]

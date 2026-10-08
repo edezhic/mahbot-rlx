@@ -64,7 +64,7 @@ rlx-runtime = { path = "../../core/rlx-runtime" }
 rlx-collectives = { path = "../../core/rlx-collectives" }
 
 [features]
-# Other backends' test targets: off by default, `cargo test -p rlx-webgl --features backend-tests`.
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-webgl --features backend-tests`.
 backend-tests = []
 
 [lints]
@@ -93,3 +93,7 @@ required-features = ["backend-tests"]
 [[test]]
 name = "ops2_parity"
 required-features = ["backend-tests"]
+
+[lib]
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false

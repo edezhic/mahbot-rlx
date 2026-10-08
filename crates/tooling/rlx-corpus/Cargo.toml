@@ -22,11 +22,13 @@ rlx-opt = { workspace = true }
 rlx-runtime = { workspace = true, features = ["cpu"] }
 
 # Which backends the DEVICE arm (`tests/device_gate.rs`) can reach. Empty by
-# default on purpose: a bare `cargo test -p rlx-corpus` stays device-free and
-# fast, and — more importantly — cargo unifies features across a workspace
-# build, so turning an Apple-only backend on here by default would turn it on
-# for every crate on Linux too. The host picks: `just check-corpus-device`.
+# default on purpose: `just check-corpus` stays device-free and fast, and — more
+# importantly — cargo unifies features across a workspace build, so turning an
+# Apple-only backend on here by default would turn it on for every crate on
+# Linux too. The host picks: `just check-corpus-device`.
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-corpus --features backend-tests`.
+backend-tests = []
 default = []
 apple = ["rlx-runtime/apple"]
 gpu = ["rlx-runtime/gpu"]
@@ -37,3 +39,35 @@ rocm = ["rlx-runtime/rocm"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "arity_gate"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "budget_sweep"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "corpus_gate"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "device_gate"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "evolution_gate"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "oracle_gate"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "verifier_gaps"
+required-features = ["backend-tests"]
+
+[lib]
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false

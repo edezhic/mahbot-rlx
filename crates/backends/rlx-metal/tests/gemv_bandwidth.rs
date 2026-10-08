@@ -16,7 +16,7 @@
 //! ~400 MB of weight traffic. Reported figure is the **min** over iterations —
 //! the uncontended cost, which is what a kernel change moves.
 //!
-//! Run: `cargo test -p rlx-metal --test gemv_bandwidth -- --ignored --nocapture`
+//! Run: `cargo test -p rlx-metal --test gemv_bandwidth --features backend-tests -- --ignored --nocapture`
 
 #![cfg(target_os = "macos")]
 

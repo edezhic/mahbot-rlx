@@ -19,7 +19,7 @@
 //! copy and takes seconds. Run it deliberately:
 //!
 //! ```text
-//! cargo test -p rlx-wgpu --release --test gguf_gemm_grouped_weight_reuse \
+//! cargo test -p rlx-wgpu --release --test gguf_gemm_grouped_weight_reuse --features backend-tests \
 //!     -- --ignored --nocapture
 //! ```
 //!

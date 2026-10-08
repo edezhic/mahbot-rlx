@@ -9,7 +9,7 @@
 //! narrower and its Obj-C FFI panics are not unwind-safe (a failed op aborts
 //! the process during cleanup). CoreML/ANE has its own CPU-vs-ANE parity
 //! suite in the `rlx-coreml` crate. Run e.g.:
-//! `cargo test -p rlx-tensor --features eval-apple -- --nocapture`.
+//! `cargo test -p rlx-tensor --features eval-apple,backend-tests -- --nocapture`.
 #![cfg(feature = "eval")]
 
 use rlx_tensor::{Device, Tensor, available_devices};

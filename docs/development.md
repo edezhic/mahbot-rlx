@@ -14,8 +14,8 @@ review and ground rules.
 
 ```sh
 just build          # workspace build
-just test           # cargo test of the CPU / Metal / wgpu paths (Darwin caps -j)
-                    # other backends: add `--features backend-tests` to cargo test
+just test           # cargo test, fast smoke gate: unit tests + pool-width checks
+                    # integration targets: add `--features backend-tests`
 just test-gpu       # Metal/MLX/wgpu/Vulkan (+ apple/cuda/rocm runtime) on host
 
 just lint           # clippy (-D warnings)
@@ -59,7 +59,7 @@ Full API reference: [`backend-selection.md`](backend-selection.md).
 
 ```sh
 cargo run --example graph_devices_demo -p rlx-runtime --features cpu
-cargo test -p rlx-runtime --test graph_devices_parity
+cargo test -p rlx-runtime --features backend-tests --test graph_devices_parity
 ```
 
 Env vars for pick/fallback: `RLX_DEVICE`, `RLX_DEVICE_CHAIN`, `RLX_DEVICES`,
@@ -123,11 +123,11 @@ Parity: `scan_unroll_parity`, `scan_backward_parity`,
 Resize prologue and batch region fusion: [`fk-fusion.md`](fk-fusion.md). Parity tests:
 
 ```sh
-cargo test -p rlx-runtime --features cpu,metal,gpu,tpu --test fk_prologue_parity
+cargo test -p rlx-runtime --features cpu,metal,gpu,tpu,backend-tests --test fk_prologue_parity
 cargo test -p rlx-fusion fk_
 cargo test -p rlx-compile --lib fusion_pipeline::tests
 cargo test -p rlx-tpu --features backend-tests --test fk_pipeline --test hlo_match batch_elementwise
-cargo test -p rlx-metal --test mps_graph_batch_region_lower
+cargo test -p rlx-metal --features backend-tests --test mps_graph_batch_region_lower
 cd crates/pyrlx && python3 -m pytest tests/test_fk_batch_native.py tests/test_fk_batch_primitive.py -q
 ```
 

@@ -30,3 +30,15 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-nemo --features backend-tests`.
+backend-tests = []
+
+[[test]]
+name = "conformer_graph"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "open_local_nemo"
+required-features = ["backend-tests"]

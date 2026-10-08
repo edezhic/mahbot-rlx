@@ -16,8 +16,12 @@ documentation.workspace = true
 [[bin]]
 name = "rlx-pkg"
 path = "src/bin/rlx-pkg.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-pkg --features backend-tests`.
+backend-tests = []
 default = []
 # Password seal for cold/sidecar members (ChaCha20-Poly1305 + Argon2id).
 encrypt = ["dep:chacha20poly1305", "dep:argon2", "dep:rand_core"]
@@ -79,3 +83,23 @@ workspace = true
 features       = ["encrypt", "remote"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "mlx_keep_packed"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_keep_packed_arch"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_nvfp4_keep_packed"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pt_import"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "roundtrip"
+required-features = ["backend-tests"]

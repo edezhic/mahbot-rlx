@@ -192,17 +192,17 @@ next device-reading step.
 
 ```sh
 cargo build -p rlx-wgpu --release
-cargo test  -p rlx-wgpu --release
-cargo test  -p rlx-wgpu --test coop_mat_probe --release -- --nocapture
+cargo test  -p rlx-wgpu --features backend-tests --release
+cargo test  -p rlx-wgpu --features backend-tests --test coop_mat_probe --release -- --nocapture
 # The CoopF16Vk tests only run with the opt-in switch; without it they self-skip
 # and still report `ok`:
 RLX_WGPU_COOP_F16_VK_ENABLE=1 \
-  cargo test -p rlx-wgpu --test coop_f16_vk_correctness --release -- --nocapture
+  cargo test -p rlx-wgpu --features backend-tests --test coop_f16_vk_correctness --release -- --nocapture
 # `coop_f16_vk_dx12` is DX12-only — run it with `WGPU_BACKEND=dx12` on Windows.
 # Anywhere else it skips on its backend check, and on a DX12 adapter it skips on
 # the cooperative-matrix property check — this engine exposes no cooperative
 # matrices on DX12 — so its assertion is never reached:
-cargo test  -p rlx-wgpu --test coop_f16_vk_dx12 --release -- --nocapture
+cargo test  -p rlx-wgpu --features backend-tests --test coop_f16_vk_dx12 --release -- --nocapture
 ```
 
 Through `rlx-runtime`:

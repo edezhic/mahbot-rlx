@@ -4,7 +4,7 @@
 #![cfg(feature = "cpu")]
 //! Benchmark: composition VQ (matmul+argmin) vs a fused single-pass loop, to
 //! decide whether a fused native kernel is worth building. Run with:
-//!   cargo test -p rlx-runtime --release --test vq_bench -- --nocapture
+//!   cargo test -p rlx-runtime --release --test vq_bench --features backend-tests -- --nocapture
 
 use rlx_ir::ops::vq::VqMetric;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};

@@ -53,7 +53,7 @@ enable f16;
 // vector, so `a·b` is a dense rank-1 outer product while `b·a` collapses to one
 // value per fragment (1008/1024 exact zeros):
 //
-//     RLX_WGPU_FORCE_COOP_F32=1 cargo test -p rlx-wgpu \
+//     RLX_WGPU_FORCE_COOP_F32=1 cargo test -p rlx-wgpu --features backend-tests \
 //         --test coop_f32_correctness coop_f32_operand_order_is_not_commuted
 //
 // Run it at an N on BOTH sides of the 768 threshold. The all-ones probe in

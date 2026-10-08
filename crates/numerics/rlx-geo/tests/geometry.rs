@@ -3,7 +3,7 @@
 //
 // Pure-geometry validation (no rlx deps): empty-circumcircle + manifold checks
 // for Delaunay, and a Voronoi grid sanity check. Runs under
-// `cargo test -p rlx-geo --no-default-features`.
+// `cargo test -p rlx-geo --no-default-features --features backend-tests`.
 
 use std::collections::HashMap;
 

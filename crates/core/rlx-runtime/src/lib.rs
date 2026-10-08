@@ -289,6 +289,19 @@ pub use pkg::{
 };
 #[cfg(feature = "cpu")]
 pub use rlx_cpu::moe_topk_capture::MoeTopkCapture;
+
+/// Worker width the CPU backend's pool actually runs with.
+///
+/// The pool is process-wide and sized once (`RLX_WORKERS`, else the tuned
+/// default); this is the width *in effect*, which differs from the requested one
+/// when another Rayon user created the shared pool first. Reading it creates the
+/// pool if nothing has yet, exactly as the first CPU dispatch would.
+#[cfg(feature = "cpu")]
+#[inline]
+pub fn cpu_pool_width() -> usize {
+    rlx_cpu::pool::num_threads()
+}
+
 pub use rlx_driver::{
     DEFAULT_HEAP_BYTES, NetTransport, ProcessGroup, TcpTransport, ThunderboltTransport, Transport,
 };

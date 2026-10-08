@@ -218,7 +218,7 @@ Implementation: `rlx-cuda/src/calibrate.rs`, `rlx-rocm/src/calibrate.rs`, `rlx-w
 ## Tests
 
 ```sh
-cargo test -p rlx-runtime --test graph_devices_parity
+cargo test -p rlx-runtime --features backend-tests --test graph_devices_parity
 cargo test -p rlx-runtime device_router --lib
 cd crates/pyrlx && pytest tests/test_graph_devices.py -q
 ```

@@ -31,7 +31,7 @@ directly for a minimal AD-only dep tree.
 ## Build / test
 
 ```sh
-cargo test -p rlx-autodiff
+cargo test -p rlx-autodiff --features backend-tests
 ```
 
 ## Benchmarks

@@ -6,7 +6,7 @@
 // the exact predicates — regular grids and circles (dense cocircular ties),
 // collinear runs, tight clusters, duplicate floods, near-max spans, and tiny n.
 // Both the serial and parallel paths must produce an exact, valid Delaunay of the
-// same size on every one. Runs under `cargo test -p rlx-geo --no-default-features`.
+// same size on every one. Runs under `cargo test -p rlx-geo --no-default-features --features backend-tests`.
 
 use std::collections::HashMap;
 

@@ -26,7 +26,7 @@ MIR fusion passes and [`unfuse_fused_for_autodiff`] for RLX. Depends on
 ## Build / test
 
 ```sh
-cargo test -p rlx-fusion
+cargo test -p rlx-fusion --features backend-tests
 ```
 
 ## License

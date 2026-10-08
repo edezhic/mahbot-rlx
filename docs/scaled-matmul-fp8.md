@@ -206,8 +206,8 @@ cargo test -p rlx-ir lowp_codec              # codec round-trip + known values (
 cargo test -p rlx-ir enumerate_all_fnexmy    # the 28 fNeXmY formats + properties (--nocapture)
 cargo test -p rlx-cpu scaled                 # ScaledMatMul/quantize vs f32, all formats + f4e3m0 grid
 cargo test -p rlx-cpu scaled_matmul_builder  # Graph::scaled_matmul builder end-to-end
-cargo test -p rlx-runtime --test scaled_quant_policy   # CompileOptions::scaled_quant e2e
-cargo test -p rlx-tensor --features eval --test tensor scaled_matmul  # Tensor DSL e2e
+cargo test -p rlx-runtime --features backend-tests --test scaled_quant_policy   # CompileOptions::scaled_quant e2e
+cargo test -p rlx-tensor --features eval,backend-tests --test tensor scaled_matmul  # Tensor DSL e2e
 cargo test -p rlx-compile scaled_quant       # rewrite structure + quantize-once
 cargo build -p rlx-cuda -p rlx-rocm -p rlx-vulkan      # compile-check the GPU kernels
 ```

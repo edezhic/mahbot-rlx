@@ -27,7 +27,7 @@
 //!   sign flips / wrong derivative rules independent of backend.
 //!
 //! Run the fan-out against real backends with e.g.
-//! `cargo test -p rlx-runtime --features metal,mlx,gpu elementwise`. With only
+//! `cargo test -p rlx-runtime --features metal,mlx,gpu,backend-tests elementwise`. With only
 //! the default `cpu` feature, the CPU-oracle self-checks and the FD sweep still
 //! run; the cross-backend loops simply find no extra backends and no-op.
 

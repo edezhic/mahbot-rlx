@@ -4,7 +4,7 @@
 // Validates the topology helpers against the triangulation: adjacency is
 // symmetric and consistent with shared edges, hull edges have no neighbor, and
 // convex_hull matches a brute-force reference. Runs under
-// `cargo test -p rlx-geo --no-default-features`.
+// `cargo test -p rlx-geo --no-default-features --features backend-tests`.
 
 use std::collections::HashMap;
 

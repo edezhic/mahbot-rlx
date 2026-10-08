@@ -7,8 +7,8 @@
 //! Covers CUDA, wgpu (`Device::Gpu`), Metal, and MLX when compiled in.
 //!
 //! ```sh
-//! cargo test -p rlx-runtime --features cpu,cuda --test third_order_gpu_parity   # CUDA rig
-//! cargo test -p rlx-runtime --features cpu,apple --test third_order_gpu_parity # macOS
+//! cargo test -p rlx-runtime --features cpu,cuda,backend-tests --test third_order_gpu_parity   # CUDA rig
+//! cargo test -p rlx-runtime --features cpu,apple,backend-tests --test third_order_gpu_parity # macOS
 //! ```
 
 #![cfg(all(

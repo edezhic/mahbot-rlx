@@ -140,6 +140,7 @@ fn dequant_gguf(w_bytes: &[u8], k: usize, n: usize, scheme: QuantScheme) -> Vec<
     let parallel = n_elems >= QK_K * 512
         && n_elems.is_multiple_of(QK_K)
         && matches!(scheme, QuantScheme::GgufQ4K | QuantScheme::GgufQ6K)
+        && crate::pool::num_threads() > 1
         && rlx_ir::env::var("RLX_DEQUANT_PARALLEL").as_deref() != Some("0");
     if parallel {
         let block_bytes = scheme.gguf_block_bytes() as usize;
@@ -150,7 +151,7 @@ fn dequant_gguf(w_bytes: &[u8], k: usize, n: usize, scheme: QuantScheme) -> Vec<
             // A few coarse chunks (≈ one per thread), each dequanting its blocks
             // in place — avoids both the per-block rayon task overhead and any
             // intermediate copy.
-            let threads = rayon::current_num_threads().max(1);
+            let threads = crate::pool::num_threads();
             let blocks_per_chunk = n_blocks.div_ceil(threads).max(1);
             out.par_chunks_mut(blocks_per_chunk * QK_K)
                 .enumerate()

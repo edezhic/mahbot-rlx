@@ -836,7 +836,7 @@ fn ptq1_0_int_pipe_gemv_matches_cpu() {
 /// flag (`RLX_METAL_PTQ1_0_NSG`, packed into the kernel's `flags` word) and
 /// every round times all variants back to back, keeping the per-variant min.
 ///
-/// `cargo test -p rlx-metal --release --test metal_gguf_dequant_matmul_prefill_parity \
+/// `cargo test -p rlx-metal --release --test metal_gguf_dequant_matmul_prefill_parity --features backend-tests \
 ///      ptq1_0_gemv_bandwidth -- --ignored --nocapture`
 #[test]
 #[ignore = "benchmark, not a correctness check"]

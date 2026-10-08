@@ -14,7 +14,7 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
-# Other backends' test targets: off by default, `cargo test -p rlx-coreml --features backend-tests`.
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-coreml --features backend-tests`.
 backend-tests = []
 default = []
 # On-device training / backward. Compiles the native MIL backward kernels
@@ -144,3 +144,7 @@ required-features = ["backend-tests"]
 [[test]]
 name = "reshape_narrow_gather"
 required-features = ["backend-tests"]
+
+[lib]
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false

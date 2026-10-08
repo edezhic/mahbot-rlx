@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! FFT — `[..., 2N]` block layout (real plane then imag plane). ndarray has
-//! no FFT at all. Run: `cargo test -p rlx-tensor --features eval`.
+//! no FFT at all. Run: `cargo test -p rlx-tensor --features eval,backend-tests`.
 #![cfg(feature = "eval")]
 
 use rlx_tensor::Tensor;

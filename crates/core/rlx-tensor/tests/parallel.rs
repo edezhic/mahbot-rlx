@@ -5,7 +5,7 @@
 //! Same graph, run on CPU and GPU **in parallel** (data parallelism). `Func`
 //! owns a plain `Graph` (Send), so it can be moved to another thread; each
 //! thread has its own compile cache + device. Run:
-//! `cargo test -p rlx-tensor --features eval-metal -- --nocapture`.
+//! `cargo test -p rlx-tensor --features eval-metal,backend-tests -- --nocapture`.
 #![cfg(feature = "eval-metal")]
 
 use std::thread;

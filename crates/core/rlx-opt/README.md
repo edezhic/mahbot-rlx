@@ -52,7 +52,7 @@ rlx-opt = "0.2"
 
 ```sh
 cargo build -p rlx-opt
-cargo test  -p rlx-fusion -p rlx-autodiff -p rlx-compile
+cargo test  -p rlx-fusion -p rlx-autodiff -p rlx-compile --features backend-tests
 ```
 
 ## Gotchas

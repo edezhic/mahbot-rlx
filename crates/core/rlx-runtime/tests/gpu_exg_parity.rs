@@ -8,8 +8,8 @@
 //! a GPU backend, and asserts the outputs match. The per-backend `mod`s below
 //! instantiate them for every Apple-Silicon backend compiled in (`metal`,
 //! `gpu`/wgpu). Run e.g.:
-//!   cargo test -p rlx-runtime --features metal --test gpu_exg_parity
-//!   cargo test -p rlx-runtime --features gpu   --test gpu_exg_parity
+//!   cargo test -p rlx-runtime --features metal,backend-tests --test gpu_exg_parity
+//!   cargo test -p rlx-runtime --features gpu,backend-tests   --test gpu_exg_parity
 //!
 //! `biquad`/`sosfilt` are intentionally absent — they lower via `Op::Scan`,
 //! which is CPU-only today; they are covered by `cpu_exg_kernels.rs`.

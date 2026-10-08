@@ -6,7 +6,7 @@
 //! `tests/ui/*.rs` case must fail with the message in its paired `.stderr`.
 //! These pin the *spans* of our own `compile_error!`s (not downstream rustc
 //! type errors), complementing the message-content checks in the proc macro's
-//! own unit tests. Run: `cargo test -p rlx-tensor --features dsl --test ui`
+//! own unit tests. Run: `cargo test -p rlx-tensor --features dsl,backend-tests --test ui`
 //! (regenerate snapshots with `TRYBUILD=overwrite`).
 #![cfg(feature = "dsl")]
 

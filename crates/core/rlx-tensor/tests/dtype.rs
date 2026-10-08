@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! dtype breadth: typed constructors, `cast`, and typed readback
-//! (`to_vec_f64/i64/i32/bool`). Run: `cargo test -p rlx-tensor --features eval`.
+//! (`to_vec_f64/i64/i32/bool`). Run: `cargo test -p rlx-tensor --features eval,backend-tests`.
 #![cfg(feature = "eval")]
 
 use rlx_tensor::{DType, Tensor};

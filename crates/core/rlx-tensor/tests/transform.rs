@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Composable function transforms (grad / vmap and their composition). Run:
-//! `cargo test -p rlx-tensor --features transforms,eval`.
+//! `cargo test -p rlx-tensor --features transforms,eval,backend-tests`.
 #![cfg(all(feature = "transforms", feature = "eval"))]
 
 use rlx_tensor::{Func, shape};

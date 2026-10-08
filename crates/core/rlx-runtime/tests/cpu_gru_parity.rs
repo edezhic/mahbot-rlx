@@ -299,7 +299,7 @@ fn gru_mlx_matches_reference() {
 }
 
 /// Throughput at OCR-recognition scale (seq≈50, hidden 256, bidirectional).
-/// `cargo test -p rlx-runtime --features metal --test cpu_gru_parity gru_bench -- --ignored --nocapture`
+/// `cargo test -p rlx-runtime --features metal,backend-tests --test cpu_gru_parity gru_bench -- --ignored --nocapture`
 #[test]
 #[ignore = "benchmark, not a correctness test; run with --ignored --nocapture for timings"]
 fn gru_bench() {

@@ -29,3 +29,11 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-gguf --features backend-tests`.
+backend-tests = []
+
+[[test]]
+name = "iq_tq_real_weights"
+required-features = ["backend-tests"]

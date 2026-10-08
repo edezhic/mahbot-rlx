@@ -23,7 +23,7 @@
 //! full graph — rather than a single kernel. The end-to-end reproducer lives in
 //! `exg`'s `rlx-stackedlora/tests/xbackend_stages.rs`.
 //!
-//!     cargo test -p rlx-wgpu --test rerun_stability -- --nocapture
+//!     cargo test -p rlx-wgpu --test rerun_stability --features backend-tests -- --nocapture
 
 // The tolerance checks below are written `!(rel < tol)` rather than
 // `rel >= tol`, and the negation is load-bearing: every comparison against NaN

@@ -40,8 +40,8 @@ fi
 echo
 echo "==> rlx-vulkan device-backed compute validation"
 # --features backend-tests: rlx-vulkan's test targets are not in the default
-# test selection (CPU / Metal / wgpu). Without it this line runs zero tests and
-# the PASSED banner below is a false green.
+# test selection, which is a fast smoke set. Without it this line runs zero
+# tests and the PASSED banner below is a false green.
 cargo test -p rlx-vulkan --features backend-tests -- --nocapture
 
 echo

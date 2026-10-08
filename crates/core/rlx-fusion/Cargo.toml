@@ -33,3 +33,31 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-fusion --features backend-tests`.
+backend-tests = []
+
+[[test]]
+name = "fixture_runner"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "region_limits_decline"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rewriter_no_duplicate_leaves"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "status_reports_are_honest"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "text_fixtures"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "trigger_kinds_are_honest"
+required-features = ["backend-tests"]

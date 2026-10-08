@@ -204,6 +204,11 @@ fn build_cpu_executable(
     io_manifest: cpu_low_precision::IoDtypeManifest,
     rng: rlx_ir::RngOptions,
 ) -> CpuExecutable {
+    // Claim the process-wide Rayon pool at RLX's width before any other Rayon
+    // user in the process (weight widening, third-party tokenizers, …) can size
+    // it first — the width is fixed for the process at that point and a CPU
+    // graph is the earliest proof that RLX work is coming.
+    crate::backend::claim_cpu_pool();
     let mut arena = Arena::from_plan(plan);
     let mut input_ids = HashMap::new();
     let mut param_ids = HashMap::new();

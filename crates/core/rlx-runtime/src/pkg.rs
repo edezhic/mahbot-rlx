@@ -23,6 +23,10 @@ use std::path::Path;
 ///
 /// Fails if the pack is weight-only (`encoding = "none"`).
 pub fn load_rlxp_graph(path: impl AsRef<Path>) -> Result<Graph> {
+    // Materializing the graph decompresses warm/cold tiers on Rayon; claim the
+    // process-wide pool at RLX's width first so that work cannot pin the process
+    // to Rayon's default width before a CPU compile gets to choose.
+    crate::backend::claim_cpu_pool();
     let pack = Package::open(path.as_ref())
         .with_context(|| format!("open package {}", path.as_ref().display()))?;
     pack.graph()
@@ -51,6 +55,8 @@ pub fn compile_rlxp_bind_params(
     session: &Session,
     path: impl AsRef<Path>,
 ) -> Result<CompiledGraph> {
+    // Same reason as [`load_rlxp_graph`]: materializing below runs on Rayon.
+    crate::backend::claim_cpu_pool();
     let pack = open_rlxp(path.as_ref())?;
     let graph = pack
         .graph_with(rlx_pkg::MaterializeMode::HotOnly)

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! conv2d forward — the CNN building block — validated against a
-//! hand-computed reference. Run: `cargo test -p rlx-tensor --features eval`.
+//! hand-computed reference. Run: `cargo test -p rlx-tensor --features eval,backend-tests`.
 #![cfg(feature = "eval")]
 
 use rlx_tensor::Tensor;

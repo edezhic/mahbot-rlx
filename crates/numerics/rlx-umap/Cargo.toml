@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-umap --features backend-tests`.
+backend-tests = []
 default = ["cpu", "graph", "full", "pca", "nn-descent"]
 
 # Register `OpExtension` + `CpuKernel` for k-NN forward (and backward when `autodiff`).
@@ -112,34 +114,35 @@ rlx-compile = { workspace = true }
 
 [[test]]
 name = "knn_reference"
+required-features = ["backend-tests"]
 
 [[test]]
 name = "knn_session"
-required-features = ["cpu", "bench"]
+required-features = ["cpu", "bench", "backend-tests"]
 
 [[test]]
 name = "cosine_parity"
-required-features = ["cpu", "graph", "bench"]
+required-features = ["cpu", "graph", "bench", "backend-tests"]
 
 [[test]]
 name = "backend_parity"
-required-features = ["cpu", "graph", "bench"]
+required-features = ["cpu", "graph", "bench", "backend-tests"]
 
 [[test]]
 name = "umap_fit_cpu"
-required-features = ["full"]
+required-features = ["full", "backend-tests"]
 
 [[test]]
 name = "forward_reference"
-required-features = ["full"]
+required-features = ["full", "backend-tests"]
 
 [[test]]
 name = "umap_transform_stats"
-required-features = ["full"]
+required-features = ["full", "backend-tests"]
 
 [[test]]
 name = "umap_determinism"
-required-features = ["full"]
+required-features = ["full", "backend-tests"]
 
 [[test]]
 name = "optim_adapter"
@@ -147,7 +150,7 @@ required-features = ["optim"]
 
 [[test]]
 name = "knn_fit_parity"
-required-features = ["full", "bench"]
+required-features = ["full", "bench", "backend-tests"]
 
 [[example]]
 name = "bench_knn"
@@ -181,6 +184,8 @@ required-features = ["full"]
 name = "train-umap"
 path = "src/bin/train_umap.rs"
 required-features = ["full"]
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [lints]
 workspace = true
@@ -189,3 +194,15 @@ workspace = true
 features       = ["autodiff", "serde", "optim", "safetensors", "io-gguf"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "cuda_fit_smoke"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_fit_smoke"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_fit_smoke"
+required-features = ["backend-tests"]

@@ -7,7 +7,7 @@
 //! The rest of the corpus asks whether a compiler change kept the answers
 //! right. This asks what the machine spends to produce them — arena bytes,
 //! host-boundary traffic, and the precision churn of a graph that is already
-//! correct. `cargo test -p rlx-corpus --test budget_sweep -- --nocapture`
+//! correct. `cargo test -p rlx-corpus --test budget_sweep --features backend-tests -- --nocapture`
 //! prints the table.
 
 use rlx_opt::rlx_compile::fusion_pipeline::FusionTarget;

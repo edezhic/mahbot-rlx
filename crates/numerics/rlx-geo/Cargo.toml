@@ -16,6 +16,8 @@ homepage.workspace      = true
 documentation.workspace = true
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-geo --features backend-tests`.
+backend-tests = []
 # The pure-geometry core (predicates, triangulation, Voronoi) has no rlx deps
 # and builds under `--no-default-features`.
 default = ["cpu"]
@@ -109,3 +111,31 @@ name = "delaunay32_bench"
 features       = ["cpu"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "delaunay32_correctness"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dual"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dwyer"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "flip"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "geometry"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "robustness"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "topology"
+required-features = ["backend-tests"]

@@ -34,18 +34,18 @@ what it covers reads like completeness it has not earned.
 ## Running it
 
 ```bash
-# device-free gate stack — the default, works anywhere
-cargo test -p rlx-corpus
+# device-free gate stack — works anywhere
+cargo test -p rlx-corpus --features backend-tests
 
 # add the device arm on a host that has the backend
 just check-corpus-device
 ```
 
 The `[features]` list (`apple`, `gpu`, `metal`, `vulkan`, `cuda`, `rocm`) is
-empty by default on purpose. A bare `cargo test -p rlx-corpus` stays
-device-free and fast — and, more importantly, cargo unifies features across a
-workspace build, so defaulting an Apple-only backend on here would turn it on
-for every crate on Linux too.
+empty by default on purpose: the gate stack is device-free and fast, and —
+more importantly — cargo unifies features across a workspace build, so
+defaulting an Apple-only backend on here would turn it on for every crate on
+Linux too.
 
 ## Evolution ledger
 

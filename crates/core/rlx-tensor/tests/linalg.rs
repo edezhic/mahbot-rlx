@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Matrix inverse (composite over DenseSolve → LAPACK). Needs a BLAS eval
-//! build. Run: `cargo test -p rlx-tensor --features eval-blas`.
+//! build. Run: `cargo test -p rlx-tensor --features eval-blas,backend-tests`.
 #![cfg(feature = "eval-blas")]
 
 use rlx_tensor::Tensor;

@@ -17,7 +17,7 @@ RLX, exposed as `Op::Custom` with per-backend kernels. Sibling to `rlx-umap`
 Build/validate, all green:
 
 ```sh
-cargo test  -p rlx-geo --no-default-features         # geometry core: 5/5
+cargo test  -p rlx-geo --no-default-features --features backend-tests   # geometry core: 5/5
 cargo check -p rlx-geo --features cpu                 # CPU ops
 # Standalone on-device flip + f32-filter A/B — needs only wgpu, no rlx-wgpu:
 cargo run   -p rlx-geo --example flip_gpu_bench \

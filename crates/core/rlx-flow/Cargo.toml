@@ -37,3 +37,19 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-flow --features backend-tests`.
+backend-tests = []
+
+[[test]]
+name = "dit_flow_train"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "downstream_layer_stage"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mla_attn_parity"
+required-features = ["backend-tests"]

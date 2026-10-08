@@ -6,8 +6,8 @@
 // CPU vs GPU parity for [`directional_nth_grad`] (ND wrt + direction inputs).
 //!
 //! ```sh
-//! cargo test -p rlx-runtime --features cpu,cuda --test directional_nth_gpu_parity
-//! cargo test -p rlx-runtime --features cpu,apple --test directional_nth_gpu_parity
+//! cargo test -p rlx-runtime --features cpu,cuda,backend-tests --test directional_nth_gpu_parity
+//! cargo test -p rlx-runtime --features cpu,apple,backend-tests --test directional_nth_gpu_parity
 //! ```
 
 #![cfg(all(

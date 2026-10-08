@@ -21,6 +21,27 @@ use std::sync::Arc;
 
 use crate::cpu_low_precision;
 
+/// Claim the process-wide Rayon pool at RLX's CPU width before Rayon work that
+/// RLX itself starts can size it at Rayon's default.
+///
+/// Rayon's pool is created once and whoever creates it fixes the width for the
+/// process, so a host-side Rayon user that runs *before* the first CPU compile
+/// (weight widening below, `.rlxp` tier materialization in [`crate::pkg`]) would
+/// otherwise pin the process to Rayon's default width — all logical CPUs
+/// including the E-cores — and the CPU backend's tuned default could no longer
+/// take effect. The callers are about to create the pool anyway, so this only
+/// decides its width; `rlx_cpu::pool::ensure_pool` is a no-op without the `cpu`
+/// feature and on wasm.
+///
+/// The pool is process-wide, so this is CPU policy on a shared path:
+/// [`widen_bytes_to_f32`] serves every backend with an f32-uniform arena, so a
+/// GPU-only process widens at the CPU width rather than Rayon's default.
+#[inline]
+pub(crate) fn claim_cpu_pool() {
+    #[cfg(feature = "cpu")]
+    rlx_cpu::pool::ensure_pool();
+}
+
 // ── Typed I/O helpers (shared across f32-arena backends) ────────────────
 
 /// Widen (or, for F64, narrow) a typed byte buffer to `Vec<f32>`. Used by
@@ -71,6 +92,7 @@ pub fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> {
             // elements/layer — serial was the measured ~1.9s upload). Elementwise
             // + order-independent → bit-identical to the serial map.
             if bits.len() >= 1 << 20 {
+                claim_cpu_pool();
                 use rayon::prelude::*;
                 bits.par_iter()
                     .map(|&b| half::f16::from_bits(b).to_f32())
@@ -85,6 +107,7 @@ pub fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> {
             let bits = rlx_ir::bytes::decode_le::<u16>(data);
             let bits = bits.as_ref();
             if bits.len() >= 1 << 20 {
+                claim_cpu_pool();
                 use rayon::prelude::*;
                 bits.par_iter()
                     .map(|&b| half::bf16::from_bits(b).to_f32())

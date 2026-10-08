@@ -3422,8 +3422,8 @@ fn sample_top_p_zero_collapses_to_argmax() {
 /// The draw semantics of the neutral configuration are covered for wgpu
 /// alongside CPU and Metal by `rlx-runtime/tests/sample_parity.rs`, but those
 /// arms sit behind `feature = "gpu"` and only build when some other workspace
-/// member asks for it — so the kernel-level assertion stays here, where
-/// `cargo test -p rlx-wgpu` always runs it.
+/// member asks for it — so the kernel-level assertion stays here, in this file's
+/// suite behind `--features backend-tests` like every other integration target.
 #[test]
 fn sample_leaves_its_logits_intact_for_other_consumers() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {

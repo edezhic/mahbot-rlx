@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [lib]
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false
 path = "src/lib.rs"
 
 [features]

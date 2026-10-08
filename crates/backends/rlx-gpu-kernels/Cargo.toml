@@ -26,6 +26,8 @@ rlx-ir = { workspace = true }
 rlxsl = { workspace = true }
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-gpu-kernels --features backend-tests`.
+backend-tests = []
 default = []
 # AMD-only rocWMMA matmul (`kernels/rocm/matmul_mfma.cu`).
 rocm = []
@@ -41,3 +43,11 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "indexing_nd_signatures"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "kernel_schedule_ports"
+required-features = ["backend-tests"]

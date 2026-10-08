@@ -14,6 +14,8 @@ documentation.workspace = true
 readme                  = "README.md"
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-lbm --features backend-tests`.
+backend-tests = []
 default = []
 
 # Build one LBM step as an rlx `Graph` (streaming via `Op::Roll`), so the solver
@@ -43,3 +45,7 @@ workspace = true
 features       = ["ir"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "invariants"
+required-features = ["backend-tests"]

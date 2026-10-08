@@ -38,6 +38,8 @@ bytemuck = { version = "1", features = ["derive"] }
 # rlx-splat = { path = "../rlx-splat", version = "0.2.17", optional = true, default-features = false, features = ["reference", "metal"] }
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-metal --features backend-tests`.
+backend-tests = []
 default = []
 # Native MSL raster via `rlx-splat` + `splat.msl` (no `rlx-runtime` on `rlx-splat` — no cycle).
 # rlx-splat moved to ../rlx-splat; no-op feature (was ["dep:rlx-splat"]) — keeps cfg gates valid.
@@ -90,3 +92,363 @@ workspace = true
 default-target = "aarch64-apple-darwin"
 targets        = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 rustdoc-args   = ["--cfg", "docsrs"]
+
+[[test]]
+name = "attention_bias_mask_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_backward_weight_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "depthwise_conv1d_wide_kernel"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "device_present"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "double_single_metal"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "f16_weight_matmul_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "full_coverage_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fv5_matmul_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gated_delta_net_backward_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gemv_bandwidth"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "grouped_mlx_moe_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "icb_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "iq4_dequant_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "iq_full_real_weights"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "iq_mv_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "kernel_schedule_port"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "layer_norm_inner_widths"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_conditioning"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_cpu_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_nan_threshold"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_argmax_sample_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_argreduce_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_asymmetric_vhead_attn_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_attention_backward_determinism"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_bhsd_attention_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_bucketed_decode_attn_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_causal_prefill_attn_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_decode_sgemm_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_dequant_matmul_int_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_fft_q_ingraph"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_fft_q_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_fused_decode_mlp_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_fused_l2_norm_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_fused_residual_rms_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_fused_swiglu_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_gather_u8_const_index_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_gelu_approx_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_gelu_erf_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_gguf_dequant_matmul_prefill_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_hc_post_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_mlp_head_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_mlp_residual_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_mlx_dequant_matmul_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_mlx_hf_checkpoint"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_mlx_lm_shaped_e2e"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_nan_localize"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_norm_bwd_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_packed_causal_attn_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_q2_0_fused_decode_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_q5k_mv_sg_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_reduce_prod_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_repeat_kv_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_reve_block_mpsgraph_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_rmsnorm_beta_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_rng_philox_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_rope_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_scaled_dequant_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_scaled_matmul_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_scatter_add_zero_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_secondary_output_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_sliding_window_attn_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_swiglu_full_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_swiglu_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_w8a8_decode_attn_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_weight_buffer_sharing"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mixed_rank_matmul_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mps_graph_batch_region_lower"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mps_graph_prologue_region_lower"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mps_graph_transpose_lower"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mps_matmul_concurrency"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mpsgraph_sync_compile"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mxfp4x2_decode_metal"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mxfp4x2_matmul_metal"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ops3d_bwd_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "precision_policy_f16_attention"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "q40_q80_mv_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "q4k_mm_xs_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "q5k_mm_xs_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "q6k_mm_xs_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "q8_0_mm_xs_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "q8_q4_dequant_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "resident_muon_train"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scaled_grouped_matmul_metal"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "sdpa_canonicalize_crash"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "spd_host_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "static_weight_pack_rebind"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "thunk_fusion_second_reader"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "training_forward_metal"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "training_full_gpu_smoke"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "zero_copy_train"
+required-features = ["backend-tests"]

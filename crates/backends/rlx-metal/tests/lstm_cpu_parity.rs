@@ -17,7 +17,7 @@
 //! Found downstream: an EEG port with a 128-unit BiLSTM over 256 steps came back
 //! entirely NaN on Metal while CPU and MLX were finite.
 //!
-//!     cargo test -p rlx-metal --test lstm_cpu_parity -- --nocapture
+//!     cargo test -p rlx-metal --test lstm_cpu_parity --features backend-tests -- --nocapture
 
 // The tolerance check is written `!(maxd < tol)` rather than `maxd >= tol` on
 // purpose: comparisons against NaN are all false, so the `>=` form reports a

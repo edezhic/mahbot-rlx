@@ -30,7 +30,14 @@ Keep both paths in sync when changing a Thunk variant.
   `dtrsm`) for `Op::DenseSolve` and the downstream
   [`rlx-linalg`](https://crates.io/crates/rlx-linalg) crate.
 - Work-stealing thread pool with `par_for(total, grain, &|off, cnt| …)`
-  primitive.
+  primitive. The width comes from `RLX_WORKERS` (else the whole P-core
+  cluster on Apple Silicon, ~¾ of the logical CPUs elsewhere) and is fixed
+  when the process-wide pool is created. A request is capped at the threads
+  the machine makes available and reported when it is; any other width that
+  could not be applied is reported on stderr naming the requested and
+  in-effect width and why. `pool::num_threads()` is the one notion of width —
+  the width in effect. `src/pool.rs`'s module docs cover the resolution rules,
+  the reports, and the inline fallback when Rayon cannot build a pool.
 - Reverse-mode AD support: thunks for every backward op
   `rlx_opt::autodiff` emits.
 - **FFT** — `Op::Fft` for F32 / F64 / C64 (2N real-block or native C64).
@@ -58,8 +65,10 @@ Keep both paths in sync when changing a Thunk variant.
 - `pool.rs` — work-stealing thread pool.
 - `arena.rs` — buffer planning interface (the actual byte buffer comes
   from rlx-runtime).
-- `autotune.rs` — `Tick`-based search over `RuntimeConfig`. Use
-  `rlx_ir::Tick` for sub-ms timing.
+- `autotune.rs` — `Tick`-based search over `RuntimeConfig` thresholds. The
+  values it returns are for a later process (the kernels read the frozen global
+  config), so it reports only what it measured. Use `rlx_ir::Tick` for sub-ms
+  timing.
 - `cost.rs` / `config.rs` — model selection + runtime knobs
   (par_threshold, sdpa_seq_threshold, attn_mask_neg_inf, ...).
 
@@ -88,7 +97,8 @@ Or via [`rlx`](https://crates.io/crates/rlx)'s `cpu` feature.
 
 ```sh
 cargo build -p rlx-cpu --release
-cargo test  -p rlx-cpu --release   # 26 tests — mostly parity vs. naive
+cargo test  -p rlx-cpu --release   # lib unit tests + the pool-width checks
+cargo test  -p rlx-cpu --release --features backend-tests   # parity suites vs. naive
 ```
 
 ### ISA portability gate

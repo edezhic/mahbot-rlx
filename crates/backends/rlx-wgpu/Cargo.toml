@@ -13,6 +13,8 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-wgpu --features backend-tests`.
+backend-tests = []
 default = []
 native-splat = []
 # `Op::GaussianSplatRender` via CPU reference (D2H) when `splat` is enabled.
@@ -84,3 +86,231 @@ workspace = true
 features       = ["splat"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "attention_head_dim_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "attention_long_seq_precision"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "attention_v_head_dim_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "basic"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "bucketed_decode_attn_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "buffer_copy_exact"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cast_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ceiling_bind_net"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ceiling_carry_rnn_parked"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ceiling_dequant_parked"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ceiling_fft_parked"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ceiling_parked"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ceiling_refusal"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ceiling_route"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ceiling_stageable"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "complex_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coop16_matmul"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coop16_perf"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coop_f16_vk_bert_baseline"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coop_f16_vk_correctness"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coop_f16_vk_dx12"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coop_f32_correctness"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coop_f32_probe"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coop_mat_probe"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coop_self_check"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dequant_plan_relaxed"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "device_present"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "empty_tensor_arena_slot"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "f16_matmul"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_dequant_matmul_prefill_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_dequant_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_gemm_gguf_wgsl"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_gemm_grouped_weight_reuse"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_gemm_parked_weight"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_kernel_scheme_coverage"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_matmul_route"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "host_route_operand_fit"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "host_stage_cache_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "kernel_schedule_target"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "matmul_accum_precision"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "matmul_vec4_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "missing_ops_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_dequant_matmul_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "op_precision_sweep"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ops3d_bwd_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rerun_stability"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "residual_ln_tee_arena_safety"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "residual_norm_tee"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scaled_grouped_matmul_wgpu"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scaled_lowp_shaders_compile"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "shard_straddle_guard"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "sharded_arena"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "spd_host_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "static_weight_pack_rebind"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "structure_host_operand_fit"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "subgroup_probe"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_fft_q_ingraph"
+required-features = ["backend-tests"]

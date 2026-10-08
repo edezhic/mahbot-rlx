@@ -36,3 +36,39 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-mlx-io --features backend-tests`.
+backend-tests = []
+
+[[test]]
+name = "arch_reference_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "arch_tiny_decode"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "arch_tiny_prefill"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lazy_offset_cache"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlx_lm_shaped_e2e"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "synth_affine_dir"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "synth_affine_session"
+required-features = ["backend-tests"]
+
+[lib]
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false

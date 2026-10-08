@@ -76,10 +76,10 @@ if [[ "$NUMERICAL" -eq 1 ]]; then
     #      policies. Catches IR-level dtype/shape regressions that
     #      single-op tests miss.
     #
-    # `backend-tests`: TPU is not one of the three default test paths (CPU /
-    # Metal / wgpu), so its test targets are not in the default test selection
-    # and every step below has to ask for them explicitly — without it
-    # `cargo test -p rlx-tpu` runs only lib unit tests.
+    # `backend-tests`: the default test selection is a fast smoke set, so TPU's
+    # test targets are not in it — every step below has to ask for them
+    # explicitly; without the feature `cargo test -p rlx-tpu` runs only lib unit
+    # tests.
     DEFAULT_CMD=(bash -c "
         set -e
         cargo test -p rlx-tpu --release --features backend-tests -- --test-threads=1 --nocapture

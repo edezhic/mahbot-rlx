@@ -62,11 +62,12 @@ test-cerebras:
     cargo test -p rlx-cerebras
 
 # Run rlx-lbm tests INCLUDING the graph path. `ir` is off by default (it pulls
-# rlx-ir + rlx-runtime), so a bare `cargo test -p rlx-lbm` runs 18 of 26 tests
-# and silently skips `graph_stream` / `lane_reset` — the two that check the
-# solver as an rlx Graph rather than as host arithmetic.
+# rlx-ir + rlx-runtime), so a bare `cargo test -p rlx-lbm` runs only the lib unit
+# tests and silently skips `graph_stream` / `lane_reset` — the two that check the
+# solver as an rlx Graph rather than as host arithmetic. The third integration
+# target (`invariants`) is behind the `backend-tests` gate.
 test-lbm:
-    cargo test -p rlx-lbm --features ir
+    cargo test -p rlx-lbm --features ir,backend-tests
 
 # Static graph checker (`cargo rlx check`) — dispatch, fusion, shape/dtype and
 # numeric diagnostics. Device-free: CPU legality + all-target fusion, no GPU.
@@ -213,7 +214,7 @@ qnn-ffi:
     export LD_LIBRARY_PATH="$QNN_SDK_ROOT/lib/x86_64-linux-clang${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     cargo test -p rlx-qnn --features runtime -- --nocapture
     cargo test -p rlx-runtime --features qnn,backend-tests --test qnn_hexagon_matmul -- --nocapture
-    cargo test -p rlx-runtime --features "cpu,qnn" --test fused_attention_block_parity -- --nocapture
+    cargo test -p rlx-runtime --features "cpu,qnn,backend-tests" --test fused_attention_block_parity -- --nocapture
     cargo test -p rlx-runtime --features "cpu,qnn,backend-tests" --test qnn_dequant_matmul -- --nocapture
     cargo test -p rlx-runtime --features qnn,backend-tests --test qnn_int8_matmul -- --nocapture
     cargo test -p rlx-runtime --features qnn,backend-tests --test qnn_int4_matmul -- --nocapture
@@ -257,15 +258,16 @@ test-fk:
     cargo test -p rlx-fusion fk_
     cargo test -p rlx-compile --lib fusion_pipeline::tests
     cargo test -p rlx-tpu --features backend-tests --test fk_pipeline --test hlo_match batch_elementwise
-    cargo test -p rlx-runtime --features cpu,metal,gpu,tpu --test fk_prologue_parity
-    cargo test -p rlx-metal --test mps_graph_batch_region_lower --test mps_graph_prologue_region_lower
+    cargo test -p rlx-runtime --features cpu,metal,gpu,tpu,backend-tests --test fk_prologue_parity
+    cargo test -p rlx-metal --features backend-tests --test mps_graph_batch_region_lower --test mps_graph_prologue_region_lower
     cargo test -p rlx-mlx --features backend-tests --test basic batch_elementwise_region_matches_atomic
 
 # Logical CPUs for cargo `-j` / libtest `--test-threads` (macOS, else Linux).
 cpus := `sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4`
 
-# Run the default test selection (CPU / Metal / wgpu — see the body) at high
-# parallelism. Other backends' targets are opt-in: `--features backend-tests`.
+# Run the default fast smoke selection (see the body) at high parallelism.
+# Integration targets anywhere in the workspace are opt-in: `--features
+# backend-tests`.
 # On Darwin, Metal / MoltenVK / MLX share one GPU — cap concurrent cargo
 # jobs so crates don't deadlock the device; within a binary, libtest still
 # uses the default (CPU count) thread pool. Linux keeps full -j / threads.
@@ -274,11 +276,11 @@ test:
     #!/usr/bin/env bash
     set -euo pipefail
     CPUS={{cpus}}
-    # The other backends' test targets (CUDA / ROCm / MLX / Vulkan / TPU / …) are
-    # behind `required-features = "backend-tests"` and stay out of this default
-    # run. Their recipes (`just test-gpu`, `test-mlx`, `test-rocm`, …) pass the
-    # feature explicitly. `required-features` gates a test *target*, so those
-    # crates' lib unit tests still run here.
+    # Integration test targets across the workspace sit behind
+    # `required-features = "backend-tests"` and stay out of this default run —
+    # the fast smoke gate. The per-backend recipes (`just test-gpu`, `test-mlx`,
+    # `test-rocm`, …) pass the feature explicitly. `required-features` gates a
+    # test *target*, so those crates' lib unit tests still run here.
     if [[ "$(uname -s)" == Darwin ]]; then
         # A few parallel test binaries is enough; more contended Apple GPU.
         JOBS=$(( CPUS < 4 ? CPUS : 4 ))
@@ -287,9 +289,10 @@ test:
         cargo test --release -j "$CPUS" -- --test-threads="$CPUS"
     fi
     # A workspace `cargo test` builds every crate with its DEFAULT features, so
-    # a test target gated behind a non-default feature is skipped without
-    # saying so. rlx-lbm's graph path is the case in tree; keep it in the gate.
-    cargo test --release -p rlx-lbm --features ir
+    # a test target gated behind a non-default feature (or behind the
+    # `backend-tests` gate) is skipped without saying so. rlx-lbm's graph path
+    # is the case in tree; keep it in the gate.
+    cargo test --release -p rlx-lbm --features ir,backend-tests
     just test-debug-verifier restricted
 
 # Run the IR-verifier-bearing tests in a DEBUG profile.
@@ -308,11 +311,11 @@ test:
 # this is scoped to the crates whose passes and schedulers carry the asserts
 # rather than the whole workspace — the point is to run the checks at all.
 #
-# `mode=restricted` is how the default `test` recipe calls it: CPU / Metal / wgpu
-# only. Run on its own it keeps the reach it always had — every runtime target
-# the host can build, including the other backends' (the defect above was in a
-# Vulkan target, which `required-features = "backend-tests"` would otherwise hide
-# from this gate).
+# `mode=restricted` is how the default `test` recipe calls it: the runtime's
+# default selection (lib unit tests plus the pool-width checks). `full` mode adds
+# the gated targets of the four crates below, including the runtime's
+# other-backend ones (the defect above was in a Vulkan target, which
+# `required-features = "backend-tests"` would otherwise hide from this gate).
 test-debug-verifier mode="full":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -320,10 +323,14 @@ test-debug-verifier mode="full":
       Darwin) FEATURES="cpu,apple,vulkan" ;;
       *)      FEATURES="cpu,gpu,vulkan" ;;
     esac
-    cargo test -p rlx-ir -p rlx-fusion -p rlx-compile
+    # Those three crates' integration targets carry the verifier asserts, so
+    # they are gated too: `restricted` runs their lib unit tests only.
     case "{{mode}}" in
-      restricted) ;;
-      *) FEATURES="$FEATURES,backend-tests" ;;
+      restricted)
+        cargo test -p rlx-ir -p rlx-fusion -p rlx-compile ;;
+      *)
+        FEATURES="$FEATURES,backend-tests"
+        cargo test -p rlx-ir -p rlx-fusion -p rlx-compile --features backend-tests ;;
     esac
     cargo test -p rlx-runtime --features "$FEATURES" -j 4 --no-fail-fast
 
@@ -342,21 +349,21 @@ test-gpu:
     export RLX_REQUIRE_DEVICE="{{require_device}}"
     case "$(uname -s)" in
       Darwin)
-        cargo test --release -p rlx-metal -j "$JOBS"
+        cargo test --release -p rlx-metal --features backend-tests -j "$JOBS"
         cargo test --release -p rlx-mlx --features backend-tests -j "$JOBS"
-        cargo test --release -p rlx-wgpu -j "$JOBS"
+        cargo test --release -p rlx-wgpu --features backend-tests -j "$JOBS"
         cargo test --release -p rlx-vulkan --features backend-tests -j "$JOBS"
         cargo test --release -p rlx-runtime --features cpu,apple,vulkan,backend-tests \
           --test vulkan_parity --test vulkan_dequant_grouped_matmul --test vulkan_dequant_moe_weights
-        cargo test --release -p rlx-runtime --features cpu,apple -j "$JOBS"
+        cargo test --release -p rlx-runtime --features cpu,apple,backend-tests -j "$JOBS"
         just test-mlx
         just test-third-order-gpu
         just check-corpus-device
         ;;
       *)
-        cargo test --release -p rlx-wgpu -j "$CPUS" -- --test-threads="$CPUS"
+        cargo test --release -p rlx-wgpu --features backend-tests -j "$CPUS" -- --test-threads="$CPUS"
         cargo test --release -p rlx-vulkan --features backend-tests -j "$CPUS" -- --test-threads="$CPUS"
-        cargo test --release -p rlx-runtime --features cpu,gpu -j "$CPUS" -- --test-threads="$CPUS"
+        cargo test --release -p rlx-runtime --features cpu,gpu,backend-tests -j "$CPUS" -- --test-threads="$CPUS"
         just test-third-order-gpu
         if cargo check -p rlx-runtime --features cpu,cuda,gpu --quiet 2>/dev/null; then
           cargo test --release -p rlx-cuda --features backend-tests -j "$CPUS" -- --test-threads="$CPUS"
@@ -369,12 +376,12 @@ test-gpu:
 
 # GGUF grouped MoE integration — serial when multiple GPU backends link in.
 test-gguf-grouped:
-    cargo test -p rlx-runtime --test dequant_grouped_matmul_gguf -- --test-threads=1
+    cargo test -p rlx-runtime --features backend-tests --test dequant_grouped_matmul_gguf -- --test-threads=1
 
 # rlx-js: the JS surface.
 # `FEATURES` picks backends the same way rlx-runtime does.
 test-js FEATURES="cpu,gguf":
-    cargo test -p rlx-js --no-default-features --features {{FEATURES}}
+    cargo test -p rlx-js --no-default-features --features {{FEATURES}},backend-tests
 
 # MNIST from JavaScript. Fetches the dataset into the cache dir if missing.
 # Usage: just js-mnist            (MLP, ~8s on Metal)
@@ -461,9 +468,10 @@ test-torch-import:
 
 # Run a specific filter; use as `just testf narrow_attention`.
 # Filters run against the default selection, so a FILTER naming a target behind
-# `required-features = "backend-tests"` (the other backends' tests — see the
-# `test` recipe) matches nothing and exits 0: add `--features backend-tests`, or
-# name the package, as `cargo test --release --features backend-tests --test ...`.
+# `required-features = "backend-tests"` (every integration target in the
+# workspace — see the `test` recipe) matches nothing and exits 0: add
+# `--features backend-tests`, or name the package, as
+# `cargo test --release --features backend-tests --test ...`.
 testf FILTER:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -491,9 +499,9 @@ fmt:
 # feature-gated code has landed unlinted here before. `lint-features` covers the
 # combinations this host can actually build.
 lint: lint-features
-    # `backend-tests`: the default test selection covers CPU / Metal / wgpu, and
-    # `required-features` hides the other backends' targets from `--all-targets`
-    # too — without it they would not be type-checked by `just lint` at all.
+    # `backend-tests`: the default test selection is a fast smoke set, and
+    # `required-features` hides every gated target from `--all-targets` too —
+    # without it they would not be type-checked by `just lint` at all.
     cargo clippy --all-targets --features backend-tests -- -D warnings
 
 # Clippy the feature combinations `--all-targets` alone cannot reach.
@@ -507,6 +515,9 @@ lint: lint-features
 lint-features:
     #!/usr/bin/env bash
     set -euo pipefail
+    # Every row also passes `backend-tests`: `required-features` hides those
+    # targets from `--all-targets` too, so without it a row would type-check the
+    # combinations it exists for and silently skip their bodies.
     checked=(); skipped=()
     lint() {  # lint <label> <cargo args...>
         local label="$1"; shift
@@ -519,17 +530,17 @@ lint-features:
     case "$(uname -s)" in
       Darwin)
         lint "rlx-runtime cpu,apple,vulkan" -p rlx-runtime --features cpu,apple,vulkan,backend-tests
-        lint "rlx-corpus apple,vulkan"      -p rlx-corpus  --features apple,vulkan
-        lint "rlx-ir test-support"          -p rlx-ir      --features test-support
+        lint "rlx-corpus apple,vulkan"      -p rlx-corpus  --features apple,vulkan,backend-tests
+        lint "rlx-ir test-support"          -p rlx-ir      --features test-support,backend-tests
         # The AMX/SME/BNNS paths are opt-in and default-OFF, so nothing else
         # here compiles them. `amx-bnns` shipped with a Result-vs-Option arm
         # that did not build at all, for exactly that reason.
-        lint "rlx-cpu amx+splat"            -p rlx-cpu     --features amx-bnns,amx-dense,amx-sme,splat,parity-gemm
+        lint "rlx-cpu amx+splat"            -p rlx-cpu     --features amx-bnns,amx-dense,amx-sme,splat,parity-gemm,backend-tests
         ;;
       *)
         lint "rlx-runtime cpu,gpu,vulkan"   -p rlx-runtime --features cpu,gpu,vulkan,backend-tests
-        lint "rlx-corpus gpu,vulkan"        -p rlx-corpus  --features gpu,vulkan
-        lint "rlx-ir test-support"          -p rlx-ir      --features test-support
+        lint "rlx-corpus gpu,vulkan"        -p rlx-corpus  --features gpu,vulkan,backend-tests
+        lint "rlx-ir test-support"          -p rlx-ir      --features test-support,backend-tests
         ;;
     esac
     for f in cuda rocm; do
@@ -548,7 +559,7 @@ lint-features:
 # GPU fault — it reads zero, so a kernel whose `len` moved does nothing at all.
 # Off by default (a relaxed atomic load); this turns it on for the suite.
 validate-metal-bindings *ARGS:
-    RLX_METAL_VALIDATE_BINDINGS=1 cargo test --release -j 4 -p rlx-metal --no-fail-fast {{ARGS}}
+    RLX_METAL_VALIDATE_BINDINGS=1 cargo test --release -j 4 -p rlx-metal --features backend-tests --no-fail-fast {{ARGS}}
 
 # Objective-C refcount gate for the Metal backend (macOS; no-ops elsewhere).
 # The test suite cannot see a leak — an over-retained object still computes the
@@ -587,7 +598,7 @@ gen-rlx-env-vars:
 # planner configuration a backend uses. Answers "which families did my compiler
 # change break", which the per-crate suites cannot.
 check-corpus:
-    cargo test -p rlx-corpus -- --nocapture
+    cargo test -p rlx-corpus --features backend-tests -- --nocapture
 
 # The same corpus, executed on every device this host can reach, scored against
 # the INDEPENDENT f64 oracle rather than against rlx's own CPU path — a defect
@@ -605,7 +616,7 @@ check-corpus-device:
       Darwin) FEATURES="apple,vulkan" ;;
       *)      FEATURES="gpu,vulkan" ;;
     esac
-    cargo test -p rlx-corpus --features "$FEATURES" --test device_gate -- --nocapture
+    cargo test -p rlx-corpus --features "$FEATURES,backend-tests" --test device_gate -- --nocapture
 
 # Env-registry gate, wired into `just ci`. Fails on any of:
 #   * docs/rlx-env-vars.md drifting from the registry
@@ -723,15 +734,15 @@ check-apple:
 # 13. The feature is off by default (it is scaffolding, not IR surface), so
 # nothing else in the tree runs these.
 check-ops:
-    cargo test -p rlx-ir --features test-support --test arity_exhaustive
+    cargo test -p rlx-ir --features test-support,backend-tests --test arity_exhaustive
     # Declared arity vs. what backends actually index — the only check here
     # that compares the table against reality rather than against itself.
     # `--lib` runs the scanner's own regression tests: every early version of
     # it passed while silently finding nothing, so the parser is pinned too.
     cargo test -p rlx-check --features op-gates --lib op_scan
-    cargo test -p rlx-check --features op-gates --test backend_operand_indexing
-    cargo clippy -p rlx-ir --features test-support --all-targets -- -D warnings
-    cargo clippy -p rlx-check --features op-gates --all-targets -- -D warnings
+    cargo test -p rlx-check --features op-gates,backend-tests --test backend_operand_indexing
+    cargo clippy -p rlx-ir --features test-support,backend-tests --all-targets -- -D warnings
+    cargo clippy -p rlx-check --features op-gates,backend-tests --all-targets -- -D warnings
 
 # Desktop coordinator for the mobile node demos. Defaults to `--self-test`,
 # which runs the worker ranks here on loopback — so the desktop half is
@@ -827,7 +838,7 @@ check-nodes:
     fi
 
     echo "==> node driver tests (host)"
-    cargo test -p rlx-runtime --no-default-features --features cpu --test dist_node_fixed_function
+    cargo test -p rlx-runtime --no-default-features --features cpu,backend-tests --test dist_node_fixed_function
     cargo test -p rlx-ffi
 
 # Run the Apple backend smoke + parity tests ON the simulators — iOS, tvOS,
@@ -874,14 +885,14 @@ test-apple-sim profile="dev":
         echo "==> $t (cpu,metal,coreml, profile {{profile}})"
         rustup target add "$t" >/dev/null
         cargo test --profile {{profile}} -p rlx-runtime \
-            --no-default-features --features cpu,metal,coreml \
+            --no-default-features --features cpu,metal,coreml,backend-tests \
             --target "$t" --test apple_backends_sim --test apple_platform_sim \
             -- --nocapture --test-threads=1
     done
 
     echo "==> aarch64-apple-watchos-sim (cpu, profile {{profile}})"
     rustup target add aarch64-apple-watchos-sim >/dev/null
-    cargo test --profile {{profile}} -p rlx-runtime --no-default-features --features cpu \
+    cargo test --profile {{profile}} -p rlx-runtime --no-default-features --features cpu,backend-tests \
         --target aarch64-apple-watchos-sim --test apple_platform_sim \
         -- --nocapture --test-threads=1
 
@@ -940,7 +951,7 @@ test-rocm:
     # kernel declares and cannot see how many were passed, so a mismatch is
     # silent — this repo shipped one (see `gguf_gpu::launch_dequant_gguf`).
     RLX_GPU_VALIDATE_PARAMS=1 cargo test -p rlx-rocm --features backend-tests
-    cargo test -p rlx-runtime --features cpu,rocm --test graph_devices_parity
+    cargo test -p rlx-runtime --features cpu,rocm,backend-tests --test graph_devices_parity
     cargo test -p rlx-runtime --features cpu,rocm,backend-tests \
         --test rocm_op_parity --test rocm_gpu_custom_op
 
@@ -961,33 +972,33 @@ test-third-order-gpu:
     #!/usr/bin/env bash
     set -euo pipefail
     export RLX_REQUIRE_DEVICE="{{require_device}}"
-    cargo test -p rlx-runtime --release --features cpu --test nth_order_grad
+    cargo test -p rlx-runtime --release --features cpu,backend-tests --test nth_order_grad
     case "$(uname -s)" in
       Darwin)
-        cargo test -p rlx-runtime --release --features cpu,apple \
+        cargo test -p rlx-runtime --release --features cpu,apple,backend-tests \
           --test higher_order_low_precision_parity
-        cargo test -p rlx-runtime --release --features cpu,apple \
+        cargo test -p rlx-runtime --release --features cpu,apple,backend-tests \
           --test third_order_gpu_parity --test directional_nth_gpu_parity
-        cargo test -p rlx-runtime --release --features cpu,apple \
+        cargo test -p rlx-runtime --release --features cpu,apple,backend-tests \
           --test higher_order_decompose_parity -- --test-threads=1 ;;
       *)
-        cargo test -p rlx-runtime --release --features cpu,gpu \
+        cargo test -p rlx-runtime --release --features cpu,gpu,backend-tests \
           --test higher_order_low_precision_parity
-        cargo test -p rlx-runtime --release --features cpu,gpu \
+        cargo test -p rlx-runtime --release --features cpu,gpu,backend-tests \
           --test third_order_gpu_parity --test directional_nth_gpu_parity
-        cargo test -p rlx-runtime --release --features cpu,gpu \
+        cargo test -p rlx-runtime --release --features cpu,gpu,backend-tests \
           --test higher_order_decompose_parity -- --test-threads=1
         if cargo check -p rlx-runtime --features cpu,cuda,gpu --quiet 2>/dev/null; then
-          cargo test -p rlx-runtime --release --features cpu,cuda,gpu \
+          cargo test -p rlx-runtime --release --features cpu,cuda,gpu,backend-tests \
             --test higher_order_decompose_parity -- --test-threads=1
         fi
         if cargo check -p rlx-runtime --features cpu,rocm --quiet 2>/dev/null; then
           cargo test -p rlx-runtime --release --features cpu,rocm,backend-tests \
             --test rocm_op_parity --test graph_devices_parity
-          cargo test -p rlx-runtime --release --features cpu,rocm \
+          cargo test -p rlx-runtime --release --features cpu,rocm,backend-tests \
             --test third_order_gpu_parity --test directional_nth_gpu_parity \
             --test higher_order_low_precision_parity
-          cargo test -p rlx-runtime --release --features cpu,rocm \
+          cargo test -p rlx-runtime --release --features cpu,rocm,backend-tests \
             --test higher_order_decompose_parity -- --test-threads=1
         fi ;;
     esac
@@ -1020,7 +1031,7 @@ test-wgpu-linux:
         -v "{{justfile_directory()}}:/rlx" \
         -v rlx-vk-target:/target \
         rlx-wgpu-vk \
-        cargo test -p rlx-wgpu --tests --no-fail-fast -- --test-threads=1
+        cargo test -p rlx-wgpu --features backend-tests --tests --no-fail-fast -- --test-threads=1
 
 # Checks the browser-reachable kernels compute correctly there, AND that the
 # cooperative-matrix kernels are rejected — `enable wgpu_cooperative_matrix`

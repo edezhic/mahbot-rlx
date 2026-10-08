@@ -55,7 +55,7 @@ error in the flux-source term. Second-order convergence is checked separately on
 a case that is *not* exactly representable.
 
 ```sh
-cargo test -p rlx-fem --no-default-features
+cargo test -p rlx-fem --no-default-features --features backend-tests
 ```
 ## License
 

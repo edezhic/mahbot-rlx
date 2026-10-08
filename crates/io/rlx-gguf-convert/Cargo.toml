@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-gguf-convert --features backend-tests`.
+backend-tests = []
 # Source readers are opt-in. Default to safetensors only — the
 # common case. `onnx` pulls in the heavier rlx-onnx-import crate.
 default = ["safetensors"]
@@ -52,3 +54,11 @@ required-features = ["safetensors"]
 features       = ["safetensors", "onnx"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "pt_convert"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "safetensors_roundtrip"
+required-features = ["backend-tests"]

@@ -32,7 +32,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "$ROOT"
 
 echo "mpsgraph-soak: building ${TEST}…"
-cargo test --release -p rlx-metal --test "$TEST" --no-run -q 2>/dev/null
+cargo test --release -p rlx-metal --features backend-tests --test "$TEST" --no-run -q 2>/dev/null
 
 bin="$(ls -t target/release/deps 2>/dev/null | grep -E "^${TEST}-[0-9a-f]+$" | head -1 || true)"
 if [[ -z "$bin" ]]; then

@@ -76,6 +76,8 @@ all-ep = ["metal", "mlx", "cuda", "rocm", "gpu", "vulkan", "oneapi", "coreml", "
 name = "rlx-onnx-run"
 path = "src/bin/run.rs"
 required-features = ["native"]
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [lints]
 workspace = true

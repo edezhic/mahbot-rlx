@@ -176,8 +176,8 @@ Four test harnesses, in increasing order of weight:
 
 ```sh
 # 1. Host-agnostic — prost decode + HLO builder + lowering walker.
-# (`--features backend-tests`: rlx-tpu is not one of the default test paths, so
-# its test targets are not in the default `cargo test` run.)
+# (`--features backend-tests`: the default `cargo test` run is a fast smoke set,
+# so rlx-tpu's test targets are not in it.)
 cargo test -p rlx-tpu --features backend-tests # 2 unit + 12 hlo_decode
                                               # + 32 hlo_match + 4 check
                                               # = 50 tests

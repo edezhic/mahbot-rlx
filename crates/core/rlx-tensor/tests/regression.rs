@@ -5,7 +5,7 @@
 //! Capstone: fit a real linear model with gradient descent. Exercises the
 //! whole stack — inputs + multiple params, matmul, broadcast bias, MSE loss,
 //! grad w.r.t. several params, optimizer convergence. Run:
-//! `cargo test -p rlx-tensor --features optim`.
+//! `cargo test -p rlx-tensor --features optim,backend-tests`.
 #![cfg(feature = "optim")]
 
 use rlx_tensor::{Func, Sgd, shape};

@@ -433,7 +433,7 @@ def cmd_emulate(
         print(f"[3/4] building rlx-cpu tests inside {platform} …")
         build = dk(
             "exec", container, "sh", "-c",
-            "cargo test -p rlx-cpu --release --no-run --locked 2>&1",
+            "cargo test -p rlx-cpu --release --features backend-tests --no-run --locked 2>&1",
             capture_output=True, text=True,
         )
         bins = re.findall(r"\((/build/target/\S+)\)", build.stdout)

@@ -22,6 +22,8 @@ rlx-optim = { workspace = true, optional = true }
 ndarray = { version = "0.16", optional = true }
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-tensor --features backend-tests`.
+backend-tests = []
 default = []
 # `rlx! { … }` declarative graph DSL. Opt-in so the base crate stays a lean
 # `rlx-ir` graph builder — this feature is the only thing that pulls in the
@@ -72,3 +74,107 @@ trybuild = "1"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "attention"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "backends"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cache"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dtype"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ergonomics"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "eval"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fft"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "grad"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "half_metal"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "interop"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "linalg"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "manip"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "norm"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "parallel"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pool"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "reductions"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "regression"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rlx_dsl"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "shape"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "tensor"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "train"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "train_dsl"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "transform"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ui"
+required-features = ["backend-tests"]

@@ -30,6 +30,8 @@ path = "src/lib.rs"
 [[bin]]
 name = "rlx-cerebras-emit"
 path = "src/bin/emit.rs"
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 
 [lints]
 workspace = true

@@ -12,12 +12,12 @@
 //! Lives here rather than in `rlx-metal/tests` because only `rlx-runtime` can
 //! enable both backends at once:
 //!
-//!     cargo test -p rlx-runtime --test lstm_three_way --features metal,gpu -- --nocapture
-//!     cargo test -p rlx-runtime --test lstm_three_way --features metal,gpu -- --ignored --nocapture
+//!     cargo test -p rlx-runtime --test lstm_three_way --features metal,gpu,backend-tests -- --nocapture
+//!     cargo test -p rlx-runtime --test lstm_three_way --features metal,gpu,backend-tests -- --ignored --nocapture
 //!
-//! The first runs the tests that stay in the default run — they print a verdict
-//! and assert nothing; the second adds the three `#[ignore]`d print-only
-//! diagnostics in this file.
+//! The first runs the tests that are not `#[ignore]`d — they print a verdict
+//! and assert nothing; the second adds the three print-only diagnostics in this
+//! file.
 
 #![cfg(any(feature = "metal", feature = "gpu", feature = "cuda", feature = "rocm"))]
 

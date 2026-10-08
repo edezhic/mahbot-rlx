@@ -14,7 +14,7 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
-# Other backends' test targets: off by default, `cargo test -p rlx-oneapi --features backend-tests`.
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-oneapi --features backend-tests`.
 backend-tests = []
 default = []
 # Generate a tiled matmul entry point FROM a typed `KernelSchedule` (see
@@ -85,3 +85,7 @@ required-features = ["backend-tests"]
 [[test]]
 name = "spd_host_parity"
 required-features = ["backend-tests"]
+
+[lib]
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false

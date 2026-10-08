@@ -650,8 +650,9 @@ until the kind moves from **common-ir** to **native**.
 
 ## Development workflow
 
-- **Fast local gate**: `just ci` (build, workspace tests at the default
-  selection — CPU / Metal / wgpu — lint, pyrlx pytest).
+- **Fast local gate**: `just ci` (build, workspace tests — a fast smoke gate;
+  the heavy integration suites are opt-in with `--features backend-tests` —
+  lint, pyrlx pytest).
 - **Always gate benches on throttle.** `scripts/check-throttle.sh` refuses
   to proceed under thermal pressure (`pmset -g therm`). Silent 10×
   slowdowns are a real failure mode on Macs. `--warn` mode for CI;

@@ -14,6 +14,8 @@ homepage.workspace      = true
 documentation.workspace = true
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx --features backend-tests`.
+backend-tests = []
 # Empty by default: the prelude carries only the backend-agnostic IR / opt /
 # runtime surface, and the consumer picks a backend (`cpu`, `metal`, `cuda`,
 # …) plus companion features (`tensor`, `gguf`, …) explicitly. Keeps the base
@@ -158,3 +160,11 @@ workspace = true
 features      = ["cpu", "tensor", "gpu", "gguf", "bench", "sparse", "linalg", "geo", "peft", "rng", "splat", "cortexm", "fpga", "optim", "distributed"]
 rustdoc-args  = ["--cfg", "docsrs"]
 all-features  = false
+
+[[test]]
+name = "rlx_dsl_umbrella"
+required-features = ["backend-tests"]
+
+[lib]
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false

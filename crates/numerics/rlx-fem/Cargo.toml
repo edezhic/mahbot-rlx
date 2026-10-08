@@ -16,6 +16,8 @@ homepage.workspace      = true
 documentation.workspace = true
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-fem --features backend-tests`.
+backend-tests = []
 # The solver core has no rlx dependencies and builds under
 # `--no-default-features`, the same layering `rlx-geo` uses for its geometry
 # core. There is nothing here that needs a graph runtime to be useful.
@@ -29,3 +31,7 @@ workspace = true
 [package.metadata.docs.rs]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "analytical"
+required-features = ["backend-tests"]

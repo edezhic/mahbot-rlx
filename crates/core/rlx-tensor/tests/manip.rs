@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Tier-3 array manipulation: split/chunk/tile/flip/roll/pad.
-//! Run: `cargo test -p rlx-tensor --features eval`.
+//! Run: `cargo test -p rlx-tensor --features eval,backend-tests`.
 #![cfg(feature = "eval")]
 
 use rlx_tensor::Tensor;

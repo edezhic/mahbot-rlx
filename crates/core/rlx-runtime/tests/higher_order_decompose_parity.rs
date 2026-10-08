@@ -7,8 +7,8 @@
 // (RmsNorm, LayerNorm, Attention, Conv2d/3d, MaxPool2d/3d).
 //
 //! ```sh
-//! cargo test -p rlx-runtime --features cpu,apple --test higher_order_decompose_parity
-//! cargo test -p rlx-runtime --features cpu,gpu --test higher_order_decompose_parity
+//! cargo test -p rlx-runtime --features cpu,apple,backend-tests --test higher_order_decompose_parity
+//! cargo test -p rlx-runtime --features cpu,gpu,backend-tests --test higher_order_decompose_parity
 //! ```
 
 #![cfg(all(

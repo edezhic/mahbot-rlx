@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Reverse-mode autodiff against closed-form gradients. Run with:
-//! `cargo test -p rlx-tensor --features grad,eval`.
+//! `cargo test -p rlx-tensor --features grad,eval,backend-tests`.
 #![cfg(all(feature = "grad", feature = "eval"))]
 
 use rlx_tensor::Tensor;

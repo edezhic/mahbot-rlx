@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [lib]
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
 name = "rlx_peft"
 path = "src/lib.rs"
 
@@ -25,6 +27,8 @@ rlx-runtime = { workspace = true }
 rlx-cpu = { workspace = true }
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-peft --features backend-tests`.
+backend-tests = []
 default = ["cpu"]
 cpu = ["rlx-runtime/cpu"]
 metal = ["rlx-runtime/metal"]
@@ -40,3 +44,11 @@ workspace = true
 features       = ["cpu"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "adapters"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "backends"
+required-features = ["backend-tests"]

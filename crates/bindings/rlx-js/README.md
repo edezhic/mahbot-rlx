@@ -491,7 +491,7 @@ own, for embedders adding globals of their own.
 the engine and this binding move together, so an engine bump is deliberate.
 
 ```bash
-just test-js                       # or: cargo test -p rlx-js
+just test-js                       # or: cargo test -p rlx-js --features backend-tests
 just test-js metal,gguf,training
 ```
 

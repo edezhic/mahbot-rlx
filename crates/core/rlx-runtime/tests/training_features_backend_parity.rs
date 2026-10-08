@@ -13,7 +13,7 @@
 //!   NaN and a GEMM panic on CPU.
 //!
 //! ```text
-//! cargo test -p rlx-runtime --features metal,mlx --test training_features_backend_parity
+//! cargo test -p rlx-runtime --features metal,mlx,backend-tests --test training_features_backend_parity
 //! ```
 #![cfg(feature = "cpu")]
 

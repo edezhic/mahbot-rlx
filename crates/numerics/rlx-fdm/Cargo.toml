@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-fdm --features backend-tests`.
+backend-tests = []
 default = ["reference", "sparse", "nonlinear"]
 
 # Pure-Rust equilibrium reference (dense K, LAPACK-free Gaussian elimination).
@@ -62,23 +64,23 @@ required-features = ["ir"]
 
 [[test]]
 name = "sparse_parity"
-required-features = ["sparse"]
+required-features = ["sparse", "backend-tests"]
 
 [[test]]
 name = "nonlinear_iter"
-required-features = ["nonlinear"]
+required-features = ["nonlinear", "backend-tests"]
 
 [[test]]
 name = "sparse_fast_parity"
-required-features = ["sparse"]
+required-features = ["sparse", "backend-tests"]
 
 [[test]]
 name = "face_loads"
-required-features = ["nonlinear"]
+required-features = ["nonlinear", "backend-tests"]
 
 [[test]]
 name = "implicit_grad"
-required-features = ["nonlinear"]
+required-features = ["nonlinear", "backend-tests"]
 
 [[test]]
 name = "rlx_sparse_pcg"
@@ -94,15 +96,15 @@ required-features = ["reference"]
 
 [[test]]
 name = "constrained_opt"
-required-features = ["reference"]
+required-features = ["reference", "backend-tests"]
 
 [[test]]
 name = "nonlinear_adjoint"
-required-features = ["nonlinear"]
+required-features = ["nonlinear", "backend-tests"]
 
 [[test]]
 name = "goals_extended"
-required-features = ["reference"]
+required-features = ["reference", "backend-tests"]
 
 [[test]]
 name = "io_mesh_json"
@@ -122,23 +124,23 @@ required-features = ["ir", "rlx-sparse"]
 
 [[test]]
 name = "mesh_goals"
-required-features = ["reference"]
+required-features = ["reference", "backend-tests"]
 
 [[test]]
 name = "lbfgs_opt"
-required-features = ["reference"]
+required-features = ["reference", "backend-tests"]
 
 [[test]]
 name = "pcg_adjoint"
-required-features = ["reference", "sparse"]
+required-features = ["reference", "sparse", "backend-tests"]
 
 [[test]]
 name = "fixed_coord_grad"
-required-features = ["reference"]
+required-features = ["reference", "backend-tests"]
 
 [[test]]
 name = "anderson_accel"
-required-features = ["nonlinear"]
+required-features = ["nonlinear", "backend-tests"]
 
 [[test]]
 name = "fused_e2e"
@@ -155,3 +157,23 @@ workspace = true
 features       = ["reference", "sparse", "nonlinear", "io", "ir", "fuse"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "arch_equilibrium"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "parameters_opt"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "residual_grad"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "slsqp_constraints"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "vault_dome"
+required-features = ["backend-tests"]

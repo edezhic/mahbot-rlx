@@ -16,7 +16,7 @@
 //! the codegen).
 //!
 //! Run it (not part of CI):
-//!   cargo test -p rlx-runtime --features gpu,metal \
+//!   cargo test -p rlx-runtime --features gpu,metal,backend-tests \
 //!       --test activation_throughput_bench -- --ignored --nocapture
 //! On the CUDA/Vulkan rig: `--features cuda,vulkan,gpu`.
 

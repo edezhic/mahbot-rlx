@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! NumPy-grade shape ops, evaluated end-to-end. Run:
-//! `cargo test -p rlx-tensor --features eval`.
+//! `cargo test -p rlx-tensor --features eval,backend-tests`.
 #![cfg(feature = "eval")]
 
 use rlx_tensor::{Tensor, cat, stack};

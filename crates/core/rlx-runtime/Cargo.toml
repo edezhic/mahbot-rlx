@@ -14,7 +14,7 @@ repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
 [features]
-# Other backends' test targets: off by default, `cargo test -p rlx-runtime --features backend-tests`.
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-runtime --features backend-tests`.
 backend-tests = []
 default = ["cpu", "model-io"]
 
@@ -463,4 +463,876 @@ required-features = ["backend-tests"]
 
 [[test]]
 name = "vulkan_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "activation_backward_fd"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "activation_backward_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "activation_batch_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "activation_recip_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "activation_throughput_bench"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "apple_backends_sim"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "apple_platform_sim"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "argreduce_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "atan2_backend_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "attention_bias_backend_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "attention_bshd_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "attention_mask_shapes"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "autodiff_attention_backward"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "autodiff_attention_backward_gpu"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "autodiff_checkpoint"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "autodiff_dequant_grouped_backward"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "autodiff_dequant_grouped_vmap"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "autodiff_mnist_pipeline"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "autodiff_training_backward"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "autodiff_training_backward_gpu"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "bench_conv_bias_act"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "bf16_activation_layout"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "binary_ops_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "browser_support"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "c64_matmul"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "capability_table_matches_backends"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "check_budget"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "check_schedule_axis"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cholesky_cpu"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "compiled_graph_clone"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv2d_groups_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_bias_act_fusion"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_bias_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_transpose2d_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_batched_transpose"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_binary_bidirectional_broadcast"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_c64_wirtinger"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_complex"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_control_flow"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_custom_op"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_exg_kernels"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_f64_dense_solve"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_f64_run"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_fft"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_filters"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_gated_delta_net_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_grad_finite_difference"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_grouped_matmul_fold"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_gru_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_half_activation_layout"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_hvp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_jvp_linalg"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_linalg"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_linalg_v2"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_linalg_v3"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_linalg_vjp"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_log_mel"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_log_mel_autodiff"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_lstm_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_matmul_transpose_fold"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_nop_fused_ops_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_perf_diag"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_scalar_constant"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_selective_scan_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_softmax_cross_entropy_dense"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_sparse_ops"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_sparse_ops_v2"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_sparse_ops_v3"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_sparse_ops_v4"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_sparse_ops_v5"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_spdnet"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_sqrt_grad"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_sqrt_grad_f64"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_vmap_linalg"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cumulative_ops_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "custom_op_lowering"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "decompose_gaps_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dequant_grouped_matmul_gguf"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dequant_matmul_gguf"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dequant_matmul_gguf_iq"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dequant_matmul_mxfp4x2"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "device_present"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "directional_nth_gpu_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dist_node_fixed_function"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dist_node_training"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dist_train_e2e"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dit_block_train"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dit_import_fuse"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dit_modulation_grad"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dit_modulation_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dit_multiblock_train"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "eeg_pipeline"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "elementwise_backend_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "elementwise_region_kept"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "expand_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "expand_vulkan_repro"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "expert_pool_tide"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fd_backward_gate"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fk_prologue_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fused_attention_block_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gdn_backward_backend_fallback"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gdn_cuda_scaling"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gpu_exg_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gpu_fft_norm"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gpu_filters_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "graph_devices_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "group_norm_backward_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "grouped_matmul_bank_layout"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gru_carry_native"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gru_rnn"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "higher_order_activation_probe"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "higher_order_decompose_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "higher_order_low_precision_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "histogram_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "host_fallback_never_nops"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "indexing_ops_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "jvp_hvp_third_regression"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "jvp_over_hvp_third_order"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "kv_append_backends"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "kv_resident_row_feed"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lane_reset"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "linalg_backend_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lora_matmul_decompose"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "low_precision_boundary"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lower_conv_transpose2d_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lsq_quant"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_autodiff"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_carry_writeback"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_host_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_metal_diagnose"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_metal_proj_scaling"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_metal_wide"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_multilayer_native"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_rev_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_three_way"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lstm_variants"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mamba2"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_cast_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_conv2d_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_conv_pool_backward_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_dw_reduce"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_fft"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_fft_real"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_gpu_custom_op"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_group_norm_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_layernorm_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_rnn_native"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_self_mul"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_softmax_cross_entropy"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_softmax_cross_entropy_thunk"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_sparse_ops"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_sparse_ops_v2"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_synth_vjp_dx_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_vq_debug"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mla_attn_backend_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mlip_loss"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "moe_grouped_residency"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "moe_hot_cold_split"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mps_attention_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "mrope_rope_integration"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "multi_shape_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "nontrailing_reduce_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "nth_order_grad"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pad_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "param_hoist"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pestle_schemes_all_backends"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pipeline_schedule"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "qr_backend_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "require_device_coverage"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "resident_kan_train"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "resident_trainer_wgpu"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "reverse_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rfft_exact"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rlxp_mlx_keep_packed_run"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rlxp_placement"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rng_ops"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rnn_cross_backend"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rnn_metal_concurrent"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "rnn_multilayer_native"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "roll_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "sample_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scaled_grouped_matmul"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scaled_quant_policy"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scan_backward_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scan_unroll_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scatter_add_axis"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "scatter_nd_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "selective_scan_backward_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "slice_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "sort_backend_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "sort_cpu"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "spd_spectral_lowering"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "spline_activation_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "stable_norm_softmax_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "structural_ops_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "svd_backend_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "synth_codebook_train"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "synth_matmul_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "synth_qcodebook"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "third_order_gpu_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "tinyconv_graph"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "training_features_backend_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "triangular_solve_cpu"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "typed_io"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "vq_bench"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_batch_norm_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_bf16_weight_matmul"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_conv3d_bias_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_conv_bias_act"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_fft"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_gpu_custom_op"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_indexing_nd_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_quant_i8_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_rnn_native"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_scaled_lowp_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_softmax_cross_entropy"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_swiglu"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wgpu_vision_ops_parity"
 required-features = ["backend-tests"]

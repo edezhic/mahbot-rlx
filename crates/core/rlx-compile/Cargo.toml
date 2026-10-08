@@ -14,6 +14,8 @@ homepage.workspace     = true
 documentation.workspace = true
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-compile --features backend-tests`.
+backend-tests = []
 default = []
 training = ["dep:rlx-autodiff"]
 
@@ -32,3 +34,35 @@ workspace = true
 features       = ["training"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "dequant_guard_plan"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "dynamic"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "hardening"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "host_indexing_pin"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "kv_append_portability"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lir_stage_grad_errors"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "plan_check_gate"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "plan_check_real_graphs"
+required-features = ["backend-tests"]

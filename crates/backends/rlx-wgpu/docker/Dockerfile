@@ -9,7 +9,7 @@
 # Build for the host arch (arm64 on Apple silicon) so it runs natively:
 #   docker build -t rlx-wgpu-vk crates/backends/rlx-wgpu/docker
 #   docker run --rm -v "$PWD:/rlx" -v rlx-vk-target:/target rlx-wgpu-vk \
-#       cargo test -p rlx-wgpu --tests -- --test-threads=1
+#       cargo test -p rlx-wgpu --features backend-tests --tests -- --test-threads=1
 FROM rust:1-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -35,7 +35,7 @@ than closing it, which is the honest thing a standalone study can do.
 ## Running it
 
 ```bash
-cargo test -p rlx-megakernel
+cargo test -p rlx-megakernel --features backend-tests
 ```
 
 The tests report dispatch counts before and after fusion, and assert that

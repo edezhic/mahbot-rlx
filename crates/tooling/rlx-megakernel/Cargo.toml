@@ -24,3 +24,17 @@ rlx-runtime = { workspace = true, features = ["cpu"] }
 
 [lints]
 workspace = true
+
+[features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-megakernel --features backend-tests`.
+backend-tests = []
+
+[[test]]
+name = "composition"
+required-features = ["backend-tests"]
+
+[lib]
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false

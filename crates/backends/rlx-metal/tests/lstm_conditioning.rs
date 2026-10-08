@@ -21,7 +21,7 @@
 //! alone and should not have: the reference disagreeing with a perturbed copy of
 //! itself is the control that separates the two explanations.
 //!
-//!     cargo test -p rlx-metal --test lstm_conditioning -- --nocapture
+//!     cargo test -p rlx-metal --test lstm_conditioning --features backend-tests -- --nocapture
 
 use rlx_ir::op::Op;
 use rlx_ir::{DType, Graph, Shape};

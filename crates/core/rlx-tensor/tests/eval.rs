@@ -4,7 +4,7 @@
 
 //! End-to-end materialization: build with NumPy-style constructors, then
 //! compile + run on CPU via the `eval` feature. Run with:
-//! `cargo test -p rlx-tensor --features eval`.
+//! `cargo test -p rlx-tensor --features eval,backend-tests`.
 #![cfg(feature = "eval")]
 
 use rlx_tensor::Tensor;

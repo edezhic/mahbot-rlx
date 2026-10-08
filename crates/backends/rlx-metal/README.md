@@ -90,7 +90,7 @@ rlx = { version = "0.1", features = ["metal"] }
 
 ```sh
 cargo build -p rlx-metal --release
-cargo test  -p rlx-metal --release
+cargo test  -p rlx-metal --release --features backend-tests
 ```
 
 Gating env vars worth knowing:

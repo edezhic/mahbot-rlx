@@ -113,7 +113,7 @@ convention swap automatically for HF-named keys).
 ## Build / test
 
 ```sh
-cargo test -p rlx-gguf
+cargo test -p rlx-gguf --features backend-tests
 ```
 
 Unit tests cover each block format with hand-encoded fixtures, plus

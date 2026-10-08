@@ -5,7 +5,7 @@
 //! Validate the fused `Op::Attention` against the naive decomposition
 //! `softmax(Q·Kᵀ · d^-0.5) · V`, both run through the lazy `Tensor`/`Func`
 //! pipeline. The headline op for rlx's LLM domain. Run:
-//! `cargo test -p rlx-tensor --features eval`.
+//! `cargo test -p rlx-tensor --features eval,backend-tests`.
 #![cfg(feature = "eval")]
 
 use rlx_tensor::{Func, MaskKind, shape};

@@ -20,6 +20,8 @@ bincode = { version = "1", optional = true }
 aes = "0.9.1"
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-ir --features backend-tests`.
+backend-tests = []
 serialize = ["dep:serde", "dep:serde_json", "dep:bincode"]
 # One constructible `Op` per `OpKind` (`sample_ops`), so gates keyed on the op
 # set can cover all of it instead of the handful a test author thought of.
@@ -34,3 +36,23 @@ workspace = true
 features       = ["serialize"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "arity_exhaustive"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "kernel_schedule_principles"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "kernel_schedule_verify"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lowp_encode_f32_feasibility"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "lowp_invariants"
+required-features = ["backend-tests"]

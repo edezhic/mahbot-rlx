@@ -36,17 +36,28 @@ per-head buffers without rewriting the kernel — same code path,
 different stride values.
 
 **Persistent thread pool, no per-call init.** `pool::par_for(total,
-grain, &|off, cnt| ...)` is the parallel primitive. Fixed worker
-count from `RuntimeConfig::pool_workers`. Workers spin briefly
-before parking — better tail latency than a wakeup-per-call pool
-on Apple Silicon's P/E asymmetric cores.
+grain, &|off, cnt| ...)` is the parallel primitive. The worker width
+is fixed when the process-wide pool is created: `RLX_WORKERS` when
+set, else all of the performance cores on Apple Silicon and ~¾ of the
+logical CPUs elsewhere. `pool::num_threads()` is the one notion of
+width — it reports the width in effect — and every width that could not
+be applied as asked is reported on stderr; `src/pool.rs`'s module docs
+are the reference for the resolution rules and their reports.
 
 ## What doesn't work / why
 
 - **`autotune.rs` only tunes `par_threshold` and `sdpa_seq_threshold`.**
-  Pool worker count can't be retuned after init (the pool is
-  constructed once). To tune workers we'd need a dispose-and-rebuild
-  pattern.
+  The pool worker count is process-wide and fixed before the first
+  parallel dispatch, so it is not a search axis. The swept thresholds
+  and the returned `TuneResult::config` are values to install in a later
+  process — the kernels read the frozen global config — so the tuner
+  reports only what it measured, never a setting as if it were live.
+- **The shared elementwise floor is set for the heavy kernels.** An op fans out
+  only once every worker can get `ELEMENTWISE_PAR_FLOOR` (4 K) elements — right
+  for conv/pool/transpose/region callers, generous for a bare activation, which
+  is still dispatch-bound at 32 K (measured, min-of-40 `relu`: 37 µs at the
+  5-worker default, where a serial pass is ~15 µs). One knob is shared on
+  purpose; splitting it per kernel class is the tunable left on the table.
 - **No fused dequant + matmul.** `QuantMap` exists in `rlx-ir` (#57)
   but blas.rs doesn't read it. The big LLM-bandwidth win on Apple
   Silicon is still on the table (plan #5).

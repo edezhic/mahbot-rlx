@@ -30,6 +30,8 @@ toml        = "0.8"
 rlx-gguf    = { workspace = true, optional = true }
 
 [features]
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-distributed --features backend-tests`.
+backend-tests = []
 default = []
 gguf = ["dep:rlx-gguf"]
 
@@ -55,3 +57,15 @@ workspace = true
 features       = ["gguf"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
+
+[[test]]
+name = "experts_loopback"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "paging_real_gguf"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pipeline_parity"
+required-features = ["backend-tests"]

@@ -6,7 +6,7 @@ See `crates/core/rlx-autodiff/README.md` for the API and [`CHANGELOG.md`](../../
 
 ```sh
 # GPU parity (x³, relu, tanh, gelu, silu @ order 3)
-cargo test -p rlx-runtime --features cpu,apple --test third_order_gpu_parity
+cargo test -p rlx-runtime --features cpu,apple,backend-tests --test third_order_gpu_parity
 ./rig.sh test-third-order-gpu   # CPU + CUDA decompose + wgpu on rig
 just test-third-order-gpu       # macOS: Apple backends; Linux: wgpu (+ CUDA decompose when built)
 ```

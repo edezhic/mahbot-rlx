@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! ndarray interop (feature `ndarray`). Run:
-//! `cargo test -p rlx-tensor --features ndarray,eval`.
+//! `cargo test -p rlx-tensor --features ndarray,eval,backend-tests`.
 #![cfg(all(feature = "ndarray", feature = "eval"))]
 
 use ndarray::{Array2, array};

@@ -42,7 +42,7 @@ path = "src/lib.rs"
 # Kernel sources live in `rlx-gpu-kernels`. This harness reuses
 # rlx-cuda's `cpp/cpu_dispatch.cpp` and HIP-CPU at `rlx-cuda/docker/vendor/HIP-CPU`.
 [features]
-# Other backends' test targets: off by default, `cargo test -p rlx-rocm --features backend-tests`.
+# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-rocm --features backend-tests`.
 backend-tests = []
 default = []
 native-splat = []

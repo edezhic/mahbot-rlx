@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! End-to-end training loop: value+grad + optimizer step. Run:
-//! `cargo test -p rlx-tensor --features optim`.
+//! `cargo test -p rlx-tensor --features optim,backend-tests`.
 #![cfg(feature = "optim")]
 
 use rlx_tensor::{Func, Sgd, shape};

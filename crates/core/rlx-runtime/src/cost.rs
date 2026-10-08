@@ -309,8 +309,7 @@ pub struct CpuCostModel(rlx_cpu::cost::HwModel);
 #[cfg(feature = "cpu")]
 impl CpuCostModel {
     pub fn new() -> Self {
-        let cfg = rlx_cpu::config::RuntimeConfig::global();
-        Self(rlx_cpu::cost::HwModel::from_config(cfg))
+        Self(rlx_cpu::cost::HwModel::platform())
     }
 }
 
@@ -327,8 +326,8 @@ impl BackendCostModel for CpuCostModel {
         Device::Cpu
     }
     fn calibration(&self) -> CostCalibration {
-        // `rlx_cpu::cost::HwModel` is built from detected CPU features and
-        // per-arch compile-time constants — real for the arch, not measured here.
+        // `rlx_cpu::cost::HwModel` is per-arch compile-time constants — real for
+        // the arch, not measured here.
         CostCalibration::ArchDefault
     }
     fn sgemm_gflops(&self, m: usize, k: usize, n: usize) -> f64 {
@@ -353,7 +352,7 @@ impl BackendCostModel for CpuCostModel {
         self.0.mem_bw
     }
     fn num_threads(&self) -> usize {
-        self.0.num_threads
+        rlx_cpu::pool::num_threads()
     }
 }
 

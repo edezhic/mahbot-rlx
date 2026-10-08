@@ -18,6 +18,10 @@ documentation.workspace = true
 publish = false
 
 [lib]
+# No unit tests in this target: the empty harness was pure launch cost.
+test = false
+# No doctests in this crate: the empty stage was pure rustdoc cost.
+doctest = false
 name = "pyrlx"
 crate-type = ["cdylib", "rlib"]
 

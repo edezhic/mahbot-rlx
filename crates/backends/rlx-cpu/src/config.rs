@@ -10,7 +10,7 @@
 //! code via [`rlx_ir::env::set`] / [`RuntimeConfig::install`].
 //!
 //! ```bash
-//! RLX_WORKERS=8           # thread pool size (0 = auto)
+//! RLX_WORKERS=8           # worker width; unset/0 = the tuned default
 //! RLX_PAR_THRESHOLD=20000 # min elements for parallel dispatch
 //! RLX_SDPA_THRESHOLD=32   # seq len: NEON dots (≤) vs BLAS sgemm (>)
 //! RLX_ARENA_ALIGN=128     # arena buffer alignment in bytes
@@ -56,9 +56,7 @@ struct HwInfo {
 
 impl HwInfo {
     fn detect() -> Self {
-        let total = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(2);
+        let total = machine_threads();
 
         // `info` is mutated only under per-OS cfg blocks below; on targets
         // without one (e.g. wasm) it stays as-detected.
@@ -102,14 +100,21 @@ impl HwInfo {
         info
     }
 
-    /// Optimal worker count.
+    /// Worker width RLX asks the process-wide pool for.
     ///
-    /// Apple Silicon: half of P-cores (avoid E-cores + AMX cache thrashing).
-    /// Elsewhere: ~¾ of logical CPUs — DiT/CNN CPU paths want more outer
-    /// Rayon width once BLAS is pinned to 1 thread.
+    /// Apple Silicon: the whole performance cluster. The P-cores are the only
+    /// cores that help here, so the pool should neither leave them idle nor
+    /// spill onto the E-cores — measured on the reference host (5 P-cores /
+    /// 11 logical CPUs), half the cluster (the previous rule) reached only a
+    /// third to a half of the achievable throughput on pool-bound work, while
+    /// going past the cluster was worse once the machine was shared. When the
+    /// OS reports no P-core count we cannot tell P from E, so stay at half the
+    /// logical CPUs.
+    /// Elsewhere: ~¾ of logical CPUs — DiT/CNN CPU paths want more outer Rayon
+    /// width once BLAS is pinned to 1 thread. Unchanged.
     fn optimal_workers(&self) -> usize {
         let base = if self.perf_cores > 0 {
-            self.perf_cores / 2
+            self.perf_cores
         } else if cfg!(all(target_arch = "aarch64", target_vendor = "apple")) {
             self.total_cpus / 2
         } else {
@@ -143,6 +148,64 @@ impl HwInfo {
     }
 }
 
+/// A worker width the caller asked for through `RLX_WORKERS` — the same key
+/// [`RuntimeConfig::install`] and [`rlx_ir::env::set`] write.
+///
+/// `0` means "auto" and is not a request. A positive value is honoured, capped
+/// at the threads the machine makes available (see [`machine_threads`]) —
+/// [`crate::pool::ensure_pool`] reports the cap instead of applying it silently.
+pub(crate) fn explicit_workers() -> Option<usize> {
+    match rlx_ir::env::var("RLX_WORKERS").and_then(|v| v.parse::<usize>().ok()) {
+        Some(n) if n > 0 => Some(n),
+        _ => None,
+    }
+}
+
+/// `Some(raw)` when `RLX_WORKERS` is set to something that is neither a positive
+/// integer nor `0` (the documented "auto") — i.e. a value that is not a width.
+/// [`crate::pool::ensure_pool`] reports it and falls back to the tuned default.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn unusable_workers_request() -> Option<String> {
+    let raw = rlx_ir::env::var("RLX_WORKERS")?;
+    raw.parse::<usize>().err().map(|_| raw)
+}
+
+/// Where the width RLX asks the pool for came from — the label the refusal
+/// report names, so it identifies the request as well as the number.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn requested_workers_source() -> &'static str {
+    if explicit_workers().is_some() {
+        "requested via RLX_WORKERS"
+    } else {
+        "the hardware-tuned default"
+    }
+}
+
+/// Threads the OS makes available; the ceiling RLX asks the pool for, and the
+/// logical-CPU total [`HwInfo`] reasons about.
+pub(crate) fn machine_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// The width RLX asks the shared pool for. The one rule — the explicit
+/// `RLX_WORKERS` request, else the hardware-tuned [`HwInfo::optimal_workers`]
+/// default — is [`pool_width_for`], which
+/// [`RuntimeConfig::from_env`] uses with the hardware it already detected.
+///
+/// [`crate::pool::ensure_pool`] reads it at pool-creation time (not here), so a
+/// request that lands before the pool exists always takes effect, and the
+/// machine-threads cap is applied and reported there rather than here.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn requested_workers() -> usize {
+    pool_width_for(&HwInfo::detect())
+}
+
+fn pool_width_for(hw: &HwInfo) -> usize {
+    explicit_workers().unwrap_or_else(|| hw.optimal_workers())
+}
+
 #[cfg(target_vendor = "apple")]
 fn sysctl_usize(name: &str) -> Option<usize> {
     use std::ffi::CString;
@@ -174,6 +237,10 @@ fn sysctl_usize(name: &str) -> Option<usize> {
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     // ── Thread pool ─────────────────────────────────────────
+    /// Worker width this config asks for: `RLX_WORKERS` when set, else the
+    /// hardware-tuned default. The width *in effect* can differ — the pool is
+    /// process-wide and sized once — so read [`crate::pool::num_threads`]
+    /// (`rlx_runtime::cpu_pool_width()`) when it matters.
     pub pool_workers: usize,
 
     // ── Parallelization ─────────────────────────────────────
@@ -205,8 +272,10 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     /// Auto-detect hardware and apply optimal defaults.
     pub fn auto_detect() -> Self {
-        let hw = HwInfo::detect();
+        Self::from_hw(&HwInfo::detect())
+    }
 
+    fn from_hw(hw: &HwInfo) -> Self {
         Self {
             pool_workers: hw.optimal_workers(),
             par_threshold: PLATFORM_PAR_THRESHOLD,
@@ -223,13 +292,13 @@ impl RuntimeConfig {
 
     /// Auto-detect then override from `RLX_*` environment variables.
     pub fn from_env() -> Self {
-        let mut cfg = Self::auto_detect();
-
-        if let Some(v) = rlx_ir::env::var("RLX_WORKERS")
-            && let Ok(n) = v.parse::<usize>()
-        {
-            cfg.pool_workers = if n == 0 { cfg.pool_workers } else { n.min(32) };
-        }
+        // One hardware detection for both the defaults and the width rule; the
+        // machine-threads cap and every other width that cannot be applied is
+        // reported by `pool::ensure_pool` when the pool is created — never
+        // dropped in silence.
+        let hw = HwInfo::detect();
+        let mut cfg = Self::from_hw(&hw);
+        cfg.pool_workers = pool_width_for(&hw);
         if let Some(v) = rlx_ir::env::var("RLX_PAR_THRESHOLD")
             && let Ok(n) = v.parse()
         {
@@ -252,7 +321,6 @@ impl RuntimeConfig {
         }
 
         if cfg.verbose >= 1 {
-            let hw = HwInfo::detect();
             eprintln!(
                 "[rlx] hw: {} CPUs ({} P-cores), L1={}KB, L2={}KB, cacheline={}B",
                 hw.total_cpus,
@@ -261,9 +329,14 @@ impl RuntimeConfig {
                 hw.l2_cache / 1024,
                 hw.cache_line()
             );
+            // The width in effect — not the requested one: a request can be
+            // refused when the process-wide pool already exists.
             eprintln!(
                 "[rlx] config: workers={}, par_thr={}, sdpa_thr={}, align={}",
-                cfg.pool_workers, cfg.par_threshold, cfg.sdpa_seq_threshold, cfg.arena_alignment
+                crate::pool::num_threads(),
+                cfg.par_threshold,
+                cfg.sdpa_seq_threshold,
+                cfg.arena_alignment
             );
         }
 
@@ -272,12 +345,30 @@ impl RuntimeConfig {
 
     /// Push this config into the global [`rlx_ir::env`] override map so all
     /// RLX backends see the same knobs without setting process env vars.
+    ///
+    /// An `RLX_WORKERS` request this config's width overrides is reported, as is
+    /// a width that cannot be applied because the pool is already sized.
     pub fn install(&self) {
+        // `RLX_WORKERS` is read when the pool is created, so capture the request
+        // this config supersedes before overwriting it. While the pool has not
+        // been created yet, this config's width is the one it will be created
+        // at, i.e. installing it takes effect — the reports below say nothing in
+        // that case (and must not resolve the pool to find that out).
+        let request = explicit_workers();
         rlx_ir::env::set("RLX_WORKERS", self.pool_workers.to_string());
         rlx_ir::env::set("RLX_PAR_THRESHOLD", self.par_threshold.to_string());
         rlx_ir::env::set("RLX_SDPA_THRESHOLD", self.sdpa_seq_threshold.to_string());
         rlx_ir::env::set("RLX_ARENA_ALIGN", self.arena_alignment.to_string());
         rlx_ir::env::set("RLX_VERBOSE", self.verbose.to_string());
+        // If the pool is already sized neither the installed width nor the
+        // request it replaced can take effect, so say so rather than leaving the
+        // caller to believe either one did.
+        if let Some(request) = request
+            && request != self.pool_workers
+        {
+            crate::pool::report_replaced_request(request, self.pool_workers);
+        }
+        crate::pool::report_if_not_applied(self.pool_workers, "set by RuntimeConfig::install()");
     }
 
     /// Get or initialize the global singleton config.
@@ -299,6 +390,43 @@ mod tests {
         // Platform-appropriate cache line
         assert!(cfg.arena_alignment >= 64);
         assert!(cfg.verbose == 0);
+    }
+
+    /// The Apple rule: the whole performance cluster, not half of it (half left
+    /// throughput on the table on pool-bound work) and never past it (the
+    /// machine is shared, and the E-cores do not help). The shared 1..=32 bound
+    /// still applies above the cluster, as on the non-Apple branch — no host
+    /// reports more P-cores than that today, and `auto_detect_sane_defaults`
+    /// pins the same ceiling.
+    #[test]
+    #[cfg(target_vendor = "apple")]
+    fn apple_default_is_the_whole_performance_cluster() {
+        let hw = HwInfo::detect();
+        if hw.perf_cores == 0 {
+            return; // no P/E split reported: nothing platform-specific to pin
+        }
+        assert_eq!(hw.optimal_workers(), hw.perf_cores.min(32));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn workers_env_parsing() {
+        rlx_ir::env::set("RLX_WORKERS", "4");
+        assert_eq!(explicit_workers(), Some(4));
+        assert!(unusable_workers_request().is_none());
+
+        rlx_ir::env::set("RLX_WORKERS", "0");
+        assert_eq!(explicit_workers(), None, "0 is the documented auto");
+        assert!(unusable_workers_request().is_none());
+
+        rlx_ir::env::set("RLX_WORKERS", "-5");
+        assert_eq!(explicit_workers(), None);
+        assert_eq!(unusable_workers_request().as_deref(), Some("-5"));
+
+        // Leave the documented "auto" behind, not a stale request for the rest
+        // of this test binary.
+        rlx_ir::env::set("RLX_WORKERS", "0");
+        assert_eq!(explicit_workers(), None);
     }
 
     #[test]

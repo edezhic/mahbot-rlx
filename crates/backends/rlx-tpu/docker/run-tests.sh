@@ -14,9 +14,9 @@
 #   3. `validate_hlo.py` — round-trips emitted HLO bytes through
 #      jax.lib.xla_extension.HloModule for parse validity.
 #
-# `backend-tests`: TPU is not one of the three default test paths (CPU / Metal /
-# wgpu), so its test targets — and the tpu_* targets in rlx-runtime — are not in
-# the default test selection and each layer has to ask for them.
+# `backend-tests`: the default test selection is a fast smoke set, so TPU's test
+# targets — and the tpu_* targets in rlx-runtime — are not in it, and each layer
+# has to ask for them.
 
 set -euo pipefail
 
