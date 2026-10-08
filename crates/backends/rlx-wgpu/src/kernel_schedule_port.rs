@@ -28,11 +28,12 @@
 //!
 //! # What this can and cannot see
 //!
-//! wgpu does not surface `VkCooperativeMatrixPropertiesKHR` — it exposes a
-//! single `EXPERIMENTAL_COOPERATIVE_MATRIX` boolean. So [`target_for_device`]
-//! records the 8x8x8 shape the WGSL kernel is written against **and marks the
-//! set truncated**, because the device may support other shapes this query
-//! cannot enumerate.
+//! wgpu surfaces the device's cooperative-matrix combinations
+//! (`Adapter::cooperative_matrix_properties`, the table this crate reads in
+//! `device::coop_f32_8x8_supported` / `coop_f16_16x16_supported` /
+//! `coop_f16_16x16_f32_acc_supported`). [`target_for_device`] nevertheless
+//! records only the 8x8x8 shape its WGSL kernel is written against **and marks
+//! the set truncated**, because combinations it did not ask about may exist.
 //!
 //! That is the honest encoding of the situation: a `false` from
 //! [`rlx_ir::kernel_schedule::Target::has`] here means "not known to be
@@ -57,9 +58,9 @@ pub fn target_for_device(device: &wgpu::Device) -> Target {
     let feats = device.features();
 
     let mut set = FeatureSet::new();
-    // Only claim the shape the shipped kernel actually uses. wgpu cannot
-    // enumerate the rest, and inventing entries would be worse than admitting
-    // the list is partial.
+    // Only claim the shape the shipped kernel actually uses: this gate reads the
+    // feature bits, not the adapter's cooperative-matrix table, and inventing
+    // entries would be worse than admitting the list is partial.
     if feats.contains(wgpu::Features::SHADER_F16)
         && feats.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
     {
@@ -69,8 +70,8 @@ pub fn target_for_device(device: &wgpu::Device) -> Target {
             k: COOP_TILE,
         });
     }
-    // Mark the list partial regardless: wgpu exposes a boolean where Vulkan has
-    // a table, so this set is never known to be complete.
+    // Mark the list partial regardless: this records the one shape the kernel
+    // is written against, not the device's whole table.
     set.truncated = true;
 
     Target {

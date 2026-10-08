@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Direct correctness test for matmul_coop_f32 (Metal simdgroup path).
-//! On Vulkan/DX12 the portable coop kernel auto-enables when 8×8 f32
-//! cooperative-matrix support is present.
+//! On Vulkan the portable coop kernel auto-enables when 8×8 f32
+//! cooperative-matrix support is present; DX12 exposes no cooperative matrices.
 
 use rlx_ir::infer::GraphExt;
 use rlx_ir::op::Activation;

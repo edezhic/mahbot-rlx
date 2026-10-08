@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //
-// DX12 backend probe for CoopF16Vk (runs when WGPU_BACKEND=dx12).
+// DX12 backend probe for CoopF16Vk. Not exercised by default: this engine
+// exposes no cooperative matrices on DX12, so the property check below returns
+// early, and the kernel constructor would additionally require
+// `RLX_WGPU_COOP_F16_VK_ENABLE=1`, which this probe does not set.
 
 use rlx_ir::{DType, Graph, Shape};
 use rlx_wgpu::backend::WgpuExecutable;

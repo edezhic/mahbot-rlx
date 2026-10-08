@@ -56,7 +56,8 @@ use crate::kernels::Kernel;
 pub enum CoopKernel {
     /// `matmul_coop_f32` — Metal `simdgroup_float8x8`, 32×32 tile.
     F32Metal,
-    /// `matmul_coop_f32_portable` — Vulkan/DX12 8×8 tile.
+    /// `matmul_coop_f32_portable` — the portable 8×8 tile, reached on a
+    /// discrete Vulkan adapter.
     F32Portable,
     /// `matmul_coop16` — all-f16 operands and accumulator, 32×32 tile.
     Coop16,

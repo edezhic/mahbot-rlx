@@ -57,7 +57,9 @@ fn param_triggers_oscillation_wide(data: &[f32]) -> bool {
     weight_oscillation_score(data) >= oscillation_threshold()
 }
 
-/// Whether CoopF16Vk should dispatch `matmul_wide_nv` instead of a coop kernel.
+/// Whether a CoopF16Vk matmul should take the wide f32 fallback (the
+/// `wide_variant()` matmul, or `matmul_qkv` for the QKV variant) instead of
+/// the coop kernel.
 pub fn use_wide_matmul(
     b_off_f32: u32,
     n: u32,

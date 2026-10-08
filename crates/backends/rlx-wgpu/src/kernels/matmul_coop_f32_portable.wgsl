@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //
-// Portable cooperative-matrix matmul for Vulkan / DX12 (8×8 f32 tiles).
+// Portable cooperative-matrix matmul for Vulkan (8×8 f32 tiles); DX12 exposes
+// no cooperative matrices.
 // Matches the wgpu `cooperative_matrix/shader.wgsl` load/store pattern:
 // row-major `coopLoad`, dispatch (M/8, N/8).
 
@@ -34,9 +35,10 @@
 // `matmul_coop_f16_vulkan.wgsl` and `matmul_coop_f16_vulkan_widen.wgsl` differ
 // by EXACTLY ONE TOKEN (`coopLoadT` vs `coopLoad` on B) and nothing else — same
 // `b_ptr = b_base + k_off * params.n + tile_col`, same `params.n` stride, same
-// body. Which one runs is chosen by SIZE: `use_wide_matmul` in
-// `src/coop_f16_vk.rs` picks the `coopLoad` variant when `n > 768` (or when the
-// weight is in the `wide_b` allowlist).
+// body. Which one runs is measured, not chosen by size:
+// `coop_probe::f16_vk_widen_choice` runs a non-commuting probe on the device and
+// returns the variant that computes `a·b`, with the size rule only a tie-break.
+// (`use_wide_matmul` is the separate wide-f32 decision, in `src/coop_f16_vk.rs`.)
 //
 // A memory layout is a property of the bytes, not of N. The same buffer cannot
 // be row-major at n=768 and column-major at n=769, so one of these two kernels
@@ -57,9 +59,11 @@
 //     RLX_WGPU_FORCE_COOP_F32=1 cargo test -p rlx-wgpu \
 //         --test coop_f32_correctness coop_f32_operand_order_is_not_commuted
 //
-// Run it at an N on BOTH sides of the 768 threshold. The existing
-// `coop_f16_vk_correctness.rs` cannot catch this: its K=8 probe multiplies
-// all-ones by all-ones, which is commutation-blind.
+// Run it at an N on BOTH sides of the 768 threshold. The all-ones probe in
+// `coop_f16_vk_correctness.rs` (`coop_f16_vk_ones_matmul_sum_k`) is 256³ of
+// all-ones, which commutes with itself — it passes for either operand order.
+// The K=8 rank-1 probe that discriminates the orders is the one above, in
+// `coop_f32_correctness.rs`, and it runs against the f32 kernels.
 //
 // HOW THIS IS HANDLED NOW: `src/coop_probe.rs` runs a non-commuting GEMM probe
 // through this kernel on the actual device, once per process, and

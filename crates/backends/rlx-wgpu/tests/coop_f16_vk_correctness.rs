@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //
-// Correctness tests for Vulkan/DX12 cooperative-matrix matmul (16×16 f16).
+// Correctness tests for the Vulkan 16×16 f16 cooperative-matrix matmul. DX12
+// exposes no cooperative matrices, and the path is off unless
+// `RLX_WGPU_COOP_F16_VK_ENABLE=1` is set.
 
 use rlx_ir::op::Activation;
 use rlx_ir::{DType, Graph, Shape};
@@ -28,9 +30,16 @@ fn require_coop_f16_vk_test() -> bool {
             return false;
         }
     };
+    if !rlx_ir::env::flag("RLX_WGPU_COOP_F16_VK_ENABLE") {
+        eprintln!(
+            "CoopF16Vk is opt-in and off by default: set \
+             RLX_WGPU_COOP_F16_VK_ENABLE=1, skipping"
+        );
+        return false;
+    }
     if !rlx_wgpu::device::coop_discrete_backend() {
         eprintln!(
-            "CoopF16Vk requires Vulkan/DX12; skipping on {:?}",
+            "CoopF16Vk requires a discrete Vulkan adapter; skipping on {:?}",
             dev.backend
         );
         return false;
@@ -44,7 +53,7 @@ fn require_coop_f16_vk_test() -> bool {
         return false;
     }
     if rlx_wgpu::kernels::matmul_coop_f16_vulkan_kernel(&dev.device).is_none() {
-        eprintln!("matmul_coop_f16_vulkan kernel unavailable, skipping");
+        eprintln!("matmul_coop_f16_vulkan kernel unavailable on this adapter, skipping");
         return false;
     }
     true

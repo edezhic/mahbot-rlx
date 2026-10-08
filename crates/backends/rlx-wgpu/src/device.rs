@@ -5,7 +5,9 @@
 //! wgpu device discovery + capabilities.
 //!
 //! [`wgpu_device`] returns a process-global singleton. [`select_vulkan_backend`]
-//! routes subsequent calls to a Vulkan-only instance (for `Device::Vulkan`).
+//! switches that singleton to a Vulkan-only instance; it is not how the
+//! runtime's `Device::Vulkan` is served — `rlx-runtime` maps that device to the
+//! separate `rlx-vulkan` (ash/SPIR-V) backend.
 
 use std::sync::OnceLock;
 #[cfg(not(target_arch = "wasm32"))]
@@ -188,7 +190,10 @@ fn default_backends() -> wgpu::Backends {
     }
     #[cfg(target_os = "windows")]
     {
-        // Native DX12 first on Windows MSVC; Vulkan remains as fallback.
+        // Both, as one unordered set, with no preference of this crate's own:
+        // wgpu registers Vulkan before DX12 and sorts adapters only by device
+        // type, which both report identically for the same card — so Vulkan
+        // wins, and DX12 is used only when no Vulkan adapter survives.
         wgpu::Backends::DX12 | wgpu::Backends::VULKAN
     }
     #[cfg(target_os = "linux")]
@@ -226,9 +231,9 @@ fn vulkan_device() -> Option<&'static WgpuDevice> {
         .as_ref()
 }
 
-/// Prefer the Vulkan-only wgpu instance for `Device::Vulkan` sessions.
-/// Call before the first [`wgpu_device`] use in that process (or use
-/// `Device::Vulkan` via the runtime registry, which calls this).
+/// Point this crate's own singleton at a Vulkan-only instance. Call before the
+/// first [`wgpu_device`] use in that process. Nothing in the runtime calls it:
+/// `Device::Vulkan` there is served by `rlx-vulkan`, not by this crate.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn select_vulkan_backend() {
     BACKEND_PREF.store(PREF_VULKAN, Ordering::SeqCst);
@@ -296,15 +301,19 @@ pub fn adapter_name() -> Option<String> {
     wgpu_device().map(|d| d.name.clone())
 }
 
-/// True on Vulkan or DX12 — discrete GPU cooperative-matrix backends.
+/// True on Vulkan or DX12 — the discrete-adapter predicate behind this
+/// backend's host-fallback routing and a term in its cooperative-matrix
+/// eligibility checks. On DX12 no cooperative path can follow from it: this
+/// engine exposes no cooperative matrices there (the adapter reports an empty
+/// property list and its shader compilers cannot emit them).
 pub fn coop_discrete_backend() -> bool {
     wgpu_device()
         .map(|d| matches!(d.backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12))
         .unwrap_or(false)
 }
 
-/// True when the adapter reports 8×8×8 f32 cooperative-matrix support
-/// (required for `matmul_coop_f32_portable` on Vulkan/DX12).
+/// True when the adapter reports 8×8×8 f32 cooperative-matrix support, which
+/// selects `matmul_coop_f32_portable` automatically on a discrete adapter.
 pub fn coop_f32_8x8_supported() -> bool {
     let dev = match wgpu_device() {
         Some(d) => d,
@@ -320,7 +329,7 @@ pub fn coop_f32_8x8_supported() -> bool {
 }
 
 /// True when the adapter reports 16×16×16 f16 cooperative-matrix support
-/// (NVIDIA / AMD tensor-core path on Vulkan/DX12).
+/// (the NVIDIA / AMD tensor-core path on Vulkan; DX12 reports none).
 pub fn coop_f16_16x16_supported() -> bool {
     let dev = match wgpu_device() {
         Some(d) => d,

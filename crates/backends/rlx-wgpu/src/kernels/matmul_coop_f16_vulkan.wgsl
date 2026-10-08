@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //
-// Vulkan/DX12 16×16 f16 cooperative matmul with K-slab f32 reduction.
+// Vulkan 16×16 f16 cooperative matmul with K-slab f32 reduction (DX12 exposes
+// no cooperative matrices).
 // RTX row-major GEMM: coopLoad on A, coopLoadT on B (N <= 768).
 
 enable f16;
@@ -31,9 +32,11 @@ enable f16;
 //
 // This file holds the REFERENCE Vulkan convention (`coopLoad` on A,
 // `coopLoadT` on B), established on RTX hardware. Note that its `_widen`
-// sibling — selected purely by `n > 768` — uses `coopLoad` on B against the
-// same pointer and stride, which contradicts this file. See the ⚠ block in
-// `matmul_coop_f16_vulkan_widen.wgsl`; one of the two is wrong.
+// sibling uses `coopLoad` on B against the same pointer and stride, which
+// contradicts this file. Which of the two runs is measured, not chosen by size
+// (`coop_probe::f16_vk_widen_choice`), so the size rule is only a tie-break.
+// See the ⚠ block in `matmul_coop_f16_vulkan_widen.wgsl`; one of the two is
+// wrong.
 //
 // HOW THIS IS HANDLED NOW: `src/coop_probe.rs` runs a non-commuting GEMM probe
 // through this kernel on the actual device, once per process, and

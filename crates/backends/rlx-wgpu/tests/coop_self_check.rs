@@ -26,10 +26,10 @@ fn every_buildable_coop_kernel_passes_its_self_check() {
         eprintln!("adapter has no cooperative-matrix support, skipping");
         return;
     }
-    // Which kernels this adapter would actually DISPATCH — see the selection in
-    // `backend/run.rs`. The others are compiled here but never chosen, and they
-    // are written against the other backend's convention, so they are reported
-    // rather than asserted: `coopLoad`/`coopLoadT` do not mean the same thing on
+    // The whole `F16Vk` family needs the opt-in `RLX_WGPU_COOP_F16_VK_ENABLE=1`,
+    // which this test does not set, so a default run checks the f32 path and
+    // `Coop16`. The kernels written against the other backend's convention are
+    // not listed at all: `coopLoad`/`coopLoadT` do not mean the same thing on
     // Metal and Vulkan (naga's one `row_major` bool becomes Metal's
     // `transpose_matrix` but SPIR-V's `RowMajorKHR`/`ColumnMajorKHR`).
     let reachable: &[CoopKernel] = if d.backend == wgpu::Backend::Metal {

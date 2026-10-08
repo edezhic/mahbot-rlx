@@ -15,6 +15,9 @@ fn require_vk() -> bool {
         Some(d) => d,
         None => return false,
     };
+    if !rlx_ir::env::flag("RLX_WGPU_COOP_F16_VK_ENABLE") {
+        return false;
+    }
     rlx_wgpu::device::coop_discrete_backend()
         && !rlx_ir::env::flag("RLX_WGPU_NO_COOP_F16_VK")
         && rlx_wgpu::device::coop_f16_16x16_supported()
@@ -181,7 +184,9 @@ fn baseline_n(n: usize, gentle: bool) {
 fn coop_f16_vk_bert_qkv_baseline() {
     let _g = COOP_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     if !require_vk() {
-        eprintln!("skip bert baseline (no CoopF16Vk adapter)");
+        eprintln!(
+            "skip bert baseline: no CoopF16Vk adapter, or RLX_WGPU_COOP_F16_VK_ENABLE is unset"
+        );
         return;
     }
     baseline_n(1152, true);

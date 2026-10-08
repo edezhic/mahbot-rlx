@@ -399,9 +399,11 @@ pub(crate) enum Step {
         key: u64,
         op_seed: Option<f32>,
     },
-    /// Host-side buffer copy (recorded into a command encoder) used to
-    /// stage small param tensors into the tail scratch region so kernels
-    /// can bind a ≤4GiB window of the arena.
+    /// f32 value-move / staging copy used to put a tensor where a kernel can
+    /// bind it (e.g. a small param into the arena's tail scratch region) and to
+    /// materialize a node whose slot differs from its input's. `copy_route`
+    /// decides where it runs: a copy-kernel dispatch over a bind window covering
+    /// both operands when one exists, otherwise a host round-trip.
     BufferCopy {
         // u64: staging copies for >4 GiB GGUF decode arenas address tensors past
         // the 4 GiB mark; a u32 byte offset truncates and stages garbage.

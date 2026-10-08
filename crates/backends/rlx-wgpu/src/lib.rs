@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! RLX wgpu backend — cross-platform GPU execution via the `wgpu`
-//! Rust crate (Metal on macOS, Vulkan on Linux, DX12 on Windows,
+//! Rust crate (Metal on macOS, Vulkan on Linux and on Windows, where DX12 is
+//! enabled too and wgpu's own adapter ordering picks between them,
 //! WebGPU in browsers).
 //!
 //! Compared to rlx-metal: same overall shape (device singleton, buffer

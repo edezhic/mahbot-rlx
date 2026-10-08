@@ -2085,7 +2085,10 @@ impl WgpuExecutable {
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::BufferCopy { .. } => {
-                                // Host step: `copy_buffer_to_buffer` runs outside compute passes.
+                                // `step_runs_on_host` classifies a copy as a host
+                                // step, so the host-step loop below routes it —
+                                // a copy-kernel dispatch or a host round-trip —
+                                // and this GPU pass encodes nothing for it.
                             }
                             Step::ElementwiseRegion { params } => {
                                 let len_s = scale(params.len);
@@ -3436,52 +3439,27 @@ impl WgpuExecutable {
                     dst_byte_off,
                     bytes,
                 } => {
-                    // wgpu forbids `copy_buffer_to_buffer` on the same buffer;
-                    // use the generic copy compute kernel instead.
                     let src = *src_byte_off;
                     let dst = *dst_byte_off;
                     let nbytes = *bytes as u64;
-                    let elems = (nbytes / 4).max(1) as u32;
-                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
-                    // wgpu forbids `copy_buffer_to_buffer` on the same buffer;
-                    // use the generic copy compute kernel instead.
-                    // Weight-tagged sources live in a separate buffer — always
-                    // host-round-trip (or distinct-buffer GPU copy). Also when
-                    // src/dst are more than `max_binding` apart on a large arena.
                     let src_is_weight = crate::buffer::is_weight_off(src as usize);
                     let dst_is_weight = crate::buffer::is_weight_off(dst as usize);
-                    let lo = if src_is_weight || dst_is_weight {
-                        0u64
-                    } else {
-                        src.min(dst)
-                    };
-                    let hi = if src_is_weight || dst_is_weight {
-                        max_binding.saturating_add(1) // force host / resolve_w path
-                    } else {
-                        src.saturating_add(nbytes).max(dst.saturating_add(nbytes))
-                    };
-                    // Same for sharded arenas when src/dst live on different stripes.
-                    // Virtually-sharded NVIDIA arenas: GPU copy kernels corrupt
-                    // Kitten NSF — host those. Unsharded discrete can use the
-                    // GPU copy kernel (was blanket-hosted via coop_discrete and
-                    // dominated Kitten wall time). Force host with
-                    // RLX_WGPU_HOST_BUFFER_COPY=1.
-                    let cross_shard =
-                        self.arena.is_sharded() && !src_is_weight && !dst_is_weight && {
-                            let s = self.arena.shard_size as u64;
-                            let src_hi = src.saturating_add(nbytes.saturating_sub(1));
-                            let dst_hi = dst.saturating_add(nbytes.saturating_sub(1));
-                            src / s != src_hi / s || dst / s != dst_hi / s || src / s != dst / s
-                        };
-                    if hi.saturating_sub(lo) > max_binding
-                        || cross_shard
-                        || self.arena.is_sharded()
-                        || src_is_weight
-                        || dst_is_weight
-                        || host_cache.has_deferred_writes()
-                        || crate::device::coop_discrete_backend()
-                        || rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
-                    {
+                    // wgpu forbids `copy_buffer_to_buffer` on one buffer, so a
+                    // device-side copy is the copy kernel over the bind window
+                    // `copy_route` picks.
+                    let route = buffer_copy_route(&CopyRouteInputs {
+                        src,
+                        dst,
+                        nbytes,
+                        arena_size: self.arena.size as u64,
+                        max_binding: dev.device.limits().max_storage_buffer_binding_size,
+                        // `shard_size` is 0 exactly when the arena is unsharded.
+                        shard_size: self.arena.shard_size as u64,
+                        weight_operand: src_is_weight || dst_is_weight,
+                        deferred_writes: host_cache.has_deferred_writes(),
+                        force_host: rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY"),
+                    });
+                    if route == CopyRoute::Host {
                         let n_f32 = (nbytes as usize) / 4;
                         let src_u = src as usize;
                         let dst_u = dst as usize;
@@ -3528,67 +3506,65 @@ impl WgpuExecutable {
                         step_i += 1;
                         continue;
                     }
-                    // GPU copy — deferred mirrors must be on device first.
-                    if host_cache.has_deferred_writes() {
-                        let mut a = crate::host_stage::WgpuArena {
-                            arena: &self.arena,
-                            device: &dev.device,
-                            queue: &dev.queue,
-                            size_bytes: 0,
+                    // `CopyRoute::Skip` falls through to the per-step
+                    // bookkeeping below.
+                    if let CopyRoute::Device { base, size } = route {
+                        // Dead code: `deferred_writes` above already routed
+                        // every copy with a pending mirror to the host, so
+                        // this arm cannot see one. Kept so the flush is
+                        // already correct if that condition ever changes.
+                        if host_cache.has_deferred_writes() {
+                            let mut a = crate::host_stage::WgpuArena {
+                                arena: &self.arena,
+                                device: &dev.device,
+                                queue: &dev.queue,
+                                size_bytes: 0,
+                            };
+                            host_cache.flush_to_device(&mut a);
+                            let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                        }
+                        // `copy_route` refused a zero-byte copy above, and
+                        // every producer sizes a slot at `elems * 4`, so the
+                        // element count below is exact.
+                        let elems = (nbytes / 4) as u32;
+                        let p = CopyParams {
+                            n: elems,
+                            in_off: (src.saturating_sub(base) / 4) as u32,
+                            out_off: (dst.saturating_sub(base) / 4) as u32,
+                            _p0: 0,
+                            _p1: 0,
+                            _p2: 0,
+                            _p3: 0,
+                            _p4: 0,
                         };
-                        host_cache.flush_to_device(&mut a);
-                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-                    }
-                    let mut base = (lo / 256) * 256;
-                    // The bind window must cover [base, hi]. `base` is floored to 256B
-                    // alignment (so base ≤ lo); measuring the size from `lo` instead of
-                    // `base` clips the window when the copy straddles a 256B boundary,
-                    // silently dropping the tail (e.g. a 92B Bool→F32 mask copy whose
-                    // dst sat just past the window → x_mask stayed 0).
-                    let span = hi.saturating_sub(base).max(1);
-                    let mut size = span.div_ceil(256) * 256;
-                    size = size.max(256).min(max_binding);
-                    if base.saturating_add(size) > self.arena.size as u64 {
-                        base = (self.arena.size as u64).saturating_sub(size);
-                        base = (base / 256) * 256;
-                    }
-                    let p = CopyParams {
-                        n: elems,
-                        in_off: (src.saturating_sub(base) / 4) as u32,
-                        out_off: (dst.saturating_sub(base) / 4) as u32,
-                        _p0: 0,
-                        _p1: 0,
-                        _p2: 0,
-                        _p3: 0,
-                        _p4: 0,
-                    };
-                    let ck = copy_kernel(&dev.device);
-                    let u = dev.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("rlx-wgpu arena_copy uniform"),
-                        size: std::mem::size_of::<CopyParams>() as u64,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-                    dev.queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
-                    let bg = bind_arena_window(&dev.device, ck, &self.arena, base, size, &u);
-                    let mut enc =
-                        dev.device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("rlx-wgpu arena_copy"),
-                            });
-                    {
-                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("rlx-wgpu arena_copy pass"),
-                            ..Default::default()
+                        let ck = copy_kernel(&dev.device);
+                        let u = dev.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("rlx-wgpu arena_copy uniform"),
+                            size: std::mem::size_of::<CopyParams>() as u64,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
                         });
-                        pass.set_pipeline(&ck.pipeline);
-                        pass.set_bind_group(0, &bg, &[]);
-                        let (gx, gy, gz) = dispatch_dims(elems, 64);
-                        pass.dispatch_workgroups(gx, gy, gz);
+                        dev.queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+                        let bg = bind_arena_window(&dev.device, ck, &self.arena, base, size, &u);
+                        let mut enc =
+                            dev.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("rlx-wgpu arena_copy"),
+                                });
+                        {
+                            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: Some("rlx-wgpu arena_copy pass"),
+                                ..Default::default()
+                            });
+                            pass.set_pipeline(&ck.pipeline);
+                            pass.set_bind_group(0, &bg, &[]);
+                            let (gx, gy, gz) = dispatch_dims(elems, 64);
+                            pass.dispatch_workgroups(gx, gy, gz);
+                        }
+                        dev.queue.submit(std::iter::once(enc.finish()));
+                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                        host_cache.invalidate(dst as usize);
                     }
-                    dev.queue.submit(std::iter::once(enc.finish()));
-                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-                    host_cache.invalidate(dst as usize);
                 }
                 Step::GatherSplit {
                     n_out,

@@ -2373,7 +2373,7 @@ fn build_kernel_f32_rw_uniform_f16_rw(
     Kernel { pipeline, bgl }
 }
 
-/// f16 shadow (read) + f32 arena (rw) + uniform — Vulkan/DX12 coop f16 matmul.
+/// f16 shadow (read) + f32 arena (rw) + uniform — Vulkan coop f16 matmul.
 fn build_kernel_coop_f16_vk(
     device: &wgpu::Device,
     label: &'static str,
@@ -2773,7 +2773,8 @@ pub fn matmul_coop_f32_kernel(device: &wgpu::Device) -> Option<&'static Kernel> 
         )
     }))
 }
-/// Vulkan/DX12-oriented coop f32 matmul (`coopLoad`, 8×8 workgroups).
+/// Portable 8×8 coop f32 matmul (`coopLoad`, 8×8 workgroups) — the discrete
+/// Vulkan form; DX12 exposes no cooperative matrices.
 pub fn matmul_coop_f32_portable_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     let feats = device.features();
     if !feats.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
@@ -2791,7 +2792,7 @@ pub fn matmul_coop_f32_portable_kernel(device: &wgpu::Device) -> Option<&'static
     }))
 }
 fn coop_f16_vk_device_ready(device: &wgpu::Device) -> bool {
-    // Cooperative-matrix Vulkan/DX12 matmul is OFF by default — see
+    // Cooperative-matrix f16 matmul is OFF by default — see
     // `coop_f16_vk_eligible` in `backend.rs` for the rationale. Opt in
     // with `RLX_WGPU_COOP_F16_VK_ENABLE=1`. Legacy
     // `RLX_WGPU_COOP_F16_VK_DISABLE=1` also fully disables.
@@ -2942,7 +2943,9 @@ pub fn matmul_coop_f16_vulkan_widen_kernel(device: &wgpu::Device) -> Option<&'st
 pub fn coop_f16_vk_f32acc_available(device: &wgpu::Device) -> bool {
     matmul_coop_f16_vulkan_f32acc_kernel(device).is_some()
 }
-/// CoopF32 kernel for the active wgpu backend (Metal simdgroup vs Vulkan/DX12 portable).
+/// CoopF32 kernel for the active wgpu backend (Metal `simdgroup_float8x8` vs the
+/// portable 8×8 form, which only a discrete Vulkan adapter can actually build —
+/// the DX12 arm names the same kernel and gets `None` from it).
 pub fn matmul_coop_f32_active_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     match crate::device::wgpu_device().map(|d| d.backend) {
         Some(wgpu::Backend::Metal) => matmul_coop_f32_kernel(device),

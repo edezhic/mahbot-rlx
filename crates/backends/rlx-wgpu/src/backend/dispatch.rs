@@ -61,58 +61,27 @@ impl WgpuExecutable {
         dst_id: NodeId,
         nbytes: usize,
     ) {
-        if nbytes == 0 {
-            return;
-        }
         let src = self.arena.offset(src_id) as u64;
         let dst = self.arena.offset(dst_id) as u64;
         let nbytes = nbytes
             .min(self.arena.len_of(src_id))
             .min(self.arena.len_of(dst_id)) as u64;
-        let elems = (nbytes / 4).max(1) as u32;
-        let lo = src.min(dst);
-        let hi = src.saturating_add(nbytes).max(dst.saturating_add(nbytes));
-        let max_binding = dev.device.limits().max_storage_buffer_binding_size;
-        // The window must span from `base` to `hi`, NOT from `lo` to `hi`.
-        //
-        // `base` is `lo` floored to the 256-byte storage-binding alignment, so
-        // it sits at or below `lo`; sizing the window as `hi - lo` leaves it
-        // short by exactly that flooring, and whichever operand is at the far
-        // end falls outside the binding. The shader's clamped access then reads
-        // or writes nothing, silently.
-        //
-        // Measured: resident training feeding `b` (src=240, dst=1216) got
-        // base=0 with size=1024, so the destination at 1216..1232 was outside
-        // the window and the parameter never updated. The same off-by-`lo & 255`
-        // put `w__v`'s SOURCE (768..832) outside a 512-byte window, so Adam's
-        // second moment read garbage and exploded. Compute `base` first, then
-        // size from it.
-        let base = (lo / 256) * 256;
-        let mut size = hi.saturating_sub(base).div_ceil(256) * 256;
-        size = size.max(256);
-        // Shrink rather than slide: `hi` is inside the arena by construction, so
-        // clamping the far end keeps both operands covered, whereas moving
-        // `base` down would uncover `hi`.
-        if base.saturating_add(size) > self.arena.size as u64 {
-            size = (self.arena.size as u64).saturating_sub(base);
+        // A request of zero bytes, or one the clamp above shrinks to nothing
+        // because a slot is empty: a copy of zero bytes moves nothing.
+        if nbytes == 0 {
+            return;
         }
-        assert!(
-            size <= max_binding,
-            "rlx-wgpu arena copy spans {size} B between offsets {src} and {dst}, over this \
-             adapter's {max_binding} B storage-binding limit. Widening the window is not \
-             possible here; the copy would have to be split or routed through \
-             copy_buffer_to_buffer."
-        );
-        debug_assert!(
-            src >= base
-                && src.saturating_add(nbytes) <= base + size
-                && dst >= base
-                && dst.saturating_add(nbytes) <= base + size,
-            "arena copy window [{base}, {}) does not cover src {src}..{} and dst {dst}..{}",
-            base + size,
-            src + nbytes,
-            dst + nbytes
-        );
+        let elems = (nbytes / 4) as u32;
+        let (lo, hi) = copy_span(src, dst, nbytes);
+        let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+        let Some((base, size)) = copy_window(lo, hi, self.arena.size as u64, max_binding) else {
+            panic!(
+                "rlx-wgpu arena copy spans {lo}..{hi} between offsets {src} and {dst} and no \
+                 storage-binding window covers it: the window would exceed this adapter's \
+                 {max_binding} B binding limit, or could not reach {hi}. The copy would have to \
+                 be split."
+            );
+        };
         let p = CopyParams {
             n: elems,
             in_off: (src.saturating_sub(base) / 4) as u32,

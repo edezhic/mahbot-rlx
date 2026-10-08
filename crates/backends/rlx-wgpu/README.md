@@ -1,9 +1,9 @@
 # rlx-wgpu
 
 Cross-platform GPU backend via the [wgpu](https://wgpu.rs/) crate.
-Single backend serves Metal (macOS), Vulkan (Linux), DirectX 12
-(Windows), and WebGPU (browsers). WGSL kernels, pure Rust deps —
-no FFI, no submodules.
+Single backend serves Metal (macOS), Vulkan (Linux, and Windows
+alongside DX12), DirectX 12 (Windows), and WebGPU (browsers). WGSL
+kernels, pure Rust deps — no FFI, no submodules.
 
 ## What's here
 
@@ -11,10 +11,12 @@ no FFI, no submodules.
   matmul (32×32 tile, `simdgroup_matrix` / `KHR_cooperative_matrix`),
   f16-storage matmul.
 - **`device.rs`** — wgpu instance/adapter/device singleton. Platform
-  defaults: DX12 (+ Vulkan fallback) on Windows, Vulkan on Linux/WSL,
-  Metal (+ MoltenVK) on macOS. Override with `WGPU_BACKEND`. Sync wrapper
-  via `pollster::block_on` so the rest of the backend matches the
-  rlx-cpu / rlx-metal / rlx-mlx synchronous shape.
+  defaults: **Vulkan and DX12 both enabled on Windows**, with no preference of
+  this crate's own — wgpu registers Vulkan before DX12 and sorts adapters only
+  by device type, so DX12 is reached only when no Vulkan adapter survives.
+  Vulkan on Linux/WSL, Metal (+ MoltenVK) on macOS. Override with
+  `WGPU_BACKEND`. Sync wrapper via `pollster::block_on` so the rest of the
+  backend matches the rlx-cpu / rlx-metal / rlx-mlx synchronous shape.
 - **`buffer.rs` / `Arena`** — logical activation arena with per-node offsets
   from `plan_f32_uniform`. When the plan exceeds wgpu `max_buffer_size`
   (~4 GiB), the arena is **striped** across multiple ≤4 GiB buffers
@@ -110,38 +112,47 @@ When a wgpu adapter is available, `rlx_wgpu::calibrate::Calibration::load_or_mea
 benchmarks a 512³ matmul and caches results at `~/.cache/rlx/wgpu-calib-<adapter>.json`.
 Feeds `WgpuCostModel` in `rlx-runtime` for backend ranking.
 
-## Cooperative-matrix matmul (Vulkan / DX12 / Metal)
+## Cooperative-matrix matmul (Vulkan / Metal)
 
-On discrete GPUs (Vulkan, DX12), aligned f32 matmul with Param weights
-auto-selects **CoopF16Vk** when the adapter reports 16×16 f16 cooperative
-matrix support:
+This engine exposes **no cooperative matrices on DX12 at all** — the DX12
+adapter reports an empty property list and its shader compilers cannot emit
+cooperative-matrix code — so every cooperative path below is Vulkan or Metal.
+
+The 16-bit path is **opt-in and off by default**: on a discrete Vulkan
+adapter, aligned f32 matmul with Param weights selects **CoopF16Vk** only with
+`RLX_WGPU_COOP_F16_VK_ENABLE=1`, and only when the adapter reports 16×16 f16
+cooperative-matrix support:
 
 - **`matmul_coop_f16_vulkan.wgsl`** — 16×16 f16 tensor-core tiles,
-  `coopLoad` on A + `coopLoadT` on B when N ≤ 768; optional widen variant uses
-  `coopLoad` on B for N > 768 when `RLX_WGPU_COOP_F16_VK_LARGE_N=1`. By default
-  N > 768 dispatches `matmul_wide_nv` instead (see auto wide fallback).
+  `coopLoad` on A, and either `coopLoadT` or `coopLoad` on B — which of the two
+  forms computes `a·b` is measured per device by `coop_probe`, with the size rule
+  (the `_widen` form for N > 768) only a tie-break. By default N > 768 dispatches
+  the wide f32 path instead (see auto wide fallback).
 - **`matmul_qkv_coop_f16_vk.wgsl`** — split-write Q/K/V variant (same
   numerics, one dispatch instead of matmul + Narrow×3).
 - **Auto wide fallback** — at `set_param`, an oscillation score on Param B
   selects wide f32 matmul for stress weights; **N > 768** also defaults to wide
-  f32 (`matmul_wide_nv`) because RTX coop B-load at large N stays ~4e-3 vs f16-ref.
+  f32 because RTX coop B-load at large N stays ~4e-3 vs f16-ref.
   Opt back into coop for large N with `RLX_WGPU_COOP_F16_VK_LARGE_N=1`.
-- Fallback wide path: **`matmul_wide_nv.wgsl`** (64×64 tiles).
+- Fallback wide path: the vectorised **`matmul_wide_vec4.wgsl`**. The 64×64
+  **`matmul_wide_nv.wgsl`** is behind `RLX_WGPU_WIDE_NV=1`, and
+  **`matmul_wide.wgsl`** behind `RLX_WGPU_WIDE_STD=1`.
 
 When a matmul operand is an `Activation`, the lowering **host-mirrors** it
 each `run()` (`apply_activation` + `write_f32`, same f16 shadow as Params)
-and routes the matmul through **F32 wide** (`matmul_wide_nv`). CoopF16Vk
+and routes the matmul through the **wide f32** path. CoopF16Vk
 remains on Input/Param-only operands (BERT QKV weights, etc.). A GPU
 `cast_f32_to_f16` pre-pass still handles non-unary computed tensors when
-CoopF16Vk applies. Pass flushes between unary → cast → coop matmul keep
-Vulkan/DX12 visibility correct.
+CoopF16Vk applies. Pass flushes between unary → cast → coop matmul keep the
+discrete-adapter visibility correct.
 
 ### Environment flags
 
 | Variable | Effect |
 |----------|--------|
-| `WGPU_BACKEND` | `vulkan` (default Linux/Windows), `dx12` (Windows), `metal` (macOS) |
-| `RLX_WGPU_NO_COOP_F16_VK=1` | Force `matmul_wide_nv` instead of CoopF16Vk |
+| `WGPU_BACKEND` | Force one wgpu backend: `vulkan`, `dx12` (Windows), `metal` (macOS). Unset, this crate enables both Vulkan and DX12 on Windows — without preferring either, so wgpu's own ordering picks — and Metal on macOS |
+| `RLX_WGPU_COOP_F16_VK_ENABLE=1` | Opt in to CoopF16Vk (default: off) |
+| `RLX_WGPU_NO_COOP_F16_VK=1` | Legacy: skip CoopF16Vk — the matmul falls through the cascade (CoopF32, else the f32 tile path) |
 | `RLX_WGPU_COOP_F16_VK_OSC_THRESH` | Oscillation score threshold for auto wide fallback (default `0.35`) |
 | `RLX_WGPU_COOP_F16_VK_NO_AUTO_WIDE=1` | Disable oscillation-based wide fallback |
 | `RLX_WGPU_COOP_F16_VK_NO_F32ACC=1` | Disable f16×f16→f32 coop accumulator kernels |
@@ -149,7 +160,7 @@ Vulkan/DX12 visibility correct.
 | `RLX_WGPU_COOP_F16_VK_LARGE_N=1` | Keep CoopF16Vk for N > 768 (default: wide f32 for accuracy) |
 | `RLX_WGPU_COOP_F16_VK_LOAD_T=1` | Force `coopLoadT` on B when `RLX_WGPU_COOP_F16_VK_LARGE_N=1` and N > 768 |
 | `RLX_WGPU_NO_COOP_F32=1` | Disable CoopF32 on Metal |
-| `RLX_WGPU_FORCE_COOP_F32=1` | Opt-in CoopF32 on Vulkan (portable 8×8; correctness not validated) |
+| `RLX_WGPU_FORCE_COOP_F32=1` | Force CoopF32 eligibility where the adapter reports no 8×8 f32 cooperative matrices (output is unreliable there); the portable 8×8 path is otherwise selected automatically |
 | `RLX_WGPU_FORCE_INPUT_UPLOAD=1` | No-op (inputs are always re-uploaded; kept for older scripts) |
 | `RLX_BENCH_DISPATCH_ONLY=1` | Skip output readback (micro-benchmarks) |
 | `RLX_WGPU_F16_WEIGHTS=1` | Legacy f16-storage matmul experiment |
@@ -182,9 +193,15 @@ next device-reading step.
 ```sh
 cargo build -p rlx-wgpu --release
 cargo test  -p rlx-wgpu --release
-cargo test  -p rlx-wgpu --test coop_f16_vk_correctness --release -- --nocapture
 cargo test  -p rlx-wgpu --test coop_mat_probe --release -- --nocapture
-# DX12-only (set WGPU_BACKEND=dx12 on Windows):
+# The CoopF16Vk tests only run with the opt-in switch; without it they self-skip
+# and still report `ok`:
+RLX_WGPU_COOP_F16_VK_ENABLE=1 \
+  cargo test -p rlx-wgpu --test coop_f16_vk_correctness --release -- --nocapture
+# `coop_f16_vk_dx12` is DX12-only — run it with `WGPU_BACKEND=dx12` on Windows.
+# Anywhere else it skips on its backend check, and on a DX12 adapter it skips on
+# the cooperative-matrix property check — this engine exposes no cooperative
+# matrices on DX12 — so its assertion is never reached:
 cargo test  -p rlx-wgpu --test coop_f16_vk_dx12 --release -- --nocapture
 ```
 
@@ -197,8 +214,10 @@ cargo build -p rlx-runtime --features gpu --release
 ## Status
 
 Functional, less battle-tested than `rlx-metal` / `rlx-mlx` on Apple
-Silicon. CoopF16Vk on Vulkan/DX12 is validated on RTX-class GPUs via
-`coop_f16_vk_correctness` and `coop_f16_vk_bert_baseline` (gentle BERT
+Silicon. CoopF16Vk on Vulkan is **not exercised by default**: its two tests,
+`coop_f16_vk_correctness` and `coop_f16_vk_bert_baseline`, never set
+`RLX_WGPU_COOP_F16_VK_ENABLE`, so they self-skip and still report `ok`. With the
+switch set they compare against f16-ref on RTX-class GPUs (gentle BERT
 weights vs f16-ref, oscillating weights auto-wide to f32). The legacy fp32
 tile matmul kernel remains correctness-first for unaligned shapes.
 

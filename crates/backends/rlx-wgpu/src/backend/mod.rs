@@ -30,8 +30,8 @@ fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
         // Norm staging: when params live far from activations in the arena,
         // wgpu's `max_storage_buffer_binding_size` can prevent binding a
         // single window that covers both. We reserve a small scratch tail
-        // zone so we can copy gamma/beta next to activations via
-        // `copy_buffer_to_buffer` and keep shader bindings local.
+        // zone so the schedule can move gamma/beta next to activations via
+        // a copy step and keep shader bindings local.
         if matches!(
             &node.op,
             rlx_ir::Op::LayerNorm { .. } | rlx_ir::Op::RmsNorm { .. }
@@ -404,6 +404,7 @@ pub struct WgpuExecutable {
 }
 
 mod compile;
+mod copy_route;
 mod dispatch;
 mod helpers;
 mod run;
@@ -413,6 +414,7 @@ mod set;
 mod step;
 mod test;
 
+pub(crate) use copy_route::*;
 pub(crate) use helpers::*;
 pub(crate) use step::*;
 
@@ -945,8 +947,9 @@ fn dispatch_dims(threads_total: u32, workgroup_size: u32) -> (u32, u32, u32) {
 /// Shape/feature gate for CoopF16Vk (no operand tracing — avoids circular
 /// dependency with compile-time f16 mirror planning).
 ///
-/// **Default OFF.** The Vulkan/DX12 cooperative-matrix matmul path
-/// silently produces wrong output on BERT-family attention chains on at
+/// **Default OFF.** The 16-bit cooperative-matrix matmul path — Vulkan only,
+/// since this engine exposes no cooperative matrices on DX12 at all — silently
+/// produces wrong output on BERT-family attention chains on at
 /// least NVIDIA GPU (verified empirically against Bio_ClinicalBERT:
 /// encoder cosine collapses from ≈1.0 on the wide-F32 fallback to ≈0.09
 /// when the coop path runs, regardless of whether the kernel uses
@@ -954,7 +957,7 @@ fn dispatch_dims(threads_total: u32, workgroup_size: u32) -> (u32, u32, u32) {
 /// in how wgpu's `coopLoadT` / `coopMultiplyAdd` interact with strided
 /// arena buffers on non-Apple drivers — and needs a focused
 /// reproducer before it can be fixed in `rlx-wgpu`. Until then the
-/// correctness-first default is to route Vulkan/DX12 matmuls through the
+/// correctness-first default is to route Vulkan matmuls through the
 /// wide-F32 path, even though it's substantially slower (~80× on this
 /// shape).
 ///
@@ -993,18 +996,18 @@ fn dispatch_wide_f32_matmul(
 ) {
     // Tile-size selection differs by GPU backend.
     //
-    // **Vulkan / DX12** (`matmul_wide_nv`, 64×64 tile): when `m_s < 64`
-    // the bottom rows of every workgroup's M-axis tile contain padded
-    // zeros that the kernel still computes and writes back — pure
-    // wasted work on small-M shapes like BERT-base prefill (m=32). The
-    // regular 32×32-tile kernel sidesteps the M-axis padding and is
-    // ~8% faster end-to-end on NVIDIA GPU (verified on Bio_ClinicalBERT:
-    // encoder forward 58.9 ms → 54.1 ms at cosine 0.9999995 vs HF).
+    // **Vulkan / DX12** (small M takes the 32×32-tile kernel): when `m_s < 64`
+    // the bottom rows of every workgroup's M-axis tile contain padded zeros that
+    // the kernel still computes and writes back — pure wasted work on small-M
+    // shapes like BERT-base prefill (m=32). The regular 32×32-tile kernel
+    // sidesteps the M-axis padding and is ~8% faster end-to-end on NVIDIA GPU
+    // (verified on Bio_ClinicalBERT: encoder forward 58.9 ms → 54.1 ms at cosine
+    // 0.9999995 vs HF).
     //
-    // **Metal / other** (`matmul_wide`, 64×64 tile): the wider tile
-    // wins even on small M — Apple GPUs prefer the larger workgroup
-    // and amortize the M-padding well. Forcing the 32×32 kernel here
-    // regresses Mac WGPU encoder time (26.6 → 29.1 ms verified).
+    // **Metal / other**: the wider tile wins even on small M — Apple GPUs
+    // prefer the larger workgroup and amortize the M-padding well. Forcing the
+    // 32×32 kernel here regresses Mac WGPU encoder time (26.6 → 29.1 ms
+    // verified).
     let backend = wgpu_device()
         .map(|d| d.backend)
         .unwrap_or(wgpu::Backend::Noop);
@@ -1870,7 +1873,7 @@ const ARENA_STAGE_CAP: u64 = crate::buffer::SHARD_STAGE_RESERVE as u64;
 const CONV2D_TILE: u32 = 4;
 
 /// Return a window-local f32 offset, staging into scratch when the tensor lies
-/// outside the bind window (via `copy_buffer_to_buffer`).
+/// outside the bind window (by emitting a copy step).
 fn arena_off_in_window_or_stage(
     arena: &Arena,
     schedule: &mut Vec<Step>,
@@ -2254,12 +2257,19 @@ fn bind_two_buf0_window(
 /// Compute precision selector: derive from IR dtypes of A and B and
 /// the device features.
 ///
-/// Priority:
+/// Priority (the cascade at the end of this function, in order):
 ///   1. Coop16 — if EXPERIMENTAL_COOPERATIVE_MATRIX + SHADER_F16 +
 ///      F16 IR tag + b traces to a Param + M/K/N are 32/8/32 aligned.
 ///      Unlocks Apple's `simdgroup_matrix` / Vulkan's KHR_cooperative
 ///      hardware GEMM units (~18× faster than f32 ALU on Apple M-series).
-///   2. F32 — every other case, *including* when AutoMixedPrecision
+///   2. CoopF16Vk — the 16-bit cooperative path on a discrete Vulkan
+///      adapter: opt-in (`RLX_WGPU_COOP_F16_VK_ENABLE=1`), gated by the
+///      runtime operand-order probe, and off for large N unless
+///      `RLX_WGPU_COOP_F16_VK_LARGE_N=1`. See `coop_f16_vk_eligible`.
+///   3. CoopF32 — `simdgroup_float8x8` on Metal, the portable 8×8 form on
+///      Vulkan, when cooperative matrices are available, B is a Param and
+///      the shapes align.
+///   4. F32 — every other case, *including* when AutoMixedPrecision
 ///      tagged the matmul as F16 but it failed Coop16's alignment
 ///      check. The non-coop F16 path (`matmul_f16_compute.wgsl`) was
 ///      empirically measured 4-5× SLOWER than the f32 baseline on
@@ -2310,7 +2320,7 @@ fn derive_matmul_compute_default(
     // orthogonal garbage on Metal for aligned bf16-tagged weights. Keep
     // bf16 in `any_low` (so it never falls into the `!any_low`
     // CoopF16Vk branch) but exclude it from Coop16 below → it lands on
-    // F32 (or opt-in CoopF32, which reads the correct f32 arena weight).
+    // F32 (or CoopF32, which reads the correct f32 arena weight).
     let any_bf16 = matches!(a_dt, DType::BF16) || matches!(b_dt, DType::BF16);
     // CoopF32 (`simdgroup_float8x8`) needs K and N aligned to 8 and 32
     // (one micro-tile per K-iter, one 32-col workgroup per N-tile).
@@ -2364,8 +2374,10 @@ fn derive_matmul_compute_default(
     // tiled `matmul_wide` path with no precision loss vs the f32
     // baseline (BERT max|Δ| stays at 2.3e-3 vs CPU on Apple).
     //
-    // CoopF32: on by default on Metal. Vulkan portable 8×8 is opt-in via
-    // RLX_WGPU_FORCE_COOP_F32 (RTX lacks 8×8 f32 coop; output is unreliable).
+    // CoopF32: on by default on Metal. The Vulkan portable 8×8 path is
+    // selected automatically too, when the adapter reports 8×8 f32
+    // cooperative matrices; RLX_WGPU_FORCE_COOP_F32 only widens eligibility to
+    // adapters that report none (RTX lacks 8×8 f32 coop; output is unreliable).
     let disabled = rlx_ir::env::flag("RLX_WGPU_NO_COOP_F32");
     let forced = rlx_ir::env::flag("RLX_WGPU_FORCE_COOP_F32");
     // This was opt-in because Metal `simdgroup_float8x8` CoopF32 produced

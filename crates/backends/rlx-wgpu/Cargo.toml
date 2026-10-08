@@ -45,8 +45,9 @@ rlx-gguf = { workspace = true }
 
 # wgpu 30: WebGPU-spec dispatch/present renames, `get_mapped_range` → Result,
 # signed `%` fix on Vulkan SPIR-V, Metal bindless storage buffers, etc.
-# Backends picked explicitly. DX12 is enabled for native Windows tensor-core
-# paths (preferred over Vulkan when the adapter supports it). GLES excluded.
+# Backends picked explicitly so one build covers macOS (Metal), Linux and
+# Windows (Vulkan, plus DX12 on Windows — this crate prefers neither and lets
+# wgpu's own adapter ordering decide). GLES excluded.
 wgpu = { version = "30", default-features = false, features = [
     "std",
     "parking_lot",

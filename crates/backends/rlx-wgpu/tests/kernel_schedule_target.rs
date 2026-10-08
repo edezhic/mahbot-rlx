@@ -10,10 +10,11 @@ use rlx_wgpu::kernel_schedule_port::{COOP_TILE, target_for_device, target_withou
 
 #[test]
 fn a_queried_target_reports_that_its_list_may_be_partial() {
-    // The load-bearing distinction. wgpu exposes a boolean where Vulkan has a
-    // property table, so a queried set is never known to be complete — and a
-    // `false` from `has()` must therefore mean "not known to be supported",
-    // not "known to be unsupported".
+    // The load-bearing distinction. This queried set records the one shape its
+    // kernel is written against, not the device's whole cooperative-matrix
+    // table, so it is never known to be complete — and a `false` from `has()`
+    // must therefore mean "not known to be supported", not "known to be
+    // unsupported".
     let t = target_without_coop_matrix(32 * 1024);
     assert!(
         t.capabilities_may_be_incomplete(),

@@ -23,9 +23,10 @@ use std::sync::OnceLock;
 ///
 /// Keyed by **backend and adapter**, not just the chip: wgpu runs over Metal,
 /// Vulkan, DX12 and GL, and which matmul path wins differs per backend at least
-/// as much as per GPU — the CoopF32 kernel that is opt-in-only on Metal (it
-/// produced orthogonal garbage there) is the fast path on a discrete Vulkan
-/// adapter. One key covering both would average two opposite answers.
+/// as much as per GPU — Metal's `simdgroup_float8x8` CoopF32 and the portable
+/// 8×8 CoopF32 a discrete Vulkan adapter reaches are different kernels with
+/// different eligibility, and a bf16 weight param keeps the packed path on
+/// Metal. One key covering both would average two different answers.
 pub fn gpu_arch() -> &'static rlx_gpu_dispatch::dispatch::GpuArch {
     static ARCH: OnceLock<rlx_gpu_dispatch::dispatch::GpuArch> = OnceLock::new();
     ARCH.get_or_init(|| {
@@ -139,8 +140,8 @@ mod tests {
         rlx_gpu_dispatch::dispatch::clear_overrides();
     }
 
-    /// Two adapters on different wgpu backends must not share tuning — the
-    /// CoopF32 path that is opt-in-only on Metal is the fast path on Vulkan.
+    /// Two adapters on different wgpu backends must not share tuning — Metal and
+    /// Vulkan reach different matmul kernels with different eligibility.
     #[test]
     fn backend_is_part_of_the_key() {
         let metal = rlx_gpu_dispatch::dispatch::GpuArch::wgpu("Metal", "Apple M4 Pro");
