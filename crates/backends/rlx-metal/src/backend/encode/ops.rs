@@ -4986,7 +4986,23 @@ pub(crate) fn encode_arena_cast(
     );
 }
 
-pub(crate) fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
+/// Max f32 dequant scratch the Metal arena reserves for this graph, i.e. the
+/// graph-wide slab the encoder's scratch route writes through.
+///
+/// A reservation, not a statement about the route taken: zero means no packed op
+/// in this graph keeps the slab busy *as this function models it* — every op is
+/// Q1_0 / Q2_0 with its `*_FUSED_DISABLE` off, or a decode-only G8_0 / PTQ1_0
+/// GEMV at `m == 1` that also clears `k % 32 == 0` (PTQ1_0: `k % 128 == 0`) and
+/// `n % 8 == 0`. It is not "zero iff every packed op reads its weight directly":
+/// a fused op on any other scheme still books the slab (a fused Q8_0 `m == 96`
+/// op books 655360 B), a Q1_0 op with unaligned `k` reports zero here and runs on
+/// the host instead, and the global `RLX_METAL_DEQUANT_GPU_DISABLE` off-switch is
+/// not consulted at all.
+///
+/// The planner calls this on the post-fusion graph to size `dequant_scratch_off`;
+/// on a pre-fusion graph it returns the same number unless fusion rewrote a packed
+/// op, so callers can report the reservation without mirroring the rule.
+pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
     let mut max = 0usize;
     for node in graph.nodes() {
         if let Op::DequantMatMul { scheme } = &node.op

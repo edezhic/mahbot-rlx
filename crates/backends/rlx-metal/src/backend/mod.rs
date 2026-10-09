@@ -639,6 +639,7 @@ mod read;
 mod run;
 mod set;
 
+pub use encode::dequant_gguf_scratch_bytes;
 pub use encode::has_metal_dequant_kernel;
 pub(crate) use encode::*;
 

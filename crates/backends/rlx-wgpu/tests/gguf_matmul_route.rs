@@ -31,19 +31,37 @@ fn case(
     k: usize,
     n: usize,
 ) -> (Graph, Vec<u8>, Vec<f32>) {
+    case_batched(scheme, ggml, &[], m, k, n)
+}
+
+/// As [`case`], with leading batch dims: the 3-D single-token decode shape the
+/// models use has to reach the same route counters as the 2-D one.
+fn case_batched(
+    scheme: QuantScheme,
+    ggml: rlx_gguf::GgmlType,
+    batch: &[usize],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (Graph, Vec<u8>, Vec<f32>) {
     let w_row: Vec<f32> = (0..k * n)
         .map(|i| ((i as f32) * 0.011).sin() * 0.5)
         .collect();
     let packed = rlx_gguf::quantize(&w_row, ggml).expect("quantize");
     let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.017).sin()).collect();
 
+    let mut in_shape = batch.to_vec();
+    in_shape.extend_from_slice(&[m, k]);
+    let mut out_shape = batch.to_vec();
+    out_shape.extend_from_slice(&[m, n]);
+
     let mut g = Graph::new("wgpu_gguf_route");
-    let x_in = g.input("x", Shape::new(&[m, k], DType::F32));
+    let x_in = g.input("x", Shape::new(&in_shape, DType::F32));
     let w = g.param("w", Shape::new(&[packed.len()], DType::U8));
     let y = g.add_node(
         Op::DequantMatMul { scheme },
         vec![x_in, w],
-        Shape::new(&[m, n], DType::F32),
+        Shape::new(&out_shape, DType::F32),
     );
     g.set_outputs(vec![y]);
     (g, packed, x)
@@ -61,6 +79,32 @@ fn route_of(scheme: QuantScheme, ggml: rlx_gguf::GgmlType, m: usize) -> DequantM
     reset_route_counts();
     let _ = run(Device::Gpu, g, &packed, &x);
     route_counts()
+}
+
+/// Worst per-element error between two runs of the same shape, rejecting
+/// non-finite values first: `f32::max` returns the non-NaN operand, so an
+/// all-NaN side would fold to `0.0` and pass a max-abs check.
+fn parity_max_abs(got: &[f32], want: &[f32]) -> f32 {
+    assert_eq!(got.len(), want.len(), "parity needs equal shapes");
+    let (mut nan, mut pos_inf, mut neg_inf) = (0usize, 0usize, 0usize);
+    for &v in got.iter().chain(want) {
+        if v.is_nan() {
+            nan += 1;
+        } else if v == f32::INFINITY {
+            pos_inf += 1;
+        } else if v == f32::NEG_INFINITY {
+            neg_inf += 1;
+        }
+    }
+    assert_eq!(
+        (nan, pos_inf, neg_inf),
+        (0, 0, 0),
+        "non-finite in the parity pair: NaN={nan} +inf={pos_inf} -inf={neg_inf}"
+    );
+    got.iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
 }
 
 /// One test fn on purpose — see the module doc.
@@ -110,32 +154,108 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     let q5 = route_of(QuantScheme::GgufQ5_0, rlx_gguf::GgmlType::Q5_0, 4);
     assert_eq!(q5.host + q5.scratch, 1, "Q5_0 route: {q5:?}");
 
-    // Q4_K parity and routing at a second shape (k=256, n=640), m=1 against m=96:
-    // the m=1 GEMV must stay the m=1 route, the 12-row-tile case must be one
-    // grouped call, and both must match the CPU reference.
+    // Q4_K parity at a second shape (k=256, n=640), m=1 against m=96, against the
+    // CPU reference. The routes for these two cells are asserted by the shape grid
+    // below, alongside every other shape; this loop is what pins their parity.
     for m in [1usize, 96] {
         let scheme = QuantScheme::GgufQ4K;
         let (g, packed, x) = case(scheme, rlx_gguf::GgmlType::Q4K, m, 256, 640);
-        reset_route_counts();
         let gpu = run(Device::Gpu, g.clone(), &packed, &x);
-        let c = route_counts();
         let cpu = run(Device::Cpu, g, &packed, &x);
-        let want = if m == 1 { (0, 1) } else { (1, 0) };
-        assert_eq!(
-            (c.grouped, c.per_row),
-            want,
-            "{scheme:?} m={m} route: {c:?}"
-        );
-        let max_abs = cpu
-            .iter()
-            .zip(&gpu)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let max_abs = parity_max_abs(&gpu, &cpu);
         eprintln!("{scheme:?} m={m} k=256 n=640: max_abs={max_abs:.6e}");
         assert!(
             max_abs <= 1e-2,
             "{scheme:?} m={m}: max_abs {max_abs} > 1e-2"
         );
+    }
+
+    // The in-scope schemes at every shape the parity suite's grid uses, printed
+    // from the process-global counters this binary owns. That file reports a route
+    // DERIVED from the selector; these lines are the backend's own census for the
+    // same shapes, so neither the small-grid shapes nor the 3-D single-token decode
+    // rests on the derivation alone.
+    //
+    // Q5_K and Q8_0 have NO fused route — `gemv_supports_scheme` is exactly
+    // {Q4_K(0), Q6_K(2), Q1_0(24)} — so both take dequant-scratch + matmul_bt at
+    // every m: one route, no change point for them to measure, and `host == 0` is
+    // what an in-arena weight produces (the host route is reserved for a sharded
+    // arena, a parked weight, or a refused scratch, and — the case the k=384 cell
+    // below is here to reach — a fused family whose k is not a whole number of
+    // blocks, which books no slab for the selector to fall back into). Q4_K / Q6_K
+    // change at m == 1: one per-row GEMV below, one row-grouped dispatch above.
+    //
+    // The model-class graph's own widths (H=1024, I=4096) are counter-checked here
+    // in both regimes rather than only derived: gate/up is k=1024→n=4096, down is
+    // k=4096→n=1024, and the o-projection is k=1024→n=1024. Each appears in the
+    // decode regime (the 2-D m=1 form and the 3-D single-token `[1,1,k]` form) and
+    // in the prefill regime where the model graph uses it (gate/up and o at m>1,
+    // down at large m).
+    let shapes: &[(&'static [usize], usize, usize, usize)] = &[
+        (&[], 2, 256, 8),
+        // k=384 is 1.5 Q4_K/Q6_K superblocks and 12 whole Q8_0 blocks: the cell
+        // that reaches the selector's host fallback, so that arm is exercised
+        // rather than left as scaffolding. Q5_K is non-fused at any k, so it still
+        // takes its single scratch route here.
+        (&[], 4, 384, 8),
+        (&[], 96, 256, 640),
+        (&[], 128, 256, 640),
+        (&[], 64, 2048, 512),
+        (&[], 192, 1024, 2048),
+        (&[], 1, 256, 640),
+        (&[1], 1, 2048, 640),
+        (&[], 192, 4096, 1024),
+        (&[], 1, 1024, 4096),
+        (&[], 1, 4096, 1024),
+        (&[], 96, 1024, 4096),
+        (&[], 1, 1024, 1024),
+        (&[], 96, 1024, 1024),
+        (&[1], 1, 1024, 4096),
+        (&[1], 1, 4096, 1024),
+        (&[1], 1, 1024, 1024),
+    ];
+    for (scheme, ggml) in [
+        (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K),
+        (QuantScheme::GgufQ5K, rlx_gguf::GgmlType::Q5K),
+        (QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K),
+        (QuantScheme::GgufQ8_0, rlx_gguf::GgmlType::Q8_0),
+    ] {
+        for &(batch, m, k, n) in shapes {
+            let (g, packed, x) = case_batched(scheme, ggml, batch, m, k, n);
+            reset_route_counts();
+            let gpu = run(Device::Gpu, g.clone(), &packed, &x);
+            let c = route_counts();
+            // `Debug` is the backend's own census — all five counters, rather than
+            // one name picked for them.
+            eprintln!(
+                "[rlx-gguf-route] scheme={scheme:?} m={m} k={k} n={n} batch={batch:?} route={c:?}"
+            );
+            let fused = matches!(scheme, QuantScheme::GgufQ4K | QuantScheme::GgufQ6K);
+            let aligned = k.is_multiple_of(scheme.gguf_block_size() as usize);
+            let want = match (fused, m == 1, aligned) {
+                (false, ..) => (0, 0, 1, 0), // Q5_K / Q8_0: one scratch route at every m
+                (true, true, _) => (0, 1, 0, 0), // decode: the m==1 arm consults no k
+                (true, false, true) => (1, 0, 0, 0),
+                (true, false, false) => (0, 0, 0, 1), // host fallback: no slab booked, no row slicing
+            };
+            assert_eq!(
+                (c.grouped, c.per_row, c.scratch, c.host),
+                want,
+                "{scheme:?} m={m} k={k} n={n} batch={batch:?}: {c:?}"
+            );
+            if want == (0, 0, 0, 1) {
+                // The host fallback's numbers are checked here as well as its
+                // counter: the row slices are invalid and a broken staging would
+                // show as a wrong or non-finite value, not as a wrong counter.
+                let cpu = run(Device::Cpu, g, &packed, &x);
+                let max_abs = parity_max_abs(&gpu, &cpu);
+                eprintln!("host-fallback {scheme:?} m={m} k={k} n={n}: max_abs={max_abs:.6e}");
+                assert!(
+                    max_abs <= 1e-2,
+                    "{scheme:?} m={m} k={k} n={n}: host fallback max_abs {max_abs} > 1e-2"
+                );
+            }
+        }
     }
 
     // A weight window wider than the binding limit must be N-chunked (the
@@ -165,11 +285,7 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             "{scheme:?} m={m}: a weight window over the binding limit must still \
              be grouped: {c:?}"
         );
-        let max_abs = cpu
-            .iter()
-            .zip(&gpu)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let max_abs = parity_max_abs(&gpu, &cpu);
         eprintln!("chunked-window {scheme:?} m={m} k=256 n=16384: max_abs={max_abs:.6e}");
         assert!(
             max_abs <= 1e-2,
@@ -195,13 +311,7 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         for r in 0..m {
             let (g1, _, _) = case(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 1, k, n);
             let row = run(Device::Gpu, g1, &packed, &x[r * k..(r + 1) * k]);
-            worst = worst.max(
-                grouped[r * n..(r + 1) * n]
-                    .iter()
-                    .zip(&row)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0f32, f32::max),
-            );
+            worst = worst.max(parity_max_abs(&grouped[r * n..(r + 1) * n], &row));
         }
         rlx_ir::env::unset("RLX_WGPU_MAX_BIND_MB");
         assert_eq!(
@@ -282,11 +392,7 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         {
             let (g1, packed, x1) = case(scheme, ggml, m, k, n);
             let want = run(Device::Cpu, g1, &packed, &x1);
-            let max_abs = want
-                .iter()
-                .zip(&got[i])
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
+            let max_abs = parity_max_abs(&got[i], &want);
             eprintln!("two weights: op{i} {scheme:?} m={m} k={k} n={n} max_abs={max_abs:.6e}");
             assert!(
                 max_abs <= 1e-2,
