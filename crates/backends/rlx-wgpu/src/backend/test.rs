@@ -94,6 +94,14 @@ impl WgpuExecutable {
         self.schedule.iter().map(step_name).collect()
     }
 
+    /// Test hook: every step in the schedule is marked safe for the
+    /// active-extent (bucketed/padded decode) path. A step that is not
+    /// silently vetoes that optimisation for the whole graph.
+    #[doc(hidden)]
+    pub fn test_all_steps_safe_for_active_extent(&self) -> bool {
+        self.all_safe_for_active()
+    }
+
     /// Test hook: the windowed bind path an absolute-offset arm uses, against this
     /// executable's own arena. It panics exactly as the real path does, so a test can
     /// pin the net under `lower::should_host_at_ceiling` for a geometry the routing

@@ -18,6 +18,8 @@
 //! weight *window* over the binding limit must be N-chunked, and no chunk window
 //! may be sized from the weight's position relative to offset 0.
 
+mod common;
+use common::max_abs_diff;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
@@ -81,32 +83,6 @@ fn route_of(scheme: QuantScheme, ggml: rlx_gguf::GgmlType, m: usize) -> DequantM
     route_counts()
 }
 
-/// Worst per-element error between two runs of the same shape, rejecting
-/// non-finite values first: `f32::max` returns the non-NaN operand, so an
-/// all-NaN side would fold to `0.0` and pass a max-abs check.
-fn parity_max_abs(got: &[f32], want: &[f32]) -> f32 {
-    assert_eq!(got.len(), want.len(), "parity needs equal shapes");
-    let (mut nan, mut pos_inf, mut neg_inf) = (0usize, 0usize, 0usize);
-    for &v in got.iter().chain(want) {
-        if v.is_nan() {
-            nan += 1;
-        } else if v == f32::INFINITY {
-            pos_inf += 1;
-        } else if v == f32::NEG_INFINITY {
-            neg_inf += 1;
-        }
-    }
-    assert_eq!(
-        (nan, pos_inf, neg_inf),
-        (0, 0, 0),
-        "non-finite in the parity pair: NaN={nan} +inf={pos_inf} -inf={neg_inf}"
-    );
-    got.iter()
-        .zip(want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max)
-}
-
 /// One test fn on purpose — see the module doc.
 #[test]
 fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
@@ -162,7 +138,7 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         let (g, packed, x) = case(scheme, rlx_gguf::GgmlType::Q4K, m, 256, 640);
         let gpu = run(Device::Gpu, g.clone(), &packed, &x);
         let cpu = run(Device::Cpu, g, &packed, &x);
-        let max_abs = parity_max_abs(&gpu, &cpu);
+        let max_abs = max_abs_diff(&gpu, &cpu);
         eprintln!("{scheme:?} m={m} k=256 n=640: max_abs={max_abs:.6e}");
         assert!(
             max_abs <= 1e-2,
@@ -248,7 +224,7 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
                 // counter: the row slices are invalid and a broken staging would
                 // show as a wrong or non-finite value, not as a wrong counter.
                 let cpu = run(Device::Cpu, g, &packed, &x);
-                let max_abs = parity_max_abs(&gpu, &cpu);
+                let max_abs = max_abs_diff(&gpu, &cpu);
                 eprintln!("host-fallback {scheme:?} m={m} k={k} n={n}: max_abs={max_abs:.6e}");
                 assert!(
                     max_abs <= 1e-2,
@@ -285,7 +261,7 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             "{scheme:?} m={m}: a weight window over the binding limit must still \
              be grouped: {c:?}"
         );
-        let max_abs = parity_max_abs(&gpu, &cpu);
+        let max_abs = max_abs_diff(&gpu, &cpu);
         eprintln!("chunked-window {scheme:?} m={m} k=256 n=16384: max_abs={max_abs:.6e}");
         assert!(
             max_abs <= 1e-2,
@@ -311,7 +287,7 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         for r in 0..m {
             let (g1, _, _) = case(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 1, k, n);
             let row = run(Device::Gpu, g1, &packed, &x[r * k..(r + 1) * k]);
-            worst = worst.max(parity_max_abs(&grouped[r * n..(r + 1) * n], &row));
+            worst = worst.max(max_abs_diff(&grouped[r * n..(r + 1) * n], &row));
         }
         rlx_ir::env::unset("RLX_WGPU_MAX_BIND_MB");
         assert_eq!(
@@ -392,7 +368,7 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         {
             let (g1, packed, x1) = case(scheme, ggml, m, k, n);
             let want = run(Device::Cpu, g1, &packed, &x1);
-            let max_abs = parity_max_abs(&got[i], &want);
+            let max_abs = max_abs_diff(&got[i], &want);
             eprintln!("two weights: op{i} {scheme:?} m={m} k={k} n={n} max_abs={max_abs:.6e}");
             assert!(
                 max_abs <= 1e-2,

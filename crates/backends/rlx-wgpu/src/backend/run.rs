@@ -19,14 +19,14 @@ use crate::kernels::{
     ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
     FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
     GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNormBwdParams, LayerNormParams,
-    Mamba2Params, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams,
-    Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
-    SampleParams, ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams,
-    TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
-    activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
-    argmax_kernel, attention_bwd_kernel, attention_kernel, axial_rope2d_kernel,
-    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNorm2dParams, LayerNormBwdParams,
+    LayerNormParams, Mamba2Params, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams,
+    Pool2dParams, Pool3dParams, ReduceParams, ReverseParams, RmsNormBwdParams, RnnParams,
+    RopeBwdParams, RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams,
+    SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
+    WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
+    ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_kernel,
+    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
     cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
@@ -44,19 +44,20 @@ use crate::kernels::{
     gather_nd_kernel, gather_split_kernel, group_norm_backward_beta_kernel,
     group_norm_backward_gamma_kernel, group_norm_backward_input_kernel, group_norm_kernel,
     grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
-    layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layernorm_kernel,
-    lstm_kernel, mamba2_kernel, matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel,
-    matmul_coop_f16_vulkan_kernel, matmul_coop_f32_active_kernel, matmul_coop16_kernel,
-    matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_kernel,
-    matmul_qkv_coop_f16_vk_active_kernel, matmul_qkv_coop_f16_vk_kernel,
-    matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_active_kernel, matmul_wide_kernel,
-    maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel,
-    pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel,
-    reduce_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scaled_dequantize_kernel,
-    scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel, scaled_quant_scale_kernel,
-    scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel,
-    selective_scan_kernel, softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
+    layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
+    layernorm_kernel, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
+    matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
+    matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
+    matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
+    matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
+    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
+    maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
+    q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel, reverse_kernel,
+    rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel,
+    rope_kernel, sample_kernel, scaled_dequantize_kernel, scaled_grouped_matmul_decode_kernel,
+    scaled_matmul_decode_kernel, scaled_quant_scale_kernel, scaled_quantize_kernel,
+    scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel, selective_scan_kernel,
+    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
     softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
     umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, welch_peaks_gpu_kernel, where_kernel,
 };
@@ -746,6 +747,15 @@ impl WgpuExecutable {
                             bytemuck::bytes_of(params),
                         );
                     }
+                    Step::LayerNorm2d { params } => {
+                        // Same as GroupNorm: NCHW geometry is fixed and the
+                        // step is never scaled, so the params go out verbatim.
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
+                    }
                     Step::FusedSwiGLU { params } => {
                         let mut p = *params;
                         p.outer = scale(p.outer);
@@ -948,6 +958,18 @@ impl WgpuExecutable {
                             let scaled_d0 = scale(p.out_dim_0);
                             let inner = p.out_total / p.out_dim_0;
                             p.out_total = scaled_d0 * inner;
+                        }
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::Reverse { params, .. } => {
+                        // PLAN L1: same per-instance decision as Expand — scale
+                        // the leading dim only when this flip does not touch it.
+                        let mut p = *params;
+                        if p.scale_leading == 1 && p.dim_0 > 0 {
+                            let scaled_d0 = scale(p.dim_0);
+                            let inner = p.total / p.dim_0;
+                            p.total = scaled_d0 * inner;
                         }
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
@@ -1769,6 +1791,25 @@ impl WgpuExecutable {
                                     dispatch_dims(params.groups_total.saturating_mul(64), 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
+                            Step::LayerNorm2d { params } => {
+                                if params.positions == 0 || params.c == 0 {
+                                    gpu_bi += 1;
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let lk = layer_norm2d_kernel(&dev.device);
+                                pass.set_pipeline(&lk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                // One workgroup (64 threads) per (batch, spatial)
+                                // position → tree reduction over the channels.
+                                // The grid is the POSITION count, not a thread
+                                // count — the kernel recovers `pos` from
+                                // `workgroup_id` and `num_workgroups` — so the
+                                // count is handed over as-is, by asking
+                                // `dispatch_dims` for a workgroup size of 1.
+                                let (gx, gy, gz) = dispatch_dims(params.positions, 1);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
                             Step::FusedSwiGLU { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
@@ -2435,6 +2476,25 @@ impl WgpuExecutable {
                                 }
                                 let ek = expand_kernel(&dev.device);
                                 pass.set_pipeline(&ek.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Reverse { params, .. } => {
+                                let total_s = if params.scale_leading == 1 && params.dim_0 > 0 {
+                                    let scaled_d0 = scale(params.dim_0);
+                                    let inner = params.total / params.dim_0;
+                                    scaled_d0 * inner
+                                } else {
+                                    params.total
+                                };
+                                if total_s == 0 {
+                                    gpu_bi += 1;
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let rk = reverse_kernel(&dev.device);
+                                pass.set_pipeline(&rk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 let (gx, gy, gz) = dispatch_dims(total_s, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);

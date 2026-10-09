@@ -29,16 +29,16 @@ use crate::kernels::{
     FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams,
     GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
     GatherBwdParams, GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams,
-    GruParams, Im2Col2dParams, IndexingNdParams, Kernel, LayerNormBwdParams, LayerNormParams,
-    LstmParams, Mamba2Params, MatmulParams, MatmulQkvParams, MaxPool2dBwdParams,
+    GruParams, Im2Col2dParams, IndexingNdParams, Kernel, LayerNorm2dParams, LayerNormBwdParams,
+    LayerNormParams, LstmParams, Mamba2Params, MatmulParams, MatmulQkvParams, MaxPool2dBwdParams,
     MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams,
-    QConv2dParams, QMatMulParams, QUANT_I8_MAX_CHAN, QuantI8Params, ReduceParams, RmsNormBwdParams,
-    RnnParams, RopeBwdParams, RopeParams, SampleParams, ScaledGroupedMatmulParams,
-    ScaledLowpParams, ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams,
-    SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams,
-    WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
-    argmax_kernel, attention_bwd_kernel, attention_kernel, axial_rope2d_kernel,
-    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    QConv2dParams, QMatMulParams, QUANT_I8_MAX_CHAN, QuantI8Params, ReduceParams, ReverseParams,
+    RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, SampleParams,
+    ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams, SceParams,
+    SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
+    WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
+    ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_kernel,
+    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
     cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
@@ -56,22 +56,22 @@ use crate::kernels::{
     gather_nd_kernel, gather_split_kernel, group_norm_backward_beta_kernel,
     group_norm_backward_gamma_kernel, group_norm_backward_input_kernel, group_norm_kernel,
     grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
-    layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layernorm_kernel,
-    lead_pack_uniform, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
+    layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
+    layernorm_kernel, lead_pack_uniform, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
     matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
     matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
     matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
     maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
-    q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel, rms_norm_backward_kernel,
-    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
-    scaled_dequantize_kernel, scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel,
-    scaled_quant_scale_kernel, scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel,
-    scatter_nd_reduce_kernel, selective_scan_kernel, softmax_cross_entropy_backward_kernel,
-    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
-    topk_kernel, transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
-    welch_peaks_gpu_kernel, where_kernel,
+    q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel, reverse_kernel,
+    rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel,
+    rope_kernel, sample_kernel, scaled_dequantize_kernel, scaled_grouped_matmul_decode_kernel,
+    scaled_matmul_decode_kernel, scaled_quant_scale_kernel, scaled_quantize_kernel,
+    scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel, selective_scan_kernel,
+    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
+    softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
+    umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_gpu_dispatch::indexing::{KernelKind as IndexKind, Reduction as IndexReduction};
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
@@ -167,7 +167,9 @@ fn patch_region_cast_subs(chain: &[rlx_ir::op::ChainStep], chain_enc: &mut [u32]
 ///   [`wgpu_prefer_structure_host`] / [`wgpu_prefer_conv_host`].
 /// Metal keeps GPU kernels. Opt out of hosting with `RLX_WGPU_SHARD_GPU=1`.
 /// Force full discrete hosting with `RLX_WGPU_DISCRETE_HOST=1` (via
-/// [`wgpu_prefer_host_fallback`] for norms/sharded paths).
+/// [`wgpu_prefer_host_fallback`] for norms/sharded paths). `LayerNorm2d` and
+/// `Reverse` do not consult the adapter-kind term at all — see
+/// [`wgpu_prefer_host_fallback_agnostic`].
 fn wgpu_prefer_host_fallback(arena: &crate::buffer::Arena) -> bool {
     if rlx_ir::env::flag("RLX_WGPU_FORCE_HOST") {
         return true;
@@ -179,6 +181,29 @@ fn wgpu_prefer_host_fallback(arena: &crate::buffer::Arena) -> bool {
         return true;
     }
     rlx_ir::env::flag("RLX_WGPU_DISCRETE_HOST") && crate::device::coop_discrete_backend()
+}
+
+/// [`wgpu_prefer_host_fallback`] without its adapter-kind term.
+///
+/// The `RLX_WGPU_DISCRETE_HOST`-on-a-discrete-adapter test exists for
+/// operations whose SPIR-V path is numerically wrong there. `LayerNorm2d` and
+/// `Reverse` are not in that set — their device path is exact on every adapter,
+/// so consulting the adapter kind would put them back on the host on exactly
+/// the adapters this backend is measured on. `RLX_WGPU_FORCE_HOST`, the sharded
+/// arena and the `RLX_WGPU_SHARD_GPU` opt-out still apply.
+///
+/// Written out rather than derived from [`wgpu_prefer_host_fallback`]: there
+/// `RLX_WGPU_FORCE_HOST` is asked before `RLX_WGPU_SHARD_GPU`, and that
+/// precedence is observable (`FORCE_HOST=1 SHARD_GPU=1` hosts), so the two
+/// cannot share one expression without changing an existing route.
+fn wgpu_prefer_host_fallback_agnostic(arena: &crate::buffer::Arena) -> bool {
+    if rlx_ir::env::flag("RLX_WGPU_FORCE_HOST") {
+        return true;
+    }
+    if rlx_ir::env::flag("RLX_WGPU_SHARD_GPU") {
+        return false;
+    }
+    arena.is_sharded()
 }
 
 /// Expand / Concat / Transpose / Narrow: host on discrete Vulkan/DX12 even when
@@ -480,6 +505,86 @@ fn any_parked_operand(arena: &Arena, node: &rlx_ir::Node) -> bool {
         .any(|&i| crate::buffer::is_weight_off(arena.offset(i)))
 }
 
+/// Is this *parameter's* stored form one f32 lane per element — what both of
+/// this op's routes read?
+///
+/// Exhaustive on purpose, and mirroring `set_param_typed`'s arms in
+/// `crates/core/rlx-runtime/src/backend/wgpu_backend.rs` (this crate sits below
+/// it): a new encoding has to be decided here rather than default to a verdict
+/// nobody checked. [`crate::buffer::unstageable_reason`] decides the same set
+/// for the *generic* host route, which reads no more than the four bytes per
+/// element it is given, so its `F64`/`I64` verdict is the opposite of this
+/// one's — a new encoding belongs in both matches, not in either. `slot_bytes` is what the arena's record says the parameter's
+/// storage holds — `rlx_compile`'s `node_slot_bytes` sizes a non-F32 `Param` at
+/// its native width, while the split plan's parameters get four bytes per
+/// element, and the widened upload has to fit whichever it got.
+fn param_lane_readable(dt: rlx_ir::DType, elems: usize, slot_bytes: usize) -> bool {
+    use rlx_ir::DType::*;
+    match dt {
+        // `set_param_typed` widens these to one f32 lane per element.
+        F32 | F16 | F64 | I32 | I64 | U32 | Bool => {}
+        // Stored raw at the encoding's own one or two bytes per element, so the
+        // lanes a device step would read are not the values the model wrote.
+        U8 | I8 | BF16 => return false,
+        // No arm in the typed upload at all: the parameter never reaches the arena.
+        I16 | C64 | C128 => return false,
+    }
+    slot_bytes >= 4 * elems
+}
+
+/// Can every parameter operand of `node` be read as one f32 lane per element?
+///
+/// Activations always are — the planner widens the sub-four-byte encodings at the
+/// boundary and `compile_static_inner` records the payload as `elems * 4` bytes
+/// for anything that is not complex — so only an operand the graph says is a
+/// parameter's storage is judged; an arena with no record for it is refused
+/// ([`param_lane_readable`] never sees a slot).
+///
+/// [`crate::buffer::unstageable_reason`] answers a neighbouring question for the
+/// *generic* host route, whose staged read is wider than a lane for a declared
+/// `F64`/`I64`; its verdict on those is deliberately not mirrored here, because
+/// they really are one f32 lane per element in an eight-byte slot. Complex keeps
+/// its own host route and is refused here.
+fn param_operands_are_lane_readable(graph: &Graph, arena: &Arena, node: &rlx_ir::Node) -> bool {
+    node.inputs.iter().all(|&id| {
+        if !crate::buffer::is_parameter_storage(graph, id) {
+            return true;
+        }
+        let shape = &graph.node(id).shape;
+        arena
+            .param_storage_at(arena.offset(id))
+            .is_some_and(|storage| {
+                param_lane_readable(
+                    shape.dtype(),
+                    shape.num_elements().unwrap_or(0),
+                    storage.bytes,
+                )
+            })
+    })
+}
+
+/// Refuse a parameter operand neither route can read, naming the geometry.
+fn assert_param_operands_are_lane_readable(graph: &Graph, arena: &Arena, node: &rlx_ir::Node) {
+    // Only ever read on the refusal path, where the predicate found a parameter
+    // operand; the `unwrap_or` keeps the message from naming a subexpression.
+    let offender = node
+        .inputs
+        .iter()
+        .copied()
+        .find(|&id| crate::buffer::is_parameter_storage(graph, id))
+        .unwrap_or(node.inputs[0]);
+    assert!(
+        param_operands_are_lane_readable(graph, arena, node),
+        "rlx-wgpu: REFUSED (parameter not readable as f32 lanes): {:?} reads {offender:?}, a \
+         parameter whose stored form is not one f32 lane per element (a packed U8/I8/BF16 upload, \
+         or a non-F32 parameter the flat plan sized at its native width, whose widened upload does \
+         not fit its own slot; or a parameter the arena holds no storage record for). Both this \
+         op's routes read lanes, so neither can compute it. \
+         Widen the parameter, or move the op to a backend that honours its declared width.",
+        node.op.kind(),
+    );
+}
+
 /// Refuse a listed op whose *parameter* operand the generic host route cannot stage.
 ///
 /// That route reads every operand as one f32 lane per element, so a parameter is
@@ -538,6 +643,105 @@ fn assert_host_route_stageable(graph: &Graph, arena: &Arena, node: &rlx_ir::Node
     }
 }
 
+/// The guards a whole-arena host step needs, whichever op keeps one.
+///
+/// `Step::LayerNorm2dHost` and `Step::ReverseHost` are addressed by 32-bit byte
+/// offsets into the whole arena, and read their operands as one f32 lane per
+/// element. A parameter parked in the separate weight buffer loses
+/// `WEIGHT_BUF_TAG` in that cast, and an arena past `u32::MAX` bytes truncates
+/// every offset, so either geometry would read and write the wrong bytes
+/// silently. Refuse loudly instead; `device_hint` names the route that can
+/// address them.
+///
+/// That route is the one these ops take by default, which is what keeps a plan
+/// that parks every parameter working: the device step stages such an operand,
+/// and the generic packed host route (`Step::HostOp`) stages it too — but an
+/// unsharded arena with the norm forced onto this route reaches neither, and
+/// this refusal is then the honest answer rather than a wrong one.
+fn assert_whole_arena_host_route(
+    graph: &Graph,
+    arena: &Arena,
+    node: &rlx_ir::Node,
+    device_hint: &str,
+) {
+    assert_param_operands_are_lane_readable(graph, arena, node);
+    assert!(
+        !any_parked_operand(arena, node),
+        "rlx-wgpu: REFUSED (parked {:?} operand): the whole-arena host step carries 32-bit byte \
+         offsets that drop the weight-buffer tag ({}). Avoid parking this operand, or \
+         {device_hint}.",
+        node.op.kind(),
+        parked_operand_report(arena),
+    );
+    assert!(
+        arena.size <= u32::MAX as usize,
+        "rlx-wgpu: REFUSED ({:?} arena too large): the whole-arena host step carries 32-bit byte \
+         offsets and this arena is {} bytes, so its offsets would truncate. Shrink the arena, or \
+         {device_hint}.",
+        node.op.kind(),
+        arena.size,
+    );
+}
+
+/// Resolve `ids` into the bind window a device step will read them from, and
+/// return each one's f32-lane offset inside it.
+///
+/// The two windowed steps added for `Op::LayerNorm2d` and `Op::Reverse` share
+/// this prologue. A single binding may not cover every operand, so
+/// `arena_multi_op_window` anchors on what fits and stages the rest into the
+/// arena's scratch tail (emitting `Step::BufferCopy`); because staging an
+/// operand relocates or widens `base`, every offset is then re-resolved against
+/// the final window rather than trusted from before the staging.
+///
+/// `win` is the operand list the window is built over, in the order that
+/// builder prefers; `ids` are the operands whose offsets the caller wants, in
+/// the order it wants them resolved (each call can stage, so that order is
+/// observable).
+fn window_offsets(
+    device: &wgpu::Device,
+    arena: &Arena,
+    graph: &Graph,
+    param_offsets: &HashMap<String, NodeId>,
+    schedule: &mut Vec<Step>,
+    win: &[NodeId],
+    ids: &[NodeId],
+) -> (u64, u64, Vec<u32>) {
+    let fits = arena_span_bytes(arena, win) <= device.limits().max_storage_buffer_binding_size;
+    let mut scratch = arena.scratch_off as u64;
+    let (mut base, mut size, param_anchor) = arena_multi_op_window(
+        device,
+        arena,
+        graph,
+        param_offsets,
+        schedule,
+        &mut scratch,
+        win,
+    );
+    if !fits && !param_anchor {
+        base = arena_bind_window_covering_scratch_if_needed(arena, base, size, scratch);
+    }
+    let mut offsets = Vec::with_capacity(ids.len());
+    for &id in ids {
+        offsets.push(arena_off_in_bind_window(
+            graph,
+            param_offsets,
+            device,
+            arena,
+            schedule,
+            &mut scratch,
+            id,
+            &mut base,
+            &mut size,
+        ));
+    }
+    for (&id, off) in ids.iter().zip(offsets.iter_mut()) {
+        if arena_tensor_in_window(arena, id, base, size) {
+            *off = arena_local_off_f32(arena, id, base);
+        }
+    }
+    (base, size, offsets)
+}
+
 /// The addressed geometry, for the ceiling rule's messages: which arena could not
 /// be bound whole, and why.
 fn geometry_report(arena: &Arena, limit: u64) -> String {
@@ -569,12 +773,27 @@ fn parked_operand_report(arena: &Arena) -> String {
 /// Mirrors the LayerNorm/RmsNorm policy in [`wgpu_prefer_host_fallback`]:
 /// virtually-sharded arenas keep the host path (the native kernel binds a
 /// single arena window). `RLX_WGPU_HOST_NORM` forces it; `RLX_WGPU_GPU_NORM`
-/// forces the kernel.
+/// forces the kernel. `Op::LayerNorm2d` uses [`wgpu_prefer_host_norm2d`]
+/// instead, which drops the adapter-kind term.
 fn wgpu_prefer_host_norm(arena: &crate::buffer::Arena) -> bool {
     if rlx_ir::env::flag("RLX_WGPU_GPU_NORM") {
         return false;
     }
     wgpu_prefer_host_fallback(arena) || rlx_ir::env::flag("RLX_WGPU_HOST_NORM")
+}
+
+/// Whether `Op::LayerNorm2d` must fall back to the whole-arena host step.
+///
+/// Same documented switch pair as [`wgpu_prefer_host_norm`] —
+/// `RLX_WGPU_HOST_NORM` forces the host step, `RLX_WGPU_GPU_NORM` forces the
+/// device kernel — but the adapter-kind term is deliberately absent, so the
+/// "force norms onto the GPU" switch the registry documents also covers this
+/// normalisation on a discrete adapter.
+fn wgpu_prefer_host_norm2d(arena: &crate::buffer::Arena) -> bool {
+    if rlx_ir::env::flag("RLX_WGPU_GPU_NORM") {
+        return false;
+    }
+    wgpu_prefer_host_fallback_agnostic(arena) || rlx_ir::env::flag("RLX_WGPU_HOST_NORM")
 }
 
 /// Conv2d SPIR-V is still wrong on discrete NVIDIA even for unsharded arenas
@@ -7585,12 +7804,109 @@ pub(crate) fn compile_static_inner(
                 });
             }
             Op::LayerNorm2d { eps } => {
-                // NCHW: x [n,c,h,w], gamma/beta [c]. Host step (schedule-only).
-                let in_shape = &graph.node(node.inputs[0]).shape;
+                let in_id = node.inputs[0];
+                let gamma_id = node.inputs[1];
+                let beta_id = node.inputs[2];
+                let in_shape = &graph.node(in_id).shape;
+                // Eligibility first, loudest first: this op is NCHW, and both of
+                // this backend's routes read `h`/`w` from axes 2 and 3, so any
+                // other rank would be normalised over the wrong axes — silently,
+                // for the ranks a shape can still be read at. `rlx-cpu` also
+                // takes rank 3 as `[N, C, 1, W]`; neither step here implements
+                // that form, so it is refused too.
+                assert!(
+                    matches!(in_shape.rank(), 4),
+                    "rlx-wgpu: REFUSED (LayerNorm2d rank): Op::LayerNorm2d is NCHW-shaped and both \
+                     of this backend's routes read h/w from axes 2 and 3, so rank {} would \
+                     normalise over the wrong axes. Reshape to rank 4, or run the norm on a \
+                     backend that accepts this rank.",
+                    in_shape.rank()
+                );
+                // Complex packs several lanes per element (C64 = 2, C128 = 4) while
+                // both routes read an operand as one f32 lane per element — the
+                // whole-arena host step would lose half of every C64 element. It
+                // is `should_pack_host_op`'s "COMPLEX NEVER HOSTS" verdict.
+                for &id in &[in_id, gamma_id, beta_id, node.id] {
+                    let dt = graph.node(id).shape.dtype();
+                    assert!(
+                        !dt.is_complex(),
+                        "rlx-wgpu: REFUSED (LayerNorm2d encoding): {id:?} is {dt:?}, which packs \
+                         several lanes per element, while both of this op's routes read an operand \
+                         as one f32 lane per element. Cast the operand to a real dtype, or run \
+                         the norm on a backend that reads its declared encoding."
+                    );
+                }
+                // Native kernel: one workgroup per (batch, spatial) position,
+                // tree reduction over the channel axis. `RLX_WGPU_HOST_NORM`
+                // takes the host step and `RLX_WGPU_GPU_NORM` this one; the
+                // adapter kind is not consulted (see `wgpu_prefer_host_norm2d`).
+                if !wgpu_prefer_host_norm2d(&arena)
+                    && param_operands_are_lane_readable(&graph, &arena, node)
+                {
+                    // gamma/beta can sit far from the activations, or be parked
+                    // in the weight buffer; the same window + staging machinery
+                    // GroupNorm uses resolves them next to `in` — including
+                    // into the scratch tail via `Step::BufferCopy` when a single
+                    // binding window cannot cover both.
+                    let n = in_shape.dim(0).unwrap_static() as u32;
+                    let c = in_shape.dim(1).unwrap_static() as u32;
+                    let h = in_shape.dim(2).unwrap_static() as u32;
+                    let w = in_shape.dim(3).unwrap_static() as u32;
+
+                    let gamma_is_param = tensor_is_graph_param(&graph, &param_offsets, gamma_id);
+                    let gamma_bytes = arena.len_of(gamma_id) as u64;
+                    let win: Vec<NodeId> = if gamma_is_param && gamma_bytes > ARENA_STAGE_CAP {
+                        vec![gamma_id, node.id, in_id]
+                    } else {
+                        let mut v = vec![node.id, in_id];
+                        if gamma_is_param {
+                            v.push(gamma_id);
+                            v.push(beta_id);
+                        }
+                        v
+                    };
+                    let (base, size, offsets) = window_offsets(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &win,
+                        &[in_id, gamma_id, beta_id],
+                    );
+                    let [in_off, gamma_off, beta_off] = offsets[..] else {
+                        unreachable!("one offset per operand")
+                    };
+                    let p = LayerNorm2dParams {
+                        positions: n * h * w,
+                        c,
+                        hw: h * w,
+                        in_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        gamma_off,
+                        beta_off,
+                        eps_bits: eps.to_bits(),
+                    };
+                    schedule.push(Step::LayerNorm2d { params: p });
+                    let lk = layer_norm2d_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<LayerNorm2dParams>());
+                    let bg = bind_arena_window(&dev.device, lk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                    continue;
+                }
+                // Host route: a whole-arena step whose byte offsets are `u32`.
+                assert_whole_arena_host_route(
+                    &graph,
+                    &arena,
+                    node,
+                    "run the norm on the device route",
+                );
+                let in_shape = &graph.node(in_id).shape;
                 schedule.push(Step::LayerNorm2dHost {
-                    src_byte_off: arena.offset(node.inputs[0]) as u32,
-                    gamma_byte_off: arena.offset(node.inputs[1]) as u32,
-                    beta_byte_off: arena.offset(node.inputs[2]) as u32,
+                    src_byte_off: arena.offset(in_id) as u32,
+                    gamma_byte_off: arena.offset(gamma_id) as u32,
+                    beta_byte_off: arena.offset(beta_id) as u32,
                     dst_byte_off: arena.offset(node.id) as u32,
                     n: in_shape.dim(0).unwrap_static() as u32,
                     c: in_shape.dim(1).unwrap_static() as u32,
@@ -7612,8 +7928,8 @@ pub(crate) fn compile_static_inner(
                 });
             }
             Op::Reverse { axes } => {
-                // Batch-general flip. Host step (schedule-only).
-                let in_shape = &graph.node(node.inputs[0]).shape;
+                let in_id = node.inputs[0];
+                let in_shape = &graph.node(in_id).shape;
                 let rank = in_shape.rank();
                 let dims: Vec<u32> = (0..rank)
                     .map(|i| in_shape.dim(i).unwrap_static() as u32)
@@ -7624,12 +7940,141 @@ pub(crate) fn compile_static_inner(
                         rev_mask[a] = true;
                     }
                 }
+                let total: u64 = dims.iter().map(|&d| d as u64).product();
+                // Device path: a per-element lane permutation. NOT gated on
+                // `coop_discrete_backend()` — this flip is exact on every
+                // adapter, and putting it back on the host there is the cost
+                // this route exists to remove. A sharded arena still hosts (a
+                // single binding cannot cover it), `RLX_WGPU_FORCE_HOST` still
+                // hosts, and an operand the arena does not hold as one f32 lane
+                // per element keeps the host route.
+                // Complex packs several lanes per element, so it keeps the host
+                // route (which indexes what the arena stores). The flip is a pure
+                // permutation, so `Op::Reverse` carries no parameter of its own —
+                // `param_operands_are_lane_readable` still guards a graph that
+                // feeds it one.
+                if !in_shape.dtype().is_complex()
+                    && !node.shape.dtype().is_complex()
+                    && total > 0
+                    && total <= u32::MAX as u64
+                    && !wgpu_prefer_host_fallback_agnostic(&arena)
+                    && param_operands_are_lane_readable(&graph, &arena, node)
+                {
+                    // Source strides over the full shape (the output has the
+                    // same dims). A reversed axis keeps its own stride; only
+                    // the index within it flips.
+                    let mut strides = vec![1u32; rank];
+                    for i in (0..rank.saturating_sub(1)).rev() {
+                        strides[i] = strides[i + 1] * dims[i + 1];
+                    }
+                    // meta = dims (rank) ++ strides (rank) ++ rev flags (rank).
+                    let mut meta_data: Vec<u32> = Vec::with_capacity(rank * 3);
+                    meta_data.extend_from_slice(&dims);
+                    meta_data.extend_from_slice(&strides);
+                    meta_data.extend(rev_mask.iter().map(|&r| r as u32));
+                    let meta_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("rlx-wgpu reverse meta"),
+                        size: (meta_data.len() * 4).max(4) as u64,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    dev.queue
+                        .write_buffer(&meta_buf, 0, bytemuck::cast_slice(&meta_data));
+                    let meta_idx = meta_buffers.len();
+                    meta_buffers.push(meta_buf);
+                    // PLAN L1: the bucket axis is the leading dim. Scaling
+                    // `total` is safe only when this flip does not touch it —
+                    // the same per-instance decision `Step::Expand` makes with
+                    // `bucket_outermost`.
+                    let scale_leading = if rev_mask.first().copied().unwrap_or(false) {
+                        0u32
+                    } else {
+                        1u32
+                    };
+                    let rev_ids = [node.id, in_id];
+                    let (base, size, offsets) = window_offsets(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &rev_ids,
+                        &[in_id, node.id],
+                    );
+                    let [in_off, out_off] = offsets[..] else {
+                        unreachable!("one offset per operand")
+                    };
+                    let p = ReverseParams {
+                        rank: rank as u32,
+                        total: total as u32,
+                        in_off,
+                        out_off,
+                        scale_leading,
+                        dim_0: dims.first().copied().unwrap_or(1),
+                        _p0: 0,
+                        _p1: 0,
+                    };
+                    schedule.push(Step::Reverse {
+                        params: p,
+                        meta_idx,
+                    });
+                    let rk = reverse_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<ReverseParams>());
+                    let bg = dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("rlx-wgpu reverse bg"),
+                        layout: &rk.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: arena_bind_buf(&arena, base).0,
+                                    offset: arena_bind_buf(&arena, base).1,
+                                    size: {
+                                        let (b, l) = arena_bind_buf(&arena, base);
+                                        aligned_bind_size(size, l, b.size())
+                                    },
+                                }),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: u.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: meta_buffers[meta_idx].as_entire_binding(),
+                            },
+                        ],
+                    });
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                    continue;
+                }
+                // Host route. `Step::ReverseHost` derives its element width from
+                // the declared dtype, so it is correct only for a tensor the arena
+                // really stores at that width: complex (its slot is
+                // `elems * size_bytes` of interleaved lanes) and the four-byte
+                // reals keep this route; every other width is refused loudly.
+                let host_dtype = in_shape.dtype();
+                assert_whole_arena_host_route(
+                    &graph,
+                    &arena,
+                    node,
+                    "move the flip to the device route",
+                );
+                assert!(
+                    host_dtype.is_complex() || host_dtype.size_bytes() == 4,
+                    "rlx-wgpu: REFUSED (Reverse element width): the whole-arena host step moves \
+                     `size_bytes` per element of a {host_dtype:?} tensor, but the arena stores \
+                     real dtypes as one f32 lane per element, so the flip would move a different \
+                     number of bytes than it permutes. Either widen the operand or move the flip \
+                     to the device route."
+                );
                 schedule.push(Step::ReverseHost {
-                    src_byte_off: arena.offset(node.inputs[0]) as u32,
+                    src_byte_off: arena.offset(in_id) as u32,
                     dst_byte_off: arena.offset(node.id) as u32,
                     dims,
                     rev_mask,
-                    elem_bytes: in_shape.dtype().size_bytes() as u32,
+                    elem_bytes: host_dtype.size_bytes() as u32,
                 });
             }
             Op::ArgMax { axis, keep_dim: _ } | Op::ArgMin { axis, keep_dim: _ } => {

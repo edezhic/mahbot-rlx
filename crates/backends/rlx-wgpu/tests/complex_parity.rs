@@ -589,6 +589,8 @@ fn reverse_complex() {
     // C64[4] --reverse axis0--> [4]. Reverse is a host step that memcpy's
     // `elem_bytes` (=8 for C64) per element, so it's inherently lane-safe;
     // this gate pins that (a per-f32 flip would swap re/im across elements).
+    // Complex is exactly why this one still takes the host step: its element is
+    // two f32 lanes, while the device flip is a one-lane permutation.
     let c64 = [0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]; // 4 complex elems
     let op = Op::Reverse { axes: vec![0] };
     let cpu = cpu_op1_bytes(&[4], &[4], DType::C64, op.clone(), &c64_bytes(&c64));

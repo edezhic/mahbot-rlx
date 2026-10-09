@@ -4,8 +4,11 @@
 
 //! Host-side NCHW vision / RNN ops for wgpu arenas.
 //!
-//! Thin adapters over [`rlx_gpu_host`]. Native WGSL kernels remain a perf
-//! follow-up; this closes the correctness gap for SAM/U-Net-style graphs.
+//! Thin adapters over [`rlx_gpu_host`]. `LayerNorm2d` now has a native WGSL
+//! kernel (`kernels/layer_norm2d.wgsl`); `GroupNorm`, `Reverse` and the RNN ops
+//! here remain host adapters, reached on the routes that ask for the host step
+//! (a sharded arena, `RLX_WGPU_FORCE_HOST`, `RLX_WGPU_HOST_NORM` for the two
+//! norm families, a complex reversal).
 
 use crate::buffer::Arena;
 use crate::host_stage::WgpuArena;

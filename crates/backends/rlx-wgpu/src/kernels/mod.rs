@@ -63,6 +63,7 @@ pub const CONV3D_BWD_INPUT_WGSL: &str = include_str!("conv3d_backward_input.wgsl
 pub const CONV3D_BWD_WEIGHT_WGSL: &str = include_str!("conv3d_backward_weight.wgsl");
 pub const LAYERNORM_WGSL: &str = include_str!("layernorm.wgsl");
 pub const GROUP_NORM_WGSL: &str = include_str!("group_norm.wgsl");
+pub const LAYER_NORM2D_WGSL: &str = include_str!("layer_norm2d.wgsl");
 pub const RMS_NORM_BWD_WGSL: &str = include_str!("rms_norm_backward.wgsl");
 pub const LAYER_NORM_BWD_WGSL: &str = include_str!("layer_norm_backward.wgsl");
 pub const CUMSUM_BWD_WGSL: &str = include_str!("cumsum_backward.wgsl");
@@ -99,6 +100,7 @@ pub const ATTENTION_WGSL: &str = include_str!("attention.wgsl");
 pub const ATTENTION_BWD_WGSL: &str = include_str!("attention_bwd.wgsl");
 pub const ROPE_WGSL: &str = include_str!("rope.wgsl");
 pub const EXPAND_WGSL: &str = include_str!("expand.wgsl");
+pub const REVERSE_WGSL: &str = include_str!("reverse.wgsl");
 /// On-device ONNX ND indexing (GatherND / GatherElements / ScatterElements /
 /// ScatterND + the scatter prologue). Five entry points over one 3-binding
 /// layout: arena, `Params`, and the `meta` shape/stride buffer.
@@ -532,6 +534,21 @@ pub struct GroupNormParams {
     pub hw: u32,
     pub _pad0: u32,
     pub _pad1: u32,
+}
+
+/// Layout for the native NCHW `LayerNorm2d` kernel. Mirrors the WGSL `Params`;
+/// `positions = n * hw` (one workgroup per position). 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct LayerNorm2dParams {
+    pub positions: u32,
+    pub c: u32,
+    pub hw: u32,
+    pub in_off: u32,
+    pub out_off: u32,
+    pub gamma_off: u32,
+    pub beta_off: u32,
+    pub eps_bits: u32,
 }
 
 /// Layout for LayerNorm / RmsNorm.
@@ -1135,6 +1152,21 @@ pub struct ExpandParams {
     pub out_dim_0: u32,
     pub _p2: u32,
     pub _p3: u32,
+}
+
+/// Layout for Reverse. Mirrors the WGSL `Params`; per-axis dims/strides/flags
+/// ride in the meta storage buffer. `scale_leading` is the PLAN L1 flag. 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ReverseParams {
+    pub rank: u32,
+    pub total: u32,
+    pub in_off: u32,
+    pub out_off: u32,
+    pub scale_leading: u32,
+    pub dim_0: u32,
+    pub _p0: u32,
+    pub _p1: u32,
 }
 
 /// Layout for the two `quant_i8.wgsl` entry points.
@@ -2542,6 +2574,7 @@ static FAKE_QUANTIZE_FIXED: OnceLock<Kernel> = OnceLock::new();
 static FAKE_QUANTIZE_PERBATCH: OnceLock<Kernel> = OnceLock::new();
 static LAYERNORM: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM: OnceLock<Kernel> = OnceLock::new();
+static LAYER_NORM2D: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD_PARAM: OnceLock<Kernel> = OnceLock::new();
 static LAYER_NORM_BWD_INPUT: OnceLock<Kernel> = OnceLock::new();
@@ -2584,6 +2617,7 @@ static ATTENTION: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_BWD: OnceLock<Kernel> = OnceLock::new();
 static ROPE: OnceLock<Kernel> = OnceLock::new();
 static EXPAND: OnceLock<Kernel> = OnceLock::new();
+static REVERSE: OnceLock<Kernel> = OnceLock::new();
 static QUANTIZE_I8: OnceLock<Kernel> = OnceLock::new();
 static DEQUANTIZE_I8: OnceLock<Kernel> = OnceLock::new();
 static Q_MATMUL: OnceLock<Kernel> = OnceLock::new();
@@ -3264,6 +3298,16 @@ pub fn group_norm_kernel(device: &wgpu::Device) -> &'static Kernel {
     GROUP_NORM
         .get_or_init(|| build_kernel(device, "rlx-wgpu group_norm", GROUP_NORM_WGSL, "group_norm"))
 }
+pub fn layer_norm2d_kernel(device: &wgpu::Device) -> &'static Kernel {
+    LAYER_NORM2D.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu layer_norm2d",
+            LAYER_NORM2D_WGSL,
+            "layer_norm2d",
+        )
+    })
+}
 pub fn rms_norm_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
     RMS_NORM_BWD.get_or_init(|| {
         build_kernel(
@@ -3668,6 +3712,9 @@ pub fn rope_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn expand_kernel(device: &wgpu::Device) -> &'static Kernel {
     EXPAND.get_or_init(|| build_kernel_3(device, "rlx-wgpu expand", EXPAND_WGSL, "expand"))
+}
+pub fn reverse_kernel(device: &wgpu::Device) -> &'static Kernel {
+    REVERSE.get_or_init(|| build_kernel_3(device, "rlx-wgpu reverse", REVERSE_WGSL, "reverse"))
 }
 pub fn quantize_i8_kernel(device: &wgpu::Device) -> &'static Kernel {
     QUANTIZE_I8

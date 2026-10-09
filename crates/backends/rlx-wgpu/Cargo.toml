@@ -320,5 +320,21 @@ name = "unattributable_encoding_refused"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "vision_norm2d_adapter_agnostic"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "vision_norm2d_host_switch"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "vision_norm2d_parked_param"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "vision_norm2d_reverse_device"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "wgpu_fft_q_ingraph"
 required-features = ["backend-tests"]

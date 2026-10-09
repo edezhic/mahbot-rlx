@@ -158,9 +158,9 @@ fn device_lock() -> DeviceGuard {
 /// folding anything into a max-abs metric — an all-NaN output would otherwise
 /// fold to `0.0` and pass.
 ///
-/// `gguf_matmul_route.rs` (a separate wgpu test binary, so it cannot share this)
-/// carries the same count-before-fold rule in `parity_max_abs`; keep the two in
-/// step.
+/// `rlx-wgpu`'s `tests/common/mod.rs` (a different crate, so it cannot share this
+/// copy) carries the same count-before-fold rule in its `max_abs_diff`; keep the
+/// two in step.
 #[derive(Clone, Copy, Debug)]
 struct Finiteness {
     nan: usize,

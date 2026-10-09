@@ -102,9 +102,9 @@ fn set_params(c: &mut CompiledGraph, params: &[(String, Param)]) {
 /// folding anything into a max-abs metric — an all-NaN output would otherwise
 /// fold to `0.0` and pass.
 ///
-/// `gguf_matmul_route.rs` (a separate wgpu test binary, so it cannot share this)
-/// carries the same count-before-fold rule in `parity_max_abs`; keep the two in
-/// step.
+/// This binary keeps its own census because it also *reports* the counts;
+/// `tests/common/mod.rs` asserts the same rule before folding in `max_abs_diff`.
+/// Keep the two in step.
 #[derive(Clone, Copy, Debug)]
 struct Finiteness {
     nan: usize,

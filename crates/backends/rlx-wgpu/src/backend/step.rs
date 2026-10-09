@@ -15,13 +15,14 @@ use crate::kernels::{
     FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams,
     GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
     GatherBwdParams, GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams,
-    GruParams, Im2Col2dParams, IndexingNdParams, LayerNormBwdParams, LayerNormParams, LstmParams,
-    Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams,
-    Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QuantI8Params,
-    ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, SampleParams,
-    ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams, SceParams,
-    SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
-    WelchPeaksGpuParams, WhereParams,
+    GruParams, Im2Col2dParams, IndexingNdParams, LayerNorm2dParams, LayerNormBwdParams,
+    LayerNormParams, LstmParams, Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams,
+    MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams,
+    QConv2dParams, QMatMulParams, QuantI8Params, ReduceParams, ReverseParams, RmsNormBwdParams,
+    RnnParams, RopeBwdParams, RopeParams, SampleParams, ScaledGroupedMatmulParams,
+    ScaledLowpParams, ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams,
+    SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams,
+    WhereParams,
 };
 
 use super::helpers::{MatmulCompute, MatmulQkvKind};
@@ -171,6 +172,10 @@ pub(crate) enum Step {
     /// staging on backends where GPU norms are trusted).
     GroupNorm {
         params: GroupNormParams,
+    },
+    /// Native WGSL `Op::LayerNorm2d` (channels-first, NCHW).
+    LayerNorm2d {
+        params: LayerNorm2dParams,
     },
     Cumsum {
         params: CumsumParams,
@@ -553,6 +558,12 @@ pub(crate) enum Step {
     },
     Expand {
         params: ExpandParams,
+        meta_idx: usize,
+    },
+    /// Native WGSL `Op::Reverse` (per-axis flip), per-axis dims/strides/flags in
+    /// the meta storage buffer.
+    Reverse {
+        params: ReverseParams,
         meta_idx: usize,
     },
     /// Host broadcast when GPU Expand cannot cover the full output window
@@ -1223,6 +1234,11 @@ impl Step {
             | Step::SoftmaxCrossEntropyBackward { .. }
             | Step::LayerNorm { .. }
             | Step::GroupNorm { .. }
+            // LayerNorm2d: one workgroup per (batch, spatial) position and
+            // full-extent `plane` strides are baked at compile time; the step
+            // never scales, so it must not veto the whole-graph active-extent
+            // gate — same call as `Step::GroupNorm`.
+            | Step::LayerNorm2d { .. }
             | Step::FusedResidualLn { .. }
             | Step::FusedResidualLnTee { .. }
             | Step::FusedResidualRmsNorm { .. }
@@ -1395,6 +1411,11 @@ impl Step {
             // but must NOT veto the whole-graph active-extent gate — Bonsai-27B
             // has many such expands and was stuck computing full max_seq.
             Step::Expand { .. } => true,
+            // Reverse: the run path scales `total` exactly when
+            // `scale_leading == 1` (the bucket axis is not flipped) and stays
+            // full-extent otherwise — the same per-instance decision
+            // `Step::Expand` makes.
+            Step::Reverse { .. } => true,
             // Training backward ops: not used in inference; disable
             // active-extent fast path until individually audited.
             Step::RmsNormBackwardInput { .. }
@@ -1481,6 +1502,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::AttentionBackward { .. } => "attention_bwd",
         Step::Rope { .. } => "rope",
         Step::Expand { .. } => "expand",
+        Step::Reverse { .. } => "reverse",
         Step::ExpandHost { .. } => "expand_host",
         Step::Argmax { .. } => "argmax",
         Step::Pool2d { .. } => "pool2d",
@@ -1519,6 +1541,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ConvTranspose3d { .. } => "conv_transpose3d",
         Step::ConvTranspose3dHost { .. } => "conv_transpose3d_host",
         Step::GroupNorm { .. } => "group_norm",
+        Step::LayerNorm2d { .. } => "layer_norm2d",
         Step::GroupNormHost { .. } => "group_norm_host",
         Step::LayerNorm2dHost { .. } => "layer_norm2d_host",
         Step::ResizeNearest2xHost { .. } => "resize_nearest2x_host",

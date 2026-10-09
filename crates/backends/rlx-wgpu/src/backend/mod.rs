@@ -320,8 +320,9 @@ pub struct WgpuExecutable {
     /// so run() just writes new bytes per step.
     uniforms: Vec<wgpu::Buffer>,
     bind_groups: Vec<wgpu::BindGroup>,
-    /// Per-step metadata storage buffers (only Transpose uses them).
-    /// Indexed by `Step::Transpose.meta_idx`.
+    /// Per-step metadata storage buffers, for the steps that need per-axis
+    /// geometry their uniform cannot carry: `Transpose`, `Expand`, `IndexingNd`
+    /// and `Reverse`. Indexed by each step's `meta_idx`.
     meta_buffers: Vec<wgpu::Buffer>,
 
     // ── Lazy dynamic-shape state ─────────────────────────────────

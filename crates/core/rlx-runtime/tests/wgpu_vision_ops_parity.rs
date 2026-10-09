@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Cross-backend parity for the WGPU vision trio (`GroupNorm`, `LayerNorm2d`,
-//! `ResizeNearest2x`) added via host-staging. CPU is the reference.
+//! `ResizeNearest2x`). CPU is the reference.
 
 #![cfg(feature = "cpu")]
 #![allow(dead_code)]
