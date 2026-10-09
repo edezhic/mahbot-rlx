@@ -4,7 +4,8 @@
 
 //! The row-grouped GGUF GEMM against a weight parked in the backend's separate
 //! packed-weight buffer — the regime a model larger than the device's binding
-//! limit lands in.
+//! limit lands in — and, through the same hand-built arena, the one-row route's
+//! X-window alignment guard.
 //!
 //! The executable only takes that regime when the *plan* exceeds the binding
 //! limit: 4 GiB of packed weights on this hardware, which no test can afford to
@@ -19,7 +20,9 @@
 //! arena, i.e. the path the CPU-parity tests already cover.
 //!
 //! The second test repeats the exercise at the size the harness uses (777 MiB,
-//! four bind windows); it is `#[ignore]`d for the memory it needs.
+//! four bind windows); it is `#[ignore]`d for the memory it needs. The third is
+//! the alignment guard: the runner is handed an X window four bytes off its slot,
+//! which is the only way to reach it — the planner aligns every activation.
 
 use rlx_compile::memory::plan_memory_f32_uniform;
 use rlx_ir::quant::QuantScheme;
@@ -190,6 +193,85 @@ fn grouped_gemm_reads_a_parked_weight_from_the_weight_buffer() {
         );
     }
     rlx_ir::env::unset("RLX_WGPU_MAX_BIND_MB");
+}
+
+/// The one-row route's X-window guard, driven through the same runner as the
+/// executable uses: the tiled arm reads X as `vec4`, so a window that does not
+/// line up with a four-element group must go to the host instead. The reference
+/// is the same bytes read from an aligned window — the device arm — so an arm
+/// that read the misaligned window would take it shifted by up to three elements
+/// and not match.
+#[test]
+fn a_misaligned_x_window_is_not_read_as_vec4() {
+    let Some(dev) = wgpu_device() else {
+        eprintln!("skip: wgpu unavailable");
+        return;
+    };
+    let (k, n) = (256usize, 1024usize);
+    let w = packed(k, n);
+    // `+1 / -1` rather than a smooth ramp: an arm that reads the window one
+    // element off must show it here, and consecutive samples of a smooth input
+    // are too close for that.
+    let x: Vec<f32> = (0..k)
+        .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+        .collect();
+    let (g, x_in, w_id, y) = one_weight_graph(k, n, 1, w.len());
+    let arena = Arena::from_plan(&dev.device, &plan_memory_f32_uniform(&g, 16));
+    arena.write_bytes_range(&dev.queue, arena.offset(w_id), &w);
+    let (x_off, w_off, y_off) = (arena.offset(x_in), arena.offset(w_id), arena.offset(y));
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    // X four bytes past its slot: a 4-byte-aligned window of the same tensor.
+    let mis = x_off + 4;
+    assert!(
+        mis + x_bytes.len() <= arena.buffer.size() as usize,
+        "X's slot needs four spare bytes to shift its window"
+    );
+    arena.write_bytes_range(&dev.queue, mis, &x_bytes);
+    run_dequant_matmul_gguf_gemv_rows(
+        &arena,
+        &dev.device,
+        &dev.queue,
+        1,
+        k,
+        n,
+        gguf_scheme_id(QuantScheme::GgufQ4K),
+        mis,
+        w_off,
+        y_off,
+    );
+    let via_host = arena.read_f32(&dev.device, &dev.queue, y);
+
+    arena.write_bytes_range(&dev.queue, x_off, &x_bytes);
+    run_dequant_matmul_gguf_gemv_rows(
+        &arena,
+        &dev.device,
+        &dev.queue,
+        1,
+        k,
+        n,
+        gguf_scheme_id(QuantScheme::GgufQ4K),
+        x_off,
+        w_off,
+        y_off,
+    );
+    let on_device = arena.read_f32(&dev.device, &dev.queue, y);
+
+    assert!(
+        on_device.iter().any(|v| v.abs() > 1e-3),
+        "the aligned reference is all-zero"
+    );
+    let max_abs = via_host
+        .iter()
+        .zip(&on_device)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let scale = on_device.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    eprintln!("misaligned X window vs aligned: max_abs={max_abs:e} ref_scale={scale:e}");
+    assert!(
+        max_abs <= 1e-3,
+        "a misaligned X window must not be read as vec4: max_abs {max_abs}"
+    );
 }
 
 /// The same exercise at the size the harness uses — 202048 × 7168 Q4_K = 777 MiB

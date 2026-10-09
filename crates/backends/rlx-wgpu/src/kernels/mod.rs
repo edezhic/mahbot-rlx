@@ -2210,16 +2210,24 @@ fn build_kernel_3(
     Kernel { pipeline, bgl }
 }
 
-/// 4-binding layout: storage(ro) + uniform + storage(ro) + storage(rw).
+/// Binding layout: storage(ro) + uniform + storage(ro) + storage(rw) [+ one more
+/// storage(ro) when `x_vec4`].
 /// For the GGUF GEMV: x (ro arena window) + params + weight (ro arena window) +
 /// out (rw separate buffer). The arena is bound read-only twice (allowed), and
 /// the single read-write binding is a distinct buffer — sidestepping wgpu's
 /// "STORAGE_READ_WRITE is exclusive" rule for same-buffer aliasing.
+///
+/// `x_vec4` adds the one-row GEMV's fifth read-only binding: the same `x` window
+/// as binding 0, typed `array<vec4<f32>>` so the tiled arm reads a lane's 32
+/// contiguous X elements with 8 vector loads instead of 32 scalar ones. Both of
+/// that module's entry points get the layout (they share its declarations); only
+/// the tiled one reads through it.
 fn build_kernel_ro_u_ro_rw(
     device: &wgpu::Device,
     label: &'static str,
     wgsl: &str,
     entry_point: &'static str,
+    x_vec4: bool,
 ) -> Kernel {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
@@ -2230,38 +2238,48 @@ fn build_kernel_ro_u_ro_rw(
         has_dynamic_offset: false,
         min_binding_size: None,
     };
+    let mut entries = [
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: storage(true),
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: storage(true),
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 3,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: storage(false),
+            count: None,
+        },
+    ]
+    .to_vec();
+    if x_vec4 {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 4,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: storage(true),
+            count: None,
+        });
+    }
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(true),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(true),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: storage(false),
-                count: None,
-            },
-        ],
+        entries: &entries,
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
@@ -2663,6 +2681,7 @@ static DEQUANT_MATMUL: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_MATMUL_MLX: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GGUF: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMV_GGUF: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMV_GGUF_TILED: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q1_0: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q4K: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q6K: OnceLock<Kernel> = OnceLock::new();
@@ -3680,7 +3699,13 @@ pub fn gather_kernel(device: &wgpu::Device) -> &'static Kernel {
 /// table's bind window. See `build_kernel_ro_u_ro_rw`.
 pub fn gather_split_kernel(device: &wgpu::Device) -> &'static Kernel {
     GATHER_SPLIT.get_or_init(|| {
-        build_kernel_ro_u_ro_rw(device, "rlx-wgpu gather_split", GATHER_SPLIT_WGSL, "gather")
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu gather_split",
+            GATHER_SPLIT_WGSL,
+            "gather",
+            false,
+        )
     })
 }
 pub fn gather_axis_kernel(device: &wgpu::Device) -> &'static Kernel {
@@ -4036,6 +4061,20 @@ pub fn dequant_gemv_gguf_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu dequant_gemv_gguf",
             DEQUANT_GEMV_GGUF_WGSL,
             "dequant_gemv",
+            true,
+        )
+    })
+}
+/// The one-row Q4_K / Q6_K entry of `dequant_gemv_gguf.wgsl`: one workgroup per
+/// output column, the workgroup's threads splitting the contraction.
+pub fn dequant_gemv_gguf_tiled_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMV_GGUF_TILED.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemv_gguf_tiled",
+            DEQUANT_GEMV_GGUF_WGSL,
+            "dequant_gemv_tiled",
+            true,
         )
     })
 }
@@ -4046,6 +4085,7 @@ pub fn dequant_gemm_q1_0_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu dequant_gemm_q1_0",
             DEQUANT_GEMM_Q1_0_WGSL,
             "dequant_gemm_q1_0",
+            false,
         )
     })
 }
@@ -4057,6 +4097,7 @@ pub fn dequant_gemm_q4k_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu dequant_gemm_q4k",
             DEQUANT_GEMM_GGUF_WGSL,
             "dequant_gemm_q4k",
+            false,
         )
     })
 }
@@ -4068,6 +4109,7 @@ pub fn dequant_gemm_q6k_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu dequant_gemm_q6k",
             DEQUANT_GEMM_GGUF_WGSL,
             "dequant_gemm_q6k",
+            false,
         )
     })
 }

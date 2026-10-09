@@ -515,7 +515,7 @@ bytes (2 tensor inputs); non-GGUF schemes take separate scale/zp (4 inputs).
 > | **CPU** | — | block-wise fused matmul in `rlx-cpu` | — | always available |
 > | **Metal** | `dequant_gguf` MSL → MPS matmul | Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2_XXS/XS/S, IQ3_XXS/S, **IQ1_S/M** | Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4NL, Q4/5/8_K, **Q2/3/6_K** (`mul`+`sub`) | `RLX_METAL_DEQUANT_GPU_DISABLE=1`; TQ/MX without MSL branch |
 > | **CUDA / ROCm** | `dequant_gguf` → cuBLAS/rocBLAS | — | — | same disable flag pattern as Metal |
-> | **WGPU** | `dequant_gguf.wgsl` → `matmul_bt` when arena scratch fits; grouped MoE GPU when scratch fits | — | — | `gguf_host` when scratch exceeds `max_buffer_size` |
+> | **WGPU** | `dequant_gguf.wgsl` → `matmul_bt` when arena scratch fits; grouped MoE GPU when scratch fits | Q4_K, Q6_K at `m == 1` (one workgroup per output column, its lanes splitting the contraction); Q1_0 (one thread per column). At `m > 1` Q4_K/Q6_K take the row-grouped GEMM | — | `gguf_host` when scratch exceeds `max_buffer_size` |
 > | **ANE (CoreML)** | hybrid host segments for exotic schemes | — | see Metal ANE column; K with per-element scales use `[nb,32]` tensors | `RLX_COREML_HOST_DEQUANT=1` bakes full f32 weights |
 > | **TPU** | — | — | — | **compile-time** host dequant of `Constant` weights → f32 HLO dot; `Param` weights must be pre-baked |
 > | **MLX** | host dequant + cache | — | — | primary Apple path when MLX feature enabled |

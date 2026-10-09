@@ -4,7 +4,9 @@
 
 //! Which route a packed GGUF `DequantMatMul` took is readable from the backend
 //! (`gguf_gpu::route_counts`), and a weight window wider than the binding limit
-//! must be N-chunked rather than pushed onto the per-row path.
+//! must be N-chunked rather than pushed onto the per-row path. The one-row route
+//! is a single route with a shape of its own, which is readable the same way
+//! (`gguf_gpu::gemv_one_row_shape`).
 //!
 //! Its own test binary and a single test fn, so the process-global counters have
 //! no concurrent writers.
@@ -23,7 +25,10 @@ use common::max_abs_diff;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
-use rlx_wgpu::gguf_gpu::{DequantMatmulRoutes, reset_route_counts, route_counts};
+use rlx_wgpu::gguf_gpu::{
+    DequantMatmulRoutes, gemv_one_row_shape, reset_gemv_one_row_shape, reset_route_counts,
+    route_counts,
+};
 
 /// Packed `w` and its row-major `x` for one `DequantMatMul`.
 fn case(
@@ -210,7 +215,10 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             let aligned = k.is_multiple_of(scheme.gguf_block_size() as usize);
             let want = match (fused, m == 1, aligned) {
                 (false, ..) => (0, 0, 1, 0), // Q5_K / Q8_0: one scratch route at every m
-                (true, true, _) => (0, 1, 0, 0), // decode: the m==1 arm consults no k
+                // Decode takes one row per call so long as k is a multiple of
+                // four (the tiled arm's `vec4` X read); the block gate is the
+                // m > 1 GEMM's.
+                (true, true, _) => (0, 1, 0, 0),
                 (true, false, true) => (1, 0, 0, 0),
                 (true, false, false) => (0, 0, 0, 1), // host fallback: no slab booked, no row slicing
             };
@@ -375,6 +383,237 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
                 "two weights: op{i} {scheme:?} max_abs {max_abs} > 1e-2"
             );
         }
+    }
+
+    // The one-bit scheme's one-row arm: it keeps the scalar X view while the
+    // route's bind group also carries the tiled arm's fifth (`vec4` X) binding,
+    // so this is its route and parity at m == 1 — not a reshaped shape, which it
+    // deliberately does not have.
+    {
+        let (k, n) = (256usize, 640usize);
+        let (g, packed, x) = case(QuantScheme::GgufQ1_0, rlx_gguf::GgmlType::Q1_0, 1, k, n);
+        reset_route_counts();
+        reset_gemv_one_row_shape();
+        let gpu = run(Device::Gpu, g.clone(), &packed, &x);
+        let c = route_counts();
+        let shape = gemv_one_row_shape().expect("the one-row arm must record its shape");
+        let cpu = run(Device::Cpu, g, &packed, &x);
+        let max_abs = max_abs_diff(&gpu, &cpu);
+        eprintln!("GgufQ1_0 m=1 k={k} n={n}: routes={c:?} shape={shape:?} max_abs={max_abs:.6e}");
+        assert_eq!(
+            (c.per_row, c.q1_0_gemm),
+            (1, 0),
+            "Q1_0 m=1 must take the one-row arm, not the tiled GEMM: {c:?}"
+        );
+        assert_eq!(
+            (
+                shape.cols_per_workgroup,
+                shape.threads_per_workgroup,
+                shape.workgroups
+            ),
+            (64, 64, n.div_ceil(64) as u32),
+            "this arm keeps one thread per output column, 64 columns to a \
+             workgroup: {shape:?}"
+        );
+        assert!(max_abs <= 1e-2, "GgufQ1_0 m=1: max_abs {max_abs} > 1e-2");
+    }
+
+    // One row: the packed multiply's shape at the widths the model bodies use
+    // (H=1024 and I=6144 columns) and at the contraction lengths those
+    // projections have, in the 2-D `[1, k]` form and the 3-D `[1, 1, k]`
+    // single-token form those calls take. What is recorded is the arrangement
+    // actually used — one workgroup per output column with the workgroup's lanes
+    // splitting that column's contraction over its sub-blocks, and
+    // `workgroups x cols_per_workgroup` exactly the call's output width. That
+    // last equality is the "no tile row is computed and discarded" half; a change
+    // back to one unit of work per output column reading the weight byte-wise
+    // would move `cols_per_workgroup` to 64 and `workgroups` to `ceil(n/64)`.
+    for (scheme, ggml) in [
+        (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K),
+        (QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K),
+    ] {
+        for &(k, n, batches) in &[
+            (1024usize, 1024usize, &[&[][..], &[1][..]][..]),
+            (1024, 6144, &[&[][..], &[1][..]][..]),
+            // The down-projection's longer contraction: the split is over k, so
+            // this is the same shape with more work per column.
+            (4096, 1024, &[&[][..]][..]),
+        ] {
+            for &batch in batches {
+                let (g, packed, x) = case_batched(scheme, ggml, batch, 1, k, n);
+                reset_route_counts();
+                reset_gemv_one_row_shape();
+                let gpu = run(Device::Gpu, g.clone(), &packed, &x);
+                let counts = route_counts();
+                let shape = gemv_one_row_shape().expect("the one-row arm must record its shape");
+                eprintln!(
+                    "[rlx-gguf-gemv-shape] scheme={scheme:?} m=1 k={k} n={n} batch={batch:?} \
+                     cols_per_workgroup={} threads_per_workgroup={} workgroups={}",
+                    shape.cols_per_workgroup, shape.threads_per_workgroup, shape.workgroups
+                );
+                assert_eq!(
+                    (counts.per_row, counts.grouped),
+                    (1, 0),
+                    "{scheme:?} m=1 k={k} n={n} batch={batch:?}: {counts:?}"
+                );
+                assert_eq!(
+                    (
+                        shape.cols_per_workgroup,
+                        shape.threads_per_workgroup,
+                        shape.workgroups
+                    ),
+                    (1, 32, n as u32),
+                    "{scheme:?} k={k} n={n} batch={batch:?}: one row's work is its output \
+                     columns times its contraction — one workgroup per column, the \
+                     workgroup's threads splitting that column, no tile rows: {shape:?}"
+                );
+                let cpu = run(Device::Cpu, g, &packed, &x);
+                let max_abs = max_abs_diff(&gpu, &cpu);
+                eprintln!(
+                    "one-row shape {scheme:?} k={k} n={n} batch={batch:?}: max_abs={max_abs:.6e}"
+                );
+                assert!(
+                    max_abs <= 1e-2,
+                    "{scheme:?} k={k} n={n} batch={batch:?}: max_abs {max_abs} > 1e-2"
+                );
+            }
+        }
+    }
+
+    // Throughput at those shapes and beyond over repeated calls — a measurement
+    // for the record, not a threshold. One call's own submission and device wait
+    // swamp the streaming it does, which is why this is not a single call, and
+    // the best of a few rounds is reported rather than one round: at the narrower
+    // width the per-call floor is a large part of the figure, so the spread
+    // between rounds is real information about the shape, not noise to smooth
+    // away silently.
+    for (scheme, ggml) in [
+        (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K),
+        (QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K),
+    ] {
+        for (k, n, iters) in [
+            (1024usize, 1024usize, 200usize),
+            (1024, 6144, 200),
+            // Wider than the model widths (1024…6144 columns), where the arm
+            // must not get worse than the shape it replaced, with a shorter run
+            // so the cell stays cheap. n = 65536 also crosses the tiled arm's
+            // one-workgroup-per-column dispatch cap, so that figure carries the
+            // extra chunk dispatch the cell above pins.
+            (1024, 16384, 40),
+            (1024, 32768, 40),
+            (1024, 65536, 40),
+        ] {
+            let (g, packed, x) = case(scheme, ggml, 1, k, n);
+            let mut c = Session::new(Device::Gpu).compile(g);
+            c.set_param_typed("w", &packed, DType::U8);
+            let warm = c.run(&[("x", &x)]);
+            assert_eq!(warm[0].len(), n, "one row of {n} columns");
+            let mut best_us = f64::MAX;
+            for _ in 0..3 {
+                // `Tick`, not `Instant`: this measures sub-millisecond per-call
+                // work, and the tree mandates the tick at that scale.
+                let start = rlx_runtime::Tick::now();
+                for _ in 0..iters {
+                    let _ = c.run(&[("x", &x)]);
+                }
+                best_us = best_us.min(rlx_runtime::Tick::now().elapsed_us(start));
+            }
+            let streamed_mib = (packed.len() * iters) as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "[rlx-gguf-gemv-throughput] scheme={scheme:?} m=1 k={k} n={n} iters={iters} \
+                 streamed_MiB={streamed_mib:.1} best_ms={:.2} per_call_us={:.0} \
+                 streamed_MiB_per_s={:.0}",
+                best_us * 1e-3,
+                best_us / iters as f64,
+                streamed_mib / (best_us * 1e-6)
+            );
+        }
+    }
+
+    // The same arm when the weight window exceeds the binding limit: rows are
+    // N-chunked, so one call is several dispatches and the recorded one is the
+    // last chunk's — never wider than the width asked for, and never zero. The
+    // chunk stride is the share of the row indexing a wrong chunking would move,
+    // which is what the parity check against CPU pins.
+    {
+        let (k, n) = (256usize, 16384usize);
+        let (g, packed, x) = case(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 1, k, n);
+        rlx_ir::env::set("RLX_WGPU_MAX_BIND_MB", "1");
+        reset_route_counts();
+        reset_gemv_one_row_shape();
+        let gpu = run(Device::Gpu, g.clone(), &packed, &x);
+        let counts = route_counts();
+        let shape = gemv_one_row_shape().expect("the one-row arm must record its shape");
+        let cpu = run(Device::Cpu, g, &packed, &x);
+        rlx_ir::env::unset("RLX_WGPU_MAX_BIND_MB");
+        assert_eq!(
+            (counts.per_row, counts.grouped),
+            (1, 0),
+            "a 1 MiB window must still take the one-row arm: {counts:?}"
+        );
+        assert_eq!(
+            (shape.cols_per_workgroup, shape.threads_per_workgroup),
+            (1, 32),
+            "{shape:?}"
+        );
+        assert!(
+            shape.workgroups as usize > 0 && (shape.workgroups as usize) < n,
+            "the window must have been split into more than one chunk: {shape:?}"
+        );
+        let max_abs = max_abs_diff(&gpu, &cpu);
+        eprintln!(
+            "chunked one-row GgufQ4K m=1 k={k} n={n}: last-chunk workgroups={} max_abs={max_abs:.6e}",
+            shape.workgroups
+        );
+        assert!(
+            max_abs <= 1e-2,
+            "chunked one-row GgufQ4K k={k} n={n}: max_abs {max_abs} > 1e-2"
+        );
+    }
+
+    // The same arm when the output is wider than one dispatch dimension's cap:
+    // the tiled arm spends one workgroup per output column, and 65535 is the
+    // WebGPU floor for a dimension (`max_compute_workgroups_per_dimension`), so
+    // a wider output has to be another chunk of the same arm. Reaching it in one
+    // dispatch is a wgpu validation error rather than a slow path — this cell is
+    // what keeps that from coming back. The weight window is far under the
+    // binding limit, so the split is the cap's and nothing else's, and the chunk
+    // boundary is a fresh stride through the packed rows, which the CPU parity
+    // pins.
+    {
+        let (k, n) = (256usize, 65536usize);
+        let (g, packed, x) = case(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 1, k, n);
+        reset_route_counts();
+        reset_gemv_one_row_shape();
+        let gpu = run(Device::Gpu, g.clone(), &packed, &x);
+        let counts = route_counts();
+        let shape = gemv_one_row_shape().expect("the one-row arm must record its shape");
+        let cpu = run(Device::Cpu, g, &packed, &x);
+        assert_eq!(
+            (counts.per_row, counts.grouped),
+            (1, 0),
+            "an output over the dispatch cap must still take the one-row arm: {counts:?}"
+        );
+        assert_eq!(
+            (
+                shape.cols_per_workgroup,
+                shape.threads_per_workgroup,
+                shape.workgroups as usize
+            ),
+            (1, 32, n - 65535),
+            "the dispatch cap (the WebGPU floor for one dimension, \
+             max_compute_workgroups_per_dimension) must have split {n} columns \
+             into the cap plus a remainder: {shape:?}"
+        );
+        let max_abs = max_abs_diff(&gpu, &cpu);
+        eprintln!(
+            "capped one-row GgufQ4K m=1 k={k} n={n}: last-chunk workgroups={} max_abs={max_abs:.6e}",
+            shape.workgroups
+        );
+        assert!(
+            max_abs <= 1e-2,
+            "capped one-row GgufQ4K k={k} n={n}: max_abs {max_abs} > 1e-2"
+        );
     }
 
     // The grouped path's output slab is device memory the arena plan does not own,

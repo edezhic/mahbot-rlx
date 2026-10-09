@@ -78,8 +78,11 @@ kernels, pure Rust deps — no FFI, no submodules.
   CPU/Metal/MLX" diagnostic.
 - **GGUF dequant** — `kernels/dequant_gguf.wgsl`, `dequant_gemv_gguf.wgsl`,
   `dequant_gemm_gguf.wgsl` + `gguf_gpu.rs`: fused windowed kernels for
-  Q4_K/Q6_K/Q1_0 (scratch-free, shard-safe) — a per-row GEMV at `m == 1`, and
-  for `m > 1` Q4_K/Q6_K a row-grouped GEMM that reads each packed weight tile
+  Q4_K/Q6_K/Q1_0 (scratch-free, shard-safe). At `m == 1` Q4_K/Q6_K take a tiled
+  per-row GEMV arm (one workgroup per output column, its lanes splitting the
+  contraction, X read four elements at a time) while Q1_0 keeps one thread per
+  column on the scalar X view; for `m > 1` Q4_K/Q6_K a
+  row-grouped GEMM reads each packed weight tile
   once per group of 8 rows instead of once per row. Other schemes
   dequant into scratch then `matmul_bt` when the arena is a single buffer;
   sharded / split-weight arenas fall back to `gguf_host`. Grouped MoE GGUF

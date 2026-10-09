@@ -90,7 +90,7 @@ once per device context on Metal/CUDA/ROCm/WGPU.
 | **CPU** | — | block-wise fused matmul in `rlx-cpu::gguf_matmul` | — | always available |
 | **Metal** | `dequant_gguf.msl` → MPS sgemm | Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M | MIL `mul`+`sub` for K/IQ/TQ/MX (see ANE) | `RLX_METAL_DEQUANT_GPU_DISABLE=1` |
 | **CUDA / ROCm** | `dequant_gguf.cu` → BLAS | — | — | same disable pattern |
-| **WGPU** | `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | — | — | `gguf_host` when scratch exceeds limits |
+| **WGPU** | `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | Q4_K, Q6_K at `m == 1` (one workgroup per output column, its lanes splitting the contraction); Q1_0 (one thread per column). At `m > 1` Q4_K/Q6_K take the row-grouped GEMM | — | `gguf_host` when scratch exceeds limits |
 | **ANE (CoreML)** | hybrid host segments | — | MIL `mul` + optional `sub` | `RLX_COREML_HOST_DEQUANT=1` |
 | **TPU** | — | — | — | host dequant at HLO emit (`Constant`, `quant_param_bindings`, or runtime `set_param_typed` on deferred Param) |
 | **MLX** | Q1_0 on-device (`dequant_q1_0.metal`); other GGUF host dequant + cache | — | — | `RLX_MLX_GGUF_HOST_FALLBACK=1` / `RLX_MLX_Q1_HOST=1` |
@@ -175,6 +175,19 @@ Otherwise Q4_1+ fall through with wrong block stride.
 2. If scratch fits `max_buffer_size`, dispatch `dequant_gguf` then `matmul_bt`
    (or grouped MoE GPU path below).
 3. Otherwise fall back to `gguf_host` (CPU dequant + wgpu matmul).
+
+**Fused one-row GEMV (`m == 1`):** Q4_K / Q6_K take the `dequant_gemv_gguf.wgsl`
+`dequant_gemv_tiled` arm — one workgroup per output column, its lanes splitting
+the contraction, X read four elements at a time through a second binding, no f32
+scratch. Q1_0 takes the `dequant_gemv` arm (one thread per output column, the
+scalar X view). The tiled arm's `vec4` X read needs a window that lines up with a
+four-element group — true of every planned F32 activation, and a 4-byte-aligned
+view of one takes the host path instead of being read misaligned. Multi-row
+`m > 1` Q4_K / Q6_K stays on the row-grouped `dequant_gemm_gguf` kernels; the arm
+is picked by scheme rather than by row count, so when that grouped GEMM cannot
+encode a call (rows spread over shards, an X window over the binding limit) the
+same one-row arm serves it, one row at a time, with the per-row weight reuse
+unchanged.
 
 **Grouped MoE (`DequantGroupedMatmulGguf`):** when scratch fits, CUDA-style GPU
 path — host sort/unpermute, per-expert `dequant_gguf` + `matmul_bt` on sorted

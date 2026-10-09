@@ -6,19 +6,30 @@
 //! GPU GGUF dequant + wgpu matmul for `Op::DequantMatMul`.
 //!
 //! Preferred path: scratch-free windowed kernels for Q4_K / Q6_K / Q1_0
-//! (decode `m=1` and prefill `m>1`). For `m > 1` Q4_K / Q6_K uses the
-//! row-grouped GEMM (`encode_dequant_matmul_gguf_gemm_grouped`): one pass over
-//! each packed weight tile per group of 8 rows, instead of the per-row GEMV's
-//! one full pass over the weight per row. Older scratch+`matmul_bt` path still
-//! exists for schemes without a fused kernel.
+//! (decode `m=1` and prefill `m>1`). At `m == 1` Q4_K / Q6_K take the tiled
+//! one-row arm (`dequant_gemv_tiled`: one workgroup per output column, its
+//! threads splitting the contraction, X read four elements at a time); Q1_0
+//! keeps the original one-thread-per-column arm on the scalar X view. For
+//! `m > 1` Q4_K / Q6_K uses the row-grouped GEMM
+//! (`encode_dequant_matmul_gguf_gemm_grouped`): one pass over each packed weight
+//! tile per group of 8 rows, instead of the per-row GEMV's one full pass over
+//! the weight per row. Older scratch+`matmul_bt` path still exists for schemes
+//! without a fused kernel.
+//!
+//! The one-row arm is picked by *scheme*, not by row count, so it also serves
+//! the per-row fallback the grouped GEMM declines (rows spread over shards, an
+//! X window over the binding limit) — one row at a time, with each row's weight
+//! reuse unchanged.
 //!
 //! **Host fallback:** [`crate::gguf_host`] when the scheme is unsupported on GPU
-//! and no dequant scratch was reserved.
+//! and no dequant scratch was reserved, and for a call whose X window the tiled
+//! one-row arm cannot address ([`gemv_one_row_device_ok`]).
 //!
 //! **Grouped MoE:** [`run_dequant_grouped_matmul_gguf_gpu`] when scratch fits;
 //! otherwise [`crate::gguf_host::run_dequant_grouped_matmul_gguf`].
 //!
-//! **Which route a call took:** [`route_counts`].
+//! **Which route a call took:** [`route_counts`]. **What shape the one-row
+//! route took:** [`gemv_one_row_shape`].
 //!
 //! **Limits:** arena byte offsets are u32; IQ-family branches mirror Metal/CUDA
 //! but are not covered by dedicated WGPU parity tests yet.
@@ -34,17 +45,45 @@ use crate::gguf_host::scheme_from_id;
 use crate::kernels::{
     DequantGemmGgufParams, DequantGemmQ10Params, DequantGemvGgufParams, DequantGgufParams, Kernel,
     MatmulParams, dequant_gemm_q1_0_kernel, dequant_gemm_q4k_kernel, dequant_gemm_q6k_kernel,
-    dequant_gemv_gguf_kernel, dequant_gguf_kernel, matmul_bt_kernel,
+    dequant_gemv_gguf_kernel, dequant_gemv_gguf_tiled_kernel, dequant_gguf_kernel,
+    matmul_bt_kernel,
 };
 
 /// Schemes the fused decode GEMV ([`run_dequant_matmul_gguf_gemv`]) handles
-/// on-GPU without f32 scratch. Q4_K (0) + Q6_K (2) cover Llama Q4_K_M GGUFs
-/// (q/k/o/gate/up are Q4_K; v/down/embed are Q6_K). Q1_0 (24) is the prism-ml
-/// Bonsai-27B 1-bit scheme — scratch-free here avoids re-materializing the whole
-/// 27B to f32 every token (~200s/tok → fused) AND avoids the multi-GiB dequant
-/// scratch that blew wgpu's storage-buffer binding limit.
+/// on-GPU without f32 scratch — the union of its two one-row arms: the tiled
+/// arm's K-quants ([`gemv_tiled_supports_scheme`]) and Q1_0, which keeps the
+/// original shape. Q4_K (0) + Q6_K (2) cover Llama Q4_K_M GGUFs (q/k/o/gate/up
+/// are Q4_K; v/down/embed are Q6_K). Q1_0 (24) is the prism-ml Bonsai-27B 1-bit
+/// scheme — scratch-free here avoids re-materializing the whole 27B to f32 every
+/// token (~200s/tok → fused) AND avoids the multi-GiB dequant scratch that blew
+/// wgpu's storage-buffer binding limit.
 pub fn gemv_supports_scheme(scheme_id: u32) -> bool {
-    matches!(scheme_id, 0 | 2 | 24)
+    gemv_tiled_supports_scheme(scheme_id) || scheme_id == 24
+}
+
+/// The reshaped one-row arm of that GEMV (`dequant_gemv_tiled`): the K-quant
+/// schemes whose 256-element blocks split into 32-element sub-blocks, which is
+/// the element/byte mapping that arm is written against. The other arm is what
+/// is left of [`gemv_supports_scheme`] once these are taken out — Q1_0, whose
+/// 128-element blocks with 8-element sign bytes do not fit the tiled arm's
+/// sub-blocks and so keeps one thread per output column. Each arm's shader
+/// branches are tied to its routing by `tests/gguf_kernel_scheme_coverage.rs`.
+pub fn gemv_tiled_supports_scheme(scheme_id: u32) -> bool {
+    matches!(scheme_id, 0 | 2)
+}
+
+/// Whether the one-row route can run this call on the device.
+///
+/// The tiled arm reads X as `vec4` (8 vector loads per lane instead of 32 scalar
+/// ones), so the window's own offset and the row stride (`k` elements) must both
+/// line up with a four-element group. True at the shapes these schemes are used
+/// at — the arena aligns every tensor to 16 bytes and `k` is a multiple of 256 —
+/// and false for a view the route then hands to the host rather than reading X
+/// shifted. The grouped GEMM checks the same two things for its own `vec4` X
+/// reads. Pinned device-free by `tests/gguf_kernel_scheme_coverage.rs`.
+pub fn gemv_one_row_device_ok(scheme_id: u32, x_byte_off: usize, row_bytes: usize) -> bool {
+    !gemv_tiled_supports_scheme(scheme_id)
+        || (x_byte_off.is_multiple_of(16) && row_bytes.is_multiple_of(16))
 }
 
 /// Route a batched packed GGUF multiply can take.
@@ -160,6 +199,83 @@ pub fn reset_route_counts() {
 
 pub(crate) fn note_route(route: DequantMatmulRoute) {
     route.counter().fetch_add(1, Ordering::Relaxed);
+}
+
+/// Threads one workgroup of a one-row packed multiply runs, per arm: the tiled
+/// arm splits a column's contraction over 32 lanes (one lane per 32-element
+/// sub-block), the legacy arm gives each of its 64 threads one output column.
+///
+/// The shader's declared `@workgroup_size` and the shape the route records must
+/// both be these numbers: `tests/gguf_kernel_scheme_coverage.rs` pins the first
+/// (as literals, the constants being private), `tests/gguf_matmul_route.rs` the
+/// second.
+const GEMV_TILED_THREADS: u32 = 32;
+const GEMV_LEGACY_THREADS: u32 = 64;
+
+/// Most workgroups one dispatch may have along a dimension — the WebGPU floor
+/// (`max_compute_workgroups_per_dimension`), which every backend honours. Only
+/// the tiled one-row arm can reach it at one workgroup per output column.
+const GEMV_MAX_WORKGROUPS: usize = 65535;
+
+/// The shape the one-row packed multiply actually issued, recorded per call.
+///
+/// The one-row route (`DequantMatmulRoute::PerRow`) only says a call took it;
+/// this says what shape it took — output columns per workgroup, threads per
+/// workgroup, workgroups in the dispatch — which together say how one row's work
+/// was arranged. Always recorded, in-process, with no environment variable
+/// behind it, so a change that quietly returns the model-width shapes (1024…6144
+/// columns, one row) to one unit of work per output column reading the weight
+/// byte-wise, or to a tile with discarded rows, is visible in
+/// `tests/gguf_matmul_route.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GemvOneRowShape {
+    /// Output columns one workgroup serves. `1` on the tiled arm; `64` while the
+    /// arm is one thread per output column.
+    pub cols_per_workgroup: u32,
+    /// Threads one workgroup runs. On the tiled arm they split that column's
+    /// contraction; on the legacy arm each thread serves its own column.
+    pub threads_per_workgroup: u32,
+    /// Workgroups in the recorded dispatch — the last chunk's, when the call was
+    /// split.
+    pub workgroups: u32,
+}
+
+static ONE_ROW_COLS_PER_WG: AtomicU64 = AtomicU64::new(0);
+static ONE_ROW_THREADS: AtomicU64 = AtomicU64::new(0);
+static ONE_ROW_WORKGROUPS: AtomicU64 = AtomicU64::new(0);
+
+/// Shape of the last one-row packed multiply this process issued, `None` before
+/// the first one. Read after a run (or [`reset_gemv_one_row_shape`] first to
+/// bracket a single call).
+pub fn gemv_one_row_shape() -> Option<GemvOneRowShape> {
+    let threads = ONE_ROW_THREADS.load(Ordering::Relaxed);
+    if threads == 0 {
+        return None;
+    }
+    Some(GemvOneRowShape {
+        cols_per_workgroup: ONE_ROW_COLS_PER_WG.load(Ordering::Relaxed) as u32,
+        threads_per_workgroup: threads as u32,
+        workgroups: ONE_ROW_WORKGROUPS.load(Ordering::Relaxed) as u32,
+    })
+}
+
+/// Forget [`gemv_one_row_shape`] (tests bracketing a single call).
+pub fn reset_gemv_one_row_shape() {
+    ONE_ROW_COLS_PER_WG.store(0, Ordering::Relaxed);
+    ONE_ROW_THREADS.store(0, Ordering::Relaxed);
+    ONE_ROW_WORKGROUPS.store(0, Ordering::Relaxed);
+}
+
+/// Record what one one-row dispatch was shaped like. `cols_per_workgroup` is how
+/// many output columns a workgroup covers, so on the tiled arm
+/// `workgroups * cols_per_workgroup` is exactly the output width dispatched — a
+/// tile with rows nothing reads would make it larger. (The legacy arm's last
+/// workgroup rounds up to 64 columns, so there the product can exceed the width
+/// by under 64; that is rounding, not a discarded tile.)
+fn note_gemv_one_row_shape(cols_per_workgroup: u32, threads_per_workgroup: u32, workgroups: u32) {
+    ONE_ROW_COLS_PER_WG.store(cols_per_workgroup as u64, Ordering::Relaxed);
+    ONE_ROW_THREADS.store(threads_per_workgroup as u64, Ordering::Relaxed);
+    ONE_ROW_WORKGROUPS.store(workgroups as u64, Ordering::Relaxed);
 }
 
 /// Scheme ids the WGSL `dequant_gguf` kernel actually has a branch for.
@@ -518,6 +634,11 @@ fn with_pooled_out_buf<R>(
 /// row-grouped K-quant GEMMs first, then the per-row GEMV loop. Uniforms are
 /// unique per dispatch (`queue.write_buffer` is not ordered inside an encoder
 /// the way copies are).
+///
+/// The per-row loop's tiled arm reads X as `vec4`, so X's window must be
+/// four-element addressable. [`run_dequant_matmul_gguf_gemv_rows`] — the route
+/// the executable takes — checks that with [`gemv_one_row_device_ok`] before
+/// calling here; a direct caller has to make sure of it itself.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_dequant_matmul_gguf_into(
     arena: &Arena,
@@ -602,6 +723,10 @@ pub fn encode_dequant_matmul_gguf_into(
 /// * Q1_0 + `m > 1` → tiled GEMM (Metal `q1_0_mm_f32` parity) — one dispatch,
 ///   unless `RLX_WGPU_Q1_0_GEMM_DISABLE=1` or X spans shards.
 /// * Otherwise → per-row GEMV encoded into one command buffer (one submit).
+///
+/// An X window the tiled arm's `vec4` read cannot address sends the whole call
+/// to [`crate::gguf_host`] — this is the route that reaches that arm, so the
+/// check belongs here rather than at any one of its callers.
 #[allow(clippy::too_many_arguments)]
 pub fn run_dequant_matmul_gguf_gemv_rows(
     arena: &Arena,
@@ -615,6 +740,22 @@ pub fn run_dequant_matmul_gguf_gemv_rows(
     w_byte_off: usize,
     out_byte_off: usize,
 ) {
+    if !gemv_one_row_device_ok(scheme_id, x_byte_off, k * 4) {
+        note_route(DequantMatmulRoute::Host);
+        crate::gguf_host::run_dequant_matmul_gguf(
+            arena,
+            device,
+            queue,
+            m,
+            k,
+            n,
+            scheme_id,
+            x_byte_off,
+            w_byte_off,
+            out_byte_off,
+        );
+        return;
+    }
     let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("rlx-wgpu dequant_gguf rows"),
     });
@@ -876,9 +1017,11 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
     if x_size > max_bind {
         return false;
     }
-    // The kernel reads X as `vec4`, so the window base and the row stride must
-    // be 16-byte aligned. Always true for a planned F32 activation (16-byte
-    // arena alignment, k a multiple of 256); a 4-byte-aligned view falls back.
+    // The kernel reads X as `vec4`: with `x_base` = `x0` rounded down to
+    // [`STORAGE_ALIGN`] (256, a multiple of 16), `x0 - x_base` is a multiple of
+    // 16 exactly when `x0` is. That is this encoder's precondition — enforced on
+    // the route by [`gemv_one_row_device_ok`], and documented on the public entry
+    // [`encode_dequant_matmul_gguf_into`] for a direct caller.
     if !(x0 - x_base).is_multiple_of(16) {
         return false;
     }
@@ -1032,8 +1175,10 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
 /// the arena cannot also be bound read-write in the same dispatch (wgpu treats
 /// STORAGE_READ_WRITE as exclusive) — which is then copied back into the arena.
 ///
-/// Caller guarantees [`gemv_supports_scheme`]. Prefer
-/// [`run_dequant_matmul_gguf_gemv_rows`] when `m > 1` (this helper is m=1 only).
+/// Caller guarantees [`gemv_supports_scheme`]. This is the `m == 1` form of
+/// [`run_dequant_matmul_gguf_gemv_rows`] — the entry the executable calls — and
+/// delegates to it rather than encoding the row itself, so the route's X-window
+/// guard covers both.
 #[allow(clippy::too_many_arguments)]
 pub fn run_dequant_matmul_gguf_gemv(
     arena: &Arena,
@@ -1046,14 +1191,11 @@ pub fn run_dequant_matmul_gguf_gemv(
     w_byte_off: usize,
     out_byte_off: usize,
 ) {
-    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("rlx-wgpu dequant_gemv_gguf"),
-    });
-    encode_dequant_matmul_gguf_gemv_one(
+    run_dequant_matmul_gguf_gemv_rows(
         arena,
         device,
         queue,
-        &mut enc,
+        1,
         k,
         n,
         scheme_id,
@@ -1061,7 +1203,6 @@ pub fn run_dequant_matmul_gguf_gemv(
         w_byte_off,
         out_byte_off,
     );
-    queue.submit(std::iter::once(enc.finish()));
 }
 
 fn encode_dequant_matmul_gguf_gemv_one(
@@ -1105,14 +1246,29 @@ fn encode_dequant_matmul_gguf_gemv_one(
         x_size <= max_bind,
         "rlx-wgpu gguf gemv: x window {x_size} > max_bind {max_bind}"
     );
+    // Two arms, one route: the tiled arm gives each output column a whole
+    // workgroup (`cols_per_workgroup == 1`); the original gives one thread per
+    // column, 64 columns to a workgroup. Which one ran is recorded — see
+    // [`gemv_one_row_shape`].
+    let tiled = gemv_tiled_supports_scheme(scheme_id);
     // Rows per chunk from the window budget; at least one, so a single row
-    // wider than the whole budget still makes progress.
+    // wider than the whole budget still makes progress. The tiled arm also
+    // spends one workgroup per output column, and a dispatch dimension is capped
+    // (65535 on every backend, WebGPU's guaranteed floor), so an output wider
+    // than that is split too — the same arm, one more chunk.
     let budget = gguf_window_budget(max_bind).max(row_bytes);
-    let rows_per_chunk = ((budget / row_bytes.max(1)) as usize).max(1);
+    let mut rows_per_chunk = ((budget / row_bytes.max(1)) as usize).max(1);
+    if tiled {
+        rows_per_chunk = rows_per_chunk.min(GEMV_MAX_WORKGROUPS);
+    }
 
     let out_bytes = ((n * 4).max(4) as u64).div_ceil(16) * 16;
     with_pooled_out_buf(device, out_bytes, |out_buf| {
-        let dk = dequant_gemv_gguf_kernel(device);
+        let dk = if tiled {
+            dequant_gemv_gguf_tiled_kernel(device)
+        } else {
+            dequant_gemv_gguf_kernel(device)
+        };
         let mut n0 = 0usize;
         while n0 < n {
             let n_chunk = (n - n0).min(rows_per_chunk);
@@ -1172,6 +1328,16 @@ fn encode_dequant_matmul_gguf_gemv_one(
                         binding: 3,
                         resource: out_buf.as_entire_binding(),
                     },
+                    // The same X window as binding 0, read as `vec4` by the tiled
+                    // arm — see that shader's binding declaration.
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: x_buf,
+                            offset: x_local,
+                            size: wgpu::BufferSize::new(x_size),
+                        }),
+                    },
                 ],
             });
 
@@ -1182,7 +1348,16 @@ fn encode_dequant_matmul_gguf_gemv_one(
                 });
                 pass.set_pipeline(&dk.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.dispatch_workgroups((n_chunk as u32).div_ceil(64), 1, 1);
+                if tiled {
+                    // One workgroup per output column of the chunk.
+                    note_gemv_one_row_shape(1, GEMV_TILED_THREADS, n_chunk as u32);
+                    pass.dispatch_workgroups(n_chunk as u32, 1, 1);
+                } else {
+                    // One thread per output column, 64 columns per workgroup.
+                    let workgroups = (n_chunk as u32).div_ceil(GEMV_LEGACY_THREADS);
+                    note_gemv_one_row_shape(GEMV_LEGACY_THREADS, GEMV_LEGACY_THREADS, workgroups);
+                    pass.dispatch_workgroups(workgroups, 1, 1);
+                }
             }
             n0 += n_chunk;
         }

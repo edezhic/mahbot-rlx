@@ -35,15 +35,16 @@
 //
 // The dequant is the GEMV's, element for element and in the same k order; the
 // accumulation is not — each thread keeps four vec4<f32> lanes per row and adds
-// them horizontally at the store (`dot4`), where the GEMV sums scalars in k
-// order, so round-off differs. The measured CPU-reference parity is the real
-// justification: max-abs 1.9e-5 .. 6.5e-4 over the prefill-parity shapes,
-// against the 1e-2 this op is compared at.
+// them horizontally at the store (`dot4`), where the one-row arms sum in their
+// own orders (the tiled arm reduces lane partials in a fixed tree), so round-off
+// differs. The measured CPU-reference parity is the real justification: max-abs
+// 1.9e-5 .. 6.5e-4 over the prefill-parity shapes, against the 1e-2 this op is
+// compared at.
 //
 // The dequant helpers (`read_w`, `read_w_i8`, `dq_read_f16`,
-// `dq_get_scale_min_k4`) are copied from the `dequant_gemv` entry of
-// `dequant_gemv_gguf.wgsl` in the same k order, rewritten to build one `vec4`
-// per 4 weights. They are the third copy of the Q4_K/Q6_K packing in this
+// `dq_get_scale_min_k4`) are copied from the one-row K-quant arm
+// (`dequant_gemv_tiled`) of `dequant_gemv_gguf.wgsl`, rewritten to build one
+// `vec4` per 4 weights. They are the third copy of the Q4_K/Q6_K packing in this
 // directory (`dequant_gguf.wgsl`, `dequant_gemv_gguf.wgsl`): a fix to the
 // nibble or scale/min layout has to land in all three.
 
@@ -158,8 +159,9 @@ fn dequant_gemm_q4k(
             let m0 = dmin * f32(sm0.y);
             let d1 = d * f32(sm1.x);
             let m1 = dmin * f32(sm1.y);
-            // Two separate nibble passes, low half fully before high half, so the
-            // accumulation order matches `dequant_gemv_gguf.wgsl` (k ascending).
+            // Two separate nibble passes, low half fully before high half, so a
+            // sub-block's elements land in the same k positions here and in the
+            // one-row arms' dequant.
             for (var l: u32 = 0u; l < 32u; l = l + 4u) {
                 var ww = vec4<f32>(0.0);
                 ww.x = d0 * f32(read_w(qs_rel + is + l) & 0x0Fu) - m0;

@@ -327,7 +327,8 @@ const ROUTE_HOST: &str = "host dequant (k is not a whole number of GGUF blocks, 
 /// same ladder so each cell can print which route it *should* have taken.
 ///
 /// The selector is `use_gemv = m == 1 || scheme == Q1_0` FIRST and the `k` gate
-/// only after it, so `m == 1` takes the fused path at any `k` — the `k % block`
+/// only after it, so `m == 1` takes the fused path whenever the X window is
+/// four-element addressable (the tiled arm's `vec4` read) — the `k % block`
 /// requirement belongs to the `m > 1` arm alone, and printing it on the decode
 /// cells would claim a gate the encoder never consults.
 ///
@@ -374,7 +375,9 @@ fn wgpu_route(scheme: QuantScheme, m: usize, k: usize, arena_scratch_reserved: b
         // (row-grouped GEMM) — the latter only when k is a whole number of
         // 256-element blocks.
         QuantScheme::GgufQ4K | QuantScheme::GgufQ6K if m == 1 => {
-            format!("{ROUTE_PER_ROW}; {blocks}; the m==1 arm consults no k")
+            format!(
+                "{ROUTE_PER_ROW}; {blocks}; one row per call, for a k that is a multiple of four"
+            )
         }
         QuantScheme::GgufQ4K | QuantScheme::GgufQ6K if aligned => {
             format!("{ROUTE_GROUPED}; {blocks}; k%256==0")
