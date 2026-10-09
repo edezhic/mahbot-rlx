@@ -229,6 +229,13 @@ pub(crate) enum Step {
     /// ScanBackward / ScanBackwardXs via arena readback + shared [`HostOpDesc`].
     HostOp {
         desc: rlx_cpu::thunk::HostOpDesc,
+        /// One flag per `desc.inputs` entry, in that order: whether that operand is a
+        /// *parameter's* storage, by the graph. The run-time operand-fit net judges only
+        /// the operands flagged here — the arena's record is keyed by byte offset alone, so
+        /// only the graph can say which operands are its to judge
+        /// (`crate::buffer::first_unstageable_operand`). Every other host step's
+        /// `param_operand(s)` field means the same.
+        param_operands: Vec<bool>,
     },
     /// Native CPU ScatterNd / ScatterElements / GatherNd / GatherElements
     /// via span readback (correct for `I64` indices; no mini-graph rebuild).
@@ -475,6 +482,9 @@ pub(crate) enum Step {
         in_dims: Vec<u32>,
         out_dims: Vec<u32>,
         in_strides: Vec<usize>,
+        /// Whether the operand read (`in_byte_off`) is a parameter's storage — see
+        /// [`Step::HostOp`]'s `param_operands`.
+        param_operand: bool,
     },
     /// Host slice for a virtual arena whose source and destination straddle
     /// storage binding windows.
@@ -486,6 +496,9 @@ pub(crate) enum Step {
         axis_in_size: u32,
         start: u32,
         axis_out_size: u32,
+        /// Whether the operand read (`in_byte_off`) is a parameter's storage — see
+        /// [`Step::HostOp`]'s `param_operands`.
+        param_operand: bool,
     },
     Narrow {
         params: NarrowConcatParams,
@@ -503,6 +516,9 @@ pub(crate) enum Step {
         total_axis: u32,
         /// `(src_byte_off, axis_len, numel)` per input.
         inputs: Vec<(usize, u32, u32)>,
+        /// One flag per `inputs` entry, in that order — see [`Step::HostOp`]'s
+        /// `param_operands`.
+        param_operands: Vec<bool>,
     },
     /// Host-merge selected Concat pieces into an output that other inputs already
     /// filled via GPU Concat (cross-shard leftovers).
@@ -514,6 +530,9 @@ pub(crate) enum Step {
         inputs: Vec<(usize, u32, u32)>,
         /// Axis start position for each entry in `inputs`.
         starts: Vec<u32>,
+        /// One flag per `inputs` entry, in that order — see [`Step::HostOp`]'s
+        /// `param_operands`.
+        param_operands: Vec<bool>,
     },
     Gather {
         params: GatherParams,
@@ -543,6 +562,9 @@ pub(crate) enum Step {
         out_byte_off: usize,
         in_dims: Vec<u32>,
         out_dims: Vec<u32>,
+        /// Whether the operand read (`in_byte_off`) is a parameter's storage — see
+        /// [`Step::HostOp`]'s `param_operands`.
+        param_operand: bool,
     },
     Argmax {
         params: ArgmaxParams,

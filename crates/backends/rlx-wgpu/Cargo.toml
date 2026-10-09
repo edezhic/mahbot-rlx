@@ -120,6 +120,10 @@ name = "ceiling_bind_net"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "ceiling_carry_rnn_narrow_parked"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "ceiling_carry_rnn_parked"
 required-features = ["backend-tests"]
 
@@ -309,6 +313,10 @@ required-features = ["backend-tests"]
 
 [[test]]
 name = "subgroup_probe"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "unattributable_encoding_refused"
 required-features = ["backend-tests"]
 
 [[test]]

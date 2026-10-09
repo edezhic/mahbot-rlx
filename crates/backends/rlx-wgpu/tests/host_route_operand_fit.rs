@@ -9,7 +9,8 @@
 //! GPU kernel, a non-contiguous reduce, a non-last-axis softmax — get no plan-time
 //! check. `scan_host::assert_host_reads_fit` is the net for those: it refuses an
 //! operand whose storage the read would run past, judged on the slot the plan gave
-//! that storage, and leaves activations (one f32 lane per element) alone.
+//! that storage — and only where the graph says the operand is a parameter's, since its
+//! record is keyed by a byte offset an activation can share with a released slot.
 //!
 //! The interesting geometry needs no ceiling lever: an `F16` parameter in the ordinary
 //! unsplit arena keeps a two-byte-per-element slot, while both the typed upload and the

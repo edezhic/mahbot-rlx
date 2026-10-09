@@ -315,8 +315,8 @@ pub(crate) fn is_parameter_storage(graph: &Graph, id: NodeId) -> bool {
 /// arena that was never recorded answers `None` for *every* offset, and there an operand
 /// would read as an activation and be measured against nothing. Refusing is the safe
 /// default for a decision the arena cannot answer, and it is the one this function makes
-/// where the shared walk ([`first_unstageable_operand`]) cannot: it has the graph, and the
-/// walk has only the offsets.
+/// where the shared walk ([`first_unstageable_parameter_operand`]) cannot: that walk reads
+/// an offset the record does not name as a fit, and this refuses it.
 ///
 /// Pure — the graph the check already holds and the arena's map — so it is pinned without
 /// a device: `an_unrecorded_parameter_is_not_an_activation`.
@@ -334,6 +334,13 @@ pub(crate) fn first_unrecorded_parameter(
 /// What a *parameter's* storage holds from a byte offset on: the bytes a staged read of
 /// an operand there has to fit, and the encoding that parameter was declared with, where
 /// the record can attribute one to that offset.
+///
+/// The key is the byte offset alone, so the entry cannot say whether a read there is the
+/// parameter's: an offset a parameter's storage starts at is also where a released slot a
+/// later plan put to other use can begin. A caller must know the operand *is* a
+/// parameter's storage — the graph at plan time
+/// ([`first_unstageable_parameter_operand`]), the carried flag at run time
+/// ([`first_unstageable_operand`]) — before asking the record about it.
 ///
 /// The encoding is here because the structural host steps carry element counts rather
 /// than shapes (`scan_host::assert_read_fits`), so the refusal they raise cannot read the
@@ -524,26 +531,65 @@ pub(crate) fn unstageable_reason(
     (slot_bytes < read).then_some(Unstageable::SlotTooNarrow)
 }
 
-/// The first operand among `operands` the generic host route cannot stage, with the
-/// reason — `operands` yields `(payload, byte offset, dtype, elements)`, and both the
-/// payload and the offset come back so the caller can name the offender in its own terms
-/// (a node id at plan time; nothing at all at run time, where the offset is the name).
-/// `None` when every read fits, and for every operand whose storage is not a parameter's:
-/// an activation's slot holds one f32 lane per element by construction.
+/// `unstageable_reason`'s question about one operand whose storage the record bounds at
+/// `off`, or `None` when the record names no parameter's storage there.
+fn unstageable_at(
+    record: &HashMap<usize, ParamStorage>,
+    off: usize,
+    dt: rlx_ir::DType,
+    ne: usize,
+) -> Option<Unstageable> {
+    let slot = record.get(&off)?.bytes;
+    unstageable_reason(dt, ne, slot)
+}
+
+/// The first operand the plan-time route check must judge: the first that is a
+/// parameter's storage — or a view of one, by the graph — whose staged read the
+/// record cannot bound, or `None` when every such operand fits. `operands` yields
+/// `(node id, byte offset, dtype, elements)`.
 ///
-/// The one walk both checkers use, asking one bound: the arena's record of where a
-/// parameter's storage is and how much of it is there ([`Arena::param_storage_at`], filled
-/// by `Arena::record_param_storage`) — so the plan-time check
-/// (`lower::assert_host_route_stageable`) and the check at the route's staging point
-/// (`scan_host::assert_host_reads_fit`) cannot drift apart.
-pub(crate) fn first_unstageable_operand<T>(
-    arena: &Arena,
-    operands: impl IntoIterator<Item = (T, usize, rlx_ir::DType, usize)>,
-) -> Option<(T, usize, rlx_ir::DType, Unstageable)> {
-    operands.into_iter().find_map(|(payload, off, dt, ne)| {
-        let slot = arena.param_storage_at(off)?.bytes;
-        Some((payload, off, dt, unstageable_reason(dt, ne, slot)?))
-    })
+/// The graph is what lets this walk ask the record without a carried verdict: the
+/// record is keyed by byte offset alone, so an operand that is neither a parameter nor
+/// a view of one — an activation a later plan put on a released slot, say — would
+/// otherwise be judged against a bound that is not about it. Skipping one hides no
+/// overrun: these plans size every non-parameter node at one f32 lane per element, so
+/// an activation's staged read always fits.
+pub(crate) fn first_unstageable_parameter_operand(
+    graph: &Graph,
+    record: &HashMap<usize, ParamStorage>,
+    operands: impl IntoIterator<Item = (NodeId, usize, rlx_ir::DType, usize)>,
+) -> Option<(NodeId, usize, rlx_ir::DType, Unstageable)> {
+    operands
+        .into_iter()
+        .filter(|&(id, _, _, _)| is_parameter_storage(graph, id))
+        .find_map(|(id, off, dt, ne)| Some((id, off, dt, unstageable_at(record, off, dt, ne)?)))
+}
+
+/// The same walk at the route's own staging point, where the graph is not at hand:
+/// `param_operands[k]` is whether the graph called operand `k` a parameter's storage,
+/// recorded when the step was emitted (`lower::host_op_step` and the structural host
+/// arms). An operand the graph did not is not judged, so the two walks reach the same
+/// verdict. `operands` yields `(byte offset, dtype, elements)` — one entry per flag, a
+/// count that is asserted rather than quietly truncated.
+pub(crate) fn first_unstageable_operand<I>(
+    record: &HashMap<usize, ParamStorage>,
+    param_operands: &[bool],
+    operands: I,
+) -> Option<(usize, rlx_ir::DType, Unstageable)>
+where
+    I: IntoIterator<Item = (usize, rlx_ir::DType, usize)>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let operands = operands.into_iter();
+    assert_eq!(
+        operands.len(),
+        param_operands.len(),
+        "one param_operands flag per judged operand"
+    );
+    operands
+        .enumerate()
+        .filter(|&(k, _)| param_operands[k])
+        .find_map(|(_, (off, dt, ne))| Some((off, dt, unstageable_at(record, off, dt, ne)?)))
 }
 
 /// Where an operand's storage lives, for a refusal message.
@@ -2083,18 +2129,24 @@ impl Arena {
     }
 
     /// What a *parameter's* storage holds from `off` on — its bytes, and the encoding that
-    /// parameter was declared with — or `None` when no parameter's storage starts there: an
-    /// activation's slot holds one f32 lane per element by construction, so a staged read of
-    /// it always fits and needs no bound.
+    /// parameter was declared with — or `None` when the record names no parameter's storage
+    /// starting there.
+    ///
+    /// `None` is not "this is an activation": the record is keyed by byte offset alone, so
+    /// it answers about a parameter's storage only where the caller already knows the
+    /// operand is one ([`first_unstageable_parameter_operand`] holds the graph that says so;
+    /// [`first_unstageable_operand`] the flag a step carried). An activation the planner put
+    /// on a released slot starts where a parameter's storage did, and this answers for that
+    /// offset all the same.
     ///
     /// The encoding is `None` as well where two parameters' storages reach the offset and the
     /// record cannot say which of them a read there reads ([`ParamStorage::dtype`]).
     ///
-    /// `None` is also what an arena that was never recorded answers, and that reads as
-    /// "no parameter here": the recording is an obligation of whoever builds the arena
-    /// ([`Self::record_param_storage`]), and both constructions the compile path uses
-    /// honour it. The plan-time check does not lean on that silence — a `Param` operand
-    /// with no record is refused rather than read (`lower::assert_host_route_stageable`).
+    /// `None` is also what an arena that was never recorded answers. The recording is an
+    /// obligation of whoever builds the arena ([`Self::record_param_storage`]), and both
+    /// constructions the compile path uses honour it. The plan-time check does not lean on
+    /// that silence for an operand it knows is a parameter's — a `Param` operand with no
+    /// record is refused rather than read (`lower::assert_host_route_stageable`).
     pub(crate) fn param_storage_at(&self, off: usize) -> Option<ParamStorage> {
         self.param_slots.get(&off).copied()
     }
@@ -3053,6 +3105,61 @@ mod operand_stageability_tests {
         assert_eq!(
             first_unrecorded_parameter(&g, &partial, &operands),
             Some((view, 264))
+        );
+    }
+
+    /// An operand that is not a parameter's storage is not judged against one. The record
+    /// is keyed by offset alone, so a plan that puts a released slot to another use places
+    /// an activation's bytes where a parameter's storage starts; asking there would refuse
+    /// a read the route computes correctly. The parameter's own operand, same offset, is
+    /// still judged — and still refused while its slot is narrower than the read.
+    #[test]
+    fn an_activation_at_a_parameters_offset_is_not_judged_against_it() {
+        let mut g = Graph::new("activation-on-a-released-slot");
+        let p = g.param("p", rlx_ir::Shape::new(&[8], DType::F16));
+        let x = g.input("x", rlx_ir::Shape::new(&[16], DType::F32));
+        g.set_outputs(vec![p, x]);
+        // The parameter's storage starts here, and holds its native two bytes per element.
+        let record = record(&[(256, 16)]);
+        // Both operands sit at that offset: the parameter, and the activation the planner
+        // put on the slot it released. The activation is first, so without the identity
+        // filter its read (64 B > 16 B) is what the walk would return.
+        let operands = [(x, 256usize, DType::F32, 16), (p, 256, DType::F16, 8)];
+        assert_eq!(
+            first_unstageable_parameter_operand(&g, &record, operands),
+            Some((p, 256, DType::F16, Unstageable::SlotTooNarrow)),
+            "the activation must not be judged, and the parameter's own read must still be"
+        );
+    }
+
+    /// The run-time half of the same rule. That net has only the flags the step carried,
+    /// so it must judge exactly the operands they name — the same record and the same
+    /// offsets as above, so the two walks are shown to reach the same verdict.
+    #[test]
+    fn the_runtime_walk_judges_only_the_flags_the_step_carried() {
+        let record = record(&[(256, 16)]);
+        // The activation first, the parameter second, both at the recorded offset.
+        let operands = [(256usize, DType::F32, 16), (256, DType::F16, 8)];
+        assert_eq!(
+            first_unstageable_operand(&record, &[false, true], operands),
+            Some((256, DType::F16, Unstageable::SlotTooNarrow)),
+            "an unflagged activation must be skipped, and the flagged parameter still judged"
+        );
+        // Flag the activation instead: it is judged by its own read, and nothing else.
+        assert_eq!(
+            first_unstageable_operand(&record, &[true, false], operands),
+            Some((256, DType::F32, Unstageable::SlotTooNarrow)),
+            "a flagged operand must be judged even when an unflagged one shares its offset"
+        );
+        // A flag list that does not match the operands is a caller defect, not a silent
+        // narrowing of the net: the tail of the operand list would go unjudged.
+        let short =
+            std::panic::catch_unwind(|| first_unstageable_operand(&record, &[true], operands))
+                .expect_err("a flag per operand is what makes the run-time walk whole");
+        let msg = short.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            msg.contains("one param_operands flag per judged operand"),
+            "got {msg}"
         );
     }
 

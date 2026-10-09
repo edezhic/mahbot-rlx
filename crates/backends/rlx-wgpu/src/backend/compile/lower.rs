@@ -370,10 +370,11 @@ fn should_pack_host_op(
 /// parameter. Resolving a parked parameter needs `Arena::resolve_w`, staging
 /// (`arena_off_in_window_or_stage`) or a separate binding, and no arm on this
 /// list uses any of them — `arena_window_for_nodes` skips tagged operands for
-/// exactly that reason. A parameter the host route cannot stage — one whose read is
-/// not one f32 lane per element, in what the upload stored or in the slot its plan
-/// gave it ([`crate::buffer::unstageable_reason`]) — is refused instead
-/// ([`assert_host_route_stageable`]), wherever that parameter lives.
+/// exactly that reason. A *parameter's* operand the host route cannot stage — one whose
+/// read is not one f32 lane per element, in what the upload stored or in the slot its plan
+/// gave it ([`crate::buffer::unstageable_reason`]) — is what
+/// [`assert_host_route_stageable`] refuses, wherever that parameter lives; an operand that
+/// is not a parameter's storage, or a view of one, is not judged at all.
 ///
 /// The price of that second geometry: on an adapter that parks every parameter
 /// (`from_plan_split` under a small `max_buffer_size`, or
@@ -485,11 +486,12 @@ fn any_parked_operand(arena: &Arena, node: &rlx_ir::Node) -> bool {
 /// stageable only where its storage and the slot it was given really are that
 /// ([`crate::buffer::unstageable_reason`] is the condition,
 /// [`crate::buffer::refuse_unstageable_operand`] the message).
-/// [`crate::buffer::first_unstageable_operand`] is that walk, shared with
+/// [`crate::buffer::first_unstageable_parameter_operand`] is that walk, shared with
 /// `crate::scan_host::assert_host_reads_fit`, which asks the same question of every
-/// operand the host route stages; an operand the arena has no parameter record for reads
-/// as an activation there, and an activation holds one f32 lane per element, so reading
-/// it always fits.
+/// operand the host route stages. Only an operand that is a parameter's storage — or a
+/// view of one, by the graph ([`crate::buffer::is_parameter_storage`]) — is judged at
+/// all: the record is keyed by byte offset alone, so an operand that is not is not judged,
+/// whatever the record holds at its offset.
 ///
 /// The graph is what makes this site stronger than that walk: an operand that *is* a
 /// parameter's storage (`crate::buffer::is_parameter_storage`) with no record for its
@@ -506,7 +508,7 @@ fn assert_host_route_stageable(graph: &Graph, arena: &Arena, node: &rlx_ir::Node
         )
     });
     if let Some((id, off, dtype, reason)) =
-        crate::buffer::first_unstageable_operand(arena, operands)
+        crate::buffer::first_unstageable_parameter_operand(graph, &arena.param_slots, operands)
     {
         crate::buffer::refuse_unstageable_operand(
             node.op.kind(),
@@ -580,6 +582,20 @@ fn wgpu_prefer_host_norm(arena: &crate::buffer::Arena) -> bool {
 /// [`wgpu_prefer_host_fallback`].
 fn wgpu_prefer_conv_host(arena: &crate::buffer::Arena) -> bool {
     wgpu_prefer_structure_host(arena) || rlx_ir::env::flag("RLX_WGPU_CONV_HOST")
+}
+
+/// A `Step::HostOp` that also carries which of `node`'s operands are a *parameter's*
+/// storage, by the graph — the predicate the plan-time check uses, so the run-time net
+/// (`scan_host::assert_host_reads_fit`) and it cannot disagree.
+fn host_op_step(graph: &Graph, node: &rlx_ir::Node, arena: &Arena) -> Step {
+    Step::HostOp {
+        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
+        param_operands: node
+            .inputs
+            .iter()
+            .map(|&id| crate::buffer::is_parameter_storage(graph, id))
+            .collect(),
+    }
 }
 
 pub(crate) fn compile_static_inner(
@@ -1206,9 +1222,7 @@ pub(crate) fn compile_static_inner(
         // `should_host_at_ceiling` and `supported_ops::addresses_arena_by_absolute_offset`.
         if should_host_at_ceiling(&dev.device, &arena, &graph, node) {
             ceiling_hosted += 1;
-            schedule.push(Step::HostOp {
-                desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-            });
+            schedule.push(host_op_step(&graph, node, &arena));
             continue;
         }
         // Helpers — capture device + arena into closures isn't
@@ -1224,9 +1238,7 @@ pub(crate) fn compile_static_inner(
             // Unsharded discrete: Binary/Activation stay on GPU; Expand/Conv/…
             // still host via wgpu_prefer_structure_host / wgpu_prefer_conv_host.
             op if should_pack_host_op(&arena, op, node, &graph) => {
-                schedule.push(Step::HostOp {
-                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                });
+                schedule.push(host_op_step(&graph, node, &arena));
                 continue;
             }
             Op::MatMul => {
@@ -2462,9 +2474,7 @@ pub(crate) fn compile_static_inner(
                 let contiguous = sorted.windows(2).all(|w| w[1] == w[0] + 1);
                 if !contiguous {
                     // Non-contiguous axes: packed HostOp (CPU thunk).
-                    schedule.push(Step::HostOp {
-                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                    });
+                    schedule.push(host_op_step(&graph, node, &arena));
                     continue;
                 }
                 let ax_first = sorted[0];
@@ -2526,9 +2536,7 @@ pub(crate) fn compile_static_inner(
                 let last = (in_shape.len() - 1) as i32;
                 if *axis != -1 && *axis != last {
                     // Non-last-axis Softmax: packed HostOp (CPU thunk).
-                    schedule.push(Step::HostOp {
-                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                    });
+                    schedule.push(host_op_step(&graph, node, &arena));
                     continue;
                 }
                 let inner = in_shape[in_shape.len() - 1].unwrap_static() as u32;
@@ -3429,6 +3437,7 @@ pub(crate) fn compile_static_inner(
                             .into_iter()
                             .map(|stride| stride as usize)
                             .collect(),
+                        param_operand: crate::buffer::is_parameter_storage(&graph, in_id),
                     });
                     continue;
                 }
@@ -3606,6 +3615,7 @@ pub(crate) fn compile_static_inner(
                         axis_in_size: axis_in,
                         start: *start as u32,
                         axis_out_size: *len as u32,
+                        param_operand: crate::buffer::is_parameter_storage(&graph, in_id),
                     });
                     continue;
                 }
@@ -3787,6 +3797,7 @@ pub(crate) fn compile_static_inner(
                 let mut start_pos: u32 = 0;
                 let mut host_inputs: Vec<(usize, u32, u32)> = Vec::new();
                 let mut host_starts: Vec<u32> = Vec::new();
+                let mut host_param_operands: Vec<bool> = Vec::new();
                 for &in_id in &node.inputs {
                     let in_shape = graph.node(in_id).shape.dims();
                     let axis_in = in_shape[*axis].unwrap_static() as u32;
@@ -3856,6 +3867,8 @@ pub(crate) fn compile_static_inner(
                         // element units (the lane axis is innermost).
                         host_inputs.push((arena.offset(in_id), axis_in, numel * lanes));
                         host_starts.push(start_pos);
+                        host_param_operands
+                            .push(crate::buffer::is_parameter_storage(&graph, in_id));
                     }
                     start_pos += axis_in;
                 }
@@ -3867,6 +3880,7 @@ pub(crate) fn compile_static_inner(
                             inner: inner_lanes,
                             total_axis: axis_out,
                             inputs: host_inputs,
+                            param_operands: host_param_operands,
                         });
                     } else {
                         schedule.push(Step::ConcatHostPieces {
@@ -3876,6 +3890,7 @@ pub(crate) fn compile_static_inner(
                             total_axis: axis_out,
                             inputs: host_inputs,
                             starts: host_starts,
+                            param_operands: host_param_operands,
                         });
                     }
                 }
@@ -4660,6 +4675,7 @@ pub(crate) fn compile_static_inner(
                         out_byte_off: arena.offset(node.id),
                         in_dims,
                         out_dims,
+                        param_operand: crate::buffer::is_parameter_storage(&graph, in_id),
                     });
                     continue;
                 }
@@ -6271,9 +6287,7 @@ pub(crate) fn compile_static_inner(
             }
 
             Op::Interpolate3d { .. } => {
-                schedule.push(Step::HostOp {
-                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                });
+                schedule.push(host_op_step(&graph, node, &arena));
             }
 
             Op::Cumsum { axis, exclusive } => {
@@ -6282,9 +6296,7 @@ pub(crate) fn compile_static_inner(
                 let last = (in_shape.len() - 1) as i32;
                 if *axis != -1 && *axis != last {
                     // Non-last-axis Cumsum: packed HostOp (CPU thunk).
-                    schedule.push(Step::HostOp {
-                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                    });
+                    schedule.push(host_op_step(&graph, node, &arena));
                     continue;
                 }
                 let inner = in_shape[in_shape.len() - 1].unwrap_static() as u32;
@@ -6313,9 +6325,7 @@ pub(crate) fn compile_static_inner(
                 let last = (in_shape.len() - 1) as i32;
                 if *axis != -1 && *axis != last {
                     // Non-last-axis: packed HostOp (CPU thunk).
-                    schedule.push(Step::HostOp {
-                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                    });
+                    schedule.push(host_op_step(&graph, node, &arena));
                     continue;
                 }
                 let inner = in_shape[in_shape.len() - 1].unwrap_static() as u32;
@@ -8353,9 +8363,7 @@ pub(crate) fn compile_static_inner(
                 // base 0 (these kernels carry ABSOLUTE offsets, which a rebased
                 // window would silently misdirect).
                 if chan_dim > QUANT_I8_MAX_CHAN || !arena_binds_whole_at_zero(&dev.device, &arena) {
-                    schedule.push(Step::HostOp {
-                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                    });
+                    schedule.push(host_op_step(&graph, node, &arena));
                 } else {
                     let x_id = node.inputs[0];
                     let mut affine = [0u32; 24];
@@ -8704,9 +8712,7 @@ pub(crate) fn compile_static_inner(
             // crate without a GPU — see that function, and
             // `rlx-runtime/tests/host_fallback_never_nops.rs`.
             other if crate::supported_ops::routes_to_cpu_host(other) => {
-                schedule.push(Step::HostOp {
-                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                });
+                schedule.push(host_op_step(&graph, node, &arena));
             }
             Op::FftButterflyStage { stage, n_fft } => {
                 let state = node.inputs[0];
@@ -9137,9 +9143,7 @@ pub(crate) fn compile_static_inner(
                 };
                 // EMA needs mutable running-scale state — keep HostOp.
                 if matches!(scale_mode, ScaleMode::EMA { .. }) {
-                    schedule.push(Step::HostOp {
-                        desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                    });
+                    schedule.push(host_op_step(&graph, node, &arena));
                     continue;
                 }
                 let in_id = node.inputs[0];
@@ -9258,9 +9262,7 @@ pub(crate) fn compile_static_inner(
                 });
             }
             Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } => {
-                schedule.push(Step::HostOp {
-                    desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                });
+                schedule.push(host_op_step(&graph, node, &arena));
             }
             Op::ScatterNd { .. }
             | Op::ScatterElements { .. }
@@ -10716,9 +10718,7 @@ pub(crate) fn compile_static_inner(
                         // length, past the operand and possibly past the weight
                         // buffer.
                         assert_host_route_stageable(&graph, &arena, node);
-                        schedule.push(Step::HostOp {
-                            desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
-                        });
+                        schedule.push(host_op_step(&graph, node, &arena));
                     } else {
                         let p = DequantMatmulParams {
                             m,

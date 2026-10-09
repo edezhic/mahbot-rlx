@@ -4366,12 +4366,16 @@ impl WgpuExecutable {
                 Step::ScanHost { desc } => {
                     crate::scan_host::run_scan(&self.arena, &dev.device, &dev.queue, desc);
                 }
-                Step::HostOp { desc } => {
+                Step::HostOp {
+                    desc,
+                    param_operands,
+                } => {
                     crate::scan_host::run_host_op_with_cache(
                         &self.arena,
                         &dev.device,
                         &dev.queue,
                         desc,
+                        param_operands,
                         Some(&mut host_cache),
                     );
                 }
@@ -4384,6 +4388,7 @@ impl WgpuExecutable {
                     inner,
                     total_axis,
                     inputs,
+                    param_operands,
                 } => {
                     crate::scan_host::run_concat_host_cached(
                         &self.arena,
@@ -4394,6 +4399,7 @@ impl WgpuExecutable {
                         *inner,
                         *total_axis,
                         inputs,
+                        param_operands,
                         Some(&mut host_cache),
                     );
                 }
@@ -4404,6 +4410,7 @@ impl WgpuExecutable {
                     total_axis,
                     inputs,
                     starts,
+                    param_operands,
                 } => {
                     // Partial fill — other columns already on device; flush first.
                     if host_cache.has_deferred_writes() {
@@ -4426,6 +4433,7 @@ impl WgpuExecutable {
                         *total_axis,
                         inputs,
                         starts,
+                        param_operands,
                         /*clear=*/ false,
                     );
                 }
@@ -4435,6 +4443,7 @@ impl WgpuExecutable {
                     in_dims,
                     out_dims,
                     in_strides,
+                    param_operand,
                 } => {
                     crate::scan_host::run_transpose_host_cached(
                         &self.arena,
@@ -4445,6 +4454,7 @@ impl WgpuExecutable {
                         in_dims,
                         out_dims,
                         in_strides,
+                        *param_operand,
                         Some(&mut host_cache),
                     );
                 }
@@ -4456,6 +4466,7 @@ impl WgpuExecutable {
                     axis_in_size,
                     start,
                     axis_out_size,
+                    param_operand,
                 } => {
                     crate::scan_host::run_narrow_host_cached(
                         &self.arena,
@@ -4468,6 +4479,7 @@ impl WgpuExecutable {
                         *axis_in_size,
                         *start,
                         *axis_out_size,
+                        *param_operand,
                         Some(&mut host_cache),
                     );
                 }
@@ -4476,6 +4488,7 @@ impl WgpuExecutable {
                     out_byte_off,
                     in_dims,
                     out_dims,
+                    param_operand,
                 } => {
                     crate::scan_host::run_expand_host_cached(
                         &self.arena,
@@ -4485,6 +4498,7 @@ impl WgpuExecutable {
                         *out_byte_off,
                         in_dims,
                         out_dims,
+                        *param_operand,
                         Some(&mut host_cache),
                     );
                 }

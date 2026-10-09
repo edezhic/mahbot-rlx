@@ -27,8 +27,14 @@ pub fn run_scan(arena: &Arena, device: &wgpu::Device, queue: &wgpu::Queue, desc:
     rlx_gpu_host::run_scan_span(&mut a, desc.clone());
 }
 
-pub fn run_host_op(arena: &Arena, device: &wgpu::Device, queue: &wgpu::Queue, desc: &HostOpDesc) {
-    run_host_op_with_cache(arena, device, queue, desc, None);
+pub fn run_host_op(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    desc: &HostOpDesc,
+    param_operands: &[bool],
+) {
+    run_host_op_with_cache(arena, device, queue, desc, param_operands, None);
 }
 
 /// The bound every operand read of the generic host route is checked against, at the
@@ -38,8 +44,11 @@ pub fn run_host_op(arena: &Arena, device: &wgpu::Device, queue: &wgpu::Queue, de
 /// `rlx_gpu_host` makes of each is [`crate::buffer::unstageable_reason`]'s question,
 /// asked with the bytes the arena's record holds for that operand's storage: the plan's
 /// slot where a *parameter's* storage is in the activation arena, the weight buffer's own
-/// sizing where it is parked. An operand that is not a parameter's storage — an
-/// activation — is left alone: its slot holds one f32 lane per element by construction.
+/// sizing where it is parked. Only the operands `param_operands` flags are judged — the
+/// record is keyed by byte offset alone, so an operand that is not a *parameter's*
+/// storage is left alone whatever the record holds at its offset (`lower::host_op_step`
+/// records the flags when the step is emitted). An activation's slot holds one f32 lane
+/// per element by construction, so its read always fits and skipping it hides no overrun.
 ///
 /// This is one of the two places "the read never runs past the operand" is held, and the
 /// one for the sites that reach the route without a plan-time check
@@ -51,12 +60,17 @@ pub fn run_host_op(arena: &Arena, device: &wgpu::Device, queue: &wgpu::Queue, de
 /// oversight: `rlx_gpu_host` stages each as one span over every operand, and
 /// `run_indexing` may mirror the whole arena. No case has been established in which a
 /// parameter narrower than four bytes per element reaches either.
-fn assert_host_reads_fit(arena: &Arena, op: rlx_ir::OpKind, inputs: &[(usize, rlx_ir::Shape)]) {
+fn assert_host_reads_fit(
+    arena: &Arena,
+    op: rlx_ir::OpKind,
+    inputs: &[(usize, rlx_ir::Shape)],
+    param_operands: &[bool],
+) {
     let operands = inputs
         .iter()
-        .map(|(off, shape)| ((), *off, shape.dtype(), shape.num_elements().unwrap_or(0)));
-    if let Some(((), off, dtype, reason)) =
-        crate::buffer::first_unstageable_operand(arena, operands)
+        .map(|(off, shape)| (*off, shape.dtype(), shape.num_elements().unwrap_or(0)));
+    if let Some((off, dtype, reason)) =
+        crate::buffer::first_unstageable_operand(&arena.param_slots, param_operands, operands)
     {
         crate::buffer::refuse_unstageable_operand(
             op,
@@ -85,10 +99,33 @@ fn assert_host_reads_fit(arena: &Arena, op: rlx_ir::OpKind, inputs: &[(usize, rl
 /// declared encoding out of the same record the bound came from
 /// ([`crate::buffer::ParamStorage::dtype`]) rather than from a stand-in, and stays silent
 /// about the encoding where the record cannot attribute one to that offset.
-fn assert_read_fits(arena: &Arena, op: rlx_ir::OpKind, off: usize, elems: usize) {
-    let Some(storage) = arena.param_storage_at(off) else {
-        return;
-    };
+///
+/// `param_operand` is whether the graph called this operand a parameter's storage (the
+/// flag the step carried); only then is the record asked, for the reason
+/// [`assert_host_reads_fit`] gives.
+fn assert_read_fits(
+    arena: &Arena,
+    op: rlx_ir::OpKind,
+    off: usize,
+    elems: usize,
+    param_operand: bool,
+) {
+    if param_operand {
+        judge_structural_read(op, off, elems, arena.param_storage_at(off));
+    }
+}
+
+/// The structural host steps' slot-half bound. Pure, so the arm that reports an
+/// *unattributable* encoding — the record's `dtype` is `None` where two parameters'
+/// storages reach one offset — is reachable by a check that needs no device:
+/// `an_unattributable_encoding_is_refused`.
+fn judge_structural_read(
+    op: rlx_ir::OpKind,
+    off: usize,
+    elems: usize,
+    storage: Option<crate::buffer::ParamStorage>,
+) {
+    let Some(storage) = storage else { return };
     if elems.saturating_mul(4) > storage.bytes {
         crate::buffer::refuse_unstageable_operand(
             op,
@@ -104,9 +141,10 @@ pub fn run_host_op_with_cache(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     desc: &HostOpDesc,
+    param_operands: &[bool],
     cache: Option<&mut HostTensorCache>,
 ) {
-    assert_host_reads_fit(arena, desc.op.kind(), &desc.inputs);
+    assert_host_reads_fit(arena, desc.op.kind(), &desc.inputs, param_operands);
     let mut a = WgpuArena {
         arena,
         device,
@@ -197,6 +235,7 @@ pub fn run_concat_host(
     inner: u32,
     total_axis: u32,
     inputs: &[(usize, u32, u32)],
+    param_operands: &[bool],
 ) {
     run_concat_host_cached(
         arena,
@@ -207,6 +246,7 @@ pub fn run_concat_host(
         inner,
         total_axis,
         inputs,
+        param_operands,
         None,
     );
 }
@@ -220,6 +260,7 @@ pub fn run_concat_host_cached(
     inner: u32,
     total_axis: u32,
     inputs: &[(usize, u32, u32)],
+    param_operands: &[bool],
     cache: Option<&mut HostTensorCache>,
 ) {
     let starts: Vec<u32> = {
@@ -243,6 +284,7 @@ pub fn run_concat_host_cached(
         total_axis,
         inputs,
         &starts,
+        param_operands,
         /*clear=*/ true,
         cache,
     );
@@ -260,6 +302,7 @@ pub fn run_concat_host_pieces(
     total_axis: u32,
     inputs: &[(usize, u32, u32)],
     starts: &[u32],
+    param_operands: &[bool],
     clear: bool,
 ) {
     run_concat_host_pieces_cached(
@@ -272,6 +315,7 @@ pub fn run_concat_host_pieces(
         total_axis,
         inputs,
         starts,
+        param_operands,
         clear,
         None,
     );
@@ -287,6 +331,7 @@ pub fn run_concat_host_pieces_cached(
     total_axis: u32,
     inputs: &[(usize, u32, u32)],
     starts: &[u32],
+    param_operands: &[bool],
     clear: bool,
     mut cache: Option<&mut HostTensorCache>,
 ) {
@@ -309,7 +354,13 @@ pub fn run_concat_host_pieces_cached(
         Vec::new()
     };
     for (i, &(src_off, axis_len, numel)) in inputs.iter().enumerate() {
-        assert_read_fits(arena, rlx_ir::OpKind::Concat, src_off, numel as usize);
+        assert_read_fits(
+            arena,
+            rlx_ir::OpKind::Concat,
+            src_off,
+            numel as usize,
+            param_operands[i],
+        );
         let copy_per_row = (axis_len as usize).saturating_mul(inner);
         let dst_col_off = (starts[i] as usize).saturating_mul(inner);
         let src = if use_cache {
@@ -379,6 +430,7 @@ pub fn run_expand_host(
     out_byte_off: usize,
     in_dims: &[u32],
     out_dims: &[u32],
+    param_operand: bool,
 ) {
     run_expand_host_cached(
         arena,
@@ -388,6 +440,7 @@ pub fn run_expand_host(
         out_byte_off,
         in_dims,
         out_dims,
+        param_operand,
         None,
     );
 }
@@ -400,6 +453,7 @@ pub fn run_expand_host_cached(
     out_byte_off: usize,
     in_dims: &[u32],
     out_dims: &[u32],
+    param_operand: bool,
     mut cache: Option<&mut HostTensorCache>,
 ) {
     let rank = out_dims.len();
@@ -424,7 +478,13 @@ pub fn run_expand_host_cached(
         // arena untouched, which is what an empty output means.
         return;
     }
-    assert_read_fits(arena, rlx_ir::OpKind::Expand, in_byte_off, in_elems);
+    assert_read_fits(
+        arena,
+        rlx_ir::OpKind::Expand,
+        in_byte_off,
+        in_elems,
+        param_operand,
+    );
     let mut a = WgpuArena {
         arena,
         device,
@@ -467,6 +527,7 @@ pub fn run_transpose_host(
     in_dims: &[u32],
     out_dims: &[u32],
     in_strides: &[usize],
+    param_operand: bool,
 ) {
     run_transpose_host_cached(
         arena,
@@ -477,6 +538,7 @@ pub fn run_transpose_host(
         in_dims,
         out_dims,
         in_strides,
+        param_operand,
         None,
     );
 }
@@ -490,6 +552,7 @@ pub fn run_transpose_host_cached(
     in_dims: &[u32],
     out_dims: &[u32],
     in_strides: &[usize],
+    param_operand: bool,
     mut cache: Option<&mut HostTensorCache>,
 ) {
     let rank = out_dims.len();
@@ -501,7 +564,13 @@ pub fn run_transpose_host_cached(
     let out_elems = out_dims
         .iter()
         .fold(1usize, |n, &d| n.saturating_mul(d as usize));
-    assert_read_fits(arena, rlx_ir::OpKind::Transpose, in_byte_off, in_elems);
+    assert_read_fits(
+        arena,
+        rlx_ir::OpKind::Transpose,
+        in_byte_off,
+        in_elems,
+        param_operand,
+    );
     let mut a = WgpuArena {
         arena,
         device,
@@ -538,6 +607,7 @@ pub fn run_narrow_host(
     axis_in_size: u32,
     start: u32,
     axis_out_size: u32,
+    param_operand: bool,
 ) {
     run_narrow_host_cached(
         arena,
@@ -550,6 +620,7 @@ pub fn run_narrow_host(
         axis_in_size,
         start,
         axis_out_size,
+        param_operand,
         None,
     );
 }
@@ -566,6 +637,7 @@ pub fn run_narrow_host_cached(
     axis_in_size: u32,
     start: u32,
     axis_out_size: u32,
+    param_operand: bool,
     mut cache: Option<&mut HostTensorCache>,
 ) {
     let outer = outer as usize;
@@ -581,6 +653,7 @@ pub fn run_narrow_host_cached(
         rlx_ir::OpKind::Narrow,
         in_byte_off,
         outer.saturating_mul(in_row),
+        param_operand,
     );
     let mut a = WgpuArena {
         arena,
@@ -603,4 +676,38 @@ pub fn run_narrow_host_cached(
         out[dst_start..dst_start + out_row].copy_from_slice(&src[src_start..src_start + out_row]);
     }
     store_f32_out(arena, device, queue, out_byte_off, out, cache.take());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refusal for an operand whose encoding the record cannot attribute — two
+    /// parameters' storages reach the offset — is emitted by one branch, reached only from
+    /// the structural host steps' net. Executed here without a device.
+    #[test]
+    fn an_unattributable_encoding_is_refused() {
+        let caught = std::panic::catch_unwind(|| {
+            judge_structural_read(
+                rlx_ir::OpKind::Narrow,
+                0x100,
+                4,
+                Some(crate::buffer::ParamStorage {
+                    bytes: 0,
+                    dtype: None,
+                }),
+            )
+        });
+        let payload =
+            caught.expect_err("a read past a bound the record cannot attribute must be refused");
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            msg.contains("Two parameters' storages share this offset"),
+            "got {msg}"
+        );
+        assert!(msg.contains("not attributable"), "got {msg}");
+    }
 }

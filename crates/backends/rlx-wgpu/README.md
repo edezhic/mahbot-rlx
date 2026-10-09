@@ -52,7 +52,10 @@ kernels, pure Rust deps — no FFI, no submodules.
   whose descriptors carry element counts rather than shapes: they ask the slot half alone,
   though the refusal they raise still names the operand's declared encoding, read from the
   arena's parameter record — and names none where the record cannot attribute one, since
-  the record is keyed by offset. Three arms ask that question
+  the record is keyed by byte offset. That key is also why not every operand is judged: an
+  operand is measured against the record only where the graph — or, at run time, the flag
+  the host step recorded — says it is a parameter's storage, since an activation a plan put
+  on a released slot starts where a parameter's storage did. Three arms ask that question
   themselves instead: `Op::DequantMatMul`'s quantized sub-path refuses a packed
   weight rather than staging it (its GGUF and Int8 sub-paths keep their own route, but
   every other scheme's step reads the weight through the f32-lane staging), and
