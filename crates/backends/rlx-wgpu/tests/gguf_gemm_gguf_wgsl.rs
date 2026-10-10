@@ -8,6 +8,10 @@
 //! Device-free (naga only). Without this a WGSL mistake would surface as a
 //! panic at `create_shader_module` on whatever graph first runs a batched
 //! Q4_K / Q6_K multiply, long after the edit.
+//!
+//! The dispatch geometry these entries have to match — their `@workgroup_size`
+//! and their `TG`/`TM` consts against the Rust dispatch constants — is pinned by
+//! `gguf_gpu.rs`'s own test, where those constants are private.
 
 #[test]
 fn wgsl_parses_validates_and_keeps_both_entry_points() {

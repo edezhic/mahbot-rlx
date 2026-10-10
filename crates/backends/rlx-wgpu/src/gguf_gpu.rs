@@ -1035,6 +1035,17 @@ fn gguf_window_budget(max_bind: u64) -> u64 {
 /// the widest served shape (276 rows x 202048 columns = 213 MiB) in one chunk.
 const OUT_SLAB_CAP: u64 = 256 << 20;
 
+/// Threads in one workgroup of the row-grouped GEMM — the shader's `TG`, from
+/// which the dispatch geometry below is sized: a workgroup covers this many
+/// output columns, one thread each.
+const GROUPED_THREADS: u32 = 64;
+
+/// Rows one workgroup of the row-grouped GEMM covers — the shader's `TM`, the
+/// tile over which one pass over the packed weight is reused. Both are tied to
+/// the shader they describe by the `grouped_geometry_matches_the_shader` test
+/// below, which is why they stay private here.
+const GROUPED_ROWS: u32 = 8;
+
 /// Fused multi-row GGUF K-quant GEMM for Q4_K / Q6_K into `enc` (no submit).
 ///
 /// One pass over each packed weight tile per group of `TM = 8` rows, instead of
@@ -1053,11 +1064,13 @@ const OUT_SLAB_CAP: u64 = 256 << 20;
 ///
 /// Returns `false` when the tiled kernel cannot be encoded for this call: the
 /// scheme has no entry point, X spans shards, its window exceeds the binding
-/// limit, or `k` is not a whole number of blocks — all decided before anything is
-/// encoded, including the per-chunk window fit (only the first chunk can decline,
-/// every later one reads less and ends inside the weight region). The caller then
-/// uses the per-row GEMV, which rewrites the same `m*n*4` output bytes row by row,
-/// so the fallback is correct.
+/// limit, `k` is not a whole number of blocks, or X's own window offset is not a
+/// multiple of 16 (the `vec4` reads) — all decided before anything is encoded,
+/// including the per-chunk window fit and, for Q4_K, the weight window's
+/// 4-alignment that its word-granular reads need (only the first chunk can
+/// decline, every later one reads less and ends inside the weight region). The
+/// caller then uses the per-row GEMV, which rewrites the same `m*n*4` output bytes
+/// row by row, so the fallback is correct.
 #[allow(clippy::too_many_arguments)]
 fn encode_dequant_matmul_gguf_gemm_grouped(
     arena: &Arena,
@@ -1150,6 +1163,16 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
             let w_base = (w0 / STORAGE_ALIGN) * STORAGE_ALIGN;
             let n_chunk = (n - n0).min(n_chunk_max).max(1);
 
+            // Q4_K reads the weight as whole words (`read_u32`), so this window's
+            // offset has to be a multiple of 4; Q6_K's reader reassembles across a
+            // 2-byte boundary and its 210-byte rows put odd chunks on a 2 anyway.
+            // Mirrors the X-side check above and declines nothing that occurs
+            // today: it turns a silent shifted read into the per-row path.
+            if scheme_id == 0 && !(w0 - w_base).is_multiple_of(4) {
+                ok = false;
+                return;
+            }
+
             // The window the chunk reads — every packed weight byte it touches.
             // That one quantity is compared against both limits, rather than the
             // 4-byte-rounded binding size below: both limits are multiples of 4
@@ -1236,7 +1259,11 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
                 });
                 pass.set_pipeline(&dk.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.dispatch_workgroups((n_chunk as u32).div_ceil(64), (m as u32).div_ceil(8), 1);
+                pass.dispatch_workgroups(
+                    (n_chunk as u32).div_ceil(GROUPED_THREADS),
+                    (m as u32).div_ceil(GROUPED_ROWS),
+                    1,
+                );
             }
 
             // Slab rows are [m, n_chunk]; this chunk owns arena columns
@@ -1573,4 +1600,35 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
 
     let out_bytes: Vec<u8> = out_host.iter().flat_map(|v| v.to_le_bytes()).collect();
     arena.write_bytes_range(queue, out_byte_off, &out_bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GROUPED_ROWS, GROUPED_THREADS};
+
+    /// The row-grouped GEMM's geometry is written twice — `GROUPED_THREADS` /
+    /// `GROUPED_ROWS` size the dispatch, and the shader declares its own
+    /// `@workgroup_size` plus its `TG`/`TM` consts — so read the shader here and
+    /// tie the two. A lone edit of any one of them would otherwise describe a
+    /// kernel that no longer runs: `TG` drives `col = wid.x * TG + tid` and the
+    /// staging stride, `TM` the rows a pass over the weight covers.
+    #[test]
+    fn grouped_geometry_matches_the_shader() {
+        let wgsl = crate::kernels::DEQUANT_GEMM_GGUF_WGSL;
+        let module = naga::front::wgsl::parse_str(wgsl).expect("wgsl parse");
+        for entry in &module.entry_points {
+            assert_eq!(
+                entry.workgroup_size,
+                [GROUPED_THREADS, 1, 1],
+                "{}: workgroup must be GROUPED_THREADS wide",
+                entry.name
+            );
+        }
+        for want in [
+            format!("const TG: u32 = {GROUPED_THREADS}u;"),
+            format!("const TM: u32 = {GROUPED_ROWS}u;"),
+        ] {
+            assert!(wgsl.contains(&want), "expected `{want}` in the shader");
+        }
+    }
 }
