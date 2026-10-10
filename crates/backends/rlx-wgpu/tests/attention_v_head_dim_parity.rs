@@ -8,13 +8,22 @@
 //! wide (v != head_dim). The CPU backend already implements the asymmetric
 //! path (`dh`=head_dim for Q/K, `dh_v`=v_head_dim for V-read/score@V/O-write);
 //! this pins the wgpu kernel to it.
+//!
+//! The decode shapes (`lq = 1`, long key sequence) take the decode-shaped
+//! kernel, whose merge walks the value dims in fixed-width passes — so a
+//! `v_head_dim` narrower than one pass, and one that is asymmetric but wide,
+//! both have to round-trip.
 
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
+use rlx_wgpu::kernels::{
+    attention_decode_eligible, attention_route_counts, reset_attention_route_counts,
+};
 
 /// Rank-3 `[B, S, H·head_dim]` Q/K, `[B, S, H·v_head_dim]` V/out, causal.
-fn run_case(nh: usize, hd: usize, v_hd: usize, seq: usize) -> Option<f32> {
+/// `lq` query rows over `lk` cached keys (`lq = 1` is the decode shape).
+fn run_case(nh: usize, hd: usize, v_hd: usize, lq: usize, lk: usize) -> Option<f32> {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return None;
@@ -23,20 +32,20 @@ fn run_case(nh: usize, hd: usize, v_hd: usize, seq: usize) -> Option<f32> {
     let q_dim = nh * hd; // Q/K per-head width = head_dim
     let v_dim = nh * v_hd; // V/out per-head width = v_head_dim (asymmetric)
 
-    let q: Vec<f32> = (0..b * seq * q_dim)
+    let q: Vec<f32> = (0..b * lq * q_dim)
         .map(|i| ((i as f32) * 0.021).sin())
         .collect();
-    let k: Vec<f32> = (0..b * seq * q_dim)
+    let k: Vec<f32> = (0..b * lk * q_dim)
         .map(|i| ((i as f32) * 0.017).cos())
         .collect();
-    let v: Vec<f32> = (0..b * seq * v_dim)
+    let v: Vec<f32> = (0..b * lk * v_dim)
         .map(|i| ((i as f32) * 0.013).sin())
         .collect();
 
     let mut g = Graph::new("attn_vhd");
-    let qi = g.input("q", Shape::new(&[b, seq, q_dim], DType::F32));
-    let ki = g.input("k", Shape::new(&[b, seq, q_dim], DType::F32));
-    let vi = g.input("v", Shape::new(&[b, seq, v_dim], DType::F32));
+    let qi = g.input("q", Shape::new(&[b, lq, q_dim], DType::F32));
+    let ki = g.input("k", Shape::new(&[b, lk, q_dim], DType::F32));
+    let vi = g.input("v", Shape::new(&[b, lk, v_dim], DType::F32));
     let y = g.add_node(
         Op::Attention {
             num_heads: nh,
@@ -47,7 +56,7 @@ fn run_case(nh: usize, hd: usize, v_hd: usize, seq: usize) -> Option<f32> {
             attn_logit_softcap: None,
         },
         vec![qi, ki, vi],
-        Shape::new(&[b, seq, v_dim], DType::F32),
+        Shape::new(&[b, lq, v_dim], DType::F32),
     );
     g.set_outputs(vec![y]);
 
@@ -60,16 +69,26 @@ fn run_case(nh: usize, hd: usize, v_hd: usize, seq: usize) -> Option<f32> {
         ])
         .remove(0)
     };
+    reset_attention_route_counts();
     let gpu = run(Device::Gpu);
+    let routes = attention_route_counts();
     let cpu = run(Device::Cpu);
+    // One attention step per run: it took the kernel the host's predicate names.
+    let decode = attention_decode_eligible(lq as u32, lk as u32, hd as u32, v_hd as u32);
+    assert_eq!(
+        (routes.decode, routes.serial),
+        if decode { (1, 0) } else { (0, 1) },
+        "nh={nh} hd={hd} v_hd={v_hd} lq={lq} lk={lk}: attention_decode_eligible says \
+         {decode}, the run says {routes:?}"
+    );
     assert_eq!(
         gpu.len(),
-        b * seq * v_dim,
+        b * lq * v_dim,
         "gpu output width == H·v_head_dim"
     );
     assert_eq!(
         cpu.len(),
-        b * seq * v_dim,
+        b * lq * v_dim,
         "cpu output width == H·v_head_dim"
     );
     let max_abs = cpu
@@ -77,18 +96,33 @@ fn run_case(nh: usize, hd: usize, v_hd: usize, seq: usize) -> Option<f32> {
         .zip(&gpu)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    eprintln!("attn asym nh={nh} hd={hd} v_hd={v_hd} seq={seq}: max_abs={max_abs:.6e}");
+    eprintln!("attn asym nh={nh} hd={hd} v_hd={v_hd} lq={lq} lk={lk}: max_abs={max_abs:.6e}");
     Some(max_abs)
 }
 
 #[test]
 fn wgpu_attention_asymmetric_v_head_dim_parity() {
     // head_dim=8, v_head_dim=4, 2 heads, short seq, Causal, rank-3.
-    let Some(max_abs) = run_case(2, 8, 4, 6) else {
+    let Some(max_abs) = run_case(2, 8, 4, 6, 6) else {
         return;
     };
     assert!(
         max_abs < 1e-3,
         "wgpu asymmetric v_head_dim max_abs {max_abs} >= 1e-3"
     );
+    // Decode shapes on the same asymmetric path: a value width below one merge
+    // pass (4 of head_dim 8), a wide asymmetric one (64 of head_dim 128), and one
+    // wider than the score width (128 of head_dim 64) — the last is inside the
+    // decode form's eligibility (both widths ≤ the cap) and puts the merge on V
+    // dims the Q/K contraction does not cover.
+    for (nh, hd, v_hd) in [(2usize, 8usize, 4usize), (4, 128, 64), (4, 64, 128)] {
+        let Some(max_abs) = run_case(nh, hd, v_hd, 1, 186) else {
+            return;
+        };
+        assert!(
+            max_abs < 1e-3,
+            "wgpu decode asymmetric v_head_dim nh={nh} hd={hd} v_hd={v_hd} \
+             max_abs {max_abs} >= 1e-3"
+        );
+    }
 }

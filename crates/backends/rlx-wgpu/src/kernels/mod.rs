@@ -10,6 +10,7 @@
 //! compilation.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 
@@ -2632,6 +2633,7 @@ static GATHER: OnceLock<Kernel> = OnceLock::new();
 static GATHER_SPLIT: OnceLock<Kernel> = OnceLock::new();
 static GATHER_AXIS: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION: OnceLock<Kernel> = OnceLock::new();
+static ATTENTION_DECODE: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_BWD: OnceLock<Kernel> = OnceLock::new();
 static ROPE: OnceLock<Kernel> = OnceLock::new();
 static EXPAND: OnceLock<Kernel> = OnceLock::new();
@@ -3722,6 +3724,86 @@ pub fn attention_kernel(device: &wgpu::Device) -> &'static Kernel {
     ATTENTION
         .get_or_init(|| build_kernel(device, "rlx-wgpu attention", ATTENTION_WGSL, "attention"))
 }
+/// Decode-shaped attention: one workgroup per (batch, head), the key sequence
+/// walked across the workgroup's lanes. Same WGSL module and same two-entry
+/// bind-group layout as [`attention_kernel`], so the bind group the lowerer
+/// built from that layout drives either pipeline.
+pub fn attention_decode_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ATTENTION_DECODE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu attention_decode",
+            ATTENTION_WGSL,
+            "attention_decode",
+        )
+    })
+}
+
+/// Key length above which the decode-shaped form is worth its merge cost:
+/// the threshold the native (Metal) backend records for its decode-shaped form
+/// (`kv_seq > 64`), not a new number.
+pub const ATTENTION_DECODE_MIN_KEYS: u32 = 64;
+
+/// Head width the lane-parallel decode form serves, mirroring the native
+/// backend's decode kernel. That cap is the native kernel's own — 32 lanes of
+/// partial O in one threadgroup array. Here the per-lane Q/O arrays are the
+/// serial kernel's and the merge scratch is dim-chunked, so this is coverage
+/// parity with the native route, not a limit of this kernel. Wider heads stay
+/// on `attention`.
+pub const ATTENTION_DECODE_MAX_HEAD_DIM: u32 = 128;
+
+/// Which attention kernel `Step::Attention` takes, from the extents the run
+/// actually walks (`seq_q`/`seq_k` after active-extent scaling) rather than the
+/// lowered ones. Anything outside this set keeps the serial kernel's behaviour,
+/// including its head-width ceiling; which mask kinds exist is decided inside
+/// the WGSL entry point, which mirrors the serial one's. The two widths are only
+/// each compared against the cap, so their order is immaterial.
+pub fn attention_decode_eligible(seq_q: u32, seq_k: u32, head_dim: u32, v_head_dim: u32) -> bool {
+    seq_q == 1
+        && seq_k > ATTENTION_DECODE_MIN_KEYS
+        && head_dim <= ATTENTION_DECODE_MAX_HEAD_DIM
+        // 0 means "unset": the kernel then reads `head_dim` for V, already
+        // capped by the conjunct above.
+        && v_head_dim <= ATTENTION_DECODE_MAX_HEAD_DIM
+}
+
+/// Which kernel each `Step::Attention` dispatch took, counted process-wide.
+/// `serial` covers both the multi-row path and every shape the decode form
+/// cannot serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionRoutes {
+    pub decode: u64,
+    pub serial: u64,
+}
+
+static ATTENTION_DECODE_STEPS: AtomicU64 = AtomicU64::new(0);
+static ATTENTION_SERIAL_STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// How many attention dispatches this process has routed each way. The engine's
+/// dispatch report answers per `OpKind`, not per kernel, so this is the
+/// wgpu-local answer for *which* attention kernel a step took.
+pub fn attention_route_counts() -> AttentionRoutes {
+    AttentionRoutes {
+        decode: ATTENTION_DECODE_STEPS.load(Ordering::Relaxed),
+        serial: ATTENTION_SERIAL_STEPS.load(Ordering::Relaxed),
+    }
+}
+
+/// Zero [`attention_route_counts`] (tests bracketing one run).
+pub fn reset_attention_route_counts() {
+    ATTENTION_DECODE_STEPS.store(0, Ordering::Relaxed);
+    ATTENTION_SERIAL_STEPS.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn note_attention_route(decode: bool) {
+    let counter = if decode {
+        &ATTENTION_DECODE_STEPS
+    } else {
+        &ATTENTION_SERIAL_STEPS
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn attention_bwd_kernel(device: &wgpu::Device) -> &'static Kernel {
     ATTENTION_BWD.get_or_init(|| {
         build_kernel(

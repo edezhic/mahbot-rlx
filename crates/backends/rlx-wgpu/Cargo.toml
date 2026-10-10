@@ -88,6 +88,10 @@ rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
 
 [[test]]
+name = "attention_decode_route"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "attention_head_dim_parity"
 required-features = ["backend-tests"]
 

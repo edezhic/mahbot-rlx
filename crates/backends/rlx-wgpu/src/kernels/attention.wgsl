@@ -28,8 +28,24 @@
 // `O` is held in a per-thread private array<f32, MAX_HEAD_DIM>. Gemma 3
 // decode uses head_dim=256; keep headroom for Llama-class 128 and future
 // 512-dim heads without spilling on Apple GPUs (private limit ~10 KiB/thread).
+//
+// This module also carries a decode-shaped variant, `attention_decode`: one
+// workgroup per (batch, head) with the key sequence walked across the
+// workgroup's lanes and the lane partials merged in workgroup memory. The
+// serial form above is the wrong shape for a decode step — one query row means
+// one workgroup of 64 lanes of which only batch·heads are live, each walking
+// the whole context alone. The host picks the variant from the extent the run
+// will actually walk (`kernels::attention_decode_eligible`).
 
 const MAX_HEAD_DIM: u32 = 512u;
+
+// Decode-shaped variant: workgroup width == key lanes, and the value dims merged
+// per pass. DECODE_LANES * DECODE_DIM_CHUNK f32 is 8 KiB of workgroup storage
+// (8.26 KiB with the merge scratch), half of WebGPU's guaranteed 16 KiB
+// `maxComputeWorkgroupStorageSize` — the native backend's equivalent needs
+// 16.25 KiB and is above that floor.
+const DECODE_LANES: u32 = 64u;
+const DECODE_DIM_CHUNK: u32 = 32u;
 
 struct Params {
     batch: u32,
@@ -183,5 +199,142 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
     let inv_l = 1.0 / l;
     for (var d: u32 = 0u; d < hd_v; d = d + 1u) {
         arena[o_base + d] = o[d] * inv_l;
+    }
+}
+
+// Merge scratch: [0] merged max, [1] merged sum.
+var<workgroup> dec_pub: array<f32, 2u>;
+// Per-lane partial, reused: first the lane's running max, then its weighted sum.
+var<workgroup> dec_lane: array<f32, DECODE_LANES>;
+// Per-lane weighted O partials, `[dim * DECODE_LANES + lane]` (dim-major: the
+// writes and the reduction reads are both across consecutive lanes).
+var<workgroup> dec_dims: array<f32, DECODE_DIM_CHUNK * DECODE_LANES>;
+
+// One workgroup per (batch, head); `row` is the (batch, head) pair. Every lane
+// keeps its own running (m, l, O[]) over the keys it walks, and the merge at the
+// bottom is the same online-softmax rebase the serial kernel does serially: a
+// lane whose partial sits below the merged max contributes exp(m - max) of its
+// own weighting. Only lane 0's reduction of a 64-lane array differs in shape
+// from the serial form — at this width a barrier tree is not worth it.
+@compute @workgroup_size(DECODE_LANES)
+fn attention_decode(
+    @builtin(local_invocation_id) lid3: vec3<u32>,
+    @builtin(workgroup_id) wid3: vec3<u32>,
+    @builtin(num_workgroups) ngs: vec3<u32>,
+) {
+    let lid = lid3.x;
+    let row = wid3.x + wid3.y * ngs.x;
+    let total = params.batch * params.heads;
+    if (row >= total) { return; }
+    let h = row % params.heads;
+    let b = row / params.heads;
+    let hd = params.head_dim;
+    let hd_v = select(params.v_head_dim, hd, params.v_head_dim == 0u);
+
+    let scale = bitcast<f32>(params.scale_bits);
+    // seq_q == 1 on this route, so the single query row is qi = 0, sitting at
+    // absolute position seq_k - 1 — the same `q_abs` the serial kernel derives.
+    let qi = 0u;
+    let q_abs = select(0u, params.seq_k - params.seq_q, params.seq_k >= params.seq_q);
+    let mask_partial = params.mask_off
+        + b  * params.mask_batch_stride
+        + h  * params.mask_head_stride
+        + qi * params.seq_q_stride;
+    let q_base = params.q_off
+        + b * params.q_batch_stride
+        + h * params.q_head_stride
+        + qi * params.q_seq_stride;
+    let kv_denom = max(params.kv_heads, 1u);
+    let kv_h = h / max(params.heads / kv_denom, 1u);
+    let k_bh = params.k_off + b * params.k_batch_stride + kv_h * params.k_head_stride;
+    let v_bh = params.v_off + b * params.v_batch_stride + kv_h * params.v_head_stride;
+    let o_base = params.out_off
+        + b * params.o_batch_stride
+        + h * params.o_head_stride
+        + qi * params.o_seq_stride;
+
+    var q_reg: array<f32, MAX_HEAD_DIM>;
+    for (var d: u32 = 0u; d < hd; d = d + 1u) { q_reg[d] = arena[q_base + d]; }
+
+    // Running (m, l, O[]) over this lane's share of the keys: lane `lid` takes
+    // keys lid, lid + DECODE_LANES, ... . Zero-fill to a DECODE_DIM_CHUNK
+    // multiple so the merge below never reads an indeterminate O element.
+    var m: f32 = -3.4e38;
+    var l: f32 = 0.0;
+    var o: array<f32, MAX_HEAD_DIM>;
+    let hd_v_pad = (hd_v + DECODE_DIM_CHUNK - 1u) / DECODE_DIM_CHUNK * DECODE_DIM_CHUNK;
+    for (var d: u32 = 0u; d < hd_v_pad; d = d + 1u) { o[d] = 0.0; }
+
+    // Mirrors the `attention` entry point's key loop — same mask kinds, same
+    // sentinels, same online-softmax update — with the walk split across lanes.
+    // Keep the two in sync. This is inlined rather than factored into a shared
+    // helper on purpose: the helper measured ~1.6% on the prefill path, which
+    // the multi-row measurements would show as a regression.
+    for (var s: u32 = lid; s < params.seq_k; s = s + DECODE_LANES) {
+        let k_base = k_bh + s * params.k_seq_stride;
+        var score: f32 = 0.0;
+        for (var d: u32 = 0u; d < hd; d = d + 1u) {
+            score = score + q_reg[d] * arena[k_base + d];
+        }
+        score = score * scale;
+        if (params.mask_kind == 1u) {
+            if (s > q_abs) { score = -3.4e38; }
+        } else if (params.mask_kind == 2u) {
+            if (arena[mask_partial + s * params.seq_k_stride] < 0.5) { score = -1e9; }
+        } else if (params.mask_kind == 3u) {
+            if (s > q_abs) { score = -3.4e38; }
+            else if (q_abs - s > params.window) { score = -3.4e38; }
+        } else if (params.mask_kind == 4u) {
+            score = score + arena[mask_partial + s * params.seq_k_stride];
+        }
+        let m_new = max(m, score);
+        let e_old = exp(m - m_new);
+        let e_cur = exp(score - m_new);
+        l = e_old * l + e_cur;
+        let v_base = v_bh + s * params.v_seq_stride;
+        for (var d: u32 = 0u; d < hd_v; d = d + 1u) {
+            o[d] = e_old * o[d] + e_cur * arena[v_base + d];
+        }
+        m = m_new;
+    }
+
+    // Merge the lanes. Lane 0 does the two scalar reductions (DECODE_LANES adds
+    // each, far cheaper than a barrier tree at this width); `w` rescales each
+    // lane's partial onto the merged max. Empty lanes carry l = 0 and contribute
+    // nothing, and a fully masked row keeps the serial kernel's l = 1 / O = 0.
+    dec_lane[lid] = m;
+    workgroupBarrier();
+    if (lid == 0u) {
+        var mm = -3.4e38;
+        for (var i: u32 = 0u; i < DECODE_LANES; i = i + 1u) { mm = max(mm, dec_lane[i]); }
+        dec_pub[0] = mm;
+    }
+    workgroupBarrier();
+    let w = exp(m - dec_pub[0]);
+    dec_lane[lid] = w * l;
+    workgroupBarrier();
+    if (lid == 0u) {
+        var ll = 0.0;
+        for (var i: u32 = 0u; i < DECODE_LANES; i = i + 1u) { ll = ll + dec_lane[i]; }
+        dec_pub[1] = ll;
+    }
+    workgroupBarrier();
+    let inv_l = 1.0 / dec_pub[1];
+
+    // Output: value dims in DECODE_DIM_CHUNK-wide passes.
+    for (var c: u32 = 0u; c < hd_v; c = c + DECODE_DIM_CHUNK) {
+        for (var j: u32 = 0u; j < DECODE_DIM_CHUNK; j = j + 1u) {
+            dec_dims[j * DECODE_LANES + lid] = w * o[c + j];
+        }
+        workgroupBarrier();
+        if (lid < DECODE_DIM_CHUNK) {
+            let d = c + lid;
+            var acc = 0.0;
+            for (var i: u32 = 0u; i < DECODE_LANES; i = i + 1u) {
+                acc = acc + dec_dims[lid * DECODE_LANES + i];
+            }
+            if (d < hd_v) { arena[o_base + d] = acc * inv_l; }
+        }
+        workgroupBarrier();
     }
 }

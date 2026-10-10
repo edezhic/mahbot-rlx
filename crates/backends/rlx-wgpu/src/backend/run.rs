@@ -25,8 +25,9 @@ use crate::kernels::{
     RopeBwdParams, RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams,
     SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
     WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
-    ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_kernel,
-    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_decode_eligible,
+    attention_decode_kernel, attention_kernel, axial_rope2d_kernel,
+    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
     cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
@@ -51,13 +52,13 @@ use crate::kernels::{
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
     matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
-    maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
-    q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel, reverse_kernel,
-    rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel,
-    rope_kernel, sample_kernel, scaled_dequantize_kernel, scaled_grouped_matmul_decode_kernel,
-    scaled_matmul_decode_kernel, scaled_quant_scale_kernel, scaled_quantize_kernel,
-    scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel, selective_scan_kernel,
-    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
+    maxpool3d_backward_kernel, narrow_kernel, note_attention_route, pool1d_kernel, pool2d_kernel,
+    pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel,
+    reverse_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
+    rope_backward_kernel, rope_kernel, sample_kernel, scaled_dequantize_kernel,
+    scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel, scaled_quant_scale_kernel,
+    scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel,
+    selective_scan_kernel, softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
     softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
     umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, welch_peaks_gpu_kernel, where_kernel,
 };
@@ -2503,12 +2504,39 @@ impl WgpuExecutable {
                                     step_i += 1;
                                     continue;
                                 }
-                                let ak = attention_kernel(&dev.device);
+                                // Route from the extents this run walks, not
+                                // from the lowered ones: `scale` is the same
+                                // active-extent factor the uniform write above
+                                // applies to seq_q / seq_k.
+                                let decode = attention_decode_eligible(
+                                    seq_q_s,
+                                    scale(params.seq_k),
+                                    params.head_dim,
+                                    params.v_head_dim,
+                                );
+                                let ak = if decode {
+                                    // Both kernels are `OnceLock`-cached, so
+                                    // this is a load after the first step; like
+                                    // the scaled-multiply decode kernels, the
+                                    // variant is fetched where it is used rather
+                                    // than in the prelude, which would compile
+                                    // the shader for graphs that never dispatch
+                                    // attention at all.
+                                    attention_decode_kernel(&dev.device)
+                                } else {
+                                    attention_kernel(&dev.device)
+                                };
                                 pass.set_pipeline(&ak.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = params.batch * params.heads * seq_q_s;
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                // Decode form: one workgroup per (batch, head).
+                                // Serial form: one thread per (batch, head, row).
+                                let (gx, gy, gz) = if decode {
+                                    dispatch_dims(params.batch * params.heads, 1)
+                                } else {
+                                    dispatch_dims(params.batch * params.heads * seq_q_s, 64)
+                                };
                                 pass.dispatch_workgroups(gx, gy, gz);
+                                note_attention_route(decode);
                             }
                             Step::AttentionBackward { params, .. } => {
                                 let axis = if params.wrt == 0 {
