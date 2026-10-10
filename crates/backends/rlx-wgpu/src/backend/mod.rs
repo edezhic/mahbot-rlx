@@ -154,8 +154,9 @@ fn rnn_gru_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
 
 /// Hard cap on the col scratch matrix (bytes). Convs whose col would exceed
 /// this fall back to the direct conv kernel (keeps the arena well under the
-/// 4 GiB storage-binding limit).
-const CONV_IM2COL_MAX_COL_BYTES: u64 = 1024 * 1024 * 1024;
+/// 4 GiB storage-binding limit). The host transposed-conv route reuses the same
+/// cap for its own `col` panel.
+pub(crate) const CONV_IM2COL_MAX_COL_BYTES: u64 = 1024 * 1024 * 1024;
 
 // Defaults live in [`crate::config::WgpuRuntimeConfig::from_env`].
 const _CONV_IM2COL_DEFAULTS: (u64, u64, u64) = (2048, 256, 64);

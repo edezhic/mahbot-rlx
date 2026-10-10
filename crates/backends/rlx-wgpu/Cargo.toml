@@ -200,6 +200,14 @@ name = "coop_self_check"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "conv_transpose2d_host_route"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_transpose2d_parked_param"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "dequant_plan_relaxed"
 required-features = ["backend-tests"]
 

@@ -55,7 +55,7 @@ kernels, pure Rust deps — no FFI, no submodules.
   the record is keyed by byte offset. That key is also why not every operand is judged: an
   operand is measured against the record only where the graph — or, at run time, the flag
   the host step recorded — says it is a parameter's storage, since an activation a plan put
-  on a released slot starts where a parameter's storage did. Five arms ask that question
+  on a released slot starts where a parameter's storage did. Six arms ask that question
   themselves instead: `Op::DequantMatMul`'s quantized sub-path refuses a packed
   weight rather than staging it (its GGUF and Int8 sub-paths keep their own route, but
   every other scheme's step reads the weight through the f32-lane staging),
@@ -63,7 +63,9 @@ kernels, pure Rust deps — no FFI, no submodules.
   step can address, and the whole-arena host steps this backend still keeps for
   `Op::LayerNorm2d` and for `Op::Reverse` refuse a parked operand and an arena past
   their 32-bit byte offsets too (the flip also refuses a declared element width the
-  arena does not store). An absolute-offset arm
+  arena does not store) — and so does `Op::ConvTranspose2d`'s host route, whose step
+  carries 32-bit byte offsets into that arena while its compact form stages the weight
+  from there. An absolute-offset arm
   that is not classified there and binds through the windowed path is refused at
   bind time instead of read through a re-based window. `RLX_WGPU_SHARD_GPU=1`
   cannot undo any of it.

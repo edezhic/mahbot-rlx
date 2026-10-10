@@ -643,41 +643,45 @@ fn assert_host_route_stageable(graph: &Graph, arena: &Arena, node: &rlx_ir::Node
     }
 }
 
-/// The guards a whole-arena host step needs, whichever op keeps one.
+/// The guards a host step addressed by 32-bit arena byte offsets needs, whichever
+/// op keeps one.
 ///
-/// `Step::LayerNorm2dHost` and `Step::ReverseHost` are addressed by 32-bit byte
-/// offsets into the whole arena, and read their operands as one f32 lane per
-/// element. A parameter parked in the separate weight buffer loses
-/// `WEIGHT_BUF_TAG` in that cast, and an arena past `u32::MAX` bytes truncates
-/// every offset, so either geometry would read and write the wrong bytes
-/// silently. Refuse loudly instead; `device_hint` names the route that can
-/// address them.
+/// `Step::LayerNorm2dHost`, `Step::ReverseHost` and `Step::ConvTranspose2dHost` are
+/// addressed by 32-bit byte offsets into the activation arena and read their
+/// operands as one f32 lane per element — the transposed conv even in its compact
+/// form, which stages only the tensors it touches. A parameter parked in the
+/// separate weight buffer loses `WEIGHT_BUF_TAG` in that cast, and an arena past
+/// `u32::MAX` bytes truncates every offset, so either geometry would read and
+/// write the wrong bytes silently. Refuse loudly instead; `parked_hint` names the
+/// route that can address a parked operand.
 ///
-/// That route is the one these ops take by default, which is what keeps a plan
-/// that parks every parameter working: the device step stages such an operand,
-/// and the generic packed host route (`Step::HostOp`) stages it too — but an
-/// unsharded arena with the norm forced onto this route reaches neither, and
-/// this refusal is then the honest answer rather than a wrong one.
-fn assert_whole_arena_host_route(
+/// For the norm and the flip that route is the device step they take by default,
+/// which is what keeps a plan that parks every parameter working: the device step
+/// stages such an operand, and the generic packed host route (`Step::HostOp`)
+/// stages it too — but an unsharded arena with the norm forced onto this route
+/// reaches neither, and this refusal is then the honest answer rather than a wrong
+/// one. The transposed conv has no device step on this backend at all.
+fn assert_byte_offset_host_route(
     graph: &Graph,
     arena: &Arena,
     node: &rlx_ir::Node,
-    device_hint: &str,
+    parked_hint: &str,
 ) {
     assert_param_operands_are_lane_readable(graph, arena, node);
     assert!(
         !any_parked_operand(arena, node),
-        "rlx-wgpu: REFUSED (parked {:?} operand): the whole-arena host step carries 32-bit byte \
-         offsets that drop the weight-buffer tag ({}). Avoid parking this operand, or \
-         {device_hint}.",
+        "rlx-wgpu: REFUSED (parked {:?} operand): the host step addresses its operands by 32-bit \
+         byte offsets into the activation arena, which drop the weight-buffer tag ({}). Avoid \
+         parking this operand, or {parked_hint}.",
         node.op.kind(),
         parked_operand_report(arena),
     );
     assert!(
         arena.size <= u32::MAX as usize,
-        "rlx-wgpu: REFUSED ({:?} arena too large): the whole-arena host step carries 32-bit byte \
-         offsets and this arena is {} bytes, so its offsets would truncate. Shrink the arena, or \
-         {device_hint}.",
+        "rlx-wgpu: REFUSED ({:?} arena too large): the host step addresses its operands by 32-bit \
+         byte offsets into the activation arena and this arena is {} bytes, so its offsets would \
+         truncate. Shrink the arena, or run the op on a backend whose host route addresses its \
+         operands by 64-bit offsets.",
         node.op.kind(),
         arena.size,
     );
@@ -7396,7 +7400,18 @@ pub(crate) fn compile_static_inner(
             } => {
                 let in_shape = &graph.node(node.inputs[0]).shape;
                 let out_shape = &node.shape;
-                schedule.push(Step::ConvTranspose2d {
+                // Host route, and this op's only one: the step carries 32-bit byte offsets
+                // into the activation arena, so a parameter parked in the separate weight
+                // buffer would be read from the wrong bytes silently (see
+                // `assert_byte_offset_host_route`).
+                assert_byte_offset_host_route(
+                    &graph,
+                    &arena,
+                    node,
+                    "keep this weight in the activation arena (it is what RLX_WGPU_ALL_PARAMS_WEIGHT parks), \
+                     or run the op on a backend whose host route stages a parked parameter",
+                );
+                schedule.push(Step::ConvTranspose2dHost {
                     src_byte_off: arena.offset(node.inputs[0]) as u32,
                     weight_byte_off: arena.offset(node.inputs[1]) as u32,
                     dst_byte_off: arena.offset(node.id) as u32,
@@ -7896,7 +7911,7 @@ pub(crate) fn compile_static_inner(
                     continue;
                 }
                 // Host route: a whole-arena step whose byte offsets are `u32`.
-                assert_whole_arena_host_route(
+                assert_byte_offset_host_route(
                     &graph,
                     &arena,
                     node,
@@ -8055,7 +8070,7 @@ pub(crate) fn compile_static_inner(
                 // `elems * size_bytes` of interleaved lanes) and the four-byte
                 // reals keep this route; every other width is refused loudly.
                 let host_dtype = in_shape.dtype();
-                assert_whole_arena_host_route(
+                assert_byte_offset_host_route(
                     &graph,
                     &arena,
                     node,

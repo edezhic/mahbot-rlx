@@ -1398,7 +1398,7 @@ impl WgpuExecutable {
                     | Step::DequantGroupedMatmulMlxHost { .. }
                     | Step::GatedDeltaNet { use_gpu: false, .. }
                     | Step::Lstm { .. }
-                    | Step::ConvTranspose2d { .. }
+                    | Step::ConvTranspose2dHost { .. }
                     | Step::ConvTranspose3dHost { .. }
                     | Step::GroupNormHost { .. }
                     | Step::LayerNorm2dHost { .. }
@@ -3446,7 +3446,7 @@ impl WgpuExecutable {
                             | Step::DequantGroupedMatmulMlxHost { .. }
                             | Step::GatedDeltaNet { use_gpu: false, .. }
                             | Step::Lstm { .. }
-                            | Step::ConvTranspose2d { .. }
+                            | Step::ConvTranspose2dHost { .. }
                             | Step::ConvTranspose3dHost { .. }
                             | Step::GroupNormHost { .. }
                             | Step::LayerNorm2dHost { .. }
@@ -4309,7 +4309,7 @@ impl WgpuExecutable {
                         *carry,
                     );
                 }
-                Step::ConvTranspose2d {
+                Step::ConvTranspose2dHost {
                     src_byte_off,
                     weight_byte_off,
                     dst_byte_off,

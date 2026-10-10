@@ -837,7 +837,10 @@ pub(crate) enum Step {
     LstmGpu {
         params: LstmParams,
     },
-    ConvTranspose2d {
+    /// Host-staged NCHW `Op::ConvTranspose2d` (compact-staged through the
+    /// conv-backward-input kernel where the geometry permits, the whole-arena
+    /// CPU kernel otherwise).
+    ConvTranspose2dHost {
         src_byte_off: u32,
         weight_byte_off: u32,
         dst_byte_off: u32,
@@ -1286,7 +1289,7 @@ impl Step {
             | Step::DequantGroupedMatmulGguf { .. }
             | Step::DequantGroupedMatmulMlxHost { .. }
             | Step::Lstm { .. }
-            | Step::ConvTranspose2d { .. }
+            | Step::ConvTranspose2dHost { .. }
             | Step::ConvTranspose3dHost { .. }
             | Step::GroupNormHost { .. }
             | Step::LayerNorm2dHost { .. }
@@ -1545,7 +1548,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::GatedDeltaNet { .. } => "gated_delta_net",
         Step::Lstm { .. } => "lstm",
         Step::LstmGpu { .. } => "lstm_gpu",
-        Step::ConvTranspose2d { .. } => "conv_transpose2d",
+        Step::ConvTranspose2dHost { .. } => "conv_transpose2d_host",
         Step::ConvTranspose3d { .. } => "conv_transpose3d",
         Step::ConvTranspose3dHost { .. } => "conv_transpose3d_host",
         Step::GroupNorm { .. } => "group_norm",
@@ -1652,7 +1655,7 @@ pub(crate) fn step_runs_on_host(step: &Step) -> bool {
         | Step::DequantGroupedMatmulGguf { .. }
         | Step::DequantGroupedMatmulMlxHost { .. }
         | Step::Lstm { .. }
-        | Step::ConvTranspose2d { .. }
+        | Step::ConvTranspose2dHost { .. }
         | Step::ConvTranspose3dHost { .. }
         | Step::GroupNormHost { .. }
         | Step::LayerNorm2dHost { .. }
