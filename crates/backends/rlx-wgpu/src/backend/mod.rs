@@ -776,6 +776,74 @@ impl WgpuExecutable {
         }
     }
 
+    /// The debug scans that read the whole arena back once a run's device work is
+    /// complete: the node-stats dump and the per-node NaN/Inf localization. Every
+    /// tail that reads outputs back runs this, not only the post-loop one — a batch
+    /// that carries its work to the end returns through the fused readback (or the
+    /// tiny / deferred-tail readback), so a scan wired only to the run loop's exit
+    /// left those runs unscanned. The zero-filled return (`skip_readback` /
+    /// `defer_tail`) reads nothing back and does not come here.
+    ///
+    /// Both knobs are debug-only, so this costs a normal run nothing; the two
+    /// tiny-readback tails deliberately gain the node-stats dump as well, since a
+    /// tail that reads outputs back is exactly where the dump belongs.
+    pub(crate) fn debug_scans_after_run(&self, dev: &crate::device::WgpuDevice) {
+        self.dump_node_stats_if_requested(dev);
+        // NaN/Inf localization (`RLX_DEBUG_NANS`; `RLX_WGPU_NAN_TRACE` kept as an
+        // alias). wgpu can read every node's buffer back from the arena after the
+        // run, so this is a true per-node scan in topological order — the first bad
+        // node is the origin, and the shared scanner classifies it as culprit vs
+        // propagator with provenance + a fix hint.
+        let scanner = {
+            let s = rlx_ir::numeric_check::DebugScanner::from_env("wgpu");
+            if s.enabled() {
+                Some(s)
+            } else if rlx_ir::env::flag("RLX_WGPU_NAN_TRACE") {
+                Some(rlx_ir::numeric_check::DebugScanner::with_mode(
+                    rlx_ir::numeric_check::DebugMode::Warn,
+                    "wgpu",
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some(scanner) = scanner {
+            let mut found = false;
+            for node in self.graph.nodes() {
+                if !self.arena.has(node.id)
+                    || matches!(
+                        node.op,
+                        rlx_ir::Op::Input { .. }
+                            | rlx_ir::Op::Param { .. }
+                            | rlx_ir::Op::Constant { .. }
+                    )
+                {
+                    continue;
+                }
+                let out = self.arena.read_f32(&dev.device, &dev.queue, node.id);
+                // Gather f32 operand buffers for culprit-vs-propagator (skip
+                // packed U8/I8 quant weights, which aren't f32).
+                let mut owned: Vec<(rlx_ir::NodeId, Vec<f32>)> = Vec::new();
+                for &inp in &node.inputs {
+                    let ish = self.graph.node(inp).shape.dtype();
+                    if self.arena.has(inp) && !matches!(ish, rlx_ir::DType::U8 | rlx_ir::DType::I8)
+                    {
+                        owned.push((inp, self.arena.read_f32(&dev.device, &dev.queue, inp)));
+                    }
+                }
+                let inrefs: Vec<(rlx_ir::NodeId, &[f32])> =
+                    owned.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+                if scanner.check(&self.graph, node.id, &out, &inrefs).is_some() {
+                    found = true;
+                    break; // first bad in topo order is the origin
+                }
+            }
+            if !found {
+                eprintln!("rlx nan-check [wgpu]: clean run — no NaN/Inf");
+            }
+        }
+    }
+
     pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
         if !self.input_offsets.contains_key(name) {
             return false;

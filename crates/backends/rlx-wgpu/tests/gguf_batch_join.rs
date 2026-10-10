@@ -316,10 +316,11 @@ fn mirrored_x() -> (
 /// neither is a planner view — `pure_view_offset` aliases a `Cast` only when the
 /// dtypes match — so each gets its own slot and the second copy's destination is
 /// exactly the packed multiply's X window. With `RLX_WGPU_HOST_BUFFER_COPY=1`
-/// that copy takes the host route (read at the step's own arm and nowhere else in
-/// the crate) and, its source not a weight, the write is deferred into the host
-/// mirror — where only the join block's own flush can carry it to the device
-/// before the joined multiply reads it.
+/// that copy takes the host route (the run path's one route answer for a copy,
+/// read at the batch boundary and at the copy's own arm) and, its source not a
+/// weight, the write is deferred into the host mirror — where only the join
+/// block's own flush can carry it to the device before the joined multiply reads
+/// it.
 fn host_copied_x() -> (
     Graph,
     Vec<(&'static str, Vec<u8>)>,
@@ -789,9 +790,9 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
         "the two value-preserving casts must lower to two non-zero BufferCopies, \
          the second feeding the packed multiply: schedule = {hc_kinds:?}"
     );
-    // Scoped to the run: the knob is read at the copy's own arm, so compiling
-    // under it is not needed — but leaving it set would re-route every later
-    // bracket's copies.
+    // Scoped to the run: the knob is read where the run path routes a copy (the
+    // copy's own arm and the batch boundary), so compiling under it is not needed
+    // — but leaving it set would re-route every later bracket's copies.
     rlx_ir::env::set("RLX_WGPU_HOST_BUFFER_COPY", "1");
     // Warm up (arena + uniforms), then bracket one forward pass.
     let _ = hcexe.run(&hc_inputs);

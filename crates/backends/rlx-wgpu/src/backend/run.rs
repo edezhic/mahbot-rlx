@@ -108,57 +108,158 @@ impl WgpuExecutable {
         .is_provably_device_only()
     }
 
-    /// Whether this run treats `step` as a host boundary: every host-classified
-    /// step is one except a packed multiply this run joins into the enclosing batch.
-    /// The run path's scheduling decisions read this rather than the plan-time
-    /// classification, which stays as it is and keeps its consumers (the
-    /// uniform/bind-group lanes, the memory plan, the browser answer).
+    /// Whether this run treats `self.schedule[step_i]` as a host boundary: every
+    /// host-classified step is one except a device-only call this run joins into
+    /// the enclosing batch — a provably device-only packed multiply
+    /// ([`Self::joined_dequant_gguf`]) or a buffer copy whose route answer is the
+    /// device one ([`CopyRoute::joins_batch`]). The run path's scheduling decisions
+    /// read this rather than the plan-time classification, which stays as it is and
+    /// keeps its consumers (the uniform/bind-group lanes, the memory plan, the
+    /// browser answer).
     ///
-    /// Every place the run path consults this step's host-vs-device behaviour, and
-    /// what this run does there:
+    /// A step this run *skips* never joins, whichever classification it carries: a
+    /// baked static pack (`static_once_done`) is consumed by the pass loop or by the
+    /// skip loop that follows the batch, so it is not work this boundary can hand to
+    /// the enclosing run. That leaves each skip where it was before the copy join —
+    /// a host-classified staging copy keeps this boundary's `true` (the skip loop
+    /// consumes it), a device one keeps `false` (the pass loop consumes it together
+    /// with its bind-group cursor).
     ///
-    /// * **changed** — `starting_on_host` (a joined call starts no batch of its own;
-    ///   a carried encoder is that batch's outstanding device work), the post-batch
-    ///   `need_host_sync` poll and mirror clear (a joined call is not a host sync),
-    ///   and the door that flushes the host mirror before device work following a
-    ///   host step (it fires for a joined call too, so a host result reaches the
-    ///   device before the batch carrying the joined dispatches).
-    /// * **kept, plan-time too** — the lane cursors: the uniform pre-pass and the
-    ///   dispatch loop skip `step_runs_on_host` steps to index `gpu_ui`, and
-    ///   `gpu_bi` likewise, so a joined call consumes no uniform, bind-group or
-    ///   meta-buffer slot and no later step's index moves.
-    ///   `Step::DequantMatmulGguf` carries no lane index for the same reason, and
-    ///   the plan-time pushes in `compile/lower.rs` are its other half.
-    /// * **kept** — the inner pass loop's `break` on a host step (that break is what
-    ///   feeds the join, which consumes the step right after it), its two
-    ///   `static_once` skips and its `step_needs_pass_flush` split, the final mirror
-    ///   flush, the BufferCopy device route's poll/invalidate, and the
+    /// `step_i` must be within `self.schedule`; every caller checks that first.
+    ///
+    /// The sites that read the answer, so "the boundary stays correct everywhere it
+    /// is consulted" has one list:
+    /// * **a joined call is device work** at `starting_on_host`, at the post-batch
+    ///   `need_host_sync` and its mirror clear, and at the door in front of device
+    ///   work after a host step (which now fires for it too). These are the sites
+    ///   that act on this step only because the plan classifies it as a host step.
+    /// * **a joined call is device work *inside the batch*** for
+    ///   `step_needs_pass_flush`, where it can now be the `prev` step: on
+    ///   Vulkan/DX12-class adapters that arm asks for the pass split and the drain
+    ///   the copy's own submission used to provide (commented at that arm).
+    /// * **the run's exit path**: a joined call keeps the batch carried, so the loop
+    ///   runs on to the tail that reads the outputs back instead of ending the run
+    ///   after the arm — which tail a copy-ending graph leaves through is decided
+    ///   here, and that is why every such tail runs the debug scans
+    ///   ([`Self::debug_scans_after_run`]).
+    /// * **untouched**: the lane cursors (a joined call consumes no uniform,
+    ///   bind-group or meta-buffer slot, so no later step's index moves), the pass
+    ///   loop's `break` on a host step and its two `static_once` skips, the final
+    ///   mirror flush, the host route's own readback and drain, `bypasses_host_cache`
+    ///   (a joined call never reaches it — the join consumes it first), and the
     ///   `RLX_WGPU_DBG_COUNTERS` census.
-    /// * **kept, and a joined call never reaches them** — `needs_f16_drain` (the
-    ///   site looks at the step *after* the batch, which is never the joined one),
-    ///   the batch-end `continue`, and `bypasses_host_cache` with its pre-step
-    ///   flush/poll and post-step `host_cache.clear()`. The join consumes a joined
-    ///   call before the host match, and the mirror a host step reads is cleared at
-    ///   the next host boundary (`need_host_sync`, re-keyed above) — the joined
-    ///   batch's own submission invalidates it there.
-    /// * **kept** — `requires_host_execution` / `run_async`'s browser assert: the
-    ///   browser answer stays pessimistic, and stays correct because the host arms
-    ///   remain reachable in the ladder at run time.
-    ///
-    /// The one site where the widened `step_is_tail_host` term is not equivalent to
-    /// the old `step_runs_on_host(next)`: the post-batch `need_host_sync` under
-    /// `RLX_WGPU_ONE_OP_PER_PASS`, where the pass loop's one-op `break` can leave
-    /// `step_i` on a tail-host step, and this then adds a poll and a mirror clear
-    /// the old predicate did not ask for — harmless in that debugging mode (it only
-    /// drains work already submitted), and recorded so the claim is exact.
     fn step_breaks_batch(
         &self,
-        step: &Step,
+        step_i: usize,
         scale: &impl Fn(u32) -> u32,
         one_op_per_pass: bool,
+        host_cache: &rlx_gpu_host::HostTensorCache,
+        dev: &crate::device::WgpuDevice,
     ) -> bool {
-        let joins = !one_op_per_pass && self.joined_dequant_gguf(step, scale);
+        let step = &self.schedule[step_i];
+        // A step this run skips is not work this boundary can hand to the
+        // enclosing run — see the doc above.
+        let skipped = self.static_once_done && self.static_once_steps.contains(&step_i);
+        let joins = !one_op_per_pass
+            && !skipped
+            && (self.joined_dequant_gguf(step, scale)
+                || self
+                    .buffer_copy_route_now(step, host_cache, dev)
+                    .is_some_and(CopyRoute::joins_batch));
         step_is_tail_host(step) || (step_runs_on_host(step) && !joins)
+    }
+
+    /// The run path's route answer for a copy `step`, or `None` for every other
+    /// step kind. **This is the one [`buffer_copy_route`] call the run path makes for
+    /// a copy**: the batch boundary asks it (through [`CopyRoute::joins_batch`]) and
+    /// the host arm routes by it, both from the same run state — so the boundary and
+    /// the arm cannot disagree, which is what makes a join safe to take.
+    ///
+    /// `deferred_writes` is the mirror's own answer, so a copy with a pending host
+    /// write can never answer `Device`: the host route is the one that reads the
+    /// mirror, and joining a call that could reach it would run host work with an
+    /// encoder carried.
+    fn buffer_copy_route_now(
+        &self,
+        step: &Step,
+        host_cache: &rlx_gpu_host::HostTensorCache,
+        dev: &crate::device::WgpuDevice,
+    ) -> Option<CopyRoute> {
+        let Step::BufferCopy {
+            src_byte_off,
+            dst_byte_off,
+            bytes,
+        } = step
+        else {
+            return None;
+        };
+        Some(buffer_copy_route(&CopyRouteInputs {
+            src: *src_byte_off,
+            dst: *dst_byte_off,
+            nbytes: *bytes as u64,
+            arena_size: self.arena.size as u64,
+            max_binding: dev.device.limits().max_storage_buffer_binding_size,
+            // `shard_size` is 0 exactly when the arena is unsharded.
+            shard_size: self.arena.shard_size as u64,
+            weight_operand: crate::buffer::is_weight_off(*src_byte_off as usize)
+                || crate::buffer::is_weight_off(*dst_byte_off as usize),
+            deferred_writes: host_cache.has_deferred_writes(),
+            force_host: rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY"),
+        }))
+    }
+
+    /// Encode the whole device-side body of a `Step::BufferCopy` into `enc`: one
+    /// `copy_kernel` dispatch over the storage window `[base, base + size)` that
+    /// [`buffer_copy_route`] picked, in a compute pass of its own.
+    ///
+    /// Shared by the two places the copy's work is encoded — the host arm, which
+    /// submits the encoder it creates, and the join branch, which hands the
+    /// enclosing batch's encoder — so both encode the identical dispatch. Its own
+    /// pass is what keeps the barrier the arena's aliased slots need between this
+    /// write and every later read of it: a pass of its own is exactly what the
+    /// unjoined arm's submission of its own used to provide. Nothing is staged for
+    /// it: the window is the arena itself, and the per-call uniform and bind group
+    /// live as long as the encoder that references them.
+    fn encode_arena_copy_dispatch(
+        &self,
+        dev: &crate::device::WgpuDevice,
+        enc: &mut wgpu::CommandEncoder,
+        src: u64,
+        dst: u64,
+        nbytes: u64,
+        base: u64,
+        size: u64,
+    ) {
+        // `copy_route` refused a zero-byte copy above, and every producer sizes a
+        // slot at `elems * 4`, so the element count below is exact.
+        let elems = (nbytes / 4) as u32;
+        let p = CopyParams {
+            n: elems,
+            in_off: (src.saturating_sub(base) / 4) as u32,
+            out_off: (dst.saturating_sub(base) / 4) as u32,
+            _p0: 0,
+            _p1: 0,
+            _p2: 0,
+            _p3: 0,
+            _p4: 0,
+        };
+        let ck = copy_kernel(&dev.device);
+        let u = dev.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rlx-wgpu arena_copy uniform"),
+            size: std::mem::size_of::<CopyParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        dev.queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+        let bg = bind_arena_window(&dev.device, ck, &self.arena, base, size, &u);
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("rlx-wgpu arena_copy pass"),
+            ..Default::default()
+        });
+        pass.set_pipeline(&ck.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        let (gx, gy, gz) = dispatch_dims(elems, 64);
+        pass.dispatch_workgroups(gx, gy, gz);
     }
 
     /// Register a resident-KV row feed: `handle_name` (a device-resident input,
@@ -495,9 +596,9 @@ impl WgpuExecutable {
     ///
     /// Read off the plan-time classification, deliberately: it stays pessimistic,
     /// and stays correct, because the host arms remain reachable in the run-time
-    /// route ladder — the one-row packed multiply the run encodes into the
-    /// enclosing batch is joined by a run-time decision, and the same step runs on
-    /// the host whenever its ladder answer is not device-only.
+    /// route ladder — a one-row packed multiply and a buffer copy whose route
+    /// answers `Device` are joined by a run-time decision, and either runs on the
+    /// host whenever its own ladder answer is not device-only.
     pub fn requires_host_execution(&self) -> bool {
         self.schedule
             .iter()
@@ -1443,19 +1544,20 @@ impl WgpuExecutable {
         let mut gpu_bi = 0usize;
         let mut fft_i = 0usize;
         let mut host_cache = rlx_gpu_host::HostTensorCache::new();
-        // The batch's encoder. A joined packed multiply hands it to the next
-        // outer iteration instead of submitting, so one contiguous run of device
-        // work is one command buffer and one submission — the route's own
-        // `enc.finish()` would be exactly the per-call submission this join
-        // removes. It also removes command buffers rather than adding any: a
-        // batch creates its encoder once (the loop below reuses it across joined
-        // calls), so a forward pass holds at most one encoder that has been created
-        // but not yet submitted, against the graphics layer's own budget of those
-        // (4096 on Metal). Never `Some` when the loop exits: the loop condition
-        // keeps iterating until the carried encoder has been submitted, and every
-        // other `break` out of the loop happens after a submission — the snapshot
-        // break below is the one that does not, and it cannot see a carried encoder
-        // because the snapshot forces `one_op_per_pass`, which makes the join inert.
+        // The batch's encoder. A joined call — a packed multiply or a
+        // device-route copy — hands it to the next outer iteration instead of
+        // submitting, so one contiguous run of device work is one command buffer
+        // and one submission — the route's own `enc.finish()` would be exactly
+        // the per-call submission this join removes. It also removes command
+        // buffers rather than adding any: a batch creates its encoder once (the
+        // loop below reuses it across joined calls), so a forward pass holds at
+        // most one encoder that has been created but not yet submitted, against
+        // the graphics layer's own budget of those (4096 on Metal). Never `Some`
+        // when the loop exits: the loop condition keeps iterating until the
+        // carried encoder has been submitted, and every other `break` out of the
+        // loop happens after a submission — the snapshot break below is the one
+        // that does not, and it cannot see a carried encoder because the snapshot
+        // forces `one_op_per_pass`, which makes the join inert.
         let mut pending_enc: Option<wgpu::CommandEncoder> = None;
         // "This batch dispatched something" — set by any dispatched or joined
         // step, reset when the batch's encoder is created, and read by the
@@ -1472,7 +1574,7 @@ impl WgpuExecutable {
             // step may read or write the arena.
             let starting_on_host = pending_enc.is_none()
                 && step_i < self.schedule.len()
-                && self.step_breaks_batch(&self.schedule[step_i], &scale, one_op_per_pass);
+                && self.step_breaks_batch(step_i, &scale, one_op_per_pass, &host_cache, dev);
             if !starting_on_host {
                 let mut enc = match pending_enc.take() {
                     Some(enc) => enc,
@@ -2253,8 +2355,10 @@ impl WgpuExecutable {
                             Step::BufferCopy { .. } => {
                                 // `step_runs_on_host` classifies a copy as a host
                                 // step, so the host-step loop below routes it —
-                                // a copy-kernel dispatch or a host round-trip —
-                                // and this GPU pass encodes nothing for it.
+                                // a copy-kernel dispatch (into a batch whose
+                                // encoder the join branch carries, or one of its
+                                // own) or a host round-trip — and this GPU pass
+                                // encodes nothing for it.
                             }
                             Step::ElementwiseRegion { params } => {
                                 let len_s = scale(params.len);
@@ -3454,12 +3558,53 @@ impl WgpuExecutable {
                     pending_enc = Some(enc);
                     continue;
                 }
+                // A joined copy: the same shape as the packed multiply above — end
+                // the pass, encode the copy's work into THIS encoder, carry the
+                // batch on. The route value comes from `buffer_copy_route_now`; its
+                // doc has why this branch and the batch boundary cannot disagree.
+                //
+                // The dispatch's own pass, and the reason nothing is staged, are
+                // `encode_arena_copy_dispatch`'s doc. The mirror's entry for `dst` is
+                // invalidated here instead of after a submission — the same point in
+                // the work's life, since no host step can run while an encoder is
+                // carried and the route refuses to join while any deferred write is
+                // pending. `pass_dispatched` keeps the whole-mirror clear at the next
+                // host boundary firing.
+                if !one_op_per_pass
+                    && let Some(step) = self.schedule.get(step_i)
+                    && let Some((base, size)) = self
+                        .buffer_copy_route_now(step, &host_cache, dev)
+                        .and_then(CopyRoute::join_window)
+                    && let Step::BufferCopy {
+                        src_byte_off,
+                        dst_byte_off,
+                        bytes,
+                    } = step
+                {
+                    self.encode_arena_copy_dispatch(
+                        dev,
+                        &mut enc,
+                        *src_byte_off,
+                        *dst_byte_off,
+                        *bytes as u64,
+                        base,
+                        size,
+                    );
+                    host_cache.invalidate(*dst_byte_off as usize);
+                    step_i += 1;
+                    pass_dispatched = true;
+                    pending_enc = Some(enc);
+                    continue;
+                }
                 // `step_runs_on_host` on purpose, not `step_breaks_batch`: the two
                 // agree here. A joined call never reaches this site (the branch above
                 // consumed it), and neither does the widened tail-host term change the
                 // answer — `step_needs_pass_flush` has no arm for a tail-host step kind
                 // and is false for every `DequantMatmulGguf` arm, so the drain is off
-                // under both predicates.
+                // under both predicates. A *joined copy* can be the `prev` step this
+                // reads: on a Vulkan/DX12-class adapter that arm then asks for the
+                // drain, which stands in for the boundary the copy's own submission
+                // used to provide (see `step_breaks_batch`'s doc).
                 let needs_f16_drain = step_i < self.schedule.len()
                     && !step_runs_on_host(&self.schedule[step_i])
                     && step_i > 0
@@ -3498,6 +3643,7 @@ impl WgpuExecutable {
                         let sub = dev.queue.submit(std::iter::once(enc.finish()));
                         wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                         map_rx.recv().unwrap().unwrap();
+                        self.debug_scans_after_run(dev);
                         // Decode before arming: `tiny` borrows `self` immutably and the
                         // borrow must end before `arm_static_once` takes it mutably.
                         let decoded =
@@ -3558,6 +3704,7 @@ impl WgpuExecutable {
                             let sub = dev.queue.submit(std::iter::once(rb_enc.finish()));
                             wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                             map_rx.recv().unwrap().unwrap();
+                            self.debug_scans_after_run(dev);
                             // Decode before arming: `tiny` borrows `self` immutably and the
                             // borrow must end before `arm_static_once` takes it mutably.
                             let decoded =
@@ -3584,7 +3731,7 @@ impl WgpuExecutable {
                             let sub = dev.queue.submit(std::iter::once(rb_enc.finish()));
                             wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                             map_rx.recv().unwrap().unwrap();
-                            self.dump_node_stats_if_requested(dev);
+                            self.debug_scans_after_run(dev);
                             let partial = decode_mapped_readback_f32(staging.buffer(), &layout);
                             self.arm_static_once();
                             return self.pack_readback_outputs(&plan, partial);
@@ -3595,10 +3742,17 @@ impl WgpuExecutable {
                     crate::backend::note_device_wait();
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                 }
-                // A joined packed multiply is the one host-classified step that is
-                // not a host sync here; `step_breaks_batch`'s doc has the site list.
+                // A joined call — a packed multiply or a device-route copy — is
+                // host-classified but is not a host sync here; `step_breaks_batch`'s
+                // doc has the site list. This is also the one place where the
+                // widened `step_is_tail_host` term is not equivalent to
+                // `step_runs_on_host(next)`: under `RLX_WGPU_ONE_OP_PER_PASS` the
+                // pass loop's one-op `break` can leave `step_i` on a tail-host step,
+                // and this then adds a poll and a mirror clear the old predicate did
+                // not ask for — harmless in that debugging mode (it only drains work
+                // already submitted), and recorded so the claim is exact.
                 let need_host_sync = step_i < self.schedule.len()
-                    && self.step_breaks_batch(&self.schedule[step_i], &scale, one_op_per_pass);
+                    && self.step_breaks_batch(step_i, &scale, one_op_per_pass, &host_cache, dev);
                 if need_host_sync {
                     crate::backend::note_device_wait();
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
@@ -3637,7 +3791,7 @@ impl WgpuExecutable {
                             layout.total_bytes,
                         );
                         map_rx.recv().unwrap().unwrap();
-                        self.dump_node_stats_if_requested(dev);
+                        self.debug_scans_after_run(dev);
                         let partial = decode_mapped_readback_f32(staging.buffer(), &layout);
                         self.arm_static_once();
                         return self.pack_readback_outputs(&plan, partial);
@@ -3705,22 +3859,11 @@ impl WgpuExecutable {
                     let dst = *dst_byte_off;
                     let nbytes = *bytes as u64;
                     let src_is_weight = crate::buffer::is_weight_off(src as usize);
-                    let dst_is_weight = crate::buffer::is_weight_off(dst as usize);
-                    // wgpu forbids `copy_buffer_to_buffer` on one buffer, so a
-                    // device-side copy is the copy kernel over the bind window
-                    // `copy_route` picks.
-                    let route = buffer_copy_route(&CopyRouteInputs {
-                        src,
-                        dst,
-                        nbytes,
-                        arena_size: self.arena.size as u64,
-                        max_binding: dev.device.limits().max_storage_buffer_binding_size,
-                        // `shard_size` is 0 exactly when the arena is unsharded.
-                        shard_size: self.arena.shard_size as u64,
-                        weight_operand: src_is_weight || dst_is_weight,
-                        deferred_writes: host_cache.has_deferred_writes(),
-                        force_host: rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY"),
-                    });
+                    // The route this arm runs by — `buffer_copy_route_now`'s doc has
+                    // why it is the same answer the batch boundary joined on.
+                    let route = self
+                        .buffer_copy_route_now(&self.schedule[step_i], &host_cache, dev)
+                        .expect("this arm is a BufferCopy");
                     if route == CopyRoute::Host {
                         let n_f32 = (nbytes as usize) / 4;
                         let src_u = src as usize;
@@ -3787,44 +3930,19 @@ impl WgpuExecutable {
                             crate::backend::note_device_wait();
                             let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                         }
-                        // `copy_route` refused a zero-byte copy above, and
-                        // every producer sizes a slot at `elems * 4`, so the
-                        // element count below is exact.
-                        let elems = (nbytes / 4) as u32;
-                        let p = CopyParams {
-                            n: elems,
-                            in_off: (src.saturating_sub(base) / 4) as u32,
-                            out_off: (dst.saturating_sub(base) / 4) as u32,
-                            _p0: 0,
-                            _p1: 0,
-                            _p2: 0,
-                            _p3: 0,
-                            _p4: 0,
-                        };
-                        let ck = copy_kernel(&dev.device);
-                        let u = dev.device.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some("rlx-wgpu arena_copy uniform"),
-                            size: std::mem::size_of::<CopyParams>() as u64,
-                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                            mapped_at_creation: false,
-                        });
-                        dev.queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
-                        let bg = bind_arena_window(&dev.device, ck, &self.arena, base, size, &u);
+                        // The copy's own submission: reached when this run did not
+                        // join the call — the step-by-step and snapshot modes, which
+                        // keep one operation per submission on purpose. Anything else
+                        // reaching here is a call the join branch declined, so the
+                        // arm stays self-contained rather than assume it cannot.
                         let mut enc =
                             dev.device
                                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                                     label: Some("rlx-wgpu arena_copy"),
                                 });
-                        {
-                            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                label: Some("rlx-wgpu arena_copy pass"),
-                                ..Default::default()
-                            });
-                            pass.set_pipeline(&ck.pipeline);
-                            pass.set_bind_group(0, &bg, &[]);
-                            let (gx, gy, gz) = dispatch_dims(elems, 64);
-                            pass.dispatch_workgroups(gx, gy, gz);
-                        }
+                        self.encode_arena_copy_dispatch(
+                            dev, &mut enc, src, dst, nbytes, base, size,
+                        );
                         crate::backend::note_device_submit();
                         dev.queue.submit(std::iter::once(enc.finish()));
                         crate::backend::note_device_wait();
@@ -5274,13 +5392,21 @@ impl WgpuExecutable {
             // deferred write is reached by the next flush instead: the join's own
             // flush when the following step is a joined packed multiply, or the
             // host boundary in front of the next host reader of that slot.
+            //
+            // A joined copy no longer breaks the batch, so this door fires in
+            // front of it too. What it owes there is the device poll that a host
+            // step owes the device work after it; it cannot supply a flush, because
+            // a joined copy is only reachable with no deferred write pending — a
+            // dirty mirror forces the copy's own route to `Host`, which makes it a
+            // boundary here and leaves the door unfired. A joined *packed multiply*
+            // is the arm that still needs the flush: nothing in its route consults
+            // the mirror.
             if step_i < self.schedule.len() {
-                let next = &self.schedule[step_i];
-                // A joined packed multiply is the next batch's device work: it
-                // reads what this host step wrote, so the mirror reaches the
-                // device (and the device is polled) before the batch runs — the
-                // same door a plain device step goes through.
-                if !self.step_breaks_batch(next, &scale, one_op_per_pass) {
+                // A joined packed multiply or a joined device-route copy is the
+                // next batch's device work: it reads what this host step wrote, so
+                // the mirror reaches the device (and the device is polled) before
+                // the batch runs — the same door a plain device step goes through.
+                if !self.step_breaks_batch(step_i, &scale, one_op_per_pass, &host_cache, dev) {
                     if host_cache.has_deferred_writes() {
                         let mut a = crate::host_stage::WgpuArena {
                             arena: &self.arena,
@@ -5323,61 +5449,7 @@ impl WgpuExecutable {
             let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
         }
 
-        self.dump_node_stats_if_requested(dev);
-
-        // NaN/Inf localization (RLX_DEBUG_NANS; RLX_WGPU_NAN_TRACE kept as an
-        // alias). wgpu can read every node's buffer back from the arena after
-        // the run, so this is a true per-node scan in topological order — the
-        // first bad node is the origin, and the shared scanner classifies it as
-        // culprit vs propagator with provenance + a fix hint.
-        let scanner = {
-            let s = rlx_ir::numeric_check::DebugScanner::from_env("wgpu");
-            if s.enabled() {
-                Some(s)
-            } else if rlx_ir::env::flag("RLX_WGPU_NAN_TRACE") {
-                Some(rlx_ir::numeric_check::DebugScanner::with_mode(
-                    rlx_ir::numeric_check::DebugMode::Warn,
-                    "wgpu",
-                ))
-            } else {
-                None
-            }
-        };
-        if let Some(scanner) = scanner {
-            let mut found = false;
-            for node in self.graph.nodes() {
-                if !self.arena.has(node.id)
-                    || matches!(
-                        node.op,
-                        rlx_ir::Op::Input { .. }
-                            | rlx_ir::Op::Param { .. }
-                            | rlx_ir::Op::Constant { .. }
-                    )
-                {
-                    continue;
-                }
-                let out = self.arena.read_f32(&dev.device, &dev.queue, node.id);
-                // Gather f32 operand buffers for culprit-vs-propagator (skip
-                // packed U8/I8 quant weights, which aren't f32).
-                let mut owned: Vec<(rlx_ir::NodeId, Vec<f32>)> = Vec::new();
-                for &inp in &node.inputs {
-                    let ish = self.graph.node(inp).shape.dtype();
-                    if self.arena.has(inp) && !matches!(ish, rlx_ir::DType::U8 | rlx_ir::DType::I8)
-                    {
-                        owned.push((inp, self.arena.read_f32(&dev.device, &dev.queue, inp)));
-                    }
-                }
-                let inrefs: Vec<(rlx_ir::NodeId, &[f32])> =
-                    owned.iter().map(|(id, v)| (*id, v.as_slice())).collect();
-                if scanner.check(&self.graph, node.id, &out, &inrefs).is_some() {
-                    found = true;
-                    break; // first bad in topo order is the origin
-                }
-            }
-            if !found {
-                eprintln!("rlx nan-check [wgpu]: clean run — no NaN/Inf");
-            }
-        }
+        self.debug_scans_after_run(dev);
 
         if rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY") {
             if !self.static_once_done && !self.static_once_steps.is_empty() {

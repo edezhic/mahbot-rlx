@@ -415,7 +415,10 @@ pub(crate) enum Step {
     /// bind it (e.g. a small param into the arena's tail scratch region) and to
     /// materialize a node whose slot differs from its input's. `copy_route`
     /// decides where it runs: a copy-kernel dispatch over a bind window covering
-    /// both operands when one exists, otherwise a host round-trip.
+    /// both operands when one exists, otherwise a host round-trip. At run time a
+    /// dispatch-routed copy joins the enclosing batch of device work instead of
+    /// creating a submission of its own (`CopyRoute::joins_batch`); the host
+    /// route keeps its own submission, its own waits and its own readback.
     BufferCopy {
         // u64: staging copies for >4 GiB GGUF decode arenas address tensors past
         // the 4 GiB mark; a u32 byte offset truncates and stages garbage.
@@ -1710,6 +1713,11 @@ pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
         // Discrete Vulkan/DX12: Kitten NSF collapses when Binary/Unary follow
         // MatMul in the same compute pass (peak ~0.05). End the pass so the
         // matmul writes are visible before elementwise. Metal is fine without.
+        //
+        // `BufferCopy` is in the `prev` list because a *joined* copy is dispatched
+        // work in the run's batch (in a pass of its own), so this arm now decides
+        // for it: it keeps elementwise work in a pass of its own after the copy,
+        // where the copy's own command buffer used to put it there.
         Step::Binary { .. }
         | Step::Unary { .. }
         | Step::Where { .. }

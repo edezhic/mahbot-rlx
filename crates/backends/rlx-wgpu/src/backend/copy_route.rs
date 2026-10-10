@@ -16,11 +16,34 @@ const WINDOW_ALIGN: u64 = 256;
 pub(crate) enum CopyRoute {
     /// Zero bytes: nothing to move, on either route.
     Skip,
-    /// One `copy_kernel` dispatch over the window `[base, base + size)`.
+    /// One `copy_kernel` dispatch over the window `[base, base + size)` — a
+    /// dispatch rather than a buffer-to-buffer transfer, because wgpu forbids
+    /// `copy_buffer_to_buffer` between two regions of one buffer and both
+    /// operands are arena offsets.
     Device { base: u64, size: u64 },
     /// A host round-trip: a surviving condition forbids a device copy, or no
     /// single window can cover the range.
     Host,
+}
+
+impl CopyRoute {
+    /// Whether the run path may fold this copy into the enclosing batch of device
+    /// work — the predicate form of [`Self::join_window`], which is the rule.
+    pub(crate) fn joins_batch(self) -> bool {
+        self.join_window().is_some()
+    }
+
+    /// The window a joining copy's dispatch covers, or `None` when the copy keeps
+    /// its own submission. This is the whole of the join rule: only the device route
+    /// joins, because `Host` reads and writes through the host (so it keeps its own
+    /// submission, its own wait(s) and its own readback, with the device drained
+    /// before it goes through the host) and `Skip` moves nothing.
+    pub(crate) fn join_window(self) -> Option<(u64, u64)> {
+        match self {
+            CopyRoute::Device { base, size } => Some((base, size)),
+            CopyRoute::Host | CopyRoute::Skip => None,
+        }
+    }
 }
 
 /// Inputs to [`buffer_copy_route`] — values rather than process state, so the
@@ -284,5 +307,51 @@ mod tests {
             ..inputs(0, 4096, 64)
         };
         assert_eq!(buffer_copy_route(&forced), CopyRoute::Host);
+    }
+
+    /// The batch boundary's join rule — the whole of it: only the device route
+    /// rides the enclosing batch, and it rides it with the window it picked; every
+    /// answer that can read or write through the host keeps its own submission,
+    /// its own wait and its own readback, and the zero-byte skip keeps the
+    /// boundary treatment it has.
+    ///
+    /// This is [`CopyRoute::join_window`] on the same [`buffer_copy_route`] answer
+    /// the run path's host arm routes by, so it is evaluated here without a device
+    /// and cannot disagree with that arm at run time. Which conditions answer
+    /// `Host` — and so decline to join — is the subject of the sibling tests
+    /// above; what is pinned here is what the boundary does with each answer it
+    /// can get.
+    #[test]
+    fn only_the_device_route_joins_the_enclosing_batch() {
+        // The pin's own row-write geometry (`tests/buffer_copy_batch_join.rs`), as
+        // this decision sees it: a 256-byte row (`W = 64`, f32) written far below
+        // the activation it reads, in that pin's unsharded arena, on an adapter
+        // whose binding limit covers the span. Device route, so it joins.
+        let row_write = CopyRouteInputs {
+            max_binding: 4 << 30,
+            ..inputs(262_400, 130_560, 256)
+        };
+        let CopyRoute::Device { base, size } = buffer_copy_route(&row_write) else {
+            panic!("the pin's row write must take the device route");
+        };
+        // ... with a window that covers the byte range, so both operands are inside
+        // the one binding the dispatch reads and writes through.
+        assert!(base <= 130_560 && 262_400 + 256 <= base + size);
+        assert_eq!(
+            buffer_copy_route(&row_write).join_window(),
+            Some((base, size))
+        );
+
+        // Every answer that can read or write through the host declines, and the
+        // one that matters is the pending deferred write: the host route is the one
+        // that reads that mirror, so a copy that joined with one outstanding would
+        // run device work over a mirror that still has to reach the device. Which
+        // conditions answer `Host` at all is the sibling tests' subject; that no
+        // `Host` or `Skip` answer carries a window is `join_window`'s own `match`.
+        let deferred = CopyRouteInputs {
+            deferred_writes: true,
+            ..inputs(0, 4096, 64)
+        };
+        assert!(buffer_copy_route(&deferred).join_window().is_none());
     }
 }

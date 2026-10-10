@@ -108,7 +108,15 @@ name = "bucketed_decode_attn_parity"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "buffer_copy_batch_join"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "buffer_copy_exact"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "buffer_copy_nan_scan"
 required-features = ["backend-tests"]
 
 [[test]]
