@@ -136,5 +136,6 @@ pub fn run_gated_delta_net(
     if use_carry {
         arena.write_bytes_range(queue, state_byte_off, &host[state_h..state_h + st]);
     }
+    crate::backend::note_device_wait();
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
 }

@@ -222,7 +222,9 @@ fn dispatch_prepared(
         let h = prep.params.height;
         pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
     }
+    crate::backend::note_device_submit();
     queue.submit(Some(encoder.finish()));
+    crate::backend::note_device_wait();
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
 }
 

@@ -461,6 +461,7 @@ fn run_with(
         pass.dispatch_workgroups(p.grid.0, p.grid.1, 1);
     }
     enc.copy_buffer_to_buffer(&arena, c_off as u64 * 4, &readback, 0, (m * n) as u64 * 4);
+    crate::backend::note_device_submit();
     queue.submit(Some(enc.finish()));
 
     let slice = readback.slice(..);
@@ -468,6 +469,7 @@ fn run_with(
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
+    crate::backend::note_device_wait();
     device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
     rx.recv().ok()?.ok()?;
     let view = slice.get_mapped_range().ok()?;

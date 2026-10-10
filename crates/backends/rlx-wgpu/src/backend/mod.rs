@@ -435,6 +435,56 @@ pub fn bf16_packed_dispatch_count() -> u64 {
     BF16_PACKED_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide count of `queue.submit` calls `src/` makes. Together with
+/// [`DEVICE_WAITS`] it is the test/telemetry hook for whether a forward pass pays
+/// its own submissions: a call whose work is encoded into the enclosing batch
+/// adds none.
+///
+/// Every `queue.submit` and every `device.poll` in `src/` is annotated with
+/// [`note_device_submit`] / [`note_device_wait`] — including the shared readback
+/// helpers a host route stages through, which no call-site-only counter inside the
+/// run loop would see. `tests/` and `examples/` drive their own brackets and are
+/// not annotated on purpose. A new site in `src/` must be annotated too, or a pin
+/// that brackets a forward pass reads a count that silently missed it — that
+/// completeness is a handoff statement, not a gate.
+pub(crate) static DEVICE_SUBMITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Process-wide count of places this crate blocks on device progress: every
+/// `Device::poll` (indefinite or submission-indexed — the latter is what a
+/// mapped readback waits on).
+pub(crate) static DEVICE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one `queue.submit`.
+#[inline]
+pub(crate) fn note_device_submit() {
+    DEVICE_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count one blocking `Device::poll`.
+#[inline]
+pub(crate) fn note_device_wait() {
+    DEVICE_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Queue submissions this crate has made since process start (or since
+/// [`reset_device_counts`]).
+pub fn device_submit_count() -> u64 {
+    DEVICE_SUBMITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Places this crate has blocked on device progress since process start (or
+/// since [`reset_device_counts`]).
+pub fn device_wait_count() -> u64 {
+    DEVICE_WAITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zero both device counters — for a test bracketing one forward pass.
+pub fn reset_device_counts() {
+    DEVICE_SUBMITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    DEVICE_WAITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl WgpuExecutable {
     /// Resolve the deferred graph against bindings inferred from
     /// `inputs`, recompile the inner state if the bindings changed
@@ -1424,6 +1474,7 @@ fn run_gather_split(
     // Copy the embedding back into the arena (distinct buffers → legal).
     let (dst, dst_off) = arena.resolve_w(out_byte_off);
     enc.copy_buffer_to_buffer(&out_buf, 0, dst, dst_off as u64, out_bytes);
+    crate::backend::note_device_submit();
     queue.submit(std::iter::once(enc.finish()));
 }
 

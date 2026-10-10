@@ -481,12 +481,14 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     }
 
     // Throughput at those shapes and beyond over repeated calls — a measurement
-    // for the record, not a threshold. One call's own submission and device wait
-    // swamp the streaming it does, which is why this is not a single call, and
-    // the best of a few rounds is reported rather than one round: at the narrower
-    // width the per-call floor is a large part of the figure, so the spread
-    // between rounds is real information about the shape, not noise to smooth
-    // away silently.
+    // for the record, not a threshold. At these one-row shapes the arm's
+    // dispatches ride in the enclosing batch, so what a call costs per call is its
+    // encode plus that batch's own submission and output readback, and the
+    // remainder is the streaming it does — which is why this is not a single call,
+    // and the best of a few rounds is reported rather than one round: at the
+    // narrower width the per-call floor is a large part of the figure, so the
+    // spread between rounds is real information about the shape, not noise to
+    // smooth away silently.
     for (scheme, ggml) in [
         (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K),
         (QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K),

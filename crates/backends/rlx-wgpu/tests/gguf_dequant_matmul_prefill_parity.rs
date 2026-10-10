@@ -317,7 +317,8 @@ const ROUTE_HOST: &str = "host dequant (k is not a whole number of GGUF blocks, 
      the fused GEMV/GEMM reads, so at m > 1 no fused route applies)";
 
 /// The route the wgpu encoder takes for a packed `DequantMatMul`, derived from
-/// the runtime selector: `use_gemv` in `rlx-wgpu/src/backend/run.rs` and
+/// the runtime selector: `gguf_gpu::select_path` (whose tiled one-row arm is
+/// `gemv_one_row_device_ok`), the ladder the run path calls, and
 /// `gguf_gpu::encode_dequant_matmul_gguf_into`'s Q1_0 → grouped K-quant →
 /// per-row ladder.
 ///
@@ -326,11 +327,11 @@ const ROUTE_HOST: &str = "host dequant (k is not a whole number of GGUF blocks, 
 /// lives in `gguf_matmul_route.rs`'s single-test binary. This helper mirrors the
 /// same ladder so each cell can print which route it *should* have taken.
 ///
-/// The selector is `use_gemv = m == 1 || scheme == Q1_0` FIRST and the `k` gate
-/// only after it, so `m == 1` takes the fused path whenever the X window is
-/// four-element addressable (the tiled arm's `vec4` read) — the `k % block`
-/// requirement belongs to the `m > 1` arm alone, and printing it on the decode
-/// cells would claim a gate the encoder never consults.
+/// The selector checks the fused arm FIRST and the `k` gate only after it, so
+/// `m == 1` takes the fused path whenever the X window is four-element
+/// addressable (the tiled arm's `vec4` read) — the `k % block` requirement
+/// belongs to the `m > 1` arm alone, and printing it on the decode cells would
+/// claim a gate the encoder never consults.
 ///
 /// `arena_scratch_reserved` is the caller's statement of the graph-level fact the
 /// lowerer tests as `dequant_scratch_off != 0`, taken from the graph's own

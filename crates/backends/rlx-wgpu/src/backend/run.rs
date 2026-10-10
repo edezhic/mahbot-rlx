@@ -71,6 +71,96 @@ use std::num::NonZeroU64;
 use super::*;
 
 impl WgpuExecutable {
+    /// The run path's join decision for `step`: `true` when this run encodes the
+    /// call's dispatches into the enclosing batch, so its work rides the batch's
+    /// submission instead of one of its own.
+    ///
+    /// That is the route ladder's own answer for the call
+    /// ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`], the device-only work
+    /// [`crate::gguf_gpu::encode_dequant_matmul_gguf_into`] can be handed a caller's
+    /// encoder). Whether this *run* batches at all is the caller's business — the
+    /// step-by-step and snapshot modes keep one operation per submission on purpose
+    /// (`RLX_WGPU_ONE_OP_PER_PASS`, and the snapshot stops between steps), so both of
+    /// them apply that mode to this answer rather than fold it in here.
+    ///
+    /// `scale` is the step arm's own active-extent scaling, so the answer is for the
+    /// row count in use, not the compiled one. A false answer is conservative: it
+    /// covers every route that can read the host, and the caller is the join branch,
+    /// which re-matches the step geometry it needs.
+    fn joined_dequant_gguf(&self, step: &Step, scale: &impl Fn(u32) -> u32) -> bool {
+        let Step::DequantMatmulGguf {
+            m,
+            k,
+            scheme_id,
+            x_byte_off,
+            ..
+        } = step
+        else {
+            return false;
+        };
+        crate::gguf_gpu::select_path(
+            scale(*m) as usize,
+            *k as usize,
+            *scheme_id,
+            *x_byte_off as usize,
+            self.dequant_scratch_off,
+        )
+        .is_provably_device_only()
+    }
+
+    /// Whether this run treats `step` as a host boundary: every host-classified
+    /// step is one except a packed multiply this run joins into the enclosing batch.
+    /// The run path's scheduling decisions read this rather than the plan-time
+    /// classification, which stays as it is and keeps its consumers (the
+    /// uniform/bind-group lanes, the memory plan, the browser answer).
+    ///
+    /// Every place the run path consults this step's host-vs-device behaviour, and
+    /// what this run does there:
+    ///
+    /// * **changed** — `starting_on_host` (a joined call starts no batch of its own;
+    ///   a carried encoder is that batch's outstanding device work), the post-batch
+    ///   `need_host_sync` poll and mirror clear (a joined call is not a host sync),
+    ///   and the door that flushes the host mirror before device work following a
+    ///   host step (it fires for a joined call too, so a host result reaches the
+    ///   device before the batch carrying the joined dispatches).
+    /// * **kept, plan-time too** — the lane cursors: the uniform pre-pass and the
+    ///   dispatch loop skip `step_runs_on_host` steps to index `gpu_ui`, and
+    ///   `gpu_bi` likewise, so a joined call consumes no uniform, bind-group or
+    ///   meta-buffer slot and no later step's index moves.
+    ///   `Step::DequantMatmulGguf` carries no lane index for the same reason, and
+    ///   the plan-time pushes in `compile/lower.rs` are its other half.
+    /// * **kept** — the inner pass loop's `break` on a host step (that break is what
+    ///   feeds the join, which consumes the step right after it), its two
+    ///   `static_once` skips and its `step_needs_pass_flush` split, the final mirror
+    ///   flush, the BufferCopy device route's poll/invalidate, and the
+    ///   `RLX_WGPU_DBG_COUNTERS` census.
+    /// * **kept, and a joined call never reaches them** — `needs_f16_drain` (the
+    ///   site looks at the step *after* the batch, which is never the joined one),
+    ///   the batch-end `continue`, and `bypasses_host_cache` with its pre-step
+    ///   flush/poll and post-step `host_cache.clear()`. The join consumes a joined
+    ///   call before the host match, and the mirror a host step reads is cleared at
+    ///   the next host boundary (`need_host_sync`, re-keyed above) — the joined
+    ///   batch's own submission invalidates it there.
+    /// * **kept** — `requires_host_execution` / `run_async`'s browser assert: the
+    ///   browser answer stays pessimistic, and stays correct because the host arms
+    ///   remain reachable in the ladder at run time.
+    ///
+    /// The one site where the widened `step_is_tail_host` term is not equivalent to
+    /// the old `step_runs_on_host(next)`: the post-batch `need_host_sync` under
+    /// `RLX_WGPU_ONE_OP_PER_PASS`, where the pass loop's one-op `break` can leave
+    /// `step_i` on a tail-host step, and this then adds a poll and a mirror clear
+    /// the old predicate did not ask for — harmless in that debugging mode (it only
+    /// drains work already submitted), and recorded so the claim is exact.
+    fn step_breaks_batch(
+        &self,
+        step: &Step,
+        scale: &impl Fn(u32) -> u32,
+        one_op_per_pass: bool,
+    ) -> bool {
+        let joins = !one_op_per_pass && self.joined_dequant_gguf(step, scale);
+        step_is_tail_host(step) || (step_runs_on_host(step) && !joins)
+    }
+
     /// Register a resident-KV row feed: `handle_name` (a device-resident input,
     /// see `bind_gpu_handle`) receives row data from graph output `output_index`.
     ///
@@ -388,6 +478,7 @@ impl WgpuExecutable {
                 label: Some("rlx-wgpu async readback"),
             });
         encode_readback_copies(&mut enc, &self.arena, &staging_buf, &out_ids, &layout);
+        crate::backend::note_device_submit();
         dev.queue.submit(std::iter::once(enc.finish()));
 
         crate::buffer::wasm_async::map_read_async(&staging_buf, layout.total_bytes)
@@ -401,6 +492,12 @@ impl WgpuExecutable {
     /// True when the compiled schedule contains host-executed ops (GGUF
     /// dequant, LSTM/GRU, collectives, FFT-host, …). Such graphs cannot
     /// run on browser WebGPU (`run_async` rejects them).
+    ///
+    /// Read off the plan-time classification, deliberately: it stays pessimistic,
+    /// and stays correct, because the host arms remain reachable in the run-time
+    /// route ladder — the one-row packed multiply the run encodes into the
+    /// enclosing batch is joined by a run-time decision, and the same step runs on
+    /// the host whenever its ladder answer is not device-only.
     pub fn requires_host_execution(&self) -> bool {
         self.schedule
             .iter()
@@ -523,7 +620,9 @@ impl WgpuExecutable {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("rlx-wgpu host mirror flush"),
                 });
+            crate::backend::note_device_submit();
             dev.queue.submit(std::iter::once(flush.finish()));
+            crate::backend::note_device_wait();
             let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
         }
 
@@ -1344,21 +1443,47 @@ impl WgpuExecutable {
         let mut gpu_bi = 0usize;
         let mut fft_i = 0usize;
         let mut host_cache = rlx_gpu_host::HostTensorCache::new();
-        while step_i < self.schedule.len() {
+        // The batch's encoder. A joined packed multiply hands it to the next
+        // outer iteration instead of submitting, so one contiguous run of device
+        // work is one command buffer and one submission — the route's own
+        // `enc.finish()` would be exactly the per-call submission this join
+        // removes. It also removes command buffers rather than adding any: a
+        // batch creates its encoder once (the loop below reuses it across joined
+        // calls), so a forward pass holds at most one encoder that has been created
+        // but not yet submitted, against the graphics layer's own budget of those
+        // (4096 on Metal). Never `Some` when the loop exits: the loop condition
+        // keeps iterating until the carried encoder has been submitted, and every
+        // other `break` out of the loop happens after a submission — the snapshot
+        // break below is the one that does not, and it cannot see a carried encoder
+        // because the snapshot forces `one_op_per_pass`, which makes the join inert.
+        let mut pending_enc: Option<wgpu::CommandEncoder> = None;
+        // "This batch dispatched something" — set by any dispatched or joined
+        // step, reset when the batch's encoder is created, and read by the
+        // f16-mirror pass split and by the host-mirror invalidation.
+        let mut pass_dispatched = false;
+        while step_i < self.schedule.len() || pending_enc.is_some() {
             if self.snapshot_stop.is_some_and(|stop| step_i >= stop) {
                 break;
             }
             // Host→Host streaks: skip empty compute encodes/submits between
             // HostOps (was dominating Kitten discrete wall time alongside D2H).
-            let starting_on_host = step_runs_on_host(&self.schedule[step_i])
-                || step_is_tail_host(&self.schedule[step_i]);
-            let mut pass_dispatched = false;
+            // A carried encoder is that batch's outstanding device work, so it
+            // ends the streak: the batch is finished (submitted) before a host
+            // step may read or write the arena.
+            let starting_on_host = pending_enc.is_none()
+                && step_i < self.schedule.len()
+                && self.step_breaks_batch(&self.schedule[step_i], &scale, one_op_per_pass);
             if !starting_on_host {
-                let mut enc = dev
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("rlx-wgpu run"),
-                    });
+                let mut enc = match pending_enc.take() {
+                    Some(enc) => enc,
+                    None => {
+                        pass_dispatched = false;
+                        dev.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("rlx-wgpu run"),
+                            })
+                    }
+                };
                 {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("rlx-wgpu compute pass"),
@@ -3273,6 +3398,68 @@ impl WgpuExecutable {
                         }
                     }
                 }
+                // A joined packed multiply: end the pass, encode its dispatches
+                // into THIS encoder, and carry the batch on. Its scratch stays alive
+                // because the encode is contiguous inside this one encoder — dispatch,
+                // then `copy_buffer_to_buffer` into the arena — and a later call that
+                // reuses the pooled out slab can only do so after that copy in command
+                // order; the slab's buffer is not released while a submitted-or-carried
+                // command buffer references it. It consumes no lane either: lowering
+                // pushed none for this step and the run-time cursors skip
+                // host-classified steps, so no later device step's slot moves.
+                if !one_op_per_pass
+                    && let Some(step) = self.schedule.get(step_i)
+                    && self.joined_dequant_gguf(step, &scale)
+                    && let Step::DequantMatmulGguf {
+                        m,
+                        k,
+                        n,
+                        scheme_id,
+                        x_byte_off,
+                        w_byte_off,
+                        out_byte_off,
+                    } = step
+                {
+                    // This call reads the arena on the device, so a host result still
+                    // only in the mirror has to reach the device before this batch is
+                    // submitted. Reached at a batch's start (a host step never runs
+                    // while an encoder is carried), so the write lands with the
+                    // submission that carries the joined dispatches.
+                    if host_cache.has_deferred_writes() {
+                        let mut a = crate::host_stage::WgpuArena {
+                            arena: &self.arena,
+                            device: &dev.device,
+                            queue: &dev.queue,
+                            size_bytes: 0,
+                        };
+                        host_cache.flush_to_device(&mut a);
+                        crate::backend::note_device_wait();
+                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                    }
+                    crate::gguf_gpu::encode_dequant_matmul_gguf_into(
+                        &self.arena,
+                        &dev.device,
+                        &dev.queue,
+                        &mut enc,
+                        scale(*m) as usize,
+                        *k as usize,
+                        *n as usize,
+                        *scheme_id,
+                        *x_byte_off as usize,
+                        *w_byte_off as usize,
+                        *out_byte_off as usize,
+                    );
+                    step_i += 1;
+                    pass_dispatched = true;
+                    pending_enc = Some(enc);
+                    continue;
+                }
+                // `step_runs_on_host` on purpose, not `step_breaks_batch`: the two
+                // agree here. A joined call never reaches this site (the branch above
+                // consumed it), and neither does the widened tail-host term change the
+                // answer — `step_needs_pass_flush` has no arm for a tail-host step kind
+                // and is false for every `DequantMatmulGguf` arm, so the drain is off
+                // under both predicates.
                 let needs_f16_drain = step_i < self.schedule.len()
                     && !step_runs_on_host(&self.schedule[step_i])
                     && step_i > 0
@@ -3307,6 +3494,7 @@ impl WgpuExecutable {
                             &layout,
                         );
                         let map_rx = schedule_readback_map(&mut enc, tiny.buffer(), &layout);
+                        crate::backend::note_device_submit();
                         let sub = dev.queue.submit(std::iter::once(enc.finish()));
                         wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                         map_rx.recv().unwrap().unwrap();
@@ -3334,8 +3522,10 @@ impl WgpuExecutable {
                         fused_readback = Some((layout, map_rx, plan));
                     }
                 }
+                crate::backend::note_device_submit();
                 let main_submission = dev.queue.submit(std::iter::once(enc.finish()));
                 if defer_tail {
+                    crate::backend::note_device_wait();
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                     self.run_tail_host_audio_ops(dev);
                     if !skip_readback {
@@ -3364,6 +3554,7 @@ impl WgpuExecutable {
                                 &layout,
                             );
                             let map_rx = schedule_readback_map(&mut rb_enc, tiny.buffer(), &layout);
+                            crate::backend::note_device_submit();
                             let sub = dev.queue.submit(std::iter::once(rb_enc.finish()));
                             wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                             map_rx.recv().unwrap().unwrap();
@@ -3389,6 +3580,7 @@ impl WgpuExecutable {
                             );
                             let map_rx =
                                 schedule_readback_map(&mut rb_enc, staging.buffer(), &layout);
+                            crate::backend::note_device_submit();
                             let sub = dev.queue.submit(std::iter::once(rb_enc.finish()));
                             wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                             map_rx.recv().unwrap().unwrap();
@@ -3400,15 +3592,24 @@ impl WgpuExecutable {
                     }
                 }
                 if needs_f16_drain {
+                    crate::backend::note_device_wait();
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                 }
-                let need_host_sync =
-                    step_i < self.schedule.len() && step_runs_on_host(&self.schedule[step_i]);
+                // A joined packed multiply is the one host-classified step that is
+                // not a host sync here; `step_breaks_batch`'s doc has the site list.
+                let need_host_sync = step_i < self.schedule.len()
+                    && self.step_breaks_batch(&self.schedule[step_i], &scale, one_op_per_pass);
                 if need_host_sync {
+                    crate::backend::note_device_wait();
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                     // Only invalidate after real GPU work. Host→Host chains share
                     // one outer loop iteration's empty encode; clearing there made
-                    // HostTensorCache always miss (full D2H every HostOp).
+                    // HostTensorCache always miss (full D2H every HostOp). This is
+                    // also where a joined batch's write invalidates the mirror: its
+                    // carried encoder is submitted by the iteration after the join,
+                    // which reaches this site with `pass_dispatched` set and the next
+                    // step a host step (the schedule's end leaves `need_host_sync`
+                    // false, and there the final flush below drains the device).
                     if pass_dispatched {
                         host_cache.clear();
                     }
@@ -3491,6 +3692,7 @@ impl WgpuExecutable {
                     size_bytes: 0,
                 };
                 host_cache.flush_to_device(&mut a);
+                crate::backend::note_device_wait();
                 let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
             }
             match &self.schedule[step_i] {
@@ -3560,6 +3762,7 @@ impl WgpuExecutable {
                                 dst_u,
                                 bytemuck::cast_slice(data.as_slice()),
                             );
+                            crate::backend::note_device_wait();
                             let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                         }
                         host_cache.insert(dst_u, data, defer);
@@ -3581,6 +3784,7 @@ impl WgpuExecutable {
                                 size_bytes: 0,
                             };
                             host_cache.flush_to_device(&mut a);
+                            crate::backend::note_device_wait();
                             let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                         }
                         // `copy_route` refused a zero-byte copy above, and
@@ -3621,7 +3825,9 @@ impl WgpuExecutable {
                             let (gx, gy, gz) = dispatch_dims(elems, 64);
                             pass.dispatch_workgroups(gx, gy, gz);
                         }
+                        crate::backend::note_device_submit();
                         dev.queue.submit(std::iter::once(enc.finish()));
+                        crate::backend::note_device_wait();
                         let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                         host_cache.invalidate(dst as usize);
                     }
@@ -3661,68 +3867,80 @@ impl WgpuExecutable {
                     let mm = scale(*m) as usize;
                     let kk = *k as usize;
                     let nn = *n as usize;
-                    // Scratch-free windowed kernels for Q4_K / Q6_K / Q1_0.
-                    // - m==1 (decode): always OK for supported schemes.
+                    // The ladder's own selection — the same call the batch
+                    // boundary joins on (`joined_dequant_gguf`), so a call this arm
+                    // runs unjoined is one the boundary deliberately left alone (the
+                    // step-by-step / snapshot modes, or a route outside the join set)
+                    // rather than a second opinion about the route.
+                    // - m==1 Q4_K / Q6_K with an addressable X window is the
+                    //   joined one-row arm
+                    //   ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`]).
                     // - Q4_K / Q6_K + m>1: row-grouped GEMM (one pass over each
                     //   packed weight tile per group of rows) inside gemv_rows;
                     //   that path N-chunks the weight window itself, so a weight
                     //   parked in the weight buffer or wider than the binding
                     //   limit still takes it.
                     // - Q1_0 + m>1: tiled GEMM (or per-row GEMV) inside gemv_rows.
-                    // - Other schemes + m>1: per-row GEMV only when k is an
-                    //   integer number of GGUF blocks — flat pack is block-linear
-                    //   over n*k, so unaligned k makes row slices invalid and used
-                    //   to force the host D2H/H2D fallback for *all* m>1 (very slow).
-                    let use_gemv = if !crate::gguf_gpu::gemv_supports_scheme(*scheme_id) {
-                        false
-                    } else if mm == 1 || *scheme_id == 24 {
-                        true
-                    } else {
-                        let be =
-                            crate::gguf_host::scheme_from_id(*scheme_id).gguf_block_size() as usize;
-                        kk.is_multiple_of(be.max(1))
-                    };
-                    if use_gemv {
-                        crate::gguf_gpu::run_dequant_matmul_gguf_gemv_rows(
-                            &self.arena,
-                            &dev.device,
-                            &dev.queue,
-                            mm,
-                            kk,
-                            nn,
-                            *scheme_id,
-                            *x_byte_off as usize,
-                            *w_byte_off as usize,
-                            *out_byte_off as usize,
-                        );
-                    } else if self.dequant_scratch_off > 0 {
-                        crate::gguf_gpu::run_dequant_matmul_gguf_gpu(
-                            &self.arena,
-                            &dev.device,
-                            &dev.queue,
-                            mm,
-                            kk,
-                            nn,
-                            *scheme_id,
-                            *x_byte_off as usize,
-                            *w_byte_off as usize,
-                            self.dequant_scratch_off,
-                            *out_byte_off as usize,
-                        );
-                    } else {
-                        crate::gguf_gpu::note_route(crate::gguf_gpu::DequantMatmulRoute::Host);
-                        crate::gguf_host::run_dequant_matmul_gguf(
-                            &self.arena,
-                            &dev.device,
-                            &dev.queue,
-                            mm,
-                            kk,
-                            nn,
-                            *scheme_id,
-                            *x_byte_off as usize,
-                            *w_byte_off as usize,
-                            *out_byte_off as usize,
-                        );
+                    // - The scratch arm: the fused entry point's own scratch route,
+                    //   an in-arena f32 slab then `matmul_bt` (`gemv` schemes are
+                    //   handed back to the per-row loop above, so a slab can still
+                    //   record PerRow). A scheme whose flat pack is block-linear over
+                    //   n·k needs k a whole number of blocks to slice rows; unaligned
+                    //   k there used to force the host D2H/H2D fallback for *all* m>1.
+                    match crate::gguf_gpu::select_path(
+                        mm,
+                        kk,
+                        *scheme_id,
+                        *x_byte_off as usize,
+                        self.dequant_scratch_off,
+                    ) {
+                        // Joined when the batch boundary could take it; the arm
+                        // is the unjoined fallback (one-op-per-pass, snapshot).
+                        crate::gguf_gpu::DequantMatmulPath::OneRowDevice
+                        | crate::gguf_gpu::DequantMatmulPath::FusedArm => {
+                            crate::gguf_gpu::run_dequant_matmul_gguf_gemv_rows(
+                                &self.arena,
+                                &dev.device,
+                                &dev.queue,
+                                mm,
+                                kk,
+                                nn,
+                                *scheme_id,
+                                *x_byte_off as usize,
+                                *w_byte_off as usize,
+                                *out_byte_off as usize,
+                            );
+                        }
+                        crate::gguf_gpu::DequantMatmulPath::ScratchArm => {
+                            crate::gguf_gpu::run_dequant_matmul_gguf_gpu(
+                                &self.arena,
+                                &dev.device,
+                                &dev.queue,
+                                mm,
+                                kk,
+                                nn,
+                                *scheme_id,
+                                *x_byte_off as usize,
+                                *w_byte_off as usize,
+                                self.dequant_scratch_off,
+                                *out_byte_off as usize,
+                            );
+                        }
+                        crate::gguf_gpu::DequantMatmulPath::Host => {
+                            crate::gguf_gpu::note_route(crate::gguf_gpu::DequantMatmulRoute::Host);
+                            crate::gguf_host::run_dequant_matmul_gguf(
+                                &self.arena,
+                                &dev.device,
+                                &dev.queue,
+                                mm,
+                                kk,
+                                nn,
+                                *scheme_id,
+                                *x_byte_off as usize,
+                                *w_byte_off as usize,
+                                *out_byte_off as usize,
+                            );
+                        }
                     }
                 }
                 Step::DequantMatmulInt8Host {
@@ -4481,6 +4699,7 @@ impl WgpuExecutable {
                             size_bytes: 0,
                         };
                         host_cache.flush_to_device(&mut a);
+                        crate::backend::note_device_wait();
                         let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                     }
                     crate::scan_host::run_concat_host_pieces(
@@ -5048,10 +5267,20 @@ impl WgpuExecutable {
             step_i += 1;
             // Host paths stage with `queue.write_buffer` (no submit). Flush
             // deferred mirrors before the next GPU compute pass so kernels see
-            // host results on discrete Vulkan/DX12.
+            // host results on discrete Vulkan/DX12. Reached by the host arms that
+            // fall through to here, which is every cache-aware one (ConcatHost,
+            // ExpandHost, NarrowHost, TransposeHost, HostOp, Conv2dHost, …). The
+            // arm that `continue`s (the host `BufferCopy`) skips this door, so its
+            // deferred write is reached by the next flush instead: the join's own
+            // flush when the following step is a joined packed multiply, or the
+            // host boundary in front of the next host reader of that slot.
             if step_i < self.schedule.len() {
                 let next = &self.schedule[step_i];
-                if !step_runs_on_host(next) && !step_is_tail_host(next) {
+                // A joined packed multiply is the next batch's device work: it
+                // reads what this host step wrote, so the mirror reaches the
+                // device (and the device is polled) before the batch runs — the
+                // same door a plain device step goes through.
+                if !self.step_breaks_batch(next, &scale, one_op_per_pass) {
                     if host_cache.has_deferred_writes() {
                         let mut a = crate::host_stage::WgpuArena {
                             arena: &self.arena,
@@ -5061,6 +5290,7 @@ impl WgpuExecutable {
                         };
                         host_cache.flush_to_device(&mut a);
                     }
+                    crate::backend::note_device_wait();
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                     // Keep mirrors until GPU actually runs (cleared when
                     // `pass_dispatched` on the next host sync).
@@ -5073,8 +5303,10 @@ impl WgpuExecutable {
                     size_bytes: 0,
                 };
                 host_cache.flush_to_device(&mut a);
+                crate::backend::note_device_wait();
                 let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
             } else {
+                crate::backend::note_device_wait();
                 let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
             }
         }
@@ -5087,6 +5319,7 @@ impl WgpuExecutable {
                 size_bytes: 0,
             };
             host_cache.flush_to_device(&mut a);
+            crate::backend::note_device_wait();
             let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
         }
 
@@ -5237,7 +5470,9 @@ fn wgpu_rng_dispatch(
         let (gx, gy, gz) = dispatch_dims(len, 64);
         pass.dispatch_workgroups(gx, gy, gz);
     }
+    crate::backend::note_device_submit();
     queue.submit(std::iter::once(enc.finish()));
+    crate::backend::note_device_wait();
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     host_cache.invalidate(dst as usize);
 }

@@ -5114,9 +5114,9 @@ pub(crate) fn compile_static_inner(
                         idx_byte_off: arena.offset(idx_id) as u64,
                         out_byte_off: arena.offset(node.id) as u64,
                     });
-                    // Host segment: like DequantMatmulGguf, it builds its own
-                    // bind group at exec time, so do NOT push a uniform/bind
-                    // group lane (those are indexed by GPU-step count).
+                    // Host-classified step: it builds its own bind group at exec
+                    // time, so do NOT push a uniform/bind group lane (those are
+                    // indexed by GPU-step count).
                     continue;
                 }
                 // Complex packs `lanes` contiguous f32 per element (C64=2,
@@ -11029,13 +11029,14 @@ pub(crate) fn compile_static_inner(
                         w_byte_off: arena.offset(w_id) as u64,
                         out_byte_off: arena.offset(node.id) as u64,
                     });
-                    // Host step (`run_dequant_matmul_gguf_gpu` builds its own
-                    // bind groups): schedule-only, like `GroupNorm`. The
-                    // uniform/bind_group lanes are indexed by GPU-step count
-                    // (`gpu_ui`/`gpu_bi`, host steps skipped), so pushing here
-                    // would shift every later GPU op's lane — fatal in the
-                    // packed decode graph where GGUF ops interleave with
-                    // RmsNorm/RoPE/Attention/SwiGLU. Do NOT push.
+                    // Host-classified step (`run_dequant_matmul_gguf_gpu` builds
+                    // its own bind groups, and a one-row call of the tiled K-quant
+                    // arm is encoded into the enclosing batch at run time):
+                    // schedule-only, like `GroupNorm`. The uniform/bind_group lanes
+                    // are indexed by GPU-step count (`gpu_ui`/`gpu_bi`, host steps
+                    // skipped), so pushing here would shift every later GPU op's
+                    // lane — fatal in the packed decode graph where GGUF ops
+                    // interleave with RmsNorm/RoPE/Attention/SwiGLU. Do NOT push.
                 } else if matches!(
                     scheme,
                     QuantScheme::Int8Block { .. } | QuantScheme::Int8BlockAsym { .. }

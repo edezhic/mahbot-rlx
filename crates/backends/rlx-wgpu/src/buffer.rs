@@ -1842,6 +1842,7 @@ impl Arena {
             enc.copy_buffer_to_buffer(staging, 0, dst_buf, dst_local as u64, chunk as u64);
             done += chunk;
         }
+        crate::backend::note_device_submit();
         queue.submit(std::iter::once(enc.finish()));
     }
 
@@ -2291,6 +2292,7 @@ impl Arena {
                     label: Some("rlx-wgpu readback bytes enc"),
                 });
                 enc.copy_buffer_to_buffer(src, local as u64, &staging, 0, len as u64);
+                crate::backend::note_device_submit();
                 queue.submit(std::iter::once(enc.finish()));
 
                 let slice = staging.slice(..);
@@ -2298,6 +2300,7 @@ impl Arena {
                 slice.map_async(wgpu::MapMode::Read, move |r| {
                     let _ = sender.send(r);
                 });
+                crate::backend::note_device_wait();
                 let _ = device.poll(wgpu::PollType::wait_indefinitely());
                 receiver.recv().unwrap().unwrap();
 
@@ -2334,6 +2337,7 @@ impl Arena {
                 label: Some("rlx-wgpu readback bytes enc"),
             });
             enc.copy_buffer_to_buffer(src, local as u64, &staging, 0, len as u64);
+            crate::backend::note_device_submit();
             queue.submit(std::iter::once(enc.finish()));
 
             let slice = staging.slice(..);
@@ -2341,6 +2345,7 @@ impl Arena {
             slice.map_async(wgpu::MapMode::Read, move |r| {
                 let _ = sender.send(r);
             });
+            crate::backend::note_device_wait();
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
             receiver.recv().unwrap().unwrap();
 
@@ -2472,6 +2477,7 @@ pub fn read_tiny_f32_after_submit(
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = sender.send(r);
     });
+    crate::backend::note_device_wait();
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     receiver.recv().unwrap().unwrap();
     decode_tiny_mapped_f32(staging, len)
@@ -2596,6 +2602,7 @@ pub fn wait_readback_map(
     _map_rx: &std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
     _total_bytes: usize,
 ) {
+    crate::backend::note_device_wait();
     let _ = device.poll(wgpu::PollType::Wait {
         submission_index: Some(submission),
         timeout: None,
@@ -2630,6 +2637,7 @@ fn map_readback_f32_after_submit(
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = sender.send(r);
     });
+    crate::backend::note_device_wait();
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     receiver.recv().unwrap().unwrap();
 
@@ -2751,6 +2759,7 @@ pub fn read_f32_pooled(
         label: Some("rlx-wgpu readback enc"),
     });
     enc.copy_buffer_to_buffer(src, local as u64, &staging.buffer, 0, len as u64);
+    crate::backend::note_device_submit();
     queue.submit(std::iter::once(enc.finish()));
 
     let slice = staging.buffer.slice(..len as u64);
@@ -2758,6 +2767,7 @@ pub fn read_f32_pooled(
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = sender.send(r);
     });
+    crate::backend::note_device_wait();
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     receiver.recv().unwrap().unwrap();
 
@@ -2787,6 +2797,7 @@ pub fn read_f32_many_pooled(
         label: Some("rlx-wgpu readback batch enc"),
     });
     encode_readback_copies(&mut enc, arena, &staging_buf, ids, &layout);
+    crate::backend::note_device_submit();
     queue.submit(std::iter::once(enc.finish()));
     map_readback_f32(device, &staging_buf, &layout)
 }

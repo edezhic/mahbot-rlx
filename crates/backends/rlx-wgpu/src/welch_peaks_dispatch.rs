@@ -44,6 +44,7 @@ pub fn run_welch_peaks_gpu(
         });
         dispatch_welch_peaks_gpu_in_pass(&mut pass, device, uniform, bind_group, welch_batch);
     }
+    crate::backend::note_device_submit();
     queue.submit(std::iter::once(encoder.finish()));
 }
 

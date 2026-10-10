@@ -258,6 +258,109 @@ fn the_one_row_device_guard_requires_a_vec4_addressable_x_window() {
     assert!(ok(24, 4, 257 * 4));
 }
 
+/// The route ladder's answer, pinned device-free. The batch boundary joins
+/// exactly on [`rlx_wgpu::gguf_gpu::DequantMatmulPath::OneRowDevice`], so the
+/// predicate must be an exact test of the one-row tiled arm rather than its bare
+/// window guard: it has to compose the arm's addressability check with the
+/// tiled-arm scheme check. Q1_0 passes that guard (its arm reads X a scalar at a
+/// time) but has no tiled branch, and a K-quant whose window is misaligned is
+/// refused — joining either would encode work the tiled kernel cannot read, and
+/// the batch boundary would have handed it a submission instead of the host.
+///
+/// The ladder is also deliberately pure: it records nothing, so asking it what
+/// the route will be does not perturb [`rlx_wgpu::gguf_gpu::route_counts`].
+#[test]
+fn select_path_is_exact_for_the_one_row_device_arm() {
+    use rlx_wgpu::gguf_gpu::{DequantMatmulPath, select_path};
+
+    // Q4_K (0) / Q6_K (2) at one row with an addressable X window — the shape a
+    // decode calls at, and the only one the boundary may join. `k = 384` is not a
+    // whole number of 256-element blocks but the window is still addressable
+    // (1536 B, a multiple of 16), and at m=1 that is enough: the arm's guard is
+    // about addressability, not block geometry.
+    for (name, id) in [("Q4_K", 0u32), ("Q6_K", 2)] {
+        for k in [256usize, 384] {
+            for scratch_off in [0usize, 4096] {
+                assert_eq!(
+                    select_path(1, k, id, 64, scratch_off),
+                    DequantMatmulPath::OneRowDevice,
+                    "{name} (id {id}) m=1 k={k} scratch_off={scratch_off}: an \
+                     addressable one-row window is device-only and must join the \
+                     enclosing batch"
+                );
+            }
+        }
+    }
+
+    // Q1_0 (24) at one row passes the same window guard — its arm reads X a
+    // scalar at a time — but is not the tiled arm, so it must not be joined.
+    for k in [256usize, 384] {
+        assert_eq!(
+            select_path(1, k, 24, 64, 0),
+            DequantMatmulPath::FusedArm,
+            "Q1_0 (24) m=1 k={k}: the bare guard passes but the scheme is not the \
+             tiled arm, so the ladder must say Fused"
+        );
+    }
+
+    // Q4_K / Q6_K above one row: the row-grouped GEMM when k is a whole number of
+    // packing blocks (whatever slab the plan booked), and the scratch / host
+    // fallback when it is not.
+    for id in [0u32, 2] {
+        for scratch_off in [0usize, 4096] {
+            assert_eq!(
+                select_path(4, 256, id, 64, scratch_off),
+                DequantMatmulPath::FusedArm,
+                "id {id} m=4 k=256 scratch_off={scratch_off}: a whole number of \
+                 blocks is the row-grouped GEMM, never the joined one-row arm"
+            );
+        }
+        assert_eq!(
+            select_path(4, 384, id, 64, 4096),
+            DequantMatmulPath::ScratchArm,
+            "id {id} m=4 k=384 with a slab: not a whole number of blocks, so the \
+             scratch entry point — `ScratchArm` names the entry point, not the \
+             recorded route, and for Q4_K/Q6_K it hands the call back to the fused \
+             arm's per-row loop (`route_counts` is the arbiter)"
+        );
+        assert_eq!(
+            select_path(4, 384, id, 64, 0),
+            DequantMatmulPath::Host,
+            "id {id} m=4 k=384 with no slab: nothing to dequantize into, so the host"
+        );
+    }
+
+    // A scheme with no fused kernel is scratch / host at every row count.
+    let q5 = rlx_wgpu::gguf_host::gguf_scheme_id(rlx_ir::quant::QuantScheme::GgufQ5_0);
+    for m in [1usize, 4] {
+        assert_eq!(
+            select_path(m, 256, q5, 64, 4096),
+            DequantMatmulPath::ScratchArm,
+            "Q5_0 (id {q5}) m={m}: no fused kernel, so a booked slab means scratch"
+        );
+        assert_eq!(
+            select_path(m, 256, q5, 64, 0),
+            DequantMatmulPath::Host,
+            "Q5_0 (id {q5}) m={m}: no fused kernel and no slab, so the host"
+        );
+    }
+
+    // A K-quant at one row with a window the arm's `vec4` X read cannot address
+    // must not be joined either — the fused entry point refuses it and records the
+    // host route.
+    for id in [0u32, 2] {
+        assert_eq!(
+            select_path(1, 256, id, 4, 0),
+            DequantMatmulPath::FusedArm,
+            "id {id} m=1 with a 4-byte-aligned X window: not addressable as vec4, \
+             so the boundary must not join it"
+        );
+    }
+
+    // The selector is pure by construction; the route census it is checked
+    // against lives in `gguf_matmul_route.rs` / `gguf_batch_join.rs`.
+}
+
 /// No registered scheme may be left unhandled. Today every one of them has a
 /// WGSL branch somewhere; if that ever stops being true, the scheme must be
 /// listed here so it is host-routed on purpose rather than silently mis-decoded.

@@ -741,8 +741,8 @@ pub(crate) enum Step {
     },
     /// Split-binding embedding gather for >4 GiB arenas. The table and the
     /// idx/output slots are more than one ≤4 GiB binding window apart, so the
-    /// single-arena-binding `Step::Gather` cannot reach the output. Runs as a
-    /// host segment (its own submission + copy-back), like `DequantMatmulGguf`.
+    /// single-arena-binding `Step::Gather` cannot reach the output. Runs as a host
+    /// segment: its own submission and its own copy-back.
     /// BYTE offsets are u64 (arena exceeds 4 GiB).
     GatherSplit {
         n_out: u32,
@@ -754,6 +754,11 @@ pub(crate) enum Step {
         out_byte_off: u64,
     },
     /// GGUF K-quant — host fused dequant+matmul between GPU segments.
+    ///
+    /// Plan-time classification, and a conservative over-approximation: at run
+    /// time a one-row call of the tiled Q4_K/Q6_K arm with an addressable X window
+    /// is device-only work the run encodes into the enclosing batch
+    /// ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`]).
     DequantMatmulGguf {
         m: u32,
         k: u32,

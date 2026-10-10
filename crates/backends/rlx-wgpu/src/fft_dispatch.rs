@@ -554,6 +554,7 @@ pub fn run_fft_gpu_cached(
             device, queue, &mut pass, res, src_off, dst_off, outer, n, inverse, norm_scale,
         );
     }
+    crate::backend::note_device_submit();
     queue.submit(std::iter::once(encoder.finish()));
 }
 

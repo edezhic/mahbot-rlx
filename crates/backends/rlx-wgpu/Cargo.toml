@@ -208,6 +208,10 @@ name = "f16_matmul"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "gguf_batch_join"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "gguf_dequant_matmul_prefill_parity"
 required-features = ["backend-tests"]
 
