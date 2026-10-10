@@ -3276,7 +3276,9 @@ impl WgpuExecutable {
                                 let frk = fused_residual_ln_kernel(&dev.device);
                                 pass.set_pipeline(&frk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                // One workgroup (64 threads) per row → tree
+                                // reduction over the feature dim.
+                                let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::FusedResidualLnTee { params } => {
@@ -3291,7 +3293,9 @@ impl WgpuExecutable {
                                 let frtk = fused_residual_ln_tee_kernel(&dev.device);
                                 pass.set_pipeline(&frtk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                // One workgroup (64 threads) per row → tree
+                                // reduction over the feature dim.
+                                let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::FusedResidualRmsNorm { params } => {
@@ -3306,7 +3310,9 @@ impl WgpuExecutable {
                                 let frk = fused_residual_rms_norm_kernel(&dev.device);
                                 pass.set_pipeline(&frk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                // One workgroup (64 threads) per row → tree
+                                // reduction over the feature dim.
+                                let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::AdaLayerNorm { params } => {
@@ -3321,7 +3327,9 @@ impl WgpuExecutable {
                                 let ak = ada_layer_norm_kernel(&dev.device);
                                 pass.set_pipeline(&ak.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                // One workgroup (64 threads) per row → tree
+                                // reduction over the feature dim.
+                                let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::GatedResidual { params } => {

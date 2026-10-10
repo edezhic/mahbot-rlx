@@ -6,7 +6,14 @@
 //
 //   y = layer_norm(x + residual + [bias])
 //
-// One thread per outer row, sequential reduction over the inner dim.
+// ONE WORKGROUP (64 threads) PER ROW, shared-memory tree reduction over the
+// feature dim — the same shape as the plain `layernorm.wgsl`, and for the same
+// reason: a row reduced serially in one thread makes the step's cost grow with
+// the row width. Every pass below strides over the same lanes (element index ≡
+// lane mod 64), so an arena element is only ever read and written by the lane
+// that owns it; the one cross-lane exchange is the reduction, through `scratch`,
+// which the barriers order.
+//
 // Compared to running Add → [Add] → LayerNorm as three separate
 // kernels, this saves 2 dispatches and reads/writes the [outer, inner]
 // arena slot twice instead of four times.
@@ -37,13 +44,30 @@ struct Params {
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>              params: Params;
 
+var<workgroup> scratch: array<f32, 64>;
+
+// Sum-reduce `scratch[0..64]` into `scratch[0]`. Caller must barrier before.
+fn tree_sum(tid: u32) {
+    var stride: u32 = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) {
+            scratch[tid] = scratch[tid] + scratch[tid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+}
+
 @compute @workgroup_size(64)
 fn fused_residual_ln(
-    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(num_workgroups) ngs: vec3<u32>,
 ) {
-    let row = gid.x + gid.y * ngs.x * 64u;
+    let row = wid.x + wid.y * ngs.x;
     if (row >= params.outer || params.inner == 0u) { return; }
+    let tid = lid.x;
     let in_base  = params.in_off       + row * params.inner;
     let res_base = params.residual_off + row * params.inner;
     let out_base = params.out_off      + row * params.inner;
@@ -51,35 +75,52 @@ fn fused_residual_ln(
     let eps = bitcast<f32>(params.eps_bits);
     let with_bias = params.has_bias != 0u;
 
-    // Pass 1: fold residual + bias into the OUTPUT slot and accumulate
-    // the mean. (The summed value x+residual+bias is materialized in
-    // out_base, so the variance pass reads it back cheaply.)
-    var sum_x: f32 = 0.0;
-    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+    // Pass 1: fold residual (+ bias) into the OUTPUT slot and accumulate this
+    // lane's share of the sum. (The summed value x+residual+bias is materialized
+    // in out_base, so the variance pass reads it back cheaply.)
+    var partial: f32 = 0.0;
+    var i: u32 = tid;
+    loop {
+        if (i >= params.inner) { break; }
         var v = arena[in_base + i] + arena[res_base + i];
         if (with_bias) { v = v + arena[params.bias_off + i]; }
         arena[out_base + i] = v;
-        sum_x = sum_x + v;
+        partial = partial + v;
+        i = i + 64u;
     }
-    let mean = sum_x * n_inv;
+    scratch[tid] = partial;
+    workgroupBarrier();
+    tree_sum(tid);
+    let mean = scratch[0] * n_inv;
+    workgroupBarrier(); // all lanes read scratch[0] before Pass 1b overwrites it.
+
     // Pass 1b: STABLE TWO-PASS variance = mean((x − mean)²). The one-pass
     // identity E[x²] − (E[x])² catastrophically cancels in f32 when the
     // row carries a large DC offset (pre-norm transformer activations),
     // collapsing the variance to near-zero and corrupting the norm on
     // wgpu only. Two-pass matches CPU/Metal/MLX/CoreML; the extra read
     // over `inner` is worth correctness.
-    var sum_sq: f32 = 0.0;
-    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+    partial = 0.0;
+    i = tid;
+    loop {
+        if (i >= params.inner) { break; }
         let d = arena[out_base + i] - mean;
-        sum_sq = sum_sq + d * d;
+        partial = partial + d * d;
+        i = i + 64u;
     }
-    let var_ = sum_sq * n_inv;
+    scratch[tid] = partial;
+    workgroupBarrier();
+    tree_sum(tid);
+    let var_ = scratch[0] * n_inv;
     let inv_std = inverseSqrt(var_ + eps);
 
-    // Pass 2: normalize, scale, shift in place. (Was Pass 3.)
-    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+    // Pass 2: normalize, scale, shift in place — each lane over its own lanes.
+    i = tid;
+    loop {
+        if (i >= params.inner) { break; }
         let g = arena[params.gamma_off + i];
         let b = arena[params.beta_off  + i];
         arena[out_base + i] = (arena[out_base + i] - mean) * inv_std * g + b;
+        i = i + 64u;
     }
 }

@@ -7,6 +7,13 @@
 // `layer_norm != 0` → mean-subtract LayerNorm; else RMSNorm only.
 // `lead_pack`: [lead_rank, x_lead[8], mod_lead[8]] as 20 uints in 5×vec4
 // (uniform arrays must have stride multiple of 16).
+//
+// ONE WORKGROUP (64 threads) PER ROW, shared-memory tree reduction over the
+// feature dim. Each lane accumulates its own strided share of the row with
+// Kahan compensation — F5 DiT chains 44 AdaLN ops per step and f32 reduction
+// noise compounds across the NFE ODE — and the lanes then combine through the
+// tree. Every pass uses the same lane mapping (index ≡ lane mod 64), so arena
+// elements are only touched by the lane that owns them.
 
 struct Params {
     outer: u32,
@@ -22,6 +29,21 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>              params: Params;
+
+var<workgroup> scratch: array<f32, 64>;
+
+// Sum-reduce `scratch[0..64]` into `scratch[0]`. Caller must barrier before.
+fn tree_sum(tid: u32) {
+    var stride: u32 = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) {
+            scratch[tid] = scratch[tid] + scratch[tid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+}
 
 fn lead_at(i: u32) -> u32 {
     return params.lead_pack[i / 4u][i % 4u];
@@ -52,11 +74,13 @@ fn mod_base_for_row(row: u32, inner: u32) -> u32 {
 
 @compute @workgroup_size(64)
 fn ada_layer_norm(
-    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(num_workgroups) ngs: vec3<u32>,
 ) {
-    let row = gid.x + gid.y * ngs.x * 64u;
+    let row = wid.x + wid.y * ngs.x;
     if (row >= params.outer || params.inner == 0u) { return; }
+    let tid = lid.x;
     let in_base = params.in_off + row * params.inner;
     let out_base = params.out_off + row * params.inner;
     let mod_base = mod_base_for_row(row, params.inner);
@@ -64,13 +88,14 @@ fn ada_layer_norm(
     let eps = bitcast<f32>(params.eps_bits);
     let do_ln = params.layer_norm != 0u;
 
-    // Kahan sums — F5 DiT chains 44 AdaLN ops per step; f32 reduction noise
-    // compounds across the NFE ODE on wgpu.
+    // Per-lane Kahan sums of x and x², then the lanes combine through the tree.
     var sum_x: f32 = 0.0;
     var c_x: f32 = 0.0;
     var sum_x2: f32 = 0.0;
     var c_x2: f32 = 0.0;
-    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+    var i: u32 = tid;
+    loop {
+        if (i >= params.inner) { break; }
         let v = arena[in_base + i];
         let yx = v - c_x;
         let tx = sum_x + yx;
@@ -80,7 +105,16 @@ fn ada_layer_norm(
         let t2 = sum_x2 + y2;
         c_x2 = (t2 - sum_x2) - y2;
         sum_x2 = t2;
+        i = i + 64u;
     }
+    scratch[tid] = sum_x;
+    workgroupBarrier();
+    tree_sum(tid);
+    let total_x = scratch[0];
+    workgroupBarrier(); // all lanes read scratch[0] before the Σx² pass reuses it
+    scratch[tid] = sum_x2;
+    workgroupBarrier();
+    tree_sum(tid);
 
     var mean: f32 = 0.0;
     var inv: f32;
@@ -89,25 +123,37 @@ fn ada_layer_norm(
         // E[x²] − (E[x])² identity catastrophically cancels in f32 under a
         // large DC offset (pre-norm transformer activations) and corrupts
         // the norm on wgpu only; two-pass matches CPU/Metal/MLX/CoreML.
-        mean = sum_x * n_inv;
+        mean = total_x * n_inv;
         var sum_sq: f32 = 0.0;
         var c_sq: f32 = 0.0;
-        for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+        i = tid;
+        loop {
+            if (i >= params.inner) { break; }
             let d = arena[in_base + i] - mean;
             let y = d * d - c_sq;
             let t = sum_sq + y;
             c_sq = (t - sum_sq) - y;
             sum_sq = t;
+            i = i + 64u;
         }
-        inv = inverseSqrt(sum_sq * n_inv + eps);
+        scratch[tid] = sum_sq;
+        workgroupBarrier();
+        tree_sum(tid);
+        inv = inverseSqrt(scratch[0] * n_inv + eps);
     } else {
-        inv = inverseSqrt(sum_x2 * n_inv + eps);
+        // Σx² stays the one-pass form this kernel has always used (the RMS
+        // branch does not recentre), now tree-combined across the lanes.
+        inv = inverseSqrt(scratch[0] * n_inv + eps);
     }
 
-    for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
+    // Pass 2: modulate — each lane over its own lanes.
+    i = tid;
+    loop {
+        if (i >= params.inner) { break; }
         let n = (arena[in_base + i] - mean) * inv;
         let s = arena[params.scale_off + mod_base + i];
         let t = arena[params.shift_off + mod_base + i];
         arena[out_base + i] = n * (1.0 + s) + t;
+        i = i + 64u;
     }
 }

@@ -1351,14 +1351,16 @@ pub(crate) fn compile_static_inner(
                     let Some((ws, we)) = span(n.id) else {
                         return false;
                     };
-                    // The tee is one invocation per row, and it reads the
-                    // whole of that row before writing any of it. So the norm
-                    // aliasing an operand EXACTLY — same offset, same length —
-                    // is safe: row r's write lands on row r's bytes, which that
-                    // same invocation has already consumed, and no other row
-                    // touches them. Only a partial or shifted overlap is fatal,
-                    // and only from a *different* dispatch, which clobbers the
-                    // bytes for good before the tee ever runs.
+                    // The tee is one workgroup per row, and every pass in it
+                    // strides over the same lanes (element index ≡ lane mod 64),
+                    // so an arena element is only read and written by the lane
+                    // that owns it — the reduction is the one cross-lane exchange
+                    // and it goes through barrier-ordered workgroup memory. The
+                    // norm aliasing an operand EXACTLY (same offset, same length)
+                    // is therefore safe: row r's writes land on the lanes those
+                    // same threads have already read. Only a partial or shifted
+                    // overlap is fatal, and it only ever comes from a *different*
+                    // dispatch, which clobbers the bytes before the tee runs.
                     let hit = operands.iter().any(|&(os, oe)| {
                         let overlaps = ws < oe && we > os;
                         let exact_self_alias = n.id == **ln_id && ws == os && we == oe;

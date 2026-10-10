@@ -7,9 +7,11 @@
 //! v1 only lowers MatMul (plus leaf nodes), so the test is a single
 //! 2D matmul against a hand-computed reference.
 
-use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
+use rlx_ir::op::{Activation, AdaNormKind, BinaryOp, CmpOp, MaskKind, ReduceOp};
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_wgpu::backend::WgpuExecutable;
+
+mod common;
 
 fn build_graph() -> Graph {
     let mut g = Graph::new("basic");
@@ -2175,6 +2177,233 @@ fn fused_residual_rms_norm_matches_unfused_reference() {
         close(&out[0], &want, 1e-3),
         "FusedResidualRmsNorm mismatch: got {:?} want {want:?}",
         out[0]
+    );
+}
+
+/// The folded residual+norm kernels on the paths the one-workgroup-per-row
+/// rewrite changed — two shapes per kernel:
+///
+/// * `rows = 2, h = 130` (2·64 + 2, so the last stride over the row is partial)
+///   under a large per-row DC offset: the partial tail, the two-pass variance
+///   branch — a one-pass `E[x²] − E[x]²` rewrite loses ~1% of the variance at
+///   this DC (4.6e-2 measured through the tee chain at the same row shape) — and
+///   that the rows stay independent;
+/// * `rows = 1, h = 512` through the **bias** input: a decode-shaped width (8
+///   strides per lane) and the one folded input path no other test exercises.
+///
+/// The reference is an f64 two-pass reduction, and each bar is stated against
+/// what its own input can show: the ramp below is exactly representable at
+/// DC=1e3, so the measured residual is 7.2e-7 (LayerNorm) / 1.2e-7 (RmsNorm) for
+/// the DC case (bar 1e-3) and 2.4e-7 for both on the wide+bias case (bar 1e-4).
+/// The DC case keeps the looser bar because a *generic* row at that mean carries
+/// `ulp(Σx)/inner` ≈ 6e-5 of summation error of its own, which an adapter that
+/// orders the partials differently can spend.
+#[test]
+fn folded_residual_norm_strided_dc_matches_two_pass_reference() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    for rms in [false, true] {
+        folded_case(rms, 2, 130, 1_000.0, false, 1e-3);
+        folded_case(rms, 1, 512, 0.0, true, 1e-4);
+    }
+}
+
+fn folded_case(rms: bool, rows: usize, h: usize, dc: f32, with_bias: bool, bar: f32) {
+    const EPS: f32 = 1e-5;
+    let shape = Shape::new(&[rows, h], DType::F32);
+    let mut g = Graph::new("frln_case");
+    let x = g.input("x", shape.clone());
+    let r = g.input("r", shape.clone());
+    let bias = with_bias.then(|| g.param("c", Shape::new(&[h], DType::F32)));
+    let ga = g.param("g", Shape::new(&[h], DType::F32));
+    let be = g.param("b", Shape::new(&[h], DType::F32));
+    let y = if rms {
+        g.fused_residual_rms_norm(x, r, bias, ga, be, EPS, shape.clone())
+    } else {
+        g.fused_residual_ln(x, r, bias, ga, be, EPS, shape.clone())
+    };
+    g.set_outputs(vec![y]);
+    // gamma/beta are not all-ones: a lane or stride error in pass 2 has to show.
+    let gamma: Vec<f32> = (0..h).map(|i| 1.0 + (i % 5) as f32 * 0.1).collect();
+    let beta: Vec<f32> = (0..h).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
+    let bias_v: Vec<f32> = (0..h).map(|i| ((i % 11) as f32 - 5.0) * 0.03).collect();
+    let mut exe = WgpuExecutable::compile(g);
+    exe.set_param("g", &gamma);
+    exe.set_param("b", &beta);
+    if with_bias {
+        exe.set_param("c", &bias_v);
+    }
+    let xv: Vec<f32> = (0..rows * h)
+        .map(|i| dc + (((i + 3) % 17) as f32 - 8.0) * 0.5)
+        .collect();
+    let rv: Vec<f32> = (0..rows * h)
+        .map(|i| (((i * 7) % 13) as f32 - 6.0) * 0.25)
+        .collect();
+    let got = exe.run(&[("x", &xv), ("r", &rv)]).remove(0);
+
+    // f64 two-pass reference, row-wise.
+    let mut want = vec![0f32; rows * h];
+    for row in 0..rows {
+        let o = row * h;
+        let s: Vec<f64> = (0..h)
+            .map(|i| {
+                xv[o + i] as f64 + rv[o + i] as f64 + if with_bias { bias_v[i] as f64 } else { 0.0 }
+            })
+            .collect();
+        let n = h as f64;
+        let mean = s.iter().sum::<f64>() / n;
+        let var = s.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+        let inv = if rms {
+            1.0 / (var + mean * mean + EPS as f64).sqrt()
+        } else {
+            1.0 / (var + EPS as f64).sqrt()
+        };
+        for i in 0..h {
+            let base = if rms { s[i] * inv } else { (s[i] - mean) * inv };
+            want[o + i] = (base * gamma[i] as f64 + beta[i] as f64) as f32;
+        }
+    }
+
+    let kind = if rms {
+        "fused_residual_rms_norm"
+    } else {
+        "fused_residual_ln"
+    };
+    let maxd = common::max_abs_diff(&got, &want);
+    // Numerics first — as in the tee helper, it applies on every adapter,
+    // however the ops routed.
+    assert!(
+        maxd < bar,
+        "{kind} rows={rows} h={h} dc={dc} bias={with_bias}: wgpu differs from the f64 \
+         two-pass reference by {maxd:.3e} (bar {bar:.1e}) — check the tree reduction's tail \
+         stride, the two-pass variance and the bias input"
+    );
+
+    let counts = exe.step_kind_counts();
+    let steps = counts.get(kind).copied().unwrap_or(0);
+    let binaries = counts.get("binary").copied().unwrap_or(0);
+    let norms = counts.get("layer_norm").copied().unwrap_or(0);
+    eprintln!(
+        "  {kind} rows={rows} h={h} dc={dc} bias={with_bias}: {steps} step(s), maxd={maxd:.3e}"
+    );
+    // On a discrete adapter the elementwise/norm ops are host-routed entirely
+    // (`wgpu_prefer_host_fallback`), so no device step of any of these kinds is
+    // the correct outcome — not a regression.
+    if steps == 0 && binaries == 0 && norms == 0 {
+        eprintln!("  {kind} rows={rows} h={h}: ops are host-routed on this adapter — kernel N/A");
+        return;
+    }
+    assert_eq!(
+        steps, 1,
+        "{kind} rows={rows} h={h} bias={with_bias}: expected one folded step on the device, \
+         got {steps} ({binaries} binary + {norms} norm) — the folded kernel is not what ran"
+    );
+}
+
+/// The adaptive-layer-norm kernel is dispatched the same one-workgroup-per-row
+/// way as the folded family and is the fourth kernel the rewrite touched — no
+/// wgpu suite built this node before, so this is its only numeric guard. Same two
+/// shapes as the folded case: the partial tail stride (130 = 2·64 + 2) with the
+/// two-pass LayerNorm branch under a DC offset, and a decode-shaped width (512 =
+/// 8 strides per lane) — for both the LayerNorm branch and the RMS branch the
+/// kernel selects on `layer_norm`. Measured: 130/DC LayerNorm 1.2e-5, RmsNorm
+/// 2.4e-7; 512 LayerNorm 3.6e-7, RmsNorm 2.4e-7. The DC LayerNorm figure is f32
+/// mean quantisation at DC=1e3 (`ulp(mean)` ≈ 6e-5) amplified by `inv_std`, not a
+/// reduction error, which is why that case takes the looser bar.
+#[test]
+fn ada_layer_norm_strided_dc_matches_reference() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    for norm in [AdaNormKind::LayerNorm, AdaNormKind::RmsNorm] {
+        ada_case(norm, 130, 1_000.0, 1e-3);
+        ada_case(norm, 512, 0.0, 1e-4);
+    }
+}
+
+fn ada_case(norm: AdaNormKind, h: usize, dc: f32, bar: f32) {
+    const B: usize = 2;
+    const S: usize = 3;
+    const EPS: f32 = 1e-5;
+    let mut g = Graph::new("ada_case");
+    let x = g.input("x", Shape::new(&[B, S, h], DType::F32));
+    let scale = g.input("scale", Shape::new(&[B, 1, h], DType::F32));
+    let shift = g.input("shift", Shape::new(&[B, 1, h], DType::F32));
+    let y = g.add_node(
+        Op::AdaLayerNorm { norm, eps: EPS },
+        vec![x, scale, shift],
+        Shape::new(&[B, S, h], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    let mut exe = WgpuExecutable::compile(g);
+    let xv: Vec<f32> = (0..B * S * h)
+        .map(|i| dc + (((i + 3) % 17) as f32 - 8.0) * 0.5)
+        .collect();
+    let scale_v: Vec<f32> = (0..B * h)
+        .map(|i| (((i * 5) % 11) as f32 - 5.0) * 0.02)
+        .collect();
+    let shift_v: Vec<f32> = (0..B * h)
+        .map(|i| (((i * 7) % 13) as f32 - 6.0) * 0.05)
+        .collect();
+    let got = exe
+        .run(&[("x", &xv), ("scale", &scale_v), ("shift", &shift_v)])
+        .remove(0);
+
+    // f64 reference. scale/shift are [B, 1, h], so outer row `b·S + s` takes
+    // modulation row `b`.
+    let mut want = vec![0f32; B * S * h];
+    for b in 0..B {
+        for s in 0..S {
+            let o = (b * S + s) * h;
+            let row: Vec<f64> = (0..h).map(|i| xv[o + i] as f64).collect();
+            let n = h as f64;
+            let mean = row.iter().sum::<f64>() / n;
+            let inv = match norm {
+                AdaNormKind::LayerNorm => {
+                    let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+                    1.0 / (var + EPS as f64).sqrt()
+                }
+                AdaNormKind::RmsNorm => {
+                    1.0 / (row.iter().map(|v| v * v).sum::<f64>() / n + EPS as f64).sqrt()
+                }
+            };
+            for i in 0..h {
+                let base = match norm {
+                    AdaNormKind::LayerNorm => (row[i] - mean) * inv,
+                    AdaNormKind::RmsNorm => row[i] * inv,
+                };
+                want[o + i] =
+                    (base * (1.0 + scale_v[b * h + i] as f64) + shift_v[b * h + i] as f64) as f32;
+            }
+        }
+    }
+
+    let maxd = common::max_abs_diff(&got, &want);
+    // Numerics first — as in the tee helper, it applies on every adapter,
+    // however the ops routed.
+    assert!(
+        maxd < bar,
+        "ada {norm:?} rows={} h={h} dc={dc}: wgpu differs from the f64 reference by \
+         {maxd:.3e} (bar {bar:.1e}) — check the tree reduction's tail stride and the \
+         two-pass LayerNorm branch",
+        B * S
+    );
+
+    let counts = exe.step_kind_counts();
+    let steps = counts.get("ada_layer_norm").copied().unwrap_or(0);
+    eprintln!(
+        "  ada {norm:?} rows={} h={h} dc={dc}: {steps} step(s), maxd={maxd:.3e}",
+        B * S
+    );
+    // No host-route N/A here, unlike the folded/tee helpers: `Op::AdaLayerNorm`
+    // is not in the norm family's host-route predicate (`lower.rs`) and has one
+    // unconditional device lowering, so the step is always scheduled.
+    assert_eq!(
+        steps,
+        1,
+        "ada {norm:?} rows={} h={h}: expected one ada_layer_norm step on the device, got {steps}",
+        B * S
     );
 }
 

@@ -224,6 +224,10 @@ name = "f16_matmul"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "fused_residual_norm_cost"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "gguf_batch_join"
 required-features = ["backend-tests"]
 
