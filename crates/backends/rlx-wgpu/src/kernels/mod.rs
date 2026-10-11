@@ -2687,6 +2687,7 @@ static DEQUANT_GEMV_GGUF_TILED: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q1_0: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q4K: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q6K: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMM_Q8_0: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_BT: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN_TEE: OnceLock<Kernel> = OnceLock::new();
@@ -4191,6 +4192,20 @@ pub fn dequant_gemm_q6k_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu dequant_gemm_q6k",
             DEQUANT_GEMM_GGUF_WGSL,
             "dequant_gemm_q6k",
+            false,
+        )
+    })
+}
+/// Multi-row Q8_0 GEMM (`m > 1`): one thread per column covers 8 rows. Same
+/// binding set as the K-quant entries; its 34-byte blocks are read without the
+/// whole-word alignment they have, through the shader's reassembling reader.
+pub fn dequant_gemm_q8_0_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMM_Q8_0.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemm_q8_0",
+            DEQUANT_GEMM_GGUF_WGSL,
+            "dequant_gemm_q8_0",
             false,
         )
     })

@@ -8,11 +8,14 @@
 //! parity against the CPU reference, zero-input ~ zero, input dependence, and an
 //! in-process repeat.
 //!
-//! wgpu's change point is `m == 1` vs `m > 1` on the scratch-free K-quant
-//! routes: Q4_K / Q6_K decode with one fused per-row GEMV and prefill with a
-//! row-grouped GEMM (8 rows/tile, one weight read per tile). Q5_K / Q8_0 have NO
-//! fused route — they always dequantize into an in-arena f32 scratch and run
-//! `matmul_bt`, so there is no change point for them to measure.
+//! wgpu's change point is `m == 1` vs `m > 1`: Q4_K / Q6_K decode with one fused
+//! per-row GEMV and prefill with a row-grouped GEMM (8 rows/tile, one weight read
+//! per tile), and Q8_0 — which has no GEMV arm at all — takes that same row-grouped
+//! GEMM above one row, at a `k` that is a whole number of its staged activation
+//! tiles. Q5_K has NO fused route: it always dequantizes into an in-arena f32
+//! scratch and runs `matmul_bt`, so there is no change point for it to measure,
+//! and Q8_0 takes that same slab at one row and at every `k` its GEMM cannot
+//! stage.
 //!
 //! wgpu DOES expose an authoritative route signal —
 //! `rlx_wgpu::gguf_gpu::route_counts()` — but it is process-global, so the
@@ -47,6 +50,10 @@ use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{CompiledGraph, Device, Session};
+// The row-grouped arm's `k` gate, read from the encoder rather than restated: the
+// staged tile is `gguf_gpu`'s own const, pinned against the shader's `BLK_ELEMS`
+// there.
+use rlx_wgpu::gguf_gpu::GROUPED_STAGE_ELEMS;
 
 /// One parity cell: a packed weight `[n, k]` applied to an input of
 /// `batch ++ [m, k]`.
@@ -290,25 +297,31 @@ fn wgpu_has_fused_route(scheme: QuantScheme) -> bool {
 /// The fused decode route: one GEMV dispatch per output row, no f32 scratch.
 const ROUTE_PER_ROW: &str = "per-row GEMV (fused, no scratch)";
 /// The fused prefill route: one pass over each packed weight tile per 8 output
-/// rows, no f32 scratch. Only Q4_K / Q6_K have it, and only at `m > 1`.
+/// rows, no f32 scratch. Q4_K / Q6_K have it at `m > 1`; Q8_0 has it at `m > 1`
+/// and a staged-tile-aligned `k`, and nothing else (it has no GEMV arm).
 const ROUTE_GROUPED: &str =
     "row-grouped fused GEMM (8 rows/tile, one weight read per tile, no scratch)";
-/// The only route Q5_K / Q8_0 have, at every `m`: device dequant into the
-/// in-arena f32 scratch, then `matmul_bt`. The lowerer substitutes a whole-op host
-/// D2H+H2D staging when no slab was booked (sharded arena, parked weight); that is
-/// not distinguishable from here, and no cell in this file builds it.
+/// The route Q5_K has at every `m`, and Q8_0's at one row and for a `k` its GEMM
+/// cannot stage: device dequant into the in-arena f32 scratch, then `matmul_bt`.
+/// The lowerer substitutes a whole-op host D2H+H2D staging when no slab was
+/// booked (sharded arena, parked weight); that is not distinguishable from here,
+/// and no cell in this file builds it.
 const ROUTE_SCRATCH: &str = "dequant_scratch + matmul_bt (in-arena f32 scratch k*n*4)";
 /// The fused GEMV/GEMM kernels read whole GGUF blocks, so at `m > 1` an unaligned
 /// `k` on a scratch-free family takes no fused route: the multiply runs on the
 /// host (where the graph booked no f32 slab for it), or through the slab.
 const ROUTE_HOST: &str = "host dequant (k is not a whole number of GGUF blocks, which \
      the fused GEMV/GEMM reads, so at m > 1 no fused route applies)";
+/// The same host route for its other cause: the graph booked no f32 slab at all,
+/// which the selector reads before any arm (so no ladder arm is even asked).
+const ROUTE_HOST_NO_SLAB: &str = "host dequant (the graph booked no in-arena f32 scratch slab)";
 
 /// The route the wgpu encoder takes for a packed `DequantMatMul`, derived from
 /// the runtime selector: `gguf_gpu::select_path` (whose tiled one-row arm is
 /// `gemv_one_row_device_ok`), the ladder the run path calls, and
-/// `gguf_gpu::encode_dequant_matmul_gguf_into`'s Q1_0 → grouped K-quant →
-/// per-row ladder.
+/// `gguf_gpu::encode_dequant_matmul_gguf_into`'s Q1_0 → grouped → per-row
+/// ladder, its row-grouped arm being the one the scratch entry point hands a
+/// multi-row call of a GEMV-less scheme to.
 ///
 /// There is deliberately no in-process probe here: wgpu's own signal
 /// (`gguf_gpu::route_counts`) is process-global, so the authoritative assertion
@@ -333,14 +346,39 @@ fn wgpu_route(scheme: QuantScheme, m: usize, k: usize, arena_scratch_reserved: b
         scheme.gguf_block_size(),
         scheme.gguf_block_bytes()
     );
+    if scheme == QuantScheme::GgufQ8_0 {
+        // Q8_0's one fused arm is the row-grouped GEMM: one pass over each packed
+        // weight tile per group of 8 rows, no slab. Its gate is the *staged tile*
+        // (256 elements — the tile the shader's barriers and its `xs` staging are
+        // sized by, shared with the Q4_K/Q6_K entries, and eight of this scheme's
+        // 32-element blocks), not this scheme's own block size; below one row there
+        // is no GEMM arm at all.
+        if !arena_scratch_reserved {
+            // The selector reads the booking before any arm: with no slab the call
+            // is the host's, whatever this scheme's ladder would have done with it.
+            return format!("{ROUTE_HOST_NO_SLAB}; {blocks}; no slab booked");
+        }
+        if m > 1 && k.is_multiple_of(GROUPED_STAGE_ELEMS) {
+            return format!(
+                "{ROUTE_GROUPED}; {blocks}; k%{GROUPED_STAGE_ELEMS}==0 (eight blocks to a staged \
+                 tile)"
+            );
+        }
+        let why = if m == 1 {
+            "one row has no GEMM arm"
+        } else {
+            "k is not a whole number of staged tiles"
+        };
+        return format!("{ROUTE_SCRATCH}; {blocks}; {why}");
+    }
     if !wgpu_has_fused_route(scheme) {
-        // Q5_K and Q8_0 have NO fused route: one scratch route at every m, so
-        // there is no change point between decode and prefill to measure.
+        // Q5_K has NO fused route: one scratch route at every m, so there is no
+        // change point between decode and prefill to measure.
         return match scheme {
             QuantScheme::GgufQ5K => {
                 // The only scratch-route family here whose k this file can leave off
-                // a block boundary (Q8_0's is always whole), so the note names the
-                // geometry only where a cell has one — no cell reads a neighbour's.
+                // a block boundary, so the note names the geometry only where a cell
+                // has one — no cell reads a neighbour's.
                 let partial = if k.is_multiple_of(block_elems) {
                     String::new()
                 } else {
@@ -351,10 +389,6 @@ fn wgpu_route(scheme: QuantScheme, m: usize, k: usize, arena_scratch_reserved: b
                      requirement{partial}; ONE route at every m"
                 )
             }
-            QuantScheme::GgufQ8_0 => format!(
-                "{ROUTE_SCRATCH}; {blocks}; every k this file feeds is a whole number of 32-element \
-                 blocks; ONE route at every m"
-            ),
             _ => ROUTE_SCRATCH.to_string(),
         };
     }
@@ -385,6 +419,26 @@ fn wgpu_route(scheme: QuantScheme, m: usize, k: usize, arena_scratch_reserved: b
             format!("tiled Q1_0 GEMM (one dispatch, no scratch); {blocks}; no k gate")
         }
         _ => ROUTE_SCRATCH.to_string(),
+    }
+}
+
+/// The mirror's own Q8_0 corners, device-free: `arena_scratch_reserved` is the
+/// graph's booking, and the selector reads it before any arm, so an unbooked call
+/// is the host's whatever the ladder would have done with it — while a booked one
+/// is the grouped GEMM above one staged tile of `k` and the slab otherwise.
+#[test]
+fn wgpu_route_mirror_places_q8_0_by_booking_and_row_count() {
+    for (m, k, booked, want) in [
+        (2usize, 1024usize, false, ROUTE_HOST_NO_SLAB),
+        (2, 1024, true, ROUTE_GROUPED),
+        (1, 1024, true, ROUTE_SCRATCH),
+        (2, 384, true, ROUTE_SCRATCH),
+    ] {
+        let route = wgpu_route(QuantScheme::GgufQ8_0, m, k, booked);
+        assert!(
+            route.starts_with(want),
+            "Q8_0 m={m} k={k} booked={booked}: expected the {want} mirror, got {route}"
+        );
     }
 }
 
@@ -451,8 +505,9 @@ struct CaseReport {
 const BARE_GRAPH_CONTEXT: &str = "bare single packed matmul (no norm/activation to fuse)";
 /// The model-class graph's graph: what wgpu does with a real block.
 const MODEL_GRAPH_CONTEXT: &str = "packed matmuls stay their own steps (never common-IR); \
-     elementwise/mul ops fuse into the surrounding segments; the eight Q5_K/Q8_0 nodes share one \
-     in-arena dequant scratch, which the Q4_K/Q6_K fused routes never materialize";
+     elementwise/mul ops fuse into the surrounding segments; Q4_K/Q6_K and a multi-row Q8_0 take \
+     the fused row-grouped GEMM, which materializes no f32 image, so the one in-arena dequant \
+     scratch the eight Q5_K/Q8_0 nodes share is read by Q5_K and by Q8_0's one-row cell";
 
 impl CaseReport {
     fn print(&self) {
@@ -858,8 +913,9 @@ struct MemAcc {
     f32_image_total: usize,
     /// Graph-wide in-arena dequant scratch the wgpu planner reserves, taken from
     /// `gguf_gpu::dequant_gguf_scratch_bytes` — `max(k*n*4)` over the nodes whose
-    /// scheme has no fused route (Q5_K / Q8_0 here). The fused Q4_K / Q6_K routes
-    /// materialize nothing.
+    /// scheme has no fused route (Q5_K here, and Q8_0, whose multi-row calls take
+    /// the fused GEMM while its one-row calls and refused shapes still read this).
+    /// The fused Q4_K / Q6_K routes materialize nothing.
     scratch_graph_max: usize,
 }
 
@@ -1098,11 +1154,13 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
     // point.
     let shapes: &[(&'static [usize], usize, usize, usize, f32)] = &[
         (&[], 2, 256, 8, 1e-2), // tiny, on the grouped side of the m==1 change point
-        // Unaligned k (1.5 K-quant superblocks): no fused Q4_K/Q6_K GEMM reads it,
-        // so those schemes take the documented HOST route while Q5_K/Q8_0 stay on
-        // scratch. This is the shape the route census counter-asserts (`host: 1`)
-        // for them; the pre-existing k=640 case is mid-superblock too, but has no
-        // census cell behind its route.
+        // Unaligned k (1.5 K-quant superblocks, 12 whole Q8_0 blocks): no fused
+        // Q4_K/Q6_K GEMM reads it, and it is not a whole number of the staged
+        // tiles Q8_0's GEMM needs either, so all of them take the documented
+        // routes — Q4_K/Q6_K the HOST one, Q5_K/Q8_0 the slab. This is the shape
+        // the route census counter-asserts (`host: 1` for the K-quants, scratch
+        // for the other two); the pre-existing k=640 case is mid-superblock too,
+        // but has no census cell behind its route.
         (&[], 4, 384, 8, 1e-2),
         (&[], 128, 256, 640, 1e-2),   // grouped side, wide n
         (&[], 64, 2048, 512, 1e-2),   // key width 2048
@@ -1132,9 +1190,10 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
     // f32 if the whole block were expanded at once (the build materializes one
     // weight at a time, so its own peak is the widest projection, 16 MiB), the 16 MiB
     // dequant slab the planner books for that projection (`max(k*n*4)` = 4096*1024*4)
-    // reserved once for the eight Q5_K/Q8_0 nodes, and three cells: m=1 in the
-    // models' 3-D single-token form `[1, 1, H]`, m=96 and m=192 at `[m, H]` — one
-    // bounded test, weights built in memory with `rlx_gguf::quantize` (no file).
+    // reserved once for the eight Q5_K/Q8_0 nodes — those nodes' m=1 cells and any
+    // shape their fused arms refuse are what still read it — and three cells: m=1 in
+    // the models' 3-D single-token form `[1, 1, H]`, m=96 and m=192 at `[m, H]` —
+    // one bounded test, weights built in memory with `rlx_gguf::quantize` (no file).
     // The measured figures are what the `[rlx-gguf-mem]` line prints.
     const H: usize = 1024;
     const I: usize = 4096;
@@ -1152,10 +1211,12 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
         let label = format!("model mlp-block {LAYERS}L batch={batch:?} m={m} H={H} I={I}");
         // Q4_K (o-projection, k=H) and Q6_K (up, k=H) sit on the change point:
         // m=1 is the decode (per-row GEMV) side, m>=2 the row-grouped side.
-        // Q5_K (gate, k=H) and Q8_0 (down, k=I) have only their single scratch
-        // route at every m — all three m take the same one. Every projection has k a
-        // whole number of blocks, so the slab's presence only affects the qualifier
-        // the unaligned-k arm would print, and it is the block's own reservation.
+        // Q8_0 (down, k=I=4096) sits on its own change point too — m=1 the slab,
+        // m>=2 the row-grouped GEMM, k being a whole number of staged tiles there
+        // — while Q5_K (gate, k=H) has only its single scratch route at every m.
+        // Every projection has k a whole number of blocks, so the slab's presence
+        // only affects the qualifier the unaligned-k arm would print, and it is
+        // the block's own reservation.
         let scratch_reserved = block.mem.scratch_graph_max > 0;
         let mut routes = [
             wgpu_route(QuantScheme::GgufQ5K, m, H, scratch_reserved),
@@ -1178,11 +1239,11 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
         // low thousands (two un-normalized MLP expansions, no downstream norm), so
         // no grid-cell absolute bound holds here. Measured max_abs / cpu_max
         // (relative):
-        //   m=1 (3-D) 1.12e-2 / 1617 = 6.9e-6
-        //   m=96      2.01e-2 / 2939 = 6.8e-6
-        //   m=192     2.25e-2 / 2940 = 7.6e-6
-        // All three sit on the same ~7e-6 relative floor — the absolute value
-        // tracks cpu_max, not the route — so one absolute bound with >=2x headroom
+        //   m=1 (3-D) 8.30e-3 / 1617 = 5.1e-6
+        //   m=96      2.25e-2 / 2939 = 7.6e-6
+        //   m=192     2.87e-2 / 2940 = 9.8e-6
+        // All three sit on the same ~1e-5 relative floor — the absolute value
+        // tracks cpu_max, not the route — so one absolute bound with >=1.7x headroom
         // over the largest measured side is the honest form, PAIRED with the
         // relative bound asserted below. What actually bounds the fused GEMV/GEMM
         // and the scratch-dequant accumulation is the relative error.
@@ -1204,7 +1265,7 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
         assert_measured(&report.label, &report.measured, tol);
         // The absolute bound above scales with |y|, so the per-element error is
         // also asserted against the reference magnitude: every observed cell sits
-        // at ~7e-6 relative, and 1e-4 is the gross-divergence ceiling.
+        // at ~1e-5 relative, and 1e-4 is the gross-divergence ceiling.
         let rel = report.measured.max_abs / report.measured.cpu_max.max(1e-30);
         assert!(
             rel <= 1e-4,

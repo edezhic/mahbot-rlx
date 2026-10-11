@@ -330,19 +330,29 @@ fn select_path_is_exact_for_the_one_row_device_arm() {
         );
     }
 
-    // A scheme with no fused kernel is scratch / host at every row count.
-    let q5 = rlx_wgpu::gguf_host::gguf_scheme_id(rlx_ir::quant::QuantScheme::GgufQ5_0);
-    for m in [1usize, 4] {
-        assert_eq!(
-            select_path(m, 256, q5, 64, 4096),
-            DequantMatmulPath::ScratchArm,
-            "Q5_0 (id {q5}) m={m}: no fused kernel, so a booked slab means scratch"
-        );
-        assert_eq!(
-            select_path(m, 256, q5, 64, 0),
-            DequantMatmulPath::Host,
-            "Q5_0 (id {q5}) m={m}: no fused kernel and no slab, so the host"
-        );
+    // A scheme with no fused kernel is scratch / host at every row count. Q8_0 has
+    // one arm inside the scratch entry point — the row-grouped GEMM at `m > 1` with
+    // a staged-tile-aligned `k` — but that is the entry point's own choice, not
+    // this selector's answer, so it is pinned by the route census in
+    // `gguf_matmul_route.rs` and not here. One row takes the slab rather than a
+    // per-row GEMV for both schemes, and that is the whole of this test's claim.
+    for (name, scheme) in [
+        ("Q5_0", rlx_ir::quant::QuantScheme::GgufQ5_0),
+        ("Q8_0", rlx_ir::quant::QuantScheme::GgufQ8_0),
+    ] {
+        let id = rlx_wgpu::gguf_host::gguf_scheme_id(scheme);
+        for m in [1usize, 4] {
+            assert_eq!(
+                select_path(m, 256, id, 64, 4096),
+                DequantMatmulPath::ScratchArm,
+                "{name} (id {id}) m={m}: no fused kernel, so a booked slab means scratch"
+            );
+            assert_eq!(
+                select_path(m, 256, id, 64, 0),
+                DequantMatmulPath::Host,
+                "{name} (id {id}) m={m}: no fused kernel and no slab, so the host"
+            );
+        }
     }
 
     // A K-quant at one row with a window the arm's `vec4` X read cannot address

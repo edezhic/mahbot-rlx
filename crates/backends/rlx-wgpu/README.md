@@ -79,13 +79,14 @@ kernels, pure Rust deps — no FFI, no submodules.
   Unsupported ops panic at compile time with a clear "fall back to
   CPU/Metal/MLX" diagnostic.
 - **GGUF dequant** — `kernels/dequant_gguf.wgsl`, `dequant_gemv_gguf.wgsl`,
-  `dequant_gemm_gguf.wgsl` + `gguf_gpu.rs`: fused windowed kernels for
-  Q4_K/Q6_K/Q1_0 (scratch-free, shard-safe). At `m == 1` Q4_K/Q6_K take a tiled
-  per-row GEMV arm (one workgroup per output column, its lanes splitting the
-  contraction, X read four elements at a time) while Q1_0 keeps one thread per
-  column on the scalar X view; for `m > 1` Q4_K/Q6_K a
-  row-grouped GEMM reads each packed weight tile
-  once per group of 8 rows instead of once per row. Other schemes
+  `dequant_gemm_gguf.wgsl` + `gguf_gpu.rs`: `select_path` picks the fused
+  windowed kernels for Q4_K/Q6_K/Q1_0 (scratch-free, shard-safe). At `m == 1`
+  Q4_K/Q6_K take a tiled per-row GEMV arm (one workgroup per output column, its
+  lanes splitting the contraction, X read four elements at a time) while Q1_0
+  keeps one thread per column on the scalar X view; for `m > 1` Q4_K/Q6_K **and
+  Q8_0** a row-grouped GEMM reads each packed weight tile once per group of 8
+  rows instead of once per row. Q8_0 has no one-row arm, so it takes the scratch
+  slab at `m == 1` and at any multi-row shape the GEMM declines. Other schemes
   dequant into scratch then `matmul_bt` when the arena is a single buffer;
   sharded / split-weight arenas fall back to `gguf_host`. Grouped MoE GGUF
   uses the GPU path when scratch fits and the arena is unsharded. Scheme ids
@@ -105,7 +106,8 @@ kernels, pure Rust deps — no FFI, no submodules.
 
 Broad inference surface (matmul, norms, attention, conv, vision, RNN/SSM,
 quantized matmul, etc.) — see [docs/op-coverage.md](../../../docs/op-coverage.md).
-GGUF `DequantMatMul` uses the GPU path when arena scratch fits; otherwise
+GGUF `DequantMatMul` follows the `select_path` ladder — the fused windowed
+kernels, or `dequant_gguf` + `matmul_bt` when arena scratch fits; otherwise
 CPU dequant via `gguf_host`. MoE grouped GGUF remains host-only on WGPU.
 
 ## Install

@@ -2,12 +2,14 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// Fused multi-row GGUF K-quant GEMM (prefill `m > 1`) for `Op::DequantMatMul`.
+// Fused multi-row GGUF packed-weight GEMM (prefill `m > 1`) for
+// `Op::DequantMatMul`.
 //
-// One entry point per scheme — `dequant_gemm_q4k` (scheme 0) and
-// `dequant_gemm_q6k` (scheme 2). Deliberately NOT a `scheme_id` branch chain
-// like `dequant_gguf.wgsl`: an id routed to a kernel with no branch for it
-// matches nothing and reads the weights as **zeros** instead of failing.
+// One entry point per scheme — `dequant_gemm_q4k` (scheme 0), `dequant_gemm_q6k`
+// (scheme 2) and `dequant_gemm_q8_0` (scheme 20, the byte-per-weight form).
+// Deliberately NOT a `scheme_id` branch chain like `dequant_gguf.wgsl`: an id
+// routed to a kernel with no branch for it matches nothing and reads the weights
+// as **zeros** instead of failing.
 //
 // Each thread owns one output column `j` and accumulates `TM = 8` rows of
 // `Y[m,n] = X[m,k] @ dequant(W)[n,k]^T` straight from the packed weight (no f32
@@ -55,7 +57,10 @@
 // own orders (the tiled arm reduces lane partials in a fixed tree), so round-off
 // differs. The measured CPU-reference parity is the real justification: max-abs
 // 1.9e-5 .. 6.5e-4 over the prefill-parity shapes, against the 1e-2 this op is
-// compared at.
+// compared at. The Q8_0 entry's own band, over the cells
+// `rlx-wgpu/tests/gguf_matmul_route.rs` measures it at, is 2.7e-5 .. 4.2e-4
+// (identical against the CPU reference and against the scratch route it
+// replaces), well inside that gate.
 //
 // The Q6_K dequant (`read_w`, `read_w_i8`, `dq_read_f16`, `bytes_x4`, `q6c`,
 // `q6_quarter`) is the one-row tiled arm's, `dequant_gemv_tiled` of
@@ -63,7 +68,9 @@
 // is that same math with its scale/min bytes and nibble words unpacked as whole
 // words (`q4k_scale_min`, `q4k_nibbles`). This is the third copy of the Q4_K/Q6_K
 // packing in this directory (`dequant_gguf.wgsl`, `dequant_gemv_gguf.wgsl`): a
-// fix to the nibble or scale/min layout has to land in all three.
+// fix to the nibble or scale/min layout has to land in all three. Q8_0's
+// (`q8_0_quants`, the entry at the end of this file) has one other copy, the
+// `scheme_id == 20` branch of `dequant_gguf.wgsl`.
 
 struct Params {
     m: u32,           // rows
@@ -411,6 +418,88 @@ fn dequant_gemm_q6k(
                 a5 = a5 + xs_at(5u, o) * v1 + xs_at(5u, o + 32u) * v2 + xs_at(5u, o + 64u) * v3 + xs_at(5u, o + 96u) * v4;
                 a6 = a6 + xs_at(6u, o) * v1 + xs_at(6u, o + 32u) * v2 + xs_at(6u, o + 64u) * v3 + xs_at(6u, o + 96u) * v4;
                 a7 = a7 + xs_at(7u, o) * v1 + xs_at(7u, o + 32u) * v2 + xs_at(7u, o + 64u) * v3 + xs_at(7u, o + 96u) * v4;
+            }
+        }
+    }
+
+    if (col < params.ncols) { store_col(a0, a1, a2, a3, a4, a5, a6, a7, row0, col); }
+}
+
+// Q8_0: 34 bytes / 32 elements — f16 `d` and 32 i8 quants, the byte-per-weight
+// form. Its block stride is not a multiple of four, so a block's quants sit two
+// bytes off a word boundary for half the (column, block) pairs: neither the
+// block's `d` nor its quants can use the whole-word reader the Q4_K entry has
+// ([`read_u32`]), and both go through the reassembling [`read_word_at`], as
+// Q6_K's 210-byte rows already do.
+const Q8_0_BLK_ELEMS: u32 = 32u;
+const Q8_0_BLK_BYTES: u32 = 34u;
+
+/// One `qs` word's four quants, as `(b + 128) / 255`: the word is biased by 0x80
+/// so the signed bytes land on the unsigned `unorm` unpack, which is exact,
+/// where a signed unpack clamps the lowest quant (-128) at -1.0. The 255 and the
+/// bias both fold back out in [`dequant_gemm_q8_0`]'s `fma`, so four weights cost
+/// one unpack and one `fma` — the same shape as the Q4_K entry's nibble path, and
+/// not the byte-at-a-time read with a shift, a mask and a sign fix each that
+/// measured 2.1-2.7x here.
+fn q8_0_quants(word: u32) -> vec4<f32> {
+    return unpack4x8unorm(word ^ 0x80808080u);
+}
+
+/// The bias `q8_0_quants` adds, folded into the block's scale together with
+/// [`DQ_UNORM`]: `fma(quants, d * 255, -128 * d)` recovers `d * b` for a quant
+/// `b`, since `quants` is `(b + 128) / 255`.
+const Q8_0_BIAS: f32 = 128.0;
+
+@compute @workgroup_size(64, 1, 1)
+fn dequant_gemm_q8_0(
+    @builtin(local_invocation_index) tid: u32,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    let col = wid.x * TG + tid;
+    let row0 = wid.y * TM;
+    let colc = min(col, params.ncols - 1u);
+
+    let nbk = params.k / Q8_0_BLK_ELEMS;
+    let k4 = params.k >> 2u;
+    let last_row = params.m - 1u;
+    let xb = params.x_vec4_off;
+
+    var a0 = vec4<f32>(0.0);
+    var a1 = vec4<f32>(0.0);
+    var a2 = vec4<f32>(0.0);
+    var a3 = vec4<f32>(0.0);
+    var a4 = vec4<f32>(0.0);
+    var a5 = vec4<f32>(0.0);
+    var a6 = vec4<f32>(0.0);
+    var a7 = vec4<f32>(0.0);
+
+    // One staged activation tile per `BLK_ELEMS` of `k` — the Q4_K/Q6_K entries'
+    // tile, and eight of this scheme's blocks — so the barrier pair falls once per
+    // 256 elements instead of once per 32-element block, with the same staging
+    // work at the same granularity as the entries above.
+    for (var b0: u32 = 0u; b0 < params.k; b0 = b0 + BLK_ELEMS) {
+        workgroupBarrier();
+        stage_x(tid, row0, b0, k4, xb, last_row);
+        workgroupBarrier();
+
+        for (var bi: u32 = 0u; bi < BLK_ELEMS / Q8_0_BLK_ELEMS; bi = bi + 1u) {
+            let b = (b0 / Q8_0_BLK_ELEMS) + bi;
+            let off = (colc * nbk + b) * Q8_0_BLK_BYTES;
+            let d = f16_bits_to_f32(read_word_at(off) & 0xFFFFu);
+            let dq = vec4<f32>(d * DQ_UNORM);
+            let bias = vec4<f32>(-Q8_0_BIAS * d);
+            let lp = bi * Q8_0_BLK_ELEMS;
+            for (var l: u32 = 0u; l < Q8_0_BLK_ELEMS; l = l + 4u) {
+                let ww = fma(q8_0_quants(read_word_at(off + 2u + l)), dq, bias);
+                let o = lp + l;
+                a0 = a0 + xs_at(0u, o) * ww;
+                a1 = a1 + xs_at(1u, o) * ww;
+                a2 = a2 + xs_at(2u, o) * ww;
+                a3 = a3 + xs_at(3u, o) * ww;
+                a4 = a4 + xs_at(4u, o) * ww;
+                a5 = a5 + xs_at(5u, o) * ww;
+                a6 = a6 + xs_at(6u, o) * ww;
+                a7 = a7 + xs_at(7u, o) * ww;
             }
         }
     }

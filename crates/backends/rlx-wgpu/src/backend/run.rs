@@ -3581,7 +3581,11 @@ impl WgpuExecutable {
                         crate::backend::note_device_wait();
                         let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                     }
-                    crate::gguf_gpu::encode_dequant_matmul_gguf_into(
+                    // The join decision admits only `OneRowDevice` (schemes 0/2 at
+                    // one row), whose ladder always encodes: this site owns no
+                    // fallback, so a scheme the ladder declines has to be handled
+                    // here rather than advanced with nothing encoded.
+                    let encoded = crate::gguf_gpu::encode_dequant_matmul_gguf_into(
                         &self.arena,
                         &dev.device,
                         &dev.queue,
@@ -3594,6 +3598,7 @@ impl WgpuExecutable {
                         *w_byte_off as usize,
                         *out_byte_off as usize,
                     );
+                    debug_assert!(encoded, "joined step has no arm in the ladder");
                     step_i += 1;
                     pass_dispatched = true;
                     pending_enc = Some(enc);
@@ -4040,12 +4045,14 @@ impl WgpuExecutable {
                     //   parked in the weight buffer or wider than the binding
                     //   limit still takes it.
                     // - Q1_0 + m>1: tiled GEMM (or per-row GEMV) inside gemv_rows.
-                    // - The scratch arm: the fused entry point's own scratch route,
-                    //   an in-arena f32 slab then `matmul_bt` (`gemv` schemes are
-                    //   handed back to the per-row loop above, so a slab can still
-                    //   record PerRow). A scheme whose flat pack is block-linear over
-                    //   n·k needs k a whole number of blocks to slice rows; unaligned
-                    //   k there used to force the host D2H/H2D fallback for *all* m>1.
+                    // - The scratch arm: the fused entry point's own ladder — the
+                    //   row-grouped GEMM for a multi-row scheme with no one-row arm
+                    //   (Q8_0), else an in-arena f32 slab then `matmul_bt` (`gemv`
+                    //   schemes are handed back to the per-row loop above, so a slab
+                    //   can still record PerRow). A scheme whose flat pack is
+                    //   block-linear over n·k needs k a whole number of blocks to
+                    //   slice rows; unaligned k there used to force the host
+                    //   D2H/H2D fallback for *all* m>1.
                     match crate::gguf_gpu::select_path(
                         mm,
                         kk,

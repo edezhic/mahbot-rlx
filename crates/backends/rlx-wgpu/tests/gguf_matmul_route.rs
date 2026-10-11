@@ -8,6 +8,13 @@
 //! is a single route with a shape of its own, which is readable the same way
 //! (`gguf_gpu::gemv_one_row_shape`).
 //!
+//! The same counters pin Q8_0's change point: the byte-per-weight form has no
+//! one-row arm, so above one row it takes the row-grouped GEMM instead of the
+//! slab. The A/B block below measures such a call against the slab it used to
+//! take, at the shapes the packed steps actually multiply, and *reports* the
+//! figures (its `[rlx-gguf-q8-0-gemm]` lines) — the asserts there are the route,
+//! the recorded route census, the step count and the values, not the timings.
+//!
 //! Its own test binary and a single test fn, so the process-global counters have
 //! no concurrent writers.
 //!
@@ -33,9 +40,18 @@ use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_wgpu::gguf_gpu::{
-    DequantMatmulRoutes, gemv_one_row_shape, reset_gemv_one_row_shape, reset_route_counts,
-    route_counts,
+    DequantMatmulRoutes, GROUPED_STAGE_ELEMS, gemv_one_row_shape, reset_gemv_one_row_shape,
+    reset_route_counts, route_counts,
 };
+use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts};
+
+/// Whether a Q8_0 call takes the scheme's one fused arm — the row-grouped GEMM —
+/// rather than the dequant slab: more than one row, and a `k` that is a whole
+/// number of the staged activation tiles that arm needs ([`GROUPED_STAGE_ELEMS`],
+/// the shader's `BLK_ELEMS`, which is eight of this scheme's 32-element blocks).
+fn q8_0_byte_direct(m: usize, k: usize) -> bool {
+    m > 1 && k.is_multiple_of(GROUPED_STAGE_ELEMS)
+}
 
 /// Packed `w` and its row-major `x` for one `DequantMatMul`.
 fn case(
@@ -164,14 +180,17 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // same shapes, so neither the small-grid shapes nor the 3-D single-token decode
     // rests on the derivation alone.
     //
-    // Q5_K and Q8_0 have NO fused route — `gemv_supports_scheme` is exactly
-    // {Q4_K(0), Q6_K(2), Q1_0(24)} — so both take dequant-scratch + matmul_bt at
-    // every m: one route, no change point for them to measure, and `host == 0` is
-    // what an in-arena weight produces (the host route is reserved for a sharded
-    // arena, a parked weight, or a refused scratch, and — the case the k=384 cell
-    // below is here to reach — a fused family whose k is not a whole number of
-    // blocks, which books no slab for the selector to fall back into). Q4_K / Q6_K
-    // change at m == 1: one per-row GEMV below, one row-grouped dispatch above.
+    // Q5_K has NO fused route, and Q8_0 has none at one row, so those calls take
+    // dequant-scratch + matmul_bt: one route, no change point for them to measure,
+    // and `host == 0` is what an in-arena weight produces (the host route is
+    // reserved for a sharded arena, a parked weight, or a refused scratch, and —
+    // the case the k=384 cell below is here to reach — a fused family whose k is
+    // not a whole number of blocks, which books no slab for the selector to fall
+    // back into). Q8_0's change point is `m == 1`: above it the row-grouped GEMM
+    // reads the packed weight in place, at any `k` that is a whole number of its
+    // staged tiles — which is why the k=384 cell stays on the slab and is what
+    // pins that gate. Q4_K / Q6_K change at `m == 1` too: one per-row GEMV below,
+    // one row-grouped dispatch above.
     //
     // The model-class graph's own widths (H=1024, I=4096) are counter-checked here
     // in both regimes rather than only derived: gate/up is k=1024→n=4096, down is
@@ -182,9 +201,10 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     let shapes: &[(&'static [usize], usize, usize, usize)] = &[
         (&[], 2, 256, 8),
         // k=384 is 1.5 Q4_K/Q6_K superblocks and 12 whole Q8_0 blocks: the cell
-        // that reaches the selector's host fallback, so that arm is exercised
-        // rather than left as scaffolding. Q5_K is non-fused at any k, so it still
-        // takes its single scratch route here.
+        // that reaches the selector's host fallback for the K-quants and Q8_0's
+        // staged-tile gate, so both arms are exercised rather than left as
+        // scaffolding. Q5_K is non-fused at any k, so it still takes its single
+        // scratch route here.
         (&[], 4, 384, 8),
         (&[], 96, 256, 640),
         (&[], 128, 256, 640),
@@ -220,30 +240,45 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             );
             let fused = matches!(scheme, QuantScheme::GgufQ4K | QuantScheme::GgufQ6K);
             let aligned = k.is_multiple_of(scheme.gguf_block_size() as usize);
-            let want = match (fused, m == 1, aligned) {
-                (false, ..) => (0, 0, 1, 0), // Q5_K / Q8_0: one scratch route at every m
+            // Q8_0's one fused arm is the multi-row GEMM. Its gate is the staged
+            // tile's 256 elements, not its own 32-element block: below `m == 1` or
+            // off that granularity the slab is all there is.
+            let byte_direct = scheme == QuantScheme::GgufQ8_0 && q8_0_byte_direct(m, k);
+            let want = match (fused, byte_direct, m == 1, aligned) {
+                (_, true, ..) => (1, 0, 0, 0), // Q8_0 m>1, staged-tile-aligned k: grouped GEMM
+                (false, false, ..) => (0, 0, 1, 0), // Q5_K / one-row Q8_0 / k the GEMM refuses
                 // Decode takes one row per call so long as k is a multiple of
                 // four (the tiled arm's `vec4` X read); the block gate is the
                 // m > 1 GEMM's.
-                (true, true, _) => (0, 1, 0, 0),
-                (true, false, true) => (1, 0, 0, 0),
-                (true, false, false) => (0, 0, 0, 1), // host fallback: no slab booked, no row slicing
+                (true, _, true, _) => (0, 1, 0, 0),
+                (true, _, false, true) => (1, 0, 0, 0),
+                (true, _, false, false) => (0, 0, 0, 1), // host fallback: no slab booked, no row slicing
             };
             assert_eq!(
                 (c.grouped, c.per_row, c.scratch, c.host),
                 want,
                 "{scheme:?} m={m} k={k} n={n} batch={batch:?}: {c:?}"
             );
-            if want == (0, 0, 0, 1) {
-                // The host fallback's numbers are checked here as well as its
-                // counter: the row slices are invalid and a broken staging would
-                // show as a wrong or non-finite value, not as a wrong counter.
+            // The host fallback's numbers are checked here as well as its counter:
+            // the row slices are invalid and a broken staging would show as a wrong
+            // or non-finite value, not as a wrong counter. So are the cells that
+            // newly left the slab for Q8_0's GEMM — its first evidence against the
+            // CPU reference at the grid's own shapes rather than only at the packed
+            // steps' shapes the throughput block below uses.
+            if want == (0, 0, 0, 1) || byte_direct {
                 let cpu = run(Device::Cpu, g, &packed, &x);
                 let max_abs = max_abs_diff(&gpu, &cpu);
-                eprintln!("host-fallback {scheme:?} m={m} k={k} n={n}: max_abs={max_abs:.6e}");
+                eprintln!(
+                    "{}{scheme:?} m={m} k={k} n={n}: max_abs={max_abs:.6e}",
+                    if byte_direct {
+                        "byte-direct "
+                    } else {
+                        "host-fallback "
+                    }
+                );
                 assert!(
                     max_abs <= 1e-2,
-                    "{scheme:?} m={m} k={k} n={n}: host fallback max_abs {max_abs} > 1e-2"
+                    "{scheme:?} m={m} k={k} n={n}: max_abs {max_abs} > 1e-2"
                 );
             }
         }
@@ -257,11 +292,14 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // (`by_out`) rather than the weight the binding constraint, which is the
     // widest chunk count the encoder can be made to produce here. Q6_K is a
     // different packed layout (210-byte blocks, quarter-sized sub-blocks) with
-    // its own chunk arithmetic.
+    // its own chunk arithmetic, and Q8_0 a third (34-byte blocks, no word
+    // alignment to read them through) — both ride the same loop, which is what
+    // these cells are here to show.
     for (scheme, ggml, m) in [
         (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 4usize),
         (QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K, 4),
         (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 96),
+        (QuantScheme::GgufQ8_0, rlx_gguf::GgmlType::Q8_0, 4),
     ] {
         let (g, packed, x) = case(scheme, ggml, m, 256, 16384);
         rlx_ir::env::set("RLX_WGPU_MAX_BIND_MB", "1");
@@ -537,6 +575,169 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
                 streamed_mib / (best_us * 1e-6)
             );
         }
+    }
+
+    // A multi-row Q8_0 call against the slab it used to take, at the shapes the
+    // byte-per-weight steps multiply — the steps' own rows (13, 17, 72) against
+    // `[1024,1024]`, `[1024,4096]` / `[4096,1024]`, `[1024,3072]` / `[3072,1024]`,
+    // `[512,512]`, `[512,1024]` and `[1024,512]` — plus a row sweep either side of
+    // the change point at one of those widths, since a row-grouped kernel can lose
+    // above the rows it was built for.
+    //
+    // Both sides are one build and one instrument: A is the default route, B is
+    // the same call with `RLX_WGPU_Q8_0_GEMM_DISABLE=1`, which is the dequant slab
+    // — this scheme's route before the arm, at every m. That switch only lowers the
+    // arm, so the two sides share one compiled graph, one arena and one uploaded
+    // weight, and each side's own census below proves which route it ran. The calls
+    // alternate A/B within a round rather than running one side at a time: this
+    // crate's A/B protocol notes record a first-touch ordering bias that made a
+    // later arm look up to 20% faster than it was.
+    {
+        /// Timed rounds; each round runs both sides once. The figures are a
+        /// measurement for the record, like `dequant_plan_relaxed.rs`'s — the
+        /// asserted facts here are the routes, the route census, the step count and
+        /// the values.
+        const ROUNDS: usize = 5;
+
+        for &(m, k, n) in &[
+            // The packed steps' own cells, all multi-row.
+            (13usize, 1024usize, 1024usize),
+            (13, 1024, 4096),
+            (13, 4096, 1024),
+            (17, 1024, 1024),
+            (17, 1024, 3072),
+            (17, 3072, 1024),
+            (72, 512, 512),
+            (72, 512, 1024),
+            (72, 1024, 512),
+            // The row sweep, on a model width, either side of the arm's change
+            // point (m == 1) and past the ~96 rows one large-row measurement put
+            // in doubt on Metal. m=1 is the control: both sides are the slab
+            // there, so a route away from the slab would say the switch does more
+            // than lower this arm. m=2 and m=8 are the first row group and the
+            // tile; 512 and 1024 are an order of magnitude past the cells' rows,
+            // where a row-grouped kernel with no cap must still hold.
+            (1, 1024, 1024),
+            (2, 1024, 1024),
+            (8, 1024, 1024),
+            (96, 1024, 1024),
+            (192, 1024, 1024),
+            (276, 1024, 1024),
+            (512, 1024, 1024),
+            (1024, 1024, 1024),
+        ] {
+            let (g, packed, x) = case(QuantScheme::GgufQ8_0, rlx_gguf::GgmlType::Q8_0, m, k, n);
+            let mut c = Session::new(Device::Gpu).compile(g);
+            c.set_param_typed("w", &packed, DType::U8);
+            let _ = c.run(&[("x", &x)]);
+
+            // The route each side takes, from this binary's own counters, and what
+            // each side's steps cost the device: the arm's multiply is one
+            // submission against the slab's dequant-then-`matmul_bt` pair, and the
+            // bracket also counts the output readback's own submission on both
+            // sides — hence the two-against-three it prints.
+            reset_route_counts();
+            reset_device_counts();
+            let direct = c.run(&[("x", &x)]).remove(0);
+            let a = route_counts();
+            let a_submits = device_submit_count();
+            let a_waits = device_wait_count();
+            rlx_ir::env::set("RLX_WGPU_Q8_0_GEMM_DISABLE", "1");
+            reset_route_counts();
+            reset_device_counts();
+            let slab = c.run(&[("x", &x)]).remove(0);
+            let b = route_counts();
+            let b_submits = device_submit_count();
+            let b_waits = device_wait_count();
+            rlx_ir::env::unset("RLX_WGPU_Q8_0_GEMM_DISABLE");
+            // Only the arm is lowered: a call with no slab behind it must not
+            // change route with the switch either, so this is exact for both.
+            let direct_arm = q8_0_byte_direct(m, k);
+            assert_eq!(
+                (a.grouped, a.scratch, b.grouped, b.scratch),
+                if direct_arm {
+                    (1, 0, 0, 1)
+                } else {
+                    (0, 1, 0, 1)
+                },
+                "Q8_0 m={m} k={k} n={n}: the arm must be the default route and the \
+                 switch must lower it to the slab: {a:?} / {b:?}"
+            );
+
+            let mut a_us = f64::MAX;
+            let mut b_us = f64::MAX;
+            for _ in 0..ROUNDS {
+                let t0 = rlx_runtime::Tick::now();
+                let _ = c.run(&[("x", &x)]);
+                a_us = a_us.min(rlx_runtime::Tick::now().elapsed_us(t0));
+
+                rlx_ir::env::set("RLX_WGPU_Q8_0_GEMM_DISABLE", "1");
+                let t0 = rlx_runtime::Tick::now();
+                let _ = c.run(&[("x", &x)]);
+                b_us = b_us.min(rlx_runtime::Tick::now().elapsed_us(t0));
+                rlx_ir::env::unset("RLX_WGPU_Q8_0_GEMM_DISABLE");
+            }
+            let packed_mib = packed.len() as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "[rlx-gguf-q8-0-gemm] m={m} k={k} n={n} packed_MiB={packed_mib:.2} \
+                 arm_us={a_us:.0} slab_us={b_us:.0} ratio={:.2}x arm_MiB_per_s={:.0} \
+                 slab_MiB_per_s={:.0} arm_submits={a_submits} slab_submits={b_submits} \
+                 arm_waits={a_waits} slab_waits={b_waits}",
+                b_us / a_us,
+                packed_mib / (a_us * 1e-6),
+                packed_mib / (b_us * 1e-6)
+            );
+
+            if direct_arm {
+                // The arm's own step boundary, which is the other half of leaving
+                // the slab: the multiply is one submission against the slab's
+                // dequant-then-`matmul_bt` pair, and the bracket counts the
+                // readback's own submission on both sides (so two against three).
+                assert!(
+                    a_submits < b_submits,
+                    "Q8_0 m={m} k={k} n={n}: the arm must pay fewer submissions than \
+                     the slab, not {a_submits} against {b_submits}"
+                );
+                // The arm's own values, against both references it has. The slab
+                // side is the same weight and inputs through the f32 path this
+                // arm replaced — a route-against-route check, independent of the
+                // test's weight scale, that catches the stride and the byte
+                // unpack of the arm's own read. The CPU reference is the op's
+                // declared reference; same absolute 1e-2 every packed-multiply
+                // check in this crate uses. The CPU side runs for the packed steps'
+                // own rows (m <= 72) only: past them the grid above and
+                // `gguf_dequant_matmul_prefill_parity.rs` carry the same
+                // comparison at their own shapes.
+                let vs_slab = max_abs_diff(&direct, &slab);
+                eprintln!("byte-direct Q8_0 m={m} k={k} n={n}: vs_slab_max_abs={vs_slab:.6e}");
+                assert!(
+                    vs_slab <= 1e-2,
+                    "byte-direct Q8_0 m={m} k={k} n={n}: {vs_slab} from the slab route"
+                );
+                if m <= 72 {
+                    let (gc, _, _) = case(QuantScheme::GgufQ8_0, rlx_gguf::GgmlType::Q8_0, m, k, n);
+                    let cpu = run(Device::Cpu, gc, &packed, &x);
+                    let max_abs = max_abs_diff(&direct, &cpu);
+                    eprintln!("byte-direct Q8_0 m={m} k={k} n={n}: vs_cpu_max_abs={max_abs:.6e}");
+                    assert!(
+                        max_abs <= 1e-2,
+                        "byte-direct Q8_0 m={m} k={k} n={n}: max_abs {max_abs} > 1e-2"
+                    );
+                }
+            }
+        }
+        // The pooled slab the arm's path allocates for a chunk's output — the
+        // process-global, lazily created, never-released buffer the plan does not
+        // know about. Printed here as this process's peak, measured rather than
+        // assumed: this block sizes it, its widest cell being the sweep's m=1024
+        // at n=1024 (4 MiB of output) against the grid cells' 1.5 MiB. Compare it
+        // against the in-arena slab those calls no longer read (`scratch_graph_max`,
+        // still 16 MiB in the model block of the prefill parity test, because that
+        // scheme's one-row calls and refused shapes keep the booking).
+        eprintln!(
+            "[rlx-gguf-q8-0-gemm] pooled_out_buf_bytes={}",
+            rlx_wgpu::gguf_gpu::pooled_out_buf_bytes()
+        );
     }
 
     // The same arm when the weight window exceeds the binding limit: rows are
