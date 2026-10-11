@@ -24,6 +24,11 @@ pub struct WgpuRuntimeConfig {
     pub matmul_f32_only: bool,
     pub f16_weights: bool,
     pub no_tiled_conv: bool,
+    /// The conv-routes switch (`RLX_WGPU_CONV_IM2COL`, default on) *as read when
+    /// this snapshot was taken*. The router does not read it — `conv_routes_enabled()`
+    /// reads the env live, so the switch is not frozen at snapshot time, exactly as
+    /// `no_tiled_conv` above relates to the tiled route. Kept rather than deleted as
+    /// reader-less: it is part of the public struct upstream also ships.
     pub conv_im2col: bool,
     pub debug: bool,
 }
@@ -54,7 +59,7 @@ impl WgpuRuntimeConfig {
             matmul_f32_only: reg::flag("RLX_WGPU_MATMUL_F32_ONLY"),
             f16_weights: reg::flag("RLX_WGPU_F16_WEIGHTS"),
             no_tiled_conv: reg::flag("RLX_WGPU_NO_TILED_CONV"),
-            conv_im2col: reg::flag("RLX_WGPU_CONV_IM2COL"),
+            conv_im2col: reg::flag_or("RLX_WGPU_CONV_IM2COL", true),
             debug: reg::flag("RLX_WGPU_DEBUG"),
         }
     }

@@ -204,6 +204,14 @@ name = "coop_self_check"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "conv_route_cost"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_routes_parked_weight"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "conv_transpose2d_host_route"
 required-features = ["backend-tests"]
 

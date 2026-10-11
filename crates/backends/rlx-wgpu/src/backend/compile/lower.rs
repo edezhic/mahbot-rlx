@@ -950,10 +950,10 @@ pub(crate) fn compile_static_inner(
     // Pre-walk to compute the max scratch any single op needs — see
     // `compute_scratch_bytes` for the ops that claim a slice of the tail.
     let base_scratch_bytes = compute_scratch_bytes(&graph);
-    // Reserve tail scratch for the im2col `col` matrix only when the opt-in
-    // im2col+GEMM conv path is enabled (the default tiled/direct convs need
-    // no extra scratch, so the arena stays lean).
-    let conv_col_scratch = if rlx_ir::env::flag("RLX_WGPU_CONV_IM2COL") {
+    // Reserve tail scratch for the im2col `col` matrix only when the accelerated
+    // conv routes are enabled (they are on by default; `RLX_WGPU_CONV_IM2COL=0`
+    // restores the lean arena — the tiled/direct convs need no extra scratch).
+    let conv_col_scratch = if crate::backend::conv_routes_enabled() {
         conv_im2col_scratch_bytes(
             &graph,
             plan.arena_size,
@@ -1738,6 +1738,7 @@ pub(crate) fn compile_static_inner(
                     bias_off_f32: 0,
                     act_id: 0xFFFF,
                     b_is_param,
+                    from_conv1x1: false,
                     compute_precision,
                 });
                 let b_off_global = (arena.offset(b_id) / 4) as u32;
@@ -5640,6 +5641,7 @@ pub(crate) fn compile_static_inner(
                         bias_off_f32,
                         act_id,
                         b_is_param,
+                        from_conv1x1: false,
                         compute_precision,
                     });
                     register_coop_f16_vk_b_param(
@@ -5984,6 +5986,20 @@ pub(crate) fn compile_static_inner(
                             && w_in > 1
                             && kernel_size[0] > 1
                             && kernel_size.get(1).copied().unwrap_or(1) == 1;
+                        // The mirrored lift: the taps-in-slot-1 shape a decoder body
+                        // presents. The relabel is value-preserving only for a genuine
+                        // unit-height lift — any height extent or height padding means
+                        // H is a real axis, which the relabel would move and silently
+                        // resize the output — and `conv1d_tiled`'s own `w_out == 1`
+                        // criterion stays as it is: the relabel is what makes it hold.
+                        let mirror_eligible = h_in == 1
+                            && w_in > 1
+                            && out_shape[2].unwrap_static() == 1
+                            && kernel_size[0] == 1
+                            && kernel_size.get(1).copied().unwrap_or(1) > 1
+                            && p(0) == 0
+                            && *groups == 1
+                            && in_shape[0].unwrap_static() == 1;
                         let (h, w, h_out, w_out, kh, kw, sh, sw, ph, pw, dh, dw) = if one_d {
                             (
                                 w_in,
@@ -6015,7 +6031,9 @@ pub(crate) fn compile_static_inner(
                                 d(1),
                             )
                         };
-                        let p2 = Conv2dParams {
+                        // Every route receives these unless the mirrored relabel
+                        // below rewrites them in place; the host branch returns first.
+                        let mut p2 = Conv2dParams {
                             n: in_shape[0].unwrap_static() as u32,
                             c_in: in_shape[1].unwrap_static() as u32,
                             c_out: out_shape[1].unwrap_static() as u32,
@@ -6062,24 +6080,34 @@ pub(crate) fn compile_static_inner(
                                 out_byte_off: arena.offset(node.id) as u64,
                             });
                         } else {
-                            // Two accelerated conv paths for the `one_d`
-                            // (kw==1) vocoder convs:
-                            //   • conv1d_tiled (default): 2D register-blocked
-                            //     direct conv — reuses input across the output-
-                            //     channel tile. Drop-in for the direct conv
-                            //     (same params + bind window); no scratch.
-                            //   • im2col + GEMM (opt-in, RLX_WGPU_CONV_IM2COL):
-                            //     materialize `col` in scratch, run the tiled
-                            //     f32 GEMM. Wins only for GEMM-friendly shapes;
-                            //     needs whole-arena bind + reserved scratch.
+                            // Three accelerated conv paths, all under the one
+                            // switch (`RLX_WGPU_CONV_IM2COL`, on by default):
+                            //   • im2col + GEMM: a GEMM-friendly shape (the floors
+                            //     below) materialized into the reserved scratch;
+                            //     needs the whole arena bound.
+                            //   • 1×1 pointwise GEMM: a `Step::Matmul` straight off
+                            //     the activation, no gather needed.
+                            //   • conv1d_tiled (the `one_d` shape's default,
+                            //     independent of the switch): register-blocked
+                            //     direct conv, drop-in for the direct one. The
+                            //     `mirror` relabel below is what lets it serve a
+                            //     unit-height lift whose taps sit in slot 1.
                             // Everything else falls back to the direct conv.
+                            let accel = crate::backend::conv_routes_enabled();
+                            // A weight parked in the separate weight buffer
+                            // (`WEIGHT_BUF_TAG`) is not addressable by the two GEMM
+                            // routes: the raw word offset they address it with drops
+                            // the tag, and the `col` panel occupies the scratch a
+                            // staged copy would need. It keeps the previous
+                            // tiled/direct route, exactly what ran before.
+                            let parked = crate::buffer::is_weight_off(arena.offset(w_id));
                             let spatial = (p2.h_out as u64) * (p2.w_out as u64);
                             let k_total = (p2.c_in as u64) * (p2.kh as u64) * (p2.kw as u64);
                             let col_bytes = k_total.saturating_mul(spatial).saturating_mul(4);
                             let max_binding = dev.device.limits().max_storage_buffer_binding_size;
                             let whole = arena_whole_arena_bind(&arena, max_binding);
-                            let im2col_opt_in = rlx_ir::env::flag("RLX_WGPU_CONV_IM2COL");
-                            let use_im2col = im2col_opt_in
+                            let use_im2col = accel
+                                && !parked
                                 && p2.groups == 1
                                 && p2.n == 1
                                 && (p2.kh as u64) * (p2.kw as u64) >= 2
@@ -6089,16 +6117,99 @@ pub(crate) fn compile_static_inner(
                                 && col_bytes <= CONV_IM2COL_MAX_COL_BYTES
                                 && col_bytes <= arena.scratch_bytes as u64
                                 && whole.is_some();
-                            let use_tiled = !use_im2col
-                                && one_d
+                            // 1×1 conv: `W[c_out,c_in] @ in[c_in,h*w]`, both operands
+                            // already in the layout a GEMM wants, so no gather — a
+                            // routing change onto the matmul machinery, not a new
+                            // kernel. Admitted at the im2col route's own col-matrix
+                            // and channel floors (a 1×1 kernel's col *is* the
+                            // activation), capped so the step's own dispatch grid
+                            // stays inside the per-dimension workgroup limit. The
+                            // three routes are mutually exclusive by shape — this one
+                            // needs 1×1 taps, `mirror_eligible` a >1 tap in slot 1,
+                            // `one_d` a >1 tap in slot 0 — so each predicate tests
+                            // only what it decides.
+                            let pointwise = accel
+                                && !parked
+                                && p2.kh == 1
                                 && p2.kw == 1
-                                && p2.w == 1
-                                && p2.w_out == 1
+                                && p2.sh == 1
+                                && p2.sw == 1
+                                && p2.ph == 0
+                                && p2.pw == 0
+                                && p2.dh == 1
+                                && p2.dw == 1
                                 && p2.groups == 1
                                 && p2.n == 1
+                                && (p2.c_out as u64) >= im2col_min_cout()
+                                && k_total.saturating_mul(spatial)
+                                    >= im2col_min_k().saturating_mul(im2col_min_spatial())
+                                && spatial <= POINTWISE_MAX_SPATIAL;
+                            // The relabel exists only to unlock the tiled route for a
+                            // unit-height lift the im2col route does not take: it
+                            // leaves `spatial` and `k_total` alone, so no other
+                            // route's criterion moves.
+                            let mirror = accel
+                                && !parked
+                                && !use_im2col
+                                && mirror_eligible
                                 && spatial >= conv_tiled_min_spatial()
                                 && !rlx_ir::env::flag("RLX_WGPU_NO_TILED_CONV");
-                            if use_im2col {
+                            if mirror {
+                                // The relabel, in place: the length axis onto H and
+                                // the taps/stride/padding/dilation from slot 1.
+                                (p2.h, p2.w, p2.h_out, p2.w_out) =
+                                    (w_in, 1, out_shape[3].unwrap_static() as u32, 1);
+                                (p2.kh, p2.kw) = (kernel_size[1] as u32, 1);
+                                (p2.sh, p2.sw) = (s(1), 1);
+                                (p2.ph, p2.pw) = (p(1), 0);
+                                (p2.dh, p2.dw) = (d(1), 1);
+                            }
+                            // `mirror` implies every criterion below (the relabel is
+                            // what makes `kw == w == w_out == 1` hold), so only the
+                            // `one_d` branch has to state them.
+                            let use_tiled = mirror
+                                || (!use_im2col
+                                    && one_d
+                                    && p2.kw == 1
+                                    && p2.w == 1
+                                    && p2.w_out == 1
+                                    && p2.groups == 1
+                                    && p2.n == 1
+                                    && spatial >= conv_tiled_min_spatial()
+                                    && !rlx_ir::env::flag("RLX_WGPU_NO_TILED_CONV"));
+                            if pointwise {
+                                // GEMM: weight[c_out, c_in] @ in[c_in, spatial]
+                                //   → out[c_out, spatial]  (NCHW, N==1). No gather:
+                                // the activation already sits in the layout a GEMM
+                                // wants. The operands are addressed through the same
+                                // `arena_off_in_bind_window` offsets the direct conv
+                                // uses, not a raw `arena.offset(id)` cast. `m` is the
+                                // output-channel axis here, so `from_conv1x1: true`
+                                // keeps active-extent dispatch from scaling it.
+                                schedule.push(Step::Matmul {
+                                    m: p2.c_out,
+                                    k: p2.c_in,
+                                    n: spatial as u32,
+                                    batch: 1,
+                                    a_batch_stride: p2.c_out.saturating_mul(p2.c_in),
+                                    b_batch_stride: p2.c_in.saturating_mul(spatial as u32),
+                                    c_batch_stride: p2.c_out.saturating_mul(spatial as u32),
+                                    a_off_f32: w_off,
+                                    b_off_f32: in_off,
+                                    c_off_f32: out_off,
+                                    has_bias: 0,
+                                    bias_off_f32: 0,
+                                    act_id: 0xFFFF,
+                                    b_is_param: false,
+                                    compute_precision: MatmulCompute::F32,
+                                    from_conv1x1: true,
+                                });
+                                let u_mm = emit_uniform(std::mem::size_of::<MatmulParams>());
+                                let bg_mm =
+                                    bind_arena_window(&dev.device, mm_k, &arena, base, size, &u_mm);
+                                uniforms.push(u_mm);
+                                bind_groups.push(bg_mm);
+                            } else if use_im2col {
                                 let (base_w, size_w) = whole.expect("whole-arena bind");
                                 // col lives at the reserved scratch tail (free of
                                 // live data); consumed immediately by the GEMM.
@@ -6162,6 +6273,7 @@ pub(crate) fn compile_static_inner(
                                     bias_off_f32: 0,
                                     act_id: 0xFFFF,
                                     b_is_param: false,
+                                    from_conv1x1: false,
                                     compute_precision: MatmulCompute::F32,
                                 });
                                 let u_mm = emit_uniform(std::mem::size_of::<MatmulParams>());

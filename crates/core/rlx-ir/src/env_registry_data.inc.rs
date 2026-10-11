@@ -3133,8 +3133,8 @@
     EnvVarEntry {
         name: "RLX_WGPU_CONV_IM2COL",
         group: "wgpu",
-        summary: "Use the im2col convolution path on wgpu",
-        kind: EnvKind::Bool,
+        summary: "Accelerated conv routes on wgpu — im2col+GEMM, the mirrored 1-D tiled lift, the 1×1 pointwise GEMM (default on; `=0` restores the plain routing)",
+        kind: EnvKind::BoolOr { default: true },
         stability: EnvStability::Bisect,
         aliases: &[],
         layer: EnvLayer::Backend("wgpu"),

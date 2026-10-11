@@ -691,7 +691,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_CONCAT_HOST` | Bisect | Bool | Backend(wgpu) | Run Concat on the host instead of a wgpu kernel |
 | `RLX_WGPU_CONV3D_SCALAR` | Bisect | Bool | Backend(wgpu) | Force the one-element-per-thread Conv3D kernel instead of the 4-channel tiled one |
 | `RLX_WGPU_CONV_HOST` | Internal | Bool | Backend(wgpu) | Run convolution on the host instead of a wgpu kernel |
-| `RLX_WGPU_CONV_IM2COL` | Bisect | Bool | Backend(wgpu) | Use the im2col convolution path on wgpu |
+| `RLX_WGPU_CONV_IM2COL` | Bisect | BoolOr | Backend(wgpu) | Accelerated conv routes on wgpu — im2col+GEMM, the mirrored 1-D tiled lift, the 1×1 pointwise GEMM (default on; `=0` restores the plain routing) |
 | `RLX_WGPU_COOP_F16_VK_DISABLE` | Bisect | Bool | Backend(wgpu) | Disable f16 cooperative-matrix matmul on Vulkan |
 | `RLX_WGPU_COOP_F16_VK_ENABLE` | Bisect | Bool | Backend(wgpu) | Re-enable f16 cooperative-matrix matmul on Vulkan (at your risk) |
 | `RLX_WGPU_COOP_F16_VK_FORCE_WIDE` | Bisect | Bool | Backend(wgpu) | Force the wide cooperative-matrix tile |

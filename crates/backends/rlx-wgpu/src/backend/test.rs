@@ -94,6 +94,14 @@ impl WgpuExecutable {
         self.schedule.iter().map(step_name).collect()
     }
 
+    /// Test hook: the planned arena size in bytes — the memory plan's visible
+    /// half, so a test can pin that a route's scratch reservation did not leak
+    /// into a graph whose convolutions never qualify.
+    #[doc(hidden)]
+    pub fn test_arena_bytes(&self) -> u64 {
+        self.arena.size as u64
+    }
+
     /// Test hook: every step in the schedule is marked safe for the
     /// active-extent (bucketed/padded decode) path. A step that is not
     /// silently vetoes that optimisation for the whole graph.

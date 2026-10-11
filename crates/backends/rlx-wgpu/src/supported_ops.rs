@@ -354,15 +354,30 @@ pub fn routes_to_cpu_host(op: &rlx_ir::Op) -> bool {
 /// half reach them.
 ///
 /// Exempt, because they ask the rule's own question inside the arm and route to
-/// the host path when it fails: the im2col sub-path of `Op::Conv` (guarded by
-/// `arena_whole_arena_bind`), the GPU sub-paths of `Op::DequantMatMul` (guarded
+/// the host path when it fails: the GPU sub-paths of `Op::DequantMatMul` (guarded
 /// in-arm, because the GGUF/Int8 sub-paths of that same arm bind the weight
 /// buffer directly and are correct with a parked weight — its remaining quantized
 /// sub-path routes to the host path only for an operand that route can stage and
 /// refuses a packed weight loudly instead), and `Op::Fft` (its GPU
 /// step binds the entire buffer, so its arm asks the same whole-arena-at-zero
 /// question the rule asks, and refuses a parked operand, which neither its GPU
-/// nor its host step can address). `Op::FftQ` is the same class from the host
+/// nor its host step can address).
+///
+/// `OpKind::Conv` is absent from this list, and no conv arm needs the parked
+/// half of the rule: the conv routes this crate enables by default all switch on
+/// the parked-weight test and keep the previous route — the tiled or direct conv
+/// kernel — which stages that weight exactly as it did before those routes
+/// existed, and the im2col sub-path asks the *arena* half in-arm
+/// (`arena_whole_arena_bind`) like the rest. Staging it *into the GEMM route* is
+/// not the remedy: that route addresses its weight by a raw
+/// `arena.offset(w) / 4` word offset, whose 32-bit cast drops `WEIGHT_BUF_TAG`
+/// (the kernel would read plausible activations), and its `col` panel occupies
+/// the scratch a staged copy would need. Same for the other two conv routes this
+/// crate now enables by default (the mirrored 1-D tiled lift and the 1×1
+/// pointwise GEMM, both switching on the same parked-weight test): they too keep
+/// the previous route.
+///
+/// `Op::FftQ` is the same class from the host
 /// side: it has no GPU step, its only step (`FftQHost`) carries 32-bit byte
 /// offsets and resolves no parked tag, so its arm refuses a parked operand and an
 /// arena past that byte range instead of routing the geometry to the rule. The

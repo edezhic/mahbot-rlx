@@ -121,6 +121,13 @@ pub(crate) enum Step {
         // exposes SHADER_F16. Set at compile time; consulted only by
         // the dispatch arm.
         b_is_param: bool,
+        /// True iff this GEMM is the 1×1 pointwise-conv route. Its `m` is the
+        /// output (channel) axis rather than a bucket row axis, so a narrowed
+        /// active extent (PLAN L1) would leave the channels past it unwritten,
+        /// and nothing else vetoes this step — so `safe_for_active_extent`
+        /// refuses the mode for the whole graph, and `step_name` reports it as
+        /// `conv1x1_gemm` in place of `matmul`.
+        from_conv1x1: bool,
         // Compute precision for the inner FMA. F32 = full precision
         // (the historical / default path). F16 = mixed-precision
         // (operands cast to f16, multiply in f16 for 2× ALU on Apple,
@@ -1351,6 +1358,13 @@ impl Step {
             | Step::WelchPeaksHost { .. }
             | Step::LogMelHost { .. }
             | Step::LogMelBackwardHost { .. } => true,
+            // The 1×1 pointwise-conv route's `m` is the output-channel axis, so
+            // scaling it would leave channels unwritten; veto the mode for the
+            // whole graph, as the im2col gather does for the gather route.
+            Step::Matmul {
+                from_conv1x1: true,
+                ..
+            } => false,
             // Matmul: c_batch_stride is set at compile time at full m,
             // independent of params.m. With scaled m, threads with
             // global_row >= m early-return; per-batch output offsets
@@ -1464,6 +1478,9 @@ impl Step {
 pub(crate) fn step_name(step: &Step) -> &'static str {
     match step {
         Step::CastF32ToF16 { .. } => "cast_f32_to_f16",
+        Step::Matmul {
+            from_conv1x1: true, ..
+        } => "conv1x1_gemm",
         Step::Matmul { .. } => "matmul",
         Step::Binary { .. } => "binary",
         Step::Compare { .. } => "compare",

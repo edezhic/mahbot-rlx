@@ -158,6 +158,13 @@ fn rnn_gru_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
 /// cap for its own `col` panel.
 pub(crate) const CONV_IM2COL_MAX_COL_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Largest spatial extent the 1×1 pointwise GEMM may take. The route's `n` is
+/// the spatial extent and the matmul dispatch emits one workgroup per 32 (or 64)
+/// output columns, so WebGPU's 65535-workgroups-per-dimension cap is reached at
+/// `65535 * 32` — the conservative bound holds whichever of those two kernels
+/// the run picks. Past it the shape keeps the previous direct/tiled route.
+pub(crate) const POINTWISE_MAX_SPATIAL: u64 = 65535 * 32;
+
 // Defaults live in [`crate::config::WgpuRuntimeConfig::from_env`].
 const _CONV_IM2COL_DEFAULTS: (u64, u64, u64) = (2048, 256, 64);
 
@@ -169,6 +176,18 @@ fn im2col_min_k() -> u64 {
 }
 fn im2col_min_cout() -> u64 {
     crate::runtime_config().im2col_min_cout as u64
+}
+/// The single switch the accelerated conv routes sit under: im2col+GEMM, the
+/// mirrored 1-D tiled lift, and the 1×1 pointwise GEMM. Default **on**;
+/// `RLX_WGPU_CONV_IM2COL=0` restores the plain routing and the lean arena
+/// exactly, which is what keeps a bisect of that flip possible. The same
+/// predicate gates the col-scratch reservation, which is decided from a conv's
+/// *shape* alone (see [`conv_im2col_col_elems`]): a graph whose convs do not
+/// qualify by shape reserves nothing, while one whose conv qualifies pays that
+/// reservation even where the route then does not run — a parked weight, a conv
+/// its adapter routes to the host, a sharded arena.
+pub(crate) fn conv_routes_enabled() -> bool {
+    rlx_ir::env::flag_or("RLX_WGPU_CONV_IM2COL", true)
 }
 
 /// Minimum output length for routing a `one_d` conv through the register-blocked
@@ -634,6 +653,15 @@ impl WgpuExecutable {
         self.schedule.iter().all(|s| s.safe_for_active_extent())
     }
 
+    /// The active extent (PLAN L1) actually in force: the requested one, or none
+    /// at all when any step in the schedule cannot honour it (the mode is
+    /// all-or-nothing). Both readers — the run loop and the fed-handle copy — must
+    /// agree on it: a copy sized from the *requested* extent while the run wrote the
+    /// *full* one would leave a stale tail.
+    pub(crate) fn active_extent_in_effect(&self) -> Option<(usize, usize)> {
+        self.active_extent.filter(|_| self.all_safe_for_active())
+    }
+
     /// Steps the per-binding-ceiling rule routed to the host route. Non-zero means
     /// the graph's arena exceeded the device's per-binding limit (or a parameter
     /// was parked in the weight buffer) and at least one absolute-addressing op
@@ -924,7 +952,7 @@ impl WgpuExecutable {
         dev: &crate::device::WgpuDevice,
         enc: &mut wgpu::CommandEncoder,
     ) {
-        let extent = self.active_extent;
+        let extent = self.active_extent_in_effect();
         let feeds: Vec<(String, usize)> = self
             .gpu_handle_feeds
             .iter()

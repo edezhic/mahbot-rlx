@@ -731,8 +731,8 @@ impl WgpuExecutable {
         // Active-extent (PLAN L1): scale safe Steps' primary dim by
         // actual/upper. Used in BOTH the uniform-write loop (so the
         // kernel sees the scaled count) AND the dispatch loop (so the
-        // workgroup grid is shrunk).
-        let active = self.active_extent.filter(|_| self.all_safe_for_active());
+        // workgroup grid is shrunk). Off entirely when any step vetoes it.
+        let active = self.active_extent_in_effect();
         if rlx_ir::env::flag("RLX_WGPU_ACTIVE_TRACE")
             && self.active_extent.is_some()
             && active.is_none()
@@ -845,12 +845,14 @@ impl WgpuExecutable {
                         has_bias,
                         bias_off_f32,
                         act_id,
-                        b_is_param: _,
-                        compute_precision: _,
+                        ..
                     } => {
                         // PLAN L1 (safe at any batch — c_batch_stride is
                         // pre-baked at compile time at FULL m, so scaling
                         // params.m only changes per-thread bound checks).
+                        // `scale` is the identity on a schedule carrying the 1×1
+                        // pointwise-conv GEMM (`from_conv1x1`): that step makes
+                        // `all_safe_for_active` false, so `active` is None throughout.
                         let m_scaled = scale(*m);
                         let p = MatmulParams {
                             m: m_scaled,
@@ -1673,6 +1675,9 @@ impl WgpuExecutable {
                                 // Safe at any batch (see safe_for_active_extent
                                 // comment); scale m, output rows past m_s per
                                 // batch retain prior values via c_batch_stride.
+                                // A schedule carrying the 1×1 pointwise-conv GEMM
+                                // never gets an active extent, so `scale` is the
+                                // identity there.
                                 let m_s = scale(*m);
                                 if m_s == 0 {
                                     if !matches!(step, Step::FftGpu { .. }) {
