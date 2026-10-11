@@ -53,9 +53,11 @@ weights = ["dep:rlx-pkg", "dep:rlx-mlx-io", "dep:rlx-dduf", "dep:rlx-nemo"]
 graph-json = ["rlx-ir/serialize", "dep:serde_json"]
 
 [dependencies]
-# Pure-Rust QuickJS-ng, pinned to an exact crates.io version: the engine and
-# this binding move together, so an engine bump is deliberate.
-quickrs-core = { version = "=0.16.2", default-features = false, features = ["std"] }
+# Pure-Rust QuickJS-ng, from crates.io. To iterate on the engine alongside
+# this binding, add a `[patch.crates-io]` entry for a local checkout rather
+# than reintroducing a path dep — a path dep makes the whole workspace
+# unresolvable for anyone without that sibling directory.
+quickrs-core = { version = "0.16.2", default-features = false, features = ["std"] }
 
 rlx-ir      = { workspace = true }
 rlx-opt     = { workspace = true }
