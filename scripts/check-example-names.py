@@ -36,18 +36,9 @@ import sys
 #
 # An entry is a promise that the packages listed can never be built into the
 # same `target/` directory. "Nobody runs it by the bare path today" is NOT a
-# reason — that is a property of the harness, which changes; the platform split
-# below is a property of the toolchains, which does not.
-ALLOWED: dict[str, tuple[set[str], str]] = {
-    "reference_perf": (
-        {"rlx-cuda", "rlx-metal"},
-        "rlx-corpus's reference register derives the anchor path per backend as "
-        "`crates/backends/rlx-{backend}/examples/reference_perf.rs`, so the shared "
-        "name is load-bearing (see reference.rs::a_backend_with_an_anchor_has_at_"
-        "least_one_measured_row). Safe because Metal builds only on Apple and CUDA "
-        "only off it — the two can never land in one target/ directory.",
-    ),
-}
+# reason — that is a property of the harness, which changes; a platform split
+# between the packages is a property of the toolchains, which does not.
+ALLOWED: dict[str, tuple[set[str], str]] = {}
 
 
 def examples_by_name() -> dict[str, set[str]]:

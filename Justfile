@@ -280,7 +280,9 @@ test:
     # `required-features = "backend-tests"` and stay out of this default run —
     # the fast smoke gate. The per-backend recipes (`just test-gpu`, `test-mlx`,
     # `test-rocm`, …) pass the feature explicitly. `required-features` gates a
-    # test *target*, so those crates' lib unit tests still run here.
+    # test *target*, so those crates' lib unit tests still run here. The one
+    # exception is `rlx-metal`, whose manifest (fork-local) drops its lib unit
+    # tests, doctests, examples and auto-discovered test files from this run.
     if [[ "$(uname -s)" == Darwin ]]; then
         # A few parallel test binaries is enough; more contended Apple GPU.
         JOBS=$(( CPUS < 4 ? CPUS : 4 ))
@@ -320,7 +322,8 @@ test-debug-verifier mode="full":
     #!/usr/bin/env bash
     set -euo pipefail
     case "$(uname -s)" in
-      Darwin) FEATURES="cpu,apple,vulkan" ;;
+      # `apple` would add `metal`; this fork develops wgpu (`gpu`) only.
+      Darwin) FEATURES="cpu,gpu,coreml,mlx,vulkan" ;;
       *)      FEATURES="cpu,gpu,vulkan" ;;
     esac
     # Those three crates' integration targets carry the verifier asserts, so

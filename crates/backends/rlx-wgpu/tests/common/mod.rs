@@ -15,7 +15,7 @@
 /// non-NaN operand: an all-NaN or infinity-poisoned output would otherwise fold
 /// to a small number and pass any tolerance, so a broken kernel could satisfy a
 /// parity bar. NaN, +inf and −inf are counted separately so an infinity cannot
-/// hide behind a NaN. The Metal prefill parity suite carries the same rule.
+/// hide behind a NaN.
 pub fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
     assert_eq!(got.len(), want.len(), "parity needs equal lengths");
     let (mut nan, mut pos_inf, mut neg_inf) = (0usize, 0usize, 0usize);

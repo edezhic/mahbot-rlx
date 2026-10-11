@@ -19,6 +19,13 @@
 //! The `RLX_WGPU_MAX_BIND_MB` cases below drive the window/chunk arithmetic: a
 //! weight *window* over the binding limit must be N-chunked, and no chunk window
 //! may be sized from the weight's position relative to offset 0.
+//!
+//! The knob is written through `rlx_ir::env` — the code-override layer the encoder
+//! reads (`env::flag` / `parse_or`) and which outranks the process environment —
+//! never through `std::env`, which is `unsafe` in edition 2024 and process-global.
+//! Each bracket unsets it before its assertions, so a failing case leaves no cap
+//! pinned behind it, and the counter read right after the run is what proves the
+//! override reached the encoder at all: an A/B that changes nothing proves nothing.
 
 mod common;
 use common::max_abs_diff;

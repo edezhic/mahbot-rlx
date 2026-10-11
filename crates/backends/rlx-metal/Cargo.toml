@@ -12,6 +12,13 @@ readme                 = "README.md"
 repository.workspace   = true
 homepage.workspace     = true
 documentation.workspace = true
+# Fork-local: `rlx-wgpu` is the backend this fork develops, so nothing of this one
+# runs in a default `cargo test`. The auto flags keep that true for any test or
+# example file upstream adds later — the name-by-name `[[test]]` gating below
+# cannot — while narrowing only the *default* target selection. The 24 examples
+# stop being targets; `cargo run --example X` here now needs an `[[example]]`.
+autotests    = false
+autoexamples = false
 [dependencies]
 rlx-ir = { workspace = true }
 # Shape-keyed kernel-variant dispatch table, shared with CUDA/ROCm/wgpu.
@@ -92,6 +99,12 @@ workspace = true
 default-target = "aarch64-apple-darwin"
 targets        = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 rustdoc-args   = ["--cfg", "docsrs"]
+
+# Fork-local: the unit tests and doctests leave the default test run with the
+# rest of this backend; `cargo test -p rlx-metal --lib` / `--doc` still run them.
+[lib]
+test    = false
+doctest = false
 
 [[test]]
 name = "attention_bias_mask_parity"

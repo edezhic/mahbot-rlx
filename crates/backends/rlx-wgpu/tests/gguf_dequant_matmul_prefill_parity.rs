@@ -38,22 +38,10 @@
 //! Cross-process reproducibility is 3 serial invocations of that same command
 //! with `--test-threads=1`, which a single test cannot observe.
 //!
-//! This suite and `rlx-metal`'s `metal_gguf_dequant_matmul_prefill_parity.rs` are
-//! deliberate mirrors of each other: an edit to this harness must be applied to
-//! both. They differ in backend-specific values — each file's tolerance
-//! table (`1e-2` here), the rows its grid needs (this one drops the `m=96`
-//! k=256/n=640 row Metal needs for its fused-GEMM cap, since the cases above
-//! already run that shape and wgpu has no boundary above `m == 1`, and adds an
-//! unaligned-k row only wgpu has a host route for), and the route strings, adapter
-//! limits and memory figures, which are this backend's own. They also differ in
-//! one structural thing, deliberately: that file serializes its device tests
-//! under a lock, this one takes none, so the tests here run in parallel as they
-//! always have.
-//!
-//! Two things make that difference safe rather than drift: this file pins no knob
-//! (see above), and wgpu's process-global state is thread-safe by construction
-//! (pipeline `OnceLock`s, the pooled out-slab behind its `Mutex`, the `Device`/
-//! `Queue` a `Session` shares). Do not add a lock here to match the Metal file.
+//! This file pins no knob (see above) and takes no lock: wgpu's process-global
+//! state is thread-safe by construction (pipeline `OnceLock`s, the pooled
+//! out-slab behind its `Mutex`, the `Device`/`Queue` a `Session` shares), so the
+//! device tests here run in parallel as they always have. Do not add a lock.
 
 use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::quant::QuantScheme;
@@ -1078,9 +1066,8 @@ fn build_mlp_block(
     }
 }
 
-/// The scheme × shape grid and the model-class graph: the four packed families at
-/// the Metal grid's shapes (minus one — see the shape list), plus a bounded
-/// model-class graph.
+/// The scheme × shape grid and the model-class graph: the four packed families,
+/// plus a bounded model-class graph.
 #[test]
 fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
@@ -1105,10 +1092,10 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
     // convention: 1e-2 sits ~36x above the worst observed cell (2.75e-4 at k=2048)
     // rather than being tightened to a number measured on one adapter, and it is
     // still orders of magnitude away from a zeroed or grossly wrong projection.
-    // The shape list is the Metal mirror's minus its `m=96` k=256/n=640 row (this
-    // file's pre-existing cases above already run that shape for Q4_K and Q6_K,
-    // and wgpu has no routing boundary above `m == 1`, so the row adds no side of a
-    // change point here) and plus an unaligned-k row Metal has no host route for.
+    // The shape list drops the `m=96` k=256/n=640 row: this file's pre-existing
+    // cases above already run that shape for Q4_K and Q6_K, and wgpu has no
+    // routing boundary above `m == 1`, so the row would add no side of a change
+    // point.
     let shapes: &[(&'static [usize], usize, usize, usize, f32)] = &[
         (&[], 2, 256, 8, 1e-2), // tiny, on the grouped side of the m==1 change point
         // Unaligned k (1.5 K-quant superblocks): no fused Q4_K/Q6_K GEMM reads it,
