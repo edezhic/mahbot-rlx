@@ -1,9 +1,11 @@
 # Workspace clippy configuration (plan #17).
 #
 # Tightens the bar for what's considered "clean" beyond Rust's
-# defaults. Combined with `cargo clippy --all-targets -- -D warnings`
-# in CI, this keeps API hygiene a build-time check, not a code-review
-# afterthought.
+# defaults. Combined with `cargo clippy --workspace --all-targets
+# --features backend-tests -- -D warnings` (the `lint` recipe in the
+# Justfile — `--workspace` because the default selection is this
+# fork's contour, see `default-members` in Cargo.toml), this keeps API
+# hygiene a build-time check, not a code-review afterthought.
 
 # Cognitive complexity threshold — keep functions readable.
 cognitive-complexity-threshold = 30

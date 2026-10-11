@@ -94,10 +94,20 @@ ane = []                           # Apple Neural Engine (via CoreML/ANE framewo
 gpu = ["cpu", "dep:rlx-wgpu", "rlx-wgpu/splat"]
 
 # Apple Metal (MPSGraph + custom MSL). Splat: CPU reference + common IR.
+#
+# Deliberately no `rlx-sparse/metal` forward here: forwarding it made
+# rlx-sparse's own units compile with `feature = "metal"` but without the
+# `rlx-metal` extern, so `cargo test --workspace --features backend-tests` broke
+# with `cannot find crate rlx_metal` in rlx-sparse. The sparse
+# kernel-registration tests are selected with the crate instead — `-p rlx-sparse`
+# (see the `test-gpu` / `test-mlx` recipes, which also keep the `metal`/`mlx`
+# gated modules of rlx-sparse compiled).
 metal = ["cpu", "dep:rlx-metal"]
 
-# Apple MLX (unified memory); splat via CPU reference on host buffers.
+# Apple MLX (unified memory); splat via CPU reference on host buffers. The MLX
+# sparse tests are selected the same way, as above.
 mlx = ["cpu", "dep:rlx-mlx"]
+
 # Opt-in MLX C++ `quantized_matmul` for mxfp packs (see `rlx-mlx/native-mxfp`).
 mlx-native-mxfp = ["mlx", "rlx-mlx/native-mxfp"]
 # Linux/WSL: MLX with upstream CUDA backend (long nvcc compile — opt-in only).
@@ -273,12 +283,12 @@ rlx-compile = { workspace = true, features = ["training"] }
 # rlx-splat moved out of tree; splat examples/tests below are disabled until it returns.
 # rlx-splat = { path = "../rlx-splat", version = "0.2.17", default-features = false, features = ["test-support", "io"] }
 # Downstream demonstration packages used in integration tests.
-# `metal`/`mlx` are enabled ONLY on macOS (see the target-specific
-# dev-dependencies below) — those backends exist solely on Apple, and on a
-# non-Apple target rlx-mlx's build.rs would try to build MLX + OpenBLAS via
-# cmake. The sparse kernel-registration tests those features gate are
-# themselves macOS-only, so other targets stay cpu-only and still build (and
-# run the CPU-side tests).
+# The sparse kernel-registration tests need rlx-sparse's `metal`/`mlx`; those
+# features are enabled by the recipes that run them (`just test-mlx` /
+# `just test-gpu` select `-p rlx-sparse`), not from here — a macOS-only
+# dev-dependency row is unioned into *every* test build on that host, which is
+# what pulled rlx-metal / rlx-mlx / the vendored MLX C++ build into a bare
+# `cargo test` (see the `metal` feature comment).
 # Back-edge: rlx-sparse/rlx-linalg (tier 9) publish AFTER rlx-runtime
 # (tier 7), so keep these PATH-ONLY — cargo strips them from the published
 # manifest and `cargo publish -p rlx-runtime` won't resolve them on crates.io.
@@ -290,18 +300,6 @@ anyhow = "1"
 half = "2"
 tempfile = "3"
 safetensors = "0.7"
-
-# Apple-only backends for the sparse kernel-registration tests. Kept out of the
-# base [dev-dependencies] so Linux/Windows test builds don't pull rlx-metal /
-# rlx-mlx (rlx-mlx-sys builds MLX via cmake). Cargo unions these features with
-# the cpu-only base above → on macOS rlx-sparse gets cpu + metal + mlx.
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-rlx-sparse = { path = "../../numerics/rlx-sparse", default-features = false, features = ["metal", "mlx"] }
-# For the raw-GPU custom-kernel test (metal_gpu_custom_op.rs): construct MTLSize
-# / call the compute encoder directly, exactly as a downstream MetalGpuKernel would.
-# The custom-kernel seam now hands out `rlx_metal::mtl` types, so the test
-# uses those directly — no metal-rs dev-dependency needed.
-
 
 [lints]
 workspace = true

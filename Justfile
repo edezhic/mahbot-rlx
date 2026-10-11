@@ -34,9 +34,12 @@ throttle:
 throttle-warn:
     {{justfile_directory()}}/scripts/check-throttle.sh --warn
 
-# Build whole workspace (release).
+# Build the whole workspace (release) — `--workspace` is explicit, not
+# decorative: a bare `cargo build` here means this fork's default contour,
+# which excludes the backends it does not develop (see `default-members` in
+# Cargo.toml). A gate that is meant to cover the whole set has to say so.
 build:
-    cargo build --release
+    cargo build --release --workspace
 
 # Build with everything turned on (Metal, kernel-trace, nan-check).
 build-all:
@@ -50,7 +53,11 @@ build-mlx:
 # Run rlx-mlx tests (matmul+add parity check, both eager and lazy modes).
 test-mlx:
     cargo test --release -p rlx-mlx --features backend-tests
-    cargo test --release -p rlx-runtime --features cpu,mlx,backend-tests \
+    # `-p rlx-sparse`: the two `mlx_sparse_ops` targets register rlx-sparse's
+    # MlxKernel, so rlx-sparse has to be built with `mlx`; a feature forward
+    # from rlx-runtime's `mlx` does not reach it (see that feature's comment).
+    # The `--features` list applies to both selected packages.
+    cargo test --release -p rlx-runtime -p rlx-sparse --features cpu,mlx,backend-tests \
         --test gru_rnn_mlx --test mlx_attention_parity --test mlx_compile_lir \
         --test mlx_depthwise_convtranspose --test mlx_fft --test mlx_im2col_parity \
         --test mlx_sparse_ops --test mlx_sparse_ops_v2 --test rnn_mlx_f16
@@ -279,10 +286,15 @@ test:
     # Integration test targets across the workspace sit behind
     # `required-features = "backend-tests"` and stay out of this default run —
     # the fast smoke gate. The per-backend recipes (`just test-gpu`, `test-mlx`,
-    # `test-rocm`, …) pass the feature explicitly. `required-features` gates a
-    # test *target*, so those crates' lib unit tests still run here. The one
-    # exception is `rlx-metal`, whose manifest (fork-local) drops its lib unit
-    # tests, doctests, examples and auto-discovered test files from this run.
+    # `test-rocm`, …) pass the feature explicitly, and `required-features` gates
+    # a test *target*, so in those recipes the crates' lib unit tests run too —
+    # except `rlx-metal`, whose manifest (fork-local) drops its lib unit tests,
+    # doctests, examples and auto-discovered test files from every run.
+    # This run is the *selection*, not just a target filter: a bare `cargo test`
+    # at the root means the fork's default contour, so no Apple backend is
+    # compiled here at all. (Linux x86_64 excepted: rlx-collectives' retained
+    # upstream dev-dependency row still pulls CUDA / ROCm / XDNA into this run.)
+    # `just test-gpu` and the backend recipes below are what build the rest.
     if [[ "$(uname -s)" == Darwin ]]; then
         # A few parallel test binaries is enough; more contended Apple GPU.
         JOBS=$(( CPUS < 4 ? CPUS : 4 ))
@@ -290,7 +302,7 @@ test:
     else
         cargo test --release -j "$CPUS" -- --test-threads="$CPUS"
     fi
-    # A workspace `cargo test` builds every crate with its DEFAULT features, so
+    # The default run builds each selected crate with its DEFAULT features, so
     # a test target gated behind a non-default feature (or behind the
     # `backend-tests` gate) is skipped without saying so. rlx-lbm's graph path
     # is the case in tree; keep it in the gate.
@@ -315,17 +327,19 @@ test:
 #
 # `mode=restricted` is how the default `test` recipe calls it: the runtime's
 # default selection (lib unit tests plus the pool-width checks). `full` mode adds
-# the gated targets of the four crates below, including the runtime's
-# other-backend ones (the defect above was in a Vulkan target, which
-# `required-features = "backend-tests"` would otherwise hide from this gate).
+# the gated targets of the four crates below.
+#
+# The runtime line runs this fork's backend only (`cpu,gpu`), and that applies to
+# BOTH modes. Upstream's list — `cpu,gpu,coreml,mlx,vulkan` on an Apple host —
+# is the way back, but re-adding it is a hand edit, and it does not restore what
+# this trim gives up: the debug-assert graph-invariant route over the Apple and
+# Vulkan graphs is now covered by no gate at all (the defect above was in a
+# Vulkan target).
 test-debug-verifier mode="full":
     #!/usr/bin/env bash
     set -euo pipefail
-    case "$(uname -s)" in
-      # `apple` would add `metal`; this fork develops wgpu (`gpu`) only.
-      Darwin) FEATURES="cpu,gpu,coreml,mlx,vulkan" ;;
-      *)      FEATURES="cpu,gpu,vulkan" ;;
-    esac
+    # This fork develops wgpu (`gpu`) only, plus the CPU baseline.
+    FEATURES="cpu,gpu"
     # Those three crates' integration targets carry the verifier asserts, so
     # they are gated too: `restricted` runs their lib unit tests only.
     case "{{mode}}" in
@@ -358,7 +372,12 @@ test-gpu:
         cargo test --release -p rlx-vulkan --features backend-tests -j "$JOBS"
         cargo test --release -p rlx-runtime --features cpu,apple,vulkan,backend-tests \
           --test vulkan_parity --test vulkan_dequant_grouped_matmul --test vulkan_dequant_moe_weights
-        cargo test --release -p rlx-runtime --features cpu,apple,backend-tests -j "$JOBS"
+        # `-p rlx-sparse`: this row runs the whole rlx-runtime suite, including
+        # the `*_sparse_ops` targets that register rlx-sparse's Metal/MLX
+        # kernels. `apple` covers those backends for the rlx-runtime half; the
+        # extra `metal,mlx` tokens are for the rlx-sparse half of `-p`, which
+        # needs its own features (see rlx-runtime's `metal` feature comment).
+        cargo test --release -p rlx-runtime -p rlx-sparse --features cpu,apple,metal,mlx,backend-tests -j "$JOBS"
         just test-mlx
         just test-third-order-gpu
         just check-corpus-device
@@ -470,8 +489,9 @@ test-torch-import:
     fi
 
 # Run a specific filter; use as `just testf narrow_attention`.
-# Filters run against the default selection, so a FILTER naming a target behind
-# `required-features = "backend-tests"` (every integration target in the
+# Filters run against the default selection — this fork's contour, i.e. the
+# `default-members` in Cargo.toml, not every member — so a FILTER naming a target
+# behind `required-features = "backend-tests"` (every integration target in the
 # workspace — see the `test` recipe) matches nothing and exits 0: add
 # `--features backend-tests`, or name the package, as
 # `cargo test --release --features backend-tests --test ...`.
@@ -502,10 +522,13 @@ fmt:
 # feature-gated code has landed unlinted here before. `lint-features` covers the
 # combinations this host can actually build.
 lint: lint-features
+    # `--workspace`: this gate is meant to cover the whole set, and the default
+    # selection is only this fork's contour (see `default-members` in
+    # Cargo.toml). Naming no package would silently narrow the lint too.
     # `backend-tests`: the default test selection is a fast smoke set, and
     # `required-features` hides every gated target from `--all-targets` too —
     # without it they would not be type-checked by `just lint` at all.
-    cargo clippy --all-targets --features backend-tests -- -D warnings
+    cargo clippy --workspace --all-targets --features backend-tests -- -D warnings
 
 # Clippy the feature combinations `--all-targets` alone cannot reach.
 #
@@ -938,7 +961,8 @@ serve-web-static BACKEND="python" PORT="8000":
 run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
-# Quick basic test of the workspace: build + test + lint + fast smokes.
+# Fork gate: `build` over the whole set + `test` over the default contour +
+# lint + the fast smokes.
 ci: build test fmt-check lint check-rlx-env-vars check-example-names check-doc-links check-corpus check-wasm test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
 
 # ROCm compile check + graph_devices parity (tests skip when HIP unavailable).

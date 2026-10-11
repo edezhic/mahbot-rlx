@@ -39,9 +39,10 @@
 #
 # Default flow:
 #
-#   1. Pre-flight: cargo fmt --check, cargo clippy -- -D warnings,
-#      cargo test --workspace --release --features backend-tests. Aborts if any
-#      fails.
+#   1. Pre-flight: cargo fmt --all -- --check,
+#      cargo clippy --workspace --all-targets --features backend-tests -- -D warnings,
+#      cargo test --workspace --release --no-fail-fast --features backend-tests.
+#      Aborts if any fails.
 #   2. Confirm prompt (skip with --yes).
 #   3. Per tier, publish each crate sequentially. After each crate:
 #        a. wait for the sparse index to report the new version

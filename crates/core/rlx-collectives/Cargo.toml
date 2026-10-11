@@ -29,6 +29,17 @@ default = []
 # unicast rendezvous path (DISCOVER_HOST) needs no extra deps.
 mdns = ["rlx-driver/mdns"]
 
+# The host-delegate tests in this crate's lib build a real session on the
+# host's native backend, so the runtime backend each one needs is opt-in here
+# instead of being requested by the target-specific dev-dependency below — a
+# `features` request there is target-blind in the other direction too: cargo
+# unions it into *every* crate's test build on that host, which is how a bare
+# `cargo test` on macOS compiled rlx-metal / rlx-coreml in.
+# Road back: `cargo test -p rlx-collectives --features metal,coreml`, or
+# `cargo run -p rlx-collectives --features metal,coreml --example dist_node`.
+metal = ["rlx-runtime/metal"]
+coreml = ["rlx-runtime/coreml"]
+
 [dev-dependencies]
 # Path-only (no version): test-only cycle on rlx-runtime, which publishes
 # right after rlx-collectives in the same tier (7). cargo strips path-only
@@ -50,17 +61,20 @@ serde_json = "1"
 # `dist_job` example: read the job description from a TOML config file.
 toml = "0.8"
 
-# The `dist_node` example drives the native GPU backend of whichever host
-# it runs on. Cargo unions feature sets across these tables: cpu+metal on
-# macOS, cpu+cuda on x86_64 Linux, and cpu-only elsewhere — notably
-# aarch64 Linux (Raspberry Pi / qemu), which has no CUDA. Local-only.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-# `metal` + `gpu` (portable wgpu-on-Metal) + `coreml` (ANE) so the collective
-# host-delegate tests can exercise those backends' custom-op paths on the local
-# Apple hardware.
-rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["metal", "gpu", "coreml"] }
+# `gpu` (portable wgpu-on-Metal) so the collective host-delegate test for this
+# fork's own backend keeps running for real; `metal` and `coreml` are this
+# crate's own features now (see [features]) so a bare macOS `cargo test`
+# compiles neither — `dist_node` on Apple asks for them:
+# `cargo run -p rlx-collectives --features metal,coreml --example dist_node`.
+rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["gpu"] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
+# Kept as upstream wrote it: `dist_node`'s `autofleet` lane calls
+# `rlx_xdna::overlay_from_env` / `rlx_xdna::npu_gemm`, which rlx-xdna's
+# `xrt`/`direct` features gate, and the example is built by a bare `cargo test`
+# on Linux, so moving those features would turn a documented command red.
+# (Inert on this fork's host.)
 # Enable the backends a Linux x86_64 host may expose so `dist_node` can pin
 # ranks to Device::{Cuda,Rocm,Xdna,Cpu} — NVIDIA GPUs, ROCm GPUs, an XDNA NPU.
 # All build driverless (cudarc/hip are dlopen'd; xdna is libc/libloading), so

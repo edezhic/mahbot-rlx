@@ -28,9 +28,14 @@ just install-git-hooks   # cargo fmt --all (re-stages fixed files) + clippy
 ```
 
 Backends are feature-gated and auto-detected — you build only what your hardware
-supports. On Apple Silicon the primary path is `cpu` + `metal` (optional `mlx`);
-CUDA/ROCm/TPU/wgpu/Vulkan and the Cortex-M / FPGA products live behind their own
-features. See each backend crate's `README.md` for the specifics, and
+supports. A bare `cargo build` / `cargo test` at the root operates on this fork's
+default contour (`default-members` in [`Cargo.toml`](Cargo.toml)): `rlx-cpu`,
+`rlx-wgpu`, and every crate that is not a backend. The other backends stay
+workspace members and stay addressable by name (`cargo test -p rlx-metal
+--features backend-tests`); `--workspace` asks for them all. On Apple Silicon the
+primary path is `cpu` + `metal` (optional `mlx`); CUDA/ROCm/TPU/Vulkan and the
+Cortex-M / FPGA products live behind their own features. See each backend crate's
+`README.md` for the specifics, and
 [`docs/backend-selection.md`](docs/backend-selection.md) for how the runtime
 picks between them.
 
@@ -52,14 +57,18 @@ picks between them.
 
 ## Dev loop
 
-- **Local gate:** `just ci` is the full build, workspace tests, `fmt-check`,
-  lint, and pyrlx pytest suite — but its workspace test step is the **default
-  selection**, a fast smoke gate: every crate's unit tests plus the pool-width
-  checks. The heavy integration suites do real device/graph work and are opt-in
-  with `--features backend-tests`, through the recipes that name them
-  (`test-gpu`, `test-rocm`, `test-third-order-gpu`). It spans the GPU / ROCm /
-  wasm matrix, so run the subset your hardware supports (see
-  [What CI expects](#what-ci-expects)).
+- **Local gate:** `just ci` is the whole-set build, `fmt-check`, lint, and
+  pyrlx pytest suite — and its test step is the **default
+  selection**, a fast smoke gate: the unit tests of the crates in this fork's
+  default contour plus the pool-width checks. That contour is the
+  `default-members` in [`Cargo.toml`](Cargo.toml), not every member — the Apple /
+  CUDA / ROCm / NPU backends are not even compiled by it (on Linux x86_64,
+  rlx-collectives' retained upstream dev-dependency row still pulls CUDA / ROCm /
+  XDNA into the run). The heavy integration
+  suites do real device/graph work and are opt-in with `--features
+  backend-tests`, through the recipes that name them (`test-gpu`, `test-rocm`,
+  `test-third-order-gpu`). It spans the GPU / ROCm / wasm matrix, so run the
+  subset your hardware supports (see [What CI expects](#what-ci-expects)).
 - **Format & lint:** `just fmt` / `just lint` (clippy with `-D warnings`). The
   pre-commit hook and `just ci` run these for you.
 - **Static graph check:** `cargo rlx check` folds shape/dtype verification,
@@ -92,8 +101,9 @@ research op — use the stable seams in
 - New backend work needs a **cross-backend parity test** against the CPU
   reference — a numeric match, not a shape-or-compile check. Prefer meaningful
   parity/integration coverage over trivial asserts.
-- `just test` runs the default selection: every crate's unit tests plus the
-  pool-width checks. The heavy integration suites are opt-in with
+- `just test` runs the default selection — this fork's contour, see
+  `default-members` in [`Cargo.toml`](Cargo.toml): those crates' unit tests plus
+  the pool-width checks. The heavy integration suites are opt-in with
   `--features backend-tests`; `just test-gpu` adds the host GPU backends and
   runtime feature tests, and the backend-specific recipes (`just test-mlx`,
   `just test-rocm`, `just test-fpga`, …) pass that gate for the targets they

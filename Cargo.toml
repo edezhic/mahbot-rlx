@@ -133,6 +133,104 @@ members = [
     "crates/backends/rlx-webgl",
 ]
 
+# ── Default selection (what a bare `cargo build` / `cargo test` operates on) ──
+#
+# This fork develops one GPU backend (`rlx-wgpu`), so the default contour is an
+# explicit enumeration instead of the whole member list. It is NOT `members` and
+# must not be read as it: every crate above stays a member and stays addressable
+# by name (`cargo test -p rlx-cuda --features backend-tests`). The selection is
+# the only form that does both — pruning `members` cannot narrow anything (a path
+# dependency inside the workspace directory becomes a member again), and
+# `exclude`-ing members outright would break those per-crate invocations.
+#
+# Deliberately in although the name suggests otherwise: the shared
+# `rlx-gpu-dispatch` / `rlx-gpu-host` crates and the `rlx-mlx-io` weight-layout
+# reader — none of them is a backend. A bare `cargo build` / `check` / `clippy`
+# covers these crates and no others; the whole-set gates name `--workspace`
+# explicitly (`just build`, `just lint`, the pre-commit hook's workspace branch,
+# the publish pre-flight).
+#
+# Trade-off, accepted knowingly: a crate added upstream lands silently OUTSIDE
+# this contour until it is listed here, and a member removed or renamed upstream
+# makes every bare invocation hard-error until it is dropped.
+default-members = [
+    # Core (no backend dependencies)
+    "crates/core/rlx-ir",
+    "crates/core/rlx-tensor",
+    "crates/core/rlx-flow",
+    "crates/core/rlx-fusion",
+    "crates/core/rlx-unfuse",
+    "crates/core/rlx-autodiff",
+    "crates/core/rlx-compile",
+    "crates/core/rlx-opt",
+    "crates/core/rlx-optim",
+    "crates/core/rlx-extend",
+    "crates/core/rlx-driver",
+    "crates/core/rlx-collectives",
+    "crates/core/rlx-distributed",
+
+    # CPU backend
+    "crates/backends/rlx-cpu",
+
+    # wgpu backend + the GPU support crates it and the CPU backend keep
+    "crates/backends/rlx-wgpu",
+    "crates/backends/rlx-gpu-dispatch",
+    "crates/backends/rlx-gpu-host",
+
+    # Proc macros
+    "crates/core/rlx-macros",
+
+    # Runtime (user-facing, feature-gated) and the prelude crate
+    "crates/core/rlx-runtime",
+    "crates/rlx",
+
+    # IO / weight formats
+    "crates/io/rlx-gguf",
+    "crates/io/rlx-gguf-convert",
+    "crates/io/rlx-bake",
+    "crates/io/rlx-pkg",
+    "crates/io/rlx-hub",
+    "crates/io/rlx-mlx-io",
+    "crates/io/rlx-dduf",
+    "crates/io/rlx-torch-ckpt",
+    "crates/io/rlx-nemo",
+    "crates/io/rlx-onnx",
+    "crates/io/rlx-onnx-proto",
+    "crates/io/rlx-onnx-import",
+    "crates/io/rlx-onnx-conformance",
+    "crates/io/rlx-torch-import",
+    "crates/io/rlx-text",
+
+    # Downstream packages (registered against the custom-op scaffold)
+    "crates/numerics/rlx-sparse",
+    "crates/numerics/rlx-linalg",
+    "crates/numerics/rlx-peft",
+    "crates/numerics/rlx-rng",
+    "crates/numerics/rlx-vq",
+    "crates/numerics/rlx-fdm",
+    "crates/numerics/rlx-lbm",
+    "crates/numerics/rlx-rl",
+    "crates/numerics/rlx-bbo",
+    "crates/numerics/rlx-umap",
+    "crates/numerics/rlx-geo",
+    "crates/numerics/rlx-fem",
+
+    # Tooling
+    "crates/tooling/rlx-bench",
+    "crates/tooling/rlx-opscope",
+    "crates/tooling/rlx-hwprofile",
+    "crates/tooling/rlx-check",
+    "crates/tooling/rlx-corpus",
+    "crates/tooling/rlx-megakernel",
+    "crates/tooling/rlxsl",
+
+    # Bindings
+    "crates/bindings/pyrlx",
+    "crates/bindings/rlx-js",
+    "crates/bindings/rlx-ffi",
+    "crates/bindings/rlx-web",
+]
+
 # ── Sanitizer / debug profiles (plan #41) ────────────────────────
 #
 # Borrowed from MAX's --config=asan / --config=debug-modular pattern.
@@ -160,7 +258,9 @@ incremental = false
 #
 # Tightens the bar without going to "deny all the things." Crates can
 # locally `#[allow(...)]` for genuinely-needed exceptions. Pair with
-# `cargo clippy --all-targets -- -D warnings` in CI (see Justfile).
+# `cargo clippy --workspace --all-targets --features backend-tests -- -D warnings`
+# in CI (see the `lint` recipe in the Justfile — `--workspace` because the
+# default selection is this fork's contour, see `default-members` above).
 #
 # Not yet enabled (would generate ~1000 warnings to fix in one go):
 #   missing_docs / unsafe_op_in_unsafe_fn / clippy::pedantic.

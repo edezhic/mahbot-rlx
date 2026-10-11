@@ -13,22 +13,32 @@ review and ground rules.
 ## Common commands
 
 ```sh
-just build          # workspace build
+just build          # whole-workspace build (`--workspace`)
 just test           # cargo test, fast smoke gate: unit tests + pool-width checks
                     # integration targets: add `--features backend-tests`
+                    # also the *selection*: a bare `cargo test` here means this
+                    # fork's default contour, not every member (Cargo.toml
+                    # `default-members`) — the Apple/CUDA/ROCm/NPU backends are
+                    # out of it (Linux x86_64 excepted: rlx-collectives' retained
+                    # dev-dependency row still pulls CUDA/ROCm/XDNA in there)
 just test-gpu       # Metal/MLX/wgpu/Vulkan (+ apple/cuda/rocm runtime) on host
 
-just lint           # clippy (-D warnings)
+just lint           # clippy (-D warnings), whole workspace
 just fmt            # rustfmt
 just fmt-check      # rustfmt --check
 just install-git-hooks  # pre-commit auto-fmt + clippy
-just ci             # build + tests + fmt-check + clippy + pyrlx pytest
+just ci             # whole-workspace build + default-contour tests + fmt-check
+                    # + clippy + pyrlx pytest
 just throttle       # thermal gate before benchmarks
 ```
 
 Fmt/clippy are gated by git: `just install-git-hooks` installs a pre-commit
 hook (`scripts/git-hooks/pre-commit`) that runs `cargo fmt --all`, re-stages
 touched staged `.rs` files, then clippy; `just ci` runs `fmt-check` + `lint`.
+The workspace-wide clippy invocations — `just lint` and the pre-commit hook's
+whole-workspace branch — name `--workspace`, because the default selection is
+this fork's contour — a bare `cargo clippy` at the root would lint only that
+contour.
 
 Before benchmarks: run `just throttle` or set `RLX_ALLOW_THROTTLE=1` for one-offs.
 Use `rlx_ir::Tick` for sub-ms timing in hot paths, not `Instant::now()`.

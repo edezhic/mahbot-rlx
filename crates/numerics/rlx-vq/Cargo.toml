@@ -19,8 +19,20 @@ backend-tests = []
 default = ["cpu"]
 # CPU execution: registers the fused CpuKernel.
 cpu = ["dep:rlx-cpu"]
-# Metal execution: registers the fused MetalKernel (macOS only).
-metal = ["dep:rlx-metal"]
+# Metal execution: registers the fused MetalKernel (macOS only). Also carries
+# the wgpu runtime leg of the cross-backend parity test. A `features` request
+# from the macOS-only dev-dependency this replaces would instead be unioned into
+# *every* crate's test build on that host, which is how a bare `cargo test`
+# compiled rlx-metal / rlx-mlx / the vendored MLX C++ build in. The wgpu leg
+# skips itself when its backend is absent.
+metal = ["dep:rlx-metal", "rlx-runtime/metal", "rlx-runtime/gpu"]
+# The parity test's MLX leg, kept separate because `rlx-runtime`'s `mlx` is not
+# platform-gated: folding it into `metal` would let the vendored MLX C++ build
+# follow a `--features metal` onto Linux.
+# Road: `cargo test -p rlx-vq --features metal,mlx,backend-tests`; add
+# `-- --test-threads=1` for the parity suite, whose `metal_gpu_beats_cpu` timing
+# assert loses to CPU while the other Metal tests run alongside it.
+mlx = ["rlx-runtime/mlx"]
 
 [dependencies]
 rlx-ir = { workspace = true }
@@ -32,10 +44,6 @@ rlx-metal = { workspace = true, optional = true }
 
 [dev-dependencies]
 rlx-runtime = { workspace = true, features = ["cpu"] }
-
-# Metal/wgpu/MLX-featured runtime for the cross-backend parity test (macOS only).
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-rlx-runtime = { workspace = true, features = ["cpu", "metal", "gpu", "mlx"] }
 
 [lints]
 workspace = true

@@ -558,10 +558,17 @@ core model-agnostic.
 ## Building from source
 
 ```sh
-cargo build --release                         # cpu only
+cargo build --release                         # this fork's contour: cpu + wgpu
+cargo build --release --workspace             # every member, all backends
 cargo build --release --features metal,mlx    # apple silicon GPU
 cargo test  --release --workspace --features backend-tests   # full workspace suite
 ```
+
+A bare `cargo build` / `cargo test` at the root operates on this fork's
+`default-members` — `rlx-cpu`, `rlx-wgpu` and everything that is not a backend.
+The other backends stay members and stay addressable by name
+(`cargo test -p rlx-vulkan --features backend-tests`); they are simply not
+compiled unless named or asked for with `--workspace`.
 
 For Apple Silicon, MLX is a git submodule under `rlx-mlx-sys`:
 
@@ -650,9 +657,9 @@ until the kind moves from **common-ir** to **native**.
 
 ## Development workflow
 
-- **Fast local gate**: `just ci` (build, workspace tests — a fast smoke gate;
-  the heavy integration suites are opt-in with `--features backend-tests` —
-  lint, pyrlx pytest).
+- **Fast local gate**: `just ci` (the whole-set build, the default-contour test
+  run — a fast smoke gate; the heavy integration suites are opt-in with
+  `--features backend-tests` — lint, pyrlx pytest).
 - **Always gate benches on throttle.** `scripts/check-throttle.sh` refuses
   to proceed under thermal pressure (`pmset -g therm`). Silent 10×
   slowdowns are a real failure mode on Macs. `--warn` mode for CI;

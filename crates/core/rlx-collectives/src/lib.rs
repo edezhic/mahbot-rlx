@@ -3184,6 +3184,17 @@ mod tests {
     #[test]
     fn all_reduce_runs_on_metal_across_ranks() {
         use rlx_runtime::Device;
+        // `rlx-runtime/metal` is opt-in for this crate (see [features]): a bare
+        // `cargo test` compiles this fork's backend only, so the Apple device is
+        // absent rather than broken here. `RLX_REQUIRE_DEVICE=1` keeps it a
+        // failure where the backend *is* compiled in.
+        if rlx_ir::env::skip_unless_device(
+            "metal",
+            rlx_runtime::feature_compiled(Device::Metal),
+            rlx_runtime::is_available(Device::Metal),
+        ) {
+            return;
+        }
         register();
         let world = 2u32;
         let n = 4usize;
@@ -3314,6 +3325,14 @@ mod tests {
     #[test]
     fn all_to_all_runs_on_metal_across_ranks() {
         use rlx_runtime::Device;
+        // Apple device opt-in, as in `all_reduce_runs_on_metal_across_ranks`.
+        if rlx_ir::env::skip_unless_device(
+            "metal",
+            rlx_runtime::feature_compiled(Device::Metal),
+            rlx_runtime::is_available(Device::Metal),
+        ) {
+            return;
+        }
         register();
         let world = 2u32;
         let xr = |r: u32| -> Vec<f32> {
@@ -3433,6 +3452,14 @@ mod tests {
     #[test]
     fn all_reduce_runs_on_ane_across_ranks() {
         use rlx_runtime::Device;
+        // Apple device opt-in, as in `all_reduce_runs_on_metal_across_ranks`.
+        if rlx_ir::env::skip_unless_device(
+            "coreml",
+            rlx_runtime::feature_compiled(Device::Ane),
+            rlx_runtime::is_available(Device::Ane),
+        ) {
+            return;
+        }
         register();
         let world = 2u32;
         let n = 4usize;

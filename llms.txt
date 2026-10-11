@@ -44,7 +44,7 @@ Each crate has its own `README.md`. `rlx-mlx-sys/vendor/mlx` is a git submodule 
 
 ## Commands
 
-- `just ci` — build + workspace tests + clippy + pyrlx pytest
+- `just ci` — whole-workspace build + default-contour tests + clippy + pyrlx pytest
 - `just test` / `just test-gpu` — cargo tests
 - `cargo rlx check` — static graph checker (shape / dispatch / fusion / NaN lint)
 - `RLX_DISPATCH_REPORT=1` — print native / common-ir / rewritten / missing per op after compile
