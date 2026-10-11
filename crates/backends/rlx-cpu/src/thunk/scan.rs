@@ -177,7 +177,7 @@ pub fn eval_single_op_f32(
     // Fast path: Kitten discrete wgpu packs ~1000 Binary/Activation HostOps per
     // infer. Building a mini-graph + plan_memory + compile_thunks each time was
     // the dominant cost (~17s hello). Direct kernels keep numerics identical.
-    if let Some(y) = eval_elementwise_fast(op, n, inputs) {
+    if let Some(y) = eval_elementwise_fast(op, out_shape, n, inputs) {
         return y;
     }
     // wgpu (and HostOp packed staging) store every tensor as f32-uniform,
@@ -232,8 +232,27 @@ pub fn eval_single_op_f32(
     arena.slice_mut(out)[..n].to_vec()
 }
 
+/// Per-operand broadcast as one contiguous run: output lane `i` reads operand
+/// index `(i / rep) % len`, the form the GPU elementwise kernels and the lowering
+/// that feeds them encode (`rlx_unfuse::simple_broadcast`), so the host route
+/// computes exactly what the device route would.
+///
+/// `None` when the operand's kept axes are not one contiguous run of the output,
+/// which no single `(rep, len)` pair describes — those keep the historical flat
+/// `i % len` read, and the lowering keeps their copy materialised.
+fn broadcast_run(out: &rlx_ir::Shape, src: &rlx_ir::Shape, lanes: usize) -> Option<(usize, usize)> {
+    // `(i / rep) % len` indexes elements, so it only applies when the lane index
+    // *is* the element index (a wide dtype stages more lanes than elements), and
+    // `simple_broadcast` wants both ranks static.
+    if out.num_elements() != Some(lanes) || !src.is_static() {
+        return None;
+    }
+    rlx_unfuse::simple_broadcast(out, src).map(|(rep, len)| (rep as usize, len as usize))
+}
+
 fn eval_elementwise_fast(
     op: &Op,
+    out_shape: &rlx_ir::Shape,
     n: usize,
     inputs: &[(rlx_ir::Shape, &[f32])],
 ) -> Option<Vec<f32>> {
@@ -248,6 +267,24 @@ fn eval_elementwise_fast(
             let b = inputs[1].1;
             let a_n = a.len().max(1);
             let b_n = b.len().max(1);
+            // An operand can arrive as a broadcast whose copy the producer no
+            // longer materialises (a GPU backend peels the `Op::Expand` it put
+            // in front of an elementwise operand). Read it the way those
+            // kernels do, so hosting an op does not change its answer; a shape
+            // one contiguous run cannot describe keeps the historical flat form.
+            //
+            // `broadcast_run`'s run length comes from the shape while the flat
+            // form's divisor is the *slice* length, and a caller may hand a slice
+            // shorter than its shape (`eval_host_op_on_f32_arena` clips to the
+            // host arena) — so a run the slice cannot hold falls back to the flat
+            // read rather than indexing past it.
+            let runs = |i: usize, slice: usize, lanes: usize| {
+                broadcast_run(out_shape, &inputs[i].0, lanes)
+                    .filter(|&(_, len)| len <= slice)
+                    .unwrap_or((1, slice))
+            };
+            let (a_rep, a_len) = runs(0, a_n, n);
+            let (b_rep, b_len) = runs(1, b_n, n);
             let mut y = vec![0f32; n];
             if n < 4096 {
                 if a_n == n && b_n == n {
@@ -266,7 +303,11 @@ fn eval_elementwise_fast(
                     }
                 } else {
                     for i in 0..n {
-                        y[i] = region_binary_scalar(*bop, a[i % a_n], b[i % b_n]);
+                        y[i] = region_binary_scalar(
+                            *bop,
+                            a[(i / a_rep) % a_len],
+                            b[(i / b_rep) % b_len],
+                        );
                     }
                 }
             } else if a_n == n && b_n == n {
@@ -284,9 +325,11 @@ fn eval_elementwise_fast(
                     *out = region_binary_scalar(*bop, a[i], bv);
                 });
             } else {
-                // General broadcast via modulus (equal-rank trailing).
+                // General broadcast: one contiguous run of `len` values repeated
+                // `rep` times (`(1, n)` here is the historical flat `i % n`).
                 y.par_iter_mut().enumerate().for_each(|(i, out)| {
-                    *out = region_binary_scalar(*bop, a[i % a_n], b[i % b_n]);
+                    *out =
+                        region_binary_scalar(*bop, a[(i / a_rep) % a_len], b[(i / b_rep) % b_len]);
                 });
             }
             Some(y)

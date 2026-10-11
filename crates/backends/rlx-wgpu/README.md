@@ -195,9 +195,12 @@ compute encodes between host steps; deferred H2D batches uploads before the
 next device-reading step.
 
 **Encoder parity notes:** compile runs `LegalizeBroadcast` before fusion
-(mid-axis `[1,C,1,D]+[1,C,P,D]` needs `Expand`) and unfuses
-`ElementwiseRegion` on wgpu (region kernel only supports trailing broadcast).
-`Activation::Gelu` uses exact `erf` in `unary.wgsl` (not the tanh approx).
+(mid-axis `[1,C,1,D]+[1,C,P,D]` needs `Expand`); the copies it inserts for a
+binary operand `simple_broadcast` *can* describe (`[1,C,1]` against `[1,C,T]`)
+are peeled back at lowering (`unfuse::elide_binary_broadcast_expands`). Compile
+also unfuses `ElementwiseRegion` on wgpu (region kernel only supports trailing
+broadcast). `Activation::Gelu` uses exact `erf` in `unary.wgsl` (not the tanh
+approx).
 
 ## Build / test
 

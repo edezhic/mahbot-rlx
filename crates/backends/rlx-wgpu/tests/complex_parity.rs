@@ -18,9 +18,15 @@
 //!      (combine) → host f64 (π, 1/3, f32-exact); rel err ≤ 1e-14.
 //!   4. Slot-sizing — a C64/C128 output reads back 2N / 4N f32 lanes (8N / 16N B).
 //!
+//! Gate 7 (below) is a *lowering-structure* gate for f32 broadcast shapes: it
+//! pins the step table the peel leaves. The values at those shapes are pinned
+//! cross-backend in `rlx-runtime`'s `elementwise_backend_parity`.
+//!
 //! Runs only when a wgpu device is present; otherwise a graceful no-op.
 
-use rlx_ir::op::BinaryOp;
+mod common;
+
+use rlx_ir::op::{BinaryOp, CmpOp};
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::backend::{narrow_f32_to_bytes, widen_bytes_to_f32};
 use rlx_wgpu::backend::WgpuExecutable;
@@ -596,4 +602,273 @@ fn reverse_complex() {
     let cpu = cpu_op1_bytes(&[4], &[4], DType::C64, op.clone(), &c64_bytes(&c64));
     let gpu = wgpu_op1_bytes(&[4], &[4], DType::C64, op, &c64_bytes(&c64));
     assert_eq!(gpu, cpu, "C64 Reverse wgpu vs cpu mismatch");
+}
+
+// ── Gate 7: elementwise broadcast operand shapes ───────────────────────────
+//
+// The runtime path legalises `Op::Binary` broadcasts before fusion, and the
+// shapes that pass leaves alone — equal shape, scalar, clean trailing slice —
+// are strictly fewer than the per-operand run `(i/rep)%len` the elementwise
+// kernel reads. The canonical per-channel operand (channel axis in the middle,
+// `[1,C,1]` against `[B,C,T]`) is therefore copied in full unless the lowering
+// peels that copy (`rlx_wgpu::unfuse::elide_binary_broadcast_expands`).
+//
+// What these gates pin is the lowering's step table: the shapes that must be
+// peeled (a mid-axis *input* operand, a per-channel *parameter* operand) and the
+// two that must keep their copy — a pattern `simple_broadcast` cannot describe,
+// and the complex consumer, whose kernel has no stride form. The f32 *values* at
+// these shapes are compared against the CPU reference cross-backend in
+// `rlx-runtime`'s `elementwise_backend_parity`; the C64 values stay here, since
+// that consumer is this file's subject.
+
+#[test]
+fn binary_mid_axis_broadcast_copy_is_peeled() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, available()) {
+        return;
+    }
+    let (b, c, t) = (2usize, 6usize, 5usize);
+
+    for op in [BinaryOp::Add, BinaryOp::Mul] {
+        let mut g = Graph::new("mid_axis_input");
+        let a = g.input("a", Shape::new(&[b, c, t], DType::F32));
+        let p = g.input("p", Shape::new(&[1, c, 1], DType::F32));
+        let y = g.add_node(
+            Op::Binary(op),
+            vec![a, p],
+            Shape::new(&[b, c, t], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        // The per-channel operand is read through `(i/rep)%len`, so the copy the
+        // legalising pass inserted for it must be gone.
+        assert_eq!(
+            common::expand_steps(&common::legalised_step_names(&g)),
+            0,
+            "per-channel operand must not stay materialised"
+        );
+    }
+}
+
+#[test]
+fn binary_non_contiguous_broadcast_keeps_its_copy() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, available()) {
+        return;
+    }
+    // Kept axes 0 and 2 with a broadcast in between: not one contiguous run, so
+    // no single `(rep, len)` describes it and the copy has to stay.
+    let dims = [2usize, 4usize, 3usize, 4usize];
+
+    let mut g = Graph::new("non_contiguous_broadcast");
+    let a = g.input("a", Shape::new(&dims, DType::F32));
+    let p = g.input("p", Shape::new(&[2, 1, 3, 1], DType::F32));
+    let y = g.add_node(
+        Op::Binary(BinaryOp::Add),
+        vec![a, p],
+        Shape::new(&dims, DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    assert_eq!(
+        common::expand_steps(&common::legalised_step_names(&g)),
+        1,
+        "a pattern `(i/rep)%len` cannot describe must keep its copy"
+    );
+}
+
+#[test]
+fn binary_per_channel_param_operand_copy_is_peeled() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, available()) {
+        return;
+    }
+    let (b, c, t) = (2usize, 6usize, 5usize);
+
+    let mut g = Graph::new("chan_param");
+    let a = g.input("a", Shape::new(&[b, c, t], DType::F32));
+    let p = g.param("bias", Shape::new(&[1, c, 1], DType::F32));
+    let y = g.add_node(
+        Op::Binary(BinaryOp::Add),
+        vec![a, p],
+        Shape::new(&[b, c, t], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    assert_eq!(
+        common::expand_steps(&common::legalised_step_names(&g)),
+        0,
+        "a per-channel parameter operand must not stay materialised"
+    );
+}
+
+#[test]
+fn c64_mid_axis_broadcast_keeps_its_copy() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, available()) {
+        return;
+    }
+    use rlx::prelude::*;
+    let (c, t) = (3usize, 4usize);
+    let chan = [1.5f32, 2.5, -3.0, 4.0, 0.5, -0.25];
+    let other: Vec<f32> = (0..c * t * 2)
+        .map(|i| ((i * 29 % 61) as f32) / 8.0 - 2.0)
+        .collect();
+
+    let mut g = Graph::new("c64_mid_axis");
+    let a = g.input("a", Shape::new(&[1, c, 1], DType::C64));
+    let b = g.input("b", Shape::new(&[1, c, t], DType::C64));
+    let y = g.add_node(
+        Op::Binary(BinaryOp::Add),
+        vec![a, b],
+        Shape::new(&[1, c, t], DType::C64),
+    );
+    g.set_outputs(vec![y]);
+    // The graph the runtime path hands the lowering (the C64 boundary of
+    // `run_typed` stops the shim itself here, so the pass is applied directly).
+    let legalised = {
+        use rlx_opt::pass::Pass as _;
+        rlx_opt::LegalizeBroadcast.run(g.clone())
+    };
+
+    let cpu = {
+        let mut s = Session::new(Device::Cpu).compile(legalised.clone());
+        let out = s
+            .run_typed(&[
+                ("a", &c64_bytes(&chan), DType::C64),
+                ("b", &c64_bytes(&other), DType::C64),
+            ])
+            .remove(0)
+            .0;
+        out.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect::<Vec<f32>>()
+    };
+    let gpu = {
+        let la = widen_bytes_to_f32(&c64_bytes(&chan), DType::C64);
+        let lb = widen_bytes_to_f32(&c64_bytes(&other), DType::C64);
+        WgpuExecutable::compile(legalised)
+            .run(&[("a", &la), ("b", &lb)])
+            .remove(0)
+    };
+    assert_eq!(
+        common::max_abs_diff(&gpu, &cpu),
+        0.0,
+        "C64 [1,C,T] + [1,C,1] wgpu vs cpu mismatch"
+    );
+    // `binary_c64.wgsl` reads its operands with a plain `k % n`, so this operand
+    // has to keep arriving materialised.
+    let names = common::legalised_step_names(&g);
+    assert_eq!(
+        common::expand_steps(&names),
+        1,
+        "the complex kernel has no stride form — the copy must stay: {names:?}"
+    );
+}
+
+/// The peel's guard where it has to say *keep the copy*, device-free: a consumer
+/// whose f32 lanes are not its elements, and a parameter operand whose storage is
+/// not one f32 lane per element.
+///
+/// `binary_broadcast_expand_elisions` does not expose those two refusals through a
+/// step table (a refused copy is simply one the schedule still carries), and a
+/// graph that exercises them end to end does not exist in the tree, so the verdict
+/// is pinned here, on the legalised graph, where no device is needed.
+#[test]
+fn peel_guard_keeps_the_copy_where_the_operand_cannot_be_read_as_lanes() {
+    // `(legalised copies, elisions)` for a mid-axis `[1,6,1]` operand of the given
+    // dtype, staged as a parameter or as an input.
+    let probe = |dtype: DType, as_param: bool| {
+        let act = Shape::new(&[2, 6, 5], dtype);
+        let mut g = Graph::new("peel_guard");
+        let a = g.input("a", act.clone());
+        let p = if as_param {
+            g.param("p", Shape::new(&[1, 6, 1], dtype))
+        } else {
+            g.input("p", Shape::new(&[1, 6, 1], dtype))
+        };
+        let y = g.add_node(Op::Binary(BinaryOp::Add), vec![a, p], act);
+        g.set_outputs(vec![y]);
+        let legalised = {
+            use rlx_opt::pass::Pass as _;
+            rlx_opt::LegalizeBroadcast.run(g)
+        };
+        let copies = legalised
+            .nodes()
+            .iter()
+            .filter(|n| matches!(&n.op, Op::Expand { .. }))
+            .count();
+        let elided = rlx_wgpu::unfuse::binary_broadcast_expand_elisions(&legalised).len();
+        assert_eq!(copies, 1, "the pass must have inserted the copy to judge");
+        elided
+    };
+    // The canonical case, for contrast: peeled.
+    assert_eq!(probe(DType::F32, false), 1, "f32 mid-axis operand");
+    // A wider dtype stages more f32 lanes than elements, and the host replay reads
+    // such an operand flat, so the copy has to stay.
+    assert_eq!(probe(DType::F64, false), 0, "f64 consumer");
+    // `set_param_typed` stores `BF16` raw at two bytes per element, so a device
+    // step would read the model's packed bytes as lanes
+    // (`buffer::unstageable_reason`'s `StoredRaw`).
+    assert_eq!(probe(DType::BF16, true), 0, "bf16 parameter operand");
+    // The same encoding as an *activation* is not judged that way: the planner
+    // widens activations at the boundary, a rule stated and applied by
+    // `param_operands_are_lane_readable` in the lowering (`lower.rs`), so only a
+    // parameter's storage is asked.
+    assert_eq!(probe(DType::BF16, false), 1, "bf16 activation operand");
+
+    // A non-`Op::Binary` reader keeps its copy whatever the shapes say. The pass
+    // only legalises `Op::Binary` (`legalize_broadcast.rs`'s `maybe_expand` caller),
+    // so such an expand can only be one the graph already carried — which is
+    // exactly the case that must not be peeled: those kernels index flat.
+    let mut g = Graph::new("authored_expand");
+    let a = g.input("a", Shape::new(&[2, 6, 5], DType::F32));
+    let p = g.input("p", Shape::new(&[1, 6, 1], DType::F32));
+    let e = g.add_node(
+        Op::Expand {
+            target_shape: vec![2, 6, 5],
+        },
+        vec![p],
+        Shape::new(&[2, 6, 5], DType::F32),
+    );
+    let y = g.add_node(
+        Op::Compare(CmpOp::Eq),
+        vec![a, e],
+        Shape::new(&[2, 6, 5], DType::Bool),
+    );
+    g.set_outputs(vec![y]);
+    assert_eq!(
+        rlx_wgpu::unfuse::binary_broadcast_expand_elisions(&g).len(),
+        0,
+        "a `Compare` operand must keep its copy: the kernel indexes flat"
+    );
+
+    // A dynamic operand cannot be described at all — `simple_broadcast` demands
+    // both ranks static — so the guard refuses before it is asked. Without the
+    // static term the element count alone reads `Some(60) != None` → true and the
+    // peel reaches `simple_broadcast`, which panics there.
+    let mut g = Graph::new("dynamic_source");
+    let a = g.input("a", Shape::new(&[2, 6, 5], DType::F32));
+    let p = g.input(
+        "p",
+        rlx_ir::Shape::from_dims(
+            &[
+                rlx_ir::Dim::Dynamic(0),
+                rlx_ir::Dim::Static(6),
+                rlx_ir::Dim::Static(1),
+            ],
+            DType::F32,
+        ),
+    );
+    let e = g.add_node(
+        Op::Expand {
+            target_shape: vec![2, 6, 5],
+        },
+        vec![p],
+        Shape::new(&[2, 6, 5], DType::F32),
+    );
+    let y = g.add_node(
+        Op::Binary(BinaryOp::Add),
+        vec![a, e],
+        Shape::new(&[2, 6, 5], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    assert_eq!(
+        rlx_wgpu::unfuse::binary_broadcast_expand_elisions(&g).len(),
+        0,
+        "a dynamic operand must keep its copy: no single run describes it"
+    );
 }

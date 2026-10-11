@@ -4977,6 +4977,7 @@ dependencies = [
  "rlx-ir",
  "rlx-mlx-io",
  "rlx-opt",
+ "rlx-unfuse",
  "serde",
  "strum_macros",
  "toml 0.8.23",

@@ -196,7 +196,8 @@ impl FusionOptions {
     }
 
     /// wgpu region kernel only supports trailing/scalar broadcast via
-    /// modulus — unfuse so LegalizeBroadcast Expand + Binary run separately.
+    /// modulus — unfuse so the elementwise step owns the broadcast instead
+    /// (its kernel reads a broadcast operand through `(i/rep)%len`).
     pub fn for_wgpu() -> Self {
         let keep = rlx_ir::env::flag("RLX_KEEP_ELEMENTWISE_REGIONS");
         Self {

@@ -108,6 +108,10 @@ name = "basic"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "binary_parked_param"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "bucketed_decode_attn_parity"
 required-features = ["backend-tests"]
 
@@ -225,6 +229,10 @@ required-features = ["backend-tests"]
 
 [[test]]
 name = "device_present"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "elementwise_broadcast_cost"
 required-features = ["backend-tests"]
 
 [[test]]

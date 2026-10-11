@@ -87,7 +87,9 @@ pub struct IoFusionGate {
 use rlx_ir::{Graph, Node, Op, OpKind};
 use std::collections::HashSet;
 
-fn is_metadata_op(op: &Op) -> bool {
+/// Ops that carry no bytes of their own in this profile: their output is their
+/// reader's read, so charging them again would double-count it.
+pub fn is_metadata_op(op: &Op) -> bool {
     matches!(
         op,
         Op::Input { .. }
@@ -106,7 +108,10 @@ fn tensor_bytes(shape: &rlx_ir::Shape) -> u64 {
         .unwrap_or(0)
 }
 
-fn node_io_bytes(node: &Node, graph: &Graph) -> u64 {
+/// Bytes [`profile_graph_io`] charges one node: its inputs' bytes plus its own
+/// output's. Public so a report of that traffic can be attributed per node
+/// without restating the recipe.
+pub fn node_io_bytes(node: &Node, graph: &Graph) -> u64 {
     let out = tensor_bytes(&node.shape);
     let inputs: u64 = node
         .inputs

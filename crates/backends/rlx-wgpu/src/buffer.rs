@@ -531,6 +531,27 @@ pub(crate) fn unstageable_reason(
     (slot_bytes < read).then_some(Unstageable::SlotTooNarrow)
 }
 
+/// [`unstageable_reason`]'s dtype half alone, for a caller that has no plan yet —
+/// the lowering's peel runs before the planner, so it has no slot to judge. `None`
+/// when no dtype arm refuses the storage, i.e. when the widest possible slot would
+/// make it readable.
+///
+/// Deliberately [`unstageable_reason`]'s verdict and not
+/// `param_lane_readable`'s: the two are opposite on exactly `F64`/`I64`, which the
+/// latter widens to one f32 lane per element and accepts. A caller with no record
+/// to judge wants the answer that keeps the copy, so this is the conservative one
+/// of the pair — not a mismatch to be reconciled in either direction.
+///
+/// A parameter whose declared dtype stores fewer than the four bytes per element a
+/// device step reads (`StoredRaw`: `U8`/`I8`/`BF16`) can never be read as lanes
+/// whatever its slot, and neither can one with no typed upload arm at all
+/// (`NoUploadArm`).
+pub(crate) fn unstageable_by_dtype(dt: rlx_ir::DType) -> Option<Unstageable> {
+    // `usize::MAX` because the width arm is not the question here: a dtype-only verdict
+    // never depends on the slot.
+    unstageable_reason(dt, 1, usize::MAX)
+}
+
 /// `unstageable_reason`'s question about one operand whose storage the record bounds at
 /// `off`, or `None` when the record names no parameter's storage there.
 fn unstageable_at(

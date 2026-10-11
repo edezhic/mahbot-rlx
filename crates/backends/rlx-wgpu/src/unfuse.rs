@@ -16,7 +16,7 @@
 //! accepts rank-3 `[B, S, H·D]` inputs directly and skips the
 //! reshape/transpose to `[B, H, S, D]`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rlx_ir::{Graph, NodeId, Op, Shape};
 use rlx_unfuse::DecomposePolicy;
@@ -58,6 +58,124 @@ impl DecomposePolicy for WgpuPolicy {
 pub fn unfuse(graph: Graph) -> Graph {
     let g = fold_conv_bias_into_conv3d(expand_unsupported_fusions(graph));
     rlx_unfuse::unfuse(g, &WgpuPolicy)
+}
+
+/// Peel the broadcast copy `LegalizeBroadcast` materialises in front of an
+/// `Op::Binary` operand that the elementwise kernel reads itself.
+///
+/// That pass runs before fusion (the runtime backend calls it ahead of the
+/// pipeline, so no backend pass ever sees the mismatch), and the shapes it
+/// leaves alone — equal shape, scalar, clean trailing slice — are *strictly*
+/// fewer than the ones `rlx_unfuse::simple_broadcast` can describe. So the
+/// canonical per-channel operand (`[1,C,1]` against `[1,C,T]`) gets a full-size
+/// copy even though [`WgpuPolicy::binary_broadcast_native`] exists to leave
+/// exactly that operand in place, and the copy is a real step: the planner gives
+/// it a slot and every run writes and reads it in full.
+///
+/// Peeling here — after all fusion, before memory planning — puts the operand
+/// back to the form the kernel wants (`binary_main.wgsl` reads `(i/rep)%len`, and
+/// the host route reads the same form in `rlx-cpu`'s `eval_elementwise_fast`) and
+/// drops the `expand` step and the slot. What the peel refuses to touch is
+/// [`binary_broadcast_expand_elisions`]'s business; a pattern no single contiguous
+/// run describes keeps its copy, because the lowering reads an operand it cannot
+/// describe *densely* — its `bcast` closure falls back to `(1, 0)` and
+/// `binary_main.wgsl` indexes flat then — so peeling one would read the source's
+/// own bytes where the output shape's are wanted.
+pub fn elide_binary_broadcast_expands(graph: Graph) -> Graph {
+    let peeled: HashMap<NodeId, NodeId> = binary_broadcast_expand_elisions(&graph)
+        .into_iter()
+        .collect();
+    if peeled.is_empty() {
+        return graph;
+    }
+    let mut out = Graph::new(graph.name.clone());
+    let mut id_map: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in graph.nodes() {
+        let inputs: Vec<NodeId> = node.inputs.iter().map(|i| id_map[i]).collect();
+        let new_id = match peeled.get(&node.id) {
+            // The source precedes its expand in node order, so its remap is
+            // known: hand it on and every reader reads the source directly.
+            Some(&src) => id_map[&src],
+            None => out.add_node(node.op.clone(), inputs, node.shape.clone()),
+        };
+        id_map.insert(node.id, new_id);
+    }
+    out.set_outputs(graph.outputs.iter().map(|i| id_map[i]).collect());
+    out
+}
+
+/// The `(expand, source)` pairs [`elide_binary_broadcast_expands`] drops, in node
+/// order — the one definition of the peel's selection, so evidence gathered about
+/// the peel cannot drift from it.
+///
+/// Selected when the expand is not itself a graph output and every one of its
+/// readers is an `Op::Binary` that reads the operand itself: a different element
+/// count from the source, a dtype whose f32 lanes *are* the elements, a shape
+/// `simple_broadcast` describes, and a source whose storage the device step may
+/// read as lanes. An expand with no readers at all goes too.
+///
+/// `Op::Compare`/`Op::Where`/`Op::Fma` are not in it: only `Compare` even requires
+/// equal shapes, and all three index their operands flat, so the copy is their
+/// only way to see a broadcast operand. A complex consumer, and any dtype staging
+/// more lanes than elements (F64/I64, a complex lane pair), keep theirs for the
+/// same reason — the host replay reads those flat too. So does a parameter
+/// operand whose storage is not one f32 lane per element.
+pub fn binary_broadcast_expand_elisions(graph: &Graph) -> Vec<(NodeId, NodeId)> {
+    let outputs: HashSet<NodeId> = graph.outputs.iter().copied().collect();
+    // Per input: "every reader of it reads the broadcast itself", folded over the
+    // edges, so nothing is collected per consumer.
+    let mut readable_by_all: HashMap<NodeId, bool> = HashMap::new();
+    for node in graph.nodes() {
+        for &input in &node.inputs {
+            // A reader of an expand reads the expand's *source* once it is peeled,
+            // so that is the shape the kernel has to describe.
+            let src = match &graph.node(input).op {
+                Op::Expand { .. } if graph.node(input).inputs.len() == 1 => {
+                    graph.node(input).inputs[0]
+                }
+                _ => input,
+            };
+            let src_shape = &graph.node(src).shape;
+            let ok = matches!(&node.op, Op::Binary(_))
+                // `(i/rep)%len` indexes f32 lanes, so it describes the operand
+                // only when a lane is an element.
+                && node.shape.dtype().size_bytes() <= 4
+                // An equal element count is already read flat.
+                && node.shape.num_elements() != src_shape.num_elements()
+                // Both shapes have to be static before `simple_broadcast` is asked:
+                // it demands them, and a dynamic dim would otherwise reach it by
+                // making the count test above `None != Some(..)`. The host twin
+                // (`rlx-cpu`'s `broadcast_run`) guards the same way.
+                && node.shape.is_static()
+                && src_shape.is_static()
+                && rlx_unfuse::simple_broadcast(&node.shape, src_shape).is_some()
+                // A parameter's storage is only read as lanes when its dtype says so:
+                // the typed upload stores `U8`/`I8`/`BF16` raw, so peeling would hand
+                // the step the model's packed bytes. Keeping the copy keeps whatever
+                // refusal that operand already hit at the expand's own arm. An
+                // activation is not judged here — the planner widens those at the
+                // boundary, a rule stated and applied by `lower.rs`'s
+                // `param_operands_are_lane_readable`.
+                && (!crate::buffer::is_parameter_storage(graph, src)
+                    || crate::buffer::unstageable_by_dtype(src_shape.dtype()).is_none());
+            readable_by_all
+                .entry(input)
+                .and_modify(|all| *all &= ok)
+                .or_insert(ok);
+        }
+    }
+    graph
+        .nodes()
+        .iter()
+        .filter(|n| {
+            matches!(&n.op, Op::Expand { .. })
+                && n.inputs.len() == 1
+                // An expand that is itself an output keeps its storage.
+                && !outputs.contains(&n.id)
+                && readable_by_all.get(&n.id).copied().unwrap_or(true)
+        })
+        .map(|n| (n.id, n.inputs[0]))
+        .collect()
 }
 
 /// Rewrite a 3-D [`Op::FusedConvBiasAct`] into an [`Op::Conv3d`] that keeps the

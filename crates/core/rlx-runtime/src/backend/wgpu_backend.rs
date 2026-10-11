@@ -21,9 +21,13 @@ impl Backend for WgpuBackend {
             });
         let graph = apply_scan_device_preference(graph, options);
         let graph = crate::precompile::precompile_cleanup(graph, options);
-        // Materialize mid-axis broadcasts before MarkElementwiseRegions:
-        // wgpu Binary/region kernels only handle trailing/scalar broadcast
-        // via modulus; EEG patch embed uses [1,C,1,D] + [1,C,P,D].
+        // Legalize mid-axis broadcasts before MarkElementwiseRegions: no kernel
+        // here describes a broadcast whose kept axes are not one contiguous run
+        // (EEG patch embed uses [1,C,1,D] + [1,C,P,D]). The copies it inserts for
+        // an `Op::Binary` operand the elementwise kernel *can* read through
+        // `(i/rep)%len` — the operand blown out to the output shape — are peeled
+        // again at lowering — see
+        // `rlx_wgpu::unfuse::elide_binary_broadcast_expands`.
         let graph = rlx_opt::LegalizeBroadcast.run(graph);
         // ORDER MATTERS: targeted-pattern fusions run BEFORE the
         // catch-all `MarkElementwiseRegions`. Otherwise the region

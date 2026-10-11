@@ -4,6 +4,10 @@
 //! Fixtures shared by this crate's parity tests. `tests/common/` is not a test
 //! target of its own; each test binary pulls it in with `mod common;`.
 
+// Each test binary declaring `mod common;` uses only the helpers it needs, so
+// the rest are dead code in that binary and `just lint` runs with `-D warnings`.
+#![allow(dead_code)]
+
 /// Largest absolute difference between a computed and a reference output, after
 /// a finiteness census.
 ///
@@ -33,4 +37,26 @@ pub fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
         .zip(want)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max)
+}
+
+/// How many schedule steps are the materialised broadcast family
+/// (`expand` / `expand_host`) — the lowering leaves one wherever a broadcast
+/// operand has to arrive as a real tensor.
+pub fn expand_steps(names: &[&str]) -> usize {
+    names
+        .iter()
+        .filter(|n| **n == "expand" || **n == "expand_host")
+        .count()
+}
+
+/// The step names this backend dispatches for `g` as the runtime path reaches it:
+/// the legalising pass first (what the shim runs ahead of fusion —
+/// `rlx-runtime/src/backend/wgpu_backend.rs`), then the lowering.
+///
+/// Legalising first is what makes a *missing* `expand` step evidence that the
+/// peel fired, rather than evidence that the pass never ran and inserted none.
+pub fn legalised_step_names(g: &rlx_ir::Graph) -> Vec<&'static str> {
+    use rlx_opt::pass::Pass as _;
+    let legalised = rlx_opt::LegalizeBroadcast.run(g.clone());
+    rlx_wgpu::backend::WgpuExecutable::compile(legalised).test_step_names()
 }

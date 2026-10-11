@@ -215,3 +215,49 @@ fn a_deferred_host_write_reaches_the_compact_conv_transpose_step() {
         want[0]
     );
 }
+
+/// A per-channel operand must reach the host step the way the device kernel
+/// reads it.
+///
+/// `RLX_WGPU_FORCE_HOST` puts the elementwise family on the host route on any
+/// adapter, and a per-channel operand arrives without the copy the device kernel
+/// does not need: the lowering peels the `Op::Expand` the legalising pass
+/// inserted for it. The host evaluator then has to index the operand with the
+/// same `(i/rep)%len` run the device kernel uses — a flat `i % C` read walks the
+/// channel with time and mixes every channel's operand. The operand is a
+/// parameter here, so the host step's own parameter staging is on the path too.
+#[test]
+fn per_channel_broadcast_operand_is_channel_wise_on_the_host_route() {
+    rlx_ir::env::set("RLX_WGPU_FORCE_HOST", "1");
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let (b, c, t) = (2usize, 6usize, 5usize);
+    let xs: Vec<f32> = (0..b * c * t)
+        .map(|i| ((i * 41 % 173) as f32) / 8.0 - 4.0)
+        .collect();
+    let chan: Vec<f32> = (0..c).map(|i| i as f32 * 0.25 - 0.5).collect();
+
+    let mut g = Graph::new("chan_host_route");
+    let x = g.input("x", Shape::new(&[b, c, t], DType::F32));
+    let p = g.param("p", Shape::new(&[1, c, 1], DType::F32));
+    let y = g.add_node(
+        Op::Binary(BinaryOp::Add),
+        vec![x, p],
+        Shape::new(&[b, c, t], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+
+    let mut gpu = Session::new(Device::Gpu).compile(g.clone());
+    gpu.set_param("p", &chan);
+    let got = gpu.run(&[("x", &xs)]);
+    let mut cpu = Session::new(Device::Cpu).compile(g);
+    cpu.set_param("p", &chan);
+    let want = cpu.run(&[("x", &xs)]);
+    let max_d = common::max_abs_diff(&got[0], &want[0]);
+    eprintln!("max abs diff {max_d:.2e}");
+    assert!(
+        max_d < 1e-4,
+        "the host route read the per-channel operand flat (max|Δ| = {max_d:.3e})"
+    );
+}

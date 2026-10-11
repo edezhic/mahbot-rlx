@@ -5,8 +5,13 @@
 
 //! Sharded activation arenas (> wgpu max_buffer_size / ~4 GiB).
 
+mod common;
+
 use rlx_ir::NodeId;
+use rlx_ir::op::BinaryOp;
+use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_opt::memory::{BufferSlot, MemoryPlan};
+use rlx_runtime::{Device, Session};
 use rlx_wgpu::buffer::{Arena, effective_shard_cap};
 use std::collections::HashMap;
 
@@ -169,4 +174,76 @@ fn binds_whole_at_base_zero_covers_striping_limit_and_u32_words() {
         arena.size = beyond_u32_words;
         assert!(!arena.binds_whole_at_base_zero(u64::MAX));
     }
+}
+
+/// The **default** sharded routing (host, not `RLX_WGPU_SHARD_GPU`) combined with
+/// the per-channel operand the lowering peeled
+/// (`rlx_wgpu::unfuse::elide_binary_broadcast_expands`): the peel is what puts
+/// the operand back to `(i / rep) % len`, and the host route has to read it that
+/// way out of a striped arena.
+///
+/// `[1,C,1]` against `[1,C,T]` is 2 MiB per tensor, and two outputs keep three of
+/// them live at once — past the 4 MiB shard cap below, while each single tensor
+/// still fits a stripe's usable region (stage reserve 1 MiB). A wrong-byte read
+/// of the peeled operand is O(1) wrong, far above the 1e-4 bar.
+#[test]
+fn sharded_host_route_reads_a_peeled_per_channel_operand() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    force_small_shards();
+
+    const C: usize = 256;
+    const T: usize = 2048; // C*T f32 = 2 MiB per tensor
+    const F: DType = DType::F32;
+
+    let xs: Vec<f32> = (0..C * T)
+        .map(|i| ((i * 41 % 173) as f32) / 8.0 - 4.0)
+        .collect();
+    let bias: Vec<f32> = (0..C).map(|i| i as f32 * 0.125 - 0.5).collect();
+
+    let act = Shape::new(&[1, C, T], F);
+    let mut g = Graph::new("sharded_peeled_param");
+    let x = g.input("x", act.clone());
+    let b = g.param("b", Shape::new(&[1, C, 1], F));
+    let y0 = g.add_node(Op::Binary(BinaryOp::Add), vec![x, b], act.clone());
+    let y1 = g.add_node(Op::Binary(BinaryOp::Mul), vec![x, b], act);
+    g.set_outputs(vec![y0, y1]);
+
+    // The count is what anchors the peel here: this route gives an un-peeled copy a
+    // step of its own (`expand_host` where it can be staged, `host_op` where its
+    // operands straddle stripes — the plan decides), so the peeled schedule is one
+    // step per elementwise leg and nothing in front of it.
+    let names = common::legalised_step_names(&g);
+    assert!(
+        names.iter().all(|n| *n == "host_op"),
+        "expected every step on the sharded host route, got {names:?} — a device step here \
+         means the arena did not stripe or the route changed"
+    );
+    // The count is what anchors the peel here: this route gives an un-peeled copy a
+    // step of its own (`expand_host` where it can be staged, `host_op` where its
+    // operands straddle stripes — the plan decides), so the peeled schedule is one
+    // step per elementwise leg and nothing in front of it.
+    assert_eq!(
+        names.len(),
+        2,
+        "one step per elementwise leg and no copy for the per-channel operand: {names:?}"
+    );
+    eprintln!("  sharded host route: steps {names:?}");
+
+    let mut gpu = Session::new(Device::Gpu).compile(g.clone());
+    gpu.set_param("b", &bias);
+    let got = gpu.run(&[("x", &xs)]).remove(0);
+    let mut cpu = Session::new(Device::Cpu).compile(g);
+    cpu.set_param("b", &bias);
+    let want = cpu.run(&[("x", &xs)]).remove(0);
+    let max_d = common::max_abs_diff(&got, &want);
+    // This pair is Add/Mul in f32 through the same read form, so it has to be
+    // bit-exact: the bar is the strictest one the suite can state, and a peeled
+    // operand read out of the wrong stripe is wrong by O(1).
+    assert_eq!(
+        max_d, 0.0,
+        "sharded host route: wgpu differs from the CPU reference by {max_d:.3e} — a peeled \
+         per-channel operand read out of the wrong stripe is wrong by O(1)"
+    );
 }

@@ -27,6 +27,12 @@
 //! This costs an extra arena buffer per legalized binary, but the
 //! correctness win dominates — and the buffer's lifetime is tight
 //! (single consumer), so memory planning recycles it aggressively.
+//!
+//! A backend whose elementwise kernel *is* stride-aware does not have to pay
+//! that: it peels these copies back at lowering (wgpu's
+//! `unfuse::elide_binary_broadcast_expands`) instead of relaxing this pass —
+//! what this pass leaves alone is what keeps the lowering's dense-read
+//! fallback unreachable.
 
 use rlx_ir::shape::Dim;
 use rlx_ir::{Graph, Node, NodeId, Op, Shape};

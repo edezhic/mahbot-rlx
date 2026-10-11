@@ -62,6 +62,10 @@ amx-sme = []
 [dependencies]
 rlx-ir = { workspace = true }
 rlx-opt = { workspace = true }
+# `simple_broadcast` — the per-operand `(rep, len)` a broadcast reads through.
+# The host route (`thunk::scan::eval_single_op_f32`) needs it to compute the same
+# index a GPU backend's elementwise kernel does; single source for the form.
+rlx-unfuse = { workspace = true }
 # GGUF K-quant block decoders — used by Op::DequantMatMul's GGUF
 # schemes so packed weight bytes can stay in the arena until matmul
 # time instead of round-tripping through f32 at load.

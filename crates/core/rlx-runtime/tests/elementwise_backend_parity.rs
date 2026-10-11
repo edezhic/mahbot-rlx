@@ -20,6 +20,11 @@
 //!   disagrees with the canonical opcode id (an off-by-one, a Round/Recip swap,
 //!   a copy-paste from the wrong scheme), the wrong *function* is computed and
 //!   the parity error jumps to O(1), failing here.
+//! * **Broadcast operand shapes** — the operand shapes `LegalizeBroadcast`
+//!   rewrites before lowering, in both the input and the parameter route.
+//!   Whether a `[1,C,1]` operand reaches the kernel as a materialised `Expand`
+//!   or is read through its `(i/rep)%len` stride depends on the backend (and,
+//!   on wgpu, on the peel), so the values must not depend on which happened.
 //! * **Gradient parity (CPU, finite differences)** — for the smooth
 //!   activations, the analytic VJP from `grad_with_loss` is checked against
 //!   central differences. Backward activations decompose to primitives on the
@@ -65,18 +70,41 @@ fn available_backends() -> Vec<Device> {
     v
 }
 
-fn run(device: Device, g: &Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
+/// Compile `g` on `device`, stage `params` on it, and run `inputs` once.
+fn run_with(
+    device: Device,
+    g: &Graph,
+    inputs: &[(&str, &[f32])],
+    params: &[(&str, &[f32])],
+) -> Vec<f32> {
     // Serialize device use across this binary's test threads. Without it the
     // Vulkan cases intermittently returned garbage (worst_rel=1.0, ~1 run in 6)
     // while `--test-threads=1` was always clean — the adapters in this tree are
     // not safe to init/teardown concurrently, which is what `GpuTestGuard` is
     // for. This file never took it.
     let _guard = common::GpuTestGuard::acquire(device);
-    Session::new(device)
-        .compile(g.clone())
-        .run(inputs)
-        .pop()
-        .expect("graph produced no output")
+    let mut c = Session::new(device).compile(g.clone());
+    for &(name, data) in params {
+        c.set_param(name, data);
+    }
+    c.run(inputs).pop().expect("graph produced no output")
+}
+
+/// [`run_with`] with nothing staged.
+fn run(device: Device, g: &Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
+    run_with(device, g, inputs, &[])
+}
+
+/// The device-side finiteness rule `worst_rel` does not carry: it folds with
+/// `f32::max`, so an all-NaN output would compare as a small number.
+fn assert_finite(got: &[f32], what: &str) {
+    let nan = got.iter().filter(|v| v.is_nan()).count();
+    let inf = got.iter().filter(|v| v.is_infinite()).count();
+    assert_eq!(
+        (nan, inf),
+        (0, 0),
+        "{what}: non-finite device output (NaN={nan}, +inf/−inf={inf})"
+    );
 }
 
 /// Worst per-element error, absolute below unit magnitude and relative above —
@@ -307,6 +335,134 @@ fn kernel_dsl_matches_cpu_activation_oracle() {
                 "{act:?} at x={xi}: manifest={dsl} cpu_kernel={c} err={err:e}"
             );
         }
+    }
+}
+
+// ── Broadcast operand shapes ────────────────────────────────────────────────
+
+// The runtime path legalises `Op::Binary` broadcasts before fusion
+// (`rlx_opt::LegalizeBroadcast`, run by the wgpu/cuda/rocm/cpu runtime
+// backends). The shapes that pass leaves alone — equal shape, scalar, clean
+// trailing slice — are *strictly* fewer than the per-operand contiguous-run
+// form `idx = (i/rep)%len` a stride-aware elementwise kernel reads, so the
+// canonical per-channel operand (`[1,C,1]` against `[B,C,T]`, channel axis in
+// the middle) is materialised as a full-size copy in front of the consumer
+// unless the backend peels it at lowering (wgpu does, in
+// `rlx_wgpu::unfuse::elide_binary_broadcast_expands`). The other backends
+// either keep the copy (they run the pass: cuda/rocm/cpu) or read the stride
+// themselves (metal deliberately skips the pass). Every one of them must
+// produce the same values at these shapes.
+//
+// The last case additionally stages the operand as a *param*, which is the
+// path the peel newly exposes on the GPU routes (the parameter's own staging
+// step sits between `set_param` and the kernel).
+
+/// Mildly-scaled, distinct-per-index values: every channel of a `[1,C,1]`
+/// operand differs from its neighbours, so a stride misread cannot alias.
+fn broadcast_values(n: usize) -> Vec<f32> {
+    (0..n).map(|i| (i * 37 % 97) as f32 / 4.0 - 3.0).collect()
+}
+
+/// `[B,C,T] + [1,C,1]` — the per-channel operand as an **input**, which on a
+/// backend that runs `LegalizeBroadcast` arrives as a full-size `Expand` copy
+/// and on wgpu is peeled back to the kernel's `(i/rep)%len` read.
+#[test]
+fn binary_mid_axis_input_operand_matches_cpu() {
+    let backends = available_backends();
+    let a = broadcast_values(2 * 6 * 5);
+    let p = broadcast_values(6);
+    for &op in &[BinaryOp::Add, BinaryOp::Mul] {
+        let mut g = Graph::new("bin_mid_axis");
+        let a_id = g.input("a", Shape::new(&[2, 6, 5], DType::F32));
+        let p_id = g.input("p", Shape::new(&[1, 6, 1], DType::F32));
+        let y = g.binary(op, a_id, p_id, Shape::new(&[2, 6, 5], DType::F32));
+        g.set_outputs(vec![y]);
+        let cpu = run(Device::Cpu, &g, &[("a", &a), ("p", &p)]);
+        assert_finite(&cpu, &format!("CPU oracle for {op:?} (mid-axis operand)"));
+        for &dev in &backends {
+            if !supports_graph(dev, &g) {
+                eprintln!("skip {op:?} mid-axis on {dev:?} (unsupported)");
+                continue;
+            }
+            let got = run(dev, &g, &[("a", &a), ("p", &p)]);
+            assert_finite(&got, &format!("mid-axis {op:?} on {dev:?}"));
+            let err = worst_rel(&cpu, &got);
+            assert!(
+                err < PARITY_TOL,
+                "mid-axis {op:?} on {dev:?}: worst_rel={err:.3e} \
+                 (channel-strided operand misread?)"
+            );
+        }
+    }
+}
+
+/// `[2,4,3,4] + [2,1,3,1]` — kept axes 0 and 2 with a broadcast between them,
+/// the pattern no single contiguous run describes. `LegalizeBroadcast` must
+/// keep its materialised copy on every backend, including wgpu, whose peel
+/// only drops expands `simple_broadcast` can describe.
+#[test]
+fn binary_non_contiguous_broadcast_matches_cpu() {
+    let backends = available_backends();
+    let g_shape = [2, 4, 3, 4];
+    let a = broadcast_values(g_shape.iter().product());
+    let p = broadcast_values(2 * 3);
+    let mut g = Graph::new("bin_non_contiguous");
+    let a_id = g.input("a", Shape::new(&g_shape, DType::F32));
+    let p_id = g.input("p", Shape::new(&[2, 1, 3, 1], DType::F32));
+    let y = g.binary(BinaryOp::Add, a_id, p_id, Shape::new(&g_shape, DType::F32));
+    g.set_outputs(vec![y]);
+    let cpu = run(Device::Cpu, &g, &[("a", &a), ("p", &p)]);
+    assert_finite(&cpu, "CPU oracle for the non-contiguous broadcast");
+    for &dev in &backends {
+        if !supports_graph(dev, &g) {
+            eprintln!("skip non-contiguous broadcast on {dev:?} (unsupported)");
+            continue;
+        }
+        let got = run(dev, &g, &[("a", &a), ("p", &p)]);
+        assert_finite(&got, &format!("non-contiguous broadcast on {dev:?}"));
+        let err = worst_rel(&cpu, &got);
+        assert!(
+            err < PARITY_TOL,
+            "non-contiguous broadcast on {dev:?}: worst_rel={err:.3e} \
+             (operand aliased across the mid broadcast?)"
+        );
+    }
+}
+
+/// The same `[1,6,1]` operand, staged as a **param** instead of an input, so
+/// the parameter staging on the GPU routes is in the path. `set_param` copies
+/// the 6 values and the consumer reads them as a stride, exactly as it would
+/// the input — the peel must not depend on which route delivered them.
+#[test]
+fn binary_per_channel_param_operand_matches_cpu() {
+    let backends = available_backends();
+    let a = broadcast_values(2 * 6 * 5);
+    let bias = broadcast_values(6);
+    let mut g = Graph::new("bin_per_channel_param");
+    let a_id = g.input("a", Shape::new(&[2, 6, 5], DType::F32));
+    let b_id = g.param("bias", Shape::new(&[1, 6, 1], DType::F32));
+    let y = g.binary(
+        BinaryOp::Add,
+        a_id,
+        b_id,
+        Shape::new(&[2, 6, 5], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    let cpu = run_with(Device::Cpu, &g, &[("a", &a)], &[("bias", &bias)]);
+    assert_finite(&cpu, "CPU oracle for the param operand");
+    for &dev in &backends {
+        if !supports_graph(dev, &g) {
+            eprintln!("skip param per-channel broadcast on {dev:?} (unsupported)");
+            continue;
+        }
+        let got = run_with(dev, &g, &[("a", &a)], &[("bias", &bias)]);
+        assert_finite(&got, &format!("param per-channel broadcast on {dev:?}"));
+        let err = worst_rel(&cpu, &got);
+        assert!(
+            err < PARITY_TOL,
+            "param per-channel broadcast on {dev:?}: worst_rel={err:.3e} \
+             (staged param read with the wrong stride?)"
+        );
     }
 }
 

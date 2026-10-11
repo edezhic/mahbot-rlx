@@ -837,6 +837,9 @@ pub(crate) fn compile_static_inner(
     // Elide the redundant reshapes unfuse/matmul-lowering emit — they alias
     // parents and block the planner's slot reuse (see collapse_reshapes).
     let graph = crate::unfuse::collapse_reshapes(graph);
+    // The runtime path legalises `Op::Binary` broadcasts before fusion; peel the
+    // copies the f32 kernel reads itself, so they are not a step or a slot.
+    let graph = crate::unfuse::elide_binary_broadcast_expands(graph);
 
     if rlx_ir::env::flag("RLX_WGPU_DEBUG_OP_HIST") {
         let mut hist: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -2020,10 +2023,12 @@ pub(crate) fn compile_static_inner(
                     c_off
                 };
                 // A broadcast operand is read through `(i / rep) % len`
-                // instead of being materialised. `rlx_unfuse` only leaves the
-                // mismatch in place when `simple_broadcast` can describe it,
-                // so anything it could not is already an Expand and lands here
-                // dense.
+                // instead of being materialised: `rlx_unfuse` leaves the mismatch
+                // in place when `simple_broadcast` can describe it, and
+                // `elide_binary_broadcast_expands` peels the copy the runtime
+                // path's `LegalizeBroadcast` inserted for the same shapes.
+                // Anything `simple_broadcast` could not describe is still an
+                // Expand and lands here dense.
                 let bcast = |id: rlx_ir::NodeId| -> (u32, u32) {
                     let src = &graph.node(id).shape;
                     if src.num_elements() == node.shape.num_elements() {
