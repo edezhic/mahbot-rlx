@@ -264,6 +264,10 @@ name = "gguf_gemm_gguf_wgsl"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "gguf_gemm_grouped_split_rate"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "gguf_gemm_grouped_weight_reuse"
 required-features = ["backend-tests"]
 

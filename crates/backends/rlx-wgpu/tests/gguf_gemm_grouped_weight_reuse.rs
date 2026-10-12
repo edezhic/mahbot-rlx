@@ -5,9 +5,9 @@
 //! Weight reuse, measured, for the row-grouped GGUF GEMM at the widest served
 //! shape: a ~800 MiB packed Q4_K weight (and the same shape's Q6_K side), wider
 //! than one bind window, so the encoder has to re-resolve and re-bind the weight
-//! several times per call. The route exists to read the packed weight once per
-//! group of 8 rows instead of once per row; a "pass" is the single-row cell's own
-//! cost, so every ratio here is denominated in the one-row arm.
+//! several times per call. The route exists to read the packed weight's quant bytes
+//! once per group of 8 rows instead of once per row; a "pass" is the single-row
+//! cell's own cost, so every ratio here is denominated in the one-row arm.
 //!
 //! As recorded before that arm's reshape, one group cost 1.45-1.50 passes at 2-4
 //! rows and 1.49-1.54 at 8 (Q6_K: 1.36-1.43), with the 96- and 276-row cells at
@@ -77,8 +77,6 @@
 
 mod common;
 
-use std::time::Instant;
-
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{CompiledGraph, Device, Session};
@@ -91,36 +89,25 @@ const WARMUP: usize = 3;
 /// module doc for why round-robin rather than a long run per cell.
 const ROUNDS: usize = 9;
 
-/// The two K-quant schemes the row-grouped route serves, each with the packed
-/// geometry its blocks carry and the entry point that decodes them: `k / 256`
-/// blocks per column of `block_bytes`, with the f16 scale fields the generator
-/// has to keep small listed in `f16_high_bytes`.
+/// The two K-quant schemes the row-grouped route serves, each with the entry
+/// point that decodes its blocks.
 struct Scheme {
     quant: QuantScheme,
     entry: &'static str,
-    block_bytes: usize,
-    /// Byte offsets within a block whose high half is an f16 exponent; the
-    /// generator writes a fixed small exponent there so `d`/`dmin` land in
-    /// [2^-13, 2^-12).
-    f16_high_bytes: &'static [usize],
 }
 
 const Q4K: Scheme = Scheme {
     quant: QuantScheme::GgufQ4K,
     entry: "dequant_gemm_q4k",
-    block_bytes: 144,
-    f16_high_bytes: &[1, 3],
 };
 const Q6K: Scheme = Scheme {
     quant: QuantScheme::GgufQ6K,
     entry: "dequant_gemm_q6k",
-    block_bytes: 210,
-    f16_high_bytes: &[209],
 };
 
 /// One `DequantMatMul` over `packed` (`[n, k]`) and its row-major `x`.
 fn graph(scheme: &Scheme, k: usize, n: usize, m: usize, packed_len: usize) -> (Graph, Vec<f32>) {
-    let x: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 1e-4).sin()).collect();
+    let x: Vec<f32> = common::ramp(m, k, 1e-4);
     let mut g = Graph::new("wgpu_gguf_weight_reuse");
     let x_in = g.input("x", Shape::new(&[m, k], DType::F32));
     let w = g.param("w", Shape::new(&[packed_len], DType::U8));
@@ -133,32 +120,6 @@ fn graph(scheme: &Scheme, k: usize, n: usize, m: usize, packed_len: usize) -> (G
     );
     g.set_outputs(vec![y]);
     (g, x)
-}
-
-/// The packed weight: a deterministic function of `(k, n)` alone, so a
-/// single-row graph can reuse a wider case's weight. Nothing here is a real
-/// quantization, but every byte is masked to six bits and the high halves of the
-/// scheme's f16 scale fields get a fixed small exponent, so `d`/`dmin` land in
-/// [2^-13, 2^-12) and the dequantized weights stay ~1e-2 in magnitude: finite,
-/// and small enough that the grouped and per-row results can be compared under
-/// the op's absolute 1e-2 tolerance rather than measuring the test's own weight
-/// scale (large random weights cancel catastrophically, and the round-off of that
-/// cancellation would be what such a bound caught).
-fn packed_bytes(scheme: &Scheme, k: usize, n: usize) -> Vec<u8> {
-    let mut s = 7u32;
-    (0..(k / 256) * scheme.block_bytes * n)
-        .map(|i| {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            let b = (s >> 24) as u8;
-            if scheme.f16_high_bytes.contains(&(i % scheme.block_bytes)) {
-                // High half of an f16: sign 0, exponent 2, low mantissa bits from
-                // the generator.
-                0x08 | (b & 0x03)
-            } else {
-                b & 0x3F
-            }
-        })
-        .collect()
 }
 
 /// What one cell measured, and the route its calls took.
@@ -190,21 +151,18 @@ fn prepared(
 /// The single-row arm and the grouped arm are the two sides of the ratio, and on
 /// this backend a sequential A/B is not trustworthy (see the module doc). Round
 /// robin gives both sides the same device state, the same warm-up and the same
-/// number of calls, and the report is each cell's minimum over the rounds.
+/// number of calls, and the report is each cell's minimum over the rounds. The
+/// loop itself is [`common::time_round_robin`]; what stays here is this cell set's
+/// warm-up and its route census.
 fn measure_round_robin(cells: &mut [(usize, CompiledGraph, Vec<f32>)]) -> Vec<(usize, Measured)> {
     for (_, c, x) in cells.iter_mut() {
         for _ in 0..WARMUP {
             let _ = c.run(&[("x", x)]);
         }
     }
-    let mut times: Vec<Vec<f64>> = vec![Vec::with_capacity(ROUNDS); cells.len()];
-    for _ in 0..ROUNDS {
-        for (i, (_, c, x)) in cells.iter_mut().enumerate() {
-            let t0 = Instant::now();
-            let _ = c.run(&[("x", x)]);
-            times[i].push(t0.elapsed().as_secs_f64() * 1e3);
-        }
-    }
+    let times = common::time_round_robin(cells, ROUNDS, 1, |(_, c, x)| {
+        let _ = c.run(&[("x", x)]);
+    });
     cells
         .iter_mut()
         .enumerate()
@@ -213,13 +171,11 @@ fn measure_round_robin(cells: &mut [(usize, CompiledGraph, Vec<f32>)]) -> Vec<(u
             reset_route_counts();
             let _ = c.run(&[("x", x)]);
             let routes = route_counts();
-            let mut t = times[i].clone();
-            t.sort_by(|a, b| a.partial_cmp(b).expect("finite timings"));
             (
                 *m,
                 Measured {
-                    min_ms: t[0],
-                    median_ms: t[t.len() / 2],
+                    min_ms: times[i].iter().cloned().fold(f64::MAX, f64::min),
+                    median_ms: common::median(&times[i]),
                     routes,
                 },
             )
@@ -230,7 +186,7 @@ fn measure_round_robin(cells: &mut [(usize, CompiledGraph, Vec<f32>)]) -> Vec<(u
 /// Measure one scheme's weight at the widest served shape and assert each cell's
 /// route census, then its parity against the per-row path at 4 rows.
 fn measure_scheme(scheme: &Scheme, k: usize, n: usize, ms: &[usize]) {
-    let packed = packed_bytes(scheme, k, n);
+    let packed = common::packed_gguf_weight(scheme.quant, k, n);
     let mut cells: Vec<(usize, CompiledGraph, Vec<f32>)> = ms
         .iter()
         .map(|&m| {
@@ -309,6 +265,13 @@ fn measure_scheme(scheme: &Scheme, k: usize, n: usize, ms: &[usize]) {
         "{} (`{}`) grouped m=4 vs per-row m=1 at k={k} n={n}: max_abs={worst:e} \
          (per-row |y|max={scale:e})",
         scheme.quant, scheme.entry
+    );
+    // The bound below is absolute, so a degenerate reference would satisfy it
+    // vacuously — the same guard `gguf_gemm_parked_weight.rs` carries.
+    assert!(
+        scale > 1.0,
+        "{}: per-row reference is degenerate ({scale:e})",
+        scheme.quant
     );
     assert!(
         worst <= 1e-2,

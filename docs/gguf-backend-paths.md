@@ -90,7 +90,7 @@ once per device context on Metal/CUDA/ROCm/WGPU.
 | **CPU** | — | block-wise fused matmul in `rlx-cpu::gguf_matmul` | — | always available |
 | **Metal** | `dequant_gguf.msl` → MPS sgemm | Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M | MIL `mul`+`sub` for K/IQ/TQ/MX (see ANE) | `RLX_METAL_DEQUANT_GPU_DISABLE=1` |
 | **CUDA / ROCm** | `dequant_gguf.cu` → BLAS | — | — | same disable pattern |
-| **WGPU** | `select_path` ladder: fused windowed kernels (`dequant_gemv_gguf` at one row, `dequant_gemm_gguf` / `dequant_gemm_q1_0` above), else `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | Q4_K, Q6_K at `m == 1` (one workgroup per two output columns, its lanes splitting each column's contraction); Q1_0 (one thread per column at `m == 1`, a tiled GEMM above). At `m > 1` Q4_K/Q6_K **and Q8_0** take the row-grouped GEMM | — | `gguf_host` for a sharded arena, a parked weight, or a refused slab |
+| **WGPU** | `select_path` ladder: fused windowed kernels (`dequant_gemv_gguf` at one row, `dequant_gemm_gguf` / `dequant_gemm_q1_0` above), else `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | Q4_K, Q6_K at `m == 1` (one workgroup per two output columns, its lanes splitting each column's contraction); Q1_0 (one thread per column at `m == 1`, a tiled GEMM above). At `m > 1` Q4_K/Q6_K **and Q8_0** take the row-grouped GEMM, its Q4_K entry splitting a starved dispatch's columns across two threads each | — | `gguf_host` for a sharded arena, a parked weight, or a refused slab |
 | **ANE (CoreML)** | hybrid host segments | — | MIL `mul` + optional `sub` | `RLX_COREML_HOST_DEQUANT=1` |
 | **TPU** | — | — | — | host dequant at HLO emit (`Constant`, `quant_param_bindings`, or runtime `set_param_typed` on deferred Param) |
 | **MLX** | Q1_0 on-device (`dequant_q1_0.metal`); other GGUF host dequant + cache | — | — | `RLX_MLX_GGUF_HOST_FALLBACK=1` / `RLX_MLX_Q1_HOST=1` |
@@ -192,18 +192,27 @@ Otherwise Q4_1+ fall through with wrong block stride.
      X read needs a window that lines up with a four-element group — true of every
      planned F32 activation, and a 4-byte-aligned view of one takes the host path
      instead of being read misaligned.
-   - `dequant_gemm_gguf.wgsl` above one row: the row-grouped GEMM, one entry
-     point per scheme — Q4_K (`dequant_gemm_q4k`), Q6_K (`dequant_gemm_q6k`),
-     Q8_0 (`dequant_gemm_q8_0`) — reads each packed weight tile once per group of
-     8 rows instead of once per row. Q1_0's multi-row call takes its own tiled
-     GEMM (`dequant_gemm_q1_0.wgsl`). The arm is picked by scheme rather than by
-     row count, so when that grouped GEMM cannot encode a call (rows spread over
-     shards, an X window over the binding limit) a scheme with a one-row arm
-     falls back to it, one row at a time, with the per-row weight reuse
+   - `dequant_gemm_gguf.wgsl` above one row: the row-grouped GEMM, one entry point
+     per scheme — Q4_K (`dequant_gemm_q4k`), Q6_K (`dequant_gemm_q6k`), Q8_0
+     (`dequant_gemm_q8_0`) — reads each packed weight tile's quant bytes once per
+     group of 8 rows instead of once per row. At a base dispatch of 32 workgroups
+     or fewer (`GROUPED_SPLIT_MAX_BASE_WORKGROUPS`, whose doc carries the measured
+     band, the reach and the base geometry's exposure) the Q4_K entry point takes a
+     split geometry instead: a workgroup covers half the columns with two threads
+     to each, splitting the contraction in half down the sub-block boundary — up to
+     twice the warps over the same packed quant bytes, its x grid at
+     `ceil(ncols / COLS)`, with each block's 16-byte header read by both halves and
+     the two halves' partial sums added in workgroup memory (the fold reusing the
+     staged activation tile, so the base geometry's own workgroup storage is
+     unchanged). The Q6_K and Q8_0 entries have no such arm. Q1_0's multi-row call
+     takes its own tiled GEMM (`dequant_gemm_q1_0.wgsl`). The arm is picked by scheme
+     rather than by row count, so when that grouped GEMM cannot encode a call (rows
+     spread over shards, an X window over the binding limit) a scheme with a one-row
+     arm falls back to it, one row at a time, with the per-row weight reuse
      unchanged, and Q8_0 — which has no one-row arm — falls to the scratch slab
-     below. Q8_0's own arm additionally needs `k % 256 == 0` (a whole number of
-     the staged activation tiles, i.e. eight of its 32-element blocks — its block
-     size is not the gate); no row cap applies at any of these entries.
+     below. Q8_0's own arm additionally needs `k % 256 == 0` (a whole number of the
+     staged activation tiles, i.e. eight of its 32-element blocks — its block size
+     is not the gate); no row cap applies at any of these entries.
 3. **Scratch fallback** (`ScratchArm`): the arena planner reserves
    `dequant_gguf_scratch_bytes(graph)` tail space; dispatch `dequant_gguf` then
    `matmul_bt` (or the grouped MoE GPU path below). This is Q8_0's route at one

@@ -134,6 +134,8 @@
 //! `before` sides in every run so far, which is the change's support — run-to-run
 //! evidence under a varying machine load, not an interleaved pair.
 
+mod common;
+
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
@@ -209,51 +211,15 @@ const FORMS: [Form; 4] = [
 const ROUNDS: usize = 5;
 const CALLS_PER_ROUND: usize = 3;
 
-/// One packed weight of `[n, k]` at the scheme's own block geometry, filled
-/// deterministically.
-///
-/// The bytes are laid out by hand rather than quantized from an f32 tensor: at
-/// the widest form the buffer is 243 MiB, so a `quantize` needs the f32 tensor
-/// (1.2 GiB, more than the packed form) and is most of the cell's cost, while
-/// this arm's time does not read the byte values — no branch and no indexed
-/// gather depends on them. What the fixture does have to guarantee is that the
-/// decode stays finite, which is the scale slots' job: `d` and `dmin` are
-/// written as finite f16 bit patterns (1.0 and 0.5) and the 6-bit and 8-bit
-/// scale fields cannot be non-finite whatever their bits. The finiteness census
-/// after the first call is what checks that, and the packed-byte assertion is
-/// what checks the geometry.
+/// The form's packed weight: the crate's shared fixture at this scheme's own block
+/// geometry, narrowed to the two schemes this arm has an entry point for — the
+/// shared fixture also accepts Q8_0, which has none.
 fn packed_weights(scheme: QuantScheme, k: usize, n: usize) -> Vec<u8> {
     assert!(
         matches!(scheme, QuantScheme::GgufQ4K | QuantScheme::GgufQ6K),
         "{scheme:?} has no one-row arm"
     );
-    let block_elems = scheme.gguf_block_size() as usize;
-    let block_bytes = scheme.gguf_block_bytes() as usize;
-    let blocks = k / block_elems * n;
-    let mut buf = vec![0u8; blocks * block_bytes];
-    // A shifted ramp rather than a statistic: the fill only has to be
-    // deterministic and varied, and no part of the arm branches on it.
-    let mut state = 0x1234_5678u32;
-    for word in buf.chunks_exact_mut(4) {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        word.copy_from_slice(&state.to_le_bytes());
-    }
-    for block in buf.chunks_exact_mut(block_bytes) {
-        if scheme == QuantScheme::GgufQ4K {
-            // d, dmin (f16), then the 12 bytes of 6-bit scales/mins: any bits
-            // here are a value in 0..63, so only the two f16 slots need writing.
-            block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // 1.0
-            block[2..4].copy_from_slice(&0x3800u16.to_le_bytes()); // 0.5
-        } else {
-            // ql (128 B), qh (64 B), 16 i8 scales, d (f16): any i8 is finite, so
-            // again only `d` and the scales are written.
-            block[192..208].fill(3);
-            block[208..210].copy_from_slice(&0x3C00u16.to_le_bytes()); // 1.0
-        }
-    }
-    buf
+    common::packed_gguf_weight(scheme, k, n)
 }
 
 /// The form's graph: `steps` packed multiplies, each over its own parameter and
@@ -279,13 +245,7 @@ fn form_graph(form: &Form, packed_bytes: usize) -> Graph {
 /// One call's steps share this row, so that the input-side term stays "one row
 /// requested once per output-unit workgroup per step" — see the module doc.
 fn input_row(k: usize) -> Vec<f32> {
-    (0..k).map(|i| ((i as f32) * 0.017).sin()).collect()
-}
-
-/// Median of a sorted copy; `ROUNDS` is odd so it is an element, not an average.
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).expect("finite times"));
-    v[v.len() / 2]
+    common::ramp(1, k, 0.017)
 }
 
 /// One form, built and dropped on its own — the module doc says why that is
@@ -351,7 +311,7 @@ fn measure(form: &Form, dev: &rlx_wgpu::device::WgpuDevice) {
         assert_eq!(
             non_finite, 0,
             "{}: step {s} produced {non_finite} non-finite values — the fixture's \
-             scale slots are not the finite patterns this cell writes",
+             scale slots are not the finite patterns it writes",
             form.label
         );
     }
@@ -389,17 +349,14 @@ fn measure(form: &Form, dev: &rlx_wgpu::device::WgpuDevice) {
         gemv_one_row_dispatches(&dev.device, gguf_scheme_id(form.scheme), form.k, form.n)
             .expect("the one-row arm's chunking rule answers for this scheme");
 
-    let mut per_call_ms = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
-        let start = rlx_runtime::Tick::now();
-        for _ in 0..CALLS_PER_ROUND {
-            let _ = c.run(&[("x", &x)]);
-        }
-        per_call_ms
-            .push(rlx_runtime::Tick::now().elapsed_ns(start) as f64 / CALLS_PER_ROUND as f64 / 1e6);
-    }
+    // The timed rounds: this form alone, built and dropped on its own (the module
+    // doc's "The four forms"), each round's figure the mean per call over its
+    // `CALLS_PER_ROUND` calls.
+    let per_call_ms = common::time_rounds(ROUNDS, CALLS_PER_ROUND, || {
+        let _ = c.run(&[("x", &x)]);
+    });
     let min_ms = per_call_ms.iter().cloned().fold(f64::MAX, f64::min);
-    let med_ms = median(per_call_ms.clone());
+    let med_ms = common::median(&per_call_ms);
     let max_ms = per_call_ms.iter().cloned().fold(0.0f64, f64::max);
     // The figure: one step's packed bytes over one step's share of the call.
     let rate = |call_ms: f64| {

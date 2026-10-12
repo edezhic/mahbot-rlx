@@ -15,8 +15,13 @@
 //! keeps the scratch route. For `m > 1` Q4_K / Q6_K / Q8_0 use the row-grouped
 //! GEMM (`encode_dequant_matmul_gguf_gemm_grouped`): one pass over each packed
 //! weight tile per group of 8 rows, instead of the per-row GEMV's one full pass
-//! over the weight per row. Older scratch+`matmul_bt` path still exists for
-//! schemes without a fused kernel, and for every shape those kernels refuse.
+//! over the weight per row. On a Q4_K chunk whose base dispatch would starve the
+//! GPU, that entry point covers half the columns per workgroup with two threads to
+//! each — the same quant bytes over up to twice the warps, every block's header
+//! read twice (`GROUPED_SPLIT_MAX_BASE_WORKGROUPS` carries the rule and its
+//! worth).
+//! Older scratch+`matmul_bt` path still exists for schemes without a fused
+//! kernel, and for every shape those kernels refuse.
 //!
 //! The one-row arm is picked by *scheme*, not by row count, so it also serves
 //! the per-row fallback the grouped GEMM declines (rows spread over shards, an
@@ -184,7 +189,9 @@ pub fn select_path(
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DequantMatmulRoute {
     /// Row-grouped fused GEMM: each packed weight tile is read once per group
-    /// of 8 rows (Q4_K / Q6_K / Q8_0, `m > 1`), no f32 scratch.
+    /// of 8 rows (Q4_K / Q6_K / Q8_0, `m > 1`), no f32 scratch — except that a
+    /// chunk the Q4_K entry point splits reads each block's 16-byte header twice,
+    /// its quant bytes still once.
     Grouped,
     /// One fused GEMV dispatch per output row (decode `m == 1`, or a fallback).
     PerRow,
@@ -902,7 +909,8 @@ pub fn encode_dequant_matmul_gguf_into(
 /// Fused decode/prefill path: `Y[m,n] = X[m,k] @ W^T` with packed GGUF `W`.
 ///
 /// * Q4_K / Q6_K / Q8_0 + `m > 1` → row-grouped tiled GEMM — one pass over each
-///   packed weight tile per group of 8 rows (unless X spans shards).
+///   packed weight tile per group of 8 rows (unless X spans shards); on a split
+///   chunk the Q4_K block headers are read twice, the quant bytes still once.
 /// * Q1_0 + `m > 1` → tiled GEMM (Metal `q1_0_mm_f32` parity) — one dispatch,
 ///   unless `RLX_WGPU_Q1_0_GEMM_DISABLE=1` or X spans shards.
 /// * Otherwise → per-row GEMV, encoded into one command buffer and submitted
@@ -1109,7 +1117,7 @@ fn gguf_max_bind(device: &wgpu::Device) -> u64 {
 }
 
 /// Packed-weight bytes that fit under `max_bind`: leaves room for the window's
-/// align-down base slack (< [`STORAGE_ALIGN`]) and its 16-byte round-up. Both
+/// align-down base slack (under [`STORAGE_ALIGN`]) and its 16-byte round-up. Both
 /// the row-grouped GEMM's column chunking and the per-row GEMV's own column
 /// chunking are sized from this, so they cannot drift apart.
 fn gguf_window_budget(max_bind: u64) -> u64 {
@@ -1141,7 +1149,12 @@ fn gemv_one_row_cols_per_chunk(row_bytes: u64, max_bind: u64, tiled: bool) -> us
 /// this shape — the per-row stride the encoders chunk by and the shaders index by
 /// (`col * nbk * block_bytes`), taken from the scheme's block geometry rather
 /// than restated.
-fn gguf_row_bytes(scheme_id: u32, k: usize) -> u64 {
+///
+/// Public for the measurement cells, which quote a tensor's packed bytes and
+/// compare a chunking budget against them ([`grouped_dispatch_cols`]) —
+/// `gemv_one_row_dispatches`'s reason. Nothing in the encoder calls it from
+/// outside this module.
+pub fn gguf_row_bytes(scheme_id: u32, k: usize) -> u64 {
     let scheme = scheme_from_id(scheme_id);
     let block_elems = scheme.gguf_block_size() as usize;
     let block_bytes = scheme.gguf_block_bytes() as usize;
@@ -1186,7 +1199,9 @@ const OUT_SLAB_CAP: u64 = 256 << 20;
 
 /// Threads in one workgroup of the row-grouped GEMM — the shader's `TG`, from
 /// which the dispatch geometry below is sized: a workgroup covers this many
-/// output columns, one thread each.
+/// output columns, one thread each, or [`GROUPED_SPLIT_COLS`] columns with two
+/// threads to each in the split geometry [`GROUPED_SPLIT_MAX_BASE_WORKGROUPS`]
+/// describes.
 const GROUPED_THREADS: u32 = 64;
 
 /// Rows one workgroup of the row-grouped GEMM covers — the shader's `TM`, the
@@ -1204,14 +1219,170 @@ const GROUPED_ROWS: u32 = 8;
 /// has to know (the route tests read it rather than restate its value).
 pub const GROUPED_STAGE_ELEMS: usize = 256;
 
+/// Columns one workgroup of the row-grouped GEMM covers with the split geometry
+/// on — the shader's `COLS`, half of [`GROUPED_THREADS`] because the two halves
+/// are its two k-lane groups (the shader's column and lane indexing assumes that
+/// pair, and `grouped_geometry_matches_the_shader` pins it). It sizes that
+/// geometry's x grid, and is tied to the shader's own const like the rest of this
+/// geometry.
+const GROUPED_SPLIT_COLS: u32 = 32;
+
+/// Workgroups in the **base** geometry's dispatch at or below which the Q4_K
+/// entry point runs the split geometry instead.
+///
+/// A dispatch of this kernel costs about the same whether it has 16 workgroups or
+/// 500, so a starved one leaves the device idle. What the split is worth there is
+/// the author's own **out-of-tree** raw-kernel A/B on one adapter (wgpu over Metal,
+/// M3 Pro) — one process, one set of buffers, the two geometries interleaved
+/// round-robin over the same packed bytes, three processes x two sweeps of 28
+/// shapes, the min of each arm's medians — and is to be re-taken on the adapter at
+/// hand rather than trusted: **-11% .. -27%** at or below this ceiling (m = 8 .. 24,
+/// 13 .. 32 base workgroups), growing with `k` (m = 13, n = 1024 is -12% at k = 1024
+/// and -27% at k = 6144); it still wins at 33 .. 52 base workgroups (-4% .. -21%),
+/// is a wash at 60 .. 64, and from 72 up loses (+2% .. +16%), where the base
+/// geometry already fills the GPU and the second warp per column gives nothing back
+/// while its second read of every block's 16-byte header, its second pass at the
+/// staged activations and its fold stay paid. The in-tree
+/// `tests/gguf_gemm_grouped_split_rate.rs` is not that A/B: it measures the geometry
+/// the encoder itself picks for each shape — one geometry per shape, printing that
+/// geometry, the bytes it reads and the per-shape times — and no split-versus-base
+/// pair.
+///
+/// It is a ceiling on the product of the grid's two dimensions rather than on
+/// either alone because a narrow `n` starves a dispatch exactly as a small `m` does
+/// (m = 100, n = 64 is 13 workgroups); [`grouped_chunk_geometry`] combines them.
+/// wgpu exposes no compute-thread-capacity limit to derive the cut from (the
+/// transition measured here sits between 52 and 72 workgroups, about three per core
+/// on an 18-core adapter), so this ceiling is a measurement rather than a
+/// derivation: a GPU that saturates earlier loses where this wins, a larger one
+/// could raise this const.
+///
+/// This arm's presence costs the base geometry **+0.9% .. +4.5%** over this module's
+/// pre-split kernel (same 28 shapes, six samples each, interleaved round-robin,
+/// against a positional control — the same two pipelines timed from other positions
+/// in the round-robin, averaging 0.05%). The same protocol reads +0.2% .. +3.5% on
+/// the untouched Q6_K entry point of this module, so this tree cannot separate that
+/// residue from the protocol's own spread: it is recorded as an exposure, not
+/// claimed to be zero.
+///
+/// The reach is per **chunk**, not per call: the geometry follows the chunk width,
+/// which follows the weight window — the adapter's binding budget and
+/// `RLX_WGPU_MAX_BIND_MB` — against the scheme's own row stride, so a smaller budget
+/// shortens the chunks and can move a form onto the split that the full-width
+/// dispatch leaves on the base geometry, and whether it does depends on the stride
+/// as well. One call can mix the two geometries between its chunks (its trailing
+/// chunk is the usual candidate). At `RLX_WGPU_MAX_BIND_MB=1` a Q4_K weight at
+/// k = 1024 is chunked 1819 columns to a dispatch, so the 13-row, n = 6144 form is
+/// three 1819-column chunks on the base geometry (a 29 x 2 = 58 base grid, above
+/// this ceiling) and a trailing 687-column one on the split (a 22 x 2 grid over the
+/// same rows); `grouped_split_reach_at_the_body_shapes` pins both widths' verdicts.
+///
+/// Chunking alone is value-neutral on this route (a chunk boundary decides which
+/// dispatch reads which columns, not the arithmetic), so a chunk that crosses the
+/// ceiling is where the route's last bits start to depend on the host and the
+/// environment — the chunk width, and so the adapter's binding budget and
+/// `RLX_WGPU_MAX_BIND_MB`: the fold adds a column's two half-`k` partials in a fixed
+/// order the base geometry has no equivalent of, so a split chunk and a base chunk of
+/// the same weight can round differently in the last bits (2.4414e-4 against 2.2888e-4
+/// for the two geometries, from the same out-of-tree A/B as the band and to be
+/// re-taken with it — no committed cell prints a split-versus-base pair — both far
+/// inside the route's tolerance) — the same graph can differ between two machines.
+/// There is no switch for it; the geometry is the encoder's own answer for the chunk
+/// width.
+///
+/// At the widths a model body's own forms are chunked at on this adapter (n = 1024
+/// and 6144, one chunk each) it reaches the 13-row body at n = 1024 — 16 x 2 = 32
+/// base workgroups — and neither that body's n = 6144 node (96 x 2 = 192) nor any
+/// of the 24-, 48-, 100- or 104-row ones, whose base grids are 48 workgroups and up.
+/// A **chunk** narrow enough to starve those grids reaches it at any row count: 640
+/// columns at 24 rows, 320 at 48, 128 at 100 and 104, and 2048 at 8 — each with a
+/// width past it pinned by `grouped_split_reach_at_the_body_shapes`. Moving this
+/// const moves which shapes take each geometry; re-taking the **band** needs the
+/// A/B the band came from, which compares the split arm against the pre-split kernel
+/// and so needs the arm compiled out — the in-tree file above re-measures the
+/// encoder's own choice at the new geometry instead.
+const GROUPED_SPLIT_MAX_BASE_WORKGROUPS: u32 = 32;
+
+/// The grid one dispatch of the row-grouped GEMM covers in its **base** geometry
+/// — `(x, y)` workgroups over a chunk of `n_chunk` columns and `m` rows. This is
+/// what the Q6_K and Q8_0 entry points dispatch at every shape, and what the
+/// Q4_K one dispatches wherever [`grouped_chunk_geometry`] does not put it on the
+/// split; that function is this plus the split decision, so the arithmetic has
+/// one spelling.
+pub fn grouped_base_geometry(m: usize, n_chunk: usize) -> (u32, u32) {
+    (
+        n_chunk.div_ceil(GROUPED_THREADS as usize) as u32,
+        m.div_ceil(GROUPED_ROWS as usize) as u32,
+    )
+}
+
+/// The row-grouped GEMM's dispatch for one chunk: `(x, y)` workgroups and whether
+/// the Q4_K entry point runs its `GROUPED_SPLIT_COLS` geometry over them. One
+/// function, so the grid the encoder dispatches and the flag it writes cannot
+/// drift apart, and so a test can read the encoder's own answer rather than
+/// restating the rule.
+pub fn grouped_chunk_geometry(scheme_id: u32, m: usize, n_chunk: usize) -> (u32, u32, bool) {
+    let (bx, by) = grouped_base_geometry(m, n_chunk);
+    // Q4_K only: the Q6_K and Q8_0 entry points have no split arm.
+    let split = scheme_id == 0 && bx as u64 * by as u64 <= GROUPED_SPLIT_MAX_BASE_WORKGROUPS as u64;
+    if split {
+        // The split's workgroup covers half the columns, so its x is
+        // `ceil(n_chunk / COLS)` where the base one is `ceil(n_chunk / TG)`.
+        let x = n_chunk.div_ceil(GROUPED_SPLIT_COLS as usize) as u32;
+        (x, by, true)
+    } else {
+        (bx, by, false)
+    }
+}
+
+/// Output columns one *dispatch* of the row-grouped GEMM covers from the two
+/// budgets that bind it: the bound weight window ([`gguf_window_budget`]) and the
+/// whole-bound output slab (`OUT_SLAB_CAP` against the device limit) — `m * ncols * 4`.
+/// The encoder chunks its column loop by this; [`grouped_dispatch_cols`] reports it.
+/// Three floors, for three different reasons: the trailing `.max(1)` keeps a row
+/// wider than the whole budget at one column per chunk, i.e. still progress;
+/// `m.max(1)` below keeps the division defined for [`grouped_dispatch_cols`], which
+/// is public and can be handed no rows even though the encoder declines those
+/// before it dispatches; and `row_bytes.max(1)` only keeps the other division
+/// defined, as in [`gemv_one_row_cols_per_chunk`].
+fn grouped_cols_per_chunk(row_bytes: u64, max_bind: u64, m: usize) -> usize {
+    let by_bind = gguf_window_budget(max_bind) / row_bytes.max(1);
+    let by_out = OUT_SLAB_CAP.min(max_bind).saturating_sub(16) / (m.max(1) as u64 * 4);
+    by_bind.min(by_out).max(1) as usize
+}
+
+/// The columns one *dispatch* of the row-grouped GEMM covers at this shape, from
+/// the device's own binding budget: the weight window and the output slab
+/// together (`grouped_cols_per_chunk` above), `m` and the per-row stride in.
+///
+/// Public for the split-rate measurement, which has to know whether its `n` is
+/// one chunk before it prints a whole-tensor geometry the encoder would not
+/// dispatch — [`gemv_one_row_dispatches`] is the same kind of reporting hook.
+/// `n` is not an argument: the caller compares this against it.
+pub fn grouped_dispatch_cols(device: &wgpu::Device, scheme_id: u32, m: usize, k: usize) -> usize {
+    grouped_cols_per_chunk(gguf_row_bytes(scheme_id, k), gguf_max_bind(device), m)
+}
+
 /// Fused multi-row GGUF packed-weight GEMM for Q4_K / Q6_K / Q8_0 into `enc` (no
 /// submit).
 ///
 /// One pass over each packed weight tile per group of `TM = 8` rows, instead of
-/// the per-row GEMV's one full pass over the whole weight per row. `n` is split
+/// the per-row GEMV's one full pass over the whole weight per row — its Q4_K entry
+/// point's split chunk excepted, where the quant bytes still pass once but each
+/// block's 16-byte header passes twice (the paragraph below). `n` is split
 /// into column chunks that fit `max_storage_buffer_binding_size` (and the
 /// weight buffer's shard), so a weight parked in [`Arena::weight_buffer`] — or
 /// one whose window is larger than the binding limit — still takes this path.
+///
+/// A chunk whose base dispatch would leave the GPU idle — at most
+/// [`GROUPED_SPLIT_MAX_BASE_WORKGROUPS`] workgroups of it, [`grouped_chunk_geometry`]
+/// being the rule — puts the Q4_K scheme on the split geometry instead: one
+/// workgroup covers [`GROUPED_SPLIT_COLS`] columns with two half-`k` threads each
+/// (its x grid is `ceil(ncols / GROUPED_SPLIT_COLS)`, its y untouched), so the
+/// dispatch has up to twice the warps over the same packed quant bytes, with a
+/// column's two half-`k` partial sums added in workgroup memory (one fixed order,
+/// no atomics) before the store. The flag rides in the params; the Q6_K and Q8_0
+/// entry points have no split arm and run the base geometry whatever it says.
 ///
 /// The output slab is `[m, ncols]` bound whole, so `ncols` is bounded by the
 /// binding limit *and* by [`OUT_SLAB_CAP`] — what keeps the wide-`n`,
@@ -1312,13 +1483,14 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
 
     // Columns per chunk, from both budgets: the bound weight window and the
     // whole-bound output slab (m * ncols * 4). Bounding the slab rather than
-    // only the weight is what keeps a wide-n, large-m head inside the limit.
+    // only the weight is what keeps a wide-n, large-m head inside the limit. The
+    // rule is [`grouped_cols_per_chunk`]'s, which the split-rate measurement also
+    // reads through [`grouped_dispatch_cols`], so a shape this encoder dispatches
+    // whole is one that cell prints as one chunk.
     if (m as u64) * 4 > max_bind {
         return false; // no column chunk's slab could be bound
     }
-    let by_bind = (gguf_window_budget(max_bind) / row_bytes.max(1)).max(1);
-    let by_out = (OUT_SLAB_CAP.min(max_bind).saturating_sub(16) / (m as u64 * 4)).max(1);
-    let n_chunk_max = (n as u64).min(by_bind).min(by_out).max(1) as usize;
+    let n_chunk_max = grouped_cols_per_chunk(row_bytes, max_bind, m).min(n);
 
     // Slab bytes for one chunk: `m * ncols * 4` out of the pooled output buffer,
     // which is process-global and only grows. It is scratch the arena plan does
@@ -1355,14 +1527,14 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
             // `write_buffer` rejects an unaligned copy), so the two comparisons
             // agree — and a row size that is not a multiple of 4 (Q6_K rows are
             // 210·B bytes) can never make a window that fits look like one that
-            // does not. `by_bind` sizes `n_chunk` inside the same budget, so only
-            // a first chunk whose row is wider than the whole budget — which no
-            // chunking here or in the per-row GEMV can fix — declines here, before
-            // anything is encoded; every later chunk reads less than the first and
-            // ends inside the weight region, so none of them can bail. (A parked
-            // weight never spans buffers: `from_plan_split` spills any single
-            // weight that does not fit one weight buffer into the act arena, so
-            // `resolve_w` yields the whole weight region.)
+            // does not. `grouped_cols_per_chunk` sizes `n_chunk` inside that same
+            // budget, so only a first chunk whose row is wider than the whole budget
+            // — which no chunking here or in the per-row GEMV can fix — declines
+            // here, before anything is encoded; every later chunk reads less than
+            // the first and ends inside the weight region, so none of them can bail.
+            // (A parked weight never spans buffers: `from_plan_split` spills any
+            // single weight that does not fit one weight buffer into the act arena,
+            // so `resolve_w` yields the whole weight region.)
             let need = (w0 - w_base) + n_chunk as u64 * row_bytes;
             if need > max_bind.min(w_buf_size.saturating_sub(w_base)) {
                 ok = false;
@@ -1370,15 +1542,20 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
             }
             let w_size = need.div_ceil(4) * 4;
 
+            // The grid this chunk dispatches, and whether the Q4_K entry point
+            // runs the split geometry over it — the encoder's one answer to both
+            // ([`grouped_chunk_geometry`]).
+            let (x_groups, y_groups, split) = grouped_chunk_geometry(scheme_id, m, n_chunk);
+
             let p = DequantGemmGgufParams {
                 m: m as u32,
                 k: k as u32,
                 ncols: n_chunk as u32,
                 x_vec4_off,
                 w_byte_off: (w0 - w_base) as u32,
+                split: split as u32,
                 _p0: 0,
                 _p1: 0,
-                _p2: 0,
             };
             let u = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rlx-wgpu dequant_gemm_gguf uniform"),
@@ -1433,11 +1610,7 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
                 });
                 pass.set_pipeline(&dk.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.dispatch_workgroups(
-                    (n_chunk as u32).div_ceil(GROUPED_THREADS),
-                    (m as u32).div_ceil(GROUPED_ROWS),
-                    1,
-                );
+                pass.dispatch_workgroups(x_groups, y_groups, 1);
             }
 
             // Slab rows are [m, n_chunk]; this chunk owns arena columns
@@ -1772,17 +1945,20 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
 #[cfg(test)]
 mod tests {
     use super::{
-        GEMV_TILED_COLS_PER_WG, GEMV_TILED_THREADS, GROUPED_ROWS, GROUPED_STAGE_ELEMS,
-        GROUPED_THREADS,
+        GEMV_TILED_COLS_PER_WG, GEMV_TILED_THREADS, GROUPED_ROWS, GROUPED_SPLIT_COLS,
+        GROUPED_STAGE_ELEMS, GROUPED_THREADS, gguf_row_bytes, grouped_chunk_geometry,
+        grouped_cols_per_chunk,
     };
 
     /// The row-grouped GEMM's geometry is written twice — `GROUPED_THREADS` /
-    /// `GROUPED_ROWS` size the dispatch, `GROUPED_STAGE_ELEMS` the `k` gate — and
-    /// the shader declares its own `@workgroup_size` plus its `TG` / `TM` /
-    /// `BLK_ELEMS` consts, so read the shader here and tie the two. A lone edit of
-    /// any one of them would otherwise describe a kernel that no longer runs:
-    /// `TG` drives `col = wid.x * TG + tid` and the staging stride, `TM` the rows a
-    /// pass over the weight covers, `BLK_ELEMS` the tile the barriers fall at.
+    /// `GROUPED_ROWS` size the dispatch, `GROUPED_STAGE_ELEMS` the `k` gate,
+    /// `GROUPED_SPLIT_COLS` the split one — and the shader declares its own
+    /// `@workgroup_size` plus its `TG` / `TM` / `BLK_ELEMS` / `COLS` consts, so
+    /// read the shader here and tie the two. A lone edit of any one of them would
+    /// otherwise describe a kernel that no longer runs: `TG` drives
+    /// `col = wid.x * TG + tid` and the staging stride, `TM` the rows a pass over
+    /// the weight covers, `BLK_ELEMS` the tile the barriers fall at, `COLS` the
+    /// columns a split workgroup covers.
     #[test]
     fn grouped_geometry_matches_the_shader() {
         let wgsl = crate::kernels::DEQUANT_GEMM_GGUF_WGSL;
@@ -1799,9 +1975,118 @@ mod tests {
             format!("const TG: u32 = {GROUPED_THREADS}u;"),
             format!("const TM: u32 = {GROUPED_ROWS}u;"),
             format!("const BLK_ELEMS: u32 = {GROUPED_STAGE_ELEMS}u;"),
+            format!("const COLS: u32 = {GROUPED_SPLIT_COLS}u;"),
         ] {
             assert!(wgsl.contains(&want), "expected `{want}` in the shader");
         }
+        // The split entry point's indexing reads exactly two k-lane groups out of
+        // a workgroup (`sl = tid / COLS` into two halves whose slices are
+        // `sl * 128` and `sl * 64` of a block), so `COLS` being half of `TG` is
+        // what makes `sl` the set {0, 1}. Moving either const on its own — and both
+        // spellings with it — would let `sl` reach 2 and read a column's slice out
+        // of another column's half, silently, which no other assertion here sees.
+        assert_eq!(
+            GROUPED_SPLIT_COLS * 2,
+            GROUPED_THREADS,
+            "the split geometry is two k-lane groups of a workgroup, so COLS must be TG / 2"
+        );
+        // The split's fold writes its partials into the staged tile's own first
+        // `COLS * (TM + 1)` slots (`xs`'s first `TM * (BLK_ELEMS / 4)`) rather than
+        // into an array of its own, so the tile has to be at least that big: an `xs`
+        // index past its length is clamped by WGSL, which would drop a column's
+        // partial sum silently instead of failing, and the assert above makes a
+        // coordinated move of COLS and TG the natural way to reach that.
+        let xs_slots = GROUPED_ROWS * (GROUPED_STAGE_ELEMS as u32 / 4);
+        assert!(
+            GROUPED_SPLIT_COLS * (GROUPED_ROWS + 1) <= xs_slots,
+            "the split's fold needs COLS * (TM + 1) = {} of the staged tile's {xs_slots} slots",
+            GROUPED_SPLIT_COLS * (GROUPED_ROWS + 1)
+        );
+    }
+
+    /// Which shapes the Q4_K entry point's split geometry reaches: the rule is the
+    /// product of the base grid's two dimensions against
+    /// [`GROUPED_SPLIT_MAX_BASE_WORKGROUPS`], so a narrow `n` reaches it exactly as
+    /// a small `m` does, and the row counts a model body's forms have reach it at
+    /// very different widths — n <= 1024 at 13 rows, n <= 640 at 24, n <= 128 at
+    /// 100. Those verdicts are pinned here; a change to the ceiling, to `TG` or to
+    /// `TM` has to move them with it.
+    #[test]
+    fn grouped_split_reach_at_the_body_shapes() {
+        // (scheme_id, m, n, split): 0 Q4_K, 2 Q6_K, 20 Q8_0.
+        for &(scheme_id, m, n, split) in &[
+            // The 13-row body at the two widths its forms are chunked at: 16 x 2 =
+            // 32 workgroups at n = 1024, 96 x 2 = 192 at n = 6144.
+            (0u32, 13usize, 1024usize, true),
+            (0, 13, 1920, false),
+            (0, 13, 6144, false),
+            // The 24-row body: 10 x 3 = 30 at n = 640, 16 x 3 = 48 at n = 1024.
+            (0, 24, 640, true),
+            (0, 24, 1024, false),
+            // Wider bodies are reached by a narrow chunk alone: 10 x 6 = 60 at 48
+            // rows / 640, 2 x 13 = 26 at 100 rows / 128, 1 x 13 = 13 at 100 rows /
+            // 64, 4 x 13 = 52 at 100 rows / 256, 32 x 1 = 32 at 8 rows / 2048. The
+            // chunk widths the const's doc names, and the far side of each of their
+            // boundaries.
+            (0, 48, 640, false),
+            (0, 48, 320, true),
+            (0, 48, 384, false),
+            (0, 8, 2048, true),
+            (0, 8, 2112, false),
+            (0, 100, 64, true),
+            (0, 100, 128, true),
+            (0, 100, 256, false),
+            (0, 100, 1024, false),
+            (0, 104, 1024, false),
+            (0, 104, 128, true),
+            // Q6_K and Q8_0 have no split arm: their entry points run the base
+            // geometry whatever this says.
+            (2, 13, 1024, false),
+            (20, 13, 1024, false),
+        ] {
+            let (x, y, split_taken) = grouped_chunk_geometry(scheme_id, m, n);
+            assert_eq!(
+                split_taken, split,
+                "scheme {scheme_id} m={m} n={n} dispatched as {x} x {y} workgroups"
+            );
+        }
+        // Two grids written out rather than re-derived from the helper: under the
+        // split a workgroup covers `GROUPED_SPLIT_COLS` columns, so its x is twice
+        // the base geometry's, or one workgroup short of twice where the chunk's
+        // last thread group is half-full or less — n = 65 is 2 column groups base
+        // and 3 split, not 4.
+        assert_eq!(grouped_chunk_geometry(0, 13, 1024), (32, 2, true));
+        assert_eq!(grouped_chunk_geometry(0, 13, 6144), (96, 2, false));
+        assert_eq!(grouped_chunk_geometry(0, 8, 65), (3, 1, true));
+        // The mixed call the ceiling const's doc records, derived here through the
+        // encoder's own rule rather than restated: the 1819 columns one dispatch of
+        // a Q4_K weight at k = 1024 covers under a 1 MiB binding cap
+        // (`grouped_cols_per_chunk` at that budget against this scheme's 576-byte
+        // row stride), then the verdicts for the 13-row, n = 6144 form's three
+        // chunks of it and its trailing 687-column chunk.
+        let chunk = grouped_cols_per_chunk(gguf_row_bytes(0, 1024), 1024 * 1024, 13);
+        assert_eq!(chunk, 1819, "the 1 MiB cap's chunk width at k = 1024");
+        assert_eq!(grouped_chunk_geometry(0, 13, chunk), (29, 2, false));
+        assert_eq!(
+            grouped_chunk_geometry(0, 13, 6144 - 3 * chunk),
+            (22, 2, true)
+        );
+        // The split arm's committed numeric coverage, named because lowering this
+        // ceiling is what would take a cell out of it: `gguf_dequant_matmul_prefill_parity.rs`'s
+        // Gemma cell (m = 5, n = 1536, k = 12288 — 48 blocks of 256) is the one
+        // prefill-parity cell that runs the split across many blocks, its
+        // m = 5 / n = 100 cell covers the narrowest partial column tile (4 real
+        // columns of its 32; the m = 4 / n = 8 cell above already covers 8 of 32),
+        // its m = 104 / n = 128 cell is the one that folds 13 row groups, and
+        // `dequant_plan_relaxed.rs`'s two projections cover both block-count cases
+        // (n = 256 over k = 512 is the two-block one; the n = 512 projection
+        // contracts over k = 256, a single block). The `48` asserted below is that
+        // first cell's x grid — 1536 / COLS — not its block count.
+        assert_eq!(grouped_chunk_geometry(0, 5, 1536), (48, 1, true));
+        assert_eq!(grouped_chunk_geometry(0, 5, 100), (4, 1, true));
+        assert_eq!(grouped_chunk_geometry(0, 104, 128), (4, 13, true));
+        assert_eq!(grouped_chunk_geometry(0, 8, 256), (8, 1, true));
+        assert_eq!(grouped_chunk_geometry(0, 8, 512), (16, 1, true));
     }
 
     /// The tiled one-row arm's geometry is written twice the same way: the

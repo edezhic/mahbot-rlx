@@ -1545,8 +1545,11 @@ pub struct DequantGemmQ10Params {
 /// Layout for the fused multi-row K-quant GEMM (`dequant_gemm_gguf.wgsl`).
 /// 32 bytes. `m` is the full row count (the out slab is `[m, ncols]`);
 /// `ncols` is only this dispatch's column chunk, and the weight window starts
-/// at column 0 of that chunk. The last three words are padding: a uniform
-/// binding size must be a multiple of 16 bytes.
+/// at column 0 of that chunk. `split` is 1 when the encoder put the Q4_K entry
+/// point on its split geometry (see `gguf_gpu.rs`'s
+/// `GROUPED_SPLIT_MAX_BASE_WORKGROUPS`), 0 for the base one; the Q6_K and Q8_0
+/// entries ignore it. The last two words are padding: a uniform binding size
+/// must be a multiple of 16 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct DequantGemmGgufParams {
@@ -1555,9 +1558,9 @@ pub struct DequantGemmGgufParams {
     pub ncols: u32,
     pub x_vec4_off: u32,
     pub w_byte_off: u32,
+    pub split: u32,
     pub _p0: u32,
     pub _p1: u32,
-    pub _p2: u32,
 }
 
 /// Layout for DequantMatMul. 48 bytes.
@@ -4173,7 +4176,10 @@ pub fn dequant_gemm_q1_0_kernel(device: &wgpu::Device) -> &'static Kernel {
         )
     })
 }
-/// Multi-row Q4_K GEMM (`m > 1`): one thread per column covers 8 rows.
+/// Multi-row Q4_K GEMM (`m > 1`): one thread per column covers 8 rows, or —
+/// when the encoder puts the dispatch on the split geometry, because it would
+/// otherwise be too small to fill the GPU — half a column's contraction each,
+/// two threads to a column.
 pub fn dequant_gemm_q4k_kernel(device: &wgpu::Device) -> &'static Kernel {
     DEQUANT_GEMM_Q4K.get_or_init(|| {
         build_kernel_ro_u_ro_rw(

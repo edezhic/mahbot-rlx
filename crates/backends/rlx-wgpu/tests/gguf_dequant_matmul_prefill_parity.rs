@@ -9,13 +9,13 @@
 //! in-process repeat.
 //!
 //! wgpu's change point is `m == 1` vs `m > 1`: Q4_K / Q6_K decode with one fused
-//! per-row GEMV and prefill with a row-grouped GEMM (8 rows/tile, one weight read
-//! per tile), and Q8_0 — which has no GEMV arm at all — takes that same row-grouped
-//! GEMM above one row, at a `k` that is a whole number of its staged activation
-//! tiles. Q5_K has NO fused route: it always dequantizes into an in-arena f32
-//! scratch and runs `matmul_bt`, so there is no change point for it to measure,
-//! and Q8_0 takes that same slab at one row and at every `k` its GEMM cannot
-//! stage.
+//! per-row GEMV and prefill with a row-grouped GEMM (8 rows/tile, one pass over each
+//! tile's quant bytes; a chunk the Q4_K entry point splits reads each block's
+//! 16-byte header twice), and Q8_0 — which has no GEMV arm at all — takes that same
+//! row-grouped GEMM above one row, at a `k` that is a whole number of its staged
+//! activation tiles. Q5_K has NO fused route: it always dequantizes into an in-arena
+//! f32 scratch and runs `matmul_bt`, so there is no change point for it to measure,
+//! and Q8_0 takes that same slab at one row and at every `k` its GEMM cannot stage.
 //!
 //! wgpu DOES expose an authoritative route signal —
 //! `rlx_wgpu::gguf_gpu::route_counts()` — but it is process-global, so the
@@ -297,10 +297,12 @@ fn wgpu_has_fused_route(scheme: QuantScheme) -> bool {
 /// The fused decode route: one GEMV dispatch per output row, no f32 scratch.
 const ROUTE_PER_ROW: &str = "per-row GEMV (fused, no scratch)";
 /// The fused prefill route: one pass over each packed weight tile per 8 output
-/// rows, no f32 scratch. Q4_K / Q6_K have it at `m > 1`; Q8_0 has it at `m > 1`
-/// and a staged-tile-aligned `k`, and nothing else (it has no GEMV arm).
-const ROUTE_GROUPED: &str =
-    "row-grouped fused GEMM (8 rows/tile, one weight read per tile, no scratch)";
+/// rows, no f32 scratch — a chunk the Q4_K entry point splits reading each block's
+/// 16-byte header twice, its quant bytes still once. Q4_K / Q6_K have it at `m > 1`;
+/// Q8_0 has it at `m > 1` and a staged-tile-aligned `k`, and nothing else (it has no
+/// GEMV arm).
+const ROUTE_GROUPED: &str = "row-grouped fused GEMM (8 rows/tile, one weight read per tile of \
+     quant bytes, no scratch; a split Q4_K chunk reads each block's header twice)";
 /// The route Q5_K has at every `m`, and Q8_0's at one row and for a `k` its GEMM
 /// cannot stage: device dequant into the in-arena f32 scratch, then `matmul_bt`.
 /// The lowerer substitutes a whole-op host D2H+H2D staging when no slab was
@@ -727,6 +729,31 @@ fn wgpu_gguf_dequant_matmul_prefill_matches_cpu() {
             5,
             12288,
             1536,
+            1e-2,
+        ),
+        // A narrow partial column tile under the split geometry: m=5 / n=100 put
+        // the Q4_K entry on the split (2 base workgroups) with an x grid of
+        // ceil(100 / COLS) = 4, so the last workgroup holds 4 real columns of its
+        // 32 and its other threads clamp their weight column — the narrowest
+        // partial tile here, the m=4 / n=8 cell above already covering 8 of 32.
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            5,
+            256,
+            100,
+            1e-2,
+        ),
+        // The split geometry's row groups: m=104 / n=128 is a 2 x 13 = 26 base
+        // workgroup dispatch, so the Q4_K entry takes the split and each of the 13
+        // row groups folds its own column partials. The split cells above stop at
+        // 3 row groups.
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            104,
+            512,
+            128,
             1e-2,
         ),
         // Gemma 3 270M unsloth GGUF: q/k Q5_0, v Q8_0 (hidden=640).

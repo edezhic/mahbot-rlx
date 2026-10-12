@@ -4040,7 +4040,8 @@ impl WgpuExecutable {
                     //   joined one-row arm
                     //   ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`]).
                     // - Q4_K / Q6_K + m>1: row-grouped GEMM (one pass over each
-                    //   packed weight tile per group of rows) inside gemv_rows;
+                    //   packed weight tile per group of rows; a split Q4_K chunk
+                    //   reads each block's 16-byte header twice) inside gemv_rows;
                     //   that path N-chunks the weight window itself, so a weight
                     //   parked in the weight buffer or wider than the binding
                     //   limit still takes it.

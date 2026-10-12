@@ -372,8 +372,9 @@ fn dequant_matmul_q4k_metal_matches_cpu() {
 /// no f32 scratch) for the two schemes Llama Q4_K_M uses — one workgroup per
 /// two output columns, the workgroup's lanes splitting each column's
 /// contraction. Multi-row `m > 1` Q4_K / Q6_K takes the row-grouped
-/// `dequant_gemm_gguf` kernels instead (one pass over each packed weight tile
-/// per group of 8 rows); this targets the m=1 decode GEMV.
+/// `dequant_gemm_gguf` kernels instead (one pass over each packed weight tile's
+/// quant bytes per group of 8 rows — a chunk the Q4_K entry point splits reads
+/// each block's 16-byte header twice); this targets the m=1 decode GEMV.
 #[cfg(feature = "gpu")]
 fn run_gguf_gemv_case(scheme: QuantScheme, k: usize, n: usize) {
     use half::f16;
