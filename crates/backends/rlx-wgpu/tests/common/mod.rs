@@ -6,8 +6,9 @@
 //! loops ([`time_rounds`], one cell alone, and [`time_round_robin`], round-robin
 //! across a cell set) that the three harnesses using them — `gguf_one_row_stream_rate`,
 //! `gguf_gemm_grouped_weight_reuse` and `gguf_gemm_grouped_split_rate` — time their
-//! calls with, plus the parity helpers at the end of the file. `tests/common/` is not
-//! a test target of its own; each test binary pulls it in with `mod common;`.
+//! calls with, plus the parity helpers and the pins' own refusal at the end of the
+//! file. `tests/common/` is not a test target of its own; each test binary pulls it
+//! in with `mod common;`.
 
 // Each test binary declaring `mod common;` uses only the helpers it needs, so
 // the rest are dead code in that binary and `just lint` runs with `-D warnings`.
@@ -163,4 +164,19 @@ pub fn legalised_step_names(g: &rlx_ir::Graph) -> Vec<&'static str> {
     use rlx_opt::pass::Pass as _;
     let legalised = rlx_opt::LegalizeBroadcast.run(g.clone());
     rlx_wgpu::backend::WgpuExecutable::compile(legalised).test_step_names()
+}
+
+/// The run report's switch, spelled in one place: a pin whose figures the report's
+/// own fence would move names it by this, and this is what the pins refuse on.
+pub const RUN_REPORT_SWITCH: &str = "RLX_WGPU_DBG_COUNTERS";
+
+/// Refuse when the run report's switch is set: a reporting run adds a fence, a
+/// resolve submit and a map of its own, so the submission/wait counts and the
+/// rates a pin measures under it are not that pin's.
+pub fn refuse_under_run_report() {
+    assert!(
+        !rlx_ir::env::flag(RUN_REPORT_SWITCH),
+        "RLX_WGPU_DBG_COUNTERS changes the submission/wait shape of a forward pass; \
+         unset it to run this pin"
+    );
 }

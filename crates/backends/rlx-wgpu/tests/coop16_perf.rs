@@ -4,6 +4,10 @@
 
 //! Micro-bench: time matmul_coop16 vs matmul.wgsl on a BERT-shape matmul.
 //! Answers the question "is coop_mat8x8 actually faster?"
+//!
+//! No `refuse_under_run_report()` here, and none needed: this harness never calls
+//! `WgpuExecutable::run` — it encodes its own dispatches and times `queue.submit`
+//! directly — so the run report cannot be active inside these figures.
 
 #![cfg(target_os = "macos")]
 

@@ -404,6 +404,7 @@ fn one_row_packed_stream_rate() {
         eprintln!("skip: wgpu unavailable");
         return;
     }
+    common::refuse_under_run_report();
     let Some(dev) = wgpu_device() else {
         eprintln!("skip: wgpu unavailable");
         return;

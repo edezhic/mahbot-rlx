@@ -86,7 +86,7 @@
 
 mod common;
 
-use common::max_abs_diff;
+use common::{RUN_REPORT_SWITCH, max_abs_diff};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, GraphExt, Op, Shape};
 use rlx_runtime::{Device, Session};
@@ -360,7 +360,7 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
     // supports — it selects the unjoined expectation. `RLX_WGPU_CONCAT_HOST`,
     // `RLX_WGPU_FORCE_HOST`, `RLX_WGPU_HOST_BUFFER_COPY` and
     // `RLX_WGPU_MAX_BIND_MB` are set and unset inside their own brackets, below.
-    const GUARDED: [&str; 12] = [
+    const GUARDED: [&str; 13] = [
         "RLX_WGPU_SNAPSHOT",
         "RLX_BENCH_DISPATCH_ONLY",
         "RLX_WGPU_ALL_PARAMS_WEIGHT",
@@ -373,6 +373,7 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
         "RLX_WGPU_DISCRETE_HOST",
         "RLX_WGPU_SHARD_GPU",
         "RLX_WGPU_ALLOW_SHARD",
+        RUN_REPORT_SWITCH,
     ];
     for key in GUARDED {
         assert!(

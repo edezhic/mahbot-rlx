@@ -32,6 +32,8 @@
 //! `backend::step::tests::no_packed_multiply_step_is_deferred_to_the_host_tail`,
 //! not on a run.
 
+mod common;
+
 use rlx_compile::memory::{GuardedPlanner, plan_memory_with_dequant_guard};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, GraphExt, NodeId, Op, Shape};
@@ -301,6 +303,7 @@ fn the_relaxed_plan_runs_both_arena_routes_and_matches_cpu() {
         eprintln!("skip: wgpu unavailable");
         return;
     }
+    common::refuse_under_run_report();
 
     // Pin every knob this test depends on, *before* the first compile: an exported
     // environment a developer has set would otherwise move the plan figures below,

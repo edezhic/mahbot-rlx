@@ -687,11 +687,14 @@ impl WgpuExecutable {
     }
 
     pub(crate) fn run_inner(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        let mut report = RunReport::start(self.in_snapshot);
         // Lazy compile path: if we deferred compile waiting for shapes,
         // infer the binding from input data lengths now and compile.
         if self.unresolved.is_some() {
+            report.open(Phase::Compile, 0, &self.schedule);
             self.lazy_compile_for_inputs(inputs);
         }
+        report.open(Phase::Stage, 0, &self.schedule);
         let dev = wgpu_device().expect("rlx-wgpu: device gone");
         self.stage_gpu_handle_inputs(dev, inputs);
         // Always re-stage graph inputs. Arena liveness reuse may overwrite
@@ -780,6 +783,7 @@ impl WgpuExecutable {
                     let usz = self.uniforms.get(gpu_ui).map(|u| u.size()).unwrap_or(0);
                     eprintln!("[wgpu-uni gpu_ui={gpu_ui} ubuf={usz}B] {}", step_name(step));
                 }
+                report.note_step(step);
                 match step {
                     Step::CastF32ToF16 { .. } => {
                         // Params are static for this step (offset+len), so the
@@ -1579,6 +1583,7 @@ impl WgpuExecutable {
                 && step_i < self.schedule.len()
                 && self.step_breaks_batch(step_i, &scale, one_op_per_pass, &host_cache, dev);
             if !starting_on_host {
+                report.open(Phase::Encode, step_i, &self.schedule);
                 let mut enc = match pending_enc.take() {
                     Some(enc) => enc,
                     None => {
@@ -1590,10 +1595,7 @@ impl WgpuExecutable {
                     }
                 };
                 {
-                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("rlx-wgpu compute pass"),
-                        timestamp_writes: None,
-                    });
+                    let mut pass = report.begin_pass(&mut enc);
                     while step_i < self.schedule.len() {
                         if step_is_tail_host(&self.schedule[step_i]) {
                             step_i += 1;
@@ -3687,8 +3689,10 @@ impl WgpuExecutable {
                         let map_rx = schedule_readback_map(&mut enc, tiny.buffer(), &layout);
                         crate::backend::note_device_submit();
                         let sub = dev.queue.submit(std::iter::once(enc.finish()));
+                        report.open(Phase::Wait, step_i, &self.schedule);
                         wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
                         map_rx.recv().unwrap().unwrap();
+                        report.open(Phase::Readback, step_i, &self.schedule);
                         self.debug_scans_after_run(dev);
                         // Decode before arming: `tiny` borrows `self` immutably and the
                         // borrow must end before `arm_static_once` takes it mutably.
@@ -3717,10 +3721,13 @@ impl WgpuExecutable {
                 crate::backend::note_device_submit();
                 let main_submission = dev.queue.submit(std::iter::once(enc.finish()));
                 if defer_tail {
+                    report.open(Phase::Wait, step_i, &self.schedule);
                     crate::backend::note_device_wait();
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                    report.open(Phase::Host, step_i, &self.schedule);
                     self.run_tail_host_audio_ops(dev);
                     if !skip_readback {
+                        report.open(Phase::Readback, step_i, &self.schedule);
                         let mut rb_enc =
                             dev.device
                                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3785,6 +3792,7 @@ impl WgpuExecutable {
                     }
                 }
                 if needs_f16_drain {
+                    report.open(Phase::Wait, step_i, &self.schedule);
                     crate::backend::note_device_wait();
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                 }
@@ -3800,6 +3808,7 @@ impl WgpuExecutable {
                 let need_host_sync = step_i < self.schedule.len()
                     && self.step_breaks_batch(step_i, &scale, one_op_per_pass, &host_cache, dev);
                 if need_host_sync {
+                    report.open(Phase::Wait, step_i, &self.schedule);
                     crate::backend::note_device_wait();
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                     // Only invalidate after real GPU work. Host→Host chains share
@@ -3815,6 +3824,10 @@ impl WgpuExecutable {
                     }
                 }
                 if gpu_schedule_done {
+                    // The schedule's end can be reached from inside the batch — the
+                    // paths below return or break here — so it is read at this edge
+                    // too, not only at the loop's own exit.
+                    report.end_of_schedule(step_i, &self.schedule);
                     if skip_readback || defer_tail {
                         self.arm_static_once();
                         return self
@@ -3830,6 +3843,7 @@ impl WgpuExecutable {
                     if let (Some((layout, map_rx, plan)), Some(staging)) =
                         (fused_readback, self.readback_staging.as_ref())
                     {
+                        report.open(Phase::Wait, step_i, &self.schedule);
                         wait_readback_map(
                             &dev.device,
                             main_submission,
@@ -3837,6 +3851,7 @@ impl WgpuExecutable {
                             layout.total_bytes,
                         );
                         map_rx.recv().unwrap().unwrap();
+                        report.open(Phase::Readback, step_i, &self.schedule);
                         self.debug_scans_after_run(dev);
                         let partial = decode_mapped_readback_f32(staging.buffer(), &layout);
                         self.arm_static_once();
@@ -3860,6 +3875,7 @@ impl WgpuExecutable {
             if !step_runs_on_host(&self.schedule[step_i]) {
                 continue;
             }
+            report.open(Phase::Host, step_i, &self.schedule);
             // Does this host step go straight at the device, bypassing the
             // mirror? The cache-aware steps below read and write through
             // `host_cache` themselves; everything else (the `with_whole_arena`
@@ -5486,6 +5502,11 @@ impl WgpuExecutable {
             }
         }
 
+        // The loop's own exit: the schedule's end, read while the schedule is
+        // still in hand, so the interval still open closes over the steps it
+        // covered rather than over an empty cursor range.
+        report.end_of_schedule(step_i, &self.schedule);
+
         if host_cache.has_deferred_writes() {
             let mut a = crate::host_stage::WgpuArena {
                 arena: &self.arena,
@@ -5517,6 +5538,7 @@ impl WgpuExecutable {
         if !self.static_once_done && !self.static_once_steps.is_empty() {
             self.static_once_done = true;
         }
+        report.open(Phase::Readback, step_i, &self.schedule);
         let out_ids: Vec<_> = self.graph.outputs.clone();
         read_f32_many_pooled(
             &self.arena,

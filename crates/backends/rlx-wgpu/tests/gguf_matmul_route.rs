@@ -35,7 +35,7 @@
 //! override reached the encoder at all: an A/B that changes nothing proves nothing.
 
 mod common;
-use common::max_abs_diff;
+use common::{max_abs_diff, refuse_under_run_report};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
@@ -118,6 +118,8 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         eprintln!("skip: wgpu unavailable");
         return;
     }
+
+    refuse_under_run_report();
 
     // m == 1 keeps today's single-row path.
     let one = route_of(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 1);

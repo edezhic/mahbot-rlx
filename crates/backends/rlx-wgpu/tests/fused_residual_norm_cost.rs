@@ -40,6 +40,8 @@
 //! the host fallback; the arm step counts are asserted so that cannot pass
 //! silently. Run the thermal gate first (`just throttle`).
 
+mod common;
+
 use rlx_ir::{DType, Graph, GraphExt, Shape};
 use rlx_runtime::Tick;
 use rlx_wgpu::backend::WgpuExecutable;
@@ -237,6 +239,7 @@ fn folded_residual_norm_marginal_cost() {
         eprintln!("no wgpu adapter — skipping");
         return;
     }
+    common::refuse_under_run_report();
     eprintln!(
         "wgpu folded residual+norm: H={H}, chains {SHORT} vs {LONG} steps, {REPS} \
          runs each, minimum per length; marginal = (long − short)/(LONG − SHORT)"

@@ -476,6 +476,7 @@ fn elementwise_broadcast_cost_over_decoder_chain_shapes() {
         eprintln!("no wgpu adapter — skipping");
         return;
     }
+    common::refuse_under_run_report();
     eprintln!(
         "[elementwise_broadcast_cost] wgpu adapter: {}",
         rlx_wgpu::device::adapter_name().unwrap_or_else(|| "wgpu".into())

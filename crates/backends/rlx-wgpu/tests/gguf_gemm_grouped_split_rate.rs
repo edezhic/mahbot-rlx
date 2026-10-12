@@ -532,6 +532,7 @@ fn gguf_grouped_split_rate_at_the_body_shapes() {
         eprintln!("skip: wgpu unavailable");
         return;
     }
+    common::refuse_under_run_report();
     let Some(dev) = wgpu_device() else {
         eprintln!("skip: wgpu unavailable");
         return;

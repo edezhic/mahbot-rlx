@@ -447,6 +447,7 @@ mod copy_route;
 mod dispatch;
 mod helpers;
 mod run;
+mod run_report;
 mod set;
 /// Static-string label for each Step variant — used by the Perfetto
 /// trace layer (PLAN L3) to mark per-step events without allocating.
@@ -455,6 +456,7 @@ mod test;
 
 pub(crate) use copy_route::*;
 pub(crate) use helpers::*;
+pub(crate) use run_report::*;
 pub(crate) use step::*;
 
 /// Process-wide count of packed-BF16 (`matmul_bf16w`) matmul dispatches.

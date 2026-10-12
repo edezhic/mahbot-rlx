@@ -20,6 +20,10 @@ use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts};
 
+mod common;
+
+use common::RUN_REPORT_SWITCH;
+
 /// Rows in the cache, the row width, and where the new row lands: a non-zero offset
 /// inside a long-lived slot, as in `buffer_copy_batch_join.rs`.
 const CAP: usize = 64;
@@ -30,7 +34,7 @@ const POS: usize = CAP - 2;
 /// number of slots the scan reads — or what a submission or a wait means. The
 /// sibling counter pins guard the same set; `RLX_DEBUG_NANS` and its alias are this
 /// pin's own switches, set and unset inside it.
-const GUARDED: [&str; 15] = [
+const GUARDED: [&str; 16] = [
     "RLX_WGPU_SNAPSHOT",
     "RLX_BENCH_DISPATCH_ONLY",
     "RLX_WGPU_ALL_PARAMS_WEIGHT",
@@ -46,6 +50,7 @@ const GUARDED: [&str; 15] = [
     "RLX_WGPU_SHARD_STAGE_MIB",
     "RLX_WGPU_SHARD_GPU",
     "RLX_WGPU_ALLOW_SHARD",
+    RUN_REPORT_SWITCH,
 ];
 
 /// A row write into an existing cache slot — `KvAppend`'s lower on this backend —

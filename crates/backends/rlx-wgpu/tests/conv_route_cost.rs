@@ -820,6 +820,7 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         eprintln!("no wgpu adapter — skipping");
         return;
     }
+    common::refuse_under_run_report();
     let device = rlx_wgpu::device::adapter_name().unwrap_or_else(|| "wgpu".into());
     eprintln!(
         "wgpu conv-route cost on {device}: {} Conv1x7 + {} Conv1x1 body shapes + {} in-band 2-D \

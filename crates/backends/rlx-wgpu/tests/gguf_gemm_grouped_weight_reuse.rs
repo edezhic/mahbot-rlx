@@ -288,6 +288,7 @@ fn a_row_group_reuses_the_packed_weight() {
         eprintln!("skip: wgpu unavailable");
         return;
     }
+    common::refuse_under_run_report();
     // The widest served shape: 202048 x 7168 — 777 MiB packed as Q4_K, 1.1 GiB as
     // Q6_K. The 256 MiB bind cap splits each weight into its own column chunks,
     // standing in for a device whose binding limit is under the weight size.

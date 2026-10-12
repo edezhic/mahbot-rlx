@@ -266,7 +266,7 @@ fn assert_exact(got: &[Vec<f32>], want: &[Vec<f32>], what: &str) {
 /// pass, or move these graphs' routing (the shard knobs stripe the arena, which
 /// hosts every copy) — so an operator's environment cannot flip the pins instead
 /// of tripping this guard.
-const GUARDED: [&str; 14] = [
+const GUARDED: [&str; 15] = [
     "RLX_WGPU_SNAPSHOT",
     "RLX_BENCH_DISPATCH_ONLY",
     "RLX_WGPU_ALL_PARAMS_WEIGHT",
@@ -281,6 +281,7 @@ const GUARDED: [&str; 14] = [
     "RLX_WGPU_SHARD_STAGE_MIB",
     "RLX_WGPU_SHARD_GPU",
     "RLX_WGPU_ALLOW_SHARD",
+    common::RUN_REPORT_SWITCH,
 ];
 
 /// One test fn on purpose — see the module doc.

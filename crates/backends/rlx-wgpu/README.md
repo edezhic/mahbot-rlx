@@ -185,6 +185,7 @@ discrete-adapter visibility correct.
 | `RLX_DISPATCH_REPORT=1` | Per-step dispatch report |
 | `RLX_WGPU_NO_PACKED_BSHD_ATTN=1` | Disable packed QKV attention stride path |
 | `RLX_WGPU_DUMP_NODES=1` | Per-node max-abs dump after run (debug) |
+| `RLX_WGPU_DBG_COUNTERS=1` | Per-run report of where the run's time went, plus the step/uniform/bind-group census (see below) |
 | `RLX_WGPU_FORCE_HOST=1` | Host-fallback all risky SPIR-V paths |
 | `RLX_WGPU_SHARD_GPU=1` | Opt out of discrete/sharded host packing (unsafe for Kitten NSF) |
 | `RLX_WGPU_DISCRETE_HOST=1` | Extra discrete hosting via `wgpu_prefer_host_fallback` |
@@ -207,6 +208,145 @@ are peeled back at lowering (`unfuse::elide_binary_broadcast_expands`). Compile
 also unfuses `ElementwiseRegion` on wgpu (region kernel only supports trailing
 broadcast). `Activation::Gelu` uses exact `erf` in `unary.wgsl` (not the tanh
 approx).
+
+## Where a run's time goes
+
+`RLX_WGPU_DBG_COUNTERS=1` prints a `[wgpu-run-report]` block to stderr once per
+run of the compiled graph — the bracket is entry to return, so building the
+graph, loading weights and an AOT compile sit outside it, while a dynamic-shape
+graph's in-call compile is one of the named intervals. A cold first run pays
+pipeline creation too, so figures compare between warm runs of one graph. One
+caller-side call can be several reported runs, and a per-token decode loop prints
+one block per token; each block is a single `eprintln!`, so blocks never
+interleave.
+
+The partition is `stage` (inputs and params reaching the arena), `compile` (that
+build), `encode` (this run's dispatches), `wait` (a fence on device progress),
+`readback` (outputs crossing back), `host` (a host-route step's own compute) and
+`probe` (the instrument's own work: the query set and buffers it builds with the
+bracket, then its fence, resolve submit and map) — contiguous,
+non-overlapping, summing to the bracket by construction. Every label is
+**host-visible**: `encode`, `wait` and `readback` carry queue latency and the
+fence rather than kernel time, so reading them as kernel cost is the mistake this
+instrument exists to prevent. A read-back copy that rides the same submission as
+the run's own device work is inside that `wait` too — the run path serves the
+fence and the map with one edge, and splitting them would change the run being
+measured — while the pooled read-back that closes a run reads its outputs through
+a submission of its own, so its fence and its map are both `readback`. A path
+with no such edge omits the label and says so on an `omitted` line, never a zero
+beside it: a graph compiled outside the bracket has no `compile` edge, and the
+run's report says exactly that rather than printing a zero-steps `compile` line.
+Labels may repeat, so the line count is not fixed — parse by label, never by
+position or count. `convergence=ok` compares the integer clock units of the
+partition against the total: it proves the timeline is fully covered, **not** that
+each step was attributed to the right interval. Every figure is printed as
+milliseconds with six decimals, which is the integer nanosecond itself — one unit
+throughout, never a ratio — so the printed interval figures sum to the printed
+`total_ms` exactly and the convergence check is one a reader can repeat on the
+block. An interval whose integer span is zero is never pushed at all, so no
+interval line reads `0.000000` in the role of a row: a label the run had no edge
+for is an `omitted` line, and a span the clock could not separate from the stretch
+around it is that stretch's.
+
+Each interval line's `kinds=` is the schedule steps that interval covered, by
+step kind with counts, sorted by count descending — so the `host` line ranks the
+host-executed kinds, including a step the run defers to the end of the schedule,
+which `host` counts because that is the interval that ran it. A step the run
+walked past *without* doing it — a weight pack already baked, a dispatch scaled to
+zero — is counted by the interval whose cursor range spanned it, since no other
+interval ran it. A step appears in **every** interval that covered it — the
+uniform pre-pass stages one, the batch that dispatches it is another — so these
+counts are per interval and are not a partition of the schedule. `wait`, `readback`
+and `probe` cover no steps of their own (a wait covers device work issued in the
+interval before it) and print `steps=0 kinds=`; `stage` prints none on a run whose
+uniforms already match the extent in use, which is the pre-pass having nothing to
+write. The run line's `reached=` is how far into the schedule the run got, read
+where the schedule's end is reached — the run loop's own exit, or the end of the
+last batch when that batch already carried the whole schedule — so a run that
+finished it reports the schedule's length, and a figure short of `schedule=` is a
+run that stopped early.
+
+The `device` line is a **lower bound**, deliberately outside the partition and
+never added to or subtracted from it: nested inside the host-visible intervals,
+attributed to the interval that issued the pass. It is **per contiguous stretch
+of dispatch passes, not per step** — the run packs a whole contiguous stretch of
+device work into one pass on this adapter family, and the crate splits passes
+differently elsewhere, so the figures are not comparable across adapters — and it
+comes from a quantised, implementation-defined device clock: values are sanitised
+before display, and the adapter they came from is named on the line. Nesting is by
+issue and not by containment: the device runs ahead while the host encodes, so a
+figure can exceed the interval that issued its pass, and nothing here compares the
+two halves. Only the passes the run's own dispatch loop creates carry a figure —
+the pass a joined device-route copy opens, a joined packed multiply's own passes
+and every host route's own submissions do not. `unavailable` is what a pass
+reports when no figure can be obtained (the capability absent, a run that encoded
+no pass, the query never written, samples that do not advance, a delta larger than
+the bracket, a pass past the instrument's capacity, or the empty pass the loop
+opens to submit an encoder it is still carrying, which contains nothing to
+measure) — never a zero, never a measurement, never a silent truncation — and the
+wall time of such a pass stays inside the host-visible interval that carried it,
+which the `device_unusable` line restates by name and count: one line per interval
+that carried unusable passes, `index=` its 1-based line ordinal (so a repeated
+label is still matchable) and `host_ms=` that one interval's own span — a figure
+already in the partition, never summed into it and never a device figure. A pass
+no interval ever closed over has no span to restate and prints
+`index=none host_ms=unavailable`, not a fabricated zero. The instrument's own work
+is the `probe` interval, not production time: its query set and two buffers, then
+the resolve, which is fenced off from the passes it reads and submitted on its
+own, since the same-encoder form read back all-zero samples on Metal here, and a
+dispatch-only run gains that fence.
+
+Under `RLX_WGPU_SNAPSHOT=1` a call is a replay session end to end, so nothing is
+produced at all — its last pass is a full one, and the report cannot tell that
+pass apart from a production run's. The browser build produces nothing either,
+with no clock to read and the capability never requested there. Set, the report's
+own query set, buffers, fence, resolve submit and map change a run's
+submission/wait shape (adding one fence to a dispatch-only run), so tests that pin
+that shape or a rate refuse while it is set; an ordinary run is unchanged in work,
+values and printed lines. Where an existing debug switch makes the profiled run do
+extra work inside the bracket, an `extra_work` line names it — including this
+switch itself, whose census adds both the pre-pass line printed inside `stage` and
+one line per *dispatched* step from inside the batch's dispatch loop (a run with no
+dispatched step has the pre-pass line only), so a reported `stage` and `encode`
+carry those stderr writes. The table behind those lines is the switches the run
+path itself reads, not every diagnostic switch in the crate: one a dump path, a
+feed path or the compiler reads is not named.
+
+```
+[wgpu-run-report] run total_ms=4.153058 partition_ms=4.153058 convergence=ok intervals=7 schedule=2 reached=2
+[wgpu-run-report] interval label=probe host_ms=0.041185 steps=0 kinds=
+[wgpu-run-report] interval label=stage host_ms=0.029600 steps=1 kinds=matmul:1
+[wgpu-run-report] interval label=encode host_ms=0.056577 steps=1 kinds=matmul:1
+[wgpu-run-report] interval label=wait host_ms=2.663947 steps=0 kinds=
+[wgpu-run-report] interval label=host host_ms=0.401103 steps=1 kinds=buffer_copy:1
+[wgpu-run-report] interval label=readback host_ms=0.487822 steps=0 kinds=
+[wgpu-run-report] interval label=probe host_ms=0.472824 steps=0 kinds=
+[wgpu-run-report] omitted label=compile reason=no_deferred_compile_in_this_path
+[wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes per=stretch passes=1 measured=1 unusable=0 device_ms=0.130125
+[wgpu-run-report] device_pass index=0 interval=encode ms=0.130125
+[wgpu-run-report] extra_work switch=RLX_WGPU_DBG_COUNTERS effect=prepass_census_and_per_step_print
+```
+
+The `[wgpu-run-report]` prefix is unique to this block, so the lines can be
+extracted from the interleaved diagnostics a run already prints; field names are
+fixed and every time is in milliseconds with six decimals; an interval line
+reads `interval label=<phase> host_ms=<ms> steps=<n> kinds=<name>:<count>,...`;
+an unavailable device figure is the literal `unavailable`. The kinds and their
+fields, which is all a parser needs:
+
+```
+run            total_ms partition_ms convergence intervals schedule reached
+interval       label host_ms steps kinds
+omitted        label reason
+device         adapter backend view [reason] scope per passes measured unusable device_ms
+device_unusable passes interval index host_ms
+device_pass    index interval ms
+extra_work     switch effect
+```
+
+No test asserts a time: the tests assert structure, labels and parseability — by
+re-running a case in a child process and parsing its stderr — and anything
+adapter-dependent rides the `backend-tests` feature.
 
 ## Build / test
 

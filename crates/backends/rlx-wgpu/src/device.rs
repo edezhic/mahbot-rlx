@@ -48,6 +48,15 @@ fn required_features_for(adapter: &wgpu::Adapter) -> wgpu::Features {
     if adapter_feats.contains(wgpu::Features::SUBGROUP) {
         required_features |= wgpu::Features::SUBGROUP;
     }
+    // The run report's device-time view asks for pass timestamps, so the device
+    // has to carry the capability even on runs that never print one — a
+    // capability is not a behaviour, and asking for one the adapter does not
+    // advertise is fatal here. The browser build gets no clock to read, so it is
+    // never asked for there.
+    #[cfg(not(target_arch = "wasm32"))]
+    if adapter_feats.contains(wgpu::Features::TIMESTAMP_QUERY) {
+        required_features |= wgpu::Features::TIMESTAMP_QUERY;
+    }
     required_features
 }
 

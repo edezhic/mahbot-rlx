@@ -336,6 +336,10 @@ name = "residual_norm_tee"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "run_report"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "scaled_grouped_matmul_wgpu"
 required-features = ["backend-tests"]
 

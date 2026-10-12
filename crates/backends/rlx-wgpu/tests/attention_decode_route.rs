@@ -16,7 +16,7 @@
 //! while the route counts, which is what a regression moves first, are asserted.
 mod common;
 
-use common::max_abs_diff;
+use common::{max_abs_diff, refuse_under_run_report};
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
@@ -291,6 +291,9 @@ fn cost_per_position_per_layer() {
         eprintln!("skip: wgpu unavailable");
         return;
     }
+
+    refuse_under_run_report();
+
     let _guard = route_lock();
     // `serial-1row` is the pre-change baseline this build can still produce: one
     // query row at the largest key length that is not decode-shaped, so the same
