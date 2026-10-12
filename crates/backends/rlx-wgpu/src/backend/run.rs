@@ -3599,6 +3599,7 @@ impl WgpuExecutable {
                         *x_byte_off as usize,
                         *w_byte_off as usize,
                         *out_byte_off as usize,
+                        &mut report.marks(),
                     );
                     debug_assert!(encoded, "joined step has no arm in the ladder");
                     step_i += 1;
@@ -4092,6 +4093,7 @@ impl WgpuExecutable {
                                 *x_byte_off as usize,
                                 *w_byte_off as usize,
                                 *out_byte_off as usize,
+                                &mut report.marks(),
                             );
                         }
                         crate::gguf_gpu::DequantMatmulPath::ScratchArm => {
@@ -4107,6 +4109,7 @@ impl WgpuExecutable {
                                 *w_byte_off as usize,
                                 self.dequant_scratch_off,
                                 *out_byte_off as usize,
+                                &mut report.marks(),
                             );
                         }
                         crate::gguf_gpu::DequantMatmulPath::Host => {
@@ -4255,6 +4258,7 @@ impl WgpuExecutable {
                             *idx_byte_off as usize,
                             self.dequant_scratch_off,
                             *out_byte_off as usize,
+                            &mut report.marks(),
                         );
                     } else {
                         crate::gguf_host::run_dequant_grouped_matmul_gguf(

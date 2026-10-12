@@ -27,6 +27,7 @@
 use rlx_compile::memory::plan_memory_f32_uniform;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
+use rlx_wgpu::backend::PassMarks;
 use rlx_wgpu::buffer::{Arena, is_weight_off, raw_weight_off};
 use rlx_wgpu::gguf_gpu::run_dequant_matmul_gguf_gemv_rows;
 use rlx_wgpu::gguf_host::gguf_scheme_id;
@@ -163,6 +164,7 @@ fn grouped_gemm_reads_a_parked_weight_from_the_weight_buffer() {
             parked.offset(x_in),
             parked.offset(if n == na { pa } else { pb }),
             parked.offset(y),
+            &mut PassMarks::none(),
         );
         run_dequant_matmul_gguf_gemv_rows(
             &plain,
@@ -175,6 +177,7 @@ fn grouped_gemm_reads_a_parked_weight_from_the_weight_buffer() {
             plain.offset(x_in),
             plain.offset(if n == na { pa } else { pb }),
             plain.offset(y),
+            &mut PassMarks::none(),
         );
         let (got, want) = (
             parked.read_f32(&dev.device, &dev.queue, y),
@@ -239,6 +242,7 @@ fn a_misaligned_x_window_is_not_read_as_vec4() {
         mis,
         w_off,
         y_off,
+        &mut PassMarks::none(),
     );
     let via_host = arena.read_f32(&dev.device, &dev.queue, y);
 
@@ -254,6 +258,7 @@ fn a_misaligned_x_window_is_not_read_as_vec4() {
         x_off,
         w_off,
         y_off,
+        &mut PassMarks::none(),
     );
     let on_device = arena.read_f32(&dev.device, &dev.queue, y);
 
@@ -308,6 +313,7 @@ fn harness_size_parked_weight_matches_the_per_row_path() {
         parked.offset(x_in),
         parked.offset(w),
         parked.offset(y),
+        &mut PassMarks::none(),
     );
     let grouped = parked.read_f32(&dev.device, &dev.queue, y);
 
@@ -331,6 +337,7 @@ fn harness_size_parked_weight_matches_the_per_row_path() {
             rows.offset(x1),
             rows.offset(w1),
             rows.offset(y1),
+            &mut PassMarks::none(),
         );
         let one = rows.read_f32(&dev.device, &dev.queue, y1);
         scale = one.iter().fold(scale, |a, v| a.max(v.abs()));

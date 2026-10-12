@@ -276,32 +276,67 @@ comes from a quantised, implementation-defined device clock: values are sanitise
 before display, and the adapter they came from is named on the line. Nesting is by
 issue and not by containment: the device runs ahead while the host encodes, so a
 figure can exceed the interval that issued its pass, and nothing here compares the
-two halves. Only the passes the run's own dispatch loop creates carry a figure —
-the pass a joined device-route copy opens, a joined packed multiply's own passes
-and every host route's own submissions do not. `unavailable` is what a pass
-reports when no figure can be obtained (the capability absent, a run that encoded
-no pass, the query never written, samples that do not advance, a delta larger than
-the bracket, a pass past the instrument's capacity, or the empty pass the loop
-opens to submit an encoder it is still carrying, which contains nothing to
-measure) — never a zero, never a measurement, never a silent truncation — and the
-wall time of such a pass stays inside the host-visible interval that carried it,
-which the `device_unusable` line restates by name and count: one line per interval
-that carried unusable passes, `index=` its 1-based line ordinal (so a repeated
-label is still matchable) and `host_ms=` that one interval's own span — a figure
-already in the partition, never summed into it and never a device figure. A pass
-no interval ever closed over has no span to restate and prints
-`index=none host_ms=unavailable`, not a fabricated zero. The instrument's own work
-is the `probe` interval, not production time: its query set and two buffers, then
-the resolve, which is fenced off from the passes it reads and submitted on its
-own, since the same-encoder form read back all-zero samples on Metal here, and a
-dispatch-only run gains that fence.
+two halves. Its `scope=` names both kinds of pass it covers: the run's own
+dispatch loop's, and a **packed-weight multiply's** — the GEMV arm, the one-row
+multiply a batch joins and the per-row fallback's one pass per row alike, the
+row-grouped and Q1_0 arms, and the dequant-scratch route's two — each keeping the
+label its own site gave it. `passes=` counts those records, so it is this
+instrument's ledger and not the run's batched pass count.
+
+Coverage is not completeness. A pass another site opens still carries no figure: an
+arena copy's — the one site, whether the batch joins it or the call submits on its
+own — a KV row feed's, the RNG's, `GatherSplit`'s, the splat route's, the
+kernel-selection probe's, and every host route's own submission. Device work can
+therefore be missing from the view, and subtracting these figures from an
+interval's `host_ms` is **not** the run's waiting.
+
+Reading a packed multiply's own figures: one the run joins into its batch opens its
+pass beside the batch's own, so its line is an `encode` one, and one that runs as
+its own submission — the row-grouped, Q1_0 and per-row arms', the scratch route's
+two — opens its pass inside the `host` interval its step runs in. The run's own
+dispatch loop only ever opens passes in `encode`, so **a `device_pass` line outside
+`encode` is a packed multiply's own submission**. Inside `encode` the interval's
+`kinds=` names the packed step that batch carried, which is as far as attribution
+goes: `per=stretch` is the finest a pass-level timer gives, so read those lines with
+the interval's kinds rather than reading one `index=` as one multiply — and a
+per-row fallback under one step can be many lines.
+
+`unavailable` is what a pass reports when no figure can be obtained (the capability
+absent, a run that encoded no pass, the query never written, samples that do not
+advance, a delta larger than the bracket, a pass past the instrument's capacity, or
+the empty pass the loop opens to submit an encoder it is still carrying, which
+contains nothing to measure) — never a zero, never a measurement, never a silent
+truncation — and the wall time of such a pass stays inside the host-visible interval
+that carried it, which the `device_unusable` line restates by name and count: one
+line per interval that carried unusable passes, `index=` its 1-based line ordinal
+(so a repeated label is still matchable) and `host_ms=` that one interval's own
+span — a figure already in the partition, never summed into it and never a device
+figure. A pass no interval ever closed over has no span to restate and prints
+`index=none host_ms=unavailable`, not a fabricated zero.
+
+The instrument holds 2048 passes — wgpu's query-set ceiling, not a tunable — and a
+run that creates more keeps every one of them: `passes=` counts them all, while the
+query slots run out at 2048. `measured=` is at most those 2048 slots and can be
+short of them, since a slotted pass whose samples give no figure — the empty batch
+pass the loop opens to submit an encoder it is still carrying, a query never written
+— counts `unusable` too, as does every pass past the ceiling. So what a reader sees
+then is `measured=` at (at most) the 2048 slots, a non-zero `unusable=`, and a
+`device_unusable` line per interval that carried them: never a dropped pass, never a
+silent truncation. The count grows with the packed multiplies a step takes, so the
+per-row fallback — one pass per row — is the shape that reaches the ceiling first.
+
+The instrument's own work is the `probe` interval, not production time: its query
+set and two buffers, then the resolve, which is fenced off from the passes it reads
+and submitted on its own, since the same-encoder form read back all-zero samples on
+Metal here, and a dispatch-only run gains that fence.
 
 Under `RLX_WGPU_SNAPSHOT=1` a call is a replay session end to end, so nothing is
 produced at all — its last pass is a full one, and the report cannot tell that
 pass apart from a production run's. The browser build produces nothing either,
 with no clock to read and the capability never requested there. Set, the report's
 own query set, buffers, fence, resolve submit and map change a run's
-submission/wait shape (adding one fence to a dispatch-only run), so tests that pin
+submission/wait shape (adding one fence to a dispatch-only run), and its passes —
+the batch's and the packed multiplies' — carry timestamp writes, so tests that pin
 that shape or a rate refuse while it is set; an ordinary run is unchanged in work,
 values and printed lines. Where an existing debug switch makes the profiled run do
 extra work inside the bracket, an `extra_work` line names it — including this
@@ -322,10 +357,47 @@ feed path or the compiler reads is not named.
 [wgpu-run-report] interval label=readback host_ms=0.487822 steps=0 kinds=
 [wgpu-run-report] interval label=probe host_ms=0.472824 steps=0 kinds=
 [wgpu-run-report] omitted label=compile reason=no_deferred_compile_in_this_path
-[wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes per=stretch passes=1 measured=1 unusable=0 device_ms=0.130125
+[wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes+packed_multiplies per=stretch passes=1 measured=1 unusable=0 device_ms=0.130125
 [wgpu-run-report] device_pass index=0 interval=encode ms=0.130125
 [wgpu-run-report] extra_work switch=RLX_WGPU_DBG_COUNTERS effect=prepass_census_and_per_step_print
 ```
+
+The packed multiply's own figures, on one Q4_K weight multiply with the dense step
+beside it (same rig and switch). **One row** — the arm the run joins into its batch:
+the `encode` interval's `kinds=` name the packed step, and the multiply's pass is
+the second of its three lines (the first is the empty batch pass the loop opens
+before it sees that its step is the host-classified multiply, the third the dense
+step's), so the multiply's own device figure — 0.017750 ms here — is read off that
+line rather than inferred from the interval's host time:
+
+```
+[wgpu-run-report] interval label=encode host_ms=1.936316 steps=2 kinds=dequant_matmul_gguf:1,matmul:1
+[wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes+packed_multiplies per=stretch passes=3 measured=2 unusable=1 device_ms=0.106458
+[wgpu-run-report] device_unusable passes=1 interval=encode index=3 host_ms=1.936316
+[wgpu-run-report] device_pass index=0 interval=encode ms=unavailable
+[wgpu-run-report] device_pass index=1 interval=encode ms=0.017750
+[wgpu-run-report] device_pass index=2 interval=encode ms=0.088708
+```
+
+**Four rows** — the row-grouped arm, a submission of its own: its pass is the one
+line outside `encode`, inside the `host` interval that ran the step. `ms=0.074167`
+against that interval's `host_ms=4.103415` accounts for a tenth of a millisecond of
+it, and nothing here says what the rest was — with the passes this view still does
+not cover, the remainder is "not this pass", never "waiting":
+
+```
+[wgpu-run-report] interval label=host host_ms=4.103415 steps=1 kinds=dequant_matmul_gguf:1
+[wgpu-run-report] interval label=encode host_ms=0.073411 steps=1 kinds=matmul:1
+[wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes+packed_multiplies per=stretch passes=2 measured=2 unusable=0 device_ms=0.201709
+[wgpu-run-report] device_pass index=0 interval=host ms=0.074167
+[wgpu-run-report] device_pass index=1 interval=encode ms=0.127542
+```
+
+Before the multiply's passes carried marks, those same two runs read
+`passes=2 measured=1 unusable=1`, with `device_pass index=1 interval=encode` the
+dense step's alone, and `passes=1 measured=1 unusable=0` with **no** `device_pass`
+line in `host` at all: the four-row run's `host_ms=4.103415` interval covering a
+packed multiply was unreadable, which is the reading this covers.
 
 The `[wgpu-run-report]` prefix is unique to this block, so the lines can be
 extracted from the interleaved diagnostics a run already prints; field names are

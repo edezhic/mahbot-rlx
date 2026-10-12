@@ -112,20 +112,13 @@ const TOL: f32 = 1e-2;
 
 /// Deterministic packed Q4_K bytes for a `[k, n]` weight.
 fn packed(k: usize, n: usize) -> Vec<u8> {
-    packed_as(k, n, rlx_gguf::GgmlType::Q4K)
+    common::packed_gguf_bytes(rlx_gguf::GgmlType::Q4K, k, n)
 }
 
 /// [`packed`] in the 6-bit K-block scheme (Q6_K) — the join set's other half.
 /// Same 256-element superblock, so a graph may mix the two at one `K`.
 fn packed_q6k(k: usize, n: usize) -> Vec<u8> {
-    packed_as(k, n, rlx_gguf::GgmlType::Q6K)
-}
-
-fn packed_as(k: usize, n: usize, ty: rlx_gguf::GgmlType) -> Vec<u8> {
-    let w: Vec<f32> = (0..k * n)
-        .map(|i| ((i as f32) * 0.011).sin() * 0.5)
-        .collect();
-    rlx_gguf::quantize(&w, ty).expect("quantize")
+    common::packed_gguf_bytes(rlx_gguf::GgmlType::Q6K, k, n)
 }
 
 /// Deterministic values for an `n`-element tensor or parameter.
@@ -650,6 +643,7 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
         x_off + 4,
         w_off,
         y_off,
+        &mut rlx_wgpu::backend::PassMarks::none(),
     );
     let d_submits = device_submit_count();
     let d_waits = device_wait_count();

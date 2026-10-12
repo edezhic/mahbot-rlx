@@ -459,6 +459,11 @@ pub(crate) use helpers::*;
 pub(crate) use run_report::*;
 pub(crate) use step::*;
 
+/// The run report's marks handle, public only because the `gguf_gpu` entry
+/// points that take it are: the crate's integration tests are external and
+/// cannot name a crate-private type.
+pub use run_report::PassMarks;
+
 /// Process-wide count of packed-BF16 (`matmul_bf16w`) matmul dispatches.
 /// Test/telemetry hook proving the packed path was actually taken.
 pub(crate) static BF16_PACKED_DISPATCHES: std::sync::atomic::AtomicU64 =

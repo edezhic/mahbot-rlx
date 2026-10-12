@@ -71,6 +71,17 @@ pub fn time_round_robin<T>(
     per_call_ms
 }
 
+/// Deterministic packed GGUF bytes for a `[k, n]` weight — a fixed f32 ramp
+/// quantized into `ty`, the construction `gguf_batch_join`, `buffer_copy_batch_join`
+/// and `run_report` all build their weights with. A fixture and not a value:
+/// nothing reading it looks at the bytes.
+pub fn packed_gguf_bytes(ty: rlx_gguf::GgmlType, k: usize, n: usize) -> Vec<u8> {
+    let w: Vec<f32> = (0..k * n)
+        .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+        .collect();
+    rlx_gguf::quantize(&w, ty).expect("quantize")
+}
+
 /// One packed GGUF weight of `[n, k]` at `quant`'s own block geometry, filled
 /// deterministically.
 ///

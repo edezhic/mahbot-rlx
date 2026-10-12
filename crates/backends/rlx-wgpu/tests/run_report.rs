@@ -13,7 +13,7 @@
 //! Printed text is asserted the way this tree does it: the test re-runs itself in a
 //! child process (`crates/backends/rlx-cpu/tests/pool_width_claimed.rs`'s
 //! `the_refusal_is_reported_on_stderr` is the idiom) and reads the child's stderr.
-//! The seven cases differ by environment — the switches are read by the run path,
+//! The nine cases differ by environment — the switches are read by the run path,
 //! and the environment is a fact of the run rather than of the test's own process
 //! — so each case gets its own child and the parser sees one run's report and
 //! nothing else: the region mix in full; the same graph under
@@ -44,9 +44,24 @@
 //! target rides `backend-tests`. It is also the half that says whether a figure
 //! could be obtained at all: `view=unavailable` is pinned together with
 //! `measured=0` and `device_ms=unavailable`, and a lost sample is never a zero.
+//!
+//! The packed-multiply cases — 8 and 9 — are the ones the device view's coverage
+//! is about. Their graph is one packed Q4_K weight multiply and the dense multiply
+//! over its rows, run at two row counts, because the row count is what decides the
+//! multiply's route: at one row it is the one-row tiled arm the run *joins* into its
+//! batch, so the multiply's pass is an `encode` pass beside the batch's own, and at
+//! four rows it is the row-grouped arm whose pass is that call's own submission,
+//! which lands in `host` — the interval the run's own dispatch loop never opens a
+//! pass in. Both cases assert the same thing about the view: the packed multiply's
+//! pass is recorded, `passes` counts it, and the interval the report names for it is
+//! the one that carried the multiply. A disabled report cannot print, so the same
+//! fixture under the switch off would only restate case 3, and the crate's other
+//! packed-multiply targets run these same routes with the switch off — the marks'
+//! ordinary path needs no case of its own here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, GraphExt, Op, Shape};
 use rlx_runtime::{Device, Session};
 
@@ -59,13 +74,30 @@ const PREFIX: &str = "[wgpu-run-report]";
 /// value is the fixture that child runs.
 const MARKER: &str = "RUN_REPORT_CHILD";
 
-/// The three fixtures a child can be asked for: [`region_mix_graph`], the mix the
-/// report's two halves need; [`tail_host_graph`], whose one host step is a step
-/// the run defers to the end of the schedule; and [`dynamic_graph`], which the run
-/// resolves — and so compiles — inside the reported bracket.
+/// The fixtures a child can be asked for: [`region_mix_graph`], the mix the
+/// report's two halves need; [`tail_host_graph`], whose one host step is a step the
+/// run defers to the end of the schedule; [`dynamic_graph`], which the run resolves
+/// — and so compiles — inside the reported bracket; and [`packed_graph`] at each of
+/// [`PACKED_ROWS`]'s row counts, the only fixtures whose schedule holds a packed
+/// multiply.
 const REGION_MIX: &str = "region_mix";
 const TAIL_HOST: &str = "tail_host";
 const DYNAMIC: &str = "dynamic";
+const PACKED_JOIN: &str = "packed_join";
+const PACKED_HOST: &str = "packed_host";
+
+/// The two row counts the packed-multiply fixtures run at, each with its fixture
+/// name and the route its row count decides — the one place all three are written
+/// down, so the cases and the premise assertions below cannot drift apart.
+const PACKED_ROWS: [(usize, &str, bool); 2] = [(1, PACKED_JOIN, true), (4, PACKED_HOST, false)];
+
+/// The row count a packed-multiply fixture runs at, or `None` for another fixture.
+fn packed_rows(fixture: &str) -> Option<usize> {
+    PACKED_ROWS
+        .iter()
+        .find(|(_, name, _)| *name == fixture)
+        .map(|(rows, _, _)| *rows)
+}
 
 /// The seven phase tokens an interval, an omission or a pass may name.
 const PHASES: [&str; 7] = [
@@ -136,6 +168,12 @@ const POS: usize = CAP - 2;
 const NFFT: usize = 32;
 const N_BINS: usize = NFFT / 2 + 1;
 const N_MELS: usize = 8;
+
+/// Geometry of the packed-multiply fixture: the contraction is one Q4_K
+/// superblock — the whole number of packing blocks the one-row arm answers over —
+/// against a `[k, n]` packed weight.
+const PACKED_K: usize = 256;
+const PACKED_N: usize = 64;
 
 /// One line's fields, as the line spelled them: the key is the name and the value
 /// is the text after `=`, quotes stripped — both borrowed from the line.
@@ -216,6 +254,32 @@ fn dynamic_graph() -> Graph {
     g
 }
 
+/// The packed-multiply fixture: one packed Q4_K weight multiply and a dense one
+/// over its rows, at `m` rows. Returns the graph and the packed weight's bytes.
+///
+/// `m` is the whole route decision — the two row counts [`PACKED_ROWS`] names put
+/// the multiply on the joined one-row arm and on the row-grouped arm with a
+/// submission of its own — and the dense multiply beside it keeps the run's own
+/// dispatch loop in the schedule, so the report has a batched pass to read the
+/// packed one against.
+fn packed_graph(m: usize) -> (Graph, Vec<u8>) {
+    let bytes = common::packed_gguf_bytes(rlx_gguf::GgmlType::Q4K, PACKED_K, PACKED_N);
+    let mut g = Graph::new("wgpu_run_report_packed");
+    let x = g.input("x", Shape::new(&[m, PACKED_K], DType::F32));
+    let w = g.param("w", Shape::new(&[bytes.len()], DType::U8));
+    let y = g.add_node(
+        Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ4K,
+        },
+        vec![x, w],
+        Shape::new(&[m, PACKED_N], DType::F32),
+    );
+    let p = g.param("p", Shape::new(&[PACKED_N, PACKED_N], DType::F32));
+    let out = g.mm(y, p);
+    g.set_outputs(vec![out]);
+    (g, bytes)
+}
+
 /// The child's whole job, for the fixture `run_case` asked it for: one forward pass
 /// of that graph. The report goes to stderr; this prints nothing of its own.
 fn run_region_mix() {
@@ -245,6 +309,16 @@ fn run_dynamic() {
     let mut exe = rlx_wgpu::backend::WgpuExecutable::compile(dynamic_graph());
     let xv: Vec<f32> = (1..=12).map(|i| i as f32).collect();
     let _ = exe.run(&[("x", &xv)]);
+}
+
+/// A packed-multiply child's job: one forward pass at `m` rows, the packed weight
+/// uploaded as the bytes its param is declared to hold.
+fn run_packed(m: usize) {
+    let (g, bytes) = packed_graph(m);
+    let mut exe = Session::new(Device::Gpu).compile(g);
+    exe.set_param_typed("w", &bytes, DType::U8);
+    exe.set_param("p", &common::ramp(PACKED_N * PACKED_N, 1, 0.019));
+    let _ = exe.run(&[("x", &common::ramp(m * PACKED_K, 1, 0.023))]);
 }
 
 /// The child's stderr for one case: this binary re-run with `MARKER` naming
@@ -425,6 +499,157 @@ fn assert_interval_lines(intervals: &[Fields<'_>], stderr: &str) {
     }
 }
 
+/// The device view's battery — what **every** case that reads the device half owes
+/// wherever it reads it: one `device` line; its fields, with `reason` exactly when
+/// the view is `unavailable`, and `measured=0` with `device_ms=unavailable` when it
+/// is; the `measured + unusable == passes` identity; one `device_pass` record per
+/// pass, numbered in dispatch order, each `ms` either a six-decimal figure or the
+/// literal `unavailable` — never a zero — with their split agreeing with the line's
+/// counts; and one `device_unusable` line per interval that carried unusable passes,
+/// each restating that interval's own label and span, summing to `unusable`. The
+/// records come back in dispatch order: which pass is whose, and which interval
+/// carried it, is the calling case's own claim.
+fn assert_device_view<'a>(lines: &[(&'a str, Fields<'a>)], stderr: &str) -> Vec<Fields<'a>> {
+    let devices = fields_of(lines, "device");
+    assert_eq!(devices.len(), 1, "one run names one adapter:\n{stderr}");
+    let device = &devices[0];
+    let view = device["view"];
+    assert_eq!(
+        device["scope"], "dispatch_passes+packed_multiplies",
+        "{stderr}"
+    );
+    assert_eq!(device["per"], "stretch", "{stderr}");
+    assert!(!device["adapter"].is_empty(), "{stderr}");
+    assert!(!device["backend"].is_empty(), "{stderr}");
+    assert!(
+        view == "lower_bound" || view == "unavailable",
+        "`{view}` is not a view of the device figures:\n{stderr}"
+    );
+    // `reason` is exactly what the unavailable view has to explain, so its
+    // presence is the same claim as the view's value.
+    let mut expected = vec![
+        "adapter",
+        "backend",
+        "view",
+        "scope",
+        "per",
+        "passes",
+        "measured",
+        "unusable",
+        "device_ms",
+    ];
+    if view == "unavailable" {
+        expected.push("reason");
+    }
+    assert_shape(device, &expected, "the device line's fields", stderr);
+    let passes: usize = device["passes"].parse().expect("a pass count");
+    let measured: usize = device["measured"].parse().expect("a count");
+    let unusable: usize = device["unusable"].parse().expect("a count");
+    assert_eq!(
+        measured + unusable,
+        passes,
+        "every pass is measured or unusable:\n{stderr}"
+    );
+
+    let pass_lines = fields_of(lines, "device_pass");
+    assert_eq!(
+        pass_lines.len(),
+        passes,
+        "one pass record per pass:\n{stderr}"
+    );
+    let mut measured_passes = 0;
+    for (index, pass) in pass_lines.iter().enumerate() {
+        assert_shape(
+            pass,
+            &["index", "interval", "ms"],
+            "a device_pass line's fields",
+            stderr,
+        );
+        assert_eq!(
+            pass["index"].parse::<usize>().expect("a pass index"),
+            index,
+            "the passes are numbered in dispatch order:\n{stderr}"
+        );
+        let interval = pass["interval"];
+        assert!(
+            PHASES.contains(&interval),
+            "`{interval}` is not a phase token:\n{stderr}"
+        );
+        // A figure this pass could not obtain is `unavailable`, never a zero.
+        if pass["ms"] != "unavailable" {
+            ms_of(pass["ms"], &format!("device_pass {index} ms"));
+            measured_passes += 1;
+        }
+    }
+    assert_eq!(
+        (measured_passes, passes - measured_passes),
+        (measured, unusable),
+        "the pass lines must split into `measured` figures and `unusable` ones:\n{stderr}"
+    );
+
+    // Unusable passes are restated one line per interval that carried them —
+    // never added to the partition — so they are accounted for per interval and
+    // sum to `unusable`. `index` is the ordinal of the interval line the row
+    // restates, which is how a consumer matches it when a label repeats; a record
+    // no interval ever closed over has no ordinal and no span to restate, and the
+    // report says so rather than inventing a zero.
+    let intervals = fields_of(lines, "interval");
+    let mut unusable_restated = 0;
+    for line in fields_of(lines, "device_unusable") {
+        assert_shape(
+            &line,
+            &["passes", "interval", "index", "host_ms"],
+            "a device_unusable line's fields",
+            stderr,
+        );
+        let interval = line["interval"];
+        assert!(
+            PHASES.contains(&interval),
+            "`{interval}` is not a phase token:\n{stderr}"
+        );
+        match line["index"].parse::<usize>() {
+            Ok(index) => {
+                assert!(
+                    (1..=intervals.len()).contains(&index),
+                    "device_unusable index={index} names no interval line:\n{stderr}"
+                );
+                assert_eq!(
+                    intervals[index - 1]["label"],
+                    interval,
+                    "device_unusable index={index} must restate that interval's own label:\n\
+                     {stderr}"
+                );
+                ms_of(
+                    line["host_ms"],
+                    &format!("device_unusable {interval} host_ms"),
+                );
+            }
+            Err(_) => assert_eq!(
+                (line["index"], line["host_ms"]),
+                ("none", "unavailable"),
+                "a pass no interval closed over has no ordinal and no span:\n{stderr}"
+            ),
+        }
+        unusable_restated += line["passes"].parse::<usize>().expect("a pass count");
+    }
+    assert_eq!(
+        unusable_restated, unusable,
+        "every unusable pass is restated on one line:\n{stderr}"
+    );
+
+    if view == "unavailable" {
+        assert_eq!(
+            (measured, device["device_ms"]),
+            (0, "unavailable"),
+            "a view with no figure has no measured pass and no figure to print:\n{stderr}"
+        );
+    } else {
+        ms_of(device["device_ms"], "device device_ms");
+    }
+
+    pass_lines
+}
+
 /// Case 1 — the region mix, whose report is the whole of it.
 ///
 /// Structure only, and each claim is about a line's own fields or about the
@@ -601,138 +826,7 @@ fn assert_region_mix(stderr: &str, schedule: usize) {
     );
 
     // ── the device view ──────────────────────────────────────────────────
-    let devices = fields_of(&lines, "device");
-    assert_eq!(devices.len(), 1, "one run names one adapter:\n{stderr}");
-    let device = &devices[0];
-    let view = device["view"];
-    assert_eq!(device["scope"], "dispatch_passes", "{stderr}");
-    assert_eq!(device["per"], "stretch", "{stderr}");
-    assert!(!device["adapter"].is_empty(), "{stderr}");
-    assert!(!device["backend"].is_empty(), "{stderr}");
-    assert!(
-        view == "lower_bound" || view == "unavailable",
-        "`{view}` is not a view of the device figures:\n{stderr}"
-    );
-    // `reason` is exactly what the unavailable view has to explain, so its
-    // presence is the same claim as the view's value.
-    let mut expected = vec![
-        "adapter",
-        "backend",
-        "view",
-        "scope",
-        "per",
-        "passes",
-        "measured",
-        "unusable",
-        "device_ms",
-    ];
-    if view == "unavailable" {
-        expected.push("reason");
-    }
-    assert_shape(device, &expected, "the device line's fields", stderr);
-    let passes: usize = device["passes"].parse().expect("a pass count");
-    let measured: usize = device["measured"].parse().expect("a count");
-    let unusable: usize = device["unusable"].parse().expect("a count");
-    assert_eq!(
-        measured + unusable,
-        passes,
-        "every pass is measured or unusable:\n{stderr}"
-    );
-
-    let pass_lines = fields_of(&lines, "device_pass");
-    assert_eq!(
-        pass_lines.len(),
-        passes,
-        "one pass record per pass:\n{stderr}"
-    );
-    let mut measured_passes = 0;
-    for (index, pass) in pass_lines.iter().enumerate() {
-        assert_shape(
-            pass,
-            &["index", "interval", "ms"],
-            "a device_pass line's fields",
-            stderr,
-        );
-        assert_eq!(
-            pass["index"].parse::<usize>().expect("a pass index"),
-            index,
-            "the passes are numbered in dispatch order:\n{stderr}"
-        );
-        let interval = pass["interval"];
-        assert!(
-            PHASES.contains(&interval),
-            "`{interval}` is not a phase token:\n{stderr}"
-        );
-        // A figure this pass could not obtain is `unavailable`, never a zero.
-        if pass["ms"] != "unavailable" {
-            ms_of(pass["ms"], &format!("device_pass {index} ms"));
-            measured_passes += 1;
-        }
-    }
-    assert_eq!(
-        (measured_passes, passes - measured_passes),
-        (measured, unusable),
-        "the pass lines must split into `measured` figures and `unusable` ones:\n{stderr}"
-    );
-
-    // Unusable passes are restated one line per interval that carried them —
-    // never added to the partition — so they are accounted for per interval and
-    // sum to `unusable`. `index` is the ordinal of the interval line the row
-    // restates, which is how a consumer matches it when a label repeats; a record
-    // no interval ever closed over has no ordinal and no span to restate, and the
-    // report says so rather than inventing a zero.
-    let mut unusable_restated = 0;
-    for line in fields_of(&lines, "device_unusable") {
-        assert_shape(
-            &line,
-            &["passes", "interval", "index", "host_ms"],
-            "a device_unusable line's fields",
-            stderr,
-        );
-        let interval = line["interval"];
-        assert!(
-            PHASES.contains(&interval),
-            "`{interval}` is not a phase token:\n{stderr}"
-        );
-        match line["index"].parse::<usize>() {
-            Ok(index) => {
-                assert!(
-                    (1..=intervals.len()).contains(&index),
-                    "device_unusable index={index} names no interval line:\n{stderr}"
-                );
-                assert_eq!(
-                    intervals[index - 1]["label"],
-                    interval,
-                    "device_unusable index={index} must restate that interval's own label:\n\
-                     {stderr}"
-                );
-                ms_of(
-                    line["host_ms"],
-                    &format!("device_unusable {interval} host_ms"),
-                );
-            }
-            Err(_) => assert_eq!(
-                (line["index"], line["host_ms"]),
-                ("none", "unavailable"),
-                "a pass no interval closed over has no ordinal and no span:\n{stderr}"
-            ),
-        }
-        unusable_restated += line["passes"].parse::<usize>().expect("a pass count");
-    }
-    assert_eq!(
-        unusable_restated, unusable,
-        "every unusable pass is restated on one line:\n{stderr}"
-    );
-
-    if view == "unavailable" {
-        assert_eq!(
-            (measured, device["device_ms"]),
-            (0, "unavailable"),
-            "a view with no figure has no measured pass and no figure to print:\n{stderr}"
-        );
-    } else {
-        ms_of(device["device_ms"], "device device_ms");
-    }
+    assert_device_view(&lines, stderr);
 
     // The switch that inflates these intervals is named on every line it touched.
     for line in fields_of(&lines, "extra_work") {
@@ -977,7 +1071,85 @@ fn assert_dispatch_only_device_only(stderr: &str, schedule: usize) {
     );
 }
 
-/// One test fn, seven child cases: the report's structure is one claim per case,
+/// Cases 8 and 9 — the packed multiply's own pass in the device view.
+///
+/// [`assert_device_view`] owns the device line's full battery (its fields, its
+/// `unavailable` reason, the `device_unusable` cross-checks); what a packed
+/// multiply adds is read here: the multiply's pass must be one of the recorded
+/// passes and not the dispatch loop's alone, and the interval the report names for
+/// it must be the one that carried the multiply.
+///
+/// `joined` is the route this case's row count takes. The one-row arm is encoded
+/// into the run's own batch, so its pass is an `encode` pass beside the batch's:
+/// the `encode` interval then carries the batch pass opened before its first
+/// remaining step turns out to be the host-classified multiply, the multiply's own
+/// pass, and the dense step's batch pass. The row-grouped arm is a submission of
+/// its own inside the `host` step, so its pass is the only `device_pass` line
+/// outside `encode` — the interval the run's own dispatch loop never opens a pass
+/// in, which is what makes such a line readable as a packed multiply's.
+fn assert_packed_covered(stderr: &str, joined: bool) {
+    let lines = report_lines(stderr);
+    let pass_lines = assert_device_view(&lines, stderr);
+
+    // The premise, read off the report: this run's schedule held a packed multiply,
+    // and the interval whose kinds count it is the one that carried it — the link a
+    // reader uses, which is why the cases read it rather than assuming it.
+    let intervals = fields_of(&lines, "interval");
+    assert_interval_lines(&intervals, stderr);
+    let carrier = intervals
+        .iter()
+        .find(|interval| kinds_of(interval["kinds"]).contains_key("dequant_matmul_gguf"))
+        .expect("no interval counts the packed multiply this graph has");
+
+    let outside_encode: Vec<&Fields<'_>> = pass_lines
+        .iter()
+        .filter(|pass| pass["interval"] != "encode")
+        .collect();
+    if joined {
+        // The joined arm: the multiply rides the run's own batch, so its pass is an
+        // `encode` line among the batch's — one more there than the run's own dispatch
+        // loop opened, since the batch pass before it is the empty one the loop opens
+        // before it sees that its step is the host-classified multiply.
+        assert_eq!(
+            carrier["label"], "encode",
+            "the row the batch joined is the interval that carried it:\n{stderr}"
+        );
+        assert!(
+            outside_encode.is_empty(),
+            "the joined multiply rides the batch it joined:\n{stderr}"
+        );
+        let encodes = pass_lines
+            .iter()
+            .filter(|pass| pass["interval"] == "encode")
+            .count();
+        assert!(
+            encodes >= 3,
+            "the `encode` interval must carry the packed multiply's own pass beside the \
+             run's own — the empty batch pass, the multiply's, and the dense step's — \
+             found {encodes}:\n{stderr}"
+        );
+    } else {
+        // The row-grouped arm: a submission of its own, inside the `host` step's
+        // interval — the one the run's own dispatch loop never opens a pass in.
+        assert_eq!(
+            carrier["label"], "host",
+            "the unjoined multiply's own submission runs in the `host` step:\n{stderr}"
+        );
+        assert_eq!(
+            outside_encode.len(),
+            1,
+            "an unjoined packed multiply's pass must be the run's one pass outside \
+             `encode`:\n{stderr}"
+        );
+        assert_eq!(
+            outside_encode[0]["interval"], carrier["label"],
+            "the pass outside `encode` must be the one the packed multiply's interval \
+             carried:\n{stderr}"
+        );
+    }
+}
+
+/// One test fn, nine child cases: the report's structure is one claim per case,
 /// and a case's switch set is its own process's environment.
 #[test]
 fn a_run_reports_where_its_time_went() {
@@ -986,7 +1158,10 @@ fn a_run_reports_where_its_time_went() {
             REGION_MIX => run_region_mix(),
             TAIL_HOST => run_tail_host(),
             DYNAMIC => run_dynamic(),
-            other => panic!("`{other}` is not a fixture this test runs"),
+            other => match packed_rows(other) {
+                Some(rows) => run_packed(rows),
+                None => panic!("`{other}` is not a fixture this test runs"),
+            },
         }
         return;
     }
@@ -1026,6 +1201,20 @@ fn a_run_reports_where_its_time_went() {
         dynamic_steps.is_empty(),
         "the dynamic graph is unresolved until the run resolves it, found {dynamic_steps:?}"
     );
+
+    // The packed-multiply premise: one packed multiply and the dense step over its
+    // rows, in that order, at either row count a case runs. A packed multiply whose
+    // scheme had no fused arm would leave this list without its step — and the
+    // report could then only say the view covers nothing here.
+    for (m, _, _) in PACKED_ROWS {
+        let (g, _) = packed_graph(m);
+        let packed_steps = rlx_wgpu::backend::WgpuExecutable::compile(g).test_step_names();
+        assert_eq!(
+            packed_steps,
+            ["dequant_matmul_gguf", "matmul"],
+            "the packed fixture at {m} rows must be one packed multiply and one dense step"
+        );
+    }
 
     // 1. The region mix: the report in full, structure only.
     assert_region_mix(
@@ -1098,4 +1287,13 @@ fn a_run_reports_where_its_time_went() {
         ),
         1,
     );
+
+    // 8–9. The packed multiply, on the two routes the row count decides: joined
+    // into the run's own batch, and as a submission of its own.
+    for (_, fixture, joined) in PACKED_ROWS {
+        assert_packed_covered(
+            &run_case(fixture, &[(common::RUN_REPORT_SWITCH, "1")]),
+            joined,
+        );
+    }
 }

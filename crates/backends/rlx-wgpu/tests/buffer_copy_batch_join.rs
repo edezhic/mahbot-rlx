@@ -107,15 +107,6 @@ const KM: usize = 256;
 /// Its output width.
 const NM: usize = 64;
 
-/// Deterministic packed Q4_K bytes for a `[k, n]` weight (bracket 4's multiply,
-/// as `gguf_batch_join.rs` builds its own).
-fn packed(k: usize, n: usize) -> Vec<u8> {
-    let w: Vec<f32> = (0..k * n)
-        .map(|i| ((i as f32) * 0.011).sin() * 0.5)
-        .collect();
-    rlx_gguf::quantize(&w, rlx_gguf::GgmlType::Q4K).expect("quantize")
-}
-
 /// Deterministic values for an `n`-element tensor or parameter.
 fn feed(n: usize, step: f32) -> Vec<f32> {
     (0..n).map(|i| ((i as f32) * step).sin()).collect()
@@ -194,7 +185,7 @@ fn kv_row_mixed_graph() -> (Graph, Vec<(&'static str, Vec<u8>)>) {
     // device work: `m == 1` over a whole superblock, so its route is the one-row
     // device arm and it joins like the copies do.
     let xm = g.input("xm", Shape::new(&[1, KM], DType::F32));
-    let bytes = packed(KM, NM);
+    let bytes = common::packed_gguf_bytes(rlx_gguf::GgmlType::Q4K, KM, NM);
     let w = g.param("w", Shape::new(&[bytes.len()], DType::U8));
     let y = g.add_node(
         Op::DequantMatMul {

@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rlx_ir::{Graph, Op};
 
+use crate::backend::PassMarks;
 use crate::buffer::Arena;
 use crate::gguf_host::scheme_from_id;
 use crate::kernels::{
@@ -485,6 +486,7 @@ fn launch_dequant_gguf(
     scratch_byte_off: usize,
     scheme_id: u32,
     num_blocks: usize,
+    marks: &mut PassMarks<'_>,
 ) {
     let dk = dequant_gguf_kernel(device);
     let lut = crate::iq_grid::wgpu_iq_grid_buffer(device, queue);
@@ -510,10 +512,7 @@ fn launch_dequant_gguf(
         label: Some("rlx-wgpu dequant_gguf"),
     });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("rlx-wgpu dequant_gguf pass"),
-            ..Default::default()
-        });
+        let mut pass = marks.begin(&mut enc, "rlx-wgpu dequant_gguf pass");
         pass.set_pipeline(&dk.pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(grid, 1, 1);
@@ -559,6 +558,7 @@ fn dispatch_matmul_bt(
     x_off_f32: u32,
     w_off_f32: u32,
     out_off_f32: u32,
+    marks: &mut PassMarks<'_>,
 ) {
     let mm = matmul_bt_kernel(device);
     let p = MatmulParams {
@@ -604,10 +604,7 @@ fn dispatch_matmul_bt(
         label: Some("rlx-wgpu gguf matmul_bt"),
     });
     {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("rlx-wgpu gguf matmul_bt pass"),
-            ..Default::default()
-        });
+        let mut pass = marks.begin(&mut enc, "rlx-wgpu gguf matmul_bt pass");
         pass.set_pipeline(&mm.pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(n.div_ceil(32), m.div_ceil(32), 1);
@@ -632,6 +629,7 @@ pub fn run_dequant_matmul_gguf_gpu(
     w_byte_off: usize,
     scratch_byte_off: usize,
     out_byte_off: usize,
+    marks: &mut PassMarks<'_>,
 ) {
     // Windowed GEMV covers the sharded / split-weight case; this scratch+matmul_bt
     // path still assumes one contiguous arena bind.
@@ -667,6 +665,7 @@ pub fn run_dequant_matmul_gguf_gpu(
             x_byte_off,
             w_byte_off,
             out_byte_off,
+            marks,
         );
         return;
     }
@@ -695,6 +694,7 @@ pub fn run_dequant_matmul_gguf_gpu(
             x_byte_off,
             w_byte_off,
             out_byte_off,
+            marks,
         ) {
             crate::backend::note_device_submit();
             queue.submit(std::iter::once(enc.finish()));
@@ -734,6 +734,7 @@ pub fn run_dequant_matmul_gguf_gpu(
         scratch_byte_off,
         scheme_id,
         num_blocks,
+        marks,
     );
 
     dispatch_matmul_bt(
@@ -746,6 +747,7 @@ pub fn run_dequant_matmul_gguf_gpu(
         (x_byte_off / 4) as u32,
         (scratch_byte_off / 4) as u32,
         (out_byte_off / 4) as u32,
+        marks,
     );
 }
 
@@ -822,6 +824,10 @@ fn with_pooled_out_buf<R>(
 /// with [`gemv_one_row_device_ok`] for the routes it owns, and the run's join
 /// decision asks [`select_path`] — the same ladder — before calling here
 /// directly. A direct caller has to make sure of it itself.
+///
+/// `marks` is the run's pass-marks handle: every pass this ladder opens carries
+/// it, so the report's device view covers a packed multiply's passes as it covers
+/// the batch's.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_dequant_matmul_gguf_into(
     arena: &Arena,
@@ -835,6 +841,7 @@ pub fn encode_dequant_matmul_gguf_into(
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
+    marks: &mut PassMarks<'_>,
 ) -> bool {
     if m == 0 {
         return true;
@@ -853,6 +860,7 @@ pub fn encode_dequant_matmul_gguf_into(
             x_byte_off,
             w_byte_off,
             out_byte_off,
+            marks,
         )
     {
         note_route(DequantMatmulRoute::Q1_0Gemm);
@@ -877,6 +885,7 @@ pub fn encode_dequant_matmul_gguf_into(
             x_byte_off,
             w_byte_off,
             out_byte_off,
+            marks,
         )
     {
         note_route(DequantMatmulRoute::Grouped);
@@ -900,6 +909,7 @@ pub fn encode_dequant_matmul_gguf_into(
             x_byte_off + row * k * 4,
             w_byte_off,
             out_byte_off + row * n * 4,
+            marks,
         );
     }
     note_route(DequantMatmulRoute::PerRow);
@@ -935,6 +945,7 @@ pub fn run_dequant_matmul_gguf_gemv_rows(
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
+    marks: &mut PassMarks<'_>,
 ) {
     if !gemv_one_row_device_ok(scheme_id, x_byte_off, k * 4) {
         note_route(DequantMatmulRoute::Host);
@@ -967,6 +978,7 @@ pub fn run_dequant_matmul_gguf_gemv_rows(
         x_byte_off,
         w_byte_off,
         out_byte_off,
+        marks,
     );
     crate::backend::note_device_submit();
     queue.submit(std::iter::once(enc.finish()));
@@ -985,6 +997,7 @@ fn encode_dequant_matmul_gguf_gemm_q1_0(
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
+    marks: &mut PassMarks<'_>,
 ) -> bool {
     debug_assert!(k.is_multiple_of(128), "Q1_0 GEMM requires k % 128 == 0");
     let block_elems = 128usize;
@@ -1070,10 +1083,7 @@ fn encode_dequant_matmul_gguf_gemm_q1_0(
         });
 
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("rlx-wgpu dequant_gemm_q1_0 pass"),
-                timestamp_writes: None,
-            });
+            let mut pass = marks.begin(enc, "rlx-wgpu dequant_gemm_q1_0 pass");
             pass.set_pipeline(&dk.pipeline);
             pass.set_bind_group(0, &bg, &[]);
             const TM: u32 = 8;
@@ -1415,6 +1425,7 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
+    marks: &mut PassMarks<'_>,
 ) -> bool {
     debug_assert!(
         m > 1,
@@ -1604,10 +1615,7 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
             });
 
             {
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("rlx-wgpu dequant_gemm_gguf pass"),
-                    timestamp_writes: None,
-                });
+                let mut pass = marks.begin(enc, "rlx-wgpu dequant_gemm_gguf pass");
                 pass.set_pipeline(&dk.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(x_groups, y_groups, 1);
@@ -1661,6 +1669,7 @@ pub fn run_dequant_matmul_gguf_gemv(
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
+    marks: &mut PassMarks<'_>,
 ) {
     run_dequant_matmul_gguf_gemv_rows(
         arena,
@@ -1673,6 +1682,7 @@ pub fn run_dequant_matmul_gguf_gemv(
         x_byte_off,
         w_byte_off,
         out_byte_off,
+        marks,
     );
 }
 
@@ -1687,6 +1697,7 @@ fn encode_dequant_matmul_gguf_gemv_one(
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
+    marks: &mut PassMarks<'_>,
 ) {
     let x0 = x_byte_off as u64;
     let x_base = (x0 / STORAGE_ALIGN) * STORAGE_ALIGN;
@@ -1805,10 +1816,7 @@ fn encode_dequant_matmul_gguf_gemv_one(
             });
 
             {
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("rlx-wgpu dequant_gemv_gguf pass"),
-                    timestamp_writes: None,
-                });
+                let mut pass = marks.begin(enc, "rlx-wgpu dequant_gemv_gguf pass");
                 pass.set_pipeline(&dk.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
                 if tiled {
@@ -1850,6 +1858,7 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
     idx_byte_off: usize,
     scratch_byte_off: usize,
     out_byte_off: usize,
+    marks: &mut PassMarks<'_>,
 ) {
     if arena.is_sharded() {
         crate::gguf_host::run_dequant_grouped_matmul_gguf(
@@ -1908,6 +1917,7 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
             dequant_off,
             scheme_id,
             num_blocks,
+            marks,
         );
         let in_start = offsets[e];
         dispatch_matmul_bt(
@@ -1920,6 +1930,7 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
             (pack_in_off / 4 + in_start * k) as u32,
             (dequant_off / 4) as u32,
             (pack_out_off / 4 + in_start * n) as u32,
+            marks,
         );
     }
 

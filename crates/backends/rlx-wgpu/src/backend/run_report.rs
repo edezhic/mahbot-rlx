@@ -38,12 +38,23 @@
 //! subtracted from, or otherwise used to derive one, comes from a quantised,
 //! implementation-defined device clock (so its figures are not comparable across
 //! adapters, and the adapter they came from is named on every report), and is per
-//! contiguous stretch of dispatch passes — `per=stretch`. `unavailable` is what a
-//! pass reports when no figure can be obtained — it is never a zero and never a
-//! measurement — and the wall time of such a pass stays inside the host-visible
-//! interval that carried it; the `device_unusable` lines and
-//! [`RunReport::pass_phase`]'s fallback for a pass no interval closed over are the
-//! bookkeeping those two rules need.
+//! contiguous stretch of dispatch passes — `per=stretch`. It holds the passes the
+//! run's device work opens through this instrument's one pass-opening entry:
+//! [`RunReport::begin_pass`] for the batch loop, and [`PassMarks`] for the
+//! packed-weight multiplies — each keeping the label its own site gave it, since a
+//! mark never renames the pass it marks. It is **not** the run's device work: a
+//! pass any other site opens carries no figure, so subtracting the device figures
+//! from an interval's `host_ms` is not what the run waited for. What `scope=` means
+//! arm by arm, and which sites stay out, is `README.md`'s coverage statement.
+//!
+//! `unavailable` is what a pass reports when no figure can be obtained — it is
+//! never a zero and never a measurement — and the wall time of such a pass stays
+//! inside the host-visible interval that carried it; the `device_unusable` lines
+//! and [`RunReport::pass_phase`]'s fallback for a pass no interval closed over are
+//! the bookkeeping those two rules need. The device line's `passes` counts the
+//! passes this instrument recorded, which is this ledger and not the run's own
+//! batched pass count; past [`MAX_PASSES`] the records keep coming and the excess
+//! is reported unusable rather than dropped.
 //!
 //! `README.md`'s "Where a run's time goes" is the consumer contract: field names,
 //! per-label meaning, the sample block, and what a caller may and may not read out
@@ -56,10 +67,11 @@ use super::step::{Step, step_name};
 /// Printed prefix of every line of one report. A strict parser keys on it.
 const PREFIX: &str = "[wgpu-run-report]";
 
-/// Pass pairs the device view can hold: two query slots per dispatch pass. A
-/// run with more passes than this still runs — see [`RunReport::begin_pass`].
-/// `2 * MAX_PASSES` is exactly wgpu's `QUERY_SET_MAX_QUERIES`, the largest count
-/// `create_query_set` accepts: this is the ceiling, not a round number.
+/// Pass pairs the device view can hold: two query slots per recorded pass, the
+/// batch loop's and a packed multiply's alike. A run with more passes than this
+/// still runs — see [`RunReport::open_pass`]. `2 * MAX_PASSES` is exactly wgpu's
+/// `QUERY_SET_MAX_QUERIES`, the largest count `create_query_set` accepts: this is
+/// the ceiling, not a round number.
 const MAX_PASSES: u32 = 2048;
 
 /// The intervals a run may have, with the reason printed when one never
@@ -184,7 +196,7 @@ struct PassRecord {
     interval_index: Option<u32>,
 }
 
-/// The device-time view: one query pair per dispatch pass, resolved and mapped
+/// The device-time view: one query pair per recorded pass, resolved and mapped
 /// once at the end of the run.
 ///
 /// The browser build reads no clock there — `RunReport::start` cannot enable the
@@ -245,6 +257,57 @@ impl PassTimer {
             period_ps: (period * 1000.0).round() as u64,
             ticks: Vec::new(),
         })
+    }
+}
+
+/// A pass with no timestamp marks: exactly the pass every site opened before
+/// there were marks, and what a report-disabled pass and a [`PassMarks::none`]
+/// pass both open.
+fn unmarked_pass<'e>(enc: &'e mut wgpu::CommandEncoder, label: &str) -> wgpu::ComputePass<'e> {
+    enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(label),
+        timestamp_writes: None,
+    })
+}
+
+/// The marks handle: what the run's device work outside its own dispatch loop —
+/// the packed-weight multiplies — opens its passes through, so each of them
+/// carries the same timestamp pair a batched pass carries and the device view can
+/// say whether it was device-busy or the run was waiting.
+///
+/// It is the report handle already in hand rather than another read of the
+/// switch: the run creates it from its own report ([`RunReport::marks`]), and
+/// whether the passes it opens are marked is that report's decision
+/// ([`RunReport::open_pass`]) — a disabled report marks none of them.
+/// [`PassMarks::none`] is the other unmarked case: the handle a caller with no
+/// report holds — this crate's own tests, and any direct caller of the `gguf_gpu`
+/// entry points that runs outside a reported run.
+///
+/// `pub` because those entry points are: the crate's integration tests are
+/// external and can only name a public handle.
+pub struct PassMarks<'a> {
+    /// `None` for the handle with no report at all ([`PassMarks::none`]). Private,
+    /// so the report stays crate-private.
+    report: Option<&'a mut RunReport>,
+}
+
+impl<'a> PassMarks<'a> {
+    /// The handle with no report: every pass it opens is unmarked.
+    pub fn none() -> Self {
+        Self { report: None }
+    }
+
+    /// Open `label`'s pass, marked when this handle holds a report. The label is
+    /// the site's own, so a marked pass is named exactly as its unmarked form was.
+    pub(crate) fn begin<'e>(
+        &mut self,
+        enc: &'e mut wgpu::CommandEncoder,
+        label: &str,
+    ) -> wgpu::ComputePass<'e> {
+        match self.report.as_deref_mut() {
+            Some(report) => report.open_pass(enc, label),
+            None => unmarked_pass(enc, label),
+        }
     }
 }
 
@@ -395,8 +458,8 @@ impl RunReport {
     /// Begin the run's own dispatch compute pass, sampling its device time when
     /// the adapter advertises the capability.
     ///
-    /// One record per call, slotted or not: the device line's `passes` is what
-    /// this run really created, so a run past [`MAX_PASSES`] reports its
+    /// One record per call, slotted or not: the device line's `passes` is every
+    /// pass this instrument recorded, so a run past [`MAX_PASSES`] reports its
     /// overflow instead of looking like a short one. The descriptor is a
     /// temporary inside this call and the returned pass borrows the encoder
     /// only, which is what lets the bookkeeping borrow `self` mutably here.
@@ -404,12 +467,22 @@ impl RunReport {
         &mut self,
         enc: &'e mut wgpu::CommandEncoder,
     ) -> wgpu::ComputePass<'e> {
-        let label = Some("rlx-wgpu compute pass");
+        self.open_pass(enc, "rlx-wgpu compute pass")
+    }
+
+    /// The one pass-opening entry: the run's own batch passes come through it
+    /// ([`RunReport::begin_pass`]) and so does every packed-weight multiply's
+    /// ([`PassMarks::begin`]). `label` is the caller's, so carrying the mark never
+    /// renames the pass that carries it, and whether a pass is marked at all is
+    /// read from this report rather than off the switch — which was read once, in
+    /// [`RunReport::start`].
+    fn open_pass<'e>(
+        &mut self,
+        enc: &'e mut wgpu::CommandEncoder,
+        label: &str,
+    ) -> wgpu::ComputePass<'e> {
         if !self.enabled {
-            return enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label,
-                timestamp_writes: None,
-            });
+            return unmarked_pass(enc, label);
         }
         let slot = if self.timer.is_some() && (self.passes.len() as u32) < MAX_PASSES {
             Some(self.passes.len() as u32)
@@ -430,9 +503,18 @@ impl RunReport {
             _ => None,
         };
         enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label,
+            label: Some(label),
             timestamp_writes,
         })
+    }
+
+    /// The marks handle for this run's device work outside its dispatch loop:
+    /// the packed-weight multiplies, which open their passes through it. Whether a
+    /// pass is marked is settled in [`RunReport::open_pass`], so the marks are
+    /// never a second read of the switch — a disabled report's handle marks
+    /// nothing, and only [`PassMarks::none`] leaves a caller with no report at all.
+    pub(crate) fn marks(&mut self) -> PassMarks<'_> {
+        PassMarks { report: Some(self) }
     }
 
     /// Close the interval that is open at `cursor`. A non-zero span is pushed
@@ -542,8 +624,12 @@ impl RunReport {
     }
 
     /// Which interval carried a pass, for the lines that name one. A record no
-    /// interval ever closed over has no name of its own: every pass this run
-    /// begins is begun in its dispatch work, so `encode` is what it is read as.
+    /// interval ever closed over has no name of its own — the zero-span close
+    /// that absorbed its stretch left no interval to name — so the passes the
+    /// run's own dispatch loop opened are read as `encode`, which is where that
+    /// loop opens them. A packed multiply's pass can land there too, and the
+    /// `device_unusable` line's `index=none host_ms=unavailable` pair is what says
+    /// the record had no interval, in either case.
     fn pass_phase(&self, pass: &PassRecord) -> Phase {
         pass.interval_index
             .and_then(|index| self.intervals.get(index as usize))
@@ -606,8 +692,12 @@ impl RunReport {
             } else {
                 "view=unavailable reason=no_usable_sample".to_string()
             };
+            // `scope` names both kinds of pass the view covers, so the line does
+            // not read as the run's own dispatch loop alone; what it still does
+            // not cover is the crate's coverage statement, not a token here.
             lines.push(format!(
-                "{PREFIX} device adapter=\"{}\" backend={} {view} scope=dispatch_passes \
+                "{PREFIX} device adapter=\"{}\" backend={} {view} \
+                 scope=dispatch_passes+packed_multiplies \
                  per=stretch passes={} measured={measured} unusable={} device_ms={}",
                 dev.name,
                 format!("{:?}", dev.backend).to_lowercase(),
