@@ -165,9 +165,22 @@ pub(crate) const CONV_IM2COL_MAX_COL_BYTES: u64 = 1024 * 1024 * 1024;
 /// the run picks. Past it the shape keeps the previous direct/tiled route.
 pub(crate) const POINTWISE_MAX_SPATIAL: u64 = 65535 * 32;
 
-// Defaults live in [`crate::config::WgpuRuntimeConfig::from_env`].
-const _CONV_IM2COL_DEFAULTS: (u64, u64, u64) = (2048, 256, 64);
+/// Admission bar for the 1×1 pointwise GEMM, in `c_in × spatial` elements. The
+/// im2col spatial and K floors used to be multiplied together for this test; the
+/// number that product then stood for (`256 × 2048`) is kept here as a frozen
+/// literal of its own, so the spatial floor can move under the non-pointwise shapes
+/// without the 1×1 admission moving with it — nothing recomputes this bar from
+/// either floor, and the 1×1 route keeps exactly the admission it had. The channel
+/// floor ([`im2col_min_cout`]) is what both routes still share.
+pub(crate) const POINTWISE_MIN_COL_ELEMS: u64 = 524_288;
 
+/// Whether a 1×1 conv of this shape takes the pointwise GEMM route: its own bar
+/// above, deliberately not a product of the im2col floors.
+pub(crate) fn pointwise_admitted(k_total: u64, spatial: u64) -> bool {
+    k_total.saturating_mul(spatial) >= POINTWISE_MIN_COL_ELEMS
+}
+
+// Defaults live in [`crate::config::WgpuRuntimeConfig::from_env`].
 fn im2col_min_spatial() -> u64 {
     crate::runtime_config().im2col_min_spatial as u64
 }
@@ -200,7 +213,7 @@ fn conv_tiled_min_spatial() -> u64 {
 
 /// Element count of the im2col `col[c_in*kh*kw, spatial]` matrix if this conv
 /// node qualifies for the im2col+GEMM path (2D / 1D-as-2D NCHW, `N==1`,
-/// `groups==1`, real spatial kernel, spatial ≥ [`CONV_IM2COL_MIN_SPATIAL`]).
+/// `groups==1`, real spatial kernel, spatial ≥ the im2col spatial floor).
 /// Returns `None` otherwise. Mirrors the shape math in the `Op::Conv` compile
 /// arm so scratch sizing and lowering agree on which convs are routed.
 fn conv_im2col_col_elems(
@@ -422,6 +435,11 @@ pub struct WgpuExecutable {
     /// least one absolute-addressing op was computed on the host instead of
     /// through a re-based window. See `lower::should_host_at_ceiling`.
     ceiling_hosted: usize,
+    /// Convs whose shape qualified for im2col but which took the direct/tiled route
+    /// for a reason the shapes alone do not settle — counted where that route is
+    /// decided, in the `Op::Conv` arm of [`crate::backend::compile`], so a term added
+    /// there cannot leave the count behind.
+    im2col_fallbacks: usize,
 }
 
 mod compile;
@@ -540,6 +558,7 @@ impl WgpuExecutable {
         self.gdn_scratch_off = fresh.gdn_scratch_off;
         self.schedule = fresh.schedule;
         self.ceiling_hosted = fresh.ceiling_hosted;
+        self.im2col_fallbacks = fresh.im2col_fallbacks;
         self.input_offsets = fresh.input_offsets;
         self.param_offsets = fresh.param_offsets;
         self.uniforms = fresh.uniforms;
@@ -646,6 +665,7 @@ impl WgpuExecutable {
             static_once_steps: HashSet::new(),
             static_once_done: false,
             ceiling_hosted: 0,
+            im2col_fallbacks: 0,
         }
     }
 
@@ -670,6 +690,17 @@ impl WgpuExecutable {
     /// from timing.
     pub fn ceiling_hosted_steps(&self) -> usize {
         self.ceiling_hosted
+    }
+
+    /// Convs whose shape qualified for the im2col route but which took the
+    /// direct/tiled route for a reason the shapes alone do not settle (see the
+    /// `Op::Conv` arm of [`crate::backend::compile`], where the count is taken).
+    /// Exposed so the fallback is observable — the schedule report prints it, and the
+    /// route tests assert both arms of it, zero on a graph that binds and parks nothing
+    /// and the qualifying conv's own count where it does — instead of the route that
+    /// was *not* taken having to be inferred from a timing.
+    pub fn im2col_fallbacks(&self) -> usize {
+        self.im2col_fallbacks
     }
 
     /// Debug helper: run forward, then read every node slot back and
@@ -3608,4 +3639,167 @@ fn build_matmul_bind_group(
         bind_arena_window(device, mm_k, arena, arena_base, arena_size, params),
         b_off,
     )
+}
+
+/// The two conv-route decisions, pinned without a device: the 1×1 route's frozen
+/// bar and the shape/arena split of the im2col decision, plus the col reservation
+/// the planner sizes from that split. The route *tests* observe which route a
+/// shape took on an adapter; these pin the arithmetic under it, and run in the
+/// plain `cargo test` gate rather than only under `--features backend-tests`.
+/// The rows are sized from the *effective* floors (`im2col_min_*()`, the env the
+/// lowering reads), so they hold at the shipped values and across the lever's measured
+/// range (`RLX_WGPU_IM2COL_MIN_SPATIAL` 512..48000); a floor far outside that range is
+/// outside this claim. A row that deliberately pins a shipped constant says so in place.
+#[cfg(test)]
+mod conv_route_decision_tests {
+    use super::*;
+    use rlx_ir::{DType, Shape};
+
+    /// The 1×1 admission is its own frozen bar: it must not follow the im2col
+    /// spatial floor, which moved under the non-pointwise shapes of the same graphs.
+    #[test]
+    fn the_pointwise_bar_is_frozen_against_the_im2col_floors() {
+        // 128 × 3000 = 384 000 — under this bar, but over what the two floors admit
+        // once the spatial floor is 800 (256 × 800 = 204 800), so an admission test
+        // re-coupled to them would take this shape.
+        assert!(!pointwise_admitted(128, 3000));
+        assert!(pointwise_admitted(256, 2048), "the bar itself");
+        assert!(!pointwise_admitted(256, 2047));
+        // The decoder body's 1×1 form (`[1,768,1,800]`) was over the bar and stays.
+        assert!(pointwise_admitted(768, 800));
+    }
+
+    /// The col reservation is sized from the shapes the floor admits and dropped by
+    /// the two caps the planner applies, over a tail floored at 64 MiB. The binding
+    /// half is driven with a caller-supplied limit, so it is reachable without an
+    /// adapter under the arena.
+    #[test]
+    fn the_col_reservation_follows_the_shape_and_the_binding_window() {
+        let (band, col_elems) = band_graph();
+        let col_elems = col_elems.expect("the band shape clears the effective floors");
+        let col_bytes = col_elems * 4;
+        // The planner hands the panel back 256-byte aligned, so the row is compared
+        // against the aligned figure: a K or spatial floor that makes the col a
+        // non-multiple of the alignment would otherwise fail a rule that is not in doubt.
+        let aligned = col_bytes.div_ceil(256) * 256;
+        let planned = 1u64 << 20;
+        assert_eq!(
+            conv_im2col_scratch_bytes(&band, planned as usize, planned + aligned),
+            aligned as usize,
+            "a window with room for the panel reserves exactly it, 256-byte aligned"
+        );
+        assert_eq!(
+            conv_im2col_scratch_bytes(&band, planned as usize, planned + col_bytes - 1),
+            0,
+            "a window one byte short of the panel drops it"
+        );
+        assert_eq!(
+            conv_im2col_scratch_bytes(&band, planned as usize, u64::MAX),
+            aligned as usize,
+            "an unlimited window reserves it whatever the plan costs"
+        );
+        // The hard cap drops a col past it even where the window would take it. The map is
+        // `(2 × the spatial floor).max(64)` wide — 1600 at the shipped 800 — with enough
+        // channels to clear the K floor and to push the panel past the cap at that extent.
+        let w = (im2col_min_spatial() * 2).max(64) as usize;
+        let c_in = (im2col_min_k().div_ceil(25) as usize)
+            .max((CONV_IM2COL_MAX_COL_BYTES as usize).div_ceil(25 * w * 4));
+        let (huge, huge_elems) =
+            conv_graph(c_in, im2col_min_cout() as usize, [1, w], [5, 5], [2, 2]);
+        assert!(huge_elems.expect("floor-clearing shape") * 4 > CONV_IM2COL_MAX_COL_BYTES);
+        assert_eq!(conv_im2col_scratch_bytes(&huge, 0, u64::MAX), 0);
+        // …and the tail the panel is reserved in is floored at 64 MiB, the base every
+        // recorded `expected_col_delta` in the route harness is measured against.
+        assert_eq!(compute_scratch_bytes(&band), 64 * 1024 * 1024);
+    }
+
+    /// The spatial floor's rule, at its own boundary: the quantity is one conv
+    /// node's own output spatial extent (`h_out * w_out`, the output length for the
+    /// unit-height lift) and the comparison is a bare `u64` `>=`, so the extent equal
+    /// to the floor is admitted and one shorter is refused — no multiplier, margin or
+    /// rounding. Sized from the effective floors, so the documented
+    /// `RLX_WGPU_IM2COL_MIN_SPATIAL` A/B lever moves both rows with it.
+    #[test]
+    fn the_spatial_floor_admits_exactly_its_own_extent() {
+        let floor = im2col_min_spatial() as usize;
+        if floor < 2 {
+            // A floor of 0 or 1 admits every extent there is, so there is no two-sided
+            // boundary to state, and `floor - 1` would be a degenerate width.
+            return;
+        }
+        let c_in = (im2col_min_k().div_ceil(7) as usize).max(64);
+        let c_out = im2col_min_cout() as usize;
+        let (_, on_the_floor) = conv_graph(c_in, c_out, [1, floor], [1, 7], [0, 3]);
+        assert_eq!(
+            on_the_floor,
+            Some(c_in as u64 * 7 * floor as u64),
+            "out {floor} is the floor itself"
+        );
+        let (_, one_short) = conv_graph(c_in, c_out, [1, floor - 1], [1, 7], [0, 3]);
+        assert_eq!(one_short, None, "one output shorter is under the floor");
+    }
+
+    /// The reservation and the 1×1 route are two decisions, which is what lets the
+    /// spatial floor move without moving the pointwise shapes: the same 1×1 form is
+    /// admitted by its own bar and reserves no col panel at all.
+    #[test]
+    fn a_one_by_one_conv_reserves_no_col_panel() {
+        let mut g = Graph::new("pointwise_col");
+        let x = g.input("x", Shape::new(&[1, 768, 1, 800], DType::F32));
+        let w = g.param("w", Shape::new(&[768, 768, 1, 1], DType::F32));
+        let y = g.conv2d(x, w, [1, 1], [1, 1], [0, 0], [1, 1], 1);
+        let node = g.node(y);
+        assert_eq!(
+            conv_im2col_col_elems(
+                &node.op,
+                &g.node(node.inputs[0]).shape,
+                &g.node(node.inputs[1]).shape,
+                &node.shape,
+            ),
+            None,
+            "1×1 taps are not the im2col route's shape"
+        );
+        assert_eq!(conv_im2col_scratch_bytes(&g, 1 << 20, u64::MAX), 0);
+    }
+
+    /// A conv graph, and the col element count `conv_im2col_col_elems` gives its
+    /// shape (`None` where the shape clears no floor) — the planner's own function,
+    /// so these tests and the planner cannot drift apart.
+    fn conv_graph(
+        c_in: usize,
+        c_out: usize,
+        hw: [usize; 2],
+        k: [usize; 2],
+        p: [usize; 2],
+    ) -> (Graph, Option<u64>) {
+        let mut g = Graph::new("conv_col_reservation");
+        let x = g.input("x", Shape::new(&[1, c_in, hw[0], hw[1]], DType::F32));
+        let w = g.param("w", Shape::new(&[c_out, c_in, k[0], k[1]], DType::F32));
+        let y = g.conv2d(x, w, k, [1, 1], p, [1, 1], 1);
+        let node = g.node(y);
+        let elems = conv_im2col_col_elems(
+            &node.op,
+            &g.node(node.inputs[0]).shape,
+            &g.node(node.inputs[1]).shape,
+            &node.shape,
+        );
+        (g, elems)
+    }
+
+    /// A 2-D map that clears the effective floors with the smallest side there is —
+    /// `ceil(sqrt(spatial floor))`, so it sits just inside the im2col band — and at
+    /// least 64 channels, above the K floor. Derived rather than taken from the route
+    /// harness's fixture tables: the reservation it sizes follows the map's area and
+    /// the kernel's taps, not the fixture's geometry.
+    fn band_graph() -> (Graph, Option<u64>) {
+        let side = (im2col_min_spatial() as f64).sqrt().ceil() as usize;
+        let c_in = (im2col_min_k().div_ceil(9) as usize).max(64);
+        conv_graph(
+            c_in,
+            im2col_min_cout() as usize,
+            [side, side],
+            [3, 3],
+            [1, 1],
+        )
+    }
 }

@@ -42,10 +42,13 @@ impl Default for WgpuRuntimeConfig {
 impl WgpuRuntimeConfig {
     pub fn from_env() -> Self {
         use rlx_ir::env_registry as reg;
-        // Defaults match `backend/mod.rs` constants when unset.
+        // Conv-route floors. 800 is the tightest floor admitting the shape the move was
+        // measured on — the decoder body's `conv1` forms land on it exactly, and the test
+        // is inclusive — and the only value below the old 2048 that was sampled (nothing
+        // between 800 and 16000 was). The 1×1 route's own bar is `POINTWISE_MIN_COL_ELEMS`.
         Self {
             gdn_host: reg::flag("RLX_WGPU_GDN_HOST"),
-            im2col_min_spatial: reg::parse_or("RLX_WGPU_IM2COL_MIN_SPATIAL", 2048usize),
+            im2col_min_spatial: reg::parse_or("RLX_WGPU_IM2COL_MIN_SPATIAL", 800usize),
             im2col_min_k: reg::parse_or("RLX_WGPU_IM2COL_MIN_K", 256usize),
             im2col_min_cout: reg::parse_or("RLX_WGPU_IM2COL_MIN_COUT", 64usize),
             tiled_min_spatial: reg::parse_or("RLX_WGPU_TILED_MIN_SPATIAL", 256usize),

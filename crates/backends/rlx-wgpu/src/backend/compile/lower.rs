@@ -1437,6 +1437,12 @@ pub(crate) fn compile_static_inner(
     // `should_host_at_ceiling`); surfaced on `WgpuExecutable` so the route is
     // observable rather than inferred.
     let mut ceiling_hosted: usize = 0;
+    // Convs whose shape qualified for im2col but which kept the direct/tiled route.
+    // The shape half is what sizes the col reservation, so a qualifying shape that
+    // still does not route is kept off it for a reason the shapes alone do not
+    // settle — counted at that decision and reported (see the conv arm and the
+    // schedule report).
+    let mut im2col_fallbacks: usize = 0;
     let mut prev_node: Option<NodeId> = None;
     for node in graph.nodes() {
         if let Some(prev) = prev_node {
@@ -6111,24 +6117,45 @@ pub(crate) fn compile_static_inner(
                             let col_bytes = k_total.saturating_mul(spatial).saturating_mul(4);
                             let max_binding = dev.device.limits().max_storage_buffer_binding_size;
                             let whole = arena_whole_arena_bind(&arena, max_binding);
-                            let use_im2col = accel
-                                && !parked
+                            // What a conv has to be for the route, all of it decided
+                            // without reading the adapter: one group and a unit batch, real
+                            // spatial taps, the shape floors `conv_im2col_col_elems` mirrors,
+                            // the hard col cap `conv_im2col_scratch_bytes` applies, and the
+                            // route switch — so the col reservation and the lowering agree on
+                            // which convs the route could take, on this adapter or any other.
+                            let im2col_candidate = accel
                                 && p2.groups == 1
                                 && p2.n == 1
                                 && (p2.kh as u64) * (p2.kw as u64) >= 2
                                 && spatial >= im2col_min_spatial()
                                 && k_total >= im2col_min_k()
                                 && (p2.c_out as u64) >= im2col_min_cout()
-                                && col_bytes <= CONV_IM2COL_MAX_COL_BYTES
+                                && col_bytes <= CONV_IM2COL_MAX_COL_BYTES;
+                            // …and the three terms the shapes alone do not settle, which keep a
+                            // candidate conv on the direct/tiled route: a parked weight the
+                            // route's raw word offset cannot address, a col panel past the tail
+                            // reserved for it (the planner drops a panel that would push the
+                            // arena over the binding limit), and an arena — tail included —
+                            // that does not bind in one storage binding. Counted here, where
+                            // the decision is made, so none of them is silent and no term added
+                            // to the candidate test above can leave the count behind.
+                            let use_im2col = im2col_candidate
+                                && !parked
                                 && col_bytes <= arena.scratch_bytes as u64
                                 && whole.is_some();
+                            if im2col_candidate && !use_im2col {
+                                im2col_fallbacks += 1;
+                            }
                             // 1×1 conv: `W[c_out,c_in] @ in[c_in,h*w]`, both operands
                             // already in the layout a GEMM wants, so no gather — a
                             // routing change onto the matmul machinery, not a new
-                            // kernel. Admitted at the im2col route's own col-matrix
-                            // and channel floors (a 1×1 kernel's col *is* the
-                            // activation), capped so the step's own dispatch grid
-                            // stays inside the per-dimension workgroup limit. The
+                            // kernel. Admitted at its own frozen bar
+                            // (`pointwise_admitted` — a 1×1 kernel's col *is* the
+                            // activation) and the shared channel floor, capped so the
+                            // step's own dispatch grid stays inside the per-dimension
+                            // workgroup limit. That bar is deliberately NOT the im2col
+                            // route's floors: the spatial floor below has to move for
+                            // the non-pointwise shapes, and this one must not. The
                             // three routes are mutually exclusive by shape — this one
                             // needs 1×1 taps, `mirror_eligible` a >1 tap in slot 1,
                             // `one_d` a >1 tap in slot 0 — so each predicate tests
@@ -6146,8 +6173,7 @@ pub(crate) fn compile_static_inner(
                                 && p2.groups == 1
                                 && p2.n == 1
                                 && (p2.c_out as u64) >= im2col_min_cout()
-                                && k_total.saturating_mul(spatial)
-                                    >= im2col_min_k().saturating_mul(im2col_min_spatial())
+                                && pointwise_admitted(k_total, spatial)
                                 && spatial <= POINTWISE_MAX_SPATIAL;
                             // The relabel exists only to unlock the tiled route for a
                             // unit-height lift the im2col route does not take: it
@@ -11826,6 +11852,17 @@ pub(crate) fn compile_static_inner(
                  in it (do not set RLX_WGPU_ALLOW_SHARD)."
             );
         }
+        if im2col_fallbacks > 0 {
+            eprintln!(
+                "    im2col: {im2col_fallbacks} conv(s) cleared the route's shape gates but \
+                 kept the direct/tiled route, for a reason the shapes alone do not settle: \
+                 a weight parked in the weight buffer, a col panel over the {} B tail \
+                 reserved for it, or an arena that with its panel does not fit one storage \
+                 binding (max_storage_buffer_binding_size = {} B)",
+                arena.scratch_bytes,
+                dev.device.limits().max_storage_buffer_binding_size
+            );
+        }
         for (n, c) in &counts {
             eprintln!("    {c:>4} × {n}");
         }
@@ -11878,6 +11915,7 @@ pub(crate) fn compile_static_inner(
         static_once_steps,
         static_once_done: false,
         ceiling_hosted,
+        im2col_fallbacks,
     }
 }
 

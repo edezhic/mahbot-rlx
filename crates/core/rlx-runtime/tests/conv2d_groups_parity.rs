@@ -173,6 +173,27 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 groups: 1,
             },
         ),
+        // Just inside the band the wgpu im2col spatial floor's new default (800,
+        // from 2048) newly admits: 40×40 = 1600 output elements, so on that backend
+        // this row takes the materialised im2col route. It is the 2-D half of that
+        // band's regression surface — the unit-height body rows below reach the
+        // floor only through the length axis, and this is the only 2-D map in the
+        // band (`dense-1x7-l800` sits on the floor itself, at its inclusive lower bound).
+        (
+            "band-3x3-40x40",
+            Cfg {
+                n: 1,
+                c_in: 64,
+                c_out: 64,
+                h: 40,
+                w: 40,
+                k: [3, 3],
+                s: [1, 1],
+                p: [1, 1],
+                d: [1, 1],
+                groups: 1,
+            },
+        ),
         // Detection in_conv resolution (800×600) — exposes spatial-size kernel bugs.
         (
             "hires-3x3",
@@ -289,8 +310,9 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 groups: 1,
             },
         ),
-        // 1×7 dense below the im2col spatial floor (out 800 < 2048) ⇒ the
-        // mirrored 1-D tiled relabel, not im2col.
+        // 1×7 dense sitting exactly on the 800 im2col spatial floor (out 800 is
+        // that floor's own boundary, inclusive) ⇒ im2col — the shape the decoder
+        // body's `blk.*.res.*.conv1` presents.
         (
             "dense-1x7-l800",
             Cfg {
@@ -323,8 +345,9 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 groups: 1,
             },
         ),
-        // ... and with a stride: out 2000 is below both the im2col spatial floor
-        // and its `c_out` floor ⇒ mirrored relabel with a stride.
+        // ... and with a stride: out 2000 clears the 800 im2col spatial floor, but
+        // `c_out = 32` does not clear its 64-channel floor ⇒ mirrored relabel with
+        // a stride.
         (
             "mirror-strided-s2",
             Cfg {
@@ -340,8 +363,8 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 groups: 1,
             },
         ),
-        // ... and with dilation: out 994 sits above the 256 tiled floor and below
-        // the 2048 im2col spatial floor, so this is the *mirrored* relabel with a
+        // ... and with dilation: out 794 sits above the 256 tiled floor and under
+        // the 800 im2col spatial floor, so this is the *mirrored* relabel with a
         // non-unit `dh` — the one relabel field the strided case above cannot
         // cover — compared against CPU like every other case here.
         (
@@ -351,7 +374,7 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 c_in: 384,
                 c_out: 384,
                 h: 1,
-                w: 1000,
+                w: 800,
                 k: [1, 7],
                 s: [1, 1],
                 p: [0, 3],
@@ -409,19 +432,19 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
             },
         ),
         // The shape the mirror must *refuse* (H a real axis: height padding 1 ⇒
-        // out 3×512) is deliberately NOT here: the shared suite runs every case
+        // out 3×200) is deliberately NOT here: the shared suite runs every case
         // on every arm, and the MLX backend's own 1-D lift takes such a shape and
-        // fails its reshape (`Cannot reshape array of size 32768 into shape
-        // (1,64,3,512)`) — its guard, like the wgpu mirror's, has to exclude a
+        // fails its reshape — its guard, like the wgpu mirror's, has to exclude a
         // padded height axis, but that is a sibling backend's defect to fix, not
         // this change's. The refusal is pinned instead in the wgpu-only route
         // table (`conv_route_cost::expected_routes`, row `refuse-height-pad`),
-        // where the shape is discriminable: its output spatial sits above the
-        // tiled floor, so a lost refusal relabels it into the tiled route and
-        // fails that assertion.
+        // where the shape is discriminable: its output spatial sits above the 256
+        // tiled floor and under the 800 im2col floor, so a lost refusal relabels it
+        // into the tiled route and fails that assertion.
         // 1×1 pointwise: routed to the `Step::Matmul` GEMM when the activation
-        // clears that route's floor (`c_in * h_out * w_out` at least the im2col
-        // route's smallest col matrix, `min_k * min_spatial`) — all four are.
+        // clears that route's own frozen bar (`c_in * h_out * w_out` at least
+        // `256 × 2048`) — all four are. The bar is a number of its own, not the
+        // im2col route's `min_k * min_spatial`, which has to be free to move.
         (
             "pointwise-1x1-l800",
             Cfg {

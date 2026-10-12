@@ -4,32 +4,49 @@
 
 //! **Measurement only, `#[ignore]`d — prints, never asserts a time.**
 //!
-//! The accelerated conv routes — im2col+GEMM, the mirrored 1-D tiled relabel and
-//! the 1×1 pointwise GEMM — are on by default under one switch
-//! (`RLX_WGPU_CONV_IM2COL`; `=0` restores the plain routing). This harness is the
-//! marginal-cost evidence for that flip over the decoder-body conv shapes the
-//! forward-parity suite pins (`conv2d_groups_parity.rs`), plus one dilated
-//! mirrored shape the relabel has to carry and one shape it must refuse: per family
-//! (`Conv1x7`, `Conv1x1`) it prints the wall time of one `WgpuExecutable::run` on
-//! each arm of the switch, then the same protocol per *single shape* — the
-//! family schedule is the union over its shapes, so a shape the route leaves
-//! behind hides in that union, while a one-shape graph names the route that
-//! shape alone takes. It also prints the compiled schedule (arena MiB +
-//! step-name table, which names the routes taken), the cost of the reduced-dispatch
-//! (active-extent) mode the routes veto — once per veto on its own graph: the
-//! dense body conv's `im2col_gpu` step and the 1×1 pointwise conv's
-//! `conv1x1_gemm` step, each probe naming the step that vetoes the mode — and
-//! the plan-invariance check — a conv-free graph must plan identically under
-//! both arms, arena included — and the col-scratch reservation a shape-qualifying
-//! conv pays even where its route does not run (a parked weight).
+//! The accelerated conv routes — im2col+GEMM, the mirrored 1-D tiled relabel and the
+//! 1×1 pointwise GEMM — are on by default under one switch (`RLX_WGPU_CONV_IM2COL`;
+//! `=0` restores the plain routing). This harness is the marginal-cost evidence for
+//! that flip over the decoder-body conv shapes the forward-parity suite pins
+//! (`conv2d_groups_parity.rs`), over one dilated mirrored shape the relabel has to
+//! carry, over one it must refuse, and over the band the im2col floor newly admits on
+//! real 2-D maps (`Conv2d` — unit-height rows reach that band only through the length
+//! axis, so the 2-D half of its blast radius is that family's job). Per family, and
+//! then per *single shape* (the family schedule is the union over its shapes, where a
+//! shape the route leaves behind hides), it prints the route table, the arena MiB, the
+//! wall time of one `WgpuExecutable::run` on each arm of the switch, the
+//! reduced-dispatch (active-extent) cost the routes veto, the plan-invariance check
+//! and the col-scratch reservation a shape-qualifying conv pays even where its route
+//! does not run (a parked weight).
 //!
-//! Nothing here asserts a duration. `run()` includes submission, the device wait
-//! and the readback, so a single reading is mostly that fixed floor; the table is
-//! a direction, not a gate. Only facts that can be stated exactly are asserted: the
-//! route each body shape takes on each arm, that the off arm's schedules carry no
-//! `im2col_gpu` step, that a graph whose convolutions never qualify keeps its plan
-//! *and* its arena under both arms, and that a shape-qualifying conv pays the col
-//! reservation even where its route then does not run (a parked weight).
+//! The im2col spatial floor and the 1×1 route's admission bar are two decisions, not
+//! one: the 1×1 bar is the frozen `256 × 2048` product the two once shared
+//! (`backend::POINTWISE_MIN_COL_ELEMS`), so the floor's default of 800 moves the
+//! non-pointwise sub-2048 shapes (the decoder body's `conv1` forms) onto the
+//! materialised route and leaves every 1×1 shape exactly where it was.
+//!
+//! Nothing here asserts a duration: `run()` includes submission, the device wait and
+//! the readback, so a reading is mostly that fixed floor. Only facts that can be
+//! stated exactly are asserted — the route each shape takes on each arm (only the
+//! scalable direct/tiled ones can honour a bucketed extent), that the off arm carries
+//! no `im2col_gpu` step, that a graph whose convolutions never qualify keeps its plan
+//! *and* its arena under both arms, every row's arena growth (see `expected_col_delta`
+//! for the recorded deltas and `backend::conv_route_decision_tests` for the arithmetic
+//! under them), and that a shape-qualifying conv pays its reservation, parked or not.
+//!
+//! For the rows this change moves that no other accelerated path served — every `Conv2d`
+//! row, which the old floor of 2048 left on the direct kernel — the off arm *is* the
+//! pre-change routing, so its ratio is the row's own. `dense-l800` is not such a row: that
+//! floor left it on the `conv2d_tiled` relabel, so its off column (the direct kernel)
+//! overstates the win, and it alone is measured a third time with the old floor put back
+//! through the lever the run itself pulls (`RLX_WGPU_IM2COL_MIN_SPATIAL=2048`; see
+//! `predecessor_pair`). `lift-slot0-l1000`'s off arm already *is* that relabel, so its off
+//! column is its before side.
+//!
+//! The adapter/allocation half of the same decision is printed here where it is non-zero
+//! and asserted where both arms are reachable (`conv_routes_parked_weight.rs` reads
+//! `im2col_fallbacks()` as zero on the arm that routes and non-zero on the parked arm);
+//! the causes are stated once, in the `Op::Conv` arm of `src/backend/compile/lower.rs`.
 //!
 //! Run the thermal gate first (`just throttle`).
 
@@ -40,13 +57,16 @@ use std::collections::BTreeMap;
 
 mod common;
 
-/// One unit-height 1-D conv of the reproduced decoder body: `[1, C_in, 1, L]`
-/// input, kernel `k`, stride `s`, padding `p`, per-axis dilation `d`, `groups`.
+/// One conv fixture of an `N = 1` NCHW graph: `[1, C_in, h, l]` input, kernel
+/// `k`, stride `s`, padding `p`, per-axis dilation `d`, `groups`. The decoder
+/// body rows are unit-height 1-D lifts (`h: 1`); the 2-D band rows below are real
+/// maps.
 #[derive(Clone, Copy)]
 struct BodyConv {
     label: &'static str,
     c_in: usize,
     c_out: usize,
+    h: usize,
     l: usize,
     k: [usize; 2],
     s: [usize; 2],
@@ -55,15 +75,17 @@ struct BodyConv {
     groups: usize,
 }
 
-/// The 7-tap (`Conv1x7`) family: the nine dense/sub-threshold shapes with the
-/// length taps in slot 1, the two depthwise shapes, the ONNX lift with the taps
-/// in slot 0, and one dilated mirrored shape — the shapes the forward-parity
-/// suite added plus the dilation axis the mirrored relabel has to carry.
-const CONV1X7: [BodyConv; 12] = [
+/// The 7-tap (`Conv1x7`) family: the dense shapes with the length taps in slot 1
+/// (`dense-l800` sits exactly on the 800 im2col spatial floor and is the
+/// boundary pin for it), the two depthwise shapes, the ONNX lift with the taps in
+/// slot 0, and one dilated mirrored shape — the shapes the forward-parity suite
+/// added plus the dilation axis the mirrored relabel has to carry.
+const CONV1X7: [BodyConv; 13] = [
     BodyConv {
         label: "dense-l800",
         c_in: 768,
         c_out: 768,
+        h: 1,
         l: 800,
         k: [1, 7],
         s: [1, 1],
@@ -75,6 +97,7 @@ const CONV1X7: [BodyConv; 12] = [
         label: "dense-l4000",
         c_in: 384,
         c_out: 384,
+        h: 1,
         l: 4000,
         k: [1, 7],
         s: [1, 1],
@@ -86,6 +109,7 @@ const CONV1X7: [BodyConv; 12] = [
         label: "dense-l16000",
         c_in: 192,
         c_out: 192,
+        h: 1,
         l: 16000,
         k: [1, 7],
         s: [1, 1],
@@ -97,6 +121,7 @@ const CONV1X7: [BodyConv; 12] = [
         label: "dense-l48000",
         c_in: 96,
         c_out: 96,
+        h: 1,
         l: 48000,
         k: [1, 7],
         s: [1, 1],
@@ -108,6 +133,7 @@ const CONV1X7: [BodyConv; 12] = [
         label: "mirror-projection",
         c_in: 96,
         c_out: 1,
+        h: 1,
         l: 48000,
         k: [1, 7],
         s: [1, 1],
@@ -119,6 +145,7 @@ const CONV1X7: [BodyConv; 12] = [
         label: "mirror-strided-s2",
         c_in: 768,
         c_out: 32,
+        h: 1,
         l: 4000,
         k: [1, 7],
         s: [1, 2],
@@ -130,6 +157,7 @@ const CONV1X7: [BodyConv; 12] = [
         label: "entry-l100",
         c_in: 1024,
         c_out: 1536,
+        h: 1,
         l: 100,
         k: [1, 7],
         s: [1, 1],
@@ -141,6 +169,7 @@ const CONV1X7: [BodyConv; 12] = [
         label: "depthwise-l50",
         c_in: 1024,
         c_out: 1024,
+        h: 1,
         l: 50,
         k: [1, 7],
         s: [1, 1],
@@ -152,6 +181,7 @@ const CONV1X7: [BodyConv; 12] = [
         label: "depthwise-l100",
         c_in: 1024,
         c_out: 1024,
+        h: 1,
         l: 100,
         k: [1, 7],
         s: [1, 1],
@@ -163,6 +193,7 @@ const CONV1X7: [BodyConv; 12] = [
         label: "overlap-slot0",
         c_in: 384,
         c_out: 384,
+        h: 1,
         l: 4000,
         k: [7, 1],
         s: [1, 1],
@@ -170,16 +201,34 @@ const CONV1X7: [BodyConv; 12] = [
         d: [1, 1],
         groups: 1,
     },
+    // The same slot-0 lift as `overlap-slot0`, but in the band the floor moved: out
+    // 1000 clears the 800 floor, so this row leaves the `one_d` tiled route for the
+    // materialised one (`overlap-slot0`'s 4000 was already im2col at the old floor,
+    // so it cannot census that move). Col 1 792 000 B — under the 64 MiB base
+    // scratch, so it costs the arena nothing.
+    BodyConv {
+        label: "lift-slot0-l1000",
+        c_in: 64,
+        c_out: 64,
+        h: 1,
+        l: 1000,
+        k: [7, 1],
+        s: [1, 1],
+        p: [3, 0],
+        d: [1, 1],
+        groups: 1,
+    },
     // The only shape here that exercises the dilation axis through the mirrored
-    // relabel: the out length is 994, under the 2048 im2col spatial floor — so
-    // im2col does not take it — but over the 256 tiled floor, so it lands on the
+    // relabel: the out length is 794, just under the 800 im2col spatial floor — so
+    // im2col does not take it — and over the 256 tiled floor, so it lands on the
     // mirrored relabel, which copies the slot-1 dilation into the tiled kernel's
-    // `dh` (2 here, the stride-2 case above only covers `sh`).
+    // `dh` (2 here; the stride-2 case above only covers `sh`).
     BodyConv {
         label: "mirror-dilated-d2",
         c_in: 384,
         c_out: 384,
-        l: 1000,
+        h: 1,
+        l: 800,
         k: [1, 7],
         s: [1, 1],
         p: [0, 3],
@@ -188,17 +237,19 @@ const CONV1X7: [BodyConv; 12] = [
     },
     // The mirror must be REFUSED here, and the route table below pins that: the
     // height axis carries padding, so H is a real axis — the relabel would move
-    // it onto the length axis and resize the output (3×512 instead of 512). The
-    // output spatial (1536) is deliberately *above* the 256 tiled floor and below
-    // the 2048 im2col floor, so this row discriminates: were the refusal lost,
-    // the shape would relabel into the tiled route and the assertion below would
-    // fail instead of the row printing a plausible number (with spatial below the
-    // tiled floor both outcomes are `conv2d` and the row is inert).
+    // it onto the length axis and resize the output (3×200 instead of 200). The
+    // output spatial (3×200 = 600) is deliberately *above* the 256 tiled floor
+    // and *below* the 800 im2col floor, so this row discriminates: were the
+    // refusal lost, the shape would relabel into the tiled route and the assertion
+    // below would fail instead of the row printing a plausible number (with
+    // spatial below the tiled floor both outcomes are `conv2d` and the row is
+    // inert).
     BodyConv {
         label: "refuse-height-pad",
         c_in: 64,
         c_out: 64,
-        l: 512,
+        h: 1,
+        l: 200,
         k: [1, 7],
         s: [1, 1],
         p: [1, 3],
@@ -207,13 +258,32 @@ const CONV1X7: [BodyConv; 12] = [
     },
 ];
 
-/// The pointwise (`Conv1x1`) family.
-const CONV1X1: [BodyConv; 4] = [
+/// The pointwise (`Conv1x1`) family: four shapes above the 1×1 route's own
+/// frozen col-matrix bar and one below it.
+const CONV1X1: [BodyConv; 5] = [
     BodyConv {
         label: "l800",
         c_in: 768,
         c_out: 768,
+        h: 1,
         l: 800,
+        k: [1, 1],
+        s: [1, 1],
+        p: [0, 0],
+        d: [1, 1],
+        groups: 1,
+    },
+    // The frozen 1×1 bar, seen from below: `c_in × spatial` = 384 000 lies inside
+    // the band the im2col floor's old coupling would admit once that floor moved
+    // (256 × 800) and below the 1×1 route's own bar (256 × 2048), so the row must
+    // keep the direct kernel on both arms. Were the 1×1 admission still tied to
+    // the im2col floor, it would flip to `conv1x1_gemm` here.
+    BodyConv {
+        label: "sub-bar-l3000",
+        c_in: 128,
+        c_out: 128,
+        h: 1,
+        l: 3000,
         k: [1, 1],
         s: [1, 1],
         p: [0, 0],
@@ -224,6 +294,7 @@ const CONV1X1: [BodyConv; 4] = [
         label: "l4000",
         c_in: 384,
         c_out: 384,
+        h: 1,
         l: 4000,
         k: [1, 1],
         s: [1, 1],
@@ -235,6 +306,7 @@ const CONV1X1: [BodyConv; 4] = [
         label: "l16000",
         c_in: 192,
         c_out: 192,
+        h: 1,
         l: 16000,
         k: [1, 1],
         s: [1, 1],
@@ -246,10 +318,64 @@ const CONV1X1: [BodyConv; 4] = [
         label: "l48000",
         c_in: 96,
         c_out: 96,
+        h: 1,
         l: 48000,
         k: [1, 1],
         s: [1, 1],
         p: [0, 0],
+        d: [1, 1],
+        groups: 1,
+    },
+];
+
+/// The band the 800 im2col spatial floor newly admits — spatial in `[800, 2048)`,
+/// the extent the old floor of 2048 refused — on shapes the unit-height families
+/// above cannot represent: real 2-D maps. Those rows reach the floor only through
+/// the length axis, so the 2-D half of the band's blast radius (an ordinary
+/// vision conv on a small map) is this family's job.
+///
+/// All three rows sit strictly inside the band. `map-3x3-29x29-c32` is the smallest
+/// ordinary one: extent 841 just over the floor, `c_in*kh*kw` 288 just over the K
+/// floor, `c_out` on its floor. `map-3x3-40x40` is the ordinary case
+/// (spatial 1600, col 3.7 MB — under the 64 MiB base scratch, so the shape costs
+/// the arena nothing); `map-5x5-30x30-c1024` carries the same band with a col
+/// panel past that base (`c_in*kh*kw*spatial*4` = 92 MB), so its reservation does
+/// grow the tail, by `col − 64 MiB`, exactly as any qualifying conv above the old
+/// floor already did before this change.
+const CONV2D: [BodyConv; 3] = [
+    BodyConv {
+        label: "map-3x3-29x29-c32",
+        c_in: 32,
+        c_out: 64,
+        h: 29,
+        l: 29,
+        k: [3, 3],
+        s: [1, 1],
+        p: [1, 1],
+        d: [1, 1],
+        groups: 1,
+    },
+    BodyConv {
+        label: "map-3x3-40x40",
+        c_in: 64,
+        c_out: 64,
+        h: 40,
+        l: 40,
+        k: [3, 3],
+        s: [1, 1],
+        p: [1, 1],
+        d: [1, 1],
+        groups: 1,
+    },
+    BodyConv {
+        label: "map-5x5-30x30-c1024",
+        c_in: 1024,
+        c_out: 64,
+        h: 30,
+        l: 30,
+        k: [5, 5],
+        s: [1, 1],
+        p: [2, 2],
         d: [1, 1],
         groups: 1,
     },
@@ -287,13 +413,13 @@ fn build_family(name: &'static str, shapes: &[BodyConv]) -> BodyGraph {
     for (i, c) in shapes.iter().enumerate() {
         let xn = format!("x{i}");
         let wn = format!("w{i}");
-        let x = g.input(&xn, Shape::new(&[1, c.c_in, 1, c.l], DType::F32));
+        let x = g.input(&xn, Shape::new(&[1, c.c_in, c.h, c.l], DType::F32));
         let w = g.param(
             &wn,
             Shape::new(&[c.c_out, c.c_in / c.groups, c.k[0], c.k[1]], DType::F32),
         );
         outs.push(g.conv2d(x, w, c.k, c.s, c.p, c.d, c.groups));
-        inputs.push((xn, fill(c.c_in * c.l, i as u64)));
+        inputs.push((xn, fill(c.c_in * c.h * c.l, i as u64)));
         params.push((
             wn,
             fill(
@@ -310,6 +436,16 @@ fn build_family(name: &'static str, shapes: &[BodyConv]) -> BodyGraph {
         inputs,
         labels,
     }
+}
+
+/// The table row a probe measures, looked up rather than re-spelled: a probe that
+/// repeated a row's geometry would silently measure a different shape once the table
+/// is edited.
+fn row(table: &[BodyConv], label: &str) -> BodyConv {
+    *table
+        .iter()
+        .find(|c| c.label == label)
+        .unwrap_or_else(|| panic!("no {label} row in the harness tables"))
 }
 
 /// One compiled arm of the switch: the executable plus the inputs to hand it.
@@ -374,19 +510,38 @@ fn conv_route(counts: &BTreeMap<&'static str, usize>) -> &'static str {
 /// The route each body shape must take on each arm of the switch, `(off, on)`:
 /// a shape whose route silently disappears would otherwise show up only as a
 /// 1.00× row in a harness nobody diffs. The two arms are pinned together, so the
-/// table also states which shape moved (the `overlap` row: already accelerated
-/// today, onto the other accelerated route), which shapes stay on the direct
-/// kernel under both arms (`entry`, the two `depthwise`, and the shape the mirror
-/// must *refuse*), and that a lost refusal cannot pass unnoticed.
+/// table also states which shapes moved (`overlap`: already accelerated today, onto
+/// the other accelerated route; `dense-l800`: the decoder-body row whose route the
+/// 800 im2col floor changes — it sits exactly on it; the `Conv2d` rows: shapes
+/// strictly inside the band that floor newly admits), which shapes stay on the
+/// direct kernel
+/// under both arms (`entry`, the two `depthwise`, the shape the mirror must
+/// *refuse*, and the 1×1 shape below the pointwise bar), and that a lost refusal
+/// cannot pass unnoticed. The two rows that floor would otherwise swallow —
+/// `mirror-dilated-d2` (the relabel's dilation axis) and `refuse-height-pad` (the
+/// refusal) — sit just under it by construction.
 fn expected_routes(family: &str, label: &str) -> (&'static str, &'static str) {
     match (family, label) {
+        ("Conv1x1", "sub-bar-l3000") => ("conv2d", "conv2d"),
         ("Conv1x1", _) => ("conv2d", "conv1x1_gemm"),
-        (_, "dense-l800") => ("conv2d", "conv2d_tiled"),
-        (_, "dense-l4000" | "dense-l16000" | "dense-l48000") => ("conv2d", "im2col_gpu"),
+        // The newly admitted band on real 2-D maps: all three rows sit strictly
+        // inside it (extents 841, 1600 and 900), so all move direct → materialised.
+        ("Conv2d", "map-3x3-29x29-c32" | "map-3x3-40x40" | "map-5x5-30x30-c1024") => {
+            ("conv2d", "im2col_gpu")
+        }
+        // `dense-l800` sits exactly on the 800 im2col spatial floor: the boundary
+        // row for it (the floor is inclusive).
+        (_, "dense-l800" | "dense-l4000" | "dense-l16000" | "dense-l48000") => {
+            ("conv2d", "im2col_gpu")
+        }
+        // `mirror-projection` and `mirror-strided-s2` clear the spatial floor but
+        // not the `c_out` floor, so they still carry the mirrored relabel; and
+        // `mirror-dilated-d2` carries the relabel's dilation axis from below the
+        // 800 floor.
         (_, "mirror-projection" | "mirror-strided-s2" | "mirror-dilated-d2") => {
             ("conv2d", "conv2d_tiled")
         }
-        (_, "overlap-slot0") => ("conv2d_tiled", "im2col_gpu"),
+        (_, "overlap-slot0" | "lift-slot0-l1000") => ("conv2d_tiled", "im2col_gpu"),
         (_, "entry-l100" | "depthwise-l50" | "depthwise-l100" | "refuse-height-pad") => {
             ("conv2d", "conv2d")
         }
@@ -416,13 +571,15 @@ fn set_arm(off: bool) {
 }
 
 /// One graph measured under both arms of the switch: the medians, each arm's
-/// step-name table (which names the routes it took) and the outputs of the last
-/// round.
+/// step-name table (which names the routes it took), the planned arena bytes and
+/// the outputs of the last round.
 struct Pair {
     off_us: u128,
     on_us: u128,
     off_counts: BTreeMap<&'static str, usize>,
     on_counts: BTreeMap<&'static str, usize>,
+    off_arena: u64,
+    on_arena: u64,
     off_out: Vec<Vec<f32>>,
     on_out: Vec<Vec<f32>>,
 }
@@ -436,8 +593,8 @@ fn measure_pair(scope: &str, bg: &BodyGraph) -> Pair {
     let mut off = Arm::new("off", bg);
     set_arm(false);
     let mut on = Arm::new("on", bg);
-    let off_counts = off.exe.step_kind_counts();
-    let on_counts = on.exe.step_kind_counts();
+    let (off_counts, on_counts) = (off.exe.step_kind_counts(), on.exe.step_kind_counts());
+    let (off_arena, on_arena) = (off.exe.test_arena_bytes(), on.exe.test_arena_bytes());
     eprintln!(
         "  {scope}: arm off {} steps [{}]",
         off_counts.values().sum::<usize>(),
@@ -481,27 +638,51 @@ fn measure_pair(scope: &str, bg: &BodyGraph) -> Pair {
         on_us,
         off_counts,
         on_counts,
+        off_arena,
+        on_arena,
         off_out,
         on_out,
     }
 }
 
-/// The active-extent (reduced-dispatch) protocol, once per graph: on each arm of
-/// the switch, compile, print the arm's step-name table and the mode's
-/// availability, and — where some step vetoes the mode — measure what a bucketed
-/// `(2, 4)` extent costs against the full extent. `scope` names the graph and the
-/// step the routes are expected to veto it with, so the two probes (the dense
-/// conv's `im2col_gpu`, the 1×1 pointwise conv's `conv1x1_gemm`) read apart.
-fn probe_active_extent(scope: &str, bg: &BodyGraph) {
-    for off in [true, false] {
+/// The third arm, for `dense-l800`, whose off column is not its before side: the same
+/// protocol with the documented lever's floor put back, so the row's before side is printed
+/// by this run instead of living as a reading in prose.
+fn predecessor_pair(scope: &str, bg: &BodyGraph) -> Pair {
+    rlx_ir::env::set("RLX_WGPU_IM2COL_MIN_SPATIAL", "2048");
+    rlx_wgpu::reload_runtime_config();
+    let pair = measure_pair(scope, bg);
+    rlx_ir::env::unset("RLX_WGPU_IM2COL_MIN_SPATIAL");
+    rlx_wgpu::reload_runtime_config();
+    pair
+}
+
+/// The active-extent (reduced-dispatch) protocol, once per graph: on each arm of the
+/// switch, compile, assert the arm's conv route and whether the mode is available for
+/// it (only the scalable `conv2d` / `conv2d_tiled` routes can honour a bucketed
+/// extent), print the arm's step-name table, and — where some step vetoes the mode —
+/// measure what a bucketed `(2, 4)` extent costs against the full extent. `want_routes`
+/// is the `(off, on)` route the probe's graph must take, which also names the step that
+/// vetoes the mode.
+fn probe_active_extent(scope: &str, bg: &BodyGraph, want_routes: [&'static str; 2]) {
+    for (i, off) in [true, false].into_iter().enumerate() {
         set_arm(off);
         let mut arm = Arm::new(if off { "off" } else { "on" }, bg);
         let counts = arm.exe.step_kind_counts();
+        let route = conv_route(&counts);
         let safe = arm.exe.test_all_steps_safe_for_active_extent();
         eprintln!(
-            "  active-extent, {scope}, arm {}: test_all_steps_safe_for_active_extent = {safe} [{}]",
+            "  active-extent, {scope}, arm {}: route {route}, \
+             test_all_steps_safe_for_active_extent = {safe} [{}]",
             arm.label,
             fmt_counts(&counts)
+        );
+        assert_eq!(route, want_routes[i], "{scope}: arm {} route", arm.label);
+        assert_eq!(
+            safe,
+            matches!(route, "conv2d" | "conv2d_tiled"),
+            "{scope}: arm {} — only the scalable conv routes can honour a bucketed extent",
+            arm.label
         );
         if safe {
             // Nothing vetoes the mode on this arm, so no bucketed run is lost.
@@ -551,6 +732,33 @@ fn fmt_delta(d: f32) -> String {
     }
 }
 
+/// The arena bytes each row's col reservation costs, recorded from a run of this
+/// harness rather than recomputed here: the tail scratch is `max(existing, col)`,
+/// and `compute_scratch_bytes` floors the existing half at 64 MiB, so a col under
+/// that base costs nothing and a larger one costs `col − 64 MiB`. A row that
+/// qualifies for no accelerated route by shape reserves nothing. The reservation's
+/// arithmetic — the col a shape gives, both caps the planner applies to it and the
+/// 64 MiB tail base — is pinned device-free by `backend::conv_route_decision_tests`;
+/// what the numbers below add is that arithmetic against these exact fixtures. An
+/// unlisted label panics rather than recording a silent zero, so a renamed or added
+/// fixture cannot assert nothing.
+fn expected_col_delta(label: &str) -> u64 {
+    match label {
+        // 129 024 000 B col − 64 MiB, the body's largest.
+        "dense-l48000" => 61_915_136,
+        // 86 016 000 B col − 64 MiB.
+        "dense-l16000" => 18_907_136,
+        // 92 160 000 B col − 64 MiB, the in-band 2-D map.
+        "map-5x5-30x30-c1024" => 25_051_136,
+        // Cols that fit the 64 MiB base tail: nothing to reserve.
+        "dense-l800" | "dense-l4000" | "map-3x3-29x29-c32" | "map-3x3-40x40"
+        | "lift-slot0-l1000" | "mirror-projection" | "mirror-strided-s2" | "mirror-dilated-d2"
+        | "refuse-height-pad" | "overlap-slot0" | "entry-l100" | "depthwise-l50"
+        | "depthwise-l100" | "l800" | "l4000" | "l16000" | "l48000" | "sub-bar-l3000" => 0,
+        other => panic!("no recorded col delta for {other:?} — the body shape list grew"),
+    }
+}
+
 /// One row of a per-shape table.
 struct ShapeRow {
     label: &'static str,
@@ -558,21 +766,23 @@ struct ShapeRow {
     on_counts: BTreeMap<&'static str, usize>,
     off_us: u128,
     on_us: u128,
+    off_arena: u64,
+    on_arena: u64,
     max_delta: f32,
 }
 
 /// Print a family's per-shape table: for each single-shape graph, the route its
-/// *own* compile took on each arm, the medians, the speedup, and the cross-arm
-/// `max|Δ|`.
+/// *own* compile took on each arm, the medians, the speedup, the planned arena on
+/// each arm (MiB) and the cross-arm `max|Δ|`.
 fn print_shape_table(family: &str, rows: &[ShapeRow]) {
     eprintln!("  {family} per-shape (one graph per shape, same protocol, same session):");
     eprintln!(
-        "    {:<16} | {:<40} | {:>8} | {:>8} | {:>8} | {:>16}",
-        "label", "route off → route on", "off µs", "on µs", "speedup", "max|Δ|"
+        "    {:<16} | {:<40} | {:>8} | {:>8} | {:>8} | {:>16} | {:>13}",
+        "label", "route off → route on", "off µs", "on µs", "speedup", "max|Δ|", "arena MiB"
     );
     for r in rows {
         eprintln!(
-            "    {:<16} | {:<40} | {:>8} | {:>8} | {:>7.2}× | {:>16}",
+            "    {:<16} | {:<40} | {:>8} | {:>8} | {:>7.2}× | {:>16} | {:>13}",
             r.label,
             format!(
                 "{} → {}",
@@ -583,6 +793,11 @@ fn print_shape_table(family: &str, rows: &[ShapeRow]) {
             r.on_us,
             r.off_us as f64 / r.on_us.max(1) as f64,
             fmt_delta(r.max_delta),
+            format!(
+                "{:.1}→{:.1}",
+                r.off_arena as f64 / (1u64 << 20) as f64,
+                r.on_arena as f64 / (1u64 << 20) as f64
+            ),
         );
     }
 }
@@ -607,10 +822,12 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     }
     let device = rlx_wgpu::device::adapter_name().unwrap_or_else(|| "wgpu".into());
     eprintln!(
-        "wgpu conv-route cost on {device}: {} Conv1x7 + {} Conv1x1 body shapes, 3 interleaved \
-         rounds per arm (off = RLX_WGPU_CONV_IM2COL=0, on = unset/default) after one warm-up run",
+        "wgpu conv-route cost on {device}: {} Conv1x7 + {} Conv1x1 body shapes + {} in-band 2-D \
+         maps, 3 interleaved rounds per arm (off = RLX_WGPU_CONV_IM2COL=0, on = unset/default) \
+         after one warm-up run",
         CONV1X7.len(),
-        CONV1X1.len()
+        CONV1X1.len(),
+        CONV2D.len()
     );
     // The lowering prints `[rlx-wgpu] schedule: N steps, arena=X MiB` plus the
     // `count × step-name` table for every compile below.
@@ -621,7 +838,11 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     // whose every row names the route *that shape alone* takes. The family
     // schedule is the union over its shapes, so a shape the route leaves behind
     // (or one it newly takes) is invisible in it.
-    for (family, shapes) in [("Conv1x7", &CONV1X7[..]), ("Conv1x1", &CONV1X1[..])] {
+    for (family, shapes) in [
+        ("Conv1x7", &CONV1X7[..]),
+        ("Conv1x1", &CONV1X1[..]),
+        ("Conv2d", &CONV2D[..]),
+    ] {
         let bg = build_family(family, shapes);
         eprintln!("  {family}: shapes [{}]", bg.labels.join(", "));
         let _ = measure_pair(family, &bg);
@@ -644,12 +865,41 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
                 shape.label,
                 pair.on_counts
             );
+            // The memory half of the switch, pinned on every row against the delta
+            // recorded for it in `expected_col_delta` — nothing is recomputed here. A
+            // shape-qualifying conv costs the col panel above the 64 MiB base
+            // `compute_scratch_bytes` floors the existing tail at; every other row
+            // costs nothing, which is why the moved decoder shape's own col leaves the
+            // arena alone while an in-band col over that base does grow it. A failure
+            // here on an adapter whose `max_storage_buffer_binding_size` cannot take
+            // the col says the accelerated routes are off on that adapter — loud, not
+            // silent.
+            assert_eq!(
+                pair.on_arena - pair.off_arena,
+                expected_col_delta(shape.label),
+                "{}: the arena growth the row's recorded col reservation predicts",
+                shape.label
+            );
+            // `dense-l800`'s off column is not its before side (that floor left it on the
+            // relabel, off leaves it on the direct kernel): it alone gets the third arm.
+            if shape.label == "dense-l800" {
+                // The reading at the old floor, where the `conv2d_tiled` relabel carried it.
+                let pre = predecessor_pair(&format!("{} @2048", shape.label), &one);
+                assert_eq!(
+                    conv_route(&pre.on_counts),
+                    "conv2d_tiled",
+                    "{}: the route this row ran at the old 2048 floor",
+                    shape.label
+                );
+            }
             rows.push(ShapeRow {
                 label: shape.label,
                 off_counts: pair.off_counts,
                 on_counts: pair.on_counts,
                 off_us: pair.off_us,
                 on_us: pair.on_us,
+                off_arena: pair.off_arena,
+                on_arena: pair.on_arena,
                 max_delta: max_delta(&pair.off_out, &pair.on_out),
             });
         }
@@ -657,43 +907,37 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     }
 
     // (2) the reduced-dispatch (active-extent) cost of the routes that veto it,
-    // one probe per veto on its own graph: the dense body conv routes through
-    // `im2col_gpu`, and the 1×1 pointwise conv emits a `conv1x1_gemm` step
-    // (`Step::Matmul { from_conv1x1: true }` — its `m` is the output-channel axis,
-    // so scaling `m` would leave channels unwritten) on a shape the dense probe
-    // never measures.
-    let dense = BodyConv {
-        label: "dense-l4000",
-        c_in: 384,
-        c_out: 384,
-        l: 4000,
-        k: [1, 7],
-        s: [1, 1],
-        p: [0, 3],
-        d: [1, 1],
-        groups: 1,
-    };
+    // three probes on their own graphs, each naming the step that vetoes the mode:
+    // the dense body conv routes through `im2col_gpu`; the 1×1 pointwise conv emits
+    // a `conv1x1_gemm` step (`Step::Matmul { from_conv1x1: true }` — its `m` is the
+    // output-channel axis, so scaling `m` would leave channels unwritten) on a shape
+    // the dense probe never measures; and (2b) below, the band the moved floor newly
+    // admits.
+    let dense = row(&CONV1X7, "dense-l4000");
     probe_active_extent(
         "dense [1,384,1,4000] k=[1,7], vetoed by im2col_gpu",
         &build_family("conv_active_extent", std::slice::from_ref(&dense)),
+        ["conv2d", "im2col_gpu"],
     );
-    let pointwise = BodyConv {
-        label: "l800",
-        c_in: 768,
-        c_out: 768,
-        l: 800,
-        k: [1, 1],
-        s: [1, 1],
-        p: [0, 0],
-        d: [1, 1],
-        groups: 1,
-    };
+    let pointwise = row(&CONV1X1, "l800");
     probe_active_extent(
         "pointwise [1,768,1,800] 1×1 768→768, vetoed by conv1x1_gemm",
         &build_family(
             "conv_active_extent_pointwise",
             std::slice::from_ref(&pointwise),
         ),
+        ["conv2d", "conv1x1_gemm"],
+    );
+
+    // (2b) the band the moved floor newly admits, on a graph whose only conv sits in
+    // it — the smallest row there is, its extent just over the floor: the direct kernel
+    // the shape used to take was active-extent safe, the `im2col_gpu` step it now takes
+    // is not, so this graph loses the mode.
+    let near_floor = row(&CONV2D, "map-3x3-29x29-c32");
+    probe_active_extent(
+        "band [map-3x3-29x29-c32] (the floor's newest band), vetoed by im2col_gpu",
+        &build_family("conv_active_extent_band", std::slice::from_ref(&near_floor)),
+        ["conv2d", "im2col_gpu"],
     );
 
     // (3) plan invariance. The col-scratch reservation is decided from a conv's
@@ -761,19 +1005,18 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
 
     // (4) the shape-decided col reservation, seen where its route does not run: a
     // parked weight keeps the qualifying conv on the previous `conv2d` route, yet the
-    // arena still holds the reservation the switch grants by *shape* alone. The tail
-    // scratch is `max(existing, col)` — shared, not additive — and
-    // `compute_scratch_bytes` floors the existing half at 64 MiB, so the reservation
-    // costs arena bytes only above that floor: nothing for a col under it
-    // (dense-l4000, 43 MB) and `col − 64 MiB` for the body's largest (dense-l48000,
-    // 129 MB) — measured below as the difference between the two arms' printed
-    // arena sizes, and the reason the whole Conv1x7 family's arena grows by the
-    // largest col alone rather than by the sum of them.
-    const SCRATCH_FLOOR: u64 = 64 * 1024 * 1024;
-    let big = *CONV1X7
-        .iter()
-        .find(|c| c.label == "dense-l48000")
-        .expect("dense-l48000");
+    // arena still holds the reservation the switch grants by *shape* alone — the same
+    // recorded deltas `expected_col_delta` holds (a col under the 64 MiB base scratch
+    // costs nothing, a larger one costs `col − 64 MiB`), which is also why the whole
+    // Conv1x7 family's arena grows by the largest col alone rather than by the sum of
+    // them. This is also the arm where `im2col_fallbacks()` is non-zero; the count is
+    // printed here, and `conv_routes_parked_weight.rs` asserts both of its arms.
+    let big = row(&CONV1X7, "dense-l48000");
+    let moved = row(&CONV1X7, "dense-l800");
+    // The band's own parked row: a 2-D map newly admitted by the floor whose col
+    // panel is past the 64 MiB base, so the combination "parked, in the band, col
+    // over the base" is pinned too rather than only its two halves.
+    let in_band = row(&CONV2D, "map-5x5-30x30-c1024");
     let parked_pair = |shape: &BodyConv| {
         rlx_ir::env::set("RLX_WGPU_ALL_PARAMS_WEIGHT", "1");
         let bg = build_family("conv_col_scratch_parked", std::slice::from_ref(shape));
@@ -784,21 +1027,19 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         rlx_ir::env::unset("RLX_WGPU_ALL_PARAMS_WEIGHT");
         (off, on)
     };
-    for shape in [dense, big] {
+    for shape in [dense, moved, big, in_band] {
         let (off, on) = parked_pair(&shape);
         let (off_counts, on_counts) = (off.exe.step_kind_counts(), on.exe.step_kind_counts());
-        let col_bytes =
-            (shape.c_in as u64 * shape.k[0] as u64 * shape.k[1] as u64 * shape.l as u64 * 4)
-                .div_ceil(256)
-                * 256;
         let (off_b, on_b) = (off.exe.test_arena_bytes(), on.exe.test_arena_bytes());
         eprintln!(
             "  col reservation, {} weight parked: off [{}] arena {off_b} B / on [{}] arena {on_b} B \
-             — on − off = {} B, col {col_bytes} B",
+             — on − off = {} B, recorded delta {} B, on-arm im2col fallbacks {}",
             shape.label,
             fmt_counts(&off_counts),
             fmt_counts(&on_counts),
-            on_b - off_b
+            on_b - off_b,
+            expected_col_delta(shape.label),
+            on.exe.im2col_fallbacks()
         );
         assert_eq!(
             conv_route(&on_counts),
@@ -808,7 +1049,7 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         );
         assert_eq!(
             on_b - off_b,
-            col_bytes.saturating_sub(SCRATCH_FLOOR),
+            expected_col_delta(shape.label),
             "{}: a shape-qualifying conv pays the col reservation even where its route does \
              not run",
             shape.label
