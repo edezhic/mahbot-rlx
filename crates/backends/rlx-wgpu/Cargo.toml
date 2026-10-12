@@ -280,6 +280,10 @@ name = "gguf_matmul_route"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "gguf_one_row_stream_rate"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "host_route_operand_fit"
 required-features = ["backend-tests"]
 

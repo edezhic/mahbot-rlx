@@ -8,14 +8,15 @@
 //! Preferred path: scratch-free windowed kernels for Q4_K / Q6_K / Q1_0
 //! (decode `m=1` and prefill `m>1`) and for Q8_0's multi-row calls. At `m == 1`
 //! Q4_K / Q6_K take the tiled one-row arm (`dequant_gemv_tiled`: one workgroup
-//! per output column, its threads splitting the contraction, X read four
-//! elements at a time); Q1_0 keeps the original one-thread-per-column arm on the
-//! scalar X view; Q8_0 has no one-row arm and keeps the scratch route. For
-//! `m > 1` Q4_K / Q6_K / Q8_0 use the row-grouped GEMM
-//! (`encode_dequant_matmul_gguf_gemm_grouped`): one pass over each packed weight
-//! tile per group of 8 rows, instead of the per-row GEMV's one full pass over
-//! the weight per row. Older scratch+`matmul_bt` path still exists for schemes
-//! without a fused kernel, and for every shape those kernels refuse.
+//! per `GEMV_TILED_COLS_PER_WG` output columns, its threads splitting each
+//! column's contraction over 32-element units of the packed weight, X read four
+//! elements at a time and shared across those columns); Q1_0 keeps the original
+//! one-thread-per-column arm on the scalar X view; Q8_0 has no one-row arm and
+//! keeps the scratch route. For `m > 1` Q4_K / Q6_K / Q8_0 use the row-grouped
+//! GEMM (`encode_dequant_matmul_gguf_gemm_grouped`): one pass over each packed
+//! weight tile per group of 8 rows, instead of the per-row GEMV's one full pass
+//! over the weight per row. Older scratch+`matmul_bt` path still exists for
+//! schemes without a fused kernel, and for every shape those kernels refuse.
 //!
 //! The one-row arm is picked by *scheme*, not by row count, so it also serves
 //! the per-row fallback the grouped GEMM declines (rows spread over shards, an
@@ -65,28 +66,29 @@ pub fn gemv_supports_scheme(scheme_id: u32) -> bool {
 }
 
 /// The reshaped one-row arm of that GEMV (`dequant_gemv_tiled`): the K-quant
-/// schemes whose 256-element blocks split into 32-element sub-blocks, which is
-/// the element/byte mapping that arm is written against. The other arm is what
-/// is left of [`gemv_supports_scheme`] once these are taken out — Q1_0, whose
-/// 128-element blocks with 8-element sign bytes do not fit the tiled arm's
-/// sub-blocks and so keeps one thread per output column. Each arm's shader
-/// branches are tied to its routing by `tests/gguf_kernel_scheme_coverage.rs`.
+/// schemes, whose 256-element blocks this arm reads through 32-element units
+/// (what a unit *is* differs per scheme — see its shader header). The other arm
+/// is what is left of [`gemv_supports_scheme`] once these are taken out — Q1_0,
+/// whose 128-element blocks with 8-element sign bytes do not fit that unit and so
+/// keeps one thread per output column. Each arm's shader branches are tied to its
+/// routing by `tests/gguf_kernel_scheme_coverage.rs`.
 pub fn gemv_tiled_supports_scheme(scheme_id: u32) -> bool {
     matches!(scheme_id, 0 | 2)
 }
 
 /// Whether the one-row route can run this call on the device.
 ///
-/// The tiled arm reads X as `vec4` (8 vector loads per lane instead of 32 scalar
-/// ones), so the window's own offset and the row stride (`k` elements) must both
-/// line up with a four-element group. True at the shapes these schemes are used
-/// at — the arena aligns every tensor to 16 bytes and `k` is a multiple of 256 —
-/// and false for a view the route then hands to the host rather than reading X
-/// shifted. The grouped GEMM checks the same two things for its own `vec4` X
-/// reads. Pinned device-free by `tests/gguf_kernel_scheme_coverage.rs`.
-pub fn gemv_one_row_device_ok(scheme_id: u32, x_byte_off: usize, row_bytes: usize) -> bool {
+/// The tiled arm reads X as `vec4` (8 vector loads per unit instead of 32 scalar
+/// ones), so the window's own offset and the input row stride (`x_row_bytes`, the
+/// row's `k` elements — not `gguf_row_bytes`, the packed weight's stride) must
+/// both line up with a four-element group. True at the shapes these schemes are
+/// used at — the arena aligns every tensor to 16 bytes and `k` is a multiple of
+/// 256 — and false for a view the route then hands to the host rather than
+/// reading X shifted. The grouped GEMM checks the same two things for its own
+/// `vec4` X reads. Pinned device-free by `tests/gguf_kernel_scheme_coverage.rs`.
+pub fn gemv_one_row_device_ok(scheme_id: u32, x_byte_off: usize, x_row_bytes: usize) -> bool {
     !gemv_tiled_supports_scheme(scheme_id)
-        || (x_byte_off.is_multiple_of(16) && row_bytes.is_multiple_of(16))
+        || (x_byte_off.is_multiple_of(16) && x_row_bytes.is_multiple_of(16))
 }
 
 /// Which entry point the run path calls for one packed multiply — the ladder's
@@ -294,19 +296,33 @@ pub(crate) fn note_route(route: DequantMatmulRoute) {
 }
 
 /// Threads one workgroup of a one-row packed multiply runs, per arm: the tiled
-/// arm splits a column's contraction over 32 lanes (one lane per 32-element
-/// sub-block), the legacy arm gives each of its 64 threads one output column.
+/// arm splits a column's contraction over 32 lanes, one lane per 32-element unit
+/// of the row (a Q4_K sub-block, or half a Q6_K `ql` span read at both of its
+/// nibble sets — see the shader header); the legacy arm gives each of its 64
+/// threads one output column.
 ///
 /// The shader's declared `@workgroup_size` and the shape the route records must
-/// both be these numbers: `tests/gguf_kernel_scheme_coverage.rs` pins the first
-/// (as literals, the constants being private), `tests/gguf_matmul_route.rs` the
-/// second.
+/// both be these numbers: the device-free `tiled_gemv_geometry_matches_the_shader`
+/// below derives the tiled arm's `@workgroup_size` (and its `LANES`/`COLS_PER_WG`)
+/// from these constants, `tests/gguf_kernel_scheme_coverage.rs` pins the legacy
+/// arm's size and the portable floor, and `tests/gguf_matmul_route.rs` pins the
+/// recorded shape.
 const GEMV_TILED_THREADS: u32 = 32;
 const GEMV_LEGACY_THREADS: u32 = 64;
 
+/// Output columns one workgroup of the tiled arm covers. Two, so a workgroup
+/// covers two output columns and splits each one's contraction over its threads,
+/// reusing one X read for both; the dispatch is then `ceil(columns / this)`
+/// workgroups wide, which is the form both the dispatch cap in
+/// [`gemv_one_row_cols_per_chunk`] and the recorded shape below are written in.
+const GEMV_TILED_COLS_PER_WG: u32 = 2;
+
 /// Most workgroups one dispatch may have along a dimension — the WebGPU floor
-/// (`max_compute_workgroups_per_dimension`), which every backend honours. Only
-/// the tiled one-row arm can reach it at one workgroup per output column.
+/// (`max_compute_workgroups_per_dimension`), which every backend honours. Both
+/// one-row arms are chunked to it: at `GEMV_TILED_COLS_PER_WG` output columns per
+/// workgroup on the tiled arm, and at `GEMV_LEGACY_THREADS` columns per workgroup
+/// on the one-thread-per-column arm, so the column cap is this times the arm's own
+/// workgroup width.
 const GEMV_MAX_WORKGROUPS: usize = 65535;
 
 /// The shape the one-row packed multiply actually issued, recorded per call.
@@ -321,11 +337,12 @@ const GEMV_MAX_WORKGROUPS: usize = 65535;
 /// `tests/gguf_matmul_route.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GemvOneRowShape {
-    /// Output columns one workgroup serves. `1` on the tiled arm; `64` while the
-    /// arm is one thread per output column.
+    /// Output columns one workgroup serves. `GEMV_TILED_COLS_PER_WG` (two) on
+    /// the tiled arm; `64` while the arm is one thread per output column.
     pub cols_per_workgroup: u32,
-    /// Threads one workgroup runs. On the tiled arm they split that column's
-    /// contraction; on the legacy arm each thread serves its own column.
+    /// Threads one workgroup runs. On the tiled arm they split each of those
+    /// columns' contractions; on the legacy arm each thread serves its own
+    /// column.
     pub threads_per_workgroup: u32,
     /// Workgroups in the recorded dispatch — the last chunk's, when the call was
     /// split.
@@ -360,10 +377,12 @@ pub fn reset_gemv_one_row_shape() {
 
 /// Record what one one-row dispatch was shaped like. `cols_per_workgroup` is how
 /// many output columns a workgroup covers, so on the tiled arm
-/// `workgroups * cols_per_workgroup` is exactly the output width dispatched — a
-/// tile with rows nothing reads would make it larger. (The legacy arm's last
-/// workgroup rounds up to 64 columns, so there the product can exceed the width
-/// by under 64; that is rounding, not a discarded tile.)
+/// `workgroups * cols_per_workgroup` is the output width the dispatch covered
+/// rounded up to a whole workgroup — a *ceiling*, not an equality: a workgroup
+/// whose second column is off the end of the chunk computes nothing for it (its
+/// second accumulator stays zero) and skips that store, so no row or column is
+/// ever discarded. (The legacy arm's last workgroup rounds up to 64 columns the
+/// same way.)
 fn note_gemv_one_row_shape(cols_per_workgroup: u32, threads_per_workgroup: u32, workgroups: u32) {
     ONE_ROW_COLS_PER_WG.store(cols_per_workgroup as u64, Ordering::Relaxed);
     ONE_ROW_THREADS.store(threads_per_workgroup as u64, Ordering::Relaxed);
@@ -1091,10 +1110,67 @@ fn gguf_max_bind(device: &wgpu::Device) -> u64 {
 
 /// Packed-weight bytes that fit under `max_bind`: leaves room for the window's
 /// align-down base slack (< [`STORAGE_ALIGN`]) and its 16-byte round-up. Both
-/// the row-grouped GEMM's column chunking and the per-row GEMV's row chunking
-/// are sized from this, so they cannot drift apart.
+/// the row-grouped GEMM's column chunking and the per-row GEMV's own column
+/// chunking are sized from this, so they cannot drift apart.
 fn gguf_window_budget(max_bind: u64) -> u64 {
     max_bind.saturating_sub(STORAGE_ALIGN + 16)
+}
+
+/// Output columns one *dispatch* of a one-row GEMV covers: what fits the weight
+/// window ([`gguf_window_budget`]) and the dispatch-dimension cap, which counts
+/// workgroups and so reaches `GEMV_MAX_WORKGROUPS * GEMV_TILED_COLS_PER_WG`
+/// columns on the tiled arm and a whole `GEMV_LEGACY_THREADS` per workgroup —
+/// one thread per column — on the arm that keeps the original shape.
+///
+/// The encoder chunks its N loop by this and
+/// [`gemv_one_row_dispatches`] reports it, so the rule has one spelling.
+fn gemv_one_row_cols_per_chunk(row_bytes: u64, max_bind: u64, tiled: bool) -> usize {
+    let cols_per_wg = if tiled {
+        GEMV_TILED_COLS_PER_WG as usize
+    } else {
+        GEMV_LEGACY_THREADS as usize
+    };
+    // The `.max(1)` is what makes a row wider than the whole budget one column per
+    // chunk, i.e. still progress; `row_bytes.max(1)` only keeps the division defined.
+    ((gguf_window_budget(max_bind) / row_bytes.max(1)) as usize)
+        .max(1)
+        .min(GEMV_MAX_WORKGROUPS * cols_per_wg)
+}
+
+/// Packed-weight bytes one output row (one column of the weight) occupies at
+/// this shape — the per-row stride the encoders chunk by and the shaders index by
+/// (`col * nbk * block_bytes`), taken from the scheme's block geometry rather
+/// than restated.
+fn gguf_row_bytes(scheme_id: u32, k: usize) -> u64 {
+    let scheme = scheme_from_id(scheme_id);
+    let block_elems = scheme.gguf_block_size() as usize;
+    let block_bytes = scheme.gguf_block_bytes() as usize;
+    ((k / block_elems.max(1)) * block_bytes) as u64
+}
+
+/// How many dispatches one step (one weight region, one input row) of the
+/// one-row packed multiply takes at this shape — the chunking rule above, from
+/// the binding budget and the dispatch cap, which is where the count comes from.
+///
+/// Reported by the stream-rate cell rather than re-derived there, so a change to
+/// the rule or to the arm's own dispatch geometry moves the reported count with
+/// it. Public for that cell (an integration test cannot reach `pub(crate)`
+/// surface); nothing else calls it. `None` for a scheme with no one-row arm.
+pub fn gemv_one_row_dispatches(
+    device: &wgpu::Device,
+    scheme_id: u32,
+    k: usize,
+    n: usize,
+) -> Option<usize> {
+    if !gemv_supports_scheme(scheme_id) {
+        return None;
+    }
+    let tiled = gemv_tiled_supports_scheme(scheme_id);
+    Some(n.div_ceil(gemv_one_row_cols_per_chunk(
+        gguf_row_bytes(scheme_id, k),
+        gguf_max_bind(device),
+        tiled,
+    )))
 }
 
 /// Largest output slab the grouped path will ask the pool for.
@@ -1207,7 +1283,7 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
     if !k.is_multiple_of(GROUPED_STAGE_ELEMS) || n == 0 {
         return false;
     }
-    let row_bytes = (k / block_elems) * block_bytes; // packed weight bytes per column
+    let row_bytes = gguf_row_bytes(scheme_id, k); // packed weight bytes per column
 
     // X: all m rows are read through one window, so they must share a shard.
     let x0 = x_byte_off as u64;
@@ -1240,7 +1316,7 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
     if (m as u64) * 4 > max_bind {
         return false; // no column chunk's slab could be bound
     }
-    let by_bind = (gguf_window_budget(max_bind) / row_bytes.max(1) as u64).max(1);
+    let by_bind = (gguf_window_budget(max_bind) / row_bytes.max(1)).max(1);
     let by_out = (OUT_SLAB_CAP.min(max_bind).saturating_sub(16) / (m as u64 * 4)).max(1);
     let n_chunk_max = (n as u64).min(by_bind).min(by_out).max(1) as usize;
 
@@ -1254,7 +1330,7 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
     with_pooled_out_buf(device, out_slab, |out_buf| {
         let mut n0 = 0usize;
         while n0 < n {
-            let (w_buf, w_raw) = arena.resolve_w(w_byte_off + n0 * row_bytes);
+            let (w_buf, w_raw) = arena.resolve_w(w_byte_off + (n0 as u64 * row_bytes) as usize);
             let w_buf_size = w_buf.size();
             let w0 = w_raw as u64;
             let w_base = (w0 / STORAGE_ALIGN) * STORAGE_ALIGN;
@@ -1287,7 +1363,7 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
             // weight never spans buffers: `from_plan_split` spills any single
             // weight that does not fit one weight buffer into the act arena, so
             // `resolve_w` yields the whole weight region.)
-            let need = (w0 - w_base) + (n_chunk * row_bytes) as u64;
+            let need = (w0 - w_base) + n_chunk as u64 * row_bytes;
             if need > max_bind.min(w_buf_size.saturating_sub(w_base)) {
                 ok = false;
                 return;
@@ -1439,11 +1515,6 @@ fn encode_dequant_matmul_gguf_gemv_one(
     w_byte_off: usize,
     out_byte_off: usize,
 ) {
-    let scheme = scheme_from_id(scheme_id);
-    let block_elems = scheme.gguf_block_size() as usize;
-    let block_bytes = scheme.gguf_block_bytes() as usize;
-    let w_total_bytes = (k * n) / block_elems.max(1) * block_bytes;
-
     let x0 = x_byte_off as u64;
     let x_base = (x0 / STORAGE_ALIGN) * STORAGE_ALIGN;
     let (x_buf, x_local) = arena.resolve_act(x_base as usize);
@@ -1455,34 +1526,31 @@ fn encode_dequant_matmul_gguf_gemv_one(
     let w_buf_size = w_buf.size();
     let w0_all = w_raw as u64;
 
-    // Packed-weight bytes per output row. Output rows are independent (each is a
-    // separate dot product over k), so when the full weight window would exceed
-    // `max_storage_buffer_binding_size` (128 MiB minimum on wgpu — hit by llvmpipe /
-    // min-spec adapters, or large models on any GPU) we split the GEMV along N and
-    // bind only each chunk's rows. `w_total_bytes / n` is the exact per-row stride
-    // (matches the shader's `j * nbk * blk` indexing).
-    let row_bytes = (w_total_bytes / n.max(1)) as u64;
+    // Packed-weight bytes per output row ([`gguf_row_bytes`]). Output rows are
+    // independent (each is a separate dot product over k), so when the full weight
+    // window would exceed `max_storage_buffer_binding_size` (128 MiB minimum on
+    // wgpu — hit by llvmpipe / min-spec adapters, or large models on any GPU) we
+    // split the GEMV along N and bind only each chunk's rows.
+    let row_bytes = gguf_row_bytes(scheme_id, k);
 
     let max_bind = gguf_max_bind(device);
     assert!(
         x_size <= max_bind,
         "rlx-wgpu gguf gemv: x window {x_size} > max_bind {max_bind}"
     );
-    // Two arms, one route: the tiled arm gives each output column a whole
-    // workgroup (`cols_per_workgroup == 1`); the original gives one thread per
-    // column, 64 columns to a workgroup. Which one ran is recorded — see
+    // Two arms, one route: the tiled arm gives each workgroup
+    // `GEMV_TILED_COLS_PER_WG` output columns and splits each column's
+    // contraction over its threads; the original gives one thread per column, 64
+    // columns to a workgroup. Which one ran is recorded — see
     // [`gemv_one_row_shape`].
     let tiled = gemv_tiled_supports_scheme(scheme_id);
-    // Rows per chunk from the window budget; at least one, so a single row
-    // wider than the whole budget still makes progress. The tiled arm also
-    // spends one workgroup per output column, and a dispatch dimension is capped
+    // Output columns per chunk from the window budget; at least one, so a single
+    // row wider than the whole budget still makes progress. The tiled arm also
+    // spends workgroups on those columns, and a dispatch dimension is capped
     // (65535 on every backend, WebGPU's guaranteed floor), so an output wider
-    // than that is split too — the same arm, one more chunk.
-    let budget = gguf_window_budget(max_bind).max(row_bytes);
-    let mut rows_per_chunk = ((budget / row_bytes.max(1)) as usize).max(1);
-    if tiled {
-        rows_per_chunk = rows_per_chunk.min(GEMV_MAX_WORKGROUPS);
-    }
+    // than the columns that cap covers is split too — the same arm, one more
+    // chunk. Both halves of that rule live in `gemv_one_row_cols_per_chunk`.
+    let cols_per_chunk = gemv_one_row_cols_per_chunk(row_bytes, max_bind, tiled);
 
     let out_bytes = ((n * 4).max(4) as u64).div_ceil(16) * 16;
     with_pooled_out_buf(device, out_bytes, |out_buf| {
@@ -1493,7 +1561,7 @@ fn encode_dequant_matmul_gguf_gemv_one(
         };
         let mut n0 = 0usize;
         while n0 < n {
-            let n_chunk = (n - n0).min(rows_per_chunk);
+            let n_chunk = (n - n0).min(cols_per_chunk);
             let w0 = w0_all + n0 as u64 * row_bytes;
             let w_base = (w0 / STORAGE_ALIGN) * STORAGE_ALIGN;
             let chunk_bytes = n_chunk as u64 * row_bytes;
@@ -1571,9 +1639,10 @@ fn encode_dequant_matmul_gguf_gemv_one(
                 pass.set_pipeline(&dk.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
                 if tiled {
-                    // One workgroup per output column of the chunk.
-                    note_gemv_one_row_shape(1, GEMV_TILED_THREADS, n_chunk as u32);
-                    pass.dispatch_workgroups(n_chunk as u32, 1, 1);
+                    // `GEMV_TILED_COLS_PER_WG` output columns per workgroup.
+                    let workgroups = (n_chunk as u32).div_ceil(GEMV_TILED_COLS_PER_WG);
+                    note_gemv_one_row_shape(GEMV_TILED_COLS_PER_WG, GEMV_TILED_THREADS, workgroups);
+                    pass.dispatch_workgroups(workgroups, 1, 1);
                 } else {
                     // One thread per output column, 64 columns per workgroup.
                     let workgroups = (n_chunk as u32).div_ceil(GEMV_LEGACY_THREADS);
@@ -1702,7 +1771,10 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
 
 #[cfg(test)]
 mod tests {
-    use super::{GROUPED_ROWS, GROUPED_STAGE_ELEMS, GROUPED_THREADS};
+    use super::{
+        GEMV_TILED_COLS_PER_WG, GEMV_TILED_THREADS, GROUPED_ROWS, GROUPED_STAGE_ELEMS,
+        GROUPED_THREADS,
+    };
 
     /// The row-grouped GEMM's geometry is written twice — `GROUPED_THREADS` /
     /// `GROUPED_ROWS` size the dispatch, `GROUPED_STAGE_ELEMS` the `k` gate — and
@@ -1727,6 +1799,51 @@ mod tests {
             format!("const TG: u32 = {GROUPED_THREADS}u;"),
             format!("const TM: u32 = {GROUPED_ROWS}u;"),
             format!("const BLK_ELEMS: u32 = {GROUPED_STAGE_ELEMS}u;"),
+        ] {
+            assert!(wgsl.contains(&want), "expected `{want}` in the shader");
+        }
+    }
+
+    /// The tiled one-row arm's geometry is written twice the same way: the
+    /// encoder sizes its dispatch from `GEMV_TILED_THREADS` /
+    /// `GEMV_TILED_COLS_PER_WG`, and the shader declares its own
+    /// `@workgroup_size` plus the two constants that size `red`, span the entry's
+    /// columns and place the second column's store. Read the shader here and tie
+    /// the two, so this arm is not invisible to the fast, device-free gate: the
+    /// reduction array's declaration is one slot per lane per output column
+    /// (`LANES * COLS_PER_WG`) and is pinned here rather than restated in
+    /// `tests/gguf_kernel_scheme_coverage.rs`; the entry's column span and its
+    /// second column's slot base are those constants, and the second column is
+    /// stored one column over — a workgroup widened past what the Rust constants
+    /// declare would otherwise accumulate into slots the array does not have.
+    ///
+    /// Half of this reads the shader as text, so a reflow of those hot-loop lines
+    /// fails it without any geometry having moved: that is the accepted cost of
+    /// tying the two spellings at all (the grouped route's pin does the same), and
+    /// the fix is to re-spell the line, not to read the failure as geometry drift.
+    #[test]
+    fn tiled_gemv_geometry_matches_the_shader() {
+        let wgsl = crate::kernels::DEQUANT_GEMV_GGUF_WGSL;
+        let module = naga::front::wgsl::parse_str(wgsl).expect("wgsl parse");
+        let tiled = module
+            .entry_points
+            .iter()
+            .find(|entry| entry.name == "dequant_gemv_tiled")
+            .expect("the tiled one-row entry point");
+        assert_eq!(
+            tiled.workgroup_size,
+            [GEMV_TILED_THREADS, 1, 1],
+            "dequant_gemv_tiled: workgroup must be GEMV_TILED_THREADS wide"
+        );
+        for want in [
+            format!("const LANES: u32 = {GEMV_TILED_THREADS}u;"),
+            format!("const COLS_PER_WG: u32 = {GEMV_TILED_COLS_PER_WG}u;"),
+            "var<workgroup> red: array<f32, LANES * COLS_PER_WG>;".to_string(),
+            // The entry's column span, and the second column's reduction slots and
+            // store — the places that column's geometry is spelled out.
+            "let j0 = wid.x * COLS_PER_WG;".to_string(),
+            "red[LANES + lane] = acc1;".to_string(),
+            "outarr[params.out_f32_off + j0 + 1u]".to_string(),
         ] {
             assert!(wgsl.contains(&want), "expected `{want}` in the shader");
         }

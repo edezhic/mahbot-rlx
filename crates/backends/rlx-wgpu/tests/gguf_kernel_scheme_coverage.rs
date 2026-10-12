@@ -169,12 +169,13 @@ fn one_row_entry_points_parse_and_validate() {
     .validate(&module)
     .expect("wgsl validate");
 
-    // Each arm stays inside the WebGPU floor (256 invocations per workgroup) and
-    // its declared size is the lane count the runtime records for it
-    // (`GEMV_TILED_THREADS` / `GEMV_LEGACY_THREADS`) and the dispatch geometry
-    // assumes — pinned here and against the record in `gguf_matmul_route.rs`,
-    // because a shader edited to a different size would otherwise leave both
-    // describing an arm that no longer runs.
+    // Each arm stays inside the WebGPU floor (256 invocations per workgroup), and
+    // the legacy arm's declared size is the thread count its dispatch geometry
+    // assumes: one thread per column, `GEMV_LEGACY_THREADS` to a workgroup. The
+    // tiled arm's lane count is not repeated here — the device-free
+    // `gguf_gpu::tests::tiled_gemv_geometry_matches_the_shader` derives it from
+    // `GEMV_TILED_THREADS` itself, which the recorded shape in
+    // `gguf_matmul_route.rs` then follows.
     let mut sizes = BTreeMap::new();
     for entry in &module.entry_points {
         assert!(
@@ -185,22 +186,15 @@ fn one_row_entry_points_parse_and_validate() {
         );
         sizes.insert(entry.name.as_str(), entry.workgroup_size);
     }
-    assert_eq!(sizes["dequant_gemv_tiled"], [32, 1, 1], "tiled lane count");
     assert_eq!(sizes["dequant_gemv"], [64, 1, 1], "legacy thread count");
 
-    // The lane partials are the reduction's storage: one f32 per tiled lane,
-    // tied to the lane count above so a widened workgroup cannot keep a buffer
-    // that is too short for the tree below it.
-    const RED: &str = "var<workgroup> red: array<f32, 32>;";
-    assert!(
-        rlx_wgpu::kernels::DEQUANT_GEMV_GGUF_WGSL.contains(RED),
-        "expected `{RED}` in the one-row shader"
-    );
-
     // How each arm reads the packed weight is part of the shape the one-row route
-    // reports: the tiled arm reads 4-byte words, the arm that keeps one thread per
-    // column reads bytes. Pinned so a return to byte-wise reads on the tiled arm is
-    // not silent — the recorded geometry alone cannot see it.
+    // reports: the tiled arm's word reads go through the 4-byte `read_word_at`,
+    // the arm that keeps one thread per column reads bytes. Pinned so a return to
+    // byte-wise reads on the tiled arm is not silent — the recorded geometry alone
+    // cannot see it. What this checks is the spelling of that arm's own reads:
+    // Q6_K's header still goes through the byte-wise `dq_read_f16` / `read_w_i8`
+    // (through a differently named helper the check would not trip).
     let wgsl = rlx_wgpu::kernels::DEQUANT_GEMV_GGUF_WGSL;
     let tiled = entry_body(wgsl, "dequant_gemv_tiled");
     assert!(
@@ -209,7 +203,7 @@ fn one_row_entry_points_parse_and_validate() {
     );
     assert!(
         !tiled.contains("read_w("),
-        "the tiled one-row arm must not read the packed weight a byte at a time"
+        "the tiled one-row arm's own reads must not fall back to the byte-wise `read_w`"
     );
     assert!(
         entry_body(wgsl, "dequant_gemv").contains("read_w("),

@@ -2219,8 +2219,8 @@ fn build_kernel_3(
 /// "STORAGE_READ_WRITE is exclusive" rule for same-buffer aliasing.
 ///
 /// `x_vec4` adds the one-row GEMV's fifth read-only binding: the same `x` window
-/// as binding 0, typed `array<vec4<f32>>` so the tiled arm reads a lane's 32
-/// contiguous X elements with 8 vector loads instead of 32 scalar ones. Both of
+/// as binding 0, typed `array<vec4<f32>>` so the tiled arm reads a unit's 32 X
+/// elements with 8 vector loads instead of 32 scalar ones. Both of
 /// that module's entry points get the layout (they share its declarations); only
 /// the tiled one reads through it.
 fn build_kernel_ro_u_ro_rw(
@@ -4149,7 +4149,8 @@ pub fn dequant_gemv_gguf_kernel(device: &wgpu::Device) -> &'static Kernel {
     })
 }
 /// The one-row Q4_K / Q6_K entry of `dequant_gemv_gguf.wgsl`: one workgroup per
-/// output column, the workgroup's threads splitting the contraction.
+/// two output columns, the workgroup's threads splitting each column's
+/// contraction.
 pub fn dequant_gemv_gguf_tiled_kernel(device: &wgpu::Device) -> &'static Kernel {
     DEQUANT_GEMV_GGUF_TILED.get_or_init(|| {
         build_kernel_ro_u_ro_rw(

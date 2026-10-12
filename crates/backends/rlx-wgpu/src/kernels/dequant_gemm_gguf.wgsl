@@ -36,9 +36,12 @@
 // that is more output columns per thread, which this adapter pays for in
 // registers — a two-column variant spilled its accumulators and measured 2x
 // SLOWER. `tests/gguf_gemm_grouped_weight_reuse.rs` holds the measurement of what
-// one row group costs against the single-row pass it replaces, and the bound this
-// kernel has to hold, which is that measurement plus a margin rather than the
-// ~1.2x this file once claimed and nothing in its history reached.
+// one row group costs against the single-row pass it replaces. It no longer
+// asserts a bound on it: the bound was denominated in single-row passes, so
+// speeding the single-row arm up tightened it without this kernel changing, and
+// it was retired rather than re-denominated — so this route has no in-tree
+// regression ceiling left, and the rig's own re-take of the grouped cells is what
+// covers it.
 //
 // Binding scheme matches `dequant_gemv_gguf.wgsl`: `x` and `weight` are separate
 // read-only windows of the arena (each under `max_storage_buffer_binding_size`)

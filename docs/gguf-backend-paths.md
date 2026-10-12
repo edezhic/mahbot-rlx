@@ -90,7 +90,7 @@ once per device context on Metal/CUDA/ROCm/WGPU.
 | **CPU** | — | block-wise fused matmul in `rlx-cpu::gguf_matmul` | — | always available |
 | **Metal** | `dequant_gguf.msl` → MPS sgemm | Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M | MIL `mul`+`sub` for K/IQ/TQ/MX (see ANE) | `RLX_METAL_DEQUANT_GPU_DISABLE=1` |
 | **CUDA / ROCm** | `dequant_gguf.cu` → BLAS | — | — | same disable pattern |
-| **WGPU** | `select_path` ladder: fused windowed kernels (`dequant_gemv_gguf` at one row, `dequant_gemm_gguf` / `dequant_gemm_q1_0` above), else `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | Q4_K, Q6_K at `m == 1` (one workgroup per output column, its lanes splitting the contraction); Q1_0 (one thread per column at `m == 1`, a tiled GEMM above). At `m > 1` Q4_K/Q6_K **and Q8_0** take the row-grouped GEMM | — | `gguf_host` for a sharded arena, a parked weight, or a refused slab |
+| **WGPU** | `select_path` ladder: fused windowed kernels (`dequant_gemv_gguf` at one row, `dequant_gemm_gguf` / `dequant_gemm_q1_0` above), else `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | Q4_K, Q6_K at `m == 1` (one workgroup per two output columns, its lanes splitting each column's contraction); Q1_0 (one thread per column at `m == 1`, a tiled GEMM above). At `m > 1` Q4_K/Q6_K **and Q8_0** take the row-grouped GEMM | — | `gguf_host` for a sharded arena, a parked weight, or a refused slab |
 | **ANE (CoreML)** | hybrid host segments | — | MIL `mul` + optional `sub` | `RLX_COREML_HOST_DEQUANT=1` |
 | **TPU** | — | — | — | host dequant at HLO emit (`Constant`, `quant_param_bindings`, or runtime `set_param_typed` on deferred Param) |
 | **MLX** | Q1_0 on-device (`dequant_q1_0.metal`); other GGUF host dequant + cache | — | — | `RLX_MLX_GGUF_HOST_FALLBACK=1` / `RLX_MLX_Q1_HOST=1` |
@@ -179,13 +179,19 @@ Otherwise Q4_1+ fall through with wrong block stride.
 2. **Fused windowed kernels** (no f32 scratch, shard-safe) — `FusedArm`, and only
    `OneRowDevice` may be joined into the caller's enclosing batch:
    - `dequant_gemv_gguf.wgsl` at one row: Q4_K / Q6_K take the
-     `dequant_gemv_tiled` arm — one workgroup per output column, its lanes
-     splitting the contraction, X read four elements at a time through a second
-     binding. Q1_0 takes the `dequant_gemv` arm (one thread per output column,
-     the scalar X view). The tiled arm's `vec4` X read needs a window that lines
-     up with a four-element group — true of every planned F32 activation, and a
-     4-byte-aligned view of one takes the host path instead of being read
-     misaligned.
+     `dequant_gemv_tiled` arm — one workgroup per two output columns, its lanes
+     splitting each column's contraction over 32-element units of the packed
+     weight, one X read four elements at a time through a second binding shared
+     by both columns. Q6_K's unit is the 16-byte half of a `ql` span read at both
+     of its nibble sets, so it requests each of those bytes once rather than
+     twice; Q4_K's is one 32-element sub-block, because a unit built from half of
+     one `qs` group at both nibbles would mix two sub-blocks' 6-bit mins in one
+     partial sum, which the one-row parity bar at small contractions rejects
+     (`tests/gguf_batch_join.rs`, k = 256, 1e-2). Q1_0 takes the `dequant_gemv`
+     arm (one thread per output column, the scalar X view). The tiled arm's `vec4`
+     X read needs a window that lines up with a four-element group — true of every
+     planned F32 activation, and a 4-byte-aligned view of one takes the host path
+     instead of being read misaligned.
    - `dequant_gemm_gguf.wgsl` above one row: the row-grouped GEMM, one entry
      point per scheme — Q4_K (`dequant_gemm_q4k`), Q6_K (`dequant_gemm_q6k`),
      Q8_0 (`dequant_gemm_q8_0`) — reads each packed weight tile once per group of
@@ -290,7 +296,7 @@ Non-GGUF schemes still use the in-HLO `convert + scale/zp tile + dot` path.
 | Dequant cache | `crates/backends/rlx-cpu/src/dequant_cache.rs` |
 | Metal MSL + encode | `crates/backends/rlx-metal/src/dequant_gguf.msl`, `backend.rs` |
 | CUDA / ROCm | `crates/backends/rlx-gpu-kernels/kernels/dequant_gguf.cu`, `rlx-cuda/src/gguf_gpu.rs` |
-| WGPU | `crates/backends/rlx-wgpu/src/kernels/dequant_gguf.wgsl`, `gguf_gpu.rs` |
+| WGPU | `crates/backends/rlx-wgpu/src/kernels/dequant_gguf.wgsl`, `dequant_gemv_gguf.wgsl` (the one-row GEMV arms), `dequant_gemm_gguf.wgsl`, `gguf_gpu.rs` |
 | ANE MIL | `crates/backends/rlx-coreml/src/mil/helpers.rs`, `mod.rs` |
 | TPU HLO | `crates/backends/rlx-tpu/src/lower/lower.rs` |
 | Python bindings | `crates/bindings/pyrlx/src/gguf.rs`, `gguf_convert.rs` |

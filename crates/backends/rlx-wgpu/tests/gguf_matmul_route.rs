@@ -467,12 +467,16 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // (H=1024 and I=6144 columns) and at the contraction lengths those
     // projections have, in the 2-D `[1, k]` form and the 3-D `[1, 1, k]`
     // single-token form those calls take. What is recorded is the arrangement
-    // actually used — one workgroup per output column with the workgroup's lanes
-    // splitting that column's contraction over its sub-blocks, and
-    // `workgroups x cols_per_workgroup` exactly the call's output width. That
-    // last equality is the "no tile row is computed and discarded" half; a change
-    // back to one unit of work per output column reading the weight byte-wise
-    // would move `cols_per_workgroup` to 64 and `workgroups` to `ceil(n/64)`.
+    // actually used — one workgroup per two output columns, with the workgroup's
+    // 32 lanes splitting each of those columns' contractions over its 32-element
+    // units — so `workgroups` is `ceil(n / 2)` and
+    // `workgroups x cols_per_workgroup` is a *ceiling* on the width the dispatch
+    // covered, not that width: a chunk of odd width has its last workgroup's
+    // second column off the end, for which nothing is computed and whose store is
+    // skipped. The product is then within one workgroup's span of the width asked
+    // for, which is the "no tile row is computed and discarded" half — no row and
+    // no column is ever dropped, and no more than a workgroup's worth of the
+    // dispatch is beyond the width.
     for (scheme, ggml) in [
         (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K),
         (QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K),
@@ -483,6 +487,15 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             // The down-projection's longer contraction: the split is over k, so
             // this is the same shape with more work per column.
             (4096, 1024, &[&[][..]][..]),
+            // The width edge this arm's two-column workgroup introduces: widths
+            // below its per-workgroup span and widths not a multiple of it, the
+            // case where the recorded `workgroups x cols_per_workgroup` has to
+            // round the width up to a whole workgroup. n = 6145 is a model width
+            // (6144) with one extra column, at the down-projection's own
+            // contraction.
+            (1024, 1, &[&[][..]][..]),
+            (1024, 3, &[&[][..]][..]),
+            (2048, 6145, &[&[][..]][..]),
         ] {
             for &batch in batches {
                 let (g, packed, x) = case_batched(scheme, ggml, batch, 1, k, n);
@@ -507,10 +520,11 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
                         shape.threads_per_workgroup,
                         shape.workgroups
                     ),
-                    (1, 32, n as u32),
+                    (2, 32, n.div_ceil(2) as u32),
                     "{scheme:?} k={k} n={n} batch={batch:?}: one row's work is its output \
-                     columns times its contraction — one workgroup per column, the \
-                     workgroup's threads splitting that column, no tile rows: {shape:?}"
+                     columns times its contraction — a workgroup per two columns, its 32 \
+                     lanes splitting each column, `ceil(n / 2)` workgroups and no tile \
+                     rows: {shape:?}"
                 );
                 let cpu = run(Device::Cpu, g, &packed, &x);
                 let max_abs = max_abs_diff(&gpu, &cpu);
@@ -543,9 +557,11 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             (1024, 6144, 200),
             // Wider than the model widths (1024…6144 columns), where the arm
             // must not get worse than the shape it replaced, with a shorter run
-            // so the cell stays cheap. n = 65536 also crosses the tiled arm's
-            // one-workgroup-per-column dispatch cap, so that figure carries the
-            // extra chunk dispatch the cell above pins.
+            // so the cell stays cheap. A workgroup now covers two output columns,
+            // so one dispatch reaches 65535 * 2 = 131070 columns before the
+            // dispatch-dimension cap and none of these figures crosses it — the
+            // extra chunk the cap forces above that width is pinned by the
+            // 131072-column cell below.
             (1024, 16384, 40),
             (1024, 32768, 40),
             (1024, 65536, 40),
@@ -742,9 +758,9 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
 
     // The same arm when the weight window exceeds the binding limit: rows are
     // N-chunked, so one call is several dispatches and the recorded one is the
-    // last chunk's — never wider than the width asked for, and never zero. The
-    // chunk stride is the share of the row indexing a wrong chunking would move,
-    // which is what the parity check against CPU pins.
+    // last chunk's — a whole-workgroup ceiling on that chunk's width, and never
+    // zero. The chunk stride is the share of the row indexing a wrong chunking
+    // would move, which is what the parity check against CPU pins.
     {
         let (k, n) = (256usize, 16384usize);
         let (g, packed, x) = case(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 1, k, n);
@@ -763,11 +779,11 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         );
         assert_eq!(
             (shape.cols_per_workgroup, shape.threads_per_workgroup),
-            (1, 32),
-            "{shape:?}"
+            (2, 32),
+            "a workgroup covers two output columns: {shape:?}"
         );
         assert!(
-            shape.workgroups as usize > 0 && (shape.workgroups as usize) < n,
+            shape.workgroups as usize > 0 && (shape.workgroups as usize) < n.div_ceil(2),
             "the window must have been split into more than one chunk: {shape:?}"
         );
         let max_abs = max_abs_diff(&gpu, &cpu);
@@ -782,16 +798,19 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     }
 
     // The same arm when the output is wider than one dispatch dimension's cap:
-    // the tiled arm spends one workgroup per output column, and 65535 is the
+    // the tiled arm spends one workgroup per two output columns, and 65535 is the
     // WebGPU floor for a dimension (`max_compute_workgroups_per_dimension`), so
-    // a wider output has to be another chunk of the same arm. Reaching it in one
-    // dispatch is a wgpu validation error rather than a slow path — this cell is
-    // what keeps that from coming back. The weight window is far under the
-    // binding limit, so the split is the cap's and nothing else's, and the chunk
-    // boundary is a fresh stride through the packed rows, which the CPU parity
-    // pins.
+    // one dispatch covers 65535 * 2 = 131070 columns and a wider output has to be
+    // another chunk of the same arm. Reaching the cap in one dispatch is a wgpu
+    // validation error rather than a slow path — this cell is what keeps that
+    // from coming back. The weight window is far under the binding limit, so the
+    // split is the cap's and nothing else's, and the chunk boundary is a fresh
+    // stride through the packed rows, which the CPU parity pins.
     {
-        let (k, n) = (256usize, 65536usize);
+        // One full cap-width plus two columns, so the remainder chunk is
+        // 131072 - 131070 = 2 columns: exactly one workgroup of the two-column
+        // arm, and the narrowest remainder there is.
+        let (k, n) = (256usize, 131072usize);
         let (g, packed, x) = case(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 1, k, n);
         reset_route_counts();
         reset_gemv_one_row_shape();
@@ -810,10 +829,11 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
                 shape.threads_per_workgroup,
                 shape.workgroups as usize
             ),
-            (1, 32, n - 65535),
+            (2, 32, 1),
             "the dispatch cap (the WebGPU floor for one dimension, \
-             max_compute_workgroups_per_dimension) must have split {n} columns \
-             into the cap plus a remainder: {shape:?}"
+             max_compute_workgroups_per_dimension) is 65535 * cols_per_workgroup = \
+             131070 columns, so {n} columns must be split into that plus a \
+             two-column remainder — one workgroup: {shape:?}"
         );
         let max_abs = max_abs_diff(&gpu, &cpu);
         eprintln!(
