@@ -5,29 +5,39 @@
 
 //! What a packed multiply costs the pass it sits in: submissions and device
 //! waits, from the backend's process-global counters
-//! ([`rlx_wgpu::device_submit_count`] / [`rlx_wgpu::device_wait_count`]). A
-//! one-row call of the tiled K-quant arms is device-only work that belongs
+//! ([`rlx_wgpu::device_submit_count`] / [`rlx_wgpu::device_wait_count`]). A call
+//! of the tiled K-quant arms' windowed route — the one-row arm, and the
+//! row-grouped GEMM it becomes above one row — is device-only work that belongs
 //! *inside* the enclosing run of device work: one submission per contiguous run,
 //! and none of its own.
 //!
-//! Six brackets, each one forward pass between a counter reset and a read of
+//! Seven brackets, each one forward pass between a counter reset and a read of
 //! them. **1 — the join set**, `dq(Q4_K) → mm → dq(Q6_K) → rv → mm`, compiled at a
 //! bucket and run at one row of it: the join set is the tiled one-row arm's two
-//! schemes and nothing else (Q1_0 keeps its own arm, `m > 1` the grouped GEMM), so
-//! this graph covers it completely — the 4-bit half, the 6-bit half, and `rv`, an
-//! `Op::Reverse` on the last axis, the filler that consumes a uniform, bind-group
-//! *and* meta-buffer lane while staying device work on both legs. It reads **1
-//! submission and 1 wait** against **5 and 4** unjoined, with the route census
-//! `per_row = 2` and nothing else. **6 — the same graph with the route's own
-//! N-chunking**: its first weight widened and the weight-window budget lowered for
-//! the bracket (`RLX_WGPU_MAX_BIND_MB=1`, the crate's own lever, used by
-//! `gguf_matmul_route.rs`), so the one-row arm splits the multiply into column
-//! chunks — dispatches and their copies *inside* the joined encoder, which must not
-//! add a submission or a wait: it reads the same **1 and 1** against the same 5 and
-//! 4, which is what covers the chunked arm of the joined encode. **2 — a
-//! host-adjacent graph**, device+host by
-//! construction, a hosted call then the joined one then another hosted call: **6
-//! and 8** against 6 and 6 unjoined — so joining is not wait-neutral: it trades the
+//! schemes at **every row count** — the tiled one-row arm at one row and the
+//! row-grouped GEMM above it — while Q1_0 keeps its own arm, the 8-bit scheme's
+//! multi-row calls their scratch entry point, and the scratch route and the
+//! single-row form answer as they did. So this graph covers it completely — the
+//! 4-bit half, the 6-bit half, and `rv`, an `Op::Reverse` on the last axis, the
+//! filler that consumes a uniform, bind-group *and* meta-buffer lane while staying
+//! device work on both legs. It reads **1 submission and 1 wait** against **5 and
+//! 4** unjoined, with the route census `per_row = 2` and nothing else. **6 — the
+//! same graph with the route's own N-chunking**: its first weight widened and the
+//! weight-window budget lowered for the bracket (`RLX_WGPU_MAX_BIND_MB=1`, the
+//! crate's own lever, used by `gguf_matmul_route.rs`), so the one-row arm splits the
+//! multiply into column chunks — dispatches and their copies *inside* the joined
+//! encoder, which must not add a submission or a wait: it reads the same **1 and 1**
+//! against the same 5 and 4, which is what covers the chunked arm of the joined
+//! encode. **7 — the same graph at its compiled row count**, no `set_active_extent`:
+//! both packed multiplies are then above one row, so both take the row-grouped GEMM
+//! and both are still joined — the route census is `grouped = 2`, the counted pair
+//! again **1 and 1** against the same 5 and 4, and the pinned identity is that the
+//! joined and the unjoined run of the same executable are **bit-identical**
+//! element-wise: the mode changes the submission arrangement, not the route or the
+//! arithmetic. **2 — a host-adjacent graph**, device+host by construction, a
+//! hosted call then a joined **row-grouped** K-quant multiply — above one row, so
+//! the batch carries the grouped arm — then another hosted call: **6 and 8**
+//! against 6 and 6 unjoined — so joining is not wait-neutral: it trades the
 //! per-call submission for the two boundary polls. **3 — the one-row host case**, through the
 //! route's own entry point with a `+4` X window (the only way in: the planner
 //! aligns every activation slot) — **2 and 2**, counters covering the shared
@@ -44,12 +54,14 @@
 //! The unjoined pairs are this same binary under `RLX_WGPU_ONE_OP_PER_PASS=1`,
 //! which is also what pins the join not reaching into the step-by-step path (that
 //! mode is inert by design). For brackets 2–5 that run reads exactly what the change
-//! removed (6/6, 2/2, 4/5, 3/4). Brackets 1 and 6 are five-step device runs and that
-//! mode submits each of those steps, so they read 5/4 there, while the join disabled
-//! with the counters in place reads 4/4 — the pair the join set's own gain is
-//! measured on.
+//! removed (6/6, 2/2, 4/5, 3/4). Brackets 1, 6 and 7 are five-step device runs and
+//! that mode submits each of those steps, so they read 5/4 there, while the join
+//! disabled with the counters in place reads 4/4 — the pair the join set's own gain
+//! is measured on. (Bracket 7 measures the unjoined leg in-process when the harness
+//! starts in the default mode; a harness already in that mode has it as the
+//! bracket's first run.)
 //!
-//! The `interleaved` graphs (1 and 6) are all-device on both legs: the packed
+//! The `interleaved` graphs (1, 6 and 7) are all-device on both legs: the packed
 //! route comes from shape and slab only, a dense matmul is hosted only by
 //! `RLX_WGPU_HOST_MATMUL` or a striped/unbindable arena, and `Reverse` only by
 //! `RLX_WGPU_FORCE_HOST` / sharding / a sharded arena — no adapter-kind term in
@@ -214,7 +226,9 @@ fn build(
 ///
 /// `[4, 384]` activations whose only job is to be the input of a call the ladder
 /// sends to the host (1.5 superblocks at more than one row books no dequant slab,
-/// so the ladder refuses the fused arms), and `[1, 256]` for the joined call.
+/// so the ladder refuses the fused arms), and `[4, 256]` for the joined call —
+/// above one row on purpose, so the batch carries a *row-grouped* K-quant multiply
+/// with host steps on both sides of it.
 fn host_adjacent() -> (
     Graph,
     Vec<(&'static str, Vec<u8>)>,
@@ -222,7 +236,7 @@ fn host_adjacent() -> (
 ) {
     let mut g = Graph::new("wgpu_gguf_batch_join_host");
     let xb = g.input("xb", Shape::new(&[BUCKET, HOST_K], DType::F32));
-    let xa = g.input("xa", Shape::new(&[1, K], DType::F32));
+    let xa = g.input("xa", Shape::new(&[BUCKET, K], DType::F32));
     let xc = g.input("xc", Shape::new(&[BUCKET, HOST_K], DType::F32));
     let wh = g.param("wh", Shape::new(&[packed(HOST_K, N).len()], DType::U8));
     let wj = g.param("wj", Shape::new(&[packed(K, N).len()], DType::U8));
@@ -239,7 +253,7 @@ fn host_adjacent() -> (
             scheme: QuantScheme::GgufQ4K,
         },
         vec![xa, wj],
-        Shape::new(&[1, N], DType::F32),
+        Shape::new(&[BUCKET, N], DType::F32),
     );
     let yc = g.add_node(
         Op::DequantMatMul {
@@ -258,7 +272,7 @@ fn host_adjacent() -> (
         ],
         vec![
             ("xb", feed(BUCKET * HOST_K, 0.029)),
-            ("xa", feed(K, 0.031)),
+            ("xa", feed(BUCKET * K, 0.031)),
             ("xc", feed(BUCKET * HOST_K, 0.037)),
         ],
     )
@@ -546,6 +560,111 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
         "N-chunked joined run: max_abs {wide_max} > {TOL}"
     );
 
+    // ── The join set above one row ──────────────────────────────────────────
+    // Bracket 1's graph at its *compiled* row count: no `set_active_extent`, so
+    // the multiplies run as the m>1 form the compile bucketed. The premise is the
+    // route census below — both packed multiplies are above one row, so both are
+    // the row-grouped GEMM, and the boundary joins it exactly as it joins the
+    // one-row arm. The counted pair is bracket 1's: joining is an arrangement of
+    // submissions, so the row count does not move it.
+    let (grp_graph, grp_packed, grp_dense, grp_x) = interleaved(BUCKET);
+    let mut grexe = build(Device::Gpu, &grp_graph, &grp_packed, &grp_dense);
+    let _ = grexe.run(&[("x", &grp_x)]).remove(0); // warm: pool + uniforms
+    reset_route_counts();
+    reset_device_counts();
+    let grouped_out = grexe.run(&[("x", &grp_x)]).remove(0);
+    let g_submits = device_submit_count();
+    let g_waits = device_wait_count();
+    let g_routes = route_counts();
+    eprintln!(
+        "[rlx-gguf-join] grouped joined run: submits={g_submits} waits={g_waits} \
+         routes={g_routes:?}"
+    );
+    assert_eq!(
+        (
+            g_routes.per_row,
+            g_routes.grouped,
+            g_routes.scratch,
+            g_routes.host
+        ),
+        (0, 2, 0, 0),
+        "at the compiled row count both packed multiplies (Q4_K and Q6_K) are above \
+         one row, so both take the row-grouped GEMM and both are joined: {g_routes:?}"
+    );
+    assert_eq!(
+        (g_submits, g_waits),
+        bucket_expected,
+        "the joined row-grouped multiplies ride the enclosing batch exactly as the \
+         one-row arm does, so the pair is bracket 1's in the same mode; measured \
+         {g_submits} submission(s) and {g_waits} wait(s)"
+    );
+    let cpu_grouped = {
+        let mut c = build(Device::Cpu, &grp_graph, &grp_packed, &grp_dense);
+        c.run(&[("x", &grp_x)]).remove(0)
+    };
+    let g_abs = max_abs_diff(&grouped_out, &cpu_grouped);
+    eprintln!(
+        "[rlx-gguf-join] grouped joined run vs CPU: max_abs={g_abs:.6e} \
+         (|out|~{:.3e})",
+        cpu_grouped.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    );
+    assert!(g_abs <= TOL, "grouped joined run: max_abs {g_abs} > {TOL}");
+
+    // Pin (c) — joined vs unjoined, in this process: the mode changes how the work
+    // is submitted, not the route or the arithmetic. Running the same executable
+    // again under `RLX_WGPU_ONE_OP_PER_PASS=1` removes the join, so the pair gains
+    // the per-step submissions back (5 and 4) while the census is still the row
+    // count's, and the two outputs must agree bit for bit. A binary the harness
+    // already runs in that mode has the unjoined leg as its first run above, so the
+    // identity is then against that same route and there is nothing to re-measure.
+    if !step_by_step {
+        rlx_ir::env::set("RLX_WGPU_ONE_OP_PER_PASS", "1");
+        reset_route_counts();
+        reset_device_counts();
+        let unjoined_out = grexe.run(&[("x", &grp_x)]).remove(0);
+        let u_submits = device_submit_count();
+        let u_waits = device_wait_count();
+        let u_routes = route_counts();
+        // Unset only what this bracket set: a harness that started in that mode
+        // must keep it for the brackets after this one.
+        rlx_ir::env::unset("RLX_WGPU_ONE_OP_PER_PASS");
+        assert_eq!(
+            (u_submits, u_waits),
+            (5, 4),
+            "the join removed submits each of the graph's five device steps on its \
+             own and waits four times; measured {u_submits} submission(s), {u_waits} \
+             wait(s)"
+        );
+        assert_eq!(
+            (
+                u_routes.per_row,
+                u_routes.grouped,
+                u_routes.scratch,
+                u_routes.host
+            ),
+            (0, 2, 0, 0),
+            "the route is the row count's, not the mode's: {u_routes:?}"
+        );
+        // Element-wise and bit for bit: the two runs are the same route at the same
+        // shapes, so the only difference the mode may make is which submissions
+        // carry the work.
+        let identity = max_abs_diff(&grouped_out, &unjoined_out);
+        eprintln!("[rlx-gguf-join] joined vs unjoined identity: max_abs_diff={identity:.6e}");
+        for (i, (a, b)) in grouped_out.iter().zip(&unjoined_out).enumerate() {
+            assert!(
+                a.to_bits() == b.to_bits(),
+                "joined and unjoined outputs must be bit-identical — element {i} reads \
+                 {a} joined vs {b} unjoined (max_abs_diff {identity})"
+            );
+        }
+    } else {
+        eprintln!(
+            "[rlx-gguf-join] grouped joined run: this harness is in \
+             RLX_WGPU_ONE_OP_PER_PASS=1, so the first run above IS the unjoined leg — \
+             nothing left to compare the join against here"
+        );
+    }
+
     // ── The host leg: a call the ladder hosts still reads back ──────────────
     let (host_graph, host_packed, host_dense) = host_adjacent();
     let mut hx = build(Device::Gpu, &host_graph, &host_packed, &host_dense);
@@ -566,8 +685,9 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
          routes={h_routes:?}"
     );
     assert!(
-        h_routes.host >= 1 && h_routes.per_row >= 1,
-        "the graph must mix a hosted call with a joined one: {h_routes:?}"
+        h_routes.host >= 1 && h_routes.grouped >= 1,
+        "the graph must mix a hosted call with a joined multi-row one, which the \
+         grouped GEMM carries: {h_routes:?}"
     );
     // Reconciled by difference, not by naming every step: the joined arrangement
     // makes the SAME submissions as the inert mode (the middle call's own encode

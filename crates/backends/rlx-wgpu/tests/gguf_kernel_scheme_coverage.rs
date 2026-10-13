@@ -253,25 +253,53 @@ fn the_one_row_device_guard_requires_a_vec4_addressable_x_window() {
 }
 
 /// The route ladder's answer, pinned device-free. The batch boundary joins
-/// exactly on [`rlx_wgpu::gguf_gpu::DequantMatmulPath::OneRowDevice`], so the
-/// predicate must be an exact test of the one-row tiled arm rather than its bare
-/// window guard: it has to compose the arm's addressability check with the
-/// tiled-arm scheme check. Q1_0 passes that guard (its arm reads X a scalar at a
-/// time) but has no tiled branch, and a K-quant whose window is misaligned is
-/// refused — joining either would encode work the tiled kernel cannot read, and
-/// the batch boundary would have handed it a submission instead of the host.
+/// exactly on [`rlx_wgpu::gguf_gpu::DequantMatmulPath::is_provably_device_only`],
+/// so that predicate must be an *exact* test of the two caller-encodable K-quant
+/// arms: the tiled one-row arm
+/// ([`rlx_wgpu::gguf_gpu::DequantMatmulPath::OneRowDevice`]) and, above one row,
+/// the row-grouped GEMM
+/// ([`rlx_wgpu::gguf_gpu::DequantMatmulPath::GroupedDevice`]) — the same windowed
+/// entry point at the row count the run encodes it at. It has to compose the arm's
+/// own X-window addressability guard (`gemv_one_row_device_ok`), so a window the
+/// arm's `vec4` reads cannot address stays out; Q1_0 passes that guard (its arm
+/// reads X a scalar at a time) but has no tiled branch, so it must not be admitted
+/// either — joining it would encode work the tiled kernel cannot read, and the
+/// batch boundary would have handed it a submission instead of the host.
 ///
 /// The ladder is also deliberately pure: it records nothing, so asking it what
 /// the route will be does not perturb [`rlx_wgpu::gguf_gpu::route_counts`].
 #[test]
-fn select_path_is_exact_for_the_one_row_device_arm() {
+fn select_path_is_exact_for_the_joined_device_arms() {
     use rlx_wgpu::gguf_gpu::{DequantMatmulPath, select_path};
 
+    // The boundary's predicate is a total function of the variant, so it is pinned
+    // once, over all five. The ladder's answers for the calls are pinned after it,
+    // per call: together the two say the join set is exactly the two arms a caller
+    // can encode, and that the three which can still reach the host stay out.
+    for path in [
+        DequantMatmulPath::OneRowDevice,
+        DequantMatmulPath::GroupedDevice,
+    ] {
+        assert!(
+            path.is_provably_device_only(),
+            "{path:?} has no host arm and must join the batch"
+        );
+    }
+    for path in [
+        DequantMatmulPath::FusedArm,
+        DequantMatmulPath::ScratchArm,
+        DequantMatmulPath::Host,
+    ] {
+        assert!(
+            !path.is_provably_device_only(),
+            "{path:?} can reach the host and must stay out of the join set"
+        );
+    }
+
     // Q4_K (0) / Q6_K (2) at one row with an addressable X window — the shape a
-    // decode calls at, and the only one the boundary may join. `k = 384` is not a
-    // whole number of 256-element blocks but the window is still addressable
-    // (1536 B, a multiple of 16), and at m=1 that is enough: the arm's guard is
-    // about addressability, not block geometry.
+    // decode calls at. `k = 384` is not a whole number of 256-element blocks but
+    // the window is still addressable (1536 B, a multiple of 16), and at m=1 that
+    // is enough: the arm's guard is about addressability, not block geometry.
     for (name, id) in [("Q4_K", 0u32), ("Q6_K", 2)] {
         for k in [256usize, 384] {
             for scratch_off in [0usize, 4096] {
@@ -285,7 +313,6 @@ fn select_path_is_exact_for_the_one_row_device_arm() {
             }
         }
     }
-
     // Q1_0 (24) at one row passes the same window guard — its arm reads X a
     // scalar at a time — but is not the tiled arm, so it must not be joined.
     for k in [256usize, 384] {
@@ -297,18 +324,50 @@ fn select_path_is_exact_for_the_one_row_device_arm() {
         );
     }
 
-    // Q4_K / Q6_K above one row: the row-grouped GEMM when k is a whole number of
-    // packing blocks (whatever slab the plan booked), and the scratch / host
-    // fallback when it is not.
-    for id in [0u32, 2] {
-        for scratch_off in [0usize, 4096] {
-            assert_eq!(
-                select_path(4, 256, id, 64, scratch_off),
-                DequantMatmulPath::FusedArm,
-                "id {id} m=4 k=256 scratch_off={scratch_off}: a whole number of \
-                 blocks is the row-grouped GEMM, never the joined one-row arm"
-            );
+    // Pin (a) — the ladder's answer for a multi-row K-quant call, over the input
+    // classes that decide it: the scheme, the slab the plan booked, a row count from
+    // the bodies' measured class beside the smallest above one row, and two
+    // contraction widths that are whole numbers of packing blocks. Each is the
+    // row-grouped GEMM, whose entry point a caller encodes into its own batch
+    // exactly as it does the one-row arm — and the predicate pinned above reads that
+    // exact answer, so the admission is not a second rule that could disagree.
+    for (name, id) in [("Q4_K", 0u32), ("Q6_K", 2)] {
+        for m in [2usize, 13] {
+            for k in [256usize, 2048] {
+                for scratch_off in [0usize, 4096] {
+                    assert_eq!(
+                        select_path(m, k, id, 64, scratch_off),
+                        DequantMatmulPath::GroupedDevice,
+                        "{name} (id {id}) m={m} k={k} scratch_off={scratch_off}: a \
+                         whole number of blocks above one row is the row-grouped GEMM"
+                    );
+                }
+            }
         }
+    }
+
+    // The negative half — the calls that share the arm but must stay *out* of the
+    // admission. Both a multi-row window the arm's `vec4` X read cannot address ...
+    for id in [0u32, 2] {
+        assert_eq!(
+            select_path(4, 256, id, 4, 0),
+            DequantMatmulPath::FusedArm,
+            "id {id} m=4 with a 4-byte-aligned X window: not addressable as vec4, \
+             so the boundary must not join it"
+        );
+    }
+    // ... and Q1_0 above one row, which passes the bare guard but is not the tiled
+    // arm.
+    assert_eq!(
+        select_path(4, 256, 24, 64, 0),
+        DequantMatmulPath::FusedArm,
+        "Q1_0 (24) m=4: the bare guard passes but the scheme is not the tiled arm, \
+         so the ladder must say Fused"
+    );
+
+    // Q4_K / Q6_K above one row with a `k` that is not a whole number of packing
+    // blocks: the scratch / host fallback, never the grouped device route.
+    for id in [0u32, 2] {
         assert_eq!(
             select_path(4, 384, id, 64, 4096),
             DequantMatmulPath::ScratchArm,
@@ -360,6 +419,25 @@ fn select_path_is_exact_for_the_one_row_device_arm() {
              so the boundary must not join it"
         );
     }
+
+    // The grouped arm's `k` gate is inherited from this ladder rather than
+    // restated: `select_path` admits a multi-row K-quant only through its `fused`
+    // term, which requires `k` a whole number of the scheme's own block, and for
+    // the two tiled schemes that block *is* `GROUPED_STAGE_ELEMS` — the staged
+    // tile the grouped GEMM's weight loop barriers fall at. That equality is what
+    // lets the admission above inherit the term and therefore cannot route an
+    // admitted call down the per-row loop, whose shader truncates `k` to that same
+    // 256-element unit.
+    assert_eq!(
+        rlx_ir::quant::QuantScheme::GgufQ4K.gguf_block_size() as usize,
+        rlx_wgpu::gguf_gpu::GROUPED_STAGE_ELEMS,
+        "Q4_K's packing block must be the grouped GEMM's staged tile"
+    );
+    assert_eq!(
+        rlx_ir::quant::QuantScheme::GgufQ6K.gguf_block_size() as usize,
+        rlx_wgpu::gguf_gpu::GROUPED_STAGE_ELEMS,
+        "Q6_K's packing block must be the grouped GEMM's staged tile"
+    );
 
     // The selector is pure by construction; the route census it is checked
     // against lives in `gguf_matmul_route.rs` / `gguf_batch_join.rs`.

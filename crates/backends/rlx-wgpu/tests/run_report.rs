@@ -13,7 +13,7 @@
 //! Printed text is asserted the way this tree does it: the test re-runs itself in a
 //! child process (`crates/backends/rlx-cpu/tests/pool_width_claimed.rs`'s
 //! `the_refusal_is_reported_on_stderr` is the idiom) and reads the child's stderr.
-//! The nine cases differ by environment — the switches are read by the run path,
+//! The ten cases differ by environment — the switches are read by the run path,
 //! and the environment is a fact of the run rather than of the test's own process
 //! — so each case gets its own child and the parser sees one run's report and
 //! nothing else: the region mix in full; the same graph under
@@ -45,19 +45,21 @@
 //! could be obtained at all: `view=unavailable` is pinned together with
 //! `measured=0` and `device_ms=unavailable`, and a lost sample is never a zero.
 //!
-//! The packed-multiply cases — 8 and 9 — are the ones the device view's coverage
-//! is about. Their graph is one packed Q4_K weight multiply and the dense multiply
-//! over its rows, run at two row counts, because the row count is what decides the
-//! multiply's route: at one row it is the one-row tiled arm the run *joins* into its
-//! batch, so the multiply's pass is an `encode` pass beside the batch's own, and at
-//! four rows it is the row-grouped arm whose pass is that call's own submission,
-//! which lands in `host` — the interval the run's own dispatch loop never opens a
-//! pass in. Both cases assert the same thing about the view: the packed multiply's
-//! pass is recorded, `passes` counts it, and the interval the report names for it is
-//! the one that carried the multiply. A disabled report cannot print, so the same
-//! fixture under the switch off would only restate case 3, and the crate's other
-//! packed-multiply targets run these same routes with the switch off — the marks'
-//! ordinary path needs no case of its own here.
+//! The packed-multiply cases — 8 to 10 — are the ones the device view's coverage
+//! is about. Their graph is one packed weight multiply and the dense multiply over
+//! its rows, run at three shapes because the row count and the scheme together
+//! decide the multiply's route: a K-quant multiply at one row is the one-row tiled
+//! arm the run *joins* into its batch, and the same scheme at four rows is the
+//! row-grouped GEMM, which the run joins the same way — both multiply passes are
+//! `encode` passes beside the batch's own. An 8-bit (Q8_0) multiply at four rows is
+//! not joined: it takes its group's own scratch entry point, so its pass is that
+//! call's own submission and lands in `host` — the interval the run's own dispatch
+//! loop never opens a pass in. All three cases assert the same thing about the
+//! view: the packed multiply's pass is recorded, `passes` counts it, and the
+//! interval the report names for it is the one that carried the multiply. A disabled
+//! report cannot print, so the same fixture under the switch off would only restate
+//! case 3, and the crate's other packed-multiply targets run these same routes with
+//! the switch off — the marks' ordinary path needs no case of its own here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -78,25 +80,34 @@ const MARKER: &str = "RUN_REPORT_CHILD";
 /// report's two halves need; [`tail_host_graph`], whose one host step is a step the
 /// run defers to the end of the schedule; [`dynamic_graph`], which the run resolves
 /// — and so compiles — inside the reported bracket; and [`packed_graph`] at each of
-/// [`PACKED_ROWS`]'s row counts, the only fixtures whose schedule holds a packed
-/// multiply.
+/// [`PACKED_ROWS`]'s rows and schemes, the only fixtures whose schedule holds a
+/// packed multiply.
 const REGION_MIX: &str = "region_mix";
 const TAIL_HOST: &str = "tail_host";
 const DYNAMIC: &str = "dynamic";
 const PACKED_JOIN: &str = "packed_join";
-const PACKED_HOST: &str = "packed_host";
+const PACKED_JOIN_M4: &str = "packed_join_m4";
+const PACKED_UNJOINED: &str = "packed_unjoined";
 
-/// The two row counts the packed-multiply fixtures run at, each with its fixture
-/// name and the route its row count decides — the one place all three are written
-/// down, so the cases and the premise assertions below cannot drift apart.
-const PACKED_ROWS: [(usize, &str, bool); 2] = [(1, PACKED_JOIN, true), (4, PACKED_HOST, false)];
+/// The packed-multiply fixtures: each row count with its fixture name, its scheme
+/// and whether its route is one the run *joins* into its batch — the one place all
+/// four are written down, so the cases and the premise assertions below cannot
+/// drift apart. Two K-quant cases ride the join at one and four rows; the 8-bit
+/// scheme's four-row call keeps its scratch entry point and its own submission,
+/// which is why one case of each kind is here.
+const PACKED_ROWS: [(usize, &str, QuantScheme, bool); 3] = [
+    (1, PACKED_JOIN, QuantScheme::GgufQ4K, true),
+    (4, PACKED_JOIN_M4, QuantScheme::GgufQ4K, true),
+    (4, PACKED_UNJOINED, QuantScheme::GgufQ8_0, false),
+];
 
-/// The row count a packed-multiply fixture runs at, or `None` for another fixture.
-fn packed_rows(fixture: &str) -> Option<usize> {
+/// The row count and scheme a packed-multiply fixture runs at, or `None` for
+/// another fixture.
+fn packed_rows(fixture: &str) -> Option<(usize, QuantScheme)> {
     PACKED_ROWS
         .iter()
-        .find(|(_, name, _)| *name == fixture)
-        .map(|(rows, _, _)| *rows)
+        .find(|(_, name, _, _)| *name == fixture)
+        .map(|(rows, _, scheme, _)| (*rows, *scheme))
 }
 
 /// The seven phase tokens an interval, an omission or a pass may name.
@@ -169,9 +180,11 @@ const NFFT: usize = 32;
 const N_BINS: usize = NFFT / 2 + 1;
 const N_MELS: usize = 8;
 
-/// Geometry of the packed-multiply fixture: the contraction is one Q4_K
-/// superblock — the whole number of packing blocks the one-row arm answers over —
-/// against a `[k, n]` packed weight.
+/// Geometry of the packed-multiply fixture: the contraction is one 256-element
+/// packing block — the whole number of blocks the fused arms answer over, and the
+/// staged tile the grouped GEMM's weight loop barriers fall at — against a `[k, n]`
+/// packed weight. It is a whole number of Q8_0's 32-element blocks too, so the
+/// 8-bit fixture reads the same `k`.
 const PACKED_K: usize = 256;
 const PACKED_N: usize = 64;
 
@@ -254,23 +267,29 @@ fn dynamic_graph() -> Graph {
     g
 }
 
-/// The packed-multiply fixture: one packed Q4_K weight multiply and a dense one
-/// over its rows, at `m` rows. Returns the graph and the packed weight's bytes.
+/// The packed-multiply fixture: one packed weight multiply in `scheme` and a dense
+/// one over its rows, at `m` rows. Returns the graph and the packed weight's bytes.
 ///
-/// `m` is the whole route decision — the two row counts [`PACKED_ROWS`] names put
-/// the multiply on the joined one-row arm and on the row-grouped arm with a
-/// submission of its own — and the dense multiply beside it keeps the run's own
-/// dispatch loop in the schedule, so the report has a batched pass to read the
+/// `m` and the scheme are the whole route decision — the row counts [`PACKED_ROWS`]
+/// names put a K-quant multiply on the joined tiled arm and, above one row, on the
+/// joined row-grouped GEMM, and the 8-bit scheme's four-row multiply on its scratch
+/// entry point's own submission — and the dense multiply beside it keeps the run's
+/// own dispatch loop in the schedule, so the report has a batched pass to read the
 /// packed one against.
-fn packed_graph(m: usize) -> (Graph, Vec<u8>) {
-    let bytes = common::packed_gguf_bytes(rlx_gguf::GgmlType::Q4K, PACKED_K, PACKED_N);
+fn packed_graph(m: usize, scheme: QuantScheme) -> (Graph, Vec<u8>) {
+    // The scheme's own GGML packing, so the bytes back the `Op::DequantMatMul` the
+    // graph carries and every kernel in the route can read them.
+    let ty = match scheme {
+        QuantScheme::GgufQ4K => rlx_gguf::GgmlType::Q4K,
+        QuantScheme::GgufQ8_0 => rlx_gguf::GgmlType::Q8_0,
+        other => panic!("no packed fixture for {other:?}"),
+    };
+    let bytes = common::packed_gguf_bytes(ty, PACKED_K, PACKED_N);
     let mut g = Graph::new("wgpu_run_report_packed");
     let x = g.input("x", Shape::new(&[m, PACKED_K], DType::F32));
     let w = g.param("w", Shape::new(&[bytes.len()], DType::U8));
     let y = g.add_node(
-        Op::DequantMatMul {
-            scheme: QuantScheme::GgufQ4K,
-        },
+        Op::DequantMatMul { scheme },
         vec![x, w],
         Shape::new(&[m, PACKED_N], DType::F32),
     );
@@ -311,10 +330,10 @@ fn run_dynamic() {
     let _ = exe.run(&[("x", &xv)]);
 }
 
-/// A packed-multiply child's job: one forward pass at `m` rows, the packed weight
-/// uploaded as the bytes its param is declared to hold.
-fn run_packed(m: usize) {
-    let (g, bytes) = packed_graph(m);
+/// A packed-multiply child's job: one forward pass at `m` rows of `scheme`, the
+/// packed weight uploaded as the bytes its param is declared to hold.
+fn run_packed(m: usize, scheme: QuantScheme) {
+    let (g, bytes) = packed_graph(m, scheme);
     let mut exe = Session::new(Device::Gpu).compile(g);
     exe.set_param_typed("w", &bytes, DType::U8);
     exe.set_param("p", &common::ramp(PACKED_N * PACKED_N, 1, 0.019));
@@ -1071,7 +1090,7 @@ fn assert_dispatch_only_device_only(stderr: &str, schedule: usize) {
     );
 }
 
-/// Cases 8 and 9 — the packed multiply's own pass in the device view.
+/// Cases 8 to 10 — the packed multiply's own pass in the device view.
 ///
 /// [`assert_device_view`] owns the device line's full battery (its fields, its
 /// `unavailable` reason, the `device_unusable` cross-checks); what a packed
@@ -1079,14 +1098,16 @@ fn assert_dispatch_only_device_only(stderr: &str, schedule: usize) {
 /// passes and not the dispatch loop's alone, and the interval the report names for
 /// it must be the one that carried the multiply.
 ///
-/// `joined` is the route this case's row count takes. The one-row arm is encoded
-/// into the run's own batch, so its pass is an `encode` pass beside the batch's:
-/// the `encode` interval then carries the batch pass opened before its first
-/// remaining step turns out to be the host-classified multiply, the multiply's own
-/// pass, and the dense step's batch pass. The row-grouped arm is a submission of
-/// its own inside the `host` step, so its pass is the only `device_pass` line
-/// outside `encode` — the interval the run's own dispatch loop never opens a pass
-/// in, which is what makes such a line readable as a packed multiply's.
+/// `joined` is the route this case's row count takes: `true` when the run encodes
+/// the call into its own batch. The joined arms — the tiled one-row arm and the
+/// row-grouped GEMM above it — ride that batch, so the multiply's pass is an
+/// `encode` pass beside the batch's: the `encode` interval then carries the batch
+/// pass opened before its first remaining step turns out to be the host-classified
+/// multiply, the multiply's own pass, and the dense step's batch pass. The 8-bit
+/// scheme's multi-row multiply is not joined: its group entry point submits on its
+/// own inside the `host` step, so its pass is the only `device_pass` line outside
+/// `encode` — the interval the run's own dispatch loop never opens a pass in, which
+/// is what makes such a line readable as a packed multiply's.
 fn assert_packed_covered(stderr: &str, joined: bool) {
     let lines = report_lines(stderr);
     let pass_lines = assert_device_view(&lines, stderr);
@@ -1129,7 +1150,8 @@ fn assert_packed_covered(stderr: &str, joined: bool) {
              found {encodes}:\n{stderr}"
         );
     } else {
-        // The row-grouped arm: a submission of its own, inside the `host` step's
+        // The unjoined case — the 8-bit scheme's four-row multiply, which takes its
+        // group's own entry point: a submission of its own, inside the `host` step's
         // interval — the one the run's own dispatch loop never opens a pass in.
         assert_eq!(
             carrier["label"], "host",
@@ -1149,7 +1171,7 @@ fn assert_packed_covered(stderr: &str, joined: bool) {
     }
 }
 
-/// One test fn, nine child cases: the report's structure is one claim per case,
+/// One test fn, ten child cases: the report's structure is one claim per case,
 /// and a case's switch set is its own process's environment.
 #[test]
 fn a_run_reports_where_its_time_went() {
@@ -1159,7 +1181,7 @@ fn a_run_reports_where_its_time_went() {
             TAIL_HOST => run_tail_host(),
             DYNAMIC => run_dynamic(),
             other => match packed_rows(other) {
-                Some(rows) => run_packed(rows),
+                Some((rows, scheme)) => run_packed(rows, scheme),
                 None => panic!("`{other}` is not a fixture this test runs"),
             },
         }
@@ -1203,16 +1225,17 @@ fn a_run_reports_where_its_time_went() {
     );
 
     // The packed-multiply premise: one packed multiply and the dense step over its
-    // rows, in that order, at either row count a case runs. A packed multiply whose
-    // scheme had no fused arm would leave this list without its step — and the
-    // report could then only say the view covers nothing here.
-    for (m, _, _) in PACKED_ROWS {
-        let (g, _) = packed_graph(m);
+    // rows, in that order, at each row count and scheme a case runs. A packed
+    // multiply whose scheme had no fused arm would leave this list without its step
+    // — and the report could then only say the view covers nothing here.
+    for (m, _, scheme, _) in PACKED_ROWS {
+        let (g, _) = packed_graph(m, scheme);
         let packed_steps = rlx_wgpu::backend::WgpuExecutable::compile(g).test_step_names();
         assert_eq!(
             packed_steps,
             ["dequant_matmul_gguf", "matmul"],
-            "the packed fixture at {m} rows must be one packed multiply and one dense step"
+            "the packed fixture at {m} rows of {scheme:?} must be one packed multiply \
+             and one dense step"
         );
     }
 
@@ -1288,9 +1311,11 @@ fn a_run_reports_where_its_time_went() {
         1,
     );
 
-    // 8–9. The packed multiply, on the two routes the row count decides: joined
-    // into the run's own batch, and as a submission of its own.
-    for (_, fixture, joined) in PACKED_ROWS {
+    // 8–10. The packed multiplies, on the routes their row counts and schemes
+    // decide: the joined K-quant cases at one and four rows, and the 8-bit scheme's
+    // four-row call, which takes its group's own scratch entry point and so keeps a
+    // submission of its own inside the `host` interval.
+    for (_, fixture, _, joined) in PACKED_ROWS {
         assert_packed_covered(
             &run_case(fixture, &[(common::RUN_REPORT_SWITCH, "1")]),
             joined,

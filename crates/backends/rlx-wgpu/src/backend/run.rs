@@ -76,11 +76,15 @@ impl WgpuExecutable {
     /// call's dispatches into the enclosing batch, so its work rides the batch's
     /// submission instead of one of its own.
     ///
-    /// That is the route ladder's own answer for the call
-    /// ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`], the device-only work
+    /// That is the route ladder's own answer for the call — the two device-only
+    /// [`crate::gguf_gpu::DequantMatmulPath`]s, whose entry point
     /// [`crate::gguf_gpu::encode_dequant_matmul_gguf_into`] can be handed a caller's
-    /// encoder). Whether this *run* batches at all is the caller's business — the
-    /// step-by-step and snapshot modes keep one operation per submission on purpose
+    /// encoder and which reach no host route at all: the tiled K-quant arm at one
+    /// row ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`]) and the
+    /// row-grouped K-quant GEMM above it
+    /// ([`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]). Whether this *run*
+    /// batches at all is the caller's business — the step-by-step and snapshot
+    /// modes keep one operation per submission on purpose
     /// (`RLX_WGPU_ONE_OP_PER_PASS`, and the snapshot stops between steps), so both of
     /// them apply that mode to this answer rather than fold it in here.
     ///
@@ -597,9 +601,9 @@ impl WgpuExecutable {
     ///
     /// Read off the plan-time classification, deliberately: it stays pessimistic,
     /// and stays correct, because the host arms remain reachable in the run-time
-    /// route ladder — a one-row packed multiply and a buffer copy whose route
-    /// answers `Device` are joined by a run-time decision, and either runs on the
-    /// host whenever its own ladder answer is not device-only.
+    /// route ladder — a packed multiply and a buffer copy whose route answers
+    /// `Device` are joined by a run-time decision, and either runs on the host
+    /// whenever its own ladder answer is not device-only.
     pub fn requires_host_execution(&self) -> bool {
         self.schedule
             .iter()
@@ -3583,10 +3587,15 @@ impl WgpuExecutable {
                         crate::backend::note_device_wait();
                         let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                     }
-                    // The join decision admits only `OneRowDevice` (schemes 0/2 at
-                    // one row), whose ladder always encodes: this site owns no
-                    // fallback, so a scheme the ladder declines has to be handled
-                    // here rather than advanced with nothing encoded.
+                    // The admission is the ladder's device-only answers, so a
+                    // refusal is unreachable for an admitted shape: it takes a scheme
+                    // with no per-row branch, see `encode_dequant_matmul_gguf_into`'s
+                    // doc. It is still never run past — an unencoded call leaves
+                    // `step_i` where it is, so this iteration's tail submits the batch
+                    // and the outer host dispatch then sees a step
+                    // `step_runs_on_host` answers true for and runs its own arm, the
+                    // same ladder and guards, on an arena that submission has made
+                    // coherent.
                     let encoded = crate::gguf_gpu::encode_dequant_matmul_gguf_into(
                         &self.arena,
                         &dev.device,
@@ -3601,11 +3610,12 @@ impl WgpuExecutable {
                         *out_byte_off as usize,
                         &mut report.marks(),
                     );
-                    debug_assert!(encoded, "joined step has no arm in the ladder");
-                    step_i += 1;
-                    pass_dispatched = true;
-                    pending_enc = Some(enc);
-                    continue;
+                    if encoded {
+                        step_i += 1;
+                        pass_dispatched = true;
+                        pending_enc = Some(enc);
+                        continue;
+                    }
                 }
                 // A joined copy: the same shape as the packed multiply above — end
                 // the pass, encode the copy's work into THIS encoder, carry the
@@ -4053,16 +4063,24 @@ impl WgpuExecutable {
                     // runs unjoined is one the boundary deliberately left alone (the
                     // step-by-step / snapshot modes, or a route outside the join set)
                     // rather than a second opinion about the route.
-                    // - m==1 Q4_K / Q6_K with an addressable X window is the
-                    //   joined one-row arm
-                    //   ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`]).
-                    // - Q4_K / Q6_K + m>1: row-grouped GEMM (one pass over each
-                    //   packed weight tile per group of rows; a split Q4_K chunk
-                    //   reads each block's 16-byte header twice) inside gemv_rows;
-                    //   that path N-chunks the weight window itself, so a weight
-                    //   parked in the weight buffer or wider than the binding
-                    //   limit still takes it.
-                    // - Q1_0 + m>1: tiled GEMM (or per-row GEMV) inside gemv_rows.
+                    // - The tiled K-quant arm with an addressable X window — the two
+                    //   the batch boundary joins:
+                    //   [`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`] at one
+                    //   row and [`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]
+                    //   above it. gemv_rows re-checks the same window guard, so
+                    //   neither reaches the host. One row is the per-row loop; above
+                    //   one row it is the row-grouped GEMM (one pass over each packed
+                    //   weight tile per group of rows; a split Q4_K chunk reads each
+                    //   block's 16-byte header twice), whose arm N-chunks the weight
+                    //   window itself, so a weight parked in the weight buffer or
+                    //   wider than the binding limit still takes it — and the per-row
+                    //   loop is that arm's own fallback.
+                    // - The fused arm: Q1_0 at every row (its tiled GEMM above one row
+                    //   while `RLX_WGPU_Q1_0_GEMM_DISABLE` is off and the windows fit
+                    //   a shard, else the per-row loop), and a tiled K-quant call
+                    //   whose X window the guard refuses — gemv_rows' own check of
+                    //   that guard hands it to gguf_host (`Host`), never to a device
+                    //   arm.
                     // - The scratch arm: the fused entry point's own ladder — the
                     //   row-grouped GEMM for a multi-row scheme with no one-row arm
                     //   (Q8_0), else an in-arena f32 slab then `matmul_bt` (`gemv`
@@ -4081,6 +4099,7 @@ impl WgpuExecutable {
                         // Joined when the batch boundary could take it; the arm
                         // is the unjoined fallback (one-op-per-pass, snapshot).
                         crate::gguf_gpu::DequantMatmulPath::OneRowDevice
+                        | crate::gguf_gpu::DequantMatmulPath::GroupedDevice
                         | crate::gguf_gpu::DequantMatmulPath::FusedArm => {
                             crate::gguf_gpu::run_dequant_matmul_gguf_gemv_rows(
                                 &self.arena,

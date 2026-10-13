@@ -82,7 +82,7 @@ pub fn gemv_tiled_supports_scheme(scheme_id: u32) -> bool {
     matches!(scheme_id, 0 | 2)
 }
 
-/// Whether the one-row route can run this call on the device.
+/// Whether a device route this call is admitted to can read its X window.
 ///
 /// The tiled arm reads X as `vec4` (8 vector loads per unit instead of 32 scalar
 /// ones), so the window's own offset and the input row stride (`x_row_bytes`, the
@@ -91,7 +91,8 @@ pub fn gemv_tiled_supports_scheme(scheme_id: u32) -> bool {
 /// used at — the arena aligns every tensor to 16 bytes and `k` is a multiple of
 /// 256 — and false for a view the route then hands to the host rather than
 /// reading X shifted. The grouped GEMM checks the same two things for its own
-/// `vec4` X reads. Pinned device-free by `tests/gguf_kernel_scheme_coverage.rs`.
+/// `vec4` X reads, and [`select_path`] composes this one guard for the multi-row
+/// admission as well. Pinned device-free by `tests/gguf_kernel_scheme_coverage.rs`.
 pub fn gemv_one_row_device_ok(scheme_id: u32, x_byte_off: usize, x_row_bytes: usize) -> bool {
     !gemv_tiled_supports_scheme(scheme_id)
         || (x_byte_off.is_multiple_of(16) && x_row_bytes.is_multiple_of(16))
@@ -102,6 +103,10 @@ pub fn gemv_one_row_device_ok(scheme_id: u32, x_byte_off: usize, x_row_bytes: us
 /// dispatches on it and the batch boundary joins on it, so entry point and
 /// boundary cannot disagree.
 ///
+/// **Batch join:** the run encodes the call's dispatches into its own enclosing
+/// batch instead of letting the call submit on its own exactly for the answers
+/// [`Self::is_provably_device_only`] admits.
+///
 /// A variant names the entry point, NOT the route `route_counts` ends up
 /// recording: the fused and scratch arms may still hand the call to
 /// [`crate::gguf_host`] when their own arm refuses it, and
@@ -111,16 +116,28 @@ pub fn gemv_one_row_device_ok(scheme_id: u32, x_byte_off: usize, x_row_bytes: us
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DequantMatmulPath {
     /// The one-row tiled K-quant arm ([`dequant_gemv_gguf_tiled_kernel`]) with an
-    /// X window it can address: fused windowed kernels, no host read, and the
-    /// only route whose dispatches a caller can encode itself
+    /// X window it can address: fused windowed kernels, no host read, and one of
+    /// the two routes whose dispatches a caller can encode itself
     /// ([`encode_dequant_matmul_gguf_into`]) instead of letting the call submit
     /// on its own.
     OneRowDevice,
+    /// The row-grouped K-quant GEMM at `m > 1` — the multi-row half of
+    /// [`Self::OneRowDevice`]'s route, encoded the same way and admitted on the
+    /// same window guard, with its `k` gate inherited rather than restated: the
+    /// `fused` term of [`select_path`] admits a multi-row call only with `k` a whole
+    /// number of the scheme's block, which for the tiled arm's schemes *is*
+    /// [`GROUPED_STAGE_ELEMS`], so an admitted call cannot make that arm decline for
+    /// `k` and fall to the per-row loop, whose tiled arm floors `k` to whole blocks.
+    /// What the arm's own gates do decline is not a refusal of the route — see
+    /// [`encode_dequant_matmul_gguf_into`], which reads it through the per-row loop
+    /// exactly as an unjoined call of that shape does; those gates read arena and
+    /// adapter facts this pure ladder cannot see, so our shapes meeting them is an
+    /// expectation about the shapes, not a property of the ladder.
+    GroupedDevice,
     /// The fused windowed entry point ([`run_dequant_matmul_gguf_gemv_rows`]):
-    /// the row-grouped K-quant GEMM, the per-row fallback for a stranded call,
-    /// the Q1_0 arm, and a one-row call whose X window the tiled arm refuses —
-    /// which that entry point hands to [`crate::gguf_host`] and records as the
-    /// host route.
+    /// the per-row fallback for a stranded call, the Q1_0 arm, and a call whose X
+    /// window the tiled arm refuses — which that entry point hands to
+    /// [`crate::gguf_host`] and records as the host route.
     FusedArm,
     /// The dequant-scratch entry point ([`run_dequant_matmul_gguf_gpu`]) with a
     /// slab booked: dequant scratch + `matmul_bt` for a scheme with no fused
@@ -136,15 +153,18 @@ pub enum DequantMatmulPath {
 
 impl DequantMatmulPath {
     /// Whether this call is known to compute entirely on the device — true for
-    /// [`DequantMatmulPath::OneRowDevice`] alone, whose entry point has no host
-    /// arm at all. The other variants are entry points that can still reach
+    /// [`DequantMatmulPath::OneRowDevice`] and
+    /// [`DequantMatmulPath::GroupedDevice`], whose entry point has no host arm at
+    /// all. The other variants are entry points that can still reach
     /// [`crate::gguf_host`], so nothing may be scheduled on the assumption that
     /// they are device-only. This is the batch boundary's own predicate, so the
     /// join set is this selection and not a second rule; the selection it reads is
-    /// pinned device-free by `tests/gguf_kernel_scheme_coverage.rs`, one case per
-    /// scheme and shape.
-    pub(crate) fn is_provably_device_only(self) -> bool {
-        matches!(self, Self::OneRowDevice)
+    /// pinned device-free by `tests/gguf_kernel_scheme_coverage.rs`, over the
+    /// variants and per call over the scheme, row count and window classes. `pub`
+    /// for that pin and for [`select_path`]-style callers, so the test reads the
+    /// real predicate rather than restating it.
+    pub fn is_provably_device_only(self) -> bool {
+        matches!(self, Self::OneRowDevice | Self::GroupedDevice)
     }
 }
 
@@ -176,14 +196,23 @@ pub fn select_path(
             DequantMatmulPath::Host
         };
     }
-    if m == 1
-        && gemv_tiled_supports_scheme(scheme_id)
-        && gemv_one_row_device_ok(scheme_id, x_byte_off, k * 4)
+    // The tiled K-quant arm with an X window its `vec4` reads can address — the
+    // same guard the grouped GEMM applies to its own `vec4` X reads, and the one
+    // the fused entry point re-checks before handing the call to the host. One row
+    // is the arm a caller encodes itself; above one row the same entry point
+    // reaches the row-grouped GEMM, which a caller encodes the same way. The `k`
+    // that arm needs is `fused`'s own term above rather than a rule stated here —
+    // see [`DequantMatmulPath::GroupedDevice`].
+    if gemv_tiled_supports_scheme(scheme_id) && gemv_one_row_device_ok(scheme_id, x_byte_off, k * 4)
     {
-        DequantMatmulPath::OneRowDevice
-    } else {
-        DequantMatmulPath::FusedArm
+        return match m {
+            // No call at all keeps the fused arm it has today.
+            0 => DequantMatmulPath::FusedArm,
+            1 => DequantMatmulPath::OneRowDevice,
+            _ => DequantMatmulPath::GroupedDevice,
+        };
     }
+    DequantMatmulPath::FusedArm
 }
 
 /// Route a batched packed GGUF multiply can take.
@@ -650,9 +679,10 @@ pub fn run_dequant_matmul_gguf_gpu(
         return;
     }
     // Q4_K/Q6_K/Q1_0: scratch-free windowed kernels — one submit from this fused
-    // entry point for batched rows, row-grouped for m>1 Q4_K/Q6_K. The one-row
-    // K-quant arm with an addressable X window is instead encoded into the caller's
-    // enclosing batch at run time ([`DequantMatmulPath::OneRowDevice`]).
+    // entry point for batched rows, row-grouped for m>1 Q4_K/Q6_K. The K-quant
+    // windowed arm with an addressable X window — one row, and the row-grouped
+    // GEMM above one — is instead encoded into the caller's enclosing batch at run
+    // time ([`DequantMatmulPath::OneRowDevice`] / [`DequantMatmulPath::GroupedDevice`]).
     if gemv_supports_scheme(scheme_id) {
         run_dequant_matmul_gguf_gemv_rows(
             arena,
@@ -809,7 +839,11 @@ fn with_pooled_out_buf<R>(
 
 /// Encode fused GGUF DequantMatMul into `enc` (no `queue.submit`), leaving the
 /// submission to the caller. Scheme and shape pick the route: the Q1_0 and
-/// row-grouped GEMMs first, then the per-row GEMV loop. Uniforms are unique per
+/// row-grouped GEMMs first, then the per-row GEMV loop. A multi-row call the
+/// grouped GEMM's own gates decline — an X window spanning arena shards or over the
+/// adapter's binding limit, an `m`-wide output slab no column chunk could bind, a
+/// first weight window the chunking cannot fit — is read through that per-row loop,
+/// the same route an unjoined call of that shape takes. Uniforms are unique per
 /// dispatch (`queue.write_buffer` is not ordered inside an encoder the way copies
 /// are).
 ///
@@ -817,13 +851,18 @@ fn with_pooled_out_buf<R>(
 /// which is a scheme outside [`gemv_supports_scheme`] whose row-grouped arm
 /// declined — the per-row loop has no branch for such a scheme, so its leg
 /// dispatch would match nothing and read the weights as zeros. Nothing is encoded
-/// in that case and the caller owns the fallback.
+/// in that case and the caller owns the fallback. Reachable from the scratch
+/// entry point, whose scheme (the 8-bit block one) has no per-row branch there;
+/// the batch boundary's join set admits the two device-only paths below instead,
+/// whose schemes are all in [`gemv_supports_scheme`], so the join branch cannot
+/// see this answer.
 ///
 /// The per-row loop's tiled arm reads X as `vec4`, so X's window must be
 /// four-element addressable. [`run_dequant_matmul_gguf_gemv_rows`] checks that
 /// with [`gemv_one_row_device_ok`] for the routes it owns, and the run's join
-/// decision asks [`select_path`] — the same ladder — before calling here
-/// directly. A direct caller has to make sure of it itself.
+/// decision asks [`select_path`] — the same ladder, whose device-only answers
+/// compose that guard — before calling here directly. A direct caller has to make
+/// sure of it itself.
 ///
 /// `marks` is the run's pass-marks handle: every pass this ladder opens carries
 /// it, so the report's device view covers a packed multiply's passes as it covers
@@ -924,15 +963,16 @@ pub fn encode_dequant_matmul_gguf_into(
 /// * Q1_0 + `m > 1` → tiled GEMM (Metal `q1_0_mm_f32` parity) — one dispatch,
 ///   unless `RLX_WGPU_Q1_0_GEMM_DISABLE=1` or X spans shards.
 /// * Otherwise → per-row GEMV, encoded into one command buffer and submitted
-///   here — except the one-row tiled K-quant arm with an addressable X window,
-///   which the run may encode into the caller's enclosing batch instead
-///   ([`DequantMatmulPath::OneRowDevice`]).
+///   here — except the K-quant windowed arm with an addressable X window, which
+///   the run may encode into the caller's enclosing batch instead
+///   ([`DequantMatmulPath::OneRowDevice`] at one row, and
+///   [`DequantMatmulPath::GroupedDevice`] for the row-grouped GEMM above it).
 ///
 /// An X window the tiled arm's `vec4` read cannot address sends the whole call
 /// to [`crate::gguf_host`]. Every caller of the tiled arm has to hold that
 /// condition: this entry point checks it for the routes it owns, and the run's
-/// join decision asks [`select_path`] before calling
-/// [`encode_dequant_matmul_gguf_into`] directly.
+/// join decision asks [`select_path`] — the same guard, composed into the ladder —
+/// before calling [`encode_dequant_matmul_gguf_into`] directly.
 #[allow(clippy::too_many_arguments)]
 pub fn run_dequant_matmul_gguf_gemv_rows(
     arena: &Arena,
