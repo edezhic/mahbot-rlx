@@ -277,11 +277,11 @@ before display, and the adapter they came from is named on the line. Nesting is 
 issue and not by containment: the device runs ahead while the host encodes, so a
 figure can exceed the interval that issued its pass, and nothing here compares the
 two halves. Its `scope=` names both kinds of pass it covers: the run's own
-dispatch loop's, and a **packed-weight multiply's** — the GEMV arm, the one-row
-multiply a batch joins and the per-row fallback's one pass per row alike, the
-row-grouped and Q1_0 arms, and the dequant-scratch route's two — each keeping the
-label its own site gave it. `passes=` counts those records, so it is this
-instrument's ledger and not the run's batched pass count.
+dispatch loop's, and a **packed-weight multiply's** — the GEMV arm, the multiplies
+a batch joins, the per-row fallback's one pass per row, the Q1_0 arm, and the
+dequant-scratch route's two — each keeping the label its own site gave it.
+`passes=` counts those records, so it is this instrument's ledger and not the run's
+batched pass count.
 
 Coverage is not completeness. A pass another site opens still carries no figure: an
 arena copy's — the one site, whether the batch joins it or the call submits on its
@@ -292,7 +292,7 @@ interval's `host_ms` is **not** the run's waiting.
 
 Reading a packed multiply's own figures: one the run joins into its batch opens its
 pass beside the batch's own, so its line is an `encode` one, and one that runs as
-its own submission — the row-grouped, Q1_0 and per-row arms', the scratch route's
+its own submission — Q1_0's arm and the per-row fallback's, and the scratch route's
 two — opens its pass inside the `host` interval its step runs in. The run's own
 dispatch loop only ever opens passes in `encode`, so **a `device_pass` line outside
 `encode` is a packed multiply's own submission**. Inside `encode` the interval's
@@ -362,7 +362,7 @@ feed path or the compiler reads is not named.
 [wgpu-run-report] extra_work switch=RLX_WGPU_DBG_COUNTERS effect=prepass_census_and_per_step_print
 ```
 
-The packed multiply's own figures, on one Q4_K weight multiply with the dense step
+The packed multiply's own figures, on one packed weight multiply with the dense step
 beside it (same rig and switch). **One row** — the arm the run joins into its batch:
 the `encode` interval's `kinds=` name the packed step, and the multiply's pass is
 the second of its three lines (the first is the empty batch pass the loop opens
@@ -379,25 +379,24 @@ line rather than inferred from the interval's host time:
 [wgpu-run-report] device_pass index=2 interval=encode ms=0.088708
 ```
 
-**Four rows** — the row-grouped arm, a submission of its own: its pass is the one
-line outside `encode`, inside the `host` interval that ran the step. `ms=0.074167`
-against that interval's `host_ms=4.103415` accounts for a tenth of a millisecond of
-it, and nothing here says what the rest was — with the passes this view still does
-not cover, the remainder is "not this pass", never "waiting":
+**Four rows, off tile** — the 8-bit scheme's contraction that is not a whole staged
+tile, which the grouped arm's admission turns down: the call recomputes on the
+scratch slab and so submits on its own, its two passes the lines outside `encode`,
+inside the `host` interval that ran the step. A multiply the admission takes opens
+its pass inside the enclosing encoder instead — the one-row case above — so no
+`device_pass` line outside `encode` is its. `ms=0.015125` and `ms=1.757041` here
+against that interval's `host_ms=11.813344` account for the slab's own device work
+and not for the rest — with the passes this view still does not cover, the remainder
+is "not this pass", never "waiting":
 
 ```
-[wgpu-run-report] interval label=host host_ms=4.103415 steps=1 kinds=dequant_matmul_gguf:1
-[wgpu-run-report] interval label=encode host_ms=0.073411 steps=1 kinds=matmul:1
-[wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes+packed_multiplies per=stretch passes=2 measured=2 unusable=0 device_ms=0.201709
-[wgpu-run-report] device_pass index=0 interval=host ms=0.074167
-[wgpu-run-report] device_pass index=1 interval=encode ms=0.127542
+[wgpu-run-report] interval label=host host_ms=11.813344 steps=1 kinds=dequant_matmul_gguf:1
+[wgpu-run-report] interval label=encode host_ms=0.226748 steps=1 kinds=matmul:1
+[wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes+packed_multiplies per=stretch passes=3 measured=3 unusable=0 device_ms=1.813541
+[wgpu-run-report] device_pass index=0 interval=host ms=0.015125
+[wgpu-run-report] device_pass index=1 interval=host ms=1.757041
+[wgpu-run-report] device_pass index=2 interval=encode ms=0.041375
 ```
-
-Before the multiply's passes carried marks, those same two runs read
-`passes=2 measured=1 unusable=1`, with `device_pass index=1 interval=encode` the
-dense step's alone, and `passes=1 measured=1 unusable=0` with **no** `device_pass`
-line in `host` at all: the four-row run's `host_ms=4.103415` interval covering a
-packed multiply was unreadable, which is the reading this covers.
 
 The `[wgpu-run-report]` prefix is unique to this block, so the lines can be
 extracted from the interleaved diagnostics a run already prints; field names are

@@ -172,12 +172,17 @@ Otherwise Q4_1+ fall through with wrong block stride.
 ## WGPU
 
 1. `select_path(m, k, scheme_id, x_byte_off, scratch_off)` is the ladder's one
-   answer for a call — `OneRowDevice` / `FusedArm` / `ScratchArm` / `Host`. It
-   names the *entry point*, not the route the run records: the fused and scratch
-   arms may still hand the call to `gguf_host`, and `ScratchArm` covers a
-   multi-row Q8_0 call its entry point forwards to the row-grouped GEMM.
-2. **Fused windowed kernels** (no f32 scratch, shard-safe) — `FusedArm`, and only
-   `OneRowDevice` may be joined into the caller's enclosing batch:
+   answer for a call — `OneRowDevice` / `GroupedDevice` / `FusedArm` /
+   `ScratchArm` / `Host`. It names the *entry point*, not the route the run
+   records: the fused and scratch arms may still hand the call to `gguf_host`,
+   and `ScratchArm` covers a multi-row Q8_0 call the grouped gates keep out — its
+   own entry point applies the same gates, so that call lands on the slab. The two
+   device-only answers — `OneRowDevice` and `GroupedDevice`, the tiled arm at one
+   row and the row-grouped GEMM at more than one — are also the batch boundary's
+   join set: the run encodes such a call into the caller's enclosing batch instead
+   of letting it submit on its own.
+2. **Fused windowed kernels** (no f32 scratch, shard-safe) — the `FusedArm` entry
+   point, and `OneRowDevice`, its one-row case:
    - `dequant_gemv_gguf.wgsl` at one row: Q4_K / Q6_K take the
      `dequant_gemv_tiled` arm — one workgroup per two output columns, its lanes
      splitting each column's contraction over 32-element units of the packed
@@ -192,32 +197,33 @@ Otherwise Q4_1+ fall through with wrong block stride.
      X read needs a window that lines up with a four-element group — true of every
      planned F32 activation, and a 4-byte-aligned view of one takes the host path
      instead of being read misaligned.
-   - `dequant_gemm_gguf.wgsl` above one row: the row-grouped GEMM, one entry point
-     per scheme — Q4_K (`dequant_gemm_q4k`), Q6_K (`dequant_gemm_q6k`), Q8_0
-     (`dequant_gemm_q8_0`) — reads each packed weight tile's quant bytes once per
-     group of 8 rows instead of once per row. At a base dispatch of 32 workgroups
-     or fewer (`GROUPED_SPLIT_MAX_BASE_WORKGROUPS`, whose doc carries the measured
-     band, the reach and the base geometry's exposure) the Q4_K entry point takes a
-     split geometry instead: a workgroup covers half the columns with two threads
-     to each, splitting the contraction in half down the sub-block boundary — up to
-     twice the warps over the same packed quant bytes, its x grid at
-     `ceil(ncols / COLS)`, with each block's 16-byte header read by both halves and
-     the two halves' partial sums added in workgroup memory (the fold reusing the
-     staged activation tile, so the base geometry's own workgroup storage is
-     unchanged). The Q6_K and Q8_0 entries have no such arm. Q1_0's multi-row call
-     takes its own tiled GEMM (`dequant_gemm_q1_0.wgsl`). The arm is picked by scheme
-     rather than by row count, so when that grouped GEMM cannot encode a call (rows
-     spread over shards, an X window over the binding limit) a scheme with a one-row
-     arm falls back to it, one row at a time, with the per-row weight reuse
-     unchanged, and Q8_0 — which has no one-row arm — falls to the scratch slab
-     below. Q8_0's own arm additionally needs `k % 256 == 0` (a whole number of the
-     staged activation tiles, i.e. eight of its 32-element blocks — its block size
-     is not the gate); no row cap applies at any of these entries.
-3. **Scratch fallback** (`ScratchArm`): the arena planner reserves
+   - Q1_0's multi-row call takes its own tiled GEMM (`dequant_gemm_q1_0.wgsl`).
+3. **Row-grouped GEMM** (`GroupedDevice`) — `dequant_gemm_gguf.wgsl` above one
+   row: the row-grouped GEMM, one entry point per scheme — Q4_K
+   (`dequant_gemm_q4k`), Q6_K (`dequant_gemm_q6k`), Q8_0 (`dequant_gemm_q8_0`) —
+   reads each packed weight tile's quant bytes once per group of 8 rows instead of
+   once per row. At a base dispatch of 32 workgroups or fewer
+   (`GROUPED_SPLIT_MAX_BASE_WORKGROUPS`, whose doc carries the measured band, the
+   reach and the base geometry's exposure) the Q4_K entry point takes a split
+   geometry instead: a workgroup covers half the columns with two threads to each,
+   splitting the contraction in half down the sub-block boundary — up to twice the
+   warps over the same packed quant bytes, its x grid at `ceil(ncols / COLS)`, with
+   each block's 16-byte header read by both halves and the two halves' partial sums
+   added in workgroup memory (the fold reusing the staged activation tile, so the
+   base geometry's own workgroup storage is unchanged). The Q6_K and Q8_0 entries
+   have no such arm. When that grouped GEMM cannot encode a call (rows spread over
+   shards, an X window over the binding limit), the fallback is picked by scheme
+   rather than by row count: a scheme with a one-row arm falls back to the fused
+   entry point above, one row at a time, with the per-row weight reuse unchanged,
+   and Q8_0 — which has no one-row arm — falls to the scratch slab below. Q8_0's own arm
+   additionally needs `k % 256 == 0` (a whole number of the staged activation tiles,
+   i.e. eight of its 32-element blocks — its block size is not the gate); no row cap
+   applies at any of these entries.
+4. **Scratch fallback** (`ScratchArm`): the arena planner reserves
    `dequant_gguf_scratch_bytes(graph)` tail space; dispatch `dequant_gguf` then
    `matmul_bt` (or the grouped MoE GPU path below). This is Q8_0's route at one
    row, and its route at any multi-row shape the grouped GEMM declines.
-4. **`gguf_host`** (`Host`; CPU dequant + wgpu matmul) for a sharded arena, a
+5. **`gguf_host`** (`Host`; CPU dequant + wgpu matmul) for a sharded arena, a
    parked weight, or a slab the plan refused.
 
 **Grouped MoE (`DequantGroupedMatmulGguf`):** when scratch fits, CUDA-style GPU

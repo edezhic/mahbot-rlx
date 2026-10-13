@@ -14,17 +14,16 @@
 //!     --test gguf_gemm_grouped_split_rate -- --ignored --nocapture
 //! ```
 //!
-//! # Steps, calls and the per-call floor
+//! # Steps, calls and the batch join
 //!
 //! **A step** is one `Op::DequantMatMul` over one packed weight region and one
 //! `m x k` activation; **a call** is one run of a graph holding [`STEPS`] of them
-//! — eight identical multiplies, several to a graph so the per-call floor is
-//! amortised over them instead of dominating a figure taken one step per graph.
-//! That floor is real here: this route is **not** in the batch boundary's join
-//! set, so each step's dispatch is its own command buffer and a call costs
-//! `STEPS`-ish submissions plus the two polls of its own readback. Both counts are
-//! printed per cell rather than asserted against a fixed shape, because a future
-//! join would change them for the better.
+//! — eight identical multiplies in one graph. Every cell here is a multi-row call
+//! over whole staged tiles, which the ladder answers as the row-grouped arm, and
+//! that answer is **in** the batch boundary's join set: a call's steps ride the
+//! enclosing batch's submission instead of each opening one of its own, so what a
+//! call costs in submissions and waits is printed per cell rather than asserted
+//! against a fixed shape.
 //!
 //! # Interleaving, and the aggregate footprint
 //!
@@ -142,7 +141,7 @@ struct Cell {
 }
 
 /// Multiplies per call, for every cell: see the module doc's "Steps, calls and the
-/// per-call floor".
+/// batch join".
 const STEPS: usize = 8;
 
 /// The cells. A `static` rather than a `const` so a cell built up front can hold
@@ -277,10 +276,9 @@ static CELLS: [Cell; 15] = [
 
 /// Timed rounds, and calls per round per cell: the per-round figure is that
 /// round's own mean per call, and the spread across rounds is reported as it
-/// stands rather than smoothed away — at the split cells the fixed per-call floor
-/// is a large part of the number, so run-to-run spread is information about the
-/// shape. The rounds are the round-robin the module doc describes: one round is
-/// every cell's own [`CALLS_PER_ROUND`] calls, not one cell's.
+/// stands rather than smoothed away, so run-to-run spread is information about
+/// the shape. The rounds are the round-robin the module doc describes: one round
+/// is every cell's own [`CALLS_PER_ROUND`] calls, not one cell's.
 const ROUNDS: usize = 5;
 const CALLS_PER_ROUND: usize = 3;
 
