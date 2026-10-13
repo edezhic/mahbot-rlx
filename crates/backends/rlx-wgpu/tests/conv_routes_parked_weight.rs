@@ -24,7 +24,10 @@
 //! compiled and run twice in the same process. First with the routes on and the
 //! weight in the activation arena — the positive control — where the shape must
 //! really reach the accelerated route it is meant to prove: `im2col_gpu` for
-//! `[1,64,1,2048] k=[1,7]`, `conv2d_tiled` for the mirrored `[1,64,1,300] k=[1,7]`,
+//! `[1,64,1,2048] k=[1,7]`, `conv2d_tiled` for the mirrored
+//! `[1,64,1,300] k=[1,7] 64→32` (the shape reaches the relabel through the im2col
+//! route's 64-channel floor, a gate the relabel does not test, now that the spatial
+//! floor at 100 no longer keeps it off the materialised route),
 //! `conv1x1_gemm` for the pointwise `[1,128,1,8192] k=[1,1]`. Then with
 //! `RLX_WGPU_ALL_PARAMS_WEIGHT=1` — the weight parked in the separate weight buffer —
 //! where every accelerated route must stay away and
@@ -81,16 +84,17 @@ const ACCELERATED_ROUTES: [&str; 3] = ["im2col_gpu", "conv2d_tiled", "conv1x1_ge
 /// deliberately clears *no* accelerated floor.
 ///
 /// Each of the first three shapes reaches the route it names — otherwise the
-/// positive control below would not be a control: `[1,64,1,2048] k=[1,7]` clears the
-/// im2col floors one by one (spatial 2048 ≥ 800, `k_total` 448 ≥ 256),
-/// `[1,64,1,300] k=[1,7]` is 300 ≥ the 256 tiled floor and under the 800 im2col
-/// floor, and the pointwise `[1,128,1,8192] k=[1,1]` is `128 × 8192` — 2× the 1×1
+/// positive control below would not be a control: `[1,64,1,2048] k=[1,7]` sits well
+/// inside the im2col floors (spatial 2048 ≥ 100, `k_total` 448 ≥ 256),
+/// `[1,64,1,300] k=[1,7] 64→32` fails the im2col route's 64-channel floor — the gate
+/// the relabel does not test — and so still reaches the relabel (300 ≥ the 256 tiled
+/// floor), and the pointwise `[1,128,1,8192] k=[1,1]` is `128 × 8192` — 2× the 1×1
 /// route's own `256 × 2048` bar — with `c_out = 64` on the channel floor. The
 /// fourth, `[1,128,1,3000] k=[1,1]`, is `128 × 3000 = 384 000`: under the 1×1
 /// route's frozen bar (`256 × 2048` = 524 288) but over the product that bar would
-/// be if the 1×1 admission were still coupled to the floors (`256 × 800` = 204 800),
-/// so it keeps the direct kernel — and re-coupling the two decisions fails this case
-/// on its route assertion.
+/// be if the 1×1 admission were still coupled to the floors
+/// (`256 × 100` = 25 600), so it keeps the direct kernel — and re-coupling the two
+/// decisions fails this case on its route assertion.
 const CASES: [Case; 4] = [
     Case {
         label: "im2col-qualifying [1,64,1,2048] k=[1,7] p=[0,3] 64→64",
@@ -103,9 +107,9 @@ const CASES: [Case; 4] = [
         parked_fallbacks: 1,
     },
     Case {
-        label: "mirrored-route [1,64,1,300] k=[1,7] p=[0,3] 64→64",
+        label: "mirrored-route [1,64,1,300] k=[1,7] p=[0,3] 64→32",
         c_in: 64,
-        c_out: 64,
+        c_out: 32,
         l: 300,
         k: 7,
         p: 3,
@@ -124,7 +128,7 @@ const CASES: [Case; 4] = [
     },
     // The two decisions pinned apart. The 1×1 route's admission bar is the frozen
     // `256 × 2048` (`backend::POINTWISE_MIN_COL_ELEMS`), not a product of the im2col
-    // floors, so a shape inside the band the moved spatial floor admits (≥ 800) but
+    // floors, so a shape over the coupled product (`256 × 100` = 25 600) but
     // under that bar keeps the direct kernel on both arms — the route assertion is
     // what fails if the two decisions are ever coupled again.
     Case {

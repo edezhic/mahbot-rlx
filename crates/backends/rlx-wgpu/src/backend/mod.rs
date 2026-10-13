@@ -3655,7 +3655,7 @@ fn build_matmul_bind_group(
 /// plain `cargo test` gate rather than only under `--features backend-tests`.
 /// The rows are sized from the *effective* floors (`im2col_min_*()`, the env the
 /// lowering reads), so they hold at the shipped values and across the lever's measured
-/// range (`RLX_WGPU_IM2COL_MIN_SPATIAL` 512..48000); a floor far outside that range is
+/// range (`RLX_WGPU_IM2COL_MIN_SPATIAL` 100..48000); a floor far outside that range is
 /// outside this claim. A row that deliberately pins a shipped constant says so in place.
 #[cfg(test)]
 mod conv_route_decision_tests {
@@ -3667,7 +3667,7 @@ mod conv_route_decision_tests {
     #[test]
     fn the_pointwise_bar_is_frozen_against_the_im2col_floors() {
         // 128 × 3000 = 384 000 — under this bar, but over what the two floors admit
-        // once the spatial floor is 800 (256 × 800 = 204 800), so an admission test
+        // once the spatial floor is 100 (256 × 100 = 25 600), so an admission test
         // re-coupled to them would take this shape.
         assert!(!pointwise_admitted(128, 3000));
         assert!(pointwise_admitted(256, 2048), "the bar itself");
@@ -3706,7 +3706,7 @@ mod conv_route_decision_tests {
             "an unlimited window reserves it whatever the plan costs"
         );
         // The hard cap drops a col past it even where the window would take it. The map is
-        // `(2 × the spatial floor).max(64)` wide — 1600 at the shipped 800 — with enough
+        // `(2 × the spatial floor).max(64)` wide — 200 at the shipped 100 — with enough
         // channels to clear the K floor and to push the panel past the cap at that extent.
         let w = (im2col_min_spatial() * 2).max(64) as usize;
         let c_in = (im2col_min_k().div_ceil(25) as usize)

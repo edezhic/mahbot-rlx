@@ -173,12 +173,12 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 groups: 1,
             },
         ),
-        // Just inside the band the wgpu im2col spatial floor's new default (800,
-        // from 2048) newly admits: 40×40 = 1600 output elements, so on that backend
-        // this row takes the materialised im2col route. It is the 2-D half of that
-        // band's regression surface — the unit-height body rows below reach the
-        // floor only through the length axis, and this is the only 2-D map in the
-        // band (`dense-1x7-l800` sits on the floor itself, at its inclusive lower bound).
+        // The 2-D map the previous wgpu im2col spatial floor move (2048 → 800)
+        // admitted: 40×40 = 1600 output elements lies inside `[800, 2048)`, so on that
+        // backend this row takes the materialised im2col route and stays there under the
+        // default of 100 — it is not a row of the band `[100, 800)` that default opens.
+        // It is the 2-D half of the band's regression surface: the unit-height body rows
+        // below reach the floor only through the length axis.
         (
             "band-3x3-40x40",
             Cfg {
@@ -189,6 +189,27 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 w: 40,
                 k: [3, 3],
                 s: [1, 1],
+                p: [1, 1],
+                d: [1, 1],
+                groups: 1,
+            },
+        ),
+        // The encoder's third input conv: real 2-D taps on a padded map with a stride of
+        // 2, output 16×13 = 208 — strictly inside the band the wgpu im2col floor's default
+        // of 100 opens, and the only case here that reaches an accelerated route with a
+        // stride other than one on a padded map (every other accelerated case is stride-1
+        // or a unit-height lift, and the mirrored relabel can never serve two real taps).
+        // On wgpu this row exercises the materialised route's strided gather.
+        (
+            "band-3x3-s2-31x25",
+            Cfg {
+                n: 1,
+                c_in: 64,
+                c_out: 64,
+                h: 31,
+                w: 25,
+                k: [3, 3],
+                s: [2, 2],
                 p: [1, 1],
                 d: [1, 1],
                 groups: 1,
@@ -310,9 +331,9 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 groups: 1,
             },
         ),
-        // 1×7 dense sitting exactly on the 800 im2col spatial floor (out 800 is
-        // that floor's own boundary, inclusive) ⇒ im2col — the shape the decoder
-        // body's `blk.*.res.*.conv1` presents.
+        // 1×7 dense, the shape the decoder body's `blk.*.res.*.conv1` presents: out 800
+        // was the im2col spatial floor's own boundary under the default of 800, and every
+        // dense row here now clears the floor of 100 ⇒ im2col.
         (
             "dense-1x7-l800",
             Cfg {
@@ -345,7 +366,7 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 groups: 1,
             },
         ),
-        // ... and with a stride: out 2000 clears the 800 im2col spatial floor, but
+        // ... and with a stride: out 2000 clears the im2col spatial floor, but
         // `c_out = 32` does not clear its 64-channel floor ⇒ mirrored relabel with
         // a stride.
         (
@@ -363,16 +384,20 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 groups: 1,
             },
         ),
-        // ... and with dilation: out 794 sits above the 256 tiled floor and under
-        // the 800 im2col spatial floor, so this is the *mirrored* relabel with a
-        // non-unit `dh` — the one relabel field the strided case above cannot
-        // cover — compared against CPU like every other case here.
+        // ... and with dilation: out 794 now clears the im2col spatial floor (100), so
+        // the materialised route would take it — `c_out = 32` deliberately stays under
+        // that route's 64-channel floor, which the relabel does not test, and keeps this
+        // case on the *mirrored* relabel with a non-unit `dh`: the one relabel field the
+        // strided case above cannot cover, and the only value coverage of it in the tree.
+        // Its route is pinned by the wgpu crate's `conv_route_cost` harness, at the row of
+        // this name (`mirror-dilated-narrow-c32` in `expected_routes`); the harness's
+        // 384-channel `mirror-dilated-d2` is the row its raised-floor arm reads.
         (
-            "mirror-dilated-d2",
+            "mirror-dilated-narrow-c32",
             Cfg {
                 n: 1,
                 c_in: 384,
-                c_out: 384,
+                c_out: 32,
                 h: 1,
                 w: 800,
                 k: [1, 7],
@@ -382,8 +407,9 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 groups: 1,
             },
         ),
-        // The body's entry shape: below every route's floor ⇒ the plain direct
-        // kernel; this is the shape the switch must leave alone.
+        // The body's entry shape: its output length 100 is the wgpu im2col spatial
+        // floor's own extent at its inclusive lower bound, so this is the decoder entry
+        // shape the floor's new default of 100 serves with the materialised route.
         (
             "entry-1x7-l100",
             Cfg {
@@ -437,10 +463,12 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
         // fails its reshape — its guard, like the wgpu mirror's, has to exclude a
         // padded height axis, but that is a sibling backend's defect to fix, not
         // this change's. The refusal is pinned instead in the wgpu-only route
-        // table (`conv_route_cost::expected_routes`, row `refuse-height-pad`),
-        // where the shape is discriminable: its output spatial sits above the 256
-        // tiled floor and under the 800 im2col floor, so a lost refusal relabels it
-        // into the tiled route and fails that assertion.
+        // table (`conv_route_cost::expected_routes`), by the row
+        // `refuse-height-pad-narrow-c32`: the same geometry with 32 output channels,
+        // which misses the im2col route's 64-channel floor, so it stays on the direct
+        // kernel, where a lost refusal relabels it into the tiled route and fails that
+        // assertion. Its 64-channel twin (`refuse-height-pad`) clears the im2col floors
+        // and takes the materialised route.
         // 1×1 pointwise: routed to the `Step::Matmul` GEMM when the activation
         // clears that route's own frozen bar (`c_in * h_out * w_out` at least
         // `256 × 2048`) — all four are. The bar is a number of its own, not the

@@ -730,7 +730,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_HOST_NORM` | Internal | Bool | Backend(wgpu) | Force norms onto the host |
 | `RLX_WGPU_IM2COL_MIN_COUT` | Bisect | U64 | Backend(wgpu) | Minimum output channels before im2col is used (default 64) |
 | `RLX_WGPU_IM2COL_MIN_K` | Bisect | U64 | Backend(wgpu) | Minimum K before im2col is used (default 256) |
-| `RLX_WGPU_IM2COL_MIN_SPATIAL` | Bisect | U64 | Backend(wgpu) | Minimum spatial extent before im2col is used (default 800; the 1×1 pointwise route has its own bar) |
+| `RLX_WGPU_IM2COL_MIN_SPATIAL` | Bisect | U64 | Backend(wgpu) | Minimum spatial extent before im2col is used (default 100; the 1×1 pointwise route has its own bar) |
 | `RLX_WGPU_INDEXING_HOST` | Bisect | Bool | Backend(wgpu) | Force ND indexing (GatherND/GatherElements/Scatter*) to the CPU host route |
 | `RLX_WGPU_LARGE_BUFFERS` | Bisect | Bool | Backend(wgpu) | Allow buffers past the conservative wgpu size limit |
 | `RLX_WGPU_MATMUL_F32_ONLY` | Bisect | Bool | Backend(wgpu) | Restrict wgpu matmul to f32, disabling f16 paths |
