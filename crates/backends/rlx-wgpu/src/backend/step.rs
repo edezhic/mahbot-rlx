@@ -6,23 +6,23 @@ use rlx_ir::Op;
 
 use crate::kernels::{
     ActivationBackwardParams, AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams,
-    AttentionBwdParams, AttentionParams, AxialRope2dParams, BatchElementwiseRegionParams,
-    BatchNormInferenceParams, BinaryC64Params, BinaryParams, CastParams, ComplexCastParams,
-    ComplexWirtingerParams, Conv1dParams, Conv2dParams, Conv3dBwdInputParams,
-    Conv3dBwdWeightParams, Conv3dParams, CopyParams, CumScanParams, CumsumBwdParams, CumsumParams,
-    DequantMatmulMlxParams, DequantMatmulParams, ElementwiseRegionParams, ExpandParams,
-    FakeQuantizeParams, FftButterflyStageParams, FmaParams, FusedConvBiasActParams,
-    FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams,
-    GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
-    GatherBwdParams, GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams,
-    GruParams, Im2Col2dParams, IndexingNdParams, LayerNorm2dParams, LayerNormBwdParams,
-    LayerNormParams, LstmParams, Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams,
-    MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams,
-    QConv2dParams, QMatMulParams, QuantI8Params, ReduceParams, ReverseParams, RmsNormBwdParams,
-    RnnParams, RopeBwdParams, RopeParams, SampleParams, ScaledGroupedMatmulParams,
-    ScaledLowpParams, ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams,
-    SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams,
-    WhereParams,
+    AttentionBwdParams, AttentionMaskParams, AttentionParams, AxialRope2dParams,
+    BatchElementwiseRegionParams, BatchNormInferenceParams, BinaryC64Params, BinaryParams,
+    CastParams, ComplexCastParams, ComplexWirtingerParams, Conv1dParams, Conv2dParams,
+    Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams, CopyParams, CumScanParams,
+    CumsumBwdParams, CumsumParams, DequantMatmulMlxParams, DequantMatmulParams,
+    ElementwiseRegionParams, ExpandParams, FakeQuantizeParams, FftButterflyStageParams, FmaParams,
+    FusedConvBiasActParams, FusedResidualLnParams, FusedResidualLnTeeParams,
+    FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
+    GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
+    GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams, GruParams,
+    Im2Col2dParams, IndexingNdParams, LayerNorm2dParams, LayerNormBwdParams, LayerNormParams,
+    LstmParams, Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams,
+    NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams,
+    QuantI8Params, ReduceParams, ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
+    RopeParams, SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams,
+    SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams,
+    UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
 };
 
 use super::helpers::{MatmulCompute, MatmulQkvKind};
@@ -162,6 +162,16 @@ pub(crate) enum Step {
     },
     Softmax {
         params: SoftmaxParams,
+    },
+    /// The many-row attention route's masked scale: the scale and the five mask
+    /// kinds `attention.wgsl`'s fused entry point applies, in place over a
+    /// `[rows, cols]` score matrix the dense multiply just wrote (see
+    /// `attention_route`). Rows are `(batch, head, query row)` major, so a row's
+    /// mask address is derived from its index exactly as the fused kernel
+    /// derives it. The softmax that follows is the ordinary dense one
+    /// (`Step::Softmax`), over the same matrix.
+    AttentionMask {
+        params: AttentionMaskParams,
     },
     SoftmaxCrossEntropy {
         params: SceParams,
@@ -1469,6 +1479,15 @@ impl Step {
             | Step::QMatMul { .. }
             | Step::QConv2d { .. }
             | Step::BatchNormInference { .. } => false,
+            // The many-row attention route's masked scale: its rows are
+            // `(batch, head, query row)` major and the regions the route bumps
+            // through are sized in that order, so no single folded extent can be
+            // rescaled to leave exactly the rows the caller asked for untouched —
+            // the score multiply's own `m` is the local query row, which is not
+            // the bucket axis either. Vetoing the mode for the whole graph is the
+            // conservative half of that (the mode is all-or-nothing), and the
+            // fused path this route replaces keeps whatever extent it had.
+            Step::AttentionMask { .. } => false,
             #[cfg(feature = "splat")]
             Step::GaussianSplatRender { .. }
             | Step::GaussianSplatRenderBackward { .. }
@@ -1494,6 +1513,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ActivationBackward { .. } => "activation_backward",
         Step::Reduce { .. } => "reduce",
         Step::Softmax { .. } => "softmax",
+        Step::AttentionMask { .. } => "attention_mask",
         Step::SoftmaxCrossEntropy { .. } => "softmax_cross_entropy",
         Step::SoftmaxCrossEntropyWithLogits { .. } => "softmax_cross_entropy_with_logits",
         Step::SoftmaxCrossEntropyBackward { .. } => "softmax_cross_entropy_backward",
@@ -1741,11 +1761,16 @@ pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
         // work in the run's batch (in a pass of its own), so this arm now decides
         // for it: it keeps elementwise work in a pass of its own after the copy,
         // where the copy's own command buffer used to put it there.
+        //
+        // `AttentionMask` is the many-row attention route's masked scale — a
+        // pass over the score matrix a `Step::Matmul` has just written, in place
+        // — so it is the same read-after-matmul shape as the kernels above.
         Step::Binary { .. }
         | Step::Unary { .. }
         | Step::Where { .. }
         | Step::Fma { .. }
         | Step::Compare { .. }
+        | Step::AttentionMask { .. }
             if crate::device::coop_discrete_backend() =>
         {
             matches!(

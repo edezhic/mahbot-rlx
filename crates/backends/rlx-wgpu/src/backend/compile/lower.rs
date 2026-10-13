@@ -20,16 +20,17 @@ use crate::buffer::{
 use crate::device::wgpu_device;
 use crate::kernels::{
     ActivationBackwardParams, AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams,
-    AttentionBwdParams, AttentionParams, AxialRope2dParams, BatchElementwiseRegionParams,
-    BatchNormInferenceParams, BinaryC64Params, BinaryParams, CastParams, ComplexCastParams,
-    ComplexWirtingerParams, Conv1dParams, Conv2dParams, Conv3dBwdInputParams,
-    Conv3dBwdWeightParams, Conv3dParams, CopyParams, CumScanParams, CumsumBwdParams, CumsumParams,
-    DequantMatmulMlxParams, DequantMatmulParams, ElementwiseRegionParams, ExpandParams,
-    FakeQuantizeParams, FftButterflyStageParams, FmaParams, FusedConvBiasActParams,
-    FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams,
-    GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
-    GatherBwdParams, GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams,
-    GruParams, Im2Col2dParams, IndexingNdParams, Kernel, LayerNorm2dParams, LayerNormBwdParams,
+    AttentionBwdParams, AttentionMaskParams, AttentionParams, AxialRope2dParams,
+    BatchElementwiseRegionParams, BatchNormInferenceParams, BinaryC64Params, BinaryParams,
+    CastParams, ComplexCastParams, ComplexWirtingerParams, Conv1dParams, Conv2dParams,
+    Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams, CopyParams, CumScanParams,
+    CumsumBwdParams, CumsumParams, DequantMatmulMlxParams, DequantMatmulParams,
+    ElementwiseRegionParams, ExpandParams, FakeQuantizeParams, FftButterflyStageParams, FmaParams,
+    FusedConvBiasActParams, FusedResidualLnParams, FusedResidualLnTeeParams,
+    FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
+    GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
+    GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams, GruParams,
+    Im2Col2dParams, IndexingNdParams, Kernel, LayerNorm2dParams, LayerNormBwdParams,
     LayerNormParams, LstmParams, Mamba2Params, MatmulParams, MatmulQkvParams, MaxPool2dBwdParams,
     MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams,
     QConv2dParams, QMatMulParams, QUANT_I8_MAX_CHAN, QuantI8Params, ReduceParams, ReverseParams,
@@ -38,18 +39,18 @@ use crate::kernels::{
     SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
     WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
     ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_kernel,
-    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
-    batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
-    batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
-    cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
-    complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel, conv_transpose3d_kernel,
-    conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
-    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, copy_sanitize_kernel,
-    cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    dequant_matmul_mlx_kernel, dequantize_i8_kernel, elementwise_region_kernel,
-    elementwise_region_spatial_kernel, expand_kernel, fake_quantize_fixed_kernel,
-    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel,
-    fused_conv_bias_act_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
+    attention_mask_kernel, axial_rope2d_kernel, batch_elementwise_region_kernel,
+    batch_norm_inference_bwd_beta_kernel, batch_norm_inference_bwd_gamma_kernel,
+    batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_c64_kernel,
+    binary_kernel, cast_f32_to_f16_kernel, cast_kernel, compare_kernel, complex_cast_kernel,
+    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel,
+    conv_transpose3d_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
+    conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel,
+    copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
+    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
+    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
+    fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
+    fma_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
     fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
     gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
     gather_backward_acc_kernel, gather_backward_zero_kernel, gather_elements_kernel, gather_kernel,
@@ -1261,7 +1262,8 @@ pub(crate) fn compile_static_inner(
     // EEG-DINO / packed QKV: FMB → [B,S,3,H,D] → Narrow×3 (axis 2) → Attention.
     // Match CPU `compile_thunks` fused_strided_attn: read Q/K/V from the
     // packed parent with seq stride 3·H·D instead of materializing narrows.
-    let mut packed_bshd_attn: HashMap<NodeId, (NodeId, u32)> = HashMap::new();
+    // (`attention_route::plan_attention` derives the same parent per node; the
+    // set below is what the Narrow arm needs to elide the three narrows.)
     let mut packed_bshd_skip_narrows: HashSet<NodeId> = HashSet::new();
     if !rlx_ir::env::flag("RLX_WGPU_NO_PACKED_BSHD_ATTN") {
         for node in graph.nodes() {
@@ -1271,13 +1273,12 @@ pub(crate) fn compile_static_inner(
             if node.inputs.len() < 3 {
                 continue;
             }
-            if let Some((parent, head_width, narrows)) = rlx_ir::detect_packed_bshd_qkv_attention(
+            if let Some((_parent, _head_width, narrows)) = rlx_ir::detect_packed_bshd_qkv_attention(
                 &graph,
                 node.inputs[0],
                 node.inputs[1],
                 node.inputs[2],
             ) {
-                packed_bshd_attn.insert(node.id, (parent, head_width as u32));
                 for narrow in narrows {
                     if rlx_ir::packed_bshd_narrow_elidable(&graph, narrow, node.id) {
                         packed_bshd_skip_narrows.insert(narrow);
@@ -1430,6 +1431,85 @@ pub(crate) fn compile_static_inner(
         })
     };
 
+    // One permutation step, shared by the `Op::Transpose` arm and the many-row
+    // attention route's operand compactions: `out_dims` are the output extents
+    // and `in_strides` the source's stride for each output axis, so the
+    // kernel's dense write lands where the caller asked. The axis metadata goes
+    // in a storage buffer of its own (uniform arrays of u32 would pad every
+    // element to 16 bytes). `arena` is a parameter rather than a capture so the
+    // loop can still take it mutably (`register_bf16_packed`).
+    let emit_transpose = |schedule: &mut Vec<Step>,
+                          uniforms: &mut Vec<wgpu::Buffer>,
+                          bind_groups: &mut Vec<wgpu::BindGroup>,
+                          meta_buffers: &mut Vec<wgpu::Buffer>,
+                          arena: &Arena,
+                          label: &str,
+                          base: u64,
+                          size: u64,
+                          out_dims: &[u32],
+                          in_strides: &[u32],
+                          bucket_outermost: u32,
+                          in_off: u32,
+                          out_off: u32| {
+        let rank = out_dims.len();
+        let mut meta_data: Vec<u32> = Vec::with_capacity(rank * 2);
+        meta_data.extend_from_slice(out_dims);
+        meta_data.extend_from_slice(in_strides);
+        let meta_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (meta_data.len() * 4).max(4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        dev.queue
+            .write_buffer(&meta_buf, 0, bytemuck::cast_slice(&meta_data));
+        let meta_idx = meta_buffers.len();
+        meta_buffers.push(meta_buf);
+        let p = TransposeParams {
+            rank: rank as u32,
+            out_total: out_dims.iter().product(),
+            in_off,
+            out_off,
+            bucket_outermost,
+            out_dim_0: out_dims[0],
+            _p2: 0,
+            _p3: 0,
+        };
+        schedule.push(Step::Transpose {
+            params: p,
+            meta_idx,
+        });
+        let tk = transpose_kernel(&dev.device);
+        let u = emit_uniform(std::mem::size_of::<TransposeParams>());
+        let bg = dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rlx-wgpu transpose bg"),
+            layout: &tk.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: arena_bind_buf(arena, base).0,
+                        offset: arena_bind_buf(arena, base).1,
+                        size: {
+                            let (b, l) = arena_bind_buf(arena, base);
+                            aligned_bind_size(size, l, b.size())
+                        },
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: u.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: meta_buffers[meta_idx].as_entire_binding(),
+                },
+            ],
+        });
+        uniforms.push(u);
+        bind_groups.push(bg);
+    };
+
     // Which node each emitted step belongs to. Recorded at the *top* of the next
     // iteration so the many `continue`s in the match below cannot skip it.
     let mut step_nodes: Vec<NodeId> = Vec::new();
@@ -1443,6 +1523,10 @@ pub(crate) fn compile_static_inner(
     // settle — counted at that decision and reported (see the conv arm and the
     // schedule report).
     let mut im2col_fallbacks: usize = 0;
+    // Many-row attention steps kept on the fused kernel for want of a window over
+    // the route's regions — the one term of that route decision the graph's shapes
+    // do not settle (see the attention arm and `attention_route`).
+    let mut attention_window_declines: usize = 0;
     let mut prev_node: Option<NodeId> = None;
     for node in graph.nodes() {
         if let Some(prev) = prev_node {
@@ -3679,21 +3763,6 @@ pub(crate) fn compile_static_inner(
                     continue;
                 }
 
-                // Build meta buffer: dims (rank u32s) + strides (rank u32s).
-                let mut meta_data: Vec<u32> = Vec::with_capacity(rank * 2);
-                meta_data.extend_from_slice(&out_dims);
-                meta_data.extend_from_slice(&strides_for_out);
-                let meta_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("rlx-wgpu transpose meta"),
-                    size: (meta_data.len() * 4).max(4) as u64,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                dev.queue
-                    .write_buffer(&meta_buf, 0, bytemuck::cast_slice(&meta_data));
-                let meta_idx = meta_buffers.len();
-                meta_buffers.push(meta_buf);
-
                 // PLAN L1: precompute "bucket axis stays at out
                 // axis 0" flag from perm. When `perm[0] == 0`,
                 // active-extent scaling of `out_total` is safe.
@@ -3746,16 +3815,6 @@ pub(crate) fn compile_static_inner(
                     &mut base,
                     &mut size,
                 );
-                let p = TransposeParams {
-                    rank: rank as u32,
-                    out_total: elems * lanes,
-                    in_off,
-                    out_off,
-                    bucket_outermost,
-                    out_dim_0: out_dims[0],
-                    _p2: 0,
-                    _p3: 0,
-                };
                 if rlx_ir::env::flag("RLX_WGPU_DBG_TRANSPOSE") {
                     eprintln!(
                         "[wgpu-transpose] node {} perm {:?} in_dims {:?} out_dims {:?} \
@@ -3780,39 +3839,21 @@ pub(crate) fn compile_static_inner(
                         (out_off as u64) * 4 + bo,
                     );
                 }
-                schedule.push(Step::Transpose {
-                    params: p,
-                    meta_idx,
-                });
-                let tk = transpose_kernel(&dev.device);
-                let u = emit_uniform(std::mem::size_of::<TransposeParams>());
-                let bg = dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("rlx-wgpu transpose bg"),
-                    layout: &tk.bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: arena_bind_buf(&arena, base).0,
-                                offset: arena_bind_buf(&arena, base).1,
-                                size: {
-                                    let (b, l) = arena_bind_buf(&arena, base);
-                                    aligned_bind_size(size, l, b.size())
-                                },
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: u.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: meta_buffers[meta_idx].as_entire_binding(),
-                        },
-                    ],
-                });
-                uniforms.push(u);
-                bind_groups.push(bg);
+                emit_transpose(
+                    &mut schedule,
+                    &mut uniforms,
+                    &mut bind_groups,
+                    &mut meta_buffers,
+                    &arena,
+                    "rlx-wgpu transpose meta",
+                    base,
+                    size,
+                    &out_dims,
+                    &strides_for_out,
+                    bucket_outermost,
+                    in_off,
+                    out_off,
+                );
             }
 
             Op::Narrow { axis, start, len } => {
@@ -4138,187 +4179,74 @@ pub(crate) fn compile_static_inner(
                 }
             }
 
-            Op::Attention {
-                num_heads,
-                head_dim,
-                v_head_dim,
-                mask_kind,
-                score_scale,
-                attn_logit_softcap: _,
-            } => {
-                // Asymmetric SDPA (DeepSeek/Kimi MLA): V rows + output are
-                // `v_head_dim` wide while Q·K scores still contract over
-                // `head_dim`. `None` ⇒ symmetric (V width == head_dim).
-                let hd_v = v_head_dim.unwrap_or(*head_dim) as u32;
-                // v5: rank-4 [B, H, S, D] inputs only. SlidingWindow
-                // synthesizes a Custom mask host-side.
+            Op::Attention { score_scale, .. } => {
                 let q_id = node.inputs[0];
                 let k_id = node.inputs[1];
                 let v_id = node.inputs[2];
-                let q_shape = graph.node(q_id).shape.dims();
-                let k_shape = graph.node(k_id).shape.dims();
-                // Accept either rank-4 [B, H, S, D] or rank-3 [B*H, S, D]
-                // (the latter is what BERT-flavored builders emit). For
-                // rank-3 we treat the leading dim as `batch * heads`,
-                // setting heads = num_heads from the Op so the kernel's
-                // (b, h) indexing folds back to the right offset.
-                let h = *num_heads as u32;
-                let hd = *head_dim as u32;
-                let q_ir = graph.node(q_id).shape.clone();
-                let k_ir = graph.node(k_id).shape.clone();
-                let geom = rlx_ir::attention_geom(&q_ir, &k_ir, *num_heads, *head_dim);
-                let bhsd = geom.bhsd;
-                let (batch, heads, seq_q, seq_k) = match q_shape.len() {
-                    4 => (
-                        geom.batch as u32,
-                        geom.heads as u32,
-                        geom.seq_q as u32,
-                        geom.seq_k as u32,
-                    ),
-                    3 => {
-                        // Two rank-3 layouts coexist:
-                        //   [B, S, H·D] — transpose-elided layout
-                        //   [B·H, S, D] — canonical compacted layout
-                        // Distinguish by last-dim: if it equals H·D
-                        // (the per-token feature width) it's [B, S, H·D];
-                        // otherwise it's [B·H, S, D].
-                        let last = q_shape[2].unwrap_static() as u32;
-                        if last == h * hd {
-                            // [B, S, H·D]: leading = B, seq = S
-                            (
-                                q_shape[0].unwrap_static() as u32,
-                                h,
-                                q_shape[1].unwrap_static() as u32,
-                                k_shape[1].unwrap_static() as u32,
-                            )
-                        } else {
-                            // [B·H, S, D]: leading must be divisible by H
-                            let leading = q_shape[0].unwrap_static() as u32;
-                            if !leading.is_multiple_of(h) {
-                                panic!(
-                                    "rlx-wgpu Attention: rank-3 leading dim {leading} \
-                                        not divisible by num_heads {h} (and last dim \
-                                        {last} ≠ H·D = {})",
-                                    h * hd
-                                );
-                            }
-                            (
-                                leading / h,
-                                h,
-                                q_shape[1].unwrap_static() as u32,
-                                k_shape[1].unwrap_static() as u32,
-                            )
-                        }
-                    }
-                    other => panic!(
-                        "rlx-wgpu Attention: only rank-3 / rank-4 Q,K,V \
-                                     inputs supported (got rank {other})"
-                    ),
+                // One derivation of this step's geometry, shared with the
+                // scratch reserve (`backend::compute_scratch_bytes`). A shape it
+                // cannot size is one the fused path below cannot index either,
+                // and the refusal names the dim that was wrong.
+                let plan = match attention_route::plan_attention(&graph, node) {
+                    Ok(plan) => plan,
+                    Err(refusal) => panic!("{refusal}"),
                 };
+                let attention_route::AttentionPlan {
+                    batch,
+                    heads,
+                    seq_q,
+                    seq_k,
+                    head_dim: hd,
+                    v_head_dim: hd_v,
+                    nkv,
+                    packed_parent,
+                    q_b,
+                    q_h,
+                    q_s,
+                    k_b,
+                    k_h,
+                    k_s,
+                    v_b,
+                    v_h,
+                    v_s,
+                    o_b,
+                    o_h,
+                    o_s,
+                    mask_kind_id,
+                    window,
+                    m_b,
+                    m_h,
+                    m_q,
+                    m_k,
+                    q_dense,
+                    v_dense,
+                    out_dense,
+                    decompose,
+                    ..
+                } = plan;
                 let scale = score_scale.unwrap_or(1.0_f32 / (hd as f32).sqrt());
 
-                let (mask_kind_id, mask_buf, window) = match mask_kind {
-                    MaskKind::None => (0u32, None, 0u32),
-                    MaskKind::Causal => (1u32, None, 0u32),
-                    // 2 = binary key-padding mask (Custom: <0.5 → -inf);
-                    // 4 = additive bias mask (Bias: score += mask). These
-                    // are NOT interchangeable — the encoder's block-diagonal
-                    // winmask is additive, so folding it into the binary
-                    // path silently corrupts attention.
-                    MaskKind::Custom => (2u32, None, 0u32),
-                    MaskKind::Bias => (4u32, None, 0u32),
-                    MaskKind::SlidingWindow(w) => (3u32, None, *w as u32),
-                };
-                if rlx_ir::env::flag("RLX_WGPU_DEBUG_ATTN_MASK") {
-                    eprintln!(
-                        "rlx-wgpu Attention node={:?} mask_kind_id={mask_kind_id} \
-                         q={:?}@{} k={:?}@{} v={:?}@{}",
-                        node.id,
-                        q_id,
-                        arena.offset(q_id),
-                        k_id,
-                        arena.offset(k_id),
-                        v_id,
-                        arena.offset(v_id),
-                    );
-                }
-
-                // Mask address strides. For Custom masks, derive from
-                // the mask's IR shape so the kernel can broadcast a
-                // [B, S] padding mask without materializing the full
-                // [B, H, S_q, S_k] expansion. Other mask kinds use
-                // canonical [B, H, S_q, S_k] strides (the kernel's
-                // mask_partial computation is harmless when not read).
-                struct MStrides {
-                    b: u32,
-                    h: u32,
-                    q: u32,
-                    k: u32,
-                }
-                // `rlx_ir::mask_strides_for_shape` is the shared derivation
-                // CUDA and ROCm already call. This was a byte-for-byte private
-                // copy of it, which is how both ended up missing the same
-                // broadcast-stride case — see the note on that function.
-                let mask_strides = if mask_kind_id == 2u32 || mask_kind_id == 4u32 {
-                    let m_dims = graph.node(node.inputs[3]).shape.dims();
-                    let (b, h, q, k) = rlx_ir::mask_strides_for_shape(m_dims, heads, seq_q, seq_k);
-                    MStrides { b, h, q, k }
+                // ── The bind window both forms below read through ────────────
+                //
+                // One resolution of the operand window and of the five operand
+                // offsets, so the many-row route and the fused path cannot
+                // disagree about where an operand is. Staging an operand that
+                // falls outside the window widens it, so every offset is read
+                // back out of the window the resolve leaves behind — and the
+                // same read-back runs wherever a later step (the fused path's
+                // alias staging) can widen it under offsets already recorded.
+                let mask_id = if mask_kind_id == 2 || mask_kind_id == 4 {
+                    Some(node.inputs[3])
                 } else {
-                    let (b, h, q, k) = rlx_ir::mask_strides_bhsd(heads, seq_q, seq_k);
-                    MStrides { b, h, q, k }
+                    None
                 };
-
-                let stride = |shape: &[rlx_ir::shape::Dim], seq_extent: u32| {
-                    rlx_ir::strides_for_shape(shape, heads, hd, seq_extent, bhsd)
-                };
-                let packed_parent = packed_bshd_attn.get(&node.id).copied();
-                // GQA/MQA: the KV-head count is layout-independent — K's
-                // element count over B·S_k·D. Packed QKV shares Q's head
-                // count (uniform strides), so treat it as MHA.
-                let nkv: u32 = if packed_parent.is_some() {
-                    heads
-                } else {
-                    let k_numel: u32 = k_shape.iter().map(|d| d.unwrap_static() as u32).product();
-                    (k_numel / (batch.max(1) * seq_k.max(1) * hd.max(1))).max(1)
-                };
-                let (q_b, q_h, q_s, k_b, k_h, k_s, v_b, v_h, v_s) =
-                    if let Some((_parent, head_width)) = packed_parent {
-                        let (batch_stride, head_stride, pack_seq) =
-                            rlx_ir::packed_bshd_qkv_strides(head_width as usize, hd, seq_q);
-                        (
-                            batch_stride,
-                            head_stride,
-                            pack_seq,
-                            batch_stride,
-                            head_stride,
-                            pack_seq,
-                            batch_stride,
-                            head_stride,
-                            pack_seq,
-                        )
-                    } else {
-                        let (qb, qh, qs) = stride(q_shape, seq_q);
-                        // K/V carry nkv heads (GQA); strides_for_shape
-                        // detects their BSHD/BHSD layout from nkv·D.
-                        let (kb, kh, ks) = rlx_ir::strides_for_shape(k_shape, nkv, hd, seq_k, bhsd);
-                        let v_shape = graph.node(v_id).shape.dims();
-                        // V rows are `hd_v` wide (MLA-asymmetric); use hd_v so the
-                        // batch/head/seq strides step by the V-width, not head_dim.
-                        let (vb, vh, vs) =
-                            rlx_ir::strides_for_shape(v_shape, nkv, hd_v, seq_k, bhsd);
-                        (qb, qh, qs, kb, kh, ks, vb, vh, vs)
-                    };
-                let out_shape = node.shape.dims();
-                // Output rows are `hd_v` wide (MLA-asymmetric == V-width).
-                let (o_b, o_h, o_s) =
-                    rlx_ir::strides_for_shape(out_shape, heads, hd_v, seq_q, bhsd);
                 let mut attn_ids = if let Some((parent, _)) = packed_parent {
                     vec![node.id, parent]
                 } else {
                     vec![node.id, q_id, k_id, v_id]
                 };
-                if mask_kind_id == 2 || mask_kind_id == 4 {
-                    attn_ids.push(node.inputs[3]);
+                if let Some(mid) = mask_id {
+                    attn_ids.push(mid);
                 }
                 let mut scratch = arena.scratch_off as u64;
                 let (mut base, mut size, param_anchor) = arena_multi_op_window(
@@ -4334,78 +4262,423 @@ pub(crate) fn compile_static_inner(
                     base =
                         arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
                 }
-                let (q_off, k_off, v_off) = if let Some((parent, head_width)) = packed_parent {
-                    let parent_off = arena_off_in_bind_window(
-                        &graph,
-                        &param_offsets,
-                        &dev.device,
-                        &arena,
-                        &mut schedule,
-                        &mut scratch,
-                        parent,
-                        &mut base,
-                        &mut size,
-                    );
-                    (
-                        parent_off,
-                        parent_off.saturating_add(head_width),
-                        parent_off.saturating_add(head_width * 2),
-                    )
-                } else {
-                    let q_off = arena_off_in_bind_window(
-                        &graph,
-                        &param_offsets,
-                        &dev.device,
-                        &arena,
-                        &mut schedule,
-                        &mut scratch,
-                        q_id,
-                        &mut base,
-                        &mut size,
-                    );
-                    let k_off = arena_off_in_bind_window(
-                        &graph,
-                        &param_offsets,
-                        &dev.device,
-                        &arena,
-                        &mut schedule,
-                        &mut scratch,
-                        k_id,
-                        &mut base,
-                        &mut size,
-                    );
-                    let v_off = arena_off_in_bind_window(
-                        &graph,
-                        &param_offsets,
-                        &dev.device,
-                        &arena,
-                        &mut schedule,
-                        &mut scratch,
-                        v_id,
-                        &mut base,
-                        &mut size,
-                    );
-                    (q_off, k_off, v_off)
+                // An operand whose own slot the window reaches is addressed
+                // there; one it does not reach keeps the offset the resolve left
+                // — the copy it staged into the window.
+                let rebase = |base: u64, size: u64, prev: (u32, u32, u32, u32, u32)| {
+                    let read = |id: NodeId, off: u32| {
+                        if arena_tensor_in_window(&arena, id, base, size) {
+                            arena_local_off_f32(&arena, id, base)
+                        } else {
+                            off
+                        }
+                    };
+                    let (q, k, v, out, mask) = prev;
+                    let (q, k, v) = if let Some((parent, head_width)) = packed_parent {
+                        // One parent slot holds all three: Q/K/V are its own
+                        // axis-2 narrows, so they keep the parent's rebase.
+                        let p = if arena_tensor_in_window(&arena, parent, base, size) {
+                            arena_local_off_f32(&arena, parent, base)
+                        } else {
+                            q
+                        };
+                        (
+                            p,
+                            p.saturating_add(head_width),
+                            p.saturating_add(head_width * 2),
+                        )
+                    } else {
+                        (read(q_id, q), read(k_id, k), read(v_id, v))
+                    };
+                    let out = read(node.id, out);
+                    let mask = match mask_id {
+                        Some(mid) => read(mid, mask),
+                        None => mask,
+                    };
+                    (q, k, v, out, mask)
+                };
+                let resolve_operands = |base: &mut u64,
+                                        size: &mut u64,
+                                        scratch: &mut u64,
+                                        schedule: &mut Vec<Step>|
+                 -> (u32, u32, u32, u32, u32) {
+                    let id_off = |id: NodeId,
+                                  schedule: &mut Vec<Step>,
+                                  scratch: &mut u64,
+                                  base: &mut u64,
+                                  size: &mut u64| {
+                        arena_off_in_bind_window(
+                            &graph,
+                            &param_offsets,
+                            &dev.device,
+                            &arena,
+                            schedule,
+                            scratch,
+                            id,
+                            base,
+                            size,
+                        )
+                    };
+                    let (q, k, v) = if let Some((parent, head_width)) = packed_parent {
+                        let p = id_off(parent, schedule, scratch, base, size);
+                        (
+                            p,
+                            p.saturating_add(head_width),
+                            p.saturating_add(head_width * 2),
+                        )
+                    } else {
+                        (
+                            id_off(q_id, schedule, scratch, base, size),
+                            id_off(k_id, schedule, scratch, base, size),
+                            id_off(v_id, schedule, scratch, base, size),
+                        )
+                    };
+                    let out = id_off(node.id, schedule, scratch, base, size);
+                    let mask = match mask_id {
+                        Some(mid) => id_off(mid, schedule, scratch, base, size),
+                        None => 0,
+                    };
+                    rebase(*base, *size, (q, k, v, out, mask))
                 };
                 let out_byte = arena.offset(node.id) as u64;
                 let out_len = arena.len_of(node.id) as u64;
+                let (mut q_off, mut k_off, mut v_off, mut out_off, mut mask_off) =
+                    resolve_operands(&mut base, &mut size, &mut scratch, &mut schedule);
+                // An output slot the fused path below overlaps with any operand:
+                // its threads read all of K and V while writing the output, so it
+                // writes through scratch and copies back (see below).
                 let out_aliases_qkv = arena_tensors_overlap(&arena, node.id, q_id)
                     || arena_tensors_overlap(&arena, node.id, k_id)
                     || arena_tensors_overlap(&arena, node.id, v_id)
                     || packed_parent
                         .is_some_and(|(parent, _)| arena_tensors_overlap(&arena, node.id, parent));
-                let mut kernel_out_off = arena_off_in_bind_window(
-                    &graph,
-                    &param_offsets,
-                    &dev.device,
-                    &arena,
-                    &mut schedule,
-                    &mut scratch,
-                    node.id,
-                    &mut base,
-                    &mut size,
-                );
-                let mut attn_scratch_copy: Option<(u64, u32)> = None;
+                // The route reads its operands in steps of its own, so only V can be
+                // in its way: the second multiply writes the output while it reads
+                // V, so V is compacted through the region the plan books for exactly
+                // this (`v_spare`) instead of being read where it lies. Q and K are
+                // read before anything is written, so an output over those — or over
+                // a packed QKV parent, whose V is compacted anyway — needs no such
+                // step.
+                let v_dense = v_dense && !arena_tensors_overlap(&arena, node.id, v_id);
+
+                // ── Many-row attention: the dense arrangement ────────────────
+                //
+                // Above the measured query-row floor the fused kernel below — one
+                // thread per (batch, head, query row), each walking the whole key
+                // sequence on its own — is an order of magnitude behind what the
+                // same work reaches as a dense multiply of the scores, a masked
+                // scale over them and a dense multiply by V (`attention_route`
+                // carries the measurements). That arrangement is emitted here as
+                // steps rather than as a graph decomposition because on a discrete
+                // adapter the corresponding *ops* would be hosted; as steps, every
+                // part of it stays on the device.
+                //
+                // This branch is additive: below the floor, and for every step it
+                // does not serve, the fused path below runs exactly as it did.
+                //
+                // The route's own regions begin at the scratch cursor the operand
+                // resolve above left, and the plan sizes every one of them as a
+                // 256-byte multiple (the arena's own window granularity) plus one
+                // slack for the cursor's own alignment, so the bump below keeps
+                // each region aligned and stays inside what the plan reserved.
+                // `v_compacted` is this arm's answer — an output slot on V's bytes
+                // cannot be written by the multiply that reads V — and the plan
+                // books that compaction as `v_spare`, so the offsets cover it.
+                let offsets = plan.scratch_offsets(!v_dense);
+                let route_start = scratch.div_ceil(256) * 256;
+                let route_end = route_start + offsets.end;
+                // The window the operands were resolved against has to reach the
+                // regions too, since the route's steps bind their operands and
+                // their scratch as one range. True whenever the arena binds
+                // whole, which is the case the route is measured in, and
+                // otherwise only where that window already reaches the tail. A
+                // striped arena keeps the fused path instead: its per-stripe
+                // stage reserve is a different zone from the tail the plan
+                // reserves, and the fused path stages each operand into whatever
+                // window it has. A shape that does not fit falls back rather than
+                // failing at compile time.
+                let route_fits = !arena.is_sharded()
+                    && route_start >= base
+                    && route_end <= base.saturating_add(size);
+                // Every other term of the decision is the graph's own
+                // (`decompose`, of which the two dispatch extents are part); the
+                // two arena terms below are the arm's, so they are what the count
+                // and the print exist for.
+                if decompose && !route_fits {
+                    attention_window_declines += 1;
+                }
+                if rlx_ir::env::flag("RLX_WGPU_DEBUG_ATTN_MASK") {
+                    let route = if !decompose {
+                        "fused"
+                    } else if arena.is_sharded() {
+                        "fused (the arena is addressed in stripes)"
+                    } else if !route_fits {
+                        "fused (the bind window does not reach the plan's regions)"
+                    } else {
+                        "decomposed"
+                    };
+                    eprintln!(
+                        "rlx-wgpu Attention node={:?} mask_kind_id={mask_kind_id} \
+                         q={:?}@{} k={:?}@{} v={:?}@{} route={route}",
+                        node.id,
+                        q_id,
+                        arena.offset(q_id),
+                        k_id,
+                        arena.offset(k_id),
+                        v_id,
+                        arena.offset(v_id),
+                    );
+                }
+                if decompose && route_fits {
+                    // The regions the route bumps through, in the plan's fixed
+                    // order (Kᵀ, the scores, then the compactions the operand
+                    // layouts force). Each is already a 256-byte multiple, so
+                    // summing them keeps every offset aligned.
+                    let window_f32 = |byte: u64| ((byte.saturating_sub(base)) / 4) as u32;
+                    let kt_off = window_f32(route_start + offsets.kt);
+                    let scores_off = window_f32(route_start + offsets.scores);
+                    let q_tmp_off = window_f32(route_start + offsets.q);
+                    let v_tmp_off = window_f32(route_start + offsets.v);
+                    let out_tmp_off = window_f32(route_start + offsets.out);
+                    // GQA/MQA: the group of KV heads each KV head serves, as the
+                    // fused kernel derives it (`heads / kv_heads`).
+                    let group = (heads / nkv.max(1)).max(1);
+                    // One dense multiply over the two arena operands the step
+                    // reads, `batch = B·H` tiles. Deliberately F32: the score and
+                    // value multiplies are f32 and this route is not the place for
+                    // `derive_matmul_compute`'s device-dependent variants (coop /
+                    // f16 weights), which are keyed on a weight operand this step
+                    // has none of. The run-time arm's `m ≥ 32 && n ≥ 64` branch
+                    // picks the wide f32 kernel for these shapes — the machinery
+                    // the route's measurements were made with.
+                    let emit_matmul = |schedule: &mut Vec<Step>,
+                                       uniforms: &mut Vec<wgpu::Buffer>,
+                                       bind_groups: &mut Vec<wgpu::BindGroup>,
+                                       m: u32,
+                                       k: u32,
+                                       n: u32,
+                                       a_off: u32,
+                                       b_off: u32,
+                                       c_off: u32| {
+                        let batch_bh = batch * heads;
+                        schedule.push(Step::Matmul {
+                            m,
+                            k,
+                            n,
+                            batch: batch_bh,
+                            a_batch_stride: m * k,
+                            b_batch_stride: k * n,
+                            c_batch_stride: m * n,
+                            a_off_f32: a_off,
+                            b_off_f32: b_off,
+                            c_off_f32: c_off,
+                            has_bias: 0,
+                            bias_off_f32: 0,
+                            act_id: 0xFFFF,
+                            b_is_param: false,
+                            from_conv1x1: false,
+                            compute_precision: MatmulCompute::F32,
+                        });
+                        let u = emit_uniform(std::mem::size_of::<MatmulParams>());
+                        let (bg, _) = build_matmul_bind_group(
+                            &dev.device,
+                            mm_k,
+                            mm_w,
+                            &mm_f16w,
+                            mm_bf16w,
+                            &mm_f16c,
+                            &mm_coop,
+                            &mm_coop_f32,
+                            &arena,
+                            base,
+                            size,
+                            &u,
+                            false,
+                            MatmulCompute::F32,
+                            k,
+                            n,
+                            batch_bh,
+                            b_off,
+                            k * n,
+                        );
+                        uniforms.push(u);
+                        bind_groups.push(bg);
+                    };
+
+                    // 1. Kᵀ: the score multiply needs K as `[k=D, n=S_k]`, and
+                    //    this is also where a grouped KV head becomes one tile per
+                    //    query head — the head axis splits into (kv head, group)
+                    //    with the group's stride 0, which is the only form of the
+                    //    fused kernel's `kv_h = h / group` a stride-driven permute
+                    //    can express.
+                    emit_transpose(
+                        &mut schedule,
+                        &mut uniforms,
+                        &mut bind_groups,
+                        &mut meta_buffers,
+                        &arena,
+                        "rlx-wgpu attention route transpose meta",
+                        base,
+                        size,
+                        &[batch, nkv, group, hd, seq_k],
+                        &[k_b, k_h, 0, 1, k_s],
+                        // Never the active-extent bucket (`0`): the route's own
+                        // steps walk the query rows, not the batch, so a folded
+                        // extent could not leave exactly the rows the caller asked
+                        // for — this flag is what the step's own predicate reads.
+                        // (Such a graph is off that mode anyway: the route's masked
+                        // scale declines it.)
+                        0,
+                        k_off,
+                        kt_off,
+                    );
+                    // 2. Q′: only when Q's tile is not already a dense `[S_q, D]`.
+                    if !q_dense {
+                        emit_transpose(
+                            &mut schedule,
+                            &mut uniforms,
+                            &mut bind_groups,
+                            &mut meta_buffers,
+                            &arena,
+                            "rlx-wgpu attention route transpose meta",
+                            base,
+                            size,
+                            &[batch, heads, seq_q, hd],
+                            &[q_b, q_h, q_s, 1],
+                            0,
+                            q_off,
+                            q_tmp_off,
+                        );
+                    }
+                    // 3. scores = Q′·Kᵀ, dense `[B, H, S_q, S_k]` in scratch.
+                    emit_matmul(
+                        &mut schedule,
+                        &mut uniforms,
+                        &mut bind_groups,
+                        seq_q,
+                        hd,
+                        seq_k,
+                        if q_dense { q_off } else { q_tmp_off },
+                        kt_off,
+                        scores_off,
+                    );
+                    // 4. The operation's own normalisation, in place over those
+                    //    scores: the scale and the mask as one step, then the
+                    //    ordinary dense softmax over the last axis.
+                    let ap = AttentionMaskParams {
+                        rows: batch * heads * seq_q,
+                        cols: seq_k,
+                        seq_q,
+                        heads,
+                        scale_bits: scale.to_bits(),
+                        mask_kind: mask_kind_id,
+                        window,
+                        scores_off,
+                        mask_off,
+                        mask_batch_stride: m_b,
+                        mask_head_stride: m_h,
+                        seq_q_stride: m_q,
+                        seq_k_stride: m_k,
+                        _p0: 0,
+                        _p1: 0,
+                        _p2: 0,
+                    };
+                    schedule.push(Step::AttentionMask { params: ap });
+                    let u = emit_uniform(std::mem::size_of::<AttentionMaskParams>());
+                    let bg = bind_arena_window(
+                        &dev.device,
+                        attention_mask_kernel(&dev.device),
+                        &arena,
+                        base,
+                        size,
+                        &u,
+                    );
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                    // …then the standard dense softmax, in place over the same
+                    // matrix. Its last pass is elementwise, so `in_off == out_off`
+                    // is safe; two dispatches replace a second copy of the
+                    // reduction against the mask pass.
+                    let sp = SoftmaxParams {
+                        outer: batch * heads * seq_q,
+                        inner: seq_k,
+                        in_off: scores_off,
+                        out_off: scores_off,
+                        _p0: 0,
+                        _p1: 0,
+                        _p2: 0,
+                        _p3: 0,
+                    };
+                    schedule.push(Step::Softmax { params: sp });
+                    let u = emit_uniform(std::mem::size_of::<SoftmaxParams>());
+                    let bg = bind_arena_window(
+                        &dev.device,
+                        softmax_kernel(&dev.device),
+                        &arena,
+                        base,
+                        size,
+                        &u,
+                    );
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                    // 5. V′: only when V's tile is not already a dense `[S_k, D_v]`
+                    //    (`v_dense` also covers the grouped-KV replication).
+                    if !v_dense {
+                        emit_transpose(
+                            &mut schedule,
+                            &mut uniforms,
+                            &mut bind_groups,
+                            &mut meta_buffers,
+                            &arena,
+                            "rlx-wgpu attention route transpose meta",
+                            base,
+                            size,
+                            &[batch, nkv, group, seq_k, hd_v],
+                            &[v_b, v_h, 0, v_s, 1],
+                            0,
+                            v_off,
+                            v_tmp_off,
+                        );
+                    }
+                    // 6. out = P·V′, straight into the output slot when that slot's
+                    //    own per-(b, h) tiles are dense, else into a scratch region.
+                    emit_matmul(
+                        &mut schedule,
+                        &mut uniforms,
+                        &mut bind_groups,
+                        seq_q,
+                        seq_k,
+                        hd_v,
+                        scores_off,
+                        if v_dense { v_off } else { v_tmp_off },
+                        if out_dense { out_off } else { out_tmp_off },
+                    );
+                    // 7. …and when it is not: the same permute step returns out′
+                    //    to the slot. Output axes `(b, s, h, d)` with dims
+                    //    `(B, S_q, H, D_v)` and input strides
+                    //    `(H·S_q·D_v, D_v, S_q·D_v, 1)` land the kernel's dense
+                    //    write exactly on `out[b, s, h·D_v + d]` — the `[B, S, H·D_v]`
+                    //    block's own dense memory — so no scatter kernel is needed.
+                    if !out_dense {
+                        let (h_sq_dv, sq_dv) = (heads * seq_q * hd_v, seq_q * hd_v);
+                        emit_transpose(
+                            &mut schedule,
+                            &mut uniforms,
+                            &mut bind_groups,
+                            &mut meta_buffers,
+                            &arena,
+                            "rlx-wgpu attention route transpose meta",
+                            base,
+                            size,
+                            &[batch, seq_q, heads, hd_v],
+                            &[h_sq_dv, hd_v, sq_dv, 1],
+                            0,
+                            out_tmp_off,
+                            out_off,
+                        );
+                    }
+                    continue;
+                }
                 if out_aliases_qkv && rlx_ir::env::flag("RLX_WGPU_DEBUG_ATTN_ALIAS") {
                     eprintln!(
                         "rlx-wgpu Attention alias: out={:?}@{}+{} q={:?}@{} k={:?}@{} v={:?}@{}",
@@ -4420,6 +4693,7 @@ pub(crate) fn compile_static_inner(
                         arena.offset(v_id),
                     );
                 }
+                let mut attn_scratch_copy: Option<(u64, u32)> = None;
                 if out_aliases_qkv {
                     // In-place QKV/out: write to scratch then copy back.
                     // On sharded arenas continue past any Q/K/V already
@@ -4453,76 +4727,20 @@ pub(crate) fn compile_static_inner(
                             &arena, base, size, scratch,
                         );
                     }
-                    kernel_out_off = ((tmp_byte.saturating_sub(base)) / 4) as u32;
                     attn_scratch_copy = Some((tmp_byte, out_len as u32));
                 }
-                let mask_id = if mask_kind_id == 2 || mask_kind_id == 4 {
-                    Some(node.inputs[3])
-                } else {
-                    None
-                };
-                let mask_off = if let Some(mid) = mask_id {
-                    arena_off_in_bind_window(
-                        &graph,
-                        &param_offsets,
-                        &dev.device,
-                        &arena,
-                        &mut schedule,
-                        &mut scratch,
-                        mid,
-                        &mut base,
-                        &mut size,
-                    )
-                } else {
-                    0
-                };
-                // Alias scratch / mask staging can widen `base` after Q/K/V
-                // were recorded — same stale-offset trap as FusedResidualLN.
-                let (q_off, k_off, v_off) = if let Some((parent, head_width)) = packed_parent {
-                    let parent_off = if arena_tensor_in_window(&arena, parent, base, size) {
-                        arena_local_off_f32(&arena, parent, base)
-                    } else {
-                        q_off
-                    };
-                    (
-                        parent_off,
-                        parent_off.saturating_add(head_width),
-                        parent_off.saturating_add(head_width * 2),
-                    )
-                } else {
-                    (
-                        if arena_tensor_in_window(&arena, q_id, base, size) {
-                            arena_local_off_f32(&arena, q_id, base)
-                        } else {
-                            q_off
-                        },
-                        if arena_tensor_in_window(&arena, k_id, base, size) {
-                            arena_local_off_f32(&arena, k_id, base)
-                        } else {
-                            k_off
-                        },
-                        if arena_tensor_in_window(&arena, v_id, base, size) {
-                            arena_local_off_f32(&arena, v_id, base)
-                        } else {
-                            v_off
-                        },
-                    )
-                };
-                let kernel_out_off = if let Some((tmp_byte, _)) = attn_scratch_copy {
-                    ((tmp_byte.saturating_sub(base)) / 4) as u32
-                } else if arena_tensor_in_window(&arena, node.id, base, size) {
-                    arena_local_off_f32(&arena, node.id, base)
-                } else {
-                    kernel_out_off
-                };
-                let mask_off = if let Some(mid) = mask_id {
-                    if arena_tensor_in_window(&arena, mid, base, size) {
-                        arena_local_off_f32(&arena, mid, base)
-                    } else {
-                        mask_off
-                    }
-                } else {
-                    0
+                // The alias scratch path above can widen `base` after Q/K/V and
+                // the output were recorded, so the offsets are read back out of
+                // the window it left.
+                (q_off, k_off, v_off, out_off, mask_off) =
+                    rebase(base, size, (q_off, k_off, v_off, out_off, mask_off));
+                // `out_off` was rebased into the window before the route
+                // decision and nothing after it moved `base` unless the alias
+                // path above did — which is exactly when the write goes through
+                // its own scratch copy instead.
+                let kernel_out_off = match attn_scratch_copy {
+                    Some((tmp_byte, _)) => ((tmp_byte.saturating_sub(base)) / 4) as u32,
+                    None => out_off,
                 };
                 let p = AttentionParams {
                     batch,
@@ -4546,10 +4764,10 @@ pub(crate) fn compile_static_inner(
                     // axis (reads the same element for every value of
                     // the index). Lets us skip the Expand pre-pass that
                     // unfuse used to emit per attention block.
-                    seq_q_stride: mask_strides.q,
-                    seq_k_stride: mask_strides.k,
-                    mask_batch_stride: mask_strides.b,
-                    mask_head_stride: mask_strides.h,
+                    seq_q_stride: m_q,
+                    seq_k_stride: m_k,
+                    mask_batch_stride: m_b,
+                    mask_head_stride: m_h,
                     kv_heads: nkv,
                     v_head_dim: hd_v,
                     _pad_mask_2: 0,
@@ -4570,10 +4788,9 @@ pub(crate) fn compile_static_inner(
                     o_seq_stride: o_s,
                     _pad_o: 0,
                 };
-                let _ = num_heads;
                 schedule.push(Step::Attention {
                     params: p,
-                    mask_buf,
+                    mask_buf: None,
                 });
                 if let Some((tmp_byte, bytes)) = attn_scratch_copy {
                     schedule.push(Step::BufferCopy {
@@ -11863,6 +12080,16 @@ pub(crate) fn compile_static_inner(
                 dev.device.limits().max_storage_buffer_binding_size
             );
         }
+        if attention_window_declines > 0 {
+            eprintln!(
+                "    attention: {attention_window_declines} many-row step(s) cleared the \
+                 route's shape gates but kept the fused kernel, for a reason the shapes do \
+                 not settle: an arena addressed in stripes rather than whole (a binding \
+                 limit below it, or RLX_WGPU_ALLOW_SHARD), or one whose bind window does \
+                 not reach the plan's regions. RLX_WGPU_DEBUG_ATTN_MASK names the term per \
+                 step."
+            );
+        }
         for (n, c) in &counts {
             eprintln!("    {c:>4} × {n}");
         }
@@ -11916,6 +12143,7 @@ pub(crate) fn compile_static_inner(
         static_once_done: false,
         ceiling_hosted,
         im2col_fallbacks,
+        attention_window_declines,
     }
 }
 

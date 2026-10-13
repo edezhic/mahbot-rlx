@@ -315,6 +315,46 @@ pub struct SoftmaxParams {
     pub _p3: u32,
 }
 
+/// Layout for `attention_mask` — the many-row attention route's masked scale.
+/// 64 bytes: the 13 fields the pass reads, padded to 16 `u32`.
+///
+/// Its own struct rather than the fused entry's `Params`: that one is 36 `u32`
+/// of Q/K/V/output offsets and per-tensor strides this pass reads none of, and
+/// it has no field for the score matrix the pass scales in place. What the two
+/// do share is the bind-group shape (arena + one uniform), which is why
+/// `attention.wgsl` carries a binding per entry point.
+///
+/// `rows × cols` is the whole score matrix: rows are `(batch, head, query row)`
+/// major, which is the order the dense multiply wrote them in, and `seq_q` /
+/// `heads` decompose a row index back into the mask address the fused kernel
+/// derives for the same `(b, h, qi)` triple. `scale_bits` is `1/sqrt(D)` bitcast,
+/// applied before the mask exactly as the fused kernel applies it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct AttentionMaskParams {
+    pub rows: u32,
+    /// The key sequence — the last axis the mask pass walks, also the fused
+    /// kernel's `seq_k`.
+    pub cols: u32,
+    pub seq_q: u32,
+    pub heads: u32,
+    pub scale_bits: u32,
+    /// 0=None, 1=Causal, 2=Custom(binary), 3=SlidingWindow, 4=Bias(additive).
+    pub mask_kind: u32,
+    /// SlidingWindow width (only read when `mask_kind == 3`).
+    pub window: u32,
+    /// The score matrix's own base, read and written in place.
+    pub scores_off: u32,
+    pub mask_off: u32,
+    pub mask_batch_stride: u32,
+    pub mask_head_stride: u32,
+    pub seq_q_stride: u32,
+    pub seq_k_stride: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+}
+
 /// Layout for the fused dense softmax cross-entropy. 32 bytes.
 /// Also used by integer-label `SoftmaxCrossEntropyWithLogits` (labels in
 /// `targets_off`, one f32 per row).
@@ -2637,6 +2677,7 @@ static GATHER_SPLIT: OnceLock<Kernel> = OnceLock::new();
 static GATHER_AXIS: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_DECODE: OnceLock<Kernel> = OnceLock::new();
+static ATTENTION_MASK: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_BWD: OnceLock<Kernel> = OnceLock::new();
 static ROPE: OnceLock<Kernel> = OnceLock::new();
 static EXPAND: OnceLock<Kernel> = OnceLock::new();
@@ -3742,6 +3783,21 @@ pub fn attention_decode_kernel(device: &wgpu::Device) -> &'static Kernel {
         )
     })
 }
+/// The many-row attention route's masked scale: the score multiply's own
+/// output, scaled and masked in place, in front of the ordinary dense softmax
+/// (`softmax_kernel`). Same WGSL module and same two-entry bind-group layout as
+/// [`attention_kernel`], so the bind group the lowerer built from that layout
+/// drives this pipeline too.
+pub fn attention_mask_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ATTENTION_MASK.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu attention_mask",
+            ATTENTION_WGSL,
+            "attention_mask",
+        )
+    })
+}
 
 /// Key length above which the decode-shaped form is worth its merge cost:
 /// the threshold the native (Metal) backend records for its decode-shaped form
@@ -3771,17 +3827,21 @@ pub fn attention_decode_eligible(seq_q: u32, seq_k: u32, head_dim: u32, v_head_d
         && v_head_dim <= ATTENTION_DECODE_MAX_HEAD_DIM
 }
 
-/// Which kernel each `Step::Attention` dispatch took, counted process-wide.
-/// `serial` covers both the multi-row path and every shape the decode form
-/// cannot serve.
+/// Which kernel each `Step::Attention` dispatch took, counted process-wide, plus
+/// the many-row route (`AttentionRoutes::decomposed`), which is not a
+/// `Step::Attention` dispatch at all: it is counted where the route's own
+/// normalise runs, one per attention step it served. `serial` covers both the
+/// multi-row path and every shape the decode form cannot serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttentionRoutes {
     pub decode: u64,
+    pub decomposed: u64,
     pub serial: u64,
 }
 
 static ATTENTION_DECODE_STEPS: AtomicU64 = AtomicU64::new(0);
 static ATTENTION_SERIAL_STEPS: AtomicU64 = AtomicU64::new(0);
+static ATTENTION_DECOMPOSED_STEPS: AtomicU64 = AtomicU64::new(0);
 
 /// How many attention dispatches this process has routed each way. The engine's
 /// dispatch report answers per `OpKind`, not per kernel, so this is the
@@ -3789,6 +3849,7 @@ static ATTENTION_SERIAL_STEPS: AtomicU64 = AtomicU64::new(0);
 pub fn attention_route_counts() -> AttentionRoutes {
     AttentionRoutes {
         decode: ATTENTION_DECODE_STEPS.load(Ordering::Relaxed),
+        decomposed: ATTENTION_DECOMPOSED_STEPS.load(Ordering::Relaxed),
         serial: ATTENTION_SERIAL_STEPS.load(Ordering::Relaxed),
     }
 }
@@ -3797,6 +3858,7 @@ pub fn attention_route_counts() -> AttentionRoutes {
 pub fn reset_attention_route_counts() {
     ATTENTION_DECODE_STEPS.store(0, Ordering::Relaxed);
     ATTENTION_SERIAL_STEPS.store(0, Ordering::Relaxed);
+    ATTENTION_DECOMPOSED_STEPS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) fn note_attention_route(decode: bool) {
@@ -3806,6 +3868,12 @@ pub(crate) fn note_attention_route(decode: bool) {
         &ATTENTION_SERIAL_STEPS
     };
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One attention step served by the many-row route — counted at its normalise,
+/// which every such step emits exactly one of.
+pub(crate) fn note_attention_decomposed_route() {
+    ATTENTION_DECOMPOSED_STEPS.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn attention_bwd_kernel(device: &wgpu::Device) -> &'static Kernel {

@@ -26,7 +26,7 @@ use crate::kernels::{
     SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
     WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
     ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_decode_eligible,
-    attention_decode_kernel, attention_kernel, axial_rope2d_kernel,
+    attention_decode_kernel, attention_kernel, attention_mask_kernel, axial_rope2d_kernel,
     batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
@@ -52,15 +52,16 @@ use crate::kernels::{
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
     matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
-    maxpool3d_backward_kernel, narrow_kernel, note_attention_route, pool1d_kernel, pool2d_kernel,
-    pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel,
-    reverse_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scaled_dequantize_kernel,
-    scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel, scaled_quant_scale_kernel,
-    scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel,
-    selective_scan_kernel, softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
-    softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
-    umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, welch_peaks_gpu_kernel, where_kernel,
+    maxpool3d_backward_kernel, narrow_kernel, note_attention_decomposed_route,
+    note_attention_route, pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel,
+    q_matmul_kernel, quantize_i8_kernel, reduce_kernel, reverse_kernel, rms_norm_backward_kernel,
+    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
+    scaled_dequantize_kernel, scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel,
+    scaled_quant_scale_kernel, scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel,
+    scatter_nd_reduce_kernel, selective_scan_kernel, softmax_cross_entropy_backward_kernel,
+    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
+    topk_kernel, transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
+    welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
@@ -938,6 +939,17 @@ impl WgpuExecutable {
                         p.outer = scale(p.outer);
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::AttentionMask { params } => {
+                        // Not active-extent scaled — see
+                        // `Step::safe_for_active_extent`, which vetoes that mode
+                        // for the whole graph — so the params go out verbatim and
+                        // the rows are the planned ones.
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
                     }
                     Step::SoftmaxCrossEntropyWithLogits { params } => {
                         let mut p = *params;
@@ -1958,6 +1970,25 @@ impl WgpuExecutable {
                                 // reduction over the softmax axis.
                                 let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::AttentionMask { params } => {
+                                // Not active-extent scaled (the step vetoes that
+                                // mode for the whole graph), so the rows are the
+                                // planned ones — and a step reaching here is one the
+                                // route took, which its own floor keeps non-empty.
+                                let ak = attention_mask_kernel(&dev.device);
+                                pass.set_pipeline(&ak.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                // One 64-lane workgroup per row: the kernel reads
+                                // `wid.x + wid.y * ngs.x` as its row index, which is
+                                // the grid convention `softmax_kernel` asserts, so it
+                                // is expressed the same way here.
+                                let (gx, gy, gz) =
+                                    dispatch_dims(params.rows.saturating_mul(64), 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                                // One per attention step this route served: the
+                                // step is the route's own masked scale.
+                                note_attention_decomposed_route();
                             }
                             Step::SoftmaxCrossEntropy { params } => {
                                 let outer_s = scale(params.outer);

@@ -79,6 +79,20 @@ fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
                 }
             }
         }
+        // The many-row attention route's Kᵀ, score matrix and operand
+        // compaction: the route's own plan of this node. Every other node — and
+        // every attention shape the route does not serve — answers zero
+        // (`attention_route`). The 64 MiB floor below already covers the route's
+        // own cap, so what this branch raises the reserve by is the plan's
+        // ≤ 256-byte alignment slack — which is exactly what lets a route shape
+        // fit without depending on the bump cursor's own alignment.
+        let attn = match attention_route::plan_attention(graph, node) {
+            Ok(plan) if plan.decompose => plan.scratch_bytes(),
+            _ => 0,
+        };
+        if attn > max_bytes {
+            max_bytes = attn;
+        }
     }
     // Reserve extra scratch for staging small far-apart operands when the
     // arena exceeds wgpu's binding window. This keeps compile-time simple
@@ -160,10 +174,11 @@ pub(crate) const CONV_IM2COL_MAX_COL_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Largest spatial extent the 1×1 pointwise GEMM may take. The route's `n` is
 /// the spatial extent and the matmul dispatch emits one workgroup per 32 (or 64)
-/// output columns, so WebGPU's 65535-workgroups-per-dimension cap is reached at
-/// `65535 * 32` — the conservative bound holds whichever of those two kernels
-/// the run picks. Past it the shape keeps the previous direct/tiled route.
-pub(crate) const POINTWISE_MAX_SPATIAL: u64 = 65535 * 32;
+/// output columns, so [`MAX_WORKGROUPS_PER_DIM`] is reached at
+/// `MAX_WORKGROUPS_PER_DIM * 32` — the conservative bound holds whichever of
+/// those two kernels the run picks. Past it the shape keeps the previous
+/// direct/tiled route.
+pub(crate) const POINTWISE_MAX_SPATIAL: u64 = MAX_WORKGROUPS_PER_DIM as u64 * 32;
 
 /// Admission bar for the 1×1 pointwise GEMM, in `c_in × spatial` elements. The
 /// im2col spatial and K floors used to be multiplied together for this test; the
@@ -440,8 +455,20 @@ pub struct WgpuExecutable {
     /// decided, in the `Op::Conv` arm of [`crate::backend::compile`], so a term added
     /// there cannot leave the count behind.
     im2col_fallbacks: usize,
+    /// Many-row attention steps this compile sent to the fused kernel for want of
+    /// a window over the route's regions — the one term of the route decision the
+    /// graph's shapes do not settle (an arena addressed in stripes rather than
+    /// whole, or one whose bind window does not reach the plan's regions). Reaching
+    /// it takes an arena larger than what the adapter binds at once — 4 GiB on the
+    /// adapter this crate is measured on, so nothing in its suite counts one, and a
+    /// striped arena hosts a straddling attention step before the decision. Counted
+    /// where the step is lowered, so a graph that is declined says so instead of
+    /// leaving the route to be inferred from a timing: the schedule report prints
+    /// the count, and the arm's attention debug print names which term it was.
+    attention_window_declines: usize,
 }
 
+mod attention_route;
 mod compile;
 mod copy_route;
 mod dispatch;
@@ -458,6 +485,11 @@ pub(crate) use copy_route::*;
 pub(crate) use helpers::*;
 pub(crate) use run_report::*;
 pub(crate) use step::*;
+
+/// The many-row attention route's query-row floor: public because the crate's
+/// integration tests are external and read it to place their shapes on either
+/// side of it.
+pub use attention_route::ATTENTION_DECOMPOSE_MIN_Q;
 
 /// The run report's marks handle, public only because the `gguf_gpu` entry
 /// points that take it are: the crate's integration tests are external and
@@ -566,6 +598,7 @@ impl WgpuExecutable {
         self.schedule = fresh.schedule;
         self.ceiling_hosted = fresh.ceiling_hosted;
         self.im2col_fallbacks = fresh.im2col_fallbacks;
+        self.attention_window_declines = fresh.attention_window_declines;
         self.input_offsets = fresh.input_offsets;
         self.param_offsets = fresh.param_offsets;
         self.uniforms = fresh.uniforms;
@@ -673,6 +706,7 @@ impl WgpuExecutable {
             static_once_done: false,
             ceiling_hosted: 0,
             im2col_fallbacks: 0,
+            attention_window_declines: 0,
         }
     }
 
@@ -708,6 +742,15 @@ impl WgpuExecutable {
     /// was *not* taken having to be inferred from a timing.
     pub fn im2col_fallbacks(&self) -> usize {
         self.im2col_fallbacks
+    }
+
+    /// Many-row attention steps this compile kept on the fused kernel for want of
+    /// a window over the route's regions (see the field of the same name). Every
+    /// other term of that decision is the graph's own, so a non-zero count is the
+    /// arena and not the geometry; the schedule report prints it, and the lowering's
+    /// attention debug print says which term it was, for the step's own addresses.
+    pub fn attention_window_declines(&self) -> usize {
+        self.attention_window_declines
     }
 
     /// Debug helper: run forward, then read every node slot back and
@@ -1109,10 +1152,19 @@ impl WgpuExecutable {
     }
 }
 
+/// WebGPU's spec cap on a single `dispatch_workgroups` dimension, which
+/// [`dispatch_dims`] folds a wider workload across the dispatch's own dimensions
+/// against, [`POINTWISE_MAX_SPATIAL`] scales by the pointwise kernel's columns,
+/// and `attention_route`'s plan caps the extents the many-row attention
+/// multiplies dispatch on. A few older sites in this crate still spell the number
+/// out; they are left as they are.
+pub(crate) const MAX_WORKGROUPS_PER_DIM: u32 = 65_535;
+
 /// Compute a (X, Y, 1) workgroup grid for a 1-D workload.
 ///
-/// WebGPU caps `dispatch_workgroups` per-dimension at 65535. For
-/// workloads beyond `65535 × workgroup_size_x` threads we split into
+/// WebGPU caps `dispatch_workgroups` per-dimension at
+/// [`MAX_WORKGROUPS_PER_DIM`]. For workloads beyond
+/// `MAX_WORKGROUPS_PER_DIM × workgroup_size_x` threads we split into
 /// a 2-D grid; kernels recover the linear thread index via
 /// `gid.x + gid.y * num_workgroups.x * 64u`.
 fn dispatch_prologue_nchw(w: u32, h: u32, nc: u32) -> (u32, u32, u32) {
@@ -1121,10 +1173,10 @@ fn dispatch_prologue_nchw(w: u32, h: u32, nc: u32) -> (u32, u32, u32) {
 
 fn dispatch_dims(threads_total: u32, workgroup_size: u32) -> (u32, u32, u32) {
     let groups = threads_total.div_ceil(workgroup_size);
-    if groups <= 65535 {
+    if groups <= MAX_WORKGROUPS_PER_DIM {
         (groups, 1, 1)
     } else {
-        let gx = 65535u32;
+        let gx = MAX_WORKGROUPS_PER_DIM;
         let gy = groups.div_ceil(gx);
         (gx, gy, 1)
     }

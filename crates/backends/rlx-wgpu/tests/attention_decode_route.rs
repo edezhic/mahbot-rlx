@@ -16,7 +16,7 @@
 //! while the route counts, which is what a regression moves first, are asserted.
 mod common;
 
-use common::{max_abs_diff, refuse_under_run_report};
+use common::{max_abs_diff, refuse_under_run_report, route_lock};
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
@@ -24,15 +24,6 @@ use rlx_wgpu::kernels::{
     ATTENTION_DECODE_MAX_HEAD_DIM, ATTENTION_DECODE_MIN_KEYS, AttentionRoutes,
     attention_decode_eligible, attention_route_counts, reset_attention_route_counts,
 };
-use std::sync::{Mutex, MutexGuard};
-
-/// The route counters are process-global, so tests in this binary that bracket
-/// one (`reset` … `run` … `read`) must not run next to each other.
-static ROUTE_TEST_MUTEX: Mutex<()> = Mutex::new(());
-
-fn route_lock() -> MutexGuard<'static, ()> {
-    ROUTE_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// Head count / width of the 1.7B-class decode body the route targets.
 const NH: usize = 16;
@@ -274,6 +265,7 @@ fn decode_route_rank4_bshd_matches_cpu() {
             routes,
             AttentionRoutes {
                 decode: 1,
+                decomposed: 0,
                 serial: 0,
             },
             "rank-4 decode nkv={nkv} {kind:?}: the decode kernel must serve the step"
@@ -312,25 +304,17 @@ fn cost_per_position_per_layer() {
              layers={LAYERS} mask=causal: {us:.3} us/position/layer \
              (submits={submits} waits={waits}) routes={routes:?}"
         );
-        if label == "decode" {
-            assert_eq!(
-                routes,
-                AttentionRoutes {
-                    decode: REPS as u64 * LAYERS as u64,
-                    serial: 0,
-                },
-                "{label} rows={rows} lk={lk}: every layer must take the decode kernel"
-            );
-        } else {
-            assert_eq!(
-                routes,
-                AttentionRoutes {
-                    decode: 0,
-                    serial: REPS as u64 * LAYERS as u64,
-                },
-                "{label} rows={rows} lk={lk}: the serial path must keep its kernel"
-            );
-        }
+        // The expectation comes from the shape: `prefill`'s 64 query rows are
+        // above the dense route's floor (`backend::attention_route`), so its
+        // layers take that arrangement — the numbers `attention_decompose_cost`
+        // reports — and this harness keeps timing them from the decode side. The
+        // arm's own window term can still keep the fused kernel (that module's
+        // doc); where it does, this assertion is the pin that says so.
+        assert_eq!(
+            routes,
+            common::expected_attention_routes(rows, lk, LAYERS, REPS),
+            "{label} rows={rows} lk={lk}: every layer must take its own shape's route"
+        );
     }
 }
 
@@ -355,6 +339,7 @@ fn decode_route_follows_the_extent_patched_down() {
             512usize,
             AttentionRoutes {
                 decode: LAYERS_PATCHED as u64,
+                decomposed: 0,
                 serial: 0,
             },
         ),
@@ -362,6 +347,7 @@ fn decode_route_follows_the_extent_patched_down() {
             48,
             AttentionRoutes {
                 decode: 0,
+                decomposed: 0,
                 serial: LAYERS_PATCHED as u64,
             },
         ),
@@ -454,6 +440,7 @@ fn decode_route_mask_kinds_match_cpu() {
             routes,
             AttentionRoutes {
                 decode: 1,
+                decomposed: 0,
                 serial: 0,
             },
             "{kind:?} on the decode shape must take the decode kernel"
@@ -500,6 +487,7 @@ fn route_falls_back_outside_the_decode_form() {
             routes,
             AttentionRoutes {
                 decode: 0,
+                decomposed: 0,
                 serial: 1,
             },
             "rows={rows} nh={nh} hd={hd} lk={lk}: outside the decode form the \

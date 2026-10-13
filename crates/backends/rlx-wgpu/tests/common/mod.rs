@@ -6,13 +6,18 @@
 //! loops ([`time_rounds`], one cell alone, and [`time_round_robin`], round-robin
 //! across a cell set) that the three harnesses using them — `gguf_one_row_stream_rate`,
 //! `gguf_gemm_grouped_weight_reuse` and `gguf_gemm_grouped_split_rate` — time their
-//! calls with, plus the parity helpers and the pins' own refusal at the end of the
-//! file. `tests/common/` is not a test target of its own; each test binary pulls it
-//! in with `mod common;`.
+//! calls with, plus the parity helpers, the pins' own refusal and the route-counter
+//! lock at the end of the file. `tests/common/` is not a test target of its own;
+//! each test binary pulls it in with `mod common;`.
 
 // Each test binary declaring `mod common;` uses only the helpers it needs, so
 // the rest are dead code in that binary and `just lint` runs with `-D warnings`.
 #![allow(dead_code)]
+
+use std::sync::{Mutex, MutexGuard};
+
+use rlx_wgpu::backend::ATTENTION_DECOMPOSE_MIN_Q;
+use rlx_wgpu::kernels::{ATTENTION_DECODE_MIN_KEYS, AttentionRoutes};
 
 /// A deterministic `[m, k]` row-major activation, at `step`'s ramp rate. `step`
 /// stays the caller's because it sets the result's magnitude, which a parity
@@ -226,4 +231,59 @@ pub fn refuse_under_run_report() {
         "RLX_WGPU_DBG_COUNTERS changes the submission/wait shape of a forward pass; \
          unset it to run this pin"
     );
+}
+
+/// The arrangement every layer of a many-layer attention chain is expected to
+/// take: one query row over more than `ATTENTION_DECODE_MIN_KEYS` keys is the
+/// decode-shaped form, below the many-row route's floor the fused kernel, and
+/// from that floor up the dense arrangement. `layers` attention steps per run,
+/// over `reps` runs, so the counters it predicts are the whole bracket.
+///
+/// The shape decides which arrangement the route is *asked for*; the arm's
+/// window term (`attention_window_declines`, whose count tells that decline
+/// apart from the shape's own answer) can still keep the fused kernel, and a
+/// harness on an adapter where it does fails this expectation loudly rather
+/// than skipping. The head widths a harness uses must clear
+/// `attention_decode_eligible`'s caps for the decode arm to apply; the two
+/// harnesses here run 8 heads × 64 and 16 × 128, both inside the cap.
+pub fn expected_attention_routes(
+    rows: usize,
+    lk: usize,
+    layers: usize,
+    reps: usize,
+) -> AttentionRoutes {
+    let per_run = if rows == 1 && lk > ATTENTION_DECODE_MIN_KEYS as usize {
+        AttentionRoutes {
+            decode: layers as u64,
+            decomposed: 0,
+            serial: 0,
+        }
+    } else if rows >= ATTENTION_DECOMPOSE_MIN_Q as usize {
+        AttentionRoutes {
+            decode: 0,
+            decomposed: layers as u64,
+            serial: 0,
+        }
+    } else {
+        AttentionRoutes {
+            decode: 0,
+            decomposed: 0,
+            serial: layers as u64,
+        }
+    };
+    AttentionRoutes {
+        decode: per_run.decode * reps as u64,
+        decomposed: per_run.decomposed * reps as u64,
+        serial: per_run.serial * reps as u64,
+    }
+}
+
+/// The route counters are process-global, so tests in one binary that bracket
+/// one (`reset` … `run` … `read`) must not run next to each other.
+static ROUTE_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+/// [`ROUTE_TEST_MUTEX`], poisoned-tolerant: an earlier failing assertion must not
+/// turn every later test in the binary into a lock error.
+pub fn route_lock() -> MutexGuard<'static, ()> {
+    ROUTE_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }

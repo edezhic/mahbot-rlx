@@ -18,7 +18,8 @@ use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_wgpu::kernels::{
-    attention_decode_eligible, attention_route_counts, reset_attention_route_counts,
+    AttentionRoutes, attention_decode_eligible, attention_route_counts,
+    reset_attention_route_counts,
 };
 
 /// Rank-3 `[B, S, H·head_dim]` Q/K, `[B, S, H·v_head_dim]` V/out, causal.
@@ -73,13 +74,28 @@ fn run_case(nh: usize, hd: usize, v_hd: usize, lq: usize, lk: usize) -> Option<f
     let gpu = run(Device::Gpu);
     let routes = attention_route_counts();
     let cpu = run(Device::Cpu);
-    // One attention step per run: it took the kernel the host's predicate names.
+    // One attention step per run, and every shape here is below the many-row
+    // route's floor: it must take the kernel the host's predicate names and none
+    // of its step may be served by the route.
     let decode = attention_decode_eligible(lq as u32, lk as u32, hd as u32, v_hd as u32);
     assert_eq!(
-        (routes.decode, routes.serial),
-        if decode { (1, 0) } else { (0, 1) },
+        routes,
+        if decode {
+            AttentionRoutes {
+                decode: 1,
+                decomposed: 0,
+                serial: 0,
+            }
+        } else {
+            AttentionRoutes {
+                decode: 0,
+                decomposed: 0,
+                serial: 1,
+            }
+        },
         "nh={nh} hd={hd} v_hd={v_hd} lq={lq} lk={lk}: attention_decode_eligible says \
-         {decode}, the run says {routes:?}"
+         {decode}, the run says {routes:?}; the many-row route serves neither, its floor \
+         being above these query-row counts"
     );
     assert_eq!(
         gpu.len(),

@@ -92,11 +92,19 @@ name = "attention_decode_route"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "attention_decompose_cost"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "attention_head_dim_parity"
 required-features = ["backend-tests"]
 
 [[test]]
 name = "attention_long_seq_precision"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "attention_rows_route"
 required-features = ["backend-tests"]
 
 [[test]]

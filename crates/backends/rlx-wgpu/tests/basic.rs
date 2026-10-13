@@ -1205,7 +1205,11 @@ fn wgpu_chain_attention_uses_packed_qkv_stride() {
         return;
     }
     use rlx::prelude::*;
-    let (b, s, nh, dh) = (1, 191, 8, 25);
+    // Below the dense route's floor (`backend::attention_route`): this hook
+    // describes the fused kernel's packed reads, while a packed attention past
+    // the floor takes that route instead — `wgpu_packed_attn_matches_strided_cpu_ref`
+    // below covers it numerically at such a sequence.
+    let (b, s, nh, dh) = (1, 24, 8, 25);
     let hd = nh * dh;
     let f = DType::F32;
     let mut g = Graph::new("qkv_chain");

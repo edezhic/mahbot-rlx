@@ -1,20 +1,28 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Attention precision on wgpu as the sequence crosses the kernel-selection
+//! Attention precision on wgpu as the sequence crosses the arrangement
 //! boundary.
 //!
 //! `rlx-brainbert` is 12 heads x 64 head_dim at **seq = 186**, and its relative
 //! L2 on wgpu is ~240x CPU's while every isolated op (matmul, LayerNorm, GELU,
-//! softmax) is bit-exact or near it. The backend has two attention kernel
-//! shapes — a serial one (one thread per (batch, head, query row)) and a
-//! decode-shaped one that only a single query row over a long key sequence
-//! takes — and this file now covers both; the earlier cross-backend check only
-//! covered seq = 16, i.e. not the path this model uses.
+//! softmax) is bit-exact or near it. The sweep below runs BrainBERT's own
+//! geometry at four lengths, and they do not all take the same arrangement: seq
+//! 16 sits below the many-row route's query-row floor and keeps the serial kernel
+//! (one thread per (batch, head, query row)), while 64, 65 and 186 sit at or
+//! above the floor and take the many-row route (`backend::attention_route`). This
+//! is where BrainBERT's own geometry (12 heads x 64 head_dim, seq 186) is pinned
+//! across that boundary, and its sub-floor seq 16 case is what pins the serial
+//! kernel with a Custom mask — a many-row Custom-mask step is pinned too, in
+//! `attention_rows_route::route_mask_kinds_match_cpu`. The bar is asserted for
+//! both arrangements, because the point is BrainBERT's own geometry (12 heads x
+//! 64 head_dim) rather than one arrangement's numbers. The decode-shaped form —
+//! one query row over a long key sequence — is covered at the end of the test.
 
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
+use rlx_wgpu::backend::ATTENTION_DECOMPOSE_MIN_Q;
 use rlx_wgpu::kernels::{AttentionRoutes, attention_route_counts, reset_attention_route_counts};
 
 fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
@@ -141,10 +149,14 @@ fn case_decode_causal(nh: usize, nkv: usize, hd: usize, lk: usize) -> Option<f64
 
 #[test]
 fn attention_precision_across_the_seq_boundary() {
-    // 12 x 64 is BrainBERT's geometry; 186 is its sequence. Every length here has
-    // more than one query row, so all of them take the serial kernel (the decode
-    // shape is one query row only, covered at the end of the test).
+    // 12 x 64 is BrainBERT's geometry; 186 is its sequence. Only seq 16 sits below
+    // the many-row route's floor and keeps the serial kernel — the sub-floor case
+    // that pins the serial kernel under a Custom mask; 64, 65 and 186 are at or
+    // above the floor and take the route — 186's ≈4 MB of scratch is far under its
+    // 64 MiB cap. The decode shape is one query row only, covered at the end of the
+    // test.
     let mut rows = Vec::new();
+    reset_attention_route_counts();
     for seq in [16usize, 64, 65, 186] {
         let Some(r) = case_masked(12, 64, seq, false) else {
             eprintln!("skip: wgpu unavailable");
@@ -157,6 +169,25 @@ fn attention_precision_across_the_seq_boundary() {
             rows.push((seq, rm));
         }
     }
+    // One attention step per case, so one route count each: the two runs at seq 16
+    // must keep the serial kernel and every run at or above the floor must take
+    // the route.
+    let below = rows
+        .iter()
+        .filter(|(seq, _)| *seq < ATTENTION_DECOMPOSE_MIN_Q as usize)
+        .count() as u64;
+    assert_eq!(
+        attention_route_counts(),
+        AttentionRoutes {
+            decode: 0,
+            decomposed: rows.len() as u64 - below,
+            serial: below,
+        },
+        "below the route's floor ({ATTENTION_DECOMPOSE_MIN_Q} query rows) the serial \
+         kernel must serve the step and at or above it the route must: {below} of the \
+         {} runs were sub-floor",
+        rows.len()
+    );
     // Decode shapes: one query row, grouped KV heads, causal. A 512-key softmax
     // over this data is diffuse, so the output is small (|out| ~ 7e-3) and this
     // relative measure amplifies the CPU/wgpu summation-order difference. Measured
@@ -186,6 +217,7 @@ fn attention_precision_across_the_seq_boundary() {
         attention_route_counts(),
         AttentionRoutes {
             decode: decode_cases,
+            decomposed: 0,
             serial: 0,
         },
         "a decode-shaped case ran on the serial kernel"
