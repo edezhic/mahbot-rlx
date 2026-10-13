@@ -770,7 +770,8 @@ pub(crate) enum Step {
     /// row, and the row-grouped GEMM above one — is device-only work the run
     /// encodes into the enclosing batch
     /// ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`] /
-    /// [`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]).
+    /// [`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]), and so is Q8_0's
+    /// multi-row call, whose grouped arm that ladder admits.
     DequantMatmulGguf {
         m: u32,
         k: u32,

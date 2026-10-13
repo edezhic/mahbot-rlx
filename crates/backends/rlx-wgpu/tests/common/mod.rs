@@ -155,6 +155,42 @@ pub fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+/// Whole-vector bit-pattern equality — the tree's idiom for "the same work in a
+/// different arrangement" (a joined vs an unjoined pass, a striped vs a whole
+/// arena). `what` is the site's own claim, which names the two arrangements the
+/// pair came from.
+pub fn assert_bit_identical(a: &[f32], b: &[f32], what: &str) {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "{what}: {}-element output read as {}-element",
+        a.len(),
+        b.len()
+    );
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        assert!(
+            x.to_bits() == y.to_bits(),
+            "{what}: element {i} reads {x} against {y}"
+        );
+    }
+}
+
+/// The 8-bit GGUF scheme's bisect lever, spelled in one place: it takes that
+/// scheme's multi-row multiplies off the grouped device arm, so the pins whose
+/// routes, joined intervals or counted pairs it would move refuse on it.
+pub const Q8_0_BISECT: &str = "RLX_WGPU_Q8_0_GEMM_DISABLE";
+
+/// Refuse when the 8-bit scheme's bisect lever is set: the lever is read where that
+/// call is encoded, so under it a call this tree routes on the grouped device arm
+/// answers the slab instead — another routing mode, not a defect in the pin.
+pub fn refuse_under_q8_0_bisect() {
+    assert!(
+        !rlx_ir::env::flag(Q8_0_BISECT),
+        "RLX_WGPU_Q8_0_GEMM_DISABLE moves the 8-bit scheme's multiplies off the grouped route; \
+         unset it to run this pin"
+    );
+}
+
 /// How many schedule steps are the materialised broadcast family
 /// (`expand` / `expand_host`) — the lowering leaves one wherever a broadcast
 /// operand has to arrive as a real tensor.

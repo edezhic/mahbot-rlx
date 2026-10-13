@@ -15,14 +15,18 @@
 //! figures (its `[rlx-gguf-q8-0-gemm]` lines) — the asserts there are the route,
 //! the recorded route census, the step count and the values, not the timings.
 //!
-//! Its own test binary and a single test fn, so the process-global counters have
-//! no concurrent writers.
+//! Its own test binary, and the one test fn that reads the process-global counters:
+//! the other one, the device-free pin on the grid's Q8_0 expectation, reads none and
+//! dispatches nothing, so those counters have no concurrent writers.
 //!
 //! Everything here is an IN-ARENA weight: the executable only moves a param into
 //! the separate packed-weight buffer when the *plan* exceeds the device binding
 //! limit (4 GiB of packed weights on this hardware), which no small test reaches —
-//! `RLX_WGPU_ALL_PARAMS_WEIGHT=1` would force the split, but nothing in this file
-//! sets it. `gguf_gemm_parked_weight.rs` drives the split arena directly instead.
+//! `RLX_WGPU_ALL_PARAMS_WEIGHT=1` would force the split. This file does not set that
+//! knob, and it does not guard it either: run the binary with the knob set and the
+//! grid's non-Q8_0 cells (the Q5_K shapes among them) mis-route. That sensitivity is
+//! pre-existing and no claim here rests on those cells' numbers under that knob;
+//! `gguf_gemm_parked_weight.rs` is the file that drives a split arena directly.
 //! The `RLX_WGPU_MAX_BIND_MB` cases below drive the window/chunk arithmetic: a
 //! weight *window* over the binding limit must be N-chunked, and no chunk window
 //! may be sized from the weight's position relative to offset 0.
@@ -35,7 +39,7 @@
 //! override reached the encoder at all: an A/B that changes nothing proves nothing.
 
 mod common;
-use common::{max_abs_diff, refuse_under_run_report};
+use common::{max_abs_diff, refuse_under_q8_0_bisect, refuse_under_run_report};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
@@ -49,8 +53,41 @@ use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts};
 /// rather than the dequant slab: more than one row, and a `k` that is a whole
 /// number of the staged activation tiles that arm needs ([`GROUPED_STAGE_ELEMS`],
 /// the shader's `BLK_ELEMS`, which is eight of this scheme's 32-element blocks).
+/// Both terms are exercised by the shape grid below — its k=384 cell is what pins
+/// the tile term, which is what keeps this falsifiable there — while the A/B
+/// block's grid, every cell of it on tile, states the literal it is left with.
 fn q8_0_byte_direct(m: usize, k: usize) -> bool {
     m > 1 && k.is_multiple_of(GROUPED_STAGE_ELEMS)
+}
+
+/// The shape grid's Q8_0 expectation is [`q8_0_byte_direct`], a restatement of the
+/// ladder's own shape terms — so it is checked against the ladder here: a term the
+/// ladder gains or drops without a matching line in that helper fails this, instead
+/// of leaving the grid's expectation to agree silently. Over every `m` this file's
+/// two Q8_0 grids drive (the shape grid's 1…192 and the A/B block's 1…1024) and
+/// every `k` they drive, plus a `k` below one staged tile that neither reaches.
+///
+/// Device-free — `select_path` reads no device — and the two constants are premises,
+/// not the grid's own values: 64 is a 16-aligned X window (what this scheme's grouped
+/// arm asks of it) and 4096 stands for the slab the plan books, which every grid cell
+/// has on-arena.
+#[test]
+fn the_q8_0_shape_expectation_agrees_with_the_ladder() {
+    let scheme = rlx_wgpu::gguf_host::gguf_scheme_id(QuantScheme::GgufQ8_0);
+    for m in [
+        1usize, 2, 4, 8, 13, 17, 64, 72, 96, 128, 192, 276, 512, 1024,
+    ] {
+        for k in [128usize, 256, 384, 512, 1024, 2048, 3072, 4096] {
+            let ladder = rlx_wgpu::gguf_gpu::select_path(m, k, scheme, 64, 4096)
+                == rlx_wgpu::gguf_gpu::DequantMatmulPath::GroupedDevice;
+            assert_eq!(
+                q8_0_byte_direct(m, k),
+                ladder,
+                "Q8_0 m={m} k={k}: the grid's expectation and the ladder's own answer \
+                 must agree"
+            );
+        }
+    }
 }
 
 /// Packed `w` and its row-major `x` for one `DequantMatMul`.
@@ -120,6 +157,17 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     }
 
     refuse_under_run_report();
+
+    // ... and out of the 8-bit scheme's bisect mode: this file's own A/B turns that
+    // lever on and off inside one bracket, and the bars either side of it are the
+    // shipped mode's.
+    refuse_under_q8_0_bisect();
+
+    // The one mode this binary's submission bars support, read once: the
+    // step-by-step lever (`RLX_WGPU_ONE_OP_PER_PASS`) makes the batch join inert,
+    // so a graph's steps submit one at a time instead of riding one submission.
+    // Read here so every bar below states the floor its own arrangement has.
+    let step_by_step = rlx_ir::env::flag("RLX_WGPU_ONE_OP_PER_PASS");
 
     // m == 1 keeps today's single-row path.
     let one = route_of(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 1);
@@ -650,10 +698,17 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             let _ = c.run(&[("x", &x)]);
 
             // The route each side takes, from this binary's own counters, and what
-            // each side's steps cost the device: the arm's multiply is one
-            // submission against the slab's dequant-then-`matmul_bt` pair, and the
-            // bracket also counts the output readback's own submission on both
-            // sides — hence the two-against-three it prints.
+            // each side's steps cost the device. The arm's side is now work the batch
+            // boundary *joins*: its multiply rides the graph's one submission, whose
+            // readback is encoded into the same command buffer, so one submission
+            // covers the whole forward pass. The lever's side is the refusal this
+            // whole arrangement exists to reach: the ladder reads no lever, so the
+            // same call is still admitted, the encode inside the batch declines, the
+            // boundary's tail submits that batch carrying no work for the call — one
+            // submission more than the arm's — and the run's own arm recomputes on the
+            // slab, whose `dequant_gguf` and `matmul_bt` submit again (hence the four
+            // against the one it prints, on an adapter that fuses the readback; a
+            // separate readback adds its own to both sides).
             reset_route_counts();
             reset_device_counts();
             let direct = c.run(&[("x", &x)]).remove(0);
@@ -670,7 +725,17 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             rlx_ir::env::unset("RLX_WGPU_Q8_0_GEMM_DISABLE");
             // Only the arm is lowered: a call with no slab behind it must not
             // change route with the switch either, so this is exact for both.
-            let direct_arm = q8_0_byte_direct(m, k);
+            //
+            // Every multi-row cell of this grid is admitted and the m=1 control is
+            // not, so the expectation is the ladder's one remaining term as a
+            // literal rather than a restatement of the terms that decide it here:
+            // each `k` in the grid is a whole number of `GROUPED_STAGE_ELEMS` (512,
+            // 1024, 3072, 4096), the planner aligns the X window, and the plan books
+            // this scheme's slab unconditionally — and this scheme has no one-row
+            // arm at all. A lane that stops being admitted at one of these shapes
+            // must re-point this literal deliberately; it fails the census below
+            // rather than skipping the block's own checks.
+            let direct_arm = m > 1;
             assert_eq!(
                 (a.grouped, a.scratch, b.grouped, b.scratch),
                 if direct_arm {
@@ -707,14 +772,26 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             );
 
             if direct_arm {
-                // The arm's own step boundary, which is the other half of leaving
-                // the slab: the multiply is one submission against the slab's
-                // dequant-then-`matmul_bt` pair, and the bracket counts the
-                // readback's own submission on both sides (so two against three).
+                // The refused call's own cost, which is the other half of leaving
+                // the slab. In the default arrangement the arm's multiply is joined
+                // into the graph's one submission, so the lever's side pays the
+                // batch submission the refused call leaves carrying no work for it,
+                // plus the slab's dequant-then-`matmul_bt` pair: at least three
+                // more than the arm's side. Under `RLX_WGPU_ONE_OP_PER_PASS` the
+                // join is inert and both sides are unjoined, so only that pair
+                // stands between them: at least one more. A separate readback adds
+                // its own to both sides, so each is a floor and not an equality.
+                let floor = if step_by_step { 1 } else { 3 };
+                let arrangement = if step_by_step {
+                    "step-by-step (`RLX_WGPU_ONE_OP_PER_PASS=1`)"
+                } else {
+                    "joined"
+                };
                 assert!(
-                    a_submits < b_submits,
-                    "Q8_0 m={m} k={k} n={n}: the arm must pay fewer submissions than \
-                     the slab, not {a_submits} against {b_submits}"
+                    b_submits >= a_submits + floor,
+                    "Q8_0 m={m} k={k} n={n}: in the {arrangement} arrangement the \
+                     refused call must cost at least {floor} submission(s) more than \
+                     the arm's {a_submits}, not {b_submits}"
                 );
                 // The arm's own values, against both references it has. The slab
                 // side is the same weight and inputs through the f32 path this

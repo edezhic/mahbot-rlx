@@ -9,14 +9,19 @@
 //! of the tiled K-quant arms' windowed route — the one-row arm, and the
 //! row-grouped GEMM it becomes above one row — is device-only work that belongs
 //! *inside* the enclosing run of device work: one submission per contiguous run,
-//! and none of its own.
+//! and none of its own. The 8-bit scheme's multi-row calls over whole staged tiles
+//! are that same kind of work, through the same grouped arm, once the ladder admits
+//! them.
 //!
-//! Seven brackets, each one forward pass between a counter reset and a read of
+//! Nine brackets, each one forward pass between a counter reset and a read of
 //! them. **1 — the join set**, `dq(Q4_K) → mm → dq(Q6_K) → rv → mm`, compiled at a
 //! bucket and run at one row of it: the join set is the tiled one-row arm's two
 //! schemes at **every row count** — the tiled one-row arm at one row and the
 //! row-grouped GEMM above it — while Q1_0 keeps its own arm, the 8-bit scheme's
-//! multi-row calls their scratch entry point, and the scratch route and the
+//! multi-row calls over whole staged tiles join through that same grouped arm (its
+//! off-tile and single-row forms keep the scratch entry point they had, and an
+//! admitted call whose grouped encode refuses falls through to the host arm, which
+//! recomputes it on the slab — brackets 8 and 9), and the scratch route and the
 //! single-row form answer as they did. So this graph covers it completely — the
 //! 4-bit half, the 6-bit half, and `rv`, an `Op::Reverse` on the last axis, the
 //! filler that consumes a uniform, bind-group *and* meta-buffer lane while staying
@@ -34,7 +39,27 @@
 //! again **1 and 1** against the same 5 and 4, and the pinned identity is that the
 //! joined and the unjoined run of the same executable are **bit-identical**
 //! element-wise: the mode changes the submission arrangement, not the route or the
-//! arithmetic. **2 — a host-adjacent graph**, device+host by construction, a
+//! arithmetic. **8 — the join set in the 8-bit scheme**: bracket 7's graph with
+//! Q8_0 on both multiplies, the scheme the grouped arm's refinement added to the
+//! join set. Its own block is 32 elements and the arm's admission asks for the
+//! kernel's 256-element staged tile, which `K` is a whole number of, so both
+//! multiplies are the joined grouped arm — the census `grouped = 2`, the counted
+//! pair again **1 and 1** against the same 5 and 4, and the same bit-identity
+//! against the unjoined run. The counts are the witness here and the census is not:
+//! the scratch entry point that took these calls before the arm reached this same
+//! grouped kernel and recorded this same `grouped = 2`, so only the pair and the
+//! identity tell the two arrangements apart. **9 — the refused admitted
+//! call**: bracket 4's fixture at `BUCKET` rows on the 8-bit scheme, with the
+//! arm's own bisect lever `RLX_WGPU_Q8_0_GEMM_DISABLE=1` (the ladder reads no
+//! lever — `select_path` still answers the grouped arm) beside
+//! `RLX_WGPU_CONCAT_HOST=1` + `RLX_WGPU_FORCE_HOST=1`: the call is still joined,
+//! the encode inside the batch refuses, the tail submits that batch carrying no
+//! work for the call, and the run's own arm recomputes on the f32 slab. One
+//! executable and one arena serve both legs of that A/B — **3 and 4** lever off
+//! against **6 and 5** lever on, the census `grouped = 1` then `scratch = 1`, and
+//! the lever-on leg still matching the CPU reference is what says the flush the
+//! boundary made before its (declined) encode carried the host step's deferred
+//! write, so the recompute read fresh data. **2 — a host-adjacent graph**, device+host by construction, a
 //! hosted call then a joined **row-grouped** K-quant multiply — above one row, so
 //! the batch carries the grouped arm — then another hosted call: **6 and 8**
 //! against 6 and 6 unjoined — so joining is not wait-neutral: it trades the
@@ -54,14 +79,16 @@
 //! The unjoined pairs are this same binary under `RLX_WGPU_ONE_OP_PER_PASS=1`,
 //! which is also what pins the join not reaching into the step-by-step path (that
 //! mode is inert by design). For brackets 2–5 that run reads exactly what the change
-//! removed (6/6, 2/2, 4/5, 3/4). Brackets 1, 6 and 7 are five-step device runs and
-//! that mode submits each of those steps, so they read 5/4 there, while the join
+//! removed (6/6, 2/2, 4/5, 3/4). Brackets 1, 6, 7 and 8 are five-step device runs
+//! and that mode submits each of those steps, so they read 5/4 there, while the join
 //! disabled with the counters in place reads 4/4 — the pair the join set's own gain
-//! is measured on. (Bracket 7 measures the unjoined leg in-process when the harness
-//! starts in the default mode; a harness already in that mode has it as the
-//! bracket's first run.)
+//! is measured on. (Brackets 7 and 8 measure the unjoined leg in-process when the
+//! harness starts in the default mode; a harness already in that mode has it as the
+//! bracket's first run.) Bracket 9 has no unjoined pair of that kind: its two legs
+//! are the lever's own A/B, and the step-by-step mode does not arrange them
+//! differently beyond leaving both unjoined (4 and 5, then 5 and 5).
 //!
-//! The `interleaved` graphs (1, 6 and 7) are all-device on both legs: the packed
+//! The `interleaved` graphs (1, 6, 7 and 8) are all-device on both legs: the packed
 //! route comes from shape and slab only, a dense matmul is hosted only by
 //! `RLX_WGPU_HOST_MATMUL` or a striped/unbindable arena, and `Reverse` only by
 //! `RLX_WGPU_FORCE_HOST` / sharding / a sharded arena — no adapter-kind term in
@@ -72,9 +99,11 @@
 //! the Vulkan cooperative-matrix f16 path, needs
 //! `RLX_WGPU_COOP_F16_VK_ENABLE` and an alignment these graphs lack. Brackets 2 and
 //! 3 are adapter-independent too: 2's host legs come from the ladder's shape-and-slab
-//! rule, and 3's arm refuses on the X window, not on the adapter. Brackets 4 and 5
+//! rule, and 3's arm refuses on the X window, not on the adapter. Brackets 4, 5 and 9
 //! are knob-scoped instead: their own `RLX_WGPU_CONCAT_HOST` / `RLX_WGPU_FORCE_HOST`
-//! / `RLX_WGPU_HOST_BUFFER_COPY` force the host step, but the steps around it are the
+//! / `RLX_WGPU_HOST_BUFFER_COPY` force the host step (9's the scheme's own bisect
+//! lever as well, which only lowers the grouped arm's encode), but the steps around
+//! it are the
 //! adapter's choice (`wgpu_prefer_structure_host` includes `coop_discrete_backend()`,
 //! true for any Vulkan or DX12 adapter), so their integers are asserted on a
 //! non-discrete adapter only — leg-independence is *not* claimed for them. Their
@@ -84,6 +113,9 @@
 //! flushes: removing the flush that carries the host step to the device (both
 //! sites for 4, the join block's own for 5) measures `max_abs` 5.70e1 and 5.45e1
 //! against the CPU reference, where the flush is in place the two read 7.63e-6.
+//! Bracket 9 reaches the same door with the call's work refused rather than
+//! encoded, so there the flush has to cover a recompute: its lever-on leg is a pin
+//! for the same reason, one step further along.
 //!
 //! `RLX_WGPU_SNAPSHOT=1` is rejected by the guard at the top: its replay runs the
 //! schedule once per prefix, so the readings stop meaning one forward pass. With
@@ -98,7 +130,7 @@
 
 mod common;
 
-use common::{RUN_REPORT_SWITCH, max_abs_diff};
+use common::{Q8_0_BISECT, RUN_REPORT_SWITCH, max_abs_diff};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, GraphExt, Op, Shape};
 use rlx_runtime::{Device, Session};
@@ -122,6 +154,14 @@ const HOST_K: usize = 384;
 /// (Q4_K, k a whole number of superblocks, m == 1).
 const TOL: f32 = 1e-2;
 
+/// The packed scheme a join fixture's multiplies carry: the tiled K-quants, the
+/// pair the join set was pinned on first, or the 8-bit scheme, which the grouped
+/// arm's refinement added to it.
+enum JoinScheme {
+    KQuant,
+    Q8_0,
+}
+
 /// Deterministic packed Q4_K bytes for a `[k, n]` weight.
 fn packed(k: usize, n: usize) -> Vec<u8> {
     common::packed_gguf_bytes(rlx_gguf::GgmlType::Q4K, k, n)
@@ -131,6 +171,13 @@ fn packed(k: usize, n: usize) -> Vec<u8> {
 /// Same 256-element superblock, so a graph may mix the two at one `K`.
 fn packed_q6k(k: usize, n: usize) -> Vec<u8> {
     common::packed_gguf_bytes(rlx_gguf::GgmlType::Q6K, k, n)
+}
+
+/// [`packed`] in the 8-bit scheme (Q8_0). Its own block is 32 elements, so a `K`
+/// that is a whole number of the grouped GEMM's 256-element staged tile — the
+/// term that arm's admission asks for — is a whole number of these blocks too.
+fn packed_q8_0(k: usize, n: usize) -> Vec<u8> {
+    common::packed_gguf_bytes(rlx_gguf::GgmlType::Q8_0, k, n)
 }
 
 /// Deterministic values for an `n`-element tensor or parameter.
@@ -155,14 +202,18 @@ fn interleaved(
     Vec<(&'static str, Vec<f32>)>,
     Vec<f32>,
 ) {
-    interleaved_n(m, N)
+    interleaved_n(JoinScheme::KQuant, m, N)
 }
 
 /// [`interleaved`] with the first packed multiply's output width set to `wide`
 /// (and its following dense weight to `[wide, K]`) — the join set's shape with a
-/// weight the route's window budget can split into column chunks.
+/// weight the route's window budget can split into column chunks — and both
+/// packed multiplies in `scheme`: the tiled K-quant pair, or Q8_0, which the
+/// grouped arm's refinement added to the join set (one `K` serves both, a whole
+/// number of the scheme's blocks and of that kernel's staged tile).
 #[allow(clippy::type_complexity)]
 fn interleaved_n(
+    scheme: JoinScheme,
     m: usize,
     wide: usize,
 ) -> (
@@ -171,10 +222,23 @@ fn interleaved_n(
     Vec<(&'static str, Vec<f32>)>,
     Vec<f32>,
 ) {
+    let (w1, w3, s1, s3) = match scheme {
+        JoinScheme::KQuant => (
+            packed(K, wide),
+            packed_q6k(K, N),
+            QuantScheme::GgufQ4K,
+            QuantScheme::GgufQ6K,
+        ),
+        JoinScheme::Q8_0 => (
+            packed_q8_0(K, wide),
+            packed_q8_0(K, N),
+            QuantScheme::GgufQ8_0,
+            QuantScheme::GgufQ8_0,
+        ),
+    };
     let mut g = Graph::new("wgpu_gguf_batch_join");
     let x = g.input("x", Shape::new(&[m, K], DType::F32));
-    let packed_params: Vec<(&'static str, Vec<u8>)> =
-        vec![("w1", packed(K, wide)), ("w3", packed_q6k(K, N))];
+    let packed_params: Vec<(&'static str, Vec<u8>)> = vec![("w1", w1), ("w3", w3)];
     let dense: Vec<(&'static str, Vec<f32>)> =
         vec![("p2", feed(wide * K, 0.017)), ("p4", feed(N * N, 0.019))];
     let w1 = g.param("w1", Shape::new(&[packed_params[0].1.len()], DType::U8));
@@ -182,17 +246,13 @@ fn interleaved_n(
     let p2 = g.param("p2", Shape::new(&[wide, K], DType::F32));
     let p4 = g.param("p4", Shape::new(&[N, N], DType::F32));
     let y1 = g.add_node(
-        Op::DequantMatMul {
-            scheme: QuantScheme::GgufQ4K,
-        },
+        Op::DequantMatMul { scheme: s1 },
         vec![x, w1],
         Shape::new(&[m, wide], DType::F32),
     );
     let h2 = g.mm(y1, p2);
     let y2 = g.add_node(
-        Op::DequantMatMul {
-            scheme: QuantScheme::GgufQ6K,
-        },
+        Op::DequantMatMul { scheme: s3 },
         vec![h2, w3],
         Shape::new(&[m, N], DType::F32),
     );
@@ -279,41 +339,54 @@ fn host_adjacent() -> (
 }
 
 /// `concat(x1, x2) → dq`, the X operand of the packed multiply produced by a host
-/// step: two `[1, 128]` graph inputs joined on the last axis to `[1, 256]` (a whole
-/// number of Q4_K superblocks) and contracted against a packed `[256, 64]` weight.
+/// step: two `[m, 128]` graph inputs joined on the last axis to `[m, 256]` — one
+/// Q4_K superblock, and eight Q8_0 blocks — and contracted against a packed
+/// `[256, 64]` weight.
 ///
 /// It is built to make the concat the host-classified step whose output is staged
 /// into the deferred host mirror (see the fourth bracket in the test) rather than
 /// written to the arena, so without the flush before the joined multiply the
 /// multiply reads the slot the host step never wrote.
-fn mirrored_x() -> (
+///
+/// `scheme`'s K-quant form is that one-row fixture, untouched; its Q8_0 form is
+/// `BUCKET` rows, because above one row is where the 8-bit scheme's grouped arm is
+/// what the ladder names — the shape the refusal bracket drives with the arm's own
+/// bisect lever.
+fn mirrored_x(
+    scheme: JoinScheme,
+) -> (
     Graph,
     Vec<(&'static str, Vec<u8>)>,
     Vec<(&'static str, Vec<f32>)>,
 ) {
     let half = K / 2;
+    let m = match scheme {
+        JoinScheme::KQuant => 1,
+        JoinScheme::Q8_0 => BUCKET,
+    };
+    let (bytes, quant) = match scheme {
+        JoinScheme::KQuant => (packed(K, N), QuantScheme::GgufQ4K),
+        JoinScheme::Q8_0 => (packed_q8_0(K, N), QuantScheme::GgufQ8_0),
+    };
     let mut g = Graph::new("wgpu_gguf_batch_join_host_mirror");
-    let x1 = g.input("x1", Shape::new(&[1, half], DType::F32));
-    let x2 = g.input("x2", Shape::new(&[1, half], DType::F32));
-    let bytes = packed(K, N);
+    let x1 = g.input("x1", Shape::new(&[m, half], DType::F32));
+    let x2 = g.input("x2", Shape::new(&[m, half], DType::F32));
     let w = g.param("w", Shape::new(&[bytes.len()], DType::U8));
     let c = g.add_node(
         Op::Concat { axis: 1 },
         vec![x1, x2],
-        Shape::new(&[1, K], DType::F32),
+        Shape::new(&[m, K], DType::F32),
     );
     let y = g.add_node(
-        Op::DequantMatMul {
-            scheme: QuantScheme::GgufQ4K,
-        },
+        Op::DequantMatMul { scheme: quant },
         vec![c, w],
-        Shape::new(&[1, N], DType::F32),
+        Shape::new(&[m, N], DType::F32),
     );
     g.set_outputs(vec![y]);
     (
         g,
         vec![("w", bytes)],
-        vec![("x1", feed(half, 0.023)), ("x2", feed(half, 0.041))],
+        vec![("x1", feed(m * half, 0.023)), ("x2", feed(m * half, 0.041))],
     )
 }
 
@@ -352,6 +425,137 @@ fn host_copied_x() -> (
     (g, vec![("w", bytes)], vec![("x", feed(K, 0.023))])
 }
 
+/// One bracket of the join set above one row: the fixture to compile and run, the
+/// scheme word that heads the lines it prints, and the wording that says what its
+/// integers and its route census mean.
+struct JoinCase {
+    /// This bracket's own word for the lines it prints — empty for the K-quant
+    /// bracket, `q8-0 ` for the 8-bit one — carried with its trailing space so that
+    /// one field composes every line and the two brackets stay distinguishable.
+    scheme: &'static str,
+    graph: Graph,
+    packed: Vec<(&'static str, Vec<u8>)>,
+    dense: Vec<(&'static str, Vec<f32>)>,
+    x: Vec<f32>,
+    /// Why the census reads `(0, 2, 0, 0)` at this bracket's row count.
+    census: &'static str,
+    /// Why the counted pair is bracket 1's in the same mode.
+    pair: &'static str,
+    /// Why the unjoined leg's census is still this bracket's.
+    unjoined_census: &'static str,
+    /// What the join removed from the unjoined leg's pair.
+    unjoined: &'static str,
+}
+
+/// The join set above one row, once per scheme: compile `case`'s fixture and run it
+/// **at the row count it was compiled at** (no `set_active_extent`), so both packed
+/// multiplies are above one row, take the row-grouped GEMM, and are joined by the
+/// enclosing batch. Reads the joined run's counters and census, then its `max_abs`
+/// against the CPU reference, and — unless the harness started in that mode —
+/// re-measures the unjoined leg in-process and pins the two outputs bit for bit.
+fn joined_above_one_row(case: JoinCase, bucket_expected: (u64, u64), step_by_step: bool) {
+    let JoinCase {
+        scheme,
+        graph,
+        packed,
+        dense,
+        x,
+        census,
+        pair,
+        unjoined_census,
+        unjoined,
+    } = case;
+    let mut exe = build(Device::Gpu, &graph, &packed, &dense);
+    let _ = exe.run(&[("x", &x)]).remove(0); // warm: pool + uniforms
+    reset_route_counts();
+    reset_device_counts();
+    let out = exe.run(&[("x", &x)]).remove(0);
+    let submits = device_submit_count();
+    let waits = device_wait_count();
+    let routes = route_counts();
+    eprintln!(
+        "[rlx-gguf-join] {scheme}grouped joined run: submits={submits} waits={waits} \
+         routes={routes:?}"
+    );
+    assert_eq!(
+        (routes.per_row, routes.grouped, routes.scratch, routes.host),
+        (0, 2, 0, 0),
+        "{census}: {routes:?}"
+    );
+    assert_eq!(
+        (submits, waits),
+        bucket_expected,
+        "{pair}; measured {submits} submission(s) and {waits} wait(s)"
+    );
+    let cpu = {
+        let mut c = build(Device::Cpu, &graph, &packed, &dense);
+        c.run(&[("x", &x)]).remove(0)
+    };
+    let max_abs = max_abs_diff(&out, &cpu);
+    eprintln!(
+        "[rlx-gguf-join] {scheme}grouped joined run vs CPU: max_abs={max_abs:.6e} \
+         (|out|~{:.3e})",
+        cpu.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    );
+    assert!(
+        max_abs <= TOL,
+        "{scheme}grouped joined run: max_abs {max_abs} > {TOL}"
+    );
+
+    // Pin (c) — joined vs unjoined, in this process: the mode changes how the work
+    // is submitted, not the route or the arithmetic. Running the same executable
+    // again under `RLX_WGPU_ONE_OP_PER_PASS=1` removes the join, so the pair gains
+    // the per-step submissions back (5 and 4) while the census is still the row
+    // count's, and the two outputs must agree bit for bit. A binary the harness
+    // already runs in that mode has the unjoined leg as its first run above, so the
+    // identity is then against that same route and there is nothing to re-measure.
+    if !step_by_step {
+        rlx_ir::env::set("RLX_WGPU_ONE_OP_PER_PASS", "1");
+        reset_route_counts();
+        reset_device_counts();
+        let unjoined_out = exe.run(&[("x", &x)]).remove(0);
+        let u_submits = device_submit_count();
+        let u_waits = device_wait_count();
+        let u_routes = route_counts();
+        // Unset only what this bracket set: a harness that started in that mode
+        // must keep it for the brackets after this one.
+        rlx_ir::env::unset("RLX_WGPU_ONE_OP_PER_PASS");
+        assert_eq!(
+            (u_submits, u_waits),
+            (5, 4),
+            "{unjoined}; measured {u_submits} submission(s), {u_waits} wait(s)"
+        );
+        assert_eq!(
+            (
+                u_routes.per_row,
+                u_routes.grouped,
+                u_routes.scratch,
+                u_routes.host
+            ),
+            (0, 2, 0, 0),
+            "{unjoined_census}: {u_routes:?}"
+        );
+        // Element-wise and bit for bit: the two runs are the same route at the same
+        // shapes, so the only difference the mode may make is which submissions
+        // carry the work.
+        let identity = max_abs_diff(&out, &unjoined_out);
+        eprintln!(
+            "[rlx-gguf-join] {scheme}joined vs unjoined identity: max_abs_diff={identity:.6e}"
+        );
+        common::assert_bit_identical(
+            &out,
+            &unjoined_out,
+            &format!("joined and unjoined {scheme}outputs must be bit-identical"),
+        );
+    } else {
+        eprintln!(
+            "[rlx-gguf-join] {scheme}grouped joined run: this harness is in \
+             RLX_WGPU_ONE_OP_PER_PASS=1, so the first run above IS the unjoined leg — \
+             nothing left to compare the join against here"
+        );
+    }
+}
+
 /// One test fn on purpose — see the module doc.
 #[test]
 fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_back() {
@@ -365,9 +569,10 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
     // moves this graph's routing/sharding, so the integers below would be
     // measuring another mode. `RLX_WGPU_ONE_OP_PER_PASS` is the one knob this pin
     // supports — it selects the unjoined expectation. `RLX_WGPU_CONCAT_HOST`,
-    // `RLX_WGPU_FORCE_HOST`, `RLX_WGPU_HOST_BUFFER_COPY` and
-    // `RLX_WGPU_MAX_BIND_MB` are set and unset inside their own brackets, below.
-    const GUARDED: [&str; 13] = [
+    // `RLX_WGPU_FORCE_HOST`, `RLX_WGPU_HOST_BUFFER_COPY`,
+    // `RLX_WGPU_MAX_BIND_MB` and the 8-bit scheme's bisect lever (whose own
+    // refusal leg is bracket 9) are set and unset inside their own brackets, below.
+    const GUARDED: [&str; 14] = [
         "RLX_WGPU_SNAPSHOT",
         "RLX_BENCH_DISPATCH_ONLY",
         "RLX_WGPU_ALL_PARAMS_WEIGHT",
@@ -381,6 +586,7 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
         "RLX_WGPU_SHARD_GPU",
         "RLX_WGPU_ALLOW_SHARD",
         RUN_REPORT_SWITCH,
+        Q8_0_BISECT,
     ];
     for key in GUARDED {
         assert!(
@@ -388,6 +594,12 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
             "{key} changes the submission/wait shape of a forward pass; unset it to run this pin"
         );
     }
+
+    // The counts of a knob-forced arrangement were measured on the unified-memory leg.
+    // A discrete adapter's own rule (`wgpu_prefer_structure_host` includes
+    // `coop_discrete_backend()`) can rewrite the steps around the forced-host one, so
+    // only the leg-independent facts are asserted there.
+    let measured_leg = !rlx_wgpu::device::coop_discrete_backend();
 
     // ── The join set: compiled at a bucket, run at one row ──────────────────
     // The expected integers, per mode. In the default mode the joined pair reads
@@ -512,7 +724,7 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
         "the widened weight must exceed the capped window: {wide} columns x 144 bytes \
          vs {bind_cap} bytes"
     );
-    let (wide_graph, wide_packed, wide_dense, wide_x) = interleaved_n(1, wide);
+    let (wide_graph, wide_packed, wide_dense, wide_x) = interleaved_n(JoinScheme::KQuant, 1, wide);
     rlx_ir::env::set("RLX_WGPU_MAX_BIND_MB", "1");
     let mut wexe = build(Device::Gpu, &wide_graph, &wide_packed, &wide_dense);
     let _ = wexe.run(&[("x", &wide_x)]).remove(0); // warm: pool + uniforms
@@ -568,100 +780,269 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
     // one-row arm. The counted pair is bracket 1's: joining is an arrangement of
     // submissions, so the row count does not move it.
     let (grp_graph, grp_packed, grp_dense, grp_x) = interleaved(BUCKET);
-    let mut grexe = build(Device::Gpu, &grp_graph, &grp_packed, &grp_dense);
-    let _ = grexe.run(&[("x", &grp_x)]).remove(0); // warm: pool + uniforms
-    reset_route_counts();
-    reset_device_counts();
-    let grouped_out = grexe.run(&[("x", &grp_x)]).remove(0);
-    let g_submits = device_submit_count();
-    let g_waits = device_wait_count();
-    let g_routes = route_counts();
-    eprintln!(
-        "[rlx-gguf-join] grouped joined run: submits={g_submits} waits={g_waits} \
-         routes={g_routes:?}"
+    joined_above_one_row(
+        JoinCase {
+            scheme: "",
+            graph: grp_graph,
+            packed: grp_packed,
+            dense: grp_dense,
+            x: grp_x,
+            census: "at the compiled row count both packed multiplies (Q4_K and Q6_K) are \
+                     above one row, so both take the row-grouped GEMM and both are joined",
+            pair: "the joined row-grouped multiplies ride the enclosing batch exactly as the \
+                   one-row arm does, so the pair is bracket 1's in the same mode",
+            unjoined_census: "the route is the row count's, not the mode's",
+            unjoined: "the join removed submits each of the graph's five device steps on its \
+                       own and waits four times",
+        },
+        bucket_expected,
+        step_by_step,
     );
+
+    // ── The 8-bit scheme's multi-row calls, joined ──────────────────────────
+    // Bracket 7's shape on the scheme the grouped arm's refinement added to the
+    // join set: a multi-row Q8_0 call over whole staged tiles is device-only work
+    // the boundary joins, where before that arm the scratch entry point took every
+    // such call. The admission's `k` term is the kernel's 256-element staged tile
+    // and not the scheme's own 32-element block, and `K` is a whole number of both
+    // — which is why one `K` serves the K-quant brackets and this one. The census
+    // cannot witness the join: it is recorded inside the encoder, and the scratch
+    // entry point took this same grouped arm for these calls before the change, so
+    // `grouped = 2` is what the route is and not what the arrangement is. The
+    // counted pair is that witness — bracket 1's in the same mode, against the 5
+    // and 4 the same executable reads with the join inert — and the identity
+    // against that unjoined run is the other half.
+    let (q8_graph, q8_packed, q8_dense, q8_x) = interleaved_n(JoinScheme::Q8_0, BUCKET, N);
+    // The arena does not grow — read as what it is: a plan identity, not a witness of
+    // the arrangement. The arena is sized by the planner alone, and the executable's is
+    // that plan plus the planner's fixed tail slack; read against the K-quant graph's
+    // identical term, the slack cancels and what the identity compares is the two plans.
+    // It pins that the admission's slab-booking term (`dequant_gguf_scratch_bytes`, a
+    // *plan* fact about the graph — the premise asserted below) is the only thing the
+    // 8-bit graph adds, and that the joined and the unjoined arrangement of the same
+    // calls add nothing beyond it. What it does NOT witness is the join: the plan knows
+    // nothing of the arrangement an encode takes, so it holds identically for both — the
+    // counted pair below and the identity against the unjoined run are what witness the
+    // join.
+    let q8_plan = rlx_compile::memory::plan_memory_f32_uniform(&q8_graph, 64).arena_size
+        + rlx_wgpu::gguf_gpu::dequant_gguf_scratch_bytes(&q8_graph);
+    let kq_arena = {
+        let (kq_graph, ..) = interleaved_n(JoinScheme::KQuant, BUCKET, N);
+        let kq_plan = rlx_compile::memory::plan_memory_f32_uniform(&kq_graph, 64).arena_size
+            + rlx_wgpu::gguf_gpu::dequant_gguf_scratch_bytes(&kq_graph);
+        WgpuExecutable::compile(kq_graph).test_arena_bytes() as i64 - kq_plan as i64
+    };
+    let q8_arena = WgpuExecutable::compile(q8_graph.clone()).test_arena_bytes();
+    eprintln!(
+        "[rlx-gguf-join] q8-0 arena: exe={q8_arena} B (plan {q8_plan} B, slack {} B) \
+         against the K-quant slack {kq_arena} B",
+        q8_arena as i64 - q8_plan as i64
+    );
+    // The premise that gives that identity its meaning: the plan really books this
+    // scheme's slab, or the arena comparison is vacuous.
+    assert!(
+        rlx_wgpu::gguf_gpu::dequant_gguf_scratch_bytes(&q8_graph) > 0,
+        "the 8-bit graph must book this scheme's slab in the plan — the admission's \
+         slab is a plan fact and the join a run-time arrangement of the encode over \
+         it, so neither arrangement may add an arena byte"
+    );
+    assert_eq!(
+        q8_arena as i64 - q8_plan as i64,
+        kq_arena,
+        "the 8-bit graph's arena beyond its own plan — the slab it books included — \
+         must be the same tail slack the K-quant graph reads: the admission and the \
+         join may add no arena bytes"
+    );
+    // Pin (c) again, for the scheme the refinement added: the mode changes how the
+    // work is submitted, not the route or the arithmetic.
+    joined_above_one_row(
+        JoinCase {
+            scheme: "q8-0 ",
+            graph: q8_graph,
+            packed: q8_packed,
+            dense: q8_dense,
+            x: q8_x,
+            census: "both Q8_0 multiplies are above one row over whole staged tiles, so both \
+                     take the row-grouped GEMM — the one route this scheme had for them before \
+                     the arm too, which is why the census cannot tell the arrangements apart",
+            pair: "the 8-bit scheme's joined multi-row calls ride the enclosing batch exactly \
+                   as the K-quant arms do, so the pair is bracket 1's in the same mode — and \
+                   this pair, not the census, is what witnesses the join",
+            unjoined_census: "the route is the scheme's and the row count's, not the mode's",
+            unjoined: "the join removed submits each of the graph's five device steps on its \
+                       own and waits four times, the 8-bit scheme's calls submitting through \
+                       the grouped entry point one at a time",
+        },
+        bucket_expected,
+        step_by_step,
+    );
+
+    // ── The refused admitted call: the grouped encode's own lever ────────────
+    // The ladder is device-free and reads no lever: `select_path`'s gates are the
+    // row count, `k`, the scheme, the slab and the X window's 16-alignment, and
+    // `RLX_WGPU_Q8_0_GEMM_DISABLE` is read inside the grouped *encoder* only (a
+    // lowering, as its comment there says). An admitted call can therefore be
+    // declined where its work is encoded, which is what this bracket pins from the
+    // outside: the run still joins the call at the batch boundary, the encode
+    // inside the batch refuses, the tail submits that batch carrying no work for
+    // the call, and the outer host dispatch then routes it to the entry point that
+    // owns its recompute — `run_dequant_matmul_gguf_gpu`, this scheme's own ladder,
+    // whose grouped arm declines too and whose f32 slab is behind it.
+    //
+    // One executable and one arena serve both legs of the A/B: the lever is read
+    // where the run routes, not at compile time, so the two sides differ only in
+    // the arrangement. The concat is the host step whose output goes into the
+    // deferred host mirror (bracket 4's fixture, at `BUCKET` rows because that is
+    // where the 8-bit scheme's grouped answer is the one the ladder names). The
+    // contract this bracket asserts is the drain — the pre-encode flush, then the
+    // batch's submission and its poll — and the mirror clear the host arm's tail
+    // does for this step (`DequantMatmulGguf` is not one of the cache-aware arms, so
+    // that tail drops the mirror after the arm's own recompute has run). Two of the
+    // three have a reading naming them: the flush is what the lever-on leg's
+    // `max_abs <= TOL` against the CPU reference witnesses, since a flush that had not
+    // carried the deferred write would leave the recompute below reading the slot the
+    // host step never wrote, and the drain is the one poll more the lever-on leg pays,
+    // `rd_waits - rj_waits == d_waits`, which is that tail's own poll. The mirror clear
+    // is the one with no counter of its own, and this fixture ends on the multiply, so
+    // nothing reads a mirror entry after it: it is named here rather than witnessed. A
+    // refused call changes only the batch's contents: the encode inside it declines, so
+    // the submission goes out carrying no work for the call — the census above is what
+    // says so, `grouped = 0` here where the joined leg reads `grouped = 1` — and the arm
+    // behind it recomputes on the f32 slab.
+    let (rq_graph, rq_packed, rq_dense) = mirrored_x(JoinScheme::Q8_0);
+    let rq_inputs: Vec<(&str, &[f32])> = rq_dense.iter().map(|(n, v)| (*n, v.as_slice())).collect();
+    let cpu_rq = {
+        let mut c = build(Device::Cpu, &rq_graph, &rq_packed, &rq_dense);
+        c.run(&rq_inputs).remove(0)
+    };
+    rlx_ir::env::set("RLX_WGPU_CONCAT_HOST", "1");
+    rlx_ir::env::set("RLX_WGPU_FORCE_HOST", "1");
+    let mut rqexe = WgpuExecutable::compile(rq_graph.clone());
+    for (name, bytes) in &rq_packed {
+        rqexe.set_param_bytes(name, bytes);
+    }
+    let rq_kinds = rqexe.step_kind_counts();
+    eprintln!("[rlx-gguf-join] refusal graph steps={rq_kinds:?}");
+    // The premise: X is produced by the host step, and by nothing else — at this
+    // row count too, which is what the flush before the (declined) encode has to
+    // carry.
     assert_eq!(
         (
-            g_routes.per_row,
-            g_routes.grouped,
-            g_routes.scratch,
-            g_routes.host
+            rq_kinds.get("concat_host").copied().unwrap_or(0),
+            rq_kinds.get("concat").copied().unwrap_or(0),
         ),
-        (0, 2, 0, 0),
-        "at the compiled row count both packed multiplies (Q4_K and Q6_K) are above \
-         one row, so both take the row-grouped GEMM and both are joined: {g_routes:?}"
+        (1, 0),
+        "the concat must be the host step whose deferred write the flush carries; \
+         schedule = {rq_kinds:?}"
+    );
+    // Both sides warmed before either is counted, and the ladder's admission read
+    // with the lever set: the term that could keep this call off the grouped arm is
+    // not in the ladder, so the refusal below is the encoder's and not the ladder's.
+    // The offset stands for this call's X window — any 16-aligned one answers the
+    // same, and 4096 is the slab the plan books.
+    let _ = rqexe.run(&rq_inputs);
+    rlx_ir::env::set("RLX_WGPU_Q8_0_GEMM_DISABLE", "1");
+    let _ = rqexe.run(&rq_inputs);
+    assert_eq!(
+        rlx_wgpu::gguf_gpu::select_path(
+            4,
+            K,
+            rlx_wgpu::gguf_host::gguf_scheme_id(QuantScheme::GgufQ8_0),
+            16,
+            4096
+        ),
+        rlx_wgpu::gguf_gpu::DequantMatmulPath::GroupedDevice,
+        "the 8-bit scheme's bisect lever is outside the ladder by construction, so \
+         an admitted call's encode can decline while the ladder still names the \
+         grouped arm"
+    );
+    rlx_ir::env::unset("RLX_WGPU_Q8_0_GEMM_DISABLE");
+    reset_route_counts();
+    reset_device_counts();
+    let rq_joined = rqexe.run(&rq_inputs).remove(0);
+    let rj_submits = device_submit_count();
+    let rj_waits = device_wait_count();
+    let rj_routes = route_counts();
+    rlx_ir::env::set("RLX_WGPU_Q8_0_GEMM_DISABLE", "1");
+    reset_route_counts();
+    reset_device_counts();
+    let rq_declined = rqexe.run(&rq_inputs).remove(0);
+    let rd_submits = device_submit_count();
+    let rd_waits = device_wait_count();
+    let rd_routes = route_counts();
+    rlx_ir::env::unset("RLX_WGPU_Q8_0_GEMM_DISABLE");
+    rlx_ir::env::unset("RLX_WGPU_FORCE_HOST");
+    rlx_ir::env::unset("RLX_WGPU_CONCAT_HOST");
+    eprintln!(
+        "[rlx-gguf-join] refusal: lever off submits={rj_submits} waits={rj_waits} \
+         routes={rj_routes:?}; lever on submits={rd_submits} waits={rd_waits} \
+         routes={rd_routes:?}"
     );
     assert_eq!(
-        (g_submits, g_waits),
-        bucket_expected,
-        "the joined row-grouped multiplies ride the enclosing batch exactly as the \
-         one-row arm does, so the pair is bracket 1's in the same mode; measured \
-         {g_submits} submission(s) and {g_waits} wait(s)"
+        (rj_routes.grouped, rj_routes.scratch, rj_routes.host),
+        (1, 0, 0),
+        "with the lever off the admitted call is the joined grouped one, and its \
+         census is the only one recorded: {rj_routes:?}"
     );
-    let cpu_grouped = {
-        let mut c = build(Device::Cpu, &grp_graph, &grp_packed, &grp_dense);
-        c.run(&[("x", &grp_x)]).remove(0)
-    };
-    let g_abs = max_abs_diff(&grouped_out, &cpu_grouped);
-    eprintln!(
-        "[rlx-gguf-join] grouped joined run vs CPU: max_abs={g_abs:.6e} \
-         (|out|~{:.3e})",
-        cpu_grouped.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+    assert_eq!(
+        (rd_routes.grouped, rd_routes.scratch, rd_routes.host),
+        (0, 1, 0),
+        "with the lever on the refused call recomputes on its slab — the route this \
+         shape took before the grouped arm — and nothing records the grouped one: \
+         {rd_routes:?}"
     );
-    assert!(g_abs <= TOL, "grouped joined run: max_abs {g_abs} > {TOL}");
-
-    // Pin (c) — joined vs unjoined, in this process: the mode changes how the work
-    // is submitted, not the route or the arithmetic. Running the same executable
-    // again under `RLX_WGPU_ONE_OP_PER_PASS=1` removes the join, so the pair gains
-    // the per-step submissions back (5 and 4) while the census is still the row
-    // count's, and the two outputs must agree bit for bit. A binary the harness
-    // already runs in that mode has the unjoined leg as its first run above, so the
-    // identity is then against that same route and there is nothing to re-measure.
-    if !step_by_step {
-        rlx_ir::env::set("RLX_WGPU_ONE_OP_PER_PASS", "1");
-        reset_route_counts();
-        reset_device_counts();
-        let unjoined_out = grexe.run(&[("x", &grp_x)]).remove(0);
-        let u_submits = device_submit_count();
-        let u_waits = device_wait_count();
-        let u_routes = route_counts();
-        // Unset only what this bracket set: a harness that started in that mode
-        // must keep it for the brackets after this one.
-        rlx_ir::env::unset("RLX_WGPU_ONE_OP_PER_PASS");
+    for (label, got) in [("lever off", &rq_joined), ("lever on", &rq_declined)] {
+        let max_abs = max_abs_diff(got, &cpu_rq);
+        eprintln!(
+            "[rlx-gguf-join] refusal {label} vs CPU: max_abs={max_abs:.6e} \
+             (|out|~{:.3e})",
+            cpu_rq.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+        );
+        assert!(max_abs <= TOL, "refusal {label}: max_abs {max_abs} > {TOL}");
+    }
+    assert!(
+        rq_declined.iter().fold(0.0f32, |m, v| m.max(v.abs())) > 0.0,
+        "the declined leg's output is all zeros"
+    );
+    if measured_leg {
+        // Reconciled by difference, as brackets 2–5 are. With the join in place the
+        // refused call costs the batch submission it leaves carrying no work for it,
+        // plus the slab route's own two — the `dequant_gguf` pass and the `matmul_bt`
+        // that follows it — and one poll more, which is not its own: five waits is
+        // what an unjoined arrangement of this fixture reads (bracket 4's K-quant
+        // form reads 5 with the join inert), so the refusal hands the call back the
+        // boundary poll the join had taken off it. With the mode inert neither leg is
+        // joined at all, so the whole difference is the two arms' own cost: the
+        // grouped arm's one submission against the slab's two — which is why the two
+        // modes' pairs differ by exactly the two submissions the arrangement moves,
+        // the emptied batch's and the grouped arm's own. That the emptied one carried
+        // nothing for the call is the census above, read against the lever-off leg's:
+        // `grouped = 0` here where the joined leg reads `grouped = 1`.
+        let (d_submits, d_waits) = if step_by_step { (1, 0) } else { (3, 1) };
         assert_eq!(
-            (u_submits, u_waits),
-            (5, 4),
-            "the join removed submits each of the graph's five device steps on its \
-             own and waits four times; measured {u_submits} submission(s), {u_waits} \
-             wait(s)"
+            rd_submits - rj_submits,
+            d_submits,
+            "the refused call costs the batch submission it leaves carrying no work \
+             for it plus the slab route's own two — three with the join in place, the \
+             slab's extra pass alone with it inert; measured {rd_submits} submission(s) \
+             lever on against {rj_submits} lever off, a difference of {}",
+            rd_submits as i64 - rj_submits as i64
         );
         assert_eq!(
-            (
-                u_routes.per_row,
-                u_routes.grouped,
-                u_routes.scratch,
-                u_routes.host
-            ),
-            (0, 2, 0, 0),
-            "the route is the row count's, not the mode's: {u_routes:?}"
+            rd_waits - rj_waits,
+            d_waits,
+            "the refused call pays one poll more than the joined one — the boundary \
+             poll a call that rides no batch costs, which is also what this fixture's \
+             unjoined arrangement reads — and nothing with the join inert, the two \
+             arms polling alike; measured {rd_waits} wait(s) lever on against \
+             {rj_waits} lever off, a difference of {}",
+            rd_waits as i64 - rj_waits as i64
         );
-        // Element-wise and bit for bit: the two runs are the same route at the same
-        // shapes, so the only difference the mode may make is which submissions
-        // carry the work.
-        let identity = max_abs_diff(&grouped_out, &unjoined_out);
-        eprintln!("[rlx-gguf-join] joined vs unjoined identity: max_abs_diff={identity:.6e}");
-        for (i, (a, b)) in grouped_out.iter().zip(&unjoined_out).enumerate() {
-            assert!(
-                a.to_bits() == b.to_bits(),
-                "joined and unjoined outputs must be bit-identical — element {i} reads \
-                 {a} joined vs {b} unjoined (max_abs_diff {identity})"
-            );
-        }
     } else {
         eprintln!(
-            "[rlx-gguf-join] grouped joined run: this harness is in \
-             RLX_WGPU_ONE_OP_PER_PASS=1, so the first run above IS the unjoined leg — \
-             nothing left to compare the join against here"
+            "[rlx-gguf-join] refusal: submits lever off={rj_submits} lever on=\
+             {rd_submits}, waits lever off={rj_waits} lever on={rd_waits} \
+             (counts not asserted on this adapter leg)"
         );
     }
 
@@ -752,6 +1133,7 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
     arena.write_bytes_range(&dev.queue, w_off, &d_bytes);
     reset_route_counts();
     reset_device_counts();
+    // The counters below are this bracket's claim, not the ladder's answer.
     rlx_wgpu::gguf_gpu::run_dequant_matmul_gguf_gemv_rows(
         &arena,
         &dev.device,
@@ -784,12 +1166,6 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
          {d_submits} submission(s), {d_waits} wait(s)"
     );
 
-    // The counts of a knob-forced arrangement were measured on the unified-memory leg.
-    // A discrete adapter's own rule (`wgpu_prefer_structure_host` includes
-    // `coop_discrete_backend()`) can rewrite the steps around the forced-host one, so
-    // only the leg-independent facts are asserted there.
-    let measured_leg = !rlx_wgpu::device::coop_discrete_backend();
-
     // ── The host mirror flushed before joined device work ───────────────────
     // The concat below is the host-classified step whose output goes into the
     // deferred host mirror instead of the arena (its arm stages through the host
@@ -802,7 +1178,7 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
     // `RLX_WGPU_FORCE_HOST=1` — the crate's own lever for host structural steps on
     // any adapter, the one `structure_host_operand_fit.rs` drives `ConcatHost`
     // with.
-    let (mir_graph, mir_packed, mir_dense) = mirrored_x();
+    let (mir_graph, mir_packed, mir_dense) = mirrored_x(JoinScheme::KQuant);
     let mir_inputs: Vec<(&str, &[f32])> =
         mir_dense.iter().map(|(n, v)| (*n, v.as_slice())).collect();
     let cpu_mir = {

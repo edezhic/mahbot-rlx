@@ -79,14 +79,21 @@ impl WgpuExecutable {
     /// That is the route ladder's own answer for the call — the two device-only
     /// [`crate::gguf_gpu::DequantMatmulPath`]s, whose entry point
     /// [`crate::gguf_gpu::encode_dequant_matmul_gguf_into`] can be handed a caller's
-    /// encoder and which reach no host route at all: the tiled K-quant arm at one
-    /// row ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`]) and the
-    /// row-grouped K-quant GEMM above it
-    /// ([`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]). Whether this *run*
+    /// encoder: the tiled K-quant arm at one row
+    /// ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`]) and the row-grouped
+    /// GEMM above it
+    /// ([`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]), which carries the
+    /// tiled K-quants' multi-row calls and Q8_0's. Whether this *run*
     /// batches at all is the caller's business — the step-by-step and snapshot
     /// modes keep one operation per submission on purpose
     /// (`RLX_WGPU_ONE_OP_PER_PASS`, and the snapshot stops between steps), so both of
     /// them apply that mode to this answer rather than fold it in here.
+    ///
+    /// The answer is the ladder's, not the encode's: such a call can still be
+    /// carried into an encode that refuses it — for Q8_0, whose ladder has no
+    /// per-row loop, the refusal is recomputed by the entry point that owns it,
+    /// [`crate::gguf_host`] included where a sharded arena or a parked weight lands
+    /// it there — and the join branch owns that refusal (see its comment).
     ///
     /// `scale` is the step arm's own active-extent scaling, so the answer is for the
     /// row count in use, not the compiled one. A false answer is conservative: it
@@ -151,8 +158,9 @@ impl WgpuExecutable {
     ///   bind-group or meta-buffer slot, so no later step's index moves), the pass
     ///   loop's `break` on a host step and its two `static_once` skips, the final
     ///   mirror flush, the host route's own readback and drain, `bypasses_host_cache`
-    ///   (a joined call never reaches it — the join consumes it first), and the
-    ///   `RLX_WGPU_DBG_COUNTERS` census.
+    ///   (a call the join consumed never reaches it, but one whose encode refused it
+    ///   does — `DequantMatmulGguf` is not a cache-aware arm, so that tail drops the
+    ///   mirror after the refusal's recompute), and the `RLX_WGPU_DBG_COUNTERS` census.
     fn step_breaks_batch(
         &self,
         step_i: usize,
@@ -3587,15 +3595,16 @@ impl WgpuExecutable {
                         crate::backend::note_device_wait();
                         let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                     }
-                    // The admission is the ladder's device-only answers, so a
-                    // refusal is unreachable for an admitted shape: it takes a scheme
-                    // with no per-row branch, see `encode_dequant_matmul_gguf_into`'s
-                    // doc. It is still never run past — an unencoded call leaves
-                    // `step_i` where it is, so this iteration's tail submits the batch
-                    // and the outer host dispatch then sees a step
-                    // `step_runs_on_host` answers true for and runs its own arm, the
-                    // same ladder and guards, on an arena that submission has made
-                    // coherent.
+                    // The admission is the ladder's device-only answers, and the call
+                    // can still be refused here: the encode's gates read arena, adapter
+                    // and lever facts a device-free ladder cannot see (see
+                    // [`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]). The refusal
+                    // is not run past — an unencoded call leaves `step_i` where it is,
+                    // so this iteration's tail submits the batch and the outer host
+                    // dispatch then runs its own arm on an arena that submission has made
+                    // coherent, handing the refusal to the entry point that owns its
+                    // recompute. The mirror this batch may have been carrying was flushed
+                    // by the block above, the same door a plain device step goes through.
                     let encoded = crate::gguf_gpu::encode_dequant_matmul_gguf_into(
                         &self.arena,
                         &dev.device,
@@ -3656,14 +3665,15 @@ impl WgpuExecutable {
                     continue;
                 }
                 // `step_runs_on_host` on purpose, not `step_breaks_batch`: the two
-                // agree here. A joined call never reaches this site (the branch above
-                // consumed it), and neither does the widened tail-host term change the
-                // answer — `step_needs_pass_flush` has no arm for a tail-host step kind
-                // and is false for every `DequantMatmulGguf` arm, so the drain is off
-                // under both predicates. A *joined copy* can be the `prev` step this
-                // reads: on a Vulkan/DX12-class adapter that arm then asks for the
-                // drain, which stands in for the boundary the copy's own submission
-                // used to provide (see `step_breaks_batch`'s doc).
+                // agree here. A call the join branch consumed never reaches this site;
+                // one whose encode refused it does, and both predicates answer false
+                // for it — its own step is host-classified, and `step_needs_pass_flush`
+                // has no arm for a tail-host step kind and is false for every
+                // `DequantMatmulGguf` arm, so no drain is asked for here either way. A
+                // *joined copy* can be the `prev` step this reads: on a Vulkan/DX12-class
+                // adapter that arm then asks for the drain, which stands in for the
+                // boundary the copy's own submission used to provide (see
+                // `step_breaks_batch`'s doc).
                 let needs_f16_drain = step_i < self.schedule.len()
                     && !step_runs_on_host(&self.schedule[step_i])
                     && step_i > 0
@@ -4081,27 +4091,61 @@ impl WgpuExecutable {
                     //   whose X window the guard refuses — gemv_rows' own check of
                     //   that guard hands it to gguf_host (`Host`), never to a device
                     //   arm.
-                    // - The scratch arm: the fused entry point's own ladder — the
-                    //   row-grouped GEMM for a multi-row scheme with no one-row arm
-                    //   (Q8_0), else an in-arena f32 slab then `matmul_bt` (`gemv`
+                    // - The scratch arm: an in-arena f32 slab then `matmul_bt` (`gemv`
                     //   schemes are handed back to the per-row loop above, so a slab
-                    //   can still record PerRow). A scheme whose flat pack is
-                    //   block-linear over n·k needs k a whole number of blocks to
-                    //   slice rows; unaligned k there used to force the host
-                    //   D2H/H2D fallback for *all* m>1.
-                    match crate::gguf_gpu::select_path(
+                    //   can still record PerRow), and the host route that entry point
+                    //   short-circuits a sharded arena or a parked weight to. Its
+                    //   grouped arm applies the very gates the ladder's admission did,
+                    //   so a call the ladder kept out of `GroupedDevice` that way lands
+                    //   on the slab and not on that arm. A scheme whose flat pack
+                    //   is block-linear over n·k needs k a whole number of blocks to
+                    //   slice rows; unaligned k there used to force the host D2H/H2D
+                    //   fallback for *all* m>1.
+                    //
+                    // The device answers honour the encode's answer: a call the fused
+                    // entry point cannot encode — Q8_0's grouped arm, its ladder having
+                    // no per-row loop for a scheme outside `gemv_supports_scheme` —
+                    // falls to the scratch arm's entry point, which owns its recompute.
+                    // So a call the boundary joined reaches this arm exactly when its
+                    // encode refused it, or when the run does not batch at all
+                    // (one-op-per-pass, the snapshot).
+                    let path = crate::gguf_gpu::select_path(
                         mm,
                         kk,
                         *scheme_id,
                         *x_byte_off as usize,
                         self.dequant_scratch_off,
-                    ) {
-                        // Joined when the batch boundary could take it; the arm
-                        // is the unjoined fallback (one-op-per-pass, snapshot).
-                        crate::gguf_gpu::DequantMatmulPath::OneRowDevice
-                        | crate::gguf_gpu::DequantMatmulPath::GroupedDevice
-                        | crate::gguf_gpu::DequantMatmulPath::FusedArm => {
-                            crate::gguf_gpu::run_dequant_matmul_gguf_gemv_rows(
+                    );
+                    if path == crate::gguf_gpu::DequantMatmulPath::Host {
+                        crate::gguf_gpu::note_route(crate::gguf_gpu::DequantMatmulRoute::Host);
+                        crate::gguf_host::run_dequant_matmul_gguf(
+                            &self.arena,
+                            &dev.device,
+                            &dev.queue,
+                            mm,
+                            kk,
+                            nn,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *out_byte_off as usize,
+                        );
+                    } else {
+                        // A scratch answer names the scratch entry point, so it is not
+                        // tried in the fused one: that entry point owns the route for
+                        // every shape this ladder sends to it, and its `is_sharded` /
+                        // `is_weight_off` short-circuits are the reason it must see them
+                        // — they stand in front of the per-row loop it delegates to. A
+                        // scratch answer is any call the gates above keep out of the two
+                        // device arms with a slab booked: a single row of a scheme the
+                        // fused entry point does not serve, a contraction that is not a
+                        // whole number of the scheme's blocks or of the grouped kernel's
+                        // staged tile, a multi-row call of a scheme neither arm serves,
+                        // and an X window the grouped GEMM's `vec4` reads cannot address.
+                        // Everything else is tried in the fused entry point, and one it
+                        // does not run falls to the same recompute below.
+                        let ran = path != crate::gguf_gpu::DequantMatmulPath::ScratchArm
+                            && crate::gguf_gpu::run_dequant_matmul_gguf_gemv_rows(
                                 &self.arena,
                                 &dev.device,
                                 &dev.queue,
@@ -4114,8 +4158,7 @@ impl WgpuExecutable {
                                 *out_byte_off as usize,
                                 &mut report.marks(),
                             );
-                        }
-                        crate::gguf_gpu::DequantMatmulPath::ScratchArm => {
+                        if !ran {
                             crate::gguf_gpu::run_dequant_matmul_gguf_gpu(
                                 &self.arena,
                                 &dev.device,
@@ -4129,21 +4172,6 @@ impl WgpuExecutable {
                                 self.dequant_scratch_off,
                                 *out_byte_off as usize,
                                 &mut report.marks(),
-                            );
-                        }
-                        crate::gguf_gpu::DequantMatmulPath::Host => {
-                            crate::gguf_gpu::note_route(crate::gguf_gpu::DequantMatmulRoute::Host);
-                            crate::gguf_host::run_dequant_matmul_gguf(
-                                &self.arena,
-                                &dev.device,
-                                &dev.queue,
-                                mm,
-                                kk,
-                                nn,
-                                *scheme_id,
-                                *x_byte_off as usize,
-                                *w_byte_off as usize,
-                                *out_byte_off as usize,
                             );
                         }
                     }

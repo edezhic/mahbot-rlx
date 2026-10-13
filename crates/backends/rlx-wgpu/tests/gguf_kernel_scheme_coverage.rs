@@ -254,17 +254,28 @@ fn the_one_row_device_guard_requires_a_vec4_addressable_x_window() {
 
 /// The route ladder's answer, pinned device-free. The batch boundary joins
 /// exactly on [`rlx_wgpu::gguf_gpu::DequantMatmulPath::is_provably_device_only`],
-/// so that predicate must be an *exact* test of the two caller-encodable K-quant
-/// arms: the tiled one-row arm
-/// ([`rlx_wgpu::gguf_gpu::DequantMatmulPath::OneRowDevice`]) and, above one row,
-/// the row-grouped GEMM
-/// ([`rlx_wgpu::gguf_gpu::DequantMatmulPath::GroupedDevice`]) — the same windowed
-/// entry point at the row count the run encodes it at. It has to compose the arm's
-/// own X-window addressability guard (`gemv_one_row_device_ok`), so a window the
-/// arm's `vec4` reads cannot address stays out; Q1_0 passes that guard (its arm
-/// reads X a scalar at a time) but has no tiled branch, so it must not be admitted
-/// either — joining it would encode work the tiled kernel cannot read, and the
-/// batch boundary would have handed it a submission instead of the host.
+/// so that predicate must be an *exact* test of the ladder's device-only answers:
+/// the tiled K-quant one-row arm
+/// ([`rlx_wgpu::gguf_gpu::DequantMatmulPath::OneRowDevice`]), the row-grouped GEMM
+/// above it, which the same windowed entry point reaches at the row count the run
+/// encodes it at
+/// ([`rlx_wgpu::gguf_gpu::DequantMatmulPath::GroupedDevice`]), and — new for the
+/// 8-bit scheme — that scheme's multi-row grouped arm. The last is a refinement of
+/// the slab answer that scheme used to get: it is admitted on the grouped GEMM's
+/// staged tile
+/// ([`rlx_wgpu::gguf_gpu::GROUPED_STAGE_ELEMS`], eight of Q8_0's own 32-element
+/// blocks rather than one of them, so the tile and not the scheme's block is the
+/// gate) and on the shared `vec4` X-window guard that kernel's encoder applies,
+/// which the ladder restates device-free. Every other call keeps exactly the answer
+/// it had — the scheme's slab when a slab was booked, the host when none was — so
+/// the negative cases below are half of this claim and are pinned too.
+///
+/// It has to compose the arm's own X-window addressability guard
+/// (`gemv_one_row_device_ok`), so a window the arm's `vec4` reads cannot address
+/// stays out; Q1_0 passes that guard (its arm reads X a scalar at a time) but has
+/// no tiled branch, so it must not be admitted either — joining it would encode
+/// work the tiled kernel cannot read, and the batch boundary would have handed it
+/// a submission instead of the host.
 ///
 /// The ladder is also deliberately pure: it records nothing, so asking it what
 /// the route will be does not perturb [`rlx_wgpu::gguf_gpu::route_counts`].
@@ -383,30 +394,110 @@ fn select_path_is_exact_for_the_joined_device_arms() {
         );
     }
 
-    // A scheme with no fused kernel is scratch / host at every row count. Q8_0 has
-    // one arm inside the scratch entry point — the row-grouped GEMM at `m > 1` with
-    // a staged-tile-aligned `k` — but that is the entry point's own choice, not
-    // this selector's answer, so it is pinned by the route census in
-    // `gguf_matmul_route.rs` and not here. One row takes the slab rather than a
-    // per-row GEMV for both schemes, and that is the whole of this test's claim.
-    for (name, scheme) in [
-        ("Q5_0", rlx_ir::quant::QuantScheme::GgufQ5_0),
-        ("Q8_0", rlx_ir::quant::QuantScheme::GgufQ8_0),
-    ] {
-        let id = rlx_wgpu::gguf_host::gguf_scheme_id(scheme);
-        for m in [1usize, 4] {
+    // The 8-bit scheme (Q8_0, 20) is the refinement's own case. It has no fused
+    // kernel, so above one row it used to take its slab for every call; it is now
+    // the device-only grouped arm whenever all four gates hold — the plan booked the
+    // slab, more than one row, a whole number of the grouped GEMM's staged tiles,
+    // and an X window that kernel's `vec4` reads can address.
+    let q8_0 = rlx_wgpu::gguf_host::gguf_scheme_id(rlx_ir::quant::QuantScheme::GgufQ8_0);
+    for k in [rlx_wgpu::gguf_gpu::GROUPED_STAGE_ELEMS, 2048] {
+        for m in [2usize, 4, 13] {
             assert_eq!(
-                select_path(m, 256, id, 64, 4096),
-                DequantMatmulPath::ScratchArm,
-                "{name} (id {id}) m={m}: no fused kernel, so a booked slab means scratch"
-            );
-            assert_eq!(
-                select_path(m, 256, id, 64, 0),
-                DequantMatmulPath::Host,
-                "{name} (id {id}) m={m}: no fused kernel and no slab, so the host"
+                select_path(m, k, q8_0, 64, 4096),
+                DequantMatmulPath::GroupedDevice,
+                "Q8_0 (id {q8_0}) m={m} k={k} with a slab: a multi-row call over \
+                 whole staged tiles (the kernel's 256-element tile, not the \
+                 scheme's own 32-element block) with a `vec4`-addressable X window \
+                 is device-only and must join the enclosing batch"
             );
         }
     }
+
+    // Each gate has its own negative. An off-tile contraction: 384 is 12 whole
+    // 32-element Q8_0 blocks — the scheme's own block is *not* the gate — but not a
+    // whole staged tile, and neither is one block past a whole tile.
+    assert_eq!(
+        select_path(4, 384, q8_0, 64, 4096),
+        DequantMatmulPath::ScratchArm,
+        "Q8_0 (id {q8_0}) m=4 k=384 with a slab: 12 whole Q8_0 blocks is not a whole \
+         staged tile, so the slab stands — the grouped kernel's own `k` gate is the \
+         term, not the scheme's block"
+    );
+    assert_eq!(
+        select_path(
+            4,
+            rlx_wgpu::gguf_gpu::GROUPED_STAGE_ELEMS + 32,
+            q8_0,
+            64,
+            4096
+        ),
+        DequantMatmulPath::ScratchArm,
+        "Q8_0 (id {q8_0}) m=4 k=one staged tile + 32 with a slab: a block past a \
+         whole tile is still off-tile"
+    );
+    // A window the grouped kernel's `vec4` X read cannot address ...
+    assert_eq!(
+        select_path(4, 256, q8_0, 4, 4096),
+        DequantMatmulPath::ScratchArm,
+        "Q8_0 (id {q8_0}) m=4 with a 4-byte-aligned X window and a slab: the grouped \
+         kernel reads X as `vec4`, so the slab stands"
+    );
+    // ... no slab to dequantize into ...
+    assert_eq!(
+        select_path(4, 256, q8_0, 64, 0),
+        DequantMatmulPath::Host,
+        "Q8_0 (id {q8_0}) m=4 with no slab: nothing to dequantize into, so the host"
+    );
+    // ... one row, the 8-bit scheme having no one-row device arm at all, so its
+    // single-row form is untouched by the refinement ...
+    assert_eq!(
+        select_path(1, 256, q8_0, 64, 4096),
+        DequantMatmulPath::ScratchArm,
+        "Q8_0 (id {q8_0}) m=1 with a slab: the 8-bit scheme has no grouped kernel at \
+         one row, so the slab stands"
+    );
+    // ... and a row count of zero, which is not above one row either.
+    assert_eq!(
+        select_path(0, 256, q8_0, 64, 4096),
+        DequantMatmulPath::ScratchArm,
+        "Q8_0 (id {q8_0}) m=0 with a slab: a row count of zero is not `m > 1`, so the \
+         slab stands"
+    );
+
+    // Q5_0 (22) is the out-of-scope control: no fused kernel and no grouped kernel
+    // at any row count, so its slab / host answer is exactly what it was.
+    let q5_0 = rlx_wgpu::gguf_host::gguf_scheme_id(rlx_ir::quant::QuantScheme::GgufQ5_0);
+    for m in [1usize, 4] {
+        assert_eq!(
+            select_path(m, 256, q5_0, 64, 4096),
+            DequantMatmulPath::ScratchArm,
+            "Q5_0 (id {q5_0}) m={m}: no fused and no grouped kernel, so a booked slab \
+             means scratch"
+        );
+        assert_eq!(
+            select_path(m, 256, q5_0, 64, 0),
+            DequantMatmulPath::Host,
+            "Q5_0 (id {q5_0}) m={m}: no kernel at all and no slab, so the host"
+        );
+    }
+
+    // The pin on what that one list says, by value, and over the whole id range
+    // rather than only the ids the `fused` term leaves to this admission: for Q4_K
+    // and Q6_K that term answers the grouped arm first, so a per-call reading of the
+    // ladder could not see them at all. `grouped_scheme_supported` is the kernel set
+    // read without a device, and `select_path`'s multi-row admission is its one
+    // caller — so the set is named here rather than read back from the predicate. It
+    // must stay Q4_K, Q6_K and Q8_0; a scheme added to or dropped from that list has
+    // to re-point this expectation deliberately.
+    const GROUPED: [u32; 3] = [0, 2, 20]; // Q4_K, Q6_K, Q8_0
+    let supported: Vec<u32> = (0u32..=64)
+        .filter(|id| rlx_wgpu::gguf_gpu::grouped_scheme_supported(*id))
+        .collect();
+    assert_eq!(
+        supported, GROUPED,
+        "the row-grouped GEMM's scheme list must be exactly {GROUPED:?} — a scheme \
+         added to or dropped from it has to re-point this pin deliberately"
+    );
 
     // A K-quant at one row with a window the arm's `vec4` X read cannot address
     // must not be joined either — the fused entry point refuses it and records the
@@ -437,6 +528,19 @@ fn select_path_is_exact_for_the_joined_device_arms() {
         rlx_ir::quant::QuantScheme::GgufQ6K.gguf_block_size() as usize,
         rlx_wgpu::gguf_gpu::GROUPED_STAGE_ELEMS,
         "Q6_K's packing block must be the grouped GEMM's staged tile"
+    );
+    // The 8-bit scheme's own block is deliberately *not* that tile, and the tile is
+    // eight of it: that is why the tile, not the block, is the refinement's `k` gate
+    // for this scheme — a whole number of its blocks can still be off-tile.
+    assert_eq!(
+        rlx_ir::quant::QuantScheme::GgufQ8_0.gguf_block_size(),
+        32,
+        "Q8_0's own packing block"
+    );
+    assert_eq!(
+        rlx_wgpu::gguf_gpu::GROUPED_STAGE_ELEMS,
+        8 * rlx_ir::quant::QuantScheme::GgufQ8_0.gguf_block_size() as usize,
+        "the grouped GEMM's staged tile is eight Q8_0 blocks"
     );
 
     // The selector is pure by construction; the route census it is checked
