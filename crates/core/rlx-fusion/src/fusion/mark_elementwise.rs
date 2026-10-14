@@ -45,10 +45,14 @@ impl Pass for MarkElementwiseRegions {
         // Predicate: does this op qualify for chain inclusion? Newer scalar
         // activations (`Activation::region_fusable() == false`) stay on the
         // standalone kernel path — the fused-region kernels don't carry their
-        // opcodes yet.
+        // opcodes yet. That predicate is shared by every backend, so it cannot speak
+        // for one backend's fused-region kernel; the kernel-keyed judgement is
+        // consulted on top of it (`crate::region_kernel`).
         let chain_eligible = |op: &Op| -> bool {
             match op {
-                Op::Activation(a) => a.region_fusable(),
+                Op::Activation(a) => {
+                    a.region_fusable() && crate::region_kernel::region_kernel_honours_activation(*a)
+                }
                 Op::Binary(b) => b.region_fusable(),
                 Op::Cast { .. } | Op::Compare(_) | Op::Where => true,
                 _ => false,

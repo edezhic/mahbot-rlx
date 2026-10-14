@@ -190,7 +190,12 @@ pub struct FuseRegionPrologue;
 /// Unary ops that can close a resize prologue region (one input, same shape as output).
 fn unary_region_step_from_op(graph: &Graph, node: &rlx_ir::Node) -> Option<ChainStep> {
     match &node.op {
-        Op::Activation(a) => Some(ChainStep::Activation(*a, ChainOperand::Input(0))),
+        // Such a step must never join a region: the kernel in force would compute it
+        // as its own input (`rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS`).
+        Op::Activation(a) if crate::region_kernel::region_kernel_honours_activation(*a) => {
+            Some(ChainStep::Activation(*a, ChainOperand::Input(0)))
+        }
+        Op::Activation(_) => None,
         Op::Cast { to } => {
             let in_dt = graph.shape(node.inputs[0]).dtype();
             if *to == in_dt {
@@ -388,6 +393,11 @@ fn region_signature(op: &Op) -> Option<RegionSignature> {
     else {
         return None;
     };
+    // The `BatchElementwiseRegion` a merge would build is lowered by the same region
+    // kernel, so a chain it has no arm for is not a merge candidate.
+    if !crate::region_kernel::region_kernel_honours_chain(chain) {
+        return None;
+    }
     Some(RegionSignature {
         chain_len: chain.len(),
         num_inputs: *num_inputs,
@@ -1249,5 +1259,236 @@ mod tests {
                 .any(|n| matches!(n.op, Op::ResizeNearest2x)),
             "resize should be folded into prologue"
         );
+    }
+
+    // ── The kernel-keyed activation judgement, at every formation site ────
+    //
+    // The passes cannot name the kernel that will run their regions, so the compile
+    // pipeline installs its activation-code set around them (`crate::region_kernel`,
+    // which lists the sites it must be consulted from). These tests pin each site's
+    // consultation, and that a code the kernel would run as its own input is therefore
+    // never closed into a region.
+
+    /// `Relu`'s code in `activation_sub` numbering, and the only code these tests
+    /// declare. Small and explicit on purpose: what is under test is the consultation,
+    /// not any one backend's kernel.
+    const KERNEL_SUBS: &[u32] = &[3];
+
+    /// One formation check, both halves: with [`KERNEL_SUBS`] installed the shape must
+    /// not form the region `forms` looks for, and with no judgement installed the very
+    /// same shape *must* form one. The second half is what makes the first a statement
+    /// about the consultation rather than about the shape.
+    fn assert_the_judgement_decides(
+        shape: &str,
+        build: impl Fn() -> Graph,
+        form: impl Fn(Graph) -> Graph,
+        forms: impl Fn(&Graph) -> bool,
+    ) {
+        let with_judgement =
+            crate::region_kernel::with_region_kernel_activation_subs(Some(KERNEL_SUBS), || {
+                form(build())
+            });
+        assert!(
+            !forms(&with_judgement),
+            "with the judgement installed, {shape} must not form the region it would \
+             compute as its own input"
+        );
+        assert!(
+            forms(&form(build())),
+            "without the judgement the same {shape} still forms its region — otherwise \
+             the check above would be about the shape, not the consultation"
+        );
+    }
+
+    /// `narrow → ElementwiseRegion(act) → concat` over two slices: the batch-slice
+    /// formation and the merge it feeds.
+    fn form_batch_regions(g: Graph) -> Graph {
+        let g = MarkBatchSliceRegions.run(g);
+        FuseBatchPreprocess.run(g)
+    }
+
+    /// The passes that close a resize into a prologue region, in pipeline order.
+    fn form_prologue_regions(g: Graph) -> Graph {
+        let g = MarkBatchSliceRegions.run(g);
+        let g = MarkTransformRegions.run(g);
+        FuseRegionPrologue.run(g)
+    }
+
+    fn has_elementwise_region(g: &Graph) -> bool {
+        g.nodes()
+            .iter()
+            .any(|n| matches!(n.op, Op::ElementwiseRegion { .. }))
+    }
+
+    fn has_batch_region(g: &Graph) -> bool {
+        g.nodes()
+            .iter()
+            .any(|n| matches!(n.op, Op::BatchElementwiseRegion { .. }))
+    }
+
+    /// Either region kind, for the two sites that can mint both.
+    fn has_a_region(g: &Graph) -> bool {
+        has_elementwise_region(g) || has_batch_region(g)
+    }
+
+    /// Primitive `resize → act`, `fk_graphs`' fixture at this module's test shape.
+    fn resize_activation(act: Activation) -> Graph {
+        crate::fk_graphs::resize_activation_graph("t", act, 1, 3, 8, 8)
+    }
+
+    /// Primitive `narrow → act → concat`, `fk_graphs`' fixture at this module's shape.
+    fn batch_narrow_activation(act: Activation) -> Graph {
+        crate::fk_graphs::batch_narrow_activation_primitive_graph("t", act, 2, 3, 8, 8)
+    }
+
+    /// Primitive `mul(x, x) → act`: the two-step chain `MarkElementwiseRegions` fuses
+    /// whenever both its steps are eligible.
+    fn mul_then_activation_graph(act: Activation) -> Graph {
+        let mut g = Graph::new("t");
+        let x = g.input("x", nchw(1, 3, 8, 8));
+        let sq = g.add_node(Op::Binary(BinaryOp::Mul), vec![x, x], nchw(1, 3, 8, 8));
+        let out = g.add_node(Op::Activation(act), vec![sq], nchw(1, 3, 8, 8));
+        g.set_outputs(vec![out]);
+        g
+    }
+
+    /// `FuseRegionPrologue` / `MarkBatchSliceRegions` / the per-slice construction, all
+    /// reached through `unary_region_step_from_op`. `Round` is `region_fusable`, so only
+    /// the kernel-keyed consultation can refuse it.
+    #[test]
+    fn a_resize_feeding_a_code_the_kernel_lacks_forms_no_prologue_region() {
+        assert_the_judgement_decides(
+            "resize → Round",
+            || resize_activation(Activation::Round),
+            form_prologue_regions,
+            has_elementwise_region,
+        );
+    }
+
+    /// The judgement narrows by code, it is not a blanket off switch: a code the kernel
+    /// does have an arm for still gets its prologue region.
+    #[test]
+    fn an_honoured_code_still_forms_its_prologue_region() {
+        let inside =
+            crate::region_kernel::with_region_kernel_activation_subs(Some(KERNEL_SUBS), || {
+                form_prologue_regions(resize_activation(Activation::Relu))
+            });
+        let prologue_regions = inside
+            .nodes()
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.op,
+                    Op::ElementwiseRegion {
+                        prologue: RegionPrologue::ResizeNearest2x,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(prologue_regions, 1);
+        assert!(
+            !inside
+                .nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::ResizeNearest2x)),
+            "the resize is the prologue, so it must not also stand alone"
+        );
+    }
+
+    /// `FuseBatchPreprocess` through `region_signature`: a batch slice whose code the
+    /// kernel lacks is never merged into one `BatchElementwiseRegion`, and the per-slice
+    /// regions `MarkBatchSliceRegions` would mint for it are not minted either.
+    #[test]
+    fn slicing_a_batch_on_a_code_the_kernel_lacks_forms_no_batch_region() {
+        assert_the_judgement_decides(
+            "narrow → Recip → concat",
+            || batch_narrow_activation(Activation::Recip),
+            form_batch_regions,
+            has_a_region,
+        );
+    }
+
+    /// The same consultation, at the *merge* site alone: `region_signature` decides
+    /// whether the per-slice regions a graph already carries are grouped into one
+    /// `BatchElementwiseRegion`. Those regions are hand-built here, because that is the
+    /// only way this site is load-bearing — the marking pass refuses to mint them in the
+    /// first place, so a graph the pipeline built never reaches this path with an
+    /// unhonoured code.
+    #[test]
+    fn a_batch_merge_of_slices_on_a_code_the_kernel_lacks_is_declined() {
+        let merge = |g: Graph| FuseBatchPreprocess.run(g);
+        let primitives = || {
+            crate::fk_graphs::batch_narrow_activation_regions_graph(
+                "t",
+                Activation::Recip,
+                2,
+                3,
+                8,
+                8,
+            )
+        };
+
+        let inside =
+            crate::region_kernel::with_region_kernel_activation_subs(Some(KERNEL_SUBS), || {
+                merge(primitives())
+            });
+        assert!(
+            !has_batch_region(&inside),
+            "a merge would only move the same code into a batch region kernel"
+        );
+
+        let outside = merge(primitives());
+        assert!(
+            has_batch_region(&outside),
+            "without the judgement the two slices are grouped, so the assertion above is \
+             about the consultation and not about the shape"
+        );
+    }
+
+    /// `MarkElementwiseRegions` is the third formation site: a chain whose tail is a
+    /// code the kernel lacks is not marked.
+    #[test]
+    fn the_marking_pass_declines_a_code_the_kernel_lacks() {
+        use crate::fusion::MarkElementwiseRegions;
+
+        assert_the_judgement_decides(
+            "mul(x, x) → Round",
+            || mul_then_activation_graph(Activation::Round),
+            |g| MarkElementwiseRegions.run(g),
+            has_elementwise_region,
+        );
+    }
+
+    /// The judgement is ambient and off by default, so no other device's fusion
+    /// decisions change: nothing is narrowed until a kernel set is explicitly
+    /// installed, and the install restores whatever it found on the way out.
+    #[test]
+    fn no_judgement_is_installed_by_default() {
+        use crate::region_kernel::{
+            active_region_kernel_activation_subs, region_kernel_honours_activation,
+            region_kernel_honours_chain, with_region_kernel_activation_subs,
+        };
+
+        let round_chain = vec![ChainStep::Activation(
+            Activation::Round,
+            ChainOperand::Input(0),
+        )];
+        assert!(active_region_kernel_activation_subs().is_none());
+        assert!(region_kernel_honours_activation(Activation::Round));
+        assert!(region_kernel_honours_chain(&round_chain));
+
+        with_region_kernel_activation_subs(Some(KERNEL_SUBS), || {
+            assert_eq!(active_region_kernel_activation_subs(), Some(KERNEL_SUBS));
+            assert!(!region_kernel_honours_activation(Activation::Round));
+            // The nested install restores the *outer* set, not `None`.
+            with_region_kernel_activation_subs(None, || {
+                assert!(active_region_kernel_activation_subs().is_none());
+            });
+            assert_eq!(active_region_kernel_activation_subs(), Some(KERNEL_SUBS));
+        });
+        assert!(active_region_kernel_activation_subs().is_none());
+        assert!(region_kernel_honours_activation(Activation::Round));
+        assert!(region_kernel_honours_chain(&round_chain));
     }
 }

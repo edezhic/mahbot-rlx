@@ -36,6 +36,27 @@ pub fn fusion_target_for(device: Device) -> FusionTarget {
     }
 }
 
+/// The activation codes the region kernel that runs on `device` implements, or `None`
+/// when this tree does not declare that device's kernel.
+///
+/// Keyed to the *kernel*, not to the fusion bucket: `Device::Vulkan` and `Device::OneApi`
+/// share [`FusionTarget::Wgpu`] but run their own region engines, which decompose every
+/// region, and keep their present fusion decisions. What the set means is documented at
+/// [`rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS`]; the judgement the
+/// fusion passes apply is `rlx_fusion::region_kernel`.
+///
+/// The device is the only thing that knows which kernel will execute a region, so
+/// [`pipeline_for`] takes this function's answer unconditionally: a set a caller put in
+/// `CompileOptions::fusion_opts` cannot narrow another device's fusion.
+pub fn region_kernel_activation_subs_for(device: Device) -> Option<&'static [u32]> {
+    match device {
+        Device::Gpu | Device::WebGpu => {
+            Some(rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS)
+        }
+        _ => None,
+    }
+}
+
 /// Build a [`CompilePipeline`] from session/device options.
 pub fn pipeline_for(device: Device, options: &CompileOptions) -> CompilePipeline {
     let target = options
@@ -74,6 +95,9 @@ pub fn pipeline_for(device: Device, options: &CompileOptions) -> CompilePipeline
     let mut pipe = CompilePipeline::new(target);
     pipe.opts = opts;
     pipe.opts = pipe.opts.apply_native_fk_defaults(target);
+    // The device decides, not a caller-supplied set: only the device says which kernel
+    // will execute a region (see `region_kernel_activation_subs_for`).
+    pipe.opts.region_kernel_activation_subs = region_kernel_activation_subs_for(device);
     // One shared resolver: this used to be its own copy of the target-default
     // line, and a clamp added to the other copy simply never ran here.
     pipe.opts.fusion_limits =
@@ -193,4 +217,59 @@ pub fn maybe_log_fusion(report: &FusionReport) {
 /// replan memory after precision rewrites).
 pub fn graph_from_lir(lir: LirModule) -> Graph {
     lir.into_graph()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The device→kernel keying, pinned: this is the glue that decides which labels narrow
+    /// their fusion, so deleting it must not leave the suite green. `None` where the kernel
+    /// is not the wgsl one is the "no other device's fusion decisions change" half, and the
+    /// third assertion is the other half of `region_kernel_activation_subs_for`'s claim —
+    /// the device outranks a set a caller put in `CompileOptions::fusion_opts`.
+    #[test]
+    fn only_the_labels_that_run_the_wgsl_region_kernel_get_its_activation_set() {
+        use rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS;
+
+        let wgsl = Some(WGSL_REGION_KERNEL_ACTIVATION_SUBS);
+        let caller = CompileOptions::new().fusion_opts(FusionOptions {
+            region_kernel_activation_subs: Some(&[3]),
+            ..Default::default()
+        });
+        for (device, expected) in [
+            (Device::Gpu, wgsl),
+            (Device::WebGpu, wgsl),
+            (Device::Cpu, None),
+            (Device::Metal, None),
+            // Same `FusionTarget` as `Gpu`, different region engine.
+            (Device::Vulkan, None),
+            (Device::OneApi, None),
+            (Device::Cuda, None),
+            (Device::Rocm, None),
+        ] {
+            let installed = |opts: &CompileOptions| {
+                pipeline_for(device, opts)
+                    .opts
+                    .region_kernel_activation_subs
+            };
+            assert_eq!(
+                region_kernel_activation_subs_for(device),
+                expected,
+                "{device:?} either runs kernels/elementwise_region.wgsl or a kernel that \
+                 keeps its present fusion decisions, and this mapping says which"
+            );
+            assert_eq!(
+                installed(&CompileOptions::new()),
+                expected,
+                "the judgement a {device:?} compile runs under"
+            );
+            assert_eq!(
+                installed(&caller),
+                expected,
+                "a caller-supplied set survived into a {device:?} compile, whose kernel is \
+                 not the one it describes"
+            );
+        }
+    }
 }

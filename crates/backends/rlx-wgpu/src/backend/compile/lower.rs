@@ -366,6 +366,41 @@ fn should_pack_host_op(
     false
 }
 
+/// Refuse a region carrying an activation the wgsl region kernel has no arm for
+/// (`rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS`). Called from the region
+/// arm that can still reach it, on purpose *after* the stripe-straddling rule
+/// (`should_pack_host_op`) — the only route that carries a region off the kernel onto the
+/// host step, whose region interpreter is exhaustive over the activation set, so a plain
+/// region diverted there is computed correctly and must not be refused.
+///
+/// A *well-formed* region cannot reach here: `crate::unfuse::expand_unimplemented_regions`
+/// takes every one of them first (plain and prologue `ElementwiseRegion` through the
+/// unfuse, `BatchElementwiseRegion` through `DecomposeFusionRegions`; `TransformRegion`
+/// carries no activation). What is left is a region that machinery declines — a
+/// `BatchElementwiseRegion` whose input count contradicts its own `num_batch_inputs`,
+/// which the decomposer copies through untouched. The verifier rejects such a node, but it
+/// only runs with `debug_assertions` on the HIR path, so a hand-built graph compiled
+/// directly can still carry one. It refuses rather than runs because the alternative is a
+/// plausible wrong value.
+fn assert_region_activations_implemented(node: &rlx_ir::Node, chain: &[rlx_ir::op::ChainStep]) {
+    let Some(act) = rlx_ir::region_encode::first_unimplemented_activation(
+        rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS,
+        chain,
+    ) else {
+        return;
+    };
+    panic!(
+        "rlx-wgpu: node {id} is an elementwise region whose chain carries `{act:?}` (region \
+         activation code {sub}), and the region kernel this device runs has no arm for that \
+         code — it falls through to `return x`, so the activation would be computed as its \
+         own input. `crate::unfuse::expand_unimplemented_regions` is the expansion that \
+         covers this, so reaching this arm means it could not; there is no switch on this \
+         backend that makes such a region run — the graph has to be built without it.",
+        id = node.id,
+        sub = rlx_ir::region_encode::activation_sub(act),
+    );
+}
+
 /// The per-binding-ceiling rule: one rule, decided at plan time.
 ///
 /// An op whose kernel carries absolute arena offsets — the family (and the two
@@ -898,6 +933,9 @@ pub(crate) fn compile_static_inner(
     // directly with bespoke kernels; we choose simplicity over peak
     // throughput here.
     let graph = crate::unfuse::unfuse(graph);
+    // Regions this kernel's `apply_activation` would silently compute as their own
+    // input, back on primitives before anything lowers them (see the hook's docs).
+    let graph = crate::unfuse::expand_unimplemented_regions(graph);
     // Elide the redundant reshapes unfuse/matmul-lowering emit — they alias
     // parents and block the planner's slot reuse (see collapse_reshapes).
     let graph = crate::unfuse::collapse_reshapes(graph);
@@ -2626,6 +2664,7 @@ pub(crate) fn compile_static_inner(
                 prologue,
                 prologue_input,
             } => {
+                assert_region_activations_implemented(node, chain);
                 let n = *num_batch_inputs as usize;
                 if n == 0 || chain.len() > 32 {
                     panic!(

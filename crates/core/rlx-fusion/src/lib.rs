@@ -43,6 +43,7 @@ pub mod lower_synth_matmul_backward;
 pub mod lower_synth_reconstruct;
 pub mod lower_vae_ops;
 pub mod pass;
+pub mod region_kernel;
 pub mod rewriter;
 pub mod unfuse;
 
@@ -99,6 +100,7 @@ pub use lower_vae_ops::{LowerBatchNormInference, LowerGroupNorm, LowerResizeNear
 pub use pass::{
     Pass, register_ir_pass, registered_ir_passes, run_passes, run_registered_ir_passes,
 };
+pub use region_kernel::with_region_kernel_activation_subs;
 pub use unfuse::{
     unfuse_attention_block, unfuse_dit_modulation, unfuse_fused_for_autodiff,
     unfuse_gated_delta_net_always, unfuse_recurrent_ops,

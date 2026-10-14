@@ -249,6 +249,42 @@ pub fn encode_elementwise_region_meta(
     meta
 }
 
+/// Activation codes the wgsl region kernel has an arm for, in [`activation_sub`]
+/// numbering.
+///
+/// The kernel is `rlx-wgpu`'s `kernels/elementwise_region.wgsl` — one source, three
+/// entry points. Its `apply_activation` ends in `return x`, so a code it has no arm
+/// for computes the *identity* of its input instead of the activation, with no error
+/// and a plausible value. [`crate::op::Activation::region_fusable`] keeps eleven codes
+/// out of regions for that reason, but it is shared by every backend and so cannot
+/// speak for this one kernel: it leaves the rounding code and the reciprocal in, and
+/// the kernel has neither.
+///
+/// This is the set every region path on the labels that run that kernel consults,
+/// through the ambient judgement the compile pipeline installs around the fusion passes
+/// (`rlx_fusion::region_kernel`, filled from the device). It is declared here, beside the
+/// numbering, rather than in a backend's own tables because the operator-coverage
+/// generator parses one fixed file and one fixed constant name per backend. It is held
+/// to the kernel's own arms by an in-crate unit test in `rlx-wgpu`
+/// (`kernels::tests::declared_region_activation_codes_match_the_kernel_arms`), which
+/// parses this constant and that kernel source and requires them to agree.
+pub const WGSL_REGION_KERNEL_ACTIVATION_SUBS: &[u32] =
+    &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16];
+
+/// The first activation step in `chain` whose code `subs` has no arm for — the step
+/// that would silently be computed as its own input.
+pub fn first_unimplemented_activation(subs: &[u32], chain: &[ChainStep]) -> Option<Activation> {
+    chain.iter().find_map(|step| match step {
+        ChainStep::Activation(a, _) if !subs.contains(&activation_sub(*a)) => Some(*a),
+        _ => None,
+    })
+}
+
+/// Whether `subs` has an arm for every activation step in `chain`.
+pub fn activation_subs_cover_chain(subs: &[u32], chain: &[ChainStep]) -> bool {
+    first_unimplemented_activation(subs, chain).is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

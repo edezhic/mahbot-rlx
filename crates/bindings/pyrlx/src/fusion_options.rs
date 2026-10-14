@@ -138,6 +138,9 @@ impl PyFusionOptions {
             fuse_region_prologue: self.fuse_region_prologue,
             fuse_batch_preprocess: self.fuse_batch_preprocess,
             native_fk_regions: self.native_fk_regions,
+            // Device-keyed, not a Python-facing option: the compile pipeline fills
+            // it from the device it is compiling for.
+            region_kernel_activation_subs: None,
             fusion_limits: rlx_opt::FusionLimits::default(),
             disable_conv_bias_act_fusion: false,
             no_io_peaks_output: false,

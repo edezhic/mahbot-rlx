@@ -23,16 +23,27 @@ pub struct UnfuseElementwiseRegions {
     /// When false, `ElementwiseRegion` nodes with an FKL prologue are kept
     /// for native GPU region kernels; when true (CPU), they decompose too.
     pub unfuse_prologue: bool,
+    /// When `Some(subs)`, decompose a region only if its chain carries an activation
+    /// code outside `subs` (`activation_sub` numbering); a region whose every code is
+    /// inside `subs` is copied through untouched. That is the selective form the
+    /// region-kernel expansion uses: a code the kernel has no arm for must be
+    /// decomposed wherever it sits — prologue region included — while the regions the
+    /// default contour deliberately keeps on the kernel stay where they are. `None`
+    /// (both variants below) decomposes every region the prologue field allows, as
+    /// before.
+    pub expand_unimplemented: Option<&'static [u32]>,
 }
 
 impl UnfuseElementwiseRegions {
     /// GPU / Metal / CUDA / wgpu: unfuse plain regions, keep resize prologue.
     pub const FOR_GPU: UnfuseElementwiseRegions = UnfuseElementwiseRegions {
         unfuse_prologue: false,
+        expand_unimplemented: None,
     };
     /// CPU: decompose every region (no native region executor).
     pub const FOR_CPU: UnfuseElementwiseRegions = UnfuseElementwiseRegions {
         unfuse_prologue: true,
+        expand_unimplemented: None,
     };
 }
 
@@ -68,17 +79,38 @@ impl Pass for UnfuseElementwiseRegions {
                 scalar_input_mask: _,
                 input_modulus: _,
                 prologue,
-                prologue_input: _,
+                prologue_input,
             } = &node.op
             {
-                if *prologue != RegionPrologue::None && !self.unfuse_prologue {
+                // Under the expansion form the judgement is the whole policy: exactly
+                // the regions the kernel in force cannot run are decomposed and every
+                // other one is copied through, prologue regions the contour keeps on
+                // the kernel included. Otherwise the prologue field decides, as before.
+                let decompose = match self.expand_unimplemented {
+                    Some(subs) => !rlx_ir::region_encode::activation_subs_cover_chain(subs, chain),
+                    None => *prologue == RegionPrologue::None || self.unfuse_prologue,
+                };
+                if !decompose {
                     rw.copy_node(node);
                     continue;
                 }
                 let mut region_inputs: Vec<NodeId> =
                     node.inputs.iter().map(|id| rw.map(*id)).collect();
                 if *prologue == RegionPrologue::ResizeNearest2x {
-                    let in_shape = rw.new_graph.node(region_inputs[0]).shape.clone();
+                    // The resize reads the region input `prologue_input` names — that is the
+                    // operand `elementwise_region.wgsl`'s `region_resolve_row` sends to the
+                    // prologue row — so the step must not be materialised on the first input,
+                    // which would compute the chain from the wrong tensor.
+                    let resize_src = *prologue_input as usize;
+                    assert!(
+                        resize_src < region_inputs.len(),
+                        "ElementwiseRegion {}: prologue_input {} names no input of the {} it \
+                         has, so the resize prologue's operand cannot be reproduced",
+                        node.id,
+                        resize_src,
+                        region_inputs.len()
+                    );
+                    let in_shape = rw.new_graph.node(region_inputs[resize_src]).shape.clone();
                     let out_shape = if in_shape.rank() == 4 {
                         Shape::new(
                             &[
@@ -92,9 +124,9 @@ impl Pass for UnfuseElementwiseRegions {
                     } else {
                         node.shape.clone()
                     };
-                    region_inputs[0] = rw.new_graph.add_node(
+                    region_inputs[resize_src] = rw.new_graph.add_node(
                         Op::ResizeNearest2x,
-                        vec![region_inputs[0]],
+                        vec![region_inputs[resize_src]],
                         out_shape,
                     );
                 }

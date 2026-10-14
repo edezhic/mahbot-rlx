@@ -68,7 +68,7 @@ pub fn unfuse(graph: Graph) -> Graph {
 /// leaves alone — equal shape, scalar, clean trailing slice — are *strictly*
 /// fewer than the ones `rlx_unfuse::simple_broadcast` can describe. So the
 /// canonical per-channel operand (`[1,C,1]` against `[1,C,T]`) gets a full-size
-/// copy even though [`WgpuPolicy::binary_broadcast_native`] exists to leave
+/// copy even though `WgpuPolicy::binary_broadcast_native` exists to leave
 /// exactly that operand in place, and the copy is a real step: the planner gives
 /// it a slot and every run writes and reads it in full.
 ///
@@ -327,4 +327,316 @@ fn inline_unfused(out: &mut Graph, op: &Op, inputs: &[NodeId], shape: &Shape) ->
 
 pub fn collapse_reshapes(graph: Graph) -> Graph {
     rlx_unfuse::collapse_reshapes(graph)
+}
+
+/// Expand the regions the wgsl region kernel cannot run, back to primitives — the
+/// expansion `rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS` exists for.
+///
+/// The fusion passes no longer form such a region, but a hand-built one, one decoded from
+/// a `.rlx` artifact or a package, and one replayed from cached low-level IR all reach
+/// this backend already formed. This is where they are put back on primitives — the same
+/// expansion the training path and three other backends invoke, and only for the regions
+/// that need it.
+///
+/// Selectivity has one exception: `DecomposeFusionRegions`, the only machinery that
+/// lowers a `BatchElementwiseRegion`, is all-or-nothing. When one batch region carries a
+/// code the kernel lacks it also lowers every other well-formed batch region on the graph
+/// (honoured codes included), every `TransformRegion` (a resize chain, no activation) —
+/// both accepted dispatch changes on that graph — while a prologue `ElementwiseRegion` is
+/// copied through. The selective elementwise expansion below then takes the per-slice
+/// regions it mints.
+///
+/// Called from the backend's single compile entry
+/// (`backend::compile::lower::compile_static_inner`), which every entry point funnels
+/// through.
+pub fn expand_unimplemented_regions(graph: Graph) -> Graph {
+    use rlx_opt::pass::Pass as _;
+
+    let subs = rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS;
+    // The elementwise-region chain of `op`, when it has one.
+    fn chain_of(op: &rlx_ir::Op) -> Option<&[rlx_ir::op::ChainStep]> {
+        match op {
+            rlx_ir::Op::ElementwiseRegion { chain, .. }
+            | rlx_ir::Op::BatchElementwiseRegion { chain, .. } => Some(chain.as_slice()),
+            _ => None,
+        }
+    }
+    // A graph carrying no region the kernel cannot run has nothing to expand, and must
+    // come back untouched rather than rebuilt — this is an unconditional step of every
+    // compile on this backend.
+    let unimplemented = |op: &rlx_ir::Op| {
+        chain_of(op)
+            .is_some_and(|chain| !rlx_ir::region_encode::activation_subs_cover_chain(subs, chain))
+    };
+    if !graph.nodes().iter().any(|n| unimplemented(&n.op)) {
+        return graph;
+    }
+    let graph =
+        if graph.nodes().iter().any(|n| {
+            matches!(&n.op, rlx_ir::Op::BatchElementwiseRegion { .. }) && unimplemented(&n.op)
+        }) {
+            rlx_opt::rlx_fusion::DecomposeFusionRegions.run(graph)
+        } else {
+            graph
+        };
+    // The prologue field is inert here: `expand_unimplemented` is the whole policy.
+    rlx_opt::rlx_fusion::UnfuseElementwiseRegions {
+        unfuse_prologue: false,
+        expand_unimplemented: Some(subs),
+    }
+    .run(graph)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlx_ir::op::{Activation, BinaryOp, ChainOperand, ChainStep, RegionPrologue};
+    use rlx_ir::{DType, OpKind};
+
+    fn nchw(n: usize, c: usize, h: usize, w: usize) -> Shape {
+        Shape::new(&[n, c, h, w], DType::F32)
+    }
+
+    /// A one-step chain over the region's only input.
+    fn chain_of(a: Activation) -> Vec<ChainStep> {
+        vec![ChainStep::Activation(a, ChainOperand::Input(0))]
+    }
+
+    fn region(chain: Vec<ChainStep>, prologue: RegionPrologue) -> Op {
+        Op::ElementwiseRegion {
+            chain,
+            num_inputs: 1,
+            scalar_input_mask: 0,
+            input_modulus: [0; 16],
+            prologue,
+            prologue_input: 0,
+        }
+    }
+
+    fn region_input_graph(a: Activation, prologue: RegionPrologue) -> Graph {
+        let mut g = Graph::new("t");
+        let x = g.input("x", nchw(1, 3, 8, 8));
+        // The resize prologue's region is the doubled tensor it produces.
+        let out_shape = match prologue {
+            RegionPrologue::None => nchw(1, 3, 8, 8),
+            RegionPrologue::ResizeNearest2x => nchw(1, 3, 16, 16),
+        };
+        let out = g.add_node(region(chain_of(a), prologue), vec![x], out_shape);
+        g.set_outputs(vec![out]);
+        g
+    }
+
+    fn count(g: &Graph, pred: impl Fn(&Op) -> bool) -> usize {
+        g.nodes().iter().filter(|n| pred(&n.op)).count()
+    }
+
+    fn has_region(g: &Graph) -> bool {
+        g.nodes().iter().any(|n| {
+            matches!(
+                n.op,
+                Op::ElementwiseRegion { .. }
+                    | Op::BatchElementwiseRegion { .. }
+                    | Op::TransformRegion { .. }
+            )
+        })
+    }
+
+    /// A region the kernel cannot run has no prologue to preserve, so it goes back to
+    /// primitives — here a single `Activation`.
+    #[test]
+    fn a_plain_region_on_a_code_the_kernel_lacks_is_expanded() {
+        let out = expand_unimplemented_regions(region_input_graph(
+            Activation::Recip,
+            RegionPrologue::None,
+        ));
+
+        assert!(!has_region(&out));
+        assert_eq!(
+            count(&out, |op| matches!(op, Op::Activation(Activation::Recip))),
+            1
+        );
+    }
+
+    /// The same, with a resize prologue: the resize the prologue stood for is
+    /// materialised back as its own op rather than dropped with the region.
+    #[test]
+    fn a_prologue_region_on_a_code_the_kernel_lacks_is_expanded_and_keeps_its_resize() {
+        let out = expand_unimplemented_regions(region_input_graph(
+            Activation::Round,
+            RegionPrologue::ResizeNearest2x,
+        ));
+
+        assert!(!has_region(&out));
+        assert_eq!(count(&out, |op| matches!(op, Op::ResizeNearest2x)), 1);
+        assert_eq!(
+            count(&out, |op| matches!(op, Op::Activation(Activation::Round))),
+            1
+        );
+    }
+
+    /// The selectivity the default contour depends on: a prologue region whose code the
+    /// kernel *does* have an arm for is left on the kernel, prologue and all.
+    #[test]
+    fn a_prologue_region_on_a_code_the_kernel_honours_is_left_alone() {
+        let out = expand_unimplemented_regions(region_input_graph(
+            Activation::Relu,
+            RegionPrologue::ResizeNearest2x,
+        ));
+
+        assert_eq!(
+            count(&out, |op| matches!(
+                op,
+                Op::ElementwiseRegion {
+                    prologue: RegionPrologue::ResizeNearest2x,
+                    ..
+                }
+            )),
+            1
+        );
+        assert_eq!(count(&out, |op| matches!(op, Op::Activation(_))), 0);
+        assert_eq!(count(&out, |op| matches!(op, Op::ResizeNearest2x)), 0);
+    }
+
+    /// A batch region carrying such a code is decomposed back to one region per slice
+    /// and then per-slice expanded, so the `Concat` survives and each slice gets its
+    /// own `Activation`.
+    #[test]
+    fn a_batch_region_on_a_code_the_kernel_lacks_is_decomposed() {
+        let mut g = Graph::new("t");
+        let batch = g.input("batch", nchw(2, 3, 8, 8));
+        let mut slices = Vec::new();
+        for i in 0..2 {
+            slices.push(g.add_node(
+                Op::Narrow {
+                    axis: 0,
+                    start: i,
+                    len: 1,
+                },
+                vec![batch],
+                nchw(1, 3, 8, 8),
+            ));
+        }
+        let batch_region = g.add_node(
+            Op::BatchElementwiseRegion {
+                chain: chain_of(Activation::Recip),
+                num_batch_inputs: 2,
+                scalar_input_mask: 0,
+                input_modulus: [0; 16],
+                prologue: RegionPrologue::None,
+                prologue_input: 0,
+            },
+            slices,
+            nchw(2, 3, 8, 8),
+        );
+        g.set_outputs(vec![batch_region]);
+
+        let out = expand_unimplemented_regions(g);
+
+        assert!(!has_region(&out));
+        assert_eq!(count(&out, |op| matches!(op, Op::Concat { axis: 0 })), 1);
+        assert_eq!(
+            count(&out, |op| matches!(op, Op::Activation(Activation::Recip))),
+            2
+        );
+    }
+
+    /// The prologue's operand is a field, not an assumption: `prologue_input` names the
+    /// region input `elementwise_region.wgsl`'s `region_resolve_row` sends to the prologue
+    /// row, so the expansion has to resize *that* input. Expanding on the first input
+    /// instead would put the step on a different tensor and compute a plausible wrong
+    /// value — the failure this hook exists to remove.
+    #[test]
+    fn a_prologue_region_resizes_the_input_its_prologue_input_names() {
+        let mut g = Graph::new("t");
+        let a = g.input("a", nchw(1, 3, 8, 8));
+        let b = g.input("b", nchw(1, 3, 8, 8));
+        let out = g.add_node(
+            Op::ElementwiseRegion {
+                chain: vec![ChainStep::Activation(
+                    Activation::Round,
+                    ChainOperand::Input(1),
+                )],
+                num_inputs: 2,
+                scalar_input_mask: 0,
+                input_modulus: [0; 16],
+                prologue: RegionPrologue::ResizeNearest2x,
+                prologue_input: 1,
+            },
+            vec![a, b],
+            nchw(1, 3, 16, 16),
+        );
+        g.set_outputs(vec![out]);
+
+        let out = expand_unimplemented_regions(g);
+
+        let resize = out
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.op, Op::ResizeNearest2x))
+            .expect("the prologue's resize is materialised");
+        let b_id = out
+            .nodes()
+            .iter()
+            .find(|n| matches!(&n.op, Op::Input { name } if name == "b"))
+            .expect("the region's second input survives");
+        assert_eq!(
+            resize.inputs,
+            vec![b_id.id],
+            "the resize reads the input `prologue_input` names, not input 0"
+        );
+        let act = out
+            .nodes()
+            .iter()
+            .find(|n| matches!(n.op, Op::Activation(Activation::Round)))
+            .expect("the activation is materialised");
+        assert_eq!(act.inputs, vec![resize.id]);
+        assert_eq!(count(&out, |op| matches!(op, Op::Activation(_))), 1);
+    }
+
+    /// A resize-prologue region whose `prologue_input` names no input of its own is a node
+    /// no producer here builds and `rlx_ir::verify` does not constrain. There is no operand
+    /// the resize can be reproduced from, so the expansion refuses rather than choosing one:
+    /// picking an operand is the plausible-wrong-value route this hook exists to remove.
+    #[test]
+    #[should_panic(expected = "prologue_input 3 names no input")]
+    fn a_prologue_operand_that_names_no_input_is_refused() {
+        let mut g = Graph::new("t");
+        let x = g.input("x", nchw(1, 3, 8, 8));
+        let out = g.add_node(
+            Op::ElementwiseRegion {
+                chain: chain_of(Activation::Recip),
+                num_inputs: 1,
+                scalar_input_mask: 0,
+                input_modulus: [0; 16],
+                prologue: RegionPrologue::ResizeNearest2x,
+                prologue_input: 3,
+            },
+            vec![x],
+            nchw(1, 3, 16, 16),
+        );
+        g.set_outputs(vec![out]);
+
+        let _ = expand_unimplemented_regions(g);
+    }
+
+    /// A graph with no region op at all is a no-op: same composition, same op kinds.
+    #[test]
+    fn a_graph_with_no_region_is_returned_unchanged() {
+        let mut g = Graph::new("t");
+        let x = g.input("x", nchw(1, 3, 8, 8));
+        let add = g.add_node(Op::Binary(BinaryOp::Add), vec![x, x], nchw(1, 3, 8, 8));
+        let out = g.add_node(
+            Op::Activation(Activation::Relu),
+            vec![add],
+            nchw(1, 3, 8, 8),
+        );
+        g.set_outputs(vec![out]);
+        let before: Vec<OpKind> = g.nodes().iter().map(|n| n.op.kind()).collect();
+
+        let out = expand_unimplemented_regions(g);
+
+        let after: Vec<OpKind> = out.nodes().iter().map(|n| n.op.kind()).collect();
+        assert_eq!(after, before);
+        assert_eq!(out.nodes().len(), before.len());
+    }
 }

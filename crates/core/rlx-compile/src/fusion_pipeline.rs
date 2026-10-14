@@ -62,6 +62,13 @@ pub struct FusionOptions {
     pub fuse_batch_preprocess: bool,
     /// Keep `TransformRegion` / `BatchElementwiseRegion` in MIR for native lowering. Env: `RLX_NATIVE_FK_REGIONS=1`.
     pub native_fk_regions: bool,
+    /// Activation codes the region kernel that will run this compile's regions has an
+    /// arm for (`activation_sub` numbering), or `None` for no kernel-keyed judgement.
+    /// Not an environment knob: it is filled from the *device*
+    /// (`rlx_runtime::stages::region_kernel_activation_subs_for`), because it is keyed to
+    /// a kernel and a `FusionTarget` cannot tell that kernel's labels from its
+    /// bucket-mates.
+    pub region_kernel_activation_subs: Option<&'static [u32]>,
     /// Caps for fused elementwise chains (encoder / scratch limits).
     pub fusion_limits: FusionLimits,
     /// Skip Conv+Bias+Act fusion (`RLX_DISABLE_CONV_BIAS_ACT_FUSION`).
@@ -81,6 +88,7 @@ impl Default for FusionOptions {
             fuse_region_prologue: true,
             fuse_batch_preprocess: true,
             native_fk_regions: false,
+            region_kernel_activation_subs: None,
             fusion_limits: FusionLimits::default(),
             disable_conv_bias_act_fusion: false,
             no_io_peaks_output: false,
@@ -648,6 +656,10 @@ fn finish_pipeline(mut passes: Vec<&'static dyn Pass>) -> Vec<&'static dyn Pass>
 }
 
 /// Run the fusion pipeline for `target` on a MIR graph (IO-gated passes included).
+///
+/// The kernel-keyed region-activation judgement `opts` carries is installed here, not
+/// merely carried: this is the second public entry point (`fuse` / `Fuse`), and without
+/// the explicit install `with_fusion_target`'s default options would drop it.
 pub fn run_fusion_pipeline(
     graph: Graph,
     target: FusionTarget,
@@ -657,9 +669,14 @@ pub fn run_fusion_pipeline(
     let mut opts = opts.apply_native_fk_defaults(target);
     opts.fusion_limits = resolve_fusion_limits(target, &opts);
     let limits = opts.fusion_limits;
+    let region_kernel_activation_subs = opts.region_kernel_activation_subs;
     let passes = fusion_passes_for_supported(supported, opts, target);
     with_fusion_target(target, || {
-        with_fusion_limits(limits, || run_passes(graph, &passes, false))
+        with_fusion_limits(limits, || {
+            rlx_fusion::with_region_kernel_activation_subs(region_kernel_activation_subs, || {
+                run_passes(graph, &passes, false)
+            })
+        })
     })
 }
 
@@ -1094,5 +1111,73 @@ mod tests {
         };
         assert!(should_fuse_with_target(FusionTarget::Metal, &dense, &fused));
         assert!(!should_fuse_with_target(FusionTarget::Wgpu, &dense, &fused));
+    }
+
+    /// The kernel-keyed judgement reaches the passes from *this* entry point too.
+    ///
+    /// `with_fusion_target` installs `FusionOptions::default()`, so without the explicit
+    /// install in [`run_fusion_pipeline`] a caller's `region_kernel_activation_subs` is
+    /// silently dropped — `fuse` / `Fuse` / the `cargo rlx check` preview would show a
+    /// prologue region the real compile declines.
+    #[test]
+    fn run_fusion_pipeline_honours_the_region_kernel_activation_set() {
+        use rlx_ir::Op;
+        use rlx_ir::op::{Activation, RegionPrologue};
+
+        /// `Activation::Relu`'s code in `activation_sub` numbering, and the only code
+        /// the set below declares — `Round` stays out of it, so a `resize → Round` chain
+        /// is no longer prologue-eligible.
+        const RELU_SUB: u32 = 3;
+        static RELU_ONLY: [u32; 1] = [RELU_SUB];
+        assert_eq!(
+            rlx_ir::region_encode::activation_sub(Activation::Relu),
+            RELU_SUB,
+            "the set below must be keyed to `Relu`'s real code"
+        );
+
+        let _lock = env_fk_lock();
+        let resize_round = || {
+            rlx_fusion::fk_graphs::resize_activation_graph(
+                "resize_round",
+                Activation::Round,
+                1,
+                3,
+                8,
+                8,
+            )
+        };
+        let has_prologue_region = |g: &Graph| {
+            g.nodes().iter().any(|n| {
+                matches!(
+                    n.op,
+                    Op::ElementwiseRegion {
+                        prologue: RegionPrologue::ResizeNearest2x,
+                        ..
+                    }
+                )
+            })
+        };
+        let supported = supported_for_target(FusionTarget::Wgpu);
+        let run = |subs| {
+            run_fusion_pipeline(
+                resize_round(),
+                FusionTarget::Wgpu,
+                supported,
+                FusionOptions {
+                    region_kernel_activation_subs: subs,
+                    ..FusionOptions::for_target(FusionTarget::Wgpu)
+                },
+            )
+        };
+
+        assert!(
+            !has_prologue_region(&run(Some(&RELU_ONLY))),
+            "the set a caller passes must reach the passes through this entry point"
+        );
+        assert!(
+            has_prologue_region(&run(None)),
+            "with no set the same chain is still fused, so the assertion above is about \
+             the judgement and not about the shape"
+        );
     }
 }

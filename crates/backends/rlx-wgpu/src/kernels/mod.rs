@@ -4461,3 +4461,47 @@ pub fn matmul_qkv_coop_f16_vk_widen_kernel(device: &wgpu::Device) -> Option<&'st
         )
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ELEMENTWISE_REGION_WGSL;
+
+    /// The activation codes `apply_activation` actually has an arm for, read out of
+    /// the kernel's own source. The scan is scoped to that one function: the same file's
+    /// `apply_binary` / `apply_cast` / `apply_compare` arms share the `sub == Nu` shape,
+    /// and a file-wide scan would conflate their code spaces.
+    fn kernel_activation_subs(src: &str) -> Vec<u32> {
+        let body = src
+            .split_once("fn apply_activation(")
+            .expect("apply_activation in the region kernel")
+            .1;
+        let body = body.split("\nfn ").next().unwrap();
+        let mut subs: Vec<u32> = body
+            .split("sub == ")
+            .skip(1)
+            .filter_map(|rest| rest.split('u').next()?.trim().parse::<u32>().ok())
+            .collect();
+        subs.sort_unstable();
+        subs.dedup();
+        subs
+    }
+
+    /// Claimed implies implemented, and the exclusion covers every code the kernel
+    /// lacks: the declared set and the kernel's arms must agree exactly. Reading the
+    /// kernel source is what makes this a pin rather than an assertion that a list
+    /// exists — a code added to the declared set without an arm in the kernel fails
+    /// here, which is exactly the silent-identity defect this set exists to prevent.
+    #[test]
+    fn declared_region_activation_codes_match_the_kernel_arms() {
+        let mut declared = rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS.to_vec();
+        declared.sort_unstable();
+        assert_eq!(
+            kernel_activation_subs(ELEMENTWISE_REGION_WGSL),
+            declared,
+            "the declared region-kernel activation set and `apply_activation`'s arms \
+             disagree: a declared code without an arm is computed as its own input \
+             silently, and an arm left out of the set keeps a region the kernel could \
+             have run off it"
+        );
+    }
+}

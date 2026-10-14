@@ -28,7 +28,9 @@ pub fn with_fusion_target<T>(target: FusionTarget, f: impl FnOnce() -> T) -> T {
     with_fusion_context(target, FusionOptions::default(), f)
 }
 
-/// Run `f` with target + options installed for IO-gated passes.
+/// Run `f` with target + options installed for IO-gated passes, and with the
+/// kernel-keyed region-activation judgement `opts` carries (see
+/// [`rlx_fusion::with_region_kernel_activation_subs`]).
 pub fn with_fusion_context<T>(
     target: FusionTarget,
     opts: FusionOptions,
@@ -40,7 +42,10 @@ pub fn with_fusion_context<T>(
             let prev_o = o.get();
             t.set(Some(target));
             o.set(Some(opts));
-            let out = f();
+            let out = rlx_fusion::with_region_kernel_activation_subs(
+                opts.region_kernel_activation_subs,
+                f,
+            );
             t.set(prev_t);
             o.set(prev_o);
             out

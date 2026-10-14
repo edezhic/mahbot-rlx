@@ -46,11 +46,12 @@ use rlx_ir::verify::VerifyError;
 use rlx_ir::{Graph, node_label};
 use rlx_opt::rlx_compile::KernelDispatchConfig;
 use rlx_opt::rlx_compile::dispatch_report::{DispatchPath, prepare_graph_for_backend_with_report};
-use rlx_opt::rlx_compile::fusion_pipeline::{Fuse, FusionTarget};
+use rlx_opt::rlx_compile::fusion_pipeline::{Fuse, FusionOptions, FusionTarget};
 use serde::Serialize;
 
 use crate::Device;
 use crate::registry::backend_for;
+use crate::stages::region_kernel_activation_subs_for;
 
 /// Diagnostic severity, ordered most-severe first for rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -296,6 +297,21 @@ pub fn backend_device(t: FusionTarget) -> Device {
         FusionTarget::Cuda => Device::Cuda,
         FusionTarget::Rocm => Device::Rocm,
         FusionTarget::Tpu => Device::Tpu,
+    }
+}
+
+/// The fusion options this check previews a target with: the target's canonical set,
+/// plus the kernel-keyed region-activation judgement for the device the target's label
+/// resolves to (`backend_device`).
+///
+/// The check reasons per [`FusionTarget`], and one target can cover several device
+/// labels — `FusionTarget::Wgpu` is `Device::Gpu` here, the wgsl region kernel's own
+/// label. The preview therefore matches a `Device::Gpu` compile and not a Vulkan/OneAPI
+/// one, exactly as the target-keyed legality figure beside it does.
+fn fusion_preview_options(t: FusionTarget) -> FusionOptions {
+    FusionOptions {
+        region_kernel_activation_subs: region_kernel_activation_subs_for(backend_device(t)),
+        ..FusionOptions::for_target(t)
     }
 }
 
@@ -1079,7 +1095,9 @@ pub fn check_graph(graph: &Graph, opts: &CheckOptions) -> CheckReport {
 
             // -- fusion: what fused, what was left on the table (device-free) --
             let fusion = catch_unwind(AssertUnwindSafe(|| {
-                Fuse::new(t).run_with_report(graph.clone())
+                Fuse::new(t)
+                    .options(fusion_preview_options(t))
+                    .run_with_report(graph.clone())
             }));
             let mut fused_graph: Option<Graph> = None;
             if let Ok((fused, freport)) = fusion {
@@ -1237,5 +1255,37 @@ mod tests {
         let y = g.mm(x, w);
         g.set_outputs(vec![y]);
         model_self_check("hooked", &g);
+    }
+
+    /// The preview's own wiring: the wgpu target is previewed under the wgsl region
+    /// kernel's activation set, every other target under none — so `check` shows the
+    /// fusion a real compile would do for the label it names.
+    #[test]
+    fn the_fusion_preview_runs_under_the_named_targets_region_kernel() {
+        let wgsl = Some(rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS);
+        assert_eq!(
+            fusion_preview_options(FusionTarget::Wgpu).region_kernel_activation_subs,
+            wgsl
+        );
+        for t in [
+            FusionTarget::Cpu,
+            FusionTarget::Metal,
+            FusionTarget::Mlx,
+            FusionTarget::Cuda,
+            FusionTarget::Rocm,
+            FusionTarget::Tpu,
+        ] {
+            assert_eq!(
+                fusion_preview_options(t).region_kernel_activation_subs,
+                None,
+                "{t:?} runs a different region kernel and must preview its own decisions"
+            );
+        }
+        // The rest of the canonical set is preserved, not replaced: the preview differs
+        // from the target's own options in the judgement field and nowhere else.
+        let mut canonical = FusionOptions::for_target(FusionTarget::Wgpu);
+        assert_ne!(canonical.region_kernel_activation_subs, wgsl);
+        canonical.region_kernel_activation_subs = wgsl;
+        assert_eq!(fusion_preview_options(FusionTarget::Wgpu), canonical);
     }
 }

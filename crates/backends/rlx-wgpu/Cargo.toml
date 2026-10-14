@@ -348,6 +348,10 @@ name = "ops3d_bwd_parity"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "region_activation_arms"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "rerun_stability"
 required-features = ["backend-tests"]
 
