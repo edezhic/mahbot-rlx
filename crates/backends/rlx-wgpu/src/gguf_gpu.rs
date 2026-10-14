@@ -1351,6 +1351,33 @@ const GROUPED_THREADS: u32 = 64;
 /// tile over which one pass over the packed weight is reused. Both are tied to
 /// the shader they describe by the `grouped_geometry_matches_the_shader` test
 /// below, which is why they stay private here.
+///
+/// The tile is a measurement and not a free knob: rows per thread is the lever
+/// this const sizes — the row tile, one row group — and the larger-row arms
+/// measured slower on both shapes at both sizes (the owner's re-take on the stand —
+/// an Apple M3 Pro, 14-core GPU, 18 GiB, macOS, wgpu over Metal; sides alternated
+/// in adjacent rounds, the median of three). A **step** in that re-take is a model
+/// body's whole step, every packed multiply the body runs rather than one multiply
+/// — not the sense this file's one-row-path docs give the word — which is why these
+/// figures sit far above this crate's per-multiply ones and are not comparable with
+/// them. The arms were not the shipped kernel with only that constant moved, so what
+/// was measured is recorded against the arms as measured rather than as a law about
+/// tile size, and no mechanism is claimed for the loss:
+///
+/// | step | 8-row tile | 16 rows | 32 rows |
+/// | --- | --- | --- | --- |
+/// | the recognition body's, m = 104 | 450 ms | 1.18 s | 3.51 s |
+/// | the synthesis body's, m = 24 | 132 ms | 325 ms | 1.05 s |
+///
+/// Nor are the larger rows a free knob in a second sense: on the 32-row arms
+/// 89.6 % of the output elements differed from the baseline, max |delta| = 1.87e-4
+/// against a max |.| of about 28 — summation-reordering round-off, not a wrong
+/// answer. The 16-row arms' output is not recorded either way. The 104-row cell
+/// also appears in the shader header's duplicate-read probe, which is a separate
+/// experiment and not this one. The walk and cost facts this reading sits beside —
+/// what a step does and does not pay for, and the per-group price of one further
+/// pass over the weight — are in that header's re-take paragraphs, and the two move
+/// together.
 const GROUPED_ROWS: u32 = 8;
 
 /// Elements of `k` one staged activation tile covers — the shader's `BLK_ELEMS`,

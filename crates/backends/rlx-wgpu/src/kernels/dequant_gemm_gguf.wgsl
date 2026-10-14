@@ -24,13 +24,16 @@
 // header, so every block's header is read twice under it (its own paragraph
 // below).
 //
-// Except for the parity bands this tree measures itself further down, the timing
-// figures in this header are the author's own out-of-tree A/B of the raw kernel
-// and its variants on one adapter (wgpu over Metal, M3 Pro), timed per byte and
-// per variant rather than as graph-call ratios, and are to be re-taken rather
-// than trusted: the harnesses this header names time whole graph calls instead
-// (`tests/gguf_gemm_grouped_weight_reuse.rs` answers this kernel's
-// row-group-versus-single-row question that way).
+// Except for the parity bands this tree measures itself further down and the
+// re-taken figures the owner's paragraphs below record — the owner's own stand
+// measurements, which name their stand — the timing figures in this header are
+// the author's own out-of-tree A/B of the raw kernel and its variants on one
+// adapter (wgpu over Metal, an M3 Pro with an 18-core GPU — the author's, the one
+// the split band's figures come from, and not the 14-core stand the re-takes
+// name), timed per byte and per variant rather than as graph-call ratios, and are
+// to be re-taken rather than trusted: the harnesses this header names time whole
+// graph calls instead (`tests/gguf_gemm_grouped_weight_reuse.rs` answers this
+// kernel's row-group-versus-single-row question that way).
 //
 // Both operands are read through the cheapest path that measured here, and which
 // path that is was not obvious. The weight is read as whole 4-byte words: a byte
@@ -46,17 +49,78 @@
 // multiplies the SAME X and reading it per thread made the X side the kernel's
 // largest term.
 //
-// What still limits the kernel is that staged-X path: `TM` staged loads per
-// weight word per output column is 8 loads per 32 MACs, and the only way past
-// that is more output columns per thread, which this adapter pays for in
-// registers — a two-column variant spilled its accumulators and measured 2x
-// SLOWER. Nor is the number of times the weight is re-read what a step pays for:
-// an 8-row group and a 1-row group of the same packed bytes cost the same per
-// byte, a 16-byte vectorized weight fetch and a doubled FMA count both measured
-// flat (so the kernel is not issue-bound), and a tile of 16 rows — which halves
-// the re-reads and does the same total row work wherever the row count reaches
-// into the tile's top half — measured a wash there and a regression below it,
-// where the tile computes 16 rows' worth for fewer real ones.
+// What the tree records as limiting the kernel is that staged-X path: `TM`
+// staged loads per weight word per output column is 8 loads per 32 MACs, and the
+// only way past that is more output columns per thread, which the author's
+// adapter pays for in registers — a two-column variant spilled its accumulators
+// and measured 2x SLOWER. That is the tree's claim, taken on that adapter and due
+// for re-take on ours rather than our measurement; so is the rest of it, a
+// 16-byte vectorized weight fetch and a doubled FMA count having measured flat
+// there, whence the kernel is recorded as not bound by issuing work.
+//
+// The owner's re-take measured next, on the stand (an Apple M3 Pro, 14-core GPU,
+// 18 GiB, macOS, wgpu over Metal; sides alternated in adjacent rounds, medians —
+// of three rounds in the probe below, of two per side in the join), what a step
+// pays for. "Step" here is a model body's whole step — every packed multiply the
+// body runs in one step, not one multiply — so these magnitudes sit far above this
+// crate's per-multiply figures and are not comparable with them. Elsewhere in the
+// crate the word names one packed multiply — the one-row path's step, the
+// row-grouped rate harness's `STEPS` — and that harness's *call*, one graph holding
+// several of them, is this unit's peer rather than its step.
+//
+// Duplicate reads of the same addresses are not what such a step pays for — not
+// the repeats a single walk over the weight makes within itself, anyway. A probe
+// variant that removed the repeated read of the same 32-byte quant group from the
+// Q4_K arm and lifted the Q6_K arm's scale reads out of its inner step left the two
+// sides bit-identical (all four probed cells' digests, and a byte-wise dump on one),
+// with identical routes and counters and step times inside the run-to-run spread on
+// three of the four — m = 13 -0.35 %, m = 24 -0.53 %, m = 100 +0.28 %. The fourth,
+// m = 104, measured about -3 %: recorded, and not counted an effect by the owner,
+// rather than folded into that spread.
+//
+// What a step pays for is one further pass of the grid over the weight at the
+// current geometry — the whole work such a pass drags with it (laying out the
+// activation for every weight word, pulling the row, the barriers), not the
+// weight's bytes: an arm that cut the number of passes over the weight measured
+// slower, not faster, on this stand, and it cut more than the pass count, so
+// nothing is generalised from it. The price is about 31 ms for each added
+// eight-row group, over a fixed term of about 52-53 ms that includes the first
+// pass — the owner's reading of his own sweep rather than arithmetic derived here
+// — so the cost is quantised by the eight-row group: flat inside a group, jumping
+// at each boundary. The sweep, on one and the same weight and the recognition
+// body's whole step, reads 83, 112, 111, 141, 148, 183, 243 and 450 ms at 8, 9,
+// 16, 17, 24, 32, 48 and 104 rows, and the join re-take's own before side (the
+// multiplies still opening their own boundary) reproduces them to within a few ms,
+// so these are one reading and not two laws.
+//
+// Nor is the number of submissions what a step pays for once its multiplies join
+// the enclosing batch: the join removes 310 submissions and 226 polls at every row
+// count from 8 up and buys a constant 28-45 ms, not a proportional share of the
+// step, with the staircase unchanged on both sides (the group-boundary jump
+// averages 32.0 ms before and 28.9 ms after, and the two sides coincide at one
+// row), the schedule and the output digests identical at every row count, and one
+// run of forty-two interrupted by the memory guard on the system's wired memory,
+// its cells re-run under the same protocol and flagged rather than presented
+// clean.
+//
+// Counted is not the same as paid: the byte accounts elsewhere in this file and in
+// `gguf_gpu.rs` — the split geometry's second read of each block's header, its
+// second pass at the staged activations and its fold among them — count requests
+// over the same addresses and stay true, and the split geometry's rationale for a
+// starved dispatch is not refuted here. This re-take measured what a step pays,
+// and only what a step pays.
+//
+// A larger row tile does not pay either: rows per thread is the lever this
+// header's `TM` sizes — the row tile, one row group — and the larger-row arms
+// measured slower on the same stand on two shapes at both sizes, by about 2.5x at
+// 16 rows and by about 8x at 32 (the recognition body's 104-row step against the
+// synthesis body's 24-row one), and arithmetically different too, the 32-row arms'
+// output differing by summation-reordering round-off rather than by a wrong
+// answer. `GROUPED_ROWS`'s doc in `gguf_gpu.rs`, which sizes this tile, carries the
+// arm pairs and that difference; no mechanism is claimed for the loss, and the
+// reading this re-take replaces does not explain one this size. That reading also
+// carried a regression where the tile computes 16 rows' worth for fewer real ones
+// — below the tile's height — untouched here, and still under the disclaimer above.
 //
 // `tests/gguf_gemm_grouped_weight_reuse.rs` holds the measurement of what
 // one row group costs against the single-row pass it replaces. It no longer
