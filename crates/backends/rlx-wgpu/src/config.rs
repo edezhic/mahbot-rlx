@@ -46,15 +46,28 @@ impl WgpuRuntimeConfig {
         // the whole band [100, 800), and the three convolutions of our own graphs that sit
         // in it all win there — the decoder entry conv (output 100, the floor itself; the
         // comparison is inclusive) at 282.4 → 258.7 ms of its stage's step (an earlier
-        // five-round set: 281.0 → 260.0), its device pass 28.76 → 6.45 ms and total device
-        // time 223.6 → 200.6 ms; the encoder's third input conv (output 208, kernel 3,
-        // stride 2) at 82.0 → 71.1 ms; and the long decoder input (output 744, ≈14.9 s of
-        // speech) at 1.72–1.75 → 1.62–1.63 s, spread 0.01–0.03 s. Outputs of the measured
-        // cells stay bit-identical (these shapes share one accumulation order, which is not
-        // a general guarantee), the memory guard passes, submissions/waits stay 18/24 and
-        // the other seven cells' schedules are byte-identical. Those readings are taken *at*
-        // 100: 800 was the only value sampled below the old 2048, with nothing sampled
-        // between, so they are the evidence rather than an envelope the new default sits in.
+        // five-round set: 281.0 → 260.0); the encoder's third input conv (output 208,
+        // kernel 3, stride 2) at 82.0 → 71.1 ms; and the long decoder input (output 744,
+        // ≈14.9 s of speech) at 1.72–1.75 → 1.62–1.63 s, spread 0.01–0.03 s — of a kind the
+        // tree does not record, and not the entry conv's build-to-build scatter below. Every
+        // reading in this block was taken on the stand — an Apple M3 Pro, 14-core GPU,
+        // 18 GiB, macOS — and the tree records no state for any of them. The readings' own
+        // arrows run from the old 800 to the shipped 100: 800 was the only value sampled
+        // below the old 2048, with nothing sampled between, so they are the evidence rather
+        // than an envelope the new default sits in. Across the two settings the measured
+        // cells' outputs were bit-identical (a shared accumulation order, not a general
+        // guarantee). What else the readings carried — submissions and waits, the device
+        // pass and total device time, the memory guard's pass, the other seven cells'
+        // schedules — is dropped rather than restated, as they predate the packed-weight
+        // batch boundary's change and the tree cannot re-bracket them.
+        //
+        // Read those entry-conv figures against that cell's own scatter, on the same stand
+        // at the shipped default: two builds of identical content measured it at
+        // 255.6/255.3/254.8 and 259.0/258.4/258.6 ms — a build-to-build spread of ≈1.5 %
+        // (≈4 ms) — and a byte-identical copy of the slow build stayed slow, so the gap is
+        // the build and not the run. A difference inside that spread is not a difference, and
+        // one build per side does not resolve a difference of that size on this cell; the
+        // two sets above agree to within it, and both their margins lie outside it.
         //
         // The band opens wholesale, and its two halves are not the same swap. Below 256 it
         // is direct convolution → accelerated — the tiled route's own floor is 256, so it

@@ -22,7 +22,7 @@
 //! floor, and the fused step at 24-31 rows is small enough to sit on that floor —
 //! so what it gives is a bound on the fused step, not a measurement of it, and
 //! the two arrangements are compared by their ratio there instead: 18x over 1024
-//! keys and 15x over 256. The same reading does say two things about that step
+//! keys and ≈14x over 256. The same reading does say two things about that step
 //! without being a rate: it barely moves with the row count (≈1% from 24 to 31
 //! rows, against a third more work), and it grows with the key sequence (≈4.2x
 //! from 256 to 1024 keys at 24 rows) — the serial key walk showing on top of the
