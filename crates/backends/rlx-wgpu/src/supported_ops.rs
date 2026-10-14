@@ -99,7 +99,9 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     // arena (~100 GiB for Bonsai-27B @ max_seq=96). Host-eval via gdn_host,
     // matching Metal/CUDA/MLX claim-then-host pattern.
     OpKind::GatedDeltaNet,
-    // Transposed conv (vision U-Net decoder) — host fallback via the CPU kernel.
+    // Transposed conv (vision U-Net decoder) — native gather step by default,
+    // with the CPU-kernel host route kept behind `RLX_WGPU_CONV_HOST` / the
+    // structure-host preference.
     OpKind::ConvTranspose2d,
     // 3-D convs (volumetric UNETR-style decoders) — CPU NCDHW kernels.
     OpKind::Conv3d,

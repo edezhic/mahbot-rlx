@@ -63,9 +63,11 @@ kernels, pure Rust deps — no FFI, no submodules.
   step can address, and the whole-arena host steps this backend still keeps for
   `Op::LayerNorm2d` and for `Op::Reverse` refuse a parked operand and an arena past
   their 32-bit byte offsets too (the flip also refuses a declared element width the
-  arena does not store) — and so does `Op::ConvTranspose2d`'s host route, whose step
+  arena does not store) — and so does `Op::ConvTranspose2d`'s host step, which
   carries 32-bit byte offsets into that arena while its compact form stages the weight
-  from there. An absolute-offset arm
+  from there; the op defaults to its own device step, so that host step is reached only
+  behind `RLX_WGPU_CONV_HOST` or the structure-host preference
+  (`RLX_WGPU_FORCE_HOST`, a discrete adapter, a sharded arena). An absolute-offset arm
   that is not classified there and binds through the windowed path is refused at
   bind time instead of read through a re-based window. `RLX_WGPU_SHARD_GPU=1`
   cannot undo any of it.
@@ -192,7 +194,7 @@ discrete-adapter visibility correct.
 | `RLX_WGPU_HOST_BUFFER_COPY=1` | Force host round-trip for BufferCopy |
 | `RLX_WGPU_HOST_EAGER_H2D=1` | Write every HostOp/Conv output to the device immediately (default: defer until Expand/Concat/GPU/readback) |
 | `RLX_WGPU_HOST_MATMUL=1` | Pack MatMul as HostOp |
-| `RLX_WGPU_CONV_HOST=1` | Force Conv2d host path |
+| `RLX_WGPU_CONV_HOST=1` | Force the Conv2d / transposed-conv host paths |
 
 **Discrete Vulkan/DX12 (Kitten NSF):** Binary/Activation/Where/Fma, norms,
 Expand/Concat/Transpose/Narrow, and Conv stay on the host (SPIR-V elementwise

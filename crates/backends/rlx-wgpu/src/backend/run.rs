@@ -31,11 +31,11 @@ use crate::kernels::{
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
     cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
-    complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel, conv_transpose3d_kernel,
-    conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
-    conv3d_backward_weight_kernel, conv3d_ctile_kernel, conv3d_kernel, copy_kernel,
-    copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
-    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
+    complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel, conv_transpose2d_kernel,
+    conv_transpose3d_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
+    conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_ctile_kernel,
+    conv3d_kernel, copy_kernel, copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel,
+    cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
     elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
     fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
     fma_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
@@ -1306,6 +1306,12 @@ impl WgpuExecutable {
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
                     Step::Conv3d { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::ConvTranspose2d { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
@@ -3121,6 +3127,21 @@ impl WgpuExecutable {
                                 };
                                 pass.set_pipeline(&ck.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::ConvTranspose2d { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    gpu_bi += 1;
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let ck = conv_transpose2d_kernel(&dev.device);
+                                pass.set_pipeline(&ck.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let total =
+                                    n_s * params.c_out * params.d_out * params.h_out * params.w_out;
                                 let (gx, gy, gz) = dispatch_dims(total, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }

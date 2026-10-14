@@ -224,11 +224,27 @@ name = "conv_routes_parked_weight"
 required-features = ["backend-tests"]
 
 [[test]]
-name = "conv_transpose2d_host_route"
+name = "conv_transpose2d_gather_family"
 required-features = ["backend-tests"]
 
 [[test]]
 name = "conv_transpose2d_parked_param"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_transpose2d_route_cost"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_transpose2d_routes"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_transpose2d_stage_refusal"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv_transpose2d_step_counts"
 required-features = ["backend-tests"]
 
 [[test]]

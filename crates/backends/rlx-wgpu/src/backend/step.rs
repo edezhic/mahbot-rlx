@@ -881,6 +881,11 @@ pub(crate) enum Step {
         dw: u32,
         groups: u32,
     },
+    /// Native WGSL `Op::ConvTranspose2d`: the 3-D gather with its depth axis
+    /// pinned to one (reuses [`Conv3dParams`] layout, `d = d_out = kd = 1`).
+    ConvTranspose2d {
+        params: Conv3dParams,
+    },
     /// Native WGSL `Op::ConvTranspose3d` (reuses [`Conv3dParams`] layout).
     ConvTranspose3d {
         params: Conv3dParams,
@@ -1328,6 +1333,7 @@ impl Step {
             | Step::Conv2d { .. }
             | Step::Conv2dTiled { .. }
             | Step::Conv3d { .. }
+            | Step::ConvTranspose2d { .. }
             | Step::ConvTranspose3d { .. }
             | Step::Pool1d { .. }
             | Step::Pool2d { .. }
@@ -1589,6 +1595,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Lstm { .. } => "lstm",
         Step::LstmGpu { .. } => "lstm_gpu",
         Step::ConvTranspose2dHost { .. } => "conv_transpose2d_host",
+        Step::ConvTranspose2d { .. } => "conv_transpose2d",
         Step::ConvTranspose3d { .. } => "conv_transpose3d",
         Step::ConvTranspose3dHost { .. } => "conv_transpose3d_host",
         Step::GroupNorm { .. } => "group_norm",

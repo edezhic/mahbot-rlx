@@ -6,9 +6,10 @@
 //! loops ([`time_rounds`], one cell alone, and [`time_round_robin`], round-robin
 //! across a cell set) that the three harnesses using them — `gguf_one_row_stream_rate`,
 //! `gguf_gemm_grouped_weight_reuse` and `gguf_gemm_grouped_split_rate` — time their
-//! calls with, plus the parity helpers, the pins' own refusal and the route-counter
-//! lock at the end of the file. `tests/common/` is not a test target of its own;
-//! each test binary pulls it in with `mod common;`.
+//! calls with, plus the parity helpers, the conv-transpose-2d route levers together
+//! with the pair bound its pins derive their bar from, the pins' own refusal and the
+//! route-counter lock at the end of the file. `tests/common/` is not a test target of
+//! its own; each test binary pulls it in with `mod common;`.
 
 // Each test binary declaring `mod common;` uses only the helpers it needs, so
 // the rest are dead code in that binary and `just lint` runs with `-D warnings`.
@@ -276,6 +277,167 @@ pub fn expected_attention_routes(
         decomposed: per_run.decomposed * reps as u64,
         serial: per_run.serial * reps as u64,
     }
+}
+
+/// The levers that put `Op::ConvTranspose2d` on its device gather step, spelled in
+/// one place because every pin that has to reach that arm needs the same routers out
+/// of the way: `RLX_WGPU_FORCE_HOST`, `RLX_WGPU_DISCRETE_HOST`, `RLX_WGPU_ALLOW_SHARD`
+/// and `RLX_WGPU_ALL_PARAMS_WEIGHT` zeroed, the shard-cap lever neutralised to a value
+/// the adapter clamps back to its own limit, and `RLX_WGPU_SHARD_GPU=1` — which turns
+/// the whole structure-host preference off, because on a Vulkan/DX12 adapter its
+/// discrete term would otherwise host this op on any adapter kind and no other lever
+/// clears it. The graphs these pins build carry no structural ops, so the opt-out's own
+/// caveat (it is unsafe for Kitten NSF) does not reach them.
+///
+/// The parked-weight lever belongs in that list too, as the other decision about this
+/// op's operands a pin should make for itself: the one pin that *wants* a parked weight
+/// sets it back to `1` after this call.
+///
+/// The skip stays the caller's own: ask
+/// `rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available())` after
+/// this, per file.
+pub fn conv_transpose2d_device_route_env() {
+    for key in [
+        "RLX_WGPU_FORCE_HOST",
+        "RLX_WGPU_DISCRETE_HOST",
+        "RLX_WGPU_ALL_PARAMS_WEIGHT",
+        "RLX_WGPU_ALLOW_SHARD",
+    ] {
+        rlx_ir::env::set(key, "0");
+    }
+    rlx_ir::env::set("RLX_WGPU_SHARD_GPU", "1");
+    rlx_ir::env::set("RLX_WGPU_SHARD_CAP_MIB", "1048576");
+}
+
+/// One conv-transpose-2d geometry: the operand shapes and the attribute set the bound
+/// walk below reads. The harnesses that derive a bar from their operands keep their
+/// case tables in this shape rather than in eleven loose numbers, so the walk takes it
+/// and there is one vocabulary for "which geometry" across them.
+pub struct ConvTranspose2dGeometry {
+    pub n: usize,
+    pub c_in: usize,
+    /// The weight's second dim — the output carries `c_out · groups` channels.
+    pub c_out: usize,
+    pub h: usize,
+    pub w: usize,
+    pub k: [usize; 2],
+    pub s: [usize; 2],
+    pub p: [usize; 2],
+    pub d: [usize; 2],
+    pub op: [usize; 2],
+    pub groups: usize,
+}
+
+impl ConvTranspose2dGeometry {
+    /// The output's `(h, w)`, from the tree's own shape rule rather than a locally
+    /// restated formula.
+    pub fn out(&self) -> (usize, usize) {
+        let axis = |size: usize, k: usize, s: usize, p: usize, d: usize, op: usize| {
+            rlx_ir::shape::conv_transpose2d_spatial_output(size, k, s, p, d, op)
+        };
+        (
+            axis(
+                self.h, self.k[0], self.s[0], self.p[0], self.d[0], self.op[0],
+            ),
+            axis(
+                self.w, self.k[1], self.s[1], self.p[1], self.d[1], self.op[1],
+            ),
+        )
+    }
+
+    /// The output's channel count, `c_out · groups`.
+    pub fn c_out_total(&self) -> usize {
+        self.c_out * self.groups
+    }
+}
+
+/// The bound on how far `Op::ConvTranspose2d`'s device gather can sit from the scalar
+/// oracle `rlx_cpu::kernels::conv_transpose2d_nchw`, derived from `geo`'s operands
+/// rather than from an absolute bar. Each route accumulates the same `terms` f32
+/// products per output element in its own order, so each can differ from the exact sum
+/// by no more than `γ_n · Σ|terms|` (`γ_n = n·u / (1 − n·u)`, `u = 2^-24` the f32 unit
+/// roundoff) and the two can differ from each other by at most twice that. Returns
+/// `(bound, worst terms, worst Σ|terms|)`.
+///
+/// The tap walk is input-centric and mirrors the oracle's own, so the `terms` it counts
+/// are the products the reference itself would have summed — every tap is counted,
+/// including the ones a zero operand makes vanish, which only loosens the bound and
+/// never the assertion. Padding, dilation, groups and output padding are all in it, so
+/// the decoder's unit-height geometry (one tap on the height axis, `p = 0`) is just a
+/// case of the same walk rather than a second derivation of it.
+///
+/// The grouping is the one thing it does not model, and it checks for it: `groups` must
+/// be positive and divide `c_in`, because the degenerate groupings are refusals on both
+/// routes rather than value cases, and the walk divides by `c_in / groups`.
+pub fn conv_transpose2d_pair_error_bound(
+    geo: &ConvTranspose2dGeometry,
+    x: &[f32],
+    w: &[f32],
+) -> (f64, usize, f64) {
+    /// The f32 unit roundoff, `2^-24`.
+    const U: f64 = 1.0 / (1u64 << 24) as f64;
+    // The walk groups channels on `c_in / groups`, so a grouping that does not
+    // partition `c_in` is outside what it covers — and both non-divisible groupings
+    // are refusals on either route rather than value cases, so there is no bound to
+    // derive for them. State the assumption instead of dividing by a zero.
+    assert!(
+        geo.groups >= 1 && geo.c_in.is_multiple_of(geo.groups),
+        "conv_transpose2d_pair_error_bound: c_in={} groups={} is a degenerate grouping, which \
+         the device route refuses and this walk does not cover",
+        geo.c_in,
+        geo.groups
+    );
+    let (h_out, w_out) = geo.out();
+    let c_out_total = geo.c_out_total();
+    let c_in_per_g = geo.c_in / geo.groups;
+    let mut abs_sum = vec![0f64; geo.n * c_out_total * h_out * w_out];
+    let mut terms = vec![0usize; abs_sum.len()];
+    for ni in 0..geo.n {
+        for ic in 0..geo.c_in {
+            let g = ic / c_in_per_g;
+            for iy in 0..geo.h {
+                for ix in 0..geo.w {
+                    let v = x[((ni * geo.c_in + ic) * geo.h + iy) * geo.w + ix] as f64;
+                    for ky in 0..geo.k[0] {
+                        // `oy` is the padded output coordinate the oracle's own `oy`
+                        // lives in; a tap outside `[p, p + out)` lands outside the
+                        // output and the oracle skips exactly the same ones.
+                        let oy = iy * geo.s[0] + ky * geo.d[0];
+                        if oy < geo.p[0] || oy - geo.p[0] >= h_out {
+                            continue;
+                        }
+                        let oy = oy - geo.p[0];
+                        for kx in 0..geo.k[1] {
+                            let ox = ix * geo.s[1] + kx * geo.d[1];
+                            if ox < geo.p[1] || ox - geo.p[1] >= w_out {
+                                continue;
+                            }
+                            let ox = ox - geo.p[1];
+                            for oc_off in 0..geo.c_out {
+                                let oc = g * geo.c_out + oc_off;
+                                let wt = w
+                                    [((ic * geo.c_out + oc_off) * geo.k[0] + ky) * geo.k[1] + kx]
+                                    as f64;
+                                let at = ((ni * c_out_total + oc) * h_out + oy) * w_out + ox;
+                                abs_sum[at] += (v * wt).abs();
+                                terms[at] += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut worst = (0f64, 0usize, 0f64);
+    for i in 0..abs_sum.len() {
+        let nu = terms[i] as f64 * U;
+        // Two accumulation orders of the same sum, so twice one order's bound.
+        let bound = 2.0 * nu / (1.0 - nu) * abs_sum[i];
+        if bound > worst.0 {
+            worst = (bound, terms[i], abs_sum[i]);
+        }
+    }
+    worst
 }
 
 /// The route counters are process-global, so tests in one binary that bracket

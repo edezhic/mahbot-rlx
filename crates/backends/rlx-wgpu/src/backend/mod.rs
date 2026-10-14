@@ -2107,6 +2107,52 @@ fn f16_weight_bind_range(
 
 const ARENA_STAGE_CAP: u64 = crate::buffer::SHARD_STAGE_RESERVE as u64;
 
+/// Byte ceiling the staging path applies to an operand of `id` that it has to copy
+/// into the bind window — because the operand is parked in the weight buffer or
+/// lies outside the window: the shard reserve on a striped arena, the arena's own
+/// scratch tail for a parked parameter, the dedicated reserve otherwise.
+///
+/// [`arena_off_in_window_or_stage`] refuses above this. A windowed step that has a
+/// host route asks here *before* it, so its refusal can name that route — the
+/// shared panic can only name the cap.
+///
+/// This is a **parallel derivation** of the thresholds that function applies at its
+/// own panic sites, kept beside `ARENA_STAGE_CAP` so the two read together; it is
+/// not the same expression, so any change to those thresholds has to be mirrored
+/// here. A divergence is a wrong decision in either direction, not just a worse
+/// message: a ceiling below what that function allows refuses a geometry the shared
+/// path would have served, and one above it lets the operand through to the shared
+/// panic, which cannot name this caller's route.
+fn arena_stage_ceiling(arena: &Arena, id: NodeId, base: u64) -> u64 {
+    let parked = crate::buffer::is_weight_off(arena.offset(id));
+    if arena.is_sharded() {
+        let s = arena.shard_size as u64;
+        let src = arena.offset(id) as u64;
+        let len = arena.len_of(id) as u64;
+        // An activation inside the window's own stripe is served by opening the
+        // whole stripe instead of staging (a parked operand never is — it lives in
+        // the weight buffer), and `arena_off_in_window_or_stage` checks the
+        // dedicated reserve before it gets that far, so that is all it is bounded
+        // by. Without this the asker would refuse a stripe the shared path serves.
+        if !parked
+            && s > 0
+            && src / s == base / s
+            && src.saturating_add(len).saturating_sub(1) / s == base / s
+        {
+            return ARENA_STAGE_CAP;
+        }
+        return crate::buffer::shard_stage_reserve() as u64;
+    }
+    // A parked parameter is judged against the dedicated reserve *and* the arena's
+    // own scratch tail, whichever is smaller.
+    let cap = if parked {
+        arena.scratch_bytes as u64
+    } else {
+        ARENA_STAGE_CAP
+    };
+    cap.min(ARENA_STAGE_CAP)
+}
+
 /// Output spatial positions computed per thread by `conv2d.wgsl` (register
 /// tiling for weight reuse). MUST equal `TILE` in that kernel.
 const CONV2D_TILE: u32 = 4;

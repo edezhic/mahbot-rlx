@@ -4,6 +4,11 @@
 
 // 3D NCDHW transposed conv (output-centric gather).
 // Weight: [c_in, c_out/groups, kd, kh, kw] (PyTorch ConvTranspose3d).
+//
+// This module carries both transposed-conv entry points and the gather they
+// share: `conv_transpose3d` and `conv_transpose2d`, the latter being the same
+// gather with the depth axis pinned to one (see its comment below). The file
+// keeps its `3d` name so that a path upstream has no reason to move stays put.
 
 struct Params {
     n: u32, c_in: u32, c_out: u32,
@@ -21,12 +26,9 @@ struct Params {
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>              params: Params;
 
-@compute @workgroup_size(64)
-fn conv_transpose3d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
-    let total = params.n * params.c_out * params.d_out * params.h_out * params.w_out;
-    let i = gid.x + gid.y * ngs.x * 64u;
-    if (i >= total) { return; }
-
+// Output-centric gather over the flattened [n, c_out, d_out, h_out, w_out]
+// output; the two entry points below share this body.
+fn conv_transpose_gather(i: u32) {
     let wo = i % params.w_out;
     let q1 = i / params.w_out;
     let ho = q1 % params.h_out;
@@ -70,4 +72,24 @@ fn conv_transpose3d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_
         }
     }
     arena[params.out_off + i] = acc;
+}
+
+@compute @workgroup_size(64)
+fn conv_transpose3d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
+    let total = params.n * params.c_out * params.d_out * params.h_out * params.w_out;
+    let i = gid.x + gid.y * ngs.x * 64u;
+    if (i >= total) { return; }
+    conv_transpose_gather(i);
+}
+
+// The 2-D NCHW form is this same gather with the depth axis pinned to one
+// (`d = d_out = kd = sd = 1`, `pd = 0`, `dd = 1`), which is how
+// `Op::ConvTranspose2d` is lowered. Its own entry point (and so its own
+// pipeline) keeps the 3-D name out of every route report of that operation.
+@compute @workgroup_size(64)
+fn conv_transpose2d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
+    let total = params.n * params.c_out * params.d_out * params.h_out * params.w_out;
+    let i = gid.x + gid.y * ngs.x * 64u;
+    if (i >= total) { return; }
+    conv_transpose_gather(i);
 }

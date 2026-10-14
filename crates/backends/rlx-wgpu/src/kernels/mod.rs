@@ -2710,6 +2710,7 @@ static CONV1D: OnceLock<Kernel> = OnceLock::new();
 static CONV3D: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_CTILE: OnceLock<Kernel> = OnceLock::new();
 static CONV_TRANSPOSE3D: OnceLock<Kernel> = OnceLock::new();
+static CONV_TRANSPOSE2D: OnceLock<Kernel> = OnceLock::new();
 static SCATTER_ADD: OnceLock<Kernel> = OnceLock::new();
 static TOPK: OnceLock<Kernel> = OnceLock::new();
 static WELCH_PEAKS_GPU: OnceLock<Kernel> = OnceLock::new();
@@ -4091,6 +4092,17 @@ pub fn conv_transpose3d_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu conv_transpose3d",
             CONV_TRANSPOSE3D_WGSL,
             "conv_transpose3d",
+        )
+    })
+}
+/// The 2-D entry point of the same module (see `conv_transpose3d.wgsl`).
+pub fn conv_transpose2d_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV_TRANSPOSE2D.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv_transpose2d",
+            CONV_TRANSPOSE3D_WGSL,
+            "conv_transpose2d",
         )
     })
 }

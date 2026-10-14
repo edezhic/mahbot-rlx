@@ -44,9 +44,9 @@ use crate::kernels::{
     batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_c64_kernel,
     binary_kernel, cast_f32_to_f16_kernel, cast_kernel, compare_kernel, complex_cast_kernel,
     complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel,
-    conv_transpose3d_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
-    conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel,
-    copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
+    conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel, conv1d_tiled_kernel,
+    conv2d_kernel, conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_kernel,
+    copy_kernel, copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
     dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
     elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
     fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
@@ -653,27 +653,33 @@ fn assert_host_route_stageable(graph: &Graph, arena: &Arena, node: &rlx_ir::Node
 /// form, which stages only the tensors it touches. A parameter parked in the
 /// separate weight buffer loses `WEIGHT_BUF_TAG` in that cast, and an arena past
 /// `u32::MAX` bytes truncates every offset, so either geometry would read and
-/// write the wrong bytes silently. Refuse loudly instead; `parked_hint` names the
-/// route that can address a parked operand.
+/// write the wrong bytes silently. Refuse loudly instead; `escape_hint` names the
+/// step that can serve either geometry, because both are ones this route cannot
+/// address and the device route it competes with can.
 ///
 /// For the norm and the flip that route is the device step they take by default,
 /// which is what keeps a plan that parks every parameter working: the device step
 /// stages such an operand, and the generic packed host route (`Step::HostOp`)
 /// stages it too — but an unsharded arena with the norm forced onto this route
 /// reaches neither, and this refusal is then the honest answer rather than a wrong
-/// one. The transposed conv has no device step on this backend at all.
+/// one. `Op::ConvTranspose2d` takes a device step by default too and falls back to
+/// this host route behind `RLX_WGPU_CONV_HOST` (or the structure-host preference,
+/// which covers `RLX_WGPU_FORCE_HOST`, the discrete-adapter term and a sharded
+/// arena), so a parked operand or an arena past `u32::MAX` reaches this refusal
+/// exactly when that route is the one forced. `Op::ConvTranspose3d`'s host step
+/// carries the same 32-bit offsets but is not wired here.
 fn assert_byte_offset_host_route(
     graph: &Graph,
     arena: &Arena,
     node: &rlx_ir::Node,
-    parked_hint: &str,
+    escape_hint: &str,
 ) {
     assert_param_operands_are_lane_readable(graph, arena, node);
     assert!(
         !any_parked_operand(arena, node),
         "rlx-wgpu: REFUSED (parked {:?} operand): the host step addresses its operands by 32-bit \
          byte offsets into the activation arena, which drop the weight-buffer tag ({}). Avoid \
-         parking this operand, or {parked_hint}.",
+         parking this operand, or {escape_hint}.",
         node.op.kind(),
         parked_operand_report(arena),
     );
@@ -681,10 +687,65 @@ fn assert_byte_offset_host_route(
         arena.size <= u32::MAX as usize,
         "rlx-wgpu: REFUSED ({:?} arena too large): the host step addresses its operands by 32-bit \
          byte offsets into the activation arena and this arena is {} bytes, so its offsets would \
-         truncate. Shrink the arena, or run the op on a backend whose host route addresses its \
-         operands by 64-bit offsets.",
+         truncate. Shrink the arena, or {escape_hint}.",
         node.op.kind(),
         arena.size,
+    );
+}
+
+/// The refusal `arena_off_in_window_or_stage` makes about an operand of
+/// `Op::ConvTranspose2d`'s device step: one above the reserve the step would have
+/// to copy it into. The shared helper asks the same question, but its message can
+/// only name the cap — only a step that has a route back to the host can name it —
+/// so the op asks first, where it can.
+///
+/// It asks with the shared window predicates (`arena_whole_arena_bind`,
+/// `arena_tensor_in_window`) and [`arena_stage_ceiling`], which sits beside the caps
+/// `arena_off_in_window_or_stage` applies so the two read together — but the ceiling
+/// is a parallel derivation of those thresholds rather than the same expression, and
+/// has to be kept in step with them. The guard is deliberately the weaker of the two:
+/// an operand it lets through still reaches the shared refusal, which keeps the last
+/// word.
+///
+/// The shared helper's other refusal here — a graph parameter above the adapter's
+/// binding limit — is deliberately not announced, because the host route cannot
+/// serve such an operand either (it stages through the same reserves), so naming it
+/// would be advice that does not work.
+fn assert_conv_transpose_operands_addressable(
+    arena: &Arena,
+    device: &wgpu::Device,
+    id: rlx_ir::NodeId,
+    base: u64,
+    size: u64,
+) {
+    let max_binding = device.limits().max_storage_buffer_binding_size;
+    // The window `arena_off_in_bind_window` will judge the operand against: the
+    // whole arena when that one binds (it is judged against that window, not the
+    // caller's), the caller's window otherwise.
+    let (base, size) = arena_whole_arena_bind(arena, max_binding).unwrap_or((base, size));
+    // False for a parked operand whatever the window is, so a hit here covers
+    // both reasons the shared path would fall through to staging — and a miss is
+    // the shared path's own answer that there is nothing to stage.
+    if arena_tensor_in_window(arena, id, base, size) {
+        return;
+    }
+    let len = arena.len_of(id) as u64;
+    let cap = arena_stage_ceiling(arena, id, base);
+    // A parked operand is refused by the host route too (it stages through the same
+    // reserves), so sending it there would be advice that does not work.
+    let escape = if crate::buffer::is_weight_off(arena.offset(id)) {
+        "Keep the operand in the activation arena — parking is what RLX_WGPU_ALL_PARAMS_WEIGHT \
+         forces and what a split plan does when the arena cannot hold the weights. \
+         RLX_WGPU_SHARD_STAGE_MIB only lowers the reserve a parked operand has to fit, so it is \
+         not a lever for making room, and the host route cannot take a parked operand either."
+    } else {
+        "Run this op on the host route (RLX_WGPU_CONV_HOST=1, or RLX_WGPU_FORCE_HOST=1), which \
+         reads its operands straight out of the arena instead of staging them."
+    };
+    assert!(
+        len <= cap,
+        "rlx-wgpu: REFUSED (Op::ConvTranspose2d operand too large to stage): node {id:?} is {len} \
+         bytes and the device step must copy it into a {cap}-byte staging reserve. {escape}"
     );
 }
 
@@ -803,7 +864,9 @@ fn wgpu_prefer_host_norm2d(arena: &crate::buffer::Arena) -> bool {
 
 /// Conv2d SPIR-V is still wrong on discrete NVIDIA even for unsharded arenas
 /// (Kitten vocoder 1×L "2d" convs → NSF mush). Keep hosting independently of
-/// [`wgpu_prefer_host_fallback`].
+/// [`wgpu_prefer_host_fallback`]. Both transposed convs are gated by this too —
+/// `Op::ConvTranspose3d`'s device step sits behind it as well, and
+/// `Op::ConvTranspose2d` follows the sibling under the same gate.
 fn wgpu_prefer_conv_host(arena: &crate::buffer::Arena) -> bool {
     wgpu_prefer_structure_host(arena) || rlx_ir::env::flag("RLX_WGPU_CONV_HOST")
 }
@@ -7762,41 +7825,222 @@ pub(crate) fn compile_static_inner(
             } => {
                 let in_shape = &graph.node(node.inputs[0]).shape;
                 let out_shape = &node.shape;
-                // Host route, and this op's only one: the step carries 32-bit byte offsets
-                // into the activation arena, so a parameter parked in the separate weight
-                // buffer would be read from the wrong bytes silently (see
-                // `assert_byte_offset_host_route`).
-                assert_byte_offset_host_route(
-                    &graph,
-                    &arena,
-                    node,
-                    "keep this weight in the activation arena (it is what RLX_WGPU_ALL_PARAMS_WEIGHT parks), \
-                     or run the op on a backend whose host route stages a parked parameter",
-                );
-                schedule.push(Step::ConvTranspose2dHost {
-                    src_byte_off: arena.offset(node.inputs[0]) as u32,
-                    weight_byte_off: arena.offset(node.inputs[1]) as u32,
-                    dst_byte_off: arena.offset(node.id) as u32,
-                    n: in_shape.dim(0).unwrap_static() as u32,
-                    c_in: in_shape.dim(1).unwrap_static() as u32,
-                    h: in_shape.dim(2).unwrap_static() as u32,
-                    w_in: in_shape.dim(3).unwrap_static() as u32,
-                    c_out: out_shape.dim(1).unwrap_static() as u32,
-                    h_out: out_shape.dim(2).unwrap_static() as u32,
-                    w_out: out_shape.dim(3).unwrap_static() as u32,
-                    kh: kernel_size[0] as u32,
-                    kw: kernel_size[1] as u32,
-                    sh: stride[0] as u32,
-                    sw: stride[1] as u32,
-                    ph: padding[0] as u32,
-                    pw: padding[1] as u32,
-                    dh: dilation[0] as u32,
-                    dw: dilation[1] as u32,
-                    groups: *groups as u32,
-                });
-                // Host step: schedule-only, like `MsDeformAttnHost`/`UmapKnnHost`.
-                // The uniform/bind_group lanes are indexed by GPU-step count
-                // (`gpu_ui`), so host steps must NOT push to them.
+                if wgpu_prefer_conv_host(&arena) {
+                    // Host route: the compact BLAS-backed staging, forced here by the lever
+                    // or the structure-host preference — and the one route whose 32-bit arena
+                    // byte offsets cannot serve a parked parameter or an arena past u32::MAX,
+                    // which is what the refusal below is about. The device step this op takes
+                    // otherwise stages a parked operand instead.
+                    assert_byte_offset_host_route(
+                        &graph,
+                        &arena,
+                        node,
+                        "let the op take its device step instead — drop RLX_WGPU_CONV_HOST and the \
+                         structure-host preference (RLX_WGPU_FORCE_HOST, a discrete adapter, a \
+                         sharded arena), which reads its operands through the bind window rather \
+                         than as 32-bit arena offsets",
+                    );
+                    schedule.push(Step::ConvTranspose2dHost {
+                        src_byte_off: arena.offset(node.inputs[0]) as u32,
+                        weight_byte_off: arena.offset(node.inputs[1]) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c_in: in_shape.dim(1).unwrap_static() as u32,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w_in: in_shape.dim(3).unwrap_static() as u32,
+                        c_out: out_shape.dim(1).unwrap_static() as u32,
+                        h_out: out_shape.dim(2).unwrap_static() as u32,
+                        w_out: out_shape.dim(3).unwrap_static() as u32,
+                        kh: kernel_size[0] as u32,
+                        kw: kernel_size[1] as u32,
+                        sh: stride[0] as u32,
+                        sw: stride[1] as u32,
+                        ph: padding[0] as u32,
+                        pw: padding[1] as u32,
+                        dh: dilation[0] as u32,
+                        dw: dilation[1] as u32,
+                        groups: *groups as u32,
+                    });
+                    // Host step: schedule-only, like `MsDeformAttnHost`/`UmapKnnHost`.
+                    // The uniform/bind_group lanes are indexed by GPU-step count
+                    // (`gpu_ui`), so host steps must NOT push to them.
+                } else {
+                    // Device route: the sibling 3-D gather with the depth axis pinned to one,
+                    // so the 2-D geometry is the 3-D one at d = d_out = kd = sd = 1, pd = 0,
+                    // dd = 1.
+                    //
+                    // The device step reads its operands as one f32 lane per element off
+                    // the arena, so a parameter the arena does not store that way (packed
+                    // U8, resized BF16) is refused rather than misread. The host route is
+                    // guarded the same way, inside `assert_byte_offset_host_route`.
+                    assert_param_operands_are_lane_readable(&graph, &arena, node);
+                    //
+                    // The gather groups on `c_in / groups` and divides the output channel by
+                    // `c_out / groups`, so a group count that does not partition the input
+                    // channels is refused rather than run as a different operator. The two
+                    // non-divisible cases are different failures with different ways out: with
+                    // fewer channels than groups no group is ever complete and the gather would
+                    // produce the zeroed output the replaced host route produced, while with
+                    // more channels it would accumulate the ones inside the whole groups it can
+                    // form and silently drop the rest — a geometry the host route cannot take
+                    // either, since its own scatter maps those surplus channels to group indices
+                    // past the last one and traps on the output write.
+                    let c_in = in_shape.dim(1).unwrap_static() as u32;
+                    assert!(
+                        *groups >= 1,
+                        "rlx-wgpu: REFUSED (degenerate Op::ConvTranspose2d grouping): groups=0 \
+                         would make the device gather divide by a zero group size. There is no route \
+                         to fall back to here — the host step divides by it too — so use a positive \
+                         group count."
+                    );
+                    if !c_in.is_multiple_of(*groups as u32) {
+                        if (c_in as usize) < *groups {
+                            panic!(
+                                "rlx-wgpu: REFUSED (degenerate Op::ConvTranspose2d grouping): \
+                                 groups={} exceeds the {c_in} input channels, so no group is ever \
+                                 complete and the gather would leave its output zero. The host route \
+                                 zeroes it the same way (RLX_WGPU_CONV_HOST=1, or \
+                                 RLX_WGPU_FORCE_HOST=1) — that is where this geometry's previous \
+                                 behaviour lives — or use a group count that divides the input \
+                                 channel count.",
+                                groups
+                            );
+                        }
+                        panic!(
+                            "rlx-wgpu: REFUSED (degenerate Op::ConvTranspose2d grouping): groups={} \
+                             does not divide {c_in} input channels, so the gather would accumulate \
+                             only the channels inside the whole groups it can form and silently \
+                             drop the rest. No route computes this geometry: the host route's own \
+                             scatter walks its channel indices past its output and traps there. \
+                             Use a group count that divides the input channel count.",
+                            groups
+                        );
+                    }
+                    let in_id = node.inputs[0];
+                    let w_id = node.inputs[1];
+                    // The IR validates the weight's channel dims against the input's but not
+                    // its taps, and the gather indexes the weight with *this op's*
+                    // `kernel_size` — so a graph whose attribute disagrees with the weight
+                    // would read across the operand inside the binding instead of failing.
+                    // The IR's own shape rule says the weight is `[C_in, C_out/g, kH, kW]`,
+                    // so the two are the same number by contract.
+                    //
+                    // Only this arm is asked. The host route sizes its staging from the same
+                    // declared attribute (`run_conv2d_backward_input` copies
+                    // `C_out·C_in/g·kH·kW` f32 starting at the weight), so an over-declared
+                    // tap count makes it read neighbouring arena bytes just as silently —
+                    // a pre-existing behaviour of that route, reported with this one rather
+                    // than changed by it.
+                    let w_shape = &graph.node(w_id).shape;
+                    let (wkh, wkw) = (
+                        w_shape.dim(2).unwrap_static(),
+                        w_shape.dim(3).unwrap_static(),
+                    );
+                    assert!(
+                        kernel_size[0] == wkh && kernel_size[1] == wkw,
+                        "rlx-wgpu: REFUSED (Op::ConvTranspose2d kernel size): the op declares \
+                         {}x{} taps and the weight is {wkh}x{wkw} per channel, so the device gather \
+                         would read across its operand. Declare the kernel size the weight really \
+                         has.",
+                        kernel_size[0],
+                        kernel_size[1]
+                    );
+                    let ct_win = vec![node.id, in_id, w_id];
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    let ct_fits = arena_span_bytes(&arena, &ct_win) <= max_binding;
+                    let mut scratch = arena.scratch_off as u64;
+                    let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &mut scratch,
+                        &ct_win,
+                    );
+                    if !ct_fits && !param_anchor {
+                        base = arena_bind_window_covering_scratch_if_needed(
+                            &arena, base, size, scratch,
+                        );
+                    }
+                    assert_conv_transpose_operands_addressable(
+                        &arena,
+                        &dev.device,
+                        in_id,
+                        base,
+                        size,
+                    );
+                    let in_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        in_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    assert_conv_transpose_operands_addressable(
+                        &arena,
+                        &dev.device,
+                        w_id,
+                        base,
+                        size,
+                    );
+                    let w_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        w_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let p2 = Conv3dParams {
+                        n: in_shape.dim(0).unwrap_static() as u32,
+                        c_in,
+                        c_out: out_shape.dim(1).unwrap_static() as u32,
+                        // The depth axis is pinned to one; the gather reads and writes the
+                        // same slice it would for a 2-D NCHW tensor.
+                        d: 1,
+                        h: in_shape.dim(2).unwrap_static() as u32,
+                        w: in_shape.dim(3).unwrap_static() as u32,
+                        d_out: 1,
+                        h_out: out_shape.dim(2).unwrap_static() as u32,
+                        w_out: out_shape.dim(3).unwrap_static() as u32,
+                        kd: 1,
+                        // Taps come from the op's attribute, as they do on the host step —
+                        // not from the weight shape, which the 3-D form reads.
+                        kh: kernel_size[0] as u32,
+                        kw: kernel_size[1] as u32,
+                        sd: 1,
+                        sh: stride[0] as u32,
+                        sw: stride[1] as u32,
+                        pd: 0,
+                        ph: padding[0] as u32,
+                        pw: padding[1] as u32,
+                        dd: 1,
+                        dh: dilation[0] as u32,
+                        dw: dilation[1] as u32,
+                        groups: *groups as u32,
+                        in_off,
+                        w_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        bias_off: 0,
+                        has_bias: 0,
+                        _p1: 0,
+                        _p2: 0,
+                    };
+                    schedule.push(Step::ConvTranspose2d { params: p2 });
+                    let ck = conv_transpose2d_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<Conv3dParams>());
+                    let bg = bind_arena_window(&dev.device, ck, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
             }
             Op::Conv3d {
                 stride,
@@ -7942,7 +8186,7 @@ pub(crate) fn compile_static_inner(
                 let dw = dilation[2] as u32;
                 let groups_u = (*groups).max(1) as u32;
 
-                if wgpu_prefer_structure_host(&arena) || rlx_ir::env::flag("RLX_WGPU_CONV_HOST") {
+                if wgpu_prefer_conv_host(&arena) {
                     schedule.push(Step::ConvTranspose3dHost {
                         src_byte_off: arena.offset(in_id) as u32,
                         weight_byte_off: arena.offset(w_id) as u32,
