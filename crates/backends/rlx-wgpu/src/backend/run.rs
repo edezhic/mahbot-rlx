@@ -1829,11 +1829,25 @@ impl WgpuExecutable {
                                         *batch,
                                     );
                                 } else if m_s >= 32 && *n >= 64 {
+                                    // Wide path: whole row tiles, then one remainder tile for the rows
+                                    // the tile grid would otherwise round up — so a 96-row node computes
+                                    // 96 rows, not 128. Both dispatches share this step's bind group, and
+                                    // the rule asks for the remainder exactly when the variant ships a
+                                    // pipeline to run it (both read `WideVariant::remainder`).
+                                    let grid = crate::kernels::wide_grid(
+                                        crate::kernels::wide_variant(),
+                                        m_s,
+                                        *n,
+                                    );
                                     pass.set_pipeline(&mm_w_active.pipeline);
-                                    // Same source of truth as the kernel pick.
-                                    let gx = n.div_ceil(64);
-                                    let gy = m_s.div_ceil(crate::kernels::wide_variant().tile_m());
-                                    pass.dispatch_workgroups(gx, gy, *batch);
+                                    pass.dispatch_workgroups(grid.gx, grid.full, *batch);
+                                    if grid.tail > 0
+                                        && let Some(tail) =
+                                            crate::kernels::matmul_wide_tail_kernel(&dev.device)
+                                    {
+                                        pass.set_pipeline(&tail.pipeline);
+                                        pass.dispatch_workgroups(grid.gx, grid.tail, *batch);
+                                    }
                                 } else {
                                     pass.set_pipeline(&mm_k.pipeline);
                                     pass.dispatch_workgroups(

@@ -154,9 +154,14 @@ cooperative-matrix support:
   selects wide f32 matmul for stress weights; **N > 768** also defaults to wide
   f32 because RTX coop B-load at large N stays ~4e-3 vs f16-ref.
   Opt back into coop for large N with `RLX_WGPU_COOP_F16_VK_LARGE_N=1`.
-- Fallback wide path: the vectorised **`matmul_wide_vec4.wgsl`**. The 64×64
+- Fallback wide path: the vectorised **`matmul_wide_vec4.wgsl`**, which ships a
+  second, half-height entry point (`matmul_wide_vec4_tail`, 32 rows): the row axis
+  is dispatched as whole 64-row tiles plus one remainder tile whenever the row
+  count leaves a remainder that fits, so a 96-row node computes 96 rows, not 128
+  — bit-identical to the single rounded-up grid it replaces. The 64×64
   **`matmul_wide_nv.wgsl`** is behind `RLX_WGPU_WIDE_NV=1`, and
-  **`matmul_wide.wgsl`** behind `RLX_WGPU_WIDE_STD=1`.
+  **`matmul_wide.wgsl`** behind `RLX_WGPU_WIDE_STD=1`; both pins keep the
+  single-tile dispatch.
 
 When a matmul operand is an `Activation`, the lowering **host-mirrors** it
 each `run()` (`apply_activation` + `write_f32`, same f16 shadow as Params)

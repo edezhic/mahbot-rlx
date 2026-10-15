@@ -47,7 +47,7 @@ function params({ m, k, n, batch = 1, aOff = 0, bOff, cOff, actId = 0xffff }) {
   return p;
 }
 
-async function runKernel(file, entry, { m, k, n, wgX, wgY }, A, B) {
+async function runKernel(file, entry, { m, k, n, wgX, wgY, tailEntry, tailWgY }, A, B) {
   const src = await Deno.readTextFile(KERNELS + file);
   // A spec WGSL validator runs here; a browser-illegal construct throws.
   const module = device.createShaderModule({ code: src });
@@ -76,23 +76,43 @@ async function runKernel(file, entry, { m, k, n, wgX, wgY }, A, B) {
   });
   device.queue.writeBuffer(ubo, 0, params({ m, k, n, bOff, cOff }));
 
-  const pipeline = device.createComputePipeline({
-    layout: "auto",
-    compute: { module, entryPoint: entry },
-  });
-  const bg = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
+  const binds = [
+    { binding: 0, resource: { buffer: buf } },
+    { binding: 1, resource: { buffer: ubo } },
+  ];
+  // ONE pipeline layout and ONE bind group for both entry points, as the run path
+  // binds them (it swaps the pipeline mid-pass and leaves the bind group set):
+  // an "auto" layout is per entry point, so a shared layout is the only way this
+  // harness can exercise the shipped single-bind-group usage.
+  const bgl = device.createBindGroupLayout({
     entries: [
-      { binding: 0, resource: { buffer: buf } },
-      { binding: 1, resource: { buffer: ubo } },
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
     ],
   });
+  const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+  const bg = device.createBindGroup({ layout: bgl, entries: binds });
+  const pipeline = device.createComputePipeline({
+    layout,
+    compute: { module, entryPoint: entry },
+  });
+  const tailPipeline = tailWgY
+    ? device.createComputePipeline({
+        layout,
+        compute: { module, entryPoint: tailEntry },
+      })
+    : null;
 
   const enc = device.createCommandEncoder();
   const pass = enc.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bg);
   pass.dispatchWorkgroups(wgX, wgY, 1);
+  if (tailPipeline) {
+    // Same pass, same bind group: the two dispatches cover disjoint output rows.
+    pass.setPipeline(tailPipeline);
+    pass.dispatchWorkgroups(wgX, tailWgY, 1);
+  }
   pass.end();
 
   const readback = device.createBuffer({
@@ -132,25 +152,30 @@ function refMatmul(A, B, m, k, n) {
 }
 
 const CASES = [
-  // [file, entry, m, k, n, tileN, tileM] — grid matches the Rust dispatcher:
+  // [file, entry, m, k, n, tileN, tileM, tailEntry, tailTileM] — grid matches the
+  // Rust dispatcher (`kernels::wide_grid` for the wide path):
   //   matmul       -> (n/32, m/32)
   //   matmul_wide  -> (n/64, m/32)
+  //   matmul_wide_vec4 -> (n/64, floor(m/tileM)) + tail (n/64, ceil((m%tileM)/tailTileM))
   ["matmul.wgsl", "matmul", 64, 128, 96, 32, 32],
   ["matmul.wgsl", "matmul", 33, 40, 31, 32, 32], // ragged: exercises bounds checks
   ["matmul_wide.wgsl", "matmul_wide", 128, 256, 192, 64, 32],
   ["matmul_wide.wgsl", "matmul_wide", 96, 72, 130, 64, 32], // ragged
   // The default wide kernel, and the one a browser actually reaches.
   ["matmul_wide_vec4.wgsl", "matmul_wide_vec4", 128, 256, 192, 64, 64],
-  ["matmul_wide_vec4.wgsl", "matmul_wide_vec4", 96, 72, 130, 64, 64], // ragged
+  ["matmul_wide_vec4.wgsl", "matmul_wide_vec4", 96, 72, 130, 64, 64,
+    "matmul_wide_vec4_tail", 32], // ragged: 64-row tiles plus the 32-row remainder
 ];
 
 let failed = 0;
-for (const [file, entry, m, k, n, tn, tm] of CASES) {
+for (const [file, entry, m, k, n, tn, tm, tailEntry, tailTileM] of CASES) {
   const A = make(m, k, 7), B = make(k, n, 99);
+  const wgY = tailEntry ? Math.floor(m / tm) : Math.ceil(m / tm);
+  const tailWgY = tailEntry ? Math.ceil((m % tm) / tailTileM) : 0;
   const got = await runKernel(
     file,
     entry,
-    { m, k, n, wgX: Math.ceil(n / tn), wgY: Math.ceil(m / tm) },
+    { m, k, n, wgX: Math.ceil(n / tn), wgY, tailEntry, tailWgY },
     A,
     B,
   );

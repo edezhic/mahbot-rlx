@@ -82,7 +82,8 @@ pub(crate) const ATTENTION_DECOMPOSE_MAX_SCRATCH_BYTES: u64 = 64 << 20;
 /// Rows per workgroup the route's multiplies dispatch their `m = seq_q` rows in:
 /// 32 is the narrowest row tile of the kernels the run can pick for them (the
 /// plain f32 kernel's, and `WideVariant::Std`'s — the vectorised variants take
-/// 64), so it is the conservative divisor for that extent's cap. Only that
+/// 64 rows per workgroup, whole tiles plus a 32-row remainder tile), so it is
+/// the conservative divisor for that extent's cap. Only that
 /// extent needs one: `n` is `seq_k` on the score multiply and `v_head_dim` on the
 /// value one, and the scratch conjunct already bounds `tiles · seq_k` by the
 /// reserve's own `16.7M` floats, which keeps `n`'s tiles (at most 16384 keys per

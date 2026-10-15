@@ -2803,6 +2803,22 @@ pub fn matmul_wide_vec4_kernel(device: &wgpu::Device) -> &'static Kernel {
     })
 }
 
+/// The remainder pipeline of the wide path: the same source as
+/// `matmul_wide_vec4_kernel` at half the row tile (`matmul_wide_vec4_tail`,
+/// 16x8 threads / 32 rows), so the rows the full-tile grid rounds up are
+/// computed once instead of as a whole padded tile (see `wide_grid`).
+pub fn matmul_wide_vec4_tail_kernel(device: &wgpu::Device) -> &'static Kernel {
+    static MATMUL_WIDE_VEC4_TAIL: std::sync::OnceLock<Kernel> = std::sync::OnceLock::new();
+    MATMUL_WIDE_VEC4_TAIL.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu matmul_wide_vec4_tail",
+            MATMUL_WIDE_VEC4_WGSL,
+            "matmul_wide_vec4_tail",
+        )
+    })
+}
+
 pub fn matmul_wide_nv_kernel(device: &wgpu::Device) -> &'static Kernel {
     MATMUL_WIDE_NV.get_or_init(|| {
         build_kernel(
@@ -3093,14 +3109,22 @@ pub fn matmul_coop_f32_active_kernel(device: &wgpu::Device) -> Option<&'static K
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WideVariant {
     /// `matmul_wide` — 32×64 tile, 64 threads. Scalar; ~2.5% of peak.
+    /// Keeps the single rounded-up dispatch: no remainder pipeline.
     Std,
     /// `matmul_wide_nv` — 64×64 tile, 256 threads. Scalar.
+    /// Keeps the single rounded-up dispatch: no remainder pipeline.
     Nv,
     /// `matmul_wide_vec4` — 64×64 tile, 256 threads, `vec4` tiles. Default:
     /// measured 3.0–4.4× `Std` on an M4 Pro and bit-identical to it
-    /// (`tests/matmul_vec4_parity.rs`).
+    /// (`tests/matmul_vec4_parity.rs`). Also ships the half-height remainder
+    /// configuration (`matmul_wide_vec4_tail`, `WIDE_TAIL_M` rows).
     Vec4,
 }
+
+/// The row tile of the wide path's remainder pipeline: `matmul_wide_vec4_tail`,
+/// 16×8 threads / 32 rows. Mirrors `TAIL_M` in `matmul_wide_vec4.wgsl`, and the
+/// geometry pin in this module's tests holds the two together.
+pub const WIDE_TAIL_M: u32 = 32;
 
 impl WideVariant {
     /// Output rows per workgroup — the `m` divisor for the dispatch grid. All
@@ -3109,6 +3133,19 @@ impl WideVariant {
         match self {
             WideVariant::Std => 32,
             WideVariant::Nv | WideVariant::Vec4 => 64,
+        }
+    }
+
+    /// The row count of this variant's remainder pipeline and the entry point
+    /// that runs it, for the variants that ship one; `None` keeps the single
+    /// rounded-up dispatch, so pinning the variant reproduces the pre-remainder
+    /// geometry exactly. One match decides both halves, so the grid
+    /// [`wide_grid`] builds and the pipeline [`matmul_wide_tail_kernel`]
+    /// records cannot disagree.
+    fn remainder(self) -> Option<(u32, fn(&wgpu::Device) -> &'static Kernel)> {
+        match self {
+            WideVariant::Vec4 => Some((WIDE_TAIL_M, matmul_wide_vec4_tail_kernel)),
+            WideVariant::Std | WideVariant::Nv => None,
         }
     }
 }
@@ -3131,6 +3168,59 @@ pub fn matmul_wide_active_kernel(device: &wgpu::Device) -> &'static Kernel {
         WideVariant::Std => matmul_wide_kernel(device),
         WideVariant::Nv => matmul_wide_nv_kernel(device),
         WideVariant::Vec4 => matmul_wide_vec4_kernel(device),
+    }
+}
+
+/// The active variant's remainder pipeline, `Some` exactly when [`wide_grid`]
+/// can ask for a remainder workgroup — both read [`WideVariant::remainder`].
+pub fn matmul_wide_tail_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    wide_variant().remainder().map(|(_, build)| build(device))
+}
+
+/// One wide-path matmul's row-axis split: `full` workgroups of
+/// `variant.tile_m()` rows, then `tail` workgroups of the variant's remainder
+/// tile (`WIDE_TAIL_M` rows), all over `gx` column tiles of 64.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WideGrid {
+    pub gx: u32,
+    pub full: u32,
+    pub tail: u32,
+}
+
+/// The dispatch grid of the wide path, derived from the variant alone so the
+/// kernel pick and the grid cannot disagree (see [`WideVariant`]'s note).
+///
+/// The rows `full` and `tail` cover add up to at least `m_s` and never to more
+/// than the single rounded-up grid `m_s.div_ceil(tile_m) * tile_m`, so the split
+/// removes padded rows and can never add one. Two kinds of row count keep the
+/// single rounded-up grid, both with `tail = 0`:
+///
+/// - below one whole tile: the remainder tile is anchored after the last full
+///   one, so it would start at row 0 and a 33..63-row node would lose every row
+///   above 32 — the hole, not the padding, is why this case stays whole;
+/// - a remainder wider than the remainder tile: two remainders would compute the
+///   same 64 rows through two workgroups and two passes over the B panel.
+///
+/// A variant that ships no remainder pipeline ([`WideVariant::remainder`]) has
+/// no remainder tile to record and always takes the single grid.
+pub fn wide_grid(variant: WideVariant, m_s: u32, n: u32) -> WideGrid {
+    let tile_m = variant.tile_m();
+    let gx = n.div_ceil(64);
+    match variant.remainder() {
+        Some((tail_m, _))
+            if m_s >= tile_m && !m_s.is_multiple_of(tile_m) && m_s % tile_m <= tail_m =>
+        {
+            WideGrid {
+                gx,
+                full: m_s / tile_m,
+                tail: 1,
+            }
+        }
+        _ => WideGrid {
+            gx,
+            full: m_s.div_ceil(tile_m),
+            tail: 0,
+        },
     }
 }
 
@@ -4505,8 +4595,8 @@ pub fn matmul_qkv_coop_f16_vk_widen_kernel(device: &wgpu::Device) -> Option<&'st
 #[cfg(test)]
 mod tests {
     use super::{
-        CONV_TRANSPOSE2D_TILED_WGSL, ELEMENTWISE_REGION_WGSL, TILED_TILE_CO, TILED_TILE_U,
-        conv_transpose2d_tiled_grid,
+        CONV_TRANSPOSE2D_TILED_WGSL, ELEMENTWISE_REGION_WGSL, MATMUL_WIDE_VEC4_WGSL, TILED_TILE_CO,
+        TILED_TILE_U, WIDE_TAIL_M, WideGrid, WideVariant, conv_transpose2d_tiled_grid, wide_grid,
     };
 
     /// `conv_transpose2d_tiled.wgsl` parses and validates under the WebGPU
@@ -4555,6 +4645,153 @@ mod tests {
             conv_transpose2d_tiled_grid(3 * TILED_TILE_U + 1, 1, 2 * TILED_TILE_CO + 1),
             [4, 3, 1],
         );
+    }
+
+    /// `matmul_wide_vec4.wgsl` holds both wide-path geometries: the full 64-row
+    /// tile `run` sets as the pipeline, and the half-height remainder entry
+    /// `wide_grid` records for the rows the full-tile grid rounds up. Same
+    /// device-free argument as the conv pin above, with one extra stake — the two
+    /// entry points are one body at two geometries, so a row count they disagree
+    /// with `wide_grid` about is a coverage hole (the remainder tile reaching too
+    /// few rows) or a padded one (reaching rows the full grid already stored).
+    #[test]
+    fn wide_matmul_shader_matches_its_dispatch_geometry() {
+        let module = naga::front::wgsl::parse_str(MATMUL_WIDE_VEC4_WGSL).expect("wgsl parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("wgsl validate without any optional capability");
+
+        // Both entry points, each a call to the SAME function with no loop of its
+        // own — name, workgroup size, one shared callee. A second copy of the hot
+        // loop would be free to drift from the first, and the drift would show up
+        // as a wrong number in one of the two, not as a compile error.
+        let mut entries = Vec::new();
+        for e in &module.entry_points {
+            let stmts = &*e.function.body;
+            let calls = stmts
+                .iter()
+                .filter_map(|s| match s {
+                    naga::Statement::Call { function, .. } => Some(*function),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                calls.len(),
+                1,
+                "`{}` must call exactly one function, its tile: {:?}",
+                e.name,
+                e.function.body
+            );
+            assert!(
+                !stmts
+                    .iter()
+                    .any(|s| matches!(s, naga::Statement::Loop { .. })),
+                "`{}` holds a loop of its own: the two geometries must be one body \
+                 at two tiles, not a copy of the body each: {:?}",
+                e.name,
+                e.function.body
+            );
+            entries.push((e.name.as_str(), e.workgroup_size, calls[0]));
+        }
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(name, size, _)| (*name, *size))
+                .collect::<Vec<_>>(),
+            vec![
+                ("matmul_wide_vec4", [16, 16, 1]),
+                ("matmul_wide_vec4_tail", [16, 8, 1]),
+            ],
+            "the entry point `run` sets as the pipeline, then the one it records \
+             for the remainder; either renamed or re-geometried is a dispatch the \
+             wide path cannot make"
+        );
+        assert_eq!(
+            entries[0].2, entries[1].2,
+            "the two geometries must call one shared tile function"
+        );
+        assert_eq!(
+            module.functions[entries[0].2].name.as_deref(),
+            Some("wide_vec4_tile"),
+        );
+
+        for (name, value) in [
+            ("FULL_M", WideVariant::Vec4.tile_m()),
+            ("TAIL_M", WIDE_TAIL_M),
+        ] {
+            let decl = format!("const {name}: u32 = {value}u;");
+            assert!(
+                MATMUL_WIDE_VEC4_WGSL.contains(&decl),
+                "the shader must declare `{decl}`: the geometry of each entry \
+                 point is a Rust constant the dispatch and `wide_grid` are both \
+                 built from, and WGSL cannot read it from here"
+            );
+        }
+
+        // The row counts the rule was written for, per variant: the two pins keep
+        // the single rounded-up grid they shipped (no remainder pipeline, so no
+        // split even where a remainder would fit), and the default variant splits
+        // 96 = 64 + 32 — the pin that the split is actually taken, which the
+        // bounds in the sweep below cannot tell from a rule that never splits.
+        assert_eq!(
+            wide_grid(WideVariant::Std, 100, 64),
+            WideGrid {
+                gx: 1,
+                full: 4,
+                tail: 0,
+            },
+        );
+        assert_eq!(
+            wide_grid(WideVariant::Nv, 100, 64),
+            WideGrid {
+                gx: 1,
+                full: 2,
+                tail: 0,
+            },
+        );
+        assert_eq!(
+            wide_grid(WideVariant::Vec4, 96, 48000),
+            WideGrid {
+                gx: 750,
+                full: 1,
+                tail: 1,
+            },
+        );
+    }
+
+    /// `wide_grid` over every row count a matmul dispatch can see, for each
+    /// variant. The failure this guards is a silently MISSING row — a grid that
+    /// covers less than the caller asked for — which reads back as whatever the
+    /// arena slot held before and cannot be attributed to this rule by any
+    /// numeric test.
+    #[test]
+    fn wide_grid_covers_every_row_and_pads_no_more_than_the_single_grid() {
+        for variant in [WideVariant::Std, WideVariant::Nv, WideVariant::Vec4] {
+            let tile_m = variant.tile_m();
+            for n in [64, 130, 48000] {
+                for m_s in 1..=600 {
+                    let g = wide_grid(variant, m_s, n);
+                    let rows = g.full * tile_m + g.tail * WIDE_TAIL_M;
+                    assert_eq!(g.gx, n.div_ceil(64), "column tiles at n={n}");
+                    assert!(
+                        rows >= m_s,
+                        "{variant:?} m={m_s} n={n}: the grid covers {rows} rows, \
+                         so {} row(s) would keep their previous value",
+                        m_s - rows.min(m_s)
+                    );
+                    assert!(
+                        rows <= m_s.div_ceil(tile_m) * tile_m,
+                        "{variant:?} m={m_s} n={n}: the split must never pad more \
+                         than the single rounded-up grid it replaces"
+                    );
+                    assert!(g.full >= 1, "{variant:?} m={m_s}: no full tile");
+                    assert!(g.tail <= 1, "{variant:?} m={m_s}: at most one tail");
+                }
+            }
+        }
     }
 
     /// The activation codes `apply_activation` actually has an arm for, read out of
