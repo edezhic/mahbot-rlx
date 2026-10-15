@@ -239,7 +239,7 @@ pub fn soft_memory_budget_bytes() -> Option<usize> {
 pub fn process_rss_bytes() -> Option<usize> {
     #[cfg(target_vendor = "apple")]
     {
-        use std::mem::MaybeUninit;
+        use std::mem::{MaybeUninit, offset_of, size_of};
         unsafe extern "C" {
             fn mach_task_self() -> u32;
             fn task_info(
@@ -249,27 +249,48 @@ pub fn process_rss_bytes() -> Option<usize> {
                 task_info_out_cnt: *mut u32,
             ) -> i32;
         }
-        const TASK_BASIC_INFO: u32 = 5;
-        #[repr(C)]
-        struct TaskBasicInfo {
-            suspend_count: u32,
+        // `MACH_TASK_BASIC_INFO` is the flavour `mach/task_info.h` tells callers
+        // to use, and the only one that is 20 on *every* 64-bit Apple target. The
+        // 5 this used to pass is what `TASK_BASIC_INFO` means on x86_64 alone: on
+        // arm64 that name is 18, and flavour 5 answers there with a 32-bit-shaped
+        // payload whose bytes 16..24 (time fields of terminated threads) read 0
+        // at every working set — a confident "holds nothing" once callers apply
+        // their `unwrap_or(0)`. x86_64 had the right flavour and the wrong
+        // struct: `task_basic_info_64` is packed, so a naturally-aligned struct
+        // read `resident_size` one `u32` late.
+        const MACH_TASK_BASIC_INFO: u32 = 20;
+        #[repr(C, packed(4))]
+        struct MachTaskBasicInfo {
             virtual_size: u64,
             resident_size: u64,
-            user_time: u64,
-            system_time: u64,
+            resident_size_max: u64,
+            user_time: [u32; 2],
+            system_time: [u32; 2],
             policy: i32,
+            suspend_count: i32,
         }
-        let mut info = MaybeUninit::<TaskBasicInfo>::uninit();
-        let mut count = (std::mem::size_of::<TaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+        // Words the kernel is asked for, and must write back.
+        const WORDS: u32 = (size_of::<MachTaskBasicInfo>() / size_of::<u32>()) as u32;
+        // `pack(4)` mirrors the `#pragma pack(push, 4)` the header puts this
+        // struct under; the assert keeps a later edit from silently drifting off
+        // that geometry, which is the defect class above.
+        const _: () = assert!(
+            size_of::<MachTaskBasicInfo>() == 48
+                && offset_of!(MachTaskBasicInfo, resident_size) == 8
+        );
+        let mut info = MaybeUninit::<MachTaskBasicInfo>::uninit();
+        let mut count = WORDS;
         let rc = unsafe {
             task_info(
                 mach_task_self(),
-                TASK_BASIC_INFO,
+                MACH_TASK_BASIC_INFO,
                 info.as_mut_ptr().cast(),
                 &mut count,
             )
         };
-        if rc == 0 {
+        // A flavour answering with fewer words than asked for would leave the
+        // rest of `info` uninitialised under `assume_init`.
+        if rc == 0 && count >= WORDS {
             Some(unsafe { info.assume_init() }.resident_size as usize)
         } else {
             None
