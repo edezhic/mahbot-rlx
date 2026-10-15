@@ -26,13 +26,14 @@ use rlx_driver::Device;
 /// that never activates that backend can take it before compiling anything. No
 /// session or compiled graph needed — taken once, held for the process.
 ///
-/// **What asking costs.** Nothing loads until a caller asks. The asking process
-/// then holds the platform's graphics framework in memory for the rest of its
-/// life — a few MiB (measured ≈5 MiB here on top of a process that already holds
-/// that stack, ≈12 MiB in a lean one), with no unload path, counted in the
-/// process's resident figure from then on. A process that already holds the
-/// graphics stack — Metal, MLX or a graphics API, or one that has merely asked
-/// whether such a device is available — pays nothing extra.
+/// **What asking costs.** On Apple targets with a public Metal API, nothing
+/// loads until a caller asks. The asking process then holds the platform's
+/// graphics framework in memory for the rest of its life — a few MiB (measured
+/// ≈5 MiB here on top of a process that already holds that stack, ≈12 MiB in a
+/// lean one), with no unload path, counted in the process's resident figure
+/// from then on. A process that already holds the graphics stack — Metal, MLX
+/// or a graphics API, or one that has merely asked whether such a device is
+/// available — pays nothing extra.
 ///
 /// **A figure of its own.** The platform's value as it stands — not a fraction
 /// of installed RAM, not the process soft budget, and not folded into either.
@@ -136,9 +137,10 @@ mod apple {
     }
 
     /// `MTLCreateSystemDefaultDevice().recommendedMaxWorkingSetSize`, or `None`
-    /// when the framework, the device, or the property itself is not there. This
-    /// `dlopen` is the point the framework becomes resident for the process's
-    /// lifetime; nothing else here loads it.
+    /// when the framework, the device, or the property itself is not there. The
+    /// `dlopen` of `METAL_FRAMEWORK` is the point the framework becomes
+    /// resident for the process's lifetime — in a process that did not already
+    /// hold the graphics stack; nothing else here loads it.
     pub(super) fn recommended_max_working_set() -> Option<u64> {
         let metal = unsafe { dlopen(METAL_FRAMEWORK.as_ptr(), RTLD_NOW) };
         let objc = unsafe { dlopen(OBJC_RUNTIME.as_ptr(), RTLD_NOW) };

@@ -13,14 +13,14 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 627  
-**Unregistered mentions (migration leftovers):** 136
+**Registered names:** 628  
+**Unregistered mentions (migration leftovers):** 116
 
 ## Groups
 
 - [compile](#compile) — 22
 - [coreml](#coreml) — 14
-- [cpu](#cpu) — 29
+- [cpu](#cpu) — 30
 - [cuda](#cuda) — 70
 - [debug](#debug) — 12
 - [device](#device) — 4
@@ -115,6 +115,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_DEQUANT_PARALLEL` | Internal | String | Backend(cpu) | Dequantize GGUF blocks in parallel; set 0 to serialize |
 | `RLX_FAST_CONV` | Public | BoolOr | Backend(cpu) | CPU Conv2d im2col+BLAS path (default on; set 0 for scalar nested loops) |
 | `RLX_PAR_THRESHOLD` | Bisect | U64 | Backend(cpu) | Minimum element count before an op dispatches in parallel |
+| `RLX_Q4K_EXACT_GEMV` | Internal | Bool | Backend(cpu) | Q4_K decode GEMV dequantizes to f32 per block instead of quantizing the activation to Q8_K (exact, slower) |
 | `RLX_Q4K_FUSED_MIN_N` | Internal | String | Backend(cpu) | n above which the fused Q4_K kernel is used instead of dequant |
 | `RLX_Q4K_NO_DOTPROD` | Internal | String | Backend(cpu) | Force the baseline Q4_K path instead of the dotprod intrinsics |
 | `RLX_SDPA_THRESHOLD` | Bisect | U64 | Backend(cpu) | Sequence length above which SDPA switches from NEON dots to BLAS sgemm |
@@ -792,6 +793,7 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_BATCH` | `CHANGELOG.md` |
 | `RLX_BENCH` | `crates/backends/rlx-cortexm/trainer/src/train.rs` |
 | `RLX_BINARY_FN` | `crates/backends/rlx-metal/src/kernels.rs` |
+| `RLX_BLAS_ALIAS_CHECK` | `crates/backends/rlx-cpu/src/blas.rs` |
 | `RLX_CODESIGN_IDENTITY` | `crates/backends/rlx-egpu/dext/build.sh` |
 | `RLX_COMPARE_FN` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_COMPILE_OUTPUT_CAP` | `crates/backends/rlx-mlx/src/config.rs` |
@@ -805,8 +807,6 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_CUDA_SCHEDULE_MATMUL` | `crates/backends/rlx-cuda/src/config.rs` |
 | `RLX_CUDA_TMA` | `crates/backends/rlx-cuda/src/config.rs` |
 | `RLX_DEBUG_TRIP` | `scripts/gen-rlx-env-vars.py` |
-| `RLX_DECOMPOSE_BENCH_RUNS` | `rig.sh` |
-| `RLX_DECOMPOSE_BENCH_WARMUP` | `rig.sh` |
 | `RLX_DENY_DEVICES` | `docs/backend-selection.md` |
 | `RLX_DETERMINISTIC_REDUCE` | `crates/core/rlx-collectives/src/lib.rs` |
 | `RLX_DEXT_BUNDLE_ID` | `crates/backends/rlx-egpu/dext/build.sh` |
@@ -816,26 +816,11 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_EGPU_SOCK` | `crates/backends/rlx-egpu/src/dext.rs` |
 | `RLX_ENC_MAGIC` | `crates/io/rlx-bake/src/lib.rs` |
 | `RLX_ENC_VERSION` | `crates/io/rlx-bake/src/lib.rs` |
-| `RLX_FFT_E2E_APPLE_FEATURES` | `rig.sh` |
-| `RLX_FFT_E2E_APPLE_JSON` | `rig.sh` |
-| `RLX_FFT_E2E_CUDA_JSON` | `rig.sh` |
-| `RLX_FFT_E2E_DISTILL_STEPS` | `rig.sh` |
-| `RLX_FFT_E2E_FEATURES` | `rig.sh` |
-| `RLX_FFT_E2E_HTML` | `rig.sh` |
-| `RLX_FFT_E2E_ITERS` | `rig.sh` |
-| `RLX_FFT_E2E_STEPS` | `rig.sh` |
-| `RLX_FFT_MODELS_ROOT` | `rig.sh` |
-| `RLX_FFT_PICKER_TRACE` | `rig.sh` |
-| `RLX_FFT_RIG_RUNTIME` | `rig.sh` |
-| `RLX_FFT_WELCH_DEBUG` | `rig.sh` |
-| `RLX_FFT_WELCH_ITERS` | `rig.sh` |
-| `RLX_FFT_WELCH_TRAIN_STEPS` | `rig.sh` |
 | `RLX_FFT_WGPU_BIG` | `crates/backends/rlx-wgpu/src/fft_dispatch.rs` |
 | `RLX_FFT_WGPU_ONCHIP` | `crates/backends/rlx-wgpu/src/fft_dispatch.rs` |
 | `RLX_FORMAT_VERSION` | `crates/io/rlx-bake/src/format.rs` |
 | `RLX_FW_MANIFEST` | `scripts/pull_gpu_firmware.sh` |
 | `RLX_GELU_INPLACE_F32` | `crates/backends/rlx-metal/src/kernels.rs` |
-| `RLX_GEMMA3_GGUF` | `rig.sh` |
 | `RLX_GRAPH_FUSED` | `crates/backends/rlx-cortexm/trainer/src/train.rs` |
 | `RLX_IROH_ALPN` | `crates/core/rlx-driver/src/iroh_transport.rs` |
 | `RLX_IROH_PEERS` | `crates/core/rlx-driver/src/iroh_transport.rs` |
@@ -847,12 +832,16 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_KERNELS_MSL_FFT_GPU` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_KERNELS_MSL_SPLAT` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_KERNELS_MSL_SPLAT_CONIC` | `crates/backends/rlx-metal/src/kernels.rs` |
-| `RLX_LOCATEANYTHING_DIR` | `rig.sh` |
 | `RLX_LR` | `docs/benchmarks/coreml-training.md` |
 | `RLX_MAGIC` | `crates/io/rlx-bake/src/format.rs` |
 | `RLX_METAL_GDN_NATIVE` | `crates/core/rlx-runtime/tests/cpu_gated_delta_net_parity.rs` |
 | `RLX_METAL_GDN_SG` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_METAL_IQ` | `crates/backends/rlx-metal/README.md` |
+| `RLX_METAL_NO_SMALL_M_MPS` | `crates/backends/rlx-metal/src/cost.rs` |
+| `RLX_METAL_NO_WEIGHT_SPLIT` | `crates/backends/rlx-metal/src/backend/compile.rs` |
+| `RLX_METAL_PTQ1_0_FUSED_DISABLE` | `crates/backends/rlx-metal/src/backend/encode/mod.rs` |
+| `RLX_METAL_PTQ1_0_INT_PIPE` | `crates/backends/rlx-metal/src/backend/encode/ops.rs` |
+| `RLX_METAL_PTQ1_0_NSG` | `crates/backends/rlx-metal/src/backend/encode/ops.rs` |
 | `RLX_METAL_SDPA_FLASH_DECODE` | `crates/backends/rlx-metal/src/config.rs` |
 | `RLX_METAL_SDPA_FLASH_P` | `crates/backends/rlx-metal/src/config.rs` |
 | `RLX_METAL_SDPA_TUNE_CACHE` | `crates/backends/rlx-metal/src/config.rs` |
@@ -860,13 +849,12 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_METAL_SDPA_TUNE_CACHE_LOAD` | `crates/backends/rlx-metal/src/config.rs` |
 | `RLX_METAL_SDPA_TUNE_CACHE_MAX_ENTRIES` | `crates/backends/rlx-metal/src/config.rs` |
 | `RLX_METAL_SDPA_TUNE_CACHE_PERSIST` | `crates/backends/rlx-metal/src/config.rs` |
-| `RLX_MINICPM5_GGUF_DIR` | `rig.sh` |
-| `RLX_MINICPM5_GGUF_Q4_K_M` | `rig.sh` |
-| `RLX_MLX_BENCH_PROFILE` | `rig.sh` |
+| `RLX_METAL_SMALL_M_MPS_TRACE` | `crates/backends/rlx-metal/src/cost.rs` |
+| `RLX_METAL_WEIGHT_SPLIT_MIN` | `crates/backends/rlx-metal/src/backend/compile.rs` |
 | `RLX_MLX_COMPILE_OUTPUT_CAP` | `crates/backends/rlx-mlx/src/config.rs` |
 | `RLX_MLX_CUDA` | `crates/backends/rlx-mlx-sys/build.rs` |
 | `RLX_MLX_NO_CCACHE` | `crates/backends/rlx-mlx-sys/build.rs` |
-| `RLX_MLX_OK` | `crates/backends/rlx-mlx/src/array.rs` |
+| `RLX_MLX_OK` | `crates/backends/rlx-mlx/src/lib.rs` |
 | `RLX_MPSGRAPH_ATTENTION` | `crates/backends/rlx-metal/src/mps_graph.rs` |
 | `RLX_NODE_ERR_ARG` | `crates/bindings/rlx-ffi/src/lib.rs` |
 | `RLX_NODE_ERR_BUSY` | `crates/bindings/rlx-ffi/src/lib.rs` |
@@ -874,41 +862,29 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_NODE_ERR_MODE` | `crates/bindings/rlx-ffi/src/lib.rs` |
 | `RLX_NODE_ERR_SPAWN` | `crates/bindings/rlx-ffi/src/lib.rs` |
 | `RLX_NODE_OK` | `crates/bindings/rlx-ffi/src/lib.rs` |
-| `RLX_NTH_ORDER_RUNS` | `rig.sh` |
-| `RLX_NTH_ORDER_SIZES` | `rig.sh` |
-| `RLX_NTH_ORDER_WARMUP` | `rig.sh` |
 | `RLX_ORT_INTRA_THREADS` | `crates/io/rlx-onnx/src/backend.rs` |
 | `RLX_PIPELINE_ALPN` | `crates/core/rlx-driver/src/lib.rs` |
 | `RLX_POW_SCALAR_FN` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_PREFER_DEVICES` | `docs/backend-selection.md` |
 | `RLX_QNN_HTP_LIB` | `Justfile` |
-| `RLX_QWEN25_GGUF` | `rig.sh` |
 | `RLX_QWEN3_F16_LM_HEAD` | `CHANGELOG.md` |
 | `RLX_QWEN3_INPLACE_KV` | `crates/core/rlx-flow/src/blocks/qwen3_decode_layer.rs` |
 | `RLX_QWEN3_PARITY` | `CHANGELOG.md` |
 | `RLX_QWEN3_RETENTION` | `docs/README.md` |
 | `RLX_QWEN3_RETENTION_DEBUG` | `docs/kv-retention.md` |
-| `RLX_QWEN3_TTS_DIR` | `rig.sh` |
 | `RLX_REGIONS` | `crates/backends/rlx-cortexm/trainer/src/train.rs` |
 | `RLX_RESIDENT` | `docs/benchmarks/frameworks-and-backends.md` |
-| `RLX_RIG_BUILD` | `rig.sh` |
-| `RLX_RIG_CUDA_BENCH` | `rig.sh` |
 | `RLX_RIG_DEST` | `scripts/sync-to-rig.sh` |
-| `RLX_RIG_ENV` | `rig.sh` |
 | `RLX_RIG_HOST` | `scripts/sync-to-rig.sh` |
-| `RLX_RIG_MODELS_FEATURES` | `rig.sh` |
-| `RLX_RIG_ROOT` | `rig.sh` |
-| `RLX_RIG_SKIP_SYNC` | `rig.sh` |
-| `RLX_RIG_SYNC_NO_PRUNE` | `rig.sh` |
-| `RLX_RIG_WORKSPACE` | `rig.sh` |
 | `RLX_ROCM_FORCE_ATTENTION_ROW` | `crates/backends/rlx-rocm/src/backend/run.rs` |
 | `RLX_SCALAR_ACT_FNS` | `crates/backends/rlx-metal/src/icb.rs` |
 | `RLX_SDPA_DECODE_M1` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_SGEMM_TILES` | `crates/backends/rlx-metal/src/kernels.rs` |
 | `RLX_SHFL_ALL_LANES` | `crates/backends/rlx-rocm/src/backend/run.rs` |
+| `RLX_SHOW_VALS` | `crates/backends/rlx-metal/tests/conv_backward_weight_parity.rs` |
 | `RLX_SIM_DEVICE` | `Justfile` |
+| `RLX_SIM_PLATFORM` | `scripts/apple-sim-runner.sh` |
 | `RLX_SKIP_WRITEBACK` | `docs/benchmarks/frameworks-and-backends.md` |
-| `RLX_SMOLLM2_GGUF` | `rig.sh` |
 | `RLX_STAGES` | `crates/backends/rlx-metal/src/apple_params.rs` |
 | `RLX_STAGE_T` | `crates/backends/rlx-metal/src/apple_params.rs` |
 | `RLX_TAP_L0` | `crates/backends/rlx-metal/src/backend/encode/mod.rs` |
@@ -917,7 +893,12 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_TS` | `crates/backends/rlx-metal/src/apple_params.rs` |
 | `RLX_USE_MPSGRAPH` | `crates/backends/rlx-metal/src/mps_graph.rs` |
 | `RLX_USE_MPS_GRAPH` | `crates/backends/rlx-metal/src/mps_graph.rs` |
-| `RLX_WHISPER_DIR` | `rig.sh` |
+| `RLX_WGPU_COOP_PROBE_VERBOSE` | `crates/backends/rlx-wgpu/src/coop_probe.rs` |
+| `RLX_WGPU_FEED_TRACE` | `crates/backends/rlx-wgpu/src/backend/mod.rs` |
+| `RLX_WGPU_NO_COOP_PROBE` | `crates/backends/rlx-wgpu/src/coop_probe.rs` |
+| `RLX_WGPU_WIDE_NV` | `crates/backends/rlx-wgpu/src/kernels/mod.rs` |
+| `RLX_WGPU_WIDE_STD` | `crates/backends/rlx-wgpu/src/kernels/mod.rs` |
+| `RLX_XDNA_AIECC_GET` | `crates/backends/rlx-xdna/src/compile.rs` |
 | `RLX_XDNA_INSTS` | `crates/backends/rlx-xdna/src/lib.rs` |
 | `RLX_XDNA_XCLBIN` | `crates/backends/rlx-xdna/src/lib.rs` |
 
