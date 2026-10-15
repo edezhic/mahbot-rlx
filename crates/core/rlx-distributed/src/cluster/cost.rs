@@ -766,7 +766,7 @@ mod from_gguf {
     pub fn tensor_index_multi(paths: &[std::path::PathBuf]) -> Result<Vec<TensorEntry>> {
         let mut out = Vec::new();
         for p in paths {
-            let f = rlx_gguf::GgufFile::from_path(p)?;
+            let f = rlx_gguf::GgufFile::header_from_path(p)?;
             for t in f.tensors.values() {
                 let bytes =
                     rlx_gguf::bytes_for_public(t.dtype, t.n_elements()).ok_or_else(|| {
@@ -1289,5 +1289,41 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no numbered blocks"), "{err}");
+    }
+
+    /// The index comes off the tensor table alone — names, dims and quantized
+    /// byte counts, with the data segment never read.
+    #[cfg(feature = "gguf")]
+    #[test]
+    fn tensor_index_multi_sizes_tensors_from_the_tensor_table() {
+        use rlx_gguf::{GgmlType, GgufWriter};
+        let mut w = GgufWriter::new();
+        w.add_tensor_bytes(
+            "blk.0.attn_q.weight",
+            vec![4, 8],
+            GgmlType::F32,
+            vec![0u8; 128],
+        )
+        .unwrap();
+        w.add_tensor_bytes(
+            "blk.0.attn_norm.weight",
+            vec![8],
+            GgmlType::F32,
+            vec![0u8; 32],
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("rlx_cost_index_{}.gguf", std::process::id()));
+        w.write_to_path(&path).unwrap();
+        let mut idx = tensor_index_multi(std::slice::from_ref(&path)).unwrap();
+        std::fs::remove_file(&path).ok();
+        // The tensor table is a map, so compare in a fixed order.
+        idx.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx[0].name, "blk.0.attn_norm.weight");
+        assert_eq!(idx[0].dims, vec![8]);
+        assert_eq!(idx[0].bytes, 32);
+        assert_eq!(idx[1].name, "blk.0.attn_q.weight");
+        assert_eq!(idx[1].dims, vec![4, 8]);
+        assert_eq!(idx[1].bytes, 128);
     }
 }

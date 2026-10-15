@@ -110,9 +110,21 @@ fn needs_model_io(scheme: &str) -> String {
 pub fn resolve_weight_uri(uri: &str) -> Result<Vec<f32>, String> {
     if let Some(rest) = uri.strip_prefix("gguf://") {
         let (path, tensor) = split_frag(rest)?;
-        let mut f = std::fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
-        let gguf = rlx_gguf::GgufFile::from_reader(&mut f).map_err(|e| e.to_string())?;
-        let (data, _dims) = gguf.dequant_f32(tensor).map_err(|e| e.to_string())?;
+        // Mapping + `pread`, not `from_reader` + a borrow of the mapping: the
+        // caller wants one tensor, not the whole file resident.
+        let gguf = rlx_gguf::GgufFile::from_path_mmap(path).map_err(|e| format!("{e:#}"))?;
+        let t = gguf
+            .get(tensor)
+            .ok_or_else(|| format!("tensor not found: {tensor}"))?;
+        let mut bytes = Vec::new();
+        if !gguf
+            .read_tensor_bytes_into(t, &mut bytes)
+            .map_err(|e| e.to_string())?
+        {
+            return Err(format!("{path}: gguf was not opened through its mapping"));
+        }
+        let data = rlx_gguf::dequant_typed(t.dtype, &bytes, t.n_elements(), tensor)
+            .map_err(|e| e.to_string())?;
         Ok(data)
     } else if let Some(_rest) = uri.strip_prefix("rlxp://") {
         #[cfg(feature = "model-io")]
@@ -171,12 +183,20 @@ pub fn resolve_weight_uri(uri: &str) -> Result<Vec<f32>, String> {
 pub fn resolve_weight_bytes(uri: &str) -> Result<Vec<u8>, String> {
     if let Some(rest) = uri.strip_prefix("gguf://") {
         let (path, tensor) = split_frag(rest)?;
-        let mut f = std::fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
-        let gguf = rlx_gguf::GgufFile::from_reader(&mut f).map_err(|e| e.to_string())?;
+        // Mapping + `pread`, not `from_reader` + a borrow of the mapping: the
+        // caller wants one tensor's bytes, not the whole file resident.
+        let gguf = rlx_gguf::GgufFile::from_path_mmap(path).map_err(|e| format!("{e:#}"))?;
         let t = gguf
             .get(tensor)
             .ok_or_else(|| format!("tensor not found: {tensor}"))?;
-        Ok(gguf.tensor_bytes(t).map_err(|e| e.to_string())?.to_vec())
+        let mut bytes = Vec::new();
+        if !gguf
+            .read_tensor_bytes_into(t, &mut bytes)
+            .map_err(|e| e.to_string())?
+        {
+            return Err(format!("{path}: gguf was not opened through its mapping"));
+        }
+        Ok(bytes)
     } else if let Some(_rest) = uri.strip_prefix("rlxp://") {
         #[cfg(feature = "model-io")]
         {

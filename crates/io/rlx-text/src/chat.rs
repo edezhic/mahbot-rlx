@@ -485,8 +485,11 @@ impl ChatTemplate {
 
     /// Load template + BOS/EOS from a GGUF file. Reads
     /// `tokenizer.chat_template` first, then `tokenizer.ggml.chat_template`.
+    ///
+    /// Header only: the tensor-data segment is never read.
     pub fn from_gguf(path: &Path) -> Result<Self> {
-        let raw = GgufFile::from_path(path).with_context(|| format!("opening GGUF {path:?}"))?;
+        let raw =
+            GgufFile::header_from_path(path).with_context(|| format!("opening GGUF {path:?}"))?;
         Self::from_gguf_file(&raw)
     }
 

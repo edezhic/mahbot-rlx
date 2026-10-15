@@ -10,7 +10,7 @@
 
 use crate::tier::StorageTier;
 use crate::write::{ContainerKind, PackedWeight, WriteOptions, write_package};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rlx_gguf::{GgmlType, GgufFile, MetaValue};
 use rlx_ir::{DType, Graph, Shape};
 use std::path::Path;
@@ -67,15 +67,22 @@ pub fn gguf_to_rlxp(
 
     let mut weights = Vec::new();
     let names: Vec<String> = f.keys().map(|s| s.to_string()).collect();
+    // Scratch reused across tensors, read through the file handle: borrowing
+    // the mapping instead would page the whole checkpoint into RSS behind the
+    // package's own copies of the weights.
+    let mut scratch: Vec<u8> = Vec::new();
     for name in names {
         let t = f.get(&name).with_context(|| format!("tensor {name}"))?;
-        let bytes = f.tensor_bytes(t)?.to_vec();
+        ensure!(
+            f.read_tensor_bytes_into(t, &mut scratch)?,
+            "tensor {name}: gguf was not opened through its mapping"
+        );
         weights.push(PackedWeight {
             name: name.clone(),
             shape: t.shape.clone(),
             scheme: scheme_for(t.dtype),
             layout: "bt_nk".into(),
-            data: bytes,
+            data: scratch.to_vec(),
             rank: None,
             tier: StorageTier::Hot,
         });
