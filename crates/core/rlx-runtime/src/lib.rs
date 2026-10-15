@@ -231,7 +231,7 @@ pub use hwinfo::{
 pub use hwprofile_select::{device_vram_bytes, fastest_device_with_vram};
 pub use kv_cache::LayerKvCache;
 pub use lm::{
-    ConfigSource, LmRunner, LmRunnerBuilder, MirostatMode, ModelRegistration,
+    ConfigSource, HostDriven, LmRunner, LmRunnerBuilder, MirostatMode, ModelRegistration,
     PACKED_GGUF_AUTO_THRESHOLD_BYTES, SampleOpts, WeightFormat, auto_runner_name,
     registered_models,
 };

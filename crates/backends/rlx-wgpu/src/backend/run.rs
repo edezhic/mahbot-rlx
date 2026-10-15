@@ -410,7 +410,7 @@ impl WgpuExecutable {
     ///
     /// Callers used to have only [`Self::requires_host_execution`] — one bit,
     /// which is why the browser WebGPU refusal could name only the ops it
-    /// *might* have been. See [`super::host_plan`].
+    /// *might* have been. See [`super::HostPlan`].
     pub fn host_plan(&self) -> super::HostPlan {
         super::host_plan(&self.schedule)
     }
