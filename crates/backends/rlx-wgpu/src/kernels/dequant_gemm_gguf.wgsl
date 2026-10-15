@@ -185,7 +185,8 @@
 // this file's `dequant_gemm_q4k` **twice** — once per arm of its split branch,
 // which are the same math over different spans of `k` (the arms' own comment
 // says why they are two). Q8_0's (`q8_0_quants`, the entry at the end of this
-// file) has one other copy, the `scheme_id == 20` branch of `dequant_gguf.wgsl`.
+// file) has two other copies, the `scheme_id == 20` branch of `dequant_gguf.wgsl`
+// and the tiled one-row arm's own 8-bit branch in `dequant_gemv_gguf.wgsl`.
 
 struct Params {
     m: u32,           // rows

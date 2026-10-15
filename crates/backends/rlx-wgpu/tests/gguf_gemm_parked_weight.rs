@@ -114,21 +114,20 @@ fn magnitude(v: &[f32]) -> f32 {
     v.iter().fold(0.0f32, |a, x| a.max(x.abs()))
 }
 
-/// One `DequantMatMul` over a packed Q4_K weight of `w_bytes`, and the node ids
-/// (x, w, y) a caller needs to place and read them.
+/// One `DequantMatMul` of `scheme` over a packed weight of `w_bytes`, and the node
+/// ids (x, w, y) a caller needs to place and read them.
 fn one_weight_graph(
     k: usize,
     n: usize,
     m: usize,
     w_bytes: usize,
+    scheme: QuantScheme,
 ) -> (Graph, NodeId, NodeId, NodeId) {
     let mut g = Graph::new("wgpu_gguf_parked_weight");
     let x = g.input("x", Shape::new(&[m, k], DType::F32));
     let w = g.param("w", Shape::new(&[w_bytes], DType::U8));
     let y = g.add_node(
-        Op::DequantMatMul {
-            scheme: QuantScheme::GgufQ4K,
-        },
+        Op::DequantMatMul { scheme },
         vec![x, w],
         Shape::new(&[m, n], DType::F32),
     );
@@ -148,7 +147,7 @@ fn parked_arena(dev: &rlx_wgpu::device::WgpuDevice, g: &Graph, w: NodeId) -> Are
     arena
 }
 
-/// The graph and bytes both route-movement tests drive: `n` columns of a real
+/// The graph and bytes the route-movement tests drive: `n` columns of a real
 /// Q8_0-packed weight over `m` rows of activations, with an optional larger Q4_K
 /// param that pushes the weight under test to a non-zero weight-buffer base.
 struct Q8Case {
@@ -160,12 +159,13 @@ struct Q8Case {
     y: NodeId,
 }
 
-/// The [`Q8Case`] both route-movement tests drive, built once so their arenas differ
+/// The [`Q8Case`] the route-movement tests drive, built once so their arenas differ
 /// in nothing but the geometry under test: `k` a whole number of the scheme's
 /// 32-element blocks (eight of them) and so of the grouped GEMM's 256-element staged
-/// tile, `m > 1` past the one-row arm this scheme does not have, and `n` wide enough
-/// that the 1 MiB window cap those tests set splits the weight into several chunks,
-/// each resolving `w_base + n0 * row_bytes`. Real Q8_0 bytes, through
+/// tile, `m` the row count the caller drives — one row is this scheme's own tiled
+/// arm, above one the row-grouped GEMM — and `n` wide enough that the 1 MiB window
+/// cap those tests set splits the weight into several chunks, each resolving
+/// `w_base + n0 * row_bytes`. Real Q8_0 bytes, through
 /// [`common::packed_gguf_bytes`]: this arm unpacks the scheme's scale and quant
 /// fields, so this file's synthetic Q4_K masks would be a decode of bytes the packer
 /// never writes.
@@ -239,8 +239,9 @@ fn place_q8_case(
 
 /// The admission's shared, device-free premises, returning the slab the plan books:
 /// a positive booking (the plan's own `scratch_off`, which the Q8_0 op books — a
-/// Q4_K pad is a scratch-free scheme), the multi-row call with that slab behind it
-/// admitted to the join, that arm provably device-only, and the same answer over
+/// Q4_K pad is a scratch-free scheme), the call with that slab behind it admitted to
+/// the join as `want` — the row-grouped GEMM above one row, this scheme's own tiled
+/// arm at one — that arm provably device-only, and the same answer over
 /// `other_arena_x_off` — `blind` naming the fact the two arenas differ in.
 ///
 /// That last comparison cannot prove the ladder blind to the arena: [`select_path`]
@@ -251,6 +252,7 @@ fn assert_q8_admission(
     case: &Q8Case,
     m: usize,
     k: usize,
+    want: DequantMatmulPath,
     x_off: usize,
     other_arena_x_off: usize,
     blind: &str,
@@ -263,9 +265,9 @@ fn assert_q8_admission(
     let scheme = gguf_scheme_id(QuantScheme::GgufQ8_0);
     let joined_path = select_path(m, k, scheme, x_off, booking);
     assert_eq!(
-        joined_path,
-        DequantMatmulPath::GroupedDevice,
-        "a multi-row 8-bit call with a slab behind it must be admitted to the join"
+        joined_path, want,
+        "a single-row 8-bit call is the tiled arm and a multi-row one the grouped \
+         GEMM, and both must be admitted to the join"
     );
     assert!(
         joined_path.is_provably_device_only(),
@@ -457,16 +459,17 @@ fn grouped_gemm_reads_a_parked_weight_from_the_weight_buffer() {
     rlx_ir::env::unset("RLX_WGPU_MAX_BIND_MB");
 }
 
-/// The shape both route-movement tests drive, in their case and in every leg here:
+/// The shape the route-movement tests drive, in their case and in every leg here:
 /// `K` a whole number of this scheme's 32-element blocks (eight of them) and so of
-/// the grouped GEMM's 256-element staged tile, `M > 1` past the one-row arm this
-/// scheme does not have, and `N` wide enough that the 1 MiB window cap splits the
-/// weight into several chunks, each resolving `w_base + n0 * row_bytes`.
+/// the grouped GEMM's 256-element staged tile, `M > 1` past this scheme's one-row
+/// arm (`M == 1` only), which the single-row test drives at one row instead, and `N`
+/// wide enough that the 1 MiB window cap splits the weight into several chunks, each
+/// resolving `w_base + n0 * row_bytes`.
 const M: usize = 4;
 const K: usize = 256;
 const N: usize = 8192;
 
-/// The one fact the two route-movement tests' arrangements differ in. Everything
+/// The one fact the route-movement tests' arrangements differ in. Everything
 /// else about them — the case, the plan, the whole-buffer arena and the operands
 /// placed in each — is [`Arrangement`]'s, so each test's claim is about this field
 /// alone.
@@ -482,7 +485,7 @@ enum Geometry {
     VirtualStripe,
 }
 
-/// The arrangement both route-movement tests drive: the case, the plan, both arenas
+/// The arrangement the route-movement tests drive: the case, the plan, both arenas
 /// (this geometry's own and the whole-buffer copy), the operands placed in each, and
 /// the device-free admission's premises asserted once. A claim in a test is about the
 /// route one entry point takes on [`Self::arena`].
@@ -504,18 +507,26 @@ struct Arrangement<'a> {
     /// The slab the plan books for this graph — the admission's own term.
     booking: usize,
     scheme: u32,
+    /// The rows every leg drives: one is this scheme's tiled one-row arm, above one
+    /// the row-grouped GEMM.
+    m: usize,
 }
 
 impl<'a> Arrangement<'a> {
-    fn build(dev: &'a rlx_wgpu::device::WgpuDevice, name: &str, geometry: Geometry) -> Self {
-        // Both tests' claims are about the grouped device route these calls ship on.
+    fn build(
+        dev: &'a rlx_wgpu::device::WgpuDevice,
+        name: &str,
+        geometry: Geometry,
+        m: usize,
+    ) -> Self {
+        // Every claim here is about a device route these calls ship on.
         common::refuse_under_q8_0_bisect();
         // The pad param exists only to put a parked weight at a non-zero base.
         let pad = match geometry {
             Geometry::Parked => 16384,
             Geometry::VirtualStripe => 0,
         };
-        let case = q8_case(name, M, K, N, pad);
+        let case = q8_case(name, m, K, N, pad);
         let plan = plan_memory_f32_uniform(&case.graph, 16);
         let plain = Arena::from_plan(&dev.device, &plan);
         let arena = match geometry {
@@ -562,9 +573,18 @@ impl<'a> Arrangement<'a> {
             Geometry::Parked => ("parked", "the weight's placement"),
             Geometry::VirtualStripe => ("stripe", "the arena's geometry"),
         };
+        // The arm this shape's row count is admitted to, as the ladder's own answer:
+        // one row is this scheme's tiled arm over whole 32-element blocks, above one
+        // the row-grouped GEMM over whole staged tiles — both device-only, and the
+        // weight's placement never enters either.
+        let want = if m == 1 {
+            DequantMatmulPath::OneRowDevice
+        } else {
+            DequantMatmulPath::GroupedDevice
+        };
         let _ = place_q8_case(dev, &case, &plain, "plain");
         let (x_off, w_off, y_off) = place_q8_case(dev, &case, &arena, label);
-        let booking = assert_q8_admission(&case, M, K, x_off, plain.offset(case.x_in), blind);
+        let booking = assert_q8_admission(&case, m, K, want, x_off, plain.offset(case.x_in), blind);
         let scheme = gguf_scheme_id(QuantScheme::GgufQ8_0);
         // The cap is what splits the weight, so the chunk loop, not just the first
         // chunk, resolves `w_base + n0 * row_bytes`.
@@ -579,6 +599,7 @@ impl<'a> Arrangement<'a> {
             y_off,
             booking,
             scheme,
+            m,
         }
     }
 
@@ -594,14 +615,14 @@ impl<'a> Arrangement<'a> {
     }
 
     /// The boundary's own encode of the call, submitted on its own: what the join
-    /// branch does for the call it joins. `true` is the grouped arm reading this
-    /// geometry's weight in place — for this scheme the one arm of that ladder that
-    /// can answer it.
+    /// branch does for the call it joins. `true` is the device arm this call's rows
+    /// take, reading this geometry's weight in place — the row-grouped GEMM above one
+    /// row, this scheme's own tiled arm at one.
     fn encode_joined(&self) -> Leg {
         leg(self.dev, &self.arena, &self.case, |marks| {
             assert!(
                 self.encode_against(&self.arena, marks, "rlx-wgpu q8_0 joined"),
-                "the grouped arm must encode this call against this geometry's weight"
+                "the device arm must encode this call against this geometry's weight"
             );
         })
     }
@@ -616,7 +637,7 @@ impl<'a> Arrangement<'a> {
                 &mut PassMarks::none(),
                 "rlx-wgpu q8_0 in-arena control"
             ),
-            "the grouped arm must encode the in-arena copy too"
+            "the device arm must encode the in-arena copy too"
         );
         self.plain
             .read_f32(&self.dev.device, &self.dev.queue, self.case.y)
@@ -635,7 +656,7 @@ impl<'a> Arrangement<'a> {
             &dev.device,
             &dev.queue,
             &mut enc,
-            M,
+            self.m,
             K,
             N,
             self.scheme,
@@ -658,7 +679,7 @@ impl<'a> Arrangement<'a> {
                     &self.arena,
                     &dev.device,
                     &dev.queue,
-                    M,
+                    self.m,
                     K,
                     N,
                     self.scheme,
@@ -667,7 +688,7 @@ impl<'a> Arrangement<'a> {
                     self.y_off,
                     marks,
                 ),
-                "the fused entry point must run a multi-row Q8_0 call"
+                "the fused entry point must run this Q8_0 call"
             );
         })
     }
@@ -680,7 +701,7 @@ impl<'a> Arrangement<'a> {
                 &self.arena,
                 &dev.device,
                 &dev.queue,
-                M,
+                self.m,
                 K,
                 N,
                 self.scheme,
@@ -703,7 +724,7 @@ impl<'a> Arrangement<'a> {
                 &self.plain,
                 &dev.device,
                 &dev.queue,
-                M,
+                self.m,
                 K,
                 N,
                 self.scheme,
@@ -750,7 +771,7 @@ fn a_parked_weight_moves_a_multi_row_q8_0_call_to_the_grouped_route() {
         return;
     };
     let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
-    let a = Arrangement::build(dev, "wgpu_gguf_parked_q8_0", Geometry::Parked);
+    let a = Arrangement::build(dev, "wgpu_gguf_parked_q8_0", Geometry::Parked, M);
     // One untimed call of each route first: `warm` says why.
     a.warm();
 
@@ -886,6 +907,7 @@ fn a_virtual_stripe_arena_moves_a_multi_row_q8_0_call_to_the_grouped_route() {
         dev,
         "wgpu_gguf_virtual_stripe_q8_0",
         Geometry::VirtualStripe,
+        M,
     );
 
     // Today, on the striped arena: the scratch entry point short-circuits any
@@ -973,12 +995,130 @@ fn a_virtual_stripe_arena_moves_a_multi_row_q8_0_call_to_the_grouped_route() {
     assert_under_cross_route_bar(max_abs, "a virtual bind-stripe Q8_0 arena");
 }
 
+/// The same movement at one row: a single-row Q8_0 call's device route is the tiled
+/// kernel's own 8-bit branch ([`DequantMatmulPath::OneRowDevice`]), which
+/// [`select_path`] answers device-free from the row count and this scheme's own whole
+/// 32-element blocks (`K` is eight of them) — so, as above one row, the weight's
+/// placement never enters the answer, and the boundary's join reads a parked weight
+/// or a virtual bind-stripe arena in place where the scratch entry point's
+/// short-circuit sends that call to the CPU. Both geometries are driven against their
+/// own arena, and `[rlx-gguf-parked-q8-0-one-row]` is their report.
+#[test]
+fn a_single_row_q8_0_call_reads_both_geometries_in_place() {
+    let Some(dev) = wgpu_device() else {
+        eprintln!("skip: wgpu unavailable");
+        return;
+    };
+    let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, bar_what, geometry, name) in [
+        (
+            "parked",
+            "a parked Q8_0 weight at one row",
+            Geometry::Parked,
+            "wgpu_gguf_parked_q8_0_one_row",
+        ),
+        (
+            "stripe",
+            "a virtual bind-stripe Q8_0 arena at one row",
+            Geometry::VirtualStripe,
+            "wgpu_gguf_virtual_stripe_q8_0_one_row",
+        ),
+    ] {
+        let a = Arrangement::build(dev, name, geometry, 1);
+
+        // The joined arrangement: one row of the tiled arm, off the slab and the CPU
+        // route both, reading this geometry's weight where it lies.
+        let Leg {
+            y: joined_y,
+            routes: joined_routes,
+            ..
+        } = a.encode_joined();
+        assert_eq!(
+            (
+                joined_routes.per_row,
+                joined_routes.grouped,
+                joined_routes.scratch,
+                joined_routes.host
+            ),
+            (1, 0, 0, 0),
+            "the joined single-row call on the {label} geometry must be the tiled arm's \
+             own row, off the slab and the CPU route: {joined_routes:?}"
+        );
+
+        // The same call in a run that does not batch — one-op-per-pass, or a
+        // snapshot: the step arm asks the ladder the same question and takes the same
+        // fused entry point, which reaches the arm's one submission and no poll.
+        let Leg {
+            y: arm_y,
+            routes: arm_routes,
+            submits: arm_submits,
+            waits: arm_waits,
+        } = a.fused();
+        assert_eq!(
+            (arm_routes.per_row, arm_routes.grouped),
+            (1, 0),
+            "the unjoined arrangement of the same call must reach the same device arm, \
+             not the CPU one the scratch entry point's short-circuit takes this geometry \
+             to: {arm_routes:?}"
+        );
+        assert_eq!(
+            (arm_submits, arm_waits),
+            (1, 0),
+            "the unjoined arrangement pays the arm's one submission and no poll of its \
+             own; measured {arm_submits} submission(s), {arm_waits} wait(s)"
+        );
+        // Same arm, same arithmetic, a different encoder: the mode changes the
+        // submission arrangement and nothing else.
+        common::assert_bit_identical(
+            &joined_y,
+            &arm_y,
+            "the joined and the unjoined arrangement must be bit-identical",
+        );
+
+        // Today's route for the same call: the scratch entry point short-circuits
+        // this geometry to the CPU route — the regime that short-circuit exists for —
+        // with the staging round trips that route needs.
+        let Leg {
+            y: today_y,
+            routes: today_routes,
+            ..
+        } = a.scratch();
+        assert_host_route(
+            &today_routes,
+            "the scratch entry point must keep this geometry's single-row call on the CPU \
+             route, and the tiled arm that now takes it must not have run",
+        );
+
+        // The same bytes through the whole-buffer arena, encoded by the same joined
+        // call: the control for the parked base and the chunk windows, so the movement
+        // below is not a misread of this geometry's weight region.
+        let plain_y = a.plain_joined();
+        assert_signal(&plain_y, "the in-arena control");
+        common::assert_bit_identical(
+            &joined_y,
+            &plain_y,
+            "the whole-buffer control must be the same arm over the same bytes",
+        );
+
+        let call_sites = q8_call_sites(&a.case);
+        let (max_abs, rel) = movement(&joined_y, &today_y);
+        eprintln!(
+            "[rlx-gguf-parked-q8-0-one-row] geometry={label} call_sites={call_sites} \
+             joined_route=tiled joined_census=({}, {}, {}, {}) unjoined_submits={arm_submits} \
+             unjoined_waits={arm_waits} max_abs={max_abs:.3e} rel={rel:.3e} bar=1e-2",
+            joined_routes.per_row, joined_routes.grouped, joined_routes.scratch, joined_routes.host
+        );
+        assert_under_cross_route_bar(max_abs, bar_what);
+    }
+}
+
 /// The one-row route's X-window guard, driven through the same runner as the
 /// executable uses: the tiled arm reads X as `vec4`, so a window that does not
 /// line up with a four-element group must go to the host instead. The reference
 /// is the same bytes read from an aligned window — the device arm — so an arm
 /// that read the misaligned window would take it shifted by up to three elements
-/// and not match.
+/// and not match. Driven for every scheme that arm serves: the K-quants' blocks
+/// and the 8-bit scheme's own.
 #[test]
 fn a_misaligned_x_window_is_not_read_as_vec4() {
     let Some(dev) = wgpu_device() else {
@@ -987,65 +1127,75 @@ fn a_misaligned_x_window_is_not_read_as_vec4() {
     };
     let _counters = COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
     let (k, n) = (256usize, 1024usize);
-    let w = packed(k, n);
     // `+1 / -1` rather than a smooth ramp: an arm that reads the window one
     // element off must show it here, and consecutive samples of a smooth input
     // are too close for that.
     let x: Vec<f32> = (0..k)
         .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
         .collect();
-    let (g, x_in, w_id, y) = one_weight_graph(k, n, 1, w.len());
-    let arena = Arena::from_plan(&dev.device, &plan_memory_f32_uniform(&g, 16));
-    arena.write_bytes_range(&dev.queue, arena.offset(w_id), &w);
-    let (x_off, w_off, y_off) = (arena.offset(x_in), arena.offset(w_id), arena.offset(y));
     let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-    // X four bytes past its slot: a 4-byte-aligned window of the same tensor.
-    let mis = x_off + 4;
-    assert!(
-        mis + x_bytes.len() <= arena.buffer.size() as usize,
-        "X's slot needs four spare bytes to shift its window"
-    );
-    arena.write_bytes_range(&dev.queue, mis, &x_bytes);
-    run_dequant_matmul_gguf_gemv_rows(
-        &arena,
-        &dev.device,
-        &dev.queue,
-        1,
-        k,
-        n,
-        gguf_scheme_id(QuantScheme::GgufQ4K),
-        mis,
-        w_off,
-        y_off,
-        &mut PassMarks::none(),
-    );
-    let via_host = arena.read_f32(&dev.device, &dev.queue, y);
+    for (scheme, w) in [
+        (QuantScheme::GgufQ4K, packed(k, n)),
+        (
+            QuantScheme::GgufQ8_0,
+            common::packed_gguf_weight(QuantScheme::GgufQ8_0, k, n),
+        ),
+    ] {
+        let (g, x_in, w_id, y) = one_weight_graph(k, n, 1, w.len(), scheme);
+        let arena = Arena::from_plan(&dev.device, &plan_memory_f32_uniform(&g, 16));
+        arena.write_bytes_range(&dev.queue, arena.offset(w_id), &w);
+        let (x_off, w_off, y_off) = (arena.offset(x_in), arena.offset(w_id), arena.offset(y));
 
-    arena.write_bytes_range(&dev.queue, x_off, &x_bytes);
-    run_dequant_matmul_gguf_gemv_rows(
-        &arena,
-        &dev.device,
-        &dev.queue,
-        1,
-        k,
-        n,
-        gguf_scheme_id(QuantScheme::GgufQ4K),
-        x_off,
-        w_off,
-        y_off,
-        &mut PassMarks::none(),
-    );
-    let on_device = arena.read_f32(&dev.device, &dev.queue, y);
+        // X four bytes past its slot: a 4-byte-aligned window of the same tensor.
+        let mis = x_off + 4;
+        assert!(
+            mis + x_bytes.len() <= arena.buffer.size() as usize,
+            "X's slot needs four spare bytes to shift its window"
+        );
+        arena.write_bytes_range(&dev.queue, mis, &x_bytes);
+        run_dequant_matmul_gguf_gemv_rows(
+            &arena,
+            &dev.device,
+            &dev.queue,
+            1,
+            k,
+            n,
+            gguf_scheme_id(scheme),
+            mis,
+            w_off,
+            y_off,
+            &mut PassMarks::none(),
+        );
+        let via_host = arena.read_f32(&dev.device, &dev.queue, y);
 
-    assert_signal(&on_device, "the aligned reference");
-    let max_abs = common::max_abs_diff(&via_host, &on_device);
-    let scale = magnitude(&on_device);
-    eprintln!("misaligned X window vs aligned: max_abs={max_abs:e} ref_scale={scale:e}");
-    assert!(
-        max_abs <= 1e-3,
-        "a misaligned X window must not be read as vec4: max_abs {max_abs}"
-    );
+        arena.write_bytes_range(&dev.queue, x_off, &x_bytes);
+        run_dequant_matmul_gguf_gemv_rows(
+            &arena,
+            &dev.device,
+            &dev.queue,
+            1,
+            k,
+            n,
+            gguf_scheme_id(scheme),
+            x_off,
+            w_off,
+            y_off,
+            &mut PassMarks::none(),
+        );
+        let on_device = arena.read_f32(&dev.device, &dev.queue, y);
+
+        assert_signal(&on_device, "the aligned reference");
+        let max_abs = common::max_abs_diff(&via_host, &on_device);
+        let scale = magnitude(&on_device);
+        eprintln!(
+            "misaligned X window vs aligned ({scheme:?}): max_abs={max_abs:e} ref_scale={scale:e}"
+        );
+        assert!(
+            max_abs <= 1e-3,
+            "a misaligned X window must not be read as vec4 ({scheme:?}): max_abs {max_abs}"
+        );
+    }
 }
 
 /// The same exercise at the size the harness uses — 202048 × 7168 Q4_K = 777 MiB
@@ -1068,7 +1218,7 @@ fn harness_size_parked_weight_matches_the_per_row_path() {
     let packed = packed(k, n);
     let x = common::ramp(m, k, 1e-3);
 
-    let (g, x_in, w, y) = one_weight_graph(k, n, m, packed.len());
+    let (g, x_in, w, y) = one_weight_graph(k, n, m, packed.len(), QuantScheme::GgufQ4K);
     let parked = parked_arena(dev, &g, w);
     parked.write_bytes_range(&dev.queue, parked.offset(w), &packed);
     parked.write_f32(&dev.queue, x_in, &x);
@@ -1089,7 +1239,7 @@ fn harness_size_parked_weight_matches_the_per_row_path() {
 
     // Per-row reference: a graph of its own (m == 1 picks the GEMV), one arena
     // reused for every row by rewriting just the activation.
-    let (g1, x1, w1, y1) = one_weight_graph(k, n, 1, packed.len());
+    let (g1, x1, w1, y1) = one_weight_graph(k, n, 1, packed.len(), QuantScheme::GgufQ4K);
     let rows = parked_arena(dev, &g1, w1);
     rows.write_bytes_range(&dev.queue, rows.offset(w1), &packed);
     let mut worst = 0.0f32;

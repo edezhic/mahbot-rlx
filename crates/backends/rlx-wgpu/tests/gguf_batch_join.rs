@@ -16,13 +16,14 @@
 //! Nine brackets, each one forward pass between a counter reset and a read of
 //! them. **1 — the join set**, `dq(Q4_K) → mm → dq(Q6_K) → rv → mm`, compiled at a
 //! bucket and run at one row of it: the join set is the tiled one-row arm's two
-//! schemes at **every row count** — the tiled one-row arm at one row and the
+//! K-quant schemes at **every row count** — the tiled one-row arm at one row and the
 //! row-grouped GEMM above it — while Q1_0 keeps its own arm, the 8-bit scheme's
 //! multi-row calls over whole staged tiles join through that same grouped arm (its
-//! off-tile and single-row forms keep the scratch entry point they had, and an
-//! admitted call whose grouped encode refuses falls through to the host arm, which
-//! recomputes it on the slab — brackets 8 and 9), and the scratch route and the
-//! single-row form answer as they did. So this graph covers it completely — the
+//! off-tile multi-row forms keep the scratch entry point they had, its single row
+//! takes the tiled one-row arm's own 8-bit branch, and an admitted call whose
+//! grouped encode refuses falls through to the host arm, which recomputes it on
+//! the slab — brackets 8 and 9), and the scratch route answers as it did. So this
+//! graph covers it completely — the
 //! 4-bit half, the 6-bit half, and `rv`, an `Op::Reverse` on the last axis, the
 //! filler that consumes a uniform, bind-group *and* meta-buffer lane while staying
 //! device work on both legs. It reads **1 submission and 1 wait** against **5 and

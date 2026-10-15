@@ -776,7 +776,7 @@ pub(crate) enum Step {
     /// GGUF K-quant — host fused dequant+matmul between GPU segments.
     ///
     /// Plan-time classification, and a conservative over-approximation: at run
-    /// time a call of the tiled Q4_K/Q6_K arm with an addressable X window — one
+    /// time a call of the tiled one-row arm with an addressable X window — one
     /// row, and the row-grouped GEMM above one — is device-only work the run
     /// encodes into the enclosing batch
     /// ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`] /

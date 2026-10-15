@@ -4267,9 +4267,9 @@ pub fn dequant_gemv_gguf_kernel(device: &wgpu::Device) -> &'static Kernel {
         )
     })
 }
-/// The one-row Q4_K / Q6_K entry of `dequant_gemv_gguf.wgsl`: one workgroup per
-/// two output columns, the workgroup's threads splitting each column's
-/// contraction.
+/// The one-row Q4_K / Q6_K / Q8_0 entry of `dequant_gemv_gguf.wgsl`: one
+/// workgroup per two output columns, the workgroup's threads splitting each
+/// column's contraction.
 pub fn dequant_gemv_gguf_tiled_kernel(device: &wgpu::Device) -> &'static Kernel {
     DEQUANT_GEMV_GGUF_TILED.get_or_init(|| {
         build_kernel_ro_u_ro_rw(

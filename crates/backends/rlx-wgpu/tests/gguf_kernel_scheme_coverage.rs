@@ -8,7 +8,8 @@
 //! Three entry points carry scheme dispatch:
 //!   * `dequant_gguf` (`dequant_gguf.wgsl`) — device dequant into f32 scratch;
 //!   * `dequant_gemv_tiled` / `dequant_gemv` (`dequant_gemv_gguf.wgsl`) — the
-//!     two one-row packed-multiply arms, Q4_K / Q6_K and Q1_0 respectively.
+//!     two one-row packed-multiply arms, Q4_K / Q6_K / Q8_0 and Q1_0
+//!     respectively.
 //!
 //! Each is an `if (params.scheme_id == N) { … }` chain with **no default arm**.
 //! An id that reaches one without a matching branch falls off the end, leaves
@@ -220,34 +221,39 @@ fn one_row_entry_points_parse_and_validate() {
 fn the_one_row_device_guard_requires_a_vec4_addressable_x_window() {
     use rlx_wgpu::gguf_gpu::{gemv_one_row_device_ok as ok, gemv_tiled_supports_scheme};
 
-    let tiled = (0u32..=64)
-        .find(|id| gemv_tiled_supports_scheme(*id))
-        .expect("the tiled arm has at least one scheme");
-    // A planned activation lands on a 16-byte boundary of its window and `k` is a
-    // multiple of 256, so this is every call the models make.
-    for aligned in [0usize, 16, 64, 1024, 256 * 3 + 32] {
+    let tiled: Vec<u32> = (0u32..=64)
+        .filter(|id| gemv_tiled_supports_scheme(*id))
+        .collect();
+    assert!(!tiled.is_empty(), "the tiled arm has at least one scheme");
+    // Every scheme the tiled arm branches on, the 8-bit one included: the guard is
+    // the arm's, not the first scheme's.
+    for id in tiled {
+        // A planned activation lands on a 16-byte boundary of its window and `k` is a
+        // whole number of the scheme's blocks, so this is every call the models make.
+        for aligned in [0usize, 16, 64, 1024, 256 * 3 + 32] {
+            assert!(
+                ok(id, aligned, 4096),
+                "id {id}: an X window {aligned} bytes in is readable as vec4"
+            );
+        }
+        // A 4-byte-aligned view of one is not — neither as the window ...
+        for misaligned in [4usize, 8, 12, 256 + 12, 1024 + 4] {
+            assert!(
+                !ok(id, misaligned, 4096),
+                "id {id}: an X window {misaligned} bytes in is not addressable as vec4"
+            );
+        }
+        // ... nor as the row stride, which is the window's `k * 4` bytes: a
+        // 257-element contraction strides 1028 B, four bytes off a group. The guard
+        // is about addressability, not block geometry — a `k` that is a multiple of
+        // four but not of a whole 256-element block (e.g. 384) passes it, and for
+        // the K-quants the shader's `k / 256` then truncates it, which is that
+        // shape's existing behaviour.
         assert!(
-            ok(tiled, aligned, 4096),
-            "an X window {aligned} bytes in is readable as vec4"
+            !ok(id, 16, 257 * 4),
+            "id {id}: a 257-element contraction's row stride"
         );
     }
-    // A 4-byte-aligned view of one is not — neither as the window ...
-    for misaligned in [4usize, 8, 12, 256 + 12, 1024 + 4] {
-        assert!(
-            !ok(tiled, misaligned, 4096),
-            "an X window {misaligned} bytes in is not addressable as vec4"
-        );
-    }
-    // ... nor as the row stride, which is the window's `k * 4` bytes: a
-    // 257-element contraction strides 1028 B, four bytes off a group. The guard
-    // is about addressability, not block geometry — a `k` that is a multiple of
-    // four but not of a whole 256-element block (e.g. 384) passes it and is
-    // truncated by the shader's `k / 256`, which is that shape's existing
-    // behaviour.
-    assert!(
-        !ok(tiled, 16, 257 * 4),
-        "a 257-element contraction's row stride"
-    );
     // Q1_0 (the other arm) reads X a scalar at a time, so neither matters to it.
     assert!(ok(24, 4, 257 * 4));
 }
@@ -255,20 +261,23 @@ fn the_one_row_device_guard_requires_a_vec4_addressable_x_window() {
 /// The route ladder's answer, pinned device-free. The batch boundary joins
 /// exactly on [`rlx_wgpu::gguf_gpu::DequantMatmulPath::is_provably_device_only`],
 /// so that predicate must be an *exact* test of the ladder's device-only answers:
-/// the tiled K-quant one-row arm
-/// ([`rlx_wgpu::gguf_gpu::DequantMatmulPath::OneRowDevice`]), the row-grouped GEMM
-/// above it, which the same windowed entry point reaches at the row count the run
-/// encodes it at
-/// ([`rlx_wgpu::gguf_gpu::DequantMatmulPath::GroupedDevice`]), and — new for the
-/// 8-bit scheme — that scheme's multi-row grouped arm. The last is a refinement of
-/// the slab answer that scheme used to get: it is admitted on the grouped GEMM's
-/// staged tile
+/// the tiled one-row arm
+/// ([`rlx_wgpu::gguf_gpu::DequantMatmulPath::OneRowDevice`]) — the K-quants', and
+/// new for the 8-bit scheme that scheme's own at one row, over its own 32-element
+/// blocks — the row-grouped GEMM above it, which the same windowed entry point
+/// reaches at the row count the run encodes it at
+/// ([`rlx_wgpu::gguf_gpu::DequantMatmulPath::GroupedDevice`]), and — also new for
+/// the 8-bit scheme — that scheme's multi-row grouped arm. Those last two are
+/// refinements of the slab answer that scheme used to get: the multi-row one is
+/// admitted on the grouped GEMM's staged tile
 /// ([`rlx_wgpu::gguf_gpu::GROUPED_STAGE_ELEMS`], eight of Q8_0's own 32-element
 /// blocks rather than one of them, so the tile and not the scheme's block is the
 /// gate) and on the shared `vec4` X-window guard that kernel's encoder applies,
-/// which the ladder restates device-free. Every other call keeps exactly the answer
-/// it had — the scheme's slab when a slab was booked, the host when none was — so
-/// the negative cases below are half of this claim and are pinned too.
+/// which the ladder restates device-free; the one-row one is that scheme's own
+/// block-keyed branch of the tiled kernel, admitted on its shape terms alone,
+/// exactly as the K-quants' is. Every other call keeps exactly the answer it had —
+/// the scheme's slab when a slab was booked, the host when none was — so the
+/// negative cases below are half of this claim and are pinned too.
 ///
 /// It has to compose the arm's own X-window addressability guard
 /// (`gemv_one_row_device_ok`), so a window the arm's `vec4` reads cannot address
@@ -394,11 +403,12 @@ fn select_path_is_exact_for_the_joined_device_arms() {
         );
     }
 
-    // The 8-bit scheme (Q8_0, 20) is the refinement's own case. It has no fused
-    // kernel, so above one row it used to take its slab for every call; it is now
-    // the device-only grouped arm whenever all four gates hold — the plan booked the
-    // slab, more than one row, a whole number of the grouped GEMM's staged tiles,
-    // and an X window that kernel's `vec4` reads can address.
+    // The 8-bit scheme (Q8_0, 20) is the refinement's own case. It has no arm in
+    // the fused entry point, so above one row it used to take its slab for every
+    // call; it is now the device-only grouped arm whenever all four gates hold — the
+    // plan booked the slab, more than one row, a whole number of the grouped GEMM's
+    // staged tiles, and an X window that kernel's `vec4` reads can address. Its one
+    // row is the tiled arm's own branch, pinned below.
     let q8_0 = rlx_wgpu::gguf_host::gguf_scheme_id(rlx_ir::quant::QuantScheme::GgufQ8_0);
     for k in [rlx_wgpu::gguf_gpu::GROUPED_STAGE_ELEMS, 2048] {
         for m in [2usize, 4, 13] {
@@ -448,20 +458,53 @@ fn select_path_is_exact_for_the_joined_device_arms() {
         DequantMatmulPath::Host,
         "Q8_0 (id {q8_0}) m=4 with no slab: nothing to dequantize into, so the host"
     );
-    // ... one row, the 8-bit scheme having no one-row device arm at all, so its
-    // single-row form is untouched by the refinement ...
+    // ... one row, which is now this scheme's own arm: the tiled kernel's branch
+    // keyed on this scheme's own 32-element block, joined on its shape terms
+    // alone ...
     assert_eq!(
         select_path(1, 256, q8_0, 64, 4096),
-        DequantMatmulPath::ScratchArm,
-        "Q8_0 (id {q8_0}) m=1 with a slab: the 8-bit scheme has no grouped kernel at \
-         one row, so the slab stands"
+        DequantMatmulPath::OneRowDevice,
+        "Q8_0 (id {q8_0}) m=1 with a slab: the 8-bit scheme's single row is the \
+         tiled arm's own block-keyed branch, over whole 32-element blocks, so it \
+         joins the enclosing batch"
     );
-    // ... and a row count of zero, which is not above one row either.
+    // ... a contraction that is not a whole number of those blocks, which the
+    // branch's own `k / 32` unit count would floor: the arm is not asked and
+    // today's slab answer stands. The format never carries a partial block with
+    // real packed bytes, so only this device-free ladder can exercise the gate.
+    assert_eq!(
+        select_path(1, 100, q8_0, 64, 4096),
+        DequantMatmulPath::ScratchArm,
+        "Q8_0 (id {q8_0}) m=1 k=100 with a slab: 100 is not a whole number of \
+         32-element blocks, so the one-row arm is not asked and the slab stands"
+    );
+    // ... a one-row window the arm's `vec4` X read cannot address: the fused entry
+    // point's own refusal, which hands the call to the host — the same outcome the
+    // K-quants' one-row arm produces for that window, pinned at the end of this
+    // test.
+    assert_eq!(
+        select_path(1, 256, q8_0, 4, 4096),
+        DequantMatmulPath::FusedArm,
+        "Q8_0 (id {q8_0}) m=1 with a 4-byte-aligned X window: not addressable as \
+         vec4, so the boundary must not join it"
+    );
+    // ... and no slab booked at all, which the one-row arm does not read: it is
+    // admitted on its shape terms alone, exactly as the K-quants' is
+    // (`select_path(1, 256, 0, 64, 0)` is `OneRowDevice` today) — the slab is not
+    // a term of it.
+    assert_eq!(
+        select_path(1, 256, q8_0, 64, 0),
+        DequantMatmulPath::OneRowDevice,
+        "Q8_0 (id {q8_0}) m=1 with no slab: the one-row arm's terms are its own \
+         blocks and the X window, so the booking cannot keep it out"
+    );
+    // ... and a row count of zero, which is not above one row either, nor the new
+    // term's `m == 1` exactly.
     assert_eq!(
         select_path(0, 256, q8_0, 64, 4096),
         DequantMatmulPath::ScratchArm,
-        "Q8_0 (id {q8_0}) m=0 with a slab: a row count of zero is not `m > 1`, so the \
-         slab stands"
+        "Q8_0 (id {q8_0}) m=0 with a slab: a row count of zero is not `m > 1` and \
+         not the one-row arm's `m == 1`, so the slab stands"
     );
 
     // Q5_0 (22) is the out-of-scope control: no fused kernel and no grouped kernel

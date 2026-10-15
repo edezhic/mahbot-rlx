@@ -83,18 +83,19 @@ kernels, pure Rust deps — no FFI, no submodules.
 - **GGUF dequant** — `kernels/dequant_gguf.wgsl`, `dequant_gemv_gguf.wgsl`,
   `dequant_gemm_gguf.wgsl` + `gguf_gpu.rs`: `select_path` picks the fused
   windowed kernels for Q4_K/Q6_K/Q1_0 (scratch-free, shard-safe). At `m == 1`
-  Q4_K/Q6_K take a tiled per-row GEMV arm (one workgroup per two output columns,
-  its lanes splitting each column's contraction over 32-element units of the
-  packed weight, one X read four elements at a time shared across them)
+  Q4_K/Q6_K/Q8_0 take a tiled per-row GEMV arm (one workgroup per two output
+  columns, its lanes splitting each column's contraction over 32-element units of
+  the packed weight, one X read four elements at a time shared across them)
   while Q1_0 keeps one thread per column on the scalar X view; for `m > 1`
   Q4_K/Q6_K **and Q8_0** a row-grouped GEMM reads each packed weight tile's quant
   bytes once per group of 8 rows instead of once per row — and that GEMM's Q4_K
   entry, when a dispatch would be too small to fill the GPU, covers half the
   columns per workgroup with two threads to each instead, splitting the contraction
-  across them and reading each block's 16-byte header twice. Q8_0 has no one-row
-  arm, so it takes the scratch slab at `m == 1` and at any multi-row shape the GEMM
-  declines. Other schemes dequant into scratch then `matmul_bt` when the arena is
-  a single buffer; sharded / split-weight arenas fall back to `gguf_host`. Grouped
+  across them and reading each block's 16-byte header twice. Q8_0's own case of
+  that one-row arm is keyed on its 32-element block, so it takes the scratch slab
+  only at the shapes neither of its two device arms carries. Other schemes dequant
+  into scratch then `matmul_bt` when the arena is a single buffer; sharded /
+  split-weight arenas fall back to `gguf_host`. Grouped
   MoE GGUF uses the GPU path when scratch fits and the arena is unsharded. Scheme
   ids match Metal/CUDA. Details:
   [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).

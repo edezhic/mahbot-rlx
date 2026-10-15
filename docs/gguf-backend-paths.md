@@ -90,7 +90,7 @@ once per device context on Metal/CUDA/ROCm/WGPU.
 | **CPU** | — | block-wise fused matmul in `rlx-cpu::gguf_matmul` | — | always available |
 | **Metal** | `dequant_gguf.msl` → MPS sgemm | Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M | MIL `mul`+`sub` for K/IQ/TQ/MX (see ANE) | `RLX_METAL_DEQUANT_GPU_DISABLE=1` |
 | **CUDA / ROCm** | `dequant_gguf.cu` → BLAS | — | — | same disable pattern |
-| **WGPU** | `select_path` ladder: fused windowed kernels (`dequant_gemv_gguf` at one row, `dequant_gemm_gguf` / `dequant_gemm_q1_0` above), else `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | Q4_K, Q6_K at `m == 1` (one workgroup per two output columns, its lanes splitting each column's contraction); Q1_0 (one thread per column at `m == 1`, a tiled GEMM above). At `m > 1` Q4_K/Q6_K **and Q8_0** take the row-grouped GEMM, its Q4_K entry splitting a starved dispatch's columns across two threads each | — | `gguf_host` for a sharded arena, a parked weight, or a refused slab |
+| **WGPU** | `select_path` ladder: fused windowed kernels (`dequant_gemv_gguf` at one row, `dequant_gemm_gguf` / `dequant_gemm_q1_0` above), else `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | Q4_K, Q6_K, Q8_0 at `m == 1` (one workgroup per two output columns, its lanes splitting each column's contraction, Q8_0's unit its own 32-element block, so a row holds `k / 32` of them); Q1_0 (one thread per column at `m == 1`, a tiled GEMM above). At `m > 1` Q4_K/Q6_K **and Q8_0** take the row-grouped GEMM, its Q4_K entry splitting a starved dispatch's columns across two threads each | — | `gguf_host` for a sharded arena, a parked weight, or a refused slab |
 | **ANE (CoreML)** | hybrid host segments | — | MIL `mul` + optional `sub` | `RLX_COREML_HOST_DEQUANT=1` |
 | **TPU** | — | — | — | host dequant at HLO emit (`Constant`, `quant_param_bindings`, or runtime `set_param_typed` on deferred Param) |
 | **MLX** | Q1_0 on-device (`dequant_q1_0.metal`); other GGUF host dequant + cache | — | — | `RLX_MLX_GGUF_HOST_FALLBACK=1` / `RLX_MLX_Q1_HOST=1` |
@@ -175,15 +175,15 @@ Otherwise Q4_1+ fall through with wrong block stride.
    answer for a call — `OneRowDevice` / `GroupedDevice` / `FusedArm` /
    `ScratchArm` / `Host`. It names the *entry point*, not the route the run
    records: the fused and scratch arms may still hand the call to `gguf_host`,
-   and `ScratchArm` covers a multi-row Q8_0 call the grouped gates keep out — its
-   own entry point applies the same gates, so that call lands on the slab. The two
-   device-only answers — `OneRowDevice` and `GroupedDevice`, the tiled arm at one
-   row and the row-grouped GEMM at more than one — are also the batch boundary's
-   join set: the run encodes such a call into the caller's enclosing batch instead
-   of letting it submit on its own.
+   and `ScratchArm` covers a Q8_0 call the shape gates keep out of the two device
+   arms — its own entry point applies the same gates, so that call lands on the
+   slab. The two device-only answers — `OneRowDevice` and `GroupedDevice`, the
+   tiled arm at one row and the row-grouped GEMM at more than one — are also the
+   batch boundary's join set: the run encodes such a call into the caller's
+   enclosing batch instead of letting it submit on its own.
 2. **Fused windowed kernels** (no f32 scratch, shard-safe) — the `FusedArm` entry
    point, and `OneRowDevice`, its one-row case:
-   - `dequant_gemv_gguf.wgsl` at one row: Q4_K / Q6_K take the
+   - `dequant_gemv_gguf.wgsl` at one row: Q4_K / Q6_K / Q8_0 take the
      `dequant_gemv_tiled` arm — one workgroup per two output columns, its lanes
      splitting each column's contraction over 32-element units of the packed
      weight, one X read four elements at a time through a second binding shared
@@ -196,7 +196,9 @@ Otherwise Q4_1+ fall through with wrong block stride.
      arm (one thread per output column, the scalar X view). The tiled arm's `vec4`
      X read needs a window that lines up with a four-element group — true of every
      planned F32 activation, and a 4-byte-aligned view of one takes the host path
-     instead of being read misaligned.
+     instead of being read misaligned. Q8_0's unit is its own 32-element block —
+     the block itself, not a slice of a 256-element one — so a row holds `k / 32`
+     of them.
    - Q1_0's multi-row call takes its own tiled GEMM (`dequant_gemm_q1_0.wgsl`).
 3. **Row-grouped GEMM** (`GroupedDevice`) — `dequant_gemm_gguf.wgsl` above one
    row: the row-grouped GEMM, one entry point per scheme — Q4_K
@@ -215,14 +217,16 @@ Otherwise Q4_1+ fall through with wrong block stride.
    shards, an X window over the binding limit), the fallback is picked by scheme
    rather than by row count: a scheme with a one-row arm falls back to the fused
    entry point above, one row at a time, with the per-row weight reuse unchanged,
-   and Q8_0 — which has no one-row arm — falls to the scratch slab below. Q8_0's own arm
+   and a multi-row Q8_0 call falls to the scratch slab below — its one-row call is
+   the tiled arm's, outside that per-row loop. Q8_0's own grouped arm
    additionally needs `k % 256 == 0` (a whole number of the staged activation tiles,
-   i.e. eight of its 32-element blocks — its block size is not the gate); no row cap
+   i.e. eight of its 32-element blocks — its block size is not that arm's gate); no row cap
    applies at any of these entries.
 4. **Scratch fallback** (`ScratchArm`): the arena planner reserves
    `dequant_gguf_scratch_bytes(graph)` tail space; dispatch `dequant_gguf` then
-   `matmul_bt` (or the grouped MoE GPU path below). This is Q8_0's route at one
-   row, and its route at any multi-row shape the grouped GEMM declines.
+   `matmul_bt` (or the grouped MoE GPU path below). This is Q8_0's route at one-row
+   shapes its own block gate keeps out, and its route at any multi-row shape the
+   grouped GEMM declines.
 5. **`gguf_host`** (`Host`; CPU dequant + wgpu matmul) for a sharded arena, a
    parked weight, or a slab the plan refused.
 
@@ -297,7 +301,7 @@ Non-GGUF schemes still use the in-HLO `convert + scale/zp tile + dot` path.
 | `RLX_METAL_IQ1M_FUSED_DISABLE=1` | Metal | Disable IQ1_M fused GEMV |
 | `RLX_COREML_HOST_DEQUANT=1` | ANE | Bake full f32 weights at compile |
 | `RLX_COREML_UNITS` | ANE | `cpu`/`gpu`/`all`/`ane`; unset → fp32 CPU+GPU, f16 CPU+ANE |
-| `RLX_WGPU_Q8_0_GEMM_DISABLE=1` | WGPU | Disable the Q8_0 row-grouped GEMM; take the dequant scratch slab |
+| `RLX_WGPU_Q8_0_GEMM_DISABLE=1` | WGPU | Disable the Q8_0 row-grouped GEMM; its multi-row calls then take the dequant scratch slab |
 | (arena planning) | WGPU | Auto host fallback when scratch does not fit |
 
 ## Code map

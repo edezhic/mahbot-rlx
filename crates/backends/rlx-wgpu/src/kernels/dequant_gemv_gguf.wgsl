@@ -8,7 +8,7 @@
 // (NO f32 scratch) and mirror `dequant_gguf.wgsl`'s math; only the sink differs
 // (accumulate vs store). They differ in how one row's work is arranged:
 //
-//   * `dequant_gemv_tiled` (Q4_K, Q6_K): one WORKGROUP per TWO output columns,
+//   * `dequant_gemv_tiled` (Q4_K, Q6_K, Q8_0): one WORKGROUP per TWO output columns,
 //     and that workgroup's 32 lanes split each column's contraction instead of
 //     one thread walking the whole row. A lane owns one 32-element *unit* of the
 //     row and reads X as `vec4` (8 vector loads per unit, 4 elements each),
@@ -21,6 +21,11 @@
 //
 //     What a unit *is* differs per scheme, because their nibble-to-element maps
 //     do:
+//       - Q8_0: one whole block — its 32 i8 quants and the f16 `d` at their head
+//         — so a row holds `k / 32` units rather than the K-quants' eight per
+//         256-element block, and this branch counts them itself. Its 34-byte
+//         block stride puts half the blocks' quants two bytes off a word
+//         boundary, which `read_word_at` covers for the scale and the quants.
 //       - Q6_K: the 16-byte half of a quarter's 32-byte `ql` span, read at BOTH
 //         of that span's nibble sets — byte `t` of the span holds element `t` of
 //         quarter `q` in one nibble and of quarter `q ^ 2` in the other, so the
@@ -42,12 +47,13 @@
 //         times per block — inside the 144-byte block that unit's own `qs` words
 //         come from. Header bytes requested up, loads down.
 //
-//     Both schemes' block headers are read from that scheme's own layout: Q4_K's
+//     Each scheme's block header is read from that scheme's own layout: Q4_K's
 //     16-byte header (two f16s then 12 scale/min bytes) as four `read_word_at`
-//     words parsed with shifts, Q6_K's (an f16 `d` and 16 i8 scales) byte-wise.
-//     Reading the packed weight at any alignment is `read_word_at`'s job — the
-//     blocks are 144 and 210 bytes, so Q6_K's ql/qh slices are only two-byte
-//     aligned.
+//     words parsed with shifts, Q6_K's (an f16 `d` and 16 i8 scales) byte-wise,
+//     Q8_0's as the one word its `d` and its first two quants share. Reading the
+//     packed weight at any alignment is `read_word_at`'s job — the blocks are
+//     144, 210 and 34 bytes, so even Q6_K's and Q8_0's slice offsets land at
+//     two bytes.
 //
 //     The device work a one-row multiply issues is the row's own
 //     `columns x contraction`: at the model widths (1024…6144 columns) the
@@ -75,9 +81,9 @@
 // `x[k_base + out_i]`.
 
 struct Params {
-    k: u32,            // contraction dim (multiple of 256)
+    k: u32,            // contraction dim (a whole number of the scheme's blocks)
     n: u32,            // output columns (weight rows)
-    scheme_id: u32,    // 0 = Q4_K, 2 = Q6_K, 24 = Q1_0
+    scheme_id: u32,    // 0 = Q4_K, 2 = Q6_K, 20 = Q8_0, 24 = Q1_0
     x_f32_off: u32,    // f32 index of x[0] within the x binding
     w_byte_off: u32,   // byte offset of weight[0,0] within the weight binding
     out_f32_off: u32,  // f32 index of y[0] within the output binding
@@ -91,9 +97,9 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write>  outarr: array<f32>;
 // The same `x` window as binding 0, seen four elements at a time: the tiled arm
 // reads X for a whole 32-element unit with 8 vector loads instead of 32 scalar ones
-// — one contiguous span for Q4_K, two 16-element halves 64 elements apart for
-// Q6_K (that span's other nibble set, two quarters along) — so `x_f32_off` has to
-// be a multiple of 4.
+// — one contiguous span for Q4_K and Q8_0, two 16-element halves 64 elements apart
+// for Q6_K (that span's other nibble set, two quarters along) — so `x_f32_off` has
+// to be a multiple of 4.
 // The Rust side admits a call only when it is (`gemv_one_row_device_ok`) and sends
 // the rest to the host rather than reading X shifted. The one-thread-per-column arm
 // keeps the scalar view.
@@ -180,10 +186,23 @@ fn dq_q6k_span(qlw: u32, qhw: u32, sh: u32, qbits: u32, xv: vec4<f32>, scl: f32)
     return (xv.x * q0 + xv.y * q1 + xv.z * q2 + xv.w * q3) * scl;
 }
 
-// Packed bytes one 256-element block of each K-quant occupies — what each branch
-// offsets its second column's block by.
-const Q4K_BLOCK_BYTES: u32 = 144u;
-const Q6K_BLOCK_BYTES: u32 = 210u;
+// The same for one Q8_0 element set: the four signed quants of the `qs` word at
+// `w`, scaled by the block's `d` and multiplied against that set's four X
+// elements. The word is biased by 0x80 and read through `unpack4x8unorm` — exact,
+// where a signed unpack clamps the lowest quant (-128) at -1.0 — and the 255 and
+// the bias fold back out in one `fma`, the trick the grouped Q8_0 entry's
+// `q8_0_quants` uses (`dequant_gemm_gguf.wgsl`).
+fn dq_q8_0_span(word: u32, xv: vec4<f32>, d: f32) -> f32 {
+    let q = fma(unpack4x8unorm(word ^ 0x80808080u), vec4<f32>(d * 255.0), vec4<f32>(-128.0 * d));
+    return xv.x * q.x + xv.y * q.y + xv.z * q.z + xv.w * q.w;
+}
+
+// Packed bytes one block of each scheme occupies — what each branch offsets its
+// second column's block by: a 256-element block for the K-quants, Q8_0's own
+// 32-element one.
+const Q4_K_BLK_BYTES: u32 = 144u;
+const Q6_K_BLK_BYTES: u32 = 210u;
+const Q8_0_BLK_BYTES: u32 = 34u;
 
 // Threads one workgroup of `dequant_gemv_tiled` runs: its `@workgroup_size`, and
 // the stride between one output column's reduction slots in `red` and the next
@@ -253,8 +272,9 @@ fn dequant_gemv_tiled(
     let j0 = wid.x * COLS_PER_WG;
     if (j0 >= params.n) { return; }
     let second = (j0 + 1u) < params.n;
-    // Both schemes' blocks hold 256 elements — eight of this arm's 32-element
-    // units — so only their packed size differs.
+    // The two K-quants' blocks hold 256 elements — eight of this arm's 32-element
+    // units — so only their packed size differs. Q8_0's own block IS that unit,
+    // so its branch counts the row's blocks itself.
     let nbk = params.k / 256u;        // blocks per weight row
     // Units per weight row: eight per block, over the row's own block count, so the
     // bound stays inside the row's packed bytes — a `k` that is not a whole number
@@ -273,7 +293,7 @@ fn dequant_gemv_tiled(
         // odd — read as eight words. The block's header (`d`/`dmin` as two f16s,
         // then 12 scale/min bytes) is its first four words.
         for (var u = lane; u < nu; u = u + LANES) {
-            let off0 = (j0 * nbk + u / 8u) * Q4K_BLOCK_BYTES;
+            let off0 = (j0 * nbk + u / 8u) * Q4_K_BLK_BYTES;
             let sb = u % 8u;
             let h0 = read_word_at(off0);
             let h1 = read_word_at(off0 + 4u);
@@ -289,7 +309,7 @@ fn dequant_gemv_tiled(
             var d1 = 0.0;
             var m1 = 0.0;
             if (second) {
-                let off1 = off0 + nbk * Q4K_BLOCK_BYTES;
+                let off1 = off0 + nbk * Q4_K_BLK_BYTES;
                 let g0 = read_word_at(off1);
                 let g1 = read_word_at(off1 + 4u);
                 let g2 = read_word_at(off1 + 8u);
@@ -324,7 +344,7 @@ fn dequant_gemv_tiled(
             let q = ub % 4u;              // its quarter of that half
             let rh = q / 2u;              // its 16-byte half of that quarter
             let q2 = q ^ 2u;
-            let off0 = (j0 * nbk + b) * Q6K_BLOCK_BYTES;
+            let off0 = (j0 * nbk + b) * Q6_K_BLK_BYTES;
             let qlb0 = off0 + h * 64u + (q % 2u) * 32u + 16u * rh;
             let qhb0 = off0 + 128u + h * 32u + 16u * rh;
             let d0 = dq_read_f16(off0 + 208u);
@@ -343,7 +363,7 @@ fn dequant_gemv_tiled(
             var slo1 = 0.0;
             var shi1 = 0.0;
             if (second) {
-                let off1 = off0 + nbk * Q6K_BLOCK_BYTES;
+                let off1 = off0 + nbk * Q6_K_BLK_BYTES;
                 let d1 = dq_read_f16(off1 + 208u);
                 let scb1 = off1 + 192u + h * 8u;
                 qlb1 = off1 + h * 64u + (q % 2u) * 32u + 16u * rh;
@@ -365,6 +385,37 @@ fn dequant_gemv_tiled(
                     let qhw1 = read_word_at(qhb1 + 4u * w);
                     acc1 = acc1 + dq_q6k_span(qlw1, qhw1, shlo, 2u * q, xlo, slo1)
                                 + dq_q6k_span(qlw1, qhw1, shhi, 2u * q2, xhi, shi1);
+                }
+            }
+        }
+    } else if (params.scheme_id == 20u) {
+        // Q8_0: 34 bytes / 32 elems. Unit `u` IS block `u` — the f16 `d` at its
+        // head and its 32 i8 quants — so the row holds `k / 32` units and this
+        // branch counts them itself rather than through the K-quants' `nu` (which
+        // holds the tail of a `k` that is not a whole number of 256-element
+        // blocks). The Rust side admits this scheme's single row only over whole
+        // blocks, so that tail is never served here. Its 34-byte stride is not a
+        // multiple of four, so half the (column, block) pairs put their quants two
+        // bytes off a word boundary, and a row's last one is reassembled by
+        // `read_word_at` — whose second word reaches two bytes past the row's packed
+        // bytes, the slack the plan's boundary tail guard, or the weight buffer's
+        // rounding to a word, leaves there.
+        let q8blk = params.k / 32u;
+        for (var u = lane; u < q8blk; u = u + LANES) {
+            let off0 = (j0 * q8blk + u) * Q8_0_BLK_BYTES;
+            let d0 = dq_f16_bits(read_word_at(off0) & 0xFFFFu);
+            let e4 = u * 8u;
+            var off1 = 0u;
+            var d1 = 0.0;
+            if (second) {
+                off1 = off0 + q8blk * Q8_0_BLK_BYTES;
+                d1 = dq_f16_bits(read_word_at(off1) & 0xFFFFu);
+            }
+            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                let xv = xarr4[xb4 + e4 + w];
+                acc0 = acc0 + dq_q8_0_span(read_word_at(off0 + 2u + 4u * w), xv, d0);
+                if (second) {
+                    acc1 = acc1 + dq_q8_0_span(read_word_at(off1 + 2u + 4u * w), xv, d1);
                 }
             }
         }

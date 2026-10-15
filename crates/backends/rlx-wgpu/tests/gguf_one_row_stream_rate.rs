@@ -212,12 +212,12 @@ const ROUNDS: usize = 5;
 const CALLS_PER_ROUND: usize = 3;
 
 /// The form's packed weight: the crate's shared fixture at this scheme's own block
-/// geometry, narrowed to the two schemes this arm has an entry point for — the
-/// shared fixture also accepts Q8_0, which has none.
+/// geometry, narrowed to the two K-quant forms this file drives — the shared
+/// fixture also accepts Q8_0, whose own one-row arm these forms do not measure.
 fn packed_weights(scheme: QuantScheme, k: usize, n: usize) -> Vec<u8> {
     assert!(
         matches!(scheme, QuantScheme::GgufQ4K | QuantScheme::GgufQ6K),
-        "{scheme:?} has no one-row arm"
+        "{scheme:?} is not one of the two K-quant forms this file measures"
     );
     common::packed_gguf_weight(scheme, k, n)
 }

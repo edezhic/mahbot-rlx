@@ -80,7 +80,7 @@ impl WgpuExecutable {
     /// That is the route ladder's own answer for the call — the two device-only
     /// [`crate::gguf_gpu::DequantMatmulPath`]s, whose entry point
     /// [`crate::gguf_gpu::encode_dequant_matmul_gguf_into`] can be handed a caller's
-    /// encoder: the tiled K-quant arm at one row
+    /// encoder: the tiled one-row arm
     /// ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`]) and the row-grouped
     /// GEMM above it
     /// ([`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]), which carries the
@@ -91,8 +91,8 @@ impl WgpuExecutable {
     /// them apply that mode to this answer rather than fold it in here.
     ///
     /// The answer is the ladder's, not the encode's: such a call can still be
-    /// carried into an encode that refuses it — for Q8_0, whose ladder has no
-    /// per-row loop, the refusal is recomputed by the entry point that owns it,
+    /// carried into an encode that refuses it — for Q8_0, whose per-row loop carries
+    /// its one row alone, the refusal is recomputed by the entry point that owns it,
     /// [`crate::gguf_host`] included where a sharded arena or a parked weight lands
     /// it there — and the join branch owns that refusal (see its comment).
     ///
@@ -4142,7 +4142,7 @@ impl WgpuExecutable {
                     // runs unjoined is one the boundary deliberately left alone (the
                     // step-by-step / snapshot modes, or a route outside the join set)
                     // rather than a second opinion about the route.
-                    // - The tiled K-quant arm with an addressable X window — the two
+                    // - The tiled one-row arm with an addressable X window — the two
                     //   the batch boundary joins:
                     //   [`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`] at one
                     //   row and [`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]
@@ -4156,7 +4156,7 @@ impl WgpuExecutable {
                     //   loop is that arm's own fallback.
                     // - The fused arm: Q1_0 at every row (its tiled GEMM above one row
                     //   while `RLX_WGPU_Q1_0_GEMM_DISABLE` is off and the windows fit
-                    //   a shard, else the per-row loop), and a tiled K-quant call
+                    //   a shard, else the per-row loop), and a call of the tiled arm
                     //   whose X window the guard refuses — gemv_rows' own check of
                     //   that guard hands it to gguf_host (`Host`), never to a device
                     //   arm.
@@ -4172,8 +4172,8 @@ impl WgpuExecutable {
                     //   fallback for *all* m>1.
                     //
                     // The device answers honour the encode's answer: a call the fused
-                    // entry point cannot encode — Q8_0's grouped arm, its ladder having
-                    // no per-row loop for a scheme outside `gemv_supports_scheme` —
+                    // entry point cannot encode — Q8_0's grouped arm, a multi-row call
+                    // its ladder's per-row loop does not carry —
                     // falls to the scratch arm's entry point, which owns its recompute.
                     // So a call the boundary joined reaches this arm exactly when its
                     // encode refused it, or when the run does not batch at all
@@ -4206,11 +4206,12 @@ impl WgpuExecutable {
                         // `is_weight_off` short-circuits are the reason it must see them
                         // — they stand in front of the per-row loop it delegates to. A
                         // scratch answer is any call the gates above keep out of the two
-                        // device arms with a slab booked: a single row of a scheme the
-                        // fused entry point does not serve, a contraction that is not a
-                        // whole number of the scheme's blocks or of the grouped kernel's
-                        // staged tile, a multi-row call of a scheme neither arm serves,
-                        // and an X window the grouped GEMM's `vec4` reads cannot address.
+                        // device arms with a slab booked: a single row of a scheme
+                        // neither the fused entry point nor the tiled one-row arm serves,
+                        // a contraction that is not a whole number of the scheme's blocks
+                        // or of the grouped kernel's staged tile, a multi-row call of a
+                        // scheme neither arm serves, and an X window the grouped GEMM's
+                        // `vec4` reads cannot address.
                         // Everything else is tried in the fused entry point, and one it
                         // does not run falls to the same recompute below.
                         let ran = path != crate::gguf_gpu::DequantMatmulPath::ScratchArm

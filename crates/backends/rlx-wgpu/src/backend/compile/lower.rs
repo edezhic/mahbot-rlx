@@ -11741,7 +11741,7 @@ pub(crate) fn compile_static_inner(
                         out_byte_off: arena.offset(node.id) as u64,
                     });
                     // Host-classified step (`run_dequant_matmul_gguf_gpu` builds
-                    // its own bind groups, and a one-row call of the tiled K-quant
+                    // its own bind groups, and a one-row call of the tiled one-row
                     // arm is encoded into the enclosing batch at run time):
                     // schedule-only, like `GroupNorm`. The uniform/bind_group lanes
                     // are indexed by GPU-step count (`gpu_ui`/`gpu_bi`, host steps

@@ -3493,7 +3493,7 @@
     EnvVarEntry {
         name: "RLX_WGPU_Q8_0_GEMM_DISABLE",
         group: "wgpu",
-        summary: "Disable the Q8_0 GEMM kernel on wgpu; use the dequant scratch slab",
+        summary: "Disable the Q8_0 row-grouped GEMM on wgpu; its multi-row calls then use the dequant scratch slab",
         kind: EnvKind::Bool,
         stability: EnvStability::Bisect,
         aliases: &[],
