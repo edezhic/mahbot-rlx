@@ -108,6 +108,10 @@ name = "attention_rows_route"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "attention_softcap_route"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "attention_v_head_dim_parity"
 required-features = ["backend-tests"]
 

@@ -1076,7 +1076,8 @@ pub enum Op {
     /// `score_scale`: when `Some(s)`, dot-product scores are multiplied by
     /// `s` instead of the default `1/sqrt(head_dim)` (Gemma uses `head_dim^-0.5`
     /// explicitly in config). `attn_logit_softcap`: when `Some(c)`, applies
-    /// `c * tanh(s/c)` to scores before softmax (Gemma 2).
+    /// `c * tanh(s/c)` to the scaled scores **before** the mask/bias is added and
+    /// before the softmax (Gemma 2); a `c` that is zero or negative is disabled.
     ///
     /// ## Operand layout
     ///

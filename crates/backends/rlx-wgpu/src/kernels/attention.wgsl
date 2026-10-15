@@ -38,9 +38,13 @@
 // will actually walk (`kernels::attention_decode_eligible`).
 //
 // The third entry point, `attention_mask`, is the many-row route's masked
-// scale: the same scale-then-mask the two above apply to a score, over a dense
-// score matrix a multiply just wrote, in front of the ordinary dense softmax.
+// scale: the same scale, cap and mask the two above apply to a score, over a
+// dense score matrix a multiply just wrote, in front of the ordinary dense
+// softmax.
 
+// The widest head the per-thread Q/O arrays below hold. A shape above it is
+// refused at plan time (`backend::attention_route`), so the early return that
+// reads this is a backstop, not the refusal.
 const MAX_HEAD_DIM: u32 = 512u;
 
 // Decode-shaped variant: workgroup width == key lanes, and the value dims merged
@@ -51,12 +55,16 @@ const MAX_HEAD_DIM: u32 = 512u;
 const DECODE_LANES: u32 = 64u;
 const DECODE_DIM_CHUNK: u32 = 32u;
 
-// The score a key position contributes after this operation's mask: the same
-// sentinels, threshold and window for every entry point that applies one.
-// `mask` is the value the caller loaded — only kinds 2 and 4 read the mask
-// tensor, so every other kind passes 0 — and is read only for those two.
-fn mask_score(score: f32, i: u32, q_abs: u32, kind: u32, window: u32, mask: f32) -> f32 {
+// The score a key position contributes after this operation's logit cap and
+// mask: the same cap, sentinels, threshold and window for every entry point
+// that applies one. `cap` is `attn_logit_softcap`'s own `c · tanh(s / c)`, over
+// the scaled score and *before* the mask/bias — the operation's definition, not
+// this kernel's order — and is disabled at 0 or below. `mask` is the value the
+// caller loaded — only kinds 2 and 4 read the mask tensor, so every other kind
+// passes 0 — and is read only for those two.
+fn mask_score(score: f32, cap: f32, i: u32, q_abs: u32, kind: u32, window: u32, mask: f32) -> f32 {
     var out = score;
+    if (cap > 0.0) { out = cap * tanh(out / cap); }
     if (kind == 1u) {
         if (i > q_abs) { out = -3.4e38; }
     } else if (kind == 2u) {
@@ -109,7 +117,9 @@ struct Params {
     // wide while Q/K scores still use `head_dim`. Equals `head_dim` for
     // ordinary symmetric attention; 0 (zero-init) falls back to `head_dim`.
     v_head_dim: u32,
-    _pad_mask_2: u32,
+    // `attn_logit_softcap`, bitcast: `c · tanh(s / c)` over the scaled score,
+    // before the mask. 0 or below is disabled.
+    logit_softcap_bits: u32,
 
     // Per-tensor strides (in f32 elements). Q/K/V/out can be in either
     // [B, H, S, D] or [B, S, H, D] layout — caller sets the strides.
@@ -132,6 +142,7 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
     let h  = q1 % params.heads;
     let b  = q1 / params.heads;
     let scale = bitcast<f32>(params.scale_bits);
+    let cap = bitcast<f32>(params.logit_softcap_bits);
     // Absolute query position for causal/window masking. In a decode step
     // seq_q=1 but the query sits at position seq_k-1 (past KV preceded it), so
     // causality must compare against `qi + (seq_k - seq_q)`, not the local
@@ -186,7 +197,7 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
     for (var d: u32 = 0u; d < hd_v; d = d + 1u) { o[d] = 0.0; }
 
     for (var s: u32 = 0u; s < params.seq_k; s = s + 1u) {
-        // Score: scale * Q · K[s] + mask
+        // Score: scale · Q·K[s], the logit cap, then the mask.
         let k_base = k_bh + s * params.k_seq_stride;
         var score: f32 = 0.0;
         for (var d: u32 = 0u; d < hd; d = d + 1u) {
@@ -199,7 +210,7 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
         if (params.mask_kind == 2u || params.mask_kind == 4u) {
             mask_v = arena[mask_partial + s * params.seq_k_stride];
         }
-        score = mask_score(score, s, q_abs, params.mask_kind, params.window, mask_v);
+        score = mask_score(score, cap, s, q_abs, params.mask_kind, params.window, mask_v);
 
         // Online softmax update.
         let m_new = max(m, score);
@@ -252,6 +263,7 @@ fn attention_decode(
     let hd_v = select(params.v_head_dim, hd, params.v_head_dim == 0u);
 
     let scale = bitcast<f32>(params.scale_bits);
+    let cap = bitcast<f32>(params.logit_softcap_bits);
     // seq_q == 1 on this route, so the single query row is qi = 0, sitting at
     // absolute position seq_k - 1 — the same `q_abs` the serial kernel derives.
     let qi = 0u;
@@ -285,9 +297,10 @@ fn attention_decode(
     let hd_v_pad = (hd_v + DECODE_DIM_CHUNK - 1u) / DECODE_DIM_CHUNK * DECODE_DIM_CHUNK;
     for (var d: u32 = 0u; d < hd_v_pad; d = d + 1u) { o[d] = 0.0; }
 
-    // Mirrors the `attention` entry point's key loop — same mask kinds, same
-    // sentinels, same online-softmax update — with the walk split across lanes.
-    // Keep the two in sync. The key loop itself stays inlined rather than
+    // Mirrors the `attention` entry point's key loop — same cap, same mask
+    // kinds, same sentinels, same online-softmax update — with the walk split
+    // across lanes. Keep the two in sync. The key loop itself stays inlined
+    // rather than
     // factored into a shared helper on purpose: that helper measured ~1.6% on
     // the prefill path. The mask rule it applies is the shared `mask_score`.
     for (var s: u32 = lid; s < params.seq_k; s = s + DECODE_LANES) {
@@ -303,7 +316,7 @@ fn attention_decode(
         if (params.mask_kind == 2u || params.mask_kind == 4u) {
             mask_v = arena[mask_partial + s * params.seq_k_stride];
         }
-        score = mask_score(score, s, q_abs, params.mask_kind, params.window, mask_v);
+        score = mask_score(score, cap, s, q_abs, params.mask_kind, params.window, mask_v);
         let m_new = max(m, score);
         let e_old = exp(m - m_new);
         let e_cur = exp(score - m_new);
@@ -357,8 +370,9 @@ fn attention_decode(
 }
 
 // The many-row route's masked scale (`kernels::attention_mask_kernel`): the
-// scale and the five mask kinds the `attention` entry point above applies, in
-// place over a [rows, cols] score matrix a dense multiply just wrote. One
+// scale, the logit cap and the five mask kinds the `attention` entry point
+// above applies, in place over a [rows, cols] score matrix a dense multiply
+// just wrote. One
 // 64-lane workgroup per row — the same decomposition `softmax.wgsl` uses, and
 // the same grid convention (`row` is `wid.x + wid.y * ngs.x`, so the dispatch
 // is `rows` workgroups of 64) — with `cols` unbounded: the row is strided by
@@ -370,13 +384,14 @@ fn attention_decode(
 // qi = r % seq_q, h = (r / seq_q) % heads, b = r / (seq_q · heads) — the same
 // (b, h, qi) triple the fused kernel starts from, with `q_abs` derived from it
 // the same way — and the mask is read through the same per-axis strides. The
-// scale is applied before the mask, in the same order, and the rule itself is
-// the shared `mask_score` both entry points call, so a masked position is
-// treated identically on either.
+// scale, the cap and the mask are applied in that order — the fused kernel's own
+// order — and the rule itself is the shared `mask_score` both entry points call,
+// so a masked position is treated identically on either.
 //
 // The normalisation that follows is the ordinary dense softmax
 // (`softmax.wgsl`), run in place over the same matrix: this pass writes the
-// scaled, masked score back so that matrix can stay where the multiply left it.
+// scaled, capped, masked score back so that matrix can stay where the multiply
+// left it.
 //
 // This pass writes every element exactly once and reads only that element, so
 // it is elementwise and in-place safe under any dispatch that covers the rows.
@@ -394,7 +409,10 @@ struct AttentionMaskParams {
     mask_head_stride: u32,
     seq_q_stride: u32,
     seq_k_stride: u32,
-    _p0: u32, _p1: u32, _p2: u32,
+    // `attn_logit_softcap`, bitcast: `c · tanh(s / c)` over the scaled score,
+    // before the mask. 0 or below is disabled.
+    logit_softcap_bits: u32,
+    _p1: u32, _p2: u32,
 };
 
 // The two module-scope bindings of the mask pass. A WGSL module declares one
@@ -419,6 +437,7 @@ fn attention_mask(
     let h  = q1 % mask_params.heads;
     let b  = q1 / mask_params.heads;
     let scale = bitcast<f32>(mask_params.scale_bits);
+    let cap = bitcast<f32>(mask_params.logit_softcap_bits);
     // Same absolute query position as the fused kernel: cols is the key
     // sequence, so the offset is seq_k - seq_q.
     let q_abs = qi + select(0u, mask_params.cols - mask_params.seq_q, mask_params.cols >= mask_params.seq_q);
@@ -428,8 +447,8 @@ fn attention_mask(
         + qi * mask_params.seq_q_stride;
     let base = mask_params.scores_off + row * mask_params.cols;
 
-    // ── Scale then mask, in place: the same score the fused kernel turns into
-    // an online-softmax update, before the softmax reads it. ──
+    // ── Scale, cap then mask, in place: the same score the fused kernel turns
+    // into an online-softmax update, before the softmax reads it. ──
     var i: u32 = tid;
     loop {
         if (i >= mask_params.cols) { break; }
@@ -441,7 +460,7 @@ fn attention_mask(
         }
         let score = mask_arena[base + i] * scale;
         mask_arena[base + i] =
-            mask_score(score, i, q_abs, mask_params.mask_kind, mask_params.window, mask_v);
+            mask_score(score, cap, i, q_abs, mask_params.mask_kind, mask_params.window, mask_v);
         i = i + 64u;
     }
 }

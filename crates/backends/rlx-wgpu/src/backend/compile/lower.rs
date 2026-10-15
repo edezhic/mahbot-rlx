@@ -4319,14 +4319,20 @@ pub(crate) fn compile_static_inner(
                 }
             }
 
-            Op::Attention { score_scale, .. } => {
+            Op::Attention {
+                score_scale,
+                attn_logit_softcap,
+                ..
+            } => {
                 let q_id = node.inputs[0];
                 let k_id = node.inputs[1];
                 let v_id = node.inputs[2];
                 // One derivation of this step's geometry, shared with the
                 // scratch reserve (`backend::compute_scratch_bytes`). A shape it
-                // cannot size is one the fused path below cannot index either,
-                // and the refusal names the dim that was wrong.
+                // cannot size is one the fused path below cannot index either —
+                // except the over-ceiling head width, which that path sizes and
+                // its kernel would then return from unwritten — and the refusal
+                // names the operator and the dim that was wrong.
                 let plan = match attention_route::plan_attention(&graph, node) {
                     Ok(plan) => plan,
                     Err(refusal) => panic!("{refusal}"),
@@ -4365,6 +4371,11 @@ pub(crate) fn compile_static_inner(
                     ..
                 } = plan;
                 let scale = score_scale.unwrap_or(1.0_f32 / (hd as f32).sqrt());
+                // `attn_logit_softcap`, bitcast for the uniform: `c·tanh(s/c)`
+                // over the scaled score, before the mask and the softmax. `None`
+                // and any non-positive value are disabled — in the shader, for
+                // both arrangements below (`kernels/attention.wgsl`).
+                let cap_bits = attn_logit_softcap.unwrap_or(0.0_f32).to_bits();
 
                 // ── The bind window both forms below read through ────────────
                 //
@@ -4703,8 +4714,8 @@ pub(crate) fn compile_static_inner(
                         scores_off,
                     );
                     // 4. The operation's own normalisation, in place over those
-                    //    scores: the scale and the mask as one step, then the
-                    //    ordinary dense softmax over the last axis.
+                    //    scores: the scale, the cap and the mask as one step, then
+                    //    the ordinary dense softmax over the last axis.
                     let ap = AttentionMaskParams {
                         rows: batch * heads * seq_q,
                         cols: seq_k,
@@ -4719,7 +4730,7 @@ pub(crate) fn compile_static_inner(
                         mask_head_stride: m_h,
                         seq_q_stride: m_q,
                         seq_k_stride: m_k,
-                        _p0: 0,
+                        logit_softcap_bits: cap_bits,
                         _p1: 0,
                         _p2: 0,
                     };
@@ -4910,7 +4921,7 @@ pub(crate) fn compile_static_inner(
                     mask_head_stride: m_h,
                     kv_heads: nkv,
                     v_head_dim: hd_v,
-                    _pad_mask_2: 0,
+                    logit_softcap_bits: cap_bits,
                     q_batch_stride: q_b,
                     q_head_stride: q_h,
                     q_seq_stride: q_s,

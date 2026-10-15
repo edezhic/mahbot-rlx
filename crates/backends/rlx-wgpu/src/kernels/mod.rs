@@ -338,7 +338,7 @@ pub struct SoftmaxParams {
 }
 
 /// Layout for `attention_mask` — the many-row attention route's masked scale.
-/// 64 bytes: the 13 fields the pass reads, padded to 16 `u32`.
+/// 64 bytes: the 14 fields the pass reads, padded to 16 `u32`.
 ///
 /// Its own struct rather than the fused entry's `Params`: that one is 36 `u32`
 /// of Q/K/V/output offsets and per-tensor strides this pass reads none of, and
@@ -350,7 +350,7 @@ pub struct SoftmaxParams {
 /// major, which is the order the dense multiply wrote them in, and `seq_q` /
 /// `heads` decompose a row index back into the mask address the fused kernel
 /// derives for the same `(b, h, qi)` triple. `scale_bits` is `1/sqrt(D)` bitcast,
-/// applied before the mask exactly as the fused kernel applies it.
+/// applied before the cap and the mask exactly as the fused kernel applies it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct AttentionMaskParams {
@@ -372,7 +372,9 @@ pub struct AttentionMaskParams {
     pub mask_head_stride: u32,
     pub seq_q_stride: u32,
     pub seq_k_stride: u32,
-    pub _p0: u32,
+    /// `attn_logit_softcap` bitcast: `c·tanh(s/c)` over the scaled score,
+    /// applied before the mask. 0 or below disables.
+    pub logit_softcap_bits: u32,
     pub _p1: u32,
     pub _p2: u32,
 }
@@ -1088,7 +1090,9 @@ pub struct AttentionParams {
     /// wide while the Q·K score contracts over `head_dim`. Equals `head_dim`
     /// for ordinary attention; 0 makes the shader fall back to `head_dim`.
     pub v_head_dim: u32,
-    pub _pad_mask_2: u32,
+    /// `attn_logit_softcap` bitcast: `c·tanh(s/c)` over the scaled score,
+    /// applied before the mask. 0 or below disables.
+    pub logit_softcap_bits: u32,
 
     // Q stride triple (in f32 elements). For [B, H, S, D]:
     //   q_batch_stride = H·S·D, q_head_stride = S·D, q_seq_stride = D
@@ -3808,10 +3812,10 @@ pub fn attention_decode_kernel(device: &wgpu::Device) -> &'static Kernel {
     })
 }
 /// The many-row attention route's masked scale: the score multiply's own
-/// output, scaled and masked in place, in front of the ordinary dense softmax
-/// (`softmax_kernel`). Same WGSL module and same two-entry bind-group layout as
-/// [`attention_kernel`], so the bind group the lowerer built from that layout
-/// drives this pipeline too.
+/// output, scaled, capped and masked in place, in front of the ordinary dense
+/// softmax (`softmax_kernel`). Same WGSL module and same two-entry bind-group
+/// layout as [`attention_kernel`], so the bind group the lowerer built from that
+/// layout drives this pipeline too.
 pub fn attention_mask_kernel(device: &wgpu::Device) -> &'static Kernel {
     ATTENTION_MASK.get_or_init(|| {
         build_kernel(
@@ -3847,7 +3851,7 @@ pub fn attention_decode_eligible(seq_q: u32, seq_k: u32, head_dim: u32, v_head_d
         && seq_k > ATTENTION_DECODE_MIN_KEYS
         && head_dim <= ATTENTION_DECODE_MAX_HEAD_DIM
         // 0 means "unset": the kernel then reads `head_dim` for V, already
-        // capped by the conjunct above.
+        // bounded by the conjunct above.
         && v_head_dim <= ATTENTION_DECODE_MAX_HEAD_DIM
 }
 

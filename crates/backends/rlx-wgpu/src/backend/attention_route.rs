@@ -68,7 +68,8 @@ pub const ATTENTION_DECOMPOSE_MIN_Q: u32 = 32;
 /// (`kernels/attention.wgsl`). Neither multiply on this route needs the cap —
 /// the tiled f32 kernels take any k and n — but a shape the fused kernel refuses
 /// must not become covered by the route that replaces it, so the two ceilings
-/// move together.
+/// move together. It is also the ceiling [`plan_attention`] refuses above, so
+/// this is the one width both the refusal and the route decision read.
 pub(crate) const ATTENTION_DECOMPOSE_MAX_HEAD_DIM: u32 = 512;
 
 /// The route must not need more scratch than this. [`crate::backend::compute_scratch_bytes`]
@@ -346,11 +347,13 @@ impl AttentionPlan {
 }
 
 /// Why a node has no plan, carrying the message the lowering's own panic for
-/// that shape prints. Every variant but [`NotAttention`](Self::NotAttention)
-/// describes a step the fused path cannot derive a shape for either — the arms
-/// that hit them index a dim that is not there — so a refusal is never a shape
-/// the route could have taken, and never one that lowers to an unwritten
-/// output.
+/// that shape prints. Every variant but [`NotAttention`](Self::NotAttention) and
+/// [`HeadWidth`](Self::HeadWidth) describes a step the fused path cannot derive a
+/// shape for either — the arms that hit them index a dim that is not there — so a
+/// refusal is never a shape the route could have taken. [`HeadWidth`](Self::HeadWidth)
+/// is the exception: that shape has geometry the fused path could size, and the
+/// kernel would then early-return without writing the output slot, which is why
+/// the width is refused here rather than lowered to a blank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttentionRefusal {
     /// The node is not an `Op::Attention` — what the scratch reserve, which
@@ -374,6 +377,10 @@ pub(crate) enum AttentionRefusal {
     },
     /// A mask kind that reads `node.inputs[3]` on a node that has fewer inputs.
     MissingMask { kind: u32, inputs: usize },
+    /// A head width — after the kernel's own "0 means V is as wide as Q"
+    /// resolution — above [`ATTENTION_DECOMPOSE_MAX_HEAD_DIM`], which the fused
+    /// kernel's `MAX_HEAD_DIM` and this route's decision both cap at.
+    HeadWidth { head_dim: u32, v_head_dim: u32 },
 }
 
 impl std::fmt::Display for AttentionRefusal {
@@ -414,6 +421,14 @@ impl std::fmt::Display for AttentionRefusal {
                 f,
                 "rlx-wgpu Attention: mask kind {kind} needs a mask input (node has {inputs} inputs)"
             ),
+            Self::HeadWidth {
+                head_dim,
+                v_head_dim,
+            } => write!(
+                f,
+                "rlx-wgpu Attention: head_dim {head_dim} / v_head_dim {v_head_dim} is above the \
+                 {ATTENTION_DECOMPOSE_MAX_HEAD_DIM} this route serves"
+            ),
         }
     }
 }
@@ -426,7 +441,7 @@ impl std::fmt::Display for AttentionRefusal {
 /// derive geometry for gets the refusal that names the dim. The refusals are
 /// what the lowering's own arm panics with — there is no plan with no geometry
 /// for it to read instead, so a shape this cannot plan is loud rather than a
-/// step the kernel early-returns from.
+/// step the kernel early-returns from, the over-ceiling head width included.
 pub(crate) fn plan_attention(
     graph: &rlx_ir::Graph,
     node: &rlx_ir::Node,
@@ -480,6 +495,16 @@ pub(crate) fn plan_attention(
         Some(v) if v > 0 => v as u32,
         _ => hd,
     };
+    // The one width above which neither the fused kernel (whose per-thread Q/O
+    // arrays are `MAX_HEAD_DIM` wide) nor the dense route serves the step: the
+    // kernel would return without writing the output slot, so the step is
+    // refused here instead — naming the shape — rather than lowered to a blank.
+    if hd > ATTENTION_DECOMPOSE_MAX_HEAD_DIM || hd_v > ATTENTION_DECOMPOSE_MAX_HEAD_DIM {
+        return Err(AttentionRefusal::HeadWidth {
+            head_dim: hd,
+            v_head_dim: hd_v,
+        });
+    }
     let dim = |d: rlx_ir::shape::Dim| d.unwrap_static() as u32;
     // Rank-4 resolves through the shared geometry; rank-3 has the two layouts
     // `attention_geom` cannot tell apart, told apart here by the last dim.
@@ -727,6 +752,78 @@ mod tests {
         let mut wide_v = geom(64, 256);
         wide_v.v_head_dim = ATTENTION_DECOMPOSE_MAX_HEAD_DIM + 1;
         assert!(!decompose_attention(&wide_v));
+    }
+
+    /// A shape past that ceiling is one the fused path *can* size — and whose
+    /// kernel then returns without writing the output slot — so it has no plan at
+    /// all rather than a plan the arm would lower to a blank. The refusal names
+    /// the operator and the width, and the plan-side ceiling is the shader's own
+    /// `MAX_HEAD_DIM`, so the two cannot be raised apart (the silent blank
+    /// returns if only this one moves).
+    #[test]
+    fn a_head_width_past_the_ceiling_is_refused_rather_than_left_blank() {
+        const SHADER: &str = include_str!("../kernels/attention.wgsl");
+        assert!(
+            SHADER.contains(&format!(
+                "const MAX_HEAD_DIM: u32 = {ATTENTION_DECOMPOSE_MAX_HEAD_DIM}u;"
+            )),
+            "the plan's ceiling and the fused kernel's `MAX_HEAD_DIM` are one number: a shape \
+             the plan serves must not be one the kernel early-returns from"
+        );
+
+        // The widths are the whole subject; the other dims are a served shape's.
+        // `v_head_dim` of 0 is the kernel's own "as wide as Q" spelling, so the
+        // shapes resolve it the same way the plan does.
+        let plan = |hd: usize, v_hd: Option<usize>| {
+            let vd = match v_hd {
+                Some(v) if v > 0 => v,
+                _ => hd,
+            };
+            plan_of(
+                &[1, 4, hd],
+                &[1, 8, hd],
+                &[1, 8, vd],
+                &[1, 4, vd],
+                1,
+                hd,
+                v_hd,
+            )
+        };
+
+        let at = ATTENTION_DECOMPOSE_MAX_HEAD_DIM as usize;
+        assert!(
+            plan(at, None).is_ok(),
+            "the width equal to the ceiling is served"
+        );
+        assert_eq!(
+            plan(at + 1, None).unwrap_err(),
+            AttentionRefusal::HeadWidth {
+                head_dim: at as u32 + 1,
+                v_head_dim: at as u32 + 1,
+            }
+        );
+        // V's own width, which the kernel caps the same way, and the 0 spelling.
+        assert_eq!(
+            plan(at, Some(at + 1)).unwrap_err(),
+            AttentionRefusal::HeadWidth {
+                head_dim: at as u32,
+                v_head_dim: at as u32 + 1,
+            }
+        );
+        assert!(
+            plan(64, Some(0)).is_ok(),
+            "a zero width means V is as wide as Q"
+        );
+
+        // The refusal names the operator and the shape, so a caller can act on it
+        // rather than read it as a crash.
+        let msg = AttentionRefusal::HeadWidth {
+            head_dim: at as u32 + 1,
+            v_head_dim: at as u32 + 1,
+        }
+        .to_string();
+        assert!(msg.contains("Attention"), "the operator: {msg}");
+        assert!(msg.contains(&(at + 1).to_string()), "the width: {msg}");
     }
 
     /// Both dispatch caps the multiplies walk are shape terms, at the tree's own

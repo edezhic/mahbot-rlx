@@ -163,11 +163,11 @@ pub(crate) enum Step {
     Softmax {
         params: SoftmaxParams,
     },
-    /// The many-row attention route's masked scale: the scale and the five mask
-    /// kinds `attention.wgsl`'s fused entry point applies, in place over a
-    /// `[rows, cols]` score matrix the dense multiply just wrote (see
-    /// `attention_route`). Rows are `(batch, head, query row)` major, so a row's
-    /// mask address is derived from its index exactly as the fused kernel
+    /// The many-row attention route's masked scale: the scale, the logit cap
+    /// and the five mask kinds `attention.wgsl`'s fused entry point applies, in
+    /// place over a `[rows, cols]` score matrix the dense multiply just wrote
+    /// (see `attention_route`). Rows are `(batch, head, query row)` major, so a
+    /// row's mask address is derived from its index exactly as the fused kernel
     /// derives it. The softmax that follows is the ordinary dense one
     /// (`Step::Softmax`), over the same matrix.
     AttentionMask {
