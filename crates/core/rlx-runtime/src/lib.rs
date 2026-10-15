@@ -79,6 +79,9 @@ mod cpu_low_precision;
 mod deferred;
 pub mod device_bench;
 pub mod device_ext;
+/// Per-device memory ceiling — Apple's own `recommendedMaxWorkingSetSize`,
+/// as opposed to the process / machine figures in `memory_estimate`.
+pub mod device_memory;
 pub mod device_parse;
 pub mod device_policy;
 /// Ship-graph distributed execution (build the worker once, run any model).
@@ -202,6 +205,7 @@ pub use device_ext::{
     legalize_graph_for_device_with_report, preferred_browser_device, supports, supports_graph,
     supports_graph_with_options, supports_run_slots, trim_accelerator_arena_pool,
 };
+pub use device_memory::device_working_set_bytes;
 pub use device_parse::{ParseDeviceError, device_label, parse_device, parse_device_list};
 pub use device_policy::{
     DeviceCandidate, DeviceFallbackError, DevicePickStrategy, DevicePolicy, advisory_capabilities,
