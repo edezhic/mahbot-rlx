@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! What each of `Op::ConvTranspose2d`'s two wgpu routes costs the device: a
+//! What each of `Op::ConvTranspose2d`'s wgpu routes costs the device: a
 //! host-classified step carries its own submission and its own completion poll,
 //! the device step does not.
 //!
@@ -21,14 +21,17 @@
 //! branch the host step pays only one submission and one poll *for the whole
 //! step*, so a geometry that fell to it would not show the pair this file
 //! measures. The compact branch stages the two operands it touches, an input and
-//! a weight, and each staged read is its own submission and drain.
+//! a weight, and each staged read is its own submission and drain. The shape is
+//! `k = 2·s` at unit height, so its device step is the tiled GEMM
+//! (`conv_transpose2d_tiled`), the form the decoder's own forms take.
 //!
-//! Measured on the decoder geometry: the device route spends one submission and
-//! one wait (its dispatch and the output readback), the host route three and four
-//! — the compact branch's two staged reads, plus the poll the run loop owes the
-//! device once a host step is over, plus the same readback. This file pins that
-//! pair exactly; see the assertion for why the wait differential is three rather
-//! than the two a "one submission, one poll" reading of the host step suggests.
+//! Measured on that geometry: the device route spends one submission and one wait
+//! (its dispatch and the output readback), the host route three and four — the
+//! compact branch's two staged reads, plus the poll the run loop owes the device
+//! once a host step is over, plus the same readback. This file pins the device
+//! pair outright and the host pair as its excess; see the assertions for why the
+//! wait excess is three rather than the two a "one submission, one poll" reading
+//! of the host step suggests.
 //!
 //! Its own test binary: the route is read per compile and the lever is
 //! process-global.
@@ -100,7 +103,10 @@ fn the_host_step_spends_its_own_submission_and_poll_and_the_device_step_does_not
          host route: {host_submits} submission(s), {host_waits} wait(s)"
     );
     assert_eq!(
-        device_kinds.get("conv_transpose2d").copied().unwrap_or(0),
+        device_kinds
+            .get("conv_transpose2d_tiled")
+            .copied()
+            .unwrap_or(0),
         1,
         "with the structure-host preference off the route must be the device step; schedule = \
          {device_kinds:?}"
@@ -113,14 +119,23 @@ fn the_host_step_spends_its_own_submission_and_poll_and_the_device_step_does_not
         1,
         "the levered executable must name the host step; schedule = {host_kinds:?}"
     );
+    // The device step's pair is pinned outright rather than only as a difference:
+    // the regression this pin exists for is an *extra* submission on that step —
+    // a second dispatch, a staging copy, a per-step buffer — and a difference
+    // against the host arm would not see one.
+    assert_eq!(
+        (device_submits, device_waits),
+        (1, 1),
+        "the device step is one submission (its dispatch) and one wait (the output \
+         readback); measured {device_submits}/{device_waits}, schedule = {device_kinds:?}"
+    );
     // The host step stages two operands — the input and the weight — so its own
     // cost is two D2H submission/drain pairs; the device step is one dispatch. On
     // top of that pair the run loop owes the device one poll after a host step
     // (`backend/run.rs`, the boundary taken once the host step is over), which a
-    // schedule of device steps has no reason to pay, so the differential is two
-    // extra submissions and three extra waits. This is the measured pair, not the
-    // two-and-two this pin was first written against: the third wait is that
-    // boundary poll, and it is stated rather than absorbed into a range.
+    // schedule of device steps has no reason to pay, so the excess is two extra
+    // submissions and three extra waits. The third wait is that boundary poll, and
+    // it is stated rather than absorbed into a range.
     assert_eq!(
         (host_submits, host_waits),
         (device_submits + 2, device_waits + 3),

@@ -883,7 +883,23 @@ pub(crate) enum Step {
     },
     /// Native WGSL `Op::ConvTranspose2d`: the 3-D gather with its depth axis
     /// pinned to one (reuses [`Conv3dParams`] layout, `d = d_out = kd = 1`).
+    ///
+    /// The whole operator, and so the destination for every 2-D form
+    /// [`Step::ConvTranspose2dTiled`] does not claim.
     ConvTranspose2d {
+        params: Conv3dParams,
+    },
+    /// Native WGSL `Op::ConvTranspose2d` in its phase-decomposed tiled GEMM
+    /// (reuses [`Conv3dParams`] layout; see `conv_transpose2d_tiled.wgsl`).
+    ///
+    /// A fast path *over* [`Step::ConvTranspose2d`], not a replacement: only
+    /// the unit-height, unit-batch, ungrouped, undilated `k ≤ 2·s` family
+    /// reaching here is proven for it (`lower.rs`,
+    /// `conv_transpose2d_tiled_fits`), and everything else keeps the gather.
+    /// The distinct name is what makes the serving form attributable: a
+    /// measurement of this operation has to be able to say which of the two it
+    /// timed.
+    ConvTranspose2dTiled {
         params: Conv3dParams,
     },
     /// Native WGSL `Op::ConvTranspose3d` (reuses [`Conv3dParams`] layout).
@@ -1334,6 +1350,7 @@ impl Step {
             | Step::Conv2dTiled { .. }
             | Step::Conv3d { .. }
             | Step::ConvTranspose2d { .. }
+            | Step::ConvTranspose2dTiled { .. }
             | Step::ConvTranspose3d { .. }
             | Step::Pool1d { .. }
             | Step::Pool2d { .. }
@@ -1596,6 +1613,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::LstmGpu { .. } => "lstm_gpu",
         Step::ConvTranspose2dHost { .. } => "conv_transpose2d_host",
         Step::ConvTranspose2d { .. } => "conv_transpose2d",
+        Step::ConvTranspose2dTiled { .. } => "conv_transpose2d_tiled",
         Step::ConvTranspose3d { .. } => "conv_transpose3d",
         Step::ConvTranspose3dHost { .. } => "conv_transpose3d_host",
         Step::GroupNorm { .. } => "group_norm",

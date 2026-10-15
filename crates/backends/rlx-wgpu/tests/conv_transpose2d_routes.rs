@@ -2,17 +2,28 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `Op::ConvTranspose2d`'s two wgpu routes: the device gather step, printed
-//! `conv_transpose2d`, and the host step, printed `conv_transpose2d_host`.
+//! `Op::ConvTranspose2d`'s three wgpu steps: the device route's tiled GEMM,
+//! printed `conv_transpose2d_tiled`, which serves the decoder family (unit height
+//! with no height padding, unit batch, one group, no dilation, `s ≤ k ≤ 2·s` —
+//! `conv_transpose2d_tiled_fits` in `lower.rs` is the authority on it,
+//! `conv_transpose2d_gather_family.rs` witnesses its forms); the device gather,
+//! printed `conv_transpose2d`, which serves every shape outside that family; and
+//! the host step, printed `conv_transpose2d_host`.
 //!
 //! This file used to pin the host step as the op's *only* route: with the other
 //! routers zeroed, `step_kind_counts()` had to be `conv_transpose2d_host == 1`.
-//! The device step inverts that pin — with the structure-host preference off the
-//! router picks the device gather (on an integrated adapter that preference is
-//! off on its own, so this is the default there; on a discrete adapter the
-//! preference hosts the op instead), and the host route did not disappear, it is
-//! one lever away (`RLX_WGPU_CONV_HOST=1`, or the structure-host preference
-//! itself: `RLX_WGPU_FORCE_HOST`, a discrete adapter, a sharded arena).
+//! The device route inverts that pin — with the structure-host preference off the
+//! router picks one of the two device steps (on an integrated adapter that
+//! preference is off on its own, so this is the default there; on a discrete
+//! adapter the preference hosts the op instead) — and the boundary between them is
+//! pinned here from both sides: this file's decoder geometry is inside the tiled
+//! family and takes `conv_transpose2d_tiled`, while two shapes outside it keep the
+//! incumbent gather — the same geometry at batch 4 (`n == 1`) and a unit-height
+//! form that carries height padding (`ph`, which the gather answers by dropping its
+//! single height tap). A move of the route is therefore a move and not a shape
+//! losing one. The host route did not disappear either, it is one lever away
+//! (`RLX_WGPU_CONV_HOST=1`, or the structure-host preference itself:
+//! `RLX_WGPU_FORCE_HOST`, a discrete adapter, a sharded arena).
 //!
 //! The numeric arm compares against `rlx_cpu::kernels::conv_transpose2d_nchw`,
 //! the crate's naive scalar scatter reference kernel — an oracle the runtime
@@ -41,7 +52,9 @@ const L_IN: usize = 96;
 const K: usize = 16;
 const S: usize = 8;
 /// The batch the behavioural active-extent arm compiles at: its reduced `(2, 4)`
-/// extent scales `n` to exactly half.
+/// extent scales `n` to exactly half. It is also the family-boundary pin's shape —
+/// `DECODER` is unit batch and this is not, so the two census readings in this file
+/// sit on either side of `conv_transpose2d_tiled_fits`'s `n == 1`.
 const N: usize = 4;
 
 fn graph(batch: usize) -> Graph {
@@ -85,17 +98,26 @@ fn the_upsampler_takes_the_device_step_and_falls_back_to_the_host_step_behind_it
         return;
     }
 
-    // State 1: with the structure-host preference off the route is the device
-    // step. This assertion inverts the pin this file used to carry
-    // (`conv_transpose2d_host == 1` with exactly these gates zeroed).
+    // State 1: with the structure-host preference off the route is a device step,
+    // and on this geometry it is the tiled one — the decoder form is inside the
+    // family `conv_transpose2d_tiled_fits` describes. This assertion is where a
+    // route pin that used to name the gather (`conv_transpose2d == 1` with exactly
+    // these gates zeroed, before that the host step) now names the tiled step.
     let mut device = WgpuExecutable::compile(graph(1));
     let device_kinds = device.step_kind_counts();
     eprintln!("device route: {device_kinds:?}");
     assert_eq!(
-        device_kinds.get("conv_transpose2d").copied().unwrap_or(0),
+        device_kinds
+            .get("conv_transpose2d_tiled")
+            .copied()
+            .unwrap_or(0),
         1,
-        "with the structure-host preference off the route must be the device step; schedule = \
-         {device_kinds:?}"
+        "this is a decoder form, so with the structure-host preference off the route must be \
+         the tiled device step; schedule = {device_kinds:?}"
+    );
+    assert!(
+        !device_kinds.contains_key("conv_transpose2d"),
+        "and the incumbent gather must not also be in the schedule; schedule = {device_kinds:?}"
     );
     assert!(
         !device_kinds.contains_key("conv_transpose2d_host"),
@@ -177,6 +199,51 @@ fn the_upsampler_takes_the_device_step_and_falls_back_to_the_host_step_behind_it
     // batches that remain are the same work in the same arrangement, so their
     // outputs must agree bit for bit.
     let mut batched = WgpuExecutable::compile(graph(N));
+
+    // The family boundary from the other side, read before the arm below runs:
+    // batch 4 is outside the tiled form's family (`conv_transpose2d_tiled_fits`
+    // wants `n == 1`), so the shape the change excludes must keep the incumbent
+    // gather — a shape outside a fast path's family is a shape whose route moves
+    // back, not one that loses its route.
+    let batched_kinds = batched.step_kind_counts();
+    eprintln!("batch {N} route: {batched_kinds:?}");
+    assert_eq!(
+        batched_kinds.get("conv_transpose2d").copied().unwrap_or(0),
+        1,
+        "batch {N} is outside the tiled family, so it must keep the incumbent device \
+         gather; schedule = {batched_kinds:?}"
+    );
+    assert!(
+        !batched_kinds.contains_key("conv_transpose2d_tiled")
+            && !batched_kinds.contains_key("conv_transpose2d_host"),
+        "and neither the tiled step nor the host step may serve it; schedule = {batched_kinds:?}"
+    );
+
+    // The family's other boundary, on the height axis: unit height and a single
+    // height tap, but with height padding — `h_out = 1` only allows `ph = 1` at
+    // `output_padding[0] = 2`, and that is exactly the form where the gather drops
+    // its one height tap (it lands outside the input) while the tiled kernel, which
+    // knows nothing of the height axis, would still sum the width walk. No terms
+    // land on such a shape, so this is a census pin and nothing else.
+    let mut padded = Graph::new("conv_transpose2d_height_padding");
+    let px = padded.input("x", Shape::new(&[1, C_IN, 1, L_IN], DType::F32));
+    let pw = padded.param("w", Shape::new(&[C_IN, C_OUT, 1, 1], DType::F32));
+    let py = padded.conv_transpose2d(px, pw, [1, 1], [1, 1], [1, 0], [1, 1], [2, 0], 1);
+    padded.set_outputs(vec![py]);
+    let padded_kinds = WgpuExecutable::compile(padded).step_kind_counts();
+    eprintln!("height-padded (ph = 1) route: {padded_kinds:?}");
+    assert_eq!(
+        padded_kinds.get("conv_transpose2d").copied().unwrap_or(0),
+        1,
+        "a height-padded form is outside the tiled family, so it must keep the incumbent device \
+         gather; schedule = {padded_kinds:?}"
+    );
+    assert!(
+        !padded_kinds.contains_key("conv_transpose2d_tiled")
+            && !padded_kinds.contains_key("conv_transpose2d_host"),
+        "and neither the tiled step nor the host step may serve it; schedule = {padded_kinds:?}"
+    );
+
     batched.set_param("w", &w);
     let x4: Vec<f32> = (0..N * C_IN * L_IN)
         .map(|i| ((i % 29) as f32 - 14.0) * 0.05)

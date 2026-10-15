@@ -84,8 +84,11 @@ fn conv_transpose3d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_
 
 // The 2-D NCHW form is this same gather with the depth axis pinned to one
 // (`d = d_out = kd = sd = 1`, `pd = 0`, `dd = 1`), which is how
-// `Op::ConvTranspose2d` is lowered. Its own entry point (and so its own
-// pipeline) keeps the 3-D name out of every route report of that operation.
+// `Op::ConvTranspose2d` is lowered outside the family
+// `conv_transpose2d_tiled.wgsl` serves (`lower.rs`'s
+// `conv_transpose2d_tiled_fits` is that boundary). Its own entry point (and so
+// its own pipeline) keeps the 3-D name out of every route report of that
+// operation.
 @compute @workgroup_size(64)
 fn conv_transpose2d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
     let total = params.n * params.c_out * params.d_out * params.h_out * params.w_out;

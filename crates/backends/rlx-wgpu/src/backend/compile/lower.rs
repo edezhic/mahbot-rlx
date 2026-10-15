@@ -784,6 +784,44 @@ fn assert_conv_transpose_operands_addressable(
     );
 }
 
+/// Whether `conv_transpose2d_tiled.wgsl` is proven for `p` — the 1-D-lifted
+/// shapes it was measured on, and nothing wider.
+///
+/// The 2-D arm pins the depth axis before calling (`d = d_out = kd = sd = 1`,
+/// `pd = 0`, `dd = 1`), so the family is stated over the rest. The kernel
+/// flattens input and output to one row and reads one `kw`-long weight row per
+/// (ci, co), so batch, height and the height's single tap must all be one:
+/// `h = h_out = kh = 1`. `ph = 0` is the load-bearing one of that group — a form
+/// with height padding is one where the gather finds its single height tap
+/// outside the input and drops it, while this kernel, which does not know about
+/// the height axis at all, sums the width walk anyway. `dw = 1` because the
+/// phase's `kx = r + s·m` carries no dilation. `s ≤ k ≤ 2·s` is the family the
+/// tile's `TAPS` taps and each phase's tap bound are written against — one or two
+/// taps a phase, never none. And the grid must be one the device can hold.
+///
+/// Everything else keeps [`Step::ConvTranspose2d`], which serves the whole
+/// operator — no shape loses its route, and none reaches this form without being
+/// proven for it.
+fn conv_transpose2d_tiled_fits(p: &Conv3dParams) -> bool {
+    if p.sw < 1
+        || p.n != 1
+        || p.h != 1
+        || p.h_out != 1
+        || p.kh != 1
+        || p.ph != 0
+        || p.dw != 1
+        || p.groups != 1
+    {
+        return false;
+    }
+    // Checked before the doubling below: the grid bounds `sw`.
+    let grid = crate::kernels::conv_transpose2d_tiled_grid(p.w_out, p.sw, p.c_out);
+    if grid.iter().any(|g| *g > MAX_WORKGROUPS_PER_DIM) {
+        return false;
+    }
+    p.sw <= p.kw && p.kw <= 2 * p.sw
+}
+
 /// Resolve `ids` into the bind window a device step will read them from, and
 /// return each one's f32-lane offset inside it.
 ///
@@ -7904,9 +7942,11 @@ pub(crate) fn compile_static_inner(
                     // The uniform/bind_group lanes are indexed by GPU-step count
                     // (`gpu_ui`), so host steps must NOT push to them.
                 } else {
-                    // Device route: the sibling 3-D gather with the depth axis pinned to one,
-                    // so the 2-D geometry is the 3-D one at d = d_out = kd = sd = 1, pd = 0,
-                    // dd = 1.
+                    // Device route: two forms. The tiled GEMM takes the shapes
+                    // `conv_transpose2d_tiled_fits` admits (unit height and batch, one group,
+                    // no dilation, `k ≤ 2·s`); the rest take the sibling 3-D gather with the
+                    // depth axis pinned to one, so the 2-D geometry is the 3-D one at
+                    // d = d_out = kd = sd = 1, pd = 0, dd = 1.
                     //
                     // The device step reads its operands as one f32 lane per element off
                     // the arena, so a parameter the arena does not store that way (packed
@@ -7928,9 +7968,9 @@ pub(crate) fn compile_static_inner(
                     assert!(
                         *groups >= 1,
                         "rlx-wgpu: REFUSED (degenerate Op::ConvTranspose2d grouping): groups=0 \
-                         would make the device gather divide by a zero group size. There is no route \
-                         to fall back to here — the host step divides by it too — so use a positive \
-                         group count."
+                         would make the device gather — the step every grouped form keeps — divide \
+                         by a zero group size. There is no route to fall back to here — the host \
+                         step divides by it too — so use a positive group count."
                     );
                     if !c_in.is_multiple_of(*groups as u32) {
                         if (c_in as usize) < *groups {
@@ -7978,7 +8018,7 @@ pub(crate) fn compile_static_inner(
                     assert!(
                         kernel_size[0] == wkh && kernel_size[1] == wkw,
                         "rlx-wgpu: REFUSED (Op::ConvTranspose2d kernel size): the op declares \
-                         {}x{} taps and the weight is {wkh}x{wkw} per channel, so the device gather \
+                         {}x{} taps and the weight is {wkh}x{wkw} per channel, so the device route \
                          would read across its operand. Declare the kernel size the weight really \
                          has.",
                         kernel_size[0],
@@ -8073,8 +8113,19 @@ pub(crate) fn compile_static_inner(
                         _p1: 0,
                         _p2: 0,
                     };
-                    schedule.push(Step::ConvTranspose2d { params: p2 });
-                    let ck = conv_transpose2d_kernel(&dev.device);
+                    // The tiled GEMM serves the family it is proven for (see
+                    // `conv_transpose2d_tiled_fits`); the gather serves the rest.
+                    let tiled = conv_transpose2d_tiled_fits(&p2);
+                    schedule.push(if tiled {
+                        Step::ConvTranspose2dTiled { params: p2 }
+                    } else {
+                        Step::ConvTranspose2d { params: p2 }
+                    });
+                    let ck = if tiled {
+                        crate::kernels::conv_transpose2d_tiled_kernel(&dev.device)
+                    } else {
+                        conv_transpose2d_kernel(&dev.device)
+                    };
                     let u = emit_uniform(std::mem::size_of::<Conv3dParams>());
                     let bg = bind_arena_window(&dev.device, ck, &arena, base, size, &u);
                     uniforms.push(u);

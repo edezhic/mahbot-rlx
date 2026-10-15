@@ -7,14 +7,17 @@
 //! Metal (wrong mask) / MLX (NHWC channel mismatch) / wgpu (then unsupported)
 //! bugs surfaced by the OCR detection decoder.
 //!
-//! wgpu's default route for this op is now a device gather, with the CPU-kernel
-//! host route kept behind `RLX_WGPU_CONV_HOST` (or the structure-host
-//! preference). The device gather is the default only where
-//! `coop_discrete_backend()` is false: on a discrete Vulkan/DX12 adapter that
-//! preference hosts this op. Against that CPU reference this file pins the
-//! device route at a fixed `1e-4` bar, and the worst deviation measured over the
-//! whole case set is of order `1e-6` (on `large-up2-k3s2`), so the bar holds
-//! with a large margin and is deliberately NOT re-based. The per-case numbers
+//! wgpu's default route for this op is now a device step: the phase-decomposed
+//! tiled GEMM (`conv_transpose2d_tiled`) for the unit-height, unit-batch,
+//! ungrouped, `k ≤ 2·s` family — the decoder's six forms among them — and the
+//! gather over the whole operator for every shape outside it. The CPU-kernel host
+//! route is kept behind `RLX_WGPU_CONV_HOST` (or the structure-host preference),
+//! and is the default only where `coop_discrete_backend()` is true: on a discrete
+//! Vulkan/DX12 adapter that preference hosts this op. Against that CPU reference
+//! this file pins the wgpu device route at a fixed `1e-4` bar, and the worst
+//! deviation measured over the whole case set, the decoder forms at the bottom
+//! included, is `2.1e-6` (on `blk.0`), so the bar holds with a ~48× margin and is
+//! deliberately NOT re-based. The per-case numbers
 //! are NOT enumerated here: they go stale silently and nothing in this file
 //! checks them, and the run prints them itself (`-- --nocapture`). The tolerance
 //! is *argued* rather than asserted in
@@ -81,6 +84,34 @@ impl Cfg {
             groups: 1,
         }
     }
+
+    /// Kernel, stride, padding and output padding per axis, no dilation and one
+    /// group — the 1-D-lifted decoder shapes `sym` cannot express.
+    const fn asym(
+        n: usize,
+        c_in: usize,
+        c_out: usize,
+        h: usize,
+        w: usize,
+        k: [usize; 2],
+        s: [usize; 2],
+        p: [usize; 2],
+        op: [usize; 2],
+    ) -> Self {
+        Self {
+            n,
+            c_in,
+            c_out,
+            h,
+            w,
+            k,
+            s,
+            p,
+            d: [1, 1],
+            op,
+            groups: 1,
+        }
+    }
 }
 
 fn build(cfg: &Cfg) -> Graph {
@@ -126,6 +157,47 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
         ("up2-k3s2-p1-odd", Cfg::sym(1, 5, 3, 7, 5, 3, 2, 1)),
         // U-Net scale.
         ("large-up2-k3s2", Cfg::sym(1, 64, 32, 32, 32, 3, 2, 1)),
+    ]
+}
+
+/// The six real decoder forms, in the order the run prints them: single batch,
+/// unit height (`h = kH = sH = 1`, `pH = 0`), one group, no dilation, and the
+/// width axis the decoder's transposed convolutions carry. The labels are the
+/// decoder's own blocks and `c_in`/`c_out`/`w` its real channel counts and
+/// input widths. The width padding and output padding are the stand's
+/// generator's, `padding = (k − s + 1)/2` and `output_padding = (k − s) % 2`:
+/// the two `up.blk` forms are the upsample `k = s = 2`, where both are zero, and
+/// the four `blk` forms are `k = 2·s`, so the extra output column appears exactly
+/// where `k − s` is odd — `blk.1` and `blk.3`.
+///
+/// Kept out of `cfgs()` so that the Metal and MLX arms stay on the small
+/// geometries this reading is not about.
+fn decoder_cfgs() -> Vec<(&'static str, Cfg)> {
+    vec![
+        (
+            "up.blk.0",
+            Cfg::asym(1, 1024, 1024, 1, 25, [1, 2], [1, 2], [0, 0], [0, 0]),
+        ),
+        (
+            "up.blk.1",
+            Cfg::asym(1, 1024, 1024, 1, 50, [1, 2], [1, 2], [0, 0], [0, 0]),
+        ),
+        (
+            "blk.0",
+            Cfg::asym(1, 1536, 768, 1, 100, [1, 16], [1, 8], [0, 4], [0, 0]),
+        ),
+        (
+            "blk.1",
+            Cfg::asym(1, 768, 384, 1, 800, [1, 10], [1, 5], [0, 3], [0, 1]),
+        ),
+        (
+            "blk.2",
+            Cfg::asym(1, 384, 192, 1, 4000, [1, 8], [1, 4], [0, 2], [0, 0]),
+        ),
+        (
+            "blk.3",
+            Cfg::asym(1, 192, 96, 1, 16000, [1, 6], [1, 3], [0, 2], [0, 1]),
+        ),
     ]
 }
 
@@ -217,6 +289,26 @@ fn conv_transpose2d_wgpu_matches_cpu() {
     }
 }
 
+/// The six real decoder forms on the wgpu device route: the same `1e-4` bar and the
+/// same CPU-device reference as the arm above, on the geometries the decoder actually
+/// presents rather than the small uniform ones. Its own list, so the Metal and MLX
+/// arms above keep the case set they were written for.
+#[test]
+#[cfg(feature = "gpu")]
+fn conv_transpose2d_wgpu_decoder_forms_match_cpu() {
+    let _gpu = common::serialize_gpu();
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
+        return;
+    }
+    for (name, cfg) in decoder_cfgs() {
+        assert_close(
+            &format!("wgpu {name}"),
+            &run_on(&cfg, Device::Gpu),
+            &run_on(&cfg, Device::Cpu),
+        );
+    }
+}
+
 /// Compile `cfg` on the wgpu **device** route and return the refusal it panics
 /// with, panicking itself if the route accepted the graph.
 ///
@@ -247,8 +339,8 @@ fn device_route_refusal(name: &str, cfg: &Cfg) -> String {
 
 /// The geometry a vocoder actually presents — a 1-D-lifted kernel `[1, 16]` at
 /// stride `[1, 8]` on unit height — plus the grouped / dilated / padded /
-/// output-padded family the device gather has to reproduce, and the two
-/// degenerate groupings it refuses in place of the pre-device-route behaviour.
+/// output-padded family the device routes have to reproduce, and the two
+/// degenerate groupings they refuse in place of the pre-device-route behaviour.
 #[test]
 #[cfg(feature = "gpu")]
 fn conv_transpose2d_wgpu_decoder_and_family_matches_cpu() {

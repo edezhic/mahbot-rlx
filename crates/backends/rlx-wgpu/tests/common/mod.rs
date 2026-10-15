@@ -7,8 +7,9 @@
 //! across a cell set) that the three harnesses using them — `gguf_one_row_stream_rate`,
 //! `gguf_gemm_grouped_weight_reuse` and `gguf_gemm_grouped_split_rate` — time their
 //! calls with, plus the parity helpers, the conv-transpose-2d route levers together
-//! with the pair bound its pins derive their bar from, the pins' own refusal and the
-//! route-counter lock at the end of the file. `tests/common/` is not a test target of
+//! with the pair bound its pins derive their bar from and the six real decoder
+//! geometries those pins and the route harness both read, the pins' own refusal and
+//! the route-counter lock at the end of the file. `tests/common/` is not a test target of
 //! its own; each test binary pulls it in with `mod common;`.
 
 // Each test binary declaring `mod common;` uses only the helpers it needs, so
@@ -279,7 +280,8 @@ pub fn expected_attention_routes(
     }
 }
 
-/// The levers that put `Op::ConvTranspose2d` on its device gather step, spelled in
+/// The levers that put `Op::ConvTranspose2d` on its device route — whichever of its
+/// two device steps the form's geometry selects — spelled in
 /// one place because every pin that has to reach that arm needs the same routers out
 /// of the way: `RLX_WGPU_FORCE_HOST`, `RLX_WGPU_DISCRETE_HOST`, `RLX_WGPU_ALLOW_SHARD`
 /// and `RLX_WGPU_ALL_PARAMS_WEIGHT` zeroed, the shard-cap lever neutralised to a value
@@ -312,7 +314,9 @@ pub fn conv_transpose2d_device_route_env() {
 /// One conv-transpose-2d geometry: the operand shapes and the attribute set the bound
 /// walk below reads. The harnesses that derive a bar from their operands keep their
 /// case tables in this shape rather than in eleven loose numbers, so the walk takes it
-/// and there is one vocabulary for "which geometry" across them.
+/// and there is one vocabulary for "which geometry" across them. `Copy` because the
+/// real forms below are a `const` table read out more than once.
+#[derive(Clone, Copy)]
 pub struct ConvTranspose2dGeometry {
     pub n: usize,
     pub c_in: usize,
@@ -351,7 +355,53 @@ impl ConvTranspose2dGeometry {
     }
 }
 
-/// The bound on how far `Op::ConvTranspose2d`'s device gather can sit from the scalar
+/// One of the stand's `dac:25` decoder-cell transposed convolutions: `(label,
+/// geometry)`, single batch, unit height, one group, no dilation, and the width
+/// padding / output padding the decoder's generator derives from the taps and
+/// stride (`padding = (k − s + 1)/2`, `output_padding = (k − s) % 2`) — derived
+/// here once rather than restated per caller, because these six shapes are the
+/// operation's own acceptance and every copy of them is a shape that can drift.
+pub const fn decoder_form(
+    label: &'static str,
+    c_in: usize,
+    c_out: usize,
+    w_in: usize,
+    k: usize,
+    s: usize,
+) -> (&'static str, ConvTranspose2dGeometry) {
+    (
+        label,
+        ConvTranspose2dGeometry {
+            n: 1,
+            c_in,
+            c_out,
+            h: 1,
+            w: w_in,
+            k: [1, k],
+            s: [1, s],
+            p: [0, (k - s).div_ceil(2)],
+            d: [1, 1],
+            op: [0, (k - s) % 2],
+            groups: 1,
+        },
+    )
+}
+
+/// The six real forms, in graph order (`up.blk.0`, `up.blk.1`, `blk.0`…`blk.3`),
+/// with the channel counts and input widths the decoder really carries. The
+/// cross-crate copy of these numbers is
+/// `crates/core/rlx-runtime/tests/conv_transpose2d_parity.rs`'s `decoder_cfgs()`,
+/// which is where a change to them has to land too.
+pub const DECODER_FORMS: &[(&str, ConvTranspose2dGeometry)] = &[
+    decoder_form("up.blk.0", 1024, 1024, 25, 2, 2),
+    decoder_form("up.blk.1", 1024, 1024, 50, 2, 2),
+    decoder_form("blk.0", 1536, 768, 100, 16, 8),
+    decoder_form("blk.1", 768, 384, 800, 10, 5),
+    decoder_form("blk.2", 384, 192, 4000, 8, 4),
+    decoder_form("blk.3", 192, 96, 16000, 6, 3),
+];
+
+/// The bound on how far `Op::ConvTranspose2d`'s device steps can sit from the scalar
 /// oracle `rlx_cpu::kernels::conv_transpose2d_nchw`, derived from `geo`'s operands
 /// rather than from an absolute bar. Each route accumulates the same `terms` f32
 /// products per output element in its own order, so each can differ from the exact sum

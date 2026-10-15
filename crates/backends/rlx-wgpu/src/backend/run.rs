@@ -1311,7 +1311,7 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
-                    Step::ConvTranspose2d { params } => {
+                    Step::ConvTranspose2d { params } | Step::ConvTranspose2dTiled { params } => {
                         let mut p = *params;
                         p.n = scale(p.n);
                         dev.queue
@@ -3143,6 +3143,23 @@ impl WgpuExecutable {
                                 let total =
                                     n_s * params.c_out * params.d_out * params.h_out * params.w_out;
                                 let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::ConvTranspose2dTiled { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    gpu_bi += 1;
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let ck = crate::kernels::conv_transpose2d_tiled_kernel(&dev.device);
+                                pass.set_pipeline(&ck.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let [gx, gy, gz] = crate::kernels::conv_transpose2d_tiled_grid(
+                                    params.w_out,
+                                    params.sw,
+                                    params.c_out,
+                                );
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::ConvTranspose3d { params } => {

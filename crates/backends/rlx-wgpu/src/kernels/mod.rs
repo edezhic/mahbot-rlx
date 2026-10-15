@@ -129,6 +129,28 @@ pub const CONV1D_WGSL: &str = include_str!("conv1d.wgsl");
 pub const CONV3D_WGSL: &str = include_str!("conv3d.wgsl");
 pub const CONV3D_CTILE_WGSL: &str = include_str!("conv3d_ctile.wgsl");
 pub const CONV_TRANSPOSE3D_WGSL: &str = include_str!("conv_transpose3d.wgsl");
+pub const CONV_TRANSPOSE2D_TILED_WGSL: &str = include_str!("conv_transpose2d_tiled.wgsl");
+
+/// The output-position and output-channel tile of `conv_transpose2d_tiled.wgsl`
+/// (its `TILE_U`/`TILE_CO`, which WGSL cannot read from here), tied to the
+/// shader's own declarations by the test at the end of this module.
+/// [`conv_transpose2d_tiled_grid`] is the one place they become a dispatch.
+const TILED_TILE_U: u32 = 64;
+const TILED_TILE_CO: u32 = 64;
+
+/// The dispatch grid `conv_transpose2d_tiled.wgsl` is launched with: one
+/// workgroup per `TILED_TILE_U` output positions of one phase, one per
+/// `TILED_TILE_CO` output channels, and one per phase (`sw` of them, the third
+/// dimension). `lower` admits a form by asking whether this grid fits the
+/// device's dimensions and `run` launches exactly it — the grid is the only
+/// bound on which output elements a dispatch covers, so both call it once.
+pub(crate) fn conv_transpose2d_tiled_grid(w_out: u32, sw: u32, c_out: u32) -> [u32; 3] {
+    [
+        w_out.div_ceil(sw).div_ceil(TILED_TILE_U),
+        c_out.div_ceil(TILED_TILE_CO),
+        sw,
+    ]
+}
 pub const GROUP_NORM_BWD_WGSL: &str = include_str!("group_norm_backward.wgsl");
 pub const AXIAL_ROPE2D_WGSL: &str = include_str!("axial_rope2d.wgsl");
 pub const FAKE_QUANTIZE_WGSL: &str = include_str!("fake_quantize.wgsl");
@@ -2711,6 +2733,7 @@ static CONV3D: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_CTILE: OnceLock<Kernel> = OnceLock::new();
 static CONV_TRANSPOSE3D: OnceLock<Kernel> = OnceLock::new();
 static CONV_TRANSPOSE2D: OnceLock<Kernel> = OnceLock::new();
+static CONV_TRANSPOSE2D_TILED: OnceLock<Kernel> = OnceLock::new();
 static SCATTER_ADD: OnceLock<Kernel> = OnceLock::new();
 static TOPK: OnceLock<Kernel> = OnceLock::new();
 static WELCH_PEAKS_GPU: OnceLock<Kernel> = OnceLock::new();
@@ -4106,6 +4129,19 @@ pub fn conv_transpose2d_kernel(device: &wgpu::Device) -> &'static Kernel {
         )
     })
 }
+/// `Op::ConvTranspose2d`'s phase-decomposed tiled GEMM, the fast path over the
+/// gather above (see `conv_transpose2d_tiled.wgsl` for both the design and the
+/// family it is proven for).
+pub fn conv_transpose2d_tiled_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV_TRANSPOSE2D_TILED.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv_transpose2d_tiled",
+            CONV_TRANSPOSE2D_TILED_WGSL,
+            "conv_transpose2d_tiled",
+        )
+    })
+}
 pub fn scatter_add_kernel(device: &wgpu::Device) -> &'static Kernel {
     SCATTER_ADD.get_or_init(|| {
         build_kernel(
@@ -4464,7 +4500,58 @@ pub fn matmul_qkv_coop_f16_vk_widen_kernel(device: &wgpu::Device) -> Option<&'st
 
 #[cfg(test)]
 mod tests {
-    use super::ELEMENTWISE_REGION_WGSL;
+    use super::{
+        CONV_TRANSPOSE2D_TILED_WGSL, ELEMENTWISE_REGION_WGSL, TILED_TILE_CO, TILED_TILE_U,
+        conv_transpose2d_tiled_grid,
+    };
+
+    /// `conv_transpose2d_tiled.wgsl` parses and validates under the WebGPU
+    /// baseline, and the tile its dispatch grid is built from is the tile it
+    /// declares. Device-free (naga only): without this a WGSL mistake would
+    /// surface as a panic at `create_shader_module` on the first graph that takes
+    /// the route — and, since the route is `lower.rs`'s family predicate rather
+    /// than an option, on every machine at once rather than on whichever one
+    /// happened to run it. `Capabilities::empty()` is the strictest set, so an arm
+    /// reaching for an optional capability cannot compile here and fail only on a
+    /// device that provides less.
+    #[test]
+    fn conv_transpose2d_tiled_shader_matches_its_dispatch_geometry() {
+        let module = naga::front::wgsl::parse_str(CONV_TRANSPOSE2D_TILED_WGSL).expect("wgsl parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("wgsl validate without any optional capability");
+
+        assert_eq!(
+            module
+                .entry_points
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["conv_transpose2d_tiled"],
+            "one compute entry, and it the one `run.rs` sets as the pipeline"
+        );
+
+        for (name, value) in [("TILE_U", TILED_TILE_U), ("TILE_CO", TILED_TILE_CO)] {
+            let decl = format!("const {name}: u32 = {value}u;");
+            assert!(
+                CONV_TRANSPOSE2D_TILED_WGSL.contains(&decl),
+                "the shader must declare `{decl}`: the dispatch grid is built from the Rust \
+                 constant, and that grid is the only bound on which output elements a dispatch \
+                 covers"
+            );
+        }
+
+        // The grid's rounding, at a width that is not a multiple of the tile: a
+        // floor division here would leave a phase's last positions unserved, which
+        // no shape in the pinned family would show.
+        assert_eq!(
+            conv_transpose2d_tiled_grid(3 * TILED_TILE_U + 1, 1, 2 * TILED_TILE_CO + 1),
+            [4, 3, 1],
+        );
+    }
 
     /// The activation codes `apply_activation` actually has an arm for, read out of
     /// the kernel's own source. The scan is scoped to that one function: the same file's
