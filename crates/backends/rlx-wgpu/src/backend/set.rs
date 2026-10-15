@@ -147,15 +147,24 @@ impl WgpuExecutable {
         }
     }
 
-    pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) {
+    /// Register a *prefix* feed: after each run, the whole prefix of graph output
+    /// `output_index` is folded into the device-resident input `handle_name` (see
+    /// [`Self::bind_gpu_handle`]). Answers whether this executable can bind that
+    /// name — the same question [`Self::bind_gpu_handle`] asks, so a name that
+    /// can be bound can be registered.
+    pub fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+        if !self.can_bind_gpu_handle(handle_name) {
+            return false;
+        }
         self.gpu_handle_feeds
             .insert(handle_name.to_string(), output_index);
+        true
     }
 
     /// Mark an already-staged graph input as device-resident so subsequent
     /// `run` calls skip host re-upload (ORT-style I/O binding for constants).
     pub fn prepare_resident_gpu_handle(&mut self, name: &str) -> bool {
-        if !self.input_offsets.contains_key(name) {
+        if !self.can_bind_gpu_handle(name) {
             return false;
         }
         self.gpu_handle_resident.insert(name.to_string());

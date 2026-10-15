@@ -398,6 +398,12 @@ mod capabilities_tests {
 /// See [`crate::ExecutableCapabilities`] for the optional feature bits and a
 /// table of which trait methods belong to which group. Core execution is
 /// `set_param` / `run` (and friends); everything else defaults to unsupported.
+///
+/// The GPU-handle family — `bind_gpu_handle`, the two feed registrations,
+/// `feed_kv_row`, `read_gpu_handle_row` — is the one group whose answers say
+/// whether this executable really did what was asked. A wrapper that has not
+/// adopted that contract answers without consulting anything, so each backend
+/// owes its own route a gate on the answers it gives.
 pub trait ExecutableGraph: Send {
     /// Advisory optional-feature bitmask. Default: all clear. Override when
     /// you implement MoE / GPU handles / typed I/O / etc. Callers must still
@@ -562,7 +568,8 @@ pub trait ExecutableGraph: Send {
         None
     }
 
-    /// GPU-resident input (MLX): upload once, reuse across runs.
+    /// GPU-resident input handle: upload once, reuse across runs, and (on
+    /// backends that track it) keep the rows in this executable's storage.
     fn bind_gpu_handle(&mut self, _name: &str, _data: &[f32]) -> bool {
         false
     }
@@ -571,6 +578,9 @@ pub trait ExecutableGraph: Send {
         false
     }
 
+    /// Feed output `_output_index` back into the resident handle
+    /// `_handle_name`. `false` when the name is not one this executable can bind
+    /// as a GPU handle.
     fn set_gpu_handle_feed(&mut self, _handle_name: &str, _output_index: usize) -> bool {
         false
     }
@@ -580,21 +590,44 @@ pub trait ExecutableGraph: Send {
     }
 
     /// Read one row from a resident GPU input handle without full-tensor D2H.
+    /// Resolves the same slot [`Self::read_gpu_handle`] does, but answers only
+    /// that row and costs only that row.
+    ///
+    /// `_row_inner` is the row width the caller states: the window is
+    /// `[_row * _row_inner, (_row + 1) * _row_inner)`, so a width that is not the
+    /// cache's own row size reads across the rows beside it rather than being
+    /// refused — the caller that knows the row width passes it.
+    ///
+    /// `None` when the handle does not hold it: a row outside the extent the
+    /// handle declares, a zero-length row, or no rows held in this executable at
+    /// all. A shortened answer would not be tellable apart from a truncated one,
+    /// so nothing about the row is guessed.
     fn read_gpu_handle_row(&self, _name: &str, _row: usize, _row_inner: usize) -> Option<Vec<f32>> {
         None
     }
 
     /// Register a targeted *row* feed for resident KV decode (graphs that emit
-    /// the new token at the last bucket-padded output row). Returns false when
-    /// the backend has no GPU-resident handle support. See `feed_kv_row`.
+    /// the new token at the last bucket-padded output row). Answers whether this
+    /// executable can bind `_handle_name` as a GPU handle — the same question
+    /// `bind_gpu_handle` asks. Returns false on backends with no GPU-resident
+    /// handle support. See `feed_kv_row`.
     fn register_kv_row_feed(&mut self, _handle_name: &str, _output_index: usize) -> bool {
         false
     }
 
     /// Fold each registered row feed's new-token row (`src_row` of its output)
     /// into the resident handle slot at `dst_row` (`row_elems` = kv_dim),
-    /// in-place on device. Call after a logits-only run. Returns false when
-    /// unsupported (caller keeps the host KV path).
+    /// in-place on device. Call after a logits-only run.
+    ///
+    /// `false` when the row cannot be put where it was asked to go: nothing is
+    /// registered, a registered name is not a graph input this executable can
+    /// bind, its output index is past the graph's outputs, `row_elems` is zero,
+    /// this executable holds no such cache (never bound or seeded here, a clone,
+    /// or one that recompiled), a row is outside the extent its own node declares
+    /// (`dst_row` the cache input's, `src_row` the output's), or either slot is
+    /// missing from the arena this executable has. The caller keeps the host KV
+    /// path, and must find every cache reading back as it did before the call —
+    /// nothing may be left claiming to be current.
     fn feed_kv_row(&mut self, _src_row: usize, _dst_row: usize, _row_elems: usize) -> bool {
         false
     }

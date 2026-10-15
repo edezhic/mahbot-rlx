@@ -110,8 +110,7 @@ impl ExecutableGraph for WgpuExecutableWrapper {
         self.inner.bind_gpu_handle(name, data)
     }
     fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
-        self.inner.register_kv_row_feed(handle_name, output_index);
-        true
+        self.inner.register_kv_row_feed(handle_name, output_index)
     }
     fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
         self.inner.feed_kv_row(src_row, dst_row, row_elems)
@@ -120,11 +119,13 @@ impl ExecutableGraph for WgpuExecutableWrapper {
         self.inner.has_gpu_handle(name)
     }
     fn set_gpu_handle_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
-        self.inner.set_gpu_handle_feed(handle_name, output_index);
-        true
+        self.inner.set_gpu_handle_feed(handle_name, output_index)
     }
     fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         self.inner.read_gpu_handle(name)
+    }
+    fn read_gpu_handle_row(&self, name: &str, row: usize, row_inner: usize) -> Option<Vec<f32>> {
+        self.inner.read_gpu_handle_row(name, row, row_inner)
     }
     fn prepare_resident_gpu_handle(&mut self, name: &str) -> bool {
         self.inner.prepare_resident_gpu_handle(name)

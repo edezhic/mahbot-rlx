@@ -146,8 +146,11 @@ fn probeable_flags_agree_with_what_the_methods_return() {
 /// **A backend that advertises `kv_resident` must have a working row feed.**
 ///
 /// `register_kv_row_feed` returning `true` is the contract the flag stands for;
-/// the wrappers return a bare `true` without consulting anything, so the flag
-/// and the method can disagree without either looking wrong in isolation.
+/// a wrapper that returns a bare `true` without consulting anything lets the flag
+/// and the method disagree without either looking wrong in isolation. So for
+/// every backend that claims the flag, this checks that `gpu_handles` comes with
+/// it, that `bind_gpu_handle` really binds, and that `register_kv_row_feed`
+/// really registers.
 #[test]
 fn kv_resident_implies_a_row_feed_that_registers() {
     let _gpu = common::serialize_gpu();

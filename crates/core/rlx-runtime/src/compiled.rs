@@ -332,7 +332,8 @@ impl CompiledGraph {
         self.inner.capabilities()
     }
 
-    /// GPU-resident MLX input (no-op on non-MLX backends).
+    /// GPU-resident input handle: bound here and kept on the device across runs
+    /// (no-op where the backend has none).
     pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
         self.inner.bind_gpu_handle(name, data)
     }
@@ -374,6 +375,9 @@ impl CompiledGraph {
     }
 
     /// Read one row from a resident GPU input handle without full-tensor D2H.
+    /// `None` when the handle does not hold that row — a row outside its extent,
+    /// a zero-length row, or no rows held here at all. See the `ExecutableGraph`
+    /// trait for what a given implementation holds itself to.
     pub fn read_gpu_handle_row(
         &self,
         name: &str,
@@ -384,15 +388,20 @@ impl CompiledGraph {
     }
 
     /// Register a targeted row feed for resident KV decode (graphs that emit the
-    /// new token at the last bucket-padded output row). No-op (false) on
-    /// backends without GPU-resident handle support. See [`Self::feed_kv_row`].
+    /// new token at the last bucket-padded output row). Answers whether this
+    /// executable can bind that name — see the `ExecutableGraph` trait for what
+    /// that answer holds itself to. False on backends without GPU-resident handle
+    /// support.
     pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
         self.inner.register_kv_row_feed(handle_name, output_index)
     }
 
     /// Fold each registered row feed's new-token row (`src_row` of its output)
     /// into the resident handle slot at `dst_row` (`row_elems` = kv_dim),
-    /// in-place on device. Returns false when unsupported.
+    /// in-place on device. `false` when the row cannot be put where it was asked
+    /// to go, so the caller keeps the host KV path; the `ExecutableGraph` trait
+    /// holds the list of what refuses, and the promise that a `false` has left
+    /// every cache reading back as it did before the call.
     pub fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
         self.inner.feed_kv_row(src_row, dst_row, row_elems)
     }

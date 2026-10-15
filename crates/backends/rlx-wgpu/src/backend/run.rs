@@ -278,15 +278,22 @@ impl WgpuExecutable {
 
     /// Register a resident-KV row feed: `handle_name` (a device-resident input,
     /// see `bind_gpu_handle`) receives row data from graph output `output_index`.
+    /// Answers whether this executable can bind that name — the same question
+    /// [`Self::bind_gpu_handle`] asks, so a name that can be bound can be
+    /// registered; `false` means the registration is not there to be fed.
     ///
     /// Pairs with `Op::KvAppend`. Without residency the op does not actually
     /// remove the O(context) cost — the concat it replaces copies the cache
     /// on-GPU, but the runtime still re-uploads the past KV as a graph input
     /// every step, so the cost merely moves. This is the half that keeps the
     /// cache on the device between steps.
-    pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) {
+    pub fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
+        if !self.can_bind_gpu_handle(handle_name) {
+            return false;
+        }
         self.kv_row_feeds
             .insert(handle_name.to_string(), output_index);
+        true
     }
 
     /// Fold each registered feed's new-token row (`src_row` of its output) into
@@ -296,31 +303,54 @@ impl WgpuExecutable {
     /// output IS the input (in-place `KvAppend`, `out_id == in_id`), a copy with
     /// `src_row != dst_row` is a legitimate intra-buffer relocate — the graph
     /// writes the new token at a fixed row and this moves it to the growing
-    /// `past_seq` row. Only a genuine no-op (same node AND same row) is skipped.
+    /// `past_seq` row. Only a genuine no-op (same node AND same row) is skipped,
+    /// and it stays a success: a consumer that folds a row where it already sits
+    /// must not be pushed onto its host fallback.
+    ///
+    /// Every registered name is resolved and vetted BEFORE any byte moves, so one
+    /// name that cannot take its row fails the whole call and leaves every cache
+    /// reading back as it did before the call — `ExecutableGraph::feed_kv_row`
+    /// holds the list of what makes a name unservable.
     pub fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
         let Some(dev) = crate::device::wgpu_device() else {
             return false;
         };
-        let feeds: Vec<(String, usize)> = self
-            .kv_row_feeds
-            .iter()
-            .map(|(k, &v)| (k.clone(), v))
-            .collect();
-        if feeds.is_empty() {
+        if self.kv_row_feeds.is_empty() || row_elems == 0 {
             return false;
         }
-        let bytes = row_elems * std::mem::size_of::<f32>();
-        for (name, out_idx) in feeds {
-            if out_idx >= self.graph.outputs.len() {
-                continue;
-            }
-            let out_id = self.graph.outputs[out_idx];
-            let Some(&in_id) = self.input_offsets.get(name.as_str()) else {
-                continue;
+        // Vet every registered feed first: reporting failure after some row had
+        // already moved would leave some caches current and others not.
+        let mut moves: Vec<(String, NodeId, NodeId)> = Vec::with_capacity(self.kv_row_feeds.len());
+        for (name, &out_idx) in &self.kv_row_feeds {
+            let Some(&out_id) = self.graph.outputs.get(out_idx) else {
+                return false;
             };
-            if !self.arena.has(in_id) || !self.arena.has(out_id) {
-                continue;
+            let Some(&in_id) = self.input_offsets.get(name.as_str()) else {
+                return false;
+            };
+            // "Held here": this name's rows are in the arena slot (authoritative
+            // once resident), or in the host mirror this executable still holds.
+            // A clone emptied the mirror when the rows became resident, so it
+            // holds neither and reports failure rather than feeding a zeroed
+            // cache.
+            let held = self.gpu_handle_resident.contains(name)
+                || self.gpu_handles.get(name).is_some_and(|m| !m.is_empty());
+            if !held || !self.arena.has(in_id) || !self.arena.has(out_id) {
+                return false;
             }
+            // A row past what its node declares is refused rather than copied from
+            // or into whatever the arena holds beside the slots. A divide, not a
+            // product: release has no overflow checks (`apple` is release with
+            // `panic = "abort"`), so a huge row index would wrap the product.
+            if dst_row >= self.extent_elems(in_id) / row_elems
+                || src_row >= self.extent_elems(out_id) / row_elems
+            {
+                return false;
+            }
+            moves.push((name.clone(), in_id, out_id));
+        }
+        let bytes = row_elems * std::mem::size_of::<f32>();
+        for (name, in_id, out_id) in moves {
             if in_id != out_id || src_row != dst_row {
                 let staging = self.kv_feed_staging.get_or_insert_with(|| {
                     dev.device.create_buffer(&wgpu::BufferDescriptor {
@@ -349,7 +379,7 @@ impl WgpuExecutable {
                 );
             }
             self.gpu_handle_resident.insert(name.clone());
-            self.gpu_handles.insert(name.clone(), Vec::new());
+            self.gpu_handles.insert(name, Vec::new());
         }
         true
     }

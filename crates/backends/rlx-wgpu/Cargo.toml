@@ -328,6 +328,10 @@ name = "kernel_schedule_target"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "kv_row_residency"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "matmul_accum_precision"
 required-features = ["backend-tests"]
 

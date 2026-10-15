@@ -600,6 +600,10 @@ impl WgpuExecutable {
         self.im2col_fallbacks = fresh.im2col_fallbacks;
         self.attention_window_declines = fresh.attention_window_declines;
         self.input_offsets = fresh.input_offsets;
+        // The arena is this compile's, and a resident handle's host mirror was
+        // emptied when its rows became resident — so this executable no longer
+        // holds those rows, and must not answer as if it did.
+        self.gpu_handle_resident.clear();
         self.param_offsets = fresh.param_offsets;
         self.uniforms = fresh.uniforms;
         self.bind_groups = fresh.bind_groups;
@@ -954,8 +958,15 @@ impl WgpuExecutable {
         }
     }
 
+    /// Whether this executable can bind `name` as a GPU handle — the one question
+    /// [`Self::bind_gpu_handle`], the two feed registrations and
+    /// [`Self::prepare_resident_gpu_handle`] all ask.
+    fn can_bind_gpu_handle(&self, name: &str) -> bool {
+        self.input_offsets.contains_key(name)
+    }
+
     pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
-        if !self.input_offsets.contains_key(name) {
+        if !self.can_bind_gpu_handle(name) {
             return false;
         }
         self.gpu_handle_resident.remove(name);
@@ -963,29 +974,119 @@ impl WgpuExecutable {
         true
     }
 
+    /// Whether this executable holds `name`'s rows as a GPU handle at all: a host
+    /// copy of them, or — once they are resident — the mark left where the mirror
+    /// was emptied because the arena's rows became the authoritative ones. A
+    /// different question from `can_bind_gpu_handle`, which asks whether `name` is
+    /// a graph input here.
     pub fn has_gpu_handle(&self, name: &str) -> bool {
         self.gpu_handles.contains_key(name)
     }
 
     pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
-        if let Some(&out_idx) = self.gpu_handle_feeds.get(name) {
-            if out_idx < self.graph.outputs.len() {
-                let id = self.graph.outputs[out_idx];
-                if self.arena.has(id) {
-                    let dev = wgpu_device().expect("rlx-wgpu: device gone");
-                    return Some(self.arena.read_f32(&dev.device, &dev.queue, id));
-                }
-            }
-        }
-        if self.gpu_handle_resident.contains(name) {
-            if let Some(&id) = self.input_offsets.get(name) {
-                if self.arena.has(id) {
-                    let dev = wgpu_device().expect("rlx-wgpu: device gone");
-                    return Some(self.arena.read_f32(&dev.device, &dev.queue, id));
-                }
-            }
+        if let Some(id) = self.resolve_handle_slot(name) {
+            let dev = wgpu_device().expect("rlx-wgpu: device gone");
+            return Some(self.arena.read_f32(&dev.device, &dev.queue, id));
         }
         self.gpu_handles.get(name).cloned()
+    }
+
+    /// The arena slot a named handle's rows are in right now, or `None` when only
+    /// the host mirror is left. Both reads ask this one ladder — fed output slot,
+    /// else resident input slot — so their answers cannot drift apart.
+    fn resolve_handle_slot(&self, name: &str) -> Option<NodeId> {
+        if let Some(id) = self
+            .gpu_handle_feeds
+            .get(name)
+            .and_then(|&out_idx| self.graph.outputs.get(out_idx).copied())
+            .filter(|id| self.arena.has(*id))
+        {
+            return Some(id);
+        }
+        if self.gpu_handle_resident.contains(name) {
+            return self
+                .input_offsets
+                .get(name)
+                .copied()
+                .filter(|id| self.arena.has(*id));
+        }
+        None
+    }
+
+    /// Read one row (`row_inner` f32 elements at `row`) of a named handle,
+    /// resolving the slot exactly as [`Self::read_gpu_handle`] does — fed output
+    /// slot, else resident arena slot, else host mirror — but copying only that
+    /// row to the host, so the read costs the row and not the cache's capacity.
+    ///
+    /// `None` when the row is outside the extent the handle declares, and for a
+    /// zero-length row: a shortened answer could not be told apart from a
+    /// truncated one. A slot this executable no longer holds does not fall back
+    /// to bytes somewhere else — the answer is nothing.
+    pub fn read_gpu_handle_row(
+        &self,
+        name: &str,
+        row: usize,
+        row_inner: usize,
+    ) -> Option<Vec<f32>> {
+        if row_inner == 0 {
+            return None;
+        }
+        // Checked, because this is release code: a row index near `usize::MAX`
+        // must be refused rather than wrap into a range inside the slot.
+        let start = row.checked_mul(row_inner)?;
+        let end = start.checked_add(row_inner)?;
+        let Some(id) = self.resolve_handle_slot(name) else {
+            // No slot here: the host mirror, bounded by what the name declares —
+            // it may be a longer binding than the slot it was uploaded into.
+            let mirror = self.gpu_handles.get(name)?;
+            let declared = self.declared_extent_elems(*self.input_offsets.get(name)?, mirror.len());
+            if end > declared {
+                return None;
+            }
+            return Some(mirror[start..end].to_vec());
+        };
+        if end > self.extent_elems(id) {
+            return None;
+        }
+        let dev = wgpu_device().expect("rlx-wgpu: device gone");
+        let off = self.arena.offset(id) + start * std::mem::size_of::<f32>();
+        // Only the row is copied, so the cost is the row's and not the slot's;
+        // `read_bytes_range` stitches a range that straddles a stripe.
+        let mut out = vec![0f32; row_inner];
+        let raw = self.arena.read_bytes_range(
+            &dev.device,
+            &dev.queue,
+            off,
+            row_inner * std::mem::size_of::<f32>(),
+        );
+        bytemuck::cast_slice_mut::<f32, u8>(&mut out).copy_from_slice(&raw);
+        Some(out)
+    }
+
+    /// The extent the node behind `id` declares, in f32 elements, never more than
+    /// `held` — the slot or mirror that carries its rows: an unresolved shape
+    /// leaves the carrier itself as the extent. The row feed and both read paths
+    /// bound their row by this, so a row that does not exist is neither written
+    /// beside the cache nor read out of it.
+    fn declared_extent_elems(&self, id: NodeId, held: usize) -> usize {
+        self.graph
+            .node(id)
+            .shape
+            .num_elements()
+            .unwrap_or(held)
+            .min(held)
+    }
+
+    /// [`Self::declared_extent_elems`] capped by the node's arena slot — the
+    /// extent of any node whose rows this executable holds, cache input or feed
+    /// output alike.
+    fn extent_elems(&self, id: NodeId) -> usize {
+        let slot = if self.arena.has(id) {
+            self.arena.len_of(id) / std::mem::size_of::<f32>()
+        } else {
+            0
+        };
+        self.declared_extent_elems(id, slot)
     }
 
     /// Clone into an independent executable (recompiles from the stored graph).
@@ -1007,9 +1108,11 @@ impl WgpuExecutable {
         for (k, v) in &self.gpu_handles {
             exe.bind_gpu_handle(k, v);
         }
-        for (k, &idx) in &self.gpu_handle_feeds {
-            exe.set_gpu_handle_feed(k, idx);
-        }
+        // Copied, not re-registered: the feed map is a plain name→output record,
+        // and a clone whose arena is still deferred has no input set to ask about
+        // — asking would drop the registration its parent had, and a lost prefix
+        // feed stops updating the cache with nothing reporting it.
+        exe.gpu_handle_feeds.clone_from(&self.gpu_handle_feeds);
         exe.set_active_extent(self.active_extent);
         exe.set_rng(self.rng());
         exe

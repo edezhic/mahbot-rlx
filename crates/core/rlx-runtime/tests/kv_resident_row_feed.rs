@@ -10,10 +10,11 @@
 //! the other half — `bind_gpu_handle` keeps the cache on the device and
 //! `feed_kv_row` folds each new row into it without a host round trip.
 //!
-//! This is easy to wire up and have silently do nothing: registering a feed and
-//! calling it returns `true` whether or not any bytes moved. So the check is
-//! behavioural — run twice, feeding a different row each time, and require the
-//! resident buffer to show BOTH rows. A no-op feed shows neither.
+//! This is easy to wire up and have silently do nothing, and not every wrapper
+//! says so. So the check here is behavioural, on every backend alike: seed the
+//! cache, run, fold a row of the output into a different row of the cache, and
+//! require that row to still hold it on the next run. A feed that moved no bytes
+//! leaves it empty, and one that re-uploads the host copy loses it.
 //!
 //! Backends without residency return `false` from `register_kv_row_feed`; the
 //! test reports and skips rather than asserting a capability they never claimed
@@ -79,9 +80,9 @@ fn a_registered_row_feed_accumulates_into_the_resident_handle() {
         let _ = c.run(&[]);
         c.feed_kv_row(0, 1, ROW);
 
-        // Step 2: a different marker in row 0, folded into row 2. If the feed
-        // is a no-op this leaves row 1 empty; if it re-uploads from the host it
-        // loses row 1 as well.
+        // Step 2: run again, feeding nothing. The resident cache still holds the
+        // row the feed folded in — a feed that moved no bytes leaves row 1 empty,
+        // and one that re-uploads from the host loses it.
         let out = c.run(&[]);
         let after = &out[0];
         let row1 = &after[ROW..2 * ROW];
