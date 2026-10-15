@@ -6,10 +6,16 @@
 //! `Step::Matmul` of the scores, a `Step::AttentionMask` and a `Step::Softmax`
 //! over them, and one `Step::Matmul` by V — in place of one
 //! `Step::Attention` in which a single thread walks the whole key sequence
-//! alone. Shapes and strides only, so it is testable without a device, and
-//! [`plan_attention`] the one derivation of it from a node: the reserve in
-//! [`crate::backend`] and the `Op::Attention` arm of `compile::lower` both read
-//! the plan it returns.
+//! alone. Shapes, strides and the nodes that produce them — never a device — so
+//! it is testable without one, and [`plan_attention`] the one derivation of it
+//! from a node: the reserve in [`crate::backend`] and the `Op::Attention` arm of
+//! `compile::lower` both read the plan it returns.
+//!
+//! A rank-4 operand's layout — `[B, H, S, D]` or `[B, S, H, D]` — is read from
+//! the graph wherever the operand's own extents leave both readings possible, by
+//! [`rank4_geometry`]: the extents settle it wherever they can, and the one extent
+//! they cannot is refused by name rather than guessed — still device-free, the
+//! walk over the producing nodes included.
 //!
 //! Why: the fused kernel runs one thread per (batch, head, query row), each
 //! reading all of K and V itself, so the work never fills the machine as the row
@@ -348,13 +354,17 @@ impl AttentionPlan {
 }
 
 /// Why a node has no plan, carrying the message the lowering's own panic for
-/// that shape prints. Every variant but [`NotAttention`](Self::NotAttention) and
-/// [`HeadWidth`](Self::HeadWidth) describes a step the fused path cannot derive a
-/// shape for either — the arms that hit them index a dim that is not there — so a
-/// refusal is never a shape the route could have taken. [`HeadWidth`](Self::HeadWidth)
-/// is the exception: that shape has geometry the fused path could size, and the
-/// kernel would then early-return without writing the output slot, which is why
-/// the width is refused here rather than lowered to a blank.
+/// that shape prints. Every variant but [`NotAttention`](Self::NotAttention),
+/// [`HeadWidth`](Self::HeadWidth) and [`AmbiguousRank4`](Self::AmbiguousRank4)
+/// describes a step the fused path cannot derive a shape for either — the arms
+/// that hit them index a dim that is not there — so a refusal is never a shape
+/// the route could have taken. Both exceptions are shapes the fused path *can*
+/// size, refused here rather than lowered to a wrong result: [`HeadWidth`](Self::HeadWidth)
+/// is a width whose kernel would early-return without writing the output slot,
+/// and [`AmbiguousRank4`](Self::AmbiguousRank4) is a rank-4 operand at the one
+/// extent where both axis orders fit it with nothing declaring which — a reading
+/// the fused path would take off the head axis and compute wrong in silence. See
+/// [`rank4_layout`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttentionRefusal {
     /// The node is not an `Op::Attention` — what the scratch reserve, which
@@ -382,6 +392,10 @@ pub(crate) enum AttentionRefusal {
     /// resolution — above [`ATTENTION_DECOMPOSE_MAX_HEAD_DIM`], which the fused
     /// kernel's `MAX_HEAD_DIM` and this route's decision both cap at.
     HeadWidth { head_dim: u32, v_head_dim: u32 },
+    /// A rank-4 operand at the one extent where both readings fit it — axis 1 and
+    /// axis 2 are both `heads`, one extent rather than two — with nothing on the
+    /// operand's own path declaring which one it is. See [`rank4_layout`].
+    AmbiguousRank4 { heads: u32, head_dim: u32 },
 }
 
 impl std::fmt::Display for AttentionRefusal {
@@ -430,8 +444,228 @@ impl std::fmt::Display for AttentionRefusal {
                 "rlx-wgpu Attention: head_dim {head_dim} / v_head_dim {v_head_dim} is above the \
                  {ATTENTION_DECOMPOSE_MAX_HEAD_DIM} this route serves"
             ),
+            Self::AmbiguousRank4 { heads, head_dim } => write!(
+                f,
+                "rlx-wgpu Attention: rank-4 layout is ambiguous — axis 1 and axis 2 are both \
+                 {heads}, so `[B, H, S, D]` and `[B, S, H, D]` fit the operand equally and the \
+                 key length read off it differs — and nothing on its way into the step declares \
+                 which one it is. Read one of them: unroll a packed `[.., {heads}·{head_dim}]` \
+                 feature axis into `[B, S, H, D]`, or swap axes 1 and 2 into `[B, H, S, D]`"
+            ),
         }
     }
+}
+
+/// Which way round a rank-4 attention operand's axes run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rank4Layout {
+    /// `[B, H, S, D]`: axis 1 is the head axis, axis 2 the query/key rows.
+    HeadsFirst,
+    /// `[B, S, H, D]`: axis 1 carries the rows, axis 2 the heads.
+    RowsFirst,
+}
+
+impl Rank4Layout {
+    /// The reading an axis 1 ↔ 2 swap of a rank-4 operand gives.
+    fn flipped(self) -> Self {
+        match self {
+            Self::HeadsFirst => Self::RowsFirst,
+            Self::RowsFirst => Self::HeadsFirst,
+        }
+    }
+}
+
+/// A dim the walk or the derivation has to read, or `None` where the graph has
+/// not pinned it. Producer dims are read too, so a dynamic one is answered with
+/// [`AttentionRefusal::NonStatic`] rather than panicking out of `unwrap_static`.
+fn static_dim(d: rlx_ir::shape::Dim) -> Option<u32> {
+    d.is_static().then(|| d.unwrap_static() as u32)
+}
+
+/// The extents of a shape, or `None` where the graph has not pinned them.
+fn static_dims(shape: &rlx_ir::Shape) -> Option<Vec<u32>> {
+    shape.dims().iter().map(|d| static_dim(*d)).collect()
+}
+
+/// The layout the graph declares for a rank-4 operand, or `None` where nothing
+/// on the operand's own path says which one it is.
+///
+/// This tree spells the two presentations differently, and these are the
+/// spellings read here:
+///
+/// * a `Reshape` that unrolls a packed head width into per-head axes — the
+///   rank-3 `[B, S, H·D]` projection, or the `[B, S, 1, H, D]` axis-2 narrow of
+///   a packed QKV parent — leaves the rows on axis 1: rows-first;
+/// * a `Transpose` swapping axes 1 and 2 of a rank-4 operand moves the head axis
+///   onto axis 1 (or off it): its own operand's layout, flipped;
+/// * every other producer — a norm, a rope, an elementwise op, a cast — hands
+///   the axes back as it found them, so the walk continues into the operand it
+///   transforms: its *first* input, which is the data for the ops named here but
+///   not for all of them (`Where` carries its condition there, and a scaled
+///   `Binary` may carry the scale). No spelling in this tree reaches a coincident
+///   rank-4 operand that way, and which input an op transforms is not something
+///   its shape alone decides — so the walk is not widened to guess one.
+///
+/// Anything else ends the walk: the operand's layout is then one nothing
+/// declares, which is what [`rank4_layout`] refuses at the coincident extent.
+fn declared_rank4_layout(
+    graph: &rlx_ir::Graph,
+    id: rlx_ir::NodeId,
+    heads: u32,
+    head_dim: u32,
+) -> Result<Option<Rank4Layout>, AttentionRefusal> {
+    let node = graph.node(id);
+    // The operand under discussion is the rank-4 one; a node on the way to it
+    // that is not rank-4 itself is not a spelling of it.
+    if node.shape.rank() != 4 {
+        return Ok(None);
+    }
+    match &node.op {
+        rlx_ir::Op::Reshape { .. } => {
+            let Some(src_id) = node.inputs.first().copied() else {
+                return Ok(None);
+            };
+            let src = static_dims(&graph.node(src_id).shape).ok_or(AttentionRefusal::NonStatic)?;
+            let dims = static_dims(&node.shape).ok_or(AttentionRefusal::NonStatic)?;
+            let unrolled = match src.len() {
+                // `[B, S, H·D] → [B, S, H, D]` — a rank-1 to rank-3 source, so that
+                // it has a last axis at all: the packed head width unrolled into
+                // the head axes, with the source's own leading extents (the batch
+                // and the sequence) ahead of them, a unit axis either side being no
+                // extent at all. The rows stay on axis 1. A source with no axis to
+                // unroll is not a spelling, and ends the walk below rather than
+                // indexing one.
+                n if (1..4).contains(&n) => {
+                    src[n - 1] == heads * head_dim
+                        && dims[2..4] == [heads, head_dim]
+                        && src[..n - 1]
+                            .iter()
+                            .filter(|&&d| d != 1)
+                            .eq(dims[..2].iter().filter(|&&d| d != 1))
+                }
+                // `[B, S, 1, H, D] → [B, S, H, D]`: the packed QKV parent's
+                // axis-2 narrow unrolled — the spelling `packed_bshd_qkv_strides`
+                // is read for. Its unit axis is dropped on the way, so the whole
+                // target is checked here.
+                5 => src[2] == 1 && [src[0], src[1], src[3], src[4]] == dims[..4],
+                _ => false,
+            };
+            if unrolled {
+                return Ok(Some(Rank4Layout::RowsFirst));
+            }
+            // A reshape that folds unit axes away — or is a no-op — leaves the
+            // order alone, so its own operand answers; any other reshape is not a
+            // spelling this route reads.
+            if src != dims {
+                return Ok(None);
+            }
+            declared_rank4_layout(graph, src_id, heads, head_dim)
+        }
+        rlx_ir::Op::Transpose { perm } if perm.len() == 4 => {
+            let swaps = match perm[..] {
+                [0, 2, 1, 3] => true,
+                [0, 1, 2, 3] => false,
+                _ => return Ok(None),
+            };
+            let Some(src_id) = node.inputs.first().copied() else {
+                return Ok(None);
+            };
+            let Some(src) = declared_rank4_layout(graph, src_id, heads, head_dim)? else {
+                return Ok(None);
+            };
+            Ok(Some(if swaps { src.flipped() } else { src }))
+        }
+        _ => match node.inputs.first().copied() {
+            Some(src) => declared_rank4_layout(graph, src, heads, head_dim),
+            None => Ok(None),
+        },
+    }
+}
+
+/// The layout of a rank-4 attention operand: what its own extents settle, and —
+/// where they leave both readings possible — what the graph declares.
+///
+/// Heads-first needs axis 1 to be the head count and rows-first needs axis 2 to
+/// be it, so the one operand both readings fit is the one whose first two axes
+/// are *both* the head count. There the two presentations are shape-identical
+/// and no shape-only tie-break is sound: a reading taken from the extents alone
+/// comes out heads-first whatever the operand really is, and the key length is
+/// then read off the head axis — the KV-head count in place of the number of
+/// keys — so the tensor is computed wrong with no refusal and no report. The
+/// graph breaks the tie ([`declared_rank4_layout`]); where it does not, this
+/// refuses the step by name instead of guessing.
+fn rank4_layout(
+    graph: &rlx_ir::Graph,
+    q_id: rlx_ir::NodeId,
+    heads: u32,
+    head_dim: u32,
+) -> Result<Rank4Layout, AttentionRefusal> {
+    let q = &graph.node(q_id).shape;
+    let (Some(axis1), Some(axis2)) = (static_dim(q.dim(1)), static_dim(q.dim(2))) else {
+        return Err(AttentionRefusal::NonStatic);
+    };
+    if axis1 != heads {
+        return Ok(Rank4Layout::RowsFirst);
+    }
+    if axis2 != heads {
+        return Ok(Rank4Layout::HeadsFirst);
+    }
+    declared_rank4_layout(graph, q_id, heads, head_dim)?
+        .ok_or(AttentionRefusal::AmbiguousRank4 { heads, head_dim })
+}
+
+/// `(batch, seq_q, seq_k)` and whether the layout is heads-first, for the rank-4
+/// Q and K of one attention step. The one derivation this route reads — the plan
+/// below and the `Op::AttentionBackward` arm of the lowering both go through it,
+/// so no graph is read two ways by the route. A dim it reads that the graph has
+/// not pinned is the enum's own [`AttentionRefusal::NonStatic`].
+pub(crate) fn rank4_geometry(
+    graph: &rlx_ir::Graph,
+    q_id: rlx_ir::NodeId,
+    k_id: rlx_ir::NodeId,
+    heads: u32,
+    head_dim: u32,
+) -> Result<(u32, u32, u32, bool), AttentionRefusal> {
+    let dim = |id: rlx_ir::NodeId, i: usize| -> Result<u32, AttentionRefusal> {
+        static_dim(graph.node(id).shape.dim(i)).ok_or(AttentionRefusal::NonStatic)
+    };
+    Ok(match rank4_layout(graph, q_id, heads, head_dim)? {
+        Rank4Layout::HeadsFirst => (dim(q_id, 0)?, dim(q_id, 2)?, dim(k_id, 2)?, true),
+        Rank4Layout::RowsFirst => (dim(q_id, 0)?, dim(q_id, 1)?, dim(k_id, 1)?, false),
+    })
+}
+
+/// `(batch, seq_q, seq_k)` for the rank-3 spellings of one attention step: the
+/// packed `[B, S, H·D]` projection against `[B·H, S, D]`, told apart by the last
+/// dim. The route's one rank-3 derivation — the plan below and the
+/// `Op::AttentionBackward` arm of the lowering both go through it, so a rank-3
+/// graph is not read two ways by the route either.
+pub(crate) fn rank3_geometry(
+    graph: &rlx_ir::Graph,
+    q_id: rlx_ir::NodeId,
+    k_id: rlx_ir::NodeId,
+    heads: u32,
+    head_dim: u32,
+) -> Result<(u32, u32, u32), AttentionRefusal> {
+    let dim = |id: rlx_ir::NodeId, i: usize| -> Result<u32, AttentionRefusal> {
+        static_dim(graph.node(id).shape.dim(i)).ok_or(AttentionRefusal::NonStatic)
+    };
+    let (leading, seq_q, seq_k) = (dim(q_id, 0)?, dim(q_id, 1)?, dim(k_id, 1)?);
+    let last = dim(q_id, 2)?;
+    if last == heads * head_dim {
+        // [B, S, H·D] — the leading dim is the batch.
+        return Ok((leading, seq_q, seq_k));
+    }
+    if !leading.is_multiple_of(heads) {
+        // [B·H, S, D] with a leading dim that is not B·H.
+        return Err(AttentionRefusal::Rank3Leading {
+            leading: leading as usize,
+            heads: heads as usize,
+            head_dim: head_dim as usize,
+            last: last as usize,
+        });
+    }
+    Ok((leading / heads, seq_q, seq_k))
 }
 
 /// The route's geometry for one node of a graph, or why the node has none.
@@ -442,7 +676,8 @@ impl std::fmt::Display for AttentionRefusal {
 /// derive geometry for gets the refusal that names the dim. The refusals are
 /// what the lowering's own arm panics with — there is no plan with no geometry
 /// for it to read instead, so a shape this cannot plan is loud rather than a
-/// step the kernel early-returns from, the over-ceiling head width included.
+/// step the kernel early-returns from, the over-ceiling head width and the
+/// rank-4 layout nothing declares included.
 pub(crate) fn plan_attention(
     graph: &rlx_ir::Graph,
     node: &rlx_ir::Node,
@@ -507,29 +742,15 @@ pub(crate) fn plan_attention(
         });
     }
     let dim = |d: rlx_ir::shape::Dim| d.unwrap_static() as u32;
-    // Rank-4 resolves through the shared geometry; rank-3 has the two layouts
-    // `attention_geom` cannot tell apart, told apart here by the last dim.
-    let geom = rlx_ir::attention_geom(q_ir, k_ir, *num_heads, *head_dim);
-    let bhsd = geom.bhsd;
-    let (batch, seq_q, seq_k) = match q_ir.rank() {
-        4 => (geom.batch as u32, geom.seq_q as u32, geom.seq_k as u32),
+    // Rank-4's layout is the graph's to declare and not its extents' — see
+    // [`rank4_geometry`], which is also what the backward arm reads. Rank-3 has
+    // its own two spellings, told apart below by the last dim (the packed
+    // `[B, S, H·D]` feature width against `[B·H, S, D]`).
+    let (batch, seq_q, seq_k, bhsd) = match q_ir.rank() {
+        4 => rank4_geometry(graph, q_id, k_id, h, hd)?,
         _ => {
-            let (last, leading) = (dim(q_ir.dim(2)), dim(q_ir.dim(0)));
-            let (seq_q, seq_k) = (dim(q_ir.dim(1)), dim(k_ir.dim(1)));
-            if last == h * hd {
-                // [B, S, H·D] — leading is the batch.
-                (leading, seq_q, seq_k)
-            } else if !leading.is_multiple_of(h) {
-                // [B·H, S, D] with a leading dim that is not B·H.
-                return Err(AttentionRefusal::Rank3Leading {
-                    leading: leading as usize,
-                    heads: h as usize,
-                    head_dim: *head_dim,
-                    last: last as usize,
-                });
-            } else {
-                (leading / h, seq_q, seq_k)
-            }
+            let (batch, seq_q, seq_k) = rank3_geometry(graph, q_id, k_id, h, hd)?;
+            (batch, seq_q, seq_k, false)
         }
     };
     let (mask_kind_id, window) = match mask_kind {
@@ -671,7 +892,7 @@ pub(crate) fn plan_attention(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rlx_ir::{DType, Graph, Op, Shape};
+    use rlx_ir::{DType, Dim, Graph, Op, Shape};
 
     /// The measured shape family: 8 heads of head_dim 64, both widths clear of
     /// the ceiling, a single batch, and the scratch computed from the same
@@ -723,6 +944,139 @@ mod tests {
             Shape::new(out, DType::F32),
         );
         plan_attention(&g, g.node(attn))
+    }
+
+    /// How a rank-4 operand reaches the step: as a bare input (nothing declares
+    /// its layout), unrolled out of a rank-3 packed `[B, S, H·D]` projection, or
+    /// out of the packed QKV parent's axis-2 narrow — the spellings this tree
+    /// builds attention operands with — or swapped 1↔2 out of the unrolled one.
+    #[derive(Clone, Copy)]
+    enum Presented {
+        Bare,
+        Unrolled,
+        Packed,
+        Swapped,
+    }
+
+    /// One rank-4 attention step of `rows` query rows over `lk` keys presented
+    /// the way `how` says. The operand's extents are `[B, rows, H, D]` /
+    /// `[B, lk, H, D]` under both readings, so at `rows == H` the extents fit
+    /// either one and only the producers tell them apart. A packed QKV parent
+    /// carries one sequence extent for all three operands, so that spelling is a
+    /// self-attention step (`rows` is both).
+    fn presented_graph(
+        b: usize,
+        rows: usize,
+        lk: usize,
+        nh: usize,
+        hd: usize,
+        how: Presented,
+    ) -> (Graph, rlx_ir::NodeId) {
+        let f = DType::F32;
+        let mut g = Graph::new("attention_presented");
+        let dim = nh * hd;
+        let unroll = |g: &mut Graph, name: &str, seq: usize| -> rlx_ir::NodeId {
+            let packed = g.input(name, Shape::new(&[b, seq, dim], f));
+            g.add_node(
+                Op::Reshape {
+                    new_shape: vec![b as i64, seq as i64, nh as i64, hd as i64],
+                },
+                vec![packed],
+                Shape::new(&[b, seq, nh, hd], f),
+            )
+        };
+        let (q, k, v, out) = match how {
+            Presented::Bare => (
+                g.input("q", Shape::new(&[b, rows, nh, hd], f)),
+                g.input("k", Shape::new(&[b, lk, nh, hd], f)),
+                g.input("v", Shape::new(&[b, lk, nh, hd], f)),
+                Shape::new(&[b, rows, nh, hd], f),
+            ),
+            Presented::Unrolled => (
+                unroll(&mut g, "q", rows),
+                unroll(&mut g, "k", lk),
+                unroll(&mut g, "v", lk),
+                Shape::new(&[b, rows, nh, hd], f),
+            ),
+            Presented::Swapped => {
+                let swap = |g: &mut Graph, name: &str, seq: usize| -> rlx_ir::NodeId {
+                    let unrolled = unroll(g, name, seq);
+                    g.add_node(
+                        Op::Transpose {
+                            perm: vec![0, 2, 1, 3],
+                        },
+                        vec![unrolled],
+                        Shape::new(&[b, nh, seq, hd], f),
+                    )
+                };
+                (
+                    swap(&mut g, "q", rows),
+                    swap(&mut g, "k", lk),
+                    swap(&mut g, "v", lk),
+                    Shape::new(&[b, nh, rows, hd], f),
+                )
+            }
+            Presented::Packed => {
+                let parent = g.input("qkv", Shape::new(&[b, rows, 3, nh, hd], f));
+                let narrow = |g: &mut Graph, start: usize| -> rlx_ir::NodeId {
+                    let view = g.add_node(
+                        Op::Narrow {
+                            axis: 2,
+                            start,
+                            len: 1,
+                        },
+                        vec![parent],
+                        Shape::new(&[b, rows, 1, nh, hd], f),
+                    );
+                    g.add_node(
+                        Op::Reshape {
+                            new_shape: vec![b as i64, rows as i64, nh as i64, hd as i64],
+                        },
+                        vec![view],
+                        Shape::new(&[b, rows, nh, hd], f),
+                    )
+                };
+                (
+                    narrow(&mut g, 0),
+                    narrow(&mut g, 1),
+                    narrow(&mut g, 2),
+                    Shape::new(&[b, rows, nh, hd], f),
+                )
+            }
+        };
+        let attn = g.add_node(
+            Op::Attention {
+                num_heads: nh,
+                head_dim: hd,
+                v_head_dim: None,
+                mask_kind: MaskKind::None,
+                score_scale: None,
+                attn_logit_softcap: None,
+            },
+            vec![q, k, v],
+            out,
+        );
+        (g, attn)
+    }
+
+    /// [`presented_graph`], and the plan its own graph derives.
+    fn presented(
+        b: usize,
+        rows: usize,
+        lk: usize,
+        nh: usize,
+        hd: usize,
+        how: Presented,
+    ) -> Result<AttentionPlan, AttentionRefusal> {
+        let (g, attn) = presented_graph(b, rows, lk, nh, hd, how);
+        plan_attention(&g, g.node(attn))
+    }
+
+    /// A test that reads the packed-parent path needs the reading it is gated by
+    /// on: it is the default, and this forces it — `set("0")` overrides an exported
+    /// `RLX_WGPU_NO_PACKED_BSHD_ATTN`, where `unset` would fall back to it.
+    fn packed_parent_reading_on() {
+        rlx_ir::env::set("RLX_WGPU_NO_PACKED_BSHD_ATTN", "0");
     }
 
     /// The floor's two sides and the measured bracket it has to fall inside: the
@@ -1048,10 +1402,11 @@ mod tests {
         assert_eq!(gqa.regions.v, 8 * 8 * 64);
         assert_eq!((gqa.k_b, gqa.k_h, gqa.k_s), (2 * 64 * 8, 8 * 64, 64));
 
-        // Rank-4 [B, S, H, D] (the CPU / EEG-DINO convention), told from BHSD by
-        // its second dim: every tile is strided — seq stride `H·D`, not the head
-        // width — so all three operand regions are emitted on a step the floor
-        // admits.
+        // Rank-4 [B, S, H, D] (the CPU / EEG-DINO convention), on a shape whose
+        // own extents settle which way it runs — axis 2 is the 8 heads, axis 1 is
+        // 32 rows, and no operand's production is consulted. Every tile is strided
+        // — seq stride `H·D`, not the head width — so all three operand regions
+        // are emitted on a step the floor admits.
         let bshd = plan_of(
             &[1, 32, 8, 64],
             &[1, 32, 8, 64],
@@ -1072,6 +1427,7 @@ mod tests {
 
         // Packed QKV: Q/K/V are axis-2 narrows of one [B, S, 3, H, D] parent,
         // read through the parent's own strides so the KV-head count is Q's.
+        packed_parent_reading_on();
         let mut packed = Graph::new("packed_qkv");
         let parent = packed.input("fmb", Shape::new(&[1, 4, 3, 2, 8], DType::F32));
         let shape_5 = Shape::new(&[1, 4, 1, 2, 8], DType::F32);
@@ -1305,5 +1661,328 @@ mod tests {
         )
         .expect("a one-batch plan");
         assert!(served.decompose);
+    }
+
+    /// The core pin: an operand whose first two axes are both the head count fits
+    /// either reading, so the reading is its graph's and not its extents' — the
+    /// key length comes off the row axis even where the head axis sits on it —
+    /// and a presentation that declares neither is refused by name rather than
+    /// read off the head axis.
+    #[test]
+    fn a_coincident_extent_is_read_the_way_the_graph_lays_the_operand_out() {
+        const NH: usize = 16;
+        const HD: usize = 64;
+        const ROWS: usize = 16;
+        const LK: usize = 40;
+        let (nh, hd) = (NH as u32, HD as u32);
+
+        // Rows-first, unrolled: the rank-3 packed projection reshaped. K's axis 2
+        // is the head count and its axis 1 the key count, and `seq_k` is read off
+        // axis 1 — 40, not 16 — which is what a reading taken from the extents
+        // would have got wrong.
+        let unrolled =
+            presented(1, ROWS, LK, NH, HD, Presented::Unrolled).expect("a declared plan");
+        assert_eq!(
+            (unrolled.batch, unrolled.seq_q, unrolled.seq_k),
+            (1, 16, 40)
+        );
+        assert_eq!(
+            unrolled.nkv, nh,
+            "the KV heads are K's own, not the key count"
+        );
+        assert_eq!(
+            (unrolled.q_s, unrolled.q_h, unrolled.o_s),
+            (nh * hd, hd, nh * hd),
+            "a rows-first operand's sequence stride is the whole head width"
+        );
+        assert!(!unrolled.q_dense && !unrolled.v_dense && !unrolled.out_dense);
+        assert_eq!(unrolled.packed_parent, None);
+
+        // The packed spelling the bodies build: one `[B, S, 3, H, D]` parent whose
+        // axis-2 narrows are unrolled per operand, at the self-attention length
+        // that spelling has. Its axes 1 and 2 are the head count twice over, so
+        // the extents fit either reading here too — the parent under the reading
+        // its own strides give.
+        packed_parent_reading_on();
+        let packed = presented(1, ROWS, ROWS, NH, HD, Presented::Packed).expect("a packed plan");
+        assert!(packed.packed_parent.is_some(), "the packed QKV parent");
+        assert_eq!(
+            (packed.batch, packed.seq_q, packed.seq_k, packed.nkv),
+            (1, 16, 16, 16)
+        );
+        // …and its strides are the parent's own: one head width per pack slot
+        // along the sequence, `3 · H · D`, and the head width across it.
+        assert_eq!(
+            (packed.q_s, packed.k_s, packed.v_s, packed.q_h),
+            (3 * nh * hd, 3 * nh * hd, 3 * nh * hd, hd)
+        );
+        // The output is not packed: `H · D` along the sequence, which is the
+        // number the extents-only reading flips to the head width.
+        assert_eq!(packed.o_s, nh * hd);
+        assert!(!packed.q_dense && !packed.v_dense && !packed.out_dense);
+
+        // The other direction: the unrolled operand swapped 1↔2. Its extents are
+        // the same numbers, so this is the case that would come out rows-first if
+        // the graph were not read — and the swap is what makes it heads-first,
+        // read rather than refused.
+        let swapped = presented(1, ROWS, LK, NH, HD, Presented::Swapped)
+            .expect("a declared heads-first operand must be read, not refused");
+        assert_eq!((swapped.batch, swapped.seq_q, swapped.seq_k), (1, 16, 40));
+        assert_eq!(
+            (swapped.q_s, swapped.q_h, swapped.o_s),
+            (hd, ROWS as u32 * hd, hd),
+            "the head axis is axis 1, so the head width is the sequence stride"
+        );
+        assert!(swapped.q_dense && swapped.v_dense && swapped.out_dense);
+        assert_eq!(swapped.nkv, nh);
+
+        // Nothing declares this one: a bare rank-4 input at the same extents has
+        // no plan at all, and the refusal names the head count — which is both of
+        // the operand's first two extents there — rather than reading a length off
+        // it.
+        let bare = presented(1, ROWS, LK, NH, HD, Presented::Bare).unwrap_err();
+        assert_eq!(
+            bare,
+            AttentionRefusal::AmbiguousRank4 {
+                heads: 16,
+                head_dim: 64,
+            }
+        );
+        // The message names the ambiguity, the extent both readings fit and the two
+        // spellings that would declare one — the parts a caller could act on, not
+        // the whole sentence.
+        let msg = bare.to_string();
+        assert!(msg.contains("rank-4 layout is ambiguous"), "{msg}");
+        assert!(msg.contains("axis 1 and axis 2 are both 16"), "{msg}");
+        assert!(msg.contains("swap axes 1 and 2"), "{msg}");
+    }
+
+    /// The coincidence is not a property of one head count: sixteen is the count
+    /// the measured band compiles at, and this is the rule the pin above reads, at
+    /// 4, 8, 16 and 32 heads.
+    #[test]
+    fn the_coincident_extent_is_not_a_property_of_one_head_count() {
+        const HD: usize = 64;
+        for nh in [4usize, 8, 16, 32] {
+            let lk = nh + 8;
+            let plan = presented(1, nh, lk, nh, HD, Presented::Unrolled).expect("a declared plan");
+            assert_eq!(
+                (plan.seq_q, plan.seq_k, plan.nkv),
+                (nh as u32, lk as u32, nh as u32),
+                "heads={nh}: the reading is the reshape's, so the key count is K's axis 1"
+            );
+            assert_eq!((plan.q_s, plan.q_h), (nh as u32 * HD as u32, HD as u32));
+            assert!(presented(1, nh, lk, nh, HD, Presented::Bare).is_err());
+        }
+    }
+
+    /// The other side of the rule: where the extents settle the layout the graph
+    /// is not consulted at all — a bare input and a declared operand of the same
+    /// shape derive one plan, at 13 rows and at 32 — and the layout is a tie-break
+    /// rather than a second reading, so no number moves off the shape-only answer.
+    #[test]
+    fn the_extents_still_settle_the_layout_where_they_can() {
+        const NH: usize = 16;
+        const HD: usize = 64;
+        const LK: usize = 40;
+        for rows in [13usize, 32] {
+            let bare = presented(1, rows, LK, NH, HD, Presented::Bare).expect("a plan");
+            let unrolled = presented(1, rows, LK, NH, HD, Presented::Unrolled).expect("a plan");
+            // Every field a layout can move, so the two plans are one plan.
+            assert_eq!(
+                (bare.batch, bare.seq_q, bare.seq_k, bare.nkv),
+                (unrolled.batch, unrolled.seq_q, unrolled.seq_k, unrolled.nkv),
+                "rows={rows} != heads={NH}: the extents settle the layout, so the graph's own \
+                 declaration cannot move a plan"
+            );
+            assert_eq!(
+                (
+                    bare.q_b,
+                    bare.q_h,
+                    bare.q_s,
+                    bare.o_s,
+                    bare.regions,
+                    bare.decompose
+                ),
+                (
+                    unrolled.q_b,
+                    unrolled.q_h,
+                    unrolled.q_s,
+                    unrolled.o_s,
+                    unrolled.regions,
+                    unrolled.decompose
+                ),
+                "rows={rows}: one plan, and not just the same extents"
+            );
+            // The numbers are the shape-only ones: rows-first strides and the key
+            // count off K's axis 1.
+            assert_eq!(bare.seq_k, LK as u32);
+            assert_eq!(
+                (bare.q_s, bare.q_h, bare.o_s),
+                (NH as u32 * HD as u32, HD as u32, NH as u32 * HD as u32)
+            );
+            // This operand is `[b, nh, rows, hd]`: heads-first is the only reading
+            // that fits it, so it is read that way at both row counts.
+            let swapped =
+                presented(1, rows, LK, NH, HD, Presented::Swapped).expect("a heads-first plan");
+            assert_eq!((swapped.seq_q, swapped.seq_k), (rows as u32, LK as u32));
+            assert_eq!(
+                (swapped.q_s, swapped.q_h),
+                (HD as u32, rows as u32 * HD as u32)
+            );
+        }
+    }
+
+    /// The walk reads the producing nodes' dims as well as the operand's, and Q's
+    /// own axes are read by both arms — the backward one without the plan's
+    /// staticness guard — so an unpinned dim is refused by name wherever it is met.
+    #[test]
+    fn a_dynamic_dim_on_the_way_into_a_rank4_operand_is_refused_by_name() {
+        let f = DType::F32;
+        // Q static at the coincident extent over a projection whose batch the
+        // graph has not pinned: the plan's own guards pass, so the walk is what
+        // meets the dynamic dim.
+        let mut g = Graph::new("attention_dynamic_producer");
+        let packed = g.input(
+            "qp",
+            Shape::from_dims(&[Dim::Dynamic(0), Dim::Static(16), Dim::Static(1024)], f),
+        );
+        let q = g.add_node(
+            Op::Reshape {
+                new_shape: vec![1, 16, 16, 64],
+            },
+            vec![packed],
+            Shape::new(&[1, 16, 16, 64], f),
+        );
+        let k = g.input("k", Shape::new(&[1, 40, 16, 64], f));
+        let v = g.input("v", Shape::new(&[1, 40, 16, 64], f));
+        let node = g.add_node(
+            Op::Attention {
+                num_heads: 16,
+                head_dim: 64,
+                v_head_dim: None,
+                mask_kind: MaskKind::None,
+                score_scale: None,
+                attn_logit_softcap: None,
+            },
+            vec![q, k, v],
+            Shape::new(&[1, 16, 16, 64], f),
+        );
+        assert_eq!(
+            plan_attention(&g, g.node(node)).unwrap_err(),
+            AttentionRefusal::NonStatic
+        );
+
+        // …and Q's own axes, which the backward arm reads without that guard.
+        let mut g = Graph::new("attention_dynamic_q");
+        let q = g.input(
+            "q",
+            Shape::from_dims(
+                &[
+                    Dim::Static(1),
+                    Dim::Dynamic(0),
+                    Dim::Static(16),
+                    Dim::Static(64),
+                ],
+                f,
+            ),
+        );
+        let k = g.input("k", Shape::new(&[1, 40, 16, 64], f));
+        assert_eq!(
+            rank4_geometry(&g, q, k, 16, 64).unwrap_err(),
+            AttentionRefusal::NonStatic,
+            "the arm reads the derivation directly, so the dim it cannot read is a refusal and \
+             not a panic"
+        );
+    }
+
+    /// The route's two arms read one derivation, so a step whose forward reads a
+    /// graph rows-first cannot have a backward that reads its head axis. Both
+    /// entry points are pinned here, device-free, on the graphs the plan above
+    /// derives from: the rank-4 geometry the arm's rank-4 branch reads, and the
+    /// rank-3 geometry its rank-3 branch reads — the spelling whose own batch and
+    /// key length must survive it. What the arm does with them is the device pin's
+    /// (`tests/attention_rows_route.rs`), which shows a step and its gradients
+    /// computing one graph's numbers in both spellings.
+    #[test]
+    fn the_backward_arm_reads_the_same_layout_derivation() {
+        let (g, attn) = presented_graph(1, 16, 40, 16, 64, Presented::Unrolled);
+        let inputs = g.node(attn).inputs.clone();
+        assert_eq!(
+            rank4_geometry(&g, inputs[0], inputs[1], 16, 64),
+            Ok((1, 16, 40, false)),
+            "the arm's rank-4 branch reads the reshape: the key length is the key count off K's \
+             axis 1, 40, and not K's head axis' 16"
+        );
+        let (bare, attn) = presented_graph(1, 16, 40, 16, 64, Presented::Bare);
+        let inputs = bare.node(attn).inputs.clone();
+        assert_eq!(
+            rank4_geometry(&bare, inputs[0], inputs[1], 16, 64),
+            Err(AttentionRefusal::AmbiguousRank4 {
+                heads: 16,
+                head_dim: 64
+            }),
+            "and the residue the graph leaves open is refused by the arm too"
+        );
+
+        // The arm's rank-3 branch, on the two rank-3 spellings: the packed
+        // `[B, S, H·D]` projection, whose leading dim is the batch, and the
+        // `[B·H, S, D]` one, whose leading dim is not.
+        let f = DType::F32;
+        let mut packed = Graph::new("attention_rank3_packed");
+        let q = packed.input("q", Shape::new(&[1, 16, 16 * 64], f));
+        let k = packed.input("k", Shape::new(&[1, 40, 16 * 64], f));
+        assert_eq!(
+            rank3_geometry(&packed, q, k, 16, 64),
+            Ok((1, 16, 40)),
+            "a batch read off the head axis is the batch divided away: 1, not 1/16"
+        );
+        let mut bhsd = Graph::new("attention_rank3_bhsd");
+        let q = bhsd.input("q", Shape::new(&[16, 16, 64], f));
+        let k = bhsd.input("k", Shape::new(&[16, 40, 64], f));
+        assert_eq!(
+            rank3_geometry(&bhsd, q, k, 16, 64),
+            Ok((1, 16, 40)),
+            "the `[B·H, S, D]` spelling is the leading dim over the head count"
+        );
+    }
+
+    /// The walk's unroll arm reads a source's last-but-one extent, so it treats
+    /// rank-1 to rank-3 sources as the packed spellings: a rankless one has no
+    /// axis to unroll, and is refused by name rather than indexed out of its
+    /// shape.
+    #[test]
+    fn a_rankless_packed_source_is_refused_rather_than_indexed() {
+        let f = DType::F32;
+        let mut g = Graph::new("attention_rankless_source");
+        let scalar = g.input("q", Shape::new(&[], f));
+        let q = g.add_node(
+            Op::Reshape {
+                new_shape: vec![1, 16, 16, 64],
+            },
+            vec![scalar],
+            Shape::new(&[1, 16, 16, 64], f),
+        );
+        let k = g.input("k", Shape::new(&[1, 40, 16, 64], f));
+        let v = g.input("v", Shape::new(&[1, 40, 16, 64], f));
+        let node = g.add_node(
+            Op::Attention {
+                num_heads: 16,
+                head_dim: 64,
+                v_head_dim: None,
+                mask_kind: MaskKind::None,
+                score_scale: None,
+                attn_logit_softcap: None,
+            },
+            vec![q, k, v],
+            Shape::new(&[1, 16, 16, 64], f),
+        );
+        assert_eq!(
+            plan_attention(&g, g.node(node)).unwrap_err(),
+            AttentionRefusal::AmbiguousRank4 {
+                heads: 16,
+                head_dim: 64
+            }
+        );
     }
 }

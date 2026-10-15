@@ -4971,25 +4971,32 @@ pub(crate) fn compile_static_inner(
                 let q_shape = graph.node(q_id).shape.dims();
                 let k_shape = graph.node(k_id).shape.dims();
                 let hd = *head_dim as u32;
-                let q_ir = graph.node(q_id).shape.clone();
-                let k_ir = graph.node(k_id).shape.clone();
-                let geom = rlx_ir::attention_geom(&q_ir, &k_ir, *num_heads, *head_dim);
-                let bhsd = geom.bhsd;
-                let (batch, heads, seq_q, seq_k) = match q_shape.len() {
-                    4 => (
-                        geom.batch as u32,
-                        geom.heads as u32,
-                        geom.seq_q as u32,
-                        geom.seq_k as u32,
-                    ),
-                    3 => {
-                        let h = q_shape[2].unwrap_static() as u32 / hd;
-                        (
-                            q_shape[0].unwrap_static() as u32 / h,
-                            h,
-                            q_shape[1].unwrap_static() as u32,
-                            k_shape[1].unwrap_static() as u32,
+                let (batch, heads, seq_q, seq_k, bhsd) = match q_shape.len() {
+                    4 => {
+                        // The forward arm's own reading of a rank-4 operand — one
+                        // derivation, so the route cannot read a graph two ways.
+                        let (batch, seq_q, seq_k, bhsd) = attention_route::rank4_geometry(
+                            &graph,
+                            q_id,
+                            k_id,
+                            *num_heads as u32,
+                            hd,
                         )
+                        .unwrap_or_else(|refusal| panic!("{refusal}"));
+                        (batch, *num_heads as u32, seq_q, seq_k, bhsd)
+                    }
+                    3 => {
+                        // The forward plan's own rank-3 reading — one derivation, so
+                        // the route cannot read a rank-3 graph two ways either.
+                        let (batch, seq_q, seq_k) = attention_route::rank3_geometry(
+                            &graph,
+                            q_id,
+                            k_id,
+                            *num_heads as u32,
+                            hd,
+                        )
+                        .unwrap_or_else(|refusal| panic!("{refusal}"));
+                        (batch, *num_heads as u32, seq_q, seq_k, false)
                     }
                     other => {
                         panic!("rlx-wgpu AttentionBackward: only rank-3/4 Q,K,V (got rank {other})")

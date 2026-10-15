@@ -14,6 +14,12 @@
 //! strided `[B, S, H, D]` one, grouped KV heads (whose head axis is replicated on
 //! the way into Kᵀ and V′) and an asymmetric value width.
 //!
+//! Which of the two layouts a rank-4 operand is *read* in is the graph's to
+//! declare and not its extents': at the extent where the two presentations are
+//! shape-identical, one body spelled both ways computes the same numbers. The
+//! operand nothing declares is refused by name rather than read off the head
+//! axis, which `backend::attention_route`'s own unit tests pin device-free.
+//!
 //! One test compares the two arrangements directly. The route is chosen
 //! from the step's own query-row count, so the pair is one per-(batch, head)
 //! problem twice — the same prefill computed by the fused kernel and by the
@@ -117,11 +123,13 @@ fn chain_bhsd(
     g
 }
 
-/// Rank-4 `[B, S, H, D]` MHA (the CPU / EEG-DINO convention, told from
-/// `[B, H, S, D]` by its second dim): every operand's per-`(batch, head)` tile is
-/// strided — its `seq_stride` is `H·D`, not the head width — so the route
-/// compacts Q, V and the output as well as Kᵀ. A caller must keep `rows != nh`,
-/// or the second dim reads as the head axis.
+/// Rank-4 `[B, S, H, D]` MHA (the CPU / EEG-DINO convention): every operand's
+/// per-`(batch, head)` tile is strided — its `seq_stride` is `H·D`, not the head
+/// width — so the route compacts Q, V and the output as well as Kᵀ. The operands
+/// are bare inputs, so their own extents are all there is to settle the layout
+/// and a caller must keep `rows != nh`: at `rows == nh` the two readings are
+/// shape-identical and the step is refused by name. A rows-first operand at that
+/// extent has to be built from the projection ([`unrolled_rank4`] below).
 fn chain_bshd(b: usize, rows: usize, lk: usize, nh: usize, hd: usize, kind: MaskKind) -> Graph {
     let f = DType::F32;
     let mut g = Graph::new("attn_rows_bshd");
@@ -242,6 +250,13 @@ fn run_case(
 /// max-abs against the CPU backend, not a relative one, so a diffuse softmax
 /// leaving the output small cannot loosen it.
 const ATTENTION_BAR: f32 = 1e-6;
+
+/// The bar the backward step's gradients are held to against the CPU backend.
+/// They are sums over the keys of products of exponentials rather than one
+/// softmax, so the two backends' own summation orders separate further than a
+/// forward's does — measured at ~1e-6 on these shapes, against the ~1e0 the one
+/// that used to come back as zeros separates by.
+const BACKWARD_BAR: f32 = 1e-5;
 
 /// A prefill-shaped step — `rows` query rows over `lk` keys — asserted to take
 /// the dense arrangement and to reach the CPU reference.
@@ -815,4 +830,370 @@ fn a_param_mask_takes_the_route_and_matches_cpu() {
         "a parameter-carried mask must take the dense arrangement"
     );
     assert!(d < ATTENTION_BAR, "parameter mask: max_abs {d} vs CPU");
+}
+
+/// Rank-4 `[B, S, H, D]` MHA spelled the way the bodies spell it: each rank-3
+/// `[B, S, H·D]` projection unrolled into per-head axes. At `rows == nh` its
+/// first two axes are both the head count — the two readings are then
+/// shape-identical — so the reshape is the only thing that says which way round
+/// the operand runs.
+fn unrolled_rank4(b: usize, rows: usize, lk: usize, nh: usize, hd: usize) -> Graph {
+    let f = DType::F32;
+    let dim = nh * hd;
+    let mut g = Graph::new("attn_rows_unrolled");
+    let unroll = |g: &mut Graph, name: &str, seq: usize| -> rlx_ir::NodeId {
+        let packed = g.input(name, Shape::new(&[b, seq, dim], f));
+        g.add_node(
+            Op::Reshape {
+                new_shape: vec![b as i64, seq as i64, nh as i64, hd as i64],
+            },
+            vec![packed],
+            Shape::new(&[b, seq, nh, hd], f),
+        )
+    };
+    let (q, k, v) = (
+        unroll(&mut g, "q", rows),
+        unroll(&mut g, "k", lk),
+        unroll(&mut g, "v", lk),
+    );
+    let y = g.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: hd,
+            v_head_dim: None,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q, k, v],
+        Shape::new(&[b, rows, nh, hd], f),
+    );
+    g.set_outputs(vec![y]);
+    g
+}
+
+/// The packed QKV spelling the decoder bodies build, at a self-attention shape:
+/// one `[B, S, 3·H·D]` input viewed as `[B, S, 3, H, D]`, narrowed on axis 2 per
+/// operand and each narrow unrolled into `[B, S, H, D]`. Its sequence is the
+/// query rows as well as the keys, so a packed step is one `rows` over all three.
+fn packed_rank4(b: usize, rows: usize, nh: usize, hd: usize) -> Graph {
+    let f = DType::F32;
+    let dim = nh * hd;
+    let mut g = Graph::new("attn_rows_packed_rank4");
+    let packed = g.input("qkv", Shape::new(&[b, rows, 3 * dim], f));
+    let view = g.add_node(
+        Op::Reshape {
+            new_shape: vec![b as i64, rows as i64, 3, nh as i64, hd as i64],
+        },
+        vec![packed],
+        Shape::new(&[b, rows, 3, nh, hd], f),
+    );
+    let operand = |g: &mut Graph, start: usize| -> rlx_ir::NodeId {
+        let narrow = g.add_node(
+            Op::Narrow {
+                axis: 2,
+                start,
+                len: 1,
+            },
+            vec![view],
+            Shape::new(&[b, rows, 1, nh, hd], f),
+        );
+        g.add_node(
+            Op::Reshape {
+                new_shape: vec![b as i64, rows as i64, nh as i64, hd as i64],
+            },
+            vec![narrow],
+            Shape::new(&[b, rows, nh, hd], f),
+        )
+    };
+    let (q, k, v) = (operand(&mut g, 0), operand(&mut g, 1), operand(&mut g, 2));
+    let y = g.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: hd,
+            v_head_dim: None,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q, k, v],
+        Shape::new(&[b, rows, nh, hd], f),
+    );
+    g.set_outputs(vec![y]);
+    g
+}
+
+/// The rank-3 reading of that same `[B, S, 3·H·D]` input: the feature axis
+/// narrowed per operand directly, which is the spelling [`chain`] takes.
+fn packed_rank3(b: usize, rows: usize, nh: usize, hd: usize) -> Graph {
+    let f = DType::F32;
+    let dim = nh * hd;
+    let mut g = Graph::new("attn_rows_packed_rank3");
+    let packed = g.input("qkv", Shape::new(&[b, rows, 3 * dim], f));
+    let operand = |g: &mut Graph, start: usize| -> rlx_ir::NodeId {
+        g.add_node(
+            Op::Narrow {
+                axis: 2,
+                start,
+                len: dim,
+            },
+            vec![packed],
+            Shape::new(&[b, rows, dim], f),
+        )
+    };
+    let (q, k, v) = (
+        operand(&mut g, 0),
+        operand(&mut g, dim),
+        operand(&mut g, 2 * dim),
+    );
+    let y = g.add_node(
+        Op::Attention {
+            num_heads: nh,
+            head_dim: hd,
+            v_head_dim: None,
+            mask_kind: MaskKind::None,
+            score_scale: None,
+            attn_logit_softcap: None,
+        },
+        vec![q, k, v],
+        Shape::new(&[b, rows, dim], f),
+    );
+    g.set_outputs(vec![y]);
+    g
+}
+
+/// A backward step of the same shapes, spelled both ways one graph can spell it:
+/// the rank-3 `[B, S, H·D]` projections [`chain`] uses, or those projections
+/// unrolled into per-head axes — the rows-first rank-4 spelling. `dy` carries the
+/// step's output shape, and the three gradients are the graph's outputs.
+fn backward_graph(b: usize, rows: usize, lk: usize, nh: usize, hd: usize, unrolled: bool) -> Graph {
+    let f = DType::F32;
+    let dim = nh * hd;
+    let mut g = Graph::new("attn_rows_backward");
+    let unroll = |g: &mut Graph, name: &str, seq: usize| -> rlx_ir::NodeId {
+        let packed = g.input(name, Shape::new(&[b, seq, dim], f));
+        g.add_node(
+            Op::Reshape {
+                new_shape: vec![b as i64, seq as i64, nh as i64, hd as i64],
+            },
+            vec![packed],
+            Shape::new(&[b, seq, nh, hd], f),
+        )
+    };
+    let (q, k, v, dy) = if unrolled {
+        (
+            unroll(&mut g, "q", rows),
+            unroll(&mut g, "k", lk),
+            unroll(&mut g, "v", lk),
+            unroll(&mut g, "dy", rows),
+        )
+    } else {
+        (
+            g.input("q", Shape::new(&[b, rows, dim], f)),
+            g.input("k", Shape::new(&[b, lk, dim], f)),
+            g.input("v", Shape::new(&[b, lk, dim], f)),
+            g.input("dy", Shape::new(&[b, rows, dim], f)),
+        )
+    };
+    let (dq, dk, dv) = g.attention_backward_all(q, k, v, dy, nh, hd, MaskKind::None, None);
+    g.set_outputs(vec![dq, dk, dv]);
+    g
+}
+
+/// Rows-first `[B, S, H, D]` SDPA — `rows` query rows over `lk` keys, no mask —
+/// written out here rather than taken from the crate's own reference
+/// (`basic.rs::cpu_attention_bshd`), so that two paths misreading an operand
+/// alike cannot satisfy the pin between them. The scale is `1/sqrt(head_dim)`,
+/// the softmax rebases once per row on the row max, and V is read at the key's
+/// own row.
+fn cpu_attention_rows_first(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    b: usize,
+    rows: usize,
+    lk: usize,
+    nh: usize,
+    hd: usize,
+) -> Vec<f32> {
+    let hs = nh * hd;
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let mut out = vec![0.0f32; b * rows * hs];
+    for bi in 0..b {
+        for qi in 0..rows {
+            for hi in 0..nh {
+                let q_base = bi * rows * hs + qi * hs + hi * hd;
+                let mut m = f32::NEG_INFINITY;
+                let mut l = 0.0f32;
+                let mut acc = vec![0.0f32; hd];
+                for ki in 0..lk {
+                    let k_base = bi * lk * hs + ki * hs + hi * hd;
+                    let mut score = 0.0f32;
+                    for d in 0..hd {
+                        score += q[q_base + d] * k[k_base + d];
+                    }
+                    score *= scale;
+                    let m_new = m.max(score);
+                    let e_old = (m - m_new).exp();
+                    let e_cur = (score - m_new).exp();
+                    l = e_old * l + e_cur;
+                    let v_base = bi * lk * hs + ki * hs + hi * hd;
+                    for d in 0..hd {
+                        acc[d] = e_old * acc[d] + e_cur * v[v_base + d];
+                    }
+                    m = m_new;
+                }
+                let inv_l = 1.0 / l;
+                for d in 0..hd {
+                    out[q_base + d] = acc[d] * inv_l;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The coincident extent on the device: a body-shaped step whose Q carries the
+/// head count on axis 1 *and* axis 2, in the two presentations one graph can
+/// spell it in. Both must compute the same numbers — the reading is the graph's
+/// and not the extents' — and the rows-first one must reach a reference written
+/// in this file, so a pair of paths misreading the operand alike cannot pass
+/// between them. The head counts bracket the route's query-row floor: 16 rows at
+/// the body's 16 heads is the fused kernel, 32 at 32 the dense arrangement — a
+/// coincidence in both. The pair at 13 and at 32 rows over 16 heads is the guard
+/// that nothing moved where the extents settle the layout: before the graph was
+/// read, `rows = 16` alone came out `1.159` off its rank-3 spelling at these
+/// shapes, while 13 and 32 were bitwise equal.
+#[test]
+fn a_coincident_extent_computes_as_its_graph_lays_it_out() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
+        eprintln!("skip: wgpu unavailable");
+        return;
+    }
+    let _guard = route_lock();
+    const HD: usize = 64;
+    const LK: usize = 40;
+    for (nh, rows) in [(16usize, 13usize), (16, 16), (16, 32), (32, 32)] {
+        let dim = nh * HD;
+        // One data stream per step, read by both of its presentations, so the two
+        // carry identical operands.
+        let q = data(rows * dim, 0.011, false);
+        let k = data(LK * dim, 0.013, true);
+        let v = data(LK * dim, 0.017, false);
+        let inputs: Vec<(&str, &[f32])> = vec![("q", &q), ("k", &k), ("v", &v)];
+        let (rank3, rank3_routes, _) =
+            run_graph(chain(1, rows, LK, nh, HD, MaskKind::None).0, &inputs);
+        let (rank4, rank4_routes, _) = run_graph(unrolled_rank4(1, rows, LK, nh, HD), &inputs);
+        let cross = max_abs_diff(&rank4, &rank3);
+        // The other half of the pin: the rows-first reading is the one this file's
+        // own reference computes, not just the one the other spelling does.
+        let want = cpu_attention_rows_first(&q, &k, &v, 1, rows, LK, nh, HD);
+        let against_reference = max_abs_diff(&rank4, &want);
+        eprintln!(
+            "[rlx-attn-coincident] rows={rows} heads={nh} head_dim={HD} lk={LK} \
+             rank4={rank4_routes:?} rank3={rank3_routes:?} rank4-vs-rank3: max_abs={cross:.6e} \
+             rank4-vs-reference: max_abs={against_reference:.6e}"
+        );
+        assert_eq!(
+            rank4_routes, rank3_routes,
+            "rows={rows} heads={nh}: which way an operand is spelled must not move the step's \
+             arrangement"
+        );
+        assert!(
+            cross <= ATTENTION_BAR,
+            "rows={rows} heads={nh}: the rank-4 rows-first spelling must compute the rank-3 \
+             spelling's own numbers — the key length off the row axis, {LK}, and not the head \
+             axis' {nh}: max_abs {cross}"
+        );
+        assert!(
+            against_reference <= 1e-5,
+            "rows={rows} heads={nh}: the rows-first spelling against the reference written in \
+             this file: max_abs {against_reference}"
+        );
+    }
+
+    // The other spelling the bodies build — one packed QKV parent — at a
+    // self-attention shape where its axis 2 is the head count too, against the
+    // rank-3 narrows of the same input.
+    const NH: usize = 16;
+    let rows = NH;
+    let dim = NH * HD;
+    let packed = data(rows * 3 * dim, 0.007, false);
+    let inputs: Vec<(&str, &[f32])> = vec![("qkv", &packed)];
+    let (unrolled, unrolled_routes, _) = run_graph(packed_rank4(1, rows, NH, HD), &inputs);
+    let (narrowed, narrowed_routes, _) = run_graph(packed_rank3(1, rows, NH, HD), &inputs);
+    let d = max_abs_diff(&unrolled, &narrowed);
+    eprintln!(
+        "[rlx-attn-coincident-packed] rows={rows} heads={NH} head_dim={HD} \
+         rank4={unrolled_routes:?} rank3={narrowed_routes:?} max_abs={d:.6e}"
+    );
+    assert_eq!(
+        unrolled_routes, narrowed_routes,
+        "the packed step's two spellings must take one arrangement"
+    );
+    assert!(
+        d <= ATTENTION_BAR,
+        "the packed rank-4 spelling must compute the rank-3 narrows of the same parent's own \
+         numbers: max_abs {d}"
+    );
+}
+
+/// The backward half of the same step, on the device: a body-shaped step's three
+/// gradients, spelled the rank-3 `[B, S, H·D]` way and the rows-first rank-4 way,
+/// are one set of numbers — and neither spelling's own batch and key length may
+/// be lost on the way, which is how the rank-3 spelling once came back as zeros
+/// while the rank-4 spelling of the same graph was right. The rank-4 half is at
+/// the coincident extent, so it is also the backward movement of the forward pin
+/// above: the layout the graph declares, read by the arm that computes these
+/// gradients. The CPU backend's own rank-3 reading is the second oracle, rank-3
+/// being the spelling with no coincidence to settle.
+#[test]
+fn a_backward_step_computes_the_numbers_its_spelling_declares() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
+        eprintln!("skip: wgpu unavailable");
+        return;
+    }
+    let _guard = route_lock();
+    const NH: usize = 16;
+    const HD: usize = 64;
+    const ROWS: usize = 16;
+    const LK: usize = 40;
+    let dim = NH * HD;
+    let (q, k, v, dy) = (
+        data(ROWS * dim, 0.011, false),
+        data(LK * dim, 0.013, true),
+        data(LK * dim, 0.017, false),
+        data(ROWS * dim, 0.019, true),
+    );
+    let inputs: Vec<(&str, &[f32])> = vec![("q", &q), ("k", &k), ("v", &v), ("dy", &dy)];
+    let run = |device: Device, unrolled: bool| -> Vec<Vec<f32>> {
+        Session::new(device)
+            .compile(backward_graph(1, ROWS, LK, NH, HD, unrolled))
+            .run(&inputs)
+    };
+    let cpu = run(Device::Cpu, false);
+    let rank3 = run(Device::Gpu, false);
+    let rank4 = run(Device::Gpu, true);
+    for (i, name) in ["dq", "dk", "dv"].into_iter().enumerate() {
+        let (rank3, rank4, cpu) = (&rank3[i], &rank4[i], &cpu[i]);
+        let declared = max_abs_diff(rank3, rank4);
+        let against_cpu = max_abs_diff(rank3, cpu);
+        eprintln!(
+            "[rlx-attn-coincident-backward] {name} rows={ROWS} heads={NH} head_dim={HD} lk={LK} \
+             rank3-vs-rank4: max_abs={declared:.6e} rank3-vs-cpu: max_abs={against_cpu:.6e}"
+        );
+        assert!(
+            rank3.iter().any(|x| x.is_finite() && x.abs() > 1e-8),
+            "{name}: the step's own gradient, which is not all zeros"
+        );
+        assert!(
+            declared <= ATTENTION_BAR,
+            "{name}: the two spellings are one graph, so one set of numbers — the reading is the \
+             graph's and no extent of it is read off the head axis: max_abs {declared}"
+        );
+        assert!(
+            against_cpu <= BACKWARD_BAR,
+            "{name}: and the CPU backend's own rank-3 reading of it: max_abs {against_cpu}"
+        );
+    }
 }

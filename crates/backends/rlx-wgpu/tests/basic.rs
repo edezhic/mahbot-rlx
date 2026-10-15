@@ -1204,6 +1204,9 @@ fn wgpu_chain_attention_uses_packed_qkv_stride() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    // This hook pins the packed reading, which `set("0")` forces on against an
+    // exported `RLX_WGPU_NO_PACKED_BSHD_ATTN` — the knob's own opt-out.
+    rlx_ir::env::set("RLX_WGPU_NO_PACKED_BSHD_ATTN", "0");
     use rlx::prelude::*;
     // Below the dense route's floor (`backend::attention_route`): this hook
     // describes the fused kernel's packed reads, while a packed attention past
