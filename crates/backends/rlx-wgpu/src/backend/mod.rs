@@ -562,6 +562,19 @@ pub fn reset_device_counts() {
     DEVICE_WAITS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Where a named handle's row is, as `WgpuExecutable::locate_handle_row` answers
+/// it: the host mirror that still carries the rows, or the byte range of the
+/// arena slot they live in. One ladder for both readback paths, so a row resolved
+/// on its own and one resolved inside a step's batch cannot answer differently.
+enum LocatedRow<'a> {
+    /// The rows this executable holds are the host mirror's and no arena slot
+    /// serves the name: the answer itself, and no device work.
+    Mirror(&'a [f32]),
+    /// `len` bytes of the arena at `byte_off` — weight-tagged if the slot is in
+    /// the parked weight buffer.
+    Arena { byte_off: usize, len: usize },
+}
+
 impl WgpuExecutable {
     /// Resolve the deferred graph against bindings inferred from
     /// `inputs`, recompile the inner state if the bindings changed
@@ -1013,21 +1026,15 @@ impl WgpuExecutable {
         None
     }
 
-    /// Read one row (`row_inner` f32 elements at `row`) of a named handle,
-    /// resolving the slot exactly as [`Self::read_gpu_handle`] does — fed output
-    /// slot, else resident arena slot, else host mirror — but copying only that
-    /// row to the host, so the read costs the row and not the cache's capacity.
-    ///
-    /// `None` when the row is outside the extent the handle declares, and for a
-    /// zero-length row: a shortened answer could not be told apart from a
-    /// truncated one. A slot this executable no longer holds does not fall back
-    /// to bytes somewhere else — the answer is nothing.
-    pub fn read_gpu_handle_row(
+    /// Where a named handle's row is. Both readback paths ask this one ladder, so
+    /// a row resolved on its own and one resolved inside a step's batch cannot be
+    /// answered differently.
+    fn locate_handle_row(
         &self,
         name: &str,
         row: usize,
         row_inner: usize,
-    ) -> Option<Vec<f32>> {
+    ) -> Option<LocatedRow<'_>> {
         if row_inner == 0 {
             return None;
         }
@@ -1043,24 +1050,84 @@ impl WgpuExecutable {
             if end > declared {
                 return None;
             }
-            return Some(mirror[start..end].to_vec());
+            return Some(LocatedRow::Mirror(&mirror[start..end]));
         };
         if end > self.extent_elems(id) {
             return None;
         }
-        let dev = wgpu_device().expect("rlx-wgpu: device gone");
-        let off = self.arena.offset(id) + start * std::mem::size_of::<f32>();
-        // Only the row is copied, so the cost is the row's and not the slot's;
-        // `read_bytes_range` stitches a range that straddles a stripe.
-        let mut out = vec![0f32; row_inner];
-        let raw = self.arena.read_bytes_range(
-            &dev.device,
-            &dev.queue,
-            off,
-            row_inner * std::mem::size_of::<f32>(),
-        );
-        bytemuck::cast_slice_mut::<f32, u8>(&mut out).copy_from_slice(&raw);
-        Some(out)
+        Some(LocatedRow::Arena {
+            byte_off: self.arena.offset(id) + start * std::mem::size_of::<f32>(),
+            len: row_inner * std::mem::size_of::<f32>(),
+        })
+    }
+
+    /// Read one row (`row_inner` f32 elements at `row`) of a named handle,
+    /// resolving the slot exactly as [`Self::read_gpu_handle`] does — fed output
+    /// slot, else resident arena slot, else host mirror — but copying only that
+    /// row to the host, so the read costs the row and not the cache's capacity.
+    ///
+    /// `None` when the row is outside the extent the handle declares, and for a
+    /// zero-length row: a shortened answer could not be told apart from a
+    /// truncated one. A slot this executable no longer holds does not fall back
+    /// to bytes somewhere else — the answer is nothing.
+    pub fn read_gpu_handle_row(
+        &self,
+        name: &str,
+        row: usize,
+        row_inner: usize,
+    ) -> Option<Vec<f32>> {
+        self.read_gpu_handle_rows(&[(name, row, row_inner)])
+            .pop()
+            .flatten()
+    }
+
+    /// Read many rows in **one** device round trip, answering in request order:
+    /// everything a decode step consumes, at once. A step's rows span one handle
+    /// per layer per K/V, so a read that covers a single handle pays a submission
+    /// and a wait per row however small the rows are, while here the copies are
+    /// encoded together and answered by one map — the cost follows the rows asked
+    /// for, not how many handles they are spread across, nor how long the caches
+    /// are.
+    ///
+    /// Every answer holds exactly what [`Self::read_gpu_handle_row`] answers for
+    /// that request, and a `None` is that request's alone: a row that is not there
+    /// withholds nothing its neighbours asked for. A name whose rows are only in
+    /// this executable's host mirror is answered from it and asks nothing of the
+    /// device, so a call that asks for no arena row submits nothing at all.
+    pub fn read_gpu_handle_rows(&self, rows: &[(&str, usize, usize)]) -> Vec<Option<Vec<f32>>> {
+        let mut answers: Vec<Option<Vec<f32>>> = Vec::with_capacity(rows.len());
+        // The arena-backed requests in the order asked, each with the answer slot
+        // it fills.
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut slots: Vec<usize> = Vec::new();
+        for &(name, row, row_inner) in rows {
+            match self.locate_handle_row(name, row, row_inner) {
+                None => answers.push(None),
+                Some(LocatedRow::Mirror(mirror)) => answers.push(Some(mirror.to_vec())),
+                Some(LocatedRow::Arena { byte_off, len }) => {
+                    slots.push(answers.len());
+                    answers.push(None);
+                    ranges.push((byte_off, len));
+                }
+            }
+        }
+        if !ranges.is_empty() {
+            let dev = wgpu_device().expect("rlx-wgpu: device gone");
+            let read = self.arena.read_f32_ranges(&dev.device, &dev.queue, &ranges);
+            // One answer per range, or the slots left `None` below would read as
+            // requests the batch refused.
+            assert_eq!(
+                read.len(),
+                ranges.len(),
+                "rlx-wgpu: a row readback answered {} of {} ranges",
+                read.len(),
+                ranges.len()
+            );
+            for (&slot, row) in slots.iter().zip(read) {
+                answers[slot] = Some(row);
+            }
+        }
+        answers
     }
 
     /// The extent the node behind `id` declares, in f32 elements, never more than

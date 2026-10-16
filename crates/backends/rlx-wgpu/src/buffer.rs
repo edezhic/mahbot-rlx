@@ -2823,6 +2823,90 @@ pub fn read_f32_many_pooled(
     map_readback_f32(device, &staging_buf, &layout)
 }
 
+impl Arena {
+    /// Read several byte ranges of the arena with **one** submission and **one**
+    /// map: the batched form of [`Self::read_bytes_range`], whose per-range
+    /// staging buffer, submit and poll this folds into one of each, so the round
+    /// trip is the call's and not the range's. A range that crosses a physical
+    /// stripe is still stitched.
+    ///
+    /// Answers in the order asked, one `Vec<f32>` per `(byte offset, bytes)`,
+    /// each range a non-empty multiple of 4 — the copy and the decode both want
+    /// that. Offsets are passed through to [`Arena::resolve_w`], so a
+    /// weight-tagged one reads the weight buffer.
+    pub fn read_f32_ranges(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ranges: &[(usize, usize)],
+    ) -> Vec<Vec<f32>> {
+        if ranges.is_empty() {
+            return Vec::new();
+        }
+        // Regions laid out end to end, each padded to a 4-byte boundary: a
+        // `copy_buffer_to_buffer` offset must be COPY_BUFFER_ALIGNMENT-aligned.
+        let mut layout = ReadbackLayout {
+            regions: Vec::with_capacity(ranges.len()),
+            total_bytes: 0,
+        };
+        for &(_, len) in ranges {
+            let start = layout.total_bytes;
+            layout.total_bytes = align4(start + len);
+            layout.regions.push((start, len));
+        }
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rlx-wgpu range readback"),
+            size: layout.total_bytes as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rlx-wgpu range readback enc"),
+        });
+        for (&(off, len), &(dst, _)) in ranges.iter().zip(layout.regions.iter()) {
+            self.encode_range_copies(&mut enc, &staging, off, dst, len);
+        }
+        crate::backend::note_device_submit();
+        queue.submit(std::iter::once(enc.finish()));
+        map_readback_f32(device, &staging, &layout)
+    }
+
+    /// Append the copies `len` bytes at the arena byte offset `off` need into
+    /// `staging` at `dst`. Each *physical* stripe is a buffer of its own, so a
+    /// range that crosses one is more than one copy; a geometry addressed whole
+    /// — one buffer, however many bind-sized windows it spans — is one copy
+    /// whatever the range.
+    fn encode_range_copies(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        staging: &wgpu::Buffer,
+        off: usize,
+        dst: usize,
+        len: usize,
+    ) {
+        let weight = is_weight_off(off);
+        let stripe = if weight {
+            self.weight_shard_size
+        } else {
+            self.shard_size
+        };
+        let whole = stripe == 0 || (!weight && self.extra_shards.is_empty());
+        let mut done = 0usize;
+        while done < len {
+            let g = off + done;
+            let n = if whole {
+                len - done
+            } else {
+                let at = if weight { raw_weight_off(g) } else { g };
+                (len - done).min(stripe - (at % stripe))
+            };
+            let (src, local) = self.resolve_w(g);
+            enc.copy_buffer_to_buffer(src, local as u64, staging, (dst + done) as u64, n as u64);
+            done += n;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -328,6 +328,10 @@ name = "kernel_schedule_target"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "kv_row_readback_step_counts"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "kv_row_residency"
 required-features = ["backend-tests"]
 

@@ -400,10 +400,10 @@ mod capabilities_tests {
 /// `set_param` / `run` (and friends); everything else defaults to unsupported.
 ///
 /// The GPU-handle family — `bind_gpu_handle`, the two feed registrations,
-/// `feed_kv_row`, `read_gpu_handle_row` — is the one group whose answers say
-/// whether this executable really did what was asked. A wrapper that has not
-/// adopted that contract answers without consulting anything, so each backend
-/// owes its own route a gate on the answers it gives.
+/// `feed_kv_row`, `read_gpu_handle_row` / `read_gpu_handle_rows` — is the one
+/// group whose answers say whether this executable really did what was asked. A
+/// wrapper that has not adopted that contract answers without consulting
+/// anything, so each backend owes its own route a gate on the answers it gives.
 pub trait ExecutableGraph: Send {
     /// Advisory optional-feature bitmask. Default: all clear. Override when
     /// you implement MoE / GPU handles / typed I/O / etc. Callers must still
@@ -602,8 +602,33 @@ pub trait ExecutableGraph: Send {
     /// handle declares, a zero-length row, or no rows held in this executable at
     /// all. A shortened answer would not be tellable apart from a truncated one,
     /// so nothing about the row is guessed.
+    ///
+    /// A consumer that reads one row of each of many handles — the rows a decode
+    /// step consumes — wants [`Self::read_gpu_handle_rows`]: asking a handle at a
+    /// time costs a device round trip per row.
     fn read_gpu_handle_row(&self, _name: &str, _row: usize, _row_inner: usize) -> Option<Vec<f32>> {
         None
+    }
+
+    /// Read many rows in **one** device round trip, each request a
+    /// `(handle, row, row_inner)` triple answered in request order. The shape a
+    /// decode step needs: its rows span one handle per layer per K/V, so a shape
+    /// that reads a single handle per call pays a device round trip per row and
+    /// puts a floor under the step however small the rows are — and the floor is
+    /// what a batch exists to remove.
+    ///
+    /// Every answer holds what [`Self::read_gpu_handle_row`] answers for that one
+    /// request — the same extent bounds, the same refusals — and a `None` is that
+    /// request's alone, so a row that is not there withholds nothing its
+    /// neighbours asked for.
+    ///
+    /// Default: one [`Self::read_gpu_handle_row`] per request — every backend
+    /// answers a whole step correctly, and one that serves rows a handle at a
+    /// time pays a round trip for each of them.
+    fn read_gpu_handle_rows(&self, rows: &[(&str, usize, usize)]) -> Vec<Option<Vec<f32>>> {
+        rows.iter()
+            .map(|&(name, row, row_inner)| self.read_gpu_handle_row(name, row, row_inner))
+            .collect()
     }
 
     /// Register a targeted *row* feed for resident KV decode (graphs that emit

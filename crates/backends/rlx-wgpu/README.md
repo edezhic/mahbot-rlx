@@ -26,7 +26,9 @@ kernels, pure Rust deps — no FFI, no submodules.
   region is its size minus that reserve (with a 256-byte floor), and the snap
   that fits a compact plan into one buffer may halve the reserve while it tries.
   f32 host I/O via `queue.write_buffer` / pooled MAP_READ staging readback
-  (`ReadbackStaging`, `read_f32_many_pooled`). Env: `RLX_WGPU_SHARD_LOG=1`.
+  (`ReadbackStaging`, `read_f32_many_pooled`), and `read_f32_ranges` — several
+  rows of several slots in one submission and one map, which is the shape a
+  decode step's resident-KV rows leave through. Env: `RLX_WGPU_SHARD_LOG=1`.
   Packed quant weights may live in a separate `weight_buffer` (`from_plan_split`).
   Physical striping is **unsupported and opt-in only** (`RLX_WGPU_ALLOW_SHARD=1`,
   which warns uncutably on every striping decision), and the stripe count is

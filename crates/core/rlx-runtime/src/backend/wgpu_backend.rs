@@ -127,6 +127,9 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     fn read_gpu_handle_row(&self, name: &str, row: usize, row_inner: usize) -> Option<Vec<f32>> {
         self.inner.read_gpu_handle_row(name, row, row_inner)
     }
+    fn read_gpu_handle_rows(&self, rows: &[(&str, usize, usize)]) -> Vec<Option<Vec<f32>>> {
+        self.inner.read_gpu_handle_rows(rows)
+    }
     fn prepare_resident_gpu_handle(&mut self, name: &str) -> bool {
         self.inner.prepare_resident_gpu_handle(name)
     }

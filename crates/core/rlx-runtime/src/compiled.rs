@@ -378,6 +378,10 @@ impl CompiledGraph {
     /// `None` when the handle does not hold that row — a row outside its extent,
     /// a zero-length row, or no rows held here at all. See the `ExecutableGraph`
     /// trait for what a given implementation holds itself to.
+    ///
+    /// A consumer that reads one row of each of many handles — the rows a decode
+    /// step consumes — wants [`Self::read_gpu_handle_rows`]: asking a handle at a
+    /// time costs a device round trip per row.
     pub fn read_gpu_handle_row(
         &self,
         name: &str,
@@ -385,6 +389,15 @@ impl CompiledGraph {
         row_inner: usize,
     ) -> Option<Vec<f32>> {
         self.inner.read_gpu_handle_row(name, row, row_inner)
+    }
+
+    /// Read many rows in one device round trip, each request a
+    /// `(handle, row, row_inner)` triple, answered in request order — the shape a
+    /// decode step needs, whose rows span one handle per layer per K/V. See the
+    /// `ExecutableGraph` trait for what each answer holds itself to, and for what
+    /// the default (a row at a time) costs against the batch.
+    pub fn read_gpu_handle_rows(&self, rows: &[(&str, usize, usize)]) -> Vec<Option<Vec<f32>>> {
+        self.inner.read_gpu_handle_rows(rows)
     }
 
     /// Register a targeted row feed for resident KV decode (graphs that emit the

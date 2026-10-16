@@ -16,7 +16,10 @@
 //!   executable never bound, a `dst_row` past the cache input's own extent (which
 //!   wrote into whatever the arena holds next to the slot) all reported success;
 //! * the whole cache could only be read back, so a consumer that needs one row
-//!   paid for every row (the row readback below costs the row).
+//!   paid for every row. A row now costs the row, and a step's rows — one per
+//!   layer per K/V, across as many handles — cost one device round trip: the
+//!   batch readback is the shape a step's price turns on, since a call that
+//!   resolves one handle pays a submission and a wait for each row.
 //!
 //! The answer must also stay honest as the executable's storage changes: a clone
 //! and a recompile both rebuild it, and a name whose rows went with the old
@@ -291,6 +294,102 @@ fn a_row_readback_answers_what_the_whole_handle_readback_answers() {
     assert!(
         exe.read_gpu_handle_row("cache_a", ROWS_A - 1, W).is_some(),
         "the last row the cache declares is inside its extent"
+    );
+}
+
+#[test]
+fn a_batch_readback_answers_a_steps_requests_in_one_call() {
+    if skip() {
+        return;
+    }
+    let mut exe = resident_caches();
+    let extra = rows(ROWS_A, 900.0);
+    let _ = exe.run(&[("extra", &extra)]);
+    assert!(
+        exe.feed_kv_row(0, 1, W),
+        "fold the output row into both caches"
+    );
+    let whole_a = exe.read_gpu_handle("cache_a").expect("cache_a readable");
+    let whole_b = exe.read_gpu_handle("cache_b").expect("cache_b readable");
+
+    // A step asks after many handles in one call, so the requests interleave
+    // three this executable cannot serve with five it can: a row past cache_b's
+    // extent, a name it does not hold, and a zero-width row. Every answer is a
+    // position in the same list, which is what an implementation that dropped or
+    // shifted a request would get wrong.
+    let requests = [
+        ("cache_a", 0, W),
+        ("cache_b", 0, W),
+        ("cache_b", ROWS_B, W),
+        ("cache_a", 2, W),
+        ("not_here", 0, W),
+        ("cache_a", 0, 0),
+        ("cache_b", ROWS_B - 1, W),
+        ("cache_a", ROWS_A - 1, W),
+    ];
+    let want = [
+        Some(row_of(&whole_a, 0)),
+        Some(row_of(&whole_b, 0)),
+        None,
+        Some(row_of(&whole_a, 2)),
+        None,
+        None,
+        Some(row_of(&whole_b, ROWS_B - 1)),
+        Some(row_of(&whole_a, ROWS_A - 1)),
+    ];
+    let answers = exe.read_gpu_handle_rows(&requests);
+    assert_eq!(
+        answers.len(),
+        requests.len(),
+        "the batch answered {} of {} requests",
+        answers.len(),
+        requests.len()
+    );
+    for (i, (got, want)) in answers.iter().zip(want).enumerate() {
+        assert_eq!(
+            got.as_deref(),
+            want,
+            "request {i} {:?} answered {got:?}, not {want:?}",
+            requests[i]
+        );
+    }
+    // Asked again, the same rows answer the same way — reading a cache leaves it
+    // reading back as it did.
+    assert_eq!(
+        exe.read_gpu_handle_rows(&requests),
+        answers,
+        "the same requests answered differently on the second call"
+    );
+    // That holds for the requests the batch refused too: they took nothing with
+    // them, and the caches read back whole.
+    for (name, whole) in [("cache_a", &whole_a), ("cache_b", &whole_b)] {
+        assert_eq!(
+            exe.read_gpu_handle(name).as_deref(),
+            Some(whole.as_slice()),
+            "{name} reads back differently after a batch that refused a request for it"
+        );
+    }
+
+    // Rows this executable holds only in its host mirror are answered from there:
+    // a batch must not need an arena slot to answer a row the host holds.
+    let mirror = rows(ROWS_A, 400.0);
+    assert!(
+        exe.bind_gpu_handle("cache_a", &mirror),
+        "binding a graph input was refused"
+    );
+    assert_eq!(
+        exe.read_gpu_handle_rows(&[("cache_a", 1, W), ("cache_a", 0, W)])[0].as_deref(),
+        Some(row_of(&mirror, 1)),
+        "a row of a handle this executable holds only on the host answered nothing"
+    );
+    // Both sources in one call: cache_a is the host's alone now while cache_b
+    // still holds its rows in the arena, and each answer lands at its own
+    // request's position.
+    let mixed = exe.read_gpu_handle_rows(&[("cache_a", 0, W), ("cache_b", 0, W)]);
+    assert_eq!(
+        (mixed[0].as_deref(), mixed[1].as_deref()),
+        (Some(row_of(&mirror, 0)), Some(row_of(&whole_b, 0))),
+        "a batch mixing a host-held row with an arena-held one answered the wrong rows"
     );
 }
 
