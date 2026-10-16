@@ -832,11 +832,11 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             (13, 288, 1024),
             (13, 896, 1024),
             // The sub-tile end of that same class: one whole 32-element block of k,
-            // where the arm stages a 256-element tile — eight of them. The ticket
-            // admits this end only if it is shown not to lose, so its figures are
-            // printed beside the others' while its route, its join and its values are
-            // asserted like the rest: one tile iteration is paid for a single real
-            // block here.
+            // where the arm's tile is 256 elements wide — eight of them, with the
+            // staged fetch bounded to the row. The arm admits this end only if it
+            // is shown not to lose, so its figures are printed beside the others'
+            // while its route, its join and its values are asserted like the rest:
+            // one tile iteration is paid for a single real block here.
             (13, 32, 1024),
             // The row sweep, on a model width, either side of the arm's change
             // point (m == 1) and past the ~96 rows one large-row measurement put
@@ -965,7 +965,7 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
                      refused call must cost at least {floor} submission(s) more than \
                      the arm's {a_submits}, not {b_submits}"
                 );
-                // The join witness for the class's boundaries, which is the ticket's
+                // The join witness for the class's boundaries, which is this arm's
                 // own acceptance for the sub-tile end: what the ladder newly admits
                 // must be submitted exactly as the shapes it already admitted are —
                 // the whole run one submission and one blocking wait, the counts the

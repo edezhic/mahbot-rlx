@@ -97,11 +97,12 @@ kernels, pure Rust deps — no FFI, no submodules.
   `k` gate is the scheme's own packing block — Q4_K/Q6_K: 256, which is the staged
   tile itself; Q8_0: 32 — so a Q8_0 row of several tiles plus a block, or of less
   than one tile, takes the arm and joins the enclosing batch: the shader's tail tile
-  stops at the row's last whole block. The scratch slab is left for the shapes the
-  arm refuses — a `k` off the scheme's blocks, an X window its `vec4` reads cannot
-  address, the binding limit, the arm's bisect lever. Other schemes dequant
-  into scratch then `matmul_bt` when the arena is a single buffer; sharded /
-  split-weight arenas fall back to `gguf_host`. Grouped
+  stops at the row's last whole block, and stages no activation past the row's own
+  end (`stage_x_bounded`, its fetch guarded by `p0 + c4 < k`). The scratch slab is
+  left for the shapes the arm refuses — a `k` off the scheme's blocks, an X window
+  its `vec4` reads cannot address, the binding limit, the arm's bisect lever.
+  Other schemes dequant into scratch then `matmul_bt` when the arena is a single
+  buffer; sharded / split-weight arenas fall back to `gguf_host`. Grouped
   MoE GGUF uses the GPU path when scratch fits and the arena is unsharded. Scheme
   ids match Metal/CUDA. Details:
   [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).

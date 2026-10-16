@@ -817,10 +817,11 @@ fn wgpu_gguf_dequant_matmul_prefill_matches_cpu() {
             1e-2,
         ),
         // The sub-tile end of the same arm's class: k=32 is one whole 32-element
-        // block, where that entry point stages a 256-element tile (eight blocks), so
-        // its tail tile's block loop stops after the first block. This is that end's
-        // value evidence on a device — an admission keyed on the staged tile would
-        // serve this row as 256 elements and read past its weight.
+        // block, where that entry point's tile is 256 elements wide (eight blocks),
+        // so its tail tile's block loop stops after the first block and the fetch it
+        // stages is bounded to the row — 32 of the tile's 256 elements. This is that
+        // end's value evidence on a device — an admission keyed on the staged tile
+        // would serve this row as 256 elements and read past its weight.
         (
             QuantScheme::GgufQ8_0,
             rlx_gguf::GgmlType::Q8_0,

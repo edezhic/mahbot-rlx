@@ -583,22 +583,43 @@ fn bytes_x4(w: u32) -> vec4<u32> {
 /// columns paying them. Staging each block's tile once and reading it back from
 /// workgroup memory is the third leg of the same load-path rebuild the one-row
 /// tiled arm's `vec4` X read and this kernel's word-granular weight read are the
-/// first two of.
+/// first two of. A tile whose row ends inside it — only `dequant_gemm_q8_0`'s last
+/// one is — stages only the slots its own elements reach (see
+/// [`stage_x_bounded`]).
 var<workgroup> xs: array<vec4<f32>, TM * (BLK_ELEMS / 4u)>;
 
 /// Stage `X[row0, row0+TM) x [p0, p0+BLK_ELEMS)` into [`xs`], one `vec4` per
 /// thread per round. Rows past `m` clamp to the last valid row, exactly as the
-/// weight reads do; their accumulators are dropped at the store. Columns past `k`
-/// — only the `dequant_gemm_q8_0` tail tile has any, and only when `k` is not a
-/// whole number of tiles — are staged and never read: the mask is that entry
-/// point's block loop, which stops at the row's last whole block, so nothing here
-/// depends on what such a load returned.
+/// weight reads do; their accumulators are dropped at the store. The two entries
+/// that stage through this one — `dequant_gemm_q4k` and `dequant_gemm_q6k` — have
+/// a row that is a whole number of these tiles: their own gate's block is the tile
+/// (`BLK_ELEMS`), so the tile is inside the row and this needs no bound of its own.
+/// The `dequant_gemm_q8_0` entry's row may end inside a tile — its scheme's block
+/// is 32 elements — and it stages through [`stage_x_bounded`] instead.
 fn stage_x(tid: u32, row0: u32, p0: u32, k4: u32, xb: u32, last_row: u32) {
     let per_row = BLK_ELEMS / 4u;
     for (var i: u32 = tid; i < TM * per_row; i = i + TG) {
         let r = i / per_row;
         let c4 = (i % per_row) * 4u;
         xs[i] = xarr[xb + min(row0 + r, last_row) * k4 + ((p0 + c4) >> 2u)];
+    }
+}
+
+/// [`stage_x`] with the fetch bounded by the row's own length — the staging the
+/// `dequant_gemm_q8_0` entry uses, that scheme's 32-element blocks letting a row
+/// end inside one of these tiles. The guard is on the fetch itself, so no element
+/// at or past the row's end is read: the route reads nothing outside the window a
+/// call binds, and does not depend on what a read past it would return, on this
+/// adapter or any other. The slots past the row are left unwritten and are never
+/// read — that entry's block loop stops at the row's last whole block.
+fn stage_x_bounded(tid: u32, row0: u32, p0: u32, k4: u32, xb: u32, last_row: u32) {
+    let per_row = BLK_ELEMS / 4u;
+    for (var i: u32 = tid; i < TM * per_row; i = i + TG) {
+        let r = i / per_row;
+        let c4 = (i % per_row) * 4u;
+        if (p0 + c4 < params.k) {
+            xs[i] = xarr[xb + min(row0 + r, last_row) * k4 + ((p0 + c4) >> 2u)];
+        }
     }
 }
 
@@ -733,11 +754,12 @@ fn dequant_gemm_q8_0(
     // work at the same granularity as the entries above. This entry is the one whose
     // `k` need not be a whole number of those tiles: its own block is 32 elements, so
     // the last tile may hold a few of its eight, and `bis` stops the block loop at
-    // the row's last whole block — no weight block past it is read, and the tile's
-    // surplus activations are staged but never used.
+    // the row's last whole block — no weight block past it is read — while
+    // `stage_x_bounded` fetches only the activations that loop consumes, so the
+    // tile's surplus is not staged either.
     for (var b0: u32 = 0u; b0 < params.k; b0 = b0 + BLK_ELEMS) {
         workgroupBarrier();
-        stage_x(tid, row0, b0, k4, xb, last_row);
+        stage_x_bounded(tid, row0, b0, k4, xb, last_row);
         workgroupBarrier();
 
         let bis = min(BLK_ELEMS / Q8_0_BLK_ELEMS, (params.k - b0) / Q8_0_BLK_ELEMS);

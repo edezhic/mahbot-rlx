@@ -223,15 +223,22 @@ Otherwise Q4_1+ fall through with wrong block stride.
    K-quants that block is the tile itself (256), while Q8_0's 32-element block lets
    a row end inside one, so an off-tile Q8_0 row is served — the
    `dequant_gemm_q8_0` entry point's staged-tile loop bounds its block loop by a
-   uniform `min`, so its tail tile computes only that row's real whole blocks. The
-   only contraction this gate turns away is one that is not a whole number of the
-   scheme's blocks (a partial block, which no packed weight carries); the arm's
+   uniform `min`, so its tail tile computes only that row's real whole blocks — and
+   stages that tile through a fetch bounded by the row's own length
+   (`stage_x_bounded`, guarded by `p0 + c4 < k`), so the surplus this admission
+   would otherwise have staged past the call's window — up to
+   `4 * (256 - k % 256)` bytes, 896 B at `k = 32` — is not read at all, and nothing
+   here rests on what a read outside a bound window returns. That bound is the 8-bit
+   entry's alone — the two K-quants stage through the unbounded routine, their tiles
+   being whole rows — so their staged element set and trip counts are what they
+   were. The only contraction this gate turns away is one that is not a whole number
+   of the scheme's blocks (a partial block, which no packed weight carries); the arm's
    other refusals — a window over the binding limit, a chunk, an adapter limit —
    belong to its encode, not to this term. The rows shorter than one tile
-   that same term admits are served by that same bound: all of a sub-tile row's
+   that same term admits are served by that same `min`: all of a sub-tile row's
    blocks live in its first staged tile, and the call still rides the batch's single
    submission — `gguf_matmul_route.rs`'s route census, submission pair and
-   cross-route value checks are what witness that end not losing. That bound is
+   cross-route value checks are what witness that end not losing. That `min` is
    uniform, so a whole-tile call walks it too: an on-tile cell's cost is watched on
    the stand's figures rather than by an in-tree timing ceiling, the A/B cells'
    `[rlx-gguf-q8-0-gemm]` lines reporting it. No row cap applies at any of these
@@ -260,7 +267,9 @@ stays inside `OUT_SLAB_CAP` whatever the shape, a larger `m` costing more chunks
 rather than more memory. An attention ear's newly joined up projection is wider than
 the down projection joined today, so that pool's high-water can rise by the
 difference. No environment key was added for the widening:
-`RLX_WGPU_Q8_0_GEMM_DISABLE` is the arm's only lever.
+`RLX_WGPU_Q8_0_GEMM_DISABLE` is the arm's only lever. No changelog entry is owed
+for the row-bounded fetch either: nothing user-visible changes — no environment
+key, no admission, no value — and the fix is in code this fork added.
 
 The class's calls in the regimes the ladder cannot see move with the arm's other
 admitted shapes: a striped arena, a parked weight and the bisect lever place them

@@ -18,8 +18,9 @@
 //! over the weight per row. Its `k` gate is the scheme's own packing block
 //! ([`grouped_k_ok`]): the K-quants' block is the staged tile itself, while Q8_0's
 //! 32-element one lets a row end inside a tile — the `dequant_gemm_q8_0` entry
-//! point's staged-tile loop stops at the last whole block of such a row, so a
-//! contraction of several tiles plus a block, or a sub-tile one, takes this route
+//! point's staged-tile loop stops at the last whole block of such a row and stages
+//! the tile through a fetch bounded by the row's own length (`stage_x_bounded`), so
+//! a contraction of several tiles plus a block, or a sub-tile one, takes this route
 //! rather than the slab. On a Q4_K chunk whose base dispatch would starve the
 //! GPU, that entry point covers half the columns per workgroup with two threads to
 //! each — the same quant bytes over up to twice the warps, every block's header
@@ -592,8 +593,11 @@ pub fn grouped_scheme_supported(scheme_id: u32) -> bool {
 /// one: the `dequant_gemm_q8_0` entry point's staged-tile loop is written to stop at
 /// the last whole block of such a tail tile (`BLK_ELEMS` there is the tile, not the
 /// unit), which is what lets a row of several tiles plus a block — and the sub-tile
-/// rows this allows — take this route instead of the slab. The surplus the tile
-/// stages past `k` is never read: the block loop stops before it.
+/// rows this allows — take this route instead of the slab. The tile's surplus, what
+/// lies past `k`, is neither fetched nor read: that entry stages it through the
+/// row-bounded `stage_x_bounded` and its block loop stops at the row's last whole
+/// block, so this route does not depend on what a read outside the window it binds
+/// would return.
 pub fn grouped_k_ok(scheme_id: u32, k: usize) -> bool {
     grouped_scheme_supported(scheme_id)
         && k.is_multiple_of(scheme_from_id(scheme_id).gguf_block_size() as usize)
@@ -1433,8 +1437,8 @@ const GROUPED_ROWS: u32 = 8;
 /// around. Every arm of this entry set reads whole packing blocks out of it: the
 /// tile is one 256-element Q4_K/Q6_K block, and eight of Q8_0's 32-element ones —
 /// so for the K-quants this is also their `k` gate, while Q8_0's is its own block
-/// ([`grouped_k_ok`]), whose tail tile the `dequant_gemm_q8_0` entry stops early
-/// on. Pinned against the shader's own const by
+/// ([`grouped_k_ok`]), whose tail tile that entry stops early on and stages only as
+/// far as the row reaches. Pinned against the shader's own const by
 /// `grouped_geometry_matches_the_shader`.
 pub const GROUPED_STAGE_ELEMS: usize = 256;
 
@@ -2362,6 +2366,146 @@ mod tests {
             "outarr[params.out_f32_off + j0 + 1u]".to_string(),
         ] {
             assert!(wgsl.contains(&want), "expected `{want}` in the shader");
+        }
+    }
+
+    /// The row-grouped 8-bit entry stages no activation past the call's own window.
+    ///
+    /// The class's value cells cannot witness this: the surplus past a row is never
+    /// consumed, so they pass with and without the bound. What is pinned here is the
+    /// shader's own guard over the staged fetch — `p0 + c4 < params.k`, whose left
+    /// operand is the very expression the fetch's address is built from
+    /// (`((p0 + c4) >> 2u)`, the `vec4` it loads), with the fetch itself inside the
+    /// guard. A guard that only masks the value (a `select`), one moved onto the
+    /// store with the load left outside it, and one written against a tile's
+    /// remainder rather than the contraction's own extent all fail this. Reading the
+    /// shader as text costs what the geometry pin above says it costs: a reflow of
+    /// these lines fails it without any rule having moved, and the fix is to
+    /// re-spell them.
+    ///
+    /// The module carries the other half, which no text pin reaches: the bounded
+    /// routine's staged store sits under a conditional and the unbounded routine's
+    /// under none, so the two 256-element-block schemes' staging carries no compare
+    /// — the class's bound is the 8-bit entry's alone, and their staged element set
+    /// and trip counts are what they were. The guard tests the contraction's own
+    /// extent, not a tile's remainder, so its reach is a property of the guard and
+    /// not of a shape: the class's off-tile rows — a block past a tile (288),
+    /// several tiles plus a block (896), the sub-tile ends (128, 32) — are the route
+    /// census's cells, whose route, join and values `gguf_matmul_route.rs` asserts.
+    #[test]
+    fn the_q8_0_tail_tile_fetches_nothing_past_the_call_window() {
+        let wgsl = crate::kernels::DEQUANT_GEMM_GGUF_WGSL;
+        // Device-free validity: a WGSL mistake in the staging routines would
+        // otherwise surface only where an adapter builds the module.
+        let module = naga::front::wgsl::parse_str(wgsl).expect("wgsl parse");
+
+        // The guard and the fetch under it. The fetch must be inside the guard's own
+        // block — a guard the block closes before is a guard on the store alone,
+        // which leaves the address free to leave the window.
+        let guard = "if (p0 + c4 < params.k) {";
+        let fetch = "xs[i] = xarr[xb + min(row0 + r, last_row) * k4 + ((p0 + c4) >> 2u)];";
+        let guard_at = wgsl
+            .find(guard)
+            .unwrap_or_else(|| panic!("the staged fetch must be bounded: no `{guard}`"));
+        let fetch_at = guard_at
+            + wgsl[guard_at..]
+                .find(fetch)
+                .unwrap_or_else(|| panic!("the guarded statement must be the fetch `{fetch}`"));
+        assert!(
+            !wgsl[guard_at..fetch_at].contains('}'),
+            "`{guard}` must wrap the fetch itself, not close over it"
+        );
+        // The two staging routines differ by that guard alone: a fetch respelled in
+        // one of them would be a second address to keep right, silently.
+        assert_eq!(
+            wgsl.matches(fetch).count(),
+            2,
+            "both staging routines must fetch the tile through the same address"
+        );
+
+        // One bound in the shader, and it on the staging the 8-bit entry alone uses:
+        // the two K-quant entries call the unbounded `stage_x`, so nothing bounds
+        // their staged set or their trip counts.
+        assert_eq!(
+            wgsl.matches("< params.k)").count(),
+            1,
+            "the staged fetch's bound is the one comparison against the contraction's extent"
+        );
+        assert_eq!(
+            wgsl.matches("stage_x(tid, row0, p0, k4, xb, last_row);")
+                .count(),
+            2,
+            "the two K-quant entries must stage through the unbounded routine"
+        );
+        assert_eq!(
+            wgsl.matches("stage_x_bounded(tid, row0, b0, k4, xb, last_row);")
+                .count(),
+            1,
+            "the 8-bit entry must stage through the bounded routine"
+        );
+
+        // The same two facts off the parsed module, where a text pin cannot reach:
+        // the conditional is on the bounded routine's own staged store, and the
+        // unbounded routine has none.
+        assert!(
+            staged_store_is_guarded(&module, "stage_x_bounded"),
+            "the bounded routine must store the staged tile under its guard"
+        );
+        assert!(
+            !staged_store_is_guarded(&module, "stage_x"),
+            "the unbounded routine must stage through no conditional at all"
+        );
+
+        /// Whether `routine` carries the store into `xs` under a conditional, read
+        /// off the emitted module rather than the text: a `Statement::If` (the loop's
+        /// own included) above that store is a guard over it.
+        fn staged_store_is_guarded(module: &naga::Module, routine: &str) -> bool {
+            let (_, f) = module
+                .functions
+                .iter()
+                .find(|(_, f)| f.name.as_deref() == Some(routine))
+                .unwrap_or_else(|| panic!("no `{routine}` in the shader"));
+            let (xs, _) = module
+                .global_variables
+                .iter()
+                .find(|(_, v)| v.name.as_deref() == Some("xs"))
+                .expect("the staged tile `xs` in the shader");
+            fn walk(
+                exprs: &naga::Arena<naga::Expression>,
+                xs: naga::Handle<naga::GlobalVariable>,
+                stmts: &[naga::Statement],
+                guarded: bool,
+                found: &mut Option<bool>,
+            ) {
+                for s in stmts {
+                    match s {
+                        naga::Statement::If { accept, reject, .. } => {
+                            walk(exprs, xs, accept, true, found);
+                            walk(exprs, xs, reject, true, found);
+                        }
+                        naga::Statement::Block(b) => walk(exprs, xs, b, guarded, found),
+                        naga::Statement::Loop {
+                            body, continuing, ..
+                        } => {
+                            walk(exprs, xs, body, guarded, found);
+                            walk(exprs, xs, continuing, guarded, found);
+                        }
+                        naga::Statement::Store { pointer, .. } => {
+                            let naga::Expression::Access { base, .. } = &exprs[*pointer] else {
+                                continue;
+                            };
+                            if matches!(&exprs[*base], naga::Expression::GlobalVariable(h) if *h == xs)
+                            {
+                                *found = Some(guarded);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let mut found = None;
+            walk(&f.expressions, xs, &f.body, false, &mut found);
+            found.expect("the routine stores the staged tile")
         }
     }
 }
