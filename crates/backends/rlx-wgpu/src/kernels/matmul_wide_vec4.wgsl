@@ -29,7 +29,9 @@
 // per node. `kernels::wide_grid` is the Rust side of that rule and the
 // device-free tests at the end of `kernels/mod.rs` pin the two together;
 // `tests/matmul_vec4_parity.rs` pins the pair bit-identical to the single
-// rounded-up grid it replaces.
+// rounded-up grid it replaces. (That node's GEMM may now take the f32
+// cooperative kernel where its alignment admits it — see `conv_gemm` — which
+// leaves these tiles to the shapes the cooperative alignment refuses.)
 //
 // This is the path a BROWSER gets: WebGPU has no cooperative-matrix extension,
 // so `matmul_coop_*` is unreachable there, and it is also the fallback on any

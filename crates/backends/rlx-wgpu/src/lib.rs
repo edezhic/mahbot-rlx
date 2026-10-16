@@ -29,6 +29,7 @@ pub mod kernel_schedule_port;
 #[cfg(feature = "schedule-codegen")]
 pub mod kernel_schedule_emit;
 pub use backend::bf16_packed_dispatch_count;
+pub use backend::coop_f32_dispatch_count;
 pub use backend::{device_submit_count, device_wait_count, reset_device_counts};
 pub mod supported_ops;
 pub mod tuning;

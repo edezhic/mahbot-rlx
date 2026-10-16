@@ -182,6 +182,70 @@ pub fn assert_bit_identical(a: &[f32], b: &[f32], what: &str) {
     }
 }
 
+/// A deterministic fill for the convolution-route harnesses' activations and
+/// weights: `(i * mul + add) % modu`, scaled and biased. The two callers differ
+/// only in the tabulation, so the shape of the fill is one definition.
+pub fn fill(n: usize, mul: usize, add: usize, modu: usize, scale: f32, bias: f32) -> Vec<f32> {
+    (0..n)
+        .map(|i| ((i * mul + add) % modu) as f32 * scale + bias)
+        .collect()
+}
+
+/// The conv the two convolution-route harnesses measure: one unit-height 1-D
+/// conv, input `[1, c_in, 1, l]`, weight `[c_out, c_in, 1, k]`, kernel `[1, k]`,
+/// padding `[0, p]`, stride `[1, 1]`, `groups = 1`, output `[1, c_out, 1, l]`.
+pub fn unit_conv_graph(
+    name: &str,
+    c_in: usize,
+    c_out: usize,
+    l: usize,
+    k: usize,
+    p: usize,
+) -> rlx_ir::Graph {
+    let mut g = rlx_ir::Graph::new(name);
+    let x = g.input(
+        "x",
+        rlx_ir::Shape::new(&[1, c_in, 1, l], rlx_ir::DType::F32),
+    );
+    let w = g.param(
+        "w",
+        rlx_ir::Shape::new(&[c_out, c_in, 1, k], rlx_ir::DType::F32),
+    );
+    let y = g.conv2d(x, w, [1, k], [1, 1], [0, p], [1, 1], 1);
+    g.set_outputs(vec![y]);
+    g
+}
+
+/// That conv's output from the crate's own CPU conv rather than a hand-written
+/// loop, so the reference and the device arm cannot share a misreading of the
+/// layout. The weight param is `w`; the only input is `x`.
+pub fn unit_conv_cpu_reference(g: rlx_ir::Graph, xs: &[f32], ws: &[f32]) -> Vec<f32> {
+    let mut cpu = rlx_runtime::Session::new(rlx_runtime::Device::Cpu).compile(g);
+    cpu.set_param("w", ws);
+    cpu.run(&[("x", xs)]).remove(0)
+}
+
+/// `got` against `want` under the convolution routes' own `1e-5` budget, the bar
+/// both harnesses hold every arm to; returns the difference it measured, so the
+/// caller can print or compare it. `label` and `arm` name the case and which
+/// compile it was. The budget is the claim, so the bar leaves room for a
+/// different accumulation order — on a Metal adapter an arm may run one of these
+/// convs on the f32 cooperative kernel (`conv_gemm`), whose order this tree does
+/// not fix. The fold is [`max_abs_diff`], whose finiteness census runs first, so
+/// a poisoned output cannot fold to a small number and pass.
+pub fn assert_close_under(label: &str, arm: &str, got: &[f32], want: &[f32]) -> f32 {
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{label}: {arm} length {} vs {}",
+        got.len(),
+        want.len()
+    );
+    let max = max_abs_diff(got, want);
+    assert!(max < 1e-5, "{label}: {arm} max|Δ| {max:e} > 1e-5");
+    max
+}
+
 /// The 8-bit GGUF scheme's bisect lever, spelled in one place: it takes that
 /// scheme's multi-row multiplies off the grouped device arm, so the pins whose
 /// routes, joined intervals or counted pairs it would move refuse on it.

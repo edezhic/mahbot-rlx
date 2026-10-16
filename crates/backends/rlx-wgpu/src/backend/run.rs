@@ -1823,20 +1823,20 @@ impl WgpuExecutable {
                                         );
                                     }
                                 } else if let Some(coop_f32) = mm_coop_f32.as_ref()
-                                    && *b_is_param
                                     && *compute_precision == MatmulCompute::CoopF32
                                 {
                                     // CoopF32: Metal uses 32×32 simdgroup tiles;
-                                    // Vulkan uses 8×8 coopLoadT portable kernel.
+                                    // Vulkan uses 8×8 coopLoad portable kernel.
+                                    // The weight's operand role is deliberately
+                                    // not part of this test: the kernel reads
+                                    // both operands straight out of the f32
+                                    // arena, so the conv GEMM routes (weight in
+                                    // A) reach it too. Every family that DOES
+                                    // read a weight-side buffer is still kept
+                                    // away by the eligibility that admitted it.
+                                    coop_f32_dispatch_inc();
                                     pass.set_pipeline(&coop_f32.pipeline);
-                                    let backend = wgpu_device()
-                                        .map(|d| d.backend)
-                                        .unwrap_or(wgpu::Backend::Noop);
-                                    let (gx, gy) = if backend == wgpu::Backend::Metal {
-                                        (n.div_ceil(32), m_s.div_ceil(32))
-                                    } else {
-                                        (m_s.div_ceil(8), n.div_ceil(8))
-                                    };
+                                    let (gx, gy) = coop_f32_grid(m_s, *n);
                                     pass.dispatch_workgroups(gx, gy, *batch);
                                 } else if let Some(f16c) = mm_f16c.as_ref()
                                     && *b_is_param

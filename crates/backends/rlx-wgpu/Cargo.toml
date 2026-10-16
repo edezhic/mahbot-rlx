@@ -220,6 +220,10 @@ name = "coop_self_check"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "conv_gemm_coop_f32"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "conv_route_cost"
 required-features = ["backend-tests"]
 

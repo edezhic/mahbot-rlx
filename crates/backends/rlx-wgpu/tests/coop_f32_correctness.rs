@@ -57,7 +57,8 @@ fn coop_f32_uses_real_f32() {
         return;
     }
 
-    // M=32, K=8, N=32 — meets the coop alignment (m%32==0, k%8==0, n%32==0).
+    // M=32, K=8, N=32 — the alignment this kernel asks for (K % 8, N % 32; M is
+    // free, the padded rows are computed and their stores dropped).
     // A: all 1.0
     // B: all 70_000.0  (f16 max = 65504, so 70_000 saturates in f16)
     // Expected C: each cell = 8 * 70_000 = 560_000.0

@@ -173,6 +173,18 @@ remains on Input/Param-only operands (BERT QKV weights, etc.). A GPU
 CoopF16Vk applies. Pass flushes between unary → cast → coop matmul keep the
 discrete-adapter visibility correct.
 
+The **f32 path** is on by default on Metal — `matmul_coop_f32.wgsl`, 32×32
+`simdgroup_float8x8` tiles, admitted where `K` is a multiple of 8 and the
+output-column extent a multiple of 32 (`M` is free: the padded rows are computed
+and their stores dropped). It reads both operands straight out of the f32 arena,
+so the weight's operand role does not matter to it: the ordinary Param-weight
+multiply and the two convolution GEMM routes — the im2col panel multiply and the
+1×1 pointwise GEMM, whose weight is the FIRST operand — all reach it, and
+`coop_f32_dispatch_count()` counts every dispatch of it. Opt out with
+`RLX_WGPU_NO_COOP_F32=1`. The portable 8×8 sibling
+(`matmul_coop_f32_portable.wgsl`) is a discrete Vulkan adapter's; the conv routes
+never take it, whatever the adapter — their admission is Metal-scoped.
+
 ### Environment flags
 
 | Variable | Effect |
@@ -186,8 +198,8 @@ discrete-adapter visibility correct.
 | `RLX_WGPU_COOP_F16_VK_FORCE_WIDE=1` | Always wide-fallback CoopF16Vk matmul at dispatch |
 | `RLX_WGPU_COOP_F16_VK_LARGE_N=1` | Keep CoopF16Vk for N > 768 (default: wide f32 for accuracy) |
 | `RLX_WGPU_COOP_F16_VK_LOAD_T=1` | Force `coopLoadT` on B when `RLX_WGPU_COOP_F16_VK_LARGE_N=1` and N > 768 |
-| `RLX_WGPU_NO_COOP_F32=1` | Disable CoopF32 on Metal |
-| `RLX_WGPU_FORCE_COOP_F32=1` | Force CoopF32 eligibility where the adapter reports no 8×8 f32 cooperative matrices (output is unreliable there); the portable 8×8 path is otherwise selected automatically |
+| `RLX_WGPU_NO_COOP_F32=1` | Disable the f32 cooperative-matrix matmul, on Metal's 32×32 form and the portable Vulkan 8×8 one alike |
+| `RLX_WGPU_FORCE_COOP_F32=1` | Force CoopF32 eligibility where the adapter reports no 8×8 f32 cooperative matrices (output is unreliable there), and widen it to the portable form's `K % 8` / `N % 8` alignment; the portable 8×8 path is otherwise selected automatically |
 | `RLX_WGPU_FORCE_INPUT_UPLOAD=1` | No-op (inputs are always re-uploaded; kept for older scripts) |
 | `RLX_BENCH_DISPATCH_ONLY=1` | Skip output readback (micro-benchmarks) |
 | `RLX_WGPU_F16_WEIGHTS=1` | Legacy f16-storage matmul experiment |

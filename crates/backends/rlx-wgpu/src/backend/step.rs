@@ -119,7 +119,9 @@ pub(crate) enum Step {
         // doesn't change between `run()` calls. Read from the f16
         // shadow buffer (half memory bandwidth) when set + the device
         // exposes SHADER_F16. Set at compile time; consulted only by
-        // the dispatch arm.
+        // the dispatch arm's weight-side families — the two convolution
+        // GEMM routes hold their weight in A, so this is false there, which
+        // is what keeps those families out of reach at those two sites.
         b_is_param: bool,
         /// True iff this GEMM is the 1×1 pointwise-conv route. Its `m` is the
         /// output (channel) axis rather than a bucket row axis, so a narrowed
@@ -132,7 +134,9 @@ pub(crate) enum Step {
         // (the historical / default path). F16 = mixed-precision
         // (operands cast to f16, multiply in f16 for 2× ALU on Apple,
         // accumulator in f32). Set at compile time from the IR's
-        // dtype after AutoMixedPrecision policy.
+        // dtype after AutoMixedPrecision policy, or by the conv GEMM
+        // routes, whose weight in A leaves `conv_gemm` only CoopF32
+        // and F32 to choose between.
         compute_precision: MatmulCompute,
     },
     Binary {
@@ -608,7 +612,7 @@ pub(crate) enum Step {
     },
     /// GPU im2col: gather a conv's receptive fields into a `col` matrix in the
     /// arena scratch tail. Always immediately followed by a `Step::Matmul`
-    /// (weight @ col → NCHW output) that reuses the tiled f32 GEMM kernels.
+    /// (weight @ col → NCHW output), whose kernel `conv_gemm` picks.
     Im2ColGpu {
         params: Im2Col2dParams,
     },

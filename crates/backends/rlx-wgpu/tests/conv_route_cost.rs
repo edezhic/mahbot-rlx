@@ -804,11 +804,12 @@ fn probe_active_extent(scope: &str, bg: &BodyGraph, want_routes: [&'static str; 
     }
 }
 
-/// Largest `|off − on|` over every element both arms produced. Both arms sum
-/// the same f32 products in a different order, so this is either exactly zero
-/// (the routes reassociate nothing here) or the honest size of the
-/// reassociation — either way it is stated, not assumed. The fold is the shared
-/// `common::max_abs_diff`, whose finiteness census runs first.
+/// Largest `|off − on|` over every element both arms produced: exactly zero, or
+/// the honest size of the reassociation — stated, never assumed. A zero does not
+/// mean both arms ran the same kernel: these routes' GEMMs can take the f32
+/// cooperative kernel, whose accumulation order is its own and which still lands
+/// on the same bits on some devices (see `conv_gemm_coop_f32.rs`). The fold is
+/// the shared `common::max_abs_diff`, whose finiteness census runs first.
 fn max_delta(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
     assert_eq!(a.len(), b.len(), "both arms must produce the same outputs");
     a.iter()
@@ -819,7 +820,7 @@ fn max_delta(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
 
 fn fmt_delta(d: f32) -> String {
     if d == 0.0 {
-        "0 (bit-identical)".to_string()
+        "0 (bit-identical outputs)".to_string()
     } else {
         format!("{d:.3e}")
     }

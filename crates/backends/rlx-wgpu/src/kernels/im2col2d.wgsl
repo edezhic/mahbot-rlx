@@ -13,8 +13,13 @@
 //   C = out[c_out, spatial]         (matmul writes NCHW output for N=1)
 //
 // The flattened reduction index `k = ((ci*kh)+kr)*kw + kc` matches the
-// (ci, kr, kc) nesting of the direct conv kernel, so the subsequent GEMM
-// accumulates in the same order → bit-identical f32 result.
+// (ci, kr, kc) nesting of the direct conv kernel, so the direct and gathered
+// routes accumulate in the same order — which made their f32 outputs identical
+// while the GEMM below stayed on the plain f32 kernel. That GEMM may now take
+// the f32 cooperative kernel for a shape whose k is a multiple of 8 and whose
+// spatial extent is a multiple of 32 (`conv_gemm` in `backend/mod.rs`), whose
+// accumulation order the tree does not fix — so on those shapes the two routes
+// are held to a tolerance, not to bit-identity.
 //
 // One thread per col element (`k_total * spatial` threads). Out-of-bounds
 // receptive-field taps (padding / dilation past the edge) store 0.0.

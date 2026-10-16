@@ -20,6 +20,14 @@
 //! windowed `arena_off_in_bind_window` offsets rather than a raw word cast, and the
 //! mirrored lift is gated for the same previous-behaviour-preserved reason.
 //!
+//! On the arm that routes, each GEMM picks its own kernel: on a Metal adapter the
+//! f32 cooperative one where that kernel's alignment holds (both GEMM shapes below
+//! are aligned, so what is printed here is that kernel's numbers there), the wide
+//! f32 kernel on any other adapter and for any shape the alignment refuses — see
+//! `conv_gemm`, and `conv_gemm_coop_f32.rs` for the pin on that choice. Both arms
+//! are held to the crate's `1e-5` bar against the CPU conv
+//! (`common::assert_close_under`); this rig measures 0 on every check below.
+//!
 //! **How this proves the fallback rather than just asserting numbers.** Each case is
 //! compiled and run twice in the same process. First with the routes on and the
 //! weight in the activation arena — the positive control — where the shape must
@@ -49,8 +57,7 @@
 //! it parked at the end, so a second test in the same binary would compile parked
 //! parameters it never asked for.
 
-use rlx_ir::{DType, Graph, Shape};
-use rlx_runtime::{Device, Session};
+use rlx_ir::Graph;
 use rlx_wgpu::backend::WgpuExecutable;
 
 mod common;
@@ -143,30 +150,17 @@ const CASES: [Case; 4] = [
     },
 ];
 
+/// This file's own geometry, from the fixtures `common` shares with
+/// `conv_gemm_coop_f32.rs` (see `common::unit_conv_graph`).
 fn graph(case: &Case) -> Graph {
-    let mut g = Graph::new("conv_routes_parked_weight");
-    let x = g.input("x", Shape::new(&[1, case.c_in, 1, case.l], DType::F32));
-    let w = g.param(
-        "w",
-        Shape::new(&[case.c_out, case.c_in, 1, case.k], DType::F32),
-    );
-    let y = g.conv2d(x, w, [1, case.k], [1, 1], [0, case.p], [1, 1], 1);
-    g.set_outputs(vec![y]);
-    g
-}
-
-fn fill(n: usize, mul: usize, add: usize, modu: usize, scale: f32, bias: f32) -> Vec<f32> {
-    (0..n)
-        .map(|i| ((i * mul + add) % modu) as f32 * scale + bias)
-        .collect()
-}
-
-/// The reference: the same graph compiled for the CPU backend, so the numbers come
-/// from the crate's own conv rather than from a hand-written loop.
-fn reference(case: &Case, xs: &[f32], ws: &[f32]) -> Vec<f32> {
-    let mut cpu = Session::new(Device::Cpu).compile(graph(case));
-    cpu.set_param("w", ws);
-    cpu.run(&[("x", xs)]).remove(0)
+    common::unit_conv_graph(
+        "conv_routes_parked_weight",
+        case.c_in,
+        case.c_out,
+        case.l,
+        case.k,
+        case.p,
+    )
 }
 
 /// Compile `case` under the switches currently in force, bind the weight, run `x`,
@@ -184,25 +178,6 @@ fn compile_and_run(
     let safe = exe.test_all_steps_safe_for_active_extent();
     let fallbacks = exe.im2col_fallbacks();
     (steps, safe, exe.run(&[("x", xs)]).remove(0), fallbacks)
-}
-
-/// `got` against the CPU reference under a `1e-5` budget — measured 0 on every
-/// check below, so the bar only leaves room for a different accumulation order.
-/// `arm` names which compile it was. The fold is the shared `common::max_abs_diff`,
-/// whose finiteness census runs first, so a poisoned output cannot fold to a small
-/// number and pass.
-fn assert_close(case: &Case, arm: &str, got: &[f32], want: &[f32]) -> f32 {
-    assert_eq!(
-        got.len(),
-        want.len(),
-        "{}: {arm} length {} vs {}",
-        case.label,
-        got.len(),
-        want.len()
-    );
-    let max = common::max_abs_diff(got, want);
-    assert!(max < 1e-5, "{}: {arm} max|Δ| {max:e} > 1e-5", case.label);
-    max
 }
 
 #[test]
@@ -225,9 +200,9 @@ fn a_parked_conv_weight_keeps_the_conv_values_right() {
     rlx_ir::env::set("RLX_WGPU_CONV_IM2COL", "1");
 
     for case in &CASES {
-        let xs = fill(case.c_in * case.l, 7, 1, 13, 0.1, -0.6);
-        let ws = fill(case.c_out * case.c_in * case.k, 5, 3, 11, 0.1, -0.5);
-        let want = reference(case, &xs, &ws);
+        let xs = common::fill(case.c_in * case.l, 7, 1, 13, 0.1, -0.6);
+        let ws = common::fill(case.c_out * case.c_in * case.k, 5, 3, 11, 0.1, -0.5);
+        let want = common::unit_conv_cpu_reference(graph(case), &xs, &ws);
 
         // Weight in the activation arena — the positive control. The shape must
         // really reach the route this case exists to prove, or the parked arm below
@@ -260,7 +235,7 @@ fn a_parked_conv_weight_keeps_the_conv_values_right() {
             "{}: a shape that routes must count no im2col fallback",
             case.label
         );
-        let max = assert_close(case, "arena", &got, &want);
+        let max = common::assert_close_under(case.label, "arena", &got, &want);
         eprintln!(
             "{}: {} max|Δ| {max:.2e} (n={}, im2col fallbacks {fallbacks})",
             case.label,
@@ -293,7 +268,7 @@ fn a_parked_conv_weight_keeps_the_conv_values_right() {
              (schedule {steps:?})",
             case.label
         );
-        let max = assert_close(case, "parked", &got, &want);
+        let max = common::assert_close_under(case.label, "parked", &got, &want);
         eprintln!(
             "{}: parked {PREVIOUS_ROUTE} max|Δ| {max:.2e} (n={}), im2col fallbacks {} (want {})",
             case.label,

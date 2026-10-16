@@ -175,8 +175,10 @@ pub(crate) const CONV_IM2COL_MAX_COL_BYTES: u64 = 1024 * 1024 * 1024;
 /// Largest spatial extent the 1×1 pointwise GEMM may take. The route's `n` is
 /// the spatial extent and the matmul dispatch emits one workgroup per 32 (or 64)
 /// output columns, so [`MAX_WORKGROUPS_PER_DIM`] is reached at
-/// `MAX_WORKGROUPS_PER_DIM * 32` — the conservative bound holds whichever of
-/// those two kernels the run picks. Past it the shape keeps the previous
+/// `MAX_WORKGROUPS_PER_DIM * 32`. This cap is what keeps the route's own grid
+/// under the ceiling — the f32 cooperative kernel included, its x grid being the
+/// same `n / 32`; [`conv_gemm`]'s ceiling check is the general guard over both
+/// routes and cannot fire under this cap. Past it the shape keeps the previous
 /// direct/tiled route.
 pub(crate) const POINTWISE_MAX_SPATIAL: u64 = MAX_WORKGROUPS_PER_DIM as u64 * 32;
 
@@ -510,6 +512,27 @@ pub(crate) fn bf16_packed_dispatch_inc() {
 /// Total packed-BF16 matmul dispatches since process start.
 pub fn bf16_packed_dispatch_count() -> u64 {
     BF16_PACKED_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-wide count of dispatches of the ACTIVE f32 cooperative kernel —
+/// `matmul_coop_f32` on Metal, `matmul_coop_f32_portable` on a Vulkan/DX12
+/// adapter that selects it — across every call site: an ordinary multiply, and
+/// the two convolution GEMM routes' weight-in-A multiplies. The same kind of
+/// hook as [`bf16_packed_dispatch_count`]: the schedule's step names carry no
+/// precision, so this is how "that node took the cooperative kernel" is observed
+/// without reading the schedule.
+pub(crate) static COOP_F32_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Increment the f32 cooperative dispatch counter (called from the run loop).
+#[inline]
+pub(crate) fn coop_f32_dispatch_inc() {
+    COOP_F32_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total f32 cooperative-matrix matmul dispatches since process start.
+pub fn coop_f32_dispatch_count() -> u64 {
+    COOP_F32_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Process-wide count of `queue.submit` calls `src/` makes. Together with
@@ -2723,7 +2746,9 @@ fn bind_two_buf0_window(
 ///      `RLX_WGPU_COOP_F16_VK_LARGE_N=1`. See `coop_f16_vk_eligible`.
 ///   3. CoopF32 — `simdgroup_float8x8` on Metal, the portable 8×8 form on
 ///      Vulkan, when cooperative matrices are available, B is a Param and
-///      the shapes align.
+///      the shapes align. A shape outside this cascade that keeps the weight in
+///      the first operand — the two convolution GEMM routes — reads the same
+///      admission with the roles swapped; see [`conv_gemm`].
 ///   4. F32 — every other case, *including* when AutoMixedPrecision
 ///      tagged the matmul as F16 but it failed Coop16's alignment
 ///      check. The non-coop F16 path (`matmul_f16_compute.wgsl`) was
@@ -2784,15 +2809,12 @@ fn derive_matmul_compute_default(
     // untouched. (The Coop16 / matmul_qkv paths still require m%32==0;
     // their kernels don't have the same bounds check.)
     //
-    // Vulkan uses `matmul_coop_f32_portable` (8×8 tiles, coopLoadT) which
+    // Vulkan uses `matmul_coop_f32_portable` (8×8 tiles, coopLoad) which
     // only requires k%8 and n%8.
     let coop16_aligned = m.is_multiple_of(32) && k.is_multiple_of(8) && n.is_multiple_of(32);
-    let coop_f32_metal_aligned = k.is_multiple_of(8) && n.is_multiple_of(32);
-    let coop_f32_portable_aligned = k.is_multiple_of(8) && n.is_multiple_of(8);
     let has_coop = dev
         .features()
         .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
-    let backend = crate::device::wgpu_device().map(|d| d.backend);
     let b_is_param = traces_to_param(graph, b_id);
 
     // ── Eligibility, computed ONCE ──────────────────────────────────────────
@@ -2823,71 +2845,22 @@ fn derive_matmul_compute_default(
         && !mirror_acts.contains(&b_id)
         && crate::coop_probe::f16_vk_path_ok(n);
 
-    // CoopF32 (`simdgroup_float8x8` on Apple): the f32 hardware-GEMM
-    // path. Used whenever cooperative-matrix is available, B is a
-    // Param, and shapes align — gives ~5-10× speedup over the
-    // tiled `matmul_wide` path with no precision loss vs the f32
-    // baseline (BERT max|Δ| stays at 2.3e-3 vs CPU on Apple).
-    //
-    // CoopF32: on by default on Metal. The Vulkan portable 8×8 path is
-    // selected automatically too, when the adapter reports 8×8 f32
-    // cooperative matrices; RLX_WGPU_FORCE_COOP_F32 only widens eligibility to
-    // adapters that report none (RTX lacks 8×8 f32 coop; output is unreliable).
-    let disabled = rlx_ir::env::flag("RLX_WGPU_NO_COOP_F32");
-    let forced = rlx_ir::env::flag("RLX_WGPU_FORCE_COOP_F32");
-    // This was opt-in because Metal `simdgroup_float8x8` CoopF32 produced
-    // ORTHOGONAL GARBAGE (not mere imprecision) on Gemma-4 vision/audio f32
-    // param-weight matmuls — scaled[1,64,768] @ input_proj[768,768], all axes
-    // aligned, gave cos 0.016 vs CPU. GGUF text models dodged it via the
-    // DequantMatMul path.
-    //
-    // ROOT CAUSE, and why "orthogonal" was the exact right word: the kernel
-    // computed `b·a` instead of `a·b`. For two unrelated matrices those are
-    // near-orthogonal, hence cos≈0 rather than a merely noisy cos≈1. Every
-    // `coopLoad` from row-major memory yields the transpose under this path's
-    // column-major fragment convention, so `ã·b̃ = aᵀbᵀ = (b·a)ᵀ`, and the
-    // equally-transposed `coopStore` writes that back as `b·a`. Loading each
-    // operand into the OTHER fragment role fixes it; see the note in
-    // `kernels/matmul_coop_f32.wgsl`. The same bug was in
-    // `matmul_qkv_coop_f32.wgsl` and `matmul_coop16.wgsl`.
-    //
-    // Measured after the fix, M4 Pro, f32 square GEMM against `matmul_wide`:
-    //   512³   88 → 403 GF/s   (4.6×)
-    //   1024³  96 → 745 GF/s   (7.8×)
-    //   2048³ 100 → 990 GF/s   (9.9×)
-    // and the Gemma-4 shape above is now BIT-EXACT vs CPU (cos 1.000000,
-    // max|Δ| 0.0). `RLX_WGPU_NO_COOP_F32=1` opts back out.
-    // A BF16 rhs param keeps the PACKED path (`matmul_bf16w`), which reads 2 B
-    // per element instead of 4 and is installed by the caller only when this
-    // function answers `F32`. Letting default-on CoopF32 outrank it silently
-    // disabled the packed path for every aligned bf16 shape — correct numbers,
-    // but twice the weight bandwidth, and
+    // CoopF32 for a multiply whose weight is operand B: `b_is_param` is the
+    // cascade's term for that role — it keeps the f16-shadow, packed-bf16 and
+    // cooperative-f16 families, each of which reads a weight-side buffer the B
+    // role builds, in front of the f32 cooperative kernel. A BF16 Param rhs
+    // keeps the PACKED path (`matmul_bf16w`), which reads 2 B per element
+    // instead of 4 and is installed by the caller only when this function
+    // answers `F32`; letting default-on CoopF32 outrank it silently disabled
+    // the packed path for every aligned bf16 shape — correct numbers, but
+    // twice the weight bandwidth, and
     // `rlx-runtime/tests/wgpu_bf16_weight_matmul.rs` asserts the packed
     // dispatch actually happens. `RLX_WGPU_FORCE_COOP_F32` still overrides.
-    let metal_coop = !disabled
-        && has_coop
-        && coop_f32_metal_aligned
-        && b_is_param
-        && (forced || (matches!(backend, Some(wgpu::Backend::Metal)) && !(any_bf16 && b_is_param)));
-    let vulkan_coop = !disabled
-        && has_coop
-        && coop_f32_portable_aligned
-        && b_is_param
-        && crate::device::coop_discrete_backend()
-        && crate::device::coop_f32_8x8_supported();
-    let coop_f32_ok = (metal_coop
-        || vulkan_coop
-        || (forced
-            && has_coop
-            && b_is_param
-            && (coop_f32_metal_aligned || coop_f32_portable_aligned)))
-        // Final gate: the kernel must have been shown to compute `a·b` ON THIS
-        // DEVICE. `coopLoad`/`coopLoadT` mean different things on Metal and
-        // Vulkan (naga's one `row_major` bool becomes Metal's
-        // `transpose_matrix` but SPIR-V's `RowMajorKHR`/`ColumnMajorKHR`), so
-        // no compile-time choice can be right everywhere. Memoized; see
-        // `crate::coop_probe`.
-        && crate::coop_probe::f32_path_ok(backend);
+    //
+    // The two convolution GEMM routes read the same admission with the weight
+    // in the FIRST operand, and no packed form to keep; see
+    // [`conv_gemm`].
+    let coop_f32_ok = b_is_param && coop_f32_admitted(dev, k, n, any_bf16 && b_is_param);
 
     let eligible = MatmulEligibility {
         coop16: coop16_ok,
@@ -2909,6 +2882,103 @@ fn derive_matmul_compute_default(
         MatmulCompute::F32
     };
     (default, eligible)
+}
+
+/// Whether the f32 cooperative-matrix kernel may serve a multiply with this
+/// contraction (`k`) and output-column (`n`) extent on this device.
+///
+/// Shared by the ordinary matmul cascade and the two convolution GEMM routes
+/// ([`conv_gemm`]), so every lever governs both: `RLX_WGPU_NO_COOP_F32` opts
+/// out, `RLX_WGPU_FORCE_COOP_F32` widens admission to adapters that report no
+/// 8×8 f32 cooperative matrices, `RLX_WGPU_MATMUL_F32_ONLY` pins the whole
+/// matmul machinery to F32 (read here as well as in the cascade, so the conv
+/// routes obey it too), and the last term is the per-device operand-order probe.
+/// `bf16_weight_in_b` is the one term that is the ordinary multiply's alone — the
+/// conv callers pass `false` for it. The backend term is the other way round: the
+/// conv callers ask this from inside their own Metal scope, which is narrower
+/// than what this function admits on a Vulkan/DX12 adapter, so every lever
+/// governs both but the scope does not — see [`conv_gemm`].
+///
+/// CoopF32 (`simdgroup_float8x8` on Apple) is the f32 hardware-GEMM path. It is
+/// on by default on Metal; the Vulkan portable 8×8 path is selected
+/// automatically too, when the adapter reports 8×8 f32 cooperative matrices.
+/// This was opt-in because Metal `simdgroup_float8x8` CoopF32 produced
+/// ORTHOGONAL GARBAGE (not mere imprecision) on Gemma-4 vision/audio f32
+/// param-weight matmuls — scaled[1,64,768] @ input_proj[768,768], all axes
+/// aligned, gave cos 0.016 vs CPU. GGUF text models dodged it via the
+/// DequantMatMul path.
+///
+/// ROOT CAUSE, and why "orthogonal" was the exact right word: the kernel
+/// computed `b·a` instead of `a·b`. For two unrelated matrices those are
+/// near-orthogonal, hence cos≈0 rather than a merely noisy cos≈1. Every
+/// `coopLoad` from row-major memory yields the transpose under this path's
+/// column-major fragment convention, so `ã·b̃ = aᵀbᵀ = (b·a)ᵀ`, and the
+/// equally-transposed `coopStore` writes that back as `b·a`. Loading each
+/// operand into the OTHER fragment role fixes it; see the note in
+/// `kernels/matmul_coop_f32.wgsl`. The same bug was in
+/// `matmul_qkv_coop_f32.wgsl` and `matmul_coop16.wgsl`.
+///
+/// Measured after the fix, M4 Pro, f32 square GEMM against `matmul_wide`:
+///   512³   88 → 403 GF/s   (4.6×)
+///   1024³  96 → 745 GF/s   (7.8×)
+///   2048³ 100 → 990 GF/s   (9.9×)
+/// and the Gemma-4 shape above is now BIT-EXACT vs CPU (cos 1.000000,
+/// max|Δ| 0.0). `RLX_WGPU_NO_COOP_F32=1` opts back out.
+fn coop_f32_admitted(dev: &wgpu::Device, k: u32, n: u32, bf16_weight_in_b: bool) -> bool {
+    // `RLX_WGPU_MATMUL_F32_ONLY` is an explicit pin: F32 is the only admissible
+    // path for the whole matmul machinery. Read in two places, and both are
+    // load-bearing: the cascade's own early return is what makes the pin absolute
+    // for every ordinary multiply (it clears all four eligibility flags), while
+    // this read covers the two convolution GEMM routes, which ask this function
+    // directly — a pin they could route around would not be the pin the registry
+    // documents. If that early return is ever relaxed, this read has to become
+    // the whole gate there rather than just the f32 cooperative flag.
+    if rlx_ir::env::flag("RLX_WGPU_MATMUL_F32_ONLY") {
+        return false;
+    }
+    let disabled = rlx_ir::env::flag("RLX_WGPU_NO_COOP_F32");
+    let forced = rlx_ir::env::flag("RLX_WGPU_FORCE_COOP_F32");
+    let has_coop = dev
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+    let backend = crate::device::wgpu_device().map(|d| d.backend);
+    // The Metal 32×32 form's own alignment, and the portable 8×8 form's; M is
+    // free on the Metal kernel (see the kernel header for the padded A read it
+    // drops). Nothing wider is asked of either.
+    let metal_aligned = k.is_multiple_of(8) && n.is_multiple_of(32);
+    let portable_aligned = k.is_multiple_of(8) && n.is_multiple_of(8);
+    let metal_coop = !disabled
+        && has_coop
+        && metal_aligned
+        && (forced || (matches!(backend, Some(wgpu::Backend::Metal)) && !bf16_weight_in_b));
+    let vulkan_coop = !disabled
+        && has_coop
+        && portable_aligned
+        && crate::device::coop_discrete_backend()
+        && crate::device::coop_f32_8x8_supported();
+    (metal_coop
+        || vulkan_coop
+        || (forced && has_coop && (metal_aligned || portable_aligned)))
+        // Final gate: the kernel must have been shown to compute `a·b` ON THIS
+        // DEVICE. `coopLoad`/`coopLoadT` mean different things on Metal and
+        // Vulkan (naga's one `row_major` bool becomes Metal's
+        // `transpose_matrix` but SPIR-V's `RowMajorKHR`/`ColumnMajorKHR`), so
+        // no compile-time choice can be right everywhere. Memoized; see
+        // `crate::coop_probe`.
+        && crate::coop_probe::f32_path_ok(backend)
+}
+
+/// The workgroup grid the f32 cooperative kernel expects, by form: Metal's
+/// 32×32 tiles over (n, m), the portable 8×8 form over (m, n) — the axes are
+/// swapped between them. One definition for the two places that need it: the
+/// dispatch, and [`conv_gemm`]'s check that the grid is one the device can
+/// launch.
+pub(crate) fn coop_f32_grid(m: u32, n: u32) -> (u32, u32) {
+    if crate::device::wgpu_device().map(|d| d.backend) == Some(wgpu::Backend::Metal) {
+        (n.div_ceil(32), m.div_ceil(32))
+    } else {
+        (m.div_ceil(8), n.div_ceil(8))
+    }
 }
 
 /// Which dense-matmul compute paths are legal for one specific call.
@@ -2948,12 +3018,8 @@ impl MatmulEligibility {
     }
 }
 
-/// Pick the dense-matmul compute path, letting a measured override from the
-/// shared dispatch table retune the choice **within** what is legal here.
-///
-/// The table proposes; eligibility disposes. An override naming a path this
-/// call cannot run — a stale cache, or one copied from another adapter — is
-/// discarded in favour of the cascade's answer rather than honoured.
+/// Pick the dense-matmul compute path for one `MatMul` node: the cascade's
+/// eligibility, then a measured override from the shared dispatch table.
 #[allow(clippy::too_many_arguments)]
 fn derive_matmul_compute(
     dev: &wgpu::Device,
@@ -2967,6 +3033,97 @@ fn derive_matmul_compute(
 ) -> MatmulCompute {
     let (default, eligible) =
         derive_matmul_compute_default(dev, graph, mirror_acts, a_id, b_id, m, k, n);
+    apply_matmul_tuning(m, k, n, default, eligible)
+}
+
+/// The compute path for the two convolution GEMM routes' multiplies — the im2col
+/// panel multiply and the 1×1 pointwise one. Returns the path **and** the kernel
+/// to bind it with, because a bind group carries the pipeline's own layout.
+///
+/// Both routes put the weight in the **FIRST** operand, the reverse of every
+/// other call site, and that role alone rules out every other family: the
+/// f16-shadow, packed-bf16 and cooperative-f16 paths each read a weight-side
+/// buffer this role never builds. So the choice is binary, and it asks the same
+/// admission an ordinary multiply of the same shape asks ([`coop_f32_admitted`],
+/// with no packed form to keep) and reads the same shared dispatch table — which
+/// can move it back to `F32`, never onto a family that cannot serve the layout.
+///
+/// Three readings of "cannot be launched with the chosen kernel", and in each of
+/// them the node keeps today's kernel: this device's f32 cooperative pipeline
+/// must exist (`coop_kernel`), the grid it would be dispatched on must fit the
+/// per-dimension ceiling, and the run loop's dispatch guard must let it through.
+/// The dispatch guard is the one the conv sites sit inside rather than satisfy:
+/// its `b_is_param` term is the weight-in-B eligibility restated, and this kernel
+/// reads both operands straight out of the arena, so weight-in-A belongs inside
+/// that guard — every family that DOES need a weight-side buffer keeps its own
+/// eligibility (see the `Step::Matmul` arm in `run.rs`). Of the other two, the
+/// pipeline exists exactly when the admission's device feature does (the getter
+/// returns `None` for that reason), and the ceilings are out of reach at the
+/// shipped floors — the col cap bounds the im2col route's spatial and the
+/// pointwise route's cap is the ceiling itself. Both are checked anyway: they are
+/// the readings this call owns, and the floors are tunable.
+///
+/// The Metal term is scope, not alignment. It is what keeps the portable 8×8
+/// sibling, Vulkan's, out of these two classes: although these routes are
+/// host-staged on a Vulkan/DX12 adapter (`wgpu_prefer_conv_host` folds in
+/// `coop_discrete_backend`), `RLX_WGPU_SHARD_GPU` opts them back onto the device,
+/// and the kernel `matmul_coop_f32_active_kernel` would then return there is the
+/// portable one.
+fn conv_gemm(
+    dev: &wgpu::Device,
+    mm_k: &'static Kernel,
+    coop_kernel: Option<&'static Kernel>,
+    m: u32,
+    k: u32,
+    n: u32,
+) -> (MatmulCompute, &'static Kernel) {
+    let coop_f32 = match crate::device::wgpu_device().map(|d| d.backend) {
+        Some(wgpu::Backend::Metal) => {
+            let (gx, gy) = coop_f32_grid(m, n);
+            coop_kernel.is_some()
+                && gx <= MAX_WORKGROUPS_PER_DIM
+                && gy <= MAX_WORKGROUPS_PER_DIM
+                && coop_f32_admitted(dev, k, n, false)
+        }
+        _ => false,
+    };
+    let eligible = MatmulEligibility {
+        coop16: false,
+        coop_f16_vk: false,
+        coop_f32,
+        f32: true,
+    };
+    let picked = apply_matmul_tuning(
+        m,
+        k,
+        n,
+        if coop_f32 {
+            MatmulCompute::CoopF32
+        } else {
+            MatmulCompute::F32
+        },
+        eligible,
+    );
+    // `allows` admits CoopF32 only when `coop_f32` holds, which is the same
+    // condition that makes `coop_kernel` present.
+    match (picked, coop_kernel) {
+        (MatmulCompute::CoopF32, Some(kernel)) => (picked, kernel),
+        _ => (picked, mm_k),
+    }
+}
+
+/// Let the shared dispatch table retune `default` **within** what is legal here.
+///
+/// The table proposes; eligibility disposes. An override naming a path this
+/// call cannot run — a stale cache, or one copied from another adapter — is
+/// discarded in favour of the default rather than honoured.
+fn apply_matmul_tuning(
+    m: u32,
+    k: u32,
+    n: u32,
+    default: MatmulCompute,
+    eligible: MatmulEligibility,
+) -> MatmulCompute {
     let Some(want) = rlx_gpu_dispatch::dispatch::resolve_matmul(
         crate::tuning::gpu_arch(),
         m as usize,
@@ -3790,7 +3947,11 @@ fn build_matmul_bind_group(
         && let Some(coop_f32) = mm_coop_f32
     {
         // 2-binding layout — both A and B come from the f32 arena
-        // (no f16 shadow buffer needed for the pure-f32 path).
+        // (no f16 shadow buffer needed for the pure-f32 path). The `b_is_param`
+        // term above is this path's operand order, NOT a requirement of the
+        // kernel: the convolution GEMM routes reach CoopF32 weight-in-A and bind
+        // through `bind_arena_window`, so this branch deliberately does not
+        // mirror `run.rs`'s role-free CoopF32 dispatch guard.
         return (
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rlx-wgpu matmul_coop_f32 bg"),

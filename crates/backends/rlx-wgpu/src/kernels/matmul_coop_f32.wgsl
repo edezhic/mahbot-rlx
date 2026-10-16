@@ -20,13 +20,35 @@ enable wgpu_cooperative_matrix;
 // is similar for float8x8 vs half8x8) without the precision cliff.
 //
 // Bind group: 0=arena (f32 rw), 1=params (uniform). Reads A and B
-// directly from arena (B is a Param node — its f32 data is already
-// in-arena from `set_param`), no f16 shadow buffer needed.
+// directly from arena, no f16 shadow buffer needed — which is why the
+// weight's operand role does not matter to this kernel: the ordinary
+// multiply reads a Param weight out of the arena as `set_param` left it
+// in B, and the convolution GEMM routes read their weight out of the
+// same arena in A.
 //
 // REQUIREMENTS:
 //   - Device feature: EXPERIMENTAL_COOPERATIVE_MATRIX
-//   - M and N multiples of 32; K multiple of 8
+//   - K multiple of 8, N multiple of 32; M is free — the y grid rounds up to the
+//     next multiple of 32 and the store guard below drops the padded rows, so
+//     they are computed and discarded
 //   - workgroup_size(32) — Apple subgroup width
+//
+// The padded rows come at a price, and it is a relied-upon one: the `a_stage`
+// gather reads `row_base + 0..32` with NO check against `params.m`, so for an M
+// that is not a multiple of 32 it reads up to 31 rows past A's extent. That
+// access is expected to be survivable and its values to be disregarded — wgpu's
+// robust buffer access bounds any read to the binding (indeterminate values,
+// never a fault), and the rows those values accumulate into are the padded ones
+// the store guard skips, so no output depends on them. The same reliance covers
+// the convolution GEMM routes, whose A is the weight: their M is the output-
+// channel axis. `tests/conv_gemm_coop_f32.rs` carries a `c_out = 80` shape that
+// makes the read happen and checks the padded rows reach no output.
+//
+// The padded COLUMNS cost the same and are relied upon the same way. Under
+// `RLX_WGPU_FORCE_COOP_F32` admission widens to an N that is a multiple of 8
+// only, so the x grid rounds up as well, the `b_*` gathers read up to 31 columns
+// past B's row, and the store guard's `global_col >= params.n` term drops every
+// one of them — same reliance, same reasoning, and the same test.
 
 struct Params {
     m: u32,

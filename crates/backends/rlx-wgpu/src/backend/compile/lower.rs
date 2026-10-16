@@ -6592,6 +6592,14 @@ pub(crate) fn compile_static_inner(
                                 // uses, not a raw `arena.offset(id)` cast. `m` is the
                                 // output-channel axis here, so `from_conv1x1: true`
                                 // keeps active-extent dispatch from scaling it.
+                                let (compute_precision, mm) = conv_gemm(
+                                    &dev.device,
+                                    mm_k,
+                                    mm_coop_f32,
+                                    p2.c_out,
+                                    p2.c_in,
+                                    spatial as u32,
+                                );
                                 schedule.push(Step::Matmul {
                                     m: p2.c_out,
                                     k: p2.c_in,
@@ -6607,12 +6615,12 @@ pub(crate) fn compile_static_inner(
                                     bias_off_f32: 0,
                                     act_id: 0xFFFF,
                                     b_is_param: false,
-                                    compute_precision: MatmulCompute::F32,
+                                    compute_precision,
                                     from_conv1x1: true,
                                 });
                                 let u_mm = emit_uniform(std::mem::size_of::<MatmulParams>());
                                 let bg_mm =
-                                    bind_arena_window(&dev.device, mm_k, &arena, base, size, &u_mm);
+                                    bind_arena_window(&dev.device, mm, &arena, base, size, &u_mm);
                                 uniforms.push(u_mm);
                                 bind_groups.push(bg_mm);
                             } else if use_im2col {
@@ -6664,6 +6672,8 @@ pub(crate) fn compile_static_inner(
                                 let m = p2.c_out;
                                 let kk = k_total as u32;
                                 let nn2 = spatial as u32;
+                                let (compute_precision, mm) =
+                                    conv_gemm(&dev.device, mm_k, mm_coop_f32, m, kk, nn2);
                                 schedule.push(Step::Matmul {
                                     m,
                                     k: kk,
@@ -6680,12 +6690,12 @@ pub(crate) fn compile_static_inner(
                                     act_id: 0xFFFF,
                                     b_is_param: false,
                                     from_conv1x1: false,
-                                    compute_precision: MatmulCompute::F32,
+                                    compute_precision,
                                 });
                                 let u_mm = emit_uniform(std::mem::size_of::<MatmulParams>());
                                 let bg_mm = bind_arena_window(
                                     &dev.device,
-                                    mm_k,
+                                    mm,
                                     &arena,
                                     base_w,
                                     size_w,
