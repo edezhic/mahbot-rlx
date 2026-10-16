@@ -88,6 +88,20 @@ impl WgpuExecutable {
         (self.arena.offset(id) / 4) as u32
     }
 
+    /// Test hook: a node's own slot as the compiler's plan placed it —
+    /// `(byte offset, byte size)`, `None` where the node has no slot. The offset is
+    /// raw, so a weight parked in the weight buffer is visible to `is_weight_off`
+    /// ([`Self::test_arena_offset_elems`] divides it for element-addressed callers).
+    /// A lowering fold's placement premises read this rather than re-running the
+    /// compiler's pass sequence in the test, so the premise cannot describe a plan
+    /// other than the one the decision was taken on.
+    #[doc(hidden)]
+    pub fn test_slot_bytes(&self, id: NodeId) -> Option<(usize, usize)> {
+        self.arena
+            .has(id)
+            .then(|| (self.arena.offset(id), self.arena.len_of(id)))
+    }
+
     /// Test hook: step names in compile order (for native-path checks).
     #[doc(hidden)]
     pub fn test_step_names(&self) -> Vec<&'static str> {

@@ -569,6 +569,13 @@ lint-features:
         lint "rlx-ir test-support"          -p rlx-ir      --features test-support,backend-tests
         ;;
     esac
+    # `rlx-bench`'s frame-slicing harness measures the device path through a
+    # `#[cfg(feature = "gpu")]` half that no other row's target set reaches.
+    if cargo clippy -p rlx-bench --features gpu --example bench_frame_slicing -- -D warnings; then
+        checked+=("rlx-bench gpu (frame-slicing example)")
+    else
+        echo "FAILED: rlx-bench gpu (frame-slicing example)" >&2; exit 1
+    fi
     for f in cuda rocm; do
         if cargo check -p rlx-runtime --features "cpu,$f" --quiet 2>/dev/null; then
             lint "rlx-runtime cpu,$f" -p rlx-runtime --features "cpu,$f,backend-tests"

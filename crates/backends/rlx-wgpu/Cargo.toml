@@ -276,6 +276,18 @@ name = "f16_matmul"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "frames_concat_fusion"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "frames_concat_host_knob"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "frames_split_qkv_source"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "fused_residual_norm_cost"
 required-features = ["backend-tests"]
 

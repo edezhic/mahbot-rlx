@@ -94,6 +94,14 @@ pub const ELEMENTWISE_REGION_WGSL: &str = include_str!("elementwise_region.wgsl"
 pub const TRANSPOSE_WGSL: &str = include_str!("transpose.wgsl");
 pub const NARROW_WGSL: &str = include_str!("narrow.wgsl");
 pub const CONCAT_WGSL: &str = include_str!("concat.wgsl");
+/// The fused spelling of `narrow`-per-frame + `concat` — see the shader's own
+/// header, and [`crate::backend::compile::lower`]'s `detect_frames_pattern`.
+pub const FRAMES_WGSL: &str = include_str!("frames.wgsl");
+
+/// The invocation count per workgroup `frames.wgsl` declares and `run.rs`
+/// dispatches with — one number, in two languages, pinned by
+/// `frames_shader_matches_its_dispatch_geometry`.
+pub const FRAMES_WORKGROUP: u32 = 64;
 pub const GATHER_WGSL: &str = include_str!("gather.wgsl");
 pub const GATHER_SPLIT_WGSL: &str = include_str!("gather_split.wgsl");
 pub const GATHER_AXIS_WGSL: &str = include_str!("gather_axis.wgsl");
@@ -1009,6 +1017,29 @@ pub struct NarrowConcatParams {
     pub start: u32,
     pub in_off: u32,
     pub out_off: u32,
+}
+
+/// Frame-matrix dispatch parameters: `narrow`-per-frame + `concat` folded into
+/// one dispatch (`frames.wgsl`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct FramesParams {
+    pub src_off: u32,
+    pub dst_off: u32,
+    pub t: u32,
+    /// The source's leading-dims product, which the destination keeps as its middle
+    /// axis — and `1` in every schedule this fold emits: a source with rows of its
+    /// own keeps its per-frame steps instead (`detect_frames_pattern`), because the
+    /// mode the step scales trims a row axis.
+    pub outer: u32,
+    pub frame_len: u32,
+    pub hop: u32,
+    /// Elements to cover: `outer · n_frames · frame_len`, the row-major prefix of
+    /// the destination in (frame, leading dim, position) order — and the one word
+    /// the active-extent mode scales (see `safe_for_active_extent` in `step.rs`).
+    pub total: u32,
+    /// Uniform stride padding, as in this crate's other param structs.
+    pub _p0: u32,
 }
 
 /// Layout for gather.
@@ -2698,6 +2729,7 @@ static ELEMENTWISE_REGION_SPATIAL: OnceLock<Kernel> = OnceLock::new();
 static TRANSPOSE: OnceLock<Kernel> = OnceLock::new();
 static NARROW: OnceLock<Kernel> = OnceLock::new();
 static CONCAT: OnceLock<Kernel> = OnceLock::new();
+static FRAMES: OnceLock<Kernel> = OnceLock::new();
 static GATHER: OnceLock<Kernel> = OnceLock::new();
 static GATHER_SPLIT: OnceLock<Kernel> = OnceLock::new();
 static GATHER_AXIS: OnceLock<Kernel> = OnceLock::new();
@@ -3856,6 +3888,9 @@ pub fn narrow_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn concat_kernel(device: &wgpu::Device) -> &'static Kernel {
     CONCAT.get_or_init(|| build_kernel(device, "rlx-wgpu concat", CONCAT_WGSL, "concat"))
 }
+pub fn frames_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FRAMES.get_or_init(|| build_kernel(device, "rlx-wgpu frames", FRAMES_WGSL, "frames"))
+}
 pub fn gather_kernel(device: &wgpu::Device) -> &'static Kernel {
     GATHER.get_or_init(|| build_kernel(device, "rlx-wgpu gather", GATHER_WGSL, "gather"))
 }
@@ -4595,9 +4630,50 @@ pub fn matmul_qkv_coop_f16_vk_widen_kernel(device: &wgpu::Device) -> Option<&'st
 #[cfg(test)]
 mod tests {
     use super::{
-        CONV_TRANSPOSE2D_TILED_WGSL, ELEMENTWISE_REGION_WGSL, MATMUL_WIDE_VEC4_WGSL, TILED_TILE_CO,
-        TILED_TILE_U, WIDE_TAIL_M, WideGrid, WideVariant, conv_transpose2d_tiled_grid, wide_grid,
+        CONV_TRANSPOSE2D_TILED_WGSL, ELEMENTWISE_REGION_WGSL, FRAMES_WGSL, FRAMES_WORKGROUP,
+        MATMUL_WIDE_VEC4_WGSL, TILED_TILE_CO, TILED_TILE_U, WIDE_TAIL_M, WideGrid, WideVariant,
+        conv_transpose2d_tiled_grid, wide_grid,
     };
+
+    /// `frames.wgsl` parses and validates under the WebGPU baseline, and the
+    /// workgroup its dispatch covers elements with is the one it declares.
+    /// Device-free (naga only) and on the same reasoning as the tile pin below: a
+    /// WGSL mistake would surface as a panic at `create_shader_module` on every
+    /// machine whose graph takes this route rather than on whichever one happened
+    /// to run it. The fold can be stood down — `RLX_WGPU_CONCAT_HOST` does, pinned
+    /// in `tests/frames_concat_host_knob.rs` — but that lever only takes the concat
+    /// off its direct window path rather than back to the pre-fold spelling (the
+    /// crate README records the route it does take), so the pre-fold *device*
+    /// spelling is what this tree cannot re-take.
+    #[test]
+    fn frames_shader_matches_its_dispatch_geometry() {
+        let module = naga::front::wgsl::parse_str(FRAMES_WGSL).expect("wgsl parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("wgsl validate without any optional capability");
+        assert_eq!(
+            module
+                .entry_points
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["frames"],
+            "one compute entry, and it the one `run.rs` sets as the pipeline"
+        );
+        assert_eq!(
+            module.entry_points[0].workgroup_size,
+            [FRAMES_WORKGROUP, 1, 1],
+            "the shader's own workgroup size must be the Rust constant `run.rs` dispatches with"
+        );
+        assert!(
+            FRAMES_WGSL.contains(&format!("const WG: u32 = {FRAMES_WORKGROUP}u;")),
+            "the shader must declare its workgroup size from `FRAMES_WORKGROUP`: it also strides \
+             its invocations by it, so two copies of that number could be two different strides"
+        );
+    }
 
     /// `conv_transpose2d_tiled.wgsl` parses and validates under the WebGPU
     /// baseline, and the tile its dispatch grid is built from is the tile it

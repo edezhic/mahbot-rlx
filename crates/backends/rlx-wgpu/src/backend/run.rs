@@ -16,18 +16,18 @@ use crate::kernels::{
     ActivationBackwardParams, AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams,
     AttentionBwdParams, AttentionParams, BatchElementwiseRegionParams, BinaryParams, Conv1dParams,
     Conv2dParams, Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
-    ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
-    FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
-    GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNorm2dParams, LayerNormBwdParams,
-    LayerNormParams, Mamba2Params, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams,
-    Pool2dParams, Pool3dParams, ReduceParams, ReverseParams, RmsNormBwdParams, RnnParams,
-    RopeBwdParams, RopeParams, SampleParams, ScatterAddParams, SceBwdParams, SceParams,
-    SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
-    WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
-    ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_decode_eligible,
-    attention_decode_kernel, attention_kernel, attention_mask_kernel, axial_rope2d_kernel,
-    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    ElementwiseRegionParams, ExpandParams, FRAMES_WORKGROUP, FmaParams, FramesParams,
+    FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams,
+    GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
+    GatherBwdParams, GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNorm2dParams,
+    LayerNormBwdParams, LayerNormParams, Mamba2Params, MatmulParams, MatmulQkvParams,
+    NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams, ReverseParams,
+    RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, SampleParams, ScatterAddParams,
+    SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams,
+    UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams, activation_backward_kernel,
+    ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
+    attention_decode_eligible, attention_decode_kernel, attention_kernel, attention_mask_kernel,
+    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
     cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
@@ -38,13 +38,14 @@ use crate::kernels::{
     cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
     elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
     fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
-    fma_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
-    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
-    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
-    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_elements_kernel, gather_kernel,
-    gather_nd_kernel, gather_split_kernel, group_norm_backward_beta_kernel,
-    group_norm_backward_gamma_kernel, group_norm_backward_input_kernel, group_norm_kernel,
-    grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
+    fma_kernel, frames_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel,
+    fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel, fused_swiglu_kernel,
+    gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
+    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel,
+    gather_elements_kernel, gather_kernel, gather_nd_kernel, gather_split_kernel,
+    group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
+    group_norm_backward_input_kernel, group_norm_kernel, grouped_matmul_kernel, gru_kernel,
+    im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
     layernorm_kernel, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
     matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
@@ -1374,6 +1375,13 @@ impl WgpuExecutable {
                     Step::WelchPeaksGpu { params } => {
                         let mut p = *params;
                         p.welch_batch = scale(p.welch_batch);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    // The one word the mode scales (see `safe_for_active_extent`).
+                    Step::Frames { params } => {
+                        let mut p = *params;
+                        p.total = scale(p.total);
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
@@ -3268,6 +3276,19 @@ impl WgpuExecutable {
                                 pass.set_pipeline(&wk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 let (gx, gy, gz) = dispatch_dims(batch_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::Frames { params } => {
+                                let total = scale(params.total);
+                                if total == 0 {
+                                    gpu_bi += 1;
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let fk = frames_kernel(&dev.device);
+                                pass.set_pipeline(&fk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total, FRAMES_WORKGROUP);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::UmapKnn { params } => {

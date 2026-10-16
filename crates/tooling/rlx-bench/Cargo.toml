@@ -21,6 +21,8 @@ rlx-cpu = { workspace = true }
 rlx-gguf = { workspace = true }
 rlx-driver = { workspace = true }
 rlx-mlx = { workspace = true, optional = true }
+# `bench_frame_slicing` reads its device rows off the wgpu lowering itself.
+rlx-wgpu = { workspace = true, optional = true }
 
 # `rlx-gpu`: read-only GPU temperature/power monitor. Reaches hardware
 # only when built with a backend feature (`--features cuda` / `rocm`);
@@ -34,7 +36,7 @@ default = []
 metal = ["rlx-runtime/metal"]
 mlx   = ["rlx-runtime/mlx", "dep:rlx-mlx"]
 mlx-cuda = ["mlx", "rlx-mlx/cuda"]
-gpu   = ["rlx-runtime/gpu"]
+gpu   = ["rlx-runtime/gpu", "dep:rlx-wgpu"]
 cuda  = ["rlx-runtime/cuda"]
 # Single-kernel on-chip FFT for Metal/wgpu (A/B against the multi-kernel path
 # via RLX_FFT_FAST=0). Pair with `metal` and/or `gpu`.

@@ -27,7 +27,7 @@
 //! which a small geometry cannot amortise but a large one can.
 //!
 //! Each cell compiles the same graph twice — once under
-//! `common::conv_transpose2d_device_route_env()`, once with `RLX_WGPU_CONV_HOST=1` —
+//! `common::neutralise_device_route_env()`, once with `RLX_WGPU_CONV_HOST=1` —
 //! **asserts the route each compile actually took** (`step_kind_counts()`: a
 //! measurement that silently timed the wrong route is worthless), warms each arm
 //! once untimed, then times `ROUNDS` rounds of `CALLS_PER_ROUND` back-to-back calls
@@ -394,7 +394,7 @@ fn conv_transpose2d_tiled_against_the_host_route_on_the_decoders_six_forms() {
     // As in the cell harness above: the `RLX_WGPU_CONV_HOST` windows of the two
     // tests in this binary are process-global.
     let _route = common::route_lock();
-    common::conv_transpose2d_device_route_env();
+    common::neutralise_device_route_env();
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;
@@ -534,7 +534,7 @@ fn conv_transpose2d_device_step_against_the_host_route_it_replaced() {
     // The `RLX_WGPU_CONV_HOST` window below is process-global, so this file's two
     // tests must not bracket one another.
     let _route = common::route_lock();
-    common::conv_transpose2d_device_route_env();
+    common::neutralise_device_route_env();
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;

@@ -12,7 +12,7 @@ use crate::kernels::{
     Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams, CopyParams, CumScanParams,
     CumsumBwdParams, CumsumParams, DequantMatmulMlxParams, DequantMatmulParams,
     ElementwiseRegionParams, ExpandParams, FakeQuantizeParams, FftButterflyStageParams, FmaParams,
-    FusedConvBiasActParams, FusedResidualLnParams, FusedResidualLnTeeParams,
+    FramesParams, FusedConvBiasActParams, FusedResidualLnParams, FusedResidualLnTeeParams,
     FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
     GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
     GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams, GruParams,
@@ -642,6 +642,12 @@ pub(crate) enum Step {
     },
     WelchPeaksGpu {
         params: WelchPeaksGpuParams,
+    },
+    /// The mel front-end's per-frame framing (`narrow` + `reshape` per frame,
+    /// stacked by one `concat`) lowered to a single strided read of the source —
+    /// `frames.wgsl`. See `lower.rs`'s `detect_frames_pattern`.
+    Frames {
+        params: FramesParams,
     },
     GroupedMatmul {
         params: GroupedMatmulParams,
@@ -1416,6 +1422,21 @@ impl Step {
             // scaled. Returning false disables the fast path for any graph
             // that contains an im2col conv (conv-heavy models don't use it).
             Step::Im2ColGpu { .. } => false,
+            // Unlike im2col, this one scales, and the trim lands on the frames a
+            // caller bucketing the frame axis reads: `total` counts whole frames
+            // (`outer · n_frames · frame_len`, row-major in frame order, and the
+            // fold is only taken where `outer == 1`), so the runner's
+            // `ceil(total · active/upper)` is the destination's own prefix — out to
+            // a frame boundary when the ratio divides, and part-way into a frame
+            // when it does not (the pin's `ceil(390 · 1/100)` = 4 words, the first
+            // frame's head), where the per-row steps this replaces would have cut a
+            // word out of *every* frame instead. Where a source carries rows of its
+            // own the fold is not taken at all (see `detect_frames_pattern`), so
+            // those steps keep their own scaling rather than losing the mode.
+            // Pinned, both ways, by `frames_concat_fusion.rs`'s
+            // `a_folded_framing_leaves_the_frames_past_the_extent_unwritten` and
+            // `a_framing_over_a_source_with_rows_keeps_its_per_frame_steps`.
+            Step::Frames { .. } => true,
             // Generic host custom-op reads exact per-node shapes off the arena;
             // disable the active-extent optimization when one is present.
             Step::CustomHost { .. } => false,
@@ -1595,6 +1616,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ScatterAdd { .. } => "scatter_add",
         Step::TopK { .. } => "topk",
         Step::WelchPeaksGpu { .. } => "welch_peaks_gpu",
+        Step::Frames { .. } => "frames",
         Step::GroupedMatmul { .. } => "grouped_matmul",
         Step::ScaledGroupedMatmul { .. } => "scaled_grouped_matmul",
         Step::Sample { .. } => "sample",
@@ -1795,6 +1817,9 @@ pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
         // `AttentionMask` is the many-row attention route's masked scale — a
         // pass over the score matrix a `Step::Matmul` has just written, in place
         // — so it is the same read-after-matmul shape as the kernels above.
+        //
+        // `Frames` is a producer in that same shape: one dispatch writing the
+        // whole frame matrix an elementwise front-end reads back.
         Step::Binary { .. }
         | Step::Unary { .. }
         | Step::Where { .. }
@@ -1809,6 +1834,7 @@ pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
                     | Step::MatmulQkv { .. }
                     | Step::BufferCopy { .. }
                     | Step::Gather { .. }
+                    | Step::Frames { .. }
                     | Step::Reduce { .. }
             )
         }

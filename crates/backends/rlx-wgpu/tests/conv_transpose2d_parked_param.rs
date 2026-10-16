@@ -72,7 +72,7 @@ fn a_parked_upsampler_weight_is_staged_on_the_device_route_and_refused_on_the_ho
     // The parked-weight switch is process-global, so this file's two tests must not
     // bracket one another's compiles.
     let _route = common::route_lock();
-    common::conv_transpose2d_device_route_env();
+    common::neutralise_device_route_env();
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;
@@ -176,7 +176,7 @@ fn a_parked_real_decoder_weight_reads_bit_like_the_unparked_arm() {
     // As above: the parked-weight switch is process-global, and a compile that read the
     // other test's window would measure the other arm.
     let _route = common::route_lock();
-    common::conv_transpose2d_device_route_env();
+    common::neutralise_device_route_env();
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;

@@ -26,7 +26,7 @@ use crate::kernels::{
     Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams, CopyParams, CumScanParams,
     CumsumBwdParams, CumsumParams, DequantMatmulMlxParams, DequantMatmulParams,
     ElementwiseRegionParams, ExpandParams, FakeQuantizeParams, FftButterflyStageParams, FmaParams,
-    FusedConvBiasActParams, FusedResidualLnParams, FusedResidualLnTeeParams,
+    FramesParams, FusedConvBiasActParams, FusedResidualLnParams, FusedResidualLnTeeParams,
     FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
     GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
     GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams, GruParams,
@@ -50,13 +50,14 @@ use crate::kernels::{
     dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
     elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
     fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
-    fma_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
-    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
-    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
-    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_elements_kernel, gather_kernel,
-    gather_nd_kernel, gather_split_kernel, group_norm_backward_beta_kernel,
-    group_norm_backward_gamma_kernel, group_norm_backward_input_kernel, group_norm_kernel,
-    grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
+    fma_kernel, frames_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel,
+    fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel, fused_swiglu_kernel,
+    gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
+    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel,
+    gather_elements_kernel, gather_kernel, gather_nd_kernel, gather_split_kernel,
+    group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
+    group_norm_backward_input_kernel, group_norm_kernel, grouped_matmul_kernel, gru_kernel,
+    im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
     layernorm_kernel, lead_pack_uniform, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
     matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
@@ -958,6 +959,311 @@ fn host_op_step(graph: &Graph, node: &rlx_ir::Node, arena: &Arena) -> Step {
     }
 }
 
+/// One `Op::Concat{axis: 0}` recognised as the mel front-end's framing: its rows
+/// are `narrow`(+`reshape`) frames sliced at a uniform `hop` out of one source,
+/// which is one strided read of that source and needs no index table to say so.
+///
+/// `Graph::stft` / `Graph::spectrogram` build exactly this, and so does any
+/// front-end that rolls its own framing out of the public builders — both are
+/// folded here without touching either's code.
+#[derive(Debug, Clone, Copy)]
+struct FramesPlan {
+    src: NodeId,
+    /// The source's last-axis length, the stride between one frame and the next
+    /// inside a leading-dims slice.
+    t: u32,
+    frame_len: u32,
+    hop: u32,
+    n_frames: u32,
+    /// Product of the source's leading dims — the destination's middle axis.
+    outer: u32,
+}
+
+/// Recognise per-frame framing (`narrow` per frame + one `concat`), returning the
+/// narrow/reshape nodes to elide and, per `concat`, the geometry the single
+/// `Step::Frames` dispatch needs.
+///
+/// The fold is worth it because the per-frame form is one step per frame on both
+/// sides of the copy (`Step::Narrow` and one `Step::Concat` input each): 200
+/// dispatches for 100 frames of 400 samples, where one strided read of the same
+/// source does it in one. It is deliberately NOT the shared IR builders' default
+/// — the batched `Op::Gather` spelling of the same matrix is ~9× slower on the
+/// CPU device, which is why this is a wgpu-local lowering fold rather than a
+/// change to `Graph::stft`.
+///
+/// Every clause below is a refusal, not a correction: a graph this cannot prove
+/// safe keeps the per-frame steps (and the values) it came with. This is the one
+/// place the clause list is recorded — the crate README and the pins name classes
+/// only, so a clause cannot be recorded in one place and updated in another.
+///
+/// 1. *the arena*: a sharded arena, one that cannot be bound whole at base zero
+///    (the kernel addresses the arena by absolute word offset), and the two
+///    structure/route knobs that move this arm's concat off its direct window path
+///    (`wgpu_prefer_structure_host`, `RLX_WGPU_CONCAT_HOST`).
+/// 2. *the rows*: every row a `narrow` (+ `reshape` view) of one source, at the
+///    source's last axis, of one length, each read by nothing but its own
+///    successor in the chain, none of them a graph output, and starting at
+///    `f · hop` with `hop` the same for all — the op is `Concat { axis: 0 }`.
+/// 3. *the source*: no rows of its own (`outer == 1`) — the mode this step scales
+///    trims a *row* axis, and the only rows the step presents are the frames, so a
+///    source that carries rows keeps the per-frame steps, which trim those rows
+///    (this also covers a zero-length leading dim); a shape known at build time
+///    (the geometry is baked); in range of the rows
+///    (`(n_frames-1)·hop + frame_len ≤ t`); a live slot (`arena.has`); a step that
+///    still *writes* it (`split_qkv_parents` — the split-QKV fold replaces that
+///    step's write with one into the narrow slots); a home in the activation arena
+///    (`is_weight_off` — a parameter parked in the weight buffer is a different
+///    binding, and today's planner only parks parameters, whose framing the
+///    destination clause below refuses first, so this is the belt to that braces);
+///    and a non-complex dtype (one word per element here, 2 or 4 lanes there).
+/// 4. *the destination*: a live slot (`arena.has`) and not a tensor the concat arm
+///    bakes as a static weight (`is_static_weight_tensor` — strictly wider than
+///    that arm's own `once` / `slot_is_exclusive` conditions).
+/// 5. *the source's live range*: nothing the planner placed on the source's bytes
+///    between the source's last reader (`last_use`) and this concat.
+///
+/// `node_pos` is the emission order the caller already keeps, which clause 5
+/// needs — the memory plan was built before this fold was chosen, and says
+/// nothing about the read this fold moves.
+///
+/// `static_weight_memo` is the caller's own memo for `is_static_weight_tensor`, so
+/// the classification clause 4 reads here is the same computation `Op::Concat`
+/// below reads rather than a second one.
+fn detect_frames_pattern(
+    graph: &Graph,
+    arena: &Arena,
+    dev: &crate::device::WgpuDevice,
+    node_pos: &HashMap<NodeId, usize>,
+    last_use: &HashMap<NodeId, usize>,
+    split_qkv_parents: &HashSet<NodeId>,
+    static_weight_memo: &mut HashMap<NodeId, bool>,
+) -> (HashSet<NodeId>, HashMap<NodeId, FramesPlan>) {
+    let mut skip: HashSet<NodeId> = HashSet::new();
+    let mut plans: HashMap<NodeId, FramesPlan> = HashMap::new();
+
+    // Who reads each tensor. A row may only be elided if nothing but its own
+    // successor in the chain reads it — and the consumer clauses below are
+    // checked per link (narrow → [reshape →] concat), so a frame sliced for a
+    // second purpose keeps its step.
+    let mut users: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for node in graph.nodes() {
+        for &input in &node.inputs {
+            users.entry(input).or_default().push(node.id);
+        }
+    }
+    let sole_user = |id: NodeId, user: NodeId| -> bool {
+        matches!(users.get(&id).map(Vec::as_slice), Some([only]) if *only == user)
+    };
+
+    // The kernel addresses the activation arena by ABSOLUTE word offset, so the
+    // whole arena has to be bound at base zero (`bind_op_output_window` refuses
+    // anything else outright) and the source has to live in that arena: a source
+    // parked in the weight buffer is a different binding, and the tag is dropped
+    // on the way into the uniform.
+    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+    if arena.is_sharded()
+        || !arena.binds_whole_at_base_zero(max_binding)
+        || wgpu_prefer_structure_host(arena)
+        // The framed concat is a concat, and `RLX_WGPU_CONCAT_HOST` is the
+        // concat arm's own bisect knob for taking those off their direct window
+        // path. Folding here would route around the lever, so honour it.
+        || rlx_ir::env::flag("RLX_WGPU_CONCAT_HOST")
+    {
+        return (skip, plans);
+    }
+
+    'concat: for node in graph.nodes() {
+        let Op::Concat { axis: 0 } = &node.op else {
+            continue;
+        };
+        if node.inputs.len() < 2 {
+            continue;
+        }
+        let mut rows: Vec<u32> = Vec::with_capacity(node.inputs.len());
+        // Only merged into `skip` once every clause below has held: an elided
+        // narrow with a step still emitting its consumer is a frame the concat
+        // reads from a slot nothing writes.
+        let mut elide: Vec<NodeId> = Vec::with_capacity(node.inputs.len());
+        let mut src: Option<NodeId> = None;
+        let mut frame_len: Option<u32> = None;
+        for &row in &node.inputs {
+            // A row is a frame: the narrow itself, or a view of it.
+            let reshaped = match &graph.node(row).op {
+                Op::Narrow { .. } => None,
+                Op::Reshape { .. } if graph.node(row).inputs.len() == 1 => Some(row),
+                _ => continue 'concat,
+            };
+            let narrow = match reshaped {
+                Some(r) => graph.node(r).inputs[0],
+                None => row,
+            };
+            let Op::Narrow { axis, start, len } = &graph.node(narrow).op else {
+                continue 'concat;
+            };
+            let in_id = graph.node(narrow).inputs[0];
+            // A frame that is itself a graph output has to be materialized where
+            // it stands, which the elided narrow no longer does.
+            if graph.outputs.contains(&narrow)
+                || reshaped.is_some_and(|r| graph.outputs.contains(&r))
+            {
+                continue 'concat;
+            }
+            // The narrow must slice the source's LAST axis: that is what makes a
+            // frame's words one contiguous run of the source, which is the whole
+            // reason this is a strided read rather than a gather.
+            if *axis + 1 != graph.node(in_id).shape.rank() {
+                continue 'concat;
+            }
+            // A reshape between the narrow and the concat has to be a view of it
+            // whose last dim is the frame length and whose element count is the
+            // narrow's, so the row's word order is the narrow's and the frame
+            // length the destination is laid out in is the one the narrow sliced.
+            // No leading-dim clause is needed: the source-rows rule below runs
+            // before this fold is chosen, and with `outer == 1` every leading dim is
+            // a unit, so a permuting view cannot be built from them.
+            if let Some(r) = reshaped {
+                let reshaped_shape = &graph.node(r).shape;
+                let last = reshaped_shape
+                    .dims()
+                    .last()
+                    .filter(|d| d.is_static())
+                    .map(|d| d.unwrap_static());
+                if last != Some(*len)
+                    || reshaped_shape.num_elements() != graph.node(narrow).shape.num_elements()
+                {
+                    continue 'concat;
+                }
+                if !sole_user(narrow, r) || !sole_user(r, node.id) {
+                    continue 'concat;
+                }
+            } else if !sole_user(narrow, node.id) {
+                continue 'concat;
+            }
+            // All rows are frames of the same source, of the same length, or the
+            // concat is not one frame matrix.
+            if src.is_some_and(|s| s != in_id) || frame_len.is_some_and(|fl| fl != *len as u32) {
+                continue 'concat;
+            }
+            src = Some(in_id);
+            frame_len = Some(*len as u32);
+            rows.push(*start as u32);
+            elide.push(narrow);
+            if let Some(r) = reshaped {
+                elide.push(r);
+            }
+        }
+        let (Some(src), Some(frame_len)) = (src, frame_len) else {
+            continue;
+        };
+        // Uniform hop: `starts[f] == f * hop`, so `start == 0` and the hop is the
+        // one the rows already agree on.
+        if rows[0] != 0 {
+            continue;
+        }
+        let hop = rows[1] - rows[0];
+        if hop == 0 || rows.iter().enumerate().any(|(f, &s)| s != f as u32 * hop) {
+            continue;
+        }
+        // The source's own step may not exist any more. The split-QKV fold elides
+        // an `FusedMatMulBiasAct`'s step (replacing it with `MatmulQkv`) and writes
+        // Q/K/V into the *narrow* slots, never the parent's own slot — and three
+        // last-axis narrows of a parent, re-joined by a concat, are exactly this
+        // fold's pattern. Reading such a parent here would read a slot nothing
+        // writes (measured: the whole matrix zeros against a non-zero reference).
+        // `rlx-lightbeam`'s GRU gate projection is that shape in the wild.
+        if split_qkv_parents.contains(&src) {
+            continue;
+        }
+        // In range, in the activation arena, and at a shape that is known at
+        // build time: the geometry below is baked into the kernel's parameters,
+        // so a source whose dims are symbols has no address to bake.
+        if !graph.node(src).shape.is_static() {
+            continue;
+        }
+        let src_dims = graph.node(src).shape.dims();
+        let t = src_dims[src_dims.len() - 1].unwrap_static() as u32;
+        let n_frames = node.inputs.len() as u32;
+        if (n_frames - 1) * hop + frame_len > t
+            || !arena.has(src)
+            || !arena.has(node.id)
+            || crate::buffer::is_weight_off(arena.offset(src))
+        {
+            continue;
+        }
+        // `frames.wgsl` moves one arena word per element, which is what the
+        // narrow/concat steps it replaces do for every non-complex dtype — and is
+        // wrong for a complex one, whose elements are 2 or 4 contiguous lanes.
+        // Complex framing would be half-written rather than refused, so refuse.
+        if graph.node(src).shape.dtype().is_complex() || node.shape.dtype().is_complex() {
+            continue;
+        }
+        // A framing the concat arm bakes as a static weight tensor (`once` /
+        // `slot_is_exclusive`, at `Op::Concat` below) is dispatched once ever
+        // there; the folded step has no such bake, so it would dispatch that
+        // matrix once per call instead. Leaving those concats to the arm that
+        // knows how to bake them needs both of its conditions, so this refusal
+        // stands on the destination's provenance alone and is strictly wider than
+        // that arm's decision — conservative on purpose.
+        if is_static_weight_tensor(graph, node.id, static_weight_memo) {
+            continue;
+        }
+        // The fold reads the source at the concat's step, while the plan's
+        // liveness for it ends at its last reader (`last_use`, above). Anything
+        // the planner placed on the source's bytes after that was free for the
+        // per-frame copy this fold removes — the destination itself, when the
+        // planner hands it the source's slot — so the step would read that value
+        // back as the framing. Reached by a source of one row whose last-axis
+        // narrows are copies — an inner-axis narrow never aliases its source,
+        // whatever the hop; only axis-0 narrows are views — so the source dies at
+        // its last narrow while the fold still reads it. The hop being wider than a
+        // frame is what makes the source wider than the destination, and that is
+        // what lets the planner place the destination on its head; the placement
+        // itself is read off the plan rather than argued, and the pin asserts it.
+        let last_read = last_use.get(&src).copied().unwrap_or(0);
+        let concat_pos = node_pos[&node.id];
+        if graph.nodes().iter().any(|n| {
+            node_pos[&n.id] > last_read
+                && node_pos[&n.id] <= concat_pos
+                && !elide.contains(&n.id)
+                && arena.has(n.id)
+                && arena_tensors_overlap(arena, src, n.id)
+        }) {
+            continue;
+        }
+
+        // The mode's trim is a row axis, and the only rows this step presents are
+        // the frames — so the fold is taken only where the source has no row axis
+        // of its own to compete with them. With a leading dim of its own (`outer`
+        // > 1) the per-frame steps this fold replaces trimmed the *source's* rows,
+        // so a caller bucketing those rows must keep them: the fold stands down and
+        // leaves those steps — and the mode, which scales them correctly — in
+        // place. A zero-length leading dim falls out of the same clause, and would
+        // otherwise dispatch over a destination with no elements while the kernel's
+        // bound counts frames (reading and writing the arena's head).
+        let outer = src_dims[..src_dims.len() - 1]
+            .iter()
+            .map(|d| d.unwrap_static() as u32)
+            .product::<u32>();
+        if outer != 1 {
+            continue;
+        }
+        skip.extend(elide);
+        plans.insert(
+            node.id,
+            FramesPlan {
+                src,
+                t,
+                frame_len,
+                hop,
+                n_frames,
+                outer,
+            },
+        );
+    }
+
+    (skip, plans)
+}
+
 pub(crate) fn compile_static_inner(
     graph: Graph,
     rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
@@ -1398,6 +1704,23 @@ pub(crate) fn compile_static_inner(
         .flat_map(|&(q, k, v)| [q, k, v])
         .collect();
 
+    // Mel front-end framing: one `narrow`(+`reshape`) per frame, stacked by one
+    // `concat`. On device that is two steps per frame for a single strided read
+    // of the source, so the whole matrix is folded into one `Step::Frames`.
+    // The split-QKV parents go with it: their step is replaced by `MatmulQkv`,
+    // which writes the narrow slots rather than the parent's own.
+    let split_qkv_parents: HashSet<NodeId> = qkv_split.keys().copied().collect();
+    let mut static_weight_memo: HashMap<NodeId, bool> = HashMap::new();
+    let (frames_skip, frames_plans) = detect_frames_pattern(
+        &graph,
+        &arena,
+        dev,
+        &node_pos,
+        &last_use,
+        &split_qkv_parents,
+        &mut static_weight_memo,
+    );
+
     // EEG-DINO / packed QKV: FMB → [B,S,3,H,D] → Narrow×3 (axis 2) → Attention.
     // Match CPU `compile_thunks` fused_strided_attn: read Q/K/V from the
     // packed parent with seq stride 3·H·D instead of materializing narrows.
@@ -1539,7 +1862,6 @@ pub(crate) fn compile_static_inner(
 
     let mut coop_f16_host_activations: Vec<(NodeId, Activation, String)> = Vec::new();
     let mut static_once_steps: HashSet<usize> = HashSet::new();
-    let mut static_weight_memo: HashMap<NodeId, bool> = HashMap::new();
 
     // Slot-safety for `static_once`: a static-weight pack may only skip recompute
     // on a graph re-run if it OWNS its arena slot exclusively. `plan_memory`'s
@@ -3636,6 +3958,15 @@ pub(crate) fn compile_static_inner(
             }
 
             Op::Reshape { .. } => {
+                // A row of the mel front-end's framing: a view of a frame narrow
+                // whose value `Step::Frames` writes into the concat's slot
+                // directly, so the row's own slot is never read. Skipped before
+                // the aliasing check below rather than through it — the narrow it
+                // views is skipped too, and a `BufferCopy` here would be a step
+                // for a tensor nothing reads.
+                if frames_skip.contains(&node.id) {
+                    continue;
+                }
                 // Normally a view-alias (planner / from_plan_split). If the
                 // output lands on a distinct slot, copy like Cast — otherwise
                 // the slot stays zero and Expand/Add of Param biases die.
@@ -4001,8 +4332,15 @@ pub(crate) fn compile_static_inner(
                 // (or will be) replaced by Step::MatmulQkv that writes
                 // directly into this narrow's arena slot. Skip the
                 // narrow's own dispatch.
+                //
+                // Or a frame of the mel front-end's framing, which
+                // `Step::Frames` at the concat below reads straight out of this
+                // narrow's source — so this slot is written by nobody and read by
+                // nobody (its single consumer is that concat, proven in
+                // `detect_frames_pattern`).
                 if qkv_skip_narrows.contains(&node.id)
                     || packed_bshd_skip_narrows.contains(&node.id)
+                    || frames_skip.contains(&node.id)
                 {
                     continue;
                 }
@@ -4151,6 +4489,33 @@ pub(crate) fn compile_static_inner(
                 });
             }
             Op::Concat { axis } => {
+                // Mel front-end framing: every input is a frame narrow (or a view
+                // of one) sliced out of one source at a uniform hop, so the whole
+                // concat is one strided read of that source. One dispatch instead
+                // of one per frame, and no index table (see
+                // `detect_frames_pattern` for the clauses this stands on).
+                if let Some(plan) = frames_plans.get(&node.id) {
+                    let p = FramesParams {
+                        src_off: (arena.offset(plan.src) / 4) as u32,
+                        dst_off: (arena.offset(node.id) / 4) as u32,
+                        t: plan.t,
+                        outer: plan.outer,
+                        frame_len: plan.frame_len,
+                        hop: plan.hop,
+                        total: plan.outer * plan.n_frames * plan.frame_len,
+                        _p0: 0,
+                    };
+                    schedule.push(Step::Frames { params: p });
+                    let fk = frames_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<FramesParams>());
+                    // Whole-arena bind: `detect_frames_pattern` refuses a sharded
+                    // arena or one past the binding ceiling precisely so these
+                    // absolute word offsets address the arena they were taken in.
+                    let bg = bind_op_output_window(&dev.device, fk, &arena, node.id, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                    continue;
+                }
                 let out_shape = node.shape.dims();
                 let outer: u32 = out_shape[..*axis]
                     .iter()

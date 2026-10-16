@@ -34,6 +34,16 @@ PrecisionPolicy Y?"
     `FK_BENCH_OPS=1` prints fused op counts; `RLX_FK_BATCH_SINGLE_KERNEL=1`
     (CUDA/ROCm/Metal/wgpu) uses one batch-region launch; TPU uses per-slice HLO.
     See [`docs/fk-fusion.md`](../../../docs/fk-fusion.md).
+  - `bench_frame_slicing` — a mel front-end's *framing* (slice-per-frame vs
+    `Op::Im2Col` vs batched `Op::Gather`) and the stages that ride on it, at the
+    shapes that stage is run at; every row carries a time, a step census, a heap and
+    arena line, and — where the row has a baseline — a `max|Δ|` against it: the
+    plain-Rust framing, which does not use the backend, for a framing row, and this
+    device's own slice-per-frame form of the same stage for a whole-stage row. `-`
+    sits in the columns a row has no reading for.
+    The reading and the method are in
+    [`rlx-wgpu`'s README](../../backends/rlx-wgpu/README.md); run `just throttle`
+    first, as with the others.
 
 Cross-platform results: [`docs/benchmarks/higher-order-ad.md`](../../../docs/benchmarks/higher-order-ad.md).
 

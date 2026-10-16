@@ -236,6 +236,161 @@ also unfuses `ElementwiseRegion` on wgpu (region kernel only supports trailing
 broadcast). `Activation::Gelu` uses exact `erf` in `unary.wgsl` (not the tanh
 approx).
 
+## The mel front-end's framing (one step instead of one per frame)
+
+A mel front-end's framing — one `narrow`(+`reshape`) per frame, stacked by one
+`concat`, which is what `Graph::stft` / `Graph::spectrogram` emit — is recognised
+at lowering and becomes one `Step::Frames`, a strided read of the signal that
+replaces two steps per frame and carries no index table
+(`lower::detect_frames_pattern`): the dispatch count follows the work rather than
+the frame count. `Op::Slice` is the other spelling of a frame slice and reaches the
+same place — this backend has no step for it, so the compiler rewrites it to this
+form (`rlx_fusion::lower_slice`), pinned end to end.
+
+Measured on an M3 Pro with `cargo run -p rlx-bench --release --example
+bench_frame_slicing --features gpu` at hop 160 (21 runs after warm-up, `just
+throttle` clean). The counts and the planned bytes (arena, tables) are exact, and the
+heap figure is the **Rust** heap's own peak — a counting global allocator, so it sees
+nothing the driver allocates and the device side is the arena line; the µs move with a shared
+box's load — the harness prints each row's own p10–p90 for that reason, and the
+ranges below span four takes at `load1` 3.2–8.4 — so every row has a count beside
+it. 512-at-hop-160 neighbours of the same rows carry the same counts (arena 201
+and 264 KiB):
+
+| the front-end's framing | 76 × 400 | 100 × 400 |
+|---|---|---|
+| slice-per-frame, pre-fold | 152 steps, 0.57–0.72 ms | 200 steps, 0.58–0.72 ms |
+| fused `Step::Frames` | **1 step**, 225–234 µs, arena **167 KiB**, tables 0 | **1 step**, 215–234 µs, arena **219 KiB**, tables 0 |
+| batched `Op::Gather` | 1 step, 169–220 µs, arena 286 KiB, tables 118 KiB | 1 step, 169–191 µs, arena 376 KiB, tables 156 KiB |
+| `Op::Im2Col` | 1 host step, 2 sub/3 waits, 389–435 µs | 1 host step, 2 sub/3 waits, 404–427 µs |
+| front-end (framing + transform + band + log) | 8 steps, 664–824 µs | 8 steps, 487–680 µs |
+| the same front-end inside a consuming pass | 9 steps, 642–846 µs | 9 steps, 626–749 µs |
+| that pass's own floor (mel handed in) | 1 step, 208–259 µs | 1 step, 214–269 µs |
+| the front-end on the host, its mel handed to the same pass | 1 step, 354–412 µs (+24 KiB upload) | 1 step, 382–453 µs (+31 KiB) |
+
+The first column's 152/200 dispatches are that spelling's pre-fold reading on this
+backend: on the CPU device rows of the same sheet the spelling costs 14–17 µs a
+call, which is what it costs where nothing folds, while the pre-fold *device*
+spelling cannot be reached here any more — the concat arm's own lever
+(`RLX_WGPU_CONCAT_HOST`, pinned in `tests/frames_concat_host_knob.rs`) stands the
+fold down, but only takes the concat off its direct window path: on this
+unified-memory adapter it is then a *device* concat staged per input through scratch
+(`buffer_copy` + `concat`, 3 steps a frame, 228–300 steps at 6.1–8.1 ms), not the
+pre-fold 2-steps-a-frame spelling, and the host spelling is reached where this
+backend prefers hosting anyway (a discrete Vulkan/DX12 adapter, a sharded arena, or
+`RLX_WGPU_FORCE_HOST`) — so the pre-fold *time* cannot be re-taken in this tree
+either (0.57–0.72 ms a call on a quiet box, 0.85–1.56 ms on a loaded one, that form
+being host-encode bound at 2 dispatches a frame). The lever corroborates the count
+half of that reading and not the time half. The step census quoted here is taken for
+this backend's schedule.
+
+The batched `Op::Gather` reaches the same dispatch count and is consistently a
+little faster on time, but buys it with a `[n_frames, frame_len]` index table:
++119…+157 KiB of arena (167→286 and 219→376 KiB on the table) plus 118…156 KiB as
+constant tables. It is also ~9× *slower* than the per-frame spelling on the CPU
+device (117 µs against 13 µs at 76 × 400), which is why the shared builders keep the
+per-frame spelling and the fold lives in this backend's lowering. `Op::Im2Col` is one
+*host* step and pays a span round trip (2 submissions, 3 waits) on every call.
+
+The same harness prices the stage as a whole: the front-end inside a pass that
+consumes its mel reads 642–846 / 626–749 µs against **354–412 / 382–453 µs** for
+the front-end on the host with its mel handed to the same pass — disjoint ranges,
+so the host form is the cheaper one at these shapes by 1.6–2.4×, which is the same
+verdict the bar was set from (763/761 µs against 361/363 µs). One heavily loaded
+re-take put the device form 0.81× ahead of the host form, which is the box's own
+spread rather than a different answer: a single take's p10–p90 spans the gap. What
+is not load-dependent is the framing's share of this: it is at the pass's own floor
+(208–259 µs for one dispatch with its readback), while the front-end is 642–846 µs
+— so the fold removes the framing from the bill and the cell that remains is the
+one it feeds. That cell is the transform's own tables, a step of their own and on
+this backend both the expensive one and a bimodal one: at 76 × 400,
+within one take of 21 runs, it spans 607–869 µs while its neighbours span ~13 µs.
+The bar's other end is ~0.15 ms — the caller's own figure for a host stage, which is
+their CPU front-end (0.10 ms at their window) plus this pass's mel upload (24–31 KiB),
+and which this repo cannot re-take; what it can re-take is the host arm on the sheet
+above. So a device form of *this* front-end is not worth its dispatch: the fold is
+here because the framing is this backend's, not because the stage is, and a stage
+that wants the host can have it — the arms are on the same sheet, measured, rather
+than implied. The caller's own instrument closed the question the same way, by
+reading the staging cost as a slope and taking the pass floor with the same transfers
+and no work at all — its readings, out of tree and not re-takeable here: the device
+cannot get under that bar even at zero arithmetic (its floor alone is 0.28–0.29 ms
+against 0.25 ms for this front-end on the CPU and about 0.10 ms for the product's own
+function) — so **this stage's cheap form is the host one**, and the submission count
+is unchanged either way (one submission, one wait, nothing host-served inside the
+pass). No device work on the transform is owed.
+
+Two things this landing must not be read as changing. It folds the framing half
+only: `Graph::stft` / `Graph::spectrogram` pad the frame to a power of two and
+return their own bin count, so the builder's whole spectrogram is not a drop-in for
+the transform this stage computes. And the window maximum this front-end subtracts
+is value-bearing, not decoration: removing it shifts the mel by exactly the constant
+and moves the accepted answers with it (the caller's reading too, out of tree and not
+re-takeable here: the encoder diverges by about 0.997 against a spread of 3.6), so it
+stays — the other reading is not a quiet change but a re-acceptance of everything
+this front-end feeds.
+
+The mode the fold's step scales trims a row axis, so the fold is taken only where
+the rows a caller buckets are the rows the step presents: a source with **no rows of
+its own** (`outer == 1`), where the frame axis is the only row axis the folded step
+has. A `total` of whole frames (`outer · n_frames · frame_len`, row-major in frame
+order) then scales to the destination's own prefix — out to a frame boundary when the
+ratio divides, and part-way into a frame when it does not (the runner's own `ceil`:
+the pinned `ceil(390 · 1/100)` = 4 words keeps the first frame's head), where the
+per-row steps this replaces would have cut a word out of every frame.
+`a_folded_framing_leaves_the_frames_past_the_extent_unwritten` pins it the only way
+it can fail: the framing is the graph's own output, and after a full run and then a
+trimmed run over *different* input, the frames past the extent still hold the full
+run's values.
+
+Where the source carries rows of its own the fold is **not taken at all**, so the
+per-frame `narrow`/`concat` steps — which trim the source's rows, the axis such a
+caller buckets — keep both the route and the mode. Two pins say so:
+`a_framing_over_a_source_with_rows_keeps_its_per_frame_steps` (the census and the
+values) and `a_framing_over_a_row_source_keeps_the_mode` (a half-extent run over a
+second input leaves the first row of every frame the new input's and the second row
+the old one's). The cost is the fold's dispatch win on such a source, which the
+green surface does not have: `Graph::stft` / `Graph::spectrogram` frame a rank-1
+signal, so their framing folds.
+
+Re-taken in a loaded window (`load1` 12.6–13.5, same box) the counts and the
+memory lines of the table above are the same numbers to the byte, while the µs column moves
+with the load exactly as the paragraph above says: the in-pass rows read
+555–1744 µs against 438–1034 µs for the host form, and the pass floor 160–305 µs.
+
+It refuses anything it cannot prove safe, and a refused graph keeps its per-frame
+steps and its values. The clause list is recorded in **one** place —
+`detect_frames_pattern`'s own doc, which is what the lowering reads — and every
+class a pin can build has a case: `tests/frames_concat_fusion.rs`, plus
+`tests/frames_split_qkv_source.rs` for the class whose own graph hides it (there the
+planner hands the rewritten source's bytes to the destination, so that file's pins
+run with one slot per tensor and this clause is the one that decides). Which case
+asserts what — and the one case that is route-only — is that file header's own list,
+which also names the clauses no case can be built for and why. The concat lever's
+own reading is `tests/frames_concat_host_knob.rs`, a test binary of its own because the
+rest of the pins neutralise this crate's routing knobs as a set
+(`common::neutralise_device_route_env`).
+
+**Re-taking that reading.** `cargo run -p rlx-bench --release --example
+bench_frame_slicing --features gpu` measures the framing forms and the stages that
+ride on them at 76 and 100 frames of 400 samples at hop 160, and at their
+512-sample neighbours, and prints per row: the median of 21 runs after warm-up with
+its p10–p90, the step census from this crate's own lowering, submissions and waits
+per run, the Rust heap's own peak (a counting global allocator; the device side is
+the arena line), the planned arena at the alignment the lowering
+itself uses, the bytes a form carries as constant tables, and a max|Δ| against the
+row's own baseline — the plain-Rust framing, which does not use the backend, for a
+framing row, and this device's own slice-per-frame form of the same stage for a
+whole-stage row. That procedure is the reusable part: an arm
+table, a time line, a memory line and a census re-measure any stage whose cost is
+suspected of following a count rather than the work, with the form that only exists
+as a lowering fold compared both against the spellings the public API already
+offers and against the stage's own host form. `tests/frames_concat_fusion.rs` is
+the same reading as a gate: the census and the values at both shapes, the fold
+firing from this crate's own builders (`Graph::stft` / `Graph::spectrogram`), a
+consumer of the framing reaching the CPU answer, and a case per refusal clause
+(that file's header names the clauses it cannot build a case for).
+
 ## Where a run's time goes
 
 `RLX_WGPU_DBG_COUNTERS=1` prints a `[wgpu-run-report]` block to stderr once per

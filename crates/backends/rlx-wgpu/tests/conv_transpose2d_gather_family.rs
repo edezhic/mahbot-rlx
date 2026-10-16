@@ -286,7 +286,7 @@ fn inputs(geo: &ConvTranspose2dGeometry) -> (Vec<f32>, Vec<f32>) {
 /// both lists take them alike; the two lists then differ in nothing but their
 /// geometries and the step they must reach.
 fn compare_device_step_against_the_scalar_oracle(cases: &[Cfg], step: &str) {
-    common::conv_transpose2d_device_route_env();
+    common::neutralise_device_route_env();
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;
@@ -403,7 +403,7 @@ fn the_heavy_decoder_forms_match_the_scalar_oracle_too() {
 /// with the naive scalar oracle bit for bit, infinities included.
 #[test]
 fn non_finite_weight_on_a_dropped_tap() {
-    common::conv_transpose2d_device_route_env();
+    common::neutralise_device_route_env();
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;

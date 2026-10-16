@@ -344,25 +344,115 @@ pub fn expected_attention_routes(
     }
 }
 
-/// The levers that put `Op::ConvTranspose2d` on its device route — whichever of its
-/// two device steps the form's geometry selects — spelled in
-/// one place because every pin that has to reach that arm needs the same routers out
-/// of the way: `RLX_WGPU_FORCE_HOST`, `RLX_WGPU_DISCRETE_HOST`, `RLX_WGPU_ALLOW_SHARD`
-/// and `RLX_WGPU_ALL_PARAMS_WEIGHT` zeroed, the shard-cap lever neutralised to a value
-/// the adapter clamps back to its own limit, and `RLX_WGPU_SHARD_GPU=1` — which turns
-/// the whole structure-host preference off, because on a Vulkan/DX12 adapter its
-/// discrete term would otherwise host this op on any adapter kind and no other lever
-/// clears it. The graphs these pins build carry no structural ops, so the opt-out's own
-/// caveat (it is unsafe for Kitten NSF) does not reach them.
+/// The deterministic signal a framing is read over.
+pub fn framing_signal(t: usize) -> Vec<f32> {
+    (0..t).map(|i| (i as f32 * 0.017).sin() * 0.5).collect()
+}
+
+/// The starts a uniform hop implies: `f · hop`.
+pub fn framing_starts(n_frames: usize, hop: usize) -> Vec<usize> {
+    (0..n_frames).map(|f| f * hop).collect()
+}
+
+/// The frame matrix in plain Rust: `out[f, o, j] = sig[o·t + starts[f] + j]` for a
+/// source of `b` rows of `t`. What a correct framing is, independent of every
+/// backend — the rows are copies, so this is what they must be bit for bit. A
+/// complex source is read in lane units, where `t` is the source's lane count and
+/// a frame is `2 · frame_len` of them.
+pub fn framing_reference(
+    sig: &[f32],
+    b: usize,
+    t: usize,
+    starts: &[usize],
+    frame_len: usize,
+) -> Vec<f32> {
+    let mut out = vec![0f32; starts.len() * b * frame_len];
+    for (f, &s) in starts.iter().enumerate() {
+        for o in 0..b {
+            for j in 0..frame_len {
+                out[(f * b + o) * frame_len + j] = sig[o * t + s + j];
+            }
+        }
+    }
+    out
+}
+
+/// One `narrow_(x, axis, start, frame_len)` per start, each reshaped to
+/// `row_shape`, stacked by one `concat_(rows, 0)` — the framing
+/// `detect_frames_pattern` recognises, built row by row.
+pub fn framing(
+    g: &mut rlx_ir::Graph,
+    x: rlx_ir::NodeId,
+    axis: usize,
+    starts: &[usize],
+    frame_len: usize,
+    row_shape: &[i64],
+) -> rlx_ir::NodeId {
+    use rlx_ir::GraphExt as _;
+    let mut rows = Vec::with_capacity(starts.len());
+    for &s in starts {
+        let frame = g.narrow_(x, axis, s, frame_len);
+        rows.push(g.reshape_(frame, row_shape.to_vec()));
+    }
+    g.concat_(rows, 0)
+}
+
+/// `[T] → [n_frames, frame_len]` over the graph's own input: one `narrow_` +
+/// `reshape_` per frame, stacked by one `concat_`. This is the framing
+/// `rlx_wgpu`'s lowering recognises (`detect_frames_pattern`), and the shape a
+/// front-end that slices one frame at a time builds for itself.
+pub fn framed_over_input(n_frames: usize, frame_len: usize, hop: usize) -> rlx_ir::Graph {
+    let t = frames_signal_len(n_frames, frame_len, hop);
+    let mut g = rlx_ir::Graph::new("frames_per_frame");
+    let x = g.input("x", rlx_ir::Shape::new(&[t], rlx_ir::DType::F32));
+    let y = framing(
+        &mut g,
+        x,
+        0,
+        &framing_starts(n_frames, hop),
+        frame_len,
+        &[1, frame_len as i64],
+    );
+    g.set_outputs(vec![y]);
+    g
+}
+
+/// The signal length one such framing needs: `frame_len + (n_frames - 1) · hop`.
+pub const fn frames_signal_len(n_frames: usize, frame_len: usize, hop: usize) -> usize {
+    frame_len + (n_frames - 1) * hop
+}
+
+/// The slots the compiler's plan gave these nodes — `(byte offset, byte size)` each,
+/// `None` where a node has none — read from a compiled executable, which is the
+/// artifact the lowering's placement clauses were decided against. Nothing here
+/// re-runs the compiler's pass sequence, so a premise cannot describe a plan other
+/// than the one the refusal was taken on. The offsets are raw: a weight parked in
+/// the weight buffer shows up through `buffer::is_weight_off`.
+pub fn planned_slots(g: &rlx_ir::Graph, ids: &[rlx_ir::NodeId]) -> Vec<Option<(usize, usize)>> {
+    let exe = rlx_wgpu::backend::WgpuExecutable::compile(g.clone());
+    ids.iter().map(|&id| exe.test_slot_bytes(id)).collect()
+}
+
+/// The knobs that move a graph off this backend's device route — the structural
+/// ones (`wgpu_prefer_structure_host`, the shard striping) and the levers for the
+/// ops whose routes they decide — set to their "device, unsharded, params
+/// unparked" values: `RLX_WGPU_FORCE_HOST`, `RLX_WGPU_DISCRETE_HOST`,
+/// `RLX_WGPU_ALL_PARAMS_WEIGHT` and `RLX_WGPU_ALLOW_SHARD` zeroed, the shard-cap
+/// lever neutralised to a value the adapter clamps back to its own limit, and
+/// `RLX_WGPU_SHARD_GPU=1` — which turns the whole structure-host preference off,
+/// because on a Vulkan/DX12 adapter its discrete term would otherwise host any op
+/// on any adapter kind and no other lever clears it.
 ///
-/// The parked-weight lever belongs in that list too, as the other decision about this
-/// op's operands a pin should make for itself: the one pin that *wants* a parked weight
-/// sets it back to `1` after this call.
-///
-/// The skip stays the caller's own: ask
-/// `rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available())` after
-/// this, per file.
-pub fn conv_transpose2d_device_route_env() {
+/// A lever that belongs to *one* op's arm (`RLX_WGPU_CONCAT_HOST` for concat,
+/// `RLX_WGPU_CONV_HOST` for conv-transpose) is deliberately not in this set: the
+/// pins of that op add their own, so a developer bisecting another route keeps
+/// that lever. A pin that neutralises one variable is green in a default
+/// environment and red under a knob the crate documents, which is not a pin;
+/// `buffer_copy_batch_join.rs` guards the same set by assertion, the conv-transpose
+/// pins spell their own superset where a lever is theirs
+/// (`conv_route_cost.rs`, `conv_routes_parked_weight.rs`), and this is what the
+/// pins that read a device route use instead of an operator's environment.
+pub fn neutralise_device_route_env() {
     for key in [
         "RLX_WGPU_FORCE_HOST",
         "RLX_WGPU_DISCRETE_HOST",

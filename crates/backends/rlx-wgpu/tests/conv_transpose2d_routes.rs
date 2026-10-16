@@ -92,7 +92,7 @@ const DECODER: common::ConvTranspose2dGeometry = common::ConvTranspose2dGeometry
 #[test]
 fn the_upsampler_takes_the_device_step_and_falls_back_to_the_host_step_behind_its_lever() {
     let _route = common::route_lock();
-    common::conv_transpose2d_device_route_env();
+    common::neutralise_device_route_env();
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;
@@ -278,7 +278,7 @@ fn the_upsampler_takes_the_device_step_and_falls_back_to_the_host_step_behind_it
 #[test]
 fn a_declared_kernel_size_the_weight_disagrees_with_is_refused_on_the_device_route() {
     let _route = common::route_lock();
-    common::conv_transpose2d_device_route_env();
+    common::neutralise_device_route_env();
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;

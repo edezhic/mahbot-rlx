@@ -1375,6 +1375,50 @@ fn dispatch_dims(threads_total: u32, workgroup_size: u32) -> (u32, u32, u32) {
     }
 }
 
+#[cfg(test)]
+mod dispatch_dims_tests {
+    use super::*;
+
+    /// The two-dimensional branch, at the dimension boundary. The frames pins'
+    /// shapes do not reach it (76 × 400 is 30 400 elements) — one pin does, and
+    /// executes it (`frames_concat_fusion.rs`'s
+    /// `a_framing_past_one_dispatch_dimension_reads_its_own_matrix`) — so what is
+    /// pinned here, device-free, is the grid this branch builds and the shader's own
+    /// `lin = gid.x + gid.y · nwg.x · WG`, which is what makes a 2-D grid a
+    /// linearization rather than a hole.
+    #[test]
+    fn the_grid_splits_into_two_dimensions_at_the_dimension_cap() {
+        let wg = crate::kernels::FRAMES_WORKGROUP;
+        let one_row = MAX_WORKGROUPS_PER_DIM * wg;
+        assert_eq!(
+            dispatch_dims(one_row, wg),
+            (MAX_WORKGROUPS_PER_DIM, 1, 1),
+            "exactly one dimension's worth stays one-dimensional"
+        );
+        let (gx, gy, gz) = dispatch_dims(one_row + 1, wg);
+        assert_eq!((gx, gz), (MAX_WORKGROUPS_PER_DIM, 1));
+        assert_eq!(
+            gy, 2,
+            "one workgroup past the first dimension needs a second"
+        );
+        let covered = gx as u64 * gy as u64 * wg as u64;
+        let wanted = (one_row + 1) as u64;
+        assert!(
+            covered >= wanted && covered - wanted < gx as u64 * wg as u64,
+            "the grid must cover the workload in whole workgroup rows and no more: covered \
+             {covered}"
+        );
+        let linearization: String = crate::kernels::FRAMES_WGSL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            linearization.contains("gid.x + gid.y * nwg.x * WG"),
+            "the shader's linearization must be the one this grid assumes"
+        );
+    }
+}
+
 /// Shape/feature gate for CoopF16Vk (no operand tracing — avoids circular
 /// dependency with compile-time f16 mirror planning).
 ///

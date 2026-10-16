@@ -61,7 +61,7 @@ fn graph() -> Graph {
 fn the_host_step_spends_its_own_submission_and_poll_and_the_device_step_does_not() {
     common::refuse_under_run_report();
     let _route = common::route_lock();
-    common::conv_transpose2d_device_route_env();
+    common::neutralise_device_route_env();
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;
