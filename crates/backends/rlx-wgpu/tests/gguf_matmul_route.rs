@@ -9,12 +9,14 @@
 //! (`gguf_gpu::gemv_one_row_shape`).
 //!
 //! The same counters pin Q8_0's change point: the byte-per-weight form's one row
-//! is the tiled kernel's own block-keyed branch, and above one row it takes the
-//! row-grouped GEMM instead of the slab. The A/B block below measures such a call
-//! against the slab it used to take, at the shapes the packed steps actually
-//! multiply, and *reports* the figures (its `[rlx-gguf-q8-0-gemm]` lines) — the
-//! asserts there are the route, the recorded route census, the step count and the
-//! values, not the timings.
+//! is the tiled kernel's own block-keyed branch, and above one row, over whole
+//! 32-element packing blocks of its own, it takes the row-grouped GEMM instead of
+//! the slab — that arm's weight loop reads the scheme's blocks, and the 256-element
+//! tile it stages is eight of them, so a row may end inside a tile. The A/B block
+//! below measures such a call against the slab it used to take, at the shapes the
+//! packed steps actually multiply, and *reports* the figures (its
+//! `[rlx-gguf-q8-0-gemm]` lines) — the asserts there are the route, the recorded
+//! route census, the step count and the values, not the timings.
 //!
 //! Its own test binary, and the one test fn that reads the process-global counters:
 //! the other one, the device-free pin on the grid's Q8_0 expectation, reads none and
@@ -48,21 +50,25 @@ use rlx_runtime::{Device, Session};
 use rlx_wgpu::backend::PassMarks;
 use rlx_wgpu::buffer::Arena;
 use rlx_wgpu::gguf_gpu::{
-    DequantMatmulPath, DequantMatmulRoutes, GROUPED_STAGE_ELEMS, dequant_gguf_scratch_bytes,
-    gemv_one_row_shape, reset_gemv_one_row_shape, reset_route_counts, route_counts,
-    run_dequant_matmul_gguf_gpu, select_path,
+    DequantMatmulPath, DequantMatmulRoutes, dequant_gguf_scratch_bytes, gemv_one_row_shape,
+    reset_gemv_one_row_shape, reset_route_counts, route_counts, run_dequant_matmul_gguf_gpu,
+    select_path,
 };
 use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts, wgpu_device};
 
 /// Whether a Q8_0 call takes the scheme's one fused arm — the row-grouped GEMM —
 /// rather than the dequant slab: more than one row, and a `k` that is a whole
-/// number of the staged activation tiles that arm needs ([`GROUPED_STAGE_ELEMS`],
-/// the shader's `BLK_ELEMS`, which is eight of this scheme's 32-element blocks).
-/// Both terms are exercised by the shape grid below — its k=384 cell is what pins
-/// the tile term, which is what keeps this falsifiable there — while the A/B
-/// block's grid, every cell of it on tile, states the literal it is left with.
+/// number of this scheme's own 32-element packing blocks
+/// (`QuantScheme::GgufQ8_0.gguf_block_size()`), which is the granularity that arm's
+/// weight loop reads. Not the 256-element staged tile the arm shares with the
+/// K-quant entries, which is eight of those blocks: a whole number of blocks can
+/// end inside a tile. Both terms are exercised by the shape grid below — its k=384
+/// cell is 12 whole blocks and 1.5 tiles, so it is the off-tile cell that pins the
+/// block term rather than the tile, which is what keeps this falsifiable there —
+/// while the A/B block's grid states the literal it is left with, its 128 / 288 /
+/// 896 cells the class's own boundaries.
 fn q8_0_byte_direct(m: usize, k: usize) -> bool {
-    m > 1 && k.is_multiple_of(GROUPED_STAGE_ELEMS)
+    m > 1 && k.is_multiple_of(QuantScheme::GgufQ8_0.gguf_block_size() as usize)
 }
 
 /// Whether a Q8_0 call takes this scheme's own one-row arm — the tiled kernel's
@@ -79,7 +85,10 @@ fn q8_0_one_row(m: usize, k: usize) -> bool {
 /// matching line in those helpers fails this, instead of leaving the grid's
 /// expectation to agree silently. Over every `m` this file's two Q8_0 grids drive
 /// (the shape grid's 1…192 and the A/B block's 1…1024) and every `k` they drive,
-/// plus a `k` below one staged tile that neither reaches.
+/// plus the `k` below one staged tile that the negative needs — 100 is not a whole
+/// number of this scheme's 32-element blocks, which is the grouped arm's `k` term
+/// and the one-row arm's, so a packed weight cannot carry it and only a device-free
+/// pin can exercise it.
 ///
 /// Device-free — `select_path` reads no device — and the two constants are premises,
 /// not the grid's own values: 64 is a 16-aligned X window (what this scheme's grouped
@@ -91,13 +100,17 @@ fn the_q8_0_shape_expectation_agrees_with_the_ladder() {
     for m in [
         1usize, 2, 4, 8, 13, 17, 64, 72, 96, 128, 192, 276, 512, 1024,
     ] {
-        for k in [128usize, 256, 384, 512, 1024, 2048, 3072, 4096] {
+        for k in [
+            100usize, 128, 256, 288, 384, 512, 896, 1024, 2048, 3072, 4096,
+        ] {
             // All three of the scheme's answers, one row included: a ladder that
             // gains a one-row term with no matching line in `q8_0_one_row` fails on
             // the grid's `m == 1` cells. That term is `m == 1` exactly, over this
             // scheme's own 32-element blocks rather than the staged tile — so its
-            // `k = 128` and `k = 384` cells are that arm's own shapes, off the
-            // tile, and only a row count other than one leaves them on the slab.
+            // `k = 128` and `k = 384` cells are that arm's own shapes, off the tile,
+            // and only a row count other than one takes them off that arm. Above one
+            // row those two are the grouped arm's, whose block term they satisfy
+            // too; `k = 100` is the one contraction neither arm can read.
             let want = if q8_0_byte_direct(m, k) {
                 DequantMatmulPath::GroupedDevice
             } else if q8_0_one_row(m, k) {
@@ -324,10 +337,14 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // books no slab for the selector to fall back into). Q8_0 changes at `m == 1`
     // too: one row of the tiled kernel's 8-bit branch, over this scheme's own
     // 32-element blocks, below; the row-grouped GEMM above, reading the packed
-    // weight in place at any `k` that is a whole number of its staged tiles — which
-    // is why the k=384 cell stays on the slab and is what pins that gate, with the
-    // one-row term's own block gate beside it. Q4_K / Q6_K change at `m == 1` the
-    // same way: one per-row GEMV below, one row-grouped dispatch above.
+    // weight in place at any `k` that is a whole number of those same blocks — so
+    // the 256-element staged tile that arm stages, eight blocks, is not what the
+    // split turns on: the k=384 cell is 12 whole blocks and 1.5 tiles and is grouped
+    // while the K-quants' cells at that same k fall to the host. That term's
+    // negative is the `k = 100` cell of the device-free ladder pin above; no cell of
+    // this grid is off it, since no packed weight carries a partial block. Q4_K /
+    // Q6_K change at `m == 1` the same way: one per-row GEMV below, one row-grouped
+    // dispatch above.
     //
     // The model-class graph's own widths (H=1024, I=4096) are counter-checked here
     // in both regimes rather than only derived: gate/up is k=1024→n=4096, down is
@@ -339,13 +356,31 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         (&[], 2, 256, 8),
         // k=384 is 1.5 Q4_K/Q6_K superblocks and 12 whole Q8_0 blocks: the cell
         // that reaches the selector's host fallback for the K-quants and Q8_0's
-        // staged-tile gate, so both arms are exercised rather than left as
-        // scaffolding. Its m = 1 cell beside it is the same shape on the one-row
-        // arm — Q8_0's own branch over those 12 whole blocks, while the K-quants'
-        // one-row term inherits none of their tile gate. Q5_K is non-fused at any k,
-        // so it still takes its single scratch route here.
+        // grouped arm — 1.5 staged tiles, so off the tile, which pins that the arm's
+        // `k` term is the scheme's own block and not the tile, and makes the pair of
+        // cells the sharpest statement of the two answers at one k. Its m = 1 cell
+        // beside it is the same shape on the one-row arm — Q8_0's own branch over
+        // those 12 whole blocks, while the K-quants' one-row term inherits none of
+        // their block gate. Q5_K is non-fused at any k, so it still takes its single
+        // scratch route here.
         (&[], 4, 384, 8),
         (&[], 1, 384, 8),
+        // The rest of Q8_0's grouped class, at the boundaries of that block term:
+        // k=128 is half a staged tile — a row ending inside one, the sub-tile end the
+        // tail tile's own bound exists for — k=288 is a tile plus one block, and
+        // k=896 is three tiles plus four blocks, the width the A/B stand below
+        // multiplies at. Each is a whole number of the scheme's 32-element blocks, so
+        // each is admitted, and the grid's CPU parity covers them as it does k=384.
+        // The other schemes read the same cells as they read k=384: none of the three
+        // is a whole superblock, so the K-quants keep their host fallback there.
+        //
+        // n=16 rather than those cells' 8: the K-quants share every cell of this
+        // grid, and k=288 of a Q6_K weight at n=8 is 9 blocks — 1890 B, which wgpu's
+        // four-byte-aligned `write_buffer` refuses at the upload, before any route is
+        // taken.
+        (&[], 4, 128, 16),
+        (&[], 4, 288, 16),
+        (&[], 4, 896, 16),
         (&[], 96, 256, 640),
         (&[], 128, 256, 640),
         (&[], 64, 2048, 512),
@@ -382,15 +417,15 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             let aligned = k.is_multiple_of(scheme.gguf_block_size() as usize);
             // Q8_0's one-row arm is the tiled kernel's 8-bit branch, over this
             // scheme's own 32-element blocks; its multi-row one is the GEMM, whose
-            // gate is the staged tile's 256 elements rather than that block. Off
-            // either of them the slab is all there is.
+            // gate is those same blocks rather than the 256-element staged tile it
+            // stages eight of. Off either of them the slab is all there is.
             let byte_direct = scheme == QuantScheme::GgufQ8_0 && q8_0_byte_direct(m, k);
             let one_row = scheme == QuantScheme::GgufQ8_0 && q8_0_one_row(m, k);
             // The one-row term: `fused` is where a K-quant's `m == 1` lands, and
             // Q8_0's is the scheme term above, whose block is its own 32 elements.
             let one_row_arm = m == 1 && (fused || one_row);
             let want = match (fused, byte_direct, one_row_arm, aligned) {
-                (_, true, ..) => (1, 0, 0, 0), // Q8_0 m>1, staged-tile-aligned k: grouped GEMM
+                (_, true, ..) => (1, 0, 0, 0), // Q8_0 m>1, whole-block k: the grouped GEMM
                 (_, _, true, _) => (0, 1, 0, 0), // the tiled arm at one row: the K-quants, and Q8_0's own branch
                 (false, false, ..) => (0, 0, 1, 0), // Q5_K / Q8_0 off its arms: the slab
                 // Decode takes one row per call so long as k is a multiple of
@@ -442,14 +477,19 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // different packed layout (210-byte blocks, quarter-sized sub-blocks) with
     // its own chunk arithmetic, and Q8_0 a third (34-byte blocks, no word
     // alignment to read them through) — both ride the same loop, which is what
-    // these cells are here to show.
-    for (scheme, ggml, m) in [
-        (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 4usize),
-        (QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K, 4),
-        (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 96),
-        (QuantScheme::GgufQ8_0, rlx_gguf::GgmlType::Q8_0, 4),
-    ] {
-        let (g, packed, x) = case(scheme, ggml, m, 256, 16384);
+    // these cells are here to show. Q8_0's second cell is the same loop at a
+    // contraction OFF the staged tile — 288 elements is nine of its 34-byte blocks,
+    // a row stride of 306 bytes, not a whole word at every column boundary — which
+    // is the class of shape this file's admission change newly hands to that loop.
+    let chunked: &[(QuantScheme, rlx_gguf::GgmlType, usize, usize)] = &[
+        (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 4, 256),
+        (QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K, 4, 256),
+        (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 96, 256),
+        (QuantScheme::GgufQ8_0, rlx_gguf::GgmlType::Q8_0, 4, 256),
+        (QuantScheme::GgufQ8_0, rlx_gguf::GgmlType::Q8_0, 4, 288),
+    ];
+    for &(scheme, ggml, m, k) in chunked {
+        let (g, packed, x) = case(scheme, ggml, m, k, 16384);
         rlx_ir::env::set("RLX_WGPU_MAX_BIND_MB", "1");
         reset_route_counts();
         let gpu = run(Device::Gpu, g.clone(), &packed, &x);
@@ -459,14 +499,14 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         assert_eq!(
             (c.grouped, c.per_row),
             (1, 0),
-            "{scheme:?} m={m}: a weight window over the binding limit must still \
+            "{scheme:?} m={m} k={k}: a weight window over the binding limit must still \
              be grouped: {c:?}"
         );
         let max_abs = max_abs_diff(&gpu, &cpu);
-        eprintln!("chunked-window {scheme:?} m={m} k=256 n=16384: max_abs={max_abs:.6e}");
+        eprintln!("chunked-window {scheme:?} m={m} k={k} n=16384: max_abs={max_abs:.6e}");
         assert!(
             max_abs <= 1e-2,
-            "chunked-window {scheme:?} m={m}: max_abs {max_abs} > 1e-2"
+            "chunked-window {scheme:?} m={m} k={k}: max_abs {max_abs} > 1e-2"
         );
     }
 
@@ -747,9 +787,10 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // A multi-row Q8_0 call against the slab it used to take, at the shapes the
     // byte-per-weight steps multiply — the steps' own rows (13, 17, 72) against
     // `[1024,1024]`, `[1024,4096]` / `[4096,1024]`, `[1024,3072]` / `[3072,1024]`,
-    // `[512,512]`, `[512,1024]` and `[1024,512]` — plus a row sweep either side of
-    // the change point at one of those widths, since a row-grouped kernel can lose
-    // above the rows it was built for.
+    // `[512,512]`, `[512,1024]` and `[1024,512]` — plus the class's own boundaries on
+    // the arm's block term, and a row sweep either side of the change point at one of
+    // those widths, since a row-grouped kernel can lose above the rows it was built
+    // for.
     //
     // Both sides are one build and one instrument: A is the default route, B is
     // the same call with `RLX_WGPU_Q8_0_GEMM_DISABLE=1`, which is the dequant slab
@@ -781,6 +822,22 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             (72, 512, 512),
             (72, 512, 1024),
             (72, 1024, 512),
+            // The class's own boundaries on the block term, at the stand's row count:
+            // k=128 ends inside a staged tile, k=288 is a tile plus a block, and
+            // k=896 is the width the stand multiplies at. All three are whole numbers
+            // of the scheme's 32-element blocks and none is on the tile, so this is
+            // where the admission's block-vs-tile question is measured rather than
+            // reasoned about.
+            (13, 128, 1024),
+            (13, 288, 1024),
+            (13, 896, 1024),
+            // The sub-tile end of that same class: one whole 32-element block of k,
+            // where the arm stages a 256-element tile — eight of them. The ticket
+            // admits this end only if it is shown not to lose, so its figures are
+            // printed beside the others' while its route, its join and its values are
+            // asserted like the rest: one tile iteration is paid for a single real
+            // block here.
+            (13, 32, 1024),
             // The row sweep, on a model width, either side of the arm's change
             // point (m == 1) and past the ~96 rows one large-row measurement put
             // in doubt on Metal. m=1 is the control: both sides are this scheme's
@@ -840,12 +897,13 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             // not — that cell is this scheme's own one-row arm, which the lever does
             // not reach — so the expectation is the ladder's terms as a literal
             // rather than a restatement of them: each `k` in the grid is a whole
-            // number of `GROUPED_STAGE_ELEMS` (512, 1024, 3072, 4096), and so of this
-            // scheme's own 32-element block, the planner aligns the X window, and the
-            // plan books this scheme's slab unconditionally. A lane that stops being
-            // admitted at one of these shapes must re-point this literal
-            // deliberately; it fails the census below rather than skipping the
-            // block's own checks.
+            // number of this scheme's own 32-element blocks, which is the admission's
+            // `k` term, the planner aligns the X window, and the plan books this
+            // scheme's slab unconditionally. The 128 / 288 / 896 cells are off the
+            // 256-element staged tile that arm stages eight blocks of, and are still
+            // admitted: the tile is not the gate. A lane that stops being admitted at
+            // one of these shapes must re-point this literal deliberately; it fails
+            // the census below rather than skipping the block's own checks.
             let direct_arm = m > 1;
             assert_eq!(
                 (
@@ -907,6 +965,25 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
                      refused call must cost at least {floor} submission(s) more than \
                      the arm's {a_submits}, not {b_submits}"
                 );
+                // The join witness for the class's boundaries, which is the ticket's
+                // own acceptance for the sub-tile end: what the ladder newly admits
+                // must be submitted exactly as the shapes it already admitted are —
+                // the whole run one submission and one blocking wait, the counts the
+                // m=1 branch pins and the stream-rate cells pin for this route. Stated
+                // at the cells the class changed rather than for every cell of the
+                // grid, since a separate readback would add its own to both and the
+                // floor above is what covers the grid's older shapes. Guarded like
+                // that branch's own pair: under `RLX_WGPU_ONE_OP_PER_PASS` the join is
+                // inert and these cells' counts are the arrangement's, not the route's.
+                if !step_by_step && matches!((m, k), (13, 128) | (13, 288) | (13, 896) | (13, 32)) {
+                    assert_eq!(
+                        (a_submits, a_waits),
+                        (1, 1),
+                        "Q8_0 m={m} k={k} n={n}: an admitted call must ride the graph's \
+                         single submission and open none of its own, as the row-aligned \
+                         ones do: took {a_submits} submission(s) and {a_waits} wait(s)"
+                    );
+                }
                 // The arm's own values, against both references it has. The slab
                 // side is the same weight and inputs through the f32 path this
                 // arm replaced — a route-against-route check, independent of the

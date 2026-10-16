@@ -190,7 +190,9 @@
 
 struct Params {
     m: u32,           // rows
-    k: u32,           // contraction dim (multiple of 256, hence of 4)
+    k: u32,           // contraction dim (a whole number of each entry's own
+                      // blocks — 256 elements for Q4_K/Q6_K, 32 for Q8_0 — hence
+                      // of 4)
     ncols: u32,       // output columns in this dispatch (also the out row stride)
     x_vec4_off: u32,  // vec4 index of X[0,0] within the x binding
     w_byte_off: u32,  // byte offset of W[col0,0] within the weight binding
@@ -586,7 +588,11 @@ var<workgroup> xs: array<vec4<f32>, TM * (BLK_ELEMS / 4u)>;
 
 /// Stage `X[row0, row0+TM) x [p0, p0+BLK_ELEMS)` into [`xs`], one `vec4` per
 /// thread per round. Rows past `m` clamp to the last valid row, exactly as the
-/// weight reads do; their accumulators are dropped at the store.
+/// weight reads do; their accumulators are dropped at the store. Columns past `k`
+/// — only the `dequant_gemm_q8_0` tail tile has any, and only when `k` is not a
+/// whole number of tiles — are staged and never read: the mask is that entry
+/// point's block loop, which stops at the row's last whole block, so nothing here
+/// depends on what such a load returned.
 fn stage_x(tid: u32, row0: u32, p0: u32, k4: u32, xb: u32, last_row: u32) {
     let per_row = BLK_ELEMS / 4u;
     for (var i: u32 = tid; i < TM * per_row; i = i + TG) {
@@ -724,13 +730,18 @@ fn dequant_gemm_q8_0(
     // One staged activation tile per `BLK_ELEMS` of `k` — the Q4_K/Q6_K entries'
     // tile, and eight of this scheme's blocks — so the barrier pair falls once per
     // 256 elements instead of once per 32-element block, with the same staging
-    // work at the same granularity as the entries above.
+    // work at the same granularity as the entries above. This entry is the one whose
+    // `k` need not be a whole number of those tiles: its own block is 32 elements, so
+    // the last tile may hold a few of its eight, and `bis` stops the block loop at
+    // the row's last whole block — no weight block past it is read, and the tile's
+    // surplus activations are staged but never used.
     for (var b0: u32 = 0u; b0 < params.k; b0 = b0 + BLK_ELEMS) {
         workgroupBarrier();
         stage_x(tid, row0, b0, k4, xb, last_row);
         workgroupBarrier();
 
-        for (var bi: u32 = 0u; bi < BLK_ELEMS / Q8_0_BLK_ELEMS; bi = bi + 1u) {
+        let bis = min(BLK_ELEMS / Q8_0_BLK_ELEMS, (params.k - b0) / Q8_0_BLK_ELEMS);
+        for (var bi: u32 = 0u; bi < bis; bi = bi + 1u) {
             let b = (b0 / Q8_0_BLK_ELEMS) + bi;
             let off = (colc * nbk + b) * Q8_0_BLK_BYTES;
             let d = f16_bits_to_f32(read_word_at(off) & 0xFFFFu);

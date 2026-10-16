@@ -15,7 +15,12 @@
 //! arm on the scalar X view. For `m > 1` Q4_K / Q6_K / Q8_0 use the row-grouped GEMM
 //! (`encode_dequant_matmul_gguf_gemm_grouped`): one pass over each packed
 //! weight tile per group of 8 rows, instead of the per-row GEMV's one full pass
-//! over the weight per row. On a Q4_K chunk whose base dispatch would starve the
+//! over the weight per row. Its `k` gate is the scheme's own packing block
+//! ([`grouped_k_ok`]): the K-quants' block is the staged tile itself, while Q8_0's
+//! 32-element one lets a row end inside a tile — the `dequant_gemm_q8_0` entry
+//! point's staged-tile loop stops at the last whole block of such a row, so a
+//! contraction of several tiles plus a block, or a sub-tile one, takes this route
+//! rather than the slab. On a Q4_K chunk whose base dispatch would starve the
 //! GPU, that entry point covers half the columns per workgroup with two threads to
 //! each — the same quant bytes over up to twice the warps, every block's header
 //! read twice (`GROUPED_SPLIT_MAX_BASE_WORKGROUPS` carries the rule and its
@@ -142,11 +147,11 @@ pub enum DequantMatmulPath {
     /// multi-row arm, both encoded the same way
     /// ([`encode_dequant_matmul_gguf_into`]) instead of letting the call submit on
     /// its own. For the tiled schemes the `k` gate is inherited from the `fused`
-    /// term of [`select_path`], which for them *is* [`GROUPED_STAGE_ELEMS`] — so an
+    /// term of [`select_path`], which for them *is* their own packing block — so an
     /// admitted call cannot fall to the per-row loop, whose tiled arm floors `k` to
-    /// whole blocks. For Q8_0, whose own 32-element block is not that tile, that tile
-    /// is the gate ([`select_path`]'s own term, [`grouped_scheme_supported`] its scheme
-    /// set).
+    /// whole blocks. For Q8_0, whose own 32-element block is one of the eight the
+    /// staged tile holds, [`grouped_k_ok`] is the gate ([`select_path`]'s own
+    /// term, and the arm's scheme set is folded into it).
     ///
     /// The arm's own gates can still decline the call, and what that means differs
     /// by scheme: for one the fused entry point carries it is a fall-through, read
@@ -175,10 +180,11 @@ pub enum DequantMatmulPath {
     /// The dequant-scratch entry point ([`run_dequant_matmul_gguf_gpu`]) with a
     /// slab booked — the answer for the calls the ladder's gates keep out of
     /// [`DequantMatmulPath::GroupedDevice`]: a contraction that is not a whole
-    /// staged tile, an X window its `vec4` reads cannot address, a single row of a
-    /// scheme no one-row arm carries, or a multi-row call of a scheme neither the
-    /// grouped GEMM nor the fused entry point serves (both of the latter two only
-    /// when the slab is booked; with none they answer [`DequantMatmulPath::Host`]).
+    /// number of the scheme's own packing blocks, an X window its `vec4` reads
+    /// cannot address, a single row of a scheme no one-row arm carries, or a
+    /// multi-row call of a scheme neither the grouped GEMM nor the fused entry point
+    /// serves (both of the latter two only when the slab is booked; with none they
+    /// answer [`DequantMatmulPath::Host`]).
     /// That entry point's own arms decide next — dequant scratch + `matmul_bt`, the
     /// row-grouped GEMM, the fused arm's per-row loop, or [`crate::gguf_host`] when
     /// it refuses the call — and its grouped and fused arms apply the very gates
@@ -234,19 +240,15 @@ pub fn select_path(
         || one_row_arm_ok(scheme_id, m, k);
     if !fused {
         // The scratch entry point's own ladder, split: a multi-row call of a scheme
-        // the row-grouped GEMM serves ([`grouped_scheme_supported`]), with the slab
-        // the plan booked behind it, over whole staged tiles ([`GROUPED_STAGE_ELEMS`])
-        // and an X window its `vec4` reads can address, is device-only work whose arm
-        // a caller can encode itself. Every other call keeps today's answer: a
-        // single-row form off its arm's own shapes, an off-tile contraction or a
-        // multi-row call of a scheme neither the row-grouped GEMM nor the fused entry
-        // point serves (the slab), no slab at all (the host).
-        if scratch_off > 0
-            && m > 1
-            && grouped_scheme_supported(scheme_id)
-            && k.is_multiple_of(GROUPED_STAGE_ELEMS)
-            && x_window_vec4_ok(x_byte_off)
-        {
+        // the row-grouped GEMM serves, with the slab the plan booked behind it, over
+        // whole packing blocks of that scheme ([`grouped_k_ok`], which carries the
+        // scheme term too) and an X window its `vec4` reads can address, is
+        // device-only work whose arm a caller can encode itself. Every other call
+        // keeps today's answer: a single-row form off its arm's own shapes, a
+        // contraction off the scheme's blocks or a multi-row call of a scheme neither
+        // the row-grouped GEMM nor the fused entry point serves (the slab), no slab
+        // at all (the host).
+        if scratch_off > 0 && m > 1 && grouped_k_ok(scheme_id, k) && x_window_vec4_ok(x_byte_off) {
             return DequantMatmulPath::GroupedDevice;
         }
         return if scratch_off > 0 {
@@ -568,11 +570,33 @@ const GROUPED_SCHEMES: [(u32, fn(&wgpu::Device) -> &'static Kernel); 3] = [
 
 /// Whether the row-grouped GEMM has an arm for `scheme_id` — the `GROUPED_SCHEMES`
 /// list without a device, which is the only form of it a device-free caller can
-/// read. [`select_path`]'s multi-row admission is its one caller;
-/// `tests/gguf_kernel_scheme_coverage.rs` pins what the list says over every
+/// read. [`grouped_k_ok`]'s scheme term is where the ladder reads it, and
+/// `tests/gguf_kernel_scheme_coverage.rs` pins the list itself, over every
 /// registered id.
 pub fn grouped_scheme_supported(scheme_id: u32) -> bool {
     GROUPED_SCHEMES.iter().any(|(id, _)| *id == scheme_id)
+}
+
+/// Whether the row-grouped GEMM covers a contraction `k` of `scheme_id`: the arm
+/// has a kernel for that scheme ([`grouped_scheme_supported`]) and `k` is a whole
+/// number of its **own packing blocks**, the granularity its entry point's weight
+/// loop reads. The arm's `k` gate, asked by [`select_path`] of the shape it is
+/// handed and by [`encode_dequant_matmul_gguf_gemm_grouped`] of the one it is about
+/// to dispatch, so a call the ladder admits cannot then be declined for its
+/// contraction. The scheme term is folded in rather than left to the caller, so the
+/// answer is defined for any id: [`scheme_from_id`] panics on one no table carries.
+///
+/// For the K-quants that block *is* [`GROUPED_STAGE_ELEMS`] — their entry points
+/// read whole staged tiles and nothing else — so this is the gate they have always
+/// had. Q8_0's block is one of the eight a tile holds, so its rows may end inside
+/// one: the `dequant_gemm_q8_0` entry point's staged-tile loop is written to stop at
+/// the last whole block of such a tail tile (`BLK_ELEMS` there is the tile, not the
+/// unit), which is what lets a row of several tiles plus a block — and the sub-tile
+/// rows this allows — take this route instead of the slab. The surplus the tile
+/// stages past `k` is never read: the block loop stops before it.
+pub fn grouped_k_ok(scheme_id: u32, k: usize) -> bool {
+    grouped_scheme_supported(scheme_id)
+        && k.is_multiple_of(scheme_from_id(scheme_id).gguf_block_size() as usize)
 }
 
 /// The row-grouped GEMM's entry point for `scheme_id`, or `None` for a scheme it
@@ -796,7 +820,7 @@ pub fn run_dequant_matmul_gguf_gpu(
     // fallback there either, so its multi-row calls take the row-grouped GEMM of the
     // same ladder the fused entry point uses, and this is the entry point that owns
     // the recompute of one the batch boundary joined and that entry point's encode
-    // refused. A call the arm declines (a `k` outside its staged tile, an X window
+    // refused. A call the arm declines (a `k` off the scheme's own blocks, an X window
     // over the binding limit or not four-element addressable, an adapter limit, its
     // bisect lever) falls through to the scratch slab below — this scheme's route for
     // the single rows its tiled arm's own block and window gates keep out, and at
@@ -1406,11 +1430,12 @@ const GROUPED_ROWS: u32 = 8;
 
 /// Elements of `k` one staged activation tile covers — the shader's `BLK_ELEMS`,
 /// which sizes its `xs` tile and the barrier pair the weight loop is written
-/// around. Every arm of this entry set needs `k` to be a whole number of them:
-/// 256-element blocks for Q4_K/Q6_K, eight 32-element blocks for Q8_0. Pinned
-/// against the shader's own const by `grouped_geometry_matches_the_shader`.
-/// Public because it is the arm's `k` gate, which a caller predicting the route
-/// has to know (the route tests read it rather than restate its value).
+/// around. Every arm of this entry set reads whole packing blocks out of it: the
+/// tile is one 256-element Q4_K/Q6_K block, and eight of Q8_0's 32-element ones —
+/// so for the K-quants this is also their `k` gate, while Q8_0's is its own block
+/// ([`grouped_k_ok`]), whose tail tile the `dequant_gemm_q8_0` entry stops early
+/// on. Pinned against the shader's own const by
+/// `grouped_geometry_matches_the_shader`.
 pub const GROUPED_STAGE_ELEMS: usize = 256;
 
 /// Columns one workgroup of the row-grouped GEMM covers with the split geometry
@@ -1588,7 +1613,8 @@ pub fn grouped_dispatch_cols(device: &wgpu::Device, scheme_id: u32, m: usize, k:
 ///
 /// Returns `false` when the tiled kernel cannot be encoded for this call: the
 /// scheme has no entry point, X spans shards, its window exceeds the binding
-/// limit, `k` is not a whole number of [`GROUPED_STAGE_ELEMS`], or X's own
+/// limit, `k` is not a whole number of the scheme's own packing blocks
+/// ([`grouped_k_ok`]), or X's own
 /// window offset is not a multiple of 16 (the `vec4` reads) — all decided before
 /// anything is encoded, including the per-chunk window fit and, for Q4_K, the
 /// weight window's 4-alignment that its word-granular reads need (only the first
@@ -1644,9 +1670,15 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
     if !geometry_ok {
         return false;
     }
-    // A whole number of staged tiles, which is the granularity the weight loop's
-    // barriers fall at and — for every arm here — a whole number of its blocks.
-    if !k.is_multiple_of(GROUPED_STAGE_ELEMS) || n == 0 {
+    // A whole number of this scheme's own packing blocks: the granularity the
+    // weight loop reads, and — for every arm here — what the staged tile's barrier
+    // pair is written around. Q8_0's 32-element blocks let a row end inside a
+    // staged tile, which that entry point's own loop handles; the K-quants' block
+    // is the tile, so this is the whole-tile gate they have always had. Asked
+    // through the ladder's own predicate rather than restated, so a call it admits
+    // is never declined here for its contraction (`block_elems` above is this
+    // scheme's copy of what [`grouped_k_ok`] divides by).
+    if !grouped_k_ok(scheme_id, k) || n == 0 {
         return false;
     }
     let row_bytes = gguf_row_bytes(scheme_id, k); // packed weight bytes per column
@@ -2150,7 +2182,7 @@ mod tests {
     };
 
     /// The row-grouped GEMM's geometry is written twice — `GROUPED_THREADS` /
-    /// `GROUPED_ROWS` size the dispatch, `GROUPED_STAGE_ELEMS` the `k` gate,
+    /// `GROUPED_ROWS` size the dispatch, `GROUPED_STAGE_ELEMS` the staged tile,
     /// `GROUPED_SPLIT_COLS` the split one — and the shader declares its own
     /// `@workgroup_size` plus its `TG` / `TM` / `BLK_ELEMS` / `COLS` consts, so
     /// read the shader here and tie the two. A lone edit of any one of them would

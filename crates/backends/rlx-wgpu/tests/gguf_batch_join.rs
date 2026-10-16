@@ -9,20 +9,20 @@
 //! of the tiled K-quant arms' windowed route — the one-row arm, and the
 //! row-grouped GEMM it becomes above one row — is device-only work that belongs
 //! *inside* the enclosing run of device work: one submission per contiguous run,
-//! and none of its own. The 8-bit scheme's multi-row calls over whole staged tiles
-//! are that same kind of work, through the same grouped arm, once the ladder admits
-//! them.
+//! and none of its own. The 8-bit scheme's multi-row calls over whole 32-element
+//! blocks of its own are that same kind of work, through the same grouped arm, once
+//! the ladder admits them.
 //!
 //! Nine brackets, each one forward pass between a counter reset and a read of
 //! them. **1 — the join set**, `dq(Q4_K) → mm → dq(Q6_K) → rv → mm`, compiled at a
 //! bucket and run at one row of it: the join set is the tiled one-row arm's two
 //! K-quant schemes at **every row count** — the tiled one-row arm at one row and the
 //! row-grouped GEMM above it — while Q1_0 keeps its own arm, the 8-bit scheme's
-//! multi-row calls over whole staged tiles join through that same grouped arm (its
-//! off-tile multi-row forms keep the scratch entry point they had, its single row
-//! takes the tiled one-row arm's own 8-bit branch, and an admitted call whose
-//! grouped encode refuses falls through to the host arm, which recomputes it on
-//! the slab — brackets 8 and 9), and the scratch route answers as it did. So this
+//! multi-row calls over whole 32-element blocks of its own join through that same
+//! grouped arm (its single row takes the tiled one-row arm's own 8-bit branch, a
+//! call off those blocks keeps the scratch entry point it had, and an admitted call
+//! whose grouped encode refuses falls through to the host arm, which recomputes it
+//! on the slab — brackets 8 and 9), and the scratch route answers as it did. So this
 //! graph covers it completely — the
 //! 4-bit half, the 6-bit half, and `rv`, an `Op::Reverse` on the last axis, the
 //! filler that consumes a uniform, bind-group *and* meta-buffer lane while staying
@@ -42,8 +42,9 @@
 //! element-wise: the mode changes the submission arrangement, not the route or the
 //! arithmetic. **8 — the join set in the 8-bit scheme**: bracket 7's graph with
 //! Q8_0 on both multiplies, the scheme the grouped arm's refinement added to the
-//! join set. Its own block is 32 elements and the arm's admission asks for the
-//! kernel's 256-element staged tile, which `K` is a whole number of, so both
+//! join set. Its own packing block is 32 elements and that block — not the
+//! 256-element staged tile the arm stages eight of — is the admission's `k` term,
+//! and `K` is a whole number of both, so both
 //! multiplies are the joined grouped arm — the census `grouped = 2`, the counted
 //! pair again **1 and 1** against the same 5 and 4, and the same bit-identity
 //! against the unjoined run. The counts are the witness here and the census is not:
@@ -174,9 +175,10 @@ fn packed_q6k(k: usize, n: usize) -> Vec<u8> {
     common::packed_gguf_bytes(rlx_gguf::GgmlType::Q6K, k, n)
 }
 
-/// [`packed`] in the 8-bit scheme (Q8_0). Its own block is 32 elements, so a `K`
-/// that is a whole number of the grouped GEMM's 256-element staged tile — the
-/// term that arm's admission asks for — is a whole number of these blocks too.
+/// [`packed`] in the 8-bit scheme (Q8_0). Its own block is 32 elements — the term
+/// this scheme's grouped admission asks for, and not the 256-element staged tile
+/// the arm stages eight of — so a `K` that is a whole number of these blocks is
+/// admitted whether or not it is a whole number of tiles.
 fn packed_q8_0(k: usize, n: usize) -> Vec<u8> {
     common::packed_gguf_bytes(rlx_gguf::GgmlType::Q8_0, k, n)
 }
@@ -802,11 +804,12 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
 
     // ── The 8-bit scheme's multi-row calls, joined ──────────────────────────
     // Bracket 7's shape on the scheme the grouped arm's refinement added to the
-    // join set: a multi-row Q8_0 call over whole staged tiles is device-only work
-    // the boundary joins, where before that arm the scratch entry point took every
-    // such call. The admission's `k` term is the kernel's 256-element staged tile
-    // and not the scheme's own 32-element block, and `K` is a whole number of both
-    // — which is why one `K` serves the K-quant brackets and this one. The census
+    // join set: a multi-row Q8_0 call over whole 32-element blocks of its own is
+    // device-only work the boundary joins, where before that arm the scratch entry
+    // point took every such call. The admission's `k` term is that block — the
+    // scheme's own packing granularity, not the 256-element staged tile the arm
+    // stages eight of — and `K` is a whole number of both, which is why one `K`
+    // serves the K-quant brackets and this one. The census
     // cannot witness the join: it is recorded inside the encoder, and the scratch
     // entry point took this same grouped arm for these calls before the change, so
     // `grouped = 2` is what the route is and not what the arrangement is. The
@@ -863,9 +866,10 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
             packed: q8_packed,
             dense: q8_dense,
             x: q8_x,
-            census: "both Q8_0 multiplies are above one row over whole staged tiles, so both \
-                     take the row-grouped GEMM — the one route this scheme had for them before \
-                     the arm too, which is why the census cannot tell the arrangements apart",
+            census: "both Q8_0 multiplies are above one row over whole 32-element blocks of \
+                     this scheme's own, so both take the row-grouped GEMM — the one route this \
+                     scheme had for them before the arm too, which is why the census cannot \
+                     tell the arrangements apart",
             pair: "the 8-bit scheme's joined multi-row calls ride the enclosing batch exactly \
                    as the K-quant arms do, so the pair is bracket 1's in the same mode — and \
                    this pair, not the census, is what witnesses the join",

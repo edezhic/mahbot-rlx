@@ -785,7 +785,8 @@ pub(crate) enum Step {
     /// encodes into the enclosing batch
     /// ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`] /
     /// [`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]), and so is Q8_0's
-    /// multi-row call, whose grouped arm that ladder admits.
+    /// multi-row call, which that ladder admits over the scheme's own 32-element
+    /// blocks rather than the staged tile.
     DequantMatmulGguf {
         m: u32,
         k: u32,

@@ -218,17 +218,55 @@ Otherwise Q4_1+ fall through with wrong block stride.
    rather than by row count: a scheme with a one-row arm falls back to the fused
    entry point above, one row at a time, with the per-row weight reuse unchanged,
    and a multi-row Q8_0 call falls to the scratch slab below — its one-row call is
-   the tiled arm's, outside that per-row loop. Q8_0's own grouped arm
-   additionally needs `k % 256 == 0` (a whole number of the staged activation tiles,
-   i.e. eight of its 32-element blocks — its block size is not that arm's gate); no row cap
-   applies at any of these entries.
+   the tiled arm's, outside that per-row loop. The arm's `k` gate is the scheme's
+   **own** packing block (`gguf_gpu::grouped_k_ok`), not the staged tile: for the
+   K-quants that block is the tile itself (256), while Q8_0's 32-element block lets
+   a row end inside one, so an off-tile Q8_0 row is served — the
+   `dequant_gemm_q8_0` entry point's staged-tile loop bounds its block loop by a
+   uniform `min`, so its tail tile computes only that row's real whole blocks. The
+   only contraction this gate turns away is one that is not a whole number of the
+   scheme's blocks (a partial block, which no packed weight carries); the arm's
+   other refusals — a window over the binding limit, a chunk, an adapter limit —
+   belong to its encode, not to this term. The rows shorter than one tile
+   that same term admits are served by that same bound: all of a sub-tile row's
+   blocks live in its first staged tile, and the call still rides the batch's single
+   submission — `gguf_matmul_route.rs`'s route census, submission pair and
+   cross-route value checks are what witness that end not losing. That bound is
+   uniform, so a whole-tile call walks it too: an on-tile cell's cost is watched on
+   the stand's figures rather than by an in-tree timing ceiling, the A/B cells'
+   `[rlx-gguf-q8-0-gemm]` lines reporting it. No row cap applies at any of these
+   entries.
 4. **Scratch fallback** (`ScratchArm`): the arena planner reserves
    `dequant_gguf_scratch_bytes(graph)` tail space; dispatch `dequant_gguf` then
    `matmul_bt` (or the grouped MoE GPU path below). This is Q8_0's route at one-row
    shapes its own block gate keeps out, and its route at any multi-row shape the
-   grouped GEMM declines.
+   grouped GEMM declines — a `k` off the scheme's own blocks, a window it cannot
+   address — and the route of a scheme neither device arm serves at all (Q5_K).
 5. **`gguf_host`** (`Host`; CPU dequant + wgpu matmul) for a sharded arena, a
    parked weight, or a slab the plan refused.
+
+Where the same gate exists on Metal, its **equal admission is deliberately left as
+it is**: `use_fused_q8_0_mm_xs`
+(`rlx-metal/src/backend/encode/mod.rs`) keeps its `k % 256 == 0` gate, its MSL
+kernel having the same 256-element staged tile, so this class of shapes stays
+unaddressed there — the two backends are intentionally not in step.
+
+For those newly joined shapes the plan's in-arena slab stays booked on WGPU (a
+route term of the ladder, and the fallback for the shapes the arm refuses) but is
+no longer read: what the class asks for is the process-global pooled output slab,
+`m * ncols * 4`, with `ncols` bounded by the same weight-window and `OUT_SLAB_CAP`
+budgets the encoder chunks by and `pooled_out_buf_bytes()` reporting it — the slab
+stays inside `OUT_SLAB_CAP` whatever the shape, a larger `m` costing more chunks
+rather than more memory. An attention ear's newly joined up projection is wider than
+the down projection joined today, so that pool's high-water can rise by the
+difference. No environment key was added for the widening:
+`RLX_WGPU_Q8_0_GEMM_DISABLE` is the arm's only lever.
+
+The class's calls in the regimes the ladder cannot see move with the arm's other
+admitted shapes: a striped arena, a parked weight and the bisect lever place them
+on the device arm and are then served by whatever that regime selects, as
+`DequantMatmulPath::GroupedDevice` records — the refusal path the arm already had,
+where an encode that declines is recomputed once by the entry point that owns it.
 
 **Grouped MoE (`DequantGroupedMatmulGguf`):** when scratch fits, CUDA-style GPU
 path — host sort/unpermute, per-expert `dequant_gguf` + `matmul_bt` on sorted

@@ -84,9 +84,10 @@ impl WgpuExecutable {
     /// ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`]) and the row-grouped
     /// GEMM above it
     /// ([`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]), which carries the
-    /// tiled K-quants' multi-row calls and Q8_0's. Whether this *run*
-    /// batches at all is the caller's business — the step-by-step and snapshot
-    /// modes keep one operation per submission on purpose
+    /// tiled K-quants' multi-row calls and Q8_0's — the latter over that scheme's
+    /// own 32-element blocks, the tile itself being only the K-quants' gate. Whether
+    /// this *run* batches at all is the caller's business — the step-by-step and
+    /// snapshot modes keep one operation per submission on purpose
     /// (`RLX_WGPU_ONE_OP_PER_PASS`, and the snapshot stops between steps), so both of
     /// them apply that mode to this answer rather than fold it in here.
     ///
@@ -4252,10 +4253,10 @@ impl WgpuExecutable {
                         // scratch answer is any call the gates above keep out of the two
                         // device arms with a slab booked: a single row of a scheme
                         // neither the fused entry point nor the tiled one-row arm serves,
-                        // a contraction that is not a whole number of the scheme's blocks
-                        // or of the grouped kernel's staged tile, a multi-row call of a
-                        // scheme neither arm serves, and an X window the grouped GEMM's
-                        // `vec4` reads cannot address.
+                        // a contraction that is not a whole number of the scheme's own
+                        // packing blocks, a multi-row call of a scheme neither arm
+                        // serves, and an X window the grouped GEMM's `vec4` reads
+                        // cannot address.
                         // Everything else is tried in the fused entry point, and one it
                         // does not run falls to the same recompute below.
                         let ran = path != crate::gguf_gpu::DequantMatmulPath::ScratchArm

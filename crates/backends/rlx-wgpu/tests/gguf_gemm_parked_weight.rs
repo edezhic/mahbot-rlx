@@ -22,8 +22,9 @@
 //!
 //! The Q8_0 test is the class whose route moves where no executable could be
 //! made to: `gguf_gpu::select_path` answers `DequantMatmulPath::GroupedDevice`
-//! for a multi-row 8-bit call with a slab booked, a whole staged tile and an
-//! addressable X window, and it is *device-free* — the weight's placement never
+//! for a multi-row 8-bit call with a slab booked, a whole number of this scheme's
+//! own 32-element blocks and an addressable X window, and it is *device-free* — the
+//! weight's placement never
 //! enters its answer, so a parked weight is admitted to the batch boundary's
 //! join just as the in-arena copy is. The scratch entry point's own
 //! short-circuit, which exists precisely for the parked regime, would have put
@@ -575,7 +576,7 @@ impl<'a> Arrangement<'a> {
         };
         // The arm this shape's row count is admitted to, as the ladder's own answer:
         // one row is this scheme's tiled arm over whole 32-element blocks, above one
-        // the row-grouped GEMM over whole staged tiles — both device-only, and the
+        // the row-grouped GEMM over those same blocks — both device-only, and the
         // weight's placement never enters either.
         let want = if m == 1 {
             DequantMatmulPath::OneRowDevice

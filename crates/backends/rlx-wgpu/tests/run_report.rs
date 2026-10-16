@@ -52,11 +52,11 @@
 //! is the one-row tiled arm the run *joins* into its batch, and the same scheme at
 //! four rows is the row-grouped GEMM, which the run joins the same way — and an
 //! 8-bit (Q8_0) multiply at four rows joins too once its contraction is a whole
-//! number of the grouped kernel's staged tiles, that arm being one a caller can
+//! number of the scheme's own packing blocks, that arm being one a caller can
 //! encode itself. All those multiply passes are `encode` passes beside the batch's
-//! own. The one call that is not joined is the 8-bit multiply whose contraction is
-//! not a whole tile (384 elements): the ladder does not admit it to that arm, so it
-//! takes its group's own scratch entry point, and its pass is that call's own
+//! own. The one call that is not joined is a scheme this route never admits at all
+//! (Q5_K): the ladder has neither a fused arm nor a grouped one for it, so it takes
+//! its group's own scratch entry point, and its pass is that call's own
 //! submission, landing in `host` — the interval the run's own dispatch loop never
 //! opens a pass in. All four cases assert the same thing about the view: the packed
 //! multiply's pass is recorded, `passes` counts it, and the interval the report
@@ -98,23 +98,17 @@ const PACKED_UNJOINED: &str = "packed_unjoined";
 /// its contraction `k` and whether its route is one the run *joins* into its batch
 /// — the one place all four are written down, so the cases and the premise
 /// assertions below cannot drift apart. Two K-quant cases ride the join at one and
-/// four rows; the 8-bit scheme's four-row call rides it too at a whole staged tile
-/// and keeps its scratch entry point's own submission off-tile, which is why one
-/// case of each kind is here. [`PACKED_UNJOINED`] carries the witness that an
-/// unjoined packed multiply's pass lands outside the encoder: its contraction is
-/// not a whole staged tile, which is the shape the ladder's admission turns down
-/// and so the shape that keeps the call on its own submission.
+/// four rows; the 8-bit scheme's four-row call rides it too, its contraction a whole
+/// number of that scheme's own packing blocks, which is the gate the grouped arm's
+/// `k` asks — so one case of each kind is here. [`PACKED_UNJOINED`] carries the
+/// witness that an unjoined packed multiply's pass lands outside the encoder: its
+/// scheme is one this route never admits — no fused arm and no grouped one — which
+/// is what keeps the call on its own submission.
 const PACKED_ROWS: [(usize, &str, QuantScheme, usize, bool); 4] = [
     (1, PACKED_JOIN, QuantScheme::GgufQ4K, PACKED_K, true),
     (4, PACKED_JOIN_M4, QuantScheme::GgufQ4K, PACKED_K, true),
     (4, PACKED_JOIN_Q8, QuantScheme::GgufQ8_0, PACKED_K, true),
-    (
-        4,
-        PACKED_UNJOINED,
-        QuantScheme::GgufQ8_0,
-        PACKED_OFF_TILE,
-        false,
-    ),
+    (4, PACKED_UNJOINED, QuantScheme::GgufQ5K, PACKED_K, false),
 ];
 
 /// The row count, scheme and contraction a packed-multiply fixture runs at, or
@@ -199,17 +193,11 @@ const N_MELS: usize = 8;
 /// Geometry of the packed-multiply fixture: the contraction is one 256-element
 /// packing block — the whole number of blocks the fused arms answer over, and the
 /// staged tile the grouped GEMM's weight loop barriers fall at — against a `[k, n]`
-/// packed weight. The 8-bit fixtures read two contractions: this one, whole in
-/// Q8_0's 32-element blocks *and* in the staged tile, so the ladder admits the
-/// multi-row call to the grouped arm; and [`PACKED_OFF_TILE`], whole in the blocks
-/// alone, which the ladder turns down so the call keeps its own submission.
+/// packed weight. The 8-bit fixture reads this contraction whole in Q8_0's
+/// 32-element blocks, so the ladder admits its multi-row call to the grouped arm;
+/// [`PACKED_UNJOINED`]'s scheme reads it whole in its own 256-element blocks and is
+/// admitted nowhere.
 const PACKED_K: usize = 256;
-
-/// The 8-bit multiply's off-tile contraction: twelve whole Q8_0 blocks
-/// (384 = 12 * 32) but not a whole [`PACKED_K`]-element staged tile
-/// (384 = 1.5 * 256), so the ladder's multi-row admission does not take it and the
-/// call submits on its own — the shape that keeps the report's witness.
-const PACKED_OFF_TILE: usize = 384;
 
 const PACKED_N: usize = 64;
 
@@ -299,16 +287,16 @@ fn dynamic_graph() -> Graph {
 /// `m`, the scheme and `k` are the whole route decision — the row counts and
 /// contractions [`PACKED_ROWS`] names put a K-quant multiply on the joined tiled
 /// arm and, above one row, on the joined row-grouped GEMM, the 8-bit scheme's
-/// four-row call on the same joined arm while its contraction is a whole staged
-/// tile, and that scheme's off-tile call on its scratch entry point's own
-/// submission — and the dense multiply beside it keeps the run's own dispatch loop
-/// in the schedule, so the report has a batched pass to read the packed one
-/// against.
+/// four-row call on the same joined arm over whole packing blocks, and a scheme the
+/// route never admits on its scratch entry point's own submission — and the dense
+/// multiply beside it keeps the run's own dispatch loop in the schedule, so the
+/// report has a batched pass to read the packed one against.
 fn packed_graph(m: usize, scheme: QuantScheme, k: usize) -> (Graph, Vec<u8>) {
     // The scheme's own GGML packing, so the bytes back the `Op::DequantMatMul` the
     // graph carries and every kernel in the route can read them.
     let ty = match scheme {
         QuantScheme::GgufQ4K => rlx_gguf::GgmlType::Q4K,
+        QuantScheme::GgufQ5K => rlx_gguf::GgmlType::Q5K,
         QuantScheme::GgufQ8_0 => rlx_gguf::GgmlType::Q8_0,
         other => panic!("no packed fixture for {other:?}"),
     };
@@ -1135,16 +1123,17 @@ fn assert_dispatch_only_device_only(stderr: &str, schedule: usize) {
 ///
 /// `joined` is the route this case's call takes: `true` when the run encodes the
 /// call into its own batch. The joined arms — the tiled one-row arm, the
-/// row-grouped GEMM above it, and the 8-bit scheme's tile-aligned grouped call —
+/// row-grouped GEMM above it, and the 8-bit scheme's block-aligned grouped call —
 /// ride that batch, so the multiply's pass is an `encode` pass beside the batch's:
 /// the `encode` interval then carries the batch pass opened before its first
 /// remaining step turns out to be the host-classified multiply, the multiply's own
-/// pass, and the dense step's batch pass. The unjoined case is the 8-bit call whose
-/// contraction is not a whole staged tile: it is not admitted to that arm, so its
-/// group entry point submits on its own inside the `host` step, and the passes that
-/// route opens — the slab's dequant and its `matmul_bt` — are the run's passes
-/// outside `encode`, the interval the run's own dispatch loop never opens a pass
-/// in, which is what makes such lines readable as an unjoined packed multiply's.
+/// pass, and the dense step's batch pass. The unjoined case is the scheme this route
+/// never admits: with no fused arm and no grouped one it is left to its group's own
+/// scratch entry point, which submits on its own inside the `host` step, and the
+/// passes that route opens — the slab's dequant and its `matmul_bt` — are the run's
+/// passes outside `encode`, the interval the run's own dispatch loop never opens a
+/// pass in, which is what makes such lines readable as an unjoined packed
+/// multiply's.
 fn assert_packed_covered(stderr: &str, joined: bool) {
     let lines = report_lines(stderr);
     let pass_lines = assert_device_view(&lines, stderr);
@@ -1187,10 +1176,10 @@ fn assert_packed_covered(stderr: &str, joined: bool) {
              found {encodes}:\n{stderr}"
         );
     } else {
-        // The unjoined case — the 8-bit scheme's off-tile contraction, which the
-        // grouped arm's admission turns down and which therefore takes its group's
-        // own entry point: a submission of its own, inside the `host` step's
-        // interval — the one the run's own dispatch loop never opens a pass in.
+        // The unjoined case — the scheme this route never admits, which therefore
+        // takes its group's own entry point: a submission of its own, inside the
+        // `host` step's interval — the one the run's own dispatch loop never opens a
+        // pass in.
         assert_eq!(
             carrier["label"], "host",
             "the unjoined multiply's own submission runs in the `host` step:\n{stderr}"
@@ -1357,10 +1346,9 @@ fn a_run_reports_where_its_time_went() {
 
     // 8–11. The packed multiplies, on the routes their row counts, schemes and
     // contractions decide: the joined K-quant cases at one and four rows, the 8-bit
-    // scheme's four-row call joined at a whole staged tile, and the same scheme's
-    // off-tile call, which is not admitted to the grouped arm and so takes its
-    // group's own scratch entry point — a submission of its own inside the `host`
-    // interval.
+    // scheme's four-row call joined over whole packing blocks of its own, and a
+    // scheme the route never admits, which takes its group's own scratch entry
+    // point — a submission of its own inside the `host` interval.
     for (_, fixture, _, _, joined) in PACKED_ROWS {
         assert_packed_covered(
             &run_case(fixture, &[(common::RUN_REPORT_SWITCH, "1")]),

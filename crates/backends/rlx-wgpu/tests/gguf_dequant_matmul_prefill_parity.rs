@@ -12,8 +12,9 @@
 //! fused per-row GEMV and prefill with a row-grouped GEMM (8 rows/tile, one pass over
 //! each tile's quant bytes; a chunk the Q4_K entry point splits reads each block's
 //! 16-byte header twice) — Q8_0's GEMV arm being the tiled kernel's branch keyed on
-//! its own 32-element blocks, and its GEMM only above one row, at a `k` that is a
-//! whole number of its staged activation tiles. Q5_K has NO fused route: it always
+//! its own 32-element blocks, and its GEMM only above one row, at a `k` over whole
+//! blocks of that same 32-element kind (eight of which fit one staged tile, so a
+//! row may end inside a tile). Q5_K has NO fused route: it always
 //! dequantizes into an in-arena f32 scratch and runs `matmul_bt`, so there is no
 //! change point for it to measure, and Q8_0 takes that same slab for a contraction
 //! neither of its two arms is asked at.
@@ -51,10 +52,6 @@ use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{CompiledGraph, Device, Session};
-// The row-grouped arm's `k` gate, read from the encoder rather than restated: the
-// staged tile is `gguf_gpu`'s own const, pinned against the shader's `BLK_ELEMS`
-// there.
-use rlx_wgpu::gguf_gpu::GROUPED_STAGE_ELEMS;
 
 /// One parity cell: a packed weight `[n, k]` applied to an input of
 /// `batch ++ [m, k]`.
@@ -300,15 +297,16 @@ const ROUTE_PER_ROW: &str = "per-row GEMV (fused, no scratch)";
 /// The fused prefill route: one pass over each packed weight tile per 8 output
 /// rows, no f32 scratch — a chunk the Q4_K entry point splits reading each block's
 /// 16-byte header twice, its quant bytes still once. Q4_K / Q6_K have it at `m > 1`;
-/// Q8_0 has it at `m > 1` and a staged-tile-aligned `k`, and nothing else (its own
-/// single row is the tiled kernel's block-keyed branch, which this route does not
-/// name).
+/// Q8_0 has it at `m > 1` and a `k` over whole 32-element blocks of its own — the
+/// granularity its arm's weight loop reads, the 256-element staged tile being eight
+/// of them — and nothing else (its own single row is the tiled kernel's block-keyed
+/// branch, which this route does not name).
 const ROUTE_GROUPED: &str = "row-grouped fused GEMM (8 rows/tile, one weight read per tile of \
      quant bytes, no scratch; a split Q4_K chunk reads each block's header twice)";
 /// The route Q5_K has at every `m`, and Q8_0's wherever neither of its arms is
-/// asked — a row count that is not one, or a `k` off this scheme's own 32-element
-/// blocks at one row and off a staged tile above it: device dequant into the
-/// in-arena f32 scratch, then `matmul_bt`.
+/// asked — a row count that is not one, or a `k` that is not a whole number of this
+/// scheme's own 32-element blocks, which both its arms read: device dequant into
+/// the in-arena f32 scratch, then `matmul_bt`.
 /// The lowerer substitutes a whole-op host D2H+H2D staging when no slab was
 /// booked (sharded arena, parked weight); that is not distinguishable from here,
 /// and no cell in this file builds it.
@@ -359,10 +357,11 @@ fn wgpu_route(scheme: QuantScheme, m: usize, k: usize, arena_scratch_reserved: b
         // Q8_0's device arms are the tiled one-row kernel, at exactly one row over
         // this scheme's own 32-element blocks, and the row-grouped GEMM: one pass
         // over each packed weight tile per group of 8 rows, no slab. The latter's
-        // gate is the *staged tile* (256 elements — the tile the shader's barriers
-        // and its `xs` staging are sized by, shared with the Q4_K/Q6_K entries, and
-        // eight of this scheme's 32-element blocks), not this scheme's own block
-        // size; below one row there is no GEMM arm at all.
+        // gate is those same 32-element blocks — the granularity its weight loop
+        // reads — and not the *staged tile* it shares with the Q4_K/Q6_K entries
+        // (256 elements, eight of this scheme's blocks): a whole number of blocks may
+        // end inside one, and the 8-bit entry point's tail tile stops at the row's
+        // last whole block. Below one row there is no GEMM arm at all.
         //
         // The one-row arm is answered before the booking, exactly as the K-quants'
         // is: the ladder admits it on this scheme's block geometry alone, and the
@@ -378,16 +377,16 @@ fn wgpu_route(scheme: QuantScheme, m: usize, k: usize, arena_scratch_reserved: b
             // scheme's ladder would have done with it.
             return format!("{ROUTE_HOST_NO_SLAB}; {blocks}; no slab booked");
         }
-        if m > 1 && k.is_multiple_of(GROUPED_STAGE_ELEMS) {
+        if m > 1 && k.is_multiple_of(block_elems) {
             return format!(
-                "{ROUTE_GROUPED}; {blocks}; k%{GROUPED_STAGE_ELEMS}==0 (eight blocks to a staged \
-                 tile)"
+                "{ROUTE_GROUPED}; {blocks}; k%{block_elems}==0 (whole 32-element blocks, \
+                 tiles of eight included — the gate is the block, not the tile)"
             );
         }
         let why = if m == 1 {
             "one row, but off this scheme's own 32-element blocks"
         } else {
-            "k is not a whole number of staged tiles"
+            "k is not a whole number of this scheme's 32-element blocks"
         };
         return format!("{ROUTE_SCRATCH}; {blocks}; {why}");
     }
@@ -446,21 +445,26 @@ fn wgpu_route(scheme: QuantScheme, m: usize, k: usize, arena_scratch_reserved: b
 /// graph's booking, which the selector reads *after* this scheme's one-row arm — a
 /// single row over whole 32-element blocks is admitted on that shape alone, booked
 /// or not, exactly as a K-quant's is — so for every other shape an unbooked call is
-/// the host's whatever the ladder would have done with it, while a booked one is
-/// the grouped GEMM above one staged tile of `k` and the slab otherwise.
+/// the host's whatever the ladder would have done with it, while a booked one is the
+/// grouped GEMM over whole 32-element blocks of `k` and the slab otherwise.
 #[test]
 fn wgpu_route_mirror_places_q8_0_by_booking_and_row_count() {
     for (m, k, booked, want) in [
         (2usize, 1024usize, false, ROUTE_HOST_NO_SLAB),
         (2, 1024, true, ROUTE_GROUPED),
-        (2, 384, true, ROUTE_SCRATCH),
+        // 12 whole blocks and 1.5 of the 256-element staged tiles: above one row the
+        // grouped arm is asked even there, so the tile gates the answer nowhere.
+        (2, 384, true, ROUTE_GROUPED),
+        // 100 is not a whole number of blocks, so neither arm is asked and the slab
+        // stands — the grouped arm's own negative, above one row.
+        (2, 100, true, ROUTE_SCRATCH),
         // The one-row arm's own corners. 1024 is 32 whole 32-element blocks, and
         // its terms do not include the slab — booked or not is the same answer.
         (1, 1024, true, ROUTE_PER_ROW),
         (1, 1024, false, ROUTE_PER_ROW),
-        // 12 whole blocks, but only 1.5 of the grouped GEMM's 256-element staged
-        // tiles: the cell that tells the one-row arm's block gate apart from the
-        // grouped arm's tile gate.
+        // 12 whole blocks, but only 1.5 of those staged tiles: the cell that shows the
+        // one-row arm is asked on the block, this scheme's own, at a `k` the tile does
+        // not divide.
         (1, 384, true, ROUTE_PER_ROW),
         // 100 is not a whole number of blocks, so the one-row arm is not asked and
         // the slab stands.
@@ -810,6 +814,19 @@ fn wgpu_gguf_dequant_matmul_prefill_matches_cpu() {
             21,
             640,
             256,
+            1e-2,
+        ),
+        // The sub-tile end of the same arm's class: k=32 is one whole 32-element
+        // block, where that entry point stages a 256-element tile (eight blocks), so
+        // its tail tile's block loop stops after the first block. This is that end's
+        // value evidence on a device — an admission keyed on the staged tile would
+        // serve this row as 256 elements and read past its weight.
+        (
+            QuantScheme::GgufQ8_0,
+            rlx_gguf::GgmlType::Q8_0,
+            13,
+            32,
+            64,
             1e-2,
         ),
         // The 8-bit scheme's own single row, over its own 32-element blocks: the
@@ -1229,12 +1246,13 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
     let shapes: &[(&'static [usize], usize, usize, usize, f32)] = &[
         (&[], 2, 256, 8, 1e-2), // tiny, on the grouped side of the m==1 change point
         // Unaligned k (1.5 K-quant superblocks, 12 whole Q8_0 blocks): no fused
-        // Q4_K/Q6_K GEMM reads it, and it is not a whole number of the staged
-        // tiles Q8_0's GEMM needs either, so all of them take the documented
-        // routes — Q4_K/Q6_K the HOST one, Q5_K/Q8_0 the slab. This is the shape
-        // the route census counter-asserts (`host: 1` for the K-quants, scratch
-        // for the other two); the pre-existing k=640 case is mid-superblock too,
-        // but has no census cell behind its route.
+        // Q4_K/Q6_K GEMM reads it, so those take the HOST route — while 12 whole
+        // blocks is exactly what Q8_0's own grouped arm reads, the 256-element tile
+        // it stages being eight of them, so Q8_0 is joined there and only Q5_K is
+        // left on the slab. This is the shape the route census counter-asserts
+        // (`host: 1` for the K-quants, `grouped: 1` for Q8_0, scratch for Q5_K); the
+        // pre-existing k=640 case is mid-superblock too, but has no census cell
+        // behind its route.
         (&[], 4, 384, 8, 1e-2),
         (&[], 128, 256, 640, 1e-2),   // grouped side, wide n
         (&[], 64, 2048, 512, 1e-2),   // key width 2048
@@ -1287,7 +1305,7 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
         // m=1 is the decode (per-row GEMV) side, m>=2 the row-grouped side.
         // Q8_0 (down, k=I=4096) sits on its own change point too — m=1 the tiled
         // one-row arm (4096 being a whole number of its 32-element blocks), m>=2
-        // the row-grouped GEMM, k being a whole number of staged tiles there
+        // the row-grouped GEMM, k being a whole number of those same blocks there
         // — while Q5_K (gate, k=H) has only its single scratch route at every m.
         // Every projection has k a whole number of blocks, so the slab's presence
         // only affects the qualifier the unaligned-k arm would print, and it is

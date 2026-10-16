@@ -93,9 +93,13 @@ kernels, pure Rust deps — no FFI, no submodules.
   bytes once per group of 8 rows instead of once per row — and that GEMM's Q4_K
   entry, when a dispatch would be too small to fill the GPU, covers half the
   columns per workgroup with two threads to each instead, splitting the contraction
-  across them and reading each block's 16-byte header twice. Q8_0's own case of
-  that one-row arm is keyed on its 32-element block, so it takes the scratch slab
-  only at the shapes neither of its two device arms carries. Other schemes dequant
+  across them and reading each block's 16-byte header twice. That row-grouped arm's
+  `k` gate is the scheme's own packing block — Q4_K/Q6_K: 256, which is the staged
+  tile itself; Q8_0: 32 — so a Q8_0 row of several tiles plus a block, or of less
+  than one tile, takes the arm and joins the enclosing batch: the shader's tail tile
+  stops at the row's last whole block. The scratch slab is left for the shapes the
+  arm refuses — a `k` off the scheme's blocks, an X window its `vec4` reads cannot
+  address, the binding limit, the arm's bisect lever. Other schemes dequant
   into scratch then `matmul_bt` when the arena is a single buffer; sharded /
   split-weight arenas fall back to `gguf_host`. Grouped
   MoE GGUF uses the GPU path when scratch fits and the arena is unsharded. Scheme
@@ -401,23 +405,23 @@ line rather than inferred from the interval's host time:
 [wgpu-run-report] device_pass index=2 interval=encode ms=0.088708
 ```
 
-**Four rows, off tile** — the 8-bit scheme's contraction that is not a whole staged
-tile, which the grouped arm's admission turns down: the call recomputes on the
-scratch slab and so submits on its own, its two passes the lines outside `encode`,
-inside the `host` interval that ran the step. A multiply the admission takes opens
-its pass inside the enclosing encoder instead — the one-row case above — so no
-`device_pass` line outside `encode` is its. `ms=0.015125` and `ms=1.757041` here
-against that interval's `host_ms=11.813344` account for the slab's own device work
-and not for the rest — with the passes this view still does not cover, the remainder
-is "not this pass", never "waiting":
+**Four rows, off the arms** — a scheme this route never admits at all (Q5_K): with
+no fused arm and no grouped one, the call recomputes on the scratch slab and so
+submits on its own, its two passes the lines outside `encode`, inside the `host`
+interval that ran the step. A multiply the admission takes opens its pass inside the
+enclosing encoder instead — the one-row case above — so no `device_pass` line
+outside `encode` is its. `ms=0.185334` and `ms=2.877292` here against that interval's
+`host_ms=100.792793` account for the slab's own device work and not for the rest —
+with the passes this view still does not cover, the remainder is "not this pass",
+never "waiting":
 
 ```
-[wgpu-run-report] interval label=host host_ms=11.813344 steps=1 kinds=dequant_matmul_gguf:1
-[wgpu-run-report] interval label=encode host_ms=0.226748 steps=1 kinds=matmul:1
-[wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes+packed_multiplies per=stretch passes=3 measured=3 unusable=0 device_ms=1.813541
-[wgpu-run-report] device_pass index=0 interval=host ms=0.015125
-[wgpu-run-report] device_pass index=1 interval=host ms=1.757041
-[wgpu-run-report] device_pass index=2 interval=encode ms=0.041375
+[wgpu-run-report] interval label=host host_ms=100.792793 steps=1 kinds=dequant_matmul_gguf:1
+[wgpu-run-report] interval label=encode host_ms=0.276158 steps=1 kinds=matmul:1
+[wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes+packed_multiplies per=stretch passes=3 measured=3 unusable=0 device_ms=3.157834
+[wgpu-run-report] device_pass index=0 interval=host ms=0.185334
+[wgpu-run-report] device_pass index=1 interval=host ms=2.877292
+[wgpu-run-report] device_pass index=2 interval=encode ms=0.095208
 ```
 
 The `[wgpu-run-report]` prefix is unique to this block, so the lines can be

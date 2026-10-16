@@ -19,7 +19,8 @@
 //! **A step** is one `Op::DequantMatMul` over one packed weight region and one
 //! `m x k` activation; **a call** is one run of a graph holding [`STEPS`] of them
 //! — eight identical multiplies in one graph. Every cell here is a multi-row call
-//! over whole staged tiles, which the ladder answers as the row-grouped arm, and
+//! over whole packing blocks of its scheme — the staged tile itself for Q4_K/Q6_K,
+//! eight of them for Q8_0 — which the ladder answers as the row-grouped arm, and
 //! that answer is **in** the batch boundary's join set: a call's steps ride the
 //! enclosing batch's submission instead of each opening one of its own, so what a
 //! call costs in submissions and waits is printed per cell rather than asserted
