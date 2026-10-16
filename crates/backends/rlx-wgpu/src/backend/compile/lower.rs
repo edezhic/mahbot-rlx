@@ -12827,6 +12827,9 @@ pub(crate) fn compile_static_inner(
             step_nodes.push(prev);
         }
     }
+    // The schedule's one placement invariant, checked before anything runs: see
+    // `assert_hosted_audio_step_placement`.
+    assert_hosted_audio_step_placement(&schedule);
     let coop_f16_vk = schedule_uses_coop_f16_vk(&schedule);
 
     crate::backend::WgpuExecutable {

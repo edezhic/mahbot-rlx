@@ -340,6 +340,10 @@ name = "host_stage_cache_parity"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "hosted_audio_step_placement"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "kernel_schedule_target"
 required-features = ["backend-tests"]
 

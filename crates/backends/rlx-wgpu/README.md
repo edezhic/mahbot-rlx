@@ -124,6 +124,17 @@ GGUF `DequantMatMul` follows the `select_path` ladder — the fused windowed
 kernels, or `dequant_gguf` + `matmul_bt` when arena scratch fits; otherwise
 CPU dequant via `gguf_host`. MoE grouped GGUF remains host-only on WGPU.
 
+`Op::WelchPeaks` / `Op::LogMel` / `Op::LogMelBackward` run in a deferred tail when their
+lowering picks the host step (`step_is_tail_host`: `Step::WelchPeaksHost` / `LogMelHost` /
+`LogMelBackwardHost`) — the walk skips those steps and performs them once the whole schedule
+has been dispatched — so on this route a hosted step is usable only where such steps **end**
+the schedule and the device work that feeds them precedes them in the same batch (a packed
+multiply or buffer copy this route joins counts as that device work). A `Step::WelchPeaksGpu`
+is device work, and may sit anywhere. Every other placement of a hosted step is refused at
+plan time, and a run of such a graph under `RLX_WGPU_SNAPSHOT` or `RLX_WGPU_ONE_OP_PER_PASS`
+stops loudly instead of spinning. See the placement guard in `src/backend/step.rs`
+(fork-local; upstream carries the same deferral and settles none of these placements).
+
 ## Install
 
 ```toml

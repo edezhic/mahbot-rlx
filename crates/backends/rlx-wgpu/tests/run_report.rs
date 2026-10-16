@@ -154,30 +154,6 @@ const REQUIRED: [(&str, &str); 5] = [
 /// happen and the interval where it must not.
 const COMPILE: (&str, &str) = ("compile", "no_deferred_compile_in_this_path");
 
-/// The switches that would move this graph's routing — which of its two steps runs
-/// where — or that add work the report itself names. Cleared on every child before
-/// the case's own switches are applied: what a case reads is the case's
-/// environment, never the operator's. (`buffer_copy_batch_join.rs` guards the same
-/// set with an assertion; here the child is re-exec'd, so clearing is what that
-/// list buys.)
-const CLEARED: [&str; 15] = [
-    "RLX_WGPU_SNAPSHOT",
-    "RLX_BENCH_DISPATCH_ONLY",
-    "RLX_WGPU_ALL_PARAMS_WEIGHT",
-    "RLX_WGPU_HOST_EAGER_H2D",
-    "RLX_WGPU_HOST_BUFFER_COPY",
-    "RLX_WGPU_CONCAT_HOST",
-    "RLX_WGPU_FORCE_HOST",
-    "RLX_WGPU_HOST_MATMUL",
-    common::RUN_REPORT_SWITCH,
-    "RLX_WGPU_DISCRETE_HOST",
-    "RLX_WGPU_SHARD_CAP_MIB",
-    "RLX_WGPU_SHARD_STAGE_MIB",
-    "RLX_WGPU_SHARD_GPU",
-    "RLX_WGPU_ALLOW_SHARD",
-    "RLX_WGPU_ONE_OP_PER_PASS",
-];
-
 /// Rows in the cache, its row width, and where the new row lands.
 const CAP: usize = 64;
 const W: usize = 64;
@@ -364,24 +340,18 @@ fn run_packed(m: usize, scheme: QuantScheme, k: usize) {
 }
 
 /// The child's stderr for one case: this binary re-run with `MARKER` naming
-/// `fixture`, under exactly the switches the case is about.
+/// `fixture`, under exactly the switches the case is about. The wait is bounded
+/// (`common::rerun_self`), so a case whose run cannot advance reports the child's
+/// stderr instead of hanging the gate.
 fn run_case(fixture: &str, env: &[(&str, &str)]) -> String {
-    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-    cmd.args([
-        "--exact",
+    let (ok, stderr) = common::rerun_self(
         "a_run_reports_where_its_time_went",
-        "--nocapture",
-    ])
-    .env(MARKER, fixture);
-    for key in CLEARED {
-        cmd.env_remove(key);
-    }
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    let out = cmd.output().expect("re-run this test in a child process");
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(out.status.success(), "the child failed:\n{stderr}");
+        MARKER,
+        fixture,
+        &common::CLEARED_SWITCHES,
+        env,
+    );
+    assert!(ok, "the child failed:\n{stderr}");
     stderr
 }
 
@@ -1209,6 +1179,9 @@ fn assert_packed_covered(stderr: &str, joined: bool) {
 #[test]
 fn a_run_reports_where_its_time_went() {
     if let Ok(fixture) = std::env::var(MARKER) {
+        // The sentinel `common::rerun_self` waits for: it proves the child ran this test,
+        // not just that the filter matched something.
+        eprintln!("{MARKER} {fixture}");
         match fixture.as_str() {
             REGION_MIX => run_region_mix(),
             TAIL_HOST => run_tail_host(),

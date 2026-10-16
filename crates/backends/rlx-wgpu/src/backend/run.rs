@@ -127,7 +127,8 @@ impl WgpuExecutable {
     /// host-classified step is one except a device-only call this run joins into
     /// the enclosing batch — a provably device-only packed multiply
     /// ([`Self::joined_dequant_gguf`]) or a buffer copy whose route answer is the
-    /// device one ([`CopyRoute::joins_batch`]). The run path's scheduling decisions
+    /// device one ([`CopyRoute::joins_batch`]), the two kinds
+    /// [`super::step::step_may_join_batch`] names. The run path's scheduling decisions
     /// read this rather than the plan-time classification, which stays as it is and
     /// keeps its consumers (the uniform/bind-group lanes, the memory plan, the
     /// browser answer).
@@ -176,8 +177,12 @@ impl WgpuExecutable {
         // A step this run skips is not work this boundary can hand to the
         // enclosing run — see the doc above.
         let skipped = self.static_once_done && self.static_once_steps.contains(&step_i);
+        // The joinable kinds are named once, in `step_may_join_batch`: the plan-time
+        // placement guard reads the same set, and gating these arms on it keeps a third
+        // arm from being added where that guard cannot see it.
         let joins = !one_op_per_pass
             && !skipped
+            && step_may_join_batch(step)
             && (self.joined_dequant_gguf(step, scale)
                 || self
                     .buffer_copy_route_now(step, host_cache, dev)
@@ -4029,6 +4034,25 @@ impl WgpuExecutable {
                 break;
             }
             if !step_runs_on_host(&self.schedule[step_i]) {
+                // The one state this walk cannot advance out of: a hosted audio step
+                // reached with no device batch in hand. The rest of the placement rule
+                // is settled at plan time (`step::assert_hosted_audio_step_placement`,
+                // which also records how each arrangement measures); this is what the
+                // plan cannot — a switch that carries no batch to the tail
+                // (`RLX_WGPU_ONE_OP_PER_PASS`, `RLX_WGPU_SNAPSHOT`), or a step in front
+                // of the tail that may join this batch and this run's route declined to
+                // join. Stop loudly: a walk that spins here is the defect this exists
+                // for, and the site stays off the path of every run that advances.
+                assert!(
+                    !step_is_tail_host(&self.schedule[step_i]),
+                    "rlx-wgpu: STOPPED (hosted audio step stranded): the walk reached the hosted \
+                     audio step `{}` at schedule index {step_i} with no device batch in hand, and \
+                     this path cannot advance it — something took the batch away: \
+                     RLX_WGPU_ONE_OP_PER_PASS, RLX_WGPU_SNAPSHOT, or a route the copy or packed \
+                     multiply in front of it declined. Unset that switch, or precede the step with \
+                     device work this route dispatches.",
+                    step_name(&self.schedule[step_i]),
+                );
                 continue;
             }
             report.open(Phase::Host, step_i, &self.schedule);

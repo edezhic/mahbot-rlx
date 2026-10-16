@@ -1788,6 +1788,21 @@ pub(crate) fn step_runs_on_host(step: &Step) -> bool {
     }
 }
 
+/// The kinds [`step_runs_on_host`] calls host work whose route may still hand the step to
+/// the enclosing device batch: `Step::DequantMatmulGguf` (a provably device-only packed
+/// multiply, `WgpuExecutable::joined_dequant_gguf`) and `Step::BufferCopy` (a copy whose
+/// route answer is the device one, `CopyRoute::joins_batch`). `run.rs`'s
+/// `step_breaks_batch` applies this as the one term in front of both of its join arms, and
+/// the plan-time placement guard [`assert_hosted_audio_step_placement`] reads the same set —
+/// so a third join arm has to be named here, or its own arm would never fire on a step this
+/// says nothing about.
+pub(crate) fn step_may_join_batch(step: &Step) -> bool {
+    matches!(
+        step,
+        Step::DequantMatmulGguf { .. } | Step::BufferCopy { .. }
+    )
+}
+
 pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
     match step {
         Step::CastF32ToF16 { .. } => matches!(
@@ -1839,6 +1854,125 @@ pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
             )
         }
         _ => false,
+    }
+}
+
+/// REFUSED: the hosted-audio-step placements this route's walk cannot execute.
+///
+/// `Step::WelchPeaksHost` / `Step::LogMelHost` / `Step::LogMelBackwardHost` are the one
+/// family the run's walk does not walk: the device batch skips them (`run_inner`'s pass
+/// loop) and `run_tail_host_audio_ops` performs every one of them once the whole schedule
+/// has been walked, out of the batch that got there. So the only executable arrangement
+/// is *the hosted audio steps as the schedule's last steps, with the device work that
+/// feeds them in the same batch* — drop either half and the arrangement does not return,
+/// or does not write what its consumer reads.
+///
+/// Measured — macOS, wgpu over Metal, Apple M3 Pro, each arrangement in its own process, at
+/// spectrum `[3, 64]` (`n_fft = 32`), filters `[8, 17]`, mel `[3, 8]` (the packed
+/// arrangement adds `x [1, 256]` and a 9216-byte Q4_K `[256, 64]` weight, mel `[1, 8]`).
+/// The refused arrangements were measured before this guard landed; the preserved one and
+/// the two switch states are pinned by `tests/hosted_audio_step_placement.rs`:
+///
+/// * `mel_only` (`[log_mel_host]`): **never returned**, killed at a 45 s bound; 771/771
+///   `sample(1)` frames in `run_inner → step_breaks_batch` — the walk, not a GPU wait.
+/// * `mel_then_device` (`[binary, log_mel_host, binary]`): **exit 101 in <0.1 s**, panic
+///   `src/backend/run.rs:931:57: index out of bounds: the len is 2 but the index is 2` —
+///   the later device step's own uniform write runs past the vector.
+/// * `mel_then_argmax` (`[binary, log_mel_host, argreduce_host]`): **returned**, its
+///   consumer reading 24 zeros for the mel where the host log-mel of that spectrum is
+///   finite (1.016…1.483), and an argmax of `[0,0,0]` where the host's is `[7,7,7]`.
+/// * `device_then_mel` under `RLX_WGPU_ONE_OP_PER_PASS=1` and under
+///   `RLX_WGPU_SNAPSHOT=1`: **never returned**, killed at a 40 s bound; the snapshot run
+///   printed its step-0 line and then stalled.
+/// * `device_then_mel` / `mel_then_backward` / `packed_then_mel` / `copy_then_mel`, no
+///   switches: each returned, its own check inside its child holding — the log-mel
+///   arrangements against the route's own host reference at `1e-6` (the copy one's over
+///   the row its copy wrote), the packed one on the degeneracy bar.
+/// * `copy_then_mel` under `RLX_WGPU_HOST_BUFFER_COPY=1`: **stopped loudly** — the plan
+///   admits a copy in front of the tail because its route is a run-time answer, and this
+///   is the run whose answer is the host one (the packed multiply's join is not reachable
+///   this way: no lever declines it).
+///
+/// Inferred rather than observed, from the walk and the uniform pre-pass: that the spin is
+/// precisely the non-advancing `continue` in the run's host path (the site this function's
+/// run-time twin guards); the pre-pass cursor's provenance in the `mel_then_device` panic;
+/// that the snapshot stall is that same walk; and that those zeros are the never-written
+/// slot rather than a genuine zero mel.
+///
+/// This check is two halves, both at plan time, before anything runs: the deferred steps
+/// must be the schedule's tail, and the step in front of the tail must be one the walk can
+/// carry a batch over. A run-time `assert!` in the walk covers what the plan cannot settle
+/// — the switches, and a joinable step whose route declines the join.
+///
+/// Fork-local and removable: this is the fork's overlay, not upstream's. Upstream at 0.2.18
+/// carries the same deferral, the same two non-partition predicates and the same
+/// non-advancing `continue` in its host path, so it does not return on the same
+/// arrangements — it settles none of them. The overlay is four sites: this function, its
+/// call at the end of `compile_static_inner` (`compile/lower.rs`), the one `assert!` in the
+/// walk (`run.rs`), and the `step_may_join_batch` term `step_breaks_batch` gates both its
+/// join arms with (behaviour-neutral there — each arm already answers false for every other
+/// kind). Removed together, nothing else changed, on a backend that computes these steps in
+/// place.
+///
+/// Residuals: (a) the switch-reached states are *stopped*, not made to advance — the two
+/// switches above now stop a graph of this family loudly where they used to hang; (b) a
+/// plan-host step in front of the tail is admitted although its join is a run-time answer,
+/// and a run whose route declines the join stops loudly — pinned end to end by
+/// `copy_then_mel` under `RLX_WGPU_HOST_BUFFER_COPY=1`, and for the packed multiply by
+/// reading the walk only (the bisect levers turn Q1_0/Q8_0's arms off, not Q4_K's, so
+/// nothing declines that one); (c) the uniform pre-pass's cursor still charges a deferred
+/// step a slot — upstream's, untouched here, and unreachable through this route once the
+/// refusal holds.
+///
+/// The capability consequence, exact: on this route the family is usable only where such a
+/// step is last — the hosted steps ending the schedule — *and* device work precedes them in
+/// the same batch (a joined packed multiply or buffer copy counts as that device work).
+/// "Usable only at the tail" would be wrong: the device work in the same batch is the other
+/// half. Generated op-coverage cannot express this (it is membership per backend), so the
+/// restriction is recorded here and in this crate's `README.md`.
+pub(crate) fn assert_hosted_audio_step_placement(schedule: &[Step]) {
+    let Some(first) = schedule.iter().position(step_is_tail_host) else {
+        return;
+    };
+    if let Some(after) = schedule[first..].iter().position(|s| !step_is_tail_host(s)) {
+        let i = first + after;
+        panic!(
+            "rlx-wgpu: REFUSED (hosted audio step placement): `{}` at schedule index {i} follows \
+             the hosted audio step `{}` at index {first}, which this route performs only in a \
+             deferred tail at the end of the schedule, so the later step runs against one that has \
+             not run (a host step reads a slot nothing wrote, a device step's uniform lands past \
+             the pre-pass cursor). Put the hosted audio step(s) last, after device work, or move \
+             this graph to a backend that computes them in place.",
+            step_name(&schedule[i]),
+            step_name(&schedule[first]),
+        );
+    }
+    // A hosted step is reached from inside a device batch: the walk skips these steps
+    // while carrying a batch over them, and performs them from that batch once the
+    // schedule ends. A step that is device work, or one whose kind may join the batch
+    // ([`step_may_join_batch`] — a packed multiply, a buffer copy), can carry it; a
+    // step this route runs on the host cannot. The join itself is a run-time answer, so
+    // a joinable step is admitted here and a run that declines the join stops loudly in
+    // the walk (`run.rs`).
+    let carried = first > 0
+        && (!step_runs_on_host(&schedule[first - 1]) || step_may_join_batch(&schedule[first - 1]));
+    if !carried {
+        let why = match first {
+            0 => "it is the first step of the schedule".to_string(),
+            _ => format!(
+                "the step before it is `{}` at index {}, which this route runs on the host",
+                step_name(&schedule[first - 1]),
+                first - 1
+            ),
+        };
+        panic!(
+            "rlx-wgpu: REFUSED (hosted audio step placement): the hosted audio step `{}` at \
+             schedule index {first} is not reached from a device batch — {why} — and the deferred \
+             tail that performs these steps is only reached by a carried batch. Precede it with \
+             device work this route dispatches (a packed multiply or buffer copy whose route joins \
+             counts), or move this graph to a backend that computes it in place.",
+            step_name(&schedule[first]),
+        );
     }
 }
 
@@ -1925,6 +2059,107 @@ mod tests {
                 "{} is a packed multiply this backend would defer past its own step",
                 step_name(step)
             );
+        }
+    }
+
+    /// The placement rule, on hand-built schedules: a hosted audio step is served only
+    /// when it is last and the step in front of it is one the walk can carry a batch
+    /// over — device work, or the two kinds whose route may join the batch.
+    #[test]
+    fn a_hosted_audio_step_is_walked_only_last_and_from_a_device_batch() {
+        let device = || Step::Unary {
+            params: bytemuck::Zeroable::zeroed(),
+            f16_mirror: false,
+        };
+        let host = || Step::NarrowHost {
+            in_byte_off: 0,
+            out_byte_off: 0,
+            outer: 1,
+            inner: 1,
+            axis_in_size: 1,
+            start: 0,
+            axis_out_size: 1,
+            param_operand: false,
+        };
+        let mel = || Step::LogMelHost {
+            spec_byte_off: 0,
+            filt_byte_off: 0,
+            dst_byte_off: 0,
+            outer: 1,
+            n_fft: 1,
+            n_bins: 1,
+            n_mels: 1,
+        };
+        let peaks = || Step::WelchPeaksHost {
+            spec_byte_off: 0,
+            dst_byte_off: 0,
+            welch_batch: 1,
+            n_fft: 1,
+            n_segments: 1,
+            k: 1,
+        };
+        let copy = || Step::BufferCopy {
+            src_byte_off: 0,
+            dst_byte_off: 0,
+            bytes: 4,
+        };
+        let packed = || Step::DequantMatmulGguf {
+            m: 1,
+            k: 1,
+            n: 1,
+            scheme_id: 0,
+            x_byte_off: 0,
+            w_byte_off: 0,
+            out_byte_off: 0,
+        };
+
+        // Served: device work in front of the tail, several family steps in a row, a
+        // joinable host step in front, and a schedule with no hosted step at all.
+        for ok in [
+            vec![device(), mel()],
+            vec![device(), mel(), peaks()],
+            vec![copy(), mel()],
+            vec![packed(), mel()],
+            vec![device(), device()],
+        ] {
+            assert_hosted_audio_step_placement(&ok);
+        }
+
+        // Refused: one case per refusal the guard can raise — nothing in front of the tail,
+        // a plain host step in front of it, and a step after the deferred one — each of
+        // which must name the arrangement it is about. The first and the third are real
+        // graphs in `tests/hosted_audio_step_placement.rs`, which needs an adapter; this
+        // table is where the rule is pinned without one, and no fixture there builds the
+        // host-step predecessor, so this is its only pin.
+        for (bad, names) in [
+            (
+                vec![mel()],
+                &["log_mel_host", "first step of the schedule"][..],
+            ),
+            (
+                vec![host(), mel()],
+                &["log_mel_host", "narrow_host", "runs on the host"],
+            ),
+            (vec![mel(), device()], &["unary", "log_mel_host"]),
+        ] {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_hosted_audio_step_placement(&bad)
+            }));
+            let payload = caught.expect_err("this placement must be refused");
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                msg.starts_with("rlx-wgpu: REFUSED (hosted audio step placement)"),
+                "the refusal must carry its stable marker, got: {msg}"
+            );
+            for name in names {
+                assert!(
+                    msg.contains(name),
+                    "the refusal must name `{name}`, got: {msg}"
+                );
+            }
         }
     }
 }

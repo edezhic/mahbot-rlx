@@ -8,9 +8,12 @@
 //! `gguf_gemm_grouped_weight_reuse` and `gguf_gemm_grouped_split_rate` — time their
 //! calls with, plus the parity helpers, the conv-transpose-2d route levers together
 //! with the pair bound its pins derive their bar from and the six real decoder
-//! geometries those pins and the route harness both read, the pins' own refusal and
-//! the route-counter lock at the end of the file. `tests/common/` is not a test target of
-//! its own; each test binary pulls it in with `mod common;`.
+//! geometries those pins and the route harness both read, the bounded child re-exec
+//! harness ([`rerun_self`]) that a case which has to run in its own process waits on
+//! with a deadline, the switch set those children clear ([`CLEARED_SWITCHES`]), the
+//! pins' own refusal and the route-counter lock at the end of the file.
+//! `tests/common/` is not a test target of its own; each test binary pulls it in with
+//! `mod common;`.
 
 // Each test binary declaring `mod common;` uses only the helpers it needs, so
 // the rest are dead code in that binary and `just lint` runs with `-D warnings`.
@@ -251,6 +254,10 @@ pub fn assert_close_under(label: &str, arm: &str, got: &[f32], want: &[f32]) -> 
 /// routes, joined intervals or counted pairs it would move refuse on it.
 pub const Q8_0_BISECT: &str = "RLX_WGPU_Q8_0_GEMM_DISABLE";
 
+/// The 1-bit GGUF scheme's bisect lever, spelled here for [`Q8_0_BISECT`]'s reason: it
+/// takes that scheme's multiplies off its fused device kernel (`gguf_gpu`).
+pub const Q1_0_BISECT: &str = "RLX_WGPU_Q1_0_GEMM_DISABLE";
+
 /// Refuse when the 8-bit scheme's bisect lever is set: the lever is read where that
 /// call is encoded, so under it a call this tree routes on the grouped device arm
 /// answers the slab instead — another routing mode, not a defect in the pin.
@@ -298,6 +305,36 @@ pub fn refuse_under_run_report() {
          unset it to run this pin"
     );
 }
+
+/// The switches that move this crate's routing — which of a fixture's steps runs where,
+/// whether a step is a device step at all, whether a packed multiply joins the batch, and
+/// whether the run reports its own figures — cleared on every re-exec'd child before the
+/// case's own switches are applied, so what a child reads is the case's environment and
+/// never the operator's. A case that is *about* one of them sets it again by name. Spelled
+/// once for every harness here that re-execs a child (`run_report.rs`,
+/// `hosted_audio_step_placement.rs`); `buffer_copy_batch_join.rs` guards the same
+/// routing set with an assertion instead of clearing it.
+pub const CLEARED_SWITCHES: [&str; 19] = [
+    "RLX_WGPU_SNAPSHOT",
+    "RLX_BENCH_DISPATCH_ONLY",
+    "RLX_WGPU_ALL_PARAMS_WEIGHT",
+    "RLX_WGPU_HOST_EAGER_H2D",
+    "RLX_WGPU_HOST_BUFFER_COPY",
+    "RLX_WGPU_CONCAT_HOST",
+    "RLX_WGPU_FORCE_HOST",
+    "RLX_WGPU_HOST_MATMUL",
+    "RLX_WGPU_DISCRETE_HOST",
+    "RLX_WGPU_SHARD_CAP_MIB",
+    "RLX_WGPU_SHARD_STAGE_MIB",
+    "RLX_WGPU_SHARD_GPU",
+    "RLX_WGPU_ALLOW_SHARD",
+    "RLX_WGPU_ONE_OP_PER_PASS",
+    "RLX_WGPU_MAX_BIND_MB",
+    Q1_0_BISECT,
+    Q8_0_BISECT,
+    "RLX_WGPU_TRANSPOSE_HOST",
+    RUN_REPORT_SWITCH,
+];
 
 /// The arrangement every layer of a many-layer attention chain is expected to
 /// take: one query row over more than `ATTENTION_DECODE_MIN_KEYS` keys is the
@@ -652,4 +689,73 @@ static ROUTE_TEST_MUTEX: Mutex<()> = Mutex::new(());
 /// turn every later test in the binary into a lock error.
 pub fn route_lock() -> MutexGuard<'static, ()> {
     ROUTE_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How long a fixture child may run before it is killed and its case reported. The
+/// crate's re-exec harnesses used to wait on `Command::output()` with no bound, so a
+/// regression that makes a run spin hung the gate instead of failing it.
+pub const CHILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run this test binary again as a child running the test `filter`, for the fixture
+/// `fixture_var` = `fixture`, `env` set and `cleared` removed, and wait for it **with a
+/// deadline** ([`CHILD_BUDGET`]) — a child that outlives it is killed and the case panics
+/// with the stderr it managed to print, so a run that cannot advance reports instead of
+/// spinning. Its stderr is captured through a file in the temp directory rather than a
+/// pipe, so the child cannot deadlock on a full pipe. Returns `(exited cleanly, stderr)`.
+///
+/// The child prints `"{fixture_var} {fixture}"` as soon as it takes its fixture branch (see
+/// each harness's own child path), and this waits for that line in the captured stderr: a
+/// child whose `filter` matches no test exits 0 having run nothing, which must report
+/// rather than pass as a case that pinned something.
+pub fn rerun_self(
+    filter: &str,
+    fixture_var: &str,
+    fixture: &str,
+    cleared: &[&str],
+    env: &[(&str, &str)],
+) -> (bool, String) {
+    let path = std::env::temp_dir().join(format!(
+        "rlx-wgpu-child-{}-{fixture}.stderr",
+        std::process::id()
+    ));
+    let file = std::fs::File::create(&path).expect("child stderr file");
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("current exe"));
+    cmd.args(["--exact", filter, "--nocapture"])
+        .env(fixture_var, fixture)
+        .stdout(std::process::Stdio::null())
+        .stderr(file);
+    for key in cleared {
+        cmd.env_remove(key);
+    }
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().expect("re-run this test in a child process");
+    let deadline = std::time::Instant::now() + CHILD_BUDGET;
+    let ok = loop {
+        match child.try_wait().expect("wait on the child") {
+            Some(status) => break status.success(),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = std::fs::read_to_string(&path).unwrap_or_default();
+                // The file is left behind on purpose: a child that could not finish is
+                // the one whose output is worth keeping, and the temp directory is the
+                // right place for it.
+                panic!(
+                    "the `{fixture}` child did not finish within {}s — a run that cannot \
+                     advance must report, not spin; its stderr so far:\n{stderr}",
+                    CHILD_BUDGET.as_secs()
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    };
+    let stderr = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        stderr.contains(&format!("{fixture_var} {fixture}")),
+        "the `{fixture}` child never reached its fixture — it ran no test of `{filter}`:\n{stderr}"
+    );
+    (ok, stderr)
 }
