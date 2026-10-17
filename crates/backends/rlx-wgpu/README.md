@@ -190,16 +190,172 @@ CoopF16Vk applies. Pass flushes between unary → cast → coop matmul keep the
 discrete-adapter visibility correct.
 
 The **f32 path** is on by default on Metal — `matmul_coop_f32.wgsl`, 32×32
-`simdgroup_float8x8` tiles, admitted where `K` is a multiple of 8 and the
+`simdgroup_float8x8` tiles. It is admitted where `K` is a multiple of 8 and the
 output-column extent a multiple of 32 (`M` is free: the padded rows are computed
-and their stores dropped). It reads both operands straight out of the f32 arena,
-so the weight's operand role does not matter to it: the ordinary Param-weight
-multiply and the two convolution GEMM routes — the im2col panel multiply and the
-1×1 pointwise GEMM, whose weight is the FIRST operand — all reach it, and
+and their stores dropped). The two **convolution GEMM routes** — the im2col panel
+multiply and the 1×1 pointwise GEMM, whose weight is the FIRST operand — ask the
+same admission for the **portable alignment** instead, a multiple of 8, because
+their `n` is a conv's spatial output extent (see below). It reads both operands
+straight out of the f32 arena, so the weight's operand role does not matter to
+it: the ordinary Param-weight multiply and those two routes all reach it, and
 `coop_f32_dispatch_count()` counts every dispatch of it. Opt out with
 `RLX_WGPU_NO_COOP_F32=1`. The portable 8×8 sibling
 (`matmul_coop_f32_portable.wgsl`) is a discrete Vulkan adapter's; the conv routes
 never take it, whatever the adapter — their admission is Metal-scoped.
+
+### The convolution GEMM routes' output-column extent
+
+A convolution's panel multiply has a conv's spatial output extent for its `n`, and
+such an extent is a multiple of 8 far more often than of 32: the recognition
+front's third stride-2 convolution reads as `16 × N` on its frame axis, so its `n`
+is 160 at N = 10, 208 at N = 13 and 256 at N = 16 — and 208, the middle one, is
+the one the Metal form's own 32 refused, on the wide non-cooperative path while
+its neighbours took the cooperative one. The kernel lays such an extent out either
+way: with an `n` a multiple of 8 only the x grid rounds up exactly as the y grid
+does, the `b_*` gathers read past the row, and the store guard's
+`global_col >= params.n` term drops the padded columns — the same reliance the
+padded rows already stand on, and the same test covers both. So `conv_gemm` asks
+the admission for the **portable** alignment, and an extent that satisfies it is no
+longer refused.
+
+Measured on an M3 Pro with Metal on macOS, `--release`, the crate's own
+`backend-tests` targets, shipped defaults, no tuning cache, `just throttle`
+clean. The stage's own figures are the trailing block of
+`conv_gemm_coop_f32.rs`: the front's third convolution as **one node** — 3×3
+taps, stride 2, pad 1, 480 → 512, i.e. a contraction of 4320 (480 × 3 × 3) —
+channels picked so that the kernel and not the submission floor decides (the
+64-channel cell of the same extent, in the route-cost table below, sits at its
+own floor), plus the other caller of the widened admission, the 1×1 pointwise
+route at the extent the case loop admits. Each arm is compiled under the shaped
+admission and under `RLX_WGPU_NO_COOP_F32=1`, and timed interleaved round by
+round, one warm-up call each and then three rounds, with the shaped arm's one
+dispatch and every arm's place against the crate's own CPU conv read with it:
+
+| the node | wide | cooperative |
+|---|---|---|
+| front's third conv, `16 × 13 = 208` (8-only — the newly admitted extent) | 3.20–3.65 ms | **2.25–2.58 ms** |
+| front's third conv, `16 × 10 = 160` (a multiple of 32 too) | 2.82–3.13 ms | 2.02–2.20 ms |
+| front's third conv, `16 × 16 = 256` (a multiple of 32 too) | 2.98–3.12 ms | 2.19–2.42 ms |
+| pointwise 1×1, `n = 5000` (8-only, the route's newly admitted extent) | 0.97–1.09 ms | 0.91–0.98 ms |
+
+Each figure is the block's median over its three rounds and the range is six takes
+of the block, in a window the box read `load1` 3.3–5.1; the rounds themselves are
+printed per take, and they are the unit here — a co-tenant on the box can swamp
+both arms of a take at once (the fork's `just throttle` gate exists for the same
+reason). The three convolution rows are the front's own frame axis at N = 10, 13
+and 16, reached by input width 19, 25 and 31. The box is shared and the absolutes
+move with what else runs on it — an earlier window (three takes at `load1`
+3.9–5.0) read the same three extents 12–20 % lower on **both** arms (2.55–2.67 wide
+against 1.95–2.22 cooperative) — while the ratio the arms hold does not: 0.68–0.87
+at the three convolution extents over all nine takes. The pointwise node's ratio is
+0.90–1.00: at `m 64 × k 128 × n 5000` it sits in the submission floor, so the kernel
+choice is not visible in its time — its rows are the parity and the dispatch count,
+not a gain. `0.0` is what the cooperative arm reads
+against the wide one and what each reads against the CPU conv, at every extent and
+in every take. The same node under `RLX_WGPU_DBG_COUNTERS=1`, one run per arm — a
+run that harness does not take, since the instrument changes a run's own
+submission shape — is the second reading: wall `total_ms` 4.216 → 2.730 and the
+`device` line (lower bound, `scope=dispatch_passes+packed_multiplies`)
+2.969 → 1.753, with `passes=1` and one `wait` interval either way — the
+submission shape does not move, what moves is the kernel inside it. The `kinds=`
+line is `im2col_gpu:1,matmul:1` on both arms, the cooperative dispatches are 1 per
+run on the cooperative arm and 0 on the wide one (`coop_f32_dispatch_count()`,
+which is the count the block asserts on the shaped arm), and the arena is the same
+77 870 464 B on both. This is a one-node graph, so its floor — the submission and
+the read-back — sits in both arms; a front-level cut of the whole model, which
+lives in the sibling `rlx-models` repo, cannot be re-taken here.
+
+**Which other extents change route, and what they cost.** Only these two routes
+have the widened term, so the shapes that move are convolution GEMM extents that
+are a multiple of 8 and not of 32, with `K` a multiple of 8 and `M` free. Of the
+crate's own route-cost cells that is three. The kernel the pre-change tree put
+them on is what `RLX_WGPU_NO_COOP_F32=1` forces (the pre-change admission did
+refuse these extents), so both columns are reproducible from this tree, from three
+takes of the harness under each setting at `load1` 3.3:
+
+| cell (its spatial extent) | pre-change kernel | shipped default | arena |
+|---|---|---|---|
+| `lift-slot0-l1000` (1000) | 433–476 µs | 439–452 µs | 64.6 MiB |
+| `refuse-height-pad` (600) | 382–411 µs | 334–378 µs | 64.3 MiB |
+| `map-3x3-s2-31x25-c64` (208, the front's extent at 64 channels) | 366–392 µs | 403–411 µs | 64.4 MiB |
+
+Every one of these is a small cell — two or three steps in 64 channels, which the
+harness prints as an unaccelerated arm of 656–731 µs against an accelerated arm of
+334–476 µs — so the kernel sits inside the cell's submission floor, and what the
+two columns read is a range and not a gain: their medians differ by ~±40 µs across
+the three cells, and which side reads ahead is not stable across windows. That is
+why the table's claim is bounded — no cell is slower by more than that, the arena
+and the routes are the same on both columns, and no other cell changes route. The
+208 cell is worth the one explanation: it is the front's own extent at a channel
+count the model does not run, its multiply 60× smaller than the model's own node at
+the same extent (which reads 0.70–0.77× the wide arm, table above), so what it
+prices is the cooperative form's setup on a multiply too small to amortize it.
+`conv_gemm_coop_f32.rs`'s `pointwise-n8-only` row is the fourth moved shape
+(`n = 5000`, refused before and admitted now), priced by the pointwise row of the
+table above — a wash, floor-bound — and carrying the parity and the dispatch count
+beside it.
+
+One rollout caveat, since these routes read the shared per-shape tuning table
+(`src/tuning.rs`) as any other multiply does: an entry persisted there for one of
+the newly admitted shapes — `RLX_GPU_TUNING_CACHE`, else
+`~/.cache/rlx-wgpu/dispatch-tuning.tsv` — that records `F32` keeps the wide kernel
+at that shape, so a re-shoot on a machine holding such a table reads as the
+widening having done nothing. Remove that file (or point `RLX_GPU_TUNING_CACHE` at
+a path that does not exist) to read the change itself; the test pins that path
+away for exactly this reason, and the route-cost harness above does not — its
+columns are read on a box without such a table.
+
+**The shared widening and this one are not separated by cost.** Widening the
+whole admission to the portable alignment is `RLX_WGPU_FORCE_COOP_F32`'s own
+geometry term, and the extents it would move beyond the two conv routes are the
+ordinary multiplies whose `n` is a multiple of 8 only. Timed the same way on
+one-node matmul graphs, the pin (`RLX_WGPU_MATMUL_F32_ONLY=1`), the shipped
+default and the widened shared rule:
+
+| shape | f32 pin | default | widened shared |
+|---|---|---|---|
+| `191×200×600` (the EEG-QKV width) | 0.326 ms | 0.328 ms | 0.303 ms |
+| `880×200×200` | 0.551 ms | 0.543 ms | 0.446 ms |
+| `1×880×200` (a decode row) | 2.457 ms | 2.456 ms | 0.432 ms |
+| `8×24×24` | 0.293 ms | 0.294 ms | 0.210 ms |
+| `8×8×8` | 0.238 ms | 0.238 ms | 0.216 ms |
+
+No extent measured slower under the shared rule either, so no cost argument
+separates the two forms; the **shape-scoped** one is what lands because it moves
+no shape outside these two routes, and the cell table above is the evidence that
+nothing outside them changes route at all.
+
+**The active-extent mode does not turn on.** `Step::Im2ColGpu` answers false to
+`safe_for_active_extent`, which is all-or-nothing per graph, so any schedule that
+walks a panel-routed convolution — the front's three-conv stack, whose first
+convolution is on the direct kernel because its contraction is under the panel
+route's 256 bar, among them — has the hint disabled on every pass. This change
+does not lower that count: what it moves is the GEMM's kernel, not the panel
+gather the veto names, so the mode is exactly as reachable after it as before.
+The crate's own probe (the active-extent block of `conv_route_cost.rs`, which
+asserts the veto per arm) reads the bucketed `(2, 4)` run at 0.85–1.00× of the
+full one on those arms — 0 % of the run skippable — so the mode's worth stays
+unmeasured as a gain, as it was before the change.
+
+**Memory.** The cooperative kernel reads both operands out of the f32 arena — no
+f16 shadow, no scratch — so the plan is the same on both arms: the block above
+asserts arena equality per node and prints 77 870 464 B at the 208 node (77 415 040 B
+at 160, 78 325 888 B at 256, 70 981 888 B at the pointwise extent), the route-cost
+cells' arena lines are unchanged (64.6→64.6, 64.3→64.3, 64.4→64.4 MiB — the third
+being 67 508 224 B for that same conv at 64 channels), and the process's resident
+set reads 53.3 MB on each arm of a one-shot run of the 208 node. Memory counts
+alongside speed here, so the model-level reading belongs beside this change's time
+rather than being assumed still, and the pair to hand is a by-arm reading taken on
+the path with `RLX_WGPU_FORCE_COOP_F32` on — an admission wider than this landing's,
+so an upper bound and not this extent's own: the front's graph 65.8 → 69.5 MiB of
+arena and 219.3 → 297.8 MiB of process peak, with the third convolution's own cell
+39.0 MiB on either arm (that reading slices the model's plan per stage, a different
+quantity from the one-node arena the block above prints). Nothing in this kernel's
+mechanism produces a plan difference — it adds no buffer and the plans here are
+byte-identical on the arms — so the pair is recorded as what that wider arm read
+and not as this landing's price. The landing's own pair is the same graph read
+**without** the lever, which is what a re-shoot takes, and it belongs next to the
+pass's time.
 
 ### Environment flags
 

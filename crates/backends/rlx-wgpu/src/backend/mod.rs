@@ -2855,6 +2855,11 @@ fn derive_matmul_compute_default(
     //
     // Vulkan uses `matmul_coop_f32_portable` (8×8 tiles, coopLoad) which
     // only requires k%8 and n%8.
+    //
+    // The two convolution GEMM routes ([`conv_gemm`]) ask the same kernel
+    // with that looser alignment on Metal too, and for their own reason:
+    // their `n` is a conv's spatial extent, whose padded columns the kernel
+    // drops where it drops the padded rows.
     let coop16_aligned = m.is_multiple_of(32) && k.is_multiple_of(8) && n.is_multiple_of(32);
     let has_coop = dev
         .features()
@@ -2902,9 +2907,11 @@ fn derive_matmul_compute_default(
     // dispatch actually happens. `RLX_WGPU_FORCE_COOP_F32` still overrides.
     //
     // The two convolution GEMM routes read the same admission with the weight
-    // in the FIRST operand, and no packed form to keep; see
+    // in the FIRST operand, no packed form to keep, and the portable
+    // output-column alignment rather than the Metal form's own; see
     // [`conv_gemm`].
-    let coop_f32_ok = b_is_param && coop_f32_admitted(dev, k, n, any_bf16 && b_is_param);
+    let coop_f32_ok =
+        b_is_param && coop_f32_admitted(dev, k, n, any_bf16 && b_is_param, CoopF32Alignment::Metal);
 
     let eligible = MatmulEligibility {
         coop16: coop16_ok,
@@ -2928,20 +2935,34 @@ fn derive_matmul_compute_default(
     (default, eligible)
 }
 
+/// Which output-column alignment a caller asks the f32 cooperative kernel for:
+/// the Metal form's own 32 columns (the ordinary multiply, whose `n` is a model's
+/// hidden width) or the portable 8 (the two convolution GEMM routes, whose `n` is
+/// a conv's spatial extent). See [`coop_f32_admitted`].
+#[derive(Clone, Copy)]
+enum CoopF32Alignment {
+    Metal,
+    Portable,
+}
+
 /// Whether the f32 cooperative-matrix kernel may serve a multiply with this
 /// contraction (`k`) and output-column (`n`) extent on this device.
 ///
 /// Shared by the ordinary matmul cascade and the two convolution GEMM routes
-/// ([`conv_gemm`]), so every lever governs both: `RLX_WGPU_NO_COOP_F32` opts
-/// out, `RLX_WGPU_FORCE_COOP_F32` widens admission to adapters that report no
-/// 8×8 f32 cooperative matrices, `RLX_WGPU_MATMUL_F32_ONLY` pins the whole
-/// matmul machinery to F32 (read here as well as in the cascade, so the conv
-/// routes obey it too), and the last term is the per-device operand-order probe.
-/// `bf16_weight_in_b` is the one term that is the ordinary multiply's alone — the
-/// conv callers pass `false` for it. The backend term is the other way round: the
-/// conv callers ask this from inside their own Metal scope, which is narrower
-/// than what this function admits on a Vulkan/DX12 adapter, so every lever
-/// governs both but the scope does not — see [`conv_gemm`].
+/// ([`conv_gemm`]), so both read one admission rather than restating it:
+/// `RLX_WGPU_NO_COOP_F32` opts out for both, `RLX_WGPU_MATMUL_F32_ONLY` pins the
+/// whole matmul machinery to F32 for both, and both are behind the same
+/// per-device operand-order probe. `RLX_WGPU_FORCE_COOP_F32` widens admission to
+/// adapters that report no 8×8 f32 cooperative matrices; its geometry term is the
+/// alignment the conv routes already ask for, so on them it has nothing left to
+/// widen.
+///
+/// Two terms are the callers' own: `bf16_weight_in_b` is the ordinary multiply's
+/// (the conv callers pass `false`), and `alignment` is the form the caller asks
+/// for — the cascade asks the Metal form's own 32 columns, the conv routes the
+/// portable 8. The backend term is the other way round: the conv routes reach this
+/// from inside a Metal check of their own, narrower than what this function admits
+/// on a Vulkan/DX12 adapter. See [`conv_gemm`].
 ///
 /// CoopF32 (`simdgroup_float8x8` on Apple) is the f32 hardware-GEMM path. It is
 /// on by default on Metal; the Vulkan portable 8×8 path is selected
@@ -2968,7 +2989,13 @@ fn derive_matmul_compute_default(
 ///   2048³ 100 → 990 GF/s   (9.9×)
 /// and the Gemma-4 shape above is now BIT-EXACT vs CPU (cos 1.000000,
 /// max|Δ| 0.0). `RLX_WGPU_NO_COOP_F32=1` opts back out.
-fn coop_f32_admitted(dev: &wgpu::Device, k: u32, n: u32, bf16_weight_in_b: bool) -> bool {
+fn coop_f32_admitted(
+    dev: &wgpu::Device,
+    k: u32,
+    n: u32,
+    bf16_weight_in_b: bool,
+    alignment: CoopF32Alignment,
+) -> bool {
     // `RLX_WGPU_MATMUL_F32_ONLY` is an explicit pin: F32 is the only admissible
     // path for the whole matmul machinery. Read in two places, and both are
     // load-bearing: the cascade's own early return is what makes the pin absolute
@@ -2989,11 +3016,28 @@ fn coop_f32_admitted(dev: &wgpu::Device, k: u32, n: u32, bf16_weight_in_b: bool)
     // The Metal 32×32 form's own alignment, and the portable 8×8 form's; M is
     // free on the Metal kernel (see the kernel header for the padded A read it
     // drops). Nothing wider is asked of either.
+    //
+    // `alignment` swaps the first for the second on the convolution GEMM routes.
+    // Their `n` is a conv's spatial extent — `16 × 13 = 208` on the recognition
+    // front — so it is a multiple of 8 far more often than of 32, and the kernel
+    // lays such an extent out anyway: the x grid rounds up exactly as the y grid
+    // does, the padded columns are gathered and accumulated and then dropped by the
+    // store guard's `global_col >= params.n` term, the same reliance the padded rows
+    // already stand on (see `kernels/matmul_coop_f32.wgsl`). What that extent is
+    // worth on the front's own geometry, which other extents move with it and why
+    // the widening is scoped to these two routes rather than asked of every shape is
+    // in `README.md`. The ordinary multiply keeps its own 32: its `n` is a model's
+    // hidden width, where a widening would move every such shape in the tree at
+    // once.
     let metal_aligned = k.is_multiple_of(8) && n.is_multiple_of(32);
     let portable_aligned = k.is_multiple_of(8) && n.is_multiple_of(8);
+    let aligned = match alignment {
+        CoopF32Alignment::Metal => metal_aligned,
+        CoopF32Alignment::Portable => portable_aligned,
+    };
     let metal_coop = !disabled
         && has_coop
-        && metal_aligned
+        && aligned
         && (forced || (matches!(backend, Some(wgpu::Backend::Metal)) && !bf16_weight_in_b));
     let vulkan_coop = !disabled
         && has_coop
@@ -3089,8 +3133,15 @@ fn derive_matmul_compute(
 /// f16-shadow, packed-bf16 and cooperative-f16 paths each read a weight-side
 /// buffer this role never builds. So the choice is binary, and it asks the same
 /// admission an ordinary multiply of the same shape asks ([`coop_f32_admitted`],
-/// with no packed form to keep) and reads the same shared dispatch table — which
+/// with no packed form to keep and the portable output-column alignment instead
+/// of the Metal form's own) and reads the same shared dispatch table — which
 /// can move it back to `F32`, never onto a family that cannot serve the layout.
+///
+/// The extent tolerance is the conv routes' one widening: their `n` is a conv's
+/// spatial output extent, so they ask the portable 8-column alignment where an
+/// ordinary multiply asks the Metal form's own 32 — see [`coop_f32_admitted`] for
+/// that term and the padded-column reliance it stands on, and `README.md` for what
+/// it measures and which other extents move with it.
 ///
 /// Three readings of "cannot be launched with the chosen kernel", and in each of
 /// them the node keeps today's kernel: this device's f32 cooperative pipeline
@@ -3107,12 +3158,12 @@ fn derive_matmul_compute(
 /// pointwise route's cap is the ceiling itself. Both are checked anyway: they are
 /// the readings this call owns, and the floors are tunable.
 ///
-/// The Metal term is scope, not alignment. It is what keeps the portable 8×8
-/// sibling, Vulkan's, out of these two classes: although these routes are
-/// host-staged on a Vulkan/DX12 adapter (`wgpu_prefer_conv_host` folds in
-/// `coop_discrete_backend`), `RLX_WGPU_SHARD_GPU` opts them back onto the device,
-/// and the kernel `matmul_coop_f32_active_kernel` would then return there is the
-/// portable one.
+/// The Metal term is scope and extent, not routing. The scope half is what keeps
+/// the portable 8×8 sibling, Vulkan's, out of these two classes: although these
+/// routes are host-staged on a Vulkan/DX12 adapter (`wgpu_prefer_conv_host` folds
+/// in `coop_discrete_backend`), `RLX_WGPU_SHARD_GPU` opts them back onto the
+/// device, and the kernel `matmul_coop_f32_active_kernel` would then return there
+/// is the portable one.
 fn conv_gemm(
     dev: &wgpu::Device,
     mm_k: &'static Kernel,
@@ -3127,7 +3178,7 @@ fn conv_gemm(
             coop_kernel.is_some()
                 && gx <= MAX_WORKGROUPS_PER_DIM
                 && gy <= MAX_WORKGROUPS_PER_DIM
-                && coop_f32_admitted(dev, k, n, false)
+                && coop_f32_admitted(dev, k, n, false, CoopF32Alignment::Portable)
         }
         _ => false,
     };

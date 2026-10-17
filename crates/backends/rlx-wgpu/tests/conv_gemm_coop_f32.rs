@@ -3,16 +3,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The convolution GEMM routes' multiplies take the f32 cooperative kernel
-//! exactly where that kernel's own alignment holds.
+//! exactly where the alignment these routes ask of it holds.
 //!
 //! The routes are the im2col panel multiply and the 1×1 pointwise GEMM. Both put
 //! the weight in the FIRST operand — the reverse of every other matmul call site —
 //! which is what used to keep them off the cooperative path: it was reserved for
-//! a multiply whose SECOND operand is a Param. The admission itself did not
-//! change; what changed is that these two sites now ask it (`conv_gemm`) with the
-//! roles swapped, so `RLX_WGPU_NO_COOP_F32`, `RLX_WGPU_FORCE_COOP_F32`,
-//! `RLX_WGPU_MATMUL_F32_ONLY` and the per-device operand-order probe govern them
-//! as they govern any other multiply.
+//! a multiply whose SECOND operand is a Param. What changed is that these two sites
+//! now ask that path's admission (`conv_gemm`), with the roles swapped, and they
+//! ask it for the portable output-column alignment (`n % 8`) instead of the Metal
+//! form's own 32, because their `n` is a conv's spatial output extent and the
+//! kernel lays one out with its padded columns dropped. So `RLX_WGPU_NO_COOP_F32`,
+//! `RLX_WGPU_FORCE_COOP_F32`, `RLX_WGPU_MATMUL_F32_ONLY` and the per-device
+//! operand-order probe govern them as they govern any other multiply, and an extent
+//! the portable form admits where the Metal form alone would refuse — `16 × 13 =
+//! 208` on the recognition front — is part of what this file pins.
 //!
 //! **Alignment decides, not the call.** Each case below is compiled and run twice
 //! in one process, once with the cooperative path available and once under
@@ -21,9 +25,10 @@
 //! (`rlx_wgpu::coop_f32_dispatch_count()`), which both arms are read around:
 //! an admitted shape must show exactly one cooperative dispatch with the arm on
 //! and zero with it off, and a shape the alignment refuses must show zero either
-//! way — the `coop` field is computed from the kernel's requirement (the
-//! contraction extent a multiple of 8, the output-column extent a multiple of 32)
-//! and never from what the run did.
+//! way — the `coop` field is computed from the alignment these routes ask the
+//! kernel for (the contraction extent a multiple of 8, and the output-column extent
+//! a multiple of 8 rather than the Metal form's own 32) and never from what the run
+//! did.
 //!
 //! **The refused shapes' outputs do not move**, and that is asserted exactly:
 //! with the arm off they take the same kernel they take with it on, so the two
@@ -45,8 +50,14 @@
 //! on the same bits is a fact about this device, not a property of either: no
 //! contract fixes an order, reordered f32 sums over these contractions differ in
 //! general, and the `1e-5` bar — not the zero — is what has to hold when they do.
-//! The forced block's `n = 5000` run, whose column extent is a multiple of 8 only,
-//! is `0.0` against the CPU conv as well.
+//! The `n = 5000` shape — a multiple of 8 and not of 32, so its x grid rounds up —
+//! is `0.0` against the CPU conv on the cooperative arm too, in the loop and again
+//! under the lever at the end.
+//!
+//! **The ordinary multiply is not the widening's.** A plain matmul keeps the Metal
+//! form's own 32 columns: the counter reads zero for an `n` that is a multiple of 8
+//! only and one for the next shape up — the block at the end of the test — so the
+//! cascade's own alignment is what this change leaves alone.
 //!
 //! **The padded-`M` cases are the bounds reliance, exercised.** The Metal kernel
 //! gathers 32 A rows per tile without checking `params.m`, so a `c_out = 80` shape
@@ -55,19 +66,29 @@
 //! must reach no output. Both routes carry such a shape, because their A windows
 //! are not the same one — the im2col panel multiply binds the whole arena, the
 //! pointwise GEMM the conv node's own window — so the read is checked against a
-//! whole-arena bind and against a bounded one. The block at the end is the mirror
-//! case on the column axis: a forced admission whose `n` is a multiple of 8 only,
-//! so the x grid rounds up the same way.
+//! whole-arena bind and against a bounded one. The padded columns are the mirror
+//! case on the column axis, and they are admitted on the route's own alignment
+//! now: `n = 5000` is a multiple of 8 and not of 32, so the x grid rounds up the
+//! same way, and the store guard's `global_col >= params.n` term has to drop what
+//! the `b_*` gathers read past the row — the CPU parities this case takes in the
+//! loop, and again under the lever at the end, are what hold those columns to no
+//! output.
 //!
 //! The case set is the route's own geometries: `conv_routes_parked_weight.rs`
 //! pins `[1,64,1,2048] k=[1,7]` (im2col), `[1,128,1,8192] k=[1,1]` (pointwise)
-//! and the mirrored `[1,64,1,300]` lift. Each class has one member the alignment
-//! refuses on its output-column extent (`2048 → 2050`, `8192 → 5000` — same route,
-//! same admission floors, only that extent moved) and one it refuses on its
-//! contraction extent (`448 → 420`, `128 → 100`), so both axes the admission
-//! checks are covered; the rest are the axes the kernel's requirement is stated
-//! in — a contraction that is a multiple of 8 only, one deepened past the routed
-//! default, and an `M` that is not a multiple of 32.
+//! and the mirrored `[1,64,1,300]` lift. Both axes the alignment reads get a
+//! refused member per class: the output-column extent (`2048 → 2050` on im2col,
+//! `2050 % 8 = 2`, and `8192 → 5004` on pointwise, `5004 % 8 = 4` — the two shapes
+//! here that fail the route's own portable alignment on that axis, each the same
+//! route with the same admission floors as its admitted sibling, only that extent
+//! moved) and the contraction extent (`448 → 420` on im2col, `128 → 100` on
+//! pointwise, both `% 8 = 4`, each with an output-column extent the alignment
+//! accepts, so the contraction axis alone refuses them). The output-column axis
+//! also gets a member the portable form admits and the Metal form's own 32 alone
+//! would not (`8192 → 5000`, `5000 % 8 = 0` and `5000 % 32 = 8`), which is the
+//! widening this file is shaped around; the rest are the axes the alignment is
+//! stated in — a contraction that is a multiple of 8 only, one deepened past the
+//! routed default, and an `M` that is not a multiple of 32.
 //!
 //! **The dispatch-tuning cache is pinned off** (`RLX_GPU_TUNING_CACHE`, a path
 //! that does not exist) because these two sites now read the shared per-shape
@@ -78,7 +99,7 @@
 //! Its own test binary: the arm is a process-global switch and the counter is
 //! process-global too.
 
-use rlx_ir::Graph;
+use rlx_ir::{DType, Graph, GraphExt, Shape};
 use rlx_wgpu::backend::WgpuExecutable;
 
 mod common;
@@ -95,38 +116,45 @@ struct Case {
     p: usize,
     /// The route this shape's conv must reach, on both arms.
     route: &'static str,
-    /// Whether this shape's conv runs a GEMM the f32 cooperative kernel's
-    /// alignment admits: `Some(true)` admitted, `Some(false)` refused, and `None`
-    /// for a conv that reaches no GEMM route at all — the mirrored lift, whose
-    /// place in the set is the witness that the arm switches neither it nor any
-    /// other node outside the two classes.
+    /// Whether this shape's conv runs a GEMM the alignment these routes ask the
+    /// f32 cooperative kernel for admits: `Some(true)` admitted, `Some(false)`
+    /// refused, and `None` for a conv that reaches no GEMM route at all — the
+    /// mirrored lift, whose place in the set is the witness that the arm switches
+    /// neither it nor any other node outside the two classes.
     coop: Option<bool>,
 }
 
-/// Seven admitted shapes, four the arm may not switch, and one inert.
+/// Nine admitted shapes, four the arm may not switch, and one inert.
 ///
 /// The two classes are the im2col panel multiply and the pointwise GEMM, and each
-/// axis the admission checks gets a refused member per class: the output-column
-/// extent (2050, 5000 — both multiple-of-32 failures, both still over their
-/// route's own admission floors) and the contraction extent (420, 100 — both
-/// multiple-of-8 failures whose output-column extent is aligned, so the
+/// axis the alignment reads gets a refused member per class: the output-column
+/// extent (`2050` on im2col, `2050 % 8 = 2`, and `5004` on pointwise, `5004 % 8 =
+/// 4` — the same routes with the same admission floors as their admitted
+/// siblings, only that extent moved) and the contraction extent (`420`, `100` —
+/// both `% 8 = 4`, each with an output-column extent the alignment accepts, so the
 /// contraction axis alone is what refuses them). The last member is the mirrored
 /// `conv2d_tiled` lift, which is not a GEMM route at all: its place in the set is
 /// the witness that the arm reaches neither it nor any other node outside the two
 /// classes.
 ///
-/// The admitted set covers what the kernel's requirement is stated in: `k` a
-/// multiple of 32 as well as one that is a multiple of 8 only (`336`, `40` — the
-/// axis the shader's `REQUIREMENTS` names as `8`, not `32`), a contraction
-/// deepened past the routed default, and an `M` that is not a multiple of 32 on
-/// **both** routes — because their A windows are not the same one (the im2col
-/// panel multiply binds the whole arena, the pointwise GEMM the conv node's own
-/// window), so the padded-row read is checked against both a whole-arena and a
-/// bounded bind.
+/// The admitted set covers the alignment's own terms: `n` a multiple of 32 as well
+/// as one that is a multiple of 8 only (`5000`, whose `% 32 = 8` — the portable
+/// extent the Metal form alone refuses, carried by the pointwise route with a
+/// padded `M` as well, so the two padded axes meet in one case); `k` a multiple of
+/// 32 as well as one that is a multiple of 8 only (`336`, `40` — the axis the
+/// shader's `REQUIREMENTS` names as `8`, not `32`); a contraction deepened past the
+/// routed default; and an `M` that is not a multiple of 32 on **both** routes —
+/// because their A windows are not the same one (the im2col panel multiply binds
+/// the whole arena, the pointwise GEMM the conv node's own window), so the
+/// padded-row read is checked against both a whole-arena and a bounded bind.
+///
+/// The recognition front's own third convolution is not a case here: its three
+/// extents are pinned at the end of the test instead, on its real 2-D geometry,
+/// where the kernel and not this fixture's protocol decides.
 ///
 /// The im2col shapes' contraction extent is `c_in × kh × kw` (448, 420, 336 and
 /// 3584 for the deep one) and the pointwise ones' is `c_in` (128, 100, 40).
-const CASES: [Case; 12] = [
+const CASES: [Case; 14] = [
     Case {
         label: "im2col [1,64,1,2048] k=[1,7] p=[0,3] 64→64",
         c_in: 64,
@@ -198,6 +226,26 @@ const CASES: [Case; 12] = [
         coop: Some(true),
     },
     Case {
+        label: "pointwise-n8-only [1,128,1,5000] k=[1,1] p=[0,0] 128→64",
+        c_in: 128,
+        c_out: 64,
+        l: 5000,
+        k: 1,
+        p: 0,
+        route: "conv1x1_gemm",
+        coop: Some(true),
+    },
+    Case {
+        label: "pointwise-n8-only-padded-M [1,128,1,5000] k=[1,1] p=[0,0] 128→80",
+        c_in: 128,
+        c_out: 80,
+        l: 5000,
+        k: 1,
+        p: 0,
+        route: "conv1x1_gemm",
+        coop: Some(true),
+    },
+    Case {
         label: "im2col-unaligned [1,64,1,2050] k=[1,7] p=[0,3] 64→64",
         c_in: 64,
         c_out: 64,
@@ -208,10 +256,10 @@ const CASES: [Case; 12] = [
         coop: Some(false),
     },
     Case {
-        label: "pointwise-unaligned [1,128,1,5000] k=[1,1] p=[0,0] 128→64",
+        label: "pointwise-unaligned [1,128,1,5004] k=[1,1] p=[0,0] 128→64",
         c_in: 128,
         c_out: 64,
-        l: 5000,
+        l: 5004,
         k: 1,
         p: 0,
         route: "conv1x1_gemm",
@@ -384,13 +432,13 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
                 assert_eq!(
                     coop_dispatches,
                     1,
-                    "{}: the alignment admits this shape's GEMM (k={k_total} % 8 = {}, \
-                     n={} % 32 = {}), so its one conv must dispatch the cooperative \
+                    "{}: the route's alignment admits this shape's GEMM (k={k_total} % 8 = {}, \
+                     n={} % 8 = {}), so its one conv must dispatch the cooperative \
                      kernel once",
                     case.label,
                     k_total % 8,
                     case.l,
-                    case.l % 32
+                    case.l % 8
                 );
                 let d = common::max_abs_diff(&got_coop, &got_base);
                 eprintln!(
@@ -475,19 +523,24 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
         common::max_abs_diff(&got, &want)
     );
 
-    // The force lever keeps its meaning for these classes too, and what it moves
-    // is the admission: on a Metal adapter it widens the alignment to the portable
-    // form's `n % 8` — the same widening an ordinary multiply gets from it, the
-    // Metal scope and the operand-order probe being the terms it does not touch.
-    // Read on one shape with the lever on and off, so "the alignment and not the
-    // call decides" holds under the lever as well. The unaligned `n` is the
-    // kernel's own bounds-checked case — its grid rounds up and the store guard
-    // drops the columns past `params.n` — which is why the output is held to the
-    // route's CPU bar here rather than merely counted.
+    // The force lever's geometry term is what these classes ask for already, so on
+    // a shape they admit it moves nothing: `RLX_WGPU_FORCE_COOP_F32=1` widens the
+    // ordinary multiply's output-column extent from a multiple of 32 to a multiple
+    // of 8, and this route asks for that 8 — the Metal scope and the operand-order
+    // probe being the terms it does not touch. Read on two shapes, so "the alignment
+    // and not the call decides" holds under the lever here as well.
+    //
+    // The first is admitted on the route's own alignment (`n = 5000`, a multiple of
+    // 8 and not of 32), where the lever must change neither the dispatch nor the
+    // output: both arms take the cooperative kernel. What is read there is the
+    // padded columns the kernel lays out — its x grid rounds up to the next multiple
+    // of 32 and the store guard's `global_col >= params.n` term drops what the
+    // `b_*` gathers read past the row — which is why the output is held to the
+    // route's CPU bar rather than merely counted.
     let case = CASES
         .iter()
-        .find(|c| c.label.starts_with("pointwise-unaligned "))
-        .expect("the pointwise unaligned case");
+        .find(|c| c.label.starts_with("pointwise-n8-only "))
+        .expect("the pointwise multiple-of-8-only case");
     let xs = common::fill(case.c_in * case.l, 7, 1, 13, 0.1, -0.6);
     let ws = common::fill(case.c_out * case.c_in * case.k, 5, 3, 11, 0.1, -0.5);
     let want = common::unit_conv_cpu_reference(graph(case), &xs, &ws);
@@ -502,23 +555,192 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
     );
     assert_eq!(
         forced, 1,
-        "{}: RLX_WGPU_FORCE_COOP_F32=1 widens the alignment to n % 8 for these \
-         classes as it does for any other multiply",
+        "{}: the route's own alignment admits this shape, so the lever — the same \
+         widening it asks for — must leave that admission standing",
         case.label
     );
     assert_eq!(
-        off, 0,
-        "{}: with the lever off the same shape keeps today's kernel, so it is the \
-         alignment the lever widened and not the call that decided",
+        off, 1,
+        "{}: with the lever off the shape keeps the kernel its own alignment admits, \
+         which is why the lever moves nothing on this class",
         case.label
     );
     common::assert_close_under(case.label, "forced", &got_forced, &want);
     common::assert_close_under(case.label, "unforced", &got_off, &want);
     eprintln!(
-        "{}: RLX_WGPU_FORCE_COOP_F32=1 — cooperative dispatch on an n % 32 ≠ 0 shape \
-         (n={}), vs CPU {:.2e}",
+        "{}: RLX_WGPU_FORCE_COOP_F32=1 — cooperative dispatch {forced} with the lever \
+         on, {off} off (n={}), vs CPU {:.2e}",
         case.label,
         got_forced.len(),
         common::max_abs_diff(&got_forced, &want)
+    );
+
+    // The second is a shape neither alignment accepts (`n = 2050`, `n % 8 = 2`),
+    // which is where the lever still has to be inert: what it widens is the Metal
+    // form's own 32, to the portable 8 these routes already ask for, and `2050` fails
+    // even that — no dispatch under it, as none without it (the case loop above took
+    // this shape's two arms bit-identical), so there is no kernel for it to have
+    // changed.
+    let case = CASES
+        .iter()
+        .find(|c| c.label.starts_with("im2col-unaligned "))
+        .expect("the im2col output-column refusal");
+    let xs = common::fill(case.c_in * case.l, 7, 1, 13, 0.1, -0.6);
+    let ws = common::fill(case.c_out * case.c_in * case.k, 5, 3, 11, 0.1, -0.5);
+    let want = common::unit_conv_cpu_reference(graph(case), &xs, &ws);
+    rlx_ir::env::set("RLX_WGPU_FORCE_COOP_F32", "1");
+    let (steps, got_forced, forced) = compile_and_run(case, &xs, &ws);
+    rlx_ir::env::set("RLX_WGPU_FORCE_COOP_F32", "0");
+    assert!(
+        steps.contains(&case.route),
+        "{}: the route is unchanged by the force lever (schedule {steps:?})",
+        case.label
+    );
+    assert_eq!(
+        forced, 0,
+        "{}: RLX_WGPU_FORCE_COOP_F32=1 widens to the portable 8 this shape fails \
+         (n % 8 = 2), so it keeps today's kernel",
+        case.label
+    );
+    common::assert_close_under(case.label, "forced", &got_forced, &want);
+    eprintln!(
+        "{}: RLX_WGPU_FORCE_COOP_F32=1 — still no cooperative dispatch on an n % 8 ≠ 0 \
+         shape (n={}), vs CPU {:.2e}",
+        case.label,
+        got_forced.len(),
+        common::max_abs_diff(&got_forced, &want)
+    );
+
+    // The two routes' newly admitted extents, priced: the front's own third
+    // convolution — 3×3 taps, stride 2, pad 1, 480 → 512, so the contraction is
+    // 4320 (480 × 3 × 3) and `m` is not trivial — at the three input widths its own
+    // lengths reach (19, 25, 31, i.e. the extents 160, 208 and 256), and the 1×1
+    // pointwise route at the extent the case loop admits above it (`5000`, a
+    // multiple of 8 and not of 32), for which no route-cost cell exists.
+    for l in [25usize, 19, 31] {
+        let mut g = Graph::new("front_third_conv");
+        let x = g.input("x", Shape::new(&[1, 480, 31, l], DType::F32));
+        let w = g.param("w", Shape::new(&[512, 480, 3, 3], DType::F32));
+        let y = g.conv2d(x, w, [3, 3], [2, 2], [1, 1], [1, 1], 1);
+        g.set_outputs(vec![y]);
+        let xs = common::fill(480 * 31 * l, 7, 1, 13, 0.1, -0.6);
+        let ws = common::fill(512 * 480 * 9, 5, 3, 11, 0.1, -0.5);
+        time_two_arms(g, &xs, &ws, "front third conv", "im2col_gpu");
+    }
+    // The other caller of the widened admission, at the extent the case loop admits
+    // above it: 1×1 pointwise, 128 → 64, a multiple of 8 and not of 32.
+    let mut g = Graph::new("pointwise_n8_only");
+    let x = g.input("x", Shape::new(&[1, 128, 1, 5000], DType::F32));
+    let w = g.param("w", Shape::new(&[64, 128, 1, 1], DType::F32));
+    let y = g.conv2d(x, w, [1, 1], [1, 1], [0, 0], [1, 1], 1);
+    g.set_outputs(vec![y]);
+    let xs = common::fill(128 * 5000, 7, 1, 13, 0.1, -0.6);
+    let ws = common::fill(64 * 128, 5, 3, 11, 0.1, -0.5);
+    time_two_arms(g, &xs, &ws, "pointwise 1×1", "conv1x1_gemm");
+
+    // And the ordinary multiply's own rule, which this change leaves alone: a plain
+    // matmul asks the Metal form's own 32, so an `n` that is a multiple of 8 only
+    // takes the wide kernel while the next shape up takes the cooperative one. The
+    // counter is the witness either way — the two arms' step names carry no
+    // precision.
+    for (n, want) in [(5000u32, 0u64), (5056, 1)] {
+        let mut g = Graph::new("plain_matmul_n");
+        let x = g.input("x", Shape::new(&[64, 256], DType::F32));
+        let w = g.param("w", Shape::new(&[256, n as usize], DType::F32));
+        let y = g.mm(x, w);
+        g.set_outputs(vec![y]);
+        let xs = common::fill(64 * 256, 7, 1, 13, 0.1, -0.6);
+        let ws = common::fill(256 * n as usize, 5, 3, 11, 0.1, -0.5);
+        let before = rlx_wgpu::coop_f32_dispatch_count();
+        let mut exe = WgpuExecutable::compile(g);
+        exe.set_param("w", &ws);
+        let _ = exe.run(&[("x", &xs)]);
+        let dispatches = rlx_wgpu::coop_f32_dispatch_count() - before;
+        assert_eq!(
+            dispatches,
+            want,
+            "a plain multiply with n = {n} (n % 32 = {}) must take the cooperative kernel \
+             {want} time(s), as it did before the conv routes' widening",
+            n % 32
+        );
+        eprintln!(
+            "plain matmul n = {n} (n % 32 = {}): cooperative dispatches {dispatches}",
+            n % 32
+        );
+    }
+    rlx_ir::env::set("RLX_WGPU_NO_COOP_F32", "0");
+}
+
+/// The spatial extent a conv GEMM node's multiply works over — the product of its
+/// output's two trailing dims — off the graph itself, so a caller cannot label the
+/// node with an extent its own geometry does not produce.
+fn conv_extent(g: &Graph) -> usize {
+    g.node(g.outputs[0]).shape.dims()[2..]
+        .iter()
+        .map(|d| d.unwrap_static())
+        .product()
+}
+
+/// Compile one node under both arms — `RLX_WGPU_NO_COOP_F32=1` and the shaped
+/// admission — hold it to `route`, to exactly one cooperative dispatch, to both
+/// arms' place against the crate's own CPU conv and to the same 2e-5 arm-to-arm bar
+/// the case loop uses, time the arms interleaved for three rounds, and print the
+/// medians, the arm difference, both arms' CPU difference and the arena. The
+/// cooperative counter is read around the shaped arm's run alone, so the wide arm's
+/// own run cannot enter the count.
+fn time_two_arms(g: Graph, xs: &[f32], ws: &[f32], node: &str, route: &str) {
+    let extent = conv_extent(&g);
+    let label = &format!("{node} at extent {extent}");
+    let want = common::unit_conv_cpu_reference(g.clone(), xs, ws);
+    rlx_ir::env::set("RLX_WGPU_NO_COOP_F32", "1");
+    let mut wide = WgpuExecutable::compile(g.clone());
+    wide.set_param("w", ws);
+    rlx_ir::env::set("RLX_WGPU_NO_COOP_F32", "0");
+    let mut coop = WgpuExecutable::compile(g);
+    coop.set_param("w", ws);
+    let steps = coop.test_step_names();
+    let arena = coop.test_arena_bytes();
+    assert!(
+        steps.contains(&route),
+        "{label}: must reach {route} (schedule {steps:?})"
+    );
+    assert_eq!(
+        arena,
+        wide.test_arena_bytes(),
+        "{label}: the plan must be the same on both arms — the cooperative kernel reads \
+         both operands out of the f32 arena, so it adds no buffer of its own"
+    );
+    let before = rlx_wgpu::coop_f32_dispatch_count();
+    let got_coop = coop.run(&[("x", xs)]).remove(0);
+    let dispatches = rlx_wgpu::coop_f32_dispatch_count() - before;
+    let got_wide = wide.run(&[("x", xs)]).remove(0);
+    assert_eq!(
+        dispatches,
+        1,
+        "{label}: a multiple of 8 is {extent} % 8 = {}, so the node must dispatch the \
+         cooperative kernel once",
+        extent % 8
+    );
+    let mut arms = vec![wide, coop];
+    let per_round = common::time_round_robin(&mut arms, 3, 1, |arm| {
+        let _ = arm.run(&[("x", xs)]);
+    });
+    common::assert_close_under(label, "cooperative", &got_coop, &want);
+    common::assert_close_under(label, "wide", &got_wide, &want);
+    let d = common::max_abs_diff(&got_coop, &got_wide);
+    assert!(
+        d < 2e-5,
+        "{label}: cooperative vs wide max|Δ| {d:e} past the 2e-5 two conforming arms \
+         can differ by"
+    );
+    eprintln!(
+        "{label}: wide {:.3} ms {:?}, cooperative {:.3} ms {:?}, cooperative vs wide {d:e}, \
+         vs CPU {:e} / {:e}, arena {arena} B",
+        common::median(&per_round[0]),
+        per_round[0],
+        common::median(&per_round[1]),
+        per_round[1],
+        common::max_abs_diff(&got_coop, &want),
+        common::max_abs_diff(&got_wide, &want),
     );
 }
