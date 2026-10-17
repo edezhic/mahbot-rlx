@@ -11,12 +11,12 @@
 //! a multiply whose SECOND operand is a Param. What changed is that these two sites
 //! now ask that path's admission (`conv_gemm`), with the roles swapped, and they
 //! ask it for the portable output-column alignment (`n % 8`) instead of the Metal
-//! form's own 32, because their `n` is a conv's spatial output extent and the
-//! kernel lays one out with its padded columns dropped. So `RLX_WGPU_NO_COOP_F32`,
+//! form's own 32 — their one widening, explained once on the admission itself
+//! (`coop_f32_admitted` in `backend/mod.rs`). So `RLX_WGPU_NO_COOP_F32`,
 //! `RLX_WGPU_FORCE_COOP_F32`, `RLX_WGPU_MATMUL_F32_ONLY` and the per-device
 //! operand-order probe govern them as they govern any other multiply, and an extent
-//! the portable form admits where the Metal form alone would refuse — `16 × 13 =
-//! 208` on the recognition front — is part of what this file pins.
+//! the portable form admits where the Metal form alone would refuse is part of what
+//! this file pins.
 //!
 //! **Alignment decides, not the call.** Each case below is compiled and run twice
 //! in one process, once with the cooperative path available and once under
@@ -52,7 +52,9 @@
 //! general, and the `1e-5` bar — not the zero — is what has to hold when they do.
 //! The `n = 5000` shape — a multiple of 8 and not of 32, so its x grid rounds up —
 //! is `0.0` against the CPU conv on the cooperative arm too, in the loop and again
-//! under the lever at the end.
+//! under the lever at the end. Every figure in this note, and the front-convolution
+//! rows the README takes from this file's trailing block, are runs of this test; the
+//! README marks the readings there that no in-tree graph or harness takes.
 //!
 //! **The ordinary multiply is not the widening's.** A plain matmul keeps the Metal
 //! form's own 32 columns: the counter reads zero for an `n` that is a multiple of 8
@@ -67,12 +69,9 @@
 //! are not the same one — the im2col panel multiply binds the whole arena, the
 //! pointwise GEMM the conv node's own window — so the read is checked against a
 //! whole-arena bind and against a bounded one. The padded columns are the mirror
-//! case on the column axis, and they are admitted on the route's own alignment
-//! now: `n = 5000` is a multiple of 8 and not of 32, so the x grid rounds up the
-//! same way, and the store guard's `global_col >= params.n` term has to drop what
-//! the `b_*` gathers read past the row — the CPU parities this case takes in the
-//! loop, and again under the lever at the end, are what hold those columns to no
-//! output.
+//! case on the column axis, admitted on the route's own alignment now (`n = 5000`,
+//! a multiple of 8 and not of 32): the CPU parities this case takes in the loop, and
+//! again under the lever at the end, are what hold them to no output.
 //!
 //! The case set is the route's own geometries: `conv_routes_parked_weight.rs`
 //! pins `[1,64,1,2048] k=[1,7]` (im2col), `[1,128,1,8192] k=[1,1]` (pointwise)
@@ -430,15 +429,11 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
         match case.coop {
             Some(true) => {
                 assert_eq!(
-                    coop_dispatches,
-                    1,
-                    "{}: the route's alignment admits this shape's GEMM (k={k_total} % 8 = {}, \
-                     n={} % 8 = {}), so its one conv must dispatch the cooperative \
+                    coop_dispatches, 1,
+                    "{}: the route's alignment admits this shape's GEMM (k = {}, n = {}, \
+                     each % 8 = 0), so its one conv must dispatch the cooperative \
                      kernel once",
-                    case.label,
-                    k_total % 8,
-                    case.l,
-                    case.l % 8
+                    case.label, k_total, case.l
                 );
                 let d = common::max_abs_diff(&got_coop, &got_base);
                 eprintln!(
@@ -532,11 +527,8 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
     //
     // The first is admitted on the route's own alignment (`n = 5000`, a multiple of
     // 8 and not of 32), where the lever must change neither the dispatch nor the
-    // output: both arms take the cooperative kernel. What is read there is the
-    // padded columns the kernel lays out — its x grid rounds up to the next multiple
-    // of 32 and the store guard's `global_col >= params.n` term drops what the
-    // `b_*` gathers read past the row — which is why the output is held to the
-    // route's CPU bar rather than merely counted.
+    // output: both arms take the cooperative kernel. Its column axis is padded, so
+    // the output is held to the route's CPU bar rather than merely counted.
     let case = CASES
         .iter()
         .find(|c| c.label.starts_with("pointwise-n8-only "))
@@ -571,7 +563,7 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
         "{}: RLX_WGPU_FORCE_COOP_F32=1 — cooperative dispatch {forced} with the lever \
          on, {off} off (n={}), vs CPU {:.2e}",
         case.label,
-        got_forced.len(),
+        case.l,
         common::max_abs_diff(&got_forced, &want)
     );
 
@@ -607,7 +599,7 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
         "{}: RLX_WGPU_FORCE_COOP_F32=1 — still no cooperative dispatch on an n % 8 ≠ 0 \
          shape (n={}), vs CPU {:.2e}",
         case.label,
-        got_forced.len(),
+        case.l,
         common::max_abs_diff(&got_forced, &want)
     );
 
@@ -717,7 +709,7 @@ fn time_two_arms(g: Graph, xs: &[f32], ws: &[f32], node: &str, route: &str) {
     assert_eq!(
         dispatches,
         1,
-        "{label}: a multiple of 8 is {extent} % 8 = {}, so the node must dispatch the \
+        "{label}: a multiple-of-8 extent (extent % 8 = {}) must dispatch the \
          cooperative kernel once",
         extent % 8
     );
@@ -735,7 +727,7 @@ fn time_two_arms(g: Graph, xs: &[f32], ws: &[f32], node: &str, route: &str) {
     );
     eprintln!(
         "{label}: wide {:.3} ms {:?}, cooperative {:.3} ms {:?}, cooperative vs wide {d:e}, \
-         vs CPU {:e} / {:e}, arena {arena} B",
+         vs CPU cooperative {:e} / wide {:e}, arena {arena} B",
         common::median(&per_round[0]),
         per_round[0],
         common::median(&per_round[1]),

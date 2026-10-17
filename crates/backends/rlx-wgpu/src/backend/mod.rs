@@ -3137,11 +3137,9 @@ fn derive_matmul_compute(
 /// of the Metal form's own) and reads the same shared dispatch table — which
 /// can move it back to `F32`, never onto a family that cannot serve the layout.
 ///
-/// The extent tolerance is the conv routes' one widening: their `n` is a conv's
-/// spatial output extent, so they ask the portable 8-column alignment where an
-/// ordinary multiply asks the Metal form's own 32 — see [`coop_f32_admitted`] for
-/// that term and the padded-column reliance it stands on, and `README.md` for what
-/// it measures and which other extents move with it.
+/// The extent tolerance is the conv routes' one widening; [`coop_f32_admitted`]
+/// explains it, and `README.md` records what it measures and which other extents
+/// move with it.
 ///
 /// Three readings of "cannot be launched with the chosen kernel", and in each of
 /// them the node keeps today's kernel: this device's f32 cooperative pipeline

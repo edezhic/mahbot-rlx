@@ -46,13 +46,9 @@ enable wgpu_cooperative_matrix;
 // channel axis. `tests/conv_gemm_coop_f32.rs` carries a `c_out = 80` shape that
 // makes the read happen and checks the padded rows reach no output.
 //
-// The padded COLUMNS cost the same and are relied upon the same way: with an N
-// that is a multiple of 8 only — the convolution GEMM routes' own extent
-// tolerance (`conv_gemm` in `backend/mod.rs`), which `RLX_WGPU_FORCE_COOP_F32`
-// then asks of every shape — the x grid rounds up as well, the `b_*` gathers
-// read up to 31 columns past B's row, and the store guard's
-// `global_col >= params.n` term drops every one of them — same reliance, same
-// reasoning, and the same test.
+// The padded COLUMNS stand on the same reliance, with the extent tolerance the
+// convolution GEMM routes take and `RLX_WGPU_FORCE_COOP_F32` asks of every shape:
+// see the admission's own note (`coop_f32_admitted` in `backend/mod.rs`).
 
 struct Params {
     m: u32,

@@ -205,23 +205,15 @@ never take it, whatever the adapter — their admission is Metal-scoped.
 
 ### The convolution GEMM routes' output-column extent
 
-A convolution's panel multiply has a conv's spatial output extent for its `n`, and
-such an extent is a multiple of 8 far more often than of 32: the recognition
-front's third stride-2 convolution reads as `16 × N` on its frame axis, so its `n`
-is 160 at N = 10, 208 at N = 13 and 256 at N = 16 — and 208, the middle one, is
-the one the Metal form's own 32 refused, on the wide non-cooperative path while
-its neighbours took the cooperative one. The kernel lays such an extent out either
-way: with an `n` a multiple of 8 only the x grid rounds up exactly as the y grid
-does, the `b_*` gathers read past the row, and the store guard's
-`global_col >= params.n` term drops the padded columns — the same reliance the
-padded rows already stand on, and the same test covers both. So `conv_gemm` asks
-the admission for the **portable** alignment, and an extent that satisfies it is no
-longer refused.
+The mechanism — why these routes ask the admission for the **portable** alignment,
+and how the kernel drops the padded columns it then lays out — is explained once, on
+the admission itself: the note on `coop_f32_admitted` in `src/backend/mod.rs`. What
+is below is what that widening measures and what it is verified not to move.
 
 Measured on an M3 Pro with Metal on macOS, `--release`, the crate's own
 `backend-tests` targets, shipped defaults, no tuning cache, `just throttle`
-clean. The stage's own figures are the trailing block of
-`conv_gemm_coop_f32.rs`: the front's third convolution as **one node** — 3×3
+clean. The stage's own figures are re-taken in this checkout by the trailing block
+of `conv_gemm_coop_f32.rs`: the front's third convolution as **one node** — 3×3
 taps, stride 2, pad 1, 480 → 512, i.e. a contraction of 4320 (480 × 3 × 3) —
 channels picked so that the kernel and not the submission floor decides (the
 64-channel cell of the same extent, in the route-cost table below, sits at its
@@ -268,10 +260,10 @@ lives in the sibling `rlx-models` repo, cannot be re-taken here.
 **Which other extents change route, and what they cost.** Only these two routes
 have the widened term, so the shapes that move are convolution GEMM extents that
 are a multiple of 8 and not of 32, with `K` a multiple of 8 and `M` free. Of the
-crate's own route-cost cells that is three. The kernel the pre-change tree put
-them on is what `RLX_WGPU_NO_COOP_F32=1` forces (the pre-change admission did
-refuse these extents), so both columns are reproducible from this tree, from three
-takes of the harness under each setting at `load1` 3.3:
+crate's own route-cost cells (`conv_route_cost.rs`) that is three. The kernel the
+pre-change tree put them on is what `RLX_WGPU_NO_COOP_F32=1` forces (the pre-change
+admission did refuse these extents), so both columns are re-takeable in this
+checkout, from three takes of the harness under each setting at `load1` 3.3:
 
 | cell (its spatial extent) | pre-change kernel | shipped default | arena |
 |---|---|---|---|
@@ -323,7 +315,10 @@ default and the widened shared rule:
 No extent measured slower under the shared rule either, so no cost argument
 separates the two forms; the **shape-scoped** one is what lands because it moves
 no shape outside these two routes, and the cell table above is the evidence that
-nothing outside them changes route at all.
+nothing outside them changes route at all. This table's figures, unlike the two
+above, are not re-takeable in this checkout: no in-tree graph or harness takes a
+bare-multiply reading of the five shapes — `191×200×600` does occur in a tree graph
+(`tests/basic.rs`), read there for parity and not for these three settings.
 
 **The active-extent mode does not turn on.** `Step::Im2ColGpu` answers false to
 `safe_for_active_extent`, which is all-or-nothing per graph, so any schedule that
@@ -353,9 +348,11 @@ arena and 219.3 → 297.8 MiB of process peak, with the third convolution's own 
 quantity from the one-node arena the block above prints). Nothing in this kernel's
 mechanism produces a plan difference — it adds no buffer and the plans here are
 byte-identical on the arms — so the pair is recorded as what that wider arm read
-and not as this landing's price. The landing's own pair is the same graph read
-**without** the lever, which is what a re-shoot takes, and it belongs next to the
-pass's time.
+and not as this landing's price. That pair is not re-takeable in this checkout: no
+in-tree graph or harness takes a model-level reading of the front, whose graph lives
+in the sibling `rlx-models` repo. Of the figures above, the one-node arena is what the
+block asserts and this checkout re-takes; the resident set beside it is a hand reading
+of that same one-node run — nothing in the tree prints one.
 
 ### Environment flags
 
