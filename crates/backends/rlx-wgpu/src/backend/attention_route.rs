@@ -19,21 +19,69 @@
 //!
 //! Why: the fused kernel runs one thread per (batch, head, query row), each
 //! reading all of K and V itself, so the work never fills the machine as the row
-//! count grows. Measured by `tests/attention_decompose_cost.rs` on this machine
-//! (Metal, M3 Pro; 8 layers, 8 heads, head_dim 64, causal; a few percent run to
-//! run): this route reaches **≈40 GF/s at 32 query rows over 1024 keys, ≈80 at
-//! 64, ≈110 at 100 and ≈190 at 256**, and ≈33-130 GF/s at those row counts over
-//! 256 keys. The fused side is deliberately not quoted as a rate: that harness's
-//! own note is that a reading of it is mostly the fixed submit/wait/readback
-//! floor, and the fused step at 24-31 rows is small enough to sit on that floor —
-//! so what it gives is a bound on the fused step, not a measurement of it, and
-//! the two arrangements are compared by their ratio there instead: 18x over 1024
-//! keys and ≈14x over 256. The same reading does say two things about that step
-//! without being a rate: it barely moves with the row count (≈1% from 24 to 31
-//! rows, against a third more work), and it grows with the key sequence (≈4.2x
-//! from 256 to 1024 keys at 24 rows) — the serial key walk showing on top of the
-//! floor. The crossover the floor sits inside was read off-device: nothing at
-//! 13-24 query rows, an order of magnitude at about 100.
+//! count grows. The route was admitted from 32 query rows and is admitted from
+//! two now: a single live query row stays on the existing one-row arrangement
+//! (the decode kernel at this cache geometry), two or more take the dense
+//! arrangement, and the key length does not enter as a term — the scratch
+//! conjunct already puts an upper bound on the key extent, so a key floor would
+//! enlarge the admission, though it would also avoid the empty-cache cell's
+//! 9.9 ms — the price of the single-term admission, paid once per generation.
+//!
+//! The figures come from the fork's own measurement stand, an out-of-tree
+//! harness (`l59_stand --part decode`) that patches this checkout's crates in
+//! and reads a cell in five rounds inside one window; they cannot be re-taken in
+//! this checkout. The body is Qwen3-ASR-0.6B's 28-layer attention — 16 heads of
+//! width 128 over 8 KV heads, one batch — on M3 Pro / Metal; milliseconds. `band`
+//! compiles the whole cache, `rows` the window's rows instead; the `interleaved`
+//! session read the two builds back to back — `before → after` is that order,
+//! and a one-row cell's single figure or `a / b` pair is the same reading on the
+//! two builds — and `31-row control` and `empty cache` are the separate control
+//! readings:
+//!
+//! | session         | form | cells | rows | ms            |
+//! |-----------------|------|-------|------|---------------|
+//! | interleaved     | band |   512 |    2 | 502.1 → 189.5 |
+//! | interleaved     | band |  2048 |    2 | 2040 → 548.1  |
+//! | interleaved     | rows |   512 |    2 | 515.2 → 147.0 |
+//! | interleaved     | rows |  2048 |    2 | 1880 → 451.4  |
+//! | interleaved     | band |   512 |    1 | 86.0          |
+//! | interleaved     | rows |   512 |    1 | 65.1          |
+//! | interleaved     | band |  2048 |    1 | 260.2 / 287.6 |
+//! | interleaved     | rows |  2048 |    1 | 193.3 / 193.6 |
+//! | 31-row control  | band |   512 |   31 | 527.1 → 177.6 |
+//! | empty cache     | band |     0 |    2 | 33.3 → 43.2   |
+//!
+//! The gain from the table's own cells is x2.65 and x3.72 for the band form
+//! (502.1 → 189.5 over 512 cells, 2040 → 548.1 over 2048) and x3.50 and x4.16
+//! for the rows form (515.2 → 147.0, 1880 → 451.4). Against two single-row
+//! passes from the same one-row rows, the two-row figure sits 10% above the band
+//! form's bound over 512 cells (189.5 against 2 × 86.0) and 13% above the rows
+//! form's (147.0 against 2 × 65.1); over 2048 cells the band form's 548.1 is 5%
+//! above 2 × 260.2 and 5% inside 2 × 287.6, and the rows form's 451.4 is 17%
+//! above either 2 × 193.3 or 2 × 193.6. That residue — the packed multiplies
+//! switching from per-row GEMV to row-grouped GEMM — is the second admission,
+//! recorded as the next subject and not tuned around.
+//!
+//! The classes it re-routes, one sentence each, with the tests that pin each
+//! route and its parity:
+//!
+//! - the cached decode body at two live rows, in
+//!   `attention_cached_decode_route::a_two_row_cached_decode_step_takes_the_route`,
+//!   with the one-row decode-kernel control in
+//!   `a_one_row_cached_decode_step_keeps_the_decode_kernel`;
+//! - a step whose query extent differs from its key extent, pinned in
+//!   `attention_rows_route` by
+//!   `a_causal_step_shorter_in_keys_than_rows_takes_the_route`;
+//! - a chunked prefill or padded walk compiled above its walked extent, in
+//!   `attention_cached_decode_route::a_padded_run_keeps_the_live_rows_answers`;
+//! - the crate's own attention fixtures from two rows up, in
+//!   `attention_rows_route::route_mask_kinds_match_cpu`,
+//!   `attention_softcap_route::the_dense_arrangement_caps_ahead_of_the_mask`,
+//!   `attention_v_head_dim_parity::wgpu_attention_asymmetric_v_head_dim_parity`
+//!   and `attention_long_seq_precision::attention_precision_across_key_lengths`.
+//!
+//! The embeddings path walks one live row, so it never meets this admission, and
+//! its digests are unchanged.
 //!
 //! Why steps and not a graph decomposition: on a discrete Vulkan/DX12 adapter
 //! the ops this would decompose into are hosted — `Op::Softmax` / `Op::Binary` /
@@ -43,7 +91,7 @@
 //! normalisation on the CPU on exactly those adapters; as steps, every piece of
 //! it stays on the device.
 //!
-//! Every term above is the graph's own, including WebGPU's per-dimension
+//! Every admission term is the graph's own, including WebGPU's per-dimension
 //! dispatch cap ([`MAX_WORKGROUPS_PER_DIM`], which both multiplies reach through
 //! their `batch · heads` z extent and their `seq_q`-row y extent). The one
 //! condition the geometry here cannot settle, so the `Op::Attention` arm applies
@@ -63,12 +111,11 @@ use rlx_ir::op::MaskKind;
 
 use super::MAX_WORKGROUPS_PER_DIM;
 
-/// Query rows below which the dense arrangement is not worth its two extra
-/// passes. The re-grouping measures nothing at 13-24 query rows and an order of
-/// magnitude at about 100, so the boundary has to fall inside that range, and
-/// this is the first power of two past its lower end — the measured pair either
-/// side of it is in `tests/attention_decompose_cost.rs` and in the note above.
-pub const ATTENTION_DECOMPOSE_MIN_Q: u32 = 32;
+/// Query rows below which the dense arrangement is not served: one, and only
+/// one. A single query row stays on the one-row arrangement — the decode kernel
+/// where [`crate::kernels::attention_decode_eligible`] allows it, the serial
+/// fused kernel otherwise — which is cheaper, so two is the floor.
+pub const ATTENTION_DECOMPOSE_MIN_Q: u32 = 2;
 
 /// Head width the route serves, mirroring the fused kernel's own `MAX_HEAD_DIM`
 /// (`kernels/attention.wgsl`). Neither multiply on this route needs the cap —
@@ -85,16 +132,28 @@ pub(crate) const ATTENTION_DECOMPOSE_MAX_HEAD_DIM: u32 = 512;
 /// chunked step) rather than in a per-step allocation this backend does not have.
 pub(crate) const ATTENTION_DECOMPOSE_MAX_SCRATCH_BYTES: u64 = 64 << 20;
 
-/// Rows per workgroup the route's multiplies dispatch their `m = seq_q` rows in:
-/// 32 is the narrowest row tile of the kernels the run can pick for them (the
-/// plain f32 kernel's, and `WideVariant::Std`'s — the vectorised variants take
-/// 64 rows per workgroup, whole tiles plus a 32-row remainder tile), so it is
-/// the conservative divisor for that extent's cap. Only that
-/// extent needs one: `n` is `seq_k` on the score multiply and `v_head_dim` on the
-/// value one, and the scratch conjunct already bounds `tiles · seq_k` by the
-/// reserve's own `16.7M` floats, which keeps `n`'s tiles (at most 16384 keys per
-/// multiply) far below the cap — an argument that needs the tile count to be at
-/// least one, which [`decompose_attention`] requires.
+/// Rows per workgroup the route's multiplies dispatch their `m = seq_q` rows
+/// in: 32 is the narrowest row tile of the kernels the run can pick for them
+/// (the plain f32 kernel's, and `WideVariant::Std`'s — the vectorised variants
+/// take 64 rows per workgroup, whole tiles plus a 32-row remainder tile), so it
+/// is the conservative divisor for that extent's cap.
+///
+/// The `n` extent carries no admission term of its own: it is `v_head_dim` on
+/// the value multiply (≤ 512, sixteen workgroups) and `seq_k` on the score one,
+/// and the scratch conjunct bounds the latter instead — `tiles · seq_k · c`
+/// with `c = head_dim + seq_q + v_head_dim` (Kᵀ plus the scores plus V's
+/// compaction, the last term zero when V's tile is already dense) against the
+/// reserve's 16.7M floats. That puts an upper bound on `seq_k` of
+/// `16 777 216 / (tiles · c)`, so `seq_k.div_ceil(32)` stays inside the cap of
+/// 65 535 wherever `tiles · c >= 9`, and at exactly 8 reaches 65 536 — one
+/// workgroup past it. The body's 16 tiles of 128-wide heads give
+/// `tiles · c = 16 · 258 = 4 128`, an upper bound of about four thousand cells.
+/// What it leaves is the single-tile end of both widths: one-wide heads with
+/// V's tile already dense put `tiles · c` at 3, so 5.6M keys pass the budget
+/// with a grid of 174 763 workgroups, and one-wide heads of any layout sit at
+/// 4. The device refuses such a dispatch rather than computing it wrongly, and
+/// closing the corner with a key-length term would enlarge the admission, so it
+/// is recorded rather than admitted around.
 const MATMUL_TILE_M: u32 = 32;
 
 /// Scratch regions are bumped through 256-byte aligned (`buffer::Arena`'s own
@@ -126,12 +185,14 @@ pub(crate) struct AttentionGeometry {
 /// operation's own masked normalisation, and a dense multiply by V — serves
 /// this step. Every conjunct is the graph's own — the two dispatch extents the
 /// multiplies walk included — so the arm's route gate needs nothing from the
-/// adapter (see the module doc). Two of them are degenerate shapes the fused
-/// path still runs: `tiles >= 1`, since with no `(batch, head)` tiles there is no
-/// multiply to dispatch and the `n`-extent argument below holds vacuously
-/// however long the key sequence is; and `seq_k >= 1`, since every region would
-/// be empty, the budget conjunct would pass vacuously, and the route would write
-/// zeros where the fused kernel's 0/0 normalisation is the NaN the operation is.
+/// adapter (see the module doc), and the floor is
+/// [`ATTENTION_DECOMPOSE_MIN_Q`]. Two of the conjuncts are degenerate shapes
+/// the fused path still runs: `tiles >= 1`, since with no
+/// `(batch, head)` tiles there is no multiply to dispatch and the `n`-extent
+/// argument above holds vacuously however long the key sequence is; and
+/// `seq_k >= 1`, since every region would be empty, the budget conjunct would
+/// pass vacuously, and the route would write zeros where the fused kernel's 0/0
+/// normalisation is the NaN the operation is.
 pub(crate) fn decompose_attention(g: &AttentionGeometry) -> bool {
     g.seq_q >= ATTENTION_DECOMPOSE_MIN_Q
         && g.seq_k >= 1
@@ -1079,16 +1140,23 @@ mod tests {
         rlx_ir::env::set("RLX_WGPU_NO_PACKED_BSHD_ATTN", "0");
     }
 
-    /// The floor's two sides and the measured bracket it has to fall inside: the
-    /// rule is a bare `>=` on the step's own query rows, the band below it
-    /// (13-24 rows, where the re-grouping returned nothing) is refused and the
-    /// order-of-magnitude end (about 100 rows) is served.
+    /// The floor, and the reading it rests on: the fork's cached decode cell —
+    /// two rows over a full cache — was measured and is served from two rows,
+    /// while one row stays with the decode kernel, which is cheaper still. The
+    /// live row count is the whole term: the key length does not change the
+    /// answer.
     #[test]
-    fn the_floor_sits_inside_the_measured_bracket() {
-        assert!(decompose_attention(&geom(32, 1024)));
-        assert!(!decompose_attention(&geom(31, 1024)));
-        assert!(!decompose_attention(&geom(24, 1024)));
-        assert!(!decompose_attention(&geom(13, 1024)));
+    fn the_floor_is_the_measured_one() {
+        assert!(
+            !decompose_attention(&geom(1, 1024)),
+            "one query row is the decode kernel's, and cheaper there"
+        );
+        assert!(decompose_attention(&geom(2, 2)));
+        assert!(decompose_attention(&geom(2, 32)));
+        assert!(decompose_attention(&geom(2, 512)));
+        assert!(decompose_attention(&geom(24, 512)));
+        assert!(decompose_attention(&geom(31, 512)));
+        assert!(decompose_attention(&geom(32, 512)));
         assert!(decompose_attention(&geom(100, 1024)));
     }
 
@@ -1230,7 +1298,7 @@ mod tests {
         let empty = AttentionGeometry {
             seq_k: 0,
             scratch_floats: 0,
-            ..geom(32, 1024)
+            ..geom(2, 1024)
         };
         assert!(!decompose_attention(&empty));
         assert!(decompose_attention(&AttentionGeometry {
@@ -1360,8 +1428,8 @@ mod tests {
         );
 
         // Rank-3 [B, S, H·D], told from [B·H, S, D] by its last dim: its tiles
-        // are strided, so every operand region is emitted and the floor refuses
-        // the step.
+        // are strided, so every operand region is emitted — and the step is still
+        // the route's, 16 query rows being well above the floor.
         let strided = plan_of(
             &[2, 16, 256],
             &[2, 16, 256],
@@ -1379,7 +1447,7 @@ mod tests {
         assert_eq!((strided.q_b, strided.q_h, strided.q_s), (16 * 256, 64, 256));
         assert!(!strided.q_dense && !strided.v_dense && !strided.out_dense);
         assert_eq!(strided.regions.q, 2 * 4 * 16 * 64);
-        assert!(!strided.decompose, "16 query rows are under the floor");
+        assert!(strided.decompose, "16 query rows are above the floor");
 
         // Grouped KV (nkv < heads): Q's and the output's tiles stay dense, V's
         // does not — the route reads one (b, h) V tile per query head.
@@ -1470,7 +1538,7 @@ mod tests {
         assert_eq!((plan.heads, plan.nkv, plan.seq_q), (2, 2, 4));
         assert_eq!((plan.q_s, plan.k_s, plan.v_s), (48, 48, 48));
         assert!(!plan.q_dense && !plan.v_dense && !plan.out_dense);
-        assert!(!plan.decompose, "4 query rows are under the floor");
+        assert!(plan.decompose, "4 query rows are above the floor");
 
         // Asymmetric SDPA: V's rows and the output are `v_head_dim` wide while
         // the scores still contract over `head_dim`.
@@ -1575,10 +1643,10 @@ mod tests {
         );
         // …and a shape under the floor is still a plan, with the route off it.
         let under = plan_of(
+            &[1, 2, 1, 64],
             &[1, 2, 4, 64],
             &[1, 2, 4, 64],
-            &[1, 2, 4, 64],
-            &[1, 2, 4, 64],
+            &[1, 2, 1, 64],
             2,
             64,
             None,
@@ -1630,10 +1698,11 @@ mod tests {
 
     /// The degenerate empty batch the fused path still runs, and the reason the
     /// route must not take it: with no `(batch, head)` tiles there is no multiply
-    /// to dispatch, and `tiles · seq_k` — the product the `n`-extent argument
-    /// rests on — is zero however long the key sequence is, so a shape no dispatch
-    /// could run would pass every other conjunct. The fused path's grid is folded
-    /// across the dispatch's own dimensions and takes it, as it did before.
+    /// to dispatch, and `tiles · c` — the coefficient the `n`-extent argument
+    /// above bounds — is zero however long the key sequence is, so a shape no
+    /// dispatch could run would pass every other conjunct. The fused path's grid
+    /// is folded across the dispatch's own dimensions and takes it, as it did
+    /// before.
     #[test]
     fn an_empty_batch_keeps_the_fused_kernel() {
         let empty = plan_of(

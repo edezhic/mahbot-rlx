@@ -20,36 +20,30 @@
 //! operand nothing declares is refused by name rather than read off the head
 //! axis, which `backend::attention_route`'s own unit tests pin device-free.
 //!
-//! One test compares the two arrangements directly. The route is chosen
-//! from the step's own query-row count, so the pair is one per-(batch, head)
-//! problem twice — the same prefill computed by the fused kernel and by the
-//! dense arrangement — and under a causal mask with `seq_q == seq_k` the rows
-//! they share attend to identical keys by construction. That pair is a
-//! cross-route comparison and not bit identity: the fused form rebases its
-//! softmax key by key and the dense form does it once against the row max, so the
-//! two sum in different orders. The test asserts the crate's bar and prints the
-//! measured deviation; it does not claim the outputs are equal.
+//! One test compares the two arrangements directly, on one per-(batch, head)
+//! problem twice: one query row over 32 keys is the fused kernel's, two rows over
+//! the same keys are the dense arrangement's, and under a causal mask both put
+//! their last row at the cache's end — so that row attends all 32 keys in either
+//! arrangement and is one computation written twice. The pair is a cross-route
+//! comparison and not bit identity: the fused form rebases its softmax key by key
+//! and the dense form does it once against the row max, so the two sum in
+//! different orders. The test asserts the crate's bar and prints the measured
+//! deviation; it does not claim the outputs are equal.
 //!
 //! Several tests here bracket the process-global route counters, so they take
 //! [`route_lock`] instead of living in one single-test binary. The timings are
 //! printed, never asserted: what a regression moves first is the route.
 mod common;
 
-use common::{max_abs_diff, route_lock};
+use common::{ATTENTION_BAR, data, max_abs_diff, route_lock};
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_wgpu::backend::{ATTENTION_DECOMPOSE_MIN_Q, WgpuExecutable};
-use rlx_wgpu::kernels::{AttentionRoutes, attention_route_counts, reset_attention_route_counts};
-
-fn data(n: usize, step: f32, cos: bool) -> Vec<f32> {
-    (0..n)
-        .map(|i| {
-            let x = i as f32 * step;
-            if cos { x.cos() } else { x.sin() }
-        })
-        .collect()
-}
+use rlx_wgpu::kernels::{
+    ATTENTION_DECODE_MIN_KEYS, AttentionRoutes, attention_route_counts,
+    reset_attention_route_counts,
+};
 
 /// Rank-3 `[B, rows, heads·head_dim]` MHA over `lk` keys. `mask_kind` decides
 /// whether the graph carries a mask input and of which shape: `[B, lk]` binary
@@ -245,11 +239,6 @@ fn run_case(
     let d = max_abs_diff(&gpu, &cpu);
     (gpu, routes, d, us)
 }
-
-/// The bar every route parity in this crate is held to at these shapes: a
-/// max-abs against the CPU backend, not a relative one, so a diffuse softmax
-/// leaving the output small cannot loosen it.
-const ATTENTION_BAR: f32 = 1e-6;
 
 /// The bar the backward step's gradients are held to against the CPU backend.
 /// They are sums over the keys of products of exponentials rather than one
@@ -460,12 +449,13 @@ fn grouped_kv_and_asymmetric_v_take_the_route_and_match_cpu() {
     }
 }
 
-/// The other side of the floor, on device: the same geometry with fewer query
-/// rows than the route serves keeps the fused kernel, and its numbers. This is
-/// the side the fused form is the right one for, so it is the side that must
-/// not silently move.
+/// The serial kernel's side of the route's floor, on device: a single query row
+/// over fewer keys than the decode form serves keeps the fused/serial kernel, and
+/// its numbers. It is one of the two live serial controls here — the scratch
+/// budget's own case in `the_scratch_budget_bounds_the_route` is the other — and
+/// the side the floor must not swallow.
 #[test]
-fn below_the_floor_keeps_the_fused_kernel() {
+fn a_one_row_short_key_step_keeps_the_serial_kernel() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return;
@@ -473,40 +463,70 @@ fn below_the_floor_keeps_the_fused_kernel() {
     let _guard = route_lock();
     const NH: usize = 8;
     const HD: usize = 64;
-    // 24 rows is the top of the range the floor was chosen from — nothing
-    // measured between 13 and 24 query rows, an order of magnitude at about 100 —
-    // and 31 is the row just below `ATTENTION_DECOMPOSE_MIN_Q`. All are above one
-    // query row, so none is decode-shaped.
-    for rows in [24usize, 31] {
-        let (_, routes, d, us) = run_case(1, rows, 256, NH, HD, MaskKind::Causal);
-        eprintln!(
-            "[rlx-attn-rows-below] rows={rows} heads={NH} head_dim={HD} lk=256 \
-             routes={routes:?} vs CPU: max_abs={d:.6e} ({us:.1} us)"
-        );
-        assert!(
-            rows < ATTENTION_DECOMPOSE_MIN_Q as usize,
-            "the floor's own points must sit below it"
-        );
-        assert_eq!(
-            routes,
-            AttentionRoutes {
-                decode: 0,
-                decomposed: 0,
-                serial: 1,
-            },
-            "rows={rows} is below the route's floor ({ATTENTION_DECOMPOSE_MIN_Q}) and is \
-             not decode-shaped: the fused kernel must serve it"
-        );
-        assert!(
-            d < ATTENTION_BAR,
-            "rows={rows} on the fused kernel: max_abs {d} vs CPU"
-        );
+    // 48 keys sits under the decode form's own 64-key floor, so a single row is
+    // the serial kernel's (see the assertion below); the mask is `None` because
+    // this cell pins the kernel, not a mask kind.
+    let lk = 48;
+    let (_, routes, d, us) = run_case(1, 1, lk, NH, HD, MaskKind::None);
+    eprintln!(
+        "[rlx-attn-rows-serial] rows=1 heads={NH} head_dim={HD} lk={lk} \
+         routes={routes:?} vs CPU: max_abs={d:.6e} ({us:.1} us)"
+    );
+    assert!(
+        lk <= ATTENTION_DECODE_MIN_KEYS as usize,
+        "the decode form's own floor must not cover this cell"
+    );
+    assert_eq!(
+        routes,
+        AttentionRoutes {
+            decode: 0,
+            decomposed: 0,
+            serial: 1,
+        },
+        "one query row over {lk} keys is the serial kernel's"
+    );
+    assert!(d < ATTENTION_BAR, "the serial kernel: max_abs {d} vs CPU");
+}
+
+/// Causal with fewer keys than query rows — a shape the two-row floor newly
+/// admits, and one where the causal offset both arrangements derive
+/// (`qi + (seq_k - seq_q)`) has to clamp at zero, since the subtraction would go
+/// negative. The leading rows are masked hardest and the step must still reach the
+/// CPU's numbers on the route.
+#[test]
+fn a_causal_step_shorter_in_keys_than_rows_takes_the_route() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
+        eprintln!("skip: wgpu unavailable");
+        return;
     }
+    let _guard = route_lock();
+    const NH: usize = 8;
+    const HD: usize = 64;
+    let (_, routes, d, us) = run_case(1, 4, 2, NH, HD, MaskKind::Causal);
+    eprintln!(
+        "[rlx-attn-rows-short] rows=4 heads={NH} head_dim={HD} lk=2 \
+         routes={routes:?} vs CPU: max_abs={d:.6e} ({us:.1} us)"
+    );
+    assert_eq!(
+        routes,
+        AttentionRoutes {
+            decode: 0,
+            decomposed: 1,
+            serial: 0,
+        },
+        "four query rows over two causal keys is the route's"
+    );
+    assert!(
+        d < ATTENTION_BAR,
+        "causal rows past the key sequence: max_abs {d} vs CPU"
+    );
 }
 
 /// Every mask kind the fused kernel implements on the dense arrangement against
 /// the CPU: the route re-arranges the same rule, so each kind has to reach the
-/// reference by the same numbers and none of them may fall off the route.
+/// reference by the same numbers and none of them may fall off the route. Walked
+/// at the band's own two query rows as well as the 48-row shape the kinds were
+/// pinned on before the floor moved.
 #[test]
 fn route_mask_kinds_match_cpu() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
@@ -514,91 +534,105 @@ fn route_mask_kinds_match_cpu() {
         return;
     }
     let _guard = route_lock();
-    for kind in [
-        MaskKind::None,
-        MaskKind::Causal,
-        MaskKind::SlidingWindow(2),
-        MaskKind::Custom,
-        MaskKind::Bias,
-    ] {
-        rows_shape(1, 48, 192, kind);
+    for rows in [ATTENTION_DECOMPOSE_MIN_Q as usize, 48] {
+        for kind in [
+            MaskKind::None,
+            MaskKind::Causal,
+            MaskKind::SlidingWindow(2),
+            MaskKind::Custom,
+            MaskKind::Bias,
+        ] {
+            rows_shape(1, rows, 192, kind);
+        }
     }
 }
 
-/// Query rows the cross-route pair below shares.
-const CROSS_ROWS: usize = 24;
+/// The shapes the cross-arrangement pair below walks: one row for the serial
+/// kernel, two for the route, over one key sequence.
+const CROSS_SERIAL_ROWS: usize = 1;
+const CROSS_DENSE_ROWS: usize = 2;
+const CROSS_LK: usize = 32;
 const CROSS_NH: usize = 8;
 const CROSS_HD: usize = 64;
 
-/// The two arrangements on the same problem: a prefill of [`CROSS_ROWS`] query
-/// rows is below the route's floor and takes the fused kernel, the same prefill
-/// padded out to [`ATTENTION_DECOMPOSE_MIN_Q`] rows takes the dense arrangement —
-/// and because both walk `seq_q == seq_k` under a causal mask, row `qi` of either
-/// attends to keys `0..=qi` only, so the shared rows are one computation.
+/// The two arrangements on the same problem: one query row over [`CROSS_LK`]
+/// keys takes the serial kernel, two rows over the same keys take the dense
+/// arrangement, and because both derive the causal position the same way —
+/// `qi + (seq_k - seq_q)` — their last shared row, row
+/// [`CROSS_DENSE_ROWS`] − 1, attends all [`CROSS_LK`] keys in both, so it is one
+/// computation.
 ///
-/// The two outputs are compared as a max-abs on those shared rows — two
-/// arrangements of the same f32 work, whose deviation here is ≈2.4e-7 and whose
-/// expected band is 1.2e-7…2.5e-7, so [`ATTENTION_BAR`] covers it. It is
-/// explicitly **not** bit identity: the fused form rebases its softmax key by key
-/// where the dense form rebases once against the row max. The measured deviation
-/// is printed.
+/// The shared row is compared as a max-abs — two arrangements of the same f32
+/// work, whose measured deviation is printed. It is explicitly **not** bit
+/// identity: the serial form rebases its softmax key by key where the dense form
+/// rebases once against the row max.
 #[test]
-fn the_two_arrangements_agree_across_the_floor() {
+fn the_two_arrangements_agree_on_their_shared_row() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return;
     }
     let _guard = route_lock();
     let dim = CROSS_NH * CROSS_HD;
-    let long = ATTENTION_DECOMPOSE_MIN_Q as usize;
-    let fused = chain(
+    let serial = chain(
         1,
-        CROSS_ROWS,
-        CROSS_ROWS,
+        CROSS_SERIAL_ROWS,
+        CROSS_LK,
         CROSS_NH,
         CROSS_HD,
         MaskKind::Causal,
     )
     .0;
-    let split = chain(1, long, long, CROSS_NH, CROSS_HD, MaskKind::Causal).0;
-    // One data stream, read at each graph's own length, so the shared rows and
-    // keys carry identical values.
-    let q = data(long * dim, 0.011, false);
-    let k = data(long * dim, 0.013, true);
-    let v = data(long * dim, 0.017, false);
-    let shared = CROSS_ROWS * dim;
-    let run = |g: Graph, n: usize| -> (Vec<f32>, AttentionRoutes, f64) {
-        let inputs: Vec<(&str, &[f32])> = vec![("q", &q[..n]), ("k", &k[..n]), ("v", &v[..n])];
+    let dense = chain(
+        1,
+        CROSS_DENSE_ROWS,
+        CROSS_LK,
+        CROSS_NH,
+        CROSS_HD,
+        MaskKind::Causal,
+    )
+    .0;
+    // One data stream, read at each graph's own length, so the shared row and
+    // every key carry identical values.
+    let q = data(CROSS_DENSE_ROWS * dim, 0.011, false);
+    let k = data(CROSS_LK * dim, 0.013, true);
+    let v = data(CROSS_LK * dim, 0.017, false);
+    let run = |g: Graph, qs: &[f32]| -> (Vec<f32>, AttentionRoutes, f64) {
+        let inputs: Vec<(&str, &[f32])> = vec![("q", qs), ("k", &k), ("v", &v)];
         run_graph(g, &inputs)
     };
-    let (fused_out, fused_routes, fused_us) = run(fused, shared);
-    let (split_out, split_routes, split_us) = run(split, long * dim);
+    // The serial leg walks the same query row the dense leg's last row does, so the
+    // two are one computation; reading the first row instead would compare two
+    // different queries.
+    let shared = (CROSS_DENSE_ROWS - 1) * dim;
+    let (serial_out, serial_routes, serial_us) = run(serial, &q[shared..shared + dim]);
+    let (dense_out, dense_routes, dense_us) = run(dense, &q[..CROSS_DENSE_ROWS * dim]);
     assert_eq!(
-        fused_routes,
+        serial_routes,
         AttentionRoutes {
             decode: 0,
             decomposed: 0,
             serial: 1,
         },
-        "{CROSS_ROWS} query rows must keep the fused kernel"
+        "one query row over {CROSS_LK} keys must keep the serial kernel"
     );
     assert_eq!(
-        split_routes,
+        dense_routes,
         AttentionRoutes {
             decode: 0,
             decomposed: 1,
             serial: 0,
         },
-        "{long} query rows must take the dense arrangement"
+        "{CROSS_DENSE_ROWS} query rows over {CROSS_LK} keys must take the dense arrangement"
     );
-    let cross = max_abs_diff(&split_out[..shared], &fused_out);
+    let cross = max_abs_diff(&dense_out[shared..shared + dim], &serial_out);
     eprintln!(
-        "[rlx-attn-rows-cross] fused({CROSS_ROWS} rows, {fused_us:.1} us) vs \
-         dense({long} rows, {split_us:.1} us) on their shared rows: max_abs={cross:.6e}"
+        "[rlx-attn-rows-cross] serial({CROSS_SERIAL_ROWS} row, {serial_us:.1} us) vs \
+         dense({CROSS_DENSE_ROWS} rows, {dense_us:.1} us) on their shared row: max_abs={cross:.6e}"
     );
     assert!(
         cross < ATTENTION_BAR,
-        "the fused and dense arrangements disagree on the shared prefill rows: max_abs {cross}"
+        "the serial and dense arrangements disagree on the shared row: max_abs {cross}"
     );
 }
 
@@ -704,11 +738,11 @@ fn the_route_keeps_its_planned_extent_under_an_active_extent_hint() {
 }
 
 /// The one term of the route decision the graph's shapes do not settle, read per
-/// compiled graph rather than from a process-global total: a shape above the
+/// compiled graph rather than from a process-global total: a shape at or above the
 /// floor is *asked for* the route and gets it wherever the arena binds whole, so
 /// a non-zero count here is the arena and not the geometry (the lowering's
-/// attention debug print says which term it was). A shape below the floor never
-/// asks, so it is not a decline either.
+/// attention debug print says which term it was). A shape the decode form or the
+/// floor keeps off the route never asks, so it is not a decline either.
 #[test]
 fn the_decline_count_is_per_graph_and_zero_where_the_route_fires() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
@@ -719,14 +753,15 @@ fn the_decline_count_is_per_graph_and_zero_where_the_route_fires() {
     assert_eq!(
         WgpuExecutable::compile(above).attention_window_declines(),
         0,
-        "{rows} query rows are above the floor, so the step asks for the route; a count here \
-         means this adapter's bind window does not reach the plan's regions"
+        "{rows} query rows are at or above the floor, so the step asks for the route; a count \
+         here means this adapter's bind window does not reach the plan's regions"
     );
-    let (below, _) = chain(1, 24, 192, 8, 64, MaskKind::Causal);
+    let (below, _) = chain(1, 1, 192, 8, 64, MaskKind::Causal);
     assert_eq!(
         WgpuExecutable::compile(below).attention_window_declines(),
         0,
-        "24 query rows are below the floor: the shape's own answer, not a decline"
+        "one query row over 192 keys is the decode form's: the shape's own answer, not a \
+         decline"
     );
 }
 
@@ -1058,12 +1093,13 @@ fn cpu_attention_rows_first(
 /// spell it in. Both must compute the same numbers — the reading is the graph's
 /// and not the extents' — and the rows-first one must reach a reference written
 /// in this file, so a pair of paths misreading the operand alike cannot pass
-/// between them. The head counts bracket the route's query-row floor: 16 rows at
-/// the body's 16 heads is the fused kernel, 32 at 32 the dense arrangement — a
-/// coincidence in both. The pair at 13 and at 32 rows over 16 heads is the guard
-/// that nothing moved where the extents settle the layout: before the graph was
-/// read, `rows = 16` alone came out `1.159` off its rank-3 spelling at these
-/// shapes, while 13 and 32 were bitwise equal.
+/// between them. The head counts are what makes the two axes coincide — 16 rows at
+/// the body's 16 heads and 32 at 32 — and all four cases are above the route's
+/// query-row floor, so what they bracket is the layout reading and not the floor.
+/// The pair at 13 and at 32 rows over 16 heads is the guard that nothing moved where
+/// the extents settle the layout: before the graph was read, `rows = 16` alone came
+/// out `1.159` off its rank-3 spelling at these shapes, while 13 and 32 were bitwise
+/// equal.
 #[test]
 fn a_coincident_extent_computes_as_its_graph_lays_it_out() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {

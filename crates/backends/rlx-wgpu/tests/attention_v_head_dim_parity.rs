@@ -12,8 +12,14 @@
 //! The decode shapes (`lq = 1`, long key sequence) take the decode-shaped
 //! kernel, whose merge walks the value dims in fixed-width passes — so a
 //! `v_head_dim` narrower than one pass, and one that is asymmetric but wide,
-//! both have to round-trip.
+//! both have to round-trip. The asymmetric width is pinned on all three
+//! arrangements a shape can land on: the dense route at six rows, the fused
+//! kernel at one row under the decode form's key floor, and the decode kernel
+//! over a long cache.
 
+mod common;
+
+use common::expected_attention_routes;
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
@@ -74,9 +80,11 @@ fn run_case(nh: usize, hd: usize, v_hd: usize, lq: usize, lk: usize) -> Option<f
     let gpu = run(Device::Gpu);
     let routes = attention_route_counts();
     let cpu = run(Device::Cpu);
-    // One attention step per run, and every shape here is below the many-row
-    // route's floor: it must take the kernel the host's predicate names and none
-    // of its step may be served by the route.
+    // One attention step per run: the decode form's for a single query row over a
+    // long enough key sequence — the predicate also carries this file's asymmetric
+    // width term — and otherwise the row/key floors `expected_attention_routes`
+    // encodes (dense from the floor up, serial below it).
+    // That helper reads the counts alone; these widths clear the decode caps.
     let decode = attention_decode_eligible(lq as u32, lk as u32, hd as u32, v_hd as u32);
     assert_eq!(
         routes,
@@ -87,15 +95,10 @@ fn run_case(nh: usize, hd: usize, v_hd: usize, lq: usize, lk: usize) -> Option<f
                 serial: 0,
             }
         } else {
-            AttentionRoutes {
-                decode: 0,
-                decomposed: 0,
-                serial: 1,
-            }
+            expected_attention_routes(lq, lk, 1, 1)
         },
         "nh={nh} hd={hd} v_hd={v_hd} lq={lq} lk={lk}: attention_decode_eligible says \
-         {decode}, the run says {routes:?}; the many-row route serves neither, its floor \
-         being above these query-row counts"
+         {decode}, the run says {routes:?}"
     );
     assert_eq!(
         gpu.len(),
@@ -118,13 +121,24 @@ fn run_case(nh: usize, hd: usize, v_hd: usize, lq: usize, lk: usize) -> Option<f
 
 #[test]
 fn wgpu_attention_asymmetric_v_head_dim_parity() {
-    // head_dim=8, v_head_dim=4, 2 heads, short seq, Causal, rank-3.
+    // head_dim=8, v_head_dim=4, 2 heads, short seq, Causal, rank-3 — the dense
+    // route's, now that the floor is two rows.
     let Some(max_abs) = run_case(2, 8, 4, 6, 6) else {
         return;
     };
     assert!(
         max_abs < 1e-3,
         "wgpu asymmetric v_head_dim max_abs {max_abs} >= 1e-3"
+    );
+    // The same asymmetric path on the serial kernel: one query row over 48 keys
+    // sits at or under the decode form's key floor, so the serial kernel serves
+    // it, and its merge must cover the V dims the Q/K contraction does not.
+    let Some(max_abs) = run_case(2, 64, 32, 1, 48) else {
+        return;
+    };
+    assert!(
+        max_abs < 1e-3,
+        "wgpu asymmetric v_head_dim on the fused kernel: max_abs {max_abs} >= 1e-3"
     );
     // Decode shapes on the same asymmetric path: a value width below one merge
     // pass (4 of head_dim 8), a wide asymmetric one (64 of head_dim 128), and one

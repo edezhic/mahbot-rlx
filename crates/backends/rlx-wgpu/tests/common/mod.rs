@@ -31,6 +31,22 @@ pub fn ramp(m: usize, k: usize, step: f32) -> Vec<f32> {
     (0..m * k).map(|i| ((i as f32) * step).sin()).collect()
 }
 
+/// The deterministic sweep the attention route tests feed their operands with: `n`
+/// values of a `cos` (or `sin`) ramp at `step`'s rate.
+pub fn data(n: usize, step: f32, cos: bool) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let x = i as f32 * step;
+            if cos { x.cos() } else { x.sin() }
+        })
+        .collect()
+}
+
+/// The bar a dense-arrangement attention parity is held to against the CPU backend
+/// at these shapes: a max-abs, never a relative error, so a diffuse softmax leaving
+/// the output small cannot loosen it.
+pub const ATTENTION_BAR: f32 = 1e-6;
+
 /// `v`'s median: the element at `len / 2` of a sorted **copy**, so an even-length
 /// series gives its upper-middle element rather than the mean of the pair, an empty
 /// one panics, and `v` keeps the order the caller prints it in.
@@ -338,9 +354,10 @@ pub const CLEARED_SWITCHES: [&str; 19] = [
 
 /// The arrangement every layer of a many-layer attention chain is expected to
 /// take: one query row over more than `ATTENTION_DECODE_MIN_KEYS` keys is the
-/// decode-shaped form, below the many-row route's floor the fused kernel, and
-/// from that floor up the dense arrangement. `layers` attention steps per run,
-/// over `reps` runs, so the counters it predicts are the whole bracket.
+/// decode-shaped form, one query row anywhere else keeps the fused/serial
+/// kernel, and from the route's query-row floor up it takes the dense
+/// arrangement. `layers` attention steps per run, over `reps` runs, so the
+/// counters it predicts are the whole bracket.
 ///
 /// The shape decides which arrangement the route is *asked for*; the arm's
 /// window term (`attention_window_declines`, whose count tells that decline

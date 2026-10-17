@@ -4879,15 +4879,15 @@ pub(crate) fn compile_static_inner(
 
                 // ── Many-row attention: the dense arrangement ────────────────
                 //
-                // Above the measured query-row floor the fused kernel below — one
+                // Above the measured query-row floor, the fused kernel below — one
                 // thread per (batch, head, query row), each walking the whole key
-                // sequence on its own — is an order of magnitude behind what the
-                // same work reaches as a dense multiply of the scores, a masked
-                // scale over them and a dense multiply by V (`attention_route`
-                // carries the measurements). That arrangement is emitted here as
-                // steps rather than as a graph decomposition because on a discrete
-                // adapter the corresponding *ops* would be hosted; as steps, every
-                // part of it stays on the device.
+                // sequence on its own — is behind what the same work reaches as a
+                // dense multiply of the scores, a masked scale over them and a dense
+                // multiply by V (`attention_route` carries the measurements, the
+                // fork's two-row decode cell among them). That arrangement is
+                // emitted here as steps rather than as a graph decomposition because
+                // on a discrete adapter the corresponding *ops* would be hosted; as
+                // steps, every part of it stays on the device.
                 //
                 // This branch is additive: below the floor, and for every step it
                 // does not serve, the fused path below runs exactly as it did.
@@ -4965,8 +4965,8 @@ pub(crate) fn compile_static_inner(
                     // `derive_matmul_compute`'s device-dependent variants (coop /
                     // f16 weights), which are keyed on a weight operand this step
                     // has none of. The run-time arm's `m ≥ 32 && n ≥ 64` branch
-                    // picks the wide f32 kernel for these shapes — the machinery
-                    // the route's measurements were made with.
+                    // picks the wide f32 kernel for these shapes; below 32 query
+                    // rows the narrow 32-row tile serves them, its rows padded.
                     let emit_matmul = |schedule: &mut Vec<Step>,
                                        uniforms: &mut Vec<wgpu::Buffer>,
                                        bind_groups: &mut Vec<wgpu::BindGroup>,

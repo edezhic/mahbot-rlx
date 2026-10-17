@@ -16,7 +16,7 @@
 //! while the route counts, which is what a regression moves first, are asserted.
 mod common;
 
-use common::{max_abs_diff, refuse_under_run_report, route_lock};
+use common::{data, max_abs_diff, refuse_under_run_report, route_lock};
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
@@ -134,15 +134,6 @@ fn mask_data(kind: MaskKind, rows: usize, lk: usize, nh: usize) -> Vec<f32> {
             })
             .collect(),
     }
-}
-
-fn data(n: usize, step: f32, cos: bool) -> Vec<f32> {
-    (0..n)
-        .map(|i| {
-            let x = i as f32 * step;
-            if cos { x.cos() } else { x.sin() }
-        })
-        .collect()
 }
 
 /// Best-of-`REPS` whole-chain timing in µs per context position per layer, plus

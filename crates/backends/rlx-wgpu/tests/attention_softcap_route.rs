@@ -52,12 +52,11 @@ use rlx_wgpu::kernels::{AttentionRoutes, attention_route_counts, reset_attention
 /// One of the three arrangements the route serves, at the geometry the cap is
 /// pinned on. The extents are the shape's own answer to
 /// `kernels::attention_decode_eligible` and `backend::ATTENTION_DECOMPOSE_MIN_Q`,
-/// so `routes` is what the arrangement this case *is* must count, and `bar` is
-/// the max-abs against the reference that arrangement is held to: the three
-/// reduce over 128 (or 48) keys and over different lane counts, so one bar
-/// would be slack for the fused form or tight for the dense one. `scale` lifts
-/// the unit-range data at the call site, and is 1.0 everywhere but
-/// [`DENSE_CAP50`].
+/// so `routes` is what the arrangement this case *is* must count, and `bar` is the
+/// max-abs against the reference that arrangement is held to: the three reduce over
+/// 128 (or 48) keys and over different lane counts, so one bar would be slack for
+/// the fused form or tight for the dense one. `scale` lifts the unit-range data at
+/// the call site, and is 1.0 everywhere but [`DENSE_CAP50`].
 struct Case {
     label: &'static str,
     b: usize,
@@ -70,12 +69,13 @@ struct Case {
     scale: f32,
 }
 
-/// The fused serial kernel's shape: 8 query rows, below the many-row route's
-/// floor, over 48 keys, below the decode form's own floor.
+/// The fused serial kernel's shape: one query row over 48 keys, below both the
+/// many-row route's query-row floor and the decode form's own floor. The causal
+/// branch puts that row at the cache's end, so it still walks all 48 keys.
 const FUSED: Case = Case {
     label: "fused",
     b: 1,
-    rows: 8,
+    rows: 1,
     lk: 48,
     nh: 4,
     hd: 64,
@@ -106,8 +106,9 @@ const DECODE: Case = Case {
     scale: 1.0,
 };
 
-/// Above the many-row route's query-row floor: the dense arrangement, whose
-/// masked scale is the shared `attention_mask` entry point.
+/// Above the many-row route's query-row floor, where every key length is served:
+/// the dense arrangement, whose masked scale is the shared `attention_mask`
+/// entry point.
 const DENSE: Case = Case {
     label: "dense",
     b: 1,
@@ -123,6 +124,10 @@ const DENSE: Case = Case {
     bar: 1e-6,
     scale: 1.0,
 };
+
+/// The band's own rows: the dense arrangement at the two query rows the fork's
+/// cached decode body walks, where the cap still meets the mask on more than one row.
+const DENSE_2ROWS: Case = Case { rows: 2, ..DENSE };
 
 /// The dense arrangement at the lift its `cap = 50.0` contrast needs, which the
 /// `cap = 1.0` cases run without: 1.35× the unit-range data (scores ×1.8).
@@ -310,9 +315,11 @@ fn assert_cap_changes_the_answer(case: &Case, capped: &[f32], cap: f32) {
     );
 }
 
-/// The fused serial arrangement — 8 query rows, below the many-row route's
-/// floor, over 48 keys, below the decode form's — under the causal kind and
-/// under the additive `Bias` that separates the two orders of cap and mask.
+/// The fused serial arrangement — one query row over 48 keys, below both the
+/// many-row route's query-row floor and the decode form's own key floor — under the
+/// causal kind and under the additive `Bias` that separates the two orders of cap
+/// and mask. The causal branch puts that row at the cache's end, so it still walks
+/// all 48 keys.
 #[test]
 fn the_fused_arrangement_caps_ahead_of_the_mask() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
@@ -358,6 +365,8 @@ fn the_dense_arrangement_caps_ahead_of_the_mask() {
     let _guard = route_lock();
     let causal = assert_case(&DENSE, MaskKind::Causal, Some(1.0));
     assert_case(&DENSE, MaskKind::Bias, Some(1.0));
+    assert_case(&DENSE_2ROWS, MaskKind::Causal, Some(1.0));
+    assert_case(&DENSE_2ROWS, MaskKind::Bias, Some(1.0));
     let causal_50 = assert_case(&DENSE_CAP50, MaskKind::Causal, Some(50.0));
     assert_case(&DENSE_CAP50, MaskKind::Bias, Some(50.0));
     assert_cap_changes_the_answer(&DENSE, &causal, 1.0);

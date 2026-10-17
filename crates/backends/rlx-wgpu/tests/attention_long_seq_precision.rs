@@ -1,23 +1,22 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Attention precision on wgpu as the sequence crosses the arrangement
-//! boundary.
+//! Attention precision on wgpu across key lengths.
 //!
 //! `rlx-brainbert` is 12 heads x 64 head_dim at **seq = 186**, and its relative
 //! L2 on wgpu is ~240x CPU's while every isolated op (matmul, LayerNorm, GELU,
 //! softmax) is bit-exact or near it. The sweep below runs BrainBERT's own
-//! geometry at four lengths, and they do not all take the same arrangement: seq
-//! 16 sits below the many-row route's query-row floor and keeps the serial kernel
-//! (one thread per (batch, head, query row)), while 64, 65 and 186 sit at or
-//! above the floor and take the many-row route (`backend::attention_route`). This
-//! is where BrainBERT's own geometry (12 heads x 64 head_dim, seq 186) is pinned
-//! across that boundary, and its sub-floor seq 16 case is what pins the serial
-//! kernel with a Custom mask — a many-row Custom-mask step is pinned too, in
+//! geometry at four lengths — 16 included, its shortest — and every one of them
+//! takes the many-row route (`backend::attention_route`) now that its floor is two
+//! query rows, so this pins that geometry and both of its masks on the dense
+//! arrangement. The serial kernel's Custom-mask control is a single query row
+//! compiled at a longer key extent and patched down
+//! (`attention_decode_route::decode_route_follows_the_extent_patched_down`); a
+//! many-row Custom-mask step is pinned in
 //! `attention_rows_route::route_mask_kinds_match_cpu`. The bar is asserted for
-//! both arrangements, because the point is BrainBERT's own geometry (12 heads x
-//! 64 head_dim) rather than one arrangement's numbers. The decode-shaped form —
-//! one query row over a long key sequence — is covered at the end of the test.
+//! every case, because the point is BrainBERT's own geometry (12 heads x 64
+//! head_dim) rather than one arrangement's numbers. The decode-shaped form — one
+//! query row over a long key sequence — is covered at the end of the test.
 
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
@@ -148,13 +147,11 @@ fn case_decode_causal(nh: usize, nkv: usize, hd: usize, lk: usize) -> Option<f64
 }
 
 #[test]
-fn attention_precision_across_the_seq_boundary() {
-    // 12 x 64 is BrainBERT's geometry; 186 is its sequence. Only seq 16 sits below
-    // the many-row route's floor and keeps the serial kernel — the sub-floor case
-    // that pins the serial kernel under a Custom mask; 64, 65 and 186 are at or
-    // above the floor and take the route — 186's ≈4 MB of scratch is far under its
-    // 64 MiB cap. The decode shape is one query row only, covered at the end of the
-    // test.
+fn attention_precision_across_key_lengths() {
+    // 12 x 64 is BrainBERT's geometry; 186 is its sequence. Every length here is
+    // at or above the route's two-row floor, so all of them take the dense
+    // arrangement — 186's ≈4 MB of scratch is far under its 64 MiB cap. The decode
+    // shape is one query row only, covered at the end of the test.
     let mut rows = Vec::new();
     reset_attention_route_counts();
     for seq in [16usize, 64, 65, 186] {
@@ -169,23 +166,18 @@ fn attention_precision_across_the_seq_boundary() {
             rows.push((seq, rm));
         }
     }
-    // One attention step per case, so one route count each: the two runs at seq 16
-    // must keep the serial kernel and every run at or above the floor must take
-    // the route.
-    let below = rows
-        .iter()
-        .filter(|(seq, _)| *seq < ATTENTION_DECOMPOSE_MIN_Q as usize)
-        .count() as u64;
+    // One attention step per case, so one route count each, and every run is above
+    // the route's floor.
     assert_eq!(
         attention_route_counts(),
         AttentionRoutes {
             decode: 0,
-            decomposed: rows.len() as u64 - below,
-            serial: below,
+            decomposed: rows.len() as u64,
+            serial: 0,
         },
-        "below the route's floor ({ATTENTION_DECOMPOSE_MIN_Q} query rows) the serial \
-         kernel must serve the step and at or above it the route must: {below} of the \
-         {} runs were sub-floor",
+        "every length in this sweep is at or above the route's floor \
+         ({ATTENTION_DECOMPOSE_MIN_Q} query rows) and is neither decode-shaped nor \
+         refused, so the route must serve all {} runs",
         rows.len()
     );
     // Decode shapes: one query row, grouped KV heads, causal. A 512-key softmax

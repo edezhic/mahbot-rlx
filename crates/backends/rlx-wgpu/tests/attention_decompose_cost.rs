@@ -4,26 +4,28 @@
 
 //! **Measurement only, `#[ignore]`d — prints, never asserts a time.**
 //!
-//! The many-row route's cost against the fused one, on the axis the route
-//! choice reads: the step's own query-row count. A `seq_q` sweep at a fixed head
-//! geometry over a couple of key lengths, plus a decode-shaped regression row —
-//! the arrangement the other two forms must keep their numbers on — printing
-//! per-layer µs, µs per query row, GF/s (2·q·k·d FMAs per row, the FLOP count
-//! `attention.wgsl`'s own header quotes) and the arrangement each shape took,
-//! read from the process-global route counters.
+//! The many-row route's cost, on the step's own query-row count, over four key
+//! lengths. A `seq_q` sweep at a fixed head geometry, plus a decode-shaped
+//! regression row — the arrangement the other two forms must keep their
+//! numbers on — printing per-layer µs, µs per query row, GF/s (2·q·k·d FMAs
+//! per row, the FLOP count `attention.wgsl`'s own header quotes) and the
+//! arrangement each shape took, read from the process-global route counters.
+//! With the floor at two rows the fused kernel is reachable here only at one
+//! row over at most `ATTENTION_DECODE_MIN_KEYS` keys, so those cells are its
+//! short-key reference rather than a many-row comparison.
 //!
-//! The rows around the floor are the point: the crossover it sits in was measured
-//! off-device (nothing at 13-24 query rows, an order of magnitude at about
-//! 100), and this harness is
-//! how a shape at 31 rows and one at 32 can be read side by side on the real
-//! adapter. Nothing here asserts a duration: `run()` includes submission, the
-//! device wait and the readback, so a reading is mostly that fixed floor, and a
-//! regression in it is not one in the kernel. What is asserted is only the route
-//! each shape took.
+//! The cells that straddle the floor are the point: one query row against two,
+//! at the key lengths where the decode form does not take the single row (the
+//! 32- and 64-key columns), and the two-row cells over short and long keys read
+//! side by side on the real adapter. Nothing here asserts a duration: `run()`
+//! includes submission, the device wait and the readback, so a reading is mostly
+//! that fixed floor, and a regression in it is not one in the kernel. What is
+//! asserted is only the route each shape took.
 //!
 //! Run the thermal gate first (`just throttle`).
 mod common;
 
+use common::data;
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session, Tick};
@@ -36,15 +38,6 @@ const NH: usize = 8;
 const HD: usize = 64;
 const REPS: usize = 5;
 const WARMUP: usize = 2;
-
-fn data(n: usize, step: f32, cos: bool) -> Vec<f32> {
-    (0..n)
-        .map(|i| {
-            let x = i as f32 * step;
-            if cos { x.cos() } else { x.sin() }
-        })
-        .collect()
-}
 
 /// `LAYERS` attention ops chained through the query, all reading one K/V.
 fn chain(rows: usize, lk: usize) -> Graph {
@@ -84,10 +77,12 @@ fn attention_decompose_cost() {
         "[rlx-attn-decompose-cost] heads={NH} head_dim={HD} layers={LAYERS} mask=causal \
          (best of {REPS} per shape; per-layer figures)"
     );
-    for lk in [256usize, 1024] {
-        // 1 is the decode regression row, 24 and 31 the fused side of the floor
-        // and its own boundary, 32 up the dense arrangement.
-        for rows in [1usize, 24, 31, 32, 64, 100, 256] {
+    for lk in [32usize, 64, 256, 1024] {
+        // 1 is the decode regression row (or the serial kernel's, over the lengths the
+        // decode form does not take: at most `ATTENTION_DECODE_MIN_KEYS`), 2 the fork's
+        // cached decode cell, 24 and 31 the top of the band the floor used to exclude,
+        // 32 and up what the route already served.
+        for rows in [1usize, 2, 24, 31, 32, 64, 100, 256] {
             let g = chain(rows, lk);
             let q = data(rows * dim, 0.011, false);
             let k = data(lk * dim, 0.013, true);
@@ -117,7 +112,7 @@ fn attention_decompose_cost() {
                 routes,
                 common::expected_attention_routes(rows, lk, LAYERS, REPS),
                 "rows={rows} lk={lk}: the shape took a different arrangement than its \
-                 query-row count says"
+                 query rows and key cells say"
             );
         }
     }

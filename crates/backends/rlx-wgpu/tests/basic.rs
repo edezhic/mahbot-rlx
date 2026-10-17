@@ -1208,11 +1208,12 @@ fn wgpu_chain_attention_uses_packed_qkv_stride() {
     // exported `RLX_WGPU_NO_PACKED_BSHD_ATTN` — the knob's own opt-out.
     rlx_ir::env::set("RLX_WGPU_NO_PACKED_BSHD_ATTN", "0");
     use rlx::prelude::*;
-    // Below the dense route's floor (`backend::attention_route`): this hook
-    // describes the fused kernel's packed reads, while a packed attention past
-    // the floor takes that route instead — `wgpu_packed_attn_matches_strided_cpu_ref`
-    // below covers it numerically at such a sequence.
-    let (b, s, nh, dh) = (1, 24, 8, 25);
+    // One query row, below the dense route's floor (`backend::attention_route`):
+    // this hook describes the fused kernel's packed reads, while a packed
+    // attention past the floor takes that route instead —
+    // `wgpu_packed_attn_matches_strided_cpu_ref` below covers it numerically at
+    // such a sequence.
+    let (b, s, nh, dh) = (1, 1, 8, 25);
     let hd = nh * dh;
     let f = DType::F32;
     let mut g = Graph::new("qkv_chain");
