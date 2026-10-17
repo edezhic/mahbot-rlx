@@ -82,11 +82,19 @@ impl ExecutableGraph for WgpuExecutableWrapper {
         crate::ExecutableCapabilities {
             clone: true,
             gpu_handles: true,
-            // Device-resident KV row feed: `register_kv_row_feed` +
-            // `feed_kv_row`, backed by a shard-aware device-to-device arena
-            // copy. Without this the `Op::KvAppend` fast path does not remove
-            // the O(context) cost — the past KV is still re-uploaded each step.
-            kv_resident: true,
+            // Resident, both halves: the row feed (`register_kv_row_feed` +
+            // `feed_kv_row`, a shard-aware device-to-device arena copy) and the
+            // row read (`read_output_row`, the one-submission staging read the
+            // wrapper forwards). Without it a decode step re-uploads the
+            // O(context) past KV and pays one readback per row instead of one for
+            // the step's rows. A browser cannot complete that read — the map it
+            // waits on never finishes — so the capability is not claimed there:
+            // advertising it beside a read that answers `None` is the "three of
+            // four methods" shape upstream's contract test exists to reject. Both
+            // capability tests hold the halves honest through
+            // `skip_unless_available`, which reports a skip unless
+            // `RLX_REQUIRE_DEVICE=1`; the GPU recipes set it.
+            kv_resident: !cfg!(target_arch = "wasm32"),
             typed_io: true,
             active_extent: true,
             ..crate::ExecutableCapabilities::NONE
@@ -114,6 +122,9 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     }
     fn feed_kv_row(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
         self.inner.feed_kv_row(src_row, dst_row, row_elems)
+    }
+    fn read_output_row(&self, out_idx: usize, row: usize, row_inner: usize) -> Option<Vec<f32>> {
+        self.inner.read_output_row(out_idx, row, row_inner)
     }
     fn has_gpu_handle(&self, name: &str) -> bool {
         self.inner.has_gpu_handle(name)
@@ -258,6 +269,10 @@ impl ExecutableGraph for WgpuExecutableWrapper {
         self.inner.requires_host_execution()
     }
 
+    fn wgpu_host_summary(&self) -> Option<String> {
+        self.inner.host_summary()
+    }
+
     #[cfg(target_arch = "wasm32")]
     fn wgpu_run_async<'a>(
         &'a mut self,
@@ -265,12 +280,18 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>, String>> + 'a>>
     {
         if self.inner.requires_host_execution() {
+            // Name what is in the way rather than listing what it might have
+            // been: a conv graph's answer is one `Conv2dHost` per convolution,
+            // which tells a caller whether to change backend or change model.
+            let detail = self
+                .inner
+                .host_summary()
+                .unwrap_or_else(|| "host-executed steps".to_string());
             return Box::pin(async move {
-                Err(
-                    "WebGPU wasm graph contains host-executed ops (GGUF dequant, LSTM, \
-                     collectives, FFT-host, …) — use WebGL fallback or CPU"
-                        .into(),
-                )
+                Err(format!(
+                    "WebGPU wasm cannot run this graph — {detail}. Use WebGL (if the \
+                     graph trains there) or CPU."
+                ))
             });
         }
         Box::pin(async move { Ok(self.inner.run_async(inputs).await) })

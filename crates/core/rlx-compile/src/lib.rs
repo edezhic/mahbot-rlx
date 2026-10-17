@@ -6,6 +6,7 @@
 //! memory planning, and diagnostics.
 
 pub mod algebraic_simplify;
+pub mod bitnet_qat;
 pub mod compiler;
 pub mod const_fold;
 pub mod cse;
@@ -32,12 +33,14 @@ pub mod quant_propagate;
 pub mod rewrite;
 pub mod scaled_quant_insert;
 pub mod sccp;
+pub mod shard;
 pub mod svg;
 
 #[cfg(feature = "training")]
 pub mod training_compile;
 
 pub use algebraic_simplify::{AlgebraicSimplify, algebraic_simplify};
+pub use bitnet_qat::{BitNetQatConfig, BitNetQatReport, inject_bitnet_qat};
 pub use compiler::{CompilePipeline, CompileResult};
 pub use const_fold::ConstantFolding;
 pub use cse::CommonSubexpressionElimination;

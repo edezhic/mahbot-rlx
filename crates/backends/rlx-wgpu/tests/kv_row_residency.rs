@@ -298,6 +298,76 @@ fn a_row_readback_answers_what_the_whole_handle_readback_answers() {
 }
 
 #[test]
+fn an_output_row_answers_the_run_and_refuses_rows_it_does_not_have() {
+    if skip() {
+        return;
+    }
+    let mut exe = WgpuExecutable::compile(two_caches());
+    let (a, b, extra) = (
+        rows(ROWS_A, 100.0),
+        rows(ROWS_B, 200.0),
+        rows(ROWS_A, 900.0),
+    );
+    let outs = exe.run(&[("cache_a", &a), ("cache_b", &b), ("extra", &extra)]);
+    let (whole_a, whole_b) = (&outs[0], &outs[1]);
+    // The read half of `kv_resident`: the row answered is the run's own output
+    // row, whichever output and row are asked for.
+    for row in 0..ROWS_A {
+        assert_eq!(
+            exe.read_output_row(0, row, W).as_deref(),
+            Some(row_of(whole_a, row)),
+            "output 0 row {row} disagrees with the output the run answered"
+        );
+    }
+    assert_eq!(
+        exe.read_output_row(1, ROWS_B - 1, W).as_deref(),
+        Some(row_of(whole_b, ROWS_B - 1)),
+        "output 1's last row disagrees with the output the run answered"
+    );
+    for (out_idx, row, row_inner, why) in [
+        (2, 0, W, "an output this graph does not have"),
+        (0, ROWS_A, W, "a row past output 0's extent"),
+        (0, 0, 0, "a zero-length row"),
+        (0, usize::MAX, W, "a row index that would wrap"),
+    ] {
+        assert!(
+            exe.read_output_row(out_idx, row, row_inner).is_none(),
+            "{why}: asked for output {out_idx} row {row} of {row_inner}, and answered bytes"
+        );
+    }
+
+    // A slot that declares no rows at all — the "no longer held" refusal, which
+    // is the extent bound at zero — answers nothing rather than an empty vector,
+    // and does not disturb the real output beside it.
+    let mut g = Graph::new("empty_output_row");
+    let x = g.input("x", Shape::new(&[1, 1, 4], F));
+    let sum = g.add(x, x);
+    let empty = g.add_node(
+        rlx_ir::Op::Expand {
+            target_shape: vec![0, 1, 4],
+        },
+        vec![x],
+        Shape::new(&[0, 1, 4], F),
+    );
+    g.set_outputs(vec![sum, empty]);
+    let mut exe = WgpuExecutable::compile(g);
+    let outs = exe.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
+    assert!(
+        outs[1].is_empty(),
+        "the zero-element output must read back empty"
+    );
+    assert_eq!(
+        exe.read_output_row(0, 0, 4).as_deref(),
+        Some(&[2.0, 4.0, 6.0, 8.0][..]),
+        "the output beside an empty one still reads its row"
+    );
+    assert!(
+        exe.read_output_row(1, 0, 4).is_none(),
+        "a slot that declares no rows answered an empty vector instead of refusing"
+    );
+}
+
+#[test]
 fn a_batch_readback_answers_a_steps_requests_in_one_call() {
     if skip() {
         return;
@@ -415,6 +485,12 @@ fn a_row_readback_of_a_cache_this_executable_does_not_hold_answers_nothing() {
     // broken residency check would still pass — and it holds no rows, so the row
     // must not go anywhere.
     let mut clone = exe.clone_for_cache();
+    // The parent's fed caches have emptied mirrors, and the arena did not come
+    // across: the clone holds no rows, and must say so.
+    assert!(
+        !clone.has_gpu_handle("cache_a"),
+        "a clone reported a handle whose rows its storage does not hold"
+    );
     assert!(
         clone.register_kv_row_feed("cache_a", 0),
         "a resolved clone cannot register a name it can bind"
@@ -522,5 +598,17 @@ fn a_recompile_drops_the_resident_marks_the_arena_went_with() {
     assert!(
         exe.read_gpu_handle_row("cache", 0, W).is_none(),
         "a row readback answered from the storage that was rebuilt"
+    );
+    // The whole-handle read and the residency question answer the same way: the
+    // mirror was emptied when the rows became resident, so with the arena gone
+    // there is nothing left to read — an empty vector here would look like a
+    // zero-element tensor to a consumer re-seeding its cache from it.
+    assert!(
+        exe.read_gpu_handle("cache").is_none(),
+        "a whole-handle readback answered an empty tensor from the rebuilt storage"
+    );
+    assert!(
+        !exe.has_gpu_handle("cache"),
+        "a handle whose rows went with the rebuilt arena still reported as held"
     );
 }

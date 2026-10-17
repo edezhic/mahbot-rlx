@@ -487,8 +487,9 @@ own, for embedders adding globals of their own.
 
 ## Building
 
-`quickrs-core` is a crates.io caret requirement rather than a path dep — the
-engine and this binding move together, so an engine bump is deliberate.
+`quickrs-core` comes from crates.io; no sibling checkout is needed. To work
+on the engine and this binding together, point a `[patch.crates-io]` entry at
+a local checkout.
 
 ```bash
 just test-js                       # or: cargo test -p rlx-js --features backend-tests
@@ -501,3 +502,6 @@ Running a *model* (`Qwen3Runner` and family) is not reachable from JS, for the
 same reason it is not from Python: those live in `../rlx-models`, which pins
 published `rlx`. The binding for that belongs there, over the
 `rlx_runtime::lm::LmRunner` trait and its `inventory` registry.
+## License
+
+MIT OR Apache-2.0.

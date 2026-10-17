@@ -153,7 +153,7 @@ pub fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> {
                 (hi, lo)
             };
             let mut out = Vec::with_capacity((data.len() / 16) * 4);
-            for elem in data.chunks_exact(16) {
+            for elem in data.as_chunks::<16>().0 {
                 let re = f64::from_le_bytes(elem[0..8].try_into().unwrap());
                 let im = f64::from_le_bytes(elem[8..16].try_into().unwrap());
                 let (re_hi, re_lo) = split(re);
@@ -258,7 +258,7 @@ pub fn narrow_f32_to_bytes(v: &[f32], dt: rlx_ir::DType) -> Vec<u8> {
             // complex element. This is the df64 COMBINE boundary: each host f64
             // component = `(f64)hi + (f64)lo`. Emit 16-byte `[re_f64, im_f64]`.
             let mut bytes = Vec::with_capacity((v.len() / 4) * 16);
-            for lanes in v.chunks_exact(4) {
+            for lanes in v.as_chunks::<4>().0 {
                 let re = lanes[0] as f64 + lanes[1] as f64;
                 let im = lanes[2] as f64 + lanes[3] as f64;
                 bytes.extend_from_slice(&re.to_le_bytes());
@@ -377,13 +377,18 @@ mod capabilities_tests {
         assert!(caps.persistent_handles);
         assert!(caps.typed_io);
         assert!(caps.active_extent);
-        assert!(!caps.gpu_handles);
+        // Resident KV: the arena is host memory, so a "resident" cache is a
+        // persistent handle plus a one-row feed per step.
+        assert!(caps.gpu_handles);
+        assert!(caps.kv_resident);
         assert_eq!(
             caps.enabled_names(),
             vec![
                 "clone",
                 "moe",
                 "persistent_handles",
+                "gpu_handles",
+                "kv_resident",
                 "typed_io",
                 "active_extent"
             ]
@@ -909,6 +914,17 @@ pub trait ExecutableGraph: Send {
     #[cfg(target_arch = "wasm32")]
     fn wgpu_requires_host(&self) -> bool {
         false
+    }
+
+    /// One line naming the host-executed steps in this executable's schedule,
+    /// how many sync points they cost, and how many are independent — or
+    /// `None` when it runs entirely on the device.
+    ///
+    /// Ungated, unlike `wgpu_requires_host` (wasm only): the same information is
+    /// what a native caller needs to decide whether a graph is worth moving to
+    /// this backend at all.
+    fn wgpu_host_summary(&self) -> Option<String> {
+        None
     }
 
     /// Async WebGPU execution for wasm (non-blocking readback). Default: error.

@@ -22,6 +22,7 @@
 | [egpu.md](egpu.md) | **External GPU over USB4/Thunderbolt** (`Device::Egpu`) — what macOS withholds (a class-0x03 driver, not the bus), building `rlx-egpu`, the signed-firmware manifest + `pull_gpu_firmware.sh`, ahead-of-time kernel packs (compile on a ROCm/CUDA host, read with no toolchain), and **how to build the DriverKit extension**: entitlement, IOKit personality, user-client contract, helper wire protocol, signing/notarizing, and pointing rlx at it with `DextConfig` |
 | [development.md](development.md) | Dev workflow: `just` recipes, pyrlx, tests, dispatch probes, `Op::Scan` unroll / host contract |
 | [fpga-export.md](fpga-export.md) | **FPGA / SystemVerilog export**: `ExportTarget`, `FpgaExportConfig`, target-agnostic RTL, `HwTarget` matrix |
+| [bitnet-fpga.md](bitnet-fpga.md) | **Ternary (BitNet b1.58) → FPGA**: absmean PTQ, QAT graph rewrite, `ExportQuantMode::Ternary`, openXC7 bitstream + UART run |
 | [kv-retention.md](kv-retention.md) | **Selective KV retention + retrieval** — extending effective context past a fixed resident budget without per-step cost growing with total context: `Full`/`Sinks`/`HeavyHitter`/`Retrieval`/`Auto` policies, `RLX_QWEN3_RETENTION`, and the small-LM retrieval-quality findings |
 | [metal-qwen3-decode-perf.md](metal-qwen3-decode-perf.md) | **Metal batch-1 decode, measured** — how qwen3-0.6B went 24 → 82 tok/s token-identically on an M4 Pro, and which "obvious" optimizations measured neutral or negative |
 | [reference-parity-and-occupancy.md](reference-parity-and-occupancy.md) | **Rig-gated workstreams** — parity against a *reference* implementation (llama.cpp / NeMo) rather than cross-backend only, and kernel-occupancy profiling; both need hardware a dev box doesn't have, so this is the turnkey harness plan |
@@ -32,7 +33,7 @@
 | [benchmarks/coreml-training.md](benchmarks/coreml-training.md) | CoreML on-device training: RLX vs native `MLUpdateTask`, compute-unit sweep, overhead- vs compute-bound regimes (why `cpu`≥`ane`, and why the result flips with model size) |
 | [benchmarks/frameworks-and-backends.md](benchmarks/frameworks-and-backends.md) | MNIST-training comparison **matrix**: every framework × backend, verified/rig/candidate status, `torch.compile`/Keras/MPSGraph/ORT runners, and the CUDA runbook |
 
-Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.16**).
+Release notes: [`CHANGELOG.md`](../CHANGELOG.md) (workspace **0.2.18**).
 
 Related repo docs:
 

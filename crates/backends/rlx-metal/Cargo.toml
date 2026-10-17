@@ -10,7 +10,6 @@ keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
 repository.workspace   = true
-homepage.workspace     = true
 documentation.workspace = true
 # Fork-local: `rlx-wgpu` is the backend this fork develops, so nothing of this one
 # runs in a default `cargo test`. The auto flags keep that true for any test or
@@ -42,7 +41,7 @@ rlx-cpu = { workspace = true, features = ["splat"] }
 rlx-gguf = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
 # rlx-splat moved out of tree; restore with the native-splat feature below.
-# rlx-splat = { path = "../rlx-splat", version = "0.2.17", optional = true, default-features = false, features = ["reference", "metal"] }
+# rlx-splat = { path = "../rlx-splat", version = "0.2.18", optional = true, default-features = false, features = ["reference", "metal"] }
 
 [features]
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-metal --features backend-tests`.
@@ -464,4 +463,8 @@ required-features = ["backend-tests"]
 
 [[test]]
 name = "zero_copy_train"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "metal_sgemm_edge_tile_overrun"
 required-features = ["backend-tests"]

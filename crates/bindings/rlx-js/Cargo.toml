@@ -10,10 +10,9 @@ keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
 repository.workspace   = true
-homepage.workspace     = true
 documentation.workspace = true
-# Not on crates.io yet: the engine dependency (`quickrs-core`) is young and
-# the JS surface is still moving. Build from the workspace.
+# Not on crates.io yet: the JS surface is still moving. (The engine,
+# `quickrs-core`, is published, so this is the only thing holding it back.)
 publish = false
 
 [features]
@@ -61,7 +60,7 @@ quickrs-core = { version = "0.16.2", default-features = false, features = ["std"
 
 rlx-ir      = { workspace = true }
 rlx-opt     = { workspace = true }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.17", default-features = false, features = ["model-io"] }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.18", default-features = false, features = ["model-io"] }
 rlx-gguf    = { workspace = true, optional = true }
 serde_json  = { version = "1", optional = true }
 rlx-pkg     = { workspace = true, optional = true }
@@ -70,7 +69,7 @@ rlx-dduf    = { workspace = true, optional = true }
 rlx-nemo    = { workspace = true, optional = true }
 rlx-optim   = { workspace = true, optional = true }
 rlx-text    = { workspace = true, optional = true }
-rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.17", optional = true, default-features = false, features = ["safetensors"] }
+rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.18", optional = true, default-features = false, features = ["safetensors"] }
 
 [[bin]]
 name = "rlx-js"

@@ -53,18 +53,84 @@ impl BlockStage for LmHeadStage {
         } else {
             DType::F32
         };
+        // Opt-in packed head (`RLX_PACKED_LM_HEAD`): project through the
+        // checkpoint's quant blob with a fused `DequantMatMul` instead of an F32
+        // `[hidden, vocab]` copy — ~5x fewer bytes read per decoded token, and
+        // that copy is never built. Tied checkpoints use a separately stored
+        // `output.weight` when the file has one (as llama.cpp does), else the
+        // packed embedding table itself — available when no stage consumed it
+        // as F32 (a host-gathered embedding). Otherwise, or for a dense
+        // source, this falls through to the F32 head below.
+        if rlx_ir::env::flag("RLX_PACKED_LM_HEAD") {
+            let mut keys = vec![self.weight_key.as_deref().unwrap_or("lm_head.weight")];
+            if self.tie_word_embeddings && !ctx.params.contains_key("model.embed_tokens.weight") {
+                keys.push("model.embed_tokens.weight");
+            }
+            let found = keys
+                .into_iter()
+                .find_map(|key| match ctx.weights.take_packed(key) {
+                    Ok(Some(p)) => Some((key, p)),
+                    _ => None,
+                });
+            if let Some((key, packed)) = found {
+                if (packed.out_dim, packed.in_dim) != (self.vocab_size, self.hidden_size) {
+                    anyhow::bail!(
+                        "packed {key} is [{}, {}], expected [{}, {}]",
+                        packed.out_dim,
+                        packed.in_dim,
+                        self.vocab_size,
+                        self.hidden_size
+                    );
+                }
+                return Ok(Some(ctx.register_packed_linear(&input, key, packed)?));
+            }
+        }
         let lm_head_w = if self.tie_word_embeddings {
             let embed_key = "model.embed_tokens.weight";
-            let embed = ctx
-                .params
-                .get(embed_key)
-                .ok_or_else(|| anyhow::anyhow!("missing {embed_key} for tied lm_head"))?;
             let vocab = self.vocab_size;
             let hidden_size = self.hidden_size;
-            let mut transposed = vec![0f32; embed.len()];
-            for v in 0..vocab {
-                for hi in 0..hidden_size {
-                    transposed[hi * vocab + v] = embed[v * hidden_size + hi];
+            let mut transposed = vec![0f32; vocab * hidden_size];
+            {
+                // Usually the token-embed stage has already read the table, in
+                // which case reuse it. But a pipeline-parallel model's *last*
+                // block holds the head without embedding anything, so nothing
+                // has read it — it has to be read here rather than requiring a
+                // stage that this block deliberately does not have.
+                //
+                // Read, not loaded as a param: the table is only needed to
+                // build the transposed head, and declaring it a param would
+                // upload a second copy of the largest tensor in the model for
+                // a graph with no node that uses it.
+                let fetched: Option<Vec<f32>> = if ctx.params.contains_key(embed_key) {
+                    None
+                } else {
+                    Some(
+                        ctx.weights
+                            .take(embed_key, false)
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "tied lm_head needs {embed_key}, which is \
+                                     neither already loaded nor in the weights: {e}"
+                                )
+                            })?
+                            .0,
+                    )
+                };
+                let embed: &[f32] = match &fetched {
+                    Some(v) => v,
+                    None => &ctx.params[embed_key],
+                };
+                if embed.len() < vocab * hidden_size {
+                    anyhow::bail!(
+                        "{embed_key} has {} values, too few for a [{vocab}, \
+                         {hidden_size}] tied lm_head",
+                        embed.len()
+                    );
+                }
+                for v in 0..vocab {
+                    for hi in 0..hidden_size {
+                        transposed[hi * vocab + v] = embed[v * hidden_size + hi];
+                    }
                 }
             }
             ctx.synth_param(

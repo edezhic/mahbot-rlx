@@ -176,6 +176,40 @@ fn a_steps_rows_leave_in_one_submission_at_either_cache_capacity() {
 }
 
 #[test]
+fn an_output_row_costs_one_submission_and_one_wait() {
+    let _route = common::route_lock();
+    if skip() {
+        return;
+    }
+    let mut g = Graph::new("output_row_cost");
+    let a = g.input("a", Shape::new(&[CAP, W], F));
+    let out = g.add(a, a);
+    g.set_outputs(vec![out]);
+    let mut exe = Session::new(Device::Gpu).compile(g);
+    let outs = exe.run(&[("a", &rows(CAP, 10.0))]);
+    let want = &outs[0][0..W];
+
+    // The read half of a resident step: one row, one round trip — not the
+    // whole-tensor D2H it replaces.
+    reset_device_counts();
+    let got = exe
+        .read_output_row(0, 0, W)
+        .expect("row 0 of the output answered nothing");
+    let (submits, waits) = (device_submit_count(), device_wait_count());
+    eprintln!("one output row → {submits} submission(s), {waits} wait(s)");
+    assert_eq!(
+        (submits, waits),
+        (1, 1),
+        "reading one output row cost {submits} submission(s) and {waits} wait(s): the row \
+         must leave in one round trip, or a resident decode pays the cache's capacity per step"
+    );
+    assert_eq!(
+        got, want,
+        "the row read back is not the row the run answered"
+    );
+}
+
+#[test]
 fn a_batch_answered_from_the_host_mirror_asks_nothing_of_the_device() {
     let _route = common::route_lock();
     if skip() {

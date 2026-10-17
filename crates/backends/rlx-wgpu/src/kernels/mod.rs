@@ -95,7 +95,7 @@ pub const TRANSPOSE_WGSL: &str = include_str!("transpose.wgsl");
 pub const NARROW_WGSL: &str = include_str!("narrow.wgsl");
 pub const CONCAT_WGSL: &str = include_str!("concat.wgsl");
 /// The fused spelling of `narrow`-per-frame + `concat` — see the shader's own
-/// header, and [`crate::backend::compile::lower`]'s `detect_frames_pattern`.
+/// header, and `backend::compile::lower`'s `detect_frames_pattern`.
 pub const FRAMES_WGSL: &str = include_str!("frames.wgsl");
 
 /// The invocation count per workgroup `frames.wgsl` declares and `run.rs`
@@ -3204,7 +3204,7 @@ pub fn matmul_wide_active_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 
 /// The active variant's remainder pipeline, `Some` exactly when [`wide_grid`]
-/// can ask for a remainder workgroup — both read [`WideVariant::remainder`].
+/// can ask for a remainder workgroup — both read `WideVariant::remainder`.
 pub fn matmul_wide_tail_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     wide_variant().remainder().map(|(_, build)| build(device))
 }
@@ -3233,7 +3233,7 @@ pub struct WideGrid {
 /// - a remainder wider than the remainder tile: two remainders would compute the
 ///   same 64 rows through two workgroups and two passes over the B panel.
 ///
-/// A variant that ships no remainder pipeline ([`WideVariant::remainder`]) has
+/// A variant that ships no remainder pipeline (`WideVariant::remainder`) has
 /// no remainder tile to record and always takes the single grid.
 pub fn wide_grid(variant: WideVariant, m_s: u32, n: u32) -> WideGrid {
     let tile_m = variant.tile_m();

@@ -11,7 +11,6 @@ keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
 repository.workspace   = true
-homepage.workspace     = true
 documentation.workspace = true
 [features]
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-runtime --features backend-tests`.
@@ -246,8 +245,8 @@ rlx-gguf = { workspace = true }
 rlx-pkg = { workspace = true, optional = true }
 rlx-mlx-io = { workspace = true, optional = true }
 rlx-dduf = { workspace = true, optional = true }
-# rlx-gpu = { path = "../rlx-gpu", version = "0.2.17", optional = true }
-# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.17", optional = true }
+# rlx-gpu = { path = "../rlx-gpu", version = "0.2.18", optional = true }
+# rlx-cuda = { path = "../../backends/rlx-cuda", version = "0.2.18", optional = true }
 
 # rlx-metal is Apple-only (Metal is an Apple API). Make it a dependency solely on
 # Apple targets — excluding watchOS, which has no Metal compute — so the `metal`
@@ -281,7 +280,7 @@ rlx-flow = { workspace = true }
 rayon = "1"
 rlx-compile = { workspace = true, features = ["training"] }
 # rlx-splat moved out of tree; splat examples/tests below are disabled until it returns.
-# rlx-splat = { path = "../rlx-splat", version = "0.2.17", default-features = false, features = ["test-support", "io"] }
+# rlx-splat = { path = "../rlx-splat", version = "0.2.18", default-features = false, features = ["test-support", "io"] }
 # Downstream demonstration packages used in integration tests.
 # The sparse kernel-registration tests need rlx-sparse's `metal`/`mlx`; those
 # features are enabled by the recipes that run them (`just test-mlx` /
@@ -329,6 +328,10 @@ required-features = ["cpu"]
 [[example]]
 name = "int8_qat_train"
 required-features = ["cpu"]
+
+[[example]]
+name = "bitnet_ternary_fpga"
+required-features = ["cpu", "fpga"]
 
 [package.metadata.docs.rs]
 features     = ["cpu", "gpu"]
@@ -1333,4 +1336,16 @@ required-features = ["backend-tests"]
 
 [[test]]
 name = "wgpu_vision_ops_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "bitnet_qat"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "cpu_resident_kv"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "shard_equivalence"
 required-features = ["backend-tests"]

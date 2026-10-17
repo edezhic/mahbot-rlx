@@ -452,30 +452,31 @@ fn bmm_broadcast_check(dev: Device, bcast_lhs: bool, tag: &str) {
     }
     let (batch, m, k, nn) = (3usize, 2usize, 4usize, 5usize);
     let mut g = Graph::new("bmm_bcast");
-    let (lhs, rhs, out) = if bcast_lhs {
-        let lhs = (0..m * k)
+    let (lhs, rhs);
+    let out = if bcast_lhs {
+        lhs = (0..m * k)
             .map(|i| (i as f64) * 0.1 - 0.3)
             .collect::<Vec<_>>();
-        let rhs = (0..batch * k * nn)
+        rhs = (0..batch * k * nn)
             .map(|i| ((i * 7 % 11) as f64 - 5.0) * 0.2)
             .collect::<Vec<_>>();
         let l = const_f32(&mut g, &lhs, &[1, m, k]);
         let r = const_f32(&mut g, &rhs, &[batch, k, nn]);
         let y = g.mm(l, r);
         g.set_outputs(vec![y]);
-        (lhs, rhs, run(dev, g))
+        run(dev, g)
     } else {
-        let lhs = (0..batch * m * k)
+        lhs = (0..batch * m * k)
             .map(|i| ((i * 5 % 13) as f64 - 6.0) * 0.15)
             .collect::<Vec<_>>();
-        let rhs = (0..k * nn)
+        rhs = (0..k * nn)
             .map(|i| (i as f64) * 0.07 - 0.2)
             .collect::<Vec<_>>();
         let l = const_f32(&mut g, &lhs, &[batch, m, k]);
         let r = const_f32(&mut g, &rhs, &[1, k, nn]);
         let y = g.mm(l, r);
         g.set_outputs(vec![y]);
-        (lhs, rhs, run(dev, g))
+        run(dev, g)
     };
     for b in 0..batch {
         let refc = if bcast_lhs {

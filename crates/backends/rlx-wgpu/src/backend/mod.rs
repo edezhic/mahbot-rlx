@@ -454,7 +454,7 @@ pub struct WgpuExecutable {
     ceiling_hosted: usize,
     /// Convs whose shape qualified for im2col but which took the direct/tiled route
     /// for a reason the shapes alone do not settle — counted where that route is
-    /// decided, in the `Op::Conv` arm of [`crate::backend::compile`], so a term added
+    /// decided, in the `Op::Conv` arm of `crate::backend::compile`, so a term added
     /// there cannot leave the count behind.
     im2col_fallbacks: usize,
     /// Many-row attention steps this compile sent to the fused kernel for want of
@@ -475,6 +475,7 @@ mod compile;
 mod copy_route;
 mod dispatch;
 mod helpers;
+mod host_plan;
 mod run;
 mod run_report;
 mod set;
@@ -485,6 +486,8 @@ mod test;
 
 pub(crate) use copy_route::*;
 pub(crate) use helpers::*;
+pub(crate) use host_plan::plan as host_plan;
+pub use host_plan::{HostBatch, HostGroup, HostIo, HostPlan, Region};
 pub(crate) use run_report::*;
 pub(crate) use step::*;
 
@@ -638,8 +641,11 @@ impl WgpuExecutable {
         self.input_offsets = fresh.input_offsets;
         // The arena is this compile's, and a resident handle's host mirror was
         // emptied when its rows became resident — so this executable no longer
-        // holds those rows, and must not answer as if it did.
+        // holds those rows, and must not answer as if it did. The marks go with
+        // the arena, and so do the emptied mirrors: what is left is the mirrors
+        // that still carry rows.
         self.gpu_handle_resident.clear();
+        self.gpu_handles.retain(|_, rows| !rows.is_empty());
         self.param_offsets = fresh.param_offsets;
         self.uniforms = fresh.uniforms;
         self.bind_groups = fresh.bind_groups;
@@ -775,7 +781,7 @@ impl WgpuExecutable {
 
     /// Convs whose shape qualified for the im2col route but which took the
     /// direct/tiled route for a reason the shapes alone do not settle (see the
-    /// `Op::Conv` arm of [`crate::backend::compile`], where the count is taken).
+    /// `Op::Conv` arm of `crate::backend::compile`, where the count is taken).
     /// Exposed so the fallback is observable — the schedule report prints it, and the
     /// route tests assert both arms of it, zero on a graph that binds and parks nothing
     /// and the qualifying conv's own count where it does — instead of the route that
@@ -1019,12 +1025,24 @@ impl WgpuExecutable {
         self.gpu_handles.contains_key(name)
     }
 
+    /// The whole handle on the host, or `None` — never an empty tensor — for a
+    /// handle whose rows this executable no longer holds. The browser rule the
+    /// read family follows is stated in [`Self::read_gpu_handle_rows`].
     pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         if let Some(id) = self.resolve_handle_slot(name) {
-            let dev = wgpu_device().expect("rlx-wgpu: device gone");
+            if cfg!(target_arch = "wasm32") {
+                return None;
+            }
+            let dev = wgpu_device()?;
             return Some(self.arena.read_f32(&dev.device, &dev.queue, id));
         }
-        self.gpu_handles.get(name).cloned()
+        // No slot: the host mirror is the answer, and an empty one is a refusal,
+        // not a zero-element tensor. The row reads bound a mirror by the declared
+        // extent; an emptied one declares nothing.
+        self.gpu_handles
+            .get(name)
+            .filter(|rows| !rows.is_empty())
+            .cloned()
     }
 
     /// The arena slot a named handle's rows are in right now, or `None` when only
@@ -1058,16 +1076,10 @@ impl WgpuExecutable {
         row: usize,
         row_inner: usize,
     ) -> Option<LocatedRow<'_>> {
-        if row_inner == 0 {
-            return None;
-        }
-        // Checked, because this is release code: a row index near `usize::MAX`
-        // must be refused rather than wrap into a range inside the slot.
-        let start = row.checked_mul(row_inner)?;
-        let end = start.checked_add(row_inner)?;
         let Some(id) = self.resolve_handle_slot(name) else {
             // No slot here: the host mirror, bounded by what the name declares —
             // it may be a longer binding than the slot it was uploaded into.
+            let (start, end) = Self::row_bounds(row, row_inner)?;
             let mirror = self.gpu_handles.get(name)?;
             let declared = self.declared_extent_elems(*self.input_offsets.get(name)?, mirror.len());
             if end > declared {
@@ -1075,13 +1087,36 @@ impl WgpuExecutable {
             }
             return Some(LocatedRow::Mirror(&mirror[start..end]));
         };
+        let (byte_off, len) = self.arena_row_range(id, row, row_inner)?;
+        Some(LocatedRow::Arena { byte_off, len })
+    }
+
+    /// The checked `(start, end)` element bounds of one row of a row-major
+    /// carrier. `None` for a zero-length row, and for an index that would wrap
+    /// rather than land inside — these are release products, so they are checked.
+    fn row_bounds(row: usize, row_inner: usize) -> Option<(usize, usize)> {
+        if row_inner == 0 {
+            return None;
+        }
+        let start = row.checked_mul(row_inner)?;
+        Some((start, start.checked_add(row_inner)?))
+    }
+
+    /// The `(byte_off, byte_len)` of one arena row of the slot `id`, bounded by
+    /// the extent it declares — the one place a row's arena address is computed,
+    /// so the KV feed's row and the two read paths cannot disagree on which
+    /// bytes a row is. A slot this executable does not hold declares no rows, so
+    /// every row of it is out of extent.
+    fn arena_row_range(&self, id: NodeId, row: usize, row_inner: usize) -> Option<(usize, usize)> {
+        let (start, end) = Self::row_bounds(row, row_inner)?;
         if end > self.extent_elems(id) {
             return None;
         }
-        Some(LocatedRow::Arena {
-            byte_off: self.arena.offset(id) + start * std::mem::size_of::<f32>(),
-            len: row_inner * std::mem::size_of::<f32>(),
-        })
+        let f32_bytes = std::mem::size_of::<f32>();
+        Some((
+            self.arena.offset(id) + start * f32_bytes,
+            row_inner * f32_bytes,
+        ))
     }
 
     /// Read one row (`row_inner` f32 elements at `row`) of a named handle,
@@ -1116,7 +1151,9 @@ impl WgpuExecutable {
     /// that request, and a `None` is that request's alone: a row that is not there
     /// withholds nothing its neighbours asked for. A name whose rows are only in
     /// this executable's host mirror is answered from it and asks nothing of the
-    /// device, so a call that asks for no arena row submits nothing at all.
+    /// device, so a call that asks for no arena row submits nothing at all. In a
+    /// browser an arena row is not answered at all — the map below cannot
+    /// complete there — and only the mirror half answers.
     pub fn read_gpu_handle_rows(&self, rows: &[(&str, usize, usize)]) -> Vec<Option<Vec<f32>>> {
         let mut answers: Vec<Option<Vec<f32>>> = Vec::with_capacity(rows.len());
         // The arena-backed requests in the order asked, each with the answer slot
@@ -1127,6 +1164,9 @@ impl WgpuExecutable {
             match self.locate_handle_row(name, row, row_inner) {
                 None => answers.push(None),
                 Some(LocatedRow::Mirror(mirror)) => answers.push(Some(mirror.to_vec())),
+                Some(LocatedRow::Arena { .. }) if cfg!(target_arch = "wasm32") => {
+                    answers.push(None)
+                }
                 Some(LocatedRow::Arena { byte_off, len }) => {
                     slots.push(answers.len());
                     answers.push(None);
@@ -1135,7 +1175,11 @@ impl WgpuExecutable {
             }
         }
         if !ranges.is_empty() {
-            let dev = wgpu_device().expect("rlx-wgpu: device gone");
+            // A device torn down between calls answers nothing, like a row it
+            // refuses, and the caller falls back.
+            let Some(dev) = wgpu_device() else {
+                return answers;
+            };
             let read = self.arena.read_f32_ranges(&dev.device, &dev.queue, &ranges);
             // One answer per range, or the slots left `None` below would read as
             // requests the batch refused.
@@ -1151,6 +1195,33 @@ impl WgpuExecutable {
             }
         }
         answers
+    }
+
+    /// Read one row of a row-major graph output without a whole-tensor D2H —
+    /// the read half of the `kv_resident` contract, next to the row feed.
+    ///
+    /// Bounded by the extent the output declares, and `None` — not a short
+    /// answer — outside it or for a zero-length row; a slot this executable no
+    /// longer holds declares no rows, so every row of it is out of extent. One
+    /// submission and one map, the same staging path
+    /// [`Self::read_gpu_handle_rows`] uses. In a browser it answers `None` for
+    /// the reason that method states, so the caller falls back rather than the
+    /// thread blocking — see `run_async`.
+    pub fn read_output_row(
+        &self,
+        out_idx: usize,
+        row: usize,
+        row_inner: usize,
+    ) -> Option<Vec<f32>> {
+        if cfg!(target_arch = "wasm32") {
+            return None;
+        }
+        let id = *self.graph.outputs.get(out_idx)?;
+        let (byte_off, len) = self.arena_row_range(id, row, row_inner)?;
+        let dev = wgpu_device()?;
+        self.arena
+            .read_f32_ranges(&dev.device, &dev.queue, &[(byte_off, len)])
+            .pop()
     }
 
     /// The extent the node behind `id` declares, in f32 elements, never more than
@@ -1196,6 +1267,11 @@ impl WgpuExecutable {
             exe.set_param_bytes(k, v);
         }
         for (k, v) in &self.gpu_handles {
+            // An emptied mirror is not a handle: its rows became resident and the
+            // arena stayed with the parent, so a clone must not report it as held.
+            if v.is_empty() {
+                continue;
+            }
             exe.bind_gpu_handle(k, v);
         }
         // Copied, not re-registered: the feed map is a plain name→output record,

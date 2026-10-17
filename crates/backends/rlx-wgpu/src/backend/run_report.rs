@@ -69,7 +69,7 @@ const PREFIX: &str = "[wgpu-run-report]";
 
 /// Pass pairs the device view can hold: two query slots per recorded pass, the
 /// batch loop's and a packed multiply's alike. A run with more passes than this
-/// still runs — see [`RunReport::open_pass`]. `2 * MAX_PASSES` is exactly wgpu's
+/// still runs — see `RunReport::open_pass`. `2 * MAX_PASSES` is exactly wgpu's
 /// `QUERY_SET_MAX_QUERIES`, the largest count `create_query_set` accepts: this is
 /// the ceiling, not a round number.
 const MAX_PASSES: u32 = 2048;
@@ -276,9 +276,9 @@ fn unmarked_pass<'e>(enc: &'e mut wgpu::CommandEncoder, label: &str) -> wgpu::Co
 /// say whether it was device-busy or the run was waiting.
 ///
 /// It is the report handle already in hand rather than another read of the
-/// switch: the run creates it from its own report ([`RunReport::marks`]), and
+/// switch: the run creates it from its own report (`RunReport::marks`), and
 /// whether the passes it opens are marked is that report's decision
-/// ([`RunReport::open_pass`]) — a disabled report marks none of them.
+/// (`RunReport::open_pass`) — a disabled report marks none of them.
 /// [`PassMarks::none`] is the other unmarked case: the handle a caller with no
 /// report holds — this crate's own tests, and any direct caller of the `gguf_gpu`
 /// entry points that runs outside a reported run.
@@ -510,7 +510,7 @@ impl RunReport {
 
     /// The marks handle for this run's device work outside its dispatch loop:
     /// the packed-weight multiplies, which open their passes through it. Whether a
-    /// pass is marked is settled in [`RunReport::open_pass`], so the marks are
+    /// pass is marked is settled in `RunReport::open_pass`, so the marks are
     /// never a second read of the switch — a disabled report's handle marks
     /// nothing, and only [`PassMarks::none`] leaves a caller with no report at all.
     pub(crate) fn marks(&mut self) -> PassMarks<'_> {

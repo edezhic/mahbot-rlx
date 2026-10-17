@@ -9,8 +9,9 @@
 //! of torch reconstructors that build tensors, and `persistent_id`
 //! resolves the storage tuple into a typed [`StorageRef`].
 //!
-//! The end product is a [`Value`] tree from which [`crate::torch`]
-//! harvests the `name -> TensorMeta` table.
+//! The end product is a [`Value`] tree from which the crate's private
+//! `torch` module harvests the `name -> TensorMeta` table, surfaced as
+//! [`crate::TensorMeta`].
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -347,7 +348,7 @@ impl<'a> Machine<'a> {
                         bail!("pickle: SETITEMS with odd count");
                     }
                     self.with_dict_top(|d| {
-                        for pair in items.chunks_exact(2) {
+                        for pair in items.as_chunks::<2>().0 {
                             d.push((pair[0].clone(), pair[1].clone()));
                         }
                     })?;

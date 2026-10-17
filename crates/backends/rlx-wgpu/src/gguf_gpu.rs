@@ -233,7 +233,7 @@ pub fn select_path(
     // The step arm's own selector, verbatim: the fused entry point serves the
     // K-quants and Q1_0 — the former at one row, the latter at any row — and
     // itself only when the contraction is a whole number of packing blocks, plus
-    // the tiled arm's own schemes' single row ([`one_row_arm_ok`]).
+    // the tiled arm's own schemes' single row (`one_row_arm_ok`).
     let fused = (gemv_supports_scheme(scheme_id)
         && (m == 1
             || scheme_id == 24
@@ -582,7 +582,7 @@ pub fn grouped_scheme_supported(scheme_id: u32) -> bool {
 /// has a kernel for that scheme ([`grouped_scheme_supported`]) and `k` is a whole
 /// number of its **own packing blocks**, the granularity its entry point's weight
 /// loop reads. The arm's `k` gate, asked by [`select_path`] of the shape it is
-/// handed and by [`encode_dequant_matmul_gguf_gemm_grouped`] of the one it is about
+/// handed and by `encode_dequant_matmul_gguf_gemm_grouped` of the one it is about
 /// to dispatch, so a call the ladder admits cannot then be declined for its
 /// contraction. The scheme term is folded in rather than left to the caller, so the
 /// answer is defined for any id: [`scheme_from_id`] panics on one no table carries.
@@ -988,7 +988,7 @@ fn with_pooled_out_buf<R>(
 /// with [`gemv_one_row_device_ok`] for the routes it owns, and the run's join
 /// decision asks [`select_path`] — the same ladder, whose device-only answers
 /// compose that guard — before calling here directly. This gate carries the
-/// 8-bit scheme's own block term ([`one_row_arm_ok`]), so a direct caller has to
+/// 8-bit scheme's own block term (`one_row_arm_ok`), so a direct caller has to
 /// make sure of the window alone.
 ///
 /// `marks` is the run's pass-marks handle: every pass this ladder opens carries
@@ -2107,13 +2107,17 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
 
     let x_bytes = arena.read_bytes_range(device, queue, x_byte_off, m * k * 4);
     let x_host: Vec<f32> = x_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
     let idx_bytes = arena.read_bytes_range(device, queue, idx_byte_off, m * 4);
     let idx_host: Vec<f32> = idx_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -2160,7 +2164,9 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
 
     let pack_out_bytes = arena.read_bytes_range(device, queue, pack_out_off, m * n * 4);
     let packed_out: Vec<f32> = pack_out_bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 

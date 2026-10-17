@@ -30,6 +30,9 @@ pub mod kernel_schedule_port;
 pub mod kernel_schedule_emit;
 pub use backend::bf16_packed_dispatch_count;
 pub use backend::coop_f32_dispatch_count;
+/// Host-step planning: what a compiled schedule asks the CPU to do, and which
+/// of those asks are independent enough to share a sync point.
+pub use backend::{HostBatch, HostGroup, HostIo, HostPlan, Region};
 pub use backend::{device_submit_count, device_wait_count, reset_device_counts};
 pub mod supported_ops;
 pub mod tuning;

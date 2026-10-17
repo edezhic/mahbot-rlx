@@ -71,8 +71,9 @@ Note also that backends treat "has an id" as "has an on-device branch" —
 *panics* for a scheme without one. So the id row and the kernel branches have
 to land together; omitting the id to "just host-route" crashes instead.
 
-Map GGUF file dtypes to IR: [`rlx_cpu::quant_scheme_for_ggml`](../crates/backends/rlx-cpu/src/gguf_scheme.rs)
-(`GgmlType` → `QuantScheme` for loader / graph builders).
+Map GGUF file dtypes to IR: [`rlx_gguf::quant_scheme`](../crates/io/rlx-gguf/src/scheme.rs)
+(`GgmlType` → `QuantScheme`, the one table loader / graph builders read; rlx-cpu's
+`quant_scheme_for_ggml` delegates to it).
 
 GPU backends must **not** hand-roll this table: encode/decode via
 `QuantScheme::gpu_dequant_scheme_id` / `from_gpu_dequant_scheme_id`
@@ -138,7 +139,7 @@ See [mlx-weights.md](mlx-weights.md) for loaders / `import-mlx --keep-packed`.
 | **B2** | WGPU + Metal dequant parity; Metal fused GEMV tests | `rlx-wgpu/tests/gguf_dequant_parity.rs`, `rlx-metal/tests/iq4_dequant_parity.rs`, `iq_mv_parity.rs`, `q40_q80_mv_parity.rs` |
 | **B3** | CoreML MIL on-device IQ/TQ/MX + K-quants | `rlx-coreml/tests/mil_p15.rs`, `mil/helpers.rs` |
 | **B4** | WGPU grouped MoE GPU path | `rlx-wgpu/src/gguf_gpu.rs` |
-| **B5** | `GgufQ5_0` / `GgufQ5_1` IR + kernel ids 22 / 23; `quant_scheme_for_ggml` | `rlx-ir`, MSL/CUDA/WGSL, `rlx-cpu/src/gguf_scheme.rs` |
+| **B5** | `GgufQ5_0` / `GgufQ5_1` IR + kernel ids 22 / 23; `quant_scheme_for_ggml` | `rlx-ir`, MSL/CUDA/WGSL, `rlx-gguf/src/scheme.rs` |
 
 **Kernel routing note:** legacy 32-element schemes (ids 19–23) must be excluded
 from the 256-element K-quant branch guard at the top of `dequant_gguf` (MSL/CUDA/WGSL).
@@ -358,7 +359,7 @@ Non-GGUF schemes still use the in-HLO `convert + scale/zp tile + dot` path.
 | IR schemes | `crates/core/rlx-ir/src/quant.rs` |
 | CPU reference + MoE | `crates/backends/rlx-cpu/src/gguf_matmul.rs` |
 | Parse / dequant | `crates/io/rlx-gguf/src/lib.rs` |
-| GgmlType → IR | `crates/backends/rlx-cpu/src/gguf_scheme.rs` |
+| GgmlType → IR | `crates/io/rlx-gguf/src/scheme.rs` |
 | Dequant cache | `crates/backends/rlx-cpu/src/dequant_cache.rs` |
 | Metal MSL + encode | `crates/backends/rlx-metal/src/dequant_gguf.msl`, `backend.rs` |
 | CUDA / ROCm | `crates/backends/rlx-gpu-kernels/kernels/dequant_gguf.cu`, `rlx-cuda/src/gguf_gpu.rs` |

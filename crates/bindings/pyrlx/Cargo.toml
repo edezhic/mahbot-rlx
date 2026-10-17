@@ -10,7 +10,6 @@ keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
 repository.workspace   = true
-homepage.workspace     = true
 documentation.workspace = true
 # Not on crates.io: pyrlx is distributed via maturin → PyPI as
 # Python wheels, not as a Rust library. Build from source with
@@ -49,10 +48,10 @@ numpy     = "0.22"
 
 rlx-ir = { workspace = true }
 rlx-opt = { workspace = true }
-rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.17", default-features = false, features = ["model-io"] }
+rlx-runtime = { path = "../../core/rlx-runtime", version = "0.2.18", default-features = false, features = ["model-io"] }
 rlx-fpga = { workspace = true, optional = true }
 rlx-gguf = { workspace = true }
-rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.17", default-features = false, features = ["safetensors"] }
+rlx-gguf-convert = { path = "../../io/rlx-gguf-convert", version = "0.2.18", default-features = false, features = ["safetensors"] }
 rlx-pkg = { workspace = true }
 rlx-mlx-io = { workspace = true }
 rlx-dduf = { workspace = true }

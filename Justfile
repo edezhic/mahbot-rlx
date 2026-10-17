@@ -364,6 +364,9 @@ test-gpu:
     JOBS=$(( CPUS < 4 ? CPUS : 4 ))
     # A backend that skips for want of a device must not report `ok` here.
     export RLX_REQUIRE_DEVICE="{{require_device}}"
+    # rlx-web's device-dependent gate: the schedule a browser rank would get,
+    # lowered natively, where the adapter it needs is the one this recipe asserts.
+    cargo test --release -p rlx-web --features webgpu --test webgpu_trainable_models -j "$JOBS"
     case "$(uname -s)" in
       Darwin)
         cargo test --release -p rlx-metal --features backend-tests -j "$JOBS"
@@ -400,9 +403,11 @@ test-gpu:
 test-gguf-grouped:
     cargo test -p rlx-runtime --features backend-tests --test dequant_grouped_matmul_gguf -- --test-threads=1
 
-# rlx-js: the JS surface.
-# `FEATURES` picks backends the same way rlx-runtime does.
-test-js FEATURES="cpu,gguf":
+# rlx-js: the JS surface. `FEATURES` picks backends the same way rlx-runtime
+# does. The default is the crate's own default set, so a bare `just test-js`
+# covers the whole surface; tests for a feature that is off are cfg'd out, so
+# a narrower set is green rather than full of "undefined is not a constructor".
+test-js FEATURES="cpu,gguf,weights,training,text":
     cargo test -p rlx-js --no-default-features --features {{FEATURES}},backend-tests
 
 # MNIST from JavaScript. Fetches the dataset into the cache dir if missing.
@@ -569,12 +574,26 @@ lint-features:
         lint "rlx-ir test-support"          -p rlx-ir      --features test-support,backend-tests
         ;;
     esac
+    # Default-off feature gates every host compiles.
+    lint "rlx-flow formats"                 -p rlx-flow    --features formats,backend-tests
+    lint "rlx-cpu int8-gemv,portable-gemm"  -p rlx-cpu     --no-default-features --features int8-gemv,portable-gemm
     # `rlx-bench`'s frame-slicing harness measures the device path through a
     # `#[cfg(feature = "gpu")]` half that no other row's target set reaches.
     if cargo clippy -p rlx-bench --features gpu --example bench_frame_slicing -- -D warnings; then
         checked+=("rlx-bench gpu (frame-slicing example)")
     else
         echo "FAILED: rlx-bench gpu (frame-slicing example)" >&2; exit 1
+    fi
+    # The int8 GEMVs and the decode-attention lanes are `cfg(target_arch =
+    # "x86_64")`: an Apple Silicon host never compiles them. Cross-lint them
+    # when the x86-64 macOS target is installed (`rustup target add
+    # x86_64-apple-darwin`).
+    if [[ "$(uname -s)-$(uname -m)" == Darwin-arm64 ]]; then
+        if rustup target list --installed 2>/dev/null | grep -qx x86_64-apple-darwin; then
+            lint "rlx-cpu x86-64 int8-gemv,portable-gemm" -p rlx-cpu --target x86_64-apple-darwin --no-default-features --features int8-gemv,portable-gemm
+        else
+            skipped+=("rlx-cpu x86-64 (rustup target add x86_64-apple-darwin)")
+        fi
     fi
     for f in cuda rocm; do
         if cargo check -p rlx-runtime --features "cpu,$f" --quiet 2>/dev/null; then
@@ -681,10 +700,43 @@ check-example-names:
 check-doc-links:
     python3 scripts/check-doc-links.py
 
+# rustdoc gate, wired into `just ci`.
+#
+# Per-crate, with each crate's own `[package.metadata.docs.rs]` features —
+# because that is what docs.rs builds. `cargo doc --workspace` uses ONE unified
+# (default) feature set instead, so every intra-doc link into a feature-gated
+# item reads as "unresolved": 26 of 28 such warnings were phantoms, and the two
+# real ones were buried in them. Skips `publish = false` crates; docs.rs never
+# builds those.
+#
+# Usage: `just check-rustdoc` or `just check-rustdoc rlx-tensor` for one crate.
+check-rustdoc *CRATES:
+    python3 scripts/check-rustdoc.py --keep-going {{CRATES}}
+
+# Dual-license header gate, wired into `just ci`.
+#
+# The writer half (`just license-headers`) existed; the gate did not, so the
+# only thing keeping headers on new files was someone remembering to run it.
+# Nine files had drifted — five tests/examples with no header and three docs
+# with no `## License` footer.
+check-license-headers:
+    python3 scripts/add_license_headers.py --check
+
+# Add any missing dual-license headers / footers in place.
+license-headers:
+    python3 scripts/add_license_headers.py
+
 # Print the checklist / stub paths for adding a new Op (does not edit the tree).
 # Usage: `just new-op MyOp` or `just new-op MyOp --write` to create empty stub files.
 new-op NAME *ARGS:
     python3 scripts/new-op.py {{NAME}} {{ARGS}}
+
+# Assemble the tab-cluster demo as a standalone static site, deployable to any
+# static host with no backend. Files are discovered from the page's real
+# dependency graph and the result self-checks, so a missed reference fails here
+# instead of in a browser.
+build-cluster-site out="examples/tab-cluster":
+    python3 crates/bindings/rlx-web/tools/build_site.py --out {{out}}
 
 # Cross-compile gate: the CPU + WebGPU stack must build for the browser
 # (wasm32-unknown-unknown). Compile-only — running models in a browser is
@@ -696,6 +748,27 @@ check-wasm:
     cargo check -p rlx-web --target wasm32-unknown-unknown --features webgpu,webgl
     # rlx-webgl's planner + CPU executor are verified natively against autodiff.
     cargo test -p rlx-webgl --features backend-tests
+    # No WGSL kernel may return from non-uniform control flow before a barrier:
+    # naga/Metal accepts it, every browser's Dawn rejects the shader, and the
+    # backend then computes zeros without erroring.
+    cargo test -p rlx-wgpu --features backend-tests --test wgsl_uniform_control_flow
+    # The tab cluster's rank math (sharded gradients average to the full batch).
+    cargo test -p rlx-web --lib cluster
+    # The tab cluster's coordination protocol, in Node against a stub rank: its
+    # failure modes (split brain, a stale joiner, a cohort stalled on a stopped
+    # tab) all produce plausible-looking training rather than an error.
+    # Skipped rather than failed where node is absent: `just ci` runs on
+    # machines that have no business installing a JS runtime.
+    # The bus test covers the transport path end to end except WebRTC itself:
+    # the wire format at every header alignment, real transfer semantics, and a
+    # cohort training through the encoded proxy hop.
+    command -v node >/dev/null 2>&1 \
+      && node --test crates/bindings/rlx-web/tests/cluster_protocol.test.mjs \
+                     crates/bindings/rlx-web/tests/cluster_bus.test.mjs \
+                     crates/bindings/rlx-web/tests/cluster_mesh.test.mjs \
+                     crates/bindings/rlx-web/tests/cluster_qr.test.mjs \
+                     crates/bindings/rlx-web/tests/cluster_highlight.test.mjs \
+      || echo 'node not found — skipping tab-cluster protocol tests'
 
 # Cross-compile gate: the Apple on-device stack must build for every Apple
 # platform, device *and* simulator. The native backends are rlx-cpu
@@ -968,9 +1041,8 @@ serve-web-static BACKEND="python" PORT="8000":
 run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
-# Fork gate: `build` over the whole set + `test` over the default contour +
-# lint + the fast smokes.
-ci: build test fmt-check lint check-rlx-env-vars check-example-names check-doc-links check-corpus check-wasm test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
+# Quick basic test of the workspace: build + test + lint + fast smokes.
+ci: build test fmt-check lint check-rlx-env-vars check-example-names check-doc-links check-rustdoc check-license-headers check-corpus check-wasm test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
 
 # ROCm compile check + graph_devices parity (tests skip when HIP unavailable).
 #
@@ -1106,3 +1178,10 @@ test-wgpu-portability: test-wgpu-webgpu build-wasm-webgpu test-wgpu-linux
 # (`Op::clone` included) where no runtime dispatch can rescue it.
 check-isa *ARGS:
     python3 crates/backends/rlx-cpu/tools/isa_portability.py {{ARGS}}
+
+# PS5 payloads (jailbroken console, ps5-payload-dev SDK). A standalone crate
+# with its own workspace and pinned nightly toolchain, never part of the
+# workspace build or `ci`. `just ps5 setup` · `just ps5 build` ·
+# `just ps5 run rlx --host <ps5-ip>`. See crates/backends/rlx-ps5/README.md.
+ps5 *ARGS:
+    python3 crates/backends/rlx-ps5/scripts/ps5.py {{ARGS}}

@@ -181,6 +181,8 @@ pub fn advisory_capabilities(device: Device) -> crate::ExecutableCapabilities {
             clone: true,
             moe: true,
             persistent_handles: true,
+            gpu_handles: true,
+            kv_resident: true,
             typed_io: true,
             active_extent: true,
             ..C::NONE
@@ -230,7 +232,10 @@ pub fn advisory_capabilities(device: Device) -> crate::ExecutableCapabilities {
         Device::Gpu | Device::WebGpu => C {
             clone: true,
             gpu_handles: true,
-            kv_resident: true,
+            // Both halves of the resident contract — the row feed and the row
+            // read — are implemented; see `backend/wgpu_backend.rs`. A browser
+            // cannot complete the read, so it does not claim the capability.
+            kv_resident: !cfg!(target_arch = "wasm32"),
             typed_io: true,
             active_extent: true,
             ..C::NONE
