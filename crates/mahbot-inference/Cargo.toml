@@ -1,0 +1,60 @@
+# MahBot inference — the live model paths, end to end, and nothing else.
+#
+# The stand (`src/stand.rs`, the `mahbot-inference` binary) walks the four unit
+# paths — the ear, recognition, synthesis and embeddings — and prints their
+# numbers. The same generation/encoding/decision code is exposed as a library
+# (`synth`, `listen`, `wake`) so the wake-word bench can measure recall, false
+# reactions and false accepts per hour on this crate's own models.
+#
+# Every input path comes from an argument or an environment variable; there is
+# no crate-relative default, because the checkout carries no models.
+
+[package]
+name = "mahbot-inference"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "MahBot inference: wake word (ear), recognition, synthesis and embeddings, end to end, on our own models."
+authors.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+publish = false
+
+[[bin]]
+name = "mahbot-inference"
+path = "src/main.rs"
+
+[dependencies]
+# The parser under the model loader: GGUF header, metadata, raw tensor bytes, dequant.
+rlx-gguf = { workspace = true }
+# Graph IR + HIR builder (`HirMut`, `HirGraphExt`) used by the emitted blocks.
+rlx-ir = { workspace = true }
+# Block assembly line: `ModelFlow` / `FlowCtx` / `WeightSource` — the graphs are built on it.
+rlx-flow = { workspace = true }
+# `gpu` pulls in the wgpu backend.
+rlx-runtime = { workspace = true, features = ["gpu"] }
+# The backend's own arena planner (`buffer::plan_f32_uniform`), which is the
+# figure the stand publishes for every unit.
+rlx-wgpu = { workspace = true }
+anyhow = "1"
+# Report serialisation.
+serde_json = "1"
+# Model and corpus provenance (SHA-256 pins) and the deterministic noise RNG.
+sha2 = "0.10"
+rand = "0.9"
+# The voice-activity gate the listening path and the speech-hours denominator use.
+earshot = "1.2"
+
+[lints]
+workspace = true
+
+[features]
+# The wake-word bench is deliberate, never automatic: without this feature a
+# workspace-wide `cargo bench` does not build or run it.
+bench = []
+
+[[bench]]
+name = "wake_word"
+harness = false
+# Kept out of a bare `cargo bench`: the run takes minutes and is started by hand.
+required-features = ["bench"]

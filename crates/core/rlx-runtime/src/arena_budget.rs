@@ -135,7 +135,10 @@ where
             None => return b,
         }
     }
-    requested.min(1).max(1)
+    // Even a batch of 1 does not fit (or `requested` was 0): there is nothing
+    // useful to fall back to, so return the caller's request and let the
+    // backend's own error be the report.
+    requested.max(1)
 }
 
 #[cfg(test)]
@@ -167,6 +170,37 @@ mod tests {
         // requested batch must survive untouched rather than silently drop.
         let n = fit_batch(Device::Cpu, 8, 0.6, |_| None);
         assert!(n <= 8 && n >= 1, "batch {n} out of range");
+    }
+
+    /// The fallthrough: when no candidate fits, the caller's request comes back
+    /// unchanged (at least 1) so the backend's own error is the report, rather
+    /// than a silent batch of one. The device must have a hard ABI cap — `Gpu`'s
+    /// 4 GiB — and the graph must not fit it, or the plan would be accepted on
+    /// the normal fit path and the assertion would hold for a batch of one too.
+    #[test]
+    fn fit_batch_returns_the_request_when_nothing_fits() {
+        let f = rlx_ir::DType::F32;
+        let big = rlx_ir::Shape::new(&[1 << 16, 1 << 16], f);
+        let mut g = Graph::new("huge");
+        let w = g.param("w", big.clone());
+        g.add_node(
+            rlx_ir::Op::Activation(rlx_ir::op::Activation::Relu),
+            vec![w],
+            big,
+        );
+        let mut builds = 0usize;
+        let n = fit_batch(Device::Gpu, 4, 1.0, |_| {
+            builds += 1;
+            Some(g.clone())
+        });
+        assert_eq!(
+            builds, 2,
+            "the halving must actually run and bottom out at 1"
+        );
+        assert_eq!(
+            n, 4,
+            "a request that cannot fit is returned, not clamped to 1"
+        );
     }
 
     #[test]

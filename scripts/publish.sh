@@ -130,6 +130,7 @@ LAST_PUBLISH_ERR=""      # temp log from the last failed publish attempt
 # now diffs this list against `cargo metadata` and fails loudly on divergence,
 # so the next addition cannot reproduce that.
 SKIPPED=(
+    mahbot-inference
     pyrlx
     rlx-cortexm-trainer
     rlx-corpus

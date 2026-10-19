@@ -125,12 +125,29 @@ pub const ATTENTION_DECOMPOSE_MIN_Q: u32 = 2;
 /// this is the one width both the refusal and the route decision read.
 pub(crate) const ATTENTION_DECOMPOSE_MAX_HEAD_DIM: u32 = 512;
 
-/// The route must not need more scratch than this. [`crate::backend::compute_scratch_bytes`]
-/// floors the tail reserve at 64 MiB, so this is the figure every graph is
-/// guaranteed to have; a route that needed more would have to size the tail
-/// itself, and a score matrix past this belongs on the fused kernel (or on a
-/// chunked step) rather than in a per-step allocation this backend does not have.
-pub(crate) const ATTENTION_DECOMPOSE_MAX_SCRATCH_BYTES: u64 = 64 << 20;
+/// The route must not need more scratch than this; a score matrix past it belongs
+/// on the fused kernel (or on a chunked step) rather than in a per-step
+/// allocation this backend does not have.
+///
+/// Raised from 64 MiB to 512 MiB. [`crate::backend::compute_scratch_bytes`]
+/// raises the tail reserve to an admitted plan's own [`AttentionPlan::scratch_bytes`],
+/// so the cap is what decides admission and the 64 MiB floor stays the minimum
+/// every graph is guaranteed — no graph is sized below the plan it takes. The
+/// floor was *not* moved with the cap: a 512 MiB tail on every graph makes a
+/// small-shard arena stripe a tail it never writes and refuse on the stripe bound
+/// (`sharded_arena`'s forced-small-shard case), for no gain. Raising the cap
+/// alone is therefore safe only because the floor still sizes every graph to the
+/// plan it takes; a cap moved without that reserve would admit a plan eight times
+/// the guaranteed tail.
+///
+/// Measured on the stand's 8 192-key embedding cell (Apple M3 Pro / Metal): 362.6 s
+/// under the 64 MiB cap against tens of seconds under this one, with its arena at
+/// 670.2 MiB (the planner's figure at align 16, before the scratch tail) and its
+/// output digest 17a3b918 unchanged under both caps — the values did not change,
+/// the arrangement did. The cell's first pass moves with load from run to run, so
+/// the stand's section of `MEASUREMENTS.md` carries the reading this tree was last
+/// measured at rather than a figure restated here.
+pub(crate) const ATTENTION_DECOMPOSE_MAX_SCRATCH_BYTES: u64 = 512 << 20;
 
 /// Rows per workgroup the route's multiplies dispatch their `m = seq_q` rows
 /// in: 32 is the narrowest row tile of the kernels the run can pick for them
@@ -143,17 +160,17 @@ pub(crate) const ATTENTION_DECOMPOSE_MAX_SCRATCH_BYTES: u64 = 64 << 20;
 /// and the scratch conjunct bounds the latter instead — `tiles · seq_k · c`
 /// with `c = head_dim + seq_q + v_head_dim` (Kᵀ plus the scores plus V's
 /// compaction, the last term zero when V's tile is already dense) against the
-/// reserve's 16.7M floats. That puts an upper bound on `seq_k` of
-/// `16 777 216 / (tiles · c)`, so `seq_k.div_ceil(32)` stays inside the cap of
-/// 65 535 wherever `tiles · c >= 9`, and at exactly 8 reaches 65 536 — one
+/// reserve's 134.2M floats. That puts an upper bound on `seq_k` of
+/// `134 217 728 / (tiles · c)`, so `seq_k.div_ceil(32)` stays inside the cap of
+/// 65 535 wherever `tiles · c >= 65`, and at exactly 64 reaches 65 536 — one
 /// workgroup past it. The body's 16 tiles of 128-wide heads give
-/// `tiles · c = 16 · 258 = 4 128`, an upper bound of about four thousand cells.
-/// What it leaves is the single-tile end of both widths: one-wide heads with
-/// V's tile already dense put `tiles · c` at 3, so 5.6M keys pass the budget
-/// with a grid of 174 763 workgroups, and one-wide heads of any layout sit at
-/// 4. The device refuses such a dispatch rather than computing it wrongly, and
-/// closing the corner with a key-length term would enlarge the admission, so it
-/// is recorded rather than admitted around.
+/// `tiles · c = 16 · 258 = 4 128`, an upper bound of about thirty-two thousand
+/// cells. What it leaves is the single-tile end of both widths: one-wide heads
+/// with V's tile already dense put `tiles · c` at 3, so 44.7M keys pass the
+/// budget with a grid of 1 398 102 workgroups, and one-wide heads of any layout
+/// sit at 4. The device refuses such a dispatch rather than computing it
+/// wrongly, and closing the corner with a key-length term would enlarge the
+/// admission, so it is recorded rather than admitted around.
 const MATMUL_TILE_M: u32 = 32;
 
 /// Scratch regions are bumped through 256-byte aligned (`buffer::Arena`'s own
@@ -1310,9 +1327,9 @@ mod tests {
 
     /// The budget's own boundary, on the field the decision reads — the cap
     /// itself is admitted and one float past it is refused — and a shape the
-    /// budget alone refuses: 4096 × 4096 keys per head is 64 MiB of scores
-    /// before Kᵀ, over the reserve every graph is guaranteed, while the other
-    /// three conjuncts hold.
+    /// budget alone refuses: 4096 × 4096 keys per head is the cap in scores
+    /// before Kᵀ, so the three other regions put it over the reserve every graph
+    /// is guaranteed, while the other three conjuncts hold.
     #[test]
     fn the_scratch_budget_admits_its_own_figure() {
         let at = AttentionGeometry {

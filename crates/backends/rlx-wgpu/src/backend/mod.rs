@@ -82,10 +82,8 @@ fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
         // The many-row attention route's Kᵀ, score matrix and operand
         // compaction: the route's own plan of this node. Every other node — and
         // every attention shape the route does not serve — answers zero
-        // (`attention_route`). The 64 MiB floor below already covers the route's
-        // own cap, so what this branch raises the reserve by is the plan's
-        // ≤ 256-byte alignment slack — which is exactly what lets a route shape
-        // fit without depending on the bump cursor's own alignment.
+        // (`attention_route`). An admitted plan fits the reserve without
+        // depending on anything but this branch.
         let attn = match attention_route::plan_attention(graph, node) {
             Ok(plan) if plan.decompose => plan.scratch_bytes(),
             _ => 0,
@@ -97,6 +95,14 @@ fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
     // Reserve extra scratch for staging small far-apart operands when the
     // arena exceeds wgpu's binding window. This keeps compile-time simple
     // and avoids per-op scratch sizing plumbing.
+    //
+    // The floor is the minimum every graph is guaranteed, not the route's cap:
+    // an admitted plan raises `max_bytes` to its own `scratch_bytes()` above.
+    // Raising the floor instead would make every graph reserve (and, under a
+    // small shard cap, stripe) the cap-sized tail it never writes, and
+    // `sharded_arena`'s forced-small-shard case then refuses on the stripe bound.
+    // The measurements behind the cap live on
+    // `attention_route::ATTENTION_DECOMPOSE_MAX_SCRATCH_BYTES`.
     max_bytes.max(64 * 1024 * 1024)
 }
 

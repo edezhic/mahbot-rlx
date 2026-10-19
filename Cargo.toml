@@ -79,6 +79,10 @@ members = [
     # Runtime (user-facing, feature-gated)
     "crates/core/rlx-runtime",     # Session API, backend dispatch
 
+    # MahBot inference: the fork's own subject — the stand binary and the
+    # wake-word bench over our models (rlx-wgpu is its backend).
+    "crates/mahbot-inference",
+
     # Prelude crate — re-exports IR + optimizer + runtime + companion
     # crates behind feature gates. The `cargo add rlx` entry point.
     "crates/rlx",
@@ -183,6 +187,9 @@ default-members = [
     # Runtime (user-facing, feature-gated) and the prelude crate
     "crates/core/rlx-runtime",
     "crates/rlx",
+
+    # MahBot inference: the fork's own subject (stand binary + wake-word bench)
+    "crates/mahbot-inference",
 
     # IO / weight formats
     "crates/io/rlx-gguf",

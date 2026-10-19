@@ -150,7 +150,7 @@ fn case_decode_causal(nh: usize, nkv: usize, hd: usize, lk: usize) -> Option<f64
 fn attention_precision_across_key_lengths() {
     // 12 x 64 is BrainBERT's geometry; 186 is its sequence. Every length here is
     // at or above the route's two-row floor, so all of them take the dense
-    // arrangement — 186's ≈4 MB of scratch is far under its 64 MiB cap. The decode
+    // arrangement — 186's ≈4 MB of scratch is far under its 512 MiB cap. The decode
     // shape is one query row only, covered at the end of the test.
     let mut rows = Vec::new();
     reset_attention_route_counts();

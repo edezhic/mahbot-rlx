@@ -637,7 +637,7 @@ fn the_two_arrangements_agree_on_their_shared_row() {
 }
 
 /// The route's scratch budget, on the device: a shape tens of MiB into it still
-/// takes the route, and one whose plan would need more than the 64 MiB cap falls
+/// takes the route, and one whose plan would need more than the 512 MiB cap falls
 /// back to the fused kernel rather than to the route.
 #[test]
 fn the_scratch_budget_bounds_the_route() {
@@ -652,14 +652,21 @@ fn the_scratch_budget_bounds_the_route() {
     // the reserve it lives in, so `rows_shape` asserts both the arrangement and
     // the CPU bar.
     rows_shape(1, 64, 4096, MaskKind::Causal);
-    // Past the budget: the same geometry over 12288 keys is ≈75 MB of scratch,
-    // over the route's 64 MiB cap, so its plan refuses and the fused kernel serves
-    // the step. The counters are the whole assertion here — a 12288-key diffuse
-    // softmax on the fused kernel is not this file's bar to claim, so there is
-    // deliberately no parity bar: the point is which arrangement the shape took.
-    let (_, routes, _, _) = run_case(1, 64, 12288, 8, 64, MaskKind::Causal);
+    // Past the budget: 4096 query rows over 4096 keys is the cap in scores alone
+    // (512 MiB) and ≈544 MiB once Kᵀ and the three 8 MiB compactions are counted,
+    // over the route's 512 MiB cap, so its plan refuses and the fused kernel
+    // serves the step. Only the route counters are read, so this case runs no
+    // CPU reference and builds no mask: a 4096-row parity bar is not this file's
+    // claim, and the point is which arrangement the shape took.
+    const DIM: usize = 8 * 64;
+    let (g, carries_mask) = chain(1, 4096, 4096, 8, 64, MaskKind::Causal);
+    assert!(!carries_mask, "a causal step carries no mask");
+    let q = data(4096 * DIM, 0.011, false);
+    let k = data(4096 * DIM, 0.013, true);
+    let v = data(4096 * DIM, 0.017, false);
+    let (_, routes, _) = run_graph(g, &[("q", &q), ("k", &k), ("v", &v)]);
     eprintln!(
-        "[rlx-attn-rows-budget] batch=1 rows=64 heads=8 head_dim=64 lk=12288 Causal \
+        "[rlx-attn-rows-budget] batch=1 rows=4096 heads=8 head_dim=64 lk=4096 Causal \
          routes={routes:?}"
     );
     assert_eq!(
@@ -669,7 +676,7 @@ fn the_scratch_budget_bounds_the_route() {
             decomposed: 0,
             serial: 1,
         },
-        "a shape over the route's 64 MiB scratch cap must keep the fused kernel"
+        "a shape over the route's 512 MiB scratch cap must keep the fused kernel"
     );
 }
 
