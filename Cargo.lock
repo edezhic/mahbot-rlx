@@ -5612,7 +5612,6 @@ dependencies = [
  "rlx-sparse",
  "rlx-tpu",
  "rlx-vulkan",
- "rlx-webgl",
  "rlx-wgpu",
  "rlx-xdna",
  "rlxsl",
@@ -5765,37 +5764,6 @@ dependencies = [
  "rlx-runtime",
  "rlx-unfuse",
  "rlxsl",
-]
-
-[[package]]
-name = "rlx-web"
-version = "0.2.18"
-dependencies = [
- "rlx-autodiff",
- "rlx-ir",
- "rlx-opt",
- "rlx-runtime",
- "rlx-webgl",
- "rlx-wgpu",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "rlx-webgl"
-version = "0.2.18"
-dependencies = [
- "js-sys",
- "rlx-autodiff",
- "rlx-collectives",
- "rlx-compile",
- "rlx-cpu",
- "rlx-fusion",
- "rlx-ir",
- "rlx-runtime",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]

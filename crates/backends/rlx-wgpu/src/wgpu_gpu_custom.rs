@@ -9,7 +9,7 @@
 //! dispatches a **real WGSL compute kernel directly against the arena buffer**,
 //! with no D2H/H2D roundtrip — the wgpu analogue of `rlx_metal`'s
 //! `MetalGpuKernel`. A registered GPU kernel takes precedence over a host one,
-//! and (being pure-GPU) it also runs on browser WebGPU, unlike `Step::CustomHost`.
+//! and (being pure-GPU) it stays on the device, unlike `Step::CustomHost`.
 //!
 //! ## Binding convention (fixed)
 //!

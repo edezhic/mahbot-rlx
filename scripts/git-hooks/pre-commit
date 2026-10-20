@@ -20,6 +20,7 @@ while IFS= read -r f; do
   [[ -z "$f" ]] && continue
   case "$f" in
     */vendor/*|crates/backends/rlx-mlx-sys/vendor/*) continue ;;
+    crates/bindings/rlx-web/*|crates/backends/rlx-webgl/*) continue ;;
   esac
   FILES+=("$f")
 done <<<"$STAGED"

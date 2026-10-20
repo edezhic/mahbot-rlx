@@ -164,7 +164,6 @@ pub(crate) fn explicit_workers() -> Option<usize> {
 /// `Some(raw)` when `RLX_WORKERS` is set to something that is neither a positive
 /// integer nor `0` (the documented "auto") — i.e. a value that is not a width.
 /// [`crate::pool::ensure_pool`] reports it and falls back to the tuned default.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn unusable_workers_request() -> Option<String> {
     let raw = rlx_ir::env::var("RLX_WORKERS")?;
     raw.parse::<usize>().err().map(|_| raw)
@@ -172,7 +171,6 @@ pub(crate) fn unusable_workers_request() -> Option<String> {
 
 /// Where the width RLX asks the pool for came from — the label the refusal
 /// report names, so it identifies the request as well as the number.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn requested_workers_source() -> &'static str {
     if explicit_workers().is_some() {
         "requested via RLX_WORKERS"
@@ -197,7 +195,6 @@ pub(crate) fn machine_threads() -> usize {
 /// [`crate::pool::ensure_pool`] reads it at pool-creation time (not here), so a
 /// request that lands before the pool exists always takes effect, and the
 /// machine-threads cap is applied and reported there rather than here.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn requested_workers() -> usize {
     pool_width_for(&HwInfo::detect())
 }
@@ -408,7 +405,6 @@ mod tests {
         assert_eq!(hw.optimal_workers(), hw.perf_cores.min(32));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn workers_env_parsing() {
         rlx_ir::env::set("RLX_WORKERS", "4");

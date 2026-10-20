@@ -12,12 +12,20 @@ autodiff and transforms (`grad`, `jvp`, `hvp`, `vmap`); a compile pipeline
 (HIR → MIR → LIR) legalizes, fuses, and memory-plans the graph, then runs
 it through backend-specific kernels across CPU, Apple Silicon (Metal / MLX
 / ANE), NVIDIA CUDA, AMD (ROCm + XDNA NPU), Intel oneAPI, Google TPU,
-Qualcomm Hexagon, cross-platform GPU (wgpu / Vulkan / WebGL / WASM),
+Qualcomm Hexagon, cross-platform GPU (wgpu / Vulkan),
 microcontrollers (Cortex-M), FPGA, and the Cerebras WSE. It imports models
 from ONNX, PyTorch (`torch.export`), and GGUF / safetensors; does
 quantization (GGUF K/IQ/TQ/MX, INT8/INT4, QAT) and multi-node distributed
 execution; and keeps the core model-agnostic — model crates live in
 sibling repos.
+
+This fork is native-only: its wgpu backend targets Metal, Vulkan and DX12 on
+real hardware, and is never built for WebAssembly or run in a browser. The two
+browser crates that remain in the tree — `crates/bindings/rlx-web` and
+`crates/backends/rlx-webgl` — are excluded from the workspace and are kept only
+to avoid conflicting with upstream, which edits those directories in nearly
+every release. They will never be used, nothing builds them, and not one line
+inside them is modified here.
 
 The design, IR, and cross-backend benchmarks are written up in
 [*RLX: A Unified Multi-Backend Tensor Compiler and Distributed Runtime in
@@ -100,7 +108,7 @@ rlx = { version = "0.2", features = ["cpu", "metal"] }
 | `mlx`               | Apple MLX (vendored)                 | macOS / iOS / tvOS / visionOS |
 | `mlx-cuda`          | Apple MLX's CUDA backend             | Linux + NVIDIA            |
 | `coreml`            | CoreML / Neural Engine (`Device::Ane`)| macOS / iOS / tvOS / visionOS |
-| `gpu`               | wgpu (Vulkan / DX12 / WebGPU / Metal)| cross-platform            |
+| `gpu`               | wgpu (Vulkan / DX12 / Metal)         | cross-platform            |
 | `vulkan`            | native Vulkan compute (`ash` + SPIR-V)| Linux / Windows (+ MoltenVK)|
 | `oneapi`            | Intel oneAPI Level Zero (SPIR-V)     | Linux + Intel GPU         |
 | `cuda`              | cuBLAS / cuDNN / NVRTC               | Linux / Windows + NVIDIA  |
@@ -258,35 +266,6 @@ net.set_param("w2", &w2_weights); // &[f32], len 8*2
 let out = net.run(&[("x", &[1.0, 2.0, 3.0, 4.0])]);
 println!("{:?}", out[0]);          // the 2 outputs
 ```
-
-### Browser example — a training cluster across tabs and devices
-
-A standalone static page (no backend) where **every browser tab is a
-data-parallel rank**: each compiles an RLX backward graph in a Web Worker,
-computes gradients over its own shard, and the cohort averages them. Tabs in one
-browser pair over a `BroadcastChannel`; other devices join a WebRTC mesh by
-scanning a QR code, with signalling over public relays and every gradient
-travelling peer-to-peer.
-
-```sh
-just build-cluster-site          # → ./examples/tab-cluster  (deployable as-is)
-just serve-web --open cluster.html
-```
-
-It is the same compiler the native backends use, so the page also shows the
-choices that normally stay invisible:
-
-| Control | What it exposes |
-|---------|-----------------|
-| backend | `cpu` / `webgpu` / `webgl` per rank, and a mixed cohort is visible in the roster |
-| batch | doubling steps, 2 → 65,536; WebGPU only beats CPU above ~64 |
-| wire | `f32` / `f16` / `f8-e4m3` / `f8-e5m2` payloads — 3.1× less traffic at f8, with the error that costs |
-
-The page ends with the same model built three ways — Rust, JavaScript
-(`WebGraph` over wasm) and Python (`pyrlx`) — each describing the graph, letting
-autodiff rewrite it, and training it. Details, measurements and the
-failure modes that shaped it are in
-[`crates/bindings/rlx-web/README.md`](crates/bindings/rlx-web/README.md).
 
 ### Advanced example
 
@@ -522,8 +501,7 @@ backends/  — one crate per hardware target
   rlx-oneapi         Intel oneAPI Level Zero (Arc / Data Center Max) + SPIR-V kernels
   rlx-tpu            Google TPU via libtpu's PJRT plugin
   rlx-vulkan         native Vulkan compute (raw ash + embedded SPIR-V)
-  rlx-wgpu           cross-platform GPU via wgpu (Metal / Vulkan / DX12 / WebGPU)
-  rlx-webgl          WebGL2 GPGPU — render-to-texture graph execution in-browser
+  rlx-wgpu           cross-platform GPU via wgpu (Metal / Vulkan / DX12)
   rlx-qnn            Qualcomm Hexagon NPU — IR → QNN model (Device::Hexagon)
   rlx-cortexm        Cortex-M INT8 kernels for ARMv7E-M microcontrollers (no_std)
   rlx-fpga           FPGA — per-graph datapath synthesis (IR → Verilog → bitstream)
@@ -576,21 +554,12 @@ tooling/
 bindings/
   pyrlx              Python bindings (PyO3) — run RLX graphs + HF models on any backend
   rlx-ffi            C ABI for the distributed node — Apple xcframework + embedded hosts
-  rlx-web            WebAssembly entry point — run models in-browser (CPU; WebGPU bring-up)
 ```
 
 Each crate carries its own `README.md` covering public surface, build
 commands, and internal gotchas. Model crates (`rlx-qwen3`, `rlx-nomic`, …)
 and `rlx-splat` (3D Gaussian splatting) live in sibling repos, keeping RLX
 core model-agnostic.
-
-### Generated example folders
-
-`./examples/` holds assembled, deployable demos — currently
-`examples/tab-cluster/`, built by `just build-cluster-site` from
-`crates/bindings/rlx-web/web/`. The page sources are committed so the folder is
-browsable; its `pkg/` wasm bundle is gitignored as an 8.4 MB build artifact, so
-rebuild it before deploying from a fresh clone.
 
 ## Building from source
 
@@ -821,7 +790,7 @@ loop; [`CONTRIBUTING.md`](CONTRIBUTING.md) and
 ```sh
 git clone --recurse-submodules https://github.com/MIT-RLX/rlx
 just install-git-hooks     # symlink the repo pre-commit hook
-just ci                    # build · test · fmt-check · lint · wasm · pyrlx — the gate every PR must pass
+just ci                    # build · test · fmt-check · lint · env-vars · WGSL-uniform · no-wasm · pyrlx — the gate every PR must pass
 ```
 
 **A PR is ready when** `just ci` is green, new behavior is covered by a

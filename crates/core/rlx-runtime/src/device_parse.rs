@@ -36,9 +36,7 @@ pub fn parse_device(s: &str) -> Result<Device, ParseDeviceError> {
         "oneapi" | "levelzero" | "level-zero" | "l0" | "intel" | "sycl" => Ok(Device::OneApi),
         "gpu" | "wgpu" => Ok(Device::Gpu),
         "vulkan" | "vk" => Ok(Device::Vulkan),
-        "opengl" | "gl" => Ok(Device::OpenGl),
         "directx" | "dx12" | "d3d12" => Ok(Device::DirectX),
-        "webgpu" => Ok(Device::WebGpu),
         "tpu" => Ok(Device::Tpu),
         "hexagon" | "htp" | "qnn" => Ok(Device::Hexagon),
         "" => Err(ParseDeviceError {
@@ -68,9 +66,7 @@ pub fn device_label(device: Device) -> &'static str {
         Device::OneApi => "oneapi",
         Device::Gpu => "gpu",
         Device::Vulkan => "vulkan",
-        Device::OpenGl => "opengl",
         Device::DirectX => "directx",
-        Device::WebGpu => "webgpu",
         Device::Tpu => "tpu",
         Device::Hexagon => "hexagon",
     }

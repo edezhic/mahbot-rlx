@@ -2429,21 +2429,10 @@ pub unsafe fn execute_gated_delta_net_f32(
         } else {
             for bi in 0..b {
                 owned_state.fill(0.0);
-                #[cfg(not(target_arch = "wasm32"))]
                 {
                     use rayon::prelude::*;
                     owned_state
                         .par_chunks_mut(n * n)
-                        .enumerate()
-                        .for_each(|(hi, s_mat)| {
-                            let mut sk_buf = [0f32; crate::gdn::GDN_MAX_STATE];
-                            run_head(bi, hi, s_mat, &mut sk_buf[..n]);
-                        });
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    owned_state
-                        .chunks_mut(n * n)
                         .enumerate()
                         .for_each(|(hi, s_mat)| {
                             let mut sk_buf = [0f32; crate::gdn::GDN_MAX_STATE];

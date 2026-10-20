@@ -7,7 +7,7 @@
 //! compute kernel straight against the arena buffer — no D2H/H2D host roundtrip
 //! (contrast the host-delegate `Step::CustomHost` path). Runs on the portable
 //! wgpu backend (`Device::Gpu`), which is Metal on macOS / Vulkan on Linux /
-//! DX12 on Windows / WebGPU in the browser.
+//! DX12 on Windows.
 
 #![cfg(feature = "gpu")]
 

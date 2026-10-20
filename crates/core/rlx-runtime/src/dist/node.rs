@@ -229,8 +229,6 @@ pub const fn platform_tag() -> &'static str {
         "linux"
     } else if cfg!(target_os = "windows") {
         "windows"
-    } else if cfg!(target_arch = "wasm32") {
-        "wasm"
     } else {
         "unknown"
     }
@@ -385,7 +383,6 @@ impl NodeConfig {
     /// Read the same variables the CLI node driver uses (`RANK`, `WORLD`,
     /// `PEERS` / `DISCOVER`, `TOPOLOGY`, `HEAP_MB`, `DEVICE`). Provided for
     /// parity; prefer the builder on platforms without a shell environment.
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_env() -> Result<Self, String> {
         let var = |k: &str| std::env::var(k).ok();
         let rank: u32 = var("RANK")

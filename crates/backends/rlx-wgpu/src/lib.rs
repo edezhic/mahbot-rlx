@@ -4,8 +4,7 @@
 
 //! RLX wgpu backend — cross-platform GPU execution via the `wgpu`
 //! Rust crate (Metal on macOS, Vulkan on Linux and on Windows, where DX12 is
-//! enabled too and wgpu's own adapter ordering picks between them,
-//! WebGPU in browsers).
+//! enabled too and wgpu's own adapter ordering picks between them).
 //!
 //! Compared to rlx-metal: same overall shape (device singleton, buffer
 //! arena, per-op compute pipelines, command-buffer-per-forward-pass)
@@ -40,7 +39,6 @@ pub use backend::{
 pub mod supported_ops;
 pub mod tuning;
 pub use supported_ops::SUPPORTED_OPS;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod bandwidth;
 pub mod buffer;
 pub mod calibrate;
@@ -95,6 +93,4 @@ pub fn is_available() -> bool {
     device::wgpu_device().is_some()
 }
 
-#[cfg(target_arch = "wasm32")]
-pub use device::init_wgpu_device;
 pub use device::{is_vulkan_available, select_vulkan_backend, wgpu_device};

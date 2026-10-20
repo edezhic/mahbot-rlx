@@ -3253,7 +3253,7 @@ mod tests {
     }
 
     /// Same end-to-end validation on the portable **wgpu** backend (Metal-backed
-    /// here): a 2-rank in-graph all-reduce compiled to `Device::WebGpu` staged
+    /// here): a 2-rank in-graph all-reduce compiled to `Device::Gpu` staged
     /// through `crate::collective_host` must equal the per-rank sum.
     #[cfg(target_os = "macos")]
     #[test]
@@ -3295,8 +3295,7 @@ mod tests {
                     let y = all_reduce(&mut g, x, gid);
                     g.set_outputs(vec![y]);
 
-                    // `Device::Gpu` is the native portable wgpu path (wgpu-on-Metal
-                    // here); `Device::WebGpu` is the WASM/browser one.
+                    // `Device::Gpu` is the portable wgpu path (wgpu-on-Metal here).
                     let mut c = Session::new(Device::Gpu).compile(g);
                     let res = c.run(&[("x", contrib(rank).as_slice())]);
                     unregister_group(gid);

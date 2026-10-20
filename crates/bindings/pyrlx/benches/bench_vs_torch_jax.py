@@ -432,8 +432,7 @@ def _jax_devices() -> list[str]:
 
 # tinygrad ↔ bench-column mapping (tinygrad 0.10+ renamed CLANG→CPU,
 # GPU→CL, added NV alongside CUDA). tinygrad's CL backend is OpenCL
-# (different API from pyrlx's `gpu`/wgpu) so it gets its own column —
-# `WEBGPU` maps to the same `gpu` column as pyrlx since both are wgpu.
+# (different API from pyrlx's `gpu`/wgpu) so it gets its own column.
 # `PYTHON` is the bytecode interpreter; included only as a last-resort
 # fallback when no compiled CPU backend is available.
 _TG_TO_LABEL: dict[str, str] = {
@@ -445,7 +444,6 @@ _TG_TO_LABEL: dict[str, str] = {
     "HIP":    "rocm",
     "AMD":    "rocm",       # newer alias for HIP in tinygrad
     "CL":     "opencl",
-    "WEBGPU": "gpu",
 }
 # Reverse: bench column → preferred tinygrad device. Iteration order
 # of `_TG_TO_LABEL` controls which tinygrad backend wins for each label

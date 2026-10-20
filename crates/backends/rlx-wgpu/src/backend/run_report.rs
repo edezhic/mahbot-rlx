@@ -11,10 +11,9 @@
 //! [`Phase::Compile`] names. It fires once per outermost run, and only when the
 //! switch is set — read once here, not at each mark. A schedule replay suppresses
 //! it: a session under `RLX_WGPU_SNAPSHOT` reports nothing at all rather than a
-//! figure that would be read as a plain run's. The browser build produces nothing
-//! either, where `Tick` reads no clock. One caller-side call may still correspond
-//! to several reported runs — a runtime wrapper can invoke the backend more than
-//! once — while a per-token decode loop produces one report per token: each
+//! figure that would be read as a plain run's. One caller-side call may still
+//! correspond to several reported runs — a runtime wrapper can invoke the backend
+//! more than once — while a per-token decode loop produces one report per token: each
 //! bracket is that call's, never the caller's.
 //!
 //! The partition is host-visible and contiguous by construction — `stage`,
@@ -199,10 +198,6 @@ struct PassRecord {
 /// The device-time view: one query pair per recorded pass, resolved and mapped
 /// once at the end of the run.
 ///
-/// The browser build reads no clock there — `RunReport::start` cannot enable the
-/// report there — so nothing ever builds one, and on `wasm32` neither the query
-/// set nor the two buffers are ever read (what the `dead_code` allow covers).
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 struct PassTimer {
     qs: wgpu::QuerySet,
     resolve: wgpu::Buffer,
@@ -343,11 +338,9 @@ pub(crate) struct RunReport {
 
 impl RunReport {
     /// Bracket start. Reads the switch once; suppressed for a replay
-    /// (`in_snapshot`, or a `RLX_WGPU_SNAPSHOT` session) and inert in the browser
-    /// build.
+    /// (`in_snapshot`, or a `RLX_WGPU_SNAPSHOT` session).
     pub(crate) fn start(in_snapshot: bool) -> Self {
-        let wanted = !cfg!(target_arch = "wasm32")
-            && rlx_ir::env::flag("RLX_WGPU_DBG_COUNTERS")
+        let wanted = rlx_ir::env::flag("RLX_WGPU_DBG_COUNTERS")
             && !in_snapshot
             // A snapshot session is a replay from end to end — its last run is a
             // full pass, indistinguishable here from a production one — so the
@@ -571,7 +564,6 @@ impl RunReport {
     /// separate encoder that resolves and copies into a mappable buffer, then
     /// the map. Every submit and poll is annotated with the crate's counters,
     /// like every other one in `src/`.
-    #[cfg(not(target_arch = "wasm32"))]
     fn probe(&mut self) {
         let Some(dev) = self.dev else {
             return;
@@ -610,11 +602,6 @@ impl RunReport {
         }
         timer.read.unmap();
     }
-
-    /// No device clock in the browser, and no scheduled work that could be
-    /// measured: the report there is the host-visible partition alone.
-    #[cfg(target_arch = "wasm32")]
-    fn probe(&mut self) {}
 
     /// The device view's figure for one pass, in ns — or `None` when no figure
     /// can be obtained from it, which is printed as `unavailable` and never as

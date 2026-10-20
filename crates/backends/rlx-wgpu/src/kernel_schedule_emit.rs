@@ -648,7 +648,7 @@ mod tests {
     use super::*;
 
     /// The portable floor: `matmul.wgsl` ships with "no extensions, no subgroup
-    /// ops; runs identically on Metal/Vulkan/DX12/WebGPU", so the schedule
+    /// ops; runs identically on Metal/Vulkan/DX12", so the schedule
     /// describing it must clear the floor rather than any one vendor's ceiling.
     const TARGET: Target = Target::PORTABLE;
     const TILE: WgslTile = WgslTile::SHIPPING;
@@ -687,12 +687,16 @@ mod tests {
         }
     }
 
-    /// Every WebGPU implementation guarantees only 16 KiB of workgroup storage.
-    /// At 4 KiB per stage a 5-deep rotation busts it, and that is caught before
-    /// any shader text exists rather than at pipeline creation.
+    /// Workgroup storage is checked against the target's declared budget.
+    /// `PORTABLE` declares 32 KiB — the figure Metal and DX12 report — so a
+    /// 9-deep rotation at 4 KiB per stage (36 KiB) busts it before any shader
+    /// text exists rather than at pipeline creation. Vulkan guarantees only
+    /// 16 KiB, so an adapter at that floor can still refuse a schedule that
+    /// fits this budget; the constant is the desktop targets' figure, not a
+    /// universal one.
     #[test]
     fn an_over_deep_rotation_busts_the_workgroup_budget() {
-        // PORTABLE's floor is 32 KiB; 9 stages x 4 KiB = 36 KiB.
+        // PORTABLE's budget is 32 KiB; 9 stages x 4 KiB = 36 KiB.
         let err = emit_wgsl(&matmul_pipelined_schedule(TILE, 9), TILE, TARGET).unwrap_err();
         assert!(
             matches!(&err, EmitError::Unsound(es)

@@ -101,27 +101,13 @@ pub fn decode_zstd_blocks_parallel(comp: &[u8]) -> Result<Vec<u8>> {
 /// size) is stopped at `expected + 1` — peak memory is tied to the block's
 /// deterministic declared length, not the attacker's frame header — and then
 /// rejected. Replaces `zstd::decode_all`, which has no output cap.
-// zstd is C-backed (won't build for wasm32). These thin wrappers keep it behind
-// `cfg`: native links zstd; wasm returns a clear error (the browser path loads
-// uncompressed / hot-tier packages, so the compressed codec is never invoked).
-#[cfg(not(target_arch = "wasm32"))]
 fn z_encode_all(data: &[u8], level: i32) -> Result<Vec<u8>> {
     zstd::encode_all(data, level).context("zstd compress")
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn z_decode_all(data: &[u8]) -> Result<Vec<u8>> {
     zstd::decode_all(data).context("zstd decompress")
 }
-#[cfg(target_arch = "wasm32")]
-fn z_encode_all(_data: &[u8], _level: i32) -> Result<Vec<u8>> {
-    bail!("rlx-pkg: zstd compression unavailable on wasm32 (use uncompressed/hot-tier packages)")
-}
-#[cfg(target_arch = "wasm32")]
-fn z_decode_all(_data: &[u8]) -> Result<Vec<u8>> {
-    bail!("rlx-pkg: zstd decompression unavailable on wasm32 (use uncompressed/hot-tier packages)")
-}
 
-#[cfg(not(target_arch = "wasm32"))]
 fn zstd_decode_bounded(input: &[u8], expected: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut dec = zstd::Decoder::new(input).context("init zstd block decoder")?;
@@ -138,11 +124,6 @@ fn zstd_decode_bounded(input: &[u8], expected: usize) -> Result<Vec<u8>> {
     }
     Ok(out)
 }
-#[cfg(target_arch = "wasm32")]
-fn zstd_decode_bounded(_input: &[u8], _expected: usize) -> Result<Vec<u8>> {
-    bail!("rlx-pkg: zstd block decode unavailable on wasm32 (use uncompressed/hot-tier packages)")
-}
-
 fn decode_zstd_blocks_impl(comp: &[u8], parallel: bool) -> Result<Vec<u8>> {
     if comp.len() < 4 + 4 + 8 + 4 {
         bail!("warm blob too short");

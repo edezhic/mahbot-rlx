@@ -467,8 +467,8 @@ They answer different questions. A napi addon puts RLX inside someone else's
 process and inherits npm, threads and an event loop. This puts a script inside
 *ours*: one static binary, deterministic, no I/O a script can reach unless an
 embedder hands it one, an instruction budget so a runaway loop cannot hang the
-host — and it cross-compiles wherever RLX already goes, including iOS and wasm,
-where a native addon cannot follow.
+host — and it cross-compiles wherever RLX already goes, including iOS, where a
+native addon cannot follow.
 
 Config files, training recipes, eval harnesses and per-customer model wiring
 are the shape that fits. To put RLX *inside* an existing Node service, a napi

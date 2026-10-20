@@ -86,9 +86,8 @@
 //! else's process and inherits npm, threads and an event loop. This puts a
 //! script inside *ours*: one static binary, deterministic, no I/O a script can
 //! reach unless an embedder hands it one, and it cross-compiles to wherever
-//! RLX already goes — including iOS and wasm, where a native addon cannot
-//! follow. Config files, training recipes and eval harnesses are the shape
-//! that fits.
+//! RLX already goes — including iOS, where a native addon cannot follow.
+//! Config files, training recipes and eval harnesses are the shape that fits.
 //!
 //! ## Backends
 //!

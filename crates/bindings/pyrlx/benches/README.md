@@ -69,7 +69,7 @@ uv pip install -U "jax[cuda12]"
 
 # tinygrad — every backend ships with the package; pick at runtime
 # via env vars (CLANG=1, METAL=1, CUDA=1, HIP=1/AMD=1, GPU=1
-# (=OpenCL), WEBGPU=1). The bench probes each automatically.
+# (=OpenCL)). The bench probes each automatically.
 uv pip install tinygrad
 ```
 

@@ -17,7 +17,7 @@ and the device handle.
   registration plumbing for downstream extension.
 - **`Device`** lives in `rlx-driver::device`; this crate just consumes
   it. Variants: `Cpu`, `Metal`, `Mlx`, `Ane`, `Cuda`, `Rocm`, `Tpu`,
-  `Gpu` (wgpu), `Vulkan`, `OpenGl`, `DirectX`, `WebGpu`.
+  `Gpu` (wgpu), `Vulkan`, `DirectX`.
 - **`device_ext.rs`** — `Device::is_available()` lookup against the
   registry (keeps the runtime→driver dep direction one-way).
 - **`hwinfo.rs`** — host + GPU introspection. `HwSnapshot` (CPU topology /

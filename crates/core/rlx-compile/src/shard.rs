@@ -30,8 +30,8 @@
 //! It performs no graph surgery. [`ShardOption`] describes the cut —
 //! which operand, which axis, which ranges — and the caller emits narrows and
 //! a concat, or ships ranges to workers, as suits it. Keeping emission out
-//! means this stays an analysis usable from a backend, from the distributed
-//! layer, and from a browser worker, none of which agree on how to execute.
+//! means this stays an analysis usable from a backend and from the distributed
+//! layer, which do not agree on how to execute.
 //!
 //! ## Sharding is exact, but not always bit-identical
 //!
@@ -45,8 +45,8 @@
 //!
 //! Measured in `rlx-runtime/tests/shard_equivalence.rs`. It matters for
 //! placement: a cohort that relies on every worker holding *identical* values
-//! (as the browser tab cluster does) must shard along batch/rows, or accept
-//! that its ranks now differ in the last bits.
+//! must shard along batch/rows, or accept that its ranks now differ in the last
+//! bits.
 //!
 //! It also defines its own cost inputs ([`LinkCost`], [`WorkerCost`]) rather
 //! than importing `rlx_collectives::planner::Link` or

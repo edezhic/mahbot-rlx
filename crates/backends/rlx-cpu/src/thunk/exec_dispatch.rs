@@ -354,14 +354,12 @@ pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     // spin instead, and this thread's share of the work is done by the worker
     // it runs on. Thread-local kernel state (MoE residency masks, counters)
     // then lives on that worker.
-    #[cfg(not(target_arch = "wasm32"))]
     if exec_in_pool() && rayon::current_thread_index().is_none() && crate::pool::num_threads() > 1 {
         return rayon::scope(|_| execute_thunks_here(schedule, arena_buf));
     }
     execute_thunks_here(schedule, arena_buf)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn exec_in_pool() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| rlx_ir::env::flag("RLX_CPU_EXEC_IN_POOL"))

@@ -247,7 +247,7 @@ fn fusion_target(device: Device) -> FusionTarget {
         Device::Metal => FusionTarget::Metal,
         Device::Cuda => FusionTarget::Cuda,
         Device::Rocm => FusionTarget::Rocm,
-        Device::Gpu | Device::Vulkan | Device::WebGpu => FusionTarget::Wgpu,
+        Device::Gpu | Device::Vulkan => FusionTarget::Wgpu,
         Device::Mlx => FusionTarget::Mlx,
         Device::Tpu => FusionTarget::Tpu,
         _ => FusionTarget::Cpu,

@@ -2,7 +2,7 @@
 
 Cross-platform GPU backend via the [wgpu](https://wgpu.rs/) crate.
 Single backend serves Metal (macOS), Vulkan (Linux, and Windows
-alongside DX12), DirectX 12 (Windows), and WebGPU (browsers). WGSL
+alongside DX12), and DirectX 12 (Windows). WGSL
 kernels, pure Rust deps — no FFI, no submodules.
 
 ## What's here
@@ -680,8 +680,7 @@ Metal here, and a dispatch-only run gains that fence.
 
 Under `RLX_WGPU_SNAPSHOT=1` a call is a replay session end to end, so nothing is
 produced at all — its last pass is a full one, and the report cannot tell that
-pass apart from a production run's. The browser build produces nothing either,
-with no clock to read and the capability never requested there. Set, the report's
+pass apart from a production run's. Set, the report's
 own query set, buffers, fence, resolve submit and map change a run's
 submission/wait shape (adding one fence to a dispatch-only run), and its passes —
 the batch's and the packed multiplies' — carry timestamp writes, so tests that pin
@@ -767,7 +766,7 @@ No test asserts a time: the tests assert structure, labels and parseability — 
 re-running a case in a child process and parsing its stderr — and anything
 adapter-dependent rides the `backend-tests` feature.
 
-## WGSL uniform control flow (browser vs native)
+## WGSL uniform control flow
 
 WGSL requires `workgroupBarrier()` to be reached in **uniform control flow**. A
 `return` gated on `global_invocation_id` breaks that, and who notices depends on
@@ -776,15 +775,15 @@ the toolchain:
 | Toolchain | Behaviour |
 |-----------|-----------|
 | naga → Metal/Vulkan | accepts it — native tests pass |
-| Dawn (every browser) | rejects the **shader module**: *"'workgroupBarrier' must only be called from uniform control flow"* |
+| Dawn (a WebGPU implementation) | rejects the **shader module**: *"'workgroupBarrier' must only be called from uniform control flow"* |
 | FXC (DirectX) | rejects it as X4026 |
 
 The browser failure mode is the dangerous one. Dawn invalidates the module, so
-every pipeline built from it is invalid and every dispatch fails — but
-`run_async` still resolves, and the arena keeps whatever was in it. A browser
-rank therefore reported `webgpu`, trained on a loss of **exactly 0.0000**, and
-fed that into a cluster's gradient average. No panic, no error, no wrong-looking
-numbers until you ask what ln(10) should be.
+every pipeline built from it is invalid and every dispatch fails — but the
+browser entry point of the day (`run_async`) resolved, and the arena kept
+whatever was in it: a browser rank reported `webgpu`, trained on a loss of
+exactly 0.0000 and poisoned a cluster's gradient average. No panic, no error, no
+wrong-looking numbers until you ask what ln(10) should be.
 
 `matmul.wgsl` already carried the fix and a comment about FXC;
 `matmul_f16w`/`matmul_f16_compute` were written later and missed it, and
@@ -813,7 +812,7 @@ A comment in one shader did not stop this spreading to three, so
 resolves which names derive from `global_invocation_id`, and walks each
 function's enclosing `if` conditions. It also self-tests — one case asserting it
 catches the exact shape that broke Chrome, one asserting it does not flag the
-legal workgroup-uniform forms. In `just check-wasm`.
+legal workgroup-uniform forms. In `just check-wgsl-uniform`.
 
 ## Host-executed steps, and planning around them
 
@@ -835,12 +834,12 @@ independent (2 sync points if run one at a time)
 It answers two questions the executor previously could not:
 
 - **What is on the host.** Callers had a single bit
-  (`requires_host_execution()`), which is why the browser WebGPU refusal could
-  only list the ops it *might* have been — "GGUF dequant, LSTM, collectives,
-  FFT-host, …" — when the real answer was one `Conv2dHost` per convolution.
-  The refusal now names the steps, so a caller knows whether to change backend
-  or change model. Surfaced through `ExecutableGraph::wgpu_host_summary()` →
-  `CompiledGraph::host_execution_summary()`, native as well as wasm.
+  (`requires_host_execution()`), which could only say that host steps existed,
+  not which ones — "GGUF dequant, LSTM, collectives, FFT-host, …" — when the
+  real answer was one `Conv2dHost` per convolution.
+  The summary names the steps, so a caller knows whether to change backend or
+  change model. Surfaced through `ExecutableGraph::wgpu_host_summary()` →
+  `CompiledGraph::host_execution_summary()`.
 - **Which of them are independent.** Consecutive host steps pay for one sync
   point each even when they have nothing to do with each other. Two can share
   one only if neither reads a byte range the other writes, so the plan groups a

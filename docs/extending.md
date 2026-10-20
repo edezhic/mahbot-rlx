@@ -108,13 +108,13 @@ Three execution choices, cheapest first:
 |---|---|---|
 | **Lower** | `OpExtension::lower` (decompose to primitives) | every backend, fuses |
 | **Host kernel** | `register_cpu_kernel` / `register_metal_kernel` / `register_mlx_kernel` | that backend, host-delegate; a CPU kernel also runs on CUDA/ROCm/wgpu/Vulkan via host staging |
-| **Raw GPU kernel** | `MetalGpuKernel` (MSL) / `WgpuGpuKernel` (WGSL) / `CudaGpuKernel` (CUDA-C·NVRTC) / `RocmGpuKernel` (HIP-C·hipRTC) | Metal / wgpu (Metal·Vulkan·DX12·WebGPU) / CUDA / ROCm, dispatched onto the arena buffer with **no host roundtrip** — takes precedence over a same-named host kernel |
+| **Raw GPU kernel** | `MetalGpuKernel` (MSL) / `WgpuGpuKernel` (WGSL) / `CudaGpuKernel` (CUDA-C·NVRTC) / `RocmGpuKernel` (HIP-C·hipRTC) | Metal / wgpu (Metal·Vulkan·DX12) / CUDA / ROCm, dispatched onto the arena buffer with **no host roundtrip** — takes precedence over a same-named host kernel |
 | **Custom AD** | `Graph::custom_fn` (subgraph body + VJP/JVP bodies) | anywhere the body runs |
 
 Four raw-GPU flavors, all dispatching straight against the arena buffer:
 
 - **Metal** — `rlx_metal::op_registry::MetalGpuKernel::encode` hands you the live compute encoder, the shared arena `MTLBuffer`, and per-operand `(byte offset, len, shape)`; compile a pipeline via `rlx_metal::pipeline_cache::load_or_compile_library` and dispatch. Example: `crates/core/rlx-runtime/tests/metal_gpu_custom_op.rs`.
-- **wgpu** — `rlx_wgpu::wgpu_gpu_custom::WgpuGpuKernel` returns WGSL following a fixed binding convention (arena storage `@0`, a `params: array<u32>` of element offsets `@1`); the executor windows the operands, builds the bind group, and dispatches. Portable to browser WebGPU (unlike the host-delegate path). Example: `crates/core/rlx-runtime/tests/wgpu_gpu_custom_op.rs`.
+- **wgpu** — `rlx_wgpu::wgpu_gpu_custom::WgpuGpuKernel` returns WGSL following a fixed binding convention (arena storage `@0`, a `params: array<u32>` of element offsets `@1`); the executor windows the operands, builds the bind group, and dispatches. Portable across the native wgpu targets (unlike the host-delegate path). Example: `crates/core/rlx-runtime/tests/wgpu_gpu_custom_op.rs`.
 - **CUDA** — `rlx_cuda::cuda_gpu_kernels::CudaGpuKernel` returns CUDA-C with a fixed launch signature (`float* arena` + element offsets); the executor NVRTC-compiles + caches it and launches against the arena (≤4 inputs). Example: `crates/core/rlx-runtime/tests/cuda_gpu_custom_op.rs` (validated on an NVIDIA GPU).
 - **ROCm** — `rlx_rocm::rocm_gpu_kernels::RocmGpuKernel` is the CUDA seam ported to HIP (same fixed signature; HIP compiles the CUDA-C source shape verbatim via hipRTC). Example: `crates/core/rlx-runtime/tests/rocm_gpu_custom_op.rs` (compile-verified + HW-ready; runtime validation pending an AMD/ROCm GPU).
 

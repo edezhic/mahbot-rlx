@@ -283,14 +283,14 @@ fn fk_prologue_session_pipeline_keeps_region() {
 #[test]
 fn fk_prologue_chain_matches_primitives_on_wgpu() {
     let _gpu = common::serialize_gpu();
-    if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
+    if !is_available(Device::Vulkan) && !is_available(Device::Gpu) {
         eprintln!("skip fk_prologue_chain_matches_primitives_on_wgpu (unavailable)");
         return;
     }
     let device = if is_available(Device::Vulkan) {
         Device::Vulkan
     } else {
-        Device::WebGpu
+        Device::Gpu
     };
     let target = FusionTarget::Wgpu;
     let g = build_resize_chain_graph();
@@ -427,7 +427,7 @@ fn fk_batch_single_launch_matches_primitives_on_metal() {
 #[test]
 fn fk_batch_region_matches_primitives_on_wgpu() {
     let _gpu = common::serialize_gpu();
-    if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
+    if !is_available(Device::Vulkan) && !is_available(Device::Gpu) {
         eprintln!("skip fk_batch_region_matches_primitives_on_wgpu (unavailable)");
         return;
     }
@@ -435,7 +435,7 @@ fn fk_batch_region_matches_primitives_on_wgpu() {
     let device = if is_available(Device::Vulkan) {
         Device::Vulkan
     } else {
-        Device::WebGpu
+        Device::Gpu
     };
     let target = FusionTarget::Wgpu;
     let g = build_batch_relu_graph();
@@ -458,7 +458,7 @@ fn fk_batch_region_matches_primitives_on_wgpu() {
 #[test]
 fn fk_batch_single_launch_matches_primitives_on_wgpu() {
     let _gpu = common::serialize_gpu();
-    if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
+    if !is_available(Device::Vulkan) && !is_available(Device::Gpu) {
         eprintln!("skip fk_batch_single_launch_matches_primitives_on_wgpu (unavailable)");
         return;
     }
@@ -467,7 +467,7 @@ fn fk_batch_single_launch_matches_primitives_on_wgpu() {
         let device = if is_available(Device::Vulkan) {
             Device::Vulkan
         } else {
-            Device::WebGpu
+            Device::Gpu
         };
         let target = FusionTarget::Wgpu;
         let g = build_batch_relu_graph();
@@ -818,14 +818,14 @@ fn fk_batch_region_matches_primitives_on_tpu() {
 #[test]
 fn fk_batch_session_pipeline_keeps_native_region_wgpu() {
     let _gpu = common::serialize_gpu();
-    if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
+    if !is_available(Device::Vulkan) && !is_available(Device::Gpu) {
         eprintln!("skip fk_batch_session_pipeline_keeps_native_region_wgpu (unavailable)");
         return;
     }
     let device = if is_available(Device::Vulkan) {
         Device::Vulkan
     } else {
-        Device::WebGpu
+        Device::Gpu
     };
     let g = build_batch_relu_graph();
     let batch: Vec<f32> = (0..2 * 3 * 8 * 8)
@@ -893,14 +893,14 @@ fn fk_prologue_resize_on_input_one_matches_cpu() {
 #[test]
 fn fk_prologue_resize_on_input_one_matches_cpu_wgpu() {
     let _gpu = common::serialize_gpu();
-    if !is_available(Device::Vulkan) && !is_available(Device::WebGpu) {
+    if !is_available(Device::Vulkan) && !is_available(Device::Gpu) {
         eprintln!("skip fk_prologue_resize_on_input_one_matches_cpu_wgpu (unavailable)");
         return;
     }
     let device = if is_available(Device::Vulkan) {
         Device::Vulkan
     } else {
-        Device::WebGpu
+        Device::Gpu
     };
     let g = build_resize_prologue_secondary_input_graph();
     let x: Vec<f32> = (0..3 * 8 * 8).map(|i| (i as f32) * 0.01 - 0.5).collect();

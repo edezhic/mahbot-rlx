@@ -19,7 +19,7 @@ __version__: str
 DeviceName = Literal[
     "cpu", "metal", "mlx", "ane",
     "cuda", "rocm",
-    "gpu", "vulkan", "opengl", "directx", "webgpu",
+    "gpu", "vulkan", "directx",
 ]
 
 PrecisionName = Literal["f32", "f16", "bf16", "float32", "float16", "bfloat16"]

@@ -29,7 +29,7 @@ members = [
     "crates/backends/rlx-mlx",         # Apple MLX (lazy graph + eager modes, hand-rolled C++ shim)
     "crates/backends/rlx-coreml",      # Apple CoreML / Neural Engine (ANE) — IR → MIL ML Program
 
-    "crates/backends/rlx-wgpu",        # Cross-platform GPU via wgpu (Metal/Vulkan/DX12/WebGPU)
+    "crates/backends/rlx-wgpu",        # Cross-platform GPU via wgpu (Metal/Vulkan/DX12)
     "crates/backends/rlx-cuda",        # NVIDIA CUDA (cuBLAS + NVRTC kernels via cudarc)
     "crates/backends/rlx-rocm",        # AMD ROCm/HIP — same kernels as rlx-cuda
     "crates/backends/rlx-xdna",        # AMD XDNA / Ryzen AI NPU (amdxdna) — Device::Xdna detection + AIE seam
@@ -127,13 +127,26 @@ members = [
     # C ABI for the distributed node — iOS (staticlib → xcframework) and
     # embedded hosts (cdylib), including the host side of an FPGA rank.
     "crates/bindings/rlx-ffi",
+]
 
-    # WebAssembly entry point — run models in the browser (CPU backend +
-    # async WebGPU device bring-up via rlx-wgpu)
+# ── Excluded: the two browser crates ─────────────────────────────────
+#
+# `rlx-web` (the WebAssembly entry point) and `rlx-webgl` (the WebGL2 GPGPU
+# backend) stay in the tree only to avoid conflicting with upstream, which edits
+# those directories in nearly every release; they will never be used. This
+# fork's wgpu backend targets native Metal / Vulkan / DX12 and is never built for
+# wasm or run in a browser, so no recipe builds, lints or tests them.
+#
+# Not one line inside them is edited: a deleted or modified file is what turns a
+# future merge into a conflict. Exclusion is what keeps them inert — their
+# manifests inherit from this workspace, so they do not resolve standalone
+# either, and nothing can be built inside them by accident.
+#
+# Trade-off, accepted knowingly: `cargo -p rlx-web` / `-p rlx-webgl` no longer
+# resolve, the recipes that selected them are gone, and because their sources
+# reference device variants this fork no longer has, they would not compile.
+exclude = [
     "crates/bindings/rlx-web",
-
-    # WebGL2 GPGPU backend — render-to-texture execution in the browser
-    # (no compute shaders on WebGL2), forward + backward.
     "crates/backends/rlx-webgl",
 ]
 
@@ -235,7 +248,6 @@ default-members = [
     "crates/bindings/pyrlx",
     "crates/bindings/rlx-js",
     "crates/bindings/rlx-ffi",
-    "crates/bindings/rlx-web",
 ]
 
 # ── Sanitizer / debug profiles (plan #41) ────────────────────────
@@ -355,8 +367,6 @@ rlx-vq = { path = "crates/numerics/rlx-vq", version = "0.2.18" }
 rlx-vulkan = { path = "crates/backends/rlx-vulkan", version = "0.2.18" }
 rlx-ffi = { path = "crates/bindings/rlx-ffi", version = "0.2.18" }
 rlx-js = { path = "crates/bindings/rlx-js", version = "0.2.18" }
-rlx-web = { path = "crates/bindings/rlx-web", version = "0.2.18" }
-rlx-webgl = { path = "crates/backends/rlx-webgl", version = "0.2.18" }
 rlx-wgpu = { path = "crates/backends/rlx-wgpu", version = "0.2.18" }
 rlx-xdna = { path = "crates/backends/rlx-xdna", version = "0.2.18" }
 rlx-egpu = { path = "crates/backends/rlx-egpu", version = "0.2.18" }

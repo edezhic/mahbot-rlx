@@ -37,30 +37,23 @@
 //! `RuntimeConfig::install()`), not when it is set; the width in effect stays
 //! readable through [`num_threads`].
 
-#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
 
 /// The one-time pool resolution: the width in effect, and why an asked-for width
 /// is not it (`None` when the ask was applied as asked).
-#[cfg(not(target_arch = "wasm32"))]
 struct PoolState {
     width: usize,
     refused: Option<Refused>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 static POOL: OnceLock<PoolState> = OnceLock::new();
 
 /// Claim the process-wide pool for RLX: create it at RLX's requested width if
 /// nothing has yet, and report a width that could not be applied. The CPU backend
 /// calls this on every compile, so a width requested in between is either in
-/// effect or said to be impossible. Idempotent; safe to call from anywhere (a
-/// no-op on wasm).
-#[cfg(not(target_arch = "wasm32"))]
+/// effect or said to be impossible. Idempotent; safe to call from anywhere.
 pub fn ensure_pool() {
     let state = resolved();
     if let Some(n) = crate::config::explicit_workers() {
@@ -73,16 +66,12 @@ pub fn ensure_pool() {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-pub fn ensure_pool() {}
-
 /// Rayon's worker count, without the panic message `current_num_threads` emits
 /// while Rayon's global registry is unset. A *foreign* `build_global` failure
 /// leaves exactly that state behind while reporting the same sourceless
 /// "already initialized" error, so the error alone cannot rule the read out.
 /// The hook swapped in is process-global: one probe at a time, and a panic on
 /// another thread inside that window prints nothing.
-#[cfg(not(target_arch = "wasm32"))]
 fn current_num_threads_quietly() -> Result<usize, Box<dyn std::any::Any + Send>> {
     static HOOK: Mutex<()> = Mutex::new(());
     let _guard = HOOK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -97,7 +86,6 @@ fn current_num_threads_quietly() -> Result<usize, Box<dyn std::any::Any + Send>>
 /// [`crate::config::requested_workers`], build the pool, record the width and
 /// report whatever could not be applied. The hot paths come straight here — they
 /// must not pay an environment read per call, and reaching them first is fine.
-#[cfg(not(target_arch = "wasm32"))]
 fn resolved() -> &'static PoolState {
     POOL.get_or_init(|| {
         let want = crate::config::requested_workers();
@@ -159,7 +147,6 @@ fn resolved() -> &'static PoolState {
 /// Why a width could not be applied exactly as asked — the one channel a pool
 /// width is reported through, so no request is dropped in silence. Each variant
 /// carries the numbers its line names.
-#[cfg(not(target_arch = "wasm32"))]
 enum Refused {
     /// The ask was wider than the machine's available threads.
     Capped {
@@ -187,7 +174,6 @@ enum Refused {
     },
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl Refused {
     /// One-line report naming the requested and the in-effect width, so a request
     /// that was not applied is audible rather than silently dropped.
@@ -228,7 +214,6 @@ impl Refused {
 /// Print [`Refused::line`], unless that exact line was already printed. The pool
 /// is sized once but [`ensure_pool`] runs on every compile, and keying on the
 /// line rather than the width still lets a *different* refusal speak.
-#[cfg(not(target_arch = "wasm32"))]
 fn report_refused(why: &Refused) {
     static LAST: Mutex<Option<String>> = Mutex::new(None);
     let line = why.line();
@@ -242,7 +227,6 @@ fn report_refused(why: &Refused) {
 
 /// Report an `RLX_WORKERS` value that is not a width. Reached from [`resolved`]
 /// and, for a value set after the pool exists, [`ensure_pool`].
-#[cfg(not(target_arch = "wasm32"))]
 fn report_unusable(raw: &str, effective: usize) {
     report_refused(&Refused::Unusable {
         raw: raw.to_string(),
@@ -251,9 +235,8 @@ fn report_unusable(raw: &str, effective: usize) {
 }
 
 /// Report that `requested` cannot take effect because the pool is already sized.
-/// No-op on wasm, and while the pool is still unclaimed — in that case the
-/// request is honoured when it is created.
-#[cfg(not(target_arch = "wasm32"))]
+/// No-op while the pool is still unclaimed — in that case the request is
+/// honoured when it is created.
 pub(crate) fn report_if_not_applied(requested: usize, source: &'static str) {
     let Some(state) = POOL.get() else {
         return;
@@ -289,7 +272,6 @@ pub(crate) fn report_if_not_applied(requested: usize, source: &'static str) {
 /// No-op while the pool is unclaimed, where the installed width is the one the
 /// pool is created at; when it is claimed the line names the width really in
 /// effect, not the installed one, which cannot have taken effect.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn report_replaced_request(request: usize, installed: usize) {
     let Some(state) = POOL.get() else {
         return;
@@ -301,47 +283,27 @@ pub(crate) fn report_replaced_request(request: usize, installed: usize) {
     });
 }
 
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn report_if_not_applied(_requested: usize, _source: &'static str) {}
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn report_replaced_request(_request: usize, _installed: usize) {}
-
 /// Worker width in effect in the process-wide pool RLX runs its CPU kernels on:
 /// the one number to reason about parallelism with. Resolves the pool once and
 /// then reports the width recorded then, so it never asks Rayon again — a process
 /// where Rayon could not build a pool degrades to serial instead of panicking on
-/// the unset global registry. Always 1 on wasm, where there is no pool.
-#[cfg(not(target_arch = "wasm32"))]
+/// the unset global registry.
 pub fn num_threads() -> usize {
     resolved().width
 }
 
-#[cfg(target_arch = "wasm32")]
-pub fn num_threads() -> usize {
-    1
-}
-
 /// Parallel `for i in 0..n` over an index range, one task per index.
-/// Serial on wasm (no thread pool). The closure must be `Sync + Send`
-/// because tasks may run on Rayon workers natively.
+/// The closure must be `Sync + Send` because tasks run on Rayon workers.
 #[inline]
 pub fn par_range<F: Fn(usize) + Sync + Send>(n: usize, f: F) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        (0..n).for_each(f);
+    // Do not let Rayon's default width win, and stay off `into_par_iter`
+    // when there is no usable pool — Rayon's unset global registry would
+    // panic. (`num_threads` resolves the pool.)
+    if num_threads() <= 1 {
+        (0..n).for_each(&f);
+        return;
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        // Do not let Rayon's default width win, and stay off `into_par_iter`
-        // when there is no usable pool — Rayon's unset global registry would
-        // panic. (`num_threads` resolves the pool.)
-        if num_threads() <= 1 {
-            (0..n).for_each(&f);
-            return;
-        }
-        (0..n).into_par_iter().for_each(f);
-    }
+    (0..n).into_par_iter().for_each(f);
 }
 
 /// Minimum elements *per worker* that make threading an element-wise kernel
@@ -381,7 +343,7 @@ pub fn outer_chunk(units: usize) -> usize {
 
 /// Parallel for: split `total` items across threads. `f(off, cnt)` is called once
 /// per chunk with disjoint regions; `min_per_thread` is the chunk floor that
-/// keeps the Rayon hand-off worth it. Serial on wasm.
+/// keeps the Rayon hand-off worth it.
 ///
 /// SAFETY: caller must ensure `f` accesses disjoint memory regions for different
 /// `(offset, count)` pairs.
@@ -390,32 +352,22 @@ pub fn par_for<F: Fn(usize, usize) + Sync>(total: usize, min_per_thread: usize, 
     if total == 0 {
         return;
     }
-    // wasm is single-threaded: run the whole range inline. (Rayon's
-    // work-stealing scheduler needs OS threads, which the browser lacks.)
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = min_per_thread;
+    let grain = min_per_thread.max(1);
+    let n_threads = (total / grain).max(1).min(num_threads());
+    if n_threads <= 1 {
         f(0, total);
+        return;
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let grain = min_per_thread.max(1);
-        let n_threads = (total / grain).max(1).min(num_threads());
-        if n_threads <= 1 {
-            f(0, total);
-            return;
+    // Pin BLAS to 1 before Rayon fan-out so a preceding huge MT GEMM
+    // cannot oversubscribe with worker-local sgemm / elementwise work.
+    crate::blas::ensure_blas_threads(1);
+    let chunk = total.div_ceil(n_threads);
+    (0..n_threads).into_par_iter().for_each(|t| {
+        let off = t * chunk;
+        if off < total {
+            f(off, (off + chunk).min(total) - off);
         }
-        // Pin BLAS to 1 before Rayon fan-out so a preceding huge MT GEMM
-        // cannot oversubscribe with worker-local sgemm / elementwise work.
-        crate::blas::ensure_blas_threads(1);
-        let chunk = total.div_ceil(n_threads);
-        (0..n_threads).into_par_iter().for_each(|t| {
-            let off = t * chunk;
-            if off < total {
-                f(off, (off + chunk).min(total) - off);
-            }
-        });
-    }
+    });
 }
 
 #[cfg(test)]
@@ -458,7 +410,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn each_refusal_names_both_widths() {
         assert_eq!(

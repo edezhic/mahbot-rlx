@@ -22,8 +22,7 @@ pub fn fusion_target_for(device: Device) -> FusionTarget {
         Device::Mlx => FusionTarget::Mlx,
         Device::Cuda => FusionTarget::Cuda,
         Device::Rocm => FusionTarget::Rocm,
-        Device::Gpu | Device::Vulkan | Device::WebGpu | Device::OneApi => FusionTarget::Wgpu,
-        Device::OpenGl => FusionTarget::Cpu,
+        Device::Gpu | Device::Vulkan | Device::OneApi => FusionTarget::Wgpu,
         Device::Tpu => FusionTarget::Tpu,
         // CoreML runs its own graph optimizer, so we want minimal RLX-side
         // fusion: the CPU fusion target only synthesizes Fused* ops the
@@ -50,9 +49,7 @@ pub fn fusion_target_for(device: Device) -> FusionTarget {
 /// `CompileOptions::fusion_opts` cannot narrow another device's fusion.
 pub fn region_kernel_activation_subs_for(device: Device) -> Option<&'static [u32]> {
     match device {
-        Device::Gpu | Device::WebGpu => {
-            Some(rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS)
-        }
+        Device::Gpu => Some(rlx_ir::region_encode::WGSL_REGION_KERNEL_ACTIVATION_SUBS),
         _ => None,
     }
 }
@@ -239,7 +236,6 @@ mod tests {
         });
         for (device, expected) in [
             (Device::Gpu, wgsl),
-            (Device::WebGpu, wgsl),
             (Device::Cpu, None),
             (Device::Metal, None),
             // Same `FusionTarget` as `Gpu`, different region engine.

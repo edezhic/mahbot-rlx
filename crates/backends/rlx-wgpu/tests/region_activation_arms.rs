@@ -31,8 +31,7 @@
 //! The device is `Device::Gpu` — the label that resolves to the wgpu backend, whose
 //! region kernel this is. `Device::Vulkan` is a different backend (`rlx-vulkan`,
 //! registered separately) that decomposes every region, so a check run on it would pass
-//! before this change and prove nothing; `Device::WebGpu` needs the separate `webgpu`
-//! feature.
+//! before this change and prove nothing.
 //!
 //! Tolerance policy, per activation: `Recip` is a division — the device's f32 is specified
 //! to a few units in the last place, never bit-exact — so it is compared under a relative

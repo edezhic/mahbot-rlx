@@ -35,13 +35,6 @@ struct SharedWeightBuffers {
     logical_bytes: usize,
 }
 
-// The browser WebGPU backend's `wgpu::Buffer` is `!Send` (holds an `Rc`), but
-// wasm is single-threaded so the shared static is never actually accessed from
-// another thread — assert `Send` there so it fits the `static Mutex`. On native
-// `wgpu::Buffer` is already `Send` (no impl needed / would conflict).
-#[cfg(target_arch = "wasm32")]
-unsafe impl Send for SharedWeightBuffers {}
-
 static SHARED_WEIGHTS: Mutex<Option<SharedWeightBuffers>> = Mutex::new(None);
 
 fn weight_layout_fingerprint(
@@ -949,8 +942,8 @@ pub struct ArenaBindSpec<'a> {
 
 /// High bit tagging a byte offset as living in [`Arena::weight_buffer`] rather
 /// than the main arena buffer. Real arena offsets are < 4 GiB, so a high bit is
-/// free. On 64-bit use bit 62; on 32-bit wasm (`usize` = 32 bits, `1 << 62`
-/// overflows) use bit 31 — browser WebGPU arenas are far below 2 GiB.
+/// free. On 64-bit use bit 62; on a 32-bit target (`usize` = 32 bits, `1 << 62`
+/// overflows) use bit 31 — a 32-bit arena is far below 2 GiB.
 #[cfg(target_pointer_width = "64")]
 pub const WEIGHT_BUF_TAG: usize = 1usize << 62;
 #[cfg(not(target_pointer_width = "64"))]
@@ -2695,68 +2688,6 @@ pub fn decode_mapped_readback_f32(
     drop(view);
     staging.unmap();
     outs
-}
-
-/// Dependency-free `map_async` await for wasm.
-///
-/// The browser is single-threaded and drives GPU completion via its event
-/// loop, so an `Rc<RefCell<…>>` oneshot is sufficient: the `map_async`
-/// callback fires from a microtask once the copy completes, stores the
-/// result, and wakes the awaiting task. No `device.poll` is needed (and it
-/// would be a no-op on the WebGPU backend anyway).
-#[cfg(target_arch = "wasm32")]
-pub mod wasm_async {
-    use std::cell::RefCell;
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::rc::Rc;
-    use std::task::{Context, Poll, Waker};
-
-    #[derive(Default)]
-    struct Shared {
-        result: Option<Result<(), wgpu::BufferAsyncError>>,
-        waker: Option<Waker>,
-    }
-
-    struct MapSignal(Rc<RefCell<Shared>>);
-
-    /// Future resolving when the mapped buffer is ready.
-    pub struct MapWait(Rc<RefCell<Shared>>);
-
-    impl MapSignal {
-        fn complete(self, r: Result<(), wgpu::BufferAsyncError>) {
-            let mut b = self.0.borrow_mut();
-            b.result = Some(r);
-            if let Some(w) = b.waker.take() {
-                w.wake();
-            }
-        }
-    }
-
-    impl Future for MapWait {
-        type Output = Result<(), wgpu::BufferAsyncError>;
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let mut b = self.0.borrow_mut();
-            match b.result.take() {
-                Some(r) => Poll::Ready(r),
-                None => {
-                    b.waker = Some(cx.waker().clone());
-                    Poll::Pending
-                }
-            }
-        }
-    }
-
-    /// Map `buffer[..len]` for read and return a future that resolves when the
-    /// GPU has finished. Call AFTER the copy into `buffer` has been submitted.
-    pub fn map_read_async(buffer: &wgpu::Buffer, len: usize) -> MapWait {
-        let shared = Rc::new(RefCell::new(Shared::default()));
-        let signal = MapSignal(shared.clone());
-        buffer
-            .slice(..len as u64)
-            .map_async(wgpu::MapMode::Read, move |r| signal.complete(r));
-        MapWait(shared)
-    }
 }
 
 /// Read one node via a reused staging buffer (one submit + one poll).

@@ -36,7 +36,7 @@ maturin develop --release \
 maturin develop --release \
   --features cpu,rocm
 
-# Cross-platform GPU only (Vulkan / DX12 / WebGPU via wgpu)
+# Cross-platform GPU only (Vulkan / DX12 via wgpu)
 maturin develop --release \
   --features cpu,gpu
 ```

@@ -234,7 +234,6 @@ fn gguf_matmul_bt_ex(
         return;
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     if allow_parallel
         && k.is_multiple_of(block_elems)
         && block_elems <= QK_K
@@ -297,10 +296,7 @@ const CACHED_BLAS_MIN_WEIGHT_ELEMS: usize = 32 * 32;
 /// keeps decode numerics independent of whether the f32 dequant cache happened
 /// to fit.
 ///
-/// Its only caller is the rayon arm of `gguf_matmul_bt_m1_parallel`, itself
-/// `cfg(not(wasm32))` — so gate it the same way as `dot256` above rather than
-/// let it warn as dead code on the wasm build.
-#[cfg(not(target_arch = "wasm32"))]
+/// Its only caller is the rayon arm of `gguf_matmul_bt_m1_parallel`.
 fn q4k_exact_gemv() -> bool {
     rlx_ir::env::flag("RLX_Q4K_EXACT_GEMV")
 }
@@ -545,7 +541,6 @@ fn gguf_grouped_matmul_bt_ex(
     } else if jobs.len() > 1 {
         // Parallelize over unique experts; serial fused GEMM per group so Rayon
         // is not nested. Batches tokens that share an expert (`count > 1`).
-        #[cfg(not(target_arch = "wasm32"))]
         {
             use rayon::prelude::*;
             let chunks: Vec<(usize, Vec<f32>)> = jobs
@@ -561,15 +556,6 @@ fn gguf_grouped_matmul_bt_ex(
             for (start, local) in chunks {
                 let count = local.len() / n;
                 packed_out[start * n..(start + count) * n].copy_from_slice(&local);
-            }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            for &(e, start, count) in &jobs {
-                let in_slice = &packed_in[start * k..(start + count) * k];
-                let w_slice = &w_bytes[e * slab_bytes..(e + 1) * slab_bytes];
-                let out_slice = &mut packed_out[start * n..(start + count) * n];
-                gguf_matmul_bt_serial(in_slice, w_slice, out_slice, count, k, n, scheme);
             }
         }
     } else {
@@ -746,10 +732,7 @@ fn gguf_matmul_bt_m1_sequential(
 
 /// 256-element dot with 4 independent accumulators.
 ///
-/// Both callers are the rayon-parallel `gguf_qk_kernels!` GEMV/GEMM, which are
-/// themselves `cfg(not(wasm32))` — so on wasm this is dead code. Gate it the
-/// same way rather than let it warn there.
-#[cfg(not(target_arch = "wasm32"))]
+/// Both callers are the rayon-parallel `gguf_qk_kernels!` GEMV/GEMM.
 #[inline(always)]
 fn dot256(xs: &[f32], blk: &[f32; QK_K]) -> f32 {
     let (mut a0, mut a1, mut a2, mut a3) = (0f32, 0f32, 0f32, 0f32);
@@ -768,7 +751,6 @@ macro_rules! gguf_qk_kernels {
     ($( $scheme:path => ($gemv:ident, $gemm:ident, $dq:path) ),+ $(,)?) => {
         $(
             /// Row-parallel GEMV (`m == 1`) specialized to one precision.
-            #[cfg(not(target_arch = "wasm32"))]
             fn $gemv(x_row: &[f32], w_bytes: &[u8], out: &mut [f32], k: usize, block_bytes: usize) {
                 use rayon::prelude::*;
                 let blocks_per_row = k / QK_K;
@@ -791,7 +773,6 @@ macro_rules! gguf_qk_kernels {
 
             /// Row-parallel GEMM (`m > 1`) specialized to one precision. Each block
             /// is dequantized ONCE and reused across all `m` rows.
-            #[cfg(not(target_arch = "wasm32"))]
             #[allow(clippy::too_many_arguments)]
             fn $gemm(
                 x: &[f32], w_bytes: &[u8], out: &mut [f32],
@@ -823,7 +804,6 @@ macro_rules! gguf_qk_kernels {
         )+
 
         /// Route to a specialized GEMV when one exists. `false` ⇒ caller falls back.
-        #[cfg(not(target_arch = "wasm32"))]
         fn gguf_gemv_specialized(
             scheme: QuantScheme, x_row: &[f32], w_bytes: &[u8], out: &mut [f32],
             k: usize, block_bytes: usize,
@@ -835,7 +815,6 @@ macro_rules! gguf_qk_kernels {
         }
 
         /// Route to a specialized GEMM when one exists. `false` ⇒ caller falls back.
-        #[cfg(not(target_arch = "wasm32"))]
         #[allow(clippy::too_many_arguments)]
         fn gguf_gemm_specialized(
             scheme: QuantScheme, x: &[f32], w_bytes: &[u8], out: &mut [f32],
@@ -874,7 +853,6 @@ gguf_qk_kernels! {
 /// so no division is needed at all. Rows are independent, so this parallelizes
 /// over `n` exactly like the Q4_K path, and the inner loop is a contiguous
 /// f32 dot the autovectorizer can handle.
-#[cfg(not(target_arch = "wasm32"))]
 fn gguf_matmul_bt_m1_rows_generic(
     x_row: &[f32],
     w_bytes: &[u8],
@@ -925,7 +903,6 @@ fn gguf_matmul_bt_m1_rows_generic(
 /// The point is to beat cached BLAS *when the dequant cache is thrashing*, where
 /// "cached" degenerates into re-dequantizing the whole model per call plus
 /// allocator churn. With a healthy cache, BLAS still wins and callers keep it.
-#[cfg(not(target_arch = "wasm32"))]
 fn gguf_matmul_bt_rows_generic_gemm(
     x: &[f32],
     w_bytes: &[u8],
@@ -1002,7 +979,6 @@ fn gguf_matmul_bt_m1_parallel(
     }
     if scheme == QuantScheme::GgufQ4K && k.is_multiple_of(QK_K) && block_elems == QK_K {
         // Independent output rows — no n-wide partial reduction.
-        #[cfg(not(target_arch = "wasm32"))]
         {
             use rayon::prelude::*;
             let blocks_per_row = k / QK_K;
@@ -1026,40 +1002,13 @@ fn gguf_matmul_bt_m1_parallel(
             });
             return;
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            q4k_gemv_rowmajor(x_row, w_bytes, out, k);
-            return;
-        }
     }
     // Every other scheme (Q5_K / Q6_K / Q2_K / Q3_K / Q8_0 / IQ*): row-parallel,
     // division-free generic GEMV whenever `k` is a whole number of blocks.
-    #[cfg(not(target_arch = "wasm32"))]
     if k.is_multiple_of(block_elems) && block_elems <= QK_K && out.len() == n {
         gguf_matmul_bt_m1_rows_generic(x_row, w_bytes, out, k, scheme, block_bytes, block_elems);
         return;
     }
-    // wasm: single-threaded serial accumulate (no Rayon thread pool).
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = n;
-        for v in out.iter_mut() {
-            *v = 0.0;
-        }
-        let mut block_f32 = [0f32; QK_K];
-        for bi in 0..num_blocks {
-            let off = bi * block_bytes;
-            dequant_block(scheme, &w_bytes[off..off + block_bytes], &mut block_f32);
-            let idx0 = bi * block_elems;
-            for t in 0..block_elems {
-                let idx = idx0 + t;
-                let j = idx / k;
-                let p = idx % k;
-                out[j] += x_row[p] * block_f32[t];
-            }
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
     {
         use rayon::prelude::*;
 
@@ -1138,18 +1087,11 @@ fn q4k_exact_gemv_rows(x_row: &[f32], w_bytes: &[u8], out: &mut [f32], k: usize)
     let row_bytes = blocks_per_row * rlx_gguf::Q4K_BLOCK_BYTES;
     debug_assert!(w_bytes.len() >= out.len() * row_bytes);
     let row = |j: usize| &w_bytes[j * row_bytes..(j + 1) * row_bytes];
-    #[cfg(not(target_arch = "wasm32"))]
     {
         use rayon::prelude::*;
         out.par_iter_mut()
             .enumerate()
             .for_each(|(j, slot)| *slot = q4k_exact_row_dot(x_row, row(j), blocks_per_row));
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        for (j, slot) in out.iter_mut().enumerate() {
-            *slot = q4k_exact_row_dot(x_row, row(j), blocks_per_row);
-        }
     }
 }
 
@@ -1541,20 +1483,12 @@ fn q2_0_gemv_parallel(x: &[f32], w_bytes: &[u8], out: &mut [f32], k: usize) {
     let mut x_q8 = vec![0u8; blocks_per_row * Q8_0_G128_BYTES];
     rlx_gguf::q2_dequant::quantize_q8_0_g128_row(&x[..k], &mut x_q8);
 
-    #[cfg(not(target_arch = "wasm32"))]
     {
         use rayon::prelude::*;
         out.par_iter_mut().enumerate().for_each(|(j, slot)| {
             let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
             *slot = q2_0_dot_row_q8(row, &x_q8, blocks_per_row);
         });
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        for (j, slot) in out.iter_mut().enumerate() {
-            let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
-            *slot = q2_0_dot_row_q8(row, &x_q8, blocks_per_row);
-        }
     }
 }
 

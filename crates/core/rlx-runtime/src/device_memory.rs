@@ -44,14 +44,13 @@ use rlx_driver::Device;
 /// not a per-allocation cap, which is a separate figure.
 ///
 /// **Which devices answer.** Those that place work on the Apple GPU —
-/// [`Device::Gpu`] (wgpu-on-Metal) and [`Device::WebGpu`], its label for that
-/// same backend, [`Device::Metal`], [`Device::Mlx`], and [`Device::Vulkan`]
-/// through MoltenVK. All answer with this one figure rather than with their own
-/// readings, so they cannot disagree about a host. Its source is the platform's
-/// default GPU — the same device the Metal backend and MLX read — which a
-/// graphics API on a multi-GPU host may not pick. Every other device answers
-/// `None`: the neural engine is a separate accelerator with its own budget, an
-/// external GPU a different physical device.
+/// [`Device::Gpu`] (wgpu-on-Metal), [`Device::Metal`], [`Device::Mlx`], and
+/// [`Device::Vulkan`] through MoltenVK. All answer with this one figure rather
+/// than with their own readings, so they cannot disagree about a host. Its
+/// source is the platform's default GPU — the same device the Metal backend and
+/// MLX read — which a graphics API on a multi-GPU host may not pick. Every other
+/// device answers `None`: the neural engine is a separate accelerator with its
+/// own budget, an external GPU a different physical device.
 ///
 /// **Absence.** `None` on non-Apple targets, on watchOS, and on an Apple host
 /// with no Metal device — never `0`, this tree's in-band "unknown VRAM" that
@@ -66,9 +65,7 @@ use rlx_driver::Device;
 /// ```
 pub fn device_working_set_bytes(device: Device) -> Option<u64> {
     match device {
-        Device::Gpu | Device::WebGpu | Device::Metal | Device::Mlx | Device::Vulkan => {
-            ceiling(platform_reading())
-        }
+        Device::Gpu | Device::Metal | Device::Mlx | Device::Vulkan => ceiling(platform_reading()),
         _ => None,
     }
 }
@@ -211,7 +208,7 @@ mod tests {
             soft_memory_budget_bytes(),
             available_unified_memory(),
         );
-        for device in [Device::WebGpu, Device::Metal, Device::Mlx, Device::Vulkan] {
+        for device in [Device::Metal, Device::Mlx, Device::Vulkan] {
             assert_eq!(device_working_set_bytes(device), reading, "{device:?}");
         }
         if let (Some(bytes), Some(ram)) = (reading, available_unified_memory()) {

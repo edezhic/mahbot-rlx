@@ -10,11 +10,12 @@
 //! platform-dependent in the worst way:
 //!
 //! * **naga → Metal** accepts it, so native wgpu tests pass.
-//! * **Dawn (every browser)** rejects the whole shader module: *"'workgroupBarrier'
+//! * **Dawn (a WebGPU implementation)** rejects the whole shader module: *"'workgroupBarrier'
 //!   must only be called from uniform control flow"*. Every pipeline built from
-//!   it is invalid, every dispatch fails, and `run_async` still resolves — so a
-//!   browser rank reported `webgpu`, trained on a loss of exactly 0.0000 and
-//!   poisoned a cluster's gradient average. No panic, no error, just zeros.
+//!   it is invalid, every dispatch fails, and the browser entry point of the day
+//!   (`run_async`) resolved — so a browser rank reported `webgpu`, trained on a
+//!   loss of exactly 0.0000 and poisoned a cluster's gradient average. No panic,
+//!   no error, just zeros.
 //! * **FXC (DirectX)** rejects it as X4026, which is why `matmul.wgsl` already
 //!   carries the fix and the comment explaining it.
 //!

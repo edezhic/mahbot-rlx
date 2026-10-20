@@ -166,18 +166,6 @@ impl CompiledGraph {
         self.device
     }
 
-    /// Set a named parameter (model weight).
-    /// Call once per parameter after compilation.
-    /// True when this executable's wgpu schedule contains host-executed steps,
-    /// which the browser WebGPU path refuses (it cannot block to run them).
-    ///
-    /// Compile succeeds for such a graph and only `run_async` fails, so without
-    /// this a caller learns about it once per step rather than once at setup.
-    #[cfg(target_arch = "wasm32")]
-    pub fn requires_host_execution(&self) -> bool {
-        self.inner.wgpu_requires_host()
-    }
-
     /// One line naming the host-executed steps in this graph's schedule, how
     /// many sync points they cost, and how many are independent — `None` when
     /// it runs entirely on the device.
@@ -185,6 +173,8 @@ impl CompiledGraph {
         self.inner.wgpu_host_summary()
     }
 
+    /// Set a named parameter (model weight).
+    /// Call once per parameter after compilation.
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
         // A narrower-than-f32 weight needs converting, not reinterpreting:
         // `set_param` writes the bytes as given, and 4 bytes of f32 read as two
@@ -258,16 +248,6 @@ impl CompiledGraph {
             .into_iter()
             .map(|(bytes, dt)| crate::backend::widen_bytes_to_f32(&bytes, dt))
             .collect()
-    }
-
-    /// Async WebGPU execution on wasm (non-blocking GPU→CPU readback).
-    /// WebGL and CPU backends fall back to synchronous [`Self::run`].
-    #[cfg(target_arch = "wasm32")]
-    pub async fn run_async(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>, String> {
-        match self.device {
-            Device::WebGpu | Device::Gpu => self.inner.wgpu_run_async(inputs).await,
-            _ => Ok(self.run(inputs)),
-        }
     }
 
     /// Run and read back only selected outputs (logits-only decode on MLX).

@@ -87,14 +87,10 @@ impl ExecutableGraph for WgpuExecutableWrapper {
             // row read (`read_output_row`, the one-submission staging read the
             // wrapper forwards). Without it a decode step re-uploads the
             // O(context) past KV and pays one readback per row instead of one for
-            // the step's rows. A browser cannot complete that read — the map it
-            // waits on never finishes — so the capability is not claimed there:
-            // advertising it beside a read that answers `None` is the "three of
-            // four methods" shape upstream's contract test exists to reject. Both
-            // capability tests hold the halves honest through
-            // `skip_unless_available`, which reports a skip unless
+            // the step's rows. Both capability tests hold the halves honest
+            // through `skip_unless_available`, which reports a skip unless
             // `RLX_REQUIRE_DEVICE=1`; the GPU recipes set it.
-            kv_resident: !cfg!(target_arch = "wasm32"),
+            kv_resident: true,
             typed_io: true,
             active_extent: true,
             ..crate::ExecutableCapabilities::NONE
@@ -267,37 +263,8 @@ impl ExecutableGraph for WgpuExecutableWrapper {
         })
     }
 
-    #[cfg(target_arch = "wasm32")]
-    fn wgpu_requires_host(&self) -> bool {
-        self.inner.requires_host_execution()
-    }
-
     fn wgpu_host_summary(&self) -> Option<String> {
         self.inner.host_summary()
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn wgpu_run_async<'a>(
-        &'a mut self,
-        inputs: &'a [(&'a str, &'a [f32])],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>, String>> + 'a>>
-    {
-        if self.inner.requires_host_execution() {
-            // Name what is in the way rather than listing what it might have
-            // been: a conv graph's answer is one `Conv2dHost` per convolution,
-            // which tells a caller whether to change backend or change model.
-            let detail = self
-                .inner
-                .host_summary()
-                .unwrap_or_else(|| "host-executed steps".to_string());
-            return Box::pin(async move {
-                Err(format!(
-                    "WebGPU wasm cannot run this graph — {detail}. Use WebGL (if the \
-                     graph trains there) or CPU."
-                ))
-            });
-        }
-        Box::pin(async move { Ok(self.inner.run_async(inputs).await) })
     }
 }
 

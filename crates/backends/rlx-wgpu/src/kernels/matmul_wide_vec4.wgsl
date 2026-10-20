@@ -33,9 +33,10 @@
 // cooperative kernel where its alignment admits it — see `conv_gemm` — which
 // leaves these tiles to the shapes the cooperative alignment refuses.)
 //
-// This is the path a BROWSER gets: WebGPU has no cooperative-matrix extension,
-// so `matmul_coop_*` is unreachable there, and it is also the fallback on any
-// adapter lacking EXPERIMENTAL_COOPERATIVE_MATRIX or failing coop alignment.
+// This is the path an adapter without the cooperative-matrix extension gets:
+// `matmul_coop_*` needs EXPERIMENTAL_COOPERATIVE_MATRIX and a shape the coop
+// alignment admits, so this tile kernel is the fallback wherever either
+// refuses.
 //
 // Accumulation order over k is unchanged (0..K-1, sequential), so results stay
 // bit-identical to `matmul_wide` — `tests/matmul_vec4_parity.rs` asserts it.

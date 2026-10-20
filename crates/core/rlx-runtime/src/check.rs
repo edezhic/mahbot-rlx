@@ -279,7 +279,7 @@ pub fn parse_backend(s: &str) -> Option<FusionTarget> {
         "cpu" => Some(FusionTarget::Cpu),
         "metal" | "mps" | "mtl" => Some(FusionTarget::Metal),
         "mlx" => Some(FusionTarget::Mlx),
-        "wgpu" | "gpu" | "webgpu" => Some(FusionTarget::Wgpu),
+        "wgpu" | "gpu" => Some(FusionTarget::Wgpu),
         "cuda" | "nvidia" => Some(FusionTarget::Cuda),
         "rocm" | "hip" | "amd" => Some(FusionTarget::Rocm),
         "tpu" => Some(FusionTarget::Tpu),

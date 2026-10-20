@@ -31,7 +31,7 @@ use crate::cpu_low_precision;
 /// including the E-cores — and the CPU backend's tuned default could no longer
 /// take effect. The callers are about to create the pool anyway, so this only
 /// decides its width; `rlx_cpu::pool::ensure_pool` is a no-op without the `cpu`
-/// feature and on wasm.
+/// feature.
 ///
 /// The pool is process-wide, so this is CPU policy on a shared path:
 /// [`widen_bytes_to_f32`] serves every backend with an f32-uniform arena, so a
@@ -917,35 +917,14 @@ pub trait ExecutableGraph: Send {
             .collect()
     }
 
-    /// True when the lowered wgpu schedule contains host-executed steps
-    /// (unsupported on browser WebGPU). Default: false.
-    #[cfg(target_arch = "wasm32")]
-    fn wgpu_requires_host(&self) -> bool {
-        false
-    }
-
     /// One line naming the host-executed steps in this executable's schedule,
     /// how many sync points they cost, and how many are independent — or
     /// `None` when it runs entirely on the device.
     ///
-    /// Ungated, unlike `wgpu_requires_host` (wasm only): the same information is
-    /// what a native caller needs to decide whether a graph is worth moving to
-    /// this backend at all.
+    /// What a caller needs to decide whether a graph is worth moving to this
+    /// backend at all.
     fn wgpu_host_summary(&self) -> Option<String> {
         None
-    }
-
-    /// Async WebGPU execution for wasm (non-blocking readback). Default: error.
-    ///
-    /// Futures are **not** `Send` on wasm — WebGPU buffer mapping uses
-    /// `Rc`/`RefCell` and browser callbacks that are single-threaded.
-    #[cfg(target_arch = "wasm32")]
-    fn wgpu_run_async<'a>(
-        &'a mut self,
-        _inputs: &'a [(&'a str, &'a [f32])],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Vec<f32>>, String>> + 'a>>
-    {
-        Box::pin(async move { Err("wgpu_run_async not implemented for this backend".into()) })
     }
 }
 
@@ -1123,9 +1102,6 @@ pub mod cpu_backend;
 
 #[cfg(feature = "gpu")]
 pub mod wgpu_backend;
-
-#[cfg(feature = "opengl")]
-pub mod webgl_backend;
 
 #[cfg(feature = "vulkan")]
 pub mod vulkan_backend;

@@ -20,10 +20,7 @@
 //! Falls back to `Instant` on non-AArch64 / non-Apple targets so the API
 //! stays portable.
 
-#[cfg(all(
-    not(all(target_arch = "aarch64", target_vendor = "apple")),
-    not(target_arch = "wasm32")
-))]
+#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
 use std::time::Instant;
 
 /// Opaque tick reading. Subtract two of these to get a `Duration`.
@@ -31,11 +28,7 @@ use std::time::Instant;
 pub struct Tick {
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     cycles: u64,
-    // wasm32 carries no field: the tick is a no-op (see `now`/`elapsed_ns`).
-    #[cfg(all(
-        not(all(target_arch = "aarch64", target_vendor = "apple")),
-        not(target_arch = "wasm32")
-    ))]
+    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
     instant: Instant,
 }
 
@@ -49,17 +42,7 @@ impl Tick {
                 cycles: read_cntvct(),
             }
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // `std::time::Instant` panics on wasm32-unknown-unknown, and a real
-            // clock here would mean a JS `performance.now()` binding. Until one
-            // exists the tick reads nothing and `elapsed_ns` reports 0.
-            Tick {}
-        }
-        #[cfg(all(
-            not(all(target_arch = "aarch64", target_vendor = "apple")),
-            not(target_arch = "wasm32")
-        ))]
+        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
         {
             Tick {
                 instant: Instant::now(),
@@ -79,15 +62,7 @@ impl Tick {
             let freq = cntfrq_hz();
             ((dt as u128) * 1_000_000_000u128 / freq as u128) as u64
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = start;
-            0
-        }
-        #[cfg(all(
-            not(all(target_arch = "aarch64", target_vendor = "apple")),
-            not(target_arch = "wasm32")
-        ))]
+        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
         {
             self.instant.duration_since(start.instant).as_nanos() as u64
         }

@@ -364,9 +364,6 @@ test-gpu:
     JOBS=$(( CPUS < 4 ? CPUS : 4 ))
     # A backend that skips for want of a device must not report `ok` here.
     export RLX_REQUIRE_DEVICE="{{require_device}}"
-    # rlx-web's device-dependent gate: the schedule a browser rank would get,
-    # lowered natively, where the adapter it needs is the one this recipe asserts.
-    cargo test --release -p rlx-web --features webgpu --test webgpu_trainable_models -j "$JOBS"
     case "$(uname -s)" in
       Darwin)
         cargo test --release -p rlx-metal --features backend-tests -j "$JOBS"
@@ -731,44 +728,20 @@ license-headers:
 new-op NAME *ARGS:
     python3 scripts/new-op.py {{NAME}} {{ARGS}}
 
-# Assemble the tab-cluster demo as a standalone static site, deployable to any
-# static host with no backend. Files are discovered from the page's real
-# dependency graph and the result self-checks, so a missed reference fails here
-# instead of in a browser.
-build-cluster-site out="examples/tab-cluster":
-    python3 crates/bindings/rlx-web/tools/build_site.py --out {{out}}
-
-# Cross-compile gate: the CPU + WebGPU stack must build for the browser
-# (wasm32-unknown-unknown). Compile-only — running models in a browser is
-# done via `just serve-web`.
-check-wasm:
-    rustup target add wasm32-unknown-unknown
-    cargo check -p rlx-cpu -p rlx-wgpu -p rlx-webgl --target wasm32-unknown-unknown
-    cargo check -p rlx-web --target wasm32-unknown-unknown
-    cargo check -p rlx-web --target wasm32-unknown-unknown --features webgpu,webgl
-    # rlx-webgl's planner + CPU executor are verified natively against autodiff.
-    cargo test -p rlx-webgl --features backend-tests
-    # No WGSL kernel may return from non-uniform control flow before a barrier:
-    # naga/Metal accepts it, every browser's Dawn rejects the shader, and the
-    # backend then computes zeros without erroring.
+# Device-free WGSL gate: no kernel may reach a `workgroupBarrier()` from
+# non-uniform control flow. naga → Metal/Vulkan accepts that shape, so a native
+# run on those adapters passes even though the barrier is non-uniform; FXC (the
+# DX12 target) rejects the whole entry point as X4026. Device-free by
+# construction: it reads the shipped WGSL, it does not dispatch it.
+check-wgsl-uniform:
     cargo test -p rlx-wgpu --features backend-tests --test wgsl_uniform_control_flow
-    # The tab cluster's rank math (sharded gradients average to the full batch).
-    cargo test -p rlx-web --lib cluster
-    # The tab cluster's coordination protocol, in Node against a stub rank: its
-    # failure modes (split brain, a stale joiner, a cohort stalled on a stopped
-    # tab) all produce plausible-looking training rather than an error.
-    # Skipped rather than failed where node is absent: `just ci` runs on
-    # machines that have no business installing a JS runtime.
-    # The bus test covers the transport path end to end except WebRTC itself:
-    # the wire format at every header alignment, real transfer semantics, and a
-    # cohort training through the encoded proxy hop.
-    command -v node >/dev/null 2>&1 \
-      && node --test crates/bindings/rlx-web/tests/cluster_protocol.test.mjs \
-                     crates/bindings/rlx-web/tests/cluster_bus.test.mjs \
-                     crates/bindings/rlx-web/tests/cluster_mesh.test.mjs \
-                     crates/bindings/rlx-web/tests/cluster_qr.test.mjs \
-                     crates/bindings/rlx-web/tests/cluster_highlight.test.mjs \
-      || echo 'node not found — skipping tab-cluster protocol tests'
+
+# No crate this fork builds may carry a wasm conditional or a wasm-only
+# dependency: the backend targets Metal, Vulkan and DX12 and is never built for
+# WebAssembly. Matches code shapes only (see scripts/check-no-wasm.py), so prose
+# that mentions the word is not a failure.
+check-no-wasm:
+    python3 scripts/check-no-wasm.py
 
 # Cross-compile gate: the Apple on-device stack must build for every Apple
 # platform, device *and* simulator. The native backends are rlx-cpu
@@ -1022,27 +995,12 @@ android-build *ARGS:
 android-e2e *ARGS:
     {{justfile_directory()}}/android/e2e.sh {{ARGS}}
 
-# Build the browser bundle (wasm + JS bindings) into crates/bindings/rlx-web/web/pkg.
-# Add `--webgpu` to also bring up a WebGPU device. One command, all platforms.
-build-web *ARGS:
-    python3 crates/bindings/rlx-web/build.py {{ARGS}}
-
-# Build + serve the demo at http://localhost:8000 (Ctrl-C to stop).
-# `--serve-with npx` uses `npx serve`; `miniserve` / `basic-http-server` need
-# `cargo install miniserve` or `cargo install basic-http-server`.
-serve-web *ARGS:
-    python3 crates/bindings/rlx-web/build.py --serve {{ARGS}}
-
-# Serve only (no wasm rebuild). Requires `just build-web` first.
-serve-web-static BACKEND="python" PORT="8000":
-    python3 crates/bindings/rlx-web/serve.py --backend {{BACKEND}} --port {{PORT}}
-
 # Verbose run — exposes [rlx] / [ktrace] log lines.
 run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
 # Quick basic test of the workspace: build + test + lint + fast smokes.
-ci: build test fmt-check lint check-rlx-env-vars check-example-names check-doc-links check-rustdoc check-license-headers check-corpus check-wasm test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
+ci: build test fmt-check lint check-rlx-env-vars check-example-names check-doc-links check-rustdoc check-license-headers check-corpus check-wgsl-uniform check-no-wasm test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
 
 # ROCm compile check + graph_devices parity (tests skip when HIP unavailable).
 #
@@ -1126,7 +1084,7 @@ micro-all:
 # ── rlx-wgpu portability validation ─────────────────────────────────
 #
 # macOS only ever exercises wgpu's Metal backend and wgpu-native's WGSL
-# superset. These three targets cover the other surfaces the crate ships to.
+# superset. This target covers the other surface the crate ships to.
 
 # Builds for the host arch, so it runs native (not emulated) on Apple silicon.
 # Found the zero-extent Expand divide-by-zero that Metal cannot reach.
@@ -1138,21 +1096,6 @@ test-wgpu-linux:
         -v rlx-vk-target:/target \
         rlx-wgpu-vk \
         cargo test -p rlx-wgpu --features backend-tests --tests --no-fail-fast -- --test-threads=1
-
-# Checks the browser-reachable kernels compute correctly there, AND that the
-# cooperative-matrix kernels are rejected — `enable wgpu_cooperative_matrix`
-# is wgpu-native-only and must never reach a browser.
-# Run the shipped WGSL through a spec-compliant WebGPU host (Deno).
-test-wgpu-webgpu:
-    deno run --unstable-webgpu --allow-read \
-        {{justfile_directory()}}/crates/backends/rlx-wgpu/webgpu/validate.js
-
-# Confirm the browser crate still builds for wasm with the WebGPU path on.
-build-wasm-webgpu:
-    cargo build --target wasm32-unknown-unknown -p rlx-web --features webgpu
-
-# All three portability surfaces: WebGPU spec, wasm build, Linux Vulkan.
-test-wgpu-portability: test-wgpu-webgpu build-wasm-webgpu test-wgpu-linux
 
 # Portability gate for the CPU backend: ONE binary has to run on the AVX-512
 # host or M4 that built it *and* on an Atom box or a Raspberry Pi. That only

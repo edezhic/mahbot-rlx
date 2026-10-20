@@ -50,16 +50,12 @@ pub enum Device {
     Hexagon,
 
     // ── Cross-platform GPU ──────────────────────────────────
-    /// Portable GPU via wgpu (Metal/Vulkan/DX12/WebGPU).
+    /// Portable GPU via wgpu (Metal/Vulkan/DX12).
     Gpu,
     /// Vulkan compute shaders.
     Vulkan,
-    /// OpenGL compute shaders (legacy).
-    OpenGl,
     /// DirectX 12 compute (Windows).
     DirectX,
-    /// WebGPU (WASM target).
-    WebGpu,
 }
 
 impl Device {
@@ -82,9 +78,7 @@ impl Device {
             Device::Hexagon => "Hexagon NPU",
             Device::Gpu => "GPU (wgpu)",
             Device::Vulkan => "Vulkan",
-            Device::OpenGl => "OpenGL",
             Device::DirectX => "DirectX 12",
-            Device::WebGpu => "WebGPU",
         }
     }
 
@@ -107,9 +101,7 @@ impl Device {
             Device::Hexagon => "hexagon",
             Device::Gpu => "gpu",
             Device::Vulkan => "vulkan",
-            Device::OpenGl => "opengl",
             Device::DirectX => "directx",
-            Device::WebGpu => "webgpu",
         }
     }
 
@@ -131,9 +123,7 @@ impl Device {
             Device::Hexagon,
             Device::Gpu,
             Device::Vulkan,
-            Device::OpenGl,
             Device::DirectX,
-            Device::WebGpu,
         ]
     }
 }
@@ -153,7 +143,7 @@ impl std::fmt::Display for DeviceFromStrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unknown device '{}' (try: cpu, metal, mlx, ane, cuda, rocm, xdna, egpu, oneapi, gpu, vulkan, opengl, directx, webgpu, tpu)",
+            "unknown device '{}' (try: cpu, metal, mlx, ane, cuda, rocm, xdna, egpu, oneapi, gpu, vulkan, directx, tpu)",
             self.0
         )
     }
@@ -178,9 +168,7 @@ impl std::str::FromStr for Device {
             "oneapi" | "levelzero" | "level-zero" | "l0" | "intel" | "sycl" => Device::OneApi,
             "gpu" | "wgpu" => Device::Gpu,
             "vulkan" | "vk" => Device::Vulkan,
-            "opengl" | "gl" => Device::OpenGl,
             "directx" | "dx12" | "d3d12" => Device::DirectX,
-            "webgpu" => Device::WebGpu,
             "tpu" => Device::Tpu,
             "hexagon" | "htp" | "qnn" => Device::Hexagon,
             _ => return Err(DeviceFromStrError(s.to_string())),

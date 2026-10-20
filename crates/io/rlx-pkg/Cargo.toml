@@ -46,12 +46,6 @@ chacha20poly1305 = { version = "0.10", optional = true }
 argon2 = { version = "0.5", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 ureq = { version = "2", optional = true, default-features = true }
-
-# zstd is C-backed and cannot build for wasm32 (amd64 asm). The browser path
-# loads uncompressed / hot-tier packages, so the compressed-tier codec is
-# non-wasm; the call sites `cfg`-error on wasm (see tier.rs). Keeps rlx-web's
-# WebGPU wasm build compiling.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = "0.13"
 
 [dev-dependencies]

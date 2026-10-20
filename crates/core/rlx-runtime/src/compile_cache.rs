@@ -393,7 +393,6 @@ fn device_has_discrete_vram(dev: Device) -> bool {
             | Device::Rocm
             | Device::OneApi
             | Device::DirectX
-            | Device::WebGpu
     )
 }
 

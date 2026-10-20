@@ -106,7 +106,7 @@ and `anyhow::Error` — the whole stack returns those.
 | `cpu` *(default)*   | NEON / AVX + Accelerate / OpenBLAS   | every host                |
 | `metal`             | Metal Performance Shaders + MSL      | macOS (Apple Silicon)     |
 | `mlx`               | Apple MLX (vendored)                 | macOS (Apple Silicon)     |
-| `gpu`               | wgpu (Vulkan / DX12 / WebGPU / Metal)| cross-platform            |
+| `gpu`               | wgpu (Vulkan / DX12 / Metal)         | cross-platform            |
 | `cuda`              | cuBLAS / cuDNN / NVRTC               | Linux / Windows + NVIDIA  |
 | `rocm`              | hipBLAS / MIOpen                     | Linux + AMD               |
 | `tpu`               | libtpu PJRT plugin                   | Linux + GCP TPU           |

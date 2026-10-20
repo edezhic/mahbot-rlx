@@ -10,15 +10,11 @@
 //! separate `rlx-vulkan` (ash/SPIR-V) backend.
 
 use std::sync::OnceLock;
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU8, Ordering};
 
-#[cfg(not(target_arch = "wasm32"))]
 const PREF_DEFAULT: u8 = 0;
-#[cfg(not(target_arch = "wasm32"))]
 const PREF_VULKAN: u8 = 1;
 
-#[cfg(not(target_arch = "wasm32"))]
 static BACKEND_PREF: AtomicU8 = AtomicU8::new(PREF_DEFAULT);
 
 /// Detected wgpu adapter + device. We hold them together because
@@ -34,8 +30,6 @@ pub struct WgpuDevice {
 }
 
 /// Pick the subset of adapter features we want to enable on the device.
-/// Shared by the native (blocking) and wasm (async) constructors so the
-/// capability policy stays in one place.
 fn required_features_for(adapter: &wgpu::Adapter) -> wgpu::Features {
     let adapter_feats = adapter.features();
     let mut required_features = wgpu::Features::empty();
@@ -51,9 +45,7 @@ fn required_features_for(adapter: &wgpu::Adapter) -> wgpu::Features {
     // The run report's device-time view asks for pass timestamps, so the device
     // has to carry the capability even on runs that never print one — a
     // capability is not a behaviour, and asking for one the adapter does not
-    // advertise is fatal here. The browser build gets no clock to read, so it is
-    // never asked for there.
-    #[cfg(not(target_arch = "wasm32"))]
+    // advertise is fatal here.
     if adapter_feats.contains(wgpu::Features::TIMESTAMP_QUERY) {
         required_features |= wgpu::Features::TIMESTAMP_QUERY;
     }
@@ -102,8 +94,7 @@ fn device_descriptor(
 }
 
 impl WgpuDevice {
-    /// Native: block on adapter + device discovery via `pollster`.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Block on adapter + device discovery via `pollster`.
     fn new_with_backends(backends: wgpu::Backends) -> Option<Self> {
         let instance = make_instance(backends);
         let adapter = pollster::block_on(instance.request_adapter(&ADAPTER_OPTIONS)).ok()?;
@@ -159,40 +150,11 @@ impl WgpuDevice {
         })
     }
 
-    /// WASM: the browser cannot block its event loop, so adapter + device
-    /// discovery is genuinely async — callers `.await` [`init_wgpu_device`]
-    /// once at startup, after which [`wgpu_device`] returns synchronously.
-    #[cfg(target_arch = "wasm32")]
-    async fn new_with_backends_async(backends: wgpu::Backends) -> Option<Self> {
-        let instance = make_instance(backends);
-        let adapter = instance.request_adapter(&ADAPTER_OPTIONS).await.ok()?;
-
-        let info = adapter.get_info();
-        let limits = adapter.limits();
-        let required_features = required_features_for(&adapter);
-
-        let (device, queue) = adapter
-            .request_device(&device_descriptor(required_features, limits))
-            .await
-            .ok()?;
-
-        Some(Self {
-            instance,
-            adapter,
-            device,
-            queue,
-            name: info.name,
-            backend: info.backend,
-        })
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
     fn new_default() -> Option<Self> {
         Self::new_with_backends(default_backends())
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn default_backends() -> wgpu::Backends {
     if let Some(b) = wgpu::Backends::from_env() {
         return b;
@@ -226,13 +188,11 @@ fn default_backends() -> wgpu::Backends {
 unsafe impl Send for WgpuDevice {}
 unsafe impl Sync for WgpuDevice {}
 
-#[cfg(not(target_arch = "wasm32"))]
 fn default_device() -> Option<&'static WgpuDevice> {
     static DEVICE: OnceLock<Option<WgpuDevice>> = OnceLock::new();
     DEVICE.get_or_init(WgpuDevice::new_default).as_ref()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn vulkan_device() -> Option<&'static WgpuDevice> {
     static DEVICE: OnceLock<Option<WgpuDevice>> = OnceLock::new();
     DEVICE
@@ -243,66 +203,23 @@ fn vulkan_device() -> Option<&'static WgpuDevice> {
 /// Point this crate's own singleton at a Vulkan-only instance. Call before the
 /// first [`wgpu_device`] use in that process. Nothing in the runtime calls it:
 /// `Device::Vulkan` there is served by `rlx-vulkan`, not by this crate.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn select_vulkan_backend() {
     BACKEND_PREF.store(PREF_VULKAN, Ordering::SeqCst);
 }
 
-/// No Vulkan path in the browser — the only wasm adapter is WebGPU.
-#[cfg(target_arch = "wasm32")]
-pub fn select_vulkan_backend() {}
-
 /// True when a Vulkan adapter is reachable (MoltenVK on macOS, native on Linux/Windows).
-#[cfg(not(target_arch = "wasm32"))]
 pub fn is_vulkan_available() -> bool {
     vulkan_device().is_some()
 }
 
-/// No Vulkan in the browser.
-#[cfg(target_arch = "wasm32")]
-pub fn is_vulkan_available() -> bool {
-    false
-}
-
 /// Get or initialize the global wgpu device singleton. Returns None
 /// on systems with no compatible adapter.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn wgpu_device() -> Option<&'static WgpuDevice> {
     if BACKEND_PREF.load(Ordering::SeqCst) == PREF_VULKAN {
         vulkan_device()
     } else {
         default_device()
     }
-}
-
-// ── WASM device singleton ──────────────────────────────────────────────
-//
-// The browser cannot block on adapter/device discovery, so the singleton
-// is populated asynchronously by [`init_wgpu_device`] (called once at
-// startup from JS via `wasm-bindgen-futures`). After that completes,
-// [`wgpu_device`] returns the cached device synchronously, so the rest of
-// the (synchronous) backend is unchanged.
-#[cfg(target_arch = "wasm32")]
-static WASM_DEVICE: OnceLock<Option<WgpuDevice>> = OnceLock::new();
-
-/// Initialize the WebGPU device. Idempotent; returns `true` when a device
-/// is available. Must be awaited before any [`wgpu_device`] call on wasm.
-#[cfg(target_arch = "wasm32")]
-pub async fn init_wgpu_device() -> bool {
-    if let Some(slot) = WASM_DEVICE.get() {
-        return slot.is_some();
-    }
-    let dev = WgpuDevice::new_with_backends_async(wgpu::Backends::BROWSER_WEBGPU).await;
-    let available = dev.is_some();
-    let _ = WASM_DEVICE.set(dev);
-    available
-}
-
-/// Get the wgpu device. On wasm this returns `None` until
-/// [`init_wgpu_device`] has been awaited.
-#[cfg(target_arch = "wasm32")]
-pub fn wgpu_device() -> Option<&'static WgpuDevice> {
-    WASM_DEVICE.get().and_then(|d| d.as_ref())
 }
 
 /// Adapter name for calibration cache keys.

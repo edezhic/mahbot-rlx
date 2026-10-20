@@ -21,7 +21,7 @@
 // [..,M,K] × [..,K,N] (matched batch) via per-batch strides.
 //
 // Pure WGSL — no extensions, no subgroup ops; runs identically on
-// Metal/Vulkan/DX12/WebGPU.
+// Metal/Vulkan/DX12.
 
 struct Params {
     m: u32,

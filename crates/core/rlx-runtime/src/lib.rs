@@ -64,8 +64,6 @@ pub mod aot_cache;
 pub mod attn_mask;
 pub mod backend;
 pub mod backends_manifest;
-pub mod browser;
-pub mod browser_support;
 pub mod capabilities;
 pub mod check;
 pub mod compile_cache;
@@ -172,13 +170,6 @@ pub use aot_cache::{AotCache, AotCacheError};
 pub use arena_budget::{arena_budget, device_arena_limit, fit_batch, plan_arena_bytes};
 pub use backend::{Backend, ExecutableGraph, compile_hir, compile_module};
 pub use backends_manifest::BackendsManifest;
-pub use browser::{
-    BrowserCompiledGraph, BrowserError, BrowserSession, browser_block_reason, init_webgpu,
-    supports_browser_graph,
-};
-pub use browser_support::{
-    collective_block_reason, passes_browser_preflight, select_browser_device_for_graph,
-};
 pub use capabilities::ExecutableCapabilities;
 pub use compile_cache::{
     BucketedCompileCache, CacheRunInput, CompileCache, DynamicDimCompileCache, pad_rows, slice_rows,
@@ -198,13 +189,12 @@ pub use device_bench::{DeviceBenchResult, benchmark_devices, warm_all};
 #[cfg(feature = "apple")]
 pub use device_ext::available_apple_devices;
 pub use device_ext::{
-    BROWSER_DEVICE_PRIORITY, available_browser_devices, available_devices,
-    detected_unavailable_devices, devices_for, dispatch_report_for_device,
+    available_devices, detected_unavailable_devices, devices_for, dispatch_report_for_device,
     dispatch_report_for_device_with_options, fastest_device, feature_compiled,
     first_unsupported_op, first_unsupported_op_with_options, full_name, is_available,
     legalize_graph_for_device, legalize_graph_for_device_with_options,
-    legalize_graph_for_device_with_report, preferred_browser_device, supports, supports_graph,
-    supports_graph_with_options, supports_run_slots, trim_accelerator_arena_pool,
+    legalize_graph_for_device_with_report, supports, supports_graph, supports_graph_with_options,
+    supports_run_slots, trim_accelerator_arena_pool,
 };
 pub use device_memory::device_working_set_bytes;
 pub use device_parse::{ParseDeviceError, device_label, parse_device, parse_device_list};

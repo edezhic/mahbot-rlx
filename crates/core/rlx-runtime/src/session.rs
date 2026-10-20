@@ -279,8 +279,6 @@ fn feature_name(device: Device) -> &'static str {
         Device::Hexagon => "qnn",
         Device::Gpu => "gpu",
         Device::Vulkan => "vulkan",
-        Device::OpenGl => "opengl",
         Device::DirectX => "directx",
-        Device::WebGpu => "webgpu",
     }
 }

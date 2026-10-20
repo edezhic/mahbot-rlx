@@ -165,9 +165,9 @@ SKIPPED=(
 #
 # rlx-vulkan/rlx-oneapi/rlx-qnn/rlx-cerebras are backends that rlx-runtime
 # optionally depends on, so they ride in the backend tier (after rlx-cpu,
-# which rlx-vulkan/rlx-oneapi depend on). rlx-webgl (rlx-ir/rlx-autodiff/
-# rlx-compile) also lands there. rlx-web pulls in rlx-runtime AND rlx-webgl,
-# so it has to follow runtime — it sits alongside rlx-tensor.
+# which rlx-vulkan/rlx-oneapi depend on).
+# rlx-webgl and rlx-web are excluded from the workspace, so they are not
+# published and are therefore absent from TIERS.
 #
 # rlx-torch-import's [dependencies] are rlx-ir plus optional rlx-cpu,
 # rlx-runtime (the `runtime` default feature) and rlx-onnx-import (the `onnx`
@@ -210,10 +210,10 @@ TIERS=(
     "rlx-autodiff rlx-extend rlx-pkg"
     "rlx-compile"
     "rlx-opt"
-    "rlx-cpu rlx-gpu-host rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-webgl rlx-xdna rlx-egpu"
+    "rlx-cpu rlx-gpu-host rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-xdna rlx-egpu"
     "rlx-metal"
     "rlx-collectives rlx-runtime"
-    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-web rlx-check rlx-ffi rlx-distributed rlx-opscope rlx-peft"
+    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-check rlx-ffi rlx-distributed rlx-opscope rlx-peft"
     "rlx-sparse rlx-linalg rlx-umap rlx-vq rlx-text rlx-gguf-convert rlx-onnx-conformance rlx-geo rlx-bake"
     "rlx-onnx"
     "rlx-fdm rlx-lbm rlx-bench"
@@ -438,9 +438,15 @@ def parse_resolved_rlx_dev_deps(toml_path: Path) -> set[str]:
                 deps.add(name)
     return deps
 
+# Crates excluded from the workspace (native-only fork, upstream-owned): not
+# published, so the coverage check must not demand a tier for them.
+EXCLUDED = {"rlx-web", "rlx-webgl"}
+
 violations: list[str] = []
 for toml in sorted(root.glob("crates/*/rlx-*/Cargo.toml")) + [root / "crates/rlx/Cargo.toml"]:
     name = toml.parent.name
+    if name in EXCLUDED:
+        continue
     if name.endswith("-trainer"):
         continue
     if re.search(r"^publish\s*=\s*false", toml.read_text(), re.M):

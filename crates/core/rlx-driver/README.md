@@ -10,7 +10,7 @@ to any of them through a uniform interface.
 ## What's here
 
 - **`Device`** — `Cpu`, `Metal`, `Mlx`, `Ane`, `Cuda`, `Rocm`, `Tpu`,
-  `Gpu` (wgpu), `Vulkan`, `OpenGl`, `DirectX`, `WebGpu`, `Fpga`. Used
+  `Gpu` (wgpu), `Vulkan`, `DirectX`, `Fpga`. Used
   by the runtime to pick a backend and by tests to pin graphs to a
   specific path.
 - **`registry`** — process-global table of which `Device` variants have

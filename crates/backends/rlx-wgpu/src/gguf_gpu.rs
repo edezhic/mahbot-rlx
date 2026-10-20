@@ -917,12 +917,8 @@ const STORAGE_ALIGN: u64 = 256;
 /// Safe across dispatches in one encoder because each multiply is followed by
 /// the slab → arena move ([`encode_out_slab_copy`]) before the next write, and
 /// dispatches execute in recording order.
-/// Pooled output buffer + its capacity. Named (vs a tuple) so it can assert
-/// `Send` on the browser WebGPU backend where `wgpu::Buffer` is `!Send`; wasm is
-/// single-threaded, so the process-global pool is never sent cross-thread.
+/// Pooled output buffer and its capacity in bytes.
 struct OutPool(wgpu::Buffer, u64);
-#[cfg(target_arch = "wasm32")]
-unsafe impl Send for OutPool {}
 
 /// Bytes held by the pooled output slab above — the one device buffer the
 /// windowed GGUF kernels use that the arena plan does not know about, so a

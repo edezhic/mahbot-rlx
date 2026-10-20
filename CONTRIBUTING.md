@@ -67,7 +67,7 @@ picks between them.
   XDNA into the run). The heavy integration
   suites do real device/graph work and are opt-in with `--features
   backend-tests`, through the recipes that name them (`test-gpu`, `test-rocm`,
-  `test-third-order-gpu`). It spans the GPU / ROCm / wasm matrix, so run the
+  `test-third-order-gpu`). It spans the GPU / ROCm matrix, so run the
   subset your hardware supports (see [What CI expects](#what-ci-expects)).
 - **Format & lint:** `just fmt` / `just lint` (clippy with `-D warnings`). The
   pre-commit hook and `just ci` run these for you.
@@ -130,7 +130,7 @@ through what doesn't apply rather than leaving it unchecked.
 
 ### What CI expects
 
-`just ci` is the full gate, but it includes GPU / ROCm / wasm steps most
+`just ci` is the full gate, but it includes GPU / ROCm steps most
 contributors can't run locally. Run what your hardware supports — at minimum
 `just fmt`, `just lint`, and `just test` — and let the project's CI cover the
 rest of the matrix. A red check on a path you couldn't run locally is expected;

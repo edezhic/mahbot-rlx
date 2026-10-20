@@ -1155,8 +1155,9 @@ fn f32_uniform_output_ancestor_pin(graph: &Graph) -> bool {
 }
 
 /// Liveness-aware planning with every slot sized as `num_elements * 4`
-/// bytes (wgpu / uniform-f32 arenas). Reuses dead tensor slots so large
-/// `[n, n]` pairwise graphs stay under WebGPU's 128 MiB binding cap.
+/// bytes (wgpu / uniform-f32 arenas). Reuses dead tensor slots so the live set
+/// of a large `[n, n]` pairwise graph — and with it the largest binding the
+/// backend has to make — stays small.
 ///
 /// When the graph has host indexing (`ScatterNd` / `Gather*`), keep the
 /// output-ancestor pin — same rule as Metal. Unpinning lets later GPU ops

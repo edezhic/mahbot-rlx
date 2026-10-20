@@ -47,7 +47,7 @@ Closes #
 ## Checklist
 
 <!-- Strike through (~~…~~) any row that doesn't apply — see CONTRIBUTING.md.
-     `just ci` spans GPU/ROCm/wasm; run what your hardware supports, CI covers the rest. -->
+     `just ci` spans GPU/ROCm; run what your hardware supports, CI covers the rest. -->
 
 - [ ] Ran what my hardware supports locally (at least `just fmt`, `just lint`, `just test`).
 - [ ] The change is focused; no unrelated refactors.

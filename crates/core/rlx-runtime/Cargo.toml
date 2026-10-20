@@ -85,7 +85,7 @@ ane = []                           # Apple Neural Engine (via CoreML/ANE framewo
 # mlas = ["cpu"]                   # Microsoft MLAS (from ONNX Runtime)
 
 # ── GPU backends ─────────────────────────────────────────────
-# Portable GPU via wgpu (Metal on macOS, Vulkan on Linux, DX12 on Windows, WebGPU in browsers)
+# Portable GPU via wgpu (Metal on macOS, Vulkan on Linux, DX12 on Windows)
 # Every backend feature implies `cpu`: the runtime's core (e.g. the always-
 # compiled `MoeResidencyStats` re-export, CPU fallbacks / splat between GPU
 # segments) is gated on `feature = "cpu"`, so a backend without it fails to
@@ -162,13 +162,7 @@ tpu = ["cpu", "dep:rlx-tpu"]
 # device / queue and embedded SPIR-V kernels, NOT the wgpu Vulkan adapter
 # (that remains `Device::Gpu`). Dynamic-loaded, so it compiles with no driver.
 vulkan = ["cpu", "dep:rlx-vulkan"]
-# WebGL2 render-to-texture backend (browser fallback; native uses exec_cpu).
-opengl = ["cpu", "dep:rlx-webgl"]
 directx = []                       # DirectX 12 compute (Windows)
-# Browser WebGPU: enables `Device::WebGpu` registry entry (implies `gpu`).
-webgpu = ["gpu"]
-# Browser bundle: WebGPU primary + WebGL fallback.
-browser = ["webgpu", "opengl"]
 
 # ── Intel GPU ───────────────────────────────────────────────
 # Intel Arc / Data Center Max via oneAPI Level Zero (`Device::OneApi`). Owns its
@@ -219,7 +213,6 @@ rlx-hwprofile = { workspace = true, optional = true }
 rlx-cpu = { workspace = true, optional = true }
 rlx-mlx = { workspace = true, optional = true }
 rlx-wgpu = { workspace = true, optional = true }
-rlx-webgl = { workspace = true, optional = true }
 rlx-vulkan = { workspace = true, optional = true }
 rlx-cuda = { workspace = true, optional = true }
 rlx-rocm = { workspace = true, optional = true }
@@ -556,10 +549,6 @@ required-features = ["backend-tests"]
 
 [[test]]
 name = "binary_ops_parity"
-required-features = ["backend-tests"]
-
-[[test]]
-name = "browser_support"
 required-features = ["backend-tests"]
 
 [[test]]

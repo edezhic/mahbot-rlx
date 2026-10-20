@@ -130,8 +130,7 @@ impl WgpuExecutable {
     /// device one ([`CopyRoute::joins_batch`]), the two kinds
     /// [`super::step::step_may_join_batch`] names. The run path's scheduling decisions
     /// read this rather than the plan-time classification, which stays as it is and
-    /// keeps its consumers (the uniform/bind-group lanes, the memory plan, the
-    /// browser answer).
+    /// keeps its consumers (the uniform/bind-group lanes, the memory plan).
     ///
     /// A step this run *skips* never joins, whichever classification it carries: a
     /// baked static pack (`static_once_done`) is consumed by the pass loop or by the
@@ -603,74 +602,17 @@ impl WgpuExecutable {
         self.in_snapshot = false;
     }
 
-    /// Async sibling of [`Self::run`] for the browser, where GPU→CPU readback
-    /// cannot block the event loop. All compute is dispatched + submitted
-    /// synchronously (via the normal `run_inner` in dispatch-only mode); the
-    /// outputs are then read back from the arena asynchronously.
-    ///
-    /// Supports pure feed-forward graphs only — graphs with host-executed ops
-    /// (GGUF dequant, LSTM/GRU, GatedDeltaNet, FFT-host, …) map intermediate
-    /// results back mid-graph, which would block the browser. Such graphs
-    /// panic with a clear message rather than hang.
-    #[cfg(target_arch = "wasm32")]
-    pub async fn run_async(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
-        // Name what is actually in the way. "Contains host-executed ops (GGUF
-        // dequant, LSTM, collectives, FFT-host, …)" listed what it might have
-        // been; a conv graph's real answer is one `Conv2dHost` per conv.
-        if let Some(summary) = self.host_summary() {
-            panic!("rlx-wgpu run_async: unsupported on wasm — {summary}");
-        }
-
-        // 1. Dispatch + submit all compute, skipping the blocking readback.
-        self.dispatch_only = true;
-        let _ = self.run_inner(inputs);
-        self.dispatch_only = false;
-
-        let dev =
-            wgpu_device().expect("rlx-wgpu: device not initialized (call init_wgpu_device first)");
-
-        // 2. Read the selected outputs back from the arena asynchronously.
-        let plan = self.readback_plan();
-        let out_ids_all: Vec<_> = self.graph.outputs.clone();
-        let out_ids: Vec<_> = plan.iter().map(|&i| out_ids_all[i]).collect();
-        let layout = ReadbackLayout::for_nodes(&self.arena, &out_ids);
-        if layout.regions.is_empty() {
-            return Vec::new();
-        }
-        ReadbackStaging::prepare(&dev.device, &mut self.readback_staging, layout.total_bytes);
-        let staging_buf = self
-            .readback_staging
-            .as_ref()
-            .expect("readback staging")
-            .buffer()
-            .clone();
-
-        let mut enc = dev
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rlx-wgpu async readback"),
-            });
-        encode_readback_copies(&mut enc, &self.arena, &staging_buf, &out_ids, &layout);
-        crate::backend::note_device_submit();
-        dev.queue.submit(std::iter::once(enc.finish()));
-
-        crate::buffer::wasm_async::map_read_async(&staging_buf, layout.total_bytes)
-            .await
-            .expect("rlx-wgpu async buffer map failed");
-
-        let partial = decode_mapped_readback_f32(&staging_buf, &layout);
-        self.pack_readback_outputs(&plan, partial)
-    }
-
     /// True when the compiled schedule contains host-executed ops (GGUF
-    /// dequant, LSTM/GRU, collectives, FFT-host, …). Such graphs cannot
-    /// run on browser WebGPU (`run_async` rejects them).
+    /// dequant, LSTM/GRU, collectives, FFT-host, …).
     ///
     /// Read off the plan-time classification, deliberately: it stays pessimistic,
     /// and stays correct, because the host arms remain reachable in the run-time
     /// route ladder — a packed multiply and a buffer copy whose route answers
     /// `Device` are joined by a run-time decision, and either runs on the host
     /// whenever its own ladder answer is not device-only.
+    ///
+    /// Kept public and named here: the run-time surface that consumed it is gone,
+    /// and this is the one-bit form of what [`Self::host_plan`] answers in full.
     pub fn requires_host_execution(&self) -> bool {
         self.schedule
             .iter()
@@ -680,9 +622,7 @@ impl WgpuExecutable {
     /// What this schedule asks the host to do, and which of those asks are
     /// independent enough to share a sync point.
     ///
-    /// Callers used to have only [`Self::requires_host_execution`] — one bit,
-    /// which is why the browser WebGPU refusal could name only the ops it
-    /// *might* have been. See [`super::HostPlan`].
+    /// See [`super::HostPlan`].
     pub fn host_plan(&self) -> super::HostPlan {
         super::host_plan(&self.schedule)
     }

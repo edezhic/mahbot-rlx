@@ -425,9 +425,9 @@ pub struct WgpuExecutable {
     /// Persistent tiny readback buffer for single scalar outputs.
     tiny_readback: Option<TinyReadbackStaging>,
     /// When set, `run_inner` dispatches + submits all compute but skips the
-    /// blocking output readback (results stay in the arena). Used by the wasm
-    /// `run_async` path, which then reads outputs back asynchronously — the
-    /// browser event loop cannot be blocked. Always false on native.
+    /// blocking output readback (results stay in the arena). Read by the
+    /// snapshot replay and by `RLX_BENCH_DISPATCH_ONLY`; a normal run leaves it
+    /// false.
     dispatch_only: bool,
     /// Per-`FftGpu` step: isolated uniform buffers + bind groups (one vec entry per op).
     fft_gpu_steps: Vec<crate::fft_dispatch::FftGpuResources>,
@@ -1107,13 +1107,10 @@ impl WgpuExecutable {
     }
 
     /// The whole handle on the host, or `None` — never an empty tensor — for a
-    /// handle whose rows this executable no longer holds. The browser rule the
-    /// read family follows is stated in [`Self::read_gpu_handle_rows`].
+    /// handle whose rows this executable no longer holds. The rule the read
+    /// family follows is stated in [`Self::read_gpu_handle_rows`].
     pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         if let Some(id) = self.resolve_handle_slot(name) {
-            if cfg!(target_arch = "wasm32") {
-                return None;
-            }
             let dev = wgpu_device()?;
             return Some(self.arena.read_f32(&dev.device, &dev.queue, id));
         }
@@ -1232,9 +1229,7 @@ impl WgpuExecutable {
     /// that request, and a `None` is that request's alone: a row that is not there
     /// withholds nothing its neighbours asked for. A name whose rows are only in
     /// this executable's host mirror is answered from it and asks nothing of the
-    /// device, so a call that asks for no arena row submits nothing at all. In a
-    /// browser an arena row is not answered at all — the map below cannot
-    /// complete there — and only the mirror half answers.
+    /// device, so a call that asks for no arena row submits nothing at all.
     pub fn read_gpu_handle_rows(&self, rows: &[(&str, usize, usize)]) -> Vec<Option<Vec<f32>>> {
         let mut answers: Vec<Option<Vec<f32>>> = Vec::with_capacity(rows.len());
         // The arena-backed requests in the order asked, each with the answer slot
@@ -1245,9 +1240,6 @@ impl WgpuExecutable {
             match self.locate_handle_row(name, row, row_inner) {
                 None => answers.push(None),
                 Some(LocatedRow::Mirror(mirror)) => answers.push(Some(mirror.to_vec())),
-                Some(LocatedRow::Arena { .. }) if cfg!(target_arch = "wasm32") => {
-                    answers.push(None)
-                }
                 Some(LocatedRow::Arena { byte_off, len }) => {
                     slots.push(answers.len());
                     answers.push(None);
@@ -1285,18 +1277,13 @@ impl WgpuExecutable {
     /// answer — outside it or for a zero-length row; a slot this executable no
     /// longer holds declares no rows, so every row of it is out of extent. One
     /// submission and one map, the same staging path
-    /// [`Self::read_gpu_handle_rows`] uses. In a browser it answers `None` for
-    /// the reason that method states, so the caller falls back rather than the
-    /// thread blocking — see `run_async`.
+    /// [`Self::read_gpu_handle_rows`] uses.
     pub fn read_output_row(
         &self,
         out_idx: usize,
         row: usize,
         row_inner: usize,
     ) -> Option<Vec<f32>> {
-        if cfg!(target_arch = "wasm32") {
-            return None;
-        }
         let id = *self.graph.outputs.get(out_idx)?;
         let (byte_off, len) = self.arena_row_range(id, row, row_inner)?;
         let dev = wgpu_device()?;

@@ -518,19 +518,15 @@ fn metal_recon_f16_matches_cpu() {
 // probe is kept (ignored) as the regression that a native wgpu kernel must fix.
 #[test]
 #[ignore = "wgpu f32-uniform arena can't decompose a u8-indexed op; needs a native kernel (like Metal)"]
-#[cfg(feature = "webgpu")]
 fn wgpu_matches_cpu() {
     let _gpu = common::serialize_gpu();
     if common::skip_unless_available(rlx_runtime::Device::Gpu, "wgpu") {
         return;
     }
-    if common::skip_unless_available(Device::WebGpu, "webgpu") {
-        return;
-    }
     for c in cases() {
         let (x, indices, codebook) = make_inputs(&c);
         let cpu = run_native(&c, &x, &indices, &codebook);
-        let mut compiled = Session::new(Device::WebGpu).compile(build(&c));
+        let mut compiled = Session::new(Device::Gpu).compile(build(&c));
         compiled.set_param_typed("indices", &indices, DType::U8);
         let wg = compiled
             .run(&[("x", &x), ("codebook", &codebook)])

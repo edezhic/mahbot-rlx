@@ -32,13 +32,8 @@ pub(crate) const DEVICE_PRIORITY: &[Device] = &[
     Device::Gpu,
     Device::Vulkan,
     Device::DirectX,
-    Device::OpenGl,
-    Device::WebGpu,
     Device::Cpu,
 ];
-
-/// Browser backend probe order: WebGPU first, WebGL fallback, then CPU.
-pub const BROWSER_DEVICE_PRIORITY: &[Device] = &[Device::WebGpu, Device::OpenGl, Device::Cpu];
 
 /// Check whether `device` has a compiled-in backend or has been
 /// registered by an external crate.
@@ -109,9 +104,7 @@ pub fn feature_compiled(device: Device) -> bool {
         Device::Hexagon => cfg!(feature = "qnn"),
         Device::Gpu => cfg!(feature = "gpu"),
         Device::Vulkan => cfg!(feature = "vulkan"),
-        Device::OpenGl => cfg!(feature = "opengl"),
         Device::DirectX => cfg!(feature = "directx"),
-        Device::WebGpu => cfg!(feature = "webgpu"),
     }
 }
 
@@ -142,29 +135,7 @@ pub fn is_available(device: Device) -> bool {
     }
     #[cfg(feature = "gpu")]
     if device == Device::Gpu {
-        #[cfg(target_arch = "wasm32")]
-        {
-            return rlx_wgpu::device::wgpu_device().is_some();
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            return rlx_wgpu::is_available();
-        }
-    }
-    #[cfg(feature = "webgpu")]
-    if device == Device::WebGpu {
-        #[cfg(target_arch = "wasm32")]
-        {
-            return rlx_wgpu::device::wgpu_device().is_some();
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            return rlx_wgpu::is_available();
-        }
-    }
-    #[cfg(feature = "opengl")]
-    if device == Device::OpenGl {
-        return true;
+        return rlx_wgpu::is_available();
     }
     #[cfg(feature = "vulkan")]
     if device == Device::Vulkan {
@@ -219,9 +190,7 @@ pub fn is_available(device: Device) -> bool {
         Device::Hexagon => cfg!(feature = "qnn"),
         Device::Gpu => cfg!(feature = "gpu"),
         Device::Vulkan => cfg!(feature = "vulkan"),
-        Device::OpenGl => cfg!(feature = "opengl"),
         Device::DirectX => cfg!(feature = "directx"),
-        Device::WebGpu => cfg!(feature = "webgpu"),
     };
     if feature_gated {
         return true;
@@ -271,20 +240,6 @@ pub fn detected_unavailable_devices() -> Vec<(Device, String)> {
         out.push((Device::Egpu, rlx_egpu::diagnostic()));
     }
     out
-}
-
-/// Browser backends currently runnable (`WebGpu` → `OpenGl` → `Cpu`).
-pub fn available_browser_devices() -> Vec<Device> {
-    BROWSER_DEVICE_PRIORITY
-        .iter()
-        .copied()
-        .filter(|d| is_available(*d))
-        .collect()
-}
-
-/// Highest-priority browser backend, or `None` when no browser path is live.
-pub fn preferred_browser_device() -> Option<Device> {
-    available_browser_devices().into_iter().next()
 }
 
 /// Intersection of [`available_devices`] and [`supports_graph`]. Use with
@@ -740,8 +695,11 @@ mod tests {
 
     #[test]
     fn unbuilt_device_supports_nothing() {
-        // OpenGl isn't a workspace feature; should report false.
-        assert!(!supports(Device::OpenGl, &Op::Activation(Activation::Relu)));
+        // The `qnn` feature isn't enabled in this fork's contour; should report false.
+        assert!(!supports(
+            Device::Hexagon,
+            &Op::Activation(Activation::Relu)
+        ));
     }
 
     #[test]

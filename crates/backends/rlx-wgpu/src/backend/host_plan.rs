@@ -14,10 +14,10 @@
 //! This module answers two questions the executor previously could not:
 //!
 //! 1. **What** is on the host — which step kinds, how many, and how many sync
-//!    points they cost. Callers had one bit (`requires_host_execution`), which
-//!    is why a conv graph on browser WebGPU could only report *"contains
-//!    host-executed ops (GGUF dequant, LSTM, collectives, FFT-host, …)"* —
-//!    a list of what it might have been rather than what it was.
+//!    points they cost. The one-bit form (`requires_host_execution()`) reports
+//!    only *"contains host-executed ops (GGUF dequant, LSTM, collectives,
+//!    FFT-host, …)"* — a list of what it might have been rather than what it
+//!    was.
 //! 2. **Which of them are independent**, and could therefore run together in
 //!    one sync point rather than one each. Nothing may be batched on a hunch:
 //!    two host steps can only share a sync point if neither reads a byte range

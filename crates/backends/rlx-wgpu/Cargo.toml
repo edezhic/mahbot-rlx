@@ -3,7 +3,7 @@ name = "rlx-wgpu"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
-description = "Cross-platform GPU backend for RLX via wgpu (Metal/Vulkan/DX12/WebGPU)"
+description = "Cross-platform GPU backend for RLX via wgpu (Metal/Vulkan/DX12)"
 authors.workspace      = true
 license.workspace      = true
 keywords.workspace     = true
@@ -56,7 +56,6 @@ wgpu = { version = "30", default-features = false, features = [
     "dx12",
     "metal",
     "wgsl",
-    "webgpu",
 ] }
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
@@ -344,6 +343,10 @@ required-features = ["backend-tests"]
 
 [[test]]
 name = "host_stage_cache_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "host_summary_report"
 required-features = ["backend-tests"]
 
 [[test]]
