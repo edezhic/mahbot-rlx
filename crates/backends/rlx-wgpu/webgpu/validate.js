@@ -213,5 +213,48 @@ for (const f of ["matmul_coop_f32.wgsl", "matmul_coop16.wgsl", "matmul_qkv_coop_
   if (!rejected) failed++;
 }
 
+// The movement kernels a decode/lowering reaches on the browser as well
+// (`copy`/`narrow`/`concat`/`transpose` with the `vec4` field set, the
+// packed-multiply slab move, and the sampling kernel's single-row workgroup
+// reduction behind storage barriers). They carry no matmul contract, so the
+// numeric bar lives in the native bit-exact parity tests (`tests/basic.rs`);
+// what this host proves is that the shipped source compiles under the spec
+// implementation and that every entry point builds a pipeline with the bindings
+// it declares — `transpose_vec4.wgsl` binds the same buffer as
+// `array<vec4<f32>>` and as `array<f32>`, which only a pipeline creation
+// exercises.
+for (const [file, entries] of [
+  ["copy_vec4.wgsl", ["copy_vec4"]],
+  ["narrow_vec4.wgsl", ["narrow_vec4"]],
+  ["concat_vec4.wgsl", ["concat_vec4"]],
+  ["transpose_vec4.wgsl", ["transpose_vec4"]],
+  ["copy_from_slab.wgsl", ["copy_from_slab"]],
+  ["copy_from_slab_vec4.wgsl", ["copy_from_slab_vec4"]],
+  ["sample.wgsl", ["sample"]],
+]) {
+  const src = await Deno.readTextFile(KERNELS + file);
+  device.pushErrorScope("validation");
+  const mod = device.createShaderModule({ code: src });
+  const info = await mod.getCompilationInfo();
+  const errs = info.messages.filter((x) => x.type === "error");
+  let ok = errs.length === 0;
+  for (const entry of entries) {
+    device.pushErrorScope("validation");
+    device.createComputePipeline({
+      layout: "auto",
+      compute: { module: mod, entryPoint: entry },
+    });
+    const piped = await device.popErrorScope();
+    ok = ok && piped === null;
+  }
+  const scoped = await device.popErrorScope();
+  ok = ok && scoped === null;
+  console.log(`${ok ? "PASS" : "FAIL"}  ${file.padEnd(26)} compiles and pipelines on spec WebGPU`);
+  if (!ok) {
+    for (const e of errs) console.error(`   ${e.lineNum}:${e.linePos} ${e.message}`);
+    failed++;
+  }
+}
+
 console.log(failed === 0 ? "\nALL WEBGPU CHECKS PASSED" : `\n${failed} WEBGPU CHECK(S) FAILED`);
 Deno.exit(failed === 0 ? 0 : 1);

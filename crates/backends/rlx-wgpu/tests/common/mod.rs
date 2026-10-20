@@ -330,7 +330,7 @@ pub fn refuse_under_run_report() {
 /// once for every harness here that re-execs a child (`run_report.rs`,
 /// `hosted_audio_step_placement.rs`); `buffer_copy_batch_join.rs` guards the same
 /// routing set with an assertion instead of clearing it.
-pub const CLEARED_SWITCHES: [&str; 19] = [
+pub const CLEARED_SWITCHES: [&str; 20] = [
     "RLX_WGPU_SNAPSHOT",
     "RLX_BENCH_DISPATCH_ONLY",
     "RLX_WGPU_ALL_PARAMS_WEIGHT",
@@ -345,6 +345,7 @@ pub const CLEARED_SWITCHES: [&str; 19] = [
     "RLX_WGPU_SHARD_GPU",
     "RLX_WGPU_ALLOW_SHARD",
     "RLX_WGPU_ONE_OP_PER_PASS",
+    "RLX_WGPU_ENCODE_CHUNK",
     "RLX_WGPU_MAX_BIND_MB",
     Q1_0_BISECT,
     Q8_0_BISECT,

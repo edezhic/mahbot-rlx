@@ -1,0 +1,57 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+// Vectorised concat: one `vec4<f32>` (16 B) per thread, and no division —
+// `gid.z` is the outer index, `gid.y` the concat-axis index, `gid.x` the
+// contiguous span in vec4 units. The scalar form in `concat.wgsl` rebuilds
+// all three from one flat index with `%` and `/` per element.
+//
+// Taken at lowering only when `inner % 4 == 0`, both window offsets are
+// 16 B aligned (f32-word offsets divisible by 4; the window base is 256 B
+// aligned), and `axis_in_size`, `outer` and the x grid fit the adapter's
+// `max_compute_workgroups_per_dimension`. Anything else keeps the 1-D
+// scalar form, which also covers the sharded/staged pieces unchanged.
+//
+// A separate module from `concat.wgsl` because a vector load needs the
+// arena bound as `array<vec4<f32>>` while the scalar fallback indexes
+// `array<f32>`. A bind group layout entry carries no element type, so
+// `build_kernel`'s layout — and every bind group built from it — fits both;
+// only the shader module and entry point differ.
+//
+// The copy moves lanes unchanged, so the output is bit-identical to the
+// scalar kernel's.
+
+struct Params {
+    n_in: u32,
+    outer: u32,
+    inner: u32,
+    axis_in_size: u32,
+    axis_out_size: u32,
+    start: u32,
+    in_off: u32,
+    out_off: u32,
+    vec4: u32,
+};
+
+@group(0) @binding(0) var<storage, read_write> arena: array<vec4<f32>>;
+@group(0) @binding(1) var<uniform>              params: Params;
+
+@compute @workgroup_size(64)
+fn concat_vec4(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let inner4 = params.inner >> 2u;
+    // `gid.y`/`gid.z` come from a grid sized exactly to the axis and outer
+    // counts, so only x (rounded up to whole workgroups) needs a guard.
+    if (gid.x >= inner4) { return; }
+    let in_row = gid.z * params.axis_in_size + gid.y;
+    // Active extent scales `n_in` at run time. `inner % 4 == 0` keeps a
+    // vector inside one row, so guarding its start cuts the same element
+    // prefix the scalar kernel does — except for the row's last vector, which
+    // travels whole and so may carry up to three elements past the scaled
+    // count. Those stay inside that row and inside the destination slot, and
+    // they lie outside the active region.
+    if (in_row * params.inner + gid.x * 4u >= params.n_in) { return; }
+    let out_row = gid.z * params.axis_out_size + (gid.y + params.start);
+    arena[(params.out_off >> 2u) + out_row * inner4 + gid.x] =
+        arena[(params.in_off >> 2u) + in_row * inner4 + gid.x];
+}

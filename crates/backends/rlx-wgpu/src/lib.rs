@@ -33,10 +33,15 @@ pub use backend::coop_f32_dispatch_count;
 /// Host-step planning: what a compiled schedule asks the CPU to do, and which
 /// of those asks are independent enough to share a sync point.
 pub use backend::{HostBatch, HostGroup, HostIo, HostPlan, Region};
-pub use backend::{device_submit_count, device_wait_count, reset_device_counts};
+pub use backend::{
+    device_submit_count, device_wait_count, reset_device_counts, reset_vec4_move_count,
+    vec4_move_count,
+};
 pub mod supported_ops;
 pub mod tuning;
 pub use supported_ops::SUPPORTED_OPS;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bandwidth;
 pub mod buffer;
 pub mod calibrate;
 pub mod collective_host;

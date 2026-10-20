@@ -85,6 +85,17 @@ pub const FFT_GPU_R4_16K_WGSL: &str = include_str!("fft_gpu_r4_16k.wgsl");
 #[cfg(feature = "native-gpu-fft")]
 pub const FFT_GPU_MULTIROW_WGSL: &str = include_str!("fft_gpu_multirow.wgsl");
 pub const COPY_WGSL: &str = include_str!("copy.wgsl");
+/// Vector sibling of `copy.wgsl` — see the shader's own header for when the
+/// lowering/encode paths take it and why it is a separate module.
+pub const COPY_VEC4_WGSL: &str = include_str!("copy_vec4.wgsl");
+/// Slab → arena move for the joined GGUF packed multiply: the two ends are
+/// different buffers, so this is a dispatch rather than `copy.wgsl`'s move.
+pub const COPY_FROM_SLAB_WGSL: &str = include_str!("copy_from_slab.wgsl");
+/// Vector sibling of `copy_from_slab.wgsl` — see that kernel's own header.
+pub const COPY_FROM_SLAB_VEC4_WGSL: &str = include_str!("copy_from_slab_vec4.wgsl");
+/// Read-only stream probe for `bandwidth::stream_ceiling` — see the shader's
+/// header for its geometry and for why it is not a copy.
+pub const STREAM_READ_WGSL: &str = include_str!("stream_read.wgsl");
 pub const CAST_WGSL: &str = include_str!("cast.wgsl");
 pub const COMPLEX_CAST_WGSL: &str = include_str!("complex_cast.wgsl");
 pub const BINARY_C64_WGSL: &str = include_str!("binary_c64.wgsl");
@@ -92,8 +103,15 @@ pub const COMPLEX_WIRINGER_WGSL: &str = include_str!("complex_wirtinger.wgsl");
 pub const FFT_BUTTERFLY_STAGE_WGSL: &str = include_str!("fft_butterfly_stage.wgsl");
 pub const ELEMENTWISE_REGION_WGSL: &str = include_str!("elementwise_region.wgsl");
 pub const TRANSPOSE_WGSL: &str = include_str!("transpose.wgsl");
+/// Vector sibling of `transpose.wgsl` — see the shader's own header for its
+/// three modes and when the lowering takes each.
+pub const TRANSPOSE_VEC4_WGSL: &str = include_str!("transpose_vec4.wgsl");
 pub const NARROW_WGSL: &str = include_str!("narrow.wgsl");
+/// Vector sibling of `narrow.wgsl` — see the shader's own header.
+pub const NARROW_VEC4_WGSL: &str = include_str!("narrow_vec4.wgsl");
 pub const CONCAT_WGSL: &str = include_str!("concat.wgsl");
+/// Vector sibling of `concat.wgsl` — see the shader's own header.
+pub const CONCAT_VEC4_WGSL: &str = include_str!("concat_vec4.wgsl");
 /// The fused spelling of `narrow`-per-frame + `concat` — see the shader's own
 /// header, and `backend::compile::lower`'s `detect_frames_pattern`.
 pub const FRAMES_WGSL: &str = include_str!("frames.wgsl");
@@ -169,6 +187,11 @@ pub const UMAP_KNN_WGSL: &str = include_str!("umap_knn.wgsl");
 pub const GROUPED_MATMUL_WGSL: &str = include_str!("grouped_matmul.wgsl");
 pub const SCALED_GROUPED_MATMUL_DECODE_WGSL: &str =
     include_str!("scaled_grouped_matmul_decode.wgsl");
+/// The sample kernel's workgroup width. `sample.wgsl` spreads a one-row draw
+/// across it and the dispatch is computed with it, so the two must be the same
+/// number — a shader wider than its dispatch would leave part of the reduction
+/// unset. The unit test below holds the shader's `LANES` to this.
+pub const SAMPLE_LANES: u32 = 64;
 pub const SAMPLE_WGSL: &str = include_str!("sample.wgsl");
 pub const SELECTIVE_SCAN_WGSL: &str = include_str!("selective_scan.wgsl");
 pub const GATED_DELTA_NET_WGSL: &str = include_str!("gated_delta_net.wgsl");
@@ -924,6 +947,17 @@ pub struct CopyParams {
     pub _p4: u32,
 }
 
+/// Uniform layout for the slab → arena move (`copy_from_slab.wgsl`). 16 bytes.
+/// The offsets are f32 words from each bound window's 256 B-aligned base.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct CopyFromSlabParams {
+    pub n: u32,
+    pub in_off: u32,
+    pub out_off: u32,
+    pub _p0: u32,
+}
+
 /// Uniform layout for the on-device Philox RNG kernels (`rng_philox.wgsl`).
 /// `a`/`b` are `mean`/`scale` (normal) or `low`/`high` (uniform); unused by
 /// `rng_fill_zero`.
@@ -1001,8 +1035,18 @@ pub struct TransposeParams {
     pub bucket_outermost: u32,
     /// PLAN L1 — `out_dims[0]` for active-extent scaling math.
     pub out_dim_0: u32,
-    pub _p2: u32,
-    pub _p3: u32,
+    /// `0` keeps the scalar `transpose.wgsl` kernel; `1`/`2`/`3` select
+    /// `transpose_vec4_kernel`'s general-last-axis / `[0,2,1,3]` /
+    /// `[0,2,1]` modes. See `transpose_vec4.wgsl`.
+    pub mode: u32,
+    /// Vector modes: the y workgroup count. Mode 1 also linearizes its flat
+    /// outer index with it (`gid.y + gid.z * grid_y`).
+    pub grid_y: u32,
+    /// Vector modes: the z workgroup count.
+    pub grid_z: u32,
+    /// Vector modes: the contiguous innermost extent in elements (a multiple
+    /// of 4). The x grid is `ceil(inner / 4 / 64)`.
+    pub inner: u32,
 }
 
 /// Layout for narrow / concat (the same struct serves both).
@@ -1017,6 +1061,10 @@ pub struct NarrowConcatParams {
     pub start: u32,
     pub in_off: u32,
     pub out_off: u32,
+    /// `1` selects the `*_vec4` kernel (one 16 B vector per thread). Set only
+    /// when `inner % 4 == 0` and both offsets are 16 B aligned — see
+    /// `concat_vec4.wgsl` / `narrow_vec4.wgsl` and `vec4_move_ok`.
+    pub vec4: u32,
 }
 
 /// Frame-matrix dispatch parameters: `narrow`-per-frame + `concat` folded into
@@ -2172,13 +2220,12 @@ impl Kernel {
 }
 
 /// Build a 4-binding compute kernel: storage(rw) / uniform / storage(ro)
-/// / storage(ro). Currently unused — `matmul_coop16` switched to a
-/// 3-binding layout (A is staged from arena through workgroup memory
-/// instead of from a separate f16 binding). Kept for future kernels
-/// that genuinely need a 4th binding.
-#[allow(dead_code)]
-/// Used by the cooperative-matrix matmul which needs a
-/// fourth binding for the f16 activation shadow buffer.
+/// / storage(rw). `transpose_vec4.wgsl` is its user: binding 0 is the `vec4`
+/// arena (modes 1/2), binding 1 params, binding 2 the axis metadata, and
+/// binding 3 a scalar alias of the same window for mode 3's non-adjacent
+/// stores — the alias is a separate binding because a component store through
+/// the `vec4` array is a whole-group read-modify-write on some backends, which
+/// two threads writing different lanes of one group would race on.
 fn build_kernel_4(
     device: &wgpu::Device,
     label: &'static str,
@@ -2226,7 +2273,7 @@ fn build_kernel_4(
                 binding: 3,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
@@ -2381,6 +2428,68 @@ fn build_kernel_ro_u_ro_rw(
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &entries,
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        module: &module,
+        entry_point: Some(entry_point),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    Kernel { pipeline, bgl }
+}
+
+/// Read-only stream (`stream_read.wgsl`): binding 0 is the read-only source,
+/// binding 1 params, binding 2 the one-f32-per-workgroup sink that keeps the
+/// loads live. Binding 0 has to be `read`: the figure the probe takes is a
+/// read stream, and the shader must not be able to write it.
+fn build_kernel_ro_u_rw(
+    device: &wgpu::Device,
+    label: &'static str,
+    wgsl: &str,
+    entry_point: &'static str,
+) -> Kernel {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let storage = |read_only: bool| wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: storage(true),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: storage(false),
+                count: None,
+            },
+        ],
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
@@ -2723,12 +2832,19 @@ static FFT_GPU_INNER: OnceLock<Kernel> = OnceLock::new();
 static FFT_GPU_OUTER_R4: OnceLock<Kernel> = OnceLock::new();
 static FFT_GPU_OUTER_R2: OnceLock<Kernel> = OnceLock::new();
 static COPY: OnceLock<Kernel> = OnceLock::new();
+static COPY_VEC4: OnceLock<Kernel> = OnceLock::new();
+static COPY_FROM_SLAB: OnceLock<Kernel> = OnceLock::new();
+static COPY_FROM_SLAB_VEC4: OnceLock<Kernel> = OnceLock::new();
+static STREAM_READ: OnceLock<Kernel> = OnceLock::new();
 static CAST: OnceLock<Kernel> = OnceLock::new();
 static ELEMENTWISE_REGION: OnceLock<Kernel> = OnceLock::new();
 static ELEMENTWISE_REGION_SPATIAL: OnceLock<Kernel> = OnceLock::new();
 static TRANSPOSE: OnceLock<Kernel> = OnceLock::new();
+static TRANSPOSE_VEC4: OnceLock<Kernel> = OnceLock::new();
 static NARROW: OnceLock<Kernel> = OnceLock::new();
+static NARROW_VEC4: OnceLock<Kernel> = OnceLock::new();
 static CONCAT: OnceLock<Kernel> = OnceLock::new();
+static CONCAT_VEC4: OnceLock<Kernel> = OnceLock::new();
 static FRAMES: OnceLock<Kernel> = OnceLock::new();
 static GATHER: OnceLock<Kernel> = OnceLock::new();
 static GATHER_SPLIT: OnceLock<Kernel> = OnceLock::new();
@@ -3727,6 +3843,50 @@ pub fn fft_gpu_outer_r2_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn copy_kernel(device: &wgpu::Device) -> &'static Kernel {
     COPY.get_or_init(|| build_kernel(device, "rlx-wgpu copy", COPY_WGSL, "copy"))
 }
+/// Vector sibling of [`copy_kernel`]; same binding layout, `array<vec4<f32>>`
+/// arena. See `copy_vec4.wgsl`.
+pub fn copy_vec4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    COPY_VEC4
+        .get_or_init(|| build_kernel(device, "rlx-wgpu copy vec4", COPY_VEC4_WGSL, "copy_vec4"))
+}
+/// Read-only streaming probe for `bandwidth::stream_ceiling`: binding 0 is the
+/// `vec4<f32>` source (ro), binding 1 its params, binding 2 one f32 per
+/// workgroup (rw). See `stream_read.wgsl`.
+pub fn stream_read_kernel(device: &wgpu::Device) -> &'static Kernel {
+    STREAM_READ.get_or_init(|| {
+        build_kernel_ro_u_rw(
+            device,
+            "rlx-wgpu stream read",
+            STREAM_READ_WGSL,
+            "stream_read",
+        )
+    })
+}
+/// Slab → arena move for the joined GGUF packed multiply. Bindings are
+/// 0 = arena window (rw), 1 = uniform, 2 = slab window (ro) — the two ends are
+/// deliberately different buffers, so no usage-scope exclusion applies.
+pub fn copy_from_slab_kernel(device: &wgpu::Device) -> &'static Kernel {
+    COPY_FROM_SLAB.get_or_init(|| {
+        build_kernel_3(
+            device,
+            "rlx-wgpu copy from slab",
+            COPY_FROM_SLAB_WGSL,
+            "copy_from_slab",
+        )
+    })
+}
+/// Vector sibling of [`copy_from_slab_kernel`]; same layout, `vec4` element
+/// type on both ends.
+pub fn copy_from_slab_vec4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    COPY_FROM_SLAB_VEC4.get_or_init(|| {
+        build_kernel_3(
+            device,
+            "rlx-wgpu copy from slab vec4",
+            COPY_FROM_SLAB_VEC4_WGSL,
+            "copy_from_slab_vec4",
+        )
+    })
+}
 
 static RNG_NORMAL_PHILOX: OnceLock<Kernel> = OnceLock::new();
 static RNG_UNIFORM_PHILOX: OnceLock<Kernel> = OnceLock::new();
@@ -3882,11 +4042,45 @@ pub fn transpose_kernel(device: &wgpu::Device) -> &'static Kernel {
     TRANSPOSE
         .get_or_init(|| build_kernel_3(device, "rlx-wgpu transpose", TRANSPOSE_WGSL, "transpose"))
 }
+/// Vector sibling of [`transpose_kernel`]; same 3-binding layout,
+/// `array<vec4<f32>>` arena. See `transpose_vec4.wgsl`.
+pub fn transpose_vec4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    TRANSPOSE_VEC4.get_or_init(|| {
+        build_kernel_4(
+            device,
+            "rlx-wgpu transpose vec4",
+            TRANSPOSE_VEC4_WGSL,
+            "transpose_vec4",
+        )
+    })
+}
 pub fn narrow_kernel(device: &wgpu::Device) -> &'static Kernel {
     NARROW.get_or_init(|| build_kernel(device, "rlx-wgpu narrow", NARROW_WGSL, "narrow"))
 }
+/// Vector sibling of [`narrow_kernel`]; see `narrow_vec4.wgsl`.
+pub fn narrow_vec4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    NARROW_VEC4.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu narrow vec4",
+            NARROW_VEC4_WGSL,
+            "narrow_vec4",
+        )
+    })
+}
 pub fn concat_kernel(device: &wgpu::Device) -> &'static Kernel {
     CONCAT.get_or_init(|| build_kernel(device, "rlx-wgpu concat", CONCAT_WGSL, "concat"))
+}
+/// Vector sibling of [`concat_kernel`]; see `concat_vec4.wgsl`.
+pub fn concat_vec4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONCAT_VEC4.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu concat vec4",
+            CONCAT_VEC4_WGSL,
+            "concat_vec4",
+        )
+    })
 }
 pub fn frames_kernel(device: &wgpu::Device) -> &'static Kernel {
     FRAMES.get_or_init(|| build_kernel(device, "rlx-wgpu frames", FRAMES_WGSL, "frames"))
@@ -4630,8 +4824,9 @@ pub fn matmul_qkv_coop_f16_vk_widen_kernel(device: &wgpu::Device) -> Option<&'st
 #[cfg(test)]
 mod tests {
     use super::{
-        CONV_TRANSPOSE2D_TILED_WGSL, ELEMENTWISE_REGION_WGSL, FRAMES_WGSL, FRAMES_WORKGROUP,
-        MATMUL_WIDE_VEC4_WGSL, TILED_TILE_CO, TILED_TILE_U, WIDE_TAIL_M, WideGrid, WideVariant,
+        ATTENTION_DECODE_MAX_HEAD_DIM, ATTENTION_WGSL, CONV_TRANSPOSE2D_TILED_WGSL,
+        ELEMENTWISE_REGION_WGSL, FRAMES_WGSL, FRAMES_WORKGROUP, MATMUL_WIDE_VEC4_WGSL,
+        SAMPLE_LANES, SAMPLE_WGSL, TILED_TILE_CO, TILED_TILE_U, WIDE_TAIL_M, WideGrid, WideVariant,
         conv_transpose2d_tiled_grid, wide_grid,
     };
 
@@ -4672,6 +4867,18 @@ mod tests {
             FRAMES_WGSL.contains(&format!("const WG: u32 = {FRAMES_WORKGROUP}u;")),
             "the shader must declare its workgroup size from `FRAMES_WORKGROUP`: it also strides \
              its invocations by it, so two copies of that number could be two different strides"
+        );
+    }
+
+    /// The sampler's cooperative one-row path splits a row across `SAMPLE_LANES`
+    /// and dispatches one workgroup per row with that width; a shader whose
+    /// `LANES` disagreed would dispatch a partial workgroup into a reduction that
+    /// assumes all of them.
+    #[test]
+    fn sample_shader_declares_the_dispatched_lane_count() {
+        assert!(
+            SAMPLE_WGSL.contains(&format!("const LANES: u32 = {SAMPLE_LANES}u;")),
+            "sample.wgsl must declare `LANES` from `SAMPLE_LANES` ({SAMPLE_LANES})"
         );
     }
 
@@ -4906,6 +5113,25 @@ mod tests {
              disagree: a declared code without an arm is computed as its own input \
              silently, and an arm left out of the set keeps a region the kernel could \
              have run off it"
+        );
+    }
+
+    /// The decode entry's register ceiling is written twice — the shader's
+    /// `DECODE_MAX_DIM` and this module's [`ATTENTION_DECODE_MAX_HEAD_DIM`] — and
+    /// nothing in the route ties them. If the shader's constant is the smaller, a
+    /// width the route admits reaches the entry and its early return writes no
+    /// output at all, silently; if it is the larger, the per-thread arrays grow
+    /// past what the Metal compiler keeps in registers. Read the source and pin
+    /// the two together.
+    #[test]
+    fn the_decode_register_ceiling_is_the_shaders_own() {
+        assert!(
+            ATTENTION_WGSL.contains(&format!(
+                "const DECODE_MAX_DIM: u32 = {ATTENTION_DECODE_MAX_HEAD_DIM}u;"
+            )),
+            "the route's decode head ceiling and the shader's `DECODE_MAX_DIM` are one \
+             number: a width past the shader's leaves the entry's early return with no \
+             output, so the step's slot is written by nobody"
         );
     }
 }

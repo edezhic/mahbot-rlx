@@ -114,6 +114,9 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     ) -> Vec<Vec<f32>> {
         self.inner.run_read_outputs(inputs, read_indices)
     }
+    fn set_sample_seeds(&mut self, seeds: &[u64]) -> bool {
+        self.inner.set_sample_seeds(seeds)
+    }
     fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
         self.inner.bind_gpu_handle(name, data)
     }

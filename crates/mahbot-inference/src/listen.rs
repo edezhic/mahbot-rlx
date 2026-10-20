@@ -27,16 +27,14 @@ pub const MEL_FRAMES: usize = 76;
 /// Samples in the wake window: [`MEL_FRAMES`] hops.
 pub const WINDOW_SAMPLES: usize = 12_160;
 
-/// The recognition prompt is 3 head + 6 text + 375 audio + 6 tail = 390 rows
-/// for a 30 s segment; a shorter clip has fewer audio rows.
-pub const ASR_PROMPT_ROWS: usize = 390;
-
-/// The decode budget; the cache holds the prompt and this together.
+/// The decode budget — the most tokens one segment may generate; the cache is
+/// sized in 128-row buckets above the prompt, not by this number.
 pub const ASR_MAX_NEW: usize = 2_048;
 
-/// The recognition prompt, in the tokenizer's own ids: 3 head + 6 text +
-/// 375 audio + 6 tail = 390 rows. The audio rows are replaced by the encoder's
-/// projected features; every other row is the real `token_embd` row.
+/// The recognition prompt's fixed ends, in the tokenizer's own ids: 3 head rows
+/// and 6 text rows before the encoder's audio rows, 6 tail rows after them. The
+/// audio count is the clip's (219 rows for the recorded 17.46 s reference), so
+/// the prompt's length is not a constant.
 pub const ASR_HEAD_IDS: [usize; 3] = [151644, 8948, 198];
 pub const ASR_TEXT_IDS: [usize; 6] = [151645, 198, 151644, 872, 198, 151669];
 pub const ASR_TAIL_IDS: [usize; 6] = [151670, 151645, 198, 151644, 77091, 198];

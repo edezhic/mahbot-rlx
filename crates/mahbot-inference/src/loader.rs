@@ -461,6 +461,9 @@ impl Model {
         picks
             .iter()
             .map(|&(level, row)| {
+                if row >= stride {
+                    bail!("`{name}`: row {row} past the level's {stride} rows");
+                }
                 let start = (level * stride + row) * row_bytes;
                 let end = start + row_bytes;
                 if end > bytes.len() {

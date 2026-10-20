@@ -8,11 +8,11 @@
 //! One entry point and no flags. The acceptance walks four units, each in its own
 //! process: the ear's 12 160-sample wake window (mel with the last frame dropped,
 //! 76 frames, the 1.7B 24-block encoder, the projection, mean over ten tokens, L2,
-//! cosine); 30 s of listening (3 000 mel frames, the 390-row prompt, at most
-//! 2 048 new tokens on a 2 438-row fixed cache); 300 text tokens → 330 codec rows
-//! (26.4 s) through the talker, predictor and sound half; and a tokenizer-fed
-//! embedding cell over the whole token table. Every other cell stays behind its
-//! number in `cells`.
+//! cosine); 30 s of listening (1 746 mel frames, the 234-row prompt, at most
+//! 2 048 new tokens on a cache that grows in 128-row buckets); 300 text tokens →
+//! 330 codec rows (26.4 s) through the talker, predictor and sound half; and a
+//! tokenizer-fed embedding cell over the whole token table. Every other cell
+//! stays behind its number in `cells`.
 //!
 //! It is a heavy run of this crate and carries the bench's three rules: one
 //! instance at a time (`MAHBOT_LOCK`, defaulting to the temp directory), a
@@ -62,8 +62,7 @@ use crate::guard::{
     Watch,
 };
 use crate::listen::{
-    ASR_HEAD_IDS, ASR_MAX_NEW, ASR_PROMPT_ROWS, ASR_TAIL_IDS, ASR_TEXT_IDS, Front, argmax,
-    is_asr_eos, l2, mean_pool,
+    ASR_HEAD_IDS, ASR_MAX_NEW, ASR_TAIL_IDS, ASR_TEXT_IDS, Front, argmax, is_asr_eos, l2, mean_pool,
 };
 use crate::loader::{Model, Pair, Role};
 use crate::report::{
@@ -87,6 +86,14 @@ const EAR_SAMPLES: usize = 12_160;
 /// front drops the last frame, leaving 3 000 frames. A shorter recording is
 /// trimmed to its speech and measured on that fixed frame count instead.
 const SPEECH_SAMPLES: usize = 480_000;
+/// The decode's compiled cache grows in these row buckets: the attention operand
+/// is the whole `[capacity + 1]` plane, so a capacity fixed at the token budget
+/// makes every step read the masked rows too. One bucket above the prompt, then
+/// one more each time the live cache reaches the compiled one, keeps the operand
+/// within a bucket of the live span. The first bucket holds a whole short
+/// utterance (a walk of 65 tokens here), so the common case pays one compile;
+/// the bucket exists to bound the operand, not to avoid a second graph.
+const DECODE_CACHE_BUCKET: usize = 128;
 /// The two embedding cells: an ordinary request/ticket, and the model limit.
 const EMBED_CELLS: [usize; 2] = [256, 8_192];
 /// The mel front end's own window.
@@ -372,6 +379,19 @@ pub fn main_entry() {
     // clock and each cell's resident set; the cell carries the stop and the
     // ceiling itself as well, so it stays bounded even if the parent dies.
     let (lock, deadline, ceiling) = heavy_run();
+    // The load the table's figures were taken under: the cells print it per run,
+    // and the record keeps the range so a reader can tell a quiet run from one
+    // that shared the machine.
+    let load_at_start = load_average();
+    // The record carries the swap the run actually saw, not only the ceiling.
+    let swap_at_start = crate::guard::swap_used_bytes();
+    // The machine's streaming ceiling, measured here and now: the reference every
+    // per-phase weight-stream rate below is reported against, because a rate on
+    // its own says nothing about how far the kernel is from what the memory system
+    // delivers on this hardware. Read again after the cells, so the record carries
+    // the probe's own reading-to-reading spread and not one session's figure.
+    let ceiling_streams = probe_ceiling();
+    print_ceiling("ceiling", &ceiling_streams);
     eprintln!(
         "stand: stop {}s · ceiling {} MiB · lock {}",
         deadline.secs(),
@@ -393,17 +413,34 @@ pub fn main_entry() {
             std::process::exit(1);
         }
     };
-    let mut rows: Vec<(&'static str, Vec<(f64, f64, u64, u64, f64)>, String, String)> = Vec::new();
+    struct Row {
+        name: &'static str,
+        /// `(cold, warm, peak, map, build, loop, sound)` per run. The split is
+        /// kept per run so the row reports the split of the same run its warm
+        /// figure came from; mixing the medians of two repetitions would print a
+        /// loop and a sound figure that do not add up to the row's warm one.
+        got: Vec<(f64, f64, u64, u64, f64, f64, f64)>,
+        /// The per-phase weight streams, one `(phase, unit, bytes, ms)` per run —
+        /// the same run-indexed form as `got`, for the same reason.
+        streams: Vec<Vec<(&'static str, &'static str, f64, f64)>>,
+        arena: String,
+        digest: String,
+        speech_s: f64,
+    }
+    let mut rows: Vec<Row> = Vec::new();
     for (i, cell) in all.iter().enumerate() {
         let Some(name) = unit_name(cell) else {
             continue;
         };
         let mut got = Vec::with_capacity(RUNS);
+        let mut streams = Vec::with_capacity(RUNS);
         let mut arena = String::new();
         let mut digest = String::new();
+        let mut speech_s = f64::NAN;
         for _ in 0..RUNS {
             let out = run_cell(&exe, i, deadline, ceiling);
             let text = String::from_utf8_lossy(&out.stdout);
+            streams.push(streams_of(name, &text));
             if let Some(value) = text
                 .split("arena=")
                 .nth(1)
@@ -412,12 +449,19 @@ pub fn main_entry() {
                 arena = value.to_string();
             }
             if let Some(value) = text
-                .split("digest=")
+                .split(" digest=")
                 .nth(1)
                 .and_then(|rest| rest.split_whitespace().next())
             {
                 digest = value.to_string();
             }
+            if let Some(value) = field(&text, "speech_s") {
+                speech_s = value;
+            }
+            // A cell with no synthesis split prints no `loop_ms`/`sound_ms`;
+            // absent is `NaN`, which the table renders as `-`.
+            let loop_ms = field(&text, "loop_ms").unwrap_or(f64::NAN);
+            let sound_ms = field(&text, "sound_ms").unwrap_or(f64::NAN);
             // Keep the child's numbers in the normal run: dropping them is what
             // used to hide the window and the load each number was taken at.
             print!("{text}");
@@ -427,7 +471,7 @@ pub fn main_entry() {
                 .then(|| parse_unit(&text, name))
                 .flatten()
             {
-                Some(v) => got.push(v),
+                Some(v) => got.push((v.0, v.1, v.2, v.3, v.4, loop_ms, sound_ms)),
                 None => {
                     eprint!("{}", String::from_utf8_lossy(&out.stderr));
                     eprintln!(
@@ -438,20 +482,31 @@ pub fn main_entry() {
                 }
             }
         }
-        rows.push((name, got, arena, digest));
+        rows.push(Row {
+            name,
+            got,
+            streams,
+            arena,
+            digest,
+            speech_s,
+        });
     }
     let mut build_runs = vec![0.0f64; RUNS];
-    for (_, got, _, _) in &rows {
-        for (run, v) in got.iter().enumerate() {
+    for row in &rows {
+        for (run, v) in row.got.iter().enumerate() {
             if run < build_runs.len() {
                 build_runs[run] += v.4;
             }
         }
     }
-    println!("# eight numbers: cold/warm run_ms, peak (GiB), map (GiB), spreads");
+    println!(
+        "# cold/warm run_ms, seconds per second of speech, the synthesis loop/sound split, \
+         peak/map and their spreads"
+    );
     let mut table = String::new();
-    table.push_str("| unit | cold ms | warm ms | build ms | peak | map | arena | digest |\n|---|---|---|---|---|---|---|---|\n");
-    for (name, got, arena, digest) in &rows {
+    table.push_str("| unit | cold ms | warm ms | speech s | s/speech s | loop ms | sound ms | build ms | peak | map | arena | digest |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    for row in &rows {
+        let (name, got, arena, digest) = (row.name, &row.got, &row.arena, &row.digest);
         let warm: Vec<f64> = got.iter().map(|v| v.1).collect();
         let cold: Vec<f64> = got.iter().map(|v| v.0).collect();
         let peak: Vec<f64> = got
@@ -468,17 +523,50 @@ pub fn main_entry() {
             median(&warm).unwrap_or(0.0),
             median(&peak).unwrap_or(0.0),
         );
+        let build_ms = median(&got.iter().map(|v| v.4).collect::<Vec<_>>()).unwrap_or(0.0);
+        // The split is the one of the run whose warm figure is the row's: the two
+        // then add up by construction.
+        let median_run = median_index(&warm)
+            .and_then(|i| got.get(i))
+            .map(|v| (v.5, v.6))
+            .unwrap_or((f64::NAN, f64::NAN));
+        // The cell's own number: warm seconds per second of speech, and the
+        // denominator printed beside it so the rate re-derives from the table. The
+        // two surfaces are the only rows with a denominator; the others print `-`.
+        let secs_of_speech = row
+            .speech_s
+            .is_finite()
+            .then_some(row.speech_s)
+            .filter(|s| *s > 0.0);
+        let per_s = secs_of_speech.map_or(f64::NAN, |s| warm_ms / 1000.0 / s);
+        let split = |v: f64| {
+            if v.is_finite() {
+                format!("{v:.1}")
+            } else {
+                "-".to_string()
+            }
+        };
+        let per_s_cell = if per_s.is_finite() {
+            format!("{per_s:.3}")
+        } else {
+            "-".to_string()
+        };
+        // The denominator itself, in the same number the rate beside it used.
+        let speech_cell = secs_of_speech.map_or_else(|| "-".to_string(), |s| format!("{s:.3}"));
         println!(
-            "{name} cold={cold_ms:.1} warm={warm_ms:.1} peak={peak_gib:.2} map={map:.2} cold_spread={:.1} warm_spread={:.1} peak_spread={:.3} at={} load={}",
+            "{name} cold={cold_ms:.1} warm={warm_ms:.1} s_per_s={per_s_cell} loop_ms={} sound_ms={} peak={peak_gib:.2} map={map:.2} cold_spread={:.1} warm_spread={:.1} peak_spread={:.3} at={} load={}",
+            split(median_run.0),
+            split(median_run.1),
             spreads(&cold),
             spreads(&warm),
             spreads(&peak),
             now(),
             load_average(),
         );
-        let build_ms = median(&got.iter().map(|v| v.4).collect::<Vec<_>>()).unwrap_or(0.0);
         table.push_str(&format!(
-            "| {name} | {cold_ms:.1} | {warm_ms:.1} | {build_ms:.1} | {peak_gib:.2} GiB | {map:.2} GiB | {arena} | {digest} |\n"
+            "| {name} | {cold_ms:.1} | {warm_ms:.1} | {speech_cell} | {per_s_cell} | {} | {} | {build_ms:.1} | {peak_gib:.2} GiB | {map:.2} GiB | {arena} | {digest} |\n",
+            split(median_run.0),
+            split(median_run.1),
         ));
     }
     let build_spread = build_runs.iter().copied().fold(f64::NEG_INFINITY, f64::max)
@@ -490,16 +578,160 @@ pub fn main_entry() {
         load_average()
     );
 
+    // The probe again, after the cells: two readings of one run bound the
+    // probe's own spread, which a single reading cannot. A diagnostic must not
+    // discard a run whose cells and witnesses all succeeded — it allocates ~130 MiB
+    // while the process holds ~2.6 GiB — so a panic reads as its own outcome
+    // (`panicked`), never as a missing adapter.
+    let ceiling_after = probe_ceiling();
+    print_ceiling("ceiling_after", &ceiling_after);
+
     // The repository's own record, refreshed by the run that produced it.
     let mut body = String::new();
     body.push_str("## Per-model measurement (stand)\n\n");
     body.push_str(&format!("_Measured {}._\n\n", crate::measurements::now()));
     body.push_str(&table);
+    body.push_str(
+        "\nThe cell's number is the **`s/speech s`** column: the **warm** figure \
+         (`warm ms`) divided by the `speech s` column — the cell's own seconds of \
+         speech, `samples / 16 000` for recognition and `rows · 1 920 / 24 000` for \
+         synthesis, printed so the rate re-derives from this table alone. `loop ms` is the \
+         synthesis generation loop (speaker, prefill, body, predictor, sampler) and \
+         `sound ms` is the sound half; their sum is `warm ms`, so a ×N synthesis \
+         claim reads off both. Both are the same phase sums the cell's \
+         `loop_ms`/`sound_ms` tokens record; `speak`'s `sound_phase_ms` field is \
+         the sound graphs' summed `step_ms` — the same sum the `sound ms` column \
+         is taken from, carried as a field so a cell line is self-describing. \
+         For `speak` the recorded `digest` is the **waveform** digest, not the \
+         `prompt_digest` its own line prints. `-` is a cell with no speech \
+         denominator. Each cell line \
+         prints its own `warm_spread` (the warm runs' max − min, in ms).\n",
+    );
+    // The per-phase weight streams, next to the machine's own streaming ceiling:
+    // the figure the synthesis and recognition targets are stated in, because a
+    // rate is only meaningful against what the same machine delivers on a plain
+    // stream. Every row is one run's own pair of a byte count and a time — the run
+    // whose warm figure is the row's — so the row's arithmetic is that division.
+    body.push_str("\n### Weight streams, against the machine's streaming ceiling\n\n");
+    match &ceiling_streams {
+        Ok(c) => {
+            // The second reading is a diagnostic, and it must not read as "not
+            // re-taken" when it failed: its own outcome — a missing adapter, a
+            // device fault, a panic — is printed in the record.
+            let after = match &ceiling_after {
+                Ok(a) => format!(
+                    " The same probe after the cells read {:.1} GB/s ({:.1}–{:.1}), which is \
+                     the reading-to-reading spread to hold the figure to.",
+                    a.read_gb_s, a.read_min_gb_s, a.read_max_gb_s
+                ),
+                Err(failure) => format!(
+                    " The same probe after the cells produced no figure — {}, so the \
+                     before reading stands alone.",
+                    failure_reading(failure),
+                ),
+            };
+            body.push_str(&format!(
+                "Ceiling, measured on this run's device before the cells: **{:.1} GB/s** on a \
+                 streaming read ({:.1}–{:.1} over {} rounds) and {:.1} GB/s of total traffic on a \
+                 streaming copy ({:.1}–{:.1}). The read figure is the one the rows below are \
+                 reported against, because a weight is read and never written; the copy figure is \
+                 the same probe's other arm, recorded beside it. Both come from \
+                 `rlx_wgpu::bandwidth::stream_ceiling`: a {:.1} MiB vectorised read and a {:.1} MiB \
+                 vectorised copy, on `{}`.{after}\n\n",
+                c.read_gb_s,
+                c.read_min_gb_s,
+                c.read_max_gb_s,
+                c.rounds,
+                c.gb_s,
+                c.min_gb_s,
+                c.max_gb_s,
+                c.bytes_per_direction as f64 / (1u64 << 20) as f64,
+                c.bytes_per_direction as f64 / (1u64 << 20) as f64,
+                crate::measurements::device(),
+            ));
+        }
+        Err(failure) => body.push_str(&format!(
+            "Ceiling: the probe produced no figure — {}, so the rows below carry no \
+             denominator.\n\n",
+            failure_reading(failure),
+        )),
+    }
+    body.push_str(
+        "| phase | unit | weight bytes/unit | ms/unit | GB/s | of the read ceiling |\n\
+         |---|---|---|---|---|---|\n",
+    );
+    let ceiling_gb_s = ceiling_streams.as_ref().ok().map(|c| c.read_gb_s);
+    for row in &rows {
+        let Some(run) = median_index(&row.got.iter().map(|v| v.1).collect::<Vec<_>>())
+            .and_then(|i| row.streams.get(i))
+        else {
+            continue;
+        };
+        for (phase, unit, bytes, ms) in run {
+            // The rate is the division of the two figures printed beside it, so
+            // both are rounded to the precision they are written at before the
+            // division; the percentage divides by the ceiling printed above. A
+            // reader can then reproduce every figure from the table.
+            let ms = printed(*ms, 2);
+            let rate = printed(bytes / (ms * 1e-3) / 1e9, 1);
+            let share = ceiling_gb_s.map_or_else(
+                || "-".to_string(),
+                |ceiling| format!("{:.1} %", rate / printed(ceiling, 1) * 100.0),
+            );
+            body.push_str(&format!(
+                "| {phase} | {unit} | {} | {ms:.2} | {rate:.1} | {share} |\n",
+                report::grouped(*bytes as u64),
+            ));
+        }
+    }
+    body.push_str(
+        "\nEach row's numerator is the graph's own parameter bytes — packed and f32 — \
+         which its multiplies and convolutions read once per unit, and only operands that \
+         are parameters count; a graph that read one of them twice per unit would move \
+         more, and one that read a slice would move less. `talker body` is one frame, `code \
+         predictor` one of a frame's sixteen projecting levels (the frame's stream and time \
+         divided by the levels it walks), `sound half` the utterance's windows summed with \
+         the graph each window actually ran, and `recognition decode` one generated token. \
+         The figure in each row is the run whose warm figure is the table's.\n",
+    );
     body.push_str("\nProvenance:\n\n");
     body.push_str(&format!("- machine: {}\n", crate::measurements::machine()));
     body.push_str(&format!("- device: {}\n", crate::measurements::device()));
     body.push_str(&format!("- profile: {}\n", crate::measurements::profile()));
-    body.push_str(&format!("- code: {}\n", crate::measurements::code_state()));
+    body.push_str(&format!(
+        "- code: {} (the commit and the SHA-256 of the tree's own difference from it — {} — \
+         which together are the content that produced these figures; a clean tree's digest is \
+         `e3b0c44298fc1c14`, the hash of an empty diff)\n",
+        crate::measurements::code_state(),
+        crate::measurements::provenance_rule(),
+    ));
+    body.push_str(&format!(
+        "- thermal: {} (`pmset -g therm`, the reading `scripts/check-throttle.sh` gates on)\n",
+        crate::report::thermal().unwrap_or_else(|| "no reading".to_string())
+    ));
+    body.push_str(&format!(
+        "- load: {load_at_start} (1/5/15-min) at the start, {} at the table; every cell line carries its own `load=`\n",
+        load_average(),
+    ));
+    let ceiling_mib = crate::guard::max_swap_growth_mib();
+    let swap_now = crate::guard::swap_used_bytes();
+    let swap_growth = swap_now
+        .zip(swap_at_start)
+        .map(|(now, start)| now.saturating_sub(start) / (1024 * 1024));
+    match (swap_at_start, swap_growth) {
+        (Some(start), Some(growth)) => body.push_str(&format!(
+            "- swap: {} MiB in use at the start, {growth} MiB grown during the run (ceiling {ceiling_mib} MiB{})\n",
+            start / (1024 * 1024),
+            if ceiling_mib == crate::guard::MAX_SWAP_GROWTH_MIB {
+                String::new()
+            } else {
+                format!(", raised by `MAHBOT_STAND_MAX_SWAP_MIB` from its default {}", crate::guard::MAX_SWAP_GROWTH_MIB)
+            },
+        )),
+        _ => body.push_str(&format!(
+            "- swap: the platform reported no figure; ceiling {ceiling_mib} MiB\n"
+        )),
+    }
     body.push_str("- command: `cargo run --release -p mahbot-inference` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`)\n");
     if let Ok(dir) = crate::loader::models_dir() {
         for (_, body_name, sound_name) in crate::loader::PAIRS {
@@ -545,6 +777,146 @@ fn unit_name(cell: &Cell) -> Option<&'static str> {
         Cell::Embed => Some("embed"),
         _ => None,
     }
+}
+
+/// One `key=value` figure from a child's stdout, by label rather than by
+/// position: the first whitespace-delimited token that starts with `{label}=`.
+/// A figure the cell does not print (a cell with no synthesis split) is `None`,
+/// which the table renders as `-`.
+fn field(text: &str, label: &str) -> Option<f64> {
+    let key = format!("{label}=");
+    text.split_whitespace()
+        .find_map(|token| token.strip_prefix(&key))
+        .and_then(|value| value.parse().ok())
+}
+
+/// The per-phase weight streams one cell's text carries, as
+/// `(phase, unit, bytes per unit, ms per unit)`. Only the two generative cells
+/// print them; a cell that does not is a row the rate table leaves out.
+fn streams_of(cell: &str, text: &str) -> Vec<(&'static str, &'static str, f64, f64)> {
+    fn pair(text: &str, bytes: &str, ms: &str) -> Option<(f64, f64)> {
+        Some((field(text, bytes)?, field(text, ms)?))
+    }
+    let mut out = Vec::new();
+    match cell {
+        "listen" => {
+            if let Some((bytes, ms)) = pair(text, "decode_stream_bytes", "decode_stream_ms") {
+                out.push(("recognition decode", "one token", bytes, ms));
+            }
+        }
+        "speak" => {
+            if let Some((bytes, ms)) = pair(text, "body_stream_bytes", "body_stream_ms") {
+                out.push(("talker body", "one frame", bytes, ms));
+            }
+            // One level of the frame's walk, not one of its draws: the walk is
+            // `steps + 1` levels (`graphs.rs`'s `for s in 0..=steps`), and the
+            // last one hands on logits instead of a code.
+            // A missing field drops the row instead of dividing by a stand-in:
+            // the level count is the divisor of one of the four phase figures.
+            if let (Some(levels), Some((bytes, ms))) = (
+                field(text, "predictor_levels").filter(|n| *n > 0.0),
+                pair(text, "predictor_stream_bytes", "predictor_stream_ms"),
+            ) {
+                out.push(("code predictor", "one level", bytes / levels, ms / levels));
+            }
+            if let Some((bytes, ms)) = pair(text, "sound_stream_bytes", "sound_stream_ms") {
+                out.push(("sound half", "one utterance", bytes, ms));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// One resident-set sample in decimal megabytes, or `unknown` where the platform
+/// did not answer — a zero would read as a measurement of a live process.
+fn mb(rss: Option<u64>) -> String {
+    rss.map_or_else(
+        || "unknown".to_string(),
+        |b| format!("{:.1}", b as f64 / 1e6),
+    )
+}
+
+/// One streaming-probe reading as a line: the ceiling every per-phase rate in the
+/// record is reported against, or the reading's own name and reason when the
+/// probe produced none — `no_adapter`, `device_work` and `panicked` are three
+/// different outcomes and the line keeps them apart.
+fn print_ceiling(
+    label: &str,
+    c: &Result<rlx_wgpu::bandwidth::StreamCeiling, rlx_wgpu::bandwidth::CeilingFailure>,
+) {
+    match c {
+        Ok(c) => println!(
+            "{label} read_gb_s={:.1} read_min_gb_s={:.1} read_max_gb_s={:.1} \
+             copy_gb_s={:.1} copy_min_gb_s={:.1} copy_max_gb_s={:.1} \
+             bytes_per_direction={} rounds={} at={} load={}",
+            c.read_gb_s,
+            c.read_min_gb_s,
+            c.read_max_gb_s,
+            c.gb_s,
+            c.min_gb_s,
+            c.max_gb_s,
+            c.bytes_per_direction,
+            c.rounds,
+            now(),
+            load_average(),
+        ),
+        Err(failure) => println!(
+            "{label} unavailable={} reason=\"{}\"",
+            failure.kind(),
+            failure.reason().map_or_else(String::new, one_line),
+        ),
+    }
+}
+
+/// A probe failure as the record reads it: its kind (`no_adapter`, `device_work`,
+/// `panicked`) and, where the platform gave one, the reason in parentheses. Both
+/// record sites go through it so the two readings cannot drift apart.
+fn failure_reading(failure: &rlx_wgpu::bandwidth::CeilingFailure) -> String {
+    format!(
+        "{}{}",
+        failure.kind(),
+        failure
+            .reason()
+            .map_or_else(String::new, |reason| format!(" ({})", one_line(reason)))
+    )
+}
+
+/// The streaming probe with its panic caught: a diagnostic must not discard a
+/// run, and a panic is its own reading rather than a missing adapter.
+fn probe_ceiling() -> Result<rlx_wgpu::bandwidth::StreamCeiling, rlx_wgpu::bandwidth::CeilingFailure>
+{
+    caught(rlx_wgpu::bandwidth::stream_ceiling)
+}
+
+/// [`probe_ceiling`]'s panic mapping, with the probe as its argument so a test can
+/// supply each of the three outcomes without a device.
+fn caught(
+    probe: impl FnOnce() -> Result<
+        rlx_wgpu::bandwidth::StreamCeiling,
+        rlx_wgpu::bandwidth::CeilingFailure,
+    > + std::panic::UnwindSafe,
+) -> Result<rlx_wgpu::bandwidth::StreamCeiling, rlx_wgpu::bandwidth::CeilingFailure> {
+    std::panic::catch_unwind(probe)
+        .map_err(|payload| {
+            rlx_wgpu::bandwidth::CeilingFailure::Panicked(panic_text(payload.as_ref()))
+        })
+        .and_then(|reading| reading)
+}
+
+/// A panic payload's message, for the `panicked` reading.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+/// One probe reason on one line: the record's fields are `key=value`, so a
+/// newline or a quote inside a reason would break the line it belongs to.
+fn one_line(text: &str) -> String {
+    text.replace(['\n', '\r', '"'], " ")
 }
 
 /// The machine-readable line a unit prints after its run:
@@ -685,13 +1057,61 @@ impl Phase {
     }
 }
 
-fn median(v: &[f64]) -> Option<f64> {
+/// The index of the value [`median`] returns, so a row takes its split from the
+/// same repetition rather than the nearest one.
+fn median_index(v: &[f64]) -> Option<usize> {
     if v.is_empty() {
         return None;
     }
-    let mut s = v.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    Some(s[s.len() / 2])
+    let mut order: Vec<usize> = (0..v.len()).collect();
+    order.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap());
+    Some(order[v.len() / 2])
+}
+
+fn median(v: &[f64]) -> Option<f64> {
+    median_index(v).map(|i| v[i])
+}
+
+/// `v` at the number of decimals the record prints it with, so a figure derived
+/// from it is the printed division rather than a more precise one.
+fn printed(v: f64, decimals: i32) -> f64 {
+    let scale = 10f64.powi(decimals);
+    (v * scale).round() / scale
+}
+
+/// The weight bytes one run of `graph` streams: every dense and packed matrix and
+/// every convolution its nodes read, counted **once per read**. This is the
+/// numerator of every per-phase rate in `MEASUREMENTS.md`, which is why it counts a
+/// block the predictor reads at each of its levels once per level — the block is
+/// streamed that many times, and a rate over the graph's *resident* bytes would
+/// overstate what the memory system delivered. Only an operand that **is** a
+/// parameter counts: an activation the shape happens to put in that position is the
+/// phase's own traffic, not its weight stream. Norms' and attention's small vectors,
+/// gathered table rows (a row read is not the table) and the input side are outside
+/// this figure.
+fn stream_bytes(graph: &rlx_ir::Graph) -> u64 {
+    let mut total = 0u64;
+    for node in graph.nodes() {
+        let reads_weights = matches!(
+            node.op,
+            rlx_ir::Op::DequantMatMul { .. }
+                | rlx_ir::Op::MatMul
+                | rlx_ir::Op::Conv { .. }
+                | rlx_ir::Op::ConvTranspose2d { .. }
+        );
+        if !reads_weights {
+            continue;
+        }
+        let Some(weight) = node.inputs.get(1) else {
+            continue;
+        };
+        let weight = graph.node(*weight);
+        if !matches!(weight.op, rlx_ir::Op::Param { .. }) {
+            continue;
+        }
+        total += weight.shape.size_bytes().unwrap_or(0) as u64;
+    }
+    total
 }
 
 /// One cell's measurements in the stand's own line: the run's price, its witnesses
@@ -708,6 +1128,8 @@ fn line(
     peak: u64,
     map_bytes: u64,
     counters: (u64, u64),
+    speech_s: f64,
+    split_ms: (f64, f64),
 ) {
     let steps: usize = o.ops.iter().map(|(_, n)| n).sum();
     let kinds: Vec<String> = o.ops.iter().map(|(k, n)| format!("{k}:{n}")).collect();
@@ -721,6 +1143,13 @@ fn line(
         phases.iter().map(|p| format!("{}:{}", p.name, p.passes)).collect::<Vec<_>>().join(",")
     ));
     text.push_str(&format!(" submits={} waits={}", counters.0, counters.1));
+    text.push_str(&format!(" speech_s={speech_s:.6}"));
+    if split_ms.0 > 0.0 || split_ms.1 > 0.0 {
+        text.push_str(&format!(
+            " loop_ms={:.2} sound_ms={:.2}",
+            split_ms.0, split_ms.1
+        ));
+    }
     text.push_str(&format!(" steps={steps} kinds={}", kinds.join("+")));
     text.push_str(&format!(
         " digest={:016x} values={} maxabs={} nonfinite={} params_f32={} params_packed={} dequant_nodes={}",
@@ -738,7 +1167,7 @@ fn line(
     let file_over_rss = map_bytes.saturating_sub(peak);
     text.push_str(&format!(
         " rss_end={} map={} beyond_map={} file_over_rss={} at={} load={}",
-        human(resident_rss()),
+        resident_rss().map_or_else(|| "unknown".to_string(), human),
         human(map_bytes),
         human(beyond_map),
         human(file_over_rss),
@@ -989,6 +1418,8 @@ fn ear() {
         peak,
         map_bytes,
         (c.0 - c0.0, c.1 - c0.1),
+        0.0,
+        (0.0, 0.0),
     );
 }
 
@@ -1048,7 +1479,10 @@ fn listen() {
         loader::Head::Separate { vocab, .. } | loader::Head::Tied { vocab, .. } => vocab,
     };
     let prompt_rows = ASR_HEAD_IDS.len() + ASR_TEXT_IDS.len() + tokens + ASR_TAIL_IDS.len();
-    let capacity = ASR_PROMPT_ROWS + ASR_MAX_NEW;
+    // The compiled capacity starts one bucket above the prompt and grows only as
+    // the walk fills it; a capacity fixed at the token budget would make every
+    // step's attention read thousands of masked rows.
+    let mut capacity = prompt_rows + DECODE_CACHE_BUCKET;
     let mut build_ms = 0f64;
 
     let mut front = match Front::build(&pair, frames) {
@@ -1130,77 +1564,45 @@ fn listen() {
     prefill_phase.cold_ms += prompt_read_ms;
     prefill_phase.warm_ms += prompt_read_ms;
     phases.push(prefill_phase);
-    // The decode is split into four layer groups: each group's arena sees only
-    // its own blocks, while the full body's weights and K/V stay the same.
-    let group_len = cfg.layers.div_ceil(4);
-    let ranges: Vec<std::ops::Range<usize>> = (0..4)
-        .map(|g| (g * group_len).min(cfg.layers)..((g + 1) * group_len).min(cfg.layers))
-        .filter(|r| !r.is_empty())
-        .collect();
-    let mut k_groups: Vec<Vec<f32>> = ranges
-        .iter()
-        .map(|r| vec![0f32; capacity * r.len() * hkv])
-        .collect();
-    let mut v_groups: Vec<Vec<f32>> = ranges
-        .iter()
-        .map(|r| vec![0f32; capacity * r.len() * hkv])
-        .collect();
-    for (gi, range) in ranges.iter().enumerate() {
-        for (local, l) in range.clone().enumerate() {
-            for r in 0..prompt_rows {
-                let dst = (r * range.len() + local) * hkv;
-                let src = (l * prompt_rows + r) * hkv;
-                k_groups[gi][dst..dst + hkv].copy_from_slice(&p.outs[1][src..src + hkv]);
-                v_groups[gi][dst..dst + hkv].copy_from_slice(&p.outs[2][src..src + hkv]);
-            }
-        }
-    }
-    let kv_bytes: usize = k_groups
-        .iter()
-        .chain(v_groups.iter())
-        .map(|c| c.len())
-        .sum::<usize>()
-        * 4;
+    // The decode is one whole-body graph on a per-layer plane cache: each
+    // layer's `[capacity + 1, hkv]` rows are already in the attention's row
+    // layout, and the step's own row is appended in-graph.
     // `mask[0..written]` is the history the decode may attend to;
     // `mask[capacity]` is the one query slot, not a cache row.
-    let mut mask = vec![0f32; capacity + 1];
-    for r in 0..prompt_rows {
-        mask[r] = 1.0;
-    }
-    mask[capacity] = 1.0;
+    let graphs::PlaneCache {
+        k: mut k_cache,
+        v: mut v_cache,
+        mut mask,
+    } = graphs::seed_plane_cache(
+        cfg.layers,
+        capacity,
+        prompt_rows,
+        hkv,
+        &p.outs[1],
+        &p.outs[2],
+    );
     let mut next = argmax(&p.outs[3][..vocab]) as usize;
     p.outs.clear();
     drop(prefill);
 
-    let t = report::Stopwatch::start();
-    let mut decodes = Vec::with_capacity(ranges.len());
-    for (gi, range) in ranges.iter().enumerate() {
-        let head = gi + 1 == ranges.len();
-        let d = match graphs::body_capacity_layers(pair.body.clone(), capacity, range.clone(), head)
-            .and_then(|m| graphs::Compiled::new(device, m))
-        {
-            Ok(b) => b,
-            Err(e) => {
-                cell_failed!("cell listen — decode group {gi} build: {e}");
-            }
-        };
-        decodes.push(d);
-    }
-    build_ms += t.ms();
-    for (gi, graph) in decodes.iter_mut().enumerate() {
-        if !graph
-            .runner
-            .resident_cache(&k_groups[gi], &v_groups[gi], (1, 2))
-        {
-            cell_failed!("cell listen — resident cache refused for group {gi}");
+    let build_decode = |cap: usize| match graphs::body_capacity_chain_planes(pair.body.clone(), cap)
+        .and_then(|m| graphs::Compiled::new(device, m))
+    {
+        Ok(b) => b,
+        Err(e) => {
+            cell_failed!("cell listen — decode build: {e}");
         }
-        k_groups[gi].clear();
-        v_groups[gi].clear();
+    };
+    let t = report::Stopwatch::start();
+    let mut decode = build_decode(capacity);
+    build_ms += t.ms();
+    if !decode.runner.resident_cache_planes(&k_cache, &v_cache) {
+        cell_failed!("cell listen — resident cache refused");
     }
-    let nodes: usize = decodes
-        .iter()
-        .map(|g| g.ops.iter().map(|(_, n)| n).sum::<usize>())
-        .sum();
+    for rows in k_cache.iter_mut().chain(v_cache.iter_mut()) {
+        rows.clear();
+    }
+    let nodes: usize = decode.ops.iter().map(|(_, n)| n).sum();
     let mut generated: Vec<usize> = Vec::new();
     let mut written = prompt_rows;
     let mut decode_times: Vec<f64> = Vec::new();
@@ -1220,34 +1622,80 @@ fn listen() {
         let cos: Vec<f32> = cos.iter().map(|v| *v as f32).collect();
         let sin: Vec<f32> = sin.iter().map(|v| *v as f32).collect();
         let t = report::Stopwatch::start();
-        let mut logits = Vec::new();
-        let last = decodes.len().saturating_sub(1);
-        for (gi, graph) in decodes.iter_mut().enumerate() {
-            let inputs = vec![
-                ("x".into(), hidden),
-                ("cos".into(), cos.clone()),
-                ("sin".into(), sin.clone()),
-                ("mask".into(), mask.clone()),
-            ];
-            let o = match graph
-                .runner
-                .run_resident(&inputs, written, ranges[gi].len(), hkv)
-            {
-                Some(o) => o,
-                None => {
-                    cell_failed!("cell listen — resident feed refused at {written}, group {gi}");
-                }
-            };
-            hidden = o[0].clone();
-            if gi == last {
-                logits = o[3].clone();
+        let inputs = vec![
+            ("x".into(), hidden),
+            ("cos".into(), cos.clone()),
+            ("sin".into(), sin.clone()),
+            ("mask".into(), mask.clone()),
+        ];
+        // Output order: `hidden`, each layer's K row, its V row, then logits.
+        // One read carries the token's whole answer; the cache rows are fed
+        // device-side.
+        let o = match decode.runner.run_resident_planes(
+            &inputs,
+            written,
+            hkv,
+            &graphs::plane_step_reads(cfg.layers),
+        ) {
+            Some(o) => o,
+            None => {
+                cell_failed!("cell listen — resident feed refused at {written}");
             }
-        }
+        };
         decode_times.push(t.ms() + row_read_ms);
         generated.push(next);
-        next = argmax(&logits[..vocab]) as usize;
+        next = argmax(&o[1][..vocab]) as usize;
+        hidden = o[0].clone();
         mask[written] = 1.0;
         written += 1;
+        // A compiled graph's attention reads its whole `[capacity + 1]` plane,
+        // so the cache grows by one bucket when the live rows reach it: the
+        // written rows move in a plain row copy, the rest stays zero, and the
+        // mask is rebuilt with the same key order (history, then the spare row
+        // now at `cap`). The arithmetic and the graph are unchanged.
+        if written == capacity && !is_asr_eos(next) && generated.len() < ASR_MAX_NEW {
+            let cap = capacity + DECODE_CACHE_BUCKET;
+            let mut k_new: Vec<Vec<f32>> = (0..cfg.layers)
+                .map(|_| vec![0f32; (cap + 1) * hkv])
+                .collect();
+            let mut v_new: Vec<Vec<f32>> = (0..cfg.layers)
+                .map(|_| vec![0f32; (cap + 1) * hkv])
+                .collect();
+            let live = written * hkv;
+            for l in 0..cfg.layers {
+                let k_rows = match decode.runner.read_plane(&format!("k{l}")) {
+                    Some(rows) => rows,
+                    None => {
+                        cell_failed!("cell listen — reading k{l} at row {written}");
+                    }
+                };
+                let v_rows = match decode.runner.read_plane(&format!("v{l}")) {
+                    Some(rows) => rows,
+                    None => {
+                        cell_failed!("cell listen — reading v{l} at row {written}");
+                    }
+                };
+                k_new[l][..live].copy_from_slice(&k_rows[..live]);
+                v_new[l][..live].copy_from_slice(&v_rows[..live]);
+            }
+            k_cache = k_new;
+            v_cache = v_new;
+            mask = vec![0f32; cap + 1];
+            for r in 0..written {
+                mask[r] = 1.0;
+            }
+            mask[cap] = 1.0;
+            let t = report::Stopwatch::start();
+            decode = build_decode(cap);
+            build_ms += t.ms();
+            if !decode.runner.resident_cache_planes(&k_cache, &v_cache) {
+                cell_failed!("cell listen — resident cache refused at capacity {cap}");
+            }
+            for rows in k_cache.iter_mut().chain(v_cache.iter_mut()) {
+                rows.clear();
+            }
+            capacity = cap;
+        }
     }
     // The decode phase: its first iteration is the cold pass, the rest give the
     // warm median.
@@ -1255,6 +1703,7 @@ fn listen() {
     decode_phase.first_ms = decode_times.first().copied().unwrap_or(0.0);
     decode_phase.cold_ms = decode_phase.first_ms
         + decode_phase.step_ms * (decode_phase.iters.saturating_sub(1)) as f64;
+    let decode_ms = decode_phase.step_ms;
     phases.push(decode_phase);
     let cold_ms: f64 = phases.iter().map(|p| p.cold_ms).sum();
     let warm_ms: f64 = phases.iter().map(|p| p.warm_ms).sum();
@@ -1274,6 +1723,8 @@ fn listen() {
     values.push(next as f32);
     values.push(if is_asr_eos(next) { 1.0 } else { 0.0 });
     values.push(written as f32);
+    // The planes as the walk left them: `2 · layers · (capacity + 1) · hkv` f32.
+    let kv_bytes = 2 * cfg.layers * (capacity + 1) * hkv * 4;
     let fields = [
         ("frames", frames.to_string()),
         ("rows", tokens.to_string()),
@@ -1281,6 +1732,7 @@ fn listen() {
         ("offset", offset.to_string()),
         ("prompt", prompt_rows.to_string()),
         ("capacity", capacity.to_string()),
+        ("capacity_bucket", DECODE_CACHE_BUCKET.to_string()),
         ("kv_bytes", kv_bytes.to_string()),
         ("generated", generated.len().to_string()),
         (
@@ -1295,12 +1747,41 @@ fn listen() {
         ),
         ("text", format!("{:?}", text)),
         ("decode_steps", (written - prompt_rows).to_string()),
+        // One token's weight stream — the body graph's multiply and conv
+        // parameters, which one decode step re-reads — and the step's own seconds.
+        // The rate table in `MEASUREMENTS.md` divides the two.
+        (
+            "decode_stream_bytes",
+            stream_bytes(&decode.runner.graph).to_string(),
+        ),
+        ("decode_stream_ms", format!("{decode_ms:.3}")),
     ];
     let o = p;
     let peak = peak_rss();
     // No drop before this read: the peak is the unit's whole live state.
     let map_bytes = file_bytes(&pair.body.path) + file_bytes(&pair.sound.path);
     let c = graphs::device_counts();
+    // The witness is checked before the line prints: a run whose answer moved is
+    // a failed run even if its seconds improved. A cell deliberately fed another
+    // recording or another generation budget is a different cell, so its answer
+    // is not compared against the pinned one.
+    let alternate = std::env::var_os("STAND_ASR_WAV").is_some()
+        || std::env::var_os("STAND_ASR_OFFSET").is_some()
+        // The voice WAV is this cell's only audio input, so its *presence* is not
+        // an alternate: the pin holds for the clip the witness was recorded with
+        // and is skipped only when that file's content differs.
+        || !crate::reference::voice_is_pinned();
+    if alternate {
+        println!("witness listen skipped=alternate-input");
+    } else if !crate::reference::check_listen(
+        frames,
+        prompt_rows,
+        generated.len(),
+        digest(&values),
+        &text,
+    ) {
+        cell_failed!("cell listen — the answer is not the pinned reference");
+    }
     line(
         "listen",
         &fields,
@@ -1316,6 +1797,8 @@ fn listen() {
         peak,
         map_bytes,
         (c.0 - c0.0, c.1 - c0.1),
+        samples as f64 / 16_000.0,
+        (0.0, 0.0),
     );
 }
 
@@ -1446,11 +1929,13 @@ fn ear_short(samples: usize, name: &str) {
         peak,
         map_bytes,
         (c.0 - c0.0, c.1 - c0.1),
+        0.0,
+        (0.0, 0.0),
     );
 }
 
 /// The generation loop: 300 text tokens and 330 codec rows (~26 s).
-/// Per frame the body step, then the fifteen predictor steps each reading the
+/// Per frame the body step, then the sixteen predictor levels each reading the
 /// code just drawn, then the sum of the sixteen code embeddings plus the next
 /// text hidden row becomes the next frame's input.
 fn speak() {
@@ -1489,7 +1974,7 @@ fn speak() {
     let hkv = cfg.kv_heads * cfg.head_dim;
     let steps = graphs::code_predictor_steps(&pair.sound).unwrap_or(0);
     let (top_k, top_p, temperature) = pair.body.sampling();
-    let (blocks, hkv_pred, hd_pred) = match graphs::code_predictor_cache(&pair.sound) {
+    let (blocks, hkv_pred, _) = match graphs::code_predictor_cache(&pair.sound) {
         Ok(v) => v,
         Err(e) => {
             cell_failed!("cell speak — predictor cache: {e}");
@@ -1502,17 +1987,6 @@ fn speak() {
         .plan("a.gen.code.head.weight")
         .unwrap()
         .ggml_shape[1];
-    let vocab_pred = pair
-        .sound
-        .plan("a.gen.code.embd.weight")
-        .unwrap()
-        .ggml_shape[1];
-    let (embd, _) = match pair.sound.f32_file_order("a.gen.code.embd.weight") {
-        Ok(v) => v,
-        Err(e) => {
-            cell_failed!("cell speak — reading `embd`: {e}");
-        }
-    };
     let mut build_ms = 0f64;
     let c0 = graphs::device_counts();
     let mut phases = Vec::new();
@@ -1598,6 +2072,12 @@ fn speak() {
         }
     };
 
+    // Residency is attributed by measurement: one sample with the sampler graphs,
+    // the speaker encoder and the talker prompt already built and run, one after
+    // each graph the generation loop holds live, one with the
+    // sound half's, so the peak's growth is read off the deltas rather than
+    // inferred from plans.
+    let rss_start = report::resident_rss();
     let t = report::Stopwatch::start();
     let mut prefill =
         match graphs::body_new_rows_head_chain(pair.body.clone(), prompt_rows, 0, true)
@@ -1609,6 +2089,7 @@ fn speak() {
             }
         };
     build_ms += t.ms();
+    let rss_prefill = report::resident_rss();
     let (cos, sin) = host::rope_tables_at(0, prompt_rows, cfg.head_dim, cfg.rope_base as f64);
     let prompt_digest = digest(&prompt_x);
     let p = prefill.run(
@@ -1646,7 +2127,7 @@ fn speak() {
     // prompt rows are copied into that cache before the first step.
     let capacity = prompt_rows + rows;
     let t = report::Stopwatch::start();
-    let mut body = match graphs::body_capacity_chain(pair.body.clone(), capacity)
+    let mut body = match graphs::body_capacity_chain_planes(pair.body.clone(), capacity)
         .and_then(|m| graphs::Compiled::new(device, m))
     {
         Ok(b) => b,
@@ -1655,47 +2136,53 @@ fn speak() {
         }
     };
     build_ms += t.ms();
-    let mut k_cache = vec![0f32; capacity * cfg.layers * hkv];
-    let mut v_cache = vec![0f32; capacity * cfg.layers * hkv];
-    for l in 0..cfg.layers {
-        for r in 0..prompt_rows {
-            let dst = (r * cfg.layers + l) * hkv;
-            let src = (l * prompt_rows + r) * hkv;
-            k_cache[dst..dst + hkv].copy_from_slice(&p.outs[1][src..src + hkv]);
-            v_cache[dst..dst + hkv].copy_from_slice(&p.outs[2][src..src + hkv]);
-        }
-    }
-    let mut mask = vec![0f32; capacity + 1];
-    for r in 0..prompt_rows {
-        mask[r] = 1.0;
-    }
-    mask[capacity] = 1.0;
-    if !body.runner.resident_cache(&k_cache, &v_cache, (1, 2)) {
+    let rss_body = report::resident_rss();
+    let graphs::PlaneCache {
+        k: mut k_cache,
+        v: mut v_cache,
+        mut mask,
+    } = graphs::seed_plane_cache(
+        cfg.layers,
+        capacity,
+        prompt_rows,
+        hkv,
+        &p.outs[1],
+        &p.outs[2],
+    );
+    if !body.runner.resident_cache_planes(&k_cache, &v_cache) {
         cell_failed!("cell speak — body resident cache refused");
     }
-    let mut kv_bytes = k_cache.len() + v_cache.len();
-    k_cache.clear();
-    v_cache.clear();
-
-    // The code predictor on its own carried cache: one row and all fifteen heads
-    // per submission, reset for every frame.
-    let t = report::Stopwatch::start();
-    let mut walk = match graphs::tts_code_predictor_step_all(pair.sound.clone(), capacity_pred)
-        .and_then(|m| graphs::Compiled::new(device, m))
-    {
-        Ok(b) => b,
-        Err(e) => {
-            cell_failed!("cell speak — predictor build: {e}");
-        }
-    };
-    build_ms += t.ms();
-    let mut k_pred = vec![0f32; capacity_pred * blocks * hkv_pred];
-    let mut v_pred = vec![0f32; capacity_pred * blocks * hkv_pred];
-    if !walk.runner.resident_cache(&k_pred, &v_pred, (1, 2)) {
-        cell_failed!("cell speak — predictor resident cache refused");
+    let mut kv_bytes: usize = k_cache
+        .iter()
+        .chain(v_cache.iter())
+        .map(|rows| rows.len())
+        .sum();
+    for rows in k_cache.iter_mut().chain(v_cache.iter_mut()) {
+        rows.clear();
     }
-    kv_bytes += k_pred.len() + v_pred.len();
+
+    // The code predictor: **one** graph for the whole sixteen-level frame — the
+    // head-less body at level 0, then every projecting level with its own head —
+    // with each code drawn by an `Op::Sample` on the device and the cache carried
+    // between levels in the arena. A frame is one run and one fence instead of
+    // sixteen, its dispatches submitted in encode chunks, and the sampled code
+    // never comes back to the host between levels.
+    let t = report::Stopwatch::start();
+    let mut pred_frame =
+        match graphs::tts_code_predictor_frame(pair.sound.clone(), capacity_pred, sampler)
+            .and_then(|m| graphs::Compiled::new(device, m))
+        {
+            Ok(b) => b,
+            Err(e) => {
+                cell_failed!("cell speak — predictor frame build: {e}");
+            }
+        };
+    build_ms += t.ms();
+    // The frame graph carries the row-first `[capacity, blocks, hkv]` cache in
+    // its own arena; the figure stays the cache the walk holds.
+    kv_bytes += 2 * capacity_pred * blocks * hkv_pred;
     // The predictor's first step is its cold pass; no throw-away run.
+    let rss_loop_graphs = report::resident_rss();
     let mut all_codes: Vec<Vec<usize>> = Vec::with_capacity(rows);
     let mut body_times: Vec<f64> = Vec::new();
     let mut pred_times: Vec<f64> = Vec::new();
@@ -1722,76 +2209,74 @@ fn speak() {
                 }
             };
 
-        // Reset the predictor's cache for this frame and walk its fifteen heads.
-        k_pred.fill(0.0);
-        v_pred.fill(0.0);
-        if !walk.runner.resident_cache(&k_pred, &v_pred, (1, 2)) {
-            cell_failed!("cell speak — predictor rebind refused");
+        // One fence for the whole walk, and one submission per encode chunk: the
+        // sixteen levels live in one schedule, each draw is `Op::Sample` on the
+        // device, and the cache rows stay in the arena between them. Only the draw
+        // seeds cross the boundary — they are `Op::Sample`'s uniform words, so the
+        // compiled frame serves every frame.
+        let seeds = graphs::predictor_draw_seeds(12345, draw_index, steps, top_k, temperature);
+        if !pred_frame.runner.set_sample_seeds(&seeds) {
+            cell_failed!("cell speak — predictor frame refused the frame's draw seeds");
         }
-        // The predictor is a two-row prefill followed by fourteen generated
-        // levels: row 0 is the talker hidden, row 1 is code0, and head `s`
-        // reads row `s+1` and predicts level `s+1`.
-        for s in 0..=steps {
-            let (cos, sin) = host::rope_tables_at(s, 1, hd_pred, 1e6);
-            let row = if s == 0 {
-                hidden.clone()
-            } else if s == 1 {
-                code0_embed.clone()
-            } else {
-                let id = frame_codes[s - 1];
-                let at = ((s - 2) * vocab_pred + id) * d_talker;
-                embd[at..at + d_talker].to_vec()
+        let read: &[usize] = if f == 0 { &[0, 1] } else { &[0] };
+        let t = report::Stopwatch::start();
+        let out = pred_frame.runner.run_read(
+            &[
+                ("hidden".into(), hidden.clone()),
+                ("code0_embed".into(), code0_embed.clone()),
+            ],
+            read,
+        );
+        pred_times.push(t.ms());
+        let codes = match out.first() {
+            Some(v) if v.len() >= steps => v,
+            _ => {
+                cell_failed!("cell speak — predictor frame returned no codes at frame {f}");
+            }
+        };
+        for k in 0..steps {
+            frame_codes.push(codes[k] as usize);
+        }
+        draw_index += steps as u64;
+        // The one-off arithmetic witness, on the frame graph's own level-1
+        // logits: the stand's one-node sampler and the host draw agree.
+        if f == 0 {
+            let logits = match out.get(1) {
+                Some(v) if v.len() >= head_out => v[..head_out].to_vec(),
+                _ => {
+                    cell_failed!("cell speak — predictor frame returned no level-1 logits");
+                }
             };
-            let mut p_mask = vec![0f32; capacity_pred + 1];
-            for p in 0..s {
-                p_mask[p] = 1.0;
-            }
-            p_mask[capacity_pred] = 1.0;
-            let inputs = vec![
-                ("x".into(), row),
-                ("cos".into(), cos.iter().map(|v| *v as f32).collect()),
-                ("sin".into(), sin.iter().map(|v| *v as f32).collect()),
-                ("mask".into(), p_mask),
-            ];
-            let t = report::Stopwatch::start();
-            let out = walk.runner.run_read(&inputs, &[0]);
-            // The predictor's cache is row-first now: this step's new rows of
-            // every block are one contiguous row, so one feed carries all of
-            // them instead of one submission per block.
-            if !walk.runner.feed_rows(0, s, blocks * hkv_pred) {
-                cell_failed!("cell speak — predictor feed refused at step {s}");
-            }
-            pred_times.push(t.ms());
-            if s == 0 {
-                continue;
-            }
-            let at = (s - 1) * head_out;
-            let t = report::Stopwatch::start();
-            let logits = out[0][at..at + head_out].to_vec();
-            let id = host::draw(&logits, top_k, top_p, temperature, 12345 + draw_index);
-            sample_times.push(t.ms());
-            if s == 1 {
-                let same_seed = host::draw(&logits, top_k, top_p, temperature, 12345);
-                let engine = sample_pred.run(&[("logits".into(), logits)], 0);
-                let got = engine.outs[0].first().copied().unwrap_or(f32::NAN) as usize;
-                sampler1 = if got == same_seed {
-                    "equal".into()
-                } else {
-                    format!("host={same_seed} engine={got}")
-                };
-            }
-            draw_index += 1;
-            frame_codes.push(id);
+            let same_seed = host::draw(&logits, top_k, top_p, temperature, 12345);
+            let engine = sample_pred.run(&[("logits".into(), logits)], 0);
+            let got = engine.outs[0].first().copied().unwrap_or(f32::NAN) as usize;
+            sampler1 = if got == same_seed {
+                "equal".into()
+            } else {
+                format!("host={same_seed} engine={got}")
+            };
         }
-        // The next frame's input: the sixteen code embeddings, summed.
+        // The next frame's input: the sixteen code embeddings, summed. The rows
+        // are picked out of the file one level at a time — the frame graph's
+        // gather reads its own copy in the arena, so the host keeps none.
         let mut sum = vec![0f32; d_talker];
         for (o, v) in sum.iter_mut().zip(&code0_embed) {
             *o += *v;
         }
-        for level in 1..=steps {
-            let id = frame_codes[level];
-            let at = ((level - 1) * vocab_pred + id) * d_talker;
-            for (o, v) in sum.iter_mut().zip(&embd[at..at + d_talker]) {
+        let picks: Vec<(usize, usize)> = (1..=steps)
+            .map(|level| (level - 1, frame_codes[level]))
+            .collect();
+        let embeds = match pair
+            .sound
+            .table_rows_f32("a.gen.code.embd.weight", &picks, d_talker)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                cell_failed!("cell speak — reading the code embeddings: {e}");
+            }
+        };
+        for e in &embeds {
+            for (o, v) in sum.iter_mut().zip(e) {
                 *o += *v;
             }
         }
@@ -1808,7 +2293,15 @@ fn speak() {
                 ("mask".into(), mask.clone()),
             ];
             let t = report::Stopwatch::start();
-            let body_o = match body.runner.run_resident(&inputs, written, cfg.layers, hkv) {
+            // Output order: `hidden`, each layer's K row, its V row, logits.
+            // The step reads the hidden row and the logits; the cache rows are
+            // fed device-side.
+            let body_o = match body.runner.run_resident_planes(
+                &inputs,
+                written,
+                hkv,
+                &graphs::plane_step_reads(cfg.layers),
+            ) {
                 Some(o) => o,
                 None => {
                     cell_failed!("cell speak — body feed refused at frame {f}");
@@ -1818,7 +2311,7 @@ fn speak() {
             mask[written] = 1.0;
             written += 1;
             hidden = body_o[0].clone();
-            let mut logits = body_o[3][..body_vocab].to_vec();
+            let mut logits = body_o[1][..body_vocab].to_vec();
             suppress_service(&mut logits, body_vocab);
             apply_repetition(&mut logits, &code_seen, TTS_REPEAT_PENALTY);
             let t = report::Stopwatch::start();
@@ -1830,12 +2323,12 @@ fn speak() {
     }
     let frames = all_codes.len();
     let body_nodes = body.ops.iter().map(|(_, n)| n).sum();
-    let pred_nodes = walk.ops.iter().map(|(_, n)| n).sum();
+    let pred_nodes: usize = pred_frame.ops.iter().map(|(_, n)| n).sum();
     phases.push(Phase::loop_times("body", &body_times, body_nodes));
     phases.push(Phase::loop_times("predictor", &pred_times, pred_nodes));
     phases.push(Phase::loop_times("sampler", &sample_times, 0));
-    // No drop before the peak: `prefill`, `body`, `walk`, the prompt and the
-    // predictor tables all stay alive through the sound half.
+    // No drop before the peak: `prefill`, `body`, `predictor` and the sound
+    // graphs all stay alive through the sound half.
 
     // The sound half: codes → codebook → wave transformer → DAC.
     let levels = pair
@@ -1909,7 +2402,10 @@ fn speak() {
     };
     build_ms += t.ms();
     let mut sound_graphs: Vec<graphs::Compiled> = Vec::new();
-    let mut sound_ms = 0f64;
+    let mut sound_phase_ms = 0f64;
+    // The sound half's own weight stream: every window re-reads the graph it runs,
+    // so the numerator is that graph's parameter bytes once per window.
+    let mut sound_weight_bytes = 0u64;
     // The wave transformer carries a 72-frame window: 71 K/V frames per layer,
     // the last `pre_conv` frames and the global position. Running the front on
     // the whole part makes every frame depend on the part's total length (the
@@ -1994,7 +2490,8 @@ fn speak() {
             run.max_ms,
             run.passes,
         ));
-        sound_ms += run.step_ms;
+        sound_phase_ms += run.step_ms;
+        sound_weight_bytes += stream_bytes(&graph.runner.graph);
         if o.is_none() {
             o = Some(run);
         }
@@ -2062,7 +2559,8 @@ fn speak() {
                 .1
                 .run(&[("codec_in".into(), chunk)], WARM_REPS);
             nodes = nodes.max(run.ops.iter().map(|(_, n)| n).sum());
-            sound_ms += run.step_ms;
+            sound_phase_ms += run.step_ms;
+            sound_weight_bytes += stream_bytes(&graphs_by_len[gi].1.runner.graph);
             stats.push((
                 run.first_ms,
                 run.step_ms,
@@ -2104,6 +2602,7 @@ fn speak() {
             println!("cell speak — writing `{path}`: {e}");
         }
     }
+    let rss_sound_graphs = report::resident_rss();
     let o = match o {
         Some(o) => o,
         None => return,
@@ -2126,9 +2625,12 @@ fn speak() {
     let cold_ms: f64 = phases.iter().map(|p| p.cold_ms).sum();
     let warm_ms: f64 = phases.iter().map(|p| p.warm_ms).sum();
     let passes = phases.iter().map(|p| p.passes).sum();
+    // The loop's own rate over its compulsory packed traffic is the record's
+    // table, not a second figure here: `body_stream_bytes`/`predictor_stream_bytes`
+    // are the numerators and their `_ms` the denominators.
     let fields = [
         ("rows", frames.to_string()),
-        ("predictor_steps", steps.to_string()),
+        ("predictor_levels", (steps + 1).to_string()),
         ("sound_graphs", groups.len().to_string()),
         ("cache", "resident".to_string()),
         ("kv_bytes", (kv_bytes * 4).to_string()),
@@ -2136,7 +2638,28 @@ fn speak() {
         ("body_ms", fmt_ms(body_total)),
         ("predictor_ms", fmt_ms(pred_total)),
         ("sampler_ms", fmt_ms(sampler_total)),
-        ("sound_ms", fmt_ms(sound_ms)),
+        ("sound_phase_ms", fmt_ms(sound_phase_ms)),
+        // The per-phase weight streams behind `MEASUREMENTS.md`'s rate table, one
+        // unit each: the bytes a unit re-reads and the milliseconds it took, both
+        // plain numbers so the record's rate is that division and nothing else.
+        // The body is one frame; the predictor's figures are one frame of the walk
+        // (all sixteen projecting levels, whose stream the record splits over them);
+        // the sound half is one utterance, every window's graph counted.
+        (
+            "body_stream_bytes",
+            stream_bytes(&body.runner.graph).to_string(),
+        ),
+        ("body_stream_ms", format!("{:.3}", body_total / rows as f64)),
+        (
+            "predictor_stream_bytes",
+            stream_bytes(&pred_frame.runner.graph).to_string(),
+        ),
+        (
+            "predictor_stream_ms",
+            format!("{:.3}", pred_total / rows as f64),
+        ),
+        ("sound_stream_bytes", sound_weight_bytes.to_string()),
+        ("sound_stream_ms", format!("{sound_phase_ms:.3}")),
         ("speaker_norm", format!("{speaker_norm:.4}")),
         ("text0_norm", format!("{text0_norm:.4}")),
         ("sampler_body", sampler0.to_string()),
@@ -2156,9 +2679,61 @@ fn speak() {
     let cell = "speak";
     let peak = peak_rss();
     // No drop before the peak: body, predictor, prompt, sound graphs and the
-    // codec all remain resident.
+    // codec all remain resident. The trajectory is read from the process, so the
+    // record attributes the peak to the owners that were live when it was
+    // reached instead of summing plans that were never allocated whole.
     let map_bytes = file_bytes(&pair.body.path) + file_bytes(&pair.sound.path);
+    println!(
+        "speak residency start_mb={} prefill_mb={} body_mb={} loop_graphs_mb={} \
+         sound_graphs_mb={} peak_mb={:.1} map_mb={:.1}",
+        mb(rss_start),
+        mb(rss_prefill),
+        mb(rss_body),
+        mb(rss_loop_graphs),
+        mb(rss_sound_graphs),
+        peak as f64 / 1e6,
+        map_bytes as f64 / 1e6,
+    );
+    let r = rlx_wgpu::gguf_gpu::route_counts();
+    // The shape of the *last* one-row dispatch, not of every call: `per_row` counts
+    // the calls, `cols_per_workgroup`/`threads_per_workgroup`/`workgroups` describe
+    // the one that ran last (see `gemv_one_row_shape`).
+    let (cols_per_wg, threads, workgroups) = rlx_wgpu::gguf_gpu::gemv_one_row_shape()
+        .map_or((0, 0, 0), |s| {
+            (s.cols_per_workgroup, s.threads_per_workgroup, s.workgroups)
+        });
+    println!(
+        "speak packed routes per_row={} host={} scratch={} grouped={} q1_0={} \
+         cols_per_workgroup={cols_per_wg} threads_per_workgroup={threads} \
+         workgroups={workgroups}",
+        r.per_row, r.host, r.scratch, r.grouped, r.q1_0_gemm,
+    );
     let c = graphs::device_counts();
+    // The generation loop (body, predictor, sampler, speaker, prefill) against
+    // the sound half; their sum is the unit's warm figure by construction.
+    let loop_ms: f64 = phases
+        .iter()
+        .filter(|p| !p.name.starts_with("sound"))
+        .map(|p| p.warm_ms)
+        .sum();
+    let sound_total: f64 = phases
+        .iter()
+        .filter(|p| p.name.starts_with("sound"))
+        .map(|p| p.warm_ms)
+        .sum();
+    // The voice is an input, not a switch: the pin holds only for the voice the
+    // witness was recorded with. Another `MAHBOT_VOICE_WAV` records its own
+    // digest rather than failing the pinned one.
+    let other_voice = !crate::reference::voice_is_pinned();
+    let alternate = std::env::var_os("STAND_SPEAK_ROWS").is_some()
+        || std::env::var_os("STAND_SPEAK_TEXT").is_some()
+        || std::env::var_os("STAND_SPEAKER_WAV").is_some()
+        || other_voice;
+    if alternate {
+        println!("witness speak skipped=alternate-input");
+    } else if !crate::reference::check_speak(frames, wave.len(), digest(&wave), prompt_digest) {
+        cell_failed!("cell speak — the waveform is not the pinned reference");
+    }
     line(
         cell,
         &fields,
@@ -2174,6 +2749,8 @@ fn speak() {
         peak,
         map_bytes,
         (c.0 - c0.0, c.1 - c0.1),
+        frames as f64 * graphs::samples_per_frame() as f64 / 24_000.0,
+        (loop_ms, sound_total),
     );
 }
 
@@ -2445,6 +3022,8 @@ fn embed() {
         peak,
         map_bytes,
         (c.0 - c0.0, c.1 - c0.1),
+        0.0,
+        (0.0, 0.0),
     );
 }
 
@@ -2487,6 +3066,8 @@ fn mel() {
         peak,
         0,
         (c.0 - c0.0, c.1 - c0.1),
+        0.0,
+        (0.0, 0.0),
     );
 }
 
@@ -2609,6 +3190,8 @@ fn head() {
         peak_rss(),
         0,
         (c.0 - c0.0, c.1 - c0.1),
+        0.0,
+        (0.0, 0.0),
     );
 
     let c0 = graphs::device_counts();
@@ -2632,6 +3215,8 @@ fn head() {
         peak_rss(),
         0,
         (c.0 - c0.0, c.1 - c0.1),
+        0.0,
+        (0.0, 0.0),
     );
 }
 
@@ -2675,4 +3260,50 @@ fn biases(g: &rlx_ir::Graph) -> (usize, usize) {
         }
     }
     (total, on_a_narrow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::caught;
+    use rlx_wgpu::bandwidth::{CeilingFailure, StreamCeiling};
+
+    /// The record keeps three readings apart — no adapter, failed device work, a
+    /// panic — and a diagnostic must never fold the last two into the first. This
+    /// exercises the mapping both probe sites share.
+    #[test]
+    fn a_probe_failure_is_three_distinguishable_readings() {
+        fn failure(reading: &Result<StreamCeiling, CeilingFailure>) -> &CeilingFailure {
+            match reading {
+                Ok(_) => panic!("no probe produced a figure"),
+                Err(failure) => failure,
+            }
+        }
+        let readings = [
+            caught(|| Err(CeilingFailure::NoAdapter)),
+            caught(|| Err(CeilingFailure::DeviceWork("the wait poll failed".into()))),
+            caught(|| -> Result<StreamCeiling, CeilingFailure> { panic!("probe exploded") }),
+        ];
+        let kinds: Vec<_> = readings.iter().map(|r| failure(r).kind()).collect();
+        assert_eq!(kinds, ["no_adapter", "device_work", "panicked"]);
+        let reasons: Vec<_> = readings
+            .iter()
+            .map(|r| failure(r).reason().map(str::to_string))
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                None,
+                Some("the wait poll failed".to_string()),
+                Some("probe exploded".to_string())
+            ],
+            "a device fault and a panic must each say what happened"
+        );
+        for (reading, kind) in readings.iter().zip(kinds) {
+            let line = failure(reading).to_string();
+            assert!(
+                !line.contains("no wgpu adapter") || kind == "no_adapter",
+                "{kind} must not read as a missing adapter: {line}"
+            );
+        }
+    }
 }

@@ -41,6 +41,7 @@
 //! | 1 device route, device work after | (4, 5) | **(1, 1)** |
 //! | 2 device route, copies last       | (4, 5) | **(1, 1)** |
 //! | 3 host route forced               | (4, 5) | **(4, 5)** |
+//! | 3b host route, device work after  | (4, 5) | parity only |
 //! | 4 both join kinds, device work    | (4, 5) | **(1, 1)** |
 //!
 //! Each device-route copy used to pay one submission and two waits: its own
@@ -81,14 +82,14 @@
 //!
 //! Single test fn on purpose: the counters are process-global, so this file owns
 //! them, resets them per bracket, and runs as its own test binary. The one knob it
-//! sets — `RLX_WGPU_HOST_BUFFER_COPY`, inside bracket 3 — is unset inside that
-//! bracket, and the guard below rejects the knobs that would change what a
+//! sets — `RLX_WGPU_HOST_BUFFER_COPY`, inside brackets 3 and 3b — is unset inside
+//! each bracket, and the guard below rejects the knobs that would change what a
 //! submission or a wait means.
 
 mod common;
 
 use rlx_ir::quant::QuantScheme;
-use rlx_ir::{DType, Graph, Op, Shape};
+use rlx_ir::{DType, Graph, GraphExt, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_wgpu::backend::WgpuExecutable;
 use rlx_wgpu::gguf_gpu::{reset_route_counts, route_counts};
@@ -158,6 +159,37 @@ fn kv_row_only_graph() -> Graph {
         Shape::new(&[1, POS + 1, W], DType::F32),
     );
     g.set_outputs(vec![k, v]);
+    g
+}
+
+/// The two row writes followed by device work that reads the rows they wrote.
+///
+/// The flips are whole-arena host steps, so a graph built only of them and the
+/// copies never dispatches before the writes; this one starts with a device
+/// step (`tanh`), which is what makes the mirror's invalidation path live when
+/// the copies run, and ends at a device consumer (`softmax`) instead of the
+/// final flush, which is what makes the copy's own delivery live.
+fn kv_row_device_consumer_graph() -> Graph {
+    let mut g = Graph::new("wgpu_buffer_copy_batch_join_device_consumer");
+    let x = g.input("x", Shape::new(&[1, 1, W], DType::F32));
+    let t = g.tanh(x);
+    let row = g.reverse(t, vec![2]);
+    let ck = g.param("cache_k", Shape::new(&[1, CAP, W], DType::F32));
+    let cv = g.param("cache_v", Shape::new(&[1, CAP, W], DType::F32));
+    let k = g.add_node(
+        Op::KvAppend { axis: 1, pos: POS },
+        vec![ck, row],
+        Shape::new(&[1, POS + 1, W], DType::F32),
+    );
+    let v = g.add_node(
+        Op::KvAppend { axis: 1, pos: POS },
+        vec![cv, row],
+        Shape::new(&[1, POS + 1, W], DType::F32),
+    );
+    let shape = Shape::new(&[1, POS + 1, W], DType::F32);
+    let sk = g.softmax(k, 2, shape.clone());
+    let sv = g.softmax(v, 2, shape);
+    g.set_outputs(vec![sk, sv]);
     g
 }
 
@@ -232,6 +264,27 @@ fn assert_packed_close(got: &[f32], want: &[f32], what: &str) {
         got.iter().fold(0.0f32, |m, v| m.max(v.abs())) > 0.0,
         "{what}: the output is all zeros"
     );
+}
+
+/// Parity at a tolerance, for a consumer that rounds (`softmax`). A row that
+/// never reached the device would read as `1/width` everywhere, orders of
+/// magnitude away from a real row, so the tolerance is not carrying the check.
+fn assert_close(got: &[Vec<f32>], want: &[Vec<f32>], tol: f32, what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: output count");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert_eq!(g.len(), w.len(), "{what}: output {i} length");
+        let max_abs = common::max_abs_diff(g, w);
+        assert!(
+            max_abs <= tol,
+            "{what}: output {i} max_abs {max_abs:e} > {tol:e}"
+        );
+        let spread = g.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - g.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(
+            spread > 0.0,
+            "{what}: output {i} is uniform — the row the consumer read is missing"
+        );
+    }
 }
 
 /// Bit-for-bit equality against the reference, reported as the first mismatch
@@ -401,6 +454,31 @@ fn a_device_route_row_write_rides_the_enclosing_batch_and_the_host_route_still_s
          submission(s) and {w3} wait(s)"
     );
     assert_exact(&out_host, &cpu_last, "graph 2, host route");
+
+    // ── 3b. The host route with device work after the copies ─────────────
+    // Bracket 3's copies are the schedule's last steps, so the run's final flush
+    // delivers them; its flips are host steps, so nothing dispatched before the
+    // writes. Here a device step precedes them and a device consumer follows
+    // them. Before the copy's deferred write reached the door in front of that
+    // consumer, and before the mirror survived the host boundary between the two
+    // copies, the consumer read zeros for the row the first copy had written.
+    // Parity against the CPU reference is what fails then.
+    rlx_ir::env::set("RLX_WGPU_HOST_BUFFER_COPY", "1");
+    let consumer = kv_row_device_consumer_graph();
+    let cpu_consumer = build(Device::Cpu, &consumer, &[]).run(&[("x", &x)]);
+    let mut exe_consumer = build(Device::Gpu, &consumer, &[]);
+    let _ = exe_consumer.run(&[("x", &x_warm)]);
+    reset_device_counts();
+    let out_consumer = exe_consumer.run(&[("x", &x)]);
+    let (s3b, w3b) = (device_submit_count(), device_wait_count());
+    rlx_ir::env::unset("RLX_WGPU_HOST_BUFFER_COPY");
+    eprintln!("[copy-join] (3b) host route, device work after: submits={s3b} waits={w3b}");
+    assert_close(
+        &out_consumer,
+        &cpu_consumer,
+        1e-5,
+        "two row writes between device work, host route",
+    );
 
     // ── 4. Both join kinds in one run of device work ─────────────────────
     // The row writes and a packed multiply whose route is the one-row device arm,

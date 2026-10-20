@@ -91,6 +91,10 @@ name = "attention_cached_decode_route"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "attention_decode_digest"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "attention_decode_route"
 required-features = ["backend-tests"]
 

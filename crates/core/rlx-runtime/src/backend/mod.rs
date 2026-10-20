@@ -465,6 +465,14 @@ pub trait ExecutableGraph: Send {
         }
     }
 
+    /// Rewrite the draw seeds of this executable's `Sample` steps, in schedule
+    /// order. `Op::Sample`'s seed is a uniform word, so one compiled sampling
+    /// graph serves every request; a backend whose steps bake it answers false.
+    /// Default: unsupported.
+    fn set_sample_seeds(&mut self, _seeds: &[u64]) -> bool {
+        false
+    }
+
     /// ZERO-COPY in-place optimizer step over GPU-resident weights. For each
     /// `trainable[i] = (weight_input_name, shape)` — a resident arena Input (see
     /// [`Self::bind_gpu_handle`]) whose gradient is at output slot `1 + i`

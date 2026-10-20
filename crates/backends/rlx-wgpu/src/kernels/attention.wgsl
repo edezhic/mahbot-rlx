@@ -54,6 +54,12 @@ const MAX_HEAD_DIM: u32 = 512u;
 // 16.25 KiB and is above that floor.
 const DECODE_LANES: u32 = 64u;
 const DECODE_DIM_CHUNK: u32 = 32u;
+// Widest head the decode entry's per-lane Q and O arrays hold. The route
+// (`kernels::attention_decode_eligible`) admits at most this width, and the two
+// arrays are sized for it rather than `MAX_HEAD_DIM`: at 512 they are 4 KiB of
+// per-thread stack, which the Metal compiler spills, and every key iteration
+// then pays a thread-local load and store for them.
+const DECODE_MAX_DIM: u32 = 128u;
 
 // The score a key position contributes after this operation's logit cap and
 // mask: the same cap, sentinels, threshold and window for every entry point
@@ -285,7 +291,8 @@ fn attention_decode(
         + h * params.o_head_stride
         + qi * params.o_seq_stride;
 
-    var q_reg: array<f32, MAX_HEAD_DIM>;
+    if (hd > DECODE_MAX_DIM || hd_v > DECODE_MAX_DIM) { return; }
+    var q_reg: array<f32, DECODE_MAX_DIM>;
     for (var d: u32 = 0u; d < hd; d = d + 1u) { q_reg[d] = arena[q_base + d]; }
 
     // Running (m, l, O[]) over this lane's share of the keys: lane `lid` takes
@@ -293,7 +300,7 @@ fn attention_decode(
     // multiple so the merge below never reads an indeterminate O element.
     var m: f32 = -3.4e38;
     var l: f32 = 0.0;
-    var o: array<f32, MAX_HEAD_DIM>;
+    var o: array<f32, DECODE_MAX_DIM>;
     let hd_v_pad = (hd_v + DECODE_DIM_CHUNK - 1u) / DECODE_DIM_CHUNK * DECODE_DIM_CHUNK;
     for (var d: u32 = 0u; d < hd_v_pad; d = d + 1u) { o[d] = 0.0; }
 

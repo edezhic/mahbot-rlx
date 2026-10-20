@@ -59,8 +59,9 @@ use crate::backend::PassMarks;
 use crate::buffer::Arena;
 use crate::gguf_host::scheme_from_id;
 use crate::kernels::{
-    DequantGemmGgufParams, DequantGemmQ10Params, DequantGemvGgufParams, DequantGgufParams, Kernel,
-    MatmulParams, dequant_gemm_q1_0_kernel, dequant_gemm_q4k_kernel, dequant_gemm_q6k_kernel,
+    CopyFromSlabParams, DequantGemmGgufParams, DequantGemmQ10Params, DequantGemvGgufParams,
+    DequantGgufParams, Kernel, MatmulParams, copy_from_slab_kernel, copy_from_slab_vec4_kernel,
+    dequant_gemm_q1_0_kernel, dequant_gemm_q4k_kernel, dequant_gemm_q6k_kernel,
     dequant_gemm_q8_0_kernel, dequant_gemv_gguf_kernel, dequant_gemv_gguf_tiled_kernel,
     dequant_gguf_kernel, matmul_bt_kernel,
 };
@@ -395,17 +396,18 @@ pub(crate) fn note_route(route: DequantMatmulRoute) {
 }
 
 /// Threads one workgroup of a one-row packed multiply runs, per arm: the tiled
-/// arm splits a column's contraction over 32 lanes, one lane per 32-element unit
-/// of the row (a Q4_K sub-block, or half a Q6_K `ql` span read at both of its
-/// nibble sets — see the shader header); the legacy arm gives each of its 64
-/// threads one output column.
+/// arm splits a column's contraction over `GEMV_TILED_THREADS` lanes, one lane per
+/// 32-element unit of the row (a Q4_K sub-block, or half a Q6_K `ql` span read at
+/// both of its nibble sets — see the shader header); the legacy arm gives each of
+/// its 64 threads one output column.
 ///
 /// The shader's declared `@workgroup_size` and the shape the route records must
 /// both be these numbers: the device-free `tiled_gemv_geometry_matches_the_shader`
 /// below derives the tiled arm's `@workgroup_size` (and its `LANES`/`COLS_PER_WG`)
 /// from these constants, `tests/gguf_kernel_scheme_coverage.rs` pins the legacy
 /// arm's size and the portable floor, and `tests/gguf_matmul_route.rs` pins the
-/// recorded shape.
+/// recorded shape. `tests/gguf_one_row_stream_rate.rs` carries what moving the
+/// tiled arm's two constants does to the rate.
 const GEMV_TILED_THREADS: u32 = 32;
 const GEMV_LEGACY_THREADS: u32 = 64;
 
@@ -912,8 +914,9 @@ const STORAGE_ALIGN: u64 = 256;
 
 /// Reused GEMM/GEMV output slabs — creating a fresh buffer per matmul was a
 /// large fraction of Bonsai-27B prefill time (hundreds of allocs/frame).
-/// Safe across dispatches in one encoder because each dispatch is followed by
-/// a `copy_buffer_to_buffer` into the arena before the next write.
+/// Safe across dispatches in one encoder because each multiply is followed by
+/// the slab → arena move ([`encode_out_slab_copy`]) before the next write, and
+/// dispatches execute in recording order.
 /// Pooled output buffer + its capacity. Named (vs a tuple) so it can assert
 /// `Send` on the browser WebGPU backend where `wgpu::Buffer` is `!Send`; wasm is
 /// single-threaded, so the process-global pool is never sent cross-thread.
@@ -964,24 +967,147 @@ fn with_pooled_out_buf<R>(
     f(buf)
 }
 
-/// Encode fused GGUF DequantMatMul into `enc` (no `queue.submit`), leaving the
-/// submission to the caller. Scheme and shape pick the route: the Q1_0 and
-/// row-grouped GEMMs first, then the per-row GEMV loop — through which a multi-row
-/// call the grouped GEMM's own gates decline is read ([`DequantMatmulPath::GroupedDevice`]
-/// lists them), the same route an unjoined call of that shape takes. For a multi-row
-/// Q8_0 call, whose per-row loop carries its one row alone, those same declines are
-/// the *refusal* below instead, its bisect lever `RLX_WGPU_Q8_0_GEMM_DISABLE`
-/// included. Uniforms are unique per
-/// dispatch (`queue.write_buffer` is not ordered inside an encoder the way copies
-/// are).
+/// Record one `out_buf → arena` move into `pass`.
+///
+/// The output slab and the arena are different buffers, so this cannot be the
+/// arena-only `copy.wgsl` move, and — because it must ride the pass a packed
+/// multiply was joined into — it cannot be a `copy_buffer_to_buffer` blit
+/// either: a blit is not a compute dispatch, so recording one ends the pass.
+/// It is a storage-to-storage dispatch instead, bindings 0 = the arena window
+/// (read-write), 1 = params, 2 = the slab window (read-only); the usage scopes
+/// are per dispatch, so the same slab being read here and written by the
+/// multiply's own dispatch before it is not a conflict.
+///
+/// Both windows start at a 256 B-aligned base and carry their intra-window
+/// offset in the uniform, the same shape every other windowed GGUF kernel
+/// uses. `elems` is the f32 count; the vector form is taken only when the span
+/// is whole vectors and both offsets are 16 B aligned.
+///
+/// `pass` executes its dispatches in recording order, so a later multiply that
+/// reuses the pooled slab cannot overwrite it before this copy has read it.
+fn encode_out_slab_copy(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pass: &mut wgpu::ComputePass<'_>,
+    out_buf: &wgpu::Buffer,
+    src_byte_off: u64,
+    dst_byte_off: usize,
+    elems: u32,
+) {
+    if elems == 0 {
+        return;
+    }
+    let dst0 = dst_byte_off as u64;
+    let dst_base = (dst0 / STORAGE_ALIGN) * STORAGE_ALIGN;
+    let (dst_buf, dst_local) = arena.resolve_act(dst_base as usize);
+    let dst_need = dst0 + elems as u64 * 4 - dst_base;
+    let dst_size =
+        (dst_need.div_ceil(16) * 16).min(dst_buf.size().saturating_sub(dst_local as u64));
+    // The old blit this replaces failed validation when the destination slot
+    // straddled a shard; keep that refusal explicit rather than binding a
+    // short window and writing half the output. A truncated window is any case
+    // where the buffer ends inside the move — a shard boundary is the common one.
+    assert!(
+        dst_size >= dst_need,
+        "rlx-wgpu: packed multiply's output copy runs past the end of its buffer \
+         (out_byte_off {dst_byte_off}, {elems} f32, window {dst_size} of {dst_need} B)"
+    );
+
+    let src_base = (src_byte_off / STORAGE_ALIGN) * STORAGE_ALIGN;
+    let src_need = src_byte_off + elems as u64 * 4 - src_base;
+    let src_size = src_need.div_ceil(16) * 16;
+
+    let in_off = ((src_byte_off - src_base) / 4) as u32;
+    let out_off = ((dst0 - dst_base) / 4) as u32;
+    let vec4 = crate::backend::vec4_move_ok(elems, in_off, out_off);
+    let p = CopyFromSlabParams {
+        n: elems,
+        in_off,
+        out_off,
+        _p0: 0,
+    };
+    let u = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rlx-wgpu copy_from_slab uniform"),
+        size: std::mem::size_of::<CopyFromSlabParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+    let ck = if vec4 {
+        copy_from_slab_vec4_kernel(device)
+    } else {
+        copy_from_slab_kernel(device)
+    };
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rlx-wgpu copy_from_slab bg"),
+        layout: &ck.bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: dst_buf,
+                    offset: dst_local as u64,
+                    size: wgpu::BufferSize::new(dst_size),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: u.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: out_buf,
+                    offset: src_base,
+                    size: wgpu::BufferSize::new(src_size),
+                }),
+            },
+        ],
+    });
+    // Vectors are one 16 B lane each; scalars one f32 each. A span wider than
+    // the grid cap splits over `gid.y` (the shaders' own linearization), which
+    // keeps a full-vocabulary head one dispatch.
+    let items = if vec4 { elems.div_ceil(4) } else { elems };
+    let (gx, gy, gz) = crate::backend::dispatch_dims(items, crate::backend::MOVE_WORKGROUP);
+    pass.set_pipeline(&ck.pipeline);
+    pass.set_bind_group(0, &bg, &[]);
+    if vec4 {
+        crate::backend::note_vec4_move();
+    }
+    pass.dispatch_workgroups(gx, gy, gz);
+}
+
+/// Encode the fused GGUF DequantMatMul ladder into `pass`, the caller's already
+/// open compute pass. Scheme and shape pick the route: the Q1_0 and row-grouped
+/// GEMMs first, then the per-row GEMV loop — through which a multi-row call the
+/// grouped GEMM's own gates decline is read ([`DequantMatmulPath::GroupedDevice`]
+/// lists them), the same route an unjoined call of that shape takes. For a
+/// multi-row Q8_0 call, whose per-row loop carries its one row alone, those same
+/// declines are the *refusal* below instead, its bisect lever
+/// `RLX_WGPU_Q8_0_GEMM_DISABLE` included. Uniforms are unique per dispatch
+/// (`queue.write_buffer` is not ordered inside an encoder the way a dispatch is).
+///
+/// This is the entry the run's batch join uses: every dispatch — the dequant
+/// multiply's and the slab → arena move that lands its output — is recorded into
+/// the pass the run already has open, so a packed multiply no longer ends that
+/// pass and the move is a dispatch (`encode_out_slab_copy`) rather than a
+/// `copy_buffer_to_buffer` blit. Dispatches in one pass execute in recording
+/// order, which is what makes the shared pooled slab safe: a later multiply can
+/// only overwrite it after this call's copy has read it.
+///
+/// The caller's pass is the one the run report already marked, so no
+/// [`PassMarks`] handle is taken here.
 ///
 /// Returns whether this ladder has an arm for the call: `false` when it does not —
 /// a scheme outside [`gemv_supports_scheme`] above one row, whose row-grouped arm
 /// declined, for which the per-row loop has no branch (its leg dispatch would match
-/// nothing and read the weights as zeros). Nothing is encoded in that case and the
-/// caller owns the fallback, [`run_dequant_matmul_gguf_gpu`] for such a scheme — so
-/// this answer cannot be discarded, by either caller: the run's join branch reads it
-/// from its own call here, and [`run_dequant_matmul_gguf_gemv_rows`] from its.
+/// nothing and read the weights as zeros). Nothing is encoded in that case — the
+/// refusals are all decided before the first dispatch — so the caller can end its
+/// pass and hand the call to the fallback, [`run_dequant_matmul_gguf_gpu`] for such
+/// a scheme. This answer cannot be discarded, by either caller: the run's in-pass
+/// join reads it from its own call here, and [`run_dequant_matmul_gguf_gemv_rows`]
+/// from the encoder wrapper's.
 ///
 /// The per-row loop's tiled arm reads X as `vec4`, so X's window must be
 /// four-element addressable. [`run_dequant_matmul_gguf_gemv_rows`] checks that
@@ -990,16 +1116,12 @@ fn with_pooled_out_buf<R>(
 /// compose that guard — before calling here directly. This gate carries the
 /// 8-bit scheme's own block term (`one_row_arm_ok`), so a direct caller has to
 /// make sure of the window alone.
-///
-/// `marks` is the run's pass-marks handle: every pass this ladder opens carries
-/// it, so the report's device view covers a packed multiply's passes as it covers
-/// the batch's.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_dequant_matmul_gguf_into(
+pub fn encode_dequant_matmul_gguf_into_pass(
     arena: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    enc: &mut wgpu::CommandEncoder,
+    pass: &mut wgpu::ComputePass<'_>,
     m: usize,
     k: usize,
     n: usize,
@@ -1007,7 +1129,6 @@ pub fn encode_dequant_matmul_gguf_into(
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
-    marks: &mut PassMarks<'_>,
 ) -> bool {
     if m == 0 {
         return true;
@@ -1019,14 +1140,13 @@ pub fn encode_dequant_matmul_gguf_into(
             arena,
             device,
             queue,
-            enc,
+            pass,
             m,
             k,
             n,
             x_byte_off,
             w_byte_off,
             out_byte_off,
-            marks,
         )
     {
         note_route(DequantMatmulRoute::Q1_0Gemm);
@@ -1043,7 +1163,7 @@ pub fn encode_dequant_matmul_gguf_into(
             arena,
             device,
             queue,
-            enc,
+            pass,
             m,
             k,
             n,
@@ -1051,7 +1171,6 @@ pub fn encode_dequant_matmul_gguf_into(
             x_byte_off,
             w_byte_off,
             out_byte_off,
-            marks,
         )
     {
         note_route(DequantMatmulRoute::Grouped);
@@ -1069,18 +1188,58 @@ pub fn encode_dequant_matmul_gguf_into(
             arena,
             device,
             queue,
-            enc,
+            pass,
             k,
             n,
             scheme_id,
             x_byte_off + row * k * 4,
             w_byte_off,
             out_byte_off + row * n * 4,
-            marks,
         );
     }
     note_route(DequantMatmulRoute::PerRow);
     true
+}
+
+/// Encode the fused GGUF DequantMatMul into `enc` (no `queue.submit`), leaving the
+/// submission to the caller. The whole ladder goes into one pass this call opens
+/// through `marks`, so a caller outside the run path — [`run_dequant_matmul_gguf_gemv_rows`]
+/// and the crate's tests — keeps the shape it had. The run's own joined calls use
+/// [`encode_dequant_matmul_gguf_into_pass`] instead, recording into the batch pass
+/// already open; the route ladder and its answer are the same function's.
+///
+/// `marks` is the run's pass-marks handle: the one pass this wrapper opens carries
+/// it, so the report's device view covers a packed multiply's passes as it covers
+/// the batch's.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_dequant_matmul_gguf_into(
+    arena: &Arena,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    enc: &mut wgpu::CommandEncoder,
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme_id: u32,
+    x_byte_off: usize,
+    w_byte_off: usize,
+    out_byte_off: usize,
+    marks: &mut PassMarks<'_>,
+) -> bool {
+    let mut pass = marks.begin(enc, "rlx-wgpu dequant_matmul_gguf pass");
+    encode_dequant_matmul_gguf_into_pass(
+        arena,
+        device,
+        queue,
+        &mut pass,
+        m,
+        k,
+        n,
+        scheme_id,
+        x_byte_off,
+        w_byte_off,
+        out_byte_off,
+    )
 }
 
 /// Fused decode/prefill path: `Y[m,n] = X[m,k] @ W^T` with packed GGUF `W`.
@@ -1173,14 +1332,13 @@ fn encode_dequant_matmul_gguf_gemm_q1_0(
     arena: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    enc: &mut wgpu::CommandEncoder,
+    pass: &mut wgpu::ComputePass<'_>,
     m: usize,
     k: usize,
     n: usize,
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
-    marks: &mut PassMarks<'_>,
 ) -> bool {
     debug_assert!(k.is_multiple_of(128), "Q1_0 GEMM requires k % 128 == 0");
     let block_elems = 128usize;
@@ -1266,7 +1424,6 @@ fn encode_dequant_matmul_gguf_gemm_q1_0(
         });
 
         {
-            let mut pass = marks.begin(enc, "rlx-wgpu dequant_gemm_q1_0 pass");
             pass.set_pipeline(&dk.pipeline);
             pass.set_bind_group(0, &bg, &[]);
             const TM: u32 = 8;
@@ -1277,16 +1434,27 @@ fn encode_dequant_matmul_gguf_gemm_q1_0(
         let row_bytes = (n * 4) as u64;
         let contiguous = (dst0_off as u64) + out_bytes <= dst0.size();
         if contiguous {
-            enc.copy_buffer_to_buffer(out_buf, 0, dst0, dst0_off as u64, out_bytes);
+            encode_out_slab_copy(
+                arena,
+                device,
+                queue,
+                pass,
+                out_buf,
+                0,
+                out_byte_off,
+                (m * n) as u32,
+            );
         } else {
             for r in 0..m {
-                let (dst, dst_off) = arena.resolve_act(out_byte_off + r * n * 4);
-                enc.copy_buffer_to_buffer(
+                encode_out_slab_copy(
+                    arena,
+                    device,
+                    queue,
+                    pass,
                     out_buf,
                     (r as u64) * row_bytes,
-                    dst,
-                    dst_off as u64,
-                    row_bytes,
+                    out_byte_off + r * n * 4,
+                    n as u32,
                 );
             }
         }
@@ -1532,6 +1700,15 @@ const GROUPED_SPLIT_MAX_BASE_WORKGROUPS: u32 = 32;
 /// Q4_K one dispatches wherever [`grouped_chunk_geometry`] does not put it on the
 /// split; that function is this plus the split decision, so the arithmetic has
 /// one spelling.
+///
+/// `x` is the column axis and `y` the row-group axis, so a launch walks every
+/// column chunk of row group 0 before row group 1 and the `m / 8` groups that
+/// share a weight slice never read it from the same cache line. Swapping the two
+/// axes is arithmetic-free and was tried: the recognition prefill measured
+/// 577.4 → 576.8 ms warm (three round-robin pairs, inside the spread), so this
+/// route is not limited by the weight re-reads the swap would have served but by
+/// the staged-activation traffic and the dequant arithmetic. Do not re-take it as
+/// a bandwidth win without a new reading.
 pub fn grouped_base_geometry(m: usize, n_chunk: usize) -> (u32, u32) {
     (
         n_chunk.div_ceil(GROUPED_THREADS as usize) as u32,
@@ -1631,7 +1808,7 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
     arena: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    enc: &mut wgpu::CommandEncoder,
+    pass: &mut wgpu::ComputePass<'_>,
     m: usize,
     k: usize,
     n: usize,
@@ -1639,7 +1816,6 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
-    marks: &mut PassMarks<'_>,
 ) -> bool {
     debug_assert!(
         m > 1,
@@ -1835,7 +2011,6 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
             });
 
             {
-                let mut pass = marks.begin(enc, "rlx-wgpu dequant_gemm_gguf pass");
                 pass.set_pipeline(&dk.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(x_groups, y_groups, 1);
@@ -1843,19 +2018,29 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
 
             // Slab rows are [m, n_chunk]; this chunk owns arena columns
             // [n0, n0 + n_chunk).
-            let row_out = (n_chunk * 4) as u64;
             let (dst0, dst0_off) = arena.resolve_act(out_byte_off);
             if n_chunk == n && dst0_off as u64 + (m * n * 4) as u64 <= dst0.size() {
-                enc.copy_buffer_to_buffer(out_buf, 0, dst0, dst0_off as u64, (m * n * 4) as u64);
+                encode_out_slab_copy(
+                    arena,
+                    device,
+                    queue,
+                    pass,
+                    out_buf,
+                    0,
+                    out_byte_off,
+                    (m * n) as u32,
+                );
             } else {
                 for r in 0..m {
-                    let (dst, dst_off) = arena.resolve_act(out_byte_off + r * n * 4 + n0 * 4);
-                    enc.copy_buffer_to_buffer(
+                    encode_out_slab_copy(
+                        arena,
+                        device,
+                        queue,
+                        pass,
                         out_buf,
                         (r * n_chunk * 4) as u64,
-                        dst,
-                        dst_off as u64,
-                        row_out,
+                        out_byte_off + r * n * 4 + n0 * 4,
+                        n_chunk as u32,
                     );
                 }
             }
@@ -1914,14 +2099,13 @@ fn encode_dequant_matmul_gguf_gemv_one(
     arena: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    enc: &mut wgpu::CommandEncoder,
+    pass: &mut wgpu::ComputePass<'_>,
     k: usize,
     n: usize,
     scheme_id: u32,
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
-    marks: &mut PassMarks<'_>,
 ) {
     let x0 = x_byte_off as u64;
     let x_base = (x0 / STORAGE_ALIGN) * STORAGE_ALIGN;
@@ -2040,7 +2224,6 @@ fn encode_dequant_matmul_gguf_gemv_one(
             });
 
             {
-                let mut pass = marks.begin(enc, "rlx-wgpu dequant_gemv_gguf pass");
                 pass.set_pipeline(&dk.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
                 if tiled {
@@ -2057,8 +2240,16 @@ fn encode_dequant_matmul_gguf_gemv_one(
             }
             n0 += n_chunk;
         }
-        let (dst, dst_off) = arena.resolve_act(out_byte_off);
-        enc.copy_buffer_to_buffer(out_buf, 0, dst, dst_off as u64, (n * 4) as u64);
+        encode_out_slab_copy(
+            arena,
+            device,
+            queue,
+            pass,
+            out_buf,
+            0,
+            out_byte_off,
+            n as u32,
+        );
     });
 }
 
@@ -2365,6 +2556,9 @@ mod tests {
             format!("const LANES: u32 = {GEMV_TILED_THREADS}u;"),
             format!("const COLS_PER_WG: u32 = {GEMV_TILED_COLS_PER_WG}u;"),
             "var<workgroup> red: array<f32, LANES * COLS_PER_WG>;".to_string(),
+            // The reduction's own shape: a halving tree from `LANES / 2`, so the
+            // number of partial sums a store reads is the width the dispatch declares.
+            "var step = LANES / 2u;".to_string(),
             // The entry's column span, and the second column's reduction slots and
             // store — the places that column's geometry is spelled out.
             "let j0 = wid.x * COLS_PER_WG;".to_string(),

@@ -8,8 +8,9 @@
 //! ([`rlx_wgpu::device_submit_count`] / [`rlx_wgpu::device_wait_count`]). A call
 //! of the tiled K-quant arms' windowed route — the one-row arm, and the
 //! row-grouped GEMM it becomes above one row — is device-only work that belongs
-//! *inside* the enclosing run of device work: one submission per contiguous run,
-//! and none of its own. The 8-bit scheme's multi-row calls over whole 32-element
+//! *inside* the enclosing run of device work: it takes the batch's own
+//! submission (the batch submits once per encode chunk, `RLX_WGPU_ENCODE_CHUNK`)
+//! and adds none of its own. The 8-bit scheme's multi-row calls over whole 32-element
 //! blocks of its own are that same kind of work, through the same grouped arm, once
 //! the ladder admits them.
 //!
@@ -75,13 +76,15 @@
 //! it — **3 and 4** against 4 and 5 unjoined. **5 — a host `BufferCopy` → joined**:
 //! the one host arm that `continue`s past the shared post-host-step door, so only
 //! the join block's own flush can carry its deferred write to the device
-//! (`RLX_WGPU_HOST_BUFFER_COPY=1` forces the copy to the host route) — **2 and 3**
-//! against 3 and 4 unjoined.
+//! (`RLX_WGPU_HOST_BUFFER_COPY=1` forces the copy to the host route) — **2 and 2**
+//! against 3 and 4 unjoined: the flush rides the batch's own submission, where the
+//! multiply's pre-step door (the unjoined arm) still polls the device.
 //!
 //! The unjoined pairs are this same binary under `RLX_WGPU_ONE_OP_PER_PASS=1`,
 //! which is also what pins the join not reaching into the step-by-step path (that
 //! mode is inert by design). For brackets 2–5 that run reads exactly what the change
-//! removed (6/6, 2/2, 4/5, 3/4). Brackets 1, 6, 7 and 8 are five-step device runs
+//! removed (6/6, 2/2, 4/5, 3/4 — bracket 5's own pair being 3/4 there, its flush then
+//! polling for itself). Brackets 1, 6, 7 and 8 are five-step device runs
 //! and that mode submits each of those steps, so they read 5/4 there, while the join
 //! disabled with the counters in place reads 4/4 — the pair the join set's own gain
 //! is measured on. (Brackets 7 and 8 measure the unjoined leg in-process when the
@@ -1318,12 +1321,13 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
     if measured_leg {
         assert_eq!(
             (c_submits, c_waits),
-            if step_by_step { (3, 4) } else { (2, 3) },
-            "the host copy's readback, the join block's flush of its deferred write, \
-             and the joined batch's own submission and readback: 2 and 3 with the join \
-             in place, 3 and 4 with it inert, the multiply then flushing the mirror \
-             through its own pre-step door; measured {c_submits} submission(s), \
-             {c_waits} wait(s)"
+            if step_by_step { (3, 4) } else { (2, 2) },
+            "the host copy's readback and the joined batch's own submission and readback: \
+             2 and 2 with the join in place, 3 and 4 with it inert. The join block's flush of \
+             the copy's deferred write rides the batch — the queue write is ordered before that \
+             batch's submission — so it costs no poll of its own, where the multiply's pre-step \
+             door (the inert arm's route) still drains the device before it reads X; measured \
+             {c_submits} submission(s), {c_waits} wait(s)"
         );
     } else {
         eprintln!(

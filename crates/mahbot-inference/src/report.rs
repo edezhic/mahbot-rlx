@@ -67,7 +67,10 @@ unsafe extern "C" {
 }
 
 /// Resident set size right now, in bytes (the fallback / diagnostic reading).
-pub fn resident_rss() -> u64 {
+///
+/// `None` when the platform's process query fails or answers nothing usable: a
+/// zero here would read as a measurement of a live process, which no run has.
+pub fn resident_rss() -> Option<u64> {
     let pid = std::process::id().to_string();
     std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &pid])
@@ -76,7 +79,6 @@ pub fn resident_rss() -> u64 {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|kb| kb * 1024)
-        .unwrap_or(0)
 }
 /// Return the pages freed so far to the OS. macOS keeps them in the malloc
 /// zones, so a process that drops one phase and builds the next peaks at the
@@ -110,6 +112,22 @@ pub fn human(bytes: u64) -> String {
     } else {
         format!("{bytes}B")
     }
+}
+
+/// An exact count in space-grouped thousands (`1 101 234 567`), the way
+/// `MEASUREMENTS.md` writes one. A rate printed beside it is that exact
+/// division, where [`human`]'s rounding would leave a per-cent of slack.
+#[must_use]
+pub fn grouped(bytes: u64) -> String {
+    let digits = bytes.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 /// Milliseconds, in the unit the reports use.
@@ -178,6 +196,42 @@ pub fn load_average() -> String {
                 .join(" ")
         })
         .unwrap_or_else(|| "unknown".into())
+}
+
+/// The thermal state the numbers were taken under, as `scripts/check-throttle.sh`
+/// reads it from `pmset -g therm`: the limits the platform printed, naming only
+/// those, or `unknown` where it printed none of them. `None` where the reading
+/// itself is unavailable, so the record can say "no reading" instead of claiming
+/// a cool run.
+pub fn thermal() -> Option<String> {
+    let text = std::process::Command::new("pmset")
+        .args(["-g", "therm"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())?;
+    let limit = |key: &str| {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(key))
+            .and_then(|rest| rest.split('=').nth(1)?.trim().parse::<u32>().ok())
+    };
+    let (speed, sched) = (limit("CPU_Speed_Limit"), limit("CPU_Scheduler_Limit"));
+    let mut printed = Vec::new();
+    if let Some(speed) = speed {
+        printed.push(format!("CPU_Speed_Limit {speed}"));
+    }
+    if let Some(sched) = sched {
+        printed.push(format!("CPU_Scheduler_Limit {sched}"));
+    }
+    if printed.is_empty() {
+        return Some("unknown (pmset -g therm printed no CPU limit line)".into());
+    }
+    let state = if speed.is_some_and(|v| v < 100) || sched.is_some_and(|v| v < 100) {
+        "throttled"
+    } else {
+        "not throttled"
+    };
+    Some(format!("{state} ({})", printed.join(", ")))
 }
 
 /// The `RLX_*` and `STAND_*` keys this process carries, sorted. The first are the

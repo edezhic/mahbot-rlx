@@ -6,6 +6,14 @@
 // One thread per batch row; serial inside each row (vocab N typically
 // 32k–50k — fast enough on a single SIMD lane for batch=1 inference).
 //
+// A one-row dispatch (`outer == 1`) instead splits the row across the
+// workgroup: the draw sits on the critical path of a decode step, where the row
+// is browsed once per sampled token. Every reduction that decides
+// the drawn id keeps the serial order — the exponent sum and the
+// renormalisation sum stay lane-0 loops in index order, the max scans keep the
+// lower index on ties — so the cooperative path picks exactly the id the serial
+// one does.
+//
 // Algorithm:
 //   1. Scale logits by 1/temperature into the scratch slot; track row max.
 //   2. Convert to probabilities (exp(x - max) / sum_exp) in the scratch
@@ -108,9 +116,179 @@ fn threefry2x32_20(c_in: vec2<u32>, k_in: vec2<u32>) -> vec2<u32> {
     return vec2<u32>(x0, x1);
 }
 
-@compute @workgroup_size(64)
-fn sample(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
-    let row = gid.x + gid.y * ngs.x * 64u;
+/// The workgroup width of every entry point in this module, written once: the
+/// scratch arrays, the cooperative scans' strides and the grid's row index are
+/// all this number (it is also each `@workgroup_size`). The dispatch is computed
+/// with `kernels::SAMPLE_LANES`, which a unit test holds to this literal.
+const LANES: u32 = 64u;
+
+// Workgroup scratch for a one-row draw. `wg_best` reduces (value, index) pairs;
+// `wg_one` broadcasts the one scalar the serial order must produce on lane 0.
+var<workgroup> wg_best_v: array<f32, LANES>;
+var<workgroup> wg_best_i: array<u32, LANES>;
+var<workgroup> wg_one: f32;
+
+/// The best **value** over the workgroup: higher wins, and on an exact tie the
+/// **lower index** wins — the serial scan's `v > best` order. The index is
+/// selected and carried as a `u32` (`wg_best_i[0]`); only the output slot the
+/// caller finally writes it to is `f32`, which is not what indexes a row.
+fn wg_best(lane: u32, value: f32, index: u32) -> f32 {
+    wg_best_v[lane] = value;
+    wg_best_i[lane] = index;
+    workgroupBarrier();
+    var stride: u32 = LANES / 2u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lane < stride) {
+            let ov = wg_best_v[lane + stride];
+            let oi = wg_best_i[lane + stride];
+            let sv = wg_best_v[lane];
+            let si = wg_best_i[lane];
+            if (ov > sv || (ov == sv && oi < si)) {
+                wg_best_v[lane] = ov;
+                wg_best_i[lane] = oi;
+            }
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    return wg_best_v[0];
+}
+
+/// `outer == 1`: the whole workgroup draws row 0. The loops whose *order*
+/// decides the bits (the exponent sum, the renormalisation sum, the pick order)
+/// stay serial on lane 0; the scans are split across `LANES`.
+fn sample_one_coop(lane: u32) {
+    let inner = params.inner;
+    let base = params.in_off;
+    let sbase = params.scratch_off;
+    let temp = bitcast<f32>(params.temp_bits);
+    let top_p = bitcast<f32>(params.top_p_bits);
+    let inv_temp = 1.0 / max(temp, 1e-6);
+
+    // 1. Apply temperature into scratch; row max.
+    var local_max: f32 = NEG_INF;
+    for (var i: u32 = lane; i < inner; i = i + LANES) {
+        let v = arena[base + i] * inv_temp;
+        arena[sbase + i] = v;
+        local_max = max(local_max, v);
+    }
+    let m: f32 = wg_best(lane, local_max, 0u);
+
+    // 2. exp into scratch, then the sum in index order on lane 0.
+    for (var i: u32 = lane; i < inner; i = i + LANES) {
+        arena[sbase + i] = exp(arena[sbase + i] - m);
+    }
+    storageBarrier();
+    if (lane == 0u) {
+        var sum_e: f32 = 0.0;
+        for (var i: u32 = 0u; i < inner; i = i + 1u) {
+            sum_e = sum_e + arena[sbase + i];
+        }
+        wg_one = sum_e;
+    }
+    workgroupBarrier();
+    // Lane 0 read the scratch in the sum above; the rescale loop writes it, so
+    // the storage accesses need their own barrier — `workgroupBarrier` orders
+    // the workgroup address space only.
+    storageBarrier();
+    let inv_sum = 1.0 / wg_one;
+    for (var i: u32 = lane; i < inner; i = i + LANES) {
+        arena[sbase + i] = arena[sbase + i] * inv_sum;
+    }
+    storageBarrier();
+
+    // 3. Top-K / Top-P: each pick is a workgroup-wide max scan; the pick
+    //    order and the running sum stay serial (all lanes hold the same
+    //    value, so the loop is uniform).
+    let need_filter = (params.top_k > 0u) || (top_p < 1.0 && top_p > 0.0);
+    if (need_filter) {
+        let k_limit = select(inner, params.top_k, params.top_k > 0u);
+        var cum: f32 = 0.0;
+        var picked_count: u32 = 0u;
+        loop {
+            if (picked_count >= k_limit) { break; }
+            var best_v: f32 = -1.0;
+            var best_i: u32 = 0u;
+            for (var i: u32 = lane; i < inner; i = i + LANES) {
+                let v = arena[sbase + i];
+                if (v >= 0.0 && v > best_v) {
+                    best_v = v;
+                    best_i = i;
+                }
+            }
+            let best = wg_best(lane, best_v, best_i);
+            if (best < 0.0) { break; }
+            if (lane == 0u) {
+                arena[sbase + wg_best_i[0]] = -best - SENTINEL_EPS;
+            }
+            cum = cum + best;
+            picked_count = picked_count + 1u;
+            storageBarrier();
+            if (top_p < 1.0 && cum >= top_p) { break; }
+        }
+        // Restore selected, zero the rest, and sum in index order on lane 0.
+        if (lane == 0u) {
+            var new_sum: f32 = 0.0;
+            for (var i: u32 = 0u; i < inner; i = i + 1u) {
+                let v = arena[sbase + i];
+                if (v < 0.0) {
+                    let restored = -v - SENTINEL_EPS;
+                    arena[sbase + i] = restored;
+                    new_sum = new_sum + restored;
+                } else {
+                    arena[sbase + i] = 0.0;
+                }
+            }
+            wg_one = new_sum;
+        }
+        workgroupBarrier();
+        // Lane 0 restored/zeroed the scratch; the scaling loop reads the
+        // elements other lanes wrote, so order the storage accesses too.
+        storageBarrier();
+        let inv_new = 1.0 / max(wg_one, 1e-12);
+        for (var i: u32 = lane; i < inner; i = i + LANES) {
+            arena[sbase + i] = arena[sbase + i] * inv_new;
+        }
+        storageBarrier();
+    }
+
+    // 4. Gumbel-max: per-index scores are independent; the reduction keeps the
+    //    lower index on an exact tie, as the serial `score > best` scan does.
+    let raw_key = vec2<u32>(params.seed_lo, params.seed_hi);
+    let key = threefry2x32_20(vec2<u32>(0u, 0u), raw_key);
+    var best_score: f32 = NEG_INF;
+    var best_i: u32 = 0u;
+    for (var i: u32 = lane; i < inner; i = i + LANES) {
+        let p = arena[sbase + i];
+        if (p <= 0.0) { continue; }
+        let rng2 = threefry2x32_20(vec2<u32>(0u, i), key);
+        let u: f32 = f32(rng2.x >> 8u) / 16777216.0;
+        let g: f32 = -log(-log(max(u, 1e-30)));
+        let score: f32 = log(p) + g;
+        if (score > best_score) {
+            best_score = score;
+            best_i = i;
+        }
+    }
+    wg_best(lane, best_score, best_i);
+    if (lane == 0u) {
+        arena[params.out_off] = f32(wg_best_i[0]);
+    }
+}
+
+@compute @workgroup_size(LANES)
+fn sample(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) ngs: vec3<u32>,
+) {
+    // One row is a decode step's critical path: split it across the workgroup.
+    if (params.outer == 1u) {
+        sample_one_coop(lid.x);
+        return;
+    }
+    let row = gid.x + gid.y * ngs.x * LANES;
     if (row >= params.outer) { return; }
     let base = params.in_off + row * params.inner;
     let sbase = params.scratch_off + row * params.inner;

@@ -355,6 +355,8 @@ pub fn dispatch_fft_gpu_in_pass(
             n: count,
             in_off: src_off,
             out_off: dst_off,
+            // The FFT compaction keeps the scalar copy: its window offsets need
+            // not be vector-aligned and this path is not the movement hot spot.
             _p0: 0,
             _p1: 0,
             _p2: 0,

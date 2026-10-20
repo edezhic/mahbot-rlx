@@ -6,12 +6,12 @@
 //! sound half.
 //!
 //! The graphs whose shapes do not depend on the request are built and compiled
-//! once ([`Synthesis::new`] — the speaker encoder and the code predictor); the
-//! prompt and the sound half are built per call exactly as the stand builds
-//! them. [`Synthesis::synthesize`] is the reusable entry point the wake-word
-//! bench calls for every corpus clip. Output is mono f32 PCM at [`SAMPLE_RATE`]
-//! (24 kHz, the sound half's own rate), `frames · 1920` samples for the frames
-//! the talker produced.
+//! once ([`Synthesis::new`] — the speaker encoder and the code predictor's whole
+//! sixteen-level frame as one graph); the prompt and the sound half are built per call exactly as the
+//! stand builds them. [`Synthesis::synthesize`] is the reusable entry point the
+//! wake-word bench calls for every corpus clip. Output is mono f32 PCM at
+//! [`SAMPLE_RATE`] (24 kHz, the sound half's own rate), `frames · 1920` samples
+//! for the frames the talker produced.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -53,16 +53,22 @@ pub const TTS_REPEAT_PENALTY: f32 = 1.05;
 /// as the whole part away from the edges, and the planned arena — which is a
 /// graph's — shrinks with the window instead of being the part's.
 ///
+/// The window is 72 frames, the front's own chunk ([`FRONT_WINDOW`]): every
+/// window runs its graph over every frame in it, so a longer window is fewer
+/// graph runs over the same frames. Its figures are in `MEASUREMENTS.md`.
+///
 /// Shared with the stand.
-pub(crate) const DAC_WINDOW: usize = 24;
+pub(crate) const DAC_WINDOW: usize = 72;
 /// The wave transformer's own window: the front is cut at this many frames so
 /// its output does not depend on the part's total length.
 ///
 /// Shared with the stand.
 pub(crate) const FRONT_WINDOW: usize = 72;
-/// Frames of margin on each side: the four DAC blocks' kernels and strides
-/// reach this far into a window, so a core sample never reads the window's own
-/// edge.
+/// Frames of margin on each side, clipped at the part's own edges: the four DAC
+/// blocks' kernels and strides reach this far into a window, so a core sample
+/// never reads a window edge the part does not have. The first window's span is
+/// the front's chunk, so a window narrower than [`FRONT_WINDOW`] keeps the
+/// difference as its right margin.
 ///
 /// Shared with the stand.
 pub(crate) const DAC_MARGIN: usize = 4;
@@ -217,11 +223,14 @@ pub(crate) fn windows(
     window: usize,
     margin: usize,
 ) -> Vec<(usize, usize, usize, usize)> {
+    // The first window's span is the front's chunk, so a wider window would push
+    // its core past the span the first part's graph is built for.
+    debug_assert!(window <= FRONT_WINDOW);
     let mut v = Vec::new();
     let mut a = 0;
     if rows > 0 {
         let b = window.min(rows);
-        v.push((0, 72.min(rows), 0, b));
+        v.push((0, FRONT_WINDOW.min(rows), 0, b));
         a = b;
     }
     while a < rows {
@@ -263,16 +272,14 @@ pub struct Synthesis {
     top_p: f32,
     temperature: f32,
     steps: usize,
-    capacity_pred: usize,
-    blocks: usize,
-    hkv_pred: usize,
-    hd_pred: usize,
     d_talker: usize,
-    head_out: usize,
-    vocab_pred: usize,
-    embd: Vec<f32>,
     speaker_embed: Vec<f32>,
-    walk: Compiled,
+    /// The code predictor's whole sixteen-level frame in **one** graph: the
+    /// head-less body at level 0, every projecting level with its own head, each
+    /// draw an `Op::Sample` on the device and the cache carried in the arena. A
+    /// frame is one run and one fence, its dispatches submitted in encode chunks;
+    /// [`Synthesis::generate`] rewrites the draw seeds and runs it.
+    frame: Compiled,
     /// The prompt and body graphs are shape-only, and a TTS request that repeats
     /// a prompt length reuses them instead of paying the compile again — the
     /// bench's corpus cycles phrases across seeds, and a served voice answers
@@ -283,10 +290,11 @@ pub struct Synthesis {
 }
 
 impl Synthesis {
-    /// Compile the code predictor and the speaker encoder, and embed the
-    /// reference voice once. The prompt and body graphs are built on first use
-    /// and reused while the shape repeats (`Synthesis::prefill`,
-    /// `Synthesis::body`); the sound graphs are built per call.
+    /// Compile the code predictor's whole sixteen-level frame as one graph, and
+    /// the speaker encoder, and embed the reference voice once. The prompt and
+    /// body graphs are built on first use and reused while the shape repeats
+    /// (`Synthesis::prefill`, `Synthesis::body`); the sound graphs are built per
+    /// call.
     pub fn new(pair: Arc<Pair>, voice_wav: &Path) -> Result<Self> {
         let tokenizer = Tokenizer::from_model(&pair.body)?;
         let cfg = pair.body.config().clone();
@@ -296,12 +304,8 @@ impl Synthesis {
         let hkv = cfg.kv_heads * cfg.head_dim;
         let (top_k, top_p, temperature) = pair.body.sampling();
         let steps = graphs::code_predictor_steps(&pair.sound)?;
-        let (blocks, hkv_pred, hd_pred) = graphs::code_predictor_cache(&pair.sound)?;
         let capacity_pred = steps + 1;
         let (d_talker, _) = pair.sound.code_proj_widths()?;
-        let head_out = pair.sound.plan("a.gen.code.head.weight")?.ggml_shape[1];
-        let vocab_pred = pair.sound.plan("a.gen.code.embd.weight")?.ggml_shape[1];
-        let (embd, _) = pair.sound.f32_file_order("a.gen.code.embd.weight")?;
 
         // The reference loads the voice at its own length and resamples it to
         // 24 kHz: no offset and no 5-second cut.
@@ -322,9 +326,18 @@ impl Synthesis {
             .next()
             .ok_or_else(|| anyhow!("the speaker encoder returned no embedding"))?;
 
-        let walk = Compiled::new(
+        // The draw seed is a uniform word, not a pipeline constant: the graph is
+        // built once with a neutral default and every frame rewrites the seeds
+        // (`Runner::set_sample_seeds`) before its one run.
+        let sampler = graphs::SampleSpec {
+            top_k,
+            top_p,
+            temperature,
+            seed: 0,
+        };
+        let frame = Compiled::new(
             rlx_runtime::Device::Gpu,
-            graphs::tts_code_predictor_step_all(pair.sound.clone(), capacity_pred)?,
+            graphs::tts_code_predictor_frame(pair.sound.clone(), capacity_pred, sampler)?,
         )?;
 
         Ok(Self {
@@ -337,16 +350,9 @@ impl Synthesis {
             top_p,
             temperature,
             steps,
-            capacity_pred,
-            blocks,
-            hkv_pred,
-            hd_pred,
             d_talker,
-            head_out,
-            vocab_pred,
-            embd,
             speaker_embed,
-            walk,
+            frame,
             prefill: None,
             body: None,
         })
@@ -412,21 +418,21 @@ impl Synthesis {
             .ok_or_else(|| anyhow!("the talker prefill returned {} logits", p[3].len()))?
             .to_vec();
 
-        // The talker on the part's fixed-capacity cache: one row per frame. The
-        // prompt rows are copied into that cache before the first step.
+        // The talker on the part's fixed-capacity plane cache: one row per layer
+        // per frame, the prompt rows copied into each layer's own
+        // `[capacity + 1, hkv]` cache before the first step.
         let capacity = prompt_rows + MAX_CODEC_ROWS;
         if self.body.as_ref().is_none_or(|(rows, _)| *rows != capacity) {
             self.body = None;
             let compiled = Compiled::new(
                 device,
-                graphs::body_capacity_chain(self.pair.body.clone(), capacity)?,
+                graphs::body_capacity_chain_planes(self.pair.body.clone(), capacity)?,
             )?;
             self.body = Some((capacity, compiled));
         }
         let body = &mut self.body.as_mut().expect("talker graph").1;
-        let mut k_cache = vec![0f32; capacity * self.cfg.layers * self.hkv];
-        let mut v_cache = vec![0f32; capacity * self.cfg.layers * self.hkv];
-        let kv_span = self.cfg.layers * prompt_rows * self.hkv;
+        let layers = self.cfg.layers;
+        let kv_span = layers * prompt_rows * self.hkv;
         let k_rows = p
             .get(1)
             .filter(|v| v.len() >= kv_span)
@@ -435,31 +441,21 @@ impl Synthesis {
             .get(2)
             .filter(|v| v.len() >= kv_span)
             .ok_or_else(|| anyhow!("the talker prefill returned no prompt values"))?;
-        for l in 0..self.cfg.layers {
-            for r in 0..prompt_rows {
-                let dst = (r * self.cfg.layers + l) * self.hkv;
-                let src = (l * prompt_rows + r) * self.hkv;
-                k_cache[dst..dst + self.hkv].copy_from_slice(&k_rows[src..src + self.hkv]);
-                v_cache[dst..dst + self.hkv].copy_from_slice(&v_rows[src..src + self.hkv]);
-            }
-        }
-        let mut mask = vec![0f32; capacity + 1];
-        for r in 0..prompt_rows {
-            mask[r] = 1.0;
-        }
-        mask[capacity] = 1.0;
-        if !body.runner.resident_cache(&k_cache, &v_cache, (1, 2)) {
+        let graphs::PlaneCache {
+            k: k_cache,
+            v: v_cache,
+            mut mask,
+        } = graphs::seed_plane_cache(layers, capacity, prompt_rows, self.hkv, k_rows, v_rows);
+        if !body.runner.resident_cache_planes(&k_cache, &v_cache) {
             return Err(anyhow!("the talker refused the resident K/V cache"));
         }
 
-        // The code predictor on its own carried cache: one row and all fifteen
-        // heads per submission, reset for every frame.
-        let mut k_pred = vec![0f32; self.capacity_pred * self.blocks * self.hkv_pred];
-        let mut v_pred = vec![0f32; self.capacity_pred * self.blocks * self.hkv_pred];
-        if !self.walk.runner.resident_cache(&k_pred, &v_pred, (1, 2)) {
-            return Err(anyhow!("the code predictor refused the resident K/V cache"));
-        }
-
+        // The code predictor: **one** graph for the whole sixteen-level frame —
+        // the head-less body at level 0, every projecting level with its own
+        // head — with each draw an `Op::Sample` on the device and the cache
+        // carried in the arena. A frame is one run and one fence — its dispatches
+        // are submitted in encode chunks, not per level — and only its draw seeds
+        // cross the boundary.
         let mut code_seen: Vec<usize> = Vec::new();
         let mut draw_index = 0u64;
         suppress_service(&mut logits, self.body_vocab);
@@ -491,83 +487,54 @@ impl Synthesis {
                 .next()
                 .ok_or_else(|| anyhow!("no `token_embd` row for codec id {code0}"))?;
 
-            k_pred.fill(0.0);
-            v_pred.fill(0.0);
-            if !self.walk.runner.resident_cache(&k_pred, &v_pred, (1, 2)) {
-                return Err(anyhow!("the code predictor refused the frame's K/V reset"));
+            // The seeds are uniform words, so a compiled
+            // frame serves every frame and every request.
+            let seeds = graphs::predictor_draw_seeds(
+                seed,
+                draw_index,
+                self.steps,
+                self.top_k,
+                self.temperature,
+            );
+            if !self.frame.runner.set_sample_seeds(&seeds) {
+                return Err(anyhow!("the code predictor frame refused its draw seeds"));
             }
-            // Row 0 is the talker hidden, row 1 is code0, and head `s` reads
-            // row `s + 1` and predicts level `s + 1`.
-            for s in 0..=self.steps {
-                let (cos, sin) = host::rope_tables_at(s, 1, self.hd_pred, 1e6);
-                let row = if s == 0 {
-                    hidden.clone()
-                } else if s == 1 {
-                    code0_embed.clone()
-                } else {
-                    let id = *frame_codes
-                        .get(s - 1)
-                        .ok_or_else(|| anyhow!("level {} has no code", s - 1))?;
-                    let at = ((s - 2) * self.vocab_pred + id) * self.d_talker;
-                    self.embd
-                        .get(at..at + self.d_talker)
-                        .ok_or_else(|| {
-                            anyhow!("code embedding {id} at level {} is out of range", s - 1)
-                        })?
-                        .to_vec()
-                };
-                let mut p_mask = vec![0f32; self.capacity_pred + 1];
-                for p in 0..s {
-                    p_mask[p] = 1.0;
-                }
-                p_mask[self.capacity_pred] = 1.0;
-                let cos: Vec<f32> = cos.iter().map(|v| *v as f32).collect();
-                let sin: Vec<f32> = sin.iter().map(|v| *v as f32).collect();
-                let out = self.walk.runner.run_read(
-                    &[
-                        ("x".into(), row),
-                        ("cos".into(), cos),
-                        ("sin".into(), sin),
-                        ("mask".into(), p_mask),
-                    ],
-                    &[0],
-                );
-                if !self
-                    .walk
-                    .runner
-                    .feed_rows(0, s, self.blocks * self.hkv_pred)
-                {
-                    return Err(anyhow!("the code predictor refused the feed at step {s}"));
-                }
-                if s == 0 {
-                    continue;
-                }
-                let at = (s - 1) * self.head_out;
-                let logits = out
-                    .first()
-                    .and_then(|v| v.get(at..at + self.head_out))
-                    .ok_or_else(|| anyhow!("the code predictor returned no logits at step {s}"))?;
-                let id = host::draw(
-                    logits,
-                    self.top_k,
-                    self.top_p,
-                    self.temperature,
-                    seed + draw_index,
-                );
-                draw_index += 1;
-                frame_codes.push(id);
-            }
-
-            // The next frame's input: the sixteen code embeddings, summed.
-            let mut sum = code0_embed;
-            for level in 1..=self.steps {
-                let id = *frame_codes
-                    .get(level)
-                    .ok_or_else(|| anyhow!("level {level} has no code"))?;
-                let at = ((level - 1) * self.vocab_pred + id) * self.d_talker;
-                let e = self.embd.get(at..at + self.d_talker).ok_or_else(|| {
-                    anyhow!("code embedding {id} at level {level} is out of range")
+            let out = self.frame.runner.run_read(
+                &[
+                    ("hidden".into(), hidden.clone()),
+                    ("code0_embed".into(), code0_embed.clone()),
+                ],
+                &[0],
+            );
+            let codes = out
+                .first()
+                .filter(|v| v.len() >= self.steps)
+                .ok_or_else(|| {
+                    anyhow!("the code predictor frame returned no codes at frame {f}")
                 })?;
+            for k in 0..self.steps {
+                frame_codes.push(codes[k] as usize);
+            }
+            draw_index += self.steps as u64;
+
+            // The next frame's input: the sixteen code embeddings, summed. The
+            // rows are picked out of the file one level at a time — the frame
+            // graph's gather reads its own copy in the arena, so the host keeps
+            // none.
+            let mut sum = code0_embed;
+            let picks: Vec<(usize, usize)> = (1..=self.steps)
+                .map(|level| {
+                    frame_codes
+                        .get(level)
+                        .map(|&id| (level - 1, id))
+                        .ok_or_else(|| anyhow!("level {level} has no code"))
+                })
+                .collect::<Result<_>>()?;
+            let embeds =
+                self.pair
+                    .sound
+                    .table_rows_f32("a.gen.code.embd.weight", &picks, self.d_talker)?;
+            for e in &embeds {
                 for (o, v) in sum.iter_mut().zip(e) {
                     *o += *v;
                 }
@@ -583,7 +550,7 @@ impl Synthesis {
                 let sin: Vec<f32> = sin.iter().map(|v| *v as f32).collect();
                 let body_o = body
                     .runner
-                    .run_resident(
+                    .run_resident_planes(
                         &[
                             ("x".into(), x),
                             ("cos".into(), cos),
@@ -591,8 +558,8 @@ impl Synthesis {
                             ("mask".into(), mask.clone()),
                         ],
                         written,
-                        self.cfg.layers,
                         self.hkv,
+                        &graphs::plane_step_reads(layers),
                     )
                     .ok_or_else(|| anyhow!("the talker refused the resident feed at frame {f}"))?;
                 mask[written] = 1.0;
@@ -602,7 +569,7 @@ impl Synthesis {
                     .cloned()
                     .ok_or_else(|| anyhow!("the talker returned no hidden row at frame {f}"))?;
                 let mut logits = body_o
-                    .get(3)
+                    .get(1)
                     .and_then(|v| v.get(..self.body_vocab))
                     .ok_or_else(|| anyhow!("the talker returned no logits at frame {f}"))?
                     .to_vec();

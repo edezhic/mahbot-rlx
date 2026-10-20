@@ -5555,6 +5555,15 @@
         layer: EnvLayer::Backend("wgpu"),
     },
     EnvVarEntry {
+        name: "RLX_WGPU_ENCODE_CHUNK",
+        group: "wgpu",
+        summary: "Steps one submission encodes before carrying on in a fresh encoder (0 = no chunking)",
+        kind: EnvKind::U64,
+        stability: EnvStability::Internal,
+        aliases: &[],
+        layer: EnvLayer::Backend("wgpu"),
+    },
+    EnvVarEntry {
         name: "RLX_WGPU_ONE_OP_PER_PASS",
         group: "wgpu",
         summary: "Submit one op per compute pass (isolates sync bugs)",

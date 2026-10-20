@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 651  
+**Registered names:** 652  
 **Unregistered mentions (migration leftovers):** 101
 
 ## Groups
@@ -38,7 +38,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [rocm](#rocm) — 31
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
-- [wgpu](#wgpu) — 83
+- [wgpu](#wgpu) — 84
 - [xdna](#xdna) — 11
 
 ## compile
@@ -734,6 +734,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_DUMP_NODES` | Bisect | Bool | Backend(wgpu) | Dump per-node output buffers for cross-backend diffing |
 | `RLX_WGPU_DUMP_NODES_LIMIT` | Bisect | U64 | Backend(wgpu) | Cap how many nodes the wgpu dump writes (default 40) |
 | `RLX_WGPU_DUMP_TAIL` | Bisect | Bool | Backend(wgpu) | Dump the tail of each buffer rather than the head |
+| `RLX_WGPU_ENCODE_CHUNK` | Internal | U64 | Backend(wgpu) | Steps one submission encodes before carrying on in a fresh encoder (0 = no chunking) |
 | `RLX_WGPU_EXPAND_HOST` | Internal | Bool | Backend(wgpu) | Run Expand on the host instead of a wgpu kernel |
 | `RLX_WGPU_F16_WEIGHTS` | Bisect | Bool | Backend(wgpu) | Store wgpu weights in f16 to halve weight bandwidth |
 | `RLX_WGPU_FEED_TRACE` | Bisect | Bool | Backend(wgpu) | Trace GPU-handle feed wiring and per-step input staging |

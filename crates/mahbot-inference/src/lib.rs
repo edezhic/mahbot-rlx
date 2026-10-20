@@ -19,6 +19,7 @@ pub mod host;
 pub mod listen;
 pub mod loader;
 pub mod measurements;
+pub mod reference;
 pub mod report;
 pub mod stand;
 pub mod synth;

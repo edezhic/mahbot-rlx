@@ -455,16 +455,26 @@ fn hosted_audio_steps_are_walked_only_where_the_route_can_reach_them() {
     // The arrangements this route serves: each runs, and each checks its own output
     // against the host function the route itself calls. A run that cannot advance
     // fails here with the child's stderr rather than spinning.
-    for fixture in [
-        DEVICE_THEN_MEL,
-        MEL_THEN_BACKWARD,
-        PACKED_THEN_MEL,
-        COPY_THEN_MEL,
-    ] {
-        let (ok, stderr) =
-            common::rerun_self(FILTER, MARKER, fixture, &common::CLEARED_SWITCHES, &[]);
-        assert!(ok, "the `{fixture}` child failed:\n{stderr}");
-    }
+    let served = |extra: &[(&str, &str)]| {
+        for fixture in [
+            DEVICE_THEN_MEL,
+            MEL_THEN_BACKWARD,
+            PACKED_THEN_MEL,
+            COPY_THEN_MEL,
+        ] {
+            let (ok, stderr) =
+                common::rerun_self(FILTER, MARKER, fixture, &common::CLEARED_SWITCHES, extra);
+            assert!(ok, "the `{fixture}` child failed:\n{stderr}");
+        }
+    };
+    served(&[]);
+
+    // A chunk boundary lands wherever the encoder's chunk size puts it, so the switch
+    // that puts one at *every* step is that boundary at its worst: the step left in
+    // front of a deferred audio step must never be one, or the walk loses the batch
+    // it needs to advance the mel. A boundary tested `step_is_tail_host` alone, and
+    // this panicked with `hosted audio step stranded` on the first two fixtures.
+    served(&[("RLX_WGPU_ENCODE_CHUNK", "1")]);
 
     // The states the plan cannot settle: the crate's own debugging switches force one
     // operation per submission and carry no batch to the deferred tail either way, so

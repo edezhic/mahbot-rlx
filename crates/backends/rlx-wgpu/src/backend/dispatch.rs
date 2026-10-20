@@ -15,24 +15,24 @@ use crate::device::wgpu_device;
 use crate::kernels::{
     AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams, AttentionBwdParams,
     AttentionParams, BatchElementwiseRegionParams, BinaryParams, Conv1dParams, Conv2dParams,
-    Conv3dParams, CopyParams, CumsumBwdParams, CumsumParams, DequantMatmulParams,
-    ElementwiseRegionParams, ExpandParams, FmaParams, FusedResidualLnParams,
-    FusedResidualLnTeeParams, FusedResidualRmsNormParams, GatedResidualBackwardParams,
-    GatedResidualParams, GatherAxisParams, GatherBwdParams, GatherParams, GroupedMatmulParams,
-    GruParams, Kernel, LayerNormBwdParams, LayerNormParams, Mamba2Params, MatmulParams,
-    MatmulQkvParams, NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams,
-    RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, SampleParams, ScatterAddParams,
-    SceParams, SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams,
-    UnaryParams, WelchPeaksGpuParams, WhereParams, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, batch_elementwise_region_kernel, binary_kernel, cast_f32_to_f16_kernel,
-    compare_kernel, concat_kernel, conv1d_kernel, conv2d_kernel, conv3d_kernel, copy_kernel,
-    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, elementwise_region_kernel,
-    elementwise_region_spatial_kernel, expand_kernel, fma_kernel, fused_residual_ln_kernel,
-    fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel, gather_axis_kernel,
-    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel, gather_split_kernel,
-    grouped_matmul_kernel, gru_kernel, layer_norm_backward_gamma_partial_kernel,
-    layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layernorm_kernel,
-    mamba2_kernel, matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
+    Conv3dParams, CumsumBwdParams, CumsumParams, DequantMatmulParams, ElementwiseRegionParams,
+    ExpandParams, FmaParams, FusedResidualLnParams, FusedResidualLnTeeParams,
+    FusedResidualRmsNormParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
+    GatherBwdParams, GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNormBwdParams,
+    LayerNormParams, Mamba2Params, MatmulParams, MatmulQkvParams, NarrowConcatParams, Pool1dParams,
+    Pool2dParams, Pool3dParams, ReduceParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
+    RopeParams, SampleParams, ScatterAddParams, SceParams, SelectiveScanParams, SoftmaxParams,
+    TopKParams, TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
+    argmax_kernel, attention_bwd_kernel, attention_kernel, batch_elementwise_region_kernel,
+    binary_kernel, cast_f32_to_f16_kernel, compare_kernel, concat_kernel, conv1d_kernel,
+    conv2d_kernel, conv3d_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
+    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel, fma_kernel,
+    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
+    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel, gather_kernel,
+    gather_split_kernel, grouped_matmul_kernel, gru_kernel,
+    layer_norm_backward_gamma_partial_kernel, layer_norm_backward_gamma_reduce_kernel,
+    layer_norm_backward_input_kernel, layernorm_kernel, mamba2_kernel,
+    matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
     matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
@@ -82,45 +82,29 @@ impl WgpuExecutable {
                  be split."
             );
         };
-        let p = CopyParams {
-            n: elems,
-            in_off: (src.saturating_sub(base) / 4) as u32,
-            out_off: (dst.saturating_sub(base) / 4) as u32,
-            _p0: 0,
-            _p1: 0,
-            _p2: 0,
-            _p3: 0,
-            _p4: 0,
-        };
         if rlx_ir::env::flag("RLX_WGPU_FEED_TRACE") {
             eprintln!(
                 "[copy] src={src} dst={dst} nbytes={nbytes} elems={elems} base={base} size={size} \
                  in_off={} out_off={} src_end_rel={} dst_end_rel={} window_elems={} arena={}",
-                p.in_off,
-                p.out_off,
+                src.saturating_sub(base) / 4,
+                dst.saturating_sub(base) / 4,
                 (src + nbytes).saturating_sub(base),
                 (dst + nbytes).saturating_sub(base),
                 size / 4,
                 self.arena.size,
             );
         }
-        let ck = copy_kernel(&dev.device);
-        let u = dev.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rlx-wgpu kv_feed_copy uniform"),
-            size: std::mem::size_of::<CopyParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        dev.queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
-        let bg = bind_arena_window(&dev.device, ck, &self.arena, base, size, &u);
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("rlx-wgpu kv_feed_copy pass"),
-            ..Default::default()
-        });
-        pass.set_pipeline(&ck.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
-        let (gx, gy, gz) = dispatch_dims(elems, 64);
-        pass.dispatch_workgroups(gx, gy, gz);
+        super::encode_arena_copy(
+            dev,
+            &self.arena,
+            enc,
+            src,
+            dst,
+            nbytes,
+            base,
+            size,
+            "rlx-wgpu kv_feed_copy",
+        );
     }
 
     #[allow(dead_code)]

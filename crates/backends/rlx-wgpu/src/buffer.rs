@@ -1803,15 +1803,11 @@ impl Arena {
             .saturating_sub(shard_stage_reserve())
             .max(shard_begin)
     }
-
-    /// Physical buffer + local offset for a logical activation byte address.
-    /// Device-to-device copy inside the arena: `bytes` from `src_off` to
-    /// `dst_off`, both logical activation offsets.
-    ///
-    /// Needed by the resident-KV row feed, which folds the new token's row into
-    /// a device-resident handle without a host round trip. `rlx-metal` does this
-    /// with a plain memcpy because its arena is unified memory; here it has to
-    /// be a real GPU copy.
+    /// Device-to-device copy inside the arena for several ranges in one
+    /// submission. A plane cache folds one row per layer into its own handle,
+    /// and those used to be one encode/submit per layer; they share the staging
+    /// bounce and the command buffer here. The ranges are copied in order, so
+    /// the staged bytes of one are consumed before the next overwrites them.
     ///
     /// **WebGPU forbids `copy_buffer_to_buffer` where source and destination are
     /// the same buffer** ("Source and destination cannot be the same buffer"),
@@ -1824,44 +1820,49 @@ impl Arena {
     /// offsets and sizes, which arena slots satisfy (the arena is f32-uniform)
     /// — asserted rather than assumed, because a silent misalignment here
     /// corrupts a cache instead of failing.
-    pub fn copy_within_device(
+    pub fn copy_within_device_batch(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         staging: &wgpu::Buffer,
-        src_off: usize,
-        dst_off: usize,
-        bytes: usize,
+        moves: &[(usize, usize, usize)],
     ) {
-        if bytes == 0 {
-            return;
-        }
-        assert!(
-            src_off.is_multiple_of(4) && dst_off.is_multiple_of(4) && bytes.is_multiple_of(4),
-            "rlx-wgpu: copy_within_device needs 4-byte alignment \
-             (src={src_off} dst={dst_off} bytes={bytes})"
-        );
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("rlx-wgpu kv row feed"),
         });
-        // Walk the range in pieces that lie within one shard on BOTH sides.
-        let mut done = 0usize;
-        while done < bytes {
-            let (src_buf, src_local) = self.resolve_act(src_off + done);
-            let (dst_buf, dst_local) = self.resolve_act(dst_off + done);
-            let remaining = bytes - done;
-            let chunk = if self.is_sharded() && self.shard_size > 0 {
-                let src_room = self.shard_size - (src_local % self.shard_size.max(1));
-                let dst_room = self.shard_size - (dst_local % self.shard_size.max(1));
-                remaining.min(src_room).min(dst_room)
-            } else {
-                remaining
-            };
-            // arena -> staging -> arena. A direct arena->arena copy is a
-            // validation error even when the ranges do not overlap.
-            enc.copy_buffer_to_buffer(src_buf, src_local as u64, staging, 0, chunk as u64);
-            enc.copy_buffer_to_buffer(staging, 0, dst_buf, dst_local as u64, chunk as u64);
-            done += chunk;
+        let mut any = false;
+        for &(src_off, dst_off, bytes) in moves {
+            if bytes == 0 {
+                continue;
+            }
+            any = true;
+            assert!(
+                src_off.is_multiple_of(4) && dst_off.is_multiple_of(4) && bytes.is_multiple_of(4),
+                "rlx-wgpu: copy_within_device_batch needs 4-byte alignment \
+                 (src={src_off} dst={dst_off} bytes={bytes})"
+            );
+            // Walk the range in pieces that lie within one shard on BOTH sides.
+            let mut done = 0usize;
+            while done < bytes {
+                let (src_buf, src_local) = self.resolve_act(src_off + done);
+                let (dst_buf, dst_local) = self.resolve_act(dst_off + done);
+                let remaining = bytes - done;
+                let chunk = if self.is_sharded() && self.shard_size > 0 {
+                    let src_room = self.shard_size - (src_local % self.shard_size.max(1));
+                    let dst_room = self.shard_size - (dst_local % self.shard_size.max(1));
+                    remaining.min(src_room).min(dst_room)
+                } else {
+                    remaining
+                };
+                // arena -> staging -> arena. A direct arena->arena copy is a
+                // validation error even when the ranges do not overlap.
+                enc.copy_buffer_to_buffer(src_buf, src_local as u64, staging, 0, chunk as u64);
+                enc.copy_buffer_to_buffer(staging, 0, dst_buf, dst_local as u64, chunk as u64);
+                done += chunk;
+            }
+        }
+        if !any {
+            return;
         }
         crate::backend::note_device_submit();
         queue.submit(std::iter::once(enc.finish()));

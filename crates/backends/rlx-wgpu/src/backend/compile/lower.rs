@@ -43,21 +43,21 @@ use crate::kernels::{
     batch_norm_inference_bwd_beta_kernel, batch_norm_inference_bwd_gamma_kernel,
     batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_c64_kernel,
     binary_kernel, cast_f32_to_f16_kernel, cast_kernel, compare_kernel, complex_cast_kernel,
-    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel,
-    conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel, conv1d_tiled_kernel,
-    conv2d_kernel, conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_kernel,
-    copy_kernel, copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
-    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
-    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
-    fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
-    fma_kernel, frames_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel,
-    fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel, fused_swiglu_kernel,
-    gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
-    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel,
-    gather_elements_kernel, gather_kernel, gather_nd_kernel, gather_split_kernel,
-    group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
-    group_norm_backward_input_kernel, group_norm_kernel, grouped_matmul_kernel, gru_kernel,
-    im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
+    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, concat_vec4_kernel,
+    conjugate_c64_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel,
+    conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
+    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, copy_sanitize_kernel,
+    cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
+    dequant_matmul_mlx_kernel, dequantize_i8_kernel, elementwise_region_kernel,
+    elementwise_region_spatial_kernel, expand_kernel, fake_quantize_fixed_kernel,
+    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel, frames_kernel,
+    fused_conv_bias_act_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
+    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
+    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
+    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_elements_kernel, gather_kernel,
+    gather_nd_kernel, gather_split_kernel, group_norm_backward_beta_kernel,
+    group_norm_backward_gamma_kernel, group_norm_backward_input_kernel, group_norm_kernel,
+    grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
     layernorm_kernel, lead_pack_uniform, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
     matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
@@ -65,15 +65,16 @@ use crate::kernels::{
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
     matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
-    maxpool3d_backward_kernel, narrow_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel,
-    q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel, reverse_kernel,
-    rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel,
-    rope_kernel, sample_kernel, scaled_dequantize_kernel, scaled_grouped_matmul_decode_kernel,
-    scaled_matmul_decode_kernel, scaled_quant_scale_kernel, scaled_quantize_kernel,
-    scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel, selective_scan_kernel,
-    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
+    maxpool3d_backward_kernel, narrow_kernel, narrow_vec4_kernel, pool1d_kernel, pool2d_kernel,
+    pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel,
+    reverse_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
+    rope_backward_kernel, rope_kernel, sample_kernel, scaled_dequantize_kernel,
+    scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel, scaled_quant_scale_kernel,
+    scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel,
+    selective_scan_kernel, softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
     softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
-    umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel, welch_peaks_gpu_kernel, where_kernel,
+    transpose_vec4_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
+    welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_gpu_dispatch::indexing::{KernelKind as IndexKind, Reduction as IndexReduction};
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
@@ -101,6 +102,93 @@ fn int_range_f32(dt: rlx_ir::DType) -> (f32, f32) {
         // Non-int dst never reaches here (guarded by is_int at the call site).
         _ => (f32::NEG_INFINITY, f32::INFINITY),
     }
+}
+
+/// Whether the 3-D grid a vector move reads fits the adapter: `gid.x` covers
+/// `span / 4` vectors, `gid.y` one axis index and `gid.z` one outer index.
+/// `false` keeps the scalar 1-D form, which splits its own flat index and has
+/// no per-dimension cap.
+fn vec4_axes_fit(span: u32, axis: u32, outer: u32, max_wg: u32) -> bool {
+    let gx = move_workgroups(span);
+    gx >= 1 && axis >= 1 && outer >= 1 && gx <= max_wg && axis <= max_wg && outer <= max_wg
+}
+
+/// How `transpose_vec4.wgsl` takes a permutation, or `None` for the scalar
+/// kernel. `out_dims`/`perm` are the *extended* rank: a C64/C128 operand has
+/// its lane axis appended and mapped to itself, so a rank-3 complex permute
+/// arrives here as rank 4.
+#[derive(Debug, Clone, Copy)]
+struct Vec4Transpose {
+    /// `1` general last-axis-kept, `2` `[0,2,1,3..]`, `3` `[0,2,1]`.
+    mode: u32,
+    /// Contiguous innermost extent in elements (a multiple of 4).
+    inner: u32,
+    grid_y: u32,
+    grid_z: u32,
+}
+
+/// Pick the vector transpose mode for `(out_dims, perm)`, or `None`.
+///
+/// The innermost axis must be contiguous on both sides for a vector copy:
+/// that is the trailing self-mapped run (mode 1), the head-major swap's
+/// last axis (mode 2), or — for `[0,2,1]`, where the input's contiguous axis
+/// lands mid-output — the read side of a strided component write (mode 3).
+/// Every other permutation keeps the scalar kernel.
+fn transpose_vec4_plan(
+    out_dims: &[u32],
+    perm: &[usize],
+    in_off: u32,
+    out_off: u32,
+    max_wg: u32,
+) -> Option<Vec4Transpose> {
+    let rank = out_dims.len();
+    if rank < 2 {
+        return None;
+    }
+    let plan = |mode: u32, inner: u32, grid_y: u32, grid_z: u64| -> Option<Vec4Transpose> {
+        // The z grid is computed in u64, so a value past `u32` — and, inside
+        // `vec4_axes_fit`, past the dimension cap — keeps the scalar kernel.
+        let gz = u32::try_from(grid_z).ok()?;
+        let ok = vec4_move_ok(inner, in_off, out_off) && vec4_axes_fit(inner, grid_y, gz, max_wg);
+        ok.then_some(Vec4Transpose {
+            mode,
+            inner,
+            grid_y,
+            grid_z: gz,
+        })
+    };
+
+    // mode 2: [0, 2, 1, 3, ...] — the attention head-major swap.
+    if rank >= 4 && perm[0] == 0 && perm[1] == 2 && perm[2] == 1 && (3..rank).all(|i| perm[i] == i)
+    {
+        let inner: u32 = out_dims[3..].iter().product();
+        let gy = out_dims[1];
+        let gz = out_dims[2] as u64;
+        if let Some(p) = plan(2, inner, gy, gz) {
+            return Some(p);
+        }
+    }
+
+    // mode 3: [0, 2, 1] — the rank-3 head-major swap (input [outer, seq, hd]
+    // → output [outer, hd, seq]). The contiguous axis is out_dims[1].
+    if rank == 3 && perm == [0, 2, 1] {
+        let inner = out_dims[1];
+        if let Some(p) = plan(3, inner, out_dims[2], out_dims[0] as u64) {
+            return Some(p);
+        }
+    }
+
+    // mode 1: the innermost axis stays put; only the outer axes permute.
+    if perm[rank - 1] == rank - 1 {
+        let inner = out_dims[rank - 1];
+        let outer: u64 = out_dims[..rank - 1].iter().map(|&d| d as u64).product();
+        let gy = outer.min(max_wg as u64).max(1) as u32;
+        let gz = outer.div_ceil(gy as u64);
+        if let Some(p) = plan(1, inner, gy, gz) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Cast target-class code for a fused `ChainStep::Cast`, packed into the chain
@@ -1883,6 +1971,11 @@ pub(crate) fn compile_static_inner(
         arena.has(id) && offset_owner_count.get(&arena.offset(id)).copied() == Some(1)
     };
 
+    // Per-dimension workgroup cap for the vector movement kernels' 3-D grids;
+    // a shape whose grid would not fit keeps the scalar 1-D form (see
+    // `vec4_axes_fit` / `transpose_vec4_plan`).
+    let max_wg = dev.device.limits().max_compute_workgroups_per_dimension;
+
     let emit_uniform = |size: usize| -> wgpu::Buffer {
         dev.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rlx-wgpu uniform"),
@@ -1911,7 +2004,8 @@ pub(crate) fn compile_static_inner(
                           in_strides: &[u32],
                           bucket_outermost: u32,
                           in_off: u32,
-                          out_off: u32| {
+                          out_off: u32,
+                          vec4: Option<Vec4Transpose>| {
         let rank = out_dims.len();
         let mut meta_data: Vec<u32> = Vec::with_capacity(rank * 2);
         meta_data.extend_from_slice(out_dims);
@@ -1933,39 +2027,53 @@ pub(crate) fn compile_static_inner(
             out_off,
             bucket_outermost,
             out_dim_0: out_dims[0],
-            _p2: 0,
-            _p3: 0,
+            mode: vec4.map_or(0, |v| v.mode),
+            grid_y: vec4.map_or(1, |v| v.grid_y),
+            grid_z: vec4.map_or(1, |v| v.grid_z),
+            inner: vec4.map_or(0, |v| v.inner),
         };
         schedule.push(Step::Transpose {
             params: p,
             meta_idx,
         });
-        let tk = transpose_kernel(&dev.device);
+        let tk = if vec4.is_some() {
+            transpose_vec4_kernel(&dev.device)
+        } else {
+            transpose_kernel(&dev.device)
+        };
         let u = emit_uniform(std::mem::size_of::<TransposeParams>());
+        let (bind_buf, bind_local) = arena_bind_buf(arena, base);
+        let window = || wgpu::BufferBinding {
+            buffer: bind_buf,
+            offset: bind_local,
+            size: aligned_bind_size(size, bind_local, bind_buf.size()),
+        };
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(window()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: u.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: meta_buffers[meta_idx].as_entire_binding(),
+            },
+        ];
+        if vec4.is_some() {
+            // Scalar alias of the same window, mode 3's store side (see
+            // `build_kernel_transpose_vec4`).
+            entries.push(wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Buffer(window()),
+            });
+        }
         let bg = dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rlx-wgpu transpose bg"),
             layout: &tk.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: arena_bind_buf(arena, base).0,
-                        offset: arena_bind_buf(arena, base).1,
-                        size: {
-                            let (b, l) = arena_bind_buf(arena, base);
-                            aligned_bind_size(size, l, b.size())
-                        },
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: u.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: meta_buffers[meta_idx].as_entire_binding(),
-                },
-            ],
+            entries: &entries,
         });
         uniforms.push(u);
         bind_groups.push(bg);
@@ -4324,6 +4432,7 @@ pub(crate) fn compile_static_inner(
                     bucket_outermost,
                     in_off,
                     out_off,
+                    transpose_vec4_plan(&out_dims, &perm, in_off, out_off, max_wg),
                 );
             }
 
@@ -4434,18 +4543,29 @@ pub(crate) fn compile_static_inner(
                     rlx_ir::DType::C128 => 4,
                     _ => 1,
                 };
+                // Vector move when the copied row is whole vectors and both
+                // window ends are 16 B aligned; the 3-D grid also has to fit the
+                // adapter's per-dimension cap. Otherwise the scalar kernel.
+                let inner_lanes = inner * lanes;
+                let vec4 = vec4_move_ok(inner_lanes, in_off, out_off)
+                    && vec4_axes_fit(inner_lanes, *len as u32, outer, max_wg);
                 let p = NarrowConcatParams {
                     total: elems * lanes,
                     outer,
-                    inner: inner * lanes,
+                    inner: inner_lanes,
                     axis_in_size: axis_in,
                     axis_out_size: *len as u32,
                     start: *start as u32,
                     in_off,
                     out_off,
+                    vec4: u32::from(vec4),
                 };
                 schedule.push(Step::Narrow { params: p });
-                let nk = narrow_kernel(&dev.device);
+                let nk = if vec4 {
+                    narrow_vec4_kernel(&dev.device)
+                } else {
+                    narrow_kernel(&dev.device)
+                };
                 let u = emit_uniform(std::mem::size_of::<NarrowConcatParams>());
                 let bg = bind_arena_window(&dev.device, nk, &arena, base, size, &u);
                 uniforms.push(u);
@@ -4592,6 +4712,8 @@ pub(crate) fn compile_static_inner(
                             arena_window_for_nodes(&dev.device, &arena, &[node.id, in_id]);
                         let in_off = arena_local_off_f32(&arena, in_id, base);
                         let out_off = arena_local_off_f32(&arena, node.id, base);
+                        let vec4 = vec4_move_ok(inner_lanes, in_off, out_off)
+                            && vec4_axes_fit(inner_lanes, axis_in, outer, max_wg);
                         let p = NarrowConcatParams {
                             total: in_total * lanes,
                             outer,
@@ -4601,9 +4723,14 @@ pub(crate) fn compile_static_inner(
                             start: start_pos,
                             in_off,
                             out_off,
+                            vec4: u32::from(vec4),
                         };
                         schedule.push(Step::Concat { params: p });
-                        let cck = concat_kernel(&dev.device);
+                        let cck = if vec4 {
+                            concat_vec4_kernel(&dev.device)
+                        } else {
+                            concat_kernel(&dev.device)
+                        };
                         let u = emit_uniform(std::mem::size_of::<NarrowConcatParams>());
                         let bg = bind_arena_window(&dev.device, cck, &arena, base, size, &u);
                         uniforms.push(u);
@@ -4626,6 +4753,8 @@ pub(crate) fn compile_static_inner(
                         let (base, size) = arena_window_for_nodes(&dev.device, &arena, &[node.id]);
                         let in_off = ((dst.saturating_sub(base)) / 4) as u32;
                         let out_off = arena_local_off_f32(&arena, node.id, base);
+                        let vec4 = vec4_move_ok(inner_lanes, in_off, out_off)
+                            && vec4_axes_fit(inner_lanes, axis_in, outer, max_wg);
                         let p = NarrowConcatParams {
                             total: in_total * lanes,
                             outer,
@@ -4635,9 +4764,14 @@ pub(crate) fn compile_static_inner(
                             start: start_pos,
                             in_off,
                             out_off,
+                            vec4: u32::from(vec4),
                         };
                         schedule.push(Step::Concat { params: p });
-                        let cck = concat_kernel(&dev.device);
+                        let cck = if vec4 {
+                            concat_vec4_kernel(&dev.device)
+                        } else {
+                            concat_kernel(&dev.device)
+                        };
                         let u = emit_uniform(std::mem::size_of::<NarrowConcatParams>());
                         let bg = bind_arena_window(&dev.device, cck, &arena, base, size, &u);
                         uniforms.push(u);
@@ -5047,6 +5181,7 @@ pub(crate) fn compile_static_inner(
                         0,
                         k_off,
                         kt_off,
+                        None,
                     );
                     // 2. Q′: only when Q's tile is not already a dense `[S_q, D]`.
                     if !q_dense {
@@ -5064,6 +5199,7 @@ pub(crate) fn compile_static_inner(
                             0,
                             q_off,
                             q_tmp_off,
+                            None,
                         );
                     }
                     // 3. scores = Q′·Kᵀ, dense `[B, H, S_q, S_k]` in scratch.
@@ -5154,6 +5290,7 @@ pub(crate) fn compile_static_inner(
                             0,
                             v_off,
                             v_tmp_off,
+                            None,
                         );
                     }
                     // 6. out = P·V′, straight into the output slot when that slot's
@@ -5191,6 +5328,7 @@ pub(crate) fn compile_static_inner(
                             0,
                             out_tmp_off,
                             out_off,
+                            None,
                         );
                     }
                     continue;

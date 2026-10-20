@@ -398,6 +398,7 @@ fn transpose_2x3_to_3x2_matches_reference() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     let mut g = Graph::new("tr");
     let x = g.input("x", Shape::new(&[2, 3], DType::F32));
     let y = g.add_node(
@@ -425,6 +426,7 @@ fn transpose_param_then_matmul_matches_reference() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     let mut g = Graph::new("tr_param_mm");
     let x = g.input("x", Shape::new(&[1, 2], DType::F32));
     let w = g.param("w", Shape::new(&[3, 2], DType::F32)); // ONNX Gemm transB layout
@@ -447,6 +449,7 @@ fn transpose_bhsd_layout_swap_matches_reference() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     // [B=1, H=2, S=2, D=2] → perm [0, 2, 1, 3] → [B, S, H, D]
     let mut g = Graph::new("tr4");
     let x = g.input("x", Shape::new(&[1, 2, 2, 2], DType::F32));
@@ -476,6 +479,7 @@ fn narrow_axis2_slice_matches_reference() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     // [1, 1, 4] → narrow(axis=2, start=1, len=2) → [1, 1, 2]
     let mut g = Graph::new("nrw");
     let x = g.input("x", Shape::new(&[1, 1, 4], DType::F32));
@@ -499,6 +503,7 @@ fn concat_axis_minus_one_matches_reference() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     let mut g = Graph::new("cat");
     let a = g.input("a", Shape::new(&[2, 2], DType::F32));
     let b = g.input("b", Shape::new(&[2, 3], DType::F32));
@@ -514,6 +519,222 @@ fn concat_axis_minus_one_matches_reference() {
         r[0],
         vec![1.0, 2.0, 10.0, 20.0, 30.0, 3.0, 4.0, 40.0, 50.0, 60.0]
     );
+}
+
+/// Run one movement graph on both backends and assert the outputs are the same
+/// f32 words. These ops only move lanes, so "equal within a tolerance" would
+/// understate the claim: the vector path must be the same bytes as rlx-cpu.
+/// `expect_vec4` is how many `vec4` movement dispatches the graph emits (one
+/// `Concat` step per input, one for a `Narrow` or `Transpose`), or `0` for a
+/// graph that must fall back to the scalar kernels.
+fn movement_cpu_vs_wgpu(g: Graph, inputs: &[(&str, &[f32])], what: &str, expect_vec4: u64) {
+    let cpu = rlx::prelude::Session::new(rlx::prelude::Device::Cpu)
+        .compile(g.clone())
+        .run(inputs)
+        .remove(0);
+    let mut exe = WgpuExecutable::compile(g);
+    // The scalar arm lands the same bytes, so the output alone cannot tell which
+    // ran: the vector path is asserted by the counter it bumps. Every case here
+    // holds the route lock, so the reading is exact — a scalar fallback moves
+    // nothing, and a case that emitted more dispatches than its shape allows
+    // fails too.
+    rlx_wgpu::reset_vec4_move_count();
+    let gpu = exe.run(inputs).remove(0);
+    let moved = rlx_wgpu::vec4_move_count();
+    if expect_vec4 == 0 {
+        // This case's claim is the fallback itself: nothing may move lanes.
+        assert_eq!(
+            moved, 0,
+            "{what}: the graph must fall back to the scalar kernels"
+        );
+    } else {
+        assert_eq!(
+            moved, expect_vec4,
+            "{what}: {moved} vector kernel dispatches, expected {expect_vec4} \
+             — the vector path was not the one dispatched"
+        );
+    }
+    common::assert_bit_identical(&gpu, &cpu, what);
+}
+
+/// The vector movement paths: concat/narrow whose contiguous `inner` is whole
+/// `vec4`s, and the two attention head-major transposes. The shapes are chosen
+/// so every one of them clears `vec4_move_ok`/`transpose_vec4_plan` (including
+/// the rank-4 swap's batch term, which needs the per-thread division) and the
+/// grid fits one dispatch dimension, so the kernels actually run. Bit-exact
+/// against rlx-cpu is the bar: a byte move either lands the same word or it is
+/// a mis-copy, not a rounding difference.
+#[test]
+fn movement_vector_paths_are_bit_identical_to_cpu() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let _route = common::route_lock();
+
+    // concat on axis 1 with inner = 8.
+    {
+        let mut g = Graph::new("cat_vec4_ax1");
+        let a = g.input("a", Shape::new(&[2, 3, 8], DType::F32));
+        let b = g.input("b", Shape::new(&[2, 2, 8], DType::F32));
+        let y = g.concat(vec![a, b], 1, Shape::new(&[2, 5, 8], DType::F32));
+        g.set_outputs(vec![y]);
+        let a = common::data(2 * 3 * 8, 0.11, false);
+        let b = common::data(2 * 2 * 8, 0.13, true);
+        movement_cpu_vs_wgpu(g, &[("a", &a), ("b", &b)], "concat axis 1, inner 8", 2);
+    }
+
+    // concat on axis 2 of a rank-4 operand, inner = 4.
+    {
+        let mut g = Graph::new("cat_vec4_ax2");
+        let a = g.input("a", Shape::new(&[2, 2, 3, 4], DType::F32));
+        let b = g.input("b", Shape::new(&[2, 2, 2, 4], DType::F32));
+        let y = g.concat(vec![a, b], 2, Shape::new(&[2, 2, 5, 4], DType::F32));
+        g.set_outputs(vec![y]);
+        let a = common::data(2 * 2 * 3 * 4, 0.07, false);
+        let b = common::data(2 * 2 * 2 * 4, 0.09, true);
+        movement_cpu_vs_wgpu(g, &[("a", &a), ("b", &b)], "concat axis 2, inner 4", 2);
+    }
+
+    // narrow with inner = 8.
+    {
+        let mut g = Graph::new("narrow_vec4");
+        let x = g.input("x", Shape::new(&[2, 3, 8], DType::F32));
+        let y = g.add_node(
+            Op::Narrow {
+                axis: 1,
+                start: 1,
+                len: 2,
+            },
+            vec![x],
+            Shape::new(&[2, 2, 8], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        let x = common::data(2 * 3 * 8, 0.05, false);
+        movement_cpu_vs_wgpu(g, &[("x", &x)], "narrow axis 1, inner 8", 1);
+    }
+
+    // transpose [0, 2, 1, 3] with batch 2, heads 4, seq 3, head-dim 8. The
+    // batch term is what exercises the kernel's one division per thread.
+    {
+        let mut g = Graph::new("tr4_vec4");
+        let x = g.input("x", Shape::new(&[2, 3, 4, 8], DType::F32));
+        let y = g.add_node(
+            Op::Transpose {
+                perm: vec![0, 2, 1, 3],
+            },
+            vec![x],
+            Shape::new(&[2, 4, 3, 8], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        let x = common::data(2 * 3 * 4 * 8, 0.03, false);
+        movement_cpu_vs_wgpu(g, &[("x", &x)], "transpose [0,2,1,3], inner 8", 1);
+    }
+
+    // transpose [0, 2, 1]: the input's contiguous head-dim is read as vectors
+    // and each lane is written at its strided output position.
+    {
+        let mut g = Graph::new("tr3_vec4");
+        let x = g.input("x", Shape::new(&[2, 3, 8], DType::F32));
+        let y = g.add_node(
+            Op::Transpose {
+                perm: vec![0, 2, 1],
+            },
+            vec![x],
+            Shape::new(&[2, 8, 3], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        let x = common::data(2 * 3 * 8, 0.04, false);
+        movement_cpu_vs_wgpu(g, &[("x", &x)], "transpose [0,2,1], inner 8", 1);
+    }
+
+    // The general last-axis-kept mode: only the outer axes permute.
+    {
+        let mut g = Graph::new("tr_generic_vec4");
+        let x = g.input("x", Shape::new(&[2, 3, 4], DType::F32));
+        let y = g.add_node(
+            Op::Transpose {
+                perm: vec![1, 0, 2],
+            },
+            vec![x],
+            Shape::new(&[3, 2, 4], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        let x = common::data(2 * 3 * 4, 0.06, false);
+        movement_cpu_vs_wgpu(g, &[("x", &x)], "transpose [1,0,2], inner 4", 1);
+    }
+}
+
+/// The same ops at a contiguous span that is not a whole `vec4`, plus a
+/// permutation that leaves no axis contiguous. These must take the scalar
+/// kernels and still land the same words: the fallback is the guarantee that a
+/// shape outside the vector path is served, never silently mis-copied.
+#[test]
+fn movement_odd_inner_falls_back_bit_identically() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let _route = common::route_lock();
+
+    // concat axis 1 with inner = 3.
+    {
+        let mut g = Graph::new("cat_odd");
+        let a = g.input("a", Shape::new(&[2, 2, 3], DType::F32));
+        let b = g.input("b", Shape::new(&[2, 3, 3], DType::F32));
+        let y = g.concat(vec![a, b], 1, Shape::new(&[2, 5, 3], DType::F32));
+        g.set_outputs(vec![y]);
+        let a = common::data(2 * 2 * 3, 0.11, false);
+        let b = common::data(2 * 3 * 3, 0.13, true);
+        movement_cpu_vs_wgpu(g, &[("a", &a), ("b", &b)], "concat axis 1, inner 3", 0);
+    }
+
+    // narrow with inner = 3.
+    {
+        let mut g = Graph::new("narrow_odd");
+        let x = g.input("x", Shape::new(&[2, 3, 3], DType::F32));
+        let y = g.add_node(
+            Op::Narrow {
+                axis: 1,
+                start: 1,
+                len: 2,
+            },
+            vec![x],
+            Shape::new(&[2, 2, 3], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        let x = common::data(2 * 3 * 3, 0.05, false);
+        movement_cpu_vs_wgpu(g, &[("x", &x)], "narrow axis 1, inner 3", 0);
+    }
+
+    // transpose [0, 2, 1] with a non-vector head-dim.
+    {
+        let mut g = Graph::new("tr3_odd");
+        let x = g.input("x", Shape::new(&[2, 3, 3], DType::F32));
+        let y = g.add_node(
+            Op::Transpose {
+                perm: vec![0, 2, 1],
+            },
+            vec![x],
+            Shape::new(&[2, 3, 3], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        let x = common::data(2 * 3 * 3, 0.04, false);
+        movement_cpu_vs_wgpu(g, &[("x", &x)], "transpose [0,2,1], inner 3", 0);
+    }
+
+    // transpose [1, 0]: no axis is contiguous on both sides, so even a
+    // vector-wide shape keeps the scalar kernel.
+    {
+        let mut g = Graph::new("tr2_odd");
+        let x = g.input("x", Shape::new(&[3, 4], DType::F32));
+        let y = g.add_node(
+            Op::Transpose { perm: vec![1, 0] },
+            vec![x],
+            Shape::new(&[4, 3], DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        let x = common::data(3 * 4, 0.02, false);
+        movement_cpu_vs_wgpu(g, &[("x", &x)], "transpose [1,0]", 0);
+    }
 }
 
 #[test]
@@ -702,6 +923,7 @@ fn eeg_qkv_fmb_and_narrows_match_cpu() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     use rlx::prelude::*;
     let (b, s, nh, dh) = (1, 191, 8, 25);
     let hd = nh * dh;
@@ -754,6 +976,7 @@ fn eeg_qkv_tensors_gpu_match_cpu() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     use rlx::prelude::*;
     let (b, s, nh, dh) = (1, 191, 8, 25);
     let hd = nh * dh;
@@ -839,6 +1062,7 @@ fn eeg_attention_with_cpu_qkv_matches_cpu() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     use rlx::prelude::*;
     let (b, s, nh, dh) = (1, 191, 8, 25);
     let hd = nh * dh;
@@ -964,6 +1188,7 @@ fn attention_in_graph_does_not_change_qkv_activations() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     use rlx::prelude::*;
     let (b, s, nh, dh) = (1, 191, 8, 25);
     let hd = nh * dh;
@@ -1119,6 +1344,7 @@ fn eeg_qkv4_after_fmb_matches_cpu() {
 
 #[test]
 fn detect_packed_bshd_on_eeg_chain_graph() {
+    let _route = common::route_lock();
     use rlx::prelude::*;
     let (b, s, nh, dh) = (1, 191, 8, 25);
     let hd = nh * dh;
@@ -1204,6 +1430,7 @@ fn wgpu_chain_attention_uses_packed_qkv_stride() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     // This hook pins the packed reading, which `set("0")` forces on against an
     // exported `RLX_WGPU_NO_PACKED_BSHD_ATTN` — the knob's own opt-out.
     rlx_ir::env::set("RLX_WGPU_NO_PACKED_BSHD_ATTN", "0");
@@ -1293,6 +1520,7 @@ fn wgpu_packed_attn_matches_strided_cpu_ref() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     use rlx::prelude::*;
     let (b, s, nh, dh) = (1, 191, 8, 25);
     let hd = nh * dh;
@@ -1388,6 +1616,7 @@ fn encoder_qkv_attention_chain_matches_cpu() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     use rlx::prelude::*;
     let (b, s, nh, dh) = (1, 191, 8, 25);
     let hd = nh * dh;
@@ -2613,6 +2842,7 @@ fn fused_attention_block_end_to_end() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     // FusedAttentionBlock through the unfusion pass exercises the full
     // chain: 3D@2D matmul, narrow×3, reshape+transpose to BHSD, attention,
     // transpose+reshape, output 3D@2D matmul. Identity weights so the
@@ -3428,6 +3658,7 @@ fn dot_general_lhs_transposed_matches_reference() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     // lhs[K, M] · rhs[K, N] → [M, N]. Contracting on axis 0 of both inputs.
     let mut g = Graph::new("dg-lhs-t");
     let m = 2;
@@ -4071,6 +4302,7 @@ fn bisect_wgpu_matmul_bias_narrow() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     use rlx_ir::op::BinaryOp;
     let f = DType::F32;
     let h = 8;
@@ -4113,6 +4345,7 @@ fn bisect_wgpu_attention_with_qkv_chain() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     use rlx_ir::op::BinaryOp;
     let f = DType::F32;
     let (b, s, nh, dh) = (1, 3, 2, 4);
@@ -4238,6 +4471,7 @@ fn bisect_wgpu_full_bert_layer() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     use rlx_ir::op::{Activation, BinaryOp};
     let f = DType::F32;
     let (b, s, nh, dh) = (1, 3, 2, 4);
@@ -4418,6 +4652,7 @@ fn bisect_wgpu_full_bert_realistic_dim() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     use rlx_ir::op::{Activation, BinaryOp};
     let f = DType::F32;
     let (b, s, nh, dh) = (1, 6, 12, 32);
@@ -4591,6 +4826,7 @@ fn bisect_wgpu_full_bert_layer_stack() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    let _route = common::route_lock();
     let f = DType::F32;
     let mut g = Graph::new("bert_real_2layer");
     let (b, s, h, nh, dh, n_layers, vocab) = (1, 4, 32, 4, 8, 2, 100);

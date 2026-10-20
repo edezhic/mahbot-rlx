@@ -17,8 +17,9 @@
 //! their own absence. On the platform this stand runs on, all three read.
 //!
 //! The figures are inputs (`--timeout` / `MAHBOT_TIMEOUT_SECS`,
-//! `--max-rss` / `MAHBOT_MAX_RSS_MIB`); the defaults are stated here so a run
-//! without them is still bounded.
+//! `--max-rss` / `MAHBOT_MAX_RSS_MIB`); the swap-growth ceiling has
+//! `MAHBOT_STAND_MAX_SWAP_MIB` for a reproduction on a busy machine. The
+//! defaults are stated here so a run without them is still bounded.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -41,13 +42,26 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 3_600;
 /// machine and aborts before the machine starts swapping.
 pub const DEFAULT_MAX_RSS_MIB: u64 = 6_144;
 
-/// Swap **growth since the run started** above which it stops. GPU allocations
-/// on a unified-memory machine are not visible in the process's resident set, so
+/// Swap **growth since the run started** above which it stops, unless
+/// `MAHBOT_STAND_MAX_SWAP_MIB` names another ceiling. GPU allocations on a
+/// unified-memory machine are not visible in the process's resident set, so
 /// this is the figure that catches the pressure a sweep creates: the run that
 /// stopped working held 6.9 GiB of an 8.2 GiB swap file while its own resident
 /// set read under 700 MiB. Growth rather than the absolute figure, because a
 /// machine that has swapped before this run started is not this run's doing.
 pub const MAX_SWAP_GROWTH_MIB: u64 = 1_024;
+
+/// The swap-growth ceiling this process runs under: [`MAX_SWAP_GROWTH_MIB`]
+/// unless `MAHBOT_STAND_MAX_SWAP_MIB` names another one. One accessor, so the
+/// enforcement in [`MemoryCeiling::check_system`] and the record's provenance
+/// line cannot disagree about the bound a run was taken under.
+#[must_use]
+pub fn max_swap_growth_mib() -> u64 {
+    std::env::var("MAHBOT_STAND_MAX_SWAP_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(MAX_SWAP_GROWTH_MIB)
+}
 
 /// System-wide free memory, as a percentage, below which a run stops.
 pub const MIN_FREE_PERCENT: u64 = 8;
@@ -214,10 +228,10 @@ impl MemoryCeiling {
         self.rss_bytes
     }
 
-    /// The current resident set, in bytes (`0` where the platform cannot
+    /// The current resident set, in bytes (`None` where the platform cannot
     /// report it, in which case this ceiling cannot trip).
     #[must_use]
-    pub fn resident(&self) -> u64 {
+    pub fn resident(&self) -> Option<u64> {
         report::resident_rss()
     }
 
@@ -229,7 +243,9 @@ impl MemoryCeiling {
 
     /// The process's own resident set. Cheap enough for every work item.
     pub fn check_process(&self, phase: &'static str) -> Result<()> {
-        let rss = self.resident();
+        let Some(rss) = self.resident() else {
+            return Ok(());
+        };
         if rss > self.rss_bytes {
             return Err(anyhow::Error::new(Abort::Memory {
                 phase,
@@ -243,17 +259,20 @@ impl MemoryCeiling {
     }
 
     /// Swap in use and free system memory. Two process spawns on macOS, so this
-    /// is a phase / file boundary check, not a per-clip one.
+    /// is a phase / file boundary check, not a per-clip one. The swap-growth
+    /// ceiling is [`MAX_SWAP_GROWTH_MIB`] unless `MAHBOT_STAND_MAX_SWAP_MIB`
+    /// names another one, so a reproduction on a busy machine can raise the
+    /// bound without changing the default.
     pub fn check_system(&self, phase: &'static str) -> Result<()> {
         if let Some(start) = self.swap_start
             && let Some(now) = swap_used_bytes()
         {
             let growth = now.saturating_sub(start);
-            let ceiling = MAX_SWAP_GROWTH_MIB * 1024 * 1024;
+            let ceiling = max_swap_growth_mib().saturating_mul(1024 * 1024);
             if growth > ceiling {
                 return Err(anyhow::Error::new(Abort::Memory {
                     phase,
-                    detail: "swap growth since the run started",
+                    detail: "swap growth since the run started (override MAHBOT_STAND_MAX_SWAP_MIB)",
                     reading: growth,
                     ceiling,
                     unit: Unit::Bytes,
@@ -532,7 +551,8 @@ mod tests {
         // A zero resident-set ceiling is below any live process's reading, so
         // it trips wherever the platform reports one.
         let ceiling = MemoryCeiling::new(0);
-        if ceiling.resident() > 0 {
+        if let Some(rss) = ceiling.resident() {
+            assert!(rss > 0, "a live process reads more than zero bytes");
             let error = ceiling
                 .check_process("real audio")
                 .expect_err("over the ceiling");

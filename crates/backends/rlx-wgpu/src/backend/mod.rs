@@ -594,6 +594,29 @@ pub fn reset_device_counts() {
     DEVICE_WAITS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-wide count of movement dispatches that took a `vec4` kernel.
+///
+/// The scalar arm produces the same bytes, so an output-only parity test cannot
+/// tell which one ran; this counter is what ties such a test to the vector path
+/// it claims to cover.
+pub(crate) static VEC4_MOVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one `vec4` movement dispatch.
+#[inline]
+pub(crate) fn note_vec4_move() {
+    VEC4_MOVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `vec4` movement dispatches since process start ([`reset_vec4_move_count`]).
+pub fn vec4_move_count() -> u64 {
+    VEC4_MOVES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zero [`vec4_move_count`] — for a test bracketing one forward pass.
+pub fn reset_vec4_move_count() {
+    VEC4_MOVES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Where a named handle's row is, as `WgpuExecutable::locate_handle_row` answers
 /// it: the host mirror that still carries the rows, or the byte range of the
 /// arena slot they live in. One ladder for both readback paths, so a row resolved
@@ -773,6 +796,58 @@ impl WgpuExecutable {
     /// *full* one would leave a stale tail.
     pub(crate) fn active_extent_in_effect(&self) -> Option<(usize, usize)> {
         self.active_extent.filter(|_| self.all_safe_for_active())
+    }
+
+    /// Rewrite the draw seeds of this executable's `Sample` steps, in schedule
+    /// order — the one per-run knob a sampling graph needs, since `Op::Sample`'s
+    /// seed is a uniform word and not a pipeline constant.
+    ///
+    /// Answers `false` (writing nothing) when the schedule's `Sample` count is
+    /// not `seeds.len()` or the device is gone, so a graph whose sampler lowered
+    /// to `Argmax` — greedy draws, `temperature <= 0` or `top_k == 1` — is asked
+    /// with an empty slice rather than silently keeping a stale seed. The seeds
+    /// reach the device here — the two words of each `Sample`'s uniform, not the
+    /// whole struct — because `run` skips its whole uniform loop when the active
+    /// extent is unchanged, so a seed change would otherwise never arrive.
+    pub fn set_sample_seeds(&mut self, seeds: &[u64]) -> bool {
+        let count = self
+            .schedule
+            .iter()
+            .filter(|s| matches!(s, Step::Sample { .. }))
+            .count();
+        if count != seeds.len() {
+            return false;
+        }
+        let Some(dev) = wgpu_device() else {
+            return false;
+        };
+        let mut i = 0;
+        let mut gpu_ui = 0usize;
+        for step in &mut self.schedule {
+            // The run loop's own cursor rule: a step that owns no uniform slot is
+            // skipped, and every step that owns one advances the cursor.
+            if !step_owns_slot(step) {
+                continue;
+            }
+            if let Step::Sample { params } = step {
+                let seed = seeds[i];
+                params.seed_lo = seed as u32;
+                params.seed_hi = (seed >> 32) as u32;
+                // Only the seed's two words: the rest of the uniform — `outer`
+                // above all, which the run loop writes scaled to the active
+                // extent — holds what the last run left there, and rewriting the
+                // whole struct here would restore the full extent it trimmed.
+                let at = std::mem::offset_of!(crate::kernels::SampleParams, seed_lo) as u64;
+                dev.queue.write_buffer(
+                    &self.uniforms[gpu_ui],
+                    at,
+                    bytemuck::cast_slice(&[params.seed_lo, params.seed_hi]),
+                );
+                i += 1;
+            }
+            gpu_ui += 1;
+        }
+        true
     }
 
     /// Steps the per-binding-ceiling rule routed to the host route. Non-zero means
@@ -1446,7 +1521,7 @@ fn dispatch_prologue_nchw(w: u32, h: u32, nc: u32) -> (u32, u32, u32) {
     (w.div_ceil(8).max(1), h.div_ceil(8).max(1), nc.max(1))
 }
 
-fn dispatch_dims(threads_total: u32, workgroup_size: u32) -> (u32, u32, u32) {
+pub(crate) fn dispatch_dims(threads_total: u32, workgroup_size: u32) -> (u32, u32, u32) {
     let groups = threads_total.div_ceil(workgroup_size);
     if groups <= MAX_WORKGROUPS_PER_DIM {
         (groups, 1, 1)
@@ -1455,6 +1530,140 @@ fn dispatch_dims(threads_total: u32, workgroup_size: u32) -> (u32, u32, u32) {
         let gy = groups.div_ceil(gx);
         (gx, gy, 1)
     }
+}
+
+/// Threads in one workgroup of the movement kernels (`copy`/`narrow`/`concat`/
+/// `transpose` and their `vec4` siblings), whose `@workgroup_size` is this. Every
+/// grid those kernels are dispatched on divides by it, so the width is written
+/// once here rather than as a literal at each call site.
+pub(crate) const MOVE_WORKGROUP: u32 = 64;
+
+/// Workgroups one flat `vec4` move dispatch of `elems` words needs.
+pub(crate) fn move_workgroups(elems: u32) -> u32 {
+    (elems / 4).div_ceil(MOVE_WORKGROUP)
+}
+
+/// One `vec4<f32>` move per thread is a pure 16 B lane copy, so it is only
+/// legal when the contiguous span is whole vectors and both ends are 16 B
+/// aligned. The offsets here are f32-word offsets from a bind-window base that
+/// is 256 B aligned, so "word offset divisible by 4" is exactly "16 B aligned".
+/// Anything else — an odd `inner`, a staged piece at a non-vector offset —
+/// keeps the scalar kernel rather than re-deriving the shape.
+///
+/// The one eligibility predicate: every caller that picks a vector movement
+/// kernel reads this, and a caller that must also fit a 3-D grid layers
+/// `vec4_axes_fit` on top rather than restating the alignment terms.
+pub(crate) fn vec4_move_ok(span: u32, in_off: u32, out_off: u32) -> bool {
+    span.is_multiple_of(4) && in_off.is_multiple_of(4) && out_off.is_multiple_of(4)
+}
+
+/// One flat `vec4` dispatch covers `elems`: `elems / 4` vectors at
+/// [`MOVE_WORKGROUP`] threads each, inside the adapter's x dimension. `false`
+/// means the span needs the scalar kernel, whose grid [`dispatch_dims`] splits:
+/// the in-arena `copy_vec4` form reads only `gid.x` and has no second dimension
+/// to fall back on.
+pub(crate) fn vec4_flat_grid_ok(elems: u32, max_wg: u32) -> bool {
+    move_workgroups(elems) <= max_wg
+}
+
+/// Encode one in-arena `src → dst` move of `nbytes` inside the storage window
+/// `[base, base + size)`, as a `copy_vec4` dispatch when the span and both ends
+/// are whole 16 B vectors and the x grid fits the adapter's cap, else the
+/// scalar `copy` kernel.
+///
+/// Both callers that move bytes device-side share this — the KV-row feed
+/// (`dispatch::dispatch_arena_copy_bytes`) and a lowering `Step::BufferCopy`
+/// (`run::encode_arena_copy_dispatch`) — so the eligibility rule, the params
+/// and the grid are written once. The pass is the caller's: its own pass was
+/// what used to provide the barrier between this write and every later read of
+/// the arena, and a caller that dispatches into a wider batch gets that
+/// barrier from the batch's ordering instead.
+pub(crate) fn encode_arena_copy(
+    dev: &crate::device::WgpuDevice,
+    arena: &Arena,
+    enc: &mut wgpu::CommandEncoder,
+    src: u64,
+    dst: u64,
+    nbytes: u64,
+    base: u64,
+    size: u64,
+    label: &str,
+) {
+    let (ck, bg, vec4, elems) = prepare_arena_copy(dev, arena, src, dst, nbytes, base, size, label);
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(label),
+        ..Default::default()
+    });
+    encode_arena_copy_into_pass(ck, &bg, vec4, elems, &mut pass);
+}
+
+/// Dispatch a move prepared by [`encode_arena_copy`]'s rules into an already
+/// open pass. The eligibility, the params and the kernel are picked the same
+/// way; only the pass is the caller's, so a run that batches several moves into
+/// one pass pays one pass boundary instead of one per move.
+pub(crate) fn encode_arena_copy_into_pass(
+    ck: &Kernel,
+    bg: &wgpu::BindGroup,
+    vec4: bool,
+    elems: u32,
+    pass: &mut wgpu::ComputePass<'_>,
+) {
+    pass.set_pipeline(&ck.pipeline);
+    pass.set_bind_group(0, bg, &[]);
+    if vec4 {
+        note_vec4_move();
+        pass.dispatch_workgroups(move_workgroups(elems), 1, 1);
+    } else {
+        let (gx, gy, gz) = dispatch_dims(elems, MOVE_WORKGROUP);
+        pass.dispatch_workgroups(gx, gy, gz);
+    }
+}
+
+/// The pipeline, bind group and grid decision for an in-arena move, without a
+/// pass: a caller that already holds one dispatches through
+/// [`encode_arena_copy_into_pass`].
+pub(crate) fn prepare_arena_copy(
+    dev: &crate::device::WgpuDevice,
+    arena: &Arena,
+    src: u64,
+    dst: u64,
+    nbytes: u64,
+    base: u64,
+    size: u64,
+    label: &str,
+) -> (&'static Kernel, wgpu::BindGroup, bool, u32) {
+    let elems = (nbytes / 4) as u32;
+    let in_off = (src.saturating_sub(base) / 4) as u32;
+    let out_off = (dst.saturating_sub(base) / 4) as u32;
+    let vec4 = vec4_move_ok(elems, in_off, out_off)
+        && vec4_flat_grid_ok(
+            elems,
+            dev.device.limits().max_compute_workgroups_per_dimension,
+        );
+    let p = crate::kernels::CopyParams {
+        n: elems,
+        in_off,
+        out_off,
+        _p0: 0,
+        _p1: 0,
+        _p2: 0,
+        _p3: 0,
+        _p4: 0,
+    };
+    let ck = if vec4 {
+        crate::kernels::copy_vec4_kernel(&dev.device)
+    } else {
+        crate::kernels::copy_kernel(&dev.device)
+    };
+    let u = dev.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: std::mem::size_of::<crate::kernels::CopyParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    dev.queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+    let bg = bind_arena_window(&dev.device, ck, arena, base, size, &u);
+    (ck, bg, vec4, elems)
 }
 
 #[cfg(test)]

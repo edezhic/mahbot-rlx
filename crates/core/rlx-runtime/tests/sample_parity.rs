@@ -58,6 +58,18 @@ fn run_on(
     exe.run(&[("logits", logits.as_slice())]).pop().unwrap()
 }
 
+/// `batch1-draw`: one row over 4096 logits, no truncation, temperature 1.0, seed
+/// 11 — the case whose `outer == 1` draw takes the cooperative single-row kernel.
+/// Named because the GPU gate below reads the same tuple the parity sweep does.
+const BATCH1_DRAW: (&str, usize, usize, usize, f32, f32, u64) =
+    ("batch1-draw", 1, 4096, 0, 1.0, 1.0, 11);
+
+/// The truncation the single-row gate's filtered leg sweeps: the plain draw above
+/// skips `need_filter` entirely, so the cooperative top-k scans need a shape of
+/// their own (`top_k=40`, `top_p=1.0`, `temp=0.9`; the loader's default is
+/// `top_k=50` at that temperature).
+const FILTERED_DRAW: (usize, f32, f32) = (40, 1.0, 0.9);
+
 #[allow(dead_code)]
 fn cases() -> Vec<(&'static str, usize, usize, usize, f32, f32, u64)> {
     vec![
@@ -71,6 +83,10 @@ fn cases() -> Vec<(&'static str, usize, usize, usize, f32, f32, u64)> {
         ("topk40", 2, 32000, 40, 1.0, 0.8, 7), // realistic LLM decode
         ("topp", 2, 4096, 0, 0.9, 1.0, 123),   // nucleus
         ("topk-topp", 5, 8192, 50, 0.95, 0.7, 999), // combined
+        // One row is the decode shape, and the only one the cooperative
+        // single-row kernel draws: a genuine draw (not the argmax fast path), so
+        // the branch is compared against this backend's own standalone draw.
+        BATCH1_DRAW,
     ]
 }
 
@@ -274,4 +290,66 @@ fn sample_default_config_is_a_genuine_draw_metal() {
         return;
     }
     assert_default_config_draws(Device::Metal);
+}
+
+/// The cooperative one-row branch must pick the token the serial per-row path
+/// picks for row 0 — on both of the branch's legs: the plain draw, and the
+/// top-k filter the product path runs.
+///
+/// `sample_one_coop` splits a single row across the workgroup; the reductions
+/// whose *order* decides the drawn id stay serial on lane 0, and the Threefry
+/// counter it feeds is `(0, i)` — exactly what the serial path uses for row 0.
+/// So a batch-1 draw and row 0 of a batch-2 draw at the same seed must agree,
+/// while the batch-2 draw (`outer == 2`) takes the serial per-row path with
+/// counter `(row, i)`. The unfiltered case skips `need_filter` entirely, so the
+/// filter's workgroup scans, sentinel marking and lane-0 restore/renormalise are
+/// swept on a second shape at its own truncation (`FILTERED_DRAW`). The seeds
+/// are swept because the drawn id is the only observable, and a single seed that
+/// happens to pick the same token either way cannot see a last-bit difference in
+/// the cooperative reduction.
+///
+/// The two rows of the batch-2 draw differ only by the 0.1 per-row offset the
+/// logits fixture adds, which no argmax can see, so a seed where they disagree
+/// also rules out an argmax fast path behind either branch.
+#[test]
+#[cfg(feature = "gpu")]
+fn sample_batch1_coop_draw_matches_the_serial_row_wgpu() {
+    let (_, _, v, top_k, top_p, temp, case_seed) = BATCH1_DRAW;
+    if common::skip_unless_available(Device::Gpu, "wgpu") {
+        return;
+    }
+    let _gpu = common::serialize_gpu();
+
+    for (top_k, top_p, temp) in [(top_k, top_p, temp), FILTERED_DRAW] {
+        let mut drew_apart = false;
+        for seed in [case_seed].into_iter().chain(1u64..=8) {
+            let coop = run_on(Device::Gpu, 1, v, top_k, top_p, temp, seed);
+            let serial = run_on(Device::Gpu, 2, v, top_k, top_p, temp, seed);
+            assert_eq!(coop.len(), 1, "seed {seed}: expected one drawn row");
+            assert_eq!(serial.len(), 2, "seed {seed}: expected two drawn rows");
+            for &idx in coop.iter().chain(&serial) {
+                assert!(
+                    idx >= 0.0 && (idx as usize) < v,
+                    "batch1-draw (top_k={top_k}) seed {seed}: index {idx} out of range"
+                );
+            }
+            assert_eq!(
+                coop[0], serial[0],
+                "batch1-draw (top_k={top_k}, temp={temp}) seed {seed}: the cooperative \
+                 one-row draw {} != serial row 0 {}",
+                coop[0], serial[0]
+            );
+            drew_apart |= serial[0] != serial[1];
+            eprintln!(
+                "wgpu batch1-draw (top_k={top_k}, temp={temp}) seed {seed}: coop {coop:?}, \
+                 serial {serial:?}"
+            );
+        }
+        assert!(
+            drew_apart,
+            "batch1-draw (top_k={top_k}, temp={temp}): both rows of every batch-2 draw \
+             picked the same token — the logits fixture differs by only 0.1 per row, so \
+             that is an argmax, not a draw"
+        );
+    }
 }

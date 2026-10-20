@@ -355,6 +355,15 @@ impl CompiledGraph {
         self.inner.bind_gpu_handle(name, data)
     }
 
+    /// Rewrite the draw seeds of the graph's `Sample` steps, in schedule order —
+    /// the per-run knob a compiled sampling graph needs, because `Op::Sample`'s
+    /// seed is a uniform word rather than a pipeline constant. Answers false, and
+    /// writes nothing, when the backend does not support it or the graph does not
+    /// have exactly that many `Sample` steps.
+    pub fn set_sample_seeds(&mut self, seeds: &[u64]) -> bool {
+        self.inner.set_sample_seeds(seeds)
+    }
+
     /// ZERO-COPY in-place optimizer step over GPU-resident weights: the
     /// optimizer reads gradients and writes params directly on the unified-memory
     /// arena (no GPU→host→GPU roundtrip). `trainable[i] = (input_name, shape)`;

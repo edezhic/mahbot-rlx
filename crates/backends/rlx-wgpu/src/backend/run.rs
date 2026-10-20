@@ -31,19 +31,19 @@ use crate::kernels::{
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
     cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
-    complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel, conv_transpose2d_kernel,
-    conv_transpose3d_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
-    conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_ctile_kernel,
-    conv3d_kernel, copy_kernel, copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel,
-    cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
-    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
-    fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
-    fma_kernel, frames_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel,
-    fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel, fused_swiglu_kernel,
-    gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
-    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel,
-    gather_elements_kernel, gather_kernel, gather_nd_kernel, gather_split_kernel,
-    group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
+    complex_norm_sq_kernel, concat_kernel, concat_vec4_kernel, conjugate_c64_kernel,
+    conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel, conv1d_tiled_kernel,
+    conv2d_kernel, conv3d_backward_input_kernel, conv3d_backward_weight_kernel,
+    conv3d_ctile_kernel, conv3d_kernel, copy_kernel, copy_sanitize_kernel, cum_scan_kernel,
+    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel,
+    dequantize_i8_kernel, elementwise_region_kernel, elementwise_region_spatial_kernel,
+    expand_kernel, fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel,
+    fft_butterfly_stage_kernel, fma_kernel, frames_kernel, fused_conv_bias_act_kernel,
+    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
+    fused_swiglu_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
+    gated_residual_kernel, gather_axis_kernel, gather_backward_acc_kernel,
+    gather_backward_zero_kernel, gather_elements_kernel, gather_kernel, gather_nd_kernel,
+    gather_split_kernel, group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
     group_norm_backward_input_kernel, group_norm_kernel, grouped_matmul_kernel, gru_kernel,
     im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
@@ -53,7 +53,7 @@ use crate::kernels::{
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
     matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
-    maxpool3d_backward_kernel, narrow_kernel, note_attention_decomposed_route,
+    maxpool3d_backward_kernel, narrow_kernel, narrow_vec4_kernel, note_attention_decomposed_route,
     note_attention_route, pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel,
     q_matmul_kernel, quantize_i8_kernel, reduce_kernel, reverse_kernel, rms_norm_backward_kernel,
     rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
@@ -61,8 +61,8 @@ use crate::kernels::{
     scaled_quant_scale_kernel, scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel,
     scatter_nd_reduce_kernel, selective_scan_kernel, softmax_cross_entropy_backward_kernel,
     softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
-    topk_kernel, transpose_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
-    welch_peaks_gpu_kernel, where_kernel,
+    topk_kernel, transpose_kernel, transpose_vec4_kernel, umap_knn_kernel, unary_f16_mirror_kernel,
+    unary_kernel, welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
@@ -80,8 +80,8 @@ impl WgpuExecutable {
     ///
     /// That is the route ladder's own answer for the call — the two device-only
     /// [`crate::gguf_gpu::DequantMatmulPath`]s, whose entry point
-    /// [`crate::gguf_gpu::encode_dequant_matmul_gguf_into`] can be handed a caller's
-    /// encoder: the tiled one-row arm
+    /// [`crate::gguf_gpu::encode_dequant_matmul_gguf_into_pass`] can be handed a
+    /// caller's open pass: the tiled one-row arm
     /// ([`crate::gguf_gpu::DequantMatmulPath::OneRowDevice`]) and the row-grouped
     /// GEMM above it
     /// ([`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]), which carries the
@@ -96,7 +96,7 @@ impl WgpuExecutable {
     /// carried into an encode that refuses it — for Q8_0, whose per-row loop carries
     /// its one row alone, the refusal is recomputed by the entry point that owns it,
     /// [`crate::gguf_host`] included where a sharded arena or a parked weight lands
-    /// it there — and the join branch owns that refusal (see its comment).
+    /// it there — and the in-pass join arm owns that refusal (see its comment).
     ///
     /// `scale` is the step arm's own active-extent scaling, so the answer is for the
     /// row count in use, not the compiled one. A false answer is conservative: it
@@ -150,17 +150,23 @@ impl WgpuExecutable {
     ///   work after a host step (which now fires for it too). These are the sites
     ///   that act on this step only because the plan classifies it as a host step.
     /// * **a joined call is device work *inside the batch*** for
-    ///   `step_needs_pass_flush`, where it can now be the `prev` step: on
+    ///   `step_needs_pass_flush`, where it can be the `prev` step: on
     ///   Vulkan/DX12-class adapters that arm asks for the pass split and the drain
-    ///   the copy's own submission used to provide (commented at that arm).
-    /// * **the run's exit path**: a joined call keeps the batch carried, so the loop
-    ///   runs on to the tail that reads the outputs back instead of ending the run
-    ///   after the arm — which tail a copy-ending graph leaves through is decided
-    ///   here, and that is why every such tail runs the debug scans
-    ///   ([`Self::debug_scans_after_run`]).
+    ///   the copy's own submission used to provide (commented at that arm). A packed
+    ///   multiply is dispatched into the pass itself; a copy ends the pass and its
+    ///   work lands in the next one that runs.
+    /// * **the run's exit path**: a joined call does not end the run after the arm —
+    ///   the packed multiply advances inside the pass and the copy keeps the encoder
+    ///   carried — so the loop runs on to the tail that reads the outputs back
+    ///   instead of ending the run after the arm; which tail a copy-ending graph
+    ///   leaves through is decided here, and that is why every such tail runs the
+    ///   debug scans ([`Self::debug_scans_after_run`]).
+    /// * **the pass loop's `break`** on a host step: the in-pass gate calls this
+    ///   predicate, so it and the boundary cannot disagree; a joined call is the
+    ///   `false` that keeps the step inside the pass (see the in-pass arm).
     /// * **untouched**: the lane cursors (a joined call consumes no uniform,
-    ///   bind-group or meta-buffer slot, so no later step's index moves), the pass
-    ///   loop's `break` on a host step and its two `static_once` skips, the final
+    ///   bind-group or meta-buffer slot, so no later step's index moves) and the
+    ///   pass loop's two `static_once` skips, the final
     ///   mirror flush, the host route's own readback and drain, `bypasses_host_cache`
     ///   (a call the join consumed never reaches it, but one whose encode refused it
     ///   does — `DequantMatmulGguf` is not a cache-aware arm, so that tail drops the
@@ -229,18 +235,36 @@ impl WgpuExecutable {
         }))
     }
 
-    /// Encode the whole device-side body of a `Step::BufferCopy` into `enc`: one
-    /// `copy_kernel` dispatch over the storage window `[base, base + size)` that
-    /// [`buffer_copy_route`] picked, in a compute pass of its own.
-    ///
-    /// Shared by the two places the copy's work is encoded — the host arm, which
-    /// submits the encoder it creates, and the join branch, which hands the
-    /// enclosing batch's encoder — so both encode the identical dispatch. Its own
-    /// pass is what keeps the barrier the arena's aliased slots need between this
-    /// write and every later read of it: a pass of its own is exactly what the
-    /// unjoined arm's submission of its own used to provide. Nothing is staged for
-    /// it: the window is the arena itself, and the per-call uniform and bind group
-    /// live as long as the encoder that references them.
+    /// The arena window a `Step::BufferCopy` dispatches over when this run joins
+    /// it into the enclosing batch, or `None` for every step it does not. This is
+    /// the same [`CopyRoute`] answer [`Self::step_breaks_batch`] reads through
+    /// [`CopyRoute::joins_batch`], carried one step further to the window the
+    /// dispatch needs — so the boundary, the gate and the encoding arm cannot
+    /// spell the join rule three ways.
+    fn joined_copy_window(
+        &self,
+        step: &Step,
+        one_op_per_pass: bool,
+        host_cache: &rlx_gpu_host::HostTensorCache,
+        dev: &crate::device::WgpuDevice,
+    ) -> Option<(u64, u64)> {
+        if one_op_per_pass {
+            return None;
+        }
+        self.buffer_copy_route_now(step, host_cache, dev)
+            .filter(|route| route.joins_batch())
+            .and_then(CopyRoute::join_window)
+    }
+
+    /// Encode a `Step::BufferCopy`'s device body into `enc`, as a compute pass of
+    /// its own over the storage window `[base, base + size)` that
+    /// [`buffer_copy_route`] picked. Shared by the host arm (which submits the
+    /// encoder it creates) and the join branch (which hands the enclosing batch's
+    /// encoder), so both encode the identical dispatch; the pass is what provides
+    /// the barrier the arena's aliased slots need. The eligibility rule and the
+    /// dispatch itself are [`super::encode_arena_copy`]'s, shared with the KV-row
+    /// feed. Nothing is staged: the window is the arena, and the per-call uniform
+    /// and bind group live as long as the encoder that references them.
     fn encode_arena_copy_dispatch(
         &self,
         dev: &crate::device::WgpuDevice,
@@ -251,36 +275,17 @@ impl WgpuExecutable {
         base: u64,
         size: u64,
     ) {
-        // `copy_route` refused a zero-byte copy above, and every producer sizes a
-        // slot at `elems * 4`, so the element count below is exact.
-        let elems = (nbytes / 4) as u32;
-        let p = CopyParams {
-            n: elems,
-            in_off: (src.saturating_sub(base) / 4) as u32,
-            out_off: (dst.saturating_sub(base) / 4) as u32,
-            _p0: 0,
-            _p1: 0,
-            _p2: 0,
-            _p3: 0,
-            _p4: 0,
-        };
-        let ck = copy_kernel(&dev.device);
-        let u = dev.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rlx-wgpu arena_copy uniform"),
-            size: std::mem::size_of::<CopyParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        dev.queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
-        let bg = bind_arena_window(&dev.device, ck, &self.arena, base, size, &u);
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("rlx-wgpu arena_copy pass"),
-            ..Default::default()
-        });
-        pass.set_pipeline(&ck.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
-        let (gx, gy, gz) = dispatch_dims(elems, 64);
-        pass.dispatch_workgroups(gx, gy, gz);
+        super::encode_arena_copy(
+            dev,
+            &self.arena,
+            enc,
+            src,
+            dst,
+            nbytes,
+            base,
+            size,
+            "rlx-wgpu arena_copy",
+        );
     }
 
     /// Register a resident-KV row feed: `handle_name` (a device-resident input,
@@ -371,34 +376,37 @@ impl WgpuExecutable {
             });
         }
         let bytes = row_elems * std::mem::size_of::<f32>();
-        for m in moves {
-            if !m.no_op {
-                let staging = self.kv_feed_staging.get_or_insert_with(|| {
-                    dev.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("rlx-wgpu kv feed staging"),
-                        size: bytes as u64,
-                        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    })
+        let carry = moves.iter().filter(|m| !m.no_op).count();
+        if carry > 0 {
+            let staging = self.kv_feed_staging.get_or_insert_with(|| {
+                dev.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("rlx-wgpu kv feed staging"),
+                    size: bytes as u64,
+                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
+            // Grow if a later feed carries a wider row.
+            if staging.size() < bytes as u64 {
+                *staging = dev.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("rlx-wgpu kv feed staging"),
+                    size: bytes as u64,
+                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
                 });
-                // Grow if a later feed carries a wider row.
-                if staging.size() < bytes as u64 {
-                    *staging = dev.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("rlx-wgpu kv feed staging"),
-                        size: bytes as u64,
-                        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-                }
-                self.arena.copy_within_device(
-                    &dev.device,
-                    &dev.queue,
-                    staging,
-                    m.src_off,
-                    m.dst_off,
-                    bytes,
-                );
             }
+            // One command buffer for every registered name: a plane cache folds
+            // one row per layer, and one encode/submit per layer is the shape
+            // the same feed paid before this batch.
+            let batch: Vec<(usize, usize, usize)> = moves
+                .iter()
+                .filter(|m| !m.no_op)
+                .map(|m| (m.src_off, m.dst_off, bytes))
+                .collect();
+            self.arena
+                .copy_within_device_batch(&dev.device, &dev.queue, staging, &batch);
+        }
+        for m in moves {
             self.gpu_handle_resident.insert(m.name.clone());
             self.gpu_handles.insert(m.name, Vec::new());
         }
@@ -854,7 +862,7 @@ impl WgpuExecutable {
                     continue;
                 }
                 if self.static_once_done && self.static_once_steps.contains(&step_i) {
-                    if !matches!(step, Step::FftGpu { .. }) {
+                    if step_owns_slot(step) {
                         gpu_ui += 1;
                     }
                     continue;
@@ -1602,7 +1610,7 @@ impl WgpuExecutable {
                     | Step::GaussianSplatPrepare { .. }
                     | Step::GaussianSplatRasterize { .. } => {}
                 }
-                if !matches!(step, Step::FftGpu { .. }) {
+                if step_owns_slot(step) {
                     gpu_ui += 1;
                 }
             }
@@ -1651,19 +1659,52 @@ impl WgpuExecutable {
         // after a chosen step and read what that step produced.
         let one_op_per_pass =
             rlx_ir::env::flag("RLX_WGPU_ONE_OP_PER_PASS") || self.snapshot_stop.is_some();
+        // Steps one batch encodes before submitting it and carrying on in a fresh
+        // encoder. Encoding is host work, so a batch that carries one encoder to
+        // the end of the schedule pays all of it with the device idle: the code
+        // predictor's frame (1 465 steps) exposed its whole encode before the first
+        // dispatch ran. Chunked, the encode of chunk n+1 overlaps the execution of
+        // chunk n, and only one chunk's encode is exposed. Bit-exact by
+        // construction - dispatch order, arena and barriers are unchanged, only the
+        // command buffers they are recorded in - and a boundary can only *narrow* a
+        // batch between passes, which `step_needs_pass_flush` never forbids.
+        //
+        // Measured as an alternating A/B on the speak cell in one window, chunk
+        // off against 256 steps: the predictor's frame 78.24/78.02 -> 61.67/59.03 ms
+        // and the cell 38 814/37 968 -> 31 453/29 923 ms. The sweep is monotone in
+        // chunk count and flat past 128 (predictor warm, two runs each: 256 ->
+        // 19 748/19 798, 128 -> 19 512/19 442, 64 -> 19 417/19 274 ms), so it is
+        // cheaper to expose one chunk's encode and pay the per-submit floor than to
+        // expose the batch's. A graph of a few dozen steps still submits once.
+        //
+        // `enc_steps` counts the steps this batch has *encoded*, and it is read by
+        // the chunk boundary only. Every site that encodes a dispatch must increment
+        // it - the pass loop's tail, the two arms inside the pass that dispatch and
+        // `continue` (a joined packed multiply, a joined copy), and the arm below the
+        // pass that encodes a joined copy into the carried encoder - and it is reset
+        // wherever a new encoder is created, as `pass_dispatched` is. A site that
+        // dispatches without counting only makes the chunks longer; a site that counts
+        // without dispatching would end a chunk on work that is not there.
+        let encode_chunk_steps = match rlx_ir::env::parse_or("RLX_WGPU_ENCODE_CHUNK", 64usize) {
+            0 => usize::MAX,
+            n => n,
+        };
+        let mut enc_steps = 0usize;
         let mut step_i = 0;
         let mut gpu_bi = 0usize;
         let mut fft_i = 0usize;
         let mut host_cache = rlx_gpu_host::HostTensorCache::new();
         // The batch's encoder. A joined call — a packed multiply or a
         // device-route copy — hands it to the next outer iteration instead of
-        // submitting, so one contiguous run of device work is one command buffer
-        // and one submission — the route's own `enc.finish()` would be exactly
-        // the per-call submission this join removes. It also removes command
-        // buffers rather than adding any: a batch creates its encoder once (the
-        // loop below reuses it across joined calls), so a forward pass holds at
-        // most one encoder that has been created but not yet submitted, against
-        // the graphics layer's own budget of those (4096 on Metal). Never `Some`
+        // submitting, so one contiguous run of device work shares one command
+        // buffer — the route's own `enc.finish()` would be exactly the per-call
+        // submission this join removes — until `encode_chunk_steps` is reached,
+        // at which point the batch is submitted and a fresh encoder carries the
+        // next chunk (that is what overlaps encoding with execution; it is not a
+        // per-frame submission count, and a frame is one submission per chunk). A
+        // forward pass therefore holds at most one encoder that has been created
+        // but not yet submitted, against the graphics layer's own budget of those
+        // (4096 on Metal). Never `Some`
         // when the loop exits: the loop condition keeps iterating until the
         // carried encoder has been submitted, and every other `break` out of the
         // loop happens after a submission — the snapshot break below is the one
@@ -1691,7 +1732,16 @@ impl WgpuExecutable {
                 let mut enc = match pending_enc.take() {
                     Some(enc) => enc,
                     None => {
+                        // A chunk this run submitted before this point holds device
+                        // writes the mirror has not seen. A chunk boundary can leave
+                        // an iteration that dispatches nothing in between, so the
+                        // clear cannot wait for the next host boundary; it cannot
+                        // lose a deferred write either (`clear_mirror` delivers one).
+                        if pass_dispatched {
+                            clear_mirror(&mut host_cache, &self.arena, dev);
+                        }
                         pass_dispatched = false;
+                        enc_steps = 0;
                         dev.device
                             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                                 label: Some("rlx-wgpu run"),
@@ -1711,13 +1761,20 @@ impl WgpuExecutable {
                                 step_i += 1;
                                 continue;
                             }
-                            if !matches!(step, Step::FftGpu { .. }) {
+                            if step_owns_slot(step) {
                                 gpu_bi += 1;
                             }
                             step_i += 1;
                             continue;
                         }
-                        if step_runs_on_host(&self.schedule[step_i]) {
+                        // A host-classified step ends the pass unless this run
+                        // joins it into the batch: `step_breaks_batch` is the one
+                        // spelling of that decision, so the boundary above and this
+                        // gate cannot disagree about a packed multiply's device
+                        // answer or a copy's route. `one_op_per_pass` makes every
+                        // join inert, which that predicate already encodes.
+                        if self.step_breaks_batch(step_i, &scale, one_op_per_pass, &host_cache, dev)
+                        {
                             break;
                         }
                         // Vulkan/DX12: end the pass after unary/cast so f32→f16
@@ -1786,7 +1843,7 @@ impl WgpuExecutable {
                                 // identity there.
                                 let m_s = scale(*m);
                                 if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -1934,7 +1991,7 @@ impl WgpuExecutable {
                             Step::Binary { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -1948,7 +2005,7 @@ impl WgpuExecutable {
                             Step::Compare { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -1962,7 +2019,7 @@ impl WgpuExecutable {
                             Step::Unary { params, f16_mirror } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -1984,7 +2041,7 @@ impl WgpuExecutable {
                             Step::Where { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -1998,7 +2055,7 @@ impl WgpuExecutable {
                             Step::Fma { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2012,7 +2069,7 @@ impl WgpuExecutable {
                             Step::ReluBackward { params } | Step::ActivationBackward { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2026,7 +2083,7 @@ impl WgpuExecutable {
                             Step::Reduce { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2051,7 +2108,7 @@ impl WgpuExecutable {
                             Step::Softmax { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2087,7 +2144,7 @@ impl WgpuExecutable {
                             Step::SoftmaxCrossEntropy { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2102,7 +2159,7 @@ impl WgpuExecutable {
                             Step::SoftmaxCrossEntropyWithLogits { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2117,7 +2174,7 @@ impl WgpuExecutable {
                             Step::SoftmaxCrossEntropyBackward { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2132,7 +2189,7 @@ impl WgpuExecutable {
                             Step::LayerNorm { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2148,7 +2205,7 @@ impl WgpuExecutable {
                             }
                             Step::GroupNorm { params } => {
                                 if params.groups_total == 0 || params.group_elems == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2185,7 +2242,7 @@ impl WgpuExecutable {
                             Step::FusedSwiGLU { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2202,7 +2259,7 @@ impl WgpuExecutable {
                             Step::RmsNormBackwardInput { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2216,7 +2273,7 @@ impl WgpuExecutable {
                             Step::RmsNormBackwardGamma { params }
                             | Step::RmsNormBackwardBeta { params } => {
                                 if params.inner == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2230,7 +2287,7 @@ impl WgpuExecutable {
                             Step::LayerNormBackwardInput { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2246,7 +2303,7 @@ impl WgpuExecutable {
                                 num_workgroups,
                             } => {
                                 if params.inner == 0 || *num_workgroups == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2259,7 +2316,7 @@ impl WgpuExecutable {
                             }
                             Step::LayerNormBackwardGammaReduce { params } => {
                                 if params.inner == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2273,7 +2330,7 @@ impl WgpuExecutable {
                             Step::CumsumBackward { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2288,7 +2345,7 @@ impl WgpuExecutable {
                             Step::RopeBackward { params } => {
                                 let seq_s = scale(params.seq);
                                 if seq_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2304,7 +2361,7 @@ impl WgpuExecutable {
                             Step::GatherBackward { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2326,7 +2383,7 @@ impl WgpuExecutable {
                             Step::Cumsum { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2341,7 +2398,7 @@ impl WgpuExecutable {
                             Step::CumScan { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2379,7 +2436,7 @@ impl WgpuExecutable {
                             Step::Copy { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2394,7 +2451,7 @@ impl WgpuExecutable {
                             Step::Cast { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2409,7 +2466,7 @@ impl WgpuExecutable {
                             Step::ComplexCast { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2424,7 +2481,7 @@ impl WgpuExecutable {
                             Step::BinaryC64 { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2439,7 +2496,7 @@ impl WgpuExecutable {
                             Step::ComplexNormSq { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2454,7 +2511,7 @@ impl WgpuExecutable {
                             Step::ComplexNormSqBackward { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2469,7 +2526,7 @@ impl WgpuExecutable {
                             Step::ConjugateC64 { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2485,7 +2542,7 @@ impl WgpuExecutable {
                                 let batch_s = scale(params.batch);
                                 let n = batch_s.saturating_mul(params.half);
                                 if n == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2497,18 +2554,92 @@ impl WgpuExecutable {
                                 let (gx, gy, gz) = dispatch_dims(n, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
-                            Step::BufferCopy { .. } => {
+                            Step::DequantMatmulGguf {
+                                m,
+                                k,
+                                n,
+                                scheme_id,
+                                x_byte_off,
+                                w_byte_off,
+                                out_byte_off,
+                            } => {
+                                // A packed multiply this run joined: its dispatches
+                                // land in the pass already open, so no pass boundary is
+                                // paid for it. The ladder's own refusal (nothing
+                                // encoded) ends the batch here, exactly where the old
+                                // host boundary did, and the host arm recomputes the
+                                // call after this batch is submitted; `step_i` stays
+                                // put, so the walk resumes on the same step.
+                                //
+                                // A host result still only in the mirror has to reach
+                                // the device before the multiply reads X. The queue
+                                // write is ordered before this pass's eventual
+                                // submission, so it lands with the batch and the
+                                // device is not drained here.
+                                if host_cache.has_deferred_writes() {
+                                    deliver_deferred(&mut host_cache, &self.arena, dev);
+                                }
+                                let encoded = crate::gguf_gpu::encode_dequant_matmul_gguf_into_pass(
+                                    &self.arena,
+                                    &dev.device,
+                                    &dev.queue,
+                                    &mut pass,
+                                    scale(*m) as usize,
+                                    *k as usize,
+                                    *n as usize,
+                                    *scheme_id,
+                                    *x_byte_off as usize,
+                                    *w_byte_off as usize,
+                                    *out_byte_off as usize,
+                                );
+                                if encoded {
+                                    // No lane: lowering booked no uniform or bind
+                                    // group for a host-classified step, so the run's
+                                    // cursors stay where they are.
+                                    step_i += 1;
+                                    pass_dispatched = true;
+                                    enc_steps += 1;
+                                    continue;
+                                }
+                                break;
+                            }
+                            Step::BufferCopy {
+                                src_byte_off,
+                                dst_byte_off,
+                                bytes,
+                            } => {
                                 // `step_runs_on_host` classifies a copy as a host
-                                // step, so the host-step loop below routes it —
-                                // a copy-kernel dispatch (into a batch whose
-                                // encoder the join branch carries, or one of its
-                                // own) or a host round-trip — and this GPU pass
-                                // encodes nothing for it.
+                                // step; the boundary above keeps the ones whose
+                                // route is a device window here, and the rest go
+                                // to the host-step loop below (a copy dispatch
+                                // into a batch of its own, or a host round-trip).
+                                let (base, size) = self
+                                    .joined_copy_window(step, one_op_per_pass, &host_cache, dev)
+                                    .expect("a joined copy has a device window");
+                                let (ck, bg, vec4, elems) = super::prepare_arena_copy(
+                                    dev,
+                                    &self.arena,
+                                    *src_byte_off,
+                                    *dst_byte_off,
+                                    *bytes as u64,
+                                    base,
+                                    size,
+                                    "rlx-wgpu arena_copy",
+                                );
+                                super::encode_arena_copy_into_pass(ck, &bg, vec4, elems, &mut pass);
+                                host_cache.invalidate(*dst_byte_off as usize);
+                                // A copy carries no bound lane: lowering pushed no
+                                // bind group for it, so it must not advance
+                                // `gpu_bi` the way a dispatched step's tail does.
+                                step_i += 1;
+                                pass_dispatched = true;
+                                enc_steps += 1;
+                                continue;
                             }
                             Step::ElementwiseRegion { params } => {
                                 let len_s = scale(params.len);
                                 if len_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2536,7 +2667,7 @@ impl WgpuExecutable {
                                 let slice_len_s = scale(params.slice_len);
                                 let num_batch_s = scale(params.num_batch);
                                 if slice_len_s == 0 || num_batch_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2561,52 +2692,90 @@ impl WgpuExecutable {
                                         params.out_total
                                     };
                                 if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
                                     continue;
                                 }
-                                let tk = transpose_kernel(&dev.device);
-                                pass.set_pipeline(&tk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
+                                if params.mode != 0 {
+                                    // Vector modes: the grid is the one the
+                                    // lowering sized (x over `inner / 4`); x is
+                                    // recomputed here so a scaled `out_total`
+                                    // needs no new params.
+                                    super::note_vec4_move();
+                                    let tk = transpose_vec4_kernel(&dev.device);
+                                    pass.set_pipeline(&tk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let gx = super::move_workgroups(params.inner);
+                                    pass.dispatch_workgroups(gx, params.grid_y, params.grid_z);
+                                } else {
+                                    let tk = transpose_kernel(&dev.device);
+                                    pass.set_pipeline(&tk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) =
+                                        dispatch_dims(total_s, super::MOVE_WORKGROUP);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
                             }
                             Step::Narrow { params } => {
                                 let total_s = scale(params.total);
                                 if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
                                     continue;
                                 }
-                                let nk = narrow_kernel(&dev.device);
-                                pass.set_pipeline(&nk.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
+                                if params.vec4 != 0 {
+                                    super::note_vec4_move();
+                                    let nk = narrow_vec4_kernel(&dev.device);
+                                    pass.set_pipeline(&nk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let gx = super::move_workgroups(params.inner);
+                                    pass.dispatch_workgroups(
+                                        gx,
+                                        params.axis_out_size,
+                                        params.outer,
+                                    );
+                                } else {
+                                    let nk = narrow_kernel(&dev.device);
+                                    pass.set_pipeline(&nk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) =
+                                        dispatch_dims(total_s, super::MOVE_WORKGROUP);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
                             }
                             Step::Concat { params } => {
                                 let total_s = scale(params.total);
                                 if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
                                     continue;
                                 }
-                                let cck = concat_kernel(&dev.device);
-                                pass.set_pipeline(&cck.pipeline);
-                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(total_s, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
+                                if params.vec4 != 0 {
+                                    super::note_vec4_move();
+                                    let cck = concat_vec4_kernel(&dev.device);
+                                    pass.set_pipeline(&cck.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let gx = super::move_workgroups(params.inner);
+                                    pass.dispatch_workgroups(gx, params.axis_in_size, params.outer);
+                                } else {
+                                    let cck = concat_kernel(&dev.device);
+                                    pass.set_pipeline(&cck.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (gx, gy, gz) =
+                                        dispatch_dims(total_s, super::MOVE_WORKGROUP);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
                             }
                             Step::Gather { params } => {
                                 let n_out_s = scale(params.n_out);
                                 if n_out_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2624,7 +2793,7 @@ impl WgpuExecutable {
                                 let total_s =
                                     scale(params.outer) * params.num_idx * params.trailing;
                                 if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2642,7 +2811,7 @@ impl WgpuExecutable {
                                 // extent) inside the WGSL.
                                 let seq_q_s = scale(params.seq_q);
                                 if seq_q_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2690,7 +2859,7 @@ impl WgpuExecutable {
                                 };
                                 let axis_s = scale(axis);
                                 if axis_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2709,7 +2878,7 @@ impl WgpuExecutable {
                                 let s_active = scale(params.seq);
                                 let total_s = params.batch * s_active * params.last_dim;
                                 if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2833,7 +3002,7 @@ impl WgpuExecutable {
                             }
                             Step::IndexingNd { params, kernel, .. } => {
                                 if params.n == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2869,7 +3038,7 @@ impl WgpuExecutable {
                                         params.out_total
                                     };
                                 if total_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2903,7 +3072,7 @@ impl WgpuExecutable {
                             Step::Argmax { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2918,7 +3087,7 @@ impl WgpuExecutable {
                             Step::Pool2d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2934,7 +3103,7 @@ impl WgpuExecutable {
                             Step::MaxPool2dBackward { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2951,7 +3120,7 @@ impl WgpuExecutable {
                             Step::MaxPool3dBackward { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2967,7 +3136,7 @@ impl WgpuExecutable {
                             Step::Conv3dBackwardInput { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -2983,7 +3152,7 @@ impl WgpuExecutable {
                             Step::Conv3dBackwardWeight { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3001,7 +3170,7 @@ impl WgpuExecutable {
                             Step::GroupNormBackwardInput { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3027,7 +3196,7 @@ impl WgpuExecutable {
                             Step::AxialRope2d { params } => {
                                 let batch_s = scale(params.batch);
                                 if batch_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3043,7 +3212,7 @@ impl WgpuExecutable {
                             Step::FakeQuantizeFixed { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3058,7 +3227,7 @@ impl WgpuExecutable {
                             Step::FakeQuantizePerBatch { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 || params.chan_dim == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3073,7 +3242,7 @@ impl WgpuExecutable {
                             Step::Conv2d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3093,7 +3262,7 @@ impl WgpuExecutable {
                             Step::Conv2dTiled { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3111,7 +3280,7 @@ impl WgpuExecutable {
                             Step::FusedConvBiasAct { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3141,7 +3310,7 @@ impl WgpuExecutable {
                             Step::Pool1d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3157,7 +3326,7 @@ impl WgpuExecutable {
                             Step::Pool3d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3174,7 +3343,7 @@ impl WgpuExecutable {
                             Step::Conv1d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3190,7 +3359,7 @@ impl WgpuExecutable {
                             Step::Conv3d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3253,7 +3422,7 @@ impl WgpuExecutable {
                             Step::ConvTranspose3d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3286,7 +3455,7 @@ impl WgpuExecutable {
                             Step::TopK { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3301,7 +3470,7 @@ impl WgpuExecutable {
                             Step::WelchPeaksGpu { params } => {
                                 let batch_s = scale(params.welch_batch);
                                 if batch_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3329,7 +3498,7 @@ impl WgpuExecutable {
                             Step::UmapKnn { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3359,7 +3528,7 @@ impl WgpuExecutable {
                             Step::GroupedMatmul { params } => {
                                 let m_s = scale(params.m);
                                 if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3373,7 +3542,7 @@ impl WgpuExecutable {
                             Step::ScaledGroupedMatmul { params } => {
                                 let m_s = scale(params.m);
                                 if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3387,7 +3556,7 @@ impl WgpuExecutable {
                             Step::Sample { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3396,7 +3565,10 @@ impl WgpuExecutable {
                                 let sk = sample_kernel(&dev.device);
                                 pass.set_pipeline(&sk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                // The shader's own lane count: a one-row draw splits
+                                // the row across exactly this many invocations.
+                                let (gx, gy, gz) =
+                                    dispatch_dims(outer_s, crate::kernels::SAMPLE_LANES);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::SelectiveScan { params } => {
@@ -3453,7 +3625,7 @@ impl WgpuExecutable {
                             Step::DequantMatmul { params } => {
                                 let m_s = scale(params.m);
                                 if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3467,7 +3639,7 @@ impl WgpuExecutable {
                             Step::DequantMatmulMlx { params } => {
                                 let m_s = scale(params.m);
                                 if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3484,7 +3656,7 @@ impl WgpuExecutable {
                             Step::FusedResidualLn { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3501,7 +3673,7 @@ impl WgpuExecutable {
                             Step::FusedResidualLnTee { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3518,7 +3690,7 @@ impl WgpuExecutable {
                             Step::FusedResidualRmsNorm { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3535,7 +3707,7 @@ impl WgpuExecutable {
                             Step::AdaLayerNorm { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3552,7 +3724,7 @@ impl WgpuExecutable {
                             Step::GatedResidual { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3568,7 +3740,7 @@ impl WgpuExecutable {
                             Step::AdaLayerNormBackward { params } => {
                                 let mod_rows_s = scale(params.mod_rows);
                                 if mod_rows_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3582,7 +3754,7 @@ impl WgpuExecutable {
                             Step::GatedResidualBackward { params } => {
                                 let mod_rows_s = scale(params.mod_rows);
                                 if mod_rows_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3596,7 +3768,7 @@ impl WgpuExecutable {
                             Step::MatmulQkv { params, kind } => {
                                 let m_s = scale(params.m);
                                 if m_s == 0 {
-                                    if !matches!(step, Step::FftGpu { .. }) {
+                                    if step_owns_slot(step) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -3663,7 +3835,6 @@ impl WgpuExecutable {
                                 }
                             }
                             Step::GatherSplit { .. }
-                            | Step::DequantMatmulGguf { .. }
                             | Step::DequantMatmulInt8Host { .. }
                             | Step::DequantMatmulMlxHost { .. }
                             | Step::Conv2dHost { .. }
@@ -3711,7 +3882,7 @@ impl WgpuExecutable {
                             | Step::GaussianSplatPrepare { .. }
                             | Step::GaussianSplatRasterize { .. } => {}
                         }
-                        if !matches!(step, Step::FftGpu { .. }) {
+                        if step_owns_slot(step) {
                             gpu_bi += 1;
                         }
                         if rlx_ir::env::flag("RLX_WGPU_DBG_COUNTERS") {
@@ -3722,83 +3893,40 @@ impl WgpuExecutable {
                         }
                         step_i += 1;
                         pass_dispatched = true;
+                        enc_steps += 1;
                         if one_op_per_pass {
                             break; // end the pass after this op ⇒ barrier before next
                         }
+                        // Chunk boundary: submit what is encoded and carry on in a
+                        // fresh encoder, so this chunk's execution overlaps the next
+                        // one's encode (see `encode_chunk_steps`). The step left at the
+                        // boundary must be one the *pass loop* dispatches, so that the
+                        // next iteration encodes a batch rather than falling into the
+                        // host route. Two kinds must not be left there: a host-classified
+                        // step, which would take the host route — including a joined
+                        // packed multiply or copy, whose join arm needs the carried
+                        // encoder this break would have submitted, and which lands on the
+                        // host arm when it is refused there — and a deferred tail-host
+                        // step (`step_is_tail_host`), admissible only behind a carried
+                        // device batch, which is the stranding
+                        // `assert_hosted_audio_step_placement` refuses.
+                        // `RLX_WGPU_ENCODE_CHUNK=1` is enough to reach that one without
+                        // this guard. `step_breaks_batch` is deliberately *not* the
+                        // predicate here: it answers false for a joining call, which is
+                        // the case this must exclude.
+                        if enc_steps >= encode_chunk_steps
+                            && step_i < self.schedule.len()
+                            && !step_runs_on_host(&self.schedule[step_i])
+                            && !step_is_tail_host(&self.schedule[step_i])
+                        {
+                            break;
+                        }
                     }
                 }
-                // A joined packed multiply: end the pass, encode its dispatches
-                // into THIS encoder, and carry the batch on. Its scratch stays alive
-                // because the encode is contiguous inside this one encoder — dispatch,
-                // then `copy_buffer_to_buffer` into the arena — and a later call that
-                // reuses the pooled out slab can only do so after that copy in command
-                // order; the slab's buffer is not released while a submitted-or-carried
-                // command buffer references it. It consumes no lane either: lowering
-                // pushed none for this step and the run-time cursors skip
-                // host-classified steps, so no later device step's slot moves.
-                if !one_op_per_pass
-                    && let Some(step) = self.schedule.get(step_i)
-                    && self.joined_dequant_gguf(step, &scale)
-                    && let Step::DequantMatmulGguf {
-                        m,
-                        k,
-                        n,
-                        scheme_id,
-                        x_byte_off,
-                        w_byte_off,
-                        out_byte_off,
-                    } = step
-                {
-                    // This call reads the arena on the device, so a host result still
-                    // only in the mirror has to reach the device before this batch is
-                    // submitted. Reached at a batch's start (a host step never runs
-                    // while an encoder is carried), so the write lands with the
-                    // submission that carries the joined dispatches.
-                    if host_cache.has_deferred_writes() {
-                        let mut a = crate::host_stage::WgpuArena {
-                            arena: &self.arena,
-                            device: &dev.device,
-                            queue: &dev.queue,
-                            size_bytes: 0,
-                        };
-                        host_cache.flush_to_device(&mut a);
-                        crate::backend::note_device_wait();
-                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-                    }
-                    // The admission is the ladder's device-only answers, and the call
-                    // can still be refused here: the encode's gates read arena, adapter
-                    // and lever facts a device-free ladder cannot see (see
-                    // [`crate::gguf_gpu::DequantMatmulPath::GroupedDevice`]). The refusal
-                    // is not run past — an unencoded call leaves `step_i` where it is,
-                    // so this iteration's tail submits the batch and the outer host
-                    // dispatch then runs its own arm on an arena that submission has made
-                    // coherent, handing the refusal to the entry point that owns its
-                    // recompute. The mirror this batch may have been carrying was flushed
-                    // by the block above, the same door a plain device step goes through.
-                    let encoded = crate::gguf_gpu::encode_dequant_matmul_gguf_into(
-                        &self.arena,
-                        &dev.device,
-                        &dev.queue,
-                        &mut enc,
-                        scale(*m) as usize,
-                        *k as usize,
-                        *n as usize,
-                        *scheme_id,
-                        *x_byte_off as usize,
-                        *w_byte_off as usize,
-                        *out_byte_off as usize,
-                        &mut report.marks(),
-                    );
-                    if encoded {
-                        step_i += 1;
-                        pass_dispatched = true;
-                        pending_enc = Some(enc);
-                        continue;
-                    }
-                }
-                // A joined copy: the same shape as the packed multiply above — end
-                // the pass, encode the copy's work into THIS encoder, carry the
-                // batch on. The route value comes from `buffer_copy_route_now`; its
+                // A joined copy: end the pass, encode the copy's work into THIS
+                // encoder, carry the batch on. (A joined packed multiply is *not*
+                // here: it dispatches into the pass above, so it needs no boundary.)
+                // The route value comes from `buffer_copy_route_now`; its
                 // doc has why this branch and the batch boundary cannot disagree.
                 //
                 // The dispatch's own pass, and the reason nothing is staged, are
@@ -3808,11 +3936,9 @@ impl WgpuExecutable {
                 // carried and the route refuses to join while any deferred write is
                 // pending. `pass_dispatched` keeps the whole-mirror clear at the next
                 // host boundary firing.
-                if !one_op_per_pass
-                    && let Some(step) = self.schedule.get(step_i)
-                    && let Some((base, size)) = self
-                        .buffer_copy_route_now(step, &host_cache, dev)
-                        .and_then(CopyRoute::join_window)
+                if let Some(step) = self.schedule.get(step_i)
+                    && let Some((base, size)) =
+                        self.joined_copy_window(step, one_op_per_pass, &host_cache, dev)
                     && let Step::BufferCopy {
                         src_byte_off,
                         dst_byte_off,
@@ -3831,6 +3957,7 @@ impl WgpuExecutable {
                     host_cache.invalidate(*dst_byte_off as usize);
                     step_i += 1;
                     pass_dispatched = true;
+                    enc_steps += 1;
                     pending_enc = Some(enc);
                     continue;
                 }
@@ -4011,7 +4138,7 @@ impl WgpuExecutable {
                     // step a host step (the schedule's end leaves `need_host_sync`
                     // false, and there the final flush below drains the device).
                     if pass_dispatched {
-                        host_cache.clear();
+                        clear_mirror(&mut host_cache, &self.arena, dev);
                     }
                 }
                 if gpu_schedule_done {
@@ -4078,6 +4205,7 @@ impl WgpuExecutable {
                     "rlx-wgpu: STOPPED (hosted audio step stranded): the walk reached the hosted \
                      audio step `{}` at schedule index {step_i} with no device batch in hand, and \
                      this path cannot advance it — something took the batch away: \
+                     RLX_WGPU_ENCODE_CHUNK (a boundary just short of it), \
                      RLX_WGPU_ONE_OP_PER_PASS, RLX_WGPU_SNAPSHOT, or a route the copy or packed \
                      multiply in front of it declined. Unset that switch, or precede the step with \
                      device work this route dispatches.",
@@ -4096,10 +4224,9 @@ impl WgpuExecutable {
             // pending host results) *and* dropped AFTER (so the next cache-aware
             // step does not serve a pre-step copy from the mirror). Only the
             // first half used to happen: a `HostOp` following a hosted
-            // GroupNorm re-read its stale cached input, silently, and nothing
-            // cleared the mirror because `host_cache.clear()` is reached only
-            // after real GPU work (`pass_dispatched`) — a run of consecutive
-            // host steps never gets there.
+            // GroupNorm re-read its stale cached input, silently, because a run
+            // of consecutive host steps never reaches a dispatch that clears the
+            // mirror.
             let bypasses_host_cache = !matches!(
                 &self.schedule[step_i],
                 Step::HostOp { .. }
@@ -4111,13 +4238,7 @@ impl WgpuExecutable {
                     | Step::BufferCopy { .. }
             );
             if host_cache.has_deferred_writes() && bypasses_host_cache {
-                let mut a = crate::host_stage::WgpuArena {
-                    arena: &self.arena,
-                    device: &dev.device,
-                    queue: &dev.queue,
-                    size_bytes: 0,
-                };
-                host_cache.flush_to_device(&mut a);
+                deliver_deferred(&mut host_cache, &self.arena, dev);
                 crate::backend::note_device_wait();
                 let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
             }
@@ -4181,27 +4302,41 @@ impl WgpuExecutable {
                             let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
                         }
                         host_cache.insert(dst_u, data, defer);
+                        // A deferred write must reach the device before the next
+                        // step that runs there. This arm used to `continue` and
+                        // leave it to the next flush, which a device consumer that
+                        // is not a joined multiply never provides — so deliver it
+                        // here. A queue write is ordered before that step's
+                        // submission, so it costs no poll, where the door below
+                        // would add one; the host read above already drained the
+                        // device. A next step that stays on the host keeps the
+                        // mirror, which is the host chain's whole point.
+                        let next = step_i + 1;
+                        if host_cache.has_deferred_writes()
+                            && next < self.schedule.len()
+                            && !self.step_breaks_batch(
+                                next,
+                                &scale,
+                                one_op_per_pass,
+                                &host_cache,
+                                dev,
+                            )
+                        {
+                            deliver_deferred(&mut host_cache, &self.arena, dev);
+                        }
                         step_i += 1;
                         continue;
                     }
                     // `CopyRoute::Skip` falls through to the per-step
                     // bookkeeping below.
                     if let CopyRoute::Device { base, size } = route {
-                        // Dead code: `deferred_writes` above already routed
-                        // every copy with a pending mirror to the host, so
-                        // this arm cannot see one. Kept so the flush is
-                        // already correct if that condition ever changes.
-                        if host_cache.has_deferred_writes() {
-                            let mut a = crate::host_stage::WgpuArena {
-                                arena: &self.arena,
-                                device: &dev.device,
-                                queue: &dev.queue,
-                                size_bytes: 0,
-                            };
-                            host_cache.flush_to_device(&mut a);
-                            crate::backend::note_device_wait();
-                            let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-                        }
+                        // `buffer_copy_route`'s `deferred_writes` term routes
+                        // every copy with a pending mirror to the host, so this
+                        // arm cannot see one.
+                        debug_assert!(
+                            !host_cache.has_deferred_writes(),
+                            "the device copy arm reached with a deferred host write"
+                        );
                         // The copy's own submission: reached when this run did not
                         // join the call — the step-by-step and snapshot modes, which
                         // keep one operation per submission on purpose. Anything else
@@ -5114,18 +5249,9 @@ impl WgpuExecutable {
                     starts,
                     param_operands,
                 } => {
-                    // Partial fill — other columns already on device; flush first.
-                    if host_cache.has_deferred_writes() {
-                        let mut a = crate::host_stage::WgpuArena {
-                            arena: &self.arena,
-                            device: &dev.device,
-                            queue: &dev.queue,
-                            size_bytes: 0,
-                        };
-                        host_cache.flush_to_device(&mut a);
-                        crate::backend::note_device_wait();
-                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-                    }
+                    // Partial fill — other columns already on device. The mirror
+                    // here holds nothing: the door in front of this step delivered
+                    // any deferred write (the arm is not cache-aware).
                     crate::scan_host::run_concat_host_pieces(
                         &self.arena,
                         &dev.device,
@@ -5685,8 +5811,10 @@ impl WgpuExecutable {
             }
             // The step just rewrote the arena directly, so every cached
             // mirror entry is potentially stale (see `bypasses_host_cache`).
+            // A deferred write is delivered before the clear, so this cannot
+            // lose one.
             if bypasses_host_cache {
-                host_cache.clear();
+                clear_mirror(&mut host_cache, &self.arena, dev);
             }
             step_i += 1;
             // Host paths stage with `queue.write_buffer` (no submit). Flush
@@ -5694,10 +5822,8 @@ impl WgpuExecutable {
             // host results on discrete Vulkan/DX12. Reached by the host arms that
             // fall through to here, which is every cache-aware one (ConcatHost,
             // ExpandHost, NarrowHost, TransposeHost, HostOp, Conv2dHost, …). The
-            // arm that `continue`s (the host `BufferCopy`) skips this door, so its
-            // deferred write is reached by the next flush instead: the join's own
-            // flush when the following step is a joined packed multiply, or the
-            // host boundary in front of the next host reader of that slot.
+            // host `BufferCopy` continues instead and delivers its own deferred
+            // write before a device consumer (see its arm).
             //
             // A joined copy no longer breaks the batch, so this door fires in
             // front of it too. What it owes there is the device poll that a host
@@ -5714,13 +5840,7 @@ impl WgpuExecutable {
                 // the batch runs — the same door a plain device step goes through.
                 if !self.step_breaks_batch(step_i, &scale, one_op_per_pass, &host_cache, dev) {
                     if host_cache.has_deferred_writes() {
-                        let mut a = crate::host_stage::WgpuArena {
-                            arena: &self.arena,
-                            device: &dev.device,
-                            queue: &dev.queue,
-                            size_bytes: 0,
-                        };
-                        host_cache.flush_to_device(&mut a);
+                        deliver_deferred(&mut host_cache, &self.arena, dev);
                     }
                     crate::backend::note_device_wait();
                     let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
@@ -5728,13 +5848,7 @@ impl WgpuExecutable {
                     // `pass_dispatched` on the next host sync).
                 }
             } else if host_cache.has_deferred_writes() {
-                let mut a = crate::host_stage::WgpuArena {
-                    arena: &self.arena,
-                    device: &dev.device,
-                    queue: &dev.queue,
-                    size_bytes: 0,
-                };
-                host_cache.flush_to_device(&mut a);
+                deliver_deferred(&mut host_cache, &self.arena, dev);
                 crate::backend::note_device_wait();
                 let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
             } else {
@@ -5749,13 +5863,7 @@ impl WgpuExecutable {
         report.end_of_schedule(step_i, &self.schedule);
 
         if host_cache.has_deferred_writes() {
-            let mut a = crate::host_stage::WgpuArena {
-                arena: &self.arena,
-                device: &dev.device,
-                queue: &dev.queue,
-                size_bytes: 0,
-            };
-            host_cache.flush_to_device(&mut a);
+            deliver_deferred(&mut host_cache, &self.arena, dev);
             crate::backend::note_device_wait();
             let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
         }
@@ -5789,6 +5897,44 @@ impl WgpuExecutable {
             &mut self.readback_staging,
         )
     }
+}
+
+/// Deliver the host mirror's deferred writes to the device.
+///
+/// A `queue.write_buffer` is ordered before the next submission, so a caller that
+/// owes a fence polls for its own reason; the batch door and the schedule's end
+/// both do, the host-route copy's own arm does not (the read above it already
+/// drained the device).
+fn deliver_deferred(
+    host_cache: &mut rlx_gpu_host::HostTensorCache,
+    arena: &crate::buffer::Arena,
+    dev: &crate::device::WgpuDevice,
+) {
+    let mut a = crate::host_stage::WgpuArena {
+        arena,
+        device: &dev.device,
+        queue: &dev.queue,
+        size_bytes: 0,
+    };
+    host_cache.flush_to_device(&mut a);
+}
+
+/// Drop the host mirror, delivering anything the device has not seen first.
+///
+/// The three sites that drop it — a new encoder, the host boundary, and a
+/// whole-arena step — can hold a deferred write: a forced host-copy route
+/// (`RLX_WGPU_HOST_BUFFER_COPY=1`), a sharded arena (`RLX_WGPU_ALLOW_SHARD=1`),
+/// or a joined call whose encode took the host arm defers one. So the delivery is
+/// part of the clear and no arrangement can lose a write through it. It costs no
+/// submission: the delivery is a `queue.write_buffer`, ordered before whatever
+/// this run submits next.
+fn clear_mirror(
+    host_cache: &mut rlx_gpu_host::HostTensorCache,
+    arena: &Arena,
+    dev: &crate::device::WgpuDevice,
+) {
+    deliver_deferred(host_cache, arena, dev);
+    host_cache.clear();
 }
 
 /// One-shot on-device Philox / Zero RNG fill (no host round-trip): binds a

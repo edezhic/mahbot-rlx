@@ -8,16 +8,16 @@
 // (NO f32 scratch) and mirror `dequant_gguf.wgsl`'s math; only the sink differs
 // (accumulate vs store). They differ in how one row's work is arranged:
 //
-//   * `dequant_gemv_tiled` (Q4_K, Q6_K, Q8_0): one WORKGROUP per TWO output columns,
-//     and that workgroup's 32 lanes split each column's contraction instead of
-//     one thread walking the whole row. A lane owns one 32-element *unit* of the
-//     row and reads X as `vec4` (8 vector loads per unit, 4 elements each),
-//     which is why this arm's X window has to line up with a four-element group,
-//     i.e. `x_f32_off` be a multiple of 4; that one X read is then reused for
-//     both of the workgroup's columns. A row holds eight of these units per
-//     256-element block, the same count the shape this arm replaced walked (one
-//     32-element sub-block per lane), so the lane occupancy is unchanged at every
-//     contraction length.
+//   * `dequant_gemv_tiled` (Q4_K, Q6_K, Q8_0): one WORKGROUP per `COLS_PER_WG`
+//     output columns, and that workgroup's `LANES` threads split each column's
+//     contraction instead of one thread walking the whole row. A lane owns one
+//     32-element *unit* of the row and reads X as `vec4` (8 vector loads per unit,
+//     4 elements each), which is why this arm's X window has to line up with a
+//     four-element group, i.e. `x_f32_off` be a multiple of 4; that one X read is
+//     then reused for both of the workgroup's columns. A row holds eight of these
+//     units per 256-element block, the same count the shape this arm replaced
+//     walked (one 32-element sub-block per lane), so the lane occupancy is
+//     unchanged at every contraction length.
 //
 //     What a unit *is* differs per scheme, because their nibble-to-element maps
 //     do:
@@ -128,6 +128,16 @@ fn read_word_at(rel: u32) -> u32 {
     return (warr[word] >> sh) | (warr[word + 1u] << (32u - sh));
 }
 
+// The same word when the window is 4-aligned and `rel` is a multiple of four —
+// Q4_K's 144-byte blocks are. The aligned read is one load with no branch or
+// reassembly; the shader derives the window's alignment itself (`aligned`), and
+// an unaligned window falls back to `read_word_at` rather than reading a
+// shifted word.
+fn read_word_q4(rel: u32, aligned: bool) -> u32 {
+    if (aligned) { return warr[(params.w_byte_off + rel) >> 2u]; }
+    return read_word_at(rel);
+}
+
 fn dq_f16_bits(bits: u32) -> f32 {
     let sign = (bits >> 15u) & 1u;
     let exp = (bits >> 10u) & 0x1Fu;
@@ -206,7 +216,10 @@ const Q8_0_BLK_BYTES: u32 = 34u;
 
 // Threads one workgroup of `dequant_gemv_tiled` runs: its `@workgroup_size`, and
 // the stride between one output column's reduction slots in `red` and the next
-// column's. The Rust side's `GEMV_TILED_THREADS`.
+// column's. The Rust side's `GEMV_TILED_THREADS`. A lane advances through its
+// column's units by `LANES`, so this is also the serial depth one lane walks: a
+// row holds `nu = k / 32` units, so `LANES` threads take `nu / LANES` units each,
+// and that depth is the concurrency the arm's shape decides.
 const LANES: u32 = 32u;
 // Output columns one workgroup of that entry covers — the Rust side's
 // `GEMV_TILED_COLS_PER_WG`, which sizes the dispatch and the shape it records,
@@ -256,15 +269,15 @@ fn dequant_gemv(@builtin(global_invocation_id) gid: vec3<u32>) {
     outarr[params.out_f32_off + j] = acc;
 }
 
-// One workgroup per two output columns; its 32 lanes split each column's
-// contraction. A lane owns one 32-element **unit** of the row and reads X as
-// eight `vec4<f32>` loads; both of the workgroup's columns are then given their
+// One workgroup per `COLS_PER_WG` output columns; its `LANES` threads split each
+// column's contraction. A lane owns one 32-element **unit** of the row and reads X
+// as eight `vec4<f32>` loads; both of the workgroup's columns are then given their
 // weights' worth of work out of that one X read, so the X side is shared rather
 // than re-requested per column. The row holds eight units per 256-element block
 // under either shape, so the lane occupancy is unchanged at every contraction
 // length. What a unit is differs per scheme — see the file header; Q6_K's is the
 // one that also halves the packed-weight requests.
-@compute @workgroup_size(32)
+@compute @workgroup_size(LANES)
 fn dequant_gemv_tiled(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -283,6 +296,10 @@ fn dequant_gemv_tiled(
     let nu = nbk * 8u;
     let lane = lid.x;
     let xb4 = params.x_f32_off / 4u;  // X as vec4 groups (see `xarr4`)
+    // Q4_K's block stride and every offset derived from it are multiples of
+    // four, so the window's own 4-alignment settles whether its words can be
+    // read directly; Q6_K (210 B) and Q8_0 (34 B) keep the reassembling reader.
+    let w4 = (params.w_byte_off & 3u) == 0u;
     var acc0 = 0.0;
     var acc1 = 0.0;
 
@@ -295,10 +312,10 @@ fn dequant_gemv_tiled(
         for (var u = lane; u < nu; u = u + LANES) {
             let off0 = (j0 * nbk + u / 8u) * Q4_K_BLK_BYTES;
             let sb = u % 8u;
-            let h0 = read_word_at(off0);
-            let h1 = read_word_at(off0 + 4u);
-            let h2 = read_word_at(off0 + 8u);
-            let h3 = read_word_at(off0 + 12u);
+            let h0 = read_word_q4(off0, w4);
+            let h1 = read_word_q4(off0 + 4u, w4);
+            let h2 = read_word_q4(off0 + 8u, w4);
+            let h3 = read_word_q4(off0 + 12u, w4);
             let sm0 = dq_q4k_sc_min(h1, h2, h3, sb);
             let d0 = dq_f16_bits(h0 & 0xFFFFu) * f32(sm0.x);
             let m0 = dq_f16_bits(h0 >> 16u) * f32(sm0.y);
@@ -310,22 +327,30 @@ fn dequant_gemv_tiled(
             var m1 = 0.0;
             if (second) {
                 let off1 = off0 + nbk * Q4_K_BLK_BYTES;
-                let g0 = read_word_at(off1);
-                let g1 = read_word_at(off1 + 4u);
-                let g2 = read_word_at(off1 + 8u);
-                let g3 = read_word_at(off1 + 12u);
+                let g0 = read_word_q4(off1, w4);
+                let g1 = read_word_q4(off1 + 4u, w4);
+                let g2 = read_word_q4(off1 + 8u, w4);
+                let g3 = read_word_q4(off1 + 12u, w4);
                 let sm1 = dq_q4k_sc_min(g1, g2, g3, sb);
                 d1 = dq_f16_bits(g0 & 0xFFFFu) * f32(sm1.x);
                 m1 = dq_f16_bits(g0 >> 16u) * f32(sm1.y);
                 qs1 = off1 + 16u + 32u * (sb / 2u);
             }
-            for (var w: u32 = 0u; w < 8u; w = w + 1u) {
-                let xv = xarr4[xb4 + e4 + w];
-                let word0 = read_word_at(qs0 + 4u * w);
-                acc0 = acc0 + dq_q4k_span(word0, sh, xv, d0, m0);
-                if (second) {
-                    let word1 = read_word_at(qs1 + 4u * w);
+            // The two columns' words are independent loads, so the pair is
+            // issued together rather than behind a per-iteration `if`: the
+            // branch's own predication sat between the two requests.
+            if (second) {
+                for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                    let xv = xarr4[xb4 + e4 + w];
+                    let word0 = read_word_q4(qs0 + 4u * w, w4);
+                    let word1 = read_word_q4(qs1 + 4u * w, w4);
+                    acc0 = acc0 + dq_q4k_span(word0, sh, xv, d0, m0);
                     acc1 = acc1 + dq_q4k_span(word1, sh, xv, d1, m1);
+                }
+            } else {
+                for (var w: u32 = 0u; w < 8u; w = w + 1u) {
+                    let xv = xarr4[xb4 + e4 + w];
+                    acc0 = acc0 + dq_q4k_span(read_word_q4(qs0 + 4u * w, w4), sh, xv, d0, m0);
                 }
             }
         }
@@ -424,34 +449,27 @@ fn dequant_gemv_tiled(
     // Fixed-order tree over the lane partials, one tree per column: the same
     // order on every lane and every run, so the sum is deterministic and needs
     // no f32 atomics. Column `c`'s slots are `c * LANES ..`, so the second tree's
-    // every step moves by one `LANES`-wide block.
+    // every step moves by one `LANES`-wide block. Written as a halving loop from
+    // `LANES / 2`: at `LANES == 32` it takes exactly the five steps this arm
+    // hand-wrote (16, 8, 4, 2, 1), so widening the workgroup does not change the
+    // order the width that was taken measures.
     red[lane] = acc0;
     red[LANES + lane] = acc1;
-    workgroupBarrier();
-    if (lane < 16u) {
-        red[lane] = red[lane] + red[lane + 16u];
-        red[LANES + lane] = red[LANES + lane] + red[LANES + lane + 16u];
-    }
-    workgroupBarrier();
-    if (lane < 8u) {
-        red[lane] = red[lane] + red[lane + 8u];
-        red[LANES + lane] = red[LANES + lane] + red[LANES + lane + 8u];
-    }
-    workgroupBarrier();
-    if (lane < 4u) {
-        red[lane] = red[lane] + red[lane + 4u];
-        red[LANES + lane] = red[LANES + lane] + red[LANES + lane + 4u];
-    }
-    workgroupBarrier();
-    if (lane < 2u) {
-        red[lane] = red[lane] + red[lane + 2u];
-        red[LANES + lane] = red[LANES + lane] + red[LANES + lane + 2u];
+    var step = LANES / 2u;
+    loop {
+        if (step == 0u) { break; }
+        workgroupBarrier();
+        if (lane < step) {
+            red[lane] = red[lane] + red[lane + step];
+            red[LANES + lane] = red[LANES + lane] + red[LANES + lane + step];
+        }
+        step = step / 2u;
     }
     workgroupBarrier();
     if (lane == 0u) {
-        outarr[params.out_f32_off + j0] = red[0u] + red[1u];
+        outarr[params.out_f32_off + j0] = red[0u];
         // The width edge: an odd (or one-column) chunk has no second column to
         // store, and its `acc1` is zero because its body never ran.
-        if (second) { outarr[params.out_f32_off + j0 + 1u] = red[LANES] + red[LANES + 1u]; }
+        if (second) { outarr[params.out_f32_off + j0 + 1u] = red[LANES]; }
     }
 }

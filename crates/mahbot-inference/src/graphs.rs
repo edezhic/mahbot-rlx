@@ -192,21 +192,36 @@ pub fn block(
     // Head-major in, head-major out: the core picks the layout by "does axis 1
     // hold `num_heads`?" (`rlx-ir/src/attention_layout.rs::attention_geom`), so a
     // rows-first `[1, S, H, D]` is misread as head-major whenever `S == H`.
-    // Head-major is unambiguous at any `S`, so every block here hands it over.
-    let (q4, k4, v4) = (
-        emit::h(ctx).transpose_(q4, vec![0, 2, 1, 3]),
-        emit::h(ctx).transpose_(k4, vec![0, 2, 1, 3]),
-        emit::h(ctx).transpose_(v4, vec![0, 2, 1, 3]),
-    );
+    // Head-major is unambiguous at any `S`, so every block here hands it over;
+    // at `seq == 1` moving the length-1 axis keeps every element in place, so
+    // the declaration alone is that layout and no step is needed.
+    let (q4, k4, v4) = if seq == 1 {
+        let head_major_dims = |heads: usize| {
+            [
+                (m / seq) as i64,
+                heads as i64,
+                seq as i64,
+                b.head_dim as i64,
+            ]
+        };
+        (
+            emit::reshape(ctx, q4, &head_major_dims(b.heads)),
+            emit::reshape(ctx, k4, &head_major_dims(b.kv_heads)),
+            emit::reshape(ctx, v4, &head_major_dims(b.kv_heads)),
+        )
+    } else {
+        (
+            emit::h(ctx).transpose_(q4, vec![0, 2, 1, 3]),
+            emit::h(ctx).transpose_(k4, vec![0, 2, 1, 3]),
+            emit::h(ctx).transpose_(v4, vec![0, 2, 1, 3]),
+        )
+    };
     let kind = if b.causal {
         MaskKind::Causal
     } else {
         MaskKind::None
     };
-    // The declared output shape must match the layout the operands are in: they
-    // are `[1, H, S, D]`, so declaring `[1, S, H, D]` would contradict them (the
-    // arena is sized from the declaration while the kernels read their extents
-    // from the operands — a real overwrite, not a refined shape).
+    // The declared output shape is the operands' own head-major layout.
     let a = emit::attention(
         ctx,
         q4,
@@ -217,8 +232,12 @@ pub fn block(
         kind,
         &[m / seq, b.heads, seq, b.head_dim],
     );
-    let a = emit::h(ctx).transpose_(a, vec![0, 2, 1, 3]);
-    let a = emit::reshape(ctx, a, &[m as i64, (b.heads * b.head_dim) as i64]);
+    let a = if seq == 1 {
+        emit::reshape(ctx, a, &[m as i64, (b.heads * b.head_dim) as i64])
+    } else {
+        let a = emit::h(ctx).transpose_(a, vec![0, 2, 1, 3]);
+        emit::reshape(ctx, a, &[m as i64, (b.heads * b.head_dim) as i64])
+    };
 
     let w = emit::linear(
         ctx,
@@ -804,8 +823,15 @@ pub struct BodyStateStage {
     /// all layers is contiguous), `[layers, capacity, hkv]` when false.
     pub row_first: bool,
     /// The file's own head on the same row, published as the `logits` side
-    /// output: the body and its head are one submission per frame.
+    /// output: the body and its head are one graph and one fence per frame.
     pub head: bool,
+    /// Per-layer carried caches of `[prefix + 1, hkv]` rows, the spare row at
+    /// `prefix` written in-graph by `KvAppend` and one row fed device-side after
+    /// the step. The attention operand is then the cache itself — the same
+    /// `[prefix + 1]`-row operand the row-first layout built by transposing and
+    /// concatenating, without either pass. Requires `m == 1`, `masked` and
+    /// `row_first`.
+    pub plane_cache: bool,
     /// Pack a block's cache input as `[capacity / rows, rows · layers · hkv]`
     /// and publish this block's new rows as one row of the same width. The
     /// memory is still the row-first `[capacity, layers, hkv]`; only the
@@ -834,6 +860,16 @@ impl LayerStage for BodyStateStage {
         let model = &self.model;
         let cfg = model.config().clone();
         let (m, pre) = (self.m, self.prefix);
+        // The plane cache reads the whole `[prefix + 1]` row operand that the
+        // in-graph append builds, so it only makes sense for one row per step,
+        // against a mask, in the row-first layout the spare row assumes.
+        assert!(
+            !self.plane_cache || (m == 1 && self.masked && self.row_first),
+            "a plane cache needs one row, a mask and the row-first layout \
+             (plane_cache = true, m = {m}, masked = {}, row_first = {})",
+            self.masked,
+            self.row_first
+        );
         let (d, nh, nkv, hd) = (cfg.d, cfg.heads, cfg.kv_heads, cfg.head_dim);
         let hkv = nkv * hd;
         // The group this graph carries, not the whole file: a split body's block
@@ -850,7 +886,24 @@ impl LayerStage for BodyStateStage {
         let mask = self
             .masked
             .then(|| emit::h(ctx).input("mask", Shape::new(&[1, pre + m], DType::F32)));
-        let kv_in = if pre > 0 {
+        // The plane cache's per-layer inputs, already in the attention's row
+        // layout: `[prefix + 1, hkv]`, the spare row at `prefix` for this step's
+        // own rows. Created here so the loop below reads them by layer index.
+        let plane_in: Option<Vec<(HirNodeId, HirNodeId)>> = self.plane_cache.then(|| {
+            (0..layers)
+                .map(|gi| {
+                    (
+                        emit::h(ctx)
+                            .input(format!("k{gi}"), Shape::new(&[pre + 1, hkv], DType::F32)),
+                        emit::h(ctx)
+                            .input(format!("v{gi}"), Shape::new(&[pre + 1, hkv], DType::F32)),
+                    )
+                })
+                .collect()
+        });
+        let kv_in = if plane_in.is_some() {
+            None
+        } else if pre > 0 {
             // The fixed-capacity body keeps its cache **row-first**:
             // `[capacity, layers, hkv]`, so the new row of all layers of a step is
             // contiguous and the caller folds it in with one device-side feed. The
@@ -942,31 +995,74 @@ impl LayerStage for BodyStateStage {
             let q = emit::h(ctx).rope(q, cos, sin, hd);
             let k = emit::h(ctx).rope(k, cos, sin, hd);
 
-            let q4 = head_major(ctx, q, m, nh, hd);
-            let k4 = head_major(ctx, k, m, nkv, hd);
-            let v4 = head_major(ctx, v, m, nkv, hd);
-            let (k_all, v_all) = match kv_in {
-                Some((kp, vp)) => {
-                    let kpq = kv_prefix(ctx, kp, gi, pre, nkv, hd);
-                    let vpq = kv_prefix(ctx, vp, gi, pre, nkv, hd);
-                    (
-                        emit::h(ctx).concat_(vec![kpq, k4], 2),
-                        emit::h(ctx).concat_(vec![vpq, v4], 2),
-                    )
+            let (q4, k4, v4) = if plane_in.is_some() {
+                // The attention reads `[1, rows, heads, dim]` and the cache is
+                // already in that layout, so there is nothing to permute: the
+                // projections reshape into it directly.
+                (
+                    emit::reshape(ctx, q, &[1, m as i64, nh as i64, hd as i64]),
+                    emit::reshape(ctx, k, &[1, m as i64, nkv as i64, hd as i64]),
+                    emit::reshape(ctx, v, &[1, m as i64, nkv as i64, hd as i64]),
+                )
+            } else {
+                (
+                    head_major(ctx, q, m, nh, hd),
+                    head_major(ctx, k, m, nkv, hd),
+                    head_major(ctx, v, m, nkv, hd),
+                )
+            };
+            // One reshape per plane serves both the in-graph append and the
+            // new-row side output this layer publishes: the same node, so a
+            // layer's row is not reshaped twice.
+            let rows = plane_in.as_ref().map(|_| {
+                (
+                    emit::reshape(ctx, k4, &[m as i64, hkv as i64]),
+                    emit::reshape(ctx, v4, &[m as i64, hkv as i64]),
+                )
+            });
+            let (k_all, v_all) = if let (Some(planes), Some((k_row, v_row))) = (&plane_in, rows) {
+                let (kp, vp) = planes[gi];
+                // The step's own rows land in the spare row, in-graph: the
+                // operand is then `[cache rows; the new row]`, the same operand
+                // the concat used to build, with no pass over the cache.
+                let k_app = emit::h(ctx).kv_append(kp, k_row, 0, pre);
+                let v_app = emit::h(ctx).kv_append(vp, v_row, 0, pre);
+                (
+                    emit::reshape(ctx, k_app, &[1, (pre + m) as i64, nkv as i64, hd as i64]),
+                    emit::reshape(ctx, v_app, &[1, (pre + m) as i64, nkv as i64, hd as i64]),
+                )
+            } else {
+                match kv_in {
+                    Some((kp, vp)) => {
+                        let kpq = kv_prefix(ctx, kp, gi, pre, nkv, hd);
+                        let vpq = kv_prefix(ctx, vp, gi, pre, nkv, hd);
+                        (
+                            emit::h(ctx).concat_(vec![kpq, k4], 2),
+                            emit::h(ctx).concat_(vec![vpq, v4], 2),
+                        )
+                    }
+                    None => (k4, v4),
                 }
-                None => (k4, v4),
             };
             // Causal over `[cache ; window]`: query `i` of the window reaches the
             // whole cache and the window up to itself. A fixed-capacity cache says
             // the same thing with a mask: the rows past the written ones are 0.
-            let sh = Shape::new(&[1, nh, m, hd], DType::F32);
+            let sh = if plane_in.is_some() {
+                Shape::new(&[1, m, nh, hd], DType::F32)
+            } else {
+                Shape::new(&[1, nh, m, hd], DType::F32)
+            };
             let a = if let Some(mk) = mask {
                 emit::h(ctx).attention(q4, k_all, v_all, mk, nh, hd, sh)
             } else {
                 emit::h(ctx).attention_kind(q4, k_all, v_all, nh, hd, MaskKind::Causal, sh)
             };
-            let a = emit::h(ctx).transpose_(a, vec![0, 2, 1, 3]);
-            let a = emit::reshape(ctx, a, &[m as i64, (nh * hd) as i64]);
+            let a = if plane_in.is_some() {
+                emit::reshape(ctx, a, &[m as i64, (nh * hd) as i64])
+            } else {
+                let a = emit::h(ctx).transpose_(a, vec![0, 2, 1, 3]);
+                emit::reshape(ctx, a, &[m as i64, (nh * hd) as i64])
+            };
             let o = emit::linear(
                 ctx,
                 &FlowValue::new(a, Shape::new(&[m, nh * hd], DType::F32)),
@@ -1003,43 +1099,64 @@ impl LayerStage for BodyStateStage {
             x = emit::add(ctx, x, down.hir_id());
 
             // What the next window reads: this window's own rows, which the
-            // caller appends to its cache.
-            k_next.push(kv_tail(ctx, k4, 0, out_rows, nkv, hd));
-            v_next.push(kv_tail(ctx, v4, 0, out_rows, nkv, hd));
+            // caller appends to its cache. A plane cache publishes each layer's
+            // row on its own, already in the cache's row layout.
+            if let Some((k_row, v_row)) = rows {
+                k_next.push(k_row);
+                v_next.push(v_row);
+            } else {
+                k_next.push(kv_tail(ctx, k4, 0, out_rows, nkv, hd));
+                v_next.push(kv_tail(ctx, v4, 0, out_rows, nkv, hd));
+            }
         }
-        let packed = self.packed_feed && out_rows > 1;
-        let kv_shape = if packed {
-            Shape::new(&[1, out_rows * layers * hkv], DType::F32)
-        } else if self.row_first && out_rows > 1 {
-            Shape::new(&[out_rows, layers, hkv], DType::F32)
+        if plane_in.is_some() {
+            for (gi, id) in k_next.iter().enumerate() {
+                ctx.publish_side_output(
+                    format!("knew{gi}"),
+                    &FlowValue::new(*id, Shape::new(&[m, hkv], DType::F32)),
+                );
+            }
+            for (gi, id) in v_next.iter().enumerate() {
+                ctx.publish_side_output(
+                    format!("vnew{gi}"),
+                    &FlowValue::new(*id, Shape::new(&[m, hkv], DType::F32)),
+                );
+            }
         } else {
-            Shape::new(&[layers, out_rows, hkv], DType::F32)
-        };
-        let k_out = emit::h(ctx).concat_(k_next, 0);
-        let v_out = emit::h(ctx).concat_(v_next, 0);
-        // A multi-row row-first cache hands each row's whole layer width to one
-        // feed; a single-row step is already contiguous either way. `kv_tail` is
-        // `[1, 1, rows, hkv]`, so the transpose is `[rows, layers, 1, hkv]`.
-        let (k_out, v_out) = if self.row_first && out_rows > 1 {
-            let k = emit::h(ctx).transpose_(k_out, vec![2, 0, 1, 3]);
-            let v = emit::h(ctx).transpose_(v_out, vec![2, 0, 1, 3]);
-            (
-                emit::reshape(ctx, k, &[out_rows as i64, layers as i64, hkv as i64]),
-                emit::reshape(ctx, v, &[out_rows as i64, layers as i64, hkv as i64]),
-            )
-        } else {
-            (k_out, v_out)
-        };
-        let (k_out, v_out) = if packed {
-            (
-                emit::reshape(ctx, k_out, &[1, (out_rows * layers * hkv) as i64]),
-                emit::reshape(ctx, v_out, &[1, (out_rows * layers * hkv) as i64]),
-            )
-        } else {
-            (k_out, v_out)
-        };
-        ctx.publish_side_output("kpre", &FlowValue::new(k_out, kv_shape.clone()));
-        ctx.publish_side_output("vpre", &FlowValue::new(v_out, kv_shape));
+            let packed = self.packed_feed && out_rows > 1;
+            let kv_shape = if packed {
+                Shape::new(&[1, out_rows * layers * hkv], DType::F32)
+            } else if self.row_first && out_rows > 1 {
+                Shape::new(&[out_rows, layers, hkv], DType::F32)
+            } else {
+                Shape::new(&[layers, out_rows, hkv], DType::F32)
+            };
+            let k_out = emit::h(ctx).concat_(k_next, 0);
+            let v_out = emit::h(ctx).concat_(v_next, 0);
+            // A multi-row row-first cache hands each row's whole layer width to one
+            // feed; a single-row step is already contiguous either way. `kv_tail` is
+            // `[1, 1, rows, hkv]`, so the transpose is `[rows, layers, 1, hkv]`.
+            let (k_out, v_out) = if self.row_first && out_rows > 1 {
+                let k = emit::h(ctx).transpose_(k_out, vec![2, 0, 1, 3]);
+                let v = emit::h(ctx).transpose_(v_out, vec![2, 0, 1, 3]);
+                (
+                    emit::reshape(ctx, k, &[out_rows as i64, layers as i64, hkv as i64]),
+                    emit::reshape(ctx, v, &[out_rows as i64, layers as i64, hkv as i64]),
+                )
+            } else {
+                (k_out, v_out)
+            };
+            let (k_out, v_out) = if packed {
+                (
+                    emit::reshape(ctx, k_out, &[1, (out_rows * layers * hkv) as i64]),
+                    emit::reshape(ctx, v_out, &[1, (out_rows * layers * hkv) as i64]),
+                )
+            } else {
+                (k_out, v_out)
+            };
+            ctx.publish_side_output("kpre", &FlowValue::new(k_out, kv_shape.clone()));
+            ctx.publish_side_output("vpre", &FlowValue::new(v_out, kv_shape));
+        }
 
         // `output_norm` closes the *body*, so only the group that ends at the
         // file's last block applies it: a split body's earlier groups hand on the
@@ -1104,6 +1221,7 @@ pub fn body_new_rows_head_chain(
             masked: false,
             row_first: false,
             head,
+            plane_cache: false,
             packed_feed: false,
             fused: false,
             fused_gate_up: false,
@@ -1128,51 +1246,11 @@ pub fn projector_chain(pair: Arc<Pair>, tokens: usize) -> Result<BuiltModel> {
     flow.build(&mut weights).map_err(Into::into)
 }
 
-/// The body with a **fixed-capacity** cache and a mask: one graph for a whole part.
-/// Every step hands the same `[layers, capacity, hkv]` cache — its row for this
-/// frame rewritten, the ones not written yet masked out — and one row of input.
-/// The file's own head rides in the same graph, so a frame is one submission:
-/// hidden row, the cache rows, and the logits the draw reads.
-pub fn body_capacity_chain(model: Arc<Model>, capacity: usize) -> Result<BuiltModel> {
-    body_capacity_chain_with_head(model, capacity, true)
-}
-
-/// The fixed-capacity body through only `layers`; a decode split into groups.
-pub fn body_capacity_layers(
-    model: Arc<Model>,
-    capacity: usize,
-    layers: std::ops::Range<usize>,
-    head: bool,
-) -> Result<BuiltModel> {
-    let cfg = model.config().clone();
-    let mut weights = LoaderWeights::new(model.clone());
-    let flow = ModelFlow::new(format!(
-        "body_capacity_{capacity}_{}_{}_h{head}",
-        layers.start, layers.end
-    ))
-    .with_profile(profile())
-    .input("x", Shape::new(&[1, cfg.d], DType::F32))
-    .layer_stage(BodyStateStage {
-        model,
-        m: 1,
-        prefix: capacity,
-        layers,
-        masked: true,
-        row_first: true,
-        head,
-        packed_feed: false,
-        fused: false,
-        fused_gate_up: false,
-    })
-    .output("hidden");
-    flow.build(&mut weights).map_err(Into::into)
-}
-
-fn body_capacity_chain_with_head(
-    model: Arc<Model>,
-    capacity: usize,
-    head: bool,
-) -> Result<BuiltModel> {
+/// The whole body with a plane cache: one `[capacity + 1, hkv]` input per
+/// layer, already in the attention's row layout, the step's own row appended
+/// in-graph. The synthesis body's and recognition decode's fixed-capacity loops
+/// are the callers.
+pub fn body_capacity_chain_planes(model: Arc<Model>, capacity: usize) -> Result<BuiltModel> {
     let cfg = model.config().clone();
     let mut weights = LoaderWeights::new(model.clone());
     let mut fused = true;
@@ -1195,7 +1273,7 @@ fn body_capacity_chain_with_head(
             ],
         )?;
     }
-    let flow = ModelFlow::new(format!("body_capacity_{capacity}_h{head}"))
+    let flow = ModelFlow::new(format!("body_capacity_planes_{capacity}"))
         .with_profile(profile())
         .input("x", Shape::new(&[1, cfg.d], DType::F32))
         .layer_stage(BodyStateStage {
@@ -1205,13 +1283,79 @@ fn body_capacity_chain_with_head(
             layers: 0..cfg.layers,
             masked: true,
             row_first: true,
-            head,
+            head: true,
+            plane_cache: true,
             packed_feed: false,
             fused,
             fused_gate_up,
         })
         .output("hidden");
     flow.build(&mut weights).map_err(Into::into)
+}
+
+/// How many resident moves one plane-cache step collects: one K row and one V
+/// row per layer. `resident_cache_planes` registers exactly this many, and
+/// `run_resident_planes` folds all of them with one device-side copy — the
+/// feed is one submission whatever the layer count.
+pub fn plane_feed_moves(layers: usize) -> usize {
+    2 * layers
+}
+
+/// The plane cache's output order is `hidden`, one K row and one V row per
+/// layer, then the logits. A step reads the hidden row and the logits; the
+/// `2 · layers` cache rows are fed device-side rather than returned to the
+/// host, so one host return carries the step's answer.
+pub fn plane_step_reads(layers: usize) -> [usize; 2] {
+    [0, 1 + plane_feed_moves(layers)]
+}
+
+/// The full output count of a plane-cache body: the hidden row, the `2 · layers`
+/// cache rows the feed consumes, and the logits.
+pub fn plane_step_outputs(layers: usize) -> usize {
+    plane_feed_moves(layers) + 2
+}
+
+/// A talker plane cache seeded from its prompt: one `[capacity + 1, hkv]` K and
+/// V plane per layer — the attention's row layout already — with the prefill's
+/// `[layers, prompt_rows, hkv]` rows scattered in, and a mask with the prompt's
+/// rows and the spare query slot at `capacity` set.
+pub struct PlaneCache {
+    pub k: Vec<Vec<f32>>,
+    pub v: Vec<Vec<f32>>,
+    pub mask: Vec<f32>,
+}
+
+/// Build the talker's planes and mask before its first step. The prompt's rows
+/// come from the prefill's layer-major output, one row at a time; every step
+/// after the prefill writes one row of its own through the registered feed.
+pub fn seed_plane_cache(
+    layers: usize,
+    capacity: usize,
+    prompt_rows: usize,
+    hkv: usize,
+    k_rows: &[f32],
+    v_rows: &[f32],
+) -> PlaneCache {
+    let mut k: Vec<Vec<f32>> = (0..layers)
+        .map(|_| vec![0f32; (capacity + 1) * hkv])
+        .collect();
+    let mut v: Vec<Vec<f32>> = (0..layers)
+        .map(|_| vec![0f32; (capacity + 1) * hkv])
+        .collect();
+    for l in 0..layers {
+        for r in 0..prompt_rows {
+            let dst = r * hkv;
+            let src = (l * prompt_rows + r) * hkv;
+            k[l][dst..dst + hkv].copy_from_slice(&k_rows[src..src + hkv]);
+            v[l][dst..dst + hkv].copy_from_slice(&v_rows[src..src + hkv]);
+        }
+    }
+    let mut mask = vec![0f32; capacity + 1];
+    for r in 0..prompt_rows {
+        mask[r] = 1.0;
+    }
+    mask[capacity] = 1.0;
+    PlaneCache { k, v, mask }
 }
 
 /// A causal block of body rows after an exact prefix: the 8 192-token cell is
@@ -1244,6 +1388,7 @@ pub fn body_block_causal_layers(
         masked: false,
         row_first: true,
         head: false,
+        plane_cache: false,
         packed_feed: rows > 1 && prefix >= rows && prefix.is_multiple_of(rows),
         fused: false,
         fused_gate_up: false,
@@ -1749,6 +1894,24 @@ pub fn code_predictor_steps(model: &Model) -> Result<usize> {
     Ok(model.plan("a.gen.code.head.weight")?.ggml_shape[2])
 }
 
+/// The draw seeds one predictor frame's `steps` samplers read: level `s` uses
+/// `seed + draw_index + s`, the seed the reference walk hands `host::draw`. Empty
+/// when the sampler lowered to `Argmax` — a greedy walk reads no seed. One helper
+/// for both walks (the crate's own path and the measuring stand), because the two
+/// must agree bit-exactly or the pinned waveform moves.
+pub fn predictor_draw_seeds(
+    seed: u64,
+    draw_index: u64,
+    steps: usize,
+    top_k: usize,
+    temperature: f32,
+) -> Vec<u64> {
+    if top_k == 1 || temperature <= 0.0 {
+        return Vec::new();
+    }
+    (0..steps as u64).map(|k| seed + draw_index + k).collect()
+}
+
 /// What a step's cache is made of: `(blocks, kv_heads·head_dim, head_dim)`.
 /// The step's own RoPE tables are the host's, at the row's position.
 pub fn code_predictor_cache(model: &Model) -> Result<(usize, usize, usize)> {
@@ -1763,32 +1926,243 @@ pub fn code_predictor_cache(model: &Model) -> Result<(usize, usize, usize)> {
     ))
 }
 
-/// One step of the code predictor on a **carried cache** — the way the reference
-/// walks its positions: one row in (already embedded by the caller), the keys and
-/// values of everything already seen read from `kpre`/`vpre` with a mask saying
-/// which rows are written, and the step's own LM head out. One row per submission
-/// instead of recomputing the prefix.
-pub struct CodePredictorStepStage {
-    pub model: Arc<Model>,
-    /// Rows the cache holds — the file's `steps + 1` positions.
-    pub capacity: usize,
-    /// Which of the file's LM heads this graph carries; `None` means all of
-    /// them when `with_head` is set, otherwise none.
-    pub head: Option<usize>,
-    /// Whether the graph projects the hidden row through the LM head at all.
-    /// The body-only step is reused for every level and the head is a separate
-    /// one-multiply graph, so a walk does not compute fifteen heads per step.
-    pub with_head: bool,
-    /// q/k/v and gate/up fused at load time, as in the body.
-    pub fused: bool,
-    /// The fifteen LM heads fused into one multiply; one output tensor then
-    /// reshaped to `[steps, head_out]`.
-    pub fused_heads: bool,
+/// The code predictor's block stack for one row on a carried cache — the
+/// arithmetic the one-submission frame walk spells once per level. `x` is the
+/// row after `proj_in`; each block's key/value cache is its own preallocated
+/// `[capacity, hkv]` plane, and the level's row is appended to it in-graph.
+struct PredictorBlocks {
+    m: usize,
+    d_pred: usize,
+    nh: usize,
+    nkv: usize,
+    ffn: usize,
+    eps: f32,
+    blocks: usize,
+    head_dim: usize,
+    /// One layer's key/value width, `nkv · head_dim`.
+    hkv: usize,
+    /// Rows in one block's key/value plane: one per level of the walk.
+    capacity: usize,
 }
 
-impl LayerStage for CodePredictorStepStage {
+/// One row through the predictor's block stack, appending it to each block's
+/// key/value plane. The plane is the attention's row layout already
+/// (`[rows, heads · head_dim]`), so no narrow, concat or transpose moves the
+/// cache: a level writes one row per block through `Op::KvAppend` (the same
+/// in-place append the body's plane cache uses) and reads the `[..pos + 1]`
+/// prefix the append returns. The mask selects every one of those rows, so the
+/// valid keys are the same past rows plus this level's own row, in the same
+/// order, and the levels' rows never have to be re-collected.
+///
+/// Level 0 seeds each plane: `[its own row; zeros]` is one `Concat` per block,
+/// and it is what makes the walk's first level live. Reading a plane later
+/// through the append that wrote it is a buffer mutation, not a dataflow edge —
+/// on its own, level 0's block stack would be unreachable from every output
+/// (its hidden row is only the input to the next level's cache) and dead-code
+/// elimination would drop the arithmetic that produced rows 0. Seeding the
+/// plane with that row keeps it an ordinary value every later append reads.
+/// Neither the cache nor the projections are permuted.
+#[allow(clippy::too_many_arguments)]
+fn emit_predictor_blocks(
+    ctx: &mut FlowCtx<'_>,
+    model: &Model,
+    g: &PredictorBlocks,
+    x: HirNodeId,
+    cos: HirNodeId,
+    sin: HirNodeId,
+    mask: HirNodeId,
+    k_planes: &mut [Option<HirNodeId>],
+    v_planes: &mut [Option<HirNodeId>],
+    pos: usize,
+    fused: bool,
+) -> Result<HirNodeId> {
+    let PredictorBlocks {
+        m,
+        d_pred,
+        nh,
+        nkv,
+        ffn,
+        eps,
+        blocks,
+        head_dim,
+        hkv,
+        capacity,
+    } = *g;
+    let mut x = x;
+    for i in 0..blocks {
+        let p = format!("a.gen.code.blk.{i}");
+        let lc = |x: HirNodeId| FlowValue::new(x, Shape::new(&[m, d_pred], DType::F32));
+        let gamma = emit::f32_param(ctx, model, &format!("{p}.ln1.weight"), &[d_pred])?;
+        let h = emit::rms_norm(ctx, x, gamma, eps, &[m, d_pred]);
+        let [q, k, v] = if fused {
+            let parts = emit::linear_fused(
+                ctx,
+                &lc(h),
+                &format!("{p}.qkv.fused"),
+                &[nh * head_dim, hkv, hkv],
+            )?;
+            [parts[0], parts[1], parts[2]]
+        } else {
+            emit::qkv(
+                ctx,
+                h,
+                m,
+                d_pred,
+                [
+                    &format!("{p}.attn_q.weight"),
+                    &format!("{p}.attn_k.weight"),
+                    &format!("{p}.attn_v.weight"),
+                ],
+            )?
+        };
+        let q3 = vec![1, m as i64, (nh * head_dim) as i64];
+        let kv3 = vec![1, m as i64, hkv as i64];
+        let r = emit::reshape(ctx, q, &[(m * nh) as i64, head_dim as i64]);
+        let gq = emit::f32_param(ctx, model, &format!("{p}.attn_q_norm.weight"), &[head_dim])?;
+        let r = emit::rms_norm(ctx, r, gq, eps, &[m * nh, head_dim]);
+        let q = emit::reshape(ctx, r, &q3);
+        let r = emit::reshape(ctx, k, &[(m * nkv) as i64, head_dim as i64]);
+        let gk = emit::f32_param(ctx, model, &format!("{p}.attn_k_norm.weight"), &[head_dim])?;
+        let r = emit::rms_norm(ctx, r, gk, eps, &[m * nkv, head_dim]);
+        let k = emit::reshape(ctx, r, &kv3);
+        let q = emit::h(ctx).rope(q, cos, sin, head_dim);
+        let k = emit::h(ctx).rope(k, cos, sin, head_dim);
+        let q4 = emit::reshape(ctx, q, &[1, m as i64, nh as i64, head_dim as i64]);
+        let k4 = emit::reshape(ctx, k, &[1, m as i64, nkv as i64, head_dim as i64]);
+        let v4 = emit::reshape(ctx, v, &[1, m as i64, nkv as i64, head_dim as i64]);
+        // Rows-first is a declaration for one row, not a move. `attention_geom`
+        // keys the layout off Q's axis 1, so the hazard is a single head: K/V
+        // then read `[1, pos + 1, nkv, D]` with the sequence taken from dim 2.
+        assert!(
+            nh != 1,
+            "rows-first attention keys the layout off Q's axis 1: one head would read \
+             K/V with its sequence taken from dim 2"
+        );
+        // The level's own row lands in the block's plane at `pos`, and the
+        // append's `[..pos + 1]` prefix is the attention operand: the past rows
+        // are the rows earlier levels wrote, then this level's own row. One row
+        // write per block per level replaces the narrow + concat the cache used
+        // to be rebuilt with. Level 0 has no plane yet and seeds it instead.
+        let k_row = emit::reshape(ctx, k4, &[m as i64, hkv as i64]);
+        let v_row = emit::reshape(ctx, v4, &[m as i64, hkv as i64]);
+        let k_src = match k_planes[i] {
+            Some(plane) => emit::h(ctx).kv_append(plane, k_row, 0, pos),
+            None => {
+                assert_eq!(pos, 0, "a block's cache plane is seeded at level 0");
+                let zeros = emit::constant(ctx, &[capacity - m, hkv], 0.0);
+                let plane = emit::h(ctx).concat_(vec![k_row, zeros], 0);
+                k_planes[i] = Some(plane);
+                k_row
+            }
+        };
+        let v_src = match v_planes[i] {
+            Some(plane) => emit::h(ctx).kv_append(plane, v_row, 0, pos),
+            None => {
+                assert_eq!(pos, 0, "a block's cache plane is seeded at level 0");
+                let zeros = emit::constant(ctx, &[capacity - m, hkv], 0.0);
+                let plane = emit::h(ctx).concat_(vec![v_row, zeros], 0);
+                v_planes[i] = Some(plane);
+                v_row
+            }
+        };
+        let k_all = emit::reshape(
+            ctx,
+            k_src,
+            &[1, (pos + m) as i64, nkv as i64, head_dim as i64],
+        );
+        let v_all = emit::reshape(
+            ctx,
+            v_src,
+            &[1, (pos + m) as i64, nkv as i64, head_dim as i64],
+        );
+        let sh = Shape::new(&[1, m, nh, head_dim], DType::F32);
+        let a = emit::h(ctx).attention(q4, k_all, v_all, mask, nh, head_dim, sh);
+        let a = emit::reshape(ctx, a, &[m as i64, (nh * head_dim) as i64]);
+        let o = emit::linear(
+            ctx,
+            &FlowValue::new(a, Shape::new(&[m, nh * head_dim], DType::F32)),
+            &format!("{p}.attn_out.weight"),
+        )?;
+        x = emit::add(ctx, x, o.hir_id());
+
+        let gamma = emit::f32_param(ctx, model, &format!("{p}.ln2.weight"), &[d_pred])?;
+        let h = emit::rms_norm(ctx, x, gamma, eps, &[m, d_pred]);
+        let (gate, up) = if fused {
+            let parts =
+                emit::linear_fused(ctx, &lc(h), &format!("{p}.gate_up.fused"), &[ffn, ffn])?;
+            (
+                FlowValue::new(parts[0], Shape::new(&[m, ffn], DType::F32)),
+                FlowValue::new(parts[1], Shape::new(&[m, ffn], DType::F32)),
+            )
+        } else {
+            (
+                emit::linear(ctx, &lc(h), &format!("{p}.ffn_gate.weight"))?,
+                emit::linear(ctx, &lc(h), &format!("{p}.ffn_up.weight"))?,
+            )
+        };
+        let act = emit::silu(ctx, gate.hir_id(), &[m, ffn]);
+        let act = emit::mul(ctx, act, up.hir_id());
+        let down = emit::linear(
+            ctx,
+            &FlowValue::new(act, Shape::new(&[m, ffn], DType::F32)),
+            &format!("{p}.ffn_down.weight"),
+        )?;
+        x = emit::add(ctx, x, down.hir_id());
+    }
+    Ok(x)
+}
+
+/// The stacked tensor the frame walk's per-level `#s-1` head slots slice — the
+/// file's `[in, out, steps]` LM-head stack, one level per slot.
+pub const PREDICTOR_HEAD_WEIGHT: &str = "a.gen.code.head.weight";
+
+/// A constant F32 tensor from its values — the frame walk's per-level RoPE
+/// tables and masks, and the gather's slot offset.
+fn f32_values(ctx: &mut FlowCtx<'_>, dims: &[usize], values: &[f32]) -> HirNodeId {
+    assert_eq!(values.len(), dims.iter().product::<usize>());
+    let mut data = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    ctx.hir()
+        .mir(Op::Constant { data }, vec![], Shape::new(dims, DType::F32))
+}
+
+/// One code-predictor frame as **one graph**: the sixteen-level walk that used to
+/// be sixteen `run`s — level 0's head-less body, then every projecting level with
+/// its own head — now emits every level into one schedule, draws each level's
+/// code with `Op::Sample` on the device, and gathers the next level's row out of
+/// the code table in the same graph. The cache never leaves the device: each
+/// block keeps its own `[capacity, hkv]` plane, level 0 seeds it with its row
+/// and every later level appends one row in place (`Op::KvAppend`), so a level's
+/// attention reads the same rows the reference walk binds without rebuilding
+/// the cache.
+///
+/// The walk is sequential by construction — level `s + 1` embeds the code level
+/// `s` drew — so the single submit/wait is the only boundary a frame pays. A
+/// draw's seed is a uniform word, not a pipeline constant: the caller rewrites
+/// the `Sample` steps' seeds for each frame ([`Runner::set_sample_seeds`]), which
+/// is why one compiled graph serves every frame and every request. The draw
+/// reproduces [`crate::host::draw`] bit for bit; `sample_graph_one` pins that
+/// arithmetic against it.
+///
+/// The engine's phase classifier marks `Sample` as epilogue, but this backend
+/// schedules by graph node order and the runtime pipeline preserves it, so a
+/// draw with a consumer after it follows that consumer's level; no phase edit is
+/// needed for the mid-graph draw.
+pub struct CodePredictorFrameStage {
+    pub model: Arc<Model>,
+    /// Rows the reference walk's cache holds — `steps + 1`.
+    pub capacity: usize,
+    /// Projecting levels: `steps` codes follow level 0's `code0`.
+    pub steps: usize,
+    pub fused: bool,
+    pub sampler: SampleSpec,
+}
+
+impl LayerStage for CodePredictorFrameStage {
     fn name(&self) -> &str {
-        "tts_code_predictor_step"
+        "tts_code_predictor_frame"
     }
 
     fn emit_layer(
@@ -1798,12 +2172,11 @@ impl LayerStage for CodePredictorStepStage {
     ) -> Result<(FlowValue, StageArtifacts)> {
         let model = &self.model;
         let c = model.clip();
-        let head = self.head;
         let (d_talker, d_pred) = model.code_proj_widths()?;
-        let head_out = model.plan("a.gen.code.head.weight")?.ggml_shape[1];
         let head_dim = model
             .plan("a.gen.code.blk.0.attn_q_norm.weight")?
             .ggml_shape[0];
+        let head_out = model.plan(PREDICTOR_HEAD_WEIGHT)?.ggml_shape[1];
         let (nh, nkv, ffn) = (
             c.gen_heads.unwrap_or(0),
             c.gen_kv_heads.unwrap_or(0),
@@ -1811,176 +2184,153 @@ impl LayerStage for CodePredictorStepStage {
         );
         let eps = c.gen_eps.unwrap_or(1e-6);
         let blocks = c.gen_layers.unwrap_or(0);
-        let (m, pre) = (1usize, self.capacity);
-        let hkv = nkv * head_dim;
+        let (m, hkv) = (1usize, nkv * head_dim);
+        let geom = PredictorBlocks {
+            m,
+            d_pred,
+            nh,
+            nkv,
+            ffn,
+            eps,
+            blocks,
+            head_dim,
+            hkv,
+            capacity: self.capacity,
+        };
 
-        let seq = emit::reshape(ctx, input.hir_id(), &[1, d_talker as i64]);
-        let mut x = code_proj_in_node(ctx, model, seq, m, d_talker, d_pred)?;
-        let (cos, sin) = (
-            emit::h(ctx).input("cos", Shape::new(&[m, head_dim / 2], DType::F32)),
-            emit::h(ctx).input("sin", Shape::new(&[m, head_dim / 2], DType::F32)),
+        let hidden = emit::reshape(ctx, input.hir_id(), &[1, d_talker as i64]);
+        let code0 = emit::h(ctx).input("code0_embed", Shape::new(&[1, d_talker], DType::F32));
+        // The code table is one `[steps, vocab, d_talker]` stack; flattening the
+        // first two axes makes a level's row a plain leading-axis gather, which
+        // is the one embedding lookup this backend serves without a transpose.
+        let p = model.plan("a.gen.code.embd.weight")?.clone();
+        let (d_embd, vocab, slots) = (p.ggml_shape[0], p.ggml_shape[1], p.ggml_shape[2]);
+        assert_eq!(
+            d_embd, d_talker,
+            "the code table's width must be the predictor's input width"
         );
-        let mask = emit::h(ctx).input("mask", Shape::new(&[1, pre + m], DType::F32));
-        let kpre = emit::h(ctx).input("kpre", Shape::new(&[pre, blocks, hkv], DType::F32));
-        let vpre = emit::h(ctx).input("vpre", Shape::new(&[pre, blocks, hkv], DType::F32));
-        // The carried cache is row-first (`[row, layer, width]`), so one step's
-        // new rows of all layers are contiguous and the caller folds them in
-        // with one feed. The block loop below reads a layer's `[pre, width]`
-        // slice, as before.
-        let kpre = emit::h(ctx).transpose_(kpre, vec![1, 0, 2]);
-        let vpre = emit::h(ctx).transpose_(vpre, vec![1, 0, 2]);
+        assert!(
+            slots >= self.steps.saturating_sub(1),
+            "the code table has {slots} levels, the walk needs {}",
+            self.steps.saturating_sub(1)
+        );
+        // A level's row is `(slot, id)` into the flattened table, so an id past
+        // the level's `vocab` rows lands on the next level's row: the head that
+        // draws the id must be exactly as wide as one level.
+        assert_eq!(
+            head_out, vocab,
+            "the LM head projects {head_out} rows, the code table has {vocab} rows per \
+             level; a wider head would gather another level's row"
+        );
+        let table = emit::f32_param(
+            ctx,
+            model,
+            "a.gen.code.embd.weight",
+            &[slots * vocab, d_talker],
+        )?;
 
-        let mut k_next: Vec<HirNodeId> = Vec::with_capacity(blocks);
-        let mut v_next: Vec<HirNodeId> = Vec::with_capacity(blocks);
-        for i in 0..blocks {
-            let p = format!("a.gen.code.blk.{i}");
-            let lc = |x: HirNodeId| FlowValue::new(x, Shape::new(&[m, d_pred], DType::F32));
-            let gamma = emit::f32_param(ctx, model, &format!("{p}.ln1.weight"), &[d_pred])?;
-            let h = emit::rms_norm(ctx, x, gamma, eps, &[m, d_pred]);
-            let [q, k, v] = if self.fused {
-                let parts = emit::linear_fused(
-                    ctx,
-                    &lc(h),
-                    &format!("{p}.qkv.fused"),
-                    &[nh * head_dim, hkv, hkv],
-                )?;
-                [parts[0], parts[1], parts[2]]
+        // Each block's key/value plane: level 0 seeds `[its row; zeros]` and
+        // every later level appends one row into it, so the cache is never
+        // copied or concatenated as the levels advance. The plane is carried
+        // between levels as an ordinary value (see `emit_predictor_blocks`).
+        let mut k_planes: Vec<Option<HirNodeId>> = vec![None; blocks];
+        let mut v_planes: Vec<Option<HirNodeId>> = vec![None; blocks];
+        let mut ids: Vec<HirNodeId> = Vec::with_capacity(self.steps);
+        let mut logits1: Option<HirNodeId> = None;
+        for s in 0..=self.steps {
+            let row = if s == 0 {
+                hidden
+            } else if s == 1 {
+                code0
             } else {
-                emit::qkv(
-                    ctx,
-                    h,
-                    m,
-                    d_pred,
-                    [
-                        &format!("{p}.attn_q.weight"),
-                        &format!("{p}.attn_k.weight"),
-                        &format!("{p}.attn_v.weight"),
-                    ],
-                )?
+                // `s == 1` drew `ids[0]`, so level `s` embeds level `s - 1`'s
+                // code from slot `s - 2`.
+                let at = ((s - 2) * vocab) as f32;
+                let at = f32_values(ctx, &[1], &[at]);
+                let idx = emit::add(ctx, ids[s - 2], at);
+                emit::gather(ctx, table, idx)
             };
-            let q3 = vec![1, m as i64, (nh * head_dim) as i64];
-            let kv3 = vec![1, m as i64, hkv as i64];
-            let r = emit::reshape(ctx, q, &[(m * nh) as i64, head_dim as i64]);
-            let gq = emit::f32_param(ctx, model, &format!("{p}.attn_q_norm.weight"), &[head_dim])?;
-            let r = emit::rms_norm(ctx, r, gq, eps, &[m * nh, head_dim]);
-            let q = emit::reshape(ctx, r, &q3);
-            let r = emit::reshape(ctx, k, &[(m * nkv) as i64, head_dim as i64]);
-            let gk = emit::f32_param(ctx, model, &format!("{p}.attn_k_norm.weight"), &[head_dim])?;
-            let r = emit::rms_norm(ctx, r, gk, eps, &[m * nkv, head_dim]);
-            let k = emit::reshape(ctx, r, &kv3);
-            let v = emit::reshape(ctx, v, &kv3);
-            let q = emit::h(ctx).rope(q, cos, sin, head_dim);
-            let k = emit::h(ctx).rope(k, cos, sin, head_dim);
-            let q4 = head_major(ctx, q, m, nh, head_dim);
-            let k4 = head_major(ctx, k, m, nkv, head_dim);
-            let v4 = head_major(ctx, v, m, nkv, head_dim);
-            let kp = kv_prefix(ctx, kpre, i, pre, nkv, head_dim);
-            let vp = kv_prefix(ctx, vpre, i, pre, nkv, head_dim);
-            let k_all = emit::h(ctx).concat_(vec![kp, k4], 2);
-            let v_all = emit::h(ctx).concat_(vec![vp, v4], 2);
-            let sh = Shape::new(&[1, nh, m, head_dim], DType::F32);
-            let a = emit::h(ctx).attention(q4, k_all, v_all, mask, nh, head_dim, sh);
-            let a = emit::h(ctx).transpose_(a, vec![0, 2, 1, 3]);
-            let a = emit::reshape(ctx, a, &[m as i64, (nh * head_dim) as i64]);
-            let o = emit::linear(
+            let (cos, sin) = crate::host::rope_tables_at(s, 1, head_dim, 1e6);
+            let cos: Vec<f32> = cos.iter().map(|v| *v as f32).collect();
+            let sin: Vec<f32> = sin.iter().map(|v| *v as f32).collect();
+            let cos = f32_values(ctx, &[1, head_dim / 2], &cos);
+            let sin = f32_values(ctx, &[1, head_dim / 2], &sin);
+            // The plane already holds every row up to this level's own, so the
+            // mask admits all of them; the operand's length is `s + 1`.
+            let mask = f32_values(ctx, &[1, s + 1], &vec![1.0; s + 1]);
+            let x = code_proj_in_node(ctx, model, row, m, d_talker, d_pred)?;
+            let x = emit_predictor_blocks(
                 ctx,
-                &FlowValue::new(a, Shape::new(&[m, nh * head_dim], DType::F32)),
-                &format!("{p}.attn_out.weight"),
+                model,
+                &geom,
+                x,
+                cos,
+                sin,
+                mask,
+                &mut k_planes,
+                &mut v_planes,
+                s,
+                self.fused,
             )?;
-            x = emit::add(ctx, x, o.hir_id());
-
-            let gamma = emit::f32_param(ctx, model, &format!("{p}.ln2.weight"), &[d_pred])?;
-            let h = emit::rms_norm(ctx, x, gamma, eps, &[m, d_pred]);
-            let (gate, up) = if self.fused {
-                let parts =
-                    emit::linear_fused(ctx, &lc(h), &format!("{p}.gate_up.fused"), &[ffn, ffn])?;
-                (
-                    FlowValue::new(parts[0], Shape::new(&[m, ffn], DType::F32)),
-                    FlowValue::new(parts[1], Shape::new(&[m, ffn], DType::F32)),
-                )
-            } else {
-                (
-                    emit::linear(ctx, &lc(h), &format!("{p}.ffn_gate.weight"))?,
-                    emit::linear(ctx, &lc(h), &format!("{p}.ffn_up.weight"))?,
-                )
-            };
-            let act = emit::silu(ctx, gate.hir_id(), &[m, ffn]);
-            let act = emit::mul(ctx, act, up.hir_id());
-            let down = emit::linear(
-                ctx,
-                &FlowValue::new(act, Shape::new(&[m, ffn], DType::F32)),
-                &format!("{p}.ffn_down.weight"),
-            )?;
-            x = emit::add(ctx, x, down.hir_id());
-
-            k_next.push(kv_tail(ctx, k4, 0, m, nkv, head_dim));
-            v_next.push(kv_tail(ctx, v4, 0, m, nkv, head_dim));
-        }
-        let kv_shape = Shape::new(&[1, blocks, hkv], DType::F32);
-        let k_out = emit::h(ctx).concat_(k_next, 0);
-        let v_out = emit::h(ctx).concat_(v_next, 0);
-        // `kv_tail` is `[1, 1, 1, hkv]`; concatenated along the first axis it is
-        // already block-major, the row-first cache's `[1, blocks, hkv]` order.
-        let k_out = emit::reshape(ctx, k_out, &[1, blocks as i64, hkv as i64]);
-        let v_out = emit::reshape(ctx, v_out, &[1, blocks as i64, hkv as i64]);
-        ctx.publish_side_output("kpre", &FlowValue::new(k_out, kv_shape.clone()));
-        ctx.publish_side_output("vpre", &FlowValue::new(v_out, kv_shape));
-
-        let gamma = emit::f32_param(ctx, model, "a.gen.code.output_norm.weight", &[d_pred])?;
-        let x = emit::rms_norm(ctx, x, gamma, eps, &[m, d_pred]);
-        if !self.with_head {
-            let sh = Shape::new(&[m, d_pred], DType::F32);
-            return Ok((
-                FlowValue::new(x, sh.clone()),
-                StageArtifacts::hidden_only(sh),
-            ));
-        }
-        let steps = model.plan("a.gen.code.head.weight")?.ggml_shape[2];
-        let heads: Vec<usize> = match head {
-            Some(h) => vec![h],
-            None => (0..steps).collect(),
-        };
-        let heads_len = heads.len();
-        let out = if self.fused_heads {
-            let out = emit::linear(
-                ctx,
-                &FlowValue::new(x, Shape::new(&[m, d_pred], DType::F32)),
-                "a.gen.code.head.fused",
-            )?;
-            emit::reshape(ctx, out.hir_id(), &[heads_len as i64, head_out as i64])
-        } else {
-            let mut logits: Vec<HirNodeId> = Vec::with_capacity(heads_len);
-            for h in heads {
-                let out = emit::linear(
+            if s >= 1 {
+                // The head projects the *normalised* hidden row the body returns.
+                let gamma =
+                    emit::f32_param(ctx, model, "a.gen.code.output_norm.weight", &[d_pred])?;
+                let x = emit::rms_norm(ctx, x, gamma, eps, &[m, d_pred]);
+                let key = format!("{PREDICTOR_HEAD_WEIGHT}#{}", s - 1);
+                let logits = emit::linear(
                     ctx,
-                    &FlowValue::new(x, Shape::new(&[m, d_pred], DType::F32)),
-                    &format!("a.gen.code.head.weight#{h}"),
+                    &FlowValue::new(x, Shape::new(&[1, d_pred], DType::F32)),
+                    &key,
                 )?;
-                logits.push(out.hir_id());
+                if s == 1 {
+                    logits1 = Some(logits.hir_id());
+                }
+                let id = emit::h(ctx).add_node(
+                    Op::Sample {
+                        top_k: self.sampler.top_k,
+                        top_p: self.sampler.top_p,
+                        temperature: self.sampler.temperature,
+                        seed: self.sampler.seed + (s - 1) as u64,
+                    },
+                    vec![logits.hir_id()],
+                    Shape::new(&[1], DType::F32),
+                );
+                ids.push(id);
             }
-            if logits.len() == 1 {
-                logits[0]
-            } else {
-                emit::h(ctx).concat_(logits, 0)
-            }
-        };
-        let sh = Shape::new(&[heads_len, head_out], DType::F32);
+        }
+        let codes = emit::h(ctx).concat_(ids, 0);
+        // Level 1's logits ride out as a side output: the stand's sampler check
+        // reads that one row once, from the same head the draw consumed.
+        if let Some(logits1) = logits1 {
+            ctx.publish_side_output(
+                "logits1",
+                &FlowValue::new(logits1, Shape::new(&[1, head_out], DType::F32)),
+            );
+        }
+        let sh = Shape::new(&[self.steps], DType::F32);
         Ok((
-            FlowValue::new(out, sh.clone()),
+            FlowValue::new(codes, sh.clone()),
             StageArtifacts::hidden_only(sh),
         ))
     }
 }
 
-/// One code-predictor step on a carried cache. `head = None` puts every LM head
-/// in the graph, one output row each, so one compiled graph serves the whole
-/// fifteen-step walk.
-pub fn tts_code_predictor_step(
+/// Build the one-graph frame walk: `[d_talker]` hidden row and `code0` row in,
+/// `steps` drawn codes out. One [`Runner::set_sample_seeds`] + one run is a whole
+/// frame, whatever the level count.
+pub fn tts_code_predictor_frame(
     model: Arc<Model>,
     capacity: usize,
-    head: Option<usize>,
+    sampler: SampleSpec,
 ) -> Result<BuiltModel> {
     let (d_talker, _) = model.code_proj_widths()?;
+    let steps = code_predictor_steps(&model)?;
+    assert_eq!(
+        capacity,
+        steps + 1,
+        "the frame walk's cache is the file's `steps + 1` positions"
+    );
     let mut weights = LoaderWeights::new(model.clone());
     let blocks = model.clip().gen_layers.unwrap_or(0);
     let mut fused = true;
@@ -2005,33 +2355,18 @@ pub fn tts_code_predictor_step(
             break;
         }
     }
-    let mut fused_heads = false;
-    if head.is_none() {
-        let steps = model.plan("a.gen.code.head.weight")?.ggml_shape[2];
-        let keys: Vec<String> = (0..steps)
-            .map(|h| format!("a.gen.code.head.weight#{h}"))
-            .collect();
-        let refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        fused_heads = weights.fuse_packed("a.gen.code.head.fused", &refs)?;
-    }
-    let flow = ModelFlow::new(format!("tts_code_step_{head:?}"))
+    let flow = ModelFlow::new("tts_code_frame")
         .with_profile(profile())
-        .input("x", Shape::new(&[d_talker], DType::F32))
-        .layer_stage(CodePredictorStepStage {
+        .input("hidden", Shape::new(&[d_talker], DType::F32))
+        .layer_stage(CodePredictorFrameStage {
             model,
             capacity,
-            head,
-            with_head: true,
+            steps,
             fused,
-            fused_heads,
+            sampler,
         })
-        .output("logits");
+        .output("codes");
     flow.build(&mut weights).map_err(Into::into)
-}
-
-/// The same step with every head: `[steps, head_out]` logits out.
-pub fn tts_code_predictor_step_all(model: Arc<Model>, capacity: usize) -> Result<BuiltModel> {
-    tts_code_predictor_step(model, capacity, None)
 }
 
 // ── the wave transformer: the codebook hidden → the codec's width ──
@@ -2282,6 +2617,11 @@ fn head_major(
     heads: usize,
     hd: usize,
 ) -> HirNodeId {
+    if rows == 1 {
+        // A one-row block: the transposed axis is length 1, so the declaration
+        // is the layout and no step is needed.
+        return emit::reshape(ctx, x, &[1, heads as i64, rows as i64, hd as i64]);
+    }
     let r = emit::reshape(ctx, x, &[1, rows as i64, heads as i64, hd as i64]);
     emit::h(ctx).transpose_(r, vec![0, 2, 1, 3])
 }
@@ -2405,10 +2745,12 @@ impl LayerStage for QuantDecodeStage {
 // ── running a built flow ───────────────────────────────────────────
 
 /// Submissions and blocking waits issued by this process's walks. Each
-/// `Runner::run`/`run_read` is one submit and one wait; `feed_rows` is one more;
-/// `run_resident` adds one for the run and one for the cache-row feed it issues.
-/// The counters live here, around the whole cell; `waits` mirrors `submits`
-/// because the backend calls are synchronous.
+/// `Runner::run`/`run_read`/`run_slices` is one submit and one wait. The
+/// counters live here, around the whole cell; `waits` mirrors `submits`
+/// because the backend calls are synchronous. Both count *calls*, not queue
+/// submissions: a chunked run (`RLX_WGPU_ENCODE_CHUNK`) submits several command
+/// buffers inside one `run`, and the queue-level figure is the backend's own
+/// `rlx_wgpu::device_submit_count`.
 static SUBMITS: AtomicU64 = AtomicU64::new(0);
 static WAITS: AtomicU64 = AtomicU64::new(0);
 
@@ -2496,6 +2838,16 @@ impl Runner {
         })
     }
 
+    /// Point the frame graph's `Sample` steps at this frame's draw seeds, in
+    /// level order — one seed per projecting level. The seeds are uniform words
+    /// the backend rewrites before the next run ([`rlx_runtime::CompiledGraph`]
+    /// forwards this to the backend), so a compiled frame serves every frame and
+    /// every request; `false` means the graph does not have exactly that many
+    /// `Sample` steps and nothing was written.
+    pub fn set_sample_seeds(&mut self, seeds: &[u64]) -> bool {
+        self.session.set_sample_seeds(seeds)
+    }
+
     /// One pass with new inputs — the same compiled buffers, refilled.
     pub fn run(&mut self, inputs: &[(String, Vec<f32>)]) -> Vec<Vec<f32>> {
         let ins: Vec<(&str, &[f32])> = inputs
@@ -2539,6 +2891,10 @@ impl Runner {
     /// a step neither uploads the whole cache nor reads it back. `out` is which
     /// output of the graph hands on the new `k` and `v` rows.
     ///
+    /// The code predictor's per-level walk calls this before each body step: the
+    /// shared body is one executable, but the host mirror it binds is the one the
+    /// previous level's readback updated.
+    ///
     /// Answers whether the backend took it; `false` leaves the caller on the
     /// ordinary path, with the caches uploaded as inputs.
     pub fn resident_cache(&mut self, kpre: &[f32], vpre: &[f32], out: (usize, usize)) -> bool {
@@ -2548,26 +2904,67 @@ impl Runner {
             && self.session.register_kv_row_feed("vpre", out.1)
     }
 
-    /// One step whose cache row is folded into the resident handles in place —
-    /// the way the model's own run keeps its cache: `row` is this step's row in a
-    /// **row-first** `[capacity, layers, hkv]` cache, so the new rows of all
-    /// `layers` are one contiguous row and the feed is one device-side copy,
-    /// not one per layer. That copy is a second device submission: both are
-    /// counted (the run and the feed). A backend that cannot move a row
-    /// device-side says so and the caller appends on the host instead.
-    pub fn run_resident(
+    /// A plane cache: each layer's `[capacity + 1, hkv]` rows are a resident
+    /// handle of their own, registered to this graph's own new-row output. The
+    /// output order is the stage's: the main output, this graph's K rows (one per
+    /// layer), then its V rows.
+    pub fn resident_cache_planes(&mut self, k: &[Vec<f32>], v: &[Vec<f32>]) -> bool {
+        if k.len() != v.len() {
+            return false;
+        }
+        for (gi, rows) in k.iter().enumerate() {
+            if !self.session.bind_gpu_handle(&format!("k{gi}"), rows) {
+                return false;
+            }
+        }
+        for (gi, rows) in v.iter().enumerate() {
+            if !self.session.bind_gpu_handle(&format!("v{gi}"), rows) {
+                return false;
+            }
+        }
+        let base = 1; // the graph's main output
+        let n = k.len();
+        for gi in 0..n {
+            if !self
+                .session
+                .register_kv_row_feed(&format!("k{gi}"), base + gi)
+            {
+                return false;
+            }
+            if !self
+                .session
+                .register_kv_row_feed(&format!("v{gi}"), base + n + gi)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// One plane-cache step: run, read only `read`, and fold each layer's new
+    /// row into its handle. `row_elems` is one layer's row width (`hkv`).
+    pub fn run_resident_planes(
         &mut self,
         inputs: &[(String, Vec<f32>)],
         row: usize,
-        layers: usize,
-        hkv: usize,
+        row_elems: usize,
+        read: &[usize],
     ) -> Option<Vec<Vec<f32>>> {
-        let out = self.run(inputs);
+        let out = self.run_read(inputs, read);
         bump(1, 1);
-        if !self.session.feed_kv_row(0, row, layers * hkv) {
+        if !self.session.feed_kv_row(0, row, row_elems) {
             return None;
         }
         Some(out)
+    }
+
+    /// The whole current contents of a resident plane input, read back from the
+    /// device. The decode's bucket rebuild is the one caller: the planes live on
+    /// the device between steps, so a larger capacity's planes are filled from
+    /// the smaller ones' live rows here, not from the host mirror the row feed
+    /// emptied.
+    pub fn read_plane(&self, name: &str) -> Option<Vec<f32>> {
+        self.session.read_gpu_handle(name)
     }
 }
 

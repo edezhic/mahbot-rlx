@@ -37,7 +37,7 @@
 //! nothing, multiplies nothing and takes no input, so it is a ceiling on reading,
 //! not a target for this arm.
 //!
-//! # The four forms
+//! # The forms
 //!
 //! Each row is a call of `steps` such multiplies over distinct weight regions
 //! (`bytes/step` = one region's packed bytes) — the `FORMS` array below mirrors
@@ -49,91 +49,151 @@
 //! | 4-bit FFN gate | Q4_K | 2048 | 6144 | 32 | 1152 | 7,077,888 |
 //! | 6-bit FFN down | Q6_K | 6144 | 2048 | 32 | 5040 | 10,321,920 |
 //! | 4-bit FFN gate, widened x8 | Q4_K | 2048 | 49152 | 8 | 1152 | 56,623,104 |
+//! | 4-bit predictor block | Q4_K | 2048 | 2048 | 128 | 1152 | 2,359,296 |
+//! | 4-bit predictor block, wide n | Q4_K | 2048 | 8192 | 32 | 1152 | 9,437,184 |
 //! | 6-bit recognition head | Q6_K | 2048 | 151936 | 3 | 1680 | 255,252,480 |
+//! | 8-bit predictor down | Q8_0 | 1024 | 1024 | 128 | 1088 | 1,114,112 |
+//! | 8-bit predictor head | Q8_0 | 1024 | 2048 | 64 | 1088 | 2,228,224 |
+//! | 8-bit predictor gate+up | Q8_0 | 1024 | 6144 | 32 | 1088 | 6,684,672 |
+//! | 8-bit predictor block, k=2048 | Q8_0 | 2048 | 2048 | 32 | 2176 | 4,456,448 |
+//! | 8-bit predictor, widened x8 | Q8_0 | 1024 | 49152 | 4 | 1088 | 53,477,376 |
+//!
+//! The five Q8_0 rows are the synthesis cell's code predictor, which stores 8-bit
+//! weights: `k = 1024` is its attention-projection width (its `ffn_down` contracts
+//! over 3072), and `n = 1024` is that projection's output, `2048` its head, `6144`
+//! its fused gate+up. Row bytes are 1088 for `k = 1024` — 32 Q8_0 blocks, each 2
+//! bytes of scale and 32 of quants — and 2176 for `k = 2048`.
 //!
 //! The widened form's region is the first form's own packed bytes repeated eight
 //! times into one buffer — a synthetic widening, no such tensor being in any file —
 //! and its eight regions are byte-identical copies of it, so the first form's bytes
-//! appear sixty-four times in that call's address space. The narrowest form is the
-//! most floor-bound and the noisiest, so a conclusion resting on it alone is labelled
-//! as such; the second is the only marginal-occupancy one, having by far the fewest
-//! output columns. Each form is built and dropped on its own — four at once is the
-//! order of two gigabytes of transient device memory — and a form whose transient
-//! bytes exceed the adapter's `max_buffer_size` is **named as not fitting and
-//! skipped**, never silently dropped, with the forms that do fit still measured.
+//! appear sixty-four times in that call's address space. The two K-quant arms'
+//! predictor forms are the geometry the model cells' multiplies have at that
+//! scheme — `k = n = 2048` for one level's block, and the same `k` at four times
+//! the width to separate a dispatch's column count from everything else; the
+//! Q8_0 rows above are the predictor's own stored scheme, at its own widths —
+//! which is why their figures are the ones the cells'
+//! rates are read against. The narrowest form is the most floor-bound and the
+//! noisiest, so a conclusion resting on it alone is labelled as such; the second is
+//! the only marginal-occupancy one, having by far the fewest output columns. Each
+//! form is built and dropped on its own — two at once is the order of two gigabytes
+//! of transient device memory — and a form whose transient bytes exceed the
+//! adapter's `max_buffer_size` is **named as not fitting and skipped**, never
+//! silently dropped, with the forms that do fit still measured.
 //!
-//! # What the arm does now, and what did not change
+//! # What the arm does now
 //!
-//! A workgroup's two columns share one `vec4` read of the input row (**input-side**,
-//! halved — a gain here is **not** a weight-read win); Q6_K's lane unit requests each
-//! byte of a `ql` span once instead of twice; Q4_K keeps its sub-block cover (see the
-//! shader header) but reads its 16-byte header as four whole words, a request-volume
-//! increase confined to the block that unit already reads; and Q4_K's per-unit decode
-//! against a `qs` group's bytes being requested by both sibling sub-blocks is
-//! **unattributed** (one term, not two).
+//! A workgroup's two columns share one `vec4` read of the input row (input-side,
+//! halved — not a weight-read win); Q6_K's lane unit requests each byte of a `ql`
+//! span once instead of twice; Q4_K reads its 16-byte header as four whole words
+//! instead of byte-wise, a request-volume increase confined to the block that unit
+//! already reads. The host work per chunk (one uniform write and one bind group,
+//! nothing pooled) and one submission and one wait per call are unchanged, so the
+//! arm rides the enclosing batch. A development-time step-count sweep found a
+//! fixed per-call cost of the order of a third of the narrow form's 32-step call,
+//! which is why that form's ratio is the one that does not reproduce; the
+//! recognition head's derived dispatch count moved 3 -> 2, two columns covering
+//! twice the columns per workgroup there.
 //!
-//! Unchanged: the host work *per chunk* (one uniform write and one bind group,
-//! nothing pooled); one submission and one wait per call, so the arm still rides the
-//! enclosing batch; and the fixed call floor, *quantified rather than cancelled* — a
-//! development-time step-count sweep found the narrow form's per-step time falling
-//! steeply as its call's step count rose (a steps-independent per-call cost of the
-//! order of a third of that 32-step call), which is why the narrow form's ratio is
-//! the one that does not reproduce. The one per-step figure that moved is the
-//! recognition head's derived dispatch count, 3 -> 2 — where the binding budget does
-//! not bind the chunk width (it does not at these forms' row widths): the cap counts
-//! workgroups, so two columns per workgroup covers twice the columns, i.e. one chunk
-//! fewer and so one fewer uniform write and bind group per step on that call. The
-//! widened form is one dispatch per step either way.
+//! # The workgroup's shape: two studies, no winner
+//!
+//! Two whole-shader constants place one workgroup on a narrow row:
+//! `GEMV_TILED_COLS_PER_WG` output columns it covers and `LANES` threads splitting
+//! each column's contraction (the Rust side's `GEMV_TILED_THREADS`, tied to the
+//! shader by `gguf_tiled_gemv_geometry_matches_the_shader`). Each study moved one
+//! of them and nothing else, in one back-to-back window per table: min GB/s over
+//! five rounds, each column pair measured in the same session.
+//!
+//! Columns per workgroup:
+//!
+//! | form | n | 1 col | 2 cols | 4 cols |
+//! | --- | --- | --- | --- | --- |
+//! | 4-bit FFN gate | 6144 | 58.3 | 58.2 | 58.5 |
+//! | 6-bit FFN down | 2048 | 67.9 | 65.6 | 48.2 |
+//! | 4-bit FFN gate, widened x8 | 49152 | 71.1 | 86.7 | 79.3 |
+//! | 4-bit predictor block | 2048 | 41.1 | 45.7 | — |
+//! | 4-bit predictor block, wide n | 8192 | 62.4 | 73.6 | — |
+//! | 6-bit recognition head | 151936 | 79.0 | 85.0 | 58.2 |
+//!
+//! Two columns — the tree's — leads on two of the four forms where all three ran
+//! (49 152 by 9 %, 151 936 by 7 %) and is within 3.5 % of the best on the other
+//! two; four columns ran on four forms, leading 6 144 by 0.5 %, sitting in the
+//! middle of 49 152's 71.1/86.7/79.3, and trailing on 2 048 (48.2) and the head
+//! (58.2). Per-setting spreads were not recorded in that sweep, so a difference
+//! under ~4 % is not a difference, and the sweep predates the paired-column issue
+//! below, so its two-column cell is not the arm as it stands.
+//!
+//! Lanes per column, at `k = 2048` (64 units a row: 16 lanes walk four each, 32
+//! two, 64 one). Window A moved 16 → 32; window B moved 32 → 64 in a second
+//! session, so its 32 column is that session's and not window A's:
+//!
+//! | form | n | A: 16 lanes | A: 32 lanes |
+//! | --- | --- | --- | --- |
+//! | 4-bit FFN gate | 6144 | 43.4 | 59.8 |
+//! | 6-bit FFN down | 2048 | 43.8 | 65.1 |
+//! | 4-bit FFN gate, widened x8 | 49152 | 54.2 | 81.9 |
+//! | 4-bit predictor block | 2048 | 32.4 | 41.6 |
+//! | 4-bit predictor block, wide n | 8192 | 47.5 | 67.9 |
+//! | 6-bit recognition head | 151936 | 52.8 | 82.3 |
+//!
+//! | form | n | B: 32 lanes | B: 64 lanes |
+//! | --- | --- | --- | --- |
+//! | 4-bit FFN gate | 6144 | 59.4 | 60.3 |
+//! | 6-bit FFN down | 2048 | 65.7 | 68.1 |
+//! | 4-bit FFN gate, widened x8 | 49152 | 81.8 | 74.6 |
+//! | 4-bit predictor block | 2048 | 43.1 | 42.1 |
+//! | 4-bit predictor block, wide n | 8192 | 69.2 | 64.0 |
+//! | 6-bit recognition head | 151936 | 82.3 | 74.7 |
+//!
+//! 16 lanes loses on all six by 22–36 %. 64 lanes wins two forms by 1.5–3.7 % and
+//! loses four by 2.3–9.2 %, one of the losses being the 4-bit predictor block at
+//! `n = 2 048` — the predictor's own shape. At cell scale the predictor frame ran
+//! 66.34 ms at 32 lanes (66.17–66.38 over three runs) against 66.84 at 64 (one
+//! run, same session), the waveform witness held on both. 32 lanes, the tree's,
+//! stands; 16 lanes was not taken through the cell.
+//!
+//! **In the arm, and not.** The two columns' packed words are issued together
+//! (`word0`/`word1` read before either is consumed) and Q4_K's block header and
+//! `qs` words go through `read_word_q4`'s aligned single load — both bit-identical,
+//! both part of every column above and of the after side of the table below. The
+//! further step of hoisting a unit's whole eighteen loads is **not** in the tree:
+//! on the four Q4_K forms it read 56.1, 93.3, 44.7 and 75.4 GB/s against that
+//! sweep's two-column 58.2, 86.7, 45.7 and 73.6 — two above (+7.6 % at 49 152,
+//! +2.4 % at 8 192), two below (−3.6 %, −2.2 %), and no spread recorded for that
+//! sweep, so none of the four is a difference.
+//!
+//! What separates the forms is the dispatch's column count, not its tile: in
+//! window A the same per-workgroup work reads 41.6 GB/s at 2 048 columns and 81.9
+//! at 49 152. One predictor frame is sixteen levels, 1 465 dispatch slots (348 of
+//! them multiplies) over 1 341 MiB, so the frame's next step is how many
+//! dispatches it issues, not the shape of any one of them.
 //!
 //! # Asserted, and not
 //!
-//! Asserted, never a time: the tabulated packed bytes per step; the joined one-row
-//! route for every step (the route counter conflates it with the multi-row per-row
-//! fallback, so this census is what ties the figures to this arm), in one submission
-//! with one blocking wait; finite outputs. Printed: the figure, the derived per-step
-//! dispatch count ([`gemv_one_row_dispatches`], from the arm's chunking rule), the
-//! submission/wait structure, the recorded one-row shape, and the per-round times.
-//!
-//! Not in this cell's sight, and so not to be read as checked: the shared shader's
-//! byte-wise helper reads, which the legacy one-bit arm uses — **uninstrumented**;
-//! the host-side wiring this route shares with that arm and with the multi-row
-//! per-row fallback (which re-enters this arm one row at a time), so a wiring change
-//! reaches further than the kernel does; the grouped multi-row route (which
-//! duplicates this arm's unpack arithmetic rather than sharing it) and that fallback
-//! — both re-taken by the owner's rig, not here; the comparable dense read, which
-//! lives on that rig too, so only absolute figures are recorded here; and any
-//! adapter but the one printed.
+//! Asserted, never a time: the tabulated packed bytes per step, the joined one-row
+//! route for every step in one submission with one blocking wait, and finite
+//! outputs. Printed: the figure, the derived per-step dispatch count, the
+//! submission/wait structure, the recorded one-row shape and the per-round times.
+//! Nothing here checks the shader's byte-wise helper reads, the host-side wiring
+//! this route shares with the multi-row fallback, or any adapter but the one
+//! printed.
 //!
 //! # Recorded figures
 //!
-//! This accounting's bytes per second, both sides through this cell on the two
-//! revisions either side of the one-row arm's change; adapter `Apple M3 Pro`,
-//! `--release`, no other workload running; each figure that side's better run, a round
-//! contributing the mean per call over `CALLS_PER_ROUND` calls, and medians are never
-//! paired with mins.
+//! Through this cell on the two revisions either side of the one-row arm's change,
+//! adapter `Apple M3 Pro`, `--release`, medians never paired with mins:
 //!
-//! | form | before, min (median) | after, min (median) | ratio, min-for-min |
-//! | --- | --- | --- | --- |
-//! | 4-bit FFN gate | 50.7 (45.8) | 55.2 (51.3) | 1.09× |
-//! | 6-bit FFN down | 50.4 (49.2) | 59.6 (57.8) | 1.18× |
-//! | 4-bit FFN gate, widened | 65.7 (63.9) | 77.1 (75.9) | 1.17× |
-//! | 6-bit recognition head | 62.3 (62.2) | 83.1 (80.7) | 1.33× |
+//! | form | before, min | after, min |
+//! | --- | --- | --- |
+//! | 4-bit FFN gate | 50.7 | 55.2 |
+//! | 6-bit FFN down | 50.4 | 59.6 |
+//! | 4-bit FFN gate, widened | 65.7 | 77.1 |
+//! | 6-bit recognition head | 62.3 | 83.1 |
 //!
-//! GB/s, one point in time and not a reproducible number — the modified side's later
-//! runs have read 54.6-55.3, 57.6-61.3, 77.7-79.0 and 82.0-84.4, so a re-run **moves
-//! this table deliberately** — and **cross-revision by construction**: two runs on
-//! two revisions, fixed order, no in-run control, no interleaving, so each side's own
-//! spread is the only bound on the ratio. The development-time interleaved measurement
-//! the claim rests on (both arms round-robin in one process, the unmodified arm kept
-//! alive as a duplicate control) is deliberately not landed, so **the tree cannot
-//! re-derive the pairing** and the before side exists only here.
+//! Cross-revision by construction — two runs on two revisions, fixed order, no
+//! in-run control — so each side's own spread is the only bound on it, and the
+//! narrowest form does not reproduce to within its spread (47.4…57.8 GB/s).
 //!
-//! **The narrowest form does not reproduce to within its own spread** (47.4…57.8 GB/s
-//! across runs), so its 1.09× ratio is inside the noise, nothing here rests on it, and
-//! it is the form the floor dominates; the three wider forms have stayed above their
-//! `before` sides in every run so far, which is the change's support — run-to-run
-//! evidence under a varying machine load, not an interleaved pair.
-
 mod common;
 
 use rlx_ir::quant::QuantScheme;
@@ -165,7 +225,10 @@ struct Form {
     packed_bytes_per_step: usize,
 }
 
-const FORMS: [Form; 4] = [
+/// The forms measured: the K-quant arms' predictor geometry (`k = n = 2048`, the
+/// narrowest call a 4-bit model's blocks issue, which its in-graph rate is set by)
+/// and the Q8_0 rows at the widths the code predictor actually multiplies at.
+const FORMS: [Form; 11] = [
     Form {
         label: "4-bit FFN gate",
         scheme: QuantScheme::GgufQ4K,
@@ -194,6 +257,24 @@ const FORMS: [Form; 4] = [
         packed_bytes_per_step: 56_623_104,
     },
     Form {
+        label: "4-bit predictor block",
+        scheme: QuantScheme::GgufQ4K,
+        k: 2048,
+        n: 2048,
+        widen: 1,
+        steps: 128,
+        packed_bytes_per_step: 2_359_296,
+    },
+    Form {
+        label: "4-bit predictor block, wide n",
+        scheme: QuantScheme::GgufQ4K,
+        k: 2048,
+        n: 8192,
+        widen: 1,
+        steps: 32,
+        packed_bytes_per_step: 9_437_184,
+    },
+    Form {
         label: "6-bit recognition head",
         scheme: QuantScheme::GgufQ6K,
         k: 2048,
@@ -201,6 +282,57 @@ const FORMS: [Form; 4] = [
         widen: 1,
         steps: 3,
         packed_bytes_per_step: 255_252_480,
+    },
+    // The code predictor's own storage and geometry: Q8_0 at `k = 1024` (its
+    // `ffn_down` is `[3072, 1024]`, its head `[1024, 2048, 15]`), the narrowest
+    // calls the synthesis cell issues. `n = 1024` is its o/down shape, `2048` its
+    // head, `6144` its fused gate+up, and the widened form the same per-workgroup
+    // work at a width no level of it issues — the anchor the others are read
+    // against.
+    Form {
+        label: "8-bit predictor down",
+        scheme: QuantScheme::GgufQ8_0,
+        k: 1024,
+        n: 1024,
+        widen: 1,
+        steps: 128,
+        packed_bytes_per_step: 1_114_112,
+    },
+    Form {
+        label: "8-bit predictor head",
+        scheme: QuantScheme::GgufQ8_0,
+        k: 1024,
+        n: 2048,
+        widen: 1,
+        steps: 64,
+        packed_bytes_per_step: 2_228_224,
+    },
+    Form {
+        label: "8-bit predictor gate+up",
+        scheme: QuantScheme::GgufQ8_0,
+        k: 1024,
+        n: 6144,
+        widen: 1,
+        steps: 32,
+        packed_bytes_per_step: 6_684_672,
+    },
+    Form {
+        label: "8-bit predictor block, k=2048",
+        scheme: QuantScheme::GgufQ8_0,
+        k: 2048,
+        n: 2048,
+        widen: 1,
+        steps: 32,
+        packed_bytes_per_step: 4_456_448,
+    },
+    Form {
+        label: "8-bit predictor, widened x8",
+        scheme: QuantScheme::GgufQ8_0,
+        k: 1024,
+        n: 49152,
+        widen: 8,
+        steps: 4,
+        packed_bytes_per_step: 53_477_376,
     },
 ];
 
@@ -210,17 +342,6 @@ const FORMS: [Form; 4] = [
 /// part of the number, so run-to-run spread is information about the shape.
 const ROUNDS: usize = 5;
 const CALLS_PER_ROUND: usize = 3;
-
-/// The form's packed weight: the crate's shared fixture at this scheme's own block
-/// geometry, narrowed to the two K-quant forms this file drives — the shared
-/// fixture also accepts Q8_0, whose own one-row arm these forms do not measure.
-fn packed_weights(scheme: QuantScheme, k: usize, n: usize) -> Vec<u8> {
-    assert!(
-        matches!(scheme, QuantScheme::GgufQ4K | QuantScheme::GgufQ6K),
-        "{scheme:?} is not one of the two K-quant forms this file measures"
-    );
-    common::packed_gguf_weight(scheme, k, n)
-}
 
 /// The form's graph: `steps` packed multiplies, each over its own parameter and
 /// all of them over one input row.
@@ -275,14 +396,14 @@ fn measure(form: &Form, dev: &rlx_wgpu::device::WgpuDevice) {
     // its own geometry. Only the bytes are shared — each step still gets its own
     // parameter region.
     let packed = if form.widen > 1 {
-        let base = packed_weights(form.scheme, form.k, form.n / form.widen);
+        let base = common::packed_gguf_weight(form.scheme, form.k, form.n / form.widen);
         let mut widened = Vec::with_capacity(base.len() * form.widen);
         for _ in 0..form.widen {
             widened.extend_from_slice(&base);
         }
         widened
     } else {
-        packed_weights(form.scheme, form.k, form.n)
+        common::packed_gguf_weight(form.scheme, form.k, form.n)
     };
     assert_eq!(
         packed.len(),
@@ -350,7 +471,7 @@ fn measure(form: &Form, dev: &rlx_wgpu::device::WgpuDevice) {
             .expect("the one-row arm's chunking rule answers for this scheme");
 
     // The timed rounds: this form alone, built and dropped on its own (the module
-    // doc's "The four forms"), each round's figure the mean per call over its
+    // doc's form table), each round's figure the mean per call over its
     // `CALLS_PER_ROUND` calls.
     let per_call_ms = common::time_rounds(ROUNDS, CALLS_PER_ROUND, || {
         let _ = c.run(&[("x", &x)]);

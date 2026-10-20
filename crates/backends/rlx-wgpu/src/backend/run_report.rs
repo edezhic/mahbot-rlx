@@ -471,9 +471,10 @@ impl RunReport {
     }
 
     /// The one pass-opening entry: the run's own batch passes come through it
-    /// ([`RunReport::begin_pass`]) and so does every packed-weight multiply's
-    /// ([`PassMarks::begin`]). `label` is the caller's, so carrying the mark never
-    /// renames the pass that carries it, and whether a pass is marked at all is
+    /// ([`RunReport::begin_pass`]) and so does every unjoined packed-weight
+    /// multiply's ([`PassMarks::begin`]); a joined one dispatches into the batch's
+    /// pass, already recorded here. `label` is the caller's, so carrying the mark
+    /// never renames the pass that carries it, and whether a pass is marked at all is
     /// read from this report rather than off the switch — which was read once, in
     /// [`RunReport::start`].
     fn open_pass<'e>(
@@ -509,10 +510,12 @@ impl RunReport {
     }
 
     /// The marks handle for this run's device work outside its dispatch loop:
-    /// the packed-weight multiplies, which open their passes through it. Whether a
-    /// pass is marked is settled in `RunReport::open_pass`, so the marks are
-    /// never a second read of the switch — a disabled report's handle marks
-    /// nothing, and only [`PassMarks::none`] leaves a caller with no report at all.
+    /// the unjoined packed-weight multiplies, which open their passes through it.
+    /// (A joined multiply dispatches into the run's own pass, which
+    /// [`RunReport::begin_pass`] already marked.) Whether a pass is marked is
+    /// settled in `RunReport::open_pass`, so the marks are never a second read of
+    /// the switch — a disabled report's handle marks nothing, and only
+    /// [`PassMarks::none`] leaves a caller with no report at all.
     pub(crate) fn marks(&mut self) -> PassMarks<'_> {
         PassMarks { report: Some(self) }
     }

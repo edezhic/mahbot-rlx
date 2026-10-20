@@ -53,8 +53,9 @@
 //! four rows is the row-grouped GEMM, which the run joins the same way — and an
 //! 8-bit (Q8_0) multiply at four rows joins too once its contraction is a whole
 //! number of the scheme's own packing blocks, that arm being one a caller can
-//! encode itself. All those multiply passes are `encode` passes beside the batch's
-//! own. The one call that is not joined is a scheme this route never admits at all
+//! encode itself. All those multiply dispatches land in the run's own batch pass,
+//! so the multiply rides an `encode` pass rather than opening one beside it. The
+//! one call that is not joined is a scheme this route never admits at all
 //! (Q5_K): the ladder has neither a fused arm nor a grouped one for it, so it takes
 //! its group's own scratch entry point, and its pass is that call's own
 //! submission, landing in `host` — the interval the run's own dispatch loop never
@@ -1083,27 +1084,26 @@ fn assert_dispatch_only_device_only(stderr: &str, schedule: usize) {
     );
 }
 
-/// Cases 8 to 11 — the packed multiply's own pass in the device view.
+/// Cases 8 to 11 — the packed multiply's pass in the device view.
 ///
 /// [`assert_device_view`] owns the device line's full battery (its fields, its
 /// `unavailable` reason, the `device_unusable` cross-checks); what a packed
-/// multiply adds is read here: the multiply's pass must be one of the recorded
-/// passes and not the dispatch loop's alone, and the interval the report names for
-/// it must be the one that carried the multiply.
+/// multiply adds is read here: the pass that carries it must be one of the recorded
+/// passes, and the interval the report names for it must be the one that carried
+/// the multiply.
 ///
 /// `joined` is the route this case's call takes: `true` when the run encodes the
 /// call into its own batch. The joined arms — the tiled one-row arm, the
 /// row-grouped GEMM above it, and the 8-bit scheme's block-aligned grouped call —
-/// ride that batch, so the multiply's pass is an `encode` pass beside the batch's:
-/// the `encode` interval then carries the batch pass opened before its first
-/// remaining step turns out to be the host-classified multiply, the multiply's own
-/// pass, and the dense step's batch pass. The unjoined case is the scheme this route
-/// never admits: with no fused arm and no grouped one it is left to its group's own
-/// scratch entry point, which submits on its own inside the `host` step, and the
-/// passes that route opens — the slab's dequant and its `matmul_bt` — are the run's
-/// passes outside `encode`, the interval the run's own dispatch loop never opens a
-/// pass in, which is what makes such lines readable as an unjoined packed
-/// multiply's.
+/// dispatch into the batch's open pass, so the multiply rides that pass instead of
+/// opening one of its own: the `encode` interval carries the batch pass and the
+/// multiply's dispatches in it, and the pass count is the run's own. The unjoined
+/// case is the scheme this route never admits: with no fused arm and no grouped one
+/// it is left to its group's own scratch entry point, which submits on its own
+/// inside the `host` step, and the passes that route opens — the slab's dequant and
+/// its `matmul_bt` — are the run's passes outside `encode`, the interval the run's
+/// own dispatch loop never opens a pass in, which is what makes such lines readable
+/// as an unjoined packed multiply's.
 fn assert_packed_covered(stderr: &str, joined: bool) {
     let lines = report_lines(stderr);
     let pass_lines = assert_device_view(&lines, stderr);
@@ -1123,10 +1123,9 @@ fn assert_packed_covered(stderr: &str, joined: bool) {
         .filter(|pass| pass["interval"] != "encode")
         .collect();
     if joined {
-        // The joined arm: the multiply rides the run's own batch, so its pass is an
-        // `encode` line among the batch's — one more there than the run's own dispatch
-        // loop opened, since the batch pass before it is the empty one the loop opens
-        // before it sees that its step is the host-classified multiply.
+        // The joined arm: the multiply dispatches into the run's own batch pass, so
+        // this two-step graph opens exactly one `encode` pass and the multiply's
+        // work is inside it — not a pass of the multiply's own beside the batch's.
         assert_eq!(
             carrier["label"], "encode",
             "the row the batch joined is the interval that carried it:\n{stderr}"
@@ -1139,11 +1138,10 @@ fn assert_packed_covered(stderr: &str, joined: bool) {
             .iter()
             .filter(|pass| pass["interval"] == "encode")
             .count();
-        assert!(
-            encodes >= 3,
-            "the `encode` interval must carry the packed multiply's own pass beside the \
-             run's own — the empty batch pass, the multiply's, and the dense step's — \
-             found {encodes}:\n{stderr}"
+        assert_eq!(
+            encodes, 1,
+            "the `encode` interval must carry the run's one batch pass — the joined \
+             multiply dispatches into it instead of opening its own — found {encodes}:\n{stderr}"
         );
     } else {
         // The unjoined case — the scheme this route never admits, which therefore

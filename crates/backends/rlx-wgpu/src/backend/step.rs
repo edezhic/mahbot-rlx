@@ -1736,6 +1736,21 @@ pub(crate) fn step_is_tail_host(step: &Step) -> bool {
     )
 }
 
+/// Whether a device step owns a slot in an executable's `uniforms` and
+/// `bind_groups`: every step that does not run on the host, but `FftGpu`, whose
+/// params and dispatch ride its own struct. It fixes the slot *order*: the
+/// compile-time allocation and the uniform staging loop both walk the schedule
+/// by this rule, and `set_sample_seeds` walks `uniforms` by it. The run loop
+/// advances `gpu_ui` for every step it dispatches or skips at this run's extent
+/// (whose pre-built bind group still occupies its index), but not for a
+/// `step_is_tail_host` step, which it passes over at the top of the pass — that
+/// is safe because the placement guard admits such a step only as the
+/// schedule's last, so no later step's index moves. A new family that owns no
+/// slot must be added here.
+pub(crate) fn step_owns_slot(step: &Step) -> bool {
+    !step_runs_on_host(step) && !matches!(step, Step::FftGpu { .. })
+}
+
 pub(crate) fn step_runs_on_host(step: &Step) -> bool {
     match step {
         Step::GatedDeltaNet { use_gpu, .. } => !*use_gpu,
@@ -1790,8 +1805,9 @@ pub(crate) fn step_runs_on_host(step: &Step) -> bool {
 
 /// The kinds [`step_runs_on_host`] calls host work whose route may still hand the step to
 /// the enclosing device batch: `Step::DequantMatmulGguf` (a provably device-only packed
-/// multiply, `WgpuExecutable::joined_dequant_gguf`) and `Step::BufferCopy` (a copy whose
-/// route answer is the device one, `CopyRoute::joins_batch`). `run.rs`'s
+/// multiply, `WgpuExecutable::joined_dequant_gguf`, dispatched into the batch's open pass)
+/// and `Step::BufferCopy` (a copy whose route answer is the device one,
+/// `CopyRoute::joins_batch`, encoded into the batch's encoder). `run.rs`'s
 /// `step_breaks_batch` applies this as the one term in front of both of its join arms, and
 /// the plan-time placement guard [`assert_hosted_audio_step_placement`] reads the same set —
 /// so a third join arm has to be named here, or its own arm would never fire on a step this
