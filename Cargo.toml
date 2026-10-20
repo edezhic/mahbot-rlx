@@ -137,10 +137,9 @@ members = [
 # fork's wgpu backend targets native Metal / Vulkan / DX12 and is never built for
 # wasm or run in a browser, so no recipe builds, lints or tests them.
 #
-# Not one line inside them is edited: a deleted or modified file is what turns a
-# future merge into a conflict. Exclusion is what keeps them inert — their
-# manifests inherit from this workspace, so they do not resolve standalone
-# either, and nothing can be built inside them by accident.
+# Exclusion is what keeps them inert — their manifests inherit from this
+# workspace, so they do not resolve standalone either, and nothing can be built
+# inside them by accident.
 #
 # Trade-off, accepted knowingly: `cargo -p rlx-web` / `-p rlx-webgl` no longer
 # resolve, the recipes that selected them are gone, and because their sources

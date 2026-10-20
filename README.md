@@ -24,8 +24,7 @@ real hardware, and is never built for WebAssembly or run in a browser. The two
 browser crates that remain in the tree — `crates/bindings/rlx-web` and
 `crates/backends/rlx-webgl` — are excluded from the workspace and are kept only
 to avoid conflicting with upstream, which edits those directories in nearly
-every release. They will never be used, nothing builds them, and not one line
-inside them is modified here.
+every release. They will never be used, nothing builds them.
 
 The design, IR, and cross-backend benchmarks are written up in
 [*RLX: A Unified Multi-Backend Tensor Compiler and Distributed Runtime in
@@ -790,7 +789,7 @@ loop; [`CONTRIBUTING.md`](CONTRIBUTING.md) and
 ```sh
 git clone --recurse-submodules https://github.com/MIT-RLX/rlx
 just install-git-hooks     # symlink the repo pre-commit hook
-just ci                    # build · test · fmt-check · lint · env-vars · WGSL-uniform · no-wasm · pyrlx — the gate every PR must pass
+just ci                    # build · test · fmt-check · lint · env-vars · WGSL-uniform · pyrlx — the gate every PR must pass
 ```
 
 **A PR is ready when** `just ci` is green, new behavior is covered by a

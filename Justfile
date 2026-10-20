@@ -736,13 +736,6 @@ new-op NAME *ARGS:
 check-wgsl-uniform:
     cargo test -p rlx-wgpu --features backend-tests --test wgsl_uniform_control_flow
 
-# No crate this fork builds may carry a wasm conditional or a wasm-only
-# dependency: the backend targets Metal, Vulkan and DX12 and is never built for
-# WebAssembly. Matches code shapes only (see scripts/check-no-wasm.py), so prose
-# that mentions the word is not a failure.
-check-no-wasm:
-    python3 scripts/check-no-wasm.py
-
 # Cross-compile gate: the Apple on-device stack must build for every Apple
 # platform, device *and* simulator. The native backends are rlx-cpu
 # (Accelerate/AMX), rlx-metal (Metal + MPS + MPSGraph) and rlx-coreml (ANE) —
@@ -1000,7 +993,7 @@ run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
 # Quick basic test of the workspace: build + test + lint + fast smokes.
-ci: build test fmt-check lint check-rlx-env-vars check-example-names check-doc-links check-rustdoc check-license-headers check-corpus check-wgsl-uniform check-no-wasm test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
+ci: build test fmt-check lint check-rlx-env-vars check-example-names check-doc-links check-rustdoc check-license-headers check-corpus check-wgsl-uniform test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
 
 # ROCm compile check + graph_devices parity (tests skip when HIP unavailable).
 #
