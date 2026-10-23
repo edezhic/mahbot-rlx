@@ -69,16 +69,18 @@ struct Case {
     scale: f32,
 }
 
-/// The fused serial kernel's shape: one query row over 48 keys, below both the
-/// many-row route's query-row floor and the decode form's own floor. The causal
-/// branch puts that row at the cache's end, so it still walks all 48 keys.
+/// The fused serial kernel's shape: one query row at a head width above the
+/// lane-parallel form's cap, which is one of the one-row shapes that form
+/// declines (`kernels::attention_decode_eligible`; a `v_head_dim` above the cap
+/// and a step with no keys are others). The causal branch puts that row at the
+/// cache's end, so it still walks all 48 keys.
 const FUSED: Case = Case {
     label: "fused",
     b: 1,
     rows: 1,
     lk: 48,
     nh: 4,
-    hd: 64,
+    hd: 192,
     routes: AttentionRoutes {
         decode: 0,
         decomposed: 0,
@@ -88,8 +90,8 @@ const FUSED: Case = Case {
     scale: 1.0,
 };
 
-/// A single query row over more keys than the decode form's floor: the
-/// lane-parallel decode kernel.
+/// A single query row over a longer key sequence: the lane-parallel decode
+/// kernel.
 const DECODE: Case = Case {
     label: "decode",
     b: 1,
@@ -315,8 +317,8 @@ fn assert_cap_changes_the_answer(case: &Case, capped: &[f32], cap: f32) {
     );
 }
 
-/// The fused serial arrangement — one query row over 48 keys, below both the
-/// many-row route's query-row floor and the decode form's own key floor — under the
+/// The fused serial arrangement — one query row over 48 keys at a head width above
+/// the decode form's cap, below the many-row route's query-row floor — under the
 /// causal kind and under the additive `Bias` that separates the two orders of cap
 /// and mask. The causal branch puts that row at the cache's end, so it still walks
 /// all 48 keys.

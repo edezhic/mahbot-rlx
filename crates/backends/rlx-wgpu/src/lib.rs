@@ -28,13 +28,14 @@ pub mod kernel_schedule_port;
 #[cfg(feature = "schedule-codegen")]
 pub mod kernel_schedule_emit;
 pub use backend::bf16_packed_dispatch_count;
+pub use backend::coop_f32_direct_dispatch_count;
 pub use backend::coop_f32_dispatch_count;
 /// Host-step planning: what a compiled schedule asks the CPU to do, and which
 /// of those asks are independent enough to share a sync point.
 pub use backend::{HostBatch, HostGroup, HostIo, HostPlan, Region};
 pub use backend::{
-    device_submit_count, device_wait_count, reset_device_counts, reset_vec4_move_count,
-    vec4_move_count,
+    device_submit_count, device_wait_count, norm_vec4_count, reset_device_counts,
+    reset_norm_vec4_count, reset_vec4_move_count, vec4_move_count,
 };
 pub mod supported_ops;
 pub mod tuning;

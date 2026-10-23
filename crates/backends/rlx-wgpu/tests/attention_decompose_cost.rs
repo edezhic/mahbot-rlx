@@ -10,17 +10,17 @@
 //! numbers on — printing per-layer µs, µs per query row, GF/s (2·q·k·d FMAs
 //! per row, the FLOP count `attention.wgsl`'s own header quotes) and the
 //! arrangement each shape took, read from the process-global route counters.
-//! With the floor at two rows the fused kernel is reachable here only at one
-//! row over at most `ATTENTION_DECODE_MIN_KEYS` keys, so those cells are its
-//! short-key reference rather than a many-row comparison.
+//! At this file's head width (`HD`, under the lane-parallel form's cap) a single
+//! query row takes that form at every key length and the fused kernel is never
+//! reachable, so the one-row cells here are the decode form's short-key cost
+//! rather than a many-row comparison.
 //!
-//! The cells that straddle the floor are the point: one query row against two,
-//! at the key lengths where the decode form does not take the single row (the
-//! 32- and 64-key columns), and the two-row cells over short and long keys read
-//! side by side on the real adapter. Nothing here asserts a duration: `run()`
-//! includes submission, the device wait and the readback, so a reading is mostly
-//! that fixed floor, and a regression in it is not one in the kernel. What is
-//! asserted is only the route each shape took.
+//! The cells that straddle the floor are the point: one query row against two or
+//! more over the same keys — the row axis is the only one that still chooses
+//! between the forms — read side by side on the real adapter. Nothing here
+//! asserts a duration: `run()` includes submission, the device wait and the
+//! readback, so a reading is mostly that fixed floor, and a regression in it is
+//! not one in the kernel. What is asserted is only the route each shape took.
 //!
 //! Run the thermal gate first (`just throttle`).
 mod common;
@@ -78,10 +78,9 @@ fn attention_decompose_cost() {
          (best of {REPS} per shape; per-layer figures)"
     );
     for lk in [32usize, 64, 256, 1024] {
-        // 1 is the decode regression row (or the serial kernel's, over the lengths the
-        // decode form does not take: at most `ATTENTION_DECODE_MIN_KEYS`), 2 the fork's
-        // cached decode cell, 24 and 31 the top of the band the floor used to exclude,
-        // 32 and up what the route already served.
+        // 1 is the decode regression row (the lane-parallel form, at every key
+        // length), 2 the fork's cached decode cell, 24 and 31 the top of the band
+        // the many-row floor excludes, 32 and up what the dense route serves.
         for rows in [1usize, 2, 24, 31, 32, 64, 100, 256] {
             let g = chain(rows, lk);
             let q = data(rows * dim, 0.011, false);
@@ -110,7 +109,7 @@ fn attention_decompose_cost() {
             );
             assert_eq!(
                 routes,
-                common::expected_attention_routes(rows, lk, LAYERS, REPS),
+                common::expected_attention_routes(rows, lk, HD, 0, LAYERS, REPS),
                 "rows={rows} lk={lk}: the shape took a different arrangement than its \
                  query rows and key cells say"
             );

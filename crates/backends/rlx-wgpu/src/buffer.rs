@@ -13,7 +13,7 @@
 //! Silicon wgpu's Metal backend gives us unified memory automatically.
 
 use crate::gguf_gpu::dequant_route_defers_host_read;
-use rlx_ir::{Graph, NodeId};
+use rlx_ir::{Graph, NodeId, Op, Shape};
 use rlx_opt::memory::MemoryPlan;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -264,8 +264,7 @@ pub(crate) fn weight_param_bytes(dt: rlx_ir::DType, ne: usize) -> usize {
 ///
 /// Its own function because [`Arena::lens`] cannot answer it: `lens` starts as these
 /// numbers and is then overwritten with each node's *actual* byte length
-/// (`Arena::set_actual_len`) once the arena exists — `elems * 4` for the widened
-/// encodings, `elems * size_bytes()` for complex tensors.
+/// (`Arena::set_actual_len`) once the arena exists — `elems * arena_elem_bytes(dtype)`.
 fn plan_node_slots(plan: &MemoryPlan) -> HashMap<NodeId, usize> {
     plan.assignments
         .iter()
@@ -758,7 +757,12 @@ fn snap_plan_to_shards_ex(plan: &mut MemoryPlan, shard_cap: usize, stage_reserve
     if local > 0 && local <= usable {
         cursor = cursor.div_ceil(shard_cap) * shard_cap;
     }
-    plan.arena_size = cursor.max(1);
+    // The round-up belongs here, on the value the buffer is allocated at, not
+    // only on the plan handed in: every re-pack below rewrites `arena_size`, and
+    // a tail left off a 16-byte multiple ends the last shard mid-group, where the
+    // one-row packed multiply's 16-byte weight window refuses to be cut
+    // (`gguf_gpu::gemv_weight_window`).
+    plan.arena_size = cursor.max(1).next_multiple_of(16);
 }
 
 fn snap_plan_to_shards(plan: &mut MemoryPlan, shard_cap: usize) {
@@ -818,6 +822,36 @@ mod shard_pack_tests {
         assert!(plan.arena_size >= usable);
     }
 
+    /// The one-row multiply cuts its weight window on a 16-byte boundary
+    /// (`gguf_gpu::gemv_weight_window`), so the buffer it binds must end on one.
+    /// The tail case is the one a slot-only round-up misses: a tail that stays in
+    /// the stage reserve keeps the exact cursor, which a scratch/tail length can
+    /// leave off 16.
+    #[test]
+    fn a_snapped_arena_always_ends_on_a_sixteen_byte_multiple() {
+        let shard_cap = 4096usize;
+        let mut plan = MemoryPlan {
+            arena_size: 333, // 100-byte slot + 233 bytes of tail
+            assignments: HashMap::from([(
+                NodeId(0),
+                rlx_opt::memory::BufferSlot {
+                    offset: 0,
+                    size: 100,
+                },
+            )]),
+            schedule: Vec::new(),
+        };
+        snap_plan_to_shards(&mut plan, shard_cap);
+        assert_eq!(
+            plan.arena_size % 16,
+            0,
+            "a snapped arena ended at {} bytes, off the 16-byte boundary the \
+             one-row multiply's weight window is cut on",
+            plan.arena_size
+        );
+        assert!(plan.arena_size >= 333, "the tail was truncated");
+    }
+
     #[test]
     fn snap_plan_does_not_open_empty_shard_for_scratch() {
         // Mimic KittenTTS wave: ~3 GiB of tensors + modest scratch under a
@@ -847,6 +881,37 @@ mod shard_pack_tests {
         let a = plan.assignments.get(&NodeId(0)).unwrap();
         assert!(a.offset + a.size <= usable);
     }
+}
+
+/// The arena's byte width of one element of `dt`: one f32 lane for every
+/// real/int/bool dtype, the dtype's own width only for complex.
+///
+/// The arena is f32-**uniform**: every real/int/bool tensor occupies one f32 lane
+/// per element whatever its dtype says, and only complex genuinely spans several
+/// (C64 = 2 lanes, C128 = 4). `DType::size_bytes` is therefore the wrong stride for
+/// everything but complex — it would stride an F16 cache by 2 bytes through a
+/// buffer laid out 4 bytes per element and leave half the row stale. This is the one
+/// rule behind [`kv_row_bytes`], a node's actual byte length, and every copy that
+/// moves whole f32 words.
+pub(crate) fn arena_elem_bytes(dt: rlx_ir::DType) -> usize {
+    if dt.is_complex() { dt.size_bytes() } else { 4 }
+}
+
+/// One KV cache row's byte length along `axis`: the trailing extents times
+/// [`arena_elem_bytes`] of the cache's dtype. The append's lowering and its
+/// in-place placement both read this, so they cannot disagree about a row's width.
+pub(crate) fn kv_row_bytes(shape: &Shape, axis: usize) -> usize {
+    let elems: usize = (axis + 1..shape.rank())
+        .map(|i| shape.dim(i).unwrap_static())
+        .product::<usize>()
+        .max(1);
+    elems * arena_elem_bytes(shape.dtype())
+}
+
+/// The byte offset an append writes its row to, from the append node's own plan
+/// offset — the one spelling the lowering's copy and the placement's move share.
+pub(crate) fn kv_row_dst(base: usize, pos: usize, row_bytes: usize) -> usize {
+    base + pos * row_bytes
 }
 
 /// One contiguous *logical* arena + per-node byte offsets. Lives for the
@@ -1216,6 +1281,14 @@ impl Arena {
             }
         }
         let mut size = plan.arena_size.max(1); // wgpu hates zero-sized allocs
+        // The one-row packed multiply reads its blocks as 16-byte legs and cuts its
+        // weight window on one (`gguf_gpu::gemv_weight_window`), and the arena binds
+        // packed weights too whenever a param outgrows one weight shard
+        // (`from_plan_split`'s spill). The round-up therefore happens **before** the
+        // shard decision below, so that decision sizes the buffer it will allocate:
+        // applied after, a plan landing within 15 bytes under the cap would flip to
+        // the striped geometry and be refused where one buffer had done.
+        size = size.next_multiple_of(16);
         // Bind-stripe snap can still leave size > max_buf when size_hint was
         // already over the cap; re-pack onto physical shard boundaries.
         // Guard: never prefer an inflated multi-shard layout when the compact
@@ -1224,6 +1297,12 @@ impl Arena {
             snap_plan_to_shards(&mut plan, shard_cap);
             size = plan.arena_size.max(1);
         }
+        assert!(
+            size.is_multiple_of(16),
+            "rlx-wgpu arena: {size} bytes is not a 16-byte multiple — the one-row packed \
+             multiply cuts its weight window on a 16-byte boundary and a buffer ending \
+             mid-group refuses the cut"
+        );
 
         // Which geometry this size allocates, decided by one pure function so the
         // stripe bound can only ever be asked of a *physical* geometry (see
@@ -1648,14 +1727,14 @@ impl Arena {
                 let mut shards = Vec::with_capacity(n_shards);
                 for i in 0..n_shards {
                     let begin = i * weight_shard_cap;
-                    // Rounded to 4 bytes: a weight window can end exactly at the
-                    // buffer end, and a storage binding must be a multiple of 4
-                    // bytes — an odd tail would make the last window of a weight
-                    // that fits unbindable, declining the grouped path for it.
+                    // Ends on a 16-byte multiple: the one-row multiply reads its packed
+                    // blocks as 16-byte legs, so its weight window is cut on one and a
+                    // buffer ending mid-group would refuse the cut
+                    // (`gguf_gpu::gemv_weight_window`).
                     let this = (weight_cursor - begin)
                         .min(weight_shard_cap)
-                        .max(4)
-                        .next_multiple_of(4);
+                        .max(16)
+                        .next_multiple_of(16);
                     shards.push(device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("rlx-wgpu weight buffer (packed quant)"),
                         size: this as u64,
@@ -2051,6 +2130,214 @@ impl Arena {
         self.lens[&id]
     }
 
+    /// `[start, end)` of the bytes `id`'s storage occupies in its buffer: the
+    /// union of the node's own slot and the [`storage_root`] it is a view of,
+    /// which is the extent a reader of `id` at run time can touch.
+    ///
+    /// A pure view shares its root's storage, and the plan sizes it as if it
+    /// were an activation of its own, so its `offset`/`len_of` alone bound the
+    /// view rather than the bytes underneath it. `None` where either is unplaced
+    /// (an elided view, which the plan leaves out of `offsets`) or parked in the
+    /// weight buffer: those offsets are tagged, a different byte space, so a
+    /// caller comparing them with an activation range would get a vacuous answer
+    /// and must refuse rather than accept it.
+    pub(crate) fn storage_span(&self, graph: &Graph, id: NodeId) -> Option<(u64, u64)> {
+        let root = storage_root(graph, graph.node(id));
+        let slot = |id: NodeId| -> Option<(u64, u64)> {
+            if self.weight_offsets.contains_key(&id) {
+                return None;
+            }
+            let off = *self.offsets.get(&id)? as u64;
+            Some((off, off.saturating_add(*self.lens.get(&id)? as u64)))
+        };
+        let (own, root) = (slot(id)?, slot(root.id)?);
+        Some((own.0.min(root.0), own.1.max(root.1)))
+    }
+
+    /// Finish the arena's plan: record every node's actual byte length, then place
+    /// each KV append's row on the cache row it is copied to. Returns how many
+    /// appends the placement erased.
+    ///
+    /// One entry because the order between the two is a contract, not a preference:
+    /// the placement judges a row's length from [`Self::lens`], and both must run on
+    /// a plan that is final and before any step bakes a byte offset from
+    /// [`Self::offsets`] — a placement after that writes at pre-move offsets.
+    /// `compile_static_inner` calls it once, where the arena is built.
+    pub(crate) fn finish_plan(&mut self, graph: &Graph, max_binding: u64) -> usize {
+        for node in graph.nodes() {
+            let actual =
+                node.shape.num_elements().unwrap_or(0) * arena_elem_bytes(node.shape.dtype());
+            self.set_actual_len(node.id, actual);
+        }
+        self.place_kv_rows_in_place(graph, max_binding)
+    }
+
+    /// [`Self::finish_plan`]'s placement half — called only from there.
+    ///
+    /// [`Op::KvAppend`] copies one row — [`kv_row_bytes`] of the operands it is
+    /// lowered with — from its row operand to [`kv_row_dst`] of the append node's
+    /// own plan offset. When that row is the whole slot of a producer, moving the
+    /// producer's slot there makes the copy a no-op: the producer writes where the
+    /// attention reads, and the append emits no step at all. Every reader of the
+    /// row resolves through the same [`Self::offsets`] map, so nothing else changes.
+    ///
+    /// The move writes the row in the producer's own dispatch, before the append
+    /// would have copied it. That is only safe because nothing ordered between the
+    /// two reads the cache (the refusal below), because `pos` names a row no reader
+    /// has read yet — the append is the cache's first reader of it — and because the
+    /// bytes written are the copy's own, at the copy's own destination.
+    ///
+    /// Refused — the copy kept — wherever the move is not provably the lowering's
+    /// own write: a striped arena or one that does not bind whole
+    /// ([`Self::binds_whole_at_base_zero`], whose bind window the move could leave
+    /// covering a different range), a cache whose own write is ordered after the
+    /// producer's (an input/parameter/constant is uploaded once, but a computed
+    /// cache's step writes the whole span and would overwrite the row the copy
+    /// would have re-written at the append), a producer that is an
+    /// input/parameter/constant (its bytes are uploaded, not written by a step in
+    /// this byte space), a row whose actual length is not exactly one row of the
+    /// cache operand (a shorter one leaves bytes the copy would have moved, a longer
+    /// one reaches the next row), a destination outside the cache's storage, two
+    /// appends naming one producer, a node ordered between the producer and the
+    /// append that reads the cache's storage root or a view of it (the move puts the
+    /// row there in the producer's dispatch, so such a reader would see the row the
+    /// copy would have written later), and any other append whose destination
+    /// interval overlaps this one's — one row cannot hold both writers, so a pair
+    /// keeps both copies whichever of the two another term would also refuse. That
+    /// last test is taken in the cache's own byte space, so it covers duplicate
+    /// positions, appends disagreeing on `axis` and appends on differently shaped
+    /// views of one storage root by one rule instead of three.
+    ///
+    /// Both order tests rest on `graph.nodes()` being topologically ordered — an
+    /// invariant `Graph` keeps as it is built, and the one `rlx_ir::verify` reports
+    /// as "graph is not a DAG" — with the lowering emitting a node's steps where it
+    /// stands in that walk, so a lower id writes and reads earlier.
+    fn place_kv_rows_in_place(&mut self, graph: &Graph, max_binding: u64) -> usize {
+        if !self.binds_whole_at_base_zero(max_binding) {
+            return 0;
+        }
+        let aliases = rlx_compile::memory::collect_view_aliases(graph);
+        // Every append's destination interval — its storage root, start and row
+        // width — and every node that reads a cache root: both over the whole graph,
+        // before any other term, because an append that keeps its copy writes the
+        // same bytes and a reader sees them wherever it stands, so neither is a
+        // property of the move alone.
+        let mut dests: HashMap<NodeId, (NodeId, usize, usize)> = HashMap::new();
+        let mut readers: HashMap<NodeId, Vec<u32>> = HashMap::new();
+        for node in graph.nodes() {
+            for input in &node.inputs {
+                let root = storage_root(graph, graph.node(*input)).id;
+                readers.entry(root).or_default().push(node.id.0);
+            }
+            let Op::KvAppend { axis, pos } = node.op else {
+                continue;
+            };
+            // An append the plan elided has no destination and writes nothing.
+            let Some(&base) = self.offsets.get(&node.id) else {
+                continue;
+            };
+            let row_bytes = kv_row_bytes(&graph.node(node.inputs[0]).shape, axis);
+            let dst = kv_row_dst(base, pos, row_bytes);
+            let root = storage_root(graph, graph.node(node.inputs[0])).id;
+            dests.insert(node.id, (root, dst, row_bytes));
+        }
+        // root → where its slot would move; `None` once two appends name it.
+        let mut wanted: HashMap<NodeId, Option<usize>> = HashMap::new();
+        for node in graph.nodes() {
+            let Op::KvAppend { .. } = node.op else {
+                continue;
+            };
+            let cache = graph.node(node.inputs[0]);
+            let cache_root = storage_root(graph, cache);
+            let row = storage_root(graph, graph.node(node.inputs[1]));
+            // The cache's storage must have no *later* writer. An input,
+            // parameter or constant is uploaded once and never rewritten; a
+            // computed cache is admitted only when its own step precedes the
+            // producer's — node order is step order, because the lowering walks
+            // `graph.nodes()` and pushes a node's steps where it stands — so its
+            // bytes are already there when the producer writes the row. Deliberately
+            // wider than "an input or parameter only": the predictor's plane caches
+            // are `Concat`-seeded, and the strict rule was measured on the synthesis
+            // cell by rebuilding with it and alternating the two binaries — the
+            // predictor frame 36.87 → 37.37/37.53 ms, +0.9–1.2 % of the loop. A step
+            // between the cache's write and the producer would overwrite the row in
+            // the producer's slot, which the copy, emitted at the append, would have
+            // survived — hence the order term. Nothing else writes a cache's span:
+            // every node above it is a pure view, and an append writes one row (the
+            // interval refusal below). A step the backend hosts instead is
+            // deferred past *both* forms alike, so it is not this term's business.
+            let cache_writer = !matches!(
+                cache_root.op,
+                Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+            );
+            if cache_writer && cache_root.id.0 > row.id.0 {
+                continue;
+            }
+            if matches!(
+                row.op,
+                Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
+            ) || cache.id == row.id
+            {
+                continue;
+            }
+            // The destination and width the pre-pass computed for this append, so
+            // the two passes cannot disagree about either. Every lookup here can
+            // miss: an elided view has no slot, a parked operand lives in the
+            // weight buffer's tagged byte space. A miss is a refusal, not a panic.
+            let Some(&(_, dst, row_bytes)) = dests.get(&node.id) else {
+                continue;
+            };
+            if !self.offsets.contains_key(&row.id) {
+                continue;
+            }
+            // One destination, or the copy stays. Any other append whose interval
+            // inside the same cache root overlaps this one is a second writer of the
+            // same bytes, so neither may be elided — whatever view, axis or position
+            // produced the interval. This append's own entry is the one counted.
+            let unique = dests
+                .values()
+                .filter(|(root, lo, rb)| {
+                    *root == cache_root.id && *lo < dst + row_bytes && dst < lo + rb
+                })
+                .count()
+                == 1;
+            // Nothing between the producer's step and the append's may read the
+            // cache: it would see the row early.
+            let unread = !readers
+                .get(&cache_root.id)
+                .is_some_and(|ids| ids.iter().any(|id| *id > row.id.0 && *id < node.id.0));
+            let Some((cache_lo, cache_hi)) = self.storage_span(graph, node.inputs[0]) else {
+                continue;
+            };
+            if !unique
+                || !unread
+                || self.lens.get(&row.id).copied() != Some(row_bytes)
+                || (dst as u64) < cache_lo
+                || dst as u64 + row_bytes as u64 > cache_hi
+            {
+                continue;
+            }
+            match wanted.get_mut(&row.id) {
+                Some(slot) => *slot = None,
+                None => {
+                    wanted.insert(row.id, Some(dst));
+                }
+            }
+        }
+        let mut moved = 0;
+        for (root, target) in wanted {
+            let Some(new_off) = target else { continue };
+            for (id, (alias_root, off)) in &aliases {
+                if *alias_root == root {
+                    self.offsets.insert(*id, new_off + off);
+                }
+            }
+            self.offsets.insert(root, new_off);
+            moved += 1;
+        }
+        moved
+    }
+
     /// Whether this node's f16 mirror fits in the capped f16 shadow buffer.
     pub fn param_fits_f16_mirror(&self, id: NodeId) -> bool {
         let Some(f16) = &self.f16_buffer else {
@@ -2067,10 +2354,9 @@ impl Arena {
         f16_off.saturating_add(f16_bytes) <= f16.size() as usize
     }
 
-    /// Override the actual data length (in bytes) for a node. The
-    /// backend calls this after planning to record true elem*4 sizes
-    /// instead of the alignment-padded slot sizes.
-    pub fn set_actual_len(&mut self, id: NodeId, bytes: usize) {
+    /// Override the actual data length (in bytes) for a node — what the node
+    /// writes, rather than the alignment-padded slot the plan reserved.
+    pub(crate) fn set_actual_len(&mut self, id: NodeId, bytes: usize) {
         self.lens.insert(id, bytes);
     }
 

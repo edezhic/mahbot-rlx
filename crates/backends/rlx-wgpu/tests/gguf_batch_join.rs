@@ -128,16 +128,18 @@
 //! step at 838.137 — the CPU `|out|` for the one-row graph — so "the debugging path
 //! sees drained data".
 //!
-//! Single test fn on purpose: the counters are process-global, so this file owns
-//! them and resets them per bracket, and it runs as its own test binary; the knobs
-//! it sets for itself are unset inside their bracket, and the guard at the top
-//! rejects the knobs that would change what a submission or a wait means.
+//! The two tests in this binary both bracket process-global counters, so both take
+//! `common::route_lock()`: one runs at a time, and neither resets a counter under
+//! the other. Each sets only its own knobs, unsets them inside its bracket, and the
+//! guard at the top rejects the ones that would change what a submission or a wait
+//! means.
 
 mod common;
 
 use common::{Q8_0_BISECT, RUN_REPORT_SWITCH, max_abs_diff};
+use rlx_ir::op::Activation;
 use rlx_ir::quant::QuantScheme;
-use rlx_ir::{DType, Graph, GraphExt, Op, Shape};
+use rlx_ir::{DType, Dim, Graph, GraphExt, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_wgpu::backend::WgpuExecutable;
 use rlx_wgpu::gguf_gpu::{reset_route_counts, route_counts};
@@ -189,6 +191,32 @@ fn packed_q8_0(k: usize, n: usize) -> Vec<u8> {
 /// Deterministic values for an `n`-element tensor or parameter.
 fn feed(n: usize, step: f32) -> Vec<f32> {
     (0..n).map(|i| ((i as f32) * step).sin()).collect()
+}
+
+/// The rebind fixture: `relu(dq(x) · w)` over `x: [Dynamic(0), k]` and a packed
+/// `[n, k]` Q8_0 weight — the 8-bit scheme's one-row arm at one row, with a `k`
+/// that is a whole number of its 32-element blocks. The relu is a second node so
+/// the output is not the raw multiply, and the row axis stays dynamic so every
+/// run's binding is the caller's to change.
+fn dynamic_row_packed_multiply(k: usize, n: usize) -> (Graph, Vec<u8>) {
+    let packed = packed_q8_0(k, n);
+    let mut g = Graph::new("wgpu_gguf_dynamic_row_rebind");
+    let x = g.input(
+        "x",
+        Shape::from_dims(&[Dim::Dynamic(0), Dim::Static(k)], DType::F32),
+    );
+    let w = g.param("w", Shape::new(&[packed.len()], DType::U8));
+    let out_shape = Shape::from_dims(&[Dim::Dynamic(0), Dim::Static(n)], DType::F32);
+    let y = g.add_node(
+        Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ8_0,
+        },
+        vec![x, w],
+        out_shape.clone(),
+    );
+    let out = g.activation(Activation::Relu, y, out_shape);
+    g.set_outputs(vec![out]);
+    (g, packed)
 }
 
 /// `dq → mm → dq → rv → mm`, at `m` rows: each packed multiply contracts over
@@ -569,6 +597,7 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
         eprintln!("skip: wgpu unavailable");
         return;
     }
+    let _route = common::route_lock();
 
     // A `const` so the list is one place. Mode mismatch, not a route defect: each
     // of these changes what a submission or a wait means for a forward pass, or
@@ -1335,4 +1364,100 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
              (counts not asserted on this adapter leg)"
         );
     }
+}
+
+/// A packed multiply's one-row arm survives the row axis being rebound. The setup
+/// cache that arm dispatches from is keyed by the record, the arm and the three
+/// arena windows — no buffer identity — so an entry left over from an earlier
+/// compile is served against that compile's arena (keeping it alive), and the
+/// live arena's output slot is never written. Three runs through one executable at
+/// `1, 4, 1` rows: the third binding is the first run's, so its windows are the
+/// first run's and a surviving entry is hit. Each run is compared against the same
+/// graph on `Device::Cpu`, whose deferred executable performs the same rebinds.
+///
+/// The same three runs pin the deferred param replay: while a graph is unresolved
+/// `set_param_bytes` only buffers, so a replay left buffered would leave every
+/// fresh arena's weight slot unwritten.
+#[test]
+fn a_packed_multiply_survives_rebinding_the_dynamic_row_axis() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
+        eprintln!("skip: wgpu unavailable");
+        return;
+    }
+    // The route counters are process-global, and the counter pin above brackets
+    // them; one of the two tests in this binary at a time.
+    let _route = common::route_lock();
+    const K: usize = 1024;
+    const N: usize = 1024;
+    let (graph, w_bytes) = dynamic_row_packed_multiply(K, N);
+    let packed = vec![("w", w_bytes)];
+    let mut cpu = build(Device::Cpu, &graph, &packed, &[]);
+    let mut exe = WgpuExecutable::compile(graph);
+    exe.set_param_bytes("w", &packed[0].1);
+    // The third row differs from the first while its binding does not.
+    let cases: [(usize, Vec<f32>, &str); 3] = [
+        (1, feed(K, 0.023), "A"),
+        (4, feed(4 * K, 0.017), "B"),
+        (1, feed(K, 0.031), "C"),
+    ];
+    for (i, (m, row, label)) in cases.iter().enumerate() {
+        if i == 0 {
+            reset_route_counts();
+        }
+        let got = exe.run(&[("x", row)]).remove(0);
+        if i == 0 {
+            // The premise: the first run is the tiled one-row arm, not a host read
+            // and not an arm that has no setup cache to survive.
+            let routes = route_counts();
+            assert_eq!(
+                (routes.per_row, routes.host),
+                (1, 0),
+                "the one-row multiply must take the tiled arm's per-row route: {routes:?}"
+            );
+        }
+        let want = cpu.run(&[("x", row)]).remove(0);
+        let abs = max_abs_diff(&got, &want);
+        eprintln!("[rlx-gguf-join] rebind run {label} (m={m}): max_abs={abs:.6e}");
+        assert!(
+            abs <= TOL,
+            "rebind run {label} at {m} row(s): max_abs {abs} > {TOL} — the packed \
+             multiply did not read the arena this rebind compiled"
+        );
+        assert!(
+            got.iter().fold(0.0f32, |v, e| v.max(e.abs())) > 0.0,
+            "rebind run {label} at {m} row(s) is all zeros — its output slot was \
+             never written"
+        );
+    }
+
+    // A weight written at the binding the executable already holds: no rebind runs,
+    // so the write is the buffered kind — the one a deferred executable only lands
+    // through the replay. The last run's values are the reference it must leave.
+    let (last_m, last_row, _) = &cases[2];
+    let before = exe.run(&[("x", last_row)]).remove(0);
+    let mut w2 = packed[0].1.clone();
+    for b in w2.iter_mut().skip(2).step_by(34) {
+        *b = b.wrapping_add(1);
+    }
+    exe.set_param_bytes("w", &w2);
+    let after = exe.run(&[("x", last_row)]).remove(0);
+    let (ref_graph, _) = dynamic_row_packed_multiply(K, N);
+    let mut cpu2 = build(Device::Cpu, &ref_graph, &[("w", w2)], &[]);
+    let want2 = cpu2.run(&[("x", last_row)]).remove(0);
+    let moved = max_abs_diff(&before, &after);
+    let abs = max_abs_diff(&after, &want2);
+    eprintln!(
+        "[rlx-gguf-join] same-binding weight write at m={last_m}: moved={moved:.6e} \
+         max_abs={abs:.6e}"
+    );
+    assert!(
+        moved > 1e-3,
+        "a weight written at an unchanged binding left the output bit-identical \
+         (moved {moved:.6e}) — the buffered param never reached the arena"
+    );
+    assert!(
+        abs <= TOL,
+        "same-binding weight write at m={last_m}: max_abs {abs} > {TOL} — the run \
+         used the weight the executable was compiled with, not the one written since"
+    );
 }

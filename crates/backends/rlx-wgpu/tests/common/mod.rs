@@ -22,7 +22,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use rlx_wgpu::backend::ATTENTION_DECOMPOSE_MIN_Q;
-use rlx_wgpu::kernels::{ATTENTION_DECODE_MIN_KEYS, AttentionRoutes};
+use rlx_wgpu::kernels::AttentionRoutes;
 
 /// A deterministic `[m, k]` row-major activation, at `step`'s ramp rate. `step`
 /// stays the caller's because it sets the result's magnitude, which a parity
@@ -210,9 +210,11 @@ pub fn fill(n: usize, mul: usize, add: usize, modu: usize, scale: f32, bias: f32
         .collect()
 }
 
-/// The conv the two convolution-route harnesses measure: one unit-height 1-D
+/// The conv the convolution-route harnesses measure — `conv_gemm_coop_f32.rs`,
+/// `conv_routes_parked_weight.rs` and `conv1d_implicit.rs`: one unit-height 1-D
 /// conv, input `[1, c_in, 1, l]`, weight `[c_out, c_in, 1, k]`, kernel `[1, k]`,
-/// padding `[0, p]`, stride `[1, 1]`, `groups = 1`, output `[1, c_out, 1, l]`.
+/// padding `[0, p]`, stride `[1, 1]`, dilation `[1, dilation]`, `groups = 1`,
+/// output `[1, c_out, 1, l]`.
 pub fn unit_conv_graph(
     name: &str,
     c_in: usize,
@@ -220,6 +222,7 @@ pub fn unit_conv_graph(
     l: usize,
     k: usize,
     p: usize,
+    dilation: usize,
 ) -> rlx_ir::Graph {
     let mut g = rlx_ir::Graph::new(name);
     let x = g.input(
@@ -230,7 +233,7 @@ pub fn unit_conv_graph(
         "w",
         rlx_ir::Shape::new(&[c_out, c_in, 1, k], rlx_ir::DType::F32),
     );
-    let y = g.conv2d(x, w, [1, k], [1, 1], [0, p], [1, 1], 1);
+    let y = g.conv2d(x, w, [1, k], [1, 1], [0, p], [1, dilation], 1);
     g.set_outputs(vec![y]);
     g
 }
@@ -330,7 +333,7 @@ pub fn refuse_under_run_report() {
 /// once for every harness here that re-execs a child (`run_report.rs`,
 /// `hosted_audio_step_placement.rs`); `buffer_copy_batch_join.rs` guards the same
 /// routing set with an assertion instead of clearing it.
-pub const CLEARED_SWITCHES: [&str; 20] = [
+pub const CLEARED_SWITCHES: [&str; 29] = [
     "RLX_WGPU_SNAPSHOT",
     "RLX_BENCH_DISPATCH_ONLY",
     "RLX_WGPU_ALL_PARAMS_WEIGHT",
@@ -339,6 +342,8 @@ pub const CLEARED_SWITCHES: [&str; 20] = [
     "RLX_WGPU_CONCAT_HOST",
     "RLX_WGPU_FORCE_HOST",
     "RLX_WGPU_HOST_MATMUL",
+    "RLX_WGPU_HOST_NORM",
+    "RLX_WGPU_GPU_NORM",
     "RLX_WGPU_DISCRETE_HOST",
     "RLX_WGPU_SHARD_CAP_MIB",
     "RLX_WGPU_SHARD_STAGE_MIB",
@@ -349,31 +354,47 @@ pub const CLEARED_SWITCHES: [&str; 20] = [
     "RLX_WGPU_MAX_BIND_MB",
     Q1_0_BISECT,
     Q8_0_BISECT,
+    "RLX_WGPU_GEMV_WIDE",
+    "RLX_WGPU_GEMV_IN_PLACE",
+    "RLX_WGPU_GEMV_ILP",
+    "RLX_WGPU_GEMV_POOL",
     "RLX_WGPU_TRANSPOSE_HOST",
+    "RLX_WGPU_NO_SNAKE_BETA",
+    "RLX_WGPU_CONV_IM2COL",
+    "RLX_WGPU_CONV_IMPLICIT",
     RUN_REPORT_SWITCH,
 ];
 
 /// The arrangement every layer of a many-layer attention chain is expected to
-/// take: one query row over more than `ATTENTION_DECODE_MIN_KEYS` keys is the
-/// decode-shaped form, one query row anywhere else keeps the fused/serial
-/// kernel, and from the route's query-row floor up it takes the dense
-/// arrangement. `layers` attention steps per run, over `reps` runs, so the
-/// counters it predicts are the whole bracket.
+/// take: a single query row is the decode-shaped form whatever its key count
+/// and whatever the caller's harness geometry, and from the route's query-row
+/// floor up it takes the dense arrangement (below that floor, and for a head
+/// wider than the decode form holds, the fused/serial kernel). `layers`
+/// attention steps per run, over `reps` runs, so the counters it predicts are
+/// the whole bracket.
 ///
 /// The shape decides which arrangement the route is *asked for*; the arm's
 /// window term (`attention_window_declines`, whose count tells that decline
 /// apart from the shape's own answer) can still keep the fused kernel, and a
 /// harness on an adapter where it does fails this expectation loudly rather
-/// than skipping. The head widths a harness uses must clear
-/// `attention_decode_eligible`'s caps for the decode arm to apply; the two
-/// harnesses here run 8 heads × 64 and 16 × 128, both inside the cap.
+/// than skipping. This is the route's one spelling: the decode term is
+/// [`rlx_wgpu::kernels::attention_decode_eligible`] itself, called with the
+/// harness's own extents, so a caller cannot re-derive that half and pass a bare
+/// `true` after the geometry outgrew the cap.
 pub fn expected_attention_routes(
     rows: usize,
     lk: usize,
+    head_dim: usize,
+    v_head_dim: usize,
     layers: usize,
     reps: usize,
 ) -> AttentionRoutes {
-    let per_run = if rows == 1 && lk > ATTENTION_DECODE_MIN_KEYS as usize {
+    let per_run = if rlx_wgpu::kernels::attention_decode_eligible(
+        rows as u32,
+        lk as u32,
+        head_dim as u32,
+        v_head_dim as u32,
+    ) {
         AttentionRoutes {
             decode: layers as u64,
             decomposed: 0,

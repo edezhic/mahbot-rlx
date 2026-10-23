@@ -91,7 +91,7 @@ impl WgpuExecutable {
             crate::coop_f16_vk::refresh_wide_b_flag(&mut self.coop_f16_vk_wide_b, name, data);
         }
         if self.unresolved.is_some() {
-            self.pending_params.insert(name.to_string(), data.to_vec());
+            self.buffer_pending_param(name, data);
             return;
         }
         let dev = wgpu_device().expect("rlx-wgpu: device gone");
@@ -102,6 +102,20 @@ impl WgpuExecutable {
         }
     }
 
+    /// Buffer an f32 param for the replay. The dirty mark is set here, with the
+    /// insert, so no further buffering path can land a param without it.
+    fn buffer_pending_param(&mut self, name: &str, data: &[f32]) {
+        self.pending_params.insert(name.to_string(), data.to_vec());
+        self.pending_params_dirty = true;
+    }
+
+    /// [`buffer_pending_param`](Self::buffer_pending_param) for packed bytes.
+    fn buffer_pending_param_bytes(&mut self, name: &str, data: &[u8]) {
+        self.pending_param_bytes
+            .insert(name.to_string(), data.to_vec());
+        self.pending_params_dirty = true;
+    }
+
     /// Upload raw bytes for a Param. The bytes land tight-packed at
     /// the param's slot offset — no f32 round-trip. Used for quantized
     /// weights (int8 / int4) where the kernel reads the byte stream
@@ -109,8 +123,7 @@ impl WgpuExecutable {
     pub fn set_param_bytes(&mut self, name: &str, data: &[u8]) {
         self.invalidate_static_weight_packs();
         if self.unresolved.is_some() {
-            self.pending_param_bytes
-                .insert(name.to_string(), data.to_vec());
+            self.buffer_pending_param_bytes(name, data);
             return;
         }
         let dev = wgpu_device().expect("rlx-wgpu: device gone");

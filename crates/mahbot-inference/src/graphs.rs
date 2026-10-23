@@ -1302,11 +1302,18 @@ pub fn plane_feed_moves(layers: usize) -> usize {
 }
 
 /// The plane cache's output order is `hidden`, one K row and one V row per
-/// layer, then the logits. A step reads the hidden row and the logits; the
-/// `2 · layers` cache rows are fed device-side rather than returned to the
-/// host, so one host return carries the step's answer.
+/// layer, then the logits. A talker step reads the hidden row (its next frame's
+/// input) and the logits; a recognition decode reads only the logits, because its
+/// next input is the sampled token's embedding rather than this row — it passes
+/// [`plane_step_logits`] alone. The `2 · layers` cache rows are fed device-side
+/// rather than returned to the host, so one host return carries the step's answer.
 pub fn plane_step_reads(layers: usize) -> [usize; 2] {
-    [0, 1 + plane_feed_moves(layers)]
+    [0, plane_step_logits(layers)]
+}
+/// Where the logits sit in a plane-cache step's outputs — the one read a step that
+/// does not continue from its own hidden row needs.
+pub fn plane_step_logits(layers: usize) -> usize {
+    1 + plane_feed_moves(layers)
 }
 
 /// The full output count of a plane-cache body: the hidden row, the `2 · layers`
@@ -1616,15 +1623,21 @@ impl DacStage {
         let w = emit::conv_param(ctx, &self.model, name)?;
         // The decoder is causal: the reference prepends `k-1` left samples and
         // never pads on the right. The old symmetric `pad` changed every sample
-        // after the first kernel, not just the edge.
-        let x = emit::pad_axis(ctx, x, 4, 3, pad, 0, rlx_ir::op::PadMode::Constant(0.0));
+        // after the first kernel, not just the edge. It is the conv's own padding
+        // rather than a materialised zero pad in front of it: every route that reads
+        // this conv reads the padding out of its own gather, so the copy is a whole
+        // activation pass per conv and nothing more.
+        //
+        // The declared extent is a deliberate truncation: the right pad of that
+        // symmetric field is never emitted, and every route takes the extent from
+        // this node's shape and reads `padding` as a left origin.
         let nchw = emit::conv2d_dilated(
             ctx,
             x,
             w,
             [1, k],
             [1, 1],
-            [0, 0],
+            [0, pad],
             [1, dilation],
             groups,
             Shape::new(&[1, cout, 1, l], DType::F32),
@@ -2848,6 +2861,11 @@ impl Runner {
         self.session.set_sample_seeds(seeds)
     }
 
+    /// The step kinds of the schedule this graph compiled to, in emission order.
+    pub fn schedule_step_names(&self) -> Option<Vec<&'static str>> {
+        self.session.schedule_step_names()
+    }
+
     /// One pass with new inputs — the same compiled buffers, refilled.
     pub fn run(&mut self, inputs: &[(String, Vec<f32>)]) -> Vec<Vec<f32>> {
         let ins: Vec<(&str, &[f32])> = inputs
@@ -3127,10 +3145,13 @@ impl LayerStage for LcToNchwStage {
 }
 
 /// How the sound half is cut into graphs.
-/// The arena is a graph's, so the cut follows the planned sizes at a
-/// part's window (72 frames): the front and the codec's first four stages plan
-/// 0,7 GiB, stages 4–5 2,7, stages 6–7 3,0 — each under the backend's 4 GiB
-/// binding, and three graphs instead of nine.
+/// The arena is a graph's, so the cut follows the planned sizes at the window the
+/// sound half actually runs (`synth::DAC_WINDOW`, 144 frames — twice what this cut
+/// was first drawn at): the front and the codec's first four stages,
+/// stages 4–5, stages 6–7 — three graphs instead of nine. A group whose plan
+/// outgrew the backend's per-binding limit would show up as host routing or arena
+/// striping in the stand's per-phase `arena` column, which is what the window's
+/// own measurement is read against.
 pub fn codec_groups() -> Vec<std::ops::Range<usize>> {
     vec![0..4, 4..6, 6..DAC_STAGES]
 }

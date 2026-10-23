@@ -53,12 +53,16 @@ pub const TTS_REPEAT_PENALTY: f32 = 1.05;
 /// as the whole part away from the edges, and the planned arena — which is a
 /// graph's — shrinks with the window instead of being the part's.
 ///
-/// The window is 72 frames, the front's own chunk ([`FRONT_WINDOW`]): every
+/// The window is 144 frames — two of the front's chunks ([`FRONT_WINDOW`]): every
 /// window runs its graph over every frame in it, so a longer window is fewer
-/// graph runs over the same frames. Its figures are in `MEASUREMENTS.md`.
+/// graph runs over the same frames, each convolution at twice the columns and for
+/// twice the frames. The measurement is the record's (three windows a group
+/// instead of five, the same waveform digest, peak unmoved); doubling again is the
+/// same curve's next step and is not taken, because the arena grows with the
+/// window.
 ///
 /// Shared with the stand.
-pub(crate) const DAC_WINDOW: usize = 72;
+pub(crate) const DAC_WINDOW: usize = 144;
 /// The wave transformer's own window: the front is cut at this many frames so
 /// its output does not depend on the part's total length.
 ///
@@ -66,9 +70,7 @@ pub(crate) const DAC_WINDOW: usize = 72;
 pub(crate) const FRONT_WINDOW: usize = 72;
 /// Frames of margin on each side, clipped at the part's own edges: the four DAC
 /// blocks' kernels and strides reach this far into a window, so a core sample
-/// never reads a window edge the part does not have. The first window's span is
-/// the front's chunk, so a window narrower than [`FRONT_WINDOW`] keeps the
-/// difference as its right margin.
+/// never reads a window edge the part does not have.
 ///
 /// Shared with the stand.
 pub(crate) const DAC_MARGIN: usize = 4;
@@ -223,14 +225,12 @@ pub(crate) fn windows(
     window: usize,
     margin: usize,
 ) -> Vec<(usize, usize, usize, usize)> {
-    // The first window's span is the front's chunk, so a wider window would push
-    // its core past the span the first part's graph is built for.
-    debug_assert!(window <= FRONT_WINDOW);
+    debug_assert!(margin < window);
     let mut v = Vec::new();
     let mut a = 0;
     if rows > 0 {
         let b = window.min(rows);
-        v.push((0, FRONT_WINDOW.min(rows), 0, b));
+        v.push((0, (b + margin).min(rows), 0, b));
         a = b;
     }
     while a < rows {
@@ -784,5 +784,57 @@ impl Synthesis {
             ));
         }
         Ok(wave)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::windows;
+
+    /// The codec's windows tile the part: every frame falls in exactly one core, a
+    /// core sits inside its padded span, no span leaves the part or reaches more
+    /// than one margin past its core — and the first window's span is the window
+    /// plus a margin, not the front's chunk, which is what lets a window wider than
+    /// [`super::FRONT_WINDOW`] run at all.
+    #[test]
+    fn the_codec_windows_tile_the_part_and_clip_at_its_edges() {
+        for (rows, window, margin) in [
+            (0usize, 144usize, 4usize),
+            (1, 144, 4),
+            (144, 144, 4),
+            (145, 144, 4),
+            (330, 144, 4),
+            (200, 72, 4),
+            (7, 3, 0),
+        ] {
+            let v = windows(rows, window, margin);
+            for w in v.windows(2) {
+                assert_eq!(
+                    w[0].3, w[1].2,
+                    "rows={rows}: a core starts where the last ended"
+                );
+            }
+            for &(p0, p1, a, b) in &v {
+                assert!(
+                    p0 <= a && a < b && b <= p1 && p1 <= rows,
+                    "rows={rows}: core {a}..{b} is not inside its span {p0}..{p1}"
+                );
+                assert!(
+                    p0 + margin >= a && p1 - p0 <= window + 2 * margin,
+                    "rows={rows}: span {p0}..{p1} reaches past its core's margin"
+                );
+            }
+            let covered: Vec<(usize, usize)> = v.iter().map(|w| (w.2, w.3)).collect();
+            assert!(
+                covered.is_empty() || (covered[0].0 == 0 && covered[covered.len() - 1].1 == rows),
+                "rows={rows}: the cores cover the part"
+            );
+        }
+        // The part's own shape: three windows, the first padded forward past the
+        // front's 72-frame chunk.
+        assert_eq!(
+            windows(330, 144, 4),
+            vec![(0, 148, 0, 144), (140, 292, 144, 288), (284, 330, 288, 330)]
+        );
     }
 }

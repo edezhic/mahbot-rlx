@@ -4,9 +4,9 @@
 
 //! **Measurement only, `#[ignore]`d — prints, never asserts a time.**
 //!
-//! The accelerated conv routes — im2col+GEMM, the mirrored 1-D tiled relabel and the
-//! 1×1 pointwise GEMM — are on by default under one switch (`RLX_WGPU_CONV_IM2COL`;
-//! `=0` restores the plain routing). This harness is the marginal-cost evidence for
+//! The accelerated conv routes — im2col+GEMM, the mirrored 1-D tiled relabel, the
+//! 1×1 pointwise GEMM and the cooperative implicit GEMM — are on by default under one
+//! switch (`RLX_WGPU_CONV_IM2COL`; `=0` restores the plain routing). This harness is the marginal-cost evidence for
 //! that flip over the decoder-body conv shapes the forward-parity suite pins
 //! (`conv2d_groups_parity.rs`; the dilated narrow row below is that suite's case of the
 //! same name), over one dilated mirrored shape the relabel has to carry and one it must
@@ -36,7 +36,8 @@
 //! no `im2col_gpu` step, that a graph whose convolutions never qualify keeps its plan
 //! *and* its arena under both arms, every row's arena growth (see `expected_col_delta`
 //! for the recorded deltas and `backend::conv_route_decision_tests` for the arithmetic
-//! under them), and that a shape-qualifying conv pays its reservation, parked or not.
+//! under them), and that a shape-qualifying conv outside the implicit route's class pays
+//! its reservation, parked or not.
 //!
 //! The rows whose predecessor route was the direct kernel — the three long-standing
 //! `Conv2d` rows, `entry-l100`, `refuse-height-pad` and the strided band row this default
@@ -560,6 +561,7 @@ impl Arm {
 /// names is present, and `conv1x1_gemm` doubles as the route's GEMM step.
 fn conv_route(counts: &BTreeMap<&'static str, usize>) -> &'static str {
     for r in [
+        "conv1d_implicit",
         "im2col_gpu",
         "conv2d_tiled",
         "conv1x1_gemm",
@@ -599,17 +601,25 @@ fn expected_routes(family: &str, label: &str) -> (&'static str, &'static str) {
         ) => ("conv2d", "im2col_gpu"),
         // The dense body rows: `entry-l100` sits exactly on the 100 im2col spatial
         // floor — the boundary row for it now that the floor is inclusive there and
-        // `dense-l800`'s 800 is far inside it.
-        (_, "dense-l800" | "dense-l4000" | "dense-l16000" | "dense-l48000" | "entry-l100") => {
+        // `dense-l800`'s 800 is far inside it. The three wider dense rows (768, 384 and
+        // 192 channels) are past the implicit route's 96-channel cap, so the accelerated
+        // route they take is still the materialised one.
+        (_, "dense-l800" | "dense-l4000" | "dense-l16000" | "entry-l100") => {
             ("conv2d", "im2col_gpu")
         }
+        // …and `dense-l48000` is the implicit route's own class — unit height, 96
+        // channels either way, well past the route's extent floor — so it is the dense
+        // row the implicit route moves off the materialised one.
+        (_, "dense-l48000") => ("conv2d", "conv1d_implicit"),
         // The two rows this floor takes off the relabel, one carrying the dilation axis
         // and the other the refusal; the `-narrow-c32` rows carry both on the relabel and
         // on the direct kernel at the shipped default (see their table comments).
         (_, "mirror-dilated-d2" | "refuse-height-pad") => ("conv2d", "im2col_gpu"),
-        // `mirror-projection` and `mirror-strided-s2` clear the spatial floor but
-        // not the `c_out` floor, so they still carry the mirrored relabel; the dilated
-        // narrow row is the same geometry as `mirror-dilated-d2` under that floor.
+        // `mirror-projection` is a unit-height 96 → 1 conv — the decoder block's own
+        // projection stage — and its output is narrower than the narrowest the implicit
+        // entry takes, so it keeps the mirrored relabel. `mirror-strided-s2` carries a
+        // stride of 2, which the class refuses on `sw`; the dilated narrow row is the
+        // same geometry as `mirror-dilated-d2` under the im2col channel floor.
         (_, "mirror-projection" | "mirror-strided-s2" | "mirror-dilated-narrow-c32") => {
             ("conv2d", "conv2d_tiled")
         }
@@ -838,15 +848,16 @@ fn fmt_delta(d: f32) -> String {
 /// fixture cannot assert nothing.
 fn expected_col_delta(label: &str) -> u64 {
     match label {
-        // 129 024 000 B col − 64 MiB, the body's largest.
-        "dense-l48000" => 61_915_136,
         // 86 016 000 B col − 64 MiB.
         "dense-l16000" => 18_907_136,
         // 92 160 000 B col − 64 MiB, the in-band 2-D map.
         "map-5x5-30x30-c1024" => 25_051_136,
-        // Nothing to reserve — the col fits the 64 MiB base tail, or the shape's gates
-        // leave it off every accelerated route and no col is asked of it at all.
-        "dense-l800"
+        // Nothing to reserve — the col fits the 64 MiB base tail, the shape's gates
+        // leave it off every accelerated route and no col is asked of it at all, or the
+        // implicit route takes the shape and the reservation subtracts its class
+        // (`conv_im2col_col_elems`), which a class row pays nothing for.
+        "dense-l48000"
+        | "dense-l800"
         | "dense-l4000"
         | "map-3x3-29x29-c32"
         | "map-3x3-40x40"
@@ -928,10 +939,17 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         rlx_ir::env::set(key, "0");
     }
     rlx_ir::env::set("RLX_WGPU_SHARD_CAP_MIB", "1048576");
+    // The implicit route's own switch, so an exported `=0` cannot decide a row this
+    // harness pins; the adapter term under it is read once, below.
+    rlx_ir::env::set("RLX_WGPU_CONV_IMPLICIT", "1");
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;
     }
+    // Every row below is pinned by shape except the implicit class's one, which the
+    // adapter decides — so the reading says which adapter it holds for.
+    let implicit_available = rlx_wgpu::device::wgpu_device()
+        .is_some_and(|d| rlx_wgpu::kernels::conv1d_implicit_supported(&d.device));
     common::refuse_under_run_report();
     let device = rlx_wgpu::device::adapter_name().unwrap_or_else(|| "wgpu".into());
     eprintln!(
@@ -963,7 +981,12 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         for shape in shapes {
             let one = build_family(family, std::slice::from_ref(shape));
             let pair = measure_pair(shape.label, &one);
-            let (want_off, want_on) = expected_routes(family, shape.label);
+            let (want_off, mut want_on) = expected_routes(family, shape.label);
+            if want_on == "conv1d_implicit" && !implicit_available {
+                // The class is stated by shape, the route by this adapter's entry:
+                // where it cannot be built the row keeps the relabel it came from.
+                want_on = "conv2d_tiled";
+            }
             assert_eq!(
                 conv_route(&pair.off_counts),
                 want_off,
@@ -1131,7 +1154,12 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     // Conv1x7 family's arena grows by the largest col alone rather than by the sum of
     // them. This is also the arm where `im2col_fallbacks()` is non-zero; the count is
     // printed here, and `conv_routes_parked_weight.rs` asserts both of its arms.
-    let big = row(&CONV1X7, "dense-l48000");
+    //
+    // `dense-l16000` carries the over-the-base col here rather than `dense-l48000`: the
+    // latter is the implicit route's class, its panel reservation is subtracted, and a
+    // parked weight only moves it from one no-panel route to another — the pairing this
+    // arm exists for needs a shape the reservation still books.
+    let big = row(&CONV1X7, "dense-l16000");
     // The row this default moves: its col reservation is new — before the move the shape
     // took the direct kernel and reserved nothing — and it still costs the arena nothing
     // because its col leaves the 64 MiB base scratch alone (`dense-l800` keeps the

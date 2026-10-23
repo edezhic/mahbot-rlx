@@ -116,6 +116,34 @@ impl WgpuExecutable {
         self.arena.size as u64
     }
 
+    /// Test hook: convs whose shape is the cooperative implicit-GEMM route's class
+    /// but which kept the im2col/tiled/direct routing, for one of the terms the
+    /// shape does not settle (see the field of the same name). Zero on a graph whose
+    /// class-shaped convs all took the route.
+    #[doc(hidden)]
+    pub fn test_conv1d_implicit_declines(&self) -> usize {
+        self.conv1d_implicit_declines
+    }
+
+    /// Test hook: bytes of im2col panel the cooperative implicit-GEMM route
+    /// removed from this schedule — `k_total · out_len · 4` for every conv it
+    /// took, which is the scratch the im2col route would have written and read
+    /// back. Zero when the route took nothing of this graph.
+    #[doc(hidden)]
+    pub fn test_conv_panel_bytes(&self) -> u64 {
+        self.schedule
+            .iter()
+            .filter_map(|s| match s {
+                Step::Conv1dImplicit { params } => Some(
+                    params.k_total as u64
+                        * params.out_len as u64
+                        * std::mem::size_of::<f32>() as u64,
+                ),
+                _ => None,
+            })
+            .sum()
+    }
+
     /// Test hook: every step in the schedule is marked safe for the
     /// active-extent (bucketed/padded decode) path. A step that is not
     /// silently vetoes that optimisation for the whole graph.

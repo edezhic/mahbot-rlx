@@ -184,6 +184,23 @@ pub fn device() -> String {
     )
 }
 
+/// The adapter's driver: `AdapterInfo`'s `driver` and `driver_info`, which only
+/// the Vulkan HAL fills — wgpu's Metal HAL reports neither, and the backend keeps
+/// that as `None`, so the line says `unknown` rather than printing an empty
+/// value. On Vulkan this is the driver's name and its version, which is what a
+/// figure taken on that machine has to be read against.
+#[must_use]
+pub fn driver() -> String {
+    rlx_wgpu::device::wgpu_device().map_or_else(
+        || "no wgpu adapter".to_string(),
+        |device| match (device.driver.as_deref(), device.driver_info.as_deref()) {
+            (Some(driver), Some(info)) => format!("{driver} {info}"),
+            (Some(driver), None) => driver.to_string(),
+            (None, _) => "unknown".to_string(),
+        },
+    )
+}
+
 /// `release` or `debug`.
 #[must_use]
 pub fn profile() -> String {

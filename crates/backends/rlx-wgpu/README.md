@@ -87,8 +87,20 @@ kernels, pure Rust deps — no FFI, no submodules.
   windowed kernels for Q4_K/Q6_K/Q1_0 (scratch-free, shard-safe). At `m == 1`
   Q4_K/Q6_K/Q8_0 take a tiled per-row GEMV arm (one workgroup per two output
   columns, its lanes splitting each column's contraction over 32-element units of
-  the packed weight, one X read four elements at a time shared across them)
-  while Q1_0 keeps one thread per column on the scalar X view; for `m > 1`
+  the packed weight, one X read four elements at a time shared across them) —
+  or, the default, a subgroup-reduction arm of the same decode
+  (one subgroup per output column, `GEMV_WIDE_THREADS` invocations per workgroup,
+  the column read from `subgroup_id`; a Q4_K row that gives a lane two or more of
+  its `qs` groups decodes a whole group a step; `RLX_WGPU_GEMV_WIDE=shared` restores
+  the workgroup-memory arm). A chunk of 1 024 columns or more whose columns are a
+  whole number of its workgroups takes that arm's wider entry — two contiguous
+  columns per subgroup with an independent accumulator each, so a lane keeps two
+  rows of packed weight in flight and the pair shares one X read — and
+  `RLX_WGPU_GEMV_ILP=0` restores the one-column entry. A narrow Q6_K chunk — a row
+  of two 32-element units a lane — raises that floor to 2 048 columns. Each
+  dispatch's uniform and
+  bind group are kept across frames (`RLX_WGPU_GEMV_POOL=0` rebuilds them) — while
+  Q1_0 keeps one thread per column reading X one element at a time; for `m > 1`
   Q4_K/Q6_K **and Q8_0** a row-grouped GEMM reads each packed weight tile's quant
   bytes once per group of 8 rows instead of once per row — and that GEMM's Q4_K
   entry, when a dispatch would be too small to fill the GPU, covers half the
@@ -198,7 +210,12 @@ same admission for the **portable alignment** instead, a multiple of 8, because
 their `n` is a conv's spatial output extent (see below). It reads both operands
 straight out of the f32 arena, so the weight's operand role does not matter to
 it: the ordinary Param-weight multiply and those two routes all reach it, and
-`coop_f32_dispatch_count()` counts every dispatch of it. Opt out with
+`coop_f32_dispatch_count()` counts every dispatch of it. Within that path, a
+whole-tile, bias-free, activation-free multiply **on those two routes** takes the
+second entry, `matmul_coop_f32_direct` (A loaded straight from the arena, no
+epilogue pass), admitted by `coop_f32_direct_admitted` and counted by
+`coop_f32_direct_dispatch_count()`; the ordinary multiply keeps
+`matmul_coop_f32`'s form. Opt out with
 `RLX_WGPU_NO_COOP_F32=1`. The portable 8×8 sibling
 (`matmul_coop_f32_portable.wgsl`) is a discrete Vulkan adapter's; the conv routes
 never take it, whatever the adapter — their admission is Metal-scoped.
@@ -627,9 +644,11 @@ two halves. Its `scope=` names the two kinds of pass it covers: the run's own
 dispatch loop's, and an **unjoined packed-weight multiply's** — the per-row
 fallback's one pass per row, the Q1_0 arm, and the dequant-scratch route's two —
 each keeping the label its own site gave it. A packed multiply the run joins into
-its batch dispatches into the batch's pass (its slab → arena move is a dispatch
-there too), so it contributes no record of its own. `passes=` counts those
-records, so it is this instrument's ledger and not the run's batched pass count.
+its batch dispatches into the batch's pass (an arm that still lands its output
+through a slab records that move there too; the one-row arm stores straight into
+the arena and issues no move), so it contributes no record of its own. `passes=`
+counts those records, so it is this instrument's ledger and not the run's batched
+pass count.
 
 Coverage is not completeness. A pass another site opens still carries no figure: an
 arena copy's — the one site, whether the batch joins it or the call submits on its
@@ -705,7 +724,7 @@ feed path or the compiler reads is not named.
 [wgpu-run-report] interval label=probe host_ms=0.472824 steps=0 kinds=
 [wgpu-run-report] omitted label=compile reason=no_deferred_compile_in_this_path
 [wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes+packed_multiplies per=stretch passes=1 measured=1 unusable=0 device_ms=0.130125
-[wgpu-run-report] device_pass index=0 interval=encode ms=0.130125
+[wgpu-run-report] device_pass index=0 interval=encode ms=0.130125 kinds=matmul:1
 [wgpu-run-report] extra_work switch=RLX_WGPU_DBG_COUNTERS effect=prepass_census_and_per_step_print
 ```
 
@@ -723,7 +742,7 @@ figure is the pass it measured:
 ```
 [wgpu-run-report] interval label=encode host_ms=1.519086 steps=2 kinds=dequant_matmul_gguf:1,matmul:1
 [wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes+packed_multiplies per=stretch passes=1 measured=1 unusable=0 device_ms=0.158708
-[wgpu-run-report] device_pass index=0 interval=encode ms=0.158708
+[wgpu-run-report] device_pass index=0 interval=encode ms=0.158708 kinds=dequant_matmul_gguf:1,matmul:1
 ```
 
 **Four rows, off the arms** — a scheme this route never admits at all (Q5_K): with
@@ -740,17 +759,22 @@ never "waiting":
 [wgpu-run-report] interval label=host host_ms=100.792793 steps=1 kinds=dequant_matmul_gguf:1
 [wgpu-run-report] interval label=encode host_ms=0.276158 steps=1 kinds=matmul:1
 [wgpu-run-report] device adapter="Apple M3 Pro" backend=metal view=lower_bound scope=dispatch_passes+packed_multiplies per=stretch passes=3 measured=3 unusable=0 device_ms=3.157834
-[wgpu-run-report] device_pass index=0 interval=host ms=0.185334
-[wgpu-run-report] device_pass index=1 interval=host ms=2.877292
-[wgpu-run-report] device_pass index=2 interval=encode ms=0.095208
+[wgpu-run-report] device_pass index=0 interval=host ms=0.185334 kinds=
+[wgpu-run-report] device_pass index=1 interval=host ms=2.877292 kinds=
+[wgpu-run-report] device_pass index=2 interval=encode ms=0.095208 kinds=matmul:1
 ```
 
 The `[wgpu-run-report]` prefix is unique to this block, so the lines can be
 extracted from the interleaved diagnostics a run already prints; field names are
 fixed and every time is in milliseconds with six decimals; an interval line
 reads `interval label=<phase> host_ms=<ms> steps=<n> kinds=<name>:<count>,...`;
-an unavailable device figure is the literal `unavailable`. The kinds and their
-fields, which is all a parser needs:
+an unavailable device figure is the literal `unavailable`. A `device_pass` line
+carries the same `kinds=` census for the schedule steps its cursor range covered —
+the basis the interval line above it uses, so a step the run walked past inside the
+range (a baked host step, a dispatch whose active extent is zero) is counted by
+both — and the run's dispatch loop is the only site that can name them, so a pass
+another site opens (an unjoined packed multiply's) carries it empty rather than a
+guess. The kinds and their fields, which is all a parser needs:
 
 ```
 run            total_ms partition_ms convergence intervals schedule reached
@@ -758,7 +782,7 @@ interval       label host_ms steps kinds
 omitted        label reason
 device         adapter backend view [reason] scope per passes measured unusable device_ms
 device_unusable passes interval index host_ms
-device_pass    index interval ms
+device_pass    index interval ms kinds
 extra_work     switch effect
 ```
 

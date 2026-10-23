@@ -21,48 +21,52 @@ use crate::kernels::{
     GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
     GatherBwdParams, GatherParams, GroupedMatmulParams, GruParams, Kernel, LayerNorm2dParams,
     LayerNormBwdParams, LayerNormParams, Mamba2Params, MatmulParams, MatmulQkvParams,
-    NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams, ReverseParams,
-    RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, SampleParams, ScatterAddParams,
-    SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams,
-    UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams, activation_backward_kernel,
-    ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
-    attention_decode_eligible, attention_decode_kernel, attention_kernel, attention_mask_kernel,
-    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    NORM_VEC4_LANES, NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, ReduceParams,
+    ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, SampleParams,
+    ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
+    TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
+    activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
+    argmax_kernel, attention_bwd_kernel, attention_decode_eligible, attention_decode_kernel,
+    attention_decode_merge_kernel, attention_kernel, attention_mask_kernel, axial_rope2d_kernel,
+    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
     batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
     cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
-    complex_norm_sq_kernel, concat_kernel, concat_vec4_kernel, conjugate_c64_kernel,
-    conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel, conv1d_tiled_kernel,
-    conv2d_kernel, conv3d_backward_input_kernel, conv3d_backward_weight_kernel,
-    conv3d_ctile_kernel, conv3d_kernel, copy_kernel, copy_sanitize_kernel, cum_scan_kernel,
-    cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel,
-    dequantize_i8_kernel, elementwise_region_kernel, elementwise_region_spatial_kernel,
-    expand_kernel, fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel,
-    fft_butterfly_stage_kernel, fma_kernel, frames_kernel, fused_conv_bias_act_kernel,
-    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_rms_norm_kernel,
-    fused_swiglu_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
-    gated_residual_kernel, gather_axis_kernel, gather_backward_acc_kernel,
-    gather_backward_zero_kernel, gather_elements_kernel, gather_kernel, gather_nd_kernel,
-    gather_split_kernel, group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
-    group_norm_backward_input_kernel, group_norm_kernel, grouped_matmul_kernel, gru_kernel,
-    im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
+    complex_norm_sq_kernel, concat_kernel, concat_many_kernel, concat_vec4_kernel,
+    conjugate_c64_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_implicit_kernel,
+    conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
+    conv3d_backward_weight_kernel, conv3d_ctile_kernel, conv3d_kernel, copy_kernel,
+    copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
+    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
+    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
+    fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
+    fma_kernel, frames_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel,
+    fused_residual_ln_tee_kernel, fused_residual_ln_tee_vec4_kernel,
+    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
+    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
+    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_elements_kernel, gather_kernel,
+    gather_nd_kernel, gather_split_kernel, group_norm_backward_beta_kernel,
+    group_norm_backward_gamma_kernel, group_norm_backward_input_kernel, group_norm_kernel,
+    grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
-    layernorm_kernel, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
+    layernorm_kernel, layernorm_vec4_kernel, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
     matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
-    matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
-    matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
-    matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
-    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
-    maxpool3d_backward_kernel, narrow_kernel, narrow_vec4_kernel, note_attention_decomposed_route,
-    note_attention_route, pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel,
-    q_matmul_kernel, quantize_i8_kernel, reduce_kernel, reverse_kernel, rms_norm_backward_kernel,
+    matmul_coop_f32_active_kernel, matmul_coop_f32_direct_kernel, matmul_coop16_kernel,
+    matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_kernel,
+    matmul_qkv_coop_f16_vk_active_kernel, matmul_qkv_coop_f16_vk_kernel,
+    matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_active_kernel, matmul_wide_kernel,
+    maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, narrow_split_kernel,
+    narrow_vec4_kernel, norm_rope_kernel, note_attention_decomposed_route, note_attention_route,
+    pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel,
+    quantize_i8_kernel, reduce_kernel, reverse_kernel, rms_norm_backward_kernel,
     rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
     scaled_dequantize_kernel, scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel,
     scaled_quant_scale_kernel, scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel,
-    scatter_nd_reduce_kernel, selective_scan_kernel, softmax_cross_entropy_backward_kernel,
-    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
-    topk_kernel, transpose_kernel, transpose_vec4_kernel, umap_knn_kernel, unary_f16_mirror_kernel,
-    unary_kernel, welch_peaks_gpu_kernel, where_kernel,
+    scatter_nd_reduce_kernel, selective_scan_kernel, snake_beta_kernel,
+    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
+    softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
+    transpose_vec4_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
+    welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
@@ -913,6 +917,18 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::SnakeBeta { params } => {
+                        // The rows are this step's active-extent axis, the same
+                        // call `Step::Reduce` / `Step::Softmax` make on `outer`:
+                        // the kernel writes one row per `gid.y`, so the scaled
+                        // count is the same prefix of the row-major tensor the
+                        // chain's own flat `n` scaling covers, up to the last
+                        // partial row.
+                        let mut p = *params;
+                        p.outer = scale(p.outer);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::Unary { params, .. } => {
                         let mut p = *params;
                         p.n = scale(p.n);
@@ -1148,6 +1164,15 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::ConcatMany { params } => {
+                        // The planned run at any extent (see
+                        // `ConcatManyParams::workgroups`): written as planned.
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
+                    }
                     Step::Gather { params } => {
                         let mut p = *params;
                         p.n_out = scale(p.n_out);
@@ -1172,6 +1197,16 @@ impl WgpuExecutable {
                         let mut p = *params;
                         p.seq_q = scale(p.seq_q);
                         p.seq_k = scale(p.seq_k);
+                        // The split depth is the walked extent's decision, by the
+                        // same predicate the encoder below dispatches on, so a
+                        // short key range takes the unsplit entry.
+                        p.splits = attention_decode_key_splits(
+                            p.seq_q,
+                            p.seq_k,
+                            p.batch.saturating_mul(p.heads),
+                            p.head_dim,
+                            p.v_head_dim,
+                        );
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
@@ -1194,6 +1229,22 @@ impl WgpuExecutable {
                         let s_active = scale(p.seq);
                         p.seq = s_active;
                         p.n_total = p.batch * s_active * p.last_dim;
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::NarrowSplit { params } => {
+                        // The row width is the step's whole extent and the active
+                        // extent never shrinks it: written as planned.
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
+                    }
+                    Step::NormRope { params } => {
+                        // `seq` is the only extent the kernel iterates over.
+                        let mut p = *params;
+                        p.seq = scale(p.seq);
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
@@ -1445,9 +1496,10 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
-                    // Im2ColGpu params are static (written once at compile);
-                    // no active-extent scaling.
+                    // Im2ColGpu and Conv1dImplicit params are static (written once
+                    // at compile); no active-extent scaling.
                     Step::Im2ColGpu { .. }
+                    | Step::Conv1dImplicit { .. }
                     | Step::GatherSplit { .. }
                     | Step::DequantMatmulGguf { .. }
                     | Step::DequantMatmulInt8Host { .. }
@@ -1585,8 +1637,10 @@ impl WgpuExecutable {
         let mm_coop = matmul_coop16_kernel(&dev.device);
         let mm_coop_f16_vk = matmul_coop_f16_vulkan_kernel(&dev.device);
         let mm_coop_f32 = matmul_coop_f32_active_kernel(&dev.device);
+        let mm_coop_f32_direct = matmul_coop_f32_direct_kernel(&dev.device);
         let mm_cast = cast_f32_to_f16_kernel(&dev.device);
         let bk = binary_kernel(&dev.device);
+        let sbk = snake_beta_kernel(&dev.device);
         let uk = unary_kernel(&dev.device);
         let ck = compare_kernel(&dev.device);
         let wk = where_kernel(&dev.device);
@@ -1625,6 +1679,12 @@ impl WgpuExecutable {
         // wherever a new encoder is created, as `pass_dispatched` is. A site that
         // dispatches without counting only makes the chunks longer; a site that counts
         // without dispatching would end a chunk on work that is not there.
+        // `encode_chunk_steps` is the one scheduling parameter with no adapter input
+        // to calibrate from: no wgpu limit bounds how many dispatches a command
+        // buffer may carry, so nothing in `Limits`/`Features` speaks to it, and the
+        // sweep above is flat past 128 steps. The value is a portable constant; a
+        // backend that ever did expose a command-buffer budget would take it from
+        // there.
         let encode_chunk_steps = match rlx_ir::env::parse_or("RLX_WGPU_ENCODE_CHUNK", 64usize) {
             0 => usize::MAX,
             n => n,
@@ -1688,6 +1748,7 @@ impl WgpuExecutable {
                             })
                     }
                 };
+                let pass_start = step_i;
                 {
                     let mut pass = report.begin_pass(&mut enc);
                     while step_i < self.schedule.len() {
@@ -1760,10 +1821,13 @@ impl WgpuExecutable {
                             }
                             Step::Matmul {
                                 m,
+                                k,
                                 n,
                                 batch,
                                 b_off_f32,
                                 b_is_param,
+                                has_bias,
+                                act_id,
                                 compute_precision,
                                 ..
                             } =>
@@ -1876,7 +1940,27 @@ impl WgpuExecutable {
                                     // read a weight-side buffer is still kept
                                     // away by the eligibility that admitted it.
                                     coop_f32_dispatch_inc();
-                                    pass.set_pipeline(&coop_f32.pipeline);
+                                    // One admission beside `coop_f32_admitted` decides
+                                    // whether this call is a convolution GEMM route's
+                                    // whole-tile, epilogue-free multiply — the one form
+                                    // with no A staging and no scalar epilogue.
+                                    let used_direct = coop_f32_direct_admitted(
+                                        *has_bias,
+                                        *act_id,
+                                        m_s,
+                                        *k,
+                                        *n,
+                                        *b_is_param,
+                                    ) && mm_coop_f32_direct.is_some();
+                                    if used_direct {
+                                        crate::backend::coop_f32_direct_dispatch_inc();
+                                    }
+                                    let kernel = if used_direct {
+                                        mm_coop_f32_direct.as_ref().unwrap()
+                                    } else {
+                                        coop_f32
+                                    };
+                                    pass.set_pipeline(&kernel.pipeline);
                                     let (gx, gy) = coop_f32_grid(m_s, *n);
                                     pass.dispatch_workgroups(gx, gy, *batch);
                                 } else if let Some(f16c) = mm_f16c.as_ref()
@@ -1941,6 +2025,25 @@ impl WgpuExecutable {
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 let (gx, gy, gz) = dispatch_dims(n_s, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::SnakeBeta { params } => {
+                                let outer_s = scale(params.outer);
+                                if outer_s == 0 || params.inner == 0 {
+                                    if step_owns_slot(step) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
+                                    continue;
+                                }
+                                pass.set_pipeline(&sbk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                // One row per `gid.y`, `SNAKE_BETA_WG` columns per
+                                // workgroup; both extents are guarded in the kernel.
+                                pass.dispatch_workgroups(
+                                    params.inner.div_ceil(crate::kernels::SNAKE_BETA_WG),
+                                    outer_s,
+                                    1,
+                                );
                             }
                             Step::Compare { params } => {
                                 let n_s = scale(params.n);
@@ -2041,7 +2144,7 @@ impl WgpuExecutable {
                                     // Tree-reduce path: 1 workgroup (64
                                     // threads) per output cell, parallel
                                     // reduction with shared scratch.
-                                    let (gx, gy, gz) = dispatch_dims(total_out, 1);
+                                    let (gx, gy, gz) = workgroup_grid(total_out);
                                     pass.dispatch_workgroups(gx, gy, gz);
                                 }
                             }
@@ -2135,12 +2238,24 @@ impl WgpuExecutable {
                                     step_i += 1;
                                     continue;
                                 }
-                                let lk = layernorm_kernel(&dev.device);
+                                // One workgroup per row, tree reduction over the
+                                // feature dim: 64 lanes scalar, or
+                                // `NORM_VEC4_LANES` with 16 B accesses on the
+                                // vector module.
+                                let vec4 = params.vec4 != 0;
+                                if vec4 {
+                                    note_norm_vec4();
+                                }
+                                let lanes = if vec4 { NORM_VEC4_LANES } else { 64 };
+                                let lk = if vec4 {
+                                    layernorm_vec4_kernel(&dev.device)
+                                } else {
+                                    layernorm_kernel(&dev.device)
+                                };
                                 pass.set_pipeline(&lk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // One workgroup (64 threads) per row → tree
-                                // reduction over the feature dim.
-                                let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
+                                let (gx, gy, gz) =
+                                    dispatch_dims(outer_s.saturating_mul(lanes), lanes);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::GroupNorm { params } => {
@@ -2173,10 +2288,8 @@ impl WgpuExecutable {
                                 // position → tree reduction over the channels.
                                 // The grid is the POSITION count, not a thread
                                 // count — the kernel recovers `pos` from
-                                // `workgroup_id` and `num_workgroups` — so the
-                                // count is handed over as-is, by asking
-                                // `dispatch_dims` for a workgroup size of 1.
-                                let (gx, gy, gz) = dispatch_dims(params.positions, 1);
+                                // `workgroup_id` and `num_workgroups`.
+                                let (gx, gy, gz) = workgroup_grid(params.positions);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::FusedSwiGLU { params } => {
@@ -2531,6 +2644,7 @@ impl WgpuExecutable {
                                     *x_byte_off as usize,
                                     *w_byte_off as usize,
                                     *out_byte_off as usize,
+                                    Some(&self.gemv_setup),
                                 );
                                 if encoded {
                                     // No lane: lowering booked no uniform or bind
@@ -2672,12 +2786,16 @@ impl WgpuExecutable {
                                     let nk = narrow_vec4_kernel(&dev.device);
                                     pass.set_pipeline(&nk.pipeline);
                                     pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                    let gx = super::move_workgroups(params.inner);
-                                    pass.dispatch_workgroups(
-                                        gx,
-                                        params.axis_out_size,
-                                        params.outer,
-                                    );
+                                    // `inner == 1` is a last-axis slice: one run of
+                                    // `axis_out_size` elements per outer row, so the
+                                    // slice length is the x span and the axis column
+                                    // is not a grid dimension.
+                                    let (gx, gy) = if params.inner == 1 {
+                                        (super::move_workgroups(params.axis_out_size), 1)
+                                    } else {
+                                        (super::move_workgroups(params.inner), params.axis_out_size)
+                                    };
+                                    pass.dispatch_workgroups(gx, gy, params.outer);
                                 } else {
                                     let nk = narrow_kernel(&dev.device);
                                     pass.set_pipeline(&nk.pipeline);
@@ -2711,6 +2829,21 @@ impl WgpuExecutable {
                                         dispatch_dims(total_s, super::MOVE_WORKGROUP);
                                     pass.dispatch_workgroups(gx, gy, gz);
                                 }
+                            }
+                            Step::ConcatMany { params } => {
+                                let groups = params.workgroups();
+                                if groups == 0 {
+                                    if step_owns_slot(step) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let cmk = concat_many_kernel(&dev.device);
+                                pass.set_pipeline(&cmk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = workgroup_grid(groups);
+                                pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::Gather { params } => {
                                 let n_out_s = scale(params.n_out);
@@ -2781,14 +2914,38 @@ impl WgpuExecutable {
                                 };
                                 pass.set_pipeline(&ak.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                // Key-range split depth from the extent this run
+                                // walks — the same predicate the uniform write
+                                // above wrote into `params.splits`, so the grid,
+                                // the merge guard and the shader agree.
+                                let splits = attention_decode_key_splits(
+                                    seq_q_s,
+                                    scale(params.seq_k),
+                                    params.batch * params.heads,
+                                    params.head_dim,
+                                    params.v_head_dim,
+                                );
                                 // Decode form: one workgroup per (batch, head).
                                 // Serial form: one thread per (batch, head, row).
                                 let (gx, gy, gz) = if decode {
-                                    dispatch_dims(params.batch * params.heads, 1)
+                                    // Key-range split: one workgroup per
+                                    // (head, key range), then the merge over the
+                                    // partials it leaves at binding 2.
+                                    workgroup_grid(params.batch * params.heads * splits)
                                 } else {
                                     dispatch_dims(params.batch * params.heads * seq_q_s, 64)
                                 };
                                 pass.dispatch_workgroups(gx, gy, gz);
+                                if splits > 1 {
+                                    // The reduction belongs here, in the same
+                                    // pass: one workgroup a head merges the
+                                    // split partials it just wrote.
+                                    let mk = attention_decode_merge_kernel(&dev.device);
+                                    pass.set_pipeline(&mk.pipeline);
+                                    pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                    let (mx, my, mz) = workgroup_grid(params.batch * params.heads);
+                                    pass.dispatch_workgroups(mx, my, mz);
+                                }
                                 note_attention_route(decode);
                             }
                             Step::AttentionBackward { params, .. } => {
@@ -2828,6 +2985,33 @@ impl WgpuExecutable {
                                 pass.set_pipeline(&rk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::NarrowSplit { params } => {
+                                let nk = narrow_split_kernel(&dev.device);
+                                pass.set_pipeline(&nk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(params.total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::NormRope { params } => {
+                                // One workgroup per (position, head) row, plus a
+                                // 64-lane stretch per workgroup for the split's
+                                // leftover piece when the step carries one.
+                                let seq_s = scale(params.seq);
+                                let rows = seq_s * (params.heads_a + params.heads_b)
+                                    + params.copy_len.div_ceil(64);
+                                if rows == 0 {
+                                    if step_owns_slot(step) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let nrk = norm_rope_kernel(&dev.device);
+                                pass.set_pipeline(&nrk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = workgroup_grid(rows);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::QuantI8 {
@@ -3296,6 +3480,17 @@ impl WgpuExecutable {
                                 let (gx, gy, gz) = dispatch_dims(total, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
+                            Step::Conv1dImplicit { params } => {
+                                // One workgroup per 32 spatial columns covers every
+                                // output row tile the class admits (three at most), so
+                                // the gathered k-step serves all of them (see
+                                // `conv1d_implicit.wgsl`).
+                                let ck = conv1d_implicit_kernel(&dev.device)
+                                    .expect("conv1d_implicit admission");
+                                pass.set_pipeline(&ck.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(params.out_len.div_ceil(32), 1, 1);
+                            }
                             Step::Conv3d { params } => {
                                 let n_s = scale(params.n);
                                 if n_s == 0 {
@@ -3619,12 +3814,24 @@ impl WgpuExecutable {
                                     step_i += 1;
                                     continue;
                                 }
-                                let frtk = fused_residual_ln_tee_kernel(&dev.device);
+                                let vec4 = params.vec4 != 0;
+                                if vec4 {
+                                    note_norm_vec4();
+                                }
+                                let lanes = if vec4 { NORM_VEC4_LANES } else { 64 };
+                                let frtk = if vec4 {
+                                    fused_residual_ln_tee_vec4_kernel(&dev.device)
+                                } else {
+                                    fused_residual_ln_tee_kernel(&dev.device)
+                                };
                                 pass.set_pipeline(&frtk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // One workgroup (64 threads) per row → tree
-                                // reduction over the feature dim.
-                                let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
+                                // One workgroup per row, tree reduction over the
+                                // feature dim: 64 lanes scalar, or
+                                // `NORM_VEC4_LANES` with 16 B accesses on the
+                                // vector module.
+                                let (gx, gy, gz) =
+                                    dispatch_dims(outer_s.saturating_mul(lanes), lanes);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::FusedResidualRmsNorm { params } => {
@@ -3863,6 +4070,7 @@ impl WgpuExecutable {
                         }
                     }
                 }
+                report.note_pass_steps(pass_start, step_i, &self.schedule);
                 // A joined copy: end the pass, encode the copy's work into THIS
                 // encoder, carry the batch on. (A joined packed multiply is *not*
                 // here: it dispatches into the pass above, so it needs no boundary.)

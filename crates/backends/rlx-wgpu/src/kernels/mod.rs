@@ -23,6 +23,7 @@ pub const MATMUL_F16W_WGSL: &str = include_str!("matmul_f16w.wgsl");
 pub const MATMUL_F16_COMPUTE_WGSL: &str = include_str!("matmul_f16_compute.wgsl");
 pub const MATMUL_COOP16_WGSL: &str = include_str!("matmul_coop16.wgsl");
 pub const MATMUL_COOP_F32_WGSL: &str = include_str!("matmul_coop_f32.wgsl");
+pub const MATMUL_COOP_F32_DIRECT_WGSL: &str = include_str!("matmul_coop_f32_direct.wgsl");
 pub const MATMUL_COOP_F32_PORTABLE_WGSL: &str = include_str!("matmul_coop_f32_portable.wgsl");
 pub const MATMUL_COOP_F16_VULKAN_WGSL: &str = include_str!("matmul_coop_f16_vulkan.wgsl");
 pub const MATMUL_COOP_F16_VULKAN_WIDEN_WGSL: &str =
@@ -63,6 +64,10 @@ pub const MAXPOOL3D_BWD_WGSL: &str = include_str!("maxpool3d_backward.wgsl");
 pub const CONV3D_BWD_INPUT_WGSL: &str = include_str!("conv3d_backward_input.wgsl");
 pub const CONV3D_BWD_WEIGHT_WGSL: &str = include_str!("conv3d_backward_weight.wgsl");
 pub const LAYERNORM_WGSL: &str = include_str!("layernorm.wgsl");
+pub const LAYERNORM_VEC4_WGSL: &str = include_str!("layernorm_vec4.wgsl");
+pub const NORM_ROPE_WGSL: &str = include_str!("norm_rope.wgsl");
+pub const NARROW_SPLIT_WGSL: &str = include_str!("narrow_split.wgsl");
+pub const CONCAT_MANY_WGSL: &str = include_str!("concat_many.wgsl");
 pub const GROUP_NORM_WGSL: &str = include_str!("group_norm.wgsl");
 pub const LAYER_NORM2D_WGSL: &str = include_str!("layer_norm2d.wgsl");
 pub const RMS_NORM_BWD_WGSL: &str = include_str!("rms_norm_backward.wgsl");
@@ -149,6 +154,7 @@ pub const POOL2D_WGSL: &str = include_str!("pool2d.wgsl");
 pub const CONV2D_WGSL: &str = include_str!("conv2d.wgsl");
 pub const CONV1D_TILED_WGSL: &str = include_str!("conv1d_tiled.wgsl");
 pub const IM2COL2D_WGSL: &str = include_str!("im2col2d.wgsl");
+pub const CONV1D_IMPLICIT_WGSL: &str = include_str!("conv1d_implicit.wgsl");
 pub const POOL1D_WGSL: &str = include_str!("pool1d.wgsl");
 pub const POOL3D_WGSL: &str = include_str!("pool3d.wgsl");
 pub const CONV1D_WGSL: &str = include_str!("conv1d.wgsl");
@@ -192,6 +198,10 @@ pub const SCALED_GROUPED_MATMUL_DECODE_WGSL: &str =
 /// number — a shader wider than its dispatch would leave part of the reduction
 /// unset. The unit test below holds the shader's `LANES` to this.
 pub const SAMPLE_LANES: u32 = 64;
+/// The widest one-row draw `sample.wgsl` stages in workgroup storage (8 KiB, of
+/// the 16 KiB every WebGPU device guarantees). A wider row keeps the
+/// global-memory path; the unit test below holds the shader's `STAGE` to this.
+pub const SAMPLE_STAGE: u32 = 2048;
 pub const SAMPLE_WGSL: &str = include_str!("sample.wgsl");
 pub const SELECTIVE_SCAN_WGSL: &str = include_str!("selective_scan.wgsl");
 pub const GATED_DELTA_NET_WGSL: &str = include_str!("gated_delta_net.wgsl");
@@ -202,10 +212,85 @@ pub const LSTM_WGSL: &str = include_str!("lstm.wgsl");
 pub const DEQUANT_MATMUL_WGSL: &str = include_str!("dequant_matmul.wgsl");
 pub const DEQUANT_MATMUL_MLX_WGSL: &str = include_str!("dequant_matmul_mlx.wgsl");
 pub const DEQUANT_GGUF_WGSL: &str = include_str!("dequant_gguf.wgsl");
-pub const DEQUANT_GEMV_GGUF_WGSL: &str = include_str!("dequant_gemv_gguf.wgsl");
+/// First byte of `dequant_gemv_gguf.wgsl`'s subgroup section (the marker line is
+/// in the shader, spelled exactly once).
+const GEMV_WIDE_MARKER: &str =
+    "// >>> dequant_gemv_wide: subgroup-reduction arm (module split here)";
+
+/// `needle`'s byte offset in `haystack`, at compile time: a `&str` constant
+/// cannot be cut at a marker on stable Rust (`str::split_at`/`find` are not
+/// `const`), and this file needs a cut rather than a second copy of the shader.
+const fn marker_at(haystack: &[u8], needle: &[u8]) -> usize {
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        let mut j = 0;
+        while j < needle.len() && haystack[i + j] == needle[j] {
+            j += 1;
+        }
+        if j == needle.len() {
+            return i;
+        }
+        i += 1;
+    }
+    panic!("dequant_gemv_gguf.wgsl: the `dequant_gemv_wide` marker is missing");
+}
+
+/// `dequant_gemv_gguf.wgsl` **up to** its subgroup section: the two shared-memory
+/// one-row entry points (`dequant_gemv`, `dequant_gemv_tiled`).
+///
+/// The cut is not cosmetic. wgpu refuses a shader module that mentions a subgroup
+/// built-in on a device without `Features::SUBGROUP`, and those two entry points
+/// are created on every device — so they are built from a module that does not
+/// contain the wide arm at all. [`DEQUANT_GEMV_GGUF_WIDE_WGSL`] is the whole
+/// file, and is only built once `gguf_gpu::gemv_subgroup_probe` has found a width
+/// on a device that carries the feature.
+pub const DEQUANT_GEMV_GGUF_WGSL: &str = {
+    const FULL: &str = include_str!("dequant_gemv_gguf.wgsl");
+    const AT: usize = marker_at(FULL.as_bytes(), GEMV_WIDE_MARKER.as_bytes());
+    // The marker is the first byte of an ASCII line in a UTF-8 source, so the
+    // prefix is valid UTF-8 — proved rather than asserted, so no `unsafe` is
+    // needed for a cut whose failure mode would be a `str` the reader cannot
+    // trust.
+    match std::str::from_utf8(FULL.as_bytes().split_at(AT).0) {
+        Ok(shared) => shared,
+        Err(_) => panic!("dequant_gemv_gguf.wgsl: the split is not on a char boundary"),
+    }
+};
+/// The whole `dequant_gemv_gguf.wgsl`: the two shared-memory entry points and the
+/// subgroup arm below the marker (see [`DEQUANT_GEMV_GGUF_WGSL`]).
+pub const DEQUANT_GEMV_GGUF_WIDE_WGSL: &str = include_str!("dequant_gemv_gguf.wgsl");
+/// The shader that reads the adapter's real subgroup width and how many of them
+/// one 128-invocation workgroup (the wide arm's width) holds.
+///
+/// `AdapterInfo::subgroup_min_size`/`max_size` are buckets (Metal reports 4..64),
+/// and the wide one-row arm maps columns onto whole subgroups, so it needs the
+/// number itself. Two built-in values give it: `subgroup_size` and
+/// `num_subgroups`. Dispatched once per process, mapped back by
+/// `gguf_gpu::gemv_subgroup_probe`; only built on a device that carries
+/// `Features::SUBGROUP`, so naming the built-ins in this module is safe.
+///
+/// The workgroup is 128 invocations — the wide arm's own width — because
+/// `num_subgroups` counts the subgroups *in a workgroup*: at one invocation it
+/// would read 1 on every device and measure nothing.
+pub const GGUF_SUBGROUP_PROBE_WGSL: &str = r#"
+@group(0) @binding(0) var<storage, read_write> probe: array<u32>;
+
+@compute @workgroup_size(128)
+fn gemv_subgroup_probe(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(subgroup_size) sg: u32,
+    @builtin(num_subgroups) n: u32,
+) {
+    if (lid.x == 0u) {
+        probe[0] = sg;
+        probe[1] = n;
+    }
+}
+"#;
 pub const DEQUANT_GEMM_Q1_0_WGSL: &str = include_str!("dequant_gemm_q1_0.wgsl");
 pub const DEQUANT_GEMM_GGUF_WGSL: &str = include_str!("dequant_gemm_gguf.wgsl");
 pub const FUSED_RESIDUAL_LN_WGSL: &str = include_str!("fused_residual_ln.wgsl");
+pub const FUSED_RESIDUAL_LN_TEE_VEC4_WGSL: &str = include_str!("fused_residual_ln_tee_vec4.wgsl");
 pub const FUSED_RESIDUAL_LN_TEE_WGSL: &str = include_str!("fused_residual_ln_tee.wgsl");
 pub const FUSED_RESIDUAL_RMS_NORM_WGSL: &str = include_str!("fused_residual_rms_norm.wgsl");
 pub const ADA_LAYER_NORM_WGSL: &str = include_str!("ada_layer_norm.wgsl");
@@ -214,6 +299,11 @@ pub const ADA_LAYER_NORM_BACKWARD_WGSL: &str = include_str!("ada_layer_norm_back
 pub const GATED_RESIDUAL_BACKWARD_WGSL: &str = include_str!("gated_residual_backward.wgsl");
 pub const MATMUL_QKV_WGSL: &str = include_str!("matmul_qkv.wgsl");
 pub const MATMUL_QKV_COOP_F32_WGSL: &str = include_str!("matmul_qkv_coop_f32.wgsl");
+pub const SNAKE_BETA_WGSL: &str = include_str!("snake_beta.wgsl");
+/// Columns one `snake_beta.wgsl` workgroup covers, and so the width the run's
+/// dispatch divides a row by. It must be the shader's own `@workgroup_size`; the
+/// unit test below holds the two to each other.
+pub const SNAKE_BETA_WG: u32 = 256;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -234,6 +324,23 @@ pub struct MatmulParams {
     pub _pad0: u32,
     pub _pad1: u32,
     pub _pad2: u32,
+}
+
+/// One fused DAC snake, `y = x + beta·sin²(alpha·x)` — see `snake_beta.wgsl`.
+/// `has_bias` is a fold flag, not a shape: the lowering passes 0 for a step it
+/// did not fold a bias into. Eight words, so the uniform struct is 16-byte
+/// aligned.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct SnakeBetaParams {
+    pub outer: u32,
+    pub inner: u32,
+    pub x_off: u32,
+    pub alpha_off: u32,
+    pub beta_off: u32,
+    pub bias_off: u32,
+    pub out_off: u32,
+    pub has_bias: u32,
 }
 
 /// Shared layout for binary, compare. 32 bytes (8 u32s).
@@ -659,6 +766,40 @@ pub struct LayerNormParams {
     pub beta_off: u32,
     pub eps_bits: u32, // bitcast::<u32>(eps)
     pub op: u32,       // 0=LayerNorm, 1=RmsNorm
+    /// 1 = the `layernorm_vec4` module (256-lane workgroup, 16 B accesses).
+    pub vec4: u32,
+}
+
+/// Layout for the fused RmsNorm + RoPE step: two head-row parts that share one
+/// position table, normalized and rotated in one dispatch, plus the split's
+/// leftover piece copied verbatim when the step also owns the cut that fed it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct NormRopeParams {
+    /// Positions the run walks (`m`); the active extent scales it.
+    pub seq: u32,
+    /// 0 ⇒ that part is absent.
+    pub heads_a: u32,
+    pub heads_b: u32,
+    /// Head width (even); the rotated pair is `(j, j + inner / 2)`.
+    pub inner: u32,
+    pub cos_row_stride: u32,
+    pub eps_bits: u32,
+    /// The split's other piece, copied at `copy_len` elements per row; 0 ⇒ the
+    /// step took no split with it.
+    pub copy_in: u32,
+    pub copy_out: u32,
+    pub copy_len: u32,
+    pub in_a: u32,
+    pub out_a: u32,
+    pub gamma_a: u32,
+    pub beta_a: u32,
+    pub in_b: u32,
+    pub out_b: u32,
+    pub gamma_b: u32,
+    pub beta_b: u32,
+    pub cos_off: u32,
+    pub sin_off: u32,
 }
 
 /// LayerNorm backward kernel params (f32 element offsets). Shared by
@@ -1067,6 +1208,47 @@ pub struct NarrowConcatParams {
     pub vec4: u32,
 }
 
+/// Layout for the split copy (`narrow_split.wgsl`): one row cut into `count`
+/// contiguous last-axis pieces, each into its own slot.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct NarrowSplitParams {
+    pub src: u32,
+    /// Elements in the source row — the sum of the pieces.
+    pub total: u32,
+    /// End of piece 0 and of piece 1 (piece 2 runs to `total`).
+    pub end0: u32,
+    pub end1: u32,
+    pub dst0: u32,
+    pub dst1: u32,
+    pub dst2: u32,
+    /// 2 or 3.
+    pub count: u32,
+}
+
+/// Most inputs one `Step::ConcatMany` folds (the loop's largest is 15).
+pub const CONCAT_MANY_MAX: usize = 16;
+
+/// Layout for the whole-concat copy (`concat_many.wgsl`): every input of one
+/// `Op::Concat`, in output order, copied by one dispatch.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ConcatManyParams {
+    /// Product of the trailing dims — the row width below the concat axis.
+    pub inner: u32,
+    /// The output's first word, as a bind-window offset.
+    pub out_off: u32,
+    /// Inputs, in output order.
+    pub count: u32,
+    /// Pads `ins` to its `vec4` stride; the struct is 272 B, the size the shader
+    /// declares.
+    pub _pad: u32,
+    /// `(in_off, axis_len, start)` per input, in output order. `start` is the
+    /// piece's planned offset along the axis, which a walked run keeps so the
+    /// pieces do not compact; `.w` is the `vec4` stride's spare lane.
+    pub ins: [[u32; 4]; CONCAT_MANY_MAX],
+}
+
 /// Frame-matrix dispatch parameters: `narrow`-per-frame + `concat` folded into
 /// one dispatch (`frames.wgsl`).
 #[repr(C)]
@@ -1180,7 +1362,12 @@ pub struct AttentionParams {
     pub q_batch_stride: u32,
     pub q_head_stride: u32,
     pub q_seq_stride: u32,
-    pub _pad_q: u32,
+    /// Key-range splits this step runs as: 1 (the default) is one workgroup per
+    /// (batch, head), `n` is `n` workgroups over disjoint key ranges plus one
+    /// merge dispatch. Never 0 — the lowerer writes
+    /// `attention_route::attention_decode_key_splits`'s return, which is 1 or
+    /// more — and read only by the decode entry and its merge.
+    pub splits: u32,
 
     pub k_batch_stride: u32,
     pub k_head_stride: u32,
@@ -1661,7 +1848,7 @@ pub struct DequantGgufParams {
 /// Layout for the fused GGUF K-quant GEMV (`dequant_gemv_gguf.wgsl`). 32 bytes.
 /// Offsets are relative to each kernel binding's windowed base.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable, PartialEq, Eq, Hash)]
 pub struct DequantGemvGgufParams {
     pub k: u32,
     pub n: u32,
@@ -1669,6 +1856,8 @@ pub struct DequantGemvGgufParams {
     pub x_f32_off: u32,
     pub w_byte_off: u32,
     pub out_f32_off: u32,
+    /// Padding to the 32 bytes a WGSL uniform struct of eight words occupies
+    /// (its alignment is 16), so the record written and the record read agree.
     pub _p0: u32,
     pub _p1: u32,
 }
@@ -1744,7 +1933,7 @@ pub struct DequantMatmulMlxParams {
     pub _pad: u32,
 }
 
-/// Layout for FusedResidualLN-Tee. 48 bytes (12 u32s).
+/// Layout for FusedResidualLN-Tee. 52 bytes (13 u32s).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct FusedResidualLnTeeParams {
@@ -1764,6 +1953,8 @@ pub struct FusedResidualLnTeeParams {
     /// share the (multi-consumer Add -> norm) shape, and only the final scaling
     /// differs.
     pub is_rms: u32,
+    /// 1 = the `fused_residual_ln_tee_vec4` module (256 lanes, 16 B accesses).
+    pub vec4: u32,
 }
 
 /// Layout for matmul_qkv (split-write QKV matmul).
@@ -2303,6 +2494,19 @@ fn build_kernel_3(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
+    build_kernel_3_with(device, label, wgsl, entry_point, true)
+}
+
+/// [`build_kernel_3`] with binding 2's access mode chosen by the caller: the
+/// attention entries write their split partials through it, the other users of
+/// this shape only read it.
+fn build_kernel_3_with(
+    device: &wgpu::Device,
+    label: &'static str,
+    wgsl: &str,
+    entry_point: &'static str,
+    parts_read_only: bool,
+) -> Kernel {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(wgsl.into()),
@@ -2334,7 +2538,9 @@ fn build_kernel_3(
                 binding: 2,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    ty: wgpu::BufferBindingType::Storage {
+                        read_only: parts_read_only,
+                    },
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
@@ -2358,24 +2564,25 @@ fn build_kernel_3(
     Kernel { pipeline, bgl }
 }
 
-/// Binding layout: storage(ro) + uniform + storage(ro) + storage(rw) [+ one more
-/// storage(ro) when `x_vec4`].
-/// For the GGUF GEMV: x (ro arena window) + params + weight (ro arena window) +
-/// out (rw separate buffer). The arena is bound read-only twice (allowed), and
-/// the single read-write binding is a distinct buffer — sidestepping wgpu's
-/// "STORAGE_READ_WRITE is exclusive" rule for same-buffer aliasing.
+/// Binding layout: storage + uniform + storage + storage — the GGUF GEMV's x
+/// (arena window) + params + weight (arena window) + out (window), each arena
+/// window bound **once**.
 ///
-/// `x_vec4` adds the one-row GEMV's fifth read-only binding: the same `x` window
-/// as binding 0, typed `array<vec4<f32>>` so the tiled arm reads a unit's 32 X
-/// elements with 8 vector loads instead of 32 scalar ones. Both of
-/// that module's entry points get the layout (they share its declarations); only
-/// the tiled one reads through it.
+/// `in_place_arena` selects the one-row GEMV's access modes. That arm can bind
+/// x, the weight and the output out of one buffer, so all three arena bindings
+/// (0, 2 and 3) are declared read_write even though the entry points only read
+/// through 0 and 2. The windows are disjoint — the planner keeps the input live
+/// until the store, and `gguf_gpu::gemv_in_place_out_window` refuses an output
+/// window whose align-down base would reach into the X row or the packed weight —
+/// so no two writable bindings share a range, which is what WebGPU requires.
+/// Without `in_place_arena` the two arena windows are read-only and the only
+/// read-write binding is a distinct buffer.
 fn build_kernel_ro_u_ro_rw(
     device: &wgpu::Device,
     label: &'static str,
     wgsl: &str,
     entry_point: &'static str,
-    x_vec4: bool,
+    in_place_arena: bool,
 ) -> Kernel {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
@@ -2386,11 +2593,14 @@ fn build_kernel_ro_u_ro_rw(
         has_dynamic_offset: false,
         min_binding_size: None,
     };
-    let mut entries = [
+    // With `in_place_arena`, every window this layout carries is declared
+    // read_write — see this function's doc for why that is the point of the flag.
+    let arena_read_only = !in_place_arena;
+    let entries = [
         wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
-            ty: storage(true),
+            ty: storage(arena_read_only),
             count: None,
         },
         wgpu::BindGroupLayoutEntry {
@@ -2406,7 +2616,7 @@ fn build_kernel_ro_u_ro_rw(
         wgpu::BindGroupLayoutEntry {
             binding: 2,
             visibility: wgpu::ShaderStages::COMPUTE,
-            ty: storage(true),
+            ty: storage(arena_read_only),
             count: None,
         },
         wgpu::BindGroupLayoutEntry {
@@ -2415,16 +2625,7 @@ fn build_kernel_ro_u_ro_rw(
             ty: storage(false),
             count: None,
         },
-    ]
-    .to_vec();
-    if x_vec4 {
-        entries.push(wgpu::BindGroupLayoutEntry {
-            binding: 4,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: storage(true),
-            count: None,
-        });
-    }
+    ];
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &entries,
@@ -2766,6 +2967,7 @@ static MATMUL_BF16W: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_F16_COMPUTE: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP16: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F32: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP_F32_DIRECT: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F32_PORTABLE: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN_WIDEN: OnceLock<Kernel> = OnceLock::new();
@@ -2773,6 +2975,7 @@ static MATMUL_COOP_F16_VULKAN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new()
 static MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
 static CAST_F32_TO_F16: OnceLock<Kernel> = OnceLock::new();
 static BINARY: OnceLock<Kernel> = OnceLock::new();
+static SNAKE_BETA: OnceLock<Kernel> = OnceLock::new();
 static BINARY_C64: OnceLock<Kernel> = OnceLock::new();
 static COMPLEX_CAST: OnceLock<Kernel> = OnceLock::new();
 static COMPLEX_NORM_SQ: OnceLock<Kernel> = OnceLock::new();
@@ -2801,6 +3004,10 @@ static AXIAL_ROPE2D: OnceLock<Kernel> = OnceLock::new();
 static FAKE_QUANTIZE_FIXED: OnceLock<Kernel> = OnceLock::new();
 static FAKE_QUANTIZE_PERBATCH: OnceLock<Kernel> = OnceLock::new();
 static LAYERNORM: OnceLock<Kernel> = OnceLock::new();
+static LAYERNORM_VEC4: OnceLock<Kernel> = OnceLock::new();
+static NORM_ROPE: OnceLock<Kernel> = OnceLock::new();
+static NARROW_SPLIT: OnceLock<Kernel> = OnceLock::new();
+static CONCAT_MANY: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM: OnceLock<Kernel> = OnceLock::new();
 static LAYER_NORM2D: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD: OnceLock<Kernel> = OnceLock::new();
@@ -2850,6 +3057,7 @@ static GATHER: OnceLock<Kernel> = OnceLock::new();
 static GATHER_SPLIT: OnceLock<Kernel> = OnceLock::new();
 static GATHER_AXIS: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION: OnceLock<Kernel> = OnceLock::new();
+static ATTENTION_DECODE_MERGE: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_DECODE: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_MASK: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_BWD: OnceLock<Kernel> = OnceLock::new();
@@ -2878,6 +3086,7 @@ static POOL2D: OnceLock<Kernel> = OnceLock::new();
 static CONV2D: OnceLock<Kernel> = OnceLock::new();
 static CONV1D_TILED: OnceLock<Kernel> = OnceLock::new();
 static IM2COL2D: OnceLock<Kernel> = OnceLock::new();
+static CONV1D_IMPLICIT: OnceLock<Kernel> = OnceLock::new();
 static POOL1D: OnceLock<Kernel> = OnceLock::new();
 static POOL3D: OnceLock<Kernel> = OnceLock::new();
 static CONV1D: OnceLock<Kernel> = OnceLock::new();
@@ -2904,6 +3113,9 @@ static DEQUANT_MATMUL_MLX: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GGUF: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMV_GGUF: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMV_GGUF_TILED: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMV_GGUF_WIDE: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMV_GGUF_WIDE_ILP: OnceLock<Kernel> = OnceLock::new();
+static GGUF_SUBGROUP_PROBE: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q1_0: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q4K: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q6K: OnceLock<Kernel> = OnceLock::new();
@@ -2911,6 +3123,7 @@ static DEQUANT_GEMM_Q8_0: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_BT: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN_TEE: OnceLock<Kernel> = OnceLock::new();
+static FUSED_RESIDUAL_LN_TEE_VEC4: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_RMS_NORM: OnceLock<Kernel> = OnceLock::new();
 static ADA_LAYER_NORM: OnceLock<Kernel> = OnceLock::new();
 static GATED_RESIDUAL: OnceLock<Kernel> = OnceLock::new();
@@ -3062,6 +3275,29 @@ pub fn matmul_coop_f32_kernel(device: &wgpu::Device) -> Option<&'static Kernel> 
             "rlx-wgpu matmul_coop_f32",
             MATMUL_COOP_F32_WGSL,
             "matmul_coop_f32",
+        )
+    }))
+}
+/// The convolution GEMM routes' direct form: the same 32×32 tile as
+/// [`matmul_coop_f32_kernel`], with no workgroup staging and no epilogue pass
+/// (see the shader header). Metal only — the load/store conventions this entry
+/// stands on are the MSL ones, and the portable Vulkan form is a different
+/// kernel. `None` when the device cannot build it, in which case every call keeps
+/// the general kernel.
+pub fn matmul_coop_f32_direct_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !device
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        || crate::device::wgpu_device().map(|d| d.backend) != Some(wgpu::Backend::Metal)
+    {
+        return None;
+    }
+    Some(MATMUL_COOP_F32_DIRECT.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu matmul_coop_f32_direct",
+            MATMUL_COOP_F32_DIRECT_WGSL,
+            "matmul_coop_f32_direct",
         )
     }))
 }
@@ -3392,6 +3628,10 @@ pub fn cast_f32_to_f16_kernel(device: &wgpu::Device) -> Option<&'static Kernel> 
 pub fn binary_kernel(device: &wgpu::Device) -> &'static Kernel {
     BINARY.get_or_init(|| build_kernel(device, "rlx-wgpu binary", BINARY_WGSL, "binary"))
 }
+pub fn snake_beta_kernel(device: &wgpu::Device) -> &'static Kernel {
+    SNAKE_BETA
+        .get_or_init(|| build_kernel(device, "rlx-wgpu snake_beta", SNAKE_BETA_WGSL, "snake_beta"))
+}
 pub fn binary_c64_kernel(device: &wgpu::Device) -> &'static Kernel {
     BINARY_C64.get_or_init(|| {
         build_kernel(
@@ -3625,6 +3865,46 @@ pub fn fake_quantize_perbatch_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn layernorm_kernel(device: &wgpu::Device) -> &'static Kernel {
     LAYERNORM.get_or_init(|| build_kernel(device, "rlx-wgpu layernorm", LAYERNORM_WGSL, "norm"))
+}
+/// Lanes one `*_vec4` norm workgroup runs, and so the width `run.rs` dispatches
+/// a row's rows-of-workgroups against. Both modules declare it as their
+/// `@workgroup_size` and their `WG`; the unit test below holds the three
+/// together.
+pub const NORM_VEC4_LANES: u32 = 256;
+
+pub fn layernorm_vec4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    LAYERNORM_VEC4.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu layernorm vec4",
+            LAYERNORM_VEC4_WGSL,
+            "norm",
+        )
+    })
+}
+pub fn narrow_split_kernel(device: &wgpu::Device) -> &'static Kernel {
+    NARROW_SPLIT.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu narrow_split",
+            NARROW_SPLIT_WGSL,
+            "narrow_split",
+        )
+    })
+}
+pub fn concat_many_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONCAT_MANY.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu concat_many",
+            CONCAT_MANY_WGSL,
+            "concat_many",
+        )
+    })
+}
+pub fn norm_rope_kernel(device: &wgpu::Device) -> &'static Kernel {
+    NORM_ROPE
+        .get_or_init(|| build_kernel(device, "rlx-wgpu norm_rope", NORM_ROPE_WGSL, "norm_rope"))
 }
 pub fn group_norm_kernel(device: &wgpu::Device) -> &'static Kernel {
     GROUP_NORM
@@ -4113,28 +4393,51 @@ pub fn gather_axis_kernel(device: &wgpu::Device) -> &'static Kernel {
     })
 }
 pub fn attention_kernel(device: &wgpu::Device) -> &'static Kernel {
-    ATTENTION
-        .get_or_init(|| build_kernel(device, "rlx-wgpu attention", ATTENTION_WGSL, "attention"))
+    ATTENTION.get_or_init(|| {
+        build_kernel_3_with(
+            device,
+            "rlx-wgpu attention",
+            ATTENTION_WGSL,
+            "attention",
+            false,
+        )
+    })
 }
-/// Decode-shaped attention: one workgroup per (batch, head), the key sequence
-/// walked across the workgroup's lanes. Same WGSL module and same two-entry
-/// bind-group layout as [`attention_kernel`], so the bind group the lowerer
-/// built from that layout drives either pipeline.
+/// Decode-shaped attention: one workgroup per (batch, head) and key range, the
+/// sequence walked across the workgroup's lanes. Same WGSL module and same
+/// three-entry bind-group layout as [`attention_kernel`], so the bind group the
+/// lowerer built from that layout drives either pipeline.
 pub fn attention_decode_kernel(device: &wgpu::Device) -> &'static Kernel {
     ATTENTION_DECODE.get_or_init(|| {
-        build_kernel(
+        build_kernel_3_with(
             device,
             "rlx-wgpu attention_decode",
             ATTENTION_WGSL,
             "attention_decode",
+            false,
+        )
+    })
+}
+/// The key-range split's reduction: one workgroup per (batch, head) merges the
+/// partials the split form of [`attention_decode_kernel`] wrote. Same WGSL
+/// module and same bind-group layout as that kernel — the parts buffer rides
+/// binding 2 there and here.
+pub fn attention_decode_merge_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ATTENTION_DECODE_MERGE.get_or_init(|| {
+        build_kernel_3_with(
+            device,
+            "rlx-wgpu attention_decode_merge",
+            ATTENTION_WGSL,
+            "attention_decode_merge",
+            false,
         )
     })
 }
 /// The many-row attention route's masked scale: the score multiply's own
 /// output, scaled, capped and masked in place, in front of the ordinary dense
-/// softmax (`softmax_kernel`). Same WGSL module and same two-entry bind-group
-/// layout as [`attention_kernel`], so the bind group the lowerer built from that
-/// layout drives this pipeline too.
+/// softmax (`softmax_kernel`). Two-entry bind-group layout: it reads and writes
+/// the arena and nothing else, so it needs neither the parts buffer the decode
+/// entries carry nor their pipeline layout.
 pub fn attention_mask_kernel(device: &wgpu::Device) -> &'static Kernel {
     ATTENTION_MASK.get_or_init(|| {
         build_kernel(
@@ -4146,28 +4449,54 @@ pub fn attention_mask_kernel(device: &wgpu::Device) -> &'static Kernel {
     })
 }
 
-/// Key length above which the decode-shaped form is worth its merge cost:
-/// the threshold the native (Metal) backend records for its decode-shaped form
-/// (`kv_seq > 64`), not a new number.
-pub const ATTENTION_DECODE_MIN_KEYS: u32 = 64;
-
 /// Head width the lane-parallel decode form serves, mirroring the native
 /// backend's decode kernel. That cap is the native kernel's own — 32 lanes of
-/// partial O in one threadgroup array. Here the per-lane Q/O arrays are the
-/// serial kernel's and the merge scratch is dim-chunked, so this is coverage
-/// parity with the native route, not a limit of this kernel. Wider heads stay
-/// on `attention`.
+/// partial O in one threadgroup array. Here the per-lane O array is the serial
+/// kernel's and the merge scratch is dim-chunked, so this is coverage parity
+/// with the native route, not a limit of this kernel. Wider heads stay on
+/// `attention`.
 pub const ATTENTION_DECODE_MAX_HEAD_DIM: u32 = 128;
+
+/// Value dims per pass of the decode entry's merge — the shader's
+/// `DECODE_DIM_CHUNK`, and the unit the key-range split's partials are padded
+/// to (`2 + pad` f32 a partial). The host sizes that buffer from this number and
+/// the kernel writes it from the shader's own; `the_split_partials_pad_is_the_
+/// shaders_own` pins the two together.
+pub const ATTENTION_PARTS_DIM_CHUNK: u32 = 32;
 
 /// Which attention kernel `Step::Attention` takes, from the extents the run
 /// actually walks (`seq_q`/`seq_k` after active-extent scaling) rather than the
-/// lowered ones. Anything outside this set keeps the serial kernel's behaviour,
-/// including its head-width ceiling; which mask kinds exist is decided inside
-/// the WGSL entry point, which mirrors the serial one's. The two widths are only
-/// each compared against the cap, so their order is immaterial.
+/// lowered ones: every one-row step whose head widths this form holds. What
+/// keeps the serial kernel is a query row count above one (the dense route
+/// takes two and up), a step with no keys, and a head wider than the cap above;
+/// which mask kinds exist is decided inside the WGSL entry point, which mirrors
+/// the serial one's. The two widths are only each compared against the cap, so
+/// their order is immaterial.
+///
+/// There is deliberately **no key floor**. The one this route used to carry (64
+/// keys, the figure the native backend records for its own decode kernel) was a
+/// shape assumption these measurements do not support: the serial form walks the
+/// keys on one thread per query row, with `MAX_HEAD_DIM`-wide private Q/O arrays
+/// behind a runtime index, so its per-layer cost grows with the key count rather
+/// than disappearing at short lengths — 498 µs a layer at 32 keys and 942 at 64
+/// on the stand (Apple M3 Pro, wgpu over Metal, the chain
+/// `tests/attention_decode_route.rs` walks), where those two are the pre-change
+/// build's own readings and cannot be re-taken now that a one-row step at those
+/// widths takes this form. The fork's speech cells live in the band the floor
+/// kept — the code predictor's attention is one row over 1..=16 keys (one cache
+/// row per level) at 16 heads of width 128 — and routing it here took that frame
+/// from 56.8 to 40.8–42.0 ms and the synthesis cell from 1.053 s per second of
+/// speech, with the waveform digest unchanged; `MEASUREMENTS.md` carries the rate
+/// it reached, which moves with the machine between runs. The same frame's
+/// attention dispatches read 307 µs and 154.7 µs before and after in the
+/// one-op-per-pass ablation, which charges each dispatch a pass open and close of
+/// its own and so prices small kinds far above their device cost: read those two
+/// as the ablation's, indicative of the direction, not as per-dispatch device
+/// time (the cell rate is the measured one).
 pub fn attention_decode_eligible(seq_q: u32, seq_k: u32, head_dim: u32, v_head_dim: u32) -> bool {
     seq_q == 1
-        && seq_k > ATTENTION_DECODE_MIN_KEYS
+        // Not a floor: a step with no keys has nothing for this form to walk.
+        && seq_k > 0
         && head_dim <= ATTENTION_DECODE_MAX_HEAD_DIM
         // 0 means "unset": the kernel then reads `head_dim` for V, already
         // bounded by the conjunct above.
@@ -4398,6 +4727,65 @@ pub fn conv2d_kernel(device: &wgpu::Device) -> &'static Kernel {
 pub fn im2col2d_kernel(device: &wgpu::Device) -> &'static Kernel {
     IM2COL2D.get_or_init(|| build_kernel(device, "rlx-wgpu im2col2d", IM2COL2D_WGSL, "im2col2d"))
 }
+/// Layout for the cooperative implicit-GEMM convolution. 64 bytes (16 u32).
+///
+/// The offsets are absolute arena words, not window locals: the entry reads the
+/// weight, the 1-D input and its own output straight out of one whole-arena
+/// binding at base zero, exactly as the im2col panel multiply does (see the
+/// `Op::Conv` arm in `backend/compile/lower.rs`, which admits this route only
+/// when the arena binds whole).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Conv1dImplicitParams {
+    pub c_in: u32,
+    pub c_out: u32,
+    /// `c_in · kw` — the weight's row stride and the contraction.
+    pub k_total: u32,
+    /// The input's own length.
+    pub w: u32,
+    /// The output's length — the multiply's `n`.
+    pub out_len: u32,
+    pub kw: u32,
+    pub dilation: u32,
+    pub pad: u32,
+    pub in_off: u32,
+    pub w_off: u32,
+    pub out_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+    pub _p2: u32,
+    pub _p3: u32,
+    pub _p4: u32,
+}
+/// Whether this adapter can run the cooperative implicit-GEMM conv at all —
+/// Metal, plus cooperative matrices. Split from the constructor so the compile
+/// arm and the panel reservation can ask it without building the pipeline.
+pub fn conv1d_implicit_supported(device: &wgpu::Device) -> bool {
+    device
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        && crate::device::wgpu_device().map(|d| d.backend) == Some(wgpu::Backend::Metal)
+}
+
+/// The convolution GEMM routes' implicit form: the direct entry's 32×32 f32
+/// cooperative tile with B gathered through the conv's taps into workgroup memory
+/// instead of materialised as an im2col panel (see the shader header). Metal only,
+/// for the same reason `matmul_coop_f32_direct_kernel` is: the load/store
+/// conventions this entry stands on are the MSL ones. `None` when the device
+/// cannot build it, in which case the conv keeps the im2col/tiled/direct routes.
+pub fn conv1d_implicit_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !conv1d_implicit_supported(device) {
+        return None;
+    }
+    Some(CONV1D_IMPLICIT.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv1d_implicit",
+            CONV1D_IMPLICIT_WGSL,
+            "conv1d_implicit",
+        )
+    }))
+}
 pub fn conv1d_tiled_kernel(device: &wgpu::Device) -> &'static Kernel {
     CONV1D_TILED.get_or_init(|| {
         build_kernel(
@@ -4604,6 +4992,83 @@ pub fn dequant_gemv_gguf_tiled_kernel(device: &wgpu::Device) -> &'static Kernel 
         )
     })
 }
+/// The subgroup-reduction entry of `dequant_gemv_gguf.wgsl`: one subgroup per
+/// output column, `GEMV_WIDE_THREADS` invocations per workgroup, the lane
+/// partials combined by `subgroupAdd`.
+///
+/// Built from [`DEQUANT_GEMV_GGUF_WIDE_WGSL`] (the whole file) rather than
+/// [`DEQUANT_GEMV_GGUF_WGSL`] (the file up to this arm's marker): only the wide
+/// module names a subgroup built-in, and wgpu refuses such a module without
+/// `Features::SUBGROUP`. The caller reaches this constructor only after
+/// `gguf_gpu::gemv_subgroup_probe` has read a width on a device carrying the
+/// feature.
+pub fn dequant_gemv_gguf_wide_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMV_GGUF_WIDE.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemv_gguf_wide",
+            DEQUANT_GEMV_GGUF_WIDE_WGSL,
+            "dequant_gemv_wide",
+            true,
+        )
+    })
+}
+/// The subgroup arm's ILP entry: `WIDE_ILP` output columns a subgroup, an
+/// independent accumulator each and one X read shared between them, so a lane
+/// keeps two rows' loads in flight where the entry above keeps one. Same bind
+/// layout and same module as [`dequant_gemv_gguf_wide_kernel`]; the host
+/// dispatches it only for a chunk whose columns are a whole number of
+/// workgroups.
+pub fn dequant_gemv_gguf_wide_ilp_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMV_GGUF_WIDE_ILP.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemv_gguf_wide_ilp",
+            DEQUANT_GEMV_GGUF_WIDE_WGSL,
+            "dequant_gemv_wide_ilp",
+            true,
+        )
+    })
+}
+/// The 128-invocation shader that reads the adapter's real subgroup width and
+/// subgroup count into a two-word storage buffer. One binding; the caller
+/// (`gguf_gpu::gemv_subgroup_probe`) allocates the buffer and maps it back.
+pub fn gguf_subgroup_probe_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GGUF_SUBGROUP_PROBE.get_or_init(|| {
+        let label = "rlx-wgpu gguf subgroup probe";
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(GGUF_SUBGROUP_PROBE_WGSL.into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(label),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some("gemv_subgroup_probe"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Kernel { pipeline, bgl }
+    })
+}
 pub fn dequant_gemm_q1_0_kernel(device: &wgpu::Device) -> &'static Kernel {
     DEQUANT_GEMM_Q1_0.get_or_init(|| {
         build_kernel_ro_u_ro_rw(
@@ -4663,6 +5128,16 @@ pub fn fused_residual_ln_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu fused_residual_ln",
             FUSED_RESIDUAL_LN_WGSL,
             "fused_residual_ln",
+        )
+    })
+}
+pub fn fused_residual_ln_tee_vec4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    FUSED_RESIDUAL_LN_TEE_VEC4.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu fused_residual_ln_tee vec4",
+            FUSED_RESIDUAL_LN_TEE_VEC4_WGSL,
+            "fused_residual_ln_tee",
         )
     })
 }
@@ -4825,9 +5300,10 @@ pub fn matmul_qkv_coop_f16_vk_widen_kernel(device: &wgpu::Device) -> Option<&'st
 mod tests {
     use super::{
         ATTENTION_DECODE_MAX_HEAD_DIM, ATTENTION_WGSL, CONV_TRANSPOSE2D_TILED_WGSL,
-        ELEMENTWISE_REGION_WGSL, FRAMES_WGSL, FRAMES_WORKGROUP, MATMUL_WIDE_VEC4_WGSL,
-        SAMPLE_LANES, SAMPLE_WGSL, TILED_TILE_CO, TILED_TILE_U, WIDE_TAIL_M, WideGrid, WideVariant,
-        conv_transpose2d_tiled_grid, wide_grid,
+        ELEMENTWISE_REGION_WGSL, FRAMES_WGSL, FRAMES_WORKGROUP, FUSED_RESIDUAL_LN_TEE_VEC4_WGSL,
+        LAYERNORM_VEC4_WGSL, MATMUL_WIDE_VEC4_WGSL, NORM_VEC4_LANES, SAMPLE_LANES, SAMPLE_STAGE,
+        SAMPLE_WGSL, SNAKE_BETA_WG, SNAKE_BETA_WGSL, TILED_TILE_CO, TILED_TILE_U, WIDE_TAIL_M,
+        WideGrid, WideVariant, conv_transpose2d_tiled_grid, wide_grid,
     };
 
     /// `frames.wgsl` parses and validates under the WebGPU baseline, and the
@@ -4873,13 +5349,91 @@ mod tests {
     /// The sampler's cooperative one-row path splits a row across `SAMPLE_LANES`
     /// and dispatches one workgroup per row with that width; a shader whose
     /// `LANES` disagreed would dispatch a partial workgroup into a reduction that
-    /// assumes all of them.
+    /// assumes all of them. `STAGE` is the same kind of shared literal: it sizes
+    /// the workgroup array the staged path indexes, so a shader that declared a
+    /// larger `STAGE` than this would write past the storage the device grants and
+    /// one that declared a smaller one would read a row it did not stage. The parse
+    /// and validate is the same device-free gate the sibling shaders carry: this
+    /// module's workgroup storage (the staged row, the selection tree's lists) is
+    /// a layout naga can reject without a device, and a rejection would otherwise
+    /// surface as a panic at `create_shader_module` on the first machine whose
+    /// graph reaches a one-row draw.
     #[test]
-    fn sample_shader_declares_the_dispatched_lane_count() {
+    fn sample_shader_matches_its_dispatch_geometry() {
+        let module = naga::front::wgsl::parse_str(SAMPLE_WGSL).expect("wgsl parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("sample.wgsl validates under the WebGPU baseline");
         assert!(
             SAMPLE_WGSL.contains(&format!("const LANES: u32 = {SAMPLE_LANES}u;")),
             "sample.wgsl must declare `LANES` from `SAMPLE_LANES` ({SAMPLE_LANES})"
         );
+        assert!(
+            SAMPLE_WGSL.contains(&format!("const STAGE: u32 = {SAMPLE_STAGE}u;")),
+            "sample.wgsl must declare `STAGE` from `SAMPLE_STAGE` ({SAMPLE_STAGE})"
+        );
+    }
+
+    /// `snake_beta.wgsl` parses and validates under the WebGPU baseline, and the
+    /// column width its dispatch is built from is the one it declares. Device-free
+    /// (naga only), on the same reasoning as the tile pins below: a WGSL mistake
+    /// would otherwise surface as a panic at `create_shader_module` on the first
+    /// machine whose graph reaches the folded step.
+    #[test]
+    fn snake_beta_shader_matches_its_dispatch_geometry() {
+        let module = naga::front::wgsl::parse_str(SNAKE_BETA_WGSL).expect("wgsl parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("snake_beta.wgsl validates under the WebGPU baseline");
+        assert!(
+            SNAKE_BETA_WGSL.contains(&format!("@workgroup_size({SNAKE_BETA_WG})")),
+            "snake_beta.wgsl must declare `@workgroup_size({SNAKE_BETA_WG})`: the run \
+             divides a row by `SNAKE_BETA_WG`"
+        );
+    }
+
+    /// `layernorm_vec4.wgsl` and `fused_residual_ln_tee_vec4.wgsl` parse and
+    /// validate under the WebGPU baseline, and each declares the lane count its
+    /// dispatch is built from. Device-free (naga only), on the same reasoning as
+    /// the snake's pin: a WGSL mistake would otherwise surface as a panic at
+    /// `create_shader_module` on the first machine whose graph reaches the vector
+    /// route, which on this rig is the one adapter that always takes it.
+    #[test]
+    fn vec4_norm_shaders_match_their_dispatch_geometry() {
+        for (name, src) in [
+            ("layernorm_vec4.wgsl", LAYERNORM_VEC4_WGSL),
+            (
+                "fused_residual_ln_tee_vec4.wgsl",
+                FUSED_RESIDUAL_LN_TEE_VEC4_WGSL,
+            ),
+        ] {
+            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| {
+                panic!("{name}: {e:?}");
+            });
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name} must validate under the WebGPU baseline: {e:?}"));
+            assert!(
+                src.contains(&format!("@workgroup_size({NORM_VEC4_LANES})")),
+                "{name} must declare `@workgroup_size({NORM_VEC4_LANES})`: the run \
+                 dispatches `NORM_VEC4_LANES` lanes per row"
+            );
+            assert!(
+                src.contains(&format!("const WG: u32 = {NORM_VEC4_LANES}u;")),
+                "{name} must stride its invocations by `NORM_VEC4_LANES` too: the two \
+                 numbers live in one file and a drift between them would leave a row's \
+                 tail unread"
+            );
+        }
     }
 
     /// `conv_transpose2d_tiled.wgsl` parses and validates under the WebGPU
@@ -5132,6 +5686,23 @@ mod tests {
             "the route's decode head ceiling and the shader's `DECODE_MAX_DIM` are one \
              number: a width past the shader's leaves the entry's early return with no \
              output, so the step's slot is written by nobody"
+        );
+    }
+
+    /// The key-range split's partials are sized on the host
+    /// ([`super::ATTENTION_PARTS_DIM_CHUNK`]) and addressed in the shader
+    /// (`DECODE_DIM_CHUNK`). A pad the host is smaller than the shader's makes
+    /// every split step write past its buffer; a pad the host is larger than the
+    /// shader's leaves the merge reading a layout the decode entry did not fill.
+    #[test]
+    fn the_split_partials_pad_is_the_shaders_own() {
+        assert!(
+            ATTENTION_WGSL.contains(&format!(
+                "const DECODE_DIM_CHUNK: u32 = {}u;",
+                super::ATTENTION_PARTS_DIM_CHUNK
+            )),
+            "the split's partial stride is `2 + pad` on both sides, so the host's pad \
+             and the shader's `DECODE_DIM_CHUNK` are one number"
         );
     }
 }

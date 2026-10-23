@@ -49,16 +49,23 @@ const MAX_HEAD_DIM: u32 = 512u;
 
 // Decode-shaped variant: workgroup width == key lanes, and the value dims merged
 // per pass. DECODE_LANES * DECODE_DIM_CHUNK f32 is 8 KiB of workgroup storage
-// (8.26 KiB with the merge scratch), half of WebGPU's guaranteed 16 KiB
-// `maxComputeWorkgroupStorageSize` — the native backend's equivalent needs
-// 16.25 KiB and is above that floor.
+// (8.76 KiB with the merge scratch and the Q row), half of WebGPU's guaranteed
+// 16 KiB `maxComputeWorkgroupStorageSize` — the native backend's equivalent
+// needs 16.75 KiB and is above that floor.
 const DECODE_LANES: u32 = 64u;
+// Depth of the decode entry's contraction and value update: a power of two,
+// because both walks mask with `& ~(DECODE_UNROLL - 1)`, and equal to the
+// number of accumulators that entry spells out.
+const DECODE_UNROLL: u32 = 16u;
+// Value dims per merge pass, and the unit the split's partials are padded to:
+// the stride both entries below use is `2 + pad`, and
+// `kernels::ATTENTION_PARTS_DIM_CHUNK` sizes the buffer from the same number.
 const DECODE_DIM_CHUNK: u32 = 32u;
-// Widest head the decode entry's per-lane Q and O arrays hold. The route
-// (`kernels::attention_decode_eligible`) admits at most this width, and the two
-// arrays are sized for it rather than `MAX_HEAD_DIM`: at 512 they are 4 KiB of
+// Widest head the decode entry's per-lane O array and its Q row hold. The route
+// (`kernels::attention_decode_eligible`) admits at most this width, and both are
+// sized for it rather than `MAX_HEAD_DIM`: at 512 the O array alone is 2 KiB of
 // per-thread stack, which the Metal compiler spills, and every key iteration
-// then pays a thread-local load and store for them.
+// then pays a thread-local load and store for it.
 const DECODE_MAX_DIM: u32 = 128u;
 
 // The score a key position contributes after this operation's logit cap and
@@ -129,7 +136,9 @@ struct Params {
 
     // Per-tensor strides (in f32 elements). Q/K/V/out can be in either
     // [B, H, S, D] or [B, S, H, D] layout — caller sets the strides.
-    q_batch_stride: u32, q_head_stride: u32, q_seq_stride: u32, _pad_q: u32,
+    q_batch_stride: u32, q_head_stride: u32, q_seq_stride: u32,
+    // Key-range splits this step runs as (1 = one workgroup per head).
+    splits: u32,
     k_batch_stride: u32, k_head_stride: u32, k_seq_stride: u32, _pad_k: u32,
     v_batch_stride: u32, v_head_stride: u32, v_seq_stride: u32, _pad_v: u32,
     o_batch_stride: u32, o_head_stride: u32, o_seq_stride: u32, _pad_o: u32,
@@ -137,6 +146,11 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>              params: Params;
+// Per-split attention partials — `[m, l, O[0..hd_v_pad]]` per (row, split), the
+// reduction the key-range split hands to `attention_decode_merge`. Declared for
+// the module so every entry in it keeps one bind-group shape; the entries that
+// do not split never touch it.
+@group(0) @binding(2) var<storage, read_write> attention_parts: array<f32>;
 
 @compute @workgroup_size(64)
 fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
@@ -246,8 +260,28 @@ var<workgroup> dec_lane: array<f32, DECODE_LANES>;
 // Per-lane weighted O partials, `[dim * DECODE_LANES + lane]` (dim-major: the
 // writes and the reduction reads are both across consecutive lanes).
 var<workgroup> dec_dims: array<f32, DECODE_DIM_CHUNK * DECODE_LANES>;
+// One query row per workgroup instead of a copy per lane: filled once and
+// read once per key each lane walks.
+var<workgroup> dec_q: array<f32, DECODE_MAX_DIM>;
 
-// One workgroup per (batch, head); `row` is the (batch, head) pair. Every lane
+// The value width both decode entries read, in one body: `v_head_dim` 0 means
+// "equal to head_dim", and the partials' value dims round up to a
+// `DECODE_DIM_CHUNK` multiple so a split's store and the merge's read cover
+// whole passes. `part_stride` is the layout `attention_parts_bytes` sizes.
+struct DecodeGeom {
+    hd_v: u32,
+    hd_v_pad: u32,
+    part_stride: u32,
+};
+
+fn decode_geom() -> DecodeGeom {
+    let hd_v = select(params.v_head_dim, params.head_dim, params.v_head_dim == 0u);
+    let hd_v_pad = (hd_v + DECODE_DIM_CHUNK - 1u) / DECODE_DIM_CHUNK * DECODE_DIM_CHUNK;
+    return DecodeGeom(hd_v, hd_v_pad, 2u + hd_v_pad);
+}
+
+// One workgroup per (batch, head) and key range: `row` is the (batch, head)
+// pair and `split` picks the `splits`-th of its disjoint key ranges. Every lane
 // keeps its own running (m, l, O[]) over the keys it walks, and the merge at the
 // bottom is the same online-softmax rebase the serial kernel does serially: a
 // lane whose partial sits below the merged max contributes exp(m - max) of its
@@ -260,13 +294,17 @@ fn attention_decode(
     @builtin(num_workgroups) ngs: vec3<u32>,
 ) {
     let lid = lid3.x;
-    let row = wid3.x + wid3.y * ngs.x;
-    let total = params.batch * params.heads;
-    if (row >= total) { return; }
+    let splits = params.splits;
+    let raw = wid3.x + wid3.y * ngs.x;
+    let row = raw / splits;
+    let split = raw % splits;
+    let total = params.batch * params.heads * splits;
+    if (raw >= total) { return; }
     let h = row % params.heads;
     let b = row / params.heads;
     let hd = params.head_dim;
-    let hd_v = select(params.v_head_dim, hd, params.v_head_dim == 0u);
+    let geom = decode_geom();
+    let hd_v = geom.hd_v;
 
     let scale = bitcast<f32>(params.scale_bits);
     let cap = bitcast<f32>(params.logit_softcap_bits);
@@ -292,8 +330,8 @@ fn attention_decode(
         + qi * params.o_seq_stride;
 
     if (hd > DECODE_MAX_DIM || hd_v > DECODE_MAX_DIM) { return; }
-    var q_reg: array<f32, DECODE_MAX_DIM>;
-    for (var d: u32 = 0u; d < hd; d = d + 1u) { q_reg[d] = arena[q_base + d]; }
+    for (var d: u32 = lid; d < hd; d = d + DECODE_LANES) { dec_q[d] = arena[q_base + d]; }
+    workgroupBarrier();
 
     // Running (m, l, O[]) over this lane's share of the keys: lane `lid` takes
     // keys lid, lid + DECODE_LANES, ... . Zero-fill to a DECODE_DIM_CHUNK
@@ -301,7 +339,7 @@ fn attention_decode(
     var m: f32 = -3.4e38;
     var l: f32 = 0.0;
     var o: array<f32, DECODE_MAX_DIM>;
-    let hd_v_pad = (hd_v + DECODE_DIM_CHUNK - 1u) / DECODE_DIM_CHUNK * DECODE_DIM_CHUNK;
+    let hd_v_pad = geom.hd_v_pad;
     for (var d: u32 = 0u; d < hd_v_pad; d = d + 1u) { o[d] = 0.0; }
 
     // Mirrors the `attention` entry point's key loop — same cap, same mask
@@ -310,11 +348,52 @@ fn attention_decode(
     // rather than
     // factored into a shared helper on purpose: that helper measured ~1.6% on
     // the prefill path. The mask rule it applies is the shared `mask_score`.
-    for (var s: u32 = lid; s < params.seq_k; s = s + DECODE_LANES) {
+    // The walks below are DECODE_UNROLL deep, so that many loads are in flight
+    // per lane instead of one: a lane would otherwise walk its whole K and V row
+    // behind a single dependent accumulate, and 64 lanes is one or two warps
+    // depending on the adapter's subgroup width — too few to hide that miss.
+    let hd_unrolled = hd & ~(DECODE_UNROLL - 1u);
+    let hd_v_unrolled = hd_v & ~(DECODE_UNROLL - 1u);
+    for (var s: u32 = split * DECODE_LANES + lid; s < params.seq_k;
+         s = s + splits * DECODE_LANES) {
         let k_base = k_bh + s * params.k_seq_stride;
-        var score: f32 = 0.0;
-        for (var d: u32 = 0u; d < hd; d = d + 1u) {
-            score = score + q_reg[d] * arena[k_base + d];
+        var s0: f32 = 0.0;
+        var s1: f32 = 0.0;
+        var s2: f32 = 0.0;
+        var s3: f32 = 0.0;
+        var s4: f32 = 0.0;
+        var s5: f32 = 0.0;
+        var s6: f32 = 0.0;
+        var s7: f32 = 0.0;
+        var s8: f32 = 0.0;
+        var s9: f32 = 0.0;
+        var s10: f32 = 0.0;
+        var s11: f32 = 0.0;
+        var s12: f32 = 0.0;
+        var s13: f32 = 0.0;
+        var s14: f32 = 0.0;
+        var s15: f32 = 0.0;
+        for (var d: u32 = 0u; d < hd_unrolled; d = d + DECODE_UNROLL) {
+            s0 = s0 + dec_q[d] * arena[k_base + d];
+            s1 = s1 + dec_q[d + 1u] * arena[k_base + d + 1u];
+            s2 = s2 + dec_q[d + 2u] * arena[k_base + d + 2u];
+            s3 = s3 + dec_q[d + 3u] * arena[k_base + d + 3u];
+            s4 = s4 + dec_q[d + 4u] * arena[k_base + d + 4u];
+            s5 = s5 + dec_q[d + 5u] * arena[k_base + d + 5u];
+            s6 = s6 + dec_q[d + 6u] * arena[k_base + d + 6u];
+            s7 = s7 + dec_q[d + 7u] * arena[k_base + d + 7u];
+            s8 = s8 + dec_q[d + 8u] * arena[k_base + d + 8u];
+            s9 = s9 + dec_q[d + 9u] * arena[k_base + d + 9u];
+            s10 = s10 + dec_q[d + 10u] * arena[k_base + d + 10u];
+            s11 = s11 + dec_q[d + 11u] * arena[k_base + d + 11u];
+            s12 = s12 + dec_q[d + 12u] * arena[k_base + d + 12u];
+            s13 = s13 + dec_q[d + 13u] * arena[k_base + d + 13u];
+            s14 = s14 + dec_q[d + 14u] * arena[k_base + d + 14u];
+            s15 = s15 + dec_q[d + 15u] * arena[k_base + d + 15u];
+        }
+        var score: f32 = (((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7))) + (((s8 + s9) + (s10 + s11)) + ((s12 + s13) + (s14 + s15)));
+        for (var d: u32 = hd_unrolled; d < hd; d = d + 1u) {
+            score = score + dec_q[d] * arena[k_base + d];
         }
         score = score * scale;
         // Only kinds 2 and 4 read the mask tensor, so the others must not
@@ -329,7 +408,25 @@ fn attention_decode(
         let e_cur = exp(score - m_new);
         l = e_old * l + e_cur;
         let v_base = v_bh + s * params.v_seq_stride;
-        for (var d: u32 = 0u; d < hd_v; d = d + 1u) {
+        for (var d: u32 = 0u; d < hd_v_unrolled; d = d + DECODE_UNROLL) {
+            o[d] = e_old * o[d] + e_cur * arena[v_base + d];
+            o[d + 1u] = e_old * o[d + 1u] + e_cur * arena[v_base + d + 1u];
+            o[d + 2u] = e_old * o[d + 2u] + e_cur * arena[v_base + d + 2u];
+            o[d + 3u] = e_old * o[d + 3u] + e_cur * arena[v_base + d + 3u];
+            o[d + 4u] = e_old * o[d + 4u] + e_cur * arena[v_base + d + 4u];
+            o[d + 5u] = e_old * o[d + 5u] + e_cur * arena[v_base + d + 5u];
+            o[d + 6u] = e_old * o[d + 6u] + e_cur * arena[v_base + d + 6u];
+            o[d + 7u] = e_old * o[d + 7u] + e_cur * arena[v_base + d + 7u];
+            o[d + 8u] = e_old * o[d + 8u] + e_cur * arena[v_base + d + 8u];
+            o[d + 9u] = e_old * o[d + 9u] + e_cur * arena[v_base + d + 9u];
+            o[d + 10u] = e_old * o[d + 10u] + e_cur * arena[v_base + d + 10u];
+            o[d + 11u] = e_old * o[d + 11u] + e_cur * arena[v_base + d + 11u];
+            o[d + 12u] = e_old * o[d + 12u] + e_cur * arena[v_base + d + 12u];
+            o[d + 13u] = e_old * o[d + 13u] + e_cur * arena[v_base + d + 13u];
+            o[d + 14u] = e_old * o[d + 14u] + e_cur * arena[v_base + d + 14u];
+            o[d + 15u] = e_old * o[d + 15u] + e_cur * arena[v_base + d + 15u];
+        }
+        for (var d: u32 = hd_v_unrolled; d < hd_v; d = d + 1u) {
             o[d] = e_old * o[d] + e_cur * arena[v_base + d];
         }
         m = m_new;
@@ -358,7 +455,10 @@ fn attention_decode(
     workgroupBarrier();
     let inv_l = 1.0 / dec_pub[1];
 
-    // Output: value dims in DECODE_DIM_CHUNK-wide passes.
+    // Output: value dims in DECODE_DIM_CHUNK-wide passes. A split writes its
+    // `(m, l, O)` partial unnormalised for the merge entry instead of dividing.
+    let part_stride = geom.part_stride;
+    let part_base = (row * splits + split) * part_stride;
     for (var c: u32 = 0u; c < hd_v; c = c + DECODE_DIM_CHUNK) {
         for (var j: u32 = 0u; j < DECODE_DIM_CHUNK; j = j + 1u) {
             dec_dims[j * DECODE_LANES + lid] = w * o[c + j];
@@ -370,9 +470,69 @@ fn attention_decode(
             for (var i: u32 = 0u; i < DECODE_LANES; i = i + 1u) {
                 acc = acc + dec_dims[lid * DECODE_LANES + i];
             }
-            if (d < hd_v) { arena[o_base + d] = acc * inv_l; }
+            if (d < hd_v) {
+                if (splits > 1u) {
+                    attention_parts[part_base + 2u + d] = acc;
+                } else {
+                    arena[o_base + d] = acc * inv_l;
+                }
+            }
         }
         workgroupBarrier();
+    }
+    if (splits > 1u && lid == 0u) {
+        attention_parts[part_base] = dec_pub[0];
+        attention_parts[part_base + 1u] = dec_pub[1];
+    }
+}
+
+// The key-range split's second dispatch: one workgroup per (batch, head) merges
+// the per-split partials `attention_decode` wrote, rescaling each onto the
+// global max — the same online-softmax rebase the decode entry applies across
+// its lanes, one level up.
+@compute @workgroup_size(DECODE_LANES)
+fn attention_decode_merge(
+    @builtin(local_invocation_id) lid3: vec3<u32>,
+    @builtin(workgroup_id) wid3: vec3<u32>,
+    @builtin(num_workgroups) ngs: vec3<u32>,
+) {
+    let lid = lid3.x;
+    let row = wid3.x + wid3.y * ngs.x;
+    if (row >= params.batch * params.heads) { return; }
+    let geom = decode_geom();
+    let hd_v = geom.hd_v;
+    let splits = params.splits;
+    let part_stride = geom.part_stride;
+    let part_base = row * splits * part_stride;
+    let h = row % params.heads;
+    let b = row / params.heads;
+    let o_base = params.out_off
+        + b * params.o_batch_stride
+        + h * params.o_head_stride;
+    if (lid == 0u) {
+        var mm = -3.4e38;
+        for (var c: u32 = 0u; c < splits; c = c + 1u) {
+            mm = max(mm, attention_parts[part_base + c * part_stride]);
+        }
+        var ll = 0.0;
+        for (var c: u32 = 0u; c < splits; c = c + 1u) {
+            let p = part_base + c * part_stride;
+            ll = ll + exp(attention_parts[p] - mm) * attention_parts[p + 1u];
+        }
+        dec_pub[0] = mm;
+        // A row no key reached keeps the serial kernel's l = 1, O = 0.
+        dec_pub[1] = select(1.0, ll, ll > 0.0);
+    }
+    workgroupBarrier();
+    let mm = dec_pub[0];
+    let inv_l = 1.0 / dec_pub[1];
+    for (var d: u32 = lid; d < hd_v; d = d + DECODE_LANES) {
+        var acc = 0.0;
+        for (var c: u32 = 0u; c < splits; c = c + 1u) {
+            let p = part_base + c * part_stride;
+            acc = acc + exp(attention_parts[p] - mm) * attention_parts[p + 2u + d];
+        }
+        arena[o_base + d] = acc * inv_l;
     }
 }
 

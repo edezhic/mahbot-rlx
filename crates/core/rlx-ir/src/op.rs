@@ -901,10 +901,14 @@ pub enum Op {
     /// (input matches the output element count; kernel reads `gid`
     /// directly). `1` means scalar; any other value means the input
     /// has fewer elements than the output and they tile by modulo.
-    /// The encoder only allows broadcasts where `out_elems % in_elems
-    /// == 0` so the modulo divides cleanly. Lets chains include bias /
-    /// scale / eps / mask factors that previously broke the chain at
-    /// a Binary op with mismatched shapes.
+    /// Only a trailing broadcast can be expressed this way — one divisor
+    /// tiles a trailing slice, and `out_elems % in_elems == 0` is *not*
+    /// sufficient (a `[1, C, 1, 1]` operand divides cleanly and needs
+    /// `(gid / L) % C`). The admission rule is
+    /// [`region_encode::region_input_modulus`], enforced by the verifier and
+    /// by each backend's lowering. Lets chains include bias / scale / eps /
+    /// mask factors that previously broke the chain at a Binary op with
+    /// mismatched shapes.
     ElementwiseRegion {
         chain: Vec<ChainStep>,
         num_inputs: u32,

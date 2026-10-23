@@ -52,8 +52,14 @@ const PASSES_PER_ROUND: usize = 8;
 /// Timed rounds; the median is reported, the min/max kept as spread.
 const ROUNDS: usize = 5;
 
-/// Untimed rounds before `ROUNDS`, so the pipeline and buffer are resident.
-const WARMUP_ROUNDS: usize = 2;
+/// Untimed rounds before `ROUNDS`, so the pipeline and buffer are resident — and
+/// so the device's clocks have risen. A round is `PASSES_PER_ROUND` ×
+/// `BYTES_PER_DIRECTION` ≈ 512 MiB, ~4 ms on this machine, and two of them were
+/// not enough: the same probe read a median 119.4-120.8 GB/s (min 110.2) at the
+/// head of a stand run and 132.7-132.9 GB/s (min 131.8) after the cells, i.e. the
+/// cold reading was 10 % low and every share quoted against it 10 % high. Sixteen
+/// rounds ≈ 64 ms of sustained traffic is what the warm reading needed.
+const WARMUP_ROUNDS: usize = 16;
 
 /// Uniform layout for `stream_read.wgsl`. 16 bytes.
 #[repr(C)]

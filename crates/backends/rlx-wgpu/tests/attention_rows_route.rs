@@ -40,10 +40,7 @@ use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_wgpu::backend::{ATTENTION_DECOMPOSE_MIN_Q, WgpuExecutable};
-use rlx_wgpu::kernels::{
-    ATTENTION_DECODE_MIN_KEYS, AttentionRoutes, attention_route_counts,
-    reset_attention_route_counts,
-};
+use rlx_wgpu::kernels::{AttentionRoutes, attention_route_counts, reset_attention_route_counts};
 
 /// Rank-3 `[B, rows, heads·head_dim]` MHA over `lk` keys. `mask_kind` decides
 /// whether the graph carries a mask input and of which shape: `[B, lk]` binary
@@ -449,43 +446,45 @@ fn grouped_kv_and_asymmetric_v_take_the_route_and_match_cpu() {
     }
 }
 
-/// The serial kernel's side of the route's floor, on device: a single query row
-/// over fewer keys than the decode form serves keeps the fused/serial kernel, and
-/// its numbers. It is one of the two live serial controls here — the scratch
-/// budget's own case in `the_scratch_budget_bounds_the_route` is the other — and
-/// the side the floor must not swallow.
+/// One query row over a handful of keys takes the lane-parallel form, not the
+/// serial one, at the geometry the fork's code predictor runs: 16 heads of width
+/// 128 over 1..=16 keys (one cache row per level of its block, so a level's step
+/// walks as many keys as the level's index plus one). The route carries no key
+/// floor (`kernels::attention_decode_eligible`), so every one of those steps is
+/// this form's; reinstating any floor above 16 on the route puts this cell back
+/// on the serial kernel and turns the assertion red.
 #[test]
-fn a_one_row_short_key_step_keeps_the_serial_kernel() {
+fn a_one_row_short_key_step_takes_the_decode_form() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return;
     }
     let _guard = route_lock();
-    const NH: usize = 8;
-    const HD: usize = 64;
-    // 48 keys sits under the decode form's own 64-key floor, so a single row is
-    // the serial kernel's (see the assertion below); the mask is `None` because
-    // this cell pins the kernel, not a mask kind.
-    let lk = 48;
-    let (_, routes, d, us) = run_case(1, 1, lk, NH, HD, MaskKind::None);
-    eprintln!(
-        "[rlx-attn-rows-serial] rows=1 heads={NH} head_dim={HD} lk={lk} \
-         routes={routes:?} vs CPU: max_abs={d:.6e} ({us:.1} us)"
-    );
-    assert!(
-        lk <= ATTENTION_DECODE_MIN_KEYS as usize,
-        "the decode form's own floor must not cover this cell"
-    );
-    assert_eq!(
-        routes,
-        AttentionRoutes {
-            decode: 0,
-            decomposed: 0,
-            serial: 1,
-        },
-        "one query row over {lk} keys is the serial kernel's"
-    );
-    assert!(d < ATTENTION_BAR, "the serial kernel: max_abs {d} vs CPU");
+    const NH: usize = 16;
+    const HD: usize = 128;
+    // The bar scales with the head width: the two backends' summation orders
+    // separate about three times further at 16 heads of 128 than on the 8 × 64
+    // cells `ATTENTION_BAR` was set on (measured 1.0e-6 at four keys here), so this
+    // cell carries its own rather than loosening the shared one.
+    const BAND_BAR: f32 = 4.0 * ATTENTION_BAR;
+    // The mask is `None` because this cell pins the kernel, not a mask kind.
+    for lk in [1usize, 2, 3, 4, 8, 16] {
+        let (_, routes, d, us) = run_case(1, 1, lk, NH, HD, MaskKind::None);
+        eprintln!(
+            "[rlx-attn-rows-decode] rows=1 heads={NH} head_dim={HD} lk={lk} \
+             routes={routes:?} vs CPU: max_abs={d:.6e} ({us:.1} us)"
+        );
+        assert_eq!(
+            routes,
+            AttentionRoutes {
+                decode: 1,
+                decomposed: 0,
+                serial: 0,
+            },
+            "one query row over {lk} keys is the lane-parallel form's"
+        );
+        assert!(d < BAND_BAR, "the decode form: max_abs {d} vs CPU");
+    }
 }
 
 /// Causal with fewer keys than query rows — a shape the two-row floor newly
@@ -549,14 +548,14 @@ fn route_mask_kinds_match_cpu() {
 
 /// The shapes the cross-arrangement pair below walks: one row for the serial
 /// kernel, two for the route, over one key sequence.
-const CROSS_SERIAL_ROWS: usize = 1;
+const CROSS_ONE_ROW_ROWS: usize = 1;
 const CROSS_DENSE_ROWS: usize = 2;
 const CROSS_LK: usize = 32;
 const CROSS_NH: usize = 8;
 const CROSS_HD: usize = 64;
 
 /// The two arrangements on the same problem: one query row over [`CROSS_LK`]
-/// keys takes the serial kernel, two rows over the same keys take the dense
+/// keys takes the lane-parallel form, two rows over the same keys take the dense
 /// arrangement, and because both derive the causal position the same way —
 /// `qi + (seq_k - seq_q)` — their last shared row, row
 /// [`CROSS_DENSE_ROWS`] − 1, attends all [`CROSS_LK`] keys in both, so it is one
@@ -564,7 +563,7 @@ const CROSS_HD: usize = 64;
 ///
 /// The shared row is compared as a max-abs — two arrangements of the same f32
 /// work, whose measured deviation is printed. It is explicitly **not** bit
-/// identity: the serial form rebases its softmax key by key where the dense form
+/// identity: the one-row form rebases per lane and merges, where the dense form
 /// rebases once against the row max.
 #[test]
 fn the_two_arrangements_agree_on_their_shared_row() {
@@ -574,9 +573,9 @@ fn the_two_arrangements_agree_on_their_shared_row() {
     }
     let _guard = route_lock();
     let dim = CROSS_NH * CROSS_HD;
-    let serial = chain(
+    let one_row = chain(
         1,
-        CROSS_SERIAL_ROWS,
+        CROSS_ONE_ROW_ROWS,
         CROSS_LK,
         CROSS_NH,
         CROSS_HD,
@@ -605,16 +604,16 @@ fn the_two_arrangements_agree_on_their_shared_row() {
     // two are one computation; reading the first row instead would compare two
     // different queries.
     let shared = (CROSS_DENSE_ROWS - 1) * dim;
-    let (serial_out, serial_routes, serial_us) = run(serial, &q[shared..shared + dim]);
+    let (one_row_out, one_row_routes, one_row_us) = run(one_row, &q[shared..shared + dim]);
     let (dense_out, dense_routes, dense_us) = run(dense, &q[..CROSS_DENSE_ROWS * dim]);
     assert_eq!(
-        serial_routes,
+        one_row_routes,
         AttentionRoutes {
-            decode: 0,
+            decode: 1,
             decomposed: 0,
-            serial: 1,
+            serial: 0,
         },
-        "one query row over {CROSS_LK} keys must keep the serial kernel"
+        "one query row over {CROSS_LK} keys must take the lane-parallel form"
     );
     assert_eq!(
         dense_routes,
@@ -625,14 +624,14 @@ fn the_two_arrangements_agree_on_their_shared_row() {
         },
         "{CROSS_DENSE_ROWS} query rows over {CROSS_LK} keys must take the dense arrangement"
     );
-    let cross = max_abs_diff(&dense_out[shared..shared + dim], &serial_out);
+    let cross = max_abs_diff(&dense_out[shared..shared + dim], &one_row_out);
     eprintln!(
-        "[rlx-attn-rows-cross] serial({CROSS_SERIAL_ROWS} row, {serial_us:.1} us) vs \
+        "[rlx-attn-rows-cross] one-row({CROSS_ONE_ROW_ROWS} row, {one_row_us:.1} us) vs \
          dense({CROSS_DENSE_ROWS} rows, {dense_us:.1} us) on their shared row: max_abs={cross:.6e}"
     );
     assert!(
         cross < ATTENTION_BAR,
-        "the serial and dense arrangements disagree on the shared row: max_abs {cross}"
+        "the one-row and dense arrangements disagree on the shared row: max_abs {cross}"
     );
 }
 

@@ -108,21 +108,17 @@ impl Pass for MarkElementwiseRegions {
             if !chain_step_safe(&graph, node) {
                 continue;
             }
-            // Each input must either match the output element count
-            // exactly OR be a trailing-shape broadcast (its element
-            // count divides the output's). The kernel reads
-            // `arena[input_offs[i] + (gid % input_modulus[i])]` for
-            // broadcast inputs; non-broadcast inputs leave the modulus
-            // at 0 to skip the modulo.
+            // Each input must be either the output's own shape or a strict trailing
+            // broadcast of it (`rlx_ir::region_encode::region_input_modulus` is the
+            // rule and says what a mid-axis singleton does). Anything the encoding
+            // cannot express stays an ordinary Binary/Compare/Where node, which the
+            // backend computes correctly. Judged per node as well as per region, so a
+            // node the encoding cannot express breaks the chain instead of being
+            // carried into a region the analysis check below would decline whole —
+            // which would take the steps on either side of it down with it.
             let out_shape = &node.shape;
-            let out_elems = out_shape.num_elements();
             let shape_ok = node.inputs.iter().all(|id| {
-                let in_elems = graph.shape(*id).num_elements();
-                match (in_elems, out_elems) {
-                    (Some(i), Some(o)) if i == o => true,
-                    (Some(i), Some(o)) if i > 0 && o % i == 0 => true,
-                    _ => false,
-                }
+                rlx_ir::region_encode::region_input_modulus(out_shape, graph.shape(*id)).is_ok()
             });
             if !shape_ok {
                 continue;
@@ -217,7 +213,9 @@ impl Pass for MarkElementwiseRegions {
             tail_of_region.insert(*root, *tails[0]);
         }
 
-        // Drop regions that exceed what a native region kernel can express.
+        // Drop regions that exceed what a native region kernel can express —
+        // its step and input limits, and an operand the encoding has no divisor
+        // for.
         //
         // This check belongs HERE, in the analysis phase, and used to live in
         // the rewrite below — which was a latent correctness bug, not a style
@@ -233,7 +231,7 @@ impl Pass for MarkElementwiseRegions {
         // Only `debug_assert_valid!` caught it, so a release build handed the
         // dangling operand to the backend. Reproduces with 20 distinct inputs
         // against `max_elementwise_inputs: 16`.
-        let over_limit = |members: &[NodeId]| {
+        let beyond_kernel = |root: &NodeId, members: &[NodeId]| {
             let limits = crate::limits::active_fusion_limits();
             if members.len() as u32 > limits.max_elementwise_steps {
                 return true;
@@ -250,14 +248,24 @@ impl Pass for MarkElementwiseRegions {
                     }
                 }
             }
-            external.len() as u32 > limits.max_elementwise_inputs
+            if external.len() as u32 > limits.max_elementwise_inputs {
+                return true;
+            }
+            // Judged against the tail's shape — the shape the emitted region node
+            // carries — so the emission site has nothing left to refuse.
+            let tail_shape = &graph.node(tail_of_region[root]).shape;
+            external.iter().any(|ext| {
+                rlx_ir::region_encode::region_input_modulus(tail_shape, graph.shape(*ext)).is_err()
+            })
         };
 
         // Drop "regions" that aren't worth fusing (size < 2 or non-unique tail)
         // or that no kernel could express.
         let by_region: HashMap<NodeId, Vec<NodeId>> = by_region
             .into_iter()
-            .filter(|(root, members)| tail_of_region.contains_key(root) && !over_limit(members))
+            .filter(|(root, members)| {
+                tail_of_region.contains_key(root) && !beyond_kernel(root, members)
+            })
             .collect();
 
         if by_region.is_empty() {
@@ -365,25 +373,27 @@ impl Pass for MarkElementwiseRegions {
                     // scalar). `input_modulus[i]` is the per-input
                     // element count: 0 means "no broadcast" (kernel
                     // reads gid directly), >0 means tile by modulo.
-                    // Encoder enforces `out_elems % in_elems == 0`
-                    // upstream so the modulo divides cleanly.
+                    // The analysis phase declined every operand this
+                    // encoding cannot express against this region's tail
+                    // shape (`rlx_ir::region_encode::region_input_modulus`),
+                    // so the `expect` names the invariant rather than
+                    // minting a divisor.
                     let mut scalar_input_mask: u32 = 0;
                     let mut input_modulus = [0u32; 16];
-                    let region_shape_elems = graph.node(tail).shape.num_elements();
+                    let tail_shape = &graph.node(tail).shape;
+                    let region_shape_elems = tail_shape.num_elements();
                     for (i, &ext) in external_inputs.iter().enumerate() {
                         if i >= 16 {
                             break;
                         }
                         let in_elems = graph.shape(ext).num_elements();
-                        match (in_elems, region_shape_elems) {
-                            (Some(1), Some(o)) if o != 1 => {
-                                scalar_input_mask |= 1u32 << i;
-                                input_modulus[i] = 1;
-                            }
-                            (Some(i_n), Some(o)) if i_n != o && i_n > 0 => {
-                                input_modulus[i] = i_n as u32;
-                            }
-                            _ => { /* no broadcast: leave modulus 0 */ }
+                        input_modulus[i] = rlx_ir::region_encode::region_input_modulus(
+                            tail_shape,
+                            graph.shape(ext),
+                        )
+                        .expect("the analysis phase admits every operand against the region's tail shape");
+                        if in_elems == Some(1) && region_shape_elems != Some(1) {
+                            scalar_input_mask |= 1u32 << i;
                         }
                     }
                     let region_new = rw.add_fused(

@@ -119,6 +119,13 @@ fn device_census(g: &Graph) -> std::collections::BTreeMap<&'static str, usize> {
     WgpuExecutable::compile(g.clone()).step_kind_counts()
 }
 
+/// The concat work a census carries, as dispatches: one per input in the plain
+/// form (`concat`), one for the whole op where the fold takes it
+/// (`concat_many`).
+fn concat_steps(census: &std::collections::BTreeMap<&'static str, usize>) -> usize {
+    census.get("concat").copied().unwrap_or(0) + census.get("concat_many").copied().unwrap_or(0)
+}
+
 /// The pins below read the fold's *default* route: the shared set of routing knobs
 /// (`common::neutralise_device_route_env`) plus this fold's own op levers, which the
 /// shared set leaves to the op that owns them — the framed concat is a concat, so
@@ -155,8 +162,8 @@ fn the_framing_folds_to_one_step_and_reproduces_the_matrix_exactly() {
             "{n_frames}×{frame_len}: the framing must be one `frames` step; census {census:?}"
         );
         assert_eq!(
-            (census.get("narrow"), census.get("concat")),
-            (None, None),
+            (census.get("narrow").copied(), concat_steps(&census)),
+            (None, 0),
             "{n_frames}×{frame_len}: the per-frame steps must be gone; census {census:?}"
         );
         assert_eq!(
@@ -251,6 +258,59 @@ fn a_framing_over_a_source_with_rows_keeps_its_per_frame_steps() {
     let got = exe.run(&[("x", &sig)]).remove(0);
     let want = reference(&sig, B, t, &uniform_starts(n_frames, hop), frame_len);
     assert_bit_identical(&got, &want, "the row source's per-frame framing");
+}
+
+/// The concat fold's mode: the **planned** run is copied at a partial extent too.
+///
+/// Two 2-row pieces at half extent: the walked axis is the pieces' own leading dim,
+/// which their producers write, so every piece's planned rows must reach the
+/// output — a rule that cut the concat axis to the walked total would leave the
+/// second piece's rows holding the previous run's bytes.
+/// `a_framing_over_a_row_source_keeps_the_mode` is the same rule through the
+/// framing that builds it.
+#[test]
+fn a_concat_copies_its_planned_run_at_a_partial_extent() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        eprintln!("no wgpu adapter — skipping");
+        return;
+    }
+    pin_the_device_route();
+    const W: usize = 24;
+    let mut g = Graph::new("concat_many_walked");
+    let a = g.input("a", Shape::new(&[2, W], DType::F32));
+    let b = g.input("b", Shape::new(&[2, W], DType::F32));
+    let out = g.add_node(
+        Op::Concat { axis: 0 },
+        vec![a, b],
+        Shape::new(&[4, W], DType::F32),
+    );
+    g.set_outputs(vec![out]);
+    assert_eq!(
+        concat_steps(&device_census(&g)),
+        1,
+        "the fold must take the concat for this pin to be about its mode"
+    );
+    let mut exe = WgpuExecutable::compile(g);
+    let a1: Vec<f32> = (0..2 * W).map(|i| i as f32).collect();
+    let b1: Vec<f32> = (0..2 * W).map(|i| 100.0 + i as f32).collect();
+    let full = exe.run(&[("a", &a1), ("b", &b1)]).remove(0);
+    assert_bit_identical(
+        &full,
+        &[a1.as_slice(), b1.as_slice()].concat(),
+        "the full run",
+    );
+
+    let a2: Vec<f32> = (0..2 * W).map(|i| 7.0 + i as f32).collect();
+    let b2: Vec<f32> = (0..2 * W).map(|i| 500.0 + i as f32).collect();
+    exe.set_active_extent(Some((2, 4)));
+    let walked = exe.run(&[("a", &a2), ("b", &b2)]).remove(0);
+    let want = [a2.as_slice(), b2.as_slice()].concat();
+    assert_bit_identical(
+        &walked,
+        &want,
+        "both pieces' planned rows reach the output at a partial extent — the \
+         walk shortens the pieces' own leading dim, not the concat axis",
+    );
 }
 
 /// And the mode still means what it always meant there: the per-frame steps trim
@@ -438,12 +498,7 @@ fn the_front_ends_own_builders_fold_too() {
         }
         let own: Vec<(usize, usize)> = censuses
             .iter()
-            .map(|(_, c)| {
-                (
-                    c.get("narrow").copied().unwrap_or(0),
-                    c.get("concat").copied().unwrap_or(0),
-                )
-            })
+            .map(|(_, c)| (c.get("narrow").copied().unwrap_or(0), concat_steps(c)))
             .collect();
         assert!(
             own.windows(2).all(|w| w[0] == w[1]),
@@ -543,9 +598,9 @@ fn a_near_miss_keeps_the_per_frame_steps_and_the_matrix() {
         "a non-uniform hop must not fold; census {census:?}"
     );
     assert_eq!(
-        (census.get("narrow"), census.get("concat")),
-        (Some(&n_frames), Some(&n_frames)),
-        "the per-frame steps must be the ones left; census {census:?}"
+        (census.get("narrow").copied(), concat_steps(&census)),
+        (Some(n_frames), 1),
+        "the per-frame steps must be the ones left, the concat in one dispatch; census {census:?}"
     );
     let sig = signal(t);
     let got = WgpuExecutable::compile(g).run(&[("x", &sig)]).remove(0);
@@ -579,9 +634,9 @@ fn a_near_miss_keeps_the_per_frame_steps_and_the_matrix() {
         "a frame with a second consumer must not fold; census {census:?}"
     );
     assert_eq!(
-        (census.get("narrow"), census.get("concat")),
-        (Some(&n_frames), Some(&n_frames)),
-        "the per-frame steps must be the ones left; census {census:?}"
+        (census.get("narrow").copied(), concat_steps(&census)),
+        (Some(n_frames), 1),
+        "the per-frame steps must be the ones left, the concat in one dispatch; census {census:?}"
     );
     let got = WgpuExecutable::compile(g).run(&[("x", &sig)]).remove(0);
     assert_bit_identical(
@@ -702,9 +757,9 @@ fn a_graph_output_row_refuses_the_fold() {
         "a graph-output row must not fold; census {census:?}"
     );
     assert_eq!(
-        (census.get("narrow"), census.get("concat")),
-        (Some(&n_frames), Some(&n_frames)),
-        "the per-frame steps must be the ones left; census {census:?}"
+        (census.get("narrow").copied(), concat_steps(&census)),
+        (Some(n_frames), 1),
+        "the per-frame steps must be the ones left, the concat in one dispatch; census {census:?}"
     );
     let sig = signal(t);
     let got = WgpuExecutable::compile(g).run(&[("x", &sig)]);

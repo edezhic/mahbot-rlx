@@ -529,11 +529,15 @@ fn vmap_op(
         // ── ElementwiseRegion: same policy as plain elementwise ──
         // The chain operates on shape `[*]` per element; lifting all
         // inputs to `[B, *]` and letting the chain run with the wider
-        // shape gives the right per-batch result. The fused kernel's
-        // `input_modulus` machinery already handles broadcast inputs
-        // — but for true unbatched-into-batched broadcast we'd need
-        // to update those moduli. For MVP: lift everything to
-        // batched (so all inputs share `[B, *]`), keep the chain.
+        // shape gives the right per-batch result. Lifting keeps the op's
+        // stored `input_modulus`, which is canonical only for the shape it
+        // was fused at: a region whose operand was a scalar or a trailing
+        // slice of `[*]` is no longer expressible against `[B, *]` once
+        // that operand lifts to `[B]` — `rlx_ir::verify` refuses it rather
+        // than let the kernel read a wrong element. A broadcast-carrying
+        // region therefore has to have its moduli recomputed (or be
+        // unfused) before it can be vmap'd; uniform-input regions lift as
+        // they are.
         Op::ElementwiseRegion { .. } => {
             let lifted: Vec<NodeId> = new_inputs
                 .iter()

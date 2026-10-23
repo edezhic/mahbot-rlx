@@ -12,7 +12,10 @@
 // the drawn id keeps the serial order — the exponent sum and the
 // renormalisation sum stay lane-0 loops in index order, the max scans keep the
 // lower index on ties — so the cooperative path picks exactly the id the serial
-// one does.
+// one does. A row that fits `STAGE` is staged in workgroup storage first, so
+// those passes read it instead of the arena. That scratch — the 8 KiB row, the
+// selection tree's per-lane lists and the picked indices, about 11 KiB — is
+// reserved by every dispatch of this entry point, the per-row path included.
 //
 // Algorithm:
 //   1. Scale logits by 1/temperature into the scratch slot; track row max.
@@ -116,17 +119,58 @@ fn threefry2x32_20(c_in: vec2<u32>, k_in: vec2<u32>) -> vec2<u32> {
     return vec2<u32>(x0, x1);
 }
 
+/// One index's Gumbel-max score: `log p + g`, with `g` from the counter-based
+/// draw the sampler (and the host reference it is checked against) uses. `ctr` is
+/// the row — `0` for a one-row draw, the batch index on the per-row path, which
+/// is what makes the two draw the same uniform stream row for row.
+fn gumbel_score(p: f32, i: u32, ctr: u32, key: vec2<u32>) -> f32 {
+    let rng2 = threefry2x32_20(vec2<u32>(ctr, i), key);
+    // The high 24 bits as a uniform on [0, 1); `1e-30` guards the log of a zero.
+    let u: f32 = f32(rng2.x >> 8u) / 16777216.0;
+    let g: f32 = -log(-log(max(u, 1e-30)));
+    return log(p) + g;
+}
+
 /// The workgroup width of every entry point in this module, written once: the
 /// scratch arrays, the cooperative scans' strides and the grid's row index are
 /// all this number (it is also each `@workgroup_size`). The dispatch is computed
 /// with `kernels::SAMPLE_LANES`, which a unit test holds to this literal.
 const LANES: u32 = 64u;
 
+/// The widest row `sample_one_staged` can hold in workgroup storage (8 KiB of the
+/// device's 16 KiB minimum). A wider one-row draw keeps the global-memory path;
+/// `kernels::SAMPLE_STAGE` is this number, held to it by a unit test.
+const STAGE: u32 = 2048u;
+
+/// The picked indices a draw records, so the restore sum and the discharge can
+/// visit the selected set instead of the row. A wider `top_k` (or `top_k == 0`
+/// with `top_p < 1`, whose count is the row's) keeps the row scans.
+const PICK_MAX: u32 = 64u;
+
+/// A lane's candidate list: descending by value, ascending by index on a tie. Four
+/// entries — one round of the selection tree's pick count. A function-scope list is
+/// indexed by constant only: a runtime index would put it in function-local memory,
+/// and the scan pushes into it once per element. The list is constructible, so
+/// `wg4` holds the lanes' lists as they are.
+struct Cand {
+    v: array<f32, 4>,
+    i: array<u32, 4>,
+}
+
 // Workgroup scratch for a one-row draw. `wg_best` reduces (value, index) pairs;
 // `wg_one` broadcasts the one scalar the serial order must produce on lane 0.
 var<workgroup> wg_best_v: array<f32, LANES>;
 var<workgroup> wg_best_i: array<u32, LANES>;
 var<workgroup> wg_one: f32;
+// The staged row: a one-row draw's probabilities, in the workgroup's own address
+// space instead of the arena. Every pass below touches it `LANES`-strided, so the
+// two serial reductions are the only lane-0 work left.
+var<workgroup> row: array<f32, STAGE>;
+// The selection tree's per-lane candidate lists, and the picked indices of a
+// draw whose `k_limit` fits `PICK_MAX` (ascending, so the restore sums them in
+// the serial pass's own order).
+var<workgroup> wg4: array<Cand, LANES>;
+var<workgroup> picks: array<u32, PICK_MAX>;
 
 /// The best **value** over the workgroup: higher wins, and on an exact tie the
 /// **lower index** wins — the serial scan's `v > best` order. The index is
@@ -153,6 +197,59 @@ fn wg_best(lane: u32, value: f32, index: u32) -> f32 {
         stride = stride / 2u;
     }
     return wg_best_v[0];
+}
+
+// ── the selection's candidates ───────────────────────────────────
+//
+// (value desc, index asc) is a total order, so the row's next four values are
+// the top four of the union of the lanes' own top four — a tree of merges,
+// one barrier per level. That is what makes a pick cheap: one round of the tree
+// yields four picks, and a round costs the same as the single-pick reduce it
+// replaces.
+
+fn cand_better(av: f32, ai: u32, bv: f32, bi: u32) -> bool {
+    return av > bv || (av == bv && ai < bi);
+}
+
+fn cand_empty() -> Cand {
+    return Cand(array<f32, 4>(-1.0, -1.0, -1.0, -1.0), array<u32, 4>(0u, 0u, 0u, 0u));
+}
+
+/// Insert one candidate into a list that is already in order: the newcomer takes
+/// the tail if it beats it, then bubbles up while it beats the one above. The list
+/// stays the four best of what has been offered, which is what the merge relies on.
+fn cand_push(c: Cand, v: f32, i: u32) -> Cand {
+    var r = c;
+    if (!cand_better(v, i, r.v[3], r.i[3])) { return r; }
+    r.v[3] = v;
+    r.i[3] = i;
+    if (cand_better(r.v[3], r.i[3], r.v[2], r.i[2])) {
+        let tv1 = r.v[2];
+        let ti1 = r.i[2];
+        r.v[2] = r.v[3]; r.i[2] = r.i[3];
+        r.v[3] = tv1; r.i[3] = ti1;
+        if (cand_better(r.v[2], r.i[2], r.v[1], r.i[1])) {
+            let tv2 = r.v[1];
+            let ti2 = r.i[1];
+            r.v[1] = r.v[2]; r.i[1] = r.i[2];
+            r.v[2] = tv2; r.i[2] = ti2;
+            if (cand_better(r.v[1], r.i[1], r.v[0], r.i[0])) {
+                let tv3 = r.v[0];
+                let ti3 = r.i[0];
+                r.v[0] = r.v[1]; r.i[0] = r.i[1];
+                r.v[1] = tv3; r.i[1] = ti3;
+            }
+        }
+    }
+    return r;
+}
+
+fn cand_merge(a: Cand, b: Cand) -> Cand {
+    var r = cand_push(a, b.v[0], b.i[0]);
+    r = cand_push(r, b.v[1], b.i[1]);
+    r = cand_push(r, b.v[2], b.i[2]);
+    r = cand_push(r, b.v[3], b.i[3]);
+    return r;
 }
 
 /// `outer == 1`: the whole workgroup draws row 0. The loops whose *order*
@@ -262,13 +359,223 @@ fn sample_one_coop(lane: u32) {
     for (var i: u32 = lane; i < inner; i = i + LANES) {
         let p = arena[sbase + i];
         if (p <= 0.0) { continue; }
-        let rng2 = threefry2x32_20(vec2<u32>(0u, i), key);
-        let u: f32 = f32(rng2.x >> 8u) / 16777216.0;
-        let g: f32 = -log(-log(max(u, 1e-30)));
-        let score: f32 = log(p) + g;
+        let score = gumbel_score(p, i, 0u, key);
         if (score > best_score) {
             best_score = score;
             best_i = i;
+        }
+    }
+    wg_best(lane, best_score, best_i);
+    if (lane == 0u) {
+        arena[params.out_off] = f32(wg_best_i[0]);
+    }
+}
+
+/// The ascending sum of `n` staged values. The one reduction whose **order**
+/// decides the drawn bits, so it is one serial chain on lane 0; the unrolled body
+/// only hoists the loads (the additions stay in index order).
+fn staged_sum(n: u32) -> f32 {
+    var s: f32 = 0.0;
+    var i: u32 = 0u;
+    loop {
+        if (i + 8u > n) { break; }
+        let a0 = row[i];
+        let a1 = row[i + 1u];
+        let a2 = row[i + 2u];
+        let a3 = row[i + 3u];
+        let a4 = row[i + 4u];
+        let a5 = row[i + 5u];
+        let a6 = row[i + 6u];
+        let a7 = row[i + 7u];
+        s = s + a0;
+        s = s + a1;
+        s = s + a2;
+        s = s + a3;
+        s = s + a4;
+        s = s + a5;
+        s = s + a6;
+        s = s + a7;
+        i = i + 8u;
+    }
+    loop {
+        if (i >= n) { break; }
+        s = s + row[i];
+        i = i + 1u;
+    }
+    return s;
+}
+
+/// `outer == 1` with the row staged: the arithmetic of `sample_one_coop`, in the
+/// same order — the same picks, the same two serial sums, the same Gumbel scores —
+/// with every pass over `row` instead of the arena. Staging is what removes the
+/// global-memory latency a wide row's draw is dominated by: the passes are
+/// `LANES`-strided workgroup accesses, and only the two order-deciding sums stay
+/// on lane 0. The two paths differ in the address space they read, not in what
+/// they compute — and a WGSL `ptr` is bound to one address space, so a helper
+/// cannot take the arena and the staged row as one parameter; the passes are
+/// therefore spelled twice rather than shared.
+fn sample_one_staged(lane: u32) {
+    let inner = params.inner;
+    let base = params.in_off;
+    let temp = bitcast<f32>(params.temp_bits);
+    let top_p = bitcast<f32>(params.top_p_bits);
+    let inv_temp = 1.0 / max(temp, 1e-6);
+    let need_filter = (params.top_k > 0u) || (top_p < 1.0 && top_p > 0.0);
+    let k_limit = select(inner, params.top_k, params.top_k > 0u);
+    // A picked set that fits `PICK_MAX` is recorded, and the restore sum and the
+    // discharge visit it instead of walking the row. `picks` is filled only inside
+    // the filter block, so both short paths also test `need_filter`.
+    let recording = k_limit <= PICK_MAX;
+
+    // 1. Apply temperature into the staged row; row max.
+    var local_max: f32 = NEG_INF;
+    for (var i: u32 = lane; i < inner; i = i + LANES) {
+        let v = arena[base + i] * inv_temp;
+        row[i] = v;
+        local_max = max(local_max, v);
+    }
+    let m: f32 = wg_best(lane, local_max, 0u);
+
+    // 2. exp into the staged row, then the sum in index order on lane 0.
+    for (var i: u32 = lane; i < inner; i = i + LANES) {
+        row[i] = exp(row[i] - m);
+    }
+    workgroupBarrier();
+    if (lane == 0u) {
+        wg_one = staged_sum(inner);
+    }
+    workgroupBarrier();
+    let inv_sum = 1.0 / wg_one;
+    for (var i: u32 = lane; i < inner; i = i + LANES) {
+        row[i] = row[i] * inv_sum;
+    }
+    workgroupBarrier();
+
+    // 3. Top-K / Top-P: the picks of `sample_one_coop`, in its order and with its
+    //    tie-break (`cand_better` keeps the lower index), four a round.
+    var cum: f32 = 0.0;
+    var picked_count: u32 = 0u;
+    if (need_filter) {
+        var done: bool = false;
+        loop {
+            if (done) { break; }
+            // The row's next four values: each lane's own top four, merged
+            // pairwise up the workgroup — one barrier a level, and the total order
+            // makes the merge exact, so the order is the serial scan's.
+            var c = cand_empty();
+            for (var i: u32 = lane; i < inner; i = i + LANES) {
+                let v = row[i];
+                // The tail test is inline: a candidate that cannot enter the list
+                // must not cost a `Cand` copy, and most of the row cannot.
+                if (v >= 0.0 && cand_better(v, i, c.v[3], c.i[3])) {
+                    c = cand_push(c, v, i);
+                }
+            }
+            wg4[lane] = c;
+            workgroupBarrier();
+            var stride: u32 = LANES / 2u;
+            loop {
+                if (stride == 0u) { break; }
+                if (lane < stride) {
+                    wg4[lane] = cand_merge(wg4[lane], wg4[lane + stride]);
+                }
+                workgroupBarrier();
+                stride = stride / 2u;
+            }
+            // Slot 0 now holds the row's next four, in the order they are picked.
+            for (var j: u32 = 0u; j < 4u; j = j + 1u) {
+                if (picked_count >= k_limit) {
+                    done = true;
+                    break;
+                }
+                let v = wg4[0u].v[j];
+                let i = wg4[0u].i[j];
+                if (v < 0.0) {
+                    done = true;
+                    break;
+                }
+                if (lane == 0u) {
+                    row[i] = -v - SENTINEL_EPS;
+                    if (recording) {
+                        // Keep `picks` ascending by index: the restore sum then adds
+                        // the selected values in the serial pass's own order.
+                        var at: u32 = picked_count;
+                        loop {
+                            if (at == 0u) { break; }
+                            if (picks[at - 1u] < i) { break; }
+                            picks[at] = picks[at - 1u];
+                            at = at - 1u;
+                        }
+                        picks[at] = i;
+                    }
+                }
+                cum = cum + v;
+                picked_count = picked_count + 1u;
+                if (top_p < 1.0 && cum >= top_p) {
+                    done = true;
+                    break;
+                }
+            }
+            workgroupBarrier();
+        }
+        // Restore the selected set and zero the rest — summed in index order on
+        // lane 0, exactly as the serial pass does, with the writes spread over the
+        // workgroup. The selected set is all the sum visits when it was recorded.
+        if (lane == 0u) {
+            var new_sum: f32 = 0.0;
+            if (recording) {
+                for (var j: u32 = 0u; j < picked_count; j = j + 1u) {
+                    new_sum = new_sum + (-row[picks[j]] - SENTINEL_EPS);
+                }
+            } else {
+                for (var i: u32 = 0u; i < inner; i = i + 1u) {
+                    let v = row[i];
+                    if (v < 0.0) {
+                        new_sum = new_sum + (-v - SENTINEL_EPS);
+                    }
+                }
+            }
+            wg_one = new_sum;
+        }
+        workgroupBarrier();
+        for (var i: u32 = lane; i < inner; i = i + LANES) {
+            let v = row[i];
+            row[i] = select(0.0, -v - SENTINEL_EPS, v < 0.0);
+        }
+        workgroupBarrier();
+        let inv_new = 1.0 / max(wg_one, 1e-12);
+        for (var i: u32 = lane; i < inner; i = i + LANES) {
+            row[i] = row[i] * inv_new;
+        }
+        workgroupBarrier();
+    }
+
+    // 4. Gumbel-max; the same reduction and tie-break. Every element outside the
+    //    selected set is zero, so a recorded set is all a draw has to score.
+    let raw_key = vec2<u32>(params.seed_lo, params.seed_hi);
+    let key = threefry2x32_20(vec2<u32>(0u, 0u), raw_key);
+    var best_score: f32 = NEG_INF;
+    var best_i: u32 = 0u;
+    if (need_filter && recording) {
+        for (var j: u32 = lane; j < picked_count; j = j + LANES) {
+            let i = picks[j];
+            let p = row[i];
+            if (p <= 0.0) { continue; }
+            let score = gumbel_score(p, i, 0u, key);
+            if (score > best_score) {
+                best_score = score;
+                best_i = i;
+            }
+        }
+    } else {
+        for (var i: u32 = lane; i < inner; i = i + LANES) {
+            let p = row[i];
+            if (p <= 0.0) { continue; }
+            let score = gumbel_score(p, i, 0u, key);
+            if (score > best_score) {
+                best_score = score;
+                best_i = i;
+            }
         }
     }
     wg_best(lane, best_score, best_i);
@@ -283,15 +590,21 @@ fn sample(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(num_workgroups) ngs: vec3<u32>,
 ) {
-    // One row is a decode step's critical path: split it across the workgroup.
+    // One row is a decode step's critical path: split it across the workgroup —
+    // staged in workgroup storage when it fits, which is what a 2 048-wide code
+    // head's row does.
     if (params.outer == 1u) {
-        sample_one_coop(lid.x);
+        if (params.inner <= STAGE) {
+            sample_one_staged(lid.x);
+        } else {
+            sample_one_coop(lid.x);
+        }
         return;
     }
-    let row = gid.x + gid.y * ngs.x * LANES;
-    if (row >= params.outer) { return; }
-    let base = params.in_off + row * params.inner;
-    let sbase = params.scratch_off + row * params.inner;
+    let row_idx = gid.x + gid.y * ngs.x * LANES;
+    if (row_idx >= params.outer) { return; }
+    let base = params.in_off + row_idx * params.inner;
+    let sbase = params.scratch_off + row_idx * params.inner;
     let temp = bitcast<f32>(params.temp_bits);
     let top_p = bitcast<f32>(params.top_p_bits);
     let inv_temp = 1.0 / max(temp, 1e-6);
@@ -382,19 +695,11 @@ fn sample(
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
         let p = arena[sbase + i];
         if (p <= 0.0) { continue; }   // filtered by top_k / top_p
-        let ctr = vec2<u32>(row, i);
-        let rng2 = threefry2x32_20(ctr, key);
-        // Two-word concat → 53-bit-ish double-equivalent uniform on [0, 1).
-        // Then -log(-log(u)) = Gumbel(0, 1).
-        let u: f32 = f32(rng2.x >> 8u) / 16777216.0;
-        // Avoid log(0) = -inf if u rolled exactly 0.
-        let u_safe: f32 = max(u, 1e-30);
-        let g: f32 = -log(-log(u_safe));
-        let score: f32 = log(p) + g;
+        let score = gumbel_score(p, i, row_idx, key);
         if (score > best_score) {
             best_score = score;
             picked = i;
         }
     }
-    arena[params.out_off + row] = f32(picked);
+    arena[params.out_off + row_idx] = f32(picked);
 }

@@ -21,6 +21,13 @@ use sha2::{Digest, Sha256};
 pub const LISTEN_FRAMES: usize = 1_746;
 pub const LISTEN_PROMPT_ROWS: usize = 234;
 pub const LISTEN_GENERATED: usize = 65;
+// The pinned digests in this file are a **witness, not a gate** (owner-directed):
+// a hash that moves because the real outputs moved by a rounding is recorded and
+// reported — with what moved and by how much — and the round carries on, as long
+// as the recognised transcript of the synthesised wave and the speech's
+// intelligibility and range are intact. What is hard: no non-finite values and no
+// clipping. Do not roll back a measured win because a digest moved in its last
+// digits, and do not spend a round chasing one back.
 /// `digest(generated ids ++ next ++ eos flag ++ written)` — the cell's own
 /// answer digest, printed as `digest=`.
 pub const LISTEN_ANSWER_DIGEST: u64 = 0x2f93_dfa1_d7cd_eeb1;
@@ -33,7 +40,14 @@ pub const LISTEN_TRANSCRIPT: &str = "обычные объявления мет�
 pub const SPEAK_ROWS: usize = 330;
 pub const SPEAK_SAMPLES: usize = 633_600;
 /// `digest(&waveform)` — FNV-1a over the f32 bytes, the cell's own `digest=`.
-pub const SPEAK_WAVE_DIGEST: u64 = 0xbae7_ba02_2d33_5038;
+///
+/// Re-recorded when the sound half's `SnakeBeta` chain became one dispatch and the
+/// frame's norms became 16 B loads: both move the waveform's last bits (the snake
+/// by at most one count of its 638-count peak on 29 of 153 600 samples, the norms
+/// by their summation order), and the previous pin was `bae7_ba02_2d33_5038`.
+/// The transcript below is the gate; this digest is the record of the waveform
+/// that produced it.
+pub const SPEAK_WAVE_DIGEST: u64 = 0x231d_8234_9645_0627;
 /// The `prompt_digest` `MEASUREMENTS.md` carried before the waveform digest was
 /// pinned — the talker prompt's FNV-1a digest, recorded beside the waveform so
 /// the waveform can be audited against a value that predates it.
@@ -43,6 +57,22 @@ pub const SPEAK_PROMPT_DIGEST: u64 = 0xfb16_0ff9_665b_4331;
 /// points it at another file expects another waveform and skips the pin.
 pub const SPEAK_VOICE_SHA256: &str =
     "0ca6c18b9189381dcdad83d26814f73b3f4d2d26dea6892371c2177d30e72ace";
+/// The synthesis round trip: the pinned waveform, resampled 24 kHz → 16 kHz and
+/// run back through the recogniser exactly as the listen cell runs it, comes back
+/// as this text — 107 generated ids, EOS reached, on the recorded voice and the
+/// models `MEASUREMENTS.md` names.
+///
+/// It is the **raw** waveform's transcript. The gate does not apply
+/// `prepare_speech`: that is the recognition side's conditioning, and this
+/// waveform's peak (0.053) trips its quiet-recording gain, which multiplies the
+/// signal by ~13 before the encoder sees it. The same clip through the prepared
+/// path answers differently ("…never mind how long since I left New Orleans…
+/// I've been to New York…"), so the two are not interchangeable and this pin
+/// belongs to the path the gate takes. What the pin establishes is that the
+/// waveform still says the same thing to the recogniser; it is not a claim that
+/// the synthesis is intelligible — the answer keeps the opening clause and then
+/// runs a repetition loop, exactly as it does on the prepared path.
+pub const SPEAK_TRANSCRIPT: &str = "Call me Ishmael. Some years ago, now I'm old, beside the sea. I've seen them all, every shore, every harbor, every city, every town, every street, every house, every farm, every field, every hill, every mountain, every forest, every river, every ocean, every island, every shore, every harbor, every city, every town, every street, every house, every farm, every field, every hill, every mountain, every forest, every river, every";
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -100,5 +130,25 @@ pub fn check_speak(rows: usize, samples: usize, wave_digest: u64, prompt_digest:
          waveform_digest={wave_digest:016x}/{SPEAK_WAVE_DIGEST:016x} \
          prompt_digest={prompt_digest:016x}/{SPEAK_PROMPT_DIGEST:016x} equal={same}"
     );
+    same
+}
+
+/// Print the round-trip witness against the pin: what the recogniser heard from
+/// the synthesis waveform, and whether it is the pinned answer. The verdict line
+/// carries the two transcripts' SHA-256 the way [`check_listen`] carries its own,
+/// and the texts print only on a mismatch. `wave=raw` states which side of
+/// `prepare_speech` the gate ran on; a mismatch is a failed cell, not a diagnostic.
+pub fn check_speak_roundtrip(heard: &str) -> bool {
+    let same = heard == SPEAK_TRANSCRIPT;
+    let hash = sha256_hex(heard.as_bytes());
+    println!(
+        "witness speak-roundtrip wave=raw transcript_sha256={hash}/{} equal={same}",
+        sha256_hex(SPEAK_TRANSCRIPT.as_bytes())
+    );
+    if !same {
+        println!("witness speak-roundtrip — the recogniser heard a different answer:");
+        println!("  heard:  {heard:?}");
+        println!("  pinned: {SPEAK_TRANSCRIPT:?}");
+    }
     same
 }

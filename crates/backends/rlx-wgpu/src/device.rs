@@ -27,6 +27,15 @@ pub struct WgpuDevice {
     pub queue: wgpu::Queue,
     pub name: String,
     pub backend: wgpu::Backend,
+    /// The adapter's driver name, as `AdapterInfo` reports it, `None` when the
+    /// HAL leaves it empty: only the Vulkan HAL fills `driver`/`driver_info`
+    /// (the Vulkan driver's name and its version), and wgpu's Metal HAL reports
+    /// neither. Kept rather than dropped so a caller can say the reading is
+    /// absent instead of presenting a placeholder as a driver.
+    pub driver: Option<String>,
+    /// The driver's own version string, in the same `None`-when-empty form:
+    /// wgpu's Vulkan HAL fills it from the Vulkan driver.
+    pub driver_info: Option<String>,
 }
 
 /// Pick the subset of adapter features we want to enable on the device.
@@ -147,6 +156,11 @@ impl WgpuDevice {
             queue,
             name: info.name,
             backend: info.backend,
+            // `AdapterInfo` carries both as empty strings on a HAL that does not
+            // report a driver; `None` is what a record's provenance line then
+            // presents as `unknown`.
+            driver: Some(info.driver).filter(|d| !d.is_empty()),
+            driver_info: Some(info.driver_info).filter(|d| !d.is_empty()),
         })
     }
 
@@ -225,6 +239,16 @@ pub fn wgpu_device() -> Option<&'static WgpuDevice> {
 /// Adapter name for calibration cache keys.
 pub fn adapter_name() -> Option<String> {
     wgpu_device().map(|d| d.name.clone())
+}
+
+/// The queue paired with the process-global device.
+///
+/// For one-shot probes that are handed only a `&wgpu::Device` and still have to
+/// submit (`gguf_gpu::gemv_subgroup_probe`). This crate has one device per
+/// process — [`wgpu_device`] — and every encoder in it is handed that device, so
+/// the queue returned here is the one that device was requested with.
+pub(crate) fn device_queue() -> Option<&'static wgpu::Queue> {
+    wgpu_device().map(|d| &d.queue)
 }
 
 /// True on Vulkan or DX12 — the discrete-adapter predicate behind this

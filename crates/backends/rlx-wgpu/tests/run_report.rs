@@ -192,15 +192,18 @@ fn region_mix_graph() -> Graph {
     let x = g.input("x", Shape::new(&[1, W], DType::F32));
     let wgt = g.param("wgt", Shape::new(&[W, W], DType::F32));
     let row = g.matmul(x, wgt, Shape::new(&[1, W], DType::F32));
-    // The multiply's `[1, W]` row as the `[1, 1, W]` row `KvAppend` takes.
-    let row = g.reshape_(row, vec![1, 1, W as i64]);
+    // The append's row is a graph input, not the multiply's output: a producer
+    // the backend can place in the cache's spare row loses the copy step, and
+    // this fixture is the schedule that carries one device step *and* one host
+    // step. The multiply stays live as the graph's second output.
+    let row_in = g.input("row", Shape::new(&[1, 1, W], DType::F32));
     let ck = g.param("cache_k", Shape::new(&[1, CAP, W], DType::F32));
     let k = g.add_node(
         Op::KvAppend { axis: 1, pos: POS },
-        vec![ck, row],
+        vec![ck, row_in],
         Shape::new(&[1, POS + 1, W], DType::F32),
     );
-    g.set_outputs(vec![k]);
+    g.set_outputs(vec![k, row]);
     g
 }
 
@@ -298,7 +301,10 @@ fn run_region_mix() {
     let mut exe = Session::new(Device::Gpu).compile(region_mix_graph());
     exe.set_param("cache_k", &common::ramp(CAP * W, 1, 0.013));
     exe.set_param("wgt", &common::ramp(W * W, 1, 0.011));
-    let _ = exe.run(&[("x", &common::ramp(W, 1, 0.031))]);
+    let _ = exe.run(&[
+        ("x", &common::ramp(W, 1, 0.031)),
+        ("row", &common::ramp(W, 1, 0.037)),
+    ]);
 }
 
 /// The tail-host child's job: one forward pass of the graph whose `Op::LogMel` the
@@ -574,7 +580,7 @@ fn assert_device_view<'a>(lines: &[(&'a str, Fields<'a>)], stderr: &str) -> Vec<
     for (index, pass) in pass_lines.iter().enumerate() {
         assert_shape(
             pass,
-            &["index", "interval", "ms"],
+            &["index", "interval", "ms", "kinds"],
             "a device_pass line's fields",
             stderr,
         );
@@ -1142,6 +1148,27 @@ fn assert_packed_covered(stderr: &str, joined: bool) {
             encodes, 1,
             "the `encode` interval must carry the run's one batch pass — the joined \
              multiply dispatches into it instead of opening its own — found {encodes}:\n{stderr}"
+        );
+        // ...and that pass's census names the work it paid for: this graph is the
+        // packed multiply and the plain one after it, both in the batch's pass. The
+        // census is the only place a pass says what its figure bought, so nothing
+        // but this assertion would notice it going empty.
+        let census = kinds_of(
+            pass_lines
+                .iter()
+                .find(|pass| pass["interval"] == "encode")
+                .expect("the one encode pass")["kinds"],
+        );
+        assert_eq!(
+            census,
+            BTreeMap::from([("dequant_matmul_gguf", 1), ("matmul", 1)]),
+            "the joined pass must name the two steps it dispatched, by kind:\n{stderr}"
+        );
+        assert_eq!(
+            census.values().sum::<usize>(),
+            carrier["steps"].parse::<usize>().expect("a step count"),
+            "the pass's census and the interval that covered it must count the same \
+             steps:\n{stderr}"
         );
     } else {
         // The unjoined case — the scheme this route never admits, which therefore

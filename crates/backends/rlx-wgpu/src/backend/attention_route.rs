@@ -109,7 +109,76 @@
 
 use rlx_ir::op::MaskKind;
 
+use crate::kernels::{ATTENTION_PARTS_DIM_CHUNK, attention_decode_eligible};
+
 use super::MAX_WORKGROUPS_PER_DIM;
+
+/// Key-range splits one decode attention step runs as: `n` workgroups over
+/// disjoint key ranges plus one merge dispatch, or 1 for the single-workgroup
+/// form. The decode form's cost is set by how many workgroups the grid has —
+/// `batch × heads` of them, one or two warps a workgroup depending on the
+/// adapter's subgroup width — so a grid this small leaves the machine idle
+/// while one workgroup walks the whole key range.
+///
+/// Called per run, twice on the same step — once where the uniform write records
+/// the depth and once where the encoder dispatches on it — so the grid, the merge
+/// guard and the shader all read the extent the run walks rather than the one the
+/// graph was lowered at.
+pub fn attention_decode_key_splits(
+    seq_q: u32,
+    seq_k: u32,
+    rows: u32,
+    head_dim: u32,
+    v_head_dim: u32,
+) -> u32 {
+    let splits = if attention_decode_eligible(seq_q, seq_k, head_dim, v_head_dim)
+        && rows <= ATTENTION_DECODE_SPLIT_MAX_ROWS
+        && seq_k >= ATTENTION_DECODE_SPLIT_MIN_KEYS
+    {
+        ATTENTION_DECODE_SPLITS
+    } else {
+        1
+    };
+    // A depth of zero dispatches nothing and writes nothing — a silently empty
+    // output slot, not a fault — so the one place that returns a depth holds it.
+    assert!(
+        splits >= 1,
+        "the attention key-range split depth is never zero (got {splits})"
+    );
+    splits
+}
+
+/// Splits a decode step takes at most.
+pub const ATTENTION_DECODE_SPLITS: u32 = 2;
+/// Above this many rows the grid already fills the machine, so the split buys
+/// nothing and costs a second dispatch.
+pub const ATTENTION_DECODE_SPLIT_MAX_ROWS: u32 = 32;
+/// A split needs keys to give every workgroup a share: below this the
+/// single-workgroup form already covers the range with one pass of its lanes.
+pub const ATTENTION_DECODE_SPLIT_MIN_KEYS: u32 = 256;
+
+/// Bytes the key-range split's partials need: one `[m, l, O[0..pad]]` per
+/// (row, split), the layout both decode entries derive from
+/// [`ATTENTION_PARTS_DIM_CHUNK`].
+pub fn attention_parts_bytes(rows: u32, splits: u32, v_head_dim: u32) -> u64 {
+    let pad = v_head_dim.div_ceil(ATTENTION_PARTS_DIM_CHUNK) * ATTENTION_PARTS_DIM_CHUNK;
+    (rows as u64) * (splits as u64) * ((2 + pad) as u64) * 4
+}
+
+/// The partials a decode step whose grid has `rows` workgroups must be sized for.
+///
+/// The depth itself is the run's decision ([`attention_decode_key_splits`] at the
+/// uniform write), so the buffer is fixed for the deepest form the step can be
+/// walked at: the row cap is static, while the query and key extents only ever
+/// shrink — a padded prefill walked at one row may split where its compile did
+/// not. A grid above the row cap never splits and binds the layout's minimum.
+pub fn attention_parts_bytes_for_grid(rows: u32, v_head_dim: u32) -> u64 {
+    if rows <= ATTENTION_DECODE_SPLIT_MAX_ROWS {
+        attention_parts_bytes(rows, ATTENTION_DECODE_SPLITS, v_head_dim)
+    } else {
+        16
+    }
+}
 
 /// Query rows below which the dense arrangement is not served: one, and only
 /// one. A single query row stays on the one-row arrangement — the decode kernel
@@ -2070,5 +2139,23 @@ mod tests {
                 head_dim: 64
             }
         );
+    }
+
+    #[test]
+    fn the_key_split_needs_a_small_grid_and_a_long_key_range() {
+        // The talker body frame: 16 rows, 330 keys, width 128 — the grid leaves
+        // most of the machine idle, so it splits into two key ranges.
+        assert_eq!(attention_decode_key_splits(1, 330, 16, 128, 128), 2);
+        // The code predictor's attention is one row over a few cached keys:
+        // nothing to split.
+        assert_eq!(attention_decode_key_splits(1, 17, 16, 128, 128), 1);
+        // A grid that already fills the machine stays on one workgroup a head.
+        assert_eq!(attention_decode_key_splits(1, 4096, 64, 128, 128), 1);
+        // The serial form's shapes never split.
+        assert_eq!(attention_decode_key_splits(2, 330, 16, 128, 128), 1);
+        assert_eq!(attention_decode_key_splits(1, 330, 16, 192, 128), 1);
+        // The partials' layout: two scalars plus a chunk-padded value row.
+        assert_eq!(attention_parts_bytes(16, 2, 128), 16 * 2 * 130 * 4);
+        assert_eq!(attention_parts_bytes(16, 1, 40), 16 * (2 + 64) * 4);
     }
 }

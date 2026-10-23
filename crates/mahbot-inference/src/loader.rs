@@ -663,10 +663,31 @@ pub fn pair_files(role: Role) -> Option<(&'static str, &'static str)> {
 impl Pair {
     /// The pair of a role from [`PAIRS`], under [`models_dir`].
     pub fn of_role(role: Role) -> Result<Self> {
-        let (body, sound) = pair_files(role)
-            .ok_or_else(|| anyhow!("no `{}` pair — pairs: {}", role.name(), PAIRS.len()))?;
+        Self::of_role_optional(role)?.ok_or_else(|| match pair_files(role) {
+            Some((body, sound)) => anyhow!(
+                "no `{}` pair — `{body}` and `{sound}` are not under the models directory",
+                role.name()
+            ),
+            None => anyhow!("no `{}` pair — pairs: {}", role.name(), PAIRS.len()),
+        })
+    }
+
+    /// [`Pair::of_role`], with a role whose files are not there reported as
+    /// `Ok(None)` instead of an error.
+    ///
+    /// A caller that skips when the pair is absent but must fail when it is present
+    /// and broken asks this, so "is this pair here" is resolved in one place rather
+    /// than re-derived from [`PAIRS`] and [`models_dir`].
+    pub fn of_role_optional(role: Role) -> Result<Option<Self>> {
+        let Some((body, sound)) = pair_files(role) else {
+            return Ok(None);
+        };
         let dir = models_dir()?;
-        Self::open(dir.join(body), dir.join(sound))
+        let (body, sound) = (dir.join(body), dir.join(sound));
+        if !(body.is_file() && sound.is_file()) {
+            return Ok(None);
+        }
+        Self::open(body, sound).map(Some)
     }
 
     /// Open both files and check that they belong together. The body file must

@@ -130,10 +130,11 @@
 // regression ceiling left, and the rig's own re-take of the grouped cells is what
 // covers it.
 //
-// Binding scheme matches `dequant_gemv_gguf.wgsl`: `x` and `weight` are separate
-// read-only windows of the arena (each under `max_storage_buffer_binding_size`)
-// and `y` goes to a separate buffer the caller copies back — a storage binding
-// bound read-write is exclusive in a dispatch and cannot also be read.
+// Binding scheme: `x` and `weight` are separate read-only windows of the arena
+// (each under `max_storage_buffer_binding_size`) and `y` goes to a separate
+// buffer the caller copies back. The one-row arm in `dequant_gemv_gguf.wgsl`
+// declares every window read_write instead, because it stores its row into the
+// arena in place.
 //
 // Grid: x = ceil(ncols / TG) column groups of `TG` columns (one thread per
 // column), y = ceil(m / TM) row tiles — the grid the Rust side sizes from the

@@ -14,8 +14,8 @@
 //! `v_head_dim` narrower than one pass, and one that is asymmetric but wide,
 //! both have to round-trip. The asymmetric width is pinned on all three
 //! arrangements a shape can land on: the dense route at six rows, the fused
-//! kernel at one row under the decode form's key floor, and the decode kernel
-//! over a long cache.
+//! kernel at one row and a head width above the decode form's cap, and the
+//! decode kernel over a long cache.
 
 mod common;
 
@@ -23,9 +23,9 @@ use common::expected_attention_routes;
 use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
+use rlx_wgpu::backend::attention_decode_key_splits;
 use rlx_wgpu::kernels::{
-    AttentionRoutes, attention_decode_eligible, attention_route_counts,
-    reset_attention_route_counts,
+    attention_decode_eligible, attention_route_counts, reset_attention_route_counts,
 };
 
 /// Rank-3 `[B, S, H·head_dim]` Q/K, `[B, S, H·v_head_dim]` V/out, causal.
@@ -80,23 +80,17 @@ fn run_case(nh: usize, hd: usize, v_hd: usize, lq: usize, lk: usize) -> Option<f
     let gpu = run(Device::Gpu);
     let routes = attention_route_counts();
     let cpu = run(Device::Cpu);
-    // One attention step per run: the decode form's for a single query row over a
-    // long enough key sequence — the predicate also carries this file's asymmetric
-    // width term — and otherwise the row/key floors `expected_attention_routes`
-    // encodes (dense from the floor up, serial below it).
-    // That helper reads the counts alone; these widths clear the decode caps.
+    // One attention step per run: the decode form's for a single query row whose
+    // head widths clear the cap — the predicate also carries this file's asymmetric
+    // width term — and otherwise what `expected_attention_routes` encodes (dense
+    // from two rows up, serial below that or over a wider head).
+    // That helper and the predicate now take the same three terms — the two
+    // counts and the two widths — so the assertion below is the cross-check that
+    // the helper's model of the route and the route itself agree.
     let decode = attention_decode_eligible(lq as u32, lk as u32, hd as u32, v_hd as u32);
     assert_eq!(
         routes,
-        if decode {
-            AttentionRoutes {
-                decode: 1,
-                decomposed: 0,
-                serial: 0,
-            }
-        } else {
-            expected_attention_routes(lq, lk, 1, 1)
-        },
+        expected_attention_routes(lq, lk, hd, v_hd, 1, 1),
         "nh={nh} hd={hd} v_hd={v_hd} lq={lq} lk={lk}: attention_decode_eligible says \
          {decode}, the run says {routes:?}"
     );
@@ -130,10 +124,10 @@ fn wgpu_attention_asymmetric_v_head_dim_parity() {
         max_abs < 1e-3,
         "wgpu asymmetric v_head_dim max_abs {max_abs} >= 1e-3"
     );
-    // The same asymmetric path on the serial kernel: one query row over 48 keys
-    // sits at or under the decode form's key floor, so the serial kernel serves
-    // it, and its merge must cover the V dims the Q/K contraction does not.
-    let Some(max_abs) = run_case(2, 64, 32, 1, 48) else {
+    // The same asymmetric path on the serial kernel: a head width above the decode
+    // form's cap is what still reaches it at one query row (the route has no key
+    // floor), and its merge must cover the V dims the Q/K contraction does not.
+    let Some(max_abs) = run_case(1, 192, 64, 1, 48) else {
         return;
     };
     assert!(
@@ -144,8 +138,16 @@ fn wgpu_attention_asymmetric_v_head_dim_parity() {
     // pass (4 of head_dim 8), a wide asymmetric one (64 of head_dim 128), and one
     // wider than the score width (128 of head_dim 64) — the last is inside the
     // decode form's eligibility (both widths ≤ the cap) and puts the merge on V
-    // dims the Q/K contraction does not cover.
-    for (nh, hd, v_hd) in [(2usize, 8usize, 4usize), (4, 128, 64), (4, 64, 128)] {
+    // dims the Q/K contraction does not cover. The last two are widths that are
+    // not a multiple of the kernel's unrolled depth, so both loops run their
+    // scalar tail after a non-empty unrolled prefix.
+    for (nh, hd, v_hd) in [
+        (2usize, 8usize, 4usize),
+        (4, 128, 64),
+        (4, 64, 128),
+        (4, 72, 40),
+        (4, 40, 72),
+    ] {
         let Some(max_abs) = run_case(nh, hd, v_hd, 1, 186) else {
             return;
         };
@@ -153,6 +155,23 @@ fn wgpu_attention_asymmetric_v_head_dim_parity() {
             max_abs < 1e-3,
             "wgpu decode asymmetric v_head_dim nh={nh} hd={hd} v_hd={v_hd} \
              max_abs {max_abs} >= 1e-3"
+        );
+    }
+    // Split-engaged decode shapes: at 320 keys over 4 rows the key-range split
+    // runs, so the partials round-trip through the buffer the host sized from
+    // the shader's own pad — on a value width the score contraction never
+    // touches, once a pad multiple and once not.
+    for (hd, v_hd) in [(128usize, 64usize), (128, 40)] {
+        assert!(
+            attention_decode_key_splits(1, 320, 4, hd as u32, v_hd as u32) > 1,
+            "hd={hd} v_hd={v_hd}: this cell is meant to run the split form"
+        );
+        let Some(max_abs) = run_case(4, hd, v_hd, 1, 320) else {
+            return;
+        };
+        assert!(
+            max_abs < 1e-3,
+            "wgpu split decode hd={hd} v_hd={v_hd} max_abs {max_abs} >= 1e-3"
         );
     }
 }

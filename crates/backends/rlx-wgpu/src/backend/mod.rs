@@ -214,16 +214,106 @@ fn im2col_min_cout() -> u64 {
     crate::runtime_config().im2col_min_cout as u64
 }
 /// The single switch the accelerated conv routes sit under: im2col+GEMM, the
-/// mirrored 1-D tiled lift, and the 1×1 pointwise GEMM. Default **on**;
-/// `RLX_WGPU_CONV_IM2COL=0` restores the plain routing and the lean arena
-/// exactly, which is what keeps a bisect of that flip possible. The same
-/// predicate gates the col-scratch reservation, which is decided from a conv's
-/// *shape* alone (see [`conv_im2col_col_elems`]): a graph whose convs do not
-/// qualify by shape reserves nothing, while one whose conv qualifies pays that
-/// reservation even where the route then does not run — a parked weight, a conv
-/// its adapter routes to the host, a sharded arena.
+/// mirrored 1-D tiled lift, the 1×1 pointwise GEMM and the cooperative implicit
+/// GEMM. Default **on**; `RLX_WGPU_CONV_IM2COL=0` restores the plain routing and
+/// the lean arena exactly, which is what keeps a bisect of that flip possible. The
+/// same predicate gates the col-scratch reservation, which is sized from a conv's
+/// *shape* and the implicit route's own two terms (its switch and the adapter's
+/// entry) without reading the graph's schedule (see [`conv_im2col_col_elems`]): a
+/// graph whose convs qualify for neither reserves nothing, and one whose conv does
+/// pays that reservation even where the route then does not run — a parked weight,
+/// a conv its adapter routes to the host, a sharded arena.
 pub(crate) fn conv_routes_enabled() -> bool {
     rlx_ir::env::flag_or("RLX_WGPU_CONV_IM2COL", true)
+}
+
+/// The cooperative implicit-GEMM convolution (`conv1d_implicit.wgsl`), live:
+/// `RLX_WGPU_CONV_IMPLICIT=0` puts every conv back on the im2col/tiled/direct
+/// routing for a bisect. Read at the point of decision rather than frozen in
+/// `WgpuRuntimeConfig`, like the other route switches.
+pub(crate) fn conv_implicit_enabled() -> bool {
+    rlx_ir::env::flag_or("RLX_WGPU_CONV_IMPLICIT", true)
+}
+
+/// The shortest output extent the implicit route is admitted at.
+///
+/// The gather is one strided read per k step and column block, so the route's cost
+/// per output element barely moves with the extent; the floor separates a conv with
+/// enough columns for that gather to dominate its own dispatch from one small enough
+/// that the dispatch overhead does. It is the measured crossover between the two
+/// routes, and the recognition front's convolutions, a few hundred positions, sit
+/// under it. Overridable via `RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL` (the parity cell
+/// drives the kernel at its own small extents with it).
+///
+/// The floor is a fallback-cost switch as well as a win threshold: the panel
+/// reservation subtracts this class without reading the schedule, so a class-shaped
+/// conv the lowering then declines — a parked weight, an arena that does not bind in
+/// one storage binding — has no panel to fall back on and runs the direct kernel.
+const CONV_IMPLICIT_MIN_SPATIAL: u64 = 4_800;
+pub(crate) fn conv_implicit_min_spatial() -> u64 {
+    rlx_ir::env::parse_or(
+        "RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL",
+        CONV_IMPLICIT_MIN_SPATIAL,
+    )
+}
+
+/// The most output rows the implicit entry's accumulator sets cover — its
+/// `ROW_TILES` sets of `TILE_M` rows, pinned against the shader source by
+/// `the_implicit_class_cap_is_the_entrys_row_tiles`. A wider `c_out` would have
+/// rows no set covers, so the class refuses it on the host.
+pub(crate) const CONV_IMPLICIT_MAX_C_OUT: u64 = 96;
+
+/// The narrowest output the implicit entry takes. The entry multiplies a whole
+/// 32-row tile whatever `c_out` is, so below a tile's rows it multiplies output the
+/// conv does not have and the panel route — which reads back only the rows it wrote
+/// — overtakes it. It is the measured crossover between the two routes at the
+/// block's own extent and taps; `conv_implicit_vs_direct_by_output_channels` is the
+/// cell that takes it. A narrower `c_out` keeps the direct routing.
+pub(crate) const CONV_IMPLICIT_MIN_C_OUT: u64 = 4;
+
+/// The shape class the cooperative implicit-GEMM conv is admitted for, in the
+/// terms the `Op::Conv` compile arm's geometry states it: a unit height with every
+/// tap on W and no height padding, one group and one batch, at most 96 input
+/// channels and between [`CONV_IMPLICIT_MIN_C_OUT`] and 96 of output, at or above
+/// the route's own extent floor, and column blocks inside the per-dimension
+/// dispatch cap. The cap on `c_out` is the kernel's own: one workgroup covers every
+/// output row tile, and the accumulator sets it has are three — 96 rows is the
+/// widest output they cover.
+///
+/// The lowering adds the terms the shape does not settle — the route's switches,
+/// the adapter, the weight's placement, the arena's binding — and
+/// [`conv_im2col_col_elems`] subtracts this class, so a conv the route takes
+/// reserves no panel and a conv it does not take still gets one.
+pub(crate) struct ConvImplicitShape {
+    pub c_in: u64,
+    pub c_out: u64,
+    pub kh: u64,
+    pub kw: u64,
+    pub h: u64,
+    pub h_out: u64,
+    pub sw: u64,
+    pub ph: u64,
+    pub groups: u64,
+    pub n: u64,
+    pub spatial: u64,
+}
+
+impl ConvImplicitShape {
+    fn admits(&self) -> bool {
+        self.kh == 1
+            && self.kw > 1
+            && self.sw == 1
+            && self.h == 1
+            && self.h_out == 1
+            && self.ph == 0
+            && self.groups == 1
+            && self.n == 1
+            && self.c_in <= CONV_IMPLICIT_MAX_C_OUT
+            && self.c_out <= CONV_IMPLICIT_MAX_C_OUT
+            && self.c_out >= CONV_IMPLICIT_MIN_C_OUT
+            && self.spatial >= conv_implicit_min_spatial()
+            && self.spatial.div_ceil(32) <= MAX_WORKGROUPS_PER_DIM as u64
+    }
 }
 
 /// Minimum output length for routing a `one_d` conv through the register-blocked
@@ -237,16 +327,21 @@ fn conv_tiled_min_spatial() -> u64 {
 /// Element count of the im2col `col[c_in*kh*kw, spatial]` matrix if this conv
 /// node qualifies for the im2col+GEMM path (2D / 1D-as-2D NCHW, `N==1`,
 /// `groups==1`, real spatial kernel, spatial ≥ the im2col spatial floor).
-/// Returns `None` otherwise. Mirrors the shape math in the `Op::Conv` compile
-/// arm so scratch sizing and lowering agree on which convs are routed.
+/// Returns `None` otherwise, and `None` for a conv the cooperative implicit route
+/// takes instead (`implicit_live`, see [`ConvImplicitShape`]). Mirrors the shape
+/// math in the `Op::Conv` compile arm so scratch sizing and lowering agree on
+/// which convs are routed.
 fn conv_im2col_col_elems(
     op: &Op,
     in_shape: &rlx_ir::Shape,
     w_shape: &rlx_ir::Shape,
     out_shape: &rlx_ir::Shape,
+    implicit_live: bool,
 ) -> Option<u64> {
     let Op::Conv {
         kernel_size,
+        stride,
+        padding,
         groups,
         ..
     } = op
@@ -310,6 +405,33 @@ fn conv_im2col_col_elems(
     if spatial < im2col_min_spatial() || k_total < im2col_min_k() || c_out < im2col_min_cout() {
         return None;
     }
+    // The fields the class test reads, mapped exactly as the compile arm's
+    // pre-relabel `p2` maps them: a `one_d` lift puts the length on H (so its
+    // `h_out` is the output's `dim(3)`), which `kh == 1` rejects before any of the
+    // rest is read — the mirror is stated rather than left to that short-circuit.
+    let (h, h_out) = if one_d {
+        (w_in as u64, out_shape.dim(3).unwrap_static() as u64)
+    } else {
+        (h_in as u64, out_shape.dim(2).unwrap_static() as u64)
+    };
+    let implicit_shape = ConvImplicitShape {
+        c_in,
+        c_out,
+        kh,
+        kw,
+        h,
+        h_out,
+        // The compile arm's own accessors default a short stride/padding vector
+        // rather than indexing it, so a 2-D op missing them cannot panic here.
+        sw: stride.get(1).copied().unwrap_or(1) as u64,
+        ph: padding.first().copied().unwrap_or(0) as u64,
+        groups: *groups as u64,
+        n: in_shape.dim(0).unwrap_static() as u64,
+        spatial,
+    };
+    if implicit_live && implicit_shape.admits() {
+        return None;
+    }
     Some(k_total * spatial)
 }
 
@@ -317,7 +439,21 @@ fn conv_im2col_col_elems(
 /// col matrix that will be routed through im2col+GEMM. Capped so the whole
 /// arena still binds in a single storage-binding window. Returns 0 when no
 /// conv qualifies or none fits.
-fn conv_im2col_scratch_bytes(graph: &Graph, planned_arena_size: usize, max_binding: u64) -> usize {
+///
+/// `implicit_live` is the cooperative implicit route's own switch and adapter
+/// capability ([`conv_implicit_enabled`] and `kernels::conv1d_implicit_supported`):
+/// a conv that class takes never writes a panel, so it reserves none. The two
+/// terms the shapes still do not settle — a weight parked in the weight buffer and
+/// an arena that with its panel does not bind — are not known here, and a conv
+/// refused for one of them keeps the direct/tiled route instead of a panel-less
+/// im2col (the count is `im2col_fallbacks`, and the lowering refuses the im2col
+/// route for want of reserved scratch).
+fn conv_im2col_scratch_bytes(
+    graph: &Graph,
+    planned_arena_size: usize,
+    max_binding: u64,
+    implicit_live: bool,
+) -> usize {
     let mut max_col_bytes: u64 = 0;
     for node in graph.nodes() {
         if node.inputs.len() < 2 {
@@ -325,7 +461,9 @@ fn conv_im2col_scratch_bytes(graph: &Graph, planned_arena_size: usize, max_bindi
         }
         let in_shape = &graph.node(node.inputs[0]).shape;
         let w_shape = &graph.node(node.inputs[1]).shape;
-        let Some(elems) = conv_im2col_col_elems(&node.op, in_shape, w_shape, &node.shape) else {
+        let Some(elems) =
+            conv_im2col_col_elems(&node.op, in_shape, w_shape, &node.shape, implicit_live)
+        else {
             continue;
         };
         let col_bytes = elems.saturating_mul(4);
@@ -391,9 +529,15 @@ pub struct WgpuExecutable {
     last_binding: Option<DimBinding>,
     /// Buffered params written via `set_param` / `set_param_bytes`
     /// before the first `run()`. Replayed against the freshly compiled
-    /// arena once shapes resolve.
+    /// arena once shapes resolve, and kept as the record every later
+    /// rebind replays from.
     pending_params: HashMap<String, Vec<f32>>,
     pending_param_bytes: HashMap<String, Vec<u8>>,
+    /// A param was written since the pending set was last replayed into the
+    /// arena this executable holds. `set_param` only buffers while a graph is
+    /// unresolved, so a write at an unchanged binding would never reach the
+    /// device without this mark.
+    pending_params_dirty: bool,
     /// Active-extent hint (PLAN L1). When set + every Step in the
     /// safe set, both the uniform write and the dispatch workgroup
     /// count are scaled by `actual / upper`. Otherwise full-extent.
@@ -452,6 +596,10 @@ pub struct WgpuExecutable {
     /// the memory planner pins those packed tensors through graph end (see
     /// `extend_static_weight_pack_liveness`).
     static_once_steps: HashSet<usize>,
+    /// The one-row packed multiply's per-dispatch setup, kept across frames: the
+    /// same step rebuilds the same uniform and bind group every frame otherwise
+    /// (~5.7 µs an op over ~516 ops a frame).
+    gemv_setup: crate::gguf_gpu::GemvSetupCache,
     static_once_done: bool,
     /// Steps the per-binding-ceiling rule routed to the host route. Non-zero
     /// means the graph's arena exceeded the device's per-binding limit and at
@@ -463,6 +611,15 @@ pub struct WgpuExecutable {
     /// decided, in the `Op::Conv` arm of `crate::backend::compile`, so a term added
     /// there cannot leave the count behind.
     im2col_fallbacks: usize,
+    /// Convs whose shape is the cooperative implicit-GEMM route's class
+    /// (`ConvImplicitShape`) but which kept the im2col/tiled/direct routing, for
+    /// one of the five terms the shape does not settle: the umbrella switch
+    /// `RLX_WGPU_CONV_IM2COL`, the route's own `RLX_WGPU_CONV_IMPLICIT=0`, an
+    /// adapter without the entry, a weight parked in the weight buffer, an arena
+    /// that does not bind whole. Counted where the route is decided, in the
+    /// `Op::Conv` arm of `crate::backend::compile`, so no route that was not taken
+    /// has to be inferred from a timing.
+    conv1d_implicit_declines: usize,
     /// Many-row attention steps this compile sent to the fused kernel for want of
     /// a window over the route's regions — the one term of the route decision the
     /// graph's shapes do not settle (an arena addressed in stripes rather than
@@ -497,10 +654,10 @@ pub use host_plan::{HostBatch, HostGroup, HostIo, HostPlan, Region};
 pub(crate) use run_report::*;
 pub(crate) use step::*;
 
-/// The many-row attention route's query-row floor: public because the crate's
-/// integration tests are external and read it to place their shapes on either
-/// side of it.
-pub use attention_route::ATTENTION_DECOMPOSE_MIN_Q;
+/// The many-row attention route's query-row floor and the decode form's
+/// key-range split predicate: public because the crate's integration tests are
+/// external and read them to place their shapes on either side.
+pub use attention_route::{ATTENTION_DECOMPOSE_MIN_Q, attention_decode_key_splits};
 
 /// The run report's marks handle, public only because the `gguf_gpu` entry
 /// points that take it are: the crate's integration tests are external and
@@ -542,6 +699,21 @@ pub(crate) fn coop_f32_dispatch_inc() {
 /// Total f32 cooperative-matrix matmul dispatches since process start.
 pub fn coop_f32_dispatch_count() -> u64 {
     COOP_F32_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The subset of [`coop_f32_dispatch_count`] that took the epilogue-free direct
+/// entry (`matmul_coop_f32_direct`): the form the convolution GEMM routes use.
+pub(crate) static COOP_F32_DIRECT_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn coop_f32_direct_dispatch_inc() {
+    COOP_F32_DIRECT_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total dispatches of the direct f32 cooperative entry since process start.
+pub fn coop_f32_direct_dispatch_count() -> u64 {
+    COOP_F32_DIRECT_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Process-wide count of `queue.submit` calls `src/` makes. Together with
@@ -617,6 +789,30 @@ pub fn reset_vec4_move_count() {
     VEC4_MOVES.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-wide count of norm dispatches that took a `*_vec4` module.
+///
+/// The scalar and vector modules compute the same norm, so only a counter can
+/// tell which one ran: without it a silent un-routing of `LayerNorm` /
+/// `FusedResidualLnTee` back to the 64-lane module would leave every parity test
+/// green.
+pub(crate) static NORM_VEC4: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one vectorised norm dispatch.
+#[inline]
+pub(crate) fn note_norm_vec4() {
+    NORM_VEC4.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Vectorised norm dispatches since process start ([`reset_norm_vec4_count`]).
+pub fn norm_vec4_count() -> u64 {
+    NORM_VEC4.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zero [`norm_vec4_count`] — for a test bracketing one forward pass.
+pub fn reset_norm_vec4_count() {
+    NORM_VEC4.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Where a named handle's row is, as `WgpuExecutable::locate_handle_row` answers
 /// it: the host mirror that still carries the rows, or the byte range of the
 /// arena slot they live in. One ladder for both readback paths, so a row resolved
@@ -642,18 +838,21 @@ impl WgpuExecutable {
         let binding = infer_bindings_from_f32_inputs(unresolved, inputs)
             .expect("rlx-wgpu lazy compile: could not infer DimBinding from inputs");
 
-        // No-op if shapes haven't changed since the last compile.
+        // No-op if shapes haven't changed since the last compile — apart from a
+        // param written since the last replay, which is buffered rather than
+        // written and would otherwise never reach this arena.
         if let Some(prev) = &self.last_binding
             && same_binding(prev, &binding)
         {
+            if self.pending_params_dirty {
+                self.replay_pending_params();
+            }
             return;
         }
 
         // Resolve and recompile.
         let resolved = bind_graph(unresolved, &binding);
         let original = self.unresolved.take();
-        let pending_params = std::mem::take(&mut self.pending_params);
-        let pending_bytes = std::mem::take(&mut self.pending_param_bytes);
 
         let fresh = Self::compile_static_inner(resolved, self.rng.clone());
 
@@ -666,6 +865,7 @@ impl WgpuExecutable {
         self.schedule = fresh.schedule;
         self.ceiling_hosted = fresh.ceiling_hosted;
         self.im2col_fallbacks = fresh.im2col_fallbacks;
+        self.conv1d_implicit_declines = fresh.conv1d_implicit_declines;
         self.attention_window_declines = fresh.attention_window_declines;
         self.input_offsets = fresh.input_offsets;
         // The arena is this compile's, and a resident handle's host mirror was
@@ -679,7 +879,6 @@ impl WgpuExecutable {
         self.uniforms = fresh.uniforms;
         self.bind_groups = fresh.bind_groups;
         self.meta_buffers = fresh.meta_buffers;
-        self.unresolved = original;
         self.last_binding = Some(binding);
         // Recompiled — uniforms are now empty buffers; force re-write
         // on next run().
@@ -688,14 +887,37 @@ impl WgpuExecutable {
         self.coop_f16_b_param = fresh.coop_f16_b_param;
         self.coop_f16_vk_wide_bind_groups = fresh.coop_f16_vk_wide_bind_groups;
         self.coop_f16_host_activations = fresh.coop_f16_host_activations;
+        // The one-row packed multiply's setup cache holds bind groups over this
+        // executable's previous arena, weight buffer and slab; its key carries no
+        // buffer identity, so an entry would dispatch against a dead arena and keep
+        // it alive. The fresh compile's cache is empty.
+        self.gemv_setup = fresh.gemv_setup;
 
-        // Replay pending param uploads against the new arena.
-        for (name, data) in pending_params {
-            self.set_param(&name, &data);
+        self.replay_pending_params();
+        // Restore the unresolved graph so a later binding recompiles again.
+        self.unresolved = original;
+    }
+
+    /// Write the buffered param uploads into the arena this executable holds.
+    ///
+    /// While a graph is unresolved `set_param` / `set_param_bytes` only buffer,
+    /// so this is the one place a deferred executable's params reach the device.
+    /// The buffered set is the record every later rebind (and `clone_for_cache`)
+    /// replays from, so it is kept rather than consumed.
+    fn replay_pending_params(&mut self) {
+        let original = self.unresolved.take();
+        let params = std::mem::take(&mut self.pending_params);
+        let bytes = std::mem::take(&mut self.pending_param_bytes);
+        for (name, data) in &params {
+            self.set_param(name, data);
         }
-        for (name, data) in pending_bytes {
-            self.set_param_bytes(&name, &data);
+        for (name, data) in &bytes {
+            self.set_param_bytes(name, data);
         }
+        self.pending_params = params;
+        self.pending_param_bytes = bytes;
+        self.pending_params_dirty = false;
+        self.unresolved = original;
     }
 
     /// Current RNG compile/execute policy.
@@ -758,6 +980,7 @@ impl WgpuExecutable {
             last_binding: None,
             pending_params: HashMap::new(),
             pending_param_bytes: HashMap::new(),
+            pending_params_dirty: false,
             active_extent: None,
             uniforms_active_extent: None,
             coop_f16_vk: false,
@@ -778,9 +1001,11 @@ impl WgpuExecutable {
             pending_read_indices: None,
             rng,
             static_once_steps: HashSet::new(),
+            gemv_setup: crate::gguf_gpu::GemvSetupCache::default(),
             static_once_done: false,
             ceiling_hosted: 0,
             im2col_fallbacks: 0,
+            conv1d_implicit_declines: 0,
             attention_window_declines: 0,
         }
     }
@@ -1519,6 +1744,12 @@ pub(crate) fn dispatch_dims(threads_total: u32, workgroup_size: u32) -> (u32, u3
     }
 }
 
+/// The grid a kernel already counted in workgroups needs, folded across `y`
+/// past one dimension's cap.
+pub(crate) fn workgroup_grid(groups: u32) -> (u32, u32, u32) {
+    dispatch_dims(groups, 1)
+}
+
 /// Threads in one workgroup of the movement kernels (`copy`/`narrow`/`concat`/
 /// `transpose` and their `vec4` siblings), whose `@workgroup_size` is this. Every
 /// grid those kernels are dispatched on divides by it, so the width is written
@@ -1542,6 +1773,14 @@ pub(crate) fn move_workgroups(elems: u32) -> u32 {
 /// `vec4_axes_fit` on top rather than restating the alignment terms.
 pub(crate) fn vec4_move_ok(span: u32, in_off: u32, out_off: u32) -> bool {
     span.is_multiple_of(4) && in_off.is_multiple_of(4) && out_off.is_multiple_of(4)
+}
+
+/// Whether a norm row may run the `*_vec4` module: the row is whole `vec4`
+/// groups (`inner % 4 == 0`) and every offset it touches is 16 B aligned. The
+/// gate is the same alignment rule as [`vec4_move_ok`]; a row that fails it
+/// keeps the scalar 64-lane module, which computes the identical function.
+pub(crate) fn norm_vec4_ok(inner: u32, offs: &[u32]) -> bool {
+    inner.is_multiple_of(4) && inner >= 4 && offs.iter().all(|o| o.is_multiple_of(4))
 }
 
 /// One flat `vec4` dispatch covers `elems`: `elems / 4` vectors at
@@ -1914,7 +2153,7 @@ fn bind_arena_window(
 ) -> wgpu::BindGroup {
     arena_clamp_bind_window(arena, &mut rebase, &mut size);
     let (buf, local) = arena_bind_buf(arena, rebase);
-    bind_two_buf0_window(device, kernel, buf, local, size, params)
+    bind_two_buf0_window(device, kernel, buf, local, size, params, None)
 }
 
 /// True when activation nodes do not all lie in one shard stripe.
@@ -3033,25 +3272,49 @@ fn bind_two_buf0_window(
     buf0_base: u64,
     buf0_size: u64,
     buf1: &wgpu::Buffer,
+    parts: Option<&wgpu::Buffer>,
 ) -> wgpu::BindGroup {
+    let mut entries = vec![
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: buf0,
+                offset: buf0_base,
+                size: aligned_bind_size(buf0_size, buf0_base, buf0.size()),
+            }),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: buf1.as_entire_binding(),
+        },
+    ];
+    if let Some(parts) = parts {
+        entries.push(wgpu::BindGroupEntry {
+            binding: 2,
+            resource: parts.as_entire_binding(),
+        });
+    }
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("rlx-wgpu bg window"),
         layout: &kernel.bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: buf0,
-                    offset: buf0_base,
-                    size: aligned_bind_size(buf0_size, buf0_base, buf0.size()),
-                }),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buf1.as_entire_binding(),
-            },
-        ],
+        entries: &entries,
     })
+}
+
+/// [`bind_arena_window`] with the attention kernels' binding 2 bound too: the
+/// key-range split's partials, which the single-workgroup form never writes.
+fn bind_arena_window_parts(
+    device: &wgpu::Device,
+    kernel: &Kernel,
+    arena: &Arena,
+    mut rebase: u64,
+    mut size: u64,
+    params: &wgpu::Buffer,
+    parts: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    arena_clamp_bind_window(arena, &mut rebase, &mut size);
+    let (buf, local) = arena_bind_buf(arena, rebase);
+    bind_two_buf0_window(device, kernel, buf, local, size, params, Some(parts))
 }
 
 /// Compute precision selector: derive from IR dtypes of A and B and
@@ -3345,6 +3608,44 @@ pub(crate) fn coop_f32_grid(m: u32, n: u32) -> (u32, u32) {
     } else {
         (m.div_ceil(8), n.div_ceil(8))
     }
+}
+
+/// Whether the direct f32 cooperative entry (`matmul_coop_f32_direct`) may serve
+/// this multiply: a whole 32×32 tile with no epilogue, on one of the two
+/// convolution GEMM routes.
+///
+/// The route term is `!b_is_param`, and it is exact rather than a proxy: the
+/// matmul cascade names `CoopF32` only for a multiply whose second operand is a
+/// Param (`MatmulEligibility`'s own admission), while both conv GEMM routes hold
+/// the weight in the FIRST operand — so a `CoopF32` step with `b_is_param` false
+/// is one of those routes and nothing else. That is what keeps this entry off the
+/// ordinary multiply, whose form is `matmul_coop_f32`'s and whose numbers are
+/// measured there; the sound half's convolutions are `m = c_out` and `n = a
+/// spatial extent`, both whole tiles at these geometries.
+///
+/// The epilogue terms are the kernel's: it stores its fragments straight to C with
+/// no scratch tile and no scalar pass, so a bias or an activation has nowhere to
+/// go. `act_id`'s no-activation sentinel is `0xFFFF` (`Step::Matmul`'s own). `k`'s
+/// term is the kernel's too: its k loop walks whole `TILE_K = 8` legs
+/// (`(k + 7) / 8` of them), so a contraction off that multiple folds the next
+/// row's values into the last leg.
+///
+/// Shared by the dispatch arm and the routes' witness (`conv_gemm_coop_f32`), so
+/// the two cannot spell the shape terms differently.
+pub fn coop_f32_direct_admitted(
+    has_bias: u32,
+    act_id: u32,
+    m: u32,
+    k: u32,
+    n: u32,
+    b_is_param: bool,
+) -> bool {
+    !b_is_param
+        && has_bias == 0
+        && act_id == 0xFFFF
+        && m.is_multiple_of(32)
+        && k.is_multiple_of(8)
+        && n.is_multiple_of(32)
 }
 
 /// Which dense-matmul compute paths are legal for one specific call.
@@ -3739,6 +4040,345 @@ fn detect_residual_ln_tee_pattern(
     (ln_to_tee, skip_adds)
 }
 
+/// One matched DAC snake for [`Step::SnakeBeta`].
+pub(super) struct SnakeBetaPlan {
+    /// The addend the snake scales and adds back to: `x` itself, or the
+    /// convolution's output when the snake's input `+ bias` was folded in.
+    pub x: NodeId,
+    /// The per-channel `[1, C, 1, 1]` operands, resolved to their own arena
+    /// offsets by the lowering like any other operand.
+    pub alpha: NodeId,
+    pub beta: NodeId,
+    /// The per-channel bias the snake's own input `Add` applied, when that Add
+    /// had no reader but this snake and its ranges allowed the fold.
+    pub bias: Option<NodeId>,
+}
+
+/// Detects the DAC snake, `out = x + beta·sin²(alpha·x)`, written as the five
+/// nodes the sound half's `snake_beta` helper emits:
+///
+/// ```text
+/// arg   = Mul(alpha, x)      alpha  [1, C, 1, 1]
+/// s     = Activation(Sin, arg)
+/// s2    = Mul(s, s)
+/// scale = Mul(beta, s2)      beta   [1, C, 1, 1]
+/// out   = Add(x, scale)      x, out [1, C, 1, L]
+/// ```
+///
+/// The elementwise REGION pass cannot carry this chain: the per-channel operands
+/// walk the channel with the time axis on the way out of a `[1, C, 1, L]`
+/// output, which is the mid-axis singleton `region_input_modulus` refuses, so
+/// the chain stays five dispatches over the same tensor today. A DAC block has
+/// seven of them.
+///
+/// The fold is structural and takes no measurement: one dispatch reading `x`,
+/// `alpha[c]`, `beta[c]` and writing `out` replaces five that each read and
+/// write the whole tensor. It changes no arithmetic — `snake_beta.wgsl` groups
+/// the product as `beta·(s·s)` and adds in the chain's order.
+///
+/// Returns:
+///   - `out_id → SnakeBetaPlan` — the Add whose step becomes `Step::SnakeBeta`;
+///   - the ids whose own steps are suppressed: the four chain intermediates,
+///     plus the input `Add` when its bias was folded.
+///
+/// ELIGIBILITY. `x`/`out` must be a rank-4 static `[1, C, 1, L]` f32, which is
+/// what makes the flattened address `base + c·inner + l` the tensor's own; the
+/// per-channel operands must be `[C]` or `[1, C, 1, 1]`, so element `c` is word
+/// `c`, and a parameter's storage — the step reads them at `out`'s position,
+/// after the plan ends their liveness at `arg`/`scale`. Every node the fold
+/// consumes must have no reader but the next one in the chain (the same node
+/// twice counting once — that is `s2 = s·s`) and none may be a graph output; the
+/// input `Add` counts among them, since folding its bias is what suppresses its
+/// own step. Each of them must also be one `on_device` answers true for — the
+/// lowering's own routing predicate, so a route that would carry a binary or an
+/// activation to the host keeps the chain's steps. The dispatch's grid must fit
+/// [`MAX_WORKGROUPS_PER_DIM`] on both axes — one workgroup per channel, and the
+/// row split into `SNAKE_BETA_WG`-wide workgroups — because a clipped grid would
+/// leave rows unwritten. Every one of those rules declines the whole pattern with
+/// `continue`; the lowering's arm only lowers.
+///
+/// The bias fold has one ownership rule of its own, and it declines the bias fold
+/// alone — the chain still folds and `bias` is left unset: the `Add` it replaces may
+/// not be another fold's `out`, because the write the fold suppresses would be that
+/// snake's. A `conv` that is another snake's `out` is read deliberately: that step
+/// is emitted, so the bytes are there.
+///
+/// THE BIAS FOLD, AND WHY IT NEEDS A RANGE GUARD. `x = Add(conv, bias)` becomes
+/// the step's own `v = conv[i] + bias[c]` when that Add's only readers are `arg`
+/// and `out`. Two things then differ from the plain fold, and both are about the
+/// arena plan rather than the arithmetic:
+///
+///   * `conv` dies at the Add's position while this step reads it at `out`'s, so
+///     every node strictly between the two positions must be one the fold
+///     consumes — those emit no step, so nothing of their own can write there.
+///     Params, Inputs and Constants are exempt: they are pinned for the whole
+///     execution and write nothing.
+///   * a freed range is reused at a *shifted* offset, not only wholesale. The
+///     DAC front graph is the repro: `out` took `[58 982 400, 66 846 720)` while
+///     `conv` sat at `[58 989 312, 66 853 632)` — the same freed region, 6 912
+///     bytes apart. Reading `conv` while writing `out` then races its own step
+///     against itself, and the sound half's waveform moved between runs of one
+///     binary (digest `006256…` against `bb2eeb…` of the same 300-token cell,
+///     peak |diff| 395 of 552 counts). The fold is therefore taken only when the
+///     two byte ranges are **disjoint**, which is what makes one dispatch over
+///     `conv` and `out` an identity mapping rather than a race. The ranges are
+///     [`Arena::storage_span`]s — a view's slot is bounded by the storage it
+///     reads, not by its own size — and the fold is declined outright where
+///     either operand is parked in the weight buffer, whose tagged offsets are a
+///     different byte space and would make the comparison vacuous. `x` itself
+///     needs no such guard: `out` reads it, so the planner keeps its slot alive
+///     to `out`'s own position, and the two ranges abut rather than overlap.
+fn detect_snake_beta_pattern(
+    graph: &Graph,
+    arena: &Arena,
+    on_device: &dyn Fn(NodeId) -> bool,
+) -> (HashMap<NodeId, SnakeBetaPlan>, HashSet<NodeId>) {
+    use rlx_ir::op::{Activation, BinaryOp};
+
+    let mut consumer_nodes: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for node in graph.nodes() {
+        for &input in &node.inputs {
+            consumer_nodes.entry(input).or_default().push(node.id);
+        }
+    }
+    let outputs: HashSet<NodeId> = graph.outputs.iter().copied().collect();
+    // Emission order: steps are pushed while walking `graph.nodes()`.
+    let order: HashMap<NodeId, usize> = graph
+        .nodes()
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id, i))
+        .collect();
+
+    // The one node reading `id`, if that is the whole of its use and it is not
+    // also a graph output (`s2 = s·s` reads `s` twice; that still counts once).
+    let sole_reader = |id: NodeId| -> Option<NodeId> {
+        if outputs.contains(&id) {
+            return None;
+        }
+        let cs = consumer_nodes.get(&id)?;
+        let first = *cs.first()?;
+        cs.iter().all(|c| *c == first).then_some(first)
+    };
+    // `[C]` or `[1, C, 1, 1]`: the two shapes whose element `c` is word `c`. The
+    // step reads them at `out`'s position while the plan ends their liveness at
+    // `arg`/`scale`, which is sound only for a parameter's pinned bytes — anything
+    // computed would be a read of a slot already reused by then.
+    let per_channel = |id: NodeId| -> bool {
+        if !crate::buffer::is_parameter_storage(graph, id) {
+            return false;
+        }
+        let n = graph.node(id);
+        if n.shape.dtype() != rlx_ir::DType::F32 {
+            return false;
+        }
+        let Some(d) = all_static_dims(&n.shape) else {
+            return false;
+        };
+        match d.as_slice() {
+            [c] => *c > 0,
+            [1, c, 1, 1] => *c > 0,
+            _ => false,
+        }
+    };
+    // `ids` are a `Mul`'s two operands: `(per_channel_id, channel_count, other)`.
+    let split_by_channel = |ids: &[NodeId]| -> Option<(NodeId, usize, NodeId)> {
+        for (i, &a) in ids.iter().enumerate() {
+            let b = ids[1 - i];
+            if !per_channel(a) {
+                continue;
+            }
+            let d = all_static_dims(&graph.node(a).shape)?;
+            let n: usize = d.iter().product();
+            return Some((a, n, b));
+        }
+        None
+    };
+
+    let mut out_to_snake = HashMap::new();
+    let mut skip: HashSet<NodeId> = HashSet::new();
+    for node in graph.nodes() {
+        if !matches!(node.op, Op::Binary(BinaryOp::Add)) || node.inputs.len() != 2 {
+            continue;
+        }
+        if node.shape.dtype() != rlx_ir::DType::F32 {
+            continue;
+        }
+        let Some(out_dims) = all_static_dims(&node.shape) else {
+            continue;
+        };
+        // `[1, C, 1, L]`, the contiguous layout the kernel's row/column
+        // addressing is the flattened form of.
+        if out_dims.len() != 4 || out_dims[0] != 1 || out_dims[2] != 1 {
+            continue;
+        }
+        let (channels, inner) = (out_dims[1], out_dims[3]);
+        if channels == 0 || inner == 0 {
+            continue;
+        }
+        // The dispatch is one workgroup per channel and `SNAKE_BETA_WG` columns
+        // per workgroup, in two dimensions; a shape whose grid would not fit a
+        // per-dimension cap would dispatch a clipped grid and leave rows
+        // unwritten, so it declines like every other rule here.
+        if channels > MAX_WORKGROUPS_PER_DIM as usize
+            || inner.div_ceil(crate::kernels::SNAKE_BETA_WG as usize)
+                > MAX_WORKGROUPS_PER_DIM as usize
+        {
+            continue;
+        }
+        for (xi, si) in [(0usize, 1usize), (1, 0)] {
+            let (x, scale) = (node.inputs[xi], node.inputs[si]);
+            if graph.node(x).shape != node.shape {
+                continue;
+            }
+            // scale = Mul(beta, s2)
+            let scale_node = graph.node(scale);
+            if !matches!(scale_node.op, Op::Binary(BinaryOp::Mul)) || scale_node.inputs.len() != 2 {
+                continue;
+            }
+            if sole_reader(scale) != Some(node.id) {
+                continue;
+            }
+            let Some((beta, beta_len, s2)) = split_by_channel(&scale_node.inputs) else {
+                continue;
+            };
+            if beta_len != channels || graph.node(s2).shape != node.shape {
+                continue;
+            }
+            // s2 = Mul(s, s)
+            let s2_node = graph.node(s2);
+            if !matches!(s2_node.op, Op::Binary(BinaryOp::Mul))
+                || s2_node.inputs.len() != 2
+                || s2_node.inputs[0] != s2_node.inputs[1]
+            {
+                continue;
+            }
+            let s = s2_node.inputs[0];
+            if sole_reader(s2) != Some(scale) || graph.node(s).shape != node.shape {
+                continue;
+            }
+            if sole_reader(s) != Some(s2) {
+                continue;
+            }
+            // s = Activation(Sin, arg)
+            let s_node = graph.node(s);
+            let Op::Activation(Activation::Sin) = s_node.op else {
+                continue;
+            };
+            if s_node.inputs.len() != 1 {
+                continue;
+            }
+            let arg = s_node.inputs[0];
+            if sole_reader(arg) != Some(s) || graph.node(arg).shape != node.shape {
+                continue;
+            }
+            // arg = Mul(alpha, x)
+            let arg_node = graph.node(arg);
+            if !matches!(arg_node.op, Op::Binary(BinaryOp::Mul)) || arg_node.inputs.len() != 2 {
+                continue;
+            }
+            let Some((alpha, alpha_len, arg_x)) = split_by_channel(&arg_node.inputs) else {
+                continue;
+            };
+            if alpha_len != channels || arg_x != x {
+                continue;
+            }
+            if ![arg, s, s2, scale].into_iter().all(on_device) {
+                continue;
+            }
+
+            // Bias fold: `x = Add(conv, bias)`, read by this snake and nothing
+            // else. `conv` takes over as the addend.
+            let mut x = x;
+            let mut bias = None;
+            let x_node = graph.node(x);
+            let chain = [arg, s, s2, scale];
+            if let Op::Binary(BinaryOp::Add) = x_node.op
+                && x_node.inputs.len() == 2
+                && x_node.shape == node.shape
+                // Its step is what the fold replaces, so it cannot also be an
+                // output: nothing else would write that slot.
+                && !outputs.contains(&x)
+                && on_device(x)
+                // Its step is the one the fold suppresses, so it cannot be
+                // another fold's `out`: that write would go with it.
+                && !out_to_snake.contains_key(&x)
+                && consumer_nodes
+                    .get(&x)
+                    .is_some_and(|cs| cs.iter().all(|c| *c == arg || *c == node.id))
+                && let Some((b, b_len, conv)) = split_by_channel(&x_node.inputs)
+                && b_len == channels
+                && graph.node(conv).shape == node.shape
+                && bias_fold_is_sound(graph, arena, &order, &chain, x, conv, node.id)
+            {
+                x = conv;
+                bias = Some(b);
+            }
+
+            skip.extend(chain);
+            if bias.is_some() {
+                // The folded Add's own step is what the fold replaces.
+                skip.insert(x_node.id);
+            }
+            out_to_snake.insert(
+                node.id,
+                SnakeBetaPlan {
+                    x,
+                    alpha,
+                    beta,
+                    bias,
+                },
+            );
+            break;
+        }
+    }
+    (out_to_snake, skip)
+}
+
+/// Whether the snake's bias fold can read `conv` at `out`'s position — the two
+/// conditions `detect_snake_beta_pattern`'s doc spells out, in the order they
+/// are cheap: nothing but the fold's own chain (or a pinned Param/Input/Constant)
+/// may sit between the Add and `out`, and the bytes of `conv` and `out` must be
+/// disjoint, since the one dispatch reads the first while writing the second.
+fn bias_fold_is_sound(
+    graph: &Graph,
+    arena: &Arena,
+    order: &HashMap<NodeId, usize>,
+    consumed: &[NodeId],
+    folded_add: NodeId,
+    conv: NodeId,
+    out: NodeId,
+) -> bool {
+    let (Some(&add_pos), Some(&out_pos)) = (order.get(&folded_add), order.get(&out)) else {
+        return false;
+    };
+    if add_pos >= out_pos {
+        return false;
+    }
+    let window_is_quiet = graph.nodes()[add_pos + 1..out_pos].iter().all(|n| {
+        consumed.contains(&n.id)
+            || matches!(
+                n.op,
+                Op::Param { .. } | Op::Input { .. } | Op::Constant { .. }
+            )
+    });
+    if !window_is_quiet {
+        return false;
+    }
+    // The step reads `conv` while writing `out` from the same dispatch, so the
+    // two have to be disjoint in the bytes each one *reaches* — the storage
+    // span, not the view's own slot: a pure view covers only its own range while
+    // the storage underneath it runs on, and a parked parameter's tagged offset
+    // is a different byte space whose comparison would answer nothing.
+    let (Some((cs, ce)), Some((os, oe))) = (
+        arena.storage_span(graph, conv),
+        arena.storage_span(graph, out),
+    ) else {
+        return false;
+    };
+    ce <= os || oe <= cs
+}
+
 fn detect_split_qkv_pattern(graph: &Graph) -> HashMap<NodeId, (NodeId, NodeId, NodeId)> {
     // consumers[parent] = list of node ids that read parent
     let mut consumers: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
@@ -3800,6 +4440,685 @@ fn detect_split_qkv_pattern(graph: &Graph) -> HashMap<NodeId, (NodeId, NodeId, N
         result.insert(node.id, (narrows[0].1, narrows[1].1, narrows[2].1));
     }
     result
+}
+
+/// One `RmsNorm → Rope` pair of the loop's per-layer chain: a per-head norm over
+/// rows of `inner` elements, then the NeoX rotation of those same rows.
+#[derive(Clone)]
+pub(crate) struct NormRopeMember {
+    pub norm: NodeId,
+    pub rope: NodeId,
+    /// The norm's operand — what the fused step reads instead of the norm's
+    /// intermediate slot.
+    pub input: NodeId,
+    pub gamma: NodeId,
+    pub beta: NodeId,
+    pub heads: u32,
+}
+
+/// The members one `Step::NormRope` folds, and the geometry they share. A
+/// block's q and k are two members of one group, so they cost one dispatch.
+pub(crate) struct NormRopeGroup {
+    pub members: Vec<NormRopeMember>,
+    pub seq: u32,
+    pub inner: u32,
+    pub cos: NodeId,
+    pub sin: NodeId,
+    pub cos_row_stride: u32,
+    pub eps_bits: u32,
+    /// Set when the pair's operands are pieces of one split, whose step this one
+    /// replaces (see [`NormRopeSplit`]).
+    pub split: Option<NormRopeSplit>,
+}
+
+/// Two byte spans that cannot overlap; `None` is a span the arena cannot place
+/// (a parked parameter lives in the weight buffer, a different byte space) and
+/// carries no hazard.
+fn spans_disjoint(a: Option<(u64, u64)>, b: Option<(u64, u64)>) -> bool {
+    match (a, b) {
+        (Some((as_, ae)), Some((bs, be))) => ae <= bs || be <= as_,
+        _ => true,
+    }
+}
+
+/// The split a norm+rope pair absorbed: the pair's pieces are slices of one row,
+/// so the step reads that row directly and copies the piece the pair does not
+/// read, instead of the split writing all three first.
+pub(crate) struct NormRopeSplit {
+    /// The row the members' pieces are slices of, in elements.
+    pub src: NodeId,
+    /// Each member's piece start in that row, in member order.
+    pub starts: [u32; 2],
+    /// The piece the pair does not read: `(node, start, len)`, in elements.
+    pub copy: Option<(NodeId, u32, u32)>,
+}
+
+/// The extents of a shape, or `None` where the graph has not pinned them.
+fn all_static_dims(shape: &rlx_ir::Shape) -> Option<Vec<usize>> {
+    shape
+        .dims()
+        .iter()
+        .map(|d| d.is_static().then(|| d.unwrap_static()))
+        .collect()
+}
+
+/// `RmsNorm → RoPE` as one `Step::NormRope`, keyed by the node the step is
+/// emitted at (the last member's rope), plus the nodes whose own steps the fold
+/// replaces.
+///
+/// The admission is `bias_fold_is_sound`'s rule, for the same reason: the step
+/// reads each norm's operand and writes each rope's slot from one dispatch one
+/// or more node positions after the operand's last planned reader, so every node
+/// strictly between must be consumed by the fold or write nothing at all, and
+/// the bytes read must be disjoint from the bytes written.
+///
+/// The geometry it will only fold:
+/// * full NeoX rotation (`n_rot == head_dim`, even, no partial pass-through),
+/// * `batch == 1` with the operand's last extent the head width,
+/// * the norm's outer extent exactly `seq × heads`,
+/// * the norm's output read by nothing but this rope, with no node whose step the
+///   fold suppresses also a graph output, and
+/// * a cos/sin table one row per position, `head_dim / 2` wide.
+///
+/// Two members group only when they are adjacent in node order up to pure views
+/// and share the position table.
+///
+/// The fold suppresses both the norm's and the rope's own steps, so it is taken
+/// only where they would have stayed on the device: `on_device` is the walk's own
+/// routing answer (`should_pack_host_op`), so a configuration that hosts the
+/// per-head norms — `RLX_WGPU_HOST_NORM`, a discrete-Vulkan norm, a sharded arena
+/// — keeps the pair's steps, and a change to that rule moves this gate with it.
+///
+/// A pair whose two operands are pieces of one [`NarrowSplitGroup`] absorbs that
+/// split: the step reads the split's source row at each piece's start and copies
+/// the piece the pair does not read, so the block's fused qkv row and its two
+/// head norms cost one dispatch instead of two. The absorbed group is removed
+/// from `splits` and all of its pieces are added to `split_skip`, so no piece
+/// keeps a step of its own; the admission is the same window rule (extended back
+/// to the split, whose source is now read at the pair's position) plus strict
+/// disjointness between that source and every written span. Runs after
+/// [`detect_narrow_split_pattern`] and may consume the groups it returns.
+pub(crate) fn detect_norm_rope_pattern(
+    graph: &Graph,
+    arena: &Arena,
+    on_device: &dyn Fn(NodeId) -> bool,
+    splits: &mut HashMap<NodeId, NarrowSplitGroup>,
+    split_skip: &mut HashSet<NodeId>,
+) -> (HashMap<NodeId, NormRopeGroup>, HashSet<NodeId>) {
+    use rlx_ir::op::RopeStyle;
+
+    let ctx = NormRopeCtx::new(graph, arena);
+
+    struct Candidate {
+        member: NormRopeMember,
+        seq: u32,
+        inner: u32,
+        cos: NodeId,
+        sin: NodeId,
+        cos_row_stride: u32,
+        eps_bits: u32,
+        /// The norm's own position — the far end of the window the fold must own.
+        norm_pos: usize,
+        rope_pos: usize,
+        /// The norm and the views between it and the rope.
+        chain: Vec<NodeId>,
+    }
+
+    let mut cands: Vec<Candidate> = Vec::new();
+    for node in graph.nodes() {
+        let Op::Rope {
+            head_dim,
+            n_rot,
+            style,
+        } = node.op
+        else {
+            continue;
+        };
+        if style != RopeStyle::NeoX || n_rot != head_dim || head_dim == 0 || head_dim % 2 != 0 {
+            continue;
+        }
+        // The rope's operand must be this one norm, through layout-only views.
+        let mut cur = node.inputs[0];
+        let mut chain: Vec<NodeId> = Vec::new();
+        let norm = loop {
+            let n = graph.node(cur);
+            if matches!(n.op, Op::Reshape { .. })
+                && !n.inputs.is_empty()
+                && rlx_compile::memory::is_pure_view(graph, n)
+            {
+                chain.push(cur);
+                cur = n.inputs[0];
+                continue;
+            }
+            break cur;
+        };
+        let Op::RmsNorm { axis, eps } = graph.node(norm).op else {
+            continue;
+        };
+        let norm_node = graph.node(norm);
+        if norm_node.inputs.len() != 3 {
+            continue;
+        }
+        // Both suppressed steps must be ones the walk would have run on the
+        // device; a hosted norm or rope keeps its own step.
+        if !on_device(norm) || !on_device(node.id) {
+            continue;
+        }
+        // Single consumer all the way down the view chain, ending at this rope.
+        // `chain` is built rope-first, so the norm's consumer is its last entry
+        // and each view reads the one before it.
+        let head = chain.last().copied().unwrap_or(node.id);
+        if !ctx.sole_user(norm, head) {
+            continue;
+        }
+        let mut single = true;
+        for (i, &v) in chain.iter().enumerate() {
+            let want = if i == 0 { node.id } else { chain[i - 1] };
+            if !ctx.sole_user(v, want) {
+                single = false;
+                break;
+            }
+        }
+        if !single {
+            continue;
+        }
+        let (input, gamma, beta) = (
+            norm_node.inputs[0],
+            norm_node.inputs[1],
+            norm_node.inputs[2],
+        );
+        let (Some(in_dims), Some(x_dims)) = (
+            all_static_dims(&graph.node(input).shape),
+            all_static_dims(&node.shape),
+        ) else {
+            continue;
+        };
+        if in_dims.len() != 2 || x_dims.len() < 2 {
+            continue;
+        }
+        let inner = in_dims[1];
+        if inner != head_dim || !inner.is_multiple_of(2) {
+            continue;
+        }
+        // `-1` and the explicit last axis are the same axis spelled two ways.
+        if axis != -1 && axis != (in_dims.len() as i32 - 1) {
+            continue;
+        }
+        let seq = x_dims[x_dims.len() - 2];
+        let batch: usize = x_dims[..x_dims.len() - 2].iter().product();
+        if batch != 1 || seq == 0 || head_dim == 0 || x_dims[x_dims.len() - 1] % head_dim != 0 {
+            continue;
+        }
+        let heads = x_dims[x_dims.len() - 1] / head_dim;
+        if in_dims.iter().product::<usize>() / inner != seq * heads {
+            continue;
+        }
+        let (cos, sin) = (node.inputs[1], node.inputs[2]);
+        let Some(cos_dims) = all_static_dims(&graph.node(cos).shape) else {
+            continue;
+        };
+        let cos_row_stride = rlx_ir::shape::rope_table_stride(&graph.node(cos).shape, n_rot);
+        if cos_dims.len() != 2
+            || cos_dims[0] != seq
+            || cos_row_stride != head_dim / 2
+            || !graph
+                .node(sin)
+                .shape
+                .dims()
+                .eq(graph.node(cos).shape.dims())
+        {
+            continue;
+        }
+        cands.push(Candidate {
+            member: NormRopeMember {
+                norm,
+                rope: node.id,
+                input,
+                gamma,
+                beta,
+                heads: heads as u32,
+            },
+            seq: seq as u32,
+            inner: inner as u32,
+            cos,
+            sin,
+            cos_row_stride: cos_row_stride as u32,
+            eps_bits: eps.to_bits(),
+            norm_pos: ctx.order[&norm],
+            rope_pos: ctx.order[&node.id],
+            chain,
+        });
+    }
+    cands.sort_by_key(|c| c.rope_pos);
+
+    // An exact alias is safe for a read against a write of the same member: with
+    // an exact alias every thread reads its own pair before writing it, and every
+    // norm pass reads the whole row before the write pass starts — the rule the
+    // residual+norm tee rests on too. A shifted overlap is the fatal case, and two
+    // members of one dispatch are ordered by nothing, so a cross-member pair has to
+    // be strictly disjoint.
+    let disjoint_or_same =
+        |a: Option<(u64, u64)>, b: Option<(u64, u64)>| a == b || spans_disjoint(a, b);
+
+    let mut groups: HashMap<NodeId, NormRopeGroup> = HashMap::new();
+    let mut skip: HashSet<NodeId> = HashSet::new();
+    let index = PieceIndex::of(splits);
+    let mut i = 0;
+    while i < cands.len() {
+        let first = &cands[i];
+        // The nodes one fold owns: its norm, its rope and the views between them.
+        let owned = |c: &Candidate| -> HashSet<NodeId> {
+            c.chain
+                .iter()
+                .copied()
+                .chain([c.member.norm, c.member.rope])
+                .collect()
+        };
+        // The window starts at the earlier of the members' norms: an operand's
+        // liveness ends at its own norm, whichever member that is.
+        let mut members = vec![first.member.clone()];
+        let mut own = owned(first);
+        let mut last = i;
+        if let Some(next) = cands.get(i + 1) {
+            let same = next.seq == first.seq
+                && next.inner == first.inner
+                && next.cos == first.cos
+                && next.sin == first.sin
+                && next.cos_row_stride == first.cos_row_stride
+                && next.eps_bits == first.eps_bits;
+            let merged: HashSet<NodeId> = own.iter().copied().chain(owned(next)).collect();
+            if same && ctx.quiet(first.norm_pos.min(next.norm_pos), next.rope_pos, &merged) {
+                members.push(next.member.clone());
+                own = merged;
+                last = i + 1;
+            }
+        }
+        if last == i && !ctx.quiet(first.norm_pos, first.rope_pos, &own) {
+            i += 1;
+            continue;
+        }
+        // One dispatch reads every operand while writing every rope's slot: each
+        // written span must be disjoint (or exactly aliased) with its own member's
+        // reads and strictly disjoint from every other member's, and strictly
+        // disjoint from the other written spans.
+        let writes: Vec<_> = members
+            .iter()
+            .map(|m| arena.storage_span(graph, m.rope))
+            .collect();
+        let reads: Vec<Vec<_>> = members
+            .iter()
+            .map(|m| {
+                [m.input, m.gamma, m.beta]
+                    .into_iter()
+                    .chain([first.cos, first.sin])
+                    .map(|id| arena.storage_span(graph, id))
+                    .collect()
+            })
+            .collect();
+        let sound = writes.iter().enumerate().all(|(j, &w)| {
+            reads.iter().enumerate().all(|(k, rs)| {
+                rs.iter().all(|&r| {
+                    if k == j {
+                        disjoint_or_same(r, w)
+                    } else {
+                        spans_disjoint(r, w)
+                    }
+                })
+            }) && writes
+                .iter()
+                .enumerate()
+                .all(|(k, &o)| k == j || spans_disjoint(o, w))
+        });
+        if sound {
+            // The split the pair's operands are pieces of, if one dispatch can own
+            // both: the members read the source row at their pieces' starts and
+            // the leftover piece is copied, so the split keeps no step.
+            let absorbed = match ctx.absorbed_split(&members, first.seq, first.inner, &index) {
+                Some((split, emitter)) => {
+                    // The group must still be there: an earlier pair may have
+                    // claimed it, and no step writes a claimed piece.
+                    let Some(gone) = splits.remove(&emitter) else {
+                        i = last + 1;
+                        continue;
+                    };
+                    split_skip.extend(gone.pieces.iter().copied());
+                    Some(split)
+                }
+                None => None,
+            };
+            let emitter = members.last().expect("a group has a member").rope;
+            for m in &members {
+                skip.insert(m.norm);
+                if m.rope != emitter {
+                    skip.insert(m.rope);
+                }
+            }
+            groups.insert(
+                emitter,
+                NormRopeGroup {
+                    members,
+                    seq: first.seq,
+                    inner: first.inner,
+                    cos: first.cos,
+                    sin: first.sin,
+                    cos_row_stride: first.cos_row_stride,
+                    eps_bits: first.eps_bits,
+                    split: absorbed,
+                },
+            );
+        }
+        i = last + 1;
+    }
+    (groups, skip)
+}
+
+/// The graph-level facts the norm+rope admission reads: node order, uses, graph
+/// outputs, and the quiet-window rule that makes reading an operand past its
+/// planned last reader sound.
+struct NormRopeCtx<'a> {
+    graph: &'a Graph,
+    arena: &'a Arena,
+    order: HashMap<NodeId, usize>,
+    consumers: HashMap<NodeId, Vec<NodeId>>,
+    outputs: HashSet<NodeId>,
+}
+
+/// The `detect_narrow_split_pattern` groups, by piece and by emitter, cloned so a
+/// pair can find the split that fed it while the loop consumes groups out of
+/// `splits`.
+struct PieceIndex {
+    owner: HashMap<NodeId, NodeId>,
+    group: HashMap<NodeId, NarrowSplitGroup>,
+}
+
+impl PieceIndex {
+    fn of(splits: &HashMap<NodeId, NarrowSplitGroup>) -> Self {
+        Self {
+            owner: splits
+                .iter()
+                .flat_map(|(e, g)| g.pieces.iter().map(move |p| (*p, *e)))
+                .collect(),
+            group: splits.iter().map(|(e, g)| (*e, g.clone())).collect(),
+        }
+    }
+}
+
+impl<'a> NormRopeCtx<'a> {
+    fn new(graph: &'a Graph, arena: &'a Arena) -> Self {
+        let order = graph
+            .nodes()
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id, i))
+            .collect();
+        let mut consumers: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for node in graph.nodes() {
+            for &input in &node.inputs {
+                consumers.entry(input).or_default().push(node.id);
+            }
+        }
+        Self {
+            graph,
+            arena,
+            order,
+            consumers,
+            outputs: graph.outputs.iter().copied().collect(),
+        }
+    }
+
+    /// The one node reading `id`, if that is the whole of its use and `id` is not
+    /// a graph output — an output's slot must be written by a step, and this fold
+    /// suppresses the step that would write it.
+    fn sole_user(&self, id: NodeId, user: NodeId) -> bool {
+        !self.outputs.contains(&id)
+            && matches!(self.consumers.get(&id).map(Vec::as_slice), Some([only]) if *only == user)
+    }
+
+    /// Everything strictly between two positions must be the fold's own or write
+    /// nothing, so no other step can write an operand between its planned death
+    /// and the one dispatch that reads it.
+    fn quiet(&self, from: usize, to: usize, owned: &HashSet<NodeId>) -> bool {
+        self.graph.nodes()[from + 1..to].iter().all(|n| {
+            owned.contains(&n.id)
+                || rlx_compile::memory::is_pure_view(self.graph, n)
+                || matches!(
+                    n.op,
+                    Op::Param { .. } | Op::Input { .. } | Op::Constant { .. }
+                )
+        })
+    }
+
+    /// The split that fed a norm+rope pair, when one dispatch can own both: each
+    /// member's operand is one of the split's pieces (through its own line of
+    /// pure views), and the piece the pair does not read is copied. The window the
+    /// fold must own starts at the split's own emitter — the row's last planned
+    /// reader — because the step now reads that row at the pair's position, and
+    /// the source must be strictly disjoint from every write.
+    ///
+    /// `index` is the piece-keyed snapshot of the split groups, so the answer does
+    /// not depend on which groups an earlier pair already consumed; the caller
+    /// removes the group it absorbed.
+    fn absorbed_split(
+        &self,
+        members: &[NormRopeMember],
+        seq: u32,
+        inner: u32,
+        index: &PieceIndex,
+    ) -> Option<(NormRopeSplit, NodeId)> {
+        if members.len() != 2 {
+            return None;
+        }
+        let mut pieces: Vec<(NodeId, u32, u32)> = Vec::with_capacity(2);
+        for m in members {
+            let mut cur = m.input;
+            let mut prev = m.norm;
+            let piece = loop {
+                if !self.sole_user(cur, prev) {
+                    return None;
+                }
+                let n = self.graph.node(cur);
+                if rlx_compile::memory::is_pure_view(self.graph, n) && !n.inputs.is_empty() {
+                    prev = cur;
+                    cur = n.inputs[0];
+                    continue;
+                }
+                let Op::Narrow { start, len, .. } = n.op else {
+                    return None;
+                };
+                if (len as u64) != (seq as u64) * (m.heads as u64) * (inner as u64) {
+                    return None;
+                }
+                break (cur, start as u32, len as u32);
+            };
+            pieces.push(piece);
+        }
+        let emitter = *index.owner.get(&pieces[0].0)?;
+        if emitter != *index.owner.get(&pieces[1].0)? || pieces[0].0 == pieces[1].0 {
+            return None;
+        }
+        let cut = index.group.get(&emitter)?;
+        let mut leftover = cut
+            .pieces
+            .iter()
+            .copied()
+            .filter(|p| *p != pieces[0].0 && *p != pieces[1].0);
+        let copy = match (leftover.next(), leftover.next()) {
+            (None, _) => None,
+            (Some(p), None) => match self.graph.node(p).op {
+                Op::Narrow { start, len, .. } => Some((p, start as u32, len as u32)),
+                _ => return None,
+            },
+            (Some(_), Some(_)) => return None,
+        };
+        if self.order[&emitter] >= self.order[&members[1].rope] {
+            return None;
+        }
+        let mut owned: HashSet<NodeId> = cut.pieces.iter().copied().collect();
+        for m in members {
+            owned.extend([m.norm, m.rope]);
+        }
+        if !self.quiet(self.order[&emitter], self.order[&members[1].rope], &owned) {
+            return None;
+        }
+        let src = self.arena.storage_span(self.graph, cut.src);
+        let written: Vec<_> = members
+            .iter()
+            .map(|m| m.rope)
+            .chain(copy.map(|(p, _, _)| p))
+            .collect();
+        if !written
+            .iter()
+            .all(|&w| spans_disjoint(src, self.arena.storage_span(self.graph, w)))
+        {
+            return None;
+        }
+        Some((
+            NormRopeSplit {
+                src: cut.src,
+                starts: [pieces[0].1, pieces[1].1],
+                copy,
+            },
+            emitter,
+        ))
+    }
+}
+
+/// The pieces one `Step::NarrowSplit` cuts from a single row, and the node it is
+/// emitted at (the last piece, so every destination slot is already live and the
+/// source is read at its planned last reader).
+#[derive(Clone)]
+pub(crate) struct NarrowSplitGroup {
+    pub pieces: Vec<NodeId>,
+    pub src: NodeId,
+    pub total: u32,
+}
+
+/// A fused projection writes one `[1, q + k + v]` row and its three consumers
+/// read it as three tensors; the decomposed form copies each piece with its own
+/// `narrow` dispatch. This finds the 2–3 pieces of one row that cover its last
+/// axis contiguously and turns them into one dispatch.
+///
+/// Admission is what makes one flat walk describe the cut: `outer == 1` (a single
+/// row — with rows the pieces are strided), pieces contiguous from 0 and covering
+/// the axis, the narrows adjacent in node order, every destination span disjoint
+/// from the source's (an exact alias is allowed; each thread reads its own element
+/// before writing it), and a real dtype — the kernel moves one f32 word per
+/// element, so a complex row's packs need the plain `narrow`'s lane handling.
+/// `on_device` is the walk's own routing answer, so a piece the plain form would
+/// have staged on the host keeps its own step.
+pub(crate) fn detect_narrow_split_pattern(
+    graph: &Graph,
+    arena: &Arena,
+    on_device: bool,
+) -> (HashMap<NodeId, NarrowSplitGroup>, HashSet<NodeId>) {
+    // One compile-global answer for every piece: a walk that stages structure
+    // work on the host keeps all of them.
+    if !on_device {
+        return (HashMap::new(), HashSet::new());
+    }
+    let order: HashMap<NodeId, usize> = graph
+        .nodes()
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.id, i))
+        .collect();
+    let mut consumers: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for node in graph.nodes() {
+        for &input in &node.inputs {
+            consumers.entry(input).or_default().push(node.id);
+        }
+    }
+    let span = |id: NodeId| arena.storage_span(graph, id);
+
+    let mut groups: HashMap<NodeId, NarrowSplitGroup> = HashMap::new();
+    let mut skip: HashSet<NodeId> = HashSet::new();
+    for node in graph.nodes() {
+        let Some(cs) = consumers.get(&node.id) else {
+            continue;
+        };
+        if cs.len() < 2 || cs.len() > 3 || node.shape.dtype().is_complex() {
+            continue;
+        }
+        let Some(dims) = all_static_dims(&node.shape) else {
+            continue;
+        };
+        if dims.is_empty() {
+            continue;
+        }
+        let axis = dims.len() - 1;
+        if dims[..axis].iter().product::<usize>() != 1 {
+            continue;
+        }
+        let mut pieces: Vec<(usize, usize, NodeId)> = Vec::with_capacity(cs.len());
+        let mut all = true;
+        for &c in cs {
+            let cn = graph.node(c);
+            match cn.op {
+                Op::Narrow {
+                    axis: a,
+                    start,
+                    len,
+                } if a == axis => pieces.push((start, len, c)),
+                _ => {
+                    all = false;
+                    break;
+                }
+            }
+        }
+        if !all {
+            continue;
+        }
+        pieces.sort_by_key(|p| p.0);
+        let mut at = 0usize;
+        for (start, len, _) in &pieces {
+            if *start != at {
+                all = false;
+                break;
+            }
+            at += len;
+        }
+        if !all || at != dims[axis] {
+            continue;
+        }
+        // Adjacent in node order: nothing else can write a destination between
+        // its own slot's birth and the one dispatch that fills it.
+        let mut adjacent = true;
+        for w in pieces.windows(2) {
+            if order[&w[1].2] != order[&w[0].2] + 1 {
+                adjacent = false;
+            }
+        }
+        if !adjacent {
+            continue;
+        }
+        let src = span(node.id);
+        let dsts: Vec<_> = pieces.iter().map(|(_, _, id)| span(*id)).collect();
+        let sound = dsts.iter().enumerate().all(|(i, &d)| {
+            (src == d || spans_disjoint(src, d))
+                && dsts
+                    .iter()
+                    .enumerate()
+                    .all(|(j, &o)| i == j || spans_disjoint(o, d))
+        });
+        if !sound {
+            continue;
+        }
+        let emitter = pieces.last().expect("two pieces at least").2;
+        for (_, _, id) in &pieces {
+            if *id != emitter {
+                skip.insert(*id);
+            }
+        }
+        groups.insert(
+            emitter,
+            NarrowSplitGroup {
+                pieces: pieces.iter().map(|(_, _, id)| *id).collect(),
+                src: node.id,
+                total: dims[axis] as u32,
+            },
+        );
+    }
+    (groups, skip)
 }
 
 /// Walk through Cast/Reshape nodes (which alias the underlying arena
@@ -4491,17 +5810,17 @@ mod conv_route_decision_tests {
         let aligned = col_bytes.div_ceil(256) * 256;
         let planned = 1u64 << 20;
         assert_eq!(
-            conv_im2col_scratch_bytes(&band, planned as usize, planned + aligned),
+            conv_im2col_scratch_bytes(&band, planned as usize, planned + aligned, false),
             aligned as usize,
             "a window with room for the panel reserves exactly it, 256-byte aligned"
         );
         assert_eq!(
-            conv_im2col_scratch_bytes(&band, planned as usize, planned + col_bytes - 1),
+            conv_im2col_scratch_bytes(&band, planned as usize, planned + col_bytes - 1, false),
             0,
             "a window one byte short of the panel drops it"
         );
         assert_eq!(
-            conv_im2col_scratch_bytes(&band, planned as usize, u64::MAX),
+            conv_im2col_scratch_bytes(&band, planned as usize, u64::MAX, false),
             aligned as usize,
             "an unlimited window reserves it whatever the plan costs"
         );
@@ -4514,10 +5833,67 @@ mod conv_route_decision_tests {
         let (huge, huge_elems) =
             conv_graph(c_in, im2col_min_cout() as usize, [1, w], [5, 5], [2, 2]);
         assert!(huge_elems.expect("floor-clearing shape") * 4 > CONV_IM2COL_MAX_COL_BYTES);
-        assert_eq!(conv_im2col_scratch_bytes(&huge, 0, u64::MAX), 0);
+        assert_eq!(conv_im2col_scratch_bytes(&huge, 0, u64::MAX, false), 0);
         // …and the tail the panel is reserved in is floored at 64 MiB, the base every
         // recorded `expected_col_delta` in the route harness is measured against.
         assert_eq!(compute_scratch_bytes(&band), 64 * 1024 * 1024);
+    }
+
+    /// The implicit class's channel bounds are the entry's own: a ceiling because it
+    /// carries three accumulator sets (an output one row past three tiles would have
+    /// rows no set covers) and a floor because below a tile's rows it multiplies
+    /// output the conv does not have. The kernel guards neither, so the refusal has
+    /// to happen here.
+    #[test]
+    fn a_conv_outside_the_implicit_class_channel_bounds_is_refused() {
+        let shape = |c_in, c_out| ConvImplicitShape {
+            c_in,
+            c_out,
+            kh: 1,
+            kw: 7,
+            h: 1,
+            h_out: 1,
+            sw: 1,
+            ph: 0,
+            groups: 1,
+            n: 1,
+            spatial: conv_implicit_min_spatial(),
+        };
+        assert!(
+            shape(96, 96).admits(),
+            "three whole row tiles is the ceiling"
+        );
+        assert!(
+            shape(96, 4).admits(),
+            "four rows is the narrowest output the entry is admitted for"
+        );
+        for (c_in, c_out) in [(97, 96), (96, 97), (96, 104), (96, 3), (96, 1)] {
+            assert!(
+                !shape(c_in, c_out).admits(),
+                "{c_in}/{c_out} is outside the channel bounds the entry keeps"
+            );
+        }
+    }
+
+    /// The class's cap restates what the entry covers, so the numbers cannot drift:
+    /// `ROW_TILES` accumulator sets of `TILE_M` rows are exactly the cap, and the
+    /// epilogue stores one row tile per set. Both are read out of the shader source,
+    /// because the kernel guards neither and the host cap is all that keeps a wider
+    /// output away from it.
+    #[test]
+    fn the_implicit_class_cap_is_the_entrys_row_tiles() {
+        let src = crate::kernels::CONV1D_IMPLICIT_WGSL;
+        assert!(src.contains("const ROW_TILES: u32 = 3u;"), "three sets");
+        assert!(src.contains("const TILE_M: u32 = 32u;"), "32 rows a set");
+        let stores = src
+            .lines()
+            .filter(|l| l.trim_start().starts_with("copy_out("))
+            .count();
+        assert_eq!(
+            stores, 3,
+            "the epilogue stores one row tile per accumulator set"
+        );
+        assert_eq!(3 * 32, CONV_IMPLICIT_MAX_C_OUT, "the cap is that coverage");
     }
 
     /// The spatial floor's rule, at its own boundary: the quantity is one conv
@@ -4562,11 +5938,52 @@ mod conv_route_decision_tests {
                 &g.node(node.inputs[0]).shape,
                 &g.node(node.inputs[1]).shape,
                 &node.shape,
+                false,
             ),
             None,
             "1×1 taps are not the im2col route's shape"
         );
-        assert_eq!(conv_im2col_scratch_bytes(&g, 1 << 20, u64::MAX), 0);
+        assert_eq!(conv_im2col_scratch_bytes(&g, 1 << 20, u64::MAX, false), 0);
+    }
+
+    /// A conv the cooperative implicit route takes reserves no panel: its own
+    /// `[1, 96, 1, l]` dilated form clears every im2col floor, so the reservation
+    /// would book `k_total · spatial · 4` for a matrix the route never writes —
+    /// and books nothing for it once the route is live.
+    #[test]
+    fn a_conv_the_implicit_route_takes_reserves_no_panel() {
+        let (g, elems) = conv_graph(96, 96, [1, 140_000], [1, 7], [0, 3]);
+        let panel = elems.expect("the class's shape clears the im2col floors") * 4;
+        assert_eq!(
+            conv_im2col_scratch_bytes(&g, 0, u64::MAX, false),
+            panel as usize,
+            "with the implicit route off the panel is booked, as it was"
+        );
+        assert_eq!(
+            conv_im2col_scratch_bytes(&g, 0, u64::MAX, true),
+            0,
+            "and a route that gathers through the taps books none"
+        );
+    }
+
+    /// The direct cooperative entry's admission, term by term: the route term keeps
+    /// it off the ordinary multiply, the epilogue terms off a multiply with a bias or
+    /// an activation, and the shape terms off a tile the kernel's unguarded 32×32
+    /// store or its whole-`TILE_K` legs would write or read past.
+    #[test]
+    fn the_direct_coop_f32_entry_is_admitted_by_its_own_terms() {
+        assert!(
+            coop_f32_direct_admitted(0, 0xFFFF, 64, 128, 64, false),
+            "the bar"
+        );
+        // A weight in the second operand is the ordinary multiply's cascaded form,
+        // which keeps `matmul_coop_f32`'s staging and scalar epilogue.
+        assert!(!coop_f32_direct_admitted(0, 0xFFFF, 64, 128, 64, true));
+        assert!(!coop_f32_direct_admitted(1, 0xFFFF, 64, 128, 64, false));
+        assert!(!coop_f32_direct_admitted(0, 1, 64, 128, 64, false));
+        assert!(!coop_f32_direct_admitted(0, 0xFFFF, 63, 128, 64, false));
+        assert!(!coop_f32_direct_admitted(0, 0xFFFF, 64, 127, 64, false));
+        assert!(!coop_f32_direct_admitted(0, 0xFFFF, 64, 128, 33, false));
     }
 
     /// A conv graph, and the col element count `conv_im2col_col_elems` gives its
@@ -4589,6 +6006,7 @@ mod conv_route_decision_tests {
             &g.node(node.inputs[0]).shape,
             &g.node(node.inputs[1]).shape,
             &node.shape,
+            false,
         );
         (g, elems)
     }

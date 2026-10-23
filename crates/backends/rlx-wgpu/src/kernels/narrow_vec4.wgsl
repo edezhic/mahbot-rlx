@@ -7,11 +7,12 @@
 // span in vec4 units. The scalar form in `narrow.wgsl` rebuilds all three
 // from one flat index with `%` and `/` per element.
 //
-// Taken at lowering only when `inner % 4 == 0`, both window offsets are
-// 16 B aligned (f32-word offsets divisible by 4; the window base is 256 B
-// aligned), and `axis_out_size`, `outer` and the x grid fit the adapter's
-// `max_compute_workgroups_per_dimension`. Anything else keeps the 1-D
-// scalar form.
+// Taken at lowering only when both window offsets are 16 B aligned (f32-word
+// offsets divisible by 4; the window base is 256 B aligned) and the grid fits
+// the adapter's `max_compute_workgroups_per_dimension`, in one of two shapes:
+// `inner % 4 == 0` (many rows of whole vectors), or `inner == 1` with the slice
+// start, its length and the input row stride all whole vectors (the trailing
+// transposed-convolution slice). Anything else keeps the 1-D scalar form.
 //
 // A separate module from `narrow.wgsl` because a vector load needs the
 // arena bound as `array<vec4<f32>>` while the scalar fallback indexes
@@ -39,6 +40,21 @@ struct Params {
 
 @compute @workgroup_size(64)
 fn narrow_vec4(@builtin(global_invocation_id) gid: vec3<u32>) {
+    // Last-axis slice (`inner == 1`): the copied run is the slice itself, so the
+    // contiguous span is `axis_out_size` elements of one input row rather than
+    // `inner` elements of many rows. This is the trailing `narrow` after every
+    // transposed convolution; its `inner` is 1, which the row form above cannot
+    // express (inner4 == 0), and the old admission test looked only at `inner`
+    // and sent it to the scalar kernel.
+    if (params.inner == 1u) {
+        if (gid.x * 4u >= params.axis_out_size) { return; }
+        let out_elem = gid.z * params.axis_out_size + gid.x * 4u;
+        if (out_elem >= params.out_total) { return; }
+        let in_elem = gid.z * params.axis_in_size + params.start + gid.x * 4u;
+        arena[(params.out_off >> 2u) + (out_elem >> 2u)] =
+            arena[(params.in_off >> 2u) + (in_elem >> 2u)];
+        return;
+    }
     let inner4 = params.inner >> 2u;
     // `gid.y`/`gid.z` come from a grid sized exactly to the axis and outer
     // counts, so only x (rounded up to whole workgroups) needs a guard.

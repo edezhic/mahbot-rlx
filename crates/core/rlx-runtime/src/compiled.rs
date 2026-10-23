@@ -172,6 +172,12 @@ impl CompiledGraph {
     pub fn host_execution_summary(&self) -> Option<String> {
         self.inner.wgpu_host_summary()
     }
+    /// The compiled schedule's step names, in run order — the schedule the product
+    /// path compiles (fusion included), for a gate that pins a property of it.
+    #[doc(hidden)]
+    pub fn schedule_step_names(&self) -> Option<Vec<&'static str>> {
+        self.inner.wgpu_step_names()
+    }
 
     /// Set a named parameter (model weight).
     /// Call once per parameter after compilation.

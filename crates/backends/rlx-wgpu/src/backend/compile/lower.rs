@@ -14,44 +14,45 @@
 use super::super::arena_binds_whole_at_zero;
 use crate::buffer::{
     Arena, ReadbackLayout, ReadbackStaging, TinyReadbackStaging, decode_mapped_readback_f32,
-    decode_tiny_mapped_f32, encode_readback_copies, plan_f32_uniform, read_f32_many_pooled,
-    schedule_readback_map, use_tiny_readback, wait_readback_map,
+    decode_tiny_mapped_f32, encode_readback_copies, kv_row_bytes, kv_row_dst, plan_f32_uniform,
+    read_f32_many_pooled, schedule_readback_map, use_tiny_readback, wait_readback_map,
 };
 use crate::device::wgpu_device;
 use crate::kernels::{
     ActivationBackwardParams, AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams,
     AttentionBwdParams, AttentionMaskParams, AttentionParams, AxialRope2dParams,
     BatchElementwiseRegionParams, BatchNormInferenceParams, BinaryC64Params, BinaryParams,
-    CastParams, ComplexCastParams, ComplexWirtingerParams, Conv1dParams, Conv2dParams,
-    Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams, CopyParams, CumScanParams,
-    CumsumBwdParams, CumsumParams, DequantMatmulMlxParams, DequantMatmulParams,
-    ElementwiseRegionParams, ExpandParams, FakeQuantizeParams, FftButterflyStageParams, FmaParams,
-    FramesParams, FusedConvBiasActParams, FusedResidualLnParams, FusedResidualLnTeeParams,
-    FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
-    GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams, GruParams,
-    Im2Col2dParams, IndexingNdParams, Kernel, LayerNorm2dParams, LayerNormBwdParams,
+    CastParams, ComplexCastParams, ComplexWirtingerParams, ConcatManyParams, Conv1dImplicitParams,
+    Conv1dParams, Conv2dParams, Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams,
+    CopyParams, CumScanParams, CumsumBwdParams, CumsumParams, DequantMatmulMlxParams,
+    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FakeQuantizeParams,
+    FftButterflyStageParams, FmaParams, FramesParams, FusedConvBiasActParams,
+    FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams,
+    GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
+    GatherBwdParams, GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams,
+    GruParams, Im2Col2dParams, IndexingNdParams, Kernel, LayerNorm2dParams, LayerNormBwdParams,
     LayerNormParams, LstmParams, Mamba2Params, MatmulParams, MatmulQkvParams, MaxPool2dBwdParams,
-    MaxPool3dBwdParams, NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams,
-    QConv2dParams, QMatMulParams, QUANT_I8_MAX_CHAN, QuantI8Params, ReduceParams, ReverseParams,
-    RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, SampleParams,
-    ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams, SceParams,
-    SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams, UmapKnnParams, UnaryParams,
-    WelchPeaksGpuParams, WhereParams, activation_backward_kernel, ada_layer_norm_backward_kernel,
-    ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel, attention_kernel,
-    attention_mask_kernel, axial_rope2d_kernel, batch_elementwise_region_kernel,
+    MaxPool3dBwdParams, NarrowConcatParams, NarrowSplitParams, NormRopeParams, Pool1dParams,
+    Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QUANT_I8_MAX_CHAN, QuantI8Params,
+    ReduceParams, ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
+    SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams,
+    SceParams, SelectiveScanParams, SnakeBetaParams, SoftmaxParams, TopKParams, TransposeParams,
+    UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams, activation_backward_kernel,
+    ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
+    attention_kernel, attention_mask_kernel, axial_rope2d_kernel, batch_elementwise_region_kernel,
     batch_norm_inference_bwd_beta_kernel, batch_norm_inference_bwd_gamma_kernel,
     batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_c64_kernel,
     binary_kernel, cast_f32_to_f16_kernel, cast_kernel, compare_kernel, complex_cast_kernel,
-    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, concat_vec4_kernel,
-    conjugate_c64_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel,
-    conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
-    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, copy_sanitize_kernel,
-    cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    dequant_matmul_mlx_kernel, dequantize_i8_kernel, elementwise_region_kernel,
-    elementwise_region_spatial_kernel, expand_kernel, fake_quantize_fixed_kernel,
-    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel, frames_kernel,
-    fused_conv_bias_act_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
+    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, concat_many_kernel,
+    concat_vec4_kernel, conjugate_c64_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel,
+    conv1d_implicit_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
+    conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel,
+    copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
+    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
+    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
+    fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
+    fma_kernel, frames_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel,
+    fused_residual_ln_tee_kernel, fused_residual_ln_tee_vec4_kernel,
     fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
     gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
     gather_backward_acc_kernel, gather_backward_zero_kernel, gather_elements_kernel, gather_kernel,
@@ -59,19 +60,20 @@ use crate::kernels::{
     group_norm_backward_gamma_kernel, group_norm_backward_input_kernel, group_norm_kernel,
     grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
-    layernorm_kernel, lead_pack_uniform, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
-    matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
+    layernorm_kernel, layernorm_vec4_kernel, lead_pack_uniform, lstm_kernel, mamba2_kernel,
+    matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
     matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
     matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
     matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
     matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
-    maxpool3d_backward_kernel, narrow_kernel, narrow_vec4_kernel, pool1d_kernel, pool2d_kernel,
-    pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel,
-    reverse_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scaled_dequantize_kernel,
-    scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel, scaled_quant_scale_kernel,
-    scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel,
-    selective_scan_kernel, softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
+    maxpool3d_backward_kernel, narrow_kernel, narrow_split_kernel, narrow_vec4_kernel,
+    norm_rope_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel,
+    q_matmul_kernel, quantize_i8_kernel, reduce_kernel, reverse_kernel, rms_norm_backward_kernel,
+    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
+    scaled_dequantize_kernel, scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel,
+    scaled_quant_scale_kernel, scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel,
+    scatter_nd_reduce_kernel, selective_scan_kernel, snake_beta_kernel,
+    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
     softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
     transpose_vec4_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
     welch_peaks_gpu_kernel, where_kernel,
@@ -488,6 +490,19 @@ fn assert_region_activations_implemented(node: &rlx_ir::Node, chain: &[rlx_ir::o
         id = node.id,
         sub = rlx_ir::region_encode::activation_sub(act),
     );
+}
+
+/// Refuse a region whose stored `input_modulus` cannot express one of its operands.
+///
+/// `WgpuExecutable::compile` is the direct entry: it runs neither the IR verifier nor
+/// `LegalizeBroadcast`, so the rule that keeps a fused region equal to the unfused path
+/// has to be applied here as well. The rule itself lives in
+/// `rlx_ir::region_encode::region_modulus_refusals`, which the verifier calls too, so
+/// what verifies clean is what lowers and the two cannot drift.
+fn assert_region_modulus_expressible(graph: &Graph, node: &rlx_ir::Node) {
+    if let Some(reason) = rlx_ir::region_encode::region_modulus_refusals(graph, node).first() {
+        panic!("rlx-wgpu: region refused: {reason}");
+    }
 }
 
 /// The per-binding-ceiling rule: one rule, decided at plan time.
@@ -970,6 +985,26 @@ fn window_offsets(
     (base, size, offsets)
 }
 
+/// A fused step writes its results into the bind window; a destination the
+/// resolve had to stage into scratch must be copied back to its own slot, or the
+/// write is silently dropped and the reader gets whatever the slot held.
+/// `offs` is [`window_offsets`]'s answer, so a staged destination's offset is its
+/// position inside the window. A destination must live in the activation arena:
+/// [`arena_tensor_in_window`] answers `false` for a weight-tagged offset, which
+/// would take the copy path with a tagged `dst_byte_off` — every fold's admission
+/// rules a weight-parked destination out.
+fn write_backs(arena: &Arena, base: u64, size: u64, written: &[(NodeId, u32)]) -> Vec<Step> {
+    written
+        .iter()
+        .filter(|(id, _)| !arena_tensor_in_window(arena, *id, base, size))
+        .map(|(id, off)| Step::BufferCopy {
+            src_byte_off: base + (*off as u64) * 4,
+            dst_byte_off: arena.offset(*id) as u64,
+            bytes: arena.len_of(*id) as u32,
+        })
+        .collect()
+}
+
 /// The addressed geometry, for the ceiling rule's messages: which arena could not
 /// be bound whole, and why.
 fn geometry_report(arena: &Arena, limit: u64) -> String {
@@ -1358,6 +1393,18 @@ pub(crate) fn compile_static_inner(
 ) -> crate::backend::WgpuExecutable {
     let dev = wgpu_device().expect("rlx-wgpu: no compatible adapter found");
 
+    // The one-row packed multiply's subgroup width is read by a one-shot dispatch
+    // and fence. Read it here, where the graph already says a one-row packed
+    // multiply will run, so it never lands inside the first run's submission
+    // bracket — a run that counts its own submits would otherwise read one high.
+    if graph
+        .nodes()
+        .iter()
+        .any(|n| matches!(n.op, Op::DequantMatMul { .. }))
+    {
+        crate::gguf_gpu::prime_gemv_subgroup_probe(&dev.device);
+    }
+
     // Decompose composed/fused ops (FusedMatMulBiasAct, LoraMatMul,
     // FusedAttentionBlock, FusedTransformerLayer, ...) into primitive
     // sequences before memory planning so every intermediate gets a
@@ -1489,12 +1536,16 @@ pub(crate) fn compile_static_inner(
     let base_scratch_bytes = compute_scratch_bytes(&graph);
     // Reserve tail scratch for the im2col `col` matrix only when the accelerated
     // conv routes are enabled (they are on by default; `RLX_WGPU_CONV_IM2COL=0`
-    // restores the lean arena — the tiled/direct convs need no extra scratch).
+    // restores the lean arena — the tiled/direct convs need no extra scratch) and
+    // only for the convs the cooperative implicit route will not take instead.
     let conv_col_scratch = if crate::backend::conv_routes_enabled() {
+        let implicit_live =
+            conv_implicit_enabled() && crate::kernels::conv1d_implicit_supported(&dev.device);
         conv_im2col_scratch_bytes(
             &graph,
             plan.arena_size,
             dev.device.limits().max_storage_buffer_binding_size,
+            implicit_live,
         )
     } else {
         0
@@ -1548,23 +1599,13 @@ pub(crate) fn compile_static_inner(
         flat
     };
     let _ = max_buf;
-    // Override slot lengths with the actual elem*4 byte counts so
-    // readback returns the right element count (slots may be
-    // padded for alignment).
-    for node in graph.nodes() {
-        let elems = node.shape.num_elements().unwrap_or(0);
-        // Actual byte length = (# of f32 lanes) × 4. Real/int/bool tensors are
-        // widened to exactly ONE f32 lane per element (→ `elems * 4`). Complex
-        // tensors genuinely occupy MULTIPLE f32 lanes — C64 = 2 lanes (8 B),
-        // C128 = 4 lanes (16 B) — so `elems * 4` would truncate the slot and
-        // drop the imaginary (and df64 lo) lanes on readback / aliasing copies.
-        let dt = node.shape.dtype();
-        let actual = if dt.is_complex() {
-            elems * dt.size_bytes()
-        } else {
-            elems * 4
-        };
-        arena.set_actual_len(node.id, actual);
+    // Record the plan's actual byte lengths and place the body frame's KV rows on
+    // the cache rows they are copied to — the copy step then does not exist instead
+    // of being scheduled better. This is the last mutation of the plan: every byte
+    // offset the step loop reads below is read after it.
+    let kv_in_place = arena.finish_plan(&graph, max_bind);
+    if kv_in_place > 0 && rlx_ir::env::flag("RLX_WGPU_SCHEDULE") {
+        eprintln!("[rlx-wgpu] kv rows written in place (copy elided): {kv_in_place}");
     }
 
     // Initialize Constants directly into the arena. The wgpu arena is f32-
@@ -1906,15 +1947,17 @@ pub(crate) fn compile_static_inner(
                         return false;
                     };
                     // The tee is one workgroup per row, and every pass in it
-                    // strides over the same lanes (element index ≡ lane mod 64),
-                    // so an arena element is only read and written by the lane
-                    // that owns it — the reduction is the one cross-lane exchange
-                    // and it goes through barrier-ordered workgroup memory. The
-                    // norm aliasing an operand EXACTLY (same offset, same length)
-                    // is therefore safe: row r's writes land on the lanes those
-                    // same threads have already read. Only a partial or shifted
-                    // overlap is fatal, and it only ever comes from a *different*
-                    // dispatch, which clobbers the bytes before the tee runs.
+                    // strides over the same lanes (the scalar module gives lane
+                    // `t` the elements `i ≡ t (mod 64)`, the vector module the
+                    // groups `4t .. 4t+3` then `+ 4·256`), so an arena element is
+                    // only read and written by the lane that owns it — the
+                    // reduction is the one cross-lane exchange and it goes
+                    // through barrier-ordered workgroup memory. The norm aliasing
+                    // an operand EXACTLY (same offset, same length) is therefore
+                    // safe: row r's writes land on the lanes those same threads
+                    // have already read. Only a partial or shifted overlap is
+                    // fatal, and it only ever comes from a *different* dispatch,
+                    // which clobbers the bytes before the tee runs.
                     let hit = operands.iter().any(|&(os, oe)| {
                         let overlaps = ws < oe && we > os;
                         let exact_self_alias = n.id == **ln_id && ws == os && we == oe;
@@ -1947,6 +1990,51 @@ pub(crate) fn compile_static_inner(
             }
         }
     }
+
+    // The sound half's snake: `x + beta·sin²(alpha·x)` arrives as five
+    // element-wise nodes and the REGION pass declines the chain (a `[1, C, 1, L]`
+    // output against `[1, C, 1, 1]` operands is the mid-axis singleton
+    // `region_input_modulus` refuses), so it would be five dispatches over the
+    // same tensor. One `Step::SnakeBeta` replaces them; the intermediates emit
+    // no step of their own. Read live, like the conv switches, so a bisect does
+    // not need a fresh config snapshot.
+    //
+    // The fold consumes five elementwise nodes, so it is taken only where those
+    // would have stayed on the device: the detector asks `should_pack_host_op`,
+    // the rule the walk below routes them by, so `RLX_WGPU_FORCE_HOST`, the
+    // discrete-Vulkan/DX12 elementwise path and a stripe straddle keep the
+    // chain's own steps, and a change to that rule moves this gate with it.
+    let (snake_beta, snake_skip) = if rlx_ir::env::flag("RLX_WGPU_NO_SNAKE_BETA") {
+        (HashMap::new(), HashSet::new())
+    } else {
+        detect_snake_beta_pattern(&graph, &arena, &|id| {
+            let n = graph.node(id);
+            !should_pack_host_op(&arena, &n.op, n, &graph)
+        })
+    };
+
+    // A fused projection's row split into its parts: one dispatch for the pieces
+    // instead of one `narrow` each. Detected before the norm+rope fold, which
+    // absorbs the split that feeds a q/k pair.
+    let (mut narrow_split, mut narrow_split_skip) =
+        detect_narrow_split_pattern(&graph, &arena, !wgpu_prefer_structure_host(&arena));
+
+    // `RmsNorm → RoPE` as one dispatch, for the per-head pair every transformer
+    // block walks: two head rows per layer become one step instead of four. The
+    // fold suppresses the norm's and the rope's steps, so it asks the walk's own
+    // routing rule — `should_pack_host_op` — and keeps both steps wherever they
+    // would have been hosted. A pair the split fed takes that split with it, so
+    // the block's fused qkv row costs one dispatch instead of two.
+    let (norm_rope, norm_rope_skip) = detect_norm_rope_pattern(
+        &graph,
+        &arena,
+        &|id| {
+            let n = graph.node(id);
+            !should_pack_host_op(&arena, &n.op, n, &graph)
+        },
+        &mut narrow_split,
+        &mut narrow_split_skip,
+    );
 
     let mut coop_f16_host_activations: Vec<(NodeId, Activation, String)> = Vec::new();
     let mut static_once_steps: HashSet<usize> = HashSet::new();
@@ -2092,6 +2180,10 @@ pub(crate) fn compile_static_inner(
     // settle — counted at that decision and reported (see the conv arm and the
     // schedule report).
     let mut im2col_fallbacks: usize = 0;
+    // Convs whose shape qualified for the cooperative implicit-GEMM route but which
+    // the route's switch turned away (`RLX_WGPU_CONV_IMPLICIT=0`). Counted where
+    // that route is decided (see the conv arm and the schedule report).
+    let mut conv1d_implicit_declines: usize = 0;
     // Many-row attention steps kept on the fused kernel for want of a window over
     // the route's regions — the one term of that route decision the graph's shapes
     // do not settle (see the attention arm and `attention_route`).
@@ -2107,6 +2199,102 @@ pub(crate) fn compile_static_inner(
         // ── The per-binding-ceiling rule (one rule, closed by default) ────────
         // Before every other routing rule, for the reason its own doc gives; see
         // `should_host_at_ceiling` and `supported_ops::addresses_arena_by_absolute_offset`.
+        // The snake comes first: its intermediates and its folded input `Add`
+        // must emit nothing at all, and the fold was only taken where the
+        // elementwise host rules would have kept those nodes on the device
+        // (`detect_snake_beta_pattern`'s `on_device` term).
+        if snake_skip.contains(&node.id) || norm_rope_skip.contains(&node.id) {
+            continue;
+        }
+        if let Some(plan) = snake_beta.get(&node.id) {
+            // The chain's five steps as one: `x + beta·sin²(alpha·x)`, with the
+            // per-channel operands read by row and the four intermediates left
+            // unwritten. `win_ids`/`rebase`/the scratch copy-back are the
+            // `Op::Binary` arm's, since this step reads and writes the same way.
+            let out_dims = node.shape.dims();
+            // The dispatch's two grid extents, admitted by
+            // `detect_snake_beta_pattern`.
+            let outer = out_dims[1].unwrap_static() as u32;
+            let inner = out_dims[3].unwrap_static() as u32;
+            let mut win_ids = vec![node.id, plan.x, plan.alpha, plan.beta];
+            win_ids.extend(plan.bias);
+            let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+            let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+            let mut scratch = arena.scratch_off as u64;
+            let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                &dev.device,
+                &arena,
+                &graph,
+                &param_offsets,
+                &mut schedule,
+                &mut scratch,
+                &win_ids,
+            );
+            if !fits && !param_anchor {
+                base = arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+            }
+            let mut off = |id: NodeId, base: &mut u64, size: &mut u64| {
+                arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    id,
+                    base,
+                    size,
+                )
+            };
+            let x_off = off(plan.x, &mut base, &mut size);
+            let alpha_off = off(plan.alpha, &mut base, &mut size);
+            let beta_off = off(plan.beta, &mut base, &mut size);
+            let bias_off = match plan.bias {
+                Some(b) => off(b, &mut base, &mut size),
+                None => 0,
+            };
+            let out_off = off(node.id, &mut base, &mut size);
+            // Staging an operand can widen `base` after an offset was recorded
+            // against a narrower window, so every operand that now sits inside
+            // it is rebased — the correction the `Op::Binary` arm makes.
+            let rebase = |id: NodeId, had: u32| -> u32 {
+                if arena_tensor_in_window(&arena, id, base, size) {
+                    arena_local_off_f32(&arena, id, base)
+                } else {
+                    had
+                }
+            };
+            let x_off = rebase(plan.x, x_off);
+            let alpha_off = rebase(plan.alpha, alpha_off);
+            let beta_off = rebase(plan.beta, beta_off);
+            let bias_off = plan.bias.map_or(0, |b| rebase(b, bias_off));
+            let out_off = rebase(node.id, out_off);
+            let p = SnakeBetaParams {
+                outer,
+                inner,
+                x_off,
+                alpha_off,
+                beta_off,
+                bias_off,
+                out_off,
+                has_bias: u32::from(plan.bias.is_some()),
+            };
+            schedule.push(Step::SnakeBeta { params: p });
+            // If the output was staged into scratch, copy it back.
+            schedule.extend(write_backs(&arena, base, size, &[(node.id, out_off)]));
+            let u = emit_uniform(std::mem::size_of::<SnakeBetaParams>());
+            let bg = bind_arena_window(
+                &dev.device,
+                snake_beta_kernel(&dev.device),
+                &arena,
+                base,
+                size,
+                &u,
+            );
+            uniforms.push(u);
+            bind_groups.push(bg);
+            continue;
+        }
         if should_host_at_ceiling(&dev.device, &arena, &graph, node) {
             ceiling_hosted += 1;
             schedule.push(host_op_step(&graph, node, &arena));
@@ -3141,6 +3329,7 @@ pub(crate) fn compile_static_inner(
                     );
                 }
                 let slice_shape = rlx_ir::batch_region_slice_shape(&node.shape);
+                assert_region_modulus_expressible(&graph, node);
                 let slice_elems = rlx_ir::batch_region_slice_elems(&node.shape, n)
                     .expect("batch region static shape");
                 let mut win_ids: Vec<NodeId> = vec![node.id];
@@ -3275,6 +3464,7 @@ pub(crate) fn compile_static_inner(
                         chain.len()
                     );
                 }
+                assert_region_modulus_expressible(&graph, node);
                 let mut win_ids: Vec<NodeId> = vec![node.id];
                 win_ids.extend(node.inputs.iter().copied());
                 let max_binding = dev.device.limits().max_storage_buffer_binding_size;
@@ -3844,6 +4034,18 @@ pub(crate) fn compile_static_inner(
                     } else {
                         beta_off
                     };
+                    let ln_out_off = arena_local_off_f32(&arena, node.id, base);
+                    let frl_tee_vec4 = crate::backend::norm_vec4_ok(
+                        inner,
+                        &[
+                            in_off,
+                            residual_off,
+                            gamma_off,
+                            beta_off,
+                            sum_off,
+                            ln_out_off,
+                        ],
+                    );
                     let p = FusedResidualLnTeeParams {
                         outer,
                         inner,
@@ -3853,16 +4055,21 @@ pub(crate) fn compile_static_inner(
                         gamma_off,
                         beta_off,
                         sum_off,
-                        ln_out_off: arena_local_off_f32(&arena, node.id, base),
+                        ln_out_off,
                         eps_bits: eps.to_bits(),
                         has_bias: 0,
                         // The detector accepts both norms; the kernel picks the
                         // scaling. RmsNorm is the Llama-class case and was the
                         // whole point of widening this path.
                         is_rms: u32::from(!is_layer_norm),
+                        vec4: u32::from(frl_tee_vec4),
                     };
                     schedule.push(Step::FusedResidualLnTee { params: p });
-                    let frtk = fused_residual_ln_tee_kernel(&dev.device);
+                    let frtk = if frl_tee_vec4 {
+                        fused_residual_ln_tee_vec4_kernel(&dev.device)
+                    } else {
+                        fused_residual_ln_tee_kernel(&dev.device)
+                    };
                     let u = emit_uniform(std::mem::size_of::<FusedResidualLnTeeParams>());
                     let bg = bind_arena_window(&dev.device, frtk, &arena, base, size, &u);
                     uniforms.push(u);
@@ -3963,18 +4170,26 @@ pub(crate) fn compile_static_inner(
                 } else {
                     beta_off
                 };
+                let out_off = arena_local_off_f32(&arena, node.id, base);
+                let vec4 =
+                    crate::backend::norm_vec4_ok(inner, &[in_off, out_off, gamma_off, beta_off]);
                 let p = LayerNormParams {
                     outer,
                     inner,
                     in_off,
-                    out_off: arena_local_off_f32(&arena, node.id, base),
+                    out_off,
                     gamma_off,
                     beta_off,
                     eps_bits: eps.to_bits(),
                     op: if is_layer_norm { 0 } else { 1 },
+                    vec4: u32::from(vec4),
                 };
                 schedule.push(Step::LayerNorm { params: p });
-                let lk = layernorm_kernel(&dev.device);
+                let lk = if vec4 {
+                    layernorm_vec4_kernel(&dev.device)
+                } else {
+                    layernorm_kernel(&dev.device)
+                };
                 let u = emit_uniform(std::mem::size_of::<LayerNormParams>());
                 let bg = bind_arena_window(&dev.device, lk, &arena, base, size, &u);
                 uniforms.push(u);
@@ -4450,7 +4665,56 @@ pub(crate) fn compile_static_inner(
                 if qkv_skip_narrows.contains(&node.id)
                     || packed_bshd_skip_narrows.contains(&node.id)
                     || frames_skip.contains(&node.id)
+                    || narrow_split_skip.contains(&node.id)
                 {
+                    continue;
+                }
+                // The pieces of one row as one dispatch, at the last piece: every
+                // destination slot is already live there and the source is read
+                // at its planned last reader.
+                if let Some(g) = narrow_split.get(&node.id) {
+                    // `window_offsets` answers in the `ids` order it is given: the
+                    // source, then the pieces.
+                    let mut win_ids = vec![g.src];
+                    win_ids.extend(g.pieces.iter().copied());
+                    let (base, size, offs) = window_offsets(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &win_ids,
+                        &win_ids,
+                    );
+                    let mut ends = Vec::with_capacity(g.pieces.len());
+                    let mut at = 0u32;
+                    for &piece in &g.pieces[..g.pieces.len() - 1] {
+                        // `len_of` is a byte count; the boundaries are elements.
+                        at += (arena.len_of(piece) / 4) as u32;
+                        ends.push(at);
+                    }
+                    let dst = &offs[1..];
+                    let p = NarrowSplitParams {
+                        src: offs[0],
+                        total: g.total,
+                        end0: ends[0],
+                        end1: ends.get(1).copied().unwrap_or(ends[0]),
+                        dst0: dst[0],
+                        dst1: dst[1],
+                        dst2: dst.get(2).copied().unwrap_or(dst[1]),
+                        count: g.pieces.len() as u32,
+                    };
+                    schedule.push(Step::NarrowSplit { params: p });
+                    // Every written slot must be inside the bind window; a
+                    // destination the resolve staged is copied back to its own.
+                    let written: Vec<(NodeId, u32)> =
+                        g.pieces.iter().copied().zip(dst.iter().copied()).collect();
+                    schedule.extend(write_backs(&arena, base, size, &written));
+                    let nsk = narrow_split_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<NarrowSplitParams>());
+                    let bg = bind_arena_window(&dev.device, nsk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
                     continue;
                 }
                 let in_id = node.inputs[0];
@@ -4543,12 +4807,28 @@ pub(crate) fn compile_static_inner(
                     rlx_ir::DType::C128 => 4,
                     _ => 1,
                 };
-                // Vector move when the copied row is whole vectors and both
-                // window ends are 16 B aligned; the 3-D grid also has to fit the
-                // adapter's per-dimension cap. Otherwise the scalar kernel.
+                // Vector move when the copy is whole vectors and both window
+                // ends are 16 B aligned; the grid also has to fit the adapter's
+                // per-dimension cap. Otherwise the scalar kernel. Two shapes
+                // qualify:
+                //   * `inner` whole vectors — many rows of `inner` elements;
+                //   * a last-axis slice (`inner == 1`) whose contiguous run is
+                //     the slice itself, when its start, its length and the input
+                //     row stride are whole vectors. Every transposed convolution
+                //     ends in this narrow, and a test that looks only at `inner`
+                //     sends it to the scalar kernel.
                 let inner_lanes = inner * lanes;
-                let vec4 = vec4_move_ok(inner_lanes, in_off, out_off)
-                    && vec4_axes_fit(inner_lanes, *len as u32, outer, max_wg);
+                let vec4 = if inner_lanes == 1 {
+                    (*len as u32).is_multiple_of(4)
+                        && (*start as u32).is_multiple_of(4)
+                        && axis_in.is_multiple_of(4)
+                        && in_off.is_multiple_of(4)
+                        && out_off.is_multiple_of(4)
+                        && vec4_axes_fit(*len as u32, 1, outer, max_wg)
+                } else {
+                    vec4_move_ok(inner_lanes, in_off, out_off)
+                        && vec4_axes_fit(inner_lanes, *len as u32, outer, max_wg)
+                };
                 let p = NarrowConcatParams {
                     total: elems * lanes,
                     outer,
@@ -4583,30 +4863,22 @@ pub(crate) fn compile_static_inner(
             // single `BufferCopy` sufficient instead of a strided kernel.
             Op::KvAppend { axis, pos } => {
                 let cache = graph.node(node.inputs[0]);
-                let inner_elems: usize = (*axis + 1..cache.shape.rank())
-                    .map(|i| cache.shape.dim(i).unwrap_static())
-                    .product::<usize>()
-                    .max(1);
-                // The arena is f32-UNIFORM: every real/int/bool tensor occupies
-                // one f32 lane per element whatever its dtype says, and only
-                // complex genuinely spans several (C64 = 2 lanes, C128 = 4).
-                // `dtype().size_bytes()` is therefore the wrong stride here —
-                // it strides an F16 cache by 2 bytes through a buffer laid out
-                // 4 bytes per element, so the write covers half the row and
-                // leaves the rest of the token stale. `Step::BufferCopy` also
-                // moves whole f32 words on every one of its paths, so a lane
-                // count is the only unit that works end to end.
-                let elem_bytes = if cache.shape.dtype().is_complex() {
-                    cache.shape.dtype().size_bytes()
-                } else {
-                    4
-                };
-                let inner_bytes = inner_elems * elem_bytes;
-                schedule.push(Step::BufferCopy {
-                    src_byte_off: arena.offset(node.inputs[1]) as u64,
-                    dst_byte_off: (arena.offset(node.id) + pos * inner_bytes) as u64,
-                    bytes: inner_bytes as u32,
-                });
+                // One row of the operand's own shape, in the arena's f32-uniform
+                // lane unit, at the destination `finish_plan`'s placement reads too.
+                let inner_bytes = kv_row_bytes(&cache.shape, *axis);
+                let dst = kv_row_dst(arena.offset(node.id), *pos, inner_bytes);
+                // `finish_plan`'s placement moves the row's producer onto this
+                // destination when nothing else reads it (the body frame's plane
+                // cache). Writing the row where the consumer reads it leaves no
+                // copy to schedule — and a copy is a dispatch plus a read-write
+                // pass over the arena, not a cheaper kind of dispatch.
+                if arena.offset(node.inputs[1]) != dst {
+                    schedule.push(Step::BufferCopy {
+                        src_byte_off: arena.offset(node.inputs[1]) as u64,
+                        dst_byte_off: dst as u64,
+                        bytes: inner_bytes as u32,
+                    });
+                }
             }
             Op::Concat { axis } => {
                 // Mel front-end framing: every input is a frame narrow (or a view
@@ -4687,6 +4959,66 @@ pub(crate) fn compile_static_inner(
                         && !arena_span_crosses_shard(&arena, &pair)
                 };
                 let out_byte = arena.offset(node.id) as u64;
+                // The whole concat in one dispatch, when every input and the
+                // output share one bind window: the per-input form costs one
+                // dispatch each, which for the loop's 15-input level concat is
+                // fourteen dispatches it does not need. A single row
+                // (`outer == 1`), a real dtype, and no staging — a staged piece
+                // would cost more than the dispatches it replaces, and the span
+                // test below is `window_offsets`' own fits test, so the window
+                // covers every destination and no copy-back arises.
+                let all_ids: Vec<NodeId> = std::iter::once(node.id)
+                    .chain(node.inputs.iter().copied())
+                    .collect();
+                let one_row = node.inputs.len() >= 2
+                    && node.inputs.len() <= crate::kernels::CONCAT_MANY_MAX
+                    && lanes == 1
+                    && outer == 1
+                    && !arena.is_sharded()
+                    && !crate::buffer::is_weight_off(arena.offset(node.id))
+                    && node.inputs.iter().all(|&id| pair_ok(id))
+                    && arena_span_bytes(&arena, &all_ids) <= max_binding;
+                if one_row {
+                    let axis_in: Vec<u32> = node
+                        .inputs
+                        .iter()
+                        .map(|&id| graph.node(id).shape.dims()[*axis].unwrap_static() as u32)
+                        .collect();
+                    let (base, size, offs) = window_offsets(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &all_ids,
+                        &all_ids,
+                    );
+                    let mut ins = [[0u32; 4]; crate::kernels::CONCAT_MANY_MAX];
+                    let mut start = 0u32;
+                    for (i, &axis_n) in axis_in.iter().enumerate() {
+                        ins[i] = [offs[1 + i], axis_n, start, 0];
+                        start += axis_n;
+                    }
+                    let p = ConcatManyParams {
+                        inner,
+                        out_off: offs[0],
+                        count: axis_in.len() as u32,
+                        _pad: 0,
+                        ins,
+                    };
+                    schedule.push(Step::ConcatMany { params: p });
+                    let cmk = concat_many_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<ConcatManyParams>());
+                    let bg = bind_arena_window(&dev.device, cmk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                    if once && slot_is_exclusive(&arena, node.id) {
+                        for i in sched_before..schedule.len() {
+                            static_once_steps.insert(i);
+                        }
+                    }
+                    continue;
+                }
                 let mut scratch = if arena.is_sharded() {
                     arena.shard_stage_off(out_byte as usize) as u64
                 } else {
@@ -5396,6 +5728,11 @@ pub(crate) fn compile_static_inner(
                     Some((tmp_byte, _)) => ((tmp_byte.saturating_sub(base)) / 4) as u32,
                     None => out_off,
                 };
+                // Key-range split: the decode form over a long key range with a
+                // grid too small to fill the machine runs `splits` workgroups a
+                // head over disjoint keys, then one merge dispatch. The depth is
+                // the run's own decision (`attention_decode_key_splits` at the
+                // uniform write), so the compiled value is never dispatched on.
                 let p = AttentionParams {
                     batch,
                     heads,
@@ -5428,7 +5765,7 @@ pub(crate) fn compile_static_inner(
                     q_batch_stride: q_b,
                     q_head_stride: q_h,
                     q_seq_stride: q_s,
-                    _pad_q: 0,
+                    splits: 1,
                     k_batch_stride: k_b,
                     k_head_stride: k_h,
                     k_seq_stride: k_s,
@@ -5455,7 +5792,19 @@ pub(crate) fn compile_static_inner(
                 }
                 let ak = attention_kernel(&dev.device);
                 let u = emit_uniform(std::mem::size_of::<AttentionParams>());
-                let bg = bind_arena_window(&dev.device, ak, &arena, base, size, &u);
+                // The depth follows the extent the run walks, so the partials are
+                // sized for the deepest split this step's grid can take.
+                let split_rows = batch.saturating_mul(heads);
+                let parts_bytes = attention_route::attention_parts_bytes_for_grid(split_rows, hd_v);
+                let parts = dev.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("rlx-wgpu attention decode partials"),
+                    // Only the split form writes partials; the single-workgroup
+                    // form still binds this entry, at the layout's minimum.
+                    size: parts_bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+                let bg = bind_arena_window_parts(&dev.device, ak, &arena, base, size, &u, &parts);
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
@@ -5632,6 +5981,97 @@ pub(crate) fn compile_static_inner(
                 n_rot,
                 style,
             } => {
+                // RmsNorm + RoPE folded into one dispatch: the chain every
+                // transformer block walks (narrow → per-head norm → rotate),
+                // read from the norm's operand and written to the rope's slot.
+                // `detect_norm_rope_pattern` owns the admission, including the
+                // window rule that makes reading an operand past its planned
+                // last reader sound.
+                if let Some(g) = norm_rope.get(&node.id) {
+                    let split = g.split.as_ref();
+                    let mut win_ids: Vec<NodeId> = Vec::with_capacity(g.members.len() * 3 + 3);
+                    for m in &g.members {
+                        win_ids.extend([m.rope, m.gamma, m.beta]);
+                    }
+                    // An absorbed split's rows are read at the split's source,
+                    // so its piece slots are not operands of this step.
+                    match split {
+                        Some(s) => {
+                            win_ids.push(s.src);
+                            win_ids.extend(s.copy.map(|(p, _, _)| p));
+                        }
+                        None => win_ids.extend(g.members.iter().map(|m| m.input)),
+                    }
+                    win_ids.extend([g.cos, g.sin]);
+                    let (base, size, offs) = window_offsets(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &win_ids,
+                        &win_ids,
+                    );
+                    let off_of = |id: NodeId| -> u32 {
+                        let i = win_ids
+                            .iter()
+                            .position(|w| *w == id)
+                            .expect("norm_rope operand resolved");
+                        offs[i]
+                    };
+                    let a = &g.members[0];
+                    let b = g.members.get(1);
+                    // Absorbed split: the members read the source row at their
+                    // pieces' starts, and the piece the pair does not read is
+                    // copied in the same dispatch.
+                    let src_off = split.map_or(0, |s| off_of(s.src));
+                    let in_a = split.map_or_else(|| off_of(a.input), |s| src_off + s.starts[0]);
+                    let in_b = match (b, split) {
+                        (Some(_), Some(s)) => src_off + s.starts[1],
+                        (Some(m), None) => off_of(m.input),
+                        (None, _) => 0,
+                    };
+                    let (copy_in, copy_out, copy_len) = match split.and_then(|s| s.copy) {
+                        Some((piece, start, len)) => (src_off + start, off_of(piece), len),
+                        None => (0, 0, 0),
+                    };
+                    let p = NormRopeParams {
+                        seq: g.seq,
+                        heads_a: a.heads,
+                        heads_b: b.map_or(0, |m| m.heads),
+                        inner: g.inner,
+                        cos_row_stride: g.cos_row_stride,
+                        eps_bits: g.eps_bits,
+                        copy_in,
+                        copy_out,
+                        copy_len,
+                        in_a,
+                        out_a: off_of(a.rope),
+                        gamma_a: off_of(a.gamma),
+                        beta_a: off_of(a.beta),
+                        in_b,
+                        out_b: b.map_or(0, |m| off_of(m.rope)),
+                        gamma_b: b.map_or(0, |m| off_of(m.gamma)),
+                        beta_b: b.map_or(0, |m| off_of(m.beta)),
+                        cos_off: off_of(g.cos),
+                        sin_off: off_of(g.sin),
+                    };
+                    schedule.push(Step::NormRope { params: p });
+                    // Every written slot must be inside the bind window; a
+                    // destination the resolve staged is copied back to its own.
+                    let mut written: Vec<(NodeId, u32)> =
+                        g.members.iter().map(|m| (m.rope, off_of(m.rope))).collect();
+                    if let Some((piece, _, _)) = split.and_then(|s| s.copy) {
+                        written.push((piece, off_of(piece)));
+                    }
+                    schedule.extend(write_backs(&arena, base, size, &written));
+                    let nrk = norm_rope_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<NormRopeParams>());
+                    let bg = bind_arena_window(&dev.device, nrk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                    continue;
+                }
                 let x_id = node.inputs[0];
                 let cos_id = node.inputs[1];
                 let sin_id = node.inputs[2];
@@ -6969,11 +7409,14 @@ pub(crate) fn compile_static_inner(
                                 out_byte_off: arena.offset(node.id) as u64,
                             });
                         } else {
-                            // Three accelerated conv paths, all under the one
+                            // Four accelerated conv paths, all under the one
                             // switch (`RLX_WGPU_CONV_IM2COL`, on by default):
                             //   • im2col + GEMM: a GEMM-friendly shape (the floors
                             //     below) materialized into the reserved scratch;
                             //     needs the whole arena bound.
+                            //   • cooperative implicit GEMM: the same multiply with
+                            //     B gathered through the taps instead of a panel,
+                            //     on its own shape gate (and its own switch).
                             //   • 1×1 pointwise GEMM: a `Step::Matmul` straight off
                             //     the activation, no gather needed.
                             //   • conv1d_tiled (the `one_d` shape's default,
@@ -6995,6 +7438,44 @@ pub(crate) fn compile_static_inner(
                             let col_bytes = k_total.saturating_mul(spatial).saturating_mul(4);
                             let max_binding = dev.device.limits().max_storage_buffer_binding_size;
                             let whole = arena_whole_arena_bind(&arena, max_binding);
+                            // The cooperative implicit-GEMM conv: the direct entry's
+                            // 32×32 f32 cooperative tile with B gathered through the
+                            // conv's taps into workgroup memory, so the im2col panel
+                            // is never materialised (`conv1d_implicit.wgsl`). The
+                            // shape class is `ConvImplicitShape::admits` — the panel
+                            // reservation subtracts the same one — and what is left
+                            // here is what that class does not settle: the route's two
+                            // switches, the weight's placement, a whole-arena binding,
+                            // the adapter's cooperative matrices. The class is the class
+                            // of conv the 6-8 block's dilated 1-D stages are (`96 → 96`,
+                            // `kw = 7`, `d ∈ {1, 3, 9}`) and every shape of that kind:
+                            // one workgroup gathers a column block's k-steps once and
+                            // multiplies every row tile the class admits against them.
+                            let implicit_shape = ConvImplicitShape {
+                                c_in: p2.c_in as u64,
+                                c_out: p2.c_out as u64,
+                                kh: p2.kh as u64,
+                                kw: p2.kw as u64,
+                                h: p2.h as u64,
+                                h_out: p2.h_out as u64,
+                                sw: p2.sw as u64,
+                                ph: p2.ph as u64,
+                                groups: p2.groups as u64,
+                                n: p2.n as u64,
+                                spatial,
+                            };
+                            let implicit_class = implicit_shape.admits();
+                            let use_implicit = accel
+                                && implicit_class
+                                && conv_implicit_enabled()
+                                && !parked
+                                && whole.is_some()
+                                && conv1d_implicit_kernel(&dev.device).is_some();
+                            // Every term the class does not settle, the umbrella
+                            // switch included, leaves a count rather than a silence.
+                            if implicit_class && !use_implicit {
+                                conv1d_implicit_declines += 1;
+                            }
                             // What a conv has to be for the route, all of it decided
                             // without reading the adapter: one group and a unit batch, real
                             // spatial taps, the shape floors `conv_im2col_col_elems` mirrors,
@@ -7018,10 +7499,11 @@ pub(crate) fn compile_static_inner(
                             // the decision is made, so none of them is silent and no term added
                             // to the candidate test above can leave the count behind.
                             let use_im2col = im2col_candidate
+                                && !use_implicit
                                 && !parked
                                 && col_bytes <= arena.scratch_bytes as u64
                                 && whole.is_some();
-                            if im2col_candidate && !use_im2col {
+                            if im2col_candidate && !use_im2col && !use_implicit {
                                 im2col_fallbacks += 1;
                             }
                             // 1×1 conv: `W[c_out,c_in] @ in[c_in,h*w]`, both operands
@@ -7037,7 +7519,8 @@ pub(crate) fn compile_static_inner(
                             // three routes are mutually exclusive by shape — this one
                             // needs 1×1 taps, `mirror_eligible` a >1 tap in slot 1,
                             // `one_d` a >1 tap in slot 0 — so each predicate tests
-                            // only what it decides.
+                            // only what it decides; the one exception is stated where
+                            // it bites, `mirror`'s `!use_implicit`.
                             let pointwise = accel
                                 && !parked
                                 && p2.kh == 1
@@ -7056,10 +7539,13 @@ pub(crate) fn compile_static_inner(
                             // The relabel exists only to unlock the tiled route for a
                             // unit-height lift the im2col route does not take: it
                             // leaves `spatial` and `k_total` alone, so no other
-                            // route's criterion moves.
+                            // route's criterion moves. It must not run on a conv the
+                            // implicit route took: the relabel moves the taps from
+                            // slot 1 onto H, and that entry reads them along W.
                             let mirror = accel
                                 && !parked
                                 && !use_im2col
+                                && !use_implicit
                                 && mirror_eligible
                                 && spatial >= conv_tiled_min_spatial()
                                 && !rlx_ir::env::flag("RLX_WGPU_NO_TILED_CONV");
@@ -7126,6 +7612,40 @@ pub(crate) fn compile_static_inner(
                                     bind_arena_window(&dev.device, mm, &arena, base, size, &u_mm);
                                 uniforms.push(u_mm);
                                 bind_groups.push(bg_mm);
+                            } else if use_implicit {
+                                let (base_w, size_w) = whole.expect("whole-arena bind");
+                                // Absolute arena words, like the panel multiply
+                                // below: the entry binds the whole arena at base 0.
+                                let im_params = Conv1dImplicitParams {
+                                    c_in: p2.c_in,
+                                    c_out: p2.c_out,
+                                    k_total: k_total as u32,
+                                    w: p2.w,
+                                    out_len: spatial as u32,
+                                    kw: p2.kw,
+                                    dilation: p2.dw,
+                                    pad: p2.pw,
+                                    in_off: (arena.offset(in_id) / 4) as u32,
+                                    w_off: (arena.offset(w_id) / 4) as u32,
+                                    out_off: (arena.offset(node.id) / 4) as u32,
+                                    _p0: 0,
+                                    _p1: 0,
+                                    _p2: 0,
+                                    _p3: 0,
+                                    _p4: 0,
+                                };
+                                schedule.push(Step::Conv1dImplicit { params: im_params });
+                                let ck = conv1d_implicit_kernel(&dev.device)
+                                    .expect("conv1d_implicit admission");
+                                let u = emit_uniform(std::mem::size_of::<Conv1dImplicitParams>());
+                                // Static params — write once at compile (the
+                                // active-extent rewrite pass is a no-op here).
+                                dev.queue
+                                    .write_buffer(&u, 0, bytemuck::bytes_of(&im_params));
+                                let bg =
+                                    bind_arena_window(&dev.device, ck, &arena, base_w, size_w, &u);
+                                uniforms.push(u);
+                                bind_groups.push(bg);
                             } else if use_im2col {
                                 let (base_w, size_w) = whole.expect("whole-arena bind");
                                 // col lives at the reserved scratch tail (free of
@@ -12945,6 +13465,17 @@ pub(crate) fn compile_static_inner(
                 dev.device.limits().max_storage_buffer_binding_size
             );
         }
+        if conv1d_implicit_declines > 0 {
+            eprintln!(
+                "    conv1d_implicit: {conv1d_implicit_declines} conv(s) whose shape is the \
+                 cooperative implicit-GEMM route's class kept the im2col/tiled/direct routing, \
+                 for one of the terms the shape does not settle: RLX_WGPU_CONV_IM2COL=0, \
+                 RLX_WGPU_CONV_IMPLICIT=0, an adapter without Metal's cooperative matrices, a \
+                 weight parked in the weight buffer, or an arena that does not bind in one \
+                 storage binding (max_storage_buffer_binding_size = {} B).",
+                dev.device.limits().max_storage_buffer_binding_size
+            );
+        }
         if attention_window_declines > 0 {
             eprintln!(
                 "    attention: {attention_window_declines} many-row step(s) cleared the \
@@ -12988,6 +13519,7 @@ pub(crate) fn compile_static_inner(
         last_binding: None,
         pending_params: HashMap::new(),
         pending_param_bytes: HashMap::new(),
+        pending_params_dirty: false,
         active_extent: None,
         uniforms_active_extent: None,
         coop_f16_vk,
@@ -13008,9 +13540,11 @@ pub(crate) fn compile_static_inner(
         pending_read_indices: None,
         rng,
         static_once_steps,
+        gemv_setup: crate::gguf_gpu::GemvSetupCache::default(),
         static_once_done: false,
         ceiling_hosted,
         im2col_fallbacks,
+        conv1d_implicit_declines,
         attention_window_declines,
     }
 }

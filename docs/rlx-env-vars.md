@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 652  
+**Registered names:** 659  
 **Unregistered mentions (migration leftovers):** 101
 
 ## Groups
@@ -38,7 +38,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [rocm](#rocm) — 31
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
-- [wgpu](#wgpu) — 84
+- [wgpu](#wgpu) — 91
 - [xdna](#xdna) — 11
 
 ## compile
@@ -710,6 +710,8 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_CONV3D_SCALAR` | Bisect | Bool | Backend(wgpu) | Force the one-element-per-thread Conv3D kernel instead of the 4-channel tiled one |
 | `RLX_WGPU_CONV_HOST` | Internal | Bool | Backend(wgpu) | Run convolution on the host instead of a wgpu kernel |
 | `RLX_WGPU_CONV_IM2COL` | Bisect | BoolOr | Backend(wgpu) | Accelerated conv routes on wgpu — im2col+GEMM, the mirrored 1-D tiled lift, the 1×1 pointwise GEMM (default on; `=0` restores the plain routing) |
+| `RLX_WGPU_CONV_IMPLICIT` | Bisect | Bool | Backend(wgpu) | The cooperative implicit-GEMM convolution — the direct entry's 32×32 f32 tile with B gathered through the conv's taps instead of an im2col panel (default on; `=0` restores the im2col/tiled/direct routing) |
+| `RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL` | Bisect | U64 | Backend(wgpu) | Shortest output extent the cooperative implicit-GEMM conv is admitted at (default 4800, the measured crossover against im2col+GEMM) |
 | `RLX_WGPU_COOP_F16_VK_DISABLE` | Bisect | Bool | Backend(wgpu) | Disable f16 cooperative-matrix matmul on Vulkan |
 | `RLX_WGPU_COOP_F16_VK_ENABLE` | Bisect | Bool | Backend(wgpu) | Re-enable f16 cooperative-matrix matmul on Vulkan (at your risk) |
 | `RLX_WGPU_COOP_F16_VK_FORCE_WIDE` | Bisect | Bool | Backend(wgpu) | Force the wide cooperative-matrix tile |
@@ -743,6 +745,10 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_FORCE_INPUT_UPLOAD` | Bisect | Bool | Backend(wgpu) | Re-upload graph inputs every run instead of reusing device copies |
 | `RLX_WGPU_GATHER_SPLIT` | Internal | Bool | Backend(wgpu) | Split Gather into per-slice dispatches |
 | `RLX_WGPU_GDN_HOST` | Public | Bool | Backend(wgpu) | Force GatedDeltaNet host fallback on wgpu (skip WGSL) |
+| `RLX_WGPU_GEMV_ILP` | Bisect | Bool | Backend(wgpu) | One-row packed GEMV: the subgroup arm's ILP entry (WIDE_ILP columns a subgroup, an independent accumulator each) instead of one column a subgroup; 0 re-takes that form's saving |
+| `RLX_WGPU_GEMV_IN_PLACE` | Bisect | Bool | Backend(wgpu) | One-row packed GEMV output: store the row straight into the arena slot instead of a pooled slab plus a copy dispatch (0 restores the slab, which is how the saving is re-taken) |
+| `RLX_WGPU_GEMV_POOL` | Bisect | Bool | Backend(wgpu) | Reuse a one-row packed multiply's uniform buffer and bind group across frames instead of creating, writing and grouping them every dispatch; 0 rebuilds them each time |
+| `RLX_WGPU_GEMV_WIDE` | Bisect | Enum | Backend(wgpu) | One-row packed GEMV reduction: 1/true/yes/on = subgroup arm (dequant_gemv_wide), 0/false/off/no/shared = workgroup-memory dequant_gemv_tiled; unset keeps the measured default (1) |
 | `RLX_WGPU_GPU_NORM` | Internal | Bool | Backend(wgpu) | Force norms onto the GPU (opposite of RLX_WGPU_HOST_NORM) |
 | `RLX_WGPU_HAZARD_REPORT` | Internal | Bool | Backend(wgpu) | Report arena slot read/write hazards after planning |
 | `RLX_WGPU_HOST_BUFFER_COPY` | Bisect | Bool | Backend(wgpu) | Route buffer-to-buffer copies through the host |
@@ -765,6 +771,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_NO_FOLD_MMBA` | Internal | Bool | Backend(wgpu) | Disable folding matmul+bias+activation into one node |
 | `RLX_WGPU_NO_FOLD_RESLN` | Internal | Bool | Backend(wgpu) | Disable folding residual add into LayerNorm |
 | `RLX_WGPU_NO_PACKED_BSHD_ATTN` | Bisect | Bool | Backend(wgpu) | Disable the packed BSHD attention kernel on wgpu |
+| `RLX_WGPU_NO_SNAKE_BETA` | Bisect | Bool | Backend(wgpu) | Disable the fused SnakeBeta (x + beta*sin^2(alpha*x)) step |
 | `RLX_WGPU_NO_TILED_CONV` | Bisect | Bool | Backend(wgpu) | Disable the tiled convolution kernel |
 | `RLX_WGPU_ONE_OP_PER_PASS` | Internal | Bool | Backend(wgpu) | Submit one op per compute pass (isolates sync bugs) |
 | `RLX_WGPU_PRINT_LIMITS` | Bisect | U64 | Backend(wgpu) | Print the adapter's reported limits at startup |

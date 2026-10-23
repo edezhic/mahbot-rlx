@@ -7,7 +7,8 @@
 //! recognition decode shape — one query row, 2 438 cached keys (a coverage case:
 //! the live cell's cache grows in 128-row buckets from its prompt), 16 heads over
 //! 8 KV heads at width 128, the width `DECODE_MAX_DIM` bounds and for which the
-//! shader sizes its per-thread Q and O arrays. A move in its last bits is the
+//! shader sizes the workgroup's Q row and its per-thread O array. A move in its
+//! last bits is the
 //! change the digest exists to catch; it is over the little-endian f32 bytes,
 //! the same witness form `mahbot-inference`'s report uses, and is pinned from
 //! the adapter it was taken on — `Apple M3 Pro` (Metal), by that exact name — so
@@ -26,7 +27,7 @@ use rlx_runtime::{Device, Session};
 use rlx_wgpu::kernels::{AttentionRoutes, attention_route_counts, reset_attention_route_counts};
 
 /// The recognition decode cell: `seq_q = 1`, `seq_k = 2438`, 16 heads over 8
-/// KV heads at width 128. `2438` is far past `ATTENTION_DECODE_MIN_KEYS`, so
+/// KV heads at width 128. A single query row is the lane-parallel form's, so
 /// the route is taken and the key walk spans 39 blocks of 64.
 const SEQ_K: usize = 2438;
 const HEADS: usize = 16;
@@ -35,7 +36,7 @@ const HEAD_DIM: usize = 128;
 
 /// FNV-1a 64 of the decode output on `PINNED_ADAPTER`. Any change to it is a
 /// changed rounding, not a tolerance question.
-const PINNED_DIGEST: u64 = 0x2bf8_3737_5852_dbde;
+const PINNED_DIGEST: u64 = 0x4a8b_4aa1_ea1f_dcb7;
 /// The adapter the digest was taken on, by its exact name: another adapter — an
 /// M2, a later Metal version — may round `exp` differently, so the pin asserts
 /// only where it was recorded.

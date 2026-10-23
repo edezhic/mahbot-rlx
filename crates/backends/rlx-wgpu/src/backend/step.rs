@@ -8,20 +8,21 @@ use crate::kernels::{
     ActivationBackwardParams, AdaLayerNormBackwardParams, AdaLayerNormParams, ArgmaxParams,
     AttentionBwdParams, AttentionMaskParams, AttentionParams, AxialRope2dParams,
     BatchElementwiseRegionParams, BatchNormInferenceParams, BinaryC64Params, BinaryParams,
-    CastParams, ComplexCastParams, ComplexWirtingerParams, Conv1dParams, Conv2dParams,
-    Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams, CopyParams, CumScanParams,
-    CumsumBwdParams, CumsumParams, DequantMatmulMlxParams, DequantMatmulParams,
-    ElementwiseRegionParams, ExpandParams, FakeQuantizeParams, FftButterflyStageParams, FmaParams,
-    FramesParams, FusedConvBiasActParams, FusedResidualLnParams, FusedResidualLnTeeParams,
-    FusedResidualRmsNormParams, FusedSwiGLUParams, GatedDeltaNetParams,
-    GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams, GatherBwdParams,
-    GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams, GruParams,
-    Im2Col2dParams, IndexingNdParams, LayerNorm2dParams, LayerNormBwdParams, LayerNormParams,
-    LstmParams, Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams, MaxPool3dBwdParams,
-    NarrowConcatParams, Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams,
-    QuantI8Params, ReduceParams, ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
-    RopeParams, SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams,
-    SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams, TransposeParams,
+    CastParams, ComplexCastParams, ComplexWirtingerParams, ConcatManyParams, Conv1dImplicitParams,
+    Conv1dParams, Conv2dParams, Conv3dBwdInputParams, Conv3dBwdWeightParams, Conv3dParams,
+    CopyParams, CumScanParams, CumsumBwdParams, CumsumParams, DequantMatmulMlxParams,
+    DequantMatmulParams, ElementwiseRegionParams, ExpandParams, FakeQuantizeParams,
+    FftButterflyStageParams, FmaParams, FramesParams, FusedConvBiasActParams,
+    FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams,
+    GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
+    GatherBwdParams, GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams,
+    GruParams, Im2Col2dParams, IndexingNdParams, LayerNorm2dParams, LayerNormBwdParams,
+    LayerNormParams, LstmParams, Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams,
+    MaxPool3dBwdParams, NarrowConcatParams, NarrowSplitParams, NormRopeParams, Pool1dParams,
+    Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QuantI8Params, ReduceParams,
+    ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, SampleParams,
+    ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams, SceParams,
+    SelectiveScanParams, SnakeBetaParams, SoftmaxParams, TopKParams, TransposeParams,
     UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
 };
 
@@ -141,6 +142,15 @@ pub(crate) enum Step {
     },
     Binary {
         params: BinaryParams,
+    },
+    /// The whole DAC snake `y = x + beta·sin²(alpha·x)` in one dispatch, in
+    /// place of the five `binary`/`activation` steps it is written as (see
+    /// `snake_beta.wgsl` and `detect_snake_beta_pattern`). A device element-wise
+    /// step in `Step::Binary`'s sense: it reads its operands' arena slots at the
+    /// addresses its params name and writes its own, and it honours the run's
+    /// active extent by scaling its row count.
+    SnakeBeta {
+        params: SnakeBetaParams,
     },
     Compare {
         params: BinaryParams,
@@ -532,9 +542,19 @@ pub(crate) enum Step {
     Narrow {
         params: NarrowConcatParams,
     },
+    /// One row cut into 2–3 contiguous last-axis pieces, one dispatch where the
+    /// decompose emits one `narrow` per piece (`narrow_split.wgsl`).
+    NarrowSplit {
+        params: NarrowSplitParams,
+    },
     Concat {
         params: NarrowConcatParams,
     }, // one Step per input
+    /// Every input of one `Op::Concat` copied in one dispatch, where the form
+    /// above costs one per input (`concat_many.wgsl`).
+    ConcatMany {
+        params: ConcatManyParams,
+    },
     /// Host Concat when inputs/output cannot share one ≤4 GiB bind window
     /// (sharded arenas / F5-scale DiT). Reads each operand separately so the
     /// span need not be contiguous.
@@ -579,6 +599,11 @@ pub(crate) enum Step {
     },
     Rope {
         params: RopeParams,
+    },
+    /// RmsNorm over head rows, then the NeoX rotation of each row's halves —
+    /// one dispatch where the decompose emits two (`kernels/norm_rope.wgsl`).
+    NormRope {
+        params: NormRopeParams,
     },
     Expand {
         params: ExpandParams,
@@ -630,6 +655,15 @@ pub(crate) enum Step {
     },
     Conv1d {
         params: Conv1dParams,
+    },
+    /// The convolution GEMM routes' implicit form (`conv1d_implicit.wgsl`): the
+    /// direct cooperative entry's 32×32 tile with B gathered through the conv's
+    /// taps into workgroup memory, so no im2col panel is materialised. One
+    /// workgroup covers every output row tile the class admits, so the gather
+    /// serves all of them. Admitted only for the shape class the route wins in —
+    /// see the `Op::Conv` arm in `compile/lower.rs`.
+    Conv1dImplicit {
+        params: Conv1dImplicitParams,
     },
     Conv3d {
         params: Conv3dParams,
@@ -1275,6 +1309,25 @@ pub(crate) enum Step {
     },
 }
 
+impl ConcatManyParams {
+    /// The dispatch's workgroup count: one per 64-element run of any piece.
+    ///
+    /// The step copies the **planned** run whatever extent the walk is at, and that
+    /// is not an omission: the axis a walk trims is the leading one, which is not
+    /// necessarily this concat's — a framing over a row source stacks
+    /// `[1, B, frame_len]` pieces, so the walked axis is `B`, inside `inner`, and
+    /// the `narrow`s that built the pieces have already trimmed it. Shortening the
+    /// concat axis there drops frames they wrote (`frames_concat_fusion`'s
+    /// row-source case is the pin). Rows past the walk that this step still writes
+    /// are rows nothing reads at that extent.
+    pub fn workgroups(&self) -> u32 {
+        self.ins[..self.count as usize]
+            .iter()
+            .map(|e| (e[1] * self.inner).div_ceil(super::MOVE_WORKGROUP))
+            .sum()
+    }
+}
+
 impl Step {
     /// True when this Step variant honors active-extent dispatch (PLAN L1).
     /// Coverage: simple element-wise + reductions + matmul + linalg
@@ -1284,6 +1337,7 @@ impl Step {
     pub fn safe_for_active_extent(&self) -> bool {
         match self {
             Step::Binary { .. }
+            | Step::SnakeBeta { .. }
             | Step::Compare { .. }
             | Step::Unary { .. }
             | Step::Where { .. }
@@ -1421,7 +1475,11 @@ impl Step {
             // time for a fixed conv shape; they cannot be active-extent
             // scaled. Returning false disables the fast path for any graph
             // that contains an im2col conv (conv-heavy models don't use it).
-            Step::Im2ColGpu { .. } => false,
+            // im2col params (offsets + spatial extents) are baked at compile
+            // time for a fixed conv shape, and the implicit route's extents
+            // (`out_len`, `c_out`) are its gather's own: neither has a folded
+            // extent to scale, so both veto the mode for the whole graph.
+            Step::Im2ColGpu { .. } | Step::Conv1dImplicit { .. } => false,
             // Unlike im2col, this one scales, and the trim lands on the frames a
             // caller bucketing the frame axis reads: `total` counts whole frames
             // (`outer · n_frames · frame_len`, row-major in frame order, and the
@@ -1480,13 +1538,24 @@ impl Step {
             // Cases where the bucket axis is the narrow/concat axis
             // itself are unsafe — fall back to full extent there.
             Step::Narrow { .. } => true,
+            // The split copy's only extent is a row width, not a row count: it
+            // never scales, so it must not veto the whole-graph gate (same call
+            // as `LayerNorm2d`).
+            Step::NarrowSplit { .. } => true,
             Step::Concat { .. } => true,
+            // ConcatMany copies the planned run, which is correct at any extent
+            // (see `ConcatManyParams::workgroups`): the axis the walk trims is not
+            // necessarily this concat's, so the step shortens nothing.
+            Step::ConcatMany { .. } => true,
             // Rope: WGSL kernel uses `seq_stride` (full extent, set
             // at compile time) for per-batch buffer offset math and
             // explicit `batch` for index decomposition. `params.seq`
             // and `params.n_total` are runtime-scaled iteration
             // bounds. Safe at any batch.
             Step::Rope { .. } => true,
+            // NormRope: `seq` is the only scaled extent; the head-row offsets
+            // are derived from it inside the kernel.
+            Step::NormRope { .. } => true,
             // Transpose: precomputed `bucket_outermost` flag in
             // params (set to 1 at compile time iff `perm[0] == 0`).
             // Active path scales `out_total` by `actual / upper`
@@ -1554,6 +1623,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         } => "conv1x1_gemm",
         Step::Matmul { .. } => "matmul",
         Step::Binary { .. } => "binary",
+        Step::SnakeBeta { .. } => "snake_beta",
         Step::Compare { .. } => "compare",
         Step::Unary { .. } => "unary",
         Step::Where { .. } => "where",
@@ -1593,7 +1663,9 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::TransposeHost { .. } => "transpose_host",
         Step::NarrowHost { .. } => "narrow_host",
         Step::Narrow { .. } => "narrow",
+        Step::NarrowSplit { .. } => "narrow_split",
         Step::Concat { .. } => "concat",
+        Step::ConcatMany { .. } => "concat_many",
         Step::ConcatHost { .. } => "concat_host",
         Step::ConcatHostPieces { .. } => "concat_host_pieces",
         Step::Gather { .. } => "gather",
@@ -1601,6 +1673,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Attention { .. } => "attention",
         Step::AttentionBackward { .. } => "attention_bwd",
         Step::Rope { .. } => "rope",
+        Step::NormRope { .. } => "norm_rope",
         Step::Expand { .. } => "expand",
         Step::Reverse { .. } => "reverse",
         Step::ExpandHost { .. } => "expand_host",
@@ -1612,6 +1685,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::Pool1d { .. } => "pool1d",
         Step::Pool3d { .. } => "pool3d",
         Step::Conv1d { .. } => "conv1d",
+        Step::Conv1dImplicit { .. } => "conv1d_implicit",
         Step::Conv3d { .. } => "conv3d",
         Step::ScatterAdd { .. } => "scatter_add",
         Step::TopK { .. } => "topk",
@@ -1852,6 +1926,7 @@ pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
         // `Frames` is a producer in that same shape: one dispatch writing the
         // whole frame matrix an elementwise front-end reads back.
         Step::Binary { .. }
+        | Step::SnakeBeta { .. }
         | Step::Unary { .. }
         | Step::Where { .. }
         | Step::Fma { .. }

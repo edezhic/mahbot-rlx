@@ -10,8 +10,13 @@
 //! takes the many-row route (`backend::attention_route`) now that its floor is two
 //! query rows, so this pins that geometry and both of its masks on the dense
 //! arrangement. The serial kernel's Custom-mask control is a single query row
-//! compiled at a longer key extent and patched down
-//! (`attention_decode_route::decode_route_follows_the_extent_patched_down`); a
+//! over a head width above the lane-parallel form's cap — a one-row step at
+//! BrainBERT's width now takes that form at every key length, so the serial
+//! branch is pinned where it is still reachable
+//! (`attention_softcap_route`'s `fused` case, `attention_v_head_dim_parity`'s
+//! `hd = 192` row) and the patched-extent property at
+//! `attention_decode_route::decode_route_follows_the_extent_patched_down`, which
+//! asserts the lane-parallel form is what a patched-down extent keeps). A
 //! many-row Custom-mask step is pinned in
 //! `attention_rows_route::route_mask_kinds_match_cpu`. The bar is asserted for
 //! every case, because the point is BrainBERT's own geometry (12 heads x 64

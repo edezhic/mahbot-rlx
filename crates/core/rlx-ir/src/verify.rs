@@ -308,6 +308,16 @@ pub fn verify_op(graph: &Graph, node: &Node) -> Vec<VerifyError> {
                 ));
             }
         }
+        // A region's operands are read through the encoded `input_modulus` divisor,
+        // so a region the encoding cannot express must not verify clean.
+        // `WgpuExecutable::compile` (the direct entry) runs neither this verifier nor
+        // `LegalizeBroadcast`, so its lowering applies the same rule; the check here
+        // is what catches a hand-built or pre-fused graph before any backend sees it.
+        Op::ElementwiseRegion { .. } | Op::BatchElementwiseRegion { .. } => {
+            for reason in crate::region_encode::region_modulus_refusals(graph, node) {
+                err(reason);
+            }
+        }
         // ── Invariants aimed at this project's actual failure history ──
         //
         // Each of these encodes a bug class that has cost real debugging time,

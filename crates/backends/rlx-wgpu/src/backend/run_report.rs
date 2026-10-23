@@ -193,6 +193,15 @@ struct PassRecord {
     /// The interval that closed over this pass, or `None` for one no interval
     /// ever closed over — a remainder shorter than one clock tick, merged away.
     interval_index: Option<u32>,
+    /// The schedule steps this pass's cursor range covered, by kind — the basis
+    /// [`Interval::kinds`] uses, so the two lines count the same way. A step the run
+    /// walked past inside the range (a baked `static_once` step, a dispatch whose
+    /// active extent is zero) is counted here and is not this pass's work. A
+    /// tail-host step is not: [`fold_range`] routes it to the `host` interval's
+    /// ledger instead, and this census drops that sink. Empty for a pass opened
+    /// outside the run's dispatch loop — an unjoined packed multiply's — where the
+    /// instrument never sees a cursor.
+    kinds: Vec<(&'static str, usize)>,
 }
 
 /// The device-time view: one query pair per recorded pass, resolved and mapped
@@ -422,6 +431,25 @@ impl RunReport {
         merge(&mut self.pending, [(step_name(step), 1)]);
     }
 
+    /// Give the pass that just closed `start..end` its step census, so a pass's
+    /// device figure and the range it covered print on one line. Called where the
+    /// run's dispatch loop leaves a pass, with both cursors in hand, which is what
+    /// makes the last record the pass this call describes: no other site opens a
+    /// pass inside that loop. A pass another site opens keeps an empty census
+    /// rather than a guessed one.
+    pub(crate) fn note_pass_steps(&mut self, start: usize, end: usize, sched: &[Step]) {
+        if !self.enabled || end <= start {
+            return;
+        }
+        let Some(pass) = self.passes.last_mut() else {
+            return;
+        };
+        let mut tail = Vec::new();
+        fold_range(start..end, sched, &mut pass.kinds, &mut tail);
+        pass.kinds
+            .sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    }
+
     /// The schedule's end, read where the run loop reaches it — with the schedule
     /// still in hand, which is what makes a return edge countable.
     ///
@@ -486,6 +514,7 @@ impl RunReport {
         self.passes.push(PassRecord {
             slot,
             interval_index: None,
+            kinds: Vec::new(),
         });
         self.passes_since_close += 1;
         let timestamp_writes = match (slot, self.timer.as_ref()) {
@@ -734,9 +763,10 @@ impl RunReport {
             }
             for (index, (pass, figure)) in self.passes.iter().zip(&figures).enumerate() {
                 lines.push(format!(
-                    "{PREFIX} device_pass index={index} interval={} ms={}",
+                    "{PREFIX} device_pass index={index} interval={} ms={} kinds={}",
                     self.pass_phase(pass).name(),
                     figure.map_or_else(|| "unavailable".to_string(), ms),
+                    kinds_line(&pass.kinds),
                 ));
             }
         }

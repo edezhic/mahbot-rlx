@@ -407,14 +407,9 @@ fn region_signature(op: &Op) -> Option<RegionSignature> {
     })
 }
 
-fn narrow_batch_slice(graph: &Graph, input_id: NodeId) -> Option<(NodeId, usize)> {
+fn narrow_batch_slice(graph: &Graph, input_id: NodeId) -> Option<(NodeId, usize, usize)> {
     let node = graph.node(input_id);
-    let Op::Narrow {
-        axis,
-        start,
-        len: _,
-    } = node.op
-    else {
+    let Op::Narrow { axis, start, len } = node.op else {
         return None;
     };
     if axis != 0 {
@@ -423,7 +418,7 @@ fn narrow_batch_slice(graph: &Graph, input_id: NodeId) -> Option<(NodeId, usize)
     if node.inputs.len() != 1 {
         return None;
     }
-    Some((node.inputs[0], start))
+    Some((node.inputs[0], start, len))
 }
 
 fn shared_concat_consumer(graph: &Graph, region_ids: &[NodeId], axis: usize) -> Option<NodeId> {
@@ -452,10 +447,10 @@ fn shared_concat_consumer(graph: &Graph, region_ids: &[NodeId], axis: usize) -> 
     if a != axis {
         return None;
     }
-    if concat.inputs.len() != region_ids.len() {
-        return None;
-    }
-    if !region_ids.iter().all(|rid| concat.inputs.contains(rid)) {
+    // The same order, not merely the same set: the merged node's output rows are
+    // the members' rows in region order, so a concat that lists them permuted
+    // would be lowered with its members swapped.
+    if concat.inputs.as_slice() != region_ids {
         return None;
     }
     Some(cid)
@@ -510,7 +505,7 @@ impl Pass for MarkBatchSliceRegions {
                     break;
                 }
                 let narrow_id = unary.inputs[0];
-                let Some((parent, _start)) = narrow_batch_slice(&graph, narrow_id) else {
+                let Some((parent, _start, _len)) = narrow_batch_slice(&graph, narrow_id) else {
                     slice_plan.clear();
                     break;
                 };
@@ -612,20 +607,40 @@ impl Pass for FuseBatchPreprocess {
             if ids.len() < 2 {
                 continue;
             }
-            let mut by_parent: HashMap<NodeId, Vec<(NodeId, usize)>> = HashMap::new();
+            let mut by_parent: HashMap<NodeId, Vec<(NodeId, usize, usize)>> = HashMap::new();
             for id in ids {
                 let node = graph.node(id);
-                let Some((parent, start)) = narrow_batch_slice(&graph, node.inputs[0]) else {
+                let Some((parent, start, len)) = narrow_batch_slice(&graph, node.inputs[0]) else {
                     continue;
                 };
-                by_parent.entry(parent).or_default().push((id, start));
+                by_parent.entry(parent).or_default().push((id, start, len));
             }
-            for (parent, mut entries) in by_parent {
+            for (parent, entries) in by_parent {
                 if entries.len() < 2 {
                     continue;
                 }
-                entries.sort_by_key(|(_, start)| *start);
-                let region_ids: Vec<NodeId> = entries.iter().map(|(id, _)| *id).collect();
+                // One slice extent for every input, which is what the lowering computes:
+                // `batch_region_slice_elems` is `total / num_batch`, one number used as
+                // both the kernel's loop bound and the stride between output slices.
+                // Slices of unequal length would be lowered with a truncated extent and
+                // mis-offset stores, so they are not merge candidates — refusing leaves
+                // the graph on its per-slice path, which handles each `<len>` itself.
+                //
+                // The lowering addresses member `i` as `slice_elems * i` and never reads
+                // the `Narrow`'s `start`, so the merged slices must be exactly the
+                // consecutive `[0, len), [len, 2 len), …` windows in the group's own
+                // order. Unordered, duplicated or gapped starts would be lowered at the
+                // wrong offset even with equal lengths, so they are refused too.
+                let slice_len = entries[0].2;
+                let uniform = entries.iter().all(|(_, _, len)| *len == slice_len);
+                let ordered = entries
+                    .iter()
+                    .enumerate()
+                    .all(|(i, (_, start, _))| *start == i * slice_len);
+                if !uniform || !ordered {
+                    continue;
+                }
+                let region_ids: Vec<NodeId> = entries.iter().map(|(id, _, _)| *id).collect();
                 let concat_id = shared_concat_consumer(&graph, &region_ids, 0);
                 if let Some(concat) = concat_id {
                     batch_groups.push((parent, region_ids, concat));
@@ -659,7 +674,7 @@ impl Pass for FuseBatchPreprocess {
                         chain,
                         num_inputs: _,
                         scalar_input_mask,
-                        input_modulus,
+                        input_modulus: _,
                         prologue,
                         prologue_input: _,
                     } = &template.op
@@ -678,7 +693,13 @@ impl Pass for FuseBatchPreprocess {
                             chain: chain.clone(),
                             num_batch_inputs: narrow_old.len() as u32,
                             scalar_input_mask: *scalar_input_mask,
-                            input_modulus: *input_modulus,
+                            // Canonical, not the template's: a batch region re-binds
+                            // the chain's slot 0 to each input for that input's own run
+                            // of the output's batch axis, so every operand has its own
+                            // slice's layout and needs no divisor. The template's value
+                            // was computed against the template's tail shape and does not
+                            // transfer.
+                            input_modulus: [0; 16],
                             prologue: *prologue,
                             prologue_input: 0,
                         },
@@ -755,7 +776,7 @@ impl Pass for DecomposeFusionRegions {
                     chain,
                     num_batch_inputs,
                     scalar_input_mask,
-                    input_modulus,
+                    input_modulus: _,
                     prologue,
                     prologue_input: _,
                 } => {
@@ -777,25 +798,23 @@ impl Pass for DecomposeFusionRegions {
                                 out_shape,
                             );
                         }
+                        let slice_shape = rw.new_graph.node(region_input).shape.clone();
                         let slice = rw.new_graph.add_node(
                             Op::ElementwiseRegion {
                                 chain: chain.clone(),
                                 num_inputs: 1,
                                 scalar_input_mask: *scalar_input_mask,
-                                input_modulus: *input_modulus,
+                                // Canonical, not the batch template's: this slice's
+                                // single operand *is* the output's layout, so it needs
+                                // no divisor. The template's value was computed against
+                                // the merged output's per-slice shape and does not
+                                // transfer to a slice of any other extent.
+                                input_modulus: [0; 16],
                                 prologue: RegionPrologue::None,
                                 prologue_input: 0,
                             },
                             vec![region_input],
-                            Shape::new(
-                                &[
-                                    1,
-                                    node.shape.dim(1).unwrap_static(),
-                                    node.shape.dim(2).unwrap_static(),
-                                    node.shape.dim(3).unwrap_static(),
-                                ],
-                                node.shape.dtype(),
-                            ),
+                            slice_shape,
                         );
                         slice_ids.push(slice);
                     }
@@ -1096,7 +1115,7 @@ mod tests {
     #[test]
     fn fuse_batch_preprocess_groups_narrow_slices() {
         let mut g = Graph::new("t");
-        let batch = g.input("batch", nchw(4, 3, 8, 8));
+        let batch = g.input("batch", nchw(2, 3, 8, 8));
         let n0 = g.add_node(
             Op::Narrow {
                 axis: 0,
@@ -1490,5 +1509,183 @@ mod tests {
         assert!(active_region_kernel_activation_subs().is_none());
         assert!(region_kernel_honours_activation(Activation::Round));
         assert!(region_kernel_honours_chain(&round_chain));
+    }
+
+    /// `Narrow` siblings as [`FuseBatchPreprocess`] sees them: primitive
+    /// `narrow → relu → concat`, one `(start, len)` slice per entry, through
+    /// [`MarkBatchSliceRegions`] and the merge. `batch` is the parent's axis-0 extent;
+    /// the lowering never consults it, so it is not part of admission.
+    fn fused_batch(name: &str, batch: usize, slices: &[(usize, usize)]) -> Graph {
+        let order: Vec<usize> = (0..slices.len()).collect();
+        fused_batch_concat_order(name, batch, slices, &order)
+    }
+
+    /// As [`fused_batch`], with the concat's operands listed in `order` rather than
+    /// in slice order.
+    fn fused_batch_concat_order(
+        name: &str,
+        batch: usize,
+        slices: &[(usize, usize)],
+        order: &[usize],
+    ) -> Graph {
+        let mut g = Graph::new(name);
+        let parent = g.input("batch", nchw(batch, 2, 2, 2));
+        let mut slices_out = Vec::with_capacity(slices.len());
+        for &(start, len) in slices {
+            let slice_shape = nchw(len, 2, 2, 2);
+            let narrow = g.add_node(
+                Op::Narrow {
+                    axis: 0,
+                    start,
+                    len,
+                },
+                vec![parent],
+                slice_shape.clone(),
+            );
+            slices_out.push(g.add_node(
+                Op::Activation(Activation::Relu),
+                vec![narrow],
+                slice_shape,
+            ));
+        }
+        let total: usize = slices.iter().map(|(_, len)| *len).sum();
+        let operands: Vec<_> = order.iter().map(|&i| slices_out[i]).collect();
+        let out = g.add_node(Op::Concat { axis: 0 }, operands, nchw(total, 2, 2, 2));
+        g.set_outputs(vec![out]);
+        let g = MarkBatchSliceRegions.run(g);
+        FuseBatchPreprocess.run(g)
+    }
+
+    fn batch_region_count(g: &Graph) -> usize {
+        g.nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::BatchElementwiseRegion { .. }))
+            .count()
+    }
+
+    /// The non-vacuity control: equal lengths cut as consecutive windows still merge
+    /// into one batch region, with the op's slice count and the concat's shape.
+    #[test]
+    fn equal_slice_lengths_in_order_merge_into_a_batch_region() {
+        let out = fused_batch("equal", 4, &[(0, 2), (2, 2)]);
+        let regions: Vec<_> = out
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::BatchElementwiseRegion { .. }))
+            .collect();
+        assert_eq!(regions.len(), 1, "2 + 2 rows cut in order must merge");
+        match &regions[0].op {
+            Op::BatchElementwiseRegion {
+                num_batch_inputs, ..
+            } => assert_eq!(*num_batch_inputs, 2),
+            other => panic!("expected a batch region, got {other:?}"),
+        }
+        assert_eq!(
+            regions[0].shape,
+            nchw(4, 2, 2, 2),
+            "the merged region takes the concat's shape"
+        );
+        assert!(
+            !out.nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Concat { axis: 0 })),
+            "the concat is absorbed by the merged region"
+        );
+    }
+
+    /// A remainder in `total / num_batch` is not what decides it — unequal lengths are
+    /// refused whether or not the division is exact, because the merged region would be
+    /// lowered with one extent for all of them.
+    #[test]
+    fn unequal_slice_lengths_are_not_merged_into_a_batch_region() {
+        // 3 rows split 1 + 2: `total / num_batch` truncates.
+        let out = fused_batch("unequal_remainder", 3, &[(0, 1), (1, 2)]);
+        assert_eq!(batch_region_count(&out), 0, "1 + 2 rows must not merge");
+        let mut lens: Vec<usize> = out
+            .nodes()
+            .iter()
+            .filter_map(|n| match n.op {
+                Op::Narrow { len, .. } => Some(len),
+                _ => None,
+            })
+            .collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![1, 2], "each slice keeps its extent");
+        assert!(
+            out.nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Concat { axis: 0 })),
+            "the per-slice concat stays"
+        );
+
+        // 4 rows split 1 + 3: the division is exact, and the 2-row stride it yields is
+        // still wrong for both slices.
+        let out = fused_batch("unequal_exact", 4, &[(0, 1), (1, 3)]);
+        assert_eq!(
+            batch_region_count(&out),
+            0,
+            "an exact `total / num_batch` must not admit 1 + 3 rows"
+        );
+    }
+
+    /// Equal lengths are not enough: the lowering addresses member `i` at
+    /// `slice_elems * i` and never reads the `Narrow`'s `start`, so slices that are not
+    /// the consecutive windows in the group's own order would be read from one place and
+    /// stored at another.
+    #[test]
+    fn equal_length_slices_with_unordered_or_gapped_starts_are_not_merged() {
+        // Starts swapped: equal lengths, but member 0 would take member 1's rows.
+        let out = fused_batch("out_of_order", 4, &[(2, 2), (0, 2)]);
+        assert_eq!(
+            batch_region_count(&out),
+            0,
+            "2 + 2 rows with swapped starts must not merge"
+        );
+        // A duplicated start: equally long and the parent is covered.
+        let out = fused_batch("duplicated_start", 4, &[(0, 2), (0, 2)]);
+        assert_eq!(
+            batch_region_count(&out),
+            0,
+            "two slices starting at row 0 must not merge"
+        );
+        // A gap: `(0, 2)` then `(4, 2)` are not the `[0, 2)`, `[2, 4)` windows.
+        let out = fused_batch("gapped", 6, &[(0, 2), (4, 2)]);
+        assert_eq!(
+            batch_region_count(&out),
+            0,
+            "a gap between equal-length slices must not merge"
+        );
+    }
+
+    /// The concat's operand order is the region order: the merged node writes its
+    /// members' rows in region order, so the same slices listed permuted would come
+    /// out with their contents swapped.
+    #[test]
+    fn a_permuted_concat_is_not_merged_into_a_batch_region() {
+        let out = fused_batch_concat_order("permuted_concat", 4, &[(0, 2), (2, 2)], &[1, 0]);
+        assert_eq!(
+            batch_region_count(&out),
+            0,
+            "a concat listing its slices permuted must not merge"
+        );
+        assert!(
+            out.nodes()
+                .iter()
+                .any(|n| matches!(n.op, Op::Concat { axis: 0 })),
+            "the per-slice concat stays"
+        );
+    }
+
+    /// The parent's axis-0 extent is not consulted: the merged region's output is the
+    /// concat's shape and its inputs are addressed through their own offsets, so slices
+    /// that leave rows of the parent unused are still the consecutive windows.
+    #[test]
+    fn a_parent_extent_wider_than_the_slices_does_not_block_the_merge() {
+        let out = fused_batch("short_coverage", 5, &[(0, 2), (2, 2)]);
+        assert_eq!(
+            batch_region_count(&out),
+            1,
+            "2 + 2 rows of a 5-row parent still merge"
+        );
     }
 }

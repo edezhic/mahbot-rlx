@@ -266,6 +266,10 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     fn wgpu_host_summary(&self) -> Option<String> {
         self.inner.host_summary()
     }
+
+    fn wgpu_step_names(&self) -> Option<Vec<&'static str>> {
+        Some(self.inner.test_step_names())
+    }
 }
 
 /// Cast every element of a wgpu f32 output buffer down to the

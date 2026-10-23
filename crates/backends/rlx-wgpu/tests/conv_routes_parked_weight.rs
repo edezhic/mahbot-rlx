@@ -160,6 +160,7 @@ fn graph(case: &Case) -> Graph {
         case.l,
         case.k,
         case.p,
+        1,
     )
 }
 

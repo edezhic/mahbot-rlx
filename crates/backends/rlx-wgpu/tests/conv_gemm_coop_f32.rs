@@ -56,10 +56,13 @@
 //! rows the README takes from this file's trailing block, are runs of this test; the
 //! README marks the readings there that no in-tree graph or harness takes.
 //!
-//! **The ordinary multiply is not the widening's.** A plain matmul keeps the Metal
-//! form's own 32 columns: the counter reads zero for an `n` that is a multiple of 8
-//! only and one for the next shape up — the block at the end of the test — so the
-//! cascade's own alignment is what this change leaves alone.
+//! **The ordinary multiply is not the widening's, and not the direct entry's.** A
+//! plain matmul keeps the Metal form's own 32 columns: the counter reads zero for an
+//! `n` that is a multiple of 8 only and one for the next shape up — the block at the
+//! end of the test — so the cascade's own alignment is what this change leaves alone.
+//! It also never takes `matmul_coop_f32_direct`: that entry is admitted only where
+//! the weight sits in the FIRST operand (`coop_f32_direct_admitted`), which only
+//! these two routes do.
 //!
 //! **The padded-`M` cases are the bounds reliance, exercised.** The Metal kernel
 //! gathers 32 A rows per tile without checking `params.m`, so a `c_out = 80` shape
@@ -306,20 +309,28 @@ fn graph(case: &Case) -> Graph {
         case.l,
         case.k,
         case.p,
+        1,
     )
 }
 
 /// Compile `case` under the switches in force, bind the weight, run `x`, and
 /// report the step names the schedule took, the output, and how many f32
-/// cooperative dispatches the run made. One conv in the graph, so the count is
-/// this node's.
-fn compile_and_run(case: &Case, xs: &[f32], ws: &[f32]) -> (Vec<&'static str>, Vec<f32>, u64) {
+/// cooperative dispatches the run made — of which how many took the direct
+/// (epilogue-free) entry. One conv in the graph, so each count is this node's.
+fn compile_and_run(case: &Case, xs: &[f32], ws: &[f32]) -> (Vec<&'static str>, Vec<f32>, u64, u64) {
     let before = rlx_wgpu::coop_f32_dispatch_count();
+    let before_direct = rlx_wgpu::coop_f32_direct_dispatch_count();
     let mut exe = WgpuExecutable::compile(graph(case));
     exe.set_param("w", ws);
     let steps = exe.test_step_names();
     let got = exe.run(&[("x", xs)]).remove(0);
-    (steps, got, rlx_wgpu::coop_f32_dispatch_count() - before)
+    let direct = rlx_wgpu::coop_f32_direct_dispatch_count() - before_direct;
+    (
+        steps,
+        got,
+        rlx_wgpu::coop_f32_dispatch_count() - before,
+        direct,
+    )
 }
 
 /// The two things a shape the arm may not switch must show: no cooperative
@@ -404,9 +415,10 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
         let k_total = case.c_in * case.k;
 
         rlx_ir::env::set("RLX_WGPU_NO_COOP_F32", "0");
-        let (steps_coop, got_coop, coop_dispatches) = compile_and_run(case, &xs, &ws);
+        let (steps_coop, got_coop, coop_dispatches, direct_dispatches) =
+            compile_and_run(case, &xs, &ws);
         rlx_ir::env::set("RLX_WGPU_NO_COOP_F32", "1");
-        let (steps_base, got_base, base_dispatches) = compile_and_run(case, &xs, &ws);
+        let (steps_base, got_base, base_dispatches, _) = compile_and_run(case, &xs, &ws);
 
         for (arm, steps) in [("arm", &steps_coop), ("base", &steps_base)] {
             assert!(
@@ -434,6 +446,28 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
                      each % 8 = 0), so its one conv must dispatch the cooperative \
                      kernel once",
                     case.label, k_total, case.l
+                );
+                // Both routes' multiply is epilogue-free, so a whole 32×32 output
+                // tile takes the direct entry (`matmul_coop_f32_direct`). The
+                // expectation is the dispatch's own admission, asked with this
+                // route's operand roles (weight in A, so `b_is_param` is false):
+                // `coop_f32_direct_admitted`. A case with a padded m or n keeps
+                // the general kernel, whose store guard and scalar epilogue cover
+                // the ragged tile.
+                let want_direct = rlx_wgpu::backend::coop_f32_direct_admitted(
+                    0,
+                    0xFFFF,
+                    case.c_out as u32,
+                    k_total as u32,
+                    case.l as u32,
+                    false,
+                );
+                assert_eq!(
+                    direct_dispatches,
+                    u64::from(want_direct),
+                    "{}: the direct entry is exactly the route-scoped, whole-tile, \
+                     epilogue-free form `coop_f32_direct_admitted` names",
+                    case.label
                 );
                 let d = common::max_abs_diff(&got_coop, &got_base);
                 eprintln!(
@@ -498,7 +532,7 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
     // kernel away — the last case above left it switched off.
     rlx_ir::env::set("RLX_WGPU_NO_COOP_F32", "0");
     rlx_ir::env::set("RLX_WGPU_MATMUL_F32_ONLY", "1");
-    let (steps, got, dispatches) = compile_and_run(case, &xs, &ws);
+    let (steps, got, dispatches, _) = compile_and_run(case, &xs, &ws);
     rlx_ir::env::set("RLX_WGPU_MATMUL_F32_ONLY", "0");
     assert!(
         steps.contains(&case.route),
@@ -537,9 +571,9 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
     let ws = common::fill(case.c_out * case.c_in * case.k, 5, 3, 11, 0.1, -0.5);
     let want = common::unit_conv_cpu_reference(graph(case), &xs, &ws);
     rlx_ir::env::set("RLX_WGPU_FORCE_COOP_F32", "1");
-    let (steps, got_forced, forced) = compile_and_run(case, &xs, &ws);
+    let (steps, got_forced, forced, _) = compile_and_run(case, &xs, &ws);
     rlx_ir::env::set("RLX_WGPU_FORCE_COOP_F32", "0");
-    let (_, got_off, off) = compile_and_run(case, &xs, &ws);
+    let (_, got_off, off, _) = compile_and_run(case, &xs, &ws);
     assert!(
         steps.contains(&case.route),
         "{}: the route is unchanged by the force lever (schedule {steps:?})",
@@ -581,7 +615,7 @@ fn alignment_decides_which_conv_gemms_take_the_cooperative_kernel() {
     let ws = common::fill(case.c_out * case.c_in * case.k, 5, 3, 11, 0.1, -0.5);
     let want = common::unit_conv_cpu_reference(graph(case), &xs, &ws);
     rlx_ir::env::set("RLX_WGPU_FORCE_COOP_F32", "1");
-    let (steps, got_forced, forced) = compile_and_run(case, &xs, &ws);
+    let (steps, got_forced, forced, _) = compile_and_run(case, &xs, &ws);
     rlx_ir::env::set("RLX_WGPU_FORCE_COOP_F32", "0");
     assert!(
         steps.contains(&case.route),

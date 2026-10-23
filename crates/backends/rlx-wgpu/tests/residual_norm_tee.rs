@@ -123,7 +123,12 @@ fn check(rms: bool, rows: usize, h: usize, x: &[f32], tol: f32, case: &str) {
     for (n, len) in &names {
         exe.set_param(n, &fill(*len, n.len() as u64 + 7));
     }
+    // The route counter is process-global: no other test of this binary may
+    // bracket a run while this one does.
+    let _guard = common::route_lock();
+    rlx_wgpu::reset_norm_vec4_count();
     let got = exe.run(&[("x", x)])[0].clone();
+    let vec4 = rlx_wgpu::norm_vec4_count();
 
     // Numerics first — it applies on every adapter, however the ops routed.
     // `max_abs_diff` censuses finiteness before it folds (a hand-rolled
@@ -164,6 +169,24 @@ fn check(rms: bool, rows: usize, h: usize, x: &[f32], tol: f32, case: &str) {
          ({binaries} binary + {norms} norm steps remain) — the multi-consumer residual \
          pattern is not being recognised, so every block pays a separate \
          Add dispatch"
+    );
+    // The tee has a scalar and a `vec4` module, and they compute the same norm, so
+    // the count above cannot say which ran: the vector admission is `h % 4 == 0`
+    // *and* every offset the step touches a multiple of 4 words, and it has to be
+    // the one the route took or the step silently pays 64 scalar lanes with one
+    // access in flight.
+    let want_vec4 = if h.is_multiple_of(4) {
+        (tees + norms) as u64
+    } else {
+        0
+    };
+    assert_eq!(
+        vec4,
+        want_vec4,
+        "{case}: {label} h={h}: {vec4} vectorised norm dispatch(es) against {} norm step(s) \
+         — a norm step must take the `vec4` module when `inner % 4 == 0` and every offset \
+         it touches is 4-word aligned",
+        tees + norms
     );
 }
 

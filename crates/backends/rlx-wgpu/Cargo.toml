@@ -86,7 +86,15 @@ rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
 
 [[test]]
+name = "gguf_gemv_tail_window"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "attention_cached_decode_route"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "narrow_last_axis_vec4"
 required-features = ["backend-tests"]
 
 [[test]]
@@ -230,6 +238,10 @@ name = "conv_gemm_coop_f32"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "conv1d_implicit"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "conv_route_cost"
 required-features = ["backend-tests"]
 
@@ -298,6 +310,10 @@ name = "fused_residual_norm_cost"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "gemm_ceiling"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "gguf_batch_join"
 required-features = ["backend-tests"]
 
@@ -334,6 +350,14 @@ name = "gguf_matmul_route"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "gguf_gemv_in_place"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_gemv_wide_arm"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "gguf_one_row_stream_rate"
 required-features = ["backend-tests"]
 
@@ -362,6 +386,10 @@ name = "kv_row_readback_step_counts"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "kv_append_in_place"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "kv_row_residency"
 required-features = ["backend-tests"]
 
@@ -382,6 +410,10 @@ name = "mlx_dequant_matmul_parity"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "norm_rope_fusion"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "op_precision_sweep"
 required-features = ["backend-tests"]
 
@@ -391,6 +423,10 @@ required-features = ["backend-tests"]
 
 [[test]]
 name = "region_activation_arms"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "region_mid_axis_broadcast"
 required-features = ["backend-tests"]
 
 [[test]]
@@ -410,6 +446,10 @@ name = "run_report"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "sample_staged_paths"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "scaled_grouped_matmul_wgpu"
 required-features = ["backend-tests"]
 
@@ -423,6 +463,14 @@ required-features = ["backend-tests"]
 
 [[test]]
 name = "sharded_arena"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "small_step_dispatch_cost"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "snake_beta_fusion"
 required-features = ["backend-tests"]
 
 [[test]]

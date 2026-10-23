@@ -926,6 +926,16 @@ pub trait ExecutableGraph: Send {
     fn wgpu_host_summary(&self) -> Option<String> {
         None
     }
+
+    /// The compiled schedule's step names, in run order — `None` for a backend
+    /// that does not report one.
+    ///
+    /// For a gate that must pin a property of the schedule the *product* path
+    /// compiles (fusion and all), which is a different schedule from the one the
+    /// backend's direct compile entry produces.
+    fn wgpu_step_names(&self) -> Option<Vec<&'static str>> {
+        None
+    }
 }
 
 /// Backend implementation trait.

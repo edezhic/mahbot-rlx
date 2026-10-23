@@ -21,8 +21,8 @@ use rlx_ir::op::MaskKind;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_wgpu::kernels::{
-    ATTENTION_DECODE_MAX_HEAD_DIM, ATTENTION_DECODE_MIN_KEYS, AttentionRoutes,
-    attention_decode_eligible, attention_route_counts, reset_attention_route_counts,
+    ATTENTION_DECODE_MAX_HEAD_DIM, AttentionRoutes, attention_decode_eligible,
+    attention_route_counts, reset_attention_route_counts,
 };
 
 /// Head count / width of the 1.7B-class decode body the route targets.
@@ -35,6 +35,9 @@ const LAYERS: usize = 28;
 const DECODE_LK: usize = 512;
 const DECODE_LK_SHORT: usize = 104;
 const PREFILL_ROWS: usize = 64;
+/// A head width above the lane-parallel form's cap — the one one-row shape the
+/// serial kernel still serves, so it is this harness's serial baseline.
+const WIDE_HD: usize = ATTENTION_DECODE_MAX_HEAD_DIM as usize + 128;
 /// Best-of-`REPS` timing loop; the counts asserted in
 /// `cost_per_position_per_layer` are `REPS * LAYERS`.
 const REPS: usize = 5;
@@ -139,10 +142,10 @@ fn mask_data(kind: MaskKind, rows: usize, lk: usize, nh: usize) -> Vec<f32> {
 /// Best-of-`REPS` whole-chain timing in µs per context position per layer, plus
 /// the submission and wait counts of one such run and the attention route that
 /// run took (both counters reset before the timed loop).
-fn cost(rows: usize, lk: usize) -> (f64, u64, u64, AttentionRoutes) {
+fn cost(rows: usize, lk: usize, hd: usize) -> (f64, u64, u64, AttentionRoutes) {
     const WARMUP: usize = 3;
-    let dim = NH * HD;
-    let g = chain(rows, lk, LAYERS, NH, HD, MaskKind::Causal);
+    let dim = NH * hd;
+    let g = chain(rows, lk, LAYERS, NH, hd, MaskKind::Causal);
     let mut c = Session::new(Device::Gpu).compile(g);
     let q = data(rows * dim, 0.011, false);
     let k = data(lk * dim, 0.013, true);
@@ -278,45 +281,50 @@ fn cost_per_position_per_layer() {
     refuse_under_run_report();
 
     let _guard = route_lock();
-    // `serial-1row` is the pre-change baseline this build can still produce: one
-    // query row at the largest key length that is not decode-shaped, so the same
-    // harness measures the serial walk on a single row. The serial form's cost is
-    // flat in key length per position (the `prefill` row below walks 512 keys for
-    // the same figure), so this is the number the decode rows are compared to.
-    for (label, rows, lk) in [
-        ("serial-1row", 1usize, ATTENTION_DECODE_MIN_KEYS as usize),
-        ("decode", 1, DECODE_LK_SHORT),
-        ("decode", 1, DECODE_LK),
-        ("prefill", PREFILL_ROWS, DECODE_LK),
+    // `serial-wide` is the only serial reading this build can still produce: one
+    // query row at a head width above the lane-parallel form's cap. It is **not**
+    // the decode rows' baseline — twice their head width is twice the work per
+    // position — and the pre-change serial figures at these widths cannot be
+    // re-taken now that the route has no key floor, so the row is here to keep a
+    // number on the fallback, not to compare against.
+    for (label, rows, lk, hd) in [
+        ("serial-wide", 1usize, DECODE_LK_SHORT, WIDE_HD),
+        ("decode", 1, DECODE_LK_SHORT, HD),
+        ("decode", 1, DECODE_LK, HD),
+        ("prefill", PREFILL_ROWS, DECODE_LK, HD),
     ] {
-        let (us, submits, waits, routes) = cost(rows, lk);
+        let (us, submits, waits, routes) = cost(rows, lk, hd);
         eprintln!(
-            "[rlx-attn-cost] {label} rows={rows} heads={NH} head_dim={HD} lk={lk} \
+            "[rlx-attn-cost] {label} rows={rows} heads={NH} head_dim={hd} lk={lk} \
              layers={LAYERS} mask=causal: {us:.3} us/position/layer \
              (submits={submits} waits={waits}) routes={routes:?}"
         );
         // The expectation comes from the shape: `prefill`'s 64 query rows are
         // above the dense route's floor (`backend::attention_route`), so its
         // layers take that arrangement — the numbers `attention_decompose_cost`
-        // reports — and this harness keeps timing them from the decode side. The
-        // arm's own window term can still keep the fused kernel (that module's
-        // doc); where it does, this assertion is the pin that says so.
+        // reports — and this harness keeps timing them from the decode side. A
+        // head wider than the lane-parallel form's cap at one row is the serial
+        // kernel's (at `PREFILL_ROWS` and up the dense arrangement takes it
+        // instead, cap or no cap); the helper applies that width term itself.
+        // The arm's own window term can still keep the fused kernel (that
+        // module's doc); where it does, this assertion is the pin that says so.
+        let want = common::expected_attention_routes(rows, lk, hd, 0, LAYERS, REPS);
         assert_eq!(
-            routes,
-            common::expected_attention_routes(rows, lk, LAYERS, REPS),
+            routes, want,
             "{label} rows={rows} lk={lk}: every layer must take its own shape's route"
         );
     }
 }
 
 /// Compiled at `UPPER` keys, run at a shorter extent by the same hint the
-/// bucketed compile cache sets (`set_active_extent`). The route must follow the
-/// patch: 512 keys is above the decode threshold and takes the decode form, 48
-/// keys is below it and must fall back to the serial kernel even though the
-/// graph was lowered for 1024. Both results are checked against the CPU on the
-/// same graph, where the mask makes the padded tail inert.
+/// bucketed compile cache sets (`set_active_extent`). The route reads the length
+/// the run walks, so a patched-down extent keeps the lane-parallel form — the
+/// route carries no key floor (`kernels::attention_decode_eligible`) — and the
+/// patched run is checked against the CPU on the same graph, where the mask makes
+/// the padded tail inert. The row axis is where a walked extent still changes the
+/// arrangement (`tests/attention_rows_route.rs`).
 #[test]
-fn decode_route_follows_the_extent_patched_down() {
+fn a_patched_down_extent_keeps_the_decode_form_and_its_numbers() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         eprintln!("skip: wgpu unavailable");
         return;
@@ -325,24 +333,12 @@ fn decode_route_follows_the_extent_patched_down() {
     const UPPER: usize = 1024;
     const LAYERS_PATCHED: usize = 2;
     let dim = NH * HD;
-    for (actual, want) in [
-        (
-            512usize,
-            AttentionRoutes {
-                decode: LAYERS_PATCHED as u64,
-                decomposed: 0,
-                serial: 0,
-            },
-        ),
-        (
-            48,
-            AttentionRoutes {
-                decode: 0,
-                decomposed: 0,
-                serial: LAYERS_PATCHED as u64,
-            },
-        ),
-    ] {
+    for actual in [512usize, 48] {
+        let want = AttentionRoutes {
+            decode: LAYERS_PATCHED as u64,
+            decomposed: 0,
+            serial: 0,
+        };
         let g = masked_chain(1, UPPER, LAYERS_PATCHED, NH, HD, MaskKind::Custom);
         let q = data(dim, 0.011, false);
         let k = data(UPPER * dim, 0.013, true);
@@ -440,9 +436,10 @@ fn decode_route_mask_kinds_match_cpu() {
     }
 }
 
-/// Shapes the decode form cannot serve keep the serial kernel, and keep its
-/// numbers: a key length at (not above) the decode threshold, and a head width
-/// above the width the lane-parallel form caps at.
+/// A shape the decode form cannot serve keeps the serial kernel, and keeps its
+/// numbers: a head wider than the width the lane-parallel form caps at. (A
+/// single query row is no longer such a shape — the form has no key floor — so
+/// the head width is the only one-row fallback left.)
 #[test]
 fn route_falls_back_outside_the_decode_form() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
@@ -453,46 +450,42 @@ fn route_falls_back_outside_the_decode_form() {
     // The constant-derived width, not a bare 256: it is `MAX + 128` that is the
     // interesting side of the boundary here.
     let wide_hd = ATTENTION_DECODE_MAX_HEAD_DIM as usize + 128;
-    for (rows, nh, hd, lk) in [
-        (1usize, NH, HD, ATTENTION_DECODE_MIN_KEYS as usize),
-        (1, 4, wide_hd, 186),
-    ] {
-        let dim = nh * hd;
-        let g = chain(rows, lk, 1, nh, hd, MaskKind::Causal);
-        let q = data(rows * dim, 0.011, false);
-        let k = data(lk * dim, 0.013, true);
-        let v = data(lk * dim, 0.017, false);
-        let inputs: Vec<(&str, &[f32])> = vec![("q", &q), ("k", &k), ("v", &v)];
-        let mut c = Session::new(Device::Gpu).compile(g.clone());
-        let _ = c.run(&inputs).remove(0);
-        reset_attention_route_counts();
-        let gpu = c.run(&inputs).remove(0);
-        let routes = attention_route_counts();
-        // The host routes on the mirror of this guard; the observed route must
-        // agree with it.
-        assert!(
-            !attention_decode_eligible(rows as u32, lk as u32, hd as u32, 0),
-            "rows={rows} nh={nh} hd={hd} lk={lk} is not decode-shaped"
-        );
-        assert_eq!(
-            routes,
-            AttentionRoutes {
-                decode: 0,
-                decomposed: 0,
-                serial: 1,
-            },
-            "rows={rows} nh={nh} hd={hd} lk={lk}: outside the decode form the \
-             serial kernel must serve the step"
-        );
-        let cpu = Session::new(Device::Cpu).compile(g).run(&inputs).remove(0);
-        let d = max_abs_diff(&gpu, &cpu);
-        eprintln!(
-            "[rlx-attn-fallback] rows={rows} heads={nh} head_dim={hd} lk={lk} \
-             routes={routes:?} vs CPU: max_abs={d:.6e}"
-        );
-        assert!(
-            d < 1e-5,
-            "serial-kernel fallback rows={rows} nh={nh} hd={hd} lk={lk}: max_abs {d} vs CPU"
-        );
-    }
+    let (rows, nh, hd, lk) = (1usize, 4usize, wide_hd, 186usize);
+    let dim = nh * hd;
+    let g = chain(rows, lk, 1, nh, hd, MaskKind::Causal);
+    let q = data(rows * dim, 0.011, false);
+    let k = data(lk * dim, 0.013, true);
+    let v = data(lk * dim, 0.017, false);
+    let inputs: Vec<(&str, &[f32])> = vec![("q", &q), ("k", &k), ("v", &v)];
+    let mut c = Session::new(Device::Gpu).compile(g.clone());
+    let _ = c.run(&inputs).remove(0);
+    reset_attention_route_counts();
+    let gpu = c.run(&inputs).remove(0);
+    let routes = attention_route_counts();
+    // The host routes on the mirror of this guard; the observed route must
+    // agree with it.
+    assert!(
+        !attention_decode_eligible(rows as u32, lk as u32, hd as u32, 0),
+        "rows={rows} nh={nh} hd={hd} lk={lk} is not decode-shaped"
+    );
+    assert_eq!(
+        routes,
+        AttentionRoutes {
+            decode: 0,
+            decomposed: 0,
+            serial: 1,
+        },
+        "rows={rows} nh={nh} hd={hd} lk={lk}: outside the decode form the \
+         serial kernel must serve the step"
+    );
+    let cpu = Session::new(Device::Cpu).compile(g).run(&inputs).remove(0);
+    let d = max_abs_diff(&gpu, &cpu);
+    eprintln!(
+        "[rlx-attn-fallback] rows={rows} heads={nh} head_dim={hd} lk={lk} \
+         routes={routes:?} vs CPU: max_abs={d:.6e}"
+    );
+    assert!(
+        d < 1e-5,
+        "serial-kernel fallback rows={rows} nh={nh} hd={hd} lk={lk}: max_abs {d} vs CPU"
+    );
 }

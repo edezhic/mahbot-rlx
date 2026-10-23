@@ -82,6 +82,18 @@ fn entry_body<'a>(src: &'a str, name: &str) -> &'a str {
     &rest[..rest.find(ENTRY).map_or(rest.len(), |i| i + ENTRY.len())]
 }
 
+/// One module-scope `fn`'s body (up to its closing brace in column 0), for the
+/// helpers [`entry_body`]'s cut does not reach: it stops at the next `@compute`,
+/// which for a decode helper is several functions away.
+fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let head = format!("fn {name}(");
+    let at = src
+        .find(&head)
+        .unwrap_or_else(|| panic!("no `{head}` in the shader"));
+    let rest = &src[at..];
+    &rest[..rest.find("\n}").map_or(rest.len(), |i| i + 2)]
+}
+
 /// Ids in the shared table, via the public inverse of the id mapping.
 fn registered_ids() -> BTreeSet<u32> {
     (0u32..=64)
@@ -190,33 +202,92 @@ fn one_row_entry_points_parse_and_validate() {
     assert_eq!(sizes["dequant_gemv"], [64, 1, 1], "legacy thread count");
 
     // How each arm reads the packed weight is part of the shape the one-row route
-    // reports: the tiled arm's word reads go through the 4-byte `read_word_at`,
-    // the arm that keeps one thread per column reads bytes. Pinned so a return to
-    // byte-wise reads on the tiled arm is not silent — the recorded geometry alone
-    // cannot see it. What this checks is the spelling of that arm's own reads:
-    // Q6_K's header still goes through the byte-wise `dq_read_f16` / `read_w_i8`
-    // (through a differently named helper the check would not trip).
+    // reports: both decoded arms read it 16 bytes at a time (`read_w16`) and pick
+    // bytes out of the leg they fetched, where a word-at-a-time read cost one fetch
+    // per word — the per-lane instruction count this latency-bound arm's rate
+    // follows. The arm that keeps one thread per column still reads bytes. Both
+    // one-row arms share one decode per scheme (`dq_q4k_unit` / `dq_q6k_unit` /
+    // `dq_q8_0_unit`), so the spelling pins below read those bodies rather than
+    // either entry point's.
     let wgsl = rlx_wgpu::kernels::DEQUANT_GEMV_GGUF_WGSL;
-    let tiled = entry_body(wgsl, "dequant_gemv_tiled");
+    let q4k = fn_body(wgsl, "dq_q4k_unit");
+    let q6k = fn_body(wgsl, "dq_q6k_unit");
+    let q8_0 = fn_body(wgsl, "dq_q8_0_unit");
     assert!(
-        tiled.contains("read_word_at("),
-        "the tiled one-row arm must read the packed weight in 4-byte words"
+        q6k.contains("read_w16(") && q8_0.contains("read_w16("),
+        "the decoded one-row arms must read the packed weight in 16-byte legs"
     );
     assert!(
-        !tiled.contains("read_w("),
-        "the tiled one-row arm's own reads must not fall back to the byte-wise `read_w`"
+        !q6k.contains("read_w(") && !q8_0.contains("read_w("),
+        "the decoded one-row arms' own reads must not fall back to the byte-wise `read_w`"
+    );
+    // …but the units *do* reach that reader, through `dq_read_f16` for a block's
+    // exact two bytes of `d`. `!contains("read_w(")` above is satisfied by moving
+    // a read one call away, so pin the indirection too: the module's byte-wise
+    // reads are `dq_read_f16`'s two and the legacy column arm's one. A leg added
+    // to any of the three bodies takes this to five.
+    assert!(
+        q6k.contains("dq_read_f16(") && q8_0.contains("dq_read_f16("),
+        "a decoded arm's scale is read at its own two bytes through `dq_read_f16`"
+    );
+    assert_eq!(
+        wgsl.matches("read_w(").count(),
+        4,
+        "byte-wise reads: the definition, `dq_read_f16`'s two, and the legacy arm's one"
+    );
+    // Q4_K's 144-byte stride puts its header and both `qs` halves on group
+    // boundaries and off the second column's, so the body is six leg reads and no
+    // word assembly. A word-at-a-time read computes bit-identical values, so no
+    // parity or digest test can see this path change; like the reads above, this
+    // file pins the spelling. One site, because the decode is one body both arms
+    // call (it used to be two — one per column — inside the tiled arm).
+    assert_eq!(
+        q4k.matches("read_w16(").count(),
+        6,
+        "the Q4_K unit reads its header and both columns' two `qs` halves as legs"
+    );
+    assert!(
+        q6k.contains("wbyte_i8("),
+        "Q6_K's 16 i8 scales are picked out of the one leg they occupy"
     );
     assert!(
         entry_body(wgsl, "dequant_gemv").contains("read_w("),
         "the one-thread-per-column arm reads the packed weight a byte at a time"
     );
+    // Each operand window is bound **once**. The layout this shader used to carry
+    // bound the X window twice (`array<f32>` at binding 0 and `array<vec4<f32>>`
+    // at 4) and the weight window twice (`array<u32>` at 2 and `array<vec4<u32>>`
+    // at 5), all `read_write` — two writable bindings of one range, which WebGPU's
+    // "bind groups alias a writable resource" rule forbids and this driver merely
+    // happens not to enforce. Pinned by declaration count, because a re-added
+    // alias is invisible to every parity and digest test: the arithmetic is
+    // identical, only the conformance is not.
+    let declarations: Vec<u32> = wgsl
+        .match_indices("@binding(")
+        .filter_map(|(at, tag)| {
+            wgsl[at + tag.len()..]
+                .split(')')
+                .next()
+                .and_then(|n| n.trim().parse().ok())
+        })
+        .collect();
+    assert_eq!(
+        declarations,
+        [0, 1, 2, 3],
+        "the one-row module binds each operand window once: X, params, weight, out"
+    );
+    assert!(
+        !wgsl.contains("warr:") && !wgsl.contains("xarr:"),
+        "a second view of a bound window is the aliasing defect, not an optimisation"
+    );
 }
 
-/// The one-row route's device guard. The tiled arm's `vec4` X read needs both the
-/// window's offset and the row stride to line up with a four-element group; the
-/// arm that reads X a scalar at a time does not. Pinned here because the decision
-/// is arithmetic — the route consults this at its own entry, so a call it refuses
-/// goes to the host instead of being read shifted.
+/// The one-row route's device guard. Both arms read X through the buffer's
+/// `vec4` view, so the window's offset must line up with a four-element group;
+/// the tiled arm additionally reads across the row, so its stride must too.
+/// Pinned here because the decision is arithmetic — the route consults this at
+/// its own entry, so a call it refuses goes to the host instead of being read
+/// shifted.
 #[test]
 fn the_one_row_device_guard_requires_a_vec4_addressable_x_window() {
     use rlx_wgpu::gguf_gpu::{gemv_one_row_device_ok as ok, gemv_tiled_supports_scheme};
@@ -254,8 +325,11 @@ fn the_one_row_device_guard_requires_a_vec4_addressable_x_window() {
             "id {id}: a 257-element contraction's row stride"
         );
     }
-    // Q1_0 (the other arm) reads X a scalar at a time, so neither matters to it.
-    assert!(ok(24, 4, 257 * 4));
+    // Q1_0 (the other arm) reads X through the same `vec4` view, so the window's
+    // offset has to line up too; its stride does not enter — it indexes the view
+    // component-wise.
+    assert!(!ok(24, 4, 257 * 4));
+    assert!(ok(24, 16, 257 * 4));
 }
 
 /// The route ladder's answer, pinned device-free. The batch boundary joins
@@ -285,10 +359,11 @@ fn the_one_row_device_guard_requires_a_vec4_addressable_x_window() {
 ///
 /// It has to compose the arm's own X-window addressability guard
 /// (`gemv_one_row_device_ok`), so a window the arm's `vec4` reads cannot address
-/// stays out; Q1_0 passes that guard (its arm reads X a scalar at a time) but has
-/// no tiled branch, so it must not be admitted either — joining it would encode
-/// work the tiled kernel cannot read, and the batch boundary would have handed it
-/// a submission instead of the host.
+/// stays out; Q1_0 passes that guard on the window's offset alone (its legacy arm
+/// indexes the same view component-wise) but has no tiled branch, so it must not
+/// be admitted either — joining it would encode work the tiled kernel cannot
+/// read, and the batch boundary would have handed it a submission instead of the
+/// host.
 ///
 /// The ladder is also deliberately pure: it records nothing, so asking it what
 /// the route will be does not perturb [`rlx_wgpu::gguf_gpu::route_counts`].
@@ -337,8 +412,9 @@ fn select_path_is_exact_for_the_joined_device_arms() {
             }
         }
     }
-    // Q1_0 (24) at one row passes the same window guard — its arm reads X a
-    // scalar at a time — but is not the tiled arm, so it must not be joined.
+    // Q1_0 (24) at one row passes the same window guard on the offset alone — its
+    // legacy arm indexes the view component-wise, so the row stride does not enter
+    // — but is not the tiled arm, so it must not be joined.
     for k in [256usize, 384] {
         assert_eq!(
             select_path(1, k, 24, 64, 0),
@@ -617,4 +693,26 @@ fn every_registered_scheme_is_branched_or_deliberately_host_routed() {
             "scheme {scheme:?} (id {id}) is both branched and listed host-only"
         );
     }
+}
+
+/// The one-row uniform record is written by the host and read by the shader, so
+/// the two declarations are one layout: the host struct must be exactly the size
+/// the WGSL struct occupies — its members' bytes rounded up to the 16-byte
+/// alignment a uniform struct has. A word added on one side only leaves the
+/// record the shader reads shifted by whatever the binding hands it, which this
+/// driver accepts silently (the layout asks for no minimum size).
+#[test]
+fn the_one_row_uniform_record_is_the_size_the_shader_declares() {
+    let src = rlx_wgpu::kernels::DEQUANT_GEMV_GGUF_WGSL;
+    let at = src
+        .find("struct Params {")
+        .expect("the one-row shader declares `struct Params`");
+    let body = &src[at..src[at..].find('}').expect("a struct closes") + at];
+    let words = body.matches(':').count();
+    let wgsl_bytes = words.div_ceil(4) * 16;
+    assert_eq!(
+        std::mem::size_of::<rlx_wgpu::kernels::DequantGemvGgufParams>(),
+        wgsl_bytes,
+        "the host record and the shader's `struct Params` ({words} words) must be one layout"
+    );
 }

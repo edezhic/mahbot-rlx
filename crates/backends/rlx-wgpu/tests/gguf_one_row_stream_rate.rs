@@ -54,15 +54,27 @@
 //! | 6-bit recognition head | Q6_K | 2048 | 151936 | 3 | 1680 | 255,252,480 |
 //! | 8-bit predictor down | Q8_0 | 1024 | 1024 | 128 | 1088 | 1,114,112 |
 //! | 8-bit predictor head | Q8_0 | 1024 | 2048 | 64 | 1088 | 2,228,224 |
+//! | 8-bit predictor width 3072 | Q8_0 | 1024 | 3072 | 64 | 1088 | 3,342,336 |
+//! | 8-bit predictor width 4096 | Q8_0 | 1024 | 4096 | 64 | 1088 | 4,456,448 |
 //! | 8-bit predictor gate+up | Q8_0 | 1024 | 6144 | 32 | 1088 | 6,684,672 |
 //! | 8-bit predictor block, k=2048 | Q8_0 | 2048 | 2048 | 32 | 2176 | 4,456,448 |
 //! | 8-bit predictor, widened x8 | Q8_0 | 1024 | 49152 | 4 | 1088 | 53,477,376 |
+//! | 4-bit attention k/v | Q4_K | 2048 | 1024 | 192 | 1152 | 1,179,648 |
+//! | 6-bit attention v | Q6_K | 2048 | 1024 | 128 | 1680 | 1,720,320 |
+//! | 4-bit FFN down | Q4_K | 6144 | 2048 | 32 | 3456 | 7,077,888 |
+//! | 4-bit FFN gate+up (body width) | Q4_K | 2048 | 12288 | 16 | 1152 | 14,155,776 |
+//! | 6-bit output head | Q6_K | 2048 | 3072 | 44 | 1680 | 5,160,960 |
+//! | 8-bit predictor attn_out | Q8_0 | 2048 | 1024 | 96 | 2176 | 2,228,224 |
+//! | 8-bit predictor ffn down | Q8_0 | 3072 | 1024 | 64 | 3264 | 3,342,336 |
 //!
-//! The five Q8_0 rows are the synthesis cell's code predictor, which stores 8-bit
+//! The seven Q8_0 rows are the synthesis cell's code predictor, which stores 8-bit
 //! weights: `k = 1024` is its attention-projection width (its `ffn_down` contracts
-//! over 3072), and `n = 1024` is that projection's output, `2048` its head, `6144`
-//! its fused gate+up. Row bytes are 1088 for `k = 1024` — 32 Q8_0 blocks, each 2
-//! bytes of scale and 32 of quants — and 2176 for `k = 2048`.
+//! over 3072), and `n = 1024` is that projection's output, `2048`/`3072`/`4096`/
+//! `6144` the widths between its head and its fused gate+up. Row bytes are 1088
+//! for `k = 1024` — 32 Q8_0 blocks, each 2 bytes of scale and 32 of quants — and
+//! 2176 for `k = 2048`. The table's last seven rows are the loop's remaining
+//! geometries: the talker body's `attn_k`/`attn_v`, `ffn_down`, fused `gate_up`
+//! and output head, and the predictor's `attn_out`/`proj_in` and `ffn_down`.
 //!
 //! The widened form's region is the first form's own packed bytes repeated eight
 //! times into one buffer — a synthetic widening, no such tensor being in any file —
@@ -154,7 +166,7 @@
 //!
 //! **In the arm, and not.** The two columns' packed words are issued together
 //! (`word0`/`word1` read before either is consumed) and Q4_K's block header and
-//! `qs` words go through `read_word_q4`'s aligned single load — both bit-identical,
+//! `qs` words are read as the aligned 16-byte legs they occupy — both bit-identical,
 //! both part of every column above and of the after side of the table below. The
 //! further step of hoisting a unit's whole eighteen loads is **not** in the tree:
 //! on the four Q4_K forms it read 56.1, 93.3, 44.7 and 75.4 GB/s against that
@@ -167,6 +179,67 @@
 //! at 49 152. One predictor frame is sixteen levels, 1 465 dispatch slots (348 of
 //! them multiplies) over 1 341 MiB, so the frame's next step is how many
 //! dispatches it issues, not the shape of any one of them.
+//!
+//! # The conforming binding layout
+//!
+//! The one-row arm used to bind the X window twice and the weight window twice
+//! (as `array<f32>`/`array<vec4<f32>>` and `array<u32>`/`array<vec4<u32>>`), which
+//! WebGPU's "bind groups alias a writable resource" rule forbids and this driver
+//! happens not to enforce. Each window is now bound once, the weight as a single
+//! `array<vec4<u32>>` every scheme reads in 16-byte legs (`read_w16`), so the
+//! comparison below measures the scalar-word layout that change replaced.
+//!
+//! **That comparison is not resolvable from this cell**, and it is recorded as
+//! bounded rather than measured. Across two windows of the same day the Q4_K forms'
+//! medians read 4-12 % lower after it (4-bit FFN gate 69.8 → 67.1, predictor block
+//! 60.9 → 53.4, wide n 78.9 → 72.0, widened x8 102.0 → 81.6), while the Q6_K and
+//! Q8_0 forms, whose read paths it did not touch then, read unchanged (6-bit
+//! recognition head 79.0 → 78.9, 8-bit predictor down 38.9 → 38.3). Two windows
+//! cannot separate a 5-10 % kernel cost from this machine's per-form drift, which the
+//! narrow forms show at up to 30 %, and no paired A/B against the old layout was
+//! taken — it would need the old shader built beside the new one. What is measured on
+//! the largest consumer is the cell: the talker body, half Q4_K by bytes, went 20.33 →
+//! 21.32 ms a frame (+4.9 %) between the same two windows. Reading a block's header
+//! from workgroup memory instead (as the word view did, four header words per block
+//! down to one) was implemented, found flat to negative — the eight lanes of a block
+//! issue those words at identical addresses inside one wave, which the memory system
+//! already coalesces — and reverted.
+//!
+//! # The per-call floor against the per-step stream
+//!
+//! `one_row_dispatch_cost` varies the step count at two fixed geometries — the
+//! code predictor's narrowest Q8_0 call (`k = n = 1 024`) and the 4-bit predictor
+//! block (`k = n = 2 048`) — at 1, 2, 4, 8, 16, 32, 64 and 128 steps, one graph
+//! built per count and timed with `measure`'s convention. It separates a call's
+//! fixed cost from what each additional step costs: at 128 steps the fixed cost
+//! is 3.2-9.3 % of the call on this machine, and the marginal rate a step adds is
+//! ~40 GB/s (Q8_0) and ~64 (Q4_K), against 55-78 GB/s for the joined rows above
+//! at wider `n` — so what separates those rows is the column count, not the step
+//! count. It varies step count, not shape, and a
+//! call's fixed cost is not one dispatch's cost (a call is one submission, one
+//! wait and one readback around every dispatch and chunk its steps issue).
+//!
+//! Recorded 2026-10-21 on this machine (Apple M3 Pro, 14-core GPU, wgpu over
+//! Metal), `--release`, min ms per call:
+//!
+//! | steps | Q8_0 k=1024 n=1024 | Q4_K k=2048 n=2048 |
+//! |---|---|---|
+//! | 1 | 0.346 | 0.206 |
+//! | 2 | 0.387 | 0.240 |
+//! | 4 | 0.512 | 0.319 |
+//! | 8 | 0.794 | 0.455 |
+//! | 16 | 1.398 | 0.746 |
+//! | 32 | 1.448 | 1.325 |
+//! | 64 | 2.282 | 2.530 |
+//! | 128 | 3.799 | 4.831 |
+//!
+//! The two extreme points fit to a fixed 219-345 µs and a marginal
+//! 26.5-28.0 µs a step (39.8-42.1 GB/s) for Q8_0, and 152-193 µs with
+//! 36.4-36.9 µs a step (63.9-64.8 GB/s) for Q4_K over three runs. The ranges,
+//! not the middle, are the figure: the steps = 1 point moved 0.247-0.372 ms for
+//! Q8_0 across the runs, the 16-to-32 pair was flat in two of them (a −0.3 µs
+//! marginal at one point), and the fit is a difference of two minima, so it is
+//! not a line through the sweep.
 //!
 //! # Asserted, and not
 //!
@@ -228,7 +301,7 @@ struct Form {
 /// The forms measured: the K-quant arms' predictor geometry (`k = n = 2048`, the
 /// narrowest call a 4-bit model's blocks issue, which its in-graph rate is set by)
 /// and the Q8_0 rows at the widths the code predictor actually multiplies at.
-const FORMS: [Form; 11] = [
+const FORMS: [Form; 20] = [
     Form {
         label: "4-bit FFN gate",
         scheme: QuantScheme::GgufQ4K,
@@ -307,6 +380,27 @@ const FORMS: [Form; 11] = [
         steps: 64,
         packed_bytes_per_step: 2_228_224,
     },
+    // The two widths between the predictor's head and its fused gate+up: same
+    // storage, same contraction, only the column count moving, which is the axis a
+    // one-row arm's columns per workgroup and lane stride are read along.
+    Form {
+        label: "8-bit predictor width 3072",
+        scheme: QuantScheme::GgufQ8_0,
+        k: 1024,
+        n: 3072,
+        widen: 1,
+        steps: 64,
+        packed_bytes_per_step: 3_342_336,
+    },
+    Form {
+        label: "8-bit predictor width 4096",
+        scheme: QuantScheme::GgufQ8_0,
+        k: 1024,
+        n: 4096,
+        widen: 1,
+        steps: 64,
+        packed_bytes_per_step: 4_456_448,
+    },
     Form {
         label: "8-bit predictor gate+up",
         scheme: QuantScheme::GgufQ8_0,
@@ -333,6 +427,74 @@ const FORMS: [Form; 11] = [
         widen: 8,
         steps: 4,
         packed_bytes_per_step: 53_477_376,
+    },
+    // The synthesis loop's own remaining geometries: the talker body's K-quant
+    // rows (`attn_k`/`attn_v` at `n = 1 024`, `attn_q`/`attn_output` at 2 048,
+    // `ffn_down` contracting over 6 144, the fused `gate_up` at 12 288 and the
+    // output head at 3 072) and the code predictor's two `n = 1 024` shapes
+    // (`attn_out`/`proj_in` at `k = 2 048`, `ffn_down` at `k = 3 072`).
+    Form {
+        label: "4-bit attention k/v",
+        scheme: QuantScheme::GgufQ4K,
+        k: 2048,
+        n: 1024,
+        widen: 1,
+        steps: 192,
+        packed_bytes_per_step: 1_179_648,
+    },
+    Form {
+        label: "6-bit attention v",
+        scheme: QuantScheme::GgufQ6K,
+        k: 2048,
+        n: 1024,
+        widen: 1,
+        steps: 128,
+        packed_bytes_per_step: 1_720_320,
+    },
+    Form {
+        label: "4-bit FFN down",
+        scheme: QuantScheme::GgufQ4K,
+        k: 6144,
+        n: 2048,
+        widen: 1,
+        steps: 32,
+        packed_bytes_per_step: 7_077_888,
+    },
+    Form {
+        label: "4-bit FFN gate+up (body width)",
+        scheme: QuantScheme::GgufQ4K,
+        k: 2048,
+        n: 12288,
+        widen: 1,
+        steps: 16,
+        packed_bytes_per_step: 14_155_776,
+    },
+    Form {
+        label: "6-bit output head",
+        scheme: QuantScheme::GgufQ6K,
+        k: 2048,
+        n: 3072,
+        widen: 1,
+        steps: 44,
+        packed_bytes_per_step: 5_160_960,
+    },
+    Form {
+        label: "8-bit predictor attn_out",
+        scheme: QuantScheme::GgufQ8_0,
+        k: 2048,
+        n: 1024,
+        widen: 1,
+        steps: 96,
+        packed_bytes_per_step: 2_228_224,
+    },
+    Form {
+        label: "8-bit predictor ffn down",
+        scheme: QuantScheme::GgufQ8_0,
+        k: 3072,
+        n: 1024,
+        widen: 1,
+        steps: 64,
+        packed_bytes_per_step: 3_342_336,
     },
 ];
 
@@ -487,7 +649,7 @@ fn measure(form: &Form, dev: &rlx_wgpu::device::WgpuDevice) {
     eprintln!(
         "[one-row packed stream] form=\"{}\" scheme={:?} k={} n={} steps={} \
          packed_bytes_per_step={} dispatches_per_step={} submits={submits} waits={waits} \
-         cols_per_workgroup={} threads_per_workgroup={} workgroups={}",
+         arm={} cols_per_workgroup={} threads_per_workgroup={} workgroups={}",
         form.label,
         form.scheme,
         form.k,
@@ -495,6 +657,17 @@ fn measure(form: &Form, dev: &rlx_wgpu::device::WgpuDevice) {
         form.steps,
         form.packed_bytes_per_step,
         dispatches,
+        // Which entry the row took, from the arm id the encoder recorded: the
+        // subgroup arm reads one column per whole subgroup (`wide`) or a pair a
+        // subgroup (`ilp`); the tiled arm splits two columns over a workgroup,
+        // and the legacy Q1_0 arm gives each of 64 threads its own column.
+        match shape.arm {
+            1 => "ilp",
+            2 => "wide",
+            3 => "tiled",
+            4 => "legacy",
+            _ => "unknown",
+        },
         shape.cols_per_workgroup,
         shape.threads_per_workgroup,
         shape.workgroups,
@@ -525,6 +698,10 @@ fn one_row_packed_stream_rate() {
         eprintln!("skip: wgpu unavailable");
         return;
     }
+    // This cell brackets the process-global route and shape counters, and the
+    // dispatch-cost sweep beside it issues thousands of the same one-row calls, so
+    // the two must not run at once: the lock is the crate's (`common::route_lock`).
+    let _route = common::route_lock();
     common::refuse_under_run_report();
     let Some(dev) = wgpu_device() else {
         eprintln!("skip: wgpu unavailable");
@@ -535,7 +712,148 @@ fn one_row_packed_stream_rate() {
          machine load only",
         rlx_wgpu::device::adapter_name()
     );
+    // The wide arm's width is measured, not assumed: report what the probe read,
+    // and whether the arm is therefore admissible on this adapter.
+    match rlx_wgpu::gguf_gpu::gemv_subgroup_probe(&dev.device) {
+        Some((sg, n)) => eprintln!(
+            "[one-row packed stream] subgroup probe: subgroup_size={sg} num_subgroups={n} \
+             wide_cols_per_workgroup={}",
+            128 / sg
+        ),
+        None => eprintln!(
+            "[one-row packed stream] subgroup probe: none (no SUBGROUP feature, or the \
+             probe declined) — the wide arm is refused and every row takes a \
+             workgroup-memory arm"
+        ),
+    }
     for form in &FORMS {
         measure(form, dev);
+    }
+}
+
+/// One call at a swept step count: the same graph `form_graph` builds, its
+/// parameters set, its outputs pinned structurally, then `ROUNDS` rounds of
+/// `CALLS_PER_ROUND` calls — `measure`'s timing convention, reported as its
+/// minimum per call.
+fn swept_min_ms(form: &Form, packed: &[u8], x: &[f32]) -> f64 {
+    let g = form_graph(form, packed.len());
+    let mut c = Session::new(Device::Gpu).compile(g);
+    for s in 0..form.steps {
+        c.set_param_typed(&format!("w{s}"), packed, DType::U8);
+    }
+    let warm = c.run(&[("x", x)]);
+    assert_eq!(warm.len(), form.steps, "one output per step");
+    for (s, out) in warm.iter().enumerate() {
+        assert_eq!(out.len(), form.n, "step {s} output width");
+        let non_finite = out.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(
+            non_finite, 0,
+            "step {s} produced {non_finite} non-finite values"
+        );
+    }
+    let per_call_ms = common::time_rounds(ROUNDS, CALLS_PER_ROUND, || {
+        let _ = c.run(&[("x", x)]);
+    });
+    per_call_ms.iter().cloned().fold(f64::MAX, f64::min)
+}
+
+/// The two geometries the sweep walks: the code predictor's narrowest Q8_0 call
+/// and the 4-bit predictor block, the K-quant arm's narrowest.
+const SWEEP_FORMS: [(&str, QuantScheme, usize, usize); 2] = [
+    ("8-bit predictor down", QuantScheme::GgufQ8_0, 1024, 1024),
+    ("4-bit predictor block", QuantScheme::GgufQ4K, 2048, 2048),
+];
+
+/// The step counts the sweep walks: two doublings past the forms' own, so the
+/// per-call fixed cost separates from the per-step stream.
+const SWEEP_STEPS: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/// Varies the step count at one fixed geometry — not the geometry: a call's fixed
+/// cost is what the two extreme points leave behind, and it is not one dispatch's
+/// cost (a call is one submission, one wait and one readback around every
+/// dispatch its steps issue). Nothing here separates the input row's traffic, the
+/// per-step host work or the unpack arithmetic from the weight stream either;
+/// the marginal rate is only the stream that adding a step adds.
+#[test]
+#[ignore = "measurement, not a gate — run with `--ignored --nocapture`"]
+fn one_row_dispatch_cost() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
+        eprintln!("skip: wgpu unavailable");
+        return;
+    }
+    // The same lock `gguf_one_row_stream_rate`'s other cell takes: both issue the
+    // one-row arm and read its route counters.
+    let _route = common::route_lock();
+    common::refuse_under_run_report();
+    let Some(dev) = wgpu_device() else {
+        eprintln!("skip: wgpu unavailable");
+        return;
+    };
+    eprintln!(
+        "[one-row dispatch cost] adapter={:?} — this cell's figures hold for this adapter and \
+         machine load only",
+        rlx_wgpu::device::adapter_name()
+    );
+    for (label, scheme, k, n) in SWEEP_FORMS {
+        let packed = common::packed_gguf_weight(scheme, k, n);
+        let x = input_row(k);
+        let max_buffer = dev.device.limits().max_buffer_size;
+        let mut points: Vec<(usize, f64)> = Vec::new();
+        for steps in SWEEP_STEPS {
+            let form = Form {
+                label,
+                scheme,
+                k,
+                n,
+                widen: 1,
+                steps,
+                packed_bytes_per_step: packed.len(),
+            };
+            let transient = packed.len() as u64 * steps as u64;
+            if transient > max_buffer {
+                eprintln!(
+                    "[one-row dispatch cost] form=\"{label}\" steps={steps}: the steps' regions \
+                     total {transient} bytes, over this adapter's per-buffer limit \
+                     ({max_buffer}) — skipped rather than allowed to fail opaquely"
+                );
+                continue;
+            }
+            let min_ms = swept_min_ms(&form, &packed, &x);
+            let marginal = points.last().map(|&(prev_steps, prev_ms)| {
+                (min_ms - prev_ms) * 1e3 / (steps - prev_steps) as f64
+            });
+            eprintln!(
+                "[one-row dispatch cost] form=\"{label}\" scheme={scheme:?} k={k} n={n} \
+                 steps={steps} packed_bytes_per_step={} call_bytes={} min_ms={min_ms:.3} \
+                 min_us_per_step={:.1} marginal_us_per_step={}",
+                packed.len(),
+                packed.len() as u64 * steps as u64,
+                min_ms * 1e3 / steps as f64,
+                marginal.map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+            );
+            points.push((steps, min_ms));
+        }
+        // The two extreme points: `t(s) = fixed + s * per_step`, so the slope is
+        // the difference over the step-count difference and the fixed cost is
+        // what the first point leaves after the slope's own steps.
+        let (s0, t0) = *points.first().expect("at least one step count fits");
+        let (s1, t1) = *points.last().expect("at least one step count fits");
+        assert!(
+            s1 > s0,
+            "[one-row dispatch cost] form=\"{label}\": only the step count {s0} fits this \
+             adapter's per-buffer limit, so the per-step slope has no second point and the \
+             marginal rate is not measurable here"
+        );
+        let per_step_us = (t1 - t0) * 1e3 / (s1 - s0) as f64;
+        let fixed_us = t0 * 1e3 - per_step_us * s0 as f64;
+        let marginal_gb_s = packed.len() as f64 / (per_step_us * 1e-6) / 1e9;
+        eprintln!(
+            "[one-row dispatch cost] form=\"{label}\": fit through steps={s0} ({t0:.3} ms) and \
+             steps={s1} ({t1:.3} ms): per_step_us = ({t1:.3} - {t0:.3}) ms x 1e3 / ({s1} - {s0}) \
+             = {per_step_us:.1} us; fixed_us = {t0:.3} ms x 1e3 - {per_step_us:.1} x {s0} = \
+             {fixed_us:.1} us; marginal stream = {} B / {per_step_us:.1} us = \
+             {marginal_gb_s:.1} GB/s",
+            packed.len()
+        );
     }
 }

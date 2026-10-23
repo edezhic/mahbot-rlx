@@ -5,6 +5,14 @@
 //! The stand: the live model paths from the compressed files to their answer, with
 //! the measurement taken on the way.
 //!
+//! Prerequisites for a full run: `MAHBOT_MODELS_DIR` naming the GGUF pairs and
+//! `MAHBOT_VOICE_WAV` naming the 16 kHz voice asset — the checkout carries no
+//! models, and the record pins their SHA-256s. `speak`'s round-trip gate opens the
+//! recognition pair too, and without it the cell runs and prints that the gate did
+//! not. The run rewrites `MEASUREMENTS.md`
+//! unless `MAHBOT_MEASUREMENTS` names another path, and `MAHBOT_STAND_MAX_SWAP_MIB`
+//! raises the swap ceiling the run is held to from its default.
+//!
 //! One entry point and no flags. The acceptance walks four units, each in its own
 //! process: the ear's 12 160-sample wake window (mel with the last frame dropped,
 //! 76 frames, the 1.7B 24-block encoder, the projection, mean over ten tokens, L2,
@@ -605,8 +613,32 @@ pub fn main_entry() {
          For `speak` the recorded `digest` is the **waveform** digest, not the \
          `prompt_digest` its own line prints. `-` is a cell with no speech \
          denominator. Each cell line \
-         prints its own `warm_spread` (the warm runs' max − min, in ms).\n",
+         prints its own `warm_spread` (the warm runs' max − min, in ms). `peak` is the \
+         cell process's own high-water (`ru_maxrss`, which no later drop can lower) and \
+         each cell is its own process, so the figure is the maximum that unit's own \
+         process reached — what it held when it peaked, not what is live when the line \
+         prints. For `speak` the reading is taken before the round-trip gate loads the \
+         recogniser, so the column excludes it (the gate prints its own post-gate \
+         reading as `speak roundtrip peak_mb`). Across this machine's records the \
+         column moves between runs of one tree, and the summary line carries the spread \
+         each run saw as `peak_spread`. \
+         `embed` walks \
+         multi-row multiplies (`m = 256` and `m = 8 192` over a Q4_K stack), which the \
+         row-grouped GEMM carries: the one-row arm's rates are not in its path, so its \
+         figure tracks the machine's ambient state and the packing, not those levers.\n",
     );
+    // The pinned answers themselves, in the record and not only in the run's
+    // stdout: the sentences the two generative surfaces are held to, and the fact
+    // that the comparison is token for token rather than a digest that an
+    // unrelated drift could leave intact.
+    body.push_str(&format!(
+        "\nThe pinned answers, compared token for token: recognition must reproduce \
+         `{}`; the synthesis round trip — the waveform the `speak` row's digest names, \
+         resampled to 16 kHz and read back through the recogniser on its raw samples — \
+         must reproduce `{}`.\n",
+        crate::reference::LISTEN_TRANSCRIPT,
+        crate::reference::SPEAK_TRANSCRIPT,
+    ));
     // The per-phase weight streams, next to the machine's own streaming ceiling:
     // the figure the synthesis and recognition targets are stated in, because a
     // rate is only meaningful against what the same machine delivers on a plain
@@ -697,6 +729,7 @@ pub fn main_entry() {
     body.push_str("\nProvenance:\n\n");
     body.push_str(&format!("- machine: {}\n", crate::measurements::machine()));
     body.push_str(&format!("- device: {}\n", crate::measurements::device()));
+    body.push_str(&format!("- driver: {}\n", crate::measurements::driver()));
     body.push_str(&format!("- profile: {}\n", crate::measurements::profile()));
     body.push_str(&format!(
         "- code: {} (the commit and the SHA-256 of the tree's own difference from it — {} — \
@@ -1089,7 +1122,23 @@ fn printed(v: f64, decimals: i32) -> f64 {
 /// phase's own traffic, not its weight stream. Norms' and attention's small vectors,
 /// gathered table rows (a row read is not the table) and the input side are outside
 /// this figure.
-fn stream_bytes(graph: &rlx_ir::Graph) -> u64 {
+///
+/// Only a node that can reach an output counts, for the same reason: the multiply a
+/// dead branch carries costs no bytes once the runtime's cleanup drops it, and the
+/// predictor's level-0 stack is exactly that — its last block's output feeds nothing
+/// (level 1 embeds the drawn code), so counting it would price a read the schedule
+/// never issues.
+pub fn stream_bytes(graph: &rlx_ir::Graph) -> u64 {
+    let mut live: std::collections::HashSet<rlx_ir::NodeId> =
+        graph.outputs.iter().copied().collect();
+    let mut stack: Vec<rlx_ir::NodeId> = graph.outputs.clone();
+    while let Some(id) = stack.pop() {
+        for &input in &graph.node(id).inputs {
+            if live.insert(input) {
+                stack.push(input);
+            }
+        }
+    }
     let mut total = 0u64;
     for node in graph.nodes() {
         let reads_weights = matches!(
@@ -1099,7 +1148,7 @@ fn stream_bytes(graph: &rlx_ir::Graph) -> u64 {
                 | rlx_ir::Op::Conv { .. }
                 | rlx_ir::Op::ConvTranspose2d { .. }
         );
-        if !reads_weights {
+        if !reads_weights || !live.contains(&node.id) {
             continue;
         }
         let Some(weight) = node.inputs.get(1) else {
@@ -1193,7 +1242,8 @@ fn line(
         );
     }
     // The unit's own summary: build, the two run figures under one rule, the
-    // unit's whole-cell counters and the residency read before any drop.
+    // unit's whole-cell counters and the process peak (`ru_maxrss`, a high-water
+    // mark that covers everything this cell allocated and that no drop lowers).
     let beyond_map = peak.saturating_sub(map_bytes);
     let file_over_rss = map_bytes.saturating_sub(peak);
     println!(
@@ -1338,8 +1388,7 @@ fn ear() {
 
     // The registered target is built and run **after** the measured path, on a
     // separate trio of graphs: its cold pass cannot spend the measured cell's
-    // first pass. It is dropped before the unit's memory read, so the peak is
-    // the measured path alone.
+    // first pass.
     let ref_path = path.clone();
     let ref_audio =
         match host::wav_mono_16k(&ref_path.display().to_string(), EAR_TARGET_OFFSET, samples) {
@@ -1380,10 +1429,10 @@ fn ear() {
     let passes = measured.iter().map(|p| p.passes).sum();
     let cosine = values.iter().zip(&target).map(|(a, b)| a * b).sum::<f32>();
     let o = p;
-    // The target graphs are the calibration, not the measured cell: drop them
-    // before the memory read so the ear's peak is its own path, not a second
-    // encoder. One memory rule for every unit: RSS while the measured graphs and
-    // weights are still resident; the build is not counted.
+    // The target graphs are the calibration, not the measured cell, and are
+    // released before the line's own readings. `peak` below is `ru_maxrss`, the
+    // process high-water mark: it covers the whole cell — its build, the measured
+    // path and this calibration — and no drop can lower it.
     drop(reference);
     drop(tm);
     drop(te);
@@ -1427,47 +1476,58 @@ fn file_bytes(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// The recognition product segment: 30 s → mel → encoder → the 390-row prompt
-/// (3 head + 6 text + 375 audio + 6 tail) → body prefill → at most 2 048 new
-/// tokens on the 2 438-row masked cache. A walk that reaches the budget without
-/// EOS is printed as `unfinished`, not as an answer.
-fn listen() {
-    let pair = match Pair::of_role(Role::Recognition) {
-        Ok(p) => Arc::new(p),
-        Err(e) => {
-            cell_failed!("cell listen — open the pair: {e}");
-        }
-    };
-    let tokenizer = match Tokenizer::from_model(&pair.body) {
-        Ok(t) => t,
-        Err(e) => {
-            cell_failed!("cell listen — tokenizer: {e}");
-        }
-    };
-    let env_path = std::env::var("STAND_ASR_WAV").ok();
-    let path = match env_path {
-        Some(p) => std::path::PathBuf::from(p),
-        None => match crate::loader::voice_wav() {
-            Ok(p) => p,
-            Err(e) => {
-                cell_failed!("cell listen — voice reference: {e}");
-            }
-        },
-    };
-    let offset = std::env::var("STAND_ASR_OFFSET")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let mut audio = match host::wav_mono_16k(&path.display().to_string(), offset, SPEECH_SAMPLES) {
-        Ok(v) => v,
-        Err(e) => {
-            cell_failed!("cell listen — audio: {e}");
-        }
-    };
-    prepare_speech(&mut audio);
+/// What one recognition pass leaves behind: the prompt's geometry, the walk's
+/// answer as ids and as text, the value list the answer digest is taken over, the
+/// phases the stand's line prints, and the prefill's own `Outcome` — the graph
+/// the cell's `arena=` figure is read from.
+struct Recognised {
+    frames: usize,
+    samples: usize,
+    tokens: usize,
+    prompt_rows: usize,
+    capacity: usize,
+    generated: Vec<usize>,
+    written: usize,
+    finished: bool,
+    truncated: bool,
+    text: String,
+    values: Vec<f32>,
+    build_ms: f64,
+    phases: Vec<Phase>,
+    o: Outcome,
+    kv_bytes: usize,
+    decode_ms: f64,
+    decode_stream_bytes: u64,
+    counters: (u64, u64),
+}
+
+/// One recognition pass over 16 kHz mono audio, on the ASR pair's own path: the
+/// mel front end, the encoder, the projector, the prompt's prefill and the greedy
+/// decode on per-layer plane caches. The listen cell measures this walk, and
+/// the speak cell's round-trip gate transcribes its own waveform through the same
+/// function, so the two cells cannot drift: a change to the arithmetic moves both
+/// answers together.
+///
+/// `reps` is the number of warm repetitions each measured phase runs after its
+/// cold pass (`WARM_REPS` in the stand). The gate passes 0 — one cold pass is the
+/// transcript it needs, and a repetition would be a second of the cell's budget
+/// spent on a correctness reading. `cell` names the caller in the
+/// `cell_failed!` messages, which end this process: a recognition that cannot
+/// run is a failed cell in both callers.
+///
+/// The audio is conditioned by the caller and never here: the listen cell applies
+/// [`prepare_speech`], the gate transcribes the raw waveform the synthesis half
+/// produced.
+fn recognise(
+    pair: &Arc<Pair>,
+    tokenizer: &Tokenizer,
+    mut audio: Vec<f32>,
+    reps: usize,
+    cell: &str,
+) -> Recognised {
     let frames = audio.len() / graphs::MEL_HOP;
     if frames == 0 {
-        cell_failed!("cell listen — `{}` gave no speech", path.display());
+        cell_failed!("cell {cell} — the audio gave no speech");
     }
     audio.truncate(frames * graphs::MEL_HOP);
     let samples = audio.len();
@@ -1485,25 +1545,23 @@ fn listen() {
     let mut capacity = prompt_rows + DECODE_CACHE_BUCKET;
     let mut build_ms = 0f64;
 
-    let mut front = match Front::build(&pair, frames) {
+    let mut front = match Front::build(pair, frames) {
         Ok(f) => f,
         Err(e) => {
-            cell_failed!("cell listen — front build: {e}");
+            cell_failed!("cell {cell} — front build: {e}");
         }
     };
     build_ms += front.build_ms();
     let c0 = graphs::device_counts();
     let mut phases = Vec::new();
 
-    let (mel_o, enc_o, proj_o) = front.run(audio, WARM_REPS);
+    let (mel_o, enc_o, proj_o) = front.run(audio, reps);
     phases.push(Phase::single("mel", &mel_o));
     phases.push(Phase::single("encoder", &enc_o));
     phases.push(Phase::single("projector", &proj_o));
     drop(mel_o);
     drop(enc_o);
     drop(front);
-    // Everything the unit built stays resident until the memory read at the end:
-    // the peak is taken before any drop, for every unit.
 
     // The prompt: the tokenizer's real rows, with the thirteen audio rows
     // replaced by the encoder's projected features.
@@ -1523,7 +1581,7 @@ fn listen() {
     let rows = match pair.body.table_rows_f32("token_embd.weight", &picks, cfg.d) {
         Ok(v) => v,
         Err(e) => {
-            cell_failed!("cell listen — reading prompt embeddings: {e}");
+            cell_failed!("cell {cell} — reading prompt embeddings: {e}");
         }
     };
     let prompt_read_ms = t_rows.ms();
@@ -1545,7 +1603,7 @@ fn listen() {
         {
             Ok(b) => b,
             Err(e) => {
-                cell_failed!("cell listen — prompt build: {e}");
+                cell_failed!("cell {cell} — prompt build: {e}");
             }
         };
     build_ms += t.ms();
@@ -1555,7 +1613,7 @@ fn listen() {
         ("cos".into(), cos.iter().map(|v| *v as f32).collect()),
         ("sin".into(), sin.iter().map(|v| *v as f32).collect()),
     ];
-    let mut p = prefill.run(&inputs, WARM_REPS);
+    let mut p = prefill.run(&inputs, reps);
     let mut prefill_phase = Phase::single("prefill", &p);
     // The prompt is part of the measured path: the table read is priced in the
     // same phase as the graph that consumes the rows.
@@ -1590,14 +1648,14 @@ fn listen() {
     {
         Ok(b) => b,
         Err(e) => {
-            cell_failed!("cell listen — decode build: {e}");
+            cell_failed!("cell {cell} — decode build: {e}");
         }
     };
     let t = report::Stopwatch::start();
     let mut decode = build_decode(capacity);
     build_ms += t.ms();
     if !decode.runner.resident_cache_planes(&k_cache, &v_cache) {
-        cell_failed!("cell listen — resident cache refused");
+        cell_failed!("cell {cell} — resident cache refused");
     }
     for rows in k_cache.iter_mut().chain(v_cache.iter_mut()) {
         rows.clear();
@@ -1608,13 +1666,13 @@ fn listen() {
     let mut decode_times: Vec<f64> = Vec::new();
     while !is_asr_eos(next) && generated.len() < ASR_MAX_NEW && written < capacity {
         let t_row = report::Stopwatch::start();
-        let mut hidden = match pair
+        let hidden = match pair
             .body
             .table_rows_f32("token_embd.weight", &[(0, next)], cfg.d)
         {
             Ok(mut v) => v.remove(0),
             Err(e) => {
-                cell_failed!("cell listen — reading token {next}: {e}");
+                cell_failed!("cell {cell} — reading token {next}: {e}");
             }
         };
         let row_read_ms = t_row.ms();
@@ -1629,23 +1687,23 @@ fn listen() {
             ("mask".into(), mask.clone()),
         ];
         // Output order: `hidden`, each layer's K row, its V row, then logits.
-        // One read carries the token's whole answer; the cache rows are fed
-        // device-side.
+        // Only the logits are read back: the next step's input is the sampled
+        // token's embedding, not this row, so asking for it would be a host
+        // return nothing consumes. The cache rows are fed device-side.
         let o = match decode.runner.run_resident_planes(
             &inputs,
             written,
             hkv,
-            &graphs::plane_step_reads(cfg.layers),
+            &[graphs::plane_step_logits(cfg.layers)],
         ) {
             Some(o) => o,
             None => {
-                cell_failed!("cell listen — resident feed refused at {written}");
+                cell_failed!("cell {cell} — resident feed refused at {written}");
             }
         };
         decode_times.push(t.ms() + row_read_ms);
         generated.push(next);
-        next = argmax(&o[1][..vocab]) as usize;
-        hidden = o[0].clone();
+        next = argmax(&o[0][..vocab]) as usize;
         mask[written] = 1.0;
         written += 1;
         // A compiled graph's attention reads its whole `[capacity + 1]` plane,
@@ -1666,13 +1724,13 @@ fn listen() {
                 let k_rows = match decode.runner.read_plane(&format!("k{l}")) {
                     Some(rows) => rows,
                     None => {
-                        cell_failed!("cell listen — reading k{l} at row {written}");
+                        cell_failed!("cell {cell} — reading k{l} at row {written}");
                     }
                 };
                 let v_rows = match decode.runner.read_plane(&format!("v{l}")) {
                     Some(rows) => rows,
                     None => {
-                        cell_failed!("cell listen — reading v{l} at row {written}");
+                        cell_failed!("cell {cell} — reading v{l} at row {written}");
                     }
                 };
                 k_new[l][..live].copy_from_slice(&k_rows[..live]);
@@ -1689,7 +1747,7 @@ fn listen() {
             decode = build_decode(cap);
             build_ms += t.ms();
             if !decode.runner.resident_cache_planes(&k_cache, &v_cache) {
-                cell_failed!("cell listen — resident cache refused at capacity {cap}");
+                cell_failed!("cell {cell} — resident cache refused at capacity {cap}");
             }
             for rows in k_cache.iter_mut().chain(v_cache.iter_mut()) {
                 rows.clear();
@@ -1705,18 +1763,12 @@ fn listen() {
         + decode_phase.step_ms * (decode_phase.iters.saturating_sub(1)) as f64;
     let decode_ms = decode_phase.step_ms;
     phases.push(decode_phase);
-    let cold_ms: f64 = phases.iter().map(|p| p.cold_ms).sum();
-    let warm_ms: f64 = phases.iter().map(|p| p.warm_ms).sum();
-    let passes = phases.iter().map(|p| p.passes).sum();
     let finished = is_asr_eos(next);
     let truncated = !finished && generated.len() >= ASR_MAX_NEW;
     let text = match generated.iter().position(|&id| id == 151704) {
         Some(at) => tokenizer.decode(&generated[at + 1..]),
         None => tokenizer.decode(&generated),
     };
-    if truncated {
-        println!("cell listen — UNFINISHED: the walk used all {ASR_MAX_NEW} tokens without EOS");
-    }
     // The digest covers the answer itself, not just its length: the generated
     // ids, the next token that stopped the walk, and the EOS flag.
     let mut values: Vec<f32> = generated.iter().map(|&v| v as f32).collect();
@@ -1725,6 +1777,101 @@ fn listen() {
     values.push(written as f32);
     // The planes as the walk left them: `2 · layers · (capacity + 1) · hkv` f32.
     let kv_bytes = 2 * cfg.layers * (capacity + 1) * hkv * 4;
+    // The decode graph's own parameter bytes — what one generated token re-reads.
+    let decode_stream_bytes = stream_bytes(&decode.runner.graph);
+    let c = graphs::device_counts();
+    Recognised {
+        frames,
+        samples,
+        tokens,
+        prompt_rows,
+        capacity,
+        generated,
+        written,
+        finished,
+        truncated,
+        text,
+        values,
+        build_ms,
+        phases,
+        o: p,
+        kv_bytes,
+        decode_ms,
+        decode_stream_bytes,
+        counters: (c.0 - c0.0, c.1 - c0.1),
+    }
+}
+
+/// The recognition product segment: the voice clip (17.46 s, 1 746 mel frames)
+/// → mel → encoder → the 234-row prompt (3 head + 6 text + 219 audio + 6 tail)
+/// → body prefill → the greedy walk, 65 tokens on the recorded clip over a
+/// 362-row cache (the prompt plus one 128-row bucket), stopping at EOS or at
+/// `ASR_MAX_NEW`. A walk that reaches the budget without EOS is printed as
+/// `unfinished`, not as an answer.
+fn listen() {
+    let pair = match Pair::of_role(Role::Recognition) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            cell_failed!("cell listen — open the pair: {e}");
+        }
+    };
+    let tokenizer = match Tokenizer::from_model(&pair.body) {
+        Ok(t) => t,
+        Err(e) => {
+            cell_failed!("cell listen — tokenizer: {e}");
+        }
+    };
+    let env_path = std::env::var("STAND_ASR_WAV").ok();
+    let path = match env_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => match crate::loader::voice_wav() {
+            Ok(p) => p,
+            Err(e) => {
+                cell_failed!("cell listen — voice reference: {e}");
+            }
+        },
+    };
+    let offset = std::env::var("STAND_ASR_OFFSET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut audio = match host::wav_mono_16k(&path.display().to_string(), offset, SPEECH_SAMPLES) {
+        Ok(v) => v,
+        Err(e) => {
+            cell_failed!("cell listen — audio: {e}");
+        }
+    };
+    prepare_speech(&mut audio);
+
+    // The measurement walks the same path the round-trip gate transcribes with —
+    // one function, so the two cells' answers move together.
+    let r = recognise(&pair, &tokenizer, audio, WARM_REPS, "listen");
+    let Recognised {
+        frames,
+        samples,
+        tokens,
+        prompt_rows,
+        capacity,
+        generated,
+        written,
+        finished,
+        truncated,
+        text,
+        values,
+        build_ms,
+        phases,
+        o,
+        kv_bytes,
+        decode_ms,
+        decode_stream_bytes,
+        counters,
+    } = r;
+    if truncated {
+        println!("cell listen — UNFINISHED: the walk used all {ASR_MAX_NEW} tokens without EOS");
+    }
+    let cold_ms: f64 = phases.iter().map(|p| p.cold_ms).sum();
+    let warm_ms: f64 = phases.iter().map(|p| p.warm_ms).sum();
+    let passes = phases.iter().map(|p| p.passes).sum();
     let fields = [
         ("frames", frames.to_string()),
         ("rows", tokens.to_string()),
@@ -1750,17 +1897,15 @@ fn listen() {
         // One token's weight stream — the body graph's multiply and conv
         // parameters, which one decode step re-reads — and the step's own seconds.
         // The rate table in `MEASUREMENTS.md` divides the two.
-        (
-            "decode_stream_bytes",
-            stream_bytes(&decode.runner.graph).to_string(),
-        ),
+        ("decode_stream_bytes", decode_stream_bytes.to_string()),
         ("decode_stream_ms", format!("{decode_ms:.3}")),
     ];
-    let o = p;
     let peak = peak_rss();
-    // No drop before this read: the peak is the unit's whole live state.
+    // `peak_rss` is `ru_maxrss`, the process's high-water mark: it reports the peak
+    // the walk reached even though `recognise` dropped its runners and graphs before
+    // returning, so the record attributes it to whoever held it then rather than to
+    // what is live now.
     let map_bytes = file_bytes(&pair.body.path) + file_bytes(&pair.sound.path);
-    let c = graphs::device_counts();
     // The witness is checked before the line prints: a run whose answer moved is
     // a failed run even if its seconds improved. A cell deliberately fed another
     // recording or another generation budget is a different cell, so its answer
@@ -1796,7 +1941,7 @@ fn listen() {
         },
         peak,
         map_bytes,
-        (c.0 - c0.0, c.1 - c0.1),
+        counters,
         samples as f64 / 16_000.0,
         (0.0, 0.0),
     );
@@ -1934,11 +2079,163 @@ fn ear_short(samples: usize, name: &str) {
     );
 }
 
-/// The generation loop: 300 text tokens and 330 codec rows (~26 s).
+/// The speak cell: the synthesis half, then its two quality gates, then the line.
+///
+/// The gates run before the line prints, as they do in `listen`: a run whose
+/// waveform left the PCM range or no longer says the same thing to our own
+/// recogniser is a failed run even if its seconds improved. The round trip needs
+/// the recognition pair; without it the cell still runs and the gate prints that
+/// it did not.
+fn speak() {
+    let Some(Synthesis {
+        frames,
+        fields,
+        wave,
+        prompt_digest,
+        o,
+        phases,
+        steps,
+        peak,
+        map_bytes,
+        counters,
+    }) = speak_synthesis()
+    else {
+        return;
+    };
+    let cell = "speak";
+    // The quality gate, both halves before the line prints — the order `listen`
+    // sets: a run whose waveform no longer says the same thing is a failed run
+    // even if its seconds improved.
+    //
+    // The first half is the waveform itself: nothing clipped (|y| <= 1, the range
+    // a 24 kHz PCM file carries) and nothing non-finite. The pinned waveform is
+    // quiet (max |y| 5.3e-2), so this bar catches a waveform that has run away,
+    // not one that moved in its last bits.
+    let peak_abs = max_abs(&wave);
+    if !peak_abs.is_finite() || peak_abs > 1.0 || non_finite(&wave) != 0 {
+        cell_failed!(
+            "cell speak — the waveform leaves the PCM range: max|y|={} nonfinite={}",
+            sci(peak_abs),
+            non_finite(&wave)
+        );
+    }
+    // The voice is an input, not a switch: the pin holds only for the voice the
+    // witness was recorded with. Another `MAHBOT_VOICE_WAV` records its own
+    // digest rather than failing the pinned one.
+    let other_voice = !crate::reference::voice_is_pinned();
+    let alternate = std::env::var_os("STAND_SPEAK_ROWS").is_some()
+        || std::env::var_os("STAND_SPEAK_TEXT").is_some()
+        || std::env::var_os("STAND_SPEAKER_WAV").is_some()
+        || other_voice;
+    if alternate {
+        println!("witness speak skipped=alternate-input");
+    } else if !crate::reference::check_speak(frames, wave.len(), digest(&wave), prompt_digest) {
+        cell_failed!("cell speak — the waveform is not the pinned reference");
+    }
+
+    // The round trip, after every phase: the waveform this cell just produced,
+    // back through the recogniser. It reads the raw waveform — `prepare_speech`
+    // is the recognition side's conditioning (a loud pre-roll trim and a gain on a
+    // quiet recording), and a gate that conditioned its own input would test a
+    // signal the product never sends. Only the rate changes, 24 kHz to the 16 kHz
+    // the ASR front reads, through the same resampler the listen cell's file goes
+    // through.
+    //
+    // One cold pass costs 5.8 s of the cell's 28.3 s on the recorded models — the
+    // recognition graphs' build and the 107 decode steps at ~25 ms each, which a
+    // switch could not take away without transcribing something other than the
+    // waveform.
+    if alternate {
+        println!("witness speak-roundtrip skipped=alternate-input");
+    } else {
+        report::release_free();
+        let audio = host::resample(&wave, 24_000, 16_000);
+        // The round trip is a check on the synthesis half, not a precondition of
+        // measuring it: a host that carries only the synthesis pair still runs the
+        // cell and says the gate did not. A pair whose files are there but will not
+        // open is a broken pair, not an absent one, and fails the cell.
+        match Pair::of_role_optional(Role::Recognition) {
+            Ok(Some(pair)) => {
+                let tokenizer = match Tokenizer::from_model(&pair.body) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        cell_failed!("cell speak — the round trip's tokenizer: {e}");
+                    }
+                };
+                let heard = recognise(&Arc::new(pair), &tokenizer, audio, 0, "speak").text;
+                if !crate::reference::check_speak_roundtrip(&heard) {
+                    cell_failed!("cell speak — the round trip is not the pinned transcript");
+                }
+                // The gate's pair is the process peak from here on. `peak_rss` is
+                // `ru_maxrss`, a high-water mark, so it cannot say what is live now;
+                // this reading is what the record's note compares the cell's own peak
+                // against.
+                println!("speak roundtrip peak_mb={:.1}", peak_rss() as f64 / 1e6);
+            }
+            Ok(None) => {
+                println!("witness speak-roundtrip skipped=no-recognition-pair reason=files-absent");
+            }
+            Err(e) => {
+                cell_failed!("cell speak — the round trip's recognition pair: {e}");
+            }
+        }
+    }
+
+    // The generation loop (body, predictor, sampler, speaker, prefill) against
+    // the sound half; their sum is the unit's warm figure by construction.
+    let loop_ms: f64 = phases
+        .iter()
+        .filter(|p| !p.name.starts_with("sound"))
+        .map(|p| p.warm_ms)
+        .sum();
+    let sound_total: f64 = phases
+        .iter()
+        .filter(|p| p.name.starts_with("sound"))
+        .map(|p| p.warm_ms)
+        .sum();
+    line(
+        cell,
+        &fields,
+        &o,
+        &wave,
+        &phases,
+        steps,
+        peak,
+        map_bytes,
+        counters,
+        frames as f64 * graphs::samples_per_frame() as f64 / 24_000.0,
+        (loop_ms, sound_total),
+    );
+}
+
+/// What the speak cell's synthesis half produced, and what its gate and its line
+/// read from it.
+///
+/// Owning it is what puts the drop at `speak_synthesis`'s return: the round trip
+/// loads the recogniser's own pair, so the boundary is the function and the
+/// process holds one model pair, not two. A graph the loop grows later is inside
+/// that boundary by construction rather than in a list to be maintained.
+struct Synthesis {
+    frames: usize,
+    fields: Vec<(&'static str, String)>,
+    wave: Vec<f32>,
+    prompt_digest: u64,
+    o: Outcome,
+    phases: Vec<Phase>,
+    steps: Steps,
+    peak: u64,
+    map_bytes: u64,
+    counters: (u64, u64),
+}
+
+/// The speak cell's synthesis half: 300 text tokens and 330 codec rows (~26 s).
 /// Per frame the body step, then the sixteen predictor levels each reading the
 /// code just drawn, then the sum of the sixteen code embeddings plus the next
-/// text hidden row becomes the next frame's input.
-fn speak() {
+/// text hidden row becomes the next frame's input; then the sound half.
+///
+/// Every graph it compiled, and both models, are still resident when the process
+/// peak is read, and all of them are dropped on return — see [`Synthesis`].
+fn speak_synthesis() -> Option<Synthesis> {
     let rows = std::env::var("STAND_SPEAK_ROWS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -2327,8 +2624,6 @@ fn speak() {
     phases.push(Phase::loop_times("body", &body_times, body_nodes));
     phases.push(Phase::loop_times("predictor", &pred_times, pred_nodes));
     phases.push(Phase::loop_times("sampler", &sample_times, 0));
-    // No drop before the peak: `prefill`, `body`, `predictor` and the sound
-    // graphs all stay alive through the sound half.
 
     // The sound half: codes → codebook → wave transformer → DAC.
     let levels = pair
@@ -2459,7 +2754,7 @@ fn speak() {
                 "cell speak — the front returned {} outputs, expected waveform + k/v/left",
                 run.outs.len()
             );
-            return;
+            return None;
         }
         front_nodes = front_nodes.max(run.ops.iter().map(|(_, n)| n).sum());
         let chunk = run.outs[0].clone();
@@ -2515,7 +2810,7 @@ fn speak() {
                 group.end,
                 wave.len()
             );
-            return;
+            return None;
         }
         let (ch_out, per_out) = if group.end == graphs::DAC_STAGES {
             (1, graphs::samples_per_frame())
@@ -2537,7 +2832,7 @@ fn speak() {
                         "cell speak — sound {}..{} at {len} frames build: {e}",
                         group.start, group.end
                     );
-                    return;
+                    return None;
                 }
             }
         }
@@ -2595,7 +2890,7 @@ fn speak() {
             wave.len(),
             frames * graphs::samples_per_frame()
         );
-        return;
+        return None;
     }
     if let Ok(path) = std::env::var("STAND_SPEAK_WAV") {
         if let Err(e) = host::write_wav16(&path, &wave, 24_000) {
@@ -2603,10 +2898,7 @@ fn speak() {
         }
     }
     let rss_sound_graphs = report::resident_rss();
-    let o = match o {
-        Some(o) => o,
-        None => return,
-    };
+    let o = o?;
     let body_total = phases
         .iter()
         .find(|p| p.name == "body")
@@ -2676,12 +2968,12 @@ fn speak() {
             format!("{:?}", &all_codes[0][..all_codes[0].len().min(16)]),
         ),
     ];
-    let cell = "speak";
     let peak = peak_rss();
-    // No drop before the peak: body, predictor, prompt, sound graphs and the
-    // codec all remain resident. The trajectory is read from the process, so the
-    // record attributes the peak to the owners that were live when it was
-    // reached instead of summing plans that were never allocated whole.
+    // Every owner above is still live at this point: `peak_rss` is the process's
+    // high-water mark, so the record attributes the peak to whoever held it when it
+    // was reached instead of summing plans that were never allocated whole, and
+    // everything but this record is dropped on return — before the round trip loads
+    // the recogniser's own pair.
     let map_bytes = file_bytes(&pair.body.path) + file_bytes(&pair.sound.path);
     println!(
         "speak residency start_mb={} prefill_mb={} body_mb={} loop_graphs_mb={} \
@@ -2709,38 +3001,14 @@ fn speak() {
         r.per_row, r.host, r.scratch, r.grouped, r.q1_0_gemm,
     );
     let c = graphs::device_counts();
-    // The generation loop (body, predictor, sampler, speaker, prefill) against
-    // the sound half; their sum is the unit's warm figure by construction.
-    let loop_ms: f64 = phases
-        .iter()
-        .filter(|p| !p.name.starts_with("sound"))
-        .map(|p| p.warm_ms)
-        .sum();
-    let sound_total: f64 = phases
-        .iter()
-        .filter(|p| p.name.starts_with("sound"))
-        .map(|p| p.warm_ms)
-        .sum();
-    // The voice is an input, not a switch: the pin holds only for the voice the
-    // witness was recorded with. Another `MAHBOT_VOICE_WAV` records its own
-    // digest rather than failing the pinned one.
-    let other_voice = !crate::reference::voice_is_pinned();
-    let alternate = std::env::var_os("STAND_SPEAK_ROWS").is_some()
-        || std::env::var_os("STAND_SPEAK_TEXT").is_some()
-        || std::env::var_os("STAND_SPEAKER_WAV").is_some()
-        || other_voice;
-    if alternate {
-        println!("witness speak skipped=alternate-input");
-    } else if !crate::reference::check_speak(frames, wave.len(), digest(&wave), prompt_digest) {
-        cell_failed!("cell speak — the waveform is not the pinned reference");
-    }
-    line(
-        cell,
-        &fields,
-        &o,
-        &wave,
-        &phases,
-        Steps {
+    Some(Synthesis {
+        frames,
+        fields: fields.to_vec(),
+        wave,
+        prompt_digest,
+        o,
+        phases,
+        steps: Steps {
             build_ms,
             cold_ms,
             warm_ms,
@@ -2748,10 +3016,8 @@ fn speak() {
         },
         peak,
         map_bytes,
-        (c.0 - c0.0, c.1 - c0.1),
-        frames as f64 * graphs::samples_per_frame() as f64 / 24_000.0,
-        (loop_ms, sound_total),
-    );
+        counters: (c.0 - c0.0, c.1 - c0.1),
+    })
 }
 
 /// The 8 192-token embedding cell walked one row at a time on a fixed-capacity
