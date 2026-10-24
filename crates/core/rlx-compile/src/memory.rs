@@ -1545,13 +1545,28 @@ fn node_slot_bytes(node: &rlx_ir::Node, policy: ArenaWidthPolicy, keep_native: b
     let f32_wide = || native.max(node.shape.num_elements().unwrap_or(0) * 4);
     let is_param = matches!(node.op, rlx_ir::Op::Param { .. });
     let non_f32_param = is_param && node.shape.dtype() != rlx_ir::DType::F32;
+    // An F16 `Param` is one of the encodings an f32-uniform arena WIDENS at its
+    // host boundary rather than one it stores packed: `set_param_typed` widens
+    // F16 to one f32 lane per element, exactly as it does the small integers.
+    // Sizing such a slot at its native two bytes reserved half the bytes the
+    // upload writes — the write overran the next slot, and the f16 mirror it also
+    // writes (addressed at `offset / 2`, one lane per element) was sized from the
+    // same two-byte slot and so could not hold it, which left an f16 matmul
+    // weight reading an unwritten mirror. `from_plan_split` already gives every
+    // parameter it places in the act arena four bytes per element; this makes the
+    // flat plan agree with it. Packed `U8`/`I8` weights keep their native width.
+    let widened_param = is_param && matches!(node.shape.dtype(), rlx_ir::DType::F16);
     let low_prec_act =
         !is_param && matches!(node.shape.dtype(), rlx_ir::DType::F16 | rlx_ir::DType::BF16);
     match policy {
         ArenaWidthPolicy::Native => native,
         ArenaWidthPolicy::F32Uniform => {
             // packed / quantized WEIGHTS keep native (sub-4-B) width; all else f32.
-            if non_f32_param { native } else { f32_wide() }
+            if non_f32_param && !widened_param {
+                native
+            } else {
+                f32_wide()
+            }
         }
         ArenaWidthPolicy::Hybrid => {
             // params + f16/bf16 activations packed native; everything else f32.

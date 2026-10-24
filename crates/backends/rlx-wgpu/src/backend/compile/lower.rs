@@ -2188,6 +2188,26 @@ pub(crate) fn compile_static_inner(
     // the route's regions — the one term of that route decision the graph's shapes
     // do not settle (see the attention arm and `attention_route`).
     let mut attention_window_declines: usize = 0;
+    // Dense square attention steps the band kernel's admission refused where the
+    // cooperative form was not booked for them, which therefore kept the fused
+    // walk. The refusal is the graph's own shapes (see
+    // `attention_route::band_attention`), so this is a count of the geometry the
+    // dense-through-band route could not take, not of an adapter term;
+    // `RLX_WGPU_DEBUG_ATTN_MASK` names the shape per step.
+    let mut attention_band_declines: usize = 0;
+    // Dense square attention steps the cooperative form's admission took but this
+    // compile could not lower onto it: the adapter does not build
+    // `matmul_coop_f16_f32acc` (features or workgroup storage), the device probe has
+    // not shown it computes `a·b`, the bind window does not reach the plan's
+    // regions, or the output slot lands on a dense Q's bytes. The first two are the
+    // adapter's, the last two the arena's, so a non-zero count names a device,
+    // memory or aliasing term rather than a shape.
+    let mut attention_dense_coop_declines: usize = 0;
+    // The dense attention route's own f16 operand buffer (Kᵀ then V′, in f16
+    // elements), one allocation per compile for every attention node that takes
+    // the cooperative square form. See the route's arm for the layout; the bind
+    // groups it is bound into keep it alive for the executable's lifetime.
+    let mut attn_f16: Option<wgpu::Buffer> = None;
     let mut prev_node: Option<NodeId> = None;
     for node in graph.nodes() {
         if let Some(prev) = prev_node {
@@ -2621,6 +2641,7 @@ pub(crate) fn compile_static_inner(
                     &mm_f16c,
                     &mm_coop,
                     &mm_coop_f32,
+                    None,
                     &arena,
                     base,
                     size,
@@ -5199,6 +5220,10 @@ pub(crate) fn compile_static_inner(
                     v_dense,
                     out_dense,
                     decompose,
+                    band,
+                    band_declined,
+                    dense_coop,
+                    coop_chunk,
                     ..
                 } = plan;
                 let scale = score_scale.unwrap_or(1.0_f32 / (hd as f32).sqrt());
@@ -5389,15 +5414,102 @@ pub(crate) fn compile_static_inner(
                 if decompose && !route_fits {
                     attention_window_declines += 1;
                 }
+                // ── The cooperative dense square form ────────────────────────
+                //
+                // The shape half of this decision is the plan's (`dense_coop`,
+                // device-free and linted in `attention_route`); the adapter's half
+                // is here: the kernel has to build (features and
+                // `kernels::COOP_F16_F32ACC_STORAGE`, 8 448 B, of workgroup
+                // storage) and the device probe has to have shown it computes `a·b`
+                // under the convention both multiplies load with
+                // (`src/coop_probe.rs`). A step the adapter declines keeps the band
+                // arrangement the plan admits underneath it, and is counted so it
+                // says so. A dense Q tile is read where it lies by every chunk's
+                // score multiply, so an output slot on Q's bytes would be corrupted
+                // by the first chunk's value multiply before the second chunk reads
+                // Q. (A compacted Q′ is a copy taken before anything is written, so
+                // only the dense case is a term.) The step keeps the arrangement
+                // below instead.
+                //
+                // Two switches reach this arm and nothing else does: `flag` is read
+                // here, at the point of decision, so a bisect can move either one
+                // mid-process. `RLX_WGPU_MATMUL_F32_ONLY` is the crate's absolute
+                // f32 pin — the conv routes honour it the same way
+                // (`tests/conv_gemm_coop_f32.rs`) — and `RLX_WGPU_NO_DENSE_COOP` is
+                // this form's own decline lever, which every other precision move in
+                // this backend has.
+                let coop_ok = dense_coop
+                    && !rlx_ir::env::flag("RLX_WGPU_MATMUL_F32_ONLY")
+                    && !rlx_ir::env::flag("RLX_WGPU_NO_DENSE_COOP")
+                    && !(q_dense && arena_tensors_overlap(&arena, node.id, q_id))
+                    && crate::kernels::matmul_coop_f16_f32acc_kernel(&dev.device).is_some()
+                    && crate::coop_probe::verified(
+                        &dev.device,
+                        &dev.queue,
+                        crate::coop_probe::CoopKernel::F16F32Acc,
+                    );
+                // One binding for the three readers below — the count, the print
+                // and the arm — so the three cannot drift apart.
+                let coop_taken = coop_ok && route_fits;
+                if dense_coop && !coop_taken {
+                    attention_dense_coop_declines += 1;
+                }
+                // A dense square step the band kernel's admission refused keeps the
+                // fused walk it had, because the cooperative form was not booked for
+                // it. The refusal is the graph's own shapes, so it is counted here
+                // (the schedule report prints the count) and named per step under
+                // the arm's debug switch, rather than left for a timing to show.
+                if band_declined {
+                    attention_band_declines += 1;
+                    if rlx_ir::env::flag("RLX_WGPU_DEBUG_ATTN_MASK")
+                        && let Err(attention_route::AttentionRefusal::BandGeometry {
+                            reason, ..
+                        }) = attention_route::band_attention(
+                            seq_q,
+                            seq_k,
+                            hd,
+                            hd_v,
+                            heads,
+                            nkv,
+                            batch as u64 * heads as u64,
+                        )
+                    {
+                        eprintln!(
+                            "rlx-wgpu Attention node={:?}: dense step not served by the band \
+                             kernel — {reason}",
+                            node.id
+                        );
+                    }
+                }
                 if rlx_ir::env::flag("RLX_WGPU_DEBUG_ATTN_MASK") {
-                    let route = if !decompose {
-                        "fused"
-                    } else if arena.is_sharded() {
-                        "fused (the arena is addressed in stripes)"
-                    } else if !route_fits {
-                        "fused (the bind window does not reach the plan's regions)"
-                    } else {
-                        "decomposed"
+                    // The arrangement is `AttentionPlan::arrangement()`'s, named in
+                    // one place; the guards below only qualify it with the terms the
+                    // plan cannot see — whether the adapter took the cooperative
+                    // form, and for the many-row arm the arena's sharding and bind
+                    // window. The arm dispatches on the same plan fields
+                    // (`coop_taken`, `decompose`, `band`), so the print and the arm
+                    // cannot disagree about which arrangement ran.
+                    use attention_route::AttentionArrangement as Arrangement;
+                    let route = match plan.arrangement() {
+                        Arrangement::DenseCoop if coop_taken => {
+                            "dense cooperative (chunked square, f16 operands / f32 accum)"
+                        }
+                        // A cooperative step the adapter declined keeps what the
+                        // plan admitted underneath it: the band kernel where that
+                        // took the shape, and the fused walk otherwise (the plan
+                        // keeps `decompose` false for it — see
+                        // `AttentionPlan::decompose`).
+                        Arrangement::DenseCoop | Arrangement::Band if band => {
+                            "band (the windowed kernel, one pass over the band's keys)"
+                        }
+                        Arrangement::ManyRow if arena.is_sharded() => {
+                            "fused (the arena is addressed in stripes)"
+                        }
+                        Arrangement::ManyRow if !route_fits => {
+                            "fused (the bind window does not reach the plan's regions)"
+                        }
+                        Arrangement::ManyRow => "decomposed",
+                        Arrangement::DenseCoop | Arrangement::Band | Arrangement::Fused => "fused",
                     };
                     eprintln!(
                         "rlx-wgpu Attention node={:?} mask_kind_id={mask_kind_id} \
@@ -5411,7 +5523,365 @@ pub(crate) fn compile_static_inner(
                         arena.offset(v_id),
                     );
                 }
+                if coop_taken {
+                    // ── The cooperative dense square form ──────────────────────
+                    //
+                    // The many-row arrangement's own three passes — a dense scores
+                    // multiply, the operation's masked normalisation over those
+                    // scores, a dense multiply by V — with both multiplies on
+                    // `matmul_coop_f16_f32acc` (16-bit operands, 32-bit
+                    // accumulation) and the score matrix materialised a chunk of
+                    // query rows at a time. The chunk reuses one scratch region:
+                    // pass `c` consumes its scores before pass `c + 1` writes them,
+                    // so the row extent the plan sizes is `coop_chunk`, not
+                    // `seq_q`, and the whole square never has to exist.
+                    //
+                    // What is deliberately the same as the f32 arrangement below:
+                    // the transposes (Kᵀ, Q′, V′ and the output's), so both
+                    // multiplies load one convention — `coopLoadT` on A and B,
+                    // `coopStoreT` on C, which `src/coop_probe.rs` proves on this
+                    // adapter — and B is a dense `[k, n]` row-major operand for
+                    // both. Kᵀ is what makes the score multiply's B that shape;
+                    // V′ is already it. That is why the transpose steps stay even
+                    // though the form measured here could in principle read K
+                    // untransposed under the other cooperative load: one verified
+                    // convention, not two.
+                    let window_f32 = |byte: u64| ((byte.saturating_sub(base)) / 4) as u32;
+                    let kt_off = window_f32(route_start + offsets.kt);
+                    let scores_off = window_f32(route_start + offsets.scores);
+                    let q_tmp_off = window_f32(route_start + offsets.q);
+                    let v_tmp_off = window_f32(route_start + offsets.v);
+                    let out_tmp_off = window_f32(route_start + offsets.out);
+                    let group = (heads / nkv.max(1)).max(1);
+                    let batch_bh = batch * heads;
+                    // ── The route's own f16 operand buffer ───────────────────────
+                    //
+                    // Both multiplies take B as f16 (`matmul_coop_f16_f32acc`'s B
+                    // convention, and the form this route is measured in), and the
+                    // step's two B operands are activations, so they are
+                    // materialised once per step: Kᵀ and V′ are written as f32 by
+                    // the transposes below, then downcast into this buffer by the
+                    // `CastF32ToF16` pre-passes that follow each of them. The buffer is the route's
+                    // own — neither the arena nor the weight mirror has a region
+                    // for it — and one allocation serves every attention node of
+                    // the graph (the bind groups below keep it alive), grown only
+                    // when a later node needs more.
+                    //
+                    // Its layout is the plan's Kᵀ then V′ region order, in f16
+                    // elements: `tiles · head_dim · seq_k` for Kᵀ, then
+                    // `tiles · seq_k · v_head_dim` for V′. Each GEMM's B tile
+                    // stride is its own `k · n`, which is what the kernel reads a
+                    // `[k, n]` operand with.
+                    // For a `MaskKind::None` step with no softcap the masked-scale
+                    // step below is only `scale · scores`, and the Kᵀ cast walks
+                    // the very operand that scale multiplies — so the scale is
+                    // folded into that cast and the step is not emitted at all.
+                    // With a softcap the step stays: the cap is `c·tanh(s/c)`,
+                    // which is not a scale of an operand.
+                    // A zero scale is not foldable: the param's `0` means "no
+                    // scale", so a step that asks for one keeps the mask pass.
+                    let fold_scale = mask_kind_id == 0
+                        && attn_logit_softcap.unwrap_or(0.0) <= 0.0
+                        && scale != 0.0;
+                    let kt16_elems = (batch as u64)
+                        .saturating_mul(heads as u64)
+                        .saturating_mul(hd as u64)
+                        .saturating_mul(seq_k as u64);
+                    let v16_elems = (batch as u64)
+                        .saturating_mul(heads as u64)
+                        .saturating_mul(seq_k as u64)
+                        .saturating_mul(hd_v as u64);
+                    let need_bytes = (kt16_elems + v16_elems).saturating_mul(2);
+                    if attn_f16.as_ref().is_none_or(|b| b.size() < need_bytes) {
+                        attn_f16 = Some(dev.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("rlx-wgpu attention f16 operands"),
+                            size: need_bytes.max(256),
+                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        }));
+                    }
+                    let attn_f16_buf = attn_f16.as_ref().expect("allocated above");
+                    let emit_coop_matmul =
+                        |schedule: &mut Vec<Step>,
+                         uniforms: &mut Vec<wgpu::Buffer>,
+                         bind_groups: &mut Vec<wgpu::BindGroup>,
+                         m: u32,
+                         k: u32,
+                         n: u32,
+                         a_off: u32,
+                         b_off: u32,
+                         c_off: u32,
+                         a_batch: u32,
+                         c_batch: u32| {
+                            schedule.push(Step::Matmul {
+                                m,
+                                k,
+                                n,
+                                batch: batch_bh,
+                                a_batch_stride: a_batch,
+                                b_batch_stride: k * n,
+                                c_batch_stride: c_batch,
+                                a_off_f32: a_off,
+                                b_off_f32: b_off,
+                                c_off_f32: c_off,
+                                has_bias: 0,
+                                bias_off_f32: 0,
+                                act_id: 0xFFFF,
+                                b_is_param: false,
+                                from_conv1x1: false,
+                                compute_precision: MatmulCompute::CoopF16F32AccScratch,
+                            });
+                            let u = emit_uniform(std::mem::size_of::<MatmulParams>());
+                            let (bg, _) = build_matmul_bind_group(
+                                &dev.device,
+                                mm_k,
+                                mm_w,
+                                &mm_f16w,
+                                mm_bf16w,
+                                &mm_f16c,
+                                &mm_coop,
+                                &mm_coop_f32,
+                                Some(attn_f16_buf),
+                                &arena,
+                                base,
+                                size,
+                                &u,
+                                false,
+                                MatmulCompute::CoopF16F32AccScratch,
+                                k,
+                                n,
+                                batch_bh,
+                                b_off,
+                                k * n,
+                            );
+                            uniforms.push(u);
+                            bind_groups.push(bg);
+                        };
+                    // 1. Kᵀ, as above: the score multiply's B is `[k=D, n=S_k]`, and
+                    //    a grouped KV head becomes one tile per query head.
+                    emit_transpose(
+                        &mut schedule,
+                        &mut uniforms,
+                        &mut bind_groups,
+                        &mut meta_buffers,
+                        &arena,
+                        "rlx-wgpu attention route transpose meta",
+                        base,
+                        size,
+                        &[batch, nkv, group, hd, seq_k],
+                        &[k_b, k_h, 0, 1, k_s],
+                        0,
+                        k_off,
+                        kt_off,
+                        None,
+                    );
+                    // 1b. Kᵀ as f16, once per step: B of every chunk's score
+                    //     multiply.
+                    crate::backend::push_cast_f32_to_f16_step(
+                        &dev.device,
+                        &arena,
+                        base,
+                        size,
+                        &mut schedule,
+                        &mut uniforms,
+                        &mut bind_groups,
+                        &mm_cast,
+                        Some((attn_f16_buf, 0)),
+                        if fold_scale { scale.to_bits() } else { 0 },
+                        kt_off,
+                        kt16_elems as u32,
+                    );
+                    // 2. Q′: only when Q's per-head tile is not already dense.
+                    if !q_dense {
+                        emit_transpose(
+                            &mut schedule,
+                            &mut uniforms,
+                            &mut bind_groups,
+                            &mut meta_buffers,
+                            &arena,
+                            "rlx-wgpu attention route transpose meta",
+                            base,
+                            size,
+                            &[batch, heads, seq_q, hd],
+                            &[q_b, q_h, q_s, 1],
+                            0,
+                            q_off,
+                            q_tmp_off,
+                            None,
+                        );
+                    }
+                    // 3. V′: only when V's tile is not already a dense `[S_k, D_v]`.
+                    if !v_dense {
+                        emit_transpose(
+                            &mut schedule,
+                            &mut uniforms,
+                            &mut bind_groups,
+                            &mut meta_buffers,
+                            &arena,
+                            "rlx-wgpu attention route transpose meta",
+                            base,
+                            size,
+                            &[batch, nkv, group, seq_k, hd_v],
+                            &[v_b, v_h, 0, v_s, 1],
+                            0,
+                            v_off,
+                            v_tmp_off,
+                            None,
+                        );
+                    }
+                    // 3b. V′ as f16, once per step: B of every chunk's value
+                    //     multiply. Read from the compacted region when the
+                    //     transpose ran, from V's own dense tiles when it did not
+                    //     — both are `tiles` dense `[seq_k, hd_v]` blocks.
+                    crate::backend::push_cast_f32_to_f16_step(
+                        &dev.device,
+                        &arena,
+                        base,
+                        size,
+                        &mut schedule,
+                        &mut uniforms,
+                        &mut bind_groups,
+                        &mm_cast,
+                        Some((attn_f16_buf, kt16_elems as u32)),
+                        0,
+                        if v_dense { v_off } else { v_tmp_off },
+                        v16_elems as u32,
+                    );
+                    // 4. Per chunk of query rows: the scores multiply, the mask and
+                    //    the softmax over them, then the value multiply into the
+                    //    output scratch at that chunk's rows. Every offset below is
+                    //    a whole number of rows of its own operand, and the chunk is
+                    //    a multiple of 64 while the remainder is too (the admission),
+                    //    so each dispatch is a whole number of cooperative tiles and
+                    //    the store guard never has to mask a row.
+                    let mut row = 0u32;
+                    while row < seq_q {
+                        let m = coop_chunk.min(seq_q - row);
+                        emit_coop_matmul(
+                            &mut schedule,
+                            &mut uniforms,
+                            &mut bind_groups,
+                            m,
+                            hd,
+                            seq_k,
+                            if q_dense { q_off } else { q_tmp_off } + row * hd,
+                            0,
+                            scores_off,
+                            seq_q * hd,
+                            m * seq_k,
+                        );
+                        if !fold_scale {
+                            let ap = AttentionMaskParams {
+                                rows: batch_bh * m,
+                                cols: seq_k,
+                                seq_q: m,
+                                heads,
+                                scale_bits: scale.to_bits(),
+                                mask_kind: mask_kind_id,
+                                window,
+                                scores_off,
+                                mask_off,
+                                mask_batch_stride: m_b,
+                                mask_head_stride: m_h,
+                                seq_q_stride: m_q,
+                                seq_k_stride: m_k,
+                                logit_softcap_bits: cap_bits,
+                                _p1: 0,
+                                _p2: 0,
+                            };
+                            schedule.push(Step::AttentionMask { params: ap });
+                            let u = emit_uniform(std::mem::size_of::<AttentionMaskParams>());
+                            let bg = bind_arena_window(
+                                &dev.device,
+                                attention_mask_kernel(&dev.device),
+                                &arena,
+                                base,
+                                size,
+                                &u,
+                            );
+                            uniforms.push(u);
+                            bind_groups.push(bg);
+                        }
+                        let sp = SoftmaxParams {
+                            outer: batch_bh * m,
+                            inner: seq_k,
+                            in_off: scores_off,
+                            out_off: scores_off,
+                            _p0: 0,
+                            _p1: 0,
+                            _p2: 0,
+                            _p3: 0,
+                        };
+                        schedule.push(Step::Softmax { params: sp });
+                        let u = emit_uniform(std::mem::size_of::<SoftmaxParams>());
+                        let bg = bind_arena_window(
+                            &dev.device,
+                            softmax_kernel(&dev.device),
+                            &arena,
+                            base,
+                            size,
+                            &u,
+                        );
+                        uniforms.push(u);
+                        bind_groups.push(bg);
+                        // The output region is chunk-sized and rewritten per chunk,
+                        // so the chunk's own permute into the slot follows its
+                        // multiply before the next chunk overwrites the region —
+                        // the same `(b, h, rows, width)` → `(b, rows, h, width)`
+                        // move the f32 arrangement does once at the end.
+                        emit_coop_matmul(
+                            &mut schedule,
+                            &mut uniforms,
+                            &mut bind_groups,
+                            m,
+                            seq_k,
+                            hd_v,
+                            scores_off,
+                            kt16_elems as u32,
+                            if out_dense {
+                                out_off + row * hd_v
+                            } else {
+                                out_tmp_off
+                            },
+                            m * seq_k,
+                            if out_dense {
+                                seq_q * hd_v
+                            } else {
+                                coop_chunk * hd_v
+                            },
+                        );
+                        if !out_dense {
+                            let (h_chunk_dv, chunk_dv) =
+                                (heads * coop_chunk * hd_v, coop_chunk * hd_v);
+                            emit_transpose(
+                                &mut schedule,
+                                &mut uniforms,
+                                &mut bind_groups,
+                                &mut meta_buffers,
+                                &arena,
+                                "rlx-wgpu attention route transpose meta",
+                                base,
+                                size,
+                                &[batch, m, heads, hd_v],
+                                &[h_chunk_dv, hd_v, chunk_dv, 1],
+                                0,
+                                out_tmp_off,
+                                out_off + row * heads * hd_v,
+                                None,
+                            );
+                        }
+                        row += m;
+                    }
+                    continue;
+                }
                 if decompose && route_fits {
+                    // Never the fallback for a step the plan booked the
+                    // cooperative form's regions for: those are sized at one chunk
+                    // of query rows, while this arrangement's `scores` region holds
+                    // the whole `seq_q × seq_k` square — `plan_attention` keeps
+                    // `decompose` false for such a step for exactly that reason, so
+                    // reaching here means the plan sized this arm's own square.
+                    //
                     // The regions the route bumps through, in the plan's fixed
                     // order (Kᵀ, the scores, then the compactions the operand
                     // layouts force). Each is already a 256-byte multiple, so
@@ -5471,6 +5941,7 @@ pub(crate) fn compile_static_inner(
                             &mm_f16c,
                             &mm_coop,
                             &mm_coop_f32,
+                            None,
                             &arena,
                             base,
                             size,
@@ -5744,7 +6215,14 @@ pub(crate) fn compile_static_inner(
                     v_off,
                     out_off: kernel_out_off,
                     mask_off,
-                    mask_kind: mask_kind_id,
+                    // The band kernel's dispatch id: kind 5 for a windowed step
+                    // and for a dense square one it serves (whose `window` is the
+                    // key extent), the op's own kind for everything else.
+                    mask_kind: if band {
+                        attention_route::BAND_MASK_KIND
+                    } else {
+                        mask_kind_id
+                    },
                     scale_bits: scale.to_bits(),
                     window,
                     // Mask strides — derive from the mask's IR shape:
@@ -5863,6 +6341,10 @@ pub(crate) fn compile_static_inner(
                     }
                     MaskKind::Bias => (4u32, (arena.offset(node.inputs[4]) / 4) as u32, None, 0u32),
                     MaskKind::SlidingWindow(w) => (3u32, 0u32, None, *w as u32),
+                    MaskKind::Window(_) => panic!(
+                        "rlx-wgpu AttentionBackward: a two-sided band (MaskKind::Window) has no \
+                         backward here"
+                    ),
                 };
                 struct MStrides {
                     b: u32,
@@ -6990,6 +7472,7 @@ pub(crate) fn compile_static_inner(
                         &mm_f16c,
                         &mm_coop,
                         &mm_coop_f32,
+                        None,
                         &arena,
                         base,
                         size,
@@ -13486,6 +13969,28 @@ pub(crate) fn compile_static_inner(
                  step."
             );
         }
+        if attention_band_declines > 0 {
+            eprintln!(
+                "    attention: {attention_band_declines} dense square step(s) kept the \
+                 fused walk because the band kernel's admission refused their shapes \
+                 (head width, chunk count or dispatch grid) where the cooperative form \
+                 was not booked for them. RLX_WGPU_DEBUG_ATTN_MASK names the shape and \
+                 the conjunct per step."
+            );
+        }
+        if attention_dense_coop_declines > 0 {
+            eprintln!(
+                "    attention: {attention_dense_coop_declines} dense square step(s) whose \
+                 shapes the cooperative form admits kept another arrangement: the adapter \
+                 does not build `matmul_coop_f16_f32acc` (SHADER_F16, \
+                 EXPERIMENTAL_COOPERATIVE_MATRIX or its {} B of workgroup storage), the \
+                 device probe has not shown it computes a·b, the bind window does not \
+                 reach the plan's regions, or RLX_WGPU_NO_DENSE_COOP / \
+                 RLX_WGPU_MATMUL_F32_ONLY declined it. RLX_WGPU_DEBUG_ATTN_MASK names the \
+                 route per step.",
+                crate::kernels::COOP_F16_F32ACC_STORAGE
+            );
+        }
         for (n, c) in &counts {
             eprintln!("    {c:>4} × {n}");
         }
@@ -13546,6 +14051,8 @@ pub(crate) fn compile_static_inner(
         im2col_fallbacks,
         conv1d_implicit_declines,
         attention_window_declines,
+        attention_band_declines,
+        attention_dense_coop_declines,
     }
 }
 

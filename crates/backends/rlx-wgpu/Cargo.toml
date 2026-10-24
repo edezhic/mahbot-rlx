@@ -94,6 +94,30 @@ name = "attention_cached_decode_route"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "attention_band_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "attention_band_cost"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "attention_dense_coop_cost"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "attention_dense_coop_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "encoder_gemm_cost"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "matmul_f16_f32acc_parity"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "narrow_last_axis_vec4"
 required-features = ["backend-tests"]
 

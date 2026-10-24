@@ -73,8 +73,8 @@ impl Graph {
     }
 
     /// Scaled dot-product attention with a kernel-synthesized mask
-    /// (`None` / `Causal` / `SlidingWindow`). Inputs are Q, K, V only —
-    /// no mask tensor is allocated or read in the inner loop. Use
+    /// (`None` / `Causal` / `SlidingWindow` / `Window`). Inputs are Q, K, V
+    /// only — no mask tensor is allocated or read in the inner loop. Use
     /// `MaskKind::None` for a single un-padded sequence.
     pub fn attention_kind(
         &mut self,

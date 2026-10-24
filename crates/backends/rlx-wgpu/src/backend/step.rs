@@ -26,6 +26,7 @@ use crate::kernels::{
     UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
 };
 
+use super::attention_route::BAND_MASK_KIND;
 use super::helpers::{MatmulCompute, MatmulQkvKind};
 
 /// f32 → f16 element-wise cast, mirroring an arena region into the
@@ -40,10 +41,19 @@ use super::helpers::{MatmulCompute, MatmulQkvKind};
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CastF32ToF16Params {
-    pub src_off: u32, // f32-element offset into arena (also f16-element offset)
+    /// f32-element offset into the arena window.
+    pub src_off: u32,
     pub len: u32,
-    pub _p0: u32,
-    pub _p1: u32,
+    /// f16-element offset into whichever f16 buffer this step binds: the weight
+    /// mirror, where it equals `src_off` (the mirror's index is the arena's), or
+    /// the dense attention route's own operand buffer, where it is that buffer's
+    /// region start.
+    pub dst_off: u32,
+    /// A scalar applied on the way through, bitcast: `0` is "none" (the value is
+    /// written as it is). The dense attention route folds the score scale into
+    /// its Kᵀ cast, which is the one pass that already walks those operands —
+    /// that is what lets the route spend no pass at all on the masked scale.
+    pub scale_bits: u32,
 }
 unsafe impl bytemuck::Pod for CastF32ToF16Params {}
 unsafe impl bytemuck::Zeroable for CastF32ToF16Params {}
@@ -1670,6 +1680,11 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ConcatHostPieces { .. } => "concat_host_pieces",
         Step::Gather { .. } => "gather",
         Step::GatherAxis { .. } => "gather_axis",
+        // The two-sided band kernel is a different pipeline from the fused
+        // entry's (`kernels::attention_band_kernel`, picked from the mask kind),
+        // so the schedule report names it rather than folding it into
+        // `"attention"`: a kind-5 step's cost is the band's, not a dense pass's.
+        Step::Attention { params, .. } if params.mask_kind == BAND_MASK_KIND => "attention_band",
         Step::Attention { .. } => "attention",
         Step::AttentionBackward { .. } => "attention_bwd",
         Step::Rope { .. } => "rope",

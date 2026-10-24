@@ -709,6 +709,18 @@ pub fn execute(graph: &Graph, arena: &mut Arena, external: &ExternalBuffers) {
                                     }
                                 }
                             }
+                            rlx_ir::op::MaskKind::Window(w) => {
+                                for qi in 0..s_q {
+                                    let abs_q = q_offset + qi;
+                                    let lo = abs_q.saturating_sub(*w);
+                                    let hi = abs_q + *w;
+                                    for ki in 0..s_k {
+                                        if ki < lo || ki > hi {
+                                            scores[qi * s_k + ki] = -1e9;
+                                        }
+                                    }
+                                }
+                            }
                             rlx_ir::op::MaskKind::Custom => {
                                 if mask.len() >= (bi + 1) * s_k {
                                     let m = &mask[bi * s_k..(bi + 1) * s_k];

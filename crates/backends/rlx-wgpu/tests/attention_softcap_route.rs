@@ -85,6 +85,7 @@ const FUSED: Case = Case {
         decode: 0,
         decomposed: 0,
         serial: 1,
+        band: 0,
     },
     bar: 1e-6,
     scale: 1.0,
@@ -103,6 +104,7 @@ const DECODE: Case = Case {
         decode: 1,
         decomposed: 0,
         serial: 0,
+        band: 0,
     },
     bar: 1e-5,
     scale: 1.0,
@@ -122,6 +124,7 @@ const DENSE: Case = Case {
         decode: 0,
         decomposed: 1,
         serial: 0,
+        band: 0,
     },
     bar: 1e-6,
     scale: 1.0,
@@ -550,6 +553,7 @@ fn reference(
                         MaskKind::None | MaskKind::Bias => false,
                         MaskKind::Causal => s > q_abs,
                         MaskKind::SlidingWindow(w) => s > q_abs || q_abs - s > w,
+                        MaskKind::Window(w) => s + w < q_abs || q_abs + w < s,
                         MaskKind::Custom => mask.expect("a custom mask")[bi * lk + s] < 0.5,
                     };
                     if excluded {

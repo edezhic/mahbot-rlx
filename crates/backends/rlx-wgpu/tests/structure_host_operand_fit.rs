@@ -12,12 +12,15 @@
 //! and only where the graph flagged the operand as a parameter's storage — the flag the
 //! step carries, the same gate `scan_host::assert_host_reads_fit` applies.
 //!
-//! The interesting geometry needs no ceiling lever: an `F16` parameter in the ordinary
-//! unsplit arena keeps a two-byte-per-element slot, while the step reads four bytes per
+//! The interesting geometry needs no ceiling lever: a `Bool` parameter in the ordinary
+//! unsplit arena keeps a one-byte-per-element slot, while the step reads four bytes per
 //! element, so the read runs past it and must be refused. An `F32` parameter of the same
 //! shape is the control — accepted, and computed. Running every arm the lever reaches
 //! with that parameter is also what makes each arm's carried flag load-bearing: with the
-//! flag false the net is a no-op and the `F16` read is staged instead of refused.
+//! flag false the net is a no-op and the `Bool` read is staged instead of refused.
+//! (`F16` was this file's example until the flat plan started reserving the four bytes
+//! per element its upload writes — the width `from_plan_split` already gave it; see
+//! `tests/host_route_operand_fit.rs`.)
 //! `ConcatHostPieces` is the one host arm the lever does not reach — it needs a mixed
 //! GPU/host concat, which `RLX_WGPU_FORCE_HOST` never produces (it hosts every input,
 //! giving `ConcatHost`) — and its flag is pushed in the same loop as its operand list, so
@@ -99,7 +102,7 @@ fn refusal(graph: Graph, op: &str, why: &str) {
     // read them from the arena's parameter record rather than from a descriptor, so a
     // stand-in would be a false statement about a parameter of another encoding.
     assert!(
-        msg.contains("F16") && msg.contains("2 bytes per element"),
+        msg.contains("Bool") && msg.contains("1 byte per element"),
         "{why}: the refusal must name the operand's real encoding and width; got {msg}"
     );
 }
@@ -145,17 +148,17 @@ fn structural_host_reads_are_bounded_by_what_the_arena_holds() {
         );
     }
 
-    // An F16 parameter: the flat plan gave it two bytes per element while the step reads
+    // A Bool parameter: the flat plan gave it one byte per element while the step reads
     // four, so the read runs past it.
     refusal(
-        narrow_graph("structure-fit-f16", DType::F16),
+        narrow_graph("structure-fit-bool", DType::Bool),
         "Narrow",
-        "an in-arena F16 parameter at a structural host step",
+        "an in-arena Bool parameter at a structural host step",
     );
 
     // The other host-structural arms the lever reaches: each is a step variant of its
     // own, and each carries the parameter flag its net gates on, so each is run here —
-    // the F32 graph accepted, the F16 one refused.
+    // the F32 graph accepted, the Bool one refused.
     for (arm, build, op) in [
         (
             "transpose",
@@ -167,9 +170,9 @@ fn structural_host_reads_are_bounded_by_what_the_arena_holds() {
     ] {
         accepted(build(&format!("structure-fit-{arm}-f32"), DType::F32), op);
         refusal(
-            build(&format!("structure-fit-{arm}-f16"), DType::F16),
+            build(&format!("structure-fit-{arm}-bool"), DType::Bool),
             op,
-            "an in-arena F16 parameter at a structural host step",
+            "an in-arena Bool parameter at a structural host step",
         );
     }
 }

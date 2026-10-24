@@ -777,8 +777,8 @@ fn where_select(g: &mut Graph, cond: NodeId, on_true: NodeId, on_false: NodeId) 
     g.add_node(Op::Where, vec![cond, on_true, on_false], s)
 }
 
-/// Additive 0 / `-inf` mask for [`MaskKind::Causal`] and [`MaskKind::SlidingWindow`],
-/// matching `apply_synthetic_mask` in `rlx-cpu`.
+/// Additive 0 / `-inf` mask for [`MaskKind::Causal`], [`MaskKind::SlidingWindow`]
+/// and [`MaskKind::Window`], matching `apply_synthetic_mask` in `rlx-cpu`.
 fn synthetic_additive_mask_data(
     bh: usize,
     q_seq: usize,
@@ -805,6 +805,20 @@ fn synthetic_additive_mask_data(
                     let lo = abs_q.saturating_sub(w);
                     for ki in 0..k_seq {
                         if ki < lo || ki > abs_q {
+                            buf[bh_i * q_seq * k_seq + qi * k_seq + ki] = ATTN_MASK_NEG_INF;
+                        }
+                    }
+                }
+            }
+        }
+        MaskKind::Window(w) => {
+            for bh_i in 0..bh {
+                for qi in 0..q_seq {
+                    let abs_q = q_offset + qi;
+                    let lo = abs_q.saturating_sub(w);
+                    let hi = abs_q + w;
+                    for ki in 0..k_seq {
+                        if ki < lo || ki > hi {
                             buf[bh_i * q_seq * k_seq + qi * k_seq + ki] = ATTN_MASK_NEG_INF;
                         }
                     }
@@ -924,7 +938,10 @@ fn apply_attn_score_mask(
         scores = g.add(scores, mask_b);
     }
 
-    if matches!(mask_kind, MaskKind::Causal | MaskKind::SlidingWindow(_)) {
+    if matches!(
+        mask_kind,
+        MaskKind::Causal | MaskKind::SlidingWindow(_) | MaskKind::Window(_)
+    ) {
         let data = synthetic_additive_mask_data(bh, q_seq, k_seq, mask_kind);
         let additive = f32_tensor_const(data, scores_shape.clone(), g);
         scores = g.add(scores, additive);

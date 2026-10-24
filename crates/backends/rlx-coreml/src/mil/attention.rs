@@ -448,6 +448,9 @@ impl<'a> LowerCtx<'a> {
                 )?;
                 cur = masked;
             }
+            MaskKind::Window(_) => {
+                panic!("two-sided attention band (MaskKind::Window) is not implemented on CoreML")
+            }
         }
         Ok(cur)
     }

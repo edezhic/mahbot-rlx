@@ -276,6 +276,10 @@ pub enum QrPart {
 ///      ever exists.
 ///
 /// `Custom` is the existing path — read mask values from the 4th input.
+///
+/// New variants are appended at the end: bincode encodes the declaration order
+/// as the discriminant, so an insertion renumbers every later kind and silently
+/// mis-decodes previously baked `.rlx` files and stale LIR AOT caches.
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MaskKind {
@@ -295,6 +299,11 @@ pub enum MaskKind {
     /// and other learned position biases reuse the fast `Op::Attention`
     /// path instead of decomposing into matmul + add + softmax + matmul.
     Bias,
+    /// Two-sided window — position `qi` attends to `ki ∈ [qi - w, qi + w]`.
+    /// The band a bidirectional encoder's local layers use (Gemma's encoder:
+    /// `w` = 512 over a ±512 window). Unlike [`MaskKind::SlidingWindow`] there
+    /// is no causal edge, so `|qi - ki| > w` is the whole rule.
+    Window(usize),
 }
 
 /// Which forward input an [`Op::AttentionBackward`] node differentiates.
@@ -1073,8 +1082,8 @@ pub enum Op {
     /// Scaled dot-product attention: Q, K, V, \[mask\] → output.
     /// The compiler can lower this to fused SDPA or flash attention.
     /// `mask_kind` controls how masking is applied — `Custom` reads from
-    /// the 4th input tensor; `None` / `Causal` / `SlidingWindow` skip the
-    /// mask load and apply the mask directly in the inner loop. See
+    /// the 4th input tensor; `None` / `Causal` / `SlidingWindow` / `Window`
+    /// skip the mask load and apply the mask directly in the inner loop. See
     /// `MaskKind` for the rationale.
     ///
     /// `score_scale`: when `Some(s)`, dot-product scores are multiplied by
@@ -3671,6 +3680,9 @@ impl std::fmt::Display for Op {
                     MaskKind::SlidingWindow(w) => {
                         format!("attention(h={num_heads},d={head_dim},sw={w})")
                     }
+                    MaskKind::Window(w) => {
+                        format!("attention(h={num_heads},d={head_dim},band={w})")
+                    }
                     MaskKind::Bias => format!("attention(h={num_heads},d={head_dim},bias)"),
                 };
                 if let Some(vd) = v_head_dim {
@@ -3989,6 +4001,9 @@ impl std::fmt::Display for Op {
                 }
                 MaskKind::SlidingWindow(w) => {
                     write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},sw={w})")
+                }
+                MaskKind::Window(w) => {
+                    write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},band={w})")
                 }
                 MaskKind::Custom => {
                     write!(f, "attn_bwd_{wrt:?}(h={num_heads},d={head_dim},custom)")
@@ -4621,5 +4636,85 @@ mod arity_tests {
             }
             assert!(a.accepts(a.min_operands()), "{op} rejects its own minimum");
         }
+    }
+}
+
+#[cfg(test)]
+mod mask_kind_encoding_tests {
+    use super::*;
+
+    /// bincode encodes serde's *declaration index* as the discriminant, and that
+    /// is what the `.rlx` format and the LIR AOT cache store. `Window` was added
+    /// without bumping either format version, which is only sound while every
+    /// existing kind keeps its position; an insertion ahead of `Custom` / `Bias`
+    /// renumbers them and silently mis-decodes an existing model. Pinned from
+    /// source text, in the spirit of the subgraph-accessor drift guard above, so
+    /// it runs in the plain (no `serialize`) test gate.
+    #[test]
+    fn mask_kind_variants_stay_append_only() {
+        let src = include_str!("op.rs");
+        let head = "pub enum MaskKind {";
+        let start = src.find(head).expect("MaskKind enum") + head.len();
+        let body = &src[start..];
+        let body = &body[..body.find("\n}").expect("MaskKind body end")];
+        // Every non-doc, non-blank line in the body is one variant declaration.
+        let declared: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("///"))
+            .map(|line| line.trim_end_matches(','))
+            .collect();
+        assert_eq!(
+            declared,
+            [
+                "None",
+                "Causal",
+                "SlidingWindow(usize)",
+                "Custom",
+                "Bias",
+                "Window(usize)",
+            ],
+            "MaskKind declaration order changed; bincode encodes it as the \
+             discriminant, so a new kind must be appended and the existing five \
+             must keep their slots"
+        );
+    }
+
+    /// `Display` is what the schedules and dumps are keyed on; keep the
+    /// pre-existing spellings, and give the appended band its own.
+    #[test]
+    fn mask_kind_display_is_unchanged() {
+        let attention = |mask_kind| Op::Attention {
+            num_heads: 2,
+            head_dim: 8,
+            v_head_dim: None,
+            mask_kind,
+            score_scale: None,
+            attn_logit_softcap: None,
+        };
+        assert_eq!(
+            attention(MaskKind::None).to_string(),
+            "attention(h=2,d=8,nomask)"
+        );
+        assert_eq!(
+            attention(MaskKind::Causal).to_string(),
+            "attention(h=2,d=8,causal)"
+        );
+        assert_eq!(
+            attention(MaskKind::SlidingWindow(4)).to_string(),
+            "attention(h=2,d=8,sw=4)"
+        );
+        assert_eq!(
+            attention(MaskKind::Custom).to_string(),
+            "attention(h=2,d=8)"
+        );
+        assert_eq!(
+            attention(MaskKind::Bias).to_string(),
+            "attention(h=2,d=8,bias)"
+        );
+        assert_eq!(
+            attention(MaskKind::Window(4)).to_string(),
+            "attention(h=2,d=8,band=4)"
+        );
     }
 }

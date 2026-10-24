@@ -28,8 +28,11 @@ pub mod kernel_schedule_port;
 #[cfg(feature = "schedule-codegen")]
 pub mod kernel_schedule_emit;
 pub use backend::bf16_packed_dispatch_count;
+pub use backend::coop_f16_f32acc_admits;
+pub use backend::coop_f16_f32acc_dispatch_count;
 pub use backend::coop_f32_direct_dispatch_count;
 pub use backend::coop_f32_dispatch_count;
+pub use backend::f32_matmul_pinned;
 /// Host-step planning: what a compiled schedule asks the CPU to do, and which
 /// of those asks are independent enough to share a sync point.
 pub use backend::{HostBatch, HostGroup, HostIo, HostPlan, Region};
@@ -94,4 +97,4 @@ pub fn is_available() -> bool {
     device::wgpu_device().is_some()
 }
 
-pub use device::{is_vulkan_available, select_vulkan_backend, wgpu_device};
+pub use device::{is_vulkan_available, select_vulkan_backend, shader_f16_supported, wgpu_device};

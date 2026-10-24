@@ -9,11 +9,11 @@
 //! single device dispatches every (graph, op) pair against a cached
 //! compilation.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use bytemuck::{Pod, Zeroable};
-
 pub const MATMUL_WGSL: &str = include_str!("matmul.wgsl");
 pub const MATMUL_BF16W_WGSL: &str = include_str!("matmul_bf16w.wgsl");
 pub const MATMUL_WIDE_WGSL: &str = include_str!("matmul_wide.wgsl");
@@ -22,6 +22,7 @@ pub const MATMUL_WIDE_VEC4_WGSL: &str = include_str!("matmul_wide_vec4.wgsl");
 pub const MATMUL_F16W_WGSL: &str = include_str!("matmul_f16w.wgsl");
 pub const MATMUL_F16_COMPUTE_WGSL: &str = include_str!("matmul_f16_compute.wgsl");
 pub const MATMUL_COOP16_WGSL: &str = include_str!("matmul_coop16.wgsl");
+pub const MATMUL_COOP_F16_F32ACC_WGSL: &str = include_str!("matmul_coop_f16_f32acc.wgsl");
 pub const MATMUL_COOP_F32_WGSL: &str = include_str!("matmul_coop_f32.wgsl");
 pub const MATMUL_COOP_F32_DIRECT_WGSL: &str = include_str!("matmul_coop_f32_direct.wgsl");
 pub const MATMUL_COOP_F32_PORTABLE_WGSL: &str = include_str!("matmul_coop_f32_portable.wgsl");
@@ -129,6 +130,16 @@ pub const GATHER_WGSL: &str = include_str!("gather.wgsl");
 pub const GATHER_SPLIT_WGSL: &str = include_str!("gather_split.wgsl");
 pub const GATHER_AXIS_WGSL: &str = include_str!("gather_axis.wgsl");
 pub const ATTENTION_WGSL: &str = include_str!("attention.wgsl");
+/// Banded (windowed) attention — the body [`attention_band_kernel`] prefixes
+/// with the tile constants [`attention_band_form_at`] derives for the adapter's
+/// thread count. Not a standalone module: it names `BM`, `C`, `DPER`, `THREADS`
+/// and `BK`, which the host declares, and writes its staged tile as `%STAGE%`,
+/// which the host substitutes for `vec4<f16>` (16-bit operands, 32-bit
+/// accumulation) or `vec4<f32>` (the fallback on an adapter without
+/// `Features::SHADER_F16` and the `RLX_WGPU_ATTENTION_BAND_F32` baseline). One
+/// body, so the two forms cannot drift — they differ in that token and in whether
+/// `enable f16;` leads the module.
+pub const ATTENTION_BAND_WGSL: &str = include_str!("attention_band.wgsl");
 pub const ATTENTION_BWD_WGSL: &str = include_str!("attention_bwd.wgsl");
 pub const ROPE_WGSL: &str = include_str!("rope.wgsl");
 pub const EXPAND_WGSL: &str = include_str!("expand.wgsl");
@@ -499,7 +510,10 @@ pub struct AttentionMaskParams {
     pub seq_q: u32,
     pub heads: u32,
     pub scale_bits: u32,
-    /// 0=None, 1=Causal, 2=Custom(binary), 3=SlidingWindow, 4=Bias(additive).
+    /// 0=None, 1=Causal, 2=Custom(binary), 3=SlidingWindow, 4=Bias(additive),
+    /// 5=two-sided band (`MaskKind::Window`, and the id a dense square step takes
+    /// when `plan_attention` routes it through the band kernel with `window` at
+    /// the key extent). 5 is never read by this pass.
     pub mask_kind: u32,
     /// SlidingWindow width (only read when `mask_kind == 3`).
     pub window: u32,
@@ -2966,6 +2980,7 @@ static MATMUL_F16W: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_BF16W: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_F16_COMPUTE: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP16: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP_F16_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
 static MATMUL_COOP_F32: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F32_DIRECT: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F32_PORTABLE: OnceLock<Kernel> = OnceLock::new();
@@ -3259,6 +3274,60 @@ pub fn matmul_coop16_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
         )
     }))
 }
+/// f16 operands with an f32 cooperative accumulator, 64×64 output tile per
+/// 64-thread workgroup (two 32-wide subgroups, each owning a 64×32 half). A is
+/// downcast from the f32 arena into a ping-pong workgroup stage at the load; B
+/// is read as f16 from the weight buffer; the accumulator never leaves f32.
+///
+/// Three refusals, each named rather than left to a later panic: the device
+/// needs `SHADER_F16` and `EXPERIMENTAL_COOPERATIVE_MATRIX` for the mixed
+/// f16-operand/f32-accumulator form to exist at all, and it needs the workgroup
+/// storage the shader actually declares — two 4 KiB ping-pong A stages plus the
+/// 256 B of zero lanes the accumulators are seeded from,
+/// [`COOP_F16_F32ACC_STORAGE`] (8 448 B) — below that `create_compute_pipeline`
+/// would fail, so the kernel is reported absent instead. There is no B stage (B
+/// is read as f16 straight from the weight buffer) and no f32 output tile in
+/// workgroup memory (the 64×64 tile lives in registers); both omissions are what
+/// the shader header measures against the forms that had them. Whether the built
+/// kernel computes `a·b` is a separate question, answered per device by
+/// `crate::coop_probe`.
+pub fn matmul_coop_f16_f32acc_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    let feats = device.features();
+    if !feats.contains(wgpu::Features::SHADER_F16)
+        || !feats.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        || device.limits().max_compute_workgroup_storage_size < COOP_F16_F32ACC_STORAGE
+    {
+        return None;
+    }
+    MATMUL_COOP_F16_F32ACC
+        .get_or_init(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_kernel_3(
+                    device,
+                    "rlx-wgpu matmul_coop_f16_f32acc",
+                    MATMUL_COOP_F16_F32ACC_WGSL,
+                    "matmul_coop_f16_f32acc",
+                )
+            }))
+            .ok()
+        })
+        .as_ref()
+}
+
+/// The workgroup storage `matmul_coop_f16_f32acc.wgsl` declares: two 2048-f16
+/// ping-pong staging buffers (4 KiB each) plus the 64 f32 zero lanes the
+/// accumulators are seeded from. The shader keeps its output tile out of
+/// workgroup memory for exactly this reason — see its header. Shared with nothing
+/// else, but named here because the kernel getter refuses a device below it.
+pub const COOP_F16_F32ACC_STORAGE: u32 = 4 * 1024 + 4 * 1024 + 256;
+
+/// The output-tile extent [`matmul_coop_f16_f32acc_kernel`] covers per workgroup,
+/// as the dispatch grid needs it: `(n / 64, m / 64)` — whole tiles only, which is
+/// what the admission requires.
+pub fn coop_f16_f32acc_grid(m: u32, n: u32) -> (u32, u32) {
+    (n.div_ceil(64), m.div_ceil(64))
+}
+
 /// Pure-f32 cooperative-matrix matmul. No SHADER_F16 needed — uses
 /// `coop_mat8x8<f32>` throughout (lowers to `simdgroup_float8x8` on
 /// Apple). Returns None if the cooperative-matrix feature is missing
@@ -4449,6 +4518,482 @@ pub fn attention_mask_kernel(device: &wgpu::Device) -> &'static Kernel {
     })
 }
 
+/// One workgroup shape of [`attention_band_kernel`]: the chunk threads a row of
+/// `head_dim` is split across (`C`) and the query rows one workgroup covers
+/// (`BM`), so every accepted form has `rows · chunks == threads` by construction.
+/// That is what lets the module's workgroup be declared from the pair rather than
+/// from a table of widths.
+///
+/// Both figures are stored rather than re-derived from the `head_dim` the form
+/// came from: a caller holds the pair the form was built with, so a mismatched
+/// width is unrepresentable rather than a value the caller has to remember not to
+/// re-pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttentionBandForm {
+    /// Threads a row is split across: `head_dim / ATTENTION_BAND_DIMS_PER_THREAD`,
+    /// the chunks the reduce sums.
+    pub chunks: u32,
+    /// Query rows one workgroup covers: `threads / chunks`.
+    pub rows: u32,
+}
+
+/// The form [`attention_band_kernel`] is built with at `head_dim` on an adapter
+/// whose [`attention_band_threads`] is `threads`, or `None` where no form of the
+/// kernel splits that width into whole rows.
+///
+/// The admitted *width set* does not depend on `threads`: chunks are
+/// `head_dim / ATTENTION_BAND_DIMS_PER_THREAD`, so the widths the plan holds give
+/// 2, 4, 8 and 16 chunks, and both thread counts are whole multiples of each. Only a
+/// workgroup's row count moves — `rows = threads / chunks`, 128/64/32/16 at the
+/// floor and 256/128/64/32 at the wide form for head widths 64/128/256/512.
+/// That is what lets the device-free plan answer at the floor
+/// ([`attention_band_form`]) without knowing which form the adapter will build.
+///
+/// Both halves are measured, and the table in `tests/attention_band_cost.rs`
+/// carries every cell (best of seven rounds after three warm-ups, this rig):
+///
+/// | threads | dims/thread | BM at d=512 | global (d=512) | sliding (d=256) |
+/// |---------|-------------|-------------|----------------|-----------------|
+/// | 256     | 32          | 16          | 566 ms         | 46.4 ms         |
+/// | 256     | 64          | 32          | 757 ms         | 58.4 ms         |
+/// | 256     | 128         | 64          | 1 498 ms       | 118.4 ms        |
+/// | 512     | 32          | 32          | 535 ms         | 41.9 ms         |
+/// | 512     | 64          | 64          | 763 ms         | 67.9 ms         |
+/// | 512     | 128         | 128         | 1 560 ms       | 133.9 ms        |
+/// | 1024    | 32          | 64          | 1 385 ms       | 106 ms          |
+///
+/// The 256 and 512 rows are the comparison the thread choice rests on, and the
+/// only two the kernel builds: 512 is the add-on (taken on an adapter that
+/// reports the room, this rig's Metal) and 256 the floor every conforming adapter
+/// launches, so the pair differs in nothing but `BM`.
+///
+/// The bytes a call re-reads are `blocks · heads · keys walked · head_dim · 4 ·
+/// 2` with `blocks = ceil(seq / BM)`, so every step down that row — and every row
+/// with a bigger `BM` — halves the traffic. The wall clock does not follow: 256/64
+/// and 512/32 have the same `BM` (32 at d = 512) and read the same 34.4 GB, and
+/// the first is 41% *slower* because a thread's Q and O doubled to 128 f32, which
+/// halves how many workgroups a core holds. 512/32 doubles `BM` with a thread's
+/// registers untouched, and that is the only arrangement here that pays for its
+/// bytes: 5% at the global cell and 10% at the sliding one — the figures the
+/// wide form is worth on this rig, and the reason the floor is a fallback rather
+/// than the shape. 1024/32 quarters the bytes again and loses 2.4× — one
+/// workgroup a core and the key block squeezed to 4. So this walk is bound by
+/// what each thread issues and by how many workgroups a core holds, not by the
+/// bytes it streams; the note in the kernel header carries that reading forward.
+///
+/// `chunks < 2` is never admitted: the reduce's four-accumulator form reads
+/// `part_s[(r·C + cc + 1)…]`, which at `C == 1` is the next row's partials (and
+/// past the array on the last row), so a width that would build a one-chunk row
+/// is refused by `backend::attention_route::band_attention` instead.
+pub fn attention_band_form_at(head_dim: u32, threads: u32) -> Option<AttentionBandForm> {
+    if head_dim == 0 || !head_dim.is_multiple_of(ATTENTION_BAND_DIMS_PER_THREAD) {
+        return None;
+    }
+    let chunks = head_dim / ATTENTION_BAND_DIMS_PER_THREAD;
+    (chunks >= 2 && threads.is_multiple_of(chunks)).then_some(AttentionBandForm {
+        chunks,
+        rows: threads / chunks,
+    })
+}
+
+/// [`attention_band_form_at`] at the guaranteed floor thread count,
+/// [`ATTENTION_BAND_MIN_THREADS`]: the device-free answer the plan
+/// (`backend::attention_route::band_attention`) is decided on and the widths a
+/// test holds the tile arithmetic to. Valid for a pipeline built at either thread
+/// count, because the admitted widths are the same at both — the rows a device
+/// actually runs come from [`attention_band_rows_for`] at its own
+/// [`attention_band_threads`].
+pub fn attention_band_form(head_dim: u32) -> Option<AttentionBandForm> {
+    attention_band_form_at(head_dim, ATTENTION_BAND_MIN_THREADS)
+}
+
+/// The module [`attention_band_kernel`] builds: the tile the adapter's workgroup
+/// storage affords ([`attention_band_key_block_within`]), the constants the body
+/// names, the body with its `// @unroll` blocks expanded and its staged-tile type
+/// bound, and `enable f16` ahead of them where the tile is 16-bit (a global
+/// directive must lead the module). Split out so the text a device is handed is
+/// the text a device-free test can hand to naga **at the same storage budget** —
+/// this shader is assembled, not read from a file, so nothing else would catch a
+/// WGSL mistake before an adapter does.
+fn attention_band_module(head_dim: u32, threads: u32, budget: u32, f16_stage: bool) -> String {
+    let block =
+        attention_band_key_block_within(head_dim, if f16_stage { 2 } else { 4 }, budget, threads);
+    attention_band_source(head_dim, threads, block, f16_stage)
+}
+
+fn attention_band_source(head_dim: u32, threads: u32, block: u32, f16_stage: bool) -> String {
+    let form = attention_band_form_at(head_dim, threads).unwrap_or_else(|| {
+        panic!(
+            "rlx-wgpu: the band kernel has no form for head_dim {head_dim} at \
+             {threads} threads"
+        )
+    });
+    let body = bind_band_stage(
+        ATTENTION_BAND_WGSL,
+        if f16_stage { "vec4<f16>" } else { "vec4<f32>" },
+    );
+    let body = expand_band_loops(&body, block, ATTENTION_BAND_DIMS_PER_THREAD / 4);
+    let constants = format!(
+        "const BM: u32 = {rows}u;\nconst C: u32 = {chunks}u;\n\
+         const DPER: u32 = {dims}u;\nconst THREADS: u32 = {threads}u;\n\
+         const BK: u32 = {block}u;\n",
+        rows = form.rows,
+        chunks = form.chunks,
+        dims = ATTENTION_BAND_DIMS_PER_THREAD,
+    );
+    if f16_stage {
+        format!("enable f16;\n{constants}{body}")
+    } else {
+        format!("{constants}{body}")
+    }
+}
+
+/// The two-sided band kernel for `head_dim` — `Step::Attention`'s pipeline for a
+/// `MaskKind::Window` step, and for a dense `MaskKind::None` step whose extents
+/// are square (the plan routes it here with `window = seq_k`, which the body
+/// reads as "no band"). No other entry point serves either: the fused and the
+/// many-row forms read kind 5 as "no mask" and run a dense pass.
+///
+/// The module is formatted per (head width, workgroup width) because the tile
+/// constants are compile-time inside it: `C = head_dim / DPER` is what makes a
+/// thread's Q/O slice a fixed `ATTENTION_BAND_DIMS_PER_THREAD` f32 it can hold in
+/// registers (the
+/// fused entry's `MAX_HEAD_DIM`-wide arrays behind a runtime index are the spill
+/// this form exists to avoid), and `@workgroup_size` is `THREADS`, which comes
+/// from [`attention_band_threads`] — the widest the adapter admits, and the floor
+/// where it does not. One process (one device) therefore holds one module per
+/// width it meets — the four head widths the plan admits, 64 to
+/// [`ATTENTION_BAND_MAX_HEAD_DIM`] — and the cache is keyed by `(width, threads,
+/// staging)`, so at most sixteen.
+///
+/// The body's hot loops are then expanded (`expand_band_loops`) because WGSL
+/// has no way to ask for an unrolled loop: a local array behind a loop index is
+/// thread-local memory in the module wgpu builds, not a register array.
+///
+/// The staged tile follows the device: `Features::SHADER_F16` selects a
+/// `vec4<f16>` tile (16-bit operands with f32 accumulation), and an adapter
+/// without it takes `vec4<f32>` — the same body over an f32 tile, substituted
+/// into the one [`ATTENTION_BAND_WGSL`] by `bind_band_stage`.
+/// [`RLX_WGPU_ATTENTION_BAND_F32`](self) forces the f32 tile on a device that
+/// has the feature, so the two readings are re-takeable on one machine. Neither
+/// is a dense fallback: the plan admits the shape before either is asked for.
+pub fn attention_band_kernel(device: &wgpu::Device, head_dim: u32) -> &'static Kernel {
+    static BAND: OnceLock<Mutex<HashMap<(u32, u32, bool), &'static Kernel>>> = OnceLock::new();
+    let f16_stage = !rlx_ir::env::flag("RLX_WGPU_ATTENTION_BAND_F32")
+        && device.features().contains(wgpu::Features::SHADER_F16);
+    let threads = attention_band_threads(device);
+    let key = (head_dim, threads, f16_stage);
+    let mut cache = BAND
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        // Poison-tolerant: a build that panicked must report its own message on
+        // the next call rather than a lock error.
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(kernel) = cache.get(&key) {
+        return kernel;
+    }
+    // The thread count comes from the adapter's limit
+    // ([`attention_band_threads`]) and the rows are that count over the chunks;
+    // the dispatch grid takes the same figure from the same limit
+    // ([`attention_band_rows_for`]), so the two agree by construction and there
+    // is no limit left to assert against here. The key block is the largest one
+    // whose tile fits this adapter's workgroup storage, which is the one thing
+    // about the module that is the device's own.
+    let source = attention_band_module(
+        head_dim,
+        threads,
+        device.limits().max_compute_workgroup_storage_size,
+        f16_stage,
+    );
+    let label = if f16_stage {
+        "rlx-wgpu attention_band"
+    } else {
+        "rlx-wgpu attention_band_f32"
+    };
+    // One leak per (width, thread count, staging) triple, the bounded set the
+    // cache holds: the returned reference outlives any graph that asked for it.
+    let kernel: &'static Kernel = Box::leak(Box::new(build_kernel_3_with(
+        device,
+        label,
+        &source,
+        "attention_band",
+        false,
+    )));
+    cache.insert(key, kernel);
+    kernel
+}
+
+/// Query rows one workgroup of [`attention_band_kernel`] takes (`BM` in the
+/// shader), for a head of `head_dim`, at an explicit workgroup width: a thread
+/// owns [`ATTENTION_BAND_DIMS_PER_THREAD`] dims and a row is `head_dim` wide, so
+/// the rows follow `threads / chunks`. Infallible for a width the plan admitted:
+/// a width with no form is one the plan refused. The run loop builds its grid
+/// from this at the adapter's own [`attention_band_threads`], so the grid and the
+/// module's `BM` are one number by construction.
+pub fn attention_band_rows_for(head_dim: u32, threads: u32) -> u32 {
+    attention_band_form_at(head_dim, threads)
+        .unwrap_or_else(|| {
+            panic!(
+                "rlx-wgpu: the band kernel has no form for head_dim {head_dim} at \
+                 {threads} threads"
+            )
+        })
+        .rows
+}
+
+/// The plan-side row count: [`attention_band_rows_for`] at the floor thread count
+/// ([`ATTENTION_BAND_MIN_THREADS`]), because the plan that admits a band step is
+/// device-free. 32 at head width 256 (the model's sliding layers) and 16 at 512
+/// (its global ones).
+///
+/// This is what `backend::attention_route::band_attention` reads to bound a grid,
+/// and what a device-free test can hold the tile arithmetic to. The rows a run
+/// actually dispatches are the same call at the adapter's own
+/// [`attention_band_threads`] — twice this figure where the wide form is taken.
+pub fn attention_band_rows(head_dim: u32) -> u32 {
+    attention_band_rows_for(head_dim, ATTENTION_BAND_MIN_THREADS)
+}
+
+/// Threads one workgroup of [`attention_band_kernel`] runs where the adapter
+/// admits them — the add-on, not the requirement.
+///
+/// 512, not the 256 this file shipped with: a workgroup's rows are
+/// `threads / chunks`, so doubling the thread count doubles `BM` — and halves the
+/// bytes the walk re-reads — while a thread keeps the same 32 dims of Q and O. It
+/// is the widest form that pays: 1024 threads quarters the bytes again and loses
+/// 2.4× (one workgroup a core, and the key block squeezed to 4). 512 is also
+/// above WebGPU's guaranteed `maxComputeInvocationsPerWorkgroup` of 256, so it is
+/// taken only where the adapter reports the room ([`attention_band_threads`]),
+/// and the route falls back to [`ATTENTION_BAND_MIN_THREADS`] below that; 1024 is
+/// what this rig's Metal reports and what `fft_gpu.wgsl` already takes.
+pub const ATTENTION_BAND_MAX_THREADS: u32 = 512;
+
+/// Threads one workgroup of [`attention_band_kernel`] runs where the adapter
+/// cannot launch [`ATTENTION_BAND_MAX_THREADS`]: the width every conforming
+/// WebGPU adapter can dispatch, because the spec guarantees
+/// `maxComputeInvocationsPerWorkgroup >= 256`.
+///
+/// It is also the width the device-free answers are taken at
+/// ([`attention_band_form`], [`attention_band_rows`]) — the plan decides a band
+/// step without a device, so it has to answer at the floor every device meets.
+pub const ATTENTION_BAND_MIN_THREADS: u32 = 256;
+
+/// The workgroup width to build [`attention_band_kernel`] with on `device`:
+/// [`ATTENTION_BAND_MAX_THREADS`] where its
+/// `maxComputeInvocationsPerWorkgroup` holds that many invocations, else
+/// [`ATTENTION_BAND_MIN_THREADS`].
+///
+/// This is the one term that turns the wide form into an add-on: the plan that
+/// chooses the band route is device-free, and the admitted head widths are the
+/// same at either count (only `BM` moves — see [`attention_band_form_at`]), so an
+/// adapter that cannot launch 512 loses rows per workgroup, not the route. Below
+/// the floor there is nothing to fall back to: no conforming adapter reports
+/// fewer than 256, so an adapter that does is refused here, naming the limit,
+/// rather than building a module its HAL would fail to launch.
+pub fn attention_band_threads(device: &wgpu::Device) -> u32 {
+    let invocations = device.limits().max_compute_invocations_per_workgroup;
+    if invocations >= ATTENTION_BAND_MAX_THREADS {
+        ATTENTION_BAND_MAX_THREADS
+    } else if invocations >= ATTENTION_BAND_MIN_THREADS {
+        ATTENTION_BAND_MIN_THREADS
+    } else {
+        panic!(
+            "rlx-wgpu: the band kernel needs a workgroup of at least \
+             {ATTENTION_BAND_MIN_THREADS} invocations, and this adapter reports \
+             maxComputeInvocationsPerWorkgroup = {invocations}; no conforming WebGPU \
+             adapter is below that floor"
+        )
+    }
+}
+
+/// Dims one thread of [`attention_band_kernel`] owns (`DPER` in the shader).
+/// Held as `vec4` slots: Q, O and the V rows it accumulates are `DPER` f32 each,
+/// all unrolled into registers, so `head_dim / this` is the chunk count — 16 at
+/// head width 512, 8 at 256, 4 at 128, 2 at 64.
+///
+/// 32 at every width, at every thread count: the wider chunks halve the traffic
+/// and lose 1.3–2.6×, because a second 32-f32 slice of Q and O a thread is what
+/// halves the workgroups a core holds. [`attention_band_form_at`] carries the table.
+pub const ATTENTION_BAND_DIMS_PER_THREAD: u32 = 32;
+
+/// Head width above which no band step is served — the fused kernel's own
+/// `MAX_HEAD_DIM`, and the widest head the form's chunk widths split into whole
+/// rows. A width that is not a multiple of [`ATTENTION_BAND_DIMS_PER_THREAD`] is
+/// refused with it: the shader's chunk is a constant, so a width it was not
+/// built for would read the wrong dims rather than merely run slowly.
+pub const ATTENTION_BAND_MAX_HEAD_DIM: u32 = 512;
+
+/// Head width below which no band step is served: the narrowest width whose chunk
+/// count is at least two. A row split across a single chunk has nothing for the
+/// reduce to sum, and the pair form it would take reads
+/// `part_s[(r·C + cc + 1)·BK + kk]` — the next query row's partials, and past the
+/// array on the last row. A 32-wide head is the width that would build that form,
+/// so it is refused by name (see `backend::attention_route::band_attention`)
+/// rather than answered from the wrong row.
+pub const ATTENTION_BAND_MIN_HEAD_DIM: u32 = 64;
+
+/// Keys one block of [`attention_band_kernel`] stages (`BK` in the shader) for
+/// one configuration: the largest power of two in `{32, 16, 8, 4, 2}` whose
+/// per-key cost — the K slot in the staged tile (reused for V), the key's share of
+/// the score partials and of the block's scores — fits `budget`, less a sixteenth
+/// left unspent for driver padding.
+///
+/// `budget` is the adapter's `maxComputeWorkgroupStorageSize`, `stage_bytes` the
+/// staged tile's width a dim (2 for the f16 module, 4 for the f32 one) and
+/// `threads` the workgroup the module is built with
+/// ([`attention_band_threads`]). The kernel asks at its own adapter's figures;
+/// the plan-side and device-free tests ask at WebGPU's *guaranteed* floor —
+/// `16 384 B` of workgroup storage and [`ATTENTION_BAND_MIN_THREADS`] threads —
+/// which is also what an adapter below this rig's 32 KiB degrades to.
+///
+/// At the floor the partials are `threads · BK` f32 whatever the head width, so
+/// they dominate but no longer fix every width at one block: 8 keys a block for
+/// the f16 tile at head widths 64, 128 and 256 (13.0, 12.0 and 13.0 KiB) and 4 at
+/// 512 (8.25 KiB), where 8 at 512 would be 16.5 KiB and over the budget. The
+/// kernel's own figure on this rig's 32 768 B and 512 threads is 8 keys a block at
+/// every width. The degradation is of the walk, never of the answer: a smaller
+/// block only means more barriers. The f32 tile is twice as wide a dim, so on a
+/// 16 KiB adapter it stages 8, 8 and 4 keys at head widths 64, 128 and 256 and 4
+/// at 512 (12.25 KiB at the widest), and the wide form — whose partials are
+/// `threads · BK` f32, twice the floor's — takes fewer keys than the floor does at
+/// one budget: 4 against 8 at head width 512 on the 16 KiB floor, and 8 against
+/// 16 at head widths 64–256 on this rig's 32 KiB.
+///
+/// The floor is 2 keys rather than 4: on the 512-thread form the f32 tile's
+/// partials are `512 · BK` f32 on their own, so a 4-key block at head width 512
+/// needs 16.9 KiB and would not build on the 16 KiB floor. 2 keys is a legal
+/// block everywhere — the reduce covers keys `c, c + C, …` and the host expands
+/// the body for whatever block this returns.
+pub fn attention_band_key_block_within(
+    head_dim: u32,
+    stage_bytes: u32,
+    budget: u32,
+    threads: u32,
+) -> u32 {
+    let form = attention_band_form_at(head_dim, threads).unwrap_or_else(|| {
+        panic!(
+            "rlx-wgpu: the band kernel has no form for head_dim {head_dim} at \
+             {threads} threads"
+        )
+    });
+    let chunks = form.chunks;
+    let rows = form.rows;
+    // A staged key costs its K slot plus its own partials and its score entry.
+    let per_key = head_dim * stage_bytes + rows * chunks * 4 + rows * 4;
+    // A sixteenth of the budget is left unspent: the figures above are the three
+    // arrays' payload, and a driver is free to pad each declaration.
+    let limit = budget - budget / 16;
+    let mut block = 32;
+    while block > 2 && block * per_key > limit {
+        block /= 2;
+    }
+    block
+}
+
+/// Bind the band body's staged-tile type: every `%STAGE%` becomes `stage`
+/// (`vec4<f16>` or `vec4<f32>`).
+///
+/// This is the whole difference between the 16-bit-staging module and the f32
+/// one — the tile's declaration and the store into it — so the two are one
+/// source file and one substitution rather than two bodies that can drift. The
+/// read side needs no marker: `vec4<f32>(stage[...])` widens an f16 slot and is
+/// an identity constructor over an f32 one. A marker left in place reaches naga
+/// as an unknown identifier, so a missed substitution fails the pipeline build.
+pub(crate) fn bind_band_stage(body: &str, stage: &str) -> String {
+    let out = body.replace("%STAGE%", stage);
+    assert!(
+        !out.contains("%STAGE%"),
+        "a band stage marker survived its substitution"
+    );
+    out
+}
+
+/// Repeat the band body's `// @unroll <name>` … `// @end` blocks with the index
+/// as a literal: `keys` times for `kk`, then `slots` times for `j`.
+///
+/// This exists because WGSL has no way to ask for an unrolled loop and the
+/// module wgpu builds is the one naga emits at dispatch: every `for` and `loop`
+/// leaves naga with a termination guard (`while (true) { if (all(loop_bound ==
+/// 0u)) break; … }`) that no backend can see through. A local array behind a
+/// loop index is therefore *thread-local memory* — every `q4[j]`, `o4[j]` and
+/// `score[kk]` becomes a load and a store. Measured on the global cell
+/// (`tests/attention_band_cost.rs`, this rig) with nothing else changed: the
+/// slot loops alone 2 223 ms as loops against 1 196 ms expanded, and 656 ms with
+/// the key loops expanded too. Same code, same shapes: this is how a WGSL loop
+/// reaches the driver, not a property of one GPU family.
+///
+/// Deliberately not a general preprocessor — one marker form, nesting by block
+/// depth, and the only substitution is `%<name>%` → `<n>` (the source keeps the
+/// `u` suffix). A marker left in
+/// place reaches naga as an invalid literal, so a missed expansion fails the
+/// pipeline build rather than computing something else.
+pub(crate) fn expand_band_loops(body: &str, keys: u32, slots: u32) -> String {
+    let keys = expand_band_block(body, "kk", keys);
+    expand_band_block(&keys, "j", slots)
+}
+
+/// One [`expand_band_loops`] pass: expand the blocks marked `name` and leave the
+/// others in place, markers intact, for their own pass.
+fn expand_band_block(src: &str, name: &str, count: u32) -> String {
+    // `(indent, marker)` a depth of nesting, `(lines)` its collected body.
+    let mut open: Vec<(String, Vec<String>)> = Vec::new();
+    let mut out = String::with_capacity(src.len() * 2);
+    // A rendered block belongs to the enclosing `// @unroll` block when there is
+    // one — nesting is indentation-free, so the parent is wherever we are.
+    fn emit(open: &mut [(String, Vec<String>)], out: &mut String, text: &str) {
+        match open.last_mut() {
+            Some((_, block)) => block.push(text.to_string()),
+            None => {
+                out.push_str(text);
+                out.push('\n');
+            }
+        }
+    }
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if let Some(inner) = trimmed.strip_prefix("// @unroll ") {
+            let indent = &line[..line.len() - trimmed.len()];
+            open.push((format!("{indent}|{}", inner.trim()), Vec::new()));
+        } else if trimmed == "// @end" {
+            let (stamp, block) = open.pop().expect("unbalanced // @end in a band kernel");
+            let (indent, inner) = stamp.split_once('|').expect("block stamp");
+            if inner == name {
+                let find = format!("%{name}%");
+                for n in 0..count {
+                    for body_line in &block {
+                        emit(
+                            &mut open,
+                            &mut out,
+                            &body_line.replace(&find, &format!("{n}")),
+                        );
+                    }
+                }
+            } else {
+                // Another pass's block: hand it back on, markers intact, so the
+                // enclosing pass can substitute into it and its own pass can
+                // expand it.
+                emit(&mut open, &mut out, &format!("{indent}// @unroll {inner}"));
+                for body_line in &block {
+                    emit(&mut open, &mut out, body_line);
+                }
+                emit(&mut open, &mut out, &format!("{indent}// @end"));
+            }
+        } else {
+            emit(&mut open, &mut out, line);
+        }
+    }
+    assert!(
+        open.is_empty(),
+        "unbalanced // @unroll {name} in a band kernel: {} block(s) left open",
+        open.len()
+    );
+    assert!(
+        !out.contains(&format!("%{name}%")),
+        "a %{name}% marker survived its own expansion pass"
+    );
+    out
+}
+
 /// Head width the lane-parallel decode form serves, mirroring the native
 /// backend's decode kernel. That cap is the native kernel's own — 32 lanes of
 /// partial O in one threadgroup array. Here the per-lane O array is the serial
@@ -4507,17 +5052,23 @@ pub fn attention_decode_eligible(seq_q: u32, seq_k: u32, head_dim: u32, v_head_d
 /// the many-row route (`AttentionRoutes::decomposed`), which is not a
 /// `Step::Attention` dispatch at all: it is counted where the route's own
 /// normalise runs, one per attention step it served. `serial` covers both the
-/// multi-row path and every shape the decode form cannot serve.
+/// multi-row path and every shape the decode form cannot serve. `band` is the
+/// two-sided band kernel ([`attention_band_kernel`]) — a `Step::Attention`
+/// dispatch like `decode`/`serial`, and disjoint from both: a `MaskKind::Window`
+/// step takes it whatever its extents, since neither of the other two computes
+/// kind 5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttentionRoutes {
     pub decode: u64,
     pub decomposed: u64,
     pub serial: u64,
+    pub band: u64,
 }
 
 static ATTENTION_DECODE_STEPS: AtomicU64 = AtomicU64::new(0);
 static ATTENTION_SERIAL_STEPS: AtomicU64 = AtomicU64::new(0);
 static ATTENTION_DECOMPOSED_STEPS: AtomicU64 = AtomicU64::new(0);
+static ATTENTION_BAND_STEPS: AtomicU64 = AtomicU64::new(0);
 
 /// How many attention dispatches this process has routed each way. The engine's
 /// dispatch report answers per `OpKind`, not per kernel, so this is the
@@ -4527,6 +5078,7 @@ pub fn attention_route_counts() -> AttentionRoutes {
         decode: ATTENTION_DECODE_STEPS.load(Ordering::Relaxed),
         decomposed: ATTENTION_DECOMPOSED_STEPS.load(Ordering::Relaxed),
         serial: ATTENTION_SERIAL_STEPS.load(Ordering::Relaxed),
+        band: ATTENTION_BAND_STEPS.load(Ordering::Relaxed),
     }
 }
 
@@ -4535,6 +5087,7 @@ pub fn reset_attention_route_counts() {
     ATTENTION_DECODE_STEPS.store(0, Ordering::Relaxed);
     ATTENTION_SERIAL_STEPS.store(0, Ordering::Relaxed);
     ATTENTION_DECOMPOSED_STEPS.store(0, Ordering::Relaxed);
+    ATTENTION_BAND_STEPS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) fn note_attention_route(decode: bool) {
@@ -4544,6 +5097,12 @@ pub(crate) fn note_attention_route(decode: bool) {
         &ATTENTION_SERIAL_STEPS
     };
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One `Step::Attention` dispatch served by the band kernel — counted where the
+/// pipeline is chosen, so it never joins `serial`'s tally.
+pub(crate) fn note_attention_band_route() {
+    ATTENTION_BAND_STEPS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// One attention step served by the many-row route — counted at its normalise,
@@ -5306,6 +5865,44 @@ mod tests {
         WideGrid, WideVariant, conv_transpose2d_tiled_grid, wide_grid,
     };
 
+    /// The widths the band route admits are the same at both workgroup widths the
+    /// kernel builds: 256 (the floor every conforming adapter launches) and 512
+    /// (the add-on). This is what keeps the device-free plan — which answers at
+    /// the floor — valid for a pipeline the adapter resizes. Device-free: the
+    /// form is arithmetic, not a pipeline, so this runs in the plain
+    /// `cargo test -p rlx-wgpu --lib` gate.
+    ///
+    /// The refusals are the widths that would build a one-chunk row (`32`, whose
+    /// `chunks == 1` breaks the reduce) or a fraction of a row
+    /// (`96, 160, 192, 224, 288, 320, 352, 384, 416, 448, 480`, whose chunk count
+    /// does not divide 256; `544` is past
+    /// [`ATTENTION_BAND_MAX_HEAD_DIM`](super::ATTENTION_BAND_MAX_HEAD_DIM)).
+    #[test]
+    fn the_band_admits_the_same_widths_at_the_floor_and_the_wide_form() {
+        use super::{
+            ATTENTION_BAND_MAX_THREADS, ATTENTION_BAND_MIN_THREADS, attention_band_form_at,
+        };
+        for threads in [ATTENTION_BAND_MIN_THREADS, ATTENTION_BAND_MAX_THREADS] {
+            for hd in [64u32, 128, 256, 512] {
+                let form = attention_band_form_at(hd, threads)
+                    .unwrap_or_else(|| panic!("hd={hd} has no form at {threads} threads"));
+                assert_eq!(
+                    form.chunks * form.rows,
+                    threads,
+                    "hd={hd} at {threads} threads must split into whole rows"
+                );
+            }
+            for hd in [
+                32u32, 96, 160, 192, 224, 288, 320, 352, 384, 416, 448, 480, 544,
+            ] {
+                assert!(
+                    attention_band_form_at(hd, threads).is_none(),
+                    "hd={hd} must have no form at {threads} threads"
+                );
+            }
+        }
+    }
+
     /// `frames.wgsl` parses and validates under the WebGPU baseline, and the
     /// workgroup its dispatch covers elements with is the one it declares.
     /// Device-free (naga only) and on the same reasoning as the tile pin below: a
@@ -5433,6 +6030,88 @@ mod tests {
                  numbers live in one file and a drift between them would leave a row's \
                  tail unread"
             );
+        }
+    }
+
+    /// `matmul_coop_f16_f32acc.wgsl` parses and validates, and declares the entry
+    /// point and workgroup the lowering's arm sets. Device-free (naga only): WGSL
+    /// is not validated at build time, and this kernel is reached only where an
+    /// adapter exposes cooperative matrices — so without this a WGSL mistake would
+    /// surface as a panic at `create_shader_module` on the machines that take the
+    /// route and stay invisible on the others. The capability set is exactly what
+    /// the kernel needs: an arm reaching for a third optional capability cannot
+    /// compile here and fail only on a device that provides less.
+    #[test]
+    fn coop_f16_f32acc_shader_parses_and_validates() {
+        let src = super::MATMUL_COOP_F16_F32ACC_WGSL;
+        let module = naga::front::wgsl::parse_str(src)
+            .unwrap_or_else(|e| panic!("matmul_coop_f16_f32acc.wgsl: {e:?}"));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::SHADER_FLOAT16
+                | naga::valid::Capabilities::COOPERATIVE_MATRIX,
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("must validate with f16 and cooperative matrices: {e:?}"));
+        assert_eq!(
+            module
+                .entry_points
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["matmul_coop_f16_f32acc"],
+            "one compute entry, and it the one the lowering sets as the pipeline"
+        );
+        assert!(
+            src.contains("@workgroup_size(64)"),
+            "the tile is assembled by two 32-wide subgroups from one 64-thread \
+             workgroup: `coop_f16_f32acc_admits`' 64x64x32 grid and the probe's \
+             single 64-thread launch both assume it"
+        );
+    }
+
+    /// The band module [`attention_band_kernel`] assembles parses and validates at
+    /// both staging widths, and its `@workgroup_size` is the `THREADS` its grid is
+    /// built from. Device-free (naga only) on the same reasoning as the kernels
+    /// above, and because this shader is not a file a reader can check on its own:
+    /// it is valid only after the tile constants, the staged-tile type and the
+    /// expanded loops are substituted in. Driven through
+    /// [`super::attention_band_module`] at the storage budgets adapters report —
+    /// WebGPU's guaranteed 16 KiB and this rig's 32 KiB — so the key block under
+    /// test is the block those devices get, not one the test chose.
+    #[test]
+    fn band_shader_parses_and_validates_at_both_stagings() {
+        for (head_dim, threads) in [(256u32, super::ATTENTION_BAND_MIN_THREADS), (512, 512)] {
+            for budget in [16 * 1024, 32 * 1024] {
+                for f16_stage in [true, false] {
+                    let src = super::attention_band_module(head_dim, threads, budget, f16_stage);
+                    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+                        panic!(
+                            "attention_band d={head_dim} threads={threads} budget={budget} \
+                             f16={f16_stage}: {e:?}"
+                        )
+                    });
+                    let caps = if f16_stage {
+                        naga::valid::Capabilities::SHADER_FLOAT16
+                    } else {
+                        naga::valid::Capabilities::empty()
+                    };
+                    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
+                        .validate(&module)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "attention_band d={head_dim} threads={threads} budget={budget} \
+                                 f16={f16_stage} must validate: {e:?}"
+                            )
+                        });
+                    assert!(
+                        src.contains("@workgroup_size(THREADS)")
+                            && src.contains(&format!("const THREADS: u32 = {threads}u;")),
+                        "d={head_dim}: the module's workgroup must be the count the grid is \
+                         built from"
+                    );
+                }
+            }
         }
     }
 

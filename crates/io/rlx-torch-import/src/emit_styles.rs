@@ -94,6 +94,7 @@ fn mask_lit(m: MaskKind) -> &'static str {
         MaskKind::Custom => "MaskKind::Custom",
         MaskKind::Bias => "MaskKind::Bias",
         MaskKind::SlidingWindow(_) => "MaskKind::SlidingWindow(0)",
+        MaskKind::Window(_) => "MaskKind::Window(0)",
     }
 }
 

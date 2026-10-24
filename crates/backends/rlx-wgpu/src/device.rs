@@ -262,6 +262,18 @@ pub fn coop_discrete_backend() -> bool {
         .unwrap_or(false)
 }
 
+/// True when the process-global device advertises `Features::SHADER_F16`.
+///
+/// The one adapter term the two-sided band kernel
+/// (`kernels::attention_band_kernel`) reads: it selects the f16 staging module
+/// where the feature is there and the f32 one where it is not, and the route is
+/// the same either way. False without a device.
+pub fn shader_f16_supported() -> bool {
+    wgpu_device()
+        .map(|d| d.device.features().contains(wgpu::Features::SHADER_F16))
+        .unwrap_or(false)
+}
+
 /// True when the adapter reports 8×8×8 f32 cooperative-matrix support, which
 /// selects `matmul_coop_f32_portable` automatically on a discrete adapter.
 pub fn coop_f32_8x8_supported() -> bool {

@@ -32,6 +32,18 @@ fn apply_synthetic_mask(scores: &mut [f32], q_seq: usize, k_seq: usize, kind: Ma
                 }
             }
         }
+        MaskKind::Window(w) => {
+            for qi in 0..q_seq {
+                let abs_q = q_offset + qi;
+                let lo = abs_q.saturating_sub(w);
+                let hi = abs_q + w;
+                for ki in 0..k_seq {
+                    if ki < lo || ki > hi {
+                        scores[qi * k_seq + ki] = neg;
+                    }
+                }
+            }
+        }
     }
 }
 

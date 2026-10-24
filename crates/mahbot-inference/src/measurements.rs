@@ -34,10 +34,13 @@ pub fn path() -> PathBuf {
 
 const HEADER: &str = "# Measurements
 
-The latest numbers from this crate's two measuring surfaces. Each section is
-replaced by the run that produced it and carries its own date; the two surfaces
-are run at different times, so one half may be older than the other. This file
-is not a log — history is what version control is for.
+The latest numbers from this crate's two measuring surfaces. Each row is
+replaced by the run that measured it: the section carries that run's date and
+`code` line, and its `rows` line names which rows the run took — a row a later
+run did not measure is carried, not re-taken, because its own inputs are not what
+that run opens. The two surfaces are run at different times, so one half may be
+older than the other. This file is not a log — history is what version control is
+for.
 
 ";
 

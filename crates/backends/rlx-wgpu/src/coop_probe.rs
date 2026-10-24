@@ -64,6 +64,12 @@ pub enum CoopKernel {
     /// The `matmul_coop_f16_vulkan*` family, 16×16 tile. `widen` selects the
     /// `coopLoad`-on-B shader, `!widen` the `coopLoadT`-on-B shader.
     F16Vk { widen: bool, f32acc: bool },
+    /// `matmul_coop_f16_f32acc` — f16 operands, f32 accumulator, 64×64 tile over
+    /// two 32-wide subgroups, 32 8×8 f32 accumulators each, with A staged through
+    /// a ping-pong workgroup buffer (B is read straight from the f16 weight
+    /// buffer). The Metal convention, and the only one of these whose tile spans
+    /// more than one subgroup.
+    F16F32Acc,
 }
 
 /// Where the probe has to place `A` and `B` for this shader's bind group.
@@ -126,6 +132,19 @@ fn plan(which: CoopKernel) -> Plan {
             n: 32,
             grid: (2, 2),
             operands: Operands::ArenaF16PlusF32Out,
+            rel_tol: 2e-2,
+        },
+        // One whole 64×64 tile in one workgroup, so both 32-wide subgroups and all
+        // 32 of their 8×8 accumulators are exercised; `k = 64` is two 32-deep K
+        // stages, so the ping-pong A stage's overwrite and its barrier are
+        // exercised too. One 64-thread workgroup, which is also the shader's
+        // `@workgroup_size`. Grid is (n/64, m/64).
+        CoopKernel::F16F32Acc => Plan {
+            m: 64,
+            k: 64,
+            n: 64,
+            grid: (1, 1),
+            operands: Operands::ArenaF32PlusF16Weights,
             rel_tol: 2e-2,
         },
     }
@@ -237,6 +256,7 @@ fn kernel_for(device: &wgpu::Device, which: CoopKernel) -> Option<&'static Kerne
             widen: true,
             f32acc: true,
         } => k::matmul_coop_f16_vulkan_widen_f32acc_kernel(device),
+        CoopKernel::F16F32Acc => k::matmul_coop_f16_f32acc_kernel(device),
     }
 }
 
@@ -535,6 +555,20 @@ pub fn coop16_path_ok() -> bool {
         return false;
     };
     verified(device, queue, CoopKernel::Coop16)
+}
+
+/// Is `matmul_coop_f16_f32acc` trustworthy on this adapter — both the operand
+/// order and the assumption that a `@workgroup_size(64)` workgroup is two
+/// contiguous 32-wide subgroups, whose `local_invocation_index` order the shader's
+/// fragment halves and its ping-pong A stage are written against? Both are settled
+/// by the same probe: a device that partitions the halves differently computes
+/// neither `a·b` nor any of the other three transpositions, and every one of those
+/// leaves zeros the true rank-1 answer does not have.
+pub fn f16_f32acc_path_ok() -> bool {
+    let Some((device, queue)) = dq() else {
+        return false;
+    };
+    verified(device, queue, CoopKernel::F16F32Acc)
 }
 
 /// Which `matmul_coop_f16_vulkan*` B-load variant actually computes `a·b` here.

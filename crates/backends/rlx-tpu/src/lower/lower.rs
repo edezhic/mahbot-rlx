@@ -2312,6 +2312,9 @@ impl<'a> LowerCtx<'a> {
                 w as i64,
                 prim_ty,
             ),
+            MaskKind::Window(_) => {
+                panic!("two-sided attention band (MaskKind::Window) is not implemented on TPU")
+            }
             MaskKind::Custom | MaskKind::Bias => {
                 // 4th input is the mask, additive [B, ?, S_q, S_k].
                 let mask = self.hlo(inputs[3]);

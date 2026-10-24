@@ -44,6 +44,9 @@ sha2 = "0.10"
 rand = "0.9"
 # The voice-activity gate the listening path and the speech-hours denominator use.
 earshot = "1.2"
+# The f16 image of a packed weight (`Store::F16Linear`): one rounding per value,
+# written as little-endian bits for `set_param_typed(..., DType::F16)`.
+half = "2"
 
 [lints]
 workspace = true

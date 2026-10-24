@@ -76,6 +76,13 @@ fn f16_shadow_write_end(f32_byte_offset: usize, f32_byte_len: usize) -> usize {
     f16_off + padded
 }
 
+/// Bytes of slack the f16 mirror carries past the last planned upload, so a
+/// weight window — which starts at a 256-byte-aligned offset and reads a few bytes
+/// past the data — still fits a mirror whose last weight ends on the buffer's last
+/// byte. Two alignment steps cover both ends of `f16_weight_bind_range`'s
+/// rounding. See the allocation in [`Arena::from_plan`].
+const F16_MIRROR_WINDOW_SLACK: usize = 2 * 256;
+
 /// Size the f16 side buffer so every planned slot's padded upload fits.
 fn f16_shadow_arena_size(plan: &MemoryPlan) -> usize {
     plan.assignments
@@ -1403,7 +1410,17 @@ impl Arena {
             // that striped the graph — any small `RLX_WGPU_SHARD_CAP_MIB` turns
             // every graph into stripes — wired multiple GiB per compile, starved
             // the machine of memory and took the OS down with a watchdog panic.
-            let f16_size = f16_shadow_arena_size(&plan).min(max_binding);
+            //
+            // Plus one binding window's worth of slack. A weight buffer's window
+            // (`f16_weight_bind_range`) starts at a 256-byte-aligned offset and
+            // reads a little past the data's end, so a mirror ending exactly on
+            // the last weight's last byte cannot hold a window for it: the window
+            // is clamped to the buffer, and the last elements of the weight land
+            // outside the binding — where a load returns zero rather than
+            // faulting. That is a wrong answer (measured: ~1e-3 relative on a
+            // 64-wide f16 weight), not a refusal.
+            let f16_size =
+                (f16_shadow_arena_size(&plan) + F16_MIRROR_WINDOW_SLACK).min(max_binding);
             Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rlx-wgpu arena f16"),
                 size: f16_size.max(256) as u64,
@@ -3497,28 +3514,42 @@ mod operand_stageability_tests {
         );
     }
 
-    /// The slot the flat plan gives a two-byte `Param` is its native width, while the
-    /// activation of the same dtype is widened — the fact the in-arena `F16`/`Bool`
-    /// verdict rests on (`node_slot_bytes` in `rlx-compile`). Read through
-    /// [`plan_node_slots`], the function the arena records its slots from, so this fails
-    /// if that rule changes; what a *real* arena makes of the recording is pinned where
-    /// the rule asks it, in `tests/host_route_operand_fit.rs`.
+    /// The slot the flat plan gives an `F16` `Param` is four bytes per element — the
+    /// width the typed upload writes and the width a one-byte `Param` is NOT given —
+    /// the fact the in-arena verdict rests on (`node_slot_bytes` in `rlx-compile`).
+    /// Read through [`plan_node_slots`], the function the arena records its slots
+    /// from, so this fails if that rule changes; what a *real* arena makes of the
+    /// recording is pinned where the rule asks it, in `tests/host_route_operand_fit.rs`.
+    ///
+    /// `F16` was the refused encoding here until the flat plan started reserving the
+    /// four bytes per element `set_param_typed` widens an `F16` parameter to (and
+    /// `from_plan_split` already gave it). Without that, the upload overran the slot
+    /// by half its length and the f16 mirror — sized from the same slot — could not
+    /// hold the copy a mirror-reading matmul kernel needs. `Bool` is the one-byte
+    /// encoding still refused, so the refusal rule keeps a live example.
     #[test]
-    fn flat_plan_slots_a_two_byte_parameter_native() {
+    fn flat_plan_widens_a_two_byte_parameter_and_refuses_a_one_byte_one() {
         let mut g = Graph::new("flat-plan-slots");
         let p = g.param("p", rlx_ir::Shape::new(&[NE], DType::F16));
+        let b = g.param("b", rlx_ir::Shape::new(&[NE], DType::Bool));
         let x = g.input("x", rlx_ir::Shape::new(&[NE], DType::F16));
-        g.set_outputs(vec![p, x]);
+        g.set_outputs(vec![p, b, x]);
         let slots = plan_node_slots(&rlx_compile::memory::plan_memory_f32_uniform(&g, 16));
         assert_eq!(
             (slots[&p], slots[&x]),
-            (NE * 2, NE * 4),
-            "the flat plan sizes a non-F32 Param native and widens activations"
+            (NE * 4, NE * 4),
+            "the flat plan widens an F16 parameter to the width its upload writes, and \
+             widens activations"
         );
         assert_eq!(
             unstageable_reason(DType::F16, NE, slots[&p]),
-            Some(Unstageable::SlotTooNarrow),
-            "an F16 parameter in that slot is what the rule refuses in the act arena"
+            None,
+            "an F16 parameter in a four-byte slot is exactly what the staging reads"
+        );
+        assert_eq!(
+            (slots[&b], unstageable_reason(DType::Bool, NE, slots[&b])),
+            (NE, Some(Unstageable::SlotTooNarrow)),
+            "a one-byte parameter keeps its native slot, and what the rule refuses"
         );
     }
 }

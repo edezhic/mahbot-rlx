@@ -13,8 +13,8 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 659  
-**Unregistered mentions (migration leftovers):** 101
+**Registered names:** 661  
+**Unregistered mentions (migration leftovers):** 102
 
 ## Groups
 
@@ -38,7 +38,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [rocm](#rocm) — 31
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
-- [wgpu](#wgpu) — 91
+- [wgpu](#wgpu) — 93
 - [xdna](#xdna) — 11
 
 ## compile
@@ -706,6 +706,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_ALLOW_SHARD` | Bisect | Bool | Backend(wgpu) | Warn instead of refusing when the activation arena would be striped across buffers (wrong results) |
 | `RLX_WGPU_ALL_PARAMS_WEIGHT` | Internal | Bool | Backend(wgpu) | Park every parameter in the weight arena rather than splitting |
 | `RLX_WGPU_ARENA_REPORT` | Internal | Bool | Backend(wgpu) | Report which tensors dominate the activation arena after planning |
+| `RLX_WGPU_ATTENTION_BAND_F32` | Bisect | Bool | Backend(wgpu) | Stage the two-sided band attention kernel's K/V tiles in f32 instead of f16 (the f32 form is also the fallback without SHADER_F16) |
 | `RLX_WGPU_CONCAT_HOST` | Bisect | Bool | Backend(wgpu) | Run Concat on the host instead of a wgpu kernel |
 | `RLX_WGPU_CONV3D_SCALAR` | Bisect | Bool | Backend(wgpu) | Force the one-element-per-thread Conv3D kernel instead of the 4-channel tiled one |
 | `RLX_WGPU_CONV_HOST` | Internal | Bool | Backend(wgpu) | Run convolution on the host instead of a wgpu kernel |
@@ -766,6 +767,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_NO_COOP_F16_VK` | Bisect | Bool | Backend(wgpu) | Disable f16 cooperative matrices in the wgpu Vulkan backend |
 | `RLX_WGPU_NO_COOP_F32` | Bisect | Bool | Backend(wgpu) | Disable f32 cooperative matrices |
 | `RLX_WGPU_NO_COOP_PROBE` | Bisect | Bool | Backend(wgpu) | Skip the cooperative-matrix self-check and trust the kernels |
+| `RLX_WGPU_NO_DENSE_COOP` | Bisect | Bool | Backend(wgpu) | Keep a dense square attention step off the cooperative f16/f32-accumulator form (the chunked three-pass square), leaving the band walk or the fused kernel |
 | `RLX_WGPU_NO_F16_MIRROR` | Bisect | Bool | Backend(wgpu) | Do not keep an f16 mirror of f32 weights |
 | `RLX_WGPU_NO_F16_SHADOW` | Bisect | Bool | Backend(wgpu) | Do not allocate the f16 shadow buffer |
 | `RLX_WGPU_NO_FOLD_MMBA` | Internal | Bool | Backend(wgpu) | Disable folding matmul+bias+activation into one node |
@@ -885,6 +887,7 @@ Identifiers still appearing in the tree but not yet in the registry (docs, bench
 | `RLX_NODE_ERR_MODE` | `crates/bindings/rlx-ffi/src/lib.rs` |
 | `RLX_NODE_ERR_SPAWN` | `crates/bindings/rlx-ffi/src/lib.rs` |
 | `RLX_NODE_OK` | `crates/bindings/rlx-ffi/src/lib.rs` |
+| `RLX_NORM_ROPE_KNOB_FIXTURE` | `crates/backends/rlx-wgpu/tests/norm_rope_fusion.rs` |
 | `RLX_ORT_INTRA_THREADS` | `crates/io/rlx-onnx/src/backend.rs` |
 | `RLX_PIPELINE_ALPN` | `crates/core/rlx-driver/src/lib.rs` |
 | `RLX_POW_SCALAR_FN` | `crates/backends/rlx-metal/src/kernels.rs` |

@@ -1911,6 +1911,9 @@ impl ThunkSchedule {
                         rlx_ir::op::MaskKind::Custom => (2, 0),
                         rlx_ir::op::MaskKind::Bias => (3, 0),
                         rlx_ir::op::MaskKind::SlidingWindow(w) => (4, *w as u32),
+                        rlx_ir::op::MaskKind::Window(_) => panic!(
+                            "two-sided attention band (MaskKind::Window) is not implemented on Metal"
+                        ),
                     };
                     let mask_off = if matches!(
                         mask_kind,
@@ -2039,6 +2042,9 @@ impl ThunkSchedule {
                         rlx_ir::op::MaskKind::SlidingWindow(w) => {
                             (3u32, off(node.inputs[0]), *w as u32)
                         }
+                        rlx_ir::op::MaskKind::Window(_) => panic!(
+                            "two-sided attention band (MaskKind::Window) is not implemented on Metal"
+                        ),
                     };
                     let q_shape = &graph.node(node.inputs[0]).shape;
                     let k_shape = &graph.node(node.inputs[1]).shape;
@@ -2169,6 +2175,9 @@ impl ThunkSchedule {
                         rlx_ir::op::MaskKind::None => (0u32, 0u32),
                         rlx_ir::op::MaskKind::Causal => (1u32, 0u32),
                         rlx_ir::op::MaskKind::SlidingWindow(w) => (3u32, *w as u32),
+                        rlx_ir::op::MaskKind::Window(_) => panic!(
+                            "two-sided attention band (MaskKind::Window) is not implemented on Metal"
+                        ),
                         rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::Bias => panic!(
                             "rlx-metal AttentionBackwardAll: custom/bias mask is not GPU-fusable \
                              (the fusion pass should not have emitted it)"

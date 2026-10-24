@@ -12,12 +12,17 @@
 //! that storage — and only where the graph says the operand is a parameter's, since its
 //! record is keyed by a byte offset an activation can share with a released slot.
 //!
-//! The interesting geometry needs no ceiling lever: an `F16` parameter in the ordinary
-//! unsplit arena keeps a two-byte-per-element slot, while both the typed upload and the
+//! The interesting geometry needs no ceiling lever: a `Bool` parameter in the ordinary
+//! unsplit arena keeps a one-byte-per-element slot, while both the typed upload and the
 //! staging use four — so the read runs past it and must be refused, and so must the
 //! same parameter read through a *view* (the planner aliases a view onto its root's
 //! storage, and only the root's remainder bounds what the view can read). An `F32`
 //! parameter of the same shape is the control: accepted, and computed.
+//!
+//! `F16` was this file's example until the flat plan started reserving four bytes per
+//! element for an `F16` parameter — the width `set_param_typed` widens it to and
+//! `from_plan_split` already gave it — so that parameter is now readable and is no
+//! longer a narrow-slot case. `Bool` still is.
 //!
 //! One test per file: the crate's convention for arena-level state.
 
@@ -59,8 +64,8 @@ fn refusal(graph: Graph, why: &str) {
         .unwrap_or_default();
     assert!(
         msg.contains("rlx-wgpu: REFUSED (operand not stageable as f32)")
-            && msg.contains("F16")
-            && msg.contains("2 bytes per element"),
+            && msg.contains("Bool")
+            && msg.contains("1 byte per element"),
         "{why}: the refusal must name the operand's real encoding and width; got {msg}"
     );
     assert!(
@@ -98,16 +103,16 @@ fn host_route_reads_are_bounded_by_what_the_arena_holds() {
         );
     }
 
-    // An F16 parameter: the typed upload widens it to one f32 lane per element, while
-    // the plan gave it two bytes per element — the read runs past it.
+    // A Bool parameter: the typed upload widens it to one f32 lane per element, while
+    // the plan gave it one byte per element — the read runs past it.
     refusal(
-        host_op_graph("host-fit-f16", DType::F16, false),
-        "an in-arena F16 parameter",
+        host_op_graph("host-fit-bool", DType::Bool, false),
+        "an in-arena Bool parameter",
     );
     // ... and the same parameter read through a `Narrow`: the view's own slot says
     // nothing about the storage it aliases, so the bound has to come from the root.
     refusal(
-        host_op_graph("host-fit-f16-view", DType::F16, true),
-        "a view of an in-arena F16 parameter",
+        host_op_graph("host-fit-bool-view", DType::Bool, true),
+        "a view of an in-arena Bool parameter",
     );
 }

@@ -7,13 +7,18 @@
 //! Every graph in this stand is assembled on `rlx-flow`: `ModelFlow` carries the
 //! topology, a [`LayerStage`](rlx_flow::LayerStage) per graph emits the blocks
 //! through `FlowCtx`'s emission surface and `HirMut`'s op set, and the loader
-//! above supplies the weights. Two weight paths:
+//! above supplies the weights. Three weight paths:
 //!
 //! * **body and sound** rank-2 tensors (`Store::Packed`) — the file's own
 //!   packed bytes through [`WeightSource::take_packed`], so
 //!   `FlowCtx::linear` emits a fused `DequantMatMul`;
 //! * **host** tensors (`Store::HostDequant`, `Store::F16Widened`) — unpacked to
-//!   f32 on the host and multiplied as a plain `MatMul`.
+//!   f32 on the host and multiplied as a plain `MatMul`;
+//! * **the embedding encoder's** linears (`Store::F16Linear`, see
+//!   [`linear_encoder`]) — unpacked to f16 on the host and multiplied as a
+//!   `MatMul` whose weight is an f16 `Param`. It is the packed route's
+//!   replacement only where the device admits the cooperative f16 kernel for
+//!   every multiply in the graph, and the packed route everywhere else.
 //!
 //! A `name#step` key is a stacked tensor read one step at a time (the code
 //! predictor's fifteen LM heads), and takes the same paths on its slice.
@@ -192,8 +197,8 @@ impl WeightSource for LoaderWeights {
                     bias: Vec::new(),
                 }))
             }
-            // Host-dequant and F16 tensors deliberately do not take this path.
-            Store::HostDequant | Store::F32File | Store::F16Widened => Ok(None),
+            // Host-dequant, f16 and F32 tensors deliberately do not take this path.
+            Store::HostDequant | Store::F32File | Store::F16Widened | Store::F16Linear => Ok(None),
         }
     }
 }
@@ -455,6 +460,52 @@ pub fn linear(
     ctx.linear(x, key, false)
 }
 
+/// The embedding encoder's linear: the f16 route when [`Model::f16_linears`]
+/// took this weight's plan, the packed route otherwise — the same topology, the
+/// same projection, one `MatMul` on an f16 `Param` instead of a fused
+/// `DequantMatMul` over the file's packed bytes.
+///
+/// It remains a separate entry rather than an argument to [`linear`] because
+/// `linear` cannot see the model's plan store; for every other store it *is*
+/// `linear`, called directly below.
+///
+/// The weight node is declared here and its bytes are attached at session time
+/// (`graphs::encoder` hands `Model::linear_f16`'s bytes to `set_param_typed`),
+/// exactly as a packed blob is: the graph carries a `Param`, not data. Nothing
+/// else about the multiply changes — `Op::MatMul`'s output is the input's dtype
+/// (f32), so the projection lands back in the f32 row the rest of the block
+/// reads, and the accumulator is f32 inside the kernel.
+///
+/// The store rule already refused f16 for a graph whose multiplies do not admit
+/// the kernel's tile, so an unadmitted extent here is a caller that asked for a
+/// row count the plans were not prepared for: it is refused by name rather than
+/// quietly served by `matmul_f16_compute`, which is slower than the packed route
+/// this call would have taken.
+pub fn linear_encoder(
+    ctx: &mut FlowCtx<'_>,
+    model: &Model,
+    x: &rlx_flow::FlowValue,
+    key: &str,
+) -> Result<rlx_flow::FlowValue> {
+    let p = model.plan(key)?;
+    if p.store != Store::F16Linear {
+        return linear(ctx, x, key);
+    }
+    let rank = x.shape.rank();
+    let m = x.shape.dims()[rank - 2].unwrap_static();
+    let (k, n) = p.in_out();
+    if !loader::f16_multiply_admits(m, k, n) {
+        bail!(
+            "`{key}`: the f16 route was taken for another row count, but this multiply is \
+             {m}×{k}×{n}, which does not admit the cooperative f16 kernel's tile \
+             (m % 64, k % 32, n % 64); take the packed route for this graph"
+        );
+    }
+    let shape = Shape::new(&[k, n], DType::F16);
+    let w = ctx.hir().param(key, shape.clone());
+    Ok(ctx.matmul(x, &rlx_flow::FlowValue::new(w, shape)))
+}
+
 /// One fused multiply, split along its output rows into `dims` — q/k/v or
 /// gate/up. The split is a `narrow` per part; the weight pass is one node.
 pub fn linear_fused(
@@ -474,10 +525,13 @@ pub fn linear_fused(
     Ok(out)
 }
 
-/// One block's three attention projections, one call site: each key through
-/// [`linear`] on its own — three multiplies.
+/// One block's three attention projections: each key through
+/// [`linear_encoder`] on its own — three multiplies. That entry is [`linear`]
+/// for every store the encoder did not flip to f16, so the packed body and the
+/// embedding encoder share this call site.
 pub fn qkv(
     ctx: &mut FlowCtx<'_>,
+    model: &Model,
     x: HirNodeId,
     m: usize,
     d: usize,
@@ -486,7 +540,7 @@ pub fn qkv(
     let value = rlx_flow::FlowValue::new(x, Shape::new(&[m, d], DType::F32));
     let mut out = [x; 3];
     for (i, key) in keys.iter().enumerate() {
-        out[i] = linear(ctx, &value, key)?.hir_id();
+        out[i] = linear_encoder(ctx, model, &value, key)?.hir_id();
     }
     Ok(out)
 }
@@ -526,6 +580,10 @@ pub fn snake_beta(
 }
 
 /// `y = softmax(q·kᵀ/√d)·v` by the core's own attention op.
+///
+/// `score_scale` is the op's own default when `None` (`1/√head_dim`);
+/// `Some(1.0)` is what the Gemma encoders ask for, their per-head q/k norms
+/// having already fixed the scores' magnitude.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &mut FlowCtx<'_>,
@@ -536,8 +594,19 @@ pub fn attention(
     head_dim: usize,
     kind: MaskKind,
     out: &[usize],
+    score_scale: Option<f32>,
 ) -> HirNodeId {
-    h(ctx).attention_kind(q, k, v, heads, head_dim, kind, Shape::new(out, DType::F32))
+    h(ctx).attention_kind_opts(
+        q,
+        k,
+        v,
+        heads,
+        head_dim,
+        kind,
+        Shape::new(out, DType::F32),
+        score_scale,
+        None,
+    )
 }
 
 /// RoPE tables `[rows, head_dim/2]` computed at the file's base (the checkpoints

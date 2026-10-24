@@ -265,6 +265,7 @@ fn rows_shape(b: usize, rows: usize, lk: usize, kind: MaskKind) {
             decode: 0,
             decomposed: 1,
             serial: 0,
+            band: 0,
         },
         "batch={b} rows={rows} lk={lk} {kind:?}: the step must take the dense arrangement"
     );
@@ -321,6 +322,7 @@ fn a_dense_layout_takes_the_route_and_matches_cpu() {
             decode: 0,
             decomposed: 1,
             serial: 0,
+            band: 0,
         },
         "a dense [B, H, S, D] step must take the dense arrangement"
     );
@@ -362,6 +364,7 @@ fn a_strided_rank4_layout_takes_the_route_and_matches_cpu() {
             decode: 0,
             decomposed: 1,
             serial: 0,
+            band: 0,
         },
         "a strided [B, S, H, D] step must take the dense arrangement"
     );
@@ -409,6 +412,7 @@ fn grouped_kv_and_asymmetric_v_take_the_route_and_match_cpu() {
                 decode: 0,
                 decomposed: 1,
                 serial: 0,
+                band: 0,
             },
             "a grouped-KV step must take the dense arrangement"
         );
@@ -439,6 +443,7 @@ fn grouped_kv_and_asymmetric_v_take_the_route_and_match_cpu() {
                 decode: 0,
                 decomposed: 1,
                 serial: 0,
+                band: 0,
             },
             "an asymmetric-V step must take the dense arrangement"
         );
@@ -480,6 +485,7 @@ fn a_one_row_short_key_step_takes_the_decode_form() {
                 decode: 1,
                 decomposed: 0,
                 serial: 0,
+                band: 0,
             },
             "one query row over {lk} keys is the lane-parallel form's"
         );
@@ -512,6 +518,7 @@ fn a_causal_step_shorter_in_keys_than_rows_takes_the_route() {
             decode: 0,
             decomposed: 1,
             serial: 0,
+            band: 0,
         },
         "four query rows over two causal keys is the route's"
     );
@@ -612,6 +619,7 @@ fn the_two_arrangements_agree_on_their_shared_row() {
             decode: 1,
             decomposed: 0,
             serial: 0,
+            band: 0,
         },
         "one query row over {CROSS_LK} keys must take the lane-parallel form"
     );
@@ -621,6 +629,7 @@ fn the_two_arrangements_agree_on_their_shared_row() {
             decode: 0,
             decomposed: 1,
             serial: 0,
+            band: 0,
         },
         "{CROSS_DENSE_ROWS} query rows over {CROSS_LK} keys must take the dense arrangement"
     );
@@ -674,8 +683,79 @@ fn the_scratch_budget_bounds_the_route() {
             decode: 0,
             decomposed: 0,
             serial: 1,
+            band: 0,
         },
         "a shape over the route's 512 MiB scratch cap must keep the fused kernel"
+    );
+}
+
+/// The band kernel's refusal is counted, and it is the *band* the dense square
+/// step wanted: a 96-wide head is a whole number of 32-wide chunks whose three
+/// chunks divide neither workgroup width (256 threads at the kernel's floor, 512
+/// where the adapter admits the wide form), the cooperative form needs
+/// `v_head_dim % 64` which 96 is not, and at 8 192 rows the many-row arrangement's
+/// score square is past its 512 MiB cap. So the step keeps the fused walk, and the
+/// compile says why: one band decline, no cooperative decline, and no step but the
+/// fused one — which is also the pin that the many-row arm was not its fallback
+/// (see `AttentionPlan::decompose` for why the square cannot follow).
+///
+/// A 192-wide head is the counterexample that keeps the flag honest: it is a whole
+/// tile width for both cooperative kernels (`192 % 32`, `192 % 64`) at an
+/// encoder-shaped 8 192 rows and one batch, so the plan books the cooperative
+/// form's chunk-sized regions; the band kernel has no form for its six chunks
+/// either, but that refusal is not a decline of a route the step takes. The
+/// compile reports no band decline for it, whether the adapter serves the
+/// cooperative form or falls back to the fused walk.
+#[test]
+fn a_dense_square_step_the_band_admission_refuses_is_counted() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
+        eprintln!("skip: wgpu unavailable");
+        return;
+    }
+    let _guard = route_lock();
+    let g = chain_bhsd(1, 8192, 8192, 4, 4, 96, MaskKind::None);
+    let exe = WgpuExecutable::compile(g);
+    let steps = exe.test_step_names();
+    eprintln!(
+        "[rlx-attn-rows-band-decline] rows=8192 heads=4 nkv=4 head_dim=96 \
+         band_declines={} dense_coop_declines={} steps={steps:?}",
+        exe.attention_band_declines(),
+        exe.attention_dense_coop_declines()
+    );
+    assert_eq!(
+        exe.attention_band_declines(),
+        1,
+        "the 96-wide dense square step is one the band admission refuses"
+    );
+    assert_eq!(
+        exe.attention_dense_coop_declines(),
+        0,
+        "and one the cooperative form never admitted, so not a decline of its own"
+    );
+    assert_eq!(
+        steps,
+        vec!["attention"],
+        "the step keeps the fused walk — not the many-row arm, whose whole square \
+         the plan did not book a region for"
+    );
+    // The same refusal on a width the cooperative form does book: the band
+    // kernel's answer is not a decline of a route the step takes, so nothing is
+    // counted. Whether the adapter serves the cooperative form is its own term
+    // (`attention_dense_coop_declines`), not this one.
+    let coop = WgpuExecutable::compile(chain_bhsd(1, 8192, 8192, 4, 4, 192, MaskKind::None));
+    eprintln!(
+        "[rlx-attn-rows-band-coop-booked] rows=8192 heads=4 nkv=4 head_dim=192 \
+         band_declines={} dense_coop_declines={} steps={:?}",
+        coop.attention_band_declines(),
+        coop.attention_dense_coop_declines(),
+        coop.test_step_names()
+    );
+    assert_eq!(
+        coop.attention_band_declines(),
+        0,
+        "a 192-wide step the cooperative form booked is not a band decline: its route \
+         is the cooperative form, and the band kernel's refusal is what it keeps only \
+         where the adapter declines that form"
     );
 }
 
@@ -724,6 +804,7 @@ fn the_route_keeps_its_planned_extent_under_an_active_extent_hint() {
             decode: 0,
             decomposed: 1,
             serial: 0,
+            band: 0,
         },
         "the masked scale vetoes the active extent for the whole graph, so the \
          planned {ROWS}-row step must take the dense arrangement"
@@ -794,6 +875,7 @@ fn a_wide_head_dim_takes_the_route_and_matches_cpu() {
             decode: 0,
             decomposed: 1,
             serial: 0,
+            band: 0,
         },
         "head_dim {HD} must take the dense arrangement"
     );
@@ -867,6 +949,7 @@ fn a_param_mask_takes_the_route_and_matches_cpu() {
             decode: 0,
             decomposed: 1,
             serial: 0,
+            band: 0,
         },
         "a parameter-carried mask must take the dense arrangement"
     );

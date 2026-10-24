@@ -60,6 +60,9 @@ fn apply_score_mask(
             let m4 = ops::reshape(&m2, &[1, 1, sq as i32, sk as i32])?;
             s = ops::add(&s, &m4)?;
         }
+        MaskKind::Window(_) => {
+            panic!("two-sided attention band (MaskKind::Window) is not implemented on mlx")
+        }
         MaskKind::Custom | MaskKind::Bias => {
             if let Some(m) = mask_additive {
                 s = ops::add(&s, m)?;

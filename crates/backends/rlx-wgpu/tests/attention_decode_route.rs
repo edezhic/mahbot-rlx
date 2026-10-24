@@ -261,6 +261,7 @@ fn decode_route_rank4_bshd_matches_cpu() {
                 decode: 1,
                 decomposed: 0,
                 serial: 0,
+                band: 0,
             },
             "rank-4 decode nkv={nkv} {kind:?}: the decode kernel must serve the step"
         );
@@ -338,6 +339,7 @@ fn a_patched_down_extent_keeps_the_decode_form_and_its_numbers() {
             decode: LAYERS_PATCHED as u64,
             decomposed: 0,
             serial: 0,
+            band: 0,
         };
         let g = masked_chain(1, UPPER, LAYERS_PATCHED, NH, HD, MaskKind::Custom);
         let q = data(dim, 0.011, false);
@@ -429,6 +431,7 @@ fn decode_route_mask_kinds_match_cpu() {
                 decode: 1,
                 decomposed: 0,
                 serial: 0,
+                band: 0,
             },
             "{kind:?} on the decode shape must take the decode kernel"
         );
@@ -474,6 +477,7 @@ fn route_falls_back_outside_the_decode_form() {
             decode: 0,
             decomposed: 0,
             serial: 1,
+            band: 0,
         },
         "rows={rows} nh={nh} hd={hd} lk={lk}: outside the decode form the \
          serial kernel must serve the step"

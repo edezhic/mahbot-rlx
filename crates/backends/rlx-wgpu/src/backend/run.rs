@@ -26,7 +26,8 @@ use crate::kernels::{
     ScatterAddParams, SceBwdParams, SceParams, SelectiveScanParams, SoftmaxParams, TopKParams,
     TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
     activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
-    argmax_kernel, attention_bwd_kernel, attention_decode_eligible, attention_decode_kernel,
+    argmax_kernel, attention_band_kernel, attention_band_rows_for, attention_band_threads,
+    attention_bwd_kernel, attention_decode_eligible, attention_decode_kernel,
     attention_decode_merge_kernel, attention_kernel, attention_mask_kernel, axial_rope2d_kernel,
     batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
     batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
@@ -50,23 +51,23 @@ use crate::kernels::{
     grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
     layernorm_kernel, layernorm_vec4_kernel, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
-    matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
-    matmul_coop_f32_active_kernel, matmul_coop_f32_direct_kernel, matmul_coop16_kernel,
-    matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_kernel,
+    matmul_coop_f16_f32acc_kernel, matmul_coop_f16_vulkan_active_kernel,
+    matmul_coop_f16_vulkan_kernel, matmul_coop_f32_active_kernel, matmul_coop_f32_direct_kernel,
+    matmul_coop16_kernel, matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_kernel,
     matmul_qkv_coop_f16_vk_active_kernel, matmul_qkv_coop_f16_vk_kernel,
     matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_active_kernel, matmul_wide_kernel,
     maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, narrow_split_kernel,
-    narrow_vec4_kernel, norm_rope_kernel, note_attention_decomposed_route, note_attention_route,
-    pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel,
-    quantize_i8_kernel, reduce_kernel, reverse_kernel, rms_norm_backward_kernel,
-    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
-    scaled_dequantize_kernel, scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel,
-    scaled_quant_scale_kernel, scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel,
-    scatter_nd_reduce_kernel, selective_scan_kernel, snake_beta_kernel,
-    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
-    softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
-    transpose_vec4_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
-    welch_peaks_gpu_kernel, where_kernel,
+    narrow_vec4_kernel, norm_rope_kernel, note_attention_band_route,
+    note_attention_decomposed_route, note_attention_route, pool1d_kernel, pool2d_kernel,
+    pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel,
+    reverse_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
+    rope_backward_kernel, rope_kernel, sample_kernel, scaled_dequantize_kernel,
+    scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel, scaled_quant_scale_kernel,
+    scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel,
+    selective_scan_kernel, snake_beta_kernel, softmax_cross_entropy_backward_kernel,
+    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
+    topk_kernel, transpose_kernel, transpose_vec4_kernel, umap_knn_kernel, unary_f16_mirror_kernel,
+    unary_kernel, welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
 use rlx_ir::op::{Activation, BinaryOp, CmpOp, MaskKind, ReduceOp};
@@ -1635,6 +1636,7 @@ impl WgpuExecutable {
         let mm_bf16w = matmul_bf16w_kernel(&dev.device);
         let mm_f16c = matmul_f16_compute_kernel(&dev.device);
         let mm_coop = matmul_coop16_kernel(&dev.device);
+        let mm_coop_f16acc = matmul_coop_f16_f32acc_kernel(&dev.device);
         let mm_coop_f16_vk = matmul_coop_f16_vulkan_kernel(&dev.device);
         let mm_coop_f32 = matmul_coop_f32_active_kernel(&dev.device);
         let mm_coop_f32_direct = matmul_coop_f32_direct_kernel(&dev.device);
@@ -1886,6 +1888,34 @@ impl WgpuExecutable {
                                         m_s.div_ceil(32),
                                         *batch,
                                     );
+                                } else if let Some(f16acc) = mm_coop_f16acc.as_ref()
+                                    && (*compute_precision == MatmulCompute::CoopF16F32Acc
+                                        || *compute_precision
+                                            == MatmulCompute::CoopF16F32AccScratch)
+                                    && (*b_is_param
+                                        || *compute_precision
+                                            == MatmulCompute::CoopF16F32AccScratch)
+                                {
+                                    // f16 operands, f32 cooperative accumulator,
+                                    // 64×64 output tile per 64-thread workgroup
+                                    // (two 32-wide subgroups over 64×32 halves, A
+                                    // staged through a ping-pong workgroup buffer,
+                                    // B read as f16). `CoopF16F32Acc` takes B from
+                                    // the weight mirror; `CoopF16F32AccScratch` —
+                                    // the dense attention route's form — from the
+                                    // route's own f16 operand buffer, which its
+                                    // bind group (built at compile) names. The
+                                    // admission is `coop_f16_f32acc_admits`:
+                                    // m % 64, n % 64 and k % 32, because a
+                                    // cooperative store cannot be masked and a
+                                    // partial K stage has no bounds test. A
+                                    // multiply that misses any of the three never
+                                    // takes this arm — `derive_matmul_compute`
+                                    // leaves it on the kernel it would have had.
+                                    pass.set_pipeline(&f16acc.pipeline);
+                                    let (gx, gy) = crate::kernels::coop_f16_f32acc_grid(m_s, *n);
+                                    crate::backend::coop_f16_f32acc_dispatch_inc();
+                                    pass.dispatch_workgroups(gx, gy, *batch);
                                 } else if let Some(coop) = mm_coop.as_ref()
                                     && *b_is_param
                                     && *compute_precision == MatmulCompute::Coop16
@@ -2900,7 +2930,26 @@ impl WgpuExecutable {
                                     params.head_dim,
                                     params.v_head_dim,
                                 );
-                                let ak = if decode {
+                                // A two-sided band step (`MaskKind::Window`), and a
+                                // dense square one the plan routed through the same
+                                // kernel, is served by the tiled band kernel and by
+                                // nothing else: the other two entries read kind 5 as
+                                // "no mask" and run a dense pass. The plan admitted
+                                // the geometry, so this is a pipeline pick, not a
+                                // route decision.
+                                let band = params.mask_kind == attention_route::BAND_MASK_KIND;
+                                // The grid's width: `attention_band_threads` is a pure
+                                // read of the adapter's limit, so the module
+                                // `attention_band_kernel` builds next (from its own
+                                // read of the same limit) takes these threads, and the
+                                // grid's rows are this width over the head's chunk
+                                // count. Gated on `band`, so a step on another entry
+                                // point pays nothing.
+                                let band_threads =
+                                    band.then(|| attention_band_threads(&dev.device));
+                                let ak = if band {
+                                    attention_band_kernel(&dev.device, params.head_dim)
+                                } else if decode {
                                     // Both kernels are `OnceLock`-cached, so
                                     // this is a load after the first step; like
                                     // the scaled-multiply decode kernels, the
@@ -2925,9 +2974,22 @@ impl WgpuExecutable {
                                     params.head_dim,
                                     params.v_head_dim,
                                 );
+                                // Band form: one workgroup per (batch, head) and
+                                // block of `attention_band_rows_for` query rows,
+                                // at the width read above — the same number the
+                                // module's `BM` is, both derived from that limit.
                                 // Decode form: one workgroup per (batch, head).
                                 // Serial form: one thread per (batch, head, row).
-                                let (gx, gy, gz) = if decode {
+                                let (gx, gy, gz) = if band {
+                                    (
+                                        seq_q_s.div_ceil(attention_band_rows_for(
+                                            params.head_dim,
+                                            band_threads.expect("band step picked its width"),
+                                        )),
+                                        params.batch * params.heads,
+                                        1,
+                                    )
+                                } else if decode {
                                     // Key-range split: one workgroup per
                                     // (head, key range), then the merge over the
                                     // partials it leaves at binding 2.
@@ -2946,7 +3008,11 @@ impl WgpuExecutable {
                                     let (mx, my, mz) = workgroup_grid(params.batch * params.heads);
                                     pass.dispatch_workgroups(mx, my, mz);
                                 }
-                                note_attention_route(decode);
+                                if band {
+                                    note_attention_band_route();
+                                } else {
+                                    note_attention_route(decode);
+                                }
                             }
                             Step::AttentionBackward { params, .. } => {
                                 let axis = if params.wrt == 0 {

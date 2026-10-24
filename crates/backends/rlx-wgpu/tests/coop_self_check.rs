@@ -33,7 +33,11 @@ fn every_buildable_coop_kernel_passes_its_self_check() {
     // Metal and Vulkan (naga's one `row_major` bool becomes Metal's
     // `transpose_matrix` but SPIR-V's `RowMajorKHR`/`ColumnMajorKHR`).
     let reachable: &[CoopKernel] = if d.backend == wgpu::Backend::Metal {
-        &[CoopKernel::F32Metal, CoopKernel::Coop16]
+        &[
+            CoopKernel::F32Metal,
+            CoopKernel::Coop16,
+            CoopKernel::F16F32Acc,
+        ]
     } else {
         &[
             CoopKernel::F32Portable,

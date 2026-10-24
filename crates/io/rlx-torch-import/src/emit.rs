@@ -60,6 +60,7 @@ fn mask_variant(m: MaskKind) -> &'static str {
         MaskKind::None => "None",
         MaskKind::Causal => "Causal",
         MaskKind::SlidingWindow(_) => "SlidingWindow(0)",
+        MaskKind::Window(_) => "Window(0)",
         MaskKind::Custom => "Custom",
         MaskKind::Bias => "Bias",
     }

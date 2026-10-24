@@ -98,6 +98,7 @@ fn the_decode_kernel_leaves_every_output_bit_where_it_was() {
             decode: 1,
             decomposed: 0,
             serial: 0,
+            band: 0,
         },
         "the decode shape must take the decode kernel; the digest below is worthless otherwise"
     );

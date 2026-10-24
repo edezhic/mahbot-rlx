@@ -1927,6 +1927,9 @@ impl CudaExecutable {
                         MaskKind::Causal => (1u32, 0u32, 0u32),
                         MaskKind::Custom => (2u32, (arena.offset(node.inputs[3]) / 4) as u32, 0u32),
                         MaskKind::SlidingWindow(w) => (3u32, 0u32, *w as u32),
+                        MaskKind::Window(_) => panic!(
+                            "two-sided attention band (MaskKind::Window) is not implemented on CUDA"
+                        ),
                         MaskKind::Bias => (4u32, (arena.offset(node.inputs[3]) / 4) as u32, 0u32),
                     };
                     schedule.push(Step::Attention {
@@ -2110,6 +2113,9 @@ impl CudaExecutable {
                         MaskKind::Causal => (1u32, 0u32, 0u32),
                         MaskKind::Custom => (2u32, (arena.offset(node.inputs[4]) / 4) as u32, 0u32),
                         MaskKind::SlidingWindow(w) => (3u32, 0u32, *w as u32),
+                        MaskKind::Window(_) => panic!(
+                            "two-sided attention band (MaskKind::Window) is not implemented on CUDA"
+                        ),
                         MaskKind::Bias => (4u32, (arena.offset(node.inputs[4]) / 4) as u32, 0u32),
                     };
                     let wrt_id = match wrt {

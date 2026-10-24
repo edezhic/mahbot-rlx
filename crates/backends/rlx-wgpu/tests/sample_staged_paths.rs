@@ -1,3 +1,7 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The sampler's one-row draw, both paths of it: `sample_one_staged` (the row in
 //! workgroup storage, taken when it fits `SAMPLE_STAGE`) and `sample_one_coop`
 //! (the same arithmetic over the arena, which carries a wider row).

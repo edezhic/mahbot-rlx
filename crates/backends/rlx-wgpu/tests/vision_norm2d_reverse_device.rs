@@ -261,10 +261,12 @@ fn layer_norm2d_matches_cpu_at_1024_channels() {
 ///
 /// A parameter is readable as one f32 lane per element when its storage really
 /// is that wide: `F64` widens into an eight-byte slot that has room for it, so
-/// the device step reads it. A non-F32 parameter the *flat* plan sized at its
-/// native width has a slot its own widened upload does not fit, so neither route
-/// can read it — that one is refused loudly rather than computed from whatever
-/// the upload left behind.
+/// the device step reads it. A parameter the *flat* plan sized at its native
+/// width — a one-byte `Bool`, say — has a slot its own widened upload does not
+/// fit, so neither route can read it: that one is refused loudly rather than
+/// computed from whatever the upload left behind. (`F16` was this case until the
+/// flat plan started reserving the four bytes per element its upload writes; see
+/// `tests/host_route_operand_fit.rs`.)
 #[test]
 fn a_non_f32_weight_and_bias_takes_the_device_route_or_is_refused() {
     pin_default_routing();
@@ -306,11 +308,11 @@ fn a_non_f32_weight_and_bias_takes_the_device_route_or_is_refused() {
     );
     eprintln!("F64 weight/bias device parity: max abs diff {diff:.2e}");
 
-    let msg = compile_refusal(ln2d_graph_dt(c, h, w, DType::F16));
+    let msg = compile_refusal(ln2d_graph_dt(c, h, w, DType::Bool));
     assert!(
         msg.contains("REFUSED (parameter not readable as f32 lanes)")
             && msg.contains("LayerNorm2d"),
-        "a two-byte parameter whose slot cannot hold its widened upload must be \
+        "a one-byte parameter whose slot cannot hold its widened upload must be \
          refused loudly; got {msg:?}"
     );
 }

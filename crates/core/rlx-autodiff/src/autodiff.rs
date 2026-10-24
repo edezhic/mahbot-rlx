@@ -50,7 +50,7 @@
 //!
 //! Attention: `Op::Attention` → three [`Op::AttentionBackward`]
 //! nodes (`dQ` / `dK` / `dV`) for all mask kinds. Causal /
-//! SlidingWindow masks are applied inside the backward kernel (no
+//! SlidingWindow / Window masks are applied inside the backward kernel (no
 //! mask tensor). `Custom` / `Bias` pass the forward mask input.
 //! before softmax; Custom uses the user-provided mask tensor;
 //! None is the no-mask path.

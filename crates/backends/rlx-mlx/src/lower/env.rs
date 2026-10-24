@@ -865,6 +865,9 @@ pub fn lower_with_env_writeback(
                         };
                         (MlxMask::Custom, Some(m4), None)
                     }
+                    MaskKind::Window(_) => panic!(
+                        "two-sided attention band (MaskKind::Window) is not implemented on mlx"
+                    ),
                     MaskKind::Bias => {
                         // Bias mask = raw additive bias tensor on the 4th input. Pass
                         // through unmodified — MLX SDPA already adds it to scores.
@@ -4364,6 +4367,9 @@ pub fn lower_with_env_writeback(
                         (Some(normalize_mask(&m_cast, &m_shape)?), 0usize)
                     }
                     MaskKind::SlidingWindow(w) => (None, *w),
+                    MaskKind::Window(_) => panic!(
+                        "two-sided attention band (MaskKind::Window) is not implemented on mlx"
+                    ),
                     _ => (None, 0usize),
                 };
                 let mask_ref = mask_additive.as_ref();

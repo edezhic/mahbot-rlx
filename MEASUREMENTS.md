@@ -1,14 +1,17 @@
 # Measurements
 
-The latest numbers from this crate's two measuring surfaces. Each section is
-replaced by the run that produced it and carries its own date; the two surfaces
-are run at different times, so one half may be older than the other. This file
-is not a log — history is what version control is for.
+The latest numbers from this crate's two measuring surfaces. Each row is
+replaced by the run that measured it: the section carries that run's date and
+`code` line, and its `rows` line names which rows the run took — a row a later
+run did not measure is carried, not re-taken, because its own inputs are not what
+that run opens. The two surfaces are run at different times, so one half may be
+older than the other. This file is not a log — history is what version control is
+for.
 
 <!-- BEGIN stand -->
 ## Per-model measurement (stand)
 
-_Measured 2026-10-22 13:59 UTC._
+_Measured 2026-10-24 04:19 UTC._
 
 | unit | cold ms | warm ms | speech s | s/speech s | loop ms | sound ms | build ms | peak | map | arena | digest |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -18,22 +21,25 @@ _Measured 2026-10-22 13:59 UTC._
 | ear.batch4 | 90.1 | 45.4 | - | - | - | - | 273.9 | 0.85 GiB | 1.53 GiB | 3.9MiB | 351492f41141665e |
 | listen | 2501.2 | 2257.6 | 17.460 | 0.129 | - | - | 1290.7 | 2.31 GiB | 1.53 GiB | 1.10GiB | 2f93dfa1d7cdeeb1 |
 | speak | 21823.1 | 20254.7 | 26.400 | 0.767 | 18927.2 | 1327.6 | 1450.7 | 2.42 GiB | 1.38 GiB | 724.6MiB | 231d823496450627 |
-| embed | 41417.8 | 41305.0 | - | - | - | - | 43233.8 | 3.05 GiB | 0.37 GiB | 670.2MiB | c57f2b3015fd8469 |
+| embed.256 | 104.6 | 68.4 | - | - | - | - | 718.8 | 1.63 GiB | 0.29 GiB | 547.9MiB | ec6e9fa56756e071 |
+| embed.8192 | 2397.4 | 2310.4 | - | - | - | - | 1033.3 | 1.77 GiB | 0.29 GiB | 1.31GiB | bfa0336b63d2e3d0 |
 
-The cell's number is the **`s/speech s`** column: the **warm** figure (`warm ms`) divided by the `speech s` column — the cell's own seconds of speech, `samples / 16 000` for recognition and `rows · 1 920 / 24 000` for synthesis, printed so the rate re-derives from this table alone. `loop ms` is the synthesis generation loop (speaker, prefill, body, predictor, sampler) and `sound ms` is the sound half; their sum is `warm ms`, so a ×N synthesis claim reads off both. Both are the same phase sums the cell's `loop_ms`/`sound_ms` tokens record; `speak`'s `sound_phase_ms` field is the sound graphs' summed `step_ms` — the same sum the `sound ms` column is taken from, carried as a field so a cell line is self-describing. For `speak` the recorded `digest` is the **waveform** digest, not the `prompt_digest` its own line prints. `-` is a cell with no speech denominator. Each cell line prints its own `warm_spread` (the warm runs' max − min, in ms). `peak` is the cell process's own high-water (`ru_maxrss`, which no later drop can lower) and each cell is its own process, so the figure is the maximum that unit's own process reached — what it held when it peaked, not what is live when the line prints. For `speak` the reading is taken before the round-trip gate loads the recogniser, so the column excludes it (the gate prints its own post-gate reading as `speak roundtrip peak_mb`). Across this machine's records the column moves between runs of one tree, and the summary line carries the spread each run saw as `peak_spread`. `embed` walks multi-row multiplies (`m = 256` and `m = 8 192` over a Q4_K stack), which the row-grouped GEMM carries: the one-row arm's rates are not in its path, so its figure tracks the machine's ambient state and the packing, not those levers.
+The cell's number is the **`s/speech s`** column: the **warm** figure (`warm ms`) divided by the `speech s` column — the cell's own seconds of speech, `samples / 16 000` for recognition and `rows · 1 920 / 24 000` for synthesis, printed so the rate re-derives from this table alone. `loop ms` is the synthesis generation loop (speaker, prefill, body, predictor, sampler) and `sound ms` is the sound half; their sum is `warm ms`, so a ×N synthesis claim reads off both. Both are the same phase sums the cell's `loop_ms`/`sound_ms` tokens record; `speak`'s `sound_phase_ms` field is the sound graphs' summed `step_ms` — the same sum the `sound ms` column is taken from, carried as a field so a cell line is self-describing. For `speak` the recorded `digest` is the **waveform** digest, not the `prompt_digest` its own line prints. `-` is a cell with no speech denominator. Each cell line prints its own `warm_spread` (the warm runs' max − min, in ms). `peak` is the cell process's own high-water (`ru_maxrss`, which no later drop can lower) and each cell is its own process, so the figure is the maximum that unit's own process reached — what it held when it peaked, not what is live when the line prints. For `speak` the reading is taken before the round-trip gate loads the recogniser, so the column excludes it (the gate prints its own post-gate reading as `speak roundtrip peak_mb`). Across this machine's records the column moves between runs of one tree, and the summary line carries the spread each run saw as `peak_spread`. `embed.256` and `embed.8192` are one bidirectional pass each over the whole sequence on a Q8_0 stack. Their `digest` is over the L2-normalised 768-vector the row names — the cell's answer, not the graph's raw output.
 
 The pinned answers, compared token for token: recognition must reproduce `обычные объявления метро делались только на каталонском языке, но не забывали переводить объявления в другие языки, например, итальянский, испанский, английский, французский, итальянский`; the synthesis round trip — the waveform the `speak` row's digest names, resampled to 16 kHz and read back through the recogniser on its raw samples — must reproduce `Call me Ishmael. Some years ago, now I'm old, beside the sea. I've seen them all, every shore, every harbor, every city, every town, every street, every house, every farm, every field, every hill, every mountain, every forest, every river, every ocean, every island, every shore, every harbor, every city, every town, every street, every house, every farm, every field, every hill, every mountain, every forest, every river, every`.
 
 ### Weight streams, against the machine's streaming ceiling
 
-Ceiling, measured on this run's device before the cells: **112.9 GB/s** on a streaming read (104.5–131.0 over 5 rounds) and 118.1 GB/s of total traffic on a streaming copy (110.5–119.1). The read figure is the one the rows below are reported against, because a weight is read and never written; the copy figure is the same probe's other arm, recorded beside it. Both come from `rlx_wgpu::bandwidth::stream_ceiling`: a 64.0 MiB vectorised read and a 64.0 MiB vectorised copy, on `Apple M3 Pro (Metal)`. The same probe after the cells read 119.7 GB/s (107.0–124.8), which is the reading-to-reading spread to hold the figure to.
+This run measured no generative cell, so it took no stream reading of its own: the rows below are the run that measured them, restated against the ceiling printed below.
+
+Ceiling, measured on this run's device before the cells: **130.9 GB/s** on a streaming read (129.6–132.2 over 5 rounds) and 129.9 GB/s of total traffic on a streaming copy (129.0–132.1). The read figure is the one the rows below are reported against, because a weight is read and never written; the copy figure is the same probe's other arm, recorded beside it. Both come from `rlx_wgpu::bandwidth::stream_ceiling`: a 64.0 MiB vectorised read and a 64.0 MiB vectorised copy, on `Apple M3 Pro (Metal)`. The same probe after the cells read 132.9 GB/s (132.1–134.2), which is the reading-to-reading spread to hold the figure to.
 
 | phase | unit | weight bytes/unit | ms/unit | GB/s | of the read ceiling |
 |---|---|---|---|---|---|
-| recognition decode | one token | 1 100 961 792 | 22.66 | 48.6 | 43.0 % |
-| talker body | one frame | 850 870 272 | 19.91 | 42.7 | 37.8 % |
-| code predictor | one level | 87 109 632 | 2.32 | 37.5 | 33.2 % |
-| sound half | one utterance | 1 348 042 624 | 1327.59 | 1.0 | 0.9 % |
+| recognition decode | one token | 1 100 961 792 | 22.66 | 48.6 | 37.1 % |
+| talker body | one frame | 850 870 272 | 19.91 | 42.7 | 32.6 % |
+| code predictor | one level | 87 109 632 | 2.32 | 37.5 | 28.6 % |
+| sound half | one utterance | 1 348 042 624 | 1327.59 | 1.0 | 0.8 % |
 
 Each row's numerator is the graph's own parameter bytes — packed and f32 — which its multiplies and convolutions read once per unit, and only operands that are parameters count; a graph that read one of them twice per unit would move more, and one that read a slice would move less. `talker body` is one frame, `code predictor` one of a frame's sixteen projecting levels (the frame's stream and time divided by the levels it walks), `sound half` the utterance's windows summed with the graph each window actually ran, and `recognition decode` one generated token. The figure in each row is the run whose warm figure is the table's.
 
@@ -43,24 +49,28 @@ Provenance:
 - device: Apple M3 Pro (Metal)
 - driver: unknown
 - profile: release
-- code: 287a3943 change-sha256 6b1dc5392335dc42 (the commit and the SHA-256 of the tree's own difference from it — `MEASUREMENTS.md` excluded, because the run that measures rewrites it, and `crates/backends/rlx-mlx-sys` excluded, because the vendored MLX checkout is not this fork's content — which together are the content that produced these figures; a clean tree's digest is `e3b0c44298fc1c14`, the hash of an empty diff)
+- code: 1654bb26 change-sha256 1bc65fe07f71478c (the commit and the SHA-256 of the tree's own difference from it — `MEASUREMENTS.md` excluded, because the run that measures rewrites it, and `crates/backends/rlx-mlx-sys` excluded, because the vendored MLX checkout is not this fork's content — which together are the content that produced these figures; a clean tree's digest is `e3b0c44298fc1c14`, the hash of an empty diff)
+- rows: this run measured embed.256, embed.8192; every other row is carried from an earlier run of this file, and its figures belong to the run that took them — the `code` line above is this run's tree, not theirs. A carried row keeps its weight-stream row and the artefact lines of the run that took it
 - thermal: unknown (pmset -g therm printed no CPU limit line) (`pmset -g therm`, the reading `scripts/check-throttle.sh` gates on)
-- load: 8.61 6.43 6.09 (1/5/15-min) at the start, 3.04 4.24 5.14 at the table; every cell line carries its own `load=`
-- swap: 5562 MiB in use at the start, 1907 MiB grown during the run (ceiling 8192 MiB, raised by `MAHBOT_STAND_MAX_SWAP_MIB` from its default 1024)
-- command: `cargo run --release -p mahbot-inference` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`)
+- load: 3.27 3.08 3.24 (1/5/15-min) at the start, 3.08 3.04 3.21 at the table; every cell line carries its own `load=`
+- swap: 7103 MiB in use at the start, 0 MiB grown during the run (ceiling 1024 MiB)
+- command: `mahbot-inference 7 6` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`, article from `MAHBOT_EMBED_TEXT`)
+- model: `embeddinggemma-2-Q8_0.gguf` · 309855456 bytes · sha256 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135 · url https://huggingface.co/ggml-org/embeddinggemma-2-GGUF · revision 58faf90940886df2d62be555c8765d00dac362c5
+- voice: `voice-sample.wav` · 558764 bytes · sha256 0ca6c18b9189381dcdad83d26814f73b3f4d2d26dea6892371c2177d30e72ace
 - model: `Qwen3-ASR-1.7B-Q4_K_M.gguf` · 1282435552 bytes · sha256 3893b8926065bbff3da7586d21d8711a9b4fa4fa8f12cd0cefad58e31b2660b6
 - model: `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf` · 355709344 bytes · sha256 46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d
 - model: `Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf` · 1035965280 bytes · sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
 - model: `mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` · 446422912 bytes · sha256 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2
-- voice: `voice-sample.wav` · 558764 bytes · sha256 0ca6c18b9189381dcdad83d26814f73b3f4d2d26dea6892371c2177d30e72ace
+- text: `atlantic.txt` · 52785 bytes · sha256 df0eb1cd6ed0844698e1b63bc34698f2c3591650fede12d4d58e2c48ce0bdc0f · https://en.wikipedia.org/w/index.php?title=Atlantic_Ocean&oldid=1381231733 (revision 1381231733) · fetched with `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&format=json&formatversion=2&revids=1381231733` · cells: `embed.8192` first 5846 words (37543 bytes, sha256 40ee7e6f2fa3f530f018d05e3538314ab9c9656b829d4654eb52a7810faaba3c) and `embed.256` 195 words from `Large quantities of basalt erupted at this time period` (1251 bytes, sha256 727dccf3fdbd6460acd836ef132e0679f2904206f940df20b10c2cbcd47ce960) · the text itself is not committed
 <!-- END stand -->
 
 ## What this record is
 
-One stand run of the tree the provenance block above names, on `Apple M3 Pro
-(Metal)`, with `RLX_WGPU_DBG_COUNTERS` and `RLX_WGPU_SCHEDULE` unset and
-`RLX_WGPU_ENCODE_CHUNK` at its default 64 steps — the scheduling shape the product
-path walks, and the one these figures belong to.
+A stand run of the tree its `code` line names, on `Apple M3 Pro (Metal)`, with
+`RLX_WGPU_DBG_COUNTERS` and `RLX_WGPU_SCHEDULE` unset and `RLX_WGPU_ENCODE_CHUNK`
+at its default 64 steps — the scheduling shape the product path walks, and the one
+these figures belong to. The `rows` line names which of them that run measured;
+the rest keep the figures of the run that took them.
 
 ### The cell, unit by unit
 
@@ -78,18 +88,88 @@ path walks, and the one these figures belong to.
 - `listen` — 2 257.6 ms, **0.129 s per second of speech**, inside the frozen
   figure's ±3 % band, with its transcript and `2f93dfa1d7cdeeb1` unchanged. The
   weight-stream row reads 22.66 ms a token at 48.6 GB/s.
-- `embed` — the ambient row: runs of one tree read 39–63 s this day, so a move
-  here is the machine and not the tree. Its `build ms` (43 233.8) is the
-  151 669-row table build and is most of this run's build total; build time
-  follows the machine, and is a lower-priority measure in any case.
+- `embed.8192` — **2 310.4 ms** for one 8 192-row bidirectional pass (three runs,
+  warm spread 5.1 ms; cold 2 397.4 ms, `load=` 3.1–3.2), the model's own masking
+  throughout: the twenty sliding layers walk their ±512 band, the four global
+  ones all 8 192 keys. The same run's `build ms` is 1 033.3 ms — the graph
+  compile plus the Q8_0→f16 widening, neither inside the timed path — and its
+  `peak` and `arena` are 1.77 GiB and 1.31 GiB. The reference engine reads
+  **~2.39 s of encode** for the same text on this machine — llama.cpp `b11724`
+  (commit `99db719bdf07`), the same Q8_0 artefact, Metal, flash attention on,
+  one 8 192-row physical batch, weights resident: 3.20–3.22 s of process over
+  five runs against 0.81–0.83 s for a one-token prompt over three. This row is
+  3.3 % under that figure and 3.7 % (89.6 ms) under the 2.4 s bar. `embed.256`
+  is the same pass over 256 rows: **68.4 ms** warm (spread 0.2 ms; cold 104.6
+  ms, `load=` 3.1–3.2), `build ms` 718.8, `peak` 1.63 GiB, `arena` 547.9 MiB —
+  tens of milliseconds.
+
+  **What is portable, and what is this device.** The 2.31 s row rides on the
+  cooperative-matrix feature. The same graph with `MAHBOT_EMBED_GEMM=packed` —
+  the file's Q8_0 bytes through `Op::DequantMatMul`, the portable route every
+  wgpu device can run — measures **3 451.9 ms** warm at 8 192 rows (three runs,
+  spread 0.7 ms; cold 3 486.3 ms; `peak` 0.73 GiB, `arena` 980.8 MiB) and
+  92.7 ms at 256 rows, 1 051.9 ms (43.8 %) over the 2.4 s bar and 1.49× the
+  cooperative arm. Both arms were taken on this tree. The win that *is* portable
+  is the route's shape: the single bidirectional pass, the banded walk over the
+  twenty sliding layers, the loop-expanded kernel and the
+  f16-operand/f32-accumulator form are the same work on any wgpu device that runs
+  them. The cooperative-matrix tile and this device's 3.5 TFLOP/s are not.
+
+  Where the two figures changed from, measured rather than argued. The dense
+  layers are one pass at **16-bit operands**: they split their 8 192 query rows
+  into 2 048-row chunks and multiply the 8 192×8 192 score squares cooperatively
+  (f16 operands downcast at the staged load, f32 accumulator, as the reference
+  engine does), 236.6 ms a layer for the whole chunked step — of which the two
+  multiplies are 157.2 ms at 3.58 and 3.42 TFLOP/s, the score matrix's softmax
+  16 ms and the transposes and f16 casts ~20 ms
+  (`tests/attention_dense_coop_cost.rs`); the same layers read ~0.57 s a layer on
+  the tiled kernel before this form. The linear/FFN **multiplies** moved from 2.19–2.57 to
+  3.07–3.66 TFLOP/s at the encoder's six shapes — a two-subgroup 64×64 tile with
+  32 accumulators and a ping-pong stage, plain WGSL over the cooperative-matrix
+  primitive (`tests/encoder_gemm_cost.rs`). The twenty sliding layers keep the
+  tiled band kernel at 49.9–51.2 ms a call, 11.7 ms of which is the call's own
+  upload/readback floor (`tests/attention_band_cost.rs`). Those figures are each a
+  call's own cost with its floor included, so this record does not apportion the
+  2.31 s between them: summing them over-counts the floors the fused pass pays
+  once. Residency is not what the cooperative form buys: the dense layers' score
+  matrix is chunked to 2 048 rows and the output region reuses Kᵀ's bytes, so
+  the cooperative row's `peak` (1.77 GiB) and `arena` (1.31 GiB) stay where the
+  f32 row's were. What separates the two arms' memory is
+  the f16 route's own 6 B per 2 B of weight — the packed arm reads `peak`
+  0.73 GiB and `arena` 980.8 MiB — and `build ms` is 1 033.3 against the packed
+  arm's 452.7.
+
+  Both rows produce the model's answer — the 8 192-row vector's cosine against the
+  reference engine's own output for the same text is 1.000000 at max-abs 8.8e-5,
+  and the 256-row one 1.000000 at 1.0e-4 on the cooperative route (0.999999 at
+  1.3e-4 packed) (`tests/embed_model.rs`, whose header states the tolerance and
+  both routes' residues, and whose fixture
+  `tests/fixtures/embeddinggemma2-golden.json` records the engine build that
+  produced it).
+
+  **The article, and how a re-run gets it.** The extract endpoint renders the
+  page's current text rather than the pinned revision's, so a fetch of the same
+  `revids=1381231733` (`query.pages[0].extract` of the JSON) on 2026-10-24
+  returned **52 787 bytes, sha256 `426ac83b…`** where the pin is 52 785 /
+  `df0eb1cd…`: the pin plus the two characters of the one edit landed after it —
+  revision 1381660382's `divided in two parts` → `divided into two parts`.
+  Undoing that edit reproduces the pin byte for byte (52 593 characters, sha256
+  `df0eb1cd…`), which is how the rows above were taken. The substitution is not
+  cosmetic to the cells: the drifted extract's own cut is 37 545 bytes against
+  the pinned 37 543 and tokenises to different ids, same 8 192 rows — so a wrong
+  article changes what the model reads, and `reference::article` checks the file
+  against both figures and refuses anything else. The text itself is not
+  committed.
 
 Each row of the weight-stream table divides that graph's own parameter bytes —
 the ones a node reaching an output reads — by the ms the same run took for one
 unit; the percentage is that quotient over the read ceiling the same run measured
 before the cells. `peak` and `build ms` are that table's own columns; both follow
 the process and the graph rather than a change, and across this machine's records
-both move between runs of one tree. This run's `peak` (2.42 GiB for `speak`) is
-inside the high-water every record of this tree carries (2.42–2.43 GiB).
+both move between runs of one tree. The `speak` row's `peak` (2.42 GiB) is
+inside the high-water every record of this tree carries (2.42–2.43 GiB); it is
+one of the rows this run did not measure, so it and its peak are the run that
+took them, as the `rows` line above says.
 
 ### The sound half's convolution blocks
 
@@ -112,8 +192,8 @@ apart from the arithmetic rate rather than as traffic.
 
 The three blocks are one session's window split, and that session's sound half read
 1 265.3 ms with a 121.5 GB/s read probe; this stand's sound half reads 1 327.6 ms on
-a box whose probe read 112.9 GB/s, so the two are read against their own probes and
-not subtracted from one another.
+a box whose probe read the figure at the head of its own table, so the two are read
+against their own probes and not subtracted from one another.
 
 The two heavy blocks are at 1.8–1.9 TFLOP/s and their GEMM demand sits at the
 probe's ceiling, so what a form change buys them is fewer reads for the same

@@ -5,22 +5,26 @@
 //! The stand: the live model paths from the compressed files to their answer, with
 //! the measurement taken on the way.
 //!
-//! Prerequisites for a full run: `MAHBOT_MODELS_DIR` naming the GGUF pairs and
-//! `MAHBOT_VOICE_WAV` naming the 16 kHz voice asset — the checkout carries no
-//! models, and the record pins their SHA-256s. `speak`'s round-trip gate opens the
-//! recognition pair too, and without it the cell runs and prints that the gate did
-//! not. The run rewrites `MEASUREMENTS.md`
+//! Prerequisites for a full run: `MAHBOT_MODELS_DIR` naming the GGUF pairs,
+//! `MAHBOT_VOICE_WAV` naming the 16 kHz voice asset and `MAHBOT_EMBED_TEXT`
+//! naming the article the embedding cells read — the checkout carries no models
+//! and no corpus, and the record pins their SHA-256s. The article is an input
+//! like the voice: the text itself is not committed, and `reference::article`
+//! refuses a file whose bytes do not hash to the pinned extract. `speak`'s
+//! round-trip gate opens the recognition pair too, and without it the cell runs
+//! and prints that the gate did not. The run rewrites `MEASUREMENTS.md`
 //! unless `MAHBOT_MEASUREMENTS` names another path, and `MAHBOT_STAND_MAX_SWAP_MIB`
 //! raises the swap ceiling the run is held to from its default.
 //!
-//! One entry point and no flags. The acceptance walks four units, each in its own
-//! process: the ear's 12 160-sample wake window (mel with the last frame dropped,
+//! One entry point, no flags: an optional list of cell indices — `mahbot-inference
+//! 7 6` — names the cells a run measures, and naming them writes their rows and
+//! one `code` line. The acceptance walks every cell in its own process: the ear's 12 160-sample wake window (mel with the last frame dropped,
 //! 76 frames, the 1.7B 24-block encoder, the projection, mean over ten tokens, L2,
 //! cosine); 30 s of listening (1 746 mel frames, the 234-row prompt, at most
 //! 2 048 new tokens on a cache that grows in 128-row buckets); 300 text tokens →
-//! 330 codec rows (26.4 s) through the talker, predictor and sound half; and a
-//! tokenizer-fed embedding cell over the whole token table. Every other cell
-//! stays behind its number in `cells`.
+//! 330 codec rows (26.4 s) through the talker, predictor and sound half; and the
+//! two embedding cells — `embed.256` and `embed.8192` — one pass each over the
+//! whole sequence through EmbeddingGemma 2's text tower, pooled and normalised.
 //!
 //! It is a heavy run of this crate and carries the bench's three rules: one
 //! instance at a time (`MAHBOT_LOCK`, defaulting to the temp directory), a
@@ -42,9 +46,9 @@
 //! runs; there is no separate "build everything first" step (`graphs::Compiled`).
 //! `build_ms` is the sum of those builds, `cold_ms` takes the first iteration of
 //! each phase cold and `run_ms` sums the warm medians. The parent collects the
-//! four units, runs each in its own process three times, and prints four unit rows
+//! cells, runs each in its own process three times, and prints a unit row for each
 //! (cold/warm time, peak, map and their spreads) plus one `build_ms` line whose
-//! value is the median of the three per-run sums of the four units. Everything
+//! value is the median of the three per-run sums over all of them. Everything
 //! goes to stdout; the child's `cell`/`phase`/`unit` lines are forwarded with
 //! their `at=`/`load=`.
 //!
@@ -64,7 +68,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::graphs::{BodyInput, Outcome, SampleSpec};
+use crate::graphs::{Outcome, SampleSpec};
 use crate::guard::{
     DEFAULT_MAX_RSS_MIB, DEFAULT_TIMEOUT_SECS, Deadline, EXIT_STOPPED, MemoryCeiling, RunLock,
     Watch,
@@ -74,8 +78,7 @@ use crate::listen::{
 };
 use crate::loader::{Model, Pair, Role};
 use crate::report::{
-    digest, fmt_ms, human, keys, load_average, max_abs, non_finite, peak_rss, pseudo_rand,
-    resident_rss, sci,
+    digest, fmt_ms, human, keys, load_average, max_abs, non_finite, peak_rss, resident_rss, sci,
 };
 use crate::synth::{
     DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, MAX_CODEC_ROWS as SPEAK_CODEC_ROWS,
@@ -102,19 +105,10 @@ const SPEECH_SAMPLES: usize = 480_000;
 /// utterance (a walk of 65 tokens here), so the common case pays one compile;
 /// the bucket exists to bound the operand, not to avoid a second graph.
 const DECODE_CACHE_BUCKET: usize = 128;
-/// The two embedding cells: an ordinary request/ticket, and the model limit.
-const EMBED_CELLS: [usize; 2] = [256, 8_192];
-/// The mel front end's own window.
-const MEL_FRAMES: usize = 72;
-/// The biases are read on a second of speech.
-const BIAS_FRAMES: usize = 100;
 
 /// The synthesis text condition, tokenized by the file's own tokenizer; it is
 /// long enough to fill all 300 tokens.
 const TTS_TEXT: &str = "Call me Ishmael. Some years ago, never mind how long precisely, having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world. It is a way I have of driving off the spleen and regulating the circulation. Whenever I find myself growing grim about the mouth; whenever it is a damp, drizzly November in my soul; whenever I find myself involuntarily pausing before coffin warehouses, and bringing up the rear of every funeral I meet; and especially whenever my hypos get such an upper hand of me, that it requires a strong moral principle to prevent me from deliberately stepping into the street, and methodically knocking people's hats off, then I account it high time to get to sea as soon as I can. This is my substitute for pistol and ball. With a philosophical flourish Cato throws himself upon his sword; I quietly take to the ship. There is nothing surprising in this. If they but knew it, almost all men in their degree, some time or other, cherish very nearly the same feelings towards the ocean with me.";
-/// A normal embedding request: the same tokenizer, filled into the 256/8192
-/// cells with the model's padding id.
-const EMBED_TEXT: &str = "Please summarize this support ticket. The customer cannot sign in after the password reset, and the verification email never arrives. Check the account state, resend the message, and report the result in one short answer.";
 /// The wake product artifact: the 1.7B 24-block sound encoder and its body,
 /// the same pair as recognition.
 const WAKE_BODY: &str = "Qwen3-ASR-1.7B-Q4_K_M.gguf";
@@ -136,10 +130,8 @@ enum Cell {
     Ear4,
     Listen,
     Speak,
-    Embed,
-    Mel,
-    Bias,
-    Head,
+    Embed256,
+    Embed8192,
 }
 
 fn cells() -> Vec<Cell> {
@@ -150,10 +142,8 @@ fn cells() -> Vec<Cell> {
         Cell::Ear4,
         Cell::Listen,
         Cell::Speak,
-        Cell::Embed,
-        Cell::Mel,
-        Cell::Bias,
-        Cell::Head,
+        Cell::Embed256,
+        Cell::Embed8192,
     ]
 }
 
@@ -177,10 +167,10 @@ fn stand_lock() -> std::path::PathBuf {
 /// carry the stop and the ceiling, in case the parent dies without killing it.
 const CELL_CHILD: &str = "MAHBOT_CELL_CHILD";
 
-/// The guards one heavy run carries: the shared lock (in the parent and in a
-/// cell started on its own), the wall-clock stop and the resident-set ceiling.
-/// The watch is the same [`Watch`] the bench installs, so a blocked device call
-/// cannot outlive either limit on any entry point.
+/// The guards a spawned cell carries: the wall-clock stop and the resident-set
+/// ceiling (the parent takes the shared lock itself). The watch is the same
+/// [`Watch`] the bench installs, so a blocked device call cannot outlive either
+/// limit on any entry point.
 struct StandGuard {
     /// Dropped with the guard: the thread wakes within a second and exits.
     _watch: Watch,
@@ -188,12 +178,6 @@ struct StandGuard {
 }
 
 impl StandGuard {
-    /// The parent, and a cell started on its own: the lock plus both limits.
-    fn install() -> Self {
-        let (lock, deadline, ceiling) = heavy_run();
-        Self::watched(Some(lock), deadline, ceiling)
-    }
-
     /// A cell the parent spawned. The parent holds the lock and kills the cell at
     /// its own stop, but the cell carries both limits itself as well: a parent
     /// that dies abnormally then leaves a cell that still ends at its ceiling or
@@ -344,41 +328,49 @@ pub fn main_entry() {
     // with the cell's position and nothing else — the list is the only thing that
     // can be named. Anything else is refused before any work starts: an argument
     // this binary does not understand must not launch the whole acceptance.
-    let mut args = std::env::args().skip(1);
-    if let Some(first) = args.next() {
-        let Ok(i) = first.parse::<usize>() else {
+    //
+    // Named indices may name more than one cell: a run that measures several at
+    // once writes each of their rows under one `code` line, which is what makes a
+    // figure's provenance the digest of the tree that produced it rather than of a
+    // later run that carried it.
+    let mut named: Vec<usize> = Vec::new();
+    for arg in std::env::args().skip(1) {
+        let Ok(i) = arg.parse::<usize>() else {
             eprintln!(
-                "stand: `{first}` is not a cell index — the stand takes one cell index and no \
-                 flags"
+                "stand: `{arg}` is not a cell index — the stand takes cell indices and no flags"
             );
             std::process::exit(2);
         };
-        if let Some(extra) = args.next() {
-            eprintln!(
-                "stand: unexpected argument `{extra}` — the stand takes one cell index and no flags"
-            );
+        // A repeated index would measure one cell twice and still write one row.
+        if named.contains(&i) {
+            eprintln!("stand: cell {i} is named twice");
             std::process::exit(2);
         }
-        let all = cells();
-        match all.get(i) {
-            Some(cell) => {
-                // A cell run on its own is a heavy run: it carries the shared
-                // lock, the stop and the ceiling. Spawned by the parent, the
-                // parent holds the lock and the cell carries both limits, so a
-                // parent that dies abnormally leaves a bounded cell behind.
-                let _guard = if std::env::var_os(CELL_CHILD).is_some() {
-                    StandGuard::child()
-                } else {
-                    StandGuard::install()
-                };
-                run(*cell, i);
-                return;
-            }
-            None => {
-                println!("cell {i} — there are {} cells", all.len());
-                std::process::exit(2);
-            }
+        named.push(i);
+    }
+    // Every named index must exist before anything runs.
+    let count = cells().len();
+    for i in &named {
+        if *i >= count {
+            println!("cell {i} — there are {count} cells");
+            std::process::exit(2);
         }
+    }
+    // A child measures exactly one cell and returns: the parent spawns one per
+    // index and owns the limits and the record, so two cells in one process would
+    // put the first one's residency inside the second's peak.
+    if std::env::var_os(CELL_CHILD).is_some() {
+        let [index] = named[..] else {
+            eprintln!(
+                "stand: {CELL_CHILD} takes one cell index and {} are named — run the cells one at \
+                 a time, or name them without the marker",
+                named.len()
+            );
+            std::process::exit(2);
+        };
+        let _guard = StandGuard::child();
+        run(cells()[index], index);
+        return;
     }
 
     // The stand is the crate's other multi-gigabyte, tens-of-minutes run, so it
@@ -408,12 +400,23 @@ pub fn main_entry() {
     );
     let _lock = lock;
 
-    // The acceptance units, each in its own process: the four paths whose time
-    // and peak the run reports. Every other cell stays behind its number. Each
-    // unit is run `RUNS` times so the report carries a real spread; the child's
-    // own `cell`/`phase`/`unit` lines are forwarded with their `at=`/`load=`.
+    // The acceptance units, each in its own process: one per row of the record's
+    // table — the ear and its three batch variants, listen, speak and the two
+    // embedding shapes. Each unit is run `RUNS` times so the report carries a real
+    // spread; the child's own `cell`/`phase`/`unit` lines are forwarded with their
+    // `at=`/`load=`.
     const RUNS: usize = 3;
-    let all = cells();
+    // The cell's position in `cells()` and the cell itself: the position is what
+    // the child is spawned with, so a run cut down to one cell still names the
+    // cell the record and the argument speak of.
+    let all: Vec<(usize, Cell)> = if named.is_empty() {
+        cells().into_iter().enumerate().collect()
+    } else {
+        // In the order named: the record's rows are written in the table's own
+        // order whatever this is, so a caller may name them for the run alone.
+        let positions = cells();
+        named.into_iter().map(|i| (i, positions[i])).collect()
+    };
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
@@ -436,17 +439,15 @@ pub fn main_entry() {
         speech_s: f64,
     }
     let mut rows: Vec<Row> = Vec::new();
-    for (i, cell) in all.iter().enumerate() {
-        let Some(name) = unit_name(cell) else {
-            continue;
-        };
+    for (i, cell) in &all {
+        let name = unit_name(cell);
         let mut got = Vec::with_capacity(RUNS);
         let mut streams = Vec::with_capacity(RUNS);
         let mut arena = String::new();
         let mut digest = String::new();
         let mut speech_s = f64::NAN;
         for _ in 0..RUNS {
-            let out = run_cell(&exe, i, deadline, ceiling);
+            let out = run_cell(&exe, *i, deadline, ceiling);
             let text = String::from_utf8_lossy(&out.stdout);
             streams.push(streams_of(name, &text));
             if let Some(value) = text
@@ -511,8 +512,7 @@ pub fn main_entry() {
         "# cold/warm run_ms, seconds per second of speech, the synthesis loop/sound split, \
          peak/map and their spreads"
     );
-    let mut table = String::new();
-    table.push_str("| unit | cold ms | warm ms | speech s | s/speech s | loop ms | sound ms | build ms | peak | map | arena | digest |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    let mut lines: Vec<(&'static str, String)> = Vec::new();
     for row in &rows {
         let (name, got, arena, digest) = (row.name, &row.got, &row.arena, &row.digest);
         let warm: Vec<f64> = got.iter().map(|v| v.1).collect();
@@ -571,11 +571,39 @@ pub fn main_entry() {
             now(),
             load_average(),
         );
-        table.push_str(&format!(
-            "| {name} | {cold_ms:.1} | {warm_ms:.1} | {speech_cell} | {per_s_cell} | {} | {} | {build_ms:.1} | {peak_gib:.2} GiB | {map:.2} GiB | {arena} | {digest} |\n",
-            split(median_run.0),
-            split(median_run.1),
+        lines.push((
+            name,
+            format!(
+                "| {name} | {cold_ms:.1} | {warm_ms:.1} | {speech_cell} | {per_s_cell} | {} | {} | {build_ms:.1} | {peak_gib:.2} GiB | {map:.2} GiB | {arena} | {digest} |\n",
+                split(median_run.0),
+                split(median_run.1),
+            ),
         ));
+    }
+    // A run that measures a subset of the cells rewrites only those rows. The
+    // rest are carried from the block this file already holds: they were taken by
+    // an earlier run against inputs this one does not open, so dropping them would
+    // lose the only record of them, and re-taking them here is impossible. The
+    // `rows` line under Provenance names which is which.
+    let mut carried = carried_block();
+    let mut table = String::from(
+        "| unit | cold ms | warm ms | speech s | s/speech s | loop ms | sound ms | build ms | peak | map | arena | digest |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+    );
+    let mut measured: Vec<&'static str> = Vec::new();
+    let mut carried_rows = 0usize;
+    for name in cell_names() {
+        match lines.iter().find(|(unit, _)| *unit == name) {
+            Some((unit, line)) => {
+                table.push_str(line);
+                measured.push(unit);
+            }
+            None => {
+                if let Some(line) = carried.rows.get(name) {
+                    table.push_str(line);
+                    carried_rows += 1;
+                }
+            }
+        }
     }
     let build_spread = build_runs.iter().copied().fold(f64::NEG_INFINITY, f64::max)
         - build_runs.iter().copied().fold(f64::INFINITY, f64::min);
@@ -622,10 +650,9 @@ pub fn main_entry() {
          reading as `speak roundtrip peak_mb`). Across this machine's records the \
          column moves between runs of one tree, and the summary line carries the spread \
          each run saw as `peak_spread`. \
-         `embed` walks \
-         multi-row multiplies (`m = 256` and `m = 8 192` over a Q4_K stack), which the \
-         row-grouped GEMM carries: the one-row arm's rates are not in its path, so its \
-         figure tracks the machine's ambient state and the packing, not those levers.\n",
+         `embed.256` and `embed.8192` are one bidirectional pass each over the whole \
+         sequence on a Q8_0 stack. Their `digest` is over the L2-normalised \
+         768-vector the row names — the cell's answer, not the graph's raw output.\n",
     );
     // The pinned answers themselves, in the record and not only in the run's
     // stdout: the sentences the two generative surfaces are held to, and the fact
@@ -644,7 +671,13 @@ pub fn main_entry() {
     // rate is only meaningful against what the same machine delivers on a plain
     // stream. Every row is one run's own pair of a byte count and a time — the run
     // whose warm figure is the row's — so the row's arithmetic is that division.
-    body.push_str("\n### Weight streams, against the machine's streaming ceiling\n\n");
+    //
+    // Only the rows are carried, never a paragraph of the earlier run's: the
+    // ceiling above them is this run's own probe on this run's device, and every
+    // percentage is taken against it here — so a carried row and a measured one
+    // cannot be denominated by two ceilings, and a second run cannot stack a note
+    // on a note.
+    let mut streams_body = String::new();
     match &ceiling_streams {
         Ok(c) => {
             // The second reading is a diagnostic, and it must not read as "not
@@ -662,7 +695,7 @@ pub fn main_entry() {
                     failure_reading(failure),
                 ),
             };
-            body.push_str(&format!(
+            streams_body.push_str(&format!(
                 "Ceiling, measured on this run's device before the cells: **{:.1} GB/s** on a \
                  streaming read ({:.1}–{:.1} over {} rounds) and {:.1} GB/s of total traffic on a \
                  streaming copy ({:.1}–{:.1}). The read figure is the one the rows below are \
@@ -682,17 +715,18 @@ pub fn main_entry() {
                 crate::measurements::device(),
             ));
         }
-        Err(failure) => body.push_str(&format!(
+        Err(failure) => streams_body.push_str(&format!(
             "Ceiling: the probe produced no figure — {}, so the rows below carry no \
              denominator.\n\n",
             failure_reading(failure),
         )),
     }
-    body.push_str(
+    streams_body.push_str(
         "| phase | unit | weight bytes/unit | ms/unit | GB/s | of the read ceiling |\n\
          |---|---|---|---|---|---|\n",
     );
     let ceiling_gb_s = ceiling_streams.as_ref().ok().map(|c| c.read_gb_s);
+    let mut measured_streams: Vec<StreamRow> = Vec::new();
     for row in &rows {
         let Some(run) = median_index(&row.got.iter().map(|v| v.1).collect::<Vec<_>>())
             .and_then(|i| row.streams.get(i))
@@ -702,21 +736,29 @@ pub fn main_entry() {
         for (phase, unit, bytes, ms) in run {
             // The rate is the division of the two figures printed beside it, so
             // both are rounded to the precision they are written at before the
-            // division; the percentage divides by the ceiling printed above. A
-            // reader can then reproduce every figure from the table.
+            // division; the percentage then divides by the ceiling printed above.
+            // A reader can reproduce every figure from the table.
             let ms = printed(*ms, 2);
             let rate = printed(bytes / (ms * 1e-3) / 1e9, 1);
-            let share = ceiling_gb_s.map_or_else(
-                || "-".to_string(),
-                |ceiling| format!("{:.1} %", rate / printed(ceiling, 1) * 100.0),
-            );
-            body.push_str(&format!(
-                "| {phase} | {unit} | {} | {ms:.2} | {rate:.1} | {share} |\n",
-                report::grouped(*bytes as u64),
-            ));
+            measured_streams.push(StreamRow {
+                unit: (*unit).to_string(),
+                columns: format!(
+                    "| {phase} | {unit} | {} | {ms:.2} | {rate:.1} |",
+                    report::grouped(*bytes as u64)
+                ),
+            });
         }
     }
-    body.push_str(
+    // The rows, keyed by the `unit` they are reported for: a run that measures one
+    // generative cell replaces that row and keeps the others, in the order the
+    // record already holds them in.
+    let measured_count = measured_streams.len();
+    let table_rows = merge_stream_rows(std::mem::take(&mut carried.streams), measured_streams);
+    let carried_any = table_rows.len() > measured_count;
+    for row in &table_rows {
+        streams_body.push_str(&stream_row(&row.columns, ceiling_gb_s));
+    }
+    streams_body.push_str(
         "\nEach row's numerator is the graph's own parameter bytes — packed and f32 — \
          which its multiplies and convolutions read once per unit, and only operands that \
          are parameters count; a graph that read one of them twice per unit would move \
@@ -726,17 +768,49 @@ pub fn main_entry() {
          the graph each window actually ran, and `recognition decode` one generated token. \
          The figure in each row is the run whose warm figure is the table's.\n",
     );
+    if carried_any && measured_count > 0 {
+        streams_body.push_str(
+            "\nA row this run did not measure is carried from the run that took it — its `ms` \
+             and `GB/s` are that run's — and only its percentage is taken against the ceiling \
+             above, which is this run's probe.\n",
+        );
+    }
+    body.push_str("\n### Weight streams, against the machine's streaming ceiling\n\n");
+    if measured_count == 0 && !table_rows.is_empty() {
+        body.push_str(
+            "This run measured no generative cell, so it took no stream reading of its own: \
+             the rows below are the run that measured them, restated against the ceiling \
+             printed below.\n\n",
+        );
+    }
+    body.push_str(&streams_body);
     body.push_str("\nProvenance:\n\n");
     body.push_str(&format!("- machine: {}\n", crate::measurements::machine()));
     body.push_str(&format!("- device: {}\n", crate::measurements::device()));
     body.push_str(&format!("- driver: {}\n", crate::measurements::driver()));
     body.push_str(&format!("- profile: {}\n", crate::measurements::profile()));
+    let code_line = crate::measurements::code_state();
     body.push_str(&format!(
-        "- code: {} (the commit and the SHA-256 of the tree's own difference from it — {} — \
-         which together are the content that produced these figures; a clean tree's digest is \
+        "- code: {code_line} (the commit and the SHA-256 of the tree's own difference from it — {} \
+         — which together are the content that produced these figures; a clean tree's digest is \
          `e3b0c44298fc1c14`, the hash of an empty diff)\n",
-        crate::measurements::code_state(),
         crate::measurements::provenance_rule(),
+    ));
+    // A row this run did not take is carried, and the tree that took it is in no
+    // line of this file — the `code` line above is this run's, rewritten on every
+    // run — so the line names which rows are the run's rather than placing the
+    // others.
+    body.push_str(&format!(
+        "- rows: this run measured {}{}\n",
+        measured.join(", "),
+        if carried_rows > 0 {
+            "; every other row is carried from an earlier run of this file, and its figures \
+             belong to the run that took them — the `code` line above is this run's tree, not \
+             theirs. A carried row keeps its weight-stream row and the artefact lines of the run \
+             that took it"
+        } else {
+            "; the table is this run's throughout"
+        },
     ));
     body.push_str(&format!(
         "- thermal: {} (`pmset -g therm`, the reading `scripts/check-throttle.sh` gates on)\n",
@@ -765,7 +839,26 @@ pub fn main_entry() {
             "- swap: the platform reported no figure; ceiling {ceiling_mib} MiB\n"
         )),
     }
-    body.push_str("- command: `cargo run --release -p mahbot-inference` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`)\n");
+    // The invocation that took these rows, cell indices and all: a fixed string
+    // here would name a run nobody made, and a row's provenance is the command
+    // that produced it.
+    let mut argv = std::env::args();
+    let exe = argv.next().unwrap_or_default();
+    let exe = std::path::Path::new(&exe)
+        .file_name()
+        .map_or(exe.clone(), |name| name.to_string_lossy().into_owned());
+    let command = argv.fold(exe, |mut line, arg| {
+        line.push(' ');
+        line.push_str(&arg);
+        line
+    });
+    body.push_str(&format!(
+        "- command: `{command}` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`, article from `MAHBOT_EMBED_TEXT`)\n"
+    ));
+    // The artefact lines this run can take, by the file name each line names: an
+    // artefact this run cannot read keeps the line the earlier run wrote for it,
+    // beside the rows it belongs to.
+    let mut artefacts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     if let Ok(dir) = crate::loader::models_dir() {
         for (_, body_name, sound_name) in crate::loader::PAIRS {
             for name in [*body_name, *sound_name] {
@@ -773,8 +866,28 @@ pub fn main_entry() {
                     body.push_str(&format!(
                         "- model: `{name}` · {bytes} bytes · sha256 {sha}\n"
                     ));
+                    artefacts.insert(name.to_string());
                 }
             }
+        }
+        // The embeddings role is one file rather than a pair, so `PAIRS` cannot
+        // name it: same form, its own line, and the source the numbers belong to
+        // when the file's own hash is that source's.
+        let name = crate::loader::EMBED_MODEL;
+        if let Some((bytes, sha)) = crate::measurements::digest(&dir.join(name)) {
+            let (url, revision, pin) = crate::loader::EMBED_MODEL_SOURCE;
+            let source = if sha == pin {
+                format!("url {url} · revision {revision}")
+            } else {
+                format!(
+                    "not the artefact of record (the record's is url {url} · revision {revision} \
+                     · sha256 {pin})"
+                )
+            };
+            body.push_str(&format!(
+                "- model: `{name}` · {bytes} bytes · sha256 {sha} · {source}\n"
+            ));
+            artefacts.insert(name.to_string());
         }
     }
     if let Ok(voice) = crate::loader::voice_wav()
@@ -789,6 +902,66 @@ pub fn main_entry() {
         body.push_str(&format!(
             "- voice: `{name}` · {bytes} bytes · sha256 {sha}\n"
         ));
+        artefacts.insert(name.to_string());
+    }
+    // The embedding cells' text: an input the checkout cannot carry, so the
+    // record names it the way it names the voice file and pins what was read —
+    // the article, the query that reproduces it, and the two cuts the cells
+    // measure. Read through [`crate::reference::article`], the same check the
+    // cells themselves use, so the line cannot name a file the cells refused, and
+    // built before the carried lines so this run's text replaces an earlier run's
+    // rather than joining it: there is one article, whatever it is named.
+    let text_line = crate::reference::article().ok().and_then(|text| {
+        let path = crate::loader::embed_text().ok()?;
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
+        // A cut that does not reproduce says why: the two cuts are pinned
+        // separately from the article, so a drift in one is not a drift in the
+        // other and the record must not fold the reason into "not reproducible".
+        let cut = |rows: usize| match crate::reference::cell_text(&text, rows) {
+            Ok(cut) => format!(
+                "{} bytes, sha256 {}",
+                cut.len(),
+                crate::reference::sha256_hex(cut.as_bytes())
+            ),
+            Err(reason) => format!("not the pinned cut: {reason}"),
+        };
+        Some(format!(
+            "- text: `{name}` · {} bytes · sha256 {} · {} (revision {}) · fetched with \
+             `{}revids={}` · cells: `embed.8192` first {} words ({}) and `embed.256` {} words \
+             from `{}` ({}) · the text itself is not committed\n",
+            text.len(),
+            crate::reference::sha256_hex(text.as_bytes()),
+            crate::reference::ARTICLE_URL,
+            crate::reference::ARTICLE_REVISION,
+            crate::reference::ARTICLE_FETCH,
+            crate::reference::ARTICLE_REVISION,
+            crate::reference::CELL_8192_WORDS,
+            cut(8_192),
+            crate::reference::CELL_256_WORDS,
+            crate::reference::CELL_256_ANCHOR,
+            cut(256),
+        ))
+    });
+    // The artefact lines this run did not emit, deduplicated by the file name in
+    // the line: the models directory here holds the embedding tower but not the
+    // ASR/TTS pairs, and those lines belong with the rows they took.
+    for line in &carried.artefacts {
+        if line.starts_with("- text: ") && text_line.is_some() {
+            continue;
+        }
+        let Some(name) = artefact_name(line) else {
+            continue;
+        };
+        if artefacts.insert(name.to_string()) {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if let Some(line) = &text_line {
+        body.push_str(line);
     }
     if let Err(error) = crate::measurements::refresh("stand", &body) {
         // The numbers are the deliverable, and the file is where they live: a
@@ -798,18 +971,172 @@ pub fn main_entry() {
     }
 }
 
-/// The four units of the acceptance, in report order.
-fn unit_name(cell: &Cell) -> Option<&'static str> {
+/// The units of the acceptance, in report order.
+fn unit_name(cell: &Cell) -> &'static str {
     match cell {
-        Cell::Ear => Some("ear"),
-        Cell::Ear075 => Some("ear.075"),
-        Cell::Ear2 => Some("ear.batch2"),
-        Cell::Ear4 => Some("ear.batch4"),
-        Cell::Listen => Some("listen"),
-        Cell::Speak => Some("speak"),
-        Cell::Embed => Some("embed"),
-        _ => None,
+        Cell::Ear => "ear",
+        Cell::Ear075 => "ear.075",
+        Cell::Ear2 => "ear.batch2",
+        Cell::Ear4 => "ear.batch4",
+        Cell::Listen => "listen",
+        Cell::Speak => "speak",
+        Cell::Embed256 => "embed.256",
+        Cell::Embed8192 => "embed.8192",
     }
+}
+
+/// The table's rows, in the record's own order.
+fn cell_names() -> Vec<&'static str> {
+    cells().into_iter().map(|cell| unit_name(&cell)).collect()
+}
+
+/// What the stand block in the record already holds and this run cannot take
+/// again: the `| unit |` rows by name, the weight-stream rows by the `unit` they
+/// are reported for (a run that measures one generative cell keeps the others'),
+/// and the `- model:` / `- voice:` / `- text:` lines for artefacts this run did
+/// not open.
+#[derive(Default)]
+struct Carried {
+    rows: std::collections::BTreeMap<&'static str, String>,
+    streams: Vec<StreamRow>,
+    artefacts: Vec<String>,
+}
+/// One weight-stream row: the `unit` it is reported for — the key a later run's
+/// row for the same phase replaces — and the five measured columns beside it (see
+/// [`stream_row_prefix`]). The percentage is not carried: it divides by the
+/// ceiling, and the ceiling is re-probed every run.
+struct StreamRow {
+    unit: String,
+    columns: String,
+}
+
+/// Read the block the record already holds. A run that measures one cell
+/// replaces that row and leaves the others where they are: the record holds the
+/// latest figures, not a log, so a row this run did not take is carried rather
+/// than dropped — and it cannot be re-taken here, because its own inputs are not
+/// what this run opens. The same holds for the stream rows and artefact lines
+/// that belong to those rows.
+fn carried_block() -> Carried {
+    std::fs::read_to_string(crate::measurements::path())
+        .map_or_else(|_| Carried::default(), |text| carried_from(&text))
+}
+
+/// [`carried_block`] over a block's text, so the carry's replace-vs-carry rule is
+/// drivable without a file on disk.
+fn carried_from(text: &str) -> Carried {
+    let mut carried = Carried::default();
+    let names = cell_names();
+    let mut inside = false;
+    let mut in_streams = false;
+    for line in text.lines() {
+        if line.starts_with("<!-- BEGIN stand -->") {
+            inside = true;
+            continue;
+        }
+        if line.starts_with("<!-- END stand -->") {
+            break;
+        }
+        if !inside {
+            continue;
+        }
+        if line.starts_with("### Weight streams") {
+            in_streams = true;
+            continue;
+        }
+        if in_streams {
+            if line.starts_with("Provenance:") || line.starts_with("### ") {
+                in_streams = false;
+            } else {
+                // Rows only: the header names the columns, the ceiling above them
+                // is this run's probe, and the prose describes both. Carrying a
+                // paragraph would re-emit it on every run that carries it.
+                let unit = line
+                    .trim_matches('|')
+                    .split('|')
+                    .nth(1)
+                    .map(str::trim)
+                    .filter(|unit| !unit.is_empty() && *unit != "unit");
+                if let (true, Some(unit), Some(five)) =
+                    (line.starts_with("| "), unit, stream_row_prefix(line))
+                {
+                    carried.streams.push(StreamRow {
+                        unit: unit.to_string(),
+                        columns: five,
+                    });
+                }
+                continue;
+            }
+        }
+        if line.starts_with("- model: ")
+            || line.starts_with("- voice: ")
+            || line.starts_with("- text: ")
+        {
+            // The provenance's artefact lines, and nothing else from it: the
+            // block's `code` line is the last run's tree and this run rewrites it,
+            // so it describes no carried row.
+            carried.artefacts.push(line.to_string());
+        } else if line.starts_with("| ") {
+            let unit = line
+                .trim_start_matches("| ")
+                .split(' ')
+                .next()
+                .unwrap_or("");
+            if let Some(name) = names.iter().find(|name| **name == unit) {
+                carried.rows.insert(*name, format!("{line}\n"));
+            }
+        }
+    }
+    carried
+}
+
+/// The five columns a weight-stream row is measured in — `| phase | unit | weight
+/// bytes/unit | ms/unit | GB/s |` — which is what a run takes and what a carried
+/// row keeps; its percentage is derived at write time, never carried.
+fn stream_row_prefix(line: &str) -> Option<String> {
+    let cols: Vec<&str> = line.trim_end().trim_matches('|').split('|').collect();
+    (cols.len() == 6).then(|| format!("|{}|", cols[..5].join("|")))
+}
+
+/// One weight-stream row: the five measured columns with the share their own
+/// `GB/s` takes of `ceiling_gb_s` beside them — always the ceiling printed above
+/// the table, so a carried row and a measured one are denominated alike. A run
+/// whose probe produced no figure writes `-` rather than a share of nothing.
+fn stream_row(five: &str, ceiling_gb_s: Option<f64>) -> String {
+    let rate = five
+        .trim_end_matches('|')
+        .rsplit('|')
+        .next()
+        .and_then(|rate| rate.trim().parse::<f64>().ok());
+    let share = match (rate, ceiling_gb_s) {
+        (Some(rate), Some(ceiling)) => format!("{:.1} %", rate / printed(ceiling, 1) * 100.0),
+        _ => "-".to_string(),
+    };
+    format!("{five} {share} |\n")
+}
+
+/// This run's rows over the ones the record holds, keyed by the `unit` each is
+/// reported for: a fresh row replaces its unit in place, a unit this run did not
+/// measure keeps the row the record holds — order and all — so measuring one
+/// generative cell cannot drop the other three.
+fn merge_stream_rows(carried: Vec<StreamRow>, measured: Vec<StreamRow>) -> Vec<StreamRow> {
+    let mut rows = carried;
+    for row in measured {
+        match rows.iter_mut().find(|slot| slot.unit == row.unit) {
+            Some(slot) => slot.columns = row.columns,
+            None => rows.push(row),
+        }
+    }
+    rows
+}
+
+/// The file name an artefact line names, between its first pair of backticks —
+/// the key the carried lines are deduplicated by.
+fn artefact_name(line: &str) -> Option<&str> {
+    let rest = line
+        .strip_prefix("- model: ")
+        .or_else(|| line.strip_prefix("- voice: "))
+        .or_else(|| line.strip_prefix("- text: "))?;
+    rest.strip_prefix('`')?.split('`').next()
 }
 
 /// One `key=value` figure from a child's stdout, by label rather than by
@@ -991,10 +1318,8 @@ fn label(cell: &Cell) -> String {
         Cell::Ear4 => "ear.batch4 samples=48000".into(),
         Cell::Listen => "listen frames=3000".into(),
         Cell::Speak => format!("speak text={SPEAK_TEXT_TOKENS} rows={SPEAK_CODEC_ROWS}"),
-        Cell::Embed => format!("embed cells={EMBED_CELLS:?}"),
-        Cell::Mel => "mel frames=72".into(),
-        Cell::Bias => format!("bias frames={BIAS_FRAMES}"),
-        Cell::Head => "head rows=1".into(),
+        Cell::Embed256 => "embed.256 rows=256".into(),
+        Cell::Embed8192 => "embed.8192 rows=8192".into(),
     }
 }
 
@@ -1273,10 +1598,8 @@ fn run(cell: Cell, i: usize) {
         Cell::Ear4 => ear_short(48_000, "ear.batch4"),
         Cell::Listen => listen(),
         Cell::Speak => speak(),
-        Cell::Embed => embed(),
-        Cell::Mel => mel(),
-        Cell::Bias => bias(),
-        Cell::Head => head(),
+        Cell::Embed256 => embed(256),
+        Cell::Embed8192 => embed(8_192),
     }
 }
 
@@ -3020,266 +3343,141 @@ fn speak_synthesis() -> Option<Synthesis> {
     })
 }
 
-/// The 8 192-token embedding cell walked one row at a time on a fixed-capacity
-/// cache. The block form rebuilt a graph per 512-row prefix and kept the whole
-/// prefix twice on the host; the one-row form carries the cache as device-resident
-/// handles and keeps only the graph's own row. Causal attention is exact — each
-/// step sees every row written before it and nothing after.
-fn embed_cell(
-    model: Arc<Model>,
-    cfg: &loader::Config,
-    ids: &[usize],
-    text_len: usize,
-    cell: usize,
-    device: rlx_runtime::Device,
-) -> anyhow::Result<(Outcome, Vec<f32>)> {
-    const BLOCK: usize = 512;
-    const GROUPS: usize = 8;
-    let hkv = cfg.kv_heads * cfg.head_dim;
-    let cell_cache = cell * hkv;
-    // Four layer groups: each group's arena sees only its own blocks, while the
-    // K/V for the whole body stays one row-first cache per group.
-    let group_len = cfg.layers.div_ceil(GROUPS);
-    let ranges: Vec<std::ops::Range<usize>> = (0..GROUPS)
-        .map(|g| (g * group_len).min(cfg.layers)..((g + 1) * group_len).min(cfg.layers))
-        .filter(|r| !r.is_empty())
-        .collect();
-    let mut k_cache: Vec<Vec<f32>> = ranges
-        .iter()
-        .map(|r| vec![0f32; cell_cache * r.len()])
-        .collect();
-    let mut v_cache: Vec<Vec<f32>> = ranges
-        .iter()
-        .map(|r| vec![0f32; cell_cache * r.len()])
-        .collect();
-    let mut times = Vec::new();
-    let mut pooled = Vec::new();
-    let mut graphs = Vec::with_capacity(ranges.len());
-    for r in &ranges {
-        graphs.push(graphs::Compiled::new(
-            device,
-            graphs::body_block_causal_layers(model.clone(), BLOCK, cell, r.clone())?,
-        )?);
-    }
-    // The K/V is bound one group at a time, just before its first block, so the
-    // host mirror of a group is gone by the time the next group is bound. Each
-    // block then feeds its own rows straight into the resident cache.
-    let compile_ms: f64 = graphs.iter().map(|g| g.compile_ms).sum();
-    let upload_ms: f64 = graphs.iter().map(|g| g.upload_ms).sum();
-    let arena_bytes = graphs.iter().map(|g| g.arena_bytes).max().unwrap_or(0);
-    let params_f32: usize = graphs.iter().map(|g| g.params_f32).sum();
-    let params_packed: usize = graphs.iter().map(|g| g.params_packed).sum();
-    let ops = graphs.last().map(|g| g.ops.clone()).unwrap_or_default();
-    let mut start = 0usize;
-    while start < cell {
-        let rows = BLOCK.min(cell - start);
-        let picks: Vec<(usize, usize)> =
-            ids[start..start + rows].iter().map(|&id| (0, id)).collect();
-        let mut table = model.table_rows_f32("token_embd.weight", &picks, cfg.d)?;
-        let mut x = Vec::with_capacity(rows * cfg.d);
-        for row in &mut table {
-            x.append(row);
-        }
-        let (cos, sin) = host::rope_tables_at(start, rows, cfg.head_dim, cfg.rope_base as f64);
-        let cos: Vec<f32> = cos.iter().map(|v| *v as f32).collect();
-        let sin: Vec<f32> = sin.iter().map(|v| *v as f32).collect();
-        let t = report::Stopwatch::start();
-        let last = graphs.len().saturating_sub(1);
-        for (gi, graph) in graphs.iter_mut().enumerate() {
-            let glen = ranges[gi].len();
-            if start == 0 {
-                if !graph
-                    .runner
-                    .resident_cache(&k_cache[gi], &v_cache[gi], (1, 2))
-                {
-                    anyhow::bail!("embed — resident cache refused for group {gi}");
-                }
-                k_cache[gi].clear();
-                v_cache[gi].clear();
-            }
-            let inputs: Vec<(&str, &[f32])> = vec![("x", &x), ("cos", &cos), ("sin", &sin)];
-            let out = graph.run_slices(&inputs);
-            // A packed feed declares the cache as `[block / rows, rows · layers
-            // · hkv]`; the block's side output is one row of that width, so all
-            // rows of this block go in one device copy. A cell smaller than a
-            // block keeps the row-at-a-time path.
-            if cell >= BLOCK && cell.is_multiple_of(BLOCK) {
-                if !graph.runner.feed_rows(0, start / rows, rows * glen * hkv) {
-                    anyhow::bail!("embed — packed feed refused at group {gi}, block {start}");
-                }
-            } else {
-                for r in 0..rows {
-                    if !graph.runner.feed_rows(r, start + r, glen * hkv) {
-                        anyhow::bail!("embed — resident feed refused at group {gi}, row {r}");
-                    }
-                }
-            }
-            if gi == last && pooled.is_empty() && start < text_len && text_len <= start + rows {
-                let at = (text_len - 1 - start) * cfg.d;
-                pooled = out[0][at..at + cfg.d].to_vec();
-            }
-            x = out[0].clone();
-        }
-        times.push(t.ms());
-        start += rows;
-    }
-    drop(graphs);
-    embed_finish(
-        times,
-        compile_ms,
-        upload_ms,
-        arena_bytes,
-        params_f32,
-        params_packed,
-        ops,
-        pooled,
-    )
-}
-
-fn embed_finish(
-    times: Vec<f64>,
-    compile_ms: f64,
-    upload_ms: f64,
-    arena_bytes: usize,
-    params_f32: usize,
-    params_packed: usize,
-    ops: Vec<(String, usize)>,
-    pooled: Vec<f32>,
-) -> anyhow::Result<(Outcome, Vec<f32>)> {
-    let v = l2(&pooled);
-    let total: f64 = times.iter().sum();
-    let o = Outcome {
-        compile_ms,
-        upload_ms,
-        first_ms: total,
-        step_ms: total,
-        min_ms: times.iter().copied().fold(f64::INFINITY, f64::min),
-        max_ms: times.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-        outs: vec![pooled],
-        arena_bytes,
-        dequant_nodes: 0,
-        params_f32,
-        params_packed,
-        ops,
-        passes: times.len(),
-    };
-    Ok((o, v))
-}
-
-/// The two embedding cells: the file's own tokenizer encodes the text, the cell
-/// is filled to its fixed length with the padding id, the body emits the last
-/// non-padding row, and the cell normalizes it to L2. The first cell is a normal
-/// request (256 tokens), the second is the model limit (8 192), walked as causal
-/// blocks so its attention never becomes the cell's whole square.
-fn embed() {
+/// One embedding cell: the model's own tokenizer over the article, BOS and EOS
+/// included, every row of the sequence and no padding, one graph run per
+/// repetition. The two cells are separate rows of the record — `embed.256` and
+/// `embed.8192` — and each is its own process, so neither is a sum of the other.
+///
+/// The sequence is `rows` long by construction — BOS, `rows - 2` content tokens,
+/// EOS — and the cell refuses a text that tokenises to anything else rather
+/// than padding it: the model's mean pooling has no padding mask, so a padded
+/// row would be pooled as if it were text.
+///
+/// The graph is the whole encoder over all rows at once ([`graphs::encoder`]):
+/// bidirectional attention, the twenty sliding layers banded at ±512, the four
+/// global ones over every key. Which arrangement serves a dense square is the
+/// plan's (`plan_attention`), not this cell's: the cooperative chunked form above
+/// its 2 048-row floor, the band walk with the band switched off where the
+/// adapter declines it.
+fn embed(rows: usize) {
     let path = match crate::loader::models_dir() {
-        Ok(dir) => dir.join("Qwen3-Embedding-0.6B-Q4_K_M.gguf"),
+        Ok(dir) => dir.join(loader::EMBED_MODEL),
         Err(e) => {
-            cell_failed!("cell embed — model directory: {e}");
+            cell_failed!("cell embed.{rows} — model directory: {e}");
         }
     };
-    let model = match Model::open(&path) {
-        Ok(m) => Arc::new(m),
+    let mut model = match Model::open(&path) {
+        Ok(m) => m,
         Err(e) => {
-            cell_failed!("cell embed — open: {e}");
+            cell_failed!("cell embed.{rows} — open: {e}");
         }
     };
+    // The route, before anything is built: the store rule hands the packed
+    // linears over as f16 params only when this device admits the cooperative
+    // f16 kernel for every multiply of this row count. The cell line names
+    // whichever route ran, so its figures cannot be read as the other's.
+    let gemm = model.f16_linears(rows);
+    let model = Arc::new(model);
     let tokenizer = match Tokenizer::from_model(&model) {
         Ok(t) => t,
         Err(e) => {
-            cell_failed!("cell embed — tokenizer: {e}");
+            cell_failed!("cell embed.{rows} — tokenizer: {e}");
         }
     };
-    let cfg = model.config().clone();
-    let device = rlx_runtime::Device::Gpu;
-    let mut text = tokenizer.encode(EMBED_TEXT);
-    text.truncate(*EMBED_CELLS.last().unwrap());
-    let pad = model
-        .file
-        .metadata
-        .get("tokenizer.ggml.padding_token_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(151643) as usize;
-    let text_len = text.len().max(1);
-    let mut build_ms = 0f64;
-    let c0 = graphs::device_counts();
-    let mut phases = Vec::new();
-    let mut values = Vec::new();
-    let mut last_outcome: Option<Outcome> = None;
-    for &cell in &EMBED_CELLS {
-        let mut ids = text.clone();
-        ids.truncate(cell);
-        while ids.len() < cell {
-            ids.push(pad);
+    let article = match crate::reference::article() {
+        Ok(text) => text,
+        Err(e) => {
+            cell_failed!("cell embed.{rows} — article: {e}");
         }
-        let last = ids.len().min(text_len) - 1;
-        let t = report::Stopwatch::start();
-        let (o, v) = if cell >= 8_192 {
-            match embed_cell(model.clone(), &cfg, &ids, text_len, cell, device) {
-                Ok(v) => v,
-                Err(e) => {
-                    cell_failed!("cell embed — serial {cell}: {e}");
-                }
-            }
-        } else {
-            let mut graph = match graphs::body_graph(
-                model.clone(),
-                cell,
-                BodyInput::Ids {
-                    table_rows: cfg.vocab,
-                    last,
-                },
-            )
-            .and_then(|m| graphs::Compiled::new(device, m))
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    cell_failed!("cell embed — build {cell}: {e}");
-                }
-            };
-            let o = graph.run(
-                &[("x".into(), ids.iter().map(|v| *v as f32).collect())],
-                WARM_REPS,
-            );
-            let v = l2(&o.outs[0]);
-            (o, v)
-        };
-        build_ms += t.ms();
-        println!(
-            "cell embed.{cell} tokens={cell} text_tokens={} pool_row={last} norm={:.6}",
-            text_len,
-            v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    };
+    let text = match crate::reference::cell_text(&article, rows) {
+        Ok(text) => text,
+        Err(e) => {
+            cell_failed!("cell embed.{rows} — cell text: {e}");
+        }
+    };
+    let ids = tokenizer.encode_with_specials(&text);
+    let content = crate::reference::content_tokens(rows);
+    if ids.len() != content + 2 {
+        cell_failed!(
+            "cell embed.{rows} — the text tokenises to {} ids, the cell is {content} content \
+             tokens plus BOS and EOS; no padding is applied",
+            ids.len()
         );
-        values.extend_from_slice(&v);
-        phases.push(Phase::single(format!("embed.{cell}"), &o));
-        last_outcome = Some(o);
     }
-    let o = match last_outcome {
-        Some(o) => o,
-        None => return,
+    let cfg = model.gemma().clone();
+    // The table's used rows only, in sequence order: the graph's input is
+    // `[rows, d]` and the whole 262 144-row table never enters the process.
+    let picks: Vec<(usize, usize)> = ids.iter().map(|&id| (0, id)).collect();
+    let mut x = Vec::with_capacity(rows * cfg.d);
+    match model.table_rows_f32("token_embd.weight", &picks, cfg.d) {
+        Ok(table) => {
+            for row in table {
+                x.extend_from_slice(&row);
+            }
+        }
+        Err(e) => {
+            cell_failed!("cell embed.{rows} — token table rows: {e}");
+        }
+    }
+
+    let device = rlx_runtime::Device::Gpu;
+    let t = report::Stopwatch::start();
+    let mut graph = match graphs::encoder(model.clone(), rows)
+        .and_then(|m| graphs::compile_encoder(device, m, gemm))
+    {
+        Ok(b) => b,
+        Err(e) => {
+            cell_failed!("cell embed.{rows} — build: {e}");
+        }
     };
-    let cold_ms: f64 = phases.iter().map(|p| p.cold_ms).sum();
-    let warm_ms: f64 = phases.iter().map(|p| p.warm_ms).sum();
-    let passes = phases.iter().map(|p| p.passes).sum();
+    let build_ms = t.ms();
+    // The memory ceiling, against this cell's own estimate before it launches:
+    // the planner's arena, the params that were just uploaded, and the mapped
+    // weight file. A graph that could only run by exhausting the resident-set
+    // ceiling is refused here, naming the three figures and the ceiling.
+    let ceiling_mib = limit("MAHBOT_MAX_RSS_MIB", DEFAULT_MAX_RSS_MIB);
+    let map_bytes = file_bytes(&model.path);
+    let params = (graph.params_f32 + graph.params_packed) as u64;
+    let estimate = graph.arena_bytes as u64 + params + map_bytes;
+    if estimate > ceiling_mib.saturating_mul(1024 * 1024) {
+        cell_failed!(
+            "cell embed.{rows} — refuses to launch: arena {} + params {} + weights {} = {} is \
+             over the {ceiling_mib} MiB ceiling (`MAHBOT_MAX_RSS_MIB`, default \
+             {DEFAULT_MAX_RSS_MIB})",
+            human(graph.arena_bytes as u64),
+            human(params),
+            human(map_bytes),
+            human(estimate),
+        );
+    }
+
+    let c0 = graphs::device_counts();
+    let o = graph.run(&[("x".into(), x)], WARM_REPS);
+    let values = l2(&o.outs[0]);
+    println!(
+        "cell embed.{rows} tokens={rows} content={content} norm={:.6}",
+        values.iter().map(|v| v * v).sum::<f32>().sqrt()
+    );
+    let phases = vec![Phase::single(format!("embed.{rows}"), &o)];
     let steps = Steps {
         build_ms,
-        cold_ms,
-        warm_ms,
-        passes,
+        cold_ms: o.first_ms,
+        warm_ms: o.step_ms,
+        passes: o.passes,
     };
     let c = graphs::device_counts();
     let peak = peak_rss();
-    let map_bytes = file_bytes(&model.path);
+    drop(graph);
     drop(model);
     report::release_free();
     line(
-        "embed",
+        &format!("embed.{rows}"),
         &[
-            ("cells", format!("{:?}", EMBED_CELLS)),
-            ("text_tokens", text_len.to_string()),
-            ("pad", pad.to_string()),
-            ("table_rows", cfg.vocab.to_string()),
+            ("tokens", rows.to_string()),
             ("dim", cfg.d.to_string()),
+            ("out", cfg.out_width.to_string()),
+            ("gemm", gemm.token().to_string()),
         ],
         &o,
         &values,
@@ -3293,245 +3491,165 @@ fn embed() {
     );
 }
 
-/// The mel front end alone, on a window of the same size the sound file is read at.
-fn mel() {
-    let frames = MEL_FRAMES;
-    let bins = 128;
-    let device = rlx_runtime::Device::Gpu;
-    let audio = pseudo_rand(graphs::MEL_HOP * frames, 5);
-    let t = report::Stopwatch::start();
-    let mut built =
-        match graphs::mel_frontend(frames, bins).and_then(|m| graphs::Compiled::new(device, m)) {
-            Ok(b) => b,
-            Err(e) => {
-                cell_failed!("cell mel — build: {e}");
-            }
-        };
-    let build_ms = t.ms();
-    let c0 = graphs::device_counts();
-    let o = built.run(&[("audio".into(), audio)], WARM_REPS);
-    let values = o.outs[0].clone();
-    let phases = vec![Phase::single("mel", &o)];
-    let steps = Steps {
-        build_ms,
-        cold_ms: o.first_ms,
-        warm_ms: o.step_ms,
-        passes: o.passes,
-    };
-    let c = graphs::device_counts();
-    let peak = peak_rss();
-    drop(built);
-    report::release_free();
-    line(
-        "mel",
-        &[("frames", frames.to_string()), ("bins", bins.to_string())],
-        &o,
-        &values,
-        &phases,
-        steps,
-        peak,
-        0,
-        (c.0 - c0.0, c.1 - c0.1),
-        0.0,
-        (0.0, 0.0),
-    );
-}
-
-/// The attention biases on this path: what the fusion pass does with them, read off
-/// the graph after the pass the backend itself runs.
-fn bias() {
-    let Some((_, sound)) = loader::pair_files(Role::Recognition) else {
-        cell_failed!("cell bias — no sound file");
-    };
-    let model = match crate::loader::models_dir().and_then(|dir| Model::open(dir.join(sound))) {
-        Ok(m) => Arc::new(m),
-        Err(e) => {
-            cell_failed!("cell bias — open {sound}: {e}");
-        }
-    };
-    let t = report::Stopwatch::start();
-    let built = match graphs::asr_encoder(model.clone(), BIAS_FRAMES) {
-        Ok(b) => b,
-        Err(e) => {
-            cell_failed!("cell bias — build: {e}");
-        }
-    };
-    let Some(hir) = built.module.into_hir() else {
-        cell_failed!("cell bias — flow built a non-HIR module");
-    };
-    let graph = match rlx_ir::hir_to_graph(hir) {
-        Ok(g) => g,
-        Err(e) => {
-            cell_failed!("cell bias — lowering: {e}");
-        }
-    };
-    let before = histogram(&graph);
-    let biases = biases(&graph);
-    let options = rlx_runtime::CompileOptions::new().with_fusion_report(true);
-    let result = match rlx_runtime::stages::compile_module_stages(
-        rlx_runtime::Device::Gpu,
-        rlx_ir::GraphModule::from_graph(graph),
-        &options,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            cell_failed!("cell bias — compile: {e}");
-        }
-    };
-    let after = histogram(result.lir.mir.as_graph());
-    let build_ms = t.ms();
-    let report = format!("{}", result.fusion);
-    let merged: Vec<&str> = report.lines().filter(|l| l.contains("nodes=")).collect();
-    println!(
-        "cell bias frames={BIAS_FRAMES} biases={} on_a_narrow={} build_ms={build_ms:.1} before={} after={} pass={} keys={}",
-        biases.0,
-        biases.1,
-        before,
-        after,
-        merged.last().map(|s| s.trim()).unwrap_or("none"),
-        keys(),
-    );
-}
-
-/// The recognition head on one row: the file's own packed multiply, and the draw on
-/// its logits.
-fn head() {
-    let Some((body, _)) = loader::pair_files(Role::Recognition) else {
-        cell_failed!("cell head — no body file");
-    };
-    let model = match crate::loader::models_dir().and_then(|dir| Model::open(dir.join(body))) {
-        Ok(m) => Arc::new(m),
-        Err(e) => {
-            cell_failed!("cell head — open {body}: {e}");
-        }
-    };
-    let cfg = model.config().clone();
-    let vocab = match cfg.head {
-        loader::Head::Separate { vocab, .. } | loader::Head::Tied { vocab, .. } => vocab,
-    };
-    let device = rlx_runtime::Device::Gpu;
-    let sampler = SampleSpec {
-        top_k: 50,
-        top_p: 0.9,
-        temperature: 0.9,
-        seed: 12345,
-    };
-    // The build step: both graphs the cell walks, compiled before either runs.
-    let t = report::Stopwatch::start();
-    let mut head_graph =
-        match graphs::head_graph(model.clone(), 1).and_then(|m| graphs::Compiled::new(device, m)) {
-            Ok(b) => b,
-            Err(e) => {
-                cell_failed!("cell head — build: {e}");
-            }
-        };
-    let mut sampler_graph = match graphs::sample_graph_one(vocab, sampler)
-        .and_then(|m| graphs::Compiled::new(device, m))
-    {
-        Ok(b) => b,
-        Err(e) => {
-            cell_failed!("cell head.sample — build: {e}");
-        }
-    };
-    let build_ms = t.ms();
-
-    let c0 = graphs::device_counts();
-    let o = head_graph.run(&[("x".into(), pseudo_rand(cfg.d, 5))], WARM_REPS);
-    let values = o.outs.first().cloned().unwrap_or_default();
-    let phases = vec![Phase::single("head", &o)];
-    let steps = Steps {
-        build_ms,
-        cold_ms: o.first_ms,
-        warm_ms: o.step_ms,
-        passes: o.passes,
-    };
-    let c = graphs::device_counts();
-    line(
-        "head",
-        &[("rows", "1".to_string()), ("vocab", vocab.to_string())],
-        &o,
-        &values,
-        &phases,
-        steps,
-        peak_rss(),
-        0,
-        (c.0 - c0.0, c.1 - c0.1),
-        0.0,
-        (0.0, 0.0),
-    );
-
-    let c0 = graphs::device_counts();
-    let o = sampler_graph.run(&[("logits".into(), pseudo_rand(vocab, 7))], WARM_REPS);
-    let values = o.outs.first().cloned().unwrap_or_default();
-    let phases = vec![Phase::single("head.sample", &o)];
-    let steps = Steps {
-        build_ms,
-        cold_ms: o.first_ms,
-        warm_ms: o.step_ms,
-        passes: o.passes,
-    };
-    let c = graphs::device_counts();
-    line(
-        "head.sample",
-        &[("vocab", vocab.to_string())],
-        &o,
-        &values,
-        &phases,
-        steps,
-        peak_rss(),
-        0,
-        (c.0 - c0.0, c.1 - c0.1),
-        0.0,
-        (0.0, 0.0),
-    );
-}
-
-// ── small readings the cells share ─────────────────────────────────
-
-/// The op histogram of a lowered graph, most frequent first.
-fn histogram(g: &rlx_ir::Graph) -> String {
-    let mut h: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for n in g.nodes() {
-        *h.entry(format!("{:?}", n.op.kind())).or_default() += 1;
-    }
-    let mut v: Vec<(String, usize)> = h.into_iter().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    v.iter()
-        .map(|(k, n)| format!("{k}:{n}"))
-        .collect::<Vec<_>>()
-        .join("+")
-}
-
-/// `(attention biases added, of which next to a merged multiply's `Narrow`)`.
-fn biases(g: &rlx_ir::Graph) -> (usize, usize) {
-    let mut total = 0usize;
-    let mut on_a_narrow = 0usize;
-    for n in g.nodes() {
-        if !matches!(n.op, rlx_ir::Op::Binary(rlx_ir::op::BinaryOp::Add)) {
-            continue;
-        }
-        let has_bias = n.inputs.iter().any(|i| {
-            matches!(&g.node(*i).op, rlx_ir::Op::Param { name }
-                if name.ends_with(".bias") && name.contains(".attn_"))
-        });
-        if !has_bias {
-            continue;
-        }
-        total += 1;
-        if n.inputs
-            .iter()
-            .any(|x| matches!(g.node(*x).op, rlx_ir::Op::Narrow { .. }))
-        {
-            on_a_narrow += 1;
-        }
-    }
-    (total, on_a_narrow)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::caught;
+    use super::{carried_from, caught, merge_stream_rows, stream_row, stream_row_prefix};
     use rlx_wgpu::bandwidth::{CeilingFailure, StreamCeiling};
+
+    /// A block of the shape the record holds: cell rows, a weight-stream
+    /// subsection whose note paragraph was written by a run that measured no
+    /// generative cell, and the three kinds of artefact line.
+    const BLOCK: &str = "\
+<!-- BEGIN stand -->
+## Per-model measurement (stand)
+
+| unit | cold ms | warm ms | speech s | s/speech s | loop ms | sound ms | build ms | peak | map | arena | digest |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ear | 1.0 | 2.0 | 3.0 | 4.0 | - | - | 5.0 | 0.1 GiB | 0.2 GiB | 1 MiB | aa |
+| embed.8192 | 6.0 | 7.0 | - | - | - | - | 8.0 | 0.3 GiB | 0.4 GiB | 2 MiB | bb |
+| no such cell | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 |
+
+### Weight streams, against the machine's streaming ceiling
+
+This run measured no generative cell, so it took no stream reading of its own: the rows below are the run that measured them, restated against the ceiling printed below.
+
+Ceiling, measured on this run's device before the cells: **112.9 GB/s** on a streaming read.
+
+| phase | unit | weight bytes/unit | ms/unit | GB/s | of the read ceiling |
+|---|---|---|---|---|---|
+| recognition decode | one token | 1 100 961 792 | 22.66 | 48.6 | 43.0 % |
+| talker body | one frame | 850 870 272 | 19.91 | 42.7 | 37.8 % |
+
+Each row's numerator is the graph's own parameter bytes.
+
+Provenance:
+
+- machine: nowhere
+- code: 1654bb26 change-sha256 aa (the commit)
+- model: `a.gguf` · 1 bytes · sha256 aa
+- voice: `v.wav` · 2 bytes · sha256 bb
+- text: `pinned.txt` · 3 bytes · sha256 cc
+<!-- END stand -->
+";
+
+    /// What the carry takes is rows and lines, never a paragraph: a paragraph it
+    /// read back would be written again on every run that carries it, one copy per
+    /// run.
+    #[test]
+    fn a_carried_block_takes_rows_and_lines_but_no_paragraph() {
+        let carried = carried_from(BLOCK);
+        assert_eq!(
+            carried.rows.keys().copied().collect::<Vec<_>>(),
+            ["ear", "embed.8192"],
+            "the cell rows it names, and no header or stranger's row"
+        );
+        assert_eq!(
+            carried
+                .streams
+                .iter()
+                .map(|row| row.unit.as_str())
+                .collect::<Vec<_>>(),
+            ["one token", "one frame"],
+            "one row per unit"
+        );
+        assert!(
+            !carried
+                .streams
+                .iter()
+                .any(|row| row.columns.contains("no generative cell")),
+            "the note is a paragraph, not a row, and re-emitting it stacks it"
+        );
+        assert_eq!(
+            carried
+                .artefacts
+                .iter()
+                .filter_map(|line| super::artefact_name(line))
+                .collect::<Vec<_>>(),
+            ["a.gguf", "v.wav", "pinned.txt"],
+            "the article's identity travels with the embed rows it belongs to"
+        );
+        assert!(
+            !carried
+                .artefacts
+                .iter()
+                .any(|line| line.starts_with("- machine:") || line.starts_with("- code:")),
+            "only artefact lines are carried, not the rest of Provenance"
+        );
+    }
+
+    /// A carried row keeps its own `ms` and `GB/s` — they are the run that took
+    /// it — and has only its percentage re-taken, against the ceiling printed
+    /// above it: one table, one denominator.
+    #[test]
+    fn a_carried_row_is_restated_against_this_runs_ceiling() {
+        let line = "| recognition decode | one token | 1 100 961 792 | 22.66 | 48.6 | 43.0 % |";
+        let five = stream_row_prefix(line).expect("a six-column row");
+        assert_eq!(
+            stream_row(&five, Some(112.9)),
+            "| recognition decode | one token | 1 100 961 792 | 22.66 | 48.6 | 43.0 % |\n",
+            "the row's own ceiling reproduces its own share"
+        );
+        assert_eq!(
+            stream_row(&five, Some(97.2)),
+            format!("{five} 50.0 % |\n"),
+            "another ceiling restates the share, and only the share"
+        );
+        assert_eq!(
+            stream_row(&five, None),
+            format!("{five} - |\n"),
+            "a probe that produced no figure invents no denominator"
+        );
+    }
+
+    /// Measuring one generative cell replaces its row and keeps the rest: the
+    /// other units' rows are what the record holds, and this run cannot re-take
+    /// them.
+    #[test]
+    fn one_measured_unit_keeps_the_other_stream_rows() {
+        let row = |unit: &str, columns: &str| super::StreamRow {
+            unit: unit.to_string(),
+            columns: columns.to_string(),
+        };
+        let table = || {
+            merge_stream_rows(
+                vec![
+                    row(
+                        "one token",
+                        "| recognition decode | one token | 1 | 2.00 | 3.0 |",
+                    ),
+                    row("one frame", "| talker body | one frame | 4 | 5.00 | 6.0 |"),
+                    row(
+                        "one level",
+                        "| code predictor | one level | 7 | 8.00 | 9.0 |",
+                    ),
+                ],
+                vec![row(
+                    "one frame",
+                    "| talker body | one frame | 10 | 11.00 | 12.0 |",
+                )],
+            )
+        };
+        let rows = table();
+        assert_eq!(
+            rows.iter().map(|row| row.unit.as_str()).collect::<Vec<_>>(),
+            ["one token", "one frame", "one level"],
+            "order and the unmeasured units survive"
+        );
+        assert_eq!(
+            rows[1].columns,
+            "| talker body | one frame | 10 | 11.00 | 12.0 |"
+        );
+        assert_eq!(
+            merge_stream_rows(table(), table())
+                .iter()
+                .map(|row| row.columns.as_str())
+                .collect::<Vec<_>>(),
+            rows.iter()
+                .map(|row| row.columns.as_str())
+                .collect::<Vec<_>>(),
+            "carrying a table over itself changes nothing"
+        );
+    }
 
     /// The record keeps three readings apart — no adapter, failed device work, a
     /// panic — and a diagnostic must never fold the last two into the first. This

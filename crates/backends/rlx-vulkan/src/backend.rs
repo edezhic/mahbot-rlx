@@ -3933,6 +3933,9 @@ fn build_schedule(
                     MaskKind::None => (0u32, 0u32, 0u32),
                     MaskKind::Causal => (1, 0, 0),
                     MaskKind::SlidingWindow(w) => (2, 0, *w as u32),
+                    MaskKind::Window(_) => panic!(
+                        "two-sided attention band (MaskKind::Window) is not implemented on Vulkan"
+                    ),
                     MaskKind::Custom => (3, binder.off(arena, node.inputs[3]), 0),
                     MaskKind::Bias => (4, binder.off(arena, node.inputs[3]), 0),
                 };
@@ -3999,6 +4002,9 @@ fn build_schedule(
                         MaskKind::Causal => (1, 0, 0),
                         MaskKind::Custom => (2, binder.off(arena, node.inputs[4]), 0),
                         MaskKind::SlidingWindow(w) => (3, 0, *w as u32),
+                        MaskKind::Window(_) => panic!(
+                            "two-sided attention band (MaskKind::Window) is not implemented on Vulkan"
+                        ),
                         MaskKind::Bias => (4, binder.off(arena, node.inputs[4]), 0),
                     };
                     let wrt_id = match wrt {

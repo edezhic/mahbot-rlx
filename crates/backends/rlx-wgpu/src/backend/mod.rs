@@ -85,7 +85,7 @@ fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
         // (`attention_route`). An admitted plan fits the reserve without
         // depending on anything but this branch.
         let attn = match attention_route::plan_attention(graph, node) {
-            Ok(plan) if plan.decompose => plan.scratch_bytes(),
+            Ok(plan) if plan.decompose || plan.dense_coop => plan.scratch_bytes(),
             _ => 0,
         };
         if attn > max_bytes {
@@ -631,6 +631,27 @@ pub struct WgpuExecutable {
     /// leaving the route to be inferred from a timing: the schedule report prints
     /// the count, and the arm's attention debug print names which term it was.
     attention_window_declines: usize,
+    /// Dense square attention steps this compile kept on the fused walk because
+    /// the band kernel's admission refused their shapes (a head width with no
+    /// whole-row form at either workgroup width, a KV-head count that does not
+    /// divide the head count, or a dispatch grid over the per-dimension cap) where
+    /// the cooperative form was not booked for them. Every term is the graph's
+    /// own, so the count is a count of geometry rather than of an adapter; the
+    /// schedule report prints it and the arm's attention debug print names the
+    /// conjunct per step, so the dense-through-band fallback is visible instead of
+    /// silent.
+    attention_band_declines: usize,
+    /// Dense square attention steps the cooperative form's admission took but this
+    /// compile could not lower onto it: an adapter that does not build
+    /// `matmul_coop_f16_f32acc`, a device probe that has not shown it computes
+    /// `a·b`, a bind window that does not reach the plan's regions, an output slot
+    /// on a dense Q's bytes (which the route's later chunks would read after the
+    /// first chunk wrote them), or one of the two switches that decline the form
+    /// (`RLX_WGPU_NO_DENSE_COOP`, `RLX_WGPU_MATMUL_F32_ONLY`). Those are device,
+    /// memory, aliasing and switch terms rather than shapes, so the count says so;
+    /// the schedule report prints it and the arm's attention debug print names the
+    /// route.
+    attention_dense_coop_declines: usize,
 }
 
 mod attention_route;
@@ -648,6 +669,12 @@ mod step;
 mod test;
 
 pub(crate) use copy_route::*;
+/// The coop-GEMM admission and the absolute f32 pin, public because
+/// `mahbot-inference` asks the backend which multiplies this kernel serves
+/// instead of restating 64/64/32, and must agree with the pin when it reports a
+/// route.
+pub use helpers::coop_f16_f32acc_admits;
+pub use helpers::f32_matmul_pinned;
 pub(crate) use helpers::*;
 pub(crate) use host_plan::plan as host_plan;
 pub use host_plan::{HostBatch, HostGroup, HostIo, HostPlan, Region};
@@ -657,7 +684,9 @@ pub(crate) use step::*;
 /// The many-row attention route's query-row floor and the decode form's
 /// key-range split predicate: public because the crate's integration tests are
 /// external and read them to place their shapes on either side.
-pub use attention_route::{ATTENTION_DECOMPOSE_MIN_Q, attention_decode_key_splits};
+pub use attention_route::{
+    ATTENTION_DECOMPOSE_MIN_Q, DENSE_COOP_CHUNK_ROWS, DENSE_COOP_MIN_Q, attention_decode_key_splits,
+};
 
 /// The run report's marks handle, public only because the `gguf_gpu` entry
 /// points that take it are: the crate's integration tests are external and
@@ -714,6 +743,24 @@ pub(crate) fn coop_f32_direct_dispatch_inc() {
 /// Total dispatches of the direct f32 cooperative entry since process start.
 pub fn coop_f32_direct_dispatch_count() -> u64 {
     COOP_F32_DIRECT_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-wide count of `matmul_coop_f16_f32acc` dispatches. Same hook as
+/// [`coop_f32_dispatch_count`], for the same reason: the schedule's step names
+/// carry no precision, so a parity test that wants to show the shape it measured
+/// took this kernel — rather than the f16-accumulator one or the f32 arena form
+/// it outranks — counts dispatches under a forced arm.
+pub(crate) static COOP_F16_F32ACC_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn coop_f16_f32acc_dispatch_inc() {
+    COOP_F16_F32ACC_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total `matmul_coop_f16_f32acc` matmul dispatches since process start.
+pub fn coop_f16_f32acc_dispatch_count() -> u64 {
+    COOP_F16_F32ACC_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Process-wide count of `queue.submit` calls `src/` makes. Together with
@@ -867,6 +914,8 @@ impl WgpuExecutable {
         self.im2col_fallbacks = fresh.im2col_fallbacks;
         self.conv1d_implicit_declines = fresh.conv1d_implicit_declines;
         self.attention_window_declines = fresh.attention_window_declines;
+        self.attention_band_declines = fresh.attention_band_declines;
+        self.attention_dense_coop_declines = fresh.attention_dense_coop_declines;
         self.input_offsets = fresh.input_offsets;
         // The arena is this compile's, and a resident handle's host mirror was
         // emptied when its rows became resident — so this executable no longer
@@ -1007,6 +1056,8 @@ impl WgpuExecutable {
             im2col_fallbacks: 0,
             conv1d_implicit_declines: 0,
             attention_window_declines: 0,
+            attention_band_declines: 0,
+            attention_dense_coop_declines: 0,
         }
     }
 
@@ -1103,6 +1154,23 @@ impl WgpuExecutable {
     /// attention debug print says which term it was, for the step's own addresses.
     pub fn attention_window_declines(&self) -> usize {
         self.attention_window_declines
+    }
+
+    /// Dense square attention steps this compile kept on the fused walk because
+    /// the band kernel's admission refused their shapes and the cooperative form
+    /// was not booked for them (see the field of the same name). A non-zero count
+    /// is geometry the dense-through-band route could not hold, never an adapter
+    /// term; the schedule report prints it.
+    pub fn attention_band_declines(&self) -> usize {
+        self.attention_band_declines
+    }
+
+    /// Dense square attention steps whose shapes the cooperative form admits but
+    /// which this compile kept on another arrangement (see the field of the same
+    /// name). Device, arena and switch terms only, never geometry; the schedule
+    /// report prints it.
+    pub fn attention_dense_coop_declines(&self) -> usize {
+        self.attention_dense_coop_declines
     }
 
     /// Debug helper: run forward, then read every node slot back and
@@ -2845,7 +2913,17 @@ fn f16_weight_bind_range(
         );
     }
     let mut base = (lo_byte / ALIGN) * ALIGN;
-    let mut size = need.div_ceil(ALIGN) * ALIGN;
+    // The window has to cover `[base, hi_byte)`. Sizing it from `lo_byte` (or from
+    // `need`, which is measured from there) under-counts by the alignment slack —
+    // `base` is rounded DOWN and can sit up to `ALIGN - 1` bytes below it — so the
+    // window ended a few elements short of the region it describes whenever
+    // `b_off` was not already 256-aligned. A cooperative load of an element past
+    // the binding is not a fault: WebGPU returns zero, so the last rows of a
+    // weight silently became zeros and the product was off by ~1e-3 relative. That
+    // is what `tests/matmul_f16_f32acc_parity.rs` caught at `n = 64` (a weight
+    // window that landed on an unaligned offset); every shape whose `b_off` is
+    // already aligned was exact, which is why the fault looked shape-specific.
+    let mut size = hi_byte.saturating_sub(base).div_ceil(ALIGN) * ALIGN;
     size = size.max(256).min(max_binding).min(f16_buf_bytes);
     if base.saturating_add(size) < hi_byte {
         base = hi_byte.saturating_sub(size);
@@ -3428,6 +3506,35 @@ fn derive_matmul_compute_default(
         && coop16_aligned
         && crate::coop_probe::coop16_path_ok();
 
+    // CoopF16F32Acc — `matmul_coop_f16_f32acc`, the 64×64 form with an f32
+    // accumulator. Same IR term as Coop16 (a 16-bit-tagged weight, never a bf16
+    // one, which must stay bit-exact and is read from the f32 arena), and it
+    // outranks Coop16 wherever both are eligible because it costs nothing to: the
+    // two forms sit within 1–8% of each other per shape on this rig (2.24–2.56
+    // against 2.26–2.61 TFLOP/s at the embedding encoder's m = 8192 geometries, one
+    // dispatch with no readback, `tests/encoder_gemm_cost.rs`), so the f32
+    // accumulator — which keeps the deep-FFN sum that overflows Coop16's f16
+    // accumulator out of range — is a precision gain at the same rate.
+    //
+    // The geometry term is the shader's, and it is a refusal rather than a
+    // rounding: a cooperative store cannot be masked, so the output tile is
+    // written whole — `m` and `n` must be whole tiles (64) and `k` whole K stages
+    // (32), which is exactly [`coop_f16_f32acc_admits`]. A multiply off that grid
+    // keeps the kernel this cascade would have given it, and never takes this
+    // arm. Every projection of the text tower is whole on all three axes; a tail
+    // falls back rather than being padded, fused or written through a scalar
+    // path. What else it needs is a device that can build it (the 8.25 KiB of
+    // workgroup storage is the term that can go missing) and the operand-order
+    // probe's verdict, which is the only thing standing between this shader and a
+    // wrong product.
+    let coop_f16_f32acc_aligned = coop_f16_f32acc_admits(m as u64, n as u64, k as u64);
+    let coop_f16_f32acc_ok = any_low
+        && !any_bf16
+        && b_is_param
+        && coop_f16_f32acc_aligned
+        && crate::kernels::matmul_coop_f16_f32acc_kernel(dev).is_some()
+        && crate::coop_probe::f16_f32acc_path_ok();
+
     let coop_f16_vk_ok = !any_low
         && coop_f16_vk_eligible(dev, m, k, n)
         && b_is_param
@@ -3455,6 +3562,7 @@ fn derive_matmul_compute_default(
         b_is_param && coop_f32_admitted(dev, k, n, any_bf16 && b_is_param, CoopF32Alignment::Metal);
 
     let eligible = MatmulEligibility {
+        coop_f16_f32acc: coop_f16_f32acc_ok,
         coop16: coop16_ok,
         coop_f16_vk: coop_f16_vk_ok,
         coop_f32: coop_f32_ok,
@@ -3464,7 +3572,9 @@ fn derive_matmul_compute_default(
     };
 
     // ── The cascade: preference order among the eligible ────────────────────
-    let default = if coop16_ok {
+    let default = if coop_f16_f32acc_ok {
+        MatmulCompute::CoopF16F32Acc
+    } else if coop16_ok {
         MatmulCompute::Coop16
     } else if coop_f16_vk_ok {
         MatmulCompute::CoopF16Vk
@@ -3656,6 +3766,7 @@ pub fn coop_f32_direct_admitted(
 /// table must not be able to conjure either one here.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MatmulEligibility {
+    pub coop_f16_f32acc: bool,
     pub coop16: bool,
     pub coop_f16_vk: bool,
     pub coop_f32: bool,
@@ -3666,6 +3777,7 @@ impl MatmulEligibility {
     /// Under `RLX_WGPU_MATMUL_F32_ONLY` the pin is absolute.
     fn only_f32() -> Self {
         Self {
+            coop_f16_f32acc: false,
             coop16: false,
             coop_f16_vk: false,
             coop_f32: false,
@@ -3675,12 +3787,15 @@ impl MatmulEligibility {
 
     fn allows(&self, v: MatmulCompute) -> bool {
         match v {
+            MatmulCompute::CoopF16F32Acc => self.coop_f16_f32acc,
             MatmulCompute::Coop16 => self.coop16,
             MatmulCompute::CoopF16Vk => self.coop_f16_vk,
             MatmulCompute::CoopF32 => self.coop_f32,
             MatmulCompute::F32 => self.f32,
             // Never selectable from the table — see the struct doc.
-            MatmulCompute::F16 | MatmulCompute::Bf16Packed => false,
+            MatmulCompute::F16
+            | MatmulCompute::Bf16Packed
+            | MatmulCompute::CoopF16F32AccScratch => false,
         }
     }
 }
@@ -3760,6 +3875,7 @@ fn conv_gemm(
         _ => false,
     };
     let eligible = MatmulEligibility {
+        coop_f16_f32acc: false,
         coop16: false,
         coop_f16_vk: false,
         coop_f32,
@@ -3829,6 +3945,25 @@ fn apply_matmul_tuning(
 /// crate consumes). `to_` exists so the mapping is stated as a bijection and can
 /// be checked as one — and it is what a tuner writing measured winners back into
 /// the table will call.
+///
+/// One deliberate exception to the bijection: `CoopF16F32Acc` has no entry of its
+/// own in the shared enum, so it maps onto `D::Coop16`, the 16-bit cooperative
+/// family the table already names — adding a variant there would touch every GPU
+/// backend's table for one wgpu shader. The consequence is exact and confined to
+/// the table: it can name that family (which then means whichever of the two the
+/// caller's eligibility admits, `CoopF16F32Acc` first), and
+/// `matmul_compute_from_dispatch` never returns `CoopF16F32Acc`, so no cached
+/// entry can select it. The round-trip test still holds because it walks the
+/// shared enum, not this one.
+///
+/// `CoopF16F32AccScratch` — the same shader with B bound from the attention
+/// route's own f16 operand buffer instead of the weight mirror — appears here for
+/// the same reason and one more: it is a *wgpu dispatch* distinction (which
+/// buffer binding 2 is), not a device fact the shared table has any term for, so
+/// it maps onto the same family and the table can never select it. It is stated
+/// rather than omitted so that the match stays exhaustive over this crate's enum:
+/// a new variant has to say what it means to the table in the same place the
+/// others do.
 #[allow(dead_code)]
 pub(crate) fn matmul_compute_to_dispatch(
     v: MatmulCompute,
@@ -3837,7 +3972,11 @@ pub(crate) fn matmul_compute_to_dispatch(
     match v {
         MatmulCompute::F32 => D::F32,
         MatmulCompute::F16 => D::F16,
-        MatmulCompute::Coop16 => D::Coop16,
+        // The scratch form reuses the probe's convention: same kernel, same
+        // family, only B's buffer differs.
+        MatmulCompute::Coop16
+        | MatmulCompute::CoopF16F32Acc
+        | MatmulCompute::CoopF16F32AccScratch => D::Coop16,
         MatmulCompute::CoopF32 => D::CoopF32,
         MatmulCompute::CoopF16Vk => D::CoopF16Vk,
         MatmulCompute::Bf16Packed => D::Bf16Packed,
@@ -5377,6 +5516,8 @@ fn maybe_push_coop_f16_vk_casts(
             uniforms,
             bind_groups,
             mm_cast,
+            None,
+            0,
             a_off_f32,
             a_elems,
         );
@@ -5396,6 +5537,8 @@ fn maybe_push_coop_f16_vk_casts(
             uniforms,
             bind_groups,
             mm_cast,
+            None,
+            0,
             b_off_f32,
             b_elems,
         );
@@ -5458,9 +5601,15 @@ fn build_matmul_qkv_coop_f16_vk_bind_group(
         rebased_b,
     )
 }
-/// Append a CastF32ToF16 pre-pass: mirrors `arena[off..off+len]` (f32) into
-/// `arena_f16[off..off+len]` (f16) so coop matmul kernels can read operands
-/// as f16. Used before CoopF16Vk when A/B are computed activations.
+/// Append a CastF32ToF16 pre-pass: mirrors `arena[off..off+len]` (f32) into an
+/// f16 buffer so coop matmul kernels can read operands as f16.
+///
+/// `dst` names the buffer and the f16-element offset to write at; `None` is the
+/// weight mirror (`arena.f16_buffer`), which is indexed by the same logical
+/// element as the arena window, so the offset is the source's own. The dense
+/// attention route passes its own operand buffer, whose regions are packed from
+/// element 0 (see the route's arm in `compile::lower`).
+#[allow(clippy::too_many_arguments)]
 fn push_cast_f32_to_f16_step(
     device: &wgpu::Device,
     arena: &Arena,
@@ -5470,6 +5619,8 @@ fn push_cast_f32_to_f16_step(
     uniforms: &mut Vec<wgpu::Buffer>,
     bind_groups: &mut Vec<wgpu::BindGroup>,
     mm_cast: &Option<&'static Kernel>,
+    dst: Option<(&wgpu::Buffer, u32)>,
+    scale_bits: u32,
     src_off: u32,
     len: u32,
 ) {
@@ -5477,15 +5628,29 @@ fn push_cast_f32_to_f16_step(
         Some(k) => *k,
         None => return, // device lacks SHADER_F16; fall through, dispatch will skip
     };
-    let f16_buf = match &arena.f16_buffer {
-        Some(b) => b,
-        None => return,
+    let mirror = arena.f16_buffer.as_ref();
+    let (f16_buf, f16_base, f16_size) = match dst {
+        Some((b, _)) => (b, 0, b.size()),
+        None => {
+            let Some(b) = mirror else { return };
+            let (base, size) = f16_shadow_bind_range(arena_base, arena_size, b.size());
+            (b, base, size)
+        }
+    };
+    let src_window = match dst {
+        // The mirror is indexed by the arena's own logical element (see
+        // `f16_shadow_bind_range`), so the source index is rebased against the
+        // arena window's base.
+        None => src_off.saturating_sub((arena_base / 4) as u32),
+        // The route's side buffer binds its own window, so the source index is the
+        // arena window's own.
+        Some(_) => src_off,
     };
     let p = CastF32ToF16Params {
-        src_off: src_off.saturating_sub((arena_base / 4) as u32),
+        src_off: src_window,
         len,
-        _p0: 0,
-        _p1: 0,
+        dst_off: dst.map_or(src_window, |(_, off)| off),
+        scale_bits,
     };
     let u = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("rlx-wgpu cast_f32_to_f16 uniform"),
@@ -5496,7 +5661,6 @@ fn push_cast_f32_to_f16_step(
     // Write params at compile (kernel doesn't depend on active extent).
     let dev = wgpu_device().expect("rlx-wgpu: device gone");
     dev.queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
-    let (f16_base, f16_size) = f16_shadow_bind_range(arena_base, arena_size, f16_buf.size());
     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("rlx-wgpu cast_f32_to_f16 bg"),
         layout: &kernel.bgl,
@@ -5531,6 +5695,12 @@ fn push_cast_f32_to_f16_step(
 /// Per-Matmul-step bind group builder. Returns `(bind_group, rebased_b_off)`;
 /// `rebased_b_off` adjusts `MatmulParams.b_off` when the f16 weight buffer is
 /// window-bound.
+///
+/// `scratch_b16` is the dense attention route's own f16 operand buffer, bound
+/// whole at offset 0 for [`MatmulCompute::CoopF16F32AccScratch`]'s B — the one
+/// caller that has no weight operand to bind instead. Every other caller passes
+/// `None`.
+#[allow(clippy::too_many_arguments)]
 fn build_matmul_bind_group(
     device: &wgpu::Device,
     mm_k: &Kernel,
@@ -5540,6 +5710,7 @@ fn build_matmul_bind_group(
     mm_f16c: &Option<&'static Kernel>,
     mm_coop: &Option<&'static Kernel>,
     mm_coop_f32: &Option<&'static Kernel>,
+    scratch_b16: Option<&wgpu::Buffer>,
     arena: &Arena,
     arena_base: u64,
     arena_size: u64,
@@ -5662,6 +5833,78 @@ fn build_matmul_bind_group(
                 ],
             }),
             b_off,
+        );
+    }
+    if compute_precision == MatmulCompute::CoopF16F32AccScratch
+        && let (Some(b16), Some(f16acc)) = (
+            scratch_b16,
+            crate::kernels::matmul_coop_f16_f32acc_kernel(device),
+        )
+    {
+        // The sibling's 3-binding layout with B bound from the route's own f16
+        // operand buffer, whole at offset 0 so `b_off` stays that buffer's element
+        // index. A is read from the f32 arena and downcast inside the kernel, as
+        // in `CoopF16F32Acc`.
+        return (
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rlx-wgpu matmul_coop_f16_f32acc scratch bg"),
+                layout: &f16acc.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: arena_bind_buf(arena, arena_base).0,
+                            offset: arena_bind_buf(arena, arena_base).1,
+                            size: NonZeroU64::new(arena_size),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: b16.as_entire_binding(),
+                    },
+                ],
+            }),
+            b_off,
+        );
+    }
+    if b_is_param
+        && compute_precision == MatmulCompute::CoopF16F32Acc
+        && let (Some(_f16_buf), Some(f16acc)) = (
+            &arena.f16_buffer,
+            crate::kernels::matmul_coop_f16_f32acc_kernel(device),
+        )
+    {
+        let (f16_res, rebased_b) = f16_bind(b_off);
+        // The same 3-binding layout as `matmul_coop16`: A is read from the f32
+        // arena and downcast inside the kernel, so it has no binding of its own.
+        return (
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rlx-wgpu matmul_coop_f16_f32acc bg"),
+                layout: &f16acc.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: arena_bind_buf(arena, arena_base).0,
+                            offset: arena_bind_buf(arena, arena_base).1,
+                            size: NonZeroU64::new(arena_size),
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: f16_res,
+                    }, // weights
+                ],
+            }),
+            rebased_b,
         );
     }
     if b_is_param

@@ -2862,6 +2862,7 @@ version = "0.2.18"
 dependencies = [
  "anyhow",
  "earshot",
+ "half",
  "rand 0.9.5",
  "rlx-flow",
  "rlx-gguf",

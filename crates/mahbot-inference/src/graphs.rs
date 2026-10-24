@@ -9,12 +9,12 @@
 //! result to a `Graph` a session can compile. Every decision that shapes the
 //! graphs is visible here: the sound stage is a separate graph from the body and runs
 //! host-unpacked weights, ConvTranspose uses the backend's transposed
-//! convolution, the embedding table is read by row / used as a tied head, and
-//! the codec reads its codebook by index.
+//! convolution, the embeddings file's table rows are read by the stand and enter
+//! the encoder as its input, and the codec reads its codebook by index.
 //!
-//! Shapes are taken from the files themselves (`Config` / `ClipConfig` merged
-//! from the metadata), not written down as constants: that is the point of doing
-//! the loading ourselves.
+//! Shapes are taken from the files themselves (`Config` / `ClipConfig` /
+//! `GemmaConfig` merged from the metadata), not written down as constants: that
+//! is the point of doing the loading ourselves.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use rlx_ir::{DType, HirNodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 
 use crate::emit::{self, LoaderWeights, PairWeights};
-use crate::loader::{Head, Model, Pair};
+use crate::loader::{Gemm, GemmaConfig, Head, Model, Pair, Store};
 
 // ── generic block: Qwen3 body and CLIP encoder are the same skeleton ──
 
@@ -88,6 +88,7 @@ pub fn block(
     // the biases ride outside the multiply, as the caller adds them below.
     let [q_mm, k_mm, v_mm] = emit::qkv(
         ctx,
+        model,
         h,
         m,
         b.d,
@@ -231,6 +232,7 @@ pub fn block(
         b.head_dim,
         kind,
         &[m / seq, b.heads, seq, b.head_dim],
+        None,
     );
     let a = if seq == 1 {
         emit::reshape(ctx, a, &[m as i64, (b.heads * b.head_dim) as i64])
@@ -594,35 +596,104 @@ pub fn profile() -> rlx_flow::CompileProfile {
     p
 }
 
-// ── a 28-layer body (all three roles share this graph) ─────────────
+// ── the embeddings encoder (EmbeddingGemma 2's text tower) ─────────
 
-/// What a body graph is fed and emits — the four things this stand checks about
-/// them, one graph each. The three roles' bodies are the same skeleton (Qwen3
-/// blocks + final norm); only the head and the tail differ, and the tail is the
-/// `pooled` flag.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BodyInput {
-    /// Rows of the file's embedding table, read by index: the whole embeddings
-    /// role — lookup → 28 blocks → final norm → the one pooled row (`last` is
-    /// the last non-padding row of the fixed cell).
-    Ids { table_rows: usize, last: usize },
-    /// The file's own separate `output.weight` as a graph of its own
-    /// (recognition 151936, synthesis 3072): hidden states in, logits out.
-    Head,
+/// The band an encoder layer attends over, as the graph states it.
+///
+/// A two-sided band is only a restriction once the sequence is longer than the
+/// band: at `rows <= radius + 1` the farthest pair of rows, `(0, rows - 1)`, is
+/// still within `radius`, so every query reaches every key and
+/// [`MaskKind::None`] names the same set of keys without stating a band. The
+/// twenty sliding layers therefore state [`MaskKind::Window`] at 8 192 rows and
+/// no mask at 256. The four global layers are dense at every length and state
+/// [`MaskKind::None`]; which kernel serves either statement is the backend
+/// router's decision, not the graph's.
+#[must_use]
+pub fn window_mask(rows: usize, radius: usize) -> MaskKind {
+    if rows <= radius + 1 {
+        MaskKind::None
+    } else {
+        MaskKind::Window(radius)
+    }
 }
 
-pub struct BodyStage {
-    pub model: Arc<Model>,
-    pub m: usize,
-    pub input: BodyInput,
+/// The nine linear projections one encoder block multiplies, as
+/// `(weight suffix, k, n)`, in the order the block emits them.
+///
+/// The stage reads its keys and extents from this one list, and the loader's
+/// route tests admit their multiplies against it, so a projection added to a
+/// block cannot drift between the graph and the f16 route's admission check.
+#[must_use]
+pub fn encoder_block_linears(
+    d: usize,
+    heads: usize,
+    head_dim: usize,
+    kv_heads: usize,
+    ffn: usize,
+    ple: usize,
+) -> [(&'static str, usize, usize); 9] {
+    [
+        ("attn_q.weight", d, heads * head_dim),
+        ("attn_k.weight", d, kv_heads * head_dim),
+        ("attn_v.weight", d, kv_heads * head_dim),
+        ("attn_output.weight", heads * head_dim, d),
+        ("ffn_gate.weight", d, ffn),
+        ("ffn_up.weight", d, ffn),
+        ("ffn_down.weight", ffn, d),
+        ("inp_gate.weight", d, ple),
+        ("proj.weight", ple, d),
+    ]
 }
 
-impl LayerStage for BodyStage {
-    fn name(&self) -> &str {
-        match self.input {
-            BodyInput::Head => "body_head",
-            _ => "body",
+/// Every linear the encoder graph states at `rows` rows, as `(m, k, n)`: the
+/// per-block list above for each layer, then the per-layer-input projection and
+/// the output projection. The stage and the loader's route tests read this one
+/// list.
+#[must_use]
+pub fn encoder_shapes(g: &GemmaConfig, rows: usize) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::with_capacity(2 + g.layers * 9);
+    out.push((rows, g.d, g.layers * g.ple));
+    for il in 0..g.layers {
+        for (_, k, n) in encoder_block_linears(
+            g.d,
+            g.heads,
+            g.head_dim_of(il),
+            g.kv_heads_of(il),
+            g.ffn,
+            g.ple,
+        ) {
+            out.push((rows, k, n));
         }
+    }
+    out.push((rows, g.d, g.out_width));
+    out
+}
+
+/// The encoder's one pass: the looked-up embedding rows in, the pooled
+/// 768-wide vector out — one graph over all rows, bidirectional, with no
+/// padding anywhere.
+///
+/// The layer is the reference's (`models/gemma-embedding2.cpp`), in its order:
+/// `attn_norm → q/k/v → per-head q/k norms and an unweighted V norm → RoPE at
+/// the layer's own base → attention (scale 1: the q/k norms replace `1/√d`) →
+/// `attn_output → post_attention_norm` → residual → `ffn_norm → gate·up (tanh
+/// GELU) → down → post_ffw_norm` → residual → the per-layer-input block
+/// (`inp_gate`·GELU · this layer's PLE slice → `proj` → `post_norm` → residual)
+/// → one scalar `layer_output_scale`. The per-layer inputs are computed once,
+/// before the stack, from the **scaled** embedding.
+///
+/// The mean over the rows — BOS and EOS included, as the reference engine's
+/// `--pooling mean` — is in the graph; the L2 normalisation is not, so the
+/// graph's output is the raw 768-vector and the record digests the normalised
+/// one the stand makes of it.
+pub struct EncoderStage {
+    pub model: Arc<Model>,
+    pub rows: usize,
+}
+
+impl LayerStage for EncoderStage {
+    fn name(&self) -> &str {
+        "gemma_encoder"
     }
 
     fn emit_layer(
@@ -631,58 +702,159 @@ impl LayerStage for BodyStage {
         input: FlowValue,
     ) -> Result<(FlowValue, StageArtifacts)> {
         let model = &self.model;
-        let cfg = model.config().clone();
-        let m = self.m;
+        let g = model.gemma();
+        let rows = self.rows;
+        let (d, heads, eps) = (g.d, g.heads, g.eps);
+        let rows_i = rows as i64;
 
-        // The file's own head, on its own: the same projection the body's tail
-        // would do, but as a graph of one op (and the only packed weight in it).
-        if let BodyInput::Head = self.input {
-            match cfg.head {
-                Head::Separate { name, vocab } => {
-                    let w = FlowValue::new(input.hir_id(), Shape::new(&[m, cfg.d], DType::F32));
-                    let out = emit::linear(ctx, &w, name)?;
-                    let sh = Shape::new(&[m, vocab], DType::F32);
-                    return Ok((
-                        FlowValue::new(out.hir_id(), sh.clone()),
-                        StageArtifacts::hidden_only(sh),
-                    ));
-                }
-                Head::Tied { .. } => {
-                    bail!("this body's head is the embedding table — build the tied head")
-                }
-            }
-        }
+        // The embedding is scaled by `√d` before anything reads it — the
+        // reference's `build_inp_embd(tok_embd, sqrtf(n_embd))`, and the PLE
+        // projection is over the scaled value, not the table's rows.
+        let root = emit::constant(ctx, &[1], (d as f32).sqrt());
+        let mut x = emit::mul(ctx, input.hir_id(), root);
 
-        // `token_embd.weight` is `[vocab, d]` in RLX order — rows are tokens.
-        let lookup = |ctx: &mut FlowCtx<'_>| -> Result<HirNodeId> {
-            let rows = match self.input {
-                BodyInput::Ids { table_rows, .. } => table_rows,
-                _ => cfg.vocab,
+        // ── the per-layer inputs, once for the whole stack ──
+        // `[rows, d] → [rows, layers · ple]` in one multiply, the `1/√d` scale,
+        // then the file's flat axis read as `[layers, ple]` with `ple` fastest
+        // (the file is `[n_embd, n_embd_per_layer · n_layer]`), one RMSNorm over
+        // each layer's own 512.
+        let w = FlowValue::new(x, Shape::new(&[rows, d], DType::F32));
+        let ple = emit::linear_encoder(ctx, model, &w, "per_layer_model_proj.weight")?;
+        let inv_root = emit::constant(ctx, &[1], 1.0 / (d as f32).sqrt());
+        let ple = emit::mul(ctx, ple.hir_id(), inv_root);
+        let ple = emit::reshape(ctx, ple, &[rows_i, g.layers as i64, g.ple as i64]);
+        let ple2 = emit::reshape(ctx, ple, &[(rows * g.layers) as i64, g.ple as i64]);
+        let gamma = emit::f32_param(ctx, model, "per_layer_proj_norm.weight", &[g.ple])?;
+        let ple2 = emit::rms_norm(ctx, ple2, gamma, eps, &[rows * g.layers, g.ple]);
+        let per_layer = emit::reshape(ctx, ple2, &[rows_i, g.layers as i64, g.ple as i64]);
+
+        // V carries no learnable norm in this file: an RMSNorm whose scale is
+        // one at the layer's own head width, not a missing step.
+        let ones_swa = emit::constant(ctx, &[g.head_dim_swa], 1.0);
+        let ones = emit::constant(ctx, &[g.head_dim], 1.0);
+
+        for il in 0..g.layers {
+            let p = format!("blk.{il}");
+            let hd = g.head_dim_of(il);
+            let nkv = g.kv_heads_of(il);
+            let lin = encoder_block_linears(d, heads, hd, nkv, g.ffn, g.ple);
+            let key = |i: usize| format!("{p}.{}", lin[i].0);
+            let qw = lin[0].2 as i64;
+            let kw = lin[1].2 as i64;
+            // One table pair per layer type: the twenty sliding layers rotate at
+            // the same width and base, so they share the two leaves.
+            let base = g.rope_base_of(il);
+            let (cos, sin) = emit::rope_tables(
+                ctx,
+                if g.is_sliding(il) {
+                    "rope_swa"
+                } else {
+                    "rope_global"
+                },
+                rows,
+                hd,
+                base,
+            );
+
+            let gamma = emit::f32_param(ctx, model, &format!("{p}.attn_norm.weight"), &[d])?;
+            let h = emit::rms_norm(ctx, x, gamma, eps, &[rows, d]);
+            let [q, k, v] = emit::qkv(ctx, model, h, rows, d, [&key(0), &key(1), &key(2)])?;
+            // Per-head norms: reshape to `[rows · heads, head_dim]` so the
+            // last-axis RMSNorm is one head's own, then back onto the row axis
+            // for the rotation (the rope step reads the row as `[-2]`).
+            let r = emit::reshape(ctx, q, &[(rows * heads) as i64, hd as i64]);
+            let gamma = emit::f32_param(ctx, model, &format!("{p}.attn_q_norm.weight"), &[hd])?;
+            let q = emit::rms_norm(ctx, r, gamma, eps, &[rows * heads, hd]);
+            let r = emit::reshape(ctx, k, &[(rows * nkv) as i64, hd as i64]);
+            let gamma = emit::f32_param(ctx, model, &format!("{p}.attn_k_norm.weight"), &[hd])?;
+            let k = emit::rms_norm(ctx, r, gamma, eps, &[rows * nkv, hd]);
+            let r = emit::reshape(ctx, v, &[(rows * nkv) as i64, hd as i64]);
+            let unit = if hd == g.head_dim_swa { ones_swa } else { ones };
+            let v = emit::rms_norm(ctx, r, unit, eps, &[rows * nkv, hd]);
+            let q = emit::reshape(ctx, q, &[1, rows_i, qw]);
+            let k = emit::reshape(ctx, k, &[1, rows_i, kw]);
+            let q = emit::h(ctx).rope(q, cos, sin, hd);
+            let k = emit::h(ctx).rope(k, cos, sin, hd);
+            // Rows-first `[1, rows, heads, head_dim]`, declared and not
+            // transposed: the route reads the layout off the extents (axis 1 is
+            // the row count here, not the head count) and the strides follow, so
+            // a transpose would only move the same elements twice.
+            let q = emit::reshape(ctx, q, &[1, rows_i, heads as i64, hd as i64]);
+            let k = emit::reshape(ctx, k, &[1, rows_i, nkv as i64, hd as i64]);
+            let v = emit::reshape(ctx, v, &[1, rows_i, nkv as i64, hd as i64]);
+            let mask = if g.is_sliding(il) {
+                window_mask(rows, g.window_radius())
+            } else {
+                MaskKind::None
             };
-            let table = emit::prefix_param(
+            let a = emit::attention(
+                ctx,
+                q,
+                k,
+                v,
+                heads,
+                hd,
+                mask,
+                &[1, rows, heads, hd],
+                Some(1.0),
+            );
+            let a = emit::reshape(ctx, a, &[rows_i, qw]);
+            let o = emit::linear_encoder(
                 ctx,
                 model,
-                "token_embd.weight",
-                &[rows, cfg.d],
-                rows * cfg.d,
+                &FlowValue::new(a, Shape::new(&[rows, lin[3].1], DType::F32)),
+                &key(3),
             )?;
-            Ok(emit::gather(ctx, table, input.hir_id()))
-        };
+            let gamma =
+                emit::f32_param(ctx, model, &format!("{p}.post_attention_norm.weight"), &[d])?;
+            let o = emit::rms_norm(ctx, o.hir_id(), gamma, eps, &[rows, d]);
+            let attn_out = emit::add(ctx, x, o);
 
-        let mut x = match self.input {
-            BodyInput::Ids { .. } => lookup(ctx)?,
-            _ => input.hir_id(),
-        };
+            let gamma = emit::f32_param(ctx, model, &format!("{p}.ffn_norm.weight"), &[d])?;
+            let f = emit::rms_norm(ctx, attn_out, gamma, eps, &[rows, d]);
+            let w = FlowValue::new(f, Shape::new(&[rows, lin[4].1], DType::F32));
+            let gate = emit::linear_encoder(ctx, model, &w, &key(4))?;
+            // `GGML_GELU` in the reference is the **tanh** fit, not the erf form:
+            // `0.5 x (1 + tanh(√(2/π)(x + 0.044715 x³)))`.
+            let gate = emit::act(ctx, Activation::GeluApprox, gate.hir_id(), &[rows, g.ffn]);
+            let w = FlowValue::new(f, Shape::new(&[rows, lin[5].1], DType::F32));
+            let up = emit::linear_encoder(ctx, model, &w, &key(5))?;
+            let f = emit::mul(ctx, gate, up.hir_id());
+            let w = FlowValue::new(f, Shape::new(&[rows, lin[6].1], DType::F32));
+            let f = emit::linear_encoder(ctx, model, &w, &key(6))?;
+            let gamma = emit::f32_param(ctx, model, &format!("{p}.post_ffw_norm.weight"), &[d])?;
+            let f = emit::rms_norm(ctx, f.hir_id(), gamma, eps, &[rows, d]);
+            x = emit::add(ctx, attn_out, f);
 
-        x = emit_body_range(ctx, model, m, 0, cfg.layers, x, true)?;
-        // `qwen3.pooling_type = 3` is last-token pooling: the fixed cell passes
-        // the last non-padding row, not the padded last row.
-        let last = match self.input {
-            BodyInput::Ids { last, .. } => last,
-            _ => m - 1,
-        };
-        let pooled = emit::narrow(ctx, x, 0, last, 1);
-        let sh = Shape::new(&[1, cfg.d], DType::F32);
+            // ── the per-layer-input block ──
+            let w = FlowValue::new(x, Shape::new(&[rows, lin[7].1], DType::F32));
+            let gated = emit::linear_encoder(ctx, model, &w, &key(7))?;
+            let gated = emit::act(ctx, Activation::GeluApprox, gated.hir_id(), &[rows, g.ple]);
+            let slice = emit::narrow(ctx, per_layer, 1, il, 1);
+            let slice = emit::reshape(ctx, slice, &[rows_i, g.ple as i64]);
+            let gated = emit::mul(ctx, gated, slice);
+            let w = FlowValue::new(gated, Shape::new(&[rows, lin[8].1], DType::F32));
+            let out = emit::linear_encoder(ctx, model, &w, &key(8))?;
+            let gamma = emit::f32_param(ctx, model, &format!("{p}.post_norm.weight"), &[d])?;
+            let out = emit::rms_norm(ctx, out.hir_id(), gamma, eps, &[rows, d]);
+            let x_ple = emit::add(ctx, x, out);
+            // A scalar per layer (1.0 in this file), applied to the layer's whole
+            // output rather than to one branch.
+            let scale =
+                emit::f32_param(ctx, model, &format!("{p}.layer_output_scale.weight"), &[1])?;
+            x = emit::mul(ctx, x_ple, scale);
+        }
+
+        let gamma = emit::f32_param(ctx, model, "output_norm.weight", &[d])?;
+        let x = emit::rms_norm(ctx, x, gamma, eps, &[rows, d]);
+        let w = FlowValue::new(x, Shape::new(&[rows, d], DType::F32));
+        let out = emit::linear_encoder(ctx, model, &w, "output.weight")?;
+        // Mean over *all* rows, BOS and EOS included — no padding to exclude.
+        // The projection is linear, so pooling before or after it is the same
+        // arithmetic; this order is the reference's.
+        let pooled = emit::h(ctx).mean(out.hir_id(), vec![0], true);
+        let pooled = emit::reshape(ctx, pooled, &[g.out_width as i64]);
+        let sh = Shape::new(&[g.out_width], DType::F32);
         Ok((
             FlowValue::new(pooled, sh.clone()),
             StageArtifacts::hidden_only(sh),
@@ -690,95 +862,85 @@ impl LayerStage for BodyStage {
     }
 }
 
-/// The body's transformer stack, blocks `first..last`, optionally followed by the
-/// final norm. One helper for the whole-body stage and for a chunk of it, so a
-/// long body can be walked as several graphs without a second copy of the block
-/// spec or a different arithmetic.
-fn emit_body_range(
-    ctx: &mut FlowCtx<'_>,
-    model: &Arc<Model>,
-    m: usize,
-    first: usize,
-    last: usize,
-    input: HirNodeId,
-    norm: bool,
-) -> Result<HirNodeId> {
-    let cfg = model.config();
-    let (c, s) = emit::rope_tables(ctx, "body_rope", m, cfg.head_dim, cfg.rope_base);
-    let spec = BlkSpec {
-        d: cfg.d,
-        ffn: cfg.ffn,
-        heads: cfg.heads,
-        kv_heads: cfg.kv_heads,
-        head_dim: cfg.head_dim,
-        eps: cfg.eps,
-        rms: true,
-        gated: true,
-        qk_norm: true,
-        rope: true,
-        bias: false,
-        causal: true,
-        ls: false,
-        norm1: "attn_norm",
-        norm2: "ffn_norm",
-        o_name: "attn_output.weight",
-    };
-    let mut x = input;
-    for i in first..last {
-        x = block(
-            ctx,
-            model,
-            &format!("blk.{i}"),
-            &spec,
-            x,
-            m,
-            m,
-            Some((c, s)),
-        )?;
+/// The embeddings graph: `rows` embedding rows (already looked up from the
+/// table, `[rows, d]`, unscaled) → the pooled 768-wide vector.
+///
+/// The rows arrive looked up rather than as ids because the table's used rows
+/// are the cell's own: the stand reads them with
+/// [`Model::table_rows_f32`](crate::loader::Model::table_rows_f32) (one row per
+/// position, ~16 MiB at 8 192 rows) and binds them as this graph's input. The
+/// whole `token_embd` table as a `Param` would be half a gigabyte of f32 for
+/// 262 144 rows, and an in-graph `Gather` over it would read from a leaf nobody
+/// needs.
+///
+/// Which route the projections take is the *model's* decision, taken before the
+/// graph is built ([`Model::f16_linears`]): this function builds whatever the
+/// plans say. It also owns the other half of that route — the f16 image of each
+/// weight the store rule flipped, dequantised here and handed to
+/// `set_param_typed` — so a graph built from packed plans never pays for it.
+/// The f16 route's compile needs the weight-concat fusions off; the switch is
+/// installed by [`compile_encoder`], not here.
+pub fn encoder(model: Arc<Model>, rows: usize) -> Result<BuiltModel> {
+    let cfg = model.gemma().clone();
+    if rows < 3 {
+        bail!("an embedding cell needs at least BOS + one token + EOS, got {rows} rows");
     }
-    if norm {
-        let gamma = emit::f32_param(ctx, model, "output_norm.weight", &[cfg.d])?;
-        x = emit::rms_norm(ctx, x, gamma, cfg.eps, &[m, cfg.d]);
-    }
-    Ok(x)
-}
-
-/// Build a body graph — the 28 layers of any of the three roles plus its final
-/// norm, with the tail the caller asks for (`BodyInput`).
-pub fn body_graph(model: Arc<Model>, m: usize, input: BodyInput) -> Result<BuiltModel> {
-    let cfg = model.config().clone();
-    if let BodyInput::Ids { table_rows, last } = input {
-        if table_rows > cfg.vocab {
-            bail!(
-                "asked for {table_rows} table rows, the file has {}",
-                cfg.vocab
-            );
-        }
-        if last >= m {
-            bail!("pool row {last} is outside the {m}-row cell");
-        }
-    }
-    let shape = match input {
-        // Ids arrive as f32-valued integers: that is the dtype the CPU gather
-        // kernel reads (`rlx-cpu/src/executor.rs`, `Op::Gather`).
-        BodyInput::Ids { .. } => Shape::new(&[m], DType::F32),
-        _ => Shape::new(&[m, cfg.d], DType::F32),
-    };
     let mut weights = LoaderWeights::new(model.clone());
-    let flow = ModelFlow::new(format!("body_m{m}"))
-        .input("x", shape)
-        .layer_stage(BodyStage { model, m, input })
-        .output("hidden");
-    flow.build(&mut weights).map_err(Into::into)
+    let flow = ModelFlow::new(format!("embed_{rows}"))
+        .with_profile(profile())
+        .input("x", Shape::new(&[rows, cfg.d], DType::F32))
+        .layer_stage(EncoderStage {
+            model: model.clone(),
+            rows,
+        })
+        .output("emb");
+    let mut built = flow.build(&mut weights)?;
+    // The f16 route's bytes. `emit::linear_encoder` declared one f16 `Param` per
+    // weight the store rule flipped and no f32 data, so the session is handed
+    // the f16 image here — `set_param_typed(name, bytes, DType::F16)`, drained
+    // by the runner exactly like a packed blob. Dequantising here rather than at
+    // open keeps a route the device refuses from costing a byte of host memory.
+    for plan in model.plans.iter().filter(|p| p.store == Store::F16Linear) {
+        let (bytes, ..) = model.linear_f16(&plan.name)?;
+        built
+            .typed_params
+            .push((plan.name.clone(), bytes, DType::F16));
+    }
+    Ok(built)
 }
 
-/// Build a body's own separate head: `output.weight` (recognition 151936,
-/// synthesis 3072). The embedding role's table is not a projection graph.
-pub fn head_graph(model: Arc<Model>, m: usize) -> Result<BuiltModel> {
-    match model.config().head {
-        Head::Separate { .. } => body_graph(model, m, BodyInput::Head),
-        Head::Tied { .. } => bail!("this body's head is its embedding table"),
-    }
+/// Compile the embedding graph with the weight-concat fusions off for the one
+/// compile that reads the switch, restoring the process's previous overrides on
+/// return.
+///
+/// `FuseSharedInputMatMul` builds q/k/v — and gate/up — as ONE `Concat` over
+/// the three weights. That takes the multiply's B out of the `Param` role, and
+/// every cooperative f16 family is admitted only for a weight-side `Param`;
+/// worse, the F16 `Concat` node makes the runtime's `prepare_f32_exec_graph` see
+/// a low-precision *arithmetic* node and promote the whole graph to f32, which
+/// takes the remaining 97 multiplies off the kernel too. Measured at 8 192 rows
+/// on the M3 Pro (the cell line's own figures): 5.27 s with the fusion on —
+/// every multiply on the f32 cooperative kernel — and 3.97 s with it off, all
+/// 217 on the f16 one.
+///
+/// The switch is process-global, so it is installed here, around this compile,
+/// and restored on return. Installing it while the graph is built would leak it
+/// into every later compile in the process, and the packed and f16 arms the
+/// record compares would then differ in fusion as well as precision. The
+/// override map has no atomicity of its own, so a second compile in the same
+/// process would see this one's install or its restore mid-flight.
+pub fn compile_encoder(device: Device, built: BuiltModel, gemm: Gemm) -> Result<Compiled> {
+    static FUSION_SCOPE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Every compile takes the lock, not only the arm that installs: a compile
+    // that installs nothing must still not observe another's override, and the
+    // arm is chosen from a process-global read. Declared before the override, so
+    // the override is restored before the lock is released.
+    let _scope = FUSION_SCOPE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _fusions = (gemm == Gemm::F16Coop)
+        .then(|| rlx_ir::env::RuntimeOverrides::install([("RLX_NO_WEIGHT_CONCAT_FUSION", "1")]));
+    Compiled::new(device, built)
 }
 
 // ── the body with the attention state carried between windows ──────
@@ -1168,8 +1330,8 @@ impl LayerStage for BodyStateStage {
             x
         };
         let sh = Shape::new(&[m, d], DType::F32);
-        // The body's own head, when asked for: the same projection the separate
-        // head graph makes, on this row, published beside the cache rows.
+        // The body's own head, when asked for: the vocabulary projection on this
+        // row, published beside the cache rows.
         if self.head {
             let (name, vocab) = match cfg.head {
                 Head::Separate { name, vocab } => (name, vocab),
@@ -1363,45 +1525,6 @@ pub fn seed_plane_cache(
     }
     mask[capacity] = 1.0;
     PlaneCache { k, v, mask }
-}
-
-/// A causal block of body rows after an exact prefix: the 8 192-token cell is
-/// walked as blocks, but each block sees only the rows actually written before
-/// it. There is no fixed-capacity mask: the KV input's own length is the prefix,
-/// so the ordinary causal mask is exact and no unfilled cache row ever enters
-/// the softmax.
-/// A causal block after an exact prefix through only `layers` of the body.
-/// Splitting the body keeps a cell's graph arena small; the caller hands the
-/// hidden row to the next group and carries that group's own K/V slice.
-pub fn body_block_causal_layers(
-    model: Arc<Model>,
-    rows: usize,
-    prefix: usize,
-    layers: std::ops::Range<usize>,
-) -> Result<BuiltModel> {
-    let cfg = model.config().clone();
-    let mut weights = LoaderWeights::new(model.clone());
-    let flow = ModelFlow::new(format!(
-        "body_block_causal_{rows}_{prefix}_{}_{}",
-        layers.start, layers.end
-    ))
-    .with_profile(profile())
-    .input("x", Shape::new(&[rows, cfg.d], DType::F32))
-    .layer_stage(BodyStateStage {
-        model,
-        m: rows,
-        prefix,
-        layers,
-        masked: false,
-        row_first: true,
-        head: false,
-        plane_cache: false,
-        packed_feed: rows > 1 && prefix >= rows && prefix.is_multiple_of(rows),
-        fused: false,
-        fused_gate_up: false,
-    })
-    .output("hidden");
-    flow.build(&mut weights).map_err(Into::into)
 }
 
 // ── the TTS speaker encoder (ECAPA-TDNN, the `mmproj` voice half) ──
@@ -2018,6 +2141,7 @@ fn emit_predictor_blocks(
         } else {
             emit::qkv(
                 ctx,
+                model,
                 h,
                 m,
                 d_pred,
@@ -2548,6 +2672,7 @@ fn wave_block(
     let h = emit::rms_norm(ctx, x, gamma, eps, &[m, d]);
     let [q, k, v] = emit::qkv(
         ctx,
+        model,
         h,
         m,
         d,
@@ -2887,39 +3012,10 @@ impl Runner {
         self.session.run_read_outputs(&ins, Some(read))
     }
 
-    /// One pass whose inputs are already borrowed. The embedding walk keeps the
-    /// carried KV in one row-first cache; cloning the whole prefix for every
-    /// block would put two more copies of it in the process at the peak.
+    /// One pass whose inputs are already borrowed.
     pub fn run_slices(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         bump(1, 1);
         self.session.run(inputs)
-    }
-
-    /// Move one layer's new row — `row_elems` values, one per frame — from the
-    /// graph's output into the resident cache. This is the layer-major feed: the
-    /// cache is `[layers, capacity, frames, hkv]`, the output `[layers, frames,
-    /// hkv]`, so a single copy carries every frame's row.
-    pub fn feed_rows(&mut self, src_row: usize, dst_row: usize, row_elems: usize) -> bool {
-        bump(1, 1);
-        self.session.feed_kv_row(src_row, dst_row, row_elems)
-    }
-
-    /// Keep `kpre`/`vpre` **on the device** between steps: bound as resident
-    /// handles and registered to the outputs that carry this step's own rows, so
-    /// a step neither uploads the whole cache nor reads it back. `out` is which
-    /// output of the graph hands on the new `k` and `v` rows.
-    ///
-    /// The code predictor's per-level walk calls this before each body step: the
-    /// shared body is one executable, but the host mirror it binds is the one the
-    /// previous level's readback updated.
-    ///
-    /// Answers whether the backend took it; `false` leaves the caller on the
-    /// ordinary path, with the caches uploaded as inputs.
-    pub fn resident_cache(&mut self, kpre: &[f32], vpre: &[f32], out: (usize, usize)) -> bool {
-        self.session.bind_gpu_handle("kpre", kpre)
-            && self.session.bind_gpu_handle("vpre", vpre)
-            && self.session.register_kv_row_feed("kpre", out.0)
-            && self.session.register_kv_row_feed("vpre", out.1)
     }
 
     /// A plane cache: each layer's `[capacity + 1, hkv]` rows are a resident

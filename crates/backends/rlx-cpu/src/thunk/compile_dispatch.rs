@@ -2469,6 +2469,18 @@ pub fn compile_thunks_with_rng(
                                             }
                                         }
                                     }
+                                    rlx_ir::op::MaskKind::Window(w) => {
+                                        for qi in 0..q_s {
+                                            let abs_q = q_offset + qi;
+                                            let lo = abs_q.saturating_sub(w);
+                                            let hi = abs_q + w;
+                                            for ki in 0..k_s {
+                                                if ki < lo || ki > hi {
+                                                    sc[qi * k_s + ki] = mask_neg;
+                                                }
+                                            }
+                                        }
+                                    }
                                     rlx_ir::op::MaskKind::Custom => {
                                         for qi in 0..q_s {
                                             for ki in 0..k_s {

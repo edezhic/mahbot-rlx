@@ -179,6 +179,7 @@ fn attention_precision_across_key_lengths() {
             decode: 0,
             decomposed: rows.len() as u64,
             serial: 0,
+            band: 0,
         },
         "every length in this sweep is at or above the route's floor \
          ({ATTENTION_DECOMPOSE_MIN_Q} query rows) and is neither decode-shaped nor \
@@ -216,6 +217,7 @@ fn attention_precision_across_key_lengths() {
             decode: decode_cases,
             decomposed: 0,
             serial: 0,
+            band: 0,
         },
         "a decode-shaped case ran on the serial kernel"
     );

@@ -2,16 +2,18 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Fixtures and measurement scaffolding shared by this crate's tests: the packed
-//! GGUF weight, the activation ramp, and the median together with the two timing
-//! loops ([`time_rounds`], one cell alone, and [`time_round_robin`], round-robin
-//! across a cell set) that the three harnesses using them — `gguf_one_row_stream_rate`,
-//! `gguf_gemm_grouped_weight_reuse` and `gguf_gemm_grouped_split_rate` — time their
-//! calls with, plus the parity helpers, the conv-transpose-2d route levers together
-//! with the pair bound its pins derive their bar from and the six real decoder
-//! geometries those pins and the route harness both read, the bounded child re-exec
-//! harness ([`rerun_self`]) that a case which has to run in its own process waits on
-//! with a deadline, the switch set those children clear ([`CLEARED_SWITCHES`]), the
-//! pins' own refusal and the route-counter lock at the end of the file.
+//! GGUF weight, the activation ramp, the band module's own geometry helpers
+//! ([`band_device`], [`band_rows`], [`band_key_block`]), and the median together
+//! with the two timing loops ([`time_rounds`], one cell alone, and
+//! [`time_round_robin`], round-robin across a cell set) that the three harnesses
+//! using them — `gguf_one_row_stream_rate`, `gguf_gemm_grouped_weight_reuse` and
+//! `gguf_gemm_grouped_split_rate` — time their calls with, plus the parity
+//! helpers, the conv-transpose-2d route levers together with the pair bound its
+//! pins derive their bar from and the six real decoder geometries those pins and
+//! the route harness both read, the bounded child re-exec harness ([`rerun_self`])
+//! that a case which has to run in its own process waits on with a deadline, the
+//! switch set those children clear ([`CLEARED_SWITCHES`]), the pins' own refusal
+//! and the route-counter lock at the end of the file.
 //! `tests/common/` is not a test target of its own; each test binary pulls it in with
 //! `mod common;`.
 
@@ -46,6 +48,47 @@ pub fn data(n: usize, step: f32, cos: bool) -> Vec<f32> {
 /// at these shapes: a max-abs, never a relative error, so a diffuse softmax leaving
 /// the output small cannot loosen it.
 pub const ATTENTION_BAR: f32 = 1e-6;
+
+/// The wgpu adapter this process runs on, for the figures that are the band
+/// module's own: the workgroup width it is built with and the storage its key
+/// block is chosen for. Every caller is behind a `skip_unless_device` prologue, so
+/// a missing device here is a harness error rather than a skip.
+pub fn band_device() -> &'static rlx_wgpu::device::WgpuDevice {
+    rlx_wgpu::wgpu_device().expect("a wgpu adapter passed this file's device prologue")
+}
+
+/// Whether the band module this process builds stages in f16 — the same two terms
+/// `kernels::attention_band_kernel` asks: the tile is f32 where the adapter lacks
+/// `Features::SHADER_F16` *and* where `RLX_WGPU_ATTENTION_BAND_F32` forces the
+/// twin, so the switch is part of the question rather than a separate one.
+pub fn band_stages_f16() -> bool {
+    !rlx_ir::env::flag("RLX_WGPU_ATTENTION_BAND_F32") && rlx_wgpu::shader_f16_supported()
+}
+
+/// The rows one workgroup of the band module this process builds runs — the `BM`
+/// the kernel is declared with, and the block its dispatch grid is built from: the
+/// adapter's own thread width over the head's chunk count, not the plan-side floor
+/// figure.
+pub fn band_rows(head_dim: u32) -> usize {
+    let dev = band_device();
+    rlx_wgpu::kernels::attention_band_rows_for(
+        head_dim,
+        rlx_wgpu::kernels::attention_band_threads(&dev.device),
+    ) as usize
+}
+
+/// The key block the band module this process builds walks (`BK`): the largest one
+/// the adapter's own workgroup storage holds at the width and staging that module
+/// uses.
+pub fn band_key_block(head_dim: u32) -> usize {
+    let dev = band_device();
+    rlx_wgpu::kernels::attention_band_key_block_within(
+        head_dim,
+        if band_stages_f16() { 2 } else { 4 },
+        dev.device.limits().max_compute_workgroup_storage_size,
+        rlx_wgpu::kernels::attention_band_threads(&dev.device),
+    ) as usize
+}
 
 /// `v`'s median: the element at `len / 2` of a sorted **copy**, so an even-length
 /// series gives its upper-middle element rather than the mean of the pair, an empty
@@ -333,7 +376,7 @@ pub fn refuse_under_run_report() {
 /// once for every harness here that re-execs a child (`run_report.rs`,
 /// `hosted_audio_step_placement.rs`); `buffer_copy_batch_join.rs` guards the same
 /// routing set with an assertion instead of clearing it.
-pub const CLEARED_SWITCHES: [&str; 29] = [
+pub const CLEARED_SWITCHES: [&str; 31] = [
     "RLX_WGPU_SNAPSHOT",
     "RLX_BENCH_DISPATCH_ONLY",
     "RLX_WGPU_ALL_PARAMS_WEIGHT",
@@ -362,6 +405,8 @@ pub const CLEARED_SWITCHES: [&str; 29] = [
     "RLX_WGPU_NO_SNAKE_BETA",
     "RLX_WGPU_CONV_IM2COL",
     "RLX_WGPU_CONV_IMPLICIT",
+    "RLX_WGPU_ATTENTION_BAND_F32",
+    "RLX_WGPU_NO_DENSE_COOP",
     RUN_REPORT_SWITCH,
 ];
 
@@ -399,24 +444,28 @@ pub fn expected_attention_routes(
             decode: layers as u64,
             decomposed: 0,
             serial: 0,
+            band: 0,
         }
     } else if rows >= ATTENTION_DECOMPOSE_MIN_Q as usize {
         AttentionRoutes {
             decode: 0,
             decomposed: layers as u64,
             serial: 0,
+            band: 0,
         }
     } else {
         AttentionRoutes {
             decode: 0,
             decomposed: 0,
             serial: layers as u64,
+            band: 0,
         }
     };
     AttentionRoutes {
         decode: per_run.decode * reps as u64,
         decomposed: per_run.decomposed * reps as u64,
         serial: per_run.serial * reps as u64,
+        band: 0,
     }
 }
 

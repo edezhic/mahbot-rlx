@@ -195,6 +195,7 @@ fn a_two_row_cached_decode_step_takes_the_route() {
             decode: 0,
             decomposed: LAYERS as u64,
             serial: 0,
+            band: 0,
         },
         "the cached two-row step must take the dense arrangement"
     );
@@ -224,6 +225,7 @@ fn a_one_row_cached_decode_step_keeps_the_decode_kernel() {
             decode: 1,
             decomposed: 0,
             serial: 0,
+            band: 0,
         },
         "one query row is the decode kernel's, and the route must not take it"
     );
@@ -306,6 +308,7 @@ fn a_padded_run_keeps_the_live_rows_answers() {
             decode: 0,
             decomposed: LAYERS as u64,
             serial: 0,
+            band: 0,
         },
         "the padded {UPPER}-row body must take the dense arrangement"
     );

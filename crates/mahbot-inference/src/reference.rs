@@ -80,6 +80,105 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     crate::measurements::hex(&h.finalize())
 }
 
+// ── the embedding cells' article ───────────────────────────────────
+//
+// The two embedding cells read one article, pinned here rather than in the
+// stand: the model file is the other input and `MEASUREMENTS.md` names both.
+// The text itself is a Wikipedia extract under CC BY-SA, so the checkout
+// carries its pins and not its bytes — `MAHBOT_EMBED_TEXT` names the file.
+
+/// The revision the extract was taken from (2026-10-20T21:22:49Z).
+pub const ARTICLE_REVISION: u64 = 1_381_231_733;
+/// The API URL the text came from: `action=query&prop=extracts&explaintext=1`
+/// at the revision above.
+pub const ARTICLE_URL: &str =
+    "https://en.wikipedia.org/w/index.php?title=Atlantic_Ocean&oldid=1381231733";
+/// The query that produced the pinned bytes — the article page URL returns HTML.
+/// The revision is pinned, but the *extract* is not: the endpoint renders the
+/// page's current text, so a re-fetch of this same revision on 2026-10-24
+/// returned 52 787 bytes (sha256 `426ac83b…`) — the pin plus the two characters
+/// of the one edit landed after it, revision 1381660382's `divided in two parts`
+/// → `divided into two parts`. Reverting that edit reproduces the pin byte for
+/// byte (52 593 characters, sha256 [`ARTICLE_SHA256`]), so a re-run may read the
+/// pinned file or re-fetch and undo it, either way checked against the pin.
+pub const ARTICLE_FETCH: &str = "https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&format=json&formatversion=2&";
+/// The plain-text extract: 52 593 characters (52 785 bytes — the article has
+/// multi-byte place names), sha256 over the bytes.
+pub const ARTICLE_CHARS: usize = 52_593;
+pub const ARTICLE_SHA256: &str = "df0eb1cd6ed0844698e1b63bc34698f2c3591650fede12d4d58e2c48ce0bdc0f";
+
+/// The two cells' row counts, BOS and EOS included — the sequence is BOS, the
+/// content, EOS, and nothing else: no padding, no filler.
+pub const EMBED_CELLS: [usize; 2] = [256, 8_192];
+/// `embed.8192`'s text: the article's first 5 846 words (37 543 bytes), which
+/// tokenise to exactly 8 190 content tokens.
+pub const CELL_8192_WORDS: usize = 5_846;
+pub const CELL_8192_BYTES: usize = 37_543;
+pub const CELL_8192_SHA256: &str =
+    "40ee7e6f2fa3f530f018d05e3538314ab9c9656b829d4654eb52a7810faaba3c";
+/// `embed.256`'s text: 195 words from the article's midpoint sentence (1 251
+/// bytes), which tokenise to exactly 254 content tokens.
+pub const CELL_256_WORDS: usize = 195;
+pub const CELL_256_BYTES: usize = 1_251;
+pub const CELL_256_SHA256: &str =
+    "727dccf3fdbd6460acd836ef132e0679f2904206f940df20b10c2cbcd47ce960";
+/// Where `embed.256`'s excerpt begins.
+pub const CELL_256_ANCHOR: &str = "Large quantities of basalt erupted at this time period";
+
+/// The content tokens of a cell: every row but the BOS and the EOS.
+#[must_use]
+pub fn content_tokens(rows: usize) -> usize {
+    rows - 2
+}
+
+/// The first `words` space-separated fields of `text`, joined as they were. A
+/// **space** is the delimiter, not any whitespace: the article's paragraphs are
+/// separated by newlines inside a field, which is how the reference cut was
+/// taken and what makes the two pinned byte counts reproducible.
+#[must_use]
+pub fn words_prefix(text: &str, words: usize) -> &str {
+    let mut seen = 0usize;
+    for (i, ch) in text.char_indices() {
+        if ch == ' ' {
+            seen += 1;
+            if seen == words {
+                return &text[..i];
+            }
+        }
+    }
+    text
+}
+
+/// The `rows`-row cell's text, cut from the article and checked against its own
+/// pin: `embed.8192` is the article's prefix, `embed.256` the excerpt that
+/// begins at [`CELL_256_ANCHOR`]. A text that does not match is an error naming
+/// the figure that differs — the cells measure a pinned input, not whatever the
+/// file happens to hold.
+pub fn cell_text(article: &str, rows: usize) -> anyhow::Result<String> {
+    let (words, bytes, sha, from) = match rows {
+        8_192 => (CELL_8192_WORDS, CELL_8192_BYTES, CELL_8192_SHA256, 0),
+        256 => {
+            let at = article
+                .find(CELL_256_ANCHOR)
+                .ok_or_else(|| anyhow::anyhow!("the article does not hold `{CELL_256_ANCHOR}`"))?;
+            (CELL_256_WORDS, CELL_256_BYTES, CELL_256_SHA256, at)
+        }
+        other => anyhow::bail!("no embedding cell of {other} rows — the cells are {EMBED_CELLS:?}"),
+    };
+    let text = words_prefix(&article[from..], words).to_string();
+    if text.len() != bytes {
+        anyhow::bail!(
+            "cell {rows}: the cut is {} bytes, the pin says {bytes}",
+            text.len()
+        );
+    }
+    let got = sha256_hex(text.as_bytes());
+    if got != sha {
+        anyhow::bail!("cell {rows}: sha256 {got} is not the pinned {sha}");
+    }
+    Ok(text)
+}
+
 /// Whether the run's voice input is the clip the speak witness was recorded
 /// with. Both generative cells pin against it and skip their own pin when it
 /// differs, so the rule is stated here once: an unreadable voice counts as the
@@ -89,6 +188,29 @@ pub fn voice_is_pinned() -> bool {
         .ok()
         .and_then(|path| std::fs::read(path).ok())
         .is_none_or(|bytes| sha256_hex(&bytes) == SPEAK_VOICE_SHA256)
+}
+
+/// The article the cells are cut from, checked against [`ARTICLE_SHA256`] — the
+/// file's own name and the mismatch are both named when it fails, because the
+/// text is an input the checkout does not carry. A file fetched today rather than
+/// the pinned one is the expected failure, not a corrupt file: the extract
+/// endpoint is not byte-stable ([`ARTICLE_FETCH`]).
+pub fn article() -> anyhow::Result<String> {
+    let path = crate::loader::embed_text()?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("cannot read `{}`: {e}", path.display()))?;
+    let chars = text.chars().count();
+    if chars != ARTICLE_CHARS || sha256_hex(text.as_bytes()) != ARTICLE_SHA256 {
+        anyhow::bail!(
+            "`{}` is not the pinned extract ({chars} characters, sha256 {}, pinned \
+             {ARTICLE_CHARS} characters, sha256 {ARTICLE_SHA256}) — the extract endpoint renders \
+             the page's current text, so a fresh fetch of the same revision is longer by the one \
+             edit landed after it (revision 1381660382); undo that edit or read the pinned file",
+            path.display(),
+            sha256_hex(text.as_bytes()),
+        );
+    }
+    Ok(text)
 }
 
 /// Print the recognition witness against the pins. `false` on any difference.
