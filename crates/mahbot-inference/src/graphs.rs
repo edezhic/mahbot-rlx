@@ -957,7 +957,9 @@ pub fn compile_encoder(device: Device, built: BuiltModel, gemm: Gemm) -> Result<
 /// cache holds the past, the queries are the new rows, and a query must reach
 /// every earlier position. (The state is RoPE'd before it is stored, exactly as
 /// in [`BodyStateStage`], so the positions the caller puts in `cos`/`sin` are
-/// the ones the query and key rows keep in the whole sequence.)
+/// the ones the query and key rows keep in the whole sequence.) The plane cache's
+/// `m > 1` arm is the exception: its mask is causal against the cache and not
+/// among its own rows (see [`BodyStateStage::plane_cache`]).
 ///
 /// `prefix == 0` is the first window: nothing to read, ordinary causal attention
 /// over the window alone, and the state published is the window's own rows.
@@ -987,12 +989,16 @@ pub struct BodyStateStage {
     /// The file's own head on the same row, published as the `logits` side
     /// output: the body and its head are one graph and one fence per frame.
     pub head: bool,
-    /// Per-layer carried caches of `[prefix + 1, hkv]` rows, the spare row at
-    /// `prefix` written in-graph by `KvAppend` and one row fed device-side after
-    /// the step. The attention operand is then the cache itself — the same
-    /// `[prefix + 1]`-row operand the row-first layout built by transposing and
-    /// concatenating, without either pass. Requires `m == 1`, `masked` and
-    /// `row_first`.
+    /// Per-layer carried caches, in the attention's row layout: `[prefix + 1, hkv]`
+    /// for a decode step, whose spare row at `prefix` an in-graph `KvAppend`
+    /// writes, and `[prefix, hkv]` for a step of more rows, whose candidates join
+    /// the operand instead. Either way the new rows are also fed device-side after
+    /// the step. Requires `masked` and `row_first`; one row per step is the decode.
+    ///
+    /// `m > 1` rows are a **cost arm**, not a verification pass: the mask is one
+    /// key mask broadcast over every query row (see [`plane_rows`]), so the rows
+    /// are not causal among themselves and their logits are not the model's
+    /// greedy choices.
     pub plane_cache: bool,
     /// Pack a block's cache input as `[capacity / rows, rows · layers · hkv]`
     /// and publish this block's new rows as one row of the same width. The
@@ -1022,13 +1028,13 @@ impl LayerStage for BodyStateStage {
         let model = &self.model;
         let cfg = model.config().clone();
         let (m, pre) = (self.m, self.prefix);
-        // The plane cache reads the whole `[prefix + 1]` row operand that the
-        // in-graph append builds, so it only makes sense for one row per step,
-        // against a mask, in the row-first layout the spare row assumes.
+        // The plane cache reads a `[prefix + m]`-key operand built without a pass
+        // over the cache, so it needs a mask and the row-first layout the spare
+        // rows assume.
         assert!(
-            !self.plane_cache || (m == 1 && self.masked && self.row_first),
-            "a plane cache needs one row, a mask and the row-first layout \
-             (plane_cache = true, m = {m}, masked = {}, row_first = {})",
+            !self.plane_cache || (self.masked && self.row_first),
+            "a plane cache needs a mask and the row-first layout \
+             (plane_cache = true, masked = {}, row_first = {})",
             self.masked,
             self.row_first
         );
@@ -1049,16 +1055,17 @@ impl LayerStage for BodyStateStage {
             .masked
             .then(|| emit::h(ctx).input("mask", Shape::new(&[1, pre + m], DType::F32)));
         // The plane cache's per-layer inputs, already in the attention's row
-        // layout: `[prefix + 1, hkv]`, the spare row at `prefix` for this step's
-        // own rows. Created here so the loop below reads them by layer index.
+        // layout: `[prefix + 1, hkv]` for a decode step, whose spare row the
+        // in-graph append writes, and `[prefix, hkv]` for a step of more rows,
+        // whose candidates join the operand instead (see [`plane_rows`]). Created
+        // here so the loop below reads them by layer index.
         let plane_in: Option<Vec<(HirNodeId, HirNodeId)>> = self.plane_cache.then(|| {
+            let rows = plane_rows(pre, m);
             (0..layers)
                 .map(|gi| {
                     (
-                        emit::h(ctx)
-                            .input(format!("k{gi}"), Shape::new(&[pre + 1, hkv], DType::F32)),
-                        emit::h(ctx)
-                            .input(format!("v{gi}"), Shape::new(&[pre + 1, hkv], DType::F32)),
+                        emit::h(ctx).input(format!("k{gi}"), Shape::new(&[rows, hkv], DType::F32)),
+                        emit::h(ctx).input(format!("v{gi}"), Shape::new(&[rows, hkv], DType::F32)),
                     )
                 })
                 .collect()
@@ -1184,15 +1191,30 @@ impl LayerStage for BodyStateStage {
             });
             let (k_all, v_all) = if let (Some(planes), Some((k_row, v_row))) = (&plane_in, rows) {
                 let (kp, vp) = planes[gi];
-                // The step's own rows land in the spare row, in-graph: the
-                // operand is then `[cache rows; the new row]`, the same operand
-                // the concat used to build, with no pass over the cache.
-                let k_app = emit::h(ctx).kv_append(kp, k_row, 0, pre);
-                let v_app = emit::h(ctx).kv_append(vp, v_row, 0, pre);
-                (
-                    emit::reshape(ctx, k_app, &[1, (pre + m) as i64, nkv as i64, hd as i64]),
-                    emit::reshape(ctx, v_app, &[1, (pre + m) as i64, nkv as i64, hd as i64]),
-                )
+                if m == 1 {
+                    // The step's own row lands in the spare row, in-graph: the
+                    // operand is then `[cache rows; the new row]`, the same operand
+                    // the concat used to build, with no pass over the cache.
+                    let k_app = emit::h(ctx).kv_append(kp, k_row, 0, pre);
+                    let v_app = emit::h(ctx).kv_append(vp, v_row, 0, pre);
+                    (
+                        emit::reshape(ctx, k_app, &[1, (pre + m) as i64, nkv as i64, hd as i64]),
+                        emit::reshape(ctx, v_app, &[1, (pre + m) as i64, nkv as i64, hd as i64]),
+                    )
+                } else {
+                    // A step's `m` rows join the resident rows in the operand: an
+                    // append answers the cache's whole `[..pos+1]` prefix — one
+                    // operand shared by every query row — so rows written
+                    // in-graph would be no more causal than rows joined by
+                    // concat. They reach the cache through the same device-side
+                    // feed a one-row step uses, and the operand is `[cache; rows]`.
+                    let kp = emit::reshape(ctx, kp, &[1, pre as i64, nkv as i64, hd as i64]);
+                    let vp = emit::reshape(ctx, vp, &[1, pre as i64, nkv as i64, hd as i64]);
+                    (
+                        emit::h(ctx).concat_(vec![kp, k4], 1),
+                        emit::h(ctx).concat_(vec![vp, v4], 1),
+                    )
+                }
             } else {
                 match kv_in {
                     Some((kp, vp)) => {
@@ -1208,7 +1230,9 @@ impl LayerStage for BodyStateStage {
             };
             // Causal over `[cache ; window]`: query `i` of the window reaches the
             // whole cache and the window up to itself. A fixed-capacity cache says
-            // the same thing with a mask: the rows past the written ones are 0.
+            // the same thing with a mask: the rows past the written ones are 0 —
+            // one mask for every query row, so only a one-row step is causal
+            // among its own rows (see [`BodyStateStage::plane_cache`]).
             let sh = if plane_in.is_some() {
                 Shape::new(&[1, m, nh, hd], DType::F32)
             } else {
@@ -1337,21 +1361,26 @@ impl LayerStage for BodyStateStage {
                 Head::Separate { name, vocab } => (name, vocab),
                 Head::Tied { table, vocab } => (table, vocab),
             };
-            // Only the last row's next-token logits are read. Running the head on
-            // every prompt row makes a `[prompt, vocab]` transient that is larger
-            // than the decoder's own cache on a long prompt.
-            let (xh, hs) = if m > 1 {
+            // A plane-cache step with `m > 1` rows publishes every row's logits:
+            // it is the cost arm [`body_capacity_chain_planes_rows`] builds, whose
+            // rows are not causal among themselves. A prefill reads only the last
+            // row's next-token logits, and running the head on every prompt row
+            // makes a `[prompt, vocab]` transient larger than the decoder's own
+            // cache.
+            let last_only = m > 1 && !self.plane_cache;
+            let (xh, hs, out_rows) = if last_only {
                 (
                     emit::narrow(ctx, x, 0, m - 1, 1),
                     Shape::new(&[1, d], DType::F32),
+                    1,
                 )
             } else {
-                (x, Shape::new(&[1, d], DType::F32))
+                (x, Shape::new(&[m, d], DType::F32), m)
             };
             let out = emit::linear(ctx, &FlowValue::new(xh, hs), name)?;
             ctx.publish_side_output(
                 "logits",
-                &FlowValue::new(out.hir_id(), Shape::new(&[1, vocab], DType::F32)),
+                &FlowValue::new(out.hir_id(), Shape::new(&[out_rows, vocab], DType::F32)),
             );
         }
         Ok((
@@ -1408,11 +1437,38 @@ pub fn projector_chain(pair: Arc<Pair>, tokens: usize) -> Result<BuiltModel> {
     flow.build(&mut weights).map_err(Into::into)
 }
 
-/// The whole body with a plane cache: one `[capacity + 1, hkv]` input per
-/// layer, already in the attention's row layout, the step's own row appended
-/// in-graph. The synthesis body's and recognition decode's fixed-capacity loops
-/// are the callers.
+/// The whole body with a plane cache: one input per layer, already in the
+/// attention's row layout and sized by [`plane_rows`], the step's own row
+/// appended in-graph. The synthesis body's and recognition decode's
+/// fixed-capacity loops are the callers.
 pub fn body_capacity_chain_planes(model: Arc<Model>, capacity: usize) -> Result<BuiltModel> {
+    body_planes_graph(model, capacity, 1)
+}
+
+/// [`body_capacity_chain_planes`] with `rows` query rows in one pass: the decode's
+/// own step, its own resident plane cache and its own shapes, reading each weight
+/// tile once for up to eight rows — the arm that prices several candidates per
+/// weight read. Every row's logits are published (`[rows, vocab]`).
+///
+/// **A cost arm, not a verification pass.** A cache hole or a future key is
+/// excluded by the mask, but the mask is one key mask broadcast over every query
+/// row (`MaskKind::Custom` is key padding), so the rows are not causal among
+/// themselves: a candidate also reads the candidates after it, and its logits are
+/// not the greedy choice a verification route would accept against. Expressing
+/// that needs a per-query mask (`MaskKind::Bias`), which this fork's decode does
+/// not change; and the rows reach the cache through the one-row device-side feed
+/// rather than an in-graph append, because an append answers the cache's whole
+/// `[..pos+1]` prefix — one operand, shared by every query row anyway (see
+/// [`plane_rows`]).
+pub fn body_capacity_chain_planes_rows(
+    model: Arc<Model>,
+    capacity: usize,
+    rows: usize,
+) -> Result<BuiltModel> {
+    body_planes_graph(model, capacity, rows)
+}
+
+fn body_planes_graph(model: Arc<Model>, capacity: usize, rows: usize) -> Result<BuiltModel> {
     let cfg = model.config().clone();
     let mut weights = LoaderWeights::new(model.clone());
     let mut fused = true;
@@ -1435,12 +1491,12 @@ pub fn body_capacity_chain_planes(model: Arc<Model>, capacity: usize) -> Result<
             ],
         )?;
     }
-    let flow = ModelFlow::new(format!("body_capacity_planes_{capacity}"))
+    let flow = ModelFlow::new(format!("body_capacity_planes_{capacity}_{rows}"))
         .with_profile(profile())
-        .input("x", Shape::new(&[1, cfg.d], DType::F32))
+        .input("x", Shape::new(&[rows, cfg.d], DType::F32))
         .layer_stage(BodyStateStage {
             model,
-            m: 1,
+            m: rows,
             prefix: capacity,
             layers: 0..cfg.layers,
             masked: true,
@@ -1482,6 +1538,18 @@ pub fn plane_step_logits(layers: usize) -> usize {
 /// cache rows the feed consumes, and the logits.
 pub fn plane_step_outputs(layers: usize) -> usize {
     plane_feed_moves(layers) + 2
+}
+
+/// The rows one plane input declares for a step of `rows` rows: the resident cache
+/// plus the one spare row a decode's in-graph `KvAppend` writes. A step of more
+/// than one row carries its candidates in the attention operand instead
+/// (`[cache; candidates]`) and needs no spare row: an append answers the cache's
+/// whole `[..pos+1]` prefix, i.e. one operand shared by every query row, so rows
+/// written in-graph would be no more causal than rows joined by concat. Its mask
+/// stays one key mask over the whole operand — a hole and a future *key* are
+/// expressible; that query `i` sees only keys up to `i` is not.
+pub fn plane_rows(capacity: usize, rows: usize) -> usize {
+    capacity + usize::from(rows == 1)
 }
 
 /// A talker plane cache seeded from its prompt: one `[capacity + 1, hkv]` K and
@@ -3013,10 +3081,10 @@ impl Runner {
         self.session.run(inputs)
     }
 
-    /// A plane cache: each layer's `[capacity + 1, hkv]` rows are a resident
-    /// handle of their own, registered to this graph's own new-row output. The
-    /// output order is the stage's: the main output, this graph's K rows (one per
-    /// layer), then its V rows.
+    /// A plane cache: each layer's [`plane_rows`] rows are a resident handle of its
+    /// own, registered to this graph's own new-row output. The output order is the
+    /// stage's: the main output, this graph's K rows (one per layer), then its V
+    /// rows.
     pub fn resident_cache_planes(&mut self, k: &[Vec<f32>], v: &[Vec<f32>]) -> bool {
         if k.len() != v.len() {
             return false;
@@ -3051,7 +3119,9 @@ impl Runner {
     }
 
     /// One plane-cache step: run, read only `read`, and fold each layer's new
-    /// row into its handle. `row_elems` is one layer's row width (`hkv`).
+    /// row into its handle. `row_elems` is one layer's row width (`hkv`). The run
+    /// and its feed are the step's two submissions, as [`Self::run_read`] counts
+    /// them.
     pub fn run_resident_planes(
         &mut self,
         inputs: &[(String, Vec<f32>)],
@@ -3059,10 +3129,31 @@ impl Runner {
         row_elems: usize,
         read: &[usize],
     ) -> Option<Vec<Vec<f32>>> {
+        self.run_resident_planes_rows(inputs, row, 1, row_elems, read)
+    }
+
+    /// [`Self::run_resident_planes`] with a step of `rows` rows: row `j` of every
+    /// layer's new-row output lands at `row + j` of its handle, one device-side
+    /// feed per row (the runtime's feed carries one row per call), so the step is
+    /// `1 + rows` submissions — the run's own count comes from [`Self::run_read`].
+    ///
+    /// `None` means a feed was refused, and the feeds before it have already
+    /// landed: the planes are then part-written, so the caller must discard the
+    /// cache (every caller here treats it as fatal, never as a retry).
+    pub fn run_resident_planes_rows(
+        &mut self,
+        inputs: &[(String, Vec<f32>)],
+        row: usize,
+        rows: usize,
+        row_elems: usize,
+        read: &[usize],
+    ) -> Option<Vec<Vec<f32>>> {
         let out = self.run_read(inputs, read);
-        bump(1, 1);
-        if !self.session.feed_kv_row(0, row, row_elems) {
-            return None;
+        bump(rows as u64, rows as u64);
+        for j in 0..rows {
+            if !self.session.feed_kv_row(j, row + j, row_elems) {
+                return None;
+            }
         }
         Some(out)
     }

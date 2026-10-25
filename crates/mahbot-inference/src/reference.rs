@@ -5,9 +5,12 @@
 //! The answers the two generative surfaces must keep producing, pinned before
 //! the memory-bandwidth work started. Synthesis is bit-exact: it samples from a
 //! seed, so a drift in the last bits flips a codec frame and then the whole
-//! waveform. Recognition is pinned by its words — the transcript must still read as
-//! [`LISTEN_TRANSCRIPT`], with at most [`LISTEN_MOVED_WORDS`] of them different —
-//! and its digest, its token count and every moved word print as witnesses.
+//! waveform. Recognition is recorded by its words — the transcript should still
+//! read as [`LISTEN_TRANSCRIPT`], with at most [`LISTEN_MOVED_WORDS`] of them
+//! different — and its digest, its token count and every moved word print as
+//! witnesses. The one hard gate among these is the synthesis round trip: what the
+//! recogniser hears from the synthesised wave must still be
+//! [`SPEAK_TRANSCRIPT`].
 //!
 //! Taken from a plain run of `mahbot-inference 4` (recognition) and `5`
 //! (synthesis) on the models `MEASUREMENTS.md` records, with no `RLX_*` or
@@ -310,12 +313,13 @@ fn moved_headline(moved: &[String], words: &Words) -> String {
     }
 }
 
-/// Print the recognition witness against its pins, and answer whether the cell
-/// holds: the clip's own reading (`frames`, `prompt_rows`) must be the pinned one —
-/// another reading of the input is another cell, not a moved answer — while the
-/// answer's witness (the digest, the generated-token count, the transcript) is
-/// printed with what moved and does not fail the cell. Every field is compared once
-/// here, and the transcript is split once by [`Words`].
+/// Print the recognition witness against its pins: every field is compared once
+/// here, and the transcript is split once by [`Words`]. Answers whether the clip's
+/// own reading holds and its words still read as the pin — the digest and the
+/// generated count print beside them and decide nothing — for the test that pins
+/// the composition; a caller records the answer and carries on, because a moved
+/// digest, a moved count or a sentence that no longer reads as the pin is printed
+/// with what moved (the owner-directed rule at the pins below).
 pub fn check_listen(
     frames: usize,
     prompt_rows: usize,
@@ -398,7 +402,7 @@ mod tests {
     /// empty or differently-worded one. A moved word and a truncated sentence are
     /// the cell's cases, below.
     #[test]
-    fn a_sentence_that_does_not_read_as_the_pinned_one_fails() {
+    fn a_sentence_off_its_words_is_not_the_pinned_one() {
         assert!(reads_as_pinned(LISTEN_TRANSCRIPT));
         assert!(!reads_as_pinned(""));
         assert!(!reads_as_pinned(&LISTEN_TRANSCRIPT.replace(
@@ -407,12 +411,12 @@ mod tests {
         )));
     }
 
-    /// [`check_listen`]'s verdict composition: the answer's witness moving — its
-    /// digest, the generated count, a word — is a record the cell carries, while
-    /// the clip's own reading, or a sentence that no longer reads as the pinned
-    /// one, fails it.
+    /// [`check_listen`]'s verdict composition — which pins decide: a moved
+    /// digest, generated count, word or spacing is a record the cell prints and
+    /// carries on with, and only the clip's own reading and a sentence off its words
+    /// leave the pins.
     #[test]
-    fn the_cell_holds_for_a_moved_witness_and_fails_for_another_reading() {
+    fn the_witness_verdict_says_which_pins_held() {
         assert!(check_listen(
             LISTEN_FRAMES,
             LISTEN_PROMPT_ROWS,
@@ -465,7 +469,7 @@ mod tests {
             LISTEN_ANSWER_DIGEST,
             LISTEN_TRANSCRIPT
         ));
-        // A truncated sentence fails whatever the witness says.
+        // A truncated sentence is off its words whatever the witness says.
         assert!(!check_listen(
             LISTEN_FRAMES,
             LISTEN_PROMPT_ROWS,

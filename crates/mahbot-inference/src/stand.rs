@@ -68,6 +68,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
+
 use crate::graphs::{DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, windows};
 use crate::graphs::{Outcome, SampleSpec};
 use crate::guard::{
@@ -659,13 +661,14 @@ pub fn main_entry() {
     // stdout: the sentences the two generative surfaces are held to, and the fact
     // that the comparison is on the words rather than on a digest that an unrelated
     // drift could leave intact — the listen transcript within
-    // `LISTEN_MOVED_WORDS`, its digest a witness, the round trip exact.
+    // `LISTEN_MOVED_WORDS` recorded, its digest a witness, the round trip exact.
     body.push_str(&format!(
-        "\nThe pinned answers: recognition must reproduce `{}`, compared word for word \
-         with at most {} of them different (its digest and generated-token count are \
-         witnesses, printed with what moved); the synthesis round trip — the waveform \
-         the `speak` row's digest names, resampled to 16 kHz and read back through the \
-         recogniser on its raw samples — must reproduce `{}` exactly.\n",
+        "\nThe pinned answers: recognition is recorded against `{}` — compared word \
+         for word, at most {} of them different, its digest and generated-token count \
+         printed as witnesses with what moved, and the run carries on; the synthesis \
+         round trip — the waveform the `speak` row's digest names, resampled to 16 kHz \
+         and read back through the recogniser on its raw samples — must reproduce \
+         `{}` exactly.\n",
         crate::reference::LISTEN_TRANSCRIPT,
         crate::reference::LISTEN_MOVED_WORDS,
         crate::reference::SPEAK_TRANSCRIPT,
@@ -1814,6 +1817,8 @@ struct Recognised {
     prompt_rows: usize,
     capacity: usize,
     generated: Vec<usize>,
+    /// The greedy choice that stopped the walk (EOS, or the token the budget ended on).
+    next: usize,
     written: usize,
     finished: bool,
     truncated: bool,
@@ -2114,6 +2119,7 @@ fn recognise(
         prompt_rows,
         capacity,
         generated,
+        next,
         written,
         finished,
         truncated,
@@ -2129,6 +2135,135 @@ fn recognise(
     }
 }
 
+/// What a recognition walk answered, for the harnesses that price a decode
+/// change: the token stream the listen cell prints as `first_tokens` (all of it),
+/// the transcript and the digest it prints as `digest`, and the walk's own price.
+pub struct Answer {
+    pub generated: Vec<usize>,
+    /// The greedy choice that stopped the walk, i.e. the model's choice at
+    /// position `generated.len()`.
+    pub next: usize,
+    pub frames: usize,
+    pub prompt_rows: usize,
+    pub capacity: usize,
+    pub text: String,
+    /// The cell's own `digest=` — the walk's value list, hashed here so a harness
+    /// compares against the pin rather than restating the list.
+    pub digest: u64,
+    pub decode_ms: f64,
+    pub build_ms: f64,
+    pub stream_bytes: u64,
+}
+
+impl Answer {
+    fn of(r: Recognised) -> Self {
+        Self {
+            generated: r.generated,
+            next: r.next,
+            frames: r.frames,
+            prompt_rows: r.prompt_rows,
+            capacity: r.capacity,
+            text: r.text,
+            digest: digest(&r.values),
+            decode_ms: r.decode_ms,
+            build_ms: r.build_ms,
+            stream_bytes: r.decode_stream_bytes,
+        }
+    }
+}
+
+/// The listen cell's recording: `STAND_ASR_WAV` when set, else the reference voice.
+pub fn listen_path() -> anyhow::Result<std::path::PathBuf> {
+    match std::env::var("STAND_ASR_WAV").ok() {
+        Some(p) => Ok(std::path::PathBuf::from(p)),
+        None => crate::loader::voice_wav(),
+    }
+}
+
+/// The offset into that recording, `STAND_ASR_OFFSET`, `0` when unset.
+pub fn listen_offset() -> usize {
+    std::env::var("STAND_ASR_OFFSET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Whether a walk over `path` at `offset` is the recording the pinned witness was
+/// taken on: the reference voice's path, at offset 0, and the voice file's content
+/// still at its pin. The pins hold only for that clip, so any other input is a
+/// different cell and its answer is printed as `skipped=alternate-input` instead of
+/// compared — the file the walk actually reads decides, not the switch that named
+/// it, so a two-recording run's first clip is still witnessed. Identity is the path,
+/// not the bytes: a copy of the pinned voice under another name reads as an
+/// alternate, and hashing every input to relabel a skip is not worth it.
+fn listen_is_alternate(path: &std::path::Path, offset: usize) -> bool {
+    offset != 0
+        // The voice WAV is this cell's only audio input, so its *presence* is not
+        // an alternate: the pin holds for the clip the witness was recorded with
+        // and is skipped only when that file's content differs.
+        || !crate::reference::voice_is_pinned()
+        || !crate::loader::voice_wav().is_ok_and(|voice| voice == path)
+}
+
+/// The listen witness, printed as the cell prints it: the pins compared when this
+/// run's input is the recorded clip, `skipped=alternate-input` when it is not. One
+/// rule, so a harness that walks the same recording cannot print a different verdict
+/// than the cell.
+pub fn witness_listen(
+    path: &std::path::Path,
+    offset: usize,
+    frames: usize,
+    prompt_rows: usize,
+    generated: usize,
+    answer_digest: u64,
+    transcript: &str,
+) {
+    if listen_is_alternate(path, offset) {
+        println!("witness listen skipped=alternate-input");
+        return;
+    }
+    let _ =
+        crate::reference::check_listen(frames, prompt_rows, generated, answer_digest, transcript);
+}
+
+/// The listen cell's input, conditioned the way the cell takes it: `path` at
+/// `offset`, 16 kHz mono, `SPEECH_SAMPLES` long, trimmed and gained by
+/// [`prepare_speech`]. The pair is the caller's, so a harness that walks several
+/// recordings opens the model once.
+fn listen_input(
+    pair: &Pair,
+    path: &std::path::Path,
+    offset: usize,
+) -> anyhow::Result<(Tokenizer, Vec<f32>)> {
+    let tokenizer = Tokenizer::from_model(&pair.body).context("the recognition tokenizer")?;
+    let mut audio = host::wav_mono_16k(&path.display().to_string(), offset, SPEECH_SAMPLES)
+        .context("the recording")?;
+    prepare_speech(&mut audio);
+    Ok((tokenizer, audio))
+}
+
+/// One recognition walk over `path` — the listen cell's own walk, its answer
+/// returned rather than printed, one pass per phase (a harness prices a decode
+/// change, not a repetition). `None` when the input cannot be read (the reason is
+/// printed, so a harness skip is attributable); a walk that has the input but cannot
+/// run ends the process exactly as the cell does (`recognise`'s `cell_failed!`).
+pub fn listen_answer(pair: &Arc<Pair>, path: &std::path::Path, offset: usize) -> Option<Answer> {
+    let (tokenizer, audio) = match listen_input(pair, path, offset) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("listen-answer skipped: {e:#}");
+            return None;
+        }
+    };
+    Some(Answer::of(recognise(
+        pair,
+        &tokenizer,
+        audio,
+        1,
+        "listen-answer",
+    )))
+}
+
 /// The recognition product segment: the voice clip (17.46 s, 1 746 mel frames)
 /// → mel → encoder → the 234-row prompt (3 head + 6 text + 219 audio + 6 tail)
 /// → body prefill → the greedy walk, 65 tokens on the recorded clip over a
@@ -2136,39 +2271,25 @@ fn recognise(
 /// `ASR_MAX_NEW`. A walk that reaches the budget without EOS is printed as
 /// `unfinished`, not as an answer.
 fn listen() {
+    let path = match listen_path() {
+        Ok(p) => p,
+        Err(e) => {
+            cell_failed!("cell listen — voice reference: {e}");
+        }
+    };
+    let offset = listen_offset();
     let pair = match Pair::of_role(Role::Recognition) {
         Ok(p) => Arc::new(p),
         Err(e) => {
-            cell_failed!("cell listen — open the pair: {e}");
+            cell_failed!("cell listen — the recognition pair: {e:#}");
         }
     };
-    let tokenizer = match Tokenizer::from_model(&pair.body) {
-        Ok(t) => t,
-        Err(e) => {
-            cell_failed!("cell listen — tokenizer: {e}");
-        }
-    };
-    let env_path = std::env::var("STAND_ASR_WAV").ok();
-    let path = match env_path {
-        Some(p) => std::path::PathBuf::from(p),
-        None => match crate::loader::voice_wav() {
-            Ok(p) => p,
-            Err(e) => {
-                cell_failed!("cell listen — voice reference: {e}");
-            }
-        },
-    };
-    let offset = std::env::var("STAND_ASR_OFFSET")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    let mut audio = match host::wav_mono_16k(&path.display().to_string(), offset, SPEECH_SAMPLES) {
+    let (tokenizer, audio) = match listen_input(&pair, &path, offset) {
         Ok(v) => v,
         Err(e) => {
-            cell_failed!("cell listen — audio: {e}");
+            cell_failed!("cell listen — input: {e:#}");
         }
     };
-    prepare_speech(&mut audio);
 
     // The measurement walks the same path the round-trip gate transcribes with —
     // one function, so the two cells' answers move together.
@@ -2180,6 +2301,7 @@ fn listen() {
         prompt_rows,
         capacity,
         generated,
+        next: _,
         written,
         finished,
         truncated,
@@ -2233,29 +2355,21 @@ fn listen() {
     // returning, so the record attributes it to whoever held it then rather than to
     // what is live now.
     let map_bytes = file_bytes(&pair.body.path) + file_bytes(&pair.sound.path);
-    // The witness is checked before the line prints: a run whose answer no longer
-    // reads as the pinned sentence is a failed run even if its seconds improved —
-    // while a moved digest or a moved word inside that sentence is printed with
-    // what moved and the run carries on (`reference::check_listen`). A cell
-    // deliberately fed another recording or another generation budget is a
-    // different cell, so its answer is not compared against the pinned one.
-    let alternate = std::env::var_os("STAND_ASR_WAV").is_some()
-        || std::env::var_os("STAND_ASR_OFFSET").is_some()
-        // The voice WAV is this cell's only audio input, so its *presence* is not
-        // an alternate: the pin holds for the clip the witness was recorded with
-        // and is skipped only when that file's content differs.
-        || !crate::reference::voice_is_pinned();
-    if alternate {
-        println!("witness listen skipped=alternate-input");
-    } else if !crate::reference::check_listen(
+    // The witness is printed before the line: the pins record what this clip
+    // answered, and a moved answer is reported with what moved, never a failed
+    // run — a round that reorders a summation (`reference.rs` says why the pins
+    // are witnesses) carries on and prints its reading. A cell deliberately fed
+    // another recording or another generation budget is a different cell, so its
+    // answer is not compared against the pinned one.
+    witness_listen(
+        &path,
+        offset,
         frames,
         prompt_rows,
         generated.len(),
         digest(&values),
         &text,
-    ) {
-        cell_failed!("cell listen — the answer no longer reads as the pinned reference");
-    }
+    );
     line(
         "listen",
         &fields,
@@ -2410,9 +2524,9 @@ fn ear_short(samples: usize, name: &str) {
 
 /// The speak cell: the synthesis half, then its two quality gates, then the line.
 ///
-/// The gates run before the line prints, as they do in `listen`: a run whose
-/// waveform left the PCM range or no longer says the same thing to our own
-/// recogniser is a failed run even if its seconds improved. The round trip needs
+/// The gates run before the line prints: a run whose waveform left the PCM range
+/// or no longer says the same thing to our own recogniser is a failed run even if
+/// its seconds improved — these two are the stand's hard gate. The round trip needs
 /// the recognition pair; without it the cell still runs and the gate prints that
 /// it did not.
 fn speak() {
@@ -2432,8 +2546,8 @@ fn speak() {
         return;
     };
     let cell = "speak";
-    // The quality gate, both halves before the line prints — the order `listen`
-    // sets. The waveform's movement is a witness, not a gate (`reference.rs`): what
+    // The quality gate, both halves before the line prints: the stand's hard gate.
+    // The waveform's movement is a witness (`reference.rs`): what
     // must hold is the range and finiteness below and the round trip after, even
     // where a digest has moved.
     //
