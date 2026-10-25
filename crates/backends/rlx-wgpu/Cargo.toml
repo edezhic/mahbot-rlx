@@ -358,6 +358,10 @@ name = "gguf_gemm_gguf_wgsl"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "gguf_gemm_grouped_loop_rate"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "gguf_gemm_grouped_split_rate"
 required-features = ["backend-tests"]
 

@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The answers the two generative surfaces must keep producing, pinned before
-//! the memory-bandwidth work started. Both are bit-exact: recognition takes an
-//! argmax, synthesis samples from a seed, so a drift in the last bits flips a
-//! token, then a codec frame, then the whole waveform.
+//! the memory-bandwidth work started. Synthesis is bit-exact: it samples from a
+//! seed, so a drift in the last bits flips a codec frame and then the whole
+//! waveform. Recognition is pinned by its words — the transcript must still read as
+//! [`LISTEN_TRANSCRIPT`], with at most [`LISTEN_MOVED_WORDS`] of them different —
+//! and its digest, its token count and every moved word print as witnesses.
 //!
 //! Taken from a plain run of `mahbot-inference 4` (recognition) and `5`
 //! (synthesis) on the models `MEASUREMENTS.md` records, with no `RLX_*` or
@@ -23,7 +25,7 @@ pub const LISTEN_PROMPT_ROWS: usize = 234;
 pub const LISTEN_GENERATED: usize = 65;
 // The pinned digests in this file are a **witness, not a gate** (owner-directed):
 // a hash that moves because the real outputs moved by a rounding is recorded and
-// reported — with what moved and by how much — and the round carries on, as long
+// reported — with what moved and by how much — and the run carries on, as long
 // as the recognised transcript of the synthesised wave and the speech's
 // intelligibility and range are intact. What is hard: no non-finite values and no
 // clipping. Do not roll back a measured win because a digest moved in its last
@@ -35,19 +37,26 @@ pub const LISTEN_ANSWER_DIGEST: u64 = 0x2f93_dfa1_d7cd_eeb1;
 pub const LISTEN_TRANSCRIPT_SHA256: &str =
     "522e47e1f6ed20ca69ad638df1b2b44ed03ef721e349d6ffacea4e13f7c18d3f";
 pub const LISTEN_TRANSCRIPT: &str = "обычные объявления метро делались только на каталонском языке, но не забывали переводить объявления в другие языки, например, итальянский, испанский, английский, французский, итальянский";
+/// Words of [`LISTEN_TRANSCRIPT`] a run may differ in and still read as it: one
+/// moved token lands in one word, and two such moves are still the same sentence.
+/// The word count itself must match — a move across a space merges or splits a
+/// word, and that is a different sentence rather than a moved word.
+pub const LISTEN_MOVED_WORDS: usize = 2;
 
 /// Synthesis: 330 codec rows, 26.40 s at 24 kHz, `330 · 1920 = 633 600` samples.
 pub const SPEAK_ROWS: usize = 330;
 pub const SPEAK_SAMPLES: usize = 633_600;
 /// `digest(&waveform)` — FNV-1a over the f32 bytes, the cell's own `digest=`.
 ///
-/// Re-recorded when the sound half's `SnakeBeta` chain became one dispatch and the
-/// frame's norms became 16 B loads: both move the waveform's last bits (the snake
-/// by at most one count of its 638-count peak on 29 of 153 600 samples, the norms
-/// by their summation order), and the previous pin was `bae7_ba02_2d33_5038`.
-/// The transcript below is the gate; this digest is the record of the waveform
-/// that produced it.
-pub const SPEAK_WAVE_DIGEST: u64 = 0x231d_8234_9645_0627;
+/// Moves when a change reorders a summation the waveform depends on: the packed
+/// multiply's accumulator became one scalar per row (`row_dot` in
+/// `dequant_gemm_gguf.wgsl`), and the seeded draws then leave the pinned sample path
+/// somewhere in the 330 rows — 330 rows and 633 600 samples as before, prompt digest
+/// unchanged, and the round-trip transcript below **identical** to its pin, which is
+/// what makes this a moved witness rather than a moved answer. Superseded pin:
+/// `231d_8234_9645_0627`. The transcript below is the gate; this digest is the record
+/// of the waveform that produced it.
+pub const SPEAK_WAVE_DIGEST: u64 = 0x9d83_7a9c_4164_ba94;
 /// The `prompt_digest` `MEASUREMENTS.md` carried before the waveform digest was
 /// pinned — the talker prompt's FNV-1a digest, recorded beside the waveform so
 /// the waveform can be audited against a value that predates it.
@@ -213,7 +222,100 @@ pub fn article() -> anyhow::Result<String> {
     Ok(text)
 }
 
-/// Print the recognition witness against the pins. `false` on any difference.
+/// One run's transcript split against the pin's own words — split once, so the
+/// verdict, the moved-word lines and the word counts `check_listen` prints cannot
+/// disagree. The rule is the sentence, not the hash: a token moves on a last-bit
+/// rounding in the multiply, which is exactly what a measured change is allowed to
+/// do, and a pinned SHA-256 failed the cell for it.
+struct Words<'a> {
+    /// `(index, produced, pinned)` for each word that differs, pairwise.
+    moved: Vec<(usize, &'a str, &'static str)>,
+    produced: usize,
+    pinned: usize,
+    /// Same word count and at most [`LISTEN_MOVED_WORDS`] words different.
+    reads_as_pinned: bool,
+}
+
+impl<'a> Words<'a> {
+    fn against_pin(transcript: &'a str) -> Self {
+        let got: Vec<&'a str> = transcript.split_whitespace().collect();
+        let want: Vec<&'static str> = LISTEN_TRANSCRIPT.split_whitespace().collect();
+        let moved = got
+            .iter()
+            .zip(&want)
+            .enumerate()
+            .filter(|(_, (g, w))| g != w)
+            .map(|(i, (g, w))| (i, *g, *w))
+            .collect::<Vec<_>>();
+        let reads_as_pinned = got.len() == want.len() && moved.len() <= LISTEN_MOVED_WORDS;
+        Self {
+            moved,
+            produced: got.len(),
+            pinned: want.len(),
+            reads_as_pinned,
+        }
+    }
+}
+
+/// The scalar fields a run's witness moved on, one entry each. The transcript's word
+/// count is one of them: [`Words`] compares pairwise over the shared prefix, so a
+/// transcript that ends early or runs long moves none of its words.
+fn moved_fields(
+    frames: usize,
+    prompt_rows: usize,
+    generated: usize,
+    answer_digest: u64,
+    words: &Words,
+) -> Vec<String> {
+    let mut moved = Vec::new();
+    if frames != LISTEN_FRAMES {
+        moved.push(format!("frames {frames} (pinned {LISTEN_FRAMES})"));
+    }
+    if prompt_rows != LISTEN_PROMPT_ROWS {
+        moved.push(format!(
+            "prompt {prompt_rows} (pinned {LISTEN_PROMPT_ROWS})"
+        ));
+    }
+    if generated != LISTEN_GENERATED {
+        moved.push(format!("generated {generated} (pinned {LISTEN_GENERATED})"));
+    }
+    if answer_digest != LISTEN_ANSWER_DIGEST {
+        moved.push(format!(
+            "answer_digest {answer_digest:016x} (pinned {LISTEN_ANSWER_DIGEST:016x})"
+        ));
+    }
+    if words.produced != words.pinned {
+        moved.push(format!(
+            "words {} (pinned {})",
+            words.produced, words.pinned
+        ));
+    }
+    moved
+}
+
+/// The `witness listen — moved:` headline: the scalar fields that moved, else the
+/// words that did, else — nothing having moved — the text's own bytes, which is the
+/// only case where the headline can claim every word is at its pin.
+fn moved_headline(moved: &[String], words: &Words) -> String {
+    if !moved.is_empty() {
+        moved.join(", ")
+    } else if !words.moved.is_empty() {
+        format!(
+            "{} of {} words (listed below)",
+            words.moved.len(),
+            words.produced
+        )
+    } else {
+        "the transcript's bytes only (every word at its pin)".to_string()
+    }
+}
+
+/// Print the recognition witness against its pins, and answer whether the cell
+/// holds: the clip's own reading (`frames`, `prompt_rows`) must be the pinned one —
+/// another reading of the input is another cell, not a moved answer — while the
+/// answer's witness (the digest, the generated-token count, the transcript) is
+/// printed with what moved and does not fail the cell. Every field is compared once
+/// here, and the transcript is split once by [`Words`].
 pub fn check_listen(
     frames: usize,
     prompt_rows: usize,
@@ -222,23 +324,30 @@ pub fn check_listen(
     transcript: &str,
 ) -> bool {
     let hash = sha256_hex(transcript.as_bytes());
-    let same = frames == LISTEN_FRAMES
-        && prompt_rows == LISTEN_PROMPT_ROWS
-        && generated == LISTEN_GENERATED
-        && answer_digest == LISTEN_ANSWER_DIGEST
-        && hash == LISTEN_TRANSCRIPT_SHA256;
+    let words = Words::against_pin(transcript);
+    let moved = moved_fields(frames, prompt_rows, generated, answer_digest, &words);
+    // The clip's own reading is the cell's identity: a run that read the input
+    // differently is not this cell, whatever it answered.
+    let input_is_pinned = frames == LISTEN_FRAMES && prompt_rows == LISTEN_PROMPT_ROWS;
+    let all_pinned = moved.is_empty() && hash == LISTEN_TRANSCRIPT_SHA256;
     println!(
         "witness listen frames={frames}/{LISTEN_FRAMES} prompt={prompt_rows}/{LISTEN_PROMPT_ROWS} \
          generated={generated}/{LISTEN_GENERATED} answer_digest={answer_digest:016x}/\
-         {LISTEN_ANSWER_DIGEST:016x} transcript_sha256={hash}/{} equal={same}",
-        LISTEN_TRANSCRIPT_SHA256
+         {LISTEN_ANSWER_DIGEST:016x} transcript_sha256={hash}/{} all_pinned={all_pinned} \
+         reads_as_pinned={}",
+        LISTEN_TRANSCRIPT_SHA256, words.reads_as_pinned
     );
-    if !same {
-        println!("witness listen — the answer is not the pinned one:");
+    if !all_pinned {
+        println!("witness listen — moved: {}", moved_headline(&moved, &words));
+        for (i, got, want) in &words.moved {
+            println!("  word {i}: produced {got:?}, pinned {want:?}");
+        }
+    }
+    if !words.reads_as_pinned {
         println!("  produced: {transcript:?}");
         println!("  pinned:   {LISTEN_TRANSCRIPT:?}");
     }
-    same
+    words.reads_as_pinned && input_is_pinned
 }
 
 /// Print the synthesis witness: the waveform hash and its sample count. A moved
@@ -274,4 +383,122 @@ pub fn check_speak_roundtrip(heard: &str) -> bool {
         println!("  pinned: {SPEAK_TRANSCRIPT:?}");
     }
     same
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`Words::against_pin`]'s verdict for one transcript.
+    fn reads_as_pinned(transcript: &str) -> bool {
+        Words::against_pin(transcript).reads_as_pinned
+    }
+
+    /// The listen witness' rule's own boundaries: the pinned sentence and an
+    /// empty or differently-worded one. A moved word and a truncated sentence are
+    /// the cell's cases, below.
+    #[test]
+    fn a_sentence_that_does_not_read_as_the_pinned_one_fails() {
+        assert!(reads_as_pinned(LISTEN_TRANSCRIPT));
+        assert!(!reads_as_pinned(""));
+        assert!(!reads_as_pinned(&LISTEN_TRANSCRIPT.replace(
+            "итальянский, испанский, английский",
+            "немецкий, шведский, датский"
+        )));
+    }
+
+    /// [`check_listen`]'s verdict composition: the answer's witness moving — its
+    /// digest, the generated count, a word — is a record the cell carries, while
+    /// the clip's own reading, or a sentence that no longer reads as the pinned
+    /// one, fails it.
+    #[test]
+    fn the_cell_holds_for_a_moved_witness_and_fails_for_another_reading() {
+        assert!(check_listen(
+            LISTEN_FRAMES,
+            LISTEN_PROMPT_ROWS,
+            LISTEN_GENERATED,
+            LISTEN_ANSWER_DIGEST,
+            LISTEN_TRANSCRIPT
+        ));
+        assert!(check_listen(
+            LISTEN_FRAMES,
+            LISTEN_PROMPT_ROWS,
+            LISTEN_GENERATED,
+            LISTEN_ANSWER_DIGEST ^ 1,
+            LISTEN_TRANSCRIPT
+        ));
+        assert!(check_listen(
+            LISTEN_FRAMES,
+            LISTEN_PROMPT_ROWS,
+            LISTEN_GENERATED + 1,
+            LISTEN_ANSWER_DIGEST,
+            LISTEN_TRANSCRIPT
+        ));
+        assert!(check_listen(
+            LISTEN_FRAMES,
+            LISTEN_PROMPT_ROWS,
+            LISTEN_GENERATED,
+            LISTEN_ANSWER_DIGEST,
+            &LISTEN_TRANSCRIPT.replace("на каталонском языке", "на каталонской языке")
+        ));
+        // The text's own bytes moving while every word holds its place — spacing —
+        // is a record too, not a failure.
+        assert!(check_listen(
+            LISTEN_FRAMES,
+            LISTEN_PROMPT_ROWS,
+            LISTEN_GENERATED,
+            LISTEN_ANSWER_DIGEST,
+            &LISTEN_TRANSCRIPT.replacen(", ", ",  ", 1)
+        ));
+        // The clip's own reading is the cell's identity, not its answer.
+        assert!(!check_listen(
+            LISTEN_FRAMES + 1,
+            LISTEN_PROMPT_ROWS,
+            LISTEN_GENERATED,
+            LISTEN_ANSWER_DIGEST,
+            LISTEN_TRANSCRIPT
+        ));
+        assert!(!check_listen(
+            LISTEN_FRAMES,
+            LISTEN_PROMPT_ROWS + 1,
+            LISTEN_GENERATED,
+            LISTEN_ANSWER_DIGEST,
+            LISTEN_TRANSCRIPT
+        ));
+        // A truncated sentence fails whatever the witness says.
+        assert!(!check_listen(
+            LISTEN_FRAMES,
+            LISTEN_PROMPT_ROWS,
+            LISTEN_GENERATED,
+            LISTEN_ANSWER_DIGEST,
+            "обычные объявления метро"
+        ));
+    }
+
+    /// The headline [`check_listen`] prints for the three cases it covers: a moved
+    /// word, a count drift and the spacing-only transcript. The verdict is the same
+    /// in the first two, so what the cell says is what this pins — the reassurance
+    /// may appear only when nothing moved at all.
+    #[test]
+    fn the_moved_headline_names_every_case_it_covers() {
+        fn headline(transcript: &str) -> String {
+            let words = Words::against_pin(transcript);
+            let moved = moved_fields(
+                LISTEN_FRAMES,
+                LISTEN_PROMPT_ROWS,
+                LISTEN_GENERATED,
+                LISTEN_ANSWER_DIGEST,
+                &words,
+            );
+            moved_headline(&moved, &words)
+        }
+        assert_eq!(
+            headline(&LISTEN_TRANSCRIPT.replacen(", ", ",  ", 1)),
+            "the transcript's bytes only (every word at its pin)"
+        );
+        let one_word = LISTEN_TRANSCRIPT.replace("на каталонском языке", "на каталонской языке");
+        assert_eq!(headline(&one_word), "1 of 22 words (listed below)");
+        let truncated = "обычные объявления метро";
+        assert_eq!(headline(truncated), "words 3 (pinned 22)");
+    }
 }

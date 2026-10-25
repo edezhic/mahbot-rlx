@@ -22,18 +22,54 @@
 // (which re-streams the weight once per row) does not scale in `m`. The split's
 // block headers are the exception: its two lane groups each read one column's
 // header, so every block's header is read twice under it (its own paragraph
-// below).
+// below). Each row's accumulator is one scalar, not the four `vec4` lanes an
+// earlier form carried and reduced at the store: four products per row per weight
+// `vec4` in one register instead of four, in a different summation order, and the
+// instruction count that costs or saves is the backend's (`row_dot` states what
+// WGSL does and does not fix there).
 //
-// Except for the parity bands this tree measures itself further down and the
-// re-taken figures the owner's paragraphs below record — the owner's own stand
-// measurements, which name their stand — the timing figures in this header are
-// the author's own out-of-tree A/B of the raw kernel and its variants on one
-// adapter (wgpu over Metal, an M3 Pro with an 18-core GPU — the author's, the one
-// the split band's figures come from, and not the 14-core stand the re-takes
-// name), timed per byte and per variant rather than as graph-call ratios, and are
-// to be re-taken rather than trusted: the harnesses this header names time whole
-// graph calls instead (`tests/gguf_gemm_grouped_weight_reuse.rs` answers this
-// kernel's row-group-versus-single-row question that way).
+// The narrower accumulator is the form this tree measured, and the tile height is
+// what it did **not** buy. `tests/gguf_gemm_grouped_loop_rate.rs` is where that
+// form's A/B and the demand live — both sides' binaries interleaved in one window,
+// over the phases' own nodes and over the raw kernel at 219 rows.
+//
+// Every tile height measured above 8 loses, and steeply, with the same narrow
+// accumulators: one window on the raw kernel at 219 rows, that window's 8-row
+// time of 4 414 us as the denominator, `TM` = 10, 12 and 15 read 8 521, 10 818
+// and 16 102 us on Q4_K 219 x 2 048 x 6 144 (1.9x, 2.5x, 3.6x) and 207 514,
+// 270 908 and 311 546 us on Q6_K 219 x 2 048 x 151 936 against 136 866 (1.5x,
+// 2.0x, 2.3x). Those arms were temporary shader variants and are not in the tree:
+// re-taking them means rebuilding this kernel at another `TM`, not flipping a
+// switch. So the tile stays at 8, and the passes over the weight a taller tile
+// would have saved are not this kernel's to save here. The height, not the rows'
+// arithmetic, is what a taller tile spends: the shipped 8-row body with its tile
+// merely *declared* 10 rows deep (10 KiB of workgroup storage, identical
+// arithmetic) measured 9 814 us on that Q4_K shape, 2.2x the same window's 8 KiB
+// tile — a reading of this adapter's occupancy, offered as the next form's
+// question and not answered here.
+//
+// What those saved passes were worth at all is bounded by the phases' own weight
+// demand — the bytes the row groups move over the packed weight, over the call's
+// time, read against the machine's streaming read ceiling. That figure and the
+// resident sweep beside it are printed there too.
+//
+// Nothing in the form is gated on the device: one scalar per row, an 8 KiB staged
+// tile, 64 invocations — all inside the WebGPU baseline, and no second arm is
+// kept. A device that could not run it would be running the four-lane form this
+// replaces; there is no other arm in the tree for it to fall to.
+//
+// Where this header's figures come from, table by table: the tile sweep and the
+// declared-storage probe above are this fork's stand's (an M3 Pro, 14-core GPU,
+// 18 GiB, wgpu over Metal); the parity bands are this tree's own measurements
+// further down; the accumulator A/B and the demand are the harness named above;
+// the step costs below are the owner's stand's; and the remaining timing figures
+// are the author's own out-of-tree A/B of the raw kernel and its variants on
+// another adapter (wgpu over Metal, an M3 Pro with an 18-core GPU — the author's,
+// the one the split band's figures come from), timed per byte and per variant
+// rather than as graph-call ratios and to be re-taken rather than trusted: the
+// harnesses this header names time whole graph calls instead
+// (`tests/gguf_gemm_grouped_weight_reuse.rs` answers this kernel's
+// row-group-versus-single-row question that way).
 //
 // Both operands are read through the cheapest path that measured here, and which
 // path that is was not obvious. The weight is read as whole 4-byte words: a byte
@@ -51,12 +87,12 @@
 //
 // What the tree records as limiting the kernel is that staged-X path: `TM`
 // staged loads per weight word per output column is 8 loads per 32 MACs, and the
-// only way past that is more output columns per thread, which the author's
-// adapter pays for in registers — a two-column variant spilled its accumulators
-// and measured 2x SLOWER. That is the tree's claim, taken on that adapter and due
-// for re-take on ours rather than our measurement; so is the rest of it, a
-// 16-byte vectorized weight fetch and a doubled FMA count having measured flat
-// there, whence the kernel is recorded as not bound by issuing work.
+// only way past that is more output columns per thread, which a two-column
+// variant measured 2x SLOWER on the author's adapter, with no cause recorded
+// there and not an arm this form took. That is the tree's claim, taken on that
+// adapter and due for re-take on ours rather than our measurement; so is the rest
+// of it, a 16-byte vectorized weight fetch and a doubled FMA count having measured
+// flat there, whence the kernel is recorded as not bound by issuing work.
 //
 // The owner's re-take measured next, on the stand (an Apple M3 Pro, 14-core GPU,
 // 18 GiB, macOS, wgpu over Metal; sides alternated in adjacent rounds, medians —
@@ -117,10 +153,12 @@
 // synthesis body's 24-row one), and arithmetically different too, the 32-row arms'
 // output differing by summation-reordering round-off rather than by a wrong
 // answer. `GROUPED_ROWS`'s doc in `gguf_gpu.rs`, which sizes this tile, carries the
-// arm pairs and that difference; no mechanism is claimed for the loss, and the
-// reading this re-take replaces does not explain one this size. That reading also
-// carried a regression where the tile computes 16 rows' worth for fewer real ones
-// — below the tile's height — untouched here, and still under the disclaimer above.
+// arm pairs and that difference. Those arms did not isolate a cause; the one this
+// tree measured since is the declared tile's own workgroup storage (above), and
+// the reading this re-take replaces does not explain a loss this size. That
+// reading also carried a regression where the tile computes 16 rows' worth for
+// fewer real ones — below the tile's height — untouched here, and still under the
+// disclaimer above.
 //
 // `tests/gguf_gemm_grouped_weight_reuse.rs` holds the measurement of what
 // one row group costs against the single-row pass it replaces. It no longer
@@ -164,18 +202,22 @@
 // no split arm and run the base geometry whatever the word says.
 //
 // The dequant is the GEMV's, element for element and in the same k order; the
-// accumulation is not — each thread keeps four vec4<f32> lanes per row and adds
-// them horizontally at the store (`dot4`), where the one-row arms sum in their
-// own orders (the tiled arm reduces lane partials in a fixed tree), so round-off
-// differs. A split workgroup adds a third order again: the two half-`k` threads'
-// partial sums meet in workgroup memory first — `sl` = 1's half written, `sl` =
-// 0's thread adding it to its own before the `dot4` — the same terms in one fixed
-// order, with no unordered updates. The measured CPU-reference parity is the
-// real justification: max-abs 1.9e-5 .. 6.5e-4 over the prefill-parity shapes,
-// against the 1e-2 this op is compared at. The Q8_0 entry's own band, over the
-// cells `rlx-wgpu/tests/gguf_matmul_route.rs` measures it at, is 2.7e-5 .. 4.2e-4
-// (identical against the CPU reference and against the scratch route it
-// replaces), well inside that gate.
+// accumulation is not — each thread keeps one scalar per row and sums each four
+// weights' products into it as they are dequantized ([`row_dot`]), where the
+// `vec4` lanes this kernel used to carry summed in their own order at the store,
+// and the one-row arms sum in theirs (the tiled arm reduces lane partials in a
+// fixed tree), so round-off differs. A split workgroup adds a third order again: the
+// two half-`k` threads' partial sums meet in workgroup memory first — `sl` = 1's
+// half written, `sl` = 0's thread adding it to its own — the same terms in one
+// fixed order, with no unordered updates; within a `vec4` the four terms'
+// association is the backend's, as `row_dot` states. The measured CPU-reference
+// parity is the real justification: max-abs 2.3e-5 .. 5.9e-4 over the
+// prefill-parity shapes with these accumulators (re-taken from
+// `rlx-wgpu/tests/gguf_dequant_matmul_prefill_parity.rs`; the lanes' own band was
+// 1.9e-5 .. 6.5e-4), against the 1e-2 this op is compared at. The Q8_0 entry's own
+// band, over the cells `rlx-wgpu/tests/gguf_matmul_route.rs` measures it at, is
+// 3.8e-6 .. 3.7e-4 (identical against the CPU reference and against the scratch
+// route it replaces), well inside that gate.
 //
 // The Q6_K dequant (`read_w`, `read_w_i8`, `dq_read_f16`, `bytes_x4`, `q6c`,
 // `q6_quarter`) is the one-row tiled arm's, `dequant_gemv_tiled` of
@@ -294,8 +336,6 @@ fn q4k_scale_min(w0: u32, w1: u32, w2: u32, j: u32) -> vec2<u32> {
     return vec2<u32>((c & 0x0Fu) | (((a >> 6u) & 3u) << 4u), (c >> 4u) | (((b >> 6u) & 3u) << 4u));
 }
 
-fn dot4(v: vec4<f32>) -> f32 { return v.x + v.y + v.z + v.w; }
-
 /// The four Q4_K weights one `qs` word carries for a sub-block, low nibble
 /// (`sh == 0`) or high nibble (`sh == 4`) — the group of four X elements one
 /// `vec4` load multiplies. Returned the way `unpack4x8unorm` gives them, i.e.
@@ -336,16 +376,17 @@ fn dequant_gemm_q4k(
     let last_row = params.m - 1u;
     let xb = params.x_vec4_off;
 
-    // TM named accumulators: an `array<vec4<f32>, TM>` indexed by a loop
-    // variable spills to local memory and costs a load+store per accumulate.
-    var a0 = vec4<f32>(0.0);
-    var a1 = vec4<f32>(0.0);
-    var a2 = vec4<f32>(0.0);
-    var a3 = vec4<f32>(0.0);
-    var a4 = vec4<f32>(0.0);
-    var a5 = vec4<f32>(0.0);
-    var a6 = vec4<f32>(0.0);
-    var a7 = vec4<f32>(0.0);
+    // TM named accumulators: an `array<f32, TM>` indexed by a loop variable would
+    // spill to local memory and cost a load+store per accumulate. Scalars rather
+    // than a `vec4` per row: one register per row instead of four.
+    var a0: f32 = 0.0;
+    var a1: f32 = 0.0;
+    var a2: f32 = 0.0;
+    var a3: f32 = 0.0;
+    var a4: f32 = 0.0;
+    var a5: f32 = 0.0;
+    var a6: f32 = 0.0;
+    var a7: f32 = 0.0;
 
     for (var b: u32 = 0u; b < nbk; b = b + 1u) {
         let p0 = b * BLK_ELEMS;
@@ -407,27 +448,27 @@ fn dequant_gemm_q4k(
                 for (var l: u32 = 0u; l < 32u; l = l + 4u) {
                     let ww = fma(q4k_nibbles(read_u32(qsw + l), 0u), d0u, nm0);
                     let o = lp + l;
-                    a0 = a0 + xs_at(0u, o) * ww;
-                    a1 = a1 + xs_at(1u, o) * ww;
-                    a2 = a2 + xs_at(2u, o) * ww;
-                    a3 = a3 + xs_at(3u, o) * ww;
-                    a4 = a4 + xs_at(4u, o) * ww;
-                    a5 = a5 + xs_at(5u, o) * ww;
-                    a6 = a6 + xs_at(6u, o) * ww;
-                    a7 = a7 + xs_at(7u, o) * ww;
+                    a0 = row_dot(a0, 0u, o, ww);
+                    a1 = row_dot(a1, 1u, o, ww);
+                    a2 = row_dot(a2, 2u, o, ww);
+                    a3 = row_dot(a3, 3u, o, ww);
+                    a4 = row_dot(a4, 4u, o, ww);
+                    a5 = row_dot(a5, 5u, o, ww);
+                    a6 = row_dot(a6, 6u, o, ww);
+                    a7 = row_dot(a7, 7u, o, ww);
                 }
                 lp = lp + 32u;
                 for (var l: u32 = 0u; l < 32u; l = l + 4u) {
                     let ww = fma(q4k_nibbles(read_u32(qsw + l), 4u), d1u, nm1);
                     let o = lp + l;
-                    a0 = a0 + xs_at(0u, o) * ww;
-                    a1 = a1 + xs_at(1u, o) * ww;
-                    a2 = a2 + xs_at(2u, o) * ww;
-                    a3 = a3 + xs_at(3u, o) * ww;
-                    a4 = a4 + xs_at(4u, o) * ww;
-                    a5 = a5 + xs_at(5u, o) * ww;
-                    a6 = a6 + xs_at(6u, o) * ww;
-                    a7 = a7 + xs_at(7u, o) * ww;
+                    a0 = row_dot(a0, 0u, o, ww);
+                    a1 = row_dot(a1, 1u, o, ww);
+                    a2 = row_dot(a2, 2u, o, ww);
+                    a3 = row_dot(a3, 3u, o, ww);
+                    a4 = row_dot(a4, 4u, o, ww);
+                    a5 = row_dot(a5, 5u, o, ww);
+                    a6 = row_dot(a6, 6u, o, ww);
+                    a7 = row_dot(a7, 7u, o, ww);
                 }
                 lp = lp + 32u;
                 is = is + 32u;
@@ -457,27 +498,27 @@ fn dequant_gemm_q4k(
                 for (var l: u32 = 0u; l < 32u; l = l + 4u) {
                     let ww = fma(q4k_nibbles(read_u32(qsw + l), 0u), d0u, nm0);
                     let o = lp + l;
-                    a0 = a0 + xs_at(0u, o) * ww;
-                    a1 = a1 + xs_at(1u, o) * ww;
-                    a2 = a2 + xs_at(2u, o) * ww;
-                    a3 = a3 + xs_at(3u, o) * ww;
-                    a4 = a4 + xs_at(4u, o) * ww;
-                    a5 = a5 + xs_at(5u, o) * ww;
-                    a6 = a6 + xs_at(6u, o) * ww;
-                    a7 = a7 + xs_at(7u, o) * ww;
+                    a0 = row_dot(a0, 0u, o, ww);
+                    a1 = row_dot(a1, 1u, o, ww);
+                    a2 = row_dot(a2, 2u, o, ww);
+                    a3 = row_dot(a3, 3u, o, ww);
+                    a4 = row_dot(a4, 4u, o, ww);
+                    a5 = row_dot(a5, 5u, o, ww);
+                    a6 = row_dot(a6, 6u, o, ww);
+                    a7 = row_dot(a7, 7u, o, ww);
                 }
                 lp = lp + 32u;
                 for (var l: u32 = 0u; l < 32u; l = l + 4u) {
                     let ww = fma(q4k_nibbles(read_u32(qsw + l), 4u), d1u, nm1);
                     let o = lp + l;
-                    a0 = a0 + xs_at(0u, o) * ww;
-                    a1 = a1 + xs_at(1u, o) * ww;
-                    a2 = a2 + xs_at(2u, o) * ww;
-                    a3 = a3 + xs_at(3u, o) * ww;
-                    a4 = a4 + xs_at(4u, o) * ww;
-                    a5 = a5 + xs_at(5u, o) * ww;
-                    a6 = a6 + xs_at(6u, o) * ww;
-                    a7 = a7 + xs_at(7u, o) * ww;
+                    a0 = row_dot(a0, 0u, o, ww);
+                    a1 = row_dot(a1, 1u, o, ww);
+                    a2 = row_dot(a2, 2u, o, ww);
+                    a3 = row_dot(a3, 3u, o, ww);
+                    a4 = row_dot(a4, 4u, o, ww);
+                    a5 = row_dot(a5, 5u, o, ww);
+                    a6 = row_dot(a6, 6u, o, ww);
+                    a7 = row_dot(a7, 7u, o, ww);
                 }
                 lp = lp + 32u;
                 is = is + 32u;
@@ -503,25 +544,30 @@ fn dequant_gemm_q4k(
         // `GROUPED_SPLIT_MAX_BASE_WORKGROUPS`'s doc.
         workgroupBarrier();
         if (sl == 1u) {
-            xs[cl * (TM + 1u)] = a0;
-            xs[cl * (TM + 1u) + 1u] = a1;
-            xs[cl * (TM + 1u) + 2u] = a2;
-            xs[cl * (TM + 1u) + 3u] = a3;
-            xs[cl * (TM + 1u) + 4u] = a4;
-            xs[cl * (TM + 1u) + 5u] = a5;
-            xs[cl * (TM + 1u) + 6u] = a6;
-            xs[cl * (TM + 1u) + 7u] = a7;
+            // One scalar per row, splatted into every lane of its slot — the tile's
+            // slots are `vec4` and the fold reads only `.x`, so which lane holds it
+            // does not matter.
+            let base = cl * (TM + 1u);
+            xs[base] = vec4<f32>(a0);
+            xs[base + 1u] = vec4<f32>(a1);
+            xs[base + 2u] = vec4<f32>(a2);
+            xs[base + 3u] = vec4<f32>(a3);
+            xs[base + 4u] = vec4<f32>(a4);
+            xs[base + 5u] = vec4<f32>(a5);
+            xs[base + 6u] = vec4<f32>(a6);
+            xs[base + 7u] = vec4<f32>(a7);
         }
         workgroupBarrier();
         if (sl == 0u) {
-            a0 = a0 + xs[cl * (TM + 1u)];
-            a1 = a1 + xs[cl * (TM + 1u) + 1u];
-            a2 = a2 + xs[cl * (TM + 1u) + 2u];
-            a3 = a3 + xs[cl * (TM + 1u) + 3u];
-            a4 = a4 + xs[cl * (TM + 1u) + 4u];
-            a5 = a5 + xs[cl * (TM + 1u) + 5u];
-            a6 = a6 + xs[cl * (TM + 1u) + 6u];
-            a7 = a7 + xs[cl * (TM + 1u) + 7u];
+            let base = cl * (TM + 1u);
+            a0 = a0 + xs[base].x;
+            a1 = a1 + xs[base + 1u].x;
+            a2 = a2 + xs[base + 2u].x;
+            a3 = a3 + xs[base + 3u].x;
+            a4 = a4 + xs[base + 4u].x;
+            a5 = a5 + xs[base + 5u].x;
+            a6 = a6 + xs[base + 6u].x;
+            a7 = a7 + xs[base + 7u].x;
         }
     }
 
@@ -533,20 +579,21 @@ fn dequant_gemm_q4k(
     }
 }
 
-// Write the `TM` row results of one column. Split out so both entries share it.
+// Write the `TM` row results of one column; both entries share it. Eight stores
+// because `TM` is 8 — `grouped_geometry_matches_the_shader` pins that const, and a
+// taller tile has to grow this function with it.
 fn store_col(
-    a0: vec4<f32>, a1: vec4<f32>, a2: vec4<f32>, a3: vec4<f32>,
-    a4: vec4<f32>, a5: vec4<f32>, a6: vec4<f32>, a7: vec4<f32>,
+    a0: f32, a1: f32, a2: f32, a3: f32, a4: f32, a5: f32, a6: f32, a7: f32,
     row0: u32, col: u32,
 ) {
-    if (row0 < params.m) { outarr[row0 * params.ncols + col] = dot4(a0); }
-    if (row0 + 1u < params.m) { outarr[(row0 + 1u) * params.ncols + col] = dot4(a1); }
-    if (row0 + 2u < params.m) { outarr[(row0 + 2u) * params.ncols + col] = dot4(a2); }
-    if (row0 + 3u < params.m) { outarr[(row0 + 3u) * params.ncols + col] = dot4(a3); }
-    if (row0 + 4u < params.m) { outarr[(row0 + 4u) * params.ncols + col] = dot4(a4); }
-    if (row0 + 5u < params.m) { outarr[(row0 + 5u) * params.ncols + col] = dot4(a5); }
-    if (row0 + 6u < params.m) { outarr[(row0 + 6u) * params.ncols + col] = dot4(a6); }
-    if (row0 + 7u < params.m) { outarr[(row0 + 7u) * params.ncols + col] = dot4(a7); }
+    if (row0 < params.m) { outarr[row0 * params.ncols + col] = a0; }
+    if (row0 + 1u < params.m) { outarr[(row0 + 1u) * params.ncols + col] = a1; }
+    if (row0 + 2u < params.m) { outarr[(row0 + 2u) * params.ncols + col] = a2; }
+    if (row0 + 3u < params.m) { outarr[(row0 + 3u) * params.ncols + col] = a3; }
+    if (row0 + 4u < params.m) { outarr[(row0 + 4u) * params.ncols + col] = a4; }
+    if (row0 + 5u < params.m) { outarr[(row0 + 5u) * params.ncols + col] = a5; }
+    if (row0 + 6u < params.m) { outarr[(row0 + 6u) * params.ncols + col] = a6; }
+    if (row0 + 7u < params.m) { outarr[(row0 + 7u) * params.ncols + col] = a7; }
 }
 
 // Q6_K: 210 bytes / 256 elems (128 ql + 64 qh + 16 i8 scales + f16 d).
@@ -574,14 +621,16 @@ fn bytes_x4(w: u32) -> vec4<u32> {
 }
 
 /// The staged activation tile: `TM` rows x one block of `k` per row, one `vec4`
-/// per four-element group — 8 KiB, and this entry point's whole workgroup
-/// storage: the split geometry's fold reuses its first slots (see the fold below)
-/// rather than declaring a second array, so what bounds `COLS` is `TG`/2 — the two
-/// k-lane groups — and not the 16 KiB WebGPU workgroup-storage floor. Every thread
-/// of a workgroup multiplies the SAME activations (they differ only in output
-/// column), so reading them from device memory once per thread made the X side
-/// this kernel's cost: `TM` device `vec4` loads per 4 weight bytes, each of the 64
-/// columns paying them. Staging each block's tile once and reading it back from
+/// per four-element group — 8 KiB, half of the 16 384 B WebGPU baseline, and this
+/// entry point's whole workgroup storage: the split geometry's fold reuses its
+/// first slots (see the fold below) rather than declaring a second array, so what
+/// bounds `COLS` is `TG`/2 — the two k-lane groups — and not the storage floor.
+/// `grouped_geometry_matches_the_shader` in `gguf_gpu.rs` keeps the tile inside the
+/// baseline (a taller tile is a loss for its own reasons — the header's reading).
+/// Every thread of a workgroup multiplies the SAME activations (they differ only in
+/// output column), so reading them from device memory once per thread made the X
+/// side this kernel's cost: `TM` device `vec4` loads per weight `vec4`, each of the
+/// 64 columns paying them. Staging each block's tile once and reading it back from
 /// workgroup memory is the third leg of the same load-path rebuild the one-row
 /// tiled arm's `vec4` X read and this kernel's word-granular weight read are the
 /// first two of. A tile whose row ends inside it — only `dequant_gemm_q8_0`'s last
@@ -629,6 +678,33 @@ fn xs_at(r: u32, o: u32) -> vec4<f32> {
     return xs[r * (BLK_ELEMS / 4u) + (o >> 2u)];
 }
 
+/// `a` plus tile row `r`'s four staged activations at `o`, against the four
+/// weights `w` — one row's contribution of one `vec4` of weight.
+///
+/// The accumulator is a scalar per row, not a `vec4` per row: with `TM` rows in
+/// flight that is `TM` registers instead of `4 * TM` (8 instead of 32 here), the
+/// form that measured 4.8-7 % faster on the raw kernel at 219 rows, and
+/// `tests/gguf_gemm_grouped_loop_rate.rs` carries that A/B. What that does to the
+/// instruction count is the backend's, not this file's: `dot` is four multiplies
+/// and three adds, and whether a driver contracts the enclosing `a + dot(..)` into
+/// four `fma`s or pays one further add per row per weight `vec4` is not something
+/// WGSL fixes — the lanes were four certain `fma`s and this is four products whose
+/// contraction is the implementation's. `dot`'s own four-term association is the
+/// implementation's too, where the lanes summed `x + y + z + w` in source. What is
+/// fixed here is the order across a row: one accumulator, terms added in `k` order.
+fn row_dot(a: f32, r: u32, o: u32, w: vec4<f32>) -> f32 {
+    return a + dot(xs_at(r, o), w);
+}
+
+/// [`row_dot`] over the four 32-element quarters one Q6_K `l` step dequantizes.
+fn q6_row(
+    a: f32, r: u32, o: u32,
+    v1: vec4<f32>, v2: vec4<f32>, v3: vec4<f32>, v4: vec4<f32>,
+) -> f32 {
+    return a + dot(xs_at(r, o), v1) + dot(xs_at(r, o + 32u), v2)
+        + dot(xs_at(r, o + 64u), v3) + dot(xs_at(r, o + 96u), v4);
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn dequant_gemm_q6k(
     @builtin(local_invocation_index) tid: u32,
@@ -644,14 +720,14 @@ fn dequant_gemm_q6k(
     let last_row = params.m - 1u;
     let xb = params.x_vec4_off;
 
-    var a0 = vec4<f32>(0.0);
-    var a1 = vec4<f32>(0.0);
-    var a2 = vec4<f32>(0.0);
-    var a3 = vec4<f32>(0.0);
-    var a4 = vec4<f32>(0.0);
-    var a5 = vec4<f32>(0.0);
-    var a6 = vec4<f32>(0.0);
-    var a7 = vec4<f32>(0.0);
+    var a0: f32 = 0.0;
+    var a1: f32 = 0.0;
+    var a2: f32 = 0.0;
+    var a3: f32 = 0.0;
+    var a4: f32 = 0.0;
+    var a5: f32 = 0.0;
+    var a6: f32 = 0.0;
+    var a7: f32 = 0.0;
 
     for (var b: u32 = 0u; b < nbk; b = b + 1u) {
         let p0 = b * BLK_ELEMS;
@@ -686,14 +762,14 @@ fn dequant_gemm_q6k(
                 // Tile-local element base of the first quarter (a multiple of 4);
                 // the quarters sit +32/+64/+96 elements, i.e. +8/+16/+24 vec4.
                 let o = row_base + l;
-                a0 = a0 + xs_at(0u, o) * v1 + xs_at(0u, o + 32u) * v2 + xs_at(0u, o + 64u) * v3 + xs_at(0u, o + 96u) * v4;
-                a1 = a1 + xs_at(1u, o) * v1 + xs_at(1u, o + 32u) * v2 + xs_at(1u, o + 64u) * v3 + xs_at(1u, o + 96u) * v4;
-                a2 = a2 + xs_at(2u, o) * v1 + xs_at(2u, o + 32u) * v2 + xs_at(2u, o + 64u) * v3 + xs_at(2u, o + 96u) * v4;
-                a3 = a3 + xs_at(3u, o) * v1 + xs_at(3u, o + 32u) * v2 + xs_at(3u, o + 64u) * v3 + xs_at(3u, o + 96u) * v4;
-                a4 = a4 + xs_at(4u, o) * v1 + xs_at(4u, o + 32u) * v2 + xs_at(4u, o + 64u) * v3 + xs_at(4u, o + 96u) * v4;
-                a5 = a5 + xs_at(5u, o) * v1 + xs_at(5u, o + 32u) * v2 + xs_at(5u, o + 64u) * v3 + xs_at(5u, o + 96u) * v4;
-                a6 = a6 + xs_at(6u, o) * v1 + xs_at(6u, o + 32u) * v2 + xs_at(6u, o + 64u) * v3 + xs_at(6u, o + 96u) * v4;
-                a7 = a7 + xs_at(7u, o) * v1 + xs_at(7u, o + 32u) * v2 + xs_at(7u, o + 64u) * v3 + xs_at(7u, o + 96u) * v4;
+                a0 = q6_row(a0, 0u, o, v1, v2, v3, v4);
+                a1 = q6_row(a1, 1u, o, v1, v2, v3, v4);
+                a2 = q6_row(a2, 2u, o, v1, v2, v3, v4);
+                a3 = q6_row(a3, 3u, o, v1, v2, v3, v4);
+                a4 = q6_row(a4, 4u, o, v1, v2, v3, v4);
+                a5 = q6_row(a5, 5u, o, v1, v2, v3, v4);
+                a6 = q6_row(a6, 6u, o, v1, v2, v3, v4);
+                a7 = q6_row(a7, 7u, o, v1, v2, v3, v4);
             }
         }
     }
@@ -740,14 +816,14 @@ fn dequant_gemm_q8_0(
     let last_row = params.m - 1u;
     let xb = params.x_vec4_off;
 
-    var a0 = vec4<f32>(0.0);
-    var a1 = vec4<f32>(0.0);
-    var a2 = vec4<f32>(0.0);
-    var a3 = vec4<f32>(0.0);
-    var a4 = vec4<f32>(0.0);
-    var a5 = vec4<f32>(0.0);
-    var a6 = vec4<f32>(0.0);
-    var a7 = vec4<f32>(0.0);
+    var a0: f32 = 0.0;
+    var a1: f32 = 0.0;
+    var a2: f32 = 0.0;
+    var a3: f32 = 0.0;
+    var a4: f32 = 0.0;
+    var a5: f32 = 0.0;
+    var a6: f32 = 0.0;
+    var a7: f32 = 0.0;
 
     // One staged activation tile per `BLK_ELEMS` of `k` — the Q4_K/Q6_K entries'
     // tile, and eight of this scheme's blocks — so the barrier pair falls once per
@@ -774,14 +850,14 @@ fn dequant_gemm_q8_0(
             for (var l: u32 = 0u; l < Q8_0_BLK_ELEMS; l = l + 4u) {
                 let ww = fma(q8_0_quants(read_word_at(off + 2u + l)), dq, bias);
                 let o = lp + l;
-                a0 = a0 + xs_at(0u, o) * ww;
-                a1 = a1 + xs_at(1u, o) * ww;
-                a2 = a2 + xs_at(2u, o) * ww;
-                a3 = a3 + xs_at(3u, o) * ww;
-                a4 = a4 + xs_at(4u, o) * ww;
-                a5 = a5 + xs_at(5u, o) * ww;
-                a6 = a6 + xs_at(6u, o) * ww;
-                a7 = a7 + xs_at(7u, o) * ww;
+                a0 = row_dot(a0, 0u, o, ww);
+                a1 = row_dot(a1, 1u, o, ww);
+                a2 = row_dot(a2, 2u, o, ww);
+                a3 = row_dot(a3, 3u, o, ww);
+                a4 = row_dot(a4, 4u, o, ww);
+                a5 = row_dot(a5, 5u, o, ww);
+                a6 = row_dot(a6, 6u, o, ww);
+                a7 = row_dot(a7, 7u, o, ww);
             }
         }
     }

@@ -5,9 +5,10 @@
 //! GGUF weight, the activation ramp, the band module's own geometry helpers
 //! ([`band_device`], [`band_rows`], [`band_key_block`]), and the median together
 //! with the two timing loops ([`time_rounds`], one cell alone, and
-//! [`time_round_robin`], round-robin across a cell set) that the three harnesses
-//! using them — `gguf_one_row_stream_rate`, `gguf_gemm_grouped_weight_reuse` and
-//! `gguf_gemm_grouped_split_rate` — time their calls with, plus the parity
+//! [`time_round_robin`], round-robin across a cell set) that the harnesses using
+//! them — `gguf_one_row_stream_rate`, `gguf_gemm_grouped_weight_reuse`,
+//! `gguf_gemm_grouped_split_rate` and `gguf_gemm_grouped_loop_rate` — time their
+//! calls with, plus the parity
 //! helpers, the conv-transpose-2d route levers together with the pair bound its
 //! pins derive their bar from and the six real decoder geometries those pins and
 //! the route harness both read, the bounded child re-exec harness ([`rerun_self`])

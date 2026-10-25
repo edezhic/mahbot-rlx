@@ -1908,7 +1908,7 @@ const GROUPED_THREADS: u32 = 64;
 /// figures sit far above this crate's per-multiply ones and are not comparable with
 /// them. The arms were not the shipped kernel with only that constant moved, so what
 /// was measured is recorded against the arms as measured rather than as a law about
-/// tile size, and no mechanism is claimed for the loss:
+/// tile size:
 ///
 /// | step | 8-row tile | 16 rows | 32 rows |
 /// | --- | --- | --- | --- |
@@ -1924,6 +1924,14 @@ const GROUPED_THREADS: u32 = 64;
 /// what a step does and does not pay for, and the per-group price of one further
 /// pass over the weight — are in that header's re-take paragraphs, and the two move
 /// together.
+///
+/// The shipped kernel was then taken to a taller tile with the accumulator footprint
+/// paid down first, and lost at every height this form was taken to — 10, 12 and 15
+/// rows — so the tile stays at 8. That header's sweep, its declared-storage probe and
+/// the narrow accumulator the kernel now carries are where those readings live, and
+/// the next height is not free even where the bytes fit — a 16-row tile is exactly
+/// the 16 384 B WebGPU workgroup-storage baseline this const's tile is held under by
+/// `grouped_geometry_matches_the_shader`, with no headroom.
 const GROUPED_ROWS: u32 = 8;
 
 /// Elements of `k` one staged activation tile covers — the shader's `BLK_ELEMS`,
@@ -3180,6 +3188,20 @@ mod tests {
             GROUPED_SPLIT_COLS * (GROUPED_ROWS + 1) <= xs_slots,
             "the split's fold needs COLS * (TM + 1) = {} of the staged tile's {xs_slots} slots",
             GROUPED_SPLIT_COLS * (GROUPED_ROWS + 1)
+        );
+        // The tile is this entry set's whole workgroup storage, so it is what a
+        // device's 16 384 B WebGPU baseline has to hold — a form that needs more is
+        // a form a baseline device cannot run, and this fork takes the portable one.
+        // Strictly under, not at: a 16-row tile is exactly the baseline, which is the
+        // "no headroom" case `GROUPED_ROWS` refuses rather than a form this const may
+        // move to.
+        const BASELINE_WORKGROUP_STORAGE: u32 = 16_384;
+        const VEC4_BYTES: u32 = 16; // `vec4<f32>`, the shader's `xs` element
+        let tile_bytes = xs_slots * VEC4_BYTES;
+        assert!(
+            tile_bytes < BASELINE_WORKGROUP_STORAGE,
+            "the staged tile is {tile_bytes} B, not under the {BASELINE_WORKGROUP_STORAGE} B \
+             WebGPU baseline"
         );
     }
 

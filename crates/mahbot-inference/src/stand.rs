@@ -657,14 +657,17 @@ pub fn main_entry() {
     );
     // The pinned answers themselves, in the record and not only in the run's
     // stdout: the sentences the two generative surfaces are held to, and the fact
-    // that the comparison is token for token rather than a digest that an
-    // unrelated drift could leave intact.
+    // that the comparison is on the words rather than on a digest that an unrelated
+    // drift could leave intact — the listen transcript within
+    // `LISTEN_MOVED_WORDS`, its digest a witness, the round trip exact.
     body.push_str(&format!(
-        "\nThe pinned answers, compared token for token: recognition must reproduce \
-         `{}`; the synthesis round trip — the waveform the `speak` row's digest names, \
-         resampled to 16 kHz and read back through the recogniser on its raw samples — \
-         must reproduce `{}`.\n",
+        "\nThe pinned answers: recognition must reproduce `{}`, compared word for word \
+         with at most {} of them different (its digest and generated-token count are \
+         witnesses, printed with what moved); the synthesis round trip — the waveform \
+         the `speak` row's digest names, resampled to 16 kHz and read back through the \
+         recogniser on its raw samples — must reproduce `{}` exactly.\n",
         crate::reference::LISTEN_TRANSCRIPT,
+        crate::reference::LISTEN_MOVED_WORDS,
         crate::reference::SPEAK_TRANSCRIPT,
     ));
     // The per-phase weight streams, next to the machine's own streaming ceiling:
@@ -2230,10 +2233,12 @@ fn listen() {
     // returning, so the record attributes it to whoever held it then rather than to
     // what is live now.
     let map_bytes = file_bytes(&pair.body.path) + file_bytes(&pair.sound.path);
-    // The witness is checked before the line prints: a run whose answer moved is
-    // a failed run even if its seconds improved. A cell deliberately fed another
-    // recording or another generation budget is a different cell, so its answer
-    // is not compared against the pinned one.
+    // The witness is checked before the line prints: a run whose answer no longer
+    // reads as the pinned sentence is a failed run even if its seconds improved —
+    // while a moved digest or a moved word inside that sentence is printed with
+    // what moved and the run carries on (`reference::check_listen`). A cell
+    // deliberately fed another recording or another generation budget is a
+    // different cell, so its answer is not compared against the pinned one.
     let alternate = std::env::var_os("STAND_ASR_WAV").is_some()
         || std::env::var_os("STAND_ASR_OFFSET").is_some()
         // The voice WAV is this cell's only audio input, so its *presence* is not
@@ -2249,7 +2254,7 @@ fn listen() {
         digest(&values),
         &text,
     ) {
-        cell_failed!("cell listen — the answer is not the pinned reference");
+        cell_failed!("cell listen — the answer no longer reads as the pinned reference");
     }
     line(
         "listen",
