@@ -149,23 +149,40 @@ fn each_one_row_arm_branches_on_exactly_the_schemes_routed_to_it() {
          both name them"
     );
 
-    let arm = |entry: &str, routed: fn(u32) -> bool| {
-        let claimed: BTreeSet<u32> = (0u32..=64).filter(|id| routed(*id)).collect();
+    let claimed_for = |routed: fn(u32) -> bool| -> BTreeSet<u32> {
+        (0u32..=64).filter(|id| routed(*id)).collect()
+    };
+    let tiled_claimed = claimed_for(rlx_wgpu::gguf_gpu::gemv_tiled_supports_scheme);
+    let legacy_claimed = claimed_for(legacy);
+    for (entry, claimed) in [
+        ("dequant_gemv_tiled", &tiled_claimed),
+        ("dequant_gemv", &legacy_claimed),
+    ] {
         assert!(
             !claimed.is_empty(),
             "{entry}: no scheme is routed to this arm at all"
         );
         assert_eq!(
-            entries[entry], claimed,
+            entries[entry], *claimed,
             "{entry}: branches {:?} vs the schemes routed to it {claimed:?}",
             entries[entry]
         );
-    };
-    arm(
-        "dequant_gemv_tiled",
-        rlx_wgpu::gguf_gpu::gemv_tiled_supports_scheme,
-    );
-    arm("dequant_gemv", legacy);
+    }
+
+    // The subgroup section's two entries decode exactly the schemes the tiled arm
+    // is routed. That set is also `grouped_k_ok`'s scheme term, so pinning the
+    // entries to the same predicate makes the coincidence a contract: a scheme
+    // added to one list and not the other would read back as zeros — and neither
+    // arm may be reached by a scheme it has no shader branch for.
+    let wide = branches_by_entry(rlx_wgpu::kernels::DEQUANT_GEMV_GGUF_WIDE_WGSL);
+    for entry in ["dequant_gemv_wide", "dequant_gemv_wide_ilp"] {
+        assert_eq!(
+            wide.get(entry),
+            Some(&tiled_claimed),
+            "{entry}: branches {:?} vs the schemes routed to it {tiled_claimed:?}",
+            wide.get(entry)
+        );
+    }
 }
 
 /// Both one-row entry points must parse and validate device-free. A WGSL

@@ -823,6 +823,8 @@ pub(crate) enum Step {
         n_idx: u32,
         dim: u32,
         vocab: u32,
+        /// Added to each f32 index before truncation, as the folded `Add` did.
+        idx_bias: f32,
         table_byte_off: u64,
         idx_byte_off: u64,
         out_byte_off: u64,

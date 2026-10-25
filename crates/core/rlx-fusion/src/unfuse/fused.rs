@@ -554,14 +554,17 @@ pub(super) fn unfuse_fused_swi_g_l_u(
     new_inputs: Vec<NodeId>,
     out: &mut Graph,
 ) -> NodeId {
-    let Op::FusedSwiGLU { cast_to, .. } = &node.op else {
+    let Op::FusedSwiGLU {
+        cast_to,
+        gate_first,
+    } = &node.op
+    else {
         unreachable!()
     };
     {
-        // Inputs: [packed]. Forward splits the last axis
-        // into [up | gate] halves, computes
-        //   out = silu(gate) * up
-        // Optionally cast at the end.
+        // Inputs: [packed]. Forward splits the last axis into [up | gate] halves —
+        // reversed when `gate_first` says the builder emitted gate first — and
+        // computes `out = silu(gate) * up`. Optionally cast at the end.
         let in_packed = new_inputs[0];
         let in_shape = out.node(in_packed).shape.clone();
         let dtype = in_shape.dtype();
@@ -576,10 +579,11 @@ pub(super) fn unfuse_fused_swi_g_l_u(
         half_dims[last] = Dim::Static(half);
         let half_shape = IrShape::from_dims(&half_dims, dtype);
 
+        let (up_start, gate_start) = if *gate_first { (half, 0) } else { (0, half) };
         let up = out.add_node(
             Op::Narrow {
                 axis: last,
-                start: 0,
+                start: up_start,
                 len: half,
             },
             vec![in_packed],
@@ -588,7 +592,7 @@ pub(super) fn unfuse_fused_swi_g_l_u(
         let gate = out.add_node(
             Op::Narrow {
                 axis: last,
-                start: half,
+                start: gate_start,
                 len: half,
             },
             vec![in_packed],

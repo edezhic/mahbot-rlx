@@ -2379,6 +2379,7 @@ fn run_gather_split(
     n_idx: u32,
     dim: u32,
     vocab: u32,
+    idx_bias: f32,
     table_byte_off: usize,
     idx_byte_off: usize,
     out_byte_off: usize,
@@ -2425,7 +2426,7 @@ fn run_gather_split(
         in_off: ((t_raw as u64 - t_base) / 4) as u32,
         idx_off: ((i_raw as u64 - i_base) / 4) as u32,
         out_off: 0,
-        _p0: 0,
+        idx_bias,
     };
     let u = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("rlx-wgpu gather_split uniform"),
@@ -4193,6 +4194,84 @@ pub(super) struct SnakeBetaPlan {
     pub bias: Option<NodeId>,
 }
 
+/// The graph-level facts every bias-fold detector asks: who reads what, which
+/// nodes are graph outputs, and the order steps are pushed in.
+pub(crate) struct FoldGraph<'a> {
+    graph: &'a Graph,
+    consumers: HashMap<NodeId, Vec<NodeId>>,
+    outputs: HashSet<NodeId>,
+    order: HashMap<NodeId, usize>,
+}
+
+impl<'a> FoldGraph<'a> {
+    pub(crate) fn new(graph: &'a Graph) -> Self {
+        let mut consumers: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for node in graph.nodes() {
+            for &input in &node.inputs {
+                consumers.entry(input).or_default().push(node.id);
+            }
+        }
+        Self {
+            graph,
+            consumers,
+            outputs: graph.outputs.iter().copied().collect(),
+            // Steps are pushed while walking `graph.nodes()`.
+            order: graph
+                .nodes()
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.id, i))
+                .collect(),
+        }
+    }
+
+    /// The one node reading `id`, if that is the whole of its use and it is not
+    /// also a graph output (a node reading `s` twice counts once).
+    fn sole_reader(&self, id: NodeId) -> Option<NodeId> {
+        if self.outputs.contains(&id) {
+            return None;
+        }
+        let cs = self.consumers.get(&id)?;
+        let first = *cs.first()?;
+        cs.iter().all(|c| *c == first).then_some(first)
+    }
+
+    fn readers(&self, id: NodeId) -> &[NodeId] {
+        self.consumers.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    fn is_output(&self, id: NodeId) -> bool {
+        self.outputs.contains(&id)
+    }
+
+    /// `[C]` or `[1, C, 1, 1]` — the two shapes whose element `c` is word `c`,
+    /// from a parameter's pinned bytes. A fold reads them at its own position
+    /// while the plan ends their liveness early, which is sound only for pinned
+    /// bytes: anything computed would be a read of a reused slot.
+    fn per_channel(&self, id: NodeId) -> Option<usize> {
+        if !crate::buffer::is_parameter_storage(self.graph, id) {
+            return None;
+        }
+        let n = self.graph.node(id);
+        if n.shape.dtype() != rlx_ir::DType::F32 {
+            return None;
+        }
+        let d = all_static_dims(&n.shape)?;
+        match d.as_slice() {
+            [c] | [1, c, 1, 1] if *c > 0 => Some(*c),
+            _ => None,
+        }
+    }
+
+    /// `ids` are a binary node's two operands: `(per_channel_id, channel_count,
+    /// other)`.
+    fn split_by_channel(&self, ids: &[NodeId]) -> Option<(NodeId, usize, NodeId)> {
+        ids.iter()
+            .enumerate()
+            .find_map(|(i, &a)| Some((a, self.per_channel(a)?, ids[1 - i])))
+    }
+}
+
 /// Detects the DAC snake, `out = x + beta·sin²(alpha·x)`, written as the five
 /// nodes the sound half's `snake_beta` helper emits:
 ///
@@ -4268,71 +4347,13 @@ pub(super) struct SnakeBetaPlan {
 ///     needs no such guard: `out` reads it, so the planner keeps its slot alive
 ///     to `out`'s own position, and the two ranges abut rather than overlap.
 fn detect_snake_beta_pattern(
-    graph: &Graph,
+    fold: &FoldGraph<'_>,
     arena: &Arena,
     on_device: &dyn Fn(NodeId) -> bool,
 ) -> (HashMap<NodeId, SnakeBetaPlan>, HashSet<NodeId>) {
     use rlx_ir::op::{Activation, BinaryOp};
 
-    let mut consumer_nodes: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-    for node in graph.nodes() {
-        for &input in &node.inputs {
-            consumer_nodes.entry(input).or_default().push(node.id);
-        }
-    }
-    let outputs: HashSet<NodeId> = graph.outputs.iter().copied().collect();
-    // Emission order: steps are pushed while walking `graph.nodes()`.
-    let order: HashMap<NodeId, usize> = graph
-        .nodes()
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.id, i))
-        .collect();
-
-    // The one node reading `id`, if that is the whole of its use and it is not
-    // also a graph output (`s2 = s·s` reads `s` twice; that still counts once).
-    let sole_reader = |id: NodeId| -> Option<NodeId> {
-        if outputs.contains(&id) {
-            return None;
-        }
-        let cs = consumer_nodes.get(&id)?;
-        let first = *cs.first()?;
-        cs.iter().all(|c| *c == first).then_some(first)
-    };
-    // `[C]` or `[1, C, 1, 1]`: the two shapes whose element `c` is word `c`. The
-    // step reads them at `out`'s position while the plan ends their liveness at
-    // `arg`/`scale`, which is sound only for a parameter's pinned bytes — anything
-    // computed would be a read of a slot already reused by then.
-    let per_channel = |id: NodeId| -> bool {
-        if !crate::buffer::is_parameter_storage(graph, id) {
-            return false;
-        }
-        let n = graph.node(id);
-        if n.shape.dtype() != rlx_ir::DType::F32 {
-            return false;
-        }
-        let Some(d) = all_static_dims(&n.shape) else {
-            return false;
-        };
-        match d.as_slice() {
-            [c] => *c > 0,
-            [1, c, 1, 1] => *c > 0,
-            _ => false,
-        }
-    };
-    // `ids` are a `Mul`'s two operands: `(per_channel_id, channel_count, other)`.
-    let split_by_channel = |ids: &[NodeId]| -> Option<(NodeId, usize, NodeId)> {
-        for (i, &a) in ids.iter().enumerate() {
-            let b = ids[1 - i];
-            if !per_channel(a) {
-                continue;
-            }
-            let d = all_static_dims(&graph.node(a).shape)?;
-            let n: usize = d.iter().product();
-            return Some((a, n, b));
-        }
-        None
-    };
+    let graph = fold.graph;
 
     let mut out_to_snake = HashMap::new();
     let mut skip: HashSet<NodeId> = HashSet::new();
@@ -4375,10 +4396,10 @@ fn detect_snake_beta_pattern(
             if !matches!(scale_node.op, Op::Binary(BinaryOp::Mul)) || scale_node.inputs.len() != 2 {
                 continue;
             }
-            if sole_reader(scale) != Some(node.id) {
+            if fold.sole_reader(scale) != Some(node.id) {
                 continue;
             }
-            let Some((beta, beta_len, s2)) = split_by_channel(&scale_node.inputs) else {
+            let Some((beta, beta_len, s2)) = fold.split_by_channel(&scale_node.inputs) else {
                 continue;
             };
             if beta_len != channels || graph.node(s2).shape != node.shape {
@@ -4393,10 +4414,10 @@ fn detect_snake_beta_pattern(
                 continue;
             }
             let s = s2_node.inputs[0];
-            if sole_reader(s2) != Some(scale) || graph.node(s).shape != node.shape {
+            if fold.sole_reader(s2) != Some(scale) || graph.node(s).shape != node.shape {
                 continue;
             }
-            if sole_reader(s) != Some(s2) {
+            if fold.sole_reader(s) != Some(s2) {
                 continue;
             }
             // s = Activation(Sin, arg)
@@ -4408,7 +4429,7 @@ fn detect_snake_beta_pattern(
                 continue;
             }
             let arg = s_node.inputs[0];
-            if sole_reader(arg) != Some(s) || graph.node(arg).shape != node.shape {
+            if fold.sole_reader(arg) != Some(s) || graph.node(arg).shape != node.shape {
                 continue;
             }
             // arg = Mul(alpha, x)
@@ -4416,7 +4437,7 @@ fn detect_snake_beta_pattern(
             if !matches!(arg_node.op, Op::Binary(BinaryOp::Mul)) || arg_node.inputs.len() != 2 {
                 continue;
             }
-            let Some((alpha, alpha_len, arg_x)) = split_by_channel(&arg_node.inputs) else {
+            let Some((alpha, alpha_len, arg_x)) = fold.split_by_channel(&arg_node.inputs) else {
                 continue;
             };
             if alpha_len != channels || arg_x != x {
@@ -4437,18 +4458,18 @@ fn detect_snake_beta_pattern(
                 && x_node.shape == node.shape
                 // Its step is what the fold replaces, so it cannot also be an
                 // output: nothing else would write that slot.
-                && !outputs.contains(&x)
+                && !fold.is_output(x)
                 && on_device(x)
                 // Its step is the one the fold suppresses, so it cannot be
                 // another fold's `out`: that write would go with it.
                 && !out_to_snake.contains_key(&x)
-                && consumer_nodes
-                    .get(&x)
-                    .is_some_and(|cs| cs.iter().all(|c| *c == arg || *c == node.id))
-                && let Some((b, b_len, conv)) = split_by_channel(&x_node.inputs)
+                && let readers = fold.readers(x)
+                && !readers.is_empty()
+                && readers.iter().all(|c| *c == arg || *c == node.id)
+                && let Some((b, b_len, conv)) = fold.split_by_channel(&x_node.inputs)
                 && b_len == channels
                 && graph.node(conv).shape == node.shape
-                && bias_fold_is_sound(graph, arena, &order, &chain, x, conv, node.id)
+                && bias_fold_is_sound(fold, arena, &chain, x, conv, node.id)
             {
                 x = conv;
                 bias = Some(b);
@@ -4474,27 +4495,119 @@ fn detect_snake_beta_pattern(
     (out_to_snake, skip)
 }
 
-/// Whether the snake's bias fold can read `conv` at `out`'s position — the two
-/// conditions `detect_snake_beta_pattern`'s doc spells out, in the order they
-/// are cheap: nothing but the fold's own chain (or a pinned Param/Input/Constant)
-/// may sit between the Add and `out`, and the bytes of `conv` and `out` must be
-/// disjoint, since the one dispatch reads the first while writing the second.
-fn bias_fold_is_sound(
-    graph: &Graph,
+/// One matched `Gather(table, Add(idx, c))` for the in-kernel index bias.
+struct GatherIndexBias {
+    /// The Add's other operand, read in place of the Add's output.
+    pub idx: NodeId,
+    /// The constant the Add applied, added in-kernel before truncation.
+    pub bias: f32,
+}
+
+/// Detects `out = Gather(table, Add(idx, c))` — a gather whose index carries a
+/// constant offset — so the gather reads `idx` with `c` added in-kernel and the
+/// `Add` emits no step of its own.
+///
+/// The fold changes no arithmetic: the kernel adds the f32 constant to the f32
+/// index before truncating it, exactly as the `Add` did. It needs an axis-0
+/// gather over a single-element index, an f32 `Add` over a single-element
+/// operand and a 4-byte `Constant`, and the Add's only reader to be this
+/// gather. Both the Add and the gather must be ones `on_device` answers true
+/// for: a straddle or host route emits no step for the gather, so the Add's
+/// write would go with nothing to consume it.
+/// [`bias_fold_is_sound`] then proves that
+/// reading `idx` at the gather's position is safe — nothing between the two can
+/// write its bytes, and the gather's output does not alias them. Every rule
+/// declines the whole pattern.
+///
+/// Returns `gather id → plan` and the Add ids whose steps are suppressed.
+fn detect_gather_index_bias(
+    fold: &FoldGraph<'_>,
     arena: &Arena,
-    order: &HashMap<NodeId, usize>,
+    on_device: &dyn Fn(NodeId) -> bool,
+) -> (HashMap<NodeId, GatherIndexBias>, HashSet<NodeId>) {
+    use rlx_ir::op::BinaryOp;
+
+    let graph = fold.graph;
+    // A scalar or `[1]` — shapes whose single element is the whole tensor.
+    let one_element = |id: NodeId| -> bool {
+        all_static_dims(&graph.node(id).shape).is_some_and(|d| d.iter().product::<usize>() == 1)
+    };
+
+    let mut plans: HashMap<NodeId, GatherIndexBias> = HashMap::new();
+    let mut skip: HashSet<NodeId> = HashSet::new();
+    for node in graph.nodes() {
+        if !matches!(node.op, Op::Gather { axis: 0 }) || node.inputs.len() != 2 {
+            continue;
+        }
+        let gather_id = node.id;
+        if !one_element(node.inputs[1]) {
+            continue;
+        }
+        let add = node.inputs[1];
+        let add_node = graph.node(add);
+        if !matches!(add_node.op, Op::Binary(BinaryOp::Add))
+            || add_node.inputs.len() != 2
+            || add_node.shape.dtype() != rlx_ir::DType::F32
+        {
+            continue;
+        }
+        // One operand is the 4-byte constant; the other is read in its place.
+        let constant = add_node
+            .inputs
+            .iter()
+            .enumerate()
+            .find_map(|(i, &operand)| {
+                let Op::Constant { data } = &graph.node(operand).op else {
+                    return None;
+                };
+                (data.len() == 4).then(|| {
+                    (
+                        f32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+                        add_node.inputs[1 - i],
+                    )
+                })
+            });
+        let Some((bias, idx)) = constant else {
+            continue;
+        };
+        // Both ends have to be ones `on_device` answers true for: a straddle or
+        // host-routed gather emits no step of its own, so suppressing the Add
+        // would leave an unwritten slot behind.
+        if !on_device(add)
+            || !on_device(gather_id)
+            || fold.sole_reader(add) != Some(gather_id)
+            || !bias_fold_is_sound(fold, arena, &[], add, idx, gather_id)
+        {
+            continue;
+        }
+        plans.insert(gather_id, GatherIndexBias { idx, bias });
+        skip.insert(add);
+    }
+    (plans, skip)
+}
+
+/// Whether a bias fold may read `x` at `out`'s position — the two conditions
+/// every bias-fold detector's doc spells out, in the order they are cheap:
+/// nothing but the fold's own consumed nodes (or a pinned
+/// Param/Input/Constant) may sit between the folded Add and `out`, and the
+/// bytes of `x` and `out` must be disjoint, since the one dispatch reads the
+/// first while writing the second.
+fn bias_fold_is_sound(
+    fold: &FoldGraph<'_>,
+    arena: &Arena,
     consumed: &[NodeId],
     folded_add: NodeId,
-    conv: NodeId,
+    x: NodeId,
     out: NodeId,
 ) -> bool {
-    let (Some(&add_pos), Some(&out_pos)) = (order.get(&folded_add), order.get(&out)) else {
+    let (Some(&add_pos), Some(&out_pos)) = (fold.order.get(&folded_add), fold.order.get(&out))
+    else {
         return false;
     };
     if add_pos >= out_pos {
         return false;
     }
-    let window_is_quiet = graph.nodes()[add_pos + 1..out_pos].iter().all(|n| {
+    let window_is_quiet = fold.graph.nodes()[add_pos + 1..out_pos].iter().all(|n| {
         consumed.contains(&n.id)
             || matches!(
                 n.op,
@@ -4504,14 +4617,14 @@ fn bias_fold_is_sound(
     if !window_is_quiet {
         return false;
     }
-    // The step reads `conv` while writing `out` from the same dispatch, so the
-    // two have to be disjoint in the bytes each one *reaches* — the storage
-    // span, not the view's own slot: a pure view covers only its own range while
-    // the storage underneath it runs on, and a parked parameter's tagged offset
-    // is a different byte space whose comparison would answer nothing.
+    // The step reads `x` while writing `out` from the same dispatch, so the two
+    // have to be disjoint in the bytes each one *reaches* — the storage span,
+    // not the view's own slot: a pure view covers only its own range while the
+    // storage underneath it runs on, and a parked parameter's tagged offset is a
+    // different byte space whose comparison would answer nothing.
     let (Some((cs, ce)), Some((os, oe))) = (
-        arena.storage_span(graph, conv),
-        arena.storage_span(graph, out),
+        arena.storage_span(fold.graph, x),
+        arena.storage_span(fold.graph, out),
     ) else {
         return false;
     };

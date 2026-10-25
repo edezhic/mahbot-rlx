@@ -351,8 +351,17 @@ pub(crate) struct AttentionGeometry {
 /// `seq_k >= 1`, since every region would be empty, the budget conjunct would
 /// pass vacuously, and the route would write zeros where the fused kernel's 0/0
 /// normalisation is the NaN the operation is.
+///
+/// `RLX_WGPU_ATTN_DENSE_ONE_ROW` lowers the floor to one query row: the fused
+/// walk is the step's own form there, so the arm prices that form against the
+/// decomposed arrangement (the same numbers, another summation order).
 pub(crate) fn decompose_attention(g: &AttentionGeometry) -> bool {
-    g.seq_q >= ATTENTION_DECOMPOSE_MIN_Q
+    let min_q = if rlx_ir::env::flag("RLX_WGPU_ATTN_DENSE_ONE_ROW") {
+        1
+    } else {
+        ATTENTION_DECOMPOSE_MIN_Q
+    };
+    g.seq_q >= min_q
         && g.seq_k >= 1
         && g.tiles >= 1
         && g.seq_q.div_ceil(MATMUL_TILE_M) <= MAX_WORKGROUPS_PER_DIM

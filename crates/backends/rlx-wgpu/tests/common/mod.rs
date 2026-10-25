@@ -348,9 +348,15 @@ pub fn expand_steps(names: &[&str]) -> usize {
 /// Legalising first is what makes a *missing* `expand` step evidence that the
 /// peel fired, rather than evidence that the pass never ran and inserted none.
 pub fn legalised_step_names(g: &rlx_ir::Graph) -> Vec<&'static str> {
+    legalised_executable(g).test_step_names()
+}
+
+/// [`legalised_step_names`]'s compile, for a test that reads another of the
+/// executable's own reports.
+pub fn legalised_executable(g: &rlx_ir::Graph) -> rlx_wgpu::backend::WgpuExecutable {
     use rlx_opt::pass::Pass as _;
     let legalised = rlx_opt::LegalizeBroadcast.run(g.clone());
-    rlx_wgpu::backend::WgpuExecutable::compile(legalised).test_step_names()
+    rlx_wgpu::backend::WgpuExecutable::compile(legalised)
 }
 
 /// The run report's switch, spelled in one place: a pin whose figures the report's
@@ -369,14 +375,15 @@ pub fn refuse_under_run_report() {
 }
 
 /// The switches that move this crate's routing — which of a fixture's steps runs where,
-/// whether a step is a device step at all, whether a packed multiply joins the batch, and
+/// whether a step is a device step at all, whether a packed multiply joins the batch, which
+/// fusion is expanded at the lowering, whether a masked key's reads are stood down, and
 /// whether the run reports its own figures — cleared on every re-exec'd child before the
 /// case's own switches are applied, so what a child reads is the case's environment and
 /// never the operator's. A case that is *about* one of them sets it again by name. Spelled
 /// once for every harness here that re-execs a child (`run_report.rs`,
 /// `hosted_audio_step_placement.rs`); `buffer_copy_batch_join.rs` guards the same
 /// routing set with an assertion instead of clearing it.
-pub const CLEARED_SWITCHES: [&str; 31] = [
+pub const CLEARED_SWITCHES: [&str; 38] = [
     "RLX_WGPU_SNAPSHOT",
     "RLX_BENCH_DISPATCH_ONLY",
     "RLX_WGPU_ALL_PARAMS_WEIGHT",
@@ -403,6 +410,13 @@ pub const CLEARED_SWITCHES: [&str; 31] = [
     "RLX_WGPU_GEMV_POOL",
     "RLX_WGPU_TRANSPOSE_HOST",
     "RLX_WGPU_NO_SNAKE_BETA",
+    "RLX_WGPU_NO_GATHER_INDEX_BIAS",
+    "RLX_WGPU_NO_LN_TEE",
+    "RLX_WGPU_NO_NORM_ROPE",
+    "RLX_WGPU_NO_FUSED_SWIGLU",
+    "RLX_WGPU_NO_FUSED_RESIDUAL_RMS",
+    "RLX_WGPU_NO_ATTN_MASK_SKIP",
+    "RLX_WGPU_ATTN_DENSE_ONE_ROW",
     "RLX_WGPU_CONV_IM2COL",
     "RLX_WGPU_CONV_IMPLICIT",
     "RLX_WGPU_ATTENTION_BAND_F32",

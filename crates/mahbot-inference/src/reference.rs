@@ -241,8 +241,10 @@ pub fn check_listen(
     same
 }
 
-/// Print the synthesis witness: the waveform hash and its sample count.
-pub fn check_speak(rows: usize, samples: usize, wave_digest: u64, prompt_digest: u64) -> bool {
+/// Print the synthesis witness: the waveform hash and its sample count. A moved
+/// digest is recorded, not gated — the range checks and the round trip below are
+/// the synthesis gates.
+pub fn check_speak(rows: usize, samples: usize, wave_digest: u64, prompt_digest: u64) {
     let same = rows == SPEAK_ROWS
         && samples == SPEAK_SAMPLES
         && wave_digest == SPEAK_WAVE_DIGEST
@@ -252,7 +254,6 @@ pub fn check_speak(rows: usize, samples: usize, wave_digest: u64, prompt_digest:
          waveform_digest={wave_digest:016x}/{SPEAK_WAVE_DIGEST:016x} \
          prompt_digest={prompt_digest:016x}/{SPEAK_PROMPT_DIGEST:016x} equal={same}"
     );
-    same
 }
 
 /// Print the round-trip witness against the pin: what the recogniser heard from

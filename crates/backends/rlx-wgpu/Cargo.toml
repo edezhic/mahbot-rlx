@@ -142,6 +142,10 @@ name = "attention_long_seq_precision"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "attention_mask_skip"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "attention_rows_route"
 required-features = ["backend-tests"]
 
@@ -495,6 +499,14 @@ required-features = ["backend-tests"]
 
 [[test]]
 name = "snake_beta_fusion"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fusion_standdowns"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gather_index_bias"
 required-features = ["backend-tests"]
 
 [[test]]

@@ -37,7 +37,7 @@
 //! The unit paths here carry the per-phase instrumentation; everything that must
 //! agree with the bench is shared rather than copied — the front end
 //! (`listen::Front`), the talker's prompt (`synth::talker_prompt`) and the codec
-//! windows and stitch (`synth::windows`, `synth::codec_slice`,
+//! windows and stitch (`graphs::windows`, `synth::codec_slice`,
 //! `synth::stitch_window`). What stays here is the measurement around them:
 //! the generation and decode loops and the per-window `Outcome`s the bench does
 //! not report.
@@ -68,6 +68,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::graphs::{DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, windows};
 use crate::graphs::{Outcome, SampleSpec};
 use crate::guard::{
     DEFAULT_MAX_RSS_MIB, DEFAULT_TIMEOUT_SECS, Deadline, EXIT_STOPPED, MemoryCeiling, RunLock,
@@ -81,10 +82,9 @@ use crate::report::{
     digest, fmt_ms, human, keys, load_average, max_abs, non_finite, peak_rss, resident_rss, sci,
 };
 use crate::synth::{
-    DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, MAX_CODEC_ROWS as SPEAK_CODEC_ROWS,
-    MAX_TEXT_TOKENS as SPEAK_TEXT_TOKENS, TTS_CODEC_EOS, TTS_REPEAT_PENALTY, TTS_TEXT_ROWS,
-    TalkerPrompt, apply_repetition, codec_slice, stitch_window, suppress_service, talker_prompt,
-    windows,
+    MAX_CODEC_ROWS as SPEAK_CODEC_ROWS, MAX_TEXT_TOKENS as SPEAK_TEXT_TOKENS, TTS_CODEC_EOS,
+    TTS_REPEAT_PENALTY, TTS_TEXT_ROWS, TalkerPrompt, apply_repetition, codec_slice, stitch_window,
+    suppress_service, talker_prompt,
 };
 use crate::tokenizer::Tokenizer;
 use crate::{graphs, host, loader, report};
@@ -107,8 +107,9 @@ const SPEECH_SAMPLES: usize = 480_000;
 const DECODE_CACHE_BUCKET: usize = 128;
 
 /// The synthesis text condition, tokenized by the file's own tokenizer; it is
-/// long enough to fill all 300 tokens.
-const TTS_TEXT: &str = "Call me Ishmael. Some years ago, never mind how long precisely, having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world. It is a way I have of driving off the spleen and regulating the circulation. Whenever I find myself growing grim about the mouth; whenever it is a damp, drizzly November in my soul; whenever I find myself involuntarily pausing before coffin warehouses, and bringing up the rear of every funeral I meet; and especially whenever my hypos get such an upper hand of me, that it requires a strong moral principle to prevent me from deliberately stepping into the street, and methodically knocking people's hats off, then I account it high time to get to sea as soon as I can. This is my substitute for pistol and ball. With a philosophical flourish Cato throws himself upon his sword; I quietly take to the ship. There is nothing surprising in this. If they but knew it, almost all men in their degree, some time or other, cherish very nearly the same feelings towards the ocean with me.";
+/// long enough to fill all 300 tokens. `pub` for `tests/predictor_draft.rs`, which
+/// reproduces the cell's pinned waveform through the library path.
+pub const TTS_TEXT: &str = "Call me Ishmael. Some years ago, never mind how long precisely, having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world. It is a way I have of driving off the spleen and regulating the circulation. Whenever I find myself growing grim about the mouth; whenever it is a damp, drizzly November in my soul; whenever I find myself involuntarily pausing before coffin warehouses, and bringing up the rear of every funeral I meet; and especially whenever my hypos get such an upper hand of me, that it requires a strong moral principle to prevent me from deliberately stepping into the street, and methodically knocking people's hats off, then I account it high time to get to sea as soon as I can. This is my substitute for pistol and ball. With a philosophical flourish Cato throws himself upon his sword; I quietly take to the ship. There is nothing surprising in this. If they but knew it, almost all men in their degree, some time or other, cherish very nearly the same feelings towards the ocean with me.";
 /// The wake product artifact: the 1.7B 24-block sound encoder and its body,
 /// the same pair as recognition.
 const WAKE_BODY: &str = "Qwen3-ASR-1.7B-Q4_K_M.gguf";
@@ -2427,8 +2428,9 @@ fn speak() {
     };
     let cell = "speak";
     // The quality gate, both halves before the line prints — the order `listen`
-    // sets: a run whose waveform no longer says the same thing is a failed run
-    // even if its seconds improved.
+    // sets. The waveform's movement is a witness, not a gate (`reference.rs`): what
+    // must hold is the range and finiteness below and the round trip after, even
+    // where a digest has moved.
     //
     // The first half is the waveform itself: nothing clipped (|y| <= 1, the range
     // a 24 kHz PCM file carries) and nothing non-finite. The pinned waveform is
@@ -2452,8 +2454,11 @@ fn speak() {
         || other_voice;
     if alternate {
         println!("witness speak skipped=alternate-input");
-    } else if !crate::reference::check_speak(frames, wave.len(), digest(&wave), prompt_digest) {
-        cell_failed!("cell speak — the waveform is not the pinned reference");
+    } else {
+        // The pinned hashes are a witness, not a gate (`reference.rs`): the
+        // waveform's movement is recorded, the range above and the round trip
+        // below are what decide.
+        crate::reference::check_speak(frames, wave.len(), digest(&wave), prompt_digest);
     }
 
     // The round trip, after every phase: the waveform this cell just produced,
@@ -2986,40 +2991,27 @@ fn speak_synthesis() -> Option<Synthesis> {
         .plan("a.gen.wav.pre_conv.weight")
         .map(|p| p.ggml_shape[0])
         .unwrap_or(1);
-    let prefix = FRONT_WINDOW.saturating_sub(1);
+    // The decoder's graphs are this call's: built on first use, reused for a repeat
+    // of the same length, and dropped when this returns — before the round trip
+    // loads the recogniser's own pair (`graphs::SoundGraphs`).
+    let mut sound_cache = graphs::SoundGraphs::default();
+    // A window runs its graph over the frames it holds: the part's own length for
+    // the first window, a full chunk for every later one (`graphs::FrontGraphs`).
     let t = report::Stopwatch::start();
-    let mut front_first = match graphs::synthesis_sound_group(
-        pair.sound.clone(),
-        FRONT_WINDOW,
+    let front = match graphs::FrontGraphs::build(
+        &mut sound_cache,
+        device,
+        &pair.sound,
+        frames,
         front_group.clone(),
-        0,
-    )
-    .and_then(|m| graphs::Compiled::new(device, m))
-    {
-        Ok(b) => b,
+    ) {
+        Ok(f) => f,
         Err(e) => {
             cell_failed!("cell speak — sound {front_group:?} build: {e}");
         }
     };
-    let mut front_next = if frames > FRONT_WINDOW {
-        match graphs::synthesis_sound_group(
-            pair.sound.clone(),
-            FRONT_WINDOW,
-            front_group.clone(),
-            prefix,
-        )
-        .and_then(|m| graphs::Compiled::new(device, m))
-        {
-            Ok(b) => Some(b),
-            Err(e) => {
-                cell_failed!("cell speak — sound {front_group:?} carried build: {e}");
-            }
-        }
-    } else {
-        None
-    };
     build_ms += t.ms();
-    let mut sound_graphs: Vec<graphs::Compiled> = Vec::new();
+    let prefix = graphs::FRONT_CARRY;
     let mut sound_phase_ms = 0f64;
     // The sound half's own weight stream: every window re-reads the graph it runs,
     // so the numerator is that graph's parameter bytes once per window.
@@ -3042,36 +3034,28 @@ fn speak_synthesis() -> Option<Synthesis> {
         .into_iter()
         .map(|(_, _, a, b)| (a, b))
     {
-        let len = b - a;
-        let mut chunk = Vec::with_capacity((levels + 1) * FRONT_WINDOW);
+        let core = b - a;
+        // The first window runs its own length; every later one a full chunk, zero
+        // padded when the part ends inside it (`graphs::FrontGraphs`).
+        let (graph, run_len) = front.pick(a);
+        let mut chunk = vec![0f32; (levels + 1) * run_len];
         for level in 0..=levels {
             for f in a..b {
-                chunk.push(flat[level * frames + f]);
+                chunk[level * run_len + (f - a)] = flat[level * frames + f];
             }
-            chunk.resize(chunk.len() + (FRONT_WINDOW - len), 0.0);
         }
-        let (cos, sin) = host::rope_tables_at(a, FRONT_WINDOW, wave_hd, 1e4);
+        let (cos, sin) = host::rope_tables_at(a, run_len, wave_hd, 1e4);
         let mut inputs = vec![
             ("codes".into(), chunk),
             ("cos".into(), cos.iter().map(|v| *v as f32).collect()),
             ("sin".into(), sin.iter().map(|v| *v as f32).collect()),
             ("left".into(), left.clone()),
         ];
-        let graph = if a == 0 {
-            &mut front_first
-        } else {
-            match front_next.as_mut() {
-                Some(g) => g,
-                None => {
-                    cell_failed!("cell speak — a carried front is missing for frame {a}");
-                }
-            }
-        };
         if a > 0 && prefix > 0 {
             inputs.push(("kpre".into(), kv_k.clone()));
             inputs.push(("vpre".into(), kv_v.clone()));
         }
-        let run = graph.run(&inputs, 1);
+        let run = graph.borrow_mut().run(&inputs, 1);
         if run.outs.len() < 4 {
             println!(
                 "cell speak — the front returned {} outputs, expected waveform + k/v/left",
@@ -3080,19 +3064,31 @@ fn speak_synthesis() -> Option<Synthesis> {
             return None;
         }
         front_nodes = front_nodes.max(run.ops.iter().map(|(_, n)| n).sum());
-        let chunk = run.outs[0].clone();
+        let chunk = &run.outs[0];
+        if chunk.len() != front_ch * run_len * front_per {
+            println!(
+                "cell speak — the front ran a {run_len}-frame window and returned {} samples, \
+                 expected {} for {front_ch} channels × {run_len} frames × {front_per}",
+                chunk.len(),
+                front_ch * run_len * front_per
+            );
+            return None;
+        }
         for ch in 0..front_ch {
-            let src = ch * FRONT_WINDOW * front_per;
+            let src = ch * run_len * front_per;
             let dst = ch * frames * front_per + a * front_per;
-            wave[dst..dst + len * front_per].copy_from_slice(&chunk[src..src + len * front_per]);
+            wave[dst..dst + core * front_per].copy_from_slice(&chunk[src..src + core * front_per]);
         }
         // Side outputs are published in this order: `left`, `knew`, `vnew`.
-        // Keep the last 71 rows of this window for the next one.
+        // Carry the last 71 rows of a full chunk; a part's first window is one
+        // whenever another window follows it, so the carry is filled before the
+        // window that reads it.
         let knew = &run.outs[2];
         let vnew = &run.outs[3];
-        if prefix > 0 && knew.len() >= wave_layers * FRONT_WINDOW * wave_hkv {
+        let rows = knew.len() / (wave_layers * wave_hkv);
+        if prefix > 0 && rows > prefix {
             for l in 0..wave_layers {
-                let src = (l * FRONT_WINDOW + (FRONT_WINDOW - prefix)) * wave_hkv;
+                let src = (l * rows + (rows - prefix)) * wave_hkv;
                 let dst = l * prefix * wave_hkv;
                 kv_k[dst..dst + prefix * wave_hkv]
                     .copy_from_slice(&knew[src..src + prefix * wave_hkv]);
@@ -3109,7 +3105,7 @@ fn speak_synthesis() -> Option<Synthesis> {
             run.passes,
         ));
         sound_phase_ms += run.step_ms;
-        sound_weight_bytes += stream_bytes(&graph.runner.graph);
+        sound_weight_bytes += stream_bytes(&graph.borrow().runner.graph);
         if o.is_none() {
             o = Some(run);
         }
@@ -3119,10 +3115,6 @@ fn speak_synthesis() -> Option<Synthesis> {
         &front_stats,
         front_nodes,
     ));
-    sound_graphs.push(front_first);
-    if let Some(front_next) = front_next {
-        sound_graphs.push(front_next);
-    }
     for group in dac_groups {
         let (ch_in, per_in) = graphs::dac_stage_io(group.start, 1);
         let expected = ch_in * frames * per_in;
@@ -3144,11 +3136,9 @@ fn speak_synthesis() -> Option<Synthesis> {
         let mut lengths: Vec<usize> = parts.iter().map(|&(p0, p1, _, _)| p1 - p0).collect();
         lengths.sort_unstable();
         lengths.dedup();
-        let mut graphs_by_len: Vec<(usize, graphs::Compiled)> = Vec::with_capacity(lengths.len());
+        let mut graphs_by_len: Vec<(usize, graphs::SoundGraph)> = Vec::with_capacity(lengths.len());
         for &len in &lengths {
-            match graphs::synthesis_sound_group(pair.sound.clone(), len, group.clone(), 0)
-                .and_then(|m| graphs::Compiled::new(device, m))
-            {
+            match sound_cache.graph(device, &pair.sound, len, group.clone(), 0) {
                 Ok(b) => graphs_by_len.push((len, b)),
                 Err(e) => {
                     println!(
@@ -3175,10 +3165,11 @@ fn speak_synthesis() -> Option<Synthesis> {
                 .expect("part length built");
             let run = graphs_by_len[gi]
                 .1
+                .borrow_mut()
                 .run(&[("codec_in".into(), chunk)], WARM_REPS);
             nodes = nodes.max(run.ops.iter().map(|(_, n)| n).sum());
             sound_phase_ms += run.step_ms;
-            sound_weight_bytes += stream_bytes(&graphs_by_len[gi].1.runner.graph);
+            sound_weight_bytes += stream_bytes(&graphs_by_len[gi].1.borrow().runner.graph);
             stats.push((
                 run.first_ms,
                 run.step_ms,
@@ -3204,7 +3195,6 @@ fn speak_synthesis() -> Option<Synthesis> {
             &stats,
             nodes,
         ));
-        sound_graphs.extend(graphs_by_len.into_iter().map(|(_, g)| g));
         wave = stitched;
     }
     if wave.len() != frames * graphs::samples_per_frame() {

@@ -12,11 +12,13 @@
 //! than behind `backend-tests`; it is the only test in this binary, so the
 //! gigabytes it maps are not contended by another test's allocations.
 //!
-//! Every threshold below is a fraction of what was mapped rather than a
-//! near-exact delta, and the one absolute threshold is asserted only once the
-//! independent reading has confirmed the process really holds that much: a
-//! machine under memory pressure compresses this process's pages away, and the
-//! check must not blame the reading for the machine.
+//! Two fractions decide a step, and neither is taken against bytes that were
+//! only mapped: a step is decided only where `ps` saw at least an eighth of the
+//! bytes the step mapped — on a machine under pressure the mapping is compressed
+//! away and the step cannot tell the reading apart, so it says so — and the
+//! reading then has to account for at least half of the change `ps` saw. Both
+//! reference the `ps` figure this file already takes, so a compressed mapping
+//! cannot blame the reading for the machine.
 use rlx_runtime::{available_unified_memory, process_rss_bytes};
 
 unsafe extern "C" {
@@ -93,10 +95,9 @@ struct Samples {
 ///
 /// Bracketing `ps` with two readings is what makes the comparison an assertion
 /// about one instant. A machine under memory pressure compresses pages out of
-/// this process *while* `ps` runs (measured: tens of MB of drift over a spawn
-/// that took milliseconds), so a point comparison would compare two different
-/// moments of a moving counter. A reading that were zero, or the peak rather
-/// than the current size, or truncated to 32 bits, still falls outside the
+/// this process *while* `ps` runs, so a point comparison would compare two
+/// different moments of a moving counter. A reading that were zero, or the peak
+/// rather than the current size, or truncated to 32 bits, still falls outside the
 /// window.
 fn sample(at: &str) -> Samples {
     let before = reading(at);
@@ -132,37 +133,55 @@ fn ps_rss_bytes() -> usize {
         * 1024
 }
 
+/// The reading followed the process's held size across one step: it moved in the
+/// same direction as the `ps` figure, by at least half of what `ps` saw move.
+///
+/// The skip gate above the assertion is the other fraction: a step whose mapping
+/// `ps` saw move by less than an eighth cannot tell the reading apart at all — the
+/// machine compressed it away — so it says so instead of asserting either way.
+fn assert_followed(at: &str, from: &Samples, to: &Samples, mapped: usize) {
+    let held = to.ps.abs_diff(from.ps);
+    if held < mapped / 8 {
+        eprintln!(
+            "at {at}: ps saw only {held} B of {mapped} B mapped change hands, so the step \
+             cannot tell the reading apart"
+        );
+        return;
+    }
+    let moved = to.rss.abs_diff(from.rss);
+    assert!(
+        moved >= held / 2 && (to.rss >= from.rss) == (to.ps >= from.ps),
+        "at {at}: over {mapped} B mapped, ps went {} B -> {} B ({held} B held) while \
+         process_rss_bytes() went {} B -> {} B ({moved} B moved)",
+        from.ps,
+        to.ps,
+        from.rss,
+        to.rss
+    );
+}
+
 #[test]
 fn the_reading_is_the_current_resident_size() {
-    let base = sample("baseline").rss;
+    let base = sample("baseline");
     let mut held = Vec::new();
 
     held.push(WorkingSet::mapped(MODEST));
-    let modest = sample("tens of MB held").rss;
-    assert!(
-        modest >= base + MODEST / 2,
-        "at tens of MB: {base} B -> {modest} B for {MODEST} mapped and touched"
-    );
+    let modest = sample("tens of MB held");
+    assert_followed("tens of MB", &base, &modest, MODEST);
 
     held.push(WorkingSet::mapped(LARGE));
-    let peak = sample("a few hundred MB held").rss;
-    assert!(
-        peak >= modest + LARGE / 2,
-        "at a few hundred MB: {modest} B -> {peak} B for {LARGE} mapped and touched"
-    );
+    let peak = sample("a few hundred MB held");
+    assert_followed("a few hundred MB", &modest, &peak, LARGE);
 
     // The release step, and the one thing a growing working set cannot show: a
     // *peak* reading (`resident_size_max`) reports `peak` here and drops by 0.
-    // Only a quarter of the release is required, since a machine under pressure
-    // may not have kept all of it resident, but a drop this large cannot happen
-    // to a reading that only ever grows.
     held.clear();
-    let released = sample("after releasing it").rss;
-    assert!(
-        peak.saturating_sub(released) >= (MODEST + LARGE) / 4,
-        "releasing {MODEST} + {LARGE} dropped the reading by only {} B \
-         ({peak} B -> {released} B)",
-        peak.saturating_sub(released)
+    let released = sample("after releasing it");
+    assert_followed(
+        "after releasing the working set",
+        &peak,
+        &released,
+        MODEST + LARGE,
     );
 
     // Above 4 GiB. Skipped only where the machine could not hold it resident at
@@ -175,13 +194,8 @@ fn the_reading_is_the_current_resident_size() {
     let huge = WorkingSet::mapped(HUGE);
     let big = sample("above 4 GiB held");
     drop(huge);
-    let back = sample("after releasing it").rss;
-    assert!(
-        big.rss.saturating_sub(back) >= HUGE / 4,
-        "releasing {HUGE} dropped the reading by only {} B ({} B -> {back} B)",
-        big.rss.saturating_sub(back),
-        big.rss
-    );
+    let back = sample("after releasing it");
+    assert_followed("releasing the above-4-GiB working set", &big, &back, HUGE);
     if big.ps > 4 << 30 {
         // The independent figure confirms this process really holds more than a
         // 32-bit count of resident bytes, so the reading has to be able to say

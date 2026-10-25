@@ -24,7 +24,12 @@ use rlx_unfuse::DecomposePolicy;
 /// wgpu's decompose policy: fold biased matmuls into `FusedMatMulBiasAct`,
 /// fold residual+norm pairs into `FusedResidualLN`, and pass rank-3 Q/K/V/
 /// mask straight to the stride-driven Attention kernel.
-pub(crate) struct WgpuPolicy;
+pub(crate) struct WgpuPolicy {
+    /// Whether `Op::FusedSwiGLU` is served by the native `fused_swiglu.wgsl`
+    /// kernel rather than decomposed. Read once in [`unfuse`], above the walk
+    /// that asks the policy per node.
+    swiglu_native: bool,
+}
 
 impl DecomposePolicy for WgpuPolicy {
     fn fold_matmul_bias_act(&self) -> bool {
@@ -48,16 +53,25 @@ impl DecomposePolicy for WgpuPolicy {
         true
     }
 
-    // Keep `Op::FusedSwiGLU` fused — wgpu has a native kernel
-    // (`fused_swiglu.wgsl`) instead of the Narrow+Silu+Mul decompose.
+    // `Op::FusedSwiGLU` is kept fused — wgpu has a native kernel
+    // (`fused_swiglu.wgsl`) instead of the Narrow+Silu+Mul decompose — unless
+    // `RLX_WGPU_NO_FUSED_SWIGLU` stands the fusion down for a measurement arm.
+    // That switch is the single decision point for this question; the arm's
+    // primitives come from `rlx_unfuse::expand_swiglu`, the shared decomposer that
+    // asks this policy. That decomposer drops the fused op's `cast_to`, and every
+    // producer in the tree sets it to `None`, so a cast-bearing `FusedSwiGLU` is
+    // not modelled by the stand-down.
     fn swiglu_native(&self) -> bool {
-        true
+        self.swiglu_native
     }
 }
 
 pub fn unfuse(graph: Graph) -> Graph {
+    let policy = WgpuPolicy {
+        swiglu_native: !rlx_ir::env::flag("RLX_WGPU_NO_FUSED_SWIGLU"),
+    };
     let g = fold_conv_bias_into_conv3d(expand_unsupported_fusions(graph));
-    rlx_unfuse::unfuse(g, &WgpuPolicy)
+    rlx_unfuse::unfuse(g, &policy)
 }
 
 /// Peel the broadcast copy `LegalizeBroadcast` materialises in front of an
@@ -250,18 +264,26 @@ fn fold_conv_bias_into_conv3d(g: Graph) -> Graph {
     out
 }
 
-/// Expand any [`Op::FusedConvBiasAct`] that is not the 2-D case wgpu lowers.
+/// Expand any [`Op::FusedConvBiasAct`] that is not the 2-D case wgpu lowers, and
+/// any fused op a measurement stand-down asks to see as primitives.
 ///
 /// `SUPPORTED_OPS` lists the op unconditionally and `compile::lower` asserts
 /// `only 2D NCHW convs are fused`, so a 3-D graph aborts at compile time
 /// rather than running. (CUDA and ROCm share the claim without the assert and
 /// silently compute a 2-D convolution instead.) Sending other ranks back to
 /// primitives lets them run on `conv3d.wgsl`.
+///
+/// `Op::FusedSwiGLU`'s stand-down is not here: it is
+/// [`WgpuPolicy::swiglu_native`], the seam the shared decompose pass already
+/// reads for that question. `Op::FusedResidualRmsNorm` has no hook there, so its
+/// arm is decided here.
 fn expand_unsupported_fusions(g: Graph) -> Graph {
     // Rank-5 with no activation and no residual is lowered natively — the
     // conv3d shaders apply the bias in their store. Expanding it instead costs
     // a full-size `Expand` of the bias and a full-size `Add` per convolution:
     // 27 of each on SynthStrip, which is most of why a 192^3 arena did not fit.
+    // Read once, above the walk: the predicate is asked twice per node.
+    let residual_rms_stand_down = rlx_ir::env::flag("RLX_WGPU_NO_FUSED_RESIDUAL_RMS");
     let unsupported = |n: &rlx_ir::Node| -> bool {
         match &n.op {
             Op::FusedConvBiasAct {
@@ -270,6 +292,9 @@ fn expand_unsupported_fusions(g: Graph) -> Graph {
                 ..
             } => n.shape.rank() != 5 || n.inputs.len() != 3,
             Op::FusedConvBiasAct { .. } => n.shape.rank() != 4,
+            // The stand-down's primitives compute the fused step's own values, so
+            // an arm on them is the fusion's price.
+            Op::FusedResidualRmsNorm { .. } => residual_rms_stand_down,
             _ => false,
         }
     };

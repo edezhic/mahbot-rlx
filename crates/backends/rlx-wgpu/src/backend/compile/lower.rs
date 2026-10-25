@@ -1888,7 +1888,13 @@ pub(crate) fn compile_static_inner(
     //   skip_adds: { add_id }  — these Add nodes are computed by the
     //                            tee step; their normal Step emission
     //                            is suppressed.
-    let (mut ln_to_tee, mut skip_adds) = detect_residual_ln_tee_pattern(&graph);
+    // The switch stands the fold down to the add and the norm it replaces — the
+    // same values, one dispatch each — so the fusion can be priced.
+    let (mut ln_to_tee, mut skip_adds) = if rlx_ir::env::flag("RLX_WGPU_NO_LN_TEE") {
+        (HashMap::new(), HashSet::new())
+    } else {
+        detect_residual_ln_tee_pattern(&graph)
+    };
 
     // ── Arena-safety veto for the tee ────────────────────────────────
     // The tee moves the Add's work to the NORM's step, so `h` and `delta` are
@@ -2004,14 +2010,26 @@ pub(crate) fn compile_static_inner(
     // the rule the walk below routes them by, so `RLX_WGPU_FORCE_HOST`, the
     // discrete-Vulkan/DX12 elementwise path and a stripe straddle keep the
     // chain's own steps, and a change to that rule moves this gate with it.
+    let on_device = |id: NodeId| {
+        let n = graph.node(id);
+        !should_pack_host_op(&arena, &n.op, n, &graph)
+    };
+    let fold_graph = FoldGraph::new(&graph);
     let (snake_beta, snake_skip) = if rlx_ir::env::flag("RLX_WGPU_NO_SNAKE_BETA") {
         (HashMap::new(), HashSet::new())
     } else {
-        detect_snake_beta_pattern(&graph, &arena, &|id| {
-            let n = graph.node(id);
-            !should_pack_host_op(&arena, &n.op, n, &graph)
-        })
+        detect_snake_beta_pattern(&fold_graph, &arena, &on_device)
     };
+
+    // `Gather(table, Add(idx, c))`: the constant offset the code predictor adds
+    // to its index is applied inside the gather's read, so the `Add` emits no
+    // step. Read live, like the snake switch.
+    let (gather_index_bias, gather_index_bias_skip) =
+        if rlx_ir::env::flag("RLX_WGPU_NO_GATHER_INDEX_BIAS") {
+            (HashMap::new(), HashSet::new())
+        } else {
+            detect_gather_index_bias(&fold_graph, &arena, &on_device)
+        };
 
     // A fused projection's row split into its parts: one dispatch for the pieces
     // instead of one `narrow` each. Detected before the norm+rope fold, which
@@ -2025,16 +2043,17 @@ pub(crate) fn compile_static_inner(
     // routing rule — `should_pack_host_op` — and keeps both steps wherever they
     // would have been hosted. A pair the split fed takes that split with it, so
     // the block's fused qkv row costs one dispatch instead of two.
-    let (norm_rope, norm_rope_skip) = detect_norm_rope_pattern(
-        &graph,
-        &arena,
-        &|id| {
-            let n = graph.node(id);
-            !should_pack_host_op(&arena, &n.op, n, &graph)
-        },
-        &mut narrow_split,
-        &mut narrow_split_skip,
-    );
+    let (norm_rope, norm_rope_skip) = if rlx_ir::env::flag("RLX_WGPU_NO_NORM_ROPE") {
+        (HashMap::new(), HashSet::new())
+    } else {
+        detect_norm_rope_pattern(
+            &graph,
+            &arena,
+            &on_device,
+            &mut narrow_split,
+            &mut narrow_split_skip,
+        )
+    };
 
     let mut coop_f16_host_activations: Vec<(NodeId, Activation, String)> = Vec::new();
     let mut static_once_steps: HashSet<usize> = HashSet::new();
@@ -2219,11 +2238,16 @@ pub(crate) fn compile_static_inner(
         // ── The per-binding-ceiling rule (one rule, closed by default) ────────
         // Before every other routing rule, for the reason its own doc gives; see
         // `should_host_at_ceiling` and `supported_ops::addresses_arena_by_absolute_offset`.
-        // The snake comes first: its intermediates and its folded input `Add`
-        // must emit nothing at all, and the fold was only taken where the
-        // elementwise host rules would have kept those nodes on the device
-        // (`detect_snake_beta_pattern`'s `on_device` term).
-        if snake_skip.contains(&node.id) || norm_rope_skip.contains(&node.id) {
+        // Three folds suppress a node's own step: the snake (its four
+        // intermediates and its folded input `Add`), the query/key norm+rope pair
+        // and the code gather's index `Add`. Each must emit nothing at all, and
+        // each was only taken where the elementwise host rules would have kept
+        // those nodes on the device — every detector answers with the same
+        // `on_device` term this walk routes by.
+        if snake_skip.contains(&node.id)
+            || norm_rope_skip.contains(&node.id)
+            || gather_index_bias_skip.contains(&node.id)
+        {
             continue;
         }
         if let Some(plan) = snake_beta.get(&node.id) {
@@ -6247,7 +6271,10 @@ pub(crate) fn compile_static_inner(
                     k_batch_stride: k_b,
                     k_head_stride: k_h,
                     k_seq_stride: k_s,
-                    _pad_k: 0,
+                    // A bisect switch, read here with the other step parameters:
+                    // an arm recompiles with it, and the frame's step set is the
+                    // same either way.
+                    skip_masked: u32::from(!rlx_ir::env::flag("RLX_WGPU_NO_ATTN_MASK_SKIP")),
                     v_batch_stride: v_b,
                     v_head_stride: v_h,
                     v_seq_stride: v_s,
@@ -6877,7 +6904,13 @@ pub(crate) fn compile_static_inner(
 
             Op::Gather { axis } => {
                 let table_id = node.inputs[0];
-                let idx_id = node.inputs[1];
+                // A detected `Add(idx, c)` is suppressed, and the gather reads `idx`
+                // with `c` applied in-kernel. `detect_gather_index_bias` plans
+                // leading-axis gathers only — `GatherAxisParams` has no index bias —
+                // so the plan belongs to this arm as it stands.
+                let idx_fold = gather_index_bias.get(&node.id);
+                let idx_id = idx_fold.map_or(node.inputs[1], |p| p.idx);
+                let idx_bias = idx_fold.map_or(0.0, |p| p.bias);
                 let table_is_param = tensor_is_graph_param(&graph, &param_offsets, table_id);
                 let table_bytes = arena.len_of(table_id) as u64;
                 // Split-binding path: on >4 GiB arenas the embedding output and
@@ -6928,6 +6961,7 @@ pub(crate) fn compile_static_inner(
                         n_idx,
                         dim: dim * lanes,
                         vocab,
+                        idx_bias,
                         table_byte_off: arena.offset(table_id) as u64,
                         idx_byte_off: arena.offset(idx_id) as u64,
                         out_byte_off: arena.offset(node.id) as u64,
@@ -7013,7 +7047,7 @@ pub(crate) fn compile_static_inner(
                         in_off,
                         idx_off,
                         out_off,
-                        _p0: 0,
+                        idx_bias,
                     };
                     schedule.push(Step::Gather { params: p });
                     let gk = gather_kernel(&dev.device);

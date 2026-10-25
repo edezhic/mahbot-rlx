@@ -7,19 +7,21 @@
 //!
 //! The graphs whose shapes do not depend on the request are built and compiled
 //! once ([`Synthesis::new`] — the speaker encoder and the code predictor's whole
-//! sixteen-level frame as one graph); the prompt and the sound half are built per call exactly as the
-//! stand builds them. [`Synthesis::synthesize`] is the reusable entry point the
-//! wake-word bench calls for every corpus clip. Output is mono f32 PCM at
-//! [`SAMPLE_RATE`] (24 kHz, the sound half's own rate), `frames · 1920` samples
-//! for the frames the talker produced.
+//! sixteen-level frame as one graph); the prompt and body graphs are built on a
+//! length they have not seen, and the sound half's graphs on a window they have
+//! not seen, both kept afterwards in this object. [`Synthesis::synthesize`] is the
+//! reusable entry point the wake-word bench calls for every corpus clip. Output is
+//! mono f32 PCM at [`SAMPLE_RATE`] (24 kHz, the sound half's own rate),
+//! `frames · 1920` samples for the frames the talker produced.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 
-use crate::graphs::Compiled;
+use crate::graphs::{Compiled, DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, windows};
 use crate::loader::{Config, Head, Pair};
+use crate::report::Stopwatch;
 use crate::tokenizer::Tokenizer;
 use crate::{graphs, host};
 
@@ -47,33 +49,6 @@ pub const TTS_CODEC_NOTTHINK: usize = 2_155;
 pub const TTS_CODEC_THINK_BOS: usize = 2_156;
 pub const TTS_CODEC_THINK_EOS: usize = 2_157;
 pub const TTS_REPEAT_PENALTY: f32 = 1.05;
-
-/// The codec's windows over a part: the DAC stages are convolutional (their
-/// LayerNorm is per position), so a window with a margin gives the same samples
-/// as the whole part away from the edges, and the planned arena — which is a
-/// graph's — shrinks with the window instead of being the part's.
-///
-/// The window is 144 frames — two of the front's chunks ([`FRONT_WINDOW`]): every
-/// window runs its graph over every frame in it, so a longer window is fewer
-/// graph runs over the same frames, each convolution at twice the columns and for
-/// twice the frames. The measurement is the record's (three windows a group
-/// instead of five, the same waveform digest, peak unmoved); doubling again is the
-/// same curve's next step and is not taken, because the arena grows with the
-/// window.
-///
-/// Shared with the stand.
-pub(crate) const DAC_WINDOW: usize = 144;
-/// The wave transformer's own window: the front is cut at this many frames so
-/// its output does not depend on the part's total length.
-///
-/// Shared with the stand.
-pub(crate) const FRONT_WINDOW: usize = 72;
-/// Frames of margin on each side, clipped at the part's own edges: the four DAC
-/// blocks' kernels and strides reach this far into a window, so a core sample
-/// never reads a window edge the part does not have.
-///
-/// Shared with the stand.
-pub(crate) const DAC_MARGIN: usize = 4;
 
 /// The codec's service block is the last 1024 codec ids. Only EOS is a
 /// legitimate answer from it; everything else is not a codebook entry.
@@ -216,31 +191,6 @@ pub(crate) fn codec_slice(
     out
 }
 
-/// Codec windows over the part's frames: `(p0, p1, a, b)` — the padded span the
-/// DAC graphs read (positions `p0 · 32 .. p1 · 32` of the front's output) and
-/// the core `[a, b)` the stitch keeps. The first and last window are not padded
-/// past the part's own edges.
-pub(crate) fn windows(
-    rows: usize,
-    window: usize,
-    margin: usize,
-) -> Vec<(usize, usize, usize, usize)> {
-    debug_assert!(margin < window);
-    let mut v = Vec::new();
-    let mut a = 0;
-    if rows > 0 {
-        let b = window.min(rows);
-        v.push((0, (b + margin).min(rows), 0, b));
-        a = b;
-    }
-    while a < rows {
-        let b = (a + window).min(rows);
-        v.push((a.saturating_sub(margin), (b + margin).min(rows), a, b));
-        a = b;
-    }
-    v
-}
-
 /// Copy one window's core `[a, b)` out of a group's output into the part's
 /// stitched tensor, channel-major at `per_out`.
 pub(crate) fn stitch_window(
@@ -283,18 +233,30 @@ pub struct Synthesis {
     /// The prompt and body graphs are shape-only, and a TTS request that repeats
     /// a prompt length reuses them instead of paying the compile again — the
     /// bench's corpus cycles phrases across seeds, and a served voice answers
-    /// requests of similar length. One entry each: the sound graphs' arenas are
-    /// far larger and consecutive requests are the ones that repeat.
+    /// requests of similar length. One entry each.
     prefill: Option<(usize, Compiled)>,
     body: Option<(usize, Compiled)>,
+    /// The sound half's graphs, one per window length and stage group, kept while
+    /// this object lives and released with it (`graphs::SoundGraphs`) — a repeated
+    /// request of a length pays neither the compile nor the upload for the
+    /// decoder, and the residency is this object's rather than the process's.
+    /// The graphs are shared handles over one thread's device state, so this makes
+    /// [`Synthesis`] `!Send`: one object per synthesizing thread.
+    sound_graphs: graphs::SoundGraphs,
+    /// What the last [`Synthesis::synthesize`] paid to build: the compiles and
+    /// uploads for the graphs it did not already hold — whether or not the call
+    /// finished, so a call that failed after some builds reports the part it paid.
+    /// A call whose text and frame count repeat pays neither, and reads a hit's own
+    /// walk of the cache.
+    build_ms: f64,
 }
 
 impl Synthesis {
     /// Compile the code predictor's whole sixteen-level frame as one graph, and
     /// the speaker encoder, and embed the reference voice once. The prompt and
     /// body graphs are built on first use and reused while the shape repeats
-    /// (`Synthesis::prefill`, `Synthesis::body`); the sound graphs are built per
-    /// call.
+    /// (`Synthesis::prefill`, `Synthesis::body`); the sound half's graphs are
+    /// built on first use and kept in `Synthesis::sound_graphs`.
     pub fn new(pair: Arc<Pair>, voice_wav: &Path) -> Result<Self> {
         let tokenizer = Tokenizer::from_model(&pair.body)?;
         let cfg = pair.body.config().clone();
@@ -355,12 +317,15 @@ impl Synthesis {
             frame,
             prefill: None,
             body: None,
+            sound_graphs: graphs::SoundGraphs::default(),
+            build_ms: 0.0,
         })
     }
 
     /// Synthesize `text` with the given sampling seed. Returns mono 24 kHz PCM
     /// of `frames · graphs::samples_per_frame()` samples.
     pub fn synthesize(&mut self, text: &str, seed: u64) -> Result<Vec<f32>> {
+        self.build_ms = 0.0;
         let mut text_ids = self.tokenizer.encode(text);
         text_ids.truncate(MAX_TEXT_TOKENS);
         if text_ids.is_empty() {
@@ -368,6 +333,13 @@ impl Synthesis {
         }
         let frames = self.generate(&text_ids, seed)?;
         self.render_sound(&frames)
+    }
+
+    /// Milliseconds the last call spent compiling and uploading graphs it did not
+    /// already hold.
+    #[must_use]
+    pub fn build_ms(&self) -> f64 {
+        self.build_ms
     }
 
     /// The talker's prompt, then one body step and a fifteen-level predictor
@@ -391,10 +363,12 @@ impl Synthesis {
             // Dropped before the replacement is compiled, as the body graph is
             // below: the two would otherwise be resident at once.
             self.prefill = None;
+            let t = Stopwatch::start();
             let compiled = Compiled::new(
                 device,
                 graphs::body_new_rows_head_chain(self.pair.body.clone(), prompt_rows, 0, true)?,
             )?;
+            self.build_ms += t.ms();
             self.prefill = Some((prompt_rows, compiled));
         }
         let prefill = &mut self.prefill.as_mut().expect("prompt graph").1;
@@ -424,10 +398,12 @@ impl Synthesis {
         let capacity = prompt_rows + MAX_CODEC_ROWS;
         if self.body.as_ref().is_none_or(|(rows, _)| *rows != capacity) {
             self.body = None;
+            let t = Stopwatch::start();
             let compiled = Compiled::new(
                 device,
                 graphs::body_capacity_chain_planes(self.pair.body.clone(), capacity)?,
             )?;
+            self.build_ms += t.ms();
             self.body = Some((capacity, compiled));
         }
         let body = &mut self.body.as_mut().expect("talker graph").1;
@@ -592,12 +568,12 @@ impl Synthesis {
     /// The sound half: codes → codebook → wave transformer → DAC, windowed to
     /// keep each graph's plan small. Stitches into one waveform of
     /// `frames · graphs::samples_per_frame()` samples.
-    fn render_sound(&self, all_codes: &[Vec<usize>]) -> Result<Vec<f32>> {
+    fn render_sound(&mut self, all_codes: &[Vec<usize>]) -> Result<Vec<f32>> {
         let frames = all_codes.len();
         if frames == 0 {
             return Err(anyhow!("the talker produced no codec frames"));
         }
-        let sound = &self.pair.sound;
+        let sound = self.pair.sound.clone();
         let levels = sound
             .plan("a.gen.wav.quant.rest.codebook.weight")?
             .ggml_shape[2];
@@ -627,26 +603,25 @@ impl Synthesis {
         let wave_hd = sound.plan("a.gen.wav.tfm.blk.0.attn_q.weight")?.ggml_shape[1] / wave_heads;
         let wave_hkv = wave_heads * wave_hd;
         let wave_k = sound.plan("a.gen.wav.pre_conv.weight")?.ggml_shape[0];
-        let prefix = FRONT_WINDOW.saturating_sub(1);
 
         let device = rlx_runtime::Device::Gpu;
-        let mut front_first = Compiled::new(
+        // The first window runs its graph over the frames it holds; every later one
+        // runs a full chunk, zero-padded when the part ends inside it (a padded slot
+        // is a real codebook row, computed for nothing — but a graph per tail length
+        // costs more to build than the padding costs to run). A part of one chunk or
+        // less builds one graph, a longer one two; both are this object's, so a
+        // second utterance of the same length pays neither the compile nor the
+        // upload for them.
+        let t = Stopwatch::start();
+        let front = graphs::FrontGraphs::build(
+            &mut self.sound_graphs,
             device,
-            graphs::synthesis_sound_group(sound.clone(), FRONT_WINDOW, front_group.clone(), 0)?,
+            &sound,
+            frames,
+            front_group.clone(),
         )?;
-        let mut front_next = if frames > FRONT_WINDOW {
-            Some(Compiled::new(
-                device,
-                graphs::synthesis_sound_group(
-                    sound.clone(),
-                    FRONT_WINDOW,
-                    front_group.clone(),
-                    prefix,
-                )?,
-            )?)
-        } else {
-            None
-        };
+        self.build_ms += t.ms();
+        let prefix = graphs::FRONT_CARRY;
 
         // The wave transformer carries a 72-frame window: 71 K/V frames per
         // layer, the last `pre_conv` frames and the global position. Carry the
@@ -660,15 +635,15 @@ impl Synthesis {
             .into_iter()
             .map(|(_, _, a, b)| (a, b))
         {
-            let len = b - a;
-            let mut chunk = Vec::with_capacity((levels + 1) * FRONT_WINDOW);
+            let core = b - a;
+            let (graph, run_len) = front.pick(a);
+            let mut chunk = vec![0f32; (levels + 1) * run_len];
             for level in 0..=levels {
                 for f in a..b {
-                    chunk.push(flat[level * frames + f]);
+                    chunk[level * run_len + (f - a)] = flat[level * frames + f];
                 }
-                chunk.resize(chunk.len() + (FRONT_WINDOW - len), 0.0);
             }
-            let (cos, sin) = host::rope_tables_at(a, FRONT_WINDOW, wave_hd, 1e4);
+            let (cos, sin) = host::rope_tables_at(a, run_len, wave_hd, 1e4);
             let cos: Vec<f32> = cos.iter().map(|v| *v as f32).collect();
             let sin: Vec<f32> = sin.iter().map(|v| *v as f32).collect();
             let mut inputs: Vec<(&str, &[f32])> = vec![
@@ -681,14 +656,7 @@ impl Synthesis {
                 inputs.push(("kpre", &kv_k));
                 inputs.push(("vpre", &kv_v));
             }
-            let graph = if a == 0 {
-                &mut front_first
-            } else {
-                front_next.as_mut().ok_or_else(|| {
-                    anyhow!("a carried wave-transformer front is missing for frame {a}")
-                })?
-            };
-            let run = graph.run_slices(&inputs);
+            let run = graph.borrow_mut().run_slices(&inputs);
             if run.len() < 4 {
                 return Err(anyhow!(
                     "the wave transformer returned {} outputs, expected waveform + left + k/v",
@@ -696,19 +664,32 @@ impl Synthesis {
                 ));
             }
             let chunk = &run[0];
+            // The run length is the graph's own; a graph whose declared width
+            // disagreed with it would slice past the end here, so refuse by name.
+            if chunk.len() != front_ch * run_len * front_per {
+                return Err(anyhow!(
+                    "the wave transformer ran a {run_len}-frame window and returned {} samples, \
+                     expected {} for {front_ch} channels × {run_len} frames × {front_per}",
+                    chunk.len(),
+                    front_ch * run_len * front_per
+                ));
+            }
             for ch in 0..front_ch {
-                let src = ch * FRONT_WINDOW * front_per;
+                let src = ch * run_len * front_per;
                 let dst = ch * frames * front_per + a * front_per;
-                wave[dst..dst + len * front_per]
-                    .copy_from_slice(&chunk[src..src + len * front_per]);
+                wave[dst..dst + core * front_per]
+                    .copy_from_slice(&chunk[src..src + core * front_per]);
             }
             // Side outputs are published in this order: `left`, `knew`, `vnew`.
-            // Keep the last 71 rows of this window for the next one.
+            // Carry the last 71 rows of a full chunk; a part's first window is one
+            // whenever another window follows it, so the carry is filled before the
+            // window that reads it.
             let knew = &run[2];
             let vnew = &run[3];
-            if prefix > 0 && knew.len() >= wave_layers * FRONT_WINDOW * wave_hkv {
+            let rows = knew.len() / (wave_layers * wave_hkv);
+            if prefix > 0 && rows > prefix {
                 for l in 0..wave_layers {
-                    let src = (l * FRONT_WINDOW + (FRONT_WINDOW - prefix)) * wave_hkv;
+                    let src = (l * rows + (rows - prefix)) * wave_hkv;
                     let dst = l * prefix * wave_hkv;
                     kv_k[dst..dst + prefix * wave_hkv]
                         .copy_from_slice(&knew[src..src + prefix * wave_hkv]);
@@ -738,15 +719,15 @@ impl Synthesis {
             let mut lengths: Vec<usize> = parts.iter().map(|&(p0, p1, _, _)| p1 - p0).collect();
             lengths.sort_unstable();
             lengths.dedup();
-            let mut graphs_by_len: Vec<(usize, Compiled)> = Vec::with_capacity(lengths.len());
+            let mut graphs_by_len: Vec<(usize, graphs::SoundGraph)> =
+                Vec::with_capacity(lengths.len());
             for &len in &lengths {
-                graphs_by_len.push((
-                    len,
-                    Compiled::new(
-                        device,
-                        graphs::synthesis_sound_group(sound.clone(), len, group.clone(), 0)?,
-                    )?,
-                ));
+                let t = Stopwatch::start();
+                let graph = self
+                    .sound_graphs
+                    .graph(device, &sound, len, group.clone(), 0)?;
+                self.build_ms += t.ms();
+                graphs_by_len.push((len, graph));
             }
             // The group's output is a tensor of its own shape, not a waveform
             // until the group that carries `post`. Stitch it channel-major at
@@ -759,7 +740,10 @@ impl Synthesis {
                     .iter()
                     .position(|(l, _)| *l == len)
                     .ok_or_else(|| anyhow!("no sound graph was built for a {len}-frame window"))?;
-                let run = graphs_by_len[gi].1.run_slices(&[("codec_in", &chunk)]);
+                let run = graphs_by_len[gi]
+                    .1
+                    .borrow_mut()
+                    .run_slices(&[("codec_in", &chunk)]);
                 let chunk = run
                     .into_iter()
                     .next()
@@ -784,57 +768,5 @@ impl Synthesis {
             ));
         }
         Ok(wave)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::windows;
-
-    /// The codec's windows tile the part: every frame falls in exactly one core, a
-    /// core sits inside its padded span, no span leaves the part or reaches more
-    /// than one margin past its core — and the first window's span is the window
-    /// plus a margin, not the front's chunk, which is what lets a window wider than
-    /// [`super::FRONT_WINDOW`] run at all.
-    #[test]
-    fn the_codec_windows_tile_the_part_and_clip_at_its_edges() {
-        for (rows, window, margin) in [
-            (0usize, 144usize, 4usize),
-            (1, 144, 4),
-            (144, 144, 4),
-            (145, 144, 4),
-            (330, 144, 4),
-            (200, 72, 4),
-            (7, 3, 0),
-        ] {
-            let v = windows(rows, window, margin);
-            for w in v.windows(2) {
-                assert_eq!(
-                    w[0].3, w[1].2,
-                    "rows={rows}: a core starts where the last ended"
-                );
-            }
-            for &(p0, p1, a, b) in &v {
-                assert!(
-                    p0 <= a && a < b && b <= p1 && p1 <= rows,
-                    "rows={rows}: core {a}..{b} is not inside its span {p0}..{p1}"
-                );
-                assert!(
-                    p0 + margin >= a && p1 - p0 <= window + 2 * margin,
-                    "rows={rows}: span {p0}..{p1} reaches past its core's margin"
-                );
-            }
-            let covered: Vec<(usize, usize)> = v.iter().map(|w| (w.2, w.3)).collect();
-            assert!(
-                covered.is_empty() || (covered[0].0 == 0 && covered[covered.len() - 1].1 == rows),
-                "rows={rows}: the cores cover the part"
-            );
-        }
-        // The part's own shape: three windows, the first padded forward past the
-        // front's 72-frame chunk.
-        assert_eq!(
-            windows(330, 144, 4),
-            vec![(0, 148, 0, 144), (140, 292, 144, 288), (284, 330, 288, 330)]
-        );
     }
 }

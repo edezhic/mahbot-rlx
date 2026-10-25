@@ -163,7 +163,7 @@ impl GroupFront {
     pub fn footprint_bytes(&self) -> u64 {
         let file = |path: &std::path::Path| std::fs::metadata(path).map_or(0, |m| m.len());
         let weights = file(&self.pair.body.path) + file(&self.pair.sound.path);
-        let graph = |g: &Compiled| g.arena_bytes as u64 + (g.params_f32 + g.params_packed) as u64;
+        let graph = |g: &Compiled| g.device_bytes() as u64;
         weights
             + [&self.mel, &self.convs, &self.tail, &self.projector]
                 .into_iter()

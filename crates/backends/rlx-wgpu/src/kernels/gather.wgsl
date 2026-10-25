@@ -18,7 +18,7 @@ struct Params {
     in_off: u32,       // offset of the embedding table
     idx_off: u32,      // offset of the indices array
     out_off: u32,
-    _p0: u32,
+    idx_bias: f32,     // added to each index before truncation
 };
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
@@ -30,7 +30,7 @@ fn gather(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
     if (o >= params.n_out) { return; }
     let d = o % params.dim;
     let i = o / params.dim;
-    let idx_f = arena[params.idx_off + i];
+    let idx_f = arena[params.idx_off + i] + params.idx_bias;
     var idx_u: u32 = u32(max(idx_f, 0.0));
     if (idx_u >= params.vocab) { idx_u = params.vocab - 1u; }
     arena[params.out_off + o] = arena[params.in_off + idx_u * params.dim + d];

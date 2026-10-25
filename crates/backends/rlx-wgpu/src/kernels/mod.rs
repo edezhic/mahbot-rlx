@@ -1297,7 +1297,8 @@ pub struct GatherParams {
     pub in_off: u32,
     pub idx_off: u32,
     pub out_off: u32,
-    pub _p0: u32,
+    /// Added to each f32 index before truncation, as the folded `Add` did.
+    pub idx_bias: f32,
 }
 
 /// Layout for gather along a non-zero axis.
@@ -1386,7 +1387,12 @@ pub struct AttentionParams {
     pub k_batch_stride: u32,
     pub k_head_stride: u32,
     pub k_seq_stride: u32,
-    pub _pad_k: u32,
+    /// Whether a binary key-padding mask (kind 2) may stand a masked key's K dot
+    /// product down in the decode entry — the `_pad_k` slot it replaces. `1` is
+    /// the shipped behaviour; `RLX_WGPU_NO_ATTN_MASK_SKIP` makes it `0`. The V
+    /// read is not this word's: the entry's `e_cur == 0` early-out stands that
+    /// down for every mask kind, independently of the switch.
+    pub skip_masked: u32,
 
     pub v_batch_stride: u32,
     pub v_head_stride: u32,
@@ -5038,6 +5044,15 @@ pub const ATTENTION_PARTS_DIM_CHUNK: u32 = 32;
 /// its own and so prices small kinds far above their device cost: read those two
 /// as the ablation's, indicative of the direction, not as per-dispatch device
 /// time (the cell rate is the measured one).
+///
+/// The entry itself also stands a binary-masked key's K dot down (the
+/// `skip_masked` word in its params, `RLX_WGPU_NO_ATTN_MASK_SKIP` to restore
+/// it), which is the body's plane cache: its rows past the written prefix are
+/// exactly the masked keys. The masked key's *V* read is the entry's separate,
+/// ungated `e_cur == 0` early-out, which stands down the value read and the O
+/// update of any key that contributes nothing — every mask kind, on every decode
+/// step — so it is not part of what the switch prices. The step is weight-stream
+/// bound, so a read count moves the cell far less than its bytes do.
 pub fn attention_decode_eligible(seq_q: u32, seq_k: u32, head_dim: u32, v_head_dim: u32) -> bool {
     seq_q == 1
         // Not a floor: a step with no keys has nothing for this form to walk.

@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 661  
+**Registered names:** 668  
 **Unregistered mentions (migration leftovers):** 102
 
 ## Groups
@@ -38,7 +38,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [rocm](#rocm) — 31
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
-- [wgpu](#wgpu) — 93
+- [wgpu](#wgpu) — 100
 - [xdna](#xdna) — 11
 
 ## compile
@@ -707,6 +707,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_ALL_PARAMS_WEIGHT` | Internal | Bool | Backend(wgpu) | Park every parameter in the weight arena rather than splitting |
 | `RLX_WGPU_ARENA_REPORT` | Internal | Bool | Backend(wgpu) | Report which tensors dominate the activation arena after planning |
 | `RLX_WGPU_ATTENTION_BAND_F32` | Bisect | Bool | Backend(wgpu) | Stage the two-sided band attention kernel's K/V tiles in f32 instead of f16 (the f32 form is also the fallback without SHADER_F16) |
+| `RLX_WGPU_ATTN_DENSE_ONE_ROW` | Bisect | Bool | Backend(wgpu) | Admit the many-row dense attention arrangement from one query row |
 | `RLX_WGPU_CONCAT_HOST` | Bisect | Bool | Backend(wgpu) | Run Concat on the host instead of a wgpu kernel |
 | `RLX_WGPU_CONV3D_SCALAR` | Bisect | Bool | Backend(wgpu) | Force the one-element-per-thread Conv3D kernel instead of the 4-channel tiled one |
 | `RLX_WGPU_CONV_HOST` | Internal | Bool | Backend(wgpu) | Run convolution on the host instead of a wgpu kernel |
@@ -764,6 +765,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_MATMUL_F32_ONLY` | Bisect | Bool | Backend(wgpu) | Restrict wgpu matmul to f32, disabling f16 paths |
 | `RLX_WGPU_MAX_BIND_MB` | Internal | String | Backend(wgpu) | Cap the bind-group size in MiB to exercise the sharding path |
 | `RLX_WGPU_NAN_TRACE` | Bisect | Bool | Backend(wgpu) | Legacy wgpu NaN trace (prefer RLX_DEBUG_NANS) |
+| `RLX_WGPU_NO_ATTN_MASK_SKIP` | Bisect | Bool | Backend(wgpu) | Read every key's K dot in the attention decode entry instead of skipping a binary-masked one's (its V read is an unconditional e_cur == 0 early-out) |
 | `RLX_WGPU_NO_COOP_F16_VK` | Bisect | Bool | Backend(wgpu) | Disable f16 cooperative matrices in the wgpu Vulkan backend |
 | `RLX_WGPU_NO_COOP_F32` | Bisect | Bool | Backend(wgpu) | Disable f32 cooperative matrices |
 | `RLX_WGPU_NO_COOP_PROBE` | Bisect | Bool | Backend(wgpu) | Skip the cooperative-matrix self-check and trust the kernels |
@@ -772,6 +774,11 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_NO_F16_SHADOW` | Bisect | Bool | Backend(wgpu) | Do not allocate the f16 shadow buffer |
 | `RLX_WGPU_NO_FOLD_MMBA` | Internal | Bool | Backend(wgpu) | Disable folding matmul+bias+activation into one node |
 | `RLX_WGPU_NO_FOLD_RESLN` | Internal | Bool | Backend(wgpu) | Disable folding residual add into LayerNorm |
+| `RLX_WGPU_NO_FUSED_RESIDUAL_RMS` | Bisect | Bool | Backend(wgpu) | Expand FusedResidualRmsNorm into its add and norm, so each emits its own step |
+| `RLX_WGPU_NO_FUSED_SWIGLU` | Bisect | Bool | Backend(wgpu) | Expand FusedSwiGLU into narrow, silu and multiply, so each emits its own step |
+| `RLX_WGPU_NO_GATHER_INDEX_BIAS` | Bisect | Bool | Backend(wgpu) | Disable folding a constant index offset into the gather |
+| `RLX_WGPU_NO_LN_TEE` | Bisect | Bool | Backend(wgpu) | Disable the residual-and-norm tee, so the add and the norm emit their own steps |
+| `RLX_WGPU_NO_NORM_ROPE` | Bisect | Bool | Backend(wgpu) | Disable the norm-plus-rotation fold, so both emit their own steps |
 | `RLX_WGPU_NO_PACKED_BSHD_ATTN` | Bisect | Bool | Backend(wgpu) | Disable the packed BSHD attention kernel on wgpu |
 | `RLX_WGPU_NO_SNAKE_BETA` | Bisect | Bool | Backend(wgpu) | Disable the fused SnakeBeta (x + beta*sin^2(alpha*x)) step |
 | `RLX_WGPU_NO_TILED_CONV` | Bisect | Bool | Backend(wgpu) | Disable the tiled convolution kernel |

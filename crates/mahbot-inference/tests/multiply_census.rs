@@ -10,6 +10,27 @@
 //! rate — a per-side constant, so within a side ordering by it is ordering by
 //! bytes. A packed multiply's own in-frame time is not attributable: it dispatches
 //! inside a pass the frame's other steps share, so the run report prices the pass.
+//!
+//! **What it does.** It compiles the shipped predictor frame, then stands one
+//! subject down at a time — each non-multiply kind, the packed multiply's two
+//! encode-time arms, and the gather index-add fold — and pairs every arm against the
+//! shipped frame. Three things make an arm a price rather than a print: its schedule
+//! census is **asserted** against the shipped one (equal for an encode-time arm,
+//! moved for every other), its outputs are checked against the shipped frame's on
+//! the same inputs, and its delta comes from paired rounds with the arm that runs
+//! second alternating. A frame's milliseconds, its `loop_ms` over the cell's frames
+//! and `wins` (the rounds the stood-down arm was faster) are what it prints, and
+//! the file states no price of its own.
+//!
+//! **The reconciliation.** `census reconcile` puts the measured frame against the
+//! sums the harness already prints — the multiply stream at the shapes' marginal
+//! rates, the savings the priced arms collect, and what stays unattributed — so the
+//! chain's total comes from the frame the harness measures rather than from a
+//! per-dispatch price times a dispatch count. Each arm is a delta against the
+//! shipped frame, so their sum is an upper bound on the part they explain, not a
+//! partition. Attention is a **bound, not a saving**: its only switch changes the
+//! arrangement rather than the dispatch count, so the kind is closed as bounded,
+//! not priced. What each kind's arm does to the graph is in the arms table below.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -17,21 +38,26 @@ use std::sync::Arc;
 use mahbot_inference::graphs;
 use mahbot_inference::loader::{self, Pair, Role};
 use rlx_ir::quant::QuantScheme;
-use rlx_ir::{DType, Graph, NodeId, Op, Shape, Tick};
-use rlx_runtime::{Device, Session};
+use rlx_ir::{Graph, NodeId, Op, Tick};
+use rlx_runtime::Device;
 
 mod support;
+
+use mahbot_inference::synth::MAX_CODEC_ROWS;
+use support::{
+    arm_once, arm_outputs, call_of, frame_arm, greatest, last_dim, least, median, packed_ramp,
+    ramped_inputs, step_census, steps_for, zero_inputs,
+};
 
 /// The body's cache capacity: any capacity builds the same multiplies.
 const BODY_CAPACITY: usize = 330;
 /// Packed bytes one harness call streams, before the shape's own step count is
-/// rounded down to whole copies and capped. The stream cell
-/// (`rlx-wgpu/tests/gguf_one_row_stream_rate.rs`) carries 214-302 MB a call, and
-/// the rate a shape reaches rises with the call it is measured in.
-const HARNESS_TARGET_BYTES: u64 = 224 * 1024 * 1024;
-/// A ceiling on the small call's copies — the marginal leg carries twice as many —
-/// so a small shape does not compile a graph of thousands of steps.
-const HARNESS_MAX_STEPS: usize = 256;
+/// rounded down to whole copies and capped. Larger than the shared
+/// [`support::TARGET_BYTES`] (96 MiB) on purpose: this census prices every shape in
+/// the models against the stream cell
+/// (`rlx-wgpu/tests/gguf_one_row_stream_rate.rs`, 214-302 MB a call), so its call
+/// carries the same bytes and its rates are comparable with that cell's.
+const CENSUS_TARGET_BYTES: u64 = 224 * 1024 * 1024;
 /// Rounds a shape's two calls are alternated in; the marginal rate is the median
 /// of the paired differences, a difference of two calls being already robust to a
 /// level shift, where the least of them would report the quietest round.
@@ -39,6 +65,11 @@ const HARNESS_ROUNDS: usize = 5;
 /// The frame's own wall time is the least of its rounds — the least perturbed
 /// sample of one whole frame.
 const FRAME_ROUNDS: usize = 5;
+/// Rounds each ablation's two arms alternate in. One frame's run-to-run spread is
+/// several times the effect, so a single pair cannot resolve it; the median of
+/// this many paired differences either separates a 0.1-0.5 ms effect or bounds
+/// it, and the win count is the sign test that says which.
+const PAIR_ROUNDS: usize = 25;
 
 fn pair(role: Role) -> Option<Arc<Pair>> {
     let Ok(dir) = loader::models_dir() else {
@@ -80,14 +111,6 @@ struct Site {
     k: usize,
     n: usize,
     bytes: u64,
-}
-
-fn last_dim(shape: &Shape) -> usize {
-    shape
-        .dims()
-        .last()
-        .expect("a multiply has a rank")
-        .unwrap_static()
 }
 
 /// Every packed multiply of `graph` in node order, live or not: the second
@@ -142,93 +165,6 @@ fn gbps(bytes: f64, ms: f64) -> f64 {
     bytes / (ms / 1000.0) / 1e9
 }
 
-fn least(mut samples: Vec<f64>) -> f64 {
-    samples.sort_by(|a, b| a.partial_cmp(b).expect("timings compare"));
-    samples[0]
-}
-
-fn median(mut samples: Vec<f64>) -> f64 {
-    samples.sort_by(|a, b| a.partial_cmp(b).expect("timings compare"));
-    samples[samples.len() / 2]
-}
-
-/// One packed weight's bytes, generated rather than quantized: a deterministic
-/// ramp with the f16 scale fields pinned to a finite exponent, the shape
-/// `rlx-wgpu/tests/common/mod.rs::packed_gguf_weight` uses. Only the timing is
-/// read, so the values need only be finite.
-fn packed_ramp(scheme: QuantScheme, len: usize) -> Vec<u8> {
-    let block_bytes = scheme.gguf_block_bytes() as usize;
-    // Byte offsets within a block whose high half is an f16 exponent: Q4_K's `d`
-    // and `dmin` at its head, Q6_K's `d` at its tail, Q8_0's `d` at its head.
-    let f16_high: &[usize] = match scheme {
-        QuantScheme::GgufQ4K => &[1, 3],
-        QuantScheme::GgufQ6K => &[209],
-        QuantScheme::GgufQ8_0 => &[1],
-        other => panic!("{other:?} has no packed ramp"),
-    };
-    let mut state = 7u32;
-    (0..len)
-        .map(|i| {
-            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-            let byte = (state >> 24) as u8;
-            if f16_high.contains(&(i % block_bytes)) {
-                0x08 | (byte & 0x03)
-            } else {
-                byte & 0x3F
-            }
-        })
-        .collect()
-}
-
-/// One call of `steps` copies of the same packed multiply over one row: the
-/// compiled call and its input row, ready to be timed. Its outputs are checked once
-/// against `steps` and `n` when it is built.
-struct Call {
-    compiled: rlx_runtime::CompiledGraph,
-    input: Vec<f32>,
-}
-
-fn call_of(scheme: QuantScheme, k: usize, n: usize, bytes: &[u8], steps: usize) -> Call {
-    let len = bytes.len();
-    let mut g = Graph::new(format!("census_{scheme}_{k}x{n}_{steps}"));
-    let x = g.input("x", Shape::new(&[1, k], DType::F32));
-    let mut outs = Vec::with_capacity(steps);
-    for step in 0..steps {
-        let w = g.param(format!("w{step}"), Shape::new(&[len], DType::U8));
-        outs.push(g.add_node(
-            Op::DequantMatMul { scheme },
-            vec![x, w],
-            Shape::new(&[1, n], DType::F32),
-        ));
-    }
-    g.set_outputs(outs);
-    let mut compiled = Session::new(Device::Gpu).compile(g);
-    for step in 0..steps {
-        compiled.set_param_typed(&format!("w{step}"), bytes, DType::U8);
-    }
-    let input: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.001).sin()).collect();
-    let mut call = Call { compiled, input };
-    let out = call.run();
-    assert_eq!(out.len(), steps, "one output per priced multiply");
-    assert!(
-        out.iter()
-            .all(|row| row.len() == n && row.iter().all(|v| v.is_finite())),
-        "harness {scheme} k={k} n={n}: every output row is {n} finite values"
-    );
-    call
-}
-
-impl Call {
-    fn run(&mut self) -> Vec<Vec<f32>> {
-        self.compiled.run(&[("x", self.input.as_slice())])
-    }
-    fn ms(&mut self) -> f64 {
-        let start = Tick::now();
-        let _ = self.run();
-        Tick::now().elapsed_ns(start) as f64 / 1e6
-    }
-}
-
 /// One shape's isolated rates, `(call, marginal)` in GB/s, from two calls of the
 /// same multiply at `steps` and `2 * steps` copies, alternated inside every round so
 /// drift lands on both alike. A call carries its run's fixed cost — one submission,
@@ -246,9 +182,9 @@ fn harness_rate(scheme: QuantScheme, k: usize, n: usize, packed_len: u64) -> Opt
         return None;
     }
     let bytes = packed_ramp(scheme, packed_len as usize);
-    let steps = ((HARNESS_TARGET_BYTES / packed_len.max(1)) as usize).clamp(1, HARNESS_MAX_STEPS);
-    let mut small = call_of(scheme, k, n, &bytes, steps);
-    let mut large = call_of(scheme, k, n, &bytes, 2 * steps);
+    let steps = steps_for(packed_len, CENSUS_TARGET_BYTES);
+    let mut small = call_of(scheme, k, n, 1, &bytes, steps);
+    let mut large = call_of(scheme, k, n, 1, &bytes, 2 * steps);
     let mut small_ms = Vec::with_capacity(HARNESS_ROUNDS);
     let mut added_ms = Vec::with_capacity(HARNESS_ROUNDS);
     for _ in 0..HARNESS_ROUNDS {
@@ -258,7 +194,7 @@ fn harness_rate(scheme: QuantScheme, k: usize, n: usize, packed_len: u64) -> Opt
         added_ms.push(b - a);
     }
     let total = (steps as u64 * packed_len) as f64;
-    let (call_ms, added_ms) = (least(small_ms), median(added_ms));
+    let (call_ms, added_ms) = (least(&small_ms), median(&added_ms));
     let (call, marginal) = (gbps(total, call_ms), gbps(total, added_ms));
     println!(
         "census harness scheme={scheme} k={k} n={n} packed={packed_len} steps={steps} \
@@ -269,30 +205,80 @@ fn harness_rate(scheme: QuantScheme, k: usize, n: usize, packed_len: u64) -> Opt
     Some((call, marginal))
 }
 
-/// The frame's own wall time: every graph input filled with zeros, one warm run,
-/// then [`FRAME_ROUNDS`] timed runs, the least.
-fn frame_ms(compiled: &mut graphs::Compiled) -> f64 {
-    let inputs: Vec<(String, Vec<f32>)> = compiled
-        .runner
-        .graph
-        .nodes()
-        .iter()
-        .filter_map(|node| match &node.op {
-            Op::Input { name } => Some((
-                name.clone(),
-                vec![0f32; node.shape.num_elements().expect("a static input shape")],
-            )),
-            _ => None,
-        })
-        .collect();
-    compiled.runner.run(&inputs);
-    let mut samples = Vec::with_capacity(FRAME_ROUNDS);
-    for _ in 0..FRAME_ROUNDS {
-        let start = Tick::now();
-        compiled.runner.run(&inputs);
-        samples.push(Tick::now().elapsed_ns(start) as f64 / 1e6);
+/// Two arms of one frame in one paired window: `rounds` pairs with the arm that runs
+/// second alternating, so a level shift or a warm-state drift lands on both arms.
+/// Each run installs its arm's own switch values, so a run-time switch is the
+/// arm's at the dispatch. Returns each arm's rounds and their per-round
+/// differences, `b - a`.
+fn paired_frame(
+    a: &mut graphs::Compiled,
+    a_set: &[(&str, &str)],
+    a_in: &[(String, Vec<f32>)],
+    b: &mut graphs::Compiled,
+    b_set: &[(&str, &str)],
+    b_in: &[(String, Vec<f32>)],
+    rounds: usize,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    arm_once(a, a_set, a_in);
+    arm_once(b, b_set, b_in);
+    let (mut a_ms, mut b_ms, mut diffs) = (Vec::new(), Vec::new(), Vec::with_capacity(rounds));
+    for round in 0..rounds {
+        let (x, y) = if round % 2 == 0 {
+            (arm_once(a, a_set, a_in), arm_once(b, b_set, b_in))
+        } else {
+            let y = arm_once(b, b_set, b_in);
+            let x = arm_once(a, a_set, a_in);
+            (x, y)
+        };
+        a_ms.push(x);
+        b_ms.push(y);
+        diffs.push(y - x);
     }
-    least(samples)
+    (a_ms, b_ms, diffs)
+}
+
+/// The largest difference between two arms' output lists, element for element: a
+/// stand-down's value witness, with the codes themselves compared by the caller.
+fn output_delta(a: &[Vec<f32>], b: &[Vec<f32>]) -> f64 {
+    assert_eq!(a.len(), b.len(), "both arms produce the same outputs");
+    let mut max_abs = 0f64;
+    for (x, y) in a.iter().zip(b) {
+        assert_eq!(x.len(), y.len(), "both arms' outputs have one width");
+        for (u, v) in x.iter().zip(y) {
+            max_abs = max_abs.max((u - v).abs() as f64);
+        }
+    }
+    max_abs
+}
+
+/// One paired window's line: both arms' medians, the paired difference's median and
+/// spread, the stood-down arm's wins, and what the difference is worth over the
+/// cell's own 330 generated frames -- a per-frame figure, not a per-level one.
+fn print_pair(subject: &str, a_ms: &[f64], b_ms: &[f64], diffs: &[f64]) {
+    let delta = median(diffs);
+    println!(
+        "census pair subject={subject} rounds={} shipped_ms={:.3} {subject}_ms={:.3} \
+         median_delta_ms={:+.3} min_delta_ms={:+.3} max_delta_ms={:+.3} \
+         {subject}_wins={}/{} loop_ms={:+.1}",
+        diffs.len(),
+        median(a_ms),
+        median(b_ms),
+        delta,
+        least(diffs),
+        greatest(diffs),
+        diffs.iter().filter(|d| **d < 0.0).count(),
+        diffs.len(),
+        delta * MAX_CODEC_ROWS as f64,
+    );
+}
+
+fn frame_ms(compiled: &mut graphs::Compiled, switches: &[(&str, &str)]) -> f64 {
+    let inputs = zero_inputs(&compiled.runner.graph);
+    arm_once(compiled, switches, &inputs);
+    let samples: Vec<f64> = (0..FRAME_ROUNDS)
+        .map(|_| arm_once(compiled, switches, &inputs))
+        .collect();
+    least(&samples)
 }
 
 /// The body's resident plane-cache step, which is the path the synthesis loop
@@ -313,10 +299,25 @@ fn resident_plane_ms(
         .nodes()
         .iter()
         .filter_map(|node| match &node.op {
-            Op::Input { name } if matches!(name.as_str(), "x" | "cos" | "sin" | "mask") => Some((
-                name.clone(),
-                vec![0f32; node.shape.num_elements().expect("a static input shape")],
-            )),
+            Op::Input { name } if matches!(name.as_str(), "x" | "cos" | "sin" | "mask") => {
+                let len = node.shape.num_elements().expect("a static input shape");
+                let values = if name == "mask" {
+                    // The step's own mask: rows `0..row` carry the history the
+                    // cell has written and the spare slot (`len - 1`) is this
+                    // step's own query, exactly as the loop feeds it. Zeros left
+                    // over that would make the step skip every key the plane
+                    // holds and price an empty cache.
+                    let mut m = vec![0f32; len];
+                    for v in &mut m[..row.min(len)] {
+                        *v = 1.0;
+                    }
+                    m[len - 1] = 1.0;
+                    m
+                } else {
+                    vec![0f32; len]
+                };
+                Some((name.clone(), values))
+            }
             _ => None,
         })
         .collect();
@@ -336,7 +337,7 @@ fn resident_plane_ms(
         run(compiled);
         samples.push(Tick::now().elapsed_ns(start) as f64 / 1e6);
     }
-    least(samples)
+    least(&samples)
 }
 
 /// One shape family's row of the census. `bytes` is the family's whole-frame
@@ -525,22 +526,33 @@ fn the_synthesis_loops_per_shape_rate_census_with_models() {
 
     // The synthesis body: a plane-cache decode step at one row, fed the way the
     // loop feeds it — the per-layer planes resident, only this step's row crossing.
-    let body = graphs::body_capacity_chain_planes(pair.body.clone(), BODY_CAPACITY)
-        .expect("build the plane-cache decode body");
-    let mut body = graphs::Compiled::new(Device::Gpu, body).expect("compile the body");
+    // The shipped switch values are installed across the body's build, compile and
+    // runs, as they are for the predictor arms: a run-time switch is read at the
+    // dispatch, so an ambient one would otherwise move this row without moving the
+    // label it is recorded under.
     let (layers, hkv) = {
         let cfg = pair.body.config();
         (cfg.layers, cfg.kv_heads * cfg.head_dim)
     };
-    let k = vec![vec![0f32; (BODY_CAPACITY + 1) * hkv]; layers];
-    let v = vec![vec![0f32; (BODY_CAPACITY + 1) * hkv]; layers];
-    assert!(
-        body.runner.resident_cache_planes(&k, &v),
-        "the body took the resident plane cache"
-    );
+    let mut body = {
+        let _switch = rlx_ir::env::RuntimeOverrides::install(support::FRAME_SWITCHES);
+        let body = graphs::body_capacity_chain_planes(pair.body.clone(), BODY_CAPACITY)
+            .expect("build the plane-cache decode body");
+        let mut body = graphs::Compiled::new(Device::Gpu, body).expect("compile the body");
+        let k = vec![vec![0f32; (BODY_CAPACITY + 1) * hkv]; layers];
+        let v = vec![vec![0f32; (BODY_CAPACITY + 1) * hkv]; layers];
+        assert!(
+            body.runner.resident_cache_planes(&k, &v),
+            "the body took the resident plane cache"
+        );
+        body
+    };
     let row = BODY_CAPACITY / 2;
     let reads = graphs::plane_step_reads(layers);
-    let body_ms = resident_plane_ms(&mut body, row, hkv, &reads);
+    let body_ms = {
+        let _switch = rlx_ir::env::RuntimeOverrides::install(support::FRAME_SWITCHES);
+        resident_plane_ms(&mut body, row, hkv, &reads)
+    };
     // The step's own row, and the two outputs it reads — the hidden row and the
     // logits; the `2 · layers` cache rows stay device-side.
     println!(
@@ -554,27 +566,156 @@ fn the_synthesis_loops_per_shape_rate_census_with_models() {
     // The predictor frame: one whole sixteen-level walk, reported per level.
     let steps = graphs::code_predictor_steps(&pair.sound).expect("predictor head count");
     let (top_k, top_p, temperature) = pair.body.sampling();
-    let frame = graphs::tts_code_predictor_frame(
-        pair.sound.clone(),
-        steps + 1,
-        graphs::SampleSpec {
-            top_k,
-            top_p,
-            temperature,
-            seed: 12345,
-        },
-    )
-    .expect("build the frame graph");
-    let mut frame = graphs::Compiled::new(Device::Gpu, frame).expect("compile the frame");
-    let frame_ms = frame_ms(&mut frame);
+    let spec = graphs::SampleSpec {
+        top_k,
+        top_p,
+        temperature,
+        seed: 12345,
+    };
+    // Each subject stood down against the shipped frame in one paired window, its
+    // own census printed and asserted against the shipped schedule, and its outputs
+    // checked against the shipped frame's on the same inputs. The arms, in table
+    // order, and what each stands down:
+    //
+    //   gather_index_bias  the gather index-add fold — the one arm a lowering
+    //                      fusion makes, so its stand-down *adds* the fold's step
+    //                      back rather than removing one
+    //   residual_ln_tee    `fused_residual_ln_tee` -> a binary add and a
+    //                      `layer_norm` each
+    //   norm_rope          `norm_rope` -> a norm and a `rope` each
+    //   gated_product      `fused_swiglu` -> `narrow`, an activation and a
+    //                      `binary` multiply each
+    //   rms_norm           `fused_residual_rms_norm` -> a binary add and a rms
+    //                      norm each
+    //   attention          the many-row dense arrangement's multiplies, mask and
+    //                      softmax
+    //   concat             the concat, run on the host
+    //   multiply_setup     the packed multiply's cached uniform and bind group,
+    //                      read when the pass is encoded
+    //   multiply_inplace   the packed multiply's in-place store, stood down to
+    //                      the pooled slab and its copy
+    //
+    // The sampler is not an arm: `Argmax` is the same dispatch count as `Sample`,
+    // so its stand-down would price a kernel rather than a dispatch, and a greedy
+    // draw is not the frame's values. One arm beyond the shipped frame is resident
+    // at a time: each is built, censused, valued, paired, dropped.
+    let (mut shipped, shipped_set) = frame_arm(&pair, steps + 1, spec, &[]);
+    // Every stand-down must leave the frame computing the same thing: its outputs
+    // are checked against the shipped frame's on the same inputs, against
+    // [`VALUE_BAR`], and the max difference is printed as the arm's witness — the
+    // fusions' own sums are the same products in another order, not another
+    // operation. `saving` is whether the delta is a saving the shipped form
+    // collects (a fusion the frame keeps, a store it makes in place) or a bound on
+    // the shipped form's worth (the attention arrangement): the two do not add up.
+    // The arms whose switch acts when the pass is encoded rather than at the
+    // lowering: they change what the frame dispatches, not the schedule it
+    // compiled, so the census must be the shipped one.
+    const ENCODE_TIME_ARMS: [&str; 2] = ["multiply_setup", "multiply_inplace"];
+    let arms: [(&str, &[(&str, &str)], bool); 9] = [
+        (
+            "gather_index_bias",
+            &[("RLX_WGPU_NO_GATHER_INDEX_BIAS", "1")],
+            true,
+        ),
+        ("residual_ln_tee", &[("RLX_WGPU_NO_LN_TEE", "1")], true),
+        ("norm_rope", &[("RLX_WGPU_NO_NORM_ROPE", "1")], true),
+        ("gated_product", &[("RLX_WGPU_NO_FUSED_SWIGLU", "1")], true),
+        ("rms_norm", &[("RLX_WGPU_NO_FUSED_RESIDUAL_RMS", "1")], true),
+        // A bound on the shipped arrangement's worth, not a saving: at `1` a
+        // one-row step takes the many-row form, which no frame would ship.
+        ("attention", &[("RLX_WGPU_ATTN_DENSE_ONE_ROW", "1")], false),
+        ("concat", &[("RLX_WGPU_CONCAT_HOST", "1")], true),
+        ("multiply_setup", &[("RLX_WGPU_GEMV_POOL", "0")], true),
+        ("multiply_inplace", &[("RLX_WGPU_GEMV_IN_PLACE", "0")], true),
+    ];
+    let shipped_in = zero_inputs(&shipped.runner.graph);
+    let values_in = ramped_inputs(&shipped.runner.graph);
+    let shipped_steps = shipped
+        .runner
+        .schedule_step_names()
+        .expect("wgpu reports its schedule");
+    println!(
+        "census steps side=predictor arm=shipped steps={} kinds={}",
+        shipped_steps.len(),
+        step_census(&shipped_steps)
+    );
+    let mut priced: Vec<(&str, f64)> = Vec::with_capacity(arms.len());
+    let mut bound: Vec<(&str, f64)> = Vec::new();
+    // The bar a stand-down's outputs are held to: another summation order of the
+    // same products, never another operation. The pins in `reference.rs` accept a
+    // moved digest as a witness; here the witness is the max difference printed
+    // beside it.
+    const VALUE_BAR: f64 = 1e-4;
+    let shipped_census = step_census(&shipped_steps);
+    for (subject, set, saving) in arms {
+        let (mut arm, arm_set) = frame_arm(&pair, steps + 1, spec, set);
+        let names = arm
+            .runner
+            .schedule_step_names()
+            .expect("wgpu reports its schedule");
+        let census = step_census(&names);
+        let moved = names.len() != shipped_steps.len() || census != shipped_census;
+        println!(
+            "census steps side=predictor arm={subject} stood_down steps={} kinds={census} \
+             schedule={}",
+            names.len(),
+            if moved { "changed" } else { "as_shipped" },
+        );
+        assert_eq!(
+            moved,
+            !ENCODE_TIME_ARMS.contains(&subject),
+            "{subject}: a lowering stand-down must move the schedule and an encode-time one \
+             must not ({} steps against the shipped {shipped_census})\n{census}",
+            names.len(),
+        );
+        let a_out = arm_outputs(&mut shipped, &shipped_set, &values_in);
+        let b_out = arm_outputs(&mut arm, &arm_set, &values_in);
+        let max_abs = output_delta(&a_out, &b_out);
+        assert!(
+            a_out
+                .iter()
+                .chain(b_out.iter())
+                .all(|out| out.iter().all(|v| v.is_finite())),
+            "{subject}: every output value is finite"
+        );
+        println!(
+            "census values side=predictor subject={subject} outputs={} max_abs={max_abs:.3e} \
+             codes_equal={}",
+            a_out.len(),
+            a_out.first() == b_out.first(),
+        );
+        assert!(
+            max_abs <= VALUE_BAR && a_out.first() == b_out.first(),
+            "{subject}: the stand-down moved the frame's values (max |delta| {max_abs:e})"
+        );
+        let arm_in = zero_inputs(&arm.runner.graph);
+        let (a_ms, b_ms, diffs) = paired_frame(
+            &mut shipped,
+            &shipped_set,
+            &shipped_in,
+            &mut arm,
+            &arm_set,
+            &arm_in,
+            PAIR_ROUNDS,
+        );
+        print_pair(subject, &a_ms, &b_ms, &diffs);
+        let delta = median(&diffs);
+        if saving {
+            priced.push((subject, delta));
+        } else {
+            bound.push((subject, delta));
+        }
+        drop(arm);
+    }
+    let shipped_ms = frame_ms(&mut shipped, &shipped_set);
     rows.extend(side_rows(
         "predictor",
-        &mut frame,
+        &mut shipped,
         steps + 1,
         ceiling.read_gb_s,
-        frame_ms,
+        shipped_ms,
     ));
-    drop(frame);
+    drop(shipped);
 
     // One harness run per distinct (scheme, k, n): the same bytes at one shape's
     // own rate.
@@ -593,21 +734,88 @@ fn the_synthesis_loops_per_shape_rate_census_with_models() {
         row.marginal_gbps = rate.map(|(_, marginal)| marginal);
     }
 
-    // What the frame's own measured time is made of: the multiplies at the rates
-    // they reach in isolation, and the rest — attention, the norms, the sampling
-    // and every dispatch around them, which no multiply form can move.
+    // What the frame's own measured time is made of, as two arms. The chained
+    // arm is the frame itself: every multiply waits on the norms, the
+    // rotation, the attention and the draw before it, at the frame's own shapes.
+    // The back-to-back arm is the same shapes at the marginal rate their own call
+    // reaches with independent inputs (`harness_rate`). Both rates are taken over
+    // the bytes an arm could drive — a shape the adapter cannot hold has no
+    // back-to-back rate, so its bytes are out of both sums and `bytes_not_driven`
+    // says how much of the frame the gap is not talking about — and the chained
+    // share is the frame's time at the bytes rate `frame_share_ms` attributes every
+    // per-shape figure with, because a shared pass makes one multiply's own
+    // in-frame time unattributable.
     for side in ["body", "predictor"] {
         let side_rows: Vec<&Row> = rows.iter().filter(|row| row.side == side).collect();
-        let frame_ms = side_rows[0].frame_ms;
-        let levels = side_rows[0].levels;
+        let Some(first) = side_rows.first() else {
+            continue;
+        };
+        let (frame_ms, levels) = (first.frame_ms, first.levels);
+        let per_level = frame_ms / levels as f64;
+        let bytes: u64 = side_rows.iter().map(|row| row.bytes).sum();
+        let driven: u64 = side_rows
+            .iter()
+            .filter(|row| row.marginal_ms().is_some())
+            .map(|row| row.bytes)
+            .sum();
+        let not_driven = side_rows
+            .iter()
+            .filter(|row| row.marginal_ms().is_none())
+            .count();
         let marginal: f64 = side_rows.iter().filter_map(|row| row.marginal_ms()).sum();
         let stream: f64 = side_rows.iter().map(|row| row.stream_ms()).sum();
+        let chained_ms = per_level * driven as f64 / bytes as f64;
+        // A shape the adapter cannot hold has no back-to-back rate, so a side with
+        // none of them driven has no rate and no gap to divide by.
+        if driven == 0 {
+            println!(
+                "census explain side={side} per_level_ms={per_level:.3} \
+                 shapes_not_driven={not_driven} bytes_not_driven={} note=no_shape_driven",
+                bytes - driven,
+            );
+            continue;
+        }
         println!(
-            "census explain side={side} per_level_ms={:.3} marginal_sum_ms={marginal:.3} \
-             stream_sum_ms={stream:.3} other_ms={:.3}",
-            frame_ms / levels as f64,
-            frame_ms / levels as f64 - marginal,
+            "census explain side={side} per_level_ms={per_level:.3} \
+             marginal_sum_ms={marginal:.3} marginal_sum_GBps={:.1} stream_sum_ms={stream:.3} \
+             other_ms={:.3} gap_pct={:.1} shapes_not_driven={not_driven} bytes_not_driven={}",
+            gbps(driven as f64, marginal),
+            per_level - marginal,
+            100.0 * (chained_ms - marginal) / chained_ms,
+            bytes - driven,
         );
+        if side == "predictor" {
+            // The chain's accounting in one frame's milliseconds, all of it the
+            // harness's own: the frame it measured, the multiply stream at the
+            // shapes' marginal rates over the same levels, and the arms it paired.
+            // The `priced` arms are savings the shipped frame collects, and each is
+            // a delta against the shipped frame, so their sum is an upper bound on
+            // the part they explain — they overlap in the dispatch setup each
+            // re-pays. `unattributed_ms` is what the frame still spends that no
+            // saving moved: the non-multiply kernels' own work, attention's above
+            // all. The `bound` arm is not a saving to subtract: it is the shipped
+            // form's worth against a worse arrangement of the same operation.
+            let multiply = marginal * levels as f64;
+            let priced_ms: f64 = priced.iter().map(|(_, d)| *d).sum();
+            let unattributed = frame_ms - multiply - priced_ms;
+            println!(
+                "census reconcile side={side} frame_ms={frame_ms:.3} levels={levels} \
+                 multiply_ms={multiply:.3} remainder_ms={:.3} priced_ms={priced_ms:+.3} \
+                 unattributed_ms={unattributed:+.3} unattributed_pct={:.1} arms=[{}] bound=[{}]",
+                frame_ms - multiply,
+                100.0 * unattributed / frame_ms,
+                priced
+                    .iter()
+                    .map(|(subject, d)| format!("{subject}:{d:+.3}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                bound
+                    .iter()
+                    .map(|(subject, d)| format!("{subject}:{d:+.3}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
     }
 
     for row in &rows {

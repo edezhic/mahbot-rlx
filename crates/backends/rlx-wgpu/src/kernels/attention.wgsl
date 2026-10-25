@@ -19,7 +19,8 @@
 //
 // Inputs all live in the arena as [B, H, S, D] f32 tensors.
 // Mask kinds:
-//   2 = binary key-padding mask (Custom): element < 0.5 → score = -1e9.
+//   2 = binary key-padding mask (Custom): element < BINARY_MASK_KEEP → score =
+//       BINARY_MASK_DROP.
 //   4 = additive bias mask (Bias): score += mask element (e.g. a
 //       block-diagonal window bias carrying 0 / large-negative).
 // Both index the mask via the per-axis mask strides below. Caller is
@@ -67,6 +68,13 @@ const DECODE_DIM_CHUNK: u32 = 32u;
 // per-thread stack, which the Metal compiler spills, and every key iteration
 // then pays a thread-local load and store for it.
 const DECODE_MAX_DIM: u32 = 128u;
+// The binary (kind 2) key-padding mask's pair: the score a dropped key stands for —
+// what `mask_score` writes for it, and what the decode entry's skipped key is scored
+// as instead of its K dot — and the element value below which a key is dropped.
+// Every site reads both from here, because the stand-down is only exact when they
+// agree with `mask_score`'s rule.
+const BINARY_MASK_DROP: f32 = -1e9;
+const BINARY_MASK_KEEP: f32 = 0.5;
 
 // The score a key position contributes after this operation's logit cap and
 // mask: the same cap, sentinels, threshold and window for every entry point
@@ -82,9 +90,9 @@ fn mask_score(score: f32, cap: f32, i: u32, q_abs: u32, kind: u32, window: u32, 
         if (i > q_abs) { out = -3.4e38; }
     } else if (kind == 2u) {
         // BERT-style binary multiplicative mask (1=valid, 0=padding).
-        // Matches CPU/Metal: a position with mask < 0.5 → score driven
-        // to -1e9. Hardcoded 0.5 keeps parity across backends.
-        if (mask < 0.5) { out = -1e9; }
+        // Matches CPU/Metal: a position whose mask is below BINARY_MASK_KEEP is
+        // driven to the drop sentinel.
+        if (mask < BINARY_MASK_KEEP) { out = BINARY_MASK_DROP; }
     } else if (kind == 3u) {
         if (i > q_abs) { out = -3.4e38; }
         else if (q_abs - i > window) { out = -3.4e38; }
@@ -139,7 +147,7 @@ struct Params {
     q_batch_stride: u32, q_head_stride: u32, q_seq_stride: u32,
     // Key-range splits this step runs as (1 = one workgroup per head).
     splits: u32,
-    k_batch_stride: u32, k_head_stride: u32, k_seq_stride: u32, _pad_k: u32,
+    k_batch_stride: u32, k_head_stride: u32, k_seq_stride: u32, skip_masked: u32,
     v_batch_stride: u32, v_head_stride: u32, v_seq_stride: u32, _pad_v: u32,
     o_batch_stride: u32, o_head_stride: u32, o_seq_stride: u32, _pad_o: u32,
 };
@@ -356,56 +364,81 @@ fn attention_decode(
     let hd_v_unrolled = hd_v & ~(DECODE_UNROLL - 1u);
     for (var s: u32 = split * DECODE_LANES + lid; s < params.seq_k;
          s = s + splits * DECODE_LANES) {
-        let k_base = k_bh + s * params.k_seq_stride;
-        var s0: f32 = 0.0;
-        var s1: f32 = 0.0;
-        var s2: f32 = 0.0;
-        var s3: f32 = 0.0;
-        var s4: f32 = 0.0;
-        var s5: f32 = 0.0;
-        var s6: f32 = 0.0;
-        var s7: f32 = 0.0;
-        var s8: f32 = 0.0;
-        var s9: f32 = 0.0;
-        var s10: f32 = 0.0;
-        var s11: f32 = 0.0;
-        var s12: f32 = 0.0;
-        var s13: f32 = 0.0;
-        var s14: f32 = 0.0;
-        var s15: f32 = 0.0;
-        for (var d: u32 = 0u; d < hd_unrolled; d = d + DECODE_UNROLL) {
-            s0 = s0 + dec_q[d] * arena[k_base + d];
-            s1 = s1 + dec_q[d + 1u] * arena[k_base + d + 1u];
-            s2 = s2 + dec_q[d + 2u] * arena[k_base + d + 2u];
-            s3 = s3 + dec_q[d + 3u] * arena[k_base + d + 3u];
-            s4 = s4 + dec_q[d + 4u] * arena[k_base + d + 4u];
-            s5 = s5 + dec_q[d + 5u] * arena[k_base + d + 5u];
-            s6 = s6 + dec_q[d + 6u] * arena[k_base + d + 6u];
-            s7 = s7 + dec_q[d + 7u] * arena[k_base + d + 7u];
-            s8 = s8 + dec_q[d + 8u] * arena[k_base + d + 8u];
-            s9 = s9 + dec_q[d + 9u] * arena[k_base + d + 9u];
-            s10 = s10 + dec_q[d + 10u] * arena[k_base + d + 10u];
-            s11 = s11 + dec_q[d + 11u] * arena[k_base + d + 11u];
-            s12 = s12 + dec_q[d + 12u] * arena[k_base + d + 12u];
-            s13 = s13 + dec_q[d + 13u] * arena[k_base + d + 13u];
-            s14 = s14 + dec_q[d + 14u] * arena[k_base + d + 14u];
-            s15 = s15 + dec_q[d + 15u] * arena[k_base + d + 15u];
-        }
-        var score: f32 = (((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7))) + (((s8 + s9) + (s10 + s11)) + ((s12 + s13) + (s14 + s15)));
-        for (var d: u32 = hd_unrolled; d < hd; d = d + 1u) {
-            score = score + dec_q[d] * arena[k_base + d];
-        }
-        score = score * scale;
-        // Only kinds 2 and 4 read the mask tensor, so the others must not
-        // form a mask address at all.
+        // A binary key-padding mask (kind 2) is the one kind whose masked keys
+        // contribute nothing once the lane's running max has been set by a valid
+        // key: `mask_score` replaces their score with the drop sentinel whatever
+        // the dot product says, so `e_cur` is exactly 0 and `e_old` exactly 1,
+        // and the update below is a no-op bit for bit. Read the mask element
+        // first and stand that key's K dot down (`skip_masked`;
+        // `RLX_WGPU_NO_ATTN_MASK_SKIP` restores it) — this keeps a plane-cache
+        // step's K reads to the rows the mask says were written. Its V read is
+        // not this switch's: the `e_cur == 0` early-out below stands that down
+        // for every mask kind, masked or merely out-weighted.
         var mask_v: f32 = 0.0;
         if (params.mask_kind == 2u || params.mask_kind == 4u) {
             mask_v = arena[mask_partial + s * params.seq_k_stride];
         }
-        score = mask_score(score, cap, s, q_abs, params.mask_kind, params.window, mask_v);
+        let skip_key =
+            params.skip_masked != 0u && params.mask_kind == 2u && mask_v < BINARY_MASK_KEEP;
+        var score: f32 = BINARY_MASK_DROP;
+        if (!skip_key) {
+            let k_base = k_bh + s * params.k_seq_stride;
+            var s0: f32 = 0.0;
+            var s1: f32 = 0.0;
+            var s2: f32 = 0.0;
+            var s3: f32 = 0.0;
+            var s4: f32 = 0.0;
+            var s5: f32 = 0.0;
+            var s6: f32 = 0.0;
+            var s7: f32 = 0.0;
+            var s8: f32 = 0.0;
+            var s9: f32 = 0.0;
+            var s10: f32 = 0.0;
+            var s11: f32 = 0.0;
+            var s12: f32 = 0.0;
+            var s13: f32 = 0.0;
+            var s14: f32 = 0.0;
+            var s15: f32 = 0.0;
+            for (var d: u32 = 0u; d < hd_unrolled; d = d + DECODE_UNROLL) {
+                s0 = s0 + dec_q[d] * arena[k_base + d];
+                s1 = s1 + dec_q[d + 1u] * arena[k_base + d + 1u];
+                s2 = s2 + dec_q[d + 2u] * arena[k_base + d + 2u];
+                s3 = s3 + dec_q[d + 3u] * arena[k_base + d + 3u];
+                s4 = s4 + dec_q[d + 4u] * arena[k_base + d + 4u];
+                s5 = s5 + dec_q[d + 5u] * arena[k_base + d + 5u];
+                s6 = s6 + dec_q[d + 6u] * arena[k_base + d + 6u];
+                s7 = s7 + dec_q[d + 7u] * arena[k_base + d + 7u];
+                s8 = s8 + dec_q[d + 8u] * arena[k_base + d + 8u];
+                s9 = s9 + dec_q[d + 9u] * arena[k_base + d + 9u];
+                s10 = s10 + dec_q[d + 10u] * arena[k_base + d + 10u];
+                s11 = s11 + dec_q[d + 11u] * arena[k_base + d + 11u];
+                s12 = s12 + dec_q[d + 12u] * arena[k_base + d + 12u];
+                s13 = s13 + dec_q[d + 13u] * arena[k_base + d + 13u];
+                s14 = s14 + dec_q[d + 14u] * arena[k_base + d + 14u];
+                s15 = s15 + dec_q[d + 15u] * arena[k_base + d + 15u];
+            }
+            score = (((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7))) + (((s8 + s9) + (s10 + s11)) + ((s12 + s13) + (s14 + s15)));
+            for (var d: u32 = hd_unrolled; d < hd; d = d + 1u) {
+                score = score + dec_q[d] * arena[k_base + d];
+            }
+            score = score * scale;
+            score = mask_score(score, cap, s, q_abs, params.mask_kind, params.window, mask_v);
+        }
         let m_new = max(m, score);
         let e_old = exp(m - m_new);
         let e_cur = exp(score - m_new);
+        // A key below the running max by more than f32's exponent adds nothing:
+        // `e_old` is exactly 1 (m did not move) and `e_cur` is exactly 0, so
+        // `l` and `O` are unchanged bit for bit for a finite V. Skipping it also
+        // skips the V read that the update would have multiplied by zero — which
+        // is why a non-finite V at a key the softmax has already out-weighted is
+        // the one thing this early-out changes: it never surfaces. Probability
+        // zero contributes nothing, so the arithmetic stands and the read is not
+        // worth paying; it applies to every mask kind, masked or merely
+        // out-weighted.
+        if (e_cur == 0.0 && m_new == m) {
+            continue;
+        }
         l = e_old * l + e_cur;
         let v_base = v_bh + s * params.v_seq_stride;
         for (var d: u32 = 0u; d < hd_v_unrolled; d = d + DECODE_UNROLL) {

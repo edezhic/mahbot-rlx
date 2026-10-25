@@ -108,6 +108,20 @@ impl WgpuExecutable {
         self.schedule.iter().map(step_name).collect()
     }
 
+    /// Test hook: the `skip_masked` word of every attention step, in compile order
+    /// — the lowering's own output, so a gate can hold the mask-skip switch to
+    /// having reached the kernel rather than to two identical compiles.
+    #[doc(hidden)]
+    pub fn test_attention_skip_masked(&self) -> Vec<u32> {
+        self.schedule
+            .iter()
+            .filter_map(|step| match step {
+                Step::Attention { params, .. } => Some(params.skip_masked),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Test hook: the planned arena size in bytes — the memory plan's visible
     /// half, so a test can pin that a route's scratch reservation did not leak
     /// into a graph whose convolutions never qualify.

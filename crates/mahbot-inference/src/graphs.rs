@@ -1703,6 +1703,18 @@ pub struct DacStage {
 /// `dac.blk.0…3`, `post` (snake + conv).
 pub const DAC_STAGES: usize = 8;
 
+/// The four DAC upsamplers, `(kernel, stride, out channels)`, at stages
+/// [`DAC_UPSAMPLE_STAGE`]`..`[`DAC_UPSAMPLE_STAGE`]` + DAC_UPSAMPLE.len()`. Their
+/// strides are [`dac_stage_io`]'s length ratios and together with the two leading
+/// 2× they make [`samples_per_frame`]; `tests/sound_transpose_form.rs` holds the
+/// table to that geometry.
+pub const DAC_UPSAMPLE: [(usize, usize, usize); 4] =
+    [(16, 8, 768), (10, 5, 384), (8, 4, 192), (6, 3, 96)];
+
+/// The stage [`DAC_UPSAMPLE`]'s first upsampler runs at — the two `up.blk` stages
+/// and the entry convolution before it.
+pub const DAC_UPSAMPLE_STAGE: usize = 3;
+
 /// `(channels, length)` stage `stage` reads when the codec is given `frames`
 /// frames — the shape a group starting at that stage declares as its input, and
 /// the shape a group ending at that stage hands on. Stage [`DAC_STAGES`] is the
@@ -1896,77 +1908,53 @@ impl LayerStage for DacStage {
             ch = 1536;
         }
 
-        for (i, (k, s, c_out)) in [
-            (16usize, 8usize, 768usize),
-            (10, 5, 384),
-            (8, 4, 192),
-            (6, 3, 96),
-        ]
-        .iter()
-        .enumerate()
-        {
-            if !self.stages.contains(&(3 + i)) {
+        for (i, &(k, s, c_out)) in DAC_UPSAMPLE.iter().enumerate() {
+            if !self.stages.contains(&(DAC_UPSAMPLE_STAGE + i)) {
                 continue;
             }
             let p = format!("a.gen.wav.dac.blk.{i}");
             let a = emit::f32_param(ctx, model, &format!("{p}.snake.alpha"), &[1, ch, 1, 1])?;
             let b = emit::f32_param(ctx, model, &format!("{p}.snake.beta"), &[1, ch, 1, 1])?;
             cur = emit::snake_beta(ctx, cur, a, b, ch, l);
-            let (y, l_new) = self.transpose_conv1d(
-                ctx,
-                cur,
-                &format!("{p}.conv.weight"),
-                (ch, *c_out),
-                l,
-                *k,
-                *s,
-            )?;
+            let (y, l_new) =
+                self.transpose_conv1d(ctx, cur, &format!("{p}.conv.weight"), (ch, c_out), l, k, s)?;
             cur = y;
             l = l_new;
-            let bias = emit::conv_bias(ctx, model, &format!("{p}.conv.bias"), *c_out)?;
+            let bias = emit::conv_bias(ctx, model, &format!("{p}.conv.bias"), c_out)?;
             cur = emit::add(ctx, cur, bias);
 
             for (r, dilation) in [1usize, 3, 9].into_iter().enumerate() {
                 let rp = format!("{p}.res.{r}");
                 let a1 =
-                    emit::f32_param(ctx, model, &format!("{rp}.act1.alpha"), &[1, *c_out, 1, 1])?;
+                    emit::f32_param(ctx, model, &format!("{rp}.act1.alpha"), &[1, c_out, 1, 1])?;
                 let b1 =
-                    emit::f32_param(ctx, model, &format!("{rp}.act1.beta"), &[1, *c_out, 1, 1])?;
+                    emit::f32_param(ctx, model, &format!("{rp}.act1.beta"), &[1, c_out, 1, 1])?;
                 let a2 =
-                    emit::f32_param(ctx, model, &format!("{rp}.act2.alpha"), &[1, *c_out, 1, 1])?;
+                    emit::f32_param(ctx, model, &format!("{rp}.act2.alpha"), &[1, c_out, 1, 1])?;
                 let b2 =
-                    emit::f32_param(ctx, model, &format!("{rp}.act2.beta"), &[1, *c_out, 1, 1])?;
-                let h1 = emit::snake_beta(ctx, cur, a1, b1, *c_out, l);
+                    emit::f32_param(ctx, model, &format!("{rp}.act2.beta"), &[1, c_out, 1, 1])?;
+                let h1 = emit::snake_beta(ctx, cur, a1, b1, c_out, l);
                 let c1 = self.conv_conv1d(
                     ctx,
                     h1,
                     &format!("{rp}.conv1.weight"),
-                    *c_out,
+                    c_out,
                     l,
                     7,
                     6 * dilation,
                     1,
                     dilation,
                 )?;
-                let bb = emit::conv_bias(ctx, model, &format!("{rp}.conv1.bias"), *c_out)?;
+                let bb = emit::conv_bias(ctx, model, &format!("{rp}.conv1.bias"), c_out)?;
                 let h1 = emit::add(ctx, c1, bb);
-                let h2 = emit::snake_beta(ctx, h1, a2, b2, *c_out, l);
-                let c2 = self.conv_conv1d(
-                    ctx,
-                    h2,
-                    &format!("{rp}.conv2.weight"),
-                    *c_out,
-                    l,
-                    1,
-                    0,
-                    1,
-                    1,
-                )?;
-                let bb = emit::conv_bias(ctx, model, &format!("{rp}.conv2.bias"), *c_out)?;
+                let h2 = emit::snake_beta(ctx, h1, a2, b2, c_out, l);
+                let c2 =
+                    self.conv_conv1d(ctx, h2, &format!("{rp}.conv2.weight"), c_out, l, 1, 0, 1, 1)?;
+                let bb = emit::conv_bias(ctx, model, &format!("{rp}.conv2.bias"), c_out)?;
                 let h2 = emit::add(ctx, c2, bb);
                 cur = emit::add(ctx, cur, h2);
             }
-            ch = *c_out;
+            ch = c_out;
         }
 
         // The group ends before `post`: it hands its `[1, ch, 1, l]` tensor on.
@@ -2456,6 +2444,13 @@ impl LayerStage for CodePredictorFrameStage {
 /// Build the one-graph frame walk: `[d_talker]` hidden row and `code0` row in,
 /// `steps` drawn codes out. One [`Runner::set_sample_seeds`] + one run is a whole
 /// frame, whatever the level count.
+///
+/// **Exclusion: the frame is one row, not `m`.** A frame graph carrying `m` frames
+/// in flight would read the stack once instead of once a frame, and it is not kept:
+/// the frames are not independent — frame `f`'s codes feed frame `f + 1`, so a
+/// chunk of `m` frames is walked to a fixed point in `m` passes. The measurement
+/// that closed the axis, and the passes it took, are in `MEASUREMENTS.md`'s
+/// dismissed forms.
 pub fn tts_code_predictor_frame(
     model: Arc<Model>,
     capacity: usize,
@@ -3134,6 +3129,22 @@ impl Compiled {
         })
     }
 
+    /// Bytes this graph's parameters occupy: the uploaded f32 copy and the packed
+    /// weights as the file holds them.
+    #[must_use]
+    pub fn params_bytes(&self) -> usize {
+        self.params_f32 + self.params_packed
+    }
+
+    /// Bytes this graph keeps on the device: [`Compiled::params_bytes`] plus its
+    /// planned arena. The arena half is the *plan* ([`Compiled::arena_bytes`]), the
+    /// pre-unfuse figure, which is larger than what the backend allocates — so this
+    /// over-states what a graph holds.
+    #[must_use]
+    pub fn device_bytes(&self) -> usize {
+        self.params_bytes() + self.arena_bytes
+    }
+
     /// The run step: one cold pass (it pays the device's warm-up) and then `reps`
     /// measured passes on the same compiled graph.
     pub fn run(&mut self, inputs: &[(String, Vec<f32>)], reps: usize) -> Outcome {
@@ -3240,9 +3251,66 @@ impl LayerStage for LcToNchwStage {
     }
 }
 
+/// The codec's windows over a part: the DAC stages are convolutional (their
+/// LayerNorm is per position) and causal, so a window with its left margin gives
+/// exactly the whole part's samples over its core, and the planned arena — which
+/// is a graph's — shrinks with the window instead of being the part's.
+///
+/// The window is 144 frames — two of the front's chunks ([`FRONT_WINDOW`]): every
+/// window runs its graph over every frame in it, so a longer window is fewer
+/// graph runs over the same frames, each convolution at twice the columns and for
+/// twice the frames. Doubling again is the same curve's next step and is not
+/// taken, because the arena grows with the window.
+pub const DAC_WINDOW: usize = 144;
+/// The wave transformer's own window: the front is cut at this many frames so
+/// its output does not depend on the part's total length.
+pub const FRONT_WINDOW: usize = 72;
+/// Frames of K/V state a full chunk carries into the next one: the chunk it runs
+/// less the single frame it re-reads. The caller allocates its carry with it.
+pub const FRONT_CARRY: usize = FRONT_WINDOW - 1;
+/// Frames of left context a window's span carries before its core, clipped at the
+/// part's own left edge: the four DAC blocks' kernels and strides reach this far
+/// into a window, so a core sample never reads a window edge the part does not
+/// have. There is no right margin — the decoder is causal, so frames past the core
+/// would produce only outputs the stitch discards.
+pub const DAC_MARGIN: usize = 4;
+
+/// One window's span: the core `[a, b)` extended `left` frames before it and
+/// `right` after, clipped at the part's own edges. [`windows`] uses it with a zero
+/// right margin; a probe that prices a right margin the decoder no longer carries
+/// reads both arms through it, from the one cut.
+pub fn window_span(rows: usize, a: usize, b: usize, left: usize, right: usize) -> (usize, usize) {
+    (a.saturating_sub(left), (b + right).min(rows))
+}
+
+/// Codec windows over the part's frames: `(p0, p1, a, b)` — the span the DAC
+/// graphs read and the core `[a, b)` the stitch keeps. A window's span carries
+/// `margin` frames of left context and none on the right: the decoder is causal
+/// (every convolution pads its left edge and a transposed conv narrows to the
+/// samples it owns), so frames past the core produce outputs `stitch_window`
+/// discards. The first window is not padded past the part's own left edge.
+pub fn windows(rows: usize, window: usize, margin: usize) -> Vec<(usize, usize, usize, usize)> {
+    debug_assert!(margin < window);
+    let mut v = Vec::new();
+    let mut a = 0;
+    if rows > 0 {
+        let b = window.min(rows);
+        let (p0, p1) = window_span(rows, a, b, margin, 0);
+        v.push((p0, p1, a, b));
+        a = b;
+    }
+    while a < rows {
+        let b = (a + window).min(rows);
+        let (p0, p1) = window_span(rows, a, b, margin, 0);
+        v.push((p0, p1, a, b));
+        a = b;
+    }
+    v
+}
+
 /// How the sound half is cut into graphs.
 /// The arena is a graph's, so the cut follows the planned sizes at the window the
-/// sound half actually runs (`synth::DAC_WINDOW`, 144 frames — twice what this cut
+/// sound half actually runs ([`DAC_WINDOW`], 144 frames — twice what this cut
 /// was first drawn at): the front and the codec's first four stages,
 /// stages 4–5, stages 6–7 — three graphs instead of nine. A group whose plan
 /// outgrew the backend's per-binding limit would show up as host routing or arena
@@ -3261,7 +3329,7 @@ pub fn samples_per_frame() -> usize {
 /// One graph of the sound half: the front (codes → the RVQ codebook decode → the
 /// wave transformer → the codec's `[1, C, 1, frames]` input) when the group starts
 /// at the codec's input, then the group's own stages.
-pub fn synthesis_sound_group(
+fn synthesis_sound_group(
     model: Arc<Model>,
     frames: usize,
     stages: std::ops::Range<usize>,
@@ -3305,6 +3373,159 @@ pub fn synthesis_sound_group(
     .output("waveform")
     .build(&mut weights)
     .map_err(Into::into)
+}
+
+/// One compiled sound-half graph, shared between a cache and its users: `Rc`
+/// because a process synthesizes on one thread and a call holds several graphs at
+/// once (a part's first and carried windows), while `Runner::run` takes
+/// `&mut self`. The graph is read many times and rewritten never, and no borrow is
+/// held across a cache call.
+pub type SoundGraph = std::rc::Rc<std::cell::RefCell<Compiled>>;
+
+/// Device bytes a decoder cache may hold, by [`Compiled::device_bytes`] — an arena
+/// is resident for as long as its graph is, so parameters alone would not bound it.
+/// This holds one part's set with the graphs a new length brings; the ceiling that
+/// decides for real is `guard`'s, which reads the resident set.
+const SOUND_GRAPHS_BYTES: usize = 5 * 1024 * 1024 * 1024;
+
+/// What fixes a sound graph: the file it reads, its device, the frames it runs,
+/// its stage group and its K/V prefix. Two requests with the same key want the
+/// same weights in the same graph. For a decoder window `frames` is the span the
+/// graph reads — its core plus the left context — not the core alone.
+#[derive(PartialEq)]
+struct SoundKey {
+    path: std::path::PathBuf,
+    device: rlx_runtime::Device,
+    frames: usize,
+    stages: std::ops::Range<usize>,
+    prefix: usize,
+}
+
+/// The decoder graphs one synthesis call needs, most recently used last. Owned by
+/// whoever synthesizes — [`crate::synth::Synthesis`] in the library, a local of the
+/// synthesis half in the stand — so the graphs are released when that is, and the
+/// process holds one model pair's decoder, not every length it ever ran.
+#[derive(Default)]
+pub struct SoundGraphs {
+    entries: Vec<(SoundKey, SoundGraph)>,
+}
+
+impl SoundGraphs {
+    /// What this cache holds, in the form the probes report and the budget reads:
+    /// `(graphs, parameters, device bytes)`. Parameters are [`Compiled::params_bytes`]
+    /// — pages of the mapped file; the third figure is the cache's own account,
+    /// [`Compiled::device_bytes`] over its graphs. A graph a caller still holds —
+    /// one part's first and carried windows during a call — stays resident after
+    /// eviction, so it is the cache's figure, not the process's.
+    #[must_use]
+    pub fn census(&self) -> (usize, usize, usize) {
+        self.entries
+            .iter()
+            .fold((0, 0, 0), |(n, params, device), (_, g)| {
+                let g = g.borrow();
+                (n + 1, params + g.params_bytes(), device + g.device_bytes())
+            })
+    }
+
+    /// The graph for `frames` frames of `stages` at `prefix`, compiled and uploaded
+    /// on first use and reused after. A hit moves to the newest end, so the graphs
+    /// every request of a length reuses — a part's first and carried windows — are
+    /// the last to be evicted when another length arrives.
+    pub fn graph(
+        &mut self,
+        device: rlx_runtime::Device,
+        model: &Arc<Model>,
+        frames: usize,
+        stages: std::ops::Range<usize>,
+        prefix: usize,
+    ) -> Result<SoundGraph> {
+        let key = SoundKey {
+            path: model.path.clone(),
+            device,
+            frames,
+            stages,
+            prefix,
+        };
+        if let Some(i) = self.entries.iter().position(|(k, _)| *k == key) {
+            let hit = self.entries.remove(i);
+            let graph = hit.1.clone();
+            self.entries.push(hit);
+            return Ok(graph);
+        }
+        // Build first and trim after, so a failed build leaves the cache as it
+        // was. The transient is the whole cache plus this graph, which is one
+        // part's set plus one graph: a graph's arena is only known once it exists,
+        // so the trim below is the bound the budget can actually promise.
+        let graph = std::rc::Rc::new(std::cell::RefCell::new(Compiled::new(
+            device,
+            synthesis_sound_group(model.clone(), frames, key.stages.clone(), prefix)?,
+        )?));
+        self.entries.push((key, graph.clone()));
+        while self.entries.len() > 1 && self.census().2 > SOUND_GRAPHS_BYTES {
+            self.entries.remove(0);
+        }
+        Ok(graph)
+    }
+}
+
+/// A part's wave-transformer graphs: the first window at the part's own length and
+/// the full chunk every later window runs.
+pub struct FrontGraphs {
+    first: SoundGraph,
+    first_len: usize,
+    next: Option<SoundGraph>,
+}
+
+/// The window lengths a part of `frames` runs a graph for: its first window, and
+/// the full chunk every later window runs (a part that does not end on a chunk
+/// boundary pads its last window with code 0, whose outputs the stitch discards).
+/// Two graphs at most, because a graph per tail length costs more to build than
+/// the padded width costs to run (`tests/sound_decoder_cost.rs`).
+fn front_lengths(frames: usize) -> (usize, Option<usize>) {
+    (
+        frames.min(FRONT_WINDOW),
+        (frames > FRONT_WINDOW).then_some(FRONT_WINDOW),
+    )
+}
+
+impl FrontGraphs {
+    /// Build (or fetch) the graphs a part of `frames` runs: its first window and,
+    /// when the part is longer than one chunk, the carried full chunk.
+    pub fn build(
+        cache: &mut SoundGraphs,
+        device: rlx_runtime::Device,
+        model: &Arc<Model>,
+        frames: usize,
+        stages: std::ops::Range<usize>,
+    ) -> Result<Self> {
+        let (first, next) = front_lengths(frames);
+        Ok(Self {
+            first: cache.graph(device, model, first, stages.clone(), 0)?,
+            first_len: first,
+            next: next
+                .map(|len| cache.graph(device, model, len, stages, FRONT_CARRY))
+                .transpose()?,
+        })
+    }
+
+    /// The graph the window at `a` runs and the length it runs over: the first
+    /// window its own length, every later one the full chunk — zero-padded when it
+    /// is the part's last, and the two always agree so a window's input is the
+    /// width its graph declares.
+    #[must_use]
+    pub fn pick(&self, a: usize) -> (&SoundGraph, usize) {
+        if a == 0 {
+            (&self.first, self.first_len)
+        } else {
+            // A window at `a > 0` exists only for a part longer than one chunk, and
+            // `front_lengths` builds the carried graph for exactly those parts — the
+            // invariant its own unit test pins.
+            let next = self.next.as_ref().expect(
+                "a window past the first needs the carried chunk `front_lengths` builds for it",
+            );
+            (next, FRONT_WINDOW)
+        }
+    }
 }
 
 /// The sampler as a graph of **one node**: logits in, drawn ids out
@@ -3604,5 +3825,67 @@ impl rlx_flow::WeightSource for NoWeights {
 
     fn has(&self, _key: &str) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FRONT_WINDOW, front_lengths, windows};
+
+    /// The codec's windows tile the part: every frame falls in exactly one core, a
+    /// core sits inside its span, no span leaves the part or reaches more than one
+    /// left margin before its core — and a span carries no right margin, because
+    /// the groups are causal and a sample past the core is one `stitch_window`
+    /// discards.
+    #[test]
+    fn the_codec_windows_tile_the_part_and_clip_at_its_edges() {
+        for (rows, window, margin) in [
+            (0usize, 144usize, 4usize),
+            (1, 144, 4),
+            (144, 144, 4),
+            (145, 144, 4),
+            (330, 144, 4),
+            (200, 72, 4),
+            (7, 3, 0),
+        ] {
+            let v = windows(rows, window, margin);
+            for w in v.windows(2) {
+                assert_eq!(
+                    w[0].3, w[1].2,
+                    "rows={rows}: a core starts where the last ended"
+                );
+            }
+            for &(p0, p1, a, b) in &v {
+                assert!(
+                    p0 <= a && a < b && b <= p1 && p1 <= rows,
+                    "rows={rows}: core {a}..{b} is not inside its span {p0}..{p1}"
+                );
+                assert!(
+                    p0 + margin >= a && p1 - p0 <= window + margin,
+                    "rows={rows}: span {p0}..{p1} reaches past its core's left margin"
+                );
+            }
+            let covered: Vec<(usize, usize)> = v.iter().map(|w| (w.2, w.3)).collect();
+            assert!(
+                covered.is_empty() || (covered[0].0 == 0 && covered[covered.len() - 1].1 == rows),
+                "rows={rows}: the cores cover the part"
+            );
+        }
+        // The part's own shape: three windows, two of them a full one and the tail
+        // its true 42 frames.
+        assert_eq!(
+            windows(330, 144, 4),
+            vec![(0, 144, 0, 144), (140, 288, 144, 288), (284, 330, 288, 330)]
+        );
+    }
+
+    /// Two graphs at most: a part of one chunk or less has its first window only,
+    /// and every longer part adds the one chunk every later window runs.
+    #[test]
+    fn a_part_runs_two_front_graphs_at_most() {
+        assert_eq!(front_lengths(40), (40, None));
+        assert_eq!(front_lengths(FRONT_WINDOW), (72, None));
+        assert_eq!(front_lengths(FRONT_WINDOW + 1), (72, Some(72)));
+        assert_eq!(front_lengths(330), (72, Some(72)));
     }
 }

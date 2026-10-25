@@ -11,7 +11,7 @@ for.
 <!-- BEGIN stand -->
 ## Per-model measurement (stand)
 
-_Measured 2026-10-24 04:19 UTC._
+_Measured 2026-10-25 01:58 UTC._
 
 | unit | cold ms | warm ms | speech s | s/speech s | loop ms | sound ms | build ms | peak | map | arena | digest |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -20,7 +20,7 @@ _Measured 2026-10-24 04:19 UTC._
 | ear.batch2 | 81.7 | 38.1 | - | - | - | - | 238.0 | 0.83 GiB | 1.53 GiB | 3.6MiB | cc5fcc79e6278b90 |
 | ear.batch4 | 90.1 | 45.4 | - | - | - | - | 273.9 | 0.85 GiB | 1.53 GiB | 3.9MiB | 351492f41141665e |
 | listen | 2501.2 | 2257.6 | 17.460 | 0.129 | - | - | 1290.7 | 2.31 GiB | 1.53 GiB | 1.10GiB | 2f93dfa1d7cdeeb1 |
-| speak | 21823.1 | 20254.7 | 26.400 | 0.767 | 18927.2 | 1327.6 | 1450.7 | 2.42 GiB | 1.38 GiB | 724.6MiB | 231d823496450627 |
+| speak | 15790.0 | 14619.0 | 26.400 | 0.554 | 13460.5 | 1158.5 | 938.4 | 2.42 GiB | 1.38 GiB | 702.9MiB | 231d823496450627 |
 | embed.256 | 104.6 | 68.4 | - | - | - | - | 718.8 | 1.63 GiB | 0.29 GiB | 547.9MiB | ec6e9fa56756e071 |
 | embed.8192 | 2397.4 | 2310.4 | - | - | - | - | 1033.3 | 1.77 GiB | 0.29 GiB | 1.31GiB | bfa0336b63d2e3d0 |
 
@@ -30,18 +30,18 @@ The pinned answers, compared token for token: recognition must reproduce `обы
 
 ### Weight streams, against the machine's streaming ceiling
 
-This run measured no generative cell, so it took no stream reading of its own: the rows below are the run that measured them, restated against the ceiling printed below.
-
-Ceiling, measured on this run's device before the cells: **130.9 GB/s** on a streaming read (129.6–132.2 over 5 rounds) and 129.9 GB/s of total traffic on a streaming copy (129.0–132.1). The read figure is the one the rows below are reported against, because a weight is read and never written; the copy figure is the same probe's other arm, recorded beside it. Both come from `rlx_wgpu::bandwidth::stream_ceiling`: a 64.0 MiB vectorised read and a 64.0 MiB vectorised copy, on `Apple M3 Pro (Metal)`. The same probe after the cells read 132.9 GB/s (132.1–134.2), which is the reading-to-reading spread to hold the figure to.
+Ceiling, measured on this run's device before the cells: **133.7 GB/s** on a streaming read (133.6–134.8 over 5 rounds) and 133.3 GB/s of total traffic on a streaming copy (129.7–133.9). The read figure is the one the rows below are reported against, because a weight is read and never written; the copy figure is the same probe's other arm, recorded beside it. Both come from `rlx_wgpu::bandwidth::stream_ceiling`: a 64.0 MiB vectorised read and a 64.0 MiB vectorised copy, on `Apple M3 Pro (Metal)`. The same probe after the cells read 132.8 GB/s (132.0–133.0), which is the reading-to-reading spread to hold the figure to.
 
 | phase | unit | weight bytes/unit | ms/unit | GB/s | of the read ceiling |
 |---|---|---|---|---|---|
-| recognition decode | one token | 1 100 961 792 | 22.66 | 48.6 | 37.1 % |
-| talker body | one frame | 850 870 272 | 19.91 | 42.7 | 32.6 % |
-| code predictor | one level | 87 109 632 | 2.32 | 37.5 | 28.6 % |
-| sound half | one utterance | 1 348 042 624 | 1327.59 | 1.0 | 0.8 % |
+| recognition decode | one token | 1 100 961 792 | 22.66 | 48.6 | 36.4 % |
+| talker body | one frame | 850 870 272 | 13.75 | 61.9 | 46.3 % |
+| code predictor | one level | 87 109 632 | 1.67 | 52.2 | 39.0 % |
+| sound half | one utterance | 1 348 042 624 | 1158.55 | 1.2 | 0.9 % |
 
 Each row's numerator is the graph's own parameter bytes — packed and f32 — which its multiplies and convolutions read once per unit, and only operands that are parameters count; a graph that read one of them twice per unit would move more, and one that read a slice would move less. `talker body` is one frame, `code predictor` one of a frame's sixteen projecting levels (the frame's stream and time divided by the levels it walks), `sound half` the utterance's windows summed with the graph each window actually ran, and `recognition decode` one generated token. The figure in each row is the run whose warm figure is the table's.
+
+A row this run did not measure is carried from the run that took it — its `ms` and `GB/s` are that run's — and only its percentage is taken against the ceiling above, which is this run's probe.
 
 Provenance:
 
@@ -49,18 +49,18 @@ Provenance:
 - device: Apple M3 Pro (Metal)
 - driver: unknown
 - profile: release
-- code: 1654bb26 change-sha256 1bc65fe07f71478c (the commit and the SHA-256 of the tree's own difference from it — `MEASUREMENTS.md` excluded, because the run that measures rewrites it, and `crates/backends/rlx-mlx-sys` excluded, because the vendored MLX checkout is not this fork's content — which together are the content that produced these figures; a clean tree's digest is `e3b0c44298fc1c14`, the hash of an empty diff)
-- rows: this run measured embed.256, embed.8192; every other row is carried from an earlier run of this file, and its figures belong to the run that took them — the `code` line above is this run's tree, not theirs. A carried row keeps its weight-stream row and the artefact lines of the run that took it
+- code: 6c677c2d change-sha256 cad0432c0f8c1ba8 (the commit and the SHA-256 of the tree's own difference from it — `MEASUREMENTS.md` excluded, because the run that measures rewrites it, and `crates/backends/rlx-mlx-sys` excluded, because the vendored MLX checkout is not this fork's content — which together are the content that produced these figures; a clean tree's digest is `e3b0c44298fc1c14`, the hash of an empty diff)
+- rows: this run measured speak; every other row is carried from an earlier run of this file, and its figures belong to the run that took them — the `code` line above is this run's tree, not theirs. A carried row keeps its weight-stream row and the artefact lines of the run that took it
 - thermal: unknown (pmset -g therm printed no CPU limit line) (`pmset -g therm`, the reading `scripts/check-throttle.sh` gates on)
-- load: 3.27 3.08 3.24 (1/5/15-min) at the start, 3.08 3.04 3.21 at the table; every cell line carries its own `load=`
-- swap: 7103 MiB in use at the start, 0 MiB grown during the run (ceiling 1024 MiB)
-- command: `mahbot-inference 7 6` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`, article from `MAHBOT_EMBED_TEXT`)
-- model: `embeddinggemma-2-Q8_0.gguf` · 309855456 bytes · sha256 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135 · url https://huggingface.co/ggml-org/embeddinggemma-2-GGUF · revision 58faf90940886df2d62be555c8765d00dac362c5
-- voice: `voice-sample.wav` · 558764 bytes · sha256 0ca6c18b9189381dcdad83d26814f73b3f4d2d26dea6892371c2177d30e72ace
+- load: 1.91 2.17 2.71 (1/5/15-min) at the start, 1.45 1.93 2.55 at the table; every cell line carries its own `load=`
+- swap: 7238 MiB in use at the start, 0 MiB grown during the run (ceiling 6000 MiB, raised by `MAHBOT_STAND_MAX_SWAP_MIB` from its default 1024)
+- command: `mahbot-inference 5` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`, article from `MAHBOT_EMBED_TEXT`)
 - model: `Qwen3-ASR-1.7B-Q4_K_M.gguf` · 1282435552 bytes · sha256 3893b8926065bbff3da7586d21d8711a9b4fa4fa8f12cd0cefad58e31b2660b6
 - model: `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf` · 355709344 bytes · sha256 46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d
 - model: `Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf` · 1035965280 bytes · sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
 - model: `mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` · 446422912 bytes · sha256 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2
+- voice: `voice-sample.wav` · 558764 bytes · sha256 0ca6c18b9189381dcdad83d26814f73b3f4d2d26dea6892371c2177d30e72ace
+- model: `embeddinggemma-2-Q8_0.gguf` · 309855456 bytes · sha256 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135 · url https://huggingface.co/ggml-org/embeddinggemma-2-GGUF · revision 58faf90940886df2d62be555c8765d00dac362c5
 - text: `atlantic.txt` · 52785 bytes · sha256 df0eb1cd6ed0844698e1b63bc34698f2c3591650fede12d4d58e2c48ce0bdc0f · https://en.wikipedia.org/w/index.php?title=Atlantic_Ocean&oldid=1381231733 (revision 1381231733) · fetched with `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&format=json&formatversion=2&revids=1381231733` · cells: `embed.8192` first 5846 words (37543 bytes, sha256 40ee7e6f2fa3f530f018d05e3538314ab9c9656b829d4654eb52a7810faaba3c) and `embed.256` 195 words from `Large quantities of basalt erupted at this time period` (1251 bytes, sha256 727dccf3fdbd6460acd836ef132e0679f2904206f940df20b10c2cbcd47ce960) · the text itself is not committed
 <!-- END stand -->
 
@@ -74,17 +74,37 @@ the rest keep the figures of the run that took them.
 
 ### The cell, unit by unit
 
-- `speak` — the table row's `loop ms` plus `sound ms`: 18 927.2 + 1 327.6 ms, so
-  the generation loop is 93 % of the cell. The wave is
-  `231d823496450627`, the round trip above is equal, the logits
-  `a3936281c1f046a0`, the hidden row `f1d93d9e91eaabf9`, and the waveform is
-  inside the PCM range with `nonfinite=0`, `maxabs=5.27e-2`. The exactness claims
-  are the round trip's transcript and the parity cells
-  (`gguf_gemv_wide_arm` against the CPU arm, 6.7e-6…3.9e-5), not the digest: the
-  digest is a pin, and it was last moved by the snake fold (one dispatch for the
-  chain, its product grouped as `beta·(s·s)`, at most one count of the 638-count
-  peak on 29 of 153 600 samples) and by the norms' 16 B loads with a 256-lane
-  tree (their summation order).
+- `speak` — the row above and the run's own lines, nothing between them: the
+  generation loop is the cell (`loop ms` against `sound ms`), the waveform digest
+  `231d823496450627`, the round trip equal. The block below is what the run
+  printed: the first of the three repeats' `residency` line (each repeat prints
+  one), the run's own summary `speak` and `build_ms` lines, and the witness lines
+  all three repeats agree on. The row's four figures are the medians of the three
+  (spreads: `cold` 7.6 ms, `warm` 15.8, `build` 98.8, `peak` 0.003 GiB).
+  Two items were dropped, each priced on the
+  decoder's own graphs by `tests/sound_decoder_cost.rs` (one subject per process):
+  the DAC windows' right margin, **6.0 (5.1–8.8) ms** at 148→144 frames and
+  **5.8 (4.7–6.0) ms** at 152→148 on group 4-6, **3.4 (2.4–4.1)** and
+  **3.0 (1.6–4.3) ms** at the same two windows on group 6-8 — **18.2 ms** an
+  utterance, 9/9 rounds on every window — and a front graph of the tail's own
+  length, which builds in **89.5–103.5 ms** (medians of 7 alternating rounds in
+  this session's two readings, spreads reaching 88.9–1 585.0) — one window's
+  figure: the same probe on this tree has read 89–170 ms across windows — against
+  the **19.7 ms** (9/9, spread 18.9–20.4) a padded last window costs to run. The
+  build is the quantity that recurs and the padding the one that pays it off, so
+  a one-shot request loses by the first and a repeated length does not pay it.
+  **Known gap:** the shipping library path is the wake-word bench's corpus in one
+  process, and that steady state — retained graphs against the guard's ceiling —
+  has not been run.
+
+  ```
+  speak residency start_mb=185.4 prefill_mb=1429.5 body_mb=1538.6 loop_graphs_mb=2556.9 sound_graphs_mb=922.7 peak_mb=2604.5 map_mb=1482.4
+  speak cold=15790.0 warm=14619.0 s_per_s=0.554 loop_ms=13460.5 sound_ms=1158.5 peak=2.42 map=1.38 cold_spread=7.6 warm_spread=15.8 peak_spread=0.003
+  build_ms 938.4 build_spread=98.8
+  witness speak rows=330/330 samples=633600/633600 waveform_digest=231d823496450627/231d823496450627 prompt_digest=fb160ff9665b4331/fb160ff9665b4331 equal=true
+  witness speak-roundtrip wave=raw transcript_sha256=f2e47729461ad4c95ed9c0c441a65ab5700613338c5132935945adfa8537b164/f2e47729461ad4c95ed9c0c441a65ab5700613338c5132935945adfa8537b164 equal=true
+  ```
+
 - `listen` — 2 257.6 ms, **0.129 s per second of speech**, inside the frozen
   figure's ±3 % band, with its transcript and `2f93dfa1d7cdeeb1` unchanged. The
   weight-stream row reads 22.66 ms a token at 48.6 GB/s.
@@ -161,15 +181,15 @@ the rest keep the figures of the run that took them.
   against both figures and refuses anything else. The text itself is not
   committed.
 
-Each row of the weight-stream table divides that graph's own parameter bytes —
-the ones a node reaching an output reads — by the ms the same run took for one
-unit; the percentage is that quotient over the read ceiling the same run measured
-before the cells. `peak` and `build ms` are that table's own columns; both follow
-the process and the graph rather than a change, and across this machine's records
-both move between runs of one tree. The `speak` row's `peak` (2.42 GiB) is
-inside the high-water every record of this tree carries (2.42–2.43 GiB); it is
-one of the rows this run did not measure, so it and its peak are the run that
-took them, as the `rows` line above says.
+Each row of the weight-stream table divides that graph's own parameter bytes — the
+ones a node reaching an output reads — by the ms the same run took for one unit; the
+percentage is that quotient over the ceiling at the head of this table — its own
+run's for a row this run measured, this section's for a carried row. Every `_mb`
+figure in this file is decimal MB (÷10⁶); every GiB one is bytes
+÷ 2³⁰ — `peak` is the cell process's own `ru_maxrss`, `map` the two model files it
+mapped, and `arena` prints its own MiB/GiB — labelled once here. `peak` and
+`build ms` follow the machine more than the graph: both move between runs of one
+tree, and the summary line carries each run's own spread.
 
 ### The sound half's convolution blocks
 
@@ -191,7 +211,7 @@ apart from the arithmetic rate rather than as traffic.
 | stages 6-8 | 394.2 | 368.2 | 0.93 | 62 | 59 |
 
 The three blocks are one session's window split, and that session's sound half read
-1 265.3 ms with a 121.5 GB/s read probe; this stand's sound half reads 1 327.6 ms on
+1 265.3 ms with a 121.5 GB/s read probe; this stand's sound half reads 1 158.5 ms on
 a box whose probe read the figure at the head of its own table, so the two are read
 against their own probes and not subtracted from one another.
 
@@ -215,10 +235,11 @@ row where the attention reads it (`Arena::finish_plan`'s placement), so the fram
 has no copy dispatch and no second pass over the arena. The predictor's frame is
 1 315 steps at a 4 KiB median.
 
-`RLX_WGPU_DBG_COUNTERS=1` splits the body frame — 433 frames of one run, in a
-window of its own; the switch adds a fence and a per-step census, and this
-record's `body_stream_ms` reads 19.91 without it, so the two are not subtracted —
-into **19.27 ms of wall** (p10–p90 19.21–23.38), **18.17 ms of device time**, in
+`RLX_WGPU_DBG_COUNTERS=1` splits the body frame in a counter run of its own — 433
+frames of one run, with the switch's fence and per-step census inside its wall, so
+its per-frame figure is not this table's 13.75 ms and the two are not subtracted
+from one another — into
+**19.27 ms of wall** (p10–p90 19.21–23.38), **18.17 ms of device time**, in
 **6 dispatch passes**,
 `encode` 2.87 ms, one `wait` of 16.11 ms and 0.01 ms of readback. So the frame is
 94 % device and **wall − device = 1.10 ms**. Its steps, by kind: `dequant_matmul_gguf:169`,
@@ -247,10 +268,10 @@ flat at 23.52/40.77 against 23.44/40.63).
 `tests/gemm_ceiling.rs::synthesis_ceiling` measures the same forms in a joined
 call of 32–128 steps: body 78.7 GB/s and predictor 90.2 GB/s on that session's box.
 This record's cell reads the loop's own bytes — 850 870 272 B a body frame and
-87 109 632 B a predictor level — at **42.7 and 37.5 GB/s** (19.91 ms a body
-frame and 2.32 ms a predictor level), so in situ the loop runs **1.8× (body) and
-2.4× (predictor) below what the same forms reach when their dispatches are back to
-back**. The predictor's multiplies are the harness table's Q8_0 forms at
+87 109 632 B a predictor level — at the weight-stream table's **61.9 and
+52.2 GB/s** (13.75 ms a body frame and 1.67 ms a predictor level), so in situ the
+loop runs **1.27× (body) and 1.73× (predictor) below what the same forms reach when
+their dispatches are back to back**. The predictor's multiplies are the harness table's Q8_0 forms at
 `k = 1 024` — one level is
 `n = 2 048` (attention out, head, proj_in), `3 072` (down), `4 096` (qkv) and
 `6 144` (gate+up) over four blocks — which read 79.7–102.2 GB/s in that table; the
@@ -260,8 +281,8 @@ dependent `layer_norm`/`rope`/`attention` chain between the multiplies — not o
 memory system.
 
 At the packings' own arithmetic intensity — 3.56 FLOP/B for Q4_K, 2.44 for Q6_K
-and 1.88 for Q8_0 — that is **0.070 TFLOP/s for the predictor's Q8_0 stream in
-situ** and 0.104–0.152 for the body's, against 0.12–0.37 across the harness table
+and 1.88 for Q8_0 — that is **0.098 TFLOP/s for the predictor's Q8_0 stream in
+situ** and 0.151–0.220 for the body's, against 0.12–0.37 across the harness table
 (the predictor's own widths 0.15–0.19) and the sound half's 0.93–1.92. The
 multiply's ceiling here is bytes over a dependent chain, not arithmetic: at this
 row's width the work is one output slab a workgroup, and neither the X side nor
@@ -360,8 +381,11 @@ these is in the tree.
 | contraction split across workgroups (knob since removed) | same bytes slower at every form and monotonically with split: 51.3 → 36.7 → 24.2 GB/s at 1/2/4 |
 | cross-window dispatch join; two whole multiplies in one dispatch | built, flat, removed |
 | middle one-row partition (two columns a subgroup, two rows a lane) | harness Q4_K 63.0 → 67.6 GB/s (0.224 → 0.240 TFLOP/s), Q8_0 68.0 → 71.5 (0.128 → 0.135) at n = 2 048; in situ flat (predictor 36.96/36.49 → 37.25 ms) |
+| the packed multiply re-rowed — one kernel decoding once for 2..16 rows | 3.2–5.9× slower than the per-row arm at sixteen rows; not kept |
+| the code predictor's frame as one graph over `m` frames in flight | `m = 16` read the stack once — 230.1 ms for sixteen frames, 14.4 ms a frame against 26.4 ms for a one-row frame — but frame `f`'s codes feed frame `f + 1`, so a chunk of `m` frames needs `m` passes: 4 passes on 82 of 83 chunks at `m = 4`, 8 on 41 of 42 at `m = 8`, the loop 3.5× and 5.9× the serial walk |
 | splitting the predictor's fused qkv at the code level | +1.9 % |
 | `RLX_WGPU_ALL_PARAMS_WEIGHT=1` | 129 and 281 ms for the body and predictor frames against 23 and 41 |
+| the decoder's transposed convs as phase panels onto the existing f32 multiply — `s` multiplies of `[c_out, 2·c_in]` by one shared `[2·c_in, l]` panel | block 330.5 → 412.1 ms over the cell's three windows, a **+24.7 %** time change (81.6 ms slower); the panel's rates come first — 0.777/0.713/0.544/0.343 TFLOP/s against the shipped `ConvTranspose2d` step's 0.802/0.841/0.754/0.450 — so the panel is 0.9 / 5.8 / 13.9 / 14.2 ms slower a form, and 7–142 MB a form (`tests/sound_transpose_form.rs`) |
 
 <!-- BEGIN bench -->
 ## Wake-word bench
