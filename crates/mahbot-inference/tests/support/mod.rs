@@ -167,10 +167,20 @@ pub fn arm_outputs(
     compiled.runner.run(inputs)
 }
 
-/// [`filled_inputs`] at a deterministic non-zero ramp: a value check on all-zero
-/// inputs would compare two draws off a degenerate distribution.
+/// The harnesses' deterministic non-zero ramp, one row: a value check on all-zero
+/// inputs would compare two draws off a degenerate distribution, and a denormal or
+/// a NaN would change what the arithmetic costs.
+pub fn ramped_row(len: usize) -> Vec<f32> {
+    (0..len).map(ramped_at).collect()
+}
+
+fn ramped_at(i: usize) -> f32 {
+    ((i as f32) * 0.0007 - 0.31).sin()
+}
+
+/// [`filled_inputs`] at [`ramped_row`]'s ramp.
 pub fn ramped_inputs(graph: &Graph) -> Vec<(String, Vec<f32>)> {
-    inputs_with(graph, |i| ((i as f32) * 0.0007 - 0.31).sin())
+    inputs_with(graph, ramped_at)
 }
 
 /// One run of a compiled frame, in milliseconds.

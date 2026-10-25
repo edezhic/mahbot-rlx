@@ -11,7 +11,7 @@ for.
 <!-- BEGIN stand -->
 ## Per-model measurement (stand)
 
-_Measured 2026-10-25 10:46 UTC._
+_Measured 2026-10-25 13:02 UTC._
 
 | unit | cold ms | warm ms | speech s | s/speech s | loop ms | sound ms | build ms | peak | map | arena | digest |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -19,7 +19,7 @@ _Measured 2026-10-25 10:46 UTC._
 | ear.075 | 73.0 | 32.1 | - | - | - | - | 213.1 | 0.84 GiB | 1.53 GiB | 3.4MiB | a8ed106ea43eeb60 |
 | ear.batch2 | 81.7 | 38.1 | - | - | - | - | 238.0 | 0.83 GiB | 1.53 GiB | 3.6MiB | cc5fcc79e6278b90 |
 | ear.batch4 | 90.1 | 45.4 | - | - | - | - | 273.9 | 0.85 GiB | 1.53 GiB | 3.9MiB | 351492f41141665e |
-| listen | 2127.9 | 1745.1 | 17.460 | 0.100 | - | - | 1274.9 | 2.31 GiB | 1.53 GiB | 1.10GiB | 2f93dfa1d7cdeeb1 |
+| listen | 1990.6 | 1784.2 | 17.460 | 0.102 | - | - | 1201.0 | 2.31 GiB | 1.53 GiB | 1.10GiB | 2f93dfa1d7cdeeb1 |
 | speak | 15874.6 | 14165.7 | 26.400 | 0.537 | 12986.1 | 1179.6 | 1766.7 | 2.42 GiB | 1.38 GiB | 702.9MiB | 9d837a9c4164ba94 |
 | embed.256 | 99.3 | 66.7 | - | - | - | - | 727.1 | 1.63 GiB | 0.29 GiB | 547.9MiB | ec6e9fa56756e071 |
 | embed.8192 | 2388.6 | 2322.6 | - | - | - | - | 1147.8 | 1.77 GiB | 0.29 GiB | 1.31GiB | bfa0336b63d2e3d0 |
@@ -30,16 +30,18 @@ The pinned answers: recognition must reproduce `обычные объявлен�
 
 ### Weight streams, against the machine's streaming ceiling
 
-Ceiling, measured on this run's device before the cells: **135.3 GB/s** on a streaming read (133.9–135.9 over 5 rounds) and 133.9 GB/s of total traffic on a streaming copy (133.0–134.1). The read figure is the one the rows below are reported against, because a weight is read and never written; the copy figure is the same probe's other arm, recorded beside it. Both come from `rlx_wgpu::bandwidth::stream_ceiling`: a 64.0 MiB vectorised read and a 64.0 MiB vectorised copy, on `Apple M3 Pro (Metal)`. The same probe after the cells read 128.5 GB/s (127.9–129.3), which is the reading-to-reading spread to hold the figure to.
+Ceiling, measured on this run's device before the cells: **120.2 GB/s** on a streaming read (114.4–133.0 over 5 rounds) and 128.9 GB/s of total traffic on a streaming copy (126.7–130.0). The read figure is the one the rows below are reported against, because a weight is read and never written; the copy figure is the same probe's other arm, recorded beside it. Both come from `rlx_wgpu::bandwidth::stream_ceiling`: a 64.0 MiB vectorised read and a 64.0 MiB vectorised copy, on `Apple M3 Pro (Metal)`. The same probe after the cells read 130.7 GB/s (130.0–131.9), which is the reading-to-reading spread to hold the figure to.
 
 | phase | unit | weight bytes/unit | ms/unit | GB/s | of the read ceiling |
 |---|---|---|---|---|---|
-| recognition decode | one token | 1 100 961 792 | 15.84 | 69.5 | 51.4 % |
-| talker body | one frame | 850 870 272 | 13.49 | 63.1 | 46.6 % |
-| code predictor | one level | 87 109 632 | 1.59 | 54.8 | 40.5 % |
-| sound half | one utterance | 1 348 042 624 | 1179.58 | 1.1 | 0.8 % |
+| recognition decode | one token | 1 100 961 792 | 16.25 | 67.8 | 56.4 % |
+| talker body | one frame | 850 870 272 | 13.49 | 63.1 | 52.5 % |
+| code predictor | one level | 87 109 632 | 1.59 | 54.8 | 45.6 % |
+| sound half | one utterance | 1 348 042 624 | 1179.58 | 1.1 | 0.9 % |
 
 Each row's numerator is the graph's own parameter bytes — packed and f32 — which its multiplies and convolutions read once per unit, and only operands that are parameters count; a graph that read one of them twice per unit would move more, and one that read a slice would move less. `talker body` is one frame, `code predictor` one of a frame's sixteen projecting levels (the frame's stream and time divided by the levels it walks), `sound half` the utterance's windows summed with the graph each window actually ran, and `recognition decode` one generated token. The figure in each row is the run whose warm figure is the table's.
+
+A row this run did not measure is carried from the run that took it — its `ms` and `GB/s` are that run's — and only its percentage is taken against the ceiling above, which is this run's probe.
 
 Provenance:
 
@@ -47,18 +49,18 @@ Provenance:
 - device: Apple M3 Pro (Metal)
 - driver: unknown
 - profile: release
-- code: c53125de change-sha256 54291d908f5a4696 (the commit and the SHA-256 of the tree's own difference from it — `MEASUREMENTS.md` excluded, because the run that measures rewrites it, and `crates/backends/rlx-mlx-sys` excluded, because the vendored MLX checkout is not this fork's content — which together are the content that produced these figures; a clean tree's digest is `e3b0c44298fc1c14`, the hash of an empty diff)
-- rows: this run measured listen, speak, embed.256, embed.8192; every other row is carried from an earlier run of this file, and its figures belong to the run that took them — the `code` line above is this run's tree, not theirs. A carried row keeps its weight-stream row and the artefact lines of the run that took it
+- code: f2aee4e3 change-sha256 58ba805d00aa3161 (the commit and the SHA-256 of the tree's own difference from it — `MEASUREMENTS.md` excluded, because the run that measures rewrites it, and `crates/backends/rlx-mlx-sys` excluded, because the vendored MLX checkout is not this fork's content — which together are the content that produced these figures; a clean tree's digest is `e3b0c44298fc1c14`, the hash of an empty diff)
+- rows: this run measured listen; every other row is carried from an earlier run of this file, and its figures belong to the run that took them — the `code` line above is this run's tree, not theirs. A carried row keeps its weight-stream row and the artefact lines of the run that took it
 - thermal: unknown (pmset -g therm printed no CPU limit line) (`pmset -g therm`, the reading `scripts/check-throttle.sh` gates on)
-- load: 2.48 2.88 4.09 (1/5/15-min) at the start, 2.65 2.76 3.80 at the table; every cell line carries its own `load=`
-- swap: 5848 MiB in use at the start, 529 MiB grown during the run (ceiling 6000 MiB, raised by `MAHBOT_STAND_MAX_SWAP_MIB` from its default 1024)
-- command: `mahbot-inference 4 5 6 7` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`, article from `MAHBOT_EMBED_TEXT`)
+- load: 2.57 2.27 2.36 (1/5/15-min) at the start, 2.96 2.41 2.41 at the table; every cell line carries its own `load=`
+- swap: 3982 MiB in use at the start, 0 MiB grown during the run (ceiling 1024 MiB)
+- command: `mahbot-inference 4` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`, article from `MAHBOT_EMBED_TEXT`)
 - model: `Qwen3-ASR-1.7B-Q4_K_M.gguf` · 1282435552 bytes · sha256 3893b8926065bbff3da7586d21d8711a9b4fa4fa8f12cd0cefad58e31b2660b6
 - model: `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf` · 355709344 bytes · sha256 46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d
 - model: `Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf` · 1035965280 bytes · sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
 - model: `mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` · 446422912 bytes · sha256 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2
-- model: `embeddinggemma-2-Q8_0.gguf` · 309855456 bytes · sha256 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135 · url https://huggingface.co/ggml-org/embeddinggemma-2-GGUF · revision 58faf90940886df2d62be555c8765d00dac362c5
 - voice: `voice-sample.wav` · 558764 bytes · sha256 0ca6c18b9189381dcdad83d26814f73b3f4d2d26dea6892371c2177d30e72ace
+- model: `embeddinggemma-2-Q8_0.gguf` · 309855456 bytes · sha256 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135 · url https://huggingface.co/ggml-org/embeddinggemma-2-GGUF · revision 58faf90940886df2d62be555c8765d00dac362c5
 - text: `article.txt` · 52785 bytes · sha256 df0eb1cd6ed0844698e1b63bc34698f2c3591650fede12d4d58e2c48ce0bdc0f · https://en.wikipedia.org/w/index.php?title=Atlantic_Ocean&oldid=1381231733 (revision 1381231733) · fetched with `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&format=json&formatversion=2&revids=1381231733` · cells: `embed.8192` first 5846 words (37543 bytes, sha256 40ee7e6f2fa3f530f018d05e3538314ab9c9656b829d4654eb52a7810faaba3c) and `embed.256` 195 words from `Large quantities of basalt erupted at this time period` (1251 bytes, sha256 727dccf3fdbd6460acd836ef132e0679f2904206f940df20b10c2cbcd47ce960) · the text itself is not committed
 <!-- END stand -->
 
