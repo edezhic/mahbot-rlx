@@ -17,25 +17,143 @@ use rlx_ir::{Graph, NodeId, Op, Shape};
 use rlx_opt::memory::MemoryPlan;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Process-wide reuse of weight buffers across prefill/decode compiles.
 /// Prefill + decode each used to allocate a full ~2 GiB weight copy and OOM
 /// VirtIO/DX12 (~8 GiB hostmem). Same **named** weight layout → share the GPU
-/// allocation (params are re-uploaded on compile).
+/// allocation.
 ///
-/// Disable with `RLX_WGPU_SHARE_WEIGHTS=0`. Fingerprint includes sorted
-/// `(param_name, nbytes, offset)` so unrelated packages with coincidentally
-/// similar byte cursors do not share buffers.
+/// One entry per **declared sharing scope** ([`set_param_sharing_scope`]), so two
+/// models' graphs keep their own allocation instead of thrashing one buffer; scope 0
+/// — no scope declared — keeps the single-entry behaviour this had before scoping.
+/// Within one entry a parameter is still re-uploaded on compile *unless* the entry's
+/// [`slots`](Self::slots) name that same scope for the exact offset, which is the
+/// re-upload a second compile of the same model skips.
+///
+/// Disable with `RLX_WGPU_SHARE_WEIGHTS=0`, which turns off the sharing and the skip
+/// together. Fingerprint includes sorted `(param_name, nbytes, offset)` so unrelated
+/// packages with coincidentally similar byte cursors do not share buffers.
 struct SharedWeightBuffers {
-    /// FNV-ish fingerprint of layout + param names/sizes.
-    fingerprint: u64,
+    /// Process-unique stamp for this allocation. An arena skips a weight write only
+    /// while the live entry for its scope still carries the generation it adopted, so
+    /// an evicted and re-created entry can never make a compile skip bytes that are
+    /// not where it thinks they are.
+    generation: u64,
     first: wgpu::Buffer,
     extras: Vec<wgpu::Buffer>,
     shard_size: usize,
     logical_bytes: usize,
+    /// Byte offset in the weight buffer → the scope whose compile wrote it. An offset
+    /// the scope never wrote is not skippable, which is why the first compile for a
+    /// scope uploads everything.
+    slots: HashMap<usize, u64>,
 }
 
-static SHARED_WEIGHTS: Mutex<Option<SharedWeightBuffers>> = Mutex::new(None);
+/// How many shared weight allocations are kept, and how many bytes they may hold
+/// together: each entry can be a whole body, so counting entries alone would let a
+/// handful of them pin several GiB for the life of the process. A further allocation
+/// evicts the **oldest** entries — [`SharedWeightBuffers::generation`] order, never the
+/// one being allocated for, whose buffers the compile in flight is about to use.
+const MAX_SHARED_WEIGHT_SCOPES: usize = 8;
+const MAX_SHARED_WEIGHT_BYTES: usize = 3 << 30;
+
+/// One shared allocation per **layout**, not per model: a prefill graph and a decode
+/// graph of the same body park different parameter sets (the head is a prefill
+/// parameter), so one buffer per scope would have the two layouts replace each other on
+/// every compile and reuse nothing.
+type SharedWeightMap = HashMap<(u64 /*scope*/, u64 /*layout fingerprint*/), SharedWeightBuffers>;
+
+fn shared_weights() -> &'static Mutex<SharedWeightMap> {
+    static SHARED_WEIGHTS: OnceLock<Mutex<SharedWeightMap>> = OnceLock::new();
+    SHARED_WEIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+thread_local! {
+    /// Caller-declared model identity for the compiles made on this thread. 0 = none
+    /// declared, and then no write is ever skipped. Thread-local rather than
+    /// process-wide: a compile declares its scope and lowers in one call, so a
+    /// concurrent compile on another thread declares its own instead of crossing this
+    /// one's — two compiles of two models cannot then attribute each other's bytes.
+    static WEIGHT_SCOPE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Hands out [`SharedWeightBuffers::generation`].
+static WEIGHT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Weight-buffer bytes, and the number of weight writes, this process skipped
+/// because a compile for the same scope had already placed them.
+static SHARED_WEIGHT_SKIPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+static SHARED_WEIGHT_SKIPPED_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// Derive a scope id from a label: FNV-1a, with the low bit set so a label never
+/// hashes to 0 (which means "no scope declared"). Byte-for-byte what
+/// `rlx_cuda::vmem::set_scope_from_label` does, so one label names one model on
+/// either backend.
+fn scope_from_label(label: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in label.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h | 1
+}
+
+/// Declare which compiles belong to one model, so a later compile of a graph with
+/// the same weight layout skips re-uploading weights an earlier one already placed
+/// in the shared weight buffer.
+///
+/// This is a *soundness* obligation, not a hint: parameter content arrives later
+/// through `set_param`, so nothing in a graph establishes that two compiles' `w` are
+/// the same tensor. Pass a stable label per model (a weights path works well); an
+/// empty label clears the scope and makes every compile upload again. Compiles under
+/// different labels each get their own weight allocation. The declaration is the
+/// calling thread's, and a compile lowers on the thread that declared it.
+///
+/// Needs `RLX_WGPU_SHARE_WEIGHTS` left on (the default). With it at `0` there is no
+/// shared buffer to skip a write into, and nothing here has any effect.
+pub fn set_param_sharing_scope(label: &str) {
+    let scope = if label.is_empty() {
+        0
+    } else {
+        scope_from_label(label)
+    };
+    WEIGHT_SCOPE.with(|cell| cell.set(scope));
+}
+
+/// Drop every shared weight allocation, so a compile after this one uploads the
+/// weights it needs and no compile skips a write. A caller that measures what a first
+/// compile costs — a cold start — empties this first: an entry left by an earlier
+/// compile of the same model would otherwise price the upload at nothing.
+pub fn clear_shared_weights() {
+    shared_weights()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// Whether the caller declared a sharing scope, so several compiles of one model are
+/// expected to share its weights: the signal that makes the plan park them in the
+/// shared weight buffer ([`Arena::from_plan_split`]).
+pub fn param_sharing_declared() -> bool {
+    weight_scope() != 0 && share_weights_enabled()
+}
+
+/// The current sharing scope (0 = none declared).
+fn weight_scope() -> u64 {
+    WEIGHT_SCOPE.with(std::cell::Cell::get)
+}
+
+/// Weight-buffer bytes and weight writes this process skipped because a compile for
+/// the same [`set_param_sharing_scope`] had already placed them. Monotonic, so a
+/// test takes a delta around the second compile.
+pub fn shared_weight_skip_stats() -> (u64, u64) {
+    (
+        SHARED_WEIGHT_SKIPPED_BYTES.load(Ordering::Relaxed),
+        SHARED_WEIGHT_SKIPPED_WRITES.load(Ordering::Relaxed),
+    )
+}
 
 fn weight_layout_fingerprint(
     weight_cursor: usize,
@@ -985,6 +1103,15 @@ pub struct Arena {
     pub weight_shard_size: usize,
     /// Per-node byte offset into the logical weight buffer (quant / parked).
     pub weight_offsets: HashMap<NodeId, usize>,
+    /// The shared entry this arena adopted — `((scope, layout fingerprint), generation)`
+    /// — when a scope was declared, sharing was on, and the allocation came from that
+    /// entry. It is what lets a write skip bytes the scope's earlier compile already
+    /// placed there, so `None` means this arena owns what it writes.
+    pub weight_share: Option<((u64, u64), u64)>,
+    /// Weight-buffer offsets this arena has written itself. A param re-set on the
+    /// same executable must land, so an offset in here is never skipped: the scope
+    /// only speaks for bytes *another* compile for the same model wrote.
+    pub(crate) weight_written: Mutex<HashSet<usize>>,
     /// Per-node, the slot the plan assigned ([`plan_node_slots`]) — the bytes a
     /// staged read of that node's operand has to fit. Distinct from [`Self::lens`],
     /// which `compile_static_inner` overwrites with the node's *actual* byte length
@@ -1453,6 +1580,8 @@ impl Arena {
             weight_extra_shards: Vec::new(),
             weight_shard_size: 0,
             weight_offsets: HashMap::new(),
+            weight_share: None,
+            weight_written: Mutex::new(HashSet::new()),
             plan_slots,
             param_slots: HashMap::new(),
         }
@@ -1513,7 +1642,26 @@ impl Arena {
                 param_bytes_est = param_bytes_est.saturating_add(weight_param_bytes(dt, ne));
             }
         }
+        // A declared sharing scope says several compiles of one model share these
+        // weights, and only a parked parameter lives in the shared buffer a later compile
+        // can skip. Only a fused multiply binds that buffer directly, though: any other
+        // op reaches a parked parameter by staging it into the act window, which costs
+        // more than the upload it saved (measured: a parked conv encoder's first run is
+        // 5.8× the unparked one). So a scope parks the params a fused multiply consumes
+        // and leaves the rest in the act arena.
+        let fused_params: HashSet<NodeId> = if param_sharing_declared() {
+            graph
+                .nodes()
+                .iter()
+                .filter(|node| matches!(&node.op, Op::DequantMatMul { .. }))
+                .filter_map(|node| node.inputs.get(1).copied())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let park_for_sharing = !fused_params.is_empty() && param_bytes_est <= weight_shard_cap;
         let park_all_params = rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
+            || park_for_sharing
             || ((new_plan.arena_size + param_bytes_est + scratch_aligned) > bind_cap
                 // Multi-shard weight buffers (~2 GiB × N) OOM on VirtIO/WARP
                 // and other adapters whose *total* GPU budget is ≈ one
@@ -1584,7 +1732,7 @@ impl Arena {
                 && !keep_in_act
                 && (packed_quant
                     || nbytes > LARGE_F32_PARAM
-                    || park_all_params
+                    || (park_all_params && (!park_for_sharing || fused_params.contains(&id)))
                     || fill_weight_shard);
             if to_weight {
                 if nbytes > weight_shard_cap {
@@ -1710,12 +1858,13 @@ impl Arena {
             named_weight_slots.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
             let fp = weight_layout_fingerprint(weight_cursor, &named_weight_slots);
             let shard_size = if n_shards > 1 { weight_shard_cap } else { 0 };
+            let scope = weight_scope();
+            let key = (scope, fp);
             let reused = if share_weights_enabled() {
-                let guard = SHARED_WEIGHTS.lock().unwrap_or_else(|e| e.into_inner());
-                match guard.as_ref() {
+                let guard = shared_weights().lock().unwrap_or_else(|e| e.into_inner());
+                match guard.get(&key) {
                     Some(shared)
-                        if shared.fingerprint == fp
-                            && shared.logical_bytes == weight_cursor
+                        if shared.logical_bytes == weight_cursor
                             && shared.shard_size == shard_size
                             && shared.extras.len() + 1 == n_shards =>
                     {
@@ -1729,6 +1878,7 @@ impl Arena {
                             shared.first.clone(),
                             shared.extras.clone(),
                             shared.shard_size,
+                            shared.generation,
                         ))
                     }
                     _ => None,
@@ -1736,10 +1886,13 @@ impl Arena {
             } else {
                 None
             };
-            if let Some((first, extras, ws)) = reused {
+            if let Some((first, extras, ws, generation)) = reused {
                 arena.weight_buffer = Some(first);
                 arena.weight_extra_shards = extras;
                 arena.weight_shard_size = ws;
+                // A declared scope may skip a write into these bytes; without one the
+                // arena shares the allocation but owns everything it writes.
+                arena.weight_share = (scope != 0).then_some((key, generation));
             } else {
                 let mut shards = Vec::with_capacity(n_shards);
                 for i in 0..n_shards {
@@ -1764,15 +1917,42 @@ impl Arena {
                 let first = shards.remove(0);
                 let extras = shards;
                 if share_weights_enabled() {
-                    if let Ok(mut guard) = SHARED_WEIGHTS.lock() {
-                        *guard = Some(SharedWeightBuffers {
-                            fingerprint: fp,
+                    let mut guard = shared_weights().lock().unwrap_or_else(|e| e.into_inner());
+                    // A layout that never compiles again must not hold its weight
+                    // allocation for the life of the process: past the entry cap or the
+                    // byte cap, the oldest entries go first — never the one being
+                    // allocated for, whose buffers are used just below.
+                    if !guard.contains_key(&key) {
+                        let mut held: usize = guard.values().map(|entry| entry.logical_bytes).sum();
+                        let mut oldest: Vec<((u64, u64), u64, usize)> = guard
+                            .iter()
+                            .filter(|(k, _)| **k != key)
+                            .map(|(k, entry)| (*k, entry.generation, entry.logical_bytes))
+                            .collect();
+                        oldest.sort_by_key(|(_, generation, _)| *generation);
+                        for (victim, _, bytes) in oldest {
+                            if guard.len() < MAX_SHARED_WEIGHT_SCOPES
+                                && held + weight_cursor <= MAX_SHARED_WEIGHT_BYTES
+                            {
+                                break;
+                            }
+                            guard.remove(&victim);
+                            held -= bytes;
+                        }
+                    }
+                    let generation = WEIGHT_GENERATION.fetch_add(1, Ordering::Relaxed);
+                    guard.insert(
+                        key,
+                        SharedWeightBuffers {
+                            generation,
                             first: first.clone(),
                             extras: extras.clone(),
                             shard_size,
                             logical_bytes: weight_cursor,
-                        });
-                    }
+                            slots: HashMap::new(),
+                        },
+                    );
+                    arena.weight_share = (scope != 0).then_some((key, generation));
                 }
                 arena.weight_buffer = Some(first);
                 arena.weight_extra_shards = extras;
@@ -2531,6 +2711,10 @@ impl Arena {
     /// Write a raw bf16 byte stream into the packed side-buffer. The packed
     /// slot begins at byte `off / 2` (bf16 element i ↔ f32 element i). Pads to
     /// a u32-word boundary so the shader's `array<u32>` view is well-formed.
+    ///
+    /// A per-compile buffer, never the shared weight buffer, so the weight
+    /// sharing check does not apply here: these bytes are re-uploaded on every
+    /// compile.
     fn write_bf16_packed_bytes_at(&self, queue: &wgpu::Queue, off: usize, data: &[u8]) {
         let Some(buf) = &self.bf16_weight_buffer else {
             return;
@@ -2687,11 +2871,78 @@ impl Arena {
         out
     }
 
+    /// Whether a write that lands in the shared weight buffer can be skipped, and the
+    /// count of what was skipped when it is.
+    ///
+    /// Yes only when all of these hold: this arena adopted the shared entry for a
+    /// declared scope, the live entry for that scope is still the one it adopted
+    /// (generation unchanged — a re-created entry means these bytes are not where this
+    /// arena thinks), the entry's [`slots`](SharedWeightBuffers::slots) name this same
+    /// scope for exactly this offset, and this arena has not written that offset
+    /// itself. The last clause is what keeps a param re-set on the same executable
+    /// landing: the scope asserts that *another* compile for the same model wrote the
+    /// same bytes, not that this one may drop the write.
+    fn skip_weight_write(&self, byte_off: usize, len: usize) -> bool {
+        let Some((key, generation)) = self.weight_share else {
+            return false;
+        };
+        let scope = key.0;
+        debug_assert!(
+            is_weight_off(byte_off),
+            "the sharing check is asked only about weight-buffer writes"
+        );
+        let raw = raw_weight_off(byte_off);
+        if self
+            .weight_written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&raw)
+        {
+            return false;
+        }
+        let guard = shared_weights().lock().unwrap_or_else(|e| e.into_inner());
+        let resident = guard.get(&key).is_some_and(|shared| {
+            shared.generation == generation && shared.slots.get(&raw) == Some(&scope)
+        });
+        if resident {
+            SHARED_WEIGHT_SKIPPED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+            SHARED_WEIGHT_SKIPPED_WRITES.fetch_add(1, Ordering::Relaxed);
+        }
+        resident
+    }
+
+    /// Record that this arena wrote the weight bytes at `byte_off`: first for itself,
+    /// so a later write to the same offset still lands, then for the scope's entry, so
+    /// the next compile for this model can skip them.
+    fn record_weight_write(&self, byte_off: usize) {
+        let Some((key, generation)) = self.weight_share else {
+            return;
+        };
+        let scope = key.0;
+        let raw = raw_weight_off(byte_off);
+        self.weight_written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(raw);
+        let mut guard = shared_weights().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(shared) = guard.get_mut(&key)
+            && shared.generation == generation
+        {
+            shared.slots.insert(raw, scope);
+        }
+    }
+
     /// Write raw bytes into the arena at `byte_off`.
     ///
     /// Chunks large payloads (Metal `queue.write_buffer` can truncate above
     /// ~64 MiB) and splits at shard boundaries so a single call never writes
     /// past the end of a physical stripe.
+    ///
+    /// The one place a write into the shared weight buffer is *decided*: every weight
+    /// upload — `write_f32`'s weight-tagged branch, `set_param_bytes`, a parameter's raw
+    /// bytes — arrives here, so the sharing check below covers all of them. A path that
+    /// called `queue.write_buffer` on [`Self::weight_buffer`] directly would re-upload
+    /// silently and defeat the sharing with no sign of it.
     pub fn write_bytes_range(&self, queue: &wgpu::Queue, byte_off: usize, data: &[u8]) {
         if data.is_empty() {
             return;
@@ -2700,6 +2951,9 @@ impl Arena {
         // Weight-buffer uploads must not use act-shard boundary math — the high
         // WEIGHT_BUF_TAG bit would make `% shard_size` nonsense and truncate.
         let weight = is_weight_off(byte_off);
+        if weight && self.skip_weight_write(byte_off, data.len()) {
+            return;
+        }
         let mut off = 0usize;
         while off < data.len() {
             let mut n = (data.len() - off).min(CHUNK);
@@ -2732,6 +2986,9 @@ impl Arena {
             let (buf, local) = self.resolve_w(byte_off + off);
             queue.write_buffer(buf, local as u64, &data[off..off + n]);
             off += n;
+        }
+        if weight {
+            self.record_weight_write(byte_off);
         }
     }
 }

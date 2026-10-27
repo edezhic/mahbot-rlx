@@ -14,13 +14,17 @@
 
 /// Maximum cosine floor — the upper clamp bound for the derived floor.
 ///
-/// Two reasons this is 0.80: it keeps the anchored fire factor
-/// ≥ (POS_MATCH_COSINE_ANCHOR − 0.80)/(1 − 0.80) = 0.45, so the static rolling
-/// threshold ≥ 3 × 0.45 = 1.35 > 1.0 — a single frame can never fire; and it
-/// leaves a minimal soft band for reset/adaptive resolution.
-pub const MAX_SOFT_FLOOR: f32 = 0.80;
+/// Two reasons this is 0.75: it keeps the anchored fire factor at
+/// (POS_MATCH_COSINE_ANCHOR − 0.75)/(1 − 0.75) = 0.352, so the static rolling
+/// threshold is 3 × 0.352 = 1.056 — above one stride's maximum by the margin
+/// [`MIN_STATIC_BAR`] asks for; and it leaves a soft band for reset/adaptive
+/// resolution. The floor below this bound is what the negative pool derives; the
+/// bound is what the benchmark's pool saturates, so it is the operating floor
+/// there, and lowering it is what lets the anchor sit this low.
+pub const MAX_SOFT_FLOOR: f32 = 0.75;
 
-/// Fallback cosine floor when the enrolment collected no usable negatives.
+/// Fallback cosine floor when the enrolment collected no usable negatives, and
+/// the lower clamp bound of the derived floor.
 pub const DEFAULT_SOFT_FLOOR: f32 = 0.55;
 
 /// Standard-normal 99th-percentile z-score.
@@ -32,18 +36,212 @@ pub const DEFAULT_SOFT_FLOOR: f32 = 0.55;
 /// stable sufficient statistics at any pool size.
 pub const NEG_TAIL_Z: f32 = 2.33;
 
-/// The static firing point in RAW cosine space that keeps recall while a raised
-/// floor zeroes the negative bulk.
-pub const POS_MATCH_COSINE_ANCHOR: f32 = 0.89;
+/// The static firing point in RAW cosine space: with the anchored factor binding,
+/// a rolling window fires when the mean cosine over its window reaches this.
+///
+/// The calibrated point sits at the lowest value the static bar's margin admits
+/// (see [`MIN_STATIC_BAR`]); the wake bench measures 46 of 50 recall with two
+/// false accepts over the pinned real-audio corpus, and the record carries it.
+pub const POS_MATCH_COSINE_ANCHOR: f32 = 0.838;
 
-/// Legacy per-frame soft-score factor; the effective static fire factor is its
-/// min with the anchor-derived cap ([`Calibration::fire_soft`]).
+/// Cap on the per-frame soft-score factor; the effective static fire factor is
+/// its min with the anchor-derived value ([`Calibration::fire_soft`]). At the
+/// calibrated clamp the anchored factor is below it, so it binds only for an
+/// enrolment whose derived floor sits much lower than the clamp's upper bound.
 pub const MATCH_THRESHOLD_FACTOR: f32 = 0.55;
 
-/// The no-match reset threshold is this ratio × the fire factor (≈ the
-/// historical 0.35/0.55), keeping the frame-accumulation band proportional to
-/// the firing bar.
-pub const RESET_FIRE_RATIO: f32 = 0.64;
+/// The no-match reset threshold is this ratio × the fire factor. The calibrated
+/// value narrows the frame-accumulation band to just under the firing line, which
+/// is what keeps false accepts down while the bar sits this low.
+pub const RESET_FIRE_RATIO: f32 = 0.95;
+
+/// The lowest static bar the module accepts, in rolling-sum space. One stride's
+/// maximum soft score is 1.0, so a bar at or near it is a defect rather than an
+/// invariant: the margin is what makes "a single stride can never fire" hold for
+/// every floor an enrolment can derive, not only for the fixture's.
+pub const MIN_STATIC_BAR: f32 = 1.05;
+
+/// The numbers that set the firing bar: the floor clamp, the negative-tail
+/// multiplier, the raw-cosine anchor, the fire-factor cap, the reset ratio, and the
+/// adaptive arm's k and ceiling.
+///
+/// The decision's shape is not addressable here and cannot be reached through this
+/// set: the rolling window and its length ([`ROLLING_WINDOW_N`]), the adaptive arm's
+/// window and bootstrap count ([`ADAPTIVE_WINDOW_N`],
+/// [`ADAPTIVE_BOOTSTRAP_FRAMES`]), the anti-prototype veto, the six-stride segment
+/// limit ([`WAKE_WORD_MAX_SEGMENT_STEPS`]) and the per-fire cooldown stay exactly
+/// as this module and the bench's stream declare them. An operating point is this
+/// set; [`Thresholds::DEFAULT`] is the shipped one, built from the named constants
+/// of this module, and the bench may price another by overriding the set without
+/// changing any rule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Thresholds {
+    /// Lower clamp bound of the derived floor, and the fallback floor of an
+    /// enrolment without usable negatives.
+    pub floor_min: f32,
+    /// Upper clamp bound of the derived floor.
+    pub floor_max: f32,
+    /// Multiplier on the negative pool's standard deviation.
+    pub tail_z: f32,
+    /// Cap on the per-frame soft-score factor.
+    pub fire_factor_cap: f32,
+    /// Raw-cosine firing anchor: with the anchor binding, a rolling window fires
+    /// when its mean cosine reaches this.
+    pub anchor: f32,
+    /// No-match reset line, as a fraction of the fire factor.
+    pub reset_ratio: f32,
+    /// Adaptive arm: multiplier on the score window's standard deviation.
+    pub adaptive_k: f32,
+    /// Adaptive arm: ceiling in rolling-sum space.
+    pub adaptive_ceiling: f32,
+}
+
+impl Thresholds {
+    /// The set's numbers in the vocabulary `--wake-thresholds` reads: the name, a
+    /// reader and a writer. [`Display`](core::fmt::Display) and the bench's parser
+    /// both walk this list, so a number cannot be printed without being readable
+    /// back. [`Thresholds::check`] lists the same numbers because a `const fn`
+    /// cannot call through these functions.
+    pub(crate) const FIELDS: &'static [(&'static str, fn(&Self) -> f32, fn(&mut Self, f32))] = &[
+        ("floor_min", |s| s.floor_min, |s, v| s.floor_min = v),
+        ("floor_max", |s| s.floor_max, |s, v| s.floor_max = v),
+        ("tail_z", |s| s.tail_z, |s, v| s.tail_z = v),
+        (
+            "fire_factor_cap",
+            |s| s.fire_factor_cap,
+            |s, v| s.fire_factor_cap = v,
+        ),
+        ("anchor", |s| s.anchor, |s, v| s.anchor = v),
+        ("reset_ratio", |s| s.reset_ratio, |s, v| s.reset_ratio = v),
+        ("adaptive_k", |s| s.adaptive_k, |s, v| s.adaptive_k = v),
+        (
+            "adaptive_ceiling",
+            |s| s.adaptive_ceiling,
+            |s, v| s.adaptive_ceiling = v,
+        ),
+    ];
+
+    /// The shipped point: this module's named constants and nothing else.
+    pub const DEFAULT: Self = Self {
+        floor_min: DEFAULT_SOFT_FLOOR,
+        floor_max: MAX_SOFT_FLOOR,
+        tail_z: NEG_TAIL_Z,
+        fire_factor_cap: MATCH_THRESHOLD_FACTOR,
+        anchor: POS_MATCH_COSINE_ANCHOR,
+        reset_ratio: RESET_FIRE_RATIO,
+        adaptive_k: ADAPTIVE_K_DEFAULT,
+        adaptive_ceiling: ADAPTIVE_CEILING,
+    };
+
+    /// The per-frame static fire factor at a given floor — the const form of
+    /// [`Calibration::fire_soft`], so the invariant guard and the scoring path
+    /// read one derivation rather than two.
+    const fn fire_factor_at(&self, floor: f32) -> f32 {
+        let anchored = (self.anchor - floor) / (1.0 - floor);
+        if anchored < self.fire_factor_cap {
+            anchored
+        } else {
+            self.fire_factor_cap
+        }
+    }
+
+    /// The lowest static bar this set can derive. The fire factor falls as the
+    /// floor rises ([`Calibration::fire_soft`]), so the highest floor is the
+    /// worst case; this is the number the single-stride invariant is checked
+    /// against.
+    #[must_use]
+    pub const fn lowest_static_bar(&self) -> f32 {
+        self.fire_factor_at(self.floor_max) * ROLLING_WINDOW_N as f32
+    }
+
+    /// The first invariant this set breaks, in const form: the build-time guard,
+    /// the bench's override parser and [`validate`](Self::validate) read these
+    /// same rules, so a point cannot pass one and fail another.
+    const fn check(&self) -> Result<(), &'static str> {
+        let all = [
+            self.floor_min,
+            self.floor_max,
+            self.tail_z,
+            self.fire_factor_cap,
+            self.anchor,
+            self.reset_ratio,
+            self.adaptive_k,
+            self.adaptive_ceiling,
+        ];
+        let mut i = 0;
+        while i < all.len() {
+            if !all[i].is_finite() {
+                return Err("a number in the set is not finite");
+            }
+            i += 1;
+        }
+        if self.floor_min >= self.floor_max {
+            return Err("floor_min must be below floor_max");
+        }
+        if self.floor_min <= -1.0 || self.floor_max >= 1.0 {
+            return Err("the floor clamp must lie inside (−1, 1)");
+        }
+        if self.anchor <= self.floor_max || self.anchor > 1.0 {
+            return Err("anchor must lie in (floor_max, 1]");
+        }
+        if self.fire_factor_cap <= 0.0 || self.fire_factor_cap > 1.0 {
+            return Err("fire_factor_cap must lie in (0, 1]");
+        }
+        if self.reset_ratio <= 0.0 || self.reset_ratio > 1.0 {
+            return Err("reset_ratio must lie in (0, 1]");
+        }
+        if self.adaptive_k < 0.0 || self.adaptive_ceiling <= 0.0 {
+            return Err("the adaptive arm needs k ≥ 0 and a positive ceiling");
+        }
+        // The arm clamps to `[static bar, ceiling]`, so a ceiling below the
+        // highest bar the cap can derive panics inside that clamp. The cap bounds
+        // every enrolment's bar, which is why the check needs no enrolment.
+        if self.adaptive_ceiling < ROLLING_WINDOW_N as f32 * self.fire_factor_cap {
+            return Err("adaptive_ceiling is below the highest static bar the cap can derive");
+        }
+        if self.lowest_static_bar() < MIN_STATIC_BAR {
+            return Err(
+                "the lowest static bar is below MIN_STATIC_BAR — a single stride could fire",
+            );
+        }
+        Ok(())
+    }
+
+    /// Refuse a set the module's invariants cannot hold — a number that is not
+    /// finite, a floor clamp whose bounds cross, an anchor the clamp leaves no
+    /// room for, an adaptive ceiling below the bar it has to clamp, or a static
+    /// bar a single scoring stride could clear — so an unusable point is refused
+    /// at start-up rather than panicking inside `f32::clamp` mid-run.
+    ///
+    /// # Errors
+    /// The first invariant the set breaks, followed by the set itself.
+    pub fn validate(&self) -> Result<(), String> {
+        self.check()
+            .map_err(|rule| format!("{rule} — the set was {self}"))
+    }
+}
+
+impl core::fmt::Display for Thresholds {
+    /// The set as the comma-separated `name=value` pairs the bench's
+    /// `--wake-thresholds` reads, at the shortest precision that parses back to
+    /// the same numbers.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (index, (name, read, _)) in Self::FIELDS.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{name}={}", read(self))?;
+        }
+        Ok(())
+    }
+}
+
+// The shipped constants are held to the same rules the override parser applies,
+// where the mistake is cheapest to see and impossible to ship: at build time.
+const _: () = match (Thresholds::DEFAULT).check() {
+    Ok(()) => (),
+    Err(why) => panic!("{}", why),
+};
 
 /// Enrolment consistency: minimum cosine between an utterance embedding and
 /// the centroid, and the fraction of utterances that must pass.
@@ -155,40 +353,38 @@ pub struct Calibration {
 }
 
 impl Calibration {
-    /// Cosine floor: the parametric p99 estimate `neg_mean + NEG_TAIL_Z ×
-    /// neg_std`, clamped to [`DEFAULT_SOFT_FLOOR`]..=[`MAX_SOFT_FLOOR`]. Scores
-    /// below the floor map to ~0.
+    /// Cosine floor: the parametric p99 estimate `neg_mean + tail_z × neg_std`,
+    /// clamped to the set's floor bounds. Scores below the floor map to ~0.
     #[must_use]
-    pub fn soft_floor(&self) -> f32 {
+    pub fn soft_floor(&self, thresholds: &Thresholds) -> f32 {
         if self.n_negatives == 0 || !self.neg_mean.is_finite() || !self.neg_std.is_finite() {
-            return DEFAULT_SOFT_FLOOR;
+            return thresholds.floor_min;
         }
-        let parametric = self.neg_mean + NEG_TAIL_Z * self.neg_std;
+        let parametric = self.neg_mean + thresholds.tail_z * self.neg_std;
         if !parametric.is_finite() {
-            return DEFAULT_SOFT_FLOOR;
+            return thresholds.floor_min;
         }
-        parametric.clamp(DEFAULT_SOFT_FLOOR, MAX_SOFT_FLOOR)
+        parametric.clamp(thresholds.floor_min, thresholds.floor_max)
     }
 
     /// Per-frame soft-score factor for the static detection threshold — the min
-    /// of [`MATCH_THRESHOLD_FACTOR`] and the anchored cap.
+    /// of the set's cap and the anchored cap.
     #[must_use]
-    pub fn fire_soft(&self) -> f32 {
-        let floor = self.soft_floor();
-        MATCH_THRESHOLD_FACTOR.min((POS_MATCH_COSINE_ANCHOR - floor) / (1.0 - floor))
+    pub fn fire_soft(&self, thresholds: &Thresholds) -> f32 {
+        thresholds.fire_factor_at(self.soft_floor(thresholds))
     }
 
     /// Per-frame reset threshold in soft space.
     #[must_use]
-    pub fn reset_soft(&self) -> f32 {
-        RESET_FIRE_RATIO * self.fire_soft()
+    pub fn reset_soft(&self, thresholds: &Thresholds) -> f32 {
+        thresholds.reset_ratio * self.fire_soft(thresholds)
     }
 
     /// Map a raw cosine into soft-score space: linear from `soft_floor()` → 0
     /// to 1.0 → 1.
     #[must_use]
-    pub fn soft_score(&self, cosine: f32) -> f32 {
-        let floor = self.soft_floor();
+    pub fn soft_score(&self, cosine: f32, thresholds: &Thresholds) -> f32 {
+        let floor = self.soft_floor(thresholds);
         ((cosine - floor) / (1.0 - floor)).clamp(0.0, 1.0)
     }
 }
@@ -211,6 +407,8 @@ pub struct Enrollment {
     /// Up to [`MAX_NEGATIVE_PROTOTYPES`] L2-normalized cluster centroids of the
     /// negative-sample embeddings.
     pub negative_prototypes: Vec<Vec<f32>>,
+    /// The threshold set this enrolment is scored with.
+    pub thresholds: Thresholds,
 }
 
 /// Maximum number of anti-prototype centroids distilled from the negative pool.
@@ -237,7 +435,20 @@ impl Enrollment {
             utterance_count: utterance_embeddings.len(),
             calibration,
             negative_prototypes: distill_negative_prototypes(negative_embeddings),
+            thresholds: Thresholds::DEFAULT,
         })
+    }
+
+    /// Score this enrolment with another threshold set — the bench's measurement
+    /// aid; the product reads [`Thresholds::DEFAULT`].
+    ///
+    /// # Errors
+    /// The rule the set breaks (see [`Thresholds::validate`]): a point that could
+    /// panic inside `f32::clamp` is refused before a stream scores with it.
+    pub fn with_thresholds(mut self, thresholds: Thresholds) -> Result<Self, String> {
+        thresholds.validate()?;
+        self.thresholds = thresholds;
+        Ok(self)
     }
 
     /// Cosine of a window embedding against the prototype.
@@ -268,14 +479,14 @@ impl Enrollment {
         if !self.negative_prototypes.is_empty() && neg > pos {
             return 0.0;
         }
-        self.calibration.soft_score(pos)
+        self.calibration.soft_score(pos, &self.thresholds)
     }
 
     /// The static rolling-sum firing threshold and the per-frame reset line,
     /// both derived from this enrolment's calibration.
     #[must_use]
     pub fn geometry(&self) -> DetectionGeometry {
-        DetectionGeometry::for_calibration(&self.calibration)
+        DetectionGeometry::for_calibration(&self.calibration, &self.thresholds)
     }
 }
 
@@ -363,10 +574,10 @@ pub struct DetectionGeometry {
 
 impl DetectionGeometry {
     #[must_use]
-    pub fn for_calibration(calibration: &Calibration) -> Self {
+    pub fn for_calibration(calibration: &Calibration, thresholds: &Thresholds) -> Self {
         Self {
-            static_threshold: (ROLLING_WINDOW_N as f32) * calibration.fire_soft(),
-            reset: calibration.reset_soft(),
+            static_threshold: (ROLLING_WINDOW_N as f32) * calibration.fire_soft(thresholds),
+            reset: calibration.reset_soft(thresholds),
         }
     }
 }
@@ -397,7 +608,7 @@ pub fn process_score(
 
 /// Rolling mean/std of recent per-frame soft scores, feeding the adaptive
 /// threshold `(mean + k × std) × ROLLING_WINDOW_N`, clamped to
-/// `[harbor, ADAPTIVE_CEILING]` in rolling-sum space.
+/// `[harbor, adaptive_ceiling]` in rolling-sum space.
 ///
 /// During the first [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames the callers use the
 /// static threshold: [`feed`](Self::feed) returns `None` and
@@ -419,17 +630,17 @@ impl AdaptiveThreshold {
     /// A state that has already exited bootstrap, seeded with near-silence
     /// scores so the adaptive path is active from the first real frame.
     #[must_use]
-    pub fn warmed(harbor: f32) -> Self {
+    pub fn warmed(thresholds: &Thresholds, harbor: f32) -> Self {
         let mut state = Self::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.033, ADAPTIVE_K_DEFAULT, harbor);
+            state.feed(0.033, thresholds, harbor);
         }
         state
     }
 
     /// Feed a below-reset score and return the adaptive threshold, or `None`
     /// during bootstrap.
-    pub fn feed(&mut self, score: f32, k: f32, harbor: f32) -> Option<f32> {
+    pub fn feed(&mut self, score: f32, thresholds: &Thresholds, harbor: f32) -> Option<f32> {
         if self.scores.len() >= ADAPTIVE_WINDOW_N {
             let oldest = self.scores.remove(0);
             self.sum -= oldest;
@@ -442,17 +653,17 @@ impl AdaptiveThreshold {
             self.bootstrap_count += 1;
             return None;
         }
-        Some(self.compute_threshold(k, harbor))
+        Some(self.compute_threshold(thresholds, harbor))
     }
 
     /// The current threshold without updating the statistics, or `None` during
     /// bootstrap / when the window is empty.
     #[must_use]
-    pub fn peek(&self, k: f32, harbor: f32) -> Option<f32> {
+    pub fn peek(&self, thresholds: &Thresholds, harbor: f32) -> Option<f32> {
         if self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES || self.scores.is_empty() {
             return None;
         }
-        Some(self.compute_threshold(k, harbor))
+        Some(self.compute_threshold(thresholds, harbor))
     }
 
     /// Drop all statistics (segment boundary / re-enrolment).
@@ -460,13 +671,13 @@ impl AdaptiveThreshold {
         *self = Self::default();
     }
 
-    fn compute_threshold(&self, k: f32, harbor: f32) -> f32 {
+    fn compute_threshold(&self, thresholds: &Thresholds, harbor: f32) -> f32 {
         let n = self.scores.len() as f32;
         let mean = self.sum / n;
         let variance = (self.sum_sq / n) - (mean * mean);
         let std = variance.max(0.0).sqrt();
-        let adaptive = (mean + k * std) * ROLLING_WINDOW_N as f32;
-        adaptive.clamp(harbor, ADAPTIVE_CEILING)
+        let adaptive = (mean + thresholds.adaptive_k * std) * ROLLING_WINDOW_N as f32;
+        adaptive.clamp(harbor, thresholds.adaptive_ceiling)
     }
 }
 
@@ -496,6 +707,11 @@ mod tests {
         v
     }
 
+    /// The shipped point: what the constants derive, in one name.
+    fn t() -> Thresholds {
+        Thresholds::DEFAULT
+    }
+
     #[test]
     fn calibration_floor_maps_negatives_to_zero() {
         let proto = l2_normalize(&(0..1024).map(|i| i as f32).collect::<Vec<_>>());
@@ -504,18 +720,108 @@ mod tests {
             .collect();
         let calibration = calibrate_negatives(&proto, &negatives);
         assert_eq!(calibration.n_negatives, 20);
-        // The parametric estimate sits below the 0.55 default floor, which
+        // The parametric estimate sits below the floor clamp's lower bound, which
         // clamps it; every negative therefore maps to soft score 0.
-        assert!((calibration.soft_floor() - DEFAULT_SOFT_FLOOR).abs() < 1e-6);
+        assert!((calibration.soft_floor(&t()) - DEFAULT_SOFT_FLOOR).abs() < 1e-6);
         for (i, neg) in negatives.iter().enumerate() {
             let c = cosine(neg, &proto);
             assert!(c < DEFAULT_SOFT_FLOOR, "negative {i} at cosine {c}");
-            assert_eq!(calibration.soft_score(c), 0.0);
+            assert_eq!(calibration.soft_score(c, &t()), 0.0);
         }
-        // The anchor keeps the static threshold above one frame's maximum.
-        let geometry = DetectionGeometry::for_calibration(&calibration);
-        assert!(geometry.static_threshold > 1.0);
+        // The anchor keeps the static threshold above one stride's maximum.
+        let geometry = DetectionGeometry::for_calibration(&calibration, &t());
+        assert!(geometry.static_threshold >= MIN_STATIC_BAR);
         assert!(geometry.reset < geometry.static_threshold);
+    }
+
+    #[test]
+    fn the_shipped_point_validates_and_moves_with_its_anchor() {
+        t().validate().expect("the shipped point is valid");
+        // The worst case is the clamp's upper bound: there the anchored factor is
+        // smallest, so it is below the cap and the bar is the anchor's. The guard
+        // and the scoring path must be one derivation, so the checked number is
+        // asserted against the geometry a stream is actually built from.
+        let at_upper_bound = Calibration {
+            neg_mean: MAX_SOFT_FLOOR,
+            neg_std: 0.0,
+            neg_p99: MAX_SOFT_FLOOR,
+            n_negatives: 1,
+        };
+        let worst = DetectionGeometry::for_calibration(&at_upper_bound, &t()).static_threshold;
+        assert_eq!(t().lowest_static_bar(), worst);
+        assert!(
+            worst >= MIN_STATIC_BAR,
+            "the shipped bar {worst} is inside the one-stride margin"
+        );
+        // Raising the anchor raises the bar in step.
+        let mut raised = t();
+        raised.anchor += 0.04;
+        let raised_bar =
+            DetectionGeometry::for_calibration(&at_upper_bound, &raised).static_threshold;
+        assert!(raised_bar > worst, "the anchor is the bar at the clamp");
+        // A bar one stride could clear is refused rather than measured, and it is
+        // the margin rule that refuses it.
+        let mut short = t();
+        short.anchor = MAX_SOFT_FLOOR + 0.01;
+        let err = short.validate().expect_err("a one-stride bar");
+        assert!(err.contains("single stride"), "{err}");
+    }
+
+    #[test]
+    fn a_crossed_floor_clamp_is_refused() {
+        let mut set = t();
+        set.floor_min = set.floor_max;
+        let err = set.validate().expect_err("crossed bounds");
+        assert!(err.contains("floor_min must be below floor_max"), "{err}");
+        // A clamp reaching outside (−1, 1) cannot derive a soft score at all. The
+        // rule is strict, so a bound exactly on the edge is outside it too.
+        let mut set = t();
+        set.floor_min = -1.5;
+        let err = set.validate().expect_err("an out-of-range floor");
+        assert!(err.contains("inside (−1, 1)"), "{err}");
+        let mut set = t();
+        set.floor_min = -1.0;
+        let err = set.validate().expect_err("a bound on the interval's edge");
+        assert!(err.contains("inside (−1, 1)"), "{err}");
+    }
+
+    #[test]
+    fn a_non_finite_number_is_refused() {
+        let mut set = t();
+        set.anchor = f32::NAN;
+        let err = set.validate().expect_err("NaN");
+        assert!(err.contains("not finite"), "{err}");
+        let mut set = t();
+        set.tail_z = f32::INFINITY;
+        assert!(set.validate().is_err(), "an infinite tail");
+    }
+
+    /// One vocabulary: every number the override parser can write is printed by
+    /// `Display` and refused by the guard when it is not finite, so a number added
+    /// to the set cannot be silently unprintable or unchecked.
+    #[test]
+    fn every_number_in_the_vocabulary_is_guarded_and_printed() {
+        let printed = t().to_string();
+        for (name, _, write) in Thresholds::FIELDS {
+            assert!(
+                printed.contains(&format!("{name}=")),
+                "{name} is not printed: {printed}"
+            );
+            let mut set = t();
+            write(&mut set, f32::NAN);
+            let err = set.validate().expect_err(name);
+            assert!(err.contains("not finite"), "{name} is not guarded: {err}");
+        }
+    }
+
+    #[test]
+    fn a_ceiling_below_the_bar_it_clamps_is_refused() {
+        // The adaptive arm clamps to [static bar, ceiling]; a ceiling under the
+        // bar would panic there rather than fail as a measurement.
+        let mut set = t();
+        set.adaptive_ceiling = set.fire_factor_cap * ROLLING_WINDOW_N as f32 - 1e-3;
+        let err = set.validate().expect_err("ceiling under the cap's bar");
+        assert!(err.contains("adaptive_ceiling is below"), "{err}");
     }
 
     #[test]
@@ -556,6 +862,27 @@ mod tests {
         assert!((enrollment.soft_score(&enrollment.prototype) - 1.0).abs() < 1e-6);
     }
 
+    /// The set an enrolment scores with is refused where it is installed, in every
+    /// build: a crossed clamp would otherwise panic inside `f32::clamp` mid-run.
+    #[test]
+    fn an_unusable_set_cannot_be_installed_on_an_enrolment() {
+        let embedding = l2_normalize(&[0.5f32; 16]);
+        let enrollment = Enrollment::build(
+            "hey".into(),
+            &vec![embedding; MIN_ENROLLMENT_UTTERANCES],
+            Calibration::default(),
+            &[],
+        )
+        .expect("five identical utterances enrol");
+        assert_eq!(enrollment.thresholds, t());
+        let mut crossed = t();
+        crossed.floor_min = crossed.floor_max;
+        let err = enrollment
+            .with_thresholds(crossed)
+            .expect_err("a crossed clamp");
+        assert!(err.contains("floor_min must be below floor_max"), "{err}");
+    }
+
     #[test]
     fn anti_prototype_veto_rejects_a_closer_negative() {
         let mut a = vec![0.0f32; 8];
@@ -574,6 +901,7 @@ mod tests {
                 n_negatives: 9,
             },
             negative_prototypes: vec![b],
+            thresholds: Thresholds::DEFAULT,
         };
         assert_eq!(enrollment.soft_score(&probe), 0.0);
         assert!(enrollment.soft_score(&enrollment.prototype) > 0.9);
@@ -587,9 +915,10 @@ mod tests {
             neg_p99: 0.5,
             n_negatives: 12,
         };
-        let geometry = DetectionGeometry::for_calibration(&calibration);
+        let geometry = DetectionGeometry::for_calibration(&calibration, &t());
         let mut window = Vec::new();
-        let high = calibration.fire_soft() * 0.9;
+        // Between the reset line and the fire factor: kept, but short of the bar.
+        let high = calibration.fire_soft(&t()) * 0.975;
         for _ in 0..ROLLING_WINDOW_N {
             let (fired, _) = process_score(high, &mut window, geometry, geometry.static_threshold);
             assert!(
@@ -610,28 +939,29 @@ mod tests {
 
     #[test]
     fn adaptive_threshold_starts_at_the_harbor_and_never_exceeds_the_ceiling() {
+        // The harbour is the static bar an enrolment derives, not a fixture.
+        let harbor =
+            DetectionGeometry::for_calibration(&Calibration::default(), &t()).static_threshold;
         let mut state = AdaptiveThreshold::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            assert_eq!(state.feed(0.01, ADAPTIVE_K_DEFAULT, 1.35), None);
+            assert_eq!(state.feed(0.01, &t(), harbor), None);
         }
-        let warm = state
-            .feed(0.01, ADAPTIVE_K_DEFAULT, 1.35)
-            .expect("post-bootstrap");
-        assert!((warm - 1.35).abs() < 1e-6);
+        let warm = state.feed(0.01, &t(), harbor).expect("post-bootstrap");
+        assert!((warm - harbor).abs() < 1e-6);
         for _ in 0..ADAPTIVE_WINDOW_N * 3 {
-            state.feed(1.0, ADAPTIVE_K_DEFAULT, 1.35);
+            state.feed(1.0, &t(), harbor);
         }
-        assert!(state.peek(ADAPTIVE_K_DEFAULT, 1.35).unwrap() <= ADAPTIVE_CEILING);
+        assert!(state.peek(&t(), harbor).unwrap() <= ADAPTIVE_CEILING);
         state.reset();
-        assert_eq!(state.peek(ADAPTIVE_K_DEFAULT, 1.35), None);
+        assert_eq!(state.peek(&t(), harbor), None);
     }
 
     #[test]
     fn degenerate_calibration_uses_the_documented_fallbacks() {
         let calibration = Calibration::default();
-        assert_eq!(calibration.soft_floor(), DEFAULT_SOFT_FLOOR);
-        assert_eq!(calibration.fire_soft(), MATCH_THRESHOLD_FACTOR);
-        let geometry = DetectionGeometry::for_calibration(&calibration);
+        assert_eq!(calibration.soft_floor(&t()), DEFAULT_SOFT_FLOOR);
+        assert_eq!(calibration.fire_soft(&t()), MATCH_THRESHOLD_FACTOR);
+        let geometry = DetectionGeometry::for_calibration(&calibration, &t());
         assert!(
             (geometry.static_threshold - ROLLING_WINDOW_N as f32 * MATCH_THRESHOLD_FACTOR).abs()
                 < 1e-6

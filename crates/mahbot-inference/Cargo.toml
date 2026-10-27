@@ -1,10 +1,11 @@
 # MahBot inference — the live model paths, end to end, and nothing else.
 #
-# The stand (`src/stand.rs`, the `mahbot-inference` binary) walks the four unit
-# paths — the ear, recognition, synthesis and embeddings — and prints their
-# numbers. The same generation/encoding/decision code is exposed as a library
-# (`synth`, `listen`, `wake`) so the wake-word bench can measure recall, false
-# reactions and false accepts per hour on this crate's own models.
+# The stand (`src/stand.rs`, the `mahbot-inference` binary) walks the model
+# paths — the ear, recognition, synthesis, embeddings and transcription — and
+# prints their numbers. The same generation/encoding/decision code is exposed as
+# a library (`synth`, `listen`, `transcribe`, `wake`) so the wake-word bench can
+# measure recall, false reactions and false accepts per hour on this crate's own
+# models.
 #
 # Every input path comes from an argument or an environment variable; there is
 # no crate-relative default, because the checkout carries no models.
@@ -14,7 +15,7 @@ name = "mahbot-inference"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
-description = "MahBot inference: wake word (ear), recognition, synthesis and embeddings, end to end, on our own models."
+description = "MahBot inference: ear, recognition, synthesis, embeddings and transcription, end to end, on our own models."
 authors.workspace      = true
 license.workspace      = true
 repository.workspace   = true
@@ -42,7 +43,8 @@ serde_json = "1"
 # Model and corpus provenance (SHA-256 pins) and the deterministic noise RNG.
 sha2 = "0.10"
 rand = "0.9"
-# The voice-activity gate the listening path and the speech-hours denominator use.
+# The voice-activity detector: the wake gate, the speech-hours denominator and
+# the transcription path's segmentation (`vad`).
 earshot = "1.2"
 # The f16 image of a packed weight (`Store::F16Linear`): one rounding per value,
 # written as little-endian bits for `set_param_typed(..., DType::F16)`.

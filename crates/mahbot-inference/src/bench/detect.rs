@@ -60,12 +60,9 @@ use crate::wake::{self, AdaptiveThreshold, DetectionGeometry, Enrollment};
 
 use crate::guard::Deadline;
 
-/// Samples per VAD frame (the frame length a live microphone delivers).
-pub(crate) const FRAME_LENGTH: usize = 512;
-/// Samples per VAD hop — exactly one `earshot` frame.
-pub(crate) const HOP_LENGTH: usize = 256;
-/// VAD decision threshold: at or above is speech.
-pub(crate) const VAD_THRESHOLD: f32 = 0.5;
+/// The detector's own frame, hop and threshold live in [`crate::vad`], which the
+/// transcription path decides on as well: one implementation, two callers.
+pub(crate) use crate::vad::{FRAME_LENGTH, HOP_LENGTH, is_speech, vad_gate};
 /// Samples between scoring steps: 16 mel frames at the encoder's 160-sample hop.
 pub(crate) const SCORE_STRIDE_SAMPLES: usize = 16 * 160;
 /// Consecutive VAD-negative hops that end a speech segment.
@@ -77,40 +74,6 @@ pub(crate) const COOLDOWN_SAMPLES: u64 = 3 * listen::SAMPLE_RATE as u64;
 /// score reads a whole window plus one stride of hops out of the ring, so the
 /// cap has to hold both or a score sees samples the next feed overwrote.
 const AUDIO_BUFFER_MAX: usize = listen::WINDOW_SAMPLES + 8 * SCORE_STRIDE_SAMPLES;
-
-/// One VAD decision. `samples` is chunked at 256 and a partial tail is
-/// zero-padded; every sample is clamped to [-1, 1] first, because synthesized
-/// audio can leave the range and `earshot` asserts on it.
-pub(crate) fn is_speech(detector: &mut earshot::Detector, samples: &[f32]) -> bool {
-    if samples.is_empty() {
-        return false;
-    }
-    let mut speech = false;
-    let mut frame = [0.0f32; HOP_LENGTH];
-    for chunk in samples.chunks(HOP_LENGTH) {
-        frame.fill(0.0);
-        for (slot, &sample) in frame.iter_mut().zip(chunk) {
-            *slot = sample.clamp(-1.0, 1.0);
-        }
-        if detector.predict_f32(&frame) >= VAD_THRESHOLD {
-            speech = true;
-        }
-    }
-    speech
-}
-
-/// The VAD-positive hops of `pcm`, concatenated — the "gated speech" the
-/// calibration path encodes. The detector carries across hops, so onsets and
-/// offsets are judged on the continuous stream.
-pub(crate) fn vad_gate(pcm: &[f32], detector: &mut earshot::Detector) -> Vec<f32> {
-    let mut speech = Vec::new();
-    for hop in pcm.chunks(HOP_LENGTH) {
-        if is_speech(detector, hop) {
-            speech.extend_from_slice(hop);
-        }
-    }
-    speech
-}
 
 /// One continuous-listening stream.
 pub(crate) struct DetectionStream {
@@ -164,7 +127,7 @@ impl DetectionStream {
 
     fn with_group(enrollment: Enrollment, group: usize) -> Self {
         let geometry = enrollment.geometry();
-        let adaptive = AdaptiveThreshold::warmed(geometry.static_threshold);
+        let adaptive = AdaptiveThreshold::warmed(&enrollment.thresholds, geometry.static_threshold);
         Self {
             enrollment,
             geometry,
@@ -373,17 +336,15 @@ impl DetectionStream {
     /// not have scored them, and the cooldown starts at the fire's own position
     /// in the audio, not at the moment the group was resolved.
     fn apply(&mut self, embeddings: &[Vec<f32>], at: &[u64]) -> usize {
+        let thresholds = self.enrollment.thresholds;
         for (embedding, &fired_at) in embeddings.iter().zip(at) {
             let total = self.enrollment.soft_score(embedding);
             let adaptive_value = if total < self.geometry.reset {
-                self.adaptive.feed(
-                    total,
-                    wake::ADAPTIVE_K_DEFAULT,
-                    self.geometry.static_threshold,
-                )
+                self.adaptive
+                    .feed(total, &thresholds, self.geometry.static_threshold)
             } else {
                 self.adaptive
-                    .peek(wake::ADAPTIVE_K_DEFAULT, self.geometry.static_threshold)
+                    .peek(&thresholds, self.geometry.static_threshold)
             };
             let threshold = adaptive_value.unwrap_or(self.geometry.static_threshold);
             let (fired, _) =
@@ -505,9 +466,15 @@ mod tests {
     fn a_group_below_the_threshold_scores_every_window() {
         let mut stream = stream();
         stream.samples_fed = 500;
-        // Cosine 0.73 against the prototype: soft 0.40, above the 0.35 reset
-        // line, and three of them (1.20) short of the 1.65 static threshold.
-        let embedding = vec![0.73f32, (1.0 - 0.73 * 0.73f32).sqrt()];
+        // A window between this enrolment's reset line and its fire factor: it
+        // stays in the rolling window, and three of them still miss the bar.
+        let thresholds = stream.enrollment.thresholds;
+        let calibration = &stream.enrollment.calibration;
+        let floor = calibration.soft_floor(&thresholds);
+        let fire = calibration.fire_soft(&thresholds);
+        let soft = 0.5 * (thresholds.reset_ratio * fire + fire);
+        let cosine = floor + (1.0 - floor) * soft;
+        let embedding = vec![cosine, (1.0 - cosine * cosine).sqrt()];
         let embeddings = vec![embedding; 4];
 
         assert_eq!(stream.apply(&embeddings, &[100, 200, 300, 400]), 0);

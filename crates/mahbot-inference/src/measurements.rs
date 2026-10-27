@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `MEASUREMENTS.md` at the workspace root: the latest numbers from this
-//! crate's two measuring surfaces, replaced in place by the run that produced
-//! them.
+//! crate's three measuring surfaces — the stand, the wake-word bench and the
+//! transcription cell — replaced in place by the run that produced them.
 //!
 //! The file is the repository's own record, not a log: each surface owns one
 //! section, each section carries its own date, and a run rewrites its section
@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 /// (`CARGO_MANIFEST_DIR`'s grandparent), unless `MAHBOT_MEASUREMENTS` names a
 /// path. The variable is how a run that must not touch the tree — a QA run
 /// checking the bench end to end — redirects the record. A release binary run
-/// from elsewhere otherwise still writes into that tree. Both surfaces treat a
+/// from elsewhere otherwise still writes into that tree. Every surface treats a
 /// refresh that fails as a failed run: the numbers a change produces are
 /// incomplete until this file shows them.
 #[must_use]
@@ -34,18 +34,18 @@ pub fn path() -> PathBuf {
 
 const HEADER: &str = "# Measurements
 
-The latest numbers from this crate's two measuring surfaces. Each row is
+The latest numbers from this crate's three measuring surfaces. Each row is
 replaced by the run that measured it: the section carries that run's date and
 `code` line, and its `rows` line names which rows the run took — a row a later
 run did not measure is carried, not re-taken, because its own inputs are not what
-that run opens. The two surfaces are run at different times, so one half may be
-older than the other. This file is not a log — history is what version control is
-for.
+that run opens. The surfaces are run at different times, so any one of the three
+may be older than another. This file is not a log — history is what version
+control is for.
 
 ";
 
-/// Replace one surface's section of the file at [`path`], leaving the other as
-/// it was.
+/// Replace one surface's section of the file at [`path`], leaving the other
+/// sections as they were.
 pub fn refresh(section: &str, body: &str) -> Result<()> {
     refresh_at(&path(), section, body)
 }
@@ -407,6 +407,26 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The checked-in record opens with the header this module writes. A run against
+    /// an absent file regenerates that header, so a hand-edited one would leave the
+    /// artifact contradicting the code that owns it — the drift this pins shut.
+    #[test]
+    fn the_record_opens_with_the_header_this_module_writes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("MEASUREMENTS.md");
+        let text = match std::fs::read_to_string(&root) {
+            Ok(text) => text,
+            Err(_) => return,
+        };
+        assert!(
+            text.starts_with(HEADER),
+            "{} does not open with HEADER",
+            root.display()
+        );
+    }
 
     /// The provenance line names the content, not only the commit, and the rule it
     /// prints is the rule it computes: the digest must answer here (a tree git

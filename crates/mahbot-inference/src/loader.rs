@@ -364,6 +364,87 @@ impl GemmaConfig {
     }
 }
 
+/// The CED audio tagger's configuration — the `ced.*` metadata as typed fields.
+///
+/// It is a type of its own for the reason [`GemmaConfig`] is: the file's own
+/// front end (a log-mel whose filterbank and window it carries as tensors, and
+/// whose amplitude-to-dB clamp is three numbers) has no field in a body config,
+/// and the ViT over its patches has neither a KV-head count nor a vocabulary.
+///
+/// Every field is read from the file by [`Model::open_ced`], and the arrays are
+/// checked against the tensors there: a file whose metadata and tensors
+/// disagree is refused by name rather than read as if the metadata were a
+/// comment. The front end's two tensors are given out by
+/// [`Model::ced_front_end`], not recomputed here — the converter baked them.
+#[derive(Clone, Debug)]
+pub struct CedConfig {
+    pub embed_dim: usize,
+    pub depth: usize,
+    pub heads: usize,
+    pub mlp_ratio: f32,
+    pub output_dim: usize,
+    pub qkv_bias: bool,
+    pub patch_size: usize,
+    pub patch_stride: usize,
+    /// `ced.target_length` — the mel frames one window holds.
+    pub target_length: usize,
+    pub pooling: String,
+    pub ln_eps_encoder: f32,
+    pub ln_eps_head: f32,
+    pub bn_eps: f32,
+    /// `ced.sample_rate` — the rate the signal must arrive at. Recorded rather
+    /// than used: the file's filterbank already fixes the bins.
+    pub sample_rate: usize,
+    pub n_mels: usize,
+    pub n_fft: usize,
+    pub win_size: usize,
+    pub hop_size: usize,
+    pub n_freqs: usize,
+    /// `ced.f_min`/`ced.f_max` — the band the file's own filterbank was built
+    /// over. Recorded rather than used: the filters arrive as a tensor, so
+    /// recomputing them from these two numbers would be a second front end.
+    pub f_min: f32,
+    pub f_max: f32,
+    pub center: bool,
+    /// `ced.a2db_multiplier` — 10 for a power spectrogram.
+    pub a2db_multiplier: f32,
+    pub a2db_amin: f32,
+    pub a2db_top_db: f32,
+    pub a2db_ref: f32,
+    /// The AudioSet ontology, one name per output column.
+    pub labels: Vec<String>,
+}
+
+/// The token grid the tagger's graph reshapes to, stated once: the shape check
+/// against the file's tensors and the graph that computes them read these, so a
+/// file the check blesses cannot be one the graph mis-reshapes.
+impl CedConfig {
+    /// Mel columns one window's patches span.
+    pub fn time_tokens(&self) -> usize {
+        (self.target_length - self.patch_size) / self.patch_stride + 1
+    }
+
+    /// Mel rows one window's patches span — `4` on this file.
+    pub fn freq_tokens(&self) -> usize {
+        (self.n_mels - self.patch_size) / self.patch_stride + 1
+    }
+
+    /// The tokens one window makes — `252` on this file.
+    pub fn token_count(&self) -> usize {
+        self.time_tokens() * self.freq_tokens()
+    }
+
+    /// The columns one token holds: one patch, `patch_size²`.
+    pub fn patch_width(&self) -> usize {
+        self.patch_size * self.patch_size
+    }
+
+    /// The MLP's hidden width, as the file's own ratio computes it.
+    pub fn ffn(&self) -> usize {
+        (self.embed_dim as f32 * self.mlp_ratio) as usize
+    }
+}
+
 /// Which of the three roles a file belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -386,7 +467,9 @@ impl Role {
 pub struct Model {
     pub path: PathBuf,
     pub file: GgufFile,
-    pub role: Role,
+    /// The role a pair names this file for — `None` for [`Model::open_ced`]'s
+    /// tagger, which no pair holds and which therefore has no role to claim.
+    pub role: Option<Role>,
     /// `true` for the `mmproj` (sound) files. What that means for the weights is
     /// the rule below: rank-2 weights keep the file's own quantised bytes, the
     /// non-linear sound tensors go to the host as f32.
@@ -395,6 +478,8 @@ pub struct Model {
     pub clip: Option<ClipConfig>,
     /// The embeddings file's own config — set only by `gemma-embedding2`.
     pub gemma: Option<GemmaConfig>,
+    /// The audio tagger's own config — set only by [`Model::open_ced`].
+    pub ced: Option<CedConfig>,
     pub plans: Vec<Plan>,
     by_name: HashMap<String, usize>,
 }
@@ -577,14 +662,100 @@ impl Model {
         Ok(Self {
             path,
             file,
-            role,
+            role: Some(role),
             sound,
             config,
             clip,
             gemma,
+            ced: None,
             plans,
             by_name,
         })
+    }
+
+    /// Open a **CED** audio tagger (a `ced` architecture file) read-only and plan
+    /// every tensor in it under this file's own store rule.
+    ///
+    /// It is a separate constructor rather than a fourth [`Role`]: a tagger is
+    /// not a body, not an `mmproj` and not a text tower, it is never paired with
+    /// another file, and the one rule that differs — the store — must not reach
+    /// the three files [`Model::open`] serves. Its [`Model::role`] is therefore
+    /// `None`.
+    ///
+    /// The store rule here is the tagger's own: a **rank-2 F16** tensor is kept
+    /// as f16 (`Store::F16Linear`), everything F32 stays as the file's bytes, and
+    /// any other F16 goes to the host as f32. This file is f16 end to end — its
+    /// 49 weight matrices are `F16` in the file — which is why the rule exists at
+    /// all: under [`Model::open`]'s rule every one of them would be widened.
+    /// Which bytes a multiply then reads — the f16 halves or their f32 image —
+    /// is the backend's decision per shape; [`crate::ced`] records which of the
+    /// two this tagger's geometry lands on.
+    pub fn open_ced(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file = GgufFile::from_path_mmap(&path)
+            .with_context(|| format!("open gguf {}", path.display()))?;
+        let arch = meta_str(&file, "general.architecture").unwrap_or("");
+        if arch != "ced" {
+            bail!(
+                "{} is not an audio tagger: general.architecture is `{arch}`, not `ced`",
+                path.display()
+            );
+        }
+        let ced = merge_ced(&file, arch)?;
+        let mut plans: Vec<Plan> = Vec::with_capacity(file.tensors.len());
+        for t in file.tensors.values() {
+            let rank = t.shape.len();
+            let class = classify(&t.name, rank);
+            let dims: Vec<usize> = t.shape.iter().rev().copied().collect();
+            let store = match quant_of(t.dtype) {
+                Some(_) => Store::Packed,
+                None => match t.dtype {
+                    GgmlType::F16 if class == Class::Linear2D => Store::F16Linear,
+                    GgmlType::F32 => Store::F32File,
+                    GgmlType::F16 | GgmlType::BF16 => Store::F16Widened,
+                    other => bail!("tensor {} has unhandled type {}", t.name, other.name()),
+                },
+            };
+            plans.push(Plan {
+                name: t.name.clone(),
+                ggml_shape: t.shape.clone(),
+                dims,
+                file: t.dtype,
+                class,
+                store,
+            });
+        }
+        plans.sort_by(|a, b| a.name.cmp(&b.name));
+        check_ced_tensors(&file, &ced)?;
+        let by_name = plans
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.name.clone(), i))
+            .collect();
+        Ok(Self {
+            path,
+            file,
+            role: None,
+            sound: false,
+            config: None,
+            clip: None,
+            gemma: None,
+            ced: Some(ced),
+            plans,
+            by_name,
+        })
+    }
+
+    /// The tagger's front end as the file bakes it: `(filterbank, window)`.
+    ///
+    /// The filterbank is mel-major — `n_mels` rows of `n_freqs` — and the window
+    /// is the periodic Hann of `win_size` points. Neither is computed here: a
+    /// front end that recomputed them would be a second definition of the
+    /// model's own, free to drift from the one the weights were trained against.
+    pub fn ced_front_end(&self) -> Result<(Vec<f32>, Vec<f32>)> {
+        let filterbank = self.f32_file_order("ced.mel_filterbank")?.0;
+        let window = self.f32_file_order("ced.mel_window")?.0;
+        Ok((filterbank, window))
     }
 
     pub fn plan(&self, name: &str) -> Result<&Plan> {
@@ -728,6 +899,26 @@ impl Model {
     /// The file's own bytes for a tensor, read on demand: `pread` into a buffer
     /// that lives only for this tensor, so the checkpoint's pages never enter the
     /// process's resident set behind the uploaded copy ([`GgufFile::read_tensor_bytes_into`]).
+    /// The tensor as the file holds it, borrowed from the mapping — the same bytes
+    /// [`Model::raw`] copies.
+    pub fn raw_slice(&self, name: &str) -> Result<&[u8]> {
+        let t = self
+            .file
+            .get(name)
+            .ok_or_else(|| anyhow!("tensor `{name}` is not in {}", self.path.display()))?;
+        self.file.tensor_bytes(t)
+    }
+
+    /// The tensor's size in bytes, without reading it.
+    pub fn raw_len(&self, name: &str) -> Result<usize> {
+        let t = self
+            .file
+            .get(name)
+            .ok_or_else(|| anyhow!("tensor `{name}` is not in {}", self.path.display()))?;
+        bytes_for_public(t.dtype, t.n_elements())
+            .ok_or_else(|| anyhow!("`{name}`: {} elements are not whole blocks", t.n_elements()))
+    }
+
     pub fn raw(&self, name: &str) -> Result<Vec<u8>> {
         let t = self
             .file
@@ -1121,6 +1312,240 @@ fn check_gemma_tensors(file: &GgufFile, g: &GemmaConfig) -> Result<()> {
     Ok(())
 }
 
+/// Merge the `ced.*` metadata of an audio tagger into a [`CedConfig`].
+///
+/// Every key is compulsory: the front end's arithmetic is the file's own — its
+/// clamp, its window, its `amin` — so a default here would be a second, silently
+/// different front end. Each refusal names the key it read.
+fn merge_ced(file: &GgufFile, arch: &str) -> Result<CedConfig> {
+    let u = |suffix: &str| -> Result<usize> {
+        let key = format!("{arch}.{suffix}");
+        match file.metadata.get(&key) {
+            Some(v) => v
+                .as_u32()
+                .map(|x| x as usize)
+                .ok_or_else(|| anyhow!("metadata key `{key}` is {}, not a u32", meta_type(v))),
+            None => Err(anyhow!("metadata key `{key}` is missing")),
+        }
+    };
+    let f = |suffix: &str| -> Result<f32> {
+        let key = format!("{arch}.{suffix}");
+        match file.metadata.get(&key) {
+            Some(MetaValue::F32(v)) => Ok(*v),
+            Some(MetaValue::F64(v)) => Ok(*v as f32),
+            Some(v) => Err(anyhow!(
+                "metadata key `{key}` is {}, not a float",
+                meta_type(v)
+            )),
+            None => Err(anyhow!("metadata key `{key}` is missing")),
+        }
+    };
+    let b = |suffix: &str| -> Result<bool> {
+        let key = format!("{arch}.{suffix}");
+        match file.metadata.get(&key) {
+            Some(MetaValue::Bool(v)) => Ok(*v),
+            Some(v) => Err(anyhow!(
+                "metadata key `{key}` is {}, not a bool",
+                meta_type(v)
+            )),
+            None => Err(anyhow!("metadata key `{key}` is missing")),
+        }
+    };
+    let s = |suffix: &str| -> Result<String> {
+        let key = format!("{arch}.{suffix}");
+        match file.metadata.get(&key) {
+            Some(MetaValue::String(v)) => Ok(v.clone()),
+            Some(v) => Err(anyhow!(
+                "metadata key `{key}` is {}, not a string",
+                meta_type(v)
+            )),
+            None => Err(anyhow!("metadata key `{key}` is missing")),
+        }
+    };
+    let labels = {
+        let key = format!("{arch}.labels");
+        match file.metadata.get(&key) {
+            Some(MetaValue::Array(items)) => items
+                .iter()
+                .map(|v| match v {
+                    MetaValue::String(s) => Ok(s.clone()),
+                    other => Err(anyhow!(
+                        "metadata key `{key}` holds a {}, not a string",
+                        meta_type(other)
+                    )),
+                })
+                .collect::<Result<Vec<String>>>()?,
+            Some(v) => bail!("metadata key `{key}` is {}, not an array", meta_type(v)),
+            None => bail!("metadata key `{key}` is missing"),
+        }
+    };
+    let config = CedConfig {
+        embed_dim: u("embed_dim")?,
+        depth: u("depth")?,
+        heads: u("num_heads")?,
+        mlp_ratio: f("mlp_ratio")?,
+        output_dim: u("outputdim")?,
+        qkv_bias: b("qkv_bias")?,
+        patch_size: u("patch_size")?,
+        patch_stride: u("patch_stride")?,
+        target_length: u("target_length")?,
+        pooling: s("pooling")?,
+        ln_eps_encoder: f("ln_eps_encoder")?,
+        ln_eps_head: f("ln_eps_head")?,
+        bn_eps: f("bn_eps")?,
+        sample_rate: u("sample_rate")?,
+        n_mels: u("n_mels")?,
+        n_fft: u("n_fft")?,
+        win_size: u("win_size")?,
+        hop_size: u("hop_size")?,
+        n_freqs: u("n_freqs")?,
+        f_min: f("f_min")?,
+        f_max: f("f_max")?,
+        center: b("center")?,
+        a2db_multiplier: f("a2db_multiplier")?,
+        a2db_amin: f("a2db_amin")?,
+        a2db_top_db: f("a2db_top_db")?,
+        a2db_ref: f("a2db_ref")?,
+        labels,
+    };
+
+    // ── the arithmetic the metadata itself has to settle ──
+    // These are relations between keys, not between keys and tensors, so they
+    // are refused here, before any tensor is looked at: a caller that asks about
+    // one of them gets the key it asked about.
+    if config.heads == 0 || !config.embed_dim.is_multiple_of(config.heads) {
+        bail!(
+            "metadata key `{arch}.embed_dim` is {}, which is not a whole number of \
+             head widths (`{arch}.num_heads` is {})",
+            config.embed_dim,
+            config.heads
+        );
+    }
+    if config.patch_stride == 0 {
+        bail!("metadata key `{arch}.patch_stride` is 0");
+    }
+    if config.patch_size != config.patch_stride {
+        bail!(
+            "metadata key `{arch}.patch_size` is {} but `{arch}.patch_stride` is {}: the \
+             patch matrix is the convolution only when the kernel does not overlap itself",
+            config.patch_size,
+            config.patch_stride
+        );
+    }
+    if config.target_length < config.patch_size {
+        bail!(
+            "metadata key `{arch}.target_length` is {}, shorter than one {} frame patch",
+            config.target_length,
+            config.patch_size
+        );
+    }
+    if config.n_mels < config.patch_size {
+        bail!(
+            "metadata key `{arch}.n_mels` is {}, shorter than one {} band patch",
+            config.n_mels,
+            config.patch_size
+        );
+    }
+    if config.win_size != config.n_fft {
+        bail!(
+            "metadata key `{arch}.win_size` is {} but `{arch}.n_fft` is {}: a short window \
+             would have to be centred in the transform, and this front end does not",
+            config.win_size,
+            config.n_fft
+        );
+    }
+    if config.n_freqs != config.n_fft / 2 + 1 {
+        bail!(
+            "metadata key `{arch}.n_freqs` is {}, not the {} bins a {}-point real transform has",
+            config.n_freqs,
+            config.n_fft / 2 + 1,
+            config.n_fft
+        );
+    }
+    if !config.center {
+        bail!("metadata key `{arch}.center` is false: this front end reflect-pads half a window");
+    }
+    if config.a2db_ref != 1.0 {
+        bail!(
+            "metadata key `{arch}.a2db_ref` is {}: this front end's dB scale is relative to 1.0",
+            config.a2db_ref
+        );
+    }
+    if config.pooling != "mean" {
+        bail!(
+            "metadata key `{arch}.pooling` is `{}`: this graph pools its tokens by mean",
+            config.pooling
+        );
+    }
+    if config.labels.len() != config.output_dim {
+        bail!(
+            "metadata key `{arch}.labels` has {} entries but `{arch}.outputdim` is {}",
+            config.labels.len(),
+            config.output_dim
+        );
+    }
+    Ok(config)
+}
+
+/// Check a [`CedConfig`] against the file's own tensors — every shape the graph
+/// reshapes, narrows or multiplies is named, so a file whose metadata and
+/// tensors disagree is refused here rather than computed with into nonsense.
+fn check_ced_tensors(file: &GgufFile, c: &CedConfig) -> Result<()> {
+    let want = |name: &str, expect: &[usize]| -> Result<()> {
+        let got = file
+            .get(name)
+            .map(|t| t.shape.clone())
+            .ok_or_else(|| anyhow!("tensor `{name}` is missing"))?;
+        if got.as_slice() != expect {
+            bail!("`{name}` is {got:?}, the config says {expect:?}");
+        }
+        Ok(())
+    };
+    let d = c.embed_dim;
+    let ffn = c.ffn();
+    let (ow, oh) = (c.time_tokens(), c.freq_tokens());
+
+    want("ced.mel_filterbank", &[c.n_freqs, c.n_mels])?;
+    want("ced.mel_window", &[c.win_size])?;
+    // The two position tables are declared with a trailing unit axis and their
+    // position axis first, so the axes that carry the numbers are ne[0], ne[2]
+    // for the time table and ne[1], ne[2] for the frequency one.
+    want("encoder.time_pos_embed", &[ow, 1, d, 1])?;
+    want("encoder.freq_pos_embed", &[1, oh, d, 1])?;
+    for t in ["weight", "bias", "running_mean", "running_var"] {
+        want(&format!("encoder.init_bn.{t}"), &[c.n_mels])?;
+    }
+    want(
+        "encoder.patch_embed.proj.weight",
+        &[c.patch_size, c.patch_size, 1, d],
+    )?;
+    want("encoder.patch_embed.proj.bias", &[d])?;
+    for il in 0..c.depth {
+        let p = format!("encoder.blocks.{il}");
+        for t in ["norm1", "norm2"] {
+            want(&format!("{p}.{t}.weight"), &[d])?;
+            want(&format!("{p}.{t}.bias"), &[d])?;
+        }
+        want(&format!("{p}.attn.qkv.weight"), &[d, 3 * d])?;
+        if c.qkv_bias {
+            want(&format!("{p}.attn.qkv.bias"), &[3 * d])?;
+        }
+        want(&format!("{p}.attn.proj.weight"), &[d, d])?;
+        want(&format!("{p}.attn.proj.bias"), &[d])?;
+        want(&format!("{p}.mlp.fc1.weight"), &[d, ffn])?;
+        want(&format!("{p}.mlp.fc1.bias"), &[ffn])?;
+        want(&format!("{p}.mlp.fc2.weight"), &[ffn, d])?;
+        want(&format!("{p}.mlp.fc2.bias"), &[d])?;
+    }
+    want("encoder.norm.weight", &[d])?;
+    want("encoder.norm.bias", &[d])?;
+    want("outputlayer.0.weight", &[d])?;
+    want("outputlayer.0.bias", &[d])?;
+    want("outputlayer.1.weight", &[d, c.output_dim])?;
+    want("outputlayer.1.bias", &[c.output_dim])?;
+    Ok(())
+}
+
 /// Merge the `clip.*` metadata of an `mmproj` into a typed config.
 fn merge_clip(file: &GgufFile) -> ClipConfig {
     let take = |key: &str| -> Option<u32> { meta_u32(file, key) };
@@ -1276,8 +1701,12 @@ impl Pair {
         };
 
         // 1. The roles must agree.
-        let want_role = body.role.name().to_string();
-        let got_role = sound.role.name().to_string();
+        let role_name = |m: &Model| {
+            m.role
+                .map_or_else(|| "no role".to_string(), |r| r.name().to_string())
+        };
+        let want_role = role_name(&body);
+        let got_role = role_name(&sound);
         if !check(want_role.clone(), got_role.clone()) {
             return fail("roles agree", &want_role, &got_role);
         }

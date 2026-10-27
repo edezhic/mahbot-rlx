@@ -550,6 +550,10 @@ name = "vision_norm2d_reverse_device"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "weight_scope_skip"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "wgpu_fft_q_ingraph"
 required-features = ["backend-tests"]
 

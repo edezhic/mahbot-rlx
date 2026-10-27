@@ -1585,7 +1585,17 @@ pub(crate) fn compile_static_inner(
     // as its name says; without the flag reaching this decision, the parked-operand
     // half of `should_host_at_ceiling` would only be reachable on adapters whose plan
     // happens to exceed the bind window.
+    // A declared sharing scope means this model compiles more than one graph, and only a
+    // parked parameter lives in the weight buffer a later compile can skip uploading
+    // (`set_param_sharing_scope`). A graph with no parameter has nothing to park, and
+    // re-planning it through the split pass is pure cost.
+    let shares_params = crate::buffer::param_sharing_declared()
+        && graph
+            .nodes()
+            .iter()
+            .any(|node| matches!(&node.op, rlx_ir::Op::DequantMatMul { .. }));
     let mut arena = if rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
+        || shares_params
         || (plan.arena_size + scratch_bytes) as u64 > max_bind
     {
         // This constructor has the graph, so it records the parameter-storage bounds

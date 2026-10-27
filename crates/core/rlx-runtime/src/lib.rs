@@ -51,12 +51,17 @@
 /// since parameter *content* arrives later via `set_param`. So the caller
 /// declares it: pass a stable label per model (a weights path works well).
 ///
-/// No-op unless a backend that supports sharing is compiled in. Today that is
-/// CUDA, additionally gated behind `RLX_CUDA_SHARED_PARAMS=1`.
+/// No-op unless a backend that supports sharing is compiled in. Today: `wgpu`,
+/// which skips re-uploading a parameter whose bytes a previous compile for the same
+/// label already placed in the process-wide shared weight buffer (see
+/// `rlx_wgpu::buffer::set_param_sharing_scope`), and CUDA, which shares one VMM
+/// region per label but only behind `RLX_CUDA_SHARED_PARAMS=1`.
 pub fn set_param_sharing_scope(label: &str) {
     #[cfg(feature = "cuda")]
     rlx_cuda::vmem::set_scope_from_label(label);
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(feature = "gpu")]
+    rlx_wgpu::buffer::set_param_sharing_scope(label);
+    #[cfg(not(any(feature = "cuda", feature = "gpu")))]
     let _ = label;
 }
 

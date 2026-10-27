@@ -909,9 +909,9 @@ pub fn encoder(model: Arc<Model>, rows: usize) -> Result<BuiltModel> {
     Ok(built)
 }
 
-/// Compile the embedding graph with the weight-concat fusions off for the one
-/// compile that reads the switch, restoring the process's previous overrides on
-/// return.
+/// Compile an encoder-style graph — the embedding encoder and the tagger's ViT —
+/// with the weight-concat fusions off for the one compile that reads the switch,
+/// restoring the process's previous overrides on return.
 ///
 /// `FuseSharedInputMatMul` builds q/k/v — and gate/up — as ONE `Concat` over
 /// the three weights. That takes the multiply's B out of the `Param` role, and
@@ -3009,6 +3009,20 @@ pub struct Runner {
 
 impl Runner {
     pub fn compile(device: Device, mut built: BuiltModel) -> Result<Self> {
+        // Declare which model these weights belong to, so the backend can skip
+        // re-uploading a graph shape's weights when a previous compile of the same
+        // file already placed them: a recognition call compiles one graph per chunk
+        // length, and each otherwise pays a full body upload (~0.15 s). The label is
+        // the weight file the graph's tensors were served from; a graph whose tensors
+        // come from two files — or from none — declares nothing and uploads.
+        let scope = emit::scope_of(
+            built
+                .params
+                .keys()
+                .map(String::as_str)
+                .chain(built.typed_params.iter().map(|(name, _, _)| name.as_str())),
+        );
+        rlx_runtime::set_param_sharing_scope(scope.as_deref().unwrap_or(""));
         let hir = built
             .module
             .into_hir()
@@ -3022,15 +3036,34 @@ impl Runner {
         // own copy would put two checkpoints in the process. So the entry leaves
         // the map before its clone goes to the device, not after the map has been
         // walked whole.
+        // Where each parameter's bytes really are, for the ones the build did not carry
+        // (`emit`): a weight the process already read is bound from memory, and a packed
+        // tensor straight from the mapped file — a read the write skip then makes free,
+        // when the shape's slots already hold the model's bytes.
+        let origins = emit::take_origins();
         let t = crate::report::Stopwatch::start();
         while let Some(name) = built.params.keys().next().cloned() {
             let values = built.params.remove(&name).expect("key just read");
-            session.set_param(&name, &values);
+            match emit::host_weight(&origins, &name) {
+                Some(shared) => session.set_param(&name, &shared),
+                None => session.set_param(&name, &values),
+            }
         }
         while let Some((name, bytes, dt)) = built.typed_params.pop() {
-            session.set_param_typed(&name, &bytes, dt);
+            if let Some(bytes) = emit::blob_weight(&origins, &name) {
+                session.set_param_typed(&name, &bytes, dt);
+            } else if let Some((model, key)) = emit::mapped_weight(&origins, &name) {
+                session.set_param_typed(&name, model.raw_slice(&key)?, dt);
+            } else {
+                session.set_param_typed(&name, &bytes, dt);
+            }
         }
+        emit::clear_origins();
         let upload_ms = t.ms();
+        // The declaration lives only for this compile: the arena captured the scope it
+        // was planned under, so the writes above already used it, and leaving it set
+        // would let a later compile that declares nothing inherit this model's weights.
+        rlx_runtime::set_param_sharing_scope("");
         Ok(Self {
             session,
             graph,
@@ -3917,6 +3950,57 @@ impl rlx_flow::WeightSource for NoWeights {
     fn has(&self, _key: &str) -> bool {
         false
     }
+}
+
+/// The weight bytes one run of `graph` streams: every dense and packed matrix and
+/// every convolution its nodes read, counted **once per read**. This is the
+/// numerator of every per-phase rate in `MEASUREMENTS.md`, which is why it counts a
+/// block the predictor reads at each of its levels once per level — the block is
+/// streamed that many times, and a rate over the graph's *resident* bytes would
+/// overstate what the memory system delivered. Only an operand that **is** a
+/// parameter counts: an activation the shape happens to put in that position is the
+/// phase's own traffic, not its weight stream. Norms' and attention's small vectors,
+/// gathered table rows (a row read is not the table) and the input side are outside
+/// this figure.
+///
+/// Only a node that can reach an output counts, for the same reason: the multiply a
+/// dead branch carries costs no bytes once the runtime's cleanup drops it, and the
+/// predictor's level-0 stack is exactly that — its last block's output feeds nothing
+/// (level 1 embeds the drawn code), so counting it would price a read the schedule
+/// never issues.
+pub fn stream_bytes(graph: &rlx_ir::Graph) -> u64 {
+    let mut live: std::collections::HashSet<rlx_ir::NodeId> =
+        graph.outputs.iter().copied().collect();
+    let mut stack: Vec<rlx_ir::NodeId> = graph.outputs.clone();
+    while let Some(id) = stack.pop() {
+        for &input in &graph.node(id).inputs {
+            if live.insert(input) {
+                stack.push(input);
+            }
+        }
+    }
+    let mut total = 0u64;
+    for node in graph.nodes() {
+        let reads_weights = matches!(
+            node.op,
+            rlx_ir::Op::DequantMatMul { .. }
+                | rlx_ir::Op::MatMul
+                | rlx_ir::Op::Conv { .. }
+                | rlx_ir::Op::ConvTranspose2d { .. }
+        );
+        if !reads_weights || !live.contains(&node.id) {
+            continue;
+        }
+        let Some(weight) = node.inputs.get(1) else {
+            continue;
+        };
+        let weight = graph.node(*weight);
+        if !matches!(weight.op, rlx_ir::Op::Param { .. }) {
+            continue;
+        }
+        total += weight.shape.size_bytes().unwrap_or(0) as u64;
+    }
+    total
 }
 
 #[cfg(test)]

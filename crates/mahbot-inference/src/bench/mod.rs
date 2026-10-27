@@ -62,10 +62,24 @@
 //! directory; the synthesized corpus has one fixed, durable location instead
 //! (below). There is no crate-relative path and no network access.
 //!
-//! A completed run also rewrites this surface's section of the repository's
-//! `MEASUREMENTS.md` (see [`crate::measurements`]); `MAHBOT_MEASUREMENTS` points
-//! that write at another file, which is how a run can be checked without editing
-//! the tree.
+//! # The record
+//!
+//! One run is this surface's benchmark: it scores with the shipped threshold set
+//! over all three measurements, reports `complete`, and rewrites this surface's
+//! section of the repository's `MEASUREMENTS.md` (see [`crate::measurements`]);
+//! `MAHBOT_MEASUREMENTS` points that write at another file, which is how a run
+//! can be checked without editing the tree.
+//!
+//! # Pricing an operating point
+//!
+//! `--wake-thresholds` overrides the firing-threshold set ([`crate::wake`]) and
+//! `--phases` takes a subset of the three measurements — the recall stream alone
+//! prices a candidate in half a minute instead of the run's five. Both are
+//! measurement aids, and the classification is by value rather than by flag: a
+//! run that prices another set, or measures a subset, reports `screened` and
+//! leaves `MEASUREMENTS.md` alone even when it measured all three phases, while a
+//! run that states the shipped set — naming it or not — over all three phases is
+//! the benchmark and writes the record.
 //!
 //! # The synthesized corpus
 //!
@@ -83,6 +97,9 @@ pub(crate) mod config;
 mod detect;
 mod real_audio;
 mod sets;
+// The stand transcribes the same corpus the false-accept phase feeds, so its pin
+// is named from `crate::stand` without opening the bench's private modules.
+pub(crate) use sets::REAL_AUDIO_FILES;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -178,26 +195,17 @@ pub fn run() -> Result<()> {
     );
 
     let measured = measure(&cfg, deadline, ceiling, &progress);
-    // What was measured nothing: a rate with no denominator, or no phase at all.
+    // A denominator that measured nothing: a rate with no denominator.
     let unmeasured = match &measured {
-        Ok(()) => require_measured(&state(&progress)).err(),
+        Ok(()) => require_measured(&state(&progress), cfg.phases).err(),
         Err(_) => None,
     };
-    // One classification drives the report, the console and the exit code.
-    let (status, stop) = match (&measured, &unmeasured) {
-        (Ok(()), None) => ("complete", None),
-        (Ok(()), Some(error)) => (
-            "incomplete",
-            Some((state(&progress).current, format!("{error:#}"))),
-        ),
-        (Err(error), _) => match error.downcast_ref::<Abort>() {
-            Some(abort) => ("aborted", Some((abort.phase(), abort.to_string()))),
-            None => (
-                "failed",
-                Some((state(&progress).current, format!("{error:#}"))),
-            ),
-        },
-    };
+    let (status, stop) = classify(
+        &cfg,
+        &measured,
+        unmeasured.as_ref(),
+        state(&progress).current,
+    );
     let write = report.write(
         &cfg,
         &progress,
@@ -241,35 +249,22 @@ pub fn run() -> Result<()> {
     }
 
     let progress = state(&progress);
-    let recall = progress.recall.as_ref().expect("complete run has recall");
-    let non_phrase = progress
-        .non_phrase
-        .as_ref()
-        .expect("complete run has the non-phrase set");
-    let real = progress.real.as_ref().expect("complete run has real audio");
-    eprintln!(
-        "[wake-word] recognition {}/{} ({:.1}%) · false reactions {}/{} ({:.1}%)",
-        recall.detected,
-        recall.of,
-        recall.detected as f64 / recall.of as f64 * 100.0,
-        non_phrase.fired.len(),
-        non_phrase.of,
-        non_phrase.fired.len() as f64 / non_phrase.of as f64 * 100.0,
-    );
-    eprintln!(
-        "[wake-word] real audio: {} files, {:.2} h audio ({:.2} h speech, {:.2} h VAD-active), \
-         {} FA events · {:.4}/h over VAD-active speech (the headline's denominator), \
-         {:.4}/h over wall-clock audio · one stream · {:.1}s wall · peak {} MiB",
-        real.files_fed,
-        real.audio_hours,
-        real.speech_hours,
-        real.vad_active_hours,
-        real.events,
-        real.events as f64 / real.vad_active_hours,
-        real.events as f64 / real.audio_hours,
-        real.wall_secs,
-        crate::report::peak_rss() / (1024 * 1024),
-    );
+    if let Some(real) = &progress.real {
+        eprintln!(
+            "[wake-word] real audio: {} files, {:.2} h audio ({:.2} h speech, {:.2} h VAD-active), \
+             {} FA events · {:.4}/h over VAD-active speech (the headline's denominator), \
+             {:.4}/h over wall-clock audio · one stream · {:.1}s wall · peak {} MiB",
+            real.files_fed,
+            real.audio_hours,
+            real.speech_hours,
+            real.vad_active_hours,
+            real.events,
+            real.events as f64 / real.vad_active_hours,
+            real.events as f64 / real.audio_hours,
+            real.wall_secs,
+            crate::report::peak_rss() / (1024 * 1024),
+        );
+    }
     let corpus = progress.synthesis;
     eprintln!(
         "[wake-word] corpus {}: {} of {} clips reused, {} synthesized in {:.1}s",
@@ -294,105 +289,204 @@ pub fn run() -> Result<()> {
         );
         std::process::exit(EXIT_STOPPED);
     };
-    record(&cfg, &written).with_context(|| {
-        format!(
-            "the measurement completed but {} could not be refreshed",
+    // Only the benchmark itself is the record: a screened run priced a candidate
+    // point and says so instead.
+    if status == COMPLETE {
+        measurements::refresh("bench", &record_body(&written)).with_context(|| {
+            format!(
+                "the measurement completed but {} could not be refreshed",
+                measurements::path().display()
+            )
+        })?;
+    } else {
+        eprintln!(
+            "[wake-word] screened run at {} — the record {} is left to the benchmark",
+            progress.point(&cfg),
             measurements::path().display()
-        )
-    })?;
+        );
+    }
     Ok(())
 }
 
-/// Replace the bench's section of `MEASUREMENTS.md` with this run's numbers —
-/// read out of the report this run wrote, so the file and the JSON cannot state
-/// the same fact twice or a degenerate rate differently.
-fn record(cfg: &BenchConfig, report: &Value) -> Result<()> {
-    let number = |value: Option<&Value>| value.and_then(Value::as_f64).unwrap_or(0.0);
+/// The status of the benchmark itself — the only one whose numbers the record
+/// states. One name for the producer and the gate, so they cannot desynchronize.
+const COMPLETE: &str = "complete";
+
+/// The one classification that drives the report, the console and the record.
+///
+/// `complete` is the benchmark itself: the shipped threshold set over all three
+/// phases. A run that priced a candidate — another set, or a subset of the
+/// phases — is `screened` and never writes the record, even when it measured
+/// everything; anything that stopped is named with the phase and the reason.
+fn classify(
+    cfg: &BenchConfig,
+    measured: &Result<()>,
+    unmeasured: Option<&anyhow::Error>,
+    phase: &'static str,
+) -> (&'static str, Option<(&'static str, String)>) {
+    let benchmark = cfg.thresholds == wake::Thresholds::DEFAULT && cfg.phases.is_full();
+    match (&measured, &unmeasured) {
+        (Ok(()), None) if benchmark => (COMPLETE, None),
+        (Ok(()), None) => ("screened", None),
+        (Ok(()), Some(error)) => ("incomplete", Some((phase, format!("{error:#}")))),
+        (Err(error), _) => match error.downcast_ref::<Abort>() {
+            Some(abort) => ("aborted", Some((abort.phase(), abort.to_string()))),
+            None => ("failed", Some((phase, format!("{error:#}")))),
+        },
+    }
+}
+
+/// What a bench row prints for a figure its report does not carry: the same words
+/// every row uses, so no figure is ever printed as a zero the run did not measure.
+const UNAVAILABLE: &str = "not in the report";
+
+/// One row of the record's table: the figures the row states, or [`UNAVAILABLE`].
+fn row(body: &mut String, label: &str, figures: Option<String>) {
+    body.push_str(&format!(
+        "| {label} | {} |\n",
+        figures.as_deref().unwrap_or(UNAVAILABLE)
+    ));
+}
+
+/// [`row`] for a row of numbers, each bound by name out of the report. The row is
+/// written with its render only when every figure it states is present.
+macro_rules! figure_row {
+    ($body:expr, $label:expr, [$($name:ident = $value:expr),+ $(,)?] => $render:expr) => {
+        row(
+            &mut $body,
+            $label,
+            match ($($value.and_then(Value::as_f64),)+) {
+                ($(Some($name),)+) => Some($render),
+                _ => None,
+            },
+        )
+    };
+}
+
+/// The bench section this run's report states — read out of the report the run
+/// itself wrote, so the file and the JSON cannot state the same fact twice or a
+/// degenerate rate differently.
+fn record_body(report: &Value) -> String {
     let mut body = String::new();
     body.push_str("## Wake-word bench\n\n");
     body.push_str(&format!("_Measured {}._\n\n", measurements::now()));
     body.push_str(&format!(
         "status: `{}`\n\n",
-        report.get("status").and_then(Value::as_str).unwrap_or("?")
+        report
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or(UNAVAILABLE)
     ));
     body.push_str("| metric | value |\n|---|---|\n");
-    if let Some(recognition) = report.get("recognition") {
-        body.push_str(&format!(
-            "| recall | {}/{} ({:.1} %) |\n",
-            recognition["detected"].as_u64().unwrap_or(0),
-            recognition["of"].as_u64().unwrap_or(0),
-            100.0 * number(recognition.get("rate")),
-        ));
-    }
+    let recognition = report.get("recognition");
+    figure_row!(body, "recall", [
+        detected = recognition.and_then(|node| node.get("detected")),
+        of = recognition.and_then(|node| node.get("of")),
+        rate = recognition.and_then(|node| node.get("rate")),
+    ] => format!("{detected}/{of} ({:.1} %)", 100.0 * rate));
+    let non_phrase = report
+        .get("false_reactions")
+        .and_then(|section| section.get("non_phrase_set"));
+    figure_row!(body, "false reactions", [
+        fired = non_phrase.and_then(|node| node.get("false_reactions")),
+        of = non_phrase.and_then(|node| node.get("of")),
+        rate = non_phrase.and_then(|node| node.get("rate")),
+    ] => format!("{fired}/{of} ({:.1} %)", 100.0 * rate));
     let real = report
         .get("false_reactions")
         .and_then(|section| section.get("real_audio"));
-    if let Some(set) = report
-        .get("false_reactions")
-        .and_then(|section| section.get("non_phrase_set"))
+    let fa = real.and_then(|section| section.get("fa"));
+    let feed = real.and_then(|section| section.get("feed"));
+    let hours = |key: &str| feed.and_then(|node| node.get(key)).and_then(Value::as_f64);
+    // Nothing is formatted for a row the report cannot state: without an event
+    // count the row names its absence.
+    match fa
+        .and_then(|node| node.get("events"))
+        .and_then(Value::as_u64)
     {
-        body.push_str(&format!(
-            "| false reactions | {}/{} ({:.1} %) |\n",
-            set["false_reactions"].as_u64().unwrap_or(0),
-            set["of"].as_u64().unwrap_or(0),
-            100.0 * number(set.get("rate")),
-        ));
-    }
-    if let (Some(fa), Some(feed)) = (
-        real.and_then(|section| section.get("fa")),
-        real.and_then(|section| section.get("feed")),
-    ) {
-        let events = fa["events"].as_u64().unwrap_or(0);
-        let mut cells = Vec::new();
-        for (key, label, hours_key) in [
-            (
-                "fa_per_hour_vad_active",
-                "VAD-active speech",
-                "vad_active_hours_fed",
-            ),
-            ("fa_per_hour_audio", "wall-clock audio", "audio_hours_fed"),
-        ] {
-            match fa.get(key).and_then(Value::as_f64) {
-                Some(rate) => cells.push(format!(
-                    "{rate:.4}/h over {label} ({:.3} h)",
-                    number(feed.get(hours_key))
-                )),
-                None => cells.push(format!("no rate: {label} measured no time")),
-            }
+        Some(events) => {
+            let cells: Vec<String> = [
+                (
+                    "fa_per_hour_vad_active",
+                    "VAD-active speech",
+                    "vad_active_hours_fed",
+                ),
+                ("fa_per_hour_audio", "wall-clock audio", "audio_hours_fed"),
+            ]
+            .into_iter()
+            .map(|(key, label, hours_key)| {
+                match fa.and_then(|node| node.get(key)).and_then(Value::as_f64) {
+                    Some(rate) => match hours(hours_key) {
+                        Some(hours) => format!("{rate:.4}/h over {label} ({hours:.3} h)"),
+                        None => format!("{rate:.4}/h over {label}"),
+                    },
+                    // A rate the report cannot divide names the denominator
+                    // that is missing rather than asserting a cause.
+                    None if hours(hours_key).is_some_and(|hours| hours <= 0.0) => {
+                        format!("no rate: {label} measured no time")
+                    }
+                    None => format!("no rate: {label} not in the report"),
+                }
+            })
+            .collect();
+            let ladder = hours("vad_active_hours_fed")
+                .filter(|hours| *hours > 0.0)
+                .map(|hours| format!(" · one event = {:.4}/h", 1.0 / hours))
+                .unwrap_or_default();
+            row(
+                &mut body,
+                "false accepts",
+                Some(format!("{events} events · {}{ladder}", cells.join(" · "))),
+            );
         }
-        body.push_str(&format!(
-            "| false accepts | {events} events · {} |\n",
-            cells.join(" · ")
-        ));
+        None => row(&mut body, "false accepts", None),
     }
-    body.push_str(&format!(
-        "| wall clock | {:.1} s |\n",
-        number(report.get("wall_clock_secs"))
-    ));
-    body.push_str(&format!(
-        "| peak resident | {} MiB |\n",
-        report["peak_rss_bytes"].as_u64().unwrap_or(0) / (1024 * 1024)
-    ));
-    if let Some(corpus) = report.get("corpus") {
-        body.push_str(&format!(
-            "| corpus | {} of {} clips reused, {} synthesized in {:.1} s |\n",
-            corpus["reused"].as_u64().unwrap_or(0),
-            corpus["clips"].as_u64().unwrap_or(0),
-            corpus["synthesized"].as_u64().unwrap_or(0),
-            number(corpus.get("synthesis_secs")),
-        ));
-    }
-    body.push_str(&format!(
-        "| windows per encoder pass | at most {} of {} · {} partial of {} passes |\n\n",
-        report["windows_per_pass"].as_u64().unwrap_or(0),
-        report["group_capacity"].as_u64().unwrap_or(0),
-        report["partial_passes"].as_u64().unwrap_or(0),
-        report["encoder_passes"].as_u64().unwrap_or(0),
-    ));
+    // The set the run priced, in the vocabulary `--wake-thresholds` reads, so the
+    // point can be replayed from the record by copy-paste.
+    row(
+        &mut body,
+        "thresholds",
+        report
+            .get("thresholds")
+            .and_then(Value::as_str)
+            .map(|line| format!("`{line}`")),
+    );
+    let calibration = report.get("calibration");
+    let derived = |key: &str| calibration.and_then(|node| node.get(key));
+    figure_row!(body, "derived point", [
+        floor = derived("derived_soft_floor"),
+        fire = derived("fire_factor"),
+        bar = derived("static_match_threshold"),
+        reset = derived("reset_soft"),
+    ] => format!("floor {floor:.4} · fire factor {fire:.4} · static bar {bar:.4} · reset {reset:.4}"));
+    figure_row!(body, "wall clock", [
+        secs = report.get("wall_clock_secs"),
+    ] => format!("{secs:.1} s"));
+    figure_row!(body, "peak resident", [
+        bytes = report.get("peak_rss_bytes"),
+    ] => format!("{:.0} MiB", bytes / (1024.0 * 1024.0)));
+    let corpus = report.get("corpus");
+    figure_row!(body, "corpus", [
+        reused = corpus.and_then(|node| node.get("reused")),
+        clips = corpus.and_then(|node| node.get("clips")),
+        synthesized = corpus.and_then(|node| node.get("synthesized")),
+        secs = corpus.and_then(|node| node.get("synthesis_secs")),
+    ] => format!("{reused} of {clips} clips reused, {synthesized} synthesized in {secs:.1} s"));
+    figure_row!(body, "windows per encoder pass", [
+        most = report.get("windows_per_pass"),
+        capacity = report.get("group_capacity"),
+        partial = report.get("partial_passes"),
+        passes = report.get("encoder_passes"),
+    ] => format!("at most {most} of {capacity} · {partial} partial of {passes} passes"));
+    body.push('\n');
     body.push_str("| phase | seconds |\n|---|---|\n");
     if let Some(phases) = report.get("phases").and_then(Value::as_object) {
         for (name, secs) in phases {
-            body.push_str(&format!("| {name} | {:.1} |\n", number(Some(secs))));
+            row(
+                &mut body,
+                name,
+                secs.as_f64().map(|secs| format!("{secs:.1}")),
+            );
         }
     }
     body.push_str("\nProvenance:\n\n");
@@ -400,35 +494,47 @@ fn record(cfg: &BenchConfig, report: &Value) -> Result<()> {
     body.push_str(&format!("- device: {}\n", measurements::device()));
     body.push_str(&format!("- profile: {}\n", measurements::profile()));
     body.push_str(&format!("- code: {}\n", measurements::code_state()));
-    body.push_str(&format!("- command: `{}`\n", cfg.command_line()));
-    if let Some(models) = report.get("models") {
-        let pin = |section: &str, key: Option<&str>| -> Option<&Value> {
-            let node = models.get(section)?;
-            key.map_or(Some(node), |key| node.get(key))
+    body.push_str(&format!(
+        "- command: `{}`\n",
+        report
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or(UNAVAILABLE)
+    ));
+    let models = report.get("models");
+    let pin = |section: &str, key: Option<&str>| -> Option<&Value> {
+        let node = models?.get(section)?;
+        key.map_or(Some(node), |key| node.get(key))
+    };
+    for (role, value) in [
+        ("ASR body", pin("recognition", Some("body"))),
+        ("ASR sound", pin("recognition", Some("sound"))),
+        ("TTS body", pin("synthesis", Some("body"))),
+        ("TTS sound", pin("synthesis", Some("sound"))),
+        ("voice", pin("voice_wav", None)),
+    ] {
+        // One behaviour for an absent pin: the bullet is written and names the
+        // absence, whether the report has no pin or a pin without the figure.
+        let Some(pin) = value else {
+            body.push_str(&format!("- {role}: {UNAVAILABLE}\n"));
+            continue;
         };
-        for (role, value) in [
-            ("ASR body", pin("recognition", Some("body"))),
-            ("ASR sound", pin("recognition", Some("sound"))),
-            ("TTS body", pin("synthesis", Some("body"))),
-            ("TTS sound", pin("synthesis", Some("sound"))),
-            ("voice", pin("voice_wav", None)),
-        ] {
-            if let Some(pin) = value {
-                body.push_str(&format!(
-                    "- {role}: `{}` · {} bytes · sha256 {}\n",
-                    pin.get("file")
-                        .and_then(Value::as_str)
-                        .unwrap_or("(unnamed)"),
-                    pin["bytes"].as_u64().unwrap_or(0),
-                    pin.get("sha256")
-                        .and_then(Value::as_str)
-                        .unwrap_or("(unhashed)")
-                ));
-            }
-        }
+        let bytes = pin
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .map(|bytes| format!("{bytes} bytes"))
+            .unwrap_or_else(|| UNAVAILABLE.to_string());
+        body.push_str(&format!(
+            "- {role}: `{}` · {bytes} · sha256 {}\n",
+            pin.get("file")
+                .and_then(Value::as_str)
+                .unwrap_or(UNAVAILABLE),
+            pin.get("sha256")
+                .and_then(Value::as_str)
+                .unwrap_or(UNAVAILABLE)
+        ));
     }
-    measurements::refresh("bench", &body)?;
-    Ok(())
+    body
 }
 
 /// What the run has measured so far. The complete and the stopped report are
@@ -440,7 +546,8 @@ struct Progress {
     inputs: Option<config::Inputs>,
     enrolment: Option<EnrollStats>,
     calibration: Option<wake::Calibration>,
-    geometry: Option<wake::DetectionGeometry>,
+    /// The threshold set the enrolment scores with — the point this run prices.
+    thresholds: Option<wake::Thresholds>,
     recall: Option<Recall>,
     non_phrase: Option<NonPhrase>,
     real: Option<real_audio::RealAudio>,
@@ -451,6 +558,14 @@ struct Progress {
     phases: std::collections::BTreeMap<&'static str, f64>,
 }
 
+impl Progress {
+    /// The point this run prices: the enrolment's own set once it exists, the
+    /// requested one before that.
+    fn point(&self, cfg: &BenchConfig) -> wake::Thresholds {
+        self.thresholds.unwrap_or(cfg.thresholds)
+    }
+}
+
 impl Default for Progress {
     fn default() -> Self {
         Self {
@@ -458,7 +573,7 @@ impl Default for Progress {
             inputs: None,
             enrolment: None,
             calibration: None,
-            geometry: None,
+            thresholds: None,
             recall: None,
             non_phrase: None,
             real: None,
@@ -549,80 +664,89 @@ fn measure(
     let (enrollment, stats) = phase(progress, "enrolment", || {
         deadline.check("enrolment")?;
         ceiling.check("enrolment")?;
-        enroll(&mut synth, &mut listener)
+        enroll(&mut synth, &mut listener, cfg.thresholds)
     })?;
     let calibration = enrollment.calibration.clone();
+    // The set the enrolment scores with, not the requested one: every figure the
+    // report derives is read from this same set.
+    let thresholds = enrollment.thresholds;
     let geometry = enrollment.geometry();
     eprintln!(
         "[wake-word] enrolment: {} of {} clips, {} utterances, neg_mean {:.4}, floor {:.4}, \
-         static threshold {:.4}",
+         fire factor {:.4}, static threshold {:.4}, reset {:.4}",
         stats.configured - stats.skipped.len(),
         stats.configured,
         stats.utterances,
         calibration.neg_mean,
-        calibration.soft_floor(),
-        geometry.static_threshold
+        calibration.soft_floor(&thresholds),
+        calibration.fire_soft(&thresholds),
+        geometry.static_threshold,
+        geometry.reset
     );
     {
         let mut p = state(progress);
         p.enrolment = Some(stats);
         p.calibration = Some(calibration);
-        p.geometry = Some(geometry);
+        p.thresholds = Some(thresholds);
     }
 
     // ── Recall: one warm continuous stream over the 50 phrase clips. ──
-    let recall_clips = phase(progress, "recall synthesis", || {
-        audio::recall_clips(&mut synth)
-    })?;
-    let recall = phase(progress, "recall", || {
-        deadline.check("recall")?;
-        ceiling.check("recall")?;
-        let (detected, first_pass, missed) =
-            measure_recognition(&enrollment, &mut listener, &recall_clips, deadline, ceiling)?;
-        Ok(Recall {
-            detected,
-            of: recall_clips.len(),
-            first_pass,
-            missed,
-        })
-    })?;
-    if !recall.missed.is_empty() {
-        eprintln!(
-            "[wake-word] missed recall clips: {}",
-            recall.missed.join(", ")
-        );
-    }
+    let recall = if cfg.phases.recall {
+        let clips = phase(progress, "recall synthesis", || {
+            audio::recall_clips(&mut synth)
+        })?;
+        let recall = phase(progress, "recall", || {
+            deadline.check("recall")?;
+            ceiling.check("recall")?;
+            let (detected, first_pass, missed) =
+                measure_recognition(&enrollment, &mut listener, &clips, deadline, ceiling)?;
+            Ok(Recall {
+                detected,
+                of: clips.len(),
+                first_pass,
+                missed,
+            })
+        })?;
+        if !recall.missed.is_empty() {
+            eprintln!(
+                "[wake-word] missed recall clips: {}",
+                recall.missed.join(", ")
+            );
+        }
+        eprintln!("[wake-word] recognition {}/{}", recall.detected, recall.of);
+        Some(recall)
+    } else {
+        None
+    };
 
     // ── False reactions: one warm continuous stream over the 121 clips. ──
-    let non_phrase_clips = phase(progress, "non-phrase synthesis", || {
-        audio::non_phrase_clips(&mut synth)
-    })?;
-    let non_phrase = phase(progress, "non-phrase", || {
-        deadline.check("non-phrase")?;
-        ceiling.check("non-phrase")?;
-        let fired = measure_false_reactions(
-            &enrollment,
-            &mut listener,
-            &non_phrase_clips,
-            deadline,
-            ceiling,
-        )?;
-        Ok(NonPhrase {
-            fired,
-            of: non_phrase_clips.len(),
-        })
-    })?;
-    eprintln!(
-        "[wake-word] recognition {}/{} · false reactions {}/{}",
-        recall.detected,
-        recall.of,
-        non_phrase.fired.len(),
-        non_phrase.of
-    );
+    let non_phrase = if cfg.phases.non_phrase {
+        let clips = phase(progress, "non-phrase synthesis", || {
+            audio::non_phrase_clips(&mut synth)
+        })?;
+        let non_phrase = phase(progress, "non-phrase", || {
+            deadline.check("non-phrase")?;
+            ceiling.check("non-phrase")?;
+            let fired =
+                measure_false_reactions(&enrollment, &mut listener, &clips, deadline, ceiling)?;
+            Ok(NonPhrase {
+                fired,
+                of: clips.len(),
+            })
+        })?;
+        eprintln!(
+            "[wake-word] false reactions {}/{}",
+            non_phrase.fired.len(),
+            non_phrase.of
+        );
+        Some(non_phrase)
+    } else {
+        None
+    };
     {
         let mut p = state(progress);
-        p.recall = Some(recall);
-        p.non_phrase = Some(non_phrase);
+        p.recall = recall;
+        p.non_phrase = non_phrase;
     }
 
     // The synthesis side is done: release its mapped pair and graphs before the
@@ -631,6 +755,9 @@ fn measure(
     drop(listener);
     drop(synth);
 
+    if !cfg.phases.real_audio {
+        return Ok(());
+    }
     // ── False accepts per hour: the pinned corpus through one stream. ──
     phase(progress, "real audio", || {
         deadline.check("real audio")?;
@@ -666,6 +793,11 @@ fn report_json(
     report.insert("wake_phrase".into(), json!(sets::WAKE_PHRASE));
     report.insert("timeout_secs".into(), json!(cfg.timeout_secs));
     report.insert("max_rss_mib".into(), json!(cfg.max_rss_mib));
+    // The operating point is stated whether or not a phase got far enough to
+    // derive anything, in the vocabulary `--wake-thresholds` reads, and so is the
+    // invocation that produced it.
+    report.insert("thresholds".into(), json!(p.point(cfg).to_string()));
+    report.insert("command".into(), json!(cfg.command_line()));
     if let Some((phase, message)) = abort {
         report.insert("aborted_in".into(), json!(phase));
         report.insert("message".into(), json!(message));
@@ -688,7 +820,8 @@ fn report_json(
             }),
         );
     }
-    if let (Some(calibration), Some(geometry)) = (&p.calibration, &p.geometry) {
+    if let (Some(calibration), Some(thresholds)) = (&p.calibration, &p.thresholds) {
+        let geometry = wake::DetectionGeometry::for_calibration(calibration, thresholds);
         report.insert(
             "calibration".into(),
             json!({
@@ -696,9 +829,10 @@ fn report_json(
                 "neg_std": calibration.neg_std,
                 "neg_p99": calibration.neg_p99,
                 "n_negatives": calibration.n_negatives,
-                "derived_soft_floor": calibration.soft_floor(),
-                "fire_factor": calibration.fire_soft(),
+                "derived_soft_floor": calibration.soft_floor(thresholds),
+                "fire_factor": calibration.fire_soft(thresholds),
                 "static_match_threshold": geometry.static_threshold,
+                "reset_soft": geometry.reset,
                 "clip_seed_bands": {
                     "owner_negatives": {"base": sets::OWNER_NEGATIVE_SEED_BASE, "per_phrase": sets::OWNER_NEGATIVE_SEEDS_PER_PHRASE, "phrases": sets::OWNER_NEGATIVE_PHRASES.len()},
                     "ambient_noise": {"base": sets::CALIBRATION_NOISE_SEED_BASE, "profiles": sets::NOISE_PROFILES.len(), "levels": ["full", "-6 dB"]},
@@ -736,11 +870,15 @@ fn report_json(
             }),
         );
     }
+    // Each measurement states only what it measured: the synthetic set and the
+    // real-audio stream are independent, so a real-audio-only screening still
+    // reports its false accepts, and a phase that did not finish is absent,
+    // never a null.
+    let mut false_reactions = serde_json::Map::new();
     if let Some(non_phrase) = &p.non_phrase
         && non_phrase.of > 0
     {
-        let mut section = serde_json::Map::new();
-        section.insert(
+        false_reactions.insert(
             "non_phrase_set".into(),
             json!({
                 "false_reactions": non_phrase.fired.len(),
@@ -757,23 +895,25 @@ fn report_json(
                 "composition": non_phrase_composition(),
             }),
         );
-        // A phase that did not finish is absent, never a null.
-        if let Some(real) = &p.real {
-            section.insert("real_audio".into(), real.json());
-        }
-        report.insert("false_reactions".into(), Value::Object(section));
     }
     if let Some(real) = &p.real {
-        report.insert(
-            "coverage".into(),
-            json!({
-                "phrase_utterances": p.recall.as_ref().map_or(0, |r| r.of),
-                "non_phrase_set": p.non_phrase.as_ref().map_or(0, |n| n.of),
-                "real_audio_audio_hours": real.audio_hours,
-                "real_audio_speech_hours": real.speech_hours,
-                "real_audio_noise_hours": real.noise_hours,
-            }),
-        );
+        false_reactions.insert("real_audio".into(), real.json());
+    }
+    if !false_reactions.is_empty() {
+        report.insert("false_reactions".into(), Value::Object(false_reactions));
+    }
+    if let Some(real) = &p.real {
+        let mut coverage = serde_json::Map::new();
+        if let Some(recall) = &p.recall {
+            coverage.insert("phrase_utterances".into(), json!(recall.of));
+        }
+        if let Some(non_phrase) = &p.non_phrase {
+            coverage.insert("non_phrase_set".into(), json!(non_phrase.of));
+        }
+        coverage.insert("real_audio_audio_hours".into(), json!(real.audio_hours));
+        coverage.insert("real_audio_speech_hours".into(), json!(real.speech_hours));
+        coverage.insert("real_audio_noise_hours".into(), json!(real.noise_hours));
+        report.insert("coverage".into(), Value::Object(coverage));
     }
     let synthesis = p.synthesis;
     report.insert(
@@ -796,14 +936,14 @@ fn report_json(
     report.insert("phases".into(), json!(p.phases));
     // The size the stream actually resolved windows at, against the capacity the
     // pipeline was built for: a phase cut short may never fill a group, and a
-    // slice boundary leaves the last group of a file short.
-    let (max_group, passes, partial) = p.real.as_ref().map_or((0, 0, 0), |real| {
-        (real.max_group, real.encoder_passes, real.partial_passes)
-    });
-    report.insert("windows_per_pass".into(), json!(max_group));
+    // slice boundary leaves the last group of a file short. Absent when the
+    // real-audio phase did not run — a zero would read as "measured nothing".
     report.insert("group_capacity".into(), json!(listen::GROUP));
-    report.insert("encoder_passes".into(), json!(passes));
-    report.insert("partial_passes".into(), json!(partial));
+    if let Some(real) = &p.real {
+        report.insert("windows_per_pass".into(), json!(real.max_group));
+        report.insert("encoder_passes".into(), json!(real.encoder_passes));
+        report.insert("partial_passes".into(), json!(real.partial_passes));
+    }
     report.insert("wall_clock_secs".into(), json!(wall_clock_secs));
     report.insert("peak_rss_bytes".into(), json!(crate::report::peak_rss()));
     report.insert(
@@ -866,7 +1006,11 @@ struct EnrollStats {
 /// [`wake::MIN_ENROLLMENT_UTTERANCES`] are what keep a half-empty enrolment from
 /// producing a threshold, and every skipped negative is reported so a shrunken
 /// calibration pool cannot look like a full one.
-fn enroll(synth: &mut Synth, listener: &mut listen::Listener) -> Result<(Enrollment, EnrollStats)> {
+fn enroll(
+    synth: &mut Synth,
+    listener: &mut listen::Listener,
+    thresholds: wake::Thresholds,
+) -> Result<(Enrollment, EnrollStats)> {
     let clips = audio::enrollment_clips(synth)?;
     let mut utterances = Vec::with_capacity(clips.len());
     let mut skipped = Vec::new();
@@ -929,7 +1073,9 @@ fn enroll(synth: &mut Synth, listener: &mut listen::Listener) -> Result<(Enrollm
             "the enrollment built no prototype from {} utterances",
             utterances.len()
         )
-    })?;
+    })?
+    .with_thresholds(thresholds)
+    .map_err(|why| anyhow!("the threshold set is unusable: {why}"))?;
     Ok((enrollment, stats))
 }
 
@@ -1075,13 +1221,16 @@ fn feed_fired(
     fed.map(|()| fires > 0)
 }
 
-/// The honesty floor: a run that measured nothing is an error, not a report.
+/// The honesty floor: a rate the run cannot divide is an error, not a report.
 ///
 /// The clip lists and the file feed are pinned sizes and a failed synthesis or
 /// an empty feed already aborts, so what this guards is the one denominator the
 /// report divides by: VAD-active speech time. A rate with no denominator is
 /// never written.
-fn require_measured(p: &Progress) -> Result<()> {
+fn require_measured(p: &Progress, phases: config::Phases) -> Result<()> {
+    if !phases.real_audio {
+        return Ok(());
+    }
     let real = p
         .real
         .as_ref()
@@ -1190,6 +1339,8 @@ mod tests {
             asr_sound: std::path::PathBuf::from("/models/asr-mmproj.gguf"),
             tts_body: std::path::PathBuf::from("/models/tts.gguf"),
             tts_sound: std::path::PathBuf::from("/models/tts-mmproj.gguf"),
+            thresholds: wake::Thresholds::DEFAULT,
+            phases: config::Phases::ALL,
         }
     }
 
@@ -1246,6 +1397,183 @@ mod tests {
         assert_eq!(report["recognition"]["rate"], 0.75);
         assert_eq!(report["false_reactions"]["non_phrase_set"]["rate"], 0.0);
         assert_no_null_rates(&report, "$");
+    }
+
+    /// The two measurement aids are a classification, not a different report: a
+    /// run that priced another threshold set, or a subset of the phases, is
+    /// `screened` — the status the record gate and the console both read, even
+    /// when the run took all three phases.
+    #[test]
+    fn a_run_that_prices_a_candidate_is_screened() {
+        let benchmark = test_config();
+        assert_eq!(classify(&benchmark, &Ok(()), None, "inputs").0, "complete");
+
+        let mut overridden = test_config();
+        overridden.thresholds.anchor = 0.86;
+        assert_eq!(
+            classify(&overridden, &Ok(()), None, "inputs").0,
+            "screened",
+            "another threshold set is a candidate point"
+        );
+
+        let mut subset = test_config();
+        subset.phases = config::Phases {
+            recall: true,
+            non_phrase: true,
+            real_audio: false,
+        };
+        assert_eq!(
+            classify(&subset, &Ok(()), None, "inputs").0,
+            "screened",
+            "a subset of the phases is a candidate point"
+        );
+
+        let error = anyhow!("no denominator");
+        let (status, stop) = classify(&benchmark, &Ok(()), Some(&error), "real audio");
+        assert_eq!(status, "incomplete");
+        assert_eq!(stop.expect("named").0, "real audio");
+    }
+
+    /// The point a run priced is stated whether or not a phase got far enough to
+    /// derive anything: the set and the invocation are run inputs, like the stop
+    /// and the ceiling.
+    #[test]
+    fn a_run_that_stopped_before_enrolment_still_states_its_point() {
+        let mut cfg = test_config();
+        cfg.thresholds.anchor = 0.86;
+        let report = report_json(
+            &Progress::default(),
+            "aborted",
+            1.0,
+            &cfg,
+            Some(("inputs", "stop")),
+        );
+        assert_eq!(report["thresholds"], cfg.thresholds.to_string(), "{report}");
+        assert_ne!(
+            report["thresholds"],
+            wake::Thresholds::DEFAULT.to_string(),
+            "the requested point is the one stated before a derivation exists"
+        );
+        let command = report["command"].as_str().expect("a command line");
+        assert!(command.contains("--wake-thresholds"), "{command}");
+    }
+
+    /// The real-audio phase is independent of the synthetic set: a run that took
+    /// only the real audio still states its false accepts, in the JSON and not
+    /// only on the console.
+    #[test]
+    fn a_real_audio_only_run_states_its_false_accepts() {
+        let progress = Progress {
+            real: Some(measured_real(1.066, 0.807)),
+            ..Progress::default()
+        };
+        let report = report_json(&progress, "screened", 1.0, &test_config(), None);
+        assert!(
+            report["false_reactions"].get("non_phrase_set").is_none(),
+            "{report}"
+        );
+        assert_eq!(report["false_reactions"]["real_audio"]["fa"]["events"], 2);
+        assert_eq!(
+            report["false_reactions"]["real_audio"]["fa"]["fa_per_hour_vad_active"],
+            2.0 / 0.807
+        );
+        // Coverage names the measurements it has, not the ones it does not.
+        assert!(
+            report["coverage"].get("phrase_utterances").is_none(),
+            "{report}"
+        );
+        assert!(report["coverage"].get("real_audio_audio_hours").is_some());
+        assert_no_null_rates(&report, "$");
+    }
+
+    /// A figure the report does not carry is named as unavailable, in the same
+    /// words every row uses — never printed as a zero the run did not measure.
+    #[test]
+    fn a_figure_the_report_lacks_is_named_not_zeroed() {
+        let body = record_body(&json!({}));
+        assert!(body.contains(&format!("status: `{UNAVAILABLE}`")), "{body}");
+        for role in ["ASR body", "ASR sound", "TTS body", "TTS sound", "voice"] {
+            assert!(
+                body.contains(&format!("- {role}: {UNAVAILABLE}")),
+                "the {role} pin does not name its absence:\n{body}"
+            );
+        }
+        for row in [
+            "recall",
+            "false reactions",
+            "false accepts",
+            "thresholds",
+            "derived point",
+            "wall clock",
+            "peak resident",
+            "corpus",
+            "windows per encoder pass",
+        ] {
+            assert!(
+                body.contains(&format!("| {row} | {UNAVAILABLE} |")),
+                "the {row} row does not name its missing figure:\n{body}"
+            );
+        }
+    }
+
+    /// A resolved input set: five pins with a byte count and a digest, so the
+    /// record's provenance block has the figures a real run states.
+    fn test_inputs() -> config::Inputs {
+        let pin = |name: &str| config::Pin {
+            path: std::path::PathBuf::from(format!("/models/{name}")),
+            bytes: 1,
+            sha256: "00".into(),
+        };
+        config::Inputs {
+            asr_body: pin("asr.gguf"),
+            asr_sound: pin("asr-mmproj.gguf"),
+            tts_body: pin("tts.gguf"),
+            tts_sound: pin("tts-mmproj.gguf"),
+            voice: pin("voice.wav"),
+        }
+    }
+
+    /// The same writer over a measured report states every figure: the
+    /// unavailable words appear only where the report has no number.
+    #[test]
+    fn a_measured_report_states_every_figure() {
+        let progress = Progress {
+            inputs: Some(test_inputs()),
+            recall: Some(Recall {
+                detected: 46,
+                of: 50,
+                first_pass: false,
+                missed: Vec::new(),
+            }),
+            non_phrase: Some(NonPhrase {
+                fired: vec!["clip".into()],
+                of: 121,
+            }),
+            real: Some(measured_real(1.066, 0.807)),
+            calibration: Some(wake::Calibration::default()),
+            thresholds: Some(wake::Thresholds::DEFAULT),
+            synthesis: audio::SynthStats {
+                clips: 394,
+                cache_hits: 394,
+                synth_secs: 0.0,
+            },
+            ..Progress::default()
+        };
+        let report = report_json(&progress, "complete", 287.9, &test_config(), None);
+        let body = record_body(&report);
+        assert!(!body.contains(UNAVAILABLE), "{body}");
+        assert!(body.contains("| recall | 46/50 (92.0 %) |"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "| false accepts | 2 events · {:.4}/h over VAD-active speech (0.807 h)",
+                2.0 / 0.807
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains("| peak resident | ") && body.contains("| wall clock | 287.9 s |"),
+            "{body}"
+        );
     }
 
     fn assert_no_null_rates(value: &Value, path: &str) {
@@ -1388,17 +1716,17 @@ mod tests {
 
     #[test]
     fn a_run_that_measured_no_speech_is_refused() {
-        assert!(require_measured(&Progress::default()).is_err());
+        assert!(require_measured(&Progress::default(), config::Phases::ALL).is_err());
         let no_speech = Progress {
             real: Some(measured_real(1.0, 0.0)),
             ..Progress::default()
         };
-        assert!(require_measured(&no_speech).is_err());
+        assert!(require_measured(&no_speech, config::Phases::ALL).is_err());
         let measured = Progress {
             real: Some(measured_real(1.0, 0.5)),
             ..Progress::default()
         };
-        assert!(require_measured(&measured).is_ok());
+        assert!(require_measured(&measured, config::Phases::ALL).is_ok());
     }
 
     /// A rate whose denominator measured no time is absent, never null.

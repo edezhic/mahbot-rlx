@@ -147,7 +147,7 @@ fn sites(graph: &Graph) -> (Vec<(NodeId, Site)>, usize) {
 }
 
 /// The ids the graph's outputs reach, which is the set the stand's
-/// [`stream_bytes`](mahbot_inference::stand::stream_bytes) counts reads over.
+/// [`stream_bytes`](mahbot_inference::graphs::stream_bytes) counts reads over.
 fn live_ids(graph: &Graph) -> HashSet<NodeId> {
     let mut live: HashSet<NodeId> = graph.outputs.iter().copied().collect();
     let mut stack: Vec<NodeId> = graph.outputs.clone();
@@ -438,7 +438,7 @@ fn side_rows(
              activation_weighted={activation_weighted} live_bytes={live_bytes} \
              stream_bytes={} graph_params={graph_params}",
             live_sites.len(),
-            mahbot_inference::stand::stream_bytes(graph),
+            mahbot_inference::graphs::stream_bytes(graph),
         );
         assert_eq!(
             activation_weighted, 0,
@@ -446,7 +446,7 @@ fn side_rows(
         );
         assert_eq!(
             live_bytes,
-            mahbot_inference::stand::stream_bytes(graph),
+            mahbot_inference::graphs::stream_bytes(graph),
             "{side}: the priced packed multiplies are the live weight bytes"
         );
 

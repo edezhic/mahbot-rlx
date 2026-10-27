@@ -63,6 +63,26 @@ pub fn max_swap_growth_mib() -> u64 {
         .unwrap_or(MAX_SWAP_GROWTH_MIB)
 }
 
+/// The resident-set ceiling a run is under, in MiB — `MAHBOT_MAX_RSS_MIB`, or
+/// [`DEFAULT_MAX_RSS_MIB`]. One parse, one owner: the enforced ceiling and every
+/// figure or refusal reported against it read this accessor, so a run cannot be
+/// described under a bound it was not held to.
+#[must_use]
+pub fn max_rss_mib() -> u64 {
+    std::env::var("MAHBOT_MAX_RSS_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_RSS_MIB)
+}
+
+/// [`max_rss_mib`] in bytes, for the library, which has to refuse an input the run
+/// could not hold: the record and that refusal read the same accessor, so the
+/// figure a cell says it exceeded is the ceiling the run was actually under.
+#[must_use]
+pub fn max_rss_bytes() -> u64 {
+    max_rss_mib().saturating_mul(1024 * 1024)
+}
+
 /// System-wide free memory, as a percentage, below which a run stops.
 pub const MIN_FREE_PERCENT: u64 = 8;
 

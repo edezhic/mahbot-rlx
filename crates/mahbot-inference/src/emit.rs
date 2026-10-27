@@ -23,6 +23,13 @@
 //! A `name#step` key is a stacked tensor read one step at a time (the code
 //! predictor's fifteen LM heads), and takes the same paths on its slice.
 //!
+//! A build carries no weight bytes. Every path above hands the flow a placeholder of the
+//! parameter's size and records where the bytes are — a mapped file range, a fused blob or
+//! a host copy this process keeps — and `graphs::Runner::compile` binds that at session
+//! time. A transcription compiles one graph set per chunk length and every set binds the
+//! same weights, so this is what keeps a shape's build from copying the body out of the
+//! file again, and a write the device already holds from reading it at all.
+//!
 //! The helpers below also carry the other decisions: 1-D convolutions go
 //! through 2-D with `[k, 1]` (never `[k, k]`, which silently takes the 2-D
 //! branch), dilated and strided kernels use the op's own fields, ConvTranspose
@@ -30,7 +37,7 @@
 //! `exp(alpha)`/`exp(-beta)` tensors directly, and the codebook is read by
 //! index rather than searched.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
@@ -42,6 +49,88 @@ use rlx_ir::{DType, HirNodeId, HirOp, Op, Shape};
 
 use crate::loader::{self, Model, Store};
 
+thread_local! {
+    /// Which model file served each tensor name of the graph being built, so its
+    /// compile can declare the scope its weights belong to ([`scope_of`]). Per thread,
+    /// like the scope it feeds: two builds running at once cannot overwrite each
+    /// other's names and hand one model's weights another model's scope. [`scope_of`]
+    /// empties it when it reads, so no entry outlives the build that wrote it.
+    static ORIGINS: std::cell::RefCell<Option<std::collections::HashMap<String, Arc<str>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The scope label a model's weights are shared under: its own file path.
+fn origin_label(model: &Model) -> Arc<str> {
+    Arc::from(model.path.display().to_string())
+}
+
+/// A parameter name without the markers a flow puts on it: the `#step` of a stacked
+/// tensor and the NUL-suffixed dtype tag the typed map carries
+/// (`blk.0.attn_q.weight\0q`).
+fn bare_name(key: &str) -> &str {
+    let key = split_step(key).map_or(key, |(name, _)| name);
+    key.split('\0').next().unwrap_or(key)
+}
+
+/// Record that `key` was served from `model`. Overwrites, so the entry always names the
+/// last model that served the name inside the build being made.
+fn note_origin(key: &str, model: &Model) {
+    note_origin_label(key, &origin_label(model));
+}
+
+/// [`note_origin`] without a model to name, so the bookkeeping can be exercised on its
+/// own: the label is all the scope declaration reads.
+fn note_origin_label(key: &str, label: &Arc<str>) {
+    let name = bare_name(key);
+    ORIGINS.with(|cell| {
+        cell.borrow_mut()
+            .get_or_insert_with(Default::default)
+            .insert(name.to_string(), Arc::clone(label));
+    });
+}
+
+/// The scope label every one of `names` was served from, or `None` when they disagree
+/// or one is unknown — and the record of what served which name is **emptied** by the
+/// question: it describes the one graph build that just finished, and a compile reads it
+/// once. A name no path noted therefore answers `None` rather than an earlier build's
+/// model, which is what keeps `scope_of` from attributing a graph to weights it was not
+/// built from. A compile declares a sharing scope only from here, so a graph whose
+/// weights come from two files — or from no [`LoaderWeights`] at all — uploads
+/// everything rather than risk skipping another model's bytes.
+pub fn scope_of<'a>(names: impl Iterator<Item = &'a str>) -> Option<Arc<str>> {
+    let origins = peek_origins()?;
+    let mut scope: Option<&Arc<str>> = None;
+    for name in names {
+        let this = origins.get(bare_name(name))?;
+        match scope {
+            Some(known) if known.as_ref() != this.as_ref() => return None,
+            Some(_) => {}
+            None => scope = Some(this),
+        }
+    }
+    scope.cloned()
+}
+
+/// The origin record without emptying it: a compile reads it twice (for the scope, then
+/// for each parameter's bytes) and clears it once both are done.
+fn peek_origins() -> Option<HashMap<String, Arc<str>>> {
+    ORIGINS.with(|cell| cell.borrow().clone())
+}
+
+/// Which model file served each tensor of the build that just finished. The compile that
+/// follows takes this once and then calls [`clear_origins`]: it is how a packed parameter
+/// finds the file its placeholder stands in for.
+pub fn take_origins() -> HashMap<String, Arc<str>> {
+    ORIGINS
+        .with(|cell| cell.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// Forget the build's origin record, once its compile has bound every parameter.
+pub fn clear_origins() {
+    ORIGINS.with(|cell| *cell.borrow_mut() = None);
+}
+
 /// The weight source of one file: serves both weight paths.
 pub struct LoaderWeights {
     pub model: Arc<Model>,
@@ -49,6 +138,11 @@ pub struct LoaderWeights {
     /// rewritten and no per-step graph is rebuilt: `take_packed` serves the
     /// concatenated Q8 blob once, and the graph sees one `DequantMatMul`.
     fused: HashMap<String, GgufPackedLinear>,
+    /// The concatenated blob's length per fused key, for the blobs this process keeps:
+    /// the build then carries a placeholder of this length and the compile binds the kept
+    /// copy. A blob the process does not keep is carried by the build itself, and its key
+    /// is absent here.
+    fused_len: HashMap<String, usize>,
 }
 
 impl LoaderWeights {
@@ -56,6 +150,7 @@ impl LoaderWeights {
         Self {
             model,
             fused: HashMap::new(),
+            fused_len: HashMap::new(),
         }
     }
 
@@ -63,15 +158,44 @@ impl LoaderWeights {
     /// key is not packed or the schemes/in-dims differ — the caller then keeps
     /// the separate projections rather than changing arithmetic.
     pub fn fuse_packed(&mut self, name: &str, keys: &[&str]) -> Result<bool> {
+        // The plans alone say whether the keys fuse and how wide the result is: no
+        // weight bytes are touched here, so a shape whose blob this process has already
+        // concatenated pays a handful of lookups and nothing else.
         let mut total = 0usize;
+        let mut scheme = None;
+        let mut in_dim = None;
+        let mut out_dim = 0;
+        let mut stepped = false;
         for &key in keys {
-            let name = split_step(key).map_or(key, |(n, _)| n);
-            let p = self.model.plan(name)?.clone();
-            let elems = p.ggml_shape[0] * p.ggml_shape[1];
-            let Some(n) = bytes_for_public(p.file, elems) else {
+            stepped |= split_step(key).is_some();
+            let plain = split_step(key).map_or(key, |(n, _)| n);
+            let p = self.model.plan(plain)?.clone();
+            if p.store != Store::Packed {
+                return Ok(false);
+            }
+            let Some(n) = bytes_for_public(p.file, p.ggml_shape[0] * p.ggml_shape[1]) else {
                 return Ok(false);
             };
+            let Some(q) = loader::quant_of(p.file) else {
+                return Ok(false);
+            };
+            let (i, o) = p.in_out();
+            match (scheme, in_dim) {
+                (Some(known), Some(known_in)) => {
+                    if known != q || known_in != i {
+                        return Ok(false);
+                    }
+                }
+                _ => {
+                    scheme = Some(q);
+                    in_dim = Some(i);
+                }
+            }
             total += n;
+            out_dim += o;
+        }
+        if !stepped && cached_blob(&self.model, name, total).is_some() {
+            return self.remember_fused(name, scheme, in_dim, out_dim, total);
         }
         let mut bytes = Vec::with_capacity(total);
         let mut scheme = None;
@@ -110,6 +234,55 @@ impl LoaderWeights {
         let (Some(scheme), Some(in_dim)) = (scheme, in_dim) else {
             return Ok(false);
         };
+        let total = bytes.len();
+        let kept = worth_keeping(&self.model, &packed_param(name));
+        if kept {
+            serve_blob(&self.model, name, bytes);
+            return self.remember_fused(name, Some(scheme), Some(in_dim), out_dim, total);
+        }
+        self.remember_fused_blob(name, Some(scheme), Some(in_dim), out_dim, bytes)
+    }
+
+    /// Register the fused descriptor and hand back the placeholder `take_packed` serves
+    /// for it: the blob itself is bound from the process's cache by name.
+    fn remember_fused(
+        &mut self,
+        name: &str,
+        scheme: Option<rlx_ir::quant::QuantScheme>,
+        in_dim: Option<usize>,
+        out_dim: usize,
+        total: usize,
+    ) -> Result<bool> {
+        let (Some(scheme), Some(in_dim)) = (scheme, in_dim) else {
+            return Ok(false);
+        };
+        self.fused.insert(
+            name.to_string(),
+            GgufPackedLinear {
+                w_q: Vec::new(),
+                scheme,
+                in_dim,
+                out_dim,
+                bias: Vec::new(),
+            },
+        );
+        self.fused_len.insert(name.to_string(), total);
+        Ok(true)
+    }
+
+    /// The same, for a blob this process is not keeping: the build carries it, so the
+    /// compile binds these bytes.
+    fn remember_fused_blob(
+        &mut self,
+        name: &str,
+        scheme: Option<rlx_ir::quant::QuantScheme>,
+        in_dim: Option<usize>,
+        out_dim: usize,
+        bytes: Vec<u8>,
+    ) -> Result<bool> {
+        let (Some(scheme), Some(in_dim)) = (scheme, in_dim) else {
+            return Ok(false);
+        };
         self.fused.insert(
             name.to_string(),
             GgufPackedLinear {
@@ -122,6 +295,178 @@ impl LoaderWeights {
         );
         Ok(true)
     }
+}
+
+/// The weights this process has already read, by model file and tensor: a packed blob it
+/// concatenated ([`serve_blob`]) and host f32 it dequantised ([`serve_f32`]).
+///
+/// Every graph shape of one model binds the same weights, and a transcription compiles a
+/// graph set per chunk length, so a body's 1.28 GiB was copied out of the mapped file once
+/// per shape — the largest single item of the compile line, and pure waste whenever the
+/// device already holds the bytes (which the shared weight buffer makes the rule after the
+/// first shape). A build therefore hands the flow a placeholder and the compile binds the
+/// real bytes from here, or — for a packed tensor, which needs no copy at all — straight
+/// from the mapped file ([`mapped_weight`]). The model file is part of every key, so two
+/// models whose graphs use the same tensor names never read each other's weights.
+enum Cached {
+    /// A packed blob the process produced once: the fused projections of a model.
+    Blob(Arc<[u8]>),
+    /// Host f32 the process dequantised once, and the shape it is bound at.
+    Host(Arc<Vec<f32>>, Vec<usize>),
+}
+
+/// The models whose files are mapped, by path: what a packed placeholder is bound from.
+static MAPPED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<Model>>>> =
+    std::sync::OnceLock::new();
+
+static CACHED: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), Cached>>> =
+    std::sync::OnceLock::new();
+
+/// Host weights below this are served the ordinary way: a norm's or a bias's bytes are not
+/// worth an entry, and the cache then holds the linears that cost the read.
+const CACHED_F32_MIN_BYTES: usize = 1 << 20;
+
+/// The weights one shape has already asked for, by model file and tensor. A weight is kept
+/// only when a *second* shape asks for it: a single pass — one listener, one synthesis,
+/// which build each shape once — then pays no memory for a cache it would never read,
+/// while a transcription, which compiles a graph set per chunk length, keeps what it needs.
+static SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
+    std::sync::OnceLock::new();
+
+/// `true` when this call is the second (or later) ask for the weight, and keeping it is
+/// therefore worth the memory.
+fn worth_keeping(model: &Model, key: &str) -> bool {
+    let entry = (model.path.display().to_string(), key.to_string());
+    match SEEN
+        .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+        .lock()
+    {
+        Ok(mut guard) => !guard.insert(entry),
+        Err(_) => false,
+    }
+}
+
+/// The name rlx-flow registers a packed weight's parameter as.
+fn packed_param(key: &str) -> String {
+    format!("{key}\0q")
+}
+
+fn cached() -> &'static std::sync::Mutex<HashMap<(String, String), Cached>> {
+    CACHED.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn mapped() -> &'static std::sync::Mutex<HashMap<String, Arc<Model>>> {
+    MAPPED.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The model whose file `label` names, if this process has it mapped.
+fn mapped_model(label: &str) -> Option<Arc<Model>> {
+    mapped().lock().ok()?.get(label).cloned()
+}
+
+/// Remember that `model`'s file is mapped, so a compile can bind a packed placeholder
+/// from it by name.
+fn note_mapped(model: &Arc<Model>) {
+    if let Ok(mut guard) = mapped().lock() {
+        guard.insert(model.path.display().to_string(), Arc::clone(model));
+    }
+}
+
+/// The file a packed parameter's bytes come from, and the tensor to read: what the
+/// build's placeholder stands in for, and the read that a skipped write makes free.
+pub fn mapped_weight(
+    origins: &HashMap<String, Arc<str>>,
+    name: &str,
+) -> Option<(Arc<Model>, String)> {
+    let key = name.strip_suffix("\0q")?;
+    let label = origins.get(bare_name(name))?.as_ref();
+    let model = mapped_model(label)?;
+    // Only a tensor the file holds is read from it: a fused projection and a stacked
+    // tensor's step are the build's own bytes, and a name the file does not know must not
+    // be guessed at.
+    model.has(key).then(|| (model, key.to_string()))
+}
+
+/// A packed blob the process produced once (a fused projection), if it is this model's.
+pub fn blob_weight(origins: &HashMap<String, Arc<str>>, name: &str) -> Option<Arc<[u8]>> {
+    name.strip_suffix("\0q")?;
+    let label = origins.get(bare_name(name))?;
+    match cached()
+        .lock()
+        .ok()?
+        .get(&(label.to_string(), name.to_string()))?
+    {
+        Cached::Blob(blob) => Some(Arc::clone(blob)),
+        _ => None,
+    }
+}
+
+/// Host f32 the process dequantised once, if it is this model's.
+pub fn host_weight(origins: &HashMap<String, Arc<str>>, name: &str) -> Option<Arc<Vec<f32>>> {
+    let label = origins.get(bare_name(name))?;
+    match cached()
+        .lock()
+        .ok()?
+        .get(&(label.to_string(), name.to_string()))?
+    {
+        Cached::Host(values, _) => Some(Arc::clone(values)),
+        _ => None,
+    }
+}
+
+/// Register `model` as mapped and hand back the placeholder the build carries in place of
+/// `key`'s packed bytes: the parameter has its right size, and the compile binds the file's
+/// own range ([`mapped_weight`]), which a skipped write never even reads.
+fn serve_packed(_key: &str, model: &Arc<Model>, len: usize) -> Vec<u8> {
+    note_mapped(model);
+    vec![0u8; len]
+}
+
+/// The fused blob of `name`, concatenated once per process.
+fn serve_blob(model: &Model, name: &str, bytes: Vec<u8>) {
+    if let Ok(mut guard) = cached().lock() {
+        // Under the parameter's own name, which is the key the compile asks it by.
+        let key = (model.path.display().to_string(), packed_param(name));
+        guard.insert(key, Cached::Blob(Arc::from(bytes)));
+    }
+}
+
+/// The fused blob `name` already has in this process, if its length still matches.
+fn cached_blob(model: &Model, name: &str, len: usize) -> Option<Arc<[u8]>> {
+    let key = (model.path.display().to_string(), packed_param(name));
+    match cached().lock().ok()?.get(&key)? {
+        Cached::Blob(blob) if blob.len() == len => Some(Arc::clone(blob)),
+        _ => None,
+    }
+}
+
+/// Host f32 the process has already read for `key`, with the shape it is bound at.
+fn cached_f32(model: &Model, key: &str) -> Option<(Arc<Vec<f32>>, Vec<usize>)> {
+    let key = (model.path.display().to_string(), key.to_string());
+    match cached().lock().ok()?.get(&key)? {
+        Cached::Host(values, dims) => Some((Arc::clone(values), dims.clone())),
+        _ => None,
+    }
+}
+
+/// Keep `values` for the rest of the process and hand back the placeholder the build
+/// carries in their place; a weight too small to be worth an entry is handed over as it
+/// is, and then the compile binds the build's own values.
+fn serve_f32(
+    model: &Model,
+    key: &str,
+    values: Vec<f32>,
+    dims: Vec<usize>,
+) -> (Vec<f32>, Vec<usize>) {
+    if values.len() * 4 < CACHED_F32_MIN_BYTES || !worth_keeping(model, key) {
+        return (values, dims);
+    }
+    let shared = Arc::new(values);
+    if let Ok(mut guard) = cached().lock() {
+        let entry = (model.path.display().to_string(), key.to_string());
+        guard.insert(entry, Cached::Host(Arc::clone(&shared), dims.clone()));
+    }
+    (vec![0f32; shared.len()], dims)
 }
 
 /// Split a `name#step` key: a stacked tensor (`[k, n, steps]`, the code
@@ -137,6 +482,72 @@ fn split_step(key: &str) -> Option<(&str, usize)> {
 
 impl WeightSource for LoaderWeights {
     fn take(&mut self, key: &str, transpose: bool) -> Result<(Vec<f32>, Vec<usize>)> {
+        note_origin(key, &self.model);
+        // A weight this process has already read once is served from memory: every graph
+        // shape of the model binds the same bytes, and there is one shape per chunk
+        // length. The layout is part of the entry, so a transposed read is its own.
+        let cached_key = if transpose {
+            format!("{key}\0t")
+        } else {
+            key.to_string()
+        };
+        if let Some((values, dims)) = cached_f32(&self.model, &cached_key) {
+            // The compile binds the kept values, not this placeholder
+            // (`graphs::Runner::compile`).
+            return Ok((vec![0f32; values.len()], dims));
+        }
+        let (vals, dims) = self.take_read(key, transpose)?;
+        Ok(serve_f32(&self.model, &cached_key, vals, dims))
+    }
+
+    fn has(&self, key: &str) -> bool {
+        match split_step(key) {
+            Some((name, _)) => self.model.has(name),
+            None => self.model.has(key),
+        }
+    }
+
+    fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
+        note_origin(key, &self.model);
+        if let Some(v) = self.fused.get(key) {
+            // A placeholder of the blob's length when the process keeps the blob — what
+            // reaches the device is that copy, bound by name at session time — and the
+            // build's own bytes when it does not.
+            let mut v = v.clone();
+            if let Some(len) = self.fused_len.get(key).copied() {
+                v.w_q = vec![0u8; len];
+            }
+            return Ok(Some(v));
+        }
+        if let Some((name, step)) = split_step(key) {
+            return self.take_step_packed(name, step);
+        }
+        let p = self.model.plan(key)?.clone();
+        match p.store {
+            // The file's own bytes, as the body hands them over.
+            Store::Packed => {
+                let scheme = loader::quant_of(p.file)
+                    .ok_or_else(|| anyhow!("`{key}` is planned packed but has no scheme"))?;
+                let (in_dim, out_dim) = p.in_out();
+                let w_q = serve_packed(key, &self.model, self.model.raw_len(key)?);
+                Ok(Some(GgufPackedLinear {
+                    w_q,
+                    scheme,
+                    in_dim,
+                    out_dim,
+                    bias: Vec::new(),
+                }))
+            }
+            // Host-dequant, f16 and F32 tensors deliberately do not take this path.
+            Store::HostDequant | Store::F32File | Store::F16Widened | Store::F16Linear => Ok(None),
+        }
+    }
+}
+
+impl LoaderWeights {
+    /// The weight as the file hands it over: the f32 layout and values for `key`, read
+    /// once per process and served from memory after that ([`serve_f32`]).
+    fn take_read(&mut self, key: &str, transpose: bool) -> Result<(Vec<f32>, Vec<usize>)> {
         if let Some((name, step)) = split_step(key) {
             if transpose {
                 bail!("`{key}`: transpose is only defined for a whole 2-D weight");
@@ -168,42 +579,6 @@ impl WeightSource for LoaderWeights {
         Ok((vals, dims))
     }
 
-    fn has(&self, key: &str) -> bool {
-        match split_step(key) {
-            Some((name, _)) => self.model.has(name),
-            None => self.model.has(key),
-        }
-    }
-
-    fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
-        if let Some(v) = self.fused.get(key) {
-            return Ok(Some(v.clone()));
-        }
-        if let Some((name, step)) = split_step(key) {
-            return self.take_step_packed(name, step);
-        }
-        let p = self.model.plan(key)?.clone();
-        match p.store {
-            // The file's own bytes, as the body hands them over.
-            Store::Packed => {
-                let scheme = loader::quant_of(p.file)
-                    .ok_or_else(|| anyhow!("`{key}` is planned packed but has no scheme"))?;
-                let (in_dim, out_dim) = p.in_out();
-                Ok(Some(GgufPackedLinear {
-                    w_q: self.model.raw(key)?,
-                    scheme,
-                    in_dim,
-                    out_dim,
-                    bias: Vec::new(),
-                }))
-            }
-            // Host-dequant, f16 and F32 tensors deliberately do not take this path.
-            Store::HostDequant | Store::F32File | Store::F16Widened | Store::F16Linear => Ok(None),
-        }
-    }
-}
-
-impl LoaderWeights {
     /// One step of a stacked tensor as f32 in the matmul layout `[k, n]`
     /// (`n` fastest) — the fallback when the stack is not packed.
     fn take_step(&mut self, name: &str, step: usize) -> Result<(Vec<f32>, Vec<usize>)> {
@@ -341,6 +716,7 @@ pub fn f32_param(
     name: &str,
     dims: &[usize],
 ) -> Result<HirNodeId> {
+    note_origin(name, model);
     if let Some(id) = declared_param(ctx, name, &Shape::new(dims, DType::F32)) {
         return Ok(id);
     }
@@ -365,6 +741,7 @@ pub fn prefix_param(
     dims: &[usize],
     count: usize,
 ) -> Result<HirNodeId> {
+    note_origin(name, model);
     if let Some(id) = declared_param(ctx, name, &Shape::new(dims, DType::F32)) {
         return Ok(id);
     }
@@ -385,6 +762,7 @@ pub fn prefix_param(
 /// rank-3 one (a 1-D convolution) with the unit axis inserted before the kernel,
 /// so the kernel stays `[1, k]` and never `[k, k]`.
 pub fn conv_param(ctx: &mut FlowCtx<'_>, model: &Model, name: &str) -> Result<HirNodeId> {
+    note_origin(name, model);
     let p = model.plan(name)?.clone();
     let dims = match p.dims.len() {
         4 => p.dims.clone(),
@@ -437,6 +815,7 @@ pub fn conv_transpose_param(
     model: &Model,
     name: &str,
 ) -> Result<(HirNodeId, usize, usize, usize)> {
+    note_origin(name, model);
     let p = model.plan(name)?.clone();
     if p.dims.len() != 3 {
         bail!(
@@ -491,6 +870,7 @@ pub fn linear_encoder(
     if p.store != Store::F16Linear {
         return linear(ctx, x, key);
     }
+    note_origin(key, model);
     let rank = x.shape.rank();
     let m = x.shape.dims()[rank - 2].unwrap_static();
     let (k, n) = p.in_out();
@@ -813,4 +1193,52 @@ fn declared_param(ctx: &mut FlowCtx<'_>, name: &str, shape: &Shape) -> Option<Hi
         HirOp::Param { name: p } if p == name && &n.shape == shape => Some(n.id),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    /// The scope a compile declares is the model the finished build took its weights from,
+    /// and the record is emptied by the compile that reads it: a name a later build did not
+    /// note answers nothing rather than an earlier build's model, so a graph is never
+    /// attributed to weights, or bound to bytes, it was not built from.
+    #[test]
+    fn a_build_declares_its_own_model_and_only_once() {
+        let one: Arc<str> = Arc::from("/models/one.gguf");
+        let two: Arc<str> = Arc::from("/models/two.gguf");
+        super::note_origin_label("blk.0.attn_q.weight", &one);
+        super::note_origin_label("blk.0.attn_k.weight#3", &one);
+        assert_eq!(
+            super::scope_of(["blk.0.attn_q.weight", "blk.0.attn_k.weight#3"].into_iter())
+                .as_deref(),
+            Some("/models/one.gguf"),
+            "one model's names, with the `#step` a stacked tensor carries"
+        );
+        // The scope is one of the two questions a compile asks the record; the other is
+        // where each parameter's bytes are, so the record survives the first.
+        let origins = super::take_origins();
+        assert_eq!(
+            origins.get("blk.0.attn_q.weight").map(AsRef::as_ref),
+            Some("/models/one.gguf"),
+            "the compile still reads the record the scope came from"
+        );
+        assert_eq!(
+            super::scope_of(std::iter::empty()),
+            None,
+            "the compile emptied the record, so nothing is left to answer with"
+        );
+        // Two models in one build: nothing is declared, and the compile uploads.
+        super::note_origin_label("a", &one);
+        super::note_origin_label("b", &two);
+        assert_eq!(super::scope_of(["a", "b"].into_iter()), None);
+        // A name the build never noted is not answered from what is left.
+        super::note_origin_label("a", &one);
+        assert_eq!(super::scope_of(["a", "noted-by-nobody"].into_iter()), None);
+        super::clear_origins();
+        assert!(
+            super::take_origins().is_empty(),
+            "a compile leaves nothing behind"
+        );
+    }
 }

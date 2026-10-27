@@ -316,10 +316,7 @@ fn the_synthetic_gemma_file_loads() {
     assert_eq!(g.window_radius(), 4);
     // The file is the embeddings role, and it carries neither a body config nor
     // a `clip` one: those describe files this is not.
-    assert!(matches!(
-        model.role,
-        mahbot_inference::loader::Role::Embeddings
-    ));
+    assert_eq!(model.role, Some(mahbot_inference::loader::Role::Embeddings));
     assert!(model.config.is_none() && model.clip.is_none());
 }
 

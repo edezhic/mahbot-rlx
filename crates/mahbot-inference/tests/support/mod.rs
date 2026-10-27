@@ -272,6 +272,24 @@ pub fn steps_for(packed: u64, target: u64) -> usize {
     ((target / packed.max(1)) as usize).clamp(1, MAX_STEPS)
 }
 
+/// The music pool, verified pin by pin, or the reason the caller cannot run: an
+/// unset `MAHBOT_ASR_MUSIC` is an absent corpus and the caller says why it did not
+/// run, while a pool the run was pointed at and that fails to verify is a broken
+/// provision and panics here rather than reading unverified audio.
+pub fn pool() -> Option<Vec<std::path::PathBuf>> {
+    if std::env::var_os(mahbot_inference::music::DIR_ENV).is_none_or(|v| v.is_empty()) {
+        println!(
+            "skip: {} is not set — point it at the music pool's directory",
+            mahbot_inference::music::DIR_ENV
+        );
+        return None;
+    }
+    Some(
+        mahbot_inference::music::verify()
+            .unwrap_or_else(|error| panic!("the music pool: {error:#}")),
+    )
+}
+
 impl Call {
     pub fn run(&mut self) -> Vec<Vec<f32>> {
         self.compiled.run(&[("x", self.input.as_slice())])

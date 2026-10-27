@@ -1008,6 +1008,8 @@ impl WgpuExecutable {
             weight_extra_shards: Vec::new(),
             weight_shard_size: 0,
             weight_offsets: HashMap::new(),
+            weight_share: None,
+            weight_written: std::sync::Mutex::new(HashSet::new()),
             plan_slots: HashMap::new(),
             param_slots: HashMap::new(),
         };

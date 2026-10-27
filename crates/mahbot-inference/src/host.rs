@@ -160,42 +160,134 @@ pub fn write_wav16(path: &str, samples: &[f32], rate: u32) -> Result<()> {
     Ok(())
 }
 
-/// `offset` is in output samples; `max_samples` limits the output.
-pub fn wav_mono(path: &str, rate: u32, offset: usize, max_samples: usize) -> Result<Vec<f32>> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+/// A WAV's layout, read by one walk of its chunk list: what the reader decodes and what
+/// the header counts, so the two cannot disagree about a file.
+struct WavLayout {
+    format: u16,
+    channels: u16,
+    rate: u32,
+    /// Where the `data` chunk's samples start, and how many bytes of them the file
+    /// actually holds — the last `data` chunk, with its declared length clamped to the
+    /// bytes present, so a streamed or over-declared length is read for what it has
+    /// rather than refused for what it claims.
+    from: u64,
+    bytes: u64,
+}
+
+impl WavLayout {
+    fn bytes_per_sample(&self) -> u64 {
+        if self.format == 3 { 4 } else { 2 }
+    }
+
+    fn frames(&self) -> u64 {
+        self.bytes / (self.bytes_per_sample() * u64::from(self.channels))
+    }
+}
+
+/// The chunks a layout walk reads through: [`wav_mono`] hands it the whole file, and
+/// [`wav_header`] a handle that seeks past the audio instead. Both see one parse.
+trait Chunks {
+    /// The bytes the source holds, in total.
+    fn len(&self) -> u64;
+    /// Read up to `into.len()` bytes from `at`, returning how many were read.
+    fn read(&mut self, at: u64, into: &mut [u8]) -> usize;
+}
+
+impl Chunks for &[u8] {
+    fn len(&self) -> u64 {
+        (*self).len() as u64
+    }
+
+    fn read(&mut self, at: u64, into: &mut [u8]) -> usize {
+        let from = at as usize;
+        let n = into.len().min(self.len().saturating_sub(from));
+        into[..n].copy_from_slice(&self[from..from + n]);
+        n
+    }
+}
+
+impl Chunks for std::fs::File {
+    fn len(&self) -> u64 {
+        self.metadata().map_or(0, |meta| meta.len())
+    }
+
+    fn read(&mut self, at: u64, into: &mut [u8]) -> usize {
+        use std::io::{Seek as _, SeekFrom};
+        if self.seek(SeekFrom::Start(at)).is_err() {
+            return 0;
+        }
+        std::io::Read::read(self, into).unwrap_or(0)
+    }
+}
+
+/// The layout of `source`, walked once: the crate's defaults for a `fmt ` chunk the file
+/// does not carry, the requirement that format and bit width agree, and the last `data`
+/// chunk.
+fn wav_layout(source: &mut impl Chunks, path: &str) -> Result<WavLayout> {
+    let total = source.len();
+    let mut head = [0u8; 12];
+    if total < 12
+        || source.read(0, &mut head) != 12
+        || &head[0..4] != b"RIFF"
+        || &head[8..12] != b"WAVE"
+    {
         return Err(anyhow::anyhow!("`{path}` is not a RIFF/WAVE file"));
     }
-    let mut at = 12usize;
-    let (mut format, mut channels, mut src_rate, mut bits) = (1u16, 1u16, 16000u32, 16u16);
-    let mut data: Option<&[u8]> = None;
-    while at + 8 <= bytes.len() {
-        let id = &bytes[at..at + 4];
-        let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
-        let body = bytes.get(at + 8..at + 8 + len).unwrap_or(&[]);
-        match id {
-            b"fmt " if body.len() >= 16 => {
-                format = u16::from_le_bytes(body[0..2].try_into().unwrap());
-                channels = u16::from_le_bytes(body[2..4].try_into().unwrap());
-                src_rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
-                bits = u16::from_le_bytes(body[14..16].try_into().unwrap());
+    let (mut format, mut channels, mut rate, mut bits) = (1u16, 1u16, 16_000u32, 16u16);
+    let mut data: Option<(u64, u64)> = None;
+    let mut at = 12u64;
+    while at + 8 <= total {
+        let mut chunk = [0u8; 8];
+        if source.read(at, &mut chunk) != 8 {
+            break;
+        }
+        let len = u64::from(u32::from_le_bytes(chunk[4..8].try_into().unwrap()));
+        let from = at + 8;
+        match &chunk[0..4] {
+            b"fmt " if len >= 16 => {
+                let mut fmt = [0u8; 16];
+                if source.read(from, &mut fmt) == 16 {
+                    format = u16::from_le_bytes(fmt[0..2].try_into().unwrap());
+                    channels = u16::from_le_bytes(fmt[2..4].try_into().unwrap());
+                    rate = u32::from_le_bytes(fmt[4..8].try_into().unwrap());
+                    bits = u16::from_le_bytes(fmt[14..16].try_into().unwrap());
+                }
             }
-            b"data" => data = Some(body),
+            b"data" => data = Some((from, len.min(total.saturating_sub(from)))),
             _ => {}
         }
-        at += 8 + len + (len & 1);
+        at = from.saturating_add(len + (len & 1));
     }
-    let data = data.ok_or_else(|| anyhow::anyhow!("`{path}` has no data chunk"))?;
+    let (from, bytes) = data.ok_or_else(|| anyhow::anyhow!("`{path}` has no data chunk"))?;
     if channels == 0 || !((format == 1 && bits == 16) || (format == 3 && bits == 32)) {
         return Err(anyhow::anyhow!(
             "`{path}` is not PCM16 or float32 (format={format}, bits={bits}, channels={channels})"
         ));
     }
-    if src_rate == 0 || rate == 0 {
+    if rate == 0 {
         return Err(anyhow::anyhow!("`{path}` declares a zero sample rate"));
     }
-    let bytes_per = if format == 3 { 4 } else { 2 };
-    let frames = data.len() / (bytes_per * channels as usize);
+    Ok(WavLayout {
+        format,
+        channels,
+        rate,
+        from,
+        bytes,
+    })
+}
+
+/// `offset` is in output samples; `max_samples` limits the output.
+pub fn wav_mono(path: &str, rate: u32, offset: usize, max_samples: usize) -> Result<Vec<f32>> {
+    let bytes = std::fs::read(path)?;
+    let layout = wav_layout(&mut &bytes[..], path)?;
+    if rate == 0 {
+        return Err(anyhow::anyhow!("`{path}` declares a zero sample rate"));
+    }
+    let (format, channels, src_rate) = (layout.format, layout.channels, layout.rate);
+    let data = bytes
+        .get(layout.from as usize..(layout.from + layout.bytes) as usize)
+        .unwrap_or(&[]);
+    let frames = layout.frames() as usize;
     let sample = |i: usize| -> f32 {
         let j = i * channels as usize;
         if format == 3 {
@@ -233,6 +325,38 @@ pub fn wav_mono(path: &str, rate: u32, offset: usize, max_samples: usize) -> Res
 
 pub fn wav_mono_16k(path: &str, offset: usize, max_samples: usize) -> Result<Vec<f32>> {
     wav_mono(path, 16_000, offset, max_samples)
+}
+
+/// A WAV's declared sample rate and its sample frames, read from its `fmt ` and
+/// `data` chunk headers — seeking past the chunks in between rather than reading the
+/// audio — so a caller can refuse an input too large to hold before it holds it. The
+/// walk is [`wav_layout`], the same one the reader decodes with, so the count is the one
+/// the read will produce: the last `data` chunk, its declared length clamped to the bytes
+/// the file holds.
+pub fn wav_header(path: &str) -> Result<(u32, u64)> {
+    let mut file = std::fs::File::open(path)?;
+    let layout = wav_layout(&mut file, path)?;
+    Ok((layout.rate, layout.frames()))
+}
+
+/// The peak a recording must exceed before it is taken as it is, and the level a
+/// quieter one is lifted to. A recogniser's own front end normalises nothing, so
+/// the crate lifts a quiet recording and leaves a loud one alone.
+pub const SPEECH_FLOOR: f32 = 0.1;
+pub const SPEECH_TARGET: f32 = 0.7;
+
+/// The crate's speech gain for `samples`: [`SPEECH_TARGET`] over the peak of a
+/// recording whose peak is below [`SPEECH_FLOOR`], and 1.0 for anything louder
+/// (or silent). One scalar over the samples it is given, so it is time-preserving
+/// — a caller that applies it once over a whole input moves no mark in it, and
+/// both conditioning paths share the rule rather than restating it.
+pub fn speech_gain(samples: &[f32]) -> f32 {
+    let peak = samples.iter().fold(0f32, |m, v| m.max(v.abs()));
+    if peak > 0.0 && peak < SPEECH_FLOOR {
+        SPEECH_TARGET / peak
+    } else {
+        1.0
+    }
 }
 
 /// Linear-interpolation resample of mono PCM (the same arithmetic as
@@ -358,7 +482,70 @@ pub fn mel_24k(samples: &[f32]) -> (Vec<f32>, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::resample;
+    use super::{resample, wav_header, write_wav16};
+
+    /// The header a caller refuses from reads the same length the reader will
+    /// produce, without the audio — and refuses only what the reader would refuse.
+    #[test]
+    fn a_wav_header_reports_what_the_reader_will_see() {
+        let path = std::env::temp_dir().join(format!("mahbot-header-{}.wav", std::process::id()));
+        let name = path.display().to_string();
+        let samples: Vec<f32> = (0..8_000).map(|i| (i % 17) as f32 / 17.0).collect();
+        write_wav16(&name, &samples, 16_000).expect("a temporary wav");
+        let header = wav_header(&name);
+        // The reader's own answer for the same file, so the two cannot drift.
+        let read = super::wav_mono_16k(&name, 0, usize::MAX).expect("a readable wav");
+        assert_eq!(header.unwrap(), (16_000, read.len() as u64));
+
+        // `write_wav16`'s layout: `fmt ` at 12 (8 header + 16 body), `data` at 36.
+        let pristine = std::fs::read(&path).expect("the wav just written");
+        let fmt_at = 12usize;
+        let data_at = fmt_at + 8 + 16;
+        let rate_at = fmt_at + 8 + 4;
+
+        // `fmt ` after `data`: the reader walks the whole chunk list and takes the last
+        // `data` chunk, so the header must too rather than refusing at the first one.
+        let mut reordered = pristine.clone();
+        let fmt: Vec<u8> = reordered.drain(fmt_at..data_at).collect();
+        reordered.extend_from_slice(&fmt);
+        std::fs::write(&path, &reordered).expect("the reordered wav");
+        assert_eq!(
+            wav_header(&name).unwrap(),
+            (16_000, 8_000),
+            "a data chunk before the format is measured, not refused"
+        );
+
+        // The three refusals the reader makes, made here too.
+        std::fs::write(&path, b"not a wav at all").expect("a stub");
+        assert!(wav_header(&name).is_err(), "not RIFF/WAVE");
+        let mut no_data = pristine.clone();
+        no_data[data_at..data_at + 4].copy_from_slice(b"junk");
+        std::fs::write(&path, &no_data).expect("a wav with no data chunk");
+        assert!(wav_header(&name).is_err(), "no data chunk");
+        let mut zero_rate = pristine.clone();
+        zero_rate[rate_at..rate_at + 4].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &zero_rate).expect("a wav with no rate");
+        assert!(wav_header(&name).is_err(), "a zero sample rate");
+
+        // A `data` chunk that declares more than the file holds — a streamed or corrupt
+        // length — is read for what it has in both: the audio is not silently dropped
+        // because the header claimed frames the reader will not produce.
+        let data_len_at = data_at + 4;
+        for declared in [0xFFFF_FFFFu32, 8_000 * 2 * 4] {
+            let mut over = pristine.clone();
+            over[data_len_at..data_len_at + 4].copy_from_slice(&declared.to_le_bytes());
+            std::fs::write(&path, &over).expect("an over-declared wav");
+            let read = super::wav_mono_16k(&name, 0, usize::MAX).expect("a readable wav");
+            assert_eq!(
+                wav_header(&name).unwrap(),
+                (16_000, read.len() as u64),
+                "a declared length of {declared} bytes is clamped to the file, in the header and \
+                 in the read alike"
+            );
+            assert_eq!(read.len(), 8_000, "and every sample the file holds is read");
+        }
+        std::fs::remove_file(&path).ok();
+    }
 
     #[test]
     fn the_same_rate_returns_the_input_unchanged() {

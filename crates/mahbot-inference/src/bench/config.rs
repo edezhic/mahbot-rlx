@@ -17,6 +17,7 @@
 //! path.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -24,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::loader::{self, Role};
 use crate::measurements::{hex, sha256_file};
+use crate::wake;
 
 use crate::guard::{DEFAULT_MAX_RSS_MIB, DEFAULT_TIMEOUT_SECS};
 
@@ -46,7 +48,7 @@ const VOICE: Spec = Spec {
 };
 const CORPUS: Spec = Spec {
     flag: "corpus",
-    env: "MAHBOT_FAPH_CORPUS",
+    env: crate::stand::CORPUS_ENV,
 };
 const REPORT: Spec = Spec {
     flag: "report",
@@ -80,11 +82,36 @@ const TTS_SOUND: Spec = Spec {
     flag: "tts-sound",
     env: "MAHBOT_TTS_SOUND",
 };
+/// The firing-threshold set, as `name=value` pairs. Unlike every other input, an
+/// empty value here — or one that is not text — is an error, from the flag or from
+/// the variable.
+const WAKE_THRESHOLDS: Spec = Spec {
+    flag: "wake-thresholds",
+    env: "MAHBOT_WAKE_THRESHOLDS",
+};
+/// The phase selection. Unlike every other input, an empty value here — or one that
+/// is not text — is an error, from the flag or from the variable.
+const PHASES: Spec = Spec {
+    flag: "phases",
+    env: "MAHBOT_BENCH_PHASES",
+};
 
 /// Every flag the bench accepts. Anything else is an error, so a typo cannot
 /// silently fall back to an environment variable.
 const SPECS: &[Spec] = &[
-    MODELS, VOICE, CORPUS, REPORT, LOCK, TIMEOUT, MAX_RSS, ASR_BODY, ASR_SOUND, TTS_BODY, TTS_SOUND,
+    MODELS,
+    VOICE,
+    CORPUS,
+    REPORT,
+    LOCK,
+    TIMEOUT,
+    MAX_RSS,
+    ASR_BODY,
+    ASR_SOUND,
+    TTS_BODY,
+    TTS_SOUND,
+    WAKE_THRESHOLDS,
+    PHASES,
 ];
 
 /// The resolved inputs of one bench run.
@@ -104,25 +131,44 @@ pub(crate) struct BenchConfig {
     pub asr_sound: PathBuf,
     pub tts_body: PathBuf,
     pub tts_sound: PathBuf,
+    /// Which of the three measurements this run takes. All three by default, and
+    /// all three are what the benchmark itself takes: a run that takes a subset
+    /// (to price a recall point in half a minute) reports `screened` and never
+    /// writes the record.
+    pub phases: Phases,
+    /// The firing thresholds the run scores with: [`wake::Thresholds::DEFAULT`]
+    /// unless `--wake-thresholds` / `MAHBOT_WAKE_THRESHOLDS` names another set. A
+    /// set other than the shipped one prices a candidate point and leaves the
+    /// record alone; the shipped set is the benchmark.
+    pub thresholds: wake::Thresholds,
 }
 
 impl BenchConfig {
     /// The process's own arguments and environment.
     pub(crate) fn from_env() -> Result<Self> {
-        Self::resolve(std::env::args().skip(1), |name| std::env::var(name).ok())
+        Self::resolve(std::env::args().skip(1), |name| std::env::var_os(name))
     }
 
     /// The invocation, with every input it took, for the provenance block: the
     /// report this run wrote is the thing a later reader has to be able to
     /// repeat. The four role files are recorded by name rather than the directory
     /// they came from, so the line replays whether the run was given `--models`
-    /// or the files one by one; paths under `$HOME` are shortened to `~`.
+    /// or the files one by one; paths under `$HOME` are shortened to `~`. The two
+    /// measurement aids are named whenever they differ from the defaults, so a
+    /// screened run replays as the run it was.
     pub(crate) fn command_line(&self) -> String {
         let short = crate::measurements::short_path;
+        let mut aids = String::new();
+        if !self.phases.is_full() {
+            aids.push_str(&format!(" --phases \"{}\"", self.phases.names()));
+        }
+        if self.thresholds != wake::Thresholds::DEFAULT {
+            aids.push_str(&format!(" --wake-thresholds \"{}\"", self.thresholds));
+        }
         format!(
             "cargo bench -p mahbot-inference --features bench --bench wake_word -- \
              --asr-body {} --asr-sound {} --tts-body {} --tts-sound {} --voice {} \
-             --corpus {} --report {} --lock {} --timeout {} --max-rss {}",
+             --corpus {} --report {} --lock {} --timeout {} --max-rss {}{aids}",
             short(&self.asr_body),
             short(&self.asr_sound),
             short(&self.tts_body),
@@ -149,10 +195,20 @@ impl BenchConfig {
     /// so the resolution rules are testable without touching either.
     pub(crate) fn resolve(
         argv: impl IntoIterator<Item = String>,
-        env: impl Fn(&str) -> Option<String>,
+        env: impl Fn(&str) -> Option<OsString>,
     ) -> Result<Self> {
         let flags = parse_flags(argv)?;
-        let get = |spec: Spec| pick(&flags, &env, spec);
+        // Every input but the two measurement aids reads an empty — or non-text —
+        // value as absent: a required input then names itself, a defaulted one takes
+        // its default. The aids take the value as given, so an empty or non-text flag
+        // *or* variable reaches `aid` and is refused there: `--wake-thresholds ""`, a
+        // shell's `MAHBOT_WAKE_THRESHOLDS=` and a variable holding bytes must not
+        // resolve to the shipped set and rewrite the record.
+        let get = |spec: Spec| {
+            given(&flags, &env, spec)
+                .and_then(|value| value.into_string().ok())
+                .filter(|value| !value.is_empty())
+        };
 
         let models = match get(MODELS) {
             Some(value) => {
@@ -228,6 +284,14 @@ impl BenchConfig {
 
         let timeout_secs = whole_number(get(TIMEOUT), DEFAULT_TIMEOUT_SECS, TIMEOUT)?;
         let max_rss_mib = whole_number(get(MAX_RSS), DEFAULT_MAX_RSS_MIB, MAX_RSS)?;
+        let thresholds = match given(&flags, &env, WAKE_THRESHOLDS) {
+            Some(value) => parse_thresholds(&aid(value, WAKE_THRESHOLDS)?)?,
+            None => wake::Thresholds::DEFAULT,
+        };
+        let phases = match given(&flags, &env, PHASES) {
+            Some(value) => Phases::parse(&aid(value, PHASES)?)?,
+            None => Phases::ALL,
+        };
 
         Ok(Self {
             asr_body: role(ASR_BODY, Role::Recognition, false)?,
@@ -242,8 +306,137 @@ impl BenchConfig {
             lock,
             timeout_secs,
             max_rss_mib,
+            thresholds,
+            phases,
         })
     }
+}
+
+/// Which of the three measurements a run takes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Phases {
+    pub recall: bool,
+    pub non_phrase: bool,
+    pub real_audio: bool,
+}
+
+impl Phases {
+    /// All three measurements — the selection the benchmark itself takes.
+    pub(crate) const ALL: Self = Self {
+        recall: true,
+        non_phrase: true,
+        real_audio: true,
+    };
+
+    /// Whether the run takes all three measurements (the benchmark also needs the
+    /// shipped threshold set; see `classify` in the bench).
+    pub(crate) fn is_full(&self) -> bool {
+        *self == Self::ALL
+    }
+
+    /// The selection as `--phases` reads it back, for the recorded command.
+    pub(crate) fn names(&self) -> String {
+        let mut names = Vec::new();
+        if self.recall {
+            names.push("recall");
+        }
+        if self.non_phrase {
+            names.push("non-phrase");
+        }
+        if self.real_audio {
+            names.push("real-audio");
+        }
+        names.join(",")
+    }
+
+    /// `all`, or a comma list of `recall`, `non-phrase`, `real-audio`. Every name in
+    /// the list is checked, `all` or not: a typo is an error wherever it sits.
+    fn parse(text: &str) -> Result<Self> {
+        let mut phases = Self {
+            recall: false,
+            non_phrase: false,
+            real_audio: false,
+        };
+        let mut all = false;
+        for name in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            match name {
+                "all" => all = true,
+                "recall" => phases.recall = true,
+                "non-phrase" => phases.non_phrase = true,
+                "real-audio" => phases.real_audio = true,
+                other => bail!(
+                    "--{} / {} names no phase `{other}` (all, recall, non-phrase, real-audio)",
+                    PHASES.flag,
+                    PHASES.env
+                ),
+            }
+        }
+        if all {
+            return Ok(Self::ALL);
+        }
+        if !phases.recall && !phases.non_phrase && !phases.real_audio {
+            bail!("--{} / {} names no phase", PHASES.flag, PHASES.env);
+        }
+        Ok(phases)
+    }
+}
+
+/// Read `name=value` pairs into the shipped set, so a run can evaluate another
+/// operating point without rebuilding. Only the numbers move: the decision's
+/// shape is not addressable here. An empty list is refused rather than resolved
+/// to the shipped set — a run that overrode nothing must not reach the record
+/// through a mistyped flag.
+fn parse_thresholds(text: &str) -> Result<wake::Thresholds> {
+    let mut set = wake::Thresholds::DEFAULT;
+    let mut named = false;
+    for pair in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        named = true;
+        let (name, value) = pair.split_once('=').ok_or_else(|| {
+            anyhow!(
+                "--{} / {} `{pair}` is not name=value",
+                WAKE_THRESHOLDS.flag,
+                WAKE_THRESHOLDS.env
+            )
+        })?;
+        let value: f32 = value.trim().parse().with_context(|| {
+            format!(
+                "--{} / {} `{pair}`: `{value}` is not a number",
+                WAKE_THRESHOLDS.flag, WAKE_THRESHOLDS.env
+            )
+        })?;
+        let field = wake::Thresholds::FIELDS
+            .iter()
+            .find(|(known, _, _)| *known == name.trim())
+            .map(|(_, _, write)| write)
+            .ok_or_else(|| {
+                let vocabulary: Vec<_> = wake::Thresholds::FIELDS
+                    .iter()
+                    .map(|(name, _, _)| *name)
+                    .collect();
+                anyhow!(
+                    "--{} / {} names no threshold `{name}` — the set is {}",
+                    WAKE_THRESHOLDS.flag,
+                    WAKE_THRESHOLDS.env,
+                    vocabulary.join(", ")
+                )
+            })?;
+        field(&mut set, value);
+    }
+    if !named {
+        bail!(
+            "--{} / {} names no threshold",
+            WAKE_THRESHOLDS.flag,
+            WAKE_THRESHOLDS.env
+        );
+    }
+    set.validate().map_err(|why| {
+        anyhow!(
+            "--{} / {}: {why}",
+            WAKE_THRESHOLDS.flag,
+            WAKE_THRESHOLDS.env
+        )
+    })?;
+    Ok(set)
 }
 
 /// The synthesized corpus lives in one fixed, durable place — it is not an
@@ -455,17 +648,27 @@ fn parse_flags(argv: impl IntoIterator<Item = String>) -> Result<HashMap<String,
     Ok(flags)
 }
 
-/// A flag wins over its environment variable.
-fn pick(
+/// The value a spec was given: the flag wins over its environment variable, and the
+/// value is taken as written. What an empty or non-text value means is the caller's —
+/// every input but the two measurement aids reads it as absent, the aids refuse it.
+fn given(
     flags: &HashMap<String, String>,
-    env: &impl Fn(&str) -> Option<String>,
+    env: &impl Fn(&str) -> Option<OsString>,
     spec: Spec,
-) -> Option<String> {
+) -> Option<OsString> {
     flags
         .get(spec.flag)
-        .cloned()
+        .map(OsString::from)
         .or_else(|| env(spec.env))
-        .filter(|value| !value.is_empty())
+}
+
+/// A measurement aid's value as text. A value that is not text is refused, not read
+/// as absent: either would let a run that named nothing resolve to the shipped
+/// defaults and rewrite the record.
+fn aid(value: OsString, spec: Spec) -> Result<String> {
+    value
+        .into_string()
+        .map_err(|_| anyhow!("--{} / {} is not UTF-8 text", spec.flag, spec.env))
 }
 
 fn required(value: Option<String>, spec: Spec, what: &str) -> Result<String> {
@@ -671,7 +874,7 @@ mod tests {
         let mut argv = fixture.args.clone();
         argv.push("--timeout=1234".to_string());
         let cfg = BenchConfig::resolve(argv, |name| {
-            (name == MODELS.env).then(|| "/from/the/environment".to_string())
+            (name == MODELS.env).then(|| "/from/the/environment".into())
         })
         .expect("resolved");
         assert_eq!(cfg.models.as_deref(), Some(fixture.dir.as_path()));
@@ -730,6 +933,200 @@ mod tests {
         let err = BenchConfig::resolve(vec!["--modles".to_string(), "x".to_string()], |_| None)
             .expect_err("unknown flag");
         assert!(format!("{err:#}").contains("--modles"));
+    }
+
+    #[test]
+    fn a_threshold_override_moves_the_numbers_it_names_and_nothing_else() {
+        let fixture = Fixture::new("thresholds");
+        let shipped = BenchConfig::resolve(fixture.args.clone(), |_| None).expect("the fixture");
+        assert_eq!(shipped.thresholds, wake::Thresholds::DEFAULT);
+        assert!(!shipped.command_line().contains("--wake-thresholds"));
+
+        let mut argv = fixture.args.clone();
+        argv.extend(args(&[("wake-thresholds", "anchor=0.88, reset_ratio=0.5")]));
+        let point = BenchConfig::resolve(argv, |_| None).expect("the override");
+        assert_eq!(point.thresholds.anchor, 0.88);
+        assert_eq!(point.thresholds.reset_ratio, 0.5);
+        assert_eq!(point.thresholds.floor_max, wake::MAX_SOFT_FLOOR);
+        assert!(
+            point.command_line().contains("--wake-thresholds"),
+            "an overridden run's provenance names the point: {}",
+            point.command_line()
+        );
+    }
+
+    #[test]
+    fn an_unusable_threshold_point_is_refused_before_a_model_is_opened() {
+        let fixture = Fixture::new("thresholds-bad");
+        for (value, wanted) in [
+            ("anchor=0.80", "single stride"),
+            ("anchor=0.65", "anchor must lie"),
+            (
+                "floor_min=0.9,floor_max=0.8",
+                "floor_min must be below floor_max",
+            ),
+            ("floor_min=-1.5", "inside (−1, 1)"),
+            ("reset_ratio=0", "reset_ratio must lie"),
+            ("adaptive_ceiling=-1", "positive ceiling"),
+        ] {
+            let mut argv = fixture.args.clone();
+            argv.extend(args(&[("wake-thresholds", value)]));
+            let err = BenchConfig::resolve(argv, |_| None).expect_err(value);
+            assert!(format!("{err:#}").contains(wanted), "{value}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn a_screened_run_takes_only_the_phases_it_names() {
+        let fixture = Fixture::new("phases");
+        let full = BenchConfig::resolve(fixture.args.clone(), |_| None).expect("the fixture");
+        assert!(full.phases.is_full());
+        assert!(!full.command_line().contains("--phases"));
+
+        let mut argv = fixture.args.clone();
+        argv.extend(args(&[("phases", "recall,non-phrase")]));
+        let screened = BenchConfig::resolve(argv, |_| None).expect("screened");
+        assert!(screened.phases.recall && screened.phases.non_phrase);
+        assert!(!screened.phases.real_audio);
+        assert!(!screened.phases.is_full());
+
+        let mut argv = fixture.args.clone();
+        argv.extend(args(&[("phases", "recall,captions")]));
+        let err = BenchConfig::resolve(argv, |_| None).expect_err("no such phase");
+        assert!(format!("{err:#}").contains("captions"));
+
+        // `all` does not end the check: a typo after it is still a typo.
+        let mut argv = fixture.args.clone();
+        argv.extend(args(&[("phases", "all,recalll")]));
+        let err = BenchConfig::resolve(argv, |_| None).expect_err("no such phase after all");
+        assert!(format!("{err:#}").contains("recalll"), "{err:#}");
+    }
+
+    /// A printed point is the override vocabulary: the record's threshold row and
+    /// the provenance line are pasted back into `--wake-thresholds`, and the
+    /// numbers they name are the ones that were measured — not a rounded point
+    /// that happens to look similar.
+    #[test]
+    fn a_printed_point_parses_back_to_itself() {
+        let shipped = wake::Thresholds::DEFAULT;
+        assert_eq!(parse_thresholds(&shipped.to_string()).unwrap(), shipped);
+        let mut point = shipped;
+        point.anchor = 0.8405;
+        point.reset_ratio = 0.7;
+        assert_eq!(parse_thresholds(&point.to_string()).unwrap(), point);
+    }
+
+    /// The recorded command replays the run it came from: both measurement aids
+    /// are named when they differ from the defaults, and the quoted values parse
+    /// back to the ones the run used.
+    #[test]
+    fn the_recorded_command_names_both_measurement_aids() {
+        let fixture = Fixture::new("aids");
+        let mut argv = fixture.args.clone();
+        argv.extend(args(&[
+            ("phases", "recall,real-audio"),
+            ("wake-thresholds", "anchor=0.86"),
+        ]));
+        let cfg = BenchConfig::resolve(argv, |_| None).expect("the aids");
+        let line = cfg.command_line();
+
+        let quoted = |flag: &str| -> String {
+            line.split(&format!("{flag} \""))
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_else(|| panic!("{flag} is missing from {line}"))
+                .to_string()
+        };
+        assert_eq!(quoted("--phases"), "recall,real-audio");
+        assert_eq!(Phases::parse(&quoted("--phases")).unwrap(), cfg.phases);
+        assert_eq!(
+            parse_thresholds(&quoted("--wake-thresholds")).unwrap(),
+            cfg.thresholds
+        );
+    }
+
+    #[test]
+    fn an_unknown_threshold_name_is_an_error() {
+        let fixture = Fixture::new("thresholds-name");
+        let mut argv = fixture.args.clone();
+        argv.extend(args(&[("wake-thresholds", "treshold=0.8")]));
+        let err = BenchConfig::resolve(argv, |_| None).expect_err("a typo must not be ignored");
+        assert!(format!("{err:#}").contains("treshold"));
+    }
+
+    /// An empty value is refused on both measurement aids, from the flag and from
+    /// the environment: a run that overrode nothing must not resolve to the shipped
+    /// defaults and rewrite the record. The refusal names both places, since the
+    /// operator may have exported the variable and never passed the flag.
+    #[test]
+    fn an_empty_measurement_aid_is_an_error() {
+        let fixture = Fixture::new("aids-empty");
+        for (flag, env, wanted) in [
+            (
+                WAKE_THRESHOLDS.flag,
+                WAKE_THRESHOLDS.env,
+                "names no threshold",
+            ),
+            (PHASES.flag, PHASES.env, "names no phase"),
+        ] {
+            let mut argv = fixture.args.clone();
+            argv.push(format!("--{flag}="));
+            let err = BenchConfig::resolve(argv, |_| None).expect_err(flag);
+            let message = format!("{err:#}");
+            assert!(message.contains(wanted), "--{flag}: {message}");
+            assert!(message.contains(&format!("--{flag} / {env}")), "{message}");
+
+            // A shell that exports the name with no value is the same hazard.
+            let err = BenchConfig::resolve(fixture.args.clone(), |name| {
+                (name == env).then(OsString::new)
+            })
+            .expect_err(env);
+            let message = format!("{err:#}");
+            assert!(message.contains(wanted), "{env}=: {message}");
+            assert!(message.contains(&format!("--{flag} / {env}")), "{message}");
+        }
+    }
+
+    /// A value that is not text is refused on the aids too: it would otherwise read
+    /// as absent, which is the empty-value hazard by another spelling.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_text_measurement_aid_is_an_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let fixture = Fixture::new("aids-bytes");
+        for (flag, env) in [
+            (WAKE_THRESHOLDS.flag, WAKE_THRESHOLDS.env),
+            (PHASES.flag, PHASES.env),
+        ] {
+            let bytes = OsString::from_vec(vec![0xff, b'=']);
+            let err = BenchConfig::resolve(fixture.args.clone(), |name| {
+                (name == env).then(|| bytes.clone())
+            })
+            .expect_err(env);
+            let message = format!("{err:#}");
+            assert!(message.contains("is not UTF-8 text"), "{env}: {message}");
+            assert!(message.contains(&format!("--{flag} / {env}")), "{message}");
+        }
+    }
+
+    /// The same empty value is absent on every other input: a required one names
+    /// itself, a defaulted one takes its default — the aids are the exception.
+    #[test]
+    fn an_empty_input_is_absent_outside_the_measurement_aids() {
+        let fixture = Fixture::new("inputs-empty");
+        let mut argv = fixture.args.clone();
+        argv.push("--timeout=".to_string());
+        let cfg = BenchConfig::resolve(argv, |_| None).expect("an empty timeout is absent");
+        assert_eq!(cfg.timeout_secs, DEFAULT_TIMEOUT_SECS);
+
+        let mut argv = fixture.args.clone();
+        argv.push("--voice=".to_string());
+        let err = BenchConfig::resolve(argv, |_| None).expect_err("an empty voice");
+        assert!(
+            format!("{err:#}").contains("is required"),
+            "an empty path reads as not given: {err:#}"
+        );
     }
 
     #[test]
