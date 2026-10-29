@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! "Transcribe any audio": where the speech is, how a long recording is cut into
-//! recognition chunks, which regions tile the input, which transcripts are worth
-//! trusting — and the model-backed call that runs the detector, the tagger and
-//! the recogniser over that plan.
+//! recognition chunks, which regions tile the input, which transcripts are readings of
+//! the audio rather than the model's placeholders — and the model-backed call that runs
+//! the detector, the tagger and the recogniser over that plan.
 //!
 //! The plan is pure. The span builder takes the detector's per-hop mask as an
 //! argument, the cut takes the audio only to find the quietest hop near it, and the
@@ -18,14 +18,14 @@
 //! The rules are deliberately asymmetric. A start is the detector's own hop and
 //! is never moved: conditioning and hangover may not shift where speech begins.
 //! An end reaches into the silence after it, clamped to the next run and to the
-//! input. A transcript is never dropped, only marked: the caller knows whether a
-//! doubtful region is worth printing. The product wants to filter more rather
-//! than less, but never to lose what the model actually said.
+//! input. A transcript the guards refuse is not returned at all: it is the model's
+//! placeholder or a loop, not a reading of the audio, and the region says so with
+//! its label and `read = false` rather than handing a caller words nobody said.
 //!
 //! What this module does **not** establish is anything about a transcript's
-//! content: the guards detect loops and density, not wrong words. The pinned music
-//! pool the stand measures against lives in [`crate::music`], beside the record
-//! rather than in this surface.
+//! content: the guards detect loops, density and placeholders, not wrong words. The
+//! pinned music pool the stand measures against lives in [`crate::music`], beside the
+//! record rather than in this surface.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -55,27 +55,47 @@ pub const MERGE_GAP_HOPS: usize = 50;
 /// How far a run's end reaches into the silence that follows it (0.4 s), so the
 /// last phoneme is inside the chunk.
 pub const HANGOVER_HOPS: usize = 25;
-/// The encoder's stride in mel frames: three stride-2 convolutions, so one audio
-/// token is eight frames. A chunk's frame count is rounded up to it and no further,
-/// which keeps the padding under one token — the encoder's attention is dense, so a
-/// padded frame becomes a key every real token attends to, and rounding to a coarser
-/// grid changes the reading. The record's `parity-span` row is that check.
-pub const FRAME_ALIGNMENT: usize = 8;
-/// The length every cut aims at, in seconds: the span this recogniser's encoder was
-/// trained over.
-pub const CUT_SECONDS: usize = 8;
-/// How far before its aim a cut may search. The narrower of this and
-/// [`CUT_SLACK_PCT`] of the piece share applies, so a cut never leaves its even share of
-/// the span by more than that: the caps bound the search over a long span, and the share
-/// bounds it over a short one, where a wide search would walk to the end of the span —
-/// whose hangover's silence is the quietest hop there is — and leave a fragment.
-pub const CUT_EARLY_HOPS: usize = 187;
-/// How far after its aim a cut may search, under the same two bounds.
-pub const CUT_LATE_HOPS: usize = 437;
-/// How far a cut may leave its even share of the span, in percent of that share: half a
-/// piece. A piece is therefore between half a share and one and a half — about four to
-/// twelve seconds at the aim — rather than the whole span the caps allow.
-pub const CUT_SLACK_PCT: usize = 50;
+/// The frame counts a chunk's graphs are compiled at, in the encoder's own frames
+/// (eight per audio token). A chunk is padded up to the next rung and no further, so
+/// the graphs a transcription compiles come from this closed set and each rung's
+/// compile serves every chunk of the rung for the life of the process
+/// (the ladder's `rung` cache) — a chunk's exact length is not a shape.
+///
+/// The padding is silence past the end of the piece: it cannot move a word, and the
+/// measure that keeps it honest is the reading itself — the record's transcripts and
+/// its textless figure are measured with it in place. The top rung is above the longest
+/// piece a cut can leave — [`CUT_SECONDS`] plus the window a cut may search back over —
+/// so no piece is ever truncated to fit.
+pub const FRAME_RUNGS: [usize; 6] = [128, 256, 384, 512, 640, 768];
+/// The length every cut aims at, in seconds: above it this recogniser spends its context
+/// on preamble rather than on the words, and a longer piece costs a quadratic prompt
+/// prefill. A piece is at most this plus [`CUT_EARLY_HOPS`].
+///
+/// Seven is where the two bars meet, measured both ways on the pinned corpus: a chunk
+/// costs about 0.7 s of wall time whatever its length — the prompt's own prefill and a
+/// decode apiece — so a shorter aim multiplies that cost while the recogniser gains only
+/// the hard spans it could not read (five-second pieces read four of them and cost
+/// 125.9 ms per audio second against 98.9 here). The trade is recorded, not tuned away.
+pub const CUT_SECONDS: usize = 7;
+/// How far before its aim a cut may search for a quiet hop (0.5 s). A cut never moves
+/// later than its aim, so the piece count is the span's length alone.
+pub const CUT_EARLY_HOPS: usize = 32;
+/// The ladder covers the cut: the top rung is at or above the longest piece a cut can
+/// leave, so no chunk ever needs a rung the ladder does not have.
+const _: () = assert!(
+    FRAME_RUNGS[FRAME_RUNGS.len() - 1]
+        >= (CUT_SECONDS * RATE as usize + CUT_EARLY_HOPS * HOP_SAMPLES) / crate::graphs::MEL_HOP
+);
+/// The least spread, in dB, that the frame loudness of a chunk must have before the
+/// recognition prompt declares a language for it: the tenth to the ninetieth percentile
+/// of its 20 ms frame energies. Speech and singing vary by tens of dB over a few
+/// seconds — pauses, syllables, breaths — while a steady signal (noise, a hum, a drone)
+/// stays within a few. A steady span is still sent to the recogniser; it is only not
+/// *told* the language, so the model's own "no speech" answer stands for it, which is
+/// what keeps a hallucinated transcript off audio that holds no words.
+pub const SPEECH_SPREAD_DB: f32 = 11.0;
+/// The frame the spread is measured over: 20 ms at [`RATE`].
+const SPREAD_FRAME: usize = 320;
 /// The longest word overlap [`overlap_words`] reports: an overlap longer than a region
 /// can end with is not a seam's.
 const OVERLAP_WORDS: usize = 6;
@@ -158,45 +178,35 @@ fn speech_spans(mask: &[bool], samples: usize) -> Vec<Span> {
 /// piece of speech and must not be reported as one.
 pub const MIN_CHUNK_SAMPLES: usize = MIN_SPEECH_HOPS * HOP_SAMPLES;
 
-/// The speech spans cut into recognition chunks, each aimed at [`CUT_SECONDS`]:
-/// a span shorter than that plus one fragment is one chunk, and a longer span is cut
-/// into [`cut`]'s pieces. Spans that need no cut are returned unchanged.
-fn chunks(spans: Vec<Span>, audio: &[f32]) -> Vec<Span> {
-    spans
-        .into_iter()
-        .flat_map(|span| cut(span, audio))
-        .collect()
-}
-
-/// `span` cut into pieces aimed at [`CUT_SECONDS`]: each cut lands on the quietest hop
-/// within [`CUT_EARLY_HOPS`]/[`CUT_LATE_HOPS`] of its even share of the span — and never
-/// further than [`CUT_SLACK_PCT`] of that share, so a cut sits in a pause rather than in
-/// a word and the span's trailing silence never becomes a piece of its own. The piece
-/// count follows the span's length alone, so moving a cut never adds or removes a pass.
+/// `span` cut into pieces of at most [`CUT_SECONDS`] plus one search window: the piece
+/// count is the span's length divided by the aim, rounded up, and each cut lands on the
+/// quietest hop in the half second before its even share — so a cut sits in a pause rather
+/// than in a word, never moves later than its share, and the span's trailing silence never
+/// becomes a piece of its own.
+///
+/// The bound is the aim plus [`CUT_EARLY_HOPS`]: a cut may move earlier, which lengthens
+/// the piece after it by at most that window. [`FRAME_RUNGS`]' top rung covers it, which is
+/// what keeps a piece from ever being truncated to fit.
 fn cut(span: Span, audio: &[f32]) -> Vec<Span> {
     let aim = CUT_SECONDS * RATE as usize;
     let len = span.end.saturating_sub(span.start);
-    if len <= aim + MIN_CHUNK_SAMPLES {
+    if len <= aim {
         return vec![span];
     }
-    // The number of pieces the span's length asks for, rounded to the nearest aim:
-    // twelve seconds is two six-second pieces rather than one of twelve.
-    let count = ((len + aim / 2) / aim).max(1);
-    let (early, late) = (CUT_EARLY_HOPS * HOP_SAMPLES, CUT_LATE_HOPS * HOP_SAMPLES);
-    // Each piece's own share of the span, and how far a cut may leave it.
-    let slack = len / count * CUT_SLACK_PCT / 100;
+    // Enough pieces that every one is at most the aim: a span is never one long piece with
+    // a short remainder, which is what left twelve- and fourteen-second pieces the
+    // recogniser answered with nothing.
+    let count = len.div_ceil(aim).max(1);
+    let early = CUT_EARLY_HOPS * HOP_SAMPLES;
     let mut out = Vec::with_capacity(count);
     let mut start = span.start;
     for k in 1..count {
+        // The even share, and the quietest hop in the half second before it: a cut lands in
+        // a pause rather than in a word, and never after its share.
         let target = span.start + len * k / count;
-        let lo = target
-            .saturating_sub(early.min(slack))
-            .max(start + MIN_CHUNK_SAMPLES);
-        let hi = (target + late.min(slack)).min(span.end.saturating_sub(MIN_CHUNK_SAMPLES));
-        // `lo` is itself a legal cut, which is what the fallback uses when the window is
-        // empty or the audio does not reach it.
-        let at = quietest_hop(audio, lo, hi)
-            .unwrap_or(lo)
+        let from = target.saturating_sub(early).max(start + MIN_CHUNK_SAMPLES);
+        let at = quietest_hop(audio, from, target)
+            .unwrap_or(target)
             .min(span.end.saturating_sub(MIN_CHUNK_SAMPLES))
             .max(start + MIN_CHUNK_SAMPLES);
         out.push(Span { start, end: at });
@@ -281,10 +291,10 @@ fn tile_indexed(chunks: &[Span], samples: usize) -> Vec<(Span, Option<usize>)> {
 /// chunk's own index and never by the order the walks ran, which is what keeps a
 /// transcript with the audio it describes — a chunk's text attached to its neighbour's
 /// region would hold the region times right and the text wrong.
-fn readings_by_chunk(count: usize, readings: Vec<(usize, Guarded)>) -> Vec<Option<Guarded>> {
-    let mut answers: Vec<Option<Guarded>> = (0..count).map(|_| None).collect();
+fn readings_by_chunk(count: usize, readings: Vec<(usize, Option<String>)>) -> Vec<Option<String>> {
+    let mut answers: Vec<Option<String>> = (0..count).map(|_| None).collect();
     for (index, answer) in readings {
-        answers[index] = Some(answer);
+        answers[index] = answer;
     }
     answers
 }
@@ -298,6 +308,22 @@ pub const WORD_REPEAT_LIMIT: usize = 12;
 /// Characters per second of the region's audio above which a transcript is
 /// denser than anyone can speak.
 pub const DENSITY_CEILING: f64 = 30.0;
+
+/// Words in a transcript at or below which, over a chunk of at least [`FILLER_SECONDS`], it
+/// is the model's placeholder rather than a reading of what is there: the recogniser answers
+/// audio it cannot read with one generic word ("Okay.", "Hello.", "Thank you.") over
+/// seconds of it. Three words and up is kept — a short utterance can be that short, and the
+/// reading is the caller's to judge. See [`guard`].
+pub const FILLER_WORDS: usize = 2;
+
+/// The shortest chunk the filler count applies to: two words in a second and a half is a
+/// short utterance, not a placeholder, and a chunk shorter than this has too little audio
+/// for the answer's length to mean anything.
+pub const FILLER_SECONDS: f64 = 3.0;
+
+/// How many refused transcripts one call keeps for the record: enough to see what the
+/// guards are refusing, few enough that a long call's figures stay cheap.
+pub const REFUSAL_SAMPLES: usize = 8;
 
 /// Generated tokens a chunk may spend per second of its own audio. The pinned
 /// 17.46 s recognition clip generates 3.7 a second, so ten leaves a wide margin
@@ -319,50 +345,45 @@ fn chunk_budget(seconds: f64) -> usize {
     }
 }
 
-/// One region's transcript as the guards leave it.
-#[derive(Clone, PartialEq, Debug)]
-struct Guarded {
-    text: Option<String>,
-    reliable: bool,
-}
-
 /// Whether a reading says anything a language is written with: the model's own
 /// "no speech" answer arrives empty, as whitespace, or as a lone punctuation mark.
 fn spoken(text: &str) -> bool {
     text.trim().chars().any(char::is_alphanumeric)
 }
 
-/// The three text guards, in the direction the product wants them: filter more
-/// rather than less.
-/// * a transcript with nothing a language is written with — empty, whitespace, or
-///   punctuation only — is the model's own "no speech": `text: None`, and nothing
-///   to distrust, so `reliable: true`;
-/// * a repetition loop — any `REPEAT_GRAM`-word gram occurring more than
-///   `REPEAT_LIMIT` times, or one word run more than `WORD_REPEAT_LIMIT` times —
-///   is `reliable: false` and the text is kept;
-/// * text denser than `DENSITY_CEILING` characters per second of the region's own
-///   audio is `reliable: false`, the text kept.
-/// Text is never dropped: the call marks, the caller cuts.
-fn guard(text: &str, seconds: f64) -> Guarded {
+/// What the guards leave of one chunk's transcript: `Some` when it is a reading the call
+/// stands behind, `None` when it is not a reading at all.
+///
+/// A transcript is refused when it
+/// * holds nothing a language is written with — empty, whitespace, or punctuation only,
+///   which is the model's own "no speech" answer;
+/// * loops — any [`REPEAT_GRAM`]-word gram more than [`REPEAT_LIMIT`] times, or one word
+///   run more than [`WORD_REPEAT_LIMIT`] times — the model circling instead of reading;
+/// * is denser than [`DENSITY_CEILING`] characters per second of its own audio, which is
+///   faster than anyone speaks;
+/// * says no more than [`FILLER_WORDS`] over a chunk at least [`FILLER_SECONDS`] long: the
+///   one generic word ("Okay.", "Hello.") the recogniser answers audio it cannot read with,
+///   over seconds of it.
+///
+/// A refused transcript is never returned, not even marked: a caller that cannot tell
+/// filler from a reading has no use for either. The region is then speech found and not
+/// read, and carries its label.
+fn guard(text: &str, seconds: f64) -> Option<String> {
     // Nothing at all, or nothing a language is written with: the model's own
     // "no speech" answer arrives both ways, and a lone punctuation mark is not a
     // reading of the audio either.
     if !spoken(text) {
-        return Guarded {
-            text: None,
-            reliable: true,
-        };
+        return None;
     }
     let trimmed = text.trim();
     let words: Vec<String> = trimmed.split_whitespace().map(str::to_lowercase).collect();
-    let mut reliable = true;
     // One word held for more than a dozen turns.
     let mut run = 1;
     for pair in words.windows(2) {
         if pair[0] == pair[1] {
             run += 1;
             if run > WORD_REPEAT_LIMIT {
-                reliable = false;
+                return None;
             }
         } else {
             run = 1;
@@ -381,8 +402,7 @@ fn guard(text: &str, seconds: f64) -> Guarded {
                 }
             }
             if count > REPEAT_LIMIT {
-                reliable = false;
-                break;
+                return None;
             }
         }
     }
@@ -390,24 +410,59 @@ fn guard(text: &str, seconds: f64) -> Guarded {
     // duration is not a number. Both are marks, not crashes.
     let density = trimmed.chars().count() as f64 / seconds;
     if seconds <= 0.0 || !density.is_finite() || density > DENSITY_CEILING {
-        reliable = false;
+        return None;
     }
-    Guarded {
-        text: Some(text.to_string()),
-        reliable,
+    // The placeholder: two words, or one, over seconds of audio.
+    if seconds >= FILLER_SECONDS && words.len() <= FILLER_WORDS {
+        return None;
     }
+    Some(text.to_string())
 }
 
 // ── the aligned input ───────────────────────────────────────────────
 
-/// The frame count a chunk of `frames` mel frames is compiled at:
-/// `ceil(frames / FRAME_ALIGNMENT) * FRAME_ALIGNMENT`, and never 0.
-fn aligned_frames(frames: usize) -> usize {
-    frames.div_ceil(FRAME_ALIGNMENT).max(1) * FRAME_ALIGNMENT
+/// The frame count a chunk of `frames` mel frames is compiled at: the first rung of
+/// [`FRAME_RUNGS`] at or above it. A chunk longer than the top rung is refused rather
+/// than truncated — [`cut`] never leaves one, so this is the refusal that keeps a
+/// future change to [`CUT_SECONDS`] from silently dropping the tail of every piece.
+fn rung_frames(frames: usize) -> Result<usize> {
+    FRAME_RUNGS
+        .iter()
+        .copied()
+        .find(|rung| *rung >= frames)
+        .with_context(|| {
+            format!(
+                "a chunk of {frames} frames is longer than the ladder's top rung ({})",
+                FRAME_RUNGS[FRAME_RUNGS.len() - 1]
+            )
+        })
+}
+
+/// The spread of a chunk's frame loudness, in dB: the tenth to the ninetieth percentile
+/// of its [`SPREAD_FRAME`] frame energies. See [`SPEECH_SPREAD_DB`].
+fn spread_db(audio: &[f32], span: Span) -> f32 {
+    let mut levels: Vec<f32> =
+        Vec::with_capacity(span.end.saturating_sub(span.start) / SPREAD_FRAME + 1);
+    let mut at = span.start;
+    while at + SPREAD_FRAME <= span.end.min(audio.len()) {
+        let energy: f32 = audio[at..at + SPREAD_FRAME]
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            / SPREAD_FRAME as f32;
+        levels.push(10.0 * energy.max(1e-12).log10());
+        at += SPREAD_FRAME;
+    }
+    if levels.is_empty() {
+        return 0.0;
+    }
+    levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let at = |f: f64| levels[((levels.len() - 1) as f64 * f) as usize];
+    at(0.9) - at(0.1)
 }
 
 /// `audio` truncated (or zero-padded) to exactly `samples` samples — the
-/// `frames * 160` an [`aligned_frames`] graph takes.
+/// `frames * 160` a rung's graph takes.
 fn pad_to(audio: &[f32], samples: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(samples);
     out.extend_from_slice(&audio[..audio.len().min(samples)]);
@@ -432,16 +487,20 @@ pub struct Region {
     /// End of the region, exclusive.
     pub end: usize,
     /// The transcript of the audio in this region, as the model produced it —
-    /// `None` only where the model answered nothing (`guard` read its empty
-    /// answer as "no speech").
+    /// `Some` exactly when [`Region::read`]: a reading the call stands behind. A refused
+    /// transcript is not returned (`transcribe::guard`), so there is no third state.
     pub text: Option<String>,
-    /// What the tagger heard here, when the region carries one: always for a
-    /// region without text, and also for a region whose transcript the guards
-    /// rejected. A transcript that survived carries no label.
+    /// What the tagger heard here: always on a region no reading produced — what the
+    /// audio is, which may be a non-speech class or a speech one. A region that was read
+    /// carries no label.
     pub label: Option<String>,
-    /// `false` when the guards rejected the transcript: it is returned anyway,
-    /// marked, because the call does not decide for the caller.
-    pub reliable: bool,
+    /// `true` when the plan sent this region's audio to the recogniser and came back with a
+    /// transcript. A region with `read: false` is not silence: it is audio the plan found
+    /// no reading for — speech the model answered nothing on, or speech whose answer the
+    /// guards refused as filler, or audio segmentation never called speech — and its label
+    /// says which. The caller can therefore tell "nothing there" from "we failed to read
+    /// it" without inferring it from an empty string.
+    pub read: bool,
 }
 
 /// What one call produced, in the input's own time base. The regions tile the
@@ -468,12 +527,11 @@ impl Transcription {
         at as f64 / f64::from(self.sample_rate)
     }
 
-    /// The result's own contract, checked in every build: a region answers with a
-    /// text or with a label, a label never sits beside a reliable transcript, the
-    /// regions are ordered without a hole or an overlap inside `[0, samples]`, the
-    /// first starts at 0 and the last ends at `samples`. A caller that composes a
-    /// `Transcription` — the tests do — gets the same check the call itself runs,
-    /// rather than a `debug_assert` a release build strips.
+    /// The result's own contract, checked in every build: a region answers with a text or
+    /// with a label and never both, the regions are ordered without a hole or an overlap
+    /// inside `[0, samples]`, the first starts at 0 and the last ends at `samples`. A
+    /// caller that composes a `Transcription` — the tests do — gets the same check the
+    /// call itself runs, rather than a `debug_assert` a release build strips.
     pub fn check(&self) -> Result<()> {
         let (Some(first), Some(last)) = (self.regions.first(), self.regions.last()) else {
             bail!("the result has no region");
@@ -491,11 +549,21 @@ impl Transcription {
         let mut cursor = 0usize;
         for region in &self.regions {
             let at = self.seconds(region.start);
-            if region.text.is_none() && region.label.is_none() {
-                bail!("the region at {at:.3} s answers neither with a text nor with a label");
+            if region.read != region.text.is_some() {
+                bail!(
+                    "the region at {at:.3} s says read={} with {} text",
+                    region.read,
+                    if region.text.is_some() { "a" } else { "no" }
+                );
             }
-            if region.label.is_some() && region.text.is_some() && region.reliable {
-                bail!("the region at {at:.3} s carries a label beside a reliable transcript");
+            if !region.read && region.label.is_none() {
+                bail!(
+                    "the region at {at:.3} s was not read and carries no label: a caller could \
+                     not tell what the audio is"
+                );
+            }
+            if region.read && region.label.is_some() {
+                bail!("the region at {at:.3} s carries a label beside its transcript");
             }
             if region.start != cursor || region.end <= region.start {
                 bail!(
@@ -520,7 +588,7 @@ impl Transcription {
 
 /// What one call cost, split by stage — the figures the measurement record
 /// reports. A caller that only wants the transcript ignores this.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Costs {
     /// Reading the file, for a call that came through [`Transcriber::transcribe_file`]:
     /// zero for a caller that hands the audio over itself.
@@ -535,23 +603,26 @@ pub struct Costs {
     pub recognise_ms: f64,
     /// The recognition passes: one per chunk.
     pub chunks: usize,
-    /// The distinct frame counts the graphs were compiled at — the front end, prefill
-    /// and decode a chunk pays for when no other chunk shares its length.
+    /// The distinct rungs of [`FRAME_RUNGS`] this call ran chunks at: never more than the
+    /// ladder's length, whatever the input's.
     pub shapes: usize,
+    /// How many of those rungs this call compiled: the rest were already resident,
+    /// placed by an earlier call.
+    pub compiles: usize,
     pub windows: usize,
     /// Seconds of audio the recognition passes actually covered.
-    pub speech_s: f64,
-    /// The part of [`Costs::speech_s`] whose region came back with no transcript at
+    pub covered_s: f64,
+    /// The part of [`Costs::covered_s`] whose region came back with no transcript at
     /// all: the detector called it speech and the chunk's reading produced nothing. On
     /// input that holds speech this is speech the path failed to transcribe, in
     /// seconds. On input that holds none it is the detector's false positives, which is
     /// why the record keeps the two pools apart. A region's whole seconds are counted,
     /// the hangover into silence included, so this is never more than
-    /// [`Costs::speech_s`].
+    /// [`Costs::covered_s`].
     pub textless_s: f64,
     /// [`Costs::textless_s`] over regions whose tagger label is one of
-    /// [`WORD_LABELS`]: a region the recogniser had no reading for at all — lost
-    /// speech, in seconds.
+    /// [`SPEECH_LABELS`] or [`MUSIC_LABELS`]: a region the recogniser had no reading for
+    /// at all — lost speech, in seconds.
     pub textless_voiced_s: f64,
     /// [`Costs::textless_s`] over regions whose label says otherwise: the detector
     /// marked audio the tagger calls something other than words, so there was nothing
@@ -562,21 +633,31 @@ pub struct Costs {
     /// words and that were not presented to the recogniser at all: the marked hops
     /// among them are cleared from the plan, and their audio is a region's label
     /// instead. Never more than [`Costs::masked_s`], because only marked hops are
-    /// cleared. Music and singing are always presented (`WORD_LABELS`), and so is any
+    /// cleared. Music and singing are always presented ([`bears_words`]), and so is any
     /// span shorter than one tagger window, which the tagger has judged only once.
     pub suppressed_s: f64,
     /// Chunks that ended with no transcript.
     pub textless_chunks: usize,
-    /// The part of [`Costs::speech_s`] whose transcript the guards rejected: the
-    /// text is returned, marked, with the tagger's label beside it, and a caller
-    /// that filters loses these seconds.
-    pub flagged_s: f64,
+    /// Chunks whose prompt carried the declared language: the ones the tagger calls a
+    /// class that [`speaks_words`] and whose own loudness varies the way speech does
+    /// ([`SPEECH_SPREAD_DB`]). The rest ran the one-shot prompt and the model's own
+    /// answer — the split between the two failure modes (textless speech and invented
+    /// text), and therefore a figure the record prints.
+    pub declared: usize,
+    /// Seconds of audio whose transcript the guards refused as filler or as a loop
+    /// ([`guard`]), or whose walk ran out of its own budget: speech found and not read.
+    pub discarded_s: f64,
+    /// The first [`REFUSAL_SAMPLES`] of those transcripts, with the seconds of audio each
+    /// spoke for: what the guards refused or a walk's own budget cut short, printed by the
+    /// record so the line between a reading and a placeholder can be reviewed rather than
+    /// taken on trust.
+    pub refused: Vec<(f64, String)>,
     /// Seconds the detector marked speech, before the plan dropped the runs too
     /// short to be worth a pass.
     pub masked_s: f64,
     /// The part of [`Costs::masked_s`] that no chunk covers: the audio
     /// segmentation threw away before any word existed. It is not
-    /// `masked_s - speech_s`, because a chunk's hangover reaches into silence the
+    /// `masked_s - covered_s`, because a chunk's hangover reaches into silence the
     /// detector did not mark, so that difference can be negative.
     pub uncovered_s: f64,
 }
@@ -587,15 +668,15 @@ pub struct Costs {
 /// answers where the speech is, the tagger what the region sounds like, the
 /// recogniser what was said. All three are the caller's — the pair, its tagger —
 /// so a caller that opened a pair from an explicit path cannot be paired with a
-/// tagger resolved from somewhere else. The clip a shape's chunks run on is built
-/// and dropped inside the call. A cache across calls is ruled out by residency, not
-/// by the types — the clip could own an `Arc<Tokenizer>` as it owns `Arc<Pair>`: one
-/// call already holds two body-sized graphs while a chunk's decode graph stays
-/// resident and the next chunk's prefill is compiled, so a cross-call cache would
-/// hold a third between calls. A sweep of files therefore pays one front end, one
-/// decode graph and one prefill per distinct chunk length per call; the record's
-/// `build` row prices exactly that, and the weight upload is not part of it (the
-/// shared weight buffer skips a model's bytes a compile already placed).
+/// tagger resolved from somewhere else.
+///
+/// What a call compiles is the **ladder's** rungs and nothing else: a chunk is padded
+/// up to one of [`FRAME_RUNGS`] and that rung's graphs are compiled once for the process
+/// (the ladder's `rung` cache), so a pass pays for the rungs no earlier call placed rather than a
+/// graph set per chunk length. The cache is bounded by construction — its key comes from
+/// the closed ladder and it holds at most the ladder's own number of rungs — and a rung the
+/// process has never placed is a compile, never a wrong answer.
+/// [`crate::release_process_memory`] gives all of it back.
 pub struct Transcriber {
     pair: Arc<Pair>,
     tokenizer: Tokenizer,
@@ -717,7 +798,18 @@ impl Transcriber {
                 spans.push(span);
             }
         }
-        let chunk_list = chunks(spans, audio16);
+        // Each chunk's own label, from the span it was cut out of: it decides whether the
+        // recogniser is given the language (`SPEECH_LABELS`) or left to answer with its
+        // own.
+        let mut chunk_list: Vec<Span> = Vec::new();
+        let mut chunk_labels: Vec<Option<String>> = Vec::new();
+        for span in spans {
+            let label = span_labels.get(&span).cloned().flatten();
+            for piece in cut(span, audio16) {
+                chunk_list.push(piece);
+                chunk_labels.push(label.clone());
+            }
+        }
         let plan = tile_indexed(&chunk_list, audio16.len());
         // The seconds the plan dropped: masked hops no chunk covers and no label
         // accounts for (`suppressed_s` above). Counted against the chunks themselves
@@ -740,15 +832,15 @@ impl Transcriber {
         let uncovered_s = uncovered as f64 / f64::from(RATE);
         let segment_ms = t.ms();
 
-        // The chunks grouped by the frame count their graphs are compiled at, so a
-        // file whose chunks share a length pays one front end and one decode graph
-        // for both rather than one each. Each chunk's prefill is dropped once it has
-        // run and rebuilt for the next, while the decode graph stays resident for the
-        // shape: a rebuild is half a second against a body upload, and the two graphs a
-        // call holds at once are what the record's peak pays.
+        // The chunks grouped by the rung their graphs are compiled at, so a file whose
+        // chunks share a rung — most of them, since a full piece is always the same
+        // length — visits that rung's graphs once. A rung is compiled the first time
+        // any call asks for it and kept process-wide (the ladder's `rung` cache): the call pays
+        // only the rungs no earlier call placed, so the build line is a ladder, not a
+        // per-chunk cost.
         let mut shapes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (index, chunk) in chunk_list.iter().enumerate() {
-            shapes.entry(chunk_frames(*chunk)).or_default().push(index);
+            shapes.entry(chunk_frames(*chunk)?).or_default().push(index);
         }
         // Each chunk's reading: the walk's own text through the guards, and never a
         // second pass — the plan cuts at the span the encoder was trained over, so a
@@ -757,11 +849,17 @@ impl Transcriber {
         // own index and placed by it ([`readings_by_chunk`]), never by the order the
         // shapes were visited: a reading attached to its neighbour's region would
         // mistime the text and miscount the textless seconds.
-        let mut readings: Vec<(usize, Guarded)> = Vec::with_capacity(chunk_list.len());
-        let (mut build_ms, mut recognise_ms) = (0f64, 0f64);
+        let mut readings: Vec<(usize, Option<String>)> = Vec::with_capacity(chunk_list.len());
+        let (mut build_ms, mut recognise_ms, mut compiles, mut declared) = (0f64, 0f64, 0usize, 0);
+        let mut discarded_s = 0f64;
+        let mut refused: Vec<(f64, String)> = Vec::new();
         for (frames, indexes) in &shapes {
-            let mut clip = listen::Clip::build(&self.pair, &self.tokenizer, *frames)
+            let (mut clip, placed) = listen::Clip::rung(&self.pair, &self.tokenizer, *frames)
                 .with_context(|| format!("building the {frames}-frame recognition graphs"))?;
+            if let Some(paid) = placed {
+                compiles += 1;
+                build_ms += paid;
+            }
             for &index in indexes {
                 let chunk = chunk_list[index];
                 let seconds = (chunk.end - chunk.start) as f64 / f64::from(RATE);
@@ -769,35 +867,59 @@ impl Transcriber {
                 // there cannot spend a minute looping over eighteen seconds of
                 // singing, and the loop, if it happens, is still in the words.
                 clip.set_max_new(chunk_budget(seconds));
+                // The prompt's language rows, from the chunk's own tagger label and its
+                // own loudness dynamics: a speech or singing chunk that varies the way
+                // speech does is told the language, and everything else — instrumental
+                // music, a noise span the detector called speech, a drone — is left with
+                // the prompt the one-shot path uses, so the model answers with its own
+                // language or with none. A steady signal asked for a language answers with
+                // a generic word rather than words; `guard` refuses that answer, and the
+                // split is counted ([`Costs::declared`]) because it is the switch between
+                // textless speech and invented text.
+                let told = chunk_labels[index].as_deref().is_some_and(speaks_words)
+                    && spread_db(audio16, chunk) >= SPEECH_SPREAD_DB;
+                declared += usize::from(told);
                 let walk = clip
-                    .run(chunk_audio(audio16, chunk, *frames), 0)
+                    .run(
+                        chunk_audio(audio16, chunk, *frames),
+                        told.then_some(listen::ASR_LANGUAGE_IDS),
+                        0,
+                    )
                     .with_context(|| {
                         format!("transcribing samples {}..{}", chunk.start, chunk.end)
                     })?;
-                // Each walk reports the build it paid: the shape's own graphs on its
-                // first chunk (front end, prefill, decode) and a prefill rebuild on the
-                // rest — so summing every walk's figure prices every compile the call
-                // made, which is what the record's `build` row counts. The walk's own
-                // cold pass is what produced its transcript, so it is what the
+                // A rung chunk compiles nothing: its graphs are the rung's. The walk's
+                // own cold pass is what produced its transcript, so it is what the
                 // recognition figure counts.
                 build_ms += walk.build_ms;
                 recognise_ms += passage_ms(&walk);
-                let mut answer = guard(&walk.text, seconds);
-                answer.reliable &= !walk.truncated;
+                // A walk that ran out of its own budget was circling, not reading: the
+                // words it did produce are not a reading of the chunk either.
+                let answer = if walk.truncated {
+                    None
+                } else {
+                    guard(&walk.text, seconds)
+                };
+                if answer.is_none() && spoken(&walk.text) {
+                    discarded_s += seconds;
+                    if refused.len() < REFUSAL_SAMPLES {
+                        refused.push((seconds, walk.text.clone()));
+                    }
+                }
                 readings.push((index, answer));
             }
-            // The clip is dropped here, at the end of its shape: one shape's graphs are
-            // resident at a time.
+            // The clip is dropped here, at the end of its rung: a rung's graphs stay
+            // resident in the ladder's cache, and this handle is only the walk.
         }
         let answers = readings_by_chunk(chunk_list.len(), readings);
-        let textless_chunks = answers
-            .iter()
-            .flatten()
-            .filter(|answer| answer.text.is_none())
-            .count();
+        // Speech the detector marked and the pass produced no reading for: an empty answer
+        // or one the guards refused. Both are textless speech; the refused ones are
+        // counted apart ([`Costs::discarded_s`]) because they are the filler the guards
+        // exist for.
+        let textless_chunks = answers.iter().filter(|answer| answer.is_none()).count();
         // `f64`'s `Sum` starts at `-0.0`, so an input with no chunk at all would report
         // a covered length of `-0`; adding zero normalises the sign.
-        let speech_s: f64 = chunk_list
+        let covered_s: f64 = chunk_list
             .iter()
             .map(|chunk| (chunk.end - chunk.start) as f64 / f64::from(RATE))
             .sum::<f64>()
@@ -809,22 +931,16 @@ impl Transcriber {
         // none and is described by the tagger alone.
         let mut regions: Vec<Region> = Vec::with_capacity(plan.len());
         let (mut textless_s, mut textless_voiced_s, mut textless_other_s) = (0f64, 0f64, 0f64);
-        let mut flagged_s = 0f64;
         for (span, chunk) in &plan {
-            let mut text = None;
-            let mut reliable = true;
-            if let Some(index) = *chunk {
-                let answer = answers[index]
-                    .as_ref()
-                    .with_context(|| format!("the reading of chunk {index}"))?;
-                text.clone_from(&answer.text);
-                reliable = answer.reliable;
-            }
-            // A transcript the guards rejected keeps its text but is marked, so
-            // the tagger says what was heard there beside it; one that survived
-            // carries no label. A region that is a span uncut takes the label the
-            // span already has.
-            let label = if text.is_none() || !reliable {
+            // A speech region takes its own chunk's reading; `None` is a chunk the pass
+            // produced no reading for, which the region says with its label and `read`.
+            let text = chunk
+                .map(|index| answers[index].clone())
+                .unwrap_or_default();
+            // A region with no transcript says what it is: the tagger's label for the span
+            // it is part of, asked for this region only when the span is not the region. A
+            // region that was read carries no label — there is nothing to explain.
+            let label = if text.is_none() {
                 match span_labels.get(span) {
                     Some(label) => label.clone(),
                     None => region_label(&self.tagger, &tags, *span),
@@ -838,24 +954,20 @@ impl Transcriber {
             // recognition pass is counted — a background region is audio the detector
             // never called speech, and a suppressed span is `suppressed_s`.
             let seconds = (span.end - span.start) as f64 / f64::from(RATE);
-            if chunk.is_some() {
-                if text.is_none() {
-                    textless_s += seconds;
-                    if label.as_deref().is_some_and(bears_words) {
-                        textless_voiced_s += seconds;
-                    } else {
-                        textless_other_s += seconds;
-                    }
-                } else if !reliable {
-                    flagged_s += seconds;
+            if chunk.is_some() && text.is_none() {
+                textless_s += seconds;
+                if label.as_deref().is_some_and(bears_words) {
+                    textless_voiced_s += seconds;
+                } else {
+                    textless_other_s += seconds;
                 }
             }
             regions.push(Region {
                 start: span.start,
                 end: span.end,
+                read: text.is_some(),
                 text,
                 label,
-                reliable,
             });
         }
         let out = Transcription {
@@ -876,14 +988,17 @@ impl Transcriber {
             recognise_ms,
             chunks: chunk_list.len(),
             shapes: shapes.len(),
+            compiles,
             windows: tags.len(),
-            speech_s,
+            covered_s,
             textless_s,
             textless_voiced_s,
             textless_other_s,
             suppressed_s,
             textless_chunks,
-            flagged_s,
+            declared,
+            discarded_s,
+            refused,
             masked_s,
             uncovered_s,
         };
@@ -921,8 +1036,8 @@ impl Transcriber {
     /// The costs of the most recent `transcribe` call. A call that returned an
     /// error reports zeros: it has no complete pass to price, and the call before it
     /// describes audio this one never saw.
-    pub fn costs(&self) -> Costs {
-        self.costs
+    pub fn costs(&self) -> &Costs {
+        &self.costs
     }
 
     /// The tokenizer this call encodes with — the pair's own, opened once in
@@ -999,10 +1114,10 @@ fn passage_ms(walk: &listen::Walk) -> f64 {
         + walk.decode_times.iter().sum::<f64>()
 }
 
-/// The frame count a chunk's graphs are compiled at: its own length, rounded to the
-/// encoder's stride and no further ([`FRAME_ALIGNMENT`]).
-fn chunk_frames(chunk: Span) -> usize {
-    aligned_frames(frames_of(chunk.end - chunk.start))
+/// The frame count a chunk's graphs are compiled at: its own length rounded up to the
+/// next rung ([`FRAME_RUNGS`]).
+fn chunk_frames(chunk: Span) -> Result<usize> {
+    rung_frames(frames_of(chunk.end - chunk.start))
 }
 
 /// The audio one chunk is recognised from: the samples of `read` (its own, or one of its
@@ -1035,7 +1150,7 @@ fn suppress(mask: &mut [bool], span: Span) {
 /// Whether a span may be removed from the recogniser's input rather than transcribed.
 ///
 /// Only when the tagger has seen it more than once, and only when **no** window over it
-/// names a label that can carry words ([`WORD_LABELS`]) — one such window keeps the
+/// names a label that can carry words ([`bears_words`]) — one such window keeps the
 /// whole span, whatever the span's aggregate label says. A span shorter than a tagger
 /// window is judged by a single window, itself padded and so out of distribution: a
 /// three-second excerpt of a pop song came back labelled `Meow` and lost its transcript
@@ -1074,19 +1189,27 @@ pub fn overlap_words(previous: &str, text: &str) -> usize {
 }
 
 /// The tagger's labels that mean words, taken from the file's own 527-name vocabulary:
-/// the speech classes, the singing ones, the word-bearing music ones, and the vocal
-/// noises a word can survive. A label outside this list is a span the recogniser is not
-/// asked about — its audio becomes the region's label instead.
+/// the speech and singing classes ([`SPEECH_LABELS`]) and the word-bearing music ones,
+/// which the song rule offers to the recogniser. A label outside this list is a span the
+/// recogniser is not asked about — its audio becomes the region's label instead.
 ///
 /// The list is explicit rather than a family match on purpose. A substring rule admits
-/// `Musical instrument`, `Whale vocalization`, `Singing bowl` and `Hum` and excludes
-/// `Song`, `Lullaby` and `A capella`, which is the wrong side of the line in both
-/// directions: an instrumental clip is the pool that must never be transcribed, and a
-/// sung line is the one the song rule must offer. Everything a word-bearing name could be
-/// spelled as in this ontology is here, and the record prints the list with the seconds it
-/// removed, so the rule is visible where it acts.
-pub const WORD_LABELS: &[&str] = &[
-    // Speech.
+/// `Whale vocalization`, `Singing bowl` and `Hum` and excludes `Song`, `Lullaby` and
+/// `A capella`, which is the wrong side of the line in both directions: a whale call is
+/// not words, and a sung line is the one the song rule must offer. Everything a
+/// word-bearing name could be spelled as in this ontology is here, and the record prints
+/// the list, so the rule is visible where it acts.
+pub fn word_labels() -> impl Iterator<Item = &'static str> {
+    SPEECH_LABELS.iter().chain(MUSIC_LABELS).copied()
+}
+
+/// The tagger's labels that say the audio there is *speech or singing* — the two
+/// families where the recogniser is given the language in its prompt
+/// ([`listen::ASR_LANGUAGE_IDS`]) instead of being left to identify it. Every song
+/// rule's clips are here; every instrumental music class is not, because a declared
+/// language over an orchestra produces a confident, wrong transcript, which is the one
+/// thing the music pool must never see.
+pub const SPEECH_LABELS: &[&str] = &[
     "Speech",
     "Male speech, man speaking",
     "Female speech, woman speaking",
@@ -1098,7 +1221,6 @@ pub const WORD_LABELS: &[&str] = &[
     "Whispering",
     "Speech synthesizer",
     "Hubbub, speech noise, speech babble",
-    // Singing.
     "Singing",
     "Choir",
     "Yodeling",
@@ -1114,8 +1236,12 @@ pub const WORD_LABELS: &[&str] = &[
     "A capella",
     "Song",
     "Lullaby",
-    // Music: offered to the recogniser as the song rule asks — if the words come out they
-    // are transcribed, and if they do not the guards and the label say so.
+];
+
+/// The word-bearing music classes the song rule offers to the recogniser. Separated from
+/// [`SPEECH_LABELS`] because the two families are used for different decisions — a music
+/// class may hold words but never speaks them.
+const MUSIC_LABELS: &[&str] = &[
     "Ambient music",
     "Angry music",
     "Background music",
@@ -1160,13 +1286,23 @@ pub const WORD_LABELS: &[&str] = &[
     "Wedding music",
 ];
 
-/// Whether a tagger label says the audio there can hold words: one of [`WORD_LABELS`],
-/// matched on the name the file carries.
+/// Whether a tagger label says the audio there is speech or singing.
+fn speaks_words(label: &str) -> bool {
+    let name = label.trim();
+    SPEECH_LABELS
+        .iter()
+        .any(|class| name.eq_ignore_ascii_case(class))
+}
+
+/// Whether a tagger label says the audio there can hold words: a speech or singing class
+/// ([`SPEECH_LABELS`]) or one of the word-bearing music ones ([`MUSIC_LABELS`]), matched
+/// on the name the file carries.
 fn bears_words(label: &str) -> bool {
     let name = label.trim();
-    WORD_LABELS
+    MUSIC_LABELS
         .iter()
-        .any(|word| word.eq_ignore_ascii_case(name))
+        .any(|word| name.eq_ignore_ascii_case(word))
+        || speaks_words(name)
 }
 
 /// The tagger's label for a region: the windows overlapping it, weighted by how
@@ -1195,7 +1331,7 @@ fn merge(regions: Vec<Region>) -> Vec<Region> {
     let mut out: Vec<Region> = Vec::with_capacity(regions.len());
     for region in regions {
         if let Some(last) = out.last_mut() {
-            if last.text.is_none() && region.text.is_none() && last.label == region.label {
+            if !last.read && !region.read && last.label == region.label {
                 last.end = region.end;
                 continue;
             }
@@ -1249,6 +1385,15 @@ fn retime(regions: Vec<Region>, rate: u32, samples: usize) -> Vec<Region> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spans walked through [`cut`] one by one: the production path the tests below take,
+    /// with the span's label left out (that is what the call itself carries).
+    fn chunks(spans: Vec<Span>, audio: &[f32]) -> Vec<Span> {
+        spans
+            .into_iter()
+            .flat_map(|span| cut(span, audio))
+            .collect()
+    }
 
     fn rms(audio: &[f32]) -> f32 {
         (audio.iter().map(|v| v * v).sum::<f32>() / audio.len() as f32).sqrt()
@@ -1375,13 +1520,14 @@ mod tests {
         assert_eq!(spans[0].start, 7 * 256, "a start is the detector's own hop");
     }
 
-    /// A long span is cut into pieces aimed at the encoder's span, each cut landing in
-    /// the pause nearest its even share of the span.
+    /// A span of three aims is cut into three pieces, each cut landing in the pause
+    /// nearest its even share of the span.
     #[test]
-    fn a_twenty_four_second_span_cuts_into_three_pauses() {
+    fn a_span_of_three_aims_cuts_into_three_pauses() {
         const NOTCH: usize = 2_048;
-        let mut audio = vec![0.1f32; 24 * RATE as usize];
-        for at in [8 * RATE as usize, 16 * RATE as usize] {
+        let aim = CUT_SECONDS * RATE as usize;
+        let mut audio = vec![0.1f32; 3 * aim];
+        for at in [aim, 2 * aim] {
             for value in &mut audio[at - NOTCH..at + NOTCH] {
                 *value = 0.0;
             }
@@ -1392,7 +1538,7 @@ mod tests {
             end: audio.len(),
         };
         let cuts = chunks(vec![span], &audio);
-        assert_eq!(cuts.len(), 3, "24 s is three pieces of eight");
+        assert_eq!(cuts.len(), 3, "three aims are three pieces");
         assert_eq!(
             cuts[0].start, 0,
             "the first piece starts where the span does"
@@ -1402,10 +1548,7 @@ mod tests {
             audio.len(),
             "the last piece ends where the span does"
         );
-        for (i, at) in [8 * RATE as usize, 16 * RATE as usize]
-            .into_iter()
-            .enumerate()
-        {
+        for (i, at) in [aim, 2 * aim].into_iter().enumerate() {
             let cut = cuts[i].end;
             assert!(
                 (at - NOTCH..at + NOTCH).contains(&cut),
@@ -1418,19 +1561,19 @@ mod tests {
         }
     }
 
-    /// A cut lands on the quietest hop inside its own window — its share of the span,
-    /// no further off than [`CUT_SLACK_PCT`] of that share — so a piece is the length
-    /// the encoder was trained over and no piece is a fragment.
+    /// A cut lands on the quietest hop in the half second before its share of the span,
+    /// and never after it, so no piece is longer than the aim and no piece is a
+    /// fragment.
     #[test]
-    fn a_cut_lands_in_the_quietest_hop_near_the_target() {
-        let seconds = 40usize;
+    fn a_cut_lands_in_the_quietest_hop_before_its_share() {
+        let aim = CUT_SECONDS * RATE as usize;
+        let span = 5 * aim;
         // On the detector's own hop grid: a quiet hop is a hop, not a sample index.
-        let notches: Vec<usize> = [7, 16, 24, 33]
-            .iter()
-            .map(|s| (s * RATE as usize) / HOP_SAMPLES * HOP_SAMPLES)
+        let notches: Vec<usize> = (1..5)
+            .map(|k| (k * span / 5 - HOP_SAMPLES * 8) / HOP_SAMPLES * HOP_SAMPLES)
             .collect();
         let average = 0.5f32;
-        let audio: Vec<f32> = (0..seconds * RATE as usize)
+        let audio: Vec<f32> = (0..span)
             .map(|i| {
                 let hop = i / HOP_SAMPLES * HOP_SAMPLES;
                 if notches.contains(&hop) { 0.0 } else { average }
@@ -1443,11 +1586,12 @@ mod tests {
             }],
             &audio,
         );
-        assert_eq!(cuts.len(), 5, "40 s is five pieces of eight");
+        assert_eq!(cuts.len(), 5, "five aims are five pieces");
         for (cut, notch) in cuts.iter().zip(&notches) {
-            assert_eq!(
-                cut.end, *notch,
-                "each cut takes the pause inside its own window"
+            assert!(
+                cut.end.abs_diff(*notch) <= HOP_SAMPLES * 8,
+                "each cut takes the pause inside its own window: {} against {notch}",
+                cut.end
             );
         }
         for cut in &cuts {
@@ -1458,8 +1602,8 @@ mod tests {
                 cut
             );
             assert!(
-                len <= CUT_SECONDS * RATE as usize + CUT_LATE_HOPS * HOP_SAMPLES,
-                "no piece reaches past its aim and the cut's own window: {:?}",
+                len <= aim + CUT_EARLY_HOPS * HOP_SAMPLES,
+                "no piece reaches past the aim and the cut's own window: {:?}",
                 cut
             );
         }
@@ -1479,7 +1623,7 @@ mod tests {
         );
         let shorter = Span {
             start: 1_000,
-            end: 101_000,
+            end: 1_000 + CUT_SECONDS * RATE as usize,
         };
         assert_eq!(
             chunks(vec![shorter], &audio),
@@ -1592,16 +1736,15 @@ mod tests {
     fn no_cut_leaves_a_piece_shorter_than_the_minimum() {
         let aim = CUT_SECONDS * RATE as usize;
         // One aim plus a fifth of a second: the overflow is not worth a pass of its own.
-        let short_overflow = aim + MIN_CHUNK_SAMPLES / 2;
-        let audio = vec![0.1f32; short_overflow];
+        let audio = vec![0.1f32; 2 * aim];
         let span = Span {
             start: 0,
-            end: audio.len(),
+            end: aim + MIN_CHUNK_SAMPLES / 2,
         };
         assert_eq!(
-            chunks(vec![span], &audio),
-            vec![span],
-            "an overflow shorter than the minimum stays in the chunk"
+            chunks(vec![span], &audio).len(),
+            2,
+            "anything past the aim is cut, so no piece is longer than one aim"
         );
         // 61 s: every piece inside the aim and its window, none of them a fragment.
         let audio = vec![0.1f32; 61 * RATE as usize];
@@ -1611,23 +1754,16 @@ mod tests {
         };
         let cuts = chunks(vec![span], &audio);
         assert!(cuts.len() >= 4, "61 s is at least four pieces");
-        // A cut never leaves its even share by more than `CUT_SLACK_PCT` of it, so no
-        // piece is shorter than the share less that slack.
-        let share = audio.len() / cuts.len();
-        for piece in &cuts[..cuts.len() - 1] {
-            assert!(
-                piece.end - piece.start >= share - share * CUT_SLACK_PCT / 100,
-                "no piece is a fragment: {piece:?}"
-            );
-            assert!(
-                piece.end - piece.start <= share + share * CUT_SLACK_PCT / 100,
-                "no piece reaches past the share and its own slack: {piece:?}"
-            );
-        }
+        // A cut never moves later than its share, so a piece is at most one aim plus
+        // the window a cut may search back over.
         for piece in &cuts {
             assert!(
-                piece.end - piece.start <= aim + CUT_LATE_HOPS * HOP_SAMPLES,
+                piece.end - piece.start <= aim + CUT_EARLY_HOPS * HOP_SAMPLES,
                 "no piece reaches past the aim and its own window: {piece:?}"
+            );
+            assert!(
+                piece.end - piece.start >= MIN_CHUNK_SAMPLES,
+                "no piece is a fragment: {piece:?}"
             );
         }
         for pair in cuts.windows(2) {
@@ -1635,12 +1771,13 @@ mod tests {
         }
     }
 
-    /// The wider bound a cut may never use: the caps bound the search over a long span,
-    /// and the share's own slack bounds it over a short one, so a cut on a span of two
-    /// pieces lands inside its share and not at the far end of the cap.
+    /// A cut searches only backwards: the window is the half second before its share,
+    /// so a span of two aims is two pieces of at most one aim each rather than one long
+    /// piece and a fragment.
     #[test]
-    fn a_short_spans_cut_is_bounded_by_its_share_not_by_the_cap() {
-        let audio = vec![0.1f32; 13 * RATE as usize];
+    fn a_short_spans_cut_never_reaches_past_its_share() {
+        let aim = CUT_SECONDS * RATE as usize;
+        let audio = vec![0.1f32; 2 * aim - aim / 3];
         let cuts = chunks(
             vec![Span {
                 start: 0,
@@ -1648,17 +1785,12 @@ mod tests {
             }],
             &audio,
         );
-        assert_eq!(cuts.len(), 2, "13 s is two pieces");
-        let first = cuts[0];
-        let share = audio.len() / 2;
+        assert_eq!(cuts.len(), 2, "a span of nearly two aims is two pieces");
         assert!(
-            first.end <= share + share * CUT_SLACK_PCT / 100 + HOP_SAMPLES,
-            "the cut stayed within its share's slack rather than the cap: {} against {share}",
-            first.end
-        );
-        assert!(
-            first.end < CUT_EARLY_HOPS * HOP_SAMPLES + share,
-            "the cap is not what bounded it"
+            cuts[0].end <= audio.len() / 2,
+            "the cut stayed at or before its share: {} against {}",
+            cuts[0].end,
+            audio.len() / 2
         );
     }
 
@@ -1666,10 +1798,7 @@ mod tests {
     /// they ran in is not the plan's order and a reading is placed by its chunk index.
     #[test]
     fn each_chunk_keeps_its_own_reading() {
-        let reading = |text: &str| Guarded {
-            text: Some(text.to_string()),
-            reliable: true,
-        };
+        let reading = |text: &str| Some(text.to_string());
         // Two shapes, visited shortest first: the second chunk of the plan is the one
         // the first shape read.
         let answers = readings_by_chunk(
@@ -1679,14 +1808,8 @@ mod tests {
                 (0, reading("the long piece")),
             ],
         );
-        assert_eq!(
-            answers[0].as_ref().and_then(|a| a.text.as_deref()),
-            Some("the long piece")
-        );
-        assert_eq!(
-            answers[1].as_ref().and_then(|a| a.text.as_deref()),
-            Some("the short piece")
-        );
+        assert_eq!(answers[0].as_deref(), Some("the long piece"));
+        assert_eq!(answers[1].as_deref(), Some("the short piece"));
         // The plan carries the index, so the region for a chunk takes that chunk's text
         // and the region beside it takes its own.
         let plan = tile_indexed(
@@ -1847,53 +1970,73 @@ mod tests {
         for text in ["", "   ", "\n\t ", ".", "。", " — ", "..."] {
             assert_eq!(
                 guard(text, 1.0),
-                Guarded {
-                    text: None,
-                    reliable: true
-                },
+                None,
                 "an empty transcript is the model's own no-speech"
             );
         }
     }
 
     #[test]
-    fn an_ordinary_sentence_is_reliable() {
-        let guarded = guard("the meeting starts in ten minutes", 2.5);
+    fn an_ordinary_sentence_is_a_reading() {
         assert_eq!(
-            guarded.text.as_deref(),
+            guard("the meeting starts in ten minutes", 2.5).as_deref(),
             Some("the meeting starts in ten minutes"),
             "the text is kept as it came"
         );
-        assert!(guarded.reliable, "a short ordinary sentence is trustworthy");
     }
 
     #[test]
-    fn a_repeated_gram_is_unreliable_and_its_text_is_kept() {
-        let guarded = guard("la la la la la la la", 2.0);
-        assert!(guarded.text.is_some(), "the text is never dropped");
-        assert!(
-            !guarded.reliable,
+    fn a_repeated_gram_is_refused() {
+        assert_eq!(
+            guard("la la la la la la la", 2.0),
+            None,
             "a four-word gram four times over is a loop"
         );
     }
 
     #[test]
-    fn one_word_written_thirteen_times_is_unreliable() {
-        let guarded = guard(&"word ".repeat(13), 5.0);
-        assert!(guarded.text.is_some(), "the text is never dropped");
-        assert!(!guarded.reliable, "a run of 13 words is a loop");
+    fn one_word_written_thirteen_times_is_refused() {
+        assert_eq!(
+            guard(&"word ".repeat(13), 5.0),
+            None,
+            "a run of 13 words is a loop"
+        );
     }
 
     #[test]
-    fn density_marks_text_that_outruns_its_audio() {
-        let text = "x".repeat(40);
-        assert!(
-            !guard(&text, 0.5).reliable,
-            "40 characters in 0.5 s is 80 per second"
+    fn density_refuses_text_that_outruns_its_audio() {
+        let text = "the meeting starts in ten minutes tod";
+        assert_eq!(
+            guard(text, 0.5),
+            None,
+            "38 characters in 0.5 s is 76 per second"
         );
         assert!(
-            guard(&text, 3.0).reliable,
-            "the same 40 characters over 3 s are 13.3 per second"
+            guard(text, 3.0).is_some(),
+            "the same 38 characters over 3 s are 12.7 per second, and eight words is a sentence"
+        );
+    }
+
+    /// The failure this feature exists to remove: a generic word over seconds of
+    /// unclear audio is the model's placeholder, and it is never returned as a reading.
+    #[test]
+    fn a_generic_word_over_seconds_of_audio_is_refused() {
+        for text in ["Okay.", "Hello.", "Yeah.", "Thank you."] {
+            assert_eq!(
+                guard(text, 7.0),
+                None,
+                "`{text}` over seven seconds is not a reading of them"
+            );
+        }
+        // A short utterance over short audio is a reading: the floor is a rate, and it
+        // only applies once there is enough audio for a rate to mean anything.
+        assert!(
+            guard("Yes.", 1.0).is_some(),
+            "one word in a second is speech"
+        );
+        assert!(
+            guard("Okay, let us begin.", 2.0).is_some(),
+            "four words in two seconds is speech"
         );
     }
 
@@ -1903,9 +2046,9 @@ mod tests {
         Region {
             start,
             end,
+            read: text.is_some(),
             text: text.map(str::to_string),
             label: label.map(str::to_string),
-            reliable: true,
         }
     }
 
@@ -2090,18 +2233,102 @@ mod tests {
             "a result short of its input ends early is refused"
         );
 
-        let mut empty = good.clone();
-        empty.regions[1].text = None;
+        // A reading that produced nothing keeps its text out of the answer and must say
+        // what the audio is instead: the label is the whole answer of an unread region.
+        let mut unread = good.clone();
+        unread.regions[1] = region(100, 300, None, None);
         assert!(
-            empty.check().is_err(),
-            "a region with neither answer is refused"
+            unread.check().is_err(),
+            "a region with neither a transcript nor a label is refused"
+        );
+
+        // "Speech, found but not read" is a legal region: the label says the audio holds
+        // words and nothing says they were read.
+        let mut claimed = good.clone();
+        claimed.regions[1] = region(100, 300, None, Some("Speech"));
+        assert!(
+            claimed.check().is_ok(),
+            "\"speech, found but not read\" is a legal region"
+        );
+        claimed.regions[1].read = true;
+        assert!(
+            claimed.check().is_err(),
+            "a region marked read with no transcript is refused"
         );
 
         let mut both = good.clone();
         both.regions[1].label = Some("Speech".to_string());
         assert!(
             both.check().is_err(),
-            "a label beside a reliable transcript is refused"
+            "a label beside a transcript is refused"
+        );
+    }
+
+    #[test]
+    fn the_ladder_covers_the_cut_and_refuses_a_longer_chunk() {
+        // The refusal instead of a clamp: a chunk longer than the top rung would
+        // otherwise have its tail cut off silently by the padding.
+        assert!(
+            rung_frames(FRAME_RUNGS[FRAME_RUNGS.len() - 1]).is_ok(),
+            "the top rung is a rung"
+        );
+        assert!(
+            rung_frames(FRAME_RUNGS[FRAME_RUNGS.len() - 1] + 1).is_err(),
+            "a chunk past the ladder is refused, not truncated"
+        );
+        // And no cut can leave one: with a span far longer than the aim, every piece is
+        // inside the aim and the window a cut may search back over, which the top rung
+        // covers.
+        let aim = CUT_SECONDS * RATE as usize;
+        let audio = vec![0.5f32; 4 * aim + 1_234];
+        let span = Span {
+            start: 0,
+            end: audio.len(),
+        };
+        let pieces = cut(span, &audio);
+        assert!(
+            pieces.len() > 3,
+            "four aims and a remainder are four pieces"
+        );
+        for piece in &pieces {
+            let frames = frames_of(piece.end - piece.start);
+            assert!(
+                piece.end - piece.start <= aim + CUT_EARLY_HOPS * HOP_SAMPLES,
+                "a piece is inside the aim and its own search window"
+            );
+            assert!(
+                frames <= FRAME_RUNGS[FRAME_RUNGS.len() - 1],
+                "a piece of {frames} frames is inside the ladder"
+            );
+            assert!(
+                rung_frames(frames).is_ok(),
+                "every piece a cut leaves has a rung"
+            );
+        }
+    }
+
+    #[test]
+    fn loudness_spread_tells_a_steady_signal_from_a_modulated_one() {
+        // A steady level is what a noise span the detector called speech looks like: no
+        // p10-to-p90 spread, so no declared language for it.
+        let steady = vec![0.1f32; SPREAD_FRAME * 200];
+        let span = Span {
+            start: 0,
+            end: steady.len(),
+        };
+        assert!(
+            spread_db(&steady, span) < SPEECH_SPREAD_DB,
+            "a constant level has no spread"
+        );
+        // Syllables: a quiet and a loud frame alternating is tens of dB.
+        let mut syllables = vec![0.0f32; SPREAD_FRAME * 200];
+        for (i, frame) in syllables.chunks_mut(SPREAD_FRAME).enumerate() {
+            let level = if i % 2 == 0 { 0.005 } else { 0.5 };
+            frame.fill(level);
+        }
+        assert!(
+            spread_db(&syllables, span) >= SPEECH_SPREAD_DB,
+            "a modulated signal spreads past the gate"
         );
     }
 }

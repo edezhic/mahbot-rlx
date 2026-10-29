@@ -11,7 +11,7 @@
 //! last at the file's length, no hole and no overlap) and no region comes back
 //! empty, so a caller can always name what it is looking at, by a transcript or by
 //! a label. Around that assertion the run prints, for every clip, each region
-//! (start, end, text, label, reliable) and the `Costs` split of the call — timings
+//! (start, end, text, label, read) and the `Costs` split of the call — timings
 //! and memory are printed and never asserted, so a busy machine is not a
 //! regression.
 //!
@@ -108,17 +108,17 @@ fn every_music_clip_transcribes_whole_with_models() {
         );
         for region in &out.regions {
             println!(
-                "  region {:.3}..{:.3} text={:?} label={:?} reliable={}",
+                "  region {:.3}..{:.3} text={:?} label={:?} read={}",
                 out.seconds(region.start),
                 out.seconds(region.end),
                 region.text,
                 region.label,
-                region.reliable
+                region.read
             );
         }
         println!(
             "  costs segment_ms={:.1} tag_ms={:.1} build_ms={:.1} recognise_ms={:.1} \
-             chunks={} shapes={} windows={} speech_s={:.2}",
+             chunks={} shapes={} windows={} covered_s={:.2}",
             costs.segment_ms,
             costs.tag_ms,
             costs.build_ms,
@@ -126,15 +126,15 @@ fn every_music_clip_transcribes_whole_with_models() {
             costs.chunks,
             costs.shapes,
             costs.windows,
-            costs.speech_s
+            costs.covered_s
         );
         println!("  transcript={:?}", stand::spoken(&out));
 
         // The library's own contract in the build the test ran — the tiling, the
-        // text-or-label answer, the label never beside a reliable transcript — so
+        // text-or-label answer, never a label beside a transcript — so
         // the assertions cannot drift from what a caller is promised.
         out.check()
             .unwrap_or_else(|error| panic!("{name}: {error:#}"));
     }
-    println!("peak_rss={}", report::human(report::peak_rss()));
+    println!("process_peak_bytes={}", report::peak_text());
 }

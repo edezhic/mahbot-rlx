@@ -22,7 +22,10 @@ impl Stopwatch {
 /// The process's true high-water resident set, maintained by the kernel.
 /// On macOS `ru_maxrss` is bytes; on Linux it is KiB. This is the peak over the
 /// whole process lifetime, not the RSS left at the end of the run.
-pub fn peak_rss() -> u64 {
+///
+/// `None` when the kernel cannot be asked: a zero would read as the reading of a live
+/// process, and a peak nobody measured may not be printed as one.
+pub fn peak_rss() -> Option<u64> {
     #[cfg(unix)]
     {
         let mut usage = std::mem::MaybeUninit::<libc_rusage>::zeroed();
@@ -30,14 +33,22 @@ pub fn peak_rss() -> u64 {
         if rc == 0 {
             let usage = unsafe { usage.assume_init() };
             let raw = usage.ru_maxrss as u64;
-            return if cfg!(target_os = "macos") {
+            return Some(if cfg!(target_os = "macos") {
                 raw
             } else {
                 raw * 1024
-            };
+            });
         }
     }
-    0
+    None
+}
+
+/// [`peak_rss`] as a line prints it: the count, or `-` where the kernel did not answer.
+///
+/// Every harness that prints a peak uses this, so the rule — a reading nobody took prints
+/// `-`, never a zero — is stated once rather than restated by each caller.
+pub fn peak_text() -> String {
+    peak_rss().map_or_else(|| "-".to_string(), |bytes| bytes.to_string())
 }
 
 #[cfg(unix)]
@@ -81,9 +92,10 @@ pub fn resident_rss() -> Option<u64> {
         .map(|kb| kb * 1024)
 }
 /// Return the pages freed so far to the OS. macOS keeps them in the malloc
-/// zones, so a process that drops one phase and builds the next peaks at the
-/// sum of the phases; the pressure call makes the peak the largest phase
-/// instead. Platforms that return memory on free do nothing here.
+/// zones, so a process that drops one phase and builds the next can peak at the
+/// sum of the phases; the pressure call hands those pages back and the next
+/// phase allocates from what the OS has. Platforms that return memory on free
+/// do nothing here.
 pub fn release_free() {
     #[cfg(target_os = "macos")]
     unsafe {

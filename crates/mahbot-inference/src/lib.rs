@@ -34,3 +34,21 @@ pub mod tokenizer;
 pub mod transcribe;
 pub mod vad;
 pub mod wake;
+
+/// Give back every process-wide copy of the models this crate keeps: the transcription
+/// ladder's compiled graphs, the host copies of the weights and the device's shared weight
+/// pool. A long-lived caller that has finished a pass calls this to return the memory; the
+/// next call recompiles and re-reads, so it is a cost, not a state change. Nothing that
+/// survives a completed call grows without a bound — the ladder is closed, the host caches
+/// are keyed by tensor and the pool by scope — so this is how a process gets *down* from
+/// that bound, not what makes it bounded.
+///
+/// The pages the release freed are handed back to the OS too: macOS keeps them in the
+/// malloc zones, so a process that drops one half and builds the next peaks at their sum
+/// unless the release also returns them.
+pub fn release_process_memory() {
+    listen::release_rungs();
+    emit::clear_weight_caches();
+    rlx_wgpu::buffer::clear_shared_weights();
+    report::release_free();
+}

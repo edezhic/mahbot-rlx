@@ -59,10 +59,10 @@
 //! each phase cold and `run_ms` sums the warm medians. The parent collects the
 //! cells, runs each in its own process three times — once for transcription, which
 //! measures a corpus rather than a hot loop — and prints a unit row for each
-//! (cold/warm time, peak, map and their spreads) plus one `build_ms` line whose
+//! (cold/warm time, process peak bytes, map and their spreads) plus one `build_ms` line whose
 //! value is the median of the three per-run sums over the cells that ran three
-//! times. Everything goes to stdout; the child's `cell`/`phase`/`unit` lines are
-//! forwarded with their `at=`/`load=`.
+//! times (`-` when no cell of the run did). Everything goes to stdout; the child's
+//! `cell`/`phase`/`unit` lines are forwarded with their `at=`/`load=`.
 //!
 //! A cell still prints its own diagnostic line (`key=value`):
 //!
@@ -71,10 +71,10 @@
 //!      build_ms=336.4 cold_ms=38.4 run_ms=38.4 compile_ms=.. upload_ms=..
 //!      first_ms=37.7 step_ms=37.8 min_ms=37.8 max_ms=38.2 passes=6 phase_passes=mel:6,encoder:6
 //!      steps=.. kinds=.. digest=.. values=.. maxabs=.. nonfinite=0
-//!      keys=none map=0.33GiB beyond_map=0.31GiB file_over_rss=0B arena=...
+//!      keys=none map=355709344 arena=...
 //! phase ear encoder iters=1 nodes=1108 first_ms=37.71 step_ms=37.85 … cold_ms=37.71 warm_ms=37.85
-//! unit ear build_ms=336.361 run_ms=38.420 peak=564215808 cold_ms=38.444 map=355709344
-//!      beyond_map=208506464 file_over_rss=0B submits=36 waits=36
+//! unit ear build_ms=336.361 run_ms=38.420 process_peak_bytes=564215808 cold_ms=38.444 map=355709344
+//!      submits=36 waits=36
 //! ```
 
 use std::sync::Arc;
@@ -91,7 +91,7 @@ use crate::guard::{
 use crate::listen::{self, ASR_MAX_NEW, DECODE_CACHE_BUCKET, Front, l2, mean_pool};
 use crate::loader::{Model, Pair, Role};
 use crate::report::{
-    digest, fmt_ms, human, keys, load_average, max_abs, non_finite, peak_rss, resident_rss, sci,
+    digest, fmt_ms, human, keys, load_average, max_abs, non_finite, resident_rss, sci,
 };
 use crate::synth::{
     MAX_CODEC_ROWS as SPEAK_CODEC_ROWS, MAX_TEXT_TOKENS as SPEAK_TEXT_TOKENS, TTS_CODEC_EOS,
@@ -271,6 +271,14 @@ macro_rules! cell_failed {
     }};
 }
 
+/// The process's high-water, or the run fails naming the counter it could not read: a zero
+/// would read as the reading of a live process, and no run has ever held none.
+fn peak_bytes() -> u64 {
+    report::peak_rss().unwrap_or_else(|| {
+        cell_failed!("stand — the process's high-water cannot be read (the `ru_maxrss` counter)")
+    })
+}
+
 /// The lock's path: the shared one every heavy run of this crate takes.
 fn stand_lock() -> std::path::PathBuf {
     crate::guard::lock_path()
@@ -280,6 +288,22 @@ fn stand_lock() -> std::path::PathBuf {
 /// the cell at its own stop, so the child takes no lock of its own — but it does
 /// carry the stop and the ceiling, in case the parent dies without killing it.
 const CELL_CHILD: &str = "MAHBOT_CELL_CHILD";
+
+/// A child that measures one **cold** call and exits. Cold means the process holds no
+/// bytes of the model files — no mapping, no host copy, no device buffer, no compiled
+/// graph — so the call that pays the load has to be the first thing this process does:
+/// the parent's own residency cannot flatter the figure, and the operating system's
+/// file cache is not this crate's to control (the record says so). The value names what
+/// to measure: `10`/`30` — that many seconds of the first pinned speech recording — or
+/// `corpus` — the pass's first file.
+pub const COLD_CHILD: &str = "MAHBOT_COLD_CHILD";
+
+/// A child that measures one **hour-scale** call and exits: the material built to the
+/// label's length from the pinned corpus (`LONG_INPUTS`), one call, the caller's audio
+/// dropped, the row printed. The process is its own because `retained` is a call's own
+/// growth and `process_peak_bytes` one process's high-water — a call run beside the cell's
+/// corpus pass would report the cell's, and a second length beside the first would report both.
+pub const LONG_CHILD: &str = "MAHBOT_LONG_CHILD";
 
 /// The guards a spawned cell carries: the wall-clock stop and the resident-set
 /// ceiling (the parent takes the shared lock itself). The watch is the same
@@ -349,6 +373,47 @@ fn limit(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Both of a child's pipes, drained while it runs — each on its own thread, because a cell
+/// that prints more than a pipe buffer would otherwise block on the pipe nobody is reading:
+/// the run report and the `RLX_WGPU_*` diagnostics go to stderr, so draining stdout to its
+/// end before touching stderr is the same deadlock with a smaller buffer.
+fn drain_both(
+    child: &mut std::process::Child,
+) -> (
+    std::thread::JoinHandle<Vec<u8>>,
+    std::thread::JoinHandle<Vec<u8>>,
+) {
+    let reader = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let out = reader(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    );
+    let err = reader(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    );
+    (out, err)
+}
+
+/// Whether a child ended by its own guard. The ceiling or the wall clock stopping a child
+/// is a measurement outcome — the limits did what they are there for — and the run ends
+/// with [`EXIT_STOPPED`], not with a failed-run message that reads like a crash.
+fn stopped_by_guard(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(EXIT_STOPPED)
+}
+
 /// One cell's own process, held to the stand's stop: a cell that outlives the
 /// wall clock or the resident-set ceiling is killed instead of waited for.
 fn run_cell(
@@ -377,6 +442,8 @@ fn run_cell(
             std::process::exit(1);
         }
     };
+    // Both pipes are drained while the cell runs ([`drain_both`]).
+    let (out_reader, err_reader) = drain_both(&mut child);
     let mut ticks = 0u32;
     loop {
         let status = match child.try_wait() {
@@ -387,13 +454,18 @@ fn run_cell(
             }
         };
         match status {
-            Some(_) => {
-                return match child.wait_with_output() {
-                    Ok(out) => out,
-                    Err(error) => {
-                        eprintln!("stand: cannot read cell {index}'s output: {error}");
+            Some(status) => {
+                let (out, err) = match (out_reader.join(), err_reader.join()) {
+                    (Ok(out), Ok(err)) => (out, err),
+                    _ => {
+                        eprintln!("stand: cannot read cell {index}'s output");
                         std::process::exit(1);
                     }
+                };
+                return std::process::Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
                 };
             }
             None if deadline.expired() => {
@@ -473,6 +545,14 @@ pub fn main_entry() {
     // A child measures exactly one cell and returns: the parent spawns one per
     // index and owns the limits and the record, so two cells in one process would
     // put the first one's residency inside the second's peak.
+    if std::env::var_os(COLD_CHILD).is_some() {
+        cold_child();
+        return;
+    }
+    if std::env::var_os(LONG_CHILD).is_some() {
+        long_child();
+        return;
+    }
     if std::env::var_os(CELL_CHILD).is_some() {
         let [index] = named[..] else {
             eprintln!(
@@ -556,12 +636,19 @@ pub fn main_entry() {
         /// figure came from; mixing the medians of two repetitions would print a
         /// loop and a sound figure that do not add up to the row's warm one.
         got: Vec<(f64, f64, u64, u64, f64, f64, f64)>,
-        /// The per-phase weight streams, one `(phase, unit, bytes, ms)` per run —
+        /// The per-phase weight streams, one `(phase, unit, bytes, ms)` per run, the bytes a
+        /// whole count —
         /// the same run-indexed form as `got`, for the same reason.
-        streams: Vec<Vec<(&'static str, &'static str, f64, f64)>>,
+        streams: Vec<Vec<(&'static str, &'static str, u64, f64)>>,
         arena: String,
+        /// The device's shared weight pool at the moment the cell printed its line: the
+        /// parameter bytes it holds once across every layout that binds them.
+        weights: String,
         digest: String,
-        speech_s: f64,
+        /// The seconds of audio this unit's passes covered, which the table's rate divides
+        /// by. For the transcription cell it is `Costs::covered_s` summed over its corpus
+        /// pass *and* its noise pool, so it is not the `speech` row's own denominator.
+        covered_s: f64,
     }
     let mut rows: Vec<Row> = Vec::new();
     // The transcription surface's rows, straight from that cell's stdout: the
@@ -574,8 +661,9 @@ pub fn main_entry() {
         let mut got = Vec::with_capacity(runs);
         let mut streams = Vec::with_capacity(runs);
         let mut arena = String::new();
+        let mut weights = String::new();
         let mut digest = String::new();
-        let mut speech_s = f64::NAN;
+        let mut covered_s = f64::NAN;
         for _ in 0..runs {
             let out = run_cell(&exe, *i, deadline, ceiling);
             let text = String::from_utf8_lossy(&out.stdout);
@@ -589,12 +677,17 @@ pub fn main_entry() {
                 );
             }
             streams.push(streams_of(name, &text));
-            if let Some(value) = text
-                .split("arena=")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-            {
-                arena = value.to_string();
+            // `arena` and `weights` from the unit row, which is where the cell states
+            // them: a cell prints other rows carrying the same field names (the
+            // transcription cell's phases, its hour-scale inputs), and the first of
+            // those is not the cell's own reading.
+            if let Some(line) = unit_line(&text, name) {
+                if let Some(value) = field_text(line, "arena") {
+                    arena = value.to_string();
+                }
+                if let Some(value) = field_text(line, "weights") {
+                    weights = value.to_string();
+                }
             }
             if let Some(value) = text
                 .split(" digest=")
@@ -603,11 +696,11 @@ pub fn main_entry() {
             {
                 digest = value.to_string();
             }
-            // The row's own line, not the first `speech_s=` in the child's output:
-            // the transcription cell prints it on three of them, and the table's
-            // `speech s` column is the unit row's.
-            if let Some(value) = unit_line(&text, name).and_then(|line| field(line, "speech_s")) {
-                speech_s = value;
+            // The row's own line, not the last `covered_s=` in the child's output: the
+            // transcription cell prints that figure on several of its own rows too, and the
+            // table's `covered_s` column is the unit row's.
+            if let Some(value) = unit_line(&text, name).and_then(|line| field(line, "covered_s")) {
+                covered_s = value;
             }
             // A cell with no synthesis split prints no `loop_ms`/`sound_ms`;
             // absent is `NaN`, which the table renders as `-`.
@@ -616,19 +709,20 @@ pub fn main_entry() {
             // Keep the child's numbers in the normal run: dropping them is what
             // used to hide the window and the load each number was taken at.
             print!("{text}");
-            match out
-                .status
-                .success()
-                .then(|| parse_unit(&text, name))
-                .flatten()
-            {
-                Some(v) => got.push((v.0, v.1, v.2, v.3, v.4, loop_ms, sound_ms)),
-                None => {
+            let parsed = out.status.success().then(|| parse_unit(&text, name));
+            match parsed {
+                Some(Ok(v)) => got.push((v.0, v.1, v.2, v.3, v.4, loop_ms, sound_ms)),
+                failed => {
                     eprint!("{}", String::from_utf8_lossy(&out.stderr));
-                    eprintln!(
-                        "cell {i} {name} — no unit line; the cell's own process {}",
-                        out.status
-                    );
+                    if stopped_by_guard(&out.status) {
+                        eprintln!("stand: cell {i} {name} was stopped by its own guard");
+                        std::process::exit(EXIT_STOPPED);
+                    }
+                    if let Some(Err(why)) = failed {
+                        eprintln!("cell {i} {name} — {why}");
+                    } else {
+                        eprintln!("cell {i} {name} — the cell's own process {}", out.status);
+                    }
                     std::process::exit(1);
                 }
             }
@@ -638,92 +732,120 @@ pub fn main_entry() {
             got,
             streams,
             arena,
+            weights,
             digest,
-            speech_s,
+            covered_s,
         });
     }
-    let mut build_runs = vec![0.0f64; RUNS];
-    for row in &rows {
-        // A one-pass cell's build is its own and is not a third of a repetition:
-        // summing it here would fold a corpus into the median of a hot loop.
-        if row.got.len() != RUNS {
-            continue;
-        }
-        for (run, v) in row.got.iter().enumerate() {
-            if run < build_runs.len() {
-                build_runs[run] += v.4;
-            }
-        }
-    }
+    // One figure per repetition, summed over the cells that repeat: a one-pass cell's build is
+    // its own and is not a third of a repetition, and a run with no repeating cell has no
+    // aggregate at all — the line then prints `-` rather than a zero nobody measured.
+    let repeating: Vec<&Row> = rows.iter().filter(|row| row.got.len() == RUNS).collect();
+    let build_runs: Vec<f64> = if repeating.is_empty() {
+        Vec::new()
+    } else {
+        (0..RUNS)
+            .map(|run| repeating.iter().map(|row| row.got[run].4).sum())
+            .collect()
+    };
     println!(
-        "# cold/warm run_ms, seconds per second of speech, the synthesis loop/sound split, \
-         peak/map and their spreads"
+        "# cold/warm run_ms, seconds of call per second of covered audio, the synthesis loop/sound split, \
+         process_peak_bytes/map and their spreads"
     );
     let mut lines: Vec<(&'static str, String)> = Vec::new();
+    // The transcription cell's readings, split by population and kept for the section this run
+    // writes: one derivation serves the table and the prose.
+    let mut transcribe_peaks = PathPeaks::default();
     for row in &rows {
         let (name, got, arena, digest) = (row.name, &row.got, &row.arena, &row.digest);
+        let weights = row.weights.as_str();
         let warm: Vec<f64> = got.iter().map(|v| v.1).collect();
         let cold: Vec<f64> = got.iter().map(|v| v.0).collect();
-        let peak: Vec<f64> = got
-            .iter()
-            .map(|v| v.2 as f64 / (1u64 << 30) as f64)
-            .collect();
-        let map = got[0].3 as f64 / (1u64 << 30) as f64;
-        let spreads = |v: &[f64]| {
-            v.iter().copied().fold(f64::NEG_INFINITY, f64::max)
-                - v.iter().copied().fold(f64::INFINITY, f64::min)
-        };
-        let (cold_ms, warm_ms, peak_gib) = (
-            median(&cold).unwrap_or(0.0),
-            median(&warm).unwrap_or(0.0),
-            median(&peak).unwrap_or(0.0),
+        let peak: Vec<u64> = got.iter().map(|v| v.2).collect();
+        // A figure with no reading behind it is a failed run, never a zero in the record.
+        let cold_ms = median_or_fail(&cold, "`cold_ms`", name);
+        let warm_ms = median_or_fail(&warm, "`warm_ms`", name);
+        let build_ms = median_or_fail(
+            &got.iter().map(|v| v.4).collect::<Vec<_>>(),
+            "`build_ms`",
+            name,
         );
-        let build_ms = median(&got.iter().map(|v| v.4).collect::<Vec<_>>()).unwrap_or(0.0);
+        let Some(map) = got.first().map(|v| v.3) else {
+            eprintln!("stand: {name} printed no run to take `map` from");
+            std::process::exit(1);
+        };
+        // The process's own high-water, one reading per run: the cell's unit row prints it when
+        // the cell has finished, so it is the final reading of that process — for the
+        // transcription cell too, whose `memory` row is an earlier moment of the same process.
+        let peak_bytes = median_bytes(&peak)
+            .expect("every run of a cell carries the peak its `unit` line printed");
         // The split is the one of the run whose warm figure is the row's: the two
         // then add up by construction.
         let median_run = median_index(&warm)
             .and_then(|i| got.get(i))
             .map(|v| (v.5, v.6))
             .unwrap_or((f64::NAN, f64::NAN));
-        // The cell's own number: warm seconds per second of speech, and the
+        // The cell's own number: warm seconds of call per second of covered audio, and the
         // denominator printed beside it so the rate re-derives from the table. The
         // two surfaces are the only rows with a denominator; the others print `-`.
         let secs_of_speech = row
-            .speech_s
+            .covered_s
             .is_finite()
-            .then_some(row.speech_s)
+            .then_some(row.covered_s)
             .filter(|s| *s > 0.0);
         let per_s = secs_of_speech.map_or(f64::NAN, |s| warm_ms / 1000.0 / s);
-        let split = |v: f64| {
-            if v.is_finite() {
-                format!("{v:.1}")
-            } else {
-                "-".to_string()
-            }
-        };
         let per_s_cell = if per_s.is_finite() {
             format!("{per_s:.3}")
         } else {
             "-".to_string()
         };
         // The denominator itself, in the same number the rate beside it used.
-        let speech_cell = secs_of_speech.map_or_else(|| "-".to_string(), |s| format!("{s:.3}"));
+        let covered_cell = secs_of_speech.map_or_else(|| "-".to_string(), |s| format!("{s:.3}"));
         println!(
-            "{name} cold={cold_ms:.1} warm={warm_ms:.1} s_per_s={per_s_cell} loop_ms={} sound_ms={} peak={peak_gib:.2} map={map:.2} cold_spread={:.1} warm_spread={:.1} peak_spread={:.3} at={} load={}",
-            split(median_run.0),
-            split(median_run.1),
-            spreads(&cold),
-            spreads(&warm),
-            spreads(&peak),
+            "{name} cold={cold_ms:.1} warm={warm_ms:.1} s_per_covered_s={per_s_cell} loop_ms={} sound_ms={} process_peak_bytes={peak_bytes} map={map} arena={arena} weights={weights} cold_spread={} warm_spread={} process_peak_bytes_spread={} at={} load={}",
+            render_ms(Some(median_run.0)),
+            render_ms(Some(median_run.1)),
+            render_ms(Some(spread(&cold))),
+            render_ms(Some(spread(&warm))),
+            spread_bytes(&peak).map_or_else(|| "-".to_string(), |bytes| bytes.to_string()),
             now(),
             load_average(),
         );
+        // The peak, every reading its verdict compares, and the ceiling: a cell whose readings
+        // meet the ceiling is reported `at` it. A cell run three times is three processes, so each
+        // reading is named with its run; the transcription cell is one process, and the calls it
+        // started for a message or corpus pass are the rest of the readings its verdict compares,
+        // each named with the call it made. Derived once and kept, so the table row, the prose and
+        // the verdict quote one list.
+        let per_run: Vec<PeakReading>;
+        let (own, readings): (&str, &[PeakReading]) = if name == "transcribe" {
+            transcribe_peaks = path_peaks(peak_bytes, &transcribe_rows).unwrap_or_else(|error| {
+                eprintln!("stand: the transcription path's peak readings: {error:#}");
+                std::process::exit(1);
+            });
+            // The ceiling holds the cell's own process and the calls it started of message or
+            // corpus size; the hour-scale inputs are a population of their own, stated in the
+            // section with their own rows.
+            ("cell", &transcribe_peaks.calls)
+        } else {
+            per_run = peak
+                .iter()
+                .enumerate()
+                .map(|(run, bytes)| PeakReading {
+                    process: format!("run {}", run + 1),
+                    bytes: *bytes,
+                })
+                .collect();
+            ("median", &per_run)
+        };
         lines.push((
             name,
             format!(
-                "| {name} | {cold_ms:.1} | {warm_ms:.1} | {speech_cell} | {per_s_cell} | {} | {} | {build_ms:.1} | {peak_gib:.2} GiB | {map:.2} GiB | {arena} | {digest} |\n",
-                split(median_run.0),
-                split(median_run.1),
+                "| {name} | {cold_ms:.1} | {warm_ms:.1} | {covered_cell} | {per_s_cell} | {} | {} | {build_ms:.1} | {} | {} | {weights} | {arena} | {digest} |\n",
+                render_ms(Some(median_run.0)),
+                render_ms(Some(median_run.1)),
+                peak_cell(own, peak_bytes, readings, name),
+                gib_text(map),
             ),
         ));
     }
@@ -734,7 +856,7 @@ pub fn main_entry() {
     // `rows` line under Provenance names which is which.
     let mut carried = carried_block();
     let mut table = String::from(
-        "| unit | cold ms | warm ms | speech s | s/speech s | loop ms | sound ms | build ms | peak | map | arena | digest |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "| unit | cold_ms | run_ms | covered_s | s_per_covered_s | loop_ms | sound_ms | build_ms | peak GiB (readings, or one carried figure; / ceiling verdict where held) | map | weights | arena | digest |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     let mut measured: Vec<&'static str> = Vec::new();
     let mut carried_rows = 0usize;
@@ -752,14 +874,24 @@ pub fn main_entry() {
             }
         }
     }
-    let build_spread = build_runs.iter().copied().fold(f64::NEG_INFINITY, f64::max)
-        - build_runs.iter().copied().fold(f64::INFINITY, f64::min);
-    let build_ms = median(&build_runs).unwrap_or(0.0);
+    let build_spread = spread(&build_runs);
     println!(
-        "build_ms {build_ms:.1} build_spread={build_spread:.1} at={} load={}",
+        "build_ms {} build_spread={} at={} load={}",
+        render_ms(median(&build_runs)),
+        render_ms(Some(build_spread)),
         now(),
         load_average()
     );
+    // A run whose every cell was dropped measured nothing: it has no row to record, and a
+    // section dated by it would name a run that took no reading. The record keeps the one the
+    // run that did measure those rows wrote.
+    if measured.is_empty() {
+        eprintln!(
+            "stand: no cell of this run ran, so MEASUREMENTS.md is left as it was — the rows \
+             above name why each was skipped"
+        );
+        return;
+    }
 
     // The probe again, after the cells: two readings of one run bound the
     // probe's own spread, which a single reading cannot. A diagnostic must not
@@ -769,38 +901,98 @@ pub fn main_entry() {
     let ceiling_after = probe_ceiling();
     print_ceiling("ceiling_after", &ceiling_after);
 
-    // The repository's own record, refreshed by the run that produced it.
+    // The repository's own record, refreshed by the run that produced it. Every condition the
+    // two sections quote is read once here, so a single run cannot appear under two sets of
+    // values.
+    let provenance = Provenance::take(&load_at_start, swap_at_start);
     let mut body = String::new();
     body.push_str("## Per-model measurement (stand)\n\n");
-    body.push_str(&format!("_Measured {}._\n\n", crate::measurements::now()));
+    body.push_str(&format!("_Measured {}._\n\n", provenance.taken()));
     body.push_str(&table);
     body.push_str(
-        "\nThe cell's number is the **`s/speech s`** column: the **warm** figure \
-         (`warm ms`) divided by the `speech s` column — the cell's own seconds of \
-         speech, `samples / 16 000` for recognition and `rows · 1 920 / 24 000` for \
-         synthesis, printed so the rate re-derives from this table alone. `loop ms` is the \
+        "\nThe cell's number is the **`s_per_covered_s`** column: the **warm** figure \
+         (`run_ms`) divided by the `covered_s` column — the seconds of audio the cell's \
+         passes themselves covered, `samples / 16 000` for recognition and \
+         `rows · 1 920 / 24 000` for synthesis, printed so the rate re-derives from this table \
+         alone. `loop_ms` is the \
          synthesis generation loop (speaker, prefill, body, predictor, sampler) and \
-         `sound ms` is the sound half; their sum is `warm ms`, so a ×N synthesis \
+         `sound_ms` is the sound half; their sum is `run_ms`, so a ×N synthesis \
          claim reads off both. Both are the same phase sums the cell's \
          `loop_ms`/`sound_ms` tokens record; `speak`'s `sound_phase_ms` field is \
-         the sound graphs' summed `step_ms` — the same sum the `sound ms` column \
+         the sound graphs' summed `step_ms` — the same sum the `sound_ms` column \
          is taken from, carried as a field so a cell line is self-describing. \
          For `speak` the recorded `digest` is the **waveform** digest, not the \
-         `prompt_digest` its own line prints. `-` is a cell with no speech \
-         denominator. Each cell line \
-         prints its own `warm_spread` (the warm runs' max − min, in ms). `peak` is the \
-         cell process's own high-water (`ru_maxrss`, which no later drop can lower) and \
-         each cell is its own process, so the figure is the maximum that unit's own \
-         process reached — what it held when it peaked, not what is live when the line \
-         prints. For `speak` the reading is taken before the round-trip gate loads the \
-         recogniser, so the column excludes it (the gate prints its own post-gate \
-         reading as `speak roundtrip peak_mb`). Across this machine's records the \
-         column moves between runs of one tree, and the summary line carries the spread \
-         each run saw as `peak_spread`. \
+         `prompt_digest` its own line prints. `-` marks a figure the row has none of: in \
+         `covered_s` and `s_per_covered_s`, a cell with no covered-audio denominator; in \
+         `loop_ms` and `sound_ms`, a cell with no synthesis split (only `speak` has one); in \
+         `arena`, a ladder cell whose graphs each have a plan of their own; and in `digest`, a \
+         cell with no single answer \
+         (the transcription cell's ladder of graphs). The `peak` column is a process high-water (`ru_maxrss`, which no \
+         later drop can lower): each cell run is its own process, so the figure the column leads \
+         with is the median of the cell's runs' high-waters, not what is live when the line \
+         prints. Two rows need a word on whose reading their figure is: `speak`'s is \
+         `synthesis_peak_bytes` — each run's high-water when the synthesis half had finished, \
+         before the round-trip gate loads the recogniser, whose later reading prints as \
+         `process_peak_bytes` and is not part of the row's verdict — and the transcription cell \
+         is one process, so its figure is the `process_peak_bytes` its `unit` row printed when \
+         the cell had finished, not a median over runs. Beside the leading figure the column lists \
+         every other reading the verdict compares, each named with the process that took it \
+         (`run 1` of the cell's runs, or the transcription cell's message- and corpus-size \
+         calls); a row held to no \
+         ceiling lists the readings it has. A cell's earlier moments are not in that list: the \
+         transcription cell's print as `moment_peak_bytes`. A row this run did not take carries the \
+         figures the run that took it printed — the readings list where that run printed one, \
+         the single figure it printed where it did not, which is what the header's \
+         `or one carried figure` names. Nothing outside that list enters a \
+         verdict, and no reading from another run of this code does. The ceilings \
+         beside them are policies, and the verdict those readings support is `inside` when \
+         every one is under the ceiling by more than 0.01 GiB, `over` when every one is above \
+         it by more, and `at` otherwise: the set meets the ceiling's 0.01 GiB band — readings \
+         on both sides of it, or every reading on one side with the nearest inside the band. \
+         The transcription cell's own \
+         reading is one figure — its `unit` row, printed when the cell had finished — so every \
+         reading its verdict compares is a process of that run: the cell's own and the ones it \
+         started for a call of message or corpus size, each cold message row's three \
+         runs and the corpus-cold call. The three hour-scale inputs are a population of their \
+         own and are not in that verdict: their rows carry them, and the section states them \
+         apart. ",
+    );
+    // The ceilings, from the one table the verdict beside each peak reads: a sentence that
+    // spelled them itself would drift from the column it explains.
+    let ceilings = PEAK_CEILINGS
+        .iter()
+        .map(|(name, size)| format!("{size:.2} GiB for `{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    body.push_str(&format!(
+        "The ceilings are {ceilings} — the transcription cell's is the listening cell's \
+         class plus its tagger — and the verdict beside each peak in the table is computed \
+         from that row's own readings, not restated. The columns beside the peak name the \
+         allocations a reader can hold it against: `weights` (the device's shared weight \
+         pool — one copy of each model's parameter bytes, held once however many layouts \
+         and rungs bind them, and given back by `release_process_memory`), `arena` (the \
+         compiled graph's own plan, `-` on a cell that builds a ladder of graphs, because \
+         a sum of plans is not an allocation the peak contains) and `map` (the model files \
+         the cell binds, by their size: each is opened by mapping and its tensor bytes are \
+         read with `pread` through one scratch buffer, so the mapping is not the copy the \
+         process holds and the figure is not resident pages). Each is the cell's own reading \
+         of that allocation, taken where the cell prints it; a `-` in `weights` is the one \
+         figure a carried row's run did not print, because a measured cell always prints the \
+         pool's bytes, `0B` included. Their \
+         sum is not `peak` and the record does not claim it is: the peak is what the \
+         process touched, and neither the pool nor the files is all resident at once. For \
+         `speak` all three are read together, at the end of the synthesis half, so the row is \
+         one moment: the talker's pool and graphs are released before the decoder builds, so \
+         `weights` there is the pool as it stands then — the decoder's, or nothing where the \
+         release emptied it and the graphs keep their weights in their own buffers — and \
+         `arena` is the sound half's plan. The peak is `synthesis_peak_bytes`: the process's \
+         high-water when the synthesis half had finished, taken before the round-trip gate \
+         releases it and loads the recogniser — that gate's later reading prints as \
+         `process_peak_bytes` and is not this row's figure. \
          `embed.256` and `embed.8192` are one bidirectional pass each over the whole \
          sequence on a Q8_0 stack. Their `digest` is over the L2-normalised \
          768-vector the row names — the cell's answer, not the graph's raw output.\n",
-    );
+    ));
     // The pinned answers themselves, in the record and not only in the run's
     // stdout: the sentences the two generative surfaces are held to, and the fact
     // that the comparison is on the words rather than on a digest that an unrelated
@@ -890,12 +1082,12 @@ pub fn main_entry() {
             // division; the percentage then divides by the ceiling printed above.
             // A reader can reproduce every figure from the table.
             let ms = printed(*ms, 2);
-            let rate = printed(bytes / (ms * 1e-3) / 1e9, 1);
+            let rate = printed(*bytes as f64 / (ms * 1e-3) / 1e9, 1);
             measured_streams.push(StreamRow {
                 unit: (*unit).to_string(),
                 columns: format!(
                     "| {phase} | {unit} | {} | {ms:.2} | {rate:.1} |",
-                    report::grouped(*bytes as u64)
+                    report::grouped(*bytes)
                 ),
             });
         }
@@ -927,50 +1119,41 @@ pub fn main_entry() {
         );
     }
     body.push_str("\n### Weight streams, against the machine's streaming ceiling\n\n");
+    // No stream row of this run's own: the rows are the run that took them, and this run's probe
+    // is the ceiling their percentages are restated against. Nothing is claimed about which
+    // cells this run measured — the `rows` line above does that.
     if measured_count == 0 && !table_rows.is_empty() {
         body.push_str(
-            "This run measured no generative cell, so it took no stream reading of its own: \
-             the rows below are the run that measured them, restated against the ceiling \
-             printed below.\n\n",
+            "This run took no stream reading of its own: the rows below are the run that \
+             measured them, restated against the ceiling printed below.\n\n",
         );
     }
     body.push_str(&streams_body);
     body.push_str("\nProvenance:\n\n");
     // A row this run did not take is carried, and the tree that took it is in no
     // line of this file — the `code` line is this run's, rewritten on every run —
-    // so the line names which rows are the run's rather than placing the others.
-    body.push_str(&provenance(
-        &load_at_start,
-        swap_at_start,
-        &format!(
-            "this run measured {}{}",
-            measured.join(", "),
-            if carried_rows > 0 {
-                "; every other row is carried from an earlier run of this file, and its figures \
-                 belong to the run that took them — the `code` line above is this run's tree, not \
-                 theirs. A carried row keeps its weight-stream row and the artefact lines of the \
-                 run that took it"
-            } else {
-                "; the table is this run's throughout"
-            },
-        ),
-    ));
-    // The invocation that took these rows, cell indices and all: a fixed string
-    // here would name a run nobody made, and a row's provenance is the command
-    // that produced it.
-    let mut argv = std::env::args();
-    let exe = argv.next().unwrap_or_default();
-    let exe = std::path::Path::new(&exe)
-        .file_name()
-        .map_or(exe.clone(), |name| name.to_string_lossy().into_owned());
-    let command = argv.fold(exe, |mut line, arg| {
-        line.push(' ');
-        line.push_str(&arg);
-        line
-    });
-    body.push_str(&format!(
-        "- command: `{command}` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`, article from `MAHBOT_EMBED_TEXT`)\n"
-    ));
+    // so the line names which rows are the run's rather than placing the others. One block goes
+    // into every section this run writes, its `rows` line included: one provenance, one set of
+    // values.
+    let rows_line = format!(
+        "this run measured {}{}{}",
+        measured.join(", "),
+        if transcribe_rows.is_empty() {
+            ""
+        } else {
+            ", and the transcription section this run wrote is built from its own rows"
+        },
+        if carried_rows > 0 {
+            "; every other row of the stand table is carried from an earlier run of this file, \
+             and its figures belong to the run that took them — the `code` line above is this \
+             run's tree, not theirs. A carried row keeps its weight-stream row and, where this \
+             run could not read the files, the artefact lines of the run that took it"
+        } else {
+            "; the stand table is this run's throughout"
+        },
+    );
+    let provenance_block = provenance.render(&rows_line);
+    body.push_str(&provenance_block);
     // The artefact lines this run can take, by the file name each line names: an
     // artefact this run cannot read keeps the line the earlier run wrote for it,
     // beside the rows it belongs to.
@@ -1079,28 +1262,24 @@ pub fn main_entry() {
     if let Some(line) = &text_line {
         body.push_str(line);
     }
-    if let Err(error) = crate::measurements::refresh("stand", &body) {
-        // The numbers are the deliverable, and the file is where they live: a
-        // run that cannot record them is a failed run, as the bench's is.
-        eprintln!("stand: cannot refresh MEASUREMENTS.md: {error:#}");
-        std::process::exit(1);
-    }
-    // The transcription surface's own section, after the stand's and only when
-    // this round actually ran that cell: a round that named other cells carries
-    // the section the run that took it wrote. Its provenance is the same run's, so
-    // its figures are attributed to the same tree.
-    if !transcribe_rows.is_empty() {
-        let body = match transcribe_section(
+    // The transcription surface's own section, after the stand's in the file, and only when the
+    // run named that cell: a run of other cells carries the section the run that took
+    // it wrote. It carries the same provenance block as the section above — one run, one set of
+    // values — and the same `rows` line, which already names the transcription rows as this
+    // run's. It is built before either section is written, so a section that cannot be built
+    // leaves the record as it was rather than beside a stand section that claims its rows, and
+    // it is written before the stand section: the `rows` line claims that section is this run's,
+    // so it may only be written once that is true.
+    let transcribe_body = if transcribe_rows.is_empty() {
+        None
+    } else {
+        match transcribe_section(
             &transcribe_rows,
-            &provenance(
-                &load_at_start,
-                swap_at_start,
-                "every row above is this run's; the model files, the corpus and the music pool are \
-                 verified by hash before the first one, and the `model:` lines below are what those \
-                 files hashed to here",
-            ),
+            &provenance_block,
+            provenance.taken(),
+            &transcribe_peaks,
         ) {
-            Ok(body) => body,
+            Ok(body) => Some(body),
             // The section is written from the cell's own rows: a row or a field it names
             // and the run did not print is a record that would state a figure nobody
             // measured, which is a failed run rather than a written zero.
@@ -1108,11 +1287,19 @@ pub fn main_entry() {
                 eprintln!("stand: cannot write the transcription section: {error:#}");
                 std::process::exit(1);
             }
-        };
-        if let Err(error) = crate::measurements::refresh("transcribe", &body) {
-            eprintln!("stand: cannot refresh MEASUREMENTS.md: {error:#}");
-            std::process::exit(1);
         }
+    };
+    if let Some(body) = transcribe_body
+        && let Err(error) = crate::measurements::refresh("transcribe", &body)
+    {
+        eprintln!("stand: cannot refresh MEASUREMENTS.md: {error:#}");
+        std::process::exit(1);
+    }
+    if let Err(error) = crate::measurements::refresh("stand", &body) {
+        // The numbers are the deliverable, and the file is where they live: a
+        // run that cannot record them is a failed run, as the bench's is.
+        eprintln!("stand: cannot refresh MEASUREMENTS.md: {error:#}");
+        std::process::exit(1);
     }
 }
 
@@ -1131,59 +1318,169 @@ fn unit_name(cell: &Cell) -> &'static str {
     }
 }
 
-/// The provenance block both surfaces' sections carry: the machine, the device and
-/// the tree the figures were taken from, which rows this run took, and the
-/// conditions of the run. One function, so the two sections cannot describe
-/// themselves differently.
-fn provenance(load_at_start: &str, swap_at_start: Option<u64>, rows: &str) -> String {
-    let mut body = String::new();
-    body.push_str(&format!("- machine: {}\n", crate::measurements::machine()));
-    body.push_str(&format!("- device: {}\n", crate::measurements::device()));
-    body.push_str(&format!("- driver: {}\n", crate::measurements::driver()));
-    body.push_str(&format!("- profile: {}\n", crate::measurements::profile()));
-    body.push_str(&format!(
-        "- code: {} (the commit and the SHA-256 of the tree's own difference from it — {} — which \
-         together are the content that produced these figures; a clean tree's digest is \
-         `e3b0c44298fc1c14`, the hash of an empty diff)\n",
-        crate::measurements::code_state(),
-        crate::measurements::provenance_rule(),
-    ));
-    body.push_str(&format!("- rows: {rows}\n"));
-    body.push_str(&format!(
-        "- thermal: {} (`pmset -g therm`, the reading `scripts/check-throttle.sh` gates on)\n",
-        crate::report::thermal().unwrap_or_else(|| "no reading".to_string())
-    ));
-    body.push_str(&format!(
-        "- load: {load_at_start} (1/5/15-min) at the start, {} at the table; every cell line carries its own `load=`\n",
-        load_average(),
-    ));
-    let ceiling_mib = crate::guard::max_swap_growth_mib();
-    let swap_growth = crate::guard::swap_used_bytes()
-        .zip(swap_at_start)
-        .map(|(now, start)| now.saturating_sub(start) / (1024 * 1024));
-    match (swap_at_start, swap_growth) {
-        (Some(start), Some(growth)) => body.push_str(&format!(
-            "- swap: {} MiB in use at the start, {growth} MiB grown during the run (ceiling {ceiling_mib} MiB{})\n",
-            start / (1024 * 1024),
-            if ceiling_mib == crate::guard::MAX_SWAP_GROWTH_MIB {
-                String::new()
-            } else {
-                format!(
-                    ", raised by `MAHBOT_STAND_MAX_SWAP_MIB` from its default {}",
-                    crate::guard::MAX_SWAP_GROWTH_MIB
-                )
-            },
-        )),
-        _ => body.push_str(&format!(
-            "- swap: the platform reported no figure; ceiling {ceiling_mib} MiB\n"
-        )),
+/// The conditions one run's figures were taken under, read once: every section the run writes
+/// quotes the same values under the same labels, so two sections of one run cannot disagree
+/// about the machine, the tree, the load or the swap. The `rows` line is the one part a caller
+/// supplies, because it names the rows the run measured.
+struct Provenance {
+    /// The `_Measured …._` line both sections open with.
+    taken: String,
+    machine: String,
+    device: String,
+    driver: String,
+    profile: String,
+    code: String,
+    thermal: String,
+    load_at_start: String,
+    load_at_table: String,
+    /// The resident-set ceiling every cell carried: `MAHBOT_MAX_RSS_MIB`, or the guard's default.
+    rss_ceiling_mib: u64,
+    /// The swap-growth ceiling, read in the same snapshot as the resident-set one.
+    swap_ceiling_mib: u64,
+    swap_at_start: Option<u64>,
+    swap_at_table: Option<u64>,
+    /// The invocation that took the rows, cell indices and all: a fixed string would name a run
+    /// nobody made.
+    command: String,
+}
+
+impl Provenance {
+    /// Read every condition once: after the cells, so the load and the swap the run saw at the
+    /// table are this run's readings and not a later moment's.
+    fn take(load_at_start: &str, swap_at_start: Option<u64>) -> Self {
+        let mut argv = std::env::args();
+        let exe = argv.next().unwrap_or_default();
+        let exe = std::path::Path::new(&exe)
+            .file_name()
+            .map_or(exe.clone(), |name| name.to_string_lossy().into_owned());
+        let command = argv.fold(exe, |mut line, arg| {
+            line.push(' ');
+            line.push_str(&arg);
+            line
+        });
+        Self {
+            taken: crate::measurements::now(),
+            machine: crate::measurements::machine(),
+            device: crate::measurements::device(),
+            driver: crate::measurements::driver(),
+            profile: crate::measurements::profile(),
+            code: crate::measurements::code_state(),
+            thermal: crate::report::thermal().unwrap_or_else(|| "no reading".to_string()),
+            load_at_start: load_at_start.to_string(),
+            load_at_table: load_average(),
+            rss_ceiling_mib: crate::guard::max_rss_mib(),
+            swap_ceiling_mib: crate::guard::max_swap_growth_mib(),
+            swap_at_start,
+            swap_at_table: crate::guard::swap_used_bytes(),
+            command,
+        }
     }
-    body
+
+    fn taken(&self) -> &str {
+        &self.taken
+    }
+
+    /// The block both surfaces' sections carry: the machine, the device and the tree the figures
+    /// were taken from, which rows this run took, and the conditions of the run.
+    fn render(&self, rows: &str) -> String {
+        let mut body = String::new();
+        body.push_str(&format!("- machine: {}\n", self.machine));
+        body.push_str(&format!("- device: {}\n", self.device));
+        body.push_str(&format!("- driver: {}\n", self.driver));
+        body.push_str(&format!("- profile: {}\n", self.profile));
+        body.push_str(&format!(
+            "- code: {} (the commit and the SHA-256 of the tree's own difference from it — {} — \
+             which together are the content that produced these figures; a clean tree's digest is \
+             `e3b0c44298fc1c14`, the hash of an empty diff)\n",
+            self.code,
+            crate::measurements::provenance_rule(),
+        ));
+        body.push_str(&format!("- rows: {rows}\n"));
+        body.push_str(&format!(
+            "- thermal: {} (`pmset -g therm`, the reading `scripts/check-throttle.sh` gates on)\n",
+            self.thermal
+        ));
+        body.push_str(&format!(
+            "- load: {} (1/5/15-min) at the start, {} at the table; every cell line carries its own `load=`\n",
+            self.load_at_start, self.load_at_table,
+        ));
+        // Both ceilings, each with the default it stands at: the section that narrates a cell's
+        // ceilings can then say which were the guard's own rather than the reader's guess.
+        body.push_str(&format!(
+            "- ceiling: {}\n",
+            ceiling_line(
+                "resident set",
+                self.rss_ceiling_mib,
+                crate::guard::DEFAULT_MAX_RSS_MIB,
+                "MAHBOT_MAX_RSS_MIB",
+            )
+        ));
+        let swap = ceiling_line(
+            "growth",
+            self.swap_ceiling_mib,
+            crate::guard::MAX_SWAP_GROWTH_MIB,
+            "MAHBOT_STAND_MAX_SWAP_MIB",
+        );
+        // Which of the two moments were read, never "the platform reported no figure" for a run
+        // that read one of them: a reading that did not parse is not the same absence as a
+        // moment nobody asked about. The growth is the difference of the two figures this line
+        // prints — both rounded to the tenth of a MiB it states them at, so subtracting them
+        // gives the growth printed beside them — and a run that gave swap back says so; only
+        // equal readings say nothing moved.
+        let swap_in_use = match (self.swap_at_start, self.swap_at_table) {
+            (Some(start), Some(table)) => {
+                let (start, table) = (mib_tenths(start as i64), mib_tenths(table as i64));
+                let delta = table - start;
+                let moved = if delta == 0 {
+                    "unchanged during the run".to_string()
+                } else if delta > 0 {
+                    format!("{}, grown during the run", tenths_text(delta))
+                } else {
+                    format!("{}, given back during the run", tenths_text(-delta))
+                };
+                format!(
+                    "{} in use at the start, {} at the table — {moved}",
+                    tenths_text(start),
+                    tenths_text(table),
+                )
+            }
+            (Some(start), None) => format!(
+                "{} in use at the start, and no figure at the table, so the growth is not \
+                 stated",
+                mib_text(start as i64)
+            ),
+            (None, Some(table)) => format!(
+                "no figure at the start and {} in use at the table, so the growth is not \
+                 stated",
+                mib_text(table as i64)
+            ),
+            (None, None) => "no figure at either moment, so neither the in-use figure nor the \
+                             growth is stated"
+                .to_string(),
+        };
+        body.push_str(&format!("- swap: {swap_in_use} (ceiling {swap})\n"));
+        body.push_str(&format!(
+            "- command: `{}` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`, article from `MAHBOT_EMBED_TEXT`)\n",
+            self.command
+        ));
+        body
+    }
 }
 
 /// The table's rows, in the record's own order.
 fn cell_names() -> Vec<&'static str> {
     cells().into_iter().map(|cell| unit_name(&cell)).collect()
+}
+
+/// One of the guard's ceilings as the provenance block states it: the value in force and,
+/// because the section that narrates a cell's ceilings says which were the guard's own, whether
+/// it is the default or a raised one.
+fn ceiling_line(what: &str, value_mib: u64, default_mib: u64, env: &str) -> String {
+    if value_mib == default_mib {
+        format!("{value_mib} MiB {what}, the guard's default")
+    } else {
+        format!("{value_mib} MiB {what}, raised by `{env}` from its default {default_mib}")
+    }
 }
 
 /// What the stand block in the record already holds and this run cannot take
@@ -1335,15 +1632,93 @@ fn artefact_name(line: &str) -> Option<&str> {
     rest.strip_prefix('`')?.split('`').next()
 }
 
-/// One `key=value` figure from a child's stdout, by label rather than by
-/// position: the first whitespace-delimited token that starts with `{label}=`.
-/// A figure the cell does not print (a cell with no synthesis split) is `None`,
-/// which the table renders as `-`.
-fn field(text: &str, label: &str) -> Option<f64> {
+/// One `key=value` token of a row as text: a byte count, a `human` figure or `-`. The first
+/// whitespace-delimited token that starts with `{label}=`; a label the row does not carry is
+/// `None`, which the table renders as `-`.
+fn field_text<'a>(line: &'a str, label: &str) -> Option<&'a str> {
     let key = format!("{label}=");
-    text.split_whitespace()
+    line.split_whitespace()
         .find_map(|token| token.strip_prefix(&key))
-        .and_then(|value| value.parse().ok())
+}
+
+/// The same token as a number.
+fn field(text: &str, label: &str) -> Option<f64> {
+    field_text(text, label)?.parse().ok()
+}
+
+/// The transcription cell's high-waters, split by the population each belongs to: [`PathPeaks::calls`]
+/// is the cell's own process and the calls it started of message or corpus size — the processes the
+/// cell's ceiling holds — and [`PathPeaks::hours`] the hour-scale inputs, which carry their own
+/// figures and no verdict. The cell's own reading leads `calls`.
+#[derive(Debug, Default)]
+struct PathPeaks {
+    calls: Vec<PeakReading>,
+    hours: Vec<PeakReading>,
+}
+
+/// Every high-water the transcription cell's path showed in a run, in bytes and named with the
+/// process that read it: the cell's own, every one of the three runs behind each cold message row,
+/// the corpus-cold call and the three hour-scale calls — each a whole call in a process of its own.
+/// The first reading is the cell's, and the caller passes the figure its `unit` row printed when the
+/// cell had finished: the table and the section's prose quote that one list, so one label cannot
+/// carry two readings. A row whose reading cannot be read fails the run: a peak dropped here is a
+/// process this run started that no line of the record would name.
+fn path_peaks(cell_peak: u64, rows: &[String]) -> anyhow::Result<PathPeaks> {
+    let mut peaks = PathPeaks {
+        calls: vec![PeakReading {
+            process: "cell".to_string(),
+            bytes: cell_peak,
+        }],
+        hours: Vec::new(),
+    };
+    for row in rows {
+        // A cold message row is the median of three runs, and each of the three is a process
+        // this run started: `process_peaks_bytes` carries all of them in run order. The other
+        // cold rows are one process each.
+        let (process, field, hours) = if row.starts_with("transcribe message s=")
+            && field_text(row, "pass") == Some("cold")
+        {
+            (
+                format!("message {} s cold", field_text(row, "s").unwrap_or("-")),
+                "process_peaks_bytes",
+                false,
+            )
+        } else if row.starts_with("transcribe corpus-cold ") {
+            ("corpus cold".to_string(), "process_peak_bytes", false)
+        } else if row.starts_with("transcribe long-input ") {
+            (
+                field_text(row, "label").unwrap_or("-").to_string(),
+                "process_peak_bytes",
+                true,
+            )
+        } else {
+            continue;
+        };
+        let values = field_text(row, field)
+            .with_context(|| format!("`{row}` carries no `{field}`"))?
+            .split(',')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let runs = values.len();
+        let target = if hours {
+            &mut peaks.hours
+        } else {
+            &mut peaks.calls
+        };
+        for (run, value) in values.into_iter().enumerate() {
+            target.push(PeakReading {
+                process: if runs > 1 {
+                    format!("{process} run {}", run + 1)
+                } else {
+                    process.clone()
+                },
+                bytes: value
+                    .parse()
+                    .with_context(|| format!("`{row}`'s `{field}` is not a byte count"))?,
+            });
+        }
+    }
+    Ok(peaks)
 }
 
 /// The `unit {name} …` line of a child's stdout: the row the table is built from,
@@ -1356,9 +1731,11 @@ fn unit_line<'a>(text: &'a str, name: &str) -> Option<&'a str> {
 /// The per-phase weight streams one cell's text carries, as
 /// `(phase, unit, bytes per unit, ms per unit)`. Only the two generative cells
 /// print them; a cell that does not is a row the rate table leaves out.
-fn streams_of(cell: &str, text: &str) -> Vec<(&'static str, &'static str, f64, f64)> {
-    fn pair(text: &str, bytes: &str, ms: &str) -> Option<(f64, f64)> {
-        Some((field(text, bytes)?, field(text, ms)?))
+fn streams_of(cell: &str, text: &str) -> Vec<(&'static str, &'static str, u64, f64)> {
+    // A byte count is read as one, never through a float: the rate beside it is the only
+    // quotient the record takes of it.
+    fn pair(text: &str, bytes: &str, ms: &str) -> Option<(u64, f64)> {
+        Some((field_text(text, bytes)?.parse().ok()?, field(text, ms)?))
     }
     let mut out = Vec::new();
     match cell {
@@ -1377,10 +1754,17 @@ fn streams_of(cell: &str, text: &str) -> Vec<(&'static str, &'static str, f64, f
             // A missing field drops the row instead of dividing by a stand-in:
             // the level count is the divisor of one of the four phase figures.
             if let (Some(levels), Some((bytes, ms))) = (
-                field(text, "predictor_levels").filter(|n| *n > 0.0),
+                field_text(text, "predictor_levels")
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .filter(|n| *n > 0),
                 pair(text, "predictor_stream_bytes", "predictor_stream_ms"),
             ) {
-                out.push(("code predictor", "one level", bytes / levels, ms / levels));
+                out.push((
+                    "code predictor",
+                    "one level",
+                    bytes / levels,
+                    ms / levels as f64,
+                ));
             }
             if let Some((bytes, ms)) = pair(text, "sound_stream_bytes", "sound_stream_ms") {
                 out.push(("sound half", "one utterance", bytes, ms));
@@ -1391,13 +1775,15 @@ fn streams_of(cell: &str, text: &str) -> Vec<(&'static str, &'static str, f64, f
     out
 }
 
-/// One resident-set sample in decimal megabytes, or `unknown` where the platform
-/// did not answer — a zero would read as a measurement of a live process.
-fn mb(rss: Option<u64>) -> String {
-    rss.map_or_else(
-        || "unknown".to_string(),
-        |b| format!("{:.1}", b as f64 / 1e6),
-    )
+/// A resident-set sample the `speak` cell's line cannot take: the run fails naming the moment and
+/// the counter, because a byte figure with no reading behind it may not be printed as one — a
+/// word would read as a measurement, and a zero as a measurement of a live process.
+fn speak_resident_at(rss: Option<u64>, moment: &str) -> u64 {
+    rss.unwrap_or_else(|| {
+        cell_failed!(
+            "cell speak — the resident set at the {moment} cannot be read (`speak residency`)"
+        )
+    })
 }
 
 /// One streaming-probe reading as a line: the ceiling every per-phase rate in the
@@ -1483,25 +1869,43 @@ fn one_line(text: &str) -> String {
     text.replace(['\n', '\r', '"', '|'], " ")
 }
 
-/// The machine-readable line a unit prints after its run:
-/// `unit <name> build_ms=<…> run_ms=<…> peak=<bytes> cold_ms=<…> map=<bytes>`.
-fn parse_unit(text: &str, name: &str) -> Option<(f64, f64, u64, u64, f64)> {
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("unit ") else {
-            continue;
-        };
-        let mut parts = rest.split_whitespace();
-        if parts.next()? != name {
-            continue;
-        }
-        let build = parts.next()?.strip_prefix("build_ms=")?.parse().ok()?;
-        let run = parts.next()?.strip_prefix("run_ms=")?.parse().ok()?;
-        let peak = parts.next()?.strip_prefix("peak=")?.parse().ok()?;
-        let cold = parts.next()?.strip_prefix("cold_ms=")?.parse().ok()?;
-        let map = parts.next()?.strip_prefix("map=")?.parse().ok()?;
-        return Some((cold, run, peak, map, build));
-    }
-    None
+/// The five fields this reads out of the machine-readable line a unit prints after its run:
+/// `unit <name> build_ms=<ms> run_ms=<ms> <peak>=<bytes> cold_ms=<ms> map=<bytes> …`, where
+/// `<peak>` is `process_peak_bytes` — the process's final reading — or, on `speak`, whose process
+/// outlives the reading, `synthesis_peak_bytes`. A field that is missing or unreadable is named
+/// in the error.
+fn parse_unit(text: &str, name: &str) -> Result<(f64, f64, u64, u64, f64), String> {
+    let line = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("unit "))
+        .find(|rest| rest.split_whitespace().next() == Some(name))
+        .ok_or_else(|| format!("no `unit {name}` line"))?;
+    let value = |key: &str| -> Result<&str, String> {
+        line.split_whitespace()
+            .find_map(|token| token.strip_prefix(key))
+            .ok_or_else(|| format!("its `{key}` is missing"))
+    };
+    let number = |key: &str| -> Result<f64, String> {
+        value(key)?
+            .parse()
+            .map_err(|_| format!("its `{key}` is not a number"))
+    };
+    let peak = line
+        .split_whitespace()
+        .filter_map(|token| token.split_once('='))
+        .find(|(field, _)| matches!(*field, "process_peak_bytes" | "synthesis_peak_bytes"))
+        .ok_or("its peak is neither `process_peak_bytes` nor `synthesis_peak_bytes`")?;
+    Ok((
+        number("cold_ms=")?,
+        number("run_ms=")?,
+        peak.1
+            .parse()
+            .map_err(|_| "its peak is not a byte count".to_string())?,
+        value("map=")?
+            .parse()
+            .map_err(|_| "its `map=` is not a byte count".to_string())?,
+        number("build_ms=")?,
+    ))
 }
 
 fn now() -> String {
@@ -1635,6 +2039,132 @@ fn median(v: &[f64]) -> Option<f64> {
     median_index(v).map(|i| v[i])
 }
 
+/// [`median`] over byte counts: exact, so a peak's median is not a rounded figure before the
+/// verdict beside it is computed.
+fn median_bytes(v: &[u64]) -> Option<u64> {
+    let mut order = v.to_vec();
+    order.sort_unstable();
+    if order.is_empty() {
+        None
+    } else {
+        Some(order[order.len() / 2])
+    }
+}
+
+/// The range readings spanned: what the printed figure resolves, stated beside it. Fewer than
+/// two readings resolve nothing — that is `NaN` too, not a zero that would read as a range.
+fn spread(v: &[f64]) -> f64 {
+    if v.len() < 2 {
+        return f64::NAN;
+    }
+    v.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        - v.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
+/// [`spread`] over byte counts: exact, so a peak's range is not rounded before the verdict
+/// beside it is computed, and `None` for fewer than two readings.
+fn spread_bytes(v: &[u64]) -> Option<u64> {
+    if v.len() < 2 {
+        return None;
+    }
+    Some(v.iter().max()? - v.iter().min()?)
+}
+
+/// A millisecond figure as a line prints it: `-` where there is no reading, so a line cannot
+/// carry a zero in the place of one.
+fn render_ms(value: Option<f64>) -> String {
+    value.map_or_else(
+        || "-".to_string(),
+        |ms| {
+            if ms.is_finite() {
+                format!("{ms:.1}")
+            } else {
+                "-".to_string()
+            }
+        },
+    )
+}
+
+/// The median of a row's readings, or the run fails naming what it could not aggregate: a zero
+/// would enter the record as a figure the run never measured.
+fn median_or_fail(v: &[f64], what: &str, name: &str) -> f64 {
+    median(v).unwrap_or_else(|| {
+        eprintln!("stand: {name} printed no {what} to take a median of");
+        std::process::exit(1);
+    })
+}
+
+/// The run whose figure is the median of `v`, with that figure and the range all the runs
+/// spanned: one reading cannot say what the instrument resolves, so a row prints both and
+/// takes its other figures from the median run.
+fn median_run(v: &[f64]) -> Option<(usize, f64, f64)> {
+    median_index(v).map(|i| (i, v[i], spread(v)))
+}
+
+/// A byte count as the record prints it.
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
+/// A peak reading's number, in the GiB the table's `peak GiB` column heads: one function for
+/// the figure a row leads with, the readings beside it and the bounds of the range the section
+/// states, so the same reading cannot be printed to two precisions. Bare, because the column's
+/// header names the unit every cell of it is in.
+fn peak_gib(bytes: u64) -> String {
+    format!("{:.2}", gib(bytes))
+}
+
+/// [`peak_gib`] in prose, where no header names the unit.
+fn gib_text(bytes: u64) -> String {
+    format!("{} GiB", peak_gib(bytes))
+}
+
+/// A byte count in tenths of a MiB — the precision the record prints these figures at, as an
+/// integer so that two of them subtract to the growth their printed difference states.
+fn mib_tenths(bytes: i64) -> i64 {
+    (bytes as f64 / (1u64 << 20) as f64 * 10.0).round() as i64
+}
+
+/// A count in tenths of a MiB as a bare number, sign first: the form a `MiB` column's cell and
+/// a prose figure are both built from.
+fn tenths_number(tenths: i64) -> String {
+    let sign = if tenths < 0 { "-" } else { "" };
+    let magnitude = tenths.unsigned_abs();
+    format!("{sign}{}.{}", magnitude / 10, magnitude % 10)
+}
+
+/// [`tenths_number`] in prose, where no header names the unit.
+fn tenths_text(tenths: i64) -> String {
+    format!("{} MiB", tenths_number(tenths))
+}
+
+/// A byte count in the unit its column is headed in, to the precision the table prints: bare,
+/// because a column headed `MiB` carries numbers, not units.
+fn mib(bytes: u64) -> String {
+    tenths_number(mib_tenths(bytes as i64))
+}
+
+/// [`mib`] in prose, where no header names the unit.
+fn mib_text(bytes: i64) -> String {
+    tenths_text(mib_tenths(bytes))
+}
+
+/// [`mib`] for a signed count: a call that gave memory back reads negative, and printing it as
+/// a magnitude would call a release a growth.
+fn mib_signed(bytes: i64) -> String {
+    tenths_number(mib_tenths(bytes))
+}
+
+/// A `human` token with the space this file's prose writes between a number and its unit: the
+/// tokens print `2.37GiB`, the prose reads `2.37 GiB`. The record's tables quote the token as
+/// the row printed it.
+fn spaced(measured: String) -> String {
+    match measured.find(|c: char| c.is_alphabetic()) {
+        Some(at) => format!("{} {}", &measured[..at], &measured[at..]),
+        None => measured,
+    }
+}
+
 /// `v` at the number of decimals the record prints it with, so a figure derived
 /// from it is the printed division rather than a more precise one.
 fn printed(v: f64, decimals: i32) -> f64 {
@@ -1642,10 +2172,31 @@ fn printed(v: f64, decimals: i32) -> f64 {
     (v * scale).round() / scale
 }
 
+/// A cell's memory at the moment the cell captures it, the three figures taken together so one
+/// row describes one moment: the process high-water (`ru_maxrss`, which no later drop lowers),
+/// the model files the cell read and the device's shared weight pool. A cell captures it at the
+/// end of its own run; `speak` captures it at the end of its synthesis half, before the
+/// round-trip gate replaces the pool with the recogniser's.
+struct Mem {
+    peak: u64,
+    map: u64,
+    weights: u64,
+}
+
+impl Mem {
+    /// The memory as this moment shows it: the caller's own peak and file reading, and the
+    /// pool as it stands now.
+    fn of(peak: u64, map_bytes: u64) -> Self {
+        Self {
+            peak,
+            map: map_bytes,
+            weights: rlx_wgpu::buffer::shared_weight_bytes() as u64,
+        }
+    }
+}
+
 /// One cell's measurements in the stand's own line: the run's price, its witnesses
-/// (digest, census, counters) and its memory. `arena` is `Outcome::arena_bytes` —
-/// rlx-wgpu's own planner over the graph before its unfuse passes, without the
-/// scratch tail — not the bytes the arena buffer was allocated with.
+/// (digest, census, counters) and its memory, as [`Mem`] captured it.
 fn line(
     cell: &str,
     fields: &[(&str, String)],
@@ -1653,10 +2204,9 @@ fn line(
     values: &[f32],
     phases: &[Phase],
     s: Steps,
-    peak: u64,
-    map_bytes: u64,
+    mem: Mem,
     counters: (u64, u64),
-    speech_s: f64,
+    covered_s: f64,
     split_ms: (f64, f64),
 ) {
     let steps: usize = o.ops.iter().map(|(_, n)| n).sum();
@@ -1671,10 +2221,10 @@ fn line(
         phases.iter().map(|p| format!("{}:{}", p.name, p.passes)).collect::<Vec<_>>().join(",")
     ));
     text.push_str(&format!(" submits={} waits={}", counters.0, counters.1));
-    // Printed only by a cell that has a speech denominator: a cell with none says
-    // nothing rather than `0`.
-    if speech_s > 0.0 {
-        text.push_str(&format!(" speech_s={speech_s:.6}"));
+    // Printed only by a cell that has a covered-audio denominator: a cell with none
+    // says nothing rather than `0`.
+    if covered_s > 0.0 {
+        text.push_str(&format!(" covered_s={covered_s:.6}"));
     }
     if split_ms.0 > 0.0 || split_ms.1 > 0.0 {
         text.push_str(&format!(
@@ -1694,15 +2244,17 @@ fn line(
         o.dequant_nodes
     ));
     text.push_str(&format!(" arena={}", human(o.arena_bytes as u64)));
+    text.push_str(&format!(" weights={}", human(mem.weights)));
     text.push_str(&format!(" keys={}", keys()));
-    let beyond_map = peak.saturating_sub(map_bytes);
-    let file_over_rss = map_bytes.saturating_sub(peak);
+    // `map` is the bytes of the model files, as the unit row below prints it: one quantity, one
+    // unit, whichever line carries it; `rss_end` is the resident set at this moment, a byte count
+    // read as one, and a reading that cannot be taken fails the run rather than printing a word.
     text.push_str(&format!(
-        " rss_end={} map={} beyond_map={} file_over_rss={} at={} load={}",
-        resident_rss().map_or_else(|| "unknown".to_string(), human),
-        human(map_bytes),
-        human(beyond_map),
-        human(file_over_rss),
+        " rss_end={} map={} at={} load={}",
+        resident_rss().unwrap_or_else(|| {
+            cell_failed!("cell {cell} — the resident set at the end of the cell cannot be read")
+        }),
+        mem.map,
         now(),
         load_average()
     ));
@@ -1727,25 +2279,30 @@ fn line(
     // The unit's own summary: build, the two run figures under one rule, the
     // unit's whole-cell counters and the process peak (`ru_maxrss`, a high-water
     // mark that covers everything this cell allocated and that no drop lowers).
-    let beyond_map = peak.saturating_sub(map_bytes);
-    let file_over_rss = map_bytes.saturating_sub(peak);
-    // A cell with no speech denominator says nothing rather than `0`, the same way its
-    // `cell` line does.
-    let speech = if speech_s > 0.0 {
-        format!(" speech_s={speech_s:.6}")
+    // `speak`'s process goes on after this reading (the round-trip gate follows it), so its
+    // field names the moment; every other cell has finished and prints its final reading.
+    // A cell with no covered-audio denominator says nothing rather than `0`, the same way its
+    // `cell` line does. The transcription `speech` row's own denominator is
+    // `speech_pool_s`, a narrower figure named apart.
+    let covered = if covered_s > 0.0 {
+        format!(" covered_s={covered_s:.6}")
     } else {
         String::new()
     };
+    let peak_field = if cell == "speak" {
+        "synthesis_peak_bytes"
+    } else {
+        "process_peak_bytes"
+    };
     println!(
-        "unit {cell} build_ms={:.3} run_ms={:.3} peak={} cold_ms={:.3} map={} beyond_map={} file_over_rss={} arena={} submits={} waits={} at={} load={}{speech}",
+        "unit {cell} build_ms={:.3} run_ms={:.3} {peak_field}={} cold_ms={:.3} map={} arena={} weights={} submits={} waits={} at={} load={}{covered}",
         s.build_ms,
         s.warm_ms,
-        peak,
+        mem.peak,
         s.cold_ms,
-        map_bytes,
-        beyond_map,
-        file_over_rss,
+        mem.map,
         human(o.arena_bytes as u64),
+        human(mem.weights),
         counters.0,
         counters.1,
         now(),
@@ -1808,7 +2365,7 @@ fn ear() {
     };
     let tokens = graphs::asr_tokens(frames);
 
-    let mut front = match Front::build(&pair, frames) {
+    let front = match Front::build(&pair, frames) {
         Ok(f) => f,
         Err(e) => {
             cell_failed!("cell ear — front build: {e}");
@@ -1889,7 +2446,7 @@ fn ear() {
                 cell_failed!("cell ear — reference audio: {e}");
             }
         };
-    let mut reference = match Front::build(&pair, frames) {
+    let reference = match Front::build(&pair, frames) {
         Ok(f) => f,
         Err(e) => {
             cell_failed!("cell ear — reference front build: {e}");
@@ -1926,7 +2483,7 @@ fn ear() {
     drop(tm);
     drop(te);
     drop(tp);
-    let peak = peak_rss();
+    let peak = peak_bytes();
     let map_bytes = file_bytes(&pair.body.path) + file_bytes(&pair.sound.path);
     drop(front);
     drop(pair);
@@ -1953,8 +2510,7 @@ fn ear() {
             warm_ms,
             passes,
         },
-        peak,
-        map_bytes,
+        Mem::of(peak, map_bytes),
         (c.0 - c0.0, c.1 - c0.1),
         0.0,
         (0.0, 0.0),
@@ -1962,7 +2518,13 @@ fn ear() {
 }
 
 fn file_bytes(path: &std::path::Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(e) => cell_failed!(
+            "cell — the size of `{}` cannot be read: {e}",
+            path.display()
+        ),
+    }
 }
 
 /// What one recognition pass leaves behind: the walk itself, the phases the stand's
@@ -2227,8 +2789,8 @@ fn listen() {
         ("decode_stream_bytes", walk.decode_stream_bytes.to_string()),
         ("decode_stream_ms", format!("{decode_ms:.3}")),
     ];
-    let peak = peak_rss();
-    // `peak_rss` is `ru_maxrss`, the process's high-water mark: it reports the peak
+    let peak = peak_bytes();
+    // `process_peak_bytes` is `ru_maxrss`, the process's high-water mark: it reports the peak
     // the walk reached even though `recognise` dropped its runners and graphs before
     // returning, so the record attributes it to whoever held it then rather than to
     // what is live now.
@@ -2260,8 +2822,7 @@ fn listen() {
             warm_ms,
             passes,
         },
-        peak,
-        map_bytes,
+        Mem::of(peak, map_bytes),
         walk.counters,
         samples as f64 / 16_000.0,
         (0.0, 0.0),
@@ -2347,7 +2908,7 @@ fn ear_short(samples: usize, name: &str) {
         }
     };
     let tokens = graphs::asr_tokens(frames);
-    let mut front = match Front::build(&pair, frames) {
+    let front = match Front::build(&pair, frames) {
         Ok(f) => f,
         Err(e) => {
             cell_failed!("cell ear — front build: {e}");
@@ -2372,7 +2933,7 @@ fn ear_short(samples: usize, name: &str) {
     let warm_ms: f64 = phases.iter().map(|p| p.warm_ms).sum();
     let passes = phases.iter().map(|p| p.passes).sum();
     let map_bytes = file_bytes(&pair.body.path) + file_bytes(&pair.sound.path);
-    let peak = report::peak_rss();
+    let peak = peak_bytes();
     let c = graphs::device_counts();
     line(
         name,
@@ -2393,8 +2954,7 @@ fn ear_short(samples: usize, name: &str) {
             warm_ms,
             passes,
         },
-        peak,
-        map_bytes,
+        Mem::of(peak, map_bytes),
         (c.0 - c0.0, c.1 - c0.1),
         0.0,
         (0.0, 0.0),
@@ -2417,8 +2977,7 @@ fn speak() {
         o,
         phases,
         steps,
-        peak,
-        map_bytes,
+        mem,
         counters,
     }) = speak_synthesis()
     else {
@@ -2474,7 +3033,12 @@ fn speak() {
     if alternate {
         println!("witness speak-roundtrip skipped=alternate-input");
     } else {
-        report::release_free();
+        // The gate is a second model pair. The synthesis half's weights — the device
+        // pool's scope, the host copies a build keeps — are given back before the
+        // recogniser's are asked for, so the process holds one pair's weights at a
+        // time rather than both: the cell's peak is then the larger of its two halves
+        // instead of their sum, and the same is true of what it pushes into swap.
+        crate::release_process_memory();
         let audio = host::resample(&wave, 24_000, 16_000);
         // The round trip is a check on the synthesis half, not a precondition of
         // measuring it: a host that carries only the synthesis pair still runs the
@@ -2494,11 +3058,10 @@ fn speak() {
                 if !crate::reference::check_speak_roundtrip(&heard) {
                     cell_failed!("cell speak — the round trip is not the pinned transcript");
                 }
-                // The gate's pair is the process peak from here on. `peak_rss` is
-                // `ru_maxrss`, a high-water mark, so it cannot say what is live now;
-                // this reading is what the record's note compares the cell's own peak
-                // against.
-                println!("speak roundtrip peak_mb={:.1}", peak_rss() as f64 / 1e6);
+                // The process's final reading: the round-trip gate has released the synthesis
+                // half and held the recogniser's own pair since the row's
+                // `synthesis_peak_bytes`, so this figure is the whole process's high-water.
+                println!("speak roundtrip process_peak_bytes={}", peak_bytes());
             }
             Ok(None) => {
                 println!("witness speak-roundtrip skipped=no-recognition-pair reason=files-absent");
@@ -2528,8 +3091,7 @@ fn speak() {
         &wave,
         &phases,
         steps,
-        peak,
-        map_bytes,
+        mem,
         counters,
         frames as f64 * graphs::samples_per_frame() as f64 / 24_000.0,
         (loop_ms, sound_total),
@@ -2551,8 +3113,10 @@ struct Synthesis {
     o: Outcome,
     phases: Vec<Phase>,
     steps: Steps,
-    peak: u64,
-    map_bytes: u64,
+    /// The cell's memory at the end of the synthesis half, captured there rather than
+    /// read when the row prints: the round-trip gate releases the talker's pool and
+    /// loads the recogniser's, so a later reading would name the recogniser.
+    mem: Mem,
     counters: (u64, u64),
 }
 
@@ -2561,8 +3125,11 @@ struct Synthesis {
 /// code just drawn, then the sum of the sixteen code embeddings plus the next
 /// text hidden row becomes the next frame's input; then the sound half.
 ///
-/// Every graph it compiled, and both models, are still resident when the process
-/// peak is read, and all of them are dropped on return — see [`Synthesis`].
+/// The talker's graphs and the device's copy of its weights are released before the sound
+/// half is built, so the two halves do not hold their graphs at once. What the release gives
+/// back is the allocator's to reuse or keep, so the cell's high-water is read phase by phase
+/// (the `speak residency` line) rather than assumed to be one half's; what the sound half
+/// leaves is dropped on return — see [`Synthesis`].
 fn speak_synthesis() -> Option<Synthesis> {
     let rows = std::env::var("STAND_SPEAK_ROWS")
         .ok()
@@ -2680,6 +3247,10 @@ fn speak_synthesis() -> Option<Synthesis> {
     let spk = speaker.run(&[("mel".into(), spk_mel)], WARM_REPS);
     phases.push(Phase::single("speaker", &spk));
     let speaker_embed = spk.outs[0].clone();
+    // Its arena and weight layout go before the prompt prefill is built: the embedding is
+    // all the rest of the cell needs from it, and a graph held past its last read is
+    // memory the peak carries for nothing.
+    drop(speaker);
 
     // The prompt, its trailing text and the pad row come from `synth`, where
     // `Synthesis::generate` builds the same form.
@@ -2738,15 +3309,20 @@ fn speak_synthesis() -> Option<Synthesis> {
         sample_times.push(t.ms());
         let engine = sample_body.run(&[("logits".into(), logits)], 0);
         let got = engine.outs[0].first().copied().unwrap_or(f32::NAN) as usize;
+        // `host:`/`engine:` inside the value, not `key=value` pairs: the field is one token of a
+        // `key=value` line, and `host` there is the host sampler, never the record's byte count.
         sampler0 = if got == id {
             "equal".into()
         } else {
-            format!("host={id} engine={got}")
+            format!("host:{id}/engine:{got}")
         };
         draw_index += 1;
         id
     };
     let mut hidden = p.outs[0][(prompt_rows - 1) * d..prompt_rows * d].to_vec();
+    // The prefill's own arena and weight layout go here, once its outputs are taken: the
+    // loop below reads the cache planes it seeded, not the graph.
+    drop(prefill);
 
     // The talker on the part's fixed-capacity cache: one row per frame. The
     // prompt rows are copied into that cache before the first step.
@@ -2878,7 +3454,7 @@ fn speak_synthesis() -> Option<Synthesis> {
             sampler1 = if got == same_seed {
                 "equal".into()
             } else {
-                format!("host={same_seed} engine={got}")
+                format!("host:{same_seed}/engine:{got}")
             };
         }
         // The next frame's input: the sixteen code embeddings, summed. The rows
@@ -2947,11 +3523,34 @@ fn speak_synthesis() -> Option<Synthesis> {
         all_codes.push(frame_codes);
     }
     let frames = all_codes.len();
+    // The high-water as the loop left it: `ru_maxrss` is monotonic, so this reading and the
+    // one after the decoder's half say which of the two halves reached the peak.
+    let peak_loop = peak_bytes();
     let body_nodes = body.ops.iter().map(|(_, n)| n).sum();
     let pred_nodes: usize = pred_frame.ops.iter().map(|(_, n)| n).sum();
     phases.push(Phase::loop_times("body", &body_times, body_nodes));
     phases.push(Phase::loop_times("predictor", &pred_times, pred_nodes));
     phases.push(Phase::loop_times("sampler", &sample_times, 0));
+    // The talker is done with: its body, its predictor, its two samplers and the host-side
+    // cache planes they fed are not read again by the sound half, and a graph held past its
+    // last read is memory the cell's high-water carries for nothing. Dropped here rather
+    // than at the end of the function, where they would sit beside the decoder's graphs.
+    let body_stream_bytes = graphs::stream_bytes(&body.runner.graph);
+    let pred_stream_bytes = graphs::stream_bytes(&pred_frame.runner.graph);
+    drop(body);
+    drop(pred_frame);
+    drop(sample_body);
+    drop(sample_pred);
+    drop(k_cache);
+    drop(v_cache);
+    drop(mask);
+    // ... and every host copy of them, and the ladder's graphs with them: the sound half is
+    // built from `pair.sound` and asks for no talker name, so what the talker left would sit
+    // inside the decoder's own high-water for nothing. `release_process_memory` also returns
+    // the freed pages: freeing is not returning, and without the pressure call the decoder
+    // allocates on the talker's freed-but-retained pages, so the peak would carry both
+    // halves after all.
+    crate::release_process_memory();
 
     // The sound half: codes → codebook → wave transformer → DAC.
     let levels = pair
@@ -3211,6 +3810,7 @@ fn speak_synthesis() -> Option<Synthesis> {
         }
     }
     let rss_sound_graphs = report::resident_rss();
+    let peak_sound = peak_bytes();
     let o = o?;
     let body_total = phases
         .iter()
@@ -3250,15 +3850,9 @@ fn speak_synthesis() -> Option<Synthesis> {
         // The body is one frame; the predictor's figures are one frame of the walk
         // (all sixteen projecting levels, whose stream the record splits over them);
         // the sound half is one utterance, every window's graph counted.
-        (
-            "body_stream_bytes",
-            graphs::stream_bytes(&body.runner.graph).to_string(),
-        ),
+        ("body_stream_bytes", body_stream_bytes.to_string()),
         ("body_stream_ms", format!("{:.3}", body_total / rows as f64)),
-        (
-            "predictor_stream_bytes",
-            graphs::stream_bytes(&pred_frame.runner.graph).to_string(),
-        ),
+        ("predictor_stream_bytes", pred_stream_bytes.to_string()),
         (
             "predictor_stream_ms",
             format!("{:.3}", pred_total / rows as f64),
@@ -3281,23 +3875,33 @@ fn speak_synthesis() -> Option<Synthesis> {
             format!("{:?}", &all_codes[0][..all_codes[0].len().min(16)]),
         ),
     ];
-    let peak = peak_rss();
-    // Every owner above is still live at this point: `peak_rss` is the process's
+    let peak = peak_bytes();
+    // Every owner above is still live at this point: `ru_maxrss` is the process's
     // high-water mark, so the record attributes the peak to whoever held it when it
     // was reached instead of summing plans that were never allocated whole, and
     // everything but this record is dropped on return — before the round trip loads
-    // the recogniser's own pair.
+    // the recogniser's own pair. The pool and the plan are read here, with the peak,
+    // so the row's three memory figures describe one moment of this half.
     let map_bytes = file_bytes(&pair.body.path) + file_bytes(&pair.sound.path);
+    let mem = Mem::of(peak, map_bytes);
+    // `host` is the process's own copies of the weights (`emit`'s cache: a fused blob,
+    // or host f32 the build dequantised), the figure neither the resident set nor the
+    // device pool names: the sound half's host image of the decoder is the largest thing
+    // this cell holds and it is measured here rather than inferred from the file's size.
+    // Every byte figure on this line is a whole count under the name and unit the record
+    // uses, and a counter that cannot be read fails the run rather than printing a word.
     println!(
-        "speak residency start_mb={} prefill_mb={} body_mb={} loop_graphs_mb={} \
-         sound_graphs_mb={} peak_mb={:.1} map_mb={:.1}",
-        mb(rss_start),
-        mb(rss_prefill),
-        mb(rss_body),
-        mb(rss_loop_graphs),
-        mb(rss_sound_graphs),
-        peak as f64 / 1e6,
-        map_bytes as f64 / 1e6,
+        "speak residency start_bytes={} prefill_bytes={} body_bytes={} loop_graphs_bytes={} \
+         sound_graphs_bytes={} loop_peak_bytes={} sound_peak_bytes={} host={} \
+         synthesis_peak_bytes={peak} map={map_bytes}",
+        speak_resident_at(rss_start, "start"),
+        speak_resident_at(rss_prefill, "prefill"),
+        speak_resident_at(rss_body, "body"),
+        speak_resident_at(rss_loop_graphs, "loop graphs"),
+        speak_resident_at(rss_sound_graphs, "sound graphs"),
+        peak_loop,
+        peak_sound,
+        crate::emit::host_cache_bytes() as u64,
     );
     let r = rlx_wgpu::gguf_gpu::route_counts();
     // The shape of the *last* one-row dispatch, not of every call: `per_row` counts
@@ -3308,7 +3912,7 @@ fn speak_synthesis() -> Option<Synthesis> {
             (s.cols_per_workgroup, s.threads_per_workgroup, s.workgroups)
         });
     println!(
-        "speak packed routes per_row={} host={} scratch={} grouped={} q1_0={} \
+        "speak packed routes per_row={} host_dequant={} scratch={} grouped={} q1_0={} \
          cols_per_workgroup={cols_per_wg} threads_per_workgroup={threads} \
          workgroups={workgroups}",
         r.per_row, r.host, r.scratch, r.grouped, r.q1_0_gemm,
@@ -3327,8 +3931,7 @@ fn speak_synthesis() -> Option<Synthesis> {
             warm_ms,
             passes,
         },
-        peak,
-        map_bytes,
+        mem,
         counters: (c.0 - c0.0, c.1 - c0.1),
     })
 }
@@ -3457,7 +4060,7 @@ fn embed(rows: usize) {
         passes: o.passes,
     };
     let c = graphs::device_counts();
-    let peak = peak_rss();
+    let peak = peak_bytes();
     drop(graph);
     drop(model);
     report::release_free();
@@ -3473,8 +4076,7 @@ fn embed(rows: usize) {
         &values,
         &phases,
         steps,
-        peak,
-        map_bytes,
+        Mem::of(peak, map_bytes),
         (c.0 - c0.0, c.1 - c0.1),
         0.0,
         (0.0, 0.0),
@@ -3486,6 +4088,10 @@ fn embed(rows: usize) {
 /// The longest pinned track: the whole multi-minute row, far past the 30 s the
 /// single-shot convention reads and past the encoder's own position table.
 const LONG_TRACK: &str = "speech/librivox/speech-librivox-0027.wav";
+/// The hour-scale inputs: each label with the length of audio it measures, in seconds. The
+/// parent names the label and the child that measures it ([`LONG_CHILD`]) builds the
+/// material to this length, so the two cannot disagree about what a row is.
+const LONG_INPUTS: [(&str, f64); 3] = [("1min", 60.0), ("30min", 1_800.0), ("60min", 3_600.0)];
 /// The constructed material's edge: a 10 ms window whose RMS is above `3e-3` is
 /// the excerpt's own beginning or end, so the trailing silence of the read is cut
 /// without cutting a phoneme.
@@ -3507,11 +4113,10 @@ const PASTE_GAPS_S: [f64; 4] = [1.024, 2.048, 1.536, 3.072];
 /// within one detector hop of the paste offsets, and the same signal at a different
 /// gain has to keep every boundary where it was — conditioning is time-preserving
 /// or the plan is wrong. The music pool's truth is its split: nothing in
-/// `instrumental/` may come back with a reliable transcript — a transcript the
-/// guards rejected is returned marked unreliable, beside its label, and counted
-/// rather than failed. Every region of every file is
-/// held to the same invariant: a text or a label, never a reliable transcript
-/// beside a label, and regions that tile the input.
+/// `instrumental/` may come back with a transcript, and the run fails on it: the
+/// guards never return a reading they refused, so any text over instrumental music
+/// is words invented over music. Every region of every file is held to the same
+/// invariant: a text or a label, never both, and regions that tile the input.
 ///
 /// What it does not establish. Word correctness — the pinned clip's two parity rows
 /// are reported, not gated: they count word positions that moved between two
@@ -3528,6 +4133,125 @@ const TRANSCRIBE_BAR_TOLERANCE_MS_PER_AUDIO_S: f64 = 103.0;
 /// The quality bar the same page states on its other headline figure: the share of the
 /// detector's marked speech that may come back with no transcript.
 const TRANSCRIBE_TEXTLESS_BAR_PCT: f64 = 2.0;
+/// The peak memory the three model cells are held to, in GiB: the figures the record
+/// carried for `listen` and `speak`, and for `transcribe` the listening cell's class plus
+/// its tagger. One table, because the table's rows and the prose beside them must name the
+/// same ceilings.
+const PEAK_CEILINGS: [(&str, f64); 3] = [("listen", 2.31), ("speak", 2.42), ("transcribe", 2.35)];
+
+/// The ceiling a cell is held to, in bytes — a policy stated in GiB, so it is converted here
+/// once — or `None` for a cell with none.
+fn peak_ceiling_bytes(cell: &str) -> Option<u64> {
+    PEAK_CEILINGS
+        .iter()
+        .find(|(name, _)| *name == cell)
+        .map(|(_, gib)| (gib * 1_073_741_824.0) as u64)
+}
+
+/// The quantum of the `human` figures the record prints: 0.01 GiB. A difference smaller
+/// than this is not one the printed numbers can state, so a reading within it of a ceiling
+/// is reported `at` it rather than under or over.
+const PEAK_QUANTUM_BYTES: u64 = 10_737_418;
+
+/// One process's high-water, and the process that took it: the label the record prints beside
+/// the reading — `run 2` of a cell's three, or the child that made the call (`1min`,
+/// `corpus cold`). A figure in a range is traceable to the row of the process it came from.
+#[derive(Debug)]
+struct PeakReading {
+    process: String,
+    bytes: u64,
+}
+
+/// The verdict a cell's own readings support, with the ceiling it is held to: `over` when the
+/// lowest reading is above the ceiling by more than [`PEAK_QUANTUM_BYTES`], `inside` when the
+/// highest is below it by more, and `at` otherwise — the readings meet the ceiling's 0.01 GiB
+/// band. Nothing outside `readings` enters it.
+fn peak_verdict(readings: &[PeakReading], cell: &str) -> Option<(&'static str, u64)> {
+    let ceiling = peak_ceiling_bytes(cell)?;
+    let low = readings.iter().map(|reading| reading.bytes).min()?;
+    let high = readings.iter().map(|reading| reading.bytes).max()?;
+    let verdict = if low > ceiling + PEAK_QUANTUM_BYTES {
+        "over"
+    } else if high + PEAK_QUANTUM_BYTES < ceiling {
+        "inside"
+    } else {
+        "at"
+    };
+    Some((verdict, ceiling))
+}
+
+/// A cell's peak in the record's table, in the one form every row uses: the reading the row is
+/// (the median of the cell's runs, or the transcription cell's own process), every reading its
+/// verdict compares — each named with the process that took it — and, for a cell that is held
+/// to one, the ceiling with the verdict those readings support. Numbers only: the column's
+/// header names the unit.
+fn peak_cell(own: &str, peak: u64, readings: &[PeakReading], cell: &str) -> String {
+    // A cell run three times prints its figure as the median *and* lists the run that took
+    // that value, under the run's own name: one reading, two labels, which is why the list
+    // repeats it.
+    let listed = readings
+        .iter()
+        .filter(|reading| reading.process != own)
+        .map(|reading| format!("{} {}", reading.process, peak_gib(reading.bytes)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let base = format!("{own} {} (readings {listed})", peak_gib(peak));
+    match peak_verdict(readings, cell) {
+        Some((verdict, ceiling)) => format!("{base} / {} {verdict}", peak_gib(ceiling)),
+        None => base,
+    }
+}
+
+/// The sentence an `at` verdict carries: `at` covers three shapes of reading set — every
+/// reading at or above the ceiling within the printed quantum, every one at or below it, and a
+/// set that straddles it — so the sentence names the shape these readings show rather than
+/// asserting a case they do not.
+fn at_note(readings: &[PeakReading], ceiling: u64) -> String {
+    let below = readings
+        .iter()
+        .filter(|reading| reading.bytes < ceiling)
+        .count();
+    let above = readings
+        .iter()
+        .filter(|reading| reading.bytes > ceiling)
+        .count();
+    if below == 0 {
+        let low = readings
+            .iter()
+            .map(|reading| reading.bytes)
+            .min()
+            .expect("a verdict is computed over a non-empty reading list");
+        format!(
+            ". No reading is below it and the lowest, {}, is no more than the 0.01 GiB these \
+             figures resolve above it: that is reported as at it",
+            gib_text(low)
+        )
+    } else if above == 0 {
+        let high = readings
+            .iter()
+            .map(|reading| reading.bytes)
+            .max()
+            .expect("a verdict is computed over a non-empty reading list");
+        format!(
+            ". No reading is above it and the highest, {}, is no more than the 0.01 GiB these \
+             figures resolve below it: that is reported as at it",
+            gib_text(high)
+        )
+    } else {
+        // Every reading the verdict covers is counted: a reading exactly on the ceiling is
+        // neither below nor above it, and the sentence names it rather than leaving it out.
+        let on_ceiling = readings.len() - below - above;
+        let on_text = if on_ceiling == 0 {
+            String::new()
+        } else {
+            format!(", {on_ceiling} on it")
+        };
+        format!(
+            ". Its readings fall on both sides of it — {below} below, {above} above{on_text} — \
+             so the row is reported at it"
+        )
+    }
+}
 
 fn transcribe_cell() {
     let started = report::Stopwatch::start();
@@ -3614,12 +4338,13 @@ fn transcribe_cell() {
     let (repo, revision, sha256) = crate::ced::CED_MODEL_SOURCE;
     transcribe_artefact(&ced_path, Some(sha256), &format!("{repo}@{revision}"));
 
-    // ── (0) a real 10 s and a real 30 s voice message, cold and warm ─
+    // ── (a) a real 10 s and a real 30 s voice message, cold and warm ─
     // The material is the first pinned speech recording long enough for both cuts; the
     // text each call returns is printed, so its correctness is visible rather than
-    // asserted. `cold` empties the device's shared weight buffer, loads the models
-    // inside the measurement and takes the call — no weights on the device when it
-    // starts — and `warm` is the same call on the transcriber the cold one left behind.
+    // asserted. `cold` is another process ([`COLD_CHILD`]): the models are opened
+    // inside its own measured span, so no mapping, host copy, device buffer or
+    // compiled graph of them exists when the call starts. `warm` is the same call on
+    // this one, whose models the pass below loads.
     let message_source = corpus
         .iter()
         .find(|(name, _)| name.starts_with("speech/"))
@@ -3634,54 +4359,13 @@ fn transcribe_cell() {
         if (samples as f64 / f64::from(crate::transcribe::RATE)) < seconds - 0.5 {
             continue;
         }
-        let audio = &message_audio[..samples];
-        // Cold: the models are loaded by the call, with the device's shared weight
-        // buffer emptied first so the compilations upload what they need.
-        rlx_wgpu::buffer::clear_shared_weights();
-        let t = report::Stopwatch::start();
-        let mut fresh = or_exit(
-            "the models",
-            load_transcriber(&pair.body.path, &pair.sound.path, &ced_path),
-        );
-        let load_ms = t.ms();
-        let t = report::Stopwatch::start();
-        let out = or_exit(
-            "the message",
-            fresh.transcribe(audio, crate::transcribe::RATE),
-        );
-        let call_ms = t.ms();
-        check_regions(&out, "the message");
-        let text = spoken(&out);
-        println!(
-            "transcribe message s={seconds:.0} pass=cold load_ms={load_ms:.1} call_ms={call_ms:.1} \
-             total_ms={:.1} audio_s={:.3} ms_per_audio_s={:.1} regions={} words={} text=\"{}\"",
-            load_ms + call_ms,
-            samples as f64 / f64::from(crate::transcribe::RATE),
-            (load_ms + call_ms) / seconds,
-            out.regions.len(),
-            text.split_whitespace().count(),
-            prefix(&text),
-        );
-        let t = report::Stopwatch::start();
-        let out = or_exit(
-            "the message",
-            fresh.transcribe(audio, crate::transcribe::RATE),
-        );
-        let warm_ms = t.ms();
-        check_regions(&out, "the message");
-        let text = spoken(&out);
-        println!(
-            "transcribe message s={seconds:.0} pass=warm call_ms={warm_ms:.1} audio_s={:.3} \
-             ms_per_audio_s={:.1} regions={} words={} text=\"{}\"",
-            samples as f64 / f64::from(crate::transcribe::RATE),
-            warm_ms / seconds,
-            out.regions.len(),
-            text.split_whitespace().count(),
-            prefix(&text),
-        );
+        cold_row(&format!("{seconds:.0}"));
     }
+    // The cold process's own rows, forwarded exactly as it printed them: a figure
+    // measured elsewhere must not be reformatted into one measured here.
+    cold_row("corpus");
 
-    // ── (a) the pinned clip's parity with the single-shot answer ─────
+    // ── (b) the pinned clip's parity with the single-shot answer ─────
     // The clip the listen cell reads: the same file, at the same offset
     // (`STAND_ASR_OFFSET`, 0 unless a run names another recording) and the same
     // length, so the two surfaces' answers describe the same audio.
@@ -3706,10 +4390,10 @@ fn transcribe_cell() {
     // The segments the comparison covers, beside it: the segmented call transcribes
     // the speech spans it detects, so its text describes less audio than the
     // single-shot read of the same file, and the row says how much.
-    let covered = transcriber.costs().speech_s;
+    let covered = transcriber.costs().covered_s;
     println!(
         "transcribe parity moved={moved} words={produced} pinned={pinned_words} same_count={} \
-         clip_s={:.3} transcribed_s={covered:.3} text=\"{}\"",
+         clip_s={:.3} covered_s={covered:.3} text=\"{}\"",
         produced == pinned_words,
         pinned.duration_s(),
         prefix(&segmented),
@@ -3749,7 +4433,7 @@ fn transcribe_cell() {
         None => println!("transcribe parity-span span_s=0 moved=0 words=0 single=0"),
     }
 
-    // ── (b) boundary material whose truth is the construction ───────
+    // ── (c) boundary material whose truth is the construction ───────
     // The excerpt is the pinned clip as it is read — before `prepare_speech`
     // conditions it, so its edges are the recording's own — trimmed to those edges
     // and cut to the detector's hop, so every paste offset is on its grid.
@@ -3848,13 +4532,16 @@ fn transcribe_cell() {
     // lifts to `host::SPEECH_TARGET` must tile identically. The two arms condition to
     // different levels by construction, so this compares two levels of one signal
     // rather than one buffer read twice.
-    let peak = signal
+    // The boundary test's own amplitude, named for what it is: in this cell every other
+    // `peak` is a resident-set high-water, and a bare `peak` in a format string here once
+    // published this figure as one.
+    let amplitude = signal
         .iter()
         .fold(0f32, |most, value| most.max(value.abs()));
     let untouched = (crate::host::SPEECH_FLOOR + crate::host::SPEECH_TARGET) / 2.0;
     let steady_copy: Vec<f32> = signal
         .iter()
-        .map(|value| value * (untouched / peak))
+        .map(|value| value * (untouched / amplitude))
         .collect();
     let steady = or_exit(
         "the steady copy",
@@ -3902,10 +4589,14 @@ fn transcribe_cell() {
         );
     }
 
-    // ── (c) the music pool and the song rule ────────────────────────
+    // ── (d) the music pool and the song rule ────────────────────────
     let (mut music_audio_s, mut music_wall_s) = (0f64, 0f64);
     let mut music_suppressed_s = 0f64;
-    let (mut instrumental_any_text, mut vocal_reliable) = (0usize, 0usize);
+    // The pool's chunks, and how many of them had the declared language in their prompt:
+    // the rest ran the one-shot prompt, so the split is what says how much of the pool the
+    // language gate reached at all.
+    let (mut music_chunks, mut music_declared) = (0usize, 0usize);
+    let (mut instrumental_any_text, mut vocal_read) = (0usize, 0usize);
     for (clip, path) in music::CLIPS.iter().zip(&clips) {
         let name = clip.path;
         let read = report::Stopwatch::start();
@@ -3923,52 +4614,43 @@ fn transcribe_cell() {
         music_audio_s += audio_s;
         music_wall_s += wall_ms / 1000.0;
         music_suppressed_s += c.suppressed_s;
+        music_chunks += c.chunks;
+        music_declared += c.declared;
         let text = spoken(&out);
         let transcribed = !text.is_empty();
         let labels = labels_of(&out);
         println!(
             "transcribe music {name} audio_s={audio_s:.2} regions={} text_chars={} labels={labels} \
-             suppressed_s={:.1} read_ms={read_ms:.1} wall_ms={wall_ms:.1} s_per_audio_s={:.4}",
+             suppressed_s={:.1} read_ms={read_ms:.1} wall_ms={wall_ms:.1} call_ms_per_audio_s={:.1}",
             out.regions.len(),
             text.chars().count(),
             c.suppressed_s,
-            wall_ms / 1000.0 / audio_s,
+            wall_ms / audio_s,
         );
         if name.starts_with("instrumental/") {
-            // The defect the pool exists to catch is a transcript the guards
-            // *trust* here. A rejected one is the settled contract: the transcript
-            // is returned anyway, marked `reliable: false`, beside the region's
-            // label, so it is counted and not failed. A region with no text has no
-            // label missing — `check_regions` already holds every region to a text or
-            // a label.
-            let trusted = out
-                .regions
-                .iter()
-                .any(|region| region.text.is_some() && region.reliable);
+            // The gate: instrumental music must not come back with words. Every text
+            // the call returns is a reading the guards stand behind — a refused one is
+            // never returned — so any text here is a transcript over music, and the run
+            // fails on it rather than reporting it as an observation.
             instrumental_any_text += usize::from(transcribed);
-            if trusted {
+            if transcribed {
                 cell_failed!(
-                    "cell transcribe — {name} is instrumental and came back with a reliable \
+                    "cell transcribe — {name} is instrumental and came back with a \
                      transcript: \"{}\"",
                     prefix(&text)
                 );
             }
         } else {
-            let reliable = out
-                .regions
-                .iter()
-                .filter(|region| region.text.is_some() && region.reliable)
-                .count();
-            // The aggregate counts clips whose transcript survived the guards: a
-            // clip that only produced a loop is the `transcribed=false` row beside
-            // it, not a transcript the pool delivered.
-            vocal_reliable += usize::from(reliable > 0);
-            // No vocal clip may come back empty: `check_regions` above already
-            // holds every region to a text or a label, and the row says which way
-            // each clip went — a solfège clip with no transcript is not a miss.
+            let read = out.regions.iter().filter(|region| region.read).count();
+            // The aggregate counts clips whose transcript survived the guards: a clip
+            // that only produced a loop is the `transcribed=false` row beside it.
+            vocal_read += usize::from(read > 0);
+            // No vocal clip may come back empty: `check_regions` above already holds
+            // every region to a text or a label, and the row says which way each clip
+            // went — a solfège clip with no transcript is not a miss.
             println!(
-                "transcribe music-report {name} transcribed={transcribed} \
-                 reliable_regions={reliable} suppressed_s={:.1} labels={labels} text=\"{}\"",
+                "transcribe music-report {name} transcribed={transcribed} read_regions={read} \
+                 suppressed_s={:.1} labels={labels} text=\"{}\"",
                 c.suppressed_s,
                 prefix(&text)
             );
@@ -3982,13 +4664,24 @@ fn transcribe_cell() {
     // which is what tells the rule's verdict from the recogniser's.
     println!(
         "transcribe music-total clips={} audio_s={music_audio_s:.1} wall_s={music_wall_s:.1} \
-         s_per_audio_s={:.4} suppressed_s={music_suppressed_s:.1} \
-         instrumental_any_text={instrumental_any_text} vocal_reliable={vocal_reliable}",
+         call_ms_per_audio_s={:.1} suppressed_s={music_suppressed_s:.1} \
+         declared_chunks={music_declared} chunks={music_chunks} \
+         instrumental_any_text={instrumental_any_text} vocal_read={vocal_read}",
         clips.len(),
-        music_wall_s / music_audio_s,
+        music_wall_s * 1000.0 / music_audio_s,
     );
+    println!(
+        "transcribe peak phase=music process=cell moment_peak_bytes={} weights={} host={}",
+        peak_bytes(),
+        report::human(rlx_wgpu::buffer::shared_weight_bytes() as u64),
+        crate::emit::host_cache_bytes() as u64,
+    );
+    // Returning the pools' freed pages before the next phase allocates: a high-water is a
+    // high-water, but pages an earlier phase freed and the allocator kept are pages the
+    // next phase would touch again on top of what it needs.
+    report::release_free();
 
-    // ── (e) the corpus, with (f) on the same pass and (g) inside it ──
+    // ── (e) the corpus, and the longest track inside the same pass ──
     // The headline: one call per file, hand-over to text, with every step the text
     // cannot exist without inside it — the file read, the gain and resample, the mask,
     // the tagger, the cutting, every compilation the call needs, the recognition
@@ -3996,60 +4689,35 @@ fn transcribe_cell() {
     // transcriber loaded inside the measurement (the pass's cold figure); the rest run
     // on it warm.
     let mut corpus_audio_s = 0f64;
-    let mut corpus_speech_s = 0f64;
+    let mut corpus_covered_s = 0f64;
     let mut corpus_wall_ms = 0f64;
     let mut corpus_read_ms = 0f64;
     let (mut regions, mut text_regions, mut label_regions) = (0usize, 0usize, 0usize);
     let mut costs = crate::transcribe::Costs::default();
     let (mut corpus_masked_s, mut corpus_uncovered_s) = (0f64, 0f64);
-    let (mut speech_pool_speech_s, mut speech_pool_textless_s, mut speech_pool_flagged_s) =
+    let (mut speech_pool_covered_s, mut speech_pool_textless_s, mut speech_pool_discarded_s) =
         (0f64, 0f64, 0f64);
     let (mut speech_pool_textless_voiced_s, mut speech_pool_textless_other_s) = (0f64, 0f64);
     let mut speech_pool_suppressed_s = 0f64;
     let mut seams = 0usize;
     let (mut speech_pool_chunks, mut speech_pool_textless_chunks) = (0usize, 0usize);
-    let (mut noise_pool_speech_s, mut noise_pool_textless_s) = (0f64, 0f64);
-    let (mut noise_pool_marked_s, mut noise_pool_suppressed_s) = (0f64, 0f64);
-    let (mut invented_text, mut invented_reliable, mut invented_marked, mut invented_chars) =
-        (0usize, 0usize, 0usize, 0usize);
+    // Chunks of the speech pool whose prompt carried the declared language, so the row can
+    // print how the two failure modes split: a chunk told the language and one left to the
+    // model's own answer do not fail the same way.
+    let mut speech_pool_declared = 0usize;
+    let (mut noise_pool_covered_s, mut noise_pool_textless_s) = (0f64, 0f64);
+    let (mut noise_pool_masked_s, mut noise_pool_suppressed_s) = (0f64, 0f64);
+    let (mut invented_text, mut invented_chars) = (0usize, 0usize);
     let mut invented_examples: Vec<String> = Vec::new();
+    // What the guards refused on the speech pool, with the audio each spoke for: the
+    // line between a reading and the model's placeholder is reviewed from these, not
+    // taken on trust from a total.
+    let mut refused_examples: Vec<(String, f64, String)> = Vec::new();
     // What the tagger says the noise files are: the pool the "no speech" label
     // has to be plausible on, counted over every labelled region of it.
     let mut noise_labels: std::collections::BTreeMap<String, usize> = Default::default();
     let mut long: Option<(f64, f64, usize, f64, f64, f64)> = None;
-    // The pass's cold figure: the first file, with the models loaded inside the
-    // measurement — and with the device's shared weight buffer emptied first, so the
-    // compilations really do upload the weights: an entry left by the calls above (the
-    // messages, the parity clip, the music pool) would otherwise price the upload at
-    // nothing and the figure would not be the cold one it says it is.
-    drop(transcriber);
-    rlx_wgpu::buffer::clear_shared_weights();
-    let (cold_name, cold_path) = match corpus.first() {
-        Some((name, path)) => (*name, path.clone()),
-        None => cell_failed!("cell transcribe — the pinned corpus is empty"),
-    };
-    let t = report::Stopwatch::start();
-    let mut transcriber = or_exit(
-        "the models",
-        load_transcriber(&pair.body.path, &pair.sound.path, &ced_path),
-    );
-    let cold_load_ms = t.ms();
-    let t = report::Stopwatch::start();
-    let cold = or_exit(cold_name, transcriber.transcribe_file(&cold_path));
-    let cold_call_ms = t.ms();
-    check_regions(&cold, cold_name);
-    let cold_s = cold.duration_s();
-    let cold_text = spoken(&cold);
-    println!(
-        "transcribe corpus-cold file={cold_name} load_ms={cold_load_ms:.1} call_ms={cold_call_ms:.1} \
-         audio_s={cold_s:.1} ms_per_audio_s={:.1} words={} text=\"{}\"",
-        (cold_load_ms + cold_call_ms) / cold_s,
-        cold_text.split_whitespace().count(),
-        prefix(&cold_text),
-    );
     for (name, path) in &corpus {
-        // The cold call above already read this file through the same path; the pass
-        // reads it again so every row is the same measurement.
         let t = report::Stopwatch::start();
         let out = or_exit(name, transcriber.transcribe_file(path));
         let wall_ms = t.ms();
@@ -4061,7 +4729,7 @@ fn transcribe_cell() {
         corpus_audio_s += seconds;
         corpus_wall_ms += wall_ms;
         corpus_read_ms += c.read_ms;
-        corpus_speech_s += c.speech_s;
+        corpus_covered_s += c.covered_s;
         corpus_masked_s += c.masked_s;
         corpus_uncovered_s += c.uncovered_s;
         regions += out.regions.len();
@@ -4092,45 +4760,51 @@ fn transcribe_cell() {
             // audio there is, which is what tells lost speech from the detector's
             // own artifact. A file that lost any speech is printed on its own row
             // below, so the aggregate can be attributed rather than taken on trust.
-            speech_pool_speech_s += c.speech_s;
+            speech_pool_covered_s += c.covered_s;
             speech_pool_textless_s += c.textless_s;
             speech_pool_textless_voiced_s += c.textless_voiced_s;
             speech_pool_textless_other_s += c.textless_other_s;
             speech_pool_suppressed_s += c.suppressed_s;
-            speech_pool_flagged_s += c.flagged_s;
+            speech_pool_discarded_s += c.discarded_s;
+            for (seconds, text) in &c.refused {
+                if refused_examples.len() < crate::transcribe::REFUSAL_SAMPLES {
+                    refused_examples.push((name.to_string(), *seconds, prefix(text)));
+                }
+            }
             speech_pool_chunks += c.chunks;
+            speech_pool_declared += c.declared;
             speech_pool_textless_chunks += c.textless_chunks;
             // A region that still begins with the words the region before it ended
             // with carries one of them twice, which the `seams` row counts.
             seams += seam_pairs(&out);
-            if c.textless_s > 0.0 {
-                println!(
-                    "transcribe textless-file {name} audio_s={seconds:.1} chunks={} \
-                     textless_chunks={} textless_s={:.1} labelled_voiced_s={:.1} \
-                     labelled_other_s={:.1} e2e_ms={wall_ms:.1} labels={}",
-                    c.chunks,
-                    c.textless_chunks,
-                    c.textless_s,
-                    c.textless_voiced_s,
-                    c.textless_other_s,
-                    textless_labels(&out),
-                );
-            }
+            // This file's own share, so the aggregate can be read as a distribution
+            // rather than taken on trust: the bar applies to the pool, and a per-file
+            // percentage against the same bar says which file carries the residue.
+            // Printed for every file, not only the ones that lost speech, so a zero is a
+            // measurement rather than an absence.
+            let pct = 100.0 * c.textless_s / c.covered_s.max(f64::MIN_POSITIVE);
+            println!(
+                "transcribe textless-file {name} audio_s={seconds:.1} chunks={} \
+                 textless_chunks={} textless_s={:.1} textless_pct={pct:.2} \
+                 textless_bar_pct={TRANSCRIBE_TEXTLESS_BAR_PCT:.2} \
+                 textless_voiced_s={:.1} textless_other_s={:.1} e2e_ms={wall_ms:.1} labels={}",
+                c.chunks,
+                c.textless_chunks,
+                c.textless_s,
+                c.textless_voiced_s,
+                c.textless_other_s,
+                textless_labels(&out),
+            );
         } else {
-            noise_pool_speech_s += c.speech_s;
+            noise_pool_covered_s += c.covered_s;
             noise_pool_textless_s += c.textless_s;
-            noise_pool_marked_s += c.masked_s;
+            noise_pool_masked_s += c.masked_s;
             noise_pool_suppressed_s += c.suppressed_s;
             for region in &out.regions {
                 let Some(text) = region.text.as_deref() else {
                     continue;
                 };
                 invented_text += 1;
-                if region.reliable {
-                    invented_reliable += 1;
-                } else {
-                    invented_marked += 1;
-                }
                 invented_chars += text.trim().chars().count();
                 if invented_examples.len() < 3 {
                     invented_examples.push(prefix(text));
@@ -4144,24 +4818,108 @@ fn transcribe_cell() {
         }
     }
     let minutes = corpus_audio_s / 60.0;
+    // One rounding for the cell's wall time: the `e2e` row, the unit row's `run_ms` and the
+    // table's re-derivation of it all read this one figure, so one measurement cannot print as
+    // two numbers a display digit apart.
+    let corpus_wall_ms = printed(corpus_wall_ms, 1);
     let speech_files = corpus
         .iter()
         .filter(|(name, _)| name.starts_with("speech/"))
         .count();
     let noise_files = corpus.len() - speech_files;
     println!(
-        "transcribe corpus files={} audio_s={corpus_audio_s:.1} speech_s={corpus_speech_s:.1} \
+        "transcribe corpus files={} audio_s={corpus_audio_s:.1} covered_s={corpus_covered_s:.1} \
          regions={regions} text_regions={text_regions} label_regions={label_regions} \
-         wall_s={:.1}",
+         wall_s={:.1} ladder={}",
         corpus.len(),
         corpus_wall_ms / 1000.0,
+        crate::transcribe::FRAME_RUNGS
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
     );
+    // Where the high-water was reached: the cell is one process and `ru_maxrss` covers
+    // all of it, so a reader has to be able to see which phase held the peak rather than
+    // attribute the whole cell's figure to the pass it is printed beside.
+    println!(
+        "transcribe peak phase=corpus process=cell moment_peak_bytes={} weights={} host={}",
+        peak_bytes(),
+        report::human(rlx_wgpu::buffer::shared_weight_bytes() as u64),
+        crate::emit::host_cache_bytes() as u64,
+    );
+    // The warm message rows, here and not before the pass: warm means the model bytes
+    // are in memory *and* the ladder's rungs are compiled, which is the state a later
+    // call in a live process finds. Taken first, every one of them would have paid the
+    // ladder's compiles and the figure would have been a cold one under a warm label.
+    for seconds in [10.0f64, 30.0] {
+        let samples =
+            ((seconds * f64::from(crate::transcribe::RATE)) as usize).min(message_audio.len());
+        if (samples as f64 / f64::from(crate::transcribe::RATE)) < seconds - 0.5 {
+            continue;
+        }
+        // The warm row is the median of the same three runs its cold twin is: one reading
+        // cannot say what the instrument resolves, and the two rows are read beside each
+        // other.
+        let mut runs: Vec<(
+            f64,
+            crate::transcribe::Costs,
+            crate::transcribe::Transcription,
+        )> = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let t = report::Stopwatch::start();
+            let out = or_exit(
+                "the message",
+                transcriber.transcribe(&message_audio[..samples], crate::transcribe::RATE),
+            );
+            let ms = t.ms();
+            check_regions(&out, "the message");
+            runs.push((ms, transcriber.costs().clone(), out));
+        }
+        let times: Vec<f64> = runs.iter().map(|(ms, ..)| *ms).collect();
+        let Some((middle, warm_ms, spread_ms)) = median_run(&times) else {
+            cell_failed!("cell transcribe — the {seconds}-second message produced no run");
+        };
+        // The figures of the row whose time is the median, so one row describes one run.
+        let (_, c, out) = &runs[middle];
+        let text = spoken(out);
+        // The cell's high-water as the row is taken: the process the row's `process=cell` names,
+        // not this call's, and never a figure left to an implicit capture. It is a moment of a
+        // process that prints its final reading later, so it carries the moment's own name.
+        let cell_peak = peak_bytes();
+        println!(
+            "transcribe message s={seconds:.0} pass=warm process=cell call_ms={warm_ms:.1} \
+             warm_spread_ms={spread_ms:.1} runs={RUNS} \
+             audio_s={:.3} call_ms_per_audio_s={:.1} bar_ms_per_audio_s={TRANSCRIBE_BAR_MS_PER_AUDIO_S:.0} \
+             bar_tolerance_ms_per_audio_s={TRANSCRIBE_BAR_TOLERANCE_MS_PER_AUDIO_S:.0} regions={} \
+             words={} chunks={} rungs={} compiles={} build_ms={:.1} recognise_ms={:.1} \
+             moment_peak_bytes={cell_peak} \
+             gated=false text=\"{}\"",
+            samples as f64 / f64::from(crate::transcribe::RATE),
+            warm_ms / seconds,
+            out.regions.len(),
+            text.split_whitespace().count(),
+            c.chunks,
+            c.shapes,
+            c.compiles,
+            c.build_ms,
+            c.recognise_ms,
+            prefix(&text),
+        );
+    }
+
     // The headline figure: everything the call does, from hand-over to text, per second
     // of audio. Every other row of this cell is a breakdown for the agents that
-    // optimise, and none of them is the recognition number.
+    // optimise, and none of them is the recognition number. `gated=false`: the bar is
+    // stated beside the figure and nothing in this run fails on it. `covered_s` is the
+    // seconds the passes covered over the whole corpus, the noise pool included — not the
+    // speech pool's `speech_pool_s`, which is the `speech` row's own denominator.
     println!(
         "transcribe e2e scope=corpus files={} audio_s={corpus_audio_s:.1} wall_ms={:.1} \
-         ms_per_audio_s={:.1} speech_s={corpus_speech_s:.1}",
+         call_ms_per_audio_s={:.1} covered_s={corpus_covered_s:.1} \
+         bar_ms_per_audio_s={TRANSCRIBE_BAR_MS_PER_AUDIO_S:.0} \
+         bar_tolerance_ms_per_audio_s={TRANSCRIBE_BAR_TOLERANCE_MS_PER_AUDIO_S:.0} \
+         gated=false",
         corpus.len(),
         corpus_wall_ms,
         corpus_wall_ms / corpus_audio_s,
@@ -4177,7 +4935,7 @@ fn transcribe_cell() {
         "transcribe breakdown read_ms_per_audio_min={:.1} mask_plan_ms_per_audio_min={:.1} \
          tagger_ms_per_audio_min={:.1} compile_ms_per_audio_min={:.1} \
          passes_ms_per_audio_min={:.1} unattributed_ms_per_audio_min={:.1} \
-         read_ms={:.1} chunks={} shapes={} windows={}",
+         read_ms={:.1} chunks={} rungs_per_file_summed={} windows={}",
         costs.read_ms / minutes,
         costs.segment_ms / minutes,
         costs.tag_ms / minutes,
@@ -4191,22 +4949,27 @@ fn transcribe_cell() {
     );
     // The guard and segmentation numbers this run was taken with: the direction
     // requirement ("filter more rather than less") is a choice, and a choice that is
-    // not printed cannot be reviewed.
+    // not printed cannot be reviewed. `speech_spread_db` is the loudness spread below
+    // which a chunk's prompt declares no language, and the two filler limits are the
+    // count rule that decides whether a transcript is returned at all — the knobs that
+    // decide both bars.
     println!(
         "transcribe tuning min_speech_hops={} merge_gap_hops={} hangover_hops={} \
-         cut_s={} cut_early_s={:.3} cut_late_s={:.3} cut_slack_pct={} \
-         frame_alignment={} min_chunk_s={:.1} repeat_gram={} repeat_limit={} \
-         word_repeat_limit={} density_ceiling={:.1} chunk_tokens_per_s={:.1} min_chunk_tokens={}",
+         cut_s={} cut_early_s={:.3} frame_rungs={} min_chunk_s={:.1} \
+         repeat_gram={} repeat_limit={} word_repeat_limit={} density_ceiling={:.1} \
+         chunk_tokens_per_s={:.1} min_chunk_tokens={} speech_spread_db={:.1} \
+         filler_words={} filler_seconds={:.1}",
         crate::transcribe::MIN_SPEECH_HOPS,
         crate::transcribe::MERGE_GAP_HOPS,
         crate::transcribe::HANGOVER_HOPS,
         crate::transcribe::CUT_SECONDS,
         crate::transcribe::CUT_EARLY_HOPS as f64 * crate::vad::HOP_LENGTH as f64
             / f64::from(crate::transcribe::RATE),
-        crate::transcribe::CUT_LATE_HOPS as f64 * crate::vad::HOP_LENGTH as f64
-            / f64::from(crate::transcribe::RATE),
-        crate::transcribe::CUT_SLACK_PCT,
-        crate::transcribe::FRAME_ALIGNMENT,
+        crate::transcribe::FRAME_RUNGS
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
         crate::transcribe::MIN_CHUNK_SAMPLES as f64 / f64::from(crate::transcribe::RATE),
         crate::transcribe::REPEAT_GRAM,
         crate::transcribe::REPEAT_LIMIT,
@@ -4214,6 +4977,9 @@ fn transcribe_cell() {
         crate::transcribe::DENSITY_CEILING,
         crate::transcribe::CHUNK_TOKENS_PER_S,
         crate::transcribe::MIN_CHUNK_TOKENS,
+        crate::transcribe::SPEECH_SPREAD_DB,
+        crate::transcribe::FILLER_WORDS,
+        crate::transcribe::FILLER_SECONDS,
     );
     // The speech pool, where the quality bar has an answer: how much of the detected
     // speech came back with no transcript, and how much came back with text the guards
@@ -4226,47 +4992,69 @@ fn transcribe_cell() {
     // detector's marks are mostly false positives, so a textless second is the
     // detector's, not lost speech, and `noise_suppressed_s` says how many marked seconds
     // the tagger's labels took out of it.
-    let textless_pct = speech_pool_textless_s / speech_pool_speech_s.max(f64::MIN_POSITIVE) * 100.0;
+    let textless_pct =
+        speech_pool_textless_s / speech_pool_covered_s.max(f64::MIN_POSITIVE) * 100.0;
     println!(
-        "transcribe speech files={speech_files} speech_s={speech_pool_speech_s:.1} \
-         chunks={speech_pool_chunks} textless_s={:.1} textless_pct={textless_pct:.2} \
+        "transcribe speech files={speech_files} speech_pool_s={speech_pool_covered_s:.1} \
+         chunks={speech_pool_chunks} declared_chunks={speech_pool_declared} \
+         undeclared_chunks={} textless_s={:.1} textless_pct={textless_pct:.2} \
          textless_bar_pct={TRANSCRIBE_TEXTLESS_BAR_PCT:.2} \
-         textless_gap_pct={:.2} \
+         textless_gap_pct={:.2} gated=false \
          textless_chunks={speech_pool_textless_chunks} \
          textless_voiced_s={speech_pool_textless_voiced_s:.1} \
          textless_other_s={speech_pool_textless_other_s:.1} \
-         suppressed_s={speech_pool_suppressed_s:.1} flagged_s={:.1} flagged_pct={:.2} \
-         noise_files={noise_files} noise_marked_s={noise_pool_marked_s:.1} \
+         suppressed_s={speech_pool_suppressed_s:.1} discarded_s={:.1} discarded_pct={:.2} \
+         noise_files={noise_files} noise_masked_s={noise_pool_masked_s:.1} \
          noise_suppressed_s={noise_pool_suppressed_s:.1} \
-         noise_speech_s={noise_pool_speech_s:.1} noise_textless_s={noise_pool_textless_s:.1}",
+         noise_covered_s={noise_pool_covered_s:.1} noise_textless_s={noise_pool_textless_s:.1}",
+        speech_pool_chunks.saturating_sub(speech_pool_declared),
         speech_pool_textless_s,
         textless_pct - TRANSCRIBE_TEXTLESS_BAR_PCT,
-        speech_pool_flagged_s,
-        speech_pool_flagged_s / speech_pool_speech_s.max(f64::MIN_POSITIVE) * 100.0,
+        speech_pool_discarded_s,
+        speech_pool_discarded_s / speech_pool_covered_s.max(f64::MIN_POSITIVE) * 100.0,
     );
     // A seam between two adjacent transcripts that shares three or more whole words: a
-    // reading carried twice, which is what a lead-in or a piece join could once produce.
-    // The plan gives each chunk disjoint audio, so this is a reading to look at rather
-    // than a state the path can be in — it is printed beside the pool's figures, not
-    // held against the round.
+    // reading carried twice, which is a wrong answer, so the run fails on it instead of
+    // printing it as an observation.
     println!(
-        "transcribe seams seams={seams} seam_words={}",
+        "transcribe seams seams={seams} seam_words={} gated=true",
         crate::transcribe::SEAM_WORDS
     );
+    if seams > 0 {
+        cell_failed!(
+            "cell transcribe — {seams} pair(s) of adjacent regions carry the same whole words: a \
+             reading is returned twice"
+        );
+    }
     // The loss in audio, which no paraphrase can hide: the seconds the detector
     // marked speech that no recognition pass covered.
     println!(
-        "transcribe coverage masked_s={corpus_masked_s:.1} covered_s={corpus_speech_s:.1} \
+        "transcribe coverage masked_s={corpus_masked_s:.1} covered_s={corpus_covered_s:.1} \
          uncovered_s={corpus_uncovered_s:.1} uncovered_pct={:.2}",
         100.0 * corpus_uncovered_s / corpus_masked_s.max(f64::MIN_POSITIVE),
     );
     println!(
         "transcribe invented files={noise_files} text_regions={invented_text} \
-         reliable_regions={invented_reliable} marked_regions={invented_marked} \
-         chars={invented_chars}"
+         chars={invented_chars} gated=true"
     );
+    if invented_text > 0 {
+        cell_failed!(
+            "cell transcribe — {invented_text} region(s) of the noise pool came back with text \
+             ({invented_chars} chars): the pool holds no speech and a transcript over it is \
+             invented"
+        );
+    }
     for (i, example) in invented_examples.iter().enumerate() {
         println!("transcribe invented-example {} text=\"{example}\"", i + 1);
+    }
+    // What the guards refused over the speech pool, each with its own audio and file: a
+    // placeholder the guards caught reads as one, and a real short utterance the count
+    // rule also caught is visible here rather than buried in a total.
+    for (i, (file, seconds, text)) in refused_examples.iter().enumerate() {
+        println!(
+            "transcribe refused-example {} file={file} seconds={seconds:.2} text=\"{text}\"",
+            i + 1
+        );
     }
     // One entry per label, `;`-separated because several AudioSet names carry a comma
     // of their own and a space is the row's own separator.
@@ -4279,8 +5067,17 @@ fn transcribe_cell() {
     // against the list that made it rather than guessed at.
     println!(
         "transcribe label-rule offered={} labels={}",
-        crate::transcribe::WORD_LABELS.len(),
-        crate::transcribe::WORD_LABELS.join(";"),
+        crate::transcribe::word_labels().count(),
+        crate::transcribe::word_labels()
+            .collect::<Vec<_>>()
+            .join(";"),
+    );
+    // The narrower list: where the prompt carries a declared language instead of the
+    // recogniser's own answer, and where it does not.
+    println!(
+        "transcribe speech-labels offered={} labels={}",
+        crate::transcribe::SPEECH_LABELS.len(),
+        crate::transcribe::SPEECH_LABELS.join(";"),
     );
     println!(
         "transcribe noise-labels files={noise_files} labels={}",
@@ -4291,7 +5088,7 @@ fn transcribe_cell() {
         }
     );
 
-    // ── (g) one multi-minute track, whole ───────────────────────────
+    // ── (f) one multi-minute track, whole ───────────────────────────
     let (read_ms, long_s, long_regions, long_build_ms, long_recognise_ms, long_wall_s) = match long
     {
         Some(entry) => entry,
@@ -4300,34 +5097,80 @@ fn transcribe_cell() {
     println!(
         "transcribe long file={LONG_TRACK} audio_s={long_s:.1} regions={long_regions} \
          read_ms={read_ms:.1} build_ms={long_build_ms:.1} passes_s={:.1} wall_s={long_wall_s:.1} \
-         s_per_audio_s={:.4} peak={}",
+         call_ms_per_audio_s={:.1} process=cell moment_peak_bytes={}",
         long_recognise_ms / 1000.0,
-        long_wall_s / long_s,
-        report::human(report::peak_rss()),
+        long_wall_s * 1000.0 / long_s,
+        peak_bytes(),
     );
 
-    // The unit row the table has for this cell. Its `cold` is the whole cell — the
-    // messages, the corpus pass, the music pool, the constructed material, the pinned
-    // clip's parity and the longest track — and its `run_ms` is the corpus pass alone:
-    // one call per file, hand-over to text, which is also what the `e2e` row beside it
-    // reports per second of audio. `map` is the three model files the cell binds, which
-    // is what it holds beyond the arenas its calls plan; there is no single graph here,
-    // so `arena` and `digest` are `-`. The rest of the row is the field set every other
-    // unit prints, taken the same way, so this row is read beside the others rather than
-    // as a shape of its own.
-    let cell_ms = started.ms();
+    // The memory the cell holds between calls, named apart from the input's own:
+    // the weight pool the device shares across every layout, the process's own kept copies
+    // of them, the model files it binds, the process's resident set and its high-water at this
+    // moment — the cell's final reading is the one its `unit` row prints when it has finished,
+    // under that name. A figure that cannot be measured fails this row rather than printing as
+    // zero. No arena figure: each rung's graphs have their own plan, and a sum of plans is not
+    // an allocation the peak contains.
+    let resident = match report::resident_rss() {
+        Some(bytes) => bytes,
+        None => cell_failed!("cell transcribe — the process's resident set cannot be read"),
+    };
+    let weights_bytes = rlx_wgpu::buffer::shared_weight_bytes() as u64;
+    let memory_peak = peak_bytes();
     let map_bytes = file_bytes(&pair.body.path)
         + file_bytes(&pair.sound.path)
         + file_bytes(&dir.join(crate::ced::CED_MODEL));
-    let peak = peak_rss();
+    println!(
+        "transcribe memory process=cell moment_peak_bytes={memory_peak} resident={} weights={} host={} \
+         map={map_bytes} ceiling_mib={} swap_ceiling_mib={}",
+        report::human(resident),
+        report::human(weights_bytes),
+        crate::emit::host_cache_bytes() as u64,
+        crate::guard::max_rss_mib(),
+        crate::guard::max_swap_growth_mib(),
+    );
+
+    // The residency this cell no longer needs before the hour-scale children run: each of
+    // them loads the models itself, and a cell that kept its pool and its compiled rungs
+    // across three such children would hold the machine's memory against them for nothing.
+    crate::release_process_memory();
+
+    // ── (g) hour-scale input: three calls, three processes ──────────
+    // The material is the pinned corpus itself, repeated to the length — real speech and
+    // real noise, no synthetic tone — and each length is one call in a process of its own
+    // ([`LONG_CHILD`]): this one holds the models and the cell's earlier work, so a
+    // reading here would be this cell's, not that call's. What the three show is the shape
+    // the product needs: the call completes, its regions tile the input, and the model side
+    // — the closed ladder and one copy of the weights — does not follow the length. Their
+    // peaks are a population of their own, stated apart from the message-size verdict,
+    // because each is a different call on a different length; and the two resident-set
+    // readings that give `retained` cannot resolve a difference at this granularity, which
+    // the record says rather than reading boundedness into it.
+    for (label, _) in LONG_INPUTS {
+        long_row(label);
+    }
+
+    // The unit row the table has for this cell. Its `cold_ms` is the whole cell — the messages,
+    // the corpus pass, the music pool, the constructed material, the pinned clip's parity, the
+    // hour-scale inputs (each a process of its own, whose wall time the span includes) and the
+    // longest track — and its `run_ms` is the corpus pass alone: one call per file, hand-over to
+    // text, which is also what the `e2e` row beside it reports per second of audio. `map` is the
+    // three model files the cell binds, `weights` the device's shared pool as the memory row
+    // above read it — before its release, so the two rows name the same pool — `arena` is `-`
+    // because the ladder's graphs each have a plan of their own and their sum is not an
+    // allocation this row can stand behind, and `digest` is `-` because no single graph is this
+    // cell's answer. The rest of the row is the field set every other unit prints, taken the same
+    // way, so this row is read beside the others rather than as a shape of its own. Its seconds
+    // are `covered_s` — `Costs::covered_s` over the corpus pass *and* the noise pool — while the
+    // `speech` row's `speech_pool_s` is the speech pool alone.
+    let cell_ms = started.ms();
+    let peak = peak_bytes();
     let counts = graphs::device_counts();
     println!(
-        "unit transcribe build_ms={:.3} run_ms={corpus_wall_ms:.3} peak={peak} cold_ms={cell_ms:.3} \
-         map={map_bytes} beyond_map={} file_over_rss={} arena=- submits={} waits={} at={} load={} \
-         digest=- speech_s={corpus_speech_s:.6}",
+        "unit transcribe build_ms={:.3} run_ms={corpus_wall_ms:.3} process_peak_bytes={peak} cold_ms={cell_ms:.3} \
+         map={map_bytes} arena=- weights={} submits={} waits={} at={} load={} \
+         digest=- covered_s={corpus_covered_s:.6}",
         costs.build_ms,
-        peak.saturating_sub(map_bytes),
-        map_bytes.saturating_sub(peak),
+        report::human(weights_bytes),
         counts.0 - counts_at_start.0,
         counts.1 - counts_at_start.1,
         now(),
@@ -4349,6 +5192,399 @@ fn transcribe_artefact(path: &std::path::Path, pinned: Option<&str>, source: &st
             .and_then(|name| name.to_str())
             .unwrap_or("-"),
         pinned.unwrap_or("-"),
+    );
+}
+
+/// Run one cold row in a child of its own ([`COLD_CHILD`]) and forward what it printed.
+/// A child that fails fails the cell: a headline figure with no measurement behind it is
+/// not a figure this record may carry.
+///
+/// A message row is taken [`RUNS`] times and the middle run is printed, with the spread
+/// beside it: a cold call pays every compile, every upload and every page fault of the
+/// ladder, so one sample of it moves by more than a second between runs of one tree — the
+/// median is the figure, and a single reading would be a coin toss presented as a number.
+/// The corpus-cold row is one sample because it is a five-minute call, and says so.
+fn cold_row(what: &str) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => cell_failed!("cell transcribe — the cold child's own path: {error}"),
+    };
+    // A message row is measured [`RUNS`] times, the corpus row once.
+    let runs = if what == "corpus" { 1 } else { RUNS };
+    let mut rows: Vec<String> = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let out = match std::process::Command::new(&exe)
+            .arg("0")
+            .env(COLD_CHILD, what)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            Ok(out) => out,
+            Err(error) => cell_failed!("cell transcribe — the cold child ({what}): {error}"),
+        };
+        if !out.status.success() {
+            if stopped_by_guard(&out.status) {
+                eprintln!(
+                    "stand: the cold child ({what}) was stopped by its own guard; the row it was \
+                     to take has no measurement"
+                );
+                std::process::exit(EXIT_STOPPED);
+            }
+            let error = String::from_utf8_lossy(&out.stderr);
+            cell_failed!(
+                "cell transcribe — the cold child ({what}) exited {}: {}",
+                out.status,
+                error.trim()
+            );
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let row = text
+            .lines()
+            .find(|line| line.starts_with("transcribe "))
+            .unwrap_or("")
+            .to_string();
+        if row.is_empty() {
+            cell_failed!("cell transcribe — the cold child ({what}) printed no row");
+        }
+        if runs == 1 {
+            println!("{row}");
+        }
+        rows.push(row);
+    }
+    if runs == 1 {
+        return;
+    }
+    // The row of the run whose `total_ms` is the median, so the figures of one row describe
+    // one run and add up, with the spread all three saw printed beside it. A run that printed
+    // no `total_ms` — or a value that is not a number — is named here rather than reaching a
+    // sort that cannot order it.
+    let total: Vec<f64> = rows
+        .iter()
+        .map(|row| field(row, "total_ms").unwrap_or(f64::NAN))
+        .collect();
+    for (run, value) in total.iter().enumerate() {
+        if !value.is_finite() {
+            cell_failed!(
+                "cell transcribe — the cold child ({what}) run {} printed no `total_ms`: {:?}",
+                run + 1,
+                rows[run]
+            );
+        }
+    }
+    let Some((middle, total_median, total_spread)) = median_run(&total) else {
+        cell_failed!(
+            "cell transcribe — the cold child ({what}) printed no `total_ms` to take a median of"
+        );
+    };
+    // The row the middle run printed, with its own `call_ms`/`load_ms`, so the four figures
+    // of one row describe one run and add up. Beside it, every run's high-water in run order:
+    // each is a reading of a process this run started, and the verdict that holds this cell's
+    // path takes all of them rather than the median alone.
+    let row = rows[middle].clone();
+    let peaks = rows
+        .iter()
+        .map(|row| {
+            field_text(row, "process_peak_bytes")
+                .with_context(|| "the cold child's row carries no `process_peak_bytes`")
+                .and_then(|value| {
+                    value
+                        .parse::<u64>()
+                        .with_context(|| format!("`{value}` is not a byte count"))
+                })
+        })
+        .collect::<anyhow::Result<Vec<u64>>>()
+        .unwrap_or_else(|error| {
+            cell_failed!("cell transcribe — the cold child ({what}) run's peak: {error:#}")
+        });
+    let trimmed: Vec<&str> = row
+        .split_whitespace()
+        .filter(|part| !part.starts_with("total_ms="))
+        .collect();
+    println!(
+        "{} total_ms={total_median:.1} runs={runs} total_spread_ms={total_spread:.1} \
+         process_peaks_bytes={}",
+        trimmed.join(" "),
+        peaks
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+}
+
+/// One cold call in a process of its own: the load and the call inside the measured
+/// span, and nothing of the models in the process before it. Prints the row the cell
+/// would have printed and exits.
+fn cold_child() {
+    let what = std::env::var(COLD_CHILD).unwrap_or_default();
+    // The same two limits a cell carries, and no lock: the parent holds it for the whole
+    // cell. A grandchild that loads 1.7 GiB and compiles the ladder is exactly the process
+    // the stop and the ceiling exist for.
+    let _guard = StandGuard::child();
+    let dir = match loader::models_dir() {
+        Ok(dir) => dir,
+        Err(e) => cell_failed!("cold transcribe — the model directory: {e:#}"),
+    };
+    let (body, sound) = match loader::pair_files(Role::Recognition) {
+        Some(pair) => pair,
+        None => cell_failed!("cold transcribe — no recognition pair is pinned"),
+    };
+    let ced = dir.join(crate::ced::CED_MODEL);
+    let corpus = match std::env::var_os(CORPUS_ENV) {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => cell_failed!("cold transcribe — {CORPUS_ENV} is not set"),
+    };
+    let Some((name, ..)) = crate::bench::REAL_AUDIO_FILES
+        .iter()
+        .find(|(name, ..)| name.starts_with("speech/"))
+    else {
+        cell_failed!("cold transcribe — the pinned corpus holds no speech recording");
+    };
+    // The audio is the caller's: read before the span starts, so the timed call is
+    // hand-over to text and nothing else.
+    let audio = read_whole(&corpus.join(name), name);
+    // `10`/`30` name a message's length and `corpus` the pass's first file. Anything else
+    // is refused here: a value this function cannot read must not become a silently
+    // different measurement.
+    let seconds: f64 = if what == "corpus" {
+        audio.len() as f64 / f64::from(crate::transcribe::RATE)
+    } else {
+        match what.parse::<f64>() {
+            Ok(seconds) if seconds > 0.0 && seconds.is_finite() => seconds,
+            _ => cell_failed!(
+                "cold transcribe — `{what}` is not a length in seconds and is not `corpus`"
+            ),
+        }
+    };
+    let samples = if what == "corpus" {
+        audio.len()
+    } else {
+        ((seconds * f64::from(crate::transcribe::RATE)) as usize).min(audio.len())
+    };
+    let t = report::Stopwatch::start();
+    let mut fresh = or_exit(
+        "the models",
+        load_transcriber(&dir.join(body), &dir.join(sound), &ced),
+    );
+    let load_ms = t.ms();
+    let t = report::Stopwatch::start();
+    let out = or_exit(
+        "the cold call",
+        fresh.transcribe(&audio[..samples], crate::transcribe::RATE),
+    );
+    let call_ms = t.ms();
+    check_regions(&out, "the cold call");
+    let text = spoken(&out);
+    let audio_s = samples as f64 / f64::from(crate::transcribe::RATE);
+    let peak = peak_bytes();
+    if what == "corpus" {
+        println!(
+            "transcribe corpus-cold file={name} process=own load_ms={load_ms:.1} \
+             call_ms={call_ms:.1} audio_s={audio_s:.1} total_ms_per_audio_s={:.1} \
+             bar_ms_per_audio_s={TRANSCRIBE_BAR_MS_PER_AUDIO_S:.0} \
+             bar_tolerance_ms_per_audio_s={TRANSCRIBE_BAR_TOLERANCE_MS_PER_AUDIO_S:.0} words={} \
+             process_peak_bytes={peak} gated=false text=\"{}\"",
+            (load_ms + call_ms) / audio_s,
+            text.split_whitespace().count(),
+            prefix(&text),
+        );
+    } else {
+        // The call's own build, printed beside it: a cold message pays every compile the
+        // ladder and the prompt's two lengths need, and a figure that does not say how much
+        // of it is build cannot be read against a warm call's.
+        let c = fresh.costs();
+        println!(
+            "transcribe message s={seconds:.0} pass=cold process=own load_ms={load_ms:.1} \
+             call_ms={call_ms:.1} total_ms={:.1} audio_s={audio_s:.3} \
+             total_ms_per_audio_s={:.1} \
+             bar_ms_per_audio_s={TRANSCRIBE_BAR_MS_PER_AUDIO_S:.0} \
+             bar_tolerance_ms_per_audio_s={TRANSCRIBE_BAR_TOLERANCE_MS_PER_AUDIO_S:.0} regions={} \
+             words={} chunks={} rungs={} compiles={} build_ms={:.1} recognise_ms={:.1} process_peak_bytes={peak} \
+             gated=false text=\"{}\"",
+            load_ms + call_ms,
+            (load_ms + call_ms) / seconds,
+            out.regions.len(),
+            text.split_whitespace().count(),
+            c.chunks,
+            c.shapes,
+            c.compiles,
+            c.build_ms,
+            c.recognise_ms,
+            prefix(&text),
+        );
+    }
+}
+
+/// Run one hour-scale row in a child of its own ([`LONG_CHILD`]) and forward the line it
+/// printed. A child that fails fails the cell, the same way a cold child does.
+///
+/// The child carries both limits itself ([`StandGuard::child`]), the stop and the
+/// resident-set ceiling, because the parent holds the lock and a parent that dies must
+/// leave a bounded child behind. Both pipes are drained while it runs, each on its own
+/// thread: an hour of audio prints a run report and the `RLX_WGPU_*` diagnostics to stderr,
+/// and a child that filled a pipe nobody reads would block there instead of at its call.
+fn long_row(label: &str) {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => cell_failed!("cell transcribe — the hour-scale child's own path: {error}"),
+    };
+    let mut child = match std::process::Command::new(&exe)
+        .arg("0")
+        .env(LONG_CHILD, label)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => cell_failed!("cell transcribe — the hour-scale child ({label}): {error}"),
+    };
+    let (out_reader, err_reader) = drain_both(&mut child);
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => cell_failed!("cell transcribe — the hour-scale child ({label}): {error}"),
+    };
+    let (out, err) = match (out_reader.join(), err_reader.join()) {
+        (Ok(out), Ok(err)) => (out, err),
+        _ => {
+            cell_failed!("cell transcribe — the hour-scale child's ({label}) output cannot be read")
+        }
+    };
+    if !status.success() {
+        if stopped_by_guard(&status) {
+            eprintln!(
+                "stand: the hour-scale child ({label}) was stopped by its own guard; the row it \
+                 was to take has no measurement"
+            );
+            std::process::exit(EXIT_STOPPED);
+        }
+        // A `cell_failed!` writes its reason to the child's stdout and the run report to its
+        // stderr: name whichever the child left rather than an empty exit status.
+        let stdout = String::from_utf8_lossy(&out);
+        let stderr = String::from_utf8_lossy(&err);
+        let said = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        cell_failed!("cell transcribe — the hour-scale child ({label}) exited {status}: {said}");
+    }
+    let text = String::from_utf8_lossy(&out);
+    let Some(row) = text
+        .lines()
+        .find(|line| line.starts_with("transcribe long-input "))
+    else {
+        cell_failed!("cell transcribe — the hour-scale child ({label}) printed no row");
+    };
+    // The child's own line, forwarded as it printed it: a figure measured elsewhere must not
+    // be reformatted into one measured here.
+    println!("{row}");
+}
+
+/// One hour-scale call in a process of its own ([`LONG_CHILD`]): the material built to the
+/// label's length from the pinned corpus, one call, the caller's audio dropped, and the row
+/// this cell would have printed. Prints that row and exits.
+///
+/// The process is its own so the two memory readings belong to one call: `rss_before` once
+/// this process holds the models and before the call, `rss_after` once the caller's audio is
+/// dropped and the freed pages are returned, and `retained` their signed difference — a
+/// figure that moves between repeats by more than the effect it would show, which the record
+/// states rather than reads growth into. `process_peak_bytes` is this process's high-water. A
+/// call run beside the cell's corpus pass would report the cell's readings instead.
+fn long_child() {
+    let label = std::env::var(LONG_CHILD).unwrap_or_default();
+    // The same two limits a cell carries, and no lock: the parent holds it for the whole
+    // cell, and an hour of audio in one call is exactly the process the stop and the
+    // ceiling exist for.
+    let _guard = StandGuard::child();
+    let Some(target) = LONG_INPUTS
+        .iter()
+        .find(|(name, _)| *name == label)
+        .map(|(_, seconds)| *seconds)
+    else {
+        cell_failed!(
+            "long transcribe — `{label}` is not one of the hour-scale inputs ({})",
+            LONG_INPUTS.map(|(name, _)| name).join(",")
+        );
+    };
+    let dir = match loader::models_dir() {
+        Ok(dir) => dir,
+        Err(e) => cell_failed!("long transcribe — the model directory: {e:#}"),
+    };
+    let (body, sound) = match loader::pair_files(Role::Recognition) {
+        Some(pair) => pair,
+        None => cell_failed!("long transcribe — no recognition pair is pinned"),
+    };
+    let ced = dir.join(crate::ced::CED_MODEL);
+    let corpus = match std::env::var_os(CORPUS_ENV) {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => cell_failed!("long transcribe — {CORPUS_ENV} is not set"),
+    };
+    let mut fresh = or_exit(
+        "the models",
+        load_transcriber(&dir.join(body), &dir.join(sound), &ced),
+    );
+    // The baseline is what this process holds *before the call*: the models and their
+    // tagger, no input of the caller's. The material is built after it, so the reading the
+    // call's own growth is taken against is not one that already contains a repetition's
+    // worth of audio.
+    let before = match report::resident_rss() {
+        Some(bytes) => bytes,
+        None => cell_failed!(
+            "long transcribe — {label}: the process's resident set cannot be read before the call"
+        ),
+    };
+    // The material is the pinned corpus itself, repeated to the length: real speech and
+    // real noise, no synthetic tone. The files are read one at a time and the loop stops as
+    // soon as it has the length, so at most one file beyond it is read and dropped — a
+    // repetition of the whole corpus first would put hundreds of megabytes of audio inside
+    // the very high-water the rows are compared by.
+    let want = (target * f64::from(crate::transcribe::RATE)) as usize;
+    let mut audio: Vec<f32> = Vec::with_capacity(want);
+    'enough: while audio.len() < want {
+        for (name, ..) in crate::bench::REAL_AUDIO_FILES {
+            audio.extend_from_slice(&read_whole(&corpus.join(name), name));
+            if audio.len() >= want {
+                break 'enough;
+            }
+        }
+    }
+    audio.truncate(want);
+    let audio_s = want as f64 / f64::from(crate::transcribe::RATE);
+    let t = report::Stopwatch::start();
+    let out = or_exit(
+        label.as_str(),
+        fresh.transcribe(&audio, crate::transcribe::RATE),
+    );
+    let wall_ms = t.ms();
+    check_regions(&out, &label);
+    let c = fresh.costs();
+    // The audio is the caller's and is dropped here, before the reading: what a call leaves
+    // behind is the difference the reading after it finds, not the input it was given. The
+    // freed pages are returned first, the same way every other release in this file is, so
+    // the reading is not the allocator's retained copy of the input.
+    drop(audio);
+    report::release_free();
+    let after = match report::resident_rss() {
+        Some(bytes) => bytes,
+        None => cell_failed!(
+            "long transcribe — {label}: the process's resident set cannot be read after the call"
+        ),
+    };
+    println!(
+        "transcribe long-input label={label} process=own audio_s={audio_s:.1} regions={} \
+         chunks={} rungs={} compiles={} wall_s={:.1} call_ms_per_audio_s={:.1} input_bytes={} \
+         rss_before={before} rss_after={after} retained={} process_peak_bytes={} weights={} arena=-",
+        out.regions.len(),
+        c.chunks,
+        c.shapes,
+        c.compiles,
+        wall_ms / 1000.0,
+        wall_ms / audio_s,
+        want as u64 * 4,
+        after as i64 - before as i64,
+        peak_bytes(),
+        report::human(rlx_wgpu::buffer::shared_weight_bytes() as u64),
     );
 }
 
@@ -4481,7 +5717,7 @@ fn seam_pairs(out: &crate::transcribe::Transcription) -> usize {
 /// The invariant every transcription of this cell is held to, ending the process
 /// when it does not hold: the result's own contract ([`crate::transcribe::
 /// Transcription::check`] — a region answers with a text or a label, a labelled
-/// region never carries a `reliable` transcript, the regions are ordered without a
+/// region never carries text and a label at once, the regions are ordered without a
 /// hole or an overlap inside `[0, samples]`, the first starting at 0 and the last
 /// ending at `samples`), named by the input it failed on.
 fn check_regions(out: &crate::transcribe::Transcription, name: &str) {
@@ -4496,218 +5732,319 @@ fn check_regions(out: &crate::transcribe::Transcription, name: &str) {
 /// Every figure it quotes is named by the row that carries it, because these notes
 /// are re-emitted on every refresh and must not contradict the table above them.
 const TRANSCRIBE_NOTES: &str =
-    "\n**The headline is `e2e`.** One figure is the recognition number, and it is the whole
-call from hand-over of the audio to the returned text: reading the file, the gain and
-resample, the detector's mask, the tagger's labels, the cut, every compilation the call
-needs, the recognition passes, the guards and the joins. `ms_per_audio_s` is that figure
-over the pass; `corpus-cold` is the same call with the models loaded inside the
-measurement — no weights on the device when it starts — on the first file of the pass,
-and `message` gives it absolutely for a real ten-second and a real thirty-second voice
-message, `cold` (loaded by the call) and `warm` (the same call on the loaded
-transcriber), each printing the text it returned so the result is checkable rather than
-asserted. Nothing else in this section is a recognition figure: `breakdown` is the same
-call split into what could be attributed — the file read, the mask and plan, the tagger,
-the compilations and the recognition passes, per minute of audio — plus
-`unattributed_ms_per_audio_min`, which is the remainder (gain and resample, the guards,
-the joins, the retimed result) reported rather than guessed at.
-
-`breakdown`'s `compile` is the price of a graph per chunk length: each compile uploads
-the body's weights into the shared weight buffer, and a compile for a model whose
-weights a previous compile already placed in that buffer skips the upload — the
-`set_param_sharing_scope` path this tree declares in `graphs::Runner::compile`. What
-remains of a compile is its own lowering plus the host-side read of the weight bytes,
-which is why `compile` does not fall to zero. `chunks`, `shapes` and `windows` are the
-work it prices: the recognition passes, the distinct frame counts their graphs were
-compiled at, and the tagger's windows. The tagger's own compile is `open_ms`, and the
-music pool, the constructed material and the parity rows are priced by their own rows.
-
-The `tuning` row is the decision surface this run was taken with — the pause it merges
+    "\nThe `tuning` row is the decision surface this run was taken with — the pause it merges
 across, the run it drops, the hangover it reaches into silence, the length every cut aims
-at, the caps on how far before and after that aim a cut may search and the share of the
-piece it may leave (`cut_slack_pct`: the narrower of the two bounds is the one that
-applies, so a piece is between half a share and one and a half), the frame alignment its
-graphs are compiled at, and the three text guards — because the product wants to filter
-more rather than less and a choice that is not printed cannot be reviewed. A chunk is read
-once: the plan cuts at the span the
-encoder was trained over, so there is no second presentation to price.
+at and how far before that aim a cut may search for a pause, the ladder of frame counts a
+chunk's graphs are compiled at, and the three text guards — because a choice that is not
+printed cannot be reviewed. A cut never moves later than its share, so a span's piece count
+follows its length and no piece is longer than the aim plus the search.
 
-The `speech` row answers how much of the speech the segmented path failed to
-transcribe, in audio rather than in words. Its denominator is the speech the passes
-covered, not the seconds the detector marked: a chunk's hangover reaches into silence,
-so the covered figure is larger than `masked_s` in the coverage row, and both are named
-so neither has to be derived from the other. `textless_s` is the covered audio whose
-region came back with no transcript, `textless_chunks` the passes that produced it, and
-`flagged_s` the speech whose transcript the guards rejected — returned, marked and
-labelled, so a caller that filters loses those seconds and a caller that does not still
-reads what was produced. A region's whole seconds are counted, the hangover into silence
-included. `textless_voiced_s` and `textless_other_s` split the textless seconds by what
-the tagger says the audio there is: the first a label that can hold words, the second a
-detector mark on audio the tagger calls something else. `suppressed_s` is the third kind:
-the marked seconds inside merged spans the tagger calls something that cannot carry a
-word, whose audio is their label and which are not presented to the recogniser at all.
-Every file that lost any speech has its own `textless-file` row — its `textless_s`, how
-that splits by label, what the labels are, and the call's own `e2e_ms` — so the
-aggregate is attributed rather than taken on trust. The noise pool is counted apart,
-because there the detector's marks are mostly false positives and a textless second is
-the detector's, not lost speech: `noise_marked_s` is what the detector marked,
-`noise_suppressed_s` the marked seconds the tagger's labels kept out of the recognition
-path and `noise_speech_s` what the recogniser was given. A word-level comparison cannot
-answer the question: a recogniser paraphrases across a cut, and the parity rows measure
-exactly that. `seams` counts the adjacent transcripts that share `seam_words` whole
-words or more — a reading carried twice, which is what a lead-in or a piece join could
-once produce; the plan gives every chunk disjoint audio, so it is printed beside the
-pool rather than held against the round.
+The `speech` row answers how much of the speech the segmented path failed to transcribe, in
+audio rather than in words. Its denominator is `speech_pool_s` — the speech pool's seconds a
+recognition chunk covered, the noise pool counted apart on the same row — and not the seconds
+the detector marked: a chunk's hangover reaches into silence, so the covered figure is larger
+than `masked_s` in the coverage row, and `covered_s` there is both pools together. All three
+are named so none has to be derived from another. `textless_s` is the covered audio whose region came back with no
+transcript, `textless_chunks` the passes that produced it, and `discarded_s` the speech whose
+transcript the guards refused — not returned at all, because a placeholder over audio nobody
+can read is worse than an honest hole: the region is marked found-but-not-read, and the
+first `REFUSAL_SAMPLES` of them are printed as `refused-example` rows with their own
+audio, so the line between a reading and the model's placeholder is reviewed rather than
+taken on trust. A region's
+whole seconds are counted, the hangover into silence included. `textless_voiced_s` and
+`textless_other_s` split the textless seconds by what the tagger says the audio there is:
+the first a label that can hold words, the second a detector mark on audio the tagger calls
+something else. `suppressed_s` is the third kind: the marked seconds inside merged spans the
+tagger calls something that cannot carry a word, whose audio is their label and which are
+not presented to the recogniser at all. Every speech file has its own
+`textless-file` row — its `textless_s`, that file's own percentage against the same bar, how
+that splits by label, what the labels are, and the call's own `e2e_ms` — so the aggregate is
+attributed rather than taken on trust. The noise pool is counted apart, because there the
+detector's marks are mostly false positives and a textless second is the detector's, not
+lost speech: `noise_masked_s` is what the detector marked, `noise_suppressed_s` the marked
+seconds the tagger's labels kept out of the recognition path and `noise_covered_s` what the
+recogniser was given. `seams` counts the adjacent transcripts that share `seam_words` whole
+words or more — a reading carried twice, which the plan's disjoint chunks rule out, and which
+the round is held to at zero. The pool's `invented` row is its other gate: a region over the
+noise pool that answered with words at all, with the first three printed so a reading can be
+judged rather than counted. The bar is zero, and a run that prints a figure is a run that
+failed it.
 
-`label-rule` is the list that decides whether a merged span is offered to the recogniser
-at all: the tagger's own names that can carry words — the speech classes, the singing
+Two label lists do different work, and both are printed because a decision that is not
+printed cannot be reviewed. `label-rule` decides whether a merged span is offered to the
+recogniser at all: the tagger's names that can carry words — the speech classes, the singing
 ones and the whole music family — matched on the name the file carries. Music and singing
-are offered even when no word comes out of them, because a song over an orchestra is
-exactly what the song rule must transcribe when its words come out, and an instrumental
-clip produces no text at all: offering it costs a pass and invents nothing.
-`suppressed_s` is what the rule kept out of the recognition path — on the speech pool, on
-the noise pool (`noise_suppressed_s`) and on the music pool, where the `music` and
-`music-report` rows carry it so that a clip with no transcript and suppressed seconds was
-never asked rather than misread — and `noise-labels` what the labelled regions say. The
-tagger's own arithmetic, as this tree runs it: f16 weights read from the file and served
-to f32 multiplies over their widened image — not f16 in compute, which the cooperative
-f16 tile cannot do at this model's 252-token window without padding the token axis and
-changing the arithmetic.
+are offered even when no word comes out of them, because a song over an orchestra is exactly
+what the song rule must transcribe when its words come out, and an instrumental clip
+produces no text at all: offering it costs a pass and invents nothing. `speech-labels` is
+the narrower list where the prompt may carry a **declared language** instead of letting the
+recogniser identify one: the speech and singing classes only, and only where the chunk's own
+loudness varies the way speech does (`SPEECH_SPREAD_DB`, the tenth to the ninetieth percentile
+of its 20 ms frame energies). The recogniser's own language answer stops a noisy chunk with
+`language None` and no transcript — the failure this surface exists to remove — while a
+declared language over an orchestra, or over a steady signal the detector mistook for speech,
+produces a confident, wrong reading. So a speech or singing chunk that varies is told the
+language, and everything else keeps the prompt the one-shot path uses and the model's own
+answer; that gate is what holds the music and noise gates at zero text. `suppressed_s` is what the offering rule kept out of the recognition path — on
+the speech pool, on the noise pool (`noise_suppressed_s`) and on the music pool, where the
+`music` and `music-report` rows carry it so that a clip with no transcript and suppressed
+seconds was never asked rather than misread — and `noise-labels` what the labelled regions
+say. The tagger's own arithmetic, as this tree runs it: f16 weights read from the file and
+served to f32 multiplies over their widened image — not f16 in compute, which the
+cooperative f16 tile cannot do at this model's 252-token window without padding the token
+axis and changing the arithmetic.
 
-`parity` reads the pinned clip the listen cell reads — the same file at the same
-offset and length, conditioned by the same `prepare_speech` — through the segmented
-call, whose text describes the speech spans it detected (`transcribed_s` of the
-clip's `clip_s`) and whose `moved` counts word positions against the pinned
-transcript. `parity-span` hands the same detected span to the single-shot walk at
-its own exact frame count: that is the segmented walk's own input, so a move there
-is what the segmented path costs and a match is the span's — the segmented walk
-reproduces the single-shot reading of the same audio when a chunk's frame count is
-rounded to the encoder's stride and no further, so no padded frame becomes an extra
-attention key. The `parity` row's remainder is the span's: the recogniser's own cut
-sensitivity, which moves most word positions when only the second of non-speech
-around the speech is added or removed — a reading difference, not lost speech. Both
-`moved` figures compare word by position, so one inserted or missing word marks
-every position after it.
+`parity` reads the pinned clip the listen cell reads — the same file at the same offset and
+length, conditioned by the same `prepare_speech` — through the segmented call, whose text
+describes the speech spans it detected (`covered_s` of the clip's `clip_s`) and whose
+`moved` counts word positions against the pinned transcript. `parity-span` hands the same
+detected span to the single-shot walk: that walk keeps the model's own language answer while
+the segmented one declares it where the gate allows, so a word that moved between them is what
+that difference costs, and the row is a witness rather than a gate. The `parity` row's remainder is the span's:
+the recogniser's own cut sensitivity, which moves most word positions when only the second of
+non-speech around the speech is added or removed — a reading difference, not lost speech. Both
+`moved` figures compare word by position, so one inserted or missing word marks every position
+after it.
 
-`boundary` is the binary check on material whose truth is the construction: a speech
-excerpt pasted into digital silence at known offsets. `err_ms` is each kept region's
-start against the paste it came from, signed; a boundary that conditioning moved would
-show there. The gain row repeats the same material as a copy at a level the library
-leaves alone against the lifted one: `moved` counts boundaries that shifted, and
-`identical` says the two readings are the same.
+`boundary` is the binary check on material whose truth is the construction: a speech excerpt
+pasted into digital silence at known offsets. `err_ms` is each kept region's start against the
+paste it came from, signed; a boundary that conditioning moved would show there. The gain row
+repeats the same material as a copy at a level the library leaves alone against the lifted
+one: `moved` counts boundaries that shifted, and `identical` says the two readings are the same.
 
-`music` and `music-report` are the music pool: instrumental clips must produce no
-trusted transcript (a flagged guess is counted, `instrumental_any_text`), and a vocal
-clip is transcribed where its words survive the guards. `music-total` is the pool's own
-wall time per second of audio — the call, not the baseline of a phase.
+`music` and `music-report` are the music pool: an instrumental clip must come back with no
+transcript at all — any text is counted in `instrumental_any_text` and fails the run, because a
+reading over music is a wrong answer rather than an observation — and a vocal clip is
+transcribed where its words survive the guards. `music-total` is the pool's own call time per
+second of audio (`call_ms_per_audio_s`) — the call, not the baseline of a phase.
 
-The `unit` row is this cell's row in the table above. Its `cold` is the whole cell —
-the messages, the corpus pass, the music pool, the constructed material, the pinned
-clip's parity and the longest track — and its `run_ms` is the corpus pass alone, which is
-what `s/speech s` re-derives from. `build` is the pass's compilations, `map` the model
-files the cell binds, and `arena` and `digest` are `-` because the cell has no single
-graph and no pinned answer of its own.
+The `unit` row is this cell's row in the table above, and its two time columns are read as its
+introduction says: `cold_ms` is the whole cell, `run_ms` the corpus pass alone, which is what
+`s_per_covered_s` re-derives from, and its `peak GiB` column the whole cell's own reading. This
+cell's `cold_ms` and `run_ms` are therefore two different spans of the same call and not a phase
+and its sum, which is why `s_per_covered_s` is the column to read. The table's `s_per_covered_s` is
+therefore per second of *covered audio* while the headline above is per second of *audio*:
+two denominators, each named where it is used. Its `build_ms` is the corpus pass's compilations,
+the rungs that pass placed, not the whole cell's; `arena` `-` (the ladder's graphs each have a
+plan, and a sum of plans is not an allocation) and `digest` `-` because the cell has no pinned
+answer of its own.
 ";
 /// The transcription surface's section of the record, from the rows its cell
 /// printed: the rows as one table, what they measured, the files the cell bound
 /// with their measured hashes, and the music pool's provenance, so the CC BY 2.5
 /// attribution travels with the numbers.
-fn transcribe_section(rows: &[String], provenance: &str) -> anyhow::Result<String> {
+///
+/// `peaks` is every high-water the cell's path showed, derived once in the caller and split by
+/// the population each belongs to: the table's peak column, the prose beside it and the verdict
+/// all quote that one derivation, so a row and its section cannot state two readings of one
+/// process.
+fn transcribe_section(
+    rows: &[String],
+    provenance: &str,
+    measured: &str,
+    peaks: &PathPeaks,
+) -> anyhow::Result<String> {
     // Every figure the prose names must be there: a renamed or missing field is an
     // error, never a zero written into the record as if the run had measured it.
-    let number = |key: &str, label: &str| -> anyhow::Result<f64> {
+    let token = |key: &str, label: &str| -> anyhow::Result<String> {
         let row = rows
             .iter()
             .find(|row| row.starts_with(key))
             .with_context(|| format!("this run printed no `{key}` row"))?;
-        field(row, label).with_context(|| format!("the `{key}` row carries no `{label}`"))
+        field_text(row, label)
+            .map(str::to_string)
+            .with_context(|| format!("the `{key}` row carries no `{label}`"))
+    };
+    let number = |key: &str, label: &str| -> anyhow::Result<f64> {
+        token(key, label)?
+            .parse()
+            .with_context(|| format!("the `{key}` row's `{label}` is not a number"))
+    };
+    // A byte count as the cells print it: a whole number of bytes. A figure of another kind
+    // — an amplitude, a rounded display string — is a fabricated measurement, not a rounding,
+    // and fails the run rather than entering the record.
+    let bytes = |key: &str, label: &str| -> anyhow::Result<u64> {
+        token(key, label)?
+            .parse()
+            .with_context(|| format!("the `{key}` row's `{label}` is not a byte count"))
+    };
+    // The same for a signed byte count — a difference of two resident-set readings can be
+    // negative — read as an integer, never through a float that would truncate it.
+    let signed_bytes = |key: &str, label: &str| -> anyhow::Result<i64> {
+        token(key, label)?
+            .parse()
+            .with_context(|| format!("the `{key}` row's `{label}` is not a whole byte count"))
     };
     let files = number("transcribe corpus ", "files")?;
     let audio_s = number("transcribe corpus ", "audio_s")?;
     let mut body = String::new();
     body.push_str("### Transcription: one call over the pinned corpus and the music pool\n\n");
-    body.push_str(&format!("_Measured {}._\n\n", crate::measurements::now()));
-    // The headline, from the rows themselves: the whole call per second of audio, and
-    // what a ten-second and a thirty-second voice message cost, cold and warm.
-    let e2e = number("transcribe e2e ", "ms_per_audio_s")?;
-    let mut headline = String::new();
+    body.push_str(&format!("_Measured {measured}._\n\n"));
+    // The headline, from the row the bar is stated against: the whole call per second of
+    // audio over the corpus pass. The bar's verdict is computed here rather than recalled,
+    // and every row says in its own `gated=` field whether the run fails on it, so no reader
+    // has to guess which figure a bar applies to.
+    let e2e = number("transcribe e2e ", "call_ms_per_audio_s")?;
+    let bar = number("transcribe e2e ", "bar_ms_per_audio_s")?;
+    let tolerance = number("transcribe e2e ", "bar_tolerance_ms_per_audio_s")?;
+    let verdict = if e2e <= tolerance {
+        format!(
+            "**{:.1} ms/s inside the bar at the {tolerance:.0} it allows** — {:.2}× the \
+             {bar:.0} ms/s the plan asks for, and {:.1} ms/s of headroom under a figure that \
+             already carries its tolerance",
+            e2e,
+            e2e / bar,
+            tolerance - e2e,
+        )
+    } else {
+        format!(
+            "**{:.1} ms/s above the bar** ({:.2}× it)",
+            e2e - bar,
+            e2e / bar
+        )
+    };
+    body.push_str(&format!(
+        "**The headline — the one figure the latency bar is stated against: {e2e:.1} ms of call \
+         per second of audio** over the pinned corpus. It is the whole call from hand-over of \
+         the audio to the returned text: the file read, the gain and resample, the detector's \
+         mask, the tagger's labels, the cut, every compilation the call needs, the recognition \
+         passes, the guards and the joins. The bar is {bar:.0} ms per second of audio, \
+         {tolerance:.0} at the tolerance the plan allows, and this run is {verdict}. The `e2e` \
+         row carries the bar beside the figure and `gated=false`: reported against the bar, not \
+         gated by it, because nothing in this run fails when the figure misses it. The rows \
+         that do fail the run — `seams` and the noise pool's `invented` — say `gated=true`; \
+         every other one is a reading, a breakdown or an absolute figure.\n\n",
+    ));
+    // The messages: absolute figures for a real ten-second and a real thirty-second
+    // voice message, cold and warm side by side, each with the load it paid. Cold is
+    // another process, so its load is real; the text each call returned is printed in
+    // its row, so the result is checkable rather than asserted.
+    let mut messages = String::new();
+    let mut cold_load = 0.0f64;
     for seconds in [10, 30] {
         for pass in ["cold", "warm"] {
             let key = format!("transcribe message s={seconds} pass={pass} ");
-            // Cold is the call that loads the models and warm the same call on the
-            // loaded ones, so the cold figure is the total and the warm one its call.
-            let label = if pass == "cold" {
-                "total_ms"
+            // Cold is the process that loads the models inside its own span, so its figure is
+            // the total and its load is the part of that total; warm is the same call on a
+            // process whose models are already there. The same branch names the fields the row
+            // prints, so the figure, its spread and its peak are read by one rule.
+            let (figure, spread_label, peak_label) = if pass == "cold" {
+                ("total_ms", "total_spread_ms", "process_peak_bytes")
             } else {
-                "call_ms"
+                ("call_ms", "warm_spread_ms", "moment_peak_bytes")
             };
-            let ms = number(&key, label)?;
-            headline.push_str(&format!(
-                "a {seconds}-second message takes {ms:.0} ms ({pass}); "
-            ));
+            let ms = number(&key, figure)?;
+            // The range the three runs behind the figure spanned: a missing one is an error,
+            // never a figure printed with no statement of what it resolves.
+            let spread = number(&key, spread_label)?;
+            // The paragraph below names each row's high-water field as a byte count, so a row
+            // whose figure is not one fails the run instead of being described. (A cold row's
+            // `process_peaks_bytes` list is `path_peaks`'s to read, and it fails there.)
+            bytes(&key, peak_label)?;
+            if pass == "cold" {
+                let load = number(&key, "load_ms")?;
+                if seconds == 10 {
+                    cold_load = load;
+                }
+                messages.push_str(&format!(
+                    "a {seconds}-second message takes **{ms:.0} ms cold** ({load:.0} ms of it \
+                     the model load, so {:.0} ms/s for that message, spread {spread:.0} ms); ",
+                    ms / seconds as f64,
+                ));
+            } else {
+                messages.push_str(&format!(
+                    "**{ms:.0} ms warm** ({:.0} ms/s, spread {spread:.0} ms); ",
+                    ms / seconds as f64,
+                ));
+            }
         }
     }
     body.push_str(&format!(
-        "**The headline: {e2e:.0} ms of call per second of audio** over the corpus pass, and \
-         {headline}the text each of those calls returned is in the `message` rows below.\n\n",
-    ));
-    // The bar, and the gap against it, computed from the rows rather than recalled: the
-    // target is 100 ms of call per second of audio, 103 at the tolerance, and the two
-    // largest remaining items are the rows of the breakdown beside them.
-    let passes = number("transcribe breakdown ", "passes_ms_per_audio_min")? / 60.0;
-    let compile = number("transcribe breakdown ", "compile_ms_per_audio_min")? / 60.0;
-    let tagger = number("transcribe breakdown ", "tagger_ms_per_audio_min")? / 60.0;
-    body.push_str(&format!(
-        "The bar for that figure is {bar:.0} ms per second of audio, {tolerance:.0} at the \
-         tolerance the plan allows: this run is **{gap:.0} ms/s above it** ({ratio:.2}× the bar). \
-         Of the {e2e:.0} ms, the breakdown below attributes {passes:.0} to the recognition passes, \
-         {compile:.0} to the compilations, {tagger:.1} to the tagger and the rest to the read, the \
-         mask and plan and what it does not attribute — so the passes and the compilations are \
-         what remains between this figure and the bar. Every other figure here is a breakdown for \
-         the agents that optimise, and none of them is the recognition number.\n\n",
-        bar = TRANSCRIBE_BAR_MS_PER_AUDIO_S,
-        tolerance = TRANSCRIBE_BAR_TOLERANCE_MS_PER_AUDIO_S,
-        gap = e2e - TRANSCRIBE_BAR_MS_PER_AUDIO_S,
-        ratio = e2e / TRANSCRIBE_BAR_MS_PER_AUDIO_S,
-    ));
-    // Warm is the whole pass; cold is the one file of it that pays the model load and the
-    // first compilations, because a pass has exactly one first file. Said plainly, so the
-    // two figures cannot be read as the same measurement.
-    let cold_file = rows
-        .iter()
-        .find(|row| row.starts_with("transcribe corpus-cold "))
-        .context("this run printed no `transcribe corpus-cold` row")?;
-    body.push_str(&format!(
-        "Warm is the whole pass above; **cold** is `corpus-cold`, that same call with the models \
-         loaded inside the measurement (load {:.0} ms + call {:.0} ms) on the pass's first file, \
-         `{}` — the one file of a pass that pays the load and the first compilations, since the \
-         rest of the pass reuses them.\n\n",
-        field(cold_file, "load_ms").context("`corpus-cold` carries no `load_ms`")?,
-        field(cold_file, "call_ms").context("`corpus-cold` carries no `call_ms`")?,
-        cold_file
-            .strip_prefix("transcribe corpus-cold file=")
-            .and_then(|rest| rest.split_whitespace().next())
-            .unwrap_or("-"),
+        "The message rows are absolute figures and the bar does not gate them: {messages}\
+         a ten-second cold call pays {cold_load:.0} ms of model load before a sample is \
+         read — {:.0} ms/s of the message's own ten seconds on that alone — so no \
+         implementation inside this plan's rules could put it under the per-second bar. \
+         `cold` is a claim about this process and nothing else: it holds no mapping, host \
+         copy, device buffer or compiled graph of the models when the span starts. The \
+         operating system's own file cache is not this crate's to control, and is not part \
+         of the claim. \
+         Every one of those rows says `gated=false` and carries the same \
+         `bar_ms_per_audio_s`/`bar_tolerance_ms_per_audio_s` fields the headline does, so the \
+         bar is beside the figure it does not gate rather than a comparison the reader has to \
+         make. Every message row is the median of three runs — a cold row's in three processes \
+         of its own — and carries the range the three saw: `total_spread_ms` on a cold row, \
+         `warm_spread_ms` on a warm one. A cold row also carries `load_ms`, the model files it \
+         read before a sample; every message row carries its own \
+         split — `build_ms` with `compiles` (every graph the call \
+         built: a cold process builds the ladder's rungs and the prompt's shapes from nothing) \
+         and `recognise_ms` with `chunks`, the recognition passes inside it. The peak each row \
+         prints is in bytes and named after its scope: `process_peak_bytes` is the process the \
+         row's `process=` field names, read as that process's final reading — `own` on a cold \
+         row is that child, which exits as it printed it — and a cold row's `process_peaks_bytes` \
+         lists all three of its runs' high-waters in run order, the row's own figure being the \
+         median run's. A warm row's `process=cell` names the cell's own process, which prints its \
+         final reading on its `unit` row: the high-water a warm row, the `long` row or the \
+         `memory` row carries is an earlier moment of that process, so it is `moment_peak_bytes`. \
+         A cold row's \
+         `total_ms_per_audio_s` carries the load inside it; a warm row's `call_ms_per_audio_s` \
+         does not.\n\n",
+        cold_load / 10.0,
     ));
     // The other headline figure, with its bar in the same form as the latency one.
     let textless_pct = number("transcribe speech ", "textless_pct")?;
     let textless_bar = number("transcribe speech ", "textless_bar_pct")?;
+    let pool_s = number("transcribe speech ", "speech_pool_s")?;
+    let allowance_s = (textless_bar - textless_pct) / 100.0 * pool_s;
+    let textless_verdict = if textless_pct <= textless_bar {
+        format!(
+            "**{:.2} points inside it** ({allowance_s:.2} s of the covered speech's \
+             {pool_s:.1} s could come back empty before the bar is reached)",
+            textless_bar - textless_pct,
+        )
+    } else {
+        format!("**{:.2} points above it**", textless_pct - textless_bar)
+    };
     body.push_str(&format!(
-        "**The quality figure: {textless_pct:.2} % of the covered speech came back with no \
-         transcript**, against a bar of {textless_bar:.0} %: this run is **{:.2} points above \
-         it**. The `speech` row carries the seconds, the chunks and the split by the tagger's \
-         label, and every file that lost any of them has its own `textless-file` row.\n\n",
-        textless_pct - textless_bar,
+        "**The quality figure, and the second bar: {textless_pct:.2} % of the covered speech \
+         came back with no transcript**, against {textless_bar:.0} %: this run is \
+         {textless_verdict}. Its denominator is `speech_pool_s`, the seconds of the speech \
+         pool that a recognition chunk covered — the noise pool's covered seconds are counted \
+         apart on the same row's `noise_*` fields, and `covered_s` on the `coverage` row and the \
+         `corpus` row is both pools together — and its numerator is the seconds of those regions \
+         no reading \
+         produced, so a region the detector marked but the tagger calls something other than \
+         words is counted where the `speech` row's split puts it. \
+         The `speech` row carries the bar beside the figure and `gated=false`: reported \
+         against it, the same way the headline is. Every speech file has its own \
+         `textless-file` row with that file's own percentage beside the same bar — a zero \
+         printed rather than a row left out — so the distribution can be read rather than the \
+         aggregate taken on trust.\n\n",
     ));
     body.push_str(&format!(
-        "These rows are one pass of `transcribe::Transcriber` over the pinned corpus of {files:.0} \
-         real-audio files ({:.1} min of speech and noise) and the eight-clip music pool, plus the \
-         constructed boundary material, the longest pinned track and the pinned clip's parity with \
-         the single-shot answer; a corpus has no warm repetition, so each row is one measurement of \
-         the audio it names. Every transcription is held to the invariant that a region answers \
-         with a text or a label, that a labelled region carries no reliable transcript, and that \
-         the regions tile the input exactly — the first at 0, the last at its length. The times \
-         are the detector's own 16 ms hops and the labels are the tagger's per-window winners, not \
-         a transcript.\n\n",
+        "These rows are one pass of `transcribe::Transcriber` over the pinned corpus of \
+         {files:.0} real-audio files ({:.1} min of speech and noise) and the eight-clip music \
+         pool, plus the constructed boundary material, the pinned clip's parity with the \
+         single-shot answer, the longest pinned track and three hour-scale inputs built from the \
+         corpus itself. Every transcription is held to the invariant that a region carries a \
+         text or a label and never both, and that the regions tile the input exactly — the first at 0, the last at \
+         its length. A region that was not read is not silence: it carries the tagger's label \
+         and `read=false`, which is how a caller tells nothing-there from failed-to-read. The \
+         times are the detector's own 16 ms hops and the labels are the tagger's \
+         per-window winners, not a transcript. The table's `unit` row is this cell's, and its \
+         two time columns do not mean what they mean on the other rows: its `cold_ms` is the \
+         whole cell — the messages, the corpus pass, the music pool, the constructed material, \
+         the pinned clip's parity, the hour-scale inputs (each a process of its own, whose wall \
+         time the span includes) and the longest track — while its `run_ms` is the corpus pass \
+         alone, one call per file, hand-over to text. Its `peak` is likewise the whole cell's own process and not \
+         the corpus pass's: the cell's figure is the high-water its `unit` row prints when the \
+         cell has finished, and every other reading its verdict compares is one of the processes \
+         it started for a call of message or corpus size — a `process_peak_bytes` entry of a row \
+         below, or, for a cold message row's three runs, a `process_peaks_bytes` one. The \
+         hour-scale inputs are a population of their own and are stated apart in the paragraph \
+         below. The cell's own earlier \
+         moments (its warm message rows, its `long` row, its `memory` row and its per-phase \
+         prints) are `moment_peak_bytes` entries: never part of the verdict, and never higher \
+         than the figure above.\n\n",
         audio_s / 60.0,
     ));
     body.push_str("| what | numbers |\n|---|---|\n");
@@ -4771,6 +6108,305 @@ fn transcribe_section(rows: &[String], provenance: &str) -> anyhow::Result<Strin
             numbers.trim_end().replace('|', "\\|")
         ));
     }
+    // ── the pass, phase by phase ────────────────────────────────────
+    // Its own section, and never called the recognition number: one figure is the
+    // headline above, and these are its parts. Each is the `breakdown` row's own
+    // arithmetic, per audio minute there and per audio second here.
+    let per_s =
+        |label: &str| -> anyhow::Result<f64> { Ok(number("transcribe breakdown ", label)? / 60.0) };
+    let phases = [
+        ("read (the file)", per_s("read_ms_per_audio_min")?),
+        ("mask and plan", per_s("mask_plan_ms_per_audio_min")?),
+        ("tagger", per_s("tagger_ms_per_audio_min")?),
+        ("compilations", per_s("compile_ms_per_audio_min")?),
+        ("recognition passes", per_s("passes_ms_per_audio_min")?),
+        ("unattributed", per_s("unattributed_ms_per_audio_min")?),
+    ];
+    body.push_str(
+        "\n### The pass, phase by phase\n\n\
+         One pass, split into what could be attributed to it. These are the parts of the\n\
+         headline figure and none of them is the recognition number.\n\n\
+         | phase | ms per audio second | share of the pass |\n|---|---|---|\n",
+    );
+    for (name, ms) in phases {
+        body.push_str(&format!(
+            "| {name} | {ms:.1} | {:.0} % |\n",
+            100.0 * ms / e2e
+        ));
+    }
+    body.push_str(&format!(
+        "\nThe recognition passes are the floor the model imposes: a decode step reads the\n\
+         body's weights whatever the row count, so what moves the passes is how many steps\n\
+         the audio needs — fewer chunks, or less of it decoded — not the other phases. This\n\
+         run's own figures are the row above; a change that raises them says so here rather\n\
+         than trading them for a better line elsewhere.\n\
+         The compilations are a **ladder**, not a per-chunk price: a chunk is padded up to one\n\
+         of {} closed frame counts and that rung's graphs are compiled once for the process,\n\
+         so a pass pays for the rungs no earlier call placed. `breakdown`'s\n\
+         `rungs_per_file_summed` adds each file's distinct rung count — a per-file figure, so\n\
+         its total over 33 files is larger than the ladder it can only ever draw from, which\n\
+         the `tuning` row prints whole; `compiles` counts the rungs a call had to build,\n\
+         `chunks` is the work they price and `windows` the tagger's windows.\n",
+        crate::transcribe::FRAME_RUNGS.len(),
+    ));
+
+    // ── the call's memory, and hour-scale input ─────────────────────
+    // The cell is one process, and its reading is the high-water its `unit` row printed when it
+    // had finished — taken from the readings list, so the table, this prose and the verdict
+    // cannot quote two figures for one process. Its `memory` row and its phase prints are
+    // earlier moments of that process, which is why they carry their own field name
+    // (`moment_peak_bytes`) and not the process's final one. A process high-water never falls,
+    // so neither can read higher: rows that say otherwise are not one process's, and the
+    // section does not describe them.
+    let peak_bytes = peaks
+        .calls
+        .first()
+        .expect("the path's first reading is the cell's own process")
+        .bytes;
+    let memory_peak = bytes("transcribe memory ", "moment_peak_bytes")?;
+    anyhow::ensure!(
+        memory_peak <= peak_bytes,
+        "the cell's `memory` row reads {memory_peak} B and its `unit` row, written later, reads \
+         {peak_bytes} B — a process high-water never falls"
+    );
+    // Its per-phase prints, in the order the phases ran. `weights`/`host` are quoted from the
+    // widest of them: the moment closest to the high-water at which the pool and the host copies
+    // were read. A phase print without a readable reading fails the run: a dropped one would name
+    // another phase.
+    let mut moments: Vec<(u64, &str, &str)> = Vec::new();
+    for row in rows {
+        let Some(rest) = row.strip_prefix("transcribe peak phase=") else {
+            continue;
+        };
+        let phase = rest
+            .split_whitespace()
+            .next()
+            .with_context(|| format!("`{row}` names no phase"))?;
+        let reading = rest
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("moment_peak_bytes="))
+            .with_context(|| format!("`{row}` carries no `moment_peak_bytes`"))?
+            .parse()
+            .with_context(|| format!("`{row}` carries no readable `moment_peak_bytes`"))?;
+        moments.push((reading, phase, row));
+    }
+    // The widest of them, keeping the first print that reached it: the reduce returns that
+    // element, so the phase it names is the one the reading came from.
+    let at_peak = moments
+        .iter()
+        .copied()
+        .reduce(|a, b| if b.0 > a.0 { b } else { a });
+    if let Some((top, _, row)) = at_peak {
+        anyhow::ensure!(
+            top <= peak_bytes,
+            "`{row}` reads {top} B and the cell's later `unit` row reads {peak_bytes} B — a \
+             process high-water never falls"
+        );
+    }
+    // The figure the cell reached is its final high-water; the phase prints are moments on the way
+    // there. Both forms below are guaranteed: a print that carries the figure reached it (the
+    // phases print in the order they run), and one below it was raised after that print.
+    let held = match at_peak {
+        Some((top, first, _)) if top == peak_bytes => format!(
+            "the first phase print that carries it is `{first}` ({}) — the phases print \
+             their reading in the order they run, so the high-water was reached at or \
+             before that phase",
+            gib_text(top)
+        ),
+        Some((top, first, _)) => format!(
+            "the widest of its phase prints is `{first}` ({}), below it — a later moment of \
+             the same process raised it, and that print did not",
+            gib_text(top)
+        ),
+        None => "the rows that take it per phase are not in this run".to_string(),
+    };
+    let (weights_at_peak, host_at_peak) = match at_peak {
+        Some((_, _, row)) => (
+            field_text(row, "weights")
+                .with_context(|| format!("`{row}` carries no `weights`"))?
+                .to_string(),
+            field_text(row, "host")
+                .with_context(|| format!("`{row}` carries no `host`"))?
+                .parse()
+                .with_context(|| format!("`{row}`'s `host` is not a byte count"))?,
+        ),
+        None => (
+            token("transcribe memory ", "weights")?,
+            bytes("transcribe memory ", "host")?,
+        ),
+    };
+    let at_print = match at_peak {
+        Some((_, phase, _)) => format!("`{phase}`'s print, the widest of the per-phase readings"),
+        None => "the `memory` row".to_string(),
+    };
+    // The ceiling was derived for a call of message size — one model doing the work of a
+    // listening call — so its verdict covers the processes that ran such a call: the cell's own
+    // and the children behind each message length's cold runs and the corpus pass. The
+    // hour-scale inputs are a population of their own and are stated with their own figures.
+    let calls = &peaks.calls;
+    let low = calls
+        .iter()
+        .map(|reading| reading.bytes)
+        .min()
+        .expect("the path's first reading is the cell's own process");
+    let high = calls
+        .iter()
+        .map(|reading| reading.bytes)
+        .max()
+        .expect("the path's first reading is the cell's own process");
+    let (verdict, ceiling) =
+        peak_verdict(calls, "transcribe").context("transcribe has no ceiling")?;
+    let note = match verdict {
+        "over" => format!(
+            ", i.e. every reading is at least {} above it",
+            gib_text(low - ceiling)
+        ),
+        "inside" => format!(
+            ", i.e. every reading is at least {} below it",
+            gib_text(ceiling - high)
+        ),
+        _ => at_note(calls, ceiling),
+    };
+    let each = calls
+        .iter()
+        .map(|reading| format!("{} {}", reading.process, gib_text(reading.bytes)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let readings = format!(
+        "**{verdict} its ceiling**: the cell's own process and the {} it started for a call of \
+         message or corpus size — {each} — span\n{} to {} against {}{note}. The hour-scale inputs \
+         are a population of their own and are not in it: their rows carry them, and the \
+         paragraph under their table says what their high-waters do between lengths.",
+        calls.len().saturating_sub(1),
+        gib_text(low),
+        gib_text(high),
+        gib_text(ceiling),
+    );
+    body.push_str(&format!(
+        "\n### The call's memory, and hour-scale input\n\n\
+         The cell's own reading is {}: the high-water of the one process the cell is, taken \
+         when it printed its `unit` row, after its corpus pass and the hour-scale children's \
+         calls. Its `memory` row, printed after the corpus pass, read {}; {held}. \
+         `weights` ({}) is the device's\n\
+         shared weight pool — one model's parameter bytes, held once however many layouts and\n\
+         rungs bind them — and `host` ({}) is the process's own kept copies of weights, the\n\
+         fused projections a second layout re-reads. `host` is printed in whole bytes, like\n\
+         `map`; `weights` in the display form the `unit` row prints. Both are read at\n\
+         {at_print}. `map` ({}) is the\n\
+         bytes of the three files the cell binds — the recognition pair and the tagger — by\n\
+         their size: each is opened by mapping and its tensor bytes read with `pread` through one\n\
+         scratch buffer, so the mapping is not the copy the process holds and the figure is not\n\
+         resident pages. No `arena` figure: each rung's graphs have a plan of\n\
+         their own, and a sum of plans is not an allocation. Its resident set when the `memory`\n\
+         row was taken is {}. This cell is {readings}\n\
+         The cell ran under a {} MiB resident-set ceiling and a {} MiB swap-growth ceiling;\n\
+         the provenance block says which of those was raised from the guard's default.\n\n",
+        gib_text(peak_bytes),
+        gib_text(memory_peak),
+        spaced(weights_at_peak),
+        gib_text(host_at_peak),
+        gib_text(bytes("transcribe memory ", "map")?),
+        spaced(token("transcribe memory ", "resident")?),
+        token("transcribe memory ", "ceiling_mib")?,
+        token("transcribe memory ", "swap_ceiling_mib")?,
+    ));
+    body.push_str(
+        "Three inputs built from the corpus itself — real speech and real noise, repeated, no\n\
+         synthetic tone — answer the bound the product needs. Each is one call in a process of\n\
+         its own, each returns a segmentation covering the whole input, and all three are held\n\
+         to the same closed ladder: whatever the input's length, no row compiles a shape the\n\
+         ladder does not hold.\n\n\
+         | input | audio s | regions | chunks | rungs | compiles | call ms/audio s | caller MiB | retained MiB | process peak GiB | weights |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|\n",
+    );
+    let mut retained: Vec<i64> = Vec::new();
+    let mut rungs: Vec<String> = Vec::new();
+    for (label, _) in LONG_INPUTS {
+        let key = format!("transcribe long-input label={label} ");
+        // The row's own high-water, from the one derivation the whole section quotes: the column
+        // and the paragraph under it cannot state two figures for one process.
+        let peak = peaks
+            .hours
+            .iter()
+            .find(|reading| reading.process == *label)
+            .map(|reading| reading.bytes)
+            .with_context(|| format!("the transcription path holds no reading for `{label}`"))?;
+        let kept = signed_bytes(&key, "retained")?;
+        retained.push(kept);
+        rungs.push(token(&key, "rungs")?);
+        body.push_str(&format!(
+            "| {label} | {:.1} | {} | {} | {} | {} | {:.1} | {} | {} | {} | {} |\n",
+            number(&key, "audio_s")?,
+            token(&key, "regions")?,
+            token(&key, "chunks")?,
+            token(&key, "rungs")?,
+            token(&key, "compiles")?,
+            number(&key, "call_ms_per_audio_s")?,
+            mib(bytes(&key, "input_bytes")?),
+            mib_signed(kept),
+            peak_gib(peak),
+            token(&key, "weights")?,
+        ));
+    }
+    // The three readings themselves, quoted from the rows above: what they do between rows is
+    // below what a process that has just built and dropped hundreds of megabytes resolves, so
+    // no direction is stated from them.
+    let kept = retained
+        .iter()
+        .map(|bytes| mib_text(*bytes))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The figures the paragraph below states, quoted from the rows above rather than recalled.
+    // Whether the high-water rises with the input is a fact about these readings, so the
+    // sentence follows them instead of asserting a trend they may not show.
+    let rising = peaks
+        .hours
+        .windows(2)
+        .all(|pair| pair[0].bytes <= pair[1].bytes);
+    let peak_text = peaks
+        .hours
+        .iter()
+        .map(|reading| gib_text(reading.bytes))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rungs = rungs.join(", ");
+    let growth = if rising {
+        format!(
+            "`process peak GiB` is that process's high-water, and it does not fall with the \
+             input here: {peak_text}\n\
+             for the three inputs. The caller's audio (`caller MiB`) and the tagger's log-mel\n\
+             over it are linear in the input by construction, and they are the part of a call's\n\
+             working set no implementation can hold in nothing."
+        )
+    } else {
+        format!(
+            "`process peak GiB` is that process's high-water: {peak_text} on the three rows. \
+             The caller's\n\
+             audio (`caller MiB`) and the tagger's log-mel over it are linear in the input by\n\
+             construction, but the high-water does not follow the length here — it also depends\n\
+             on what the allocator had returned and which phase held it — so these are\n\
+             readings, not a bound stated from them."
+        )
+    };
+    body.push_str(&format!(
+        "\n`compiles` is what the call asked the compiler for. Each row is a fresh process, so\n\
+         each places the rungs its own call uses — `compiles` is that call's, not a figure the\n\
+         earlier rows already paid; within one process a repeat call compiles nothing, which is\n\
+         what the corpus pass above shows. `rungs` cannot exceed the ladder the `tuning` row\n\
+         prints, whatever the input's length: the count follows the input up to the ladder's own\n\
+         size and then stops, and the rows print {rungs} against a ladder of {}.\n\
+         `weights` is the device pool each row held: one copy of the same model's parameter\n\
+         bytes, whatever the length.\n\
+         `retained` is the difference between two resident-set readings of one process —\n\
+         before the call, and after it with the caller's audio dropped and the freed pages\n\
+         returned. At the granularity of a process that has just built and dropped hundreds of\n\
+         megabytes that difference is not resolvable: it moves between repeats by more than the\n\
+         effect it would show, so it is printed as a reading rather than as evidence of growth\n\
+         or of its absence — the three rows read {kept}. {growth} What the table shows not following\n\
+         the length is the model side: `rungs` stays inside the closed ladder however long the\n\
+         input, and `weights` holds one copy of the same parameter bytes on every row.\n",
+        crate::transcribe::FRAME_RUNGS.len(),
+    ));
     body.push_str(TRANSCRIBE_NOTES);
     body.push_str("\nProvenance:\n\n");
     body.push_str(provenance);
@@ -4787,14 +6423,14 @@ mod tests {
     use super::{carried_from, caught, merge_stream_rows, stream_row, stream_row_prefix};
     use rlx_wgpu::bandwidth::{CeilingFailure, StreamCeiling};
 
-    /// A block of the shape the record holds: cell rows, a weight-stream
-    /// subsection whose note paragraph was written by a run that measured no
-    /// generative cell, and the three kinds of artefact line.
+    /// A block of the shape the record holds — this tree's header, cell rows, a weight-stream
+    /// subsection a run carried rather than took, and the three kinds of artefact line — so the
+    /// carry is read back from the form the record actually has.
     const BLOCK: &str = "\
 <!-- BEGIN stand -->
 ## Per-model measurement (stand)
 
-| unit | cold ms | warm ms | speech s | s/speech s | loop ms | sound ms | build ms | peak | map | arena | digest |
+| unit | cold_ms | run_ms | covered_s | s_per_covered_s | loop_ms | sound_ms | build_ms | peak GiB (readings, or one carried figure; / ceiling verdict where held) | map | weights | arena | digest |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | ear | 1.0 | 2.0 | 3.0 | 4.0 | - | - | 5.0 | 0.1 GiB | 0.2 GiB | 1 MiB | aa |
 | embed.8192 | 6.0 | 7.0 | - | - | - | - | 8.0 | 0.3 GiB | 0.4 GiB | 2 MiB | bb |
@@ -4802,7 +6438,7 @@ mod tests {
 
 ### Weight streams, against the machine's streaming ceiling
 
-This run measured no generative cell, so it took no stream reading of its own: the rows below are the run that measured them, restated against the ceiling printed below.
+This run took no stream reading of its own: the rows below are the run that measured them, restated against the ceiling printed below.
 
 Ceiling, measured on this run's device before the cells: **112.9 GB/s** on a streaming read.
 
@@ -4847,7 +6483,7 @@ Provenance:
             !carried
                 .streams
                 .iter()
-                .any(|row| row.columns.contains("no generative cell")),
+                .any(|row| row.columns.contains("took no stream reading of its own")),
             "the note is a paragraph, not a row, and re-emitting it stacks it"
         );
         assert_eq!(
@@ -4987,22 +6623,88 @@ Provenance:
     /// built without one of them is an error, not a zero.
     fn prose_rows() -> Vec<String> {
         vec![
-            "transcribe corpus files=33 audio_s=3838.8 speech_s=3300.1".to_string(),
-            "transcribe e2e ms_per_audio_s=167.2".to_string(),
-            "transcribe message s=10 pass=cold total_ms=3093.3 words=17".to_string(),
-            "transcribe message s=10 pass=warm call_ms=2368.2 words=17".to_string(),
-            "transcribe message s=30 pass=cold total_ms=7195.3 words=49".to_string(),
-            "transcribe message s=30 pass=warm call_ms=6539.8 words=49".to_string(),
-            "transcribe breakdown read_ms_per_audio_min=3.2 passes_ms_per_audio_min=5500.3 \
-             compile_ms_per_audio_min=4209.6 tagger_ms_per_audio_min=225.9"
+            "transcribe corpus files=33 audio_s=3838.8 covered_s=3300.1".to_string(),
+            "transcribe e2e call_ms_per_audio_s=99.8 bar_ms_per_audio_s=100 \
+             bar_tolerance_ms_per_audio_s=103 gated=false"
                 .to_string(),
-            "transcribe speech files=18 speech_s=3174.8 textless_s=90.7 textless_pct=2.86 \
-             textless_bar_pct=2.00 textless_gap_pct=0.86"
+            "transcribe message s=10 pass=cold total_ms=3173.0 total_spread_ms=41.0 \
+             load_ms=468.7 words=16 process_peak_bytes=2716566814 \
+             process_peaks_bytes=2716566814,2600000000,2500000000 gated=false"
                 .to_string(),
-            "transcribe corpus-cold file=speech/librivox/speech-librivox-0027.wav load_ms=401.2 \
-             call_ms=61181.5"
+            "transcribe message s=10 pass=warm process=cell call_ms=1232.0 warm_spread_ms=18.0 \
+             words=16 moment_peak_bytes=2458419200 gated=false"
+                .to_string(),
+            "transcribe message s=30 pass=cold total_ms=5283.9 total_spread_ms=55.0 \
+             load_ms=431.5 words=49 process_peak_bytes=2576979149 \
+             process_peaks_bytes=2576979149,2500000000,2400000000 gated=false"
+                .to_string(),
+            "transcribe message s=30 pass=warm process=cell call_ms=3367.5 warm_spread_ms=24.0 \
+             words=49 moment_peak_bytes=2458419200 gated=false"
+                .to_string(),
+            "transcribe breakdown read_ms_per_audio_min=3.5 mask_plan_ms_per_audio_min=16.3 \
+             tagger_ms_per_audio_min=229.1 compile_ms_per_audio_min=5.7 \
+             passes_ms_per_audio_min=5500.3 unattributed_ms_per_audio_min=100.0"
+                .to_string(),
+            "transcribe speech files=18 speech_pool_s=3174.8 chunks=436 declared_chunks=310 \
+             undeclared_chunks=126 textless_s=0.0 textless_pct=0.00 \
+             textless_bar_pct=2.00 textless_gap_pct=-2.00 gated=false"
+                .to_string(),
+            "transcribe corpus-cold file=speech/librivox/speech-librivox-0027.wav process=own \
+             load_ms=401.2 call_ms=61181.5 process_peak_bytes=2716566814 gated=false"
+                .to_string(),
+            "transcribe memory process=cell moment_peak_bytes=2458419200 resident=231.6MiB \
+             weights=1.33GiB host=0 map=1685639168 ceiling_mib=6144 swap_ceiling_mib=1024"
+                .to_string(),
+            "transcribe long-input label=1min audio_s=60.0 regions=16 chunks=10 rungs=3 \
+             compiles=3 wall_s=6.6 call_ms_per_audio_s=110.0 input_bytes=3840000 \
+             rss_before=1011204096 rss_after=650723328 retained=-360480768 process_peak_bytes=2458419200 \
+             weights=1.33GiB arena=-"
+                .to_string(),
+            "transcribe long-input label=30min audio_s=1800.0 regions=458 chunks=308 rungs=6 \
+             compiles=6 wall_s=199.9 call_ms_per_audio_s=111.1 input_bytes=115200000 \
+             rss_before=1011204096 rss_after=650723328 retained=-360480768 process_peak_bytes=2576980378 \
+             weights=1.33GiB arena=-"
+                .to_string(),
+            "transcribe long-input label=60min audio_s=3600.0 regions=746 chunks=574 rungs=6 \
+             compiles=6 wall_s=375.2 call_ms_per_audio_s=104.2 input_bytes=230400000 \
+             rss_before=771342336 rss_after=242892800 retained=-528449536 process_peak_bytes=2684354560 \
+             weights=1.33GiB arena=-"
                 .to_string(),
         ]
+    }
+
+    /// The section built the way the stand builds it: every reading comes from the path derived
+    /// from the cell's `unit` row, so the table and the prose quote the same list.
+    fn section(rows: &[String], provenance: &str, peak: u64) -> anyhow::Result<String> {
+        let peaks = super::path_peaks(peak, rows)?;
+        super::transcribe_section(rows, provenance, "", &peaks)
+    }
+
+    /// The unit row's peak field names the moment it was read: `speak`'s process goes on after
+    /// its reading (the round-trip gate follows), so its row says `synthesis_peak_bytes`; every
+    /// other cell prints its process's final reading. The table reads either name, and an earlier
+    /// moment is not a unit row's figure at all.
+    #[test]
+    fn a_unit_row_reads_its_peak_under_either_name() {
+        let row = |field: &str| {
+            format!(
+                "unit speak build_ms=1.000 run_ms=2.000 {field}=3072 cold_ms=3.000 \
+                 map=4096 arena=- weights=1.0GiB submits=0 waits=0 at=00:00:00 load=0.0 0.0 0.0"
+            )
+        };
+        for field in ["process_peak_bytes", "synthesis_peak_bytes"] {
+            assert_eq!(
+                super::parse_unit(&row(field), "speak"),
+                Ok((3.0, 2.0, 3072, 4096, 1.0)),
+                "the row's figure is read under `{field}`"
+            );
+        }
+        let moment = super::parse_unit(&row("moment_peak_bytes"), "speak")
+            .expect_err("a moment of the process is not the row's figure");
+        assert!(
+            moment.contains("peak"),
+            "the error names the field: {moment}"
+        );
     }
 
     /// The transcription section's table is made from the cell's own rows, and a
@@ -5013,15 +6715,14 @@ Provenance:
     fn a_transcription_row_splits_into_its_key_and_its_numbers() {
         let mut rows = prose_rows();
         rows.extend([
-            "transcribe corpus files=33 audio_s=3838.8 speech_s=3300.1".to_string(),
             "transcribe music instrumental/01-orchestra.wav audio_s=40.00 regions=1".to_string(),
             "transcribe cost times_ms_per_audio_min=16.3 chunks=435".to_string(),
             "transcribe invented-example 1 text=\"la la la and then it kept going\"".to_string(),
             "transcribe invented-example 2 text=\"a | b\"".to_string(),
         ]);
-        let body = super::transcribe_section(&rows, "- machine: test\n").expect("a full section");
+        let body = section(&rows, "- machine: test\n", 2_458_419_200).expect("a full section");
         for expected in [
-            "| corpus | files=33 audio_s=3838.8 speech_s=3300.1 |",
+            "| corpus | files=33 audio_s=3838.8 covered_s=3300.1 |",
             "| music instrumental/01-orchestra.wav | audio_s=40.00 regions=1 |",
             "| cost | times_ms_per_audio_min=16.3 chunks=435 |",
             "| invented-example 1 | text=\"la la la and then it kept going\" |",
@@ -5056,7 +6757,7 @@ Provenance:
              sha256=other pinned=- source=-"
                 .to_string(),
         ]);
-        let body = super::transcribe_section(&rows, "").expect("a full section");
+        let body = section(&rows, "", 2_458_419_200).expect("a full section");
         assert!(
             body.contains(
                 "- model: `ced-small-f16.gguf` · 43000000 bytes · sha256 c391ed8697a1b0 \
@@ -5074,18 +6775,6 @@ Provenance:
         );
     }
 
-    /// The table's `speech s` column is the unit line's own figure, taken from there
-    /// and nowhere else.
-    #[test]
-    fn the_speech_denominator_comes_from_the_unit_line() {
-        let text = "cell listen frames=3000 speech_s=17.460000 steps=1 kinds=matmul:1\n\
-                    unit listen build_ms=1.000 run_ms=2.000 peak=3 cold_ms=4.000 map=5 \
-                    beyond_map=0 file_over_rss=0 arena=6 submits=7 waits=8 at=09:00:00 load=0.1 \
-                    speech_s=17.460000\n";
-        let line = super::unit_line(text, "listen").expect("the unit line");
-        assert_eq!(super::field(line, "speech_s"), Some(17.46));
-    }
-
     /// A figure the prose names and the run did not print is an error naming what is
     /// missing: the lookup used to answer `0.0`, which would write "0 ms of call per
     /// second of audio" into the record as if the run had measured it.
@@ -5093,7 +6782,7 @@ Provenance:
     fn a_missing_figure_fails_the_section_instead_of_printing_zero() {
         let mut rows = prose_rows();
         rows.retain(|row| !row.starts_with("transcribe e2e "));
-        let error = super::transcribe_section(&rows, "").expect_err("no headline figure");
+        let error = section(&rows, "", 2_458_419_200).expect_err("no headline figure");
         assert!(
             format!("{error:#}").contains("no `transcribe e2e ` row"),
             "a missing row is named: {error:#}"
@@ -5102,13 +6791,610 @@ Provenance:
         let mut rows = prose_rows();
         for row in rows.iter_mut() {
             if row.starts_with("transcribe speech ") {
-                *row = "transcribe speech files=18 speech_s=3174.8 textless_pct=2.86".to_string();
+                *row =
+                    "transcribe speech files=18 speech_pool_s=3174.8 textless_pct=2.86 gated=false"
+                        .to_string();
             }
         }
-        let error = super::transcribe_section(&rows, "").expect_err("no bar beside the figure");
+        let error = section(&rows, "", 2_458_419_200).expect_err("no bar beside the figure");
         assert!(
             format!("{error:#}").contains("carries no `textless_bar_pct`"),
             "a missing field is named: {error:#}"
+        );
+    }
+
+    /// A cell's peak is printed with the range its own runs spanned and its ceiling, and a
+    /// range that reaches the ceiling is reported `at` it: a difference below what the
+    /// readings resolve is not a margin, and the record must not claim one either way.
+    #[test]
+    fn a_peak_range_that_reaches_the_ceiling_is_reported_at_it() {
+        let b = |gib: f64| (gib * 1_073_741_824.0) as u64;
+        let readings = |values: &[f64]| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(run, gib)| super::PeakReading {
+                    process: format!("run {}", run + 1),
+                    bytes: b(*gib),
+                })
+                .collect::<Vec<_>>()
+        };
+        let cell = |own: &str, values: &[f64], name: &str| {
+            // The figure the row leads with is the median of its runs, which is what the stand
+            // hands `peak_cell`; a fixture that led with the first reading would not mirror it.
+            let peak = readings(values);
+            let own_bytes = super::median_bytes(&peak.iter().map(|r| r.bytes).collect::<Vec<_>>())
+                .expect("a reading");
+            super::peak_cell(own, own_bytes, &peak, name)
+        };
+        assert_eq!(
+            cell("median", &[2.20, 2.19, 2.20], "listen"),
+            "median 2.20 (readings run 1 2.20, run 2 2.19, run 3 2.20) / 2.31 inside",
+            "every reading is named with the process that took it, bare under the column's \
+             unit, and a set under the ceiling is inside it"
+        );
+        assert!(
+            cell("median", &[2.40, 2.44, 2.46], "speak").ends_with("2.42 at"),
+            "readings that bracket the ceiling are at it"
+        );
+        assert!(
+            cell("median", &[2.44, 2.46, 2.46], "speak").ends_with("2.42 over"),
+            "readings above the ceiling by more than the printed quantum are over it"
+        );
+        assert!(
+            cell("cell", &[2.35, 2.35, 2.35], "transcribe").ends_with("2.35 at"),
+            "a reading exactly on the ceiling is at it: neither side is a difference the \
+             printed numbers can state"
+        );
+        assert!(
+            cell("cell", &[2.345, 2.345, 2.345], "transcribe").ends_with("2.35 at"),
+            "a reading inside the printed quantum of the ceiling is at it too"
+        );
+        assert!(
+            cell("cell", &[2.33, 2.33, 2.33], "transcribe").ends_with("2.35 inside"),
+            "and a reading a full quantum under it is inside"
+        );
+        assert!(
+            cell("cell", &[2.50, 2.60, 2.70], "transcribe").ends_with("2.35 over"),
+            "readings entirely above the ceiling are over it"
+        );
+        assert_eq!(
+            cell("median", &[0.47, 0.44, 0.51], "ear"),
+            "median 0.47 (readings run 1 0.47, run 2 0.44, run 3 0.51)",
+            "a cell with no ceiling states its readings and nothing else"
+        );
+    }
+
+    /// The record this workspace ships, or nothing: the skip is named on stderr, which the test
+    /// harness shows under `--nocapture` (the crate's model- and device-gated tests print theirs
+    /// the same way), so a missing record cannot be taken for a check that passed.
+    fn record() -> Option<String> {
+        let path = crate::measurements::path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                eprintln!("skip: {} is not readable: {error}", path.display());
+                None
+            }
+        }
+    }
+
+    /// A peak is a byte count or it is not a measurement. The cell's own rows carry their
+    /// earlier high-waters under `moment_peak_bytes`; a figure of another kind — an amplitude, a
+    /// rounded display string — must fail the section rather than be printed as a peak.
+    #[test]
+    fn a_peak_that_is_not_a_byte_count_fails_the_section() {
+        let mut rows = prose_rows();
+        for row in rows.iter_mut() {
+            if row.contains("moment_peak_bytes=2458419200") {
+                *row = row.replace(
+                    "moment_peak_bytes=2458419200",
+                    "moment_peak_bytes=0.023742676",
+                );
+            }
+        }
+        let error = section(&rows, "", 2_458_419_200)
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_default();
+        assert!(
+            error.contains("`moment_peak_bytes` is not a byte count"),
+            "an amplitude printed as a peak is an error naming the field: {error}"
+        );
+    }
+
+    /// And a byte figure is read as a whole byte count: `retained` is a signed difference of two
+    /// resident-set readings, and reading it through a float would truncate it into a figure the
+    /// run never printed.
+    #[test]
+    fn a_retained_figure_that_is_not_whole_bytes_fails_the_section() {
+        let mut rows = prose_rows();
+        for row in rows.iter_mut() {
+            if row.contains("retained=-360480768") {
+                *row = row.replace("retained=-360480768", "retained=-360480768.5");
+            }
+        }
+        let error = section(&rows, "", 2_458_419_200)
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_default();
+        assert!(
+            error.contains("`retained` is not a whole byte count"),
+            "a figure that is not whole bytes is an error naming the field: {error}"
+        );
+    }
+
+    /// And the checked-in record prints every byte figure as a whole byte count: the warm
+    /// message rows once printed the boundary test's audio amplitude, and nothing read the field
+    /// back. `retained` is a signed difference, and it is read as one, never through a float.
+    #[test]
+    fn the_record_prints_no_byte_figure_that_is_not_whole_bytes() {
+        let Some(text) = record() else {
+            return;
+        };
+        for line in text.lines() {
+            for token in line.split_whitespace() {
+                let Some((label, value)) = token.split_once('=') else {
+                    continue;
+                };
+                if label == "retained" {
+                    assert!(
+                        value.parse::<i64>().is_ok(),
+                        "retained in MEASUREMENTS.md is not a whole byte count: {value}"
+                    );
+                } else if label.ends_with("_bytes") || label.starts_with("rss_") {
+                    // A field holding several readings (`process_peaks_bytes`, the cold
+                    // child's three runs) is a list of byte counts, every one whole.
+                    assert!(
+                        value.split(',').all(|one| one.parse::<u64>().is_ok()),
+                        "{label} in MEASUREMENTS.md is not a byte count: {value}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One run writes two sections, and they carry one provenance: every line of the block —
+    /// the machine, the tree, the rows, the thermal state, the load, the ceilings and the swap —
+    /// holds the same values in both, because it is read once. A figure sampled twice under one
+    /// label would let the file describe one run two ways.
+    ///
+    /// Only a run that wrote both sections can be checked here: the record keeps a section a
+    /// later run did not write, so its `_Measured` line, its `- command:` line, the load it found
+    /// the machine in and the swap it started with are the older run's, and the blocks are meant
+    /// to differ. When all four match, one run wrote both and the blocks must be identical. The
+    /// swap figure is in the identity because a minute's resolution plus one invocation does not
+    /// separate two runs of the same cells — and a test that fails on a correct file is a defect
+    /// in its own right.
+    #[test]
+    fn the_two_sections_of_one_run_carry_one_provenance() {
+        let Some(text) = record() else {
+            return;
+        };
+        let line = |section: &str, prefix: &'static str| -> Option<String> {
+            text.split_once(&format!("<!-- BEGIN {section} -->"))
+                .and_then(|(_, rest)| rest.split_once("<!-- END"))
+                .and_then(|(body, _)| {
+                    body.lines()
+                        .find(|line| line.starts_with(prefix))
+                        .map(str::to_string)
+                })
+        };
+        let identity = |section: &str| -> Option<(String, String, String, String)> {
+            (
+                line(section, "_Measured ")?,
+                line(section, "- command: ")?,
+                line(section, "- load: ")?,
+                line(section, "- swap: ")?,
+            )
+                .into()
+        };
+        let (Some(stand_run), Some(transcribe_run)): (
+            Option<(String, String, String, String)>,
+            Option<(String, String, String, String)>,
+        ) = (identity("stand"), identity("transcribe")) else {
+            return;
+        };
+        if stand_run != transcribe_run {
+            eprintln!(
+                "skip: the stand section is {stand_run:?} and the transcription one \
+                 {transcribe_run:?} — two runs, each with its own provenance"
+            );
+            return;
+        }
+        let block = |section: &str| -> Vec<String> {
+            let begin = format!("<!-- BEGIN {section} -->");
+            let end = format!("<!-- END {section} -->");
+            let start = text
+                .find(&begin)
+                .unwrap_or_else(|| panic!("no `{section}`"));
+            let stop = text
+                .find(&end)
+                .unwrap_or_else(|| panic!("no end of `{section}`"));
+            text[start..stop]
+                .split_once("\nProvenance:\n\n")
+                .map(|(_, rest)| {
+                    rest.lines()
+                        .take_while(|line| {
+                            line.starts_with("- ")
+                                && !line.starts_with("- model: ")
+                                && !line.starts_with("- voice: ")
+                                && !line.starts_with("- text: ")
+                        })
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let stand = block("stand");
+        let transcribe = block("transcribe");
+        assert!(
+            !stand.is_empty(),
+            "the stand section has a provenance block"
+        );
+        assert!(
+            !transcribe.is_empty(),
+            "the transcription section has a provenance block"
+        );
+        assert_eq!(
+            stand, transcribe,
+            "the two sections this file's run wrote must name the same run"
+        );
+    }
+
+    /// A cell's row and its section must be made of the same readings: the transcription
+    /// cell reads its high-water once, so every child it spawns — the cold message calls, the
+    /// corpus-cold call and the hour-scale calls — is another reading of that path, and the
+    /// table and the prose take them from one helper, each named with its process.
+    #[test]
+    fn the_transcription_rows_take_every_child_the_run_started() {
+        let rows = prose_rows();
+        let peaks = super::path_peaks(2_458_419_200, &rows).expect("every reading parses");
+        let all: Vec<&super::PeakReading> = peaks.calls.iter().chain(peaks.hours.iter()).collect();
+        assert_eq!(
+            all.iter().map(|p| p.process.as_str()).collect::<Vec<_>>(),
+            [
+                "cell",
+                "message 10 s cold run 1",
+                "message 10 s cold run 2",
+                "message 10 s cold run 3",
+                "message 30 s cold run 1",
+                "message 30 s cold run 2",
+                "message 30 s cold run 3",
+                "corpus cold",
+                "1min",
+                "30min",
+                "60min"
+            ],
+            "the cell's own reading and the ten processes the fixture prints"
+        );
+        assert_eq!(
+            peaks.calls[0].bytes, 2_458_419_200,
+            "the cell's own reading comes first"
+        );
+        assert!(
+            peaks.calls[1].bytes > peaks.calls[0].bytes,
+            "the cold child's 2.53 GiB is the wider reading: {peaks:?}"
+        );
+        // A reading the run printed but the record cannot parse fails the run rather than
+        // silently leaving the list: a process this run started would go unnamed by any line.
+        let mut broken = rows.clone();
+        for row in broken.iter_mut() {
+            if row.contains("process_peak_bytes=2716566814") {
+                *row = row.replace("process_peak_bytes=2716566814", "process_peak_bytes=two");
+            }
+        }
+        assert!(
+            super::path_peaks(2_458_419_200, &broken).is_err(),
+            "an unreadable reading is an error, not a reading dropped from the range"
+        );
+    }
+
+    /// The transcription cell's verdict is computed from the readings the run printed and
+    /// nothing else, over the processes that ran a call of message or corpus size. The hour-scale
+    /// inputs are a population of their own: their figures are stated under their own table.
+    #[test]
+    fn the_transcription_verdict_covers_this_runs_message_size_calls_only() {
+        let rows = prose_rows();
+        let body = section(&rows, "", 2_458_419_200).expect("a full section");
+        let peaks = super::path_peaks(2_458_419_200, &rows).expect("every reading parses");
+        let calls = &peaks.calls;
+        assert!(
+            body.contains("at its ceiling"),
+            "the readings meet 2.35 GiB:\n{body}"
+        );
+        for process in ["cell", "message 10 s cold run 3", "corpus cold"] {
+            assert!(
+                body.contains(process),
+                "the verdict names the process `{process}` it covers:\n{body}"
+            );
+        }
+        // The verdict is one sentence, and no hour-scale input is in it — neither its readings
+        // nor the range it states.
+        let verdict_at = body.find("its ceiling**: ").expect("a verdict");
+        let verdict = &body[verdict_at..][..body[verdict_at..].find('\n').expect("one line")];
+        for label in ["1min", "30min", "60min"] {
+            assert!(
+                !verdict.contains(label),
+                "the hour-scale input `{label}` does not enter the message-size verdict:\n\
+                 {verdict}"
+            );
+        }
+        assert_eq!(
+            peaks.hours.len(),
+            super::LONG_INPUTS.len(),
+            "the hour-scale population is the three inputs and nothing else"
+        );
+        // Their figures are quoted once, by the paragraph under their own table — the only place
+        // in the section that states them.
+        let growth_at = body
+            .rfind("`process peak GiB` is that process's high-water")
+            .expect("the paragraph under the long-input table");
+        assert!(
+            growth_at > verdict_at,
+            "the paragraph follows the verdict:\n{body}"
+        );
+        let hours = peaks
+            .hours
+            .iter()
+            .map(|reading| super::gib_text(reading.bytes))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            body[growth_at..].contains(&hours),
+            "the paragraph under the table quotes the hour-scale rows:\n{body}"
+        );
+        assert!(
+            !body[verdict_at..growth_at].contains(&hours),
+            "the hour-scale figures are stated once, under their table:\n{body}"
+        );
+        let low = calls.iter().map(|reading| reading.bytes).min().unwrap();
+        let high = calls.iter().map(|reading| reading.bytes).max().unwrap();
+        assert!(
+            body.contains(&format!(
+                "span\n{} to {}",
+                super::gib_text(low),
+                super::gib_text(high)
+            )),
+            "the range is the one the verdict's readings span:\n{body}"
+        );
+        // Lower every reading this run took under the ceiling: the same rows, and the verdict
+        // follows them — the sentence is not pinned to a number a rerun cannot reach.
+        fn lower(row: &str, low: u64) -> String {
+            row.split_whitespace()
+                .map(|token| {
+                    if let Some(list) = token.strip_prefix("process_peaks_bytes=") {
+                        let runs = list.split(',').count();
+                        format!(
+                            "process_peaks_bytes={}",
+                            vec![low.to_string(); runs].join(",")
+                        )
+                    } else if token.starts_with("process_peak_bytes=")
+                        || token.starts_with("moment_peak_bytes=")
+                    {
+                        let (name, _) = token
+                            .split_once('=')
+                            .expect("a peak token carries its value after `=`");
+                        format!("{name}={low}")
+                    } else {
+                        token.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        let rows: Vec<String> = prose_rows()
+            .iter()
+            .map(|row| lower(row, 2_362_232_012))
+            .collect();
+        let body = section(&rows, "", 2_362_232_012).expect("a full section");
+        assert!(
+            body.contains("inside its ceiling"),
+            "readings of 2.20 GiB are inside 2.35:\n{body}"
+        );
+    }
+
+    /// The growth paragraph follows the hour-scale readings it quotes: a set that rises is
+    /// described as rising, and one that does not is described as what it is.
+    #[test]
+    fn the_growth_paragraph_follows_the_hour_scale_readings() {
+        let rising = section(&prose_rows(), "", 2_458_419_200).expect("a full section");
+        assert!(
+            rising.contains("it does not fall with the input here"),
+            "the fixture's three peaks rise:\n{rising}"
+        );
+        // The longest input's peak below the shortest's: the paragraph states these readings and
+        // the fact that the high-water does not follow the length.
+        let rows: Vec<String> = prose_rows()
+            .into_iter()
+            .map(|row| {
+                if row.starts_with("transcribe long-input label=60min ") {
+                    row.replace(
+                        "process_peak_bytes=2684354560",
+                        "process_peak_bytes=2400000000",
+                    )
+                } else {
+                    row
+                }
+            })
+            .collect();
+        let falling = section(&rows, "", 2_458_419_200).expect("a full section");
+        assert!(
+            falling.contains("the high-water does not follow the length here"),
+            "{falling}"
+        );
+        assert!(
+            !falling.contains("it does not fall with the input here"),
+            "a set that does not rise is not described as rising:\n{falling}"
+        );
+    }
+
+    /// `at` covers three shapes of reading set, and the sentence the record carries names the
+    /// one the readings show: a set that does not match its sentence would claim a comparison
+    /// the run never took.
+    #[test]
+    fn the_at_verdict_names_the_shape_its_readings_show() {
+        let reading = |bytes: u64| super::PeakReading {
+            process: "cell".to_string(),
+            bytes,
+        };
+        // `transcribe`'s ceiling in bytes and the 0.01 GiB the printed figures resolve, read
+        // from the policy the record is judged by rather than restated here.
+        let (ceiling, quantum) = (
+            super::peak_ceiling_bytes("transcribe").expect("transcribe has a ceiling"),
+            super::PEAK_QUANTUM_BYTES,
+        );
+        let shape = |bytes: &[u64]| -> (&'static str, String) {
+            let readings: Vec<super::PeakReading> = bytes.iter().map(|b| reading(*b)).collect();
+            let (verdict, ceiling) =
+                super::peak_verdict(&readings, "transcribe").expect("a ceiling");
+            (verdict, super::at_note(&readings, ceiling))
+        };
+        let (verdict, note) = shape(&[ceiling + 1, ceiling + quantum - 1]);
+        assert_eq!(verdict, "at", "{note}");
+        assert!(
+            note.contains("No reading is below it")
+                && note.contains("2.35 GiB")
+                && note.contains("above it"),
+            "{note}"
+        );
+        let (verdict, note) = shape(&[ceiling - 1, ceiling - quantum + 1]);
+        assert_eq!(verdict, "at", "{note}");
+        assert!(
+            note.contains("No reading is above it") && note.contains("below it"),
+            "{note}"
+        );
+        let (verdict, note) = shape(&[ceiling - 2 * quantum, ceiling + 2 * quantum]);
+        assert_eq!(verdict, "at", "{note}");
+        assert!(note.contains("fall on both sides"), "{note}");
+        // A reading exactly on the ceiling is neither below nor above it: the set is one-sided,
+        // and the sentence may not claim a straddle a reading sitting on the line does not make.
+        let (verdict, note) = shape(&[ceiling, ceiling + 5]);
+        assert_eq!(verdict, "at", "{note}");
+        assert!(
+            note.contains("No reading is below it") && !note.contains("both sides"),
+            "{note}"
+        );
+        let (verdict, note) = shape(&[ceiling, ceiling - 5]);
+        assert_eq!(verdict, "at", "{note}");
+        assert!(
+            note.contains("No reading is above it") && !note.contains("both sides"),
+            "{note}"
+        );
+        // A reading sitting on the ceiling inside a set that straddles it is counted: the
+        // sentence accounts for every reading the verdict covers.
+        let (verdict, note) = shape(&[ceiling - 2 * quantum, ceiling, ceiling + 2 * quantum]);
+        assert_eq!(verdict, "at", "{note}");
+        assert!(
+            note.contains("1 below, 1 above, 1 on it"),
+            "the counts name the reading on the ceiling: {note}"
+        );
+    }
+
+    /// The swap line states both readings and the signed difference between them: a run that
+    /// gave swap back does not print a growth of zero, and only equal readings say nothing moved.
+    #[test]
+    fn the_swap_line_states_the_difference_its_readings_show() {
+        let provenance = |start: Option<u64>, table: Option<u64>| super::Provenance {
+            taken: "at".into(),
+            machine: "machine".into(),
+            device: "device".into(),
+            driver: "driver".into(),
+            profile: "profile".into(),
+            code: "code".into(),
+            thermal: "thermal".into(),
+            load_at_start: "0.0 0.0 0.0".into(),
+            load_at_table: "0.0 0.0 0.0".into(),
+            rss_ceiling_mib: 6144,
+            swap_ceiling_mib: 1024,
+            swap_at_start: start,
+            swap_at_table: table,
+            command: "mahbot-inference".into(),
+        };
+        let swap = |start: Option<u64>, table: Option<u64>| -> String {
+            provenance(start, table)
+                .render("none")
+                .lines()
+                .find(|line| line.starts_with("- swap: "))
+                .expect("the block carries a swap line")
+                .to_string()
+        };
+        let mib = 1u64 << 20;
+        let grown = swap(Some(100 * mib), Some(112 * mib));
+        assert!(grown.contains("12.0 MiB, grown during the run"), "{grown}");
+        let back = swap(Some(112 * mib), Some(100 * mib));
+        assert!(
+            back.contains("12.0 MiB, given back during the run") && !back.contains("grown"),
+            "{back}"
+        );
+        let still = swap(Some(100 * mib), Some(100 * mib));
+        assert!(
+            still.contains("unchanged during the run") && !still.contains("grown"),
+            "{still}"
+        );
+        // The growth re-derives from the two figures the same line prints: both are rounded to
+        // the tenth of a MiB it states them at, so subtracting them gives the figure beside
+        // them. These byte counts round the readings one way and their raw difference the other.
+        let start = (4_632.64 * mib as f64) as u64;
+        let table = (4_895.76 * mib as f64) as u64;
+        let line = swap(Some(start), Some(table));
+        let printed: Vec<f64> = line
+            .split(" — ")
+            .next()
+            .expect("the readings precede the dash")
+            .split_whitespace()
+            .filter_map(|token| token.parse().ok())
+            .collect();
+        let growth: f64 = line
+            .split(" — ")
+            .nth(1)
+            .expect("the growth follows the dash")
+            .split_whitespace()
+            .next()
+            .expect("a growth figure")
+            .parse()
+            .expect("a number");
+        assert_eq!(printed.len(), 2, "two readings: {line}");
+        assert!(
+            (printed[0] + growth - printed[1]).abs() < 1e-9,
+            "the growth is the difference of the printed readings: {line}"
+        );
+    }
+
+    /// The memory paragraph states only what the rows guarantee: the phase prints are taken
+    /// before the `memory` row, so one of them can never read higher — and a run whose rows say
+    /// otherwise is not described, it fails.
+    #[test]
+    fn the_memory_paragraph_follows_the_phase_prints_it_was_given() {
+        let with_phases = |peak: u64| {
+            let mut rows: Vec<String> = prose_rows()
+                .into_iter()
+                .filter(|row| !row.starts_with("transcribe peak "))
+                .collect();
+            rows.push(format!(
+                "transcribe peak phase=music process=cell moment_peak_bytes={peak} \
+                 weights=1.33GiB host=427819008"
+            ));
+            rows
+        };
+        // The cell's own reading and its phase print agree: the figure was reached by that phase.
+        let body = section(&with_phases(2_458_419_200), "", 2_458_419_200).expect("a full section");
+        assert!(
+            body.contains("the first phase print that carries it is `music` (2.29 GiB)"),
+            "{body}"
+        );
+        // A phase print below it: the figure was raised after that print, not by it.
+        let body = section(&with_phases(2_000_000_000), "", 2_458_419_200).expect("a full section");
+        assert!(
+            body.contains("the widest of its phase prints is `music` (1.86 GiB)"),
+            "{body}"
+        );
+        // A phase print above the row taken later is not one process's: a high-water never falls.
+        let error = section(&with_phases(2_600_000_000), "", 2_458_419_200)
+            .expect_err("a high-water cannot fall");
+        assert!(
+            format!("{error:#}").contains("a process high-water never falls"),
+            "{error:#}"
         );
     }
 
@@ -5117,25 +7403,23 @@ Provenance:
     /// `speak` came back blank without anything saying so.
     #[test]
     fn the_record_reports_a_denominator_for_every_spoken_row() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("MEASUREMENTS.md");
-        let Ok(text) = std::fs::read_to_string(&root) else {
+        let Some(text) = record() else {
             return;
         };
         for name in ["listen", "speak", "transcribe"] {
+            // A record written by a single-cell run carries only that cell's row: the check is
+            // of the rows the record does carry, so a partial record is not a failure.
             let Some(row) = text
                 .lines()
                 .find(|line| line.starts_with(&format!("| {name} |")))
             else {
+                eprintln!("skip: this record carries no `{name}` row");
                 continue;
             };
             let seconds = row.split('|').nth(4).unwrap_or_default().trim();
             assert!(
                 seconds.parse::<f64>().is_ok(),
-                "{name}'s speech denominator in {}: {row}",
-                root.display()
+                "{name}'s covered-audio denominator in MEASUREMENTS.md: {row}"
             );
         }
     }

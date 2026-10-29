@@ -1624,9 +1624,9 @@ fn token_rate() {
     }
 
     eprintln!(
-        "[decode token rate] harness_peak={} note=\"this process's peak resident \
+        "[decode token rate] process_peak_bytes={} note=\"this process's peak resident \
          set, which includes the stream-ceiling probe's own buffers; the harness's \
          own frame and not the stand's cell\"",
-        report::human(report::peak_rss())
+        report::peak_text()
     );
 }

@@ -13,11 +13,11 @@
 //! the first one's answer. The second question is the one that matters — a skip that
 //! skipped bytes no compile wrote would read as a win on the counter alone.
 //!
-//! The graph is two `Cumsum`s over two parked `F32` parameters, which is a geometry
-//! whose route proves the parking: a parked operand sends `Op::Cumsum` to the generic
-//! host route, so `ceiling_hosted_steps() >= 2` says both parameters really are where
-//! this test thinks they are — without it, "nothing was skipped" would also be true of
-//! parameters that never reached the weight buffer at all.
+//! Every graph here is a set of `Cumsum`s over parked `F32` parameters, which is a
+//! geometry whose route proves the parking: a parked operand sends `Op::Cumsum` to the
+//! generic host route, so `ceiling_hosted_steps() >= params` says every parameter really
+//! is where this test thinks it is — without it, "nothing was skipped" would also be
+//! true of parameters that never reached the weight buffer at all.
 
 use rlx_ir::{DType, Graph, Shape};
 use rlx_wgpu::backend::WgpuExecutable;
@@ -83,7 +83,13 @@ fn two_param_graph() -> Graph {
 }
 
 fn param_data(base: f32) -> Vec<f32> {
-    (0..ROWS * COLS)
+    param_data_rows(base, ROWS)
+}
+
+/// One parameter of `rows` rows, so a case can use a length the other layout does not
+/// (`2 * ROWS` for a fused projection, `3 * ROWS` for a longer name).
+fn param_data_rows(base: f32, rows: usize) -> Vec<f32> {
+    (0..rows * COLS)
         .map(|i| base + (i % 16) as f32 * 0.25)
         .collect()
 }
@@ -91,7 +97,7 @@ fn param_data(base: f32) -> Vec<f32> {
 /// What `exe.run(&[])` must answer: the running sum of `data` along the last axis.
 fn running_sum(data: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0f32; data.len()];
-    for r in 0..ROWS {
+    for r in 0..data.len() / COLS {
         let mut acc = 0.0f32;
         for c in 0..COLS {
             acc += data[r * COLS + c];
@@ -99,6 +105,47 @@ fn running_sum(data: &[f32]) -> Vec<f32> {
         }
     }
     out
+}
+
+/// A graph of one hosted `Cumsum` per `(name, rows)` parameter. The route proves the
+/// parking: a parked operand sends `Op::Cumsum` to the generic host route, so
+/// `ceiling_hosted_steps() >= params.len()` says every parameter really is where this
+/// test thinks it is — without it, "nothing was re-uploaded" would also be true of
+/// parameters that never reached the weight buffer at all.
+fn cumsum_graph(params: &[(&str, usize)]) -> Graph {
+    let mut g = Graph::new("weight-scope-layout");
+    let mut outputs = Vec::with_capacity(params.len());
+    for (name, rows) in params {
+        let shape = Shape::new(&[*rows, COLS], DType::F32);
+        let param = g.param(*name, shape.clone());
+        outputs.push(g.cumsum(param, -1, false, shape));
+    }
+    g.set_outputs(outputs);
+    g
+}
+
+/// Compile `graph`, upload `data`, then run. Answers the skipped-byte/write figures
+/// those uploads moved — measured around the uploads only — and the executable with its
+/// outputs.
+fn compile_graph_upload_and_run(
+    graph: Graph,
+    data: &[(&str, Vec<f32>)],
+) -> (u64, u64, WgpuExecutable, Vec<Vec<f32>>) {
+    let mut exe = WgpuExecutable::compile(graph);
+    assert!(
+        exe.ceiling_hosted_steps() >= data.len(),
+        "every parked parameter must reach the host route ({} hosted, {} parameters) — \
+         without that this case is not about the weight buffer",
+        exe.ceiling_hosted_steps(),
+        data.len()
+    );
+    let before = shared_weight_skip_stats();
+    for (name, values) in data {
+        exe.set_param(name, values);
+    }
+    let after = shared_weight_skip_stats();
+    let out = exe.run(&[]);
+    (after.0 - before.0, after.1 - before.1, exe, out)
 }
 
 /// One compile of the graph, both weights uploaded, then a run. Answers the
@@ -261,6 +308,158 @@ fn clearing_the_shared_buffer_makes_the_next_compile_upload_again() {
         "an emptied buffer has nothing to skip, so the compile pays the upload"
     );
     assert_eq!(out, want_outputs(), "and the executable still computes");
+
+    release();
+}
+
+/// A layout that spells one projection as a fused tensor and the next as two unfused
+/// ones — the shape a prefill/decode pair of one body has — must keep every name the
+/// two layouts *share* at the offset the first compile gave it. The fused tensor is a
+/// different name, so its bytes stay resident and unreferenced; what must not happen is
+/// the rest of the body being allocated and uploaded a second time.
+#[test]
+fn a_fused_projection_spelling_does_not_re_upload_the_shared_parameters() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let _exclusive = exclusive();
+    park_every_param();
+    set_param_sharing_scope("weight-scope/fused-spelling");
+
+    let a = param_data(0.0);
+    let b = param_data(1.0);
+    let fused = param_data_rows(2.0, 2 * ROWS);
+    let (skipped, _, mut first, first_out) = compile_graph_upload_and_run(
+        cumsum_graph(&[("a", ROWS), ("b", ROWS), ("blk.0.gate_up.fused", 2 * ROWS)]),
+        &[
+            ("a", a.clone()),
+            ("b", b.clone()),
+            ("blk.0.gate_up.fused", fused.clone()),
+        ],
+    );
+    assert_eq!(
+        skipped, 0,
+        "the first compile for a scope has nothing to skip"
+    );
+    assert_eq!(
+        first_out,
+        vec![running_sum(&a), running_sum(&b), running_sum(&fused)],
+        "the first executable must compute from its own upload"
+    );
+
+    let gate = param_data_rows(3.0, ROWS);
+    let up = param_data_rows(4.0, ROWS);
+    let (skipped, writes, _second, second_out) = compile_graph_upload_and_run(
+        cumsum_graph(&[
+            ("a", ROWS),
+            ("b", ROWS),
+            ("blk.0.ffn_gate.weight", ROWS),
+            ("blk.0.ffn_up.weight", ROWS),
+        ]),
+        &[
+            ("a", a.clone()),
+            ("b", b.clone()),
+            ("blk.0.ffn_gate.weight", gate.clone()),
+            ("blk.0.ffn_up.weight", up.clone()),
+        ],
+    );
+    assert_eq!(
+        (skipped, writes),
+        (2 * PARAM_BYTES, 2),
+        "the two names both layouts hold must ride the first compile's bytes; only the \
+         two names the fused spelling replaces are new, and they are one upload each"
+    );
+    assert_eq!(
+        second_out,
+        vec![
+            running_sum(&a),
+            running_sum(&b),
+            running_sum(&gate),
+            running_sum(&up),
+        ],
+        "the second executable must read the bytes the first compile placed for the \
+         shared names, and its own bytes for the appended ones"
+    );
+
+    // The first executable is still live. The second compile appended a shard and wrote
+    // only offsets the first one never binds, so re-running it must answer what it
+    // answered before — a scheme that moved bytes, or reused an offset for a different
+    // tensor, would show here.
+    assert_eq!(
+        first.run(&[]),
+        first_out,
+        "the first executable's bytes must not have been moved or overwritten"
+    );
+
+    release();
+}
+
+/// A name the entry does not hold yet — longer than any parameter of the first layout —
+/// is appended at an offset of its own and computes; and the same name with a different
+/// length is a *different* placement, not a silent alias of the shorter or longer one.
+#[test]
+fn a_new_or_longer_parameter_is_appended_and_still_computes() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let _exclusive = exclusive();
+    park_every_param();
+    set_param_sharing_scope("weight-scope/growing-layout");
+
+    let a = param_data(0.0);
+    let b = param_data(1.0);
+    let (skipped, _, _first, _) = compile_graph_upload_and_run(
+        cumsum_graph(&[("a", ROWS), ("b", ROWS)]),
+        &[("a", a.clone()), ("b", b.clone())],
+    );
+    assert_eq!(skipped, 0, "the first compile has nothing to skip");
+
+    let long = param_data_rows(2.0, 3 * ROWS);
+    let (skipped, writes, mut longer, longer_out) = compile_graph_upload_and_run(
+        cumsum_graph(&[("a", ROWS), ("b", ROWS), ("c.long", 3 * ROWS)]),
+        &[("a", a.clone()), ("b", b.clone()), ("c.long", long.clone())],
+    );
+    assert_eq!(
+        (skipped, writes),
+        (2 * PARAM_BYTES, 2),
+        "the shared names ride the first compile's bytes; the longer name is new"
+    );
+    assert_eq!(
+        longer_out,
+        vec![running_sum(&a), running_sum(&b), running_sum(&long)],
+        "the longer layout must compute from the shared bytes and its own"
+    );
+
+    // Same name, shorter length: (name, byte length) is the identity, so this is a new
+    // placement — keying on the name alone would bind it to the 3-row bytes and both
+    // the skip count and the answer would be wrong.
+    let short = param_data_rows(3.0, ROWS);
+    let (skipped, writes, _, short_out) = compile_graph_upload_and_run(
+        cumsum_graph(&[("a", ROWS), ("b", ROWS), ("c.long", ROWS)]),
+        &[
+            ("a", a.clone()),
+            ("b", b.clone()),
+            ("c.long", short.clone()),
+        ],
+    );
+    assert_eq!(
+        (skipped, writes),
+        (2 * PARAM_BYTES, 2),
+        "a shorter tensor of the same name is not the longer one: only `a` and `b` are \
+         shared bytes"
+    );
+    assert_eq!(
+        short_out,
+        vec![running_sum(&a), running_sum(&b), running_sum(&short)],
+        "and it must compute from its own upload, not from the longer bytes"
+    );
+
+    // The longer layout's executable is still live and must keep its answer.
+    assert_eq!(
+        longer.run(&[]),
+        longer_out,
+        "appending a different length must not move the bytes the longer executable binds"
+    );
 
     release();
 }

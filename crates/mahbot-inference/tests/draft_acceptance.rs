@@ -1265,9 +1265,9 @@ fn draft_acceptance() {
         &[("pinned", &curves), ("alternate", &other)],
     );
     println!(
-        "census draft done build_ms={:.1} peak={} wall_ms={:.1}",
+        "census draft done build_ms={:.1} process_peak_bytes={} wall_ms={:.1}",
         pinned.build_ms,
-        report::human(report::peak_rss()),
+        report::peak_text(),
         started.ms(),
     );
 }

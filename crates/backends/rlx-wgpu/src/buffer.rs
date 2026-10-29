@@ -27,28 +27,74 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// One entry per **declared sharing scope** ([`set_param_sharing_scope`]), so two
 /// models' graphs keep their own allocation instead of thrashing one buffer; scope 0
-/// — no scope declared — keeps the single-entry behaviour this had before scoping.
+/// — no scope declared — keeps a per-layout entry, because such a compile may share
+/// the bytes it re-uploads but never skip one, so only an identical layout is safe.
+///
+/// Inside a scoped entry a parameter is identified by its **(name, byte length)**,
+/// not by a cursor derived from the layout's parameter order. The offset a name is
+/// first placed at is the offset every later compile binds it to, so a graph that
+/// spells one projection differently — fused `gate_up` against separate
+/// `ffn_gate`/`ffn_up` — no longer shifts every parameter after it and allocates the
+/// body's bytes a second time. A name the entry does not hold yet is appended, in a
+/// new shard when the current shards cannot fit it; nothing is ever moved, because a
+/// live executable binds these buffers and offsets.
+///
 /// Within one entry a parameter is still re-uploaded on compile *unless* the entry's
 /// [`slots`](Self::slots) name that same scope for the exact offset, which is the
 /// re-upload a second compile of the same model skips.
 ///
 /// Disable with `RLX_WGPU_SHARE_WEIGHTS=0`, which turns off the sharing and the skip
-/// together. Fingerprint includes sorted `(param_name, nbytes, offset)` so unrelated
-/// packages with coincidentally similar byte cursors do not share buffers.
+/// together. An unscoped entry's fingerprint includes sorted `(param_name, nbytes,
+/// offset)` so unrelated packages with coincidentally similar byte cursors do not
+/// share buffers.
 struct SharedWeightBuffers {
     /// Process-unique stamp for this allocation. An arena skips a weight write only
     /// while the live entry for its scope still carries the generation it adopted, so
     /// an evicted and re-created entry can never make a compile skip bytes that are
     /// not where it thinks they are.
     generation: u64,
-    first: wgpu::Buffer,
-    extras: Vec<wgpu::Buffer>,
+    /// Physical shards, shard 0 first. Append-only: a compile that needs room the
+    /// current shards do not have gets a new shard instead of a moved byte, so an
+    /// executable already binding them keeps its offsets.
+    shards: Vec<wgpu::Buffer>,
+    /// Bytes handed out of each shard, parallel to [`Self::shards`].
+    used: Vec<usize>,
+    /// Stripe width: `offset / shard_size` selects the shard and
+    /// `offset % shard_size` is the local offset. 0 means one buffer addressed
+    /// whole; a later append that needs a second shard fixes the width above every
+    /// offset already placed (they all end below [`Self::used`]`[0]`), so those keep
+    /// resolving to shard 0 at the same local offset.
     shard_size: usize,
+    /// The one offset a parameter of this (name, byte length) is bound to in this
+    /// scope. A placement is made once and never moved.
+    placements: HashMap<(String, usize), usize>,
+    /// Logical byte size of the layout that created an **unscoped** entry, which is
+    /// what tells a later unscoped compile that its layout is the same one.
     logical_bytes: usize,
     /// Byte offset in the weight buffer → the scope whose compile wrote it. An offset
     /// the scope never wrote is not skippable, which is why the first compile for a
     /// scope uploads everything.
     slots: HashMap<usize, u64>,
+}
+
+impl SharedWeightBuffers {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            shards: Vec::new(),
+            used: Vec::new(),
+            shard_size: 0,
+            placements: HashMap::new(),
+            logical_bytes: 0,
+            slots: HashMap::new(),
+        }
+    }
+
+    /// Physical bytes this entry holds, which is what the byte bound counts: a
+    /// shard's spare room still occupies the device.
+    fn resident_bytes(&self) -> usize {
+        self.shards.iter().map(|b| b.size() as usize).sum()
+    }
 }
 
 /// How many shared weight allocations are kept, and how many bytes they may hold
@@ -59,11 +105,24 @@ struct SharedWeightBuffers {
 const MAX_SHARED_WEIGHT_SCOPES: usize = 8;
 const MAX_SHARED_WEIGHT_BYTES: usize = 3 << 30;
 
-/// One shared allocation per **layout**, not per model: a prefill graph and a decode
-/// graph of the same body park different parameter sets (the head is a prefill
-/// parameter), so one buffer per scope would have the two layouts replace each other on
-/// every compile and reuse nothing.
-type SharedWeightMap = HashMap<(u64 /*scope*/, u64 /*layout fingerprint*/), SharedWeightBuffers>;
+/// Alignment every parked parameter starts at in a physical shard: a storage binding's
+/// offset, and therefore the one this planner hands out.
+const WEIGHT_WALIGN: usize = 256;
+
+fn weight_align(bytes: usize) -> usize {
+    bytes.div_ceil(WEIGHT_WALIGN) * WEIGHT_WALIGN
+}
+
+/// One shared allocation per **declared scope**; when no scope is declared the key's
+/// second half is the layout fingerprint, because such a compile may share the bytes
+/// it re-uploads but never skip one, so only an identical layout is safe to share.
+type SharedWeightMap = HashMap<
+    (
+        u64, /*scope*/
+        u64, /*layout fingerprint (unscoped)*/
+    ),
+    SharedWeightBuffers,
+>;
 
 fn shared_weights() -> &'static Mutex<SharedWeightMap> {
     static SHARED_WEIGHTS: OnceLock<Mutex<SharedWeightMap>> = OnceLock::new();
@@ -86,6 +145,19 @@ static WEIGHT_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// because a compile for the same scope had already placed them.
 static SHARED_WEIGHT_SKIPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 static SHARED_WEIGHT_SKIPPED_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// The bytes the shared weight entries hold on the device right now — one model's
+/// parameter bytes per scope, plus whatever a layout appended that the scope had not
+/// placed yet. What a cell reports as its weight residency, rather than inferring it
+/// from the model files' own size.
+pub fn shared_weight_bytes() -> usize {
+    shared_weights()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .map(SharedWeightBuffers::resident_bytes)
+        .sum()
+}
 
 /// Derive a scope id from a label: FNV-1a, with the low bit set so a label never
 /// hashes to 0 (which means "no scope declared"). Byte-for-byte what
@@ -168,6 +240,300 @@ fn weight_layout_fingerprint(
         }
     }
     fp
+}
+
+/// The weight allocation one compile ends up bound to, plus the per-node offsets its
+/// steps carry.
+struct WeightAllocation {
+    shards: Vec<wgpu::Buffer>,
+    shard_size: usize,
+    /// `Some` only for a declared scope whose entry took this compile's parameters.
+    share: Option<((u64, u64), u64)>,
+    offsets: HashMap<NodeId, usize>,
+}
+
+/// Where a scoped compile's parameters go in its entry, planned without changing it.
+struct WeightPlacementPlan {
+    /// One offset per candidate, in candidate order.
+    offsets: Vec<usize>,
+    /// Sizes of the shards to append, in order.
+    new_shards: Vec<usize>,
+    /// Per-shard byte high-water after this plan, parallel to the entry's shards
+    /// followed by the appended ones.
+    used: Vec<usize>,
+    /// The `(name, byte length) → offset` pairs this compile places for the first time.
+    placements: HashMap<(String, usize), usize>,
+    shard_size: usize,
+}
+
+/// Plan one compile's placements inside `entry`: a name the entry already holds keeps
+/// the entry's offset — the same offset every other compile binds it to — and a name it
+/// does not hold is appended to a shard with room or to a new shard. `None` when the
+/// entry cannot take the compile within [`MAX_SHARDS`], or when a compile that starts
+/// the entry would not fit its whole layout in one weight buffer (the caller then keeps
+/// the old spill-into-the-act-arena behaviour).
+fn plan_weight_placements(
+    entry: &SharedWeightBuffers,
+    params: &[(String, usize)],
+    shard_cap: usize,
+) -> Option<WeightPlacementPlan> {
+    debug_assert_eq!(entry.shards.len(), entry.used.len());
+    debug_assert!(entry.shards.len() <= 1 || entry.shard_size > 0);
+    let mut shard_size = entry.shard_size;
+    let mut caps: Vec<usize> = entry.shards.iter().map(|b| b.size() as usize).collect();
+    let mut used = entry.used.clone();
+    let mut offsets = Vec::with_capacity(params.len());
+    let mut new_shards: Vec<usize> = Vec::new();
+    let mut placements: HashMap<(String, usize), usize> = HashMap::new();
+    // Bytes of this compile's names the entry does not hold yet: what every shard this
+    // plan appends has to make room for, so one append usually takes the whole batch.
+    // Distinct names only — a graph that names one tensor twice shares one placement.
+    let mut remaining = 0usize;
+    {
+        let mut counted: HashSet<(&str, usize)> = HashSet::new();
+        for (name, nbytes) in params {
+            if entry.placements.contains_key(&(name.clone(), *nbytes)) {
+                continue;
+            }
+            if counted.insert((name.as_str(), *nbytes)) {
+                remaining += weight_align(*nbytes);
+            }
+        }
+    }
+    for (name, nbytes) in params {
+        let key = (name.clone(), *nbytes);
+        if let Some(&off) = entry.placements.get(&key).or_else(|| placements.get(&key)) {
+            offsets.push(off);
+            continue;
+        }
+        let mut placed = None;
+        for i in 0..caps.len() {
+            let start = weight_align(used[i]);
+            if shard_size > 0 && start.saturating_add(*nbytes) > shard_size {
+                continue;
+            }
+            if start.saturating_add(*nbytes) <= caps[i] {
+                used[i] = start + nbytes;
+                placed = Some(i * shard_size + start);
+                break;
+            }
+        }
+        let off = match placed {
+            Some(off) => off,
+            None => {
+                let idx = caps.len();
+                let size = if idx == 0 {
+                    // The entry's first shard keeps the geometry a compile without
+                    // sharing has always had: one whole-addressed buffer. A layout
+                    // larger than one buffer keeps spilling into the act arena.
+                    if remaining > shard_cap {
+                        return None;
+                    }
+                    remaining
+                } else {
+                    if shard_size == 0 {
+                        // Fix the stripe width above every offset already placed:
+                        // they all end below `used[0]`, so they keep resolving to
+                        // shard 0 at the same local offset.
+                        shard_size = weight_align(used[0].max(shard_cap));
+                    }
+                    if *nbytes > shard_size {
+                        return None;
+                    }
+                    weight_align(remaining.min(shard_size).max(*nbytes))
+                };
+                if idx + 1 > MAX_SHARDS {
+                    return None;
+                }
+                caps.push(size);
+                used.push(*nbytes);
+                new_shards.push(size);
+                idx * shard_size
+            }
+        };
+        offsets.push(off);
+        placements.insert(key, off);
+        remaining = remaining.saturating_sub(weight_align(*nbytes));
+    }
+    Some(WeightPlacementPlan {
+        offsets,
+        new_shards,
+        used,
+        placements,
+        shard_size,
+    })
+}
+
+/// Evict the oldest entries of the shared weight pool until `keep` more bytes and one
+/// more entry fit inside both bounds. Both callers hold the entry they are allocating for
+/// out of the map while they call this, so no map key needs protecting: the buffers in use
+/// are not in it.
+fn evict_to_fit(guard: &mut SharedWeightMap, keep: usize) {
+    let mut held: usize = guard
+        .values()
+        .map(SharedWeightBuffers::resident_bytes)
+        .sum();
+    if held.saturating_add(keep) <= MAX_SHARED_WEIGHT_BYTES
+        && guard.len() < MAX_SHARED_WEIGHT_SCOPES
+    {
+        return;
+    }
+    let mut oldest: Vec<((u64, u64), u64, usize)> = guard
+        .iter()
+        .map(|(k, entry)| (*k, entry.generation, entry.resident_bytes()))
+        .collect();
+    oldest.sort_by_key(|(_, generation, _)| *generation);
+    for (victim, _, bytes) in oldest {
+        if held.saturating_add(keep) <= MAX_SHARED_WEIGHT_BYTES
+            && guard.len() < MAX_SHARED_WEIGHT_SCOPES
+        {
+            break;
+        }
+        guard.remove(&victim);
+        held -= bytes;
+    }
+}
+
+/// Bind `params` to the shared entry for `scope`, appending shards for names the entry
+/// does not hold yet. `None` — with the entry left exactly as it was — when this
+/// compile gets its own allocation instead: an empty name cannot identify a tensor
+/// across compiles, the entry cannot take the bytes within
+/// [`MAX_SHARED_WEIGHT_BYTES`], its shard count would pass [`MAX_SHARDS`], or its first
+/// allocation would not fit one weight buffer.
+fn bind_shared_weights(
+    device: &wgpu::Device,
+    scope: u64,
+    params: &[(NodeId, usize, usize, String)], // (id, ne, nbytes, name)
+    shard_cap: usize,
+) -> Option<WeightAllocation> {
+    if params.iter().any(|(_, _, _, name)| name.is_empty()) {
+        return None;
+    }
+    let key = (scope, 0u64);
+    let mut guard = shared_weights().lock().unwrap_or_else(|e| e.into_inner());
+    let existed = guard.contains_key(&key);
+    let mut entry = guard.remove(&key).unwrap_or_else(|| {
+        SharedWeightBuffers::new(WEIGHT_GENERATION.fetch_add(1, Ordering::Relaxed))
+    });
+    let shaped: Vec<(String, usize)> = params
+        .iter()
+        .map(|(_, _, nbytes, name)| (name.clone(), *nbytes))
+        .collect();
+    let Some(plan) = plan_weight_placements(&entry, &shaped, shard_cap) else {
+        if existed {
+            guard.insert(key, entry);
+        }
+        return None;
+    };
+    // A layout that never compiles again must not hold its weight allocation for the
+    // life of the process: past either bound, the oldest entries go first — never the one
+    // being allocated for, whose buffers are used just below.
+    let grow: usize = plan.new_shards.iter().sum();
+    let keep = entry.resident_bytes().saturating_add(grow);
+    evict_to_fit(&mut guard, keep);
+    let held: usize = guard
+        .values()
+        .map(SharedWeightBuffers::resident_bytes)
+        .sum();
+    if held.saturating_add(keep) > MAX_SHARED_WEIGHT_BYTES
+        || guard.len() >= MAX_SHARED_WEIGHT_SCOPES
+    {
+        if existed {
+            guard.insert(key, entry);
+        }
+        return None;
+    }
+    for size in &plan.new_shards {
+        entry
+            .shards
+            .push(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rlx-wgpu weight buffer (packed quant)"),
+                size: *size as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }));
+    }
+    entry.used = plan.used;
+    entry.shard_size = plan.shard_size;
+    entry.placements.extend(plan.placements);
+    let allocation = WeightAllocation {
+        shards: entry.shards.clone(),
+        shard_size: entry.shard_size,
+        share: Some((key, entry.generation)),
+        offsets: params
+            .iter()
+            .zip(plan.offsets)
+            .map(|((id, _, _, _), off)| (*id, off))
+            .collect(),
+    };
+    guard.insert(key, entry);
+    Some(allocation)
+}
+
+/// Give a compile its own weight buffer, exactly as it was allocated before scoped
+/// sharing: each candidate takes the next aligned offset while it fits `shard_cap`, and
+/// one that does not spills into the activation arena. Answers the weight-buffer bytes
+/// the compile's own layout uses.
+fn place_private_weights(
+    new_plan: &mut MemoryPlan,
+    tail: &mut usize,
+    params: &[(NodeId, usize, usize, String)], // (id, ne, nbytes, name)
+    weight_offsets: &mut HashMap<NodeId, usize>,
+    shard_cap: usize,
+) -> usize {
+    let mut cursor = 0usize;
+    for (id, ne, nbytes, _) in params {
+        cursor = weight_align(cursor);
+        if cursor.saturating_add(*nbytes) > shard_cap {
+            *tail = tail.div_ceil(16) * 16;
+            new_plan.assignments.insert(
+                *id,
+                rlx_opt::memory::BufferSlot {
+                    offset: *tail,
+                    size: *ne * 4,
+                },
+            );
+            *tail += *ne * 4;
+            continue;
+        }
+        weight_offsets.insert(*id, cursor);
+        cursor += *nbytes;
+    }
+    cursor
+}
+
+/// Physical shards for a compile that has no shared entry: exactly the geometry
+/// [`Arena::from_plan_split`] has always allocated — one whole-addressed shard while
+/// the layout fits `shard_cap`, a shard per cap-sized stripe otherwise. The caller
+/// derives the shard size from the same [`bound_stripes`] count itself.
+fn create_private_weight_shards(
+    device: &wgpu::Device,
+    weight_bytes: usize,
+    shard_cap: usize,
+) -> Vec<wgpu::Buffer> {
+    let n_shards = bound_stripes("the parked weight buffer", weight_bytes, shard_cap);
+    let mut shards = Vec::with_capacity(n_shards);
+    for i in 0..n_shards {
+        let begin = i * shard_cap;
+        // Ends on a 16-byte multiple: the one-row multiply reads its packed blocks as
+        // 16-byte legs, so its weight window is cut on one and a buffer ending
+        // mid-group would refuse the cut (`gguf_gpu::gemv_weight_window`).
+        let this = (weight_bytes - begin)
+            .min(shard_cap)
+            .max(16)
+            .next_multiple_of(16);
+        shards.push(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rlx-wgpu weight buffer (packed quant)"),
+            size: this as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }));
+    }
+    shards
 }
 
 fn share_weights_enabled() -> bool {
@@ -1103,10 +1469,10 @@ pub struct Arena {
     pub weight_shard_size: usize,
     /// Per-node byte offset into the logical weight buffer (quant / parked).
     pub weight_offsets: HashMap<NodeId, usize>,
-    /// The shared entry this arena adopted — `((scope, layout fingerprint), generation)`
-    /// — when a scope was declared, sharing was on, and the allocation came from that
-    /// entry. It is what lets a write skip bytes the scope's earlier compile already
-    /// placed there, so `None` means this arena owns what it writes.
+    /// The shared entry this arena adopted — `((scope, 0), generation)` — when a scope
+    /// was declared, sharing was on, and the allocation came from that entry. It is
+    /// what lets a write skip bytes the scope's earlier compile already placed there,
+    /// so `None` means this arena owns what it writes.
     pub weight_share: Option<((u64, u64), u64)>,
     /// Weight-buffer offsets this arena has written itself. A param re-set on the
     /// same executable must land, so an offset in here is never skipped: the scope
@@ -1615,7 +1981,6 @@ impl Arena {
             rlx_compile::memory::GuardedPlanner::F32UniformNoParams,
             dequant_route_defers_host_read(),
         );
-        let walign = 256usize; // storage-buffer offset alignment for windowed binds
         let a = 16usize;
         let mut weight_offsets: HashMap<NodeId, usize> = HashMap::new();
         let mut weight_cursor = 0usize;
@@ -1710,6 +2075,12 @@ impl Arena {
         // weight shard with any param while room remains (largest first).
         let fill_weight_shard = max_buf <= (2usize << 30);
         let mut named_weight_slots: Vec<(String, usize, usize)> = Vec::new();
+        // Parameters this compile parks in the weight buffer. A declared scope places
+        // them by name afterwards, against the one entry its scope owns; every other
+        // compile takes the offsets below.
+        let mut weight_candidates: Vec<(NodeId, usize, usize, String)> = Vec::new();
+        let scope = weight_scope();
+        let shared_scope = param_sharing_declared();
         for (id, ne, nbytes, dt, is_param, name) in park_candidates {
             let packed_quant = matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8);
             // A generic op reaches a weight-buffer param only by staging a copy
@@ -1748,7 +2119,11 @@ impl Arena {
                     tail += ne * 4;
                     continue;
                 }
-                weight_cursor = weight_cursor.div_ceil(walign) * walign;
+                if shared_scope {
+                    weight_candidates.push((id, ne, nbytes, name));
+                    continue;
+                }
+                weight_cursor = weight_align(weight_cursor);
                 // Single-shard budget: spill to act once the weight buffer is full.
                 if weight_cursor.saturating_add(nbytes) > weight_shard_cap {
                     tail = tail.div_ceil(a) * a;
@@ -1775,6 +2150,39 @@ impl Arena {
                     },
                 );
                 tail += ne * 4;
+            }
+        }
+        // A declared scope binds these parameters to the offsets its entry already
+        // holds, appending only the names it has not placed yet — the same tensor name
+        // and length is never allocated twice in one scope. Anything else (no entry
+        // room, an unnamed parameter, a failed first allocation) gives this compile its
+        // own allocation, exactly as it would have without sharing. This has to happen
+        // before the view aliases below, which resolve a view of a parked parameter
+        // through `weight_offsets`.
+        let mut weight_allocation: Option<WeightAllocation> = None;
+        if !weight_candidates.is_empty() {
+            let shared = shared_scope
+                .then(|| bind_shared_weights(device, scope, &weight_candidates, weight_shard_cap))
+                .flatten();
+            match shared {
+                Some(allocation) => {
+                    weight_offsets.extend(allocation.offsets.iter().map(|(id, off)| (*id, *off)));
+                    // Diagnostics only: this compile's own parked bytes.
+                    weight_cursor = weight_candidates
+                        .iter()
+                        .map(|(_, _, nbytes, _)| *nbytes)
+                        .sum();
+                    weight_allocation = Some(allocation);
+                }
+                None => {
+                    weight_cursor = place_private_weights(
+                        &mut new_plan,
+                        &mut tail,
+                        &weight_candidates,
+                        &mut weight_offsets,
+                        weight_shard_cap,
+                    );
+                }
             }
         }
         // Alias pure views onto roots now that params live in `assignments`
@@ -1841,7 +2249,13 @@ impl Arena {
             );
         }
         let mut arena = Self::from_plan_with_scratch(device, &new_plan, scratch_bytes);
-        if weight_cursor > 0 {
+        if let Some(allocation) = weight_allocation {
+            arena.weight_buffer = allocation.shards.first().cloned();
+            arena.weight_extra_shards = allocation.shards[1..].to_vec();
+            arena.weight_shard_size = allocation.shard_size;
+            arena.weight_share = allocation.share;
+            arena.weight_offsets = weight_offsets;
+        } else if weight_cursor > 0 {
             // Same bound as the activation arena, through the same helper (see
             // MAX_SHARDS): the weight buffer stripes on the same lever, and a
             // shrunken cap turns a model's weights into the same unbounded geometry.
@@ -1858,15 +2272,18 @@ impl Arena {
             named_weight_slots.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
             let fp = weight_layout_fingerprint(weight_cursor, &named_weight_slots);
             let shard_size = if n_shards > 1 { weight_shard_cap } else { 0 };
-            let scope = weight_scope();
-            let key = (scope, fp);
-            let reused = if share_weights_enabled() {
+            // Only an *unscoped* compile shares bytes here: it may re-upload what it
+            // binds but can never skip a write, so only an identical layout is safe to
+            // share. A scoped compile that reached this point had its entry refuse to
+            // grow and keeps its allocation to itself.
+            let key = (0u64, fp);
+            let reused = if scope == 0 && share_weights_enabled() {
                 let guard = shared_weights().lock().unwrap_or_else(|e| e.into_inner());
                 match guard.get(&key) {
                     Some(shared)
                         if shared.logical_bytes == weight_cursor
                             && shared.shard_size == shard_size
-                            && shared.extras.len() + 1 == n_shards =>
+                            && shared.shards.len() == n_shards =>
                     {
                         if shard_log() {
                             eprintln!(
@@ -1874,90 +2291,45 @@ impl Arena {
                                 weight_cursor as f64 / (1u64 << 30) as f64,
                             );
                         }
-                        Some((
-                            shared.first.clone(),
-                            shared.extras.clone(),
-                            shared.shard_size,
-                            shared.generation,
-                        ))
+                        Some(shared.shards.clone())
                     }
                     _ => None,
                 }
             } else {
                 None
             };
-            if let Some((first, extras, ws, generation)) = reused {
-                arena.weight_buffer = Some(first);
-                arena.weight_extra_shards = extras;
-                arena.weight_shard_size = ws;
-                // A declared scope may skip a write into these bytes; without one the
-                // arena shares the allocation but owns everything it writes.
-                arena.weight_share = (scope != 0).then_some((key, generation));
-            } else {
-                let mut shards = Vec::with_capacity(n_shards);
-                for i in 0..n_shards {
-                    let begin = i * weight_shard_cap;
-                    // Ends on a 16-byte multiple: the one-row multiply reads its packed
-                    // blocks as 16-byte legs, so its weight window is cut on one and a
-                    // buffer ending mid-group would refuse the cut
-                    // (`gguf_gpu::gemv_weight_window`).
-                    let this = (weight_cursor - begin)
-                        .min(weight_shard_cap)
-                        .max(16)
-                        .next_multiple_of(16);
-                    shards.push(device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("rlx-wgpu weight buffer (packed quant)"),
-                        size: this as u64,
-                        usage: wgpu::BufferUsages::STORAGE
-                            | wgpu::BufferUsages::COPY_DST
-                            | wgpu::BufferUsages::COPY_SRC,
-                        mapped_at_creation: false,
-                    }));
-                }
-                let first = shards.remove(0);
-                let extras = shards;
-                if share_weights_enabled() {
-                    let mut guard = shared_weights().lock().unwrap_or_else(|e| e.into_inner());
-                    // A layout that never compiles again must not hold its weight
-                    // allocation for the life of the process: past the entry cap or the
-                    // byte cap, the oldest entries go first — never the one being
-                    // allocated for, whose buffers are used just below.
-                    if !guard.contains_key(&key) {
-                        let mut held: usize = guard.values().map(|entry| entry.logical_bytes).sum();
-                        let mut oldest: Vec<((u64, u64), u64, usize)> = guard
-                            .iter()
-                            .filter(|(k, _)| **k != key)
-                            .map(|(k, entry)| (*k, entry.generation, entry.logical_bytes))
-                            .collect();
-                        oldest.sort_by_key(|(_, generation, _)| *generation);
-                        for (victim, _, bytes) in oldest {
-                            if guard.len() < MAX_SHARED_WEIGHT_SCOPES
-                                && held + weight_cursor <= MAX_SHARED_WEIGHT_BYTES
-                            {
-                                break;
-                            }
-                            guard.remove(&victim);
-                            held -= bytes;
-                        }
+            let shards = match reused {
+                Some(shards) => shards,
+                None => {
+                    let shards =
+                        create_private_weight_shards(device, weight_cursor, weight_shard_cap);
+                    if scope == 0 && share_weights_enabled() {
+                        let mut guard = shared_weights().lock().unwrap_or_else(|e| e.into_inner());
+                        // A layout that never compiles again must not hold its weight
+                        // allocation for the life of the process: past the entry cap or
+                        // the byte cap, the oldest entries go first.
+                        let keep: usize = shards.iter().map(|b| b.size() as usize).sum();
+                        evict_to_fit(&mut guard, keep);
+                        let generation = WEIGHT_GENERATION.fetch_add(1, Ordering::Relaxed);
+                        guard.insert(
+                            key,
+                            SharedWeightBuffers {
+                                generation,
+                                shards: shards.clone(),
+                                used: vec![0; shards.len()],
+                                shard_size,
+                                placements: HashMap::new(),
+                                logical_bytes: weight_cursor,
+                                slots: HashMap::new(),
+                            },
+                        );
                     }
-                    let generation = WEIGHT_GENERATION.fetch_add(1, Ordering::Relaxed);
-                    guard.insert(
-                        key,
-                        SharedWeightBuffers {
-                            generation,
-                            first: first.clone(),
-                            extras: extras.clone(),
-                            shard_size,
-                            logical_bytes: weight_cursor,
-                            slots: HashMap::new(),
-                        },
-                    );
-                    arena.weight_share = (scope != 0).then_some((key, generation));
+                    shards
                 }
-                arena.weight_buffer = Some(first);
-                arena.weight_extra_shards = extras;
-                arena.weight_shard_size = shard_size;
-            }
+            };
+            arena.weight_buffer = shards.first().cloned();
+            arena.weight_extra_shards = shards[1..].to_vec();
+            arena.weight_shard_size = shard_size;
             arena.weight_offsets = weight_offsets;
         }
         // This planner has the graph, so it records the parameter-storage bounds

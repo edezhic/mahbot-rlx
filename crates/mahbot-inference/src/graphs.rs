@@ -1390,6 +1390,64 @@ impl LayerStage for BodyStateStage {
     }
 }
 
+/// Fuse the body's two projections, each for the whole graph or not at all: the decision is
+/// taken for every layer before the first blob is built, so a graph that cannot fuse one
+/// projection parks nothing for the layers it would have taken. The two flags are
+/// **independent** — on the pinned Q4_K_M body `attn_v` is Q6_K, so q/k/v cannot share one
+/// blob while gate+up can, and coupling them would park both spellings of every ffn and put
+/// two copies of it on the device.
+///
+/// A projection's fuse can still be refused per layer after the graph-level decision — a
+/// stacked tensor's step, say. The layers before the refusal keep the blobs already built
+/// in the process cache while the graph is then built without them; that residue is bounded
+/// by one projection of one graph and is the price of deciding before building rather than
+/// parking a second spelling of every layer, which is what the alternative costs.
+///
+/// `prefix` is the blocks' own name prefix (`""` for the body, `a.gen.code.` for the code
+/// predictor), so both layouts of one file ask the weight pool for the same blob names.
+fn fuse_layer_projections(
+    weights: &mut LoaderWeights,
+    layers: usize,
+    prefix: &str,
+) -> Result<(bool, bool)> {
+    const QKV: [&str; 3] = ["attn_q", "attn_k", "attn_v"];
+    const GATE_UP: [&str; 2] = ["ffn_gate", "ffn_up"];
+    let names = |i: usize, parts: &[&str]| -> Vec<String> {
+        parts
+            .iter()
+            .map(|p| format!("{prefix}blk.{i}.{p}.weight"))
+            .collect()
+    };
+    let admits = |weights: &LoaderWeights, parts: &[&str]| -> Result<bool> {
+        for i in 0..layers {
+            let keys = names(i, parts);
+            if !weights.can_fuse(&keys.iter().map(String::as_str).collect::<Vec<_>>())? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    let (mut qkv, mut gate_up) = (admits(weights, &QKV)?, admits(weights, &GATE_UP)?);
+    for (fuse, parts, blob) in [
+        (&mut qkv, &QKV[..], "qkv"),
+        (&mut gate_up, &GATE_UP[..], "gate_up"),
+    ] {
+        for i in 0..layers {
+            if !*fuse {
+                break;
+            }
+            let keys = names(i, parts);
+            // A layer the fuse refused changes the answer for the whole graph: the layers
+            // are then built without a blob that was not made.
+            *fuse = weights.fuse_packed(
+                &format!("{prefix}blk.{i}.{blob}.fused"),
+                &keys.iter().map(String::as_str).collect::<Vec<_>>(),
+            )?;
+        }
+    }
+    Ok((qkv, gate_up))
+}
+
 /// The body on a **growing** cache with the file's own head: `m` prompt rows,
 /// `prefix` rows already carried, logits and the new cache rows out. This is the
 /// recognition/synthesis prompt prefill.
@@ -1401,6 +1459,11 @@ pub fn body_new_rows_head_chain(
 ) -> Result<BuiltModel> {
     let cfg = model.config().clone();
     let mut weights = LoaderWeights::new(model.clone());
+    // The same fused projections the decode graph parks, name for name: the two layouts of
+    // one body then ask the weight pool for the same tensors, so the device holds the body
+    // once for a prefill and a decode of it
+    // ([`rlx_wgpu::buffer::set_param_sharing_scope`]).
+    let (fused, fused_gate_up) = fuse_layer_projections(&mut weights, cfg.layers, "")?;
     let flow = ModelFlow::new(format!("body_rows_{m}_p{prefix}_h{head}"))
         .with_profile(profile())
         .input("x", Shape::new(&[m, cfg.d], DType::F32))
@@ -1414,8 +1477,8 @@ pub fn body_new_rows_head_chain(
             head,
             plane_cache: false,
             packed_feed: false,
-            fused: false,
-            fused_gate_up: false,
+            fused,
+            fused_gate_up,
         })
         .output("hidden");
     flow.build(&mut weights).map_err(Into::into)
@@ -1471,26 +1534,7 @@ pub fn body_capacity_chain_planes_rows(
 fn body_planes_graph(model: Arc<Model>, capacity: usize, rows: usize) -> Result<BuiltModel> {
     let cfg = model.config().clone();
     let mut weights = LoaderWeights::new(model.clone());
-    let mut fused = true;
-    let mut fused_gate_up = true;
-    for i in 0..cfg.layers {
-        let p = format!("blk.{i}");
-        fused &= weights.fuse_packed(
-            &format!("{p}.qkv.fused"),
-            &[
-                &format!("{p}.attn_q.weight"),
-                &format!("{p}.attn_k.weight"),
-                &format!("{p}.attn_v.weight"),
-            ],
-        )?;
-        fused_gate_up &= weights.fuse_packed(
-            &format!("{p}.gate_up.fused"),
-            &[
-                &format!("{p}.ffn_gate.weight"),
-                &format!("{p}.ffn_up.weight"),
-            ],
-        )?;
-    }
+    let (fused, fused_gate_up) = fuse_layer_projections(&mut weights, cfg.layers, "")?;
     let flow = ModelFlow::new(format!("body_capacity_planes_{capacity}_{rows}"))
         .with_profile(profile())
         .input("x", Shape::new(&[rows, cfg.d], DType::F32))
@@ -2167,6 +2211,7 @@ fn emit_predictor_blocks(
     v_planes: &mut [Option<HirNodeId>],
     pos: usize,
     fused: bool,
+    fused_gate_up: bool,
 ) -> Result<HirNodeId> {
     let PredictorBlocks {
         m,
@@ -2280,7 +2325,7 @@ fn emit_predictor_blocks(
 
         let gamma = emit::f32_param(ctx, model, &format!("{p}.ln2.weight"), &[d_pred])?;
         let h = emit::rms_norm(ctx, x, gamma, eps, &[m, d_pred]);
-        let (gate, up) = if fused {
+        let (gate, up) = if fused_gate_up {
             let parts =
                 emit::linear_fused(ctx, &lc(h), &format!("{p}.gate_up.fused"), &[ffn, ffn])?;
             (
@@ -2349,7 +2394,11 @@ pub struct CodePredictorFrameStage {
     pub capacity: usize,
     /// Projecting levels: `steps` codes follow level 0's `code0`.
     pub steps: usize,
+    /// q/k/v were fused at load time under `*.qkv.fused`.
     pub fused: bool,
+    /// gate+up were fused at load time under `*.gate_up.fused` — a separate flag, because a
+    /// body whose `attn_v` is another scheme still fuses its ffn.
+    pub fused_gate_up: bool,
     pub sampler: SampleSpec,
 }
 
@@ -2464,6 +2513,7 @@ impl LayerStage for CodePredictorFrameStage {
                 &mut v_planes,
                 s,
                 self.fused,
+                self.fused_gate_up,
             )?;
             if s >= 1 {
                 // The head projects the *normalised* hidden row the body returns.
@@ -2533,28 +2583,7 @@ pub fn tts_code_predictor_frame(
     );
     let mut weights = LoaderWeights::new(model.clone());
     let blocks = model.clip().gen_layers.unwrap_or(0);
-    let mut fused = true;
-    for i in 0..blocks {
-        let p = format!("a.gen.code.blk.{i}");
-        fused &= weights.fuse_packed(
-            &format!("{p}.qkv.fused"),
-            &[
-                &format!("{p}.attn_q.weight"),
-                &format!("{p}.attn_k.weight"),
-                &format!("{p}.attn_v.weight"),
-            ],
-        )?;
-        fused &= weights.fuse_packed(
-            &format!("{p}.gate_up.fused"),
-            &[
-                &format!("{p}.ffn_gate.weight"),
-                &format!("{p}.ffn_up.weight"),
-            ],
-        )?;
-        if !fused {
-            break;
-        }
-    }
+    let (fused, fused_gate_up) = fuse_layer_projections(&mut weights, blocks, "a.gen.code.")?;
     let flow = ModelFlow::new("tts_code_frame")
         .with_profile(profile())
         .input("hidden", Shape::new(&[d_talker], DType::F32))
@@ -2563,6 +2592,7 @@ pub fn tts_code_predictor_frame(
             capacity,
             steps,
             fused,
+            fused_gate_up,
             sampler,
         })
         .output("codes");
@@ -2967,6 +2997,19 @@ fn bump(submits: u64, waits: u64) {
     WAITS.fetch_add(waits, Ordering::Relaxed);
 }
 
+/// Restores the compile's thread-local state when it ends, however it ends: the
+/// weight-sharing scope the next compile must not inherit, and the origin record of
+/// the build that just finished. A compile that failed with a `?` would otherwise
+/// leave both behind and change how the next build behaves.
+struct DeclaredScope;
+
+impl Drop for DeclaredScope {
+    fn drop(&mut self) {
+        rlx_runtime::set_param_sharing_scope("");
+        emit::clear_origins();
+    }
+}
+
 /// One graph × one backend: what it cost, what came out of it.
 pub struct Outcome {
     pub compile_ms: f64,
@@ -3009,12 +3052,17 @@ pub struct Runner {
 
 impl Runner {
     pub fn compile(device: Device, mut built: BuiltModel) -> Result<Self> {
+        // The build's records live for this compile and nothing else: the guard restores
+        // both however the compile leaves — including a `?` out of the lowering or the
+        // upload loop, which would otherwise leave the scope installed and the origin
+        // record standing for the next, unrelated build.
+        let _scope = DeclaredScope;
         // Declare which model these weights belong to, so the backend can skip
         // re-uploading a graph shape's weights when a previous compile of the same
-        // file already placed them: a recognition call compiles one graph per chunk
-        // length, and each otherwise pays a full body upload (~0.15 s). The label is
-        // the weight file the graph's tensors were served from; a graph whose tensors
-        // come from two files — or from none — declares nothing and uploads.
+        // file already placed them: a recognition pass runs the ladder's rungs, and
+        // each rung's layouts would otherwise pay the body upload again (~0.15 s). The
+        // label is the weight file the graph's tensors were served from; a graph whose
+        // tensors come from two files — or from none — declares nothing and uploads.
         let scope = emit::scope_of(
             built
                 .params
@@ -3038,32 +3086,49 @@ impl Runner {
         // walked whole.
         // Where each parameter's bytes really are, for the ones the build did not carry
         // (`emit`): a weight the process already read is bound from memory, and a packed
-        // tensor straight from the mapped file — a read the write skip then makes free,
-        // when the shape's slots already hold the model's bytes.
+        // tensor from the model file — a read the write skip then makes free, when the
+        // shape's slots already hold the model's bytes.
         let origins = emit::take_origins();
+        // One message for both ways a placeholder's bytes can be missing: a record released
+        // by `emit::clear_weight_caches` and a build whose record never reached this compile
+        // (built on another thread, or two builds interleaved) leave the same thing behind,
+        // and this compile cannot tell them apart.
+        let unresolved = |name: &str| {
+            anyhow!(
+                "the weight `{name}` was handed over as a placeholder and its bytes cannot \
+                 be resolved in this process: no build record names them (`emit`'s weight \
+                 caches were released after the graph was built, or the build and the compile \
+                 are not the same build) — the graph is not run on zeros"
+            )
+        };
         let t = crate::report::Stopwatch::start();
         while let Some(name) = built.params.keys().next().cloned() {
             let values = built.params.remove(&name).expect("key just read");
             match emit::host_weight(&origins, &name) {
                 Some(shared) => session.set_param(&name, &shared),
+                None if emit::is_placeholder(&name) => return Err(unresolved(&name)),
                 None => session.set_param(&name, &values),
             }
         }
+        // One scratch for the packed tensors, reused: the file's bytes are `pread` into it
+        // rather than borrowed from the mapping, so a checkpoint's pages never join the
+        // process's resident set behind the copy the device takes. Reused and grown, never
+        // cleared, so the resident cost is the largest single tensor
+        // ([`rlx_gguf::GgufFile::read_tensor_bytes_into`]).
+        let mut scratch: Vec<u8> = Vec::new();
         while let Some((name, bytes, dt)) = built.typed_params.pop() {
-            if let Some(bytes) = emit::blob_weight(&origins, &name) {
-                session.set_param_typed(&name, &bytes, dt);
+            if let Some(blob) = emit::blob_weight(&origins, &name) {
+                session.set_param_typed(&name, &blob, dt);
             } else if let Some((model, key)) = emit::mapped_weight(&origins, &name) {
-                session.set_param_typed(&name, model.raw_slice(&key)?, dt);
+                model.read_into(&key, &mut scratch)?;
+                session.set_param_typed(&name, &scratch, dt);
+            } else if emit::is_placeholder(&name) {
+                return Err(unresolved(&name));
             } else {
                 session.set_param_typed(&name, &bytes, dt);
             }
         }
-        emit::clear_origins();
         let upload_ms = t.ms();
-        // The declaration lives only for this compile: the arena captured the scope it
-        // was planned under, so the writes above already used it, and leaving it set
-        // would let a later compile that declares nothing inherit this model's weights.
-        rlx_runtime::set_param_sharing_scope("");
         Ok(Self {
             session,
             graph,
@@ -3537,7 +3602,8 @@ pub struct SoundGraphs {
 impl SoundGraphs {
     /// What this cache holds, in the form the probes report and the budget reads:
     /// `(graphs, parameters, device bytes)`. Parameters are [`Compiled::params_bytes`]
-    /// — pages of the mapped file; the third figure is the cache's own account,
+    /// — the weight bytes the graphs bind, read from the model files; the third figure is
+    /// the cache's own account,
     /// [`Compiled::device_bytes`] over its graphs. A graph a caller still holds —
     /// one part's first and carried windows during a call — stays resident after
     /// eviction, so it is the cache's figure, not the process's.

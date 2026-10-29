@@ -814,7 +814,7 @@ impl Model {
     /// ~138 MiB packed to ~780 MB. Measured on this record's M3 Pro, the two
     /// arms taken back to back (`RLX_WGPU_DBG_COUNTERS=1` and the cell lines are
     /// the record): at 8 192 rows the arena is 980.8 MiB packed against 1.31 GiB
-    /// f16, and the cell's own `peak=` 0.73 GiB against 1.75–1.77 GiB; at 256 rows
+    /// f16, and the cell's own `peak` 0.74 GiB against 1.75–1.77 GiB; at 256 rows
     /// the cooperative cell's arena is 547.9 MiB and its `peak` 1.63 GiB.
     ///
     /// The win is in the multiplies, and this doc does not apportion the pass
@@ -896,19 +896,6 @@ impl Model {
 
     // ── bytes ───────────────────────────────────────────────────────
 
-    /// The file's own bytes for a tensor, read on demand: `pread` into a buffer
-    /// that lives only for this tensor, so the checkpoint's pages never enter the
-    /// process's resident set behind the uploaded copy ([`GgufFile::read_tensor_bytes_into`]).
-    /// The tensor as the file holds it, borrowed from the mapping — the same bytes
-    /// [`Model::raw`] copies.
-    pub fn raw_slice(&self, name: &str) -> Result<&[u8]> {
-        let t = self
-            .file
-            .get(name)
-            .ok_or_else(|| anyhow!("tensor `{name}` is not in {}", self.path.display()))?;
-        self.file.tensor_bytes(t)
-    }
-
     /// The tensor's size in bytes, without reading it.
     pub fn raw_len(&self, name: &str) -> Result<usize> {
         let t = self
@@ -919,17 +906,27 @@ impl Model {
             .ok_or_else(|| anyhow!("`{name}`: {} elements are not whole blocks", t.n_elements()))
     }
 
-    pub fn raw(&self, name: &str) -> Result<Vec<u8>> {
+    /// The tensor's own bytes into `buf` with `pread`, so the checkpoint's pages never enter
+    /// the process's resident set behind the copy the device holds
+    /// ([`GgufFile::read_tensor_bytes_into`]). `buf` is grown and overwritten rather than
+    /// cleared, so one scratch reused across tensors pays at most the largest of them; a
+    /// file that cannot be read that way falls back to the mapping, which does clear it.
+    pub fn read_into(&self, name: &str, buf: &mut Vec<u8>) -> Result<()> {
         let t = self
             .file
             .get(name)
             .ok_or_else(|| anyhow!("tensor `{name}` is not in {}", self.path.display()))?;
-        let mut bytes = Vec::new();
-        if self.file.read_tensor_bytes_into(t, &mut bytes)? {
-            Ok(bytes)
-        } else {
-            Ok(self.file.tensor_bytes(t)?.to_vec())
+        if !self.file.read_tensor_bytes_into(t, buf)? {
+            buf.clear();
+            buf.extend_from_slice(self.file.tensor_bytes(t)?);
         }
+        Ok(())
+    }
+
+    pub fn raw(&self, name: &str) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.read_into(name, &mut bytes)?;
+        Ok(bytes)
     }
 
     /// The tensor as F32 values in the file's own flat order (which is also the

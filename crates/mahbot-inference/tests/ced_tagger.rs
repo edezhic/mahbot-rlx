@@ -310,5 +310,5 @@ fn the_eight_music_clips_are_labelled_by_their_split_with_models() {
             "{name}: `{label}` is speech, and this clip holds none"
         );
     }
-    println!("peak_rss_mib={}", report::peak_rss() / (1 << 20));
+    println!("process_peak_bytes={}", report::peak_text());
 }

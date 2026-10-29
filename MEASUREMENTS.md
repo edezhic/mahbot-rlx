@@ -11,34 +11,36 @@ control is for.
 <!-- BEGIN stand -->
 ## Per-model measurement (stand)
 
-_Measured 2026-10-26 21:59 UTC._
+_Measured 2026-10-29 06:58 UTC._
 
-| unit | cold ms | warm ms | speech s | s/speech s | loop ms | sound ms | build ms | peak | map | arena | digest |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| ear | 69.3 | 30.6 | - | - | - | - | 175.1 | 0.85 GiB | 1.53 GiB | 3.4MiB | 5f96a55676652c30 |
-| ear.075 | 68.0 | 30.7 | - | - | - | - | 172.2 | 0.85 GiB | 1.53 GiB | 3.4MiB | 6c69c810e6e461a5 |
-| ear.batch2 | 73.4 | 36.3 | - | - | - | - | 191.9 | 0.86 GiB | 1.53 GiB | 3.6MiB | 035ccc1722ced5ba |
-| ear.batch4 | 83.3 | 43.0 | - | - | - | - | 228.1 | 0.86 GiB | 1.53 GiB | 3.9MiB | d41141fe08378af6 |
-| listen | 2031.4 | 1734.8 | 17.460 | 0.099 | - | - | 1018.5 | 3.17 GiB | 1.53 GiB | 1.10GiB | 2f93dfa1d7cdeeb1 |
-| speak | 15249.1 | 14091.1 | 26.400 | 0.534 | 12903.6 | 1187.5 | 1540.3 | 3.20 GiB | 1.38 GiB | 702.9MiB | 9d837a9c4164ba94 |
-| embed.256 | 99.3 | 66.7 | - | - | - | - | 727.1 | 1.63 GiB | 0.29 GiB | 547.9MiB | ec6e9fa56756e071 |
-| embed.8192 | 2388.6 | 2322.6 | - | - | - | - | 1147.8 | 1.77 GiB | 0.29 GiB | 1.31GiB | bfa0336b63d2e3d0 |
-| transcribe | 543776.4 | 440021.5 | 3296.220 | 0.133 | - | - | 61690.3 | 3.90 GiB | 1.57 GiB | - | - |
+| unit | cold_ms | run_ms | covered_s | s_per_covered_s | loop_ms | sound_ms | build_ms | peak GiB (readings, or one carried figure; / ceiling verdict where held) | map | weights | arena | digest |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ear | 64.5 | 30.8 | - | - | - | - | 167.4 | median 0.54 (readings run 1 0.54, run 2 0.54, run 3 0.56) | 1.53 GiB | 309.2MiB | 3.4MiB | 5f96a55676652c30 |
+| ear.075 | 65.2 | 30.7 | - | - | - | - | 166.6 | median 0.56 (readings run 1 0.55, run 2 0.56, run 3 0.56) | 1.53 GiB | 309.2MiB | 3.4MiB | 6c69c810e6e461a5 |
+| ear.batch2 | 69.4 | 36.4 | - | - | - | - | 185.6 | median 0.56 (readings run 1 0.56, run 2 0.56, run 3 0.54) | 1.53 GiB | 309.2MiB | 3.6MiB | 035ccc1722ced5ba |
+| ear.batch4 | 87.1 | 44.2 | - | - | - | - | 227.8 | median 0.55 (readings run 1 0.55, run 2 0.55, run 3 0.56) | 1.53 GiB | 309.2MiB | 3.9MiB | d41141fe08378af6 |
+| listen | 2011.5 | 1751.8 | 17.460 | 0.100 | - | - | 1272.1 | median 1.89 (readings run 1 1.89, run 2 1.89, run 3 1.89) / 2.31 inside | 1.53 GiB | 1.33GiB | 1.10GiB | 2f93dfa1d7cdeeb1 |
+| speak | 15331.3 | 14377.5 | 26.400 | 0.545 | 13216.5 | 1160.9 | 1251.6 | median 1.96 (readings run 1 1.66, run 2 1.98, run 3 1.96) / 2.42 inside | 1.38 GiB | 0B | 702.9MiB | 9d837a9c4164ba94 |
+| embed.256 | 99.3 | 66.7 | - | - | - | - | 727.1 | 1.63 GiB | 0.29 GiB | - | 547.9MiB | ec6e9fa56756e071 |
+| embed.8192 | 2388.6 | 2322.6 | - | - | - | - | 1147.8 | 1.77 GiB | 0.29 GiB | - | 1.31GiB | bfa0336b63d2e3d0 |
+| transcribe | 1088199.4 | 377127.1 | 3296.220 | 0.114 | - | - | 1059.4 | cell 2.22 (readings message 10 s cold run 1 2.36, message 10 s cold run 2 2.36, message 10 s cold run 3 2.35, message 30 s cold run 1 2.35, message 30 s cold run 2 2.35, message 30 s cold run 3 2.36, corpus cold 2.36) / 2.35 at | 1.57 GiB | 1.33GiB | - | - |
 
-The cell's number is the **`s/speech s`** column: the **warm** figure (`warm ms`) divided by the `speech s` column — the cell's own seconds of speech, `samples / 16 000` for recognition and `rows · 1 920 / 24 000` for synthesis, printed so the rate re-derives from this table alone. `loop ms` is the synthesis generation loop (speaker, prefill, body, predictor, sampler) and `sound ms` is the sound half; their sum is `warm ms`, so a ×N synthesis claim reads off both. Both are the same phase sums the cell's `loop_ms`/`sound_ms` tokens record; `speak`'s `sound_phase_ms` field is the sound graphs' summed `step_ms` — the same sum the `sound ms` column is taken from, carried as a field so a cell line is self-describing. For `speak` the recorded `digest` is the **waveform** digest, not the `prompt_digest` its own line prints. `-` is a cell with no speech denominator. Each cell line prints its own `warm_spread` (the warm runs' max − min, in ms). `peak` is the cell process's own high-water (`ru_maxrss`, which no later drop can lower) and each cell is its own process, so the figure is the maximum that unit's own process reached — what it held when it peaked, not what is live when the line prints. For `speak` the reading is taken before the round-trip gate loads the recogniser, so the column excludes it (the gate prints its own post-gate reading as `speak roundtrip peak_mb`). Across this machine's records the column moves between runs of one tree, and the summary line carries the spread each run saw as `peak_spread`. `embed.256` and `embed.8192` are one bidirectional pass each over the whole sequence on a Q8_0 stack. Their `digest` is over the L2-normalised 768-vector the row names — the cell's answer, not the graph's raw output.
+The cell's number is the **`s_per_covered_s`** column: the **warm** figure (`run_ms`) divided by the `covered_s` column — the seconds of audio the cell's passes themselves covered, `samples / 16 000` for recognition and `rows · 1 920 / 24 000` for synthesis, printed so the rate re-derives from this table alone. `loop_ms` is the synthesis generation loop (speaker, prefill, body, predictor, sampler) and `sound_ms` is the sound half; their sum is `run_ms`, so a ×N synthesis claim reads off both. Both are the same phase sums the cell's `loop_ms`/`sound_ms` tokens record; `speak`'s `sound_phase_ms` field is the sound graphs' summed `step_ms` — the same sum the `sound_ms` column is taken from, carried as a field so a cell line is self-describing. For `speak` the recorded `digest` is the **waveform** digest, not the `prompt_digest` its own line prints. `-` marks a figure the row has none of: in `covered_s` and `s_per_covered_s`, a cell with no covered-audio denominator; in `loop_ms` and `sound_ms`, a cell with no synthesis split (only `speak` has one); in `arena`, a ladder cell whose graphs each have a plan of their own; and in `digest`, a cell with no single answer (the transcription cell's ladder of graphs). The `peak` column is a process high-water (`ru_maxrss`, which no later drop can lower): each cell run is its own process, so the figure the column leads with is the median of the cell's runs' high-waters, not what is live when the line prints. Two rows need a word on whose reading their figure is: `speak`'s is `synthesis_peak_bytes` — each run's high-water when the synthesis half had finished, before the round-trip gate loads the recogniser, whose later reading prints as `process_peak_bytes` and is not part of the row's verdict — and the transcription cell is one process, so its figure is the `process_peak_bytes` its `unit` row printed when the cell had finished, not a median over runs. Beside the leading figure the column lists every other reading the verdict compares, each named with the process that took it (`run 1` of the cell's runs, or the transcription cell's message- and corpus-size calls); a row held to no ceiling lists the readings it has. A cell's earlier moments are not in that list: the transcription cell's print as `moment_peak_bytes`. A row this run did not take carries the figures the run that took it printed — the readings list where that run printed one, the single figure it printed where it did not, which is what the header's `or one carried figure` names. Nothing outside that list enters a verdict, and no reading from another run of this code does. The ceilings beside them are policies, and the verdict those readings support is `inside` when every one is under the ceiling by more than 0.01 GiB, `over` when every one is above it by more, and `at` otherwise: the set meets the ceiling's 0.01 GiB band — readings on both sides of it, or every reading on one side with the nearest inside the band. The transcription cell's own reading is one figure — its `unit` row, printed when the cell had finished — so every reading its verdict compares is a process of that run: the cell's own and the ones it started for a call of message or corpus size, each cold message row's three runs and the corpus-cold call. The three hour-scale inputs are a population of their own and are not in that verdict: their rows carry them, and the section states them apart. The ceilings are 2.31 GiB for `listen`, 2.42 GiB for `speak`, 2.35 GiB for `transcribe` — the transcription cell's is the listening cell's class plus its tagger — and the verdict beside each peak in the table is computed from that row's own readings, not restated. The columns beside the peak name the allocations a reader can hold it against: `weights` (the device's shared weight pool — one copy of each model's parameter bytes, held once however many layouts and rungs bind them, and given back by `release_process_memory`), `arena` (the compiled graph's own plan, `-` on a cell that builds a ladder of graphs, because a sum of plans is not an allocation the peak contains) and `map` (the model files the cell binds, by their size: each is opened by mapping and its tensor bytes are read with `pread` through one scratch buffer, so the mapping is not the copy the process holds and the figure is not resident pages). Each is the cell's own reading of that allocation, taken where the cell prints it; a `-` in `weights` is the one figure a carried row's run did not print, because a measured cell always prints the pool's bytes, `0B` included. Their sum is not `peak` and the record does not claim it is: the peak is what the process touched, and neither the pool nor the files is all resident at once. For `speak` all three are read together, at the end of the synthesis half, so the row is one moment: the talker's pool and graphs are released before the decoder builds, so `weights` there is the pool as it stands then — the decoder's, or nothing where the release emptied it and the graphs keep their weights in their own buffers — and `arena` is the sound half's plan. The peak is `synthesis_peak_bytes`: the process's high-water when the synthesis half had finished, taken before the round-trip gate releases it and loads the recogniser — that gate's later reading prints as `process_peak_bytes` and is not this row's figure. `embed.256` and `embed.8192` are one bidirectional pass each over the whole sequence on a Q8_0 stack. Their `digest` is over the L2-normalised 768-vector the row names — the cell's answer, not the graph's raw output.
 
 The pinned answers: recognition is recorded against `обычные объявления метро делались только на каталонском языке, но не забывали переводить объявления в другие языки, например, итальянский, испанский, английский, французский, итальянский` — compared word for word, at most 2 of them different, its digest and generated-token count printed as witnesses with what moved, and the run carries on; the synthesis round trip — the waveform the `speak` row's digest names, resampled to 16 kHz and read back through the recogniser on its raw samples — must reproduce `Call me Ishmael. Some years ago, now I'm old, beside the sea. I've seen them all, every shore, every harbor, every city, every town, every street, every house, every farm, every field, every hill, every mountain, every forest, every river, every ocean, every island, every shore, every harbor, every city, every town, every street, every house, every farm, every field, every hill, every mountain, every forest, every river, every` exactly.
 
 ### Weight streams, against the machine's streaming ceiling
 
-Ceiling, measured on this run's device before the cells: **135.1 GB/s** on a streaming read (134.4–135.1 over 5 rounds) and 131.7 GB/s of total traffic on a streaming copy (127.7–133.2). The read figure is the one the rows below are reported against, because a weight is read and never written; the copy figure is the same probe's other arm, recorded beside it. Both come from `rlx_wgpu::bandwidth::stream_ceiling`: a 64.0 MiB vectorised read and a 64.0 MiB vectorised copy, on `Apple M3 Pro (Metal)`. The same probe after the cells read 133.9 GB/s (132.3–134.8), which is the reading-to-reading spread to hold the figure to.
+This run took no stream reading of its own: the rows below are the run that measured them, restated against the ceiling printed below.
+
+Ceiling, measured on this run's device before the cells: **127.1 GB/s** on a streaming read (124.5–132.5 over 5 rounds) and 124.9 GB/s of total traffic on a streaming copy (118.0–126.4). The read figure is the one the rows below are reported against, because a weight is read and never written; the copy figure is the same probe's other arm, recorded beside it. Both come from `rlx_wgpu::bandwidth::stream_ceiling`: a 64.0 MiB vectorised read and a 64.0 MiB vectorised copy, on `Apple M3 Pro (Metal)`. The same probe after the cells read 131.5 GB/s (126.4–132.8), which is the reading-to-reading spread to hold the figure to.
 
 | phase | unit | weight bytes/unit | ms/unit | GB/s | of the read ceiling |
 |---|---|---|---|---|---|
-| recognition decode | one token | 1 100 961 792 | 15.69 | 70.2 | 52.0 % |
-| talker body | one frame | 850 870 272 | 13.36 | 63.7 | 47.2 % |
-| code predictor | one level | 87 109 632 | 1.59 | 54.8 | 40.6 % |
-| sound half | one utterance | 1 348 042 624 | 1187.52 | 1.1 | 0.8 % |
+| recognition decode | one token | 1 100 961 792 | 16.05 | 68.6 | 54.0 % |
+| talker body | one frame | 850 870 272 | 13.54 | 62.8 | 49.4 % |
+| code predictor | one level | 87 109 632 | 1.64 | 53.1 | 41.8 % |
+| sound half | one utterance | 1 348 042 624 | 1160.93 | 1.2 | 0.9 % |
 
 Each row's numerator is the graph's own parameter bytes — packed and f32 — which its multiplies and convolutions read once per unit, and only operands that are parameters count; a graph that read one of them twice per unit would move more, and one that read a slice would move less. `talker body` is one frame, `code predictor` one of a frame's sixteen projecting levels (the frame's stream and time divided by the levels it walks), `sound half` the utterance's windows summed with the graph each window actually ran, and `recognition decode` one generated token. The figure in each row is the run whose warm figure is the table's.
 
@@ -48,12 +50,13 @@ Provenance:
 - device: Apple M3 Pro (Metal)
 - driver: unknown
 - profile: release
-- code: dd4a1a53 change-sha256 94486a2418012df3 (the commit and the SHA-256 of the tree's own difference from it — `MEASUREMENTS.md` excluded, because the run that measures rewrites it, and `crates/backends/rlx-mlx-sys` excluded, because the vendored MLX checkout is not this fork's content — which together are the content that produced these figures; a clean tree's digest is `e3b0c44298fc1c14`, the hash of an empty diff)
-- rows: this run measured ear, ear.075, ear.batch2, ear.batch4, listen, speak, transcribe; every other row is carried from an earlier run of this file, and its figures belong to the run that took them — the `code` line above is this run's tree, not theirs. A carried row keeps its weight-stream row and the artefact lines of the run that took it
+- code: 3915e22c change-sha256 b592a86c61a31521 (the commit and the SHA-256 of the tree's own difference from it — `MEASUREMENTS.md` excluded, because the run that measures rewrites it, and `crates/backends/rlx-mlx-sys` excluded, because the vendored MLX checkout is not this fork's content — which together are the content that produced these figures; a clean tree's digest is `e3b0c44298fc1c14`, the hash of an empty diff)
+- rows: this run measured transcribe, and the transcription section this run wrote is built from its own rows; every other row of the stand table is carried from an earlier run of this file, and its figures belong to the run that took them — the `code` line above is this run's tree, not theirs. A carried row keeps its weight-stream row and, where this run could not read the files, the artefact lines of the run that took it
 - thermal: unknown (pmset -g therm printed no CPU limit line) (`pmset -g therm`, the reading `scripts/check-throttle.sh` gates on)
-- load: 3.71 3.31 3.60 (1/5/15-min) at the start, 2.91 2.27 2.76 at the table; every cell line carries its own `load=`
-- swap: 5787 MiB in use at the start, 27 MiB grown during the run (ceiling 4096 MiB, raised by `MAHBOT_STAND_MAX_SWAP_MIB` from its default 1024)
-- command: `mahbot-inference 0 1 2 3 4 5 8` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`, article from `MAHBOT_EMBED_TEXT`)
+- load: 2.46 3.00 3.10 (1/5/15-min) at the start, 3.10 2.97 2.85 at the table; every cell line carries its own `load=`
+- ceiling: 6144 MiB resident set, the guard's default
+- swap: 4503.8 MiB in use at the start, 4487.8 MiB at the table — 16.0 MiB, given back during the run (ceiling 1024 MiB growth, the guard's default)
+- command: `mahbot-inference 8` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`, article from `MAHBOT_EMBED_TEXT`)
 - model: `Qwen3-ASR-1.7B-Q4_K_M.gguf` · 1282435552 bytes · sha256 3893b8926065bbff3da7586d21d8711a9b4fa4fa8f12cd0cefad58e31b2660b6
 - model: `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf` · 355709344 bytes · sha256 46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d
 - model: `Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf` · 1035965280 bytes · sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
@@ -74,79 +77,67 @@ the rest keep the figures of the run that took them.
 ### The cell, unit by unit
 
 - `speak` — the row above and the run's own lines, nothing between them: the
-  generation loop is the cell (`loop ms` against `sound ms`), the waveform digest
-  `9d837a9c4164ba94`, the round trip equal. The waveform left the pin it carried
-  before this change (`231d823496450627`) when the packed multiply's accumulator
-  became one scalar per row: a different summation order in the talker body's
-  prefill moves the seeded draws somewhere in the 330 rows, and the samples that
-  follow are another waveform of the same sentence — 330 rows, 633 600 samples, the
-  prompt digest unchanged, and the round-trip transcript still exact. The block
-  below is what the run printed: the repeat whose `residency` line carries the
-  peak the row quotes (each repeat prints one), the run's own summary `speak` line,
-  the parent's
-  `build_ms` line — this run took four cells, so it is their sum — and the witness
-  lines all three repeats agree on. The row's four figures are the
-  medians of the three (spreads: `cold` 828.8 ms, `warm` 177.1, `build` 981.2,
-  `peak` 0.672 GiB).
+  generation loop is the cell (`loop_ms` against `sound_ms`), the waveform digest
+  `9d837a9c4164ba94`, the round trip equal. Its peak is **1.96 GiB**, the median of the
+  three runs' `synthesis_peak_bytes` readings — 1.66, 1.98 and 1.96 GiB, each the process
+  high-water when the synthesis half had finished, each printed with the run that took it
+  beside this figure — and every one of those readings is under the 2.42 GiB ceiling set for
+  the cell, the widest by more than the 0.01 GiB the printed numbers resolve, so it is reported **inside** it. The talker's graphs, its host copies and the
+  pool's copy of its weights are released and their pages returned
+  (`release_process_memory`) before the decoder is built, but a resident-set high-water cannot
+  fall, so the decoder's build adds to it and does not replace it. The row's three allocation
+  figures are read at that same moment, at
+  the end of the synthesis half, and say what the half holds then: `weights` 0B — the
+  release empties the shared pool, and the decoder keeps its weights in its own graphs —
+  `arena` 702.9 MiB, the decoder's compiled plan, and `map` 1.38 GiB, the two model files
+  by their size, opened by mapping and their tensor bytes read through one scratch buffer,
+  so the mapping is not a copy the process holds. The row is
+  the median of the three runs of its invocation.
   Two items were dropped, each priced on the
-  decoder's own graphs by `tests/sound_decoder_cost.rs` (one subject per process):
+  decoder's own graphs by `tests/sound_decoder_cost.rs` (one subject per process, on
+  this machine, one run of that harness each — not this run's readings):
   the DAC windows' right margin, **6.0 (5.1–8.8) ms** at 148→144 frames and
   **5.8 (4.7–6.0) ms** at 152→148 on group 4-6, **3.4 (2.4–4.1)** and
   **3.0 (1.6–4.3) ms** at the same two windows on group 6-8 — **18.2 ms** an
   utterance, 9/9 rounds on every window — and a front graph of the tail's own
-  length, which builds in **89.5–103.5 ms** (medians of 7 alternating rounds in
-  this session's two readings, spreads reaching 88.9–1 585.0) — one window's
-  figure: the same probe on this tree has read 89–170 ms across windows — against
-  the **19.7 ms** (9/9, spread 18.9–20.4) a padded last window costs to run. The
-  build is the quantity that recurs and the padding the one that pays it off, so
-  a one-shot request loses by the first and a repeated length does not pay it.
-  **Known gap:** the shipping library path is the wake-word bench's corpus in one
-  process, and that steady state — retained graphs against the guard's ceiling —
-  has not been run.
+  length, which that harness builds in **89.5–103.5 ms** against the **19.7 ms** a
+  padded last window costs it to run. The build is the quantity that recurs and the
+  padding the one that pays it off, so a one-shot request loses by the first and a
+  repeated length does not pay it.
 
-  ```
-  speak residency start_mb=196.7 prefill_mb=1431.6 body_mb=1541.1 loop_graphs_mb=2554.1 sound_graphs_mb=448.8 peak_mb=2603.9 map_mb=1482.4
-  speak cold=15874.6 warm=14165.7 s_per_s=0.537 loop_ms=12986.1 sound_ms=1179.6 peak=2.42 map=1.38 cold_spread=828.8 warm_spread=177.1 peak_spread=0.672
-  build_ms 4902.4 build_spread=981.2
-  witness speak rows=330/330 samples=633600/633600 waveform_digest=9d837a9c4164ba94/9d837a9c4164ba94 prompt_digest=fb160ff9665b4331/fb160ff9665b4331 equal=true
-  witness speak-roundtrip wave=raw transcript_sha256=f2e47729461ad4c95ed9c0c441a65ab5700613338c5132935945adfa8537b164/f2e47729461ad4c95ed9c0c441a65ab5700613338c5132935945adfa8537b164 equal=true
-  ```
-
-- `listen` — 1 745.1 ms, **0.100 s per second of speech** (warm spread 11.2 ms;
-  cold 2 127.9 ms), with its transcript and `2f93dfa1d7cdeeb1` unchanged — the
-  decode that dominates the cell has moved since the 2 257.6 ms row this replaces.
-  The one-scalar-per-row packed multiply is inside that, from its own paired
-  window: prefill 563.4–565.9 → 522.5–523.5 ms (−7.3 %), encoder 180.2–183.0 →
-  177.0–179.3 ms — a move smaller than this row's own encoder repeats span
-  (175.9–182.3 ms across its three runs), so read as flat-to-small rather than as
-  a win. This
-  row is another window of the same tree: its three runs read 1 734.2–1 745.4 ms
-  and its prefill 528.8–530.5. The weight-stream row reads 15.84 ms a token at
-  69.5 GB/s.
-- `embed.8192` — **2 322.6 ms** for one 8 192-row bidirectional pass (three runs,
-  warm spread 34.0 ms; cold 2 388.6 ms, `load=` 2.4–2.7), the model's own masking
+- `listen` — the row above is the figure, and its transcript and digest are the ones
+  the recognition work recorded (`2f93dfa1d7cdeeb1`): a reading of the same audio.
+  Its **1 751.8 ms** is the recognition cell's own speed on this machine, and its peak
+  is **1.89 GiB** against the 2.31 GiB ceiling that was set for it: the body's parameter
+  bytes are held once, in the device's weight pool (`weights` 1.33 GiB), the compiled
+  graphs' plans are 1.10 GiB, and the model files the cell binds (1.53 GiB by their size)
+  are opened by mapping with their tensor bytes read through one scratch buffer, so the
+  mapping is not a copy the process holds and they are not pages inside that peak.
+- `embed.8192` — **2 322.6 ms** for one 8 192-row bidirectional pass (cold 2 388.6
+  ms), the model's own masking
   throughout: the twenty sliding layers walk their ±512 band, the four global
-  ones all 8 192 keys. The same run's `build ms` is 1 147.8 ms — the graph
+  ones all 8 192 keys. The same run's `build_ms` is 1 147.8 ms — the graph
   compile plus the Q8_0→f16 widening, neither inside the timed path — and its
   `peak` and `arena` are 1.77 GiB and 1.31 GiB. The reference engine reads
   **~2.39 s of encode** for the same text on this machine — llama.cpp `b11724`
   (commit `99db719bdf07`), the same Q8_0 artefact, Metal, flash attention on,
-  one 8 192-row physical batch, weights resident: 3.20–3.22 s of process over
-  five runs against 0.81–0.83 s for a one-token prompt over three. This row is
+  one 8 192-row physical batch, weights resident. Run here for this record, that
+  engine's own process times are 3.20–3.22 s over five runs against 0.81–0.83 s
+  for a one-token prompt over three. This row is
   2.8 % under that figure and 3.2 % (77.4 ms) under the 2.4 s bar. `embed.256`
-  is the same pass over 256 rows: **66.7 ms** warm (spread 0.2 ms; cold 99.3
-  ms, `load=` 2.6–2.7), `build ms` 727.1, `peak` 1.63 GiB, `arena` 547.9 MiB —
+  is the same pass over 256 rows: **66.7 ms** warm (cold 99.3
+  ms), `build_ms` 727.1, `peak` 1.63 GiB, `arena` 547.9 MiB —
   tens of milliseconds.
 
   **What is portable, and what is this device.** The 2.31 s row rides on the
-  cooperative-matrix feature. The same graph with `MAHBOT_EMBED_GEMM=packed` —
+  cooperative-matrix feature. The same `embed` cells with `MAHBOT_EMBED_GEMM=packed` —
   the file's Q8_0 bytes through `Op::DequantMatMul`, the portable route every
-  wgpu device can run — measures **3 400.1 ms** warm at 8 192 rows (three runs with
-  the stand's own cells, spread 12.0 ms; cold 3 464.7 ms; `peak` 0.74 GiB,
-  `arena` 980.8 MiB, `build ms` 458.3) and **89.9 ms** at 256 rows (spread 0.5 ms),
-  1 000.1 ms (41.7 %) over the 2.4 s bar and 1.46× the cooperative arm — 1.5 % and
-  3.0 % under the 3 451.9 ms and 92.7 ms the same arm read before the accumulator
-  became one scalar per row. Its fixture gate is where the recorded one stands:
+  wgpu device can run, one run of the stand with that switch — measure
+  **3 400.1 ms** warm at 8 192 rows (cold 3 464.7
+  ms; `peak` 0.74 GiB,
+  `arena` 980.8 MiB, `build_ms` 458.3) and **89.9 ms** at 256 rows,
+  1 000.1 ms (41.7 %) over the 2.4 s bar and 1.46× the cooperative arm. Its
+  fixture gate is where the recorded one stands:
   cosine 1.000000 at 256 rows and 0.999999 at 8 192, max-abs 1.3235e-4 and 8.6e-5.
   The win that *is* portable
   is the route's shape: the single bidirectional pass, the banded walk over the
@@ -154,15 +145,14 @@ the rest keep the figures of the run that took them.
   f16-operand/f32-accumulator form are the same work on any wgpu device that runs
   them. The cooperative-matrix tile and this device's 3.5 TFLOP/s are not.
 
-  Where the two figures changed from, measured rather than argued. The dense
+  Where the two figures come from, measured rather than argued. The dense
   layers are one pass at **16-bit operands**: they split their 8 192 query rows
   into 2 048-row chunks and multiply the 8 192×8 192 score squares cooperatively
   (f16 operands downcast at the staged load, f32 accumulator, as the reference
   engine does), 236.6 ms a layer for the whole chunked step — of which the two
   multiplies are 157.2 ms at 3.58 and 3.42 TFLOP/s, the score matrix's softmax
   16 ms and the transposes and f16 casts ~20 ms
-  (`tests/attention_dense_coop_cost.rs`); the same layers read ~0.57 s a layer on
-  the tiled kernel before this form. The linear/FFN **multiplies** moved from 2.19–2.57 to
+  (`tests/attention_dense_coop_cost.rs`). The linear/FFN **multiplies** read
   3.07–3.66 TFLOP/s at the encoder's six shapes — a two-subgroup 64×64 tile with
   32 accumulators and a ping-pong stage, plain WGSL over the cooperative-matrix
   primitive (`tests/encoder_gemm_cost.rs`). The twenty sliding layers keep the
@@ -174,9 +164,9 @@ the rest keep the figures of the run that took them.
   matrix is chunked to 2 048 rows and the output region reuses Kᵀ's bytes, so
   the cooperative row's `peak` (1.77 GiB) and `arena` (1.31 GiB) stay where the
   f32 row's were. What separates the two arms' memory is
-  the f16 route's own 6 B per 2 B of weight — the packed arm reads `peak`
-  0.74 GiB and `arena` 980.8 MiB — and `build ms` is 1 147.8 against the packed
-  arm's 458.3.
+  the f16 route's own 6 B per 2 B of weight — the same cells with
+  `MAHBOT_EMBED_GEMM=packed` read `peak` 0.74 GiB and `arena` 980.8 MiB — and
+  `build_ms` is 1 147.8 against that arm's 458.3.
 
   Both rows produce the model's answer — the 8 192-row vector's cosine against the
   reference engine's own output for the same text is 1.000000 at max-abs 8.8e-5,
@@ -202,13 +192,13 @@ the rest keep the figures of the run that took them.
 
 Each row of the weight-stream table divides that graph's own parameter bytes — the
 ones a node reaching an output reads — by the ms the same run took for one unit; the
-percentage is that quotient over the ceiling at the head of this table — its own
-run's for a row this run measured, this section's for a carried row. Every `_mb`
-figure in this file is decimal MB (÷10⁶); every GiB one is bytes
-÷ 2³⁰ — `peak` is the cell process's own `ru_maxrss`, `map` the two model files it
-mapped, and `arena` prints its own MiB/GiB — labelled once here. `peak` and
-`build ms` follow the machine more than the graph: both move between runs of one
-tree, and the summary line carries each run's own spread.
+percentage is that quotient over the ceiling at the head of this table, which is this
+run's probe for every row. Every `MiB` figure in this file is bytes ÷ 2²⁰ and every
+GiB one bytes ÷ 2³⁰ — the peak figures are process high-waters (`ru_maxrss`), `map`
+the model files the cell binds by their size (opened by mapping, their tensor bytes
+read through one scratch buffer, so not pages held as a mapping), and `arena` prints
+its own MiB/GiB — labelled once here. The peak and `build_ms` follow the machine more
+than the graph: both move between runs of one tree.
 
 ### The sound half's convolution blocks
 
@@ -228,11 +218,6 @@ apart from the arithmetic rate rather than as traffic.
 | front (0..4) | 310.3 | 563.2 | 1.82 | 113 | 114 |
 | stages 4-6 | 561.1 | 1 077.6 | 1.92 | 120 | 120 |
 | stages 6-8 | 394.2 | 368.2 | 0.93 | 62 | 59 |
-
-The three blocks are one session's window split, and that session's sound half read
-1 265.3 ms with a 121.5 GB/s read probe; this stand's sound half reads 1 179.6 ms on
-a box whose probe read the figure at the head of its own table, so the two are read
-against their own probes and not subtracted from one another.
 
 The two heavy blocks are at 1.8–1.9 TFLOP/s and their GEMM demand sits at the
 probe's ceiling, so what a form change buys them is fewer reads for the same
@@ -256,7 +241,7 @@ has no copy dispatch and no second pass over the arena. The predictor's frame is
 
 `RLX_WGPU_DBG_COUNTERS=1` splits the body frame in a counter run of its own — 433
 frames of one run, with the switch's fence and per-step census inside its wall, so
-its per-frame figure is not this table's 13.49 ms and the two are not subtracted
+its per-frame figure is not this table's 13.54 ms and the two are not subtracted
 from one another — into
 **19.27 ms of wall** (p10–p90 19.21–23.38), **18.17 ms of device time**, in
 **6 dispatch passes**,
@@ -287,9 +272,9 @@ flat at 23.52/40.77 against 23.44/40.63).
 `tests/gemm_ceiling.rs::synthesis_ceiling` measures the same forms in a joined
 call of 32–128 steps: body 78.7 GB/s and predictor 90.2 GB/s on that session's box.
 This record's cell reads the loop's own bytes — 850 870 272 B a body frame and
-87 109 632 B a predictor level — at the weight-stream table's **63.1 and
-54.8 GB/s** (13.49 ms a body frame and 1.59 ms a predictor level), so in situ the
-loop runs **1.25× (body) and 1.65× (predictor) below what the same forms reach when
+87 109 632 B a predictor level — at the weight-stream table's **62.8 and
+53.1 GB/s** (13.54 ms a body frame and 1.64 ms a predictor level), so in situ the
+loop runs **1.25× (body) and 1.70× (predictor) below what the same forms reach when
 their dispatches are back to back**. The predictor's multiplies are the harness table's Q8_0 forms at
 `k = 1 024` — one level is
 `n = 2 048` (attention out, head, proj_in), `3 072` (down), `4 096` (qkv) and
@@ -300,8 +285,8 @@ dependent `layer_norm`/`rope`/`attention` chain between the multiplies — not o
 memory system.
 
 At the packings' own arithmetic intensity — 3.56 FLOP/B for Q4_K, 2.44 for Q6_K
-and 1.88 for Q8_0 — that is **0.103 TFLOP/s for the predictor's Q8_0 stream in
-situ** and 0.154–0.225 for the body's, against 0.12–0.37 across the harness table
+and 1.88 for Q8_0 — that is **0.100 TFLOP/s for the predictor's Q8_0 stream in
+situ** and 0.153–0.224 for the body's, against 0.12–0.37 across the harness table
 (the predictor's own widths 0.15–0.19) and the sound half's 0.93–1.92. The
 multiply's ceiling here is bytes over a dependent chain, not arithmetic: at this
 row's width the work is one output slab a workgroup, and neither the X side nor
@@ -363,8 +348,7 @@ intensity (3.56 FLOP/B for Q4_K, 2.44 for Q6_K, 1.88 for Q8_0):
 
 The rate a dispatch reaches rises with the work in it. These eleven are one
 session's minima, and a session moves them: this session read 0.3–18 % above the
-one it replaces on the same forms at the same 131–132 GB/s probe, and two runs a
-few minutes apart differed by 3–10 %. A row moving inside that band is the box,
+one it replaces on the same forms, and two runs a few minutes apart differed by 3–10 %. A row moving inside that band is the box,
 not the form; a claim that a form moved needs a pair from one window, which is
 what the floor's A/B below is. What this table and the cell's own
 figures separate is a **route floor**, not a second form: the
@@ -452,170 +436,259 @@ Provenance:
 <!-- BEGIN transcribe -->
 ### Transcription: one call over the pinned corpus and the music pool
 
-_Measured 2026-10-26 21:59 UTC._
+_Measured 2026-10-29 06:58 UTC._
 
-**The headline: 115 ms of call per second of audio** over the corpus pass, and a 10-second message takes 2661 ms (cold); a 10-second message takes 1384 ms (warm); a 30-second message takes 5295 ms (cold); a 30-second message takes 3868 ms (warm); the text each of those calls returned is in the `message` rows below.
+**The headline — the one figure the latency bar is stated against: 98.2 ms of call per second of audio** over the pinned corpus. It is the whole call from hand-over of the audio to the returned text: the file read, the gain and resample, the detector's mask, the tagger's labels, the cut, every compilation the call needs, the recognition passes, the guards and the joins. The bar is 100 ms per second of audio, 103 at the tolerance the plan allows, and this run is **98.2 ms/s inside the bar at the 103 it allows** — 0.98× the 100 ms/s the plan asks for, and 4.8 ms/s of headroom under a figure that already carries its tolerance. The `e2e` row carries the bar beside the figure and `gated=false`: reported against the bar, not gated by it, because nothing in this run fails when the figure misses it. The rows that do fail the run — `seams` and the noise pool's `invented` — say `gated=true`; every other one is a reading, a breakdown or an absolute figure.
 
-The bar for that figure is 100 ms per second of audio, 103 at the tolerance the plan allows: this run is **15 ms/s above it** (1.15× the bar). Of the 115 ms, the breakdown below attributes 93 to the recognition passes, 16 to the compilations, 3.8 to the tagger and the rest to the read, the mask and plan and what it does not attribute — so the passes and the compilations are what remains between this figure and the bar. Every other figure here is a breakdown for the agents that optimise, and none of them is the recognition number.
+The message rows are absolute figures and the bar does not gate them: a 10-second message takes **2411 ms cold** (419 ms of it the model load, so 241 ms/s for that message, spread 173 ms); **1161 ms warm** (116 ms/s, spread 18 ms); a 30-second message takes **5208 ms cold** (416 ms of it the model load, so 174 ms/s for that message, spread 42 ms); **3336 ms warm** (111 ms/s, spread 28 ms); a ten-second cold call pays 419 ms of model load before a sample is read — 42 ms/s of the message's own ten seconds on that alone — so no implementation inside this plan's rules could put it under the per-second bar. `cold` is a claim about this process and nothing else: it holds no mapping, host copy, device buffer or compiled graph of the models when the span starts. The operating system's own file cache is not this crate's to control, and is not part of the claim. Every one of those rows says `gated=false` and carries the same `bar_ms_per_audio_s`/`bar_tolerance_ms_per_audio_s` fields the headline does, so the bar is beside the figure it does not gate rather than a comparison the reader has to make. Every message row is the median of three runs — a cold row's in three processes of its own — and carries the range the three saw: `total_spread_ms` on a cold row, `warm_spread_ms` on a warm one. A cold row also carries `load_ms`, the model files it read before a sample; every message row carries its own split — `build_ms` with `compiles` (every graph the call built: a cold process builds the ladder's rungs and the prompt's shapes from nothing) and `recognise_ms` with `chunks`, the recognition passes inside it. The peak each row prints is in bytes and named after its scope: `process_peak_bytes` is the process the row's `process=` field names, read as that process's final reading — `own` on a cold row is that child, which exits as it printed it — and a cold row's `process_peaks_bytes` lists all three of its runs' high-waters in run order, the row's own figure being the median run's. A warm row's `process=cell` names the cell's own process, which prints its final reading on its `unit` row: the high-water a warm row, the `long` row or the `memory` row carries is an earlier moment of that process, so it is `moment_peak_bytes`. A cold row's `total_ms_per_audio_s` carries the load inside it; a warm row's `call_ms_per_audio_s` does not.
 
-Warm is the whole pass above; **cold** is `corpus-cold`, that same call with the models loaded inside the measurement (load 395 ms + call 45968 ms) on the pass's first file, `speech/librivox/speech-librivox-0027.wav` — the one file of a pass that pays the load and the first compilations, since the rest of the pass reuses them.
+**The quality figure, and the second bar: 2.09 % of the covered speech came back with no transcript**, against 2 %: this run is **0.09 points above it**. Its denominator is `speech_pool_s`, the seconds of the speech pool that a recognition chunk covered — the noise pool's covered seconds are counted apart on the same row's `noise_*` fields, and `covered_s` on the `coverage` row and the `corpus` row is both pools together — and its numerator is the seconds of those regions no reading produced, so a region the detector marked but the tagger calls something other than words is counted where the `speech` row's split puts it. The `speech` row carries the bar beside the figure and `gated=false`: reported against it, the same way the headline is. Every speech file has its own `textless-file` row with that file's own percentage beside the same bar — a zero printed rather than a row left out — so the distribution can be read rather than the aggregate taken on trust.
 
-**The quality figure: 2.86 % of the covered speech came back with no transcript**, against a bar of 2 %: this run is **0.86 points above it**. The `speech` row carries the seconds, the chunks and the split by the tagger's label, and every file that lost any of them has its own `textless-file` row.
-
-These rows are one pass of `transcribe::Transcriber` over the pinned corpus of 33 real-audio files (64.0 min of speech and noise) and the eight-clip music pool, plus the constructed boundary material, the longest pinned track and the pinned clip's parity with the single-shot answer; a corpus has no warm repetition, so each row is one measurement of the audio it names. Every transcription is held to the invariant that a region answers with a text or a label, that a labelled region carries no reliable transcript, and that the regions tile the input exactly — the first at 0, the last at its length. The times are the detector's own 16 ms hops and the labels are the tagger's per-window winners, not a transcript.
+These rows are one pass of `transcribe::Transcriber` over the pinned corpus of 33 real-audio files (64.0 min of speech and noise) and the eight-clip music pool, plus the constructed boundary material, the pinned clip's parity with the single-shot answer, the longest pinned track and three hour-scale inputs built from the corpus itself. Every transcription is held to the invariant that a region carries a text or a label and never both, and that the regions tile the input exactly — the first at 0, the last at its length. A region that was not read is not silence: it carries the tagger's label and `read=false`, which is how a caller tells nothing-there from failed-to-read. The times are the detector's own 16 ms hops and the labels are the tagger's per-window winners, not a transcript. The table's `unit` row is this cell's, and its two time columns do not mean what they mean on the other rows: its `cold_ms` is the whole cell — the messages, the corpus pass, the music pool, the constructed material, the pinned clip's parity, the hour-scale inputs (each a process of its own, whose wall time the span includes) and the longest track — while its `run_ms` is the corpus pass alone, one call per file, hand-over to text. Its `peak` is likewise the whole cell's own process and not the corpus pass's: the cell's figure is the high-water its `unit` row prints when the cell has finished, and every other reading its verdict compares is one of the processes it started for a call of message or corpus size — a `process_peak_bytes` entry of a row below, or, for a cold message row's three runs, a `process_peaks_bytes` one. The hour-scale inputs are a population of their own and are stated apart in the paragraph below. The cell's own earlier moments (its warm message rows, its `long` row, its `memory` row and its per-phase prints) are `moment_peak_bytes` entries: never part of the verdict, and never higher than the figure above.
 
 | what | numbers |
 |---|---|
-| inputs | corpus=~/.mahbot/faph_corpus files=33 audio_s=3838.7 music=~/.mahbot/asr_audio clips=8 voice=~/.mahbot/userspaces/admin/assets/rlx-4bit-tts/voice-sample.wav open_ms=163.8 |
-| message | s=10 pass=cold load_ms=384.2 call_ms=2276.4 total_ms=2660.7 audio_s=10.000 ms_per_audio_s=266.1 regions=4 words=17 text="dedicatória e introdução de amor perdição esta é uma gravaçã" |
-| message | s=10 pass=warm call_ms=1384.4 audio_s=10.000 ms_per_audio_s=138.4 regions=4 words=17 text="dedicatória e introdução de amor perdição esta é uma gravaçã" |
-| message | s=30 pass=cold load_ms=383.3 call_ms=4911.8 total_ms=5295.1 audio_s=30.000 ms_per_audio_s=176.5 regions=9 words=49 text="dedicatória e introdução de amor perdição esta é uma gravaçã" |
-| message | s=30 pass=warm call_ms=3868.0 audio_s=30.000 ms_per_audio_s=128.9 regions=9 words=49 text="dedicatória e introdução de amor perdição esta é uma gravaçã" |
-| parity | moved=19 words=25 pinned=22 same_count=false clip_s=17.460 transcribed_s=15.392 text="обычные объявления в метро делаются только на каталонском яз" |
-| parity-span | span_s=4.720 moved=0 words=9 single=9 same_count=true text="обычные объявления в метро делаются только на каталонском яз" |
-| boundary | pastes=4 regions=13 err_ms=+0.0,+0.0,+0.0,+0.0 mean_ms=+0.0 max_abs_ms=0.0 |
+| inputs | corpus=~/.mahbot/faph_corpus files=33 audio_s=3838.7 music=~/.mahbot/asr_audio clips=8 voice=~/.mahbot/userspaces/admin/assets/rlx-4bit-tts/voice-sample.wav open_ms=165.3 |
+| message | s=10 pass=cold process=own load_ms=419.4 call_ms=1991.6 audio_s=10.000 total_ms_per_audio_s=241.1 bar_ms_per_audio_s=100 bar_tolerance_ms_per_audio_s=103 regions=4 words=16 chunks=2 rungs=1 compiles=1 build_ms=720.5 recognise_ms=1217.8 process_peak_bytes=2529329152 gated=false text="Dedicatória e introdução de amor por perdição. Esta é uma gr" total_ms=2411.0 runs=3 total_spread_ms=172.8 process_peaks_bytes=2529296384,2529329152,2527838208 |
+| message | s=30 pass=cold process=own load_ms=415.6 call_ms=4792.1 audio_s=30.000 total_ms_per_audio_s=173.6 bar_ms_per_audio_s=100 bar_tolerance_ms_per_audio_s=103 regions=10 words=49 chunks=6 rungs=3 compiles=3 build_ms=1344.0 recognise_ms=3292.6 process_peak_bytes=2528952320 gated=false text="Dedicatória e introdução de amor por perdição. Esta é uma gr" total_ms=5207.7 runs=3 total_spread_ms=42.1 process_peaks_bytes=2528493568,2525888512,2528952320 |
+| corpus-cold | file=speech/librivox/speech-librivox-0027.wav process=own load_ms=415.1 call_ms=39285.0 audio_s=318.0 total_ms_per_audio_s=124.8 bar_ms_per_audio_s=100 bar_tolerance_ms_per_audio_s=103 words=651 process_peak_bytes=2535194624 gated=false text="Dedicatória e introdução de amor por perdição. Esta é uma gr" |
+| parity | moved=21 words=25 pinned=22 same_count=false clip_s=17.460 covered_s=15.392 text="Обычные объявления в метро делаются только на каталонском яз" |
+| parity-span | span_s=4.720 moved=1 words=9 single=9 same_count=true text="Обычные объявления в метро делаются только на каталонском яз" |
+| boundary | pastes=4 regions=17 err_ms=+0.0,+0.0,+0.0,+0.0 mean_ms=+0.0 max_abs_ms=0.0 |
 | boundary | gain=1.0000 lifted_gain=29.4828 moved=0 identical=true |
-| music instrumental/01-orchestra.wav | audio_s=20.00 regions=1 text_chars=0 labels=Music suppressed_s=0.0 read_ms=1.0 wall_ms=1803.0 s_per_audio_s=0.0902 |
-| music instrumental/02-solo-piano.wav | audio_s=25.00 regions=1 text_chars=0 labels=Music suppressed_s=0.0 read_ms=1.2 wall_ms=2541.6 s_per_audio_s=0.1017 |
-| music instrumental/03-electronic.wav | audio_s=20.00 regions=1 text_chars=0 labels=Music suppressed_s=0.0 read_ms=1.0 wall_ms=1840.4 s_per_audio_s=0.0920 |
-| music instrumental/04-ambient.wav | audio_s=25.00 regions=1 text_chars=0 labels=Music suppressed_s=0.0 read_ms=1.3 wall_ms=2430.4 s_per_audio_s=0.0972 |
-| music vocal/01-acappella-solfege.wav | audio_s=20.00 regions=3 text_chars=82 labels=Lullaby suppressed_s=0.0 read_ms=1.0 wall_ms=2197.6 s_per_audio_s=0.1099 |
-| music-report vocal/01-acappella-solfege.wav | transcribed=true reliable_regions=0 suppressed_s=0.0 labels=Lullaby text="La la la la la la mi la la la la la la la la. La la la la la" |
-| music vocal/02-pop-lyrics.wav | audio_s=20.00 regions=3 text_chars=173 labels=Synthetic_singing suppressed_s=0.0 read_ms=1.0 wall_ms=2586.1 s_per_audio_s=0.1293 |
-| music-report vocal/02-pop-lyrics.wav | transcribed=true reliable_regions=2 suppressed_s=0.0 labels=Synthetic_singing text="In the town where I was born, they're the ones who sing agai" |
-| music vocal/03-vocal-over-band.wav | audio_s=20.00 regions=3 text_chars=300 labels=Music suppressed_s=0.0 read_ms=1.1 wall_ms=3875.1 s_per_audio_s=0.1938 |
-| music-report vocal/03-vocal-over-band.wav | transcribed=true reliable_regions=1 suppressed_s=0.0 labels=Music text="Of darkness, oh, Jesus, I get so cold. Lord, give me the lig" |
-| music vocal/04-vocal-indian-classical.wav | audio_s=20.00 regions=1 text_chars=0 labels=Music suppressed_s=0.0 read_ms=1.2 wall_ms=1887.3 s_per_audio_s=0.0944 |
-| music-report vocal/04-vocal-indian-classical.wav | transcribed=false reliable_regions=0 suppressed_s=0.0 labels=Music text="" |
-| music-total | clips=8 audio_s=170.0 wall_s=19.2 s_per_audio_s=0.1127 suppressed_s=0.0 instrumental_any_text=0 vocal_reliable=2 |
-| corpus-cold | file=speech/librivox/speech-librivox-0027.wav load_ms=395.0 call_ms=45967.8 audio_s=318.0 ms_per_audio_s=145.8 words=643 text="dedicatória e introdução de amor perdição esta é uma gravaçã" |
-| textless-file speech/us-gov/speech-us-gov-0147.wav | audio_s=215.9 chunks=27 textless_chunks=1 textless_s=9.4 labelled_voiced_s=9.4 labelled_other_s=0.0 e2e_ms=22774.3 labels=Speech:5 |
-| textless-file speech/us-gov/speech-us-gov-0159.wav | audio_s=173.9 chunks=22 textless_chunks=3 textless_s=23.9 labelled_voiced_s=19.9 labelled_other_s=4.0 e2e_ms=18251.3 labels=Animal:1;Speech:3 |
-| textless-file speech/us-gov/speech-us-gov-0210.wav | audio_s=123.8 chunks=15 textless_chunks=1 textless_s=9.2 labelled_voiced_s=9.2 labelled_other_s=0.0 e2e_ms=13671.5 labels=Speech:4 |
-| textless-file speech/us-gov/speech-us-gov-0201.wav | audio_s=58.0 chunks=7 textless_chunks=2 textless_s=21.5 labelled_voiced_s=21.5 labelled_other_s=0.0 e2e_ms=5618.1 labels=Speech:2 |
-| textless-file speech/us-gov/speech-us-gov-0005.wav | audio_s=26.8 chunks=3 textless_chunks=3 textless_s=26.7 labelled_voiced_s=26.7 labelled_other_s=0.0 e2e_ms=2313.3 labels=Speech:1 |
-| corpus | files=33 audio_s=3838.7 speech_s=3296.2 regions=647 text_regions=419 label_regions=228 wall_s=440.0 |
-| e2e | scope=corpus files=33 audio_s=3838.7 wall_ms=440021.5 ms_per_audio_s=114.6 speech_s=3296.2 |
-| breakdown | read_ms_per_audio_min=3.3 mask_plan_ms_per_audio_min=16.2 tagger_ms_per_audio_min=230.4 compile_ms_per_audio_min=964.2 passes_ms_per_audio_min=5573.4 unattributed_ms_per_audio_min=90.1 read_ms=211.6 chunks=472 shapes=413 windows=742 |
-| tuning | min_speech_hops=25 merge_gap_hops=50 hangover_hops=25 cut_s=8 cut_early_s=2.992 cut_late_s=6.992 cut_slack_pct=50 frame_alignment=8 min_chunk_s=0.4 repeat_gram=4 repeat_limit=3 word_repeat_limit=12 density_ceiling=30.0 chunk_tokens_per_s=10.0 min_chunk_tokens=48 |
-| speech | files=18 speech_s=3174.8 chunks=429 textless_s=90.7 textless_pct=2.86 textless_bar_pct=2.00 textless_gap_pct=0.86 textless_chunks=10 textless_voiced_s=86.7 textless_other_s=4.0 suppressed_s=0.0 flagged_s=0.0 flagged_pct=0.00 noise_files=15 noise_marked_s=125.1 noise_suppressed_s=36.7 noise_speech_s=121.5 noise_textless_s=121.5 |
-| seams | seams=0 seam_words=3 |
+| music instrumental/01-orchestra.wav | audio_s=20.00 regions=1 text_chars=0 labels=Music suppressed_s=0.0 read_ms=1.9 wall_ms=1735.2 call_ms_per_audio_s=86.8 |
+| music instrumental/02-solo-piano.wav | audio_s=25.00 regions=1 text_chars=0 labels=Music suppressed_s=0.0 read_ms=2.2 wall_ms=2095.0 call_ms_per_audio_s=83.8 |
+| music instrumental/03-electronic.wav | audio_s=20.00 regions=1 text_chars=0 labels=Music suppressed_s=0.0 read_ms=1.9 wall_ms=1271.3 call_ms_per_audio_s=63.6 |
+| music instrumental/04-ambient.wav | audio_s=25.00 regions=1 text_chars=0 labels=Music suppressed_s=0.0 read_ms=2.2 wall_ms=1563.1 call_ms_per_audio_s=62.5 |
+| music vocal/01-acappella-solfege.wav | audio_s=20.00 regions=4 text_chars=91 labels=Lullaby suppressed_s=0.0 read_ms=2.0 wall_ms=1907.8 call_ms_per_audio_s=95.4 |
+| music-report vocal/01-acappella-solfege.wav | transcribed=true read_regions=3 suppressed_s=0.0 labels=Lullaby text="La la la la la la. La, la, so, so, la, la, la, la, mila. Sol" |
+| music vocal/02-pop-lyrics.wav | audio_s=20.00 regions=4 text_chars=168 labels=Synthetic_singing suppressed_s=0.0 read_ms=2.0 wall_ms=1780.4 call_ms_per_audio_s=89.0 |
+| music-report vocal/02-pop-lyrics.wav | transcribed=true read_regions=3 suppressed_s=0.0 labels=Synthetic_singing text="In the town where I was born, there's a fountain. Michigan, " |
+| music vocal/03-vocal-over-band.wav | audio_s=20.00 regions=4 text_chars=97 labels=Music suppressed_s=0.0 read_ms=1.9 wall_ms=1898.4 call_ms_per_audio_s=94.9 |
+| music-report vocal/03-vocal-over-band.wav | transcribed=true read_regions=2 suppressed_s=0.0 labels=Music text="Of darkness, oh, she says, I get so lonely, boy. In the sun," |
+| music vocal/04-vocal-indian-classical.wav | audio_s=20.00 regions=1 text_chars=0 labels=Music suppressed_s=0.0 read_ms=1.9 wall_ms=2263.9 call_ms_per_audio_s=113.2 |
+| music-report vocal/04-vocal-indian-classical.wav | transcribed=false read_regions=0 suppressed_s=0.0 labels=Music text="" |
+| music-total | clips=8 audio_s=170.0 wall_s=14.5 call_ms_per_audio_s=85.4 suppressed_s=0.0 declared_chunks=6 chunks=27 instrumental_any_text=0 vocal_read=3 |
+| peak | phase=music process=cell moment_peak_bytes=2387755008 weights=1.33GiB host=427819008 |
+| textless-file speech/librivox/speech-librivox-0027.wav | audio_s=318.0 chunks=51 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=37662.4 labels=Speech:17 |
+| textless-file speech/librivox/speech-librivox-0051.wav | audio_s=315.6 chunks=50 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=37808.0 labels=Speech:14 |
+| textless-file speech/librivox/speech-librivox-0093.wav | audio_s=314.1 chunks=52 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=35338.4 labels=Speech:22 |
+| textless-file speech/librivox/speech-librivox-0075.wav | audio_s=312.8 chunks=55 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=28519.7 labels=Speech:39 |
+| textless-file speech/librivox/speech-librivox-0103.wav | audio_s=307.2 chunks=57 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=35918.6 labels=Speech:35 |
+| textless-file speech/librivox/speech-librivox-0088.wav | audio_s=304.2 chunks=53 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=35252.4 labels=Speech:31 |
+| textless-file speech/us-gov/speech-us-gov-0252.wav | audio_s=231.5 chunks=36 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=23683.1 labels=Speech:9 |
+| textless-file speech/us-gov/speech-us-gov-0147.wav | audio_s=215.9 chunks=34 textless_chunks=1 textless_s=6.4 textless_pct=2.99 textless_bar_pct=2.00 textless_voiced_s=6.4 textless_other_s=0.0 e2e_ms=19256.7 labels=Speech:6 |
+| textless-file speech/us-gov/speech-us-gov-0082.wav | audio_s=215.0 chunks=32 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=25986.7 labels=Speech:3 |
+| textless-file speech/us-gov/speech-us-gov-0159.wav | audio_s=173.9 chunks=26 textless_chunks=1 textless_s=6.8 textless_pct=3.94 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=6.8 e2e_ms=16202.5 labels=Animal:1;Speech:2 |
+| textless-file speech/us-gov/speech-us-gov-0067.wav | audio_s=157.8 chunks=25 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=17550.2 labels=Speech:7 |
+| textless-file speech/us-gov/speech-us-gov-0250.wav | audio_s=126.1 chunks=23 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=14140.3 labels=Speech:9 |
+| textless-file speech/us-gov/speech-us-gov-0210.wav | audio_s=123.8 chunks=18 textless_chunks=2 textless_s=13.7 textless_pct=11.54 textless_bar_pct=2.00 textless_voiced_s=13.7 textless_other_s=0.0 e2e_ms=10609.9 labels=Speech:5 |
+| textless-file speech/us-gov/speech-us-gov-0229.wav | audio_s=100.5 chunks=16 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=10277.1 labels=Speech:3 |
+| textless-file speech/us-gov/speech-us-gov-0201.wav | audio_s=58.0 chunks=9 textless_chunks=1 textless_s=6.7 textless_pct=11.60 textless_bar_pct=2.00 textless_voiced_s=6.7 textless_other_s=0.0 e2e_ms=4995.5 labels=Speech:2 |
+| textless-file speech/us-gov/speech-us-gov-0130.wav | audio_s=53.3 chunks=8 textless_chunks=1 textless_s=6.1 textless_pct=11.55 textless_bar_pct=2.00 textless_voiced_s=6.1 textless_other_s=0.0 e2e_ms=5183.1 labels=Speech:2 |
+| textless-file speech/us-gov/speech-us-gov-0005.wav | audio_s=26.8 chunks=4 textless_chunks=4 textless_s=26.7 textless_pct=100.00 textless_bar_pct=2.00 textless_voiced_s=26.7 textless_other_s=0.0 e2e_ms=2815.4 labels=Speech:1 |
+| textless-file speech/us-gov/speech-us-gov-0109.wav | audio_s=19.7 chunks=3 textless_chunks=0 textless_s=0.0 textless_pct=0.00 textless_bar_pct=2.00 textless_voiced_s=0.0 textless_other_s=0.0 e2e_ms=2065.9 labels=Speech:1 |
+| corpus | files=33 audio_s=3838.7 covered_s=3296.2 regions=772 text_regions=542 label_regions=230 wall_s=377.1 ladder=128,256,384,512,640,768 |
+| peak | phase=corpus process=cell moment_peak_bytes=2387755008 weights=1.33GiB host=427819008 |
+| message | s=10 pass=warm process=cell call_ms=1160.7 warm_spread_ms=17.6 runs=3 audio_s=10.000 call_ms_per_audio_s=116.1 bar_ms_per_audio_s=100 bar_tolerance_ms_per_audio_s=103 regions=4 words=16 chunks=2 rungs=1 compiles=0 build_ms=0.0 recognise_ms=1124.1 moment_peak_bytes=2387755008 gated=false text="Dedicatória e introdução de amor por perdição. Esta é uma gr" |
+| message | s=30 pass=warm process=cell call_ms=3336.2 warm_spread_ms=28.1 runs=3 audio_s=30.000 call_ms_per_audio_s=111.2 bar_ms_per_audio_s=100 bar_tolerance_ms_per_audio_s=103 regions=10 words=49 chunks=6 rungs=3 compiles=0 build_ms=0.0 recognise_ms=3196.2 moment_peak_bytes=2387755008 gated=false text="Dedicatória e introdução de amor por perdição. Esta é uma gr" |
+| e2e | scope=corpus files=33 audio_s=3838.7 wall_ms=377127.1 call_ms_per_audio_s=98.2 covered_s=3296.2 bar_ms_per_audio_s=100 bar_tolerance_ms_per_audio_s=103 gated=false |
+| breakdown | read_ms_per_audio_min=3.4 mask_plan_ms_per_audio_min=16.2 tagger_ms_per_audio_min=229.9 compile_ms_per_audio_min=16.6 passes_ms_per_audio_min=5581.4 unattributed_ms_per_audio_min=47.0 read_ms=219.4 chunks=597 rungs_per_file_summed=86 windows=742 |
+| tuning | min_speech_hops=25 merge_gap_hops=50 hangover_hops=25 cut_s=7 cut_early_s=0.512 frame_rungs=128,256,384,512,640,768 min_chunk_s=0.4 repeat_gram=4 repeat_limit=3 word_repeat_limit=12 density_ceiling=30.0 chunk_tokens_per_s=10.0 min_chunk_tokens=48 speech_spread_db=11.0 filler_words=2 filler_seconds=3.0 |
+| speech | files=18 speech_pool_s=3174.8 chunks=552 declared_chunks=547 undeclared_chunks=5 textless_s=66.4 textless_pct=2.09 textless_bar_pct=2.00 textless_gap_pct=0.09 gated=false textless_chunks=10 textless_voiced_s=59.6 textless_other_s=6.8 suppressed_s=0.0 discarded_s=52.6 discarded_pct=1.66 noise_files=15 noise_masked_s=125.1 noise_suppressed_s=36.7 noise_covered_s=121.5 noise_textless_s=121.5 |
+| seams | seams=0 seam_words=3 gated=true |
 | coverage | masked_s=2868.8 covered_s=3296.2 uncovered_s=1.4 uncovered_pct=0.05 |
-| invented | files=15 text_regions=0 reliable_regions=0 marked_regions=0 chars=0 |
+| invented | files=15 text_regions=0 chars=0 gated=true |
+| refused-example 1 | file=speech/us-gov/speech-us-gov-0147.wav seconds=6.35 text="Right? Nope." |
+| refused-example 2 | file=speech/us-gov/speech-us-gov-0210.wav seconds=6.68 text="Thank you." |
+| refused-example 3 | file=speech/us-gov/speech-us-gov-0201.wav seconds=6.72 text="Nice." |
+| refused-example 4 | file=speech/us-gov/speech-us-gov-0130.wav seconds=6.14 text="No, I." |
+| refused-example 5 | file=speech/us-gov/speech-us-gov-0005.wav seconds=6.34 text="Okay." |
+| refused-example 6 | file=speech/us-gov/speech-us-gov-0005.wav seconds=6.67 text="Okay." |
+| refused-example 7 | file=speech/us-gov/speech-us-gov-0005.wav seconds=6.56 text="Hello." |
+| refused-example 8 | file=speech/us-gov/speech-us-gov-0005.wav seconds=7.15 text="Oh yeah! Yeah, yeah, yeah, yeah, yeah, yeah, yeah, yeah, yea" |
 | label-rule | offered=68 labels=Speech;Male speech, man speaking;Female speech, woman speaking;Child speech, kid speaking;Conversation;Narration, monologue;Babbling;Children shouting;Whispering;Speech synthesizer;Hubbub, speech noise, speech babble;Singing;Choir;Yodeling;Chant;Mantra;Male singing;Female singing;Child singing;Synthetic singing;Rapping;Humming;Vocal music;A capella;Song;Lullaby;Ambient music;Angry music;Background music;Carnatic music;Christian music;Christmas music;Classical music;Dance music;Electronic dance music;Electronic music;Exciting music;Folk music;Funny music;Gospel music;Happy music;Hip hop music;House music;Independent music;Jingle (music);Middle Eastern music;Music;Music for children;Music of Africa;Music of Asia;Music of Bollywood;Music of Latin America;Musical instrument;New-age music;Pop music;Rock music;Sad music;Salsa music;Scary music;Soul music;Soundtrack music;Swing music;Tender music;Theme music;Traditional music;Trance music;Video game music;Wedding music |
+| speech-labels | offered=26 labels=Speech;Male speech, man speaking;Female speech, woman speaking;Child speech, kid speaking;Conversation;Narration, monologue;Babbling;Children shouting;Whispering;Speech synthesizer;Hubbub, speech noise, speech babble;Singing;Choir;Yodeling;Chant;Mantra;Male singing;Female singing;Child singing;Synthetic singing;Rapping;Humming;Vocal music;A capella;Song;Lullaby |
 | noise-labels | files=15 labels=Animal:1;Bell:1;Bird:2;Chirp,_tweet:1;Emergency_vehicle:1;Fire_alarm:1;Fireworks:1;Insect:1;Music:4;Police_car_(siren):1;Silence:1;Sine_wave:1;Speech:1;Synthesizer:1;Theremin:1;Walk,_footsteps:1;Whistle:1 |
-| long | file=speech/librivox/speech-librivox-0027.wav audio_s=318.0 regions=58 read_ms=17.2 build_ms=3949.3 passes_s=34.9 wall_s=40.7 s_per_audio_s=0.1279 peak=3.90GiB |
+| long | file=speech/librivox/speech-librivox-0027.wav audio_s=318.0 regions=68 read_ms=20.2 build_ms=728.3 passes_s=35.3 wall_s=37.7 call_ms_per_audio_s=118.4 process=cell moment_peak_bytes=2387755008 |
+| memory | process=cell moment_peak_bytes=2387755008 resident=1.27GiB weights=1.33GiB host=427819008 map=1681852576 ceiling_mib=6144 swap_ceiling_mib=1024 |
+| long-input | label=1min process=own audio_s=60.0 regions=15 chunks=10 rungs=3 compiles=3 wall_s=8.6 call_ms_per_audio_s=142.8 input_bytes=3840000 rss_before=353026048 rss_after=1561755648 retained=1208729600 process_peak_bytes=2539634688 weights=1.33GiB arena=- |
+| long-input | label=30min process=own audio_s=1800.0 regions=458 chunks=308 rungs=6 compiles=6 wall_s=204.0 call_ms_per_audio_s=113.3 input_bytes=115200000 rss_before=353075200 rss_after=252870656 retained=-100204544 process_peak_bytes=2777219072 weights=1.33GiB arena=- |
+| long-input | label=60min process=own audio_s=3600.0 regions=740 chunks=574 rungs=6 compiles=6 wall_s=379.5 call_ms_per_audio_s=105.4 input_bytes=230400000 rss_before=353042432 rss_after=362217472 retained=9175040 process_peak_bytes=3015344128 weights=1.33GiB arena=- |
 
-**The headline is `e2e`.** One figure is the recognition number, and it is the whole
-call from hand-over of the audio to the returned text: reading the file, the gain and
-resample, the detector's mask, the tagger's labels, the cut, every compilation the call
-needs, the recognition passes, the guards and the joins. `ms_per_audio_s` is that figure
-over the pass; `corpus-cold` is the same call with the models loaded inside the
-measurement — no weights on the device when it starts — on the first file of the pass,
-and `message` gives it absolutely for a real ten-second and a real thirty-second voice
-message, `cold` (loaded by the call) and `warm` (the same call on the loaded
-transcriber), each printing the text it returned so the result is checkable rather than
-asserted. Nothing else in this section is a recognition figure: `breakdown` is the same
-call split into what could be attributed — the file read, the mask and plan, the tagger,
-the compilations and the recognition passes, per minute of audio — plus
-`unattributed_ms_per_audio_min`, which is the remainder (gain and resample, the guards,
-the joins, the retimed result) reported rather than guessed at.
+### The pass, phase by phase
 
-`breakdown`'s `compile` is the price of a graph per chunk length: each compile uploads
-the body's weights into the shared weight buffer, and a compile for a model whose
-weights a previous compile already placed in that buffer skips the upload — the
-`set_param_sharing_scope` path this tree declares in `graphs::Runner::compile`. What
-remains of a compile is its own lowering plus the host-side read of the weight bytes,
-which is why `compile` does not fall to zero. `chunks`, `shapes` and `windows` are the
-work it prices: the recognition passes, the distinct frame counts their graphs were
-compiled at, and the tagger's windows. The tagger's own compile is `open_ms`, and the
-music pool, the constructed material and the parity rows are priced by their own rows.
+One pass, split into what could be attributed to it. These are the parts of the
+headline figure and none of them is the recognition number.
+
+| phase | ms per audio second | share of the pass |
+|---|---|---|
+| read (the file) | 0.1 | 0 % |
+| mask and plan | 0.3 | 0 % |
+| tagger | 3.8 | 4 % |
+| compilations | 0.3 | 0 % |
+| recognition passes | 93.0 | 95 % |
+| unattributed | 0.8 | 1 % |
+
+The recognition passes are the floor the model imposes: a decode step reads the
+body's weights whatever the row count, so what moves the passes is how many steps
+the audio needs — fewer chunks, or less of it decoded — not the other phases. This
+run's own figures are the row above; a change that raises them says so here rather
+than trading them for a better line elsewhere.
+The compilations are a **ladder**, not a per-chunk price: a chunk is padded up to one
+of 6 closed frame counts and that rung's graphs are compiled once for the process,
+so a pass pays for the rungs no earlier call placed. `breakdown`'s
+`rungs_per_file_summed` adds each file's distinct rung count — a per-file figure, so
+its total over 33 files is larger than the ladder it can only ever draw from, which
+the `tuning` row prints whole; `compiles` counts the rungs a call had to build,
+`chunks` is the work they price and `windows` the tagger's windows.
+
+### The call's memory, and hour-scale input
+
+The cell's own reading is 2.22 GiB: the high-water of the one process the cell is, taken when it printed its `unit` row, after its corpus pass and the hour-scale children's calls. Its `memory` row, printed after the corpus pass, read 2.22 GiB; the first phase print that carries it is `music` (2.22 GiB) — the phases print their reading in the order they run, so the high-water was reached at or before that phase. `weights` (1.33 GiB) is the device's
+shared weight pool — one model's parameter bytes, held once however many layouts and
+rungs bind them — and `host` (0.40 GiB) is the process's own kept copies of weights, the
+fused projections a second layout re-reads. `host` is printed in whole bytes, like
+`map`; `weights` in the display form the `unit` row prints. Both are read at
+`music`'s print, the widest of the per-phase readings. `map` (1.57 GiB) is the
+bytes of the three files the cell binds — the recognition pair and the tagger — by
+their size: each is opened by mapping and its tensor bytes read with `pread` through one
+scratch buffer, so the mapping is not the copy the process holds and the figure is not
+resident pages. No `arena` figure: each rung's graphs have a plan of
+their own, and a sum of plans is not an allocation. Its resident set when the `memory`
+row was taken is 1.27 GiB. This cell is **at its ceiling**: the cell's own process and the 7 it started for a call of message or corpus size — cell 2.22 GiB, message 10 s cold run 1 2.36 GiB, message 10 s cold run 2 2.36 GiB, message 10 s cold run 3 2.35 GiB, message 30 s cold run 1 2.35 GiB, message 30 s cold run 2 2.35 GiB, message 30 s cold run 3 2.36 GiB, corpus cold 2.36 GiB — span
+2.22 GiB to 2.36 GiB against 2.35 GiB. Its readings fall on both sides of it — 1 below, 7 above — so the row is reported at it. The hour-scale inputs are a population of their own and are not in it: their rows carry them, and the paragraph under their table says what their high-waters do between lengths.
+The cell ran under a 6144 MiB resident-set ceiling and a 1024 MiB swap-growth ceiling;
+the provenance block says which of those was raised from the guard's default.
+
+Three inputs built from the corpus itself — real speech and real noise, repeated, no
+synthetic tone — answer the bound the product needs. Each is one call in a process of
+its own, each returns a segmentation covering the whole input, and all three are held
+to the same closed ladder: whatever the input's length, no row compiles a shape the
+ladder does not hold.
+
+| input | audio s | regions | chunks | rungs | compiles | call ms/audio s | caller MiB | retained MiB | process peak GiB | weights |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1min | 60.0 | 15 | 10 | 3 | 3 | 142.8 | 3.7 | 1152.7 | 2.37 | 1.33GiB |
+| 30min | 1800.0 | 458 | 308 | 6 | 6 | 113.3 | 109.9 | -95.6 | 2.59 | 1.33GiB |
+| 60min | 3600.0 | 740 | 574 | 6 | 6 | 105.4 | 219.7 | 8.8 | 2.81 | 1.33GiB |
+
+`compiles` is what the call asked the compiler for. Each row is a fresh process, so
+each places the rungs its own call uses — `compiles` is that call's, not a figure the
+earlier rows already paid; within one process a repeat call compiles nothing, which is
+what the corpus pass above shows. `rungs` cannot exceed the ladder the `tuning` row
+prints, whatever the input's length: the count follows the input up to the ladder's own
+size and then stops, and the rows print 3, 6, 6 against a ladder of 6.
+`weights` is the device pool each row held: one copy of the same model's parameter
+bytes, whatever the length.
+`retained` is the difference between two resident-set readings of one process —
+before the call, and after it with the caller's audio dropped and the freed pages
+returned. At the granularity of a process that has just built and dropped hundreds of
+megabytes that difference is not resolvable: it moves between repeats by more than the
+effect it would show, so it is printed as a reading rather than as evidence of growth
+or of its absence — the three rows read 1152.7 MiB, -95.6 MiB, 8.8 MiB. `process peak GiB` is that process's high-water, and it does not fall with the input here: 2.37 GiB, 2.59 GiB, 2.81 GiB
+for the three inputs. The caller's audio (`caller MiB`) and the tagger's log-mel
+over it are linear in the input by construction, and they are the part of a call's
+working set no implementation can hold in nothing. What the table shows not following
+the length is the model side: `rungs` stays inside the closed ladder however long the
+input, and `weights` holds one copy of the same parameter bytes on every row.
 
 The `tuning` row is the decision surface this run was taken with — the pause it merges
 across, the run it drops, the hangover it reaches into silence, the length every cut aims
-at, the caps on how far before and after that aim a cut may search and the share of the
-piece it may leave (`cut_slack_pct`: the narrower of the two bounds is the one that
-applies, so a piece is between half a share and one and a half), the frame alignment its
-graphs are compiled at, and the three text guards — because the product wants to filter
-more rather than less and a choice that is not printed cannot be reviewed. A chunk is read
-once: the plan cuts at the span the
-encoder was trained over, so there is no second presentation to price.
+at and how far before that aim a cut may search for a pause, the ladder of frame counts a
+chunk's graphs are compiled at, and the three text guards — because a choice that is not
+printed cannot be reviewed. A cut never moves later than its share, so a span's piece count
+follows its length and no piece is longer than the aim plus the search.
 
-The `speech` row answers how much of the speech the segmented path failed to
-transcribe, in audio rather than in words. Its denominator is the speech the passes
-covered, not the seconds the detector marked: a chunk's hangover reaches into silence,
-so the covered figure is larger than `masked_s` in the coverage row, and both are named
-so neither has to be derived from the other. `textless_s` is the covered audio whose
-region came back with no transcript, `textless_chunks` the passes that produced it, and
-`flagged_s` the speech whose transcript the guards rejected — returned, marked and
-labelled, so a caller that filters loses those seconds and a caller that does not still
-reads what was produced. A region's whole seconds are counted, the hangover into silence
-included. `textless_voiced_s` and `textless_other_s` split the textless seconds by what
-the tagger says the audio there is: the first a label that can hold words, the second a
-detector mark on audio the tagger calls something else. `suppressed_s` is the third kind:
-the marked seconds inside merged spans the tagger calls something that cannot carry a
-word, whose audio is their label and which are not presented to the recogniser at all.
-Every file that lost any speech has its own `textless-file` row — its `textless_s`, how
-that splits by label, what the labels are, and the call's own `e2e_ms` — so the
-aggregate is attributed rather than taken on trust. The noise pool is counted apart,
-because there the detector's marks are mostly false positives and a textless second is
-the detector's, not lost speech: `noise_marked_s` is what the detector marked,
-`noise_suppressed_s` the marked seconds the tagger's labels kept out of the recognition
-path and `noise_speech_s` what the recogniser was given. A word-level comparison cannot
-answer the question: a recogniser paraphrases across a cut, and the parity rows measure
-exactly that. `seams` counts the adjacent transcripts that share `seam_words` whole
-words or more — a reading carried twice, which is what a lead-in or a piece join could
-once produce; the plan gives every chunk disjoint audio, so it is printed beside the
-pool rather than held against the round.
+The `speech` row answers how much of the speech the segmented path failed to transcribe, in
+audio rather than in words. Its denominator is `speech_pool_s` — the speech pool's seconds a
+recognition chunk covered, the noise pool counted apart on the same row — and not the seconds
+the detector marked: a chunk's hangover reaches into silence, so the covered figure is larger
+than `masked_s` in the coverage row, and `covered_s` there is both pools together. All three
+are named so none has to be derived from another. `textless_s` is the covered audio whose region came back with no
+transcript, `textless_chunks` the passes that produced it, and `discarded_s` the speech whose
+transcript the guards refused — not returned at all, because a placeholder over audio nobody
+can read is worse than an honest hole: the region is marked found-but-not-read, and the
+first `REFUSAL_SAMPLES` of them are printed as `refused-example` rows with their own
+audio, so the line between a reading and the model's placeholder is reviewed rather than
+taken on trust. A region's
+whole seconds are counted, the hangover into silence included. `textless_voiced_s` and
+`textless_other_s` split the textless seconds by what the tagger says the audio there is:
+the first a label that can hold words, the second a detector mark on audio the tagger calls
+something else. `suppressed_s` is the third kind: the marked seconds inside merged spans the
+tagger calls something that cannot carry a word, whose audio is their label and which are
+not presented to the recogniser at all. Every speech file has its own
+`textless-file` row — its `textless_s`, that file's own percentage against the same bar, how
+that splits by label, what the labels are, and the call's own `e2e_ms` — so the aggregate is
+attributed rather than taken on trust. The noise pool is counted apart, because there the
+detector's marks are mostly false positives and a textless second is the detector's, not
+lost speech: `noise_masked_s` is what the detector marked, `noise_suppressed_s` the marked
+seconds the tagger's labels kept out of the recognition path and `noise_covered_s` what the
+recogniser was given. `seams` counts the adjacent transcripts that share `seam_words` whole
+words or more — a reading carried twice, which the plan's disjoint chunks rule out, and which
+the round is held to at zero. The pool's `invented` row is its other gate: a region over the
+noise pool that answered with words at all, with the first three printed so a reading can be
+judged rather than counted. The bar is zero, and a run that prints a figure is a run that
+failed it.
 
-`label-rule` is the list that decides whether a merged span is offered to the recogniser
-at all: the tagger's own names that can carry words — the speech classes, the singing
+Two label lists do different work, and both are printed because a decision that is not
+printed cannot be reviewed. `label-rule` decides whether a merged span is offered to the
+recogniser at all: the tagger's names that can carry words — the speech classes, the singing
 ones and the whole music family — matched on the name the file carries. Music and singing
-are offered even when no word comes out of them, because a song over an orchestra is
-exactly what the song rule must transcribe when its words come out, and an instrumental
-clip produces no text at all: offering it costs a pass and invents nothing.
-`suppressed_s` is what the rule kept out of the recognition path — on the speech pool, on
-the noise pool (`noise_suppressed_s`) and on the music pool, where the `music` and
-`music-report` rows carry it so that a clip with no transcript and suppressed seconds was
-never asked rather than misread — and `noise-labels` what the labelled regions say. The
-tagger's own arithmetic, as this tree runs it: f16 weights read from the file and served
-to f32 multiplies over their widened image — not f16 in compute, which the cooperative
-f16 tile cannot do at this model's 252-token window without padding the token axis and
-changing the arithmetic.
+are offered even when no word comes out of them, because a song over an orchestra is exactly
+what the song rule must transcribe when its words come out, and an instrumental clip
+produces no text at all: offering it costs a pass and invents nothing. `speech-labels` is
+the narrower list where the prompt may carry a **declared language** instead of letting the
+recogniser identify one: the speech and singing classes only, and only where the chunk's own
+loudness varies the way speech does (`SPEECH_SPREAD_DB`, the tenth to the ninetieth percentile
+of its 20 ms frame energies). The recogniser's own language answer stops a noisy chunk with
+`language None` and no transcript — the failure this surface exists to remove — while a
+declared language over an orchestra, or over a steady signal the detector mistook for speech,
+produces a confident, wrong reading. So a speech or singing chunk that varies is told the
+language, and everything else keeps the prompt the one-shot path uses and the model's own
+answer; that gate is what holds the music and noise gates at zero text. `suppressed_s` is what the offering rule kept out of the recognition path — on
+the speech pool, on the noise pool (`noise_suppressed_s`) and on the music pool, where the
+`music` and `music-report` rows carry it so that a clip with no transcript and suppressed
+seconds was never asked rather than misread — and `noise-labels` what the labelled regions
+say. The tagger's own arithmetic, as this tree runs it: f16 weights read from the file and
+served to f32 multiplies over their widened image — not f16 in compute, which the
+cooperative f16 tile cannot do at this model's 252-token window without padding the token
+axis and changing the arithmetic.
 
-`parity` reads the pinned clip the listen cell reads — the same file at the same
-offset and length, conditioned by the same `prepare_speech` — through the segmented
-call, whose text describes the speech spans it detected (`transcribed_s` of the
-clip's `clip_s`) and whose `moved` counts word positions against the pinned
-transcript. `parity-span` hands the same detected span to the single-shot walk at
-its own exact frame count: that is the segmented walk's own input, so a move there
-is what the segmented path costs and a match is the span's — the segmented walk
-reproduces the single-shot reading of the same audio when a chunk's frame count is
-rounded to the encoder's stride and no further, so no padded frame becomes an extra
-attention key. The `parity` row's remainder is the span's: the recogniser's own cut
-sensitivity, which moves most word positions when only the second of non-speech
-around the speech is added or removed — a reading difference, not lost speech. Both
-`moved` figures compare word by position, so one inserted or missing word marks
-every position after it.
+`parity` reads the pinned clip the listen cell reads — the same file at the same offset and
+length, conditioned by the same `prepare_speech` — through the segmented call, whose text
+describes the speech spans it detected (`covered_s` of the clip's `clip_s`) and whose
+`moved` counts word positions against the pinned transcript. `parity-span` hands the same
+detected span to the single-shot walk: that walk keeps the model's own language answer while
+the segmented one declares it where the gate allows, so a word that moved between them is what
+that difference costs, and the row is a witness rather than a gate. The `parity` row's remainder is the span's:
+the recogniser's own cut sensitivity, which moves most word positions when only the second of
+non-speech around the speech is added or removed — a reading difference, not lost speech. Both
+`moved` figures compare word by position, so one inserted or missing word marks every position
+after it.
 
-`boundary` is the binary check on material whose truth is the construction: a speech
-excerpt pasted into digital silence at known offsets. `err_ms` is each kept region's
-start against the paste it came from, signed; a boundary that conditioning moved would
-show there. The gain row repeats the same material as a copy at a level the library
-leaves alone against the lifted one: `moved` counts boundaries that shifted, and
-`identical` says the two readings are the same.
+`boundary` is the binary check on material whose truth is the construction: a speech excerpt
+pasted into digital silence at known offsets. `err_ms` is each kept region's start against the
+paste it came from, signed; a boundary that conditioning moved would show there. The gain row
+repeats the same material as a copy at a level the library leaves alone against the lifted
+one: `moved` counts boundaries that shifted, and `identical` says the two readings are the same.
 
-`music` and `music-report` are the music pool: instrumental clips must produce no
-trusted transcript (a flagged guess is counted, `instrumental_any_text`), and a vocal
-clip is transcribed where its words survive the guards. `music-total` is the pool's own
-wall time per second of audio — the call, not the baseline of a phase.
+`music` and `music-report` are the music pool: an instrumental clip must come back with no
+transcript at all — any text is counted in `instrumental_any_text` and fails the run, because a
+reading over music is a wrong answer rather than an observation — and a vocal clip is
+transcribed where its words survive the guards. `music-total` is the pool's own call time per
+second of audio (`call_ms_per_audio_s`) — the call, not the baseline of a phase.
 
-The `unit` row is this cell's row in the table above. Its `cold` is the whole cell —
-the messages, the corpus pass, the music pool, the constructed material, the pinned
-clip's parity and the longest track — and its `run_ms` is the corpus pass alone, which is
-what `s/speech s` re-derives from. `build` is the pass's compilations, `map` the model
-files the cell binds, and `arena` and `digest` are `-` because the cell has no single
-graph and no pinned answer of its own.
+The `unit` row is this cell's row in the table above, and its two time columns are read as its
+introduction says: `cold_ms` is the whole cell, `run_ms` the corpus pass alone, which is what
+`s_per_covered_s` re-derives from, and its `peak GiB` column the whole cell's own reading. This
+cell's `cold_ms` and `run_ms` are therefore two different spans of the same call and not a phase
+and its sum, which is why `s_per_covered_s` is the column to read. The table's `s_per_covered_s` is
+therefore per second of *covered audio* while the headline above is per second of *audio*:
+two denominators, each named where it is used. Its `build_ms` is the corpus pass's compilations,
+the rungs that pass placed, not the whole cell's; `arena` `-` (the ladder's graphs each have a
+plan, and a sum of plans is not an allocation) and `digest` `-` because the cell has no pinned
+answer of its own.
 
 Provenance:
 
@@ -623,11 +696,13 @@ Provenance:
 - device: Apple M3 Pro (Metal)
 - driver: unknown
 - profile: release
-- code: dd4a1a53 change-sha256 94486a2418012df3 (the commit and the SHA-256 of the tree's own difference from it — `MEASUREMENTS.md` excluded, because the run that measures rewrites it, and `crates/backends/rlx-mlx-sys` excluded, because the vendored MLX checkout is not this fork's content — which together are the content that produced these figures; a clean tree's digest is `e3b0c44298fc1c14`, the hash of an empty diff)
-- rows: every row above is this run's; the model files, the corpus and the music pool are verified by hash before the first one, and the `model:` lines below are what those files hashed to here
+- code: 3915e22c change-sha256 b592a86c61a31521 (the commit and the SHA-256 of the tree's own difference from it — `MEASUREMENTS.md` excluded, because the run that measures rewrites it, and `crates/backends/rlx-mlx-sys` excluded, because the vendored MLX checkout is not this fork's content — which together are the content that produced these figures; a clean tree's digest is `e3b0c44298fc1c14`, the hash of an empty diff)
+- rows: this run measured transcribe, and the transcription section this run wrote is built from its own rows; every other row of the stand table is carried from an earlier run of this file, and its figures belong to the run that took them — the `code` line above is this run's tree, not theirs. A carried row keeps its weight-stream row and, where this run could not read the files, the artefact lines of the run that took it
 - thermal: unknown (pmset -g therm printed no CPU limit line) (`pmset -g therm`, the reading `scripts/check-throttle.sh` gates on)
-- load: 3.71 3.31 3.60 (1/5/15-min) at the start, 2.92 2.29 2.76 at the table; every cell line carries its own `load=`
-- swap: 5787 MiB in use at the start, 19 MiB grown during the run (ceiling 4096 MiB, raised by `MAHBOT_STAND_MAX_SWAP_MIB` from its default 1024)
+- load: 2.46 3.00 3.10 (1/5/15-min) at the start, 3.10 2.97 2.85 at the table; every cell line carries its own `load=`
+- ceiling: 6144 MiB resident set, the guard's default
+- swap: 4503.8 MiB in use at the start, 4487.8 MiB at the table — 16.0 MiB, given back during the run (ceiling 1024 MiB growth, the guard's default)
+- command: `mahbot-inference 8` (models from `MAHBOT_MODELS_DIR`, voice from `MAHBOT_VOICE_WAV`, article from `MAHBOT_EMBED_TEXT`)
 - model: `Qwen3-ASR-1.7B-Q4_K_M.gguf` · 1282435552 bytes · sha256 3893b8926065bbff3da7586d21d8711a9b4fa4fa8f12cd0cefad58e31b2660b6
 - model: `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf` · 355709344 bytes · sha256 46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d
 - model: `ced-small-f16.gguf` · 43707680 bytes · sha256 c391ed8697a1b08d7c1a463e4940a5c3a2f670e0544ab0d8ee23b544583602a8 · mudler/ced-gguf@b5e9a4aad6438763c8da16079d77563fbed35c65

@@ -253,7 +253,8 @@ pub fn run() -> Result<()> {
         eprintln!(
             "[wake-word] real audio: {} files, {:.2} h audio ({:.2} h speech, {:.2} h VAD-active), \
              {} FA events · {:.4}/h over VAD-active speech (the headline's denominator), \
-             {:.4}/h over wall-clock audio · one stream · {:.1}s wall · peak {} MiB",
+             {:.4}/h over wall-clock audio · one stream · {:.1}s wall · \
+             process_peak_bytes={}",
             real.files_fed,
             real.audio_hours,
             real.speech_hours,
@@ -262,7 +263,7 @@ pub fn run() -> Result<()> {
             real.events as f64 / real.vad_active_hours,
             real.events as f64 / real.audio_hours,
             real.wall_secs,
-            crate::report::peak_rss() / (1024 * 1024),
+            crate::report::peak_text(),
         );
     }
     let corpus = progress.synthesis;

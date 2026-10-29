@@ -49,6 +49,23 @@ pub const ASR_HEAD_IDS: [usize; 3] = [151644, 8948, 198];
 pub const ASR_TEXT_IDS: [usize; 6] = [151645, 198, 151644, 872, 198, 151669];
 pub const ASR_TAIL_IDS: [usize; 6] = [151670, 151645, 198, 151644, 77091, 198];
 pub const ASR_EOS: usize = 151645;
+/// The three tokens a recognition answer opens with — `language English <asr_text>`,
+/// written **into the prompt** by the transcription path instead of being generated. The
+/// recogniser identifies the language itself, and on noisy speech it answers
+/// `language None` and stops, so the whole chunk comes back empty — one 26.8 s voice
+/// message did, and every one of its pieces. With the tag supplied the model transcribes
+/// the audio's own language regardless of it (the pinned Russian clip returns its pinned
+/// words under an English tag) and the tag never reaches a transcript: everything up to
+/// [`ASR_TEXT`] is stripped. Only a chunk the tagger calls speech or singing *and* whose
+/// loudness varies the way speech does is told the language
+/// ([`crate::transcribe::SPEECH_SPREAD_DB`]); every other chunk gets the prompt the
+/// one-shot path uses, whose answer is the model's own. That boundary is what keeps a
+/// declared language from putting a confident transcript on a steady signal.
+pub const ASR_LANGUAGE_IDS: [usize; 3] = [11528, 6364, 151704];
+/// The `<asr_text>` token the transcript follows; also the marker a zero-shot answer's
+/// language tag ends with.
+pub const ASR_TEXT: usize = 151704;
+
 /// The ASR config's `eos_token_id` is 151645; 151643 is the vocabulary's
 /// `<|endoftext|>`, not a second config EOS. The path stops on either.
 pub const ASR_EOS_ALSO: usize = 151643;
@@ -74,32 +91,60 @@ pub const DECODE_CACHE_BUCKET: usize = 128;
 ///
 /// The mel graph is not this clip's own: it has no weights and its shape is the frame
 /// count, so every clip that reads the same count runs the same compiled graph
-/// ([`mel_graph`]). A transcription cuts its chunks to a few dozen distinct lengths, and
-/// a mel graph costs about 0.2 s to compile at 800 frames — the largest single item left
-/// once a shape stopped reading the body's weights.
+/// ([`mel_graph`]). A transcription cuts its chunks onto a closed ladder of frame counts
+/// ([`crate::transcribe::FRAME_RUNGS`]), so the mel graphs a process compiles are that
+/// ladder's — one each, however many chunks the pass reads.
 pub(crate) struct Front {
     mel: Arc<Mutex<Compiled>>,
-    encoder: Compiled,
-    projector: Compiled,
+    encoder: Arc<Mutex<Compiled>>,
+    projector: Arc<Mutex<Compiled>>,
     build_ms: f64,
+}
+
+/// The mel graphs a process keeps: the length the ear's window asks for and the rung a pass
+/// of one piece settles on, with room for a second rung without evicting the first. An
+/// evicted entry is a recompile, never a wrong answer; before the bound a process handed
+/// many lengths kept one graph each for the life of the process.
+const MEL_GRAPH_ENTRIES: usize = 4;
+
+/// The process's mel graphs and their least-recently-used order.
+type MelGraphs = (
+    HashMap<(usize, usize), Arc<Mutex<Compiled>>>,
+    std::collections::VecDeque<(usize, usize)>,
+);
+
+fn mel_graphs() -> &'static Mutex<MelGraphs> {
+    static MEL: OnceLock<Mutex<MelGraphs>> = OnceLock::new();
+    MEL.get_or_init(|| Mutex::new((HashMap::new(), std::collections::VecDeque::new())))
 }
 
 /// The mel graph for one frame count and bin count, compiled once for the process: it
 /// has no weights, so two clips of the same length share it exactly. Held behind a lock
 /// because a run needs `&mut`.
+///
+/// Keyed by the caller's own audio length, so the cache could otherwise collect one graph
+/// per length a long-lived process is handed. It is bounded instead ([`MEL_GRAPH_ENTRIES`])
+/// and cleared with the ladder ([`release_rungs`]).
 fn mel_graph(frames: usize, bins: usize) -> Result<Arc<Mutex<Compiled>>> {
-    type MelGraphs = HashMap<(usize, usize), Arc<Mutex<Compiled>>>;
-    static MEL: OnceLock<Mutex<MelGraphs>> = OnceLock::new();
-    let graphs = MEL.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = graphs.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(graph) = guard.get(&(frames, bins)) {
-        return Ok(Arc::clone(graph));
+    let mut guard = mel_graphs().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(graph) = guard.0.get(&(frames, bins)) {
+        let graph = Arc::clone(graph);
+        guard.1.retain(|key| *key != (frames, bins));
+        guard.1.push_back((frames, bins));
+        return Ok(graph);
     }
     let graph = Arc::new(Mutex::new(Compiled::new(
         rlx_runtime::Device::Gpu,
         graphs::mel_frontend(frames, bins)?,
     )?));
-    guard.insert((frames, bins), Arc::clone(&graph));
+    while guard.0.len() >= MEL_GRAPH_ENTRIES {
+        let Some(oldest) = guard.1.pop_front() else {
+            break;
+        };
+        guard.0.remove(&oldest);
+    }
+    guard.0.insert((frames, bins), Arc::clone(&graph));
+    guard.1.push_back((frames, bins));
     Ok(graph)
 }
 
@@ -108,14 +153,14 @@ impl Front {
         let t = crate::report::Stopwatch::start();
         let tokens = graphs::asr_tokens(frames);
         let mel = mel_graph(frames, pair.sound.clip().mel_bins)?;
-        let encoder = Compiled::new(
+        let encoder = Arc::new(Mutex::new(Compiled::new(
             rlx_runtime::Device::Gpu,
             graphs::asr_encoder(pair.sound.clone(), frames)?,
-        )?;
-        let projector = Compiled::new(
+        )?));
+        let projector = Arc::new(Mutex::new(Compiled::new(
             rlx_runtime::Device::Gpu,
             graphs::projector_chain(pair.clone(), tokens)?,
-        )?;
+        )?));
         Ok(Self {
             mel,
             encoder,
@@ -129,7 +174,7 @@ impl Front {
     }
 
     /// The three measured runs, for the stand's per-phase figures.
-    pub(crate) fn run(&mut self, audio: Vec<f32>, reps: usize) -> (Outcome, Outcome, Outcome) {
+    pub(crate) fn run(&self, audio: Vec<f32>, reps: usize) -> (Outcome, Outcome, Outcome) {
         let mel = self
             .mel
             .lock()
@@ -137,12 +182,156 @@ impl Front {
             .run(&[("audio".into(), audio)], reps);
         let encoder = self
             .encoder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .run(&[("mel".into(), mel.outs[0].clone())], reps);
         let projector = self
             .projector
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .run(&[("features".into(), encoder.outs[0].clone())], reps);
         (mel, encoder, projector)
     }
+}
+
+/// One frame count of the transcription ladder, compiled once for the process: the front
+/// end and the prompt prefill, over the pair's one shared decode graph. A transcription cuts
+/// its chunks onto the closed ladder of [`crate::transcribe::FRAME_RUNGS`], so the ladder's
+/// rungs are the only frame counts it ever compiles — and each is compiled once, not once
+/// per chunk.
+pub(crate) struct Rung {
+    /// The pair these graphs were built over. A cached rung is served only to a caller
+    /// holding this same pair: two models whose graphs share tensor names would
+    /// otherwise run one model's weights on the other's audio.
+    pair: Arc<Pair>,
+    front: Front,
+    /// The prompt prefill, one per prompt length: the prompt carries three declared
+    /// language rows or not at all, and the two lengths are two graphs. A variant the
+    /// process never asks for is never compiled.
+    prefills: Mutex<HashMap<usize, Arc<Mutex<Compiled>>>>,
+    /// The decode graph: one per pair, shared by every rung of the ladder, because the
+    /// capacity is one value for all of them. A step is weight-read bound, so the
+    /// attention reading a few more masked rows costs a fraction of the step, and a
+    /// decode graph per rung would park an arena, a k/v plane pair and a weight layout
+    /// apiece for no arithmetic gain.
+    decode: Arc<Shared>,
+    tokens: usize,
+}
+
+/// The capacity every rung's decode graph is compiled at: the longest rung's prompt rows —
+/// 3 head + 6 text + 768/8 = 96 audio + 6 tail = 111, or 114 with the three declared language
+/// rows — plus the most tokens a chunk of the longest piece may generate
+/// ([`crate::transcribe::CHUNK_TOKENS_PER_S`] over the 7.5 s a cut can leave = 76).
+/// 190 at the worst, rounded up to the next multiple of eight. A walk that outgrows it grows
+/// its own graph, as any clip does.
+pub(crate) const RUNG_CAPACITY: usize = 192;
+
+impl Rung {
+    fn build(pair: &Arc<Pair>, frames: usize) -> Result<Self> {
+        Ok(Self {
+            pair: Arc::clone(pair),
+            front: Front::build(pair, frames)?,
+            prefills: Mutex::new(HashMap::new()),
+            decode: shared_decode(pair)?,
+            tokens: graphs::asr_tokens(frames),
+        })
+    }
+
+    /// This rung's prefill for `prompt_rows`, compiled the first time the ladder is asked
+    /// for it and kept for the process. Built over this rung's own pair: a rung is served
+    /// only to a caller holding it.
+    fn prefill(&self, prompt_rows: usize) -> Result<Arc<Mutex<Compiled>>> {
+        let mut guard = self.prefills.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(prefill) = guard.get(&prompt_rows) {
+            return Ok(Arc::clone(prefill));
+        }
+        let prefill = Arc::new(Mutex::new(prefill_graph(&self.pair, prompt_rows)?));
+        guard.insert(prompt_rows, Arc::clone(&prefill));
+        Ok(prefill)
+    }
+}
+
+/// The rungs kept resident: the ladder's own size, so a transcription never evicts a rung
+/// it is about to ask for again. A process that walks a longer ladder evicts its least
+/// recently used rung, which is a recompile, never a wrong answer.
+const RUNG_ENTRIES: usize = crate::transcribe::FRAME_RUNGS.len();
+
+type RungCache = (HashMap<usize, Arc<Rung>>, std::collections::VecDeque<usize>);
+
+fn rung_cache() -> &'static Mutex<RungCache> {
+    static RUNGS: OnceLock<Mutex<RungCache>> = OnceLock::new();
+    RUNGS.get_or_init(|| Mutex::new((HashMap::new(), std::collections::VecDeque::new())))
+}
+
+/// The one decode graph of a pair, built on first ask: every rung of the ladder and every
+/// chunk of a rung runs the same `[RUNG_CAPACITY]`-deep body. Held beside the ladder
+/// rather than inside it because the ladder's entries come and go with the frame counts,
+/// and this graph does not.
+fn decode_slot() -> &'static Mutex<Option<(Arc<Pair>, Arc<Shared>)>> {
+    static DECODE: OnceLock<Mutex<Option<(Arc<Pair>, Arc<Shared>)>>> = OnceLock::new();
+    DECODE.get_or_init(|| Mutex::new(None))
+}
+
+fn shared_decode(pair: &Arc<Pair>) -> Result<Arc<Shared>> {
+    let mut guard = decode_slot().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((held, decode)) = guard.as_ref() {
+        // Pointer identity, not the file path: a second `Pair` opened over the same files
+        // is a second set of weights, and its graphs are not this one's.
+        if Arc::ptr_eq(held, pair) {
+            return Ok(Arc::clone(decode));
+        }
+    }
+    let decode = Shared::new(decode_graph(pair, RUNG_CAPACITY)?);
+    *guard = Some((Arc::clone(pair), Arc::clone(&decode)));
+    Ok(decode)
+}
+
+/// Empty the ladder, the decode graph that outlives its entries, and the process's mel
+/// graphs: what [`crate::release_process_memory`] asks for. A clip still holding a rung's
+/// graphs keeps them alive; nothing else does.
+pub(crate) fn release_rungs() {
+    let mut guard = rung_cache().lock().unwrap_or_else(|e| e.into_inner());
+    guard.0.clear();
+    guard.1.clear();
+    drop(guard);
+    *decode_slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let mut mel = mel_graphs().lock().unwrap_or_else(|e| e.into_inner());
+    mel.0.clear();
+    mel.1.clear();
+}
+
+/// The rung for `frames` of `pair`, compiled by this call when no earlier one placed it.
+/// The second value is the build this call paid, `None` for a rung already resident.
+pub(crate) fn rung(pair: &Arc<Pair>, frames: usize) -> Result<(Arc<Rung>, Option<f64>)> {
+    let mut guard = rung_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let resident = guard
+        .0
+        .get(&frames)
+        .filter(|rung| Arc::ptr_eq(&rung.pair, pair))
+        .map(Arc::clone);
+    if let Some(rung) = resident {
+        if let Some(at) = guard.1.iter().position(|f| *f == frames) {
+            guard.1.remove(at);
+        }
+        guard.1.push_back(frames);
+        return Ok((rung, None));
+    }
+    let t = crate::report::Stopwatch::start();
+    let built = Arc::new(Rung::build(pair, frames)?);
+    let build_ms = t.ms();
+    // The pair is part of the key, so an entry another pair placed is evicted, not served.
+    if guard.0.contains_key(&frames) {
+        guard.1.retain(|f| *f != frames);
+    }
+    while guard.0.len() >= RUNG_ENTRIES {
+        let Some(oldest) = guard.1.pop_front() else {
+            break;
+        };
+        guard.0.remove(&oldest);
+    }
+    guard.0.insert(frames, Arc::clone(&built));
+    guard.1.push_back(frames);
+    Ok((built, Some(build_ms)))
 }
 
 /// The same front end cut where a group pass needs it: the conv front runs one
@@ -196,10 +385,9 @@ impl GroupFront {
         })
     }
 
-    /// One listener's memory: the pair's two model files (its graphs bind their
-    /// weights from the mapped file, so the file sizes are the weight figure the
-    /// planned arenas do not carry), plus every compiled graph's planned arena and
-    /// uploaded parameters.
+    /// One listener's memory: the pair's two model files (a graph binds its weights
+    /// from those files, so their sizes are the weight figure the planned arenas do not
+    /// carry), plus every compiled graph's planned arena and uploaded parameters.
     ///
     /// The backend's scratch tail is excluded — it is reserved, not resident, for
     /// graphs whose attention does not fill it — and the run's system-memory guard
@@ -417,18 +605,44 @@ pub struct Walk {
     pub counters: (u64, u64),
 }
 
-/// One chunk's compiled recognition path, built once for a frame count and run
-/// per chunk: the mel front end, the encoder, the projector, the prompt prefill
-/// and the one-row decode. A caller that transcribes several chunks of the same
-/// length builds this once and reuses the front end and the decode graph; only the
-/// prefill is rebuilt between chunks, because keeping all three would hold three
-/// compiled graphs whose uploads carry the 1.28 GiB body each.
+/// A decode graph more than one chunk runs on, with the lock a walk holds while it uses
+/// it. The graph's device buffers are *this walk's* k/v planes once
+/// `resident_cache_planes` has bound them, so two walks must not interleave into them:
+/// the second waits for the first rather than rewriting its cache, which would produce a
+/// plausible, wrong transcript. A walk holds [`Shared::walk`] from its bind to its last
+/// step.
+pub(crate) struct Shared {
+    graph: Mutex<Compiled>,
+    walk: Mutex<()>,
+}
+
+impl Shared {
+    fn new(graph: Compiled) -> Arc<Self> {
+        Arc::new(Self {
+            graph: Mutex::new(graph),
+            walk: Mutex::new(()),
+        })
+    }
+
+    fn graph(&self) -> std::sync::MutexGuard<'_, Compiled> {
+        self.graph.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn walk(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.walk.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// One chunk's compiled recognition path, built for a frame count and run per chunk: the
+/// mel front end, the encoder, the projector, the prompt prefill and the one-row decode.
 ///
-/// What *is* resident: the decode graph of the previous chunk is still held while
-/// the next chunk's prefill is compiled, so two body-sized graphs share that
-/// compile — the price of one decode graph per length instead of one per chunk.
-/// The front end is not one of them: it is the mel, the sound encoder and the
-/// projector, small beside a body.
+/// Three residencies, one per caller. A **ladder chunk** ([`Clip::rung`]) borrows the
+/// process-wide graphs of its frame count, so a pass compiles each rung once. A **caller
+/// with several chunks of one length** ([`Clip::build`]) keeps its front end and its
+/// decode graph and rebuilds only the prefill between chunks, because holding all three
+/// would keep three compiled graphs whose uploads carry the body. The **one-shot** clip
+/// ([`Clip::once`]) drops the front end as soon as it has run, so the front end is never
+/// resident beside the prefill — the residency the listen cell's peak records.
 pub struct Clip<'a> {
     pair: Arc<Pair>,
     tokenizer: &'a Tokenizer,
@@ -437,7 +651,16 @@ pub struct Clip<'a> {
     /// its single run, so the front end's graphs are never resident beside the
     /// prefill — the residency the listen cell's peak records.
     front: Option<Front>,
-    decode: Option<Compiled>,
+    /// The rung this clip runs on, when it is a ladder chunk: its front end and its
+    /// prefills are the process-wide ones ([`rung`]), so this clip builds neither and
+    /// leaves `front` empty. `decode` starts as the rung's own graph, which this clip may
+    /// replace with a grown one. A clip of its own leaves this `None`.
+    shared: Option<Arc<Rung>>,
+    /// The decode graph this clip runs. On a rung that is the rung's own, cloned here at
+    /// construction; a walk that outgrows the compiled capacity grows a graph of its own
+    /// and replaces this handle, leaving the rung's entry as it was. On a clip of its own
+    /// it is built by the first `run` that needs it.
+    decode: Option<Arc<Shared>>,
     cfg: Config,
     frames: usize,
     tokens: usize,
@@ -455,8 +678,9 @@ pub struct Clip<'a> {
     owed_ms: f64,
 }
 
-/// The prompt's prefill graph: the whole body over `prompt_rows` rows, logits only
-/// on the last.
+/// The prompt's prefill graph: the whole body over `prompt_rows` rows, logits only on the
+/// last, with the fused qkv and gate/up projections the decode graph also uses — the same
+/// blob names, so the device's weight pool holds one copy of the body for both layouts.
 fn prefill_graph(pair: &Arc<Pair>, prompt_rows: usize) -> Result<Compiled> {
     graphs::body_new_rows_head_chain(pair.body.clone(), prompt_rows, 0, true)
         .and_then(|m| graphs::Compiled::new(rlx_runtime::Device::Gpu, m))
@@ -475,8 +699,8 @@ impl<'a> Clip<'a> {
     /// One chunk's compiled path, for a caller that will run several chunks of this
     /// length: the front end is compiled with the clip and kept, the decode graph by
     /// its first `run` and kept, and every `run` compiles its own prefill and drops
-    /// it once it has run (~0.5 s a chunk) rather than hold a third graph whose
-    /// upload carries the body.
+    /// it once it has run rather than hold a third graph whose upload carries the
+    /// body.
     pub fn build(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
         Self::new(pair, tokenizer, frames, true)
     }
@@ -488,6 +712,37 @@ impl<'a> Clip<'a> {
     /// [`Clip::build`] instead.
     pub fn once(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
         Self::new(pair, tokenizer, frames, false)
+    }
+
+    /// A chunk of a **rung** of the transcription ladder: every graph is the process-wide
+    /// one for that frame count ([`rung`]), so the call compiles nothing a previous chunk
+    /// of the rung compiled. The second value is the build this call paid, `None` when the
+    /// rung was already resident.
+    pub(crate) fn rung(
+        pair: &Arc<Pair>,
+        tokenizer: &'a Tokenizer,
+        frames: usize,
+    ) -> Result<(Self, Option<f64>)> {
+        let (rung, build_ms) = rung(pair, frames)?;
+        let cfg = pair.body.config().clone();
+        let hkv = cfg.kv_heads * cfg.head_dim;
+        let clip = Self {
+            pair: Arc::clone(pair),
+            tokenizer,
+            front: None,
+            decode: Some(Arc::clone(&rung.decode)),
+            shared: Some(Arc::clone(&rung)),
+            cfg,
+            frames,
+            tokens: rung.tokens,
+            prompt_rows: ASR_HEAD_IDS.len() + ASR_TEXT_IDS.len() + rung.tokens + ASR_TAIL_IDS.len(),
+            hkv,
+            capacity: RUNG_CAPACITY,
+            reuse_front: true,
+            max_new: ASR_MAX_NEW,
+            owed_ms: 0.0,
+        };
+        Ok((clip, build_ms))
     }
 
     fn new(
@@ -511,6 +766,7 @@ impl<'a> Clip<'a> {
             tokenizer,
             front: Some(front),
             decode: None,
+            shared: None,
             cfg,
             frames,
             tokens,
@@ -523,10 +779,18 @@ impl<'a> Clip<'a> {
         })
     }
 
-    /// One chunk of 16 kHz mono audio: exactly `frames * graphs::MEL_HOP` samples
-    /// (the caller truncates or pads before calling). `reps` is the warm
-    /// repetition count of every measured phase; the gate passes 0.
-    pub fn run(&mut self, mut audio: Vec<f32>, reps: usize) -> Result<Walk> {
+    /// One chunk of 16 kHz mono audio: exactly `frames * graphs::MEL_HOP` samples (the
+    /// caller truncates or pads before calling). `declared` is the three language rows
+    /// written into the prompt instead of being generated, or `None` to leave the
+    /// recogniser its own answer — the prompt is three rows longer with them, and the two
+    /// lengths are two prefills. `reps` is the warm repetition count of every measured
+    /// phase; the gate passes 0.
+    pub fn run(
+        &mut self,
+        mut audio: Vec<f32>,
+        declared: Option<[usize; ASR_LANGUAGE_IDS.len()]>,
+        reps: usize,
+    ) -> Result<Walk> {
         let frames = self.frames;
         audio.truncate(frames * graphs::MEL_HOP);
         let samples = audio.len();
@@ -535,24 +799,30 @@ impl<'a> Clip<'a> {
         let vocab = match cfg.head {
             Head::Separate { vocab, .. } | Head::Tied { vocab, .. } => vocab,
         };
-        let prompt_rows = self.prompt_rows;
+        let prompt_rows = self.prompt_rows + declared.map_or(0, |ids| ids.len());
         let mut capacity = self.capacity;
         let mut build_ms = std::mem::take(&mut self.owed_ms);
         let c0 = graphs::device_counts();
 
-        if self.front.is_none() {
-            let t = report::Stopwatch::start();
-            self.front = Some(Front::build(&self.pair, frames).context("front build")?);
-            build_ms += t.ms();
-        }
-        let (mel, encoder, projector) = self
-            .front
-            .as_mut()
-            .expect("the front end was built just above")
-            .run(audio, reps);
-        if !self.reuse_front {
-            self.front = None;
-        }
+        let (mel, encoder, projector) = match &self.shared {
+            Some(rung) => rung.front.run(audio, reps),
+            None => {
+                if self.front.is_none() {
+                    let t = report::Stopwatch::start();
+                    self.front = Some(Front::build(&self.pair, frames).context("front build")?);
+                    build_ms += t.ms();
+                }
+                let out = self
+                    .front
+                    .as_ref()
+                    .expect("the front end was built just above")
+                    .run(audio, reps);
+                if !self.reuse_front {
+                    self.front = None;
+                }
+                out
+            }
+        };
 
         // The prompt: the tokenizer's real rows, with the thirteen audio rows
         // replaced by the encoder's projected features.
@@ -569,6 +839,12 @@ impl<'a> Clip<'a> {
                 ASR_HEAD_IDS.len() + ASR_TEXT_IDS.len() + self.tokens + i,
                 *id,
             ));
+        }
+        if let Some(declared) = &declared {
+            let at = ASR_HEAD_IDS.len() + ASR_TEXT_IDS.len() + self.tokens + ASR_TAIL_IDS.len();
+            for (i, id) in declared.iter().enumerate() {
+                text_ids.push((at + i, *id));
+            }
         }
         let picks: Vec<(usize, usize)> = text_ids.iter().map(|(_, id)| (0, *id)).collect();
         let t_rows = report::Stopwatch::start();
@@ -588,24 +864,36 @@ impl<'a> Clip<'a> {
         }
 
         // Prompt prefill on a growing cache: all `prompt_rows` rows, logits on the
-        // last. The graph is dropped below, once it has run, so the prefill is never
-        // resident beside the decode graph it seeds — the decode graph held from a
-        // previous chunk is the other body-sized graph this compile shares the peak
-        // with, as the struct's own note says.
+        // last. A rung keeps its prefill resident; a clip of its own drops it once it
+        // has run, so the prefill is never resident beside the decode graph it seeds.
         let (cos, sin) = host::rope_tables_at(0, prompt_rows, cfg.head_dim, cfg.rope_base as f64);
         let inputs = vec![
             ("x".into(), prompt),
             ("cos".into(), cos.iter().map(|v| *v as f32).collect()),
             ("sin".into(), sin.iter().map(|v| *v as f32).collect()),
         ];
-        let mut prefill = {
-            let t = report::Stopwatch::start();
-            let prefill = prefill_graph(&self.pair, prompt_rows)?;
-            build_ms += t.ms();
-            prefill
+        let mut p = match &self.shared {
+            Some(rung) => {
+                let t = report::Stopwatch::start();
+                let prefill = rung.prefill(prompt_rows)?;
+                build_ms += t.ms();
+                prefill
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .run(&inputs, reps)
+            }
+            None => {
+                let mut prefill = {
+                    let t = report::Stopwatch::start();
+                    let prefill = prefill_graph(&self.pair, prompt_rows)?;
+                    build_ms += t.ms();
+                    prefill
+                };
+                let p = prefill.run(&inputs, reps);
+                drop(prefill);
+                p
+            }
         };
-        let mut p = prefill.run(&inputs, reps);
-        drop(prefill);
         // The decode is one whole-body graph on a per-layer plane cache: each
         // layer's `[capacity + 1, hkv]` rows are already in the attention's row
         // layout, and the step's own row is appended in-graph.
@@ -625,23 +913,37 @@ impl<'a> Clip<'a> {
         );
         let mut next = argmax(&p.outs[3][..vocab]) as usize;
         p.outs.clear();
-
-        let mut decode = match self.decode.take() {
-            Some(decode) => decode,
+        let mut decode = match &self.decode {
+            Some(decode) => Arc::clone(decode),
             None => {
                 let t = report::Stopwatch::start();
                 let decode = decode_graph(&self.pair, capacity)?;
                 build_ms += t.ms();
-                decode
+                Shared::new(decode)
             }
         };
-        if !decode.runner.resident_cache_planes(&k_cache, &v_cache) {
+        // This walk owns the graph's planes until its last step. The lock is taken through
+        // its own handle so a grown capacity can replace `decode` below: a graph this call
+        // builds is nobody else's, so it needs no lock of its own.
+        let held = Arc::clone(&decode);
+        let _walk = held.walk();
+        if !decode
+            .graph()
+            .runner
+            .resident_cache_planes(&k_cache, &v_cache)
+        {
             return Err(anyhow!("resident cache refused"));
         }
         for rows in k_cache.iter_mut().chain(v_cache.iter_mut()) {
             rows.clear();
         }
-        let nodes: usize = decode.ops.iter().map(|(_, n)| n).sum();
+        let (nodes, decode_stream_bytes) = {
+            let guard = decode.graph();
+            (
+                guard.ops.iter().map(|(_, n)| n).sum::<usize>(),
+                graphs::stream_bytes(&guard.runner.graph),
+            )
+        };
         let mut generated: Vec<usize> = Vec::new();
         let mut written = prompt_rows;
         let mut decode_times: Vec<f64> = Vec::new();
@@ -670,6 +972,7 @@ impl<'a> Clip<'a> {
             // token's embedding, not this row, so asking for it would be a host
             // return nothing consumes. The cache rows are fed device-side.
             let o = decode
+                .graph()
                 .runner
                 .run_resident_planes(
                     &inputs,
@@ -699,10 +1002,12 @@ impl<'a> Clip<'a> {
                 let live = written * hkv;
                 for l in 0..cfg.layers {
                     let k_rows = decode
+                        .graph()
                         .runner
                         .read_plane(&format!("k{l}"))
                         .ok_or_else(|| anyhow!("reading k{l} at row {written}"))?;
                     let v_rows = decode
+                        .graph()
                         .runner
                         .read_plane(&format!("v{l}"))
                         .ok_or_else(|| anyhow!("reading v{l} at row {written}"))?;
@@ -717,9 +1022,17 @@ impl<'a> Clip<'a> {
                 }
                 mask[cap] = 1.0;
                 let t = report::Stopwatch::start();
-                decode = decode_graph(&self.pair, cap)?;
+                let grown = decode_graph(&self.pair, cap)?;
                 build_ms += t.ms();
-                if !decode.runner.resident_cache_planes(&k_cache, &v_cache) {
+                // A grown capacity is this clip's own: a rung keeps the one graph every
+                // chunk of its ladder shares. The walk lock is still held, so nothing else
+                // is inside the graph this replaces.
+                decode = Shared::new(grown);
+                if !decode
+                    .graph()
+                    .runner
+                    .resident_cache_planes(&k_cache, &v_cache)
+                {
                     return Err(anyhow!("resident cache refused at capacity {cap}"));
                 }
                 for rows in k_cache.iter_mut().chain(v_cache.iter_mut()) {
@@ -730,7 +1043,7 @@ impl<'a> Clip<'a> {
         }
         let finished = is_asr_eos(next);
         let truncated = !finished && generated.len() >= max_new;
-        let text = match generated.iter().position(|&id| id == 151704) {
+        let text = match generated.iter().position(|&id| id == ASR_TEXT) {
             Some(at) => self.tokenizer.decode(&generated[at + 1..]),
             None => self.tokenizer.decode(&generated),
         };
@@ -742,8 +1055,6 @@ impl<'a> Clip<'a> {
         values.push(written as f32);
         // The planes as the walk left them: `2 · layers · (capacity + 1) · hkv` f32.
         let kv_bytes = 2 * cfg.layers * (capacity + 1) * hkv * 4;
-        // The decode graph's own parameter bytes — what one generated token re-reads.
-        let decode_stream_bytes = graphs::stream_bytes(&decode.runner.graph);
         let c = graphs::device_counts();
         self.capacity = capacity;
         self.decode = Some(decode);
@@ -797,7 +1108,7 @@ pub fn recognise(
     }
     let mut audio = audio;
     audio.truncate(frames * graphs::MEL_HOP);
-    Clip::once(pair, tokenizer, frames)?.run(audio, reps)
+    Clip::once(pair, tokenizer, frames)?.run(audio, None, reps)
 }
 
 #[cfg(test)]
@@ -863,7 +1174,7 @@ mod tests {
             })
             .collect();
 
-        let mut single = Front::build(&pair, MEL_FRAMES).expect("the single-window front");
+        let single = Front::build(&pair, MEL_FRAMES).expect("the single-window front");
         let mut grouped = GroupFront::build(&pair, MEL_FRAMES, GROUP).expect("a group front");
         let padded: Vec<Vec<f32>> = windows.iter().map(|w| trailing_window(w)).collect();
         let references: Vec<&[f32]> = padded.iter().map(Vec::as_slice).collect();

@@ -72,8 +72,8 @@ fn rss() -> Option<usize> {
     report::resident_rss().map(|bytes| bytes as usize)
 }
 
-/// Bytes in decimal MB, the unit the stand's own `mb` reports, so a figure from
-/// this probe and one from the record read the same.
+/// Bytes in decimal MB as this harness prints them: its own report's unit, stated
+/// on each line it writes so a figure is never a bare number.
 fn mb(bytes: usize) -> f64 {
     bytes as f64 / 1e6
 }
@@ -428,11 +428,11 @@ fn the_library_path_pays_the_decoder_once() {
         let digest = report::digest(&wave);
         println!(
             "census library call={call} chars={} ms={ms:.1} build_ms={build:.3} samples={} \
-             digest={digest:016x} rss_mb={} peak_mb={:.1}",
+             digest={digest:016x} rss_mb={} process_peak_bytes={}",
             text.chars().count(),
             wave.len(),
             mb_of(rss()),
-            mb(report::peak_rss() as usize),
+            report::peak_text(),
         );
         if call < 2 {
             pinned[call] = digest;

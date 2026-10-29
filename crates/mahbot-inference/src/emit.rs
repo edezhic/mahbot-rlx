@@ -24,11 +24,12 @@
 //! predictor's fifteen LM heads), and takes the same paths on its slice.
 //!
 //! A build carries no weight bytes. Every path above hands the flow a placeholder of the
-//! parameter's size and records where the bytes are — a mapped file range, a fused blob or
-//! a host copy this process keeps — and `graphs::Runner::compile` binds that at session
-//! time. A transcription compiles one graph set per chunk length and every set binds the
-//! same weights, so this is what keeps a shape's build from copying the body out of the
-//! file again, and a write the device already holds from reading it at all.
+//! parameter's size and records where the bytes are — the model file, a fused blob or a
+//! host copy this process keeps — and `graphs::Runner::compile` binds that at session
+//! time. A transcription compiles one graph set per rung of its closed ladder — six at most
+//! for the process, never one per chunk length — and every set binds the same weights, which
+//! is what keeps a second shape's build from copying the body out of the file again, and a
+//! write the device already holds from reading it at all.
 //!
 //! The helpers below also carry the other decisions: 1-D convolutions go
 //! through 2-D with `[k, 1]` (never `[k, k]`, which silently takes the 2-D
@@ -51,12 +52,38 @@ use crate::loader::{self, Model, Store};
 
 thread_local! {
     /// Which model file served each tensor name of the graph being built, so its
-    /// compile can declare the scope its weights belong to ([`scope_of`]). Per thread,
-    /// like the scope it feeds: two builds running at once cannot overwrite each
-    /// other's names and hand one model's weights another model's scope. [`scope_of`]
-    /// empties it when it reads, so no entry outlives the build that wrote it.
+    /// compile can declare the scope its weights belong to ([`scope_of`]) and bind a
+    /// placeholder from the file it stands in for. Per thread, like the scope it feeds:
+    /// two builds running at once cannot overwrite each other's names and hand one
+    /// model's weights another model's scope. [`take_origins`] empties it, so no entry
+    /// outlives the build that wrote it.
     static ORIGINS: std::cell::RefCell<Option<std::collections::HashMap<String, Arc<str>>>> =
         const { std::cell::RefCell::new(None) };
+    /// The names whose bytes the build handed over as a placeholder: their real bytes
+    /// are bound at compile time from [`CACHED`], [`MAPPED`] or the file. A placeholder
+    /// whose source cannot be found is a compile error naming the tensor
+    /// (`graphs::Runner::compile`), never a model run on zeros.
+    static PLACEHOLDERS: std::cell::RefCell<Option<HashSet<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record that `key` was handed over as a placeholder.
+fn note_placeholder(key: &str) {
+    let name = bare_name(key);
+    PLACEHOLDERS.with(|cell| {
+        cell.borrow_mut()
+            .get_or_insert_with(HashSet::new)
+            .insert(name.to_string());
+    });
+}
+
+/// Whether `key`'s bytes were a placeholder the compile has to resolve.
+pub fn is_placeholder(key: &str) -> bool {
+    PLACEHOLDERS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|names| names.contains(bare_name(key)))
+    })
 }
 
 /// The scope label a model's weights are shared under: its own file path.
@@ -90,13 +117,14 @@ fn note_origin_label(key: &str, label: &Arc<str>) {
 }
 
 /// The scope label every one of `names` was served from, or `None` when they disagree
-/// or one is unknown — and the record of what served which name is **emptied** by the
-/// question: it describes the one graph build that just finished, and a compile reads it
-/// once. A name no path noted therefore answers `None` rather than an earlier build's
-/// model, which is what keeps `scope_of` from attributing a graph to weights it was not
-/// built from. A compile declares a sharing scope only from here, so a graph whose
-/// weights come from two files — or from no [`LoaderWeights`] at all — uploads
-/// everything rather than risk skipping another model's bytes.
+/// or one is unknown. It peeks at the record rather than taking it: what served which name
+/// describes the one graph build that just finished, and the compile that follows reads it
+/// twice (for the scope, then for each parameter's bytes) before clearing it. A name no
+/// path noted therefore answers `None` rather than an earlier build's model, which is what
+/// keeps `scope_of` from attributing a graph to weights it was not built from. A compile
+/// declares a sharing scope only from here, so a graph whose weights come from two files —
+/// or from no [`LoaderWeights`] at all — uploads everything rather than risk skipping
+/// another model's bytes.
 pub fn scope_of<'a>(names: impl Iterator<Item = &'a str>) -> Option<Arc<str>> {
     let origins = peek_origins()?;
     let mut scope: Option<&Arc<str>> = None;
@@ -126,9 +154,45 @@ pub fn take_origins() -> HashMap<String, Arc<str>> {
         .unwrap_or_default()
 }
 
-/// Forget the build's origin record, once its compile has bound every parameter.
+/// Forget every weight this process has read, fused or mapped, so the next build reads
+/// the files again: what a caller that wants a cold process asks for, and the only way to
+/// release the host copies a warm one keeps.
+///
+/// The placeholder record is *not* cleared here: it describes graphs that are already
+/// built, and this call is exactly what makes their weights unresolvable. A build whose
+/// bytes were released must still refuse to compile onto its zeros, so the record
+/// survives until the compile that reads it.
+pub fn clear_weight_caches() {
+    cached().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    mapped().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SEEN.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    ORIGINS.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// The bytes this process's own copies of the weights hold right now: a kept fused blob at
+/// its own length, host f32 at four bytes a value. What [`clear_weight_caches`] gives back,
+/// and the figure a cell's high-water is read against.
+pub fn host_cache_bytes() -> usize {
+    cached()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .map(|entry| match entry {
+            Cached::Blob(blob) => blob.len(),
+            Cached::Host(values, _) => values.len() * std::mem::size_of::<f32>(),
+        })
+        .sum()
+}
+
+/// Forget the build's origin record and its placeholder record: both describe the one build
+/// that just finished. Called when a build starts (so nothing an earlier, failed build left
+/// can change it) and again when its compile has bound every parameter.
 pub fn clear_origins() {
     ORIGINS.with(|cell| *cell.borrow_mut() = None);
+    PLACEHOLDERS.with(|cell| *cell.borrow_mut() = None);
 }
 
 /// The weight source of one file: serves both weight paths.
@@ -147,6 +211,16 @@ pub struct LoaderWeights {
 
 impl LoaderWeights {
     pub fn new(model: Arc<Model>) -> Self {
+        // A build starts here: the records name one build, and one that failed before its
+        // compile must leave nothing that changes how a later build behaves.
+        clear_origins();
+        Self::of(model)
+    }
+
+    /// A weight source for one file of a [`PairWeights`] build, whose records are already
+    /// the build's: only [`LoaderWeights::new`] starts a build, and a pair's second file
+    /// must not wipe the first file's record.
+    fn of(model: Arc<Model>) -> Self {
         Self {
             model,
             fused: HashMap::new(),
@@ -154,38 +228,86 @@ impl LoaderWeights {
         }
     }
 
-    /// Concatenate packed `[out, in]` Q8 blobs along their rows. False when any
-    /// key is not packed or the schemes/in-dims differ — the caller then keeps
-    /// the separate projections rather than changing arithmetic.
+    /// Whether `keys` fuse: every one packed, one scheme, one in-dim. Plans only — no
+    /// weight bytes are read and nothing is cached — so a caller decides for a whole graph
+    /// before it fuses any layer, and a graph that cannot fuse leaves no blob behind.
+    pub fn can_fuse(&self, keys: &[&str]) -> Result<bool> {
+        Ok(self.fuse_plan(keys)?.is_some())
+    }
+
+    /// Concatenate packed `[out, in]` Q8 blobs along their rows. False when any key is not
+    /// packed or the schemes/in-dims differ — the caller then keeps the separate
+    /// projections rather than changing arithmetic.
     pub fn fuse_packed(&mut self, name: &str, keys: &[&str]) -> Result<bool> {
-        // The plans alone say whether the keys fuse and how wide the result is: no
-        // weight bytes are touched here, so a shape whose blob this process has already
-        // concatenated pays a handful of lookups and nothing else.
-        let mut total = 0usize;
-        let mut scheme = None;
-        let mut in_dim = None;
-        let mut out_dim = 0;
+        // The plans alone say whether the keys fuse and how wide the result is; no weight
+        // bytes are touched to answer, so a blob this process already concatenated costs a
+        // handful of lookups.
+        let Some(plan) = self.fuse_plan(keys)? else {
+            return Ok(false);
+        };
+        if !plan.stepped && cached_blob(&self.model, name, plan.total).is_some() {
+            return self.remember_fused(
+                name,
+                Some(plan.scheme),
+                Some(plan.in_dim),
+                plan.out_dim,
+                plan.total,
+            );
+        }
+        let mut bytes = Vec::with_capacity(plan.total);
+        let mut out_dim = 0usize;
+        for &key in keys {
+            let part = match split_step(key) {
+                Some((name, step)) => self.take_step_packed(name, step)?,
+                None => Some(GgufPackedLinear {
+                    w_q: self.model.raw(key)?,
+                    scheme: plan.scheme,
+                    in_dim: plan.in_dim,
+                    out_dim: self.model.plan(key)?.in_out().1,
+                    bias: Vec::new(),
+                }),
+            };
+            let Some(part) = part else { return Ok(false) };
+            bytes.extend_from_slice(&part.w_q);
+            out_dim += part.out_dim;
+        }
+        // Kept only when this is a repeat ask: the blob is a second copy of weights the
+        // device already holds, and caching every one of them measured 0.22 GiB of the
+        // transcribe cell's peak against ~100 ms of a cold call's compiles — a trade the
+        // ceiling does not afford. A graph built after an earlier one finds it here and
+        // stops re-reading.
+        if worth_keeping(&self.model, &packed_param(name)) {
+            let total = bytes.len();
+            serve_blob(&self.model, name, bytes);
+            return self.remember_fused(name, Some(plan.scheme), Some(plan.in_dim), out_dim, total);
+        }
+        self.remember_fused_blob(name, Some(plan.scheme), Some(plan.in_dim), out_dim, bytes)
+    }
+
+    /// What [`LoaderWeights::fuse_packed`] would produce, from the plans alone: the scheme,
+    /// the in-dim, the concatenated out-dim and length, and whether any key is a stacked
+    /// tensor's step (whose slice is shorter than the whole tensor). `None` when the keys do
+    /// not fuse.
+    fn fuse_plan(&self, keys: &[&str]) -> Result<Option<FusePlan>> {
+        let (mut scheme, mut in_dim, mut out_dim, mut total) = (None, None, 0usize, 0usize);
         let mut stepped = false;
         for &key in keys {
             stepped |= split_step(key).is_some();
             let plain = split_step(key).map_or(key, |(n, _)| n);
-            let p = self.model.plan(plain)?.clone();
+            let p = self.model.plan(plain)?;
             if p.store != Store::Packed {
-                return Ok(false);
+                return Ok(None);
             }
             let Some(n) = bytes_for_public(p.file, p.ggml_shape[0] * p.ggml_shape[1]) else {
-                return Ok(false);
+                return Ok(None);
             };
             let Some(q) = loader::quant_of(p.file) else {
-                return Ok(false);
+                return Ok(None);
             };
             let (i, o) = p.in_out();
             match (scheme, in_dim) {
-                (Some(known), Some(known_in)) => {
-                    if known != q || known_in != i {
-                        return Ok(false);
-                    }
-                }
+                (Some(known), Some(known_in)) if known != q || known_in != i => return Ok(None),
+                (Some(_), Some(_)) => {}
                 _ => {
                     scheme = Some(q);
                     in_dim = Some(i);
@@ -194,53 +316,16 @@ impl LoaderWeights {
             total += n;
             out_dim += o;
         }
-        if !stepped && cached_blob(&self.model, name, total).is_some() {
-            return self.remember_fused(name, scheme, in_dim, out_dim, total);
-        }
-        let mut bytes = Vec::with_capacity(total);
-        let mut scheme = None;
-        let mut in_dim = None;
-        let mut out_dim = 0;
-        for &key in keys {
-            let part = if let Some((name, step)) = split_step(key) {
-                self.take_step_packed(name, step)?
-            } else {
-                let p = self.model.plan(key)?.clone();
-                if p.store != Store::Packed {
-                    return Ok(false);
-                }
-                let Some(q) = loader::quant_of(p.file) else {
-                    return Ok(false);
-                };
-                let (i, o) = p.in_out();
-                Some(GgufPackedLinear {
-                    w_q: self.model.raw(key)?,
-                    scheme: q,
-                    in_dim: i,
-                    out_dim: o,
-                    bias: Vec::new(),
-                })
-            };
-            let Some(part) = part else { return Ok(false) };
-            if scheme.is_none() {
-                scheme = Some(part.scheme);
-                in_dim = Some(part.in_dim);
-            } else if scheme != Some(part.scheme) || in_dim != Some(part.in_dim) {
-                return Ok(false);
-            }
-            bytes.extend_from_slice(&part.w_q);
-            out_dim += part.out_dim;
-        }
-        let (Some(scheme), Some(in_dim)) = (scheme, in_dim) else {
-            return Ok(false);
-        };
-        let total = bytes.len();
-        let kept = worth_keeping(&self.model, &packed_param(name));
-        if kept {
-            serve_blob(&self.model, name, bytes);
-            return self.remember_fused(name, Some(scheme), Some(in_dim), out_dim, total);
-        }
-        self.remember_fused_blob(name, Some(scheme), Some(in_dim), out_dim, bytes)
+        Ok(match (scheme, in_dim) {
+            (Some(scheme), Some(in_dim)) => Some(FusePlan {
+                scheme,
+                in_dim,
+                out_dim,
+                total,
+                stepped,
+            }),
+            _ => None,
+        })
     }
 
     /// Register the fused descriptor and hand back the placeholder `take_packed` serves
@@ -300,14 +385,14 @@ impl LoaderWeights {
 /// The weights this process has already read, by model file and tensor: a packed blob it
 /// concatenated ([`serve_blob`]) and host f32 it dequantised ([`serve_f32`]).
 ///
-/// Every graph shape of one model binds the same weights, and a transcription compiles a
-/// graph set per chunk length, so a body's 1.28 GiB was copied out of the mapped file once
-/// per shape — the largest single item of the compile line, and pure waste whenever the
-/// device already holds the bytes (which the shared weight buffer makes the rule after the
-/// first shape). A build therefore hands the flow a placeholder and the compile binds the
-/// real bytes from here, or — for a packed tensor, which needs no copy at all — straight
-/// from the mapped file ([`mapped_weight`]). The model file is part of every key, so two
-/// models whose graphs use the same tensor names never read each other's weights.
+/// Every layout of one model binds the same weights, and a transcription compiles one set
+/// of them per rung of its ladder, so a body's 1.28 GiB would be copied out of the model
+/// file once per layout — pure waste whenever the device already holds the bytes (which
+/// the shared weight buffer makes the rule after the first layout). A build therefore
+/// hands the flow a placeholder and the compile binds the real bytes from here, or — for a
+/// packed tensor, which needs no copy at all — from the model file itself
+/// ([`mapped_weight`]). The model file is part of every key, so two models whose graphs use
+/// the same tensor names never read each other's weights.
 enum Cached {
     /// A packed blob the process produced once: the fused projections of a model.
     Blob(Arc<[u8]>),
@@ -315,7 +400,18 @@ enum Cached {
     Host(Arc<Vec<f32>>, Vec<usize>),
 }
 
-/// The models whose files are mapped, by path: what a packed placeholder is bound from.
+/// What [`LoaderWeights::fuse_packed`] would produce, from the plans alone.
+struct FusePlan {
+    scheme: rlx_ir::quant::QuantScheme,
+    in_dim: usize,
+    out_dim: usize,
+    total: usize,
+    /// Any key is a stacked tensor's step, whose slice is shorter than the whole tensor.
+    stepped: bool,
+}
+
+/// The models a packed placeholder is bound from, by path: the file its bytes are read
+/// from when the device does not hold them yet.
 static MAPPED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<Model>>>> =
     std::sync::OnceLock::new();
 
@@ -328,8 +424,9 @@ const CACHED_F32_MIN_BYTES: usize = 1 << 20;
 
 /// The weights one shape has already asked for, by model file and tensor. A weight is kept
 /// only when a *second* shape asks for it: a single pass — one listener, one synthesis,
-/// which build each shape once — then pays no memory for a cache it would never read,
-/// while a transcription, which compiles a graph set per chunk length, keeps what it needs.
+/// which build each shape once — then pays no memory for a cache it would never read, while
+/// a transcription's ladder asks for the same body once per rung and re-reads what is kept
+/// here.
 static SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
     std::sync::OnceLock::new();
 
@@ -359,13 +456,12 @@ fn mapped() -> &'static std::sync::Mutex<HashMap<String, Arc<Model>>> {
     MAPPED.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-/// The model whose file `label` names, if this process has it mapped.
+/// The model `label` names, if this process has read a tensor of it.
 fn mapped_model(label: &str) -> Option<Arc<Model>> {
     mapped().lock().ok()?.get(label).cloned()
 }
 
-/// Remember that `model`'s file is mapped, so a compile can bind a packed placeholder
-/// from it by name.
+/// Remember `model`, so a compile can bind a packed placeholder from its file by name.
 fn note_mapped(model: &Arc<Model>) {
     if let Ok(mut guard) = mapped().lock() {
         guard.insert(model.path.display().to_string(), Arc::clone(model));
@@ -414,11 +510,12 @@ pub fn host_weight(origins: &HashMap<String, Arc<str>>, name: &str) -> Option<Ar
     }
 }
 
-/// Register `model` as mapped and hand back the placeholder the build carries in place of
-/// `key`'s packed bytes: the parameter has its right size, and the compile binds the file's
-/// own range ([`mapped_weight`]), which a skipped write never even reads.
-fn serve_packed(_key: &str, model: &Arc<Model>, len: usize) -> Vec<u8> {
+/// Register `model` and hand back the placeholder the build carries in place of `key`'s
+/// packed bytes: the parameter has its right size, and the compile binds the bytes read from
+/// the file ([`mapped_weight`]), which a skipped write never even reads.
+fn serve_packed(key: &str, model: &Arc<Model>, len: usize) -> Vec<u8> {
     note_mapped(model);
+    note_placeholder(key);
     vec![0u8; len]
 }
 
@@ -466,6 +563,7 @@ fn serve_f32(
         let entry = (model.path.display().to_string(), key.to_string());
         guard.insert(entry, Cached::Host(Arc::clone(&shared), dims.clone()));
     }
+    note_placeholder(key);
     (vec![0f32; shared.len()], dims)
 }
 
@@ -483,9 +581,9 @@ fn split_step(key: &str) -> Option<(&str, usize)> {
 impl WeightSource for LoaderWeights {
     fn take(&mut self, key: &str, transpose: bool) -> Result<(Vec<f32>, Vec<usize>)> {
         note_origin(key, &self.model);
-        // A weight this process has already read once is served from memory: every graph
-        // shape of the model binds the same bytes, and there is one shape per chunk
-        // length. The layout is part of the entry, so a transposed read is its own.
+        // A weight this process has already read once is served from memory: every layout
+        // of the model binds the same bytes, and the ladder's rungs are several layouts of
+        // one body. The layout is part of the entry, so a transposed read is its own.
         let cached_key = if transpose {
             format!("{key}\0t")
         } else {
@@ -494,6 +592,7 @@ impl WeightSource for LoaderWeights {
         if let Some((values, dims)) = cached_f32(&self.model, &cached_key) {
             // The compile binds the kept values, not this placeholder
             // (`graphs::Runner::compile`).
+            note_placeholder(&cached_key);
             return Ok((vec![0f32; values.len()], dims));
         }
         let (vals, dims) = self.take_read(key, transpose)?;
@@ -516,6 +615,7 @@ impl WeightSource for LoaderWeights {
             let mut v = v.clone();
             if let Some(len) = self.fused_len.get(key).copied() {
                 v.w_q = vec![0u8; len];
+                note_placeholder(key);
             }
             return Ok(Some(v));
         }
@@ -638,6 +738,9 @@ pub struct PairWeights {
 
 impl PairWeights {
     pub fn new(body: Arc<Model>, sound: Arc<Model>) -> Self {
+        // A pair's build starts here too: one failed before its compile must leave nothing
+        // that changes how a later build on this thread behaves.
+        clear_origins();
         Self { body, sound }
     }
 
@@ -663,7 +766,7 @@ impl PairWeights {
         key: &str,
         f: impl FnOnce(&mut LoaderWeights) -> Result<T>,
     ) -> Result<T> {
-        let mut one = LoaderWeights::new(self.file_of(key)?);
+        let mut one = LoaderWeights::of(self.file_of(key)?);
         f(&mut one)
     }
 }
