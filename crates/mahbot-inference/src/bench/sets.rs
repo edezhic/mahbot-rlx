@@ -9,11 +9,15 @@
 //! The seed bands are disjoint by construction: enrolment 100–109, owner
 //! negatives 9000–9029, confusable negatives 1000+, unrelated negatives 2000+,
 //! detection confusables 800/810, detection unrelated 900/910, held-out recall
-//! 3000–3039, command-plus-speech 3100–3109, phrase-in-passing 3200–3207, and
-//! the enrolment conditioning floor at
+//! 3000–3039, command-plus-speech 3100–3109, phrase-in-passing 3200–3207,
+//! intelligibility probes 5000–5001, and the enrolment conditioning floor at
 //! [`audio::CONDITIONING_NOISE_SEED_BASE`]` + clip index`. A clip from one band
 //! is never used in another set, so no clip is both calibration material and
 //! measurement material.
+//!
+//! [`VERIFICATION_POOL`] is the other pinned input: single-reader recordings the
+//! false-accept subset does not measure, from which the ten verification voices are
+//! drawn.
 
 use super::audio::{self, NoiseGenerator};
 
@@ -153,6 +157,179 @@ pub(crate) const PHRASE_IN_PASSING_SEED_BASE: u64 = 3200;
 pub(crate) const CONFUSABLE_BANDS: &[(u64, &str)] = &[(800, "confusable"), (810, "confusable2")];
 pub(crate) const UNRELATED_BANDS: &[(u64, &str)] = &[(900, "unrelated"), (910, "unrelated2")];
 
+/// How many verification voices a measurement carries. A screening run may measure
+/// fewer ([`super::config::BenchConfig::voices`]); the record needs all of them.
+pub(crate) const NUM_VERIFICATION_VOICES: usize = 10;
+
+/// No voice's span may be shorter than this.
+pub(crate) const MIN_VOICE_SPAN_SECS: f64 = 15.0;
+
+/// One candidate for a verification voice: a single-reader recording and the
+/// contiguous span of clean speech taken from it.
+pub(crate) struct VoiceCandidate {
+    /// The recording, relative to the corpus directory — the same paths the
+    /// false-accept subset names.
+    pub recording: &'static str,
+    /// The recording's SHA-256, checked before the span is cut.
+    pub sha256: &'static str,
+    /// The span's start, seconds into the recording.
+    pub offset_secs: f64,
+    /// The span's length, seconds, never below [`MIN_VOICE_SPAN_SECS`].
+    pub secs: f64,
+}
+
+/// The pinned pool the clone voices are cut from, in the order the run tries
+/// them: twenty `speech/librivox` recordings that [`REAL_AUDIO_FILES`] does not
+/// measure, so a verification voice and the false-accept stream rest on disjoint
+/// audio. The order was chosen at pin time to keep the first ten spread as widely
+/// as the pool allows in speaker sex — five estimated below 155 Hz median f0, five
+/// above 165 Hz — and in the languages the recordings are heard in (Portuguese,
+/// Mandarin, German, Hebrew, French, English, Cantonese, Italian, Russian,
+/// Spanish); the ten after them add Dutch, Tagalog and second recordings of the
+/// languages already present, so a candidate that fails the two-sentence check is
+/// replaced without losing either spread. The corpus carries audio and a label and
+/// no speaker or language metadata, so neither spread is verifiable from the
+/// files and the record states no sex or language claim. The offsets were chosen
+/// at pin time as the 15 s window of each recording with the largest VAD-active
+/// fraction and the most even level.
+///
+/// The pool establishes ten *distinct recordings*, which is what a clone is cut
+/// from; it does not establish ten distinct people (see the record's limits).
+pub(crate) const VERIFICATION_POOL: &[VoiceCandidate] = &[
+    // ── The first ten: the widest spread in sex and language the pool carries ──
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0002.wav",
+        sha256: "f907f96e69eb8e680c86964f63ff570d2c24458beacd7d94520c44b2a5c10868",
+        offset_secs: 11.40,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0039.wav",
+        sha256: "41fb73636b15dc76815fff9f816c97e897d2d920acef4b89097f8f05fe682fca",
+        offset_secs: 2.80,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0094.wav",
+        sha256: "b529147404ffd239df9a5eaddfe19e7130393fb756e4f56f4ee85d68cd63cc7d",
+        offset_secs: 14.80,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0092.wav",
+        sha256: "00eaf9379dfd80075731d89a9f83df2139b4959037513f61597f848a5668fff0",
+        offset_secs: 106.60,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0079.wav",
+        sha256: "116937d90638753623eabc97626e0d18b7b73ffd523534caf055a48171c67d81",
+        offset_secs: 131.60,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0168.wav",
+        sha256: "d5f2d58fffc2ed0694e5362ac047e3f0386a864fa0ff5f1c9d6ce66c399e4731",
+        offset_secs: 141.10,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0009.wav",
+        sha256: "afdfc48bb6ac16ffd97cf0663cc90122d7defa17d07d6b3c5017a6523c086cef",
+        offset_secs: 3.10,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0089.wav",
+        sha256: "cf8dfec778ea249d67282b7a7396fa954d212280ff44cb723cdb45e15f2ed01b",
+        offset_secs: 13.80,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0129.wav",
+        sha256: "75252026b534c7bb730c44cb721e6c7105220cbf1b4023eee9c7d5af40256adf",
+        offset_secs: 40.60,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0065.wav",
+        sha256: "725adb1ab5289dbcd8c8016285ae34890c96ac4f150995f20d078a1cfd1ecbf3",
+        offset_secs: 5.90,
+        secs: 15.0,
+    },
+    // ── Backfill: a second language pass, and Dutch and Tagalog ──
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0109.wav",
+        sha256: "3eb09c5fd68769fbe5434c21c9a794dbbdec8beeb7cea0b90f133a88b381e016",
+        offset_secs: 143.20,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0004.wav",
+        sha256: "76965f20b10ce0ed48beed1670d8c5ed81182a2bc797ed5e4d7dbe24c4c58ae8",
+        offset_secs: 145.50,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0126.wav",
+        sha256: "ba93311b011d6e9deb153b2c9405fa34c3c78f50607073ea4b15bbb42f463d88",
+        offset_secs: 139.70,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0105.wav",
+        sha256: "abaf7ca69ffe026ef7400ba8f0c56e6dc3b2a045d8eba75a83fbeae1e8461349",
+        offset_secs: 26.80,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0067.wav",
+        sha256: "58d491eb3dcd6c5b7356c21d1c393eb013cc25a88714b3da05f0147b7cba7464",
+        offset_secs: 92.00,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0141.wav",
+        sha256: "8516a484dcd0fc2aaedec544417eea9d3d81ad24b1fa683d05cd1dc92a86b59f",
+        offset_secs: 36.70,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0056.wav",
+        sha256: "c6069953bca76ba519bdd824cd1617952ee5cd37dd8586e4bd0b8eca241f860a",
+        offset_secs: 22.80,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0110.wav",
+        sha256: "fa2d279a3b310811670ef516ae32ebf58eeffd82ada1867fd0d0a66bd0d1923c",
+        offset_secs: 15.10,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0138.wav",
+        sha256: "e9216831e8b235b5bc0a53d9b318c087337a290e246f60474100338cadfcdbf2",
+        offset_secs: 12.50,
+        secs: 15.0,
+    },
+    VoiceCandidate {
+        recording: "speech/librivox/speech-librivox-0130.wav",
+        sha256: "2187820b42afbbad0ada3c0c82aa22da55801e48c846a369898e2cb8298b085a",
+        offset_secs: 2.60,
+        secs: 15.0,
+    },
+];
+
+/// The two ordinary sentences the intelligibility check renders in every voice.
+/// Deliberately not the wake phrase: this recogniser spells no wake phrase in any
+/// voice, so requiring one would fail every candidate for a reason that has
+/// nothing to do with cloning. Short enough that a render fits one recognition
+/// chunk with room to spare.
+pub(crate) const INTELLIGIBILITY_SENTENCES: &[&str] =
+    &["the weather is sunny today", "please open the window"];
+/// Seeds `INTELLIGIBILITY_SEED_BASE..+INTELLIGIBILITY_SENTENCES.len()`.
+pub(crate) const INTELLIGIBILITY_SEED_BASE: u64 = 5000;
+
 /// The false-reaction set's silence matrix.
 pub(crate) const SILENCE_DURATIONS: &[(&str, usize)] = &[
     ("silence_0_5s", 8_000),
@@ -204,16 +381,37 @@ pub(crate) fn all_noise_profiles() -> impl Iterator<Item = &'static (&'static st
     NOISE_PROFILES.iter().chain(NOISE_PROFILES_DETECTION_ONLY)
 }
 
+/// One voice's speech negatives, by category: 56 phonetic near-misses, 40
+/// unrelated sentences and 8 phrase-in-passing clips.
+pub(crate) const CONFUSABLE_CLIPS: usize = CONFUSABLE_BANDS.len() * CONFUSABLE_PHRASES.len();
+pub(crate) const UNRELATED_CLIPS: usize = UNRELATED_BANDS.len() * UNRELATED_PHRASES.len();
+pub(crate) const PHRASE_IN_PASSING_CLIPS: usize = PHRASE_IN_PASSING_PHRASES.len();
+/// The speech negatives one voice measures: the same 104 clips in every voice,
+/// the enrolled one included.
+pub(crate) const SPEECH_NEGATIVE_CLIPS: usize =
+    CONFUSABLE_CLIPS + UNRELATED_CLIPS + PHRASE_IN_PASSING_CLIPS;
+/// The non-speech negatives: silence and noise, which have no voice and run in a
+/// stream of their own.
+pub(crate) const NON_SPEECH_CLIPS: usize =
+    SILENCE_DURATIONS.len() + NOISE_PROFILES.len() + NOISE_PROFILES_DETECTION_ONLY.len();
+
+/// The speech streams a measurement carries: the enrolled voice plus
+/// [`NUM_VERIFICATION_VOICES`] clones.
+pub(crate) const SPEECH_VOICES: usize = NUM_VERIFICATION_VOICES + 1;
+
 /// The false-reaction set's size, built from the components above.
-/// [`audio::non_phrase_clips`] asserts the set it builds is exactly this long,
-/// so a dropped clip is a build-time failure rather than a smaller denominator.
-pub(crate) const EXPECTED_NON_PHRASE_TOTAL: usize = CONFUSABLE_BANDS.len()
-    * CONFUSABLE_PHRASES.len()
-    + UNRELATED_BANDS.len() * UNRELATED_PHRASES.len()
-    + SILENCE_DURATIONS.len()
-    + NOISE_PROFILES.len()
-    + NOISE_PROFILES_DETECTION_ONLY.len()
-    + PHRASE_IN_PASSING_PHRASES.len();
+/// [`audio::speech_negatives`] and [`audio::non_speech_clips`] assert the parts
+/// they build are exactly these lengths, so a dropped clip is a failure rather
+/// than a smaller denominator.
+pub(crate) const EXPECTED_NON_PHRASE_TOTAL: usize =
+    SPEECH_NEGATIVE_CLIPS * SPEECH_VOICES + NON_SPEECH_CLIPS;
+
+/// The recall set's size: 40 bare wake-phrase renderings plus 10
+/// wake-phrase-plus-command clips, per voice.
+pub(crate) const POSITIVE_CLIPS: usize =
+    HELD_OUT_WAKE_ONLY_CLIPS + COMMAND_PLUS_SPEECH_PHRASES.len();
+/// The positives a measurement carries over every voice.
+pub(crate) const EXPECTED_POSITIVE_TOTAL: usize = POSITIVE_CLIPS * SPEECH_VOICES;
 
 /// Where the real-audio corpus came from, as its manifest records it.
 pub(crate) const REAL_AUDIO_REPO: &str = "alexwengg/musan_mini";
@@ -404,8 +602,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_false_reaction_set_is_one_hundred_and_twenty_one() {
-        assert_eq!(EXPECTED_NON_PHRASE_TOTAL, 121);
+    fn the_false_reaction_set_is_one_thousand_one_hundred_and_sixty_one() {
+        assert_eq!(EXPECTED_NON_PHRASE_TOTAL, 1_161);
+        assert_eq!(SPEECH_NEGATIVE_CLIPS, 104);
+        assert_eq!(NON_SPEECH_CLIPS, 17);
+        assert_eq!(SPEECH_NEGATIVE_CLIPS * SPEECH_VOICES, 1_144);
+        assert_eq!(EXPECTED_POSITIVE_TOTAL, 550);
+    }
+
+    /// The pool is the bench's own input: every candidate is a recording the
+    /// false-accept phase never measures, carries its hash, and its span is long
+    /// enough to clone from.
+    #[test]
+    fn the_voice_pool_is_disjoint_from_the_false_accept_subset() {
+        assert_eq!(VERIFICATION_POOL.len(), 20);
+        assert!(VERIFICATION_POOL.len() > NUM_VERIFICATION_VOICES);
+        for candidate in VERIFICATION_POOL {
+            assert!(
+                !REAL_AUDIO_FILES
+                    .iter()
+                    .any(|(path, _, _)| *path == candidate.recording),
+                "{} is measured by the false-accept phase",
+                candidate.recording
+            );
+            assert_eq!(candidate.sha256.len(), 64, "{}", candidate.recording);
+            assert!(
+                candidate.secs >= MIN_VOICE_SPAN_SECS,
+                "{} spans {} s",
+                candidate.recording,
+                candidate.secs
+            );
+            assert!(candidate.offset_secs >= 0.0);
+        }
+        // One recording appears once: two rows of the same file would be two
+        // names for one voice.
+        let mut recordings: Vec<&str> = VERIFICATION_POOL
+            .iter()
+            .map(|candidate| candidate.recording)
+            .collect();
+        let pinned = recordings.len();
+        recordings.sort_unstable();
+        recordings.dedup();
+        assert_eq!(recordings.len(), pinned);
     }
 
     #[test]
@@ -454,6 +692,10 @@ mod tests {
             (
                 audio::CONDITIONING_NOISE_SEED_BASE,
                 audio::CONDITIONING_NOISE_SEED_BASE + NUM_ENROLLMENT_VARIANTS as u64,
+            ),
+            (
+                INTELLIGIBILITY_SEED_BASE,
+                INTELLIGIBILITY_SEED_BASE + INTELLIGIBILITY_SENTENCES.len() as u64,
             ),
         ];
         bands.sort_by_key(|band| band.0);

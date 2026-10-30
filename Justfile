@@ -1121,3 +1121,19 @@ check-isa *ARGS:
 # `just ps5 run rlx --host <ps5-ip>`. See crates/backends/rlx-ps5/README.md.
 ps5 *ARGS:
     python3 crates/backends/rlx-ps5/scripts/ps5.py {{ARGS}}
+
+# ── mahbot: this fork's own models ──────────────────────────────────
+#
+# A deliberate build renders the clip corpus; a measurement only reads it.
+# Both are behind the crate's non-default `bench` feature.
+mahbot-wake-build *ARGS:
+    cargo run --release -p mahbot-inference --features bench --bin wake-word-build -- {{ARGS}}
+
+mahbot-wake-bench *ARGS:
+    cargo bench -p mahbot-inference --features bench --bench wake_word -- {{ARGS}}
+
+# No other recipe compiles the bench target (whose `harness = false` means an
+# executing gate would run a measurement), so this is the one that sees it under
+# `-D warnings`.
+lint-mahbot:
+    cargo clippy -p mahbot-inference --features bench --all-targets -- -D warnings

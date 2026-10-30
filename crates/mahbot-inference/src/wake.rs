@@ -40,8 +40,9 @@ pub const NEG_TAIL_Z: f32 = 2.33;
 /// a rolling window fires when the mean cosine over its window reaches this.
 ///
 /// The calibrated point sits at the lowest value the static bar's margin admits
-/// (see [`MIN_STATIC_BAR`]); the wake bench measures 46 of 50 recall with two
-/// false accepts over the pinned real-audio corpus, and the record carries it.
+/// (see [`MIN_STATIC_BAR`]). The wake bench measures recall over the enrolled
+/// voice and ten cloned verification voices and the false accepts over the pinned
+/// real-audio corpus; the record carries the figures.
 pub const POS_MATCH_COSINE_ANCHOR: f32 = 0.838;
 
 /// Cap on the per-frame soft-score factor; the effective static fire factor is

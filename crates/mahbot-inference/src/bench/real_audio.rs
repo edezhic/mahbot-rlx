@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::listen::Embedder;
@@ -33,7 +33,7 @@ use crate::loader::Pair;
 use crate::wake::Enrollment;
 use crate::{host, listen};
 
-use super::config::BenchConfig;
+use super::config::{BenchConfig, Refused};
 use super::detect::{self, DetectionStream};
 use super::sets;
 use crate::guard::{Deadline, MemoryCeiling};
@@ -134,19 +134,6 @@ impl RealAudio {
                 )),
             );
         }
-        fa.insert(
-            "basis_note".into(),
-            json!(
-                "One continuous stream over the pinned files in their pinned order: the \
-                 detector, the adaptive state and the 3 s audio-clock cooldown carry across \
-                 files, and two seconds of digital silence separate them. A fire is one event; \
-                 the cooldown already suppresses a second one inside the same 3 s of audio. \
-                 The denominators are raw audio hours and VAD-active hours over that one stream. \
-                 Windows are encoded in groups of sixteen, so after a fire the detector has \
-                 already run up to one group (2.56 s) of the hops that follow it, and those \
-                 hops count in the VAD-active denominator: the bound is stated, not corrected."
-            ),
-        );
         json!({
             "status": status,
             "subset": {
@@ -155,10 +142,6 @@ impl RealAudio {
                 "noise_files": self.noise_files,
                 "corpus": self.corpus.to_string_lossy(),
                 "manifest": {"repo": sets::REAL_AUDIO_REPO, "revision": sets::REAL_AUDIO_REVISION},
-                "selection_heuristic": "longest librivox speech files up to a target + all \
-                                        us-gov speech files + a fixed noise selection (longest \
-                                        free-sound + sound-bible clips) — pinned as a bench \
-                                        constant with each file's SHA-256 and size",
             },
             "feed": {
                 "streams": 1,
@@ -282,26 +265,29 @@ pub(crate) fn run(
 
 /// Size and SHA-256 of every pinned file. Run in the input phase, before the
 /// expensive part: a bad pin stops the run in its first seconds, not after the
-/// corpus synthesis. A mismatch is an error naming the file.
-pub(crate) fn verify(corpus: &Path, subset: &[(&str, &str, u64)]) -> Result<()> {
+/// corpus synthesis. A mismatch is a [`Refused`] input — the corpus is not the one
+/// the pins name, which is a fault of what the invocation pointed at, not of the run
+/// — and the message names the file.
+pub(crate) fn verify(corpus: &Path, subset: &[(&str, &str, u64)]) -> Result<(), Refused> {
     for (path, sha256, pinned) in subset {
         let file = corpus.join(path);
         let bytes = std::fs::metadata(&file)
-            .with_context(|| format!("cannot stat the pinned corpus file {}", file.display()))?
+            .with_context(|| format!("cannot stat the pinned corpus file {}", file.display()))
+            .map_err(Refused::new)?
             .len();
         if bytes != *pinned {
-            bail!(
+            return Err(Refused::new(anyhow!(
                 "the pinned corpus file {} is {bytes} bytes, not the pinned {pinned} bytes",
                 file.display()
-            );
+            )));
         }
-        let actual = crate::measurements::sha256_file(&file)?;
+        let actual = crate::measurements::sha256_file(&file).map_err(Refused::new)?;
         if actual != *sha256 {
-            bail!(
+            return Err(Refused::new(anyhow!(
                 "the pinned corpus file {} does not match its SHA-256 pin ({actual}, expected \
                  {sha256})",
                 file.display()
-            );
+            )));
         }
     }
     Ok(())
@@ -356,9 +342,9 @@ fn take_measured(stream: &mut DetectionStream, totals: &mut Totals) {
 mod tests {
     use std::path::Path;
 
-    use anyhow::Result;
+    use anyhow::{Context, Result};
 
-    use super::{Totals, feed_files};
+    use super::{Totals, feed_files, verify};
     use crate::bench::detect::DetectionStream;
     use crate::bench::sets;
     use crate::guard::{Deadline, MemoryCeiling};
@@ -527,6 +513,28 @@ mod tests {
         assert!(stopped.is_err(), "a stop at the first file is an error");
         assert_eq!(totals.files_fed, 0);
         assert_eq!(totals.audio_secs, 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A corpus file that no longer matches its pin is a refused input, not a failed
+    /// run — through the context the input phase wraps it in, which the entry point's
+    /// classification reads through.
+    #[test]
+    fn a_corpus_file_that_does_not_match_its_pin_is_refused() {
+        let dir =
+            std::env::temp_dir().join(format!("mahbot-real-audio-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp corpus");
+        wav(&dir.join("a.wav"), 0.05);
+        let bytes = std::fs::metadata(dir.join("a.wav"))
+            .expect("the clip")
+            .len();
+        let error = verify(&dir, &[("a.wav", "not-the-digest", bytes)])
+            .context("the pinned real-audio corpus")
+            .expect_err("a stale pin");
+        assert!(format!("{error:#}").contains("SHA-256"), "{error:#}");
+        assert_eq!(crate::bench::exit_code(&error), 2, "{error:#}");
+        let missing = verify(&dir, &[("b.wav", "", 0)]).expect_err("no file");
+        assert!(missing.to_string().contains("cannot stat"), "{missing}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

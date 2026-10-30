@@ -27,7 +27,43 @@ use crate::loader::{self, Role};
 use crate::measurements::{hex, sha256_file};
 use crate::wake;
 
+use super::sets;
 use crate::guard::{DEFAULT_MAX_RSS_MIB, DEFAULT_TIMEOUT_SECS};
+
+/// An input the invocation named and the run cannot use — a flag, a bound, a file, a
+/// corpus cache that cannot be created, a corpus record or manifest the cache holds,
+/// or a pinned recording that no longer matches its pin.
+///
+/// The type is the classification: a function whose failure means "this input is
+/// unusable" returns `Result<_, Refused>`, so the marker rides on the error itself
+/// and the entry point reads it once ([`super::exit_code`]) — no call site decides
+/// it, and none can forget to.
+#[derive(Debug, Clone)]
+pub(crate) struct Refused(String);
+
+impl Refused {
+    /// The refusal, with the whole context chain as its message: that chain is what
+    /// the console states.
+    pub(crate) fn new(error: anyhow::Error) -> Self {
+        Self(format!("{error:#}"))
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// A function declared to return [`Refused`] states that everything it can fail with
+/// is an unusable input, so its own `?` needs no decision.
+impl From<anyhow::Error> for Refused {
+    fn from(error: anyhow::Error) -> Self {
+        Self::new(error)
+    }
+}
 
 /// One input: the flag that names it and the environment variable that can
 /// stand in for it. One table, so a flag's name and its variable cannot drift
@@ -95,6 +131,14 @@ const PHASES: Spec = Spec {
     flag: "phases",
     env: "MAHBOT_BENCH_PHASES",
 };
+/// How many clone voices the synthetic side measures. A run that reaches the record
+/// measures all [`crate::bench::sets::NUM_VERIFICATION_VOICES`]; fewer is a screening
+/// run and writes no record. Like the other aids, an empty value is an error rather
+/// than the default.
+const VOICES: Spec = Spec {
+    flag: "voices",
+    env: "MAHBOT_BENCH_VOICES",
+};
 
 /// Every flag the bench accepts. Anything else is an error, so a typo cannot
 /// silently fall back to an environment variable.
@@ -112,17 +156,44 @@ const SPECS: &[Spec] = &[
     TTS_SOUND,
     WAKE_THRESHOLDS,
     PHASES,
+    VOICES,
 ];
+
+/// Which operation is resolving its inputs. The measurement names a report it
+/// writes and is bounded by the defaults; the corpus build writes no report, takes
+/// no measurement aid and is not a measurement at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Mode {
+    Measure,
+    Build,
+}
+
+impl Mode {
+    /// The prefix the operation's own console lines carry, so a build's voice
+    /// selection does not read as a measurement's.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Measure => "wake-word",
+            Self::Build => "wake-word build",
+        }
+    }
+}
 
 /// The resolved inputs of one bench run.
 #[derive(Debug, Clone)]
 pub(crate) struct BenchConfig {
+    /// The operation these inputs were resolved for: the measurement or the
+    /// corpus build. The build writes no report and carries no wall-clock bound;
+    /// its console lines say so.
+    pub mode: Mode,
     /// The directory the role files are resolved against. Absent when all four
     /// role files were named explicitly.
     pub models: Option<PathBuf>,
     pub voice: PathBuf,
     pub corpus: PathBuf,
-    pub report: PathBuf,
+    /// The measurement's report file. Absent for the corpus build, which is not a
+    /// measurement and writes no report.
+    pub report: Option<PathBuf>,
     pub cache: PathBuf,
     pub lock: PathBuf,
     pub timeout_secs: u64,
@@ -133,27 +204,83 @@ pub(crate) struct BenchConfig {
     pub tts_sound: PathBuf,
     /// Which of the three measurements this run takes. All three by default, and
     /// all three are what the benchmark itself takes: a run that takes a subset
-    /// (to price a recall point in half a minute) reports `screened` and never
-    /// writes the record.
+    /// (to price a recall point without the real-audio sweep) reports `screened` and
+    /// never writes the record.
     pub phases: Phases,
     /// The firing thresholds the run scores with: [`wake::Thresholds::DEFAULT`]
     /// unless `--wake-thresholds` / `MAHBOT_WAKE_THRESHOLDS` names another set. A
     /// set other than the shipped one prices a candidate point and leaves the
     /// record alone; the shipped set is the benchmark.
     pub thresholds: wake::Thresholds,
+    /// How many clone voices the synthetic side measures, never more than the
+    /// pinned pool fills ([`sets::NUM_VERIFICATION_VOICES`]). Fewer than all of
+    /// them is a screening run and is labelled as such wherever the rows are
+    /// printed.
+    pub voices: usize,
+    /// The swap-growth ceiling this run is under, resolved from the same
+    /// environment the rest of the inputs came from — so a classification never
+    /// reads a bound the run was not resolved under.
+    pub swap_growth_mib: u64,
+}
+
+/// Whether the swap-growth ceiling `ceiling` is larger than the default — the arm
+/// [`BenchConfig::screened_reasons`] reads, stated once so the enforcement and the
+/// classification cannot disagree.
+fn swap_bound_is_raised(ceiling: u64) -> bool {
+    ceiling > crate::guard::MAX_SWAP_GROWTH_MIB
 }
 
 impl BenchConfig {
-    /// The process's own arguments and environment.
-    pub(crate) fn from_env() -> Result<Self> {
-        Self::resolve(std::env::args().skip(1), |name| std::env::var_os(name))
+    /// Why this run is not the benchmark, in the order the reasons are checked. An
+    /// empty list is the benchmark itself: the shipped threshold set over all three
+    /// phases, all eleven voices, inside the default wall-clock, resident and
+    /// swap-growth bounds. The record only carries that run.
+    pub(crate) fn screened_reasons(&self) -> Vec<&'static str> {
+        let mut reasons = Vec::new();
+        if self.thresholds != wake::Thresholds::DEFAULT {
+            reasons.push("the firing-threshold set is not the shipped one");
+        }
+        if !self.phases.is_full() {
+            reasons.push("a subset of the phases is measured");
+        }
+        if self.voices != sets::NUM_VERIFICATION_VOICES {
+            reasons.push("a subset of the verification voices is measured");
+        }
+        if self.timeout_secs > DEFAULT_TIMEOUT_SECS {
+            reasons.push("the wall-clock bound is larger than the default");
+        }
+        if self.max_rss_mib > DEFAULT_MAX_RSS_MIB {
+            reasons.push("the resident bound is larger than the default");
+        }
+        if swap_bound_is_raised(self.swap_growth_mib) {
+            reasons.push("the swap-growth bound is larger than the default");
+        }
+        reasons
+    }
+
+    /// The process's own arguments and environment. A configuration that cannot be
+    /// resolved is a refused input, so the whole resolution is classified once here.
+    pub(crate) fn from_env(mode: Mode) -> Result<Self, Refused> {
+        Self::resolve(
+            std::env::args().skip(1),
+            |name| std::env::var_os(name),
+            mode,
+        )
+        .map_err(Refused::new)
+    }
+
+    /// The measurement's report. A resolved measurement always names one.
+    pub(crate) fn report_path(&self) -> &Path {
+        self.report
+            .as_deref()
+            .expect("a measurement names the report it writes")
     }
 
     /// The invocation, with every input it took, for the provenance block: the
     /// report this run wrote is the thing a later reader has to be able to
     /// repeat. The four role files are recorded by name rather than the directory
     /// they came from, so the line replays whether the run was given `--models`
-    /// or the files one by one; paths under `$HOME` are shortened to `~`. The two
+    /// or the files one by one; paths under `$HOME` are shortened to `~`. The three
     /// measurement aids are named whenever they differ from the defaults, so a
     /// screened run replays as the run it was.
     pub(crate) fn command_line(&self) -> String {
@@ -165,6 +292,9 @@ impl BenchConfig {
         if self.thresholds != wake::Thresholds::DEFAULT {
             aids.push_str(&format!(" --wake-thresholds \"{}\"", self.thresholds));
         }
+        if self.voices != sets::NUM_VERIFICATION_VOICES {
+            aids.push_str(&format!(" --voices {}", self.voices));
+        }
         format!(
             "cargo bench -p mahbot-inference --features bench --bench wake_word -- \
              --asr-body {} --asr-sound {} --tts-body {} --tts-sound {} --voice {} \
@@ -175,7 +305,7 @@ impl BenchConfig {
             short(&self.tts_sound),
             short(&self.voice),
             short(&self.corpus),
-            short(&self.report),
+            short(self.report_path()),
             short(&self.lock),
             self.timeout_secs,
             self.max_rss_mib,
@@ -196,9 +326,27 @@ impl BenchConfig {
     pub(crate) fn resolve(
         argv: impl IntoIterator<Item = String>,
         env: impl Fn(&str) -> Option<OsString>,
+        mode: Mode,
     ) -> Result<Self> {
         let flags = parse_flags(argv)?;
-        // Every input but the two measurement aids reads an empty — or non-text —
+        // The build is not a measurement: it renders every clip of every voice,
+        // writes no report and has no wall-clock bound, so the measurement aids
+        // are refused rather than accepted and ignored.
+        if mode == Mode::Build {
+            let given_aids: Vec<String> = [REPORT, WAKE_THRESHOLDS, PHASES, VOICES, TIMEOUT]
+                .into_iter()
+                .filter(|spec| given(&flags, &env, *spec).is_some())
+                .map(|spec| format!("--{} / {}", spec.flag, spec.env))
+                .collect();
+            if !given_aids.is_empty() {
+                bail!(
+                    "the corpus build is not a measurement — it renders every clip of every \
+                     voice, writes no report and has no wall-clock bound — so it takes no {}",
+                    given_aids.join(", ")
+                );
+            }
+        }
+        // Every input but the three measurement aids reads an empty — or non-text —
         // value as absent: a required input then names itself, a defaulted one takes
         // its default. The aids take the value as given, so an empty or non-text flag
         // *or* variable reaches `aid` and is refused there: `--wake-thresholds ""`, a
@@ -273,13 +421,21 @@ impl BenchConfig {
             );
         }
 
-        let report = absolute(&required(get(REPORT), REPORT, "the report file")?)?;
-        let cache = corpus_cache()?;
-        // One lock for every heavy run of this crate: an explicit path wins,
-        // otherwise the shared default, never "no lock".
+        let report = match mode {
+            Mode::Measure => Some(absolute(&required(
+                get(REPORT),
+                REPORT,
+                "the report file",
+            )?)?),
+            Mode::Build => None,
+        };
+        let cache = corpus_cache(&env)?;
+        // One lock for every heavy run of this crate, from the same lookup as every
+        // other input: an explicit path wins, otherwise the guard's shared default,
+        // never "no lock".
         let lock = match get(LOCK) {
             Some(value) => absolute(&value)?,
-            None => crate::guard::lock_path(),
+            None => crate::guard::lock_path(&env)?,
         };
 
         let timeout_secs = whole_number(get(TIMEOUT), DEFAULT_TIMEOUT_SECS, TIMEOUT)?;
@@ -292,8 +448,14 @@ impl BenchConfig {
             Some(value) => Phases::parse(&aid(value, PHASES)?)?,
             None => Phases::ALL,
         };
+        let voices = match given(&flags, &env, VOICES) {
+            Some(value) => voice_count(&aid(value, VOICES)?)?,
+            None => sets::NUM_VERIFICATION_VOICES,
+        };
+        let swap_growth_mib = crate::guard::swap_growth_ceiling(&env);
 
         Ok(Self {
+            mode,
             asr_body: role(ASR_BODY, Role::Recognition, false)?,
             asr_sound: role(ASR_SOUND, Role::Recognition, true)?,
             tts_body: role(TTS_BODY, Role::Synthesis, false)?,
@@ -308,8 +470,31 @@ impl BenchConfig {
             max_rss_mib,
             thresholds,
             phases,
+            voices,
+            swap_growth_mib,
         })
     }
+}
+
+/// A voice count from a flag or its variable: at least one and at most the ten a
+/// measurement is defined over. A typo or an out-of-range number is refused rather
+/// than clamped — a clamped count would look like the eleven-voice measurement.
+fn voice_count(text: &str) -> Result<usize> {
+    let parsed: usize = text.trim().parse().with_context(|| {
+        format!(
+            "--{} / {} `{text}` is not a whole number",
+            VOICES.flag, VOICES.env
+        )
+    })?;
+    if parsed == 0 || parsed > sets::NUM_VERIFICATION_VOICES {
+        bail!(
+            "--{} / {} must be between 1 and {}",
+            VOICES.flag,
+            VOICES.env,
+            sets::NUM_VERIFICATION_VOICES
+        );
+    }
+    Ok(parsed)
 }
 
 /// Which of the three measurements a run takes.
@@ -445,10 +630,12 @@ fn parse_thresholds(text: &str) -> Result<wake::Thresholds> {
 /// empty.
 ///
 /// `$XDG_CACHE_HOME/mahbot/wake-word-corpus`, else `~/.cache/mahbot/wake-word-corpus`.
-fn corpus_cache() -> Result<PathBuf> {
-    let root = match std::env::var_os("XDG_CACHE_HOME") {
+/// Read through the same `env` lookup every other input uses, so a configuration
+/// resolved in a test can never name the user's real cache.
+fn corpus_cache(env: &impl Fn(&str) -> Option<OsString>) -> Result<PathBuf> {
+    let root = match env("XDG_CACHE_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => match std::env::var_os("HOME") {
+        _ => match env("HOME") {
             Some(home) if !home.is_empty() => PathBuf::from(home).join(".cache"),
             _ => bail!(
                 "neither XDG_CACHE_HOME nor HOME is set — there is no durable place for the \
@@ -594,8 +781,9 @@ const SYNTHESIS_SOURCES: &[&[u8]] = &[
     include_bytes!("../loader.rs"),
 ];
 
-/// Stat and hash every input file. Errors name the file.
-pub(crate) fn pin_inputs(cfg: &BenchConfig) -> Result<Inputs> {
+/// Stat and hash every input file. Errors name the file; a file the invocation named
+/// and the run cannot use is a refused input, so the classification is made here once.
+pub(crate) fn pin_inputs(cfg: &BenchConfig) -> Result<Inputs, Refused> {
     Ok(Inputs {
         asr_body: pin(&cfg.asr_body)?,
         asr_sound: pin(&cfg.asr_sound)?,
@@ -650,7 +838,7 @@ fn parse_flags(argv: impl IntoIterator<Item = String>) -> Result<HashMap<String,
 
 /// The value a spec was given: the flag wins over its environment variable, and the
 /// value is taken as written. What an empty or non-text value means is the caller's —
-/// every input but the two measurement aids reads it as absent, the aids refuse it.
+/// every input but the three measurement aids reads it as absent, the aids refuse it.
 fn given(
     flags: &HashMap<String, String>,
     env: &impl Fn(&str) -> Option<OsString>,
@@ -698,6 +886,18 @@ mod tests {
             "mahbot-wake-config-{tag}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    /// What resolution sees in a test: the two paths a configuration can default to —
+    /// the corpus cache under `HOME`, the lock under `TMPDIR` — resolve inside the
+    /// test's own tree, so a resolved test configuration can never name the user's real
+    /// cache or lock.
+    fn test_env(name: &str) -> Option<OsString> {
+        match name {
+            "HOME" => Some(OsString::from("/home/mahbot-test")),
+            "TMPDIR" => Some(OsString::from("/home/mahbot-test/tmp")),
+            _ => None,
+        }
     }
 
     fn args(pairs: &[(&str, &str)]) -> Vec<String> {
@@ -781,7 +981,8 @@ mod tests {
 
     #[test]
     fn a_missing_model_directory_names_the_flag_and_the_variable() {
-        let err = BenchConfig::resolve(Vec::new(), |_| None).expect_err("no inputs at all");
+        let err = BenchConfig::resolve(Vec::new(), test_env, Mode::Measure)
+            .expect_err("no inputs at all");
         let text = format!("{err:#}");
         assert!(text.contains("--voice"), "{text}");
         assert!(text.contains(VOICE.env), "{text}");
@@ -790,7 +991,7 @@ mod tests {
     #[test]
     fn a_missing_role_file_without_a_model_directory_names_both_flags() {
         let fixture = Fixture::new("role");
-        let err = BenchConfig::resolve(fixture.without("models"), |_| None)
+        let err = BenchConfig::resolve(fixture.without("models"), test_env, Mode::Measure)
             .expect_err("no directory, no role files");
         let text = format!("{err:#}");
         assert!(text.contains("--asr-body"), "{text}");
@@ -800,8 +1001,12 @@ mod tests {
     #[test]
     fn a_missing_voice_names_the_flag_and_the_variable() {
         let fixture = Fixture::new("voice");
-        let err = BenchConfig::resolve(fixture.with("voice", "/nope/voice.wav"), |_| None)
-            .expect_err("the voice is missing");
+        let err = BenchConfig::resolve(
+            fixture.with("voice", "/nope/voice.wav"),
+            test_env,
+            Mode::Measure,
+        )
+        .expect_err("the voice is missing");
         let text = format!("{err:#}");
         assert!(text.contains("--voice"), "{text}");
         assert!(text.contains(VOICE.env), "{text}");
@@ -811,8 +1016,12 @@ mod tests {
     #[test]
     fn a_missing_corpus_names_the_flag_and_the_variable() {
         let fixture = Fixture::new("corpus");
-        let err = BenchConfig::resolve(fixture.with("corpus", "/nope/corpus"), |_| None)
-            .expect_err("the corpus is missing");
+        let err = BenchConfig::resolve(
+            fixture.with("corpus", "/nope/corpus"),
+            test_env,
+            Mode::Measure,
+        )
+        .expect_err("the corpus is missing");
         let text = format!("{err:#}");
         assert!(text.contains("--corpus"), "{text}");
         assert!(text.contains(CORPUS.env), "{text}");
@@ -825,7 +1034,8 @@ mod tests {
     #[test]
     fn the_recorded_command_names_the_files_the_run_used() {
         let fixture = Fixture::new("command");
-        let cfg = BenchConfig::resolve(fixture.args.clone(), |_| None).expect("resolved");
+        let cfg =
+            BenchConfig::resolve(fixture.args.clone(), test_env, Mode::Measure).expect("resolved");
         let line = cfg.command_line();
         for flag in ["--asr-body", "--asr-sound", "--tts-body", "--tts-sound"] {
             assert!(line.contains(flag), "{flag} is missing from: {line}");
@@ -848,13 +1058,19 @@ mod tests {
         let mut args = fixture.args.clone();
         let at = args.iter().position(|arg| arg == "--report").unwrap();
         args.drain(at..at + 2);
-        let err = BenchConfig::resolve(args, |_| None).expect_err("the report is missing");
+        let err =
+            BenchConfig::resolve(args, test_env, Mode::Measure).expect_err("the report is missing");
         let text = format!("{err:#}");
         assert!(text.contains("--report"), "{text}");
         assert!(text.contains(REPORT.env), "{text}");
 
-        let cfg = BenchConfig::resolve(fixture.without("lock"), |_| None).expect("resolved");
-        assert_eq!(cfg.lock, crate::guard::lock_path());
+        let cfg = BenchConfig::resolve(fixture.without("lock"), test_env, Mode::Measure)
+            .expect("resolved");
+        assert_eq!(
+            cfg.lock,
+            Path::new("/home/mahbot-test/tmp/mahbot-heavy-run.lock"),
+            "the default lock is resolved from the same environment as every other input"
+        );
     }
 
     #[test]
@@ -862,8 +1078,12 @@ mod tests {
         let missing = temp_path("nope");
         let text = format!(
             "{:#}",
-            BenchConfig::resolve(args(&[("models", missing.to_str().unwrap())]), |_| None)
-                .expect_err("the directory does not exist")
+            BenchConfig::resolve(
+                args(&[("models", missing.to_str().unwrap())]),
+                test_env,
+                Mode::Measure
+            )
+            .expect_err("the directory does not exist")
         );
         assert!(text.contains(missing.to_str().unwrap()), "{text}");
     }
@@ -873,17 +1093,28 @@ mod tests {
         let fixture = Fixture::new("resolved");
         let mut argv = fixture.args.clone();
         argv.push("--timeout=1234".to_string());
-        let cfg = BenchConfig::resolve(argv, |name| {
-            (name == MODELS.env).then(|| "/from/the/environment".into())
-        })
+        let cfg = BenchConfig::resolve(
+            argv,
+            |name| {
+                if name == MODELS.env {
+                    Some("/from/the/environment".into())
+                } else {
+                    test_env(name)
+                }
+            },
+            Mode::Measure,
+        )
         .expect("resolved");
         assert_eq!(cfg.models.as_deref(), Some(fixture.dir.as_path()));
         assert_eq!(cfg.timeout_secs, 1234);
-        assert_eq!(cfg.report, fixture.dir.join("report.json"));
-        assert!(
-            cfg.cache.ends_with("mahbot/wake-word-corpus"),
-            "the corpus cache is fixed: {}",
-            cfg.cache.display()
+        assert_eq!(
+            cfg.report.as_deref(),
+            Some(fixture.dir.join("report.json").as_path())
+        );
+        assert_eq!(
+            cfg.cache,
+            Path::new("/home/mahbot-test/.cache/mahbot/wake-word-corpus"),
+            "the corpus cache is fixed and resolved from the same environment as every input"
         );
         assert_eq!(cfg.lock, fixture.dir.join("run.lock"));
     }
@@ -895,7 +1126,8 @@ mod tests {
         for flag in ["asr-body", "asr-sound", "tts-body", "tts-sound"] {
             argv.extend(args(&[(flag, "/models/file.gguf")]));
         }
-        let cfg = BenchConfig::resolve(argv, |_| None).expect("the role files are all named");
+        let cfg = BenchConfig::resolve(argv, test_env, Mode::Measure)
+            .expect("the role files are all named");
         assert!(cfg.models.is_none());
         assert_eq!(cfg.asr_body, PathBuf::from("/models/file.gguf"));
         assert_eq!(cfg.models_label(), "per-role files");
@@ -907,7 +1139,8 @@ mod tests {
     #[test]
     fn the_synthesis_hash_covers_the_voice_reference() {
         let fixture = Fixture::new("voice-hash");
-        let cfg = BenchConfig::resolve(fixture.args.clone(), |_| None).expect("the fixture");
+        let cfg = BenchConfig::resolve(fixture.args.clone(), test_env, Mode::Measure)
+            .expect("the fixture");
         for path in [&cfg.asr_body, &cfg.asr_sound, &cfg.tts_body, &cfg.tts_sound] {
             std::fs::write(path, b"pair").expect("role file");
         }
@@ -924,27 +1157,32 @@ mod tests {
         let fixture = Fixture::new("cargo-bench");
         let mut argv = fixture.args.clone();
         argv.push("--bench".to_string());
-        let cfg = BenchConfig::resolve(argv, |_| None).expect("--bench is a no-op");
+        let cfg = BenchConfig::resolve(argv, test_env, Mode::Measure).expect("--bench is a no-op");
         assert_eq!(cfg.timeout_secs, DEFAULT_TIMEOUT_SECS);
     }
 
     #[test]
     fn an_unknown_flag_is_an_error() {
-        let err = BenchConfig::resolve(vec!["--modles".to_string(), "x".to_string()], |_| None)
-            .expect_err("unknown flag");
+        let err = BenchConfig::resolve(
+            vec!["--modles".to_string(), "x".to_string()],
+            test_env,
+            Mode::Measure,
+        )
+        .expect_err("unknown flag");
         assert!(format!("{err:#}").contains("--modles"));
     }
 
     #[test]
     fn a_threshold_override_moves_the_numbers_it_names_and_nothing_else() {
         let fixture = Fixture::new("thresholds");
-        let shipped = BenchConfig::resolve(fixture.args.clone(), |_| None).expect("the fixture");
+        let shipped = BenchConfig::resolve(fixture.args.clone(), test_env, Mode::Measure)
+            .expect("the fixture");
         assert_eq!(shipped.thresholds, wake::Thresholds::DEFAULT);
         assert!(!shipped.command_line().contains("--wake-thresholds"));
 
         let mut argv = fixture.args.clone();
         argv.extend(args(&[("wake-thresholds", "anchor=0.88, reset_ratio=0.5")]));
-        let point = BenchConfig::resolve(argv, |_| None).expect("the override");
+        let point = BenchConfig::resolve(argv, test_env, Mode::Measure).expect("the override");
         assert_eq!(point.thresholds.anchor, 0.88);
         assert_eq!(point.thresholds.reset_ratio, 0.5);
         assert_eq!(point.thresholds.floor_max, wake::MAX_SOFT_FLOOR);
@@ -971,7 +1209,7 @@ mod tests {
         ] {
             let mut argv = fixture.args.clone();
             argv.extend(args(&[("wake-thresholds", value)]));
-            let err = BenchConfig::resolve(argv, |_| None).expect_err(value);
+            let err = BenchConfig::resolve(argv, test_env, Mode::Measure).expect_err(value);
             assert!(format!("{err:#}").contains(wanted), "{value}: {err:#}");
         }
     }
@@ -979,26 +1217,28 @@ mod tests {
     #[test]
     fn a_screened_run_takes_only_the_phases_it_names() {
         let fixture = Fixture::new("phases");
-        let full = BenchConfig::resolve(fixture.args.clone(), |_| None).expect("the fixture");
+        let full = BenchConfig::resolve(fixture.args.clone(), test_env, Mode::Measure)
+            .expect("the fixture");
         assert!(full.phases.is_full());
         assert!(!full.command_line().contains("--phases"));
 
         let mut argv = fixture.args.clone();
         argv.extend(args(&[("phases", "recall,non-phrase")]));
-        let screened = BenchConfig::resolve(argv, |_| None).expect("screened");
+        let screened = BenchConfig::resolve(argv, test_env, Mode::Measure).expect("screened");
         assert!(screened.phases.recall && screened.phases.non_phrase);
         assert!(!screened.phases.real_audio);
         assert!(!screened.phases.is_full());
 
         let mut argv = fixture.args.clone();
         argv.extend(args(&[("phases", "recall,captions")]));
-        let err = BenchConfig::resolve(argv, |_| None).expect_err("no such phase");
+        let err = BenchConfig::resolve(argv, test_env, Mode::Measure).expect_err("no such phase");
         assert!(format!("{err:#}").contains("captions"));
 
         // `all` does not end the check: a typo after it is still a typo.
         let mut argv = fixture.args.clone();
         argv.extend(args(&[("phases", "all,recalll")]));
-        let err = BenchConfig::resolve(argv, |_| None).expect_err("no such phase after all");
+        let err = BenchConfig::resolve(argv, test_env, Mode::Measure)
+            .expect_err("no such phase after all");
         assert!(format!("{err:#}").contains("recalll"), "{err:#}");
     }
 
@@ -1016,18 +1256,19 @@ mod tests {
         assert_eq!(parse_thresholds(&point.to_string()).unwrap(), point);
     }
 
-    /// The recorded command replays the run it came from: both measurement aids
-    /// are named when they differ from the defaults, and the quoted values parse
+    /// The recorded command replays the run it came from: every measurement aid
+    /// is named when it differs from the defaults, and the quoted values parse
     /// back to the ones the run used.
     #[test]
-    fn the_recorded_command_names_both_measurement_aids() {
+    fn the_recorded_command_names_the_measurement_aids() {
         let fixture = Fixture::new("aids");
         let mut argv = fixture.args.clone();
         argv.extend(args(&[
             ("phases", "recall,real-audio"),
             ("wake-thresholds", "anchor=0.86"),
+            ("voices", "3"),
         ]));
-        let cfg = BenchConfig::resolve(argv, |_| None).expect("the aids");
+        let cfg = BenchConfig::resolve(argv, test_env, Mode::Measure).expect("the aids");
         let line = cfg.command_line();
 
         let quoted = |flag: &str| -> String {
@@ -1043,6 +1284,8 @@ mod tests {
             parse_thresholds(&quoted("--wake-thresholds")).unwrap(),
             cfg.thresholds
         );
+        assert!(line.contains("--voices 3"), "{line}");
+        assert_eq!(cfg.voices, 3);
     }
 
     #[test]
@@ -1050,11 +1293,12 @@ mod tests {
         let fixture = Fixture::new("thresholds-name");
         let mut argv = fixture.args.clone();
         argv.extend(args(&[("wake-thresholds", "treshold=0.8")]));
-        let err = BenchConfig::resolve(argv, |_| None).expect_err("a typo must not be ignored");
+        let err = BenchConfig::resolve(argv, test_env, Mode::Measure)
+            .expect_err("a typo must not be ignored");
         assert!(format!("{err:#}").contains("treshold"));
     }
 
-    /// An empty value is refused on both measurement aids, from the flag and from
+    /// An empty value is refused on every measurement aid, from the flag and from
     /// the environment: a run that overrode nothing must not resolve to the shipped
     /// defaults and rewrite the record. The refusal names both places, since the
     /// operator may have exported the variable and never passed the flag.
@@ -1068,18 +1312,27 @@ mod tests {
                 "names no threshold",
             ),
             (PHASES.flag, PHASES.env, "names no phase"),
+            (VOICES.flag, VOICES.env, "is not a whole number"),
         ] {
             let mut argv = fixture.args.clone();
             argv.push(format!("--{flag}="));
-            let err = BenchConfig::resolve(argv, |_| None).expect_err(flag);
+            let err = BenchConfig::resolve(argv, test_env, Mode::Measure).expect_err(flag);
             let message = format!("{err:#}");
             assert!(message.contains(wanted), "--{flag}: {message}");
             assert!(message.contains(&format!("--{flag} / {env}")), "{message}");
 
             // A shell that exports the name with no value is the same hazard.
-            let err = BenchConfig::resolve(fixture.args.clone(), |name| {
-                (name == env).then(OsString::new)
-            })
+            let err = BenchConfig::resolve(
+                fixture.args.clone(),
+                |name| {
+                    if name == env {
+                        Some(OsString::new())
+                    } else {
+                        test_env(name)
+                    }
+                },
+                Mode::Measure,
+            )
             .expect_err(env);
             let message = format!("{err:#}");
             assert!(message.contains(wanted), "{env}=: {message}");
@@ -1098,11 +1351,20 @@ mod tests {
         for (flag, env) in [
             (WAKE_THRESHOLDS.flag, WAKE_THRESHOLDS.env),
             (PHASES.flag, PHASES.env),
+            (VOICES.flag, VOICES.env),
         ] {
             let bytes = OsString::from_vec(vec![0xff, b'=']);
-            let err = BenchConfig::resolve(fixture.args.clone(), |name| {
-                (name == env).then(|| bytes.clone())
-            })
+            let err = BenchConfig::resolve(
+                fixture.args.clone(),
+                |name| {
+                    if name == env {
+                        Some(bytes.clone())
+                    } else {
+                        test_env(name)
+                    }
+                },
+                Mode::Measure,
+            )
             .expect_err(env);
             let message = format!("{err:#}");
             assert!(message.contains("is not UTF-8 text"), "{env}: {message}");
@@ -1117,15 +1379,78 @@ mod tests {
         let fixture = Fixture::new("inputs-empty");
         let mut argv = fixture.args.clone();
         argv.push("--timeout=".to_string());
-        let cfg = BenchConfig::resolve(argv, |_| None).expect("an empty timeout is absent");
+        let cfg = BenchConfig::resolve(argv, test_env, Mode::Measure)
+            .expect("an empty timeout is absent");
         assert_eq!(cfg.timeout_secs, DEFAULT_TIMEOUT_SECS);
 
         let mut argv = fixture.args.clone();
         argv.push("--voice=".to_string());
-        let err = BenchConfig::resolve(argv, |_| None).expect_err("an empty voice");
+        let err = BenchConfig::resolve(argv, test_env, Mode::Measure).expect_err("an empty voice");
         assert!(
             format!("{err:#}").contains("is required"),
             "an empty path reads as not given: {err:#}"
+        );
+    }
+
+    /// The corpus build is not a measurement: it names no report, takes no
+    /// measurement aid (all of which would be accepted and ignored), and a
+    /// measurement still requires its report.
+    #[test]
+    fn the_build_takes_no_measurement_aid() {
+        let fixture = Fixture::new("mode");
+        let err = BenchConfig::resolve(fixture.without("report"), test_env, Mode::Measure)
+            .expect_err("a measurement names its report");
+        assert!(format!("{err:#}").contains("--report"), "{err:#}");
+        let cfg = BenchConfig::resolve(fixture.without("report"), test_env, Mode::Build)
+            .expect("the build");
+        assert!(cfg.report.is_none());
+
+        for argv in [
+            args(&[("report", "/tmp/report.json")]),
+            args(&[("voices", "3")]),
+            args(&[("phases", "recall")]),
+            args(&[("timeout", "600")]),
+            args(&[("wake-thresholds", "anchor=0.86")]),
+        ] {
+            let mut full = fixture.without("report");
+            full.extend(argv.clone());
+            let err = BenchConfig::resolve(full, test_env, Mode::Build).expect_err("an aid");
+            assert!(format!("{err:#}").contains("takes no"), "{argv:?}: {err:#}");
+        }
+        // The memory ceiling is a guard the build really carries, so it is a bound
+        // the build may be given — unlike the measurement's wall-clock stop.
+        let mut full = fixture.without("report");
+        full.extend(args(&[("max-rss", "8192")]));
+        assert_eq!(
+            BenchConfig::resolve(full, test_env, Mode::Build)
+                .expect("a build may raise its memory ceiling")
+                .max_rss_mib,
+            8_192
+        );
+    }
+
+    /// A raised swap-growth ceiling is a screening reason like the other bounds, so
+    /// no run can be recorded under one — and the ceiling is read from the same
+    /// environment the run was resolved from, not from the live process.
+    #[test]
+    fn a_raised_swap_bound_is_screened() {
+        assert!(!swap_bound_is_raised(crate::guard::MAX_SWAP_GROWTH_MIB));
+        assert!(swap_bound_is_raised(crate::guard::MAX_SWAP_GROWTH_MIB + 1));
+
+        let fixture = Fixture::new("swap");
+        let raised = |name: &str| {
+            if name == "MAHBOT_STAND_MAX_SWAP_MIB" {
+                Some(OsString::from("8192"))
+            } else {
+                test_env(name)
+            }
+        };
+        let cfg = BenchConfig::resolve(fixture.args.clone(), raised, Mode::Measure)
+            .expect("a run under a raised swap bound");
+        assert_eq!(cfg.swap_growth_mib, 8_192);
+        assert_eq!(
+            cfg.screened_reasons(),
+            vec!["the swap-growth bound is larger than the default"]
         );
     }
 
@@ -1134,7 +1459,57 @@ mod tests {
         let fixture = Fixture::new("timeout");
         let mut argv = fixture.args.clone();
         argv.push("--timeout=0".to_string());
-        let err = BenchConfig::resolve(argv, |_| None).expect_err("zero timeout");
+        let err = BenchConfig::resolve(argv, test_env, Mode::Measure).expect_err("zero timeout");
         assert!(format!("{err:#}").contains("--timeout"));
+    }
+
+    /// A voice count outside the pool's own range is refused, never clamped: a
+    /// clamped count would look like the eleven-voice measurement.
+    #[test]
+    fn a_voice_count_outside_the_pool_is_an_error() {
+        let fixture = Fixture::new("voices");
+        for value in ["0", "11", "ten"] {
+            let mut argv = fixture.args.clone();
+            argv.push(format!("--voices={value}"));
+            let err = BenchConfig::resolve(argv, test_env, Mode::Measure).expect_err(value);
+            assert!(format!("{err:#}").contains("--voices"), "{value}: {err:#}");
+        }
+    }
+
+    /// The benchmark is the shipped point over all three phases, all eleven
+    /// voices, inside the defaults — and nothing else is.
+    #[test]
+    fn only_the_full_run_inside_the_defaults_is_the_benchmark() {
+        let fixture = Fixture::new("screened");
+        let cfg = BenchConfig::resolve(fixture.args.clone(), test_env, Mode::Measure)
+            .expect("the defaults");
+        assert!(
+            cfg.screened_reasons().is_empty(),
+            "{:?}",
+            cfg.screened_reasons()
+        );
+
+        for argv in [
+            args(&[("voices", "3")]),
+            args(&[("phases", "recall")]),
+            args(&[("timeout", "7200")]),
+            args(&[("max-rss", "8192")]),
+            args(&[("wake-thresholds", "anchor=0.86")]),
+        ] {
+            let mut full = fixture.args.clone();
+            full.extend(argv.clone());
+            let cfg = BenchConfig::resolve(full, test_env, Mode::Measure).expect("a screening run");
+            assert_eq!(cfg.screened_reasons().len(), 1, "{argv:?}");
+        }
+
+        // A tighter bound is still the benchmark: it can only stop the run sooner.
+        let mut full = fixture.args.clone();
+        full.extend(args(&[("timeout", "600")]));
+        let cfg = BenchConfig::resolve(full, test_env, Mode::Measure).expect("a tighter bound");
+        assert!(
+            cfg.screened_reasons().is_empty(),
+            "{:?}",
+            cfg.screened_reasons()
+        );
     }
 }

@@ -12,17 +12,21 @@
 //! against [`sets::DETECTION_NOISE_SEED_BASE`]) — no waveform is both
 //! calibration material and measurement material.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 
 use crate::listen::Listener;
+use crate::loader::Pair;
 use crate::synth::Synthesis;
 
+use super::config::Refused;
+use super::voices::Speaker;
 use super::{detect, sets};
 use crate::guard::{Deadline, MemoryCeiling};
 use crate::measurements::hex;
@@ -30,23 +34,61 @@ use crate::measurements::hex;
 /// A noise generator: its seed band decides which set it renders for.
 pub(crate) type NoiseGenerator = fn(u64) -> Vec<f32>;
 
-/// What one run's synthesis cost: the clips asked for, how many came from the
-/// cache, and the wall time spent generating the rest.
+/// What one run has read from the corpus: how many clips it asked the cache for,
+/// how many of those it served, and the wall time it spent generating the rest.
+/// A counter of **reads**, not of the corpus: a run that reads one clip twice
+/// counts it twice, while the corpus size is what [`plan`] lists.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SynthStats {
-    pub clips: usize,
+    pub reads: usize,
     pub cache_hits: usize,
     pub synth_secs: f64,
 }
+
+impl SynthStats {
+    /// The clips this run rendered, out of the ones it read.
+    pub(crate) fn rendered(&self) -> usize {
+        self.reads - self.cache_hits
+    }
+}
+
+/// What a cache miss does: the build renders it, a measurement stops and names it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Missing {
+    Render,
+    Stop,
+}
+
+/// What a measurement tells an engineer who finds a clip missing: the one
+/// instruction, worded once, for both the pre-flight and the per-clip refusal.
+pub(crate) const BUILD_FIRST: &str = "a measurement never renders, and a corpus build does: \
+     `cargo run --release -p mahbot-inference --features bench --bin wake-word-build -- <the same \
+     model, voice and corpus inputs>`";
 
 /// One synthesised-and-cached TTS front end. It owns the run's guards so a
 /// cache miss — the only phase that can be long — stops at the next clip.
 /// The resident-set check runs per clip; the system figures (two subprocesses)
 /// stay at the phase boundaries the caller checks.
+///
+/// One pipeline is resident at a time and it is built on demand: a warm corpus
+/// synthesizes nothing, and a run that walks eleven voices drops one voice's
+/// graphs before building the next.
 pub(crate) struct Synth {
-    inner: Synthesis,
+    pair: Arc<Pair>,
+    /// The enrolled reference the owner's renders are built from.
+    voice: PathBuf,
     cache: PathBuf,
     synthesis_hash: String,
+    /// What a cache miss does: the build renders it, a measurement stops and names
+    /// what the build owes it, so a measurement never turns into a synthesis.
+    missing: Missing,
+    /// The pipeline that is resident, under the speaker it was built for:
+    /// `None` while nothing has been synthesized this run.
+    pipeline: Option<(Option<String>, Synthesis)>,
+    /// Every clip key this run touched — hits and renders. With the span cuts the
+    /// selection named it is what the build's record claims, and so what the next
+    /// build's sweep may reclaim.
+    live: HashSet<String>,
     deadline: Deadline,
     ceiling: MemoryCeiling,
     progress: Arc<Mutex<super::Progress>>,
@@ -54,27 +96,105 @@ pub(crate) struct Synth {
 
 impl Synth {
     pub(crate) fn new(
-        inner: Synthesis,
+        pair: Arc<Pair>,
+        voice: PathBuf,
         cache: PathBuf,
         synthesis_hash: String,
+        missing: Missing,
         progress: Arc<Mutex<super::Progress>>,
         deadline: Deadline,
         ceiling: MemoryCeiling,
     ) -> Self {
         Self {
-            inner,
+            pair,
+            voice,
             cache,
             synthesis_hash,
+            missing,
+            pipeline: None,
+            live: HashSet::new(),
             progress,
             deadline,
             ceiling,
         }
     }
 
-    /// One utterance at the listening rate (16 kHz). The sound half renders at
-    /// [`crate::synth::SAMPLE_RATE`]; every listening path resamples.
-    pub(crate) fn clip(&mut self, text: &str, seed: u64) -> Result<Vec<f32>> {
-        let pcm = self.pcm(text, seed)?;
+    /// Whether this run renders a miss (the build) or stops on it (a measurement).
+    pub(crate) fn renders(&self) -> bool {
+        self.missing == Missing::Render
+    }
+
+    /// The clip keys this run touched — what the build's record claims beside its
+    /// span cuts.
+    pub(crate) fn live(&self) -> &HashSet<String> {
+        &self.live
+    }
+
+    /// How many of `requests` the cache does not hold whole, and the first few names —
+    /// the figure a measurement refuses to start on. A torn or truncated entry is not
+    /// a hit: the pre-flight reads each entry's header and length, so a broken clip
+    /// stops the run before it spends its setup instead of surfacing as a miss at read
+    /// time.
+    pub(crate) fn missing(&self, requests: &[Request]) -> (usize, Vec<String>) {
+        let mut missing = 0;
+        let mut first = Vec::new();
+        for request in requests {
+            let key = self.key(request);
+            if is_whole_entry(&self.cache.join(&key)) {
+                continue;
+            }
+            missing += 1;
+            if first.len() < 3 {
+                first.push(request.label());
+            }
+        }
+        (missing, first)
+    }
+
+    /// The one identity of a clip: text, seed, the sound half's rate, the generation
+    /// and the voice. The pre-flight, the sweep and the read all go through it, so it
+    /// has one composition.
+    fn key_of(&self, speaker: &Speaker, text: &str, seed: u64) -> String {
+        cache_key(
+            text,
+            seed,
+            crate::synth::SAMPLE_RATE,
+            &self.synthesis_hash,
+            speaker.cache_id().as_deref(),
+        )
+    }
+
+    fn key(&self, request: &Request) -> String {
+        self.key_of(&request.speaker, request.text, request.seed)
+    }
+
+    /// Whether this run has already touched the clip `request` names — a hit or a
+    /// render. The build skips those, so one clip is counted once.
+    pub(crate) fn touched(&self, request: &Request) -> bool {
+        self.live.contains(&self.key(request))
+    }
+
+    /// The corpus pre-flight. A measurement never renders: a cache short of what
+    /// the run needs stops it before it spends anything, naming the shortfall and
+    /// the build that fills it.
+    pub(crate) fn require_corpus(&self, requests: &[Request], what: &str) -> Result<()> {
+        let (missing, names) = self.missing(requests);
+        if missing == 0 {
+            return Ok(());
+        }
+        bail!(
+            "the corpus cache is short {missing} of the {} clips in {what} — {BUILD_FIRST}. \
+             Missing: {}",
+            requests.len(),
+            names.join(", ")
+        )
+    }
+
+    /// One utterance in `speaker`'s voice at the listening rate (16 kHz). The
+    /// sound half renders at [`crate::synth::SAMPLE_RATE`]; every listening path
+    /// resamples.
+    pub(crate) fn clip(&mut self, speaker: &Speaker, text: &str, seed: u64) -> Result<Vec<f32>> {
+        let pcm = self.pcm(speaker, text, seed)?;
         Ok(crate::host::resample(
             &pcm,
             crate::synth::SAMPLE_RATE,
@@ -84,36 +204,158 @@ impl Synth {
 
     /// The synthesised waveform at the sound half's own rate (24 kHz), from the
     /// cache when its key is present.
-    fn pcm(&mut self, text: &str, seed: u64) -> Result<Vec<f32>> {
+    fn pcm(&mut self, speaker: &Speaker, text: &str, seed: u64) -> Result<Vec<f32>> {
         // The phase is the one the caller recorded: a stop here has to name a
         // key the report's `phases` map carries (`enrolment`, `recall synthesis`,
-        // `non-phrase synthesis`), not a generic "synthesis".
+        // `non-phrase synthesis`, `voices`), not a generic "synthesis".
         let phase = super::state(&self.progress).current;
         self.deadline.check(phase)?;
         self.ceiling.check_process(phase)?;
-        let key = cache_key(text, seed, crate::synth::SAMPLE_RATE, &self.synthesis_hash);
-        let path = self.cache.join(key);
+        let key = self.key_of(speaker, text, seed);
+        let path = self.cache.join(&key);
         if let Some(samples) = read_cache(&path) {
+            self.live.insert(key);
             let mut progress = super::state(&self.progress);
-            progress.synthesis.clips += 1;
+            progress.synthesis.reads += 1;
             progress.synthesis.cache_hits += 1;
             return Ok(samples);
         }
+        if self.missing == Missing::Stop {
+            bail!(
+                "the corpus clip `{text}` seed {seed} in {} is not in {} — {BUILD_FIRST}",
+                speaker.name(),
+                self.cache.display()
+            );
+        }
         let started = std::time::Instant::now();
-        let samples = self
-            .inner
-            .synthesize(text, seed)
-            .with_context(|| format!("synthesis failed for `{text}` seed {seed}"))?;
+        let synthesized = {
+            let pipeline = self.pipeline(speaker)?;
+            pipeline.synthesize(text, seed)
+        };
+        let samples = synthesized.with_context(|| {
+            format!(
+                "synthesis failed for `{text}` seed {seed} in {}",
+                speaker.name()
+            )
+        })?;
         let elapsed = started.elapsed().as_secs_f64();
         // The disk write happens before the progress lock is taken: the guard
         // thread reads its phase and its counters through that lock, and a slow
         // write must not be able to delay the wall-clock stop.
-        write_cache(&path, &samples)?;
+        write_cache(&path, &samples).with_context(|| {
+            format!(
+                "cannot write the corpus clip `{text}` seed {seed} in {} to {}",
+                speaker.name(),
+                path.display()
+            )
+        })?;
+        self.live.insert(key);
         let mut progress = super::state(&self.progress);
-        progress.synthesis.clips += 1;
+        progress.synthesis.reads += 1;
         progress.synthesis.synth_secs += elapsed;
         Ok(samples)
     }
+
+    /// The pipeline for `speaker`, built on first use and replaced when the voice
+    /// changes. The previous one is dropped before the next is built, so two
+    /// checkpoints' graphs are never resident at once.
+    fn pipeline(&mut self, speaker: &Speaker) -> Result<&mut Synthesis> {
+        let wanted = speaker.cache_id();
+        let resident = self
+            .pipeline
+            .as_ref()
+            .is_some_and(|(built, _)| *built == wanted);
+        if !resident {
+            self.pipeline = None;
+            let path = speaker
+                .voice()
+                .map_or_else(|| self.voice.clone(), |voice| voice.wav.clone());
+            let built = Synthesis::new(Arc::clone(&self.pair), &path).with_context(|| {
+                format!("cannot build the synthesis path for {}", speaker.name())
+            })?;
+            self.pipeline = Some((wanted, built));
+        }
+        Ok(&mut self.pipeline.as_mut().expect("just built").1)
+    }
+}
+
+/// The file the build leaves beside the corpus: the generation it completed and
+/// what the render cost. A measurement states it, so a warm record cannot make the
+/// build look like nothing.
+pub(crate) const BUILD_MANIFEST: &str = "corpus-build.json";
+
+/// Record what the build just did. `builds`, `built` and `synthesis_secs` are the
+/// generation's totals over every build of it, so the recorded cost is not the last
+/// invocation's no-op; `last` is that invocation. Written atomically when the build
+/// completes, and again when a stop that rendered something claims its account.
+pub(crate) fn write_build_manifest(cache: &Path, manifest: &serde_json::Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(manifest)
+        .context("cannot serialise the corpus build's manifest")?;
+    super::write_atomic(&cache.join(BUILD_MANIFEST), |tmp| {
+        Ok(std::fs::write(tmp, text.as_bytes())?)
+    })
+}
+
+/// A whole-number cell of the manifest every build of a generation appends to, in the
+/// format that build writes it. The build's running totals and the record's cost row
+/// read counts through this one function, so the two cannot disagree.
+pub(crate) fn manifest_count(manifest: Option<&serde_json::Value>, key: &str) -> Option<u64> {
+    manifest
+        .and_then(|manifest| manifest.get(key))
+        .and_then(serde_json::Value::as_u64)
+}
+
+/// The manifest of the generation `synthesis_hash` names: `None` when the cache
+/// carries no manifest or one from another generation. A manifest that exists but
+/// cannot be interpreted — unreadable, not JSON, or naming no generation — is an
+/// error, never an absent one: writing over it from nothing would reset the
+/// generation's build totals and understate the cost the record carries.
+pub(crate) fn read_build_manifest(
+    cache: &Path,
+    synthesis_hash: &str,
+) -> Result<Option<serde_json::Value>, Refused> {
+    let path = cache.join(BUILD_MANIFEST);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            let why = format!("cannot be read ({error})");
+            return Err(Refused::new(anyhow::Error::new(error).context(refusal(
+                &path,
+                "build manifest",
+                why,
+            ))));
+        }
+    };
+    let manifest: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| refusal(&path, "build manifest", "does not parse as JSON"))?;
+    match manifest
+        .get("generation")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(generation) if generation == synthesis_hash => Ok(Some(manifest)),
+        // Another generation's manifest is not this build's business; one that names
+        // no generation at all is not any generation's, so it is refused like a
+        // corrupt one rather than written over.
+        Some(_) => Ok(None),
+        None => Err(Refused::new(anyhow!(refusal(
+            &path,
+            "build manifest",
+            "names no generation"
+        )))),
+    }
+}
+
+/// What a corpus file the run cannot interpret is refused with: each holds claims a
+/// rewrite from less than all of it would lose — the record every generation's corpus,
+/// the manifest a generation's build totals — so it is refused whole, never rewritten
+/// from nothing.
+fn refusal(path: &Path, noun: &str, why: impl std::fmt::Display) -> String {
+    format!(
+        "the corpus {noun} {} {why} — it is refused rather than rewritten from nothing, because \
+         what it records would be lost; move it aside to start a fresh one",
+        path.display()
+    )
 }
 
 /// Remove this run's own half-written cache entries, left by an earlier launch
@@ -132,10 +374,168 @@ pub(crate) fn clean_cache(dir: &Path) {
     }
 }
 
+/// Every generation's record of the corpus a completed build produced: one section
+/// per generation, headed by `generation <synthesis hash>` and then one cache entry
+/// per line — a clip's key or a span cut's file name. A section outlives its build
+/// until a later build reclaims the entries it claims, so a corpus superseded by a
+/// synthesis change is still claimed by a record.
+pub(crate) type Records = BTreeMap<String, HashSet<String>>;
+
+/// The record file's name. It lives beside the corpus and names nothing but cache
+/// entries, so the sweep never touches a file no record claims.
+pub(crate) const BUILD_KEYS: &str = "corpus-keys.txt";
+
+/// Write `generation`'s section from `produced`, plus every section in `survivors` —
+/// the records whose entries could not all be reclaimed. Atomic, and called only
+/// after the sweep.
+pub(crate) fn write_build_keys(
+    cache: &Path,
+    generation: &str,
+    produced: &HashSet<String>,
+    survivors: &Records,
+) -> Result<()> {
+    let mut records = survivors.clone();
+    records
+        .entry(generation.to_string())
+        .or_default()
+        .extend(produced.iter().cloned());
+    let mut text = String::new();
+    for (generation, entries) in &records {
+        text.push_str(&format!("generation {generation}\n"));
+        let mut lines: Vec<&str> = entries.iter().map(String::as_str).collect();
+        lines.sort_unstable();
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    super::write_atomic(&cache.join(BUILD_KEYS), |tmp| {
+        Ok(std::fs::write(tmp, text.as_bytes())?)
+    })
+}
+
+/// Every generation's record this cache carries; empty when no build has left one.
+///
+/// A record that exists but cannot be interpreted is an error, never an empty or a
+/// partial record: rewriting it from anything less than all of it would drop claims
+/// and orphan the corpora they name. A header with no entries is a record, not a
+/// broken one — the writer can emit it.
+pub(crate) fn read_build_keys(cache: &Path) -> Result<Records, Refused> {
+    let path = cache.join(BUILD_KEYS);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Records::new()),
+        Err(error) => {
+            let why = format!("cannot be read ({error})");
+            return Err(Refused::new(
+                anyhow::Error::new(error).context(refusal(&path, "record", why)),
+            ));
+        }
+    };
+    let mut records = Records::new();
+    let mut generation: Option<&str> = None;
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let Some(name) = line.strip_prefix("generation ") else {
+            let Some(generation) = generation else {
+                return Err(Refused::new(anyhow!(refusal(
+                    &path,
+                    "record",
+                    "carries an entry before its first generation header"
+                ))));
+            };
+            records
+                .entry(generation.to_string())
+                .or_default()
+                .insert(line.to_string());
+            continue;
+        };
+        generation = Some(name);
+        records.entry(name.to_string()).or_default();
+    }
+    Ok(records)
+}
+
+/// A count of entries the sweep cleared, as both printers state it: `1 superseded
+/// entry` / `N superseded entries`.
+pub(crate) fn superseded(entries: u64) -> String {
+    match entries {
+        1 => "1 superseded entry".to_string(),
+        entries => format!("{entries} superseded entries"),
+    }
+}
+
+/// Remove every corpus a recorded build has superseded: the entries any generation's
+/// record claims and this build did not produce. Returns how many entries were
+/// removed — `None` when the directory, or an entry in it, could not be read — and the
+/// records that must survive because an entry they claim is still on disk: a removal
+/// that failed keeps its generation recorded, so a later build retries instead of
+/// leaking the file. A sweep cut short keeps every record as a survivor, which may
+/// re-claim an entry this build already removed; it was not seen, so it is not
+/// forgotten, and the next build's sweep settles it. Nothing else is touched: a file
+/// no record names is kept, and so is a half-written entry ([`clean_cache`]'s).
+pub(crate) fn sweep(
+    dir: &Path,
+    produced: &HashSet<String>,
+    records: &Records,
+) -> (Option<u64>, Records) {
+    let mut claimed: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (generation, entries) in records {
+        for name in entries {
+            claimed
+                .entry(name.as_str())
+                .or_default()
+                .push(generation.as_str());
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // Nothing could be examined, so nothing may be forgotten: every record is a
+        // survivor and the next build retries.
+        return (None, records.clone());
+    };
+    let mut removed = 0u64;
+    let mut survivors = Records::new();
+    for entry in entries {
+        // A failed read is not an empty entry: its file may be one a record claims,
+        // and forgetting that claim would leave the file unreclaimable.
+        let Ok(entry) = entry else {
+            return (None, records.clone());
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(generations) = claimed.get(name.as_str()) else {
+            continue;
+        };
+        if produced.contains(&name) {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        } else {
+            for generation in generations {
+                survivors
+                    .entry((*generation).to_string())
+                    .or_default()
+                    .insert(name.clone());
+            }
+        }
+    }
+    (Some(removed), survivors)
+}
+
 /// Deterministic cache key for one synthesised utterance: text, seed, sample
 /// rate and the synthesis model's own hash — both TTS files' digests and the
 /// reference voice's, because the voice WAV is part of every prompt.
-fn cache_key(text: &str, seed: u64, sample_rate: u32, synthesis_hash: &str) -> String {
+///
+/// A clone voice adds its span's identity after the code hash. The enrolled
+/// voice passes none, so its key is the one its cached renders were stored under
+/// and they stay valid; no clone can be served another voice's audio — or the
+/// owner's.
+fn cache_key(
+    text: &str,
+    seed: u64,
+    sample_rate: u32,
+    synthesis_hash: &str,
+    voice: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     hasher.update([0u8]);
@@ -144,6 +544,10 @@ fn cache_key(text: &str, seed: u64, sample_rate: u32, synthesis_hash: &str) -> S
     hasher.update(sample_rate.to_le_bytes());
     hasher.update([0u8]);
     hasher.update(synthesis_hash.as_bytes());
+    if let Some(voice) = voice {
+        hasher.update([0u8]);
+        hasher.update(voice.as_bytes());
+    }
     hex(&hasher.finalize())
 }
 
@@ -161,6 +565,29 @@ fn read_cache(path: &Path) -> Option<Vec<f32>> {
     }
 }
 
+/// Whether `path` is a whole cache entry, from its header and its file length alone.
+/// The pre-flight's version of [`decode_cache`]: a torn entry is a miss before the run
+/// starts, without reading the samples it claims. One open, so the header and the
+/// length are the same file's even if the entry is replaced concurrently.
+fn is_whole_entry(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let mut header = [0u8; 8];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    let count = u64::from_le_bytes(header);
+    count
+        .checked_mul(4)
+        .and_then(|bytes| 8u64.checked_add(bytes))
+        == Some(meta.len())
+}
+
 /// The entry's shape, or `None` when the bytes are not one.
 fn decode_cache(data: &[u8]) -> Option<Vec<f32>> {
     let count = u64::from_le_bytes(data.get(..8)?.try_into().ok()?);
@@ -176,12 +603,11 @@ fn decode_cache(data: &[u8]) -> Option<Vec<f32>> {
     )
 }
 
-/// Atomic write: a unique temporary file in the cache directory, flushed to the
-/// device before the rename, so a crash leaves either the old entry or the new
-/// one and never a half-written clip.
+/// A cache entry, written through [`super::write_atomic`] — flushed before the rename,
+/// so a crash leaves either the old entry or the new one and never a half-written clip.
 ///
 /// The corpus is the run's durable artifact, so a cache that cannot be written
-/// is an error: silently re-synthesizing all 394 clips on every run is how the
+/// is an error: silently re-synthesizing the whole corpus on every run is how the
 /// bench spent hours producing nothing reusable.
 fn write_cache(path: &Path, samples: &[f32]) -> Result<()> {
     let mut data = Vec::with_capacity(8 + samples.len() * 4);
@@ -189,29 +615,7 @@ fn write_cache(path: &Path, samples: &[f32]) -> Result<()> {
     for &sample in samples {
         data.extend_from_slice(&sample.to_le_bytes());
     }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let written = (|| -> std::io::Result<()> {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&data)?;
-        file.sync_all()
-    })();
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error)
-            .with_context(|| format!("cannot write the corpus clip {}", tmp.display()));
-    }
-    if let Err(error) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error).with_context(|| {
-            format!(
-                "cannot move the corpus clip {} into place at {}",
-                tmp.display(),
-                path.display()
-            )
-        });
-    }
-    Ok(())
+    super::write_atomic(path, |tmp| Ok(std::fs::write(tmp, &data)?))
 }
 
 // ── Guided-prompt DSP conditioning ────────────────────────────────────────
@@ -692,143 +1096,384 @@ pub(crate) fn pulsed_broadband_noise(seed: u64) -> Vec<f32> {
 
 // ── Clip construction ─────────────────────────────────────────────────────
 
-/// The ten conditioned enrolment clips: one seeded rendering of the wake
-/// phrase each, conditioned by [`condition_enrollment_clip`].
-pub(crate) fn enrollment_clips(synth: &mut Synth) -> Result<Vec<(Vec<f32>, String)>> {
-    let mut clips = Vec::with_capacity(sets::NUM_ENROLLMENT_VARIANTS);
-    for i in 0..sets::NUM_ENROLLMENT_VARIANTS {
-        let seed = sets::ENROLLMENT_SEED_BASE + i as u64;
-        let pcm = synth.clip(sets::WAKE_PHRASE, seed)?;
-        clips.push((
-            condition_enrollment_clip(&pcm, i),
-            format!("enroll{i}_s{seed}"),
-        ));
-    }
-    Ok(clips)
+/// One measured clip, named by the stream it belongs to.
+pub(crate) struct Clip {
+    pub samples: Vec<f32>,
+    /// Unique across the run: the stream it belongs to is part of it, so a
+    /// missed or fired list never needs a second lookup to name its voice.
+    pub label: String,
 }
 
-/// One clip per phrase, seeded `seed_base + index`.
-pub(crate) fn phrase_clips(
-    synth: &mut Synth,
-    phrases: &[&str],
+/// The category a speech negative's row reports it under. Only the negative side
+/// has categories: positives and probes are not grouped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Category {
+    Confusable,
+    Unrelated,
+    PhraseInPassing,
+}
+
+impl Category {
+    /// The three categories a negative row states, in report order.
+    pub(crate) const SPEECH: [Self; 3] = [Self::Confusable, Self::Unrelated, Self::PhraseInPassing];
+
+    pub(crate) const fn key(self) -> &'static str {
+        match self {
+            Self::Confusable => "confusable",
+            Self::Unrelated => "unrelated",
+            Self::PhraseInPassing => "phrase_in_passing",
+        }
+    }
+
+    /// The words the record's tables use for the category.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Confusable => "phonetic near-misses",
+            Self::Unrelated => "unrelated sentences",
+            Self::PhraseInPassing => "wake phrase inside a sentence",
+        }
+    }
+
+    /// This category's slot in [`Self::SPEECH`].
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Confusable => 0,
+            Self::Unrelated => 1,
+            Self::PhraseInPassing => 2,
+        }
+    }
+}
+
+/// One clip a measurement needs: the speaker it is rendered in, the text, the
+/// seed, the tag its label carries, and — for the owner's non-wake speech — the
+/// SNR its second, noisy embedding is scored at.
+///
+/// One list drives the corpus build and the measurement's own clip construction,
+/// so a seed, a label or a phrase cannot drift between what is rendered and what
+/// is scored. The measurement never renders: it asks the cache, and a miss is a
+/// stop naming the clip the build owes it.
+pub(crate) struct Request {
+    pub speaker: Speaker,
+    pub text: &'static str,
+    pub seed: u64,
+    pub tag: &'static str,
+    /// `Some(snr_db)` when the clip contributes a second embedding under brown
+    /// noise at that SNR — the owner-negative cell of the calibration pool.
+    pub noise_snr_db: Option<f32>,
+}
+
+impl Request {
+    /// The clip's name inside its stream: `voice03/confusable_s800`.
+    pub(crate) fn label(&self) -> String {
+        format!("{}/{}_s{}", self.speaker.name(), self.tag, self.seed)
+    }
+}
+
+/// `seeds_per_phrase` requests per phrase, seeded `seed_base + phrase·n + variant`.
+fn phrase_requests(
+    speaker: &Speaker,
+    phrases: &[&'static str],
+    seeds_per_phrase: usize,
     seed_base: u64,
-    tag: &str,
-) -> Result<Vec<(Vec<f32>, String)>> {
-    phrases
+    tag: &'static str,
+) -> Vec<Request> {
+    let mut requests = Vec::with_capacity(phrases.len() * seeds_per_phrase);
+    for (index, phrase) in phrases.iter().enumerate() {
+        for variant in 0..seeds_per_phrase {
+            requests.push(Request {
+                speaker: speaker.clone(),
+                text: phrase,
+                seed: seed_base + (index * seeds_per_phrase + variant) as u64,
+                tag,
+                noise_snr_db: None,
+            });
+        }
+    }
+    requests
+}
+
+/// One seeded rendering per phrase, seeded `seed_base + index`.
+fn one_per_phrase(
+    speaker: &Speaker,
+    phrases: &[&'static str],
+    seed_base: u64,
+    tag: &'static str,
+) -> Vec<Request> {
+    phrase_requests(speaker, phrases, 1, seed_base, tag)
+}
+
+/// The two intelligibility probes of one voice: the list the build renders, the
+/// measurement pre-flights and the check scores.
+pub(crate) fn probe_requests(speaker: &Speaker) -> Vec<Request> {
+    sets::INTELLIGIBILITY_SENTENCES
         .iter()
         .enumerate()
-        .map(|(i, phrase)| {
-            let seed = seed_base + i as u64;
-            Ok((synth.clip(phrase, seed)?, format!("{tag}_s{seed}")))
+        .map(|(index, text)| Request {
+            speaker: speaker.clone(),
+            text,
+            seed: sets::INTELLIGIBILITY_SEED_BASE + index as u64,
+            tag: "probe",
+            noise_snr_db: None,
         })
         .collect()
 }
 
-/// The recall set: 40 bare wake-phrase clips plus 10 command-plus-speech clips.
-pub(crate) fn recall_clips(synth: &mut Synth) -> Result<Vec<(Vec<f32>, String)>> {
-    let mut clips = Vec::with_capacity(
-        sets::HELD_OUT_WAKE_ONLY_CLIPS + sets::COMMAND_PLUS_SPEECH_PHRASES.len(),
+/// The enrolment: ten seeded renders of the wake phrase in the enrolled voice.
+pub(crate) fn enrolment_variants() -> Vec<Request> {
+    (0..sets::NUM_ENROLLMENT_VARIANTS)
+        .map(|i| Request {
+            speaker: Speaker::Enrolled,
+            text: sets::WAKE_PHRASE,
+            seed: sets::ENROLLMENT_SEED_BASE + i as u64,
+            tag: "enroll",
+            noise_snr_db: None,
+        })
+        .collect()
+}
+
+/// The calibration pool: the enrolled voice's non-wake speech (scored twice, the
+/// second time under brown noise at [`sets::OWNER_NEGATIVE_SNR_DB`]), then the
+/// confusable and unrelated bands.
+pub(crate) fn calibration_requests() -> Vec<Request> {
+    let mut requests = phrase_requests(
+        &Speaker::Enrolled,
+        sets::OWNER_NEGATIVE_PHRASES,
+        sets::OWNER_NEGATIVE_SEEDS_PER_PHRASE,
+        sets::OWNER_NEGATIVE_SEED_BASE,
+        "owner",
     );
-    for i in 0..sets::HELD_OUT_WAKE_ONLY_CLIPS {
-        let seed = sets::HELD_OUT_SEED_BASE + i as u64;
-        clips.push((
-            synth.clip(sets::WAKE_PHRASE, seed)?,
-            format!("heldout_wake_s{seed}"),
-        ));
+    for request in &mut requests {
+        request.noise_snr_db = Some(sets::OWNER_NEGATIVE_SNR_DB);
     }
-    clips.extend(phrase_clips(
-        synth,
+    requests.extend(phrase_requests(
+        &Speaker::Enrolled,
+        sets::CONFUSABLE_PHRASES,
+        sets::CONFUSABLE_SEEDS_PER_PHRASE,
+        sets::CONFUSABLE_SEED_BASE,
+        "confusable",
+    ));
+    requests.extend(phrase_requests(
+        &Speaker::Enrolled,
+        sets::UNRELATED_PHRASES,
+        sets::UNRELATED_SEEDS_PER_PHRASE,
+        sets::UNRELATED_SEED_BASE,
+        "unrelated",
+    ));
+    requests
+}
+
+/// Everything the enrolment phase reads: its ten variants and its calibration pool.
+pub(crate) fn enrolment_requests() -> Vec<Request> {
+    let mut requests = enrolment_variants();
+    requests.extend(calibration_requests());
+    requests
+}
+
+/// One voice's positives: 40 bare wake-phrase renders and 10 with a command.
+pub(crate) fn positive_requests(speaker: &Speaker) -> Vec<Request> {
+    let mut requests: Vec<Request> = (0..sets::HELD_OUT_WAKE_ONLY_CLIPS)
+        .map(|i| Request {
+            speaker: speaker.clone(),
+            text: sets::WAKE_PHRASE,
+            seed: sets::HELD_OUT_SEED_BASE + i as u64,
+            tag: "heldout_wake",
+            noise_snr_db: None,
+        })
+        .collect();
+    requests.extend(one_per_phrase(
+        speaker,
         sets::COMMAND_PLUS_SPEECH_PHRASES,
         sets::COMMAND_PLUS_SPEECH_SEED_BASE,
         "command_other",
-    )?);
-    Ok(clips)
+    ));
+    requests
 }
 
-/// The 121-clip false-reaction set, in a fixed order: confusable bands,
-/// unrelated bands, silence, noise profiles, then phrase-in-passing.
-pub(crate) fn non_phrase_clips(synth: &mut Synth) -> Result<Vec<(Vec<f32>, String)>> {
-    let mut clips = Vec::new();
+/// One voice's speech negatives, in report order — the two confusable bands, the
+/// two unrelated bands, then phrase-in-passing — each tagged with the category its
+/// row states.
+pub(crate) fn negative_requests(speaker: &Speaker) -> Vec<(Category, Request)> {
+    let mut requests: Vec<(Category, Request)> = Vec::with_capacity(sets::SPEECH_NEGATIVE_CLIPS);
     for &(band, tag) in sets::CONFUSABLE_BANDS {
-        clips.extend(phrase_clips(synth, sets::CONFUSABLE_PHRASES, band, tag)?);
+        requests.extend(category_band(
+            speaker,
+            sets::CONFUSABLE_PHRASES,
+            band,
+            tag,
+            Category::Confusable,
+        ));
     }
     for &(band, tag) in sets::UNRELATED_BANDS {
-        clips.extend(phrase_clips(synth, sets::UNRELATED_PHRASES, band, tag)?);
+        requests.extend(category_band(
+            speaker,
+            sets::UNRELATED_PHRASES,
+            band,
+            tag,
+            Category::Unrelated,
+        ));
     }
-    for &(label, len) in sets::SILENCE_DURATIONS {
-        clips.push((vec![0.0f32; len], label.to_string()));
-    }
-    for (i, (label, generator)) in sets::all_noise_profiles().enumerate() {
-        let seed = sets::DETECTION_NOISE_SEED_BASE + i as u64;
-        clips.push((generator(seed), format!("{label}_s{seed}")));
-    }
-    clips.extend(phrase_clips(
-        synth,
+    requests.extend(category_band(
+        speaker,
         sets::PHRASE_IN_PASSING_PHRASES,
         sets::PHRASE_IN_PASSING_SEED_BASE,
         "phrase_in_passing",
-    )?);
+        Category::PhraseInPassing,
+    ));
+    requests
+}
+
+/// One seeded rendering per phrase, each tagged with the category its row states.
+fn category_band(
+    speaker: &Speaker,
+    phrases: &[&'static str],
+    seed_base: u64,
+    tag: &'static str,
+    category: Category,
+) -> Vec<(Category, Request)> {
+    one_per_phrase(speaker, phrases, seed_base, tag)
+        .into_iter()
+        .map(|request| (category, request))
+        .collect()
+}
+
+/// Everything a measurement over `speakers` needs: the enrolled voice's enrolment
+/// and calibration clips, and — for the phases it runs — each voice's probes,
+/// positives and speech negatives. A screening run asks the corpus only for what it
+/// reads.
+pub(crate) fn plan(speakers: &[Speaker], phases: super::config::Phases) -> Vec<Request> {
+    let mut requests = enrolment_requests();
+    for speaker in speakers {
+        requests.extend(probe_requests(speaker));
+        if phases.recall {
+            requests.extend(positive_requests(speaker));
+        }
+        if phases.non_phrase {
+            requests.extend(
+                negative_requests(speaker)
+                    .into_iter()
+                    .map(|(_, request)| request),
+            );
+        }
+    }
+    requests
+}
+
+/// The enrolled voice's enrolment clips, conditioned by
+/// [`condition_enrollment_clip`].
+pub(crate) fn enrollment_clips(synth: &mut Synth) -> Result<Vec<Clip>> {
+    let requests = enrolment_variants();
+    let mut clips = Vec::with_capacity(requests.len());
+    for (index, request) in requests.iter().enumerate() {
+        let pcm = synth.clip(&request.speaker, request.text, request.seed)?;
+        clips.push(Clip {
+            samples: condition_enrollment_clip(&pcm, index),
+            label: request.label(),
+        });
+    }
+    Ok(clips)
+}
+
+/// One clip per request, in request order.
+pub(crate) fn clips(synth: &mut Synth, requests: &[Request]) -> Result<Vec<Clip>> {
+    requests
+        .iter()
+        .map(|request| {
+            Ok(Clip {
+                samples: synth.clip(&request.speaker, request.text, request.seed)?,
+                label: request.label(),
+            })
+        })
+        .collect()
+}
+
+/// One voice's positives.
+pub(crate) fn recall_clips(synth: &mut Synth, speaker: &Speaker) -> Result<Vec<Clip>> {
+    let clips = clips(synth, &positive_requests(speaker))?;
     anyhow::ensure!(
-        clips.len() == sets::EXPECTED_NON_PHRASE_TOTAL,
-        "the non-phrase set built {} clips, not the pinned {}",
+        clips.len() == sets::POSITIVE_CLIPS,
+        "the positive set built {} clips, not the pinned {}",
         clips.len(),
-        sets::EXPECTED_NON_PHRASE_TOTAL
+        sets::POSITIVE_CLIPS
+    );
+    Ok(clips)
+}
+
+/// One voice's speech negatives, each with the category its row reports it under.
+pub(crate) fn speech_negatives(
+    synth: &mut Synth,
+    speaker: &Speaker,
+) -> Result<Vec<(Category, Clip)>> {
+    let requests = negative_requests(speaker);
+    let mut clips = Vec::with_capacity(requests.len());
+    for (category, request) in &requests {
+        clips.push((
+            *category,
+            Clip {
+                samples: synth.clip(&request.speaker, request.text, request.seed)?,
+                label: request.label(),
+            },
+        ));
+    }
+    anyhow::ensure!(
+        clips.len() == sets::SPEECH_NEGATIVE_CLIPS,
+        "a voice's speech negatives built {} clips, not the pinned {}",
+        clips.len(),
+        sets::SPEECH_NEGATIVE_CLIPS
+    );
+    Ok(clips)
+}
+
+/// The non-speech negatives, in a fixed order: digital silence, then the noise
+/// profiles. Their stream has no voice.
+pub(crate) fn non_speech_clips() -> Result<Vec<Clip>> {
+    let mut clips = Vec::with_capacity(sets::NON_SPEECH_CLIPS);
+    for &(label, len) in sets::SILENCE_DURATIONS {
+        clips.push(Clip {
+            samples: vec![0.0f32; len],
+            label: format!("non-speech/{label}"),
+        });
+    }
+    for (i, (label, generator)) in sets::all_noise_profiles().enumerate() {
+        let seed = sets::DETECTION_NOISE_SEED_BASE + i as u64;
+        clips.push(Clip {
+            samples: generator(seed),
+            label: format!("non-speech/{label}_s{seed}"),
+        });
+    }
+    anyhow::ensure!(
+        clips.len() == sets::NON_SPEECH_CLIPS,
+        "the non-speech set built {} clips, not the pinned {}",
+        clips.len(),
+        sets::NON_SPEECH_CLIPS
     );
     Ok(clips)
 }
 
 // ── Calibration negatives ────────────────────────────────────────────────
 
-/// Owner negatives: the enrolled voice's non-wake speech, VAD-gated, plus one
-/// brown-noise-at-[`sets::OWNER_NEGATIVE_SNR_DB`] embedding per cell.
-pub(crate) fn owner_negatives(
+/// The calibration pool's embeddings, from [`calibration_requests`]: one per
+/// request, plus the noisy second embedding of every band that names an SNR. A
+/// clip the VAD gate finds no speech in is skipped and named — a quiet render is a
+/// property of the model and the seed, not a reason to abandon the run.
+pub(crate) fn calibration_negatives(
     synth: &mut Synth,
     listener: &mut Listener,
-    skipped: &mut Vec<String>,
-) -> Result<Vec<Vec<f32>>> {
-    phrase_negatives(
-        synth,
-        listener,
-        sets::OWNER_NEGATIVE_PHRASES,
-        sets::OWNER_NEGATIVE_SEEDS_PER_PHRASE,
-        sets::OWNER_NEGATIVE_SEED_BASE,
-        "owner",
-        Some(sets::OWNER_NEGATIVE_SNR_DB),
-        skipped,
-    )
-}
-
-/// Phrase negatives: `seeds_per_phrase` VAD-gated renderings per phrase, each
-/// embedded once — and, when `noise_snr_db` is given, a second time under brown
-/// noise at that SNR.
-pub(crate) fn phrase_negatives(
-    synth: &mut Synth,
-    listener: &mut Listener,
-    phrases: &[&str],
-    seeds_per_phrase: usize,
-    seed_base: u64,
-    tag: &str,
-    noise_snr_db: Option<f32>,
     skipped: &mut Vec<String>,
 ) -> Result<Vec<Vec<f32>>> {
     let mut embeddings = Vec::new();
-    for (i, phrase) in phrases.iter().enumerate() {
-        for variant in 0..seeds_per_phrase {
-            let seed = seed_base + (i * seeds_per_phrase + variant) as u64;
-            let pcm = synth.clip(phrase, seed)?;
-            let speech = detect::vad_gate(&pcm, &mut earshot::Detector::default());
-            if speech.is_empty() {
-                eprintln!(
-                    "[wake-word] {tag} negative `{phrase}` seed {seed}: no VAD-positive speech — skipped"
-                );
-                skipped.push(format!("{tag} `{phrase}` seed {seed}"));
-                continue;
-            }
-            embeddings.push(listener.embed(&speech)?);
-            if let Some(snr_db) = noise_snr_db {
-                let noisy = add_noise_color(&speech, snr_db, NoiseColor::Brown, seed);
-                embeddings.push(listener.embed(&noisy)?);
-            }
+    for request in calibration_requests() {
+        let pcm = synth.clip(&request.speaker, request.text, request.seed)?;
+        let speech = detect::vad_gate(&pcm, &mut earshot::Detector::default());
+        if speech.is_empty() {
+            let label = request.label();
+            eprintln!("[wake-word] {label}: no VAD-positive speech — skipped");
+            skipped.push(label);
+            continue;
+        }
+        embeddings.push(listener.embed(&speech)?);
+        if let Some(snr_db) = request.noise_snr_db {
+            let noisy = add_noise_color(&speech, snr_db, NoiseColor::Brown, request.seed);
+            embeddings.push(listener.embed(&noisy)?);
         }
     }
     Ok(embeddings)
@@ -863,6 +1508,18 @@ mod tests {
 
     fn ramp(n: usize) -> Vec<f32> {
         (0..n).map(|i| (i as f32 / n as f32) * 2.0 - 1.0).collect()
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mahbot-wake-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
     }
 
     /// The cache is shared by every run that shares the directory, and the lock
@@ -922,34 +1579,228 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_key_covers_text_seed_rate_and_model() {
-        let base = cache_key("hey mahbot", 7, 24_000, "model");
-        assert_eq!(base, cache_key("hey mahbot", 7, 24_000, "model"));
-        assert_ne!(base, cache_key("hey mahbot", 8, 24_000, "model"));
-        assert_ne!(base, cache_key("hey mahbot", 7, 16_000, "model"));
-        assert_ne!(base, cache_key("hey mahbot ", 7, 24_000, "model"));
-        assert_ne!(base, cache_key("hey mahbot", 7, 24_000, "other"));
+    fn the_cache_key_covers_text_seed_rate_model_and_voice() {
+        let base = cache_key("hey mahbot", 7, 24_000, "model", None);
+        assert_eq!(base, cache_key("hey mahbot", 7, 24_000, "model", None));
+        assert_ne!(base, cache_key("hey mahbot", 8, 24_000, "model", None));
+        assert_ne!(base, cache_key("hey mahbot", 7, 16_000, "model", None));
+        assert_ne!(base, cache_key("hey mahbot ", 7, 24_000, "model", None));
+        assert_ne!(base, cache_key("hey mahbot", 7, 24_000, "other", None));
         assert_eq!(base.len(), 64);
+
+        // The enrolled voice's key is byte for byte the historical one, so the
+        // renders already cached under it stay valid; a clone adds its own span
+        // and no two voices share an entry.
+        let clone_a = cache_key("hey mahbot", 7, 24_000, "model", Some("a:0.00:15.00"));
+        let clone_b = cache_key("hey mahbot", 7, 24_000, "model", Some("b:0.00:15.00"));
+        assert_ne!(base, clone_a);
+        assert_ne!(clone_a, clone_b);
+        assert_eq!(
+            clone_a,
+            cache_key("hey mahbot", 7, 24_000, "model", Some("a:0.00:15.00"))
+        );
     }
 
     #[test]
     fn the_cache_round_trips_and_rejects_a_torn_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "mahbot-wake-cache-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = temp_dir("cache");
         let path = dir.join("entry");
         let samples = vec![0.0f32, 0.5, -0.25, 1.0];
         write_cache(&path, &samples).expect("write");
+        assert!(is_whole_entry(&path), "a whole entry passes the pre-flight");
         assert_eq!(read_cache(&path).expect("hit"), samples);
 
         std::fs::write(&path, [0u8; 6]).expect("torn");
+        assert!(!is_whole_entry(&path), "a truncated entry is a miss");
         assert!(read_cache(&path).is_none());
         assert!(!path.exists(), "a torn entry is deleted");
+
+        // A header whose count disagrees with the file is not whole either.
+        let mut lying = 8u64.to_le_bytes().to_vec();
+        lying.extend_from_slice(&1.0f32.to_le_bytes());
+        lying.extend_from_slice(&2.0f32.to_le_bytes());
+        std::fs::write(&path, &lying).expect("short for its count");
+        assert!(
+            !is_whole_entry(&path),
+            "a count longer than the file is a miss"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The record the sweep reads back: a completed build's section survives for its
+    /// own generation, a superseded generation's entries are reclaimed only by a
+    /// completed build, and a record written after that reclaim keeps the survivor.
+    #[test]
+    fn the_build_record_survives_for_its_generation_and_a_superseded_one_is_reclaimed() {
+        let dir = temp_dir("keys");
+        let old_clip = "a".repeat(64);
+        let new_clip = "b".repeat(64);
+        let span = "voice-0123456789abcdef-11.40-15.00-16000.wav".to_string();
+        for name in [&old_clip, &new_clip, &span] {
+            std::fs::write(dir.join(name), b"x").expect("a cache entry");
+        }
+        let first = HashSet::from([old_clip.clone(), span.clone()]);
+        write_build_keys(&dir, "gen-1", &first, &Records::new()).expect("write the record");
+        assert_eq!(
+            read_build_keys(&dir).expect("the record"),
+            Records::from([("gen-1".to_string(), first.clone())]),
+            "a completed build's record survives for its own generation"
+        );
+
+        // The next build of another generation produces the shared span and its own
+        // clip; the sweep removes what only the earlier generation claimed. A build
+        // killed here would leave the file untouched, and the next build would see
+        // the same record.
+        let produced = HashSet::from([new_clip.clone(), span.clone()]);
+        let records = read_build_keys(&dir).expect("the record");
+        let (removed, survivors) = sweep(&dir, &produced, &records);
+        assert_eq!(removed, Some(1), "the superseded clip is reclaimed");
+        assert!(
+            survivors.is_empty(),
+            "nothing was left behind: {survivors:?}"
+        );
+        assert_eq!(
+            read_build_keys(&dir).expect("the record"),
+            records,
+            "the sweep writes nothing"
+        );
+        write_build_keys(&dir, "gen-2", &produced, &survivors).expect("write the record");
+        assert_eq!(
+            read_build_keys(&dir).expect("the record"),
+            Records::from([("gen-2".to_string(), produced)]),
+            "the reclaimed generation's section goes with its entries"
+        );
+        assert!(dir.join(&span).is_file(), "the shared span stays");
+
+        // A directory that cannot be read reclaims nothing and forgets nothing.
+        let unreadable = dir.join("not-a-directory");
+        std::fs::write(&unreadable, b"x").expect("a file where a directory is expected");
+        let kept = Records::from([("gen-1".to_string(), HashSet::from([old_clip.clone()]))]);
+        assert_eq!(
+            sweep(&unreadable, &HashSet::new(), &kept),
+            (None, kept.clone()),
+            "nothing examined, nothing forgotten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An entry whose removal fails stays recorded, so the next build retries it
+    /// instead of the file leaking. `remove_file` refuses a directory, which makes
+    /// the unlink fail without depending on permissions.
+    #[test]
+    fn an_entry_that_cannot_be_removed_stays_recorded() {
+        let dir = temp_dir("stuck");
+        let stuck = "a".repeat(64);
+        std::fs::create_dir_all(dir.join(&stuck)).expect("an entry that cannot be unlinked");
+        let records = Records::from([("gen-1".to_string(), HashSet::from([stuck.clone()]))]);
+        let (removed, survivors) = sweep(&dir, &HashSet::new(), &records);
+        assert_eq!(removed, Some(0), "the entry is still there");
+        assert_eq!(
+            survivors, records,
+            "its generation stays recorded for the next build"
+        );
+        // The rewrite carries the survivor, so the claim is not lost with the sweep.
+        write_build_keys(&dir, "gen-2", &HashSet::new(), &survivors).expect("write the record");
+        assert_eq!(
+            read_build_keys(&dir).expect("the record"),
+            Records::from([
+                ("gen-1".to_string(), HashSet::from([stuck.clone()])),
+                // A section with no entries is a record of its own: this build
+                // produced nothing, because the only entry it had was the stuck one.
+                ("gen-2".to_string(), HashSet::new()),
+            ]),
+            "the surviving claim is on disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record that cannot be interpreted is refused rather than read as empty or
+    /// partial: a build that read it as less than it is would rewrite it with only
+    /// what it understood and orphan every corpus the lost lines named. A header
+    /// with no entries is a record — the writer can emit one — and is not refused.
+    #[test]
+    fn a_record_that_cannot_be_interpreted_is_refused_whole() {
+        let dir = temp_dir("record");
+        assert!(
+            read_build_keys(&dir).expect("no record yet").is_empty(),
+            "a cache with no record records nothing"
+        );
+        std::fs::write(dir.join(BUILD_KEYS), b"").expect("an empty record");
+        assert!(
+            read_build_keys(&dir).expect("an empty record").is_empty(),
+            "an empty file records nothing"
+        );
+        // The writer emits this for a section with no entries; the reader accepts it.
+        write_build_keys(&dir, "gen-2", &HashSet::new(), &Records::new()).expect("a bare section");
+        assert_eq!(
+            read_build_keys(&dir).expect("a header with no entries"),
+            Records::from([("gen-2".to_string(), HashSet::new())]),
+            "a section with no entries is a record, not a broken one"
+        );
+        // An entry before the first header belongs to no generation: the record is
+        // refused whole rather than dropped line by line.
+        std::fs::write(
+            dir.join(BUILD_KEYS),
+            format!("{}\ngeneration gen-2\n", "a".repeat(64)),
+        )
+        .expect("an entry before its header");
+        let error = read_build_keys(&dir).expect_err("a leading entry is refused");
+        assert!(
+            format!("{error:#}").contains("before its first generation header"),
+            "{error:#}"
+        );
+        std::fs::write(dir.join(BUILD_KEYS), b"not a section\n").expect("a corrupt record");
+        let error = read_build_keys(&dir).expect_err("a record with no generation is refused");
+        assert!(
+            format!("{error:#}").contains("before its first generation header"),
+            "{error:#}"
+        );
+        std::fs::remove_file(dir.join(BUILD_KEYS)).expect("remove the record");
+        std::fs::create_dir(dir.join(BUILD_KEYS)).expect("a directory where the record was");
+        let error = read_build_keys(&dir).expect_err("an unreadable record is refused");
+        assert!(format!("{error:#}").contains("cannot be read"), "{error:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest that cannot be read is refused rather than read as absent: a build
+    /// that wrote over it from nothing would reset the generation's build totals and
+    /// understate the cost the record is required to carry. A manifest of another
+    /// generation is simply not this one's; one that names no generation is refused
+    /// like the record's header-less case, not treated as another's.
+    #[test]
+    fn a_manifest_that_cannot_be_read_is_not_an_absent_one() {
+        let dir = temp_dir("manifest");
+        assert_eq!(
+            read_build_manifest(&dir, "gen").expect("no manifest is not a broken one"),
+            None
+        );
+        write_build_manifest(
+            &dir,
+            &serde_json::json!({"generation": "other", "builds": 3}),
+        )
+        .expect("write a manifest");
+        assert_eq!(
+            read_build_manifest(&dir, "gen").expect("another generation's manifest"),
+            None
+        );
+        write_build_manifest(&dir, &serde_json::json!({"builds": 3})).expect("a manifest header");
+        let error =
+            read_build_manifest(&dir, "gen").expect_err("a manifest with no generation is refused");
+        assert!(
+            format!("{error:#}").contains("names no generation"),
+            "{error:#}"
+        );
+        std::fs::write(dir.join(BUILD_MANIFEST), b"{not json").expect("a corrupt manifest");
+        let error = read_build_manifest(&dir, "gen").expect_err("a corrupt manifest is refused");
+        assert!(
+            format!("{error:#}").contains("corpus build manifest"),
+            "{error:#}"
+        );
+        std::fs::remove_file(dir.join(BUILD_MANIFEST)).expect("remove the manifest");
+        std::fs::create_dir(dir.join(BUILD_MANIFEST)).expect("a directory where the manifest was");
+        let error =
+            read_build_manifest(&dir, "gen").expect_err("an unreadable manifest is refused");
+        assert!(format!("{error:#}").contains("cannot be read"), "{error:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

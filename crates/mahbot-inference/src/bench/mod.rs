@@ -8,17 +8,34 @@
 //! One run measures three things:
 //!
 //! 1. **recall** — 40 bare wake-phrase clips plus 10 wake-phrase-plus-command
-//!    clips, fed through one warm continuous stream;
-//! 2. **false reactions** — 121 non-phrase clips (confusables, unrelated
-//!    speech, silence, noise, phrase-in-passing), through the same kind of
-//!    stream;
+//!    clips, in each of eleven voices: the enrolled one and ten clones;
+//! 2. **false reactions** — 1 161 clips. Eleven speech streams of 104 clips each
+//!    (confusables, unrelated speech, phrase-in-passing), one per voice, plus one
+//!    stream of the 17 non-speech clips (silence, noise), which have no voice;
 //! 3. **false accepts per hour** — the pinned 33-file real-audio subset, fed in
 //!    order through one continuous stream.
 //!
 //! The enrolment is the one enrolled voice: ten conditioned renderings, a
 //! consistency gate, and a negative pool that shares no clip with either
-//! measurement set. Everything the report states was measured on the models the
-//! run was given; a run that measured nothing is an error, not a report.
+//! measurement set. The ten clones are cut from single-reader corpus recordings
+//! the false-accept phase never measures ([`voices`]); they are scored against the
+//! enrolled voice's prototype, which is the point of the exercise. Everything the
+//! report states was measured on the models the run was given; a run that
+//! measured nothing is an error, not a report.
+//!
+//! # Voices and streams
+//!
+//! Every speech measurement runs in **one stream per voice**, never one shared
+//! stream: the detector's audio-clock cooldown then stays inside the stream that
+//! caused it, so every voice's rows are measured under identical scoring
+//! conditions, and the enrolled voice's own negatives run in a stream of their
+//! own rather than sharing the non-speech clips. The prototype, the calibration
+//! pool and the anti-prototypes stay built from the enrolled voice alone.
+//!
+//! The enrolled voice's row is measured at thresholds fitted on that same voice;
+//! the ten clone rows are measured at thresholds fitted on the enrolled voice.
+//! That asymmetry is deliberate and the record states it: the clone rows are the
+//! generalisation evidence, the enrolled row is not.
 //!
 //! # Window groups
 //!
@@ -33,27 +50,30 @@
 //! is flushed before the reset, so no queued window is ever scored into state it
 //! did not see.
 //!
-//! Recall and false reactions run ungrouped, one window per pass: their two
-//! phases cost about sixty seconds together, and the ungrouped path keeps their
-//! decisions free of any group boundary. The group facts are a property of the
-//! run and the report states them.
+//! Recall and false reactions run ungrouped, one window per pass: the ungrouped
+//! path keeps their decisions free of any group boundary, which grouping would
+//! move at the group's edges. The group facts are a property of the run and the
+//! report states them.
 //!
 //! # Guards
 //!
 //! A run holds an exclusive lock (`--lock` / `MAHBOT_LOCK`, defaulting to the one
 //! shared path every heavy run of this crate takes) so a second launch refuses
-//! instead of competing for the same device. It carries a wall-clock stop
-//! (3 600 s by default) and a memory guard covering the process's resident set,
-//! swap growth since the run started and the system's free-memory percentage.
+//! instead of competing for the same device. A measurement carries a wall-clock
+//! stop (3 600 s by default) and a memory guard covering the process's resident
+//! set, swap growth since the run started and the system's free-memory percentage;
+//! the corpus build carries the memory guard alone, because it has no wall-clock
+//! bound.
 //!
-//! The work items check the deadline at every synthesized clip, detection chunk
-//! and corpus file, and the cheap process figure at every clip and corpus file;
+//! The work items check the deadline at every clip read, detection chunk and
+//! corpus file, and the cheap process figure at every clip and corpus file;
 //! the two-subprocess system figures run at phase and file boundaries. A guard
 //! thread watches the wall clock every second and both figures every five, so a
 //! stop fires even while the measuring thread is inside one blocked device call.
 //! A report is written once, by whichever thread gets there first — a stop or a
 //! fatal error leaves what it measured, names the phase it stopped in, and exits
-//! non-zero.
+//! non-zero. The corpus counts a stopped run states on its console come from the
+//! same lock the guard reads.
 //!
 //! # Inputs
 //!
@@ -65,38 +85,68 @@
 //! # The record
 //!
 //! One run is this surface's benchmark: it scores with the shipped threshold set
-//! over all three measurements, reports `complete`, and rewrites this surface's
-//! section of the repository's `MEASUREMENTS.md` (see [`crate::measurements`]);
-//! `MAHBOT_MEASUREMENTS` points that write at another file, which is how a run
-//! can be checked without editing the tree.
+//! over all three measurements and all eleven voices, inside the default bounds,
+//! over a corpus the build left complete, reports `complete`, and rewrites this
+//! surface's section of the repository's `MEASUREMENTS.md` (see
+//! [`crate::measurements`]); `MAHBOT_MEASUREMENTS` points that write at another
+//! file, which is how a run can be checked without editing the tree.
 //!
 //! # Pricing an operating point
 //!
-//! `--wake-thresholds` overrides the firing-threshold set ([`crate::wake`]) and
-//! `--phases` takes a subset of the three measurements — the recall stream alone
-//! prices a candidate in half a minute instead of the run's five. Both are
-//! measurement aids, and the classification is by value rather than by flag: a
-//! run that prices another set, or measures a subset, reports `screened` and
-//! leaves `MEASUREMENTS.md` alone even when it measured all three phases, while a
-//! run that states the shipped set — naming it or not — over all three phases is
-//! the benchmark and writes the record.
+//! `--wake-thresholds` overrides the firing-threshold set ([`crate::wake`]),
+//! `--phases` takes a subset of the three measurements and `--voices` measures
+//! fewer than the ten clones. All three are measurement aids, and the
+//! classification is by value rather than by flag: a run that prices another set,
+//! measures a subset, measures a short voice set, or is given a wall-clock, resident
+//! or swap-growth bound larger than the defaults reports `screened`, says why on its
+//! console and in the report, and leaves `MEASUREMENTS.md` alone even when it
+//! measured all three phases; while a run that states the shipped set — naming it
+//! or not — over all three phases and all eleven voices, inside the defaults, is
+//! the benchmark and writes the record. A voice set short of eleven is labelled as
+//! such wherever it is printed, so a three-row table cannot be mistaken for the
+//! eleven-voice measurement.
 //!
 //! # The synthesized corpus
 //!
-//! The corpus is 394 clips. It is generated once into a fixed, durable cache
-//! (`$XDG_CACHE_HOME/mahbot/wake-word-corpus`, else `~/.cache/…`), not into a
-//! per-run directory: a clip is synthesized only when the cache key — the text,
-//! the seed, the sample rate, both TTS files, the voice reference and the code
-//! lines of the modules that produce it — has no entry. A run that reused the
-//! corpus and a run that had to build it are both stated, with their counts and
-//! the time synthesis took; a cache that cannot be written stops the run instead
-//! of quietly costing the corpus again.
+//! The corpus is 1 956 clips: the enrolled voice's 396 (ten enrolment clips, its
+//! 230 calibration negatives, 50 positives, 104 speech negatives, and the two
+//! intelligibility probes), and 156 per clone — 104 speech negatives, 50
+//! positives and the two probes — for the ten.
+//!
+//! It is **built once, deliberately**, by the `wake-word-build` binary: rendering
+//! is never a side effect of measuring. That operation's only job is to leave the
+//! cache holding every clip a measurement needs and to say how many clips it reused
+//! and how many it rendered; it writes no report, and the one-hour measurement bound
+//! does not apply to it (the memory guards do). A measurement never renders: a clip
+//! it finds missing is a stop naming the shortfall and the build, not the start of a
+//! ninety-minute synthesis.
+//!
+//! The cache is one fixed, durable directory
+//! (`$XDG_CACHE_HOME/mahbot/wake-word-corpus`, else `~/.cache/…`), not a per-run
+//! one. A clip's key is content — the text, the seed, the sample rate, both TTS
+//! files, the reference voice (or, for a clone, the span it was cut from) and the
+//! code lines of the modules that produce it — so the enrolled voice's existing
+//! clips stay valid, one voice's audio can never stand in for another's, and a
+//! second build renders nothing. The one legitimate rebuild is a change to the
+//! generation path itself: the build then sweeps the entries every recorded
+//! generation claimed and it did not produce — never a file no record names — so a
+//! superseded corpus does not accumulate. A record belongs to the generation that
+//! wrote it and survives until a later build reclaims its entries; the record is
+//! rewritten only after the sweep, so a build killed mid-sweep leaves the generation
+//! it was replacing recorded and reclaimable by the next one. The trade is stated
+//! rather than hidden: a measurement of a superseded generation that shares this
+//! cache under another lock finds its clips gone and stops with a miss, because the
+//! alternative is a cache that grows without bound. A cache that cannot be written
+//! stops the run instead of quietly costing the corpus again.
 
 mod audio;
+pub mod build;
 pub(crate) mod config;
 mod detect;
 mod real_audio;
+mod record;
 mod sets;
+mod voices;
 // The stand transcribes the same corpus the false-accept phase feeds, so its pin
 // is named from `crate::stand` without opening the bench's private modules.
 pub(crate) use sets::REAL_AUDIO_FILES;
@@ -111,28 +161,40 @@ use serde_json::{Value, json};
 use crate::listen;
 use crate::loader::Pair;
 use crate::measurements;
-use crate::synth::Synthesis;
 use crate::wake::{self, Enrollment};
 
 use crate::guard::{Abort, Deadline, EXIT_STOPPED, MemoryCeiling, RunLock, Watch};
-use audio::Synth;
+use audio::{Category, Synth};
 use config::BenchConfig;
 use detect::DetectionStream;
+use voices::Speaker;
+
+/// The bench's exit contract, shared with the corpus build and the harnesses that
+/// call them: a refused input — a flag, a bound, a corpus cache that cannot be
+/// created, a record or manifest it holds, a pinned recording that no longer matches
+/// its pin — is the stand's argument refusal (2); anything the run reached later is a
+/// failed run (1); a guard stop exits 75 from the stop itself.
+pub fn exit_code(error: &anyhow::Error) -> i32 {
+    if error.is::<config::Refused>() { 2 } else { 1 }
+}
 
 /// Run the bench once: measure, write the report atomically.
 ///
 /// # Errors
-/// A missing or malformed input; a model, corpus or synthesis failure; an
+/// A missing or malformed input; a model or corpus failure; a corpus cache short
+/// of the clips the measurement needs (a measurement never renders); an
 /// enrolment that fails its consistency gate; the wall-clock stop; or the
 /// resident-set ceiling. The report is written for every one of those — a stop
 /// or a failure leaves what it measured, and a run whose denominator measured
 /// nothing writes its report and then exits non-zero.
 pub fn run() -> Result<()> {
     let started = Instant::now();
-    let cfg = BenchConfig::from_env()?;
+    let cfg = BenchConfig::from_env(config::Mode::Measure)?;
     let _lock = RunLock::acquire(&cfg.lock)?;
     let deadline = Deadline::new(cfg.timeout_secs);
-    let ceiling = MemoryCeiling::new(cfg.max_rss_mib);
+    // The swap ceiling the record states is the one the guard enforces: both come
+    // from `cfg`, never from a second read of the environment.
+    let ceiling = MemoryCeiling::with_swap_growth(cfg.max_rss_mib, cfg.swap_growth_mib);
     let progress = Arc::new(Mutex::new(Progress::default()));
     let report = Arc::new(Report::default());
     let watchdog = match Watch::install(
@@ -151,6 +213,10 @@ pub fn run() -> Result<()> {
                 let phase = abort.phase();
                 let message = abort.to_string();
                 eprintln!("[wake-word] stopped in `{phase}`: {message}");
+                // The corpus counts are printed from the progress lock, not left
+                // to a report a stopped run may or may not write: what a cold
+                // cache built is the point of the run that stopped on it.
+                corpus_line(&cfg, &state(&progress));
                 match report.write(
                     &cfg,
                     &progress,
@@ -158,10 +224,13 @@ pub fn run() -> Result<()> {
                     "aborted",
                     Some((phase, message.as_str())),
                 ) {
-                    Ok(_) => eprintln!("[wake-word] partial report: {}", cfg.report.display()),
+                    Ok(_) => eprintln!(
+                        "[wake-word] partial report: {}",
+                        cfg.report_path().display()
+                    ),
                     Err(error) => eprintln!(
                         "[wake-word] cannot write the report {}: {error:#} — stopping without one",
-                        cfg.report.display()
+                        cfg.report_path().display()
                     ),
                 }
                 std::process::exit(EXIT_STOPPED);
@@ -185,14 +254,18 @@ pub fn run() -> Result<()> {
     };
     eprintln!(
         "[wake-word] models {} · corpus {} · up to {} windows per real-audio pass (the clip \
-         sets run one per pass) · stop {}s · ceiling {} MiB · lock {}",
+         sets run one per pass) · {} verification voices · stop {}s · ceiling {} MiB · lock {}",
         cfg.models_label(),
         cfg.corpus.display(),
         listen::GROUP,
+        cfg.voices,
         deadline.secs(),
         cfg.max_rss_mib,
         cfg.lock.display()
     );
+    for reason in cfg.screened_reasons() {
+        eprintln!("[wake-word] screened: {reason}");
+    }
 
     let measured = measure(&cfg, deadline, ceiling, &progress);
     // A denominator that measured nothing: a rate with no denominator.
@@ -214,15 +287,22 @@ pub fn run() -> Result<()> {
         stop.as_ref().map(|(phase, text)| (*phase, text.as_str())),
     );
     watchdog.finish();
+    // The corpus counts are stated on every path this thread reaches — completed,
+    // stopped at a work item, or failed — before the outcome lines. A guard-thread stop
+    // prints the same line from its own stop action and exits there, without this thread.
+    corpus_line(&cfg, &state(&progress));
     if let Some((phase, message)) = &stop {
         eprintln!("[wake-word] stopped in `{phase}`: {message}");
     }
     match (&write, &stop) {
-        (Ok(_), Some(_)) => eprintln!("[wake-word] partial report: {}", cfg.report.display()),
-        (Ok(_), None) => eprintln!("[wake-word] report: {}", cfg.report.display()),
+        (Ok(_), Some(_)) => eprintln!(
+            "[wake-word] partial report: {}",
+            cfg.report_path().display()
+        ),
+        (Ok(_), None) => eprintln!("[wake-word] report: {}", cfg.report_path().display()),
         (Err(error), _) => eprintln!(
             "[wake-word] cannot write the report {}: {error:#}",
-            cfg.report.display()
+            cfg.report_path().display()
         ),
     }
     if let Err(error) = measured {
@@ -240,7 +320,7 @@ pub fn run() -> Result<()> {
         Err(error) => {
             return Err(error.context(format!(
                 "the measurement completed but the report {} could not be written",
-                cfg.report.display()
+                cfg.report_path().display()
             )));
         }
     };
@@ -254,7 +334,7 @@ pub fn run() -> Result<()> {
             "[wake-word] real audio: {} files, {:.2} h audio ({:.2} h speech, {:.2} h VAD-active), \
              {} FA events · {:.4}/h over VAD-active speech (the headline's denominator), \
              {:.4}/h over wall-clock audio · one stream · {:.1}s wall · \
-             process_peak_bytes={}",
+             peak={}",
             real.files_fed,
             real.audio_hours,
             real.speech_hours,
@@ -263,18 +343,9 @@ pub fn run() -> Result<()> {
             real.events as f64 / real.vad_active_hours,
             real.events as f64 / real.audio_hours,
             real.wall_secs,
-            crate::report::peak_text(),
+            crate::report::peak_mib(),
         );
     }
-    let corpus = progress.synthesis;
-    eprintln!(
-        "[wake-word] corpus {}: {} of {} clips reused, {} synthesized in {:.1}s",
-        cfg.cache.display(),
-        corpus.cache_hits,
-        corpus.clips,
-        corpus.clips - corpus.cache_hits,
-        corpus.synth_secs
-    );
     // The repository's own record, refreshed from the same JSON this run wrote.
     // It is part of the run, not a courtesy: a change is not complete until the
     // file shows the numbers from after it, so a run that cannot refresh it says
@@ -286,14 +357,16 @@ pub fn run() -> Result<()> {
     let Some(written) = written else {
         eprintln!(
             "[wake-word] the guard thread wrote the report {} before the measurement returned",
-            cfg.report.display()
+            cfg.report_path().display()
         );
         std::process::exit(EXIT_STOPPED);
     };
+    // The rows, read out of the report this run just wrote.
+    record::console(&written);
     // Only the benchmark itself is the record: a screened run priced a candidate
     // point and says so instead.
     if status == COMPLETE {
-        measurements::refresh("bench", &record_body(&written)).with_context(|| {
+        measurements::refresh("bench", &record::block(&written)).with_context(|| {
             format!(
                 "the measurement completed but {} could not be refreshed",
                 measurements::path().display()
@@ -316,16 +389,18 @@ const COMPLETE: &str = "complete";
 /// The one classification that drives the report, the console and the record.
 ///
 /// `complete` is the benchmark itself: the shipped threshold set over all three
-/// phases. A run that priced a candidate — another set, or a subset of the
-/// phases — is `screened` and never writes the record, even when it measured
-/// everything; anything that stopped is named with the phase and the reason.
+/// phases, all eleven voices, inside the default wall-clock, resident and
+/// swap-growth bounds. A run that priced a candidate — another set, a subset of the
+/// phases, a short voice set, or a larger bound — is `screened` and never writes the
+/// record, even when it measured everything; anything that stopped is named with the
+/// phase and the reason.
 fn classify(
     cfg: &BenchConfig,
     measured: &Result<()>,
     unmeasured: Option<&anyhow::Error>,
     phase: &'static str,
 ) -> (&'static str, Option<(&'static str, String)>) {
-    let benchmark = cfg.thresholds == wake::Thresholds::DEFAULT && cfg.phases.is_full();
+    let benchmark = cfg.screened_reasons().is_empty();
     match (&measured, &unmeasured) {
         (Ok(()), None) if benchmark => (COMPLETE, None),
         (Ok(()), None) => ("screened", None),
@@ -337,211 +412,35 @@ fn classify(
     }
 }
 
-/// What a bench row prints for a figure its report does not carry: the same words
-/// every row uses, so no figure is ever printed as a zero the run did not measure.
-const UNAVAILABLE: &str = "not in the report";
-
-/// One row of the record's table: the figures the row states, or [`UNAVAILABLE`].
-fn row(body: &mut String, label: &str, figures: Option<String>) {
-    body.push_str(&format!(
-        "| {label} | {} |\n",
-        figures.as_deref().unwrap_or(UNAVAILABLE)
-    ));
-}
-
-/// [`row`] for a row of numbers, each bound by name out of the report. The row is
-/// written with its render only when every figure it states is present.
-macro_rules! figure_row {
-    ($body:expr, $label:expr, [$($name:ident = $value:expr),+ $(,)?] => $render:expr) => {
-        row(
-            &mut $body,
-            $label,
-            match ($($value.and_then(Value::as_f64),)+) {
-                ($(Some($name),)+) => Some($render),
-                _ => None,
-            },
-        )
-    };
-}
-
-/// The bench section this run's report states — read out of the report the run
-/// itself wrote, so the file and the JSON cannot state the same fact twice or a
-/// degenerate rate differently.
-fn record_body(report: &Value) -> String {
-    let mut body = String::new();
-    body.push_str("## Wake-word bench\n\n");
-    body.push_str(&format!("_Measured {}._\n\n", measurements::now()));
-    body.push_str(&format!(
-        "status: `{}`\n\n",
-        report
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or(UNAVAILABLE)
-    ));
-    body.push_str("| metric | value |\n|---|---|\n");
-    let recognition = report.get("recognition");
-    figure_row!(body, "recall", [
-        detected = recognition.and_then(|node| node.get("detected")),
-        of = recognition.and_then(|node| node.get("of")),
-        rate = recognition.and_then(|node| node.get("rate")),
-    ] => format!("{detected}/{of} ({:.1} %)", 100.0 * rate));
-    let non_phrase = report
-        .get("false_reactions")
-        .and_then(|section| section.get("non_phrase_set"));
-    figure_row!(body, "false reactions", [
-        fired = non_phrase.and_then(|node| node.get("false_reactions")),
-        of = non_phrase.and_then(|node| node.get("of")),
-        rate = non_phrase.and_then(|node| node.get("rate")),
-    ] => format!("{fired}/{of} ({:.1} %)", 100.0 * rate));
-    let real = report
-        .get("false_reactions")
-        .and_then(|section| section.get("real_audio"));
-    let fa = real.and_then(|section| section.get("fa"));
-    let feed = real.and_then(|section| section.get("feed"));
-    let hours = |key: &str| feed.and_then(|node| node.get(key)).and_then(Value::as_f64);
-    // Nothing is formatted for a row the report cannot state: without an event
-    // count the row names its absence.
-    match fa
-        .and_then(|node| node.get("events"))
-        .and_then(Value::as_u64)
-    {
-        Some(events) => {
-            let cells: Vec<String> = [
-                (
-                    "fa_per_hour_vad_active",
-                    "VAD-active speech",
-                    "vad_active_hours_fed",
-                ),
-                ("fa_per_hour_audio", "wall-clock audio", "audio_hours_fed"),
-            ]
-            .into_iter()
-            .map(|(key, label, hours_key)| {
-                match fa.and_then(|node| node.get(key)).and_then(Value::as_f64) {
-                    Some(rate) => match hours(hours_key) {
-                        Some(hours) => format!("{rate:.4}/h over {label} ({hours:.3} h)"),
-                        None => format!("{rate:.4}/h over {label}"),
-                    },
-                    // A rate the report cannot divide names the denominator
-                    // that is missing rather than asserting a cause.
-                    None if hours(hours_key).is_some_and(|hours| hours <= 0.0) => {
-                        format!("no rate: {label} measured no time")
-                    }
-                    None => format!("no rate: {label} not in the report"),
-                }
-            })
-            .collect();
-            let ladder = hours("vad_active_hours_fed")
-                .filter(|hours| *hours > 0.0)
-                .map(|hours| format!(" · one event = {:.4}/h", 1.0 / hours))
-                .unwrap_or_default();
-            row(
-                &mut body,
-                "false accepts",
-                Some(format!("{events} events · {}{ladder}", cells.join(" · "))),
-            );
-        }
-        None => row(&mut body, "false accepts", None),
-    }
-    // The set the run priced, in the vocabulary `--wake-thresholds` reads, so the
-    // point can be replayed from the record by copy-paste.
-    row(
-        &mut body,
-        "thresholds",
-        report
-            .get("thresholds")
-            .and_then(Value::as_str)
-            .map(|line| format!("`{line}`")),
+/// The corpus line: what this run read from the cache, how much of that it had to
+/// render, and what the rendering cost — in the same words the build's own account
+/// uses. Stated as **clip reads**, because a run the guard stopped has read only
+/// part of the corpus and must not print its own progress as the corpus size.
+/// Printed from the progress lock, so a stopped run states the same counts as one
+/// that finished.
+fn corpus_line(cfg: &BenchConfig, progress: &Progress) {
+    let corpus = progress.synthesis;
+    eprintln!(
+        "[wake-word] corpus {}: {} clip reads — {} reused, {} rendered in {:.1}s",
+        cfg.cache.display(),
+        corpus.reads,
+        corpus.cache_hits,
+        corpus.rendered(),
+        corpus.synth_secs
     );
-    let calibration = report.get("calibration");
-    let derived = |key: &str| calibration.and_then(|node| node.get(key));
-    figure_row!(body, "derived point", [
-        floor = derived("derived_soft_floor"),
-        fire = derived("fire_factor"),
-        bar = derived("static_match_threshold"),
-        reset = derived("reset_soft"),
-    ] => format!("floor {floor:.4} · fire factor {fire:.4} · static bar {bar:.4} · reset {reset:.4}"));
-    figure_row!(body, "wall clock", [
-        secs = report.get("wall_clock_secs"),
-    ] => format!("{secs:.1} s"));
-    figure_row!(body, "peak resident", [
-        bytes = report.get("peak_rss_bytes"),
-    ] => format!("{:.0} MiB", bytes / (1024.0 * 1024.0)));
-    let corpus = report.get("corpus");
-    figure_row!(body, "corpus", [
-        reused = corpus.and_then(|node| node.get("reused")),
-        clips = corpus.and_then(|node| node.get("clips")),
-        synthesized = corpus.and_then(|node| node.get("synthesized")),
-        secs = corpus.and_then(|node| node.get("synthesis_secs")),
-    ] => format!("{reused} of {clips} clips reused, {synthesized} synthesized in {secs:.1} s"));
-    figure_row!(body, "windows per encoder pass", [
-        most = report.get("windows_per_pass"),
-        capacity = report.get("group_capacity"),
-        partial = report.get("partial_passes"),
-        passes = report.get("encoder_passes"),
-    ] => format!("at most {most} of {capacity} · {partial} partial of {passes} passes"));
-    body.push('\n');
-    body.push_str("| phase | seconds |\n|---|---|\n");
-    if let Some(phases) = report.get("phases").and_then(Value::as_object) {
-        for (name, secs) in phases {
-            row(
-                &mut body,
-                name,
-                secs.as_f64().map(|secs| format!("{secs:.1}")),
-            );
-        }
-    }
-    body.push_str("\nProvenance:\n\n");
-    body.push_str(&format!("- machine: {}\n", measurements::machine()));
-    body.push_str(&format!("- device: {}\n", measurements::device()));
-    body.push_str(&format!("- profile: {}\n", measurements::profile()));
-    body.push_str(&format!("- code: {}\n", measurements::code_state()));
-    body.push_str(&format!(
-        "- command: `{}`\n",
-        report
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or(UNAVAILABLE)
-    ));
-    let models = report.get("models");
-    let pin = |section: &str, key: Option<&str>| -> Option<&Value> {
-        let node = models?.get(section)?;
-        key.map_or(Some(node), |key| node.get(key))
-    };
-    for (role, value) in [
-        ("ASR body", pin("recognition", Some("body"))),
-        ("ASR sound", pin("recognition", Some("sound"))),
-        ("TTS body", pin("synthesis", Some("body"))),
-        ("TTS sound", pin("synthesis", Some("sound"))),
-        ("voice", pin("voice_wav", None)),
-    ] {
-        // One behaviour for an absent pin: the bullet is written and names the
-        // absence, whether the report has no pin or a pin without the figure.
-        let Some(pin) = value else {
-            body.push_str(&format!("- {role}: {UNAVAILABLE}\n"));
-            continue;
-        };
-        let bytes = pin
-            .get("bytes")
-            .and_then(Value::as_u64)
-            .map(|bytes| format!("{bytes} bytes"))
-            .unwrap_or_else(|| UNAVAILABLE.to_string());
-        body.push_str(&format!(
-            "- {role}: `{}` · {bytes} · sha256 {}\n",
-            pin.get("file")
-                .and_then(Value::as_str)
-                .unwrap_or(UNAVAILABLE),
-            pin.get("sha256")
-                .and_then(Value::as_str)
-                .unwrap_or(UNAVAILABLE)
-        ));
-    }
-    body
+}
+
+/// A rate over a denominator a run measured. A zero denominator produces no rate
+/// at all in the report's sections — this helper is only reached with a count the
+/// run's own rows produced, which is never zero clips.
+fn rate(numerator: usize, denominator: usize) -> f64 {
+    numerator as f64 / denominator as f64
 }
 
 /// What the run has measured so far. The complete and the stopped report are
 /// both built from this, so a phase cannot appear in one shape and not the
 /// other.
-struct Progress {
+pub(crate) struct Progress {
     /// The phase the run is inside, for a stop or a failure to name.
     current: &'static str,
     inputs: Option<config::Inputs>,
@@ -549,13 +448,20 @@ struct Progress {
     calibration: Option<wake::Calibration>,
     /// The threshold set the enrolment scores with — the point this run prices.
     thresholds: Option<wake::Thresholds>,
+    /// The voices the synthetic side was checked with: the enrolled one's check,
+    /// the selected clones, and the witness that they are distinct.
+    voices: Option<voices::Selection>,
     recall: Option<Recall>,
     non_phrase: Option<NonPhrase>,
     real: Option<real_audio::RealAudio>,
     /// The corpus cache's counters, updated by [`Synth`] through this same lock:
-    /// a report written mid-synthesis counts the clips that phase has already
-    /// cached instead of the zero it started from.
+    /// a report written mid-run counts the clips the phases have already read
+    /// instead of the zero they started from.
     synthesis: audio::SynthStats,
+    /// What the build left beside the corpus: the generation it completed and what
+    /// rendering it cost. Absent when the cache carries no manifest for this
+    /// generation, which the record then names.
+    corpus_build: Option<Value>,
     phases: std::collections::BTreeMap<&'static str, f64>,
 }
 
@@ -575,25 +481,83 @@ impl Default for Progress {
             enrolment: None,
             calibration: None,
             thresholds: None,
+            voices: None,
             recall: None,
             non_phrase: None,
             real: None,
             synthesis: audio::SynthStats::default(),
+            corpus_build: None,
             phases: std::collections::BTreeMap::new(),
         }
     }
 }
 
+/// The positive side: one row per voice.
 struct Recall {
+    voices: Vec<VoicePositives>,
+}
+
+impl Recall {
+    /// `(detected, of)` over every voice's clips: the pooled figure, which is not
+    /// a number of independent utterances.
+    fn pooled(&self) -> (usize, usize) {
+        self.voices.iter().fold((0, 0), |(detected, of), row| {
+            (detected + row.detected, of + row.of)
+        })
+    }
+
+    fn clips_per_voice(&self) -> Option<usize> {
+        self.voices.first().map(|row| row.of)
+    }
+}
+
+/// One voice's positive row: its own stream, its own 50 clips.
+struct VoicePositives {
+    voice: String,
     detected: usize,
     of: usize,
-    first_pass: bool,
     missed: Vec<String>,
 }
 
+/// The negative side: one row per speech stream, plus the non-speech stream.
 struct NonPhrase {
-    fired: Vec<String>,
+    voices: Vec<VoiceNegatives>,
+    non_speech: NonSpeech,
+}
+
+impl NonPhrase {
+    fn speech_pooled(&self) -> (usize, usize) {
+        self.voices.iter().fold((0, 0), |(fired, of), row| {
+            (fired + row.fired(), of + row.of())
+        })
+    }
+}
+
+/// One voice's negative row: how many of its clips fired, per category, in
+/// [`Category::SPEECH`] order.
+struct VoiceNegatives {
+    voice: String,
+    fired: [usize; 3],
+    of: [usize; 3],
+    /// Every clip that fired, named with its stream.
+    fired_labels: Vec<String>,
+}
+
+impl VoiceNegatives {
+    fn fired(&self) -> usize {
+        self.fired.iter().sum()
+    }
+
+    fn of(&self) -> usize {
+        self.of.iter().sum()
+    }
+}
+
+/// The 17 non-speech clips, in a stream of their own: they have no voice.
+struct NonSpeech {
+    fired: usize,
     of: usize,
+    fired_labels: Vec<String>,
 }
 
 /// Run one phase, recording its wall time.
@@ -613,52 +577,123 @@ fn phase<T>(
     value
 }
 
-/// The measurement, phase by phase. Each phase marks itself current, so a stop
-/// names where it happened, and every long phase checks the stop at its own work
-/// item — a synthesized clip, a detection chunk, a corpus file — on top of the
-/// guard thread's own watch.
-fn measure(
-    cfg: &BenchConfig,
-    deadline: Deadline,
-    ceiling: MemoryCeiling,
-    progress: &Arc<Mutex<Progress>>,
-) -> Result<()> {
-    let inputs = phase(progress, "inputs", || {
-        deadline.check("inputs")?;
-        let inputs = config::pin_inputs(cfg)?;
-        // The corpus is verified here, before the synthesis it would otherwise
-        // follow: a bad pin stops the run in its first seconds.
-        real_audio::verify(&cfg.corpus, sets::REAL_AUDIO_FILES)
-            .context("the pinned real-audio corpus")?;
-        Ok(inputs)
-    })?;
-    std::fs::create_dir_all(&cfg.cache).with_context(|| {
-        format!(
-            "cannot create the corpus cache {} — the synthesized corpus is the run's durable \
-             artifact, so the run stops rather than re-synthesizing it silently",
-            cfg.cache.display()
-        )
-    })?;
-    audio::clean_cache(&cfg.cache);
-
+/// Both role pairs, opened once: the measurement and the corpus build read the same
+/// four inputs and fail with the same words.
+fn open_pairs(cfg: &BenchConfig) -> Result<(Arc<Pair>, Arc<Pair>)> {
     let asr = Arc::new(
         Pair::open(&cfg.asr_body, &cfg.asr_sound).context("cannot open the recognition pair")?,
     );
     let tts = Arc::new(
         Pair::open(&cfg.tts_body, &cfg.tts_sound).context("cannot open the synthesis pair")?,
     );
-    let synthesis = Synthesis::new(tts, &cfg.voice).context("cannot build the synthesis path")?;
-    let mut synth = Synth::new(
-        synthesis,
+    Ok((asr, tts))
+}
+
+/// The corpus cache is an input both entry points own: it is the run's durable
+/// artifact, so [`prepare_cache`] creates it and drops only this process's own
+/// half-written entries. Called before anything reads inside it, so a cache root that
+/// is not a directory is named here rather than by the manifest's reader.
+pub(crate) fn prepare_cache(cache: &Path) -> Result<(), config::Refused> {
+    std::fs::create_dir_all(cache).with_context(|| {
+        format!(
+            "cannot create the corpus cache {} — the synthesized corpus is the run's durable \
+             artifact",
+            cache.display()
+        )
+    })?;
+    audio::clean_cache(cache);
+    Ok(())
+}
+
+/// The synthesis front end over the cache the caller prepared ([`prepare_cache`]): a
+/// measurement requires it filled rather than synthesizing quietly somewhere else.
+fn open_corpus(
+    cfg: &BenchConfig,
+    tts: Arc<Pair>,
+    synthesis_hash: String,
+    missing: audio::Missing,
+    progress: &Arc<Mutex<Progress>>,
+    deadline: Deadline,
+    ceiling: MemoryCeiling,
+) -> Result<Synth> {
+    Ok(Synth::new(
+        tts,
+        cfg.voice.clone(),
         cfg.cache.clone(),
-        inputs.synthesis_hash(),
+        synthesis_hash,
+        missing,
         Arc::clone(progress),
         deadline,
         ceiling,
-    );
+    ))
+}
+
+/// The measurement, phase by phase. Each phase marks itself current, so a stop
+/// names where it happened, and every long phase checks the stop at its own work
+/// item — a clip read, a detection chunk, a corpus file — on top of the guard
+/// thread's own watch.
+fn measure(
+    cfg: &BenchConfig,
+    deadline: Deadline,
+    ceiling: MemoryCeiling,
+    progress: &Arc<Mutex<Progress>>,
+) -> Result<()> {
+    // The cache is the run's durable artifact: created and cleaned here once, before
+    // anything reads inside it, so a root that is not a directory is a refused input
+    // named as such rather than a failure the manifest reader reports.
+    prepare_cache(&cfg.cache)?;
+    let inputs = phase(progress, "inputs", || {
+        deadline.check("inputs")?;
+        let inputs = config::pin_inputs(cfg)?;
+        // The corpus is verified here, before any phase reads it: a bad pin stops
+        // the run in its first seconds.
+        real_audio::verify(&cfg.corpus, sets::REAL_AUDIO_FILES)
+            .context("the pinned real-audio corpus")?;
+        Ok(inputs)
+    })?;
+    let (asr, tts) = open_pairs(cfg)?;
+    let mut synth = open_corpus(
+        cfg,
+        Arc::clone(&tts),
+        inputs.synthesis_hash(),
+        audio::Missing::Stop,
+        progress,
+        deadline,
+        ceiling,
+    )?;
     let mut listener =
         listen::Listener::new(Arc::clone(&asr)).context("cannot build the listening path")?;
+    // The build's own account of this generation, so the record can state what the
+    // render cost instead of leaving a warm run looking free. A manifest that cannot
+    // be read is refused, not read as absent: the cost row would understate it.
+    let generation = inputs.synthesis_hash();
+    state(progress).corpus_build = audio::read_build_manifest(&cfg.cache, &generation)?;
     state(progress).inputs = Some(inputs);
+
+    // A measurement renders nothing: a cache short of what it needs is a stop
+    // naming the shortfall and the build that fills it, never a synthesis the
+    // measurement quietly starts. The pre-flight is its own step — its failure is a
+    // missing corpus, not the `inputs` phase, which has already finished.
+    let synthetic = cfg.phases.recall || cfg.phases.non_phrase;
+    state(progress).current = "corpus pre-flight";
+    synth.require_corpus(
+        &audio::enrolment_requests(),
+        "the enrolment and its calibration pool",
+    )?;
+    if synthetic {
+        // Read by the voices phase's enrolled check, before the plan that lists them
+        // is pre-flighted: a broken probe stops here rather than after enrolment.
+        synth.require_corpus(
+            &audio::probe_requests(&Speaker::Enrolled),
+            "the enrolled voice's intelligibility probes",
+        )?;
+        // The clone spans the voices phase reads: every cut the build recorded for this
+        // generation must be there and whole, checked here rather than inside the phase
+        // that reads it. The record is read here, not above, because this pre-flight is
+        // its only consumer: a phase subset that selects no voice does not need it.
+        let records = audio::read_build_keys(&cfg.cache)?;
+        voices::require_spans(&cfg.cache, records.get(&generation))?;
+    }
 
     // ── Enrolment: conditioned clips, the consistency gate, and the negative
     // pool that no measurement clip belongs to. ──
@@ -691,55 +726,123 @@ fn measure(
         p.thresholds = Some(thresholds);
     }
 
-    // ── Recall: one warm continuous stream over the 50 phrase clips. ──
+    // ── Voices: the enrolled one's own two-sentence check, then the ten clones
+    // the pinned pool fills. Both sides go through the same synthesis path and are
+    // read back by the same recogniser; the selection's spans are the only thing
+    // the clones differ in. ──
+    let speakers = if synthetic {
+        let selection = phase(progress, "voices", || {
+            deadline.check("voices")?;
+            ceiling.check("voices")?;
+            voices::select(&tts, &asr, &mut synth, cfg, deadline, ceiling)
+        })?;
+        let speakers = selection.speakers();
+        state(progress).voices = Some(selection);
+        speakers
+    } else {
+        Vec::new()
+    };
+    // A real-audio-only run measures no synthetic clips at all, so it asks the
+    // corpus for none of them; a screening run asks only for the phases it reads.
+    if synthetic {
+        state(progress).current = "corpus pre-flight";
+        synth.require_corpus(&audio::plan(&speakers, cfg.phases), "the measured set")?;
+    }
+
+    // ── Recall: one warm continuous stream per voice over that voice's 50
+    // phrase clips. ──
     let recall = if cfg.phases.recall {
         let clips = phase(progress, "recall synthesis", || {
-            audio::recall_clips(&mut synth)
+            speakers
+                .iter()
+                .map(|speaker| {
+                    audio::recall_clips(&mut synth, speaker).map(|clips| (speaker.clone(), clips))
+                })
+                .collect::<Result<Vec<_>>>()
         })?;
         let recall = phase(progress, "recall", || {
             deadline.check("recall")?;
             ceiling.check("recall")?;
-            let (detected, first_pass, missed) =
-                measure_recognition(&enrollment, &mut listener, &clips, deadline, ceiling)?;
-            Ok(Recall {
-                detected,
-                of: clips.len(),
-                first_pass,
-                missed,
-            })
+            let mut rows = Vec::with_capacity(clips.len());
+            // One warm stream per voice: a stream carries the rolling window, the
+            // adaptive arm and the audio-clock cooldown, so a shared one would let one
+            // voice's decision reach another's clips.
+            for (speaker, clips) in clips {
+                let mut stream = warm_stream(&enrollment);
+                rows.push(measure_recognition(
+                    &mut stream,
+                    &mut listener,
+                    &speaker,
+                    &clips,
+                    deadline,
+                    ceiling,
+                )?);
+            }
+            Ok(Recall { voices: rows })
         })?;
-        if !recall.missed.is_empty() {
-            eprintln!(
-                "[wake-word] missed recall clips: {}",
-                recall.missed.join(", ")
-            );
+        for row in &recall.voices {
+            if !row.missed.is_empty() {
+                eprintln!(
+                    "[wake-word] missed positives in {}: {}",
+                    row.voice,
+                    row.missed.join(", ")
+                );
+            }
         }
-        eprintln!("[wake-word] recognition {}/{}", recall.detected, recall.of);
         Some(recall)
     } else {
         None
     };
 
-    // ── False reactions: one warm continuous stream over the 121 clips. ──
+    // ── False reactions: one warm continuous stream per voice over that voice's
+    // 104 speech clips, plus one stream over the 17 non-speech clips. ──
     let non_phrase = if cfg.phases.non_phrase {
-        let clips = phase(progress, "non-phrase synthesis", || {
-            audio::non_phrase_clips(&mut synth)
+        let speech = phase(progress, "non-phrase synthesis", || {
+            speakers
+                .iter()
+                .map(|speaker| {
+                    audio::speech_negatives(&mut synth, speaker)
+                        .map(|clips| (speaker.clone(), clips))
+                })
+                .collect::<Result<Vec<_>>>()
         })?;
         let non_phrase = phase(progress, "non-phrase", || {
             deadline.check("non-phrase")?;
             ceiling.check("non-phrase")?;
-            let fired =
-                measure_false_reactions(&enrollment, &mut listener, &clips, deadline, ceiling)?;
+            let mut rows = Vec::with_capacity(speech.len());
+            // The same per-voice streams as the recall side, for the same reason.
+            for (speaker, clips) in speech {
+                let mut stream = warm_stream(&enrollment);
+                rows.push(measure_false_reactions(
+                    &mut stream,
+                    &mut listener,
+                    &speaker,
+                    &clips,
+                    deadline,
+                    ceiling,
+                )?);
+            }
+            let non_speech = measure_non_speech(
+                &enrollment,
+                &mut listener,
+                &audio::non_speech_clips()?,
+                deadline,
+                ceiling,
+            )?;
             Ok(NonPhrase {
-                fired,
-                of: clips.len(),
+                voices: rows,
+                non_speech,
             })
         })?;
-        eprintln!(
-            "[wake-word] false reactions {}/{}",
-            non_phrase.fired.len(),
-            non_phrase.of
-        );
+        for row in &non_phrase.voices {
+            if !row.fired_labels.is_empty() {
+                eprintln!(
+                    "[wake-word] false reactions in {}: {}",
+                    row.voice,
+                    row.fired_labels.join(", ")
+                );
+            }
+        }
         Some(non_phrase)
     } else {
         None
@@ -792,8 +895,16 @@ fn report_json(
     report.insert("benchmark".into(), json!("wake_word"));
     report.insert("status".into(), json!(status));
     report.insert("wake_phrase".into(), json!(sets::WAKE_PHRASE));
-    report.insert("timeout_secs".into(), json!(cfg.timeout_secs));
-    report.insert("max_rss_mib".into(), json!(cfg.max_rss_mib));
+    // The bounds this run was actually taken under, so a record cannot be read as
+    // one taken under the defaults when a guard was widened.
+    report.insert(
+        "guards".into(),
+        json!({
+            "timeout_secs": cfg.timeout_secs,
+            "max_rss_mib": cfg.max_rss_mib,
+            "swap_growth_mib": cfg.swap_growth_mib,
+        }),
+    );
     // The operating point is stated whether or not a phase got far enough to
     // derive anything, in the vocabulary `--wake-thresholds` reads, and so is the
     // invocation that produced it.
@@ -814,10 +925,6 @@ fn report_json(
                 "utterances": stats.utterances,
                 "skipped_clips": stats.skipped,
                 "skipped_negatives": stats.skipped_negatives,
-                "note": "A conditioned render with no VAD-positive speech is skipped and named; \
-                         the consistency gate and the five-utterance minimum decide whether the \
-                         remainder is an enrolment. A skipped negative shrinks the calibration \
-                         pool, so it is named here too.",
             }),
         );
     }
@@ -843,31 +950,47 @@ fn report_json(
                 "noise_seed_bands": {
                     "calibration_base": sets::CALIBRATION_NOISE_SEED_BASE,
                     "detection_base": sets::DETECTION_NOISE_SEED_BASE,
-                    "note": "A profile name renders at 4242+index for calibration and at 42+index \
-                             (the original constants) for the detection set; no waveform is both \
-                             calibration material and measurement material.",
                 },
-                "note": "Derived for the models that ran — thresholds do not transfer between models.",
             }),
         );
     }
     if let Some(recall) = &p.recall
-        && recall.of > 0
+        && !recall.voices.is_empty()
     {
+        let (detected, of) = recall.pooled();
+        let voices: Vec<Value> = recall
+            .voices
+            .iter()
+            .map(|row| {
+                json!({
+                    "voice": row.voice,
+                    "detected": row.detected,
+                    "of": row.of,
+                    "rate": rate(row.detected, row.of),
+                    "missed": row.missed,
+                })
+            })
+            .collect();
         report.insert(
             "recognition".into(),
             json!({
-                "detected": recall.detected,
-                "of": recall.of,
-                "rate": recall.detected as f64 / recall.of as f64,
-                "single_voice": true,
-                "first_pass_detected": recall.first_pass,
-                "missed": recall.missed,
+                "detected": detected,
+                "of": of,
+                "rate": rate(detected, of),
+                "set": {
+                    "clips": of,
+                    "clips_pinned": sets::EXPECTED_POSITIVE_TOTAL,
+                    "voices": recall.voices.len(),
+                    "clips_per_voice": recall.clips_per_voice(),
+                    "distinct_texts": 1 + sets::COMMAND_PLUS_SPEECH_PHRASES.len(),
+                    "wake_only_clips_per_voice": sets::HELD_OUT_WAKE_ONLY_CLIPS,
+                    "command_plus_speech_clips_per_voice": sets::COMMAND_PLUS_SPEECH_PHRASES.len(),
+                },
+                "voices": voices,
                 "clip_seed_bands": {
                     "wake_only": {"base": sets::HELD_OUT_SEED_BASE, "clips": sets::HELD_OUT_WAKE_ONLY_CLIPS},
                     "command_plus_speech": {"base": sets::COMMAND_PLUS_SPEECH_SEED_BASE, "clips": sets::COMMAND_PLUS_SPEECH_PHRASES.len()},
                 },
-                "composition": recognition_composition(recall.of),
             }),
         );
     }
@@ -877,23 +1000,84 @@ fn report_json(
     // never a null.
     let mut false_reactions = serde_json::Map::new();
     if let Some(non_phrase) = &p.non_phrase
-        && non_phrase.of > 0
+        && !non_phrase.voices.is_empty()
     {
+        let voices: Vec<Value> = non_phrase
+            .voices
+            .iter()
+            .map(|row| {
+                let mut cell = serde_json::Map::new();
+                cell.insert("voice".into(), json!(row.voice));
+                cell.insert("of".into(), json!(row.of()));
+                cell.insert("false_reactions".into(), json!(row.fired()));
+                cell.insert("rate".into(), json!(rate(row.fired(), row.of())));
+                cell.insert("fired".into(), json!(row.fired_labels));
+                for category in Category::SPEECH {
+                    let slot = category.index();
+                    cell.insert(
+                        category.key().into(),
+                        json!({
+                            "false_reactions": row.fired[slot],
+                            "of": row.of[slot],
+                            "rate": rate(row.fired[slot], row.of[slot]),
+                        }),
+                    );
+                }
+                Value::Object(cell)
+            })
+            .collect();
+        let (fired, of) = non_phrase.speech_pooled();
+        let mut speech = serde_json::Map::new();
+        speech.insert("false_reactions".into(), json!(fired));
+        speech.insert("of".into(), json!(of));
+        speech.insert("rate".into(), json!(rate(fired, of)));
+        for category in Category::SPEECH {
+            let slot = category.index();
+            let category_fired = non_phrase.voices.iter().map(|row| row.fired[slot]).sum();
+            let category_of = non_phrase.voices.iter().map(|row| row.of[slot]).sum();
+            speech.insert(
+                category.key().into(),
+                json!({
+                    "false_reactions": category_fired,
+                    "of": category_of,
+                    "rate": rate(category_fired, category_of),
+                }),
+            );
+        }
+        speech.insert("voices".into(), Value::Array(voices));
         false_reactions.insert(
             "non_phrase_set".into(),
             json!({
-                "false_reactions": non_phrase.fired.len(),
-                "of": non_phrase.of,
-                "rate": non_phrase.fired.len() as f64 / non_phrase.of as f64,
-                "fired": non_phrase.fired,
-                "single_voice": true,
+                "set": {
+                    "clips": of + non_phrase.non_speech.of,
+                    "clips_pinned": sets::EXPECTED_NON_PHRASE_TOTAL,
+                    "speech_clips": of,
+                    "non_speech_clips": non_phrase.non_speech.of,
+                    "voices": non_phrase.voices.len(),
+                    "speech_clips_per_voice": sets::SPEECH_NEGATIVE_CLIPS,
+                    "confusable_clips_per_voice": sets::CONFUSABLE_CLIPS,
+                    "unrelated_clips_per_voice": sets::UNRELATED_CLIPS,
+                    "phrase_in_passing_clips_per_voice": sets::PHRASE_IN_PASSING_CLIPS,
+                    "distinct_texts": sets::CONFUSABLE_PHRASES.len()
+                        + sets::UNRELATED_PHRASES.len()
+                        + sets::PHRASE_IN_PASSING_PHRASES.len(),
+                    "silence_clips": sets::SILENCE_DURATIONS.len(),
+                    "noise_clips": sets::NOISE_PROFILES.len()
+                        + sets::NOISE_PROFILES_DETECTION_ONLY.len(),
+                },
+                "speech": Value::Object(speech),
+                "non_speech": {
+                    "false_reactions": non_phrase.non_speech.fired,
+                    "of": non_phrase.non_speech.of,
+                    "rate": rate(non_phrase.non_speech.fired, non_phrase.non_speech.of),
+                    "fired": non_phrase.non_speech.fired_labels,
+                },
                 "clip_seed_bands": {
                     "confusable": [sets::CONFUSABLE_BANDS[0].0, sets::CONFUSABLE_BANDS[1].0],
                     "unrelated": [sets::UNRELATED_BANDS[0].0, sets::UNRELATED_BANDS[1].0],
                     "phrase_in_passing": sets::PHRASE_IN_PASSING_SEED_BASE,
                     "detection_noise": sets::DETECTION_NOISE_SEED_BASE,
                 },
-                "composition": non_phrase_composition(),
             }),
         );
     }
@@ -906,10 +1090,10 @@ fn report_json(
     if let Some(real) = &p.real {
         let mut coverage = serde_json::Map::new();
         if let Some(recall) = &p.recall {
-            coverage.insert("phrase_utterances".into(), json!(recall.of));
+            coverage.insert("phrase_utterances".into(), json!(recall.pooled().1));
         }
         if let Some(non_phrase) = &p.non_phrase {
-            coverage.insert("non_phrase_set".into(), json!(non_phrase.of));
+            coverage.insert("non_phrase_set".into(), json!(non_phrase.speech_pooled().1));
         }
         coverage.insert("real_audio_audio_hours".into(), json!(real.audio_hours));
         coverage.insert("real_audio_speech_hours".into(), json!(real.speech_hours));
@@ -921,19 +1105,22 @@ fn report_json(
         "corpus".into(),
         json!({
             "cache": cfg.cache.display().to_string(),
-            "clips": synthesis.clips,
+            "reads": synthesis.reads,
             "reused": synthesis.cache_hits,
-            "synthesized": synthesis.clips - synthesis.cache_hits,
+            "rendered": synthesis.rendered(),
             "synthesis_secs": synthesis.synth_secs,
-            "note": "The corpus is generated once, into this fixed cache directory, and reused \
-                     by every later run: the key covers the text, the seed, the sample rate, both \
-                     TTS files, the voice reference and the synthesis code (every code line of \
-                     the modules that produce a clip, so a comment edit does not invalidate it), \
-                     so a clip is re-synthesized only when one of those changes. Every clip is \
-                     the one enrolled voice; there is no multi-voice rotation and no \
-                     cold-versus-warm comparison.",
         }),
     );
+    if let Some(selection) = &p.voices {
+        report.insert("voices".into(), selection.json());
+    }
+    if let Some(build) = &p.corpus_build {
+        report.insert("corpus_build".into(), build.clone());
+    }
+    let screened = cfg.screened_reasons();
+    if !screened.is_empty() {
+        report.insert("screened_because".into(), json!(screened));
+    }
     report.insert("phases".into(), json!(p.phases));
     // The size the stream actually resolved windows at, against the capacity the
     // pipeline was built for: a phase cut short may never fill a group, and a
@@ -947,45 +1134,7 @@ fn report_json(
     }
     report.insert("wall_clock_secs".into(), json!(wall_clock_secs));
     report.insert("peak_rss_bytes".into(), json!(crate::report::peak_rss()));
-    report.insert(
-        "vad_gate".into(),
-        json!({
-            "retained": true,
-            "hours_basis": "VAD-active speech hours",
-            "carry_across_clips": true,
-            "note": "Every score is computed on the VAD-gated speech window; the real-audio \
-                     denominator is the VAD-active time the same detector marked over the one \
-                     stream. The detector instance carries across files. Recall and false \
-                     reactions run ungrouped, one window per encoder pass, so their decisions \
-                     do not depend on a group boundary; the bound the sweep's grouping adds is \
-                     stated with its rate in `false_reactions.real_audio.fa.basis_note`.",
-        }),
-    );
     Value::Object(report)
-}
-
-/// The non-phrase set's composition, in counts: the one place its shape is
-/// stated, so the report cannot drift into three descriptions of the same set.
-/// The total is the pinned constant the builder asserts against, not the count
-/// this run happened to produce.
-fn non_phrase_composition() -> Value {
-    json!({
-        "confusable_clips": sets::CONFUSABLE_BANDS.len() * sets::CONFUSABLE_PHRASES.len(),
-        "unrelated_clips": sets::UNRELATED_BANDS.len() * sets::UNRELATED_PHRASES.len(),
-        "silence_clips": sets::SILENCE_DURATIONS.len(),
-        "noise_clips": sets::NOISE_PROFILES.len() + sets::NOISE_PROFILES_DETECTION_ONLY.len(),
-        "phrase_in_passing_clips": sets::PHRASE_IN_PASSING_PHRASES.len(),
-        "total": sets::EXPECTED_NON_PHRASE_TOTAL,
-    })
-}
-
-/// The recall set's composition, in counts.
-fn recognition_composition(total: usize) -> Value {
-    json!({
-        "wake_only_clips": sets::HELD_OUT_WAKE_ONLY_CLIPS,
-        "command_plus_speech_clips": sets::COMMAND_PLUS_SPEECH_PHRASES.len(),
-        "total": total,
-    })
 }
 
 /// What the enrolment used: the clips that gated speech, the ones a quiet
@@ -1015,43 +1164,27 @@ fn enroll(
     let clips = audio::enrollment_clips(synth)?;
     let mut utterances = Vec::with_capacity(clips.len());
     let mut skipped = Vec::new();
-    for (samples, label) in &clips {
-        let speech = detect::vad_gate(samples, &mut earshot::Detector::default());
+    for clip in &clips {
+        let speech = detect::vad_gate(&clip.samples, &mut earshot::Detector::default());
         if speech.is_empty() {
-            eprintln!("[wake-word] enrolment clip `{label}`: no VAD-positive speech — skipped");
-            skipped.push(label.clone());
+            eprintln!(
+                "[wake-word] enrolment clip `{}`: no VAD-positive speech — skipped",
+                clip.label
+            );
+            skipped.push(clip.label.clone());
             continue;
         }
         utterances.push(listener.embed(&speech)?);
     }
     let prototype = consistency(&utterances)?;
 
-    // Ambient → owner → confusable → unrelated.
+    // Ambient → the pinned calibration pool (owner, confusable, unrelated), from
+    // the same request list the plan pre-flights and the build renders.
     let mut skipped_negatives = Vec::new();
     let mut negatives = audio::ambient_negatives(listener)?;
-    negatives.extend(audio::owner_negatives(
+    negatives.extend(audio::calibration_negatives(
         synth,
         listener,
-        &mut skipped_negatives,
-    )?);
-    negatives.extend(audio::phrase_negatives(
-        synth,
-        listener,
-        sets::CONFUSABLE_PHRASES,
-        sets::CONFUSABLE_SEEDS_PER_PHRASE,
-        sets::CONFUSABLE_SEED_BASE,
-        "confusable",
-        None,
-        &mut skipped_negatives,
-    )?);
-    negatives.extend(audio::phrase_negatives(
-        synth,
-        listener,
-        sets::UNRELATED_PHRASES,
-        sets::UNRELATED_SEEDS_PER_PHRASE,
-        sets::UNRELATED_SEED_BASE,
-        "unrelated",
-        None,
         &mut skipped_negatives,
     )?);
     audio::require_negatives(&negatives)?;
@@ -1117,64 +1250,112 @@ fn consistency(utterances: &[Vec<f32>]) -> Result<Vec<f32>> {
     Ok(centroid)
 }
 
-/// The stream a clip set is measured on: ungrouped, so a group boundary can never
-/// move a decision in the two rates reported over clips. Both the recall and the
-/// false-reaction phase take their stream from here, which is what
-/// `a_clip_set_stream_is_ungrouped` pins.
-fn clip_set_stream(enrollment: &Enrollment) -> DetectionStream {
+/// One warm, **ungrouped** scoring stream. Groups exist only in the real-audio
+/// sweep: grouping the clip sets would move a decision at a group boundary, and
+/// `a_clip_set_stream_is_ungrouped` pins that this helper never switches to it.
+fn warm_stream(enrollment: &Enrollment) -> DetectionStream {
     DetectionStream::warm(enrollment.clone())
 }
 
-/// Feed the recall clips through one warm stream, two seconds of silence
-/// between them. Returns `(detected, first_pass, missed labels)`. The stop and
-/// the resident-set ceiling are checked per clip, on top of the per-chunk check
-/// inside [`DetectionStream::feed`].
+/// Feed one voice's positive clips through its own warm stream, two seconds of
+/// silence between them. The stop and the resident-set ceiling are checked per
+/// clip, on top of the per-chunk check inside [`DetectionStream::feed`].
 fn measure_recognition(
-    enrollment: &Enrollment,
+    stream: &mut DetectionStream,
     listener: &mut listen::Listener,
-    clips: &[(Vec<f32>, String)],
+    speaker: &Speaker,
+    clips: &[audio::Clip],
     deadline: Deadline,
     ceiling: MemoryCeiling,
-) -> Result<(usize, bool, Vec<String>)> {
-    let mut stream = clip_set_stream(enrollment);
+) -> Result<VoicePositives> {
     let gap = vec![0.0f32; sets::FILE_GAP_SAMPLES];
     let mut detected = 0usize;
-    let mut first_pass = false;
     let mut missed = Vec::new();
-    for (index, (samples, label)) in clips.iter().enumerate() {
+    for clip in clips {
         ceiling.check_process("recall")?;
-        let hit = feed_clip(&mut stream, listener, samples, &gap, deadline, "recall")?;
-        if index == 0 {
-            first_pass = hit;
-        }
+        let hit = feed_clip(stream, listener, &clip.samples, &gap, deadline, "recall")?;
         if hit {
             detected += 1;
         } else {
-            missed.push(label.clone());
+            missed.push(clip.label.clone());
         }
     }
-    Ok((detected, first_pass, missed))
+    Ok(VoicePositives {
+        voice: speaker.name().to_string(),
+        detected,
+        of: clips.len(),
+        missed,
+    })
 }
 
-/// Feed the non-phrase clips through one warm stream. Returns the labels that
-/// fired — every one is a false reaction.
+/// Feed one voice's speech negatives through its own warm stream. Every clip that
+/// fired is a false reaction, counted in its category's slot.
 fn measure_false_reactions(
-    enrollment: &Enrollment,
+    stream: &mut DetectionStream,
     listener: &mut listen::Listener,
-    clips: &[(Vec<f32>, String)],
+    speaker: &Speaker,
+    clips: &[(Category, audio::Clip)],
     deadline: Deadline,
     ceiling: MemoryCeiling,
-) -> Result<Vec<String>> {
-    let mut stream = clip_set_stream(enrollment);
+) -> Result<VoiceNegatives> {
     let gap = vec![0.0f32; sets::FILE_GAP_SAMPLES];
-    let mut fired = Vec::new();
-    for (samples, label) in clips {
+    let mut fired = [0usize; 3];
+    let mut of = [0usize; 3];
+    let mut fired_labels = Vec::new();
+    for (category, clip) in clips {
         ceiling.check_process("non-phrase")?;
-        if feed_clip(&mut stream, listener, samples, &gap, deadline, "non-phrase")? {
-            fired.push(label.clone());
+        let slot = category.index();
+        of[slot] += 1;
+        if feed_clip(
+            stream,
+            listener,
+            &clip.samples,
+            &gap,
+            deadline,
+            "non-phrase",
+        )? {
+            fired[slot] += 1;
+            fired_labels.push(clip.label.clone());
         }
     }
-    Ok(fired)
+    Ok(VoiceNegatives {
+        voice: speaker.name().to_string(),
+        fired,
+        of,
+        fired_labels,
+    })
+}
+
+/// Feed the non-speech clips through a stream of their own: they have no voice,
+/// so they cannot share a stream with one.
+fn measure_non_speech(
+    enrollment: &Enrollment,
+    listener: &mut listen::Listener,
+    clips: &[audio::Clip],
+    deadline: Deadline,
+    ceiling: MemoryCeiling,
+) -> Result<NonSpeech> {
+    let mut stream = warm_stream(enrollment);
+    let gap = vec![0.0f32; sets::FILE_GAP_SAMPLES];
+    let mut fired_labels = Vec::new();
+    for clip in clips {
+        ceiling.check_process("non-phrase")?;
+        if feed_clip(
+            &mut stream,
+            listener,
+            &clip.samples,
+            &gap,
+            deadline,
+            "non-phrase",
+        )? {
+            fired_labels.push(clip.label.clone());
+        }
+    }
+    Ok(NonSpeech {
+        fired: fired_labels.len(),
+        of: clips.len(),
+        fired_labels,
+    })
 }
 
 /// One clip's turn in a continuous stream.
@@ -1238,7 +1419,7 @@ fn require_measured(p: &Progress, phases: config::Phases) -> Result<()> {
         .ok_or_else(|| anyhow!("the real-audio phase did not complete — no false-accept rate"))?;
     if !real.vad_active_hours.is_finite() || real.vad_active_hours <= 0.0 {
         bail!(
-            "the real-audio phase fed {} file(s) but the VAD marked no speech — the \
+            "the real-audio phase fed a {}-file corpus but the VAD marked no speech — the \
              false-accept rate has no denominator",
             real.files_fed
         );
@@ -1246,30 +1427,45 @@ fn require_measured(p: &Progress, phases: config::Phases) -> Result<()> {
     Ok(())
 }
 
-/// Write the report only after the whole measurement completed: a temporary
-/// file beside the target, then a rename.
+/// Atomic, durable write: a temporary beside the target, flushed to the device, then a
+/// rename — so a crash leaves either the old file or the new one, never a half-written
+/// one and never a name pointing at bytes that did not reach the disk. The one idiom
+/// every cache entry, record, manifest and report goes through. The temporary is removed
+/// when the write fails.
+pub(crate) fn write_atomic(path: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let written = write(&tmp)
+        .and_then(|()| {
+            // Flushed to the device, so the rename that follows cannot make a name
+            // visible before its bytes are.
+            Ok(std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)?
+                .sync_all()?)
+        })
+        .and_then(|()| {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("cannot move {} into place", tmp.display()))
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// Write the report only after the whole measurement completed.
 fn write_report(path: &Path, report: &Value) -> Result<()> {
     let text = serde_json::to_string_pretty(report).context("cannot serialise the report")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    if let Err(error) = std::fs::write(&tmp, text.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error).with_context(|| format!("cannot write {}", tmp.display()));
-    }
-    if let Err(error) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error)
-            .with_context(|| format!("cannot rename {} to {}", tmp.display(), path.display()));
-    }
-    Ok(())
+    write_atomic(path, |tmp| Ok(std::fs::write(tmp, text.as_bytes())?))
 }
 
 /// The progress lock, recovering from a poisoned mutex: a panic elsewhere must
 /// not take the guard's own reading, or the report, down with it.
-fn state<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn state<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1306,7 +1502,7 @@ impl Report {
             cfg,
             stop,
         );
-        write_report(&cfg.report, &report)?;
+        write_report(cfg.report_path(), &report)?;
         *written = true;
         Ok(Some(report))
     }
@@ -1328,10 +1524,11 @@ mod tests {
 
     fn test_config() -> BenchConfig {
         BenchConfig {
+            mode: config::Mode::Measure,
             models: Some(std::path::PathBuf::from("/models")),
             voice: std::path::PathBuf::from("/voice.wav"),
             corpus: std::path::PathBuf::from("/corpus"),
-            report: std::path::PathBuf::from("/report.json"),
+            report: Some(std::path::PathBuf::from("/report.json")),
             cache: std::path::PathBuf::from("/cache"),
             lock: std::path::PathBuf::from("/report.lock"),
             timeout_secs: 900,
@@ -1342,21 +1539,81 @@ mod tests {
             tts_sound: std::path::PathBuf::from("/models/tts-mmproj.gguf"),
             thresholds: wake::Thresholds::DEFAULT,
             phases: config::Phases::ALL,
+            voices: sets::NUM_VERIFICATION_VOICES,
+            swap_growth_mib: crate::guard::MAX_SWAP_GROWTH_MIB,
+        }
+    }
+
+    fn test_voice(index: usize) -> Arc<voices::Voice> {
+        Arc::new(voices::Voice {
+            name: format!("voice{index:02}"),
+            recording: "speech/librivox/speech-librivox-0002.wav",
+            sha256: "f907f96e69eb8e680c86964f63ff570d2c24458beacd7d94520c44b2a5c10868",
+            offset_secs: 11.4,
+            secs: 15.0,
+            wav: std::path::PathBuf::from("/cache/voice.wav"),
+        })
+    }
+
+    fn test_selection(count: usize) -> voices::Selection {
+        let voices: Vec<Arc<voices::Voice>> = (1..=count).map(test_voice).collect();
+        let similarity = (0..voices.len())
+            .flat_map(|a| (a + 1..voices.len()).map(move |b| (a, b, 0.5)))
+            .collect();
+        voices::Selection {
+            voices,
+            replacements: Vec::new(),
+            enrolled: vec![voices::SentenceCheck {
+                text: "the weather is sunny today",
+                seed: 5_000,
+                heard: "the weather is sunny today.".into(),
+                passed: true,
+                truncated: false,
+            }],
+            similarity,
+            spans: Vec::new(),
+        }
+    }
+
+    /// One negative row for `voice`, with `fired` split over the categories.
+    fn test_negatives(voice: &str) -> VoiceNegatives {
+        VoiceNegatives {
+            voice: voice.to_string(),
+            fired: [2, 1, 0],
+            of: [
+                sets::CONFUSABLE_CLIPS,
+                sets::UNRELATED_CLIPS,
+                sets::PHRASE_IN_PASSING_CLIPS,
+            ],
+            fired_labels: vec![format!("{voice}/confusable_s800")],
+        }
+    }
+
+    fn test_positives(voice: &str) -> VoicePositives {
+        VoicePositives {
+            voice: voice.to_string(),
+            detected: 40,
+            of: sets::POSITIVE_CLIPS,
+            missed: Vec::new(),
         }
     }
 
     /// The clip sets are measured ungrouped: both phases take their stream from
-    /// `clip_set_stream`, so a phase that switched to the grouped path — or a
-    /// change to the helper — would move a decision at a group boundary and fail
-    /// here. The sweep's own stream is the one that groups.
+    /// `warm_stream`, so a phase that switched to the grouped path — or a change to
+    /// the helper — would move a decision at a group boundary and fail here. The
+    /// sweep's own stream is the one that groups.
     #[test]
     fn a_clip_set_stream_is_ungrouped() {
+        let enrollment = enrolment();
+        assert_eq!(warm_stream(&enrollment).group(), 1);
+        assert_eq!(DetectionStream::grouped(enrollment).group(), listen::GROUP);
+    }
+
+    fn enrolment() -> crate::wake::Enrollment {
         use crate::wake::{Calibration, Enrollment};
         let utterances = vec![vec![1.0f32, 0.0]; crate::wake::MIN_ENROLLMENT_UTTERANCES];
-        let enrollment = Enrollment::build("wake".into(), &utterances, Calibration::default(), &[])
-            .expect("an enrolment of identical utterances");
-        assert_eq!(clip_set_stream(&enrollment).group(), 1);
-        assert_eq!(DetectionStream::grouped(enrollment).group(), listen::GROUP);
+        Enrollment::build("wake".into(), &utterances, Calibration::default(), &[])
+            .expect("an enrolment of identical utterances")
     }
 
     /// A run stopped before a phase measured anything must not carry that
@@ -1382,28 +1639,87 @@ mod tests {
     #[test]
     fn a_measured_run_carries_finite_rates() {
         let progress = Progress {
+            voices: Some(test_selection(2)),
             recall: Some(Recall {
-                detected: 3,
-                of: 4,
-                first_pass: true,
-                missed: vec!["clip".into()],
+                voices: vec![test_positives("enrolled"), test_positives("voice01")],
             }),
             non_phrase: Some(NonPhrase {
-                fired: Vec::new(),
-                of: 121,
+                voices: vec![test_negatives("enrolled"), test_negatives("voice01")],
+                non_speech: NonSpeech {
+                    fired: 0,
+                    of: sets::NON_SPEECH_CLIPS,
+                    fired_labels: Vec::new(),
+                },
             }),
             ..Progress::default()
         };
         let report = report_json(&progress, "complete", 1.0, &test_config(), None);
-        assert_eq!(report["recognition"]["rate"], 0.75);
-        assert_eq!(report["false_reactions"]["non_phrase_set"]["rate"], 0.0);
+        assert_eq!(report["recognition"]["rate"], 0.8);
+        assert_eq!(
+            report["false_reactions"]["non_phrase_set"]["speech"]["rate"],
+            3.0 / 104.0
+        );
+        assert_eq!(
+            report["false_reactions"]["non_phrase_set"]["non_speech"]["rate"],
+            0.0
+        );
         assert_no_null_rates(&report, "$");
     }
 
-    /// The two measurement aids are a classification, not a different report: a
-    /// run that priced another threshold set, or a subset of the phases, is
-    /// `screened` — the status the record gate and the console both read, even
-    /// when the run took all three phases.
+    /// The report's invariant: one row per voice, each over its own clips, and a
+    /// pooled figure that is labelled as pooled instead of being read as that many
+    /// independent trials. The set size and the population the overall divides are
+    /// different things, and both are stated.
+    #[test]
+    fn the_report_states_one_row_per_voice_and_its_pooled_population() {
+        let mut positives = vec![test_positives("enrolled")];
+        positives.extend((1..=2).map(|i| test_positives(&format!("voice{i:02}"))));
+        let mut negatives = vec![test_negatives("enrolled")];
+        negatives.extend((1..=2).map(|i| test_negatives(&format!("voice{i:02}"))));
+        let progress = Progress {
+            voices: Some(test_selection(2)),
+            recall: Some(Recall { voices: positives }),
+            non_phrase: Some(NonPhrase {
+                voices: negatives,
+                non_speech: NonSpeech {
+                    fired: 0,
+                    of: sets::NON_SPEECH_CLIPS,
+                    fired_labels: Vec::new(),
+                },
+            }),
+            ..Progress::default()
+        };
+        let report = report_json(&progress, "complete", 1.0, &test_config(), None);
+        let speech = &report["false_reactions"]["non_phrase_set"]["speech"];
+        let rows = speech["voices"].as_array().expect("rows");
+        assert_eq!(rows.len(), 3, "enrolled plus two clones");
+        for row in rows {
+            assert_eq!(row["of"], sets::SPEECH_NEGATIVE_CLIPS);
+            assert!(row.get("fired").is_some(), "{row}");
+        }
+        assert_eq!(speech["of"], 3 * sets::SPEECH_NEGATIVE_CLIPS);
+        assert_eq!(speech["false_reactions"], 3 * 3);
+        // The set size is what this run measured, and the population the overall
+        // divides is stated beside it: a three-voice run cannot claim the pinned set.
+        let set = &report["false_reactions"]["non_phrase_set"]["set"];
+        assert_eq!(
+            set["clips"],
+            3 * sets::SPEECH_NEGATIVE_CLIPS + sets::NON_SPEECH_CLIPS
+        );
+        assert_eq!(set["voices"], 3);
+        assert_eq!(
+            set["clips_pinned"],
+            sets::EXPECTED_NON_PHRASE_TOTAL,
+            "the pinned set the run falls short of is named, not silently equal to it"
+        );
+        assert_eq!(report["recognition"]["of"], 3 * sets::POSITIVE_CLIPS);
+    }
+
+    /// The measurement aids are a classification, not a different report: a run
+    /// that priced another threshold set, a subset of the phases, a short voice
+    /// set, or a bound larger than the defaults is `screened` — the status the
+    /// record gate and the console both read, even when the run measured
+    /// everything.
     #[test]
     fn a_run_that_prices_a_candidate_is_screened() {
         let benchmark = test_config();
@@ -1427,6 +1743,22 @@ mod tests {
             classify(&subset, &Ok(()), None, "inputs").0,
             "screened",
             "a subset of the phases is a candidate point"
+        );
+
+        let mut short = test_config();
+        short.voices = 3;
+        assert_eq!(
+            classify(&short, &Ok(()), None, "inputs").0,
+            "screened",
+            "a subset of the voices is a screening run"
+        );
+
+        let mut raised = test_config();
+        raised.timeout_secs = crate::guard::DEFAULT_TIMEOUT_SECS + 1;
+        assert_eq!(
+            classify(&raised, &Ok(()), None, "inputs").0,
+            "screened",
+            "a run given a larger wall-clock bound produces no recorded measurement"
         );
 
         let error = anyhow!("no denominator");
@@ -1491,27 +1823,33 @@ mod tests {
     /// words every row uses — never printed as a zero the run did not measure.
     #[test]
     fn a_figure_the_report_lacks_is_named_not_zeroed() {
-        let body = record_body(&json!({}));
-        assert!(body.contains(&format!("status: `{UNAVAILABLE}`")), "{body}");
+        let body = record::block(&json!({}));
+        assert!(
+            body.contains(&format!("status: `{}`", record::UNAVAILABLE)),
+            "{body}"
+        );
         for role in ["ASR body", "ASR sound", "TTS body", "TTS sound", "voice"] {
             assert!(
-                body.contains(&format!("- {role}: {UNAVAILABLE}")),
+                body.contains(&format!("- {role}: {}", record::UNAVAILABLE)),
                 "the {role} pin does not name its absence:\n{body}"
             );
         }
         for row in [
-            "recall",
-            "false reactions",
+            "negatives",
+            "negative overall (pooled speech)",
+            "non-speech",
+            "positives (pooled)",
             "false accepts",
             "thresholds",
             "derived point",
             "wall clock",
             "peak resident",
             "corpus",
+            "corpus build",
             "windows per encoder pass",
         ] {
             assert!(
-                body.contains(&format!("| {row} | {UNAVAILABLE} |")),
+                body.contains(&format!("| {row} | {} |", record::UNAVAILABLE)),
                 "the {row} row does not name its missing figure:\n{body}"
             );
         }
@@ -1534,36 +1872,345 @@ mod tests {
         }
     }
 
-    /// The same writer over a measured report states every figure: the
-    /// unavailable words appear only where the report has no number.
+    /// The plan is the corpus: every clip the synthetic side renders is a request,
+    /// its labels are unique — so a missed or fired list names one clip — and a
+    /// phase the run does not take asks the corpus for nothing.
     #[test]
-    fn a_measured_report_states_every_figure() {
-        let progress = Progress {
+    fn the_plan_is_the_whole_corpus_and_its_labels_are_unique() {
+        let speakers = test_selection(sets::NUM_VERIFICATION_VOICES).speakers();
+        let plan = audio::plan(&speakers, config::Phases::ALL);
+        assert_eq!(plan.len(), 1_956, "the corpus the module doc states");
+        let mut labels: Vec<String> = plan.iter().map(audio::Request::label).collect();
+        let planned = labels.len();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(labels.len(), planned, "two requests share a label");
+        // The probes are the two pinned sentences, not the wake phrase.
+        let probes: Vec<&str> = audio::probe_requests(&Speaker::Enrolled)
+            .iter()
+            .map(|request| request.text)
+            .collect();
+        assert_eq!(probes, sets::INTELLIGIBILITY_SENTENCES);
+        // A screening run asks for the phases it reads, not the whole corpus.
+        let recall_only = audio::plan(
+            &speakers,
+            config::Phases {
+                recall: true,
+                non_phrase: false,
+                real_audio: false,
+            },
+        );
+        assert_eq!(
+            recall_only.len(),
+            audio::enrolment_requests().len()
+                + sets::SPEECH_VOICES * (probes.len() + sets::POSITIVE_CLIPS)
+        );
+    }
+
+    /// One voice's negatives land in the category their row reports them under: the
+    /// per-category percentages divide those counts, so a category that lost a band
+    /// would move a row without moving the overall.
+    #[test]
+    fn one_voice_gets_the_pinned_clip_counts() {
+        let mut categories = [0usize; 3];
+        for (category, _) in audio::negative_requests(&Speaker::Enrolled) {
+            categories[category.index()] += 1;
+        }
+        assert_eq!(
+            categories,
+            [
+                sets::CONFUSABLE_CLIPS,
+                sets::UNRELATED_CLIPS,
+                sets::PHRASE_IN_PASSING_CLIPS
+            ]
+        );
+    }
+
+    /// A measurement never renders: the corpus build is the only writer, and the
+    /// sweep is what keeps a superseded corpus from accumulating. It removes the
+    /// entries any recorded generation claimed — clips and span cuts alike — and this
+    /// one did not produce: never an entry no build of this cache claimed, and never a
+    /// half-written one. A generation whose entries could not be removed stays
+    /// recorded for the next build.
+    #[test]
+    fn the_sweep_removes_only_the_corpus_a_recorded_build_replaced() {
+        let dir = std::env::temp_dir().join(format!(
+            "mahbot-wake-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let live = "a".repeat(64);
+        let dead = "b".repeat(64);
+        let replaced = "e".repeat(64);
+        let foreign = "d".repeat(64);
+        let span = "voice-0123456789abcdef-11.40-15.00-16000.wav".to_string();
+        let stale_span = "voice-fedcba9876543210-2.60-15.00-16000.wav".to_string();
+        let torn = format!("{}.tmp-999999", "c".repeat(64));
+        for name in [
+            &live,
+            &dead,
+            &replaced,
+            &foreign,
+            &span,
+            &stale_span,
+            &torn,
+            "notes.txt",
+        ] {
+            std::fs::write(dir.join(name), b"x").expect("a temp file");
+        }
+
+        let produced = std::collections::HashSet::from([live.clone(), span.clone()]);
+        // Two recorded generations: the corpus this build replaces is claimed by both.
+        let records = audio::Records::from([
+            (
+                "gen-1".to_string(),
+                std::collections::HashSet::from([
+                    live.clone(),
+                    dead.clone(),
+                    span.clone(),
+                    stale_span.clone(),
+                ]),
+            ),
+            (
+                "gen-2".to_string(),
+                std::collections::HashSet::from([replaced.clone()]),
+            ),
+        ]);
+
+        let (removed, survivors) = audio::sweep(&dir, &produced, &records);
+
+        assert_eq!(
+            removed,
+            Some(3),
+            "the replaced clip, the stale span and the other generation's clip go"
+        );
+        assert!(
+            survivors.is_empty(),
+            "every entry was reclaimed: {survivors:?}"
+        );
+        assert!(dir.join(&live).exists(), "the generation stays");
+        assert!(dir.join(&span).exists(), "its span stays");
+        assert!(!dir.join(&dead).exists(), "a replaced clip goes");
+        assert!(
+            !dir.join(&replaced).exists(),
+            "another generation's clip goes"
+        );
+        assert!(!dir.join(&stale_span).exists(), "a stale span goes");
+        assert!(
+            dir.join(&foreign).exists(),
+            "a clip no recorded build claimed is kept"
+        );
+        assert!(dir.join(&torn).exists(), "a half-written entry is not ours");
+        assert!(dir.join("notes.txt").exists(), "an unrelated file stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A measured run of all eleven voices, as the report writer sees it: one row
+    /// per voice on each side, the corpus entirely reused, and a generation whose
+    /// build is in the manifest.
+    fn eleven_voice_progress() -> Progress {
+        let mut positives = vec![test_positives(voices::ENROLLED)];
+        let mut negatives = vec![test_negatives(voices::ENROLLED)];
+        for index in 1..=sets::NUM_VERIFICATION_VOICES {
+            positives.push(test_positives(&format!("voice{index:02}")));
+            negatives.push(test_negatives(&format!("voice{index:02}")));
+        }
+        Progress {
             inputs: Some(test_inputs()),
-            recall: Some(Recall {
-                detected: 46,
-                of: 50,
-                first_pass: false,
-                missed: Vec::new(),
-            }),
+            voices: Some(test_selection(sets::NUM_VERIFICATION_VOICES)),
+            recall: Some(Recall { voices: positives }),
             non_phrase: Some(NonPhrase {
-                fired: vec!["clip".into()],
-                of: 121,
+                voices: negatives,
+                non_speech: NonSpeech {
+                    fired: 1,
+                    of: sets::NON_SPEECH_CLIPS,
+                    fired_labels: vec!["non-speech/pink_noise_s42".into()],
+                },
             }),
             real: Some(measured_real(1.066, 0.807)),
             calibration: Some(wake::Calibration::default()),
             thresholds: Some(wake::Thresholds::DEFAULT),
             synthesis: audio::SynthStats {
-                clips: 394,
-                cache_hits: 394,
+                reads: 1_956,
+                cache_hits: 1_956,
                 synth_secs: 0.0,
             },
+            corpus_build: Some(json!({
+                "clips": 1_956,
+                "built": 1_956,
+                "builds": 2,
+                "synthesis_secs": 2_797.2,
+                "last": {
+                    "built": 0,
+                    "swept": 0,
+                    "wall_secs": 66.6,
+                    "stopped": null,
+                },
+            })),
             ..Progress::default()
+        }
+    }
+
+    /// The console a completed run prints states both pooled overalls, one line per
+    /// voice on each side and the non-speech line — the surfaces the record's own
+    /// table cannot vouch for.
+    #[test]
+    fn the_console_states_both_pooled_overalls_and_every_voice() {
+        let report = report_json(
+            &eleven_voice_progress(),
+            "complete",
+            287.9,
+            &test_config(),
+            None,
+        );
+        let lines = record::lines(&report);
+        assert!(
+            !lines.iter().any(|line| line.contains(record::UNAVAILABLE)),
+            "{lines:#?}"
+        );
+        let pooled = |side: &str| {
+            lines
+                .iter()
+                .find(|line| line.contains(&format!("{side} pooled")))
+                .unwrap_or_else(|| panic!("no pooled {side} line: {lines:#?}"))
+                .clone()
         };
+        let negatives = pooled("negatives");
+        assert!(
+            negatives.contains("33/1144 (2.9 %) — pooled over 104 clips"),
+            "{negatives}"
+        );
+        let positives = pooled("positives");
+        assert!(
+            positives.contains("440/550 (80.0 %) — pooled over 50 clips"),
+            "{positives}"
+        );
+        let rows = |side: &str| {
+            lines
+                .iter()
+                .filter(|line| {
+                    line.starts_with(&format!("[wake-word] {side} ")) && !line.contains(" pooled")
+                })
+                .count()
+        };
+        assert_eq!(rows("negatives"), sets::SPEECH_VOICES, "{lines:#?}");
+        assert_eq!(rows("positives"), sets::SPEECH_VOICES, "{lines:#?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("non-speech: 1/17 (5.9 %) in a stream of its own")),
+            "{lines:#?}"
+        );
+    }
+
+    /// A build that stopped is recorded as stopped, and one stopped after the
+    /// corpus was already whole is not described as an incomplete corpus: the
+    /// manifest's own `corpus_complete` decides the wording, and a sweep count the
+    /// stop left unknown is named as unstated rather than printed as a zero.
+    #[test]
+    fn a_stopped_build_is_never_recorded_as_a_clean_one() {
+        // `swept` is stated once the sweep returned and `null` while it has not;
+        // neither a stop before the sweep nor one inside it measured a count.
+        let cases = [
+            (false, Value::Null, "stopped before the corpus was complete"),
+            (true, Value::Null, "stopped after the corpus was complete"),
+            (true, json!(7), "stopped after the corpus was complete"),
+        ];
+        for (complete, swept, expected) in cases {
+            let mut progress = eleven_voice_progress();
+            progress.corpus_build = Some(json!({
+                "clips": 1_956,
+                "built": 900,
+                "builds": 1,
+                "synthesis_secs": 1_000.0,
+                "last": {
+                    "built": 900,
+                    "swept": swept,
+                    "wall_secs": 1_200.0,
+                    "stopped": {"reason": "the resident ceiling", "corpus_complete": complete},
+                },
+            }));
+            let report = report_json(&progress, "stopped", 1_200.0, &test_config(), None);
+            let body = record::block(&report);
+            assert!(body.contains(expected), "{complete}: {body}");
+            let sweep = match (&swept, complete) {
+                // Both stopped cases leave the count unknown: neither a stop before
+                // the sweep nor one inside it measured how many entries it cleared.
+                (Value::Null, _) => "and its sweep count is not stated",
+                _ => "clearing 7 superseded entries",
+            };
+            assert!(body.contains(sweep), "{complete}: {body}");
+        }
+    }
+
+    /// The same writer over a measured report states every figure: the
+    /// unavailable words appear only where the report has no number.
+    #[test]
+    fn a_measured_report_states_every_figure() {
+        let progress = eleven_voice_progress();
         let report = report_json(&progress, "complete", 287.9, &test_config(), None);
-        let body = record_body(&report);
-        assert!(!body.contains(UNAVAILABLE), "{body}");
-        assert!(body.contains("| recall | 46/50 (92.0 %) |"), "{body}");
+        let body = record::block(&report);
+        assert!(!body.contains(record::UNAVAILABLE), "{body}");
+        assert!(
+            body.contains(
+                "| negatives | 1161 clips — 1144 speech across 11 voices, 17 \
+                           non-speech in a stream of their own |"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "| negative overall (pooled speech) | 33/1144 (2.9 %) — pooled over 104 clips \
+                 (56 distinct texts) across 11 voices, not 1144 independent trials |"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("| non-speech | 1/17 (5.9 %)"), "{body}");
+        assert!(
+            body.contains(
+                "| positives (pooled) | 440/550 (80.0 %) — pooled over 50 clips (11 \
+                           distinct texts) across 11 voices, not 550 independent utterances |"
+            ),
+            "{body}"
+        );
+        // One row per voice on each side, with its own denominators, and the
+        // pooled row below them.
+        assert!(
+            body.contains("Negatives by voice — 104 speech clips each:"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "| enrolled | 2/56 (3.6 %) | 1/40 (2.5 %) | 0/8 (0.0 %) | 3/104 (2.9 %) |"
+            ),
+            "{body}"
+        );
+        // Each voice's recording and span is stated once, in the provenance block.
+        assert!(
+            body.contains(
+                "- voice01: `speech/librivox/speech-librivox-0002.wav` · 11.40 s + 15.00 s · \
+                 sha256 f907f96e69eb8e680c86964f63ff570d2c24458beacd7d94520c44b2a5c10868"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("| pooled over 11 voices | 22/616 (3.6 %)"),
+            "{body}"
+        );
+        assert!(
+            body.contains("| pooled over 11 voices | 440 | 550 | 80.0 % |"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "pooled over 104 clips (56 distinct texts) across 11 voices, not 1144 \
+                 independent trials"
+            ),
+            "{body}"
+        );
         assert!(
             body.contains(&format!(
                 "| false accepts | 2 events · {:.4}/h over VAD-active speech (0.807 h)",
@@ -1575,6 +2222,38 @@ mod tests {
             body.contains("| peak resident | ") && body.contains("| wall clock | 287.9 s |"),
             "{body}"
         );
+        // The build's cost is stated, so a warm record cannot make the render free.
+        assert!(
+            body.contains(
+                "| corpus build | 1956 clips · 1956 rendered over 2 builds of this generation, \
+                 2797 s of synthesis; the last build took 67 s wall and rendered 0, clearing 0 \
+                 superseded entries |"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("is min 0.5000, median 0.5000, max 0.5000 over 45 pairs"),
+            "{body}"
+        );
+        // The record says what the numbers are, what they are not, and whose the
+        // prototype is.
+        for claim in [
+            "generalisation evidence",
+            "not comparable with the enrolled row",
+            "not a regression against anything",
+            "single-reader provenance, not speaker identity",
+            "distinct recordings, not verified different people",
+            "passed",
+            "The check is deliberately not built on the wake phrase",
+        ] {
+            assert!(
+                body.contains(claim),
+                "the record does not state `{claim}`:\n{body}"
+            );
+        }
+        // The record states this run only: nothing of the old aggregate survives.
+        assert!(!body.contains("46/121"), "{body}");
+        assert!(!body.contains("| recall |"), "{body}");
     }
 
     fn assert_no_null_rates(value: &Value, path: &str) {
@@ -1657,7 +2336,7 @@ mod tests {
 
         let blocker = dir.join("blocker");
         std::fs::write(&blocker, b"x").expect("write the blocker");
-        cfg.report = blocker.join("wake_word_report.json");
+        cfg.report = Some(blocker.join("wake_word_report.json"));
         assert!(
             report
                 .write(
@@ -1675,7 +2354,7 @@ mod tests {
             "a failed write must not spend the claim"
         );
 
-        cfg.report = dir.join("wake_word_report.json");
+        cfg.report = Some(dir.join("wake_word_report.json"));
         report
             .write(
                 &cfg,
@@ -1685,8 +2364,8 @@ mod tests {
                 Some(("recall", "stop")),
             )
             .expect("the retry writes");
-        assert!(cfg.report.exists());
-        let text = std::fs::read_to_string(&cfg.report).expect("read");
+        assert!(cfg.report_path().exists());
+        let text = std::fs::read_to_string(cfg.report_path()).expect("read");
         assert_eq!(
             serde_json::from_str::<Value>(&text).expect("parse")["status"],
             "aborted"
@@ -1747,27 +2426,60 @@ mod tests {
         assert_eq!(fa["fa"]["fa_per_hour_vad_active"], 4.0);
     }
 
-    /// The report states the set's shape once, in counts that add up to the
-    /// pinned total.
+    /// Each side states its set's shape once, in the `set` object the printers read,
+    /// and the parts add up to the pinned total.
     #[test]
-    fn the_reported_composition_adds_up() {
-        let non_phrase = non_phrase_composition();
-        let summed = non_phrase["confusable_clips"].as_u64().unwrap()
-            + non_phrase["unrelated_clips"].as_u64().unwrap()
-            + non_phrase["silence_clips"].as_u64().unwrap()
-            + non_phrase["noise_clips"].as_u64().unwrap()
-            + non_phrase["phrase_in_passing_clips"].as_u64().unwrap();
-        assert_eq!(summed as usize, sets::EXPECTED_NON_PHRASE_TOTAL);
+    fn the_reported_set_adds_up() {
+        let progress = Progress {
+            recall: Some(Recall {
+                voices: (0..sets::SPEECH_VOICES)
+                    .map(|index| test_positives(&format!("voice{index:02}")))
+                    .collect(),
+            }),
+            non_phrase: Some(NonPhrase {
+                voices: (0..sets::SPEECH_VOICES)
+                    .map(|index| test_negatives(&format!("voice{index:02}")))
+                    .collect(),
+                non_speech: NonSpeech {
+                    fired: 0,
+                    of: sets::NON_SPEECH_CLIPS,
+                    fired_labels: Vec::new(),
+                },
+            }),
+            ..Progress::default()
+        };
+        let report = report_json(&progress, "complete", 1.0, &test_config(), None);
+        let set = &report["false_reactions"]["non_phrase_set"]["set"];
+        let whole = |key: &str| set[key].as_u64().expect(key) as usize;
+        let per_voice = whole("confusable_clips_per_voice")
+            + whole("unrelated_clips_per_voice")
+            + whole("phrase_in_passing_clips_per_voice");
+        assert_eq!(per_voice, sets::SPEECH_NEGATIVE_CLIPS);
+        assert_eq!(per_voice, whole("speech_clips_per_voice"));
         assert_eq!(
-            non_phrase["total"].as_u64().unwrap() as usize,
+            whole("speech_clips") + whole("non_speech_clips"),
+            whole("clips")
+        );
+        assert_eq!(
+            per_voice * whole("voices") + whole("silence_clips") + whole("noise_clips"),
             sets::EXPECTED_NON_PHRASE_TOTAL
         );
-
-        let recall = recognition_composition(50);
         assert_eq!(
-            recall["wake_only_clips"].as_u64().unwrap()
-                + recall["command_plus_speech_clips"].as_u64().unwrap(),
-            50
+            set["clips_pinned"].as_u64().expect("pinned"),
+            sets::EXPECTED_NON_PHRASE_TOTAL as u64
+        );
+
+        let set = &report["recognition"]["set"];
+        let whole = |key: &str| set[key].as_u64().expect(key) as usize;
+        assert_eq!(
+            whole("wake_only_clips_per_voice") + whole("command_plus_speech_clips_per_voice"),
+            sets::POSITIVE_CLIPS
+        );
+        assert_eq!(whole("clips_per_voice"), sets::POSITIVE_CLIPS);
+        assert_eq!(whole("clips"), sets::EXPECTED_POSITIVE_TOTAL);
+        assert_eq!(
+            set["clips_pinned"].as_u64().expect("pinned"),
+            sets::EXPECTED_POSITIVE_TOTAL as u64
         );
     }
 

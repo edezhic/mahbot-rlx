@@ -19,7 +19,9 @@
 //! The figures are inputs (`--timeout` / `MAHBOT_TIMEOUT_SECS`,
 //! `--max-rss` / `MAHBOT_MAX_RSS_MIB`); the swap-growth ceiling has
 //! `MAHBOT_STAND_MAX_SWAP_MIB` for a reproduction on a busy machine. The
-//! defaults are stated here so a run without them is still bounded.
+//! defaults are stated here so a run without them is still bounded, and a
+//! measurement taken under a larger bound is `screened`: it produces no recorded
+//! measurement.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -31,36 +33,51 @@ use anyhow::{Context, Result, bail};
 use crate::report;
 
 /// Default wall-clock stop. With the corpus in place — the normal case, since it
-/// is generated once — the run takes ~370 s, of which the real-audio sweep is
-/// ~296 s. Building the corpus is the long path and it is measured: 1 357 s for
-/// the 394 clips, so a run that has to build it takes ~1 730 s. 3 600 s covers
-/// that build on a slower machine and still bounds a runaway.
+/// is built once, deliberately — a measured eleven-voice run finishes well inside
+/// this bound, most of its wall clock going to the two clip-stream phases and the
+/// real-audio sweep. `MEASUREMENTS.md`'s bench block is where those costs are
+/// stated; this paragraph deliberately does not repeat them.
+///
+/// Building the corpus is a separate operation with no wall-clock bound of its
+/// own, and a measurement never renders: a cache short of a clip stops and names
+/// the build instead of starting that synthesis. The bound is not raised to fit a
+/// build into a measurement either — a run given a larger one produces no recorded
+/// measurement.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 3_600;
 
-/// Default resident-set ceiling. The corpus-building run peaks at ~2.1 GiB and a
-/// warm one at ~1.3 GiB; 6 GiB leaves room for the mapped models on an 18 GiB
-/// machine and aborts before the machine starts swapping.
+/// Default resident-set ceiling. It leaves room for the mapped models and the one
+/// synthesis pipeline a run holds beside them on an 18 GiB machine, while still
+/// aborting before the machine starts swapping. The record states the peak a
+/// measured run reached; a corpus build carries the same guards and no wall clock.
 pub const DEFAULT_MAX_RSS_MIB: u64 = 6_144;
 
 /// Swap **growth since the run started** above which it stops, unless
-/// `MAHBOT_STAND_MAX_SWAP_MIB` names another ceiling. GPU allocations on a
-/// unified-memory machine are not visible in the process's resident set, so
-/// this is the figure that catches the pressure a sweep creates: the run that
-/// stopped working held 6.9 GiB of an 8.2 GiB swap file while its own resident
-/// set read under 700 MiB. Growth rather than the absolute figure, because a
-/// machine that has swapped before this run started is not this run's doing.
+/// `MAHBOT_STAND_MAX_SWAP_MIB` names another ceiling — and a measurement taken
+/// under a raised ceiling is `screened`, so it produces no recorded measurement. GPU
+/// allocations on a unified-memory machine are not visible in the process's
+/// resident set, so this is the figure that catches the pressure a sweep creates:
+/// the run that stopped working held 6.9 GiB of an 8.2 GiB swap file while its own
+/// resident set read under 700 MiB. Growth rather than the absolute figure, because
+/// a machine that has swapped before this run started is not this run's doing.
 pub const MAX_SWAP_GROWTH_MIB: u64 = 1_024;
 
-/// The swap-growth ceiling this process runs under: [`MAX_SWAP_GROWTH_MIB`]
-/// unless `MAHBOT_STAND_MAX_SWAP_MIB` names another one. One accessor, so the
-/// enforcement in [`MemoryCeiling::check_system`] and the record's provenance
-/// line cannot disagree about the bound a run was taken under.
+/// The swap-growth ceiling `env` names: [`MAX_SWAP_GROWTH_MIB`] unless
+/// `MAHBOT_STAND_MAX_SWAP_MIB` holds a whole number. The environment it reads is
+/// an input, so a resolved run can be classified under the same closure it was
+/// resolved from instead of the live process environment.
+#[must_use]
+pub fn swap_growth_ceiling(env: &impl Fn(&str) -> Option<std::ffi::OsString>) -> u64 {
+    env("MAHBOT_STAND_MAX_SWAP_MIB")
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(MAX_SWAP_GROWTH_MIB)
+}
+
+/// [`swap_growth_ceiling`] over this process's environment — the bound
+/// [`MemoryCeiling::check_system`] enforces.
 #[must_use]
 pub fn max_swap_growth_mib() -> u64 {
-    std::env::var("MAHBOT_STAND_MAX_SWAP_MIB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(MAX_SWAP_GROWTH_MIB)
+    swap_growth_ceiling(&|name| std::env::var_os(name))
 }
 
 /// The resident-set ceiling a run is under, in MiB — `MAHBOT_MAX_RSS_MIB`, or
@@ -163,7 +180,8 @@ impl std::error::Error for Abort {}
 /// A wall-clock stop shared by every phase.
 #[derive(Clone, Copy)]
 pub struct Deadline {
-    end: Instant,
+    /// `None` for the corpus build, which has no bound to expire.
+    end: Option<Instant>,
     secs: u64,
 }
 
@@ -171,9 +189,18 @@ impl Deadline {
     #[must_use]
     pub fn new(secs: u64) -> Self {
         Self {
-            end: Instant::now() + Duration::from_secs(secs),
+            end: Some(Instant::now() + Duration::from_secs(secs)),
             secs,
         }
+    }
+
+    /// A deadline that never expires: the corpus build is a deliberate operation
+    /// with no wall-clock bound — its safety guards are the memory ones. `secs`
+    /// reads as zero because there is no bound to name, and no stop can be
+    /// produced to print one.
+    #[must_use]
+    pub fn unbounded() -> Self {
+        Self { end: None, secs: 0 }
     }
 
     #[must_use]
@@ -183,7 +210,7 @@ impl Deadline {
 
     #[must_use]
     pub fn expired(&self) -> bool {
-        Instant::now() >= self.end
+        self.end.is_some_and(|end| Instant::now() >= end)
     }
 
     /// The error a caller at a work-item boundary returns when the stop expired.
@@ -203,6 +230,10 @@ impl Deadline {
 #[derive(Clone, Copy)]
 pub struct MemoryCeiling {
     rss_bytes: u64,
+    /// The swap-growth ceiling, in MiB, resolved with the rest of the run's
+    /// inputs: the bound the record states and the bound the run is held to are
+    /// one figure, not two reads of one variable.
+    swap_mib: u64,
     /// The free-memory floor; `None` leaves that arm inactive. Only the feed
     /// tests do, because they measure accounting, not a run, and must not fail
     /// because the host is busy.
@@ -215,8 +246,16 @@ pub struct MemoryCeiling {
 }
 
 impl MemoryCeiling {
+    /// The ceiling at the default swap-growth bound of this process's environment.
     #[must_use]
     pub fn new(mib: u64) -> Self {
+        Self::with_swap_growth(mib, max_swap_growth_mib())
+    }
+
+    /// The ceiling at an explicit swap-growth bound, for a caller that resolved
+    /// that input with the rest of its own.
+    #[must_use]
+    pub fn with_swap_growth(mib: u64, swap_mib: u64) -> Self {
         let swap_start = swap_used_bytes();
         if swap_start.is_none() {
             eprintln!(
@@ -226,6 +265,7 @@ impl MemoryCeiling {
         }
         Self {
             rss_bytes: mib.saturating_mul(1024 * 1024),
+            swap_mib,
             free_floor: Some(MIN_FREE_PERCENT),
             swap_start,
         }
@@ -237,6 +277,7 @@ impl MemoryCeiling {
     pub(crate) fn process_only(mib: u64) -> Self {
         Self {
             rss_bytes: mib.saturating_mul(1024 * 1024),
+            swap_mib: MAX_SWAP_GROWTH_MIB,
             free_floor: None,
             swap_start: None,
         }
@@ -280,15 +321,14 @@ impl MemoryCeiling {
 
     /// Swap in use and free system memory. Two process spawns on macOS, so this
     /// is a phase / file boundary check, not a per-clip one. The swap-growth
-    /// ceiling is [`MAX_SWAP_GROWTH_MIB`] unless `MAHBOT_STAND_MAX_SWAP_MIB`
-    /// names another one, so a reproduction on a busy machine can raise the
-    /// bound without changing the default.
+    /// ceiling is the one the run was constructed with, so a reproduction on a
+    /// busy machine can raise the bound without changing the default.
     pub fn check_system(&self, phase: &'static str) -> Result<()> {
         if let Some(start) = self.swap_start
             && let Some(now) = swap_used_bytes()
         {
             let growth = now.saturating_sub(start);
-            let ceiling = max_swap_growth_mib().saturating_mul(1024 * 1024);
+            let ceiling = self.swap_mib.saturating_mul(1024 * 1024);
             if growth > ceiling {
                 return Err(anyhow::Error::new(Abort::Memory {
                     phase,
@@ -399,18 +439,33 @@ pub fn free_percent() -> Option<u64> {
     }
 }
 
-/// The one lock every heavy run of this crate takes: `MAHBOT_LOCK` when it names
-/// a non-empty path, else `mahbot-heavy-run.lock` in the temp directory. One path
-/// for both entry points and for a cell run on its own, because two heavy runs on
-/// the same device is what the lock exists to prevent.
-#[must_use]
-pub fn lock_path() -> std::path::PathBuf {
-    std::env::var_os("MAHBOT_LOCK")
-        .filter(|value| !value.is_empty())
-        .map_or_else(
-            || std::env::temp_dir().join("mahbot-heavy-run.lock"),
-            std::path::PathBuf::from,
-        )
+/// The one lock every heavy run of this crate takes, resolved through `env`:
+/// `MAHBOT_LOCK` when it names a non-empty path, else `mahbot-heavy-run.lock` in the
+/// temp directory (`TMPDIR`, then `TMP`, `TEMP` — the order `std::env::temp_dir`
+/// reads). One path for both entry points and for a cell run on its own, because
+/// two heavy runs on the same device is what the lock exists to prevent.
+///
+/// A caller that resolves its inputs from something other than the process
+/// environment passes that lookup in, so a configuration resolved in a test cannot
+/// name the developer's lock. A lookup that names no temp directory either cannot
+/// resolve one: the lock is refused, as the corpus cache's path is.
+///
+/// # Errors
+/// Neither `MAHBOT_LOCK` nor `TMPDIR`, `TMP`, `TEMP` is set, so no shared path exists.
+pub fn lock_path(env: &impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<std::path::PathBuf> {
+    if let Some(path) = env("MAHBOT_LOCK").filter(|value| !value.is_empty()) {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    match ["TMPDIR", "TMP", "TEMP"]
+        .into_iter()
+        .find_map(|name| env(name).filter(|value| !value.is_empty()))
+    {
+        Some(dir) => Ok(std::path::PathBuf::from(dir).join("mahbot-heavy-run.lock")),
+        None => bail!(
+            "none of MAHBOT_LOCK, TMPDIR, TMP or TEMP is set — there is no shared lock path, \
+             and two heavy runs on one device is what the lock exists to prevent"
+        ),
+    }
 }
 
 /// An exclusive advisory lock on the path [`lock_path`] resolves — `MAHBOT_LOCK`
@@ -640,5 +695,34 @@ mod tests {
             "the lock was not released when the holder dropped"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shared lock: an explicit path wins, otherwise the temp directory the
+    /// platform names — and a lookup that names none refuses rather than falling
+    /// back to the process environment.
+    #[test]
+    fn the_lock_path_wins_in_order_and_refuses_an_empty_lookup() {
+        let lookup = |name: &str| match name {
+            "MAHBOT_LOCK" => Some("/tmp/explicit.lock".into()),
+            "TMPDIR" => Some("/tmp/dir".into()),
+            "TMP" => Some("/var/tmp".into()),
+            _ => None,
+        };
+        assert_eq!(
+            lock_path(&lookup).unwrap(),
+            std::path::PathBuf::from("/tmp/explicit.lock")
+        );
+        let implicit = |name: &str| (name != "MAHBOT_LOCK").then(|| lookup(name)).flatten();
+        assert_eq!(
+            lock_path(&implicit).unwrap(),
+            std::path::PathBuf::from("/tmp/dir/mahbot-heavy-run.lock")
+        );
+        let only_tmp = |name: &str| (name == "TMP").then(|| lookup(name)).flatten();
+        assert_eq!(
+            lock_path(&only_tmp).unwrap(),
+            std::path::PathBuf::from("/var/tmp/mahbot-heavy-run.lock")
+        );
+        let empty = lock_path(&|_: &str| None).expect_err("no path named");
+        assert!(empty.to_string().contains("TMPDIR"), "{empty}");
     }
 }

@@ -20,10 +20,20 @@ authors.workspace      = true
 license.workspace      = true
 repository.workspace   = true
 publish = false
+# Two binaries: without this, a bare `cargo run -p mahbot-inference --features bench`
+# is ambiguous. The stand is the product entry point.
+default-run = "mahbot-inference"
 
 [[bin]]
 name = "mahbot-inference"
 path = "src/main.rs"
+
+# The corpus build: the one deliberate operation that renders the wake-word
+# bench's clips. Not a measurement, and never automatic.
+[[bin]]
+name = "wake-word-build"
+path = "src/bin/wake_word_build.rs"
+required-features = ["bench"]
 
 [dependencies]
 # The parser under the model loader: GGUF header, metadata, raw tensor bytes, dequant.

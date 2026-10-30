@@ -43,12 +43,22 @@ pub fn peak_rss() -> Option<u64> {
     None
 }
 
-/// [`peak_rss`] as a line prints it: the count, or `-` where the kernel did not answer.
-///
-/// Every harness that prints a peak uses this, so the rule — a reading nobody took prints
-/// `-`, never a zero — is stated once rather than restated by each caller.
+/// [`peak_rss`] as the raw byte count a `process_peak_bytes=` line states, or `-`
+/// where the kernel did not answer — the rule a reading nobody took prints `-`,
+/// never a zero, stated once rather than restated by each caller.
 pub fn peak_text() -> String {
     peak_rss().map_or_else(|| "-".to_string(), |bytes| bytes.to_string())
+}
+
+/// [`peak_rss`] in MiB: the unit the wake-word bench's console and its record
+/// state a peak in, so the two cannot report the same figure differently.
+pub fn peak_mib() -> String {
+    peak_rss().map_or_else(|| "-".to_string(), mib)
+}
+
+/// A byte count in MiB, the bench's unit for a peak residency.
+pub fn mib(bytes: u64) -> String {
+    format!("{} MiB", bytes / (1024 * 1024))
 }
 
 #[cfg(unix)]

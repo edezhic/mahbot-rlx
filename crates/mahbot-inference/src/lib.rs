@@ -12,9 +12,10 @@
 //! transcription's labels come from and [`vad`] the voice-activity detector both
 //! it and the wake path decide on. [`music`] is the music pool the transcription's
 //! measurements are taken on. [`stand`] is the measurement stand
-//! (`mahbot-inference` binary) and [`bench`] is the wake-word bench. Every model
-//! path enters through an argument or an environment variable — see
-//! [`loader::models_dir`] and [`loader::voice_wav`].
+//! (`mahbot-inference` binary) and [`bench`] is the wake-word bench, whose corpus
+//! the `wake-word-build` binary renders. Every model path enters through an
+//! argument or an environment variable — see [`loader::models_dir`] and
+//! [`loader::voice_wav`].
 
 pub mod bench;
 pub mod ced;

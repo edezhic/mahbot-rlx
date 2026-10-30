@@ -393,44 +393,111 @@ these is in the tree.
 <!-- BEGIN bench -->
 ## Wake-word bench
 
-_Measured 2026-10-27 03:39 UTC._
+_Measured 2026-10-30 07:08 UTC._
 
 status: `complete`
 
 | metric | value |
 |---|---|
-| recall | 46/50 (92.0 %) |
-| false reactions | 46/121 (38.0 %) |
+| negatives | 1161 clips — 1144 speech across 11 voices, 17 non-speech in a stream of their own |
+| negative overall (pooled speech) | 54/1144 (4.7 %) — pooled over 104 clips (56 distinct texts) across 11 voices, not 1144 independent trials |
+| non-speech | 0/17 (0.0 %) — silence and noise, measured apart |
+| positives (pooled) | 61/550 (11.1 %) — pooled over 50 clips (11 distinct texts) across 11 voices, not 550 independent utterances |
 | false accepts | 2 events · 2.4773/h over VAD-active speech (0.807 h) · 1.8756/h over wall-clock audio (1.066 h) · one event = 1.2386/h |
 | thresholds | `floor_min=0.55, floor_max=0.75, tail_z=2.33, fire_factor_cap=0.55, anchor=0.838, reset_ratio=0.95, adaptive_k=2.5, adaptive_ceiling=2.6` |
 | derived point | floor 0.7500 · fire factor 0.3520 · static bar 1.0560 · reset 0.3344 |
-| wall clock | 288.2 s |
-| peak resident | 1339 MiB |
-| corpus | 394 of 394 clips reused, 0 synthesized in 0.0 s |
+| wall clock | 798.6 s |
+| peak resident | 1988 MiB |
+| corpus | 1956 of 1956 clip reads reused, 0 rendered in 0.0 s |
+| corpus build | 1956 clips · 1956 rendered over 16 builds of this generation, 2797 s of synthesis; the last build took 63 s wall and rendered 0, clearing 0 superseded entries |
 | windows per encoder pass | at most 16 of 16 · 731 partial of 1567 passes |
+
+Negatives by voice — 104 speech clips each:
+
+| voice | phonetic near-misses (56) | unrelated sentences (40) | wake phrase inside a sentence (8) | overall (104) |
+|---|---|---|---|---|
+| enrolled | 31/56 (55.4 %) | 11/40 (27.5 %) | 2/8 (25.0 %) | 44/104 (42.3 %) |
+| voice01 | 0/56 (0.0 %) | 0/40 (0.0 %) | 0/8 (0.0 %) | 0/104 (0.0 %) |
+| voice02 | 0/56 (0.0 %) | 0/40 (0.0 %) | 0/8 (0.0 %) | 0/104 (0.0 %) |
+| voice03 | 0/56 (0.0 %) | 0/40 (0.0 %) | 0/8 (0.0 %) | 0/104 (0.0 %) |
+| voice04 | 2/56 (3.6 %) | 0/40 (0.0 %) | 0/8 (0.0 %) | 2/104 (1.9 %) |
+| voice05 | 0/56 (0.0 %) | 0/40 (0.0 %) | 0/8 (0.0 %) | 0/104 (0.0 %) |
+| voice06 | 1/56 (1.8 %) | 0/40 (0.0 %) | 0/8 (0.0 %) | 1/104 (1.0 %) |
+| voice07 | 0/56 (0.0 %) | 0/40 (0.0 %) | 0/8 (0.0 %) | 0/104 (0.0 %) |
+| voice08 | 0/56 (0.0 %) | 0/40 (0.0 %) | 0/8 (0.0 %) | 0/104 (0.0 %) |
+| voice09 | 0/56 (0.0 %) | 0/40 (0.0 %) | 0/8 (0.0 %) | 0/104 (0.0 %) |
+| voice10 | 6/56 (10.7 %) | 0/40 (0.0 %) | 1/8 (12.5 %) | 7/104 (6.7 %) |
+| pooled over 11 voices | 40/616 (6.5 %) | 11/440 (2.5 %) | 3/88 (3.4 %) | 54/1144 (4.7 %) |
+
+pooled over 104 clips (56 distinct texts) across 11 voices, not 1144 independent trials
+
+Non-speech, in a stream of its own: 0/17 (0.0 %).
+
+Positives by voice — 50 clips each:
+
+| voice | detected | of | rate |
+|---|---|---|---|
+| enrolled | 46 | 50 | 92.0 % |
+| voice01 | 0 | 50 | 0.0 % |
+| voice02 | 0 | 50 | 0.0 % |
+| voice03 | 0 | 50 | 0.0 % |
+| voice04 | 0 | 50 | 0.0 % |
+| voice05 | 0 | 50 | 0.0 % |
+| voice06 | 7 | 50 | 14.0 % |
+| voice07 | 0 | 50 | 0.0 % |
+| voice08 | 0 | 50 | 0.0 % |
+| voice09 | 0 | 50 | 0.0 % |
+| voice10 | 8 | 50 | 16.0 % |
+| pooled over 11 voices | 61 | 550 | 11.1 % |
+
+pooled over 50 clips (11 distinct texts) across 11 voices, not 550 independent utterances
+
+**What these numbers are.** The prototype, the calibration pool and the anti-prototypes are the enrolled voice's alone; the 10 clone voices are scored against them, which is what makes their rows generalisation evidence. The enrolled voice's row is measured at thresholds fitted on that same voice and is not.
+
+**The voices.** The clone voices are rendered from as many distinct single-reader recordings in the corpus input that the false-accept phase does not measure, one per voice, each named in the provenance block below with the recording it was cut from and its span. A clone's only per-voice input is a speaker embedding, so their renders may resemble one another more than their sources do: these figures describe how the detector behaves across these voice variations, not how it would behave for arbitrary strangers. The corpus establishes single-reader provenance, not speaker identity: these are distinct recordings, not verified different people.
+
+The witness that the clone voices did not collapse into one voice: the pairwise cosine between the reference embeddings the clones are built from is min 0.9002, median 0.9380, max 0.9679 over 45 pairs, the closest being voice03 and voice05 at 0.9679. Nothing was rejected on it.
+
+**The set.** The negative side is 1161 clips — 1144 speech clips (104 per voice: 56 phonetic near-misses, 40 unrelated sentences, 8 wake-phrase-in-passing clips, over 11 voices) and the 17 non-speech clips measured apart in a stream of their own — and the positive side 550 clips (50 per voice: 40 bare wake-phrase renders plus 10 wake-phrase-plus-command clips, the same 40 and 10 in every voice). Every pooled figure is pooled: the same 104 (or 50) clips across 11 voices, not 1144 (or 550) independent utterances. The overalls over the 10 clone voices are not comparable with the enrolled row and are not a regression against anything — a different population, and thresholds fitted on another voice. A near-zero figure on either side is a finding about cross-voice detection, not a failed round: the detector was not re-tuned here.
+
+**The check.** A voice counts as usable when the pinned ordinary sentences — `the weather is sunny today`, `please open the window` — rendered in it come back from the workspace's own recogniser word for word, in order, ignoring case and punctuation. The enrolled voice's own outcome: passed. The check is deliberately not built on the wake phrase, which this recogniser spells in no voice, including the owner's; whether the wake phrase survives in a given voice is what that voice's rows above measure. The check establishes that a voice is usable; the rest of its renders are not individually gated.
+
+The voices were selected by walking the pinned pool of 20 recordings in its pinned order and taking the first that passed the check. The measured set is 10 clone voices plus the enrolled voice.
 
 | phase | seconds |
 |---|---|
-| enrolment | 9.8 |
-| inputs | 7.1 |
-| non-phrase | 27.3 |
-| non-phrase synthesis | 0.2 |
-| real audio | 234.0 |
-| recall | 4.1 |
-| recall synthesis | 0.1 |
+| enrolment | 10.1 |
+| inputs | 7.2 |
+| non-phrase | 369.5 |
+| non-phrase synthesis | 2.0 |
+| real audio | 233.5 |
+| recall | 122.3 |
+| recall synthesis | 1.0 |
+| voices | 51.8 |
 
 Provenance:
 
 - machine: arm64 · Apple M3 Pro
 - device: Apple M3 Pro (Metal)
 - profile: release
-- code: dd4a1a53 change-sha256 6822e184bc966446
-- command: `cargo bench -p mahbot-inference --features bench --bench wake_word -- --asr-body ~/.mahbot/userspaces/admin/models/Qwen3-ASR-1.7B-Q4_K_M.gguf --asr-sound ~/.mahbot/userspaces/admin/models/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf --tts-body ~/.mahbot/userspaces/admin/models/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf --tts-sound ~/.mahbot/userspaces/admin/models/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf --voice ~/.mahbot/userspaces/admin/assets/rlx-4bit-tts/voice-sample.wav --corpus ~/.mahbot/faph_corpus --report /tmp/mahbot-wake-report-final.json --lock /tmp/mahbot-wake.lock --timeout 3600 --max-rss 6144`
+- guards: stop 3600 s · resident 6144 MiB · swap growth 1024 MiB
+- code: 7635b567 change-sha256 d30aa59f49469ab0
+- command: `cargo bench -p mahbot-inference --features bench --bench wake_word -- --asr-body ~/.mahbot/userspaces/admin/models/Qwen3-ASR-1.7B-Q4_K_M.gguf --asr-sound ~/.mahbot/userspaces/admin/models/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf --tts-body ~/.mahbot/userspaces/admin/models/Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf --tts-sound ~/.mahbot/userspaces/admin/models/mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf --voice ~/.mahbot/userspaces/admin/assets/rlx-4bit-tts/voice-sample.wav --corpus ~/.mahbot/faph_corpus --report /tmp/mahbot/mahbot-wake-report.json --lock /tmp/mahbot/mahbot-heavy-run.lock --timeout 3600 --max-rss 6144`
 - ASR body: `Qwen3-ASR-1.7B-Q4_K_M.gguf` · 1282435552 bytes · sha256 3893b8926065bbff3da7586d21d8711a9b4fa4fa8f12cd0cefad58e31b2660b6
 - ASR sound: `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf` · 355709344 bytes · sha256 46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d
 - TTS body: `Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf` · 1035965280 bytes · sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
 - TTS sound: `mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` · 446422912 bytes · sha256 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2
 - voice: `voice-sample.wav` · 558764 bytes · sha256 0ca6c18b9189381dcdad83d26814f73b3f4d2d26dea6892371c2177d30e72ace
+- voice01: `speech/librivox/speech-librivox-0002.wav` · 11.40 s + 15.00 s · sha256 f907f96e69eb8e680c86964f63ff570d2c24458beacd7d94520c44b2a5c10868
+- voice02: `speech/librivox/speech-librivox-0039.wav` · 2.80 s + 15.00 s · sha256 41fb73636b15dc76815fff9f816c97e897d2d920acef4b89097f8f05fe682fca
+- voice03: `speech/librivox/speech-librivox-0094.wav` · 14.80 s + 15.00 s · sha256 b529147404ffd239df9a5eaddfe19e7130393fb756e4f56f4ee85d68cd63cc7d
+- voice04: `speech/librivox/speech-librivox-0092.wav` · 106.60 s + 15.00 s · sha256 00eaf9379dfd80075731d89a9f83df2139b4959037513f61597f848a5668fff0
+- voice05: `speech/librivox/speech-librivox-0079.wav` · 131.60 s + 15.00 s · sha256 116937d90638753623eabc97626e0d18b7b73ffd523534caf055a48171c67d81
+- voice06: `speech/librivox/speech-librivox-0168.wav` · 141.10 s + 15.00 s · sha256 d5f2d58fffc2ed0694e5362ac047e3f0386a864fa0ff5f1c9d6ce66c399e4731
+- voice07: `speech/librivox/speech-librivox-0009.wav` · 3.10 s + 15.00 s · sha256 afdfc48bb6ac16ffd97cf0663cc90122d7defa17d07d6b3c5017a6523c086cef
+- voice08: `speech/librivox/speech-librivox-0089.wav` · 13.80 s + 15.00 s · sha256 cf8dfec778ea249d67282b7a7396fa954d212280ff44cb723cdb45e15f2ed01b
+- voice09: `speech/librivox/speech-librivox-0129.wav` · 40.60 s + 15.00 s · sha256 75252026b534c7bb730c44cb721e6c7105220cbf1b4023eee9c7d5af40256adf
+- voice10: `speech/librivox/speech-librivox-0065.wav` · 5.90 s + 15.00 s · sha256 725adb1ab5289dbcd8c8016285ae34890c96ac4f150995f20d078a1cfd1ecbf3
 <!-- END bench -->
 
 <!-- BEGIN transcribe -->

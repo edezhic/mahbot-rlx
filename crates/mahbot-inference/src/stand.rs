@@ -279,9 +279,10 @@ fn peak_bytes() -> u64 {
     })
 }
 
-/// The lock's path: the shared one every heavy run of this crate takes.
-fn stand_lock() -> std::path::PathBuf {
-    crate::guard::lock_path()
+/// The lock's path: the shared one every heavy run of this crate takes, resolved from
+/// the process environment the stand itself was launched with.
+fn stand_lock() -> anyhow::Result<std::path::PathBuf> {
+    crate::guard::lock_path(&|name: &str| std::env::var_os(name))
 }
 
 /// Set by the parent on a cell's own process: the parent holds the lock and kills
@@ -353,7 +354,7 @@ impl StandGuard {
 /// The lock and the two limits every heavy run of the stand carries — the parent
 /// and a cell started on its own alike — or the message the run exits with.
 fn heavy_run() -> (RunLock, Deadline, MemoryCeiling) {
-    let lock = match RunLock::acquire(&stand_lock()) {
+    let lock = match stand_lock().and_then(|path| RunLock::acquire(&path)) {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("stand: {error:#}");
@@ -590,7 +591,10 @@ pub fn main_entry() {
         "stand: stop {}s · ceiling {} MiB · lock {}",
         deadline.secs(),
         ceiling.rss_bytes() / (1024 * 1024),
-        stand_lock().display()
+        stand_lock().map_or_else(
+            |error| format!("{error:#}"),
+            |path| path.display().to_string()
+        )
     );
     let _lock = lock;
 
