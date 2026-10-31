@@ -2,121 +2,265 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `MEASUREMENTS.md` at the workspace root: the latest numbers from this
-//! crate's three measuring surfaces — the stand, the wake-word bench and the
-//! transcription cell — replaced in place by the run that produced them.
+//! The repository's record: three files at its root, one per measuring surface,
+//! each rewritten whole by the only run that can produce it — `STAND.md` by a
+//! complete main stand run, `TRANSCRIPTION-CORPUS.md` by a complete corpus run,
+//! `WAKE-WORD-BENCH.md` by a complete wake-word bench run.
 //!
-//! The file is the repository's own record, not a log: each surface owns one
-//! section, each section carries its own date, and a run rewrites its section
-//! rather than appending to it. History is what version control is for.
+//! A run writes no other mode's file, and a partial, subset or screened run writes
+//! nothing at all. The files are a record, not a log: history is what version
+//! control is for.
+//!
+//! A mode takes its file before it measures — sweeping the temporaries no live run
+//! is writing beside it, and proving the file writable — and writes it once, whole,
+//! at the end.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// The file, at the workspace root of the tree that **compiled** this binary
-/// (`CARGO_MANIFEST_DIR`'s grandparent), unless `MAHBOT_MEASUREMENTS` names a
-/// path. The variable is how a run that must not touch the tree — a QA run
-/// checking the bench end to end — redirects the record. A release binary run
-/// from elsewhere otherwise still writes into that tree. Every surface treats a
-/// refresh that fails as a failed run: the numbers a change produces are
-/// incomplete until this file shows them.
-#[must_use]
-pub fn path() -> PathBuf {
-    match std::env::var_os("MAHBOT_MEASUREMENTS").filter(|path| !path.is_empty()) {
-        Some(path) => PathBuf::from(path),
-        None => Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("MEASUREMENTS.md"),
+/// A record file, and the one mode that writes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Record {
+    Stand,
+    TranscriptionCorpus,
+    WakeWordBench,
+}
+
+impl Record {
+    /// Every record, so a path that must speak of all of them — the digest's
+    /// exclusions, a test — cannot be written against three names and miss a fourth.
+    pub const ALL: [Self; 3] = [Self::Stand, Self::TranscriptionCorpus, Self::WakeWordBench];
+
+    /// The file's name at the workspace root.
+    #[must_use]
+    pub const fn file(self) -> &'static str {
+        match self {
+            Self::Stand => "STAND.md",
+            Self::TranscriptionCorpus => "TRANSCRIPTION-CORPUS.md",
+            Self::WakeWordBench => "WAKE-WORD-BENCH.md",
+        }
     }
-}
 
-const HEADER: &str = "# Measurements
-
-The latest numbers from this crate's three measuring surfaces. Each row is
-replaced by the run that measured it: the section carries that run's date and
-`code` line, and its `rows` line names which rows the run took — a row a later
-run did not measure is carried, not re-taken, because its own inputs are not what
-that run opens. The surfaces are run at different times, so any one of the three
-may be older than another. This file is not a log — history is what version
-control is for.
-
-";
-
-/// Replace one surface's section of the file at [`path`], leaving the other
-/// sections as they were.
-pub fn refresh(section: &str, body: &str) -> Result<()> {
-    refresh_at(&path(), section, body)
-}
-
-/// [`refresh`] against an explicit file, so the section arithmetic is testable
-/// without touching the tree the crate was compiled in.
-fn refresh_at(path: &Path, section: &str, body: &str) -> Result<()> {
-    let existing = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        // Absent is the first run of the first surface: start from the header.
-        // Any other failure leaves a file whose other section must not be
-        // overwritten with an empty one.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("cannot read {}", path.display()));
+    /// The file's heading.
+    #[must_use]
+    pub const fn heading(self) -> &'static str {
+        match self {
+            Self::Stand => "# Stand",
+            Self::TranscriptionCorpus => "# Transcription corpus",
+            Self::WakeWordBench => "# Wake-word bench",
         }
-    };
-    let begin = format!("<!-- BEGIN {section} -->");
-    let end = format!("<!-- END {section} -->");
-    let block = format!("{begin}\n{}\n{end}", body.trim_end());
-    let text = match (existing.find(&begin), existing.find(&end)) {
-        (Some(a), Some(b)) if b > a => {
-            format!("{}{block}{}", &existing[..a], &existing[b + end.len()..])
+    }
+
+    /// The directory the record goes into: `MAHBOT_MEASUREMENTS` when it names a
+    /// directory, otherwise the workspace root of the tree that **compiled** this
+    /// binary (`CARGO_MANIFEST_DIR`'s grandparent). A redirect that is not a
+    /// directory would collapse the three modes into one file, so it is refused —
+    /// before a run measures anything, through [`Record::prepare`].
+    fn dir() -> Result<PathBuf> {
+        let dir = match std::env::var_os("MAHBOT_MEASUREMENTS").filter(|path| !path.is_empty()) {
+            Some(path) => PathBuf::from(path),
+            None => Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(".."),
+        };
+        if !dir.is_dir() {
+            anyhow::bail!(
+                "`{}` is not a directory — each record is written under its own name",
+                dir.display()
+            );
         }
-        _ => {
-            let mut text = if existing.trim().is_empty() {
-                HEADER.to_string()
-            } else {
-                existing
-            };
-            if !text.ends_with('\n') {
-                text.push('\n');
+        Ok(dir)
+    }
+
+    /// Where a run writes it, under the directory [`Record::dir`] resolves.
+    fn path(self) -> Result<PathBuf> {
+        Ok(Self::dir()?.join(self.file()))
+    }
+
+    /// The recipe this file's mode is run with — never the process's own argv, which
+    /// for a bench harness is a hashed path in a build directory and for any mode
+    /// carries its scratch flags. The input bullets beside it name the material the
+    /// run read, which is the rest of what a re-run needs.
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Stand => "cargo run --release -p mahbot-inference",
+            Self::TranscriptionCorpus => {
+                "cargo run --release -p mahbot-inference --features bench --bin \
+                 transcription-corpus"
             }
-            if !text.ends_with("\n\n") {
-                text.push('\n');
+            Self::WakeWordBench => {
+                "cargo bench -p mahbot-inference --features bench --bench wake_word -- --report <file>"
             }
-            format!("{text}{block}\n")
         }
-    };
-    let tmp = path.with_extension(format!("md.{}.tmp", std::process::id()));
-    // A run killed between the write and the rename leaves a `.tmp` beside the
-    // record; it is untracked, so the provenance digest would fold it in and
-    // staging would commit it. Sweep this target's stale temps before writing.
-    sweep_stale_temps(path);
-    if let Err(error) = std::fs::write(&tmp, text.as_bytes()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error).with_context(|| format!("cannot write {}", tmp.display()));
     }
-    if let Err(error) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error).with_context(|| format!("cannot move {} into place", tmp.display()));
+
+    /// The provenance line stating the recipe this record is reproduced with.
+    fn command_line(self) -> String {
+        format!("- command: {}\n", self.command())
     }
-    Ok(())
+
+    /// Take the record a run is about to write: sweep the temporaries no live run is
+    /// writing beside it, then prove it writable — at the start of a run, before it
+    /// measures anything, and never from inside a write. A write is where
+    /// another run's in-flight temporary lives, and the per-clip cache this crate
+    /// writes goes through the same writer; the sweep must never reach it.
+    ///
+    /// The probe carries the name `temporary` gives this writer's own temporary, so a
+    /// run killed in this window leaves a file the next run of this record sweeps and
+    /// `tree_digest` already leaves out.
+    ///
+    /// # Errors
+    /// The redirect is not a directory, or nothing can be written into it.
+    pub fn prepare(self) -> Result<()> {
+        let path = self.path()?;
+        sweep_beside(&path);
+        let probe = temporary(&path, std::process::id());
+        std::fs::write(&probe, b"")
+            .and_then(|()| std::fs::remove_file(&probe))
+            .with_context(|| format!("cannot write {}", path.display()))
+    }
 }
 
-/// Remove `<path>.md.<pid>.tmp` leftovers beside `path`, from runs that died
-/// between the write and the rename.
-fn sweep_stale_temps(path: &Path) {
-    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
-        return;
-    };
-    let prefix = format!("{name}.");
+/// Replace `record` whole: its heading, its body — the table or tables, each with
+/// a short caption under it — and the provenance block its inputs build. A mode
+/// owns one file, so this is the only write path.
+pub fn write(record: Record, body: &str, inputs: &str) -> Result<()> {
+    write_at(&record.path()?, record, body, &provenance(record, inputs))
+}
+
+/// Replace a record file whole. Its previous content is irrelevant: a record is
+/// the run that wrote it, and no run edits another's.
+fn write_at(path: &Path, record: Record, body: &str, provenance: &str) -> Result<()> {
+    let body = format!(
+        "{}\n\n{}\n\n{}\n",
+        record.heading(),
+        body.trim(),
+        provenance.trim(),
+    );
+    write_atomic(path, |tmp| Ok(std::fs::write(tmp, body.as_bytes())?))
+}
+
+/// The mark between a file and the pid of the temporary beside it: `<target>.tmp-<pid>`,
+/// the one naming rule. `temporary` writes a name from it and `leftover` reads
+/// one back, so a change to the rule cannot reach one and miss the other.
+const TEMP_MARK: &str = ".tmp-";
+
+/// The temporary [`write_atomic`] writes beside `path` for the writer `pid`:
+/// `<target>.tmp-<pid>`, beside the file it is to become.
+fn temporary(path: &Path, pid: u32) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(TEMP_MARK);
+    name.push(pid.to_string());
+    path.with_file_name(name)
+}
+
+/// The target and pid a name carries when it is a writer's temporary, and `None`
+/// for any other name — a checkout's own `foo.tmp` is content like any other. The one
+/// rule: the writer builds its name from it, the sweep matches a target against it,
+/// and the tree digest asks whether any target matches.
+fn leftover(name: &str) -> Option<(&str, u32)> {
+    let (target, pid) = name.rsplit_once(TEMP_MARK)?;
+    let whole =
+        !target.is_empty() && !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit());
+    whole
+        .then(|| pid.parse().ok())
+        .flatten()
+        .map(|pid| (target, pid))
+}
+
+/// The crate's one atomic whole-file writer: the bytes go to a temporary file beside
+/// the target, that file is flushed to the device, and only then is it renamed into
+/// place — so a name never becomes visible before its bytes are. The rename's
+/// directory entry is flushed too, where the platform lets a directory be synced.
+/// A failed write leaves the target untouched and its own temporary file removed.
+/// A killed writer's temporary is reclaimed at the start of the next run that owns the
+/// target — [`Record::prepare`] for a record, `bench::prepare_cache` for the corpus
+/// cache, the bench's report swept beside its own path — never from here: a write is
+/// where another run's in-flight temporary lives.
+pub(crate) fn write_atomic(path: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let tmp = temporary(path, std::process::id());
+    let written = write(&tmp)
+        .and_then(|()| {
+            Ok(std::fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)?
+                .sync_all()?)
+        })
+        .and_then(|()| {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("cannot move {} into place", tmp.display()))
+        })
+        .map(|()| {
+            // Where the platform refuses to sync a directory, the file's own bytes
+            // are still flushed, which is what a reader of the new name sees.
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::File::open(dir).and_then(|dir| dir.sync_all());
+            }
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// Remove the temporaries a killed writer left in `dir` — `target`'s alone when it
+/// names one file, any target's otherwise — and never one a live run is still
+/// writing: two runs can share a directory under different locks, and deleting the
+/// temporary under a live run's rename loses that run's work. A run's own pid is
+/// swept too, because the run that prepares a record has written nothing yet. Where
+/// the platform cannot say whether a pid is running, the leftover is left alone.
+pub(crate) fn sweep(dir: &Path, target: Option<&str>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let file = entry.file_name();
-        let Some(file) = file.to_str() else { continue };
-        if file.starts_with(&prefix) && file.ends_with(".tmp") {
+        let Some((owner, pid)) = file.to_str().and_then(leftover) else {
+            continue;
+        };
+        let named = target.is_none_or(|target| owner == target);
+        if named && (pid == std::process::id() || !running(pid)) {
             let _ = std::fs::remove_file(entry.path());
         }
+    }
+}
+
+/// [`sweep`] for the file `path` is to become: the temporaries of that one name, left
+/// beside it.
+pub(crate) fn sweep_beside(path: &Path) {
+    if let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+        sweep(dir, Some(name));
+    }
+}
+
+/// Whether `pid` is a running process; `true` where the platform has no reading, so
+/// a leftover whose owner may be a run in flight is never removed. A killed writer's
+/// temporary is therefore reclaimed on unix targets only — elsewhere it stays where it
+/// lies, which the tree digest leaves out either way.
+fn running(pid: u32) -> bool {
+    // A writer is never pid 0, so a name that carries it is a leftover by definition
+    // (and signal 0 would otherwise mean this process's own group).
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // `EPERM`: the pid exists but belongs to another user, so it is a live run.
+        const EPERM: i32 = 1;
+
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let Ok(pid) = i32::try_from(pid) else {
+            return true;
+        };
+        // SAFETY: signal 0 sends nothing; it asks the kernel whether this pid exists.
+        unsafe {
+            kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(EPERM)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -133,7 +277,7 @@ pub fn short_path(path: &Path) -> String {
 
 /// `2026-10-18 21:20 UTC`.
 #[must_use]
-pub fn now() -> String {
+fn now() -> String {
     std::process::Command::new("date")
         .args(["-u", "+%Y-%m-%d %H:%M UTC"])
         .output()
@@ -147,7 +291,7 @@ pub fn now() -> String {
 
 /// The machine: architecture and CPU model.
 #[must_use]
-pub fn machine() -> String {
+fn machine() -> String {
     let arch = std::process::Command::new("uname")
         .arg("-m")
         .output()
@@ -180,38 +324,70 @@ pub fn machine() -> String {
 
 /// The device the graphs ran on, as the backend named it.
 #[must_use]
-pub fn device() -> String {
+fn device() -> String {
     rlx_wgpu::device::wgpu_device().map_or_else(
         || "no wgpu adapter".to_string(),
         |device| format!("{} ({:?})", device.name, device.backend),
     )
 }
 
-/// The adapter's driver: `AdapterInfo`'s `driver` and `driver_info`, which only
-/// the Vulkan HAL fills — wgpu's Metal HAL reports neither, and the backend keeps
-/// that as `None`, so the line says `unknown` rather than printing an empty
-/// value. On Vulkan this is the driver's name and its version, which is what a
-/// figure taken on that machine has to be read against.
-#[must_use]
-pub fn driver() -> String {
-    rlx_wgpu::device::wgpu_device().map_or_else(
-        || "no wgpu adapter".to_string(),
-        |device| match (device.driver.as_deref(), device.driver_info.as_deref()) {
-            (Some(driver), Some(info)) => format!("{driver} {info}"),
-            (Some(driver), None) => driver.to_string(),
-            (None, _) => "unknown".to_string(),
-        },
-    )
-}
-
 /// `release` or `debug`.
 #[must_use]
-pub fn profile() -> String {
+fn profile() -> String {
     if cfg!(debug_assertions) {
         "debug".to_string()
     } else {
         "release".to_string()
     }
+}
+
+/// The one provenance block every record carries: when and where the row was taken,
+/// from what code, under which switches, by which invocation, and the run's own
+/// input pins. `inputs` is `record`'s own bullets — the material the rows read.
+#[must_use]
+fn provenance(record: Record, inputs: &str) -> String {
+    let mut body = format!("_Measured {}._\n", now());
+    body.push_str(&format!("- machine: {}\n", machine()));
+    body.push_str(&format!("- device: {}\n", device()));
+    body.push_str(&format!("- profile: {}\n", profile()));
+    body.push_str(&format!(
+        "- code: {} (the commit and the SHA-256 of the tree's difference from it, {})\n",
+        code_state(),
+        exclusions_note(),
+    ));
+    body.push_str(&record.command_line());
+    body.push_str(&run_form());
+    body.push_str(inputs);
+    body
+}
+
+/// The `RLX_*` and `WGPU_*` variables this run had set, so a record taken under a
+/// scheduling, precision or instrumentation switch is distinguishable from a clean
+/// one — some of them move the numbers. Omitted when none is set. Read as the
+/// platform hands the names over, so a variable that is not UTF-8 cannot take the
+/// record with it.
+fn run_form() -> String {
+    let mut set: Vec<(String, String)> = std::env::vars_os()
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy();
+            name.starts_with("RLX_") || name.starts_with("WGPU_")
+        })
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    if set.is_empty() {
+        return String::new();
+    }
+    set.sort();
+    let pairs: Vec<String> = set
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    format!("- run form: {}\n", pairs.join(" · "))
 }
 
 /// The code state the numbers were taken at: `git describe --always` plus the
@@ -222,7 +398,7 @@ pub fn profile() -> String {
 /// inventing a figure. `git describe --dirty` counts the vendored MLX submodule,
 /// which `change_digest` excludes, so the marker and the digest would otherwise
 /// disagree about what "dirty" means.
-pub fn code_state() -> String {
+fn code_state() -> String {
     let describe = std::process::Command::new("git")
         .args(["describe", "--always"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -238,41 +414,37 @@ pub fn code_state() -> String {
     }
 }
 
-/// The paths [`change_digest`] leaves out, with the reason the record prints for
-/// each. One list: the pathspecs the digest applies and the rule the provenance
-/// line prints are generated from it, so a reader's rule and the computed figure
-/// cannot disagree.
-const EXCLUSIONS: &[(&str, &str)] = &[
-    ("MEASUREMENTS.md", "the run that measures rewrites it"),
-    (
-        "crates/backends/rlx-mlx-sys",
-        "the vendored MLX checkout is not this fork's content",
-    ),
-];
+/// The paths [`change_digest`] leaves out: the three records — each mode's own file is
+/// the figure, not part of the code that produced it — and the vendored MLX checkout,
+/// which is not this fork's content. One list, derived from [`Record::ALL`] and
+/// printed beside the figure it produces.
+fn exclusions() -> Vec<&'static str> {
+    Record::ALL
+        .into_iter()
+        .map(Record::file)
+        .chain(["crates/backends/rlx-mlx-sys"])
+        .collect()
+}
 
-/// [`EXCLUSIONS`] as the provenance line's sentence.
-pub(crate) fn provenance_rule() -> String {
-    let mut items: Vec<String> = EXCLUSIONS
+/// [`exclusions`] as the provenance line's parenthetical.
+fn exclusions_note() -> String {
+    let names: Vec<String> = exclusions()
         .iter()
-        .map(|(path, why)| format!("`{path}` excluded, because {why}"))
+        .map(|path| format!("`{path}`"))
         .collect();
-    match items.pop() {
-        None => String::new(),
-        Some(last) if items.is_empty() => last,
-        Some(last) => format!("{}, and {last}", items.join(", ")),
-    }
+    format!("{} left out", names.join(", "))
 }
 
 /// SHA-256 over what the tree holds beyond its commit: `git diff HEAD --binary`
-/// with [`EXCLUSIONS`] left out — the digest names the *code* that produced a
+/// with [`exclusions`] left out — the digest names the *code* that produced a
 /// figure, and the record is the figure — plus every untracked, non-ignored
 /// file's path and bytes, since an added source file the index has not seen is
-/// part of that code too. First 16 hex characters. `None` when git cannot answer;
-/// the caller then records the describe state alone rather than inventing a
-/// figure.
+/// part of that code too. A writer's leftover temporary is not content: it is left
+/// out by the rule that recognizes it (`leftover`). First 16 hex characters.
+/// `None` when git cannot answer; the caller then records the describe state alone
+/// rather than inventing a figure.
 fn change_digest() -> Option<String> {
-    let excluded: Vec<&str> = EXCLUSIONS.iter().map(|(path, _)| *path).collect();
-    tree_digest(&excluded)
+    tree_digest(&exclusions())
 }
 
 /// [`change_digest`] over an explicit exclusion set — so the test can recompute the
@@ -312,7 +484,18 @@ fn tree_digest(exclude: &[&str]) -> Option<String> {
     }
     let mut hasher = Sha256::new();
     hasher.update(&diff.stdout);
-    hash_untracked(&mut hasher, &root, untracked_paths(&untracked.stdout)?);
+    let untracked = untracked_paths(&untracked.stdout)?
+        .into_iter()
+        .filter(|path| !exclude.contains(&path.as_str()))
+        .filter(|path| {
+            !Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(leftover)
+                .is_some()
+        })
+        .collect();
+    hash_untracked(&mut hasher, &root, untracked);
     Some(hex(&hasher.finalize())[..16].to_string())
 }
 
@@ -362,14 +545,6 @@ fn hash_untracked(hasher: &mut sha2::Sha256, root: &Path, mut paths: Vec<String>
     }
 }
 
-/// A file's byte size and SHA-256, for the provenance block — the same hasher
-/// the input pins use, so a model file is hashed once per run, not twice.
-#[must_use]
-pub fn digest(path: &Path) -> Option<(u64, String)> {
-    let bytes = std::fs::metadata(path).ok()?.len();
-    Some((bytes, sha256_file(path).ok()?))
-}
-
 /// Hex SHA-256 of a file's bytes, streamed so a multi-gigabyte model file is not
 /// held in memory. The one hasher: the input pins, the corpus pins and the
 /// provenance block all go through it.
@@ -408,31 +583,73 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// The checked-in record opens with the header this module writes. A run against
-    /// an absent file regenerates that header, so a hand-edited one would leave the
-    /// artifact contradicting the code that owns it — the drift this pins shut.
+    /// A directory of this test's own — so a sweep that names no target cannot reach a
+    /// file another program left in the shared temp directory — removed whole when it
+    /// goes out of scope, including on an assertion that fails and returns early.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let dir = std::env::temp_dir().join(format!(
+                "mahbot-record-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("a temp directory");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A process the sweep must see as a live run, ended and reaped when it goes out of
+    /// scope so a failed assertion does not leave it running.
+    #[cfg(unix)]
+    struct Live(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for Live {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Each checked-in record opens with the heading its own mode writes, so a
+    /// hand-edited file cannot contradict the code that owns it — and the three
+    /// files' existence is the acceptance, so a missing one fails here rather than
+    /// passing quietly.
     #[test]
-    fn the_record_opens_with_the_header_this_module_writes() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("MEASUREMENTS.md");
-        let text = match std::fs::read_to_string(&root) {
-            Ok(text) => text,
-            Err(_) => return,
-        };
-        assert!(
-            text.starts_with(HEADER),
-            "{} does not open with HEADER",
-            root.display()
-        );
+    fn every_record_opens_with_its_own_heading() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        for record in Record::ALL {
+            let path = root.join(record.file());
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            assert!(
+                text.starts_with(record.heading()),
+                "{} does not open with `{}`",
+                path.display(),
+                record.heading()
+            );
+        }
     }
 
     /// The provenance line names the content, not only the commit, and the rule it
     /// prints is the rule it computes: the digest must answer here (a tree git
     /// cannot read has nothing to pin, so the run fails rather than passing
     /// quietly), and a reader who applies the exclusions the printed rule names —
-    /// read out of the rule itself, not out of [`EXCLUSIONS`] — must arrive at the
+    /// read out of the rule itself, not out of `exclusions` — must arrive at the
     /// figure the line carries.
     /// Device-free, and it reads the tree instead of writing into it.
     #[test]
@@ -448,7 +665,7 @@ mod tests {
             "hexadecimal: {state}"
         );
 
-        let rule = provenance_rule();
+        let rule = exclusions_note();
         let named: Vec<&str> = rule.split('`').skip(1).step_by(2).collect();
         assert!(!named.is_empty(), "the rule names its exclusions: {rule}");
         assert_eq!(
@@ -458,42 +675,139 @@ mod tests {
         );
     }
 
-    fn temp_file(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        std::env::temp_dir().join(format!(
-            "mahbot-measurements-{tag}-{}-{nanos}.md",
-            std::process::id()
-        ))
+    /// A write replaces the file whole: there are no sections, so a later write
+    /// cannot leave an earlier run's body behind.
+    #[test]
+    fn a_write_replaces_the_whole_file() {
+        let dir = Scratch::new("replace");
+        let path = dir.path().join("STAND.md");
+        write_at(
+            &path,
+            Record::Stand,
+            "| a |\n|---|\n\ncaption one",
+            "- code: one",
+        )
+        .expect("first write");
+        write_at(
+            &path,
+            Record::Stand,
+            "| b |\n|---|\n\ncaption two",
+            "- code: two",
+        )
+        .expect("second write");
+        let text = std::fs::read_to_string(&path).expect("the file");
+        assert!(
+            text.starts_with("# Stand\n\n| b |\n|---|\n\ncaption two"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("caption one") && !text.contains("| a |"),
+            "{text}"
+        );
     }
 
-    /// One surface's refresh replaces its own block and leaves the other's
-    /// exactly as it was — the failure that would silently drop a stale half.
+    /// Each record states the recipe its own mode is reproduced with, in the line the
+    /// provenance block renders from the record alone — a shell invocation, never a
+    /// path from the run host, which for a bench harness is a hashed path in a build
+    /// directory and for any mode carries the run's scratch flags.
     #[test]
-    fn a_refresh_replaces_its_section_and_keeps_the_other() {
-        let path = temp_file("sections");
-        refresh_at(&path, "stand", "stand v1").expect("first section");
-        refresh_at(&path, "bench", "bench v1").expect("second section");
-        let text = std::fs::read_to_string(&path).expect("the file");
-        assert!(text.contains("stand v1") && text.contains("bench v1"));
-        assert_eq!(text.matches("<!-- BEGIN stand -->").count(), 1);
-
-        refresh_at(&path, "stand", "stand v2").expect("replacement");
-        let text = std::fs::read_to_string(&path).expect("the file");
-        assert!(text.contains("stand v2") && !text.contains("stand v1"));
-        assert!(text.contains("bench v1"), "the other section survived");
-        assert_eq!(text.matches("<!-- BEGIN stand -->").count(), 1);
-        let _ = std::fs::remove_file(&path);
+    fn every_record_names_the_invocation_its_mode_documents() {
+        for record in Record::ALL {
+            let line = record.command_line();
+            assert!(
+                line.starts_with("- command: ") && !line.contains('/'),
+                "{}: {line}",
+                record.file()
+            );
+        }
     }
 
-    /// An unreadable file is an error, never an empty one: rewriting it would
-    /// destroy the section this run does not own.
+    /// The naming rule exists once: the name the writer makes for a pid is the name the
+    /// sweep and the tree digest recognize back, and nothing else is a temporary.
     #[test]
-    fn an_unreadable_file_is_refused_rather_than_emptied() {
-        let path = temp_file("unreadable");
-        std::fs::create_dir_all(&path).expect("a directory where the file should be");
-        assert!(refresh_at(&path, "stand", "body").is_err());
-        let _ = std::fs::remove_dir(&path);
+    fn the_temporary_rule_is_one_rule() {
+        let made = temporary(Path::new("STAND.md"), 12);
+        let name = made
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a name");
+        assert_eq!(name, "STAND.md.tmp-12");
+        assert_eq!(leftover(name), Some(("STAND.md", 12)));
+        assert_eq!(leftover("a.f32.tmp-0"), Some(("a.f32", 0)));
+        for other in ["STAND.md.tmp-notes", "STAND.md.tmp-", ".tmp-12", "STAND.md"] {
+            assert_eq!(leftover(other), None, "`{other}` is not a temporary");
+        }
+    }
+
+    /// A write touches nothing but its own temporary: the per-clip cache goes through
+    /// this same writer, ~2 000 times per corpus build, and a second run can share
+    /// that directory under another lock while its clips are in flight.
+    #[test]
+    fn a_write_never_removes_a_file_it_did_not_make() {
+        let dir = Scratch::new("write-isolation");
+        let path = dir.path().join("STAND.md");
+        let others = [temporary(&path, 0), temporary(&path, 999_999)];
+        for file in &others {
+            std::fs::write(file, b"another run's clip").expect("a file beside the target");
+        }
+
+        write_at(&path, Record::Stand, "| a |", "- code: one").expect("the write");
+
+        for file in &others {
+            assert!(file.exists(), "{} was removed by a write", file.display());
+        }
+    }
+
+    /// A run killed between the write and the rename leaves `<record>.tmp-<pid>`
+    /// beside it, and staging would pick it up — the write path a killed run never
+    /// reaches. The sweep runs at the start of the next run, so a subset, screened or
+    /// failed run clears it too, and it clears that record's name only: a directory can
+    /// hold another writer's files. A file that merely looks temporary is content and
+    /// stays, and so does the temporary a live run is still writing — a second run can
+    /// share a directory under another lock. A directory sweep with no target (the
+    /// corpus cache) reaps every dead writer's leftover, and no live one's.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_reaps_only_what_no_live_run_is_writing() {
+        let dir = Scratch::new("sweep");
+        let path = dir.path().join("STAND.md");
+        write_at(&path, Record::Stand, "| a |", "- code: one").expect("a first write");
+        // This process's own (a reused pid's leftover), a pid no writer can have, a name
+        // that only looks temporary, a live run's in-flight write, and another file's
+        // killed temporary.
+        let own = temporary(&path, std::process::id());
+        let stale = temporary(&path, 999_999);
+        let foreign = dir.path().join(format!("STAND.md{TEMP_MARK}notes"));
+        let sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a live process");
+        let live = temporary(&path, sleeper.id());
+        let _live = Live(sleeper);
+        let neighbour = temporary(&dir.path().join("neighbour.f32"), 999_999);
+        for file in [&own, &stale, &foreign, &live, &neighbour] {
+            std::fs::write(file, b"half a write").expect("a file beside the record");
+        }
+
+        sweep_beside(&path);
+
+        assert!(!stale.exists(), "{} survived the sweep", stale.display());
+        assert!(!own.exists(), "{} survived the sweep", own.display());
+        assert!(foreign.exists(), "{} was swept", foreign.display());
+        assert!(
+            live.exists(),
+            "{} is another run's in-flight write",
+            live.display()
+        );
+        assert!(
+            neighbour.exists(),
+            "{} is another writer's file",
+            neighbour.display()
+        );
+
+        sweep(dir.path(), None);
+
+        assert!(!neighbour.exists(), "a dead writer's neighbour survived");
+        assert!(live.exists(), "a live run's in-flight write was swept");
     }
 }

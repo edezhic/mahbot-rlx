@@ -2,18 +2,18 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The music pool: the one measurement input the pinned real-audio corpus does
-//! not hold, and the ground truth the song rule is tested against.
+//! The music pool: the ground truth the song rule is tested against.
 //!
-//! It lives here rather than in `transcribe` because it is the record's input, not
-//! the product's: the surface a caller transcribes with opens any audio it is
-//! given, and nothing it does depends on this listing. The split is the truth —
+//! It lives here rather than in `transcribe` because it is a product check's
+//! input, not the product's: the surface a caller transcribes with opens any
+//! audio it is given, and nothing it does depends on this listing. The split is
+//! the truth —
 //! `instrumental/` holds music with no words (a transcript over any of it is the
 //! defect this pool exists to catch) and `vocal/` holds singing, which the song
 //! rule transcribes only where the words come out.
 //!
 //! One table, not three: [`CLIPS`] carries each clip's path, hash, size and
-//! source, so a renamed file cannot leave the record's provenance and the gates
+//! source, so a renamed file cannot leave the check's provenance and the rule
 //! describing different files.
 
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result, bail};
 
 /// One pinned clip: where it lives in the pool, what it hashes, and what it is the
-/// ground truth for — the licence and the expectation, as the record prints them.
+/// ground truth for — the licence and the expectation the check reads.
 pub struct Clip {
     pub path: &'static str,
     pub sha256: &'static str,
@@ -131,15 +131,4 @@ pub fn verify() -> Result<Vec<PathBuf>> {
         paths.push(path);
     }
     Ok(paths)
-}
-
-/// The pool's provenance as one sentence, for the record: every clip's path, what
-/// it is and its licence, so the CC BY 2.5 clip's attribution travels with the
-/// pins.
-pub fn provenance() -> String {
-    CLIPS
-        .iter()
-        .map(|clip| format!("{} — {}.", clip.path, clip.source))
-        .collect::<Vec<_>>()
-        .join(" ")
 }

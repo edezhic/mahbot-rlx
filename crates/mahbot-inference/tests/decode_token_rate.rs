@@ -18,12 +18,12 @@
 //!
 //! # Why the frame is not the stand
 //!
-//! The stand (the `mahbot-inference` binary) measures whole cells off the model
+//! The stand (the `mahbot-inference` binary) measures product calls off the model
 //! files. This harness needs none of them: what it builds is the **shape** of one
 //! decode step — the same 28 layers, the same 169 packed multiplies at the same
 //! `(k, n, scheme)` triples, the same 28 attention calls over
-//! `[1, 363, 8, 128]` key/value planes, and the same logits readback the stand's
-//! step performs. The weights are a deterministic byte ramp
+//! `[1, 363, 8, 128]` key/value planes, and the same logits readback a product
+//! decode step performs. The weights are a deterministic byte ramp
 //! ([`support::packed_ramp`]) — nothing reads their values, so only their bytes
 //! and their block layout are modelled.
 //!
@@ -32,7 +32,7 @@
 //! `D = 2048`, `NH = 16`, `NKV = 8`, `HD = 128`, `FFN = 6144`, `LAYERS = 28`,
 //! `VOCAB = 151936`; the cache capacity the shipped decode body allocates is
 //! `KEYS = 363` rows (a 234-row prompt plus one 128-row prefill bucket, and the
-//! step's own spare row). The cell enters the decode with `WRITTEN_FIRST = 234`
+//! step's own spare row). The walk enters the decode with `WRITTEN_FIRST = 234`
 //! rows written, its first token reads 235 and its last reads
 //! `WRITTEN_LAST = 299`; the step's own append lands in the spare row.
 //!
@@ -157,17 +157,10 @@
 //! multiplies and moves only the edges; its unfused norms cost the extra
 //! elementwise steps its own census prints, so read the pair against those. D is
 //! attention in isolation: its planes are never appended to, and the row the
-//! real step writes into each before reading it is the *fold* the stand counts as
-//! its second call (a device-side copy of the rows the step appends) — the frame
-//! here writes each row in-graph (`KvAppend`, one row, aliasing the cache) but
-//! pays no fold, so it prices the chunked submissions and not the fold.
-//!
-//! The derived cell figure is arithmetic on the stand's listen cell
-//! ([`STAND_FRONT_MS`] + [`STAND_PREFILL_MS`] + [`STAND_TOKENS`] × this
-//! harness's token, over [`STAND_AUDIO_S`]) and on this harness's own token,
-//! which is not the stand's step: no plane fold, no host argmax, ramp weights.
-//! It is the proxy's arithmetic, not a measurement of the cell — a stand run in
-//! the same window is the reading of the cell itself.
+//! real step writes into each before reading it is the *fold* a step pays (a
+//! device-side copy of the rows the step appends) — the frame here writes each
+//! row in-graph (`KvAppend`, one row, aliasing the cache) but pays no fold, so it
+//! prices the chunked submissions and not the fold.
 //!
 //! The submission bracket is the one place the backend's own chunking shows: it
 //! hands one command buffer per 64 encoded steps, so a schedule this long is
@@ -213,9 +206,9 @@ const FFN: usize = 6144;
 const LAYERS: usize = 28;
 const VOCAB: usize = 151936;
 const KEYS: usize = 363;
-/// The prompt rows the stand's listen cell starts its decode from.
+/// The prompt rows the recognition walk starts its decode from.
 const WRITTEN_FIRST: usize = 234;
-/// The rows written by that cell's last generated token.
+/// The rows written by that walk's last generated token.
 const WRITTEN_LAST: usize = 299;
 const EPS: f32 = 1e-6;
 /// The recorded packed bytes one token reads: 28 layers plus the head.
@@ -225,20 +218,6 @@ const TOTAL_PACKED_BYTES: u64 = 1_100_961_792;
 /// assertion catches a schedule drift inside the frame this file builds, not a
 /// drift between that frame and the shipped body.
 const FRAME_STEPS: usize = 310;
-
-// ── The stand's `listen` cell the derived figures are anchored on: the run
-// `MEASUREMENTS.md` records for 2026-10-25 13:02 UTC, whose row reads 1 784.2 ms
-// warm over 17.460 s of audio with 65 generated tokens. These are that run's own
-// phase lines, pinned here so the arithmetic re-derives without the record; a
-// later run is a new window and does not move them ──
-/// The tokens the cell generated after its prefill.
-const STAND_TOKENS: usize = 65;
-/// The cell's audio, in seconds.
-const STAND_AUDIO_S: f64 = 17.460;
-/// The cell's mel (3.1) + encoder (181.4) + projector (1.8), warm.
-const STAND_FRONT_MS: f64 = 186.3;
-/// The cell's prefill, warm.
-const STAND_PREFILL_MS: f64 = 530.7;
 
 /// Timed rounds; odd, so [`median`] is the middle sample.
 const ROUNDS: usize = 7;
@@ -250,8 +229,7 @@ const WARMUPS: usize = 3;
 /// dispatch and softmax with essentially no key/value traffic, so the difference
 /// against the others prices the reads rather than the arrangement.
 const WRITTENS: [usize; 4] = [2, WRITTEN_FIRST, WRITTEN_LAST, KEYS];
-/// The index of the fill the token and the derived cell figures are read at: the
-/// cell's own last generated row.
+/// The index of the fill the token is read at: the walk's own last generated row.
 const WRITTEN_CELL: usize = 2;
 const _: () = assert!(WRITTENS[WRITTEN_CELL] == WRITTEN_LAST);
 /// The encode-chunk values A2 sweeps, the shipped one first: one queue
@@ -609,7 +587,7 @@ struct Frame {
 
 /// One build of a frame, in milliseconds: graph construction, compile, upload,
 /// and the bytes the upload wrote. This is the harness's own frame, not the
-/// stand's cell (whose `build_ms` is the same work over the model files).
+/// product's (whose `build_ms` is the same work over the model files).
 struct BuildMs {
     build: f64,
     compile: f64,
@@ -746,7 +724,7 @@ fn check_logits(frame: &mut Frame) {
     assert_eq!(
         out[0].len(),
         VOCAB,
-        "the logits row is the stand's decode step's own readback"
+        "the logits row is the decode step's own readback"
     );
     let non_finite = out[0].iter().filter(|v| !v.is_finite()).count();
     assert_eq!(
@@ -1228,8 +1206,8 @@ fn token_rate() {
     // The bracket: one frame call, one submission and one blocking wait. The
     // backend hands one command buffer per `RLX_WGPU_ENCODE_CHUNK` encoded steps
     // (64 by default), so a schedule this long is several queue submissions at
-    // the shipped value — the pinned `(1, 1)` is the shape of one *call*, which
-    // is what the stand's own `graphs::device_counts` counts, and it is read
+    // the shipped value — the pinned `(1, 1)` is the shape of one *call*, one
+    // submit and one wait as `graphs::device_counts` counts them, and it is read
     // with the chunk pinned to the whole schedule. Both figures are printed
     // because which one the caller wants depends on the question.
     rlx_wgpu::reset_device_counts();
@@ -1263,8 +1241,8 @@ fn token_rate() {
     eprintln!(
         "[decode token rate] arm=frame submits={submits} waits={waits} \
          encode_chunk=whole_schedule chunked_submits={chunked_submits} \
-         chunked_waits={chunked_waits} note=\"at the shipped chunk the stand's step \
-         is {chunked_submits} queue submissions, one per encode chunk, plus the one \
+         chunked_waits={chunked_waits} note=\"at the shipped chunk a product decode \
+         step is {chunked_submits} queue submissions, one per encode chunk, plus the one \
          it spends folding the rows the step appends; this harness prices the \
          first term and not the fold\""
     );
@@ -1333,21 +1311,10 @@ fn token_rate() {
         );
     }
 
-    // The token's own figure, at the fill the cell ends on, and the cell it
-    // would make of the stand's front end and prefill — the proxy's arithmetic,
-    // not a measurement of the cell.
+    // The token's own figure, at the fill the walk ends on.
     let token_ms = median(&frame_samples[WRITTEN_CELL]);
-    let cell_ms = STAND_FRONT_MS + STAND_PREFILL_MS + STAND_TOKENS as f64 * token_ms;
-    let s_per_s = cell_ms / 1000.0 / STAND_AUDIO_S;
     eprintln!(
-        "[decode token rate] token_ms={token_ms:.3} token_ms_source=written_rows={} \
-         derived_cell_ms={cell_ms:.1} derived_s_per_s={s_per_s:.4} \
-         cell_inputs=\"front {STAND_FRONT_MS:.0} + prefill {STAND_PREFILL_MS:.0} ms \
-         + {STAND_TOKENS} tokens over {STAND_AUDIO_S:.2} s of audio, the stand's \
-         listen cell of 2026-10-25 13:02 UTC\" note=\"this harness's token pays no \
-         plane fold and no host argmax, and the stand's own warm figure also carries \
-         them, so the cell figure is the proxy's arithmetic and not a measurement of \
-         the cell\"",
+        "[decode token rate] token_ms={token_ms:.3} token_ms_source=written_rows={}",
         WRITTENS[WRITTEN_CELL],
     );
 
@@ -1392,7 +1359,7 @@ fn token_rate() {
     }
     eprintln!(
         "[decode token rate] arm=submission_shape shipped_chunk={} \
-         shipped_median_ms={shipped:.3} note=\"the stand's step is \
+         shipped_median_ms={shipped:.3} note=\"a product decode step is \
          ceil(steps/{}) submissions plus the one it spends folding the rows the \
          step appends; this harness prices the first term only\"",
         CHUNKS[0], CHUNKS[0],
@@ -1416,25 +1383,14 @@ fn token_rate() {
     let additive_least = floor(|s| s.least);
     let additive_greatest = floor(|s| s.greatest);
     let penalty = token_ms - additive_ms;
-    // The cell the decode alone would make at the floor: the same 65 tokens and
-    // the stand's front end and prefill at their measured values, with every
-    // multiply of the token at its back-to-back rate. Only the decode is floored
-    // — the front and the prefill are the stand's own figures — so this is a
-    // decode-at-floor cell, not a bound on the cell.
-    let decode_floor_cell_ms =
-        STAND_FRONT_MS + STAND_PREFILL_MS + STAND_TOKENS as f64 * additive_ms;
     eprintln!(
         "[decode token rate] additive_ms={additive_ms:.3} additive_least_ms={:.3} \
          additive_greatest_ms={:.3} token_ms={token_ms:.3} \
          in_frame_penalty_ms={penalty:+.3} \
-         in_frame_penalty_pct_of_additive={:+.1} \
-         decode_floor_cell_ms={decode_floor_cell_ms:.1} \
-         decode_floor_s_per_s={:.4} note=\"decode at its back-to-back floor with the \
-         stand's own front end and prefill; not a bound on the cell\"",
+         in_frame_penalty_pct_of_additive={:+.1}",
         additive_least,
         additive_greatest,
         penalty / additive_ms * 100.0,
-        decode_floor_cell_ms / 1000.0 / STAND_AUDIO_S,
     );
 
     // ── The query and key projections, separate and fused ─────────
@@ -1624,9 +1580,9 @@ fn token_rate() {
     }
 
     eprintln!(
-        "[decode token rate] process_peak_bytes={} note=\"this process's peak resident \
+        "[decode token rate] process_peak={} note=\"this process's peak resident \
          set, which includes the stream-ceiling probe's own buffers; the harness's \
-         own frame and not the stand's cell\"",
-        report::peak_text()
+         own frame, not a stand figure\"",
+        report::shown(report::peak_rss())
     );
 }

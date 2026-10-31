@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! What every cell line needs: a stopwatch, the run's resident set, the answer's
-//! digest, and the two labels (`human`, `sci`) the numbers are printed with.
-//! Nothing here decides **what** is measured.
+//! What every measured row needs: a stopwatch, the process's memory as the
+//! platform accounts for it, an answer's digest, and the labels the numbers are
+//! printed with. Nothing here decides **what** is measured.
 
 use std::time::Instant;
 
@@ -41,24 +41,6 @@ pub fn peak_rss() -> Option<u64> {
         }
     }
     None
-}
-
-/// [`peak_rss`] as the raw byte count a `process_peak_bytes=` line states, or `-`
-/// where the kernel did not answer — the rule a reading nobody took prints `-`,
-/// never a zero, stated once rather than restated by each caller.
-pub fn peak_text() -> String {
-    peak_rss().map_or_else(|| "-".to_string(), |bytes| bytes.to_string())
-}
-
-/// [`peak_rss`] in MiB: the unit the wake-word bench's console and its record
-/// state a peak in, so the two cannot report the same figure differently.
-pub fn peak_mib() -> String {
-    peak_rss().map_or_else(|| "-".to_string(), mib)
-}
-
-/// A byte count in MiB, the bench's unit for a peak residency.
-pub fn mib(bytes: u64) -> String {
-    format!("{} MiB", bytes / (1024 * 1024))
 }
 
 #[cfg(unix)]
@@ -101,6 +83,86 @@ pub fn resident_rss() -> Option<u64> {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|kb| kb * 1024)
 }
+
+/// The process's physical footprint: `(now, lifetime maximum)`, as the platform
+/// accounts for it, or `None` where the platform supplies no such reading.
+///
+/// The resident set cannot see memory allocated for the GPU on a unified-memory
+/// machine, so the recorded figures come from here and fall back to
+/// [`resident_rss`] only where the platform has no such reading. macOS answers
+/// through `proc_pid_rusage`: `ri_phys_footprint` and
+/// `ri_lifetime_max_phys_footprint`, which no later drop can lower.
+#[cfg(target_os = "macos")]
+pub fn footprint() -> Option<(u64, u64)> {
+    let mut info = std::mem::MaybeUninit::<RusageInfoV4>::zeroed();
+    // SAFETY: `info` is a properly aligned `rusage_info_v4`, the flavour that
+    // fills exactly that layout, and the call only writes into it.
+    let rc =
+        unsafe { proc_pid_rusage(std::process::id() as i32, RUSAGE_INFO_V4, info.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: a zero return means the call filled the whole structure.
+    let info = unsafe { info.assume_init() };
+    Some((info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn footprint() -> Option<(u64, u64)> {
+    None
+}
+
+/// `proc_pid_rusage`'s `rusage_info_v4`: the layout of `sys/resource.h`, kept
+/// whole because the call writes all of it and reads none of its padding.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct RusageInfoV4 {
+    ri_uuid: [u8; 16],
+    ri_user_time: u64,
+    ri_system_time: u64,
+    ri_pkg_idle_wkups: u64,
+    ri_interrupt_wkups: u64,
+    ri_pageins: u64,
+    ri_wired_size: u64,
+    ri_resident_size: u64,
+    ri_phys_footprint: u64,
+    ri_proc_start_abstime: u64,
+    ri_proc_exit_abstime: u64,
+    ri_child_user_time: u64,
+    ri_child_system_time: u64,
+    ri_child_pkg_idle_wkups: u64,
+    ri_child_interrupt_wkups: u64,
+    ri_child_pageins: u64,
+    ri_child_elapsed_abstime: u64,
+    ri_diskio_bytesread: u64,
+    ri_diskio_byteswritten: u64,
+    ri_cpu_time_qos_default: u64,
+    ri_cpu_time_qos_maintenance: u64,
+    ri_cpu_time_qos_background: u64,
+    ri_cpu_time_qos_utility: u64,
+    ri_cpu_time_qos_legacy: u64,
+    ri_cpu_time_qos_user_initiated: u64,
+    ri_cpu_time_qos_user_interactive: u64,
+    ri_billed_system_time: u64,
+    ri_serviced_system_time: u64,
+    ri_logical_writes: u64,
+    ri_lifetime_max_phys_footprint: u64,
+    ri_instructions: u64,
+    ri_cycles: u64,
+    ri_billed_energy: u64,
+    ri_serviced_energy: u64,
+    ri_interval_max_phys_footprint: u64,
+    ri_runnable_time: u64,
+}
+
+#[cfg(target_os = "macos")]
+const RUSAGE_INFO_V4: i32 = 4;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut RusageInfoV4) -> i32;
+}
+
 /// Return the pages freed so far to the OS. macOS keeps them in the malloc
 /// zones, so a process that drops one phase and builds the next can peak at the
 /// sum of the phases; the pressure call hands those pages back and the next
@@ -123,6 +185,134 @@ unsafe extern "C" {
     fn malloc_zone_pressure_relief(zone: *mut core::ffi::c_void, goal: usize) -> usize;
 }
 
+/// The two memory figures one row carries, from the platform's accounting: the
+/// figure at rest and the process's lifetime peak.
+#[derive(Clone, Copy, Debug)]
+pub struct Memory {
+    pub now: Option<u64>,
+    pub peak: Option<u64>,
+    /// The physical footprint where the platform supplies it, the resident set
+    /// where it does not.
+    pub footprint: bool,
+}
+
+impl Memory {
+    /// The reading at rest. [`Memory::finish`] adds the lifetime peak once the
+    /// timed calls are done, so a warm call's high-water is included: the peak is
+    /// only ever read after them.
+    #[must_use]
+    pub fn take() -> Self {
+        match footprint() {
+            Some((now, _)) => Self {
+                now: Some(now),
+                peak: None,
+                footprint: true,
+            },
+            None => Self {
+                now: resident_rss(),
+                peak: None,
+                footprint: false,
+            },
+        }
+    }
+
+    /// The same reading with its lifetime peak, taken after the timed work. The
+    /// peak comes from the basis [`Memory::take`] recorded, so one row never mixes
+    /// the platform's footprint with the resident set.
+    #[must_use]
+    pub fn finish(self) -> Self {
+        Self {
+            peak: if self.footprint {
+                footprint().map(|(_, peak)| peak)
+            } else {
+                peak_rss()
+            },
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub fn now_text(&self) -> String {
+        shown(self.now)
+    }
+
+    #[must_use]
+    pub fn peak_text(&self) -> String {
+        shown(self.peak)
+    }
+}
+
+/// The basis a table's memory figures were taken on — the platform's physical
+/// footprint, the resident set where the platform supplied none, or both across
+/// the rows. It is read off the rows themselves, so a caption describes the
+/// figures under it rather than the machine the caption is printed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Basis {
+    Footprint,
+    Resident,
+    Mixed,
+}
+
+impl Basis {
+    /// The basis the rows carrying these `footprint` flags were taken on. No rows
+    /// means no figure for a caption to qualify — a table nobody filled has nothing a
+    /// fallback could describe — so the platform's own reading is the one named.
+    #[must_use]
+    pub(crate) fn of(rows: impl IntoIterator<Item = bool>) -> Self {
+        let mut flags = rows.into_iter();
+        let Some(first) = flags.next() else {
+            return Self::Footprint;
+        };
+        if flags.all(|flag| flag == first) {
+            if first {
+                Self::Footprint
+            } else {
+                Self::Resident
+            }
+        } else {
+            Self::Mixed
+        }
+    }
+
+    /// What the figures are, in the one sentence every caption that carries them
+    /// uses: the two readings count different things, and a platform without the
+    /// footprint falls back to the resident set.
+    #[must_use]
+    pub(crate) fn caption(self) -> &'static str {
+        match self {
+            Self::Footprint => {
+                "Memory is the process's physical footprint as the platform accounts for \
+                 it (`phys_footprint`), which is the only reading that sees memory allocated for \
+                 the GPU: the resident set counts different things and is not comparable. \
+                 Resting is taken once the cold call has loaded and built what it needs and \
+                 before the warm call; peak is the process's lifetime maximum."
+            }
+            Self::Resident => {
+                "Memory is the process's resident set, because this platform supplies no \
+                 physical-footprint reading: resting is the set at the moment the cold call has \
+                 loaded and built what it needs and before the warm call, and peak is the \
+                 kernel's lifetime maximum of the same set. The resident set counts a different \
+                 thing from the footprint, so these figures are not comparable with one taken \
+                 where the platform supplies it."
+            }
+            Self::Mixed => {
+                "Memory is the process's physical footprint on the rows the platform supplied \
+                 one, and the resident set on the rows it did not: the two count different things \
+                 and are not comparable with each other. Resting is taken once the cold call has \
+                 loaded and built what it needs and before the warm call; peak is the process's \
+                 lifetime maximum."
+            }
+        }
+    }
+}
+
+/// One byte count as the record writes it, and `-` for a figure nobody took: a
+/// zero would read as the reading of a live process.
+pub fn shown(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "-".to_string(), human)
+}
+
+/// One byte count as the record writes it.
 pub fn human(bytes: u64) -> String {
     let mib = bytes as f64 / (1024.0 * 1024.0);
     if mib >= 1024.0 {
@@ -134,22 +324,6 @@ pub fn human(bytes: u64) -> String {
     } else {
         format!("{bytes}B")
     }
-}
-
-/// An exact count in space-grouped thousands (`1 101 234 567`), the way
-/// `MEASUREMENTS.md` writes one. A rate printed beside it is that exact
-/// division, where [`human`]'s rounding would leave a per-cent of slack.
-#[must_use]
-pub fn grouped(bytes: u64) -> String {
-    let digits = bytes.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, digit) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(' ');
-        }
-        out.push(digit);
-    }
-    out
 }
 
 /// Milliseconds, in the unit the reports use.
@@ -167,8 +341,8 @@ pub fn sci(v: f32) -> String {
     format!("{v:.3e}")
 }
 
-/// Deterministic pseudo-random f32 in `[-1, 1)` — the stand's own input; the
-/// value is reported as read.
+/// Deterministic pseudo-random f32 in `[-1, 1)` — a test's own input; the value
+/// is reported as read.
 pub fn pseudo_rand(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     (0..n)
@@ -204,71 +378,45 @@ pub fn digest(values: &[f32]) -> u64 {
     h
 }
 
-/// The machine's load, so a log records what else was running when it was taken.
-pub fn load_average() -> String {
-    std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", "vm.loadavg"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.replace(['{', '}'], "")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_else(|| "unknown".into())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// The thermal state the numbers were taken under, as `scripts/check-throttle.sh`
-/// reads it from `pmset -g therm`: the limits the platform printed, naming only
-/// those, or `unknown` where it printed none of them. `None` where the reading
-/// itself is unavailable, so the record can say "no reading" instead of claiming
-/// a cool run.
-pub fn thermal() -> Option<String> {
-    let text = std::process::Command::new("pmset")
-        .args(["-g", "therm"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())?;
-    let limit = |key: &str| {
-        text.lines()
-            .find_map(|line| line.trim().strip_prefix(key))
-            .and_then(|rest| rest.split('=').nth(1)?.trim().parse::<u32>().ok())
-    };
-    let (speed, sched) = (limit("CPU_Speed_Limit"), limit("CPU_Scheduler_Limit"));
-    let mut printed = Vec::new();
-    if let Some(speed) = speed {
-        printed.push(format!("CPU_Speed_Limit {speed}"));
+    /// The platform's footprint is a live reading, and its lifetime maximum is at
+    /// least the current one. macOS supplies both; elsewhere the fallback is the
+    /// resident set, which the caption names.
+    #[test]
+    fn the_memory_reading_comes_from_the_platform() {
+        match footprint() {
+            Some((now, peak)) => {
+                assert!(now > 1024 * 1024, "a live process holds bytes: {now}");
+                assert!(peak >= now, "the maximum cannot trail the current reading");
+                assert!(Basis::Footprint.caption().contains("physical footprint"));
+            }
+            None => {
+                assert!(Basis::Resident.caption().contains("resident set"));
+            }
+        }
     }
-    if let Some(sched) = sched {
-        printed.push(format!("CPU_Scheduler_Limit {sched}"));
-    }
-    if printed.is_empty() {
-        return Some("unknown (pmset -g therm printed no CPU limit line)".into());
-    }
-    let state = if speed.is_some_and(|v| v < 100) || sched.is_some_and(|v| v < 100) {
-        "throttled"
-    } else {
-        "not throttled"
-    };
-    Some(format!("{state} ({})", printed.join(", ")))
-}
 
-/// The `RLX_*` and `STAND_*` keys this process carries, sorted. The first are the
-/// fork's route levers, the second the stand's own input/window levers; both are
-/// printed with the numbers they changed, so a cell is never read apart from the
-/// form it was taken on.
-pub fn keys() -> String {
-    let mut v: Vec<String> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("RLX_") || k.starts_with("STAND_"))
-        .map(|(k, value)| format!("{k}={value}"))
-        .collect();
-    v.sort();
-    if v.is_empty() {
-        "none".into()
-    } else {
-        v.join(",")
+    /// The caption describes the basis its rows were taken on, so a table that
+    /// mixed the two says so.
+    #[test]
+    fn the_basis_folds_its_rows() {
+        assert_eq!(Basis::of([true, true]), Basis::Footprint);
+        assert_eq!(Basis::of([false, false]), Basis::Resident);
+        assert_eq!(Basis::of([true, false]), Basis::Mixed);
+        assert_ne!(Basis::Mixed.caption(), Basis::Footprint.caption());
+        assert_ne!(Basis::Mixed.caption(), Basis::Resident.caption());
+    }
+
+    /// [`human`] is the one byte-count rendering the records use: a whole count in
+    /// the largest unit that keeps it whole.
+    #[test]
+    fn a_byte_count_renders_in_one_place() {
+        assert_eq!(human(512), "512B");
+        assert_eq!(human(2 * 1024), "2KiB");
+        assert_eq!(human(3 * 1024 * 1024 + 512 * 1024), "3.5MiB");
+        assert_eq!(human(3 * 1024 * 1024 * 1024), "3.00GiB");
     }
 }

@@ -1,11 +1,11 @@
 # MahBot inference — the live model paths, end to end, and nothing else.
 #
-# The stand (`src/stand.rs`, the `mahbot-inference` binary) walks the model
-# paths — the ear, recognition, synthesis, embeddings and transcription — and
-# prints their numbers. The same generation/encoding/decision code is exposed as
-# a library (`synth`, `listen`, `transcribe`, `wake`) so the wake-word bench can
-# measure recall, false reactions and false accepts per hour on this crate's own
-# models.
+# The stand (`src/stand.rs`, the `mahbot-inference` binary) walks the product
+# shapes — recognition, synthesis and the wake word — and records how the models
+# do now. The same generation/encoding/decision code is exposed as a library
+# (`synth`, `listen`, `transcribe`, `wake`) so the wake-word bench can measure
+# recall, false reactions and false accepts per hour on this crate's own models,
+# and `transcription-corpus` measures the pinned real-audio corpus.
 #
 # Every input path comes from an argument or an environment variable; there is
 # no crate-relative default, because the checkout carries no models.
@@ -15,18 +15,25 @@ name = "mahbot-inference"
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
-description = "MahBot inference: ear, recognition, synthesis, embeddings and transcription, end to end, on our own models."
+description = "MahBot inference: ear, recognition, synthesis and transcription, end to end, on our own models."
 authors.workspace      = true
 license.workspace      = true
 repository.workspace   = true
 publish = false
-# Two binaries: without this, a bare `cargo run -p mahbot-inference --features bench`
+# Three binaries: without this, a bare `cargo run -p mahbot-inference --features bench`
 # is ambiguous. The stand is the product entry point.
 default-run = "mahbot-inference"
 
 [[bin]]
 name = "mahbot-inference"
 path = "src/main.rs"
+
+# The corpus run: the pinned real-audio recordings through the product's
+# transcription call, one row per recording. Deliberate, never automatic.
+[[bin]]
+name = "transcription-corpus"
+path = "src/bin/transcription_corpus.rs"
+required-features = ["bench"]
 
 # The corpus build: the one deliberate operation that renders the wake-word
 # bench's clips. Not a measurement, and never automatic.
@@ -44,8 +51,8 @@ rlx-ir = { workspace = true }
 rlx-flow = { workspace = true }
 # `gpu` pulls in the wgpu backend.
 rlx-runtime = { workspace = true, features = ["gpu"] }
-# The backend's own arena planner (`buffer::plan_f32_uniform`), which is the
-# figure the stand publishes for every unit.
+# The backend's own arena planner (`buffer::plan_f32_uniform`), which sizes the
+# sound-graph cache's budget.
 rlx-wgpu = { workspace = true }
 anyhow = "1"
 # Report serialisation.
@@ -64,8 +71,8 @@ half = "2"
 workspace = true
 
 [features]
-# The wake-word bench is deliberate, never automatic: without this feature a
-# workspace-wide `cargo bench` does not build or run it.
+# The wake-word bench, its corpus build and the transcription corpus run are
+# deliberate, never automatic: without this feature none of them is built.
 bench = []
 
 [[bench]]

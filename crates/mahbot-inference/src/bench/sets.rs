@@ -194,7 +194,7 @@ pub(crate) struct VoiceCandidate {
 /// fraction and the most even level.
 ///
 /// The pool establishes ten *distinct recordings*, which is what a clone is cut
-/// from; it does not establish ten distinct people (see the record's limits).
+/// from; it does not establish ten distinct people.
 pub(crate) const VERIFICATION_POOL: &[VoiceCandidate] = &[
     // ── The first ten: the widest spread in sex and language the pool carries ──
     VoiceCandidate {
@@ -399,23 +399,10 @@ pub(crate) const NON_SPEECH_CLIPS: usize =
 /// [`NUM_VERIFICATION_VOICES`] clones.
 pub(crate) const SPEECH_VOICES: usize = NUM_VERIFICATION_VOICES + 1;
 
-/// The false-reaction set's size, built from the components above.
-/// [`audio::speech_negatives`] and [`audio::non_speech_clips`] assert the parts
-/// they build are exactly these lengths, so a dropped clip is a failure rather
-/// than a smaller denominator.
-pub(crate) const EXPECTED_NON_PHRASE_TOTAL: usize =
-    SPEECH_NEGATIVE_CLIPS * SPEECH_VOICES + NON_SPEECH_CLIPS;
-
 /// The recall set's size: 40 bare wake-phrase renderings plus 10
 /// wake-phrase-plus-command clips, per voice.
 pub(crate) const POSITIVE_CLIPS: usize =
     HELD_OUT_WAKE_ONLY_CLIPS + COMMAND_PLUS_SPEECH_PHRASES.len();
-/// The positives a measurement carries over every voice.
-pub(crate) const EXPECTED_POSITIVE_TOTAL: usize = POSITIVE_CLIPS * SPEECH_VOICES;
-
-/// Where the real-audio corpus came from, as its manifest records it.
-pub(crate) const REAL_AUDIO_REPO: &str = "alexwengg/musan_mini";
-pub(crate) const REAL_AUDIO_REVISION: &str = "54ce99dd44add93cec39c4d37bdcc59c7870a849";
 
 /// The pinned real-audio subset: 18 speech files + 15 noise files, in this
 /// fixed order, each with its SHA-256 and byte size. Selection at pin time: the
@@ -600,15 +587,6 @@ pub(crate) const FILE_GAP_SAMPLES: usize = 32_000;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_false_reaction_set_is_one_thousand_one_hundred_and_sixty_one() {
-        assert_eq!(EXPECTED_NON_PHRASE_TOTAL, 1_161);
-        assert_eq!(SPEECH_NEGATIVE_CLIPS, 104);
-        assert_eq!(NON_SPEECH_CLIPS, 17);
-        assert_eq!(SPEECH_NEGATIVE_CLIPS * SPEECH_VOICES, 1_144);
-        assert_eq!(EXPECTED_POSITIVE_TOTAL, 550);
-    }
 
     /// The pool is the bench's own input: every candidate is a recording the
     /// false-accept phase never measures, carries its hash, and its span is long

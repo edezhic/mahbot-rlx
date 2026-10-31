@@ -2,19 +2,19 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The bench's two text surfaces — the console rows and the `MEASUREMENTS.md`
-//! block — both read out of the report JSON the run itself wrote, so the console
+//! The bench's two text surfaces — the console rows and the `WAKE-WORD-BENCH.md`
+//! tables — both read out of the report JSON the run itself wrote, so the console
 //! and the record cannot state a different number, and a row the report does not
 //! carry names its absence instead of printing a zero nobody measured.
 
 use serde_json::Value;
 
-use crate::measurements;
-
-use super::audio::{Category, manifest_count};
+use super::audio::Category;
+use super::config::BenchConfig;
 use super::rate;
 use super::sets;
 use super::voices;
+use crate::measurements;
 
 /// The per-stream rows, on the console: the voice subset warning, each selected
 /// voice's identity, the similarity witness, one line per voice on each side, the
@@ -335,9 +335,20 @@ impl Pooled {
         cell_of(self.fired, self.of)
     }
 
+    /// `Pooled over 11 voices: 104 clips each, not 1144 independent trials.` — the
+    /// one line a table states under its pooled row, where the figure itself is
+    /// already in the row above. It opens with the pooled row's own words, so it
+    /// reads as that row's caveat rather than as a title for the next table, and it
+    /// states the per-voice count once, because the row above already divides by it.
+    fn note(&self) -> String {
+        format!(
+            "Pooled over {} voices: {} clips each, not {} independent {}.",
+            self.voices, self.clips_per_voice, self.of, self.unit
+        )
+    }
+
     /// `pooled over 104 clips (56 distinct texts) across 11 voices, not 1144
-    /// independent trials` — the clause a table states under its pooled row, where
-    /// the figure itself is already in the row above.
+    /// independent trials` — the clause the metric row states after its figure.
     fn clause(&self) -> String {
         format!(
             "pooled over {} clips ({} distinct texts) across {} voices, not {} independent {}",
@@ -398,21 +409,21 @@ macro_rules! figure_row {
     };
 }
 
-/// The bench section this run's report states — read out of the report the run
+/// The bench's tables this run's report states — read out of the report the run
 /// itself wrote, so the file and the JSON cannot state the same fact twice or a
 /// degenerate rate differently.
 pub(super) fn block(report: &Value) -> String {
     let mut body = String::new();
-    body.push_str("## Wake-word bench\n\n");
-    body.push_str(&format!("_Measured {}._\n\n", measurements::now()));
-    body.push_str(&format!(
-        "status: `{}`\n\n",
-        report
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or(UNAVAILABLE)
-    ));
     body.push_str("| metric | value |\n|---|---|\n");
+    row(
+        &mut body,
+        "corpus",
+        report
+            .get("corpus")
+            .and_then(|node| node.get("clips"))
+            .and_then(Value::as_u64)
+            .map(|clips| format!("{clips} clips")),
+    );
     let set = negative_set(report);
     figure_row!(body, "negatives", [
         total = set.and_then(|node| node.get("clips")),
@@ -426,7 +437,7 @@ pub(super) fn block(report: &Value) -> String {
     row(
         &mut body,
         "negative overall (pooled speech)",
-        rows.negatives_pooled.as_ref().map(Pooled::line),
+        rows.negatives_pooled.as_ref().map(Pooled::cell),
     );
     row(
         &mut body,
@@ -438,7 +449,7 @@ pub(super) fn block(report: &Value) -> String {
     row(
         &mut body,
         "positives (pooled)",
-        rows.positives_pooled.as_ref().map(Pooled::line),
+        rows.positives_pooled.as_ref().map(Pooled::cell),
     );
     let real = report
         .get("false_reactions")
@@ -489,16 +500,6 @@ pub(super) fn block(report: &Value) -> String {
         }
         None => row(&mut body, "false accepts", None),
     }
-    // The set the run priced, in the vocabulary `--wake-thresholds` reads, so the
-    // point can be replayed from the record by copy-paste.
-    row(
-        &mut body,
-        "thresholds",
-        report
-            .get("thresholds")
-            .and_then(Value::as_str)
-            .map(|line| format!("`{line}`")),
-    );
     let calibration = report.get("calibration");
     let derived = |key: &str| calibration.and_then(|node| node.get(key));
     figure_row!(body, "derived point", [
@@ -512,140 +513,46 @@ pub(super) fn block(report: &Value) -> String {
     ] => format!("{secs:.1} s"));
     figure_row!(body, "peak resident", [
         bytes = report.get("peak_rss_bytes"),
-    ] => crate::report::mib(bytes as u64));
-    let corpus = report.get("corpus");
-    figure_row!(body, "corpus", [
-        reused = corpus.and_then(|node| node.get("reused")),
-        reads = corpus.and_then(|node| node.get("reads")),
-        rendered = corpus.and_then(|node| node.get("rendered")),
-        secs = corpus.and_then(|node| node.get("synthesis_secs")),
-    ] => format!("{reused} of {reads} clip reads reused, {rendered} rendered in {secs:.1} s"));
-    // The build's own account: a warm run renders nothing, so without this row the
-    // record would make the corpus look free. `built` is every clip a build of this
-    // generation rendered — which exceeds the plan only when the check rejected a
-    // candidate, whose probes the plan does not list — so the note explaining the
-    // excess is stated only when the excess is there.
-    let build = report.get("corpus_build");
-    let last = build.and_then(|node| node.get("last"));
-    let seconds = |node: Option<&Value>, key: &str| {
-        node.and_then(|node| node.get(key)).and_then(Value::as_f64)
-    };
-    let cells = (
-        manifest_count(build, "clips"),
-        manifest_count(build, "built"),
-        manifest_count(build, "builds"),
-        seconds(build, "synthesis_secs"),
-        manifest_count(last, "built"),
-        seconds(last, "wall_secs"),
+    ] => crate::report::human(bytes as u64));
+    body.push_str(
+        "\nOne complete run: recall and false reactions in each of the eleven voices, and the \
+         false accepts per hour over the pinned real-audio corpus.\n\n",
     );
-    row(
-        &mut body,
-        "corpus build",
-        match cells {
-            (Some(clips), Some(built), Some(builds), Some(secs), Some(last_built), Some(wall)) => {
-                // "over 7 builds", "over 1 build": a count of builds is a word here.
-                let builds = match builds {
-                    1 => "1 build".to_string(),
-                    builds => format!("{builds} builds"),
-                };
-                // The note explains an excess that only exists when a candidate was
-                // rejected after its probes were rendered, so it appears only then.
-                let beyond = if built > clips {
-                    " (its renders include the probe renders of candidates the check rejected, \
-                     which the plan does not list)"
-                } else {
-                    ""
-                };
-                let mut figures = format!(
-                    "{clips} clips · {built} rendered over {builds} of this generation{beyond}, \
-                     {secs:.0} s of synthesis; the last build took {wall:.0} s wall and rendered \
-                     {last_built}"
-                );
-                match manifest_count(last, "swept") {
-                    Some(swept) => {
-                        figures.push_str(", clearing ");
-                        figures.push_str(&super::audio::superseded(swept));
-                    }
-                    None => figures.push_str(", and its sweep count is not stated"),
-                }
-                if let Some(stopped) = last
-                    .and_then(|node| node.get("stopped"))
-                    .filter(|node| node.is_object())
-                {
-                    let reason = text(stopped.get("reason"));
-                    let outcome = match stopped.get("corpus_complete").and_then(Value::as_bool) {
-                        Some(true) => {
-                            format!("; that build stopped after the corpus was complete ({reason})")
-                        }
-                        _ => format!(
-                            "; that build stopped before the corpus was complete ({reason}), and \
-                             its renders are counted above"
-                        ),
-                    };
-                    figures.push_str(&outcome);
-                }
-                Some(figures)
-            }
-            _ => None,
-        },
-    );
-    figure_row!(body, "windows per encoder pass", [
-        most = report.get("windows_per_pass"),
-        capacity = report.get("group_capacity"),
-        partial = report.get("partial_passes"),
-        passes = report.get("encoder_passes"),
-    ] => format!("at most {most} of {capacity} · {partial} partial of {passes} passes"));
-    body.push('\n');
     push_voice_tables(&mut body, &rows);
-    push_voice_prose(&mut body, report, &rows);
-    body.push_str("| phase | seconds |\n|---|---|\n");
-    if let Some(phases) = report.get("phases").and_then(Value::as_object) {
-        for (name, secs) in phases {
-            row(
-                &mut body,
-                name,
-                secs.as_f64().map(|secs| format!("{secs:.1}")),
-            );
-        }
+    body
+}
+
+/// The bench's inputs, as the provenance block's bullets: where the run read them
+/// from — the locations the stand and corpus records name too, so a reader can
+/// point a re-run at the same material — then every model file and every
+/// verification voice, with its size and SHA-256.
+pub(super) fn record_inputs(cfg: &BenchConfig, report: &Value) -> String {
+    let mut body = String::new();
+    match &cfg.models {
+        Some(dir) => body.push_str(&format!("- models: `{}`\n", measurements::short_path(dir))),
+        None => body.push_str(
+            "- models: per-role files, named by `--asr-body`, `--asr-sound`, `--tts-body` and \
+             `--tts-sound`\n",
+        ),
     }
-    body.push_str("\nProvenance:\n\n");
-    body.push_str(&format!("- machine: {}\n", measurements::machine()));
-    body.push_str(&format!("- device: {}\n", measurements::device()));
-    body.push_str(&format!("- profile: {}\n", measurements::profile()));
-    let guards = report.get("guards");
-    let bound = |key: &str| {
-        guards
-            .and_then(|node| node.get(key))
-            .and_then(Value::as_u64)
-    };
-    if let (Some(stop), Some(resident), Some(swap)) = (
-        bound("timeout_secs"),
-        bound("max_rss_mib"),
-        bound("swap_growth_mib"),
-    ) {
-        body.push_str(&format!(
-            "- guards: stop {stop} s · resident {resident} MiB · swap growth {swap} MiB\n"
-        ));
-    }
-    body.push_str(&format!("- code: {}\n", measurements::code_state()));
     body.push_str(&format!(
-        "- command: `{}`\n",
-        report
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or(UNAVAILABLE)
+        "- corpus: `{}`\n",
+        measurements::short_path(&cfg.corpus)
     ));
     let models = report.get("models");
     let pin = |section: &str, key: Option<&str>| -> Option<&Value> {
         let node = models?.get(section)?;
         key.map_or(Some(node), |key| node.get(key))
     };
-    for (role, value) in [
-        ("ASR body", pin("recognition", Some("body"))),
-        ("ASR sound", pin("recognition", Some("sound"))),
-        ("TTS body", pin("synthesis", Some("body"))),
-        ("TTS sound", pin("synthesis", Some("sound"))),
-        ("voice", pin("voice_wav", None)),
+    // The voice's bullet states its location — it is the one input that lives
+    // outside the model directory — and every other file its name there.
+    let voice = measurements::short_path(&cfg.voice);
+    for (role, location, value) in [
+        ("ASR body", None, pin("recognition", Some("body"))),
+        ("ASR sound", None, pin("recognition", Some("sound"))),
+        ("TTS body", None, pin("synthesis", Some("body"))),
+        ("TTS sound", None, pin("synthesis", Some("sound"))),
+        ("voice", Some(voice.as_str()), pin("voice_wav", None)),
     ] {
         // One behaviour for an absent pin: the bullet is written and names the
         // absence, whether the report has no pin or a pin without the figure.
@@ -658,11 +565,16 @@ pub(super) fn block(report: &Value) -> String {
             .and_then(Value::as_u64)
             .map(|bytes| format!("{bytes} bytes"))
             .unwrap_or_else(|| UNAVAILABLE.to_string());
+        let file = location.map_or_else(
+            || {
+                pin.get("file")
+                    .and_then(Value::as_str)
+                    .unwrap_or(UNAVAILABLE)
+            },
+            |path| path,
+        );
         body.push_str(&format!(
-            "- {role}: `{}` · {bytes} · sha256 {}\n",
-            pin.get("file")
-                .and_then(Value::as_str)
-                .unwrap_or(UNAVAILABLE),
+            "- {role}: `{file}` · {bytes} · sha256 {}\n",
             pin.get("sha256")
                 .and_then(Value::as_str)
                 .unwrap_or(UNAVAILABLE)
@@ -686,12 +598,13 @@ pub(super) fn block(report: &Value) -> String {
     body
 }
 
-/// The record's per-voice tables: one row per stream on each side, the pooled row,
-/// and the non-speech line. Captions, denominators and distinct-text counts are read
-/// out of each side's own `set` cell, so a phrase-list edit moves them without an
-/// edit here; each voice's recording and span are stated once, in the provenance
-/// bullets above. The rows themselves are the [`Rows`] the console prints, so the
-/// report is walked once for both surfaces.
+/// The record's per-voice tables: one row per stream on each side and the pooled
+/// row, each table followed by its caption — the pooled row's own caveat, built by
+/// [`Pooled::note`], never a heading that also repeats a count. Captions,
+/// denominators and distinct-text counts are read out of each side's own `set` cell,
+/// so a phrase-list edit moves them without an edit here; each voice's recording and
+/// span are stated once, in the provenance bullets above. The rows themselves are the
+/// [`Rows`] the console prints, so the report is walked once for both surfaces.
 fn push_voice_tables(body: &mut String, rows: &Rows<'_>) {
     let mut header = String::from("| voice |");
     let mut rule = String::from("|---|");
@@ -708,10 +621,8 @@ fn push_voice_tables(body: &mut String, rows: &Rows<'_>) {
         rows.set_cell("speech_clips_per_voice")
     ));
     rule.push_str("---|\n");
-    body.push_str(&format!(
-        "Negatives by voice — {} speech clips each:\n\n{header}{rule}",
-        rows.set_cell("speech_clips_per_voice")
-    ));
+    body.push_str(&header);
+    body.push_str(&rule);
     for row in &rows.negatives {
         body.push_str(&format!(
             "| {} | {} | {} |\n",
@@ -741,18 +652,10 @@ fn push_voice_tables(body: &mut String, rows: &Rows<'_>) {
         "{}\n\n",
         rows.negatives_pooled
             .as_ref()
-            .map_or_else(|| UNAVAILABLE.to_string(), Pooled::clause)
-    ));
-    body.push_str(&format!(
-        "Non-speech, in a stream of its own: {}.\n\n",
-        rows.non_speech.as_deref().unwrap_or(UNAVAILABLE)
+            .map_or_else(|| UNAVAILABLE.to_string(), Pooled::note)
     ));
 
-    body.push_str(&format!(
-        "Positives by voice — {} clips each:\n\n\
-         | voice | detected | of | rate |\n|---|---|---|---|\n",
-        rows.positive_cell("clips_per_voice")
-    ));
+    body.push_str("| voice | detected | of | rate |\n|---|---|---|---|\n");
     for row in &rows.positives {
         body.push_str(&format!("| {} | {} |\n", row.voice, row.columns()));
     }
@@ -765,7 +668,7 @@ fn push_voice_tables(body: &mut String, rows: &Rows<'_>) {
         rows.positive_cell("voices"),
         rows.positives_pooled
             .as_ref()
-            .map_or_else(|| UNAVAILABLE.to_string(), Pooled::clause)
+            .map_or_else(|| UNAVAILABLE.to_string(), Pooled::note)
     ));
 }
 
@@ -806,170 +709,4 @@ fn rate_cell(fired: usize, of: usize) -> String {
 /// not carry it.
 fn count_cell(node: Option<&Value>, key: &str) -> String {
     counts(node, key).map_or_else(|| UNAVAILABLE.to_string(), |(fired, of)| cell_of(fired, of))
-}
-
-/// The record's prose: what the numbers are, what they are not, and the limits
-/// that make them readable.
-fn push_voice_prose(body: &mut String, report: &Value, rows: &Rows<'_>) {
-    let voices = rows.set_cell("voices");
-    let clones = report
-        .get("voices")
-        .and_then(|node| node.get("selected"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    body.push_str(&format!(
-        "**What these numbers are.** The prototype, the calibration pool and the \
-        anti-prototypes are the enrolled voice's alone; the {clones} clone voices are scored \
-        against them, which is what makes their rows generalisation evidence. The enrolled \
-        voice's row is \
-        measured at thresholds fitted on that same voice and is not.\n\n"
-    ));
-    body.push_str(
-        "**The voices.** The clone voices are rendered from as many distinct single-reader \
-        recordings in the corpus input that the false-accept phase does not measure, one per \
-        voice, each named in the provenance block below with the recording it was cut from and \
-        its span. A clone's only per-voice input is a speaker embedding, so their renders may \
-        resemble one another more than their sources do: these figures describe how the detector \
-        behaves across these voice variations, not how it would behave for arbitrary strangers. \
-        The corpus establishes single-reader provenance, not speaker identity: these are distinct \
-        recordings, not verified different people.\n\n",
-    );
-    let similarity = report
-        .get("voices")
-        .and_then(|node| node.get("reference_similarity"));
-    let figure = |key: &str| {
-        similarity
-            .and_then(|node| node.get(key))
-            .and_then(Value::as_f64)
-    };
-    if let (Some(min), Some(median), Some(max)) = (figure("min"), figure("median"), figure("max")) {
-        let closest = similarity
-            .and_then(|node| node.get("closest"))
-            .map(
-                |closest| match closest.get("cosine").and_then(Value::as_f64) {
-                    Some(cosine) => format!(
-                        "{} and {} at {cosine:.4}",
-                        text(closest.get("a")),
-                        text(closest.get("b"))
-                    ),
-                    None => UNAVAILABLE.to_string(),
-                },
-            )
-            .unwrap_or_else(|| UNAVAILABLE.to_string());
-        let pairs = similarity
-            .and_then(|node| node.get("pairs"))
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        body.push_str(&format!(
-            "The witness that the clone voices did not collapse into one voice: the pairwise cosine \
-             between the reference embeddings the clones are built from is min {min:.4}, median \
-             {median:.4}, max {max:.4} over {pairs} pairs, the closest being {closest}. Nothing was \
-             rejected on it.\n\n"
-        ));
-    }
-    // Named, not positional: a reordering that silently states the wrong number is
-    // the one mistake a `format!` this wide cannot catch.
-    let negatives = rows.set_cell("clips");
-    let speech_clips = rows.set_cell("speech_clips");
-    let per_voice = rows.set_cell("speech_clips_per_voice");
-    let near_misses = rows.set_cell("confusable_clips_per_voice");
-    let unrelated = rows.set_cell("unrelated_clips_per_voice");
-    let in_passing = rows.set_cell("phrase_in_passing_clips_per_voice");
-    let non_speech_clips = rows.set_cell("non_speech_clips");
-    let positives = rows.positive_cell("clips_per_voice");
-    let wake_only = rows.positive_cell("wake_only_clips_per_voice");
-    let with_command = rows.positive_cell("command_plus_speech_clips_per_voice");
-    let positive_stream = count(report.get("recognition").and_then(|node| node.get("of")));
-    let negative_stream = count(rows.speech.and_then(|node| node.get("of")));
-    body.push_str(&format!(
-        "**The set.** The negative side is {negatives} clips — {speech_clips} speech clips \
-         ({per_voice} per voice: {near_misses} phonetic near-misses, {unrelated} unrelated \
-         sentences, {in_passing} wake-phrase-in-passing clips, over {voices} voices) and the \
-         {non_speech_clips} non-speech clips measured apart in a stream of their own — and the \
-         positive side {positive_stream} clips ({positives} per voice: {wake_only} bare \
-         wake-phrase renders plus {with_command} wake-phrase-plus-command clips, the same \
-         {wake_only} and {with_command} in every voice). Every pooled figure is pooled: the same \
-         {per_voice} (or {positives}) clips across {voices} voices, not {negative_stream} (or \
-         {positive_stream}) independent utterances. The overalls over the {clones} clone voices \
-         are not comparable with the enrolled row and are not a regression against anything — a \
-         different population, and thresholds fitted on another voice. A near-zero figure on \
-         either side is a finding about cross-voice detection, not a failed round: the detector \
-         was not re-tuned here.\n\n"
-    ));
-    let enrolled = report.get("voices").and_then(|node| node.get("enrolled"));
-    let enrolled_outcome = match enrolled
-        .and_then(|node| node.get("passed"))
-        .and_then(Value::as_bool)
-    {
-        Some(true) => "passed",
-        Some(false) => {
-            "failed, and the run completed and recorded anyway — a fact about the owner's \
-                        clip, not grounds to stop a round, and never a reason to replace it"
-        }
-        None => UNAVAILABLE,
-    };
-    // The probes the report lists, in full: the check scores every sentence of the
-    // pinned list, so the record states that list rather than a copy of it here.
-    let probes: Vec<String> = array(
-        report
-            .get("voices")
-            .and_then(|node| node.get("intelligibility"))
-            .and_then(|node| node.get("sentences")),
-    )
-    .iter()
-    .map(|sentence| format!("`{}`", text(Some(sentence))))
-    .collect();
-    body.push_str(&format!(
-        "**The check.** A voice counts as usable when the pinned ordinary sentences — {} — \
-        rendered in it come back from the workspace's own recogniser word for word, in order, \
-        ignoring case and punctuation. The enrolled voice's own outcome: {enrolled_outcome}. The \
-        check is deliberately not built on the wake phrase, which this recogniser spells in no \
-        voice, including the owner's; whether the wake phrase survives in a given voice is what \
-        that voice's rows above measure. The check establishes that a voice is usable; the rest of \
-        its renders are not individually gated.\n\n",
-        if probes.is_empty() {
-            UNAVAILABLE.to_string()
-        } else {
-            probes.join(", ")
-        },
-    ));
-    let selection = report.get("voices");
-    let selected = selection
-        .and_then(|node| node.get("selected"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let pool = selection
-        .and_then(|node| node.get("pool"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let mut selection_note = format!(
-        "The voices were selected by walking the pinned pool of {pool} recordings in its \
-         pinned order and taking the first that passed the check."
-    );
-    if let Some(replacements) = selection
-        .and_then(|node| node.get("replacements"))
-        .and_then(Value::as_array)
-        && !replacements.is_empty()
-    {
-        let named: Vec<String> = replacements
-            .iter()
-            .map(|replacement| {
-                format!(
-                    "`{}` ({}) — {}",
-                    text(replacement.get("recording")),
-                    span_of(replacement.get("span")),
-                    text(replacement.get("reason"))
-                )
-            })
-            .collect();
-        selection_note.push_str(&format!(
-            " {} rejected and replaced after failing the check, in the order tried: {}.",
-            named.len(),
-            named.join("; ")
-        ));
-    }
-    body.push_str(&selection_note);
-    body.push_str(&format!(
-        " The measured set is {selected} clone voices plus the enrolled voice.\n\n"
-    ));
 }

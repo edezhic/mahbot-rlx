@@ -199,8 +199,8 @@ fn the_synthesis_body_schedule_has_no_row_copy_with_models() {
 /// One predictor frame is **one fence** and one submission per encode chunk of
 /// the sixteen-level walk, and its cache stays in the arena. The frame graph is
 /// the live walk, so these are its pins: two inputs (`hidden`, `code0_embed`)
-/// and two outputs (the drawn codes, then level 1's logits for the stand's
-/// sampler check), one `Op::Sample` draw per projecting level, no whole-cache
+/// and two outputs (the drawn codes, then level 1's logits as a side output), one
+/// `Op::Sample` draw per projecting level, no whole-cache
 /// transpose, one in-place `KvAppend` per block and cache at every projecting
 /// level (level 0 seeds each block's plane with a concat instead), and no
 /// layer-axis narrow. Its schedule carries no `buffer_copy` and no `host_op`
@@ -246,7 +246,7 @@ fn a_predictor_frame_is_one_fence_and_one_submission_per_encode_chunk_with_model
     assert_eq!(
         graph.outputs.len(),
         2,
-        "the drawn codes, then level 1's logits for the stand's sampler check"
+        "the drawn codes, then level 1's logits as a side output"
     );
     let draws = graph
         .nodes()
@@ -424,24 +424,24 @@ fn the_recognition_prompt_is_thirty_grouped_row_tiles() {
 /// lowering emits for the graph, and the parameter bytes each site reads, totalled
 /// and as a tensor × byte × count table, beside the graph's own parameter-byte sum.
 ///
-/// On the models `MEASUREMENTS.md` names the reconciliation closes: 351 packed
+/// On the shipped models the reconciliation closes: 351 packed
 /// sites and 80 block instances (5 blocks × the frame's 16 levels: level 0 seeds
 /// the cache and draws nothing, each of levels 1..=15 appends a row and projects);
 /// 3 of those sites are dead — `blk.4`'s `attn_out`, `gate_up` and `ffn_down` at
 /// level 0, whose row nothing reads because level 1 embeds the drawn code rather
 /// than the hidden, while the block's `qkv` stays live as the cache seed — and the
-/// live 348 is exactly what the cell dispatches. The backend lowering of the flow
-/// graph still emits all 351 steps, so the other half of the method is the cell's
-/// own schedule: `RLX_WGPU_SCHEDULE=1 ./target/release/mahbot-inference 5` prints
+/// live 348 is exactly what the frame dispatches. The backend lowering of the flow
+/// graph still emits all 351 steps, so the other half of the method is the frame's
+/// own schedule: `RLX_WGPU_SCHEDULE=1 ./target/release/mahbot-inference 4` prints
 /// one 1 465-step graph with `348 × dequant_matmul_gguf`, `79 × attention` and
 /// `79 × fused_swiglu` — the same one instance short, dropped as dead work rather
 /// than shared or reused.
 ///
-/// The compile is `WgpuExecutable::compile` on the graph the flow built, which is
-/// the graph the cell's `Runner` holds; the runtime's pre-passes (the cleanup and
-/// the fusions) run inside `Session::compile` and can move a step between kinds,
-/// so a step figure here is the backend's lowering of this graph, not a promise
-/// about the cell's schedule — which is why the schedule dump is the other half.
+/// The compile is `WgpuExecutable::compile` on the graph the flow built; the
+/// runtime's pre-passes (the cleanup and the fusions) run inside `Session::compile`
+/// and can move a step between kinds, so a step figure here is the backend's
+/// lowering of this graph, not a promise about the frame's schedule — which is why
+/// the schedule dump is the other half.
 #[test]
 #[ignore = "measurement only: prints the predictor frame's multiply census and asserts the live-site reconciliation"]
 fn the_predictor_frames_multiply_census_with_models() {
@@ -471,8 +471,8 @@ fn the_predictor_frames_multiply_census_with_models() {
 
     // The multiply sites: a packed `DequantMatMul` reads its quantised weight as
     // the second operand, a plain `MatMul` its f32 one. Only an operand that is a
-    // parameter counts as a weight read — the same rule the record's stream table
-    // uses — so an activation in that position is not priced here.
+    // parameter counts as a weight read, so an activation in that position is not
+    // priced here.
     let bytes_of = |id: rlx_ir::NodeId| -> Option<(String, u64)> {
         let node = graph.node(id);
         let Op::Param { name } = &node.op else {
@@ -522,7 +522,7 @@ fn the_predictor_frames_multiply_census_with_models() {
     // level-0 block stack ends in a row nothing reads (level 1 embeds the drawn
     // code, not the hidden), so the last block's output path there is dead while
     // its K/V rows seed the cache — which is why the site count can exceed the
-    // steps the cell actually dispatches.
+    // steps the frame actually dispatches.
     let mut live: std::collections::HashSet<rlx_ir::NodeId> =
         graph.outputs.iter().copied().collect();
     let mut stack: Vec<rlx_ir::NodeId> = graph.outputs.clone();
@@ -559,7 +559,7 @@ fn the_predictor_frames_multiply_census_with_models() {
 
     // The backend's own lowering, after the runtime's pre-passes: one step per
     // settled multiply, named by kind. The direct compile entry runs no cleanup, so
-    // the dead sites above would otherwise still be lowered — the cell's schedule is
+    // the dead sites above would otherwise still be lowered — the frame's schedule is
     // the cleaned graph's.
     let cleaned = rlx_runtime::precompile::precompile_cleanup(
         graph.clone(),

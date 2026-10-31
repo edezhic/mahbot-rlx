@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 
-use crate::graphs::{self, Compiled, Outcome};
+use crate::graphs::{self, Compiled};
 use crate::host;
 use crate::loader::{Config, Head, Pair};
 use crate::report;
@@ -31,8 +31,8 @@ pub const MEL_FRAMES: usize = 76;
 /// Samples in the wake window: [`MEL_FRAMES`] hops.
 pub const WINDOW_SAMPLES: usize = 12_160;
 
-/// The most audio one recognition pass takes: 30 s, the length the stand's own
-/// measured walk is taken at (3 000 mel frames, 375 audio tokens). The encoder
+/// The most audio one recognition pass takes: 30 s (3 000 mel frames, 375 audio
+/// tokens). The encoder
 /// admits more, but the prefill's attention plane grows with the square of it, so
 /// a longer input is cut into passes of this length rather than compiled whole.
 pub const PASS_SAMPLES: usize = 30 * SAMPLE_RATE as usize;
@@ -84,10 +84,9 @@ pub fn is_asr_eos(id: usize) -> bool {
 pub const DECODE_CACHE_BUCKET: usize = 128;
 
 /// The front end's three graphs for one frame count: mel, encoder and projector.
-/// Built and run in this order everywhere the cells measure — the ear's window,
-/// the ear's shorter cells, a recognition segment — so the input names and the
-/// frame arithmetic are stated once. One window per call, which is the graph the
-/// stand's numbers belong to.
+/// Built and run in this order everywhere the path measures — the ear's window, a
+/// recognition segment, the tagger's own front — so the input names and the frame
+/// arithmetic are stated once. One window per call.
 ///
 /// The mel graph is not this clip's own: it has no weights and its shape is the frame
 /// count, so every clip that reads the same count runs the same compiled graph
@@ -173,24 +172,24 @@ impl Front {
         self.build_ms
     }
 
-    /// The three measured runs, for the stand's per-phase figures.
-    pub(crate) fn run(&self, audio: Vec<f32>, reps: usize) -> (Outcome, Outcome, Outcome) {
+    /// The three runs, for a recognition pass: the mel, the encoder and the projector.
+    pub(crate) fn run(&self, audio: Vec<f32>) -> Vec<f32> {
         let mel = self
             .mel
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .run(&[("audio".into(), audio)], reps);
+            .run(&[("audio".into(), audio)]);
         let encoder = self
             .encoder
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .run(&[("mel".into(), mel.outs[0].clone())], reps);
-        let projector = self
+            .run(&[("mel".into(), mel[0].clone())]);
+        let mut projector = self
             .projector
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .run(&[("features".into(), encoder.outs[0].clone())], reps);
-        (mel, encoder, projector)
+            .run(&[("features".into(), encoder[0].clone())]);
+        projector.remove(0)
     }
 }
 
@@ -340,7 +339,6 @@ pub(crate) fn rung(pair: &Arc<Pair>, frames: usize) -> Result<(Arc<Rung>, Option
 /// blocks, `post_ln` — runs over the whole group in one pass, with the projector
 /// after it. That is where the weight reads and the multiplies amortise.
 pub(crate) struct GroupFront {
-    pair: Arc<Pair>,
     mel: Compiled,
     convs: Compiled,
     tail: Compiled,
@@ -373,7 +371,6 @@ impl GroupFront {
             graphs::projector_chain(pair.clone(), batch * tokens)?,
         )?;
         Ok(Self {
-            pair: Arc::clone(pair),
             mel,
             convs,
             tail,
@@ -383,25 +380,6 @@ impl GroupFront {
             dim: pair.sound.clip().projection_dim,
             flat: graphs::flat_width(bins),
         })
-    }
-
-    /// One listener's memory: the pair's two model files (a graph binds its weights
-    /// from those files, so their sizes are the weight figure the planned arenas do not
-    /// carry), plus every compiled graph's planned arena and uploaded parameters.
-    ///
-    /// The backend's scratch tail is excluded — it is reserved, not resident, for
-    /// graphs whose attention does not fill it — and the run's system-memory guard
-    /// backstops the estimate.
-    #[must_use]
-    pub fn footprint_bytes(&self) -> u64 {
-        let file = |path: &std::path::Path| std::fs::metadata(path).map_or(0, |m| m.len());
-        let weights = file(&self.pair.body.path) + file(&self.pair.sound.path);
-        let graph = |g: &Compiled| g.device_bytes() as u64;
-        weights
-            + [&self.mel, &self.convs, &self.tail, &self.projector]
-                .into_iter()
-                .map(graph)
-                .sum::<u64>()
     }
 
     /// `windows.len() <= batch` windows in one tail pass and one projector pass,
@@ -477,8 +455,8 @@ impl Listener {
     /// a time, and padding a lone window into a [`GROUP`]-wide pass costs the
     /// whole group's work.
     pub fn embed(&mut self, samples_16k: &[f32]) -> Result<Vec<f32>> {
-        let (_, _, projector) = self.single.run(trailing_window(samples_16k), 0);
-        let pooled = mean_pool(&projector.outs[0], self.tokens, self.dim)?;
+        let projected = self.single.run(trailing_window(samples_16k));
+        let pooled = mean_pool(&projected, self.tokens, self.dim)?;
         Ok(l2(&pooled))
     }
 }
@@ -574,35 +552,21 @@ pub(crate) fn l2(v: &[f32]) -> Vec<f32> {
     v.iter().map(|x| x / n).collect()
 }
 
-/// What one recognition walk answered and what it cost: the answer every caller
-/// transcribes, and the materials the stand folds into its per-phase figures.
+/// What one recognition walk answered: the transcript every caller reads and the
+/// walk's own cost.
 pub struct Walk {
     pub frames: usize,
-    pub samples: usize,
-    pub tokens: usize,
     pub prompt_rows: usize,
     pub capacity: usize,
     pub generated: Vec<usize>,
     /// The greedy choice that stopped the walk (EOS, or the token the budget ended on).
     pub next: usize,
-    pub written: usize,
-    pub finished: bool,
     pub truncated: bool,
     pub text: String,
     pub values: Vec<f32>,
     pub build_ms: f64,
-    /// The prompt-embedding table read, priced into the prefill phase.
-    pub prompt_read_ms: f64,
-    pub mel: Outcome,
-    pub encoder: Outcome,
-    pub projector: Outcome,
-    pub prefill: Outcome,
-    pub decode_nodes: usize,
     /// One entry per generated token: the row's own price.
     pub decode_times: Vec<f64>,
-    pub kv_bytes: usize,
-    pub decode_stream_bytes: u64,
-    pub counters: (u64, u64),
 }
 
 /// A decode graph more than one chunk runs on, with the lock a walk holds while it uses
@@ -642,14 +606,14 @@ impl Shared {
 /// decode graph and rebuilds only the prefill between chunks, because holding all three
 /// would keep three compiled graphs whose uploads carry the body. The **one-shot** clip
 /// ([`Clip::once`]) drops the front end as soon as it has run, so the front end is never
-/// resident beside the prefill — the residency the listen cell's peak records.
+/// resident beside the prefill.
 pub struct Clip<'a> {
     pair: Arc<Pair>,
     tokenizer: &'a Tokenizer,
     /// The front end, built with the clip and held across chunks when a caller
     /// transcribes several of them. A one-shot clip ([`Clip::once`]) drops it after
     /// its single run, so the front end's graphs are never resident beside the
-    /// prefill — the residency the listen cell's peak records.
+    /// prefill.
     front: Option<Front>,
     /// The rung this clip runs on, when it is a ladder chunk: its front end and its
     /// prefills are the process-wide ones ([`rung`]), so this clip builds neither and
@@ -707,7 +671,7 @@ impl<'a> Clip<'a> {
 
     /// The one-shot path's clip: [`Clip::build`]'s graphs, with the front end
     /// dropped as soon as it has run, so the front end is not resident beside the
-    /// prefill — the residency the listen cell's peak records. A second `run` on this
+    /// prefill. A second `run` on this
     /// clip rebuilds the front end, so a caller with several chunks uses
     /// [`Clip::build`] instead.
     pub fn once(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
@@ -783,17 +747,14 @@ impl<'a> Clip<'a> {
     /// caller truncates or pads before calling). `declared` is the three language rows
     /// written into the prompt instead of being generated, or `None` to leave the
     /// recogniser its own answer — the prompt is three rows longer with them, and the two
-    /// lengths are two prefills. `reps` is the warm repetition count of every measured
-    /// phase; the gate passes 0.
+    /// lengths are two prefills.
     pub fn run(
         &mut self,
         mut audio: Vec<f32>,
         declared: Option<[usize; ASR_LANGUAGE_IDS.len()]>,
-        reps: usize,
     ) -> Result<Walk> {
         let frames = self.frames;
         audio.truncate(frames * graphs::MEL_HOP);
-        let samples = audio.len();
         let cfg = self.cfg.clone();
         let hkv = self.hkv;
         let vocab = match cfg.head {
@@ -802,10 +763,9 @@ impl<'a> Clip<'a> {
         let prompt_rows = self.prompt_rows + declared.map_or(0, |ids| ids.len());
         let mut capacity = self.capacity;
         let mut build_ms = std::mem::take(&mut self.owed_ms);
-        let c0 = graphs::device_counts();
 
-        let (mel, encoder, projector) = match &self.shared {
-            Some(rung) => rung.front.run(audio, reps),
+        let projected = match &self.shared {
+            Some(rung) => rung.front.run(audio),
             None => {
                 if self.front.is_none() {
                     let t = report::Stopwatch::start();
@@ -816,7 +776,7 @@ impl<'a> Clip<'a> {
                     .front
                     .as_ref()
                     .expect("the front end was built just above")
-                    .run(audio, reps);
+                    .run(audio);
                 if !self.reuse_front {
                     self.front = None;
                 }
@@ -847,20 +807,18 @@ impl<'a> Clip<'a> {
             }
         }
         let picks: Vec<(usize, usize)> = text_ids.iter().map(|(_, id)| (0, *id)).collect();
-        let t_rows = report::Stopwatch::start();
         let rows = self
             .pair
             .body
             .table_rows_f32("token_embd.weight", &picks, cfg.d)
             .with_context(|| "reading prompt embeddings")?;
-        let prompt_read_ms = t_rows.ms();
         for ((at, _), row) in text_ids.iter().zip(rows) {
             prompt[at * cfg.d..(at + 1) * cfg.d].copy_from_slice(&row);
         }
         for a in 0..self.tokens {
             let at = ASR_HEAD_IDS.len() + ASR_TEXT_IDS.len() + a;
             prompt[at * cfg.d..(at + 1) * cfg.d]
-                .copy_from_slice(&projector.outs[0][a * cfg.d..(a + 1) * cfg.d]);
+                .copy_from_slice(&projected[a * cfg.d..(a + 1) * cfg.d]);
         }
 
         // Prompt prefill on a growing cache: all `prompt_rows` rows, logits on the
@@ -880,7 +838,7 @@ impl<'a> Clip<'a> {
                 prefill
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .run(&inputs, reps)
+                    .run(&inputs)
             }
             None => {
                 let mut prefill = {
@@ -889,7 +847,7 @@ impl<'a> Clip<'a> {
                     build_ms += t.ms();
                     prefill
                 };
-                let p = prefill.run(&inputs, reps);
+                let p = prefill.run(&inputs);
                 drop(prefill);
                 p
             }
@@ -903,16 +861,9 @@ impl<'a> Clip<'a> {
             k: mut k_cache,
             v: mut v_cache,
             mut mask,
-        } = graphs::seed_plane_cache(
-            cfg.layers,
-            capacity,
-            prompt_rows,
-            hkv,
-            &p.outs[1],
-            &p.outs[2],
-        );
-        let mut next = argmax(&p.outs[3][..vocab]) as usize;
-        p.outs.clear();
+        } = graphs::seed_plane_cache(cfg.layers, capacity, prompt_rows, hkv, &p[1], &p[2]);
+        let mut next = argmax(&p[3][..vocab]) as usize;
+        p.clear();
         let mut decode = match &self.decode {
             Some(decode) => Arc::clone(decode),
             None => {
@@ -937,13 +888,6 @@ impl<'a> Clip<'a> {
         for rows in k_cache.iter_mut().chain(v_cache.iter_mut()) {
             rows.clear();
         }
-        let (nodes, decode_stream_bytes) = {
-            let guard = decode.graph();
-            (
-                guard.ops.iter().map(|(_, n)| n).sum::<usize>(),
-                graphs::stream_bytes(&guard.runner.graph),
-            )
-        };
         let mut generated: Vec<usize> = Vec::new();
         let mut written = prompt_rows;
         let mut decode_times: Vec<f64> = Vec::new();
@@ -1053,35 +997,19 @@ impl<'a> Clip<'a> {
         values.push(next as f32);
         values.push(if is_asr_eos(next) { 1.0 } else { 0.0 });
         values.push(written as f32);
-        // The planes as the walk left them: `2 · layers · (capacity + 1) · hkv` f32.
-        let kv_bytes = 2 * cfg.layers * (capacity + 1) * hkv * 4;
-        let c = graphs::device_counts();
         self.capacity = capacity;
         self.decode = Some(decode);
         Ok(Walk {
             frames,
-            samples,
-            tokens: self.tokens,
             prompt_rows,
             capacity,
             generated,
             next,
-            written,
-            finished,
             truncated,
             text,
             values,
             build_ms,
-            prompt_read_ms,
-            mel,
-            encoder,
-            projector,
-            prefill: p,
-            decode_nodes: nodes,
             decode_times,
-            kv_bytes,
-            decode_stream_bytes,
-            counters: (c.0 - c0.0, c.1 - c0.1),
         })
     }
 
@@ -1095,20 +1023,15 @@ impl<'a> Clip<'a> {
 }
 
 /// The one-shot path: one [`Clip::once`] for this length, one run — the clip the
-/// listen cell and the speak cell's round-trip gate transcribe with.
-pub fn recognise(
-    pair: &Arc<Pair>,
-    tokenizer: &Tokenizer,
-    audio: Vec<f32>,
-    reps: usize,
-) -> Result<Walk> {
+/// one-shot path transcribes with.
+pub fn recognise(pair: &Arc<Pair>, tokenizer: &Tokenizer, audio: Vec<f32>) -> Result<Walk> {
     let frames = audio.len() / graphs::MEL_HOP;
     if frames == 0 {
         bail!("the audio gave no speech");
     }
     let mut audio = audio;
     audio.truncate(frames * graphs::MEL_HOP);
-    Clip::once(pair, tokenizer, frames)?.run(audio, None, reps)
+    Clip::once(pair, tokenizer, frames)?.run(audio, None)
 }
 
 #[cfg(test)]
@@ -1185,10 +1108,9 @@ mod tests {
 
         for (window, grouped) in windows.iter().zip(batched) {
             let one = trailing_window(window);
-            let (_, _, projector) = single.run(one, 0);
-            let single = &projector.outs[0];
+            let single = single.run(one);
             let a = l2(&mean_pool(
-                single,
+                &single,
                 graphs::asr_tokens(MEL_FRAMES),
                 pair.sound.clip().projection_dim,
             )

@@ -10,8 +10,8 @@
 //! any cache, and reports bytes per second of wall time. A packed weight is read
 //! and never written, so the read figure is the one a weight stream is compared
 //! against; the copy's read + written rate is recorded beside it. Both are
-//! wall-time rates around one submission and poll, not spec-sheet peaks. The
-//! figures a run recorded are in `MEASUREMENTS.md`.
+//! wall-time rates around one submission and poll, not spec-sheet peaks. The probe
+//! reports its own session's figures; no record carries them.
 //!
 //! # The round
 //!
@@ -56,7 +56,7 @@ const ROUNDS: usize = 5;
 /// so the device's clocks have risen. A round is `PASSES_PER_ROUND` ×
 /// `BYTES_PER_DIRECTION` ≈ 512 MiB, ~4 ms on this machine, and two of them were
 /// not enough: the same probe read a median 119.4-120.8 GB/s (min 110.2) at the
-/// head of a stand run and 132.7-132.9 GB/s (min 131.8) after the cells, i.e. the
+/// head of a run and 132.7-132.9 GB/s (min 131.8) once the device was warm, i.e. the
 /// cold reading was 10 % low and every share quoted against it 10 % high. Sixteen
 /// rounds ≈ 64 ms of sustained traffic is what the warm reading needed.
 const WARMUP_ROUNDS: usize = 16;
@@ -377,16 +377,15 @@ mod tests {
 
     /// Prints both measurements. `#[ignore]`d like the crate's other device
     /// measurements: a round pair moves ~1.5 GiB, which does not belong in the
-    /// suite's runtime, and the stand takes the figures a record quotes. The read
-    /// dispatch's geometry is pinned above; the only assertions here are that each
-    /// rate is finite and positive with its min ≤ median ≤ max, because a rate is
-    /// a property of the machine under test.
+    /// suite's runtime. The read dispatch's geometry is pinned above; the only
+    /// assertions here are that each rate is finite and positive with its
+    /// min ≤ median ≤ max, because a rate is a property of the machine under test.
     ///
     /// ```text
     /// cargo test -p rlx-wgpu --release --lib bandwidth -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore = "device measurement: the stand takes the figures a record quotes"]
+    #[ignore = "device measurement: prints the machine's ceilings, stores nothing"]
     fn the_stream_ceiling_is_measured_on_this_device() {
         if rlx_ir::env::skip_unless_device("wgpu", true, crate::is_available()) {
             return;

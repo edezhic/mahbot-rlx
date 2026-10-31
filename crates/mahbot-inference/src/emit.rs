@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Weight plumbing and op helpers shared by the three role graphs.
+//! Weight plumbing and op helpers shared by the role graphs.
 //!
-//! Every graph in this stand is assembled on `rlx-flow`: `ModelFlow` carries the
+//! Every graph in this crate is assembled on `rlx-flow`: `ModelFlow` carries the
 //! topology, a [`LayerStage`](rlx_flow::LayerStage) per graph emits the blocks
 //! through `FlowCtx`'s emission surface and `HirMut`'s op set, and the loader
 //! above supplies the weights. Three weight paths:
@@ -14,11 +14,10 @@
 //!   `FlowCtx::linear` emits a fused `DequantMatMul`;
 //! * **host** tensors (`Store::HostDequant`, `Store::F16Widened`) — unpacked to
 //!   f32 on the host and multiplied as a plain `MatMul`;
-//! * **the embedding encoder's** linears (`Store::F16Linear`, see
-//!   [`linear_encoder`]) — unpacked to f16 on the host and multiplied as a
-//!   `MatMul` whose weight is an f16 `Param`. It is the packed route's
-//!   replacement only where the device admits the cooperative f16 kernel for
-//!   every multiply in the graph, and the packed route everywhere else.
+//! * **f16** linears (`Store::F16Linear`, see [`linear_encoder`]) — kept as f16
+//!   on the host and multiplied as a `MatMul` whose weight is an f16 `Param`, for
+//!   a file that is f16 end to end (`crate::ced`'s tagger). The packed route is
+//!   every other file's.
 //!
 //! A `name#step` key is a stacked tensor read one step at a time (the code
 //! predictor's fifteen LM heads), and takes the same paths on its slice.
@@ -172,21 +171,6 @@ pub fn clear_weight_caches() {
     ORIGINS.with(|cell| *cell.borrow_mut() = None);
 }
 
-/// The bytes this process's own copies of the weights hold right now: a kept fused blob at
-/// its own length, host f32 at four bytes a value. What [`clear_weight_caches`] gives back,
-/// and the figure a cell's high-water is read against.
-pub fn host_cache_bytes() -> usize {
-    cached()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .map(|entry| match entry {
-            Cached::Blob(blob) => blob.len(),
-            Cached::Host(values, _) => values.len() * std::mem::size_of::<f32>(),
-        })
-        .sum()
-}
-
 /// Forget the build's origin record and its placeholder record: both describe the one build
 /// that just finished. Called when a build starts (so nothing an earlier, failed build left
 /// can change it) and again when its compile has bound every parameter.
@@ -272,8 +256,8 @@ impl LoaderWeights {
             out_dim += part.out_dim;
         }
         // Kept only when this is a repeat ask: the blob is a second copy of weights the
-        // device already holds, and caching every one of them measured 0.22 GiB of the
-        // transcribe cell's peak against ~100 ms of a cold call's compiles — a trade the
+        // device already holds, and caching every one of them measured 0.22 GiB of a
+        // transcription's peak against ~100 ms of a cold call's compiles — a trade the
         // ceiling does not afford. A graph built after an earlier one finds it here and
         // stops re-reading.
         if worth_keeping(&self.model, &packed_param(name)) {
@@ -942,27 +926,25 @@ pub fn linear(
     ctx.linear(x, key, false)
 }
 
-/// The embedding encoder's linear: the f16 route when [`Model::f16_linears`]
-/// took this weight's plan, the packed route otherwise — the same topology, the
-/// same projection, one `MatMul` on an f16 `Param` instead of a fused
-/// `DequantMatMul` over the file's packed bytes.
+/// The linear for a weight whose plan the loader declared as f16
+/// ([`Store::F16Linear`]): one `MatMul` on an f16 `Param` instead of a fused
+/// `DequantMatMul` over the file's packed bytes — the same topology, the same
+/// projection.
 ///
 /// It remains a separate entry rather than an argument to [`linear`] because
 /// `linear` cannot see the model's plan store; for every other store it *is*
 /// `linear`, called directly below.
 ///
 /// The weight node is declared here and its bytes are attached at session time
-/// (`graphs::encoder` hands `Model::linear_f16`'s bytes to `set_param_typed`),
-/// exactly as a packed blob is: the graph carries a `Param`, not data. Nothing
-/// else about the multiply changes — `Op::MatMul`'s output is the input's dtype
-/// (f32), so the projection lands back in the f32 row the rest of the block
-/// reads, and the accumulator is f32 inside the kernel.
+/// ([`Model::linear_f16`]'s bytes go to `set_param_typed`, exactly as a packed
+/// blob is): the graph carries a `Param`, not data. Nothing else about the
+/// multiply changes — `Op::MatMul`'s output is the input's dtype (f32), so the
+/// projection lands back in the f32 row the rest of the block reads, and the
+/// accumulator is f32 inside the kernel.
 ///
-/// The store rule already refused f16 for a graph whose multiplies do not admit
-/// the kernel's tile, so an unadmitted extent here is a caller that asked for a
-/// row count the plans were not prepared for: it is refused by name rather than
-/// quietly served by `matmul_f16_compute`, which is slower than the packed route
-/// this call would have taken.
+/// A multiply that does not admit the cooperative f16 kernel's tile is refused
+/// by name rather than quietly served by `matmul_f16_compute`, which is slower
+/// than the packed route this call would have taken.
 pub fn linear_encoder(
     ctx: &mut FlowCtx<'_>,
     model: &Model,
@@ -1010,8 +992,8 @@ pub fn linear_fused(
 
 /// One block's three attention projections: each key through
 /// [`linear_encoder`] on its own — three multiplies. That entry is [`linear`]
-/// for every store the encoder did not flip to f16, so the packed body and the
-/// embedding encoder share this call site.
+/// for every store the loader did not declare f16, so the packed body and the
+/// sound stage share this call site.
 pub fn qkv(
     ctx: &mut FlowCtx<'_>,
     model: &Model,
@@ -1062,12 +1044,8 @@ pub fn snake_beta(
     g.add(x, scale)
 }
 
-/// `y = softmax(q·kᵀ/√d)·v` by the core's own attention op.
-///
-/// `score_scale` is the op's own default when `None` (`1/√head_dim`);
-/// `Some(1.0)` is what the Gemma encoders ask for, their per-head q/k norms
-/// having already fixed the scores' magnitude.
-#[allow(clippy::too_many_arguments)]
+/// `y = softmax(q·kᵀ/√d)·v` by the core's own attention op, at the op's own
+/// `1/√head_dim` scale.
 pub fn attention(
     ctx: &mut FlowCtx<'_>,
     q: HirNodeId,
@@ -1077,46 +1055,8 @@ pub fn attention(
     head_dim: usize,
     kind: MaskKind,
     out: &[usize],
-    score_scale: Option<f32>,
 ) -> HirNodeId {
-    h(ctx).attention_kind_opts(
-        q,
-        k,
-        v,
-        heads,
-        head_dim,
-        kind,
-        Shape::new(out, DType::F32),
-        score_scale,
-        None,
-    )
-}
-
-/// RoPE tables `[rows, head_dim/2]` computed at the file's base (the checkpoints
-/// do not carry them). These are the graph's **synthetic constants** (f32): the
-/// wave transformer consumes a whole window at once. The body's cached steps use
-/// [`crate::host::rope_tables_at`] instead — global positions and f64, so a long
-/// walk does not accumulate f32 phase drift.
-pub fn rope_tables(
-    ctx: &mut FlowCtx<'_>,
-    name: &str,
-    rows: usize,
-    hd: usize,
-    base: f32,
-) -> (HirNodeId, HirNodeId) {
-    let half = hd / 2;
-    let mut cos = vec![0f32; rows * half];
-    let mut sin = vec![0f32; rows * half];
-    for p in 0..rows {
-        for i in 0..half {
-            let theta = p as f32 / base.powf(2.0 * i as f32 / hd as f32);
-            cos[p * half + i] = theta.cos();
-            sin[p * half + i] = theta.sin();
-        }
-    }
-    let c = synth_param(ctx, &format!("{name}.cos"), cos, &[rows, half]);
-    let s = synth_param(ctx, &format!("{name}.sin"), sin, &[rows, half]);
-    (c, s)
+    h(ctx).attention_kind(q, k, v, heads, head_dim, kind, Shape::new(out, DType::F32))
 }
 
 /// `x + y` with the shape of `x` (broadcast where the caller means it to).
@@ -1286,7 +1226,7 @@ pub fn synth_param(
 /// (`FlowCtx::load_param`), but `synth_param` declares a fresh leaf on every
 /// call — and the predictor's steps are unrolled, so the same f32 parameters are
 /// asked for once per step and frame. Asking the module for the leaf already
-/// under the name is that same rule for the stand's own leaves. The **last**
+/// under the name is that same rule for the leaves this crate declares. The **last**
 /// declaration is the one a binding would win, so that is the one reused; a name
 /// that reappears with another shape is left alone — those are genuinely
 /// different leaves (the per-frame RoPE tables, the per-step slices, which differ

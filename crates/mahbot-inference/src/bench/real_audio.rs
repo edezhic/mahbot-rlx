@@ -22,7 +22,7 @@
 //! events are taken from the same stream, so the figures in a cut report describe
 //! one population.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -44,7 +44,6 @@ struct Totals {
     files_fed: usize,
     audio_secs: f64,
     speech_secs: f64,
-    noise_secs: f64,
     vad_secs: f64,
     events: usize,
 }
@@ -61,40 +60,24 @@ impl Totals {
         self.audio_secs += secs;
         if is_speech(path) {
             self.speech_secs += secs;
-        } else {
-            self.noise_secs += secs;
         }
     }
 }
 
 /// The pool a pinned file belongs to: the set partitions into `speech/` and
-/// `noise/`, so a path that is not speech is noise, here and in the report's
-/// per-pool file counts.
+/// `noise/`, so a path that is not speech is noise, and only the speech is counted
+/// into `RealAudio::speech_hours`.
 fn is_speech(path: &str) -> bool {
     path.starts_with("speech/")
 }
 
 /// Everything the report states about the real-audio phase.
 pub(crate) struct RealAudio {
-    pub files_total: usize,
-    pub speech_files: usize,
-    pub noise_files: usize,
-    pub corpus: PathBuf,
     pub files_fed: usize,
     pub audio_hours: f64,
     pub speech_hours: f64,
-    pub noise_hours: f64,
     pub vad_active_hours: f64,
     pub wall_secs: f64,
-    /// Windows in the largest group the stream resolved, how many encoder passes
-    /// its windows took, and how many of those carried fewer windows than the
-    /// capacity — the pipeline is built for `listen::GROUP`; a phase cut short
-    /// may never fill one.
-    pub max_group: usize,
-    pub encoder_passes: usize,
-    pub partial_passes: usize,
-    /// One listener's footprint, for the memory the phase actually held.
-    pub listener_bytes: u64,
     pub events: usize,
     /// Why the phase stopped early, when it did; the figures above are then what
     /// the files fed so far measured.
@@ -136,28 +119,11 @@ impl RealAudio {
         }
         json!({
             "status": status,
-            "subset": {
-                "files_total": self.files_total,
-                "speech_files": self.speech_files,
-                "noise_files": self.noise_files,
-                "corpus": self.corpus.to_string_lossy(),
-                "manifest": {"repo": sets::REAL_AUDIO_REPO, "revision": sets::REAL_AUDIO_REVISION},
-            },
             "feed": {
-                "streams": 1,
-                "windows_per_pass": self.max_group,
-                "group_capacity": listen::GROUP,
-                "encoder_passes": self.encoder_passes,
-                "partial_passes": self.partial_passes,
-                "listener_bytes": self.listener_bytes,
                 "files_fed": self.files_fed,
                 "audio_hours_fed": self.audio_hours,
-                "speech_hours_fed": self.speech_hours,
-                "noise_hours_fed": self.noise_hours,
                 "vad_active_hours_fed": self.vad_active_hours,
-                "wall_secs": self.wall_secs,
                 "cut": self.cut,
-                "failures": self.failures,
             },
             "fa": Value::Object(fa),
         })
@@ -185,16 +151,13 @@ pub(crate) fn run(
     let mut totals = Totals::default();
     let mut failures = Vec::new();
     let mut cut: Option<anyhow::Error> = None;
-    let mut listener_bytes = 0u64;
 
-    // The stream outlives the listener: it is built whether or not the front end
-    // compiles, so its group facts stay readable even when the phase is cut.
+    // One stream for the whole sweep: the detector's audio clock, its cooldown and
+    // its segment window carry from one file into the next, separated by a silent
+    // gap, so the sweep is one listener's hearing rather than one per file.
     let mut stream = DetectionStream::grouped(enrollment.clone());
     let listener = match listen::GroupFront::build(pair, listen::MEL_FRAMES, listen::GROUP) {
-        Ok(listener) => {
-            listener_bytes = listener.footprint_bytes();
-            Some(listener)
-        }
+        Ok(listener) => Some(listener),
         Err(error) => {
             cut = Some(error.context("the real-audio listener did not compile"));
             None
@@ -239,23 +202,11 @@ pub(crate) fn run(
     }
 
     let audio = RealAudio {
-        files_total: subset.len(),
-        speech_files: subset.iter().filter(|(path, _, _)| is_speech(path)).count(),
-        noise_files: subset
-            .iter()
-            .filter(|(path, _, _)| !is_speech(path))
-            .count(),
-        corpus: cfg.corpus.clone(),
         files_fed: totals.files_fed,
         audio_hours: totals.audio_secs / 3600.0,
         speech_hours: totals.speech_secs / 3600.0,
-        noise_hours: totals.noise_secs / 3600.0,
         vad_active_hours: totals.vad_secs / 3600.0,
         wall_secs: started.elapsed().as_secs_f64(),
-        max_group: stream.max_group(),
-        encoder_passes: stream.groups(),
-        partial_passes: stream.partial_groups(),
-        listener_bytes,
         events: totals.events,
         cut: cut.as_ref().map(|error| format!("{error:#}")),
         failures,
@@ -433,11 +384,6 @@ mod tests {
             (totals.speech_secs - 0.10).abs() < 1e-9,
             "{}",
             totals.speech_secs
-        );
-        assert!(
-            (totals.noise_secs - 0.05).abs() < 1e-9,
-            "{}",
-            totals.noise_secs
         );
         std::fs::remove_dir_all(&dir).ok();
     }

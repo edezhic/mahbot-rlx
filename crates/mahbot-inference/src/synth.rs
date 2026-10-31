@@ -69,8 +69,7 @@ pub(crate) fn apply_repetition(logits: &mut [f32], seen: &[usize], penalty: f32)
     }
 }
 
-/// The talker's prompt for one request, shared by [`Synthesis::generate`] and
-/// the stand's measured cell: role header → codec control prefix → first text
+/// The talker's prompt for one request: role header → codec control prefix → first text
 /// token + codec BOS, the real trailing text followed by EOS, and the pad
 /// embedding the loop falls back to once the text is spent.
 pub(crate) struct TalkerPrompt {
@@ -78,8 +77,6 @@ pub(crate) struct TalkerPrompt {
     pub rows: usize,
     pub trailing: Vec<Vec<f32>>,
     pub pad: Vec<f32>,
-    pub speaker_norm: f32,
-    pub text0_norm: f32,
 }
 
 pub(crate) fn talker_prompt(
@@ -158,16 +155,11 @@ pub(crate) fn talker_prompt(
     for r in &prompt {
         x.extend_from_slice(r);
     }
-    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let speaker_norm = norm(speaker_embed);
-    let text0_norm = norm(&row(first_text_id)?);
     Ok(TalkerPrompt {
         x,
         rows,
         trailing,
         pad,
-        speaker_norm,
-        text0_norm,
     })
 }
 

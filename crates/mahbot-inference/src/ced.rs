@@ -35,21 +35,21 @@
 //!
 //! Weights: the file is `F16` end to end, and the store rule keeps it that way —
 //! [`Store::F16Linear`] declares the 49 matrices as f16 params rather
-//! than widening them on the host, which is what every other graph in this stand
+//! than widening them on the host, which is what every other graph in this crate
 //! does. What that route does *not* buy here is the cooperative f16 kernel: its
 //! tile wants whole 64-row output tiles, and a window is 252 tokens, so these
 //! multiplies are served by the f32 cooperative form over the f16 weight's f32
 //! image — a deviation from the rule that this model is f16 in compute as well as on
 //! disk, and one this file keeps deliberately rather than by omission: admitting the
 //! f16 tile means padding the token axis to 256, and four tokens of nothing inside
-//! the attention are a different model, not a faster one. Measured on this record's
-//! M3 Pro, one window costs **17.6 ms** the way it runs against **25.7 ms** with
+//! the attention are a different model, not a faster one. Measured on an M3 Pro,
+//! one window costs **17.6 ms** the way it runs against **25.7 ms** with
 //! `RLX_WGPU_MATMUL_F32_ONLY=1` (every multiply on the portable tiled kernel) — and
 //! **14.9 ms** padded. The tagger is a few percent of a transcription pass, so the
 //! 2.7 ms a window would save is not worth an arithmetic the file did not describe.
-//! The graph is compiled with [`Gemm::F16Coop`] regardless, which is what turns the
-//! weight-concat fusion off — that fusion would build an f16 `Concat` and make the
-//! runtime promote the whole graph to f32 arithmetic.
+//! The graph is compiled with the weight-concat fusion off, which is what keeps an
+//! f16 `Concat` out of it: that node would make the runtime promote the whole graph
+//! to f32 arithmetic.
 //!
 //! What this module does **not** establish: that its numbers are the reference
 //! model's. There is no golden fixture for CED here; what `tests/ced_tagger.rs`
@@ -72,7 +72,7 @@ use rlx_runtime::Device;
 
 use crate::emit::{self, LoaderWeights};
 use crate::graphs;
-use crate::loader::{CedConfig, Gemm, Model, Store};
+use crate::loader::{CedConfig, Model, Store};
 
 /// The tagger file's name. It is an input like every other model: the caller joins
 /// it to the directory the run was pointed at.
@@ -531,8 +531,7 @@ impl LayerStage for TaggerStage {
             let k = head_major(ctx, k, tokens, heads, hd);
             let v = emit::narrow(ctx, qkv, 1, 2 * d, d);
             let v = head_major(ctx, v, tokens, heads, hd);
-            // No mask: the twelve blocks attend over every patch of the window,
-            // and the scale is the reference's own `1/√head_dim`.
+            // No mask: the twelve blocks attend over every patch of the window.
             let a = emit::attention(
                 ctx,
                 q,
@@ -542,7 +541,6 @@ impl LayerStage for TaggerStage {
                 hd,
                 MaskKind::None,
                 &[1, heads, tokens, hd],
-                None,
             );
             let a = emit::h(ctx).transpose_(a, vec![0, 2, 1, 3]);
             let a = emit::reshape(ctx, a, &[tokens as i64, d as i64]);
@@ -638,16 +636,16 @@ impl Tagger {
             .output("labels");
         let mut weights = LoaderWeights::new(model.clone());
         let mut built = flow.build(&mut weights)?;
-        // The f16 route's bytes, exactly as the embedding encoder hands them over:
-        // one `set_param_typed(name, bytes, F16)` per weight the store rule
-        // flipped, drained by the runner like a packed blob.
+        // The f16 route's bytes, one `set_param_typed(name, bytes, F16)` per
+        // weight the store rule declared f16, drained by the runner like a packed
+        // blob.
         for plan in model.plans.iter().filter(|p| p.store == Store::F16Linear) {
             let (bytes, ..) = model.linear_f16(&plan.name)?;
             built
                 .typed_params
                 .push((plan.name.clone(), bytes, DType::F16));
         }
-        let compiled = graphs::compile_encoder(Device::Gpu, built, Gemm::F16Coop)?;
+        let compiled = graphs::compile_encoder(Device::Gpu, built)?;
         drop(model);
         Ok(Self {
             config,

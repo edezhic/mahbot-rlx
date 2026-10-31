@@ -27,10 +27,9 @@
 //! enlarge the admission, though it would also avoid the empty-cache cell's
 //! 9.9 ms — the price of the single-term admission, paid once per generation.
 //!
-//! The figures come from the fork's own measurement stand, an out-of-tree
-//! harness (`l59_stand --part decode`) that patches this checkout's crates in
-//! and reads a cell in five rounds inside one window; they cannot be re-taken in
-//! this checkout. The body is Qwen3-ASR-0.6B's 28-layer attention — 16 heads of
+//! The figures were taken by the fork's own measurement harness, in five rounds
+//! inside one window, and cannot be re-taken from the shipped binary. The body is
+//! Qwen3-ASR-0.6B's 28-layer attention — 16 heads of
 //! width 128 over 8 KV heads, one batch — on M3 Pro / Metal; milliseconds. `band`
 //! compiles the whole cache, `rows` the window's rows instead; the `interleaved`
 //! session read the two builds back to back — `before → after` is that order,
@@ -80,31 +79,22 @@
 //!   `attention_v_head_dim_parity::wgpu_attention_asymmetric_v_head_dim_parity`
 //!   and `attention_long_seq_precision::attention_precision_across_key_lengths`.
 //!
-//! The embeddings path walks one live row, so it never meets this admission, and
-//! its digests are unchanged.
-//!
 //! # The cooperative dense square form
 //!
 //! A dense `MaskKind::None` step whose extents are square and which is 2 048 query
 //! rows or longer takes the same three passes on `matmul_coop_f16_f32acc` instead
 //! of on the f32 tiled multiplies: 16-bit operands, 32-bit accumulation, and the
 //! score matrix materialised [`DENSE_COOP_CHUNK_ROWS`] query rows at a time
-//! (`dense_coop_admits`). That is the embedding encoder's four global layers — 8 192
-//! rows, 4 heads of width 512 over one KV head, a 1 GiB score square — which were
-//! the band kernel's with the band switched off. Measured on the fork's stand
-//! (Apple M3 Pro / Metal, wgpu 30; `mahbot-inference`'s `embed.8192` cell, one
-//! bidirectional pass, warm): the stand reads 3 589 ms before this form and
-//! 2 312–2 313 ms after, three consecutive runs on the same rig, which puts the
-//! block's four layers at ~773 ms against the ~2 050 ms they read on the band
-//! kernel. The step itself, at that geometry, reads 230 ms in
-//! `tests/attention_dense_coop_cost.rs` — two multiplies at 3.5–3.6 TFLOP/s
+//! (`dense_coop_admits`). It serves a square dense pass — 8 192 rows, 4 heads of
+//! width 512 over one KV head, a 1 GiB score square — which the band kernel serves
+//! only with the band switched off. The step itself, at that geometry, reads 230 ms
+//! in `tests/attention_dense_coop_cost.rs` — two multiplies at 3.5–3.6 TFLOP/s
 //! (155 ms), the softmax's three passes (16 ms), the transposes and the two f16
-//! casts (10 ms), and the call's own upload/readback floor for the rest. That
-//! leaves it ~3% over the 750 ms this block was given; the measured split says the
-//! two multiplies are within 4% of the same kernel's whole-sequence rate
-//! (`tests/attention_dense_coop_cost.rs`'s chunk table) and that the residue is the
-//! score matrix's three softmax passes plus the transposes, not a mis-tiled
-//! multiply.
+//! casts (10 ms), and the call's own upload/readback floor for the rest. The
+//! measured split says the two multiplies are within 4% of the same kernel's
+//! whole-sequence rate (`tests/attention_dense_coop_cost.rs`'s chunk table) and that
+//! the residue is the score matrix's three softmax passes plus the transposes, not a
+//! mis-tiled multiply.
 //!
 //! Four shape terms keep the form off a step: the [`DENSE_COOP_MIN_Q`] row floor
 //! (below it the f32 arrangement's ~1e-6 answer is the one the tree's precision
@@ -243,29 +233,27 @@ pub(crate) const ATTENTION_DECOMPOSE_MAX_HEAD_DIM: u32 = 512;
 /// on the fused kernel (or on a chunked step) rather than in a per-step
 /// allocation this backend does not have.
 ///
-/// Raised from 64 MiB to 512 MiB. [`crate::backend::compute_scratch_bytes`]
+/// [`crate::backend::compute_scratch_bytes`]
 /// raises the tail reserve to an admitted plan's own [`AttentionPlan::scratch_bytes`],
 /// so the cap is what decides admission and the 64 MiB floor stays the minimum
 /// every graph is guaranteed — no graph is sized below the plan it takes. The
-/// floor was *not* moved with the cap: a 512 MiB tail on every graph makes a
+/// floor is not moved with the cap: a 512 MiB tail on every graph makes a
 /// small-shard arena stripe a tail it never writes and refuse on the stripe bound
-/// (`sharded_arena`'s forced-small-shard case), for no gain. Raising the cap
-/// alone is therefore safe only because the floor still sizes every graph to the
-/// plan it takes; a cap moved without that reserve would admit a plan eight times
-/// the guaranteed tail.
+/// (`sharded_arena`'s forced-small-shard case), for no gain. The cap is therefore
+/// safe only because the floor still sizes every graph to the plan it takes; a cap
+/// moved without that reserve would admit a plan eight times the guaranteed tail.
 ///
-/// Measured on the stand's 8 192-key embedding cell (Apple M3 Pro / Metal): 362.6 s
-/// under the 64 MiB cap against tens of seconds under this one, with its arena at
-/// 670.2 MiB (the planner's figure at align 16, before the scratch tail) and its
-/// output digest 17a3b918 unchanged under both caps — the values did not change,
-/// the arrangement did. The cell's first pass moves with load from run to run, so
-/// the stand's section of `MEASUREMENTS.md` carries the reading this tree was last
-/// measured at rather than a figure restated here.
+/// Measured on an 8 192-key pass at four `(batch, head)` tiles (Apple M3 Pro /
+/// Metal): 362.6 s under the 64 MiB cap against tens of seconds under this one,
+/// with its arena at 670.2 MiB (the planner's figure at align 16, before the
+/// scratch tail) and its output digest unchanged under both caps — the values did
+/// not change, the arrangement did. No record carries that reading: it belongs to
+/// the run that takes it.
 pub(crate) const ATTENTION_DECOMPOSE_MAX_SCRATCH_BYTES: u64 = 512 << 20;
 
 /// Query rows the cooperative dense square form walks per pass. Its score matrix
 /// is materialised in full for `chunk` rows over every key, and a chunk of 2 048
-/// at the stand's 8 192 keys and four `(batch, head)` tiles is 268 MiB — with Kᵀ
+/// at 8 192 keys and four `(batch, head)` tiles is 268 MiB — with Kᵀ
 /// and the two compactions that is 469 MiB of scratch, and the output region costs
 /// nothing more because it reuses Kᵀ's bytes once the f16 cast has read them
 /// (`AttentionPlan::coop_out_over_kt`). The chunk is a row count, not a tile: it
@@ -285,8 +273,8 @@ pub const DENSE_COOP_CHUNK_ROWS: u32 = 2048;
 /// question: `tests/attention_long_seq_precision.rs` holds the many-row f32
 /// arrangement to ~1e-6 at BrainBERT's geometry (12 heads × 64 head width, up to
 /// 186 rows), and the cooperative form's operands are 16-bit. 2 048 is where the
-/// dense square's own scratch is past what the f32 many-row form can hold at the
-/// stand's width *and* where `tests/attention_dense_coop_cost.rs` measures the
+/// dense square's own scratch is past what the f32 many-row form can hold at
+/// 8 192 keys *and* where `tests/attention_dense_coop_cost.rs` measures the
 /// cooperative form ahead; every shape below it keeps the route it has.
 pub const DENSE_COOP_MIN_Q: u32 = 2048;
 
@@ -1407,9 +1395,9 @@ pub(crate) fn plan_attention(
     // A dense `MaskKind::None` step whose extents are square is served by the
     // same kernel with the band switched off (`window = seq_k`, i.e. `w >= seq`),
     // where the many-row arrangement's own score matrix no longer fits its
-    // scratch cap. That is the cell this route exists for: past the cap the step
-    // kept the fused one-thread-per-row walk (the stand's four global layers read
-    // 83 s there before the routes below), and the band pass re-reads K and V once
+    // scratch cap. That is the shape this route exists for: past the cap the step
+    // kept the fused one-thread-per-row walk (83 s at the encoder's four global
+    // layers before the routes below), and the band pass re-reads K and V once
     // per query block over the whole sequence instead. Below the cap the f32
     // many-row arrangement is both affordable and the tighter answer — its bar is
     // 1e-5 against this kernel's 5e-3-of-scale f16 tile — so the step keeps the
@@ -2824,14 +2812,13 @@ mod tests {
         plan_attention(&g, g.node(node))
     }
 
-    /// The stand's four global layers — 8 192 rows, 4 heads of width 512 over one
-    /// KV head, `MaskKind::None` — take the cooperative dense square form, not the
-    /// band kernel with the band switched off nor the f32 many-row arrangement:
-    /// the score square is 1 GiB here, past both the many-row cap and the band
-    /// kernel's instruction mix, and the two two-pass multiplies are what the
-    /// stand's embedding cell is measured against
-    /// (`tests/attention_dense_coop_cost.rs`). The chunk the plan books is the
-    /// region the lowering walks, and it is the one the scratch cap admits.
+    /// A dense square step at the encoder width — 8 192 rows, 4 heads of width 512
+    /// over one KV head, `MaskKind::None` — takes the cooperative dense square
+    /// form, not the band kernel with the band switched off nor the f32 many-row
+    /// arrangement: the score square is 1 GiB here, past both the many-row cap and
+    /// the band kernel's instruction mix, and the two two-pass multiplies are what
+    /// `tests/attention_dense_coop_cost.rs` measures. The chunk the plan books is
+    /// the region the lowering walks, and it is the one the scratch cap admits.
     #[test]
     fn a_dense_square_step_at_the_encoder_width_takes_the_cooperative_form() {
         let plan = plan_dense(8192, 4, 1, 512).unwrap_or_else(|r| panic!("{r}"));
@@ -2931,7 +2918,7 @@ mod tests {
     /// replicate. `dense_coop_admits` is the one derivation of them.
     #[test]
     fn the_cooperative_dense_square_form_admits_only_whole_wide_tiles() {
-        // The stand's cell, at the widest head the fused path serves.
+        // The widest head the fused path serves, at the encoder's row count.
         assert_eq!(
             dense_coop_admits(0, 8192, 8192, 512, 512, 1, 4, 1),
             Some(2048)

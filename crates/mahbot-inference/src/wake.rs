@@ -71,10 +71,8 @@ pub const MIN_STATIC_BAR: f32 = 1.05;
 /// window and bootstrap count ([`ADAPTIVE_WINDOW_N`],
 /// [`ADAPTIVE_BOOTSTRAP_FRAMES`]), the anti-prototype veto, the six-stride segment
 /// limit ([`WAKE_WORD_MAX_SEGMENT_STEPS`]) and the per-fire cooldown stay exactly
-/// as this module and the bench's stream declare them. An operating point is this
-/// set; [`Thresholds::DEFAULT`] is the shipped one, built from the named constants
-/// of this module, and the bench may price another by overriding the set without
-/// changing any rule.
+/// as this module and the bench's stream declare them. [`Thresholds::DEFAULT`] is
+/// the shipped set, built from the named constants of this module.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Thresholds {
     /// Lower clamp bound of the derived floor, and the fallback floor of an
@@ -98,30 +96,6 @@ pub struct Thresholds {
 }
 
 impl Thresholds {
-    /// The set's numbers in the vocabulary `--wake-thresholds` reads: the name, a
-    /// reader and a writer. [`Display`](core::fmt::Display) and the bench's parser
-    /// both walk this list, so a number cannot be printed without being readable
-    /// back. [`Thresholds::check`] lists the same numbers because a `const fn`
-    /// cannot call through these functions.
-    pub(crate) const FIELDS: &'static [(&'static str, fn(&Self) -> f32, fn(&mut Self, f32))] = &[
-        ("floor_min", |s| s.floor_min, |s, v| s.floor_min = v),
-        ("floor_max", |s| s.floor_max, |s, v| s.floor_max = v),
-        ("tail_z", |s| s.tail_z, |s, v| s.tail_z = v),
-        (
-            "fire_factor_cap",
-            |s| s.fire_factor_cap,
-            |s, v| s.fire_factor_cap = v,
-        ),
-        ("anchor", |s| s.anchor, |s, v| s.anchor = v),
-        ("reset_ratio", |s| s.reset_ratio, |s, v| s.reset_ratio = v),
-        ("adaptive_k", |s| s.adaptive_k, |s, v| s.adaptive_k = v),
-        (
-            "adaptive_ceiling",
-            |s| s.adaptive_ceiling,
-            |s, v| s.adaptive_ceiling = v,
-        ),
-    ];
-
     /// The shipped point: this module's named constants and nothing else.
     pub const DEFAULT: Self = Self {
         floor_min: DEFAULT_SOFT_FLOOR,
@@ -135,7 +109,7 @@ impl Thresholds {
     };
 
     /// The per-frame static fire factor at a given floor — the const form of
-    /// [`Calibration::fire_soft`], so the invariant guard and the scoring path
+    /// [`Calibration::fire_soft`], so the invariant check and the scoring path
     /// read one derivation rather than two.
     const fn fire_factor_at(&self, floor: f32) -> f32 {
         let anchored = (self.anchor - floor) / (1.0 - floor);
@@ -150,14 +124,14 @@ impl Thresholds {
     /// floor rises ([`Calibration::fire_soft`]), so the highest floor is the
     /// worst case; this is the number the single-stride invariant is checked
     /// against.
-    #[must_use]
-    pub const fn lowest_static_bar(&self) -> f32 {
+    const fn lowest_static_bar(&self) -> f32 {
         self.fire_factor_at(self.floor_max) * ROLLING_WINDOW_N as f32
     }
 
-    /// The first invariant this set breaks, in const form: the build-time guard,
-    /// the bench's override parser and [`validate`](Self::validate) read these
-    /// same rules, so a point cannot pass one and fail another.
+    /// The first invariant this set breaks, in const form: the build-time guard
+    /// below reads these rules, so a set the scoring path cannot hold is refused
+    /// where the mistake is cheapest to see rather than panicking inside
+    /// `f32::clamp` mid-decision.
     const fn check(&self) -> Result<(), &'static str> {
         let all = [
             self.floor_min,
@@ -207,38 +181,10 @@ impl Thresholds {
         }
         Ok(())
     }
-
-    /// Refuse a set the module's invariants cannot hold — a number that is not
-    /// finite, a floor clamp whose bounds cross, an anchor the clamp leaves no
-    /// room for, an adaptive ceiling below the bar it has to clamp, or a static
-    /// bar a single scoring stride could clear — so an unusable point is refused
-    /// at start-up rather than panicking inside `f32::clamp` mid-run.
-    ///
-    /// # Errors
-    /// The first invariant the set breaks, followed by the set itself.
-    pub fn validate(&self) -> Result<(), String> {
-        self.check()
-            .map_err(|rule| format!("{rule} — the set was {self}"))
-    }
 }
 
-impl core::fmt::Display for Thresholds {
-    /// The set as the comma-separated `name=value` pairs the bench's
-    /// `--wake-thresholds` reads, at the shortest precision that parses back to
-    /// the same numbers.
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        for (index, (name, read, _)) in Self::FIELDS.iter().enumerate() {
-            if index > 0 {
-                f.write_str(", ")?;
-            }
-            write!(f, "{name}={}", read(self))?;
-        }
-        Ok(())
-    }
-}
-
-// The shipped constants are held to the same rules the override parser applies,
-// where the mistake is cheapest to see and impossible to ship: at build time.
+// The shipped constants are held to the same rules at build time, where the
+// mistake is cheapest to see and impossible to ship.
 const _: () = match (Thresholds::DEFAULT).check() {
     Ok(()) => (),
     Err(why) => panic!("{}", why),
@@ -438,18 +384,6 @@ impl Enrollment {
             negative_prototypes: distill_negative_prototypes(negative_embeddings),
             thresholds: Thresholds::DEFAULT,
         })
-    }
-
-    /// Score this enrolment with another threshold set — the bench's measurement
-    /// aid; the product reads [`Thresholds::DEFAULT`].
-    ///
-    /// # Errors
-    /// The rule the set breaks (see [`Thresholds::validate`]): a point that could
-    /// panic inside `f32::clamp` is refused before a stream scores with it.
-    pub fn with_thresholds(mut self, thresholds: Thresholds) -> Result<Self, String> {
-        thresholds.validate()?;
-        self.thresholds = thresholds;
-        Ok(self)
     }
 
     /// Cosine of a window embedding against the prototype.
@@ -736,96 +670,6 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_point_validates_and_moves_with_its_anchor() {
-        t().validate().expect("the shipped point is valid");
-        // The worst case is the clamp's upper bound: there the anchored factor is
-        // smallest, so it is below the cap and the bar is the anchor's. The guard
-        // and the scoring path must be one derivation, so the checked number is
-        // asserted against the geometry a stream is actually built from.
-        let at_upper_bound = Calibration {
-            neg_mean: MAX_SOFT_FLOOR,
-            neg_std: 0.0,
-            neg_p99: MAX_SOFT_FLOOR,
-            n_negatives: 1,
-        };
-        let worst = DetectionGeometry::for_calibration(&at_upper_bound, &t()).static_threshold;
-        assert_eq!(t().lowest_static_bar(), worst);
-        assert!(
-            worst >= MIN_STATIC_BAR,
-            "the shipped bar {worst} is inside the one-stride margin"
-        );
-        // Raising the anchor raises the bar in step.
-        let mut raised = t();
-        raised.anchor += 0.04;
-        let raised_bar =
-            DetectionGeometry::for_calibration(&at_upper_bound, &raised).static_threshold;
-        assert!(raised_bar > worst, "the anchor is the bar at the clamp");
-        // A bar one stride could clear is refused rather than measured, and it is
-        // the margin rule that refuses it.
-        let mut short = t();
-        short.anchor = MAX_SOFT_FLOOR + 0.01;
-        let err = short.validate().expect_err("a one-stride bar");
-        assert!(err.contains("single stride"), "{err}");
-    }
-
-    #[test]
-    fn a_crossed_floor_clamp_is_refused() {
-        let mut set = t();
-        set.floor_min = set.floor_max;
-        let err = set.validate().expect_err("crossed bounds");
-        assert!(err.contains("floor_min must be below floor_max"), "{err}");
-        // A clamp reaching outside (−1, 1) cannot derive a soft score at all. The
-        // rule is strict, so a bound exactly on the edge is outside it too.
-        let mut set = t();
-        set.floor_min = -1.5;
-        let err = set.validate().expect_err("an out-of-range floor");
-        assert!(err.contains("inside (−1, 1)"), "{err}");
-        let mut set = t();
-        set.floor_min = -1.0;
-        let err = set.validate().expect_err("a bound on the interval's edge");
-        assert!(err.contains("inside (−1, 1)"), "{err}");
-    }
-
-    #[test]
-    fn a_non_finite_number_is_refused() {
-        let mut set = t();
-        set.anchor = f32::NAN;
-        let err = set.validate().expect_err("NaN");
-        assert!(err.contains("not finite"), "{err}");
-        let mut set = t();
-        set.tail_z = f32::INFINITY;
-        assert!(set.validate().is_err(), "an infinite tail");
-    }
-
-    /// One vocabulary: every number the override parser can write is printed by
-    /// `Display` and refused by the guard when it is not finite, so a number added
-    /// to the set cannot be silently unprintable or unchecked.
-    #[test]
-    fn every_number_in_the_vocabulary_is_guarded_and_printed() {
-        let printed = t().to_string();
-        for (name, _, write) in Thresholds::FIELDS {
-            assert!(
-                printed.contains(&format!("{name}=")),
-                "{name} is not printed: {printed}"
-            );
-            let mut set = t();
-            write(&mut set, f32::NAN);
-            let err = set.validate().expect_err(name);
-            assert!(err.contains("not finite"), "{name} is not guarded: {err}");
-        }
-    }
-
-    #[test]
-    fn a_ceiling_below_the_bar_it_clamps_is_refused() {
-        // The adaptive arm clamps to [static bar, ceiling]; a ceiling under the
-        // bar would panic there rather than fail as a measurement.
-        let mut set = t();
-        set.adaptive_ceiling = set.fire_factor_cap * ROLLING_WINDOW_N as f32 - 1e-3;
-        let err = set.validate().expect_err("ceiling under the cap's bar");
-        assert!(err.contains("adaptive_ceiling is below"), "{err}");
-    }
-
-    #[test]
     fn distillation_spreads_selection() {
         let proto = l2_normalize(&[1.0f32; 32]);
         let negatives: Vec<Vec<f32>> = (0..20)
@@ -861,27 +705,6 @@ mod tests {
         .expect("five identical utterances enrol");
         assert!((cosine(&enrollment.prototype, &l2_normalize(&[1.0f32; 16])) - 1.0).abs() < 1e-6);
         assert!((enrollment.soft_score(&enrollment.prototype) - 1.0).abs() < 1e-6);
-    }
-
-    /// The set an enrolment scores with is refused where it is installed, in every
-    /// build: a crossed clamp would otherwise panic inside `f32::clamp` mid-run.
-    #[test]
-    fn an_unusable_set_cannot_be_installed_on_an_enrolment() {
-        let embedding = l2_normalize(&[0.5f32; 16]);
-        let enrollment = Enrollment::build(
-            "hey".into(),
-            &vec![embedding; MIN_ENROLLMENT_UTTERANCES],
-            Calibration::default(),
-            &[],
-        )
-        .expect("five identical utterances enrol");
-        assert_eq!(enrollment.thresholds, t());
-        let mut crossed = t();
-        crossed.floor_min = crossed.floor_max;
-        let err = enrollment
-            .with_thresholds(crossed)
-            .expect_err("a crossed clamp");
-        assert!(err.contains("floor_min must be below floor_max"), "{err}");
     }
 
     #[test]

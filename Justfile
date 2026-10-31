@@ -1124,13 +1124,18 @@ ps5 *ARGS:
 
 # ── mahbot: this fork's own models ──────────────────────────────────
 #
-# A deliberate build renders the clip corpus; a measurement only reads it.
-# Both are behind the crate's non-default `bench` feature.
+# A deliberate build renders the clip corpus; the measurements only read it. All
+# three are behind the crate's non-default `bench` feature.
 mahbot-wake-build *ARGS:
     cargo run --release -p mahbot-inference --features bench --bin wake-word-build -- {{ARGS}}
 
 mahbot-wake-bench *ARGS:
     cargo bench -p mahbot-inference --features bench --bench wake_word -- {{ARGS}}
+
+# The pinned real-audio corpus through the product's transcription call, one row
+# per recording, each in its own process; writes TRANSCRIPTION-CORPUS.md.
+mahbot-transcription-corpus *ARGS:
+    cargo run --release -p mahbot-inference --features bench --bin transcription-corpus -- {{ARGS}}
 
 # No other recipe compiles the bench target (whose `harness = false` means an
 # executing gate would run a measurement), so this is the one that sees it under

@@ -585,8 +585,8 @@ const GEMV_WIDE_THREADS: u32 = 128;
 /// Two rather than four, measured on both real frame graphs: halving the columns
 /// per subgroup doubles the workgroups a chunk is cut into, and the body frame's
 /// `n = 1 024` blocks issue only 64 of them at four. No switch moves this
-/// constant, so a pair of widths is rebuild-to-rebuild and the figures in
-/// `MEASUREMENTS.md` are not re-takeable from the shipped binary. Public with
+/// constant, so a pair of widths is rebuild-to-rebuild and no record carries the
+/// per-form table. Public with
 /// [`gemv_wide_cols_per_wg`] so the parity and measurement cells derive the arm's
 /// width instead of restating it.
 ///
@@ -620,9 +620,9 @@ pub const GEMV_WIDE_ILP: u32 = 2;
 /// `k = 2 048, n = 1 024` and land on the boundary, where the two entries are
 /// closest and the floor decides against the narrow one for the reason above,
 /// except on a narrow Q6_K row, which [`GEMV_ILP_Q6K_MIN_COLS`] carries. No
-/// switch moves this constant, so any pair of floors is rebuild-to-rebuild;
-/// `MEASUREMENTS.md` carries the per-form table. Public with [`GEMV_WIDE_ILP`] so
-/// the cells state the floor they assert.
+/// switch moves this constant, so any pair of floors is rebuild-to-rebuild and no
+/// record carries the per-form table. Public with [`GEMV_WIDE_ILP`] so a
+/// measurement can state the floor its rows were taken at.
 pub const GEMV_ILP_MIN_COLS: usize = 1024;
 
 /// Columns up to which a **narrow** Q6_K chunk keeps the one-column-per-subgroup
@@ -1757,8 +1757,9 @@ fn gemv_one_row_cols_per_chunk(row_bytes: u64, max_bind: u64, cols_per_wg: usize
 
 /// The ILP entry's columns per workgroup on `device`, when the arm admits it:
 /// `GEMV_WIDE_ILP` times a subgroup's width, behind `RLX_WGPU_GEMV_ILP`. One
-/// spelling for the encoder, [`gemv_one_row_dispatches`] and the cells, so the
-/// chunk cut and the entry it is cut for are sized from the same number.
+/// spelling for the encoder, [`gemv_one_row_dispatches`] and a measurement's
+/// rows, so the chunk cut and the entry it is cut for are sized from the same
+/// number.
 pub fn gemv_ilp_cols_per_wg(device: &wgpu::Device, scheme_id: u32) -> Option<u32> {
     gemv_tiled_supports_scheme(scheme_id)
         .then(|| gemv_wide_cols_per_wg(device))

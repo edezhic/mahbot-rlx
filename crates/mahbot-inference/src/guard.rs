@@ -7,14 +7,14 @@
 //! deadline, and a clip or a corpus file also checks the cheap process figure, so
 //! a run that is out of time or out of memory stops at the next work item instead
 //! of at the end. The system figures (swap growth and free memory) cost two
-//! subprocesses, so they belong to phase and file boundaries — and to [`Watch`],
+//! subprocesses, so they belong to phase and file boundaries — and to `Watch`,
 //! the guard thread, which is what makes the stop hard: it ends the process at
 //! the deadline even when a single device call is blocked, after running the
 //! caller's own stop action (the bench writes its report there).
 //!
 //! The resident-set figure comes from `ps`, so on a platform without it the
 //! process arm reads zero and never trips; the swap and free-memory arms report
-//! their own absence. On the platform this stand runs on, all three read.
+//! their own absence. On the platform this tree runs on, all three read.
 //!
 //! The figures are inputs (`--timeout` / `MAHBOT_TIMEOUT_SECS`,
 //! `--max-rss` / `MAHBOT_MAX_RSS_MIB`); the swap-growth ceiling has
@@ -35,8 +35,7 @@ use crate::report;
 /// Default wall-clock stop. With the corpus in place — the normal case, since it
 /// is built once, deliberately — a measured eleven-voice run finishes well inside
 /// this bound, most of its wall clock going to the two clip-stream phases and the
-/// real-audio sweep. `MEASUREMENTS.md`'s bench block is where those costs are
-/// stated; this paragraph deliberately does not repeat them.
+/// real-audio sweep.
 ///
 /// Building the corpus is a separate operation with no wall-clock bound of its
 /// own, and a measurement never renders: a cache short of a clip stops and names
@@ -47,8 +46,9 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 3_600;
 
 /// Default resident-set ceiling. It leaves room for the mapped models and the one
 /// synthesis pipeline a run holds beside them on an 18 GiB machine, while still
-/// aborting before the machine starts swapping. The record states the peak a
-/// measured run reached; a corpus build carries the same guards and no wall clock.
+/// aborting before the machine starts swapping. The record's peak is the platform's
+/// footprint, which is not this ceiling; a corpus build carries the same guards and
+/// no wall clock.
 pub const DEFAULT_MAX_RSS_MIB: u64 = 6_144;
 
 /// Swap **growth since the run started** above which it stops, unless
@@ -62,50 +62,107 @@ pub const DEFAULT_MAX_RSS_MIB: u64 = 6_144;
 pub const MAX_SWAP_GROWTH_MIB: u64 = 1_024;
 
 /// The swap-growth ceiling `env` names: [`MAX_SWAP_GROWTH_MIB`] unless
-/// `MAHBOT_STAND_MAX_SWAP_MIB` holds a whole number. The environment it reads is
-/// an input, so a resolved run can be classified under the same closure it was
+/// `MAHBOT_STAND_MAX_SWAP_MIB` holds a whole number, which a value that does not
+/// parse is refused over rather than defaulted. The environment it reads is an
+/// input, so a resolved run can be classified under the same closure it was
 /// resolved from instead of the live process environment.
-#[must_use]
-pub fn swap_growth_ceiling(env: &impl Fn(&str) -> Option<std::ffi::OsString>) -> u64 {
-    env("MAHBOT_STAND_MAX_SWAP_MIB")
-        .and_then(|value| value.into_string().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(MAX_SWAP_GROWTH_MIB)
+///
+/// # Errors
+/// The variable is set and is not a whole number of at least one.
+pub fn swap_growth_ceiling(env: &impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<u64> {
+    whole_number(
+        env("MAHBOT_STAND_MAX_SWAP_MIB"),
+        MAX_SWAP_GROWTH_MIB,
+        "MAHBOT_STAND_MAX_SWAP_MIB",
+    )
 }
 
-/// [`swap_growth_ceiling`] over this process's environment — the bound
-/// [`MemoryCeiling::check_system`] enforces.
-#[must_use]
-pub fn max_swap_growth_mib() -> u64 {
+/// [`swap_growth_ceiling`] over this process's environment.
+///
+/// # Errors
+/// The variable is set and is not a whole number of at least one.
+pub fn max_swap_growth_mib() -> Result<u64> {
     swap_growth_ceiling(&|name| std::env::var_os(name))
 }
 
-/// The resident-set ceiling a run is under, in MiB — `MAHBOT_MAX_RSS_MIB`, or
-/// [`DEFAULT_MAX_RSS_MIB`]. One parse, one owner: the enforced ceiling and every
-/// figure or refusal reported against it read this accessor, so a run cannot be
-/// described under a bound it was not held to.
-#[must_use]
-pub fn max_rss_mib() -> u64 {
-    std::env::var("MAHBOT_MAX_RSS_MIB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MAX_RSS_MIB)
+/// A whole number of at least one from a bound's source, or `default` when the
+/// source names nothing. A value that is set and does not parse, or that is zero, is
+/// refused rather than defaulted: a mistyped bound must not let a run pass for one
+/// held under the defaults. The one parser for the three bounds, in every entry
+/// point that resolves them — the stand, the corpus run and the bench.
+///
+/// # Errors
+/// The value is set and is not a whole number of at least one.
+pub(crate) fn whole_number(
+    value: Option<std::ffi::OsString>,
+    default: u64,
+    source: &str,
+) -> Result<u64> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let text = value.to_string_lossy();
+    let Ok(number) = text.trim().parse::<u64>() else {
+        bail!("{source} `{text}` is not a whole number");
+    };
+    if number == 0 {
+        bail!("{source} must be at least 1");
+    }
+    Ok(number)
 }
 
-/// [`max_rss_mib`] in bytes, for the library, which has to refuse an input the run
-/// could not hold: the record and that refusal read the same accessor, so the
-/// figure a cell says it exceeded is the ceiling the run was actually under.
-#[must_use]
-pub fn max_rss_bytes() -> u64 {
-    max_rss_mib().saturating_mul(1024 * 1024)
+/// [`whole_number`] over this process's environment.
+fn whole_env(name: &str, default: u64) -> Result<u64> {
+    whole_number(std::env::var_os(name), default, name)
+}
+
+/// The resident-set ceiling a run is under, in MiB — `MAHBOT_MAX_RSS_MIB`, or
+/// [`DEFAULT_MAX_RSS_MIB`]. The bench resolves the same variable in its own input
+/// table, through the same parser.
+///
+/// # Errors
+/// The variable is set and is not a whole number of at least one.
+pub fn max_rss_mib() -> Result<u64> {
+    whole_env("MAHBOT_MAX_RSS_MIB", DEFAULT_MAX_RSS_MIB)
+}
+
+/// The wall-clock stop a run is under, in seconds — `MAHBOT_TIMEOUT_SECS`, or
+/// [`DEFAULT_TIMEOUT_SECS`]. The bench resolves the same variable in its own input
+/// table, through the same parser.
+///
+/// # Errors
+/// The variable is set and is not a whole number of at least one.
+pub fn timeout_secs() -> Result<u64> {
+    whole_env("MAHBOT_TIMEOUT_SECS", DEFAULT_TIMEOUT_SECS)
+}
+
+/// The three bounds a run is held to, resolved together so a mistyped variable is
+/// refused where the run starts rather than from inside a measurement.
+#[derive(Clone, Copy, Debug)]
+pub struct Bounds {
+    pub timeout_secs: u64,
+    pub max_rss_mib: u64,
+    pub swap_growth_mib: u64,
+}
+
+impl Bounds {
+    /// # Errors
+    /// A bound variable is set and is not a whole number of at least one.
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            timeout_secs: timeout_secs()?,
+            max_rss_mib: max_rss_mib()?,
+            swap_growth_mib: max_swap_growth_mib()?,
+        })
+    }
 }
 
 /// System-wide free memory, as a percentage, below which a run stops.
 pub const MIN_FREE_PERCENT: u64 = 8;
 
 /// Exit code of a run a guard stopped (the platform's `EX_TEMPFAIL`): non-zero,
-/// and distinct from a fatal error so a caller can tell the two apart. Both
-/// entry points use it — the bench and the stand.
+/// and distinct from a fatal error so a caller can tell the two apart. Every
+/// entry point uses it: the stand, the corpus run and the bench.
 pub const EXIT_STOPPED: i32 = 75;
 
 /// Why a run stopped early. It is carried inside an `anyhow::Error` so every
@@ -231,7 +288,7 @@ impl Deadline {
 pub struct MemoryCeiling {
     rss_bytes: u64,
     /// The swap-growth ceiling, in MiB, resolved with the rest of the run's
-    /// inputs: the bound the record states and the bound the run is held to are
+    /// inputs: the bound the console states and the bound the run is held to are
     /// one figure, not two reads of one variable.
     swap_mib: u64,
     /// The free-memory floor; `None` leaves that arm inactive. Only the feed
@@ -246,21 +303,15 @@ pub struct MemoryCeiling {
 }
 
 impl MemoryCeiling {
-    /// The ceiling at the default swap-growth bound of this process's environment.
-    #[must_use]
-    pub fn new(mib: u64) -> Self {
-        Self::with_swap_growth(mib, max_swap_growth_mib())
-    }
-
-    /// The ceiling at an explicit swap-growth bound, for a caller that resolved
-    /// that input with the rest of its own.
+    /// The ceiling at an explicit swap-growth bound: a caller resolves the run's
+    /// bounds itself, so the number the run is held to is the number it read.
     #[must_use]
     pub fn with_swap_growth(mib: u64, swap_mib: u64) -> Self {
         let swap_start = swap_used_bytes();
         if swap_start.is_none() {
             eprintln!(
-                "[wake-word] the platform reported no swap figure — the swap-growth guard is \
-                 inactive; the resident-set ceiling still applies"
+                "the platform reported no swap figure — the swap-growth guard is inactive; the \
+                 resident-set ceiling still applies"
             );
         }
         Self {
@@ -281,12 +332,6 @@ impl MemoryCeiling {
             free_floor: None,
             swap_start: None,
         }
-    }
-
-    /// The ceiling's own figure, in bytes.
-    #[must_use]
-    pub fn rss_bytes(&self) -> u64 {
-        self.rss_bytes
     }
 
     /// The current resident set, in bytes (`None` where the platform cannot
@@ -442,8 +487,8 @@ pub fn free_percent() -> Option<u64> {
 /// The one lock every heavy run of this crate takes, resolved through `env`:
 /// `MAHBOT_LOCK` when it names a non-empty path, else `mahbot-heavy-run.lock` in the
 /// temp directory (`TMPDIR`, then `TMP`, `TEMP` — the order `std::env::temp_dir`
-/// reads). One path for both entry points and for a cell run on its own, because
-/// two heavy runs on the same device is what the lock exists to prevent.
+/// reads). One path for every entry point and for a row run on its own, because two
+/// heavy runs on the same device is what the lock exists to prevent.
 ///
 /// A caller that resolves its inputs from something other than the process
 /// environment passes that lookup in, so a configuration resolved in a test cannot
@@ -497,7 +542,7 @@ impl RunLock {
         match file.try_lock() {
             Ok(()) => Ok(Self { _file: file }),
             Err(std::fs::TryLockError::WouldBlock) => bail!(
-                "another wake-word bench is already running (lock: {}) — one heavy run at a time",
+                "another heavy run is already running (lock: {}) — one at a time",
                 path.display()
             ),
             Err(std::fs::TryLockError::Error(error)) => {
@@ -519,10 +564,14 @@ pub(crate) struct Watch {
 }
 
 impl Watch {
+    /// `beat` prints the once-a-minute `still running` line. A child's output is
+    /// drained and reprinted by its parent, which carries the beat, so only one
+    /// process of a record run reports it.
     pub(crate) fn install(
         label: &'static str,
         deadline: Deadline,
         ceiling: MemoryCeiling,
+        beat: bool,
         phase: impl Fn() -> &'static str + Send + 'static,
         mut on_stop: impl FnMut(Abort) + Send + 'static,
     ) -> Result<Self> {
@@ -535,7 +584,7 @@ impl Watch {
                 while !flag.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_secs(1));
                     tick += 1;
-                    if tick.is_multiple_of(60) {
+                    if beat && tick.is_multiple_of(60) {
                         eprintln!(
                             "[heartbeat] {label} still running — elapsed {}m{:02}s",
                             tick / 60,
@@ -591,11 +640,33 @@ impl Drop for Watch {
 mod tests {
     use super::*;
 
+    /// A bound that is set and unparsable, or that is zero, is refused rather than
+    /// defaulted: a mistyped variable must not let a run pass for one held under the
+    /// defaults, and neither must a zero one.
+    #[test]
+    fn a_mistyped_or_zero_bound_is_refused_rather_than_defaulted() {
+        let name = "MAHBOT_MAX_RSS_MIB";
+        let error = whole_number(Some("6 144".into()), 1, name).expect_err("refused");
+        assert!(
+            error.to_string().contains("is not a whole number"),
+            "{error}"
+        );
+
+        let error = whole_number(Some("0".into()), 1, name).expect_err("refused");
+        assert!(error.to_string().contains("must be at least 1"), "{error}");
+
+        assert_eq!(whole_number(None, 1, name).expect("the default"), 1);
+        assert_eq!(
+            whole_number(Some(" 2048 ".into()), 1, name).expect("parsed"),
+            2048
+        );
+    }
+
     /// A ceiling under the process's own resident set trips on the process arm
     /// and reports bytes — not the percentage the system arm uses.
     #[test]
     fn a_tiny_ceiling_stops_on_the_resident_set() {
-        let ceiling = MemoryCeiling::new(1);
+        let ceiling = MemoryCeiling::with_swap_growth(1, MAX_SWAP_GROWTH_MIB);
         let error = ceiling.check_process("real audio").expect_err("over");
         let abort = error.downcast::<Abort>().expect("an Abort");
         let text = abort.to_string();
@@ -625,7 +696,7 @@ mod tests {
     fn the_memory_ceiling_converts_and_trips_on_a_low_figure() {
         // A zero resident-set ceiling is below any live process's reading, so
         // it trips wherever the platform reports one.
-        let ceiling = MemoryCeiling::new(0);
+        let ceiling = MemoryCeiling::with_swap_growth(0, MAX_SWAP_GROWTH_MIB);
         if let Some(rss) = ceiling.resident() {
             assert!(rss > 0, "a live process reads more than zero bytes");
             let error = ceiling

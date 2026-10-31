@@ -4,20 +4,14 @@
 
 //! Whether reading the recognition decode's weights once for several candidate
 //! tokens can pay: the **draft acceptance** a weight-free drafter reaches on the
-//! stand's own clip, and the cost of a multi-row pass at the decode's own
+//! pinned clip, and the cost of a multi-row pass at the decode's own
 //! shape on its own resident plane cache. Both come from one process, so they
 //! belong to the same load window.
 //!
 //! ```text
 //! MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… RLX_ALLOW_THROTTLE=1 \
-//! STAND_ASR_WAV=… [STAND_ASR_OFFSET=…] \
 //! cargo test -p mahbot-inference --release --test draft_acceptance -- --ignored --nocapture
 //! ```
-//!
-//! A second recording is measured through the same walk when `STAND_ASR_WAV`
-//! names one; it joins the acceptance curve, the confidence and the decision, and
-//! its rounds are priced at the pinned clip's measured pass. `STAND_ASR_OFFSET`
-//! moves the window both walks start at, as it does for the cell.
 //!
 //! **The number.** Per-position acceptance at depths 1..8: at depth `i`, the
 //! share of positions where the drafter's `i`-th proposed token equals the
@@ -40,8 +34,8 @@
 //! logits are not the greedy choices (`graphs::body_capacity_chain_planes_rows`).
 //!
 //! **The decision** prices both sides from this one reading — the baseline is the
-//! harness's own one-row pass times the clip's token count, never the cell's
-//! figure, and the cell's own per-token time prints beside it — and takes the
+//! harness's own one-row pass times the clip's token count, never a figure another
+//! harness reported, and the walk's own per-token time prints beside it — and takes the
 //! build only if the measured curve, at the measured pass cost, predicts at least
 //! [`DECISION_WIN`] on the decode with the 5th percentile of the walk it implies
 //! clearing it too. The break-even acceptance, the acceptance a [`DECISION_WIN`]
@@ -53,22 +47,17 @@
 //! full-depth round; the
 //! nine sweep arms' logits finite and `rows × vocab`; and the two-row operand's
 //! first row equal to the one-row step's with the second key shut, while a visible
-//! candidate moves it. The pinned clip's answer prints through the cell's own
-//! witness rule in both modes — the rule keys on the file the walk read, not on the
-//! switch that named it — so a moved digest or transcript is reported and the round
-//! carries on. No wall time is asserted.
+//! candidate moves it. The pinned clip's answer prints against the reference pin
+//! (the reference's own witness rule), so a moved digest or transcript is
+//! reported and the round carries on. No wall time is asserted.
 //!
 //! # What it read on this tree
 //!
 //! Apple M3 Pro / Metal, one process, four runs of this file on this tree. The
 //! pinned clip's 65 generated ids take 6 of 9 proposals at depth one (0.667, Wilson
 //! 0.354..0.879), 2 of 9 at depth two, then 2, 1, 0, 1, 0, 0 — over **16% coverage**
-//! and 51 drafted tokens, with a second 132-token recording joining at 0.647 (11 of
-//! 17) and, once a draft of two matches, carrying the rest of an eight-token draft
-//! with it (0.59 for the whole draft). The weight-free drafter's tail is thin on
-//! free speech and dense on repeated phrasing: over that second recording its
-//! three-id minimum accepts all 9 full drafts it proposes (1.000 at every depth)
-//! over 17% coverage, and it drafts nothing over 49 of its 59 rounds.
+//! and 51 drafted tokens. The weight-free drafter's tail is thin on free speech and
+//! dense on repeated phrasing.
 //!
 //! The pass does not cost 1.7–1.8 one-row steps. On the decode's own resident
 //! cache and shapes it is **6.01–6.06** one-row steps at eight rows (96.0–96.6 ms
@@ -95,13 +84,9 @@
 //! at the 1.75× premise, and 0.29–0.30× for a drafter that proposed at every
 //! position.
 //!
-//! What decides the route is the pass, not the drafter. The second recording's
-//! three-id minimum accepts every full draft it proposes and yields 2.24 tokens a
-//! round over 17% coverage, and it still reaches only **1.07–1.11×** at the measured
-//! pass — while at the 1.75× premise the same curve would read 1.92–1.99×. So the
-//! pass's cost is the number to argue with: reading each weight tile once for eight
-//! candidates would pay on repetitive speech, and this decode's arrangement does
-//! not read it that way.
+//! What decides the route is the pass, not the drafter: reading each weight tile
+//! once for eight candidates would pay on repetitive speech, and this decode's
+//! arrangement does not read it that way.
 //!
 //! Three things about the arm, so the figure is read as what it is. With more than
 //! one query row the plane cache's mask is one key mask for all of them, so the
@@ -110,7 +95,7 @@
 //! mask and the one-row KV write (see
 //! [`graphs::body_capacity_chain_planes_rows`]); the one-row path the shipped
 //! decode runs is instead witnessed by the pinned answer, which the run prints
-//! through the cell's own rule as `all_pinned=true reads_as_pinned=true`. The rows
+//! through the pinned-clip rule as `all_pinned=true reads_as_pinned=true`. The rows
 //! reach
 //! the operand through a concat of the resident rows — 85 MB at eight rows (the two
 //! the parity check prints are 83 MB: about 0.6 ms one way and 1.3 ms read and
@@ -136,7 +121,7 @@ use std::sync::Arc;
 
 use mahbot_inference::listen::{ASR_HEAD_IDS, ASR_TAIL_IDS, ASR_TEXT_IDS};
 use mahbot_inference::loader::{self, Pair, Role};
-use mahbot_inference::{graphs, host, report, stand};
+use mahbot_inference::{graphs, host, report};
 use rlx_ir::Tick;
 use rlx_runtime::Device;
 
@@ -603,63 +588,30 @@ fn voice() -> Option<PathBuf> {
     }
 }
 
-/// The second recording: the listen cell's own path selector, which answers the
-/// reference voice when `STAND_ASR_WAV` is unset — that is the pinned clip, already
-/// measured, so only a different file is a second recording.
-fn alt_clip(pinned: &Path) -> Option<PathBuf> {
-    let path = stand::listen_path().ok()?;
-    if path == pinned {
-        return None;
-    }
-    if path.exists() {
-        return Some(path);
-    }
-    println!(
-        "census draft alternate skipped=missing-path {}",
-        path.display()
-    );
-    None
-}
-
-/// One clip through the listen cell's own walk, its stream printed against the
-/// pin. The cell's own offset switch is honoured, so the harness reads the input
-/// the cell would read, and the cell's own witness rule and alternate-input
-/// predicate are reused rather than restated — the predicate keys on the file the
-/// walk read, so the pinned clip is still witnessed beside a second recording.
-fn clip(pair: &Arc<Pair>, name: &str, path: &Path) -> Option<stand::Answer> {
-    let offset = stand::listen_offset();
-    let a = stand::listen_answer(pair, path, offset)?;
+/// One clip through the one-shot walk, its stream printed against the pin. The
+/// witness rule is the reference's own.
+fn clip(pair: &Arc<Pair>, name: &str, path: &Path) -> support::Answer {
+    let a = support::listen_answer(pair, path);
     println!(
         "census draft clip {name} frames={} prompt={} generated={} capacity={} text_ids={} \
-         decode_ms={:.3} stream_bytes={} answer_digest={:016x}",
+         decode_ms={:.3} answer_digest={:016x}",
         a.frames,
         a.prompt_rows,
         a.generated.len(),
         a.capacity,
         prompt_text_ids().len(),
         a.decode_ms,
-        a.stream_bytes,
         a.digest,
     );
-    // The cell's own witness rule, called rather than restated: the predicate inside
-    // it decides from the file this walk read, so the pinned clip is witnessed even
-    // beside a second recording.
-    stand::witness_listen(
-        path,
-        offset,
-        a.frames,
-        a.prompt_rows,
-        a.generated.len(),
-        a.digest,
-        &a.text,
-    );
-    Some(a)
+    // The walk's own witness rule, called rather than restated.
+    support::witness_listen(&a);
+    a
 }
 
 /// Every curve a clip yields: per-depth acceptance with its Wilson interval and
 /// its conditional rate, coverage, the length distribution, the walk the curve
 /// implies and the chain product.
-fn curves_of(name: &str, a: &stand::Answer) -> Vec<Curve> {
+fn curves_of(name: &str, a: &support::Answer) -> Vec<Curve> {
     let text = prompt_text_ids();
     let mut ids = text.clone();
     ids.extend_from_slice(&a.generated);
@@ -719,10 +671,9 @@ fn alpha_text(alpha: Option<f64>) -> String {
 }
 
 /// The pass arms and the decision: measured costs at 1..=[`DEPTH`] + 1 rows, the
-/// predicted decode from each curve, the break-even acceptance and the win a build
-/// would have to reach. `sets` is one `(clip, curves)` pair per recording, the
-/// pinned clip first.
-fn decide(pair: &Pair, answer: &stand::Answer, sets: &[(&str, &[Curve])]) {
+/// predicted decode from the clip's curve, the break-even acceptance and the win a
+/// build would have to reach.
+fn decide(pair: &Pair, answer: &support::Answer, curves: &[Curve]) {
     let capacity = answer.capacity;
     let tokens = answer.generated.len() as f64;
     let mut cost: PassCost = [f64::NAN; DEPTH + 2];
@@ -802,13 +753,13 @@ fn decide(pair: &Pair, answer: &stand::Answer, sets: &[(&str, &[Curve])]) {
     }
     // Both sides of every ratio below come from this one reading: the baseline is
     // the harness's own one-row pass × the clip's token count, so a round is never
-    // priced at one process's step and the baseline at another's. The cell's own
+    // priced at one process's step and the baseline at another's. The walk's own
     // per-token figure prints beside it as context.
     let baseline_total = one * tokens;
     println!(
         "census pass cost one_ms={one:.3} deep_ms={deep:.3} ratio={:.3} \
-         cell_step_ms={:.3} one_over_cell={:.3} tokens={tokens:.0} baseline_ms={baseline_total:.3} \
-         cell_baseline_ms={:.3}",
+         walk_step_ms={:.3} one_over_walk={:.3} tokens={tokens:.0} baseline_ms={baseline_total:.3} \
+         walk_baseline_ms={:.3}",
         deep / one,
         answer.decode_ms,
         one / answer.decode_ms,
@@ -938,74 +889,63 @@ fn decide(pair: &Pair, answer: &stand::Answer, sets: &[(&str, &[Curve])]) {
         alpha_text(acceptance_for(PREMISE_RATIO, DEPTH)),
         alpha_text(acceptance_for(DECISION_WIN * PREMISE_RATIO, DEPTH)),
     );
-    // Every clip's curve is priced at *this* capacity's measured costs, so the
-    // second recording's lines carry the first one's pass and are indicative: they
-    // answer whether a more favourable drafter would change the verdict, not what
-    // that clip's own decode costs.
-    for (clip, set) in sets {
-        for curve in *set {
-            if curve.rounds() == 0 || curve.emitted == 0 {
-                println!(
-                    "census decision clip={clip} min_match={} skipped=no-rounds",
-                    curve.min_match
-                );
-                continue;
-            }
-            // The clip's own token count: what the baseline pays one row each, and
-            // what a round emits from.
-            let tokens = curve.emitted as f64;
-            let baseline_total = one * tokens;
-            let predicted = predicted_ms(curve, &cost);
-            let win = baseline_total / predicted;
-            let mean_pass = predicted / curve.rounds() as f64;
-            let (p05, p50, p95) = curve.walk;
-            // The walk the curve implies pays `mean_pass` a round and needs
-            // `emitted / tokens-per-round` rounds; its low end is the highest time.
-            let win_p05 = baseline_total / (curve.emitted as f64 / p05 * mean_pass);
-            // The same curve against the pass the route would have if its many-row
-            // attention's long-cache data cost went away; this is what says whether
-            // the route is closed on the drafter alone. A refused arm prints
-            // `refused` rather than a ratio with a missing increment priced as free.
-            let implied_ms = predicted_ms(curve, &implied);
-            let win_implied = baseline_total / implied_ms;
-            let (win_implied, implied_ms) = if win_implied.is_finite() && implied_ms.is_finite() {
-                (format!("{win_implied:.3}"), format!("{implied_ms:.3}"))
-            } else {
-                ("refused".to_string(), "refused".to_string())
-            };
-            let win_premise = baseline_total / predicted_ms(curve, &premise_cost);
-            // What the same chain-conditional rates would yield if the drafter
-            // proposed at every position: precision, separated from coverage.
-            let full = Curve::yield_at_full_depth(&curve.conditional());
-            let win_full = baseline_total / (tokens / full * cost[DEPTH + 1]);
-            let passes_per_token = curve.rounds() as f64 / tokens;
-            // Bytes per *accepted* token, computed from the reads the curve's rounds
-            // take — the row groups their passes dispatch.
-            let reads_per_token = curve.stream_reads_per_token();
+    // The clip's curve is priced at this capacity's measured costs.
+    for curve in curves {
+        if curve.rounds() == 0 || curve.emitted == 0 {
             println!(
-                "census decision clip={clip} cost_capacity={capacity} min_match={} rounds={} \
-                 tokens={tokens:.0} tokens_per_round={:.3} predicted_ms={predicted:.3} \
-                 measured_ms={baseline_total:.3} win={win:.3} win_model_p05={win_p05:.3} \
-                 win_no_attention_defect={win_implied} implied_ms={implied_ms} \
-                 win_at_{PREMISE_RATIO:.2}x={win_premise:.3} \
-                 yield_if_always_proposed={full:.3} \
-                 win_if_always_proposed={win_full:.3} per_token_ms={:.3} \
-                 passes_per_token={passes_per_token:.3} stream_reads_per_token={reads_per_token:.3} \
-                 bytes_per_accepted_token={} bytes_per_read={} \
-                 model={p05:.3}/{p50:.3}/{p95:.3} verdict={}",
-                curve.min_match,
-                curve.rounds(),
-                curve.tokens_per_round(),
-                predicted / tokens,
-                report::human((reads_per_token * answer.stream_bytes as f64) as u64),
-                report::human(answer.stream_bytes),
-                if win >= DECISION_WIN && win_p05 >= DECISION_WIN {
-                    "build"
-                } else {
-                    "closed"
-                },
+                "census decision min_match={} skipped=no-rounds",
+                curve.min_match
             );
+            continue;
         }
+        // The clip's own token count: what the baseline pays one row each, and
+        // what a round emits from.
+        let tokens = curve.emitted as f64;
+        let baseline_total = one * tokens;
+        let predicted = predicted_ms(curve, &cost);
+        let win = baseline_total / predicted;
+        let mean_pass = predicted / curve.rounds() as f64;
+        let (p05, p50, p95) = curve.walk;
+        // The walk the curve implies pays `mean_pass` a round and needs
+        // `emitted / tokens-per-round` rounds; its low end is the highest time.
+        let win_p05 = baseline_total / (curve.emitted as f64 / p05 * mean_pass);
+        // The same curve against the pass the route would have if its many-row
+        // attention's long-cache data cost went away; this is what says whether
+        // the route is closed on the drafter alone. A refused arm prints
+        // `refused` rather than a ratio with a missing increment priced as free.
+        let implied_ms = predicted_ms(curve, &implied);
+        let win_implied = baseline_total / implied_ms;
+        let (win_implied, implied_ms) = if win_implied.is_finite() && implied_ms.is_finite() {
+            (format!("{win_implied:.3}"), format!("{implied_ms:.3}"))
+        } else {
+            ("refused".to_string(), "refused".to_string())
+        };
+        let win_premise = baseline_total / predicted_ms(curve, &premise_cost);
+        // What the same chain-conditional rates would yield if the drafter
+        // proposed at every position: precision, separated from coverage.
+        let full = Curve::yield_at_full_depth(&curve.conditional());
+        let win_full = baseline_total / (tokens / full * cost[DEPTH + 1]);
+        let passes_per_token = curve.rounds() as f64 / tokens;
+        println!(
+            "census decision cost_capacity={capacity} min_match={} rounds={} \
+             tokens={tokens:.0} tokens_per_round={:.3} predicted_ms={predicted:.3} \
+             measured_ms={baseline_total:.3} win={win:.3} win_model_p05={win_p05:.3} \
+             win_no_attention_defect={win_implied} implied_ms={implied_ms} \
+             win_at_{PREMISE_RATIO:.2}x={win_premise:.3} \
+             yield_if_always_proposed={full:.3} \
+             win_if_always_proposed={win_full:.3} per_token_ms={:.3} \
+             passes_per_token={passes_per_token:.3} \
+             model={p05:.3}/{p50:.3}/{p95:.3} verdict={}",
+            curve.min_match,
+            curve.rounds(),
+            curve.tokens_per_round(),
+            predicted / tokens,
+            if win >= DECISION_WIN && win_p05 >= DECISION_WIN {
+                "build"
+            } else {
+                "closed"
+            },
+        );
     }
 }
 
@@ -1227,47 +1167,13 @@ fn draft_acceptance() {
         return;
     };
     let started = report::Stopwatch::start();
-    let Some(pinned) = clip(&pair, "pinned", &voice) else {
-        eprintln!("skip: the recognition walk did not answer");
-        return;
-    };
+    let pinned = clip(&pair, "pinned", &voice);
     let curves = curves_of("pinned", &pinned);
-    let mut other: Vec<Curve> = Vec::new();
-    if let Some(alt) = alt_clip(&voice)
-        && let Some(second) = clip(&pair, "alternate", &alt)
-    {
-        other = curves_of("alternate", &second);
-        // The second recording joins the confidence and the decision — a curve
-        // that more than one recording reaches is what says whether a verdict is
-        // the drafter's or the clip's.
-        for (i, (a, b)) in curves[0].depths.iter().zip(&other[0].depths).enumerate() {
-            println!(
-                "census draft joined depth={} pinned={}/{} other={}/{}",
-                i + 1,
-                a.matched,
-                a.proposed,
-                b.matched,
-                b.proposed,
-            );
-        }
-        if let (Some(x), Some(y)) = (curves[0].depths[0].rate(), other[0].depths[0].rate()) {
-            println!(
-                "census draft joined depth=1 rate={:.4} other={:.4} delta={:+.4}",
-                x,
-                y,
-                y - x
-            );
-        }
-    }
-    decide(
-        &pair,
-        &pinned,
-        &[("pinned", &curves), ("alternate", &other)],
-    );
+    decide(&pair, &pinned, &curves);
     println!(
-        "census draft done build_ms={:.1} process_peak_bytes={} wall_ms={:.1}",
+        "census draft done build_ms={:.1} process_peak={} wall_ms={:.1}",
         pinned.build_ms,
-        report::peak_text(),
+        report::shown(report::peak_rss()),
         started.ms(),
     );
 }

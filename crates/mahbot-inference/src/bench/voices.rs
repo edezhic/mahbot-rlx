@@ -99,7 +99,6 @@ impl Speaker {
 /// One intelligibility sentence's outcome.
 pub(crate) struct SentenceCheck {
     pub text: &'static str,
-    pub seed: u64,
     /// What the recogniser answered.
     pub heard: String,
     /// Whether the answer carries the sentence's words, in order, ignoring case
@@ -126,13 +125,11 @@ pub(crate) struct Replacement {
     pub reason: String,
 }
 
-/// What the selection produced: the clones, the enrolled voice's check, and the
-/// witness that the clones' references are distinct.
+/// What the selection produced: the clones and the witness that their references
+/// are distinct.
 pub(crate) struct Selection {
     pub voices: Vec<Arc<Voice>>,
     pub replacements: Vec<Replacement>,
-    /// The enrolled voice's own check: reported, never a reason to replace it.
-    pub enrolled: Vec<SentenceCheck>,
     /// Pairwise cosine over the selected voices' reference embeddings, `i < j`.
     pub similarity: Vec<(usize, usize, f32)>,
     /// The span WAV of every candidate that was tried, so the build's sweep keeps
@@ -153,8 +150,8 @@ impl Selection {
         speakers
     }
 
-    /// The report cell: what was selected, from what, what it answered, and the
-    /// similarity witness — the one place the witness is summarised.
+    /// The report cell: what was selected, from what, and the similarity witness —
+    /// the one place the witness is summarised.
     pub(crate) fn json(&self) -> Value {
         let voices: Vec<Value> = self
             .voices
@@ -167,18 +164,11 @@ impl Selection {
                     "span": {
                         "offset_secs": voice.offset_secs,
                         "secs": voice.secs,
-                        "wav": voice.wav.to_string_lossy(),
                     },
                 })
             })
             .collect();
-        let pairs: Vec<Value> = self
-            .similarity
-            .iter()
-            .map(|(a, b, cosine)| json!([self.voices[*a].name, self.voices[*b].name, cosine,]))
-            .collect();
         let mut similarity = serde_json::Map::new();
-        similarity.insert("pairs".into(), Value::Array(pairs));
         if let Some(summary) = similarity_summary(&self.similarity) {
             similarity.insert("min".into(), json!(summary.min));
             similarity.insert("median".into(), json!(summary.median));
@@ -191,41 +181,16 @@ impl Selection {
         }
         json!({
             "selected": self.voices.len(),
-            "pool": sets::VERIFICATION_POOL.len(),
             "voices": voices,
-            "enrolled": {
-                "voice": ENROLLED,
-                "passed": enrolled_passed(&self.enrolled),
-                "sentences": sentences_json(&self.enrolled),
-            },
             "replacements": self.replacements.iter().map(|replacement| json!({
                 "recording": replacement.recording,
                 "sha256": replacement.sha256,
                 "span": {"offset_secs": replacement.offset_secs, "secs": replacement.secs},
                 "reason": replacement.reason,
             })).collect::<Vec<_>>(),
-            "intelligibility": {
-                "sentences": sets::INTELLIGIBILITY_SENTENCES,
-                "seed_base": sets::INTELLIGIBILITY_SEED_BASE,
-            },
             "reference_similarity": Value::Object(similarity),
         })
     }
-}
-
-fn sentences_json(checks: &[SentenceCheck]) -> Vec<Value> {
-    checks
-        .iter()
-        .map(|check| {
-            json!({
-                "text": check.text,
-                "seed": check.seed,
-                "heard": check.heard,
-                "passed": check.passed,
-                "truncated": check.truncated,
-            })
-        })
-        .collect()
 }
 
 /// The intelligibility probe's length: six seconds at the listening rate, which is
@@ -371,7 +336,6 @@ pub(crate) fn select(
     Ok(Selection {
         voices,
         replacements,
-        enrolled,
         similarity,
         spans,
     })
@@ -409,7 +373,7 @@ fn check(
         let samples = synth.clip(&request.speaker, request.text, request.seed)?;
         let (probe, truncated) = probe_audio(samples);
         let heard = clip
-            .run(probe, None, 0)
+            .run(probe, None)
             .with_context(|| {
                 format!(
                     "the intelligibility probe `{}` for {}",
@@ -420,7 +384,6 @@ fn check(
             .text;
         checks.push(SentenceCheck {
             text: request.text,
-            seed: request.seed,
             passed: same_words(request.text, &heard),
             heard,
             truncated,
@@ -522,7 +485,7 @@ fn cut_span(corpus: &Path, path: &Path, candidate: &sets::VoiceCandidate) -> Res
             candidate.secs
         );
     }
-    super::write_atomic(path, |tmp| {
+    crate::measurements::write_atomic(path, |tmp| {
         host::write_wav16(&tmp.display().to_string(), &pcm, listen::SAMPLE_RATE)
     })
 }
@@ -703,8 +666,7 @@ mod tests {
         ));
     }
 
-    /// The probe sentences are ordinary speech, not the wake phrase, and their
-    /// seeds sit in their own band.
+    /// The probe sentences are not the wake phrase, and there are two of them.
     #[test]
     fn the_probes_are_not_the_wake_phrase() {
         for text in sets::INTELLIGIBILITY_SENTENCES {

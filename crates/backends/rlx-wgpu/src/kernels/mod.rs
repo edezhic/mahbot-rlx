@@ -5030,20 +5030,17 @@ pub const ATTENTION_PARTS_DIM_CHUNK: u32 = 32;
 /// keys on one thread per query row, with `MAX_HEAD_DIM`-wide private Q/O arrays
 /// behind a runtime index, so its per-layer cost grows with the key count rather
 /// than disappearing at short lengths — 498 µs a layer at 32 keys and 942 at 64
-/// on the stand (Apple M3 Pro, wgpu over Metal, the chain
+/// on an Apple M3 Pro (wgpu over Metal, the chain
 /// `tests/attention_decode_route.rs` walks), where those two are the pre-change
 /// build's own readings and cannot be re-taken now that a one-row step at those
-/// widths takes this form. The fork's speech cells live in the band the floor
-/// kept — the code predictor's attention is one row over 1..=16 keys (one cache
-/// row per level) at 16 heads of width 128 — and routing it here took that frame
-/// from 56.8 to 40.8–42.0 ms and the synthesis cell from 1.053 s per second of
-/// speech, with the waveform digest unchanged; `MEASUREMENTS.md` carries the rate
-/// it reached, which moves with the machine between runs. The same frame's
-/// attention dispatches read 307 µs and 154.7 µs before and after in the
-/// one-op-per-pass ablation, which charges each dispatch a pass open and close of
-/// its own and so prices small kinds far above their device cost: read those two
-/// as the ablation's, indicative of the direction, not as per-dispatch device
-/// time (the cell rate is the measured one).
+/// widths takes this form. The fork's speech shapes live below that floor — the
+/// code predictor's attention is one row over 1..=16 keys (one cache row per level)
+/// at 16 heads of width 128 — and routing it here took that frame from 56.8 to
+/// 40.8–42.0 ms with the waveform digest unchanged. The same frame's attention
+/// dispatches read 307 µs and 154.7 µs before and after in the one-op-per-pass
+/// ablation, which charges each dispatch a pass open and close of its own and so
+/// prices small kinds far above their device cost: read those two as the
+/// ablation's, indicative of the direction, not as per-dispatch device time.
 ///
 /// The entry itself also stands a binary-masked key's K dot down (the
 /// `skip_masked` word in its params, `RLX_WGPU_NO_ATTN_MASK_SKIP` to restore

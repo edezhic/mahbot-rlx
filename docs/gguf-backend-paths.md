@@ -241,10 +241,9 @@ Otherwise Q4_1+ fall through with wrong block stride.
    blocks live in its first staged tile, and the call still rides the batch's single
    submission — `gguf_matmul_route.rs`'s route census, submission pair and
    cross-route value checks are what witness that end not losing. That `min` is
-   uniform, so a whole-tile call walks it too: an on-tile cell's cost is watched on
-   the stand's figures rather than by an in-tree timing ceiling, the A/B cells'
-   `[rlx-gguf-q8-0-gemm]` lines reporting it. No row cap applies at any of these
-   entries.
+   uniform, so a whole-tile call walks it too: an on-tile cell's cost is reported by
+   the A/B cells' `[rlx-gguf-q8-0-gemm]` lines rather than held by an in-tree timing
+   ceiling. No row cap applies at any of these entries.
 4. **Scratch fallback** (`ScratchArm`): the arena planner reserves
    `dequant_gguf_scratch_bytes(graph)` tail space; dispatch `dequant_gguf` then
    `matmul_bt` (or the grouped MoE GPU path below). This is Q8_0's route at one-row

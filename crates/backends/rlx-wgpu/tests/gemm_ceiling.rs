@@ -50,14 +50,14 @@
 //! same step in one call read 83.6 GB/s in `gguf_one_row_stream_rate`), not as a
 //! rate to quote.
 //!
-//! # The synthesis cell's ceiling
+//! # The synthesis loop's ceiling
 //!
 //! `synthesis_ceiling` takes the same accounting to the synthesis loop, whose
 //! dominant work is the same `m = 1` packed multiply: 850 870 272 packed bytes a
 //! frame in the talker body (169 packed Q4_K/Q6_K multiplies) and 1 393 754 112 in
 //! the code predictor (348 packed Q8_0 ones), over 330 frames of a 26.4 s speech.
-//! What the cell itself reads — the loop's ms a frame, the sound half — is the
-//! stand's and is recorded in `MEASUREMENTS.md`, not here. In one window it takes the stream probe's
+//! What the loop itself reads — its ms a frame, the sound half — belongs to the run
+//! that takes it; no record carries a per-form table. In one window it takes the stream probe's
 //! read and copy ceilings, then one joined call of `steps` identical
 //! `DequantMatMul`s over distinct parameters at each of the frame's geometries
 //! (best of 7 after 3 warm-up calls), `steps` chosen so a call moves 214-302 MB —
@@ -71,7 +71,7 @@
 //! sampling are not in either.
 //!
 //! Recorded 2026-10-21 on this machine (Apple M3 Pro, 14-core GPU, wgpu over
-//! Metal), three standalone runs of the same build, `--release` (the cell alone,
+//! Metal), three standalone runs of the same build, `--release` (this test alone,
 //! as the probe's own doc asks):
 //!
 //! | side | scheme | m | k | n | steps | bytes/step | GB/s |
@@ -90,21 +90,19 @@
 //! runs, 17 % apart, and its own rounds spanned 104-131, so a derived figure
 //! inherits that spread. A run with `gemm_ceiling` ahead of it in the same process
 //! read 78.9 GB/s for the body and 60.3 for the predictor (0.510 s/speech), its
-//! per-row figures up to a third lower, which is why this cell is taken alone.
+//! per-row figures up to a third lower, which is why this test is taken alone.
 //!
-//! The two denominators this cell exists to produce — the frame's packed bytes
+//! The two denominators this test exists to produce — the frame's packed bytes
 //! (2 244 624 384 = 850 870 272 + 1 393 754 112) at (a) the probe's read ceiling
-//! and (b) the byte-weighted rate of the forms above — are **recorded in
-//! [`MEASUREMENTS.md`](../../../../MEASUREMENTS.md)'s "The loop's two
-//! denominators"**, taken from the stand run that writes the record, and are not
-//! restated here: a second copy is a second number to drift. What the cell prints
-//! is (a), (b) and the frame total for its own session, so a run can be read
-//! against the recorded set.
+//! and (b) the byte-weighted rate of the forms above — are **not restated here**:
+//! a reading belongs to the run that takes it, and a second copy is a second
+//! number to drift. What the test prints is (a), (b) and the frame total for its
+//! own session, so two runs can be read against each other.
 //!
 //! The denominators bound what these geometries cost as one contiguous run over
 //! one shared input row, and **not** what a frame costs — a frame's 169 or 348
 //! multiplies are distinct calls with the frame's other work between them, none of
-//! which this cell executes. So the gap between them and the cell's own frames is a
+//! which this test executes. So the gap between them and the test's own frames is a
 //! measurement of this harness, not an attribution of the frame's time.
 //!
 //! The dense f32 comparison at the same row and two
@@ -273,10 +271,10 @@ fn packed_steps_time(
     Some((us, packed.len() as u64))
 }
 
-/// The synthesis cell's shapes: one talker-body frame and one code-predictor
-/// frame over 330 frames of a 26.4 s speech. The sound half is **not** a constant
-/// here: it belongs to the stand run that measured the cell, so this cell reports
-/// the loop's own figure and the record supplies the rest.
+/// The synthesis shapes: one talker-body frame and one code-predictor frame over
+/// 330 frames of a 26.4 s speech. The sound half is **not** a constant here: it
+/// depends on the decoder's own arrangement, so this measures the loop's figure
+/// alone and states it alone.
 const BODY_FRAME_BYTES: f64 = 850_870_272.0;
 const PREDICTOR_FRAME_BYTES: f64 = 1_393_754_112.0;
 const FRAMES: f64 = 330.0;
@@ -300,7 +298,7 @@ fn synthesis_ceiling() {
         return;
     };
     eprintln!(
-        "[rlx-synthesis-ceiling] adapter={:?} — this cell's figures hold for this adapter and \
+        "[rlx-synthesis-ceiling] adapter={:?} — these figures hold for this adapter and \
          machine load only",
         rlx_wgpu::device::adapter_name()
     );
@@ -374,8 +372,8 @@ fn synthesis_ceiling() {
     eprintln!(
         "[rlx-synthesis-ceiling] per-frame bytes: body {BODY_FRAME_BYTES:.0} + predictor \
          {PREDICTOR_FRAME_BYTES:.0} = {frame_bytes:.0}; frames={FRAMES} speech={SPEECH_S} s; \
-         the loop's figures below are the generation loop alone — the record's sound half is \
-         added to them, not carried here"
+         the figures below are the generation loop alone — the sound half is a \
+         different arrangement and is not carried here"
     );
 
     // (a) The pure byte floor: every frame byte read once at the probe's read

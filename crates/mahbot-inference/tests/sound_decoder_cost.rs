@@ -26,12 +26,12 @@
 //!
 //! **The margins.** A DAC group's full window with its right margin against the
 //! same window without it, per group, paired the same way. With the padded last
-//! window above it is the whole of what the record's sound half gained from
-//! carrying no right margin. The absolute per-window costs move between runs; the
-//! paired delta and the rounds that agree on it are the figure.
+//! window above it is the whole of what the served path gained from carrying no
+//! right margin. The absolute per-window costs move between runs; the paired delta
+//! and the rounds that agree on it are the figure.
 //!
 //! **The served path.** One process, two `Synthesis::synthesize` calls of the
-//! pinned cell's text and a third of another so the cache meets a second length:
+//! pinned text and a third of another so the cache meets a second length:
 //! the second call is the reuse a repeated request gets, and the resident set
 //! after each call is what the decoder's retained graphs cost the process.
 use std::sync::Arc;
@@ -39,12 +39,13 @@ use std::sync::Arc;
 use mahbot_inference::graphs::{self, DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, windows};
 use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::report;
-use mahbot_inference::stand::TTS_TEXT;
 use mahbot_inference::synth::{MAX_CODEC_ROWS, Synthesis};
 use rlx_ir::Tick;
 use rlx_runtime::Device;
 
 mod support;
+
+use support::TTS_TEXT;
 
 /// Rounds one arm is timed over; the median is the arm's figure and the spread of
 /// the paired deltas is the comparison's own.
@@ -307,7 +308,7 @@ fn the_fronts_last_window_runs_padded() {
 }
 
 /// The decoder's windows carry no right margin: a span padded past its core on the
-/// right computes outputs the stitch discards. Paired per DAC group at the cell's
+/// right computes outputs the stitch discards. Paired per DAC group at the part's
 /// own two full windows — the span with the margin against the span without it.
 #[test]
 #[ignore = "measurement only: prints the decoder's windows with and without their right margin"]
@@ -315,14 +316,14 @@ fn the_decoders_windows_carry_no_right_margin() {
     let Some(pair) = pair_or_skip() else { return };
     let device = Device::Gpu;
     let groups = graphs::codec_groups();
-    // The spans the cell runs, and the spans the same windows carried while the
+    // The spans the run makes, and the spans the same windows carried while the
     // right margin was on — four frames more on every window but the part's own
     // tail, which already ends at the part's end.
-    let cell = windows(MAX_CODEC_ROWS, DAC_WINDOW, DAC_MARGIN);
-    let spans: Vec<usize> = cell.iter().map(|&(p0, p1, _, _)| p1 - p0).collect();
+    let cuts = windows(MAX_CODEC_ROWS, DAC_WINDOW, DAC_MARGIN);
+    let spans: Vec<usize> = cuts.iter().map(|&(p0, p1, _, _)| p1 - p0).collect();
     // Both sides through the window function, from the one cut: the margin arm is
     // the same core with `DAC_MARGIN` frames on its right, clipped at the part's end.
-    let padded: Vec<usize> = cell
+    let padded: Vec<usize> = cuts
         .iter()
         .map(|&(_, _, a, b)| {
             let (p0, p1) = graphs::window_span(MAX_CODEC_ROWS, a, b, DAC_MARGIN, DAC_MARGIN);
@@ -428,11 +429,11 @@ fn the_library_path_pays_the_decoder_once() {
         let digest = report::digest(&wave);
         println!(
             "census library call={call} chars={} ms={ms:.1} build_ms={build:.3} samples={} \
-             digest={digest:016x} rss_mb={} process_peak_bytes={}",
+             digest={digest:016x} rss_mb={} process_peak={}",
             text.chars().count(),
             wave.len(),
             mb_of(rss()),
-            report::peak_text(),
+            report::shown(report::peak_rss()),
         );
         if call < 2 {
             pinned[call] = digest;

@@ -101,12 +101,6 @@ pub(crate) struct DetectionStream {
     /// Windows per resolve: [`listen::GROUP`] where grouping pays, one where the
     /// set is small enough that the ungrouped order is worth more than the pass.
     group: usize,
-    /// How many groups this stream resolved and how many windows the largest one
-    /// carried — the size the report states, as opposed to the capacity the
-    /// pipeline was built for — and how many of those groups were partial.
-    groups: usize,
-    max_group: usize,
-    partial: usize,
 }
 
 impl DetectionStream {
@@ -147,26 +141,7 @@ impl DetectionStream {
             pending: Vec::new(),
             pending_at: Vec::new(),
             group: group.max(1),
-            groups: 0,
-            max_group: 0,
-            partial: 0,
         }
-    }
-
-    /// The windows carried by the largest group this stream resolved: the group
-    /// size the run actually used, as distinct from the built capacity.
-    pub(crate) fn max_group(&self) -> usize {
-        self.max_group
-    }
-
-    /// How many encoder passes this stream's windows took.
-    pub(crate) fn groups(&self) -> usize {
-        self.groups
-    }
-
-    /// How many of those passes carried fewer windows than the group size.
-    pub(crate) fn partial_groups(&self) -> usize {
-        self.partial
     }
 
     /// Windows per resolve — `1` for the ungrouped streams the clip sets are
@@ -322,11 +297,6 @@ impl DetectionStream {
         }
         let windows = std::mem::take(&mut self.pending);
         let at = std::mem::take(&mut self.pending_at);
-        self.groups += 1;
-        self.max_group = self.max_group.max(windows.len());
-        if windows.len() < self.group {
-            self.partial += 1;
-        }
         let embeddings = embed.embed_group(&windows)?;
         Ok(self.apply(&embeddings, &at))
     }

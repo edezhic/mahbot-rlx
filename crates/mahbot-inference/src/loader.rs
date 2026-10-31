@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Our own GGUF loader — the thing this stand exists for.
+//! Our own GGUF loader — the thing this crate exists for.
 //!
 //! It loads a body and its `mmproj` under three rules:
 //!
@@ -27,43 +27,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use rlx_gguf::{GgmlType, GgufFile, MetaValue, bytes_for_public};
 use rlx_ir::quant::QuantScheme;
 
-/// The directory holding the six model files. The path is an input: the
+/// The directory holding the five model files. The path is an input: the
 /// checkout carries no models, so there is no crate-relative default.
 pub const MODELS_DIR_ENV: &str = "MAHBOT_MODELS_DIR";
 
 /// The recorded 16 kHz voice reference the ear, recognition and synthesis read.
 pub const VOICE_WAV_ENV: &str = "MAHBOT_VOICE_WAV";
 
-/// The article the two embedding cells are cut from — a plain-text file, not
-/// committed: the checkout carries no corpus, only its pins.
-pub const EMBED_TEXT_ENV: &str = "MAHBOT_EMBED_TEXT";
-
-/// The embeddings file: EmbeddingGemma 2's text tower, the one role that is a
-/// single file rather than a body and its `mmproj`.
-pub const EMBED_MODEL: &str = "embeddinggemma-2-Q8_0.gguf";
-
-/// The artefact the embedding rows are taken with, as `(url, revision,
-/// sha256)`: the Q8_0 text tower from `ggml-org/embeddinggemma-2-GGUF`, at the
-/// repository revision whose LFS object carries that hash. A run whose own
-/// `embeddinggemma-2-Q8_0.gguf` hashes differently did not measure this file,
-/// and the record prints that rather than folding the two together.
-pub const EMBED_MODEL_SOURCE: (&str, &str, &str) = (
-    "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF",
-    "58faf90940886df2d62be555c8765d00dac362c5",
-    "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135",
-);
-
 /// The model directory from [`MODELS_DIR_ENV`], or the error naming it.
 pub fn models_dir() -> Result<PathBuf> {
     env_dir(MODELS_DIR_ENV, "the model directory")
-}
-
-/// The embedding cells' article from [`EMBED_TEXT_ENV`], or the error naming it.
-pub fn embed_text() -> Result<PathBuf> {
-    env_dir(
-        EMBED_TEXT_ENV,
-        "the plain-text article the embedding cells read",
-    )
 }
 
 /// The voice reference from [`VOICE_WAV_ENV`], or the error naming it.
@@ -122,9 +95,9 @@ pub enum Store {
     /// `MatMul` — the path the sound stage's non-linear tensors take.
     HostDequant,
     /// Quantized, unpacked to **f16** on the host and multiplied as a plain
-    /// `MatMul` whose weight is an f16 `Param` — the embedding encoder's route
-    /// when [`Model::f16_linears`] takes it. The file's bytes are read once and
-    /// never re-quantised; the packed path stays the default and the fallback.
+    /// `MatMul` whose weight is an f16 `Param` — the tagger's route for its
+    /// rank-2 F16 matrices. The file's bytes are read once and never
+    /// re-quantised; the packed path stays the default and the fallback.
     F16Linear,
 }
 
@@ -162,37 +135,6 @@ pub fn quant_of(dt: GgmlType) -> Option<QuantScheme> {
     })
 }
 
-/// `MAHBOT_EMBED_GEMM=packed` keeps the embedding encoder's multiplies on the
-/// packed route — the measurement switch the two arms are taken with, not a
-/// tuning knob: the default is the fast path, and the packed route is also what
-/// every device without the cooperative f16 kernel gets regardless.
-pub const EMBED_GEMM_ENV: &str = "MAHBOT_EMBED_GEMM";
-
-/// Which matmul route an embedding graph's linears took — printed on the cell's
-/// own line, so a record states which route its figures price.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Gemm {
-    /// The file's own packed bytes through `Op::DequantMatMul`. The default for
-    /// every other file and for this one on any device that does not admit
-    /// [`Gemm::F16Coop`].
-    Packed,
-    /// The packed weights dequantised on the host into f16 `Param`s and
-    /// multiplied by `Op::MatMul`, which the backend serves with
-    /// `matmul_coop_f16_f32acc` (f16 operands, f32 accumulator).
-    F16Coop,
-}
-
-impl Gemm {
-    /// The token the cell line carries as `gemm=`.
-    #[must_use]
-    pub fn token(self) -> &'static str {
-        match self {
-            Gemm::Packed => "packed",
-            Gemm::F16Coop => "f16coop",
-        }
-    }
-}
-
 /// Whether the cooperative f16 kernel's tile admits a `[m, k] · [k, n]`
 /// multiply, asked of the backend that owns the admission
 /// ([`rlx_wgpu::coop_f16_f32acc_admits`]) rather than restated here.
@@ -204,37 +146,15 @@ impl Gemm {
 /// The gate is not cosmetic. An f16 weight whose multiply does not admit this
 /// tile is not served more slowly by the same kernel — it falls to
 /// `matmul_f16_compute`, which is slower than the packed Q8_0 route it would
-/// replace. So a graph that cannot put **every** linear on the cooperative
-/// kernel keeps all of them packed.
+/// replace. A caller that declares an f16 weight for its multiply therefore asks
+/// this first and refuses the graph rather than pricing an f16 residency it
+/// cannot use.
 #[must_use]
 pub fn f16_multiply_admits(m: usize, k: usize, n: usize) -> bool {
     rlx_wgpu::coop_f16_f32acc_admits(m as u64, n as u64, k as u64)
 }
 
-/// The route rule, as a pure predicate the unit tests can drive without a
-/// device: f16 only when the adapter's `f16_f32acc_path_ok()` self-check passed,
-/// the route is not pinned off (see [`f16_pinned`]), and every multiply of
-/// `shapes` — `(m, k, n)` — admits the kernel.
-#[must_use]
-pub fn f16_route(pinned: bool, probe_ok: bool, shapes: &[(usize, usize, usize)]) -> bool {
-    !pinned
-        && probe_ok
-        && !shapes.is_empty()
-        && shapes.iter().all(|&(m, k, n)| f16_multiply_admits(m, k, n))
-}
-
-/// Whether this process pins the encoder off the 16-bit route: the stand's own
-/// `MAHBOT_EMBED_GEMM=packed`, or the backend's absolute f32 pin
-/// (`RLX_WGPU_MATMUL_F32_ONLY`), under which every multiply computes in f32
-/// whatever store the graph declared. The f32 pin has to be honoured here too, or
-/// the stand would keep the 6 B-per-2 B f16 residency and a `gemm=f16coop` cell
-/// line for a route the backend's arm no longer takes.
-#[must_use]
-pub fn f16_pinned(forced_packed: bool) -> bool {
-    forced_packed || rlx_wgpu::f32_matmul_pinned()
-}
-
-/// Which head a body file carries — the three configurations the bodies use.
+/// Which head a body file carries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Head {
     /// Own `output.weight` with its own vocabulary.
@@ -282,94 +202,12 @@ pub struct ClipConfig {
     pub gen_eps: Option<f32>,
 }
 
-/// The embeddings file's configuration — EmbeddingGemma 2's **text tower**, as
-/// its own `gemma-embedding2.*` metadata states it.
-///
-/// It is a type of its own rather than a [`Config`]: this file's layers do not
-/// share a head width (four global layers at 512, twenty sliding ones at 256),
-/// nor a KV-head count (one on a global layer, two on a sliding one), and what
-/// the graph needs beyond the block shape — the band, the layer-type pattern,
-/// the per-layer-input widths and the output width — has no field in the body
-/// config at all. Squeezing it into `Config` would mean six defaults that are
-/// wrong for every Qwen file.
-///
-/// Every field is read, none is derived from a nominal shape: a file whose
-/// arrays disagree with its tensors is refused in [`Model::open`] rather than
-/// read as if its metadata were a comment.
-#[derive(Clone, Debug)]
-pub struct GemmaConfig {
-    pub layers: usize,
-    pub d: usize,
-    pub ffn: usize,
-    pub heads: usize,
-    /// `attention.key_length` — the head width of the four **global** layers.
-    pub head_dim: usize,
-    /// `attention.key_length_swa` — the head width of the twenty **sliding**
-    /// layers.
-    pub head_dim_swa: usize,
-    /// `attention.head_count_kv`, one entry per layer.
-    pub kv_heads: Vec<usize>,
-    /// `attention.sliding_window_pattern`: `true` marks a sliding layer,
-    /// `false` a global one.
-    pub sliding: Vec<bool>,
-    /// `attention.sliding_window` as the file states it — the **full** width.
-    /// llama.cpp's `LLAMA_SWA_TYPE_SYMMETRIC` halves it into a radius, so the
-    /// band a query sees is `|qi - ki| <= window / 2`, not `window`.
-    pub window: usize,
-    pub eps: f32,
-    /// `rope.freq_base` of the global layers.
-    pub rope_base: f32,
-    /// `rope.freq_base_swa` of the sliding ones.
-    pub rope_base_swa: f32,
-    /// `embedding_length_per_layer_input` — the width of one layer's slice of
-    /// the per-layer-input projection (`512` here, the block width).
-    pub ple: usize,
-    /// `embedding_length_out` — the width of the final projection (`768`).
-    pub out_width: usize,
-    pub vocab: usize,
-}
-
-impl GemmaConfig {
-    /// `true` when layer `il` is one of the twenty sliding ones.
-    pub fn is_sliding(&self, il: usize) -> bool {
-        self.sliding[il]
-    }
-
-    /// The head width layer `il`'s Q/K/V and norms are built at.
-    pub fn head_dim_of(&self, il: usize) -> usize {
-        if self.is_sliding(il) {
-            self.head_dim_swa
-        } else {
-            self.head_dim
-        }
-    }
-
-    /// The KV-head count of layer `il`.
-    pub fn kv_heads_of(&self, il: usize) -> usize {
-        self.kv_heads[il]
-    }
-
-    /// The RoPE base layer `il` rotates at.
-    pub fn rope_base_of(&self, il: usize) -> f32 {
-        if self.is_sliding(il) {
-            self.rope_base_swa
-        } else {
-            self.rope_base
-        }
-    }
-
-    /// The band's radius: half the file's `sliding_window` — see [`Self::window`].
-    pub fn window_radius(&self) -> usize {
-        self.window / 2
-    }
-}
-
 /// The CED audio tagger's configuration — the `ced.*` metadata as typed fields.
 ///
-/// It is a type of its own for the reason [`GemmaConfig`] is: the file's own
-/// front end (a log-mel whose filterbank and window it carries as tensors, and
-/// whose amplitude-to-dB clamp is three numbers) has no field in a body config,
-/// and the ViT over its patches has neither a KV-head count nor a vocabulary.
+/// It is a type of its own rather than a [`Config`]: the file's own front end (a
+/// log-mel whose filterbank and window it carries as tensors, and whose
+/// amplitude-to-dB clamp is three numbers) has no field in a body config, and
+/// the ViT over its patches has neither a KV-head count nor a vocabulary.
 ///
 /// Every field is read from the file by [`Model::open_ced`], and the arrays are
 /// checked against the tensors there: a file whose metadata and tensors
@@ -445,12 +283,11 @@ impl CedConfig {
     }
 }
 
-/// Which of the three roles a file belongs to.
+/// Which of the two roles a file belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Recognition,
     Synthesis,
-    Embeddings,
 }
 
 impl Role {
@@ -458,7 +295,6 @@ impl Role {
         match self {
             Role::Recognition => "recognition",
             Role::Synthesis => "synthesis",
-            Role::Embeddings => "embeddings",
         }
     }
 }
@@ -476,8 +312,6 @@ pub struct Model {
     pub sound: bool,
     pub config: Option<Config>,
     pub clip: Option<ClipConfig>,
-    /// The embeddings file's own config — set only by `gemma-embedding2`.
-    pub gemma: Option<GemmaConfig>,
     /// The audio tagger's own config — set only by [`Model::open_ced`].
     pub ced: Option<CedConfig>,
     pub plans: Vec<Plan>,
@@ -598,24 +432,21 @@ impl Model {
             match arch.as_str() {
                 "qwen3vl" => Role::Recognition,
                 "qwen3tts" => Role::Synthesis,
-                "gemma-embedding2" => Role::Embeddings,
                 other => bail!("unknown architecture `{other}` in {}", path.display()),
             }
         };
 
-        let (config, gemma) = if sound {
-            (None, None)
-        } else if arch == "gemma-embedding2" {
-            (None, Some(merge_gemma(&file, &arch)?))
+        let config = if sound {
+            None
         } else {
-            (Some(merge_config(&file, &arch)?), None)
+            Some(merge_config(&file, &arch)?)
         };
         let clip = if sound { Some(merge_clip(&file)) } else { None };
 
         // ── the inventory: one plan per tensor, rules applied up front ──
         // Rank-2 quantised weights keep the file's own bytes, packed, for every
         // role. The sound file's non-linear tensors go to the host as f32; no
-        // file is re-quantised in the stand.
+        // file is re-quantised here.
         let mut plans: Vec<Plan> = Vec::with_capacity(file.tensors.len());
         for t in file.tensors.values() {
             let rank = t.shape.len();
@@ -646,13 +477,6 @@ impl Model {
             });
         }
         plans.sort_by(|a, b| a.name.cmp(&b.name));
-        // The per-layer arrays are checked against the tensors themselves: a
-        // file whose `head_count_kv` or `sliding_window_pattern` disagrees with
-        // what its own projections are wide is refused here, not read as if the
-        // arrays were a comment.
-        if let Some(g) = &gemma {
-            check_gemma_tensors(&file, g)?;
-        }
         let by_name = plans
             .iter()
             .enumerate()
@@ -666,7 +490,6 @@ impl Model {
             sound,
             config,
             clip,
-            gemma,
             ced: None,
             plans,
             by_name,
@@ -676,11 +499,10 @@ impl Model {
     /// Open a **CED** audio tagger (a `ced` architecture file) read-only and plan
     /// every tensor in it under this file's own store rule.
     ///
-    /// It is a separate constructor rather than a fourth [`Role`]: a tagger is
-    /// not a body, not an `mmproj` and not a text tower, it is never paired with
-    /// another file, and the one rule that differs — the store — must not reach
-    /// the three files [`Model::open`] serves. Its [`Model::role`] is therefore
-    /// `None`.
+    /// It is a separate constructor rather than a third [`Role`]: a tagger is
+    /// not a body and not an `mmproj`, it is never paired with another file, and
+    /// the one rule that differs — the store — must not reach the four files
+    /// [`Model::open`] serves. Its [`Model::role`] is therefore `None`.
     ///
     /// The store rule here is the tagger's own: a **rank-2 F16** tensor is kept
     /// as f16 (`Store::F16Linear`), everything F32 stays as the file's bytes, and
@@ -739,7 +561,6 @@ impl Model {
             sound: false,
             config: None,
             clip: None,
-            gemma: None,
             ced: Some(ced),
             plans,
             by_name,
@@ -774,106 +595,6 @@ impl Model {
         self.by_name.contains_key(name)
     }
 
-    /// The store rule for an embedding encoder's linears: hand this file's
-    /// packed rank-2 weights over as f16 params when — and only when — the
-    /// adapter's cooperative f16 kernel is admitted for **every** multiply the
-    /// graph will state at `rows` rows. Returns the route the graph then takes,
-    /// which is what its cell line prints as `gemm=`.
-    ///
-    /// The gate has two halves, and both are needed:
-    ///
-    /// * `rlx_wgpu::coop_probe::f16_f32acc_path_ok()` — a per-device self-check
-    ///   of `matmul_coop_f16_f32acc`'s operand order. Without it an f16 weight
-    ///   is not routed to a slower variant of the same kernel, it falls to
-    ///   `matmul_f16_compute`, measured at 0.098 TFLOP/s against the packed
-    ///   route's measured 1.4 — an order worse than the path it would replace.
-    ///   A device that cannot pass the probe keeps the packed bytes, which is
-    ///   also the portable default.
-    /// * every linear admitting the kernel's 64×64 tile
-    ///   ([`f16_multiply_admits`]) — the encoder mixes `m` (the row count, so
-    ///   the two cells differ), `k` and `n` per projection, and one multiply
-    ///   that does not admit it would silently put that projection back on the
-    ///   f16 fallback while claiming the fast route on the cell's line.
-    ///
-    /// And two pins stand the route down entirely ([`f16_pinned`]): the stand's
-    /// `MAHBOT_EMBED_GEMM=packed`, and the backend's `RLX_WGPU_MATMUL_F32_ONLY`,
-    /// under which the arm computes in f32 whatever store was declared — keeping
-    /// the f16 residency (or printing `gemm=f16coop`) under that pin would cost
-    /// memory and claim a route nothing runs.
-    ///
-    /// Only `Class::Linear2D` plans are flipped: the `token_embd` table shares
-    /// the file's packed encoding but is read row by row on the host, and
-    /// widening it to f16 would pay for 134 M weights no multiply reads.
-    ///
-    /// # What it costs, and what it wins
-    ///
-    /// An f16-declared param costs **6 B on the device** for every 2 B of
-    /// weight: the f32-uniform arena keeps a 4 B-per-element slot that
-    /// `set_param_typed` widens into, and the kernel reads a 2 B f16 mirror of
-    /// the same slot. The 130 M weights this file multiplies therefore move from
-    /// ~138 MiB packed to ~780 MB. Measured on this record's M3 Pro, the two
-    /// arms taken back to back (`RLX_WGPU_DBG_COUNTERS=1` and the cell lines are
-    /// the record): at 8 192 rows the arena is 980.8 MiB packed against 1.31 GiB
-    /// f16, and the cell's own `peak` 0.74 GiB against 1.75–1.77 GiB; at 256 rows
-    /// the cooperative cell's arena is 547.9 MiB and its `peak` 1.63 GiB.
-    ///
-    /// The win is in the multiplies, and this doc does not apportion the pass
-    /// between them and the attention blocks — those have their own cost tests.
-    /// At 8 192 rows the cooperative arm reads **~2.31 s** warm against the
-    /// portable packed arm's **~3.45 s**, so the route is ~1.49× at this length;
-    /// at 256 rows the cooperative cell reads **~68 ms** warm. Those are the
-    /// record's two rows, quoted to the precision that does not move between
-    /// takes (the warm spread is a few milliseconds); the record carries the
-    /// figures and the runs that took them. The
-    /// cooperative kernel's measured rate is 3.07–3.66 TFLOP/s on the encoder's
-    /// six linear/FFN shapes (`tests/encoder_gemm_cost.rs`) and 3.42–3.58
-    /// TFLOP/s on the dense score squares
-    /// (`tests/attention_dense_coop_cost.rs`). What is left of the
-    /// 8 192-row pass is the twenty sliding layers' banded walk and the four
-    /// global layers' dense score squares; each call has its own cost pinned in
-    /// those tests, and summing them here would over-count the floors the fused
-    /// pass pays once.
-    ///
-    /// The win is **not portable** — it exists only where this device's
-    /// cooperative f16 kernel does, which is why the probe gates it. What *is*
-    /// portable is the route's shape (a plain `Op::MatMul` over an f16 param)
-    /// and its arithmetic (f16 operands, f32 accumulator, the reference engine's
-    /// own arrangement); a device without the kernel gets the packed route, the
-    /// packed route's numbers and the packed route's memory.
-    pub fn f16_linears(&mut self, rows: usize) -> Gemm {
-        // Re-decided from scratch: a second call for another row count must not
-        // inherit the first call's answer (the extents, not the file, decide).
-        for p in &mut self.plans {
-            if p.store == Store::F16Linear {
-                p.store = Store::Packed;
-            }
-        }
-        let shapes: Vec<(usize, usize, usize)> = self
-            .plans
-            .iter()
-            .filter(|p| p.store == Store::Packed && p.class == Class::Linear2D)
-            .map(|p| {
-                let (k, n) = p.in_out();
-                (rows, k, n)
-            })
-            .collect();
-        let forced_packed = std::env::var_os(EMBED_GEMM_ENV)
-            .is_some_and(|v| v.to_string_lossy().trim().eq_ignore_ascii_case("packed"));
-        let pinned = f16_pinned(forced_packed);
-        // The probe is a device round trip (it builds and runs the kernel), so a
-        // caller who has already pinned the route off does not pay for it.
-        let probe_ok = !pinned && rlx_wgpu::coop_probe::f16_f32acc_path_ok();
-        if !f16_route(pinned, probe_ok, &shapes) {
-            return Gemm::Packed;
-        }
-        for p in &mut self.plans {
-            if p.store == Store::Packed && p.class == Class::Linear2D {
-                p.store = Store::F16Linear;
-            }
-        }
-        Gemm::F16Coop
-    }
-
     /// The file's sampler, as the file states it: `(top_k, top_p, temperature)`.
     pub fn sampling(&self) -> (usize, f32, f32) {
         let top_k = meta_u32(&self.file, "general.sampling.top_k").unwrap_or(50) as usize;
@@ -888,10 +609,6 @@ impl Model {
 
     pub fn clip(&self) -> &ClipConfig {
         self.clip.as_ref().expect("mmproj file has a clip config")
-    }
-
-    pub fn gemma(&self) -> &GemmaConfig {
-        self.gemma.as_ref().expect("gemma file has a gemma config")
     }
 
     // ── bytes ───────────────────────────────────────────────────────
@@ -1013,7 +730,7 @@ impl Model {
     /// a per-value exponent against Q8_0's per-32 block scale, so this is a
     /// widening of the file's own precision, not a second quantisation. Peak
     /// host cost is one weight's f32 image plus its f16 image — 4 B + 2 B per
-    /// element, the largest here being a 512×2048 projection.
+    /// element, the largest here being a 1 536 × 384 MLP projection.
     pub fn linear_f16(&self, name: &str) -> Result<(Vec<u8>, usize, usize)> {
         let (vals, k, n) = self.linear_f32(name)?;
         let mut bytes = Vec::with_capacity(vals.len() * 2);
@@ -1093,220 +810,6 @@ fn merge_config(file: &GgufFile, arch: &str) -> Result<Config> {
         vocab,
         head,
     })
-}
-
-/// Merge the `gemma-embedding2.*` metadata of the embeddings file into a typed
-/// config, then check it against the file's own tensors.
-///
-/// The arrays are the reason this config exists: `attention.head_count_kv` and
-/// `attention.sliding_window_pattern` are per-layer in this file, and so is the
-/// head width (`key_length` for the global layers, `key_length_swa` for the
-/// sliding ones). Both arrays must be exactly as long as the block count, and
-/// `key_length`/`value_length` must agree with each other on both widths — the
-/// graph builds K and V at one width per layer, so a file that disagreed could
-/// only be served by silently reading one of the two.
-fn merge_gemma(file: &GgufFile, arch: &str) -> Result<GemmaConfig> {
-    let need = |suffix: &str| -> Result<String> {
-        let key = format!("{arch}.{suffix}");
-        if !file.metadata.contains_key(&key) {
-            bail!("metadata key `{key}` is missing");
-        }
-        Ok(key)
-    };
-    let u32_of = |suffix: &str| -> Result<usize> {
-        let key = need(suffix)?;
-        let value = file.metadata.get(&key).expect("key just checked");
-        value.as_u32().map(|v| v as usize).ok_or_else(|| {
-            anyhow!(
-                "metadata key `{key}` is {}, expected a u32",
-                meta_type(value)
-            )
-        })
-    };
-    let f32_of = |suffix: &str| -> Result<f32> {
-        let key = need(suffix)?;
-        let value = file.metadata.get(&key).expect("key just checked");
-        match value {
-            MetaValue::F32(v) => Ok(*v),
-            MetaValue::F64(v) => Ok(*v as f32),
-            other => bail!(
-                "metadata key `{key}` is {}, expected an f32",
-                meta_type(other)
-            ),
-        }
-    };
-
-    let layers = u32_of("block_count")?;
-    if layers == 0 {
-        bail!("`{arch}.block_count` is 0 — nothing to build");
-    }
-    // The per-layer arrays. `as_first_u32` is not what this wants: a file that
-    // carried a single scalar here would silently claim every layer is layer 0.
-    let array_of_u32 = |key: &str| -> Result<Vec<usize>> {
-        let value = file
-            .metadata
-            .get(key)
-            .ok_or_else(|| anyhow!("metadata key `{key}` is missing"))?;
-        let items = value.as_array().ok_or_else(|| {
-            anyhow!(
-                "metadata key `{key}` is {}, expected an array",
-                meta_type(value)
-            )
-        })?;
-        items
-            .iter()
-            .map(|v| {
-                v.as_u32().map(|v| v as usize).ok_or_else(|| {
-                    anyhow!("`{key}` holds a {} entry, expected a u32", meta_type(v))
-                })
-            })
-            .collect()
-    };
-    let kv_key = format!("{arch}.attention.head_count_kv");
-    let kv_heads = array_of_u32(&kv_key)?;
-    let pattern_key = format!("{arch}.attention.sliding_window_pattern");
-    let pattern_value = file
-        .metadata
-        .get(&pattern_key)
-        .ok_or_else(|| anyhow!("metadata key `{pattern_key}` is missing"))?;
-    let pattern_items = pattern_value.as_array().ok_or_else(|| {
-        anyhow!(
-            "metadata key `{pattern_key}` is {}, expected an array",
-            meta_type(pattern_value)
-        )
-    })?;
-    let sliding: Vec<bool> = pattern_items
-        .iter()
-        .map(|v| match v {
-            MetaValue::Bool(b) => Ok(*b),
-            other => Err(anyhow!(
-                "`{pattern_key}` holds a {} entry, expected a bool",
-                meta_type(other)
-            )),
-        })
-        .collect::<Result<_>>()?;
-    if kv_heads.len() != layers {
-        bail!(
-            "`{kv_key}` has {} entries, `{arch}.block_count` is {layers}",
-            kv_heads.len()
-        );
-    }
-    if sliding.len() != layers {
-        bail!(
-            "`{pattern_key}` has {} entries, `{arch}.block_count` is {layers}",
-            sliding.len()
-        );
-    }
-
-    // One width per layer type, and K's width is V's: the graph reads both out
-    // of one reshape, so two widths would have to be silently dropped.
-    let head_dim = u32_of("attention.key_length")?;
-    let head_dim_swa = u32_of("attention.key_length_swa")?;
-    for (name, want) in [
-        ("attention.value_length", head_dim),
-        ("attention.value_length_swa", head_dim_swa),
-        ("rope.dimension_count", head_dim),
-        ("rope.dimension_count_swa", head_dim_swa),
-    ] {
-        let got = u32_of(name)?;
-        if got != want {
-            bail!("`{arch}.{name}` is {got}, expected {want} (the head width it pairs with)");
-        }
-    }
-    if head_dim == 0 || head_dim_swa == 0 || !head_dim.is_multiple_of(2) {
-        bail!("head widths {head_dim} / {head_dim_swa} cannot be rotated pairwise");
-    }
-    let causal_key = format!("{arch}.attention.causal");
-    let causal = match file.metadata.get(&causal_key) {
-        Some(MetaValue::Bool(v)) => *v,
-        Some(other) => bail!(
-            "metadata key `{causal_key}` is {}, expected a bool",
-            meta_type(other)
-        ),
-        None => false,
-    };
-    if causal {
-        bail!("`{causal_key}` is set — the embedding pass is bidirectional");
-    }
-    let pooling = u32_of("pooling_type")?;
-    if pooling != 1 {
-        bail!("`{arch}.pooling_type` is {pooling} — this loader serves MEAN (1) only");
-    }
-    let window = u32_of("attention.sliding_window")?;
-    if sliding.iter().any(|s| *s) && window < 2 {
-        bail!("`{arch}.attention.sliding_window` is {window} — a sliding layer needs a band");
-    }
-
-    let d = u32_of("embedding_length")?;
-    let eps = f32_of("attention.layer_norm_rms_epsilon")?;
-    if !(eps.is_finite() && eps > 0.0) {
-        bail!(
-            "`{arch}.attention.layer_norm_rms_epsilon` is {eps} — an RMSNorm needs a positive \
-             finite epsilon, and a zero would divide by √mean with no floor"
-        );
-    }
-    let vocab = file
-        .get("token_embd.weight")
-        .map(|t| t.shape[1])
-        .ok_or_else(|| anyhow!("no `token_embd.weight` — no table to look rows up in"))?;
-    Ok(GemmaConfig {
-        layers,
-        d,
-        ffn: u32_of("feed_forward_length")?,
-        heads: u32_of("attention.head_count")?,
-        head_dim,
-        head_dim_swa,
-        kv_heads,
-        sliding,
-        window,
-        eps,
-        rope_base: f32_of("rope.freq_base")?,
-        rope_base_swa: f32_of("rope.freq_base_swa")?,
-        ple: u32_of("embedding_length_per_layer_input")?,
-        out_width: u32_of("embedding_length_out")?,
-        vocab,
-    })
-}
-
-/// Check a [`GemmaConfig`] against the file's own tensors: every per-layer
-/// array decides a projection's width, so each layer's `attn_q`, `attn_k`,
-/// `attn_v`, `attn_q_norm` and `attn_k_norm` must be as wide as the config says.
-/// A mismatch here is what "reject the file loudly" means — the alternative is a
-/// graph that reshapes one width as another and computes nonsense.
-fn check_gemma_tensors(file: &GgufFile, g: &GemmaConfig) -> Result<()> {
-    let shape = |name: &str| -> Result<Vec<usize>> {
-        file.get(name)
-            .map(|t| t.shape.clone())
-            .ok_or_else(|| anyhow!("tensor `{name}` is missing"))
-    };
-    let want = |name: &str, expect: &[usize]| -> Result<()> {
-        let got = shape(name)?;
-        if got.as_slice() != expect {
-            bail!("`{name}` is {got:?}, the config says {expect:?}");
-        }
-        Ok(())
-    };
-    for il in 0..g.layers {
-        let (hd, nkv) = (g.head_dim_of(il), g.kv_heads_of(il));
-        let p = format!("blk.{il}");
-        want(&format!("{p}.attn_q.weight"), &[g.d, g.heads * hd])?;
-        want(&format!("{p}.attn_k.weight"), &[g.d, nkv * hd])?;
-        want(&format!("{p}.attn_v.weight"), &[g.d, nkv * hd])?;
-        want(&format!("{p}.attn_output.weight"), &[g.heads * hd, g.d])?;
-        want(&format!("{p}.attn_q_norm.weight"), &[hd])?;
-        want(&format!("{p}.attn_k_norm.weight"), &[hd])?;
-        want(&format!("{p}.ffn_gate.weight"), &[g.d, g.ffn])?;
-        want(&format!("{p}.ffn_up.weight"), &[g.d, g.ffn])?;
-        want(&format!("{p}.ffn_down.weight"), &[g.ffn, g.d])?;
-        want(&format!("{p}.inp_gate.weight"), &[g.d, g.ple])?;
-        want(&format!("{p}.proj.weight"), &[g.ple, g.d])?;
-    }
-    want("token_embd.weight", &[g.d, g.vocab])?;
-    want("per_layer_model_proj.weight", &[g.d, g.layers * g.ple])?;
-    want("per_layer_proj_norm.weight", &[g.ple])?;
-    want("output.weight", &[g.d, g.out_width])?;
-    want("output_norm.weight", &[g.d])?;
-    Ok(())
 }
 
 /// Merge the `ced.*` metadata of an audio tagger into a [`CedConfig`].
@@ -1602,15 +1105,14 @@ fn merge_clip(file: &GgufFile) -> ClipConfig {
 /// * **the code vocabulary is the talker's head** — the synthesis body's
 ///   `output.weight` rows (3072) against `a.gen.code.out_embd.weight` rows;
 /// * **the head configuration** — a body paired with a sound file has to carry
-///   its own `output.weight`; the tied-table body (embeddings) has no `mmproj`
-///   at all, and a pair for it is refused.
+///   its own `output.weight`; a tied-table body has no `mmproj` at all, and a
+///   pair for it is refused.
 pub struct Pair {
     pub body: Arc<Model>,
     pub sound: Arc<Model>,
 }
 
-/// Which body goes with which `mmproj`: one row per role the stand runs. The
-/// embeddings role has no sound file.
+/// Which body goes with which `mmproj`: one row per role the crate runs.
 ///
 /// The pairing is a table rather than a rule off the names: the two halves of a
 /// pair do not share a name (the 1.7B body is `Q8_0`, its sound file `Q8_0`),
@@ -1630,7 +1132,7 @@ pub const PAIRS: &[(Role, &str, &str)] = &[
     ),
 ];
 
-/// The two file names of a role. The embeddings role has none.
+/// The two file names of a role.
 pub fn pair_files(role: Role) -> Option<(&'static str, &'static str)> {
     PAIRS
         .iter()
@@ -1639,33 +1141,24 @@ pub fn pair_files(role: Role) -> Option<(&'static str, &'static str)> {
 }
 
 impl Pair {
-    /// The pair of a role from [`PAIRS`], under [`models_dir`].
+    /// The pair of a role from [`PAIRS`], under [`models_dir`]. A role whose files
+    /// are not there is an error naming them, so a caller that has to tell an absent
+    /// pair from a broken one checks the files before asking.
     pub fn of_role(role: Role) -> Result<Self> {
-        Self::of_role_optional(role)?.ok_or_else(|| match pair_files(role) {
-            Some((body, sound)) => anyhow!(
-                "no `{}` pair — `{body}` and `{sound}` are not under the models directory",
-                role.name()
-            ),
-            None => anyhow!("no `{}` pair — pairs: {}", role.name(), PAIRS.len()),
-        })
-    }
-
-    /// [`Pair::of_role`], with a role whose files are not there reported as
-    /// `Ok(None)` instead of an error.
-    ///
-    /// A caller that skips when the pair is absent but must fail when it is present
-    /// and broken asks this, so "is this pair here" is resolved in one place rather
-    /// than re-derived from [`PAIRS`] and [`models_dir`].
-    pub fn of_role_optional(role: Role) -> Result<Option<Self>> {
         let Some((body, sound)) = pair_files(role) else {
-            return Ok(None);
+            bail!("no `{}` pair — pairs: {}", role.name(), PAIRS.len());
         };
         let dir = models_dir()?;
         let (body, sound) = (dir.join(body), dir.join(sound));
         if !(body.is_file() && sound.is_file()) {
-            return Ok(None);
+            bail!(
+                "no `{}` pair — `{}` and `{}` are not under the models directory",
+                role.name(),
+                body.display(),
+                sound.display()
+            );
         }
-        Self::open(body, sound).map(Some)
+        Self::open(body, sound)
     }
 
     /// Open both files and check that they belong together. The body file must
@@ -1760,106 +1253,5 @@ impl Pair {
         }
 
         Ok(Self { body, sound })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The pinned file's encoder config — the values its `gemma-embedding2.*`
-    /// metadata states: 24 blocks, 20 sliding at head 256 then a global one at
-    /// head 512 in every sixth slot, 2 KV heads throughout.
-    fn pinned_gemma() -> GemmaConfig {
-        GemmaConfig {
-            layers: 24,
-            d: 512,
-            ffn: 2048,
-            heads: 4,
-            head_dim: 512,
-            head_dim_swa: 256,
-            kv_heads: vec![2; 24],
-            sliding: (0..24).map(|il| il % 6 != 5).collect(),
-            window: 1024,
-            eps: 1e-6,
-            rope_base: 1_000_000.0,
-            rope_base_swa: 10_000.0,
-            ple: 512,
-            out_width: 768,
-            vocab: 262_144,
-        }
-    }
-
-    /// Every linear the encoder graph states at both cells' row counts, as
-    /// `(m, k, n)`, from [`crate::graphs::encoder_shapes`] — the same list the
-    /// stage reads its projections from. Whole on all three axes at either `m`.
-    fn encoder_shapes(rows: usize) -> Vec<(usize, usize, usize)> {
-        crate::graphs::encoder_shapes(&pinned_gemma(), rows)
-    }
-
-    /// The probe is the first gate: a device that cannot pass
-    /// `f16_f32acc_path_ok()` — the f16 route's whole point — keeps the packed
-    /// bytes, whatever the extents are. This is the device-free pin of that
-    /// refusal: the predicate never asks a device, so it is exercised on a
-    /// machine with no adapter at all.
-    #[test]
-    fn the_f16_route_is_refused_when_the_probe_fails() {
-        for rows in [256usize, 8_192] {
-            assert!(
-                f16_route(false, true, &encoder_shapes(rows)),
-                "the encoder's shapes admit the tile at {rows} rows"
-            );
-            assert!(
-                !f16_route(false, false, &encoder_shapes(rows)),
-                "a failed probe must keep the packed route at {rows} rows"
-            );
-        }
-    }
-
-    /// Either pin keeps the packed route: the stand's own, and the backend's
-    /// absolute f32 pin, read through the predicate the store rule calls — so the
-    /// pin reaches the store, not only the arm. Under it the f16 residency and the
-    /// `gemm=f16coop` witness would both be false.
-    #[test]
-    fn the_backend_f32_pin_keeps_the_encoder_packed() {
-        let shapes = encoder_shapes(8_192);
-        assert!(
-            f16_route(f16_pinned(false), true, &shapes),
-            "with neither pin set the encoder's shapes take the cooperative route"
-        );
-        let _pin = rlx_ir::env::RuntimeOverrides::install(Some(("RLX_WGPU_MATMUL_F32_ONLY", "1")));
-        assert!(f16_pinned(false));
-        assert!(!f16_route(f16_pinned(false), true, &shapes));
-    }
-
-    /// The explicit switch, and the extent gate underneath it: one multiply that
-    /// does not admit the 64×64 tile keeps **every** linear packed, because an
-    /// f16 weight on an unadmitted shape falls to `matmul_f16_compute` — slower
-    /// than the packed route it would replace.
-    #[test]
-    fn one_unadmitted_multiply_keeps_the_whole_graph_packed() {
-        let mut shapes = encoder_shapes(8_192);
-        assert!(f16_route(false, true, &shapes));
-        assert!(!f16_route(true, true, &shapes), "MAHBOT_EMBED_GEMM=packed");
-        // `m` is the row count: a graph whose rows are not a whole number of
-        // 64-row tiles is the case the two cells do not have and a caller can.
-        assert!(!f16_route(false, true, &encoder_shapes(8_190)));
-        // ... and so is one projection whose `n` or `k` misses its own alignment.
-        shapes.push((8_192, 512, 7_680 + 8));
-        assert!(!f16_route(false, true, &shapes));
-        shapes.pop();
-        shapes.push((8_192, 512 + 16, 512));
-        assert!(!f16_route(false, true, &shapes));
-        shapes.pop();
-        assert!(
-            f16_route(false, true, &shapes),
-            "restoring it restores the route"
-        );
-    }
-
-    /// An empty shape list is a graph with no linear at all — nothing to route.
-    #[test]
-    fn a_graph_with_no_linear_takes_no_f16_route() {
-        assert!(!f16_route(false, true, &[]));
     }
 }

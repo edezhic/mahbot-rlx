@@ -2,16 +2,15 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Measurement only and `#[ignore]`d: the cell's pinned waveform through the
-//! library path, the shipped predictor frame's time with its steps counted by
-//! kind, and the sixteen-level stack's rate against sixteen single-row reads.
+//! Measurement only and `#[ignore]`d: the pinned waveform through the library
+//! path, the shipped predictor frame's time with its steps counted by kind, and
+//! the sixteen-level stack's rate against sixteen single-row reads.
 //!
-//! **The waveform.** `Synthesis::synthesize` on the cell's own text and seed,
-//! printed against the pinned digest as a witness: the stand walks its own copy of
-//! the loop, so this is where the library path's waveform is seen, and a moved
-//! digest is the record's line, not a failure here.
+//! **The waveform.** `Synthesis::synthesize` on the pinned text and seed, printed
+//! against the pinned digest as a witness: a moved digest is recorded and reported,
+//! not a failure here.
 //!
-//! **The frame.** One row, one compile, the cell's own sampler: the frame is
+//! **The frame.** One row, one compile, the frame's own sampler: the frame is
 //! `steps + 1` levels over a carried plane cache, and its schedule is counted by
 //! step. The counts are not a price — `multiply_census` stands the frame's kinds
 //! down one at a time for that, each arm's delta taken against the shipped frame.
@@ -28,9 +27,9 @@
 
 use std::sync::Arc;
 
+use mahbot_inference::graphs;
 use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::synth::Synthesis;
-use mahbot_inference::{graphs, stand};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{Op, Tick};
 
@@ -40,7 +39,7 @@ use support::{
     arm_once, call_of, frame_arm, last_dim, least, median, packed_ramp, step_census, steps_for,
 };
 
-/// The stand's speak seed: the frame this file measures is the cell's frame.
+/// The seed the pinned synthesis witness was taken with.
 const SEED: u64 = 12_345;
 /// The gather index-add fold's arm the frame is timed under, installed around its
 /// compile and printed with the frame, so the number carries the arm it belongs to.
@@ -146,7 +145,7 @@ fn the_predictor_frame_its_chain_and_the_stacks_ratio() {
         Synthesis::new(pair.clone(), &voice).expect("compile the synthesis pipeline");
     let t = Tick::now();
     let wave = synthesis
-        .synthesize(stand::TTS_TEXT, SEED)
+        .synthesize(support::TTS_TEXT, SEED)
         .expect("the shipped walk's sound half");
     let synth_ms = Tick::now().elapsed_ns(t) as f64 / 1e6;
     let digest = mahbot_inference::report::digest(&wave);
@@ -160,7 +159,7 @@ fn the_predictor_frame_its_chain_and_the_stacks_ratio() {
     );
     drop(synthesis);
 
-    // The cell's own frame: its shapes, its time and its steps by kind. The fold's
+    // The frame's own arrangement: its shapes, its time and its steps by kind. The fold's
     // switch is pinned, so an ambient value cannot move the baseline.
     let steps = graphs::code_predictor_steps(&pair.sound).expect("predictor head count");
     let (top_k, top_p, temperature) = pair.body.sampling();
@@ -210,7 +209,7 @@ fn the_predictor_frame_its_chain_and_the_stacks_ratio() {
         .collect();
     let frame_ms = least(&samples);
     // The walk covers `steps + 1` levels — level 0 is the head-less body — and the
-    // per-level figure is the stand's convention, one convention for both.
+    // per-level figure is one convention for both.
     let levels = steps + 1;
     println!(
         "draft frame gather_index_bias_disabled={GATHER_ARM} ms={frame_ms:.3} levels={levels} \

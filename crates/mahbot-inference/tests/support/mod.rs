@@ -2,13 +2,15 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Assertions the cell's gates share, and the measurement helpers the harnesses
-//! that price packed multiplies share with them.
+//! What the measurement tests share: the pinned listen witness and the
+//! conditioning its answer was taken with, and the helpers the harnesses that
+//! price packed multiplies use.
 
 #![allow(dead_code)] // each binary takes the subset it uses
 
 use mahbot_inference::graphs;
 use mahbot_inference::loader::Pair;
+use mahbot_inference::tokenizer::Tokenizer;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape, Tick};
 use rlx_runtime::{Device, Session};
@@ -207,6 +209,99 @@ pub fn step_census(names: &[&'static str]) -> String {
 /// Packed bytes one harness call streams, so a call is long enough to leave its own
 /// submission behind.
 pub const TARGET_BYTES: u64 = 96 * 1024 * 1024;
+
+// ── the recognition walk's own helpers ──────────────────────────────
+
+/// The synthesis text condition the measurement harnesses reproduce a served
+/// request with: long enough to fill the model's whole 300-token text capacity.
+pub const TTS_TEXT: &str = "Call me Ishmael. Some years ago, never mind how long precisely, having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world. It is a way I have of driving off the spleen and regulating the circulation. Whenever I find myself growing grim about the mouth; whenever it is a damp, drizzly November in my soul; whenever I find myself involuntarily pausing before coffin warehouses, and bringing up the rear of every funeral I meet; and especially whenever my hypos get such an upper hand of me, that it requires a strong moral principle to prevent me from deliberately stepping into the street, and methodically knocking people's hats off, then I account it high time to get to sea as soon as I can. This is my substitute for pistol and ball. With a philosophical flourish Cato throws himself upon his sword; I quietly take to the ship. There is nothing surprising in this. If they but knew it, almost all men in their degree, some time or other, cherish very nearly the same feelings towards the ocean with me.";
+
+/// What the single-shot recognition walk answered, for a harness that prices a
+/// decode change.
+pub struct Answer {
+    pub generated: Vec<usize>,
+    pub next: usize,
+    pub frames: usize,
+    pub prompt_rows: usize,
+    pub capacity: usize,
+    pub text: String,
+    pub digest: u64,
+    pub decode_ms: f64,
+    pub build_ms: f64,
+}
+
+/// One recognition walk over `path`: 16 kHz mono, conditioned the way the one-shot
+/// path takes it. The caller opened the pair and resolved the path, so a failure
+/// here is a broken model or device, not an absent input: it panics, because a
+/// check that cannot run must not report a pass.
+pub fn listen_answer(pair: &std::sync::Arc<Pair>, path: &std::path::Path) -> Answer {
+    let tokenizer = Tokenizer::from_model(&pair.body)
+        .unwrap_or_else(|error| panic!("the recognition tokenizer: {error:#}"));
+    let mut audio = mahbot_inference::host::wav_mono_16k(
+        &path.display().to_string(),
+        0,
+        mahbot_inference::listen::PASS_SAMPLES,
+    )
+    .unwrap_or_else(|error| panic!("reading {}: {error:#}", path.display()));
+    prepare_speech(&mut audio);
+    let walk = mahbot_inference::listen::recognise(pair, &tokenizer, audio)
+        .unwrap_or_else(|error| panic!("recognising {}: {error:#}", path.display()));
+    Answer {
+        generated: walk.generated,
+        next: walk.next,
+        frames: walk.frames,
+        prompt_rows: walk.prompt_rows,
+        capacity: walk.capacity,
+        text: walk.text,
+        digest: mahbot_inference::report::digest(&walk.values),
+        decode_ms: if walk.decode_times.is_empty() {
+            0.0
+        } else {
+            median(&walk.decode_times)
+        },
+        build_ms: walk.build_ms,
+    }
+}
+
+/// The listen witness: the pins compared against the walk's own reading, through
+/// the reference's one rule. Answers whether every pin held — `false` prints which
+/// one moved — and the pinned-clip check asserts on it after refusing a walk over an
+/// input that is not the recorded clip.
+pub fn witness_listen(answer: &Answer) -> bool {
+    mahbot_inference::reference::check_listen(
+        answer.frames,
+        answer.prompt_rows,
+        answer.generated.len(),
+        answer.digest,
+        &answer.text,
+    )
+}
+
+/// The one-shot path's conditioning: drop a loud, non-speech opening, then lift a
+/// quiet recording with the crate's one gain rule. Both are time-preserving or
+/// the walk is not of this audio; the product's segmented path conditions the whole
+/// input instead and never reuses this.
+pub fn prepare_speech(audio: &mut Vec<f32>) {
+    const WIN: usize = 800;
+    const HEAD: usize = 2 * 16_000;
+    let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+    if audio.len() > HEAD + WIN {
+        let head_rms = rms(&audio[..HEAD]);
+        let mut body: Vec<f32> = audio[HEAD..].chunks_exact(WIN).map(rms).collect();
+        body.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let body_rms = body[body.len() / 2];
+        if head_rms > 0.01 && head_rms > 4.0 * body_rms {
+            audio.drain(..HEAD);
+        }
+    }
+    let gain = mahbot_inference::host::speech_gain(audio);
+    if gain != 1.0 {
+        for value in audio.iter_mut() {
+            *value *= gain;
+        }
+    }
+}
+
 /// A ceiling on a call's copies, so a small shape does not compile a graph of
 /// thousands of steps.
 const MAX_STEPS: usize = 256;
@@ -272,16 +367,13 @@ pub fn steps_for(packed: u64, target: u64) -> usize {
     ((target / packed.max(1)) as usize).clamp(1, MAX_STEPS)
 }
 
-/// The music pool, verified pin by pin, or the reason the caller cannot run: an
-/// unset `MAHBOT_ASR_MUSIC` is an absent corpus and the caller says why it did not
+/// The music pool, verified pin by pin, or the reason the caller cannot run: a pool
+/// directory that is not named is an absent corpus and the caller says why it did not
 /// run, while a pool the run was pointed at and that fails to verify is a broken
 /// provision and panics here rather than reading unverified audio.
 pub fn pool() -> Option<Vec<std::path::PathBuf>> {
-    if std::env::var_os(mahbot_inference::music::DIR_ENV).is_none_or(|v| v.is_empty()) {
-        println!(
-            "skip: {} is not set — point it at the music pool's directory",
-            mahbot_inference::music::DIR_ENV
-        );
+    if let Err(error) = mahbot_inference::music::dir() {
+        println!("skip: {error:#}");
         return None;
     }
     Some(

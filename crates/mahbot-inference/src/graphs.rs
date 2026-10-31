@@ -2,21 +2,19 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The three role graphs, assembled on `rlx-flow`.
+//! The role graphs, assembled on `rlx-flow`.
 //!
 //! Each graph is one `ModelFlow` plus one `LayerStage`; the stage emits the
 //! blocks through the loader's helpers (`emit.rs`) and the flow carries the
 //! result to a `Graph` a session can compile. Every decision that shapes the
 //! graphs is visible here: the sound stage is a separate graph from the body and runs
 //! host-unpacked weights, ConvTranspose uses the backend's transposed
-//! convolution, the embeddings file's table rows are read by the stand and enter
-//! the encoder as its input, and the codec reads its codebook by index.
+//! convolution, and the codec reads its codebook by index.
 //!
-//! Shapes are taken from the files themselves (`Config` / `ClipConfig` /
-//! `GemmaConfig` merged from the metadata), not written down as constants: that
-//! is the point of doing the loading ourselves.
+//! Shapes are taken from the files themselves (`Config` / `ClipConfig` merged
+//! from the metadata), not written down as constants: that is the point of doing
+//! the loading ourselves.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,7 +26,7 @@ use rlx_ir::{DType, HirNodeId, Op, Shape};
 use rlx_runtime::{Device, Session};
 
 use crate::emit::{self, LoaderWeights, PairWeights};
-use crate::loader::{Gemm, GemmaConfig, Head, Model, Pair, Store};
+use crate::loader::{Head, Model, Pair};
 
 // ── generic block: Qwen3 body and CLIP encoder are the same skeleton ──
 
@@ -232,7 +230,6 @@ pub fn block(
         b.head_dim,
         kind,
         &[m / seq, b.heads, seq, b.head_dim],
-        None,
     );
     let a = if seq == 1 {
         emit::reshape(ctx, a, &[m as i64, (b.heads * b.head_dim) as i64])
@@ -323,9 +320,9 @@ pub fn block(
 /// scale badly with a batch axis — the conv route costs a window's worth of work
 /// per window whatever `n` is — while everything after them
 /// ([`EncoderTail`]) is linear, norm and attention, which one pass can carry for
-/// a whole group. [`asr_encoder`] chains the two into the one graph the stand
-/// measures; [`asr_encoder_front`] and [`asr_encoder_tail`] expose the pieces for
-/// the bench's grouped passes.
+/// a whole group. [`asr_encoder`] chains the two into the one graph the recognition
+/// and wake paths run; [`asr_encoder_front`] and [`asr_encoder_tail`] expose the
+/// pieces for the bench's grouped passes.
 pub struct EncoderConvs {
     pub model: Arc<Model>,
     pub frames: usize,
@@ -349,8 +346,7 @@ impl LayerStage for EncoderConvs {
         // axes halve every time, so the token count is frames/8 once the mel
         // axis has bottomed out at 128/8 = 16.
         let mut cur_len = self.frames;
-        // Declared height of the current tensor (honest: halving from
-        // `mel_bins`; the earlier stand's lie: a constant `mel_bins/2`).
+        // Declared height of the current tensor: it halves from `mel_bins`.
         let mut hh = c.mel_bins;
         for i in 1..=3usize {
             let name = format!("a.conv2d.{i}.weight");
@@ -479,7 +475,7 @@ impl LayerStage for EncoderTail {
 }
 
 /// The recognition sound graph for a mel window of `frames` frames: the convs
-/// and the tail chained into one graph — the graph the stand's cells measure.
+/// and the tail chained into one graph.
 pub fn asr_encoder(model: Arc<Model>, frames: usize) -> Result<BuiltModel> {
     let c = model.clip().clone();
     let mut weights = LoaderWeights::new(model.clone());
@@ -585,7 +581,7 @@ impl LayerStage for ProjectorStage {
     }
 }
 
-/// The compile profile every graph in this stand uses.
+/// The compile profile every graph in this crate uses.
 ///
 /// `Direct` lowering. A `fusion.skip` field is not a switch the engine reads;
 /// fusion is controlled by `skip_fusion` / `RLX_METAL_NO_FUSION`, so
@@ -596,350 +592,31 @@ pub fn profile() -> rlx_flow::CompileProfile {
     p
 }
 
-// ── the embeddings encoder (EmbeddingGemma 2's text tower) ─────────
-
-/// The band an encoder layer attends over, as the graph states it.
-///
-/// A two-sided band is only a restriction once the sequence is longer than the
-/// band: at `rows <= radius + 1` the farthest pair of rows, `(0, rows - 1)`, is
-/// still within `radius`, so every query reaches every key and
-/// [`MaskKind::None`] names the same set of keys without stating a band. The
-/// twenty sliding layers therefore state [`MaskKind::Window`] at 8 192 rows and
-/// no mask at 256. The four global layers are dense at every length and state
-/// [`MaskKind::None`]; which kernel serves either statement is the backend
-/// router's decision, not the graph's.
-#[must_use]
-pub fn window_mask(rows: usize, radius: usize) -> MaskKind {
-    if rows <= radius + 1 {
-        MaskKind::None
-    } else {
-        MaskKind::Window(radius)
-    }
-}
-
-/// The nine linear projections one encoder block multiplies, as
-/// `(weight suffix, k, n)`, in the order the block emits them.
-///
-/// The stage reads its keys and extents from this one list, and the loader's
-/// route tests admit their multiplies against it, so a projection added to a
-/// block cannot drift between the graph and the f16 route's admission check.
-#[must_use]
-pub fn encoder_block_linears(
-    d: usize,
-    heads: usize,
-    head_dim: usize,
-    kv_heads: usize,
-    ffn: usize,
-    ple: usize,
-) -> [(&'static str, usize, usize); 9] {
-    [
-        ("attn_q.weight", d, heads * head_dim),
-        ("attn_k.weight", d, kv_heads * head_dim),
-        ("attn_v.weight", d, kv_heads * head_dim),
-        ("attn_output.weight", heads * head_dim, d),
-        ("ffn_gate.weight", d, ffn),
-        ("ffn_up.weight", d, ffn),
-        ("ffn_down.weight", ffn, d),
-        ("inp_gate.weight", d, ple),
-        ("proj.weight", ple, d),
-    ]
-}
-
-/// Every linear the encoder graph states at `rows` rows, as `(m, k, n)`: the
-/// per-block list above for each layer, then the per-layer-input projection and
-/// the output projection. The stage and the loader's route tests read this one
-/// list.
-#[must_use]
-pub fn encoder_shapes(g: &GemmaConfig, rows: usize) -> Vec<(usize, usize, usize)> {
-    let mut out = Vec::with_capacity(2 + g.layers * 9);
-    out.push((rows, g.d, g.layers * g.ple));
-    for il in 0..g.layers {
-        for (_, k, n) in encoder_block_linears(
-            g.d,
-            g.heads,
-            g.head_dim_of(il),
-            g.kv_heads_of(il),
-            g.ffn,
-            g.ple,
-        ) {
-            out.push((rows, k, n));
-        }
-    }
-    out.push((rows, g.d, g.out_width));
-    out
-}
-
-/// The encoder's one pass: the looked-up embedding rows in, the pooled
-/// 768-wide vector out — one graph over all rows, bidirectional, with no
-/// padding anywhere.
-///
-/// The layer is the reference's (`models/gemma-embedding2.cpp`), in its order:
-/// `attn_norm → q/k/v → per-head q/k norms and an unweighted V norm → RoPE at
-/// the layer's own base → attention (scale 1: the q/k norms replace `1/√d`) →
-/// `attn_output → post_attention_norm` → residual → `ffn_norm → gate·up (tanh
-/// GELU) → down → post_ffw_norm` → residual → the per-layer-input block
-/// (`inp_gate`·GELU · this layer's PLE slice → `proj` → `post_norm` → residual)
-/// → one scalar `layer_output_scale`. The per-layer inputs are computed once,
-/// before the stack, from the **scaled** embedding.
-///
-/// The mean over the rows — BOS and EOS included, as the reference engine's
-/// `--pooling mean` — is in the graph; the L2 normalisation is not, so the
-/// graph's output is the raw 768-vector and the record digests the normalised
-/// one the stand makes of it.
-pub struct EncoderStage {
-    pub model: Arc<Model>,
-    pub rows: usize,
-}
-
-impl LayerStage for EncoderStage {
-    fn name(&self) -> &str {
-        "gemma_encoder"
-    }
-
-    fn emit_layer(
-        &self,
-        ctx: &mut FlowCtx<'_>,
-        input: FlowValue,
-    ) -> Result<(FlowValue, StageArtifacts)> {
-        let model = &self.model;
-        let g = model.gemma();
-        let rows = self.rows;
-        let (d, heads, eps) = (g.d, g.heads, g.eps);
-        let rows_i = rows as i64;
-
-        // The embedding is scaled by `√d` before anything reads it — the
-        // reference's `build_inp_embd(tok_embd, sqrtf(n_embd))`, and the PLE
-        // projection is over the scaled value, not the table's rows.
-        let root = emit::constant(ctx, &[1], (d as f32).sqrt());
-        let mut x = emit::mul(ctx, input.hir_id(), root);
-
-        // ── the per-layer inputs, once for the whole stack ──
-        // `[rows, d] → [rows, layers · ple]` in one multiply, the `1/√d` scale,
-        // then the file's flat axis read as `[layers, ple]` with `ple` fastest
-        // (the file is `[n_embd, n_embd_per_layer · n_layer]`), one RMSNorm over
-        // each layer's own 512.
-        let w = FlowValue::new(x, Shape::new(&[rows, d], DType::F32));
-        let ple = emit::linear_encoder(ctx, model, &w, "per_layer_model_proj.weight")?;
-        let inv_root = emit::constant(ctx, &[1], 1.0 / (d as f32).sqrt());
-        let ple = emit::mul(ctx, ple.hir_id(), inv_root);
-        let ple = emit::reshape(ctx, ple, &[rows_i, g.layers as i64, g.ple as i64]);
-        let ple2 = emit::reshape(ctx, ple, &[(rows * g.layers) as i64, g.ple as i64]);
-        let gamma = emit::f32_param(ctx, model, "per_layer_proj_norm.weight", &[g.ple])?;
-        let ple2 = emit::rms_norm(ctx, ple2, gamma, eps, &[rows * g.layers, g.ple]);
-        let per_layer = emit::reshape(ctx, ple2, &[rows_i, g.layers as i64, g.ple as i64]);
-
-        // V carries no learnable norm in this file: an RMSNorm whose scale is
-        // one at the layer's own head width, not a missing step.
-        let ones_swa = emit::constant(ctx, &[g.head_dim_swa], 1.0);
-        let ones = emit::constant(ctx, &[g.head_dim], 1.0);
-
-        for il in 0..g.layers {
-            let p = format!("blk.{il}");
-            let hd = g.head_dim_of(il);
-            let nkv = g.kv_heads_of(il);
-            let lin = encoder_block_linears(d, heads, hd, nkv, g.ffn, g.ple);
-            let key = |i: usize| format!("{p}.{}", lin[i].0);
-            let qw = lin[0].2 as i64;
-            let kw = lin[1].2 as i64;
-            // One table pair per layer type: the twenty sliding layers rotate at
-            // the same width and base, so they share the two leaves.
-            let base = g.rope_base_of(il);
-            let (cos, sin) = emit::rope_tables(
-                ctx,
-                if g.is_sliding(il) {
-                    "rope_swa"
-                } else {
-                    "rope_global"
-                },
-                rows,
-                hd,
-                base,
-            );
-
-            let gamma = emit::f32_param(ctx, model, &format!("{p}.attn_norm.weight"), &[d])?;
-            let h = emit::rms_norm(ctx, x, gamma, eps, &[rows, d]);
-            let [q, k, v] = emit::qkv(ctx, model, h, rows, d, [&key(0), &key(1), &key(2)])?;
-            // Per-head norms: reshape to `[rows · heads, head_dim]` so the
-            // last-axis RMSNorm is one head's own, then back onto the row axis
-            // for the rotation (the rope step reads the row as `[-2]`).
-            let r = emit::reshape(ctx, q, &[(rows * heads) as i64, hd as i64]);
-            let gamma = emit::f32_param(ctx, model, &format!("{p}.attn_q_norm.weight"), &[hd])?;
-            let q = emit::rms_norm(ctx, r, gamma, eps, &[rows * heads, hd]);
-            let r = emit::reshape(ctx, k, &[(rows * nkv) as i64, hd as i64]);
-            let gamma = emit::f32_param(ctx, model, &format!("{p}.attn_k_norm.weight"), &[hd])?;
-            let k = emit::rms_norm(ctx, r, gamma, eps, &[rows * nkv, hd]);
-            let r = emit::reshape(ctx, v, &[(rows * nkv) as i64, hd as i64]);
-            let unit = if hd == g.head_dim_swa { ones_swa } else { ones };
-            let v = emit::rms_norm(ctx, r, unit, eps, &[rows * nkv, hd]);
-            let q = emit::reshape(ctx, q, &[1, rows_i, qw]);
-            let k = emit::reshape(ctx, k, &[1, rows_i, kw]);
-            let q = emit::h(ctx).rope(q, cos, sin, hd);
-            let k = emit::h(ctx).rope(k, cos, sin, hd);
-            // Rows-first `[1, rows, heads, head_dim]`, declared and not
-            // transposed: the route reads the layout off the extents (axis 1 is
-            // the row count here, not the head count) and the strides follow, so
-            // a transpose would only move the same elements twice.
-            let q = emit::reshape(ctx, q, &[1, rows_i, heads as i64, hd as i64]);
-            let k = emit::reshape(ctx, k, &[1, rows_i, nkv as i64, hd as i64]);
-            let v = emit::reshape(ctx, v, &[1, rows_i, nkv as i64, hd as i64]);
-            let mask = if g.is_sliding(il) {
-                window_mask(rows, g.window_radius())
-            } else {
-                MaskKind::None
-            };
-            let a = emit::attention(
-                ctx,
-                q,
-                k,
-                v,
-                heads,
-                hd,
-                mask,
-                &[1, rows, heads, hd],
-                Some(1.0),
-            );
-            let a = emit::reshape(ctx, a, &[rows_i, qw]);
-            let o = emit::linear_encoder(
-                ctx,
-                model,
-                &FlowValue::new(a, Shape::new(&[rows, lin[3].1], DType::F32)),
-                &key(3),
-            )?;
-            let gamma =
-                emit::f32_param(ctx, model, &format!("{p}.post_attention_norm.weight"), &[d])?;
-            let o = emit::rms_norm(ctx, o.hir_id(), gamma, eps, &[rows, d]);
-            let attn_out = emit::add(ctx, x, o);
-
-            let gamma = emit::f32_param(ctx, model, &format!("{p}.ffn_norm.weight"), &[d])?;
-            let f = emit::rms_norm(ctx, attn_out, gamma, eps, &[rows, d]);
-            let w = FlowValue::new(f, Shape::new(&[rows, lin[4].1], DType::F32));
-            let gate = emit::linear_encoder(ctx, model, &w, &key(4))?;
-            // `GGML_GELU` in the reference is the **tanh** fit, not the erf form:
-            // `0.5 x (1 + tanh(√(2/π)(x + 0.044715 x³)))`.
-            let gate = emit::act(ctx, Activation::GeluApprox, gate.hir_id(), &[rows, g.ffn]);
-            let w = FlowValue::new(f, Shape::new(&[rows, lin[5].1], DType::F32));
-            let up = emit::linear_encoder(ctx, model, &w, &key(5))?;
-            let f = emit::mul(ctx, gate, up.hir_id());
-            let w = FlowValue::new(f, Shape::new(&[rows, lin[6].1], DType::F32));
-            let f = emit::linear_encoder(ctx, model, &w, &key(6))?;
-            let gamma = emit::f32_param(ctx, model, &format!("{p}.post_ffw_norm.weight"), &[d])?;
-            let f = emit::rms_norm(ctx, f.hir_id(), gamma, eps, &[rows, d]);
-            x = emit::add(ctx, attn_out, f);
-
-            // ── the per-layer-input block ──
-            let w = FlowValue::new(x, Shape::new(&[rows, lin[7].1], DType::F32));
-            let gated = emit::linear_encoder(ctx, model, &w, &key(7))?;
-            let gated = emit::act(ctx, Activation::GeluApprox, gated.hir_id(), &[rows, g.ple]);
-            let slice = emit::narrow(ctx, per_layer, 1, il, 1);
-            let slice = emit::reshape(ctx, slice, &[rows_i, g.ple as i64]);
-            let gated = emit::mul(ctx, gated, slice);
-            let w = FlowValue::new(gated, Shape::new(&[rows, lin[8].1], DType::F32));
-            let out = emit::linear_encoder(ctx, model, &w, &key(8))?;
-            let gamma = emit::f32_param(ctx, model, &format!("{p}.post_norm.weight"), &[d])?;
-            let out = emit::rms_norm(ctx, out.hir_id(), gamma, eps, &[rows, d]);
-            let x_ple = emit::add(ctx, x, out);
-            // A scalar per layer (1.0 in this file), applied to the layer's whole
-            // output rather than to one branch.
-            let scale =
-                emit::f32_param(ctx, model, &format!("{p}.layer_output_scale.weight"), &[1])?;
-            x = emit::mul(ctx, x_ple, scale);
-        }
-
-        let gamma = emit::f32_param(ctx, model, "output_norm.weight", &[d])?;
-        let x = emit::rms_norm(ctx, x, gamma, eps, &[rows, d]);
-        let w = FlowValue::new(x, Shape::new(&[rows, d], DType::F32));
-        let out = emit::linear_encoder(ctx, model, &w, "output.weight")?;
-        // Mean over *all* rows, BOS and EOS included — no padding to exclude.
-        // The projection is linear, so pooling before or after it is the same
-        // arithmetic; this order is the reference's.
-        let pooled = emit::h(ctx).mean(out.hir_id(), vec![0], true);
-        let pooled = emit::reshape(ctx, pooled, &[g.out_width as i64]);
-        let sh = Shape::new(&[g.out_width], DType::F32);
-        Ok((
-            FlowValue::new(pooled, sh.clone()),
-            StageArtifacts::hidden_only(sh),
-        ))
-    }
-}
-
-/// The embeddings graph: `rows` embedding rows (already looked up from the
-/// table, `[rows, d]`, unscaled) → the pooled 768-wide vector.
-///
-/// The rows arrive looked up rather than as ids because the table's used rows
-/// are the cell's own: the stand reads them with
-/// [`Model::table_rows_f32`](crate::loader::Model::table_rows_f32) (one row per
-/// position, ~16 MiB at 8 192 rows) and binds them as this graph's input. The
-/// whole `token_embd` table as a `Param` would be half a gigabyte of f32 for
-/// 262 144 rows, and an in-graph `Gather` over it would read from a leaf nobody
-/// needs.
-///
-/// Which route the projections take is the *model's* decision, taken before the
-/// graph is built ([`Model::f16_linears`]): this function builds whatever the
-/// plans say. It also owns the other half of that route — the f16 image of each
-/// weight the store rule flipped, dequantised here and handed to
-/// `set_param_typed` — so a graph built from packed plans never pays for it.
-/// The f16 route's compile needs the weight-concat fusions off; the switch is
-/// installed by [`compile_encoder`], not here.
-pub fn encoder(model: Arc<Model>, rows: usize) -> Result<BuiltModel> {
-    let cfg = model.gemma().clone();
-    if rows < 3 {
-        bail!("an embedding cell needs at least BOS + one token + EOS, got {rows} rows");
-    }
-    let mut weights = LoaderWeights::new(model.clone());
-    let flow = ModelFlow::new(format!("embed_{rows}"))
-        .with_profile(profile())
-        .input("x", Shape::new(&[rows, cfg.d], DType::F32))
-        .layer_stage(EncoderStage {
-            model: model.clone(),
-            rows,
-        })
-        .output("emb");
-    let mut built = flow.build(&mut weights)?;
-    // The f16 route's bytes. `emit::linear_encoder` declared one f16 `Param` per
-    // weight the store rule flipped and no f32 data, so the session is handed
-    // the f16 image here — `set_param_typed(name, bytes, DType::F16)`, drained
-    // by the runner exactly like a packed blob. Dequantising here rather than at
-    // open keeps a route the device refuses from costing a byte of host memory.
-    for plan in model.plans.iter().filter(|p| p.store == Store::F16Linear) {
-        let (bytes, ..) = model.linear_f16(&plan.name)?;
-        built
-            .typed_params
-            .push((plan.name.clone(), bytes, DType::F16));
-    }
-    Ok(built)
-}
-
-/// Compile an encoder-style graph — the embedding encoder and the tagger's ViT —
-/// with the weight-concat fusions off for the one compile that reads the switch,
-/// restoring the process's previous overrides on return.
+/// Compile an encoder-style graph — the tagger's ViT — with the weight-concat
+/// fusions off for the one compile that reads the switch, restoring the
+/// process's previous overrides on return.
 ///
 /// `FuseSharedInputMatMul` builds q/k/v — and gate/up — as ONE `Concat` over
 /// the three weights. That takes the multiply's B out of the `Param` role, and
 /// every cooperative f16 family is admitted only for a weight-side `Param`;
 /// worse, the F16 `Concat` node makes the runtime's `prepare_f32_exec_graph` see
 /// a low-precision *arithmetic* node and promote the whole graph to f32, which
-/// takes the remaining 97 multiplies off the kernel too. Measured at 8 192 rows
-/// on the M3 Pro (the cell line's own figures): 5.27 s with the fusion on —
-/// every multiply on the f32 cooperative kernel — and 3.97 s with it off, all
-/// 217 on the f16 one.
+/// takes every multiply the graph has left off the kernel too.
 ///
 /// The switch is process-global, so it is installed here, around this compile,
 /// and restored on return. Installing it while the graph is built would leak it
-/// into every later compile in the process, and the packed and f16 arms the
-/// record compares would then differ in fusion as well as precision. The
-/// override map has no atomicity of its own, so a second compile in the same
-/// process would see this one's install or its restore mid-flight.
-pub fn compile_encoder(device: Device, built: BuiltModel, gemm: Gemm) -> Result<Compiled> {
+/// into every later compile in the process, and two compiles of one graph would
+/// then differ in fusion as well as precision. The override map has no atomicity
+/// of its own, so a second compile in the same process would see this one's
+/// install or its restore mid-flight.
+pub fn compile_encoder(device: Device, built: BuiltModel) -> Result<Compiled> {
     static FUSION_SCOPE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // Every compile takes the lock, not only the arm that installs: a compile
-    // that installs nothing must still not observe another's override, and the
-    // arm is chosen from a process-global read. Declared before the override, so
-    // the override is restored before the lock is released.
+    // The lock is declared before the override, so the override is restored before
+    // the lock is released.
     let _scope = FUSION_SCOPE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _fusions = (gemm == Gemm::F16Coop)
-        .then(|| rlx_ir::env::RuntimeOverrides::install([("RLX_NO_WEIGHT_CONCAT_FUSION", "1")]));
+    let _fusions = rlx_ir::env::RuntimeOverrides::install([("RLX_NO_WEIGHT_CONCAT_FUSION", "1")]);
     Compiled::new(device, built)
 }
 
@@ -1193,8 +870,8 @@ impl LayerStage for BodyStateStage {
                 let (kp, vp) = planes[gi];
                 if m == 1 {
                     // The step's own row lands in the spare row, in-graph: the
-                    // operand is then `[cache rows; the new row]`, the same operand
-                    // the concat used to build, with no pass over the cache.
+                    // operand is then `[cache rows; the new row]`, the operand a
+                    // concat would build, with no pass over the cache.
                     let k_app = emit::h(ctx).kv_append(kp, k_row, 0, pre);
                     let v_app = emit::h(ctx).kv_append(vp, v_row, 0, pre);
                     (
@@ -2133,8 +1810,8 @@ pub fn code_predictor_steps(model: &Model) -> Result<usize> {
 /// The draw seeds one predictor frame's `steps` samplers read: level `s` uses
 /// `seed + draw_index + s`, the seed the reference walk hands `host::draw`. Empty
 /// when the sampler lowered to `Argmax` — a greedy walk reads no seed. One helper
-/// for both walks (the crate's own path and the measuring stand), because the two
-/// must agree bit-exactly or the pinned waveform moves.
+/// for the crate's synthesis path, which must reproduce the pinned waveform
+/// bit-exactly.
 pub fn predictor_draw_seeds(
     seed: u64,
     draw_index: u64,
@@ -2366,10 +2043,10 @@ fn f32_values(ctx: &mut FlowCtx<'_>, dims: &[usize], values: &[f32]) -> HirNodeI
         .mir(Op::Constant { data }, vec![], Shape::new(dims, DType::F32))
 }
 
-/// One code-predictor frame as **one graph**: the sixteen-level walk that used to
-/// be sixteen `run`s — level 0's head-less body, then every projecting level with
-/// its own head — now emits every level into one schedule, draws each level's
-/// code with `Op::Sample` on the device, and gathers the next level's row out of
+/// One code-predictor frame as **one graph**: level 0's head-less body, then every
+/// projecting level with its own head, emitted into one schedule; each level's
+/// code is drawn with `Op::Sample` on the device, and the next level's row is
+/// gathered out of
 /// the code table in the same graph. The cache never leaves the device: each
 /// block keeps its own `[capacity, hkv]` plane, level 0 seeds it with its row
 /// and every later level appends one row in place (`Op::KvAppend`), so a level's
@@ -2543,8 +2220,8 @@ impl LayerStage for CodePredictorFrameStage {
             }
         }
         let codes = emit::h(ctx).concat_(ids, 0);
-        // Level 1's logits ride out as a side output: the stand's sampler check
-        // reads that one row once, from the same head the draw consumed.
+        // Level 1's logits ride out as a side output: a caller that wants the row
+        // reads it from the same head the draw consumed.
         if let Some(logits1) = logits1 {
             ctx.publish_side_output(
                 "logits1",
@@ -2566,9 +2243,7 @@ impl LayerStage for CodePredictorFrameStage {
 /// **Exclusion: the frame is one row, not `m`.** A frame graph carrying `m` frames
 /// in flight would read the stack once instead of once a frame, and it is not kept:
 /// the frames are not independent — frame `f`'s codes feed frame `f + 1`, so a
-/// chunk of `m` frames is walked to a fixed point in `m` passes. The measurement
-/// that closed the axis, and the passes it took, are in `MEASUREMENTS.md`'s
-/// dismissed forms.
+/// chunk of `m` frames is walked to a fixed point in `m` passes.
 pub fn tts_code_predictor_frame(
     model: Arc<Model>,
     capacity: usize,
@@ -2976,12 +2651,11 @@ impl LayerStage for QuantDecodeStage {
 // ── running a built flow ───────────────────────────────────────────
 
 /// Submissions and blocking waits issued by this process's walks. Each
-/// `Runner::run`/`run_read`/`run_slices` is one submit and one wait. The
-/// counters live here, around the whole cell; `waits` mirrors `submits`
-/// because the backend calls are synchronous. Both count *calls*, not queue
-/// submissions: a chunked run (`RLX_WGPU_ENCODE_CHUNK`) submits several command
-/// buffers inside one `run`, and the queue-level figure is the backend's own
-/// `rlx_wgpu::device_submit_count`.
+/// `Runner::run`/`run_read`/`run_slices` is one submit and one wait. The counters
+/// live here, around the whole walk; `waits` mirrors `submits` because the backend
+/// calls are synchronous. Both count *calls*, not queue submissions: a chunked run
+/// (`RLX_WGPU_ENCODE_CHUNK`) submits several command buffers inside one `run`, and
+/// the queue-level figure is the backend's own `rlx_wgpu::device_submit_count`.
 static SUBMITS: AtomicU64 = AtomicU64::new(0);
 static WAITS: AtomicU64 = AtomicU64::new(0);
 
@@ -3010,29 +2684,6 @@ impl Drop for DeclaredScope {
     }
 }
 
-/// One graph × one backend: what it cost, what came out of it.
-pub struct Outcome {
-    pub compile_ms: f64,
-    pub upload_ms: f64,
-    pub first_ms: f64,
-    pub step_ms: f64,
-    pub min_ms: f64,
-    pub max_ms: f64,
-    pub outs: Vec<Vec<f32>>,
-    /// The arena `rlx-wgpu`'s own planner sizes for this graph
-    /// ([`rlx_wgpu::buffer::plan_f32_uniform`], align 16) — the graph before the
-    /// backend's unfuse passes, and without its scratch tail.
-    pub arena_bytes: usize,
-    /// Packed `DequantMatMul` nodes in the graph — 0 on the sound stage.
-    pub dequant_nodes: usize,
-    pub params_f32: usize,
-    pub params_packed: usize,
-    /// Node count by op kind, in the lowered graph (what the backend schedules).
-    pub ops: Vec<(String, usize)>,
-    /// The runs a report's counters cover — the cold first run plus `reps` measured ones.
-    pub passes: usize,
-}
-
 /// Compile a built flow and run it.
 ///
 /// The flow's own outputs are taken apart by hand: `BuiltModel` keeps the f32
@@ -3040,14 +2691,13 @@ pub struct Outcome {
 /// consumes the whole value and drops them, so the module is lowered here
 /// directly (`hir_to_graph`) to keep both.
 /// A graph compiled **once** and restarted frame after frame: the same plan, the
-/// same buffers, new inputs each time. A graph per frame is a cost of the stand,
-/// not of the model — the model's own run keeps its session and feeds the cache.
+/// same buffers, new inputs each time. A graph per frame would be a cost of the
+/// harness, not of the model — the synthesis path keeps its session and feeds the
+/// cache.
 pub struct Runner {
     session: rlx_runtime::CompiledGraph,
-    /// The compiled graph itself — this crate's source for the arena and the ops.
+    /// The compiled graph itself — this crate's source for the arena.
     pub graph: rlx_ir::Graph,
-    pub compile_ms: f64,
-    pub upload_ms: f64,
 }
 
 impl Runner {
@@ -3076,9 +2726,7 @@ impl Runner {
             .into_hir()
             .ok_or_else(|| anyhow!("flow built a non-HIR module"))?;
         let graph = rlx_ir::hir_to_graph(hir)?;
-        let t = crate::report::Stopwatch::start();
         let mut session = Session::new(device).compile(graph.clone());
-        let compile_ms = t.ms();
         // Upload and release one tensor at a time: the flow hands over the whole
         // weight map at once, but holding all of it while the device receives its
         // own copy would put two checkpoints in the process. So the entry leaves
@@ -3101,7 +2749,6 @@ impl Runner {
                  are not the same build) — the graph is not run on zeros"
             )
         };
-        let t = crate::report::Stopwatch::start();
         while let Some(name) = built.params.keys().next().cloned() {
             let values = built.params.remove(&name).expect("key just read");
             match emit::host_weight(&origins, &name) {
@@ -3128,13 +2775,7 @@ impl Runner {
                 session.set_param_typed(&name, &bytes, dt);
             }
         }
-        let upload_ms = t.ms();
-        Ok(Self {
-            session,
-            graph,
-            compile_ms,
-            upload_ms,
-        })
+        Ok(Self { session, graph })
     }
 
     /// Point the frame graph's `Sample` steps at this frame's draw seeds, in
@@ -3266,127 +2907,33 @@ impl Runner {
     }
 }
 
-/// One graph built and compiled: what a cell's build step leaves behind.
+/// One graph built and compiled: what a build step leaves behind.
 ///
-/// Everything the graph is made of — the planner's arena, its op census, the param
-/// sizes — is read here, at the build, so the run step prices only the walk. The
-/// graph is then fed again and again (a frame, a window, a submission) and never
+/// The graph is then fed again and again (a frame, a window, a submission) and never
 /// rebuilt inside the run.
 ///
 /// A compiled graph lives in this process only: the engine persists optimized LIR
 /// (`rlx_runtime::AotCache`) but not the backend's executable, so a second process
-/// still pays `backend.compile_lir` — there is nothing here to reuse across cells,
-/// and that is what a cell's `build_ms` is.
+/// still pays `backend.compile_lir` — there is nothing here to reuse across runs.
 pub struct Compiled {
     pub runner: Runner,
-    pub compile_ms: f64,
-    pub upload_ms: f64,
-    pub arena_bytes: usize,
-    pub dequant_nodes: usize,
-    pub params_f32: usize,
-    pub params_packed: usize,
-    pub ops: Vec<(String, usize)>,
 }
 
 impl Compiled {
     /// The build step for one graph: emit was the caller's, this lower it, compiles
     /// it and uploads its params — the price paid once, before any pass.
     pub fn new(device: Device, built: BuiltModel) -> Result<Self> {
-        let params_f32: usize = built.params.values().map(|v| v.len() * 4).sum();
-        let params_packed: usize = built.typed_params.iter().map(|(_, b, _)| b.len()).sum();
         let runner = Runner::compile(device, built)?;
-        let graph = &runner.graph;
-        let arena_bytes = rlx_wgpu::buffer::plan_f32_uniform(graph, 16).arena_size;
-        let dequant_nodes = graph
-            .nodes()
-            .iter()
-            .filter(|n| matches!(n.op, rlx_ir::Op::DequantMatMul { .. }))
-            .count();
-        let mut ops: BTreeMap<String, usize> = BTreeMap::new();
-        for n in graph.nodes() {
-            *ops.entry(format!("{:?}", n.op.kind())).or_default() += 1;
-        }
-        Ok(Self {
-            compile_ms: runner.compile_ms,
-            upload_ms: runner.upload_ms,
-            runner,
-            arena_bytes,
-            dequant_nodes,
-            params_f32,
-            params_packed,
-            ops: ops.into_iter().collect(),
-        })
+        Ok(Self { runner })
     }
 
-    /// Bytes this graph's parameters occupy: the uploaded f32 copy and the packed
-    /// weights as the file holds them.
-    #[must_use]
-    pub fn params_bytes(&self) -> usize {
-        self.params_f32 + self.params_packed
+    /// The run step: one pass on the compiled graph.
+    pub fn run(&mut self, inputs: &[(String, Vec<f32>)]) -> Vec<Vec<f32>> {
+        self.runner.run(inputs)
     }
 
-    /// Bytes this graph keeps on the device: [`Compiled::params_bytes`] plus its
-    /// planned arena. The arena half is the *plan* ([`Compiled::arena_bytes`]), the
-    /// pre-unfuse figure, which is larger than what the backend allocates — so this
-    /// over-states what a graph holds.
-    #[must_use]
-    pub fn device_bytes(&self) -> usize {
-        self.params_bytes() + self.arena_bytes
-    }
-
-    /// The run step: one cold pass (it pays the device's warm-up) and then `reps`
-    /// measured passes on the same compiled graph.
-    pub fn run(&mut self, inputs: &[(String, Vec<f32>)], reps: usize) -> Outcome {
-        let (compile_ms, upload_ms) = (self.compile_ms, self.upload_ms);
-        let arena_bytes = self.arena_bytes;
-        let dequant_nodes = self.dequant_nodes;
-        let (params_f32, params_packed) = (self.params_f32, self.params_packed);
-        let ops = self.ops.clone();
-        let runner = &mut self.runner;
-
-        let t0 = crate::report::Stopwatch::start();
-        let first = runner.run(inputs);
-        let first_ms = t0.ms();
-
-        let mut samples = Vec::with_capacity(reps);
-        let mut outs_reps = vec![first];
-        for _ in 0..reps {
-            let t = crate::report::Stopwatch::start();
-            let out = runner.run(inputs);
-            samples.push(t.ms());
-            outs_reps.push(out);
-        }
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let (step_ms, min_ms, max_ms) = if samples.is_empty() {
-            (first_ms, first_ms, first_ms)
-        } else {
-            (
-                samples[samples.len() / 2],
-                samples[0],
-                samples[samples.len() - 1],
-            )
-        };
-        let outs = outs_reps[0].clone();
-
-        Outcome {
-            compile_ms,
-            upload_ms,
-            first_ms,
-            step_ms,
-            min_ms,
-            max_ms,
-            outs,
-            arena_bytes,
-            dequant_nodes,
-            params_f32,
-            params_packed,
-            ops,
-            passes: reps + 1,
-        }
-    }
-
-    /// One pass with borrowed inputs, no repeated warm passes: the caller owns
-    /// the state buffers and must not have them copied just to be read.
+    /// One pass with borrowed inputs: the caller owns the state buffers and must
+    /// not have them copied just to be read.
     pub fn run_slices(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         self.runner.run_slices(inputs)
     }
@@ -3466,8 +3013,8 @@ pub const DAC_MARGIN: usize = 4;
 
 /// One window's span: the core `[a, b)` extended `left` frames before it and
 /// `right` after, clipped at the part's own edges. [`windows`] uses it with a zero
-/// right margin; a probe that prices a right margin the decoder no longer carries
-/// reads both arms through it, from the one cut.
+/// right margin; a caller that prices a right margin reads both arms through it,
+/// from the one cut.
 pub fn window_span(rows: usize, a: usize, b: usize, left: usize, right: usize) -> (usize, usize) {
     (a.saturating_sub(left), (b + right).min(rows))
 }
@@ -3503,8 +3050,7 @@ pub fn windows(rows: usize, window: usize, margin: usize) -> Vec<(usize, usize, 
 /// was first drawn at): the front and the codec's first four stages,
 /// stages 4–5, stages 6–7 — three graphs instead of nine. A group whose plan
 /// outgrew the backend's per-binding limit would show up as host routing or arena
-/// striping in the stand's per-phase `arena` column, which is what the window's
-/// own measurement is read against.
+/// striping.
 pub fn codec_groups() -> Vec<std::ops::Range<usize>> {
     vec![0..4, 4..6, 6..DAC_STAGES]
 }
@@ -3571,10 +3117,10 @@ fn synthesis_sound_group(
 /// held across a cache call.
 pub type SoundGraph = std::rc::Rc<std::cell::RefCell<Compiled>>;
 
-/// Device bytes a decoder cache may hold, by [`Compiled::device_bytes`] — an arena
-/// is resident for as long as its graph is, so parameters alone would not bound it.
-/// This holds one part's set with the graphs a new length brings; the ceiling that
-/// decides for real is `guard`'s, which reads the resident set.
+/// Device bytes a decoder cache may hold — an arena is resident for as long as its
+/// graph is, so parameters alone would not bound it. This holds one part's set with
+/// the graphs a new length brings; the ceiling that decides for real is `guard`'s,
+/// which reads the resident set.
 const SOUND_GRAPHS_BYTES: usize = 5 * 1024 * 1024 * 1024;
 
 /// What fixes a sound graph: the file it reads, its device, the frames it runs,
@@ -3590,30 +3136,35 @@ struct SoundKey {
     prefix: usize,
 }
 
+/// What one cached graph holds: its parameter bytes as the model files give them,
+/// and those plus its planned arena.
+#[derive(Clone, Copy)]
+struct Held {
+    params: usize,
+    device: usize,
+}
+
 /// The decoder graphs one synthesis call needs, most recently used last. Owned by
-/// whoever synthesizes — [`crate::synth::Synthesis`] in the library, a local of the
-/// synthesis half in the stand — so the graphs are released when that is, and the
+/// [`crate::synth::Synthesis`], so the graphs are released when that is, and the
 /// process holds one model pair's decoder, not every length it ever ran.
 #[derive(Default)]
 pub struct SoundGraphs {
-    entries: Vec<(SoundKey, SoundGraph)>,
+    entries: Vec<(SoundKey, SoundGraph, Held)>,
 }
 
 impl SoundGraphs {
     /// What this cache holds, in the form the probes report and the budget reads:
-    /// `(graphs, parameters, device bytes)`. Parameters are [`Compiled::params_bytes`]
-    /// — the weight bytes the graphs bind, read from the model files; the third figure is
-    /// the cache's own account,
-    /// [`Compiled::device_bytes`] over its graphs. A graph a caller still holds —
-    /// one part's first and carried windows during a call — stays resident after
-    /// eviction, so it is the cache's figure, not the process's.
+    /// `(graphs, parameters, device bytes)`. Parameters are the weight bytes the
+    /// graphs bind, read from the model files; the third figure adds each graph's
+    /// planned arena. A graph a caller still holds — one part's first and carried
+    /// windows during a call — stays resident after eviction, so it is the cache's
+    /// figure, not the process's.
     #[must_use]
     pub fn census(&self) -> (usize, usize, usize) {
         self.entries
             .iter()
-            .fold((0, 0, 0), |(n, params, device), (_, g)| {
-                let g = g.borrow();
-                (n + 1, params + g.params_bytes(), device + g.device_bytes())
+            .fold((0, 0, 0), |(n, params, device), (_, _, held)| {
+                (n + 1, params + held.params, device + held.device)
             })
     }
 
@@ -3636,7 +3187,7 @@ impl SoundGraphs {
             stages,
             prefix,
         };
-        if let Some(i) = self.entries.iter().position(|(k, _)| *k == key) {
+        if let Some(i) = self.entries.iter().position(|(k, _, _)| *k == key) {
             let hit = self.entries.remove(i);
             let graph = hit.1.clone();
             self.entries.push(hit);
@@ -3646,11 +3197,23 @@ impl SoundGraphs {
         // was. The transient is the whole cache plus this graph, which is one
         // part's set plus one graph: a graph's arena is only known once it exists,
         // so the trim below is the bound the budget can actually promise.
-        let graph = std::rc::Rc::new(std::cell::RefCell::new(Compiled::new(
-            device,
-            synthesis_sound_group(model.clone(), frames, key.stages.clone(), prefix)?,
-        )?));
-        self.entries.push((key, graph.clone()));
+        let built = synthesis_sound_group(model.clone(), frames, key.stages.clone(), prefix)?;
+        let params = built.params.values().map(|v| v.len() * 4).sum::<usize>()
+            + built
+                .typed_params
+                .iter()
+                .map(|(_, b, _)| b.len())
+                .sum::<usize>();
+        let graph = std::rc::Rc::new(std::cell::RefCell::new(Compiled::new(device, built)?));
+        let arena = rlx_wgpu::buffer::plan_f32_uniform(&graph.borrow().runner.graph, 16).arena_size;
+        self.entries.push((
+            key,
+            graph.clone(),
+            Held {
+                params,
+                device: params + arena,
+            },
+        ));
         while self.entries.len() > 1 && self.census().2 > SOUND_GRAPHS_BYTES {
             self.entries.remove(0);
         }
@@ -3724,8 +3287,7 @@ impl FrontGraphs {
 /// (`rlx-ir/src/phase.rs`), so in a graph that has compute after the draw the
 /// node index and the execution order disagree and the slot it reads can be
 /// reused. A draw at the head's output, in its own graph, has
-/// no such disagreement, and it is what the stand checks against its own
-/// sampler.
+/// no such disagreement.
 pub struct SampleStage {
     pub rows: usize,
     pub sampler: SampleSpec,
@@ -3906,7 +3468,7 @@ impl LayerStage for MelStage {
         // The frames: `window` points every `hop`, with the signal reflected half
         // a window on each side so every frame is centred. One gather with a
         // precomputed index row replaces a `Narrow` per frame plus a `Concat`
-        // (3 001 nodes on the 30 s cell).
+        // (3 001 nodes at the 30 s recognition shape).
         let padded = emit::pad_axis(ctx, input.hir_id(), 1, 0, n / 2, n / 2, PadMode::Reflect);
         let mut indices = Vec::with_capacity(raw * n * 8);
         for i in 0..raw {
@@ -4019,8 +3581,7 @@ impl rlx_flow::WeightSource for NoWeights {
 }
 
 /// The weight bytes one run of `graph` streams: every dense and packed matrix and
-/// every convolution its nodes read, counted **once per read**. This is the
-/// numerator of every per-phase rate in `MEASUREMENTS.md`, which is why it counts a
+/// every convolution its nodes read, counted **once per read**. It counts a
 /// block the predictor reads at each of its levels once per level — the block is
 /// streamed that many times, and a rate over the graph's *resident* bytes would
 /// overstate what the memory system delivered. Only an operand that **is** a

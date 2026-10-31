@@ -59,13 +59,13 @@ pub fn main_entry() {
 /// a pool that cannot fill the voices asked for; a synthesis failure; the
 /// resident-set or swap ceiling. No report is written: the build's product is the
 /// cache. A build that fails or is stopped still states the counts it reached, and
-/// appends them to the generation's manifest unless it had rendered nothing yet.
+/// records them in the generation's manifest unless it had rendered nothing yet.
 fn run() -> Result<()> {
     let started = std::time::Instant::now();
     let cfg = BenchConfig::from_env(Mode::Build)?;
     let _lock = RunLock::acquire(&cfg.lock)?;
     // Resolved before the guard: the generation names the manifest that a stopped
-    // build appends to as well as the one a completed build writes.
+    // build records as well as the one a completed build writes.
     let inputs = super::config::pin_inputs(&cfg)?;
     // No wall-clock stop: this is the deliberate render, not a measurement.
     let deadline = Deadline::unbounded();
@@ -84,6 +84,7 @@ fn run() -> Result<()> {
         "wake-word corpus build",
         deadline,
         ceiling,
+        true,
         {
             let progress = Arc::clone(&progress);
             move || state(&progress).current
@@ -152,16 +153,13 @@ fn run() -> Result<()> {
 
 /// A build's one account, whichever way it ends: the corpus it is filling, the clip
 /// reads it reached, the sweep, and the manifest both a completed and a stopped
-/// build append to. The guard thread and the caller read the same state, so a stop
+/// build record. The guard thread and the caller read the same state, so a stop
 /// states what the build had reached, and the first of them to claim it is the one
-/// that states it: one console line and one read-modify-write of the manifest.
+/// that states it: one console line and one write of the manifest.
 struct Account {
     cache: PathBuf,
     generation: String,
     started: std::time::Instant,
-    /// The generation's manifest as this build found it, read once before anything
-    /// renders.
-    previous: Option<Value>,
     /// Why this build refuses to start, when it is the cache's root or manifest it
     /// could not use.
     refusal: Option<Refused>,
@@ -177,21 +175,17 @@ struct Account {
 
 impl Account {
     /// Read once, before anything renders: the cache directory is prepared and the
-    /// generation's manifest read. A cache root that is not a directory, and a
+    /// generation's manifest checked. A cache root that is not a directory, and a
     /// manifest that cannot be interpreted, both refuse here — naming what is wrong —
     /// rather than after hours of synthesis whose cost would then be unknown.
     fn new(cache: &Path, generation: String, started: std::time::Instant) -> Self {
-        let read = super::prepare_cache(cache)
-            .and_then(|()| audio::read_build_manifest(cache, &generation));
-        let (previous, refusal) = match read {
-            Ok(previous) => (previous, None),
-            Err(refusal) => (None, Some(refusal)),
-        };
+        let refusal = super::prepare_cache(cache)
+            .and_then(|()| audio::read_build_manifest(cache, &generation).map(|_| ()))
+            .err();
         Self {
             cache: cache.to_path_buf(),
             generation,
             started,
-            previous,
             refusal,
             clips: Mutex::new(None),
             swept: Mutex::new(None),
@@ -238,9 +232,9 @@ impl Account {
 
     /// A claimed stop: the same figures, plus what the cache now holds. A stop after
     /// nothing was rendered leaves the generation's manifest untouched on purpose:
-    /// there is no render cost to accumulate, and rewriting `last` would overwrite
-    /// the build that filled the cache with a no-op's line. A *completed* no-op is
-    /// still a build of the generation, and [`Self::finish`] counts it.
+    /// this invocation has no render to record, and rewriting the manifest would
+    /// replace the build that filled the cache with a no-op's line. A *completed*
+    /// no-op is still a build of the generation, and [`Self::finish`] records it.
     fn stop(&self, stats: SynthStats, reason: &str) {
         eprintln!("{}", self.line(&self.figures(stats)));
         if stats.rendered() == 0 {
@@ -302,42 +296,35 @@ impl Account {
             "[wake-word build] corpus {}: {figures} · {:.1} s wall · peak {}",
             self.cache.display(),
             self.started.elapsed().as_secs_f64(),
-            crate::report::peak_mib()
+            crate::report::shown(crate::report::peak_rss())
         )
     }
 
-    /// The generation's manifest, with this invocation appended: the totals over
-    /// every build of it (`builds`, `built`, `synthesis_secs`) and the invocation
-    /// itself in `last`, so neither can make the other's renders look free. `clips`
-    /// is the corpus the plan lists; a build that stopped before its plan carries the
-    /// figure an earlier build of the generation stated.
+    /// The generation's manifest, stating only what this invocation did: the corpus
+    /// it planned, the reads it reused, the clips it rendered, the synthesis time it
+    /// spent, the sweep it ran and how it ended. A build that stopped before its plan
+    /// carries a null `clips` rather than borrowing an earlier build's figure.
+    ///
+    /// This is the corpus's own build record, not a measurement report: the next
+    /// build reads `generation` to decide whether the cache is usable, and the
+    /// figures say what the last build did with it — how many clips it rendered and
+    /// swept, how long that took, and why a build that stopped early did. A
+    /// measurement never writes one.
     fn manifest(&self, stats: SynthStats, stopped: Option<&str>) -> Value {
-        let previous = self.previous.as_ref();
-        let total = |key: &str| audio::manifest_count(previous, key).unwrap_or(0);
-        let secs = previous
-            .and_then(|manifest| manifest.get("synthesis_secs"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let clips = (*state(&self.clips))
-            .or_else(|| audio::manifest_count(previous, "clips").map(|clips| clips as usize));
+        let clips = *state(&self.clips);
         let swept = state(&self.swept).map_or(Value::Null, |entries| json!(entries));
         json!({
             "generation": self.generation,
             "clips": clips,
-            "builds": total("builds") + 1,
-            "built": total("built") + stats.rendered() as u64,
-            "synthesis_secs": secs + stats.synth_secs,
-            "last": {
-                "built": stats.rendered(),
-                // `null` where a stop left the count unknown: neither a stop before
-                // the sweep nor one inside it measured how many entries it cleared.
-                "swept": swept,
-                "wall_secs": self.started.elapsed().as_secs_f64(),
-                "stopped": stopped.map_or(Value::Null, |reason| json!({
-                    "reason": reason,
-                    "corpus_complete": self.complete.load(Ordering::SeqCst),
-                })),
-            },
+            "reused": stats.cache_hits,
+            "rendered": stats.rendered(),
+            "synthesis_secs": stats.synth_secs,
+            "swept": swept,
+            "wall_secs": self.started.elapsed().as_secs_f64(),
+            "stopped": stopped.map_or(Value::Null, |reason| json!({
+                "reason": reason,
+                "corpus_complete": self.complete.load(Ordering::SeqCst),
+            })),
         })
     }
 }
@@ -462,11 +449,11 @@ mod tests {
         account
     }
 
-    /// A generation's manifest is its whole build history: a second build adds its
-    /// renders and its synthesis time to the first instead of replacing them, so a
-    /// warm rebuild cannot make the hours before it look free.
+    /// A generation's manifest states this invocation only: a second build records
+    /// its own reused/rendered counts and synthesis time, not a running total over
+    /// the builds before it.
     #[test]
-    fn a_manifest_accumulates_over_the_builds_of_its_generation() {
+    fn a_manifest_states_this_build_only() {
         let dir = temp_dir("manifest");
         let first = account_for(&dir, 1_956).manifest(
             SynthStats {
@@ -480,15 +467,18 @@ mod tests {
         let second = account_for(&dir, 1_956).manifest(
             SynthStats {
                 reads: 956,
-                cache_hits: 0,
+                cache_hits: 900,
                 synth_secs: 5.0,
             },
             None,
         );
-        assert_eq!(second["builds"], 2);
-        assert_eq!(second["built"], 1_956);
-        assert_eq!(second["synthesis_secs"], 15.0);
+        assert_eq!(second["reused"], 900);
+        assert_eq!(second["rendered"], 56);
+        assert_eq!(second["synthesis_secs"], 5.0);
         assert_eq!(second["clips"], 1_956);
+        assert!(second.get("builds").is_none(), "{second}");
+        assert!(second.get("built").is_none(), "{second}");
+        assert!(second.get("last").is_none(), "{second}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -545,11 +535,13 @@ mod tests {
         let written = audio::read_build_manifest(&dir, "gen")
             .expect("the manifest")
             .expect("this generation");
-        assert_eq!(written["builds"], 1, "one append, not two: {written}");
-        assert_eq!(written["built"], 5);
-        assert_eq!(written["last"]["stopped"]["corpus_complete"], false);
+        assert_eq!(
+            written["rendered"], 5,
+            "one statement of this build's renders: {written}"
+        );
+        assert_eq!(written["stopped"]["corpus_complete"], false);
         assert!(
-            written["last"]["swept"].is_null(),
+            written["swept"].is_null(),
             "a sweep that never ran is not a zero: {written}"
         );
 
@@ -563,8 +555,8 @@ mod tests {
         let written = audio::read_build_manifest(&dir, "gen")
             .expect("the manifest")
             .expect("this generation");
-        assert_eq!(written["last"]["stopped"]["corpus_complete"], true);
-        assert!(written["last"]["swept"].is_null(), "{written}");
+        assert_eq!(written["stopped"]["corpus_complete"], true);
+        assert!(written["swept"].is_null(), "{written}");
 
         // A stop after the sweep returned: the corpus was whole and the count is
         // known, so neither is stated as unknown.
@@ -576,7 +568,7 @@ mod tests {
         let written = audio::read_build_manifest(&dir, "gen")
             .expect("the manifest")
             .expect("this generation");
-        assert_eq!(written["last"]["swept"], 7, "{written}");
+        assert_eq!(written["swept"], 7, "{written}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -596,7 +588,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A refused input is the stand's argument refusal (2); a render that failed is a
+    /// A refused input is the shared argument refusal (2); a render that failed is a
     /// failed run (1), so a caller can tell the two apart. The marker carries the
     /// whole context chain as its message, so the console states what was refused.
     #[test]

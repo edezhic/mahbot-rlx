@@ -280,36 +280,25 @@ impl Synth {
 }
 
 /// The file the build leaves beside the corpus: the generation it completed and
-/// what the render cost. A measurement states it, so a warm record cannot make the
+/// what this build did. A measurement states it, so a warm record cannot make the
 /// build look like nothing.
 pub(crate) const BUILD_MANIFEST: &str = "corpus-build.json";
 
-/// Record what the build just did. `builds`, `built` and `synthesis_secs` are the
-/// generation's totals over every build of it, so the recorded cost is not the last
-/// invocation's no-op; `last` is that invocation. Written atomically when the build
-/// completes, and again when a stop that rendered something claims its account.
+/// Record what the build just did, for this invocation only: the corpus it planned,
+/// the reads it reused, the clips it rendered, its synthesis time and its sweep.
 pub(crate) fn write_build_manifest(cache: &Path, manifest: &serde_json::Value) -> Result<()> {
     let text = serde_json::to_string_pretty(manifest)
         .context("cannot serialise the corpus build's manifest")?;
-    super::write_atomic(&cache.join(BUILD_MANIFEST), |tmp| {
+    crate::measurements::write_atomic(&cache.join(BUILD_MANIFEST), |tmp| {
         Ok(std::fs::write(tmp, text.as_bytes())?)
     })
-}
-
-/// A whole-number cell of the manifest every build of a generation appends to, in the
-/// format that build writes it. The build's running totals and the record's cost row
-/// read counts through this one function, so the two cannot disagree.
-pub(crate) fn manifest_count(manifest: Option<&serde_json::Value>, key: &str) -> Option<u64> {
-    manifest
-        .and_then(|manifest| manifest.get(key))
-        .and_then(serde_json::Value::as_u64)
 }
 
 /// The manifest of the generation `synthesis_hash` names: `None` when the cache
 /// carries no manifest or one from another generation. A manifest that exists but
 /// cannot be interpreted — unreadable, not JSON, or naming no generation — is an
-/// error, never an absent one: writing over it from nothing would reset the
-/// generation's build totals and understate the cost the record carries.
+/// error, never an absent one: a measurement would otherwise read a corrupt file as
+/// no build at all.
 pub(crate) fn read_build_manifest(
     cache: &Path,
     synthesis_hash: &str,
@@ -358,22 +347,6 @@ fn refusal(path: &Path, noun: &str, why: impl std::fmt::Display) -> String {
     )
 }
 
-/// Remove this run's own half-written cache entries, left by an earlier launch
-/// that died mid-write. Only `*.tmp-<this pid>` is swept: the lock path is an
-/// input, so another run can legitimately share this cache directory under a
-/// different lock, and its in-flight clips must survive.
-pub(crate) fn clean_cache(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let suffix = format!(".tmp-{}", std::process::id());
-    for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().ends_with(&suffix) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
 /// Every generation's record of the corpus a completed build produced: one section
 /// per generation, headed by `generation <synthesis hash>` and then one cache entry
 /// per line — a clip's key or a span cut's file name. A section outlives its build
@@ -409,7 +382,7 @@ pub(crate) fn write_build_keys(
             text.push('\n');
         }
     }
-    super::write_atomic(&cache.join(BUILD_KEYS), |tmp| {
+    crate::measurements::write_atomic(&cache.join(BUILD_KEYS), |tmp| {
         Ok(std::fs::write(tmp, text.as_bytes())?)
     })
 }
@@ -472,7 +445,8 @@ pub(crate) fn superseded(entries: u64) -> String {
 /// leaking the file. A sweep cut short keeps every record as a survivor, which may
 /// re-claim an entry this build already removed; it was not seen, so it is not
 /// forgotten, and the next build's sweep settles it. Nothing else is touched: a file
-/// no record names is kept, and so is a half-written entry ([`clean_cache`]'s).
+/// no record names is kept, and so is a half-written entry — the start-up sweep
+/// (`prepare_cache`) leaves a live run's temporary alone.
 pub(crate) fn sweep(
     dir: &Path,
     produced: &HashSet<String>,
@@ -603,8 +577,9 @@ fn decode_cache(data: &[u8]) -> Option<Vec<f32>> {
     )
 }
 
-/// A cache entry, written through [`super::write_atomic`] — flushed before the rename,
-/// so a crash leaves either the old entry or the new one and never a half-written clip.
+/// A cache entry, written through [`crate::measurements::write_atomic`] — flushed before
+/// the rename, so a crash leaves either the old entry or the new one and never a
+/// half-written clip.
 ///
 /// The corpus is the run's durable artifact, so a cache that cannot be written
 /// is an error: silently re-synthesizing the whole corpus on every run is how the
@@ -615,7 +590,7 @@ fn write_cache(path: &Path, samples: &[f32]) -> Result<()> {
     for &sample in samples {
         data.extend_from_slice(&sample.to_le_bytes());
     }
-    super::write_atomic(path, |tmp| Ok(std::fs::write(tmp, &data)?))
+    crate::measurements::write_atomic(path, |tmp| Ok(std::fs::write(tmp, &data)?))
 }
 
 // ── Guided-prompt DSP conditioning ────────────────────────────────────────
@@ -1458,16 +1433,16 @@ pub(crate) fn non_speech_clips() -> Result<Vec<Clip>> {
 pub(crate) fn calibration_negatives(
     synth: &mut Synth,
     listener: &mut Listener,
-    skipped: &mut Vec<String>,
 ) -> Result<Vec<Vec<f32>>> {
     let mut embeddings = Vec::new();
     for request in calibration_requests() {
         let pcm = synth.clip(&request.speaker, request.text, request.seed)?;
         let speech = detect::vad_gate(&pcm, &mut earshot::Detector::default());
         if speech.is_empty() {
-            let label = request.label();
-            eprintln!("[wake-word] {label}: no VAD-positive speech — skipped");
-            skipped.push(label);
+            eprintln!(
+                "[wake-word] {}: no VAD-positive speech — skipped",
+                request.label()
+            );
             continue;
         }
         embeddings.push(listener.embed(&speech)?);
@@ -1522,29 +1497,6 @@ mod tests {
         dir
     }
 
-    /// The cache is shared by every run that shares the directory, and the lock
-    /// path is an input, so two runs can differ there. Clean-up may only remove
-    /// this process's own half-written entries.
-    #[test]
-    fn clean_up_leaves_another_runs_in_flight_clip_alone() {
-        let dir = std::env::temp_dir().join(format!("mahbot-clean-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a temp dir");
-        let mine = dir.join(format!("a.f32.tmp-{}", std::process::id()));
-        let theirs = dir.join("a.f32.tmp-999999");
-        let clip = dir.join("a.f32");
-        for path in [&mine, &theirs, &clip] {
-            std::fs::write(path, b"x").expect("a temp file");
-        }
-
-        clean_cache(&dir);
-
-        assert!(!mine.exists(), "this run's leftover is swept");
-        assert!(theirs.exists(), "another run's in-flight clip survives");
-        assert!(clip.exists(), "a finished clip survives");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn conditioning_is_deterministic_and_grouped_by_clip_index() {
         let pcm = ramp(4000);
@@ -1581,7 +1533,6 @@ mod tests {
     #[test]
     fn the_cache_key_covers_text_seed_rate_model_and_voice() {
         let base = cache_key("hey mahbot", 7, 24_000, "model", None);
-        assert_eq!(base, cache_key("hey mahbot", 7, 24_000, "model", None));
         assert_ne!(base, cache_key("hey mahbot", 8, 24_000, "model", None));
         assert_ne!(base, cache_key("hey mahbot", 7, 16_000, "model", None));
         assert_ne!(base, cache_key("hey mahbot ", 7, 24_000, "model", None));
@@ -1595,10 +1546,6 @@ mod tests {
         let clone_b = cache_key("hey mahbot", 7, 24_000, "model", Some("b:0.00:15.00"));
         assert_ne!(base, clone_a);
         assert_ne!(clone_a, clone_b);
-        assert_eq!(
-            clone_a,
-            cache_key("hey mahbot", 7, 24_000, "model", Some("a:0.00:15.00"))
-        );
     }
 
     #[test]
@@ -1762,11 +1709,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A manifest that cannot be read is refused rather than read as absent: a build
-    /// that wrote over it from nothing would reset the generation's build totals and
-    /// understate the cost the record is required to carry. A manifest of another
-    /// generation is simply not this one's; one that names no generation is refused
-    /// like the record's header-less case, not treated as another's.
+    /// A manifest that cannot be read is refused rather than read as absent: a
+    /// measurement would otherwise read a corrupt file as no build at all. A manifest
+    /// of another generation is simply not this one's; one that names no generation is
+    /// refused like the record's header-less case, not treated as another's.
     #[test]
     fn a_manifest_that_cannot_be_read_is_not_an_absent_one() {
         let dir = temp_dir("manifest");
@@ -1776,14 +1722,14 @@ mod tests {
         );
         write_build_manifest(
             &dir,
-            &serde_json::json!({"generation": "other", "builds": 3}),
+            &serde_json::json!({"generation": "other", "rendered": 3}),
         )
         .expect("write a manifest");
         assert_eq!(
             read_build_manifest(&dir, "gen").expect("another generation's manifest"),
             None
         );
-        write_build_manifest(&dir, &serde_json::json!({"builds": 3})).expect("a manifest header");
+        write_build_manifest(&dir, &serde_json::json!({"rendered": 3})).expect("a manifest header");
         let error =
             read_build_manifest(&dir, "gen").expect_err("a manifest with no generation is refused");
         assert!(

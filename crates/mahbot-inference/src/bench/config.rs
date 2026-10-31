@@ -25,7 +25,6 @@ use sha2::{Digest, Sha256};
 
 use crate::loader::{self, Role};
 use crate::measurements::{hex, sha256_file};
-use crate::wake;
 
 use super::sets;
 use crate::guard::{DEFAULT_MAX_RSS_MIB, DEFAULT_TIMEOUT_SECS};
@@ -84,7 +83,7 @@ const VOICE: Spec = Spec {
 };
 const CORPUS: Spec = Spec {
     flag: "corpus",
-    env: crate::stand::CORPUS_ENV,
+    env: crate::corpus::ENV,
 };
 const REPORT: Spec = Spec {
     flag: "report",
@@ -118,15 +117,8 @@ const TTS_SOUND: Spec = Spec {
     flag: "tts-sound",
     env: "MAHBOT_TTS_SOUND",
 };
-/// The firing-threshold set, as `name=value` pairs. Unlike every other input, an
-/// empty value here — or one that is not text — is an error, from the flag or from
-/// the variable.
-const WAKE_THRESHOLDS: Spec = Spec {
-    flag: "wake-thresholds",
-    env: "MAHBOT_WAKE_THRESHOLDS",
-};
-/// The phase selection. Unlike every other input, an empty value here — or one that
-/// is not text — is an error, from the flag or from the variable.
+/// The phase selection. Unlike a path input, an empty value here — or one that is not
+/// text — is an error, from the flag or from the variable; so is a bound's.
 const PHASES: Spec = Spec {
     flag: "phases",
     env: "MAHBOT_BENCH_PHASES",
@@ -143,20 +135,8 @@ const VOICES: Spec = Spec {
 /// Every flag the bench accepts. Anything else is an error, so a typo cannot
 /// silently fall back to an environment variable.
 const SPECS: &[Spec] = &[
-    MODELS,
-    VOICE,
-    CORPUS,
-    REPORT,
-    LOCK,
-    TIMEOUT,
-    MAX_RSS,
-    ASR_BODY,
-    ASR_SOUND,
-    TTS_BODY,
-    TTS_SOUND,
-    WAKE_THRESHOLDS,
-    PHASES,
-    VOICES,
+    MODELS, VOICE, CORPUS, REPORT, LOCK, TIMEOUT, MAX_RSS, ASR_BODY, ASR_SOUND, TTS_BODY,
+    TTS_SOUND, PHASES, VOICES,
 ];
 
 /// Which operation is resolving its inputs. The measurement names a report it
@@ -207,11 +187,6 @@ pub(crate) struct BenchConfig {
     /// (to price a recall point without the real-audio sweep) reports `screened` and
     /// never writes the record.
     pub phases: Phases,
-    /// The firing thresholds the run scores with: [`wake::Thresholds::DEFAULT`]
-    /// unless `--wake-thresholds` / `MAHBOT_WAKE_THRESHOLDS` names another set. A
-    /// set other than the shipped one prices a candidate point and leaves the
-    /// record alone; the shipped set is the benchmark.
-    pub thresholds: wake::Thresholds,
     /// How many clone voices the synthetic side measures, never more than the
     /// pinned pool fills ([`sets::NUM_VERIFICATION_VOICES`]). Fewer than all of
     /// them is a screening run and is labelled as such wherever the rows are
@@ -223,46 +198,36 @@ pub(crate) struct BenchConfig {
     pub swap_growth_mib: u64,
 }
 
-/// Whether the swap-growth ceiling `ceiling` is larger than the default — the arm
-/// [`BenchConfig::screened_reasons`] reads, stated once so the enforcement and the
-/// classification cannot disagree.
-fn swap_bound_is_raised(ceiling: u64) -> bool {
-    ceiling > crate::guard::MAX_SWAP_GROWTH_MIB
-}
-
 impl BenchConfig {
     /// Why this run is not the benchmark, in the order the reasons are checked. An
-    /// empty list is the benchmark itself: the shipped threshold set over all three
-    /// phases, all eleven voices, inside the default wall-clock, resident and
-    /// swap-growth bounds. The record only carries that run.
+    /// empty list is the benchmark itself: all three phases, all eleven voices,
+    /// inside the default wall-clock, resident and swap-growth bounds. The record
+    /// only carries that run.
     pub(crate) fn screened_reasons(&self) -> Vec<&'static str> {
         let mut reasons = Vec::new();
-        if self.thresholds != wake::Thresholds::DEFAULT {
-            reasons.push("the firing-threshold set is not the shipped one");
-        }
         if !self.phases.is_full() {
             reasons.push("a subset of the phases is measured");
         }
         if self.voices != sets::NUM_VERIFICATION_VOICES {
             reasons.push("a subset of the verification voices is measured");
         }
-        if self.timeout_secs > DEFAULT_TIMEOUT_SECS {
-            reasons.push("the wall-clock bound is larger than the default");
-        }
-        if self.max_rss_mib > DEFAULT_MAX_RSS_MIB {
-            reasons.push("the resident bound is larger than the default");
-        }
-        if swap_bound_is_raised(self.swap_growth_mib) {
-            reasons.push("the swap-growth bound is larger than the default");
-        }
+        reasons.extend(crate::run::bound_reasons(
+            self.timeout_secs,
+            self.max_rss_mib,
+            self.swap_growth_mib,
+        ));
         reasons
     }
 
     /// The process's own arguments and environment. A configuration that cannot be
     /// resolved is a refused input, so the whole resolution is classified once here.
+    /// Arguments are read as the platform hands them over and lose only the bytes
+    /// that are not UTF-8, so no argument can take the run down.
     pub(crate) fn from_env(mode: Mode) -> Result<Self, Refused> {
         Self::resolve(
-            std::env::args().skip(1),
+            std::env::args_os()
+                .skip(1)
+                .map(|arg| arg.to_string_lossy().into_owned()),
             |name| std::env::var_os(name),
             mode,
         )
@@ -274,42 +239,6 @@ impl BenchConfig {
         self.report
             .as_deref()
             .expect("a measurement names the report it writes")
-    }
-
-    /// The invocation, with every input it took, for the provenance block: the
-    /// report this run wrote is the thing a later reader has to be able to
-    /// repeat. The four role files are recorded by name rather than the directory
-    /// they came from, so the line replays whether the run was given `--models`
-    /// or the files one by one; paths under `$HOME` are shortened to `~`. The three
-    /// measurement aids are named whenever they differ from the defaults, so a
-    /// screened run replays as the run it was.
-    pub(crate) fn command_line(&self) -> String {
-        let short = crate::measurements::short_path;
-        let mut aids = String::new();
-        if !self.phases.is_full() {
-            aids.push_str(&format!(" --phases \"{}\"", self.phases.names()));
-        }
-        if self.thresholds != wake::Thresholds::DEFAULT {
-            aids.push_str(&format!(" --wake-thresholds \"{}\"", self.thresholds));
-        }
-        if self.voices != sets::NUM_VERIFICATION_VOICES {
-            aids.push_str(&format!(" --voices {}", self.voices));
-        }
-        format!(
-            "cargo bench -p mahbot-inference --features bench --bench wake_word -- \
-             --asr-body {} --asr-sound {} --tts-body {} --tts-sound {} --voice {} \
-             --corpus {} --report {} --lock {} --timeout {} --max-rss {}{aids}",
-            short(&self.asr_body),
-            short(&self.asr_sound),
-            short(&self.tts_body),
-            short(&self.tts_sound),
-            short(&self.voice),
-            short(&self.corpus),
-            short(self.report_path()),
-            short(&self.lock),
-            self.timeout_secs,
-            self.max_rss_mib,
-        )
     }
 
     /// The model directory for the run's opening line, or a note that the role
@@ -333,7 +262,7 @@ impl BenchConfig {
         // writes no report and has no wall-clock bound, so the measurement aids
         // are refused rather than accepted and ignored.
         if mode == Mode::Build {
-            let given_aids: Vec<String> = [REPORT, WAKE_THRESHOLDS, PHASES, VOICES, TIMEOUT]
+            let given_aids: Vec<String> = [REPORT, PHASES, VOICES, TIMEOUT]
                 .into_iter()
                 .filter(|spec| given(&flags, &env, *spec).is_some())
                 .map(|spec| format!("--{} / {}", spec.flag, spec.env))
@@ -346,12 +275,13 @@ impl BenchConfig {
                 );
             }
         }
-        // Every input but the three measurement aids reads an empty — or non-text —
-        // value as absent: a required input then names itself, a defaulted one takes
-        // its default. The aids take the value as given, so an empty or non-text flag
-        // *or* variable reaches `aid` and is refused there: `--wake-thresholds ""`, a
-        // shell's `MAHBOT_WAKE_THRESHOLDS=` and a variable holding bytes must not
-        // resolve to the shipped set and rewrite the record.
+        // Every input but the measurement aids and the three bounds reads an empty —
+        // or non-text — value as absent: a required input then names itself, a
+        // defaulted one takes its default. The aids and the bounds take the value as
+        // given, so an empty or non-text flag *or* variable reaches its parser and is
+        // refused there: `--phases ""`, a shell's `MAHBOT_BENCH_PHASES=`,
+        // `--timeout ""` and a bound variable holding bytes must not resolve to the
+        // defaults and rewrite the record.
         let get = |spec: Spec| {
             given(&flags, &env, spec)
                 .and_then(|value| value.into_string().ok())
@@ -438,12 +368,8 @@ impl BenchConfig {
             None => crate::guard::lock_path(&env)?,
         };
 
-        let timeout_secs = whole_number(get(TIMEOUT), DEFAULT_TIMEOUT_SECS, TIMEOUT)?;
-        let max_rss_mib = whole_number(get(MAX_RSS), DEFAULT_MAX_RSS_MIB, MAX_RSS)?;
-        let thresholds = match given(&flags, &env, WAKE_THRESHOLDS) {
-            Some(value) => parse_thresholds(&aid(value, WAKE_THRESHOLDS)?)?,
-            None => wake::Thresholds::DEFAULT,
-        };
+        let timeout_secs = bound(TIMEOUT, given(&flags, &env, TIMEOUT), DEFAULT_TIMEOUT_SECS)?;
+        let max_rss_mib = bound(MAX_RSS, given(&flags, &env, MAX_RSS), DEFAULT_MAX_RSS_MIB)?;
         let phases = match given(&flags, &env, PHASES) {
             Some(value) => Phases::parse(&aid(value, PHASES)?)?,
             None => Phases::ALL,
@@ -452,7 +378,7 @@ impl BenchConfig {
             Some(value) => voice_count(&aid(value, VOICES)?)?,
             None => sets::NUM_VERIFICATION_VOICES,
         };
-        let swap_growth_mib = crate::guard::swap_growth_ceiling(&env);
+        let swap_growth_mib = crate::guard::swap_growth_ceiling(&env).map_err(Refused::new)?;
 
         Ok(Self {
             mode,
@@ -468,7 +394,6 @@ impl BenchConfig {
             lock,
             timeout_secs,
             max_rss_mib,
-            thresholds,
             phases,
             voices,
             swap_growth_mib,
@@ -513,25 +438,9 @@ impl Phases {
         real_audio: true,
     };
 
-    /// Whether the run takes all three measurements (the benchmark also needs the
-    /// shipped threshold set; see `classify` in the bench).
+    /// Whether the run takes all three measurements.
     pub(crate) fn is_full(&self) -> bool {
         *self == Self::ALL
-    }
-
-    /// The selection as `--phases` reads it back, for the recorded command.
-    pub(crate) fn names(&self) -> String {
-        let mut names = Vec::new();
-        if self.recall {
-            names.push("recall");
-        }
-        if self.non_phrase {
-            names.push("non-phrase");
-        }
-        if self.real_audio {
-            names.push("real-audio");
-        }
-        names.join(",")
     }
 
     /// `all`, or a comma list of `recall`, `non-phrase`, `real-audio`. Every name in
@@ -566,64 +475,6 @@ impl Phases {
     }
 }
 
-/// Read `name=value` pairs into the shipped set, so a run can evaluate another
-/// operating point without rebuilding. Only the numbers move: the decision's
-/// shape is not addressable here. An empty list is refused rather than resolved
-/// to the shipped set — a run that overrode nothing must not reach the record
-/// through a mistyped flag.
-fn parse_thresholds(text: &str) -> Result<wake::Thresholds> {
-    let mut set = wake::Thresholds::DEFAULT;
-    let mut named = false;
-    for pair in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        named = true;
-        let (name, value) = pair.split_once('=').ok_or_else(|| {
-            anyhow!(
-                "--{} / {} `{pair}` is not name=value",
-                WAKE_THRESHOLDS.flag,
-                WAKE_THRESHOLDS.env
-            )
-        })?;
-        let value: f32 = value.trim().parse().with_context(|| {
-            format!(
-                "--{} / {} `{pair}`: `{value}` is not a number",
-                WAKE_THRESHOLDS.flag, WAKE_THRESHOLDS.env
-            )
-        })?;
-        let field = wake::Thresholds::FIELDS
-            .iter()
-            .find(|(known, _, _)| *known == name.trim())
-            .map(|(_, _, write)| write)
-            .ok_or_else(|| {
-                let vocabulary: Vec<_> = wake::Thresholds::FIELDS
-                    .iter()
-                    .map(|(name, _, _)| *name)
-                    .collect();
-                anyhow!(
-                    "--{} / {} names no threshold `{name}` — the set is {}",
-                    WAKE_THRESHOLDS.flag,
-                    WAKE_THRESHOLDS.env,
-                    vocabulary.join(", ")
-                )
-            })?;
-        field(&mut set, value);
-    }
-    if !named {
-        bail!(
-            "--{} / {} names no threshold",
-            WAKE_THRESHOLDS.flag,
-            WAKE_THRESHOLDS.env
-        );
-    }
-    set.validate().map_err(|why| {
-        anyhow!(
-            "--{} / {}: {why}",
-            WAKE_THRESHOLDS.flag,
-            WAKE_THRESHOLDS.env
-        )
-    })?;
-    Ok(set)
-}
-
 /// The synthesized corpus lives in one fixed, durable place — it is not an
 /// input. A per-run path is how successive runs paid for the whole corpus again:
 /// each was pointed at a freshly created directory, so the cache was always
@@ -646,22 +497,15 @@ fn corpus_cache(env: &impl Fn(&str) -> Option<OsString>) -> Result<PathBuf> {
     Ok(root.join("mahbot").join("wake-word-corpus"))
 }
 
-/// A positive whole number from a flag or its environment variable, or the
-/// documented default.
-fn whole_number(value: Option<String>, default: u64, spec: Spec) -> Result<u64> {
-    let parsed = match value {
-        Some(text) => text.parse::<u64>().with_context(|| {
-            format!(
-                "--{} / {} `{text}` is not a whole number",
-                spec.flag, spec.env
-            )
-        })?,
-        None => default,
-    };
-    if parsed == 0 {
-        bail!("--{} / {} must be at least 1", spec.flag, spec.env);
-    }
-    Ok(parsed)
+/// A bound from its flag or its environment variable, through the guard's one
+/// parser: the bench, the stand and the corpus run refuse a mistyped, empty or zero
+/// bound with the same rule, and the figure the bench is steered by is the figure it
+/// read. The value reaches the parser as given — a bound that is empty or not text is
+/// refused rather than read as absent, which is what would let a run under a bound
+/// nobody could read classify as complete and rewrite the record.
+fn bound(spec: Spec, value: Option<OsString>, default: u64) -> Result<u64> {
+    let source = format!("--{} / {}", spec.flag, spec.env);
+    crate::guard::whole_number(value, default, &source)
 }
 
 /// One model file resolved to an absolute path, with its size and digest.
@@ -676,7 +520,6 @@ impl Pin {
     /// The report cell for one file.
     pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::json!({
-            "path": self.path.to_string_lossy(),
             "file": self
                 .path
                 .file_name()
@@ -838,7 +681,7 @@ fn parse_flags(argv: impl IntoIterator<Item = String>) -> Result<HashMap<String,
 
 /// The value a spec was given: the flag wins over its environment variable, and the
 /// value is taken as written. What an empty or non-text value means is the caller's —
-/// every input but the three measurement aids reads it as absent, the aids refuse it.
+/// the path inputs read it as absent, the measurement aids and the bounds refuse it.
 fn given(
     flags: &HashMap<String, String>,
     env: &impl Fn(&str) -> Option<OsString>,
@@ -1027,29 +870,6 @@ mod tests {
         assert!(text.contains(CORPUS.env), "{text}");
     }
 
-    /// The recorded invocation must replay as written: the four role files are
-    /// what the run actually resolved, so they are what the line names — a
-    /// directory-based line would fail with "`--models` is required" once the
-    /// reader tried it from a checkout that has no such directory.
-    #[test]
-    fn the_recorded_command_names_the_files_the_run_used() {
-        let fixture = Fixture::new("command");
-        let cfg =
-            BenchConfig::resolve(fixture.args.clone(), test_env, Mode::Measure).expect("resolved");
-        let line = cfg.command_line();
-        for flag in ["--asr-body", "--asr-sound", "--tts-body", "--tts-sound"] {
-            assert!(line.contains(flag), "{flag} is missing from: {line}");
-        }
-        assert!(
-            !line.contains("--models"),
-            "the line must not depend on a directory: {line}"
-        );
-        for path in [&cfg.asr_body, &cfg.tts_sound, &cfg.voice, &cfg.corpus] {
-            let shown = crate::measurements::short_path(path);
-            assert!(line.contains(&shown), "{shown} is missing from: {line}");
-        }
-    }
-
     /// The report is a required input; the lock is not — it defaults to the one
     /// shared path every heavy run of this crate takes.
     #[test]
@@ -1173,54 +993,11 @@ mod tests {
     }
 
     #[test]
-    fn a_threshold_override_moves_the_numbers_it_names_and_nothing_else() {
-        let fixture = Fixture::new("thresholds");
-        let shipped = BenchConfig::resolve(fixture.args.clone(), test_env, Mode::Measure)
-            .expect("the fixture");
-        assert_eq!(shipped.thresholds, wake::Thresholds::DEFAULT);
-        assert!(!shipped.command_line().contains("--wake-thresholds"));
-
-        let mut argv = fixture.args.clone();
-        argv.extend(args(&[("wake-thresholds", "anchor=0.88, reset_ratio=0.5")]));
-        let point = BenchConfig::resolve(argv, test_env, Mode::Measure).expect("the override");
-        assert_eq!(point.thresholds.anchor, 0.88);
-        assert_eq!(point.thresholds.reset_ratio, 0.5);
-        assert_eq!(point.thresholds.floor_max, wake::MAX_SOFT_FLOOR);
-        assert!(
-            point.command_line().contains("--wake-thresholds"),
-            "an overridden run's provenance names the point: {}",
-            point.command_line()
-        );
-    }
-
-    #[test]
-    fn an_unusable_threshold_point_is_refused_before_a_model_is_opened() {
-        let fixture = Fixture::new("thresholds-bad");
-        for (value, wanted) in [
-            ("anchor=0.80", "single stride"),
-            ("anchor=0.65", "anchor must lie"),
-            (
-                "floor_min=0.9,floor_max=0.8",
-                "floor_min must be below floor_max",
-            ),
-            ("floor_min=-1.5", "inside (−1, 1)"),
-            ("reset_ratio=0", "reset_ratio must lie"),
-            ("adaptive_ceiling=-1", "positive ceiling"),
-        ] {
-            let mut argv = fixture.args.clone();
-            argv.extend(args(&[("wake-thresholds", value)]));
-            let err = BenchConfig::resolve(argv, test_env, Mode::Measure).expect_err(value);
-            assert!(format!("{err:#}").contains(wanted), "{value}: {err:#}");
-        }
-    }
-
-    #[test]
     fn a_screened_run_takes_only_the_phases_it_names() {
         let fixture = Fixture::new("phases");
         let full = BenchConfig::resolve(fixture.args.clone(), test_env, Mode::Measure)
             .expect("the fixture");
         assert!(full.phases.is_full());
-        assert!(!full.command_line().contains("--phases"));
 
         let mut argv = fixture.args.clone();
         argv.extend(args(&[("phases", "recall,non-phrase")]));
@@ -1242,62 +1019,6 @@ mod tests {
         assert!(format!("{err:#}").contains("recalll"), "{err:#}");
     }
 
-    /// A printed point is the override vocabulary: the record's threshold row and
-    /// the provenance line are pasted back into `--wake-thresholds`, and the
-    /// numbers they name are the ones that were measured — not a rounded point
-    /// that happens to look similar.
-    #[test]
-    fn a_printed_point_parses_back_to_itself() {
-        let shipped = wake::Thresholds::DEFAULT;
-        assert_eq!(parse_thresholds(&shipped.to_string()).unwrap(), shipped);
-        let mut point = shipped;
-        point.anchor = 0.8405;
-        point.reset_ratio = 0.7;
-        assert_eq!(parse_thresholds(&point.to_string()).unwrap(), point);
-    }
-
-    /// The recorded command replays the run it came from: every measurement aid
-    /// is named when it differs from the defaults, and the quoted values parse
-    /// back to the ones the run used.
-    #[test]
-    fn the_recorded_command_names_the_measurement_aids() {
-        let fixture = Fixture::new("aids");
-        let mut argv = fixture.args.clone();
-        argv.extend(args(&[
-            ("phases", "recall,real-audio"),
-            ("wake-thresholds", "anchor=0.86"),
-            ("voices", "3"),
-        ]));
-        let cfg = BenchConfig::resolve(argv, test_env, Mode::Measure).expect("the aids");
-        let line = cfg.command_line();
-
-        let quoted = |flag: &str| -> String {
-            line.split(&format!("{flag} \""))
-                .nth(1)
-                .and_then(|rest| rest.split('"').next())
-                .unwrap_or_else(|| panic!("{flag} is missing from {line}"))
-                .to_string()
-        };
-        assert_eq!(quoted("--phases"), "recall,real-audio");
-        assert_eq!(Phases::parse(&quoted("--phases")).unwrap(), cfg.phases);
-        assert_eq!(
-            parse_thresholds(&quoted("--wake-thresholds")).unwrap(),
-            cfg.thresholds
-        );
-        assert!(line.contains("--voices 3"), "{line}");
-        assert_eq!(cfg.voices, 3);
-    }
-
-    #[test]
-    fn an_unknown_threshold_name_is_an_error() {
-        let fixture = Fixture::new("thresholds-name");
-        let mut argv = fixture.args.clone();
-        argv.extend(args(&[("wake-thresholds", "treshold=0.8")]));
-        let err = BenchConfig::resolve(argv, test_env, Mode::Measure)
-            .expect_err("a typo must not be ignored");
-        assert!(format!("{err:#}").contains("treshold"));
-    }
-
     /// An empty value is refused on every measurement aid, from the flag and from
     /// the environment: a run that overrode nothing must not resolve to the shipped
     /// defaults and rewrite the record. The refusal names both places, since the
@@ -1306,11 +1027,6 @@ mod tests {
     fn an_empty_measurement_aid_is_an_error() {
         let fixture = Fixture::new("aids-empty");
         for (flag, env, wanted) in [
-            (
-                WAKE_THRESHOLDS.flag,
-                WAKE_THRESHOLDS.env,
-                "names no threshold",
-            ),
             (PHASES.flag, PHASES.env, "names no phase"),
             (VOICES.flag, VOICES.env, "is not a whole number"),
         ] {
@@ -1348,11 +1064,7 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         let fixture = Fixture::new("aids-bytes");
-        for (flag, env) in [
-            (WAKE_THRESHOLDS.flag, WAKE_THRESHOLDS.env),
-            (PHASES.flag, PHASES.env),
-            (VOICES.flag, VOICES.env),
-        ] {
+        for (flag, env) in [(PHASES.flag, PHASES.env), (VOICES.flag, VOICES.env)] {
             let bytes = OsString::from_vec(vec![0xff, b'=']);
             let err = BenchConfig::resolve(
                 fixture.args.clone(),
@@ -1372,17 +1084,70 @@ mod tests {
         }
     }
 
-    /// The same empty value is absent on every other input: a required one names
-    /// itself, a defaulted one takes its default — the aids are the exception.
+    /// An empty value is refused by a bound, from the flag or from the variable: a
+    /// run under a bound nobody could read must not take the default and then
+    /// classify as complete and rewrite the record. The stand and the corpus run read
+    /// the same variables through the same parser, so the answer is the same there.
     #[test]
-    fn an_empty_input_is_absent_outside_the_measurement_aids() {
-        let fixture = Fixture::new("inputs-empty");
-        let mut argv = fixture.args.clone();
-        argv.push("--timeout=".to_string());
-        let cfg = BenchConfig::resolve(argv, test_env, Mode::Measure)
-            .expect("an empty timeout is absent");
-        assert_eq!(cfg.timeout_secs, DEFAULT_TIMEOUT_SECS);
+    fn an_empty_bound_is_refused_rather_than_defaulted() {
+        let fixture = Fixture::new("bounds-empty");
+        for (flag, env) in [(TIMEOUT.flag, TIMEOUT.env), (MAX_RSS.flag, MAX_RSS.env)] {
+            let mut argv = fixture.args.clone();
+            argv.push(format!("--{flag}="));
+            let err =
+                BenchConfig::resolve(argv, test_env, Mode::Measure).expect_err("an empty flag");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(&format!("--{flag} / {env}")),
+                "{env}: {message}"
+            );
+            assert!(
+                message.contains("is not a whole number"),
+                "{env}: {message}"
+            );
 
+            let empty = |name: &str| {
+                if name == env {
+                    Some(OsString::new())
+                } else {
+                    test_env(name)
+                }
+            };
+            let err = BenchConfig::resolve(fixture.args.clone(), empty, Mode::Measure)
+                .expect_err("an empty variable");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(&format!("--{flag} / {env}")),
+                "{env}: {message}"
+            );
+            assert!(
+                message.contains("is not a whole number"),
+                "{env}: {message}"
+            );
+        }
+        // The swap-growth ceiling is the third bound, and reads the same way.
+        let err = BenchConfig::resolve(
+            fixture.args.clone(),
+            |name| {
+                if name == "MAHBOT_STAND_MAX_SWAP_MIB" {
+                    Some(OsString::new())
+                } else {
+                    test_env(name)
+                }
+            },
+            Mode::Measure,
+        )
+        .expect_err("an empty swap bound");
+        assert!(
+            format!("{err:#}").contains("MAHBOT_STAND_MAX_SWAP_MIB"),
+            "{err:#}"
+        );
+    }
+
+    /// An empty value on every other input is absent: a required one names itself.
+    #[test]
+    fn an_empty_input_is_absent_outside_the_bounds_and_aids() {
+        let fixture = Fixture::new("inputs-empty");
         let mut argv = fixture.args.clone();
         argv.push("--voice=".to_string());
         let err = BenchConfig::resolve(argv, test_env, Mode::Measure).expect_err("an empty voice");
@@ -1410,7 +1175,6 @@ mod tests {
             args(&[("voices", "3")]),
             args(&[("phases", "recall")]),
             args(&[("timeout", "600")]),
-            args(&[("wake-thresholds", "anchor=0.86")]),
         ] {
             let mut full = fixture.without("report");
             full.extend(argv.clone());
@@ -1434,8 +1198,8 @@ mod tests {
     /// environment the run was resolved from, not from the live process.
     #[test]
     fn a_raised_swap_bound_is_screened() {
-        assert!(!swap_bound_is_raised(crate::guard::MAX_SWAP_GROWTH_MIB));
-        assert!(swap_bound_is_raised(crate::guard::MAX_SWAP_GROWTH_MIB + 1));
+        assert!(crate::run::bound_reasons(0, 0, crate::guard::MAX_SWAP_GROWTH_MIB).is_empty());
+        assert!(!crate::run::bound_reasons(0, 0, crate::guard::MAX_SWAP_GROWTH_MIB + 1).is_empty());
 
         let fixture = Fixture::new("swap");
         let raised = |name: &str| {
@@ -1494,7 +1258,6 @@ mod tests {
             args(&[("phases", "recall")]),
             args(&[("timeout", "7200")]),
             args(&[("max-rss", "8192")]),
-            args(&[("wake-thresholds", "anchor=0.86")]),
         ] {
             let mut full = fixture.args.clone();
             full.extend(argv.clone());
