@@ -206,6 +206,21 @@ pub fn step_census(names: &[&'static str]) -> String {
         .join("+")
 }
 
+/// The packed multiplies one audio-encoder block dispatches: four when its three attention
+/// input projections ride one fused blob (the projection, `attn_out`, `ffn_up`, `ffn_down`),
+/// six when they ride three separate ones.
+pub const PER_BLOCK_FUSED: usize = 4;
+pub const PER_BLOCK_SPLIT: usize = 6;
+
+/// The packed multiplies a schedule names — which of the two routes a block took, read off
+/// the only place the difference is visible.
+pub fn packed_multiplies(names: &[&'static str]) -> usize {
+    names
+        .iter()
+        .filter(|name| **name == "dequant_matmul_gguf")
+        .count()
+}
+
 /// Packed bytes one harness call streams, so a call is long enough to leave its own
 /// submission behind.
 pub const TARGET_BYTES: u64 = 96 * 1024 * 1024;

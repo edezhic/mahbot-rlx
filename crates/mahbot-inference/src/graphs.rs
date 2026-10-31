@@ -56,6 +56,11 @@ pub struct BlkSpec {
 /// Emit one block over `m` rows of `seq` sequence positions each, so `m / seq`
 /// independent sequences share the weights in one pass. `seq == m` is the one
 /// sequence every other graph here uses, and the graph it emits is unchanged.
+///
+/// `qkv_fused` takes the block's three attention input projections from the one wide
+/// blob the graph's load-time fuse concatenated (`{p}.qkv.fused`) instead of three passes
+/// over the three tensors: the same bytes, read in one pass and split back into q/k/v
+/// along the output rows.
 pub fn block(
     ctx: &mut FlowCtx<'_>,
     model: &Model,
@@ -64,6 +69,7 @@ pub fn block(
     x: HirNodeId,
     m: usize,
     seq: usize,
+    qkv_fused: bool,
     rope: Option<(HirNodeId, HirNodeId)>,
 ) -> Result<HirNodeId> {
     let h = if b.rms {
@@ -82,20 +88,34 @@ pub fn block(
         (b.kv_heads * b.head_dim) as i64,
     ];
 
-    // Projections: one call site, two weight paths (packed body / unpacked sound);
-    // the biases ride outside the multiply, as the caller adds them below.
-    let [q_mm, k_mm, v_mm] = emit::qkv(
-        ctx,
-        model,
-        h,
-        m,
-        b.d,
-        [
-            &format!("{p}.attn_q.weight"),
-            &format!("{p}.attn_k.weight"),
-            &format!("{p}.attn_v.weight"),
-        ],
-    )?;
+    // The three projections: one fused packed pass over the blob the load-time fuse built
+    // when the file's q/k/v share one, three separate passes when they cannot. The biases
+    // ride outside the multiply, as the caller adds them below.
+    let [q_mm, k_mm, v_mm] = if qkv_fused {
+        emit::qkv_fused(
+            ctx,
+            &FlowValue::new(h, Shape::new(&[m, b.d], DType::F32)),
+            p,
+            [
+                b.heads * b.head_dim,
+                b.kv_heads * b.head_dim,
+                b.kv_heads * b.head_dim,
+            ],
+        )?
+    } else {
+        emit::qkv(
+            ctx,
+            model,
+            h,
+            m,
+            b.d,
+            [
+                &format!("{p}.attn_q.weight"),
+                &format!("{p}.attn_k.weight"),
+                &format!("{p}.attn_v.weight"),
+            ],
+        )?
+    };
 
     let (q, k, v) = if b.bias {
         let bq = emit::f32_param(
@@ -391,6 +411,11 @@ pub struct EncoderTail {
     pub frames: usize,
     /// Independent windows in the pass; each carries its own `tokens` rows.
     pub batch: usize,
+    /// The blocks' three attention input projections were fused into one blob at load
+    /// time, so every block reads q/k/v as one wide packed pass; false means each block
+    /// reads them as three separate passes. The shipped `mmproj` fuses, so its encoder
+    /// never takes that form.
+    pub qkv_fused: bool,
 }
 
 impl EncoderTail {
@@ -461,7 +486,17 @@ impl LayerStage for EncoderTail {
 
         let spec = self.spec();
         for i in 0..c.layers {
-            x = block(ctx, model, &format!("a.blk.{i}"), &spec, x, m, tokens, None)?;
+            x = block(
+                ctx,
+                model,
+                &format!("a.blk.{i}"),
+                &spec,
+                x,
+                m,
+                tokens,
+                self.qkv_fused,
+                None,
+            )?;
         }
         let gamma = emit::f32_param(ctx, model, "a.post_ln.weight", &[c.dim])?;
         let beta = emit::f32_param(ctx, model, "a.post_ln.bias", &[c.dim])?;
@@ -479,6 +514,7 @@ impl LayerStage for EncoderTail {
 pub fn asr_encoder(model: Arc<Model>, frames: usize) -> Result<BuiltModel> {
     let c = model.clip().clone();
     let mut weights = LoaderWeights::new(model.clone());
+    let qkv_fused = fuse_projection(&mut weights, c.layers, "a.", &QKV_PARTS, "qkv")?;
     let flow = ModelFlow::new(format!("asr_enc_{frames}"))
         .with_profile(profile())
         .input("mel", Shape::new(&[1, 1, c.mel_bins, frames], DType::F32))
@@ -490,6 +526,7 @@ pub fn asr_encoder(model: Arc<Model>, frames: usize) -> Result<BuiltModel> {
             model,
             frames,
             batch: 1,
+            qkv_fused,
         })
         .output("tokens");
     flow.build(&mut weights).map_err(Into::into)
@@ -513,6 +550,7 @@ pub fn asr_encoder_tail(model: Arc<Model>, frames: usize, batch: usize) -> Resul
     let c = model.clip().clone();
     let flat = flat_width(c.mel_bins);
     let mut weights = LoaderWeights::new(model.clone());
+    let qkv_fused = fuse_projection(&mut weights, c.layers, "a.", &QKV_PARTS, "qkv")?;
     let flow = ModelFlow::new(format!("asr_tail_{frames}x{batch}"))
         .with_profile(profile())
         .input(
@@ -523,6 +561,7 @@ pub fn asr_encoder_tail(model: Arc<Model>, frames: usize, batch: usize) -> Resul
             model,
             frames,
             batch,
+            qkv_fused,
         })
         .output("tokens");
     flow.build(&mut weights).map_err(Into::into)
@@ -807,16 +846,11 @@ impl LayerStage for BodyStateStage {
             let h = emit::rms_norm(ctx, x, gamma, eps, &[m, d]);
             let lc = |x: HirNodeId| FlowValue::new(x, Shape::new(&[m, d], DType::F32));
             let (q, k, v) = if self.fused {
-                let parts = emit::linear_fused(
-                    ctx,
-                    &lc(h),
-                    &format!("{p}.qkv.fused"),
-                    &[nh * hd, hkv, hkv],
-                )?;
+                let [q, k, v] = emit::qkv_fused(ctx, &lc(h), &p, [nh * hd, hkv, hkv])?;
                 (
-                    FlowValue::new(parts[0], Shape::new(&[m, nh * hd], DType::F32)),
-                    FlowValue::new(parts[1], Shape::new(&[m, hkv], DType::F32)),
-                    FlowValue::new(parts[2], Shape::new(&[m, hkv], DType::F32)),
+                    FlowValue::new(q, Shape::new(&[m, nh * hd], DType::F32)),
+                    FlowValue::new(k, Shape::new(&[m, hkv], DType::F32)),
+                    FlowValue::new(v, Shape::new(&[m, hkv], DType::F32)),
                 )
             } else {
                 (
@@ -1067,62 +1101,69 @@ impl LayerStage for BodyStateStage {
     }
 }
 
-/// Fuse the body's two projections, each for the whole graph or not at all: the decision is
-/// taken for every layer before the first blob is built, so a graph that cannot fuse one
-/// projection parks nothing for the layers it would have taken. The two flags are
-/// **independent** — on the pinned Q4_K_M body `attn_v` is Q6_K, so q/k/v cannot share one
-/// blob while gate+up can, and coupling them would park both spellings of every ffn and put
-/// two copies of it on the device.
+/// The three attention input projections' names inside a block.
+const QKV_PARTS: [&str; 3] = ["attn_q", "attn_k", "attn_v"];
+
+/// Fuse one projection (q/k/v or gate/up) for the whole graph or not at all: the
+/// decision is taken for every layer before the first blob is built, so a graph that
+/// cannot fuse it parks nothing for the layers it would have taken.
 ///
-/// A projection's fuse can still be refused per layer after the graph-level decision — a
-/// stacked tensor's step, say. The layers before the refusal keep the blobs already built
-/// in the process cache while the graph is then built without them; that residue is bounded
-/// by one projection of one graph and is the price of deciding before building rather than
-/// parking a second spelling of every layer, which is what the alternative costs.
+/// A fuse can still be refused per layer after the graph-level decision — a stacked
+/// tensor's step, say. The layers before the refusal keep the blobs already built in
+/// the process cache while the graph is then built without them; that residue is
+/// bounded by one projection of one graph and is the price of deciding before building
+/// rather than parking a second spelling of every layer, which is what the alternative
+/// costs.
 ///
-/// `prefix` is the blocks' own name prefix (`""` for the body, `a.gen.code.` for the code
-/// predictor), so both layouts of one file ask the weight pool for the same blob names.
-fn fuse_layer_projections(
+/// `prefix` is the blocks' own name prefix (`""` for the body, `a.gen.code.` for the
+/// code predictor, `a.` for the audio encoder), so both layouts of one file ask the
+/// weight pool for the same blob names.
+fn fuse_projection(
     weights: &mut LoaderWeights,
     layers: usize,
     prefix: &str,
-) -> Result<(bool, bool)> {
-    const QKV: [&str; 3] = ["attn_q", "attn_k", "attn_v"];
-    const GATE_UP: [&str; 2] = ["ffn_gate", "ffn_up"];
-    let names = |i: usize, parts: &[&str]| -> Vec<String> {
+    parts: &[&str],
+    blob: &str,
+) -> Result<bool> {
+    let keys = |i: usize| -> Vec<String> {
         parts
             .iter()
             .map(|p| format!("{prefix}blk.{i}.{p}.weight"))
             .collect()
     };
-    let admits = |weights: &LoaderWeights, parts: &[&str]| -> Result<bool> {
-        for i in 0..layers {
-            let keys = names(i, parts);
-            if !weights.can_fuse(&keys.iter().map(String::as_str).collect::<Vec<_>>())? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    };
-    let (mut qkv, mut gate_up) = (admits(weights, &QKV)?, admits(weights, &GATE_UP)?);
-    for (fuse, parts, blob) in [
-        (&mut qkv, &QKV[..], "qkv"),
-        (&mut gate_up, &GATE_UP[..], "gate_up"),
-    ] {
-        for i in 0..layers {
-            if !*fuse {
-                break;
-            }
-            let keys = names(i, parts);
-            // A layer the fuse refused changes the answer for the whole graph: the layers
-            // are then built without a blob that was not made.
-            *fuse = weights.fuse_packed(
-                &format!("{prefix}blk.{i}.{blob}.fused"),
-                &keys.iter().map(String::as_str).collect::<Vec<_>>(),
-            )?;
+    for i in 0..layers {
+        let keys = keys(i);
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        if !weights.can_fuse(&refs)? {
+            return Ok(false);
         }
     }
-    Ok((qkv, gate_up))
+    for i in 0..layers {
+        let keys = keys(i);
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        // A layer the fuse refused changes the answer for the whole graph: the layers are
+        // then built without a blob that was not made.
+        if !weights.fuse_packed(&format!("{prefix}blk.{i}.{blob}.fused"), &refs)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Fuse the body's two projections, each for the whole graph or not at all
+/// ([`fuse_projection`]). The two flags are **independent** — on the pinned Q4_K_M body
+/// `attn_v` is Q6_K, so q/k/v cannot share one blob while gate+up can, and coupling
+/// them would park both spellings of every ffn and put two copies of it on the device.
+fn fuse_layer_projections(
+    weights: &mut LoaderWeights,
+    layers: usize,
+    prefix: &str,
+) -> Result<(bool, bool)> {
+    const GATE_UP: [&str; 2] = ["ffn_gate", "ffn_up"];
+    Ok((
+        fuse_projection(weights, layers, prefix, &QKV_PARTS, "qkv")?,
+        fuse_projection(weights, layers, prefix, &GATE_UP, "gate_up")?,
+    ))
 }
 
 /// The body on a **growing** cache with the file's own head: `m` prompt rows,
@@ -1909,13 +1950,7 @@ fn emit_predictor_blocks(
         let gamma = emit::f32_param(ctx, model, &format!("{p}.ln1.weight"), &[d_pred])?;
         let h = emit::rms_norm(ctx, x, gamma, eps, &[m, d_pred]);
         let [q, k, v] = if fused {
-            let parts = emit::linear_fused(
-                ctx,
-                &lc(h),
-                &format!("{p}.qkv.fused"),
-                &[nh * head_dim, hkv, hkv],
-            )?;
-            [parts[0], parts[1], parts[2]]
+            emit::qkv_fused(ctx, &lc(h), &p, [nh * head_dim, hkv, hkv])?
         } else {
             emit::qkv(
                 ctx,
@@ -2936,6 +2971,11 @@ impl Compiled {
     /// not have them copied just to be read.
     pub fn run_slices(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         self.runner.run_slices(inputs)
+    }
+
+    /// [`Runner::schedule_step_names`] on this graph.
+    pub fn schedule_step_names(&self) -> Option<Vec<&'static str>> {
+        self.runner.schedule_step_names()
     }
 }
 

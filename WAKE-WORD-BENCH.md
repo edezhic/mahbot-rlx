@@ -9,8 +9,8 @@
 | positives (pooled) | 61/550 (11.1 %) |
 | false accepts | 2 events · 2.4773/h over VAD-active speech (0.807 h) · 1.8756/h over wall-clock audio (1.066 h) · one event = 1.2386/h |
 | derived point | floor 0.7500 · fire factor 0.3520 · static bar 1.0560 · reset 0.3344 |
-| wall clock | 809.3 s |
-| peak resident | 1.85GiB |
+| wall clock | 743.2 s |
+| peak resident | 2.00GiB |
 
 One complete run: recall and false reactions in each of the eleven voices, and the false accepts per hour over the pinned real-audio corpus.
 
@@ -48,11 +48,11 @@ Pooled over 11 voices: 104 clips each, not 1144 independent trials.
 
 Pooled over 11 voices: 50 clips each, not 550 independent utterances.
 
-_Measured 2026-10-31 14:20 UTC._
+_Measured 2026-10-31 20:26 UTC._
 - machine: arm64 · Apple M3 Pro
 - device: Apple M3 Pro (Metal)
 - profile: release
-- code: e199dfd4 change-sha256 768d65d2becdb727 (the commit and the SHA-256 of the tree's difference from it, `STAND.md`, `TRANSCRIPTION-CORPUS.md`, `WAKE-WORD-BENCH.md`, `crates/backends/rlx-mlx-sys` left out)
+- code: 6aa0afa2 change-sha256 4c14684345ff5529 (the commit and the SHA-256 of the tree's difference from it, `STAND.md`, `TRANSCRIPTION-CORPUS.md`, `WAKE-WORD-BENCH.md`, `crates/backends/rlx-mlx-sys` left out)
 - command: cargo bench -p mahbot-inference --features bench --bench wake_word -- --report <file>
 - models: `~/.mahbot/userspaces/admin/models`
 - corpus: `~/.mahbot/faph_corpus`

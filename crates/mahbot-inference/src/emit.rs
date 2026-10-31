@@ -415,7 +415,11 @@ static SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
     std::sync::OnceLock::new();
 
 /// `true` when this call is the second (or later) ask for the weight, and keeping it is
-/// therefore worth the memory.
+/// therefore worth the memory. What is kept lives on the host until [`clear_weight_caches`],
+/// so a process that builds two shapes of one model — the wake bench's single-window and
+/// grouped encoders, a transcription's rung ladder — carries one extra copy per fused blob in
+/// every later footprint reading, with the concatenation itself holding a second copy for as
+/// long as it is being built.
 fn worth_keeping(model: &Model, key: &str) -> bool {
     let entry = (model.path.display().to_string(), key.to_string());
     match SEEN
@@ -990,10 +994,24 @@ pub fn linear_fused(
     Ok(out)
 }
 
-/// One block's three attention projections: each key through
-/// [`linear_encoder`] on its own — three multiplies. That entry is [`linear`]
-/// for every store the loader did not declare f16, so the packed body and the
-/// sound stage share this call site.
+/// A block's q/k/v out of the one blob a file's load-time fuse concatenated at
+/// `{p}.qkv.fused`: one packed multiply over the three widths joined, split back into q, k
+/// and v. A caller whose file cannot fuse takes [`qkv`] instead.
+pub fn qkv_fused(
+    ctx: &mut FlowCtx<'_>,
+    x: &rlx_flow::FlowValue,
+    p: &str,
+    widths: [usize; 3],
+) -> Result<[HirNodeId; 3]> {
+    let parts = linear_fused(ctx, x, &format!("{p}.qkv.fused"), &widths)?;
+    Ok([parts[0], parts[1], parts[2]])
+}
+
+/// One block's three attention projections as three multiplies, each key through
+/// [`linear_encoder`] on its own: the arm [`crate::graphs::block`] and the code
+/// predictor's blocks keep for a file whose q/k/v cannot share one blob (all three
+/// packed, one scheme, one in-dim, as [`LoaderWeights::can_fuse`] answers), and what the
+/// wave transformer always does.
 pub fn qkv(
     ctx: &mut FlowCtx<'_>,
     model: &Model,

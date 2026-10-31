@@ -523,7 +523,9 @@ pub(crate) fn argmax(v: &[f32]) -> u32 {
     best.1
 }
 
-pub(crate) fn mean_pool(values: &[f32], rows: usize, dim: usize) -> Result<Vec<f32>> {
+/// The mean of `rows` rows of width `dim`: the pooling [`Listener::embed`] and the group
+/// front end do before [`l2`].
+pub fn mean_pool(values: &[f32], rows: usize, dim: usize) -> Result<Vec<f32>> {
     if rows == 0 || dim == 0 {
         return Err(anyhow!("mean pool over {rows} rows of width {dim}"));
     }
@@ -547,7 +549,9 @@ pub(crate) fn mean_pool(values: &[f32], rows: usize, dim: usize) -> Result<Vec<f
     Ok(out)
 }
 
-pub(crate) fn l2(v: &[f32]) -> Vec<f32> {
+/// `v` at unit length: what the wake decision compares two embeddings by, once the pooled
+/// row is this.
+pub fn l2(v: &[f32]) -> Vec<f32> {
     let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
     v.iter().map(|x| x / n).collect()
 }

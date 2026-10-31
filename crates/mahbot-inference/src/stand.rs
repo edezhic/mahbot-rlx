@@ -69,7 +69,7 @@ const SYNTH_SEED: u64 = 1;
 /// The speech window in the recorded voice: the file is silent up to ~1.16 s, so
 /// the ear starts where there is speech. The reference window is a later segment
 /// of the same recording, used only as the cosine's other side.
-const WAKE_OFFSET: usize = 16_000;
+pub const WAKE_OFFSET: usize = 16_000;
 const WAKE_REFERENCE_OFFSET: usize = 60_000;
 
 /// What one row measures, and the witness its output is printed against.
