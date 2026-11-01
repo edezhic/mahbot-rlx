@@ -636,8 +636,7 @@ fn measure(
         deadline,
         ceiling,
     )?;
-    let mut listener =
-        listen::Listener::new(Arc::clone(&asr)).context("cannot build the listening path")?;
+    let mut listener = listen::Listener::new(Arc::clone(&asr));
     // The build's own account of this generation: a manifest that cannot be read is
     // refused here rather than letting a cache of another generation look warm.
     let generation = inputs.synthesis_hash();
@@ -1226,6 +1225,12 @@ fn measure_non_speech(
 /// — the trailing-silence flush, which is how a match on the phrase's last
 /// frames is counted. Once the segment boundary closes no further fire is
 /// possible; the rest of the two-second gap only re-arms the stream.
+///
+/// The clip set is measured one window per resolve ([`warm_stream`]), so each
+/// [`feed`](DetectionStream::feed) leaves nothing queued; the flush at the end of
+/// the clip's turn is what keeps that true of any grouping — a window still
+/// waiting for the neighbour that a paired stream would give it is scored here,
+/// inside the clip it belongs to, rather than at the next clip's boundary.
 fn feed_clip(
     stream: &mut DetectionStream,
     listener: &mut listen::Listener,
@@ -1247,7 +1252,11 @@ fn feed_clip(
         }
         remaining = rest;
     }
-    Ok(hit)
+    stream.flush(listener, deadline, phase)?;
+    // Read after the flush whatever the clip already had: a fire the flush scored
+    // belongs to this clip, and leaving it queued would credit it to the next one.
+    let flushed = stream.take_fires();
+    Ok(hit || flushed > 0)
 }
 
 /// Feed one slice and report whether it fired, whether or not the slice ran to

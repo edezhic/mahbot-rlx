@@ -7,9 +7,10 @@
 //!
 //! [`Listener::embed`] is the wake decision's input — one VAD-gated speech
 //! window through the sound encoder and the projector, mean-pooled and
-//! L2-normalized. The real-audio sweep takes the same front end cut in two
-//! (`GroupFront`): the conv front per window, the encoder tail and the projector
-//! once for a group of windows.
+//! L2-normalized — and [`Listener::embed_pair`] scores two consecutive windows in
+//! one batched pass, which is the form the detector runs. The real-audio sweep
+//! takes the same front end cut in two (`GroupFront`): the conv front per window,
+//! the encoder tail and the projector once for a group of windows.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -30,6 +31,15 @@ pub const MEL_FRAMES: usize = 76;
 
 /// Samples in the wake window: [`MEL_FRAMES`] hops.
 pub const WINDOW_SAMPLES: usize = 12_160;
+/// The front end refuses a window that is not whole hops, so the wake window's own
+/// length and the front end's must be the same number.
+const _: () = assert!(WINDOW_SAMPLES == MEL_FRAMES * graphs::MEL_HOP);
+
+/// Samples between two consecutive scoring windows: 16 mel frames at the
+/// encoder's 160-sample hop, i.e. the 160 ms stride a live ear advances by. It is
+/// also the distance between the two windows of one [`PAIR`] and, therefore, the
+/// most a fire can be resolved later than a one-window pass would resolve it.
+pub const SCORE_STRIDE_SAMPLES: usize = 16 * graphs::MEL_HOP;
 
 /// The most audio one recognition pass takes: 30 s (3 000 mel frames, 375 audio
 /// tokens). The encoder
@@ -86,30 +96,41 @@ pub const DECODE_CACHE_BUCKET: usize = 128;
 /// The front end's three graphs for one frame count: mel, encoder and projector.
 /// Built and run in this order everywhere the path measures — the ear's window, a
 /// recognition segment, the tagger's own front — so the input names and the frame
-/// arithmetic are stated once. One window per call.
+/// arithmetic are stated once.
+///
+/// `batch` independent windows ride one pass over each stage: the mel front end and
+/// the convs carry their own batch axis and the tail and projector take the rows of
+/// the whole batch, so a window's result does not depend on which slot it took.
 ///
 /// The mel graph is not this clip's own: it has no weights and its shape is the frame
-/// count, so every clip that reads the same count runs the same compiled graph
-/// ([`mel_graph`]). A transcription cuts its chunks onto a closed ladder of frame counts
-/// ([`crate::transcribe::FRAME_RUNGS`]), so the mel graphs a process compiles are that
-/// ladder's — one each, however many chunks the pass reads.
+/// count and the batch, so every clip that reads the same shape runs the same compiled
+/// graph ([`mel_graph`]). A transcription cuts its chunks onto a closed ladder of frame
+/// counts ([`crate::transcribe::FRAME_RUNGS`]), so the one-window mel graphs a process
+/// compiles are that ladder's — one each, however many chunks the pass reads — and the
+/// ear's pair adds one more, at its own batch.
 pub(crate) struct Front {
     mel: Arc<Mutex<Compiled>>,
     encoder: Arc<Mutex<Compiled>>,
     projector: Arc<Mutex<Compiled>>,
+    /// Independent windows one pass carries.
+    batch: usize,
+    /// Samples one independent window of this front is (`MEL_HOP * frames`), so a
+    /// recognition chunk of `frames` frames is read in full rather than as a wake
+    /// window. A pass hands the mel graph `batch` of them, `batch * samples` values.
+    samples: usize,
     build_ms: f64,
 }
 
-/// The mel graphs a process keeps: the length the ear's window asks for and the rung a pass
-/// of one piece settles on, with room for a second rung without evicting the first. An
-/// evicted entry is a recompile, never a wrong answer; before the bound a process handed
-/// many lengths kept one graph each for the life of the process.
+/// The mel graphs a process keeps, keyed by `(frames, bins, batch)`: a small LRU, so the
+/// ear's two (its window and its pair) stay warm while a transcription walks the rungs of
+/// [`crate::transcribe::FRAME_RUNGS`], whose six are more than this holds — a rung it comes
+/// back to is recompiled. An evicted entry is a recompile, never a wrong answer.
 const MEL_GRAPH_ENTRIES: usize = 4;
 
 /// The process's mel graphs and their least-recently-used order.
 type MelGraphs = (
-    HashMap<(usize, usize), Arc<Mutex<Compiled>>>,
-    std::collections::VecDeque<(usize, usize)>,
+    HashMap<(usize, usize, usize), Arc<Mutex<Compiled>>>,
+    std::collections::VecDeque<(usize, usize, usize)>,
 );
 
 fn mel_graphs() -> &'static Mutex<MelGraphs> {
@@ -117,24 +138,25 @@ fn mel_graphs() -> &'static Mutex<MelGraphs> {
     MEL.get_or_init(|| Mutex::new((HashMap::new(), std::collections::VecDeque::new())))
 }
 
-/// The mel graph for one frame count and bin count, compiled once for the process: it
-/// has no weights, so two clips of the same length share it exactly. Held behind a lock
+/// The mel graph for one frame count, bin count and batch, compiled once for the process:
+/// it has no weights, so two clips of the same shape share it exactly. Held behind a lock
 /// because a run needs `&mut`.
 ///
-/// Keyed by the caller's own audio length, so the cache could otherwise collect one graph
+/// Keyed by the caller's own audio shape, so the cache could otherwise collect one graph
 /// per length a long-lived process is handed. It is bounded instead ([`MEL_GRAPH_ENTRIES`])
 /// and cleared with the ladder ([`release_rungs`]).
-fn mel_graph(frames: usize, bins: usize) -> Result<Arc<Mutex<Compiled>>> {
+fn mel_graph(frames: usize, bins: usize, batch: usize) -> Result<Arc<Mutex<Compiled>>> {
+    let batch = batch.max(1);
     let mut guard = mel_graphs().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(graph) = guard.0.get(&(frames, bins)) {
+    if let Some(graph) = guard.0.get(&(frames, bins, batch)) {
         let graph = Arc::clone(graph);
-        guard.1.retain(|key| *key != (frames, bins));
-        guard.1.push_back((frames, bins));
+        guard.1.retain(|key| *key != (frames, bins, batch));
+        guard.1.push_back((frames, bins, batch));
         return Ok(graph);
     }
     let graph = Arc::new(Mutex::new(Compiled::new(
         rlx_runtime::Device::Gpu,
-        graphs::mel_frontend(frames, bins)?,
+        graphs::mel_frontend(frames, bins, batch)?,
     )?));
     while guard.0.len() >= MEL_GRAPH_ENTRIES {
         let Some(oldest) = guard.1.pop_front() else {
@@ -142,28 +164,32 @@ fn mel_graph(frames: usize, bins: usize) -> Result<Arc<Mutex<Compiled>>> {
         };
         guard.0.remove(&oldest);
     }
-    guard.0.insert((frames, bins), Arc::clone(&graph));
-    guard.1.push_back((frames, bins));
+    guard.0.insert((frames, bins, batch), Arc::clone(&graph));
+    guard.1.push_back((frames, bins, batch));
     Ok(graph)
 }
 
 impl Front {
-    pub(crate) fn build(pair: &Arc<Pair>, frames: usize) -> Result<Self> {
+    pub(crate) fn build(pair: &Arc<Pair>, frames: usize, batch: usize) -> Result<Self> {
+        let batch = batch.max(1);
         let t = crate::report::Stopwatch::start();
         let tokens = graphs::asr_tokens(frames);
-        let mel = mel_graph(frames, pair.sound.clip().mel_bins)?;
+        let samples = graphs::MEL_HOP * frames;
+        let mel = mel_graph(frames, pair.sound.clip().mel_bins, batch)?;
         let encoder = Arc::new(Mutex::new(Compiled::new(
             rlx_runtime::Device::Gpu,
-            graphs::asr_encoder(pair.sound.clone(), frames)?,
+            graphs::asr_encoder(pair.sound.clone(), frames, batch)?,
         )?));
         let projector = Arc::new(Mutex::new(Compiled::new(
             rlx_runtime::Device::Gpu,
-            graphs::projector_chain(pair.clone(), tokens)?,
+            graphs::projector_chain(pair.clone(), batch * tokens)?,
         )?));
         Ok(Self {
             mel,
             encoder,
             projector,
+            batch,
+            samples,
             build_ms: t.ms(),
         })
     }
@@ -172,8 +198,35 @@ impl Front {
         self.build_ms
     }
 
-    /// The three runs, for a recognition pass: the mel, the encoder and the projector.
-    pub(crate) fn run(&self, audio: Vec<f32>) -> Vec<f32> {
+    /// One pass of the three graphs over `batch` windows, each exactly this front's
+    /// own length ([`Self::samples`]), in slot order: each window's projected token
+    /// rows (`tokens × projection_dim`). The caller pads — [`trailing_window`] is the
+    /// wake path's own — so a window of another length is a named error, never a
+    /// silent trim.
+    fn forward(&self, windows: &[&[f32]]) -> Result<Vec<Vec<f32>>> {
+        let (batch, samples) = (self.batch, self.samples);
+        if windows.len() != batch {
+            return Err(anyhow!(
+                "{} windows in a front end built for {batch}",
+                windows.len()
+            ));
+        }
+        let mut audio = Vec::with_capacity(batch * samples);
+        for window in windows {
+            if window.len() != samples {
+                return Err(anyhow!(
+                    "a {}-sample window in a front end built for {samples}",
+                    window.len()
+                ));
+            }
+            audio.extend_from_slice(window);
+        }
+        split_windows(self.pass(audio)?, batch)
+    }
+
+    /// The three graphs over one mel input of [`Self::batch`] windows: the projected
+    /// token rows of the whole pass, `batch × tokens × projection_dim` values.
+    fn pass(&self, audio: Vec<f32>) -> Result<Vec<f32>> {
         let mel = self
             .mel
             .lock()
@@ -183,13 +236,31 @@ impl Front {
             .encoder
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .run(&[("mel".into(), mel[0].clone())]);
-        let mut projector = self
-            .projector
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .run(&[("features".into(), encoder[0].clone())]);
-        projector.remove(0)
+            .run(&[("mel".into(), first(mel, "mel front end")?)]);
+        first(
+            self.projector
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .run(&[("features".into(), first(encoder, "encoder")?)]),
+            "projector",
+        )
+    }
+
+    /// The three runs for one recognition chunk: its mel, the encoder and the projector.
+    /// The caller's buffer is the mel graph's input — a chunk of exactly this front's
+    /// length ([`Self::samples`]) is handed over rather than copied into a batch of one,
+    /// and a chunk of any other length is a named error, never a silent trim. Only a
+    /// one-window front serves this path; every caller here builds one
+    /// ([`Self::build`] with `batch = 1`).
+    pub(crate) fn run(&self, audio: Vec<f32>) -> Result<Vec<f32>> {
+        let samples = self.samples;
+        if audio.len() != samples {
+            return Err(anyhow!(
+                "a {}-sample chunk in a front end built for {samples}",
+                audio.len()
+            ));
+        }
+        self.pass(audio)
     }
 }
 
@@ -229,7 +300,7 @@ impl Rung {
     fn build(pair: &Arc<Pair>, frames: usize) -> Result<Self> {
         Ok(Self {
             pair: Arc::clone(pair),
-            front: Front::build(pair, frames)?,
+            front: Front::build(pair, frames, 1)?,
             prefills: Mutex::new(HashMap::new()),
             decode: shared_decode(pair)?,
             tokens: graphs::asr_tokens(frames),
@@ -334,10 +405,14 @@ pub(crate) fn rung(pair: &Arc<Pair>, frames: usize) -> Result<(Arc<Rung>, Option
 }
 
 /// The same front end cut where a group pass needs it: the conv front runs one
-/// window per call (its route costs a window's work per window whatever the
-/// batch axis says), and the tail — `conv_out`, the position table, the 24 CLIP
+/// window per call and the tail — `conv_out`, the position table, the 24 CLIP
 /// blocks, `post_ln` — runs over the whole group in one pass, with the projector
 /// after it. That is where the weight reads and the multiplies amortise.
+///
+/// The conv front is left one window per call on purpose: `batch` here is the
+/// sweep's sixteen, and the im2col panel a batched conv front reserves is
+/// `batch` panels wide ([`crate::graphs::EncoderConvs`] takes a windows-wide batch
+/// for the pair, where that panel is two). The tail is what sixteen windows share.
 pub(crate) struct GroupFront {
     mel: Compiled,
     convs: Compiled,
@@ -356,7 +431,7 @@ impl GroupFront {
         let bins = pair.sound.clip().mel_bins;
         let mel = Compiled::new(
             rlx_runtime::Device::Gpu,
-            graphs::mel_frontend(frames, bins)?,
+            graphs::mel_frontend(frames, bins, 1)?,
         )?;
         let convs = Compiled::new(
             rlx_runtime::Device::Gpu,
@@ -403,16 +478,9 @@ impl GroupFront {
             self.projector.run_slices(&[("features", &encoded)]),
             "projector",
         )?;
-        let per_slot = projected.len() / batch;
-        if per_slot == 0 || projected.len() % batch != 0 {
-            return Err(anyhow!(
-                "the projector returned {} values for {batch} windows",
-                projected.len()
-            ));
-        }
-        Ok((0..windows.len())
-            .map(|slot| projected[slot * per_slot..(slot + 1) * per_slot].to_vec())
-            .collect())
+        let mut split = split_windows(projected, batch)?;
+        split.truncate(windows.len());
+        Ok(split)
     }
 }
 
@@ -426,47 +494,106 @@ impl GroupFront {
 /// of audio.
 pub const GROUP: usize = 16;
 
-/// The listening path for everything that embeds one window at a time: the
-/// enrolment, the negative pool and the ungrouped detection streams. The sweep's
-/// group front end (`GroupFront`) is built and held on its own, so neither path
-/// compiles a graph the other runs.
+/// Windows per scoring pass: one pass through the encoder's weights for two
+/// consecutive windows, at the price of a fire resolving up to one stride
+/// (0.16 s) later than a one-window pass would. The product stops at two — a
+/// wider group amortises more of the pass and delays a fire by the group's whole
+/// span, and one stride is the delay the ear accepts. The offline sweep, where no
+/// fire has to be on time, buys its amortisation with [`GROUP`].
+pub const PAIR: usize = 2;
+
+/// The listening path for the ear: the wake decision's embedding, from one window
+/// (the enrolment, the negative pool and the ungrouped streams) or from two
+/// consecutive windows in one batched pass ([`PAIR`]). The sweep's group front end
+/// (`GroupFront`) is built and held on its own, so neither path compiles a graph
+/// the other runs.
+///
+/// Each front is built on first use: a caller that only ever calls [`embed`](Self::embed)
+/// compiles the one-window graphs and not the pair's, and one that only ever calls
+/// [`embed_pair`](Self::embed_pair) the other way round. A stream that fed a lone
+/// window through the pair's slot would end up holding both, which is what a stream
+/// that flushes does — the lone window is the one case a pair has no work for.
 pub struct Listener {
+    pair: Arc<Pair>,
     tokens: usize,
     dim: usize,
-    single: Front,
+    single: Option<Front>,
+    paired: Option<Front>,
 }
 
 impl Listener {
-    /// Compile the mel front end, the encoder and the projector for the wake
-    /// window (76 frames), one window per call.
-    pub fn new(pair: Arc<Pair>) -> Result<Self> {
-        let tokens = graphs::asr_tokens(MEL_FRAMES);
-        let dim = pair.sound.clip().projection_dim;
-        let single = Front::build(&pair, MEL_FRAMES)?;
-        Ok(Self {
-            tokens,
-            dim,
-            single,
-        })
+    /// The ear's front ends for the wake window (76 frames): the pair's graphs are
+    /// compiled by the first [`embed_pair`](Self::embed_pair), the single window's
+    /// by the first [`embed`](Self::embed).
+    pub fn new(pair: Arc<Pair>) -> Self {
+        Self {
+            tokens: graphs::asr_tokens(MEL_FRAMES),
+            dim: pair.sound.clip().projection_dim,
+            pair,
+            single: None,
+            paired: None,
+        }
+    }
+
+    /// The front end for `batch` windows, built by the first call that asks for it: a
+    /// caller of one form never compiles the other's graphs. The two slots are the only
+    /// batches this listener holds, so a third one is refused rather than served from
+    /// the wrong front.
+    fn front(&mut self, batch: usize) -> Result<&mut Front> {
+        let slot = match batch {
+            1 => &mut self.single,
+            PAIR => &mut self.paired,
+            other => {
+                return Err(anyhow!(
+                    "a {other}-window pass in a listener that holds a one-window and a \
+                     {PAIR}-window front end"
+                ));
+            }
+        };
+        if slot.is_none() {
+            *slot = Some(Front::build(&self.pair, MEL_FRAMES, batch)?);
+        }
+        Ok(slot.as_mut().expect("the front end was built just above"))
+    }
+
+    /// `batch` windows of the front end's own length in one pass → one pooled,
+    /// unit-length embedding each, in slot order.
+    fn embed_windows(&mut self, batch: usize, windows: &[&[f32]]) -> Result<Vec<Vec<f32>>> {
+        let (tokens, dim) = (self.tokens, self.dim);
+        let projected = self.front(batch)?.forward(windows)?;
+        projected
+            .iter()
+            .map(|rows| embed_rows(rows, tokens, dim))
+            .collect()
     }
 
     /// One window of mono 16 kHz audio → the encoder's window embedding, through
     /// the one-window front end — enrolment and the negative pool embed a clip at
-    /// a time, and padding a lone window into a [`GROUP`]-wide pass costs the
-    /// whole group's work.
+    /// a time, and padding a lone window into a batched pass costs the pass's work.
     pub fn embed(&mut self, samples_16k: &[f32]) -> Result<Vec<f32>> {
-        let projected = self.single.run(trailing_window(samples_16k));
-        let pooled = mean_pool(&projected, self.tokens, self.dim)?;
-        Ok(l2(&pooled))
+        let window = trailing_window(samples_16k);
+        Ok(self.embed_windows(1, &[&window])?.remove(0))
+    }
+
+    /// Two consecutive windows → their two embeddings from one pass through the
+    /// mel front end, the convs, every encoder block and the projector. Each
+    /// window keeps its own mel, its own conv rows and its own attention, so a
+    /// window's embedding does not depend on the slot it took or on its neighbour.
+    pub fn embed_pair(&mut self, first: &[f32], second: &[f32]) -> Result<[Vec<f32>; PAIR]> {
+        let both = [trailing_window(first), trailing_window(second)];
+        Ok(self
+            .embed_windows(PAIR, &[&both[0], &both[1]])?
+            .try_into()
+            .expect("a two-window pass answers two embeddings"))
     }
 }
 
 /// Whatever turns a group of detection windows into one embedding each: the
-/// sweep's [`GroupFront`], or a [`Listener`] for the ungrouped streams.
+/// sweep's [`GroupFront`], or a [`Listener`] for the ungrouped and paired streams.
 pub(crate) trait Embedder {
     /// Up to [`GROUP`] windows → one embedding each. [`GroupFront`] spends one
     /// encoder tail pass and one projector pass over the whole group; a
-    /// [`Listener`] embeds them one at a time.
+    /// [`Listener`] pairs two windows in one pass and embeds a lone one alone.
     fn embed_group(&mut self, windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>>;
 }
 
@@ -487,19 +614,23 @@ impl Embedder for GroupFront {
         let (tokens, dim) = (self.tokens, self.dim);
         self.forward_group(&refs)?
             .into_iter()
-            .map(|projected| Ok(l2(&mean_pool(&projected, tokens, dim)?)))
+            .map(|projected| embed_rows(&projected, tokens, dim))
             .collect()
     }
 }
 
 impl Embedder for Listener {
     fn embed_group(&mut self, windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        if let [first, second] = windows {
+            return Ok(self.embed_pair(first, second)?.to_vec());
+        }
         windows.iter().map(|window| self.embed(window)).collect()
     }
 }
 
-/// The trailing [`WINDOW_SAMPLES`] of a window, zero-padded at the front when
-/// it is shorter.
+/// The trailing [`WINDOW_SAMPLES`] of a window, zero-padded at the front when it is
+/// shorter: the wake path's own pad, so a [`Front`] is only ever handed a window of
+/// exactly its length.
 pub(crate) fn trailing_window(samples_16k: &[f32]) -> Vec<f32> {
     let mut window = vec![0f32; WINDOW_SAMPLES];
     let take = samples_16k.len().min(WINDOW_SAMPLES);
@@ -507,10 +638,31 @@ pub(crate) fn trailing_window(samples_16k: &[f32]) -> Vec<f32> {
     window
 }
 
+/// One window's projected token rows → its embedding: the tokens pooled over, the result
+/// put on the unit sphere. What the ear and the grouped front end both report.
+fn embed_rows(projected: &[f32], tokens: usize, dim: usize) -> Result<Vec<f32>> {
+    Ok(l2(&mean_pool(projected, tokens, dim)?))
+}
+
 fn first(outs: Vec<Vec<f32>>, what: &str) -> Result<Vec<f32>> {
     outs.into_iter()
         .next()
         .ok_or_else(|| anyhow!("the {what} returned no output"))
+}
+
+/// One batched pass's projected rows split into one block per window: `batch` blocks of
+/// `projected.len() / batch` values from a pass that answered `batch` windows.
+fn split_windows(projected: Vec<f32>, batch: usize) -> Result<Vec<Vec<f32>>> {
+    let per_window = projected.len() / batch;
+    if per_window == 0 || !projected.len().is_multiple_of(batch) {
+        return Err(anyhow!(
+            "the projector returned {} values for {batch} windows",
+            projected.len()
+        ));
+    }
+    Ok((0..batch)
+        .map(|slot| projected[slot * per_window..(slot + 1) * per_window].to_vec())
+        .collect())
 }
 
 pub(crate) fn argmax(v: &[f32]) -> u32 {
@@ -727,7 +879,7 @@ impl<'a> Clip<'a> {
         // the walk fills it; a capacity fixed at the token budget would make every
         // step's attention read thousands of masked rows.
         let capacity = prompt_rows + DECODE_CACHE_BUCKET;
-        let front = Front::build(pair, frames).context("front build")?;
+        let front = Front::build(pair, frames, 1).context("front build")?;
         let build_ms = front.build_ms();
         Ok(Self {
             pair: Arc::clone(pair),
@@ -769,18 +921,18 @@ impl<'a> Clip<'a> {
         let mut build_ms = std::mem::take(&mut self.owed_ms);
 
         let projected = match &self.shared {
-            Some(rung) => rung.front.run(audio),
+            Some(rung) => rung.front.run(audio)?,
             None => {
                 if self.front.is_none() {
                     let t = report::Stopwatch::start();
-                    self.front = Some(Front::build(&self.pair, frames).context("front build")?);
+                    self.front = Some(Front::build(&self.pair, frames, 1).context("front build")?);
                     build_ms += t.ms();
                 }
                 let out = self
                     .front
                     .as_ref()
                     .expect("the front end was built just above")
-                    .run(audio);
+                    .run(audio)?;
                 if !self.reuse_front {
                     self.front = None;
                 }
@@ -1101,7 +1253,12 @@ mod tests {
             })
             .collect();
 
-        let single = Front::build(&pair, MEL_FRAMES).expect("the single-window front");
+        let tokens = graphs::asr_tokens(MEL_FRAMES);
+        let dim = pair.sound.clip().projection_dim;
+        let embedding =
+            |projected: &[f32]| embed_rows(projected, tokens, dim).expect("a window's rows");
+        let single = Front::build(&pair, MEL_FRAMES, 1).expect("the single-window front");
+        let paired = Front::build(&pair, MEL_FRAMES, PAIR).expect("the pair front");
         let mut grouped = GroupFront::build(&pair, MEL_FRAMES, GROUP).expect("a group front");
         let padded: Vec<Vec<f32>> = windows.iter().map(|w| trailing_window(w)).collect();
         let references: Vec<&[f32]> = padded.iter().map(Vec::as_slice).collect();
@@ -1112,23 +1269,91 @@ mod tests {
 
         for (window, grouped) in windows.iter().zip(batched) {
             let one = trailing_window(window);
-            let single = single.run(one);
-            let a = l2(&mean_pool(
-                &single,
-                graphs::asr_tokens(MEL_FRAMES),
-                pair.sound.clip().projection_dim,
-            )
-            .unwrap());
-            let b = l2(&mean_pool(
-                &grouped,
-                graphs::asr_tokens(MEL_FRAMES),
-                pair.sound.clip().projection_dim,
-            )
-            .unwrap());
+            let single = single.run(one).expect("the single-window pass");
+            let a = embedding(&single);
+            let b = embedding(&grouped);
             let cosine: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
             assert!(
                 cosine > 0.999_9,
                 "a grouped window's embedding matches the single-window pass: cosine {cosine}"
+            );
+        }
+
+        // The pair pass, under the same rule: two windows in one batched pass, each
+        // slot's embedding what the single-window pass gives that window.
+        let batched = paired
+            .forward(&[&padded[0], &padded[1]])
+            .expect("the pair pass");
+        assert_eq!(batched.len(), 2);
+        for slot in 0..PAIR {
+            let single = single.run(padded[slot].clone()).expect("the single pass");
+            let a = embedding(&single);
+            let b = embedding(&batched[slot]);
+            let cosine: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+            assert!(
+                cosine > 0.999_9,
+                "the pair pass's slot {slot} matches the single-window pass: cosine {cosine}"
+            );
+        }
+    }
+
+    /// A batched mel clamps each window on its own. The log-mel clamp is `max − 8`
+    /// over one utterance's every frame and bin, so a pass that reduced over the whole
+    /// batch would move every window's mel; two windows at very different levels make
+    /// that failure loud. No model is needed — the mel front end carries no weights —
+    /// so this runs wherever a wgpu adapter does.
+    #[test]
+    fn a_batched_mel_clamps_each_window_on_its_own() {
+        if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+            return;
+        }
+        // 128 bins — the recognition front's own — at the wake window's frame count.
+        let (frames, bins) = (MEL_FRAMES, 128);
+        let samples = graphs::MEL_HOP * frames;
+        let tone = |amplitude: f32, hz: f32| -> Vec<f32> {
+            (0..samples)
+                .map(|n| {
+                    let t = n as f32 / SAMPLE_RATE as f32;
+                    amplitude * (2.0 * std::f32::consts::PI * hz * t).sin()
+                })
+                .collect()
+        };
+        // 26 dB apart: a clamp shared by the pair would hold one window's log-mel
+        // against the other's maximum.
+        let quiet = tone(0.05, 220.0);
+        let loud = tone(0.9, 660.0);
+        let mut batched = Compiled::new(
+            rlx_runtime::Device::Gpu,
+            graphs::mel_frontend(frames, bins, PAIR).expect("the batched mel front end"),
+        )
+        .expect("the batched mel compiles");
+        let mut single = Compiled::new(
+            rlx_runtime::Device::Gpu,
+            graphs::mel_frontend(frames, bins, 1).expect("the mel front end"),
+        )
+        .expect("the mel compiles");
+        let mut audio = quiet.clone();
+        audio.extend_from_slice(&loud);
+        let two = batched
+            .run(&[("audio".into(), audio)])
+            .pop()
+            .expect("the batched mel answers");
+        for (slot, window) in [quiet, loud].into_iter().enumerate() {
+            let alone = single
+                .run(&[("audio".into(), window)])
+                .pop()
+                .expect("the mel answers");
+            assert_eq!(alone.len(), two.len() / PAIR, "one block per window");
+            let block = &two[slot * alone.len()..(slot + 1) * alone.len()];
+            let delta = alone
+                .iter()
+                .zip(block)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("slot {slot}: batch 2 vs batch 1 max|Δ| {delta:e}");
+            assert!(
+                delta <= 1e-6,
+                "slot {slot}: the batched mel is the window's own mel (max|Δ| {delta:e})"
             );
         }
     }

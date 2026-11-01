@@ -7962,7 +7962,11 @@ pub(crate) fn compile_static_inner(
                             let parked = crate::buffer::is_weight_off(arena.offset(w_id));
                             let spatial = (p2.h_out as u64) * (p2.w_out as u64);
                             let k_total = (p2.c_in as u64) * (p2.kh as u64) * (p2.kw as u64);
-                            let col_bytes = k_total.saturating_mul(spatial).saturating_mul(4);
+                            let images = (p2.n as u64).max(1);
+                            let col_bytes = k_total
+                                .saturating_mul(spatial)
+                                .saturating_mul(images)
+                                .saturating_mul(4);
                             let max_binding = dev.device.limits().max_storage_buffer_binding_size;
                             let whole = arena_whole_arena_bind(&arena, max_binding);
                             // The cooperative implicit-GEMM conv: the direct entry's
@@ -7978,6 +7982,9 @@ pub(crate) fn compile_static_inner(
                             // `kw = 7`, `d ∈ {1, 3, 9}`) and every shape of that kind:
                             // one workgroup gathers a column block's k-steps once and
                             // multiplies every row tile the class admits against them.
+                            // `admits` reads one image (its tile carries one), so above a
+                            // batch the class's shapes are what the im2col route below
+                            // takes instead — and pay the panel it materialises.
                             let implicit_shape = ConvImplicitShape {
                                 c_in: p2.c_in as u64,
                                 c_out: p2.c_out as u64,
@@ -8004,14 +8011,18 @@ pub(crate) fn compile_static_inner(
                                 conv1d_implicit_declines += 1;
                             }
                             // What a conv has to be for the route, all of it decided
-                            // without reading the adapter: one group and a unit batch, real
-                            // spatial taps, the shape floors `conv_im2col_col_elems` mirrors,
-                            // the hard col cap `conv_im2col_scratch_bytes` applies, and the
-                            // route switch — so the col reservation and the lowering agree on
-                            // which convs the route could take, on this adapter or any other.
+                            // without reading the adapter: one group, real spatial taps, the
+                            // shape floors `conv_im2col_col_elems` mirrors, the hard col cap
+                            // `conv_im2col_scratch_bytes` applies, and the route switch — so
+                            // the col reservation and the lowering agree on which convs the
+                            // route could take, on this adapter or any other. The batch axis
+                            // is the panel's — one panel per image, the GEMM's z — so no batch
+                            // term appears in the test below: a conv at any batch is the same
+                            // shape class. What bounds the batch is the panel's size, which
+                            // scales with the images (`col_bytes` below): a batch past the cap
+                            // or past the reserved scratch keeps the direct/tiled route.
                             let im2col_candidate = accel
                                 && p2.groups == 1
-                                && p2.n == 1
                                 && (p2.kh as u64) * (p2.kw as u64) >= 2
                                 && spatial >= im2col_min_spatial()
                                 && k_total >= im2col_min_k()
@@ -8200,7 +8211,10 @@ pub(crate) fn compile_static_inner(
                                     _p1: 0,
                                     _p2: 0,
                                 };
-                                schedule.push(Step::Im2ColGpu { params: im_params });
+                                schedule.push(Step::Im2ColGpu {
+                                    params: im_params,
+                                    images: images as u32,
+                                });
                                 let imk = im2col2d_kernel(&dev.device);
                                 let u_im = emit_uniform(std::mem::size_of::<Im2Col2dParams>());
                                 // Static params — write once at compile (the
@@ -8218,7 +8232,11 @@ pub(crate) fn compile_static_inner(
                                 uniforms.push(u_im);
                                 bind_groups.push(bg_im);
                                 // GEMM: weight[c_out, K] @ col[K, spatial]
-                                //   → out[c_out, spatial]  (NCHW, N==1).
+                                //   → out[c_out, spatial], one image per z (NCHW).
+                                // The weight is the same for every image, so its
+                                // batch stride is zero: the pass reads it once per
+                                // image from the same address, which is the L2 hit
+                                // the second image of a pair gets.
                                 let m = p2.c_out;
                                 let kk = k_total as u32;
                                 let nn2 = spatial as u32;
@@ -8228,8 +8246,8 @@ pub(crate) fn compile_static_inner(
                                     m,
                                     k: kk,
                                     n: nn2,
-                                    batch: 1,
-                                    a_batch_stride: m.saturating_mul(kk),
+                                    batch: images as u32,
+                                    a_batch_stride: 0,
                                     b_batch_stride: kk.saturating_mul(nn2),
                                     c_batch_stride: m.saturating_mul(nn2),
                                     a_off_f32: (arena.offset(w_id) / 4) as u32,

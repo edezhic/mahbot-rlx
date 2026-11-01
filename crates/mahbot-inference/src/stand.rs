@@ -9,7 +9,8 @@
 //! * **recognition** at a short, a typical and a long voice message — audio in, the
 //!   regions the product's transcription call returns out;
 //! * **synthesis** at a short and a typical text — text in, a 24 kHz waveform out;
-//! * **wake word** — one window through the ear path to a score.
+//! * **wake word** — two consecutive windows through the ear path in one batched
+//!   pass to a score.
 //!
 //! Every row carries four numbers: cold time (the process starts with no models
 //! loaded and the call loads them), warm time (the models already resident),
@@ -87,7 +88,8 @@ enum Surface {
         digest: u64,
         samples: usize,
     },
-    /// The score the row was recorded with.
+    /// The score the row was recorded with: the first window of the pair against a
+    /// later window of the same recording.
     Wake { score: f32 },
 }
 
@@ -144,7 +146,7 @@ const ROWS: [Row; 6] = [
     },
     Row {
         name: "wake",
-        label: "wake word, one scoring step",
+        label: "wake word, two scoring windows in one pass",
         surface: Surface::Wake {
             score: reference::STAND_WAKE_SCORE,
         },
@@ -310,37 +312,53 @@ fn synthesis(row: &Row, text: &str, witness: u64, witness_samples: usize) -> Res
     })
 }
 
-/// One wake window through the ear path to a score: the window embedded cold and
-/// warm, and its cosine against a later window of the same recording.
+/// The ear path's own form: two consecutive scoring windows through one batched
+/// pass — the mel front end, the convs, all twenty-four encoder blocks and the
+/// projector — embedded cold and warm and scored against a later window of the
+/// same recording.
 fn wake(row: &Row, witness: f32) -> Result<Reading> {
     let voice = loader::voice_wav()?;
-    let primary = window(&voice, WAKE_OFFSET)?;
+    let first = window(&voice, WAKE_OFFSET)?;
+    // The window the ear scores one stride later: the pair the detector forms.
+    let second = window(&voice, WAKE_OFFSET + listen::SCORE_STRIDE_SAMPLES)?;
 
     let t = Stopwatch::start();
     let pair = Arc::new(Pair::of_role(Role::Recognition)?);
-    let mut listener = Listener::new(pair)?;
-    let embedding = listener.embed(&primary)?;
+    let mut listener = Listener::new(pair);
+    let [primary, neighbour] = listener.embed_pair(&first, &second)?;
     let cold_ms = t.ms();
     let memory = report::Memory::take();
 
     let t = Stopwatch::start();
-    let again = listener.embed(&primary)?;
+    let [again, against] = listener.embed_pair(&first, &second)?;
     let warm_ms = t.ms();
-    if report::non_finite(&embedding) != 0 || report::non_finite(&again) != 0 {
-        bail!(
-            "the embedding has {} non-finite values — a score against it is no reading",
-            report::non_finite(&embedding) + report::non_finite(&again)
-        );
+    let non_finite = report::non_finite(&primary)
+        + report::non_finite(&neighbour)
+        + report::non_finite(&again)
+        + report::non_finite(&against);
+    if non_finite != 0 {
+        bail!("the pair's embeddings have {non_finite} non-finite values — no reading");
     }
-    cold_warm(row, embedding == again, "embedding");
-    // The score needs a second side: a later window of the same recording, on the
-    // same compiled graphs. It is not a second calibration pass and not timed.
+    cold_warm(row, primary == again && neighbour == against, "embeddings");
+    // The score needs a second side: a later window of the same recording, taken
+    // through the same pass as the primary window rather than alone. It is not a
+    // second calibration pass and not timed.
     let reference = window(&voice, WAKE_REFERENCE_OFFSET)?;
-    let score = wake::cosine(&embedding, &listener.embed(&reference)?);
+    let [later, primary_again] = listener.embed_pair(&reference, &first)?;
+    let score = wake::cosine(&primary, &later);
     let equal = (score - witness).abs() < 5e-5;
     if !equal {
         eprintln!(
             "stand: {}: the score moved from its witness ({score:.4} against {witness:.4})",
+            row.name
+        );
+    }
+    // The same window in a different slot, beside a different neighbour: a pass that
+    // let one window's rows reach the other's would move this.
+    let neighbour_free = primary_again == primary;
+    if !neighbour_free {
+        eprintln!(
+            "stand: {}: the first window's embedding moved when its neighbour did",
             row.name
         );
     }
@@ -350,10 +368,12 @@ fn wake(row: &Row, witness: f32) -> Result<Reading> {
         warm_ms,
         memory: memory.finish(),
         detail: run::detail([
-            ("dim", json!(embedding.len())),
+            ("windows", json!(listen::PAIR)),
+            ("dim", json!(primary.len())),
             ("score", json!(format!("{score:.4}"))),
             ("witness", json!(format!("{witness:.4}"))),
             ("equal", json!(equal)),
+            ("neighbour_free", json!(neighbour_free)),
         ]),
     })
 }

@@ -335,17 +335,23 @@ pub fn block(
 
 // ── the ASR audio encoder (recognition's sound stage) ──────────────
 
-/// Recogntion's `mmproj`, split at the point where a group pass wants it: the
-/// three stride-2 `3×3` convs and the flatten ([`EncoderConvs`]) are cheap but
-/// scale badly with a batch axis — the conv route costs a window's worth of work
-/// per window whatever `n` is — while everything after them
-/// ([`EncoderTail`]) is linear, norm and attention, which one pass can carry for
-/// a whole group. [`asr_encoder`] chains the two into the one graph the recognition
-/// and wake paths run; [`asr_encoder_front`] and [`asr_encoder_tail`] expose the
-/// pieces for the bench's grouped passes.
+/// Recognition's `mmproj`, split at the point where a group pass wants it: the
+/// three stride-2 `3×3` convs and the flatten ([`EncoderConvs`]), then everything
+/// after them ([`EncoderTail`]) — linear, norm and attention, which one pass can
+/// carry for a whole group. [`asr_encoder`] chains the two into the one graph the
+/// recognition and wake paths run; [`asr_encoder_front`] and
+/// [`asr_encoder_tail`] expose the pieces the bench's grouped pass drives, the front
+/// one window per call and the tail over the whole group.
+///
+/// `batch` independent windows ride the convs' own batch axis, one image per panel,
+/// so these three `3×3` convs keep the im2col route they take on their own
+/// (`the_conv_front_keeps_its_panel_route_at_the_pairs_batch` pins it). The routes
+/// still gated on a unit batch — the 1×1 pointwise GEMM, the 1-D tiled lift, the
+/// cooperative implicit GEMM — are ones this front never takes at any batch.
 pub struct EncoderConvs {
     pub model: Arc<Model>,
     pub frames: usize,
+    pub batch: usize,
 }
 
 impl LayerStage for EncoderConvs {
@@ -360,6 +366,7 @@ impl LayerStage for EncoderConvs {
     ) -> Result<(FlowValue, StageArtifacts)> {
         let model = &self.model;
         let c = model.clip();
+        let batch = self.batch.max(1);
         let mut x = input.hir_id();
 
         // Three stride-2 3×3 convs: 128 mel bins → 16, frames → tokens. Both
@@ -383,19 +390,23 @@ impl LayerStage for EncoderConvs {
                 [2, 2],
                 [1, 1],
                 1,
-                Shape::new(&[1, cout, conv_h, cur_len], DType::F32),
+                Shape::new(&[batch, cout, conv_h, cur_len], DType::F32),
             );
             let y = emit::add(ctx, y, b);
-            let y = emit::gelu(ctx, y, &[1, cout, conv_h, cur_len]);
+            let y = emit::gelu(ctx, y, &[batch, cout, conv_h, cur_len]);
             hh = conv_h;
-            x = emit::reshape(ctx, y, &[1, cout as i64, hh as i64, cur_len as i64]);
+            x = emit::reshape(
+                ctx,
+                y,
+                &[batch as i64, cout as i64, hh as i64, cur_len as i64],
+            );
         }
         let tokens = cur_len;
         // Per token: (channel, mel) with the channel major — 480·16 = 7680.
         let flat = flat_width(c.mel_bins);
         let t = emit::h(ctx).transpose_(x, vec![0, 3, 1, 2]);
-        let t = emit::reshape(ctx, t, &[tokens as i64, flat as i64]);
-        let sh = Shape::new(&[tokens, flat], DType::F32);
+        let t = emit::reshape(ctx, t, &[(batch * tokens) as i64, flat as i64]);
+        let sh = Shape::new(&[batch * tokens, flat], DType::F32);
         Ok((
             FlowValue::new(t, sh.clone()),
             StageArtifacts::hidden_only(sh),
@@ -510,36 +521,47 @@ impl LayerStage for EncoderTail {
 }
 
 /// The recognition sound graph for a mel window of `frames` frames: the convs
-/// and the tail chained into one graph.
-pub fn asr_encoder(model: Arc<Model>, frames: usize) -> Result<BuiltModel> {
+/// and the tail chained into one graph, `batch` windows at a time.
+pub fn asr_encoder(model: Arc<Model>, frames: usize, batch: usize) -> Result<BuiltModel> {
     let c = model.clip().clone();
+    let batch = batch.max(1);
     let mut weights = LoaderWeights::new(model.clone());
     let qkv_fused = fuse_projection(&mut weights, c.layers, "a.", &QKV_PARTS, "qkv")?;
-    let flow = ModelFlow::new(format!("asr_enc_{frames}"))
+    let flow = ModelFlow::new(format!("asr_enc_{frames}x{batch}"))
         .with_profile(profile())
-        .input("mel", Shape::new(&[1, 1, c.mel_bins, frames], DType::F32))
+        .input(
+            "mel",
+            Shape::new(&[batch, 1, c.mel_bins, frames], DType::F32),
+        )
         .layer_stage(EncoderConvs {
             model: model.clone(),
             frames,
+            batch,
         })
         .layer_stage(EncoderTail {
             model,
             frames,
-            batch: 1,
+            batch,
             qkv_fused,
         })
         .output("tokens");
     flow.build(&mut weights).map_err(Into::into)
 }
 
-/// The conv front on its own, one window per call: `mel` → `[tokens, flat]`.
+/// The conv front on its own, one window per call: `mel` → `[tokens, flat]`. A group
+/// pass leaves it at a unit batch on purpose — its im2col panel would be as wide as the
+/// group — and shares the whole group's weight reads in [`asr_encoder_tail`] instead.
 pub fn asr_encoder_front(model: Arc<Model>, frames: usize) -> Result<BuiltModel> {
     let c = model.clip().clone();
     let mut weights = LoaderWeights::new(model.clone());
     let flow = ModelFlow::new(format!("asr_conv_{frames}"))
         .with_profile(profile())
         .input("mel", Shape::new(&[1, 1, c.mel_bins, frames], DType::F32))
-        .layer_stage(EncoderConvs { model, frames })
+        .layer_stage(EncoderConvs {
+            model,
+            frames,
+            batch: 1,
+        })
         .output("flat");
     flow.build(&mut weights).map_err(Into::into)
 }
@@ -576,7 +598,8 @@ pub fn asr_encoder_tail(model: Arc<Model>, frames: usize, batch: usize) -> Resul
 /// file's host-unpacked weights, like the encoder it follows.
 pub struct ProjectorStage {
     pub model: Arc<Model>,
-    /// Mel-window tokens in (the encoder's `dim`), body width out.
+    /// Rows in (the encoder's `dim`) — one mel window's tokens times the batch the
+    /// front end carries — and the body's width out.
     pub tokens: usize,
 }
 
@@ -3473,7 +3496,7 @@ pub fn mel_filters(bins: usize, n_freq: usize, sample_rate: f64, f_max: f64) -> 
 }
 
 /// The recognition mel front end: raw samples in, the log-mel spectrogram the
-/// recognition sound encoder reads, in its own `[1, 1, bins, frames]` layout.
+/// recognition sound encoder reads, in its own `[batch, 1, bins, frames]` layout.
 /// It uses HTK filters and the **power** spectrum (`re² + im²`, no `sqrt`); the
 /// speaker encoder's front is `host::mel_24k` (Slaney filters, amplitude).
 ///
@@ -3484,11 +3507,17 @@ pub fn mel_filters(bins: usize, n_freq: usize, sample_rate: f64, f_max: f64) -> 
 /// `max − 8` over the whole utterance and scaled `(x + 4) / 4` — the convention
 /// the reference uses: the clamp and the scale are taken over the whole
 /// utterance, not per frame.
+///
+/// `batch` independent utterances ride the same graph: each one is padded,
+/// gathered and clamped on its own — the clamp is taken over that utterance's every
+/// frame and bin, as it is when the graph computes one — so a window's mel is what
+/// it would be alone.
 pub struct MelStage {
     pub frames: usize,
     pub bins: usize,
     pub window: usize,
     pub hop: usize,
+    pub batch: usize,
 }
 
 impl LayerStage for MelStage {
@@ -3502,27 +3531,35 @@ impl LayerStage for MelStage {
         input: FlowValue,
     ) -> Result<(FlowValue, StageArtifacts)> {
         let (t, bins, n, hop) = (self.frames, self.bins, self.window, self.hop);
+        let batch = self.batch.max(1);
+        let samples = hop * t;
         let raw = t + 1;
         let n_freq = n / 2 + 1;
 
         // The frames: `window` points every `hop`, with the signal reflected half
         // a window on each side so every frame is centred. One gather with a
         // precomputed index row replaces a `Narrow` per frame plus a `Concat`
-        // (3 001 nodes at the 30 s recognition shape).
-        let padded = emit::pad_axis(ctx, input.hir_id(), 1, 0, n / 2, n / 2, PadMode::Reflect);
-        let mut indices = Vec::with_capacity(raw * n * 8);
-        for i in 0..raw {
-            for j in 0..n {
-                indices.extend_from_slice(&(((i * hop + j) as i64).to_le_bytes()));
+        // (3 001 nodes at the 30 s recognition shape). Each utterance of the batch
+        // is padded inside its own row and gathered by its own base offset.
+        let rows = emit::reshape(ctx, input.hir_id(), &[batch as i64, samples as i64]);
+        let padded = emit::pad_axis(ctx, rows, 2, 1, n / 2, n / 2, PadMode::Reflect);
+        let span = samples + n;
+        let wide = emit::reshape(ctx, padded, &[(batch * span) as i64]);
+        let mut indices = Vec::with_capacity(batch * raw * n * 8);
+        for b in 0..batch {
+            for i in 0..raw {
+                for j in 0..n {
+                    indices.extend_from_slice(&(((b * span + i * hop + j) as i64).to_le_bytes()));
+                }
             }
         }
         let ids = ctx.hir().mir(
             Op::Constant { data: indices },
             vec![],
-            Shape::new(&[raw * n], DType::I64),
+            Shape::new(&[batch * raw * n], DType::I64),
         );
-        let flat = emit::gather(ctx, padded, ids);
-        let frames = emit::reshape(ctx, flat, &[raw as i64, n as i64]);
+        let flat = emit::gather(ctx, wide, ids);
+        let frames = emit::reshape(ctx, flat, &[(batch * raw) as i64, n as i64]);
 
         // The window (a row, broadcast over the frames).
         let w = ctx.synth_param(
@@ -3530,7 +3567,7 @@ impl LayerStage for MelStage {
             hann_window(n),
             Shape::new(&[1, n], DType::F32),
         );
-        let w = emit::expand(ctx, w, &[raw, n]);
+        let w = emit::expand(ctx, w, &[batch * raw, n]);
         let xw = emit::mul(ctx, frames, w);
 
         // The DFT: |X|² = re² + im².
@@ -3551,32 +3588,39 @@ impl LayerStage for MelStage {
         );
         let mel = emit::h(ctx).mm(power, fb);
         // `max(mel, 1e-10)`: a zero energy would be `log10(0)`.
-        let floor = emit::constant(ctx, &[raw, bins], 1e-10);
+        let floor = emit::constant(ctx, &[batch * raw, bins], 1e-10);
         let short = emit::sub(ctx, floor, mel);
-        let short = emit::act(ctx, Activation::Relu, short, &[raw, bins]);
+        let short = emit::act(ctx, Activation::Relu, short, &[batch * raw, bins]);
         let mel = emit::add(ctx, mel, short);
-        let ln10 = emit::constant(ctx, &[raw, bins], 1.0 / std::f64::consts::LN_10 as f32);
-        let log = emit::act(ctx, Activation::Log, mel, &[raw, bins]);
+        let ln10 = emit::constant(
+            ctx,
+            &[batch * raw, bins],
+            1.0 / std::f64::consts::LN_10 as f32,
+        );
+        let log = emit::act(ctx, Activation::Log, mel, &[batch * raw, bins]);
         let log = emit::mul(ctx, log, ln10);
 
-        // The clamp over the whole utterance, then `(x + 4) / 4`.
-        let mx = emit::reduce_max(ctx, log, &[0, 1], &[1, 1]);
-        let minus8 = emit::constant(ctx, &[1, 1], -8.0);
+        // The clamp over the whole of each utterance — every frame and every bin of
+        // it, and no other window's — then `(x + 4) / 4`.
+        let log = emit::reshape(ctx, log, &[batch as i64, raw as i64, bins as i64]);
+        let mx = emit::reduce_max(ctx, log, &[1, 2], &[batch, 1, 1]);
+        let minus8 = emit::constant(ctx, &[batch, 1, 1], -8.0);
         let thresh = emit::add(ctx, mx, minus8);
-        let thresh = emit::expand(ctx, thresh, &[raw, bins]);
+        let thresh = emit::expand(ctx, thresh, &[batch, raw, bins]);
         let low = emit::sub(ctx, log, thresh);
-        let low = emit::act(ctx, Activation::Relu, low, &[raw, bins]);
+        let low = emit::act(ctx, Activation::Relu, low, &[batch, raw, bins]);
         let clamped = emit::add(ctx, thresh, low);
-        let four = emit::constant(ctx, &[raw, bins], 4.0);
+        let four = emit::constant(ctx, &[batch, raw, bins], 4.0);
         let shifted = emit::add(ctx, clamped, four);
-        let quarter = emit::constant(ctx, &[raw, bins], 0.25);
+        let quarter = emit::constant(ctx, &[batch, raw, bins], 0.25);
         let out = emit::mul(ctx, shifted, quarter);
 
-        // `[raw, bins]` → drop the last frame → the encoder's `[1, 1, bins, T]`.
-        let out = emit::narrow(ctx, out, 0, 0, t);
-        let t1 = emit::h(ctx).transpose_(out, vec![1, 0]);
-        let y = emit::reshape(ctx, t1, &[1, 1, bins as i64, t as i64]);
-        let sh = Shape::new(&[1, 1, bins, t], DType::F32);
+        // `[batch, raw, bins]` → drop each utterance's last frame →
+        // `[batch, 1, bins, t]`.
+        let out = emit::narrow(ctx, out, 1, 0, t);
+        let t1 = emit::h(ctx).transpose_(out, vec![0, 2, 1]);
+        let y = emit::reshape(ctx, t1, &[batch as i64, 1, bins as i64, t as i64]);
+        let sh = Shape::new(&[batch, 1, bins, t], DType::F32);
         Ok((
             FlowValue::new(y, sh.clone()),
             StageArtifacts::hidden_only(sh),
@@ -3584,23 +3628,25 @@ impl LayerStage for MelStage {
     }
 }
 
-/// The mel front end as a graph: `hop · frames` samples in (the front computes
-/// one frame past the window and drops it), the `[1, 1, bins, frames]`
-/// log-mel the recognition sound encoder takes out.
-pub fn mel_frontend(frames: usize, bins: usize) -> Result<BuiltModel> {
+/// The mel front end as a graph: `batch` utterances of `hop · frames` samples
+/// each (the front computes one frame past the window and drops it), the
+/// `[batch, 1, bins, frames]` log-mel the sound encoder takes out.
+pub fn mel_frontend(frames: usize, bins: usize, batch: usize) -> Result<BuiltModel> {
     let (window, hop) = (MEL_WINDOW, MEL_HOP);
+    let batch = batch.max(1);
     let samples = hop * frames;
     // The front has no weights at all — every constant in it is computed — so the
     // weight source is the loader of no file. It still has to answer `has`.
     let mut weights = NoWeights;
-    let flow = ModelFlow::new(format!("mel_{frames}"))
+    let flow = ModelFlow::new(format!("mel_{frames}x{batch}"))
         .with_profile(profile())
-        .input("audio", Shape::new(&[samples], DType::F32))
+        .input("audio", Shape::new(&[batch * samples], DType::F32))
         .layer_stage(MelStage {
             frames,
             bins,
             window,
             hop,
+            batch,
         })
         .output("mel");
     flow.build(&mut weights).map_err(Into::into)

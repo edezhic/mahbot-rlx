@@ -646,10 +646,13 @@ pub(crate) enum Step {
         params: Conv2dParams,
     },
     /// GPU im2col: gather a conv's receptive fields into a `col` matrix in the
-    /// arena scratch tail. Always immediately followed by a `Step::Matmul`
-    /// (weight @ col → NCHW output), whose kernel `conv_gemm` picks.
+    /// arena scratch tail, one panel per image of the batch. Always immediately
+    /// followed by a `Step::Matmul` (weight @ col → NCHW output, one image per
+    /// z slice), whose kernel `conv_gemm` picks. `images` is the grid's z extent —
+    /// the uniform the shader reads does not carry it.
     Im2ColGpu {
         params: Im2Col2dParams,
+        images: u32,
     },
     /// 2D register-blocked 1D conv (`conv1d_tiled.wgsl`) — same `Conv2dParams`
     /// as `Conv2d` but a `TCO×TL` output tile per thread that reuses the input

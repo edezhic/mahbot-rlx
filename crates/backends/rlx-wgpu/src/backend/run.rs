@@ -3487,15 +3487,17 @@ impl WgpuExecutable {
                                 let (gx, gy, gz) = dispatch_dims(total, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
-                            Step::Im2ColGpu { params } => {
-                                // One thread per col element (k_total * spatial);
-                                // the following Step::Matmul consumes the col matrix.
+                            Step::Im2ColGpu { params, images } => {
+                                // One thread per col element per image; the following
+                                // Step::Matmul consumes the col panels. `dispatch_dims`
+                                // folds a long grid across y only, so z carries the image
+                                // alone and the kernel reads it as `gid.z`.
                                 let imk = im2col2d_kernel(&dev.device);
                                 pass.set_pipeline(&imk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 let total = params.k_total.saturating_mul(params.spatial);
-                                let (gx, gy, gz) = dispatch_dims(total, 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
+                                let (gx, gy, _) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, (*images).max(1));
                             }
                             Step::Pool1d { params } => {
                                 let n_s = scale(params.n);

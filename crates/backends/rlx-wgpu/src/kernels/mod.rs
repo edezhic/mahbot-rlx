@@ -1757,7 +1757,7 @@ pub struct Conv2dParams {
     pub out_off: u32,
 }
 
-/// Layout for GPU im2col (NCHW, N==1, groups==1). 80 bytes (20 u32).
+/// Layout for GPU im2col (NCHW, groups==1, one panel per image). 80 bytes (20 u32).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Im2Col2dParams {

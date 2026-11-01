@@ -62,8 +62,14 @@ pub const STAND_SYNTH_SHORT_SAMPLES: usize = 44_160;
 pub const STAND_SYNTH_TYPICAL_DIGEST: u64 = 0x213d_9b26_4c44_bebb;
 pub const STAND_SYNTH_TYPICAL_SAMPLES: usize = 172_800;
 
-/// The stand's wake row: the cosine the ear path's embedding answers against the
-/// recording's later window. A witness, not a gate.
+/// The stand's wake row: the cosine the pair pass's first window answers against a
+/// later window of the same recording. A witness, not a gate.
+///
+/// The two windows now go through the encoder in one batched pass, and this reading
+/// is that pass's. It is the one-window pass's to the fourth decimal: a window's mel,
+/// its conv rows and its attention are its own at any batch, which the row's own
+/// `neighbour_free` reading holds — the first window's embedding is bit-identical
+/// when its neighbour changes.
 pub const STAND_WAKE_SCORE: f32 = 0.8846;
 
 /// The synthesis round trip's waveform witness: `digest(&waveform)`, FNV-1a over the

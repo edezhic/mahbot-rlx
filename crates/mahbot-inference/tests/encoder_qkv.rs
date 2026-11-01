@@ -179,7 +179,7 @@ fn assert_only_the_projections(wide: &Compiled, split: &Compiled, blocks: usize)
 fn shipped(pattern: &Arc<Pair>, frames: usize) -> anyhow::Result<Compiled> {
     Compiled::new(
         Device::Gpu,
-        graphs::asr_encoder(pattern.sound.clone(), frames)?,
+        graphs::asr_encoder(pattern.sound.clone(), frames, 1)?,
     )
 }
 
@@ -195,6 +195,7 @@ fn three_pass(pattern: &Arc<Pair>, frames: usize) -> anyhow::Result<Compiled> {
         .layer_stage(EncoderConvs {
             model: sound.clone(),
             frames,
+            batch: 1,
         })
         .layer_stage(EncoderTail {
             model: sound,
@@ -345,7 +346,7 @@ fn wake_window() {
     let bins = pair.sound.clip().mel_bins;
     let mut mel = Compiled::new(
         Device::Gpu,
-        graphs::mel_frontend(MEL_FRAMES, bins).expect("the mel front end"),
+        graphs::mel_frontend(MEL_FRAMES, bins, 1).expect("the mel front end"),
     )
     .expect("compile the mel front end");
     let mel = pass(&mut mel, &[("audio", &audio)]);

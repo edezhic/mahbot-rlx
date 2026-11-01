@@ -68,10 +68,11 @@ use std::collections::BTreeMap;
 
 mod common;
 
-/// One conv fixture of an `N = 1` NCHW graph: `[1, C_in, h, l]` input, kernel
+/// One conv fixture of an NCHW graph: `[1, C_in, h, l]` input by default, kernel
 /// `k`, stride `s`, padding `p`, per-axis dilation `d`, `groups`. The decoder
 /// body rows are unit-height 1-D lifts (`h: 1`); the 2-D band rows below are real
-/// maps.
+/// maps. The fixtures are unit-batch unless a probe builds the family at a batch,
+/// which scales only the input's leading axis and its fill.
 #[derive(Clone, Copy)]
 struct BodyConv {
     label: &'static str,
@@ -471,7 +472,7 @@ struct BodyGraph {
     labels: Vec<&'static str>,
 }
 
-fn build_family(name: &'static str, shapes: &[BodyConv]) -> BodyGraph {
+fn build_family(name: &'static str, shapes: &[BodyConv], batch: usize) -> BodyGraph {
     let mut g = Graph::new(name);
     let mut params = Vec::new();
     let mut inputs = Vec::new();
@@ -480,13 +481,13 @@ fn build_family(name: &'static str, shapes: &[BodyConv]) -> BodyGraph {
     for (i, c) in shapes.iter().enumerate() {
         let xn = format!("x{i}");
         let wn = format!("w{i}");
-        let x = g.input(&xn, Shape::new(&[1, c.c_in, c.h, c.l], DType::F32));
+        let x = g.input(&xn, Shape::new(&[batch, c.c_in, c.h, c.l], DType::F32));
         let w = g.param(
             &wn,
             Shape::new(&[c.c_out, c.c_in / c.groups, c.k[0], c.k[1]], DType::F32),
         );
         outs.push(g.conv2d(x, w, c.k, c.s, c.p, c.d, c.groups));
-        inputs.push((xn, fill(c.c_in * c.h * c.l, i as u64)));
+        inputs.push((xn, fill(batch * c.c_in * c.h * c.l, i as u64)));
         params.push((
             wn,
             fill(
@@ -663,6 +664,26 @@ fn set_arm(off: bool) {
     } else {
         rlx_ir::env::unset("RLX_WGPU_CONV_IM2COL");
     }
+}
+
+/// The switch stand-down both measurements share: the six host/sharding/tiled
+/// overrides a caller's environment could carry are pinned off, the shard cap is set
+/// past any adapter's own buffer limit so the arena binds whole rather than striped,
+/// and the implicit route's own switch is on, so an exported `=0` cannot decide a row
+/// the harness pins.
+fn stand_down_switches() {
+    for key in [
+        "RLX_WGPU_FORCE_HOST",
+        "RLX_WGPU_DISCRETE_HOST",
+        "RLX_WGPU_SHARD_GPU",
+        "RLX_WGPU_ALLOW_SHARD",
+        "RLX_WGPU_CONV_HOST",
+        "RLX_WGPU_NO_TILED_CONV",
+    ] {
+        rlx_ir::env::set(key, "0");
+    }
+    rlx_ir::env::set("RLX_WGPU_SHARD_CAP_MIB", "1048576");
+    rlx_ir::env::set("RLX_WGPU_CONV_IMPLICIT", "1");
 }
 
 /// One graph measured under both arms of the switch: the medians, each arm's
@@ -928,20 +949,8 @@ fn print_shape_table(family: &str, rows: &[ShapeRow]) {
 #[test]
 #[ignore = "measurement, not a gate — run with `--ignored --nocapture`"]
 fn conv_route_cost_over_the_decoder_body_shapes() {
-    for key in [
-        "RLX_WGPU_FORCE_HOST",
-        "RLX_WGPU_DISCRETE_HOST",
-        "RLX_WGPU_SHARD_GPU",
-        "RLX_WGPU_ALLOW_SHARD",
-        "RLX_WGPU_CONV_HOST",
-        "RLX_WGPU_NO_TILED_CONV",
-    ] {
-        rlx_ir::env::set(key, "0");
-    }
-    rlx_ir::env::set("RLX_WGPU_SHARD_CAP_MIB", "1048576");
-    // The implicit route's own switch, so an exported `=0` cannot decide a row this
-    // harness pins; the adapter term under it is read once, below.
-    rlx_ir::env::set("RLX_WGPU_CONV_IMPLICIT", "1");
+    let _gate = common::route_lock();
+    stand_down_switches();
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;
@@ -974,12 +983,12 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         ("Conv1x1", &CONV1X1[..]),
         ("Conv2d", &CONV2D[..]),
     ] {
-        let bg = build_family(family, shapes);
+        let bg = build_family(family, shapes, 1);
         eprintln!("  {family}: shapes [{}]", bg.labels.join(", "));
         let _ = measure_pair(family, &bg);
         let mut rows = Vec::new();
         for shape in shapes {
-            let one = build_family(family, std::slice::from_ref(shape));
+            let one = build_family(family, std::slice::from_ref(shape), 1);
             let pair = measure_pair(shape.label, &one);
             let (want_off, mut want_on) = expected_routes(family, shape.label);
             if want_on == "conv1d_implicit" && !implicit_available {
@@ -1058,7 +1067,7 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     let dense = row(&CONV1X7, "dense-l4000");
     probe_active_extent(
         "dense [1,384,1,4000] k=[1,7], vetoed by im2col_gpu",
-        &build_family("conv_active_extent", std::slice::from_ref(&dense)),
+        &build_family("conv_active_extent", std::slice::from_ref(&dense), 1),
         ["conv2d", "im2col_gpu"],
     );
     let pointwise = row(&CONV1X1, "l800");
@@ -1067,6 +1076,7 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         &build_family(
             "conv_active_extent_pointwise",
             std::slice::from_ref(&pointwise),
+            1,
         ),
         ["conv2d", "conv1x1_gemm"],
     );
@@ -1078,7 +1088,11 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     let near_floor = row(&CONV1X7, "entry-l100");
     probe_active_extent(
         "band [entry-l100] (the band this default opens), vetoed by im2col_gpu",
-        &build_family("conv_active_extent_band", std::slice::from_ref(&near_floor)),
+        &build_family(
+            "conv_active_extent_band",
+            std::slice::from_ref(&near_floor),
+            1,
+        ),
         ["conv2d", "im2col_gpu"],
     );
 
@@ -1171,7 +1185,7 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     let in_band = row(&CONV2D, "map-5x5-30x30-c1024");
     let parked_pair = |shape: &BodyConv| {
         rlx_ir::env::set("RLX_WGPU_ALL_PARAMS_WEIGHT", "1");
-        let bg = build_family("conv_col_scratch_parked", std::slice::from_ref(shape));
+        let bg = build_family("conv_col_scratch_parked", std::slice::from_ref(shape), 1);
         set_arm(true);
         let off = Arm::new("off", &bg);
         set_arm(false);
@@ -1206,5 +1220,106 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
              not run",
             shape.label
         );
+    }
+}
+
+/// The im2col admission tests the shape, not the batch, so the census needs a row at a
+/// batch: one shape from each family the route's floors reach — the two in-band 2-D maps,
+/// whose spatial extent comes from both axes; the two unit-height lifts (taps in slot 0 and
+/// in slot 1), whose extent comes from the length axis alone; and the one unit-height lift
+/// the cooperative implicit route takes at a single image — compiled at `n = 1` and `n = 2`,
+/// with the route each takes under the switch.
+///
+/// Each row's one-image route is `expected_routes`', the table the shipped rows already hold,
+/// and its two-image route is that same route except for the class whose route reads one
+/// image: `ConvImplicitShape::admits` takes a single image, so its shapes take the panel
+/// route at two, and the row records what that reserves where one image reserved nothing.
+/// The switch's off arm disables every accelerated route (the relabel included), so a row's
+/// own off column is the direct kernel such a shape falls back to at that batch.
+///
+/// The off arm is printed and not held across batches: two of the routes it restores by hand
+/// carry their own unit-batch gates (the 1×1 GEMM's and the `one_d` tiled branch's), so the
+/// arm that runs by default is the one whose route is worth pinning.
+///
+/// Run with `--ignored --nocapture` after `just throttle`.
+#[test]
+#[ignore = "measurement, not a gate — run with `--ignored --nocapture`"]
+fn conv_route_cost_over_a_batched_map() {
+    let _gate = common::route_lock();
+    stand_down_switches();
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        eprintln!("no wgpu adapter — skipping");
+        return;
+    }
+    // The implicit class's row is the adapter's to decide, so it holds only where the
+    // route's kernel can be built at all.
+    let implicit_available = rlx_wgpu::device::wgpu_device()
+        .is_some_and(|d| rlx_wgpu::kernels::conv1d_implicit_supported(&d.device));
+    common::refuse_under_run_report();
+    let device = rlx_wgpu::device::adapter_name().unwrap_or_else(|| "wgpu".into());
+    eprintln!(
+        "wgpu batched im2col cost on {device}: two in-band 2-D maps, two unit-height lifts and \
+         the implicit class's lift at batch 1 and 2, 3 interleaved rounds per arm (off = \
+         RLX_WGPU_CONV_IM2COL=0, on = unset/default) after one warm-up run"
+    );
+    for (family, table, label) in [
+        ("Conv2d", &CONV2D[..], "map-3x3-40x40"),
+        ("Conv2d", &CONV2D[..], "map-5x5-30x30-c1024"),
+        ("Conv1x7", &CONV1X7[..], "entry-l100"),
+        ("Conv1x7", &CONV1X7[..], "lift-slot0-l1000"),
+        ("Conv1x7", &CONV1X7[..], "dense-l48000"),
+    ] {
+        let (_, at_one) = expected_routes(family, label);
+        if at_one == "conv1d_implicit" && !implicit_available {
+            eprintln!(
+                "  {label}: no cooperative matrices on {device} — the implicit class's row, and \
+                 the handover it censuses, cannot be read here"
+            );
+            continue;
+        }
+        let at_two = if at_one == "conv1d_implicit" {
+            "im2col_gpu"
+        } else {
+            at_one
+        };
+        let mut pairs = Vec::new();
+        for (batch, expected) in [(1usize, at_one), (2, at_two)] {
+            let bg = build_family(family, &[row(table, label)], batch);
+            let pair = measure_pair(&format!("{label} b{batch}"), &bg);
+            assert_eq!(
+                conv_route(&pair.on_counts),
+                expected,
+                "{family} {label} at batch {batch}: the on arm must take {expected}, the route \
+                 the row's own class gives it at that batch (schedule {:?})",
+                pair.on_counts
+            );
+            eprintln!(
+                "  {label} b{batch}: on {} µs ({:.1} µs/image), off arm [{}], arena off {:.1} / \
+                 on {:.1} MiB, on steps [{}]",
+                pair.on_us,
+                pair.on_us as f64 / batch as f64,
+                fmt_counts(&pair.off_counts),
+                pair.off_arena as f64 / (1u64 << 20) as f64,
+                pair.on_arena as f64 / (1u64 << 20) as f64,
+                fmt_counts(&pair.on_counts)
+            );
+            pairs.push(pair);
+        }
+        let (b1, b2) = (&pairs[0], &pairs[1]);
+        eprintln!(
+            "  {label}: per-image cost b2/b1 = {:.2}× ({} µs / 2 against {} µs)",
+            (b2.on_us as f64 / 2.0) / b1.on_us.max(1) as f64,
+            b2.on_us,
+            b1.on_us
+        );
+        if b2.on_arena > b1.on_arena {
+            eprintln!(
+                "  {label}: the batch-2 panel grew the on-arm arena by {:.1} MiB ({:.1} → {:.1} \
+                 MiB)",
+                (b2.on_arena - b1.on_arena) as f64 / (1u64 << 20) as f64,
+                b1.on_arena as f64 / (1u64 << 20) as f64,
+                b2.on_arena as f64 / (1u64 << 20) as f64,
+            );
+        }
     }
 }

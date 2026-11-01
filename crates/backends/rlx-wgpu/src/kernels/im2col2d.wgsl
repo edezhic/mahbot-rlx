@@ -2,15 +2,20 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// GPU im2col for the NCHW convolution im2col+GEMM path (N == 1, groups == 1).
+// GPU im2col for the NCHW convolution im2col+GEMM path (groups == 1).
 //
 // Gathers the receptive field of every output position into a column matrix
 // `col[k_total, spatial]` laid out **row-major** so it feeds the standard
-// `matmul` kernel directly as the B operand:
+// `matmul` kernel directly as the B operand, one panel per image:
 //
 //   A = weight[c_out, c_in*kh*kw]   (row-major, exactly as stored)
-//   B = col[c_in*kh*kw, spatial]    (this kernel's output)
-//   C = out[c_out, spatial]         (matmul writes NCHW output for N=1)
+//   B = col[n][c_in*kh*kw, spatial] (this kernel's output)
+//   C = out[n][c_out, spatial]      (NCHW: the matmul's z is the image)
+//
+// Image `i` of the batch is one `gid.z` slice, read from its own NCHW frame and
+// written to its own panel, so a batched conv gathers every window's receptive
+// field in one dispatch and the GEMM that follows reads the weight once per
+// image with the batch's z axis.
 //
 // The flattened reduction index `k = ((ci*kh)+kr)*kw + kc` matches the
 // (ci, kr, kc) nesting of the direct conv kernel, so the direct and gathered
@@ -21,8 +26,8 @@
 // accumulation order the tree does not fix — so on those shapes the two routes
 // are held to a tolerance, not to bit-identity.
 //
-// One thread per col element (`k_total * spatial` threads). Out-of-bounds
-// receptive-field taps (padding / dilation past the edge) store 0.0.
+// One thread per col element (`k_total * spatial` threads per image).
+// Out-of-bounds receptive-field taps (padding / dilation past the edge) store 0.0.
 
 struct Params {
     c_in: u32,
@@ -56,6 +61,7 @@ fn im2col2d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
     let idx = gid.x + gid.y * ngs.x * 64u;
     if (idx >= total) { return; }
 
+    let img = gid.z;
     let s = idx % params.spatial;   // output spatial position (ho*w_out + wo)
     let k = idx / params.spatial;   // flattened (ci, kr, kc)
 
@@ -72,9 +78,11 @@ fn im2col2d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
 
     var v: f32 = 0.0;
     if (in_r >= 0 && in_c >= 0 && in_r < i32(params.h) && in_c < i32(params.w)) {
-        // N == 1: element (0, ci, in_r, in_c) of [1, c_in, h, w].
-        let in_idx = (ci * params.h + u32(in_r)) * params.w + u32(in_c);
+        // Element (img, ci, in_r, in_c) of [n, c_in, h, w].
+        let frame = params.c_in * params.h * params.w;
+        let in_idx = img * frame + (ci * params.h + u32(in_r)) * params.w + u32(in_c);
         v = arena[params.in_off + in_idx];
     }
-    arena[params.col_off + idx] = v;
+    let panel = params.k_total * params.spatial;
+    arena[params.col_off + img * panel + idx] = v;
 }

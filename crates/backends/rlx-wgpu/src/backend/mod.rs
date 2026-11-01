@@ -324,9 +324,11 @@ fn conv_tiled_min_spatial() -> u64 {
     rlx_ir::env::parse_or("RLX_WGPU_TILED_MIN_SPATIAL", CONV_TILED_MIN_SPATIAL)
 }
 
-/// Element count of the im2col `col[c_in*kh*kw, spatial]` matrix if this conv
-/// node qualifies for the im2col+GEMM path (2D / 1D-as-2D NCHW, `N==1`,
-/// `groups==1`, real spatial kernel, spatial ≥ the im2col spatial floor).
+/// Element count of the im2col `col[n][c_in*kh*kw, spatial]` panels if this conv
+/// node qualifies for the im2col+GEMM path (2D / 1D-as-2D NCHW, `groups==1`, real
+/// spatial kernel, spatial ≥ the im2col spatial floor). One panel per image of the
+/// batch: the gather carries the image on its grid's z and the GEMM that follows
+/// carries it on the matmul's own batch axis.
 /// Returns `None` otherwise, and `None` for a conv the cooperative implicit route
 /// takes instead (`implicit_live`, see [`ConvImplicitShape`]). Mirrors the shape
 /// math in the `Op::Conv` compile arm so scratch sizing and lowering agree on
@@ -374,9 +376,7 @@ fn conv_im2col_col_elems(
     if !out_shape.dim(1).is_static() {
         return None;
     }
-    if in_shape.dim(0).unwrap_static() != 1 {
-        return None;
-    }
+    let n = in_shape.dim(0).unwrap_static() as u64;
     let c_in = in_shape.dim(1).unwrap_static() as u64;
     let c_out = out_shape.dim(1).unwrap_static() as u64;
     let h_in = in_shape.dim(2).unwrap_static() as u32;
@@ -426,13 +426,13 @@ fn conv_im2col_col_elems(
         sw: stride.get(1).copied().unwrap_or(1) as u64,
         ph: padding.first().copied().unwrap_or(0) as u64,
         groups: *groups as u64,
-        n: in_shape.dim(0).unwrap_static() as u64,
+        n,
         spatial,
     };
     if implicit_live && implicit_shape.admits() {
         return None;
     }
-    Some(k_total * spatial)
+    Some(n * k_total * spatial)
 }
 
 /// Extra arena scratch (bytes, 256-aligned) needed to hold the largest conv
@@ -6197,6 +6197,30 @@ mod conv_route_decision_tests {
         assert_eq!(compute_scratch_bytes(&band), 64 * 1024 * 1024);
     }
 
+    /// The panel reservation is one panel per image: the batch axis is the panel's
+    /// (the gather's `gid.z` and the GEMM's `batch`), so a batch-2 conv of the same
+    /// geometry is admitted and reserves exactly twice the batch-1 panel.
+    #[test]
+    fn the_col_reservation_scales_with_the_batch() {
+        let side = (im2col_min_spatial() as f64).sqrt().ceil() as usize;
+        let c_in = (im2col_min_k().div_ceil(9) as usize).max(64);
+        let c_out = im2col_min_cout() as usize;
+        let (one, elems1) = conv_graph_batch(1, c_in, c_out, [side, side], [3, 3], [1, 1]);
+        let (two, elems2) = conv_graph_batch(2, c_in, c_out, [side, side], [3, 3], [1, 1]);
+        let elems1 = elems1.expect("the band shape clears the effective floors");
+        let elems2 = elems2.expect("a batch-2 conv is admitted by the shape decision");
+        assert!(elems1 > 0);
+        assert_eq!(elems2, 2 * elems1, "one panel per image");
+        let bytes1 = conv_im2col_scratch_bytes(&one, 0, u64::MAX, false);
+        let bytes2 = conv_im2col_scratch_bytes(&two, 0, u64::MAX, false);
+        assert!(bytes2 > 0, "a batch-2 conv reserves its panels");
+        assert_eq!(
+            bytes2,
+            2 * bytes1,
+            "the reservation doubles with the batch (the 256-byte alignment is preserved)"
+        );
+    }
+
     /// The implicit class's channel bounds are the entry's own: a ceiling because it
     /// carries three accumulator sets (an output one row past three tiles would have
     /// rows no set covers) and a floor because below a tile's rows it multiplies
@@ -6354,8 +6378,21 @@ mod conv_route_decision_tests {
         k: [usize; 2],
         p: [usize; 2],
     ) -> (Graph, Option<u64>) {
+        conv_graph_batch(1, c_in, c_out, hw, k, p)
+    }
+
+    /// [`conv_graph`] at `n` images: the same node with the batch on the input's
+    /// first axis, which is the axis the panel route now carries.
+    fn conv_graph_batch(
+        n: usize,
+        c_in: usize,
+        c_out: usize,
+        hw: [usize; 2],
+        k: [usize; 2],
+        p: [usize; 2],
+    ) -> (Graph, Option<u64>) {
         let mut g = Graph::new("conv_col_reservation");
-        let x = g.input("x", Shape::new(&[1, c_in, hw[0], hw[1]], DType::F32));
+        let x = g.input("x", Shape::new(&[n, c_in, hw[0], hw[1]], DType::F32));
         let w = g.param("w", Shape::new(&[c_out, c_in, k[0], k[1]], DType::F32));
         let y = g.conv2d(x, w, k, [1, 1], p, [1, 1], 1);
         let node = g.node(y);

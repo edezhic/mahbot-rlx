@@ -262,6 +262,10 @@ name = "coop_self_check"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "conv_batched_im2col_parity"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "conv_gemm_coop_f32"
 required-features = ["backend-tests"]
 

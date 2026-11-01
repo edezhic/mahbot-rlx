@@ -270,15 +270,39 @@ fn feed_files(
         // Credited after the feed, from the audio it took, before the error leaves:
         // what a cut report's rate divides by.
         let secs = (stream.samples_fed() - before) as f64 / f64::from(listen::SAMPLE_RATE);
-        take_measured(stream, totals);
         totals.credit(path, secs);
+        // A file's own audio is one boundary and its silence gap another: a window
+        // still waiting for its neighbour is scored here, inside the file that produced
+        // it, so a fire is never attributed to the file whose audio merely completed the
+        // group.
+        flush_and_take(stream, listener, deadline, totals, fed.is_ok())?;
         fed?;
         let gap_fed = stream.feed(gap, listener, deadline, "real audio");
-        take_measured(stream, totals);
+        flush_and_take(stream, listener, deadline, totals, gap_fed.is_ok())?;
         gap_fed?;
     }
 
     Ok(())
+}
+
+/// Score the group a feed left waiting, then take what the stream measured — in that
+/// order, and both before either error leaves: a stop that lands in the flush still
+/// credits this file's fires and VAD hops to the cut report whose audio seconds it
+/// already counted, and a failed feed is followed by nothing at all.
+fn flush_and_take(
+    stream: &mut DetectionStream,
+    listener: &mut impl Embedder,
+    deadline: Deadline,
+    totals: &mut Totals,
+    fed: bool,
+) -> Result<()> {
+    let flushed = if fed {
+        stream.flush(listener, deadline, "real audio")
+    } else {
+        Ok(())
+    };
+    take_measured(stream, totals);
+    flushed
 }
 
 /// What the stream measured since the last read — fires and VAD-active seconds —
@@ -295,17 +319,32 @@ mod tests {
 
     use anyhow::{Context, Result};
 
-    use super::{Totals, feed_files, verify};
+    use super::{Totals, feed_files, flush_and_take, take_measured, verify};
+    use crate::bench::detect;
     use crate::bench::detect::DetectionStream;
     use crate::bench::sets;
     use crate::guard::{Deadline, MemoryCeiling};
     use crate::listen::Embedder;
     use crate::{listen, wake};
 
-    /// A synthesized corpus clip: 16 kHz mono PCM16.
+    /// A synthesized corpus clip: 16 kHz mono PCM16, at `440 Hz`'s ragged sawtooth, which
+    /// the VAD reads as speech only in patches.
     fn wav(path: &Path, secs: f64) {
         let frames = (secs * f64::from(listen::SAMPLE_RATE)) as usize;
-        let data = frames as u32 * 2;
+        let samples: Vec<f32> = (0..frames)
+            .map(|i| (i as f32 * 440.0 / listen::SAMPLE_RATE as f32 % 1.0) - 0.5)
+            .collect();
+        write_wav(path, &samples, 16_000.0);
+    }
+
+    /// The same container over a signal the VAD walks as speech throughout, so two runs
+    /// that feed it differently differ in nothing but the feeding.
+    fn voiced(path: &Path, secs: f64) {
+        write_wav(path, &tone(secs), 32_000.0);
+    }
+
+    fn write_wav(path: &Path, samples: &[f32], gain: f32) {
+        let data = samples.len() as u32 * 2;
         let mut bytes = Vec::with_capacity(44 + data as usize);
         bytes.extend_from_slice(b"RIFF");
         bytes.extend_from_slice(&(36 + data).to_le_bytes());
@@ -319,9 +358,8 @@ mod tests {
         bytes.extend_from_slice(&16u16.to_le_bytes());
         bytes.extend_from_slice(b"data");
         bytes.extend_from_slice(&data.to_le_bytes());
-        for i in 0..frames {
-            let tone = (i as f32 * 440.0 / listen::SAMPLE_RATE as f32 % 1.0) - 0.5;
-            bytes.extend_from_slice(&((tone * 16_000.0) as i16).to_le_bytes());
+        for v in samples {
+            bytes.extend_from_slice(&((v.clamp(-1.0, 1.0) * gain) as i16).to_le_bytes());
         }
         std::fs::write(path, bytes).expect("write the synthetic clip");
     }
@@ -336,16 +374,135 @@ mod tests {
         }
     }
 
-    fn stream() -> DetectionStream {
+    fn enrollment() -> wake::Enrollment {
         let utterances = vec![vec![1.0f32, 0.0]; wake::MIN_ENROLLMENT_UTTERANCES];
-        let enrollment = wake::Enrollment::build(
+        wake::Enrollment::build(
             "wake".into(),
             &utterances,
             wake::Calibration::default(),
             &[],
         )
-        .expect("an enrolment of identical utterances");
-        DetectionStream::warm(enrollment)
+        .expect("an enrolment of identical utterances")
+    }
+
+    fn stream() -> DetectionStream {
+        DetectionStream::warm(enrollment())
+    }
+
+    /// A voiced signal the VAD walks as speech throughout, so the streams below differ in
+    /// nothing but when they are fed and flushed.
+    fn tone(secs: f64) -> Vec<f32> {
+        let samples = (secs * f64::from(listen::SAMPLE_RATE)) as usize;
+        (0..samples)
+            .map(|n| {
+                let t = n as f32 / listen::SAMPLE_RATE as f32;
+                (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.6
+            })
+            .collect()
+    }
+
+    /// A stop that lands in the flush still leaves this file's fires and VAD hops in the
+    /// report whose audio seconds were already credited: the measurement is taken before
+    /// the flush's error leaves, and this is the only order that keeps a cut report's rate
+    /// dividing one population.
+    #[test]
+    fn a_stop_in_the_flush_still_takes_what_the_stream_measured() {
+        let mut stream = stream();
+        let mut embed = Fixed;
+        stream
+            .feed(&tone(4.0), &mut embed, Deadline::new(60), "test")
+            .expect("a feed inside the bound");
+        let mut totals = Totals::default();
+        let stopped = flush_and_take(&mut stream, &mut embed, Deadline::new(0), &mut totals, true);
+        assert!(stopped.is_err(), "the expired deadline has to surface");
+        assert!(
+            totals.events > 0,
+            "the fires the feed accepted are in the report"
+        );
+        assert!(
+            totals.vad_secs > 0.0,
+            "and so are the hops it walked as speech"
+        );
+    }
+
+    /// The sweep's flush points — one at the end of each file and one at the end of each
+    /// silence gap — decide what one continuous feed of the same audio decides: the events
+    /// a report counts do not depend on where a file ends. That is the premise behind the
+    /// bench record's figures standing across the grouping change.
+    #[test]
+    fn the_sweeps_flush_points_decide_what_one_continuous_feed_does() {
+        let dir =
+            std::env::temp_dir().join(format!("mahbot-real-audio-flush-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("speech")).expect("temp corpus");
+        voiced(&dir.join("speech/a.wav"), 0.5);
+        voiced(&dir.join("speech/b.wav"), 0.5);
+        let subset = [("speech/a.wav", "", 0u64), ("speech/b.wav", "", 0u64)];
+        let gap = vec![0f32; sets::FILE_GAP_SAMPLES];
+
+        // One continuous feed of the same audio, one flush at the end.
+        let mut audio = Vec::new();
+        for (path, _, _) in subset {
+            let file = dir.join(path);
+            let name = file.to_str().expect("a UTF-8 temp path");
+            audio.extend(
+                crate::host::wav_mono(name, listen::SAMPLE_RATE, 0, usize::MAX).expect("the clip"),
+            );
+            audio.extend_from_slice(&gap);
+        }
+        let mut whole = Totals::default();
+        let mut whole_stream = stream();
+        let mut embed = Fixed;
+        let deadline = Deadline::new(600);
+        for chunk in audio.chunks(detect::FRAME_LENGTH) {
+            whole_stream
+                .feed(chunk, &mut embed, deadline, "test")
+                .expect("a chunk");
+        }
+        whole_stream
+            .flush(&mut embed, deadline, "test")
+            .expect("a flush");
+        take_measured(&mut whole_stream, &mut whole);
+
+        for group in [1, listen::GROUP] {
+            let mut per_file = Totals::default();
+            let mut per_file_stream = if group == 1 {
+                DetectionStream::warm(enrollment())
+            } else {
+                DetectionStream::grouped(enrollment())
+            };
+            feed_files(
+                &subset,
+                &dir,
+                &mut Fixed,
+                &mut per_file_stream,
+                &gap,
+                Deadline::new(600),
+                MemoryCeiling::process_only(4096),
+                &mut per_file,
+            )
+            .expect("a synthetic corpus two files long");
+            eprintln!(
+                "group {group}: per-file flushes {} events over {:.3} s of speech · one feed {} \
+                 events over {:.3} s",
+                per_file.events, per_file.vad_secs, whole.events, whole.vad_secs
+            );
+            assert!(
+                whole.events > 0,
+                "the fixture has to fire for the comparison to mean anything"
+            );
+            assert_eq!(
+                per_file.events, whole.events,
+                "group {group}: a file boundary moved an event"
+            );
+            let per_fire =
+                group as f64 * listen::SCORE_STRIDE_SAMPLES as f64 / f64::from(listen::SAMPLE_RATE);
+            assert!(
+                (per_file.vad_secs - whole.vad_secs).abs() <= whole.events as f64 * per_fire,
+                "group {group}: the boundary moved the VAD clock by {:.3} s",
+                (per_file.vad_secs - whole.vad_secs).abs()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The phase credits each file with the audio its feed took, into the pool its
