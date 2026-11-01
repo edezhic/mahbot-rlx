@@ -34,7 +34,7 @@ use crate::listen;
 use crate::loader::Pair;
 use crate::measurements::sha256_file;
 use crate::tokenizer::Tokenizer;
-use crate::{synth, wake};
+use crate::{reference, synth, wake};
 
 use super::audio::Synth;
 use super::config::{BenchConfig, Refused};
@@ -108,6 +108,9 @@ pub(crate) struct SentenceCheck {
     /// its last words. A truncated render is a render-length failure, not a
     /// failure of the check.
     pub truncated: bool,
+    /// The engine's refusal, when the render stopped short instead of returning audio:
+    /// a candidate's own failure, recorded like a misheard sentence.
+    pub refusal: Option<String>,
 }
 
 /// Whether every sentence of the enrolled voice's own check came back.
@@ -291,15 +294,7 @@ pub(crate) fn select(
                 voices.push(voice);
             }
             Some(failed) => {
-                let reason = if failed.truncated {
-                    format!(
-                        "`{}` rendered longer than the {PROBE_SECS} s probe window, so the check \
-                         heard only its first words: `{}`",
-                        failed.text, failed.heard
-                    )
-                } else {
-                    format!("`{}` came back as `{}`", failed.text, failed.heard)
-                };
+                let reason = rejection_reason(failed);
                 eprintln!(
                     "[{label}] {} ({}) rejected: {reason}; the next pinned candidate is tried",
                     candidate.recording,
@@ -370,7 +365,28 @@ fn check(
     let mut checks = Vec::with_capacity(requests.len());
     for request in &requests {
         deadline.check("voices")?;
-        let samples = synth.clip(&request.speaker, request.text, request.seed)?;
+        let samples = match synth.clip(&request.speaker, request.text, request.seed) {
+            Ok(samples) => samples,
+            // A render the engine refused ([`synth::Unspoken`]) is this candidate's
+            // failure, recorded the way a misheard sentence is, so one bad probe render
+            // does not cost the pass its other candidates. Every other failure out of the
+            // same call — a guard stop, a build error, a device fault — ends the run.
+            Err(error) => match error.downcast_ref::<synth::Unspoken>() {
+                Some(refusal) => {
+                    checks.push(SentenceCheck {
+                        text: request.text,
+                        heard: String::new(),
+                        passed: false,
+                        truncated: false,
+                        refusal: Some(refusal.to_string()),
+                    });
+                    // The candidate is out on this render; its remaining sentence would
+                    // only cost another render.
+                    break;
+                }
+                None => return Err(error),
+            },
+        };
         let (probe, truncated) = probe_audio(samples);
         let heard = clip
             .run(probe, None)
@@ -387,23 +403,34 @@ fn check(
             passed: same_words(request.text, &heard),
             heard,
             truncated,
+            refusal: None,
         });
     }
     Ok(checks)
 }
 
-/// Whether the recogniser's answer carries the sentence's words, in order,
-/// ignoring case and punctuation. Everything that is not a letter or a digit
-/// separates words, in both the expected sentence and the answer.
-fn same_words(expected: &str, heard: &str) -> bool {
-    fn words(text: &str) -> Vec<String> {
-        text.to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|word| !word.is_empty())
-            .map(str::to_string)
-            .collect()
+/// Why a candidate was rejected, from the first sentence that did not pass: the engine's
+/// refusal when the render stopped short, a render past the probe window, or what the
+/// recogniser answered instead of the sentence.
+fn rejection_reason(failed: &SentenceCheck) -> String {
+    if let Some(refusal) = &failed.refusal {
+        format!("the render of `{}` stopped short: {refusal}", failed.text)
+    } else if failed.truncated {
+        format!(
+            "`{}` rendered longer than the {PROBE_SECS} s probe window, so the check heard only \
+             its first words: `{}`",
+            failed.text, failed.heard
+        )
+    } else {
+        format!("`{}` came back as `{}`", failed.text, failed.heard)
     }
-    words(expected) == words(heard)
+}
+
+/// Whether the recogniser's answer carries the sentence's words, in order, case and
+/// punctuation aside — [`reference::words`] is the crate's one normaliser, so this check
+/// and the round trip cannot read a sentence two ways.
+fn same_words(expected: &str, heard: &str) -> bool {
+    reference::words(expected) == reference::words(heard)
 }
 
 /// The pinned span as a 16 kHz WAV in the corpus cache: its path, after checking the
@@ -692,6 +719,23 @@ mod tests {
         assert!(!truncated);
         let (_, truncated) = probe_audio(vec![0.0; 2 * PROBE_FRAMES * graphs::MEL_HOP]);
         assert!(truncated);
+    }
+
+    /// A render the engine refused rejects its candidate and records the refusal, so a
+    /// guard that trips on one candidate does not abort the selection.
+    #[test]
+    fn a_refused_probe_render_rejects_its_candidate() {
+        let failed = SentenceCheck {
+            text: "the weather is sunny today",
+            heard: String::new(),
+            passed: false,
+            truncated: false,
+            refusal: Some("the talker is repeating itself".into()),
+        };
+        let reason = rejection_reason(&failed);
+        assert!(reason.contains("the weather is sunny today"), "{reason}");
+        assert!(reason.contains("repeating itself"), "{reason}");
+        assert!(!reason.contains("came back as"), "{reason}");
     }
 
     /// The shortfall names what is missing — how many voices, and every candidate

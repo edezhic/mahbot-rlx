@@ -84,15 +84,6 @@ pub fn is_asr_eos(id: usize) -> bool {
     id == ASR_EOS || id == ASR_EOS_ALSO
 }
 
-/// The decode's compiled cache grows in these row buckets: the attention operand
-/// is the whole `[capacity + 1]` plane, so a capacity fixed at the token budget
-/// makes every step read the masked rows too. One bucket above the prompt, then
-/// one more each time the live cache reaches the compiled one, keeps the operand
-/// within a bucket of the live span. The first bucket holds a whole short
-/// utterance (a walk of 65 tokens here), so the common case pays one compile;
-/// the bucket exists to bound the operand, not to avoid a second graph.
-pub const DECODE_CACHE_BUCKET: usize = 128;
-
 /// The front end's three graphs for one frame count: mel, encoder and projector.
 /// Built and run in this order everywhere the path measures — the ear's window, a
 /// recognition segment, the tagger's own front — so the input names and the frame
@@ -828,7 +819,7 @@ impl<'a> Clip<'a> {
         // The compiled capacity starts one bucket above the prompt and grows only as
         // the walk fills it; a capacity fixed at the token budget would make every
         // step's attention read thousands of masked rows.
-        let capacity = prompt_rows + DECODE_CACHE_BUCKET;
+        let capacity = prompt_rows + graphs::CACHE_BUCKET;
         let front = Front::build(pair, frames, 1).context("front build")?;
         let build_ms = front.build_ms();
         Ok(Self {
@@ -1042,35 +1033,12 @@ impl<'a> Clip<'a> {
             // mask is rebuilt with the same key order (history, then the spare row
             // now at `cap`). The arithmetic and the graph are unchanged.
             if written == capacity && !is_asr_eos(next) && generated.len() < max_new {
-                let cap = capacity + DECODE_CACHE_BUCKET;
-                let mut k_new: Vec<Vec<f32>> = (0..cfg.layers)
-                    .map(|_| vec![0f32; (cap + 1) * hkv])
-                    .collect();
-                let mut v_new: Vec<Vec<f32>> = (0..cfg.layers)
-                    .map(|_| vec![0f32; (cap + 1) * hkv])
-                    .collect();
-                let live = written * hkv;
-                for l in 0..cfg.layers {
-                    let k_rows = decode
-                        .graph()
-                        .runner
-                        .read_plane(&format!("k{l}"))
-                        .ok_or_else(|| anyhow!("reading k{l} at row {written}"))?;
-                    let v_rows = decode
-                        .graph()
-                        .runner
-                        .read_plane(&format!("v{l}"))
-                        .ok_or_else(|| anyhow!("reading v{l} at row {written}"))?;
-                    k_new[l][..live].copy_from_slice(&k_rows[..live]);
-                    v_new[l][..live].copy_from_slice(&v_rows[..live]);
-                }
+                let cap = capacity + graphs::CACHE_BUCKET;
+                let (k_new, v_new) =
+                    graphs::lift_planes(&decode.graph(), cfg.layers, hkv, written, cap)?;
                 k_cache = k_new;
                 v_cache = v_new;
-                mask = vec![0f32; cap + 1];
-                for r in 0..written {
-                    mask[r] = 1.0;
-                }
-                mask[cap] = 1.0;
+                mask = graphs::resident_mask(written, cap);
                 let t = report::Stopwatch::start();
                 let grown = decode_graph(&self.pair, cap)?;
                 build_ms += t.ms();

@@ -39,13 +39,13 @@ use std::sync::Arc;
 use mahbot_inference::graphs::{self, DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, windows};
 use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::report;
-use mahbot_inference::synth::{MAX_CODEC_ROWS, Synthesis};
+use mahbot_inference::synth::Synthesis;
 use rlx_ir::Tick;
 use rlx_runtime::Device;
 
 mod support;
 
-use support::TTS_TEXT;
+use support::{CELL_FRAMES, TTS_TEXT};
 
 /// Rounds one arm is timed over; the median is the arm's figure and the spread of
 /// the paired deltas is the comparison's own.
@@ -136,8 +136,8 @@ fn the_sound_graphs_are_built_per_stage_group() {
     let Some(pair) = pair_or_skip() else { return };
     let device = Device::Gpu;
     let groups = graphs::codec_groups();
-    let parts = windows(MAX_CODEC_ROWS, DAC_WINDOW, DAC_MARGIN);
-    let front_set = windows(MAX_CODEC_ROWS, FRONT_WINDOW, 0);
+    let parts = windows(CELL_FRAMES, DAC_WINDOW, DAC_MARGIN);
+    let front_set = windows(CELL_FRAMES, FRONT_WINDOW, 0);
     let tail_len = front_set.last().map_or(0, |&(p0, p1, _, _)| p1 - p0);
     assert_tail_is_not_a_chunk(tail_len);
     let mut spans: Vec<usize> = parts.iter().map(|&(p0, p1, _, _)| p1 - p0).collect();
@@ -146,9 +146,8 @@ fn the_sound_graphs_are_built_per_stage_group() {
     // Per group, in the order the sound half builds them: the front's set — its first
     // window, then the carried chunk built once the first graph has gone — and then
     // each stage group's graph for every span the part runs.
-    let mut front =
-        graphs::FrontGraphs::build(device, &pair.sound, MAX_CODEC_ROWS, groups[0].clone())
-            .expect("the front's graphs");
+    let mut front = graphs::FrontGraphs::build(device, &pair.sound, CELL_FRAMES, groups[0].clone())
+        .expect("the front's graphs");
     let first_ms = front.built_ms();
     front.pick(FRONT_WINDOW).expect("the carried chunk's graph");
     let carry_ms = front.built_ms() - first_ms;
@@ -181,7 +180,7 @@ fn the_sound_graphs_are_built_per_stage_group() {
     // the arena its graph holds. A part longer than one chunk carries the full chunk
     // its later windows run, never a graph those windows cannot dispatch.
     let carry = graphs::FRONT_CARRY;
-    for frames in [FRONT_WINDOW, 100, 2 * FRONT_WINDOW, MAX_CODEC_ROWS] {
+    for frames in [FRONT_WINDOW, 100, 2 * FRONT_WINDOW, CELL_FRAMES] {
         let mut front = graphs::FrontGraphs::build(device, &pair.sound, frames, groups[0].clone())
             .expect("a front graph");
         let (first, len) = front.pick(0).expect("the first window's graph");
@@ -246,7 +245,7 @@ fn the_fronts_last_window_runs_padded() {
     let Some(pair) = pair_or_skip() else { return };
     let device = Device::Gpu;
     let front = graphs::codec_groups()[0].clone();
-    let part = windows(MAX_CODEC_ROWS, FRONT_WINDOW, 0);
+    let part = windows(CELL_FRAMES, FRONT_WINDOW, 0);
     let &(_, _, tail_at, tail_end) = part.last().expect("a part has a window");
     let tail_len = tail_end - tail_at;
     assert_tail_is_not_a_chunk(tail_len);
@@ -312,14 +311,14 @@ fn the_decoders_windows_carry_no_right_margin() {
     // The spans the run makes, and the spans the same windows carried while the
     // right margin was on — four frames more on every window but the part's own
     // tail, which already ends at the part's end.
-    let cuts = windows(MAX_CODEC_ROWS, DAC_WINDOW, DAC_MARGIN);
+    let cuts = windows(CELL_FRAMES, DAC_WINDOW, DAC_MARGIN);
     let spans: Vec<usize> = cuts.iter().map(|&(p0, p1, _, _)| p1 - p0).collect();
     // Both sides through the window function, from the one cut: the margin arm is
     // the same core with `DAC_MARGIN` frames on its right, clipped at the part's end.
     let padded: Vec<usize> = cuts
         .iter()
         .map(|&(_, _, a, b)| {
-            let (p0, p1) = graphs::window_span(MAX_CODEC_ROWS, a, b, DAC_MARGIN, DAC_MARGIN);
+            let (p0, p1) = graphs::window_span(CELL_FRAMES, a, b, DAC_MARGIN, DAC_MARGIN);
             p1 - p0
         })
         .collect();

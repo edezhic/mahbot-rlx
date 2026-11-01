@@ -2,20 +2,17 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The answers the two generative surfaces must keep producing. Synthesis is
-//! bit-exact: it samples from a
-//! seed, so a drift in the last bits flips a codec frame and then the whole
-//! waveform. Recognition is recorded by its words — the transcript should still
-//! read as [`LISTEN_TRANSCRIPT`], with at most [`LISTEN_MOVED_WORDS`] of them
-//! different — and its digest, its token count and every moved word print as
-//! witnesses. The one hard gate among these is the synthesis round trip: what the
-//! recogniser hears from the synthesised wave must still be
-//! [`SPEAK_TRANSCRIPT`].
+//! The answers the two generative surfaces must keep producing. Recognition is
+//! recorded by its words — the transcript should still read as [`LISTEN_TRANSCRIPT`],
+//! with at most [`LISTEN_MOVED_WORDS`] of them different — and its digest, its token
+//! count and every moved word print as witnesses. Synthesis is recorded by its words
+//! too: a render is as long as its text, so no whole waveform is pinned, and the one
+//! hard gate is the round trip — the recogniser must hear the text the render was
+//! asked to speak ([`check_speak_roundtrip`]).
 //!
-//! Taken from a plain run of the recognition and synthesis rows, on the models the
-//! run loads, with no `RLX_*` switch set: the instrumented runs are not witnesses,
-//! because a switch may change the scheduling shape. The synthesis waveform digest
-//! is the one a plain run prints as the row's own `digest=`.
+//! Taken from a plain run of the stand's rows, on the models the run loads, with no
+//! `RLX_*` switch set: the instrumented runs are not witnesses, because a switch may
+//! change the scheduling shape.
 
 use sha2::{Digest, Sha256};
 
@@ -72,35 +69,15 @@ pub const STAND_SYNTH_TYPICAL_SAMPLES: usize = 172_800;
 /// when its neighbour changes.
 pub const STAND_WAKE_SCORE: f32 = 0.8846;
 
-/// The synthesis round trip's waveform witness: `digest(&waveform)`, FNV-1a over the
-/// f32 bytes.
-///
-/// A change that reorders a summation the waveform depends on may move it: the
-/// seeded draws then leave the pinned sample path somewhere in the 330 rows. It is
-/// a witness, not a gate; the transcript below is the gate, and this digest is the
-/// record of the waveform that produced it.
-pub const SPEAK_WAVE_DIGEST: u64 = 0x9d83_7a9c_4164_ba94;
 /// The voice the synthesis witness was recorded with. `MAHBOT_VOICE_WAV` names
 /// the voice input, so a run that points it at another file expects another
 /// waveform and skips the pin.
 pub const SPEAK_VOICE_SHA256: &str =
     "0ca6c18b9189381dcdad83d26814f73b3f4d2d26dea6892371c2177d30e72ace";
-/// The synthesis round trip: the pinned waveform, resampled 24 kHz → 16 kHz and
-/// run back through the recogniser exactly as the one-shot path runs it, comes
-/// back as this text — 107 generated ids, EOS reached, on the recorded voice and
-/// the models the check loads.
-///
-/// It is the **raw** waveform's transcript. The check does not apply the
-/// recognition side's one-shot conditioning, and this waveform's peak
-/// (0.053) trips its quiet-recording gain, which multiplies the signal by ~13
-/// before the encoder sees it. The same clip through the prepared path answers
-/// differently ("…never mind how long since I left New Orleans… I've been to New
-/// York…"), so the two are not interchangeable and this pin belongs to the path
-/// the gate takes. What the pin establishes is that the waveform still says the
-/// same thing to the recogniser; it is not a claim that the synthesis is
-/// intelligible — the answer keeps the opening clause and then runs a repetition
-/// loop, exactly as it does on the prepared path.
-pub const SPEAK_TRANSCRIPT: &str = "Call me Ishmael. Some years ago, now I'm old, beside the sea. I've seen them all, every shore, every harbor, every city, every town, every street, every house, every farm, every field, every hill, every mountain, every forest, every river, every ocean, every island, every shore, every harbor, every city, every town, every street, every house, every farm, every field, every hill, every mountain, every forest, every river, every";
+/// How many of the spoken text's opening words the round trip demands: enough that a
+/// waveform of noise or a silent one cannot pass, short enough that the recogniser's
+/// own reading of the rest of a long render decides nothing.
+const SPEAK_OPENING_WORDS: usize = 4;
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -109,10 +86,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Whether the run's voice input is the clip the speak witness was recorded
-/// with. The round trip pins against it, and the pinned-clip check compares the
-/// listen witness only when it holds, so the rule is stated here once: an
-/// unreadable voice counts as the pinned one, and the pin then decides on the
-/// digest it exists for.
+/// with. The round trip is judged with it — another voice renders other words, which
+/// the check cannot judge — and the pinned-clip check compares the listen witness
+/// only when it holds, so the rule is stated here once: an unreadable voice counts as
+/// the pinned one, and the pin then decides on the digest it exists for.
 pub fn voice_is_pinned() -> bool {
     crate::loader::voice_wav()
         .ok()
@@ -248,25 +225,49 @@ pub fn check_listen(
     words.reads_as_pinned && input_is_pinned
 }
 
-/// Print the round-trip witness against the pin: what the recogniser heard from
-/// the synthesis waveform, and whether it is the pinned answer. The verdict line
-/// carries the two transcripts' SHA-256 the way [`check_listen`] carries its own,
-/// and the texts print only on a mismatch. `wave=raw` states which side of the
-/// recognition side's conditioning the check ran on; a mismatch is a failed check,
-/// not a diagnostic.
-pub fn check_speak_roundtrip(heard: &str) -> bool {
-    let same = heard == SPEAK_TRANSCRIPT;
-    let hash = sha256_hex(heard.as_bytes());
+/// The words of `text` with case and punctuation aside — what the recogniser's own
+/// spelling does to a spoken sentence, and what [`check_speak_roundtrip`] compares.
+pub fn words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// Whether what the recogniser heard **opens with the text the render was asked to
+/// speak** — [`SPEAK_OPENING_WORDS`] of them, case and punctuation aside.
+fn hears_opening(heard: &str, spoken: &str) -> bool {
+    let (heard, spoken) = (words(heard), words(spoken));
+    let count = SPEAK_OPENING_WORDS.min(spoken.len());
+    count > 0 && heard.len() >= count && heard[..count] == spoken[..count]
+}
+
+/// Print the round-trip witness: what the recogniser heard from the synthesis
+/// waveform, and whether it opens with the text that was spoken. The judgement is on
+/// words, not on a hash — the waveform's bits are the sampler's, its words are the
+/// product's, and the recogniser's reading of a long render is its own. The hearing
+/// prints when it does not open with the text, so a mismatch says what it heard
+/// instead. `wave=raw` states which side of the recognition side's conditioning the
+/// check ran on; a mismatch is a failed check, not a diagnostic.
+pub fn check_speak_roundtrip(heard: &str, spoken: &str) -> bool {
+    let holds = hears_opening(heard, spoken);
     println!(
-        "witness speak-roundtrip wave=raw transcript_sha256={hash}/{} equal={same}",
-        sha256_hex(SPEAK_TRANSCRIPT.as_bytes())
+        "witness speak-roundtrip wave=raw opening={holds} heard_words={} spoken_words={} \
+         opening_words={SPEAK_OPENING_WORDS}",
+        words(heard).len(),
+        words(spoken).len(),
     );
-    if !same {
-        println!("witness speak-roundtrip — the recogniser heard a different answer:");
+    if !holds {
+        println!("witness speak-roundtrip — the recogniser did not hear the text's opening:");
         println!("  heard:  {heard:?}");
-        println!("  pinned: {SPEAK_TRANSCRIPT:?}");
+        println!("  spoken: {spoken:?}");
     }
-    same
+    holds
 }
 
 #[cfg(test)]
@@ -384,5 +385,21 @@ mod tests {
         assert_eq!(headline(&one_word), "1 of 22 words (listed below)");
         let truncated = "обычные объявления метро";
         assert_eq!(headline(truncated), "words 3 (pinned 22)");
+    }
+
+    /// The round trip's rule: the spoken text's opening is what decides, case and
+    /// punctuation aside, and a hearing that stops short of it or starts somewhere else
+    /// does not pass. The printing wrapper around it is not what is under test.
+    #[test]
+    fn the_round_trip_is_judged_on_the_texts_opening() {
+        let spoken = "Call me Ishmael. Some years ago, never mind how long precisely";
+        assert!(hears_opening(
+            "Call me Ishmael, some years ago, and then it went on",
+            spoken
+        ));
+        assert!(!hears_opening("", spoken));
+        assert!(!hears_opening("anything at all", ""));
+        assert!(!hears_opening("Call me", spoken));
+        assert!(!hears_opening("Ishmael, call me some years ago", spoken));
     }
 }

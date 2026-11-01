@@ -43,14 +43,11 @@ use rlx_runtime::Device;
 
 mod support;
 
-use mahbot_inference::synth::MAX_CODEC_ROWS;
 use support::{
-    arm_once, arm_outputs, call_of, frame_arm, greatest, last_dim, least, median, packed_ramp,
-    ramped_inputs, step_census, steps_for, zero_inputs,
+    CELL_FRAMES, arm_once, arm_outputs, call_of, frame_arm, greatest, last_dim, least, median,
+    packed_ramp, ramped_inputs, step_census, steps_for, zero_inputs,
 };
 
-/// The body's cache capacity: any capacity builds the same multiplies.
-const BODY_CAPACITY: usize = 330;
 /// Packed bytes one harness call streams, before the shape's own step count is
 /// rounded down to whole copies and capped. Larger than the shared
 /// [`support::TARGET_BYTES`] (96 MiB) on purpose: this census prices every shape in
@@ -253,7 +250,7 @@ fn output_delta(a: &[Vec<f32>], b: &[Vec<f32>]) -> f64 {
 
 /// One paired window's line: both arms' medians, the paired difference's median and
 /// spread, the stood-down arm's wins, and what the difference is worth over the
-/// cell's own 330 generated frames -- a per-frame figure, not a per-level one.
+/// cell's own [`CELL_FRAMES`] frames -- a per-frame figure, not a per-level one.
 fn print_pair(subject: &str, a_ms: &[f64], b_ms: &[f64], diffs: &[f64]) {
     let delta = median(diffs);
     println!(
@@ -268,7 +265,7 @@ fn print_pair(subject: &str, a_ms: &[f64], b_ms: &[f64], diffs: &[f64]) {
         greatest(diffs),
         diffs.iter().filter(|d| **d < 0.0).count(),
         diffs.len(),
-        delta * MAX_CODEC_ROWS as f64,
+        delta * CELL_FRAMES as f64,
     );
 }
 
@@ -536,18 +533,18 @@ fn the_synthesis_loops_per_shape_rate_census_with_models() {
     };
     let mut body = {
         let _switch = rlx_ir::env::RuntimeOverrides::install(support::FRAME_SWITCHES);
-        let body = graphs::body_capacity_chain_planes(pair.body.clone(), BODY_CAPACITY)
+        let body = graphs::body_capacity_chain_planes(pair.body.clone(), CELL_FRAMES)
             .expect("build the plane-cache decode body");
         let mut body = graphs::Compiled::new(Device::Gpu, body).expect("compile the body");
-        let k = vec![vec![0f32; (BODY_CAPACITY + 1) * hkv]; layers];
-        let v = vec![vec![0f32; (BODY_CAPACITY + 1) * hkv]; layers];
+        let k = vec![vec![0f32; (CELL_FRAMES + 1) * hkv]; layers];
+        let v = vec![vec![0f32; (CELL_FRAMES + 1) * hkv]; layers];
         assert!(
             body.runner.resident_cache_planes(&k, &v),
             "the body took the resident plane cache"
         );
         body
     };
-    let row = BODY_CAPACITY / 2;
+    let row = CELL_FRAMES / 2;
     let reads = graphs::plane_step_reads(layers);
     let body_ms = {
         let _switch = rlx_ir::env::RuntimeOverrides::install(support::FRAME_SWITCHES);
@@ -556,7 +553,7 @@ fn the_synthesis_loops_per_shape_rate_census_with_models() {
     // The step's own row, and the two outputs it reads — the hidden row and the
     // logits; the `2 · layers` cache rows stay device-side.
     println!(
-        "census body resident row={row} capacity={BODY_CAPACITY} layers={layers} hkv={hkv} \
+        "census body resident row={row} capacity={CELL_FRAMES} layers={layers} hkv={hkv} \
          hidden_out={} logits_out={}",
         reads[0], reads[1],
     );

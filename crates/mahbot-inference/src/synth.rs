@@ -8,18 +8,19 @@
 //! The graphs whose shapes do not depend on the request are built and compiled
 //! once ([`Synthesis::new`] — the speaker encoder and the code predictor's whole
 //! sixteen-level frame as one graph). The prompt and body graphs are built on a
-//! length they have not seen and kept while that length repeats. The sound half's
-//! graphs belong to the call that builds them: built for a window length, given
-//! back once the windows of that length have run, so a call leaves no sound graph
-//! resident. [`Synthesis::synthesize`] is the reusable entry point the wake-word
-//! bench calls for every corpus clip. Output is mono f32 PCM at [`SAMPLE_RATE`]
-//! (24 kHz, the sound half's own rate), `frames · 1920` samples for the frames the
-//! talker produced.
+//! length they have not seen and kept while a request lands within a bucket of that
+//! length. The sound half's graphs belong to the call that builds them: built for a
+//! window length, given back once the windows of that length have run, so a call
+//! leaves no sound graph resident. [`Synthesis::synthesize`] is the reusable entry
+//! point the wake-word bench calls for every corpus clip. Output is mono f32 PCM at
+//! [`SAMPLE_RATE`] (24 kHz, the sound half's own rate), `frames · 1920` samples for the
+//! frames the talker produced — as many as the text takes to say, since the render runs
+//! to end-of-speech rather than to a frame budget.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 
 use crate::graphs::{Compiled, DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, windows};
 use crate::loader::{Config, Head, Pair};
@@ -30,11 +31,29 @@ use crate::{graphs, host, report};
 /// Waveform rate the sound half produces.
 pub const SAMPLE_RATE: u32 = 24_000;
 
-/// The talker's text capacity: longer requests are truncated.
-pub const MAX_TEXT_TOKENS: usize = 300;
-
-/// The generation cap: 330 codec rows, about 26.4 s at 24 kHz.
-pub const MAX_CODEC_ROWS: usize = 330;
+/// The longest block a runaway render may repeat, in level-0 codes. A block of at
+/// most sixteen codes — 1.28 s of audio — said over and over for [`REPEAT_SPAN`] is
+/// the talker stuck on one phrase rather than carrying a text forward. Nothing here
+/// stops a render for being long: the guard is the talker's own stuckness, never the
+/// text's length. A trip ends the call with an error, so a corpus build stops rather
+/// than caching a clip the render never finished.
+const REPEAT_BLOCK: usize = 16;
+/// The frames a loop is seen in, whatever its period. Two and a half seconds of one
+/// block over and over is longer than any pause, sustained note or single word a
+/// legitimate render holds — and a render stuck on one code reaches it in the same
+/// two and a half seconds as one stuck on a phrase.
+const REPEAT_SPAN: usize = 32;
+/// The frames a render may run for each row of text before the call stops it as a
+/// runaway: ten times the three frames per token every text measured here takes, so a
+/// text said far slower than any of them still finishes. This is what a loop wider than
+/// [`REPEAT_BLOCK`] — the one [`self_repeating`] cannot see — runs into: minutes, with an
+/// error naming the render, rather than the talker's whole context and a killed process.
+/// Ten times a text's rows fits inside the talker's context up to about a thousand rows;
+/// past that the context is the bound, and a render that fills it is refused the same way.
+const BACKSTOP_PER_ROW: usize = 32;
+/// The floor under that backstop: forty seconds of audio, more than a text of a few
+/// words has ever taken, so the ratio never binds a short request.
+const BACKSTOP_MIN_FRAMES: usize = 512;
 
 /// The talker's own special ids and the codec control block. The body's
 /// `token_embd` table is `[projected text 151936; codec 3072]`, so a codec id is
@@ -44,6 +63,10 @@ pub const TTS_EOS_ID: usize = 151_673;
 pub const TTS_PAD_ID: usize = 151_671;
 pub const TTS_BOS_ID: usize = 151_672;
 pub const TTS_ROLE_IDS: [usize; 3] = [151_644, 77_091, 198];
+/// The rows the talker's prompt takes, whatever the text: the role header, the five
+/// codec rows and the row the first text token rides. The text's other rows follow one
+/// per frame, which is what a text's length is bounded by.
+const TTS_PROMPT_ROWS: usize = TTS_ROLE_IDS.len() + 6;
 pub const TTS_CODEC_PAD: usize = 2_148;
 pub const TTS_CODEC_BOS: usize = 2_149;
 pub const TTS_CODEC_EOS: usize = 2_150;
@@ -69,6 +92,34 @@ pub(crate) fn apply_repetition(logits: &mut [f32], seen: &[usize], penalty: f32)
             *v = if *v > 0.0 { *v / penalty } else { *v * penalty };
         }
     }
+}
+
+/// The block a render has got stuck on: `Some(period)` when its last [`REPEAT_SPAN`]
+/// level-0 codes are one block of at most [`REPEAT_BLOCK`] codes said over and over.
+/// A phrase said once is not a loop; the same stretch of audio again and again is the
+/// talker filling the render instead of finishing the text.
+fn self_repeating(level0: &[usize]) -> Option<usize> {
+    if level0.len() < REPEAT_SPAN {
+        return None;
+    }
+    let tail = &level0[level0.len() - REPEAT_SPAN..];
+    (1..=REPEAT_BLOCK).find(|&period| (period..REPEAT_SPAN).all(|i| tail[i] == tail[i - period]))
+}
+
+/// The frames a render of `rows` text rows may run: [`BACKSTOP_PER_ROW`] for each, at
+/// least [`BACKSTOP_MIN_FRAMES`], and never more than the `limit` the context leaves — a
+/// text long enough for ten times its rows to exceed that limit is bounded by the context.
+fn frame_bound(rows: usize, limit: usize) -> usize {
+    (rows * BACKSTOP_PER_ROW)
+        .max(BACKSTOP_MIN_FRAMES)
+        .min(limit)
+}
+
+/// Whether a text of `rows` rows can be spoken inside a `context`-row talker at all: the
+/// prompt and the text's own rows must come to less than the context, because the frame
+/// that answers end-of-speech reads one row more.
+fn fits_context(rows: usize, context: usize) -> bool {
+    TTS_PROMPT_ROWS + rows < context
 }
 
 /// The talker's prompt for one request: role header → codec control prefix → first text
@@ -153,6 +204,12 @@ pub(crate) fn talker_prompt(
     }
     trailing.push(row(TTS_EOS_ID)?);
     let rows = prompt.len();
+    if rows != TTS_PROMPT_ROWS {
+        bail!(
+            "the talker's prompt came to {rows} rows where its shape is {TTS_PROMPT_ROWS}: this \
+             pair cannot render text"
+        );
+    }
     let mut x = Vec::with_capacity(rows * d);
     for r in &prompt {
         x.extend_from_slice(r);
@@ -205,6 +262,33 @@ pub(crate) fn stitch_window(
     }
 }
 
+/// A render the engine refused: it did not speak the text it was asked for, for one of
+/// the reasons [`Synthesis::synthesize`] names — the text has no tokens, it cannot fit the
+/// talker's context, the render filled that context, the talker answered end-of-speech
+/// before the text was read, it started repeating itself, or it ran to the runaway
+/// backstop.
+///
+/// The type is the classification: a caller that may reject one candidate reads it, and
+/// every other failure out of the same call — a device error, a missing tensor row, a
+/// feed the talker refused — ends the run as the fault it is.
+#[derive(Debug)]
+pub struct Unspoken(String);
+
+impl Unspoken {
+    /// The refusal as an error carrying its reason.
+    fn raised(reason: String) -> anyhow::Error {
+        anyhow::Error::new(Self(reason))
+    }
+}
+
+impl std::fmt::Display for Unspoken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unspoken {}
+
 /// One compiled synthesis pipeline for one talker pair and one reference voice.
 pub struct Synthesis {
     pair: Arc<Pair>,
@@ -224,29 +308,43 @@ pub struct Synthesis {
     /// frame is one run and one fence, its dispatches submitted in encode chunks;
     /// [`Synthesis::generate`] rewrites the draw seeds and runs it.
     frame: Compiled,
-    /// The prompt and body graphs are shape-only, and a TTS request that repeats
-    /// a prompt length reuses them instead of paying the compile again — the
-    /// bench's corpus cycles phrases across seeds, and a served voice answers
-    /// requests of similar length. One entry each.
+    /// The prompt and body graphs are shape-only, and a TTS request whose length lands
+    /// within a bucket of the last one reuses them instead of paying the compile again —
+    /// the bench's corpus cycles phrases across seeds, and a served voice answers
+    /// requests of similar length. One entry each; a body grown by a much longer text
+    /// is given back rather than run a short render over its masked rows
+    /// ([`Synthesis::take_body`]), and one grown past that window stays cached until a
+    /// later call drops it — a long render's planes live until the next request, not
+    /// forever.
     prefill: Option<(usize, Compiled)>,
     body: Option<(usize, Compiled)>,
+    /// The rows the talker's context holds: the one bound a render cannot outrun. For a
+    /// text short enough that [`BACKSTOP_PER_ROW`] frames per row fits inside it,
+    /// [`frame_bound`]'s backstop stops a runaway far sooner; past that the context is
+    /// the bound, and reaching it is refused the same way.
+    context: usize,
     /// What the last [`Synthesis::synthesize`] paid to build: the prompt and body
-    /// graphs when the request's lengths are new, and the sound half's graphs, which
-    /// every call builds for the window lengths it runs. Counted as the call goes,
-    /// with the front's pair added once its window loop ends, so a failed call reports
-    /// the builds it finished — the front's only if that loop did.
+    /// graphs when the request's lengths are new, the body graph's growth when a text
+    /// outlasts its cache, and the sound half's graphs, which every call builds for
+    /// the window lengths it runs. Counted as the call goes, with the front's pair
+    /// added once its window loop ends, so a failed call reports the builds it
+    /// finished — the front's only if that loop did.
     build_ms: f64,
 }
 
 impl Synthesis {
     /// Compile the code predictor's whole sixteen-level frame as one graph, and
     /// the speaker encoder, and embed the reference voice once. The prompt and
-    /// body graphs are built on first use and reused while the shape repeats
-    /// (`Synthesis::prefill`, `Synthesis::body`); the sound half's graphs are built
-    /// and given back inside the call that runs them.
+    /// body graphs are built on first use and reused while a request's length stays
+    /// within a bucket of the one they were built for (`Synthesis::prefill`,
+    /// `Synthesis::body`); the sound half's graphs are built and given back inside the
+    /// call that runs them.
     pub fn new(pair: Arc<Pair>, voice_wav: &Path) -> Result<Self> {
         let tokenizer = Tokenizer::from_model(&pair.body)?;
         let cfg = pair.body.config().clone();
+        // A render's length is the text's, bounded by the talker's context: a file that
+        // states none cannot say how long a render may run.
+        let context = pair.body.context_length()?;
         let body_vocab = match cfg.head {
             Head::Separate { vocab, .. } | Head::Tied { vocab, .. } => vocab,
         };
@@ -304,35 +402,66 @@ impl Synthesis {
             frame,
             prefill: None,
             body: None,
+            context,
             build_ms: 0.0,
         })
     }
 
     /// Synthesize `text` with the given sampling seed. Returns mono 24 kHz PCM
-    /// of `frames · graphs::samples_per_frame()` samples.
+    /// of `frames · graphs::samples_per_frame()` samples — as long as the text is.
+    ///
+    /// The whole text is spoken: the call returns the audio of the render that
+    /// reached end-of-speech, and an error naming what stopped it when one did not. Six
+    /// outcomes are refusals, and they are [`Unspoken`] so a caller can tell them from a
+    /// fault: the text has no tokens to speak, or is longer than the talker's context
+    /// can hold; the render filled that context without answering end-of-speech; the
+    /// talker answered end-of-speech before the last row of the text was read; it
+    /// started repeating itself; or the render ran past the frames its text could
+    /// plausibly need. A shorter audio is never returned as though it were the text.
     pub fn synthesize(&mut self, text: &str, seed: u64) -> Result<Vec<f32>> {
         self.build_ms = 0.0;
-        let mut text_ids = self.tokenizer.encode(text);
-        text_ids.truncate(MAX_TEXT_TOKENS);
+        let text_ids = self.tokenizer.encode(text);
         if text_ids.is_empty() {
-            return Err(anyhow!("the tokenizer gave no text tokens for `{text}`"));
+            return Err(Unspoken::raised(format!(
+                "the tokenizer gave no text tokens for `{text}`"
+            )));
         }
         let frames = self.generate(&text_ids, seed)?;
         self.render_sound(&frames)
     }
 
     /// Milliseconds the last call spent compiling and uploading graphs: the prompt
-    /// and body graphs on a length it had not built, and the sound half's graphs,
-    /// which every call builds.
+    /// and body graphs on a length it had not built, the body graph's growth when a
+    /// text outlasts its cache, and the sound half's graphs, which every call builds.
     #[must_use]
     pub fn build_ms(&self) -> f64 {
         self.build_ms
     }
 
     /// The talker's prompt, then one body step and a fifteen-level predictor
-    /// walk per frame. Returns each frame's codes, level 0 first.
+    /// walk per frame, until the talker answers end-of-speech. Returns each
+    /// frame's codes, level 0 first.
+    ///
+    /// The length is the text's, not a budget: the loop's bounds are the frames the text
+    /// could plausibly need ([`frame_bound`]) and, past that, the talker's context — and
+    /// the repetition guard, the backstop and a context that fills all leave through an
+    /// error rather than a shorter answer.
     fn generate(&mut self, text_ids: &[usize], seed: u64) -> Result<Vec<Vec<usize>>> {
         let d = self.cfg.d;
+        // The talker reads the text one row per frame, so a text that leaves no room for
+        // its own rows and the frame that answers end-of-speech cannot be spoken at all —
+        // refused before the prompt's rows are read out of the file or this request's
+        // graphs exist.
+        if !fits_context(text_ids.len(), self.context) {
+            return Err(Unspoken::raised(format!(
+                "the text is {} tokens and the talker's {}-row context leaves {} rows beside \
+                 the prompt, one of them for the frame that answers end-of-speech: this text \
+                 cannot be spoken whole",
+                text_ids.len(),
+                self.context,
+                self.context.saturating_sub(TTS_PROMPT_ROWS)
+            )));
+        }
         let prompt = talker_prompt(&self.pair.body, d, &self.speaker_embed, text_ids)?;
         let TalkerPrompt {
             x: prompt_x,
@@ -379,21 +508,20 @@ impl Synthesis {
             .ok_or_else(|| anyhow!("the talker prefill returned {} logits", p[3].len()))?
             .to_vec();
 
-        // The talker on the part's fixed-capacity plane cache: one row per layer
+        // The talker on a plane cache sized to this render: one row per layer
         // per frame, the prompt rows copied into each layer's own
-        // `[capacity + 1, hkv]` cache before the first step.
-        let capacity = prompt_rows + MAX_CODEC_ROWS;
-        if self.body.as_ref().is_none_or(|(rows, _)| *rows != capacity) {
-            self.body = None;
-            let t = Stopwatch::start();
-            let compiled = Compiled::new(
-                device,
-                graphs::body_capacity_chain_planes(self.pair.body.clone(), capacity)?,
-            )?;
-            self.build_ms += t.ms();
-            self.body = Some((capacity, compiled));
-        }
-        let body = &mut self.body.as_mut().expect("talker graph").1;
+        // `[capacity + 1, hkv]` cache before the first step. The capacity starts
+        // one bucket above the prompt and grows as the render fills it — a
+        // capacity fixed at the longest text a caller might ask for would make
+        // every step's attention read thousands of masked rows and park their
+        // planes for the whole render.
+        //
+        // A call starts one bucket above its own prompt and reuses the cached graph
+        // when that start lands within a bucket of the last one's capacity: a short or
+        // typical text pays its compile once. A text that grew the cache past that
+        // window compiles its own graph and gives it back, so a long render never
+        // leaves the short one running over masked rows.
+        let (mut capacity, mut body) = self.take_body(prompt_rows + graphs::CACHE_BUCKET)?;
         let layers = self.cfg.layers;
         let kv_span = layers * prompt_rows * self.hkv;
         let k_rows = p
@@ -412,6 +540,11 @@ impl Synthesis {
         if !body.runner.resident_cache_planes(&k_cache, &v_cache) {
             return Err(anyhow!("the talker refused the resident K/V cache"));
         }
+        // The device holds the cache from here, and the rows this render writes go
+        // straight to it through the row feed: the host's planes are the prompt's seed
+        // only, and keeping them would park that copy for the whole loop.
+        drop(k_cache);
+        drop(v_cache);
 
         // The code predictor: **one** graph for the whole sixteen-level frame —
         // the head-less body at level 0, every projecting level with its own
@@ -432,15 +565,33 @@ impl Synthesis {
         );
         draw_index += 1;
         let mut hidden = hidden;
-        let mut all_codes: Vec<Vec<usize>> = Vec::with_capacity(MAX_CODEC_ROWS);
+        let mut all_codes: Vec<Vec<usize>> = Vec::new();
         let mut written = prompt_rows;
-        for f in 0..MAX_CODEC_ROWS {
+        // The rows the talker's context holds, and the far tighter bound a runaway runs
+        // into: a render may say its text slowly, but not ten times over.
+        let limit = self.context.saturating_sub(prompt_rows);
+        let bound = frame_bound(trailing.len(), limit);
+        // The period of the block a runaway render got stuck on, if it did.
+        let mut looped: Option<usize> = None;
+        for f in 0..bound {
             // The reference stops on codec EOS at level 0, but never before two
             // frames; EOS itself is neither penalised nor fed to the sound half.
             if f >= 2 && code0 == TTS_CODEC_EOS {
                 break;
             }
             code_seen.push(code0);
+            if let Some(period) = self_repeating(&code_seen) {
+                looped = Some(period);
+                break;
+            }
+            if written == capacity {
+                let (cap, grown) = self.grow_body(capacity, body)?;
+                body = grown;
+                capacity = cap;
+                // The mask keeps its key order: history first, then the spare row the
+                // step's own row is appended to, now at `cap`.
+                mask = graphs::resident_mask(written, cap);
+            }
             let mut frame_codes = vec![code0];
             let code0_embed = self
                 .pair
@@ -502,7 +653,7 @@ impl Synthesis {
                     *o += *v;
                 }
             }
-            if f + 1 < MAX_CODEC_ROWS {
+            if f + 1 < bound {
                 let mut x = trailing.get(f).cloned().unwrap_or_else(|| pad.clone());
                 for (v, s) in x.iter_mut().zip(&sum) {
                     *v += *s;
@@ -549,7 +700,96 @@ impl Synthesis {
             }
             all_codes.push(frame_codes);
         }
+        // The graph goes back to the cache before the loop's verdict is acted on, so
+        // a render that stopped short costs the next call no compile. It keeps the
+        // capacity the render ended with: a text that grew it past the window the next
+        // call reads is dropped then, not now, because the next call may well be another
+        // long one.
+        let frames = all_codes.len();
+        self.body = Some((capacity, body));
+        if let Some(period) = looped {
+            return Err(Unspoken::raised(format!(
+                "the talker is repeating itself — its last {REPEAT_SPAN} level-0 codes are one \
+                 {period}-code block over and over — after {frames} frames: the text was not \
+                 spoken whole"
+            )));
+        }
+        if frames == bound {
+            if bound < limit {
+                return Err(Unspoken::raised(format!(
+                    "the render ran to {frames} frames — its whole backstop of {BACKSTOP_PER_ROW} \
+                     frames for each of the {} rows the text takes, floored at \
+                     {BACKSTOP_MIN_FRAMES} — without answering end-of-speech, so it is treated \
+                     as a runaway: the text was not spoken whole",
+                    trailing.len()
+                )));
+            }
+            return Err(Unspoken::raised(format!(
+                "the talker filled the {limit} rows its context leaves behind the prompt without \
+                 answering end-of-speech: the text was not spoken whole"
+            )));
+        }
+        // The talker reads one text row per frame, in order, so a render that ends with
+        // rows still unread answered end-of-speech without ever being given the rest of
+        // the text. The count includes the EOS marker, so a render that came within one
+        // row of the text is refused rather than passed — never seen at the three frames
+        // per row these renders take.
+        if frames < trailing.len() {
+            return Err(Unspoken::raised(format!(
+                "the talker answered end-of-speech after {frames} of the {} rows the text takes: \
+                 the text was not spoken whole",
+                trailing.len()
+            )));
+        }
         Ok(all_codes)
+    }
+
+    /// The talker graph this call runs on: the cached one when its capacity is within a
+    /// bucket of what this call asks for, and a fresh compile at `start` otherwise. That
+    /// window is what a short or typical text lands in, so it reuses the graph; one grown
+    /// by a much longer text is given back, because every step of a short render at that
+    /// capacity reads rows the render has not written — a quarter more per frame than a
+    /// graph of its own size. The cache is emptied either way: the graph belongs to the
+    /// call until it hands it back, so a grown one never sits beside the graph it replaces.
+    fn take_body(&mut self, start: usize) -> Result<(usize, Compiled)> {
+        if let Some((capacity, graph)) = self.body.take() {
+            if capacity >= start && capacity <= start + graphs::CACHE_BUCKET {
+                return Ok((capacity, graph));
+            }
+            drop(graph);
+        }
+        Ok((start, self.compile_body(start)?))
+    }
+
+    /// A talker graph at `capacity` rows, its compile counted into [`Synthesis::build_ms`].
+    fn compile_body(&mut self, capacity: usize) -> Result<Compiled> {
+        let t = Stopwatch::start();
+        let compiled = Compiled::new(
+            rlx_runtime::Device::Gpu,
+            graphs::body_capacity_chain_planes(self.pair.body.clone(), capacity)?,
+        )?;
+        self.build_ms += t.ms();
+        Ok(compiled)
+    }
+
+    /// [`Synthesis::take_body`]'s graph grown by one [`graphs::CACHE_BUCKET`]: the
+    /// rows the render has written move from the graph's own planes into a fresh pair
+    /// of `capacity + CACHE_BUCKET` and the rest stays zero, so the rows the render
+    /// reads are the same rows. The graph is consumed and dropped before the
+    /// replacement is compiled; the two would otherwise park their planes at once.
+    fn grow_body(&mut self, capacity: usize, graph: Compiled) -> Result<(usize, Compiled)> {
+        // Every row of the old cache is live: growth happens at the one point the
+        // render has written all of them.
+        let grown = capacity + graphs::CACHE_BUCKET;
+        let (k, v) = graphs::lift_planes(&graph, self.cfg.layers, self.hkv, capacity, grown)?;
+        drop(graph);
+        let mut compiled = self.compile_body(grown)?;
+        if !compiled.runner.resident_cache_planes(&k, &v) {
+            return Err(anyhow!(
+                "the talker refused the resident K/V cache at capacity {grown}"
+            ));
+        }
+        Ok((grown, compiled))
     }
 
     /// The sound half: codes → codebook → wave transformer → DAC, windowed to
@@ -746,5 +986,89 @@ impl Synthesis {
             ));
         }
         Ok(wave)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runaway guard's own boundaries: a render shorter than the span is never a
+    /// loop, a full span that is not one block repeated is not a loop either, and a
+    /// block repeated over the whole span is — at every period the guard looks for.
+    #[test]
+    fn a_phrase_said_once_is_not_a_loop() {
+        // Shorter than the span, however often the phrase is said.
+        let phrase: Vec<usize> = (0..7).collect();
+        assert_eq!(self_repeating(&[&phrase[..], &phrase[..]].concat()), None);
+        // A full span of distinct codes.
+        let distinct: Vec<usize> = (0..REPEAT_SPAN).collect();
+        assert_eq!(self_repeating(&distinct), None);
+        // A full span that is periodic but for one code.
+        let mut nearly: Vec<usize> = (0..REPEAT_SPAN).map(|i| 100 + i % 3).collect();
+        nearly[REPEAT_SPAN - 1] += 1;
+        assert_eq!(self_repeating(&nearly), None);
+        // A full span whose period is one the guard does not look for.
+        let wide: Vec<usize> = (0..REPEAT_SPAN)
+            .map(|i| 100 + i % (REPEAT_BLOCK + 1))
+            .collect();
+        assert_eq!(self_repeating(&wide), None);
+    }
+
+    #[test]
+    fn a_block_said_over_and_over_is_a_loop() {
+        for period in 1..=REPEAT_BLOCK {
+            let block: Vec<usize> = (0..period).map(|i| 100 + i).collect();
+            let over: Vec<usize> = (0..REPEAT_SPAN).map(|i| block[i % period]).collect();
+            assert_eq!(
+                self_repeating(&over),
+                Some(period),
+                "a {period}-code block over the whole span is the guard's own case"
+            );
+        }
+        // The span, not the repetition count, is the threshold: one frame short of it
+        // is not a loop, however many times the block has said itself.
+        assert_eq!(self_repeating(&[7; REPEAT_SPAN - 1]), None);
+    }
+
+    /// The refusal marker is the classification, and it does not over-reach: a refusal is
+    /// found through the context a caller adds around it, and a fault out of the same call
+    /// is not.
+    #[test]
+    fn a_refusal_is_told_from_a_fault_through_its_context() {
+        let refusal = Unspoken::raised("the text was not spoken whole".into())
+            .context("synthesis failed for `hello`");
+        assert!(refusal.downcast_ref::<Unspoken>().is_some());
+        let fault =
+            anyhow!("the talker returned no hidden row").context("synthesis failed for `hello`");
+        assert!(fault.downcast_ref::<Unspoken>().is_none());
+    }
+
+    /// The runaway backstop's own boundaries: a short text is bounded by the floor, a
+    /// longer one by the per-row ratio, and neither by more than the context leaves.
+    #[test]
+    fn the_backstop_leaves_a_text_ten_times_its_rows() {
+        assert_eq!(frame_bound(1, 32_000), BACKSTOP_MIN_FRAMES);
+        assert_eq!(frame_bound(100, 32_000), 100 * BACKSTOP_PER_ROW);
+        assert_eq!(frame_bound(100, 1_000), 1_000);
+    }
+
+    /// A text is admitted only when the context leaves room for its own rows and the frame
+    /// that answers end-of-speech: the last row the talker can read is the EOS row, and the
+    /// frame after it is where the render ends.
+    #[test]
+    fn a_text_needs_its_rows_and_one_to_answer_end_of_speech() {
+        let room = TTS_PROMPT_ROWS + 10;
+        assert!(fits_context(9, room));
+        assert!(!fits_context(10, room));
+    }
+
+    /// What precedes the loop is not part of it: a render carrying a sentence
+    /// forward and then sticking on one is caught by the tail it ends on.
+    #[test]
+    fn the_guard_reads_the_tail_only() {
+        let mut codes: Vec<usize> = (0..40).map(|i| i * 3 + 1).collect();
+        codes.extend([7; REPEAT_SPAN]);
+        assert_eq!(self_repeating(&codes), Some(1));
     }
 }

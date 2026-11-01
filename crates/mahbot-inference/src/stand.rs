@@ -60,12 +60,14 @@ const RECOGNITION_RECORDING: &str = "speech/librivox/speech-librivox-0027.wav";
 const SHORT_SAMPLES: usize = 10 * 16_000;
 const TYPICAL_SAMPLES: usize = 30 * 16_000;
 
-/// The two synthesis requests: a greeting and a sentence about a sentence.
-const SHORT_TEXT: &str = "Hello, how are you today?";
+/// The two synthesis requests: a greeting and a sentence about a sentence. The
+/// greeting is the short request a read-back harness reads too, so it is named once.
+pub const SHORT_TEXT: &str = "Hello, how are you today?";
 const TYPICAL_TEXT: &str = "The weather this morning is quiet and cool, so I will walk down to \
      the harbour and watch the boats come in before the shops open.";
-/// The draw seed both requests are synthesised from.
-const SYNTH_SEED: u64 = 1;
+/// The draw seed both requests are synthesised from; the read-back harness reads the
+/// short request with it, so it is named here too.
+pub const SYNTH_SEED: u64 = 1;
 
 /// The speech window in the recorded voice: the file is silent up to ~1.16 s, so
 /// the ear starts where there is speech. The reference window is a later segment

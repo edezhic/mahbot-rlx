@@ -2,10 +2,10 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The tokenizer's metadata gate, on a synthetic file of a surviving
-//! architecture: a rule set this crate does not implement, a name or an id of the
-//! wrong type, and the GPT-2 bodies that state no BOS are each pinned here, with
-//! no model file and no device.
+//! The loader's and the tokenizer's metadata gates, on a synthetic file of a surviving
+//! architecture: a rule set this crate does not implement, a name, an id or a context
+//! length of the wrong type, and the GPT-2 bodies that state no BOS are each pinned
+//! here, with no model file and no device.
 
 use std::io::Cursor;
 
@@ -65,21 +65,24 @@ fn synthetic(overrides: &[(&str, MetaValue)]) -> GgufWriter {
     w
 }
 
-/// The tokenizer a synthetic file opens, or the reason it was refused.
-fn tokenizer(w: &GgufWriter) -> Result<Tokenizer, String> {
+/// The model a synthetic file opens, or the reason it was refused.
+fn model(w: &GgufWriter) -> Result<Model, String> {
     let path = std::env::temp_dir().join(format!(
-        "mahbot-tokenizer-{}-{:p}.gguf",
+        "mahbot-synthetic-{}-{:p}.gguf",
         std::process::id(),
         w as *const _
     ));
     let mut buf = Cursor::new(Vec::new());
     w.write(&mut buf).expect("the synthetic file writes");
     std::fs::write(&path, buf.into_inner()).expect("the synthetic file lands");
-    let out = Model::open(&path)
-        .and_then(|model| Tokenizer::from_model(&model))
-        .map_err(|e| format!("{e:#}"));
+    let out = Model::open(&path).map_err(|e| format!("{e:#}"));
     let _ = std::fs::remove_file(&path);
     out
+}
+
+/// The tokenizer a synthetic file opens, or the reason it was refused.
+fn tokenizer(w: &GgufWriter) -> Result<Tokenizer, String> {
+    model(w).and_then(|m| Tokenizer::from_model(&m).map_err(|e| format!("{e:#}")))
 }
 
 /// The synthetic file itself loads: without this the refusals below could be
@@ -99,6 +102,44 @@ fn a_tokenizer_special_that_is_not_an_id_is_refused() {
     .err()
     .expect("a float is not an id");
     assert!(err.contains("not an unsigned integer"), "{err}");
+}
+
+/// A context length is read only where it is asked for, and only as a row count: a
+/// body that states none still loads (the listening path never reads it), a stated one
+/// reads, and a mistyped one is refused by name rather than read as absent.
+#[test]
+fn a_context_length_is_read_only_where_it_is_asked_for() {
+    let absent = model(&synthetic(&[])).expect("a body stating no context length loads");
+    let err = format!(
+        "{:#}",
+        absent
+            .context_length()
+            .expect_err("a file stating none has none to read")
+    );
+    assert!(err.contains("`qwen3tts.context_length`"), "{err}");
+
+    let stated = model(&synthetic(&[(
+        "qwen3tts.context_length",
+        MetaValue::U32(4096),
+    )]))
+    .expect("the synthetic file opens");
+    assert_eq!(stated.context_length().expect("the stated rows"), 4096);
+
+    let mistyped = model(&synthetic(&[(
+        "qwen3tts.context_length",
+        MetaValue::F32(1.0),
+    )]))
+    .expect("a mistyped key does not stop the file loading");
+    let err = format!(
+        "{:#}",
+        mistyped
+            .context_length()
+            .expect_err("a float is not a row count")
+    );
+    assert!(
+        err.contains("`qwen3tts.context_length`") && err.contains("not a u32"),
+        "{err}"
+    );
 }
 
 /// A rule set named with the wrong value type is refused the same way a missing

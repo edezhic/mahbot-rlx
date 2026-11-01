@@ -138,9 +138,10 @@ fn the_predictor_frame_its_chain_and_the_stacks_ratio() {
     };
 
     // The shipped walk's waveform, through the library path the bench's corpus
-    // synthesis uses. The pin is a **witness**: a moved digest is recorded with the
-    // run that moved it, never rolled back to (`reference.rs` carries the rule and
-    // the transcript, the finiteness and the PCM range are the hard gates).
+    // synthesis uses. Nothing here pins the waveform: a render is as long as its text,
+    // and what it says is judged by the words the recogniser hears from it
+    // (`reference.rs` carries that rule, and the finiteness and the PCM range are the
+    // hard gates). The sample count is the reading this prints.
     let mut synthesis =
         Synthesis::new(pair.clone(), &voice).expect("compile the synthesis pipeline");
     let t = Tick::now();
@@ -148,13 +149,9 @@ fn the_predictor_frame_its_chain_and_the_stacks_ratio() {
         .synthesize(support::TTS_TEXT, SEED)
         .expect("the shipped walk's sound half");
     let synth_ms = Tick::now().elapsed_ns(t) as f64 / 1e6;
-    let digest = mahbot_inference::report::digest(&wave);
-    let pinned = mahbot_inference::reference::SPEAK_WAVE_DIGEST;
     println!(
-        "draft wave digest={digest:016x} samples={} pinned={pinned:016x} equal={} \
-         voice_pinned={} synth_ms={synth_ms:.1}",
+        "draft wave samples={} voice_pinned={} synth_ms={synth_ms:.1}",
         wave.len(),
-        digest == pinned,
         mahbot_inference::reference::voice_is_pinned(),
     );
     drop(synthesis);

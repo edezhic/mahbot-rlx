@@ -23,21 +23,19 @@ use std::sync::Arc;
 
 use mahbot_inference::ced::{CED_MODEL, Tagger};
 use mahbot_inference::loader::{self, Pair, Role};
-use mahbot_inference::synth::Synthesis;
+use mahbot_inference::synth::{SAMPLE_RATE, Synthesis};
 use mahbot_inference::transcribe::{self, Transcriber};
 use mahbot_inference::{host, listen, music, reference, report, tokenizer::Tokenizer, vad};
 
 mod support;
 
-/// The pinned synthesis input: the long text and the seed the waveform pin was
-/// taken with.
+/// The seed the round trip renders `support::TTS_TEXT` with.
 const SYNTH_SEED: u64 = 12_345;
 
-/// The resident-set bound these checks open the product under: the default the
-/// stand and the corpus run use, read through the guard's one parser.
-fn ceiling_mib() -> u64 {
-    mahbot_inference::guard::max_rss_mib().expect("the resident-set bound")
-}
+/// The render the round trip reads back: its first twelve seconds, which the
+/// one-shot recogniser carries as one prompt — the render itself is as long as the
+/// text, and `speak_readback` is where the rest of it is read.
+const ROUND_TRIP_SECONDS: usize = 12;
 
 /// One role's pair files through the model directory, or the reason this check
 /// cannot happen: a model that is absent is a skip; one that is present and does
@@ -115,7 +113,7 @@ fn instrumental_music_yields_no_transcribed_text() {
         return;
     };
     let mut transcriber =
-        Transcriber::open(pair, tagger, ceiling_mib()).expect("the transcriber opens");
+        Transcriber::open(pair, tagger, support::ceiling_mib()).expect("the transcriber opens");
     for (clip, path) in music::CLIPS.iter().zip(&paths) {
         if !clip.path.starts_with("instrumental/") {
             continue;
@@ -170,7 +168,7 @@ fn a_paste_onset_lands_within_one_detector_hop() {
         }
     };
     let mut transcriber =
-        Transcriber::open(pair, tagger, ceiling_mib()).expect("the transcriber opens");
+        Transcriber::open(pair, tagger, support::ceiling_mib()).expect("the transcriber opens");
 
     let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
     let edges: Vec<usize> = raw
@@ -310,21 +308,33 @@ fn the_pinned_clip_reads_as_its_witness() {
     );
 }
 
-/// **The synthesis round trip:** the rendered waveform, resampled 24 kHz → 16 kHz
-/// and read back through the recogniser on its raw samples, still says the pinned
-/// words. The main stand run neither performs this nor fails on it.
+/// **The synthesis round trip:** the rendered waveform's opening, resampled 24 kHz →
+/// 16 kHz and read back through the recogniser on its raw samples, says the words the
+/// render was asked to speak. The main stand run neither performs this nor fails on
+/// it.
+///
+/// The check reads the render's first [`ROUND_TRIP_SECONDS`] rather than all of it:
+/// the one-shot path carries the whole input as one prompt, a render is as long as
+/// its text, and what the recogniser makes of the rest of a long render is
+/// `speak_readback`'s reading — this check is the waveform still being speech.
+///
+/// It is the **raw** waveform's reading: the check does not apply the recognition
+/// side's one-shot conditioning, so a quiet render is heard as it is rather than at
+/// the gain the product path would lift it by (printed beside the peak). The same clip
+/// through the prepared path answers differently, so the two are not interchangeable
+/// and this reading belongs to the path the gate takes.
 #[test]
 #[ignore = "needs both model pairs and the reference voice; run by hand"]
 fn the_recogniser_hears_words_in_the_rendered_waveform() {
     let Some(voice) = voice() else {
         return;
     };
-    // The waveform's pin was taken with that voice: another one renders different
-    // words, which the pin cannot judge, so the check says why it did not run
-    // instead of failing on the substitution.
+    // The round trip was judged with that voice: another one renders different words,
+    // which the check cannot judge, so it says why it did not run instead of failing
+    // on the substitution.
     if !reference::voice_is_pinned() {
         println!(
-            "skip: {} does not name the voice the round-trip pin was taken with",
+            "skip: {} does not name the voice the round trip is judged with",
             loader::VOICE_WAV_ENV
         );
         return;
@@ -345,7 +355,17 @@ fn the_recogniser_hears_words_in_the_rendered_waveform() {
     // before the recogniser's are asked for.
     drop(engine);
     mahbot_inference::release_process_memory();
-    let audio = host::resample(&wave, 24_000, listen::SAMPLE_RATE);
+    let opening = &wave[..wave.len().min(SAMPLE_RATE as usize * ROUND_TRIP_SECONDS)];
+    let audio = host::resample(opening, SAMPLE_RATE, listen::SAMPLE_RATE);
+    // What the check reads: the render's length, the opening's own peak, and the gain
+    // the product path would condition that opening by — this check reads it raw.
+    println!(
+        "round trip: samples={} opening_samples={} opening_peak={} product_gain={:.2}",
+        wave.len(),
+        audio.len(),
+        report::sci(report::max_abs(&audio)),
+        host::speech_gain(&audio)
+    );
     let Some(asr) = pair(Role::Recognition) else {
         return;
     };
@@ -354,6 +374,9 @@ fn the_recogniser_hears_words_in_the_rendered_waveform() {
     let heard = listen::recognise(&asr, &tokenizer, audio)
         .unwrap_or_else(|error| panic!("the recogniser on the rendered waveform: {error:#}"))
         .text;
-    let holds = reference::check_speak_roundtrip(&heard);
-    assert!(holds, "the round trip is not the pinned transcript");
+    let holds = reference::check_speak_roundtrip(&heard, support::TTS_TEXT);
+    assert!(
+        holds,
+        "the recogniser does not hear the text the render was asked to speak: {heard:?}"
+    );
 }

@@ -228,8 +228,19 @@ pub const TARGET_BYTES: u64 = 96 * 1024 * 1024;
 // ── the recognition walk's own helpers ──────────────────────────────
 
 /// The synthesis text condition the measurement harnesses reproduce a served
-/// request with: long enough to fill the model's whole 300-token text capacity.
+/// request with: long enough that a render of it is a long render.
 pub const TTS_TEXT: &str = "Call me Ishmael. Some years ago, never mind how long precisely, having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world. It is a way I have of driving off the spleen and regulating the circulation. Whenever I find myself growing grim about the mouth; whenever it is a damp, drizzly November in my soul; whenever I find myself involuntarily pausing before coffin warehouses, and bringing up the rear of every funeral I meet; and especially whenever my hypos get such an upper hand of me, that it requires a strong moral principle to prevent me from deliberately stepping into the street, and methodically knocking people's hats off, then I account it high time to get to sea as soon as I can. This is my substitute for pistol and ball. With a philosophical flourish Cato throws himself upon his sword; I quietly take to the ship. There is nothing surprising in this. If they but knew it, almost all men in their degree, some time or other, cherish very nearly the same feelings towards the ocean with me.";
+
+/// The length every synthesis harness prices its cell at: 330 codec frames, 26.4 s of
+/// audio, the length the figures they are compared against were taken at. A render is
+/// as long as its text now, so the cell is a fixed reference, not a bound.
+pub const CELL_FRAMES: usize = 330;
+
+/// The resident-set bound a harness opens the product under: the default the stand and
+/// the corpus run use, read through the guard's one parser.
+pub fn ceiling_mib() -> u64 {
+    mahbot_inference::guard::max_rss_mib().expect("the resident-set bound")
+}
 
 /// What the single-shot recognition walk answered, for a harness that prices a
 /// decode change.

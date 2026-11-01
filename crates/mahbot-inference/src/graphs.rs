@@ -1297,6 +1297,15 @@ fn body_planes_graph(model: Arc<Model>, capacity: usize, rows: usize) -> Result<
     flow.build(&mut weights).map_err(Into::into)
 }
 
+/// The rows a resident K/V plane cache holds above what is live, and how many it
+/// grows by when the live rows reach it. A step's attention reads the whole
+/// `[capacity + 1]` plane, so a capacity fixed at the longest request a caller might
+/// make would read thousands of masked rows per step and park their planes for the
+/// whole run. One bucket holds a whole short request — the recognition walk's 65
+/// tokens, the talker's ten seconds of audio — so the common case pays one compile;
+/// the bucket exists to bound the operand, not to avoid a second graph.
+pub const CACHE_BUCKET: usize = 128;
+
 /// How many resident moves one plane-cache step collects: one K row and one V
 /// row per layer. `resident_cache_planes` registers exactly this many, and
 /// `run_resident_planes` folds all of them with one device-side copy — the
@@ -1373,12 +1382,47 @@ pub fn seed_plane_cache(
             v[l][dst..dst + hkv].copy_from_slice(&v_rows[src..src + hkv]);
         }
     }
-    let mut mask = vec![0f32; capacity + 1];
-    for r in 0..prompt_rows {
-        mask[r] = 1.0;
-    }
-    mask[capacity] = 1.0;
+    let mask = resident_mask(prompt_rows, capacity);
     PlaneCache { k, v, mask }
+}
+
+/// The attention mask of a `capacity`-row resident cache with `written` rows behind
+/// it: history first, then the spare row a one-row step appends its own row to, at
+/// `capacity`.
+pub fn resident_mask(written: usize, capacity: usize) -> Vec<f32> {
+    let mut mask = vec![0f32; capacity + 1];
+    mask[..written].fill(1.0);
+    mask[capacity] = 1.0;
+    mask
+}
+
+/// The rows a resident cache has written, lifted out of a compiled graph's own planes
+/// into fresh `grown`-row planes for the graph that replaces it: the first `written`
+/// rows of every layer's K and V plane move in a plain row copy and the rest stays
+/// zero, so the grown cache reads the rows the old one wrote. The caller compiles the
+/// replacement from these, registers them, and drops the host copy.
+pub fn lift_planes(
+    graph: &Compiled,
+    layers: usize,
+    hkv: usize,
+    written: usize,
+    grown: usize,
+) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let live = written * hkv;
+    let mut k: Vec<Vec<f32>> = (0..layers).map(|_| vec![0f32; (grown + 1) * hkv]).collect();
+    let mut v: Vec<Vec<f32>> = (0..layers).map(|_| vec![0f32; (grown + 1) * hkv]).collect();
+    for l in 0..layers {
+        for (name, planes) in [("k", &mut k), ("v", &mut v)] {
+            let plane = graph
+                .runner
+                .read_plane(&format!("{name}{l}"))
+                .ok_or_else(|| {
+                    anyhow!("the resident {name}{l} plane is not readable at row {written}")
+                })?;
+            planes[l][..live].copy_from_slice(&plane[..live]);
+        }
+    }
+    Ok((k, v))
 }
 
 // ── the TTS speaker encoder (ECAPA-TDNN, the `mmproj` voice half) ──
@@ -2349,7 +2393,7 @@ pub fn tts_code_predictor_frame(
 /// It publishes this window's `knew`/`vnew` (the caller keeps the last 71 rows)
 /// and the `left` context for the next window. Without that state the first
 /// window of a part is correct and every later one starts from zeros — exactly
-/// the 72-row/330-row split.
+/// the split between the 72-row window and the part it is one of.
 pub struct WaveTfmStage {
     pub model: Arc<Model>,
     /// Frames in the window (the reference's 72).
@@ -2957,10 +3001,10 @@ impl Runner {
     }
 
     /// The whole current contents of a resident plane input, read back from the
-    /// device. The decode's bucket rebuild is the one caller: the planes live on
-    /// the device between steps, so a larger capacity's planes are filled from
-    /// the smaller ones' live rows here, not from the host mirror the row feed
-    /// emptied.
+    /// device. The bucket rebuilds are the callers — the recognition decode's and
+    /// the talker's: the planes live on the device between steps, so a larger
+    /// capacity's planes are filled from the smaller ones' live rows here, not from
+    /// the host mirror the row feed emptied.
     pub fn read_plane(&self, name: &str) -> Option<Vec<f32>> {
         self.session.read_gpu_handle(name)
     }

@@ -20,9 +20,12 @@ use mahbot_inference::graphs::{
     DAC_MARGIN, DAC_UPSAMPLE, DAC_UPSAMPLE_STAGE, DAC_WINDOW, dac_stage_io, samples_per_frame,
     windows,
 };
-use mahbot_inference::synth::MAX_CODEC_ROWS;
 use rlx_ir::{DType, Graph, Op, Shape, Tick};
 use rlx_runtime::{Device, Session};
+
+mod support;
+
+use support::CELL_FRAMES;
 
 /// Rounds one arm is timed over; the least is the arm's own figure (the quietest
 /// sample of one call).
@@ -31,7 +34,7 @@ const ROUNDS: usize = 7;
 /// The cell's codec spans, from the window function the sound half itself uses —
 /// the three windows a group runs the pinned cell at.
 fn spans() -> Vec<usize> {
-    windows(MAX_CODEC_ROWS, DAC_WINDOW, DAC_MARGIN)
+    windows(CELL_FRAMES, DAC_WINDOW, DAC_MARGIN)
         .iter()
         .map(|&(p0, p1, _, _)| p1 - p0)
         .collect()

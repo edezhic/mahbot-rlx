@@ -607,6 +607,21 @@ impl Model {
         self.config.as_ref().expect("body file has a config")
     }
 
+    /// The rows the file's own context holds (`{arch}.context_length`) — the one bound a
+    /// render cannot outrun. Read here on demand, not at load: synthesis is its only
+    /// reader, so the listening path never depends on a value it does not use.
+    pub fn context_length(&self) -> Result<usize> {
+        let arch = meta_str(&self.file, "general.architecture").unwrap_or_default();
+        let key = format!("{arch}.context_length");
+        let value = self.file.metadata.get(&key).ok_or_else(|| {
+            anyhow!("metadata key `{key}` is missing, so a render has no bound to run to")
+        })?;
+        value
+            .as_u32()
+            .map(|v| v as usize)
+            .ok_or_else(|| anyhow!("metadata key `{key}` is {}, not a u32", meta_type(value)))
+    }
+
     pub fn clip(&self) -> &ClipConfig {
         self.clip.as_ref().expect("mmproj file has a clip config")
     }
