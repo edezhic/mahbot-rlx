@@ -3141,6 +3141,7 @@ static DEQUANT_GEMM_Q1_0: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q4K: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q6K: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q8_0: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMM_Q8_0_REASSEMBLY: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_BT: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN_TEE: OnceLock<Kernel> = OnceLock::new();
@@ -5679,15 +5680,36 @@ pub fn dequant_gemm_q6k_kernel(device: &wgpu::Device) -> &'static Kernel {
     })
 }
 /// Multi-row Q8_0 GEMM (`m > 1`): one thread per column covers 8 rows. Same
-/// binding set as the K-quant entries; its 34-byte blocks are read without the
-/// whole-word alignment they have, through the shader's reassembling reader.
+/// binding set as the K-quant entries; its 34-byte blocks are read as the nine
+/// whole words that cover one, whatever half of a word the stride puts them on.
+///
+/// `RLX_WGPU_Q8_0_BLOCK_WORDS=0` names the per-word reassembly this replaced: one
+/// body, two readers over a block's same bytes, the switch there to price them
+/// against each other in one build.
 pub fn dequant_gemm_q8_0_kernel(device: &wgpu::Device) -> &'static Kernel {
+    if !rlx_ir::env::flag_or("RLX_WGPU_Q8_0_BLOCK_WORDS", true) {
+        return dequant_gemm_q8_0_reassembly_kernel(device);
+    }
     DEQUANT_GEMM_Q8_0.get_or_init(|| {
         build_kernel_ro_u_ro_rw(
             device,
             "rlx-wgpu dequant_gemm_q8_0",
             DEQUANT_GEMM_GGUF_WGSL,
             "dequant_gemm_q8_0",
+            false,
+        )
+    })
+}
+/// The same entry point with the per-word reassembling reader it shipped with
+/// before the whole-word one: `RLX_WGPU_Q8_0_BLOCK_WORDS=0`'s arm (see the
+/// shader's `q8_0_gemm`).
+pub fn dequant_gemm_q8_0_reassembly_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DEQUANT_GEMM_Q8_0_REASSEMBLY.get_or_init(|| {
+        build_kernel_ro_u_ro_rw(
+            device,
+            "rlx-wgpu dequant_gemm_q8_0_reassembly",
+            DEQUANT_GEMM_GGUF_WGSL,
+            "dequant_gemm_q8_0_reassembly",
             false,
         )
     })

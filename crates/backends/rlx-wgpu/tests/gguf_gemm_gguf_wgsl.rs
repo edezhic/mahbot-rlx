@@ -33,19 +33,26 @@ fn wgsl_parses_validates_and_keeps_the_scheme_entry_points() {
     .expect("wgsl validate without any optional capability");
 
     // One entry point per scheme: routing Q4_K through the Q6_K entry (or a
-    // scheme with no entry at all) would decode garbage rather than fail.
+    // scheme with no entry at all) would decode garbage rather than fail. Q8_0's
+    // body carries a fourth, `dequant_gemm_q8_0_reassembly` — one body, two block
+    // readers, and only `RLX_WGPU_Q8_0_BLOCK_WORDS=0` reaches the second.
     let names: Vec<&str> = module
         .entry_points
         .iter()
         .map(|e| e.name.as_str())
         .collect();
-    for want in ["dequant_gemm_q4k", "dequant_gemm_q6k", "dequant_gemm_q8_0"] {
+    for want in [
+        "dequant_gemm_q4k",
+        "dequant_gemm_q6k",
+        "dequant_gemm_q8_0",
+        "dequant_gemm_q8_0_reassembly",
+    ] {
         assert!(
             names.contains(&want),
             "missing entry point {want}: {names:?}"
         );
     }
-    assert_eq!(names.len(), 3, "unexpected extra entry points: {names:?}");
+    assert_eq!(names.len(), 4, "unexpected extra entry points: {names:?}");
     // None may use a capability this backend avoids outright: no atomics of any
     // kind, no subgroup operations.
     for avoided in ["atomic", "subgroup"] {

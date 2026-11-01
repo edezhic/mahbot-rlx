@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 668  
+**Registered names:** 669  
 **Unregistered mentions (migration leftovers):** 102
 
 ## Groups
@@ -38,7 +38,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [rocm](#rocm) — 31
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
-- [wgpu](#wgpu) — 100
+- [wgpu](#wgpu) — 101
 - [xdna](#xdna) — 11
 
 ## compile
@@ -785,6 +785,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_ONE_OP_PER_PASS` | Internal | Bool | Backend(wgpu) | Submit one op per compute pass (isolates sync bugs) |
 | `RLX_WGPU_PRINT_LIMITS` | Bisect | U64 | Backend(wgpu) | Print the adapter's reported limits at startup |
 | `RLX_WGPU_Q1_0_GEMM_DISABLE` | Bisect | Bool | Backend(wgpu) | Disable the Q1_0 GEMM kernel on wgpu |
+| `RLX_WGPU_Q8_0_BLOCK_WORDS` | Bisect | Bool | Backend(wgpu) | Q8_0 row-grouped GEMM block read: nine whole words per 34-byte block (default), or the per-word reassembly it replaced at 0 |
 | `RLX_WGPU_Q8_0_GEMM_DISABLE` | Bisect | Bool | Backend(wgpu) | Disable the Q8_0 row-grouped GEMM on wgpu; its multi-row calls then use the dequant scratch slab |
 | `RLX_WGPU_QUIET_SHARD` | Internal | Bool | Backend(wgpu) | Suppress the buffer-sharding log |
 | `RLX_WGPU_ROW_TABS` | Internal | U64 | Backend(wgpu) | Per-row sum of |x| for one snapshot step |

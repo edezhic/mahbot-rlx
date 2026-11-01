@@ -112,7 +112,10 @@ kernels, pure Rust deps — no FFI, no submodules.
   stops at the row's last whole block, and stages no activation past the row's own
   end (`stage_x_bounded`, its fetch guarded by `p0 + c4 < k`). The scratch slab is
   left for the shapes the arm refuses — a `k` off the scheme's blocks, an X window
-  its `vec4` reads cannot address, the binding limit, the arm's bisect lever.
+  its `vec4` reads cannot address, the binding limit, the arm's bisect lever. Its
+  Q8_0 entry reads a 34-byte block as the nine whole words that span it, each
+  loaded once and joined from registers (`RLX_WGPU_Q8_0_BLOCK_WORDS=0` is the
+  per-word reassembly it replaced, kept to price the two readers in one build).
   Other schemes dequant into scratch then `matmul_bt` when the arena is a single
   buffer; sharded / split-weight arenas fall back to `gguf_host`. Grouped
   MoE GGUF uses the GPU path when scratch fits and the arena is unsharded. Scheme

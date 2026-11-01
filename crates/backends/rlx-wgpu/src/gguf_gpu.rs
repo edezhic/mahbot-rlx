@@ -2251,12 +2251,23 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
             let n_chunk = (n - n0).min(n_chunk_max).max(1);
 
             // Q4_K reads the weight as whole words (`read_u32`), so this window's
-            // offset has to be a multiple of 4; Q6_K's reader reassembles across a
-            // 2-byte boundary and its 210-byte rows put odd chunks on a 2 anyway,
-            // as do Q8_0's 34-byte blocks for its quants. Mirrors the X-side check
-            // above and declines nothing that occurs today: it turns a silent
-            // shifted read into the per-row path.
-            if scheme_id == 0 && !(w0 - w_base).is_multiple_of(4) {
+            // offset has to be a multiple of 4. Q6_K's reader reassembles across a
+            // 2-byte boundary, so its 210-byte rows put an odd chunk on a 2 and it
+            // reads correctly either way. Q8_0's whole-word reader joins each
+            // block's quant words out of the nine words it spans and knows two
+            // forms, so a block must start on a word or two bytes into one (`sh` 0
+            // or 16) — every block inside a row is a multiple of the 34-byte stride
+            // away from the row's start, so that is this window's offset being even.
+            // Mirrors the X-side check above and declines nothing that occurs today
+            // (a weight's bytes are written 4-aligned, so both hold): it turns a
+            // silent shifted read into the per-row path.
+            let w_off = w0 - w_base;
+            let misaligned = match scheme_id {
+                0 => !w_off.is_multiple_of(4),
+                20 => !w_off.is_multiple_of(2),
+                _ => false,
+            };
+            if misaligned {
                 ok = false;
                 return;
             }

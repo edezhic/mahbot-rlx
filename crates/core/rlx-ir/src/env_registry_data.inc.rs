@@ -3788,6 +3788,15 @@
         layer: EnvLayer::Backend("wgpu"),
     },
     EnvVarEntry {
+        name: "RLX_WGPU_Q8_0_BLOCK_WORDS",
+        group: "wgpu",
+        summary: "Q8_0 row-grouped GEMM block read: nine whole words per 34-byte block (default), or the per-word reassembly it replaced at 0",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Bisect,
+        aliases: &[],
+        layer: EnvLayer::Backend("wgpu"),
+    },
+    EnvVarEntry {
         name: "RLX_WGPU_ATTENTION_BAND_F32",
         group: "wgpu",
         summary: "Stage the two-sided band attention kernel's K/V tiles in f32 instead of f16 (the f32 form is also the fallback without SHADER_F16)",

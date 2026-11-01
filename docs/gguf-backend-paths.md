@@ -267,10 +267,10 @@ budgets the encoder chunks by and `pooled_out_buf_bytes()` reporting it — the 
 stays inside `OUT_SLAB_CAP` whatever the shape, a larger `m` costing more chunks
 rather than more memory. An attention ear's newly joined up projection is wider than
 the down projection joined today, so that pool's high-water can rise by the
-difference. No environment key was added for the widening:
-`RLX_WGPU_Q8_0_GEMM_DISABLE` is the arm's only lever. No changelog entry is owed
-for the row-bounded fetch either: nothing user-visible changes — no environment
-key, no admission, no value — and the fix is in code this fork added.
+difference. No environment key was added for the widening: the arm's levers stay
+`RLX_WGPU_Q8_0_GEMM_DISABLE` and `RLX_WGPU_Q8_0_BLOCK_WORDS`. No changelog entry
+is owed for the row-bounded fetch either: nothing user-visible changes — no
+environment key, no admission, no value — and the fix is in code this fork added.
 
 The class's calls in the regimes the ladder cannot see move with the arm's other
 admitted shapes: a striped arena, a parked weight and the bisect lever place them
@@ -350,6 +350,7 @@ Non-GGUF schemes still use the in-HLO `convert + scale/zp tile + dot` path.
 | `RLX_COREML_HOST_DEQUANT=1` | ANE | Bake full f32 weights at compile |
 | `RLX_COREML_UNITS` | ANE | `cpu`/`gpu`/`all`/`ane`; unset → fp32 CPU+GPU, f16 CPU+ANE |
 | `RLX_WGPU_Q8_0_GEMM_DISABLE=1` | WGPU | Disable the Q8_0 row-grouped GEMM; its multi-row calls then take the dequant scratch slab |
+| `RLX_WGPU_Q8_0_BLOCK_WORDS=0` | WGPU | The Q8_0 row-grouped GEMM's block reader: whole words (default) or the per-word reassembly its shipped arm replaced, kept to price the two in one build |
 | (arena planning) | WGPU | Auto host fallback when scratch does not fit |
 
 ## Code map

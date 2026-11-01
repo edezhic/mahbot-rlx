@@ -6,7 +6,9 @@
 // `Op::DequantMatMul`.
 //
 // One entry point per scheme — `dequant_gemm_q4k` (scheme 0), `dequant_gemm_q6k`
-// (scheme 2) and `dequant_gemm_q8_0` (scheme 20, the byte-per-weight form).
+// (scheme 2) and `dequant_gemm_q8_0` (scheme 20, the byte-per-weight form), whose
+// body also has the second entry `dequant_gemm_q8_0_reassembly`: one body, two
+// block readers, and `RLX_WGPU_Q8_0_BLOCK_WORDS` picks between them.
 // Deliberately NOT a `scheme_id` branch chain like `dequant_gguf.wgsl`: an id
 // routed to a kernel with no branch for it matches nothing and reads the weights
 // as **zeros** instead of failing.
@@ -54,9 +56,11 @@
 // resident sweep beside it are printed there too.
 //
 // Nothing in the form is gated on the device: one scalar per row, an 8 KiB staged
-// tile, 64 invocations — all inside the WebGPU baseline, and no second arm is
-// kept. A device that could not run it would be running the four-lane form this
-// replaces; there is no other arm in the tree for it to fall to.
+// tile, 64 invocations — all inside the WebGPU baseline. The one second arm the
+// file keeps is the Q8_0 entry's per-word block reader
+// (`dequant_gemm_q8_0_reassembly`), which no call reaches unless a run asks for it
+// by name: it is there to price that entry's readers in one build, not a route a
+// device without some capability falls back to.
 //
 // Where this header's figures come from, table by table: the tile sweep and the
 // declared-storage probe above are this fork's stand's (an M3 Pro, 14-core GPU,
@@ -287,8 +291,10 @@ fn read_u32(rel: u32) -> u32 {
 
 /// Four packed bytes at `rel` as one word, for a `rel` that need not be aligned:
 /// Q6_K's 210-byte blocks put every odd block's `ql`/`qh` slices on a 2-byte
-/// boundary. The branch prices the reassembly (two loads, a shift, an or) above
-/// [`read_u32`], which is why the Q4_K entry point keeps its own loader.
+/// boundary, and the Q8_0 entry's reassembly arm takes it one word at a time. The
+/// branch prices the reassembly (two loads, a shift, an or) above [`read_u32`],
+/// which is why the Q4_K entry point keeps its own loader and why Q8_0's shipped
+/// arm loads the block's nine words once instead.
 fn read_word_at(rel: u32) -> u32 {
     let abs = params.w_byte_off + rel;
     let word = abs / 4u;
@@ -778,21 +784,21 @@ fn dequant_gemm_q6k(
 }
 
 // Q8_0: 34 bytes / 32 elements — f16 `d` and 32 i8 quants, the byte-per-weight
-// form. Its block stride is not a multiple of four, so a block's quants sit two
-// bytes off a word boundary for half the (column, block) pairs: neither the
-// block's `d` nor its quants can use the whole-word reader the Q4_K entry has
-// ([`read_u32`]), and both go through the reassembling [`read_word_at`], as
-// Q6_K's 210-byte rows already do.
+// form. Its block stride is not a multiple of four, so half the (column, block)
+// pairs begin a block two bytes off a word boundary. That is where a block
+// starts, not how its bytes have to be read: nine whole words cover one block
+// either way — the word `d` sits in and the eight after it — and a quant word is
+// the two halves of consecutive ones, joined in registers.
 const Q8_0_BLK_ELEMS: u32 = 32u;
 const Q8_0_BLK_BYTES: u32 = 34u;
 
 /// One `qs` word's four quants, as `(b + 128) / 255`: the word is biased by 0x80
 /// so the signed bytes land on the unsigned `unorm` unpack, which is exact,
 /// where a signed unpack clamps the lowest quant (-128) at -1.0. The 255 and the
-/// bias both fold back out in [`dequant_gemm_q8_0`]'s `fma`, so four weights cost
-/// one unpack and one `fma` — the same shape as the Q4_K entry's nibble path, and
-/// not the byte-at-a-time read with a shift, a mask and a sign fix each that
-/// measured 2.1-2.7x here.
+/// bias both fold back out in the entry's `fma`, so four weights cost one unpack
+/// and one `fma` — the same shape as the Q4_K entry's nibble path, and not the
+/// byte-at-a-time read with a shift, a mask and a sign fix each that measured
+/// 2.1-2.7x here.
 fn q8_0_quants(word: u32) -> vec4<f32> {
     return unpack4x8unorm(word ^ 0x80808080u);
 }
@@ -802,11 +808,32 @@ fn q8_0_quants(word: u32) -> vec4<f32> {
 /// `b`, since `quants` is `(b + 128) / 255`.
 const Q8_0_BIAS: f32 = 128.0;
 
-@compute @workgroup_size(64, 1, 1)
-fn dequant_gemm_q8_0(
-    @builtin(local_invocation_index) tid: u32,
-    @builtin(workgroup_id) wid: vec3<u32>,
-) {
+/// The four quants that follow the word `d` starts in: `lo`'s high two bytes and
+/// `hi`'s low two when the block is word-aligned (`sh` 0), `hi` whole when it
+/// starts two bytes in (`sh` 16). Every shift stays well inside the word — a shift
+/// by the word width is undefined in SPIR-V, so the offset picks the form with a
+/// `select` instead of shifting `hi` into place.
+fn q8_0_join(lo: u32, hi: u32, sh: u32) -> u32 {
+    return select((lo >> 16u) | (hi << 16u), hi, sh != 0u);
+}
+
+/// The Q8_0 row-grouped GEMM. `words` picks the block reader: the nine whole
+/// words below, each loaded once and joined from registers, or the per-word
+/// reassembly [`read_word_at`] this entry shipped with — the arm
+/// `RLX_WGPU_Q8_0_BLOCK_WORDS=0` selects, kept so the two readers can be priced
+/// against each other in one build. Both read a block's same bytes and accumulate
+/// in the same order, so an arm difference is a reader difference and not a
+/// different model.
+///
+/// **What the reader is worth** (Apple M3 Pro, Metal, release; both arms
+/// alternating in one process): the wake word's two-window pass dispatches 96 of
+/// these multiplies, and their own device time — the backend's device clock, one
+/// pass a multiply (`RLX_WGPU_ONE_OP_PER_PASS`) — reads 17.88 ms against 15.53 ms,
+/// 1.151x, 9 of 9 paired rounds; the pass's own device time 32.25 ms to 29.92 ms,
+/// its wall clock 34.29 ms to 31.33 ms, and the multiplies' share of the pass's
+/// device time 55 % to 52 %. `tests/wake_multiply_share.rs` takes both arms in one
+/// run.
+fn q8_0_gemm(tid: u32, wid: vec3<u32>, words: bool) {
     let col = wid.x * TG + tid;
     let row0 = wid.y * TM;
     let colc = min(col, params.ncols - 1u);
@@ -843,21 +870,114 @@ fn dequant_gemm_q8_0(
         for (var bi: u32 = 0u; bi < bis; bi = bi + 1u) {
             let b = (b0 / Q8_0_BLK_ELEMS) + bi;
             let off = (colc * nbk + b) * Q8_0_BLK_BYTES;
-            let d = f16_bits_to_f32(read_word_at(off) & 0xFFFFu);
-            let dq = vec4<f32>(d * DQ_UNORM);
-            let bias = vec4<f32>(-Q8_0_BIAS * d);
             let lp = bi * Q8_0_BLK_ELEMS;
-            for (var l: u32 = 0u; l < Q8_0_BLK_ELEMS; l = l + 4u) {
-                let ww = fma(q8_0_quants(read_word_at(off + 2u + l)), dq, bias);
-                let o = lp + l;
-                a0 = row_dot(a0, 0u, o, ww);
-                a1 = row_dot(a1, 1u, o, ww);
-                a2 = row_dot(a2, 2u, o, ww);
-                a3 = row_dot(a3, 3u, o, ww);
-                a4 = row_dot(a4, 4u, o, ww);
-                a5 = row_dot(a5, 5u, o, ww);
-                a6 = row_dot(a6, 6u, o, ww);
-                a7 = row_dot(a7, 7u, o, ww);
+            if (words) {
+                // The nine words that cover the block, read once each: sixteen word
+                // loads a block is what the reader below takes, and the eight quant
+                // words here are joins of the ones already in registers.
+                let abs = params.w_byte_off + off;
+                let base = abs >> 2u;
+                let sh = (abs & 3u) * 8u;
+                let w0 = warr[base];
+                let w1 = warr[base + 1u];
+                let w2 = warr[base + 2u];
+                let w3 = warr[base + 3u];
+                let w4 = warr[base + 4u];
+                let w5 = warr[base + 5u];
+                let w6 = warr[base + 6u];
+                let w7 = warr[base + 7u];
+                let w8 = warr[base + 8u];
+                let d = f16_bits_to_f32((w0 >> sh) & 0xFFFFu);
+                let dq = vec4<f32>(d * DQ_UNORM);
+                let bias = vec4<f32>(-Q8_0_BIAS * d);
+                let q0 = fma(q8_0_quants(q8_0_join(w0, w1, sh)), dq, bias);
+                let q1 = fma(q8_0_quants(q8_0_join(w1, w2, sh)), dq, bias);
+                let q2 = fma(q8_0_quants(q8_0_join(w2, w3, sh)), dq, bias);
+                let q3 = fma(q8_0_quants(q8_0_join(w3, w4, sh)), dq, bias);
+                let q4 = fma(q8_0_quants(q8_0_join(w4, w5, sh)), dq, bias);
+                let q5 = fma(q8_0_quants(q8_0_join(w5, w6, sh)), dq, bias);
+                let q6 = fma(q8_0_quants(q8_0_join(w6, w7, sh)), dq, bias);
+                let q7 = fma(q8_0_quants(q8_0_join(w7, w8, sh)), dq, bias);
+                a0 = row_dot(a0, 0u, lp, q0);
+                a1 = row_dot(a1, 1u, lp, q0);
+                a2 = row_dot(a2, 2u, lp, q0);
+                a3 = row_dot(a3, 3u, lp, q0);
+                a4 = row_dot(a4, 4u, lp, q0);
+                a5 = row_dot(a5, 5u, lp, q0);
+                a6 = row_dot(a6, 6u, lp, q0);
+                a7 = row_dot(a7, 7u, lp, q0);
+                a0 = row_dot(a0, 0u, lp + 4u, q1);
+                a1 = row_dot(a1, 1u, lp + 4u, q1);
+                a2 = row_dot(a2, 2u, lp + 4u, q1);
+                a3 = row_dot(a3, 3u, lp + 4u, q1);
+                a4 = row_dot(a4, 4u, lp + 4u, q1);
+                a5 = row_dot(a5, 5u, lp + 4u, q1);
+                a6 = row_dot(a6, 6u, lp + 4u, q1);
+                a7 = row_dot(a7, 7u, lp + 4u, q1);
+                a0 = row_dot(a0, 0u, lp + 8u, q2);
+                a1 = row_dot(a1, 1u, lp + 8u, q2);
+                a2 = row_dot(a2, 2u, lp + 8u, q2);
+                a3 = row_dot(a3, 3u, lp + 8u, q2);
+                a4 = row_dot(a4, 4u, lp + 8u, q2);
+                a5 = row_dot(a5, 5u, lp + 8u, q2);
+                a6 = row_dot(a6, 6u, lp + 8u, q2);
+                a7 = row_dot(a7, 7u, lp + 8u, q2);
+                a0 = row_dot(a0, 0u, lp + 12u, q3);
+                a1 = row_dot(a1, 1u, lp + 12u, q3);
+                a2 = row_dot(a2, 2u, lp + 12u, q3);
+                a3 = row_dot(a3, 3u, lp + 12u, q3);
+                a4 = row_dot(a4, 4u, lp + 12u, q3);
+                a5 = row_dot(a5, 5u, lp + 12u, q3);
+                a6 = row_dot(a6, 6u, lp + 12u, q3);
+                a7 = row_dot(a7, 7u, lp + 12u, q3);
+                a0 = row_dot(a0, 0u, lp + 16u, q4);
+                a1 = row_dot(a1, 1u, lp + 16u, q4);
+                a2 = row_dot(a2, 2u, lp + 16u, q4);
+                a3 = row_dot(a3, 3u, lp + 16u, q4);
+                a4 = row_dot(a4, 4u, lp + 16u, q4);
+                a5 = row_dot(a5, 5u, lp + 16u, q4);
+                a6 = row_dot(a6, 6u, lp + 16u, q4);
+                a7 = row_dot(a7, 7u, lp + 16u, q4);
+                a0 = row_dot(a0, 0u, lp + 20u, q5);
+                a1 = row_dot(a1, 1u, lp + 20u, q5);
+                a2 = row_dot(a2, 2u, lp + 20u, q5);
+                a3 = row_dot(a3, 3u, lp + 20u, q5);
+                a4 = row_dot(a4, 4u, lp + 20u, q5);
+                a5 = row_dot(a5, 5u, lp + 20u, q5);
+                a6 = row_dot(a6, 6u, lp + 20u, q5);
+                a7 = row_dot(a7, 7u, lp + 20u, q5);
+                a0 = row_dot(a0, 0u, lp + 24u, q6);
+                a1 = row_dot(a1, 1u, lp + 24u, q6);
+                a2 = row_dot(a2, 2u, lp + 24u, q6);
+                a3 = row_dot(a3, 3u, lp + 24u, q6);
+                a4 = row_dot(a4, 4u, lp + 24u, q6);
+                a5 = row_dot(a5, 5u, lp + 24u, q6);
+                a6 = row_dot(a6, 6u, lp + 24u, q6);
+                a7 = row_dot(a7, 7u, lp + 24u, q6);
+                a0 = row_dot(a0, 0u, lp + 28u, q7);
+                a1 = row_dot(a1, 1u, lp + 28u, q7);
+                a2 = row_dot(a2, 2u, lp + 28u, q7);
+                a3 = row_dot(a3, 3u, lp + 28u, q7);
+                a4 = row_dot(a4, 4u, lp + 28u, q7);
+                a5 = row_dot(a5, 5u, lp + 28u, q7);
+                a6 = row_dot(a6, 6u, lp + 28u, q7);
+                a7 = row_dot(a7, 7u, lp + 28u, q7);
+            } else {
+                let d = f16_bits_to_f32(read_word_at(off) & 0xFFFFu);
+                let dq = vec4<f32>(d * DQ_UNORM);
+                let bias = vec4<f32>(-Q8_0_BIAS * d);
+                for (var l: u32 = 0u; l < Q8_0_BLK_ELEMS; l = l + 4u) {
+                    let ww = fma(q8_0_quants(read_word_at(off + 2u + l)), dq, bias);
+                    let o = lp + l;
+                    a0 = row_dot(a0, 0u, o, ww);
+                    a1 = row_dot(a1, 1u, o, ww);
+                    a2 = row_dot(a2, 2u, o, ww);
+                    a3 = row_dot(a3, 3u, o, ww);
+                    a4 = row_dot(a4, 4u, o, ww);
+                    a5 = row_dot(a5, 5u, o, ww);
+                    a6 = row_dot(a6, 6u, o, ww);
+                    a7 = row_dot(a7, 7u, o, ww);
+                }
             }
         }
     }
@@ -865,3 +985,18 @@ fn dequant_gemm_q8_0(
     if (col < params.ncols) { store_col(a0, a1, a2, a3, a4, a5, a6, a7, row0, col); }
 }
 
+@compute @workgroup_size(64, 1, 1)
+fn dequant_gemm_q8_0(
+    @builtin(local_invocation_index) tid: u32,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    q8_0_gemm(tid, wid, true);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn dequant_gemm_q8_0_reassembly(
+    @builtin(local_invocation_index) tid: u32,
+    @builtin(workgroup_id) wid: vec3<u32>,
+) {
+    q8_0_gemm(tid, wid, false);
+}
