@@ -1,22 +1,22 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Measurement only and ignored: the decoder's graphs — what they cost to build,
-//! what their cache is worth to a served request, and what the served path's two
-//! synthesis calls cost in time and resident set.
+//! Measurement only and ignored: the sound half's graphs — what they cost to build,
+//! what one graph's arena holds while it runs, and what synthesis costs a served
+//! process in time and physical footprint.
 //!
 //! Run with `MAHBOT_MODELS_DIR=… RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference
 //! --release --test sound_decoder_cost -- --ignored --nocapture <subject>`.
-//! Each subject is its own test and wants its own process: the device keeps what
-//! a test built, so one run of all four crosses this machine's memory ceiling —
+//! Each subject is its own test and wants its own process: the host copies of the
+//! weights a run reads stay in the process's caches, and the three arms that build
+//! graphs by hand never release their pages (only the served path does, inside the
+//! calls it times), so one run of all four crosses this machine's memory ceiling —
 //! take them one at a time (`graphs`, `front`, `margin`, `library`).
 //!
-//! **The build.** The graphs one 330-row utterance runs, requested twice through
-//! `graphs::SoundGraphs` — the cache `Synthesis` owns — so the second round is the
-//! hit a repeated request of a length gets, and the first is the build a served
-//! path would otherwise pay per request. The front is built by driving
-//! `graphs::FrontGraphs::build`, the builder both call sites use, so the probe
-//! cannot drift from what the sound half runs.
+//! **The build.** What one call pays to compile the sound half: the front's set,
+//! then each stage group's graph for every span the part runs, one at a time and
+//! each given back before the next is built — the arrangement the sound half runs,
+//! so the probe cannot drift from it.
 //!
 //! **The front's last window.** The shipped arrangement — a full chunk padded with
 //! code 0 — against the same frames at their true length through a graph of their
@@ -30,10 +30,10 @@
 //! right margin. The absolute per-window costs move between runs; the paired delta
 //! and the rounds that agree on it are the figure.
 //!
-//! **The served path.** One process, two `Synthesis::synthesize` calls of the
-//! pinned text and a third of another so the cache meets a second length:
-//! the second call is the reuse a repeated request gets, and the resident set
-//! after each call is what the decoder's retained graphs cost the process.
+//! **The served path.** One process, three `Synthesis::synthesize` calls — two of
+//! the pinned text and one of another — through the path the wake-word bench
+//! walks: each call builds its own sound graphs, and the physical footprint after
+//! each call is what the mid-call release leaves behind.
 use std::sync::Arc;
 
 use mahbot_inference::graphs::{self, DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, windows};
@@ -57,18 +57,18 @@ const BUILD_ROUNDS: usize = 7;
 
 /// One timed run of a compiled graph. The warm-up pass and the alternating loop
 /// that pairs two arms live at the call sites, which own the comparison.
-fn run_ms(graph: &graphs::SoundGraph, ins: &[(String, Vec<f32>)]) -> f64 {
+fn run_ms(graph: &mut graphs::Compiled, ins: &[(String, Vec<f32>)]) -> f64 {
     let slices: Vec<(&str, &[f32])> = ins
         .iter()
         .map(|(n, v)| (n.as_str(), v.as_slice()))
         .collect();
     let t = Tick::now();
-    graph.borrow_mut().run_slices(&slices);
+    graph.run_slices(&slices);
     Tick::now().elapsed_ns(t) as f64 / 1e6
 }
 
-/// The process's resident set, which is what the cache costs the ceiling rather
-/// than what its graphs plan.
+/// The process's resident set beside the footprint: the set a graph's planned
+/// arena shows up in only on a device without unified memory.
 fn rss() -> Option<usize> {
     report::resident_rss().map(|bytes| bytes as usize)
 }
@@ -85,13 +85,13 @@ fn mb_of(reading: Option<usize>) -> String {
     reading.map_or_else(|| "-".to_string(), |bytes| format!("{:.1}", mb(bytes)))
 }
 
-/// [`mb_of`] of what `after` holds beyond `before`, `-` when either end is
-/// unavailable.
-fn grown(before: Option<usize>, after: Option<usize>) -> String {
-    mb_of(
-        before
-            .zip(after)
-            .map(|(before, after)| after.saturating_sub(before)),
+/// The process's physical footprint as `(now, lifetime peak)` in the record's unit,
+/// `-` where the platform supplies no such reading. This is the figure a memory
+/// claim is read against: the resident set cannot see memory the GPU holds.
+fn footprint() -> (String, String) {
+    report::footprint().map_or_else(
+        || ("-".to_string(), "-".to_string()),
+        |(now, peak)| (report::human(now), report::human(peak)),
     )
 }
 
@@ -124,13 +124,15 @@ fn assert_tail_is_not_a_chunk(tail_len: usize) {
     );
 }
 
-/// The decoder's graphs, built once and then hit: the eight one 330-row utterance
-/// runs, their parameters, their arenas and the bytes the cache holds; the front's
-/// graph set per part length; and one front graph's own build, averaged alternately
-/// against a full chunk's — the figure a graph per tail length would be paid at.
+/// One utterance's sound graphs, built the way a call builds them: the front's set,
+/// then each stage group's set for every span the part runs, each group's graphs
+/// given back before the next is built. What a call pays to compile the sound half,
+/// what one graph's arena holds, and the front's set per part length; and one front
+/// graph's own build, averaged alternately at the tail's length against a full
+/// chunk's — the figure a graph per tail length would be paid at.
 #[test]
-#[ignore = "measurement only: prints the decoder's graph build against its cache hit"]
-fn the_decoders_graphs_build_once_and_are_hit() {
+#[ignore = "measurement only: prints what one call pays to build the sound half's graphs"]
+fn the_sound_graphs_are_built_per_stage_group() {
     let Some(pair) = pair_or_skip() else { return };
     let device = Device::Gpu;
     let groups = graphs::codec_groups();
@@ -138,71 +140,72 @@ fn the_decoders_graphs_build_once_and_are_hit() {
     let front_set = windows(MAX_CODEC_ROWS, FRONT_WINDOW, 0);
     let tail_len = front_set.last().map_or(0, |&(p0, p1, _, _)| p1 - p0);
     assert_tail_is_not_a_chunk(tail_len);
-    // One request per window the utterance runs; a repeated length is a hit.
-    let requests = front_set.len() + parts.len() * (groups.len() - 1);
     let mut spans: Vec<usize> = parts.iter().map(|&(p0, p1, _, _)| p1 - p0).collect();
     spans.sort_unstable();
     spans.dedup();
-    let before = rss();
-    let mut cache = graphs::SoundGraphs::default();
-    for round in 0..2 {
-        let t = Tick::now();
-        graphs::FrontGraphs::build(
-            &mut cache,
-            device,
-            &pair.sound,
-            MAX_CODEC_ROWS,
-            groups[0].clone(),
-        )
-        .expect("the front's graphs");
-        for group in &groups[1..] {
-            for &len in &spans {
-                cache
-                    .graph(device, &pair.sound, len, group.clone(), 0)
-                    .expect("a decoder graph");
-            }
+    // Per group, in the order the sound half builds them: the front's set — its first
+    // window, then the carried chunk built once the first graph has gone — and then
+    // each stage group's graph for every span the part runs.
+    let mut front =
+        graphs::FrontGraphs::build(device, &pair.sound, MAX_CODEC_ROWS, groups[0].clone())
+            .expect("the front's graphs");
+    let first_ms = front.built_ms();
+    front.pick(FRONT_WINDOW).expect("the carried chunk's graph");
+    let carry_ms = front.built_ms() - first_ms;
+    let mut total_ms = first_ms + carry_ms;
+    println!(
+        "census decoder group={}..{} first_ms={first_ms:.3} carry_ms={carry_ms:.3} \
+         build_ms={total_ms:.3}",
+        groups[0].start, groups[0].end,
+    );
+    drop(front);
+    for group in &groups[1..] {
+        for &len in &spans {
+            let t = Tick::now();
+            let graph = graphs::sound_graph(device, &pair.sound, len, group.clone(), 0)
+                .expect("a decoder graph");
+            let build_ms = Tick::now().elapsed_ns(t) as f64 / 1e6;
+            total_ms += build_ms;
+            let arena = rlx_wgpu::buffer::plan_f32_uniform(&graph.runner.graph, 16).arena_size;
+            println!(
+                "census decoder group={}..{} frames={len} arena_mb={:.1} build_ms={build_ms:.3}",
+                group.start,
+                group.end,
+                mb(arena),
+            );
         }
-        // The build's own elapsed time into a local before anything else: `grown`
-        // shells out to `ps`, and a fork inside the argument list would be timed as
-        // part of the build.
-        let build_ms = Tick::now().elapsed_ns(t) as f64 / 1e6;
-        let (held, params, device_bytes) = cache.census();
-        println!(
-            "census decoder round={round} graphs={held} requests={requests} \
-             params_mb={:.1} planned_arenas_mb={:.1} planned_held_mb={:.1} \
-             rss_mb={} build_ms={:.3}",
-            mb(params),
-            mb(device_bytes.saturating_sub(params)),
-            mb(device_bytes),
-            grown(before, rss()),
-            build_ms,
-        );
     }
-    drop(cache);
-    println!("census decoder released rss_mb={}", grown(before, rss()));
-    // The front's graph set per part length, through the builder the sound half
-    // uses: every part builds its first window, and a part longer than one chunk
-    // the full chunk its later windows run — never a graph those windows cannot
-    // dispatch.
+    println!("census decoder utterance_build_ms={total_ms:.3}");
+    // The front's set per part length, through the builder the sound half uses and
+    // read the way a window reads it: the length and K/V prefix that window runs and
+    // the arena its graph holds. A part longer than one chunk carries the full chunk
+    // its later windows run, never a graph those windows cannot dispatch.
     let carry = graphs::FRONT_CARRY;
     for frames in [FRONT_WINDOW, 100, 2 * FRONT_WINDOW, MAX_CODEC_ROWS] {
-        let mut fresh = graphs::SoundGraphs::default();
-        graphs::FrontGraphs::build(&mut fresh, device, &pair.sound, frames, groups[0].clone())
+        let mut front = graphs::FrontGraphs::build(device, &pair.sound, frames, groups[0].clone())
             .expect("a front graph");
-        let (held, params, device_bytes) = fresh.census();
+        let (first, len) = front.pick(0).expect("the first window's graph");
+        let arena = rlx_wgpu::buffer::plan_f32_uniform(&first.runner.graph, 16).arena_size;
         println!(
-            "census decoder front frames={frames} graphs={held} carry={carry} params_mb={:.1} \
-             arena_mb={:.1}",
-            mb(params),
-            mb(device_bytes.saturating_sub(params)),
+            "census decoder front frames={frames} window=0 len={len} prefix=0 arena_mb={:.1}",
+            mb(arena),
         );
+        if frames > FRONT_WINDOW {
+            let (carried, len) = front.pick(FRONT_WINDOW).expect("the carried chunk's graph");
+            let arena = rlx_wgpu::buffer::plan_f32_uniform(&carried.runner.graph, 16).arena_size;
+            println!(
+                "census decoder front frames={frames} window={FRONT_WINDOW} len={len} \
+                 prefix={carry} arena_mb={:.1}",
+                mb(arena),
+            );
+        }
     }
     // What one front graph costs to build, in the window the answer is read in:
-    // the tail's length against a full chunk's, alternately and in fresh caches.
-    // The tail's length is the graph the shipped builder no longer builds; it is
-    // built here only to price the alternative. Each arm's median is its own
-    // figure — the trade reads the tail's against what a padded last window costs
-    // to run, not one median against the other.
+    // the tail's length against a full chunk's, alternately, each built fresh. The
+    // tail's length is the graph the shipped builder does not build; it is built
+    // here only to price the alternative. Each arm's median is its own figure — the
+    // trade reads the tail's against what a padded last window costs to run, not one
+    // median against the other.
     let (mut tail_ms, mut chunk_ms) = (Vec::new(), Vec::new());
     for round in 0..BUILD_ROUNDS {
         let order: [usize; 2] = if round % 2 == 0 {
@@ -211,10 +214,8 @@ fn the_decoders_graphs_build_once_and_are_hit() {
             [FRONT_WINDOW, tail_len]
         };
         for len in order {
-            let mut fresh = graphs::SoundGraphs::default();
             let t = Tick::now();
-            let g = fresh
-                .graph(device, &pair.sound, len, groups[0].clone(), carry)
+            let g = graphs::sound_graph(device, &pair.sound, len, groups[0].clone(), carry)
                 .expect("a front graph");
             let ms = Tick::now().elapsed_ns(t) as f64 / 1e6;
             drop(g);
@@ -249,21 +250,13 @@ fn the_fronts_last_window_runs_padded() {
     let &(_, _, tail_at, tail_end) = part.last().expect("a part has a window");
     let tail_len = tail_end - tail_at;
     assert_tail_is_not_a_chunk(tail_len);
-    let mut cache = graphs::SoundGraphs::default();
-    let fronts = graphs::FrontGraphs::build(
-        &mut cache,
-        device,
-        &pair.sound,
-        MAX_CODEC_ROWS,
-        front.clone(),
-    )
-    .expect("the front's graphs");
-    // The two lengths side by side: what the shipped arrangement runs (the padded
-    // chunk) and the graph of the tail's own length it does not build.
-    let padded = fronts.pick(tail_at).0.clone();
+    // The two lengths side by side, both through the builder the sound half uses:
+    // what the shipped arrangement runs (the padded chunk, the front's carried
+    // window) and the graph of the tail's own length it does not build.
     let carry = graphs::FRONT_CARRY;
-    let tail = cache
-        .graph(device, &pair.sound, tail_len, front, carry)
+    let mut padded = graphs::sound_graph(device, &pair.sound, FRONT_WINDOW, front.clone(), carry)
+        .expect("the padded chunk's graph");
+    let mut tail = graphs::sound_graph(device, &pair.sound, tail_len, front, carry)
         .expect("the tail's own graph");
     println!(
         "census front_tail tail_len={tail_len} chunk={FRONT_WINDOW} carry={carry} \
@@ -271,11 +264,11 @@ fn the_fronts_last_window_runs_padded() {
         part.len(),
     );
     let (padded_in, tail_in) = (
-        support::filled_inputs(&padded.borrow().runner.graph, 0.1),
-        support::filled_inputs(&tail.borrow().runner.graph, 0.1),
+        support::filled_inputs(&padded.runner.graph, 0.1),
+        support::filled_inputs(&tail.runner.graph, 0.1),
     );
-    run_ms(&padded, &padded_in);
-    run_ms(&tail, &tail_in);
+    run_ms(&mut padded, &padded_in);
+    run_ms(&mut tail, &tail_in);
     let mut deltas = Vec::with_capacity(ROUNDS);
     let (mut p_ms, mut t_ms) = (Vec::new(), Vec::new());
     for round in 0..ROUNDS {
@@ -283,10 +276,10 @@ fn the_fronts_last_window_runs_padded() {
         // arms rather than on the delta; the sign stays padded minus tail in
         // both orders.
         let (p, t) = if round % 2 == 0 {
-            (run_ms(&padded, &padded_in), run_ms(&tail, &tail_in))
+            (run_ms(&mut padded, &padded_in), run_ms(&mut tail, &tail_in))
         } else {
-            let true_ms = run_ms(&tail, &tail_in);
-            (run_ms(&padded, &padded_in), true_ms)
+            let true_ms = run_ms(&mut tail, &tail_in);
+            (run_ms(&mut padded, &padded_in), true_ms)
         };
         p_ms.push(p);
         t_ms.push(t);
@@ -341,31 +334,29 @@ fn the_decoders_windows_carry_no_right_margin() {
             if with == without {
                 continue;
             }
-            // One pair's graphs at a time: a cache that held every span of both
-            // groups would be several gigabytes for a probe that only pairs two.
-            let mut cache = graphs::SoundGraphs::default();
-            let a = cache
-                .graph(device, &pair.sound, *with, group.clone(), 0)
+            // One pair's graphs at a time: the probe pairs two windows, so it holds
+            // two graphs, and the build that a call's release would answer for is
+            // not this arm's subject.
+            let mut a = graphs::sound_graph(device, &pair.sound, *with, group.clone(), 0)
                 .expect("a padded decoder window");
-            let b = cache
-                .graph(device, &pair.sound, *without, group.clone(), 0)
+            let mut b = graphs::sound_graph(device, &pair.sound, *without, group.clone(), 0)
                 .expect("a decoder window");
             let (a_in, b_in) = (
-                support::filled_inputs(&a.borrow().runner.graph, 0.1),
-                support::filled_inputs(&b.borrow().runner.graph, 0.1),
+                support::filled_inputs(&a.runner.graph, 0.1),
+                support::filled_inputs(&b.runner.graph, 0.1),
             );
-            run_ms(&a, &a_in);
-            run_ms(&b, &b_in);
+            run_ms(&mut a, &a_in);
+            run_ms(&mut b, &b_in);
             let mut deltas = Vec::with_capacity(ROUNDS);
             for round in 0..ROUNDS {
                 // Alternate which arm runs first, so a within-round drift lands on
                 // both arms rather than on the delta; the sign stays the margin's
                 // own (with-margin minus without-margin) in both orders.
                 let delta = if round % 2 == 0 {
-                    let (with_ms, without_ms) = (run_ms(&a, &a_in), run_ms(&b, &b_in));
+                    let (with_ms, without_ms) = (run_ms(&mut a, &a_in), run_ms(&mut b, &b_in));
                     with_ms - without_ms
                 } else {
-                    let (without_ms, with_ms) = (run_ms(&b, &b_in), run_ms(&a, &a_in));
+                    let (without_ms, with_ms) = (run_ms(&mut b, &b_in), run_ms(&mut a, &a_in));
                     with_ms - without_ms
                 };
                 deltas.push(delta);
@@ -394,12 +385,13 @@ fn the_decoders_windows_carry_no_right_margin() {
 }
 
 /// The served path: one process, two calls of the pinned text and a third of
-/// another, through `Synthesis`, which is the path the wake-word bench walks. The
-/// second call is the reuse the decoder cache exists for; the resident set after
-/// each call is what the retained graphs cost against the guard's ceiling.
+/// another, through `Synthesis`, which is the path the wake-word bench walks. Each
+/// call builds the sound graphs it runs and gives them back before the call
+/// returns, so the second call pays that build again and the footprint after each
+/// call is what the release left behind.
 #[test]
-#[ignore = "measurement only: two synthesis calls of one utterance through the library path"]
-fn the_library_path_pays_the_decoder_once() {
+#[ignore = "measurement only: three synthesis calls through the library path"]
+fn the_library_path_builds_and_releases_the_decoder() {
     let Some(pair) = pair_or_skip() else { return };
     let voice = match loader::voice_wav() {
         Ok(voice) => voice,
@@ -410,15 +402,16 @@ fn the_library_path_pays_the_decoder_once() {
     };
     let t = Tick::now();
     let mut synthesis = Synthesis::new(Arc::new(pair), &voice).expect("the synthesis object");
+    let (now, peak) = footprint();
     println!(
-        "census library open_ms={:.1} rss_mb={}",
+        "census library open_ms={:.1} rss_mb={} footprint={now} peak={peak}",
         Tick::now().elapsed_ns(t) as f64 / 1e6,
         mb_of(rss())
     );
-    // Two calls of the pinned text — the row's own utterance — and one of another
-    // so the cache meets a second length the way the bench's clips do. The repeat
-    // must build nothing and reproduce the first call's waveform: both are the
-    // claims the decoder cache and the tail graph stand on, so both are asserted.
+    // Two calls of the pinned text — the row's own utterance — and one of another,
+    // which meets the sound half's shapes the way the bench's clips do. Each call
+    // builds the sound graphs it runs and gives them back; the repeat still renders
+    // the first call's waveform, so the rebuilds cost time and not audio.
     let other = "Sit down and tell me what you saw on the way here.";
     let mut pinned = [0u64; 2];
     for (call, text) in [(0usize, TTS_TEXT), (1, TTS_TEXT), (2, other)] {
@@ -427,33 +420,28 @@ fn the_library_path_pays_the_decoder_once() {
         let ms = Tick::now().elapsed_ns(t) as f64 / 1e6;
         let build = synthesis.build_ms();
         let digest = report::digest(&wave);
+        let (now, peak) = footprint();
         println!(
             "census library call={call} chars={} ms={ms:.1} build_ms={build:.3} samples={} \
-             digest={digest:016x} rss_mb={} process_peak={}",
+             digest={digest:016x} rss_mb={} footprint={now} peak={peak}",
             text.chars().count(),
             wave.len(),
             mb_of(rss()),
-            report::shown(report::peak_rss()),
         );
         if call < 2 {
             pinned[call] = digest;
-        }
-        if call == 0 {
-            assert!(
-                build > 0.0,
-                "the first call of a length must build its graphs"
-            );
-        } else if call == 1 {
-            // A hit still walks the cache (microseconds); a compile or an upload
-            // would be two orders of magnitude more.
-            assert!(
-                build < 1.0,
-                "a repeat of a length must pay no build, read {build:.3} ms"
-            );
         }
     }
     assert_eq!(
         pinned[0], pinned[1],
         "a repeat of a text must reproduce its waveform"
     );
+    let (now, peak) = footprint();
+    println!("census library resting footprint={now} peak={peak}");
+    drop(synthesis);
+    let (now, peak) = footprint();
+    println!("census library dropped footprint={now} peak={peak}");
+    mahbot_inference::release_process_memory();
+    let (now, peak) = footprint();
+    println!("census library released footprint={now} peak={peak}");
 }

@@ -7,12 +7,14 @@
 //!
 //! The graphs whose shapes do not depend on the request are built and compiled
 //! once ([`Synthesis::new`] — the speaker encoder and the code predictor's whole
-//! sixteen-level frame as one graph); the prompt and body graphs are built on a
-//! length they have not seen, and the sound half's graphs on a window they have
-//! not seen, both kept afterwards in this object. [`Synthesis::synthesize`] is the
-//! reusable entry point the wake-word bench calls for every corpus clip. Output is
-//! mono f32 PCM at [`SAMPLE_RATE`] (24 kHz, the sound half's own rate),
-//! `frames · 1920` samples for the frames the talker produced.
+//! sixteen-level frame as one graph). The prompt and body graphs are built on a
+//! length they have not seen and kept while that length repeats. The sound half's
+//! graphs belong to the call that builds them: built for a window length, given
+//! back once the windows of that length have run, so a call leaves no sound graph
+//! resident. [`Synthesis::synthesize`] is the reusable entry point the wake-word
+//! bench calls for every corpus clip. Output is mono f32 PCM at [`SAMPLE_RATE`]
+//! (24 kHz, the sound half's own rate), `frames · 1920` samples for the frames the
+//! talker produced.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,7 +25,7 @@ use crate::graphs::{Compiled, DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, windows};
 use crate::loader::{Config, Head, Pair};
 use crate::report::Stopwatch;
 use crate::tokenizer::Tokenizer;
-use crate::{graphs, host};
+use crate::{graphs, host, report};
 
 /// Waveform rate the sound half produces.
 pub const SAMPLE_RATE: u32 = 24_000;
@@ -228,18 +230,11 @@ pub struct Synthesis {
     /// requests of similar length. One entry each.
     prefill: Option<(usize, Compiled)>,
     body: Option<(usize, Compiled)>,
-    /// The sound half's graphs, one per window length and stage group, kept while
-    /// this object lives and released with it (`graphs::SoundGraphs`) — a repeated
-    /// request of a length pays neither the compile nor the upload for the
-    /// decoder, and the residency is this object's rather than the process's.
-    /// The graphs are shared handles over one thread's device state, so this makes
-    /// [`Synthesis`] `!Send`: one object per synthesizing thread.
-    sound_graphs: graphs::SoundGraphs,
-    /// What the last [`Synthesis::synthesize`] paid to build: the compiles and
-    /// uploads for the graphs it did not already hold — whether or not the call
-    /// finished, so a call that failed after some builds reports the part it paid.
-    /// A call whose text and frame count repeat pays neither, and reads a hit's own
-    /// walk of the cache.
+    /// What the last [`Synthesis::synthesize`] paid to build: the prompt and body
+    /// graphs when the request's lengths are new, and the sound half's graphs, which
+    /// every call builds for the window lengths it runs. Counted as the call goes,
+    /// with the front's pair added once its window loop ends, so a failed call reports
+    /// the builds it finished — the front's only if that loop did.
     build_ms: f64,
 }
 
@@ -247,8 +242,8 @@ impl Synthesis {
     /// Compile the code predictor's whole sixteen-level frame as one graph, and
     /// the speaker encoder, and embed the reference voice once. The prompt and
     /// body graphs are built on first use and reused while the shape repeats
-    /// (`Synthesis::prefill`, `Synthesis::body`); the sound half's graphs are
-    /// built on first use and kept in `Synthesis::sound_graphs`.
+    /// (`Synthesis::prefill`, `Synthesis::body`); the sound half's graphs are built
+    /// and given back inside the call that runs them.
     pub fn new(pair: Arc<Pair>, voice_wav: &Path) -> Result<Self> {
         let tokenizer = Tokenizer::from_model(&pair.body)?;
         let cfg = pair.body.config().clone();
@@ -309,7 +304,6 @@ impl Synthesis {
             frame,
             prefill: None,
             body: None,
-            sound_graphs: graphs::SoundGraphs::default(),
             build_ms: 0.0,
         })
     }
@@ -327,8 +321,9 @@ impl Synthesis {
         self.render_sound(&frames)
     }
 
-    /// Milliseconds the last call spent compiling and uploading graphs it did not
-    /// already hold.
+    /// Milliseconds the last call spent compiling and uploading graphs: the prompt
+    /// and body graphs on a length it had not built, and the sound half's graphs,
+    /// which every call builds.
     #[must_use]
     pub fn build_ms(&self) -> f64 {
         self.build_ms
@@ -597,22 +592,6 @@ impl Synthesis {
         let wave_k = sound.plan("a.gen.wav.pre_conv.weight")?.ggml_shape[0];
 
         let device = rlx_runtime::Device::Gpu;
-        // The first window runs its graph over the frames it holds; every later one
-        // runs a full chunk, zero-padded when the part ends inside it (a padded slot
-        // is a real codebook row, computed for nothing — but a graph per tail length
-        // costs more to build than the padding costs to run). A part of one chunk or
-        // less builds one graph, a longer one two; both are this object's, so a
-        // second utterance of the same length pays neither the compile nor the
-        // upload for them.
-        let t = Stopwatch::start();
-        let front = graphs::FrontGraphs::build(
-            &mut self.sound_graphs,
-            device,
-            &sound,
-            frames,
-            front_group.clone(),
-        )?;
-        self.build_ms += t.ms();
         let prefix = graphs::FRONT_CARRY;
 
         // The wave transformer carries a 72-frame window: 71 K/V frames per
@@ -623,12 +602,17 @@ impl Synthesis {
         let mut kv_k = vec![0f32; wave_layers * prefix * wave_hkv];
         let mut kv_v = vec![0f32; wave_layers * prefix * wave_hkv];
         let mut left = vec![0f32; wave_d_tfm * (wave_k - 1)];
+        // The front's graphs live only until this loop has run: dropped before the
+        // first stage group is built, they cannot sit beside the decoder's arenas and
+        // set the peak at their sum. `release_free` hands their pages back too — macOS
+        // keeps a freed one in its zone until something asks for it.
+        let mut front = graphs::FrontGraphs::build(device, &sound, frames, front_group.clone())?;
         for (a, b) in windows(frames, FRONT_WINDOW, 0)
             .into_iter()
             .map(|(_, _, a, b)| (a, b))
         {
             let core = b - a;
-            let (graph, run_len) = front.pick(a);
+            let (graph, run_len) = front.pick(a)?;
             let mut chunk = vec![0f32; (levels + 1) * run_len];
             for level in 0..=levels {
                 for f in a..b {
@@ -648,7 +632,7 @@ impl Synthesis {
                 inputs.push(("kpre", &kv_k));
                 inputs.push(("vpre", &kv_v));
             }
-            let run = graph.borrow_mut().run_slices(&inputs);
+            let run = graph.run_slices(&inputs);
             if run.len() < 4 {
                 return Err(anyhow!(
                     "the wave transformer returned {} outputs, expected waveform + left + k/v",
@@ -691,6 +675,14 @@ impl Synthesis {
             }
             left = run[1].clone();
         }
+        self.build_ms += front.built_ms();
+        drop(front);
+        report::release_free();
+
+        // The distinct window lengths the part runs, the same for every stage group.
+        let mut lengths: Vec<usize> = parts.iter().map(|&(p0, p1, _, _)| p1 - p0).collect();
+        lengths.sort_unstable();
+        lengths.dedup();
 
         for group in dac_groups {
             let (ch_in, per_in) = graphs::dac_stage_io(group.start, 1);
@@ -708,48 +700,42 @@ impl Synthesis {
             } else {
                 graphs::dac_stage_io(group.end, 1)
             };
-            let mut lengths: Vec<usize> = parts.iter().map(|&(p0, p1, _, _)| p1 - p0).collect();
-            lengths.sort_unstable();
-            lengths.dedup();
-            let mut graphs_by_len: Vec<(usize, graphs::SoundGraph)> =
-                Vec::with_capacity(lengths.len());
-            for &len in &lengths {
-                let t = Stopwatch::start();
-                let graph = self
-                    .sound_graphs
-                    .graph(device, &sound, len, group.clone(), 0)?;
-                self.build_ms += t.ms();
-                graphs_by_len.push((len, graph));
-            }
             // The group's output is a tensor of its own shape, not a waveform
             // until the group that carries `post`. Stitch it channel-major at
             // `per_out`, exactly as the next group's input expects it.
             let mut stitched = vec![0f32; ch_out * frames * per_out];
-            for &(p0, p1, a, b) in &parts {
-                let len = p1 - p0;
-                let chunk = codec_slice(&wave, frames, p0, p1, per_in);
-                let gi = graphs_by_len
-                    .iter()
-                    .position(|(l, _)| *l == len)
-                    .ok_or_else(|| anyhow!("no sound graph was built for a {len}-frame window"))?;
-                let run = graphs_by_len[gi]
-                    .1
-                    .borrow_mut()
-                    .run_slices(&[("codec_in", &chunk)]);
-                let chunk = run
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow!("the sound stage returned no output"))?;
-                stitch_window(
-                    &mut stitched,
-                    &chunk,
-                    frames,
-                    (p0, p1, a, b),
-                    ch_out,
-                    per_out,
-                );
+            // One length's graph at a time: built, run over every window of that
+            // length, and gone before the next length's is built.
+            for &len in &lengths {
+                let t = Stopwatch::start();
+                let mut graph = graphs::sound_graph(device, &sound, len, group.clone(), 0)?;
+                self.build_ms += t.ms();
+                for &(p0, p1, a, b) in &parts {
+                    if p1 - p0 != len {
+                        continue;
+                    }
+                    let chunk = codec_slice(&wave, frames, p0, p1, per_in);
+                    let run = graph.run_slices(&[("codec_in", &chunk)]);
+                    let chunk = run
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow!("the sound stage returned no output"))?;
+                    stitch_window(
+                        &mut stitched,
+                        &chunk,
+                        frames,
+                        (p0, p1, a, b),
+                        ch_out,
+                        per_out,
+                    );
+                }
             }
             wave = stitched;
+            // Every graph of this group went with its length, so no two groups can
+            // coexist. The pages go here too, before the next group asks for its own:
+            // macOS keeps a freed page in its zone until something asks for it, so
+            // without this the footprint would read the sum where the arenas are gone.
+            report::release_free();
         }
 
         let expected = frames * graphs::samples_per_frame();

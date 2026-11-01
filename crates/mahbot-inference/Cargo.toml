@@ -51,8 +51,8 @@ rlx-ir = { workspace = true }
 rlx-flow = { workspace = true }
 # `gpu` pulls in the wgpu backend.
 rlx-runtime = { workspace = true, features = ["gpu"] }
-# The backend's own arena planner (`buffer::plan_f32_uniform`), which sizes the
-# sound-graph cache's budget.
+# The wgpu backend itself: the device and adapter name, the shared weight pool's
+# scope and release, and the f16 cooperative-matmul admission the loader asks.
 rlx-wgpu = { workspace = true }
 anyhow = "1"
 # Report serialisation.

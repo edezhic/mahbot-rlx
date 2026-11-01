@@ -27,6 +27,7 @@ use rlx_runtime::{Device, Session};
 
 use crate::emit::{self, LoaderWeights, PairWeights};
 use crate::loader::{Head, Model, Pair};
+use crate::report::Stopwatch;
 
 // ── generic block: Qwen3 body and CLIP encoder are the same skeleton ──
 
@@ -3173,123 +3174,42 @@ fn synthesis_sound_group(
     .map_err(Into::into)
 }
 
-/// One compiled sound-half graph, shared between a cache and its users: `Rc`
-/// because a process synthesizes on one thread and a call holds several graphs at
-/// once (a part's first and carried windows), while `Runner::run` takes
-/// `&mut self`. The graph is read many times and rewritten never, and no borrow is
-/// held across a cache call.
-pub type SoundGraph = std::rc::Rc<std::cell::RefCell<Compiled>>;
-
-/// Device bytes a decoder cache may hold — an arena is resident for as long as its
-/// graph is, so parameters alone would not bound it. This holds one part's set with
-/// the graphs a new length brings; the ceiling that decides for real is `guard`'s,
-/// which reads the resident set.
-const SOUND_GRAPHS_BYTES: usize = 5 * 1024 * 1024 * 1024;
-
-/// What fixes a sound graph: the file it reads, its device, the frames it runs,
-/// its stage group and its K/V prefix. Two requests with the same key want the
-/// same weights in the same graph. For a decoder window `frames` is the span the
-/// graph reads — its core plus the left context — not the core alone.
-#[derive(PartialEq)]
-struct SoundKey {
-    path: std::path::PathBuf,
+/// One compiled sound-half graph: `frames` frames of `stages`, at the K/V `prefix`
+/// the front carries. The caller owns it, so it is given back as soon as the windows
+/// that run it are done: one length's before the next length's is built, and a
+/// group's before the next group is.
+pub fn sound_graph(
     device: rlx_runtime::Device,
+    model: &Arc<Model>,
     frames: usize,
     stages: std::ops::Range<usize>,
     prefix: usize,
-}
-
-/// What one cached graph holds: its parameter bytes as the model files give them,
-/// and those plus its planned arena.
-#[derive(Clone, Copy)]
-struct Held {
-    params: usize,
-    device: usize,
-}
-
-/// The decoder graphs one synthesis call needs, most recently used last. Owned by
-/// [`crate::synth::Synthesis`], so the graphs are released when that is, and the
-/// process holds one model pair's decoder, not every length it ever ran.
-#[derive(Default)]
-pub struct SoundGraphs {
-    entries: Vec<(SoundKey, SoundGraph, Held)>,
-}
-
-impl SoundGraphs {
-    /// What this cache holds, in the form the probes report and the budget reads:
-    /// `(graphs, parameters, device bytes)`. Parameters are the weight bytes the
-    /// graphs bind, read from the model files; the third figure adds each graph's
-    /// planned arena. A graph a caller still holds — one part's first and carried
-    /// windows during a call — stays resident after eviction, so it is the cache's
-    /// figure, not the process's.
-    #[must_use]
-    pub fn census(&self) -> (usize, usize, usize) {
-        self.entries
-            .iter()
-            .fold((0, 0, 0), |(n, params, device), (_, _, held)| {
-                (n + 1, params + held.params, device + held.device)
-            })
-    }
-
-    /// The graph for `frames` frames of `stages` at `prefix`, compiled and uploaded
-    /// on first use and reused after. A hit moves to the newest end, so the graphs
-    /// every request of a length reuses — a part's first and carried windows — are
-    /// the last to be evicted when another length arrives.
-    pub fn graph(
-        &mut self,
-        device: rlx_runtime::Device,
-        model: &Arc<Model>,
-        frames: usize,
-        stages: std::ops::Range<usize>,
-        prefix: usize,
-    ) -> Result<SoundGraph> {
-        let key = SoundKey {
-            path: model.path.clone(),
-            device,
-            frames,
-            stages,
-            prefix,
-        };
-        if let Some(i) = self.entries.iter().position(|(k, _, _)| *k == key) {
-            let hit = self.entries.remove(i);
-            let graph = hit.1.clone();
-            self.entries.push(hit);
-            return Ok(graph);
-        }
-        // Build first and trim after, so a failed build leaves the cache as it
-        // was. The transient is the whole cache plus this graph, which is one
-        // part's set plus one graph: a graph's arena is only known once it exists,
-        // so the trim below is the bound the budget can actually promise.
-        let built = synthesis_sound_group(model.clone(), frames, key.stages.clone(), prefix)?;
-        let params = built.params.values().map(|v| v.len() * 4).sum::<usize>()
-            + built
-                .typed_params
-                .iter()
-                .map(|(_, b, _)| b.len())
-                .sum::<usize>();
-        let graph = std::rc::Rc::new(std::cell::RefCell::new(Compiled::new(device, built)?));
-        let arena = rlx_wgpu::buffer::plan_f32_uniform(&graph.borrow().runner.graph, 16).arena_size;
-        self.entries.push((
-            key,
-            graph.clone(),
-            Held {
-                params,
-                device: params + arena,
-            },
-        ));
-        while self.entries.len() > 1 && self.census().2 > SOUND_GRAPHS_BYTES {
-            self.entries.remove(0);
-        }
-        Ok(graph)
-    }
+) -> Result<Compiled> {
+    Compiled::new(
+        device,
+        synthesis_sound_group(model.clone(), frames, stages, prefix)?,
+    )
 }
 
 /// A part's wave-transformer graphs: the first window at the part's own length and
-/// the full chunk every later window runs.
+/// the full chunk every later window runs, built when the window that needs it asks.
+/// The front's loop owns them, so the first window's graph is gone before the
+/// carried chunk's is built and the front never holds two arenas.
 pub struct FrontGraphs {
-    first: SoundGraph,
+    device: rlx_runtime::Device,
+    model: Arc<Model>,
+    stages: std::ops::Range<usize>,
+    /// The part's first window, at its own length; dropped once the carried chunk
+    /// replaces it.
+    first: Option<Compiled>,
     first_len: usize,
-    next: Option<SoundGraph>,
+    /// The length the carried chunk runs, `None` for a part of one chunk or less.
+    next_len: Option<usize>,
+    carried: Option<Compiled>,
+    /// What the graphs built here cost to compile and upload, the caller adding it
+    /// to its own build figure: only a build is timed, never the window that asks
+    /// for one already held.
+    built_ms: f64,
 }
 
 /// The window lengths a part of `frames` runs a graph for: its first window, and
@@ -3305,42 +3225,71 @@ fn front_lengths(frames: usize) -> (usize, Option<usize>) {
 }
 
 impl FrontGraphs {
-    /// Build (or fetch) the graphs a part of `frames` runs: its first window and,
-    /// when the part is longer than one chunk, the carried full chunk.
+    /// Build the first window's graph. The carried chunk's graph is built by the
+    /// first window past the first, once the first window's graph has gone.
     pub fn build(
-        cache: &mut SoundGraphs,
         device: rlx_runtime::Device,
         model: &Arc<Model>,
         frames: usize,
         stages: std::ops::Range<usize>,
     ) -> Result<Self> {
-        let (first, next) = front_lengths(frames);
+        let (first_len, next_len) = front_lengths(frames);
+        let t = Stopwatch::start();
+        let first = sound_graph(device, model, first_len, stages.clone(), 0)?;
         Ok(Self {
-            first: cache.graph(device, model, first, stages.clone(), 0)?,
-            first_len: first,
-            next: next
-                .map(|len| cache.graph(device, model, len, stages, FRONT_CARRY))
-                .transpose()?,
+            device,
+            model: Arc::clone(model),
+            first: Some(first),
+            first_len,
+            next_len,
+            carried: None,
+            stages,
+            built_ms: t.ms(),
         })
     }
 
     /// The graph the window at `a` runs and the length it runs over: the first
     /// window its own length, every later one the full chunk — zero-padded when it
     /// is the part's last, and the two always agree so a window's input is the
-    /// width its graph declares.
-    #[must_use]
-    pub fn pick(&self, a: usize) -> (&SoundGraph, usize) {
+    /// width its graph declares. A window the part does not have is refused by
+    /// name, not run on a graph that has gone.
+    pub fn pick(&mut self, a: usize) -> Result<(&mut Compiled, usize)> {
         if a == 0 {
-            (&self.first, self.first_len)
-        } else {
-            // A window at `a > 0` exists only for a part longer than one chunk, and
-            // `front_lengths` builds the carried graph for exactly those parts — the
-            // invariant its own unit test pins.
-            let next = self.next.as_ref().expect(
-                "a window past the first needs the carried chunk `front_lengths` builds for it",
-            );
-            (next, FRONT_WINDOW)
+            let Some(first) = self.first.as_mut() else {
+                bail!("window 0 runs the first window's graph, which has been released");
+            };
+            return Ok((first, self.first_len));
         }
+        if self.carried.is_none() {
+            // A part of one chunk or less has no window past the first, and
+            // `front_lengths` names the carried length for exactly the parts that do.
+            // The first window's graph goes before the carried chunk's is built, so
+            // the two arenas never coexist.
+            if let Some(len) = self.next_len {
+                self.first = None;
+                let t = Stopwatch::start();
+                self.carried = Some(sound_graph(
+                    self.device,
+                    &self.model,
+                    len,
+                    self.stages.clone(),
+                    FRONT_CARRY,
+                )?);
+                self.built_ms += t.ms();
+            }
+        }
+        let carried = self.carried.as_mut().ok_or_else(|| {
+            anyhow!("window {a} runs past the first, which a part of one chunk or less does not")
+        })?;
+        Ok((carried, FRONT_WINDOW))
+    }
+
+    /// Milliseconds the graphs built here took, the figure [`crate::synth::Synthesis`]
+    /// adds to what its call paid — a window that runs a graph already held adds
+    /// nothing.
+    #[must_use]
+    pub fn built_ms(&self) -> f64 {
+        self.built_ms
     }
 }
 
