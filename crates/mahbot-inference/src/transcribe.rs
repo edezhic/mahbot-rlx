@@ -57,8 +57,7 @@ pub const HANGOVER_HOPS: usize = 25;
 /// The frame counts a chunk's graphs are compiled at, in the encoder's own frames
 /// (eight per audio token). A chunk is padded up to the next rung and no further, so
 /// the graphs a transcription compiles come from this closed set and each rung's
-/// compile serves every chunk of the rung for the life of the process
-/// (the ladder's `rung` cache) — a chunk's exact length is not a shape.
+/// compile serves every chunk of the rung — a chunk's exact length is not a shape.
 ///
 /// The padding is silence past the end of the piece: it cannot move a word, and the
 /// measure that keeps it honest is the reading itself — every product call runs with it
@@ -587,12 +586,14 @@ impl Transcription {
 /// tagger resolved from somewhere else.
 ///
 /// What a call compiles is the **ladder's** rungs and nothing else: a chunk is padded
-/// up to one of [`FRAME_RUNGS`] and that rung's graphs are compiled once for the process
-/// (the ladder's `rung` cache), so a pass pays for the rungs no earlier call placed rather than a
-/// graph set per chunk length. The cache is bounded by construction — its key comes from
-/// the closed ladder and it holds at most the ladder's own number of rungs — and a rung the
-/// process has never placed is a compile, never a wrong answer.
-/// [`crate::release_process_memory`] gives all of it back.
+/// up to one of [`FRAME_RUNGS`] and that rung's graphs are compiled once for the group of
+/// chunks that share the frame count, so a pass pays one compile per distinct rung rather
+/// than a graph set per chunk length. The group is the whole call's, so a rung is built at
+/// most once per call and its graphs are given back when its last chunk has run: a call's
+/// residency is the rung it is running, not every rung it has visited. A later call
+/// rebuilds, which is the accepted price of returning the memory.
+/// [`crate::release_process_memory`] gives back the rest: the pair's decode graph, the mel
+/// graphs and the caches the weights are read through.
 pub struct Transcriber {
     pair: Arc<Pair>,
     tokenizer: Tokenizer,
@@ -725,10 +726,8 @@ impl Transcriber {
 
         // The chunks grouped by the rung their graphs are compiled at, so a file whose
         // chunks share a rung — most of them, since a full piece is always the same
-        // length — visits that rung's graphs once. A rung is compiled the first time
-        // any call asks for it and kept process-wide (the ladder's `rung` cache): the call pays
-        // only the rungs no earlier call placed, so the build line is a ladder, not a
-        // per-chunk cost.
+        // length — compiles that rung once and gives it back after its last chunk. The
+        // group is the whole call's, so a rung is built at most once per call.
         let mut shapes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (index, chunk) in chunk_list.iter().enumerate() {
             shapes.entry(chunk_frames(*chunk)?).or_default().push(index);
@@ -742,7 +741,7 @@ impl Transcriber {
         // mistime the text.
         let mut readings: Vec<(usize, Option<String>)> = Vec::with_capacity(chunk_list.len());
         for (frames, indexes) in &shapes {
-            let (mut clip, _) = listen::Clip::rung(&self.pair, &self.tokenizer, *frames)
+            let mut clip = listen::Clip::rung(&self.pair, &self.tokenizer, *frames)
                 .with_context(|| format!("building the {frames}-frame recognition graphs"))?;
             for &index in indexes {
                 let chunk = chunk_list[index];
@@ -777,8 +776,12 @@ impl Transcriber {
                 };
                 readings.push((index, answer));
             }
-            // The clip is dropped here, at the end of its rung: a rung's graphs stay
-            // resident in the ladder's cache, and this handle is only the walk.
+            // The rung's last chunk has run. The clip owns the rung, so letting it go here
+            // hands the rung's graphs and arenas back before the next rung is built: the
+            // call's residency is the rung it is running, not every rung it has visited.
+            // Every chunk of a frame count is in this one group, so nothing is rebuilt
+            // within the call; a later call rebuilds, and that is the price of the memory.
+            drop(clip);
         }
         let answers = readings_by_chunk(chunk_list.len(), readings);
 

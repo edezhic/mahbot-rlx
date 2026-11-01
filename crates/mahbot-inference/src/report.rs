@@ -284,23 +284,21 @@ impl Basis {
                 "Memory is the process's physical footprint as the platform accounts for \
                  it (`phys_footprint`), which is the only reading that sees memory allocated for \
                  the GPU: the resident set counts different things and is not comparable. \
-                 Resting is taken once the cold call has loaded and built what it needs and \
-                 before the warm call; peak is the process's lifetime maximum."
+                 Resting is taken once the cold call has returned and before the warm \
+                 call; peak is the process's lifetime maximum."
             }
             Self::Resident => {
                 "Memory is the process's resident set, because this platform supplies no \
                  physical-footprint reading: resting is the set at the moment the cold call has \
-                 loaded and built what it needs and before the warm call, and peak is the \
-                 kernel's lifetime maximum of the same set. The resident set counts a different \
-                 thing from the footprint, so these figures are not comparable with one taken \
-                 where the platform supplies it."
+                 returned and before the warm call, and peak is the kernel's lifetime maximum of \
+                 the same set. The resident set counts a different thing from the footprint, so \
+                 these figures are not comparable with one taken where the platform supplies it."
             }
             Self::Mixed => {
                 "Memory is the process's physical footprint on the rows the platform supplied \
                  one, and the resident set on the rows it did not: the two count different things \
                  and are not comparable with each other. Resting is taken once the cold call has \
-                 loaded and built what it needs and before the warm call; peak is the process's \
-                 lifetime maximum."
+                 returned and before the warm call; peak is the process's lifetime maximum."
             }
         }
     }

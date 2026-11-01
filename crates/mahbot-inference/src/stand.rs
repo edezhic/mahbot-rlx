@@ -14,9 +14,9 @@
 //!
 //! Every row carries four numbers: cold time (the process starts with no models
 //! loaded and the call loads them), warm time (the models already resident),
-//! resting memory (after the cold call, with the models loaded and the graphs
-//! compiled) and peak memory (the highest the process reaches). Spread is not
-//! recorded; diagnostics go to the console and never enter the file.
+//! resting memory (after the cold call, with what it keeps still resident) and peak
+//! memory (the highest the process reaches). Spread is not recorded; diagnostics go
+//! to the console and never enter the file.
 //!
 //! `mahbot-inference` with no arguments is the complete run: it takes the heavy
 //! run's lock, spawns one child per row and writes `STAND.md`. `mahbot-inference

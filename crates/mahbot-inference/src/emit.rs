@@ -26,7 +26,7 @@
 //! parameter's size and records where the bytes are — the model file, a fused blob or a
 //! host copy this process keeps — and `graphs::Runner::compile` binds that at session
 //! time. A transcription compiles one graph set per rung of its closed ladder — six at most
-//! for the process, never one per chunk length — and every set binds the same weights, which
+//! for a call, never one per chunk length — and every set binds the same weights, which
 //! is what keeps a second shape's build from copying the body out of the file again, and a
 //! write the device already holds from reading it at all.
 //!

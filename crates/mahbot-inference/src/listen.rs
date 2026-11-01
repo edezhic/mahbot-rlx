@@ -106,8 +106,9 @@ pub const DECODE_CACHE_BUCKET: usize = 128;
 /// count and the batch, so every clip that reads the same shape runs the same compiled
 /// graph ([`mel_graph`]). A transcription cuts its chunks onto a closed ladder of frame
 /// counts ([`crate::transcribe::FRAME_RUNGS`]), so the one-window mel graphs a process
-/// compiles are that ladder's — one each, however many chunks the pass reads — and the
-/// ear's pair adds one more, at its own batch.
+/// compiles are that ladder's — one each, however many chunks the pass reads, and shared
+/// by every call rather than recompiled with the rung — and the ear's pair adds one more,
+/// at its own batch.
 pub(crate) struct Front {
     mel: Arc<Mutex<Compiled>>,
     encoder: Arc<Mutex<Compiled>>,
@@ -123,8 +124,8 @@ pub(crate) struct Front {
 
 /// The mel graphs a process keeps, keyed by `(frames, bins, batch)`: a small LRU, so the
 /// ear's two (its window and its pair) stay warm while a transcription walks the rungs of
-/// [`crate::transcribe::FRAME_RUNGS`], whose six are more than this holds — a rung it comes
-/// back to is recompiled. An evicted entry is a recompile, never a wrong answer.
+/// [`crate::transcribe::FRAME_RUNGS`], whose six are more than this holds — a mel graph it
+/// comes back to is recompiled. An evicted entry is a recompile, never a wrong answer.
 const MEL_GRAPH_ENTRIES: usize = 4;
 
 /// The process's mel graphs and their least-recently-used order.
@@ -144,7 +145,7 @@ fn mel_graphs() -> &'static Mutex<MelGraphs> {
 ///
 /// Keyed by the caller's own audio shape, so the cache could otherwise collect one graph
 /// per length a long-lived process is handed. It is bounded instead ([`MEL_GRAPH_ENTRIES`])
-/// and cleared with the ladder ([`release_rungs`]).
+/// and cleared with the decode graph ([`clear_graph_caches`]).
 fn mel_graph(frames: usize, bins: usize, batch: usize) -> Result<Arc<Mutex<Compiled>>> {
     let batch = batch.max(1);
     let mut guard = mel_graphs().lock().unwrap_or_else(|e| e.into_inner());
@@ -264,20 +265,19 @@ impl Front {
     }
 }
 
-/// One frame count of the transcription ladder, compiled once for the process: the front
-/// end and the prompt prefill, over the pair's one shared decode graph. A transcription cuts
-/// its chunks onto the closed ladder of [`crate::transcribe::FRAME_RUNGS`], so the ladder's
-/// rungs are the only frame counts it ever compiles — and each is compiled once, not once
-/// per chunk.
-pub(crate) struct Rung {
-    /// The pair these graphs were built over. A cached rung is served only to a caller
-    /// holding this same pair: two models whose graphs share tensor names would
-    /// otherwise run one model's weights on the other's audio.
+/// One frame count of the transcription ladder: the front end and the prompt prefill, over
+/// the pair's one shared decode graph. A transcription cuts its chunks onto the closed
+/// ladder of [`crate::transcribe::FRAME_RUNGS`], so the ladder's rungs are the only frame
+/// counts it ever compiles — each compiled once, held for the chunks that need it, and
+/// dropped with the last of them ([`Clip::rung`]) instead of for the life of the process.
+struct Rung {
+    /// The pair these graphs were built over, and the pair a prefill compiled for a later
+    /// chunk of the same rung is built over too.
     pair: Arc<Pair>,
     front: Front,
     /// The prompt prefill, one per prompt length: the prompt carries three declared
     /// language rows or not at all, and the two lengths are two graphs. A variant the
-    /// process never asks for is never compiled.
+    /// rung's chunks never ask for is never compiled.
     prefills: Mutex<HashMap<usize, Arc<Mutex<Compiled>>>>,
     /// The decode graph: one per pair, shared by every rung of the ladder, because the
     /// capacity is one value for all of them. A step is weight-read bound, so the
@@ -294,7 +294,7 @@ pub(crate) struct Rung {
 /// ([`crate::transcribe::CHUNK_TOKENS_PER_S`] over the 7.5 s a cut can leave = 76).
 /// 190 at the worst, rounded up to the next multiple of eight. A walk that outgrows it grows
 /// its own graph, as any clip does.
-pub(crate) const RUNG_CAPACITY: usize = 192;
+const RUNG_CAPACITY: usize = 192;
 
 impl Rung {
     fn build(pair: &Arc<Pair>, frames: usize) -> Result<Self> {
@@ -307,9 +307,9 @@ impl Rung {
         })
     }
 
-    /// This rung's prefill for `prompt_rows`, compiled the first time the ladder is asked
-    /// for it and kept for the process. Built over this rung's own pair: a rung is served
-    /// only to a caller holding it.
+    /// This rung's prefill for `prompt_rows`, compiled the first time one of the rung's
+    /// chunks asks for that length and kept for the rung's life. Built over this rung's
+    /// own pair, so every graph of one rung is one pair's.
     fn prefill(&self, prompt_rows: usize) -> Result<Arc<Mutex<Compiled>>> {
         let mut guard = self.prefills.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(prefill) = guard.get(&prompt_rows) {
@@ -321,22 +321,10 @@ impl Rung {
     }
 }
 
-/// The rungs kept resident: the ladder's own size, so a transcription never evicts a rung
-/// it is about to ask for again. A process that walks a longer ladder evicts its least
-/// recently used rung, which is a recompile, never a wrong answer.
-const RUNG_ENTRIES: usize = crate::transcribe::FRAME_RUNGS.len();
-
-type RungCache = (HashMap<usize, Arc<Rung>>, std::collections::VecDeque<usize>);
-
-fn rung_cache() -> &'static Mutex<RungCache> {
-    static RUNGS: OnceLock<Mutex<RungCache>> = OnceLock::new();
-    RUNGS.get_or_init(|| Mutex::new((HashMap::new(), std::collections::VecDeque::new())))
-}
-
 /// The one decode graph of a pair, built on first ask: every rung of the ladder and every
-/// chunk of a rung runs the same `[RUNG_CAPACITY]`-deep body. Held beside the ladder
-/// rather than inside it because the ladder's entries come and go with the frame counts,
-/// and this graph does not.
+/// chunk of a rung runs the same `[RUNG_CAPACITY]`-deep body. Held beside the clips rather
+/// than inside one because the rungs come and go with the chunk groups, and this graph does
+/// not: it is the pair's, not a rung's.
 fn decode_slot() -> &'static Mutex<Option<(Arc<Pair>, Arc<Shared>)>> {
     static DECODE: OnceLock<Mutex<Option<(Arc<Pair>, Arc<Shared>)>>> = OnceLock::new();
     DECODE.get_or_init(|| Mutex::new(None))
@@ -356,52 +344,15 @@ fn shared_decode(pair: &Arc<Pair>) -> Result<Arc<Shared>> {
     Ok(decode)
 }
 
-/// Empty the ladder, the decode graph that outlives its entries, and the process's mel
-/// graphs: what [`crate::release_process_memory`] asks for. A clip still holding a rung's
-/// graphs keeps them alive; nothing else does.
-pub(crate) fn release_rungs() {
-    let mut guard = rung_cache().lock().unwrap_or_else(|e| e.into_inner());
-    guard.0.clear();
-    guard.1.clear();
-    drop(guard);
+/// Empty the decode graph that outlives the rungs and the process's mel graphs: what
+/// [`crate::release_process_memory`] asks for. A clip still holding either keeps it alive;
+/// nothing else does. A rung's own graphs are not here to clear — they belong to the clip
+/// that built them and go when it does.
+pub(crate) fn clear_graph_caches() {
     *decode_slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
     let mut mel = mel_graphs().lock().unwrap_or_else(|e| e.into_inner());
     mel.0.clear();
     mel.1.clear();
-}
-
-/// The rung for `frames` of `pair`, compiled by this call when no earlier one placed it.
-/// The second value is the build this call paid, `None` for a rung already resident.
-pub(crate) fn rung(pair: &Arc<Pair>, frames: usize) -> Result<(Arc<Rung>, Option<f64>)> {
-    let mut guard = rung_cache().lock().unwrap_or_else(|e| e.into_inner());
-    let resident = guard
-        .0
-        .get(&frames)
-        .filter(|rung| Arc::ptr_eq(&rung.pair, pair))
-        .map(Arc::clone);
-    if let Some(rung) = resident {
-        if let Some(at) = guard.1.iter().position(|f| *f == frames) {
-            guard.1.remove(at);
-        }
-        guard.1.push_back(frames);
-        return Ok((rung, None));
-    }
-    let t = crate::report::Stopwatch::start();
-    let built = Arc::new(Rung::build(pair, frames)?);
-    let build_ms = t.ms();
-    // The pair is part of the key, so an entry another pair placed is evicted, not served.
-    if guard.0.contains_key(&frames) {
-        guard.1.retain(|f| *f != frames);
-    }
-    while guard.0.len() >= RUNG_ENTRIES {
-        let Some(oldest) = guard.1.pop_front() else {
-            break;
-        };
-        guard.0.remove(&oldest);
-    }
-    guard.0.insert(frames, Arc::clone(&built));
-    guard.1.push_back(frames);
-    Ok((built, Some(build_ms)))
 }
 
 /// The same front end cut where a group pass needs it: the conv front runs one
@@ -756,13 +707,13 @@ impl Shared {
 /// One chunk's compiled recognition path, built for a frame count and run per chunk: the
 /// mel front end, the encoder, the projector, the prompt prefill and the one-row decode.
 ///
-/// Three residencies, one per caller. A **ladder chunk** ([`Clip::rung`]) borrows the
-/// process-wide graphs of its frame count, so a pass compiles each rung once. A **caller
-/// with several chunks of one length** ([`Clip::build`]) keeps its front end and its
-/// decode graph and rebuilds only the prefill between chunks, because holding all three
-/// would keep three compiled graphs whose uploads carry the body. The **one-shot** clip
-/// ([`Clip::once`]) drops the front end as soon as it has run, so the front end is never
-/// resident beside the prefill.
+/// Three residencies, one per caller. A **ladder chunk** ([`Clip::rung`]) builds the rung of
+/// its frame count and holds it, so a pass compiles each rung once and the rung is given back
+/// when the group of chunks that share it has run. A **caller with several chunks of one
+/// length** ([`Clip::build`]) keeps its front end and its decode graph and rebuilds only the
+/// prefill between chunks, because holding all three would keep three compiled graphs whose
+/// uploads carry the body. The **one-shot** clip ([`Clip::once`]) drops the front end as soon
+/// as it has run, so the front end is never resident beside the prefill.
 pub struct Clip<'a> {
     pair: Arc<Pair>,
     tokenizer: &'a Tokenizer,
@@ -771,14 +722,14 @@ pub struct Clip<'a> {
     /// its single run, so the front end's graphs are never resident beside the
     /// prefill.
     front: Option<Front>,
-    /// The rung this clip runs on, when it is a ladder chunk: its front end and its
-    /// prefills are the process-wide ones ([`rung`]), so this clip builds neither and
-    /// leaves `front` empty. `decode` starts as the rung's own graph, which this clip may
-    /// replace with a grown one. A clip of its own leaves this `None`.
-    shared: Option<Arc<Rung>>,
-    /// The decode graph this clip runs. On a rung that is the rung's own, cloned here at
+    /// The rung this clip runs on, when it is a ladder chunk: the rung's front end and
+    /// prefills are the ones the clip runs, so it builds neither and leaves `front` empty.
+    /// The clip owns the rung, so the rung's graphs go with it. A clip of its own leaves
+    /// this `None`.
+    shared: Option<Rung>,
+    /// The decode graph this clip runs. On a rung it is the pair's, cloned here at
     /// construction; a walk that outgrows the compiled capacity grows a graph of its own
-    /// and replaces this handle, leaving the rung's entry as it was. On a clip of its own
+    /// and replaces this handle, leaving the pair's as it was. On a clip of its own
     /// it is built by the first `run` that needs it.
     decode: Option<Arc<Shared>>,
     cfg: Config,
@@ -834,35 +785,34 @@ impl<'a> Clip<'a> {
         Self::new(pair, tokenizer, frames, false)
     }
 
-    /// A chunk of a **rung** of the transcription ladder: every graph is the process-wide
-    /// one for that frame count ([`rung`]), so the call compiles nothing a previous chunk
-    /// of the rung compiled. The second value is the build this call paid, `None` when the
-    /// rung was already resident.
-    pub(crate) fn rung(
-        pair: &Arc<Pair>,
-        tokenizer: &'a Tokenizer,
-        frames: usize,
-    ) -> Result<(Self, Option<f64>)> {
-        let (rung, build_ms) = rung(pair, frames)?;
+    /// A chunk of a **rung** of the transcription ladder: the rung is built by this call and
+    /// the clip owns it, so the front end, the prefills and their arenas are given back when
+    /// the clip is dropped after the group's last chunk. The decode graph and the mel graph
+    /// are not the rung's — the pair and the process keep those — so they outlive the drop.
+    pub(crate) fn rung(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
+        let t = report::Stopwatch::start();
+        let rung = Rung::build(pair, frames)?;
+        let owed_ms = t.ms();
+        let decode = Arc::clone(&rung.decode);
+        let tokens = rung.tokens;
         let cfg = pair.body.config().clone();
         let hkv = cfg.kv_heads * cfg.head_dim;
-        let clip = Self {
+        Ok(Self {
             pair: Arc::clone(pair),
             tokenizer,
             front: None,
-            decode: Some(Arc::clone(&rung.decode)),
-            shared: Some(Arc::clone(&rung)),
+            decode: Some(decode),
+            shared: Some(rung),
             cfg,
             frames,
-            tokens: rung.tokens,
-            prompt_rows: ASR_HEAD_IDS.len() + ASR_TEXT_IDS.len() + rung.tokens + ASR_TAIL_IDS.len(),
+            tokens,
+            prompt_rows: ASR_HEAD_IDS.len() + ASR_TEXT_IDS.len() + tokens + ASR_TAIL_IDS.len(),
             hkv,
             capacity: RUNG_CAPACITY,
             reuse_front: true,
             max_new: ASR_MAX_NEW,
-            owed_ms: 0.0,
-        };
-        Ok((clip, build_ms))
+            owed_ms,
+        })
     }
 
     fn new(
@@ -1124,9 +1074,9 @@ impl<'a> Clip<'a> {
                 let t = report::Stopwatch::start();
                 let grown = decode_graph(&self.pair, cap)?;
                 build_ms += t.ms();
-                // A grown capacity is this clip's own: a rung keeps the one graph every
-                // chunk of its ladder shares. The walk lock is still held, so nothing else
-                // is inside the graph this replaces.
+                // A grown capacity is this clip's own: a rung keeps the pair's one graph,
+                // which its other chunks still run. The walk lock is still held, so nothing
+                // else is inside the graph this replaces.
                 decode = Shared::new(grown);
                 if !decode
                     .graph()
