@@ -6,18 +6,19 @@
 //! by the main stand run, never by the corpus run, never by the routine test
 //! command, and with no place in any record file.
 //!
-//! Four of them, each `#[ignore]`d:
+//! Five of them, each `#[ignore]`d:
 //!
 //! * instrumental music yields no transcribed text;
 //! * a paste onset at a seam lands within one detector hop, and whole-input
 //!   conditioning is time-preserving;
 //! * the pinned reference clip's transcript and digest, reported as a witness;
+//! * the long recordings are read as what was said, through both reading paths;
 //! * the synthesis round trip — that the recogniser hears words in the rendered
 //!   waveform.
 //!
 //! Run with `MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… MAHBOT_ASR_MUSIC=… \
-//! cargo test -p mahbot-inference --release --test product_checks -- --ignored
-//! --nocapture`. A test whose input is absent prints why and returns.
+//! MAHBOT_FAPH_CORPUS=… cargo test -p mahbot-inference --release --test product_checks
+//! -- --ignored --nocapture`. A test whose input is absent prints why and returns.
 
 use std::sync::Arc;
 
@@ -25,16 +26,18 @@ use mahbot_inference::ced::{CED_MODEL, Tagger};
 use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::synth::{SAMPLE_RATE, Synthesis};
 use mahbot_inference::transcribe::{self, Transcriber};
-use mahbot_inference::{host, listen, music, reference, report, tokenizer::Tokenizer, vad};
+use mahbot_inference::{
+    corpus, host, listen, music, reference, report, stand, tokenizer::Tokenizer, vad,
+};
 
 mod support;
 
 /// The seed the round trip renders `support::TTS_TEXT` with.
 const SYNTH_SEED: u64 = 12_345;
 
-/// The render the round trip reads back: its first twelve seconds, which the
-/// one-shot recogniser carries as one prompt — the render itself is as long as the
-/// text, and `speak_readback` is where the rest of it is read.
+/// The render the round trip reads back: its first twelve seconds. The render
+/// itself is as long as the text, and `speak_readback` is where the rest of it is
+/// read.
 const ROUND_TRIP_SECONDS: usize = 12;
 
 /// One role's pair files through the model directory, or the reason this check
@@ -308,15 +311,174 @@ fn the_pinned_clip_reads_as_its_witness() {
     );
 }
 
+/// What the engine says about long real audio, and the audio it says it about: a corpus
+/// recording, the first `seconds` of it, and the text the one-shot path returned — read once
+/// against the recording and confirmed to follow its speech, so a regression fails here
+/// because the words changed. The second carries the recogniser's own mishearings, pinned as
+/// it said them.
+const LONG_READINGS: &[(&str, usize, &str)] = &[
+    (
+        stand::RECOGNITION_RECORDING,
+        30,
+        "dedicação e introdução de amor de perdição Esta é uma gravação de Revox. Todas as \
+         gravações de Revox estão em domínio público. para mais informações ou para ser um \
+         voluntário, por favor visite divulgs gravado por Sandra Luna, Amor Predição de Camilo \
+         Castelo Branco, dedicação e introdução ao ilustre simão",
+    ),
+    (
+        "speech/us-gov/speech-us-gov-0130.wav",
+        35,
+        "District court judge, confined by the law, to order changes to violations that are. \
+         So let me just pull the the start of my slide. This is the beginning. Your response is \
+         yes. You would want to afford to enjoy the luxury, yes, and no. No, we're of course \
+         just. Yeah, I have control now. So do you? I do. Hendrix. Yes, ma'am. Why? Yes, \
+         because people have ears on their ears.",
+    ),
+];
+
+/// **The long recordings are read as what was said, through both reading paths.** The
+/// stand's typical thirty seconds and the thirty-five seconds of a second real recording,
+/// each through the one-shot path and through the product's, on the same audio.
+///
+/// The defect this holds against is one pass over the whole input: thirty seconds in one
+/// prompt came back as `vitória, emoção, emoção, …`, one phrase twenty-five times and none
+/// of the recording's words. So the one-shot reading is the pinned text, and neither path
+/// says a phrase more often than that text does — repetition past the recording's own is
+/// the invented words this check exists for.
+#[test]
+#[ignore = "needs the models, the tagger and the pinned corpus; run by hand"]
+fn long_recordings_are_read_as_what_was_said() {
+    let Some(dir) = corpus_dir() else {
+        return;
+    };
+    let Some((pair, tagger)) = open() else {
+        return;
+    };
+    let tokenizer = Tokenizer::from_model(&pair.body)
+        .unwrap_or_else(|error| panic!("the recognition tokenizer: {error:#}"));
+    let mut transcriber = Transcriber::open(Arc::clone(&pair), tagger, support::ceiling_mib())
+        .expect("the transcriber opens");
+    for &(name, seconds, expected) in LONG_READINGS {
+        let path = dir.join(name);
+        if !path.is_file() {
+            println!("skip: {name} is not on this machine");
+            continue;
+        }
+        // A copy that is not the pinned one fails here, in the pin's own words, rather than
+        // later as a diff in the expected text.
+        corpus::verify_file(&path, name).unwrap_or_else(|error| panic!("{error:#}"));
+        let audio = host::wav_mono_16k(
+            &path.display().to_string(),
+            0,
+            seconds * listen::SAMPLE_RATE as usize,
+        )
+        .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+        let read = listen::recognise(&pair, &tokenizer, audio.clone())
+            .unwrap_or_else(|error| panic!("the one-shot reading of {name}: {error:#}"));
+        println!(
+            "one-shot {name} seconds={:.2} frames={} prompt={} generated={} truncated={} \
+             text={:?}",
+            audio.len() as f64 / f64::from(listen::SAMPLE_RATE),
+            read.frames,
+            read.prompt_rows,
+            read.generated.len(),
+            read.truncated,
+            read.text
+        );
+        let product = transcriber
+            .transcribe(&audio, listen::SAMPLE_RATE)
+            .unwrap_or_else(|error| panic!("the product's reading of {name}: {error:#}"));
+        let heard: String = product
+            .regions
+            .iter()
+            .filter_map(|region| region.text.as_deref())
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "product {name} regions={} text={heard:?}",
+            product.regions.len()
+        );
+        assert!(
+            !read.truncated,
+            "the one-shot reading of {name} ran out of its budget"
+        );
+        assert!(
+            !reference::words(&heard).is_empty(),
+            "the product path read nothing at all of {name}"
+        );
+        assert_eq!(
+            reference::words(&read.text),
+            reference::words(expected),
+            "the one-shot reading of {name} is no longer what the recording says"
+        );
+        // A phrase a reading says more often than the recording's own text is invented,
+        // whichever path produced it: the pinned text is the count every reading is held to.
+        for (path, text) in [
+            ("one-shot", read.text.as_str()),
+            ("product", heard.as_str()),
+        ] {
+            let Some((phrase, said, recorded)) = worst_repeat(text, expected) else {
+                println!("repeat {name} {path}: no phrase said twice");
+                continue;
+            };
+            println!("repeat {name} {path} {phrase:?} ×{said}, the recording ×{recorded}");
+            assert!(
+                said <= recorded,
+                "the {path} path on {name} says {phrase:?} ×{said}; the recording says it \
+                 ×{recorded}"
+            );
+        }
+    }
+}
+
+/// The phrase `text` repeats most often beyond `recording`'s own count of it, with both
+/// counts: the invented repetition, whichever path produced it. Only a phrase the reading
+/// says more than once is a repeat — one it says once is a word the recording spells
+/// differently, not a repetition — so a reading with none of those is `None`. Words are
+/// compared the way the pin compares them, over the guards' own
+/// [`transcribe::REPEAT_GRAM`].
+fn worst_repeat(text: &str, recording: &str) -> Option<(String, usize, usize)> {
+    let words = reference::words(text);
+    let said = reference::words(recording);
+    let count = |haystack: &[String], phrase: &[String]| {
+        haystack
+            .windows(transcribe::REPEAT_GRAM)
+            .filter(|other| *other == phrase)
+            .count()
+    };
+    words
+        .windows(transcribe::REPEAT_GRAM)
+        .map(|phrase| {
+            (
+                phrase.join(" "),
+                count(&words, phrase),
+                count(&said, phrase),
+            )
+        })
+        .filter(|&(_, heard, _)| heard > 1)
+        .max_by_key(|&(_, heard, spoken)| heard.saturating_sub(spoken))
+}
+
+/// The corpus directory, or the reason the check cannot run.
+fn corpus_dir() -> Option<std::path::PathBuf> {
+    match corpus::dir() {
+        Ok(dir) => Some(dir),
+        Err(error) => {
+            println!("skip: {error:#}");
+            None
+        }
+    }
+}
+
 /// **The synthesis round trip:** the rendered waveform's opening, resampled 24 kHz →
 /// 16 kHz and read back through the recogniser on its raw samples, says the words the
 /// render was asked to speak. The main stand run neither performs this nor fails on
 /// it.
 ///
-/// The check reads the render's first [`ROUND_TRIP_SECONDS`] rather than all of it:
-/// the one-shot path carries the whole input as one prompt, a render is as long as
-/// its text, and what the recogniser makes of the rest of a long render is
-/// `speak_readback`'s reading — this check is the waveform still being speech.
+/// The check reads the render's first [`ROUND_TRIP_SECONDS`] rather than all of it: a
+/// render is as long as its text, and what the recogniser makes of the rest of a long
+/// render is `speak_readback`'s reading — this check is the waveform still being
+/// speech.
 ///
 /// It is the **raw** waveform's reading: the check does not apply the recognition
 /// side's one-shot conditioning, so a quiet render is heard as it is rather than at

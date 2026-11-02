@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use mahbot_inference::graphs;
 use mahbot_inference::loader::{self, Pair, Role};
-use mahbot_inference::reference::LISTEN_PROMPT_ROWS;
+use mahbot_inference::reference::LISTEN_PIECE_PROMPT_ROWS;
 use rlx_flow::BuiltModel;
 use rlx_ir::Op;
 
@@ -360,7 +360,7 @@ fn a_predictor_frame_is_one_fence_and_one_submission_per_encode_chunk_with_model
     );
 }
 
-/// The 234-row prompt graph is the graph the model-free row-tile guard is about:
+/// The prompt graph is the graph the model-free row-tile guard is about:
 /// every packed multiply contracts all prompt rows at once, so the dispatch's
 /// tile count is the prompt's, not a chunk's.
 #[test]
@@ -369,8 +369,8 @@ fn the_recognition_prompt_graph_contracts_all_its_rows_with_models() {
         return;
     };
     let graph = graph_of(
-        graphs::body_new_rows_head_chain(pair.body.clone(), LISTEN_PROMPT_ROWS, 0, true)
-            .expect("build the 234-row prompt graph"),
+        graphs::body_new_rows_head_chain(pair.body.clone(), LISTEN_PIECE_PROMPT_ROWS, 0, true)
+            .expect("build a piece's prompt graph"),
     );
     let packed: Vec<_> = graph
         .nodes()
@@ -385,10 +385,10 @@ fn the_recognition_prompt_graph_contracts_all_its_rows_with_models() {
     for node in packed {
         let rows = graph.node(node.inputs[0]).shape.dims()[0].unwrap_static();
         assert!(
-            rows == LISTEN_PROMPT_ROWS || rows == 1,
+            rows == LISTEN_PIECE_PROMPT_ROWS || rows == 1,
             "a packed multiply contracts either the whole prompt or the head's last row"
         );
-        over_prompt += usize::from(rows == LISTEN_PROMPT_ROWS);
+        over_prompt += usize::from(rows == LISTEN_PIECE_PROMPT_ROWS);
     }
     assert!(
         over_prompt > 0,
@@ -401,14 +401,14 @@ fn the_recognition_prompt_graph_contracts_all_its_rows_with_models() {
 ///
 /// The count comes from the backend's own
 /// [`rlx_wgpu::gguf_gpu::grouped_base_geometry`] rather than a literal here, so
-/// the assertion moves only with the kernel's geometry: the 234-row prompt over
-/// the lowerer's eight-row tiles is 30 dispatches' worth of row groups.
+/// the assertion moves only with the kernel's geometry: a piece's 95-row prompt
+/// over the lowerer's eight-row tiles is 12 dispatches' worth of row groups.
 #[test]
-fn the_recognition_prompt_is_thirty_grouped_row_tiles() {
-    let (_, rows) = rlx_wgpu::gguf_gpu::grouped_base_geometry(LISTEN_PROMPT_ROWS, 64);
+fn the_recognition_prompt_is_twelve_grouped_row_tiles() {
+    let (_, rows) = rlx_wgpu::gguf_gpu::grouped_base_geometry(LISTEN_PIECE_PROMPT_ROWS, 64);
     assert_eq!(
-        rows, 30,
-        "234 prompt rows over the lowerer's eight-row tiles"
+        rows, 12,
+        "95 prompt rows over the lowerer's eight-row tiles"
     );
 }
 

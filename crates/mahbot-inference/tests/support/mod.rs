@@ -242,8 +242,7 @@ pub fn ceiling_mib() -> u64 {
     mahbot_inference::guard::max_rss_mib().expect("the resident-set bound")
 }
 
-/// What the single-shot recognition walk answered, for a harness that prices a
-/// decode change.
+/// One recognition reading, for a harness that prices a decode change.
 pub struct Answer {
     pub generated: Vec<usize>,
     pub next: usize,
@@ -256,7 +255,7 @@ pub struct Answer {
     pub build_ms: f64,
 }
 
-/// One recognition walk over `path`: 16 kHz mono, conditioned the way the one-shot
+/// One recognition reading over `path`: 16 kHz mono, conditioned the way the one-shot
 /// path takes it. The caller opened the pair and resolved the path, so a failure
 /// here is a broken model or device, not an absent input: it panics, because a
 /// check that cannot run must not report a pass.

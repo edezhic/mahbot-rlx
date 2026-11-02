@@ -51,11 +51,12 @@ use crate::wake;
 /// Marks a child of the complete run: it measures the one row its argument names.
 const ROW_CHILD: &str = "MAHBOT_STAND_ROW";
 
-/// The pinned recording the three recognition messages are cut from: a five-minute
-/// speech file of the corpus listing. Named rather than picked out of the listing by
-/// position, so a reordering of the bench's table cannot re-point these rows at other
-/// material; [`corpus::verify_file`] holds it to its own pin.
-const RECOGNITION_RECORDING: &str = "speech/librivox/speech-librivox-0027.wav";
+/// The pinned recording the three recognition messages are cut from — and the first of the
+/// two long recordings the product checks read whole: a five-minute speech file of the corpus
+/// listing. Named rather than picked out of the listing by position, so a reordering of the
+/// bench's table cannot re-point these rows at other material; `corpus::verify_file` holds it
+/// to its own pin.
+pub const RECOGNITION_RECORDING: &str = "speech/librivox/speech-librivox-0027.wav";
 /// The short and typical voice messages, in samples at 16 kHz.
 const SHORT_SAMPLES: usize = 10 * 16_000;
 const TYPICAL_SAMPLES: usize = 30 * 16_000;

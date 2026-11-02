@@ -17,10 +17,15 @@
 use sha2::{Digest, Sha256};
 
 /// Recognition: the clip is the recorded 17.46 s Russian reference, 1 746 mel
-/// frames → a 234-row prompt (3 head + 6 text + 219 audio + 6 tail).
+/// frames, read as the three pieces the cut leaves it — three prompts of 95 rows
+/// rather than one of 234 — and 84 generated tokens across them.
 pub const LISTEN_FRAMES: usize = 1_746;
-pub const LISTEN_PROMPT_ROWS: usize = 234;
-pub const LISTEN_GENERATED: usize = 65;
+pub const LISTEN_PROMPT_ROWS: usize = 285;
+pub const LISTEN_GENERATED: usize = 84;
+/// The prompt rows one piece of that reading is compiled at: a 640-frame rung, 80
+/// audio rows and the 15 text ones. The shape a prompt graph is built at, which is
+/// what [`LISTEN_PROMPT_ROWS`] — the reading's total — is not.
+pub const LISTEN_PIECE_PROMPT_ROWS: usize = 95;
 // The pinned digests in this file are a **witness, not a gate** (owner-directed):
 // a hash that moves because the real outputs moved by a rounding is recorded and
 // reported — with what moved and by how much — and the run carries on, as long
@@ -28,13 +33,13 @@ pub const LISTEN_GENERATED: usize = 65;
 // intelligibility and range are intact. What is hard: no non-finite values and no
 // clipping. Do not roll back a measured win because a digest moved in its last
 // digits, and do not spend a round chasing one back.
-/// `digest(generated ids ++ next ++ eos flag ++ written)` — the row's own answer
-/// digest, printed as `digest=`.
-pub const LISTEN_ANSWER_DIGEST: u64 = 0x2f93_dfa1_d7cd_eeb1;
+/// `digest(generated ids ++ next ++ eos flag ++ written)` over every piece — the
+/// reading's own answer digest, printed as `digest=`.
+pub const LISTEN_ANSWER_DIGEST: u64 = 0x5df2_38e8_831e_9a9f;
 /// SHA-256 of the decoded transcript, in UTF-8.
 pub const LISTEN_TRANSCRIPT_SHA256: &str =
-    "522e47e1f6ed20ca69ad638df1b2b44ed03ef721e349d6ffacea4e13f7c18d3f";
-pub const LISTEN_TRANSCRIPT: &str = "обычные объявления метро делались только на каталонском языке, но не забывали переводить объявления в другие языки, например, итальянский, испанский, английский, французский, итальянский";
+    "fa35f3839185582ce10726608b42093bf3c405f8ec4b0c7cb087d3f3f7bb4d2c";
+pub const LISTEN_TRANSCRIPT: &str = "Обычные объявления в метро делаются только на каталонском языке. Но незапланированные перебои обергаются автоматизированными системами на самых разных языках. включая испанский, английский, французский, арабский и японский";
 /// Words of [`LISTEN_TRANSCRIPT`] a run may differ in and still read as it: one
 /// moved token lands in one word, and two such moves are still the same sentence.
 /// The word count itself must match — a move across a space merges or splits a
@@ -287,7 +292,7 @@ mod tests {
         assert!(reads_as_pinned(LISTEN_TRANSCRIPT));
         assert!(!reads_as_pinned(""));
         assert!(!reads_as_pinned(&LISTEN_TRANSCRIPT.replace(
-            "итальянский, испанский, английский",
+            "испанский, английский, французский",
             "немецкий, шведский, датский"
         )));
     }
@@ -356,7 +361,7 @@ mod tests {
             LISTEN_PROMPT_ROWS,
             LISTEN_GENERATED,
             LISTEN_ANSWER_DIGEST,
-            "обычные объявления метро"
+            "Обычные объявления в метро"
         ));
     }
 
@@ -382,9 +387,9 @@ mod tests {
             "the transcript's bytes only (every word at its pin)"
         );
         let one_word = LISTEN_TRANSCRIPT.replace("на каталонском языке", "на каталонской языке");
-        assert_eq!(headline(&one_word), "1 of 22 words (listed below)");
-        let truncated = "обычные объявления метро";
-        assert_eq!(headline(truncated), "words 3 (pinned 22)");
+        assert_eq!(headline(&one_word), "1 of 26 words (listed below)");
+        let truncated = "Обычные объявления в метро";
+        assert_eq!(headline(truncated), "words 4 (pinned 26)");
     }
 
     /// The round trip's rule: the spoken text's opening is what decides, case and

@@ -41,10 +41,10 @@ const _: () = assert!(WINDOW_SAMPLES == MEL_FRAMES * graphs::MEL_HOP);
 /// most a fire can be resolved later than a one-window pass would resolve it.
 pub const SCORE_STRIDE_SAMPLES: usize = 16 * graphs::MEL_HOP;
 
-/// The most audio one recognition pass takes: 30 s (3 000 mel frames, 375 audio
-/// tokens). The encoder
-/// admits more, but the prefill's attention plane grows with the square of it, so
-/// a longer input is cut into passes of this length rather than compiled whole.
+/// The most audio the harnesses that read the pinned clip take: 30 s (3 000 mel
+/// frames). The clip is 17.46 s, so this is the harness's own bound on a voice file
+/// that is not the pinned one — not a limit of the reading path, which cuts any
+/// length into pieces.
 pub const PASS_SAMPLES: usize = 30 * SAMPLE_RATE as usize;
 
 /// The decode budget — the most tokens one segment may generate; the cache is
@@ -53,8 +53,8 @@ pub const ASR_MAX_NEW: usize = 2_048;
 
 /// The recognition prompt's fixed ends, in the tokenizer's own ids: 3 head rows
 /// and 6 text rows before the encoder's audio rows, 6 tail rows after them. The
-/// audio count is the clip's (219 rows for the recorded 17.46 s reference), so
-/// the prompt's length is not a constant.
+/// audio count is the piece's (80 rows for each piece of the recorded 17.46 s
+/// reference), so the prompt's length is not a constant.
 pub const ASR_HEAD_IDS: [usize; 3] = [151644, 8948, 198];
 pub const ASR_TEXT_IDS: [usize; 6] = [151645, 198, 151644, 872, 198, 151669];
 pub const ASR_TAIL_IDS: [usize; 6] = [151670, 151645, 198, 151644, 77091, 198];
@@ -650,21 +650,73 @@ pub fn l2(v: &[f32]) -> Vec<f32> {
     v.iter().map(|x| x / n).collect()
 }
 
-/// What one recognition walk answered: the transcript every caller reads and the
-/// walk's own cost.
+/// What one recognition reading answered: the transcript every caller reads and the
+/// reading's own cost.
+///
+/// A reading is one piece or several — [`recognise`] cuts its input and reads each piece
+/// on its own prompt — and a piece the guards refuse contributes no words at all, so the
+/// reading is shorter than the audio rather than filled with words nobody said. The pieces'
+/// fields are joined in piece order.
 pub struct Walk {
+    /// The input's own frame count.
     pub frames: usize,
+    /// Prompt rows the body read.
     pub prompt_rows: usize,
+    /// The widest decode capacity grown to.
     pub capacity: usize,
+    /// The generated ids, in piece order.
     pub generated: Vec<usize>,
-    /// The greedy choice that stopped the walk (EOS, or the token the budget ended on).
+    /// The greedy choice that stopped the last piece: EOS, or the token its budget ended
+    /// on.
     pub next: usize,
+    /// Whether any piece ran out of its own budget.
     pub truncated: bool,
+    /// The pieces' readings with a space between.
     pub text: String,
+    /// One piece's answer as floats — its ids, then `next`, its EOS flag and the cache rows
+    /// written — concatenated over the pieces: what the answer digest is taken over
+    /// ([`crate::report::digest`]).
     pub values: Vec<f32>,
+    /// Milliseconds spent building graphs.
     pub build_ms: f64,
     /// One entry per generated token: the row's own price.
     pub decode_times: Vec<f64>,
+}
+
+impl Walk {
+    /// One reading from the pieces' own, in piece order: the lists concatenated, the counts
+    /// and the build time summed, `capacity` the widest any piece's decode grew to, `next`
+    /// the last piece's, and `text` the readings the caller kept, a space between.
+    pub(crate) fn pieces(frames: usize, pieces: Vec<(Walk, Option<String>)>) -> Walk {
+        let mut read = Walk {
+            frames,
+            prompt_rows: 0,
+            capacity: 0,
+            generated: Vec::new(),
+            next: ASR_EOS,
+            truncated: false,
+            text: String::new(),
+            values: Vec::new(),
+            build_ms: 0.0,
+            decode_times: Vec::new(),
+        };
+        let mut readings: Vec<String> = Vec::new();
+        for (walk, answer) in pieces {
+            read.build_ms += walk.build_ms;
+            read.prompt_rows += walk.prompt_rows;
+            read.capacity = read.capacity.max(walk.capacity);
+            read.truncated |= walk.truncated;
+            read.generated.extend(walk.generated);
+            read.values.extend(walk.values);
+            read.decode_times.extend(walk.decode_times);
+            read.next = walk.next;
+            if let Some(answer) = answer {
+                readings.push(answer.trim().to_string());
+            }
+        }
+        read.text = readings.join(" ");
+        read
+    }
 }
 
 /// A decode graph more than one chunk runs on, with the lock a walk holds while it uses
@@ -705,7 +757,11 @@ impl Shared {
 /// prefill between chunks, because holding all three would keep three compiled graphs whose
 /// uploads carry the body. The **one-shot** clip ([`Clip::once`]) drops the front end as soon
 /// as it has run, so the front end is never resident beside the prefill.
-pub struct Clip<'a> {
+///
+/// A clip is one pass, not a reading: a pass over a long input loops, so the reading
+/// entry points ([`recognise`], and the product's [`crate::transcribe::Transcriber`])
+/// cut the input and read the pieces through this.
+pub(crate) struct Clip<'a> {
     pair: Arc<Pair>,
     tokenizer: &'a Tokenizer,
     /// The front end, built with the clip and held across chunks when a caller
@@ -763,16 +819,16 @@ impl<'a> Clip<'a> {
     /// its first `run` and kept, and every `run` compiles its own prefill and drops
     /// it once it has run rather than hold a third graph whose upload carries the
     /// body.
-    pub fn build(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
+    pub(crate) fn build(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
         Self::new(pair, tokenizer, frames, true)
     }
 
-    /// The one-shot path's clip: [`Clip::build`]'s graphs, with the front end
-    /// dropped as soon as it has run, so the front end is not resident beside the
-    /// prefill. A second `run` on this
+    /// The clip an input that fits one piece is read on ([`recognise`]): [`Clip::build`]'s
+    /// graphs, with the front end dropped as soon as it has run, so the front end is not
+    /// resident beside the prefill. A second `run` on this
     /// clip rebuilds the front end, so a caller with several chunks uses
     /// [`Clip::build`] instead.
-    pub fn once(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
+    pub(crate) fn once(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
         Self::new(pair, tokenizer, frames, false)
     }
 
@@ -845,7 +901,7 @@ impl<'a> Clip<'a> {
     /// written into the prompt instead of being generated, or `None` to leave the
     /// recogniser its own answer — the prompt is three rows longer with them, and the two
     /// lengths are two prefills.
-    pub fn run(
+    pub(crate) fn run(
         &mut self,
         mut audio: Vec<f32>,
         declared: Option<[usize; ASR_LANGUAGE_IDS.len()]>,
@@ -1087,17 +1143,20 @@ impl<'a> Clip<'a> {
         })
     }
 
-    /// Cap one walk at `max_new` generated tokens. The one-shot path keeps the
-    /// crate's budget; a caller transcribing a bounded chunk sets one from the
-    /// chunk's own length, so a repetition loop cannot cost more than the audio it
-    /// covers — the loop is reported either way, by the transcript's words.
-    pub fn set_max_new(&mut self, max_new: usize) {
+    /// Cap one walk at `max_new` generated tokens. A caller transcribing a bounded
+    /// chunk sets one from the chunk's own length, so a repetition loop cannot cost
+    /// more than the audio it covers — the loop is reported either way, by the
+    /// transcript's words; a single-pass reading keeps the crate's own budget.
+    pub(crate) fn set_max_new(&mut self, max_new: usize) {
         self.max_new = max_new.max(1);
     }
 }
 
-/// The one-shot path: one [`Clip::once`] for this length, one run — the clip the
-/// one-shot path transcribes with.
+/// The one-shot path: any length of 16 kHz mono audio in, its reading out. The input is
+/// cut and read piece by piece on the transcription path's own plan
+/// (`crate::transcribe::read_whole`) — one pass over twenty-six seconds is a loop of
+/// invented words, not a reading — and an input that fits one piece is read by the
+/// single pass exactly as it always was.
 pub fn recognise(pair: &Arc<Pair>, tokenizer: &Tokenizer, audio: Vec<f32>) -> Result<Walk> {
     let frames = audio.len() / graphs::MEL_HOP;
     if frames == 0 {
@@ -1105,12 +1164,49 @@ pub fn recognise(pair: &Arc<Pair>, tokenizer: &Tokenizer, audio: Vec<f32>) -> Re
     }
     let mut audio = audio;
     audio.truncate(frames * graphs::MEL_HOP);
-    Clip::once(pair, tokenizer, frames)?.run(audio, None)
+    crate::transcribe::read_whole(pair, tokenizer, audio)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reading of several pieces is the pieces' own: a piece the guards refused keeps its
+    /// cost and contributes no words, and the fields are joined in piece order.
+    #[test]
+    fn a_multi_piece_reading_is_its_pieces_in_order() {
+        let piece = |prompt_rows: usize, capacity: usize, next: usize, truncated: bool| Walk {
+            frames: 96,
+            prompt_rows,
+            capacity,
+            generated: vec![next],
+            next,
+            truncated,
+            text: String::new(),
+            values: vec![next as f32],
+            build_ms: 10.0,
+            decode_times: vec![1.0],
+        };
+        let read = Walk::pieces(
+            192,
+            vec![
+                (piece(95, 16, 7, false), Some("first".to_string())),
+                // Ran out of its own budget: what it said is not a reading of the piece.
+                (piece(90, 32, 9, true), None),
+                (piece(95, 8, 11, false), Some("third".to_string())),
+            ],
+        );
+        assert_eq!(read.frames, 192);
+        assert_eq!(read.prompt_rows, 280);
+        assert_eq!(read.build_ms, 30.0);
+        assert_eq!(read.capacity, 32, "the widest piece's decode");
+        assert_eq!(read.next, 11, "the last piece's");
+        assert!(read.truncated, "one piece ran out");
+        assert_eq!(read.text, "first third", "the refused piece says nothing");
+        assert_eq!(read.generated, [7, 9, 11]);
+        assert_eq!(read.values.len(), 3);
+        assert_eq!(read.decode_times.len(), 3);
+    }
 
     /// A grouped pass must compute what the single-window pass computes: the
     /// bench's decisions are identical only if a window's embedding does not

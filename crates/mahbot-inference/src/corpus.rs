@@ -40,7 +40,7 @@ pub(crate) fn files() -> &'static [(&'static str, &'static str, u64)] {
 }
 
 /// The corpus directory, from [`ENV`] — no default: the checkout carries no audio.
-pub(crate) fn dir() -> Result<PathBuf> {
+pub fn dir() -> Result<PathBuf> {
     match std::env::var_os(ENV) {
         Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
         _ => bail!("{ENV} is not set — point it at the pinned real-audio corpus"),
@@ -58,7 +58,7 @@ fn pinned(name: &str) -> Result<&'static (&'static str, &'static str, u64)> {
 }
 
 /// Check one file against its pin: the size first, then the SHA-256.
-pub(crate) fn verify_file(path: &Path, name: &str) -> Result<()> {
+pub fn verify_file(path: &Path, name: &str) -> Result<()> {
     let (_, sha256, bytes) = *pinned(name)?;
     let len = std::fs::metadata(path)
         .with_context(|| format!("cannot read the pinned corpus file {}", path.display()))?

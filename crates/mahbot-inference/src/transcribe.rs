@@ -10,10 +10,14 @@
 //! The plan is pure. The span builder takes the detector's per-hop mask as an
 //! argument, the cut takes the audio only to find the quietest hop near it, and the
 //! guard takes the region's own duration — so it is testable on a machine with no
-//! models and no audio, and the one-window listening path is untouched: this module
-//! wires the recogniser and the tagger to the plan instead.
-//! [`Transcriber`] is the other half: one call over one input, the regions of the
-//! result tiling it exactly, or an error saying why the call could not finish.
+//! models and no audio. [`Transcriber`] wires the recogniser and the tagger to the
+//! plan, and `read_whole` is the same plan without the two front ends: the input
+//! cut and read piece by piece, which is what the one-shot listening path answers
+//! with. One call over one input returns the regions tiling it exactly, or an error
+//! saying why the call could not finish. The dependency runs both ways on purpose:
+//! [`crate::listen`] owns the recogniser, and what decides whether a pass's words
+//! stand — the cut and the guards — belongs to the plan, so that is where
+//! `listen::recognise` comes for it.
 //!
 //! The rules are deliberately asymmetric. A start is the detector's own hop and
 //! is never moved: conditioning and hangover may not shift where speech begins.
@@ -280,20 +284,6 @@ fn tile_indexed(chunks: &[Span], samples: usize) -> Vec<(Span, Option<usize>)> {
     regions
 }
 
-/// Each chunk's reading in chunk order, from the `(index, answer)` pairs the walks
-/// produced: a shape is a frame count, so the walks are taken shape by shape and the
-/// chunks of one shape sit scattered through the plan. A reading is placed by the
-/// chunk's own index and never by the order the walks ran, which is what keeps a
-/// transcript with the audio it describes — a chunk's text attached to its neighbour's
-/// region would hold the region times right and the text wrong.
-fn readings_by_chunk(count: usize, readings: Vec<(usize, Option<String>)>) -> Vec<Option<String>> {
-    let mut answers: Vec<Option<String>> = (0..count).map(|_| None).collect();
-    for (index, answer) in readings {
-        answers[index] = answer;
-    }
-    answers
-}
-
 // ── the text guards ─────────────────────────────────────────────────
 
 /// The repetition and density limits of the text guards.
@@ -380,22 +370,9 @@ fn guard(text: &str, seconds: f64) -> Option<String> {
             run = 1;
         }
     }
-    // Any short gram that keeps coming back. Occurrences may overlap, which is
-    // what makes "la la la la la la la" four four-grams and not one.
-    if words.len() >= REPEAT_GRAM {
-        let last = words.len() - REPEAT_GRAM;
-        for i in 0..=last {
-            let gram = &words[i..i + REPEAT_GRAM];
-            let mut count = 1;
-            for j in i + 1..=last {
-                if &words[j..j + REPEAT_GRAM] == gram {
-                    count += 1;
-                }
-            }
-            if count > REPEAT_LIMIT {
-                return None;
-            }
-        }
+    // Any short gram that keeps coming back.
+    if repeat_count(&words).is_some_and(|count| count > REPEAT_LIMIT) {
+        return None;
     }
     // A region with no audio and text is infinitely dense; so is one whose
     // duration is not a number. Both are marks, not crashes.
@@ -408,6 +385,30 @@ fn guard(text: &str, seconds: f64) -> Option<String> {
         return None;
     }
     Some(text.to_string())
+}
+
+/// How often the most repeated [`REPEAT_GRAM`]-word phrase in `words` occurs — the loop a
+/// pass that saw too much audio produces, and the figure [`guard`] refuses past
+/// [`REPEAT_LIMIT`]. The words arrive lowercased; occurrences may overlap.
+fn repeat_count(words: &[String]) -> Option<usize> {
+    if words.len() < REPEAT_GRAM {
+        return None;
+    }
+    // Overlapping occurrences count, which is what makes "la la la la la la la" four
+    // four-grams and not one.
+    let last = words.len() - REPEAT_GRAM;
+    let mut worst: Option<usize> = None;
+    for i in 0..=last {
+        let gram = &words[i..i + REPEAT_GRAM];
+        let count = 1
+            + (i + 1..=last)
+                .filter(|&j| &words[j..j + REPEAT_GRAM] == gram)
+                .count();
+        if worst.is_none_or(|most| count > most) {
+            worst = Some(count);
+        }
+    }
+    worst
 }
 
 // ── the aligned input ───────────────────────────────────────────────
@@ -724,66 +725,20 @@ impl Transcriber {
         }
         let plan = tile_indexed(&chunk_list, audio16.len());
 
-        // The chunks grouped by the rung their graphs are compiled at, so a file whose
-        // chunks share a rung — most of them, since a full piece is always the same
-        // length — compiles that rung once and gives it back after its last chunk. The
-        // group is the whole call's, so a rung is built at most once per call.
-        let mut shapes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for (index, chunk) in chunk_list.iter().enumerate() {
-            shapes.entry(chunk_frames(*chunk)?).or_default().push(index);
-        }
-        // Each chunk's reading: the walk's own text through the guards, and never a
-        // second pass — the plan cuts at the span the encoder was trained over, so a
-        // chunk is read once. A walk is taken per shape and a shape holds chunks
-        // scattered through the plan, so the readings are collected with the chunk's
-        // own index and placed by it ([`readings_by_chunk`]), never by the order the
-        // shapes were visited: a reading attached to its neighbour's region would
-        // mistime the text.
-        let mut readings: Vec<(usize, Option<String>)> = Vec::with_capacity(chunk_list.len());
-        for (frames, indexes) in &shapes {
-            let mut clip = listen::Clip::rung(&self.pair, &self.tokenizer, *frames)
-                .with_context(|| format!("building the {frames}-frame recognition graphs"))?;
-            for &index in indexes {
-                let chunk = chunk_list[index];
-                let seconds = (chunk.end - chunk.start) as f64 / f64::from(RATE);
-                // The chunk's own length bounds what it can say: a walk capped
-                // there cannot spend a minute looping over eighteen seconds of
-                // singing, and the loop, if it happens, is still in the words.
-                clip.set_max_new(chunk_budget(seconds));
-                // The prompt's language rows, from the chunk's own tagger label and its
-                // own loudness dynamics: a speech or singing chunk that varies the way
-                // speech does is told the language, and everything else — instrumental
-                // music, a noise span the detector called speech, a drone — is left with
-                // the prompt the one-shot path uses, so the model answers with its own
-                // language or with none. A steady signal asked for a language answers with
-                // a generic word rather than words; `guard` refuses that answer.
-                let told = chunk_labels[index].as_deref().is_some_and(speaks_words)
-                    && spread_db(audio16, chunk) >= SPEECH_SPREAD_DB;
-                let walk = clip
-                    .run(
-                        chunk_audio(audio16, chunk, *frames),
-                        told.then_some(listen::ASR_LANGUAGE_IDS),
-                    )
-                    .with_context(|| {
-                        format!("transcribing samples {}..{}", chunk.start, chunk.end)
-                    })?;
-                // A walk that ran out of its own budget was circling, not reading: the
-                // words it did produce are not a reading of the chunk either.
-                let answer = if walk.truncated {
-                    None
-                } else {
-                    guard(&walk.text, seconds)
-                };
-                readings.push((index, answer));
-            }
-            // The rung's last chunk has run. The clip owns the rung, so letting it go here
-            // hands the rung's graphs and arenas back before the next rung is built: the
-            // call's residency is the rung it is running, not every rung it has visited.
-            // Every chunk of a frame count is in this one group, so nothing is rebuilt
-            // within the call; a later call rebuilds, and that is the price of the memory.
-            drop(clip);
-        }
-        let answers = readings_by_chunk(chunk_list.len(), readings);
+        // Each chunk read once, on its own prompt, and its words kept only where the guards
+        // stand behind them. The prompt's language rows come from the chunk's own tagger
+        // label and its own loudness dynamics: a speech or singing chunk that varies the way
+        // speech does is told the language, and everything else — instrumental music, a noise
+        // span the detector called speech, a drone — is left to the model, because a steady
+        // signal asked for a language answers with a generic word rather than words.
+        let answers: Vec<Option<String>> =
+            read_pieces(&self.pair, &self.tokenizer, audio16, &chunk_list, |index| {
+                chunk_labels[index].as_deref().is_some_and(speaks_words)
+                    && spread_db(audio16, chunk_list[index]) >= SPEECH_SPREAD_DB
+            })?
+            .into_iter()
+            .map(|(_, answer)| answer)
+            .collect();
 
         // The plan's regions, each with the answer that speaks for it: a speech
         // region takes its own chunk's transcript (the plan carries the index, so
@@ -901,6 +856,102 @@ impl Transcriber {
             self.ceiling / (1024 * 1024),
         )
     }
+}
+
+/// One input read as a whole, with no detector and no tagger: the input cut at the
+/// ladder's own aim ([`cut`]) and each piece read on its own prompt, so no pass ever
+/// sees more than [`CUT_SECONDS`] plus the cut's search window. It is the cut and the
+/// guards of the product's plan; what it does not have is the two front ends — the
+/// detector's speech spans, which is why the pieces divide the input rather than the
+/// speech, and the tagger's labels, which are why no piece is withheld and no language
+/// is declared.
+///
+/// A cut input's words are kept only when the guards stand behind them ([`guard`], and a
+/// walk that ran out of its own budget is not a reading either); a piece they refuse
+/// contributes no words, so the reading comes back shorter than the audio rather than
+/// filled with plausible-sounding ones. An input that fits one piece is read by the
+/// single pass exactly as it always was — same graphs, same text, and no guard, because a
+/// piece that short is the reading the caller has always had.
+///
+/// The prompt declares no language: that decision needs the tagger's label, which this
+/// path does not have, and a language declared over a steady signal is a confident wrong
+/// transcript. The model identifies the language itself, as it always has here.
+///
+/// `audio` must be a whole number of mel hops: a piece is read from exactly `frames ·
+/// MEL_HOP` samples. [`listen::recognise`] truncates to whole hops before calling this.
+pub(crate) fn read_whole(
+    pair: &Arc<Pair>,
+    tokenizer: &Tokenizer,
+    audio: Vec<f32>,
+) -> Result<listen::Walk> {
+    let whole = Span {
+        start: 0,
+        end: audio.len(),
+    };
+    let pieces = cut(whole, &audio);
+    if pieces.len() == 1 {
+        return listen::Clip::once(pair, tokenizer, frames_of(audio.len()))?.run(audio, None);
+    }
+    let readings = read_pieces(pair, tokenizer, &audio, &pieces, |_| false)?;
+    Ok(listen::Walk::pieces(frames_of(audio.len()), readings))
+}
+
+/// Every chunk of a plan read once, in the plan's own order, each with its guarded reading
+/// — `None` where the guards refuse it or the walk ran out of its own budget, so a refused
+/// piece contributes no words.
+///
+/// The chunks are grouped by the rung their graphs are compiled at, so a plan whose chunks
+/// share a rung — most of them, since a full piece is always the same length — compiles
+/// that rung once and gives it back after its last chunk: the call's residency is the rung
+/// it is running, not every rung it has visited. A rung holds the chunks scattered through
+/// the plan, so the readings are put back in the chunk's own order before they are returned
+/// — a reading attached to its neighbour's region would hold the region times right and the
+/// text wrong.
+///
+/// `told` decides each chunk's prompt: `true` adds the language rows, `false` leaves the
+/// model to answer with its own language or with none.
+fn read_pieces(
+    pair: &Arc<Pair>,
+    tokenizer: &Tokenizer,
+    audio: &[f32],
+    chunks: &[Span],
+    told: impl Fn(usize) -> bool,
+) -> Result<Vec<(listen::Walk, Option<String>)>> {
+    let mut shapes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        shapes.entry(chunk_frames(*chunk)?).or_default().push(index);
+    }
+    let mut readings: Vec<(usize, (listen::Walk, Option<String>))> =
+        Vec::with_capacity(chunks.len());
+    for (frames, indexes) in &shapes {
+        let mut clip = listen::Clip::rung(pair, tokenizer, *frames)
+            .with_context(|| format!("building the {frames}-frame recognition graphs"))?;
+        for &index in indexes {
+            let chunk = chunks[index];
+            let seconds = (chunk.end - chunk.start) as f64 / f64::from(RATE);
+            // The chunk's own length bounds what it can say: a walk capped there cannot
+            // spend a minute looping over eighteen seconds of singing, and the loop, if it
+            // happens, is still in the words.
+            clip.set_max_new(chunk_budget(seconds));
+            let walk = clip
+                .run(
+                    chunk_audio(audio, chunk, *frames),
+                    told(index).then_some(listen::ASR_LANGUAGE_IDS),
+                )
+                .with_context(|| format!("transcribing samples {}..{}", chunk.start, chunk.end))?;
+            // A walk that ran out of its own budget was circling, not reading: the words it
+            // did produce are not a reading of the chunk either.
+            let answer = if walk.truncated {
+                None
+            } else {
+                guard(&walk.text, seconds)
+            };
+            readings.push((index, (walk, answer)));
+        }
+        drop(clip);
+    }
+    readings.sort_unstable_by_key(|&(index, _)| index);
+    Ok(readings.into_iter().map(|(_, reading)| reading).collect())
 }
 
 /// The frame count a chunk's graphs are compiled at: its own length rounded up to the
@@ -1517,24 +1568,10 @@ mod tests {
         );
     }
 
-    /// A chunk's reading is its own: the walks are taken shape by shape, so the order
-    /// they ran in is not the plan's order and a reading is placed by its chunk index.
+    /// The plan gives each region the index of the chunk it was cut from, and the background
+    /// regions none.
     #[test]
-    fn each_chunk_keeps_its_own_reading() {
-        let reading = |text: &str| Some(text.to_string());
-        // Two shapes, visited shortest first: the second chunk of the plan is the one
-        // the first shape read.
-        let answers = readings_by_chunk(
-            2,
-            vec![
-                (1, reading("the short piece")),
-                (0, reading("the long piece")),
-            ],
-        );
-        assert_eq!(answers[0].as_deref(), Some("the long piece"));
-        assert_eq!(answers[1].as_deref(), Some("the short piece"));
-        // The plan carries the index, so the region for a chunk takes that chunk's text
-        // and the region beside it takes its own.
+    fn each_region_takes_its_own_chunk() {
         let plan = tile_indexed(
             &[
                 Span {
