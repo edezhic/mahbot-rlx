@@ -389,8 +389,9 @@ fn guard(text: &str, seconds: f64) -> Option<String> {
 
 /// How often the most repeated [`REPEAT_GRAM`]-word phrase in `words` occurs — the loop a
 /// pass that saw too much audio produces, and the figure [`guard`] refuses past
-/// [`REPEAT_LIMIT`]. The words arrive lowercased; occurrences may overlap.
-fn repeat_count(words: &[String]) -> Option<usize> {
+/// [`REPEAT_LIMIT`]. The words arrive lowercased; occurrences may overlap. Also the count
+/// [`crate::reference::round_trip`] holds a whole hearing to, against the same limit.
+pub(crate) fn repeat_count(words: &[String]) -> Option<usize> {
     if words.len() < REPEAT_GRAM {
         return None;
     }

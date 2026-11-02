@@ -7,10 +7,11 @@
 //! The stand's synthesis rows are timed, not listened to. This walks the product's
 //! synthesis call over texts of three lengths and reads every waveform back through
 //! the product's transcription call, region by region, so what the render says can
-//! be compared with what was asked for. Nothing here compares a hash: the criterion
-//! is the words, and the last region is where a cut render shows itself. A text the
-//! talker's context cannot hold is checked too — the one request that is refused
-//! rather than rendered.
+//! be compared with what was asked for. Nothing here compares a hash: the reading is
+//! the words, and the last region is where a cut render shows itself. What the round
+//! trip's rules make of each reading is printed, not asserted — the assertion is the
+//! product check's, in `product_checks`. A text the talker's context cannot hold is
+//! checked too — the one request that is refused rather than rendered.
 //!
 //! Run with `MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… cargo test -p mahbot-inference
 //! --release --test speak_readback -- --ignored --nocapture --test-threads 1`.
@@ -32,7 +33,7 @@ use mahbot_inference::{reference, report};
 /// Twice [`support::TTS_TEXT`] by word count and not by repeating it: the second
 /// half is another passage of the same chapter, so a render that says it whole has
 /// carried four hundred words and not one paragraph twice. The audio's tail must be
-/// this passage's own last words — the four the harness checks, "here they all
+/// this passage's own last words — the four the round trip demands, "here they all
 /// unite".
 const DOUBLED_TAIL: &str = "Circumambulate the city of a dreamy Sabbath afternoon. Go from \
     Corlears Hook to Coenties Slip, and from thence, by Whitehall, northward. What do you see? \
@@ -135,43 +136,29 @@ fn speak_and_read_back(text: &str) {
         .filter_map(|region| region.text.as_deref())
         .collect::<Vec<_>>()
         .join(" ");
-    // The render is judged on this: the closing words of the text are at the end of
-    // what the recogniser heard, in order, with nothing after them.
-    assert!(
-        ends_with_words(&heard, text),
-        "the render does not end with the text's closing words\n  heard: {heard:?}"
-    );
+    // What the rules make of this render is printed, not asserted: the assertion is the
+    // product check's, and one rule stated in two places drifts apart.
+    println!("  round trip: {}", reference::round_trip(&heard, text));
 }
 
-/// How many of the text's closing words the read-back must end with: enough that a
-/// render stopping anywhere before the last sentence cannot pass.
-const TAIL_WORDS: usize = 4;
-
-/// Whether `heard` closes with the last [`TAIL_WORDS`] words of `text`.
-fn ends_with_words(heard: &str, text: &str) -> bool {
-    let (heard, text) = (reference::words(heard), reference::words(text));
-    let tail = &text[text.len().saturating_sub(TAIL_WORDS)..];
-    heard.ends_with(tail)
-}
-
-/// The stand's short request: the words it says today, still the words it says.
+/// The stand's short request, read back.
 #[test]
 #[ignore = "needs both model pairs and the reference voice; run by hand"]
-fn the_short_request_says_what_it_says_today() {
+fn the_short_request_read_back() {
     speak_and_read_back(SHORT_TEXT);
 }
 
-/// The pinned long paragraph, spoken to its end.
+/// The pinned long paragraph, read back whole.
 #[test]
 #[ignore = "needs both model pairs and the reference voice; run by hand"]
-fn the_long_paragraph_is_spoken_to_its_end() {
+fn the_long_paragraph_read_back() {
     speak_and_read_back(support::TTS_TEXT);
 }
 
-/// Twice that length, likewise spoken whole.
+/// Twice that length, likewise read back whole.
 #[test]
 #[ignore = "needs both model pairs and the reference voice; run by hand"]
-fn the_doubled_text_is_spoken_to_its_end() {
+fn the_doubled_text_read_back() {
     speak_and_read_back(&format!("{} {DOUBLED_TAIL}", support::TTS_TEXT));
 }
 

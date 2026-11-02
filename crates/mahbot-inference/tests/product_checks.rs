@@ -6,15 +6,15 @@
 //! by the main stand run, never by the corpus run, never by the routine test
 //! command, and with no place in any record file.
 //!
-//! Five of them, each `#[ignore]`d:
+//! Each is `#[ignore]`d:
 //!
 //! * instrumental music yields no transcribed text;
 //! * a paste onset at a seam lands within one detector hop, and whole-input
 //!   conditioning is time-preserving;
 //! * the pinned reference clip's transcript and digest, reported as a witness;
 //! * the long recordings are read as what was said, through both reading paths;
-//! * the synthesis round trip — that the recogniser hears words in the rendered
-//!   waveform.
+//! * the synthesis round trip — that the hearing reaches the text's closing words and
+//!   does not run away, with a control for each way it can fail.
 //!
 //! Run with `MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… MAHBOT_ASR_MUSIC=… \
 //! MAHBOT_FAPH_CORPUS=… cargo test -p mahbot-inference --release --test product_checks
@@ -34,11 +34,6 @@ mod support;
 
 /// The seed the round trip renders `support::TTS_TEXT` with.
 const SYNTH_SEED: u64 = 12_345;
-
-/// The render the round trip reads back: its first twelve seconds. The render
-/// itself is as long as the text, and `speak_readback` is where the rest of it is
-/// read.
-const ROUND_TRIP_SECONDS: usize = 12;
 
 /// One role's pair files through the model directory, or the reason this check
 /// cannot happen: a model that is absent is a skip; one that is present and does
@@ -459,6 +454,74 @@ fn worst_repeat(text: &str, recording: &str) -> Option<(String, usize, usize)> {
         .max_by_key(|&(_, heard, spoken)| heard.saturating_sub(spoken))
 }
 
+/// One audio through the product's own transcription call, as the words the recogniser
+/// heard: the regions' texts joined, which is what the rules read.
+fn heard(transcriber: &mut Transcriber, name: &str, audio: &[f32]) -> String {
+    let out = transcriber
+        .transcribe(audio, SAMPLE_RATE)
+        .unwrap_or_else(|error| panic!("the read-back of {name}: {error:#}"));
+    println!(
+        "hearing {name}: samples={} seconds={:.2} regions={} read={}",
+        audio.len(),
+        audio.len() as f64 / f64::from(SAMPLE_RATE),
+        out.regions.len(),
+        out.regions.iter().filter(|region| region.read).count(),
+    );
+    out.regions
+        .iter()
+        .filter_map(|region| region.text.as_deref())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The render cut at a third: a render that stopped early, the text's ending never
+/// reached.
+fn cut_at_a_third(wave: &[f32]) -> Vec<f32> {
+    wave[..wave.len() / 3].to_vec()
+}
+
+/// That third said three times over: a render that loops, as long as the render it was
+/// cut from, and the text's ending never reached.
+fn looped(wave: &[f32]) -> Vec<f32> {
+    let third = &wave[..wave.len() / 3];
+    (0..3).flat_map(|_| third.iter().copied()).collect()
+}
+
+/// A phrase from the middle said five times, with the text's own ending left intact and
+/// the render's length unchanged. Each copy is followed by a second of silence, so the
+/// detector makes each one a region of its own: the guards refuse a chunk that says a
+/// phrase past their limit, so a repeat the round trip has to catch is one no single
+/// chunk holds.
+fn spliced(wave: &[f32]) -> Vec<f32> {
+    const SECONDS: usize = 4;
+    const GAP_SECONDS: usize = 1;
+    const COPIES: usize = 5;
+    let (slice, gap) = (
+        SECONDS * SAMPLE_RATE as usize,
+        GAP_SECONDS * SAMPLE_RATE as usize,
+    );
+    let span = COPIES * (slice + gap);
+    let start = wave.len() / 3;
+    assert!(
+        wave.len() >= start + span,
+        "the render is {} s, too short to splice {span} samples into",
+        wave.len() / SAMPLE_RATE as usize
+    );
+    let mut out = wave[..start].to_vec();
+    for _ in 0..COPIES {
+        out.extend_from_slice(&wave[start..start + slice]);
+        out.extend(std::iter::repeat_n(0.0, gap));
+    }
+    out.extend_from_slice(&wave[start + span..]);
+    out
+}
+
+/// The whole render said twice: every phrase at ×2, the text's ending reached, and twice
+/// the words — the runaway only the length rule catches.
+fn doubled(wave: &[f32]) -> Vec<f32> {
+    [wave, wave].concat()
+}
+
 /// The corpus directory, or the reason the check cannot run.
 fn corpus_dir() -> Option<std::path::PathBuf> {
     match corpus::dir() {
@@ -470,33 +533,34 @@ fn corpus_dir() -> Option<std::path::PathBuf> {
     }
 }
 
-/// **The synthesis round trip:** the rendered waveform's opening, resampled 24 kHz →
-/// 16 kHz and read back through the recogniser on its raw samples, says the words the
-/// render was asked to speak. The main stand run neither performs this nor fails on
-/// it.
+/// **The synthesis round trip:** the render — read back through the product's own
+/// transcription call, which resamples it to 16 kHz and conditions it as the application
+/// does — is heard through to the text's closing words, and does not run away: no more
+/// words than the text has by a quarter, and no phrase past the product's own repetition
+/// limit. The main stand run neither performs this nor fails on it.
 ///
-/// The check reads the render's first [`ROUND_TRIP_SECONDS`] rather than all of it: a
-/// render is as long as its text, and what the recogniser makes of the rest of a long
-/// render is `speak_readback`'s reading — this check is the waveform still being
-/// speech.
-///
-/// It is the **raw** waveform's reading: the check does not apply the recognition
-/// side's one-shot conditioning, so a quiet render is heard as it is rather than at
-/// the gain the product path would lift it by (printed beside the peak). The same clip
-/// through the prepared path answers differently, so the two are not interchangeable
-/// and this reading belongs to the path the gate takes.
+/// The recogniser is not accurate enough for a word-by-word comparison and repeats a
+/// clause on a correct render, so neither accuracy nor any repetition at all is the bar.
+/// The ending is: a render cut short never reaches it, and one that loops spends its
+/// length on the loop and never gets there either. Four controls, each made from the good
+/// render at run time, fail the rule they were built to break, so the check's ability to
+/// fail is itself tested: the render cut at a third and that third said three times both
+/// miss the ending; a phrase from the middle said five times, one copy to a region, is a
+/// repeat the guards let through a chunk at a time and is the repetition rule's; and the
+/// whole render said twice reaches the ending with every phrase at ×2 and only the length
+/// rule catches it.
 #[test]
 #[ignore = "needs both model pairs and the reference voice; run by hand"]
-fn the_recogniser_hears_words_in_the_rendered_waveform() {
+fn the_render_is_heard_through_to_the_texts_end() {
     let Some(voice) = voice() else {
         return;
     };
-    // The round trip was judged with that voice: another one renders different words,
-    // which the check cannot judge, so it says why it did not run instead of failing
-    // on the substitution.
+    // The rules were measured on the pinned voice's render: another voice input is a
+    // different render, whose ending and bounds nothing here has measured, so the check
+    // says why it did not run instead of failing on the substitution.
     if !reference::voice_is_pinned() {
         println!(
-            "skip: {} does not name the voice the round trip is judged with",
+            "skip: {} does not name the voice the round trip was measured with",
             loader::VOICE_WAV_ENV
         );
         return;
@@ -513,32 +577,51 @@ fn the_recogniser_hears_words_in_the_rendered_waveform() {
         report::max_abs(&wave) <= 1.0,
         "the waveform leaves the PCM range"
     );
-    // The round trip is a second pair: give the synthesis half's weights back
-    // before the recogniser's are asked for.
+    println!(
+        "render samples={} seconds={:.2} words={}",
+        wave.len(),
+        wave.len() as f64 / f64::from(SAMPLE_RATE),
+        support::TTS_TEXT.split_whitespace().count(),
+    );
+    // The read-back is a second pair: give the synthesis half's weights back before the
+    // recogniser's are asked for.
     drop(engine);
     mahbot_inference::release_process_memory();
-    let opening = &wave[..wave.len().min(SAMPLE_RATE as usize * ROUND_TRIP_SECONDS)];
-    let audio = host::resample(opening, SAMPLE_RATE, listen::SAMPLE_RATE);
-    // What the check reads: the render's length, the opening's own peak, and the gain
-    // the product path would condition that opening by — this check reads it raw.
-    println!(
-        "round trip: samples={} opening_samples={} opening_peak={} product_gain={:.2}",
-        wave.len(),
-        audio.len(),
-        report::sci(report::max_abs(&audio)),
-        host::speech_gain(&audio)
-    );
-    let Some(asr) = pair(Role::Recognition) else {
+    let Some((asr, tagger)) = open() else {
         return;
     };
-    let tokenizer = Tokenizer::from_model(&asr.body)
-        .unwrap_or_else(|error| panic!("the recognition tokenizer: {error:#}"));
-    let heard = listen::recognise(&asr, &tokenizer, audio)
-        .unwrap_or_else(|error| panic!("the recogniser on the rendered waveform: {error:#}"))
-        .text;
-    let holds = reference::check_speak_roundtrip(&heard, support::TTS_TEXT);
+    let mut transcriber =
+        Transcriber::open(asr, tagger, support::ceiling_mib()).expect("the transcriber opens");
+    let hearing = heard(&mut transcriber, "render", &wave);
     assert!(
-        holds,
-        "the recogniser does not hear the text the render was asked to speak: {heard:?}"
+        reference::check_speak_roundtrip(&hearing, support::TTS_TEXT),
+        "the render does not pass the round trip"
     );
+    for (name, control) in [
+        ("cut at a third", cut_at_a_third(&wave)),
+        ("that third three times", looped(&wave)),
+        ("a phrase five times", spliced(&wave)),
+        ("the render twice", doubled(&wave)),
+    ] {
+        let hearing = heard(&mut transcriber, name, &control);
+        let verdict = reference::round_trip(&hearing, support::TTS_TEXT);
+        println!("control {name}: {verdict}");
+        println!("  heard: {hearing:?}");
+        // A hearing of nothing would miss the ending too, and prove nothing.
+        assert!(
+            !reference::words(&hearing).is_empty(),
+            "the control {name:?} was not heard at all"
+        );
+        let broke = match name {
+            "a phrase five times" => {
+                matches!(verdict, reference::RoundTrip::Looped { said } if said >= 4)
+            }
+            "the render twice" => matches!(verdict, reference::RoundTrip::RanLong { .. }),
+            _ => verdict == reference::RoundTrip::MissedEnding,
+        };
+        assert!(
+            broke,
+            "the control {name:?} did not fail the rule it was made to break: {verdict}"
+        );
+    }
 }
