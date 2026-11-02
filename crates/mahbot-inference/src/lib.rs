@@ -13,9 +13,9 @@
 //! it and the wake path decide on. [`stand`] is the measurement stand
 //! (`mahbot-inference` binary), [`corpus`] the transcription corpus run
 //! (`transcription-corpus` binary) and [`bench`] the wake-word bench, whose corpus
-//! the `wake-word-build` binary renders. Every model path enters through an
-//! argument or an environment variable — see [`loader::models_dir`] and
-//! [`loader::voice_wav`].
+//! the `wake-word-build` binary renders. Every input lives at one fixed path per
+//! operating system ([`paths`]); nothing is configured, and the one directory the
+//! crate creates is `wake-corpus/` below that root.
 
 pub mod bench;
 pub mod ced;
@@ -28,9 +28,11 @@ pub mod listen;
 pub mod loader;
 pub mod measurements;
 pub mod music;
+pub mod paths;
 pub mod reference;
 pub mod report;
 mod run;
+pub mod speaker;
 pub mod stand;
 pub mod synth;
 pub mod tokenizer;

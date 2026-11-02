@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Host-side pieces the live paths still need: RoPE tables at global positions,
-//! the sampler, and a RIFF/WAVE reader for the recorded 16 kHz asset.
+//! the sampler, and a RIFF/WAVE reader for a 16 kHz recording.
 
 use anyhow::Result;
 

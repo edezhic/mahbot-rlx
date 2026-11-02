@@ -6,10 +6,10 @@
 //! recordings the false-accept phase never measures.
 //!
 //! A clone's only per-voice input is the speaker embedding of its reference audio
-//! ([`crate::synth::Synthesis::new`] embeds the whole file), so a voice *is* the
-//! recording and the span taken out of it, not a name: the span is cached as a
-//! 16 kHz WAV and every clip rendered from it carries the span's own identity in
-//! its cache key, so one voice's audio can never stand in for another's.
+//! ([`crate::synth::Synthesis::with_reference`] embeds the whole file), so a voice
+//! *is* the recording and the span taken out of it, not a name: the span is cached
+//! as a 16 kHz WAV and every clip rendered from it carries the span's own identity
+//! in its cache key, so one voice's audio can never stand in for another's.
 //!
 //! Selection walks [`sets::VERIFICATION_POOL`] in its pinned order and takes the
 //! first [`sets::NUM_VERIFICATION_VOICES`] whose two-sentence render comes back
@@ -89,8 +89,8 @@ impl Speaker {
         }
     }
 
-    /// The render cache key's voice component: absent for the enrolled voice,
-    /// whose cached renders must stay valid.
+    /// The render cache key's voice component: absent for the enrolled voice, whose
+    /// speaker is the code hash's own constant.
     pub(crate) fn cache_id(&self) -> Option<String> {
         self.voice().map(Voice::cache_id)
     }
@@ -585,8 +585,8 @@ fn is_whole_span(path: &Path, samples: usize) -> bool {
 }
 
 /// The reference embedding a clone is built from. It repeats what
-/// [`crate::synth::Synthesis::new`] does with the reference audio — the speaker
-/// encoder over the 24 kHz mel — rather than reading the pipeline's field,
+/// [`crate::synth::Synthesis::with_reference`] does with the reference audio — the
+/// speaker encoder over the 24 kHz mel — rather than reading the pipeline's field,
 /// because the modules that produce clips are part of the corpus cache key: a
 /// code change there would invalidate every cached render.
 fn reference_embedding(tts: &Arc<Pair>, wav: &Path) -> Result<Vec<f32>> {

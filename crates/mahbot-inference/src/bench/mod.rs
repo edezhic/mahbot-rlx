@@ -76,10 +76,11 @@
 //!
 //! # Inputs
 //!
-//! See the private `config` module: an argument first, the environment second.
-//! The report and the lock are inputs too, so a run never writes into the model
-//! directory; the synthesized corpus has one fixed, durable location instead
-//! (below). There is no crate-relative path and no network access.
+//! Every model, corpus and music input is at one fixed path per operating system
+//! ([`crate::paths`]); nothing is configured, nothing is crate-relative, and there
+//! is no network access. The report and the lock are inputs too, so a run writes
+//! nothing into the model root except `wake-corpus/` (below), the one directory the
+//! crate may create.
 //!
 //! # The record
 //!
@@ -118,23 +119,23 @@
 //! it finds missing is a stop naming the shortfall and the build, not the start of a
 //! ninety-minute synthesis.
 //!
-//! The cache is one fixed, durable directory
-//! (`$XDG_CACHE_HOME/mahbot/wake-word-corpus`, else `~/.cache/…`), not a per-run
-//! one. A clip's key is content — the text, the seed, the sample rate, both TTS
-//! files, the reference voice (or, for a clone, the span it was cut from) and the
-//! code lines of the modules that produce it — so the enrolled voice's existing
-//! clips stay valid, one voice's audio can never stand in for another's, and a
-//! second build renders nothing. The one legitimate rebuild is a change to the
-//! generation path itself: the build then sweeps the entries every recorded
-//! generation claimed and it did not produce — never a file no record names — so a
-//! superseded corpus does not accumulate. A record belongs to the generation that
-//! wrote it and survives until a later build reclaims its entries; the record is
-//! rewritten only after the sweep, so a build killed mid-sweep leaves the generation
-//! it was replacing recorded and reclaimable by the next one. The trade is stated
-//! rather than hidden: a measurement of a superseded generation that shares this
-//! cache under another lock finds its clips gone and stops with a miss, because the
-//! alternative is a cache that grows without bound. A cache that cannot be written
-//! stops the run instead of quietly costing the corpus again.
+//! The cache is one fixed directory below the static root (`wake-corpus/`), not a
+//! per-run one. A clip's key is content — the text, the seed, the sample rate, both
+//! TTS files, the embedded speaker (or, for a clone, the span it was cut from) and
+//! the code lines of the modules that produce it — so one voice's audio can never
+//! stand in for another's and a second build renders nothing. The one legitimate
+//! rebuild is a change to the generation path itself: the build then sweeps the
+//! entries every recorded generation claimed and it did not produce — never a file
+//! no record names — so a superseded corpus does not accumulate. A record belongs to
+//! the generation that wrote it and survives until a later build reclaims its
+//! entries; the record is rewritten only after the sweep, so a build killed mid-sweep
+//! leaves the generation it was replacing recorded and reclaimable by the next one.
+//! The trade is stated rather than hidden: a measurement of a superseded generation
+//! that shares this cache under another lock finds its clips gone and stops with a
+//! miss, because the alternative is a cache that grows without bound. The cache is
+//! machine-wide while the lock is per-user, so one builder at a time is the working
+//! assumption. A cache that cannot be written stops the run instead of quietly
+//! costing the corpus again.
 
 mod audio;
 pub mod build;
@@ -250,7 +251,7 @@ pub fn run() -> Result<()> {
     eprintln!(
         "[wake-word] models {} · corpus {} · up to {} windows per real-audio pass (the clip \
          sets run one per pass) · {} verification voices · stop {}s · ceiling {} MiB · lock {}",
-        cfg.models_label(),
+        cfg.models.display(),
         cfg.corpus.display(),
         listen::GROUP,
         cfg.voices,
@@ -562,21 +563,24 @@ fn open_pairs(cfg: &BenchConfig) -> Result<(Arc<Pair>, Arc<Pair>)> {
     Ok((asr, tts))
 }
 
-/// The corpus cache is an input both entry points own: it is the run's durable
-/// artifact, so [`prepare_cache`] creates it and drops the half-written entries no
-/// run is writing any more — another run may share this directory under another
-/// lock, and its clips in flight survive. Called before anything reads inside it, so
-/// a cache root that is not a directory is named here rather than by the manifest's
-/// reader.
-pub(crate) fn prepare_cache(cache: &Path) -> Result<(), config::Refused> {
-    std::fs::create_dir_all(cache).with_context(|| {
+/// The synthesized corpus is the run's durable artifact, and `wake-corpus/` is the
+/// one directory below the static root the crate may create. An absent root is
+/// refused — provisioning is by hand — and `wake-corpus/` is created inside it; the
+/// half-written entries no run is writing any more are dropped, under the working
+/// assumption that one builder runs at a time (the cache is machine-wide while the
+/// lock is per-user). Called before anything reads inside it, so a cache root that
+/// is not a directory is named here rather than by the manifest's reader.
+pub(crate) fn prepare_cache() -> Result<(), config::Refused> {
+    crate::loader::models_dir()?;
+    let cache = crate::paths::wake_corpus();
+    std::fs::create_dir_all(&cache).with_context(|| {
         format!(
             "cannot create the corpus cache {} — the synthesized corpus is the run's durable \
              artifact",
             cache.display()
         )
     })?;
-    crate::measurements::sweep(cache, None);
+    crate::measurements::sweep(&cache, None);
     Ok(())
 }
 
@@ -593,7 +597,6 @@ fn open_corpus(
 ) -> Result<Synth> {
     Ok(Synth::new(
         tts,
-        cfg.voice.clone(),
         cfg.cache.clone(),
         synthesis_hash,
         missing,
@@ -616,7 +619,7 @@ fn measure(
     // The cache is the run's durable artifact: created and cleaned here once, before
     // anything reads inside it, so a root that is not a directory is a refused input
     // named as such rather than a failure the manifest reader reports.
-    prepare_cache(&cfg.cache)?;
+    prepare_cache()?;
     let inputs = phase(progress, "inputs", || {
         deadline.check("inputs")?;
         let inputs = config::pin_inputs(cfg)?;
@@ -1368,8 +1371,7 @@ mod tests {
     fn test_config() -> BenchConfig {
         BenchConfig {
             mode: config::Mode::Measure,
-            models: Some(std::path::PathBuf::from("/models")),
-            voice: std::path::PathBuf::from("/voice.wav"),
+            models: std::path::PathBuf::from("/models"),
             corpus: std::path::PathBuf::from("/corpus"),
             report: Some(std::path::PathBuf::from("/report.json")),
             cache: std::path::PathBuf::from("/cache"),
@@ -1618,7 +1620,7 @@ mod tests {
     fn a_figure_the_report_lacks_is_named_not_zeroed() {
         let body = record::block(&json!({}));
         let inputs = record::record_inputs(&test_config(), &json!({}));
-        for role in ["ASR body", "ASR sound", "TTS body", "TTS sound", "voice"] {
+        for role in ["ASR body", "ASR sound", "TTS body", "TTS sound"] {
             assert!(
                 inputs.contains(&format!("- {role}: {}", record::UNAVAILABLE)),
                 "the {role} pin does not name its absence:\n{inputs}"
@@ -1641,7 +1643,7 @@ mod tests {
         }
     }
 
-    /// A resolved input set: five pins with a byte count and a digest, so the
+    /// A resolved input set: four pins with a byte count and a digest, so the
     /// record's provenance block has the figures a real run states.
     fn test_inputs() -> config::Inputs {
         let pin = |name: &str| config::Pin {
@@ -1654,7 +1656,6 @@ mod tests {
             asr_sound: pin("asr-mmproj.gguf"),
             tts_body: pin("tts.gguf"),
             tts_sound: pin("tts-mmproj.gguf"),
-            voice: pin("voice.wav"),
         }
     }
 

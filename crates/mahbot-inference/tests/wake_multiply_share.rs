@@ -7,9 +7,10 @@
 //! can be read with — nine whole words (shipped) against the per-word
 //! reassembly it replaced (`RLX_WGPU_Q8_0_BLOCK_WORDS=0`).
 //!
-//! Run with `MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… RLX_ALLOW_THROTTLE=1 cargo
-//! test -p mahbot-inference --release --test wake_multiply_share -- --ignored
-//! --nocapture`, after `just throttle`.
+//! Needs the installed model directory and the pinned corpus recording; a machine
+//! without them skips. Run with `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference
+//! --release --test wake_multiply_share -- --ignored --nocapture`, after `just
+//! throttle`.
 //!
 //! **The instrument is the backend's own device clock**, never a wall clock: the
 //! child runs the product's paired pass ([`Listener::embed_pair`] — two scoring
@@ -71,11 +72,10 @@ fn the_packed_multiply_share_of_the_pair_pass() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
-    if loader::models_dir().is_err() || loader::voice_wav().is_err() {
+    if loader::models_dir().is_err() || mahbot_inference::corpus::dir().is_err() {
         eprintln!(
-            "skipped: {} or {} is not set — the packed multiply was not priced",
-            loader::MODELS_DIR_ENV,
-            loader::VOICE_WAV_ENV
+            "skipped: the model directory or the pinned corpus is not installed — the packed \
+             multiply was not priced"
         );
         return;
     }
@@ -143,10 +143,16 @@ fn the_packed_multiply_share_child() {
     }
     let pair =
         std::sync::Arc::new(Pair::of_role(Role::Recognition).expect("the recognition pair opens"));
-    let voice = loader::voice_wav().expect("the pinned voice");
+    let recording =
+        mahbot_inference::corpus::pinned(mahbot_inference::stand::RECOGNITION_RECORDING)
+            .expect("the pinned corpus recording");
     let read = |offset: usize| {
-        wav_mono_16k(&voice.display().to_string(), offset, listen::WINDOW_SAMPLES)
-            .expect("the pinned voice")
+        wav_mono_16k(
+            &recording.display().to_string(),
+            offset,
+            listen::WINDOW_SAMPLES,
+        )
+        .expect("the pinned corpus recording")
     };
     let first = read(WAKE_OFFSET);
     let second = read(WAKE_OFFSET + listen::SCORE_STRIDE_SAMPLES);

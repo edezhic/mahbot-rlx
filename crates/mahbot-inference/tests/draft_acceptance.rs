@@ -4,14 +4,13 @@
 
 //! Whether reading the recognition decode's weights once for several candidate
 //! tokens can pay: the **draft acceptance** a weight-free drafter reaches on the
-//! pinned clip, and the cost of a multi-row pass at the decode's own
+//! pinned recording, and the cost of a multi-row pass at the decode's own
 //! shape on its own resident plane cache. Both come from one process, so they
 //! belong to the same load window.
 //!
-//! ```text
-//! MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… RLX_ALLOW_THROTTLE=1 \
-//! cargo test -p mahbot-inference --release --test draft_acceptance -- --ignored --nocapture
-//! ```
+//! Needs the installed model directory and the pinned corpus recording. Run with
+//! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --test
+//! draft_acceptance -- --ignored --nocapture`.
 //!
 //! **The number.** Per-position acceptance at depths 1..8: at depth `i`, the
 //! share of positions where the drafter's `i`-th proposed token equals the
@@ -47,56 +46,15 @@
 //! full-depth round; the
 //! nine sweep arms' logits finite and `rows × vocab`; and the two-row operand's
 //! first row equal to the one-row step's with the second key shut, while a visible
-//! candidate moves it. The pinned clip's answer prints against the reference pin
-//! (the reference's own witness rule), so a moved digest or transcript is
-//! reported and the round carries on. No wall time is asserted.
-//!
-//! # What it read on this tree
-//!
-//! Apple M3 Pro / Metal, one process, four runs of this file on this tree. The
-//! pinned clip's 65 generated ids take 6 of 9 proposals at depth one (0.667, Wilson
-//! 0.354..0.879), 2 of 9 at depth two, then 2, 1, 0, 1, 0, 0 — over **16% coverage**
-//! and 51 drafted tokens. The weight-free drafter's tail is thin on free speech and
-//! dense on repeated phrasing.
-//!
-//! The pass does not cost 1.7–1.8 one-row steps. On the decode's own resident
-//! cache and shapes it is **6.01–6.06** one-row steps at eight rows (96.0–96.6 ms
-//! against 15.82–16.06) and **7.14–7.29** at nine across runs (114.0–118.4: the
-//! ninth row re-reads the weight tiles for one row), and the arms are flat from two
-//! rows up (92.4 → 96.6 across 2..8) — not because a pass steps once per eight rows,
-//! but because the row-grouped GEMM streams the same tiles at about a quarter of
-//! the one-row kernel's bandwidth. The weight stream alone, cache out of the
-//! picture, is **3.78–3.85×** at nine rows (15.7 → 60.2 ms, 18.1–18.3 GB/s where the
-//! one-row arm streams 68.3–70.1 — the unique-byte rate: the ninth row's
-//! 14.2–15.2 ms is its second read of the tiles), and the many-row attention
-//! arrangement at eight query rows over 370 keys is 58.0–58.7 ms against the one-row
-//! kernel's 4.0–4.2 at the same key count. The one-row arm re-taken after the sweep
-//! read 1.8% faster in one run and 3.7% slower in another: that, and the ninth arm's
-//! spread, is the drift these ratios carry.
-//!
-//! So break-even acceptance is **0.917–0.919** at seven candidates on eight rows,
-//! and **0.941–0.943** at eight on nine — where a [`DECISION_WIN`] is unreachable
-//! outright, because the yield it needs (9.3–9.4 tokens a round) is past the nine a
-//! round can emit; 0.757–0.763 at the weight stream's own ratio, and 0.429 at the
-//! pass the route was proposed on (1.75×), where a [`DECISION_WIN`] would need
-//! 0.563. The measured curve predicts **0.63×** (0.71× and 0.89× for the two longer
-//! minimums), 0.83–0.84× with the many-row attention's long-cache data free, 1.05×
-//! at the 1.75× premise, and 0.29–0.30× for a drafter that proposed at every
-//! position.
-//!
-//! What decides the route is the pass, not the drafter: reading each weight tile
-//! once for eight candidates would pay on repetitive speech, and this decode's
-//! arrangement does not read it that way.
+//! candidate moves it. The pinned recording's answer prints its own digest and token
+//! count. No wall time is asserted.
 //!
 //! Three things about the arm, so the figure is read as what it is. With more than
 //! one query row the plane cache's mask is one key mask for all of them, so the
 //! rows are not causal among themselves and the arm's logits are not the greedy
 //! choices — it prices a pass, and a verification route would have to change that
 //! mask and the one-row KV write (see
-//! [`graphs::body_capacity_chain_planes_rows`]); the one-row path the shipped
-//! decode runs is instead witnessed by the pinned answer, which the run prints
-//! through the pinned-clip rule as `all_pinned=true reads_as_pinned=true`. The rows
-//! reach
+//! [`graphs::body_capacity_chain_planes_rows`]). The rows reach
 //! the operand through a concat of the resident rows — 85 MB at eight rows (the two
 //! the parity check prints are 83 MB: about 0.6 ms one way and 1.3 ms read and
 //! written at this machine's ceiling) inside a 96 ms pass — where the route's own
@@ -578,18 +536,11 @@ fn pair(role: Role) -> Option<Arc<Pair>> {
     }
 }
 
-fn voice() -> Option<PathBuf> {
-    match loader::voice_wav() {
-        Ok(p) => Some(p),
-        Err(e) => {
-            eprintln!("skip: {e}");
-            None
-        }
-    }
+fn recording() -> Option<PathBuf> {
+    support::recording(mahbot_inference::stand::RECOGNITION_RECORDING)
 }
 
-/// One clip through the one-shot walk, its stream printed against the pin. The
-/// witness rule is the reference's own.
+/// One clip through the one-shot walk, its stream printed.
 fn clip(pair: &Arc<Pair>, name: &str, path: &Path) -> support::Answer {
     let a = support::listen_answer(pair, path);
     println!(
@@ -603,8 +554,6 @@ fn clip(pair: &Arc<Pair>, name: &str, path: &Path) -> support::Answer {
         a.decode_ms,
         a.digest,
     );
-    // The walk's own witness rule, called rather than restated.
-    support::witness_listen(&a);
     a
 }
 
@@ -1163,7 +1112,7 @@ fn draft_acceptance() {
     let Some(pair) = pair(Role::Recognition) else {
         return;
     };
-    let Some(voice) = voice() else {
+    let Some(voice) = recording() else {
         return;
     };
     let started = report::Stopwatch::start();
@@ -1275,7 +1224,7 @@ fn the_round_rule_is_the_hand_computed_one() {
 
 /// The byte figure's own rule: a round pays one weight-stream read, a round past
 /// [`DEPTH`] rows pays two — the grouped multiply takes eight rows a group, and the
-/// pinned clip's walked stream never reaches a full-depth round.
+/// pinned recording's walked stream never reaches a full-depth round.
 #[test]
 fn a_full_depth_round_reads_the_weight_stream_twice() {
     let curve = Curve {

@@ -264,17 +264,6 @@ fn running(pid: u32) -> bool {
     }
 }
 
-/// A path as the provenance block writes it: relative to `$HOME` when it is
-/// under it, so the record does not carry one machine's user name.
-#[must_use]
-pub fn short_path(path: &Path) -> String {
-    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
-    match home.and_then(|home| path.strip_prefix(&home).ok().map(|rest| rest.to_path_buf())) {
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
-    }
-}
-
 /// `2026-10-18 21:20 UTC`.
 #[must_use]
 fn now() -> String {

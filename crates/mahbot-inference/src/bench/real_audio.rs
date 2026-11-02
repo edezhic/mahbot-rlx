@@ -217,8 +217,8 @@ pub(crate) fn run(
 /// Size and SHA-256 of every pinned file. Run in the input phase, before the
 /// expensive part: a bad pin stops the run in its first seconds, not after the
 /// corpus synthesis. A mismatch is a [`Refused`] input — the corpus is not the one
-/// the pins name, which is a fault of what the invocation pointed at, not of the run
-/// — and the message names the file.
+/// the pins name, which is a fault of the installed material, not of the run — and
+/// the message names the file.
 pub(crate) fn verify(corpus: &Path, subset: &[(&str, &str, u64)]) -> Result<(), Refused> {
     for (path, sha256, pinned) in subset {
         let file = corpus.join(path);

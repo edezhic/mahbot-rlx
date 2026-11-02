@@ -9,8 +9,8 @@
 //! * **recognition** at a short, a typical and a long voice message — audio in, the
 //!   regions the product's transcription call returns out;
 //! * **synthesis** at a short and a typical text — text in, a 24 kHz waveform out;
-//! * **wake word** — two consecutive windows through the ear path in one batched
-//!   pass to a score.
+//! * **wake word** — two consecutive windows of the pinned corpus recording through
+//!   the ear path in one batched pass to a score.
 //!
 //! Every row carries four numbers: cold time (the process starts with no models
 //! loaded and the call loads them), warm time (the models already resident),
@@ -25,10 +25,11 @@
 //! default (a screened run). A row whose input is missing fails the run and names it.
 //! A row stopped by a guard makes the run exit [`crate::guard::EXIT_STOPPED`].
 //!
-//! Inputs: `MAHBOT_MODELS_DIR` (the two pairs and the audio tagger),
-//! `MAHBOT_VOICE_WAV` (the wake window and the synthesis reference) and
-//! `MAHBOT_FAPH_CORPUS` (the pinned recordings the recognition messages are cut
-//! from). The checkout carries no models, no corpus and no audio.
+//! Inputs: the five model files and the pinned real-audio corpus, at one fixed
+//! location per operating system ([`crate::paths`]). The three recognition rows and
+//! the wake row's windows are cut from one pinned recording of that corpus. Nothing
+//! is configured and nothing is created; a row whose input is missing fails and
+//! names the path.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -39,7 +40,7 @@ use serde_json::json;
 use crate::corpus;
 use crate::guard::Bounds;
 use crate::listen::{self, Listener};
-use crate::loader::{self, Pair, Role};
+use crate::loader::{Pair, Role};
 use crate::measurements;
 use crate::reference;
 use crate::report::{self, Stopwatch};
@@ -51,11 +52,11 @@ use crate::wake;
 /// Marks a child of the complete run: it measures the one row its argument names.
 const ROW_CHILD: &str = "MAHBOT_STAND_ROW";
 
-/// The pinned recording the three recognition messages are cut from — and the first of the
-/// two long recordings the product checks read whole: a five-minute speech file of the corpus
-/// listing. Named rather than picked out of the listing by position, so a reordering of the
-/// bench's table cannot re-point these rows at other material; `corpus::verify_file` holds it
-/// to its own pin.
+/// The pinned recording the three recognition messages are cut from, the wake row's
+/// two windows, and the first of the two long recordings the product checks read
+/// whole: a five-minute speech file of the corpus listing. Named rather than picked
+/// out of the listing by position, so a reordering of the bench's table cannot
+/// re-point these rows at other material; `corpus::pinned` holds it to its own pin.
 pub const RECOGNITION_RECORDING: &str = "speech/librivox/speech-librivox-0027.wav";
 /// The short and typical voice messages, in samples at 16 kHz.
 const SHORT_SAMPLES: usize = 10 * 16_000;
@@ -70,9 +71,9 @@ const TYPICAL_TEXT: &str = "The weather this morning is quiet and cool, so I wil
 /// short request with it, so it is named here too.
 pub const SYNTH_SEED: u64 = 1;
 
-/// The speech window in the recorded voice: the file is silent up to ~1.16 s, so
-/// the ear starts where there is speech. The reference window is a later segment
-/// of the same recording, used only as the cosine's other side.
+/// The speech window in the corpus recording: the file's speech starts within the
+/// first second, so the ear starts where there is speech. The reference window is a
+/// later segment of the same recording, used only as the cosine's other side.
 pub const WAKE_OFFSET: usize = 16_000;
 const WAKE_REFERENCE_OFFSET: usize = 60_000;
 
@@ -203,8 +204,7 @@ fn recognition(
     witness: &str,
     bounds: Bounds,
 ) -> Result<Reading> {
-    let recording = corpus::dir()?.join(RECOGNITION_RECORDING);
-    corpus::verify_file(&recording, RECOGNITION_RECORDING)?;
+    let recording = corpus::pinned(RECOGNITION_RECORDING)?;
     let limit = samples.unwrap_or(usize::MAX);
 
     let t = Stopwatch::start();
@@ -262,11 +262,9 @@ fn answer_digest(out: &transcribe::Transcription) -> String {
 
 /// One text through the product's synthesis call, cold and then warm.
 fn synthesis(row: &Row, text: &str, witness: u64, witness_samples: usize) -> Result<Reading> {
-    let voice = loader::voice_wav()?;
-
     let t = Stopwatch::start();
     let pair = Arc::new(Pair::of_role(Role::Synthesis)?);
-    let mut engine = Synthesis::new(pair, &voice)?;
+    let mut engine = Synthesis::new(pair)?;
     let cold = engine.synthesize(text, SYNTH_SEED)?;
     let cold_ms = t.ms();
     let memory = report::Memory::take();
@@ -320,10 +318,10 @@ fn synthesis(row: &Row, text: &str, witness: u64, witness_samples: usize) -> Res
 /// projector — embedded cold and warm and scored against a later window of the
 /// same recording.
 fn wake(row: &Row, witness: f32) -> Result<Reading> {
-    let voice = loader::voice_wav()?;
-    let first = window(&voice, WAKE_OFFSET)?;
+    let recording = corpus::pinned(RECOGNITION_RECORDING)?;
+    let first = window(&recording, WAKE_OFFSET)?;
     // The window the ear scores one stride later: the pair the detector forms.
-    let second = window(&voice, WAKE_OFFSET + listen::SCORE_STRIDE_SAMPLES)?;
+    let second = window(&recording, WAKE_OFFSET + listen::SCORE_STRIDE_SAMPLES)?;
 
     let t = Stopwatch::start();
     let pair = Arc::new(Pair::of_role(Role::Recognition)?);
@@ -346,7 +344,7 @@ fn wake(row: &Row, witness: f32) -> Result<Reading> {
     // The score needs a second side: a later window of the same recording, taken
     // through the same pass as the primary window rather than alone. It is not a
     // second calibration pass and not timed.
-    let reference = window(&voice, WAKE_REFERENCE_OFFSET)?;
+    let reference = window(&recording, WAKE_REFERENCE_OFFSET)?;
     let [later, primary_again] = listener.embed_pair(&reference, &first)?;
     let score = wake::cosine(&primary, &later);
     let equal = (score - witness).abs() < 5e-5;
@@ -403,7 +401,7 @@ fn call(
 
 /// One 16 kHz window at `offset`, refused when the recording is short: the
 /// ear pads a short slice with silence, and a score against a mostly-zero
-/// embedding is not a reading of the voice.
+/// embedding is not a reading of the recording.
 fn window(path: &Path, offset: usize) -> Result<Vec<f32>> {
     let samples = read(path, offset, listen::WINDOW_SAMPLES)?;
     if samples.len() < listen::WINDOW_SAMPLES {
@@ -479,22 +477,15 @@ fn table(readings: &[Reading]) -> String {
     table
 }
 
-/// The run's inputs, as bullets a reader can reproduce the rows from.
+/// The run's inputs, as bullets a reader can reproduce the rows from: the static
+/// paths themselves, never dropped — a record that omits the material it exists to
+/// name would be worse than one that refuses to be written.
 fn inputs_note() -> String {
-    let mut note = String::new();
-    for (what, path) in [
-        ("models", loader::models_dir().ok()),
-        ("voice", loader::voice_wav().ok()),
-        ("corpus", corpus::dir().ok()),
-    ] {
-        if let Some(path) = path {
-            note.push_str(&format!(
-                "- {what}: `{}`\n",
-                measurements::short_path(&path)
-            ));
-        }
-    }
-    note
+    format!(
+        "- models: `{}`\n- corpus: `{}`\n",
+        crate::paths::root().display(),
+        crate::paths::corpus().display()
+    )
 }
 
 #[cfg(test)]

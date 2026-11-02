@@ -13,8 +13,9 @@
 //! product check's, in `product_checks`. A text the talker's context cannot hold is
 //! checked too — the one request that is refused rather than rendered.
 //!
-//! Run with `MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… cargo test -p mahbot-inference
-//! --release --test speak_readback -- --ignored --nocapture --test-threads 1`.
+//! Needs both model pairs installed; a machine without them skips. Run with
+//! `cargo test -p mahbot-inference --release --test speak_readback -- --ignored
+//! --nocapture --test-threads 1`.
 //! Each subject holds a synthesis pair and then a recognition pair with the tagger,
 //! releasing the first before opening the second. The doubled render alone peaks at
 //! about 5.5 GiB of physical footprint and the three in one process peak higher than
@@ -24,7 +25,7 @@ mod support;
 
 use std::sync::Arc;
 
-use mahbot_inference::loader::{self, Pair, Role};
+use mahbot_inference::loader::{Pair, Role};
 use mahbot_inference::stand::{SHORT_TEXT, SYNTH_SEED};
 use mahbot_inference::synth::{SAMPLE_RATE, Synthesis};
 use mahbot_inference::transcribe::Transcriber;
@@ -50,20 +51,13 @@ const DOUBLED_TAIL: &str = "Circumambulate the city of a dreamy Sabbath afternoo
     come from lanes and alleys, streets and avenues, north, east, south, and west. Yet here they \
     all unite.";
 
-/// The synthesis pair and the reference voice, or `None` with the reason printed.
-fn synthesis_pair() -> Option<(Arc<Pair>, std::path::PathBuf)> {
+/// The synthesis pair, or `None` with the reason printed.
+fn synthesis_pair() -> Option<Arc<Pair>> {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return None;
     }
-    let voice = match loader::voice_wav() {
-        Ok(voice) => voice,
-        Err(error) => {
-            println!("skip: {error}");
-            return None;
-        }
-    };
     match Pair::of_role(Role::Synthesis) {
-        Ok(pair) => Some((Arc::new(pair), voice)),
+        Ok(pair) => Some(Arc::new(pair)),
         Err(error) => {
             println!("skip: {error}");
             None
@@ -74,10 +68,10 @@ fn synthesis_pair() -> Option<(Arc<Pair>, std::path::PathBuf)> {
 /// One text through the product call, then its audio read back: what the render
 /// said, in the recogniser's words.
 fn speak_and_read_back(text: &str) {
-    let Some((pair, voice)) = synthesis_pair() else {
+    let Some(pair) = synthesis_pair() else {
         return;
     };
-    let mut engine = Synthesis::new(pair, &voice).expect("the synthesis path");
+    let mut engine = Synthesis::new(pair).expect("the synthesis path");
     let memory = report::Memory::take();
     let t = report::Stopwatch::start();
     let wave = engine
@@ -143,21 +137,21 @@ fn speak_and_read_back(text: &str) {
 
 /// The stand's short request, read back.
 #[test]
-#[ignore = "needs both model pairs and the reference voice; run by hand"]
+#[ignore = "needs both model pairs; run by hand"]
 fn the_short_request_read_back() {
     speak_and_read_back(SHORT_TEXT);
 }
 
 /// The pinned long paragraph, read back whole.
 #[test]
-#[ignore = "needs both model pairs and the reference voice; run by hand"]
+#[ignore = "needs both model pairs; run by hand"]
 fn the_long_paragraph_read_back() {
     speak_and_read_back(support::TTS_TEXT);
 }
 
 /// Twice that length, likewise read back whole.
 #[test]
-#[ignore = "needs both model pairs and the reference voice; run by hand"]
+#[ignore = "needs both model pairs; run by hand"]
 fn the_doubled_text_read_back() {
     speak_and_read_back(&format!("{} {DOUBLED_TAIL}", support::TTS_TEXT));
 }
@@ -166,12 +160,12 @@ fn the_doubled_text_read_back() {
 /// graphs exist, and the refusal names what it ran out of: no waveform comes back as
 /// though it were the whole text.
 #[test]
-#[ignore = "needs the synthesis pair and the reference voice; run by hand"]
+#[ignore = "needs the synthesis pair; run by hand"]
 fn a_text_longer_than_the_context_is_refused() {
-    let Some((pair, voice)) = synthesis_pair() else {
+    let Some(pair) = synthesis_pair() else {
         return;
     };
-    let mut engine = Synthesis::new(pair, &voice).expect("the synthesis path");
+    let mut engine = Synthesis::new(pair).expect("the synthesis path");
     // Twenty thousand repetitions are tens of thousands of tokens: past any talker's
     // context, and refused before the request's own graphs are built.
     let text = "the sea ".repeat(20_000);

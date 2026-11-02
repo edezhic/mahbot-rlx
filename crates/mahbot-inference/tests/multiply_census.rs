@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Measurement only and `#[ignore]`d: the synthesis loop's per-shape rate census.
-//! Needs the model files (`MAHBOT_MODELS_DIR`); without them it prints why and
-//! returns. Run with `MAHBOT_MODELS_DIR=… RLX_ALLOW_THROTTLE=1 cargo test
-//! -p mahbot-inference --release --test multiply_census -- --ignored --nocapture`.
+//! Needs the installed model directory; without it prints why and returns. Run with
+//! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --test
+//! multiply_census -- --ignored --nocapture`.
 //! `frame_share_ms` is each family's bytes at the frame's own measured aggregate
 //! rate — a per-side constant, so within a side ordering by it is ordering by
 //! bytes. A packed multiply's own in-frame time is not attributable: it dispatches
@@ -70,10 +70,7 @@ const PAIR_ROUNDS: usize = 25;
 
 fn pair(role: Role) -> Option<Arc<Pair>> {
     let Ok(dir) = loader::models_dir() else {
-        eprintln!(
-            "skip: {} is not set — the census needs a model",
-            loader::MODELS_DIR_ENV
-        );
+        eprintln!("skip: the model directory is not installed — the census needs a model");
         return None;
     };
     match Pair::of_role(role) {

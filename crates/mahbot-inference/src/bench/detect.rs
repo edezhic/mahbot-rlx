@@ -674,7 +674,7 @@ mod tests {
         );
     }
 
-    /// The pair's decisions on real audio, not a fixture's: the pinned voice, streamed
+    /// The pair's decisions on real audio, not a fixture's: the pinned corpus recording, streamed
     /// in the microphone's own chunks through an ungrouped stream and through the
     /// product's paired one, with the real encoder behind both. The synthetic test
     /// above shows the pairing cannot move a decision when the embeddings are equal;
@@ -682,19 +682,21 @@ mod tests {
     /// pass is not enough to move one — what it would find is a score close enough to a
     /// threshold for that difference to flip it.
     ///
-    /// `#[ignore]`d: it compiles both front ends and needs the ASR pair and the voice.
-    /// Run with `MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… cargo test -p mahbot-inference
-    /// --release --lib a_real_audio_paired_stream -- --ignored --nocapture`.
+    /// `#[ignore]`d: it compiles both front ends and needs the ASR pair and the
+    /// pinned corpus recording. Run with `cargo test -p mahbot-inference --release
+    /// --lib a_real_audio_paired_stream -- --ignored --nocapture`.
     #[test]
-    #[ignore = "needs the ASR pair and the pinned voice; compiles both front ends"]
+    #[ignore = "needs the ASR pair and the pinned recording; compiles both front ends"]
     fn a_real_audio_paired_stream_decides_where_an_ungrouped_one_does() {
         if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
             return;
         }
-        let Ok(voice) = crate::loader::voice_wav() else {
-            eprintln!("skipped: {} is not set", crate::loader::VOICE_WAV_ENV);
+        if crate::corpus::dir().is_err() {
+            eprintln!("skipped: the pinned corpus is not installed");
             return;
-        };
+        }
+        let recording = crate::corpus::pinned(crate::stand::RECOGNITION_RECORDING)
+            .expect("the pinned corpus recording is installed");
         let pair = match crate::loader::Pair::of_role(crate::loader::Role::Recognition) {
             Ok(pair) => std::sync::Arc::new(pair),
             Err(error) => {
@@ -702,7 +704,7 @@ mod tests {
                 return;
             }
         };
-        let path = voice.display().to_string();
+        let path = recording.display().to_string();
         let mut listener = listen::Listener::new(pair);
 
         // An enrolment of this voice: five windows one scoring stride apart, through
@@ -711,7 +713,7 @@ mod tests {
         for i in 0..crate::wake::MIN_ENROLLMENT_UTTERANCES {
             let at = crate::stand::WAKE_OFFSET + i * listen::SCORE_STRIDE_SAMPLES;
             let window = crate::host::wav_mono_16k(&path, at, listen::WINDOW_SAMPLES)
-                .expect("a window of the pinned voice");
+                .expect("a window of the pinned corpus recording");
             utterances.push(listener.embed(&window).expect("the window embeds"));
         }
         let enrollment = crate::wake::Enrollment::build(
@@ -722,9 +724,11 @@ mod tests {
         )
         .expect("five utterances are an enrolment");
 
-        // The whole file four times over, a second of digital silence between passes:
-        // the 3 s audio-clock cooldown has to run out for the fixture to fire again.
-        let pass = crate::host::wav_mono_16k(&path, 0, usize::MAX).expect("the pinned voice");
+        // The first thirty seconds four times over, a second of digital silence
+        // between passes: the 3 s audio-clock cooldown has to run out for the
+        // fixture to fire again.
+        let pass = crate::host::wav_mono_16k(&path, 0, listen::PASS_SAMPLES)
+            .expect("the pinned corpus recording");
         let mut audio = Vec::new();
         for repeated in 0..4 {
             if repeated > 0 {
@@ -750,7 +754,7 @@ mod tests {
 
         assert!(
             !single.is_empty(),
-            "the pinned voice has to fire for the comparison to mean anything"
+            "the pinned corpus recording has to fire for the comparison to mean anything"
         );
         assert_eq!(
             two, single,

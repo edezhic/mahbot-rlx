@@ -7,9 +7,10 @@
 //! thread exactly as it found it, so the next build is not shaped by the failed one.
 //!
 //! Both checks are model-dependent (they build and compile a real recognition graph), so
-//! without `MAHBOT_MODELS_DIR` or without a wgpu adapter the test says why it skipped. They
-//! are one test on purpose: the state a failed compile leaves is thread-local, and cargo
-//! gives each `#[test]` its own thread, so a second test could not see the first one's leak.
+//! without the installed model directory or without a wgpu adapter the test says why it
+//! skipped. They are one test on purpose: the state a failed compile leaves is thread-local,
+//! and cargo gives each `#[test]` its own thread, so a second test could not see the first
+//! one's leak.
 
 use std::sync::Arc;
 
@@ -27,13 +28,13 @@ fn an_unresolvable_weight_fails_and_a_failed_build_leaves_nothing_behind() {
     }
     let Ok(dir) = loader::models_dir() else {
         eprintln!(
-            "skipped: {} is not set, so the build's failure paths were not checked",
-            loader::MODELS_DIR_ENV
+            "skipped: the model directory is not installed, so the build's failure paths were \
+             not checked"
         );
         return;
     };
     let Some((body, sound)) = loader::pair_files(Role::Recognition) else {
-        eprintln!("skipped: {} names no ASR pair", loader::MODELS_DIR_ENV);
+        eprintln!("skipped: the model directory names no ASR pair");
         return;
     };
     if !dir.join(body).exists() || !dir.join(sound).exists() {

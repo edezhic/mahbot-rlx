@@ -11,14 +11,13 @@
 //! * instrumental music yields no transcribed text;
 //! * a paste onset at a seam lands within one detector hop, and whole-input
 //!   conditioning is time-preserving;
-//! * the pinned reference clip's transcript and digest, reported as a witness;
 //! * the long recordings are read as what was said, through both reading paths;
 //! * the synthesis round trip — that the hearing reaches the text's closing words and
 //!   does not run away, with a control for each way it can fail.
 //!
-//! Run with `MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… MAHBOT_ASR_MUSIC=… \
-//! MAHBOT_FAPH_CORPUS=… cargo test -p mahbot-inference --release --test product_checks
-//! -- --ignored --nocapture`. A test whose input is absent prints why and returns.
+//! Needs the installed static tree — the models, the pinned corpus and the music pool.
+//! Run with `cargo test -p mahbot-inference --release --test product_checks --
+//! --ignored --nocapture`. A test whose input is absent prints why and returns.
 
 use std::sync::Arc;
 
@@ -26,9 +25,7 @@ use mahbot_inference::ced::{CED_MODEL, Tagger};
 use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::synth::{SAMPLE_RATE, Synthesis};
 use mahbot_inference::transcribe::{self, Transcriber};
-use mahbot_inference::{
-    corpus, host, listen, music, reference, report, stand, tokenizer::Tokenizer, vad,
-};
+use mahbot_inference::{host, listen, music, reference, report, stand, tokenizer::Tokenizer, vad};
 
 mod support;
 
@@ -77,17 +74,6 @@ fn open() -> Option<(Arc<Pair>, Tagger)> {
     let tagger = Tagger::open(&dir.join(CED_MODEL))
         .unwrap_or_else(|error| panic!("{}: {error:#}", dir.join(CED_MODEL).display()));
     Some((pair, tagger))
-}
-
-/// The reference voice, or the reason a check that needs it cannot happen.
-fn voice() -> Option<std::path::PathBuf> {
-    match loader::voice_wav() {
-        Ok(voice) => Some(voice),
-        Err(error) => {
-            println!("skip: {error:#}");
-            None
-        }
-    }
 }
 
 /// A pair that is on this machine and does not open is a failure, not a skip.
@@ -140,12 +126,12 @@ fn instrumental_music_yields_no_transcribed_text() {
 }
 
 /// **A paste onset lands within one detector hop, and conditioning is
-/// time-preserving.** The excerpt is the pinned clip as it is read, trimmed to its
+/// time-preserving.** The excerpt is the pinned corpus recording as it is read, trimmed to its
 /// own edges and cut to the detector's hop; four pastes into digital silence,
 /// separated by gaps past the merge gap, are the construction, and their offsets
 /// are the truth.
 #[test]
-#[ignore = "needs the models and the reference voice; run by hand"]
+#[ignore = "needs the models and the pinned corpus; run by hand"]
 fn a_paste_onset_lands_within_one_detector_hop() {
     const TRIM_WINDOW: usize = 160;
     const TRIM_RMS: f32 = 3e-3;
@@ -155,10 +141,10 @@ fn a_paste_onset_lands_within_one_detector_hop() {
     let Some((pair, tagger)) = open() else {
         return;
     };
-    let Some(voice) = voice() else {
+    let Some(recording) = support::recording(stand::RECOGNITION_RECORDING) else {
         return;
     };
-    let raw = match host::wav_mono_16k(&voice.display().to_string(), 0, listen::PASS_SAMPLES) {
+    let raw = match host::wav_mono_16k(&recording.display().to_string(), 0, listen::PASS_SAMPLES) {
         Ok(audio) => audio,
         Err(error) => {
             println!("skip: {error:#}");
@@ -177,7 +163,9 @@ fn a_paste_onset_lands_within_one_detector_hop() {
         .collect();
     let (first, last) = match (edges.first(), edges.last()) {
         (Some(first), Some(last)) => (*first, *last),
-        _ => panic!("the pinned clip has no 10 ms window above {TRIM_RMS}: nothing to paste"),
+        _ => panic!(
+            "the pinned corpus recording has no 10 ms window above {TRIM_RMS}: nothing to paste"
+        ),
     };
     let mut excerpt = raw[first * TRIM_WINDOW..(last + 1) * TRIM_WINDOW].to_vec();
     excerpt.truncate(excerpt.len() / vad::HOP_LENGTH * vad::HOP_LENGTH);
@@ -277,35 +265,6 @@ fn a_paste_onset_lands_within_one_detector_hop() {
     assert_eq!(moved, 0, "a gain is time-preserving and moved a boundary");
 }
 
-/// **The pinned reference clip's transcript and digest, reported as a witness.**
-/// The rule is the sentence, not the hash: a moved digest is printed and the check
-/// carries on, as long as the words still read as the pin. The witness pins one
-/// clip; a voice that is not it has nothing to be compared with, so the check says
-/// why it did not run rather than walking a different input.
-#[test]
-#[ignore = "needs the models and the reference voice; run by hand"]
-fn the_pinned_clip_reads_as_its_witness() {
-    if !reference::voice_is_pinned() {
-        println!(
-            "skip: {} does not name the voice the witness was taken with",
-            loader::VOICE_WAV_ENV
-        );
-        return;
-    }
-    let Some(asr) = pair(Role::Recognition) else {
-        return;
-    };
-    let Some(voice) = voice() else {
-        return;
-    };
-    let answer = support::listen_answer(&asr, &voice);
-    assert!(
-        support::witness_listen(&answer),
-        "the pinned clip no longer reads as its witness: {:?}",
-        answer.text
-    );
-}
-
 /// What the engine says about long real audio, and the audio it says it about: a corpus
 /// recording, the first `seconds` of it, and the text the one-shot path returned — read once
 /// against the recording and confirmed to follow its speech, so a regression fails here
@@ -343,9 +302,6 @@ const LONG_READINGS: &[(&str, usize, &str)] = &[
 #[test]
 #[ignore = "needs the models, the tagger and the pinned corpus; run by hand"]
 fn long_recordings_are_read_as_what_was_said() {
-    let Some(dir) = corpus_dir() else {
-        return;
-    };
     let Some((pair, tagger)) = open() else {
         return;
     };
@@ -354,14 +310,12 @@ fn long_recordings_are_read_as_what_was_said() {
     let mut transcriber = Transcriber::open(Arc::clone(&pair), tagger, support::ceiling_mib())
         .expect("the transcriber opens");
     for &(name, seconds, expected) in LONG_READINGS {
-        let path = dir.join(name);
-        if !path.is_file() {
-            println!("skip: {name} is not on this machine");
-            continue;
-        }
-        // A copy that is not the pinned one fails here, in the pin's own words, rather than
-        // later as a diff in the expected text.
-        corpus::verify_file(&path, name).unwrap_or_else(|error| panic!("{error:#}"));
+        // Absent corpus: skip. A recording missing from a present corpus, or a copy
+        // that is not the pinned one, fails in the pin's own words rather than later
+        // as a diff in the expected text.
+        let Some(path) = support::recording(name) else {
+            return;
+        };
         let audio = host::wav_mono_16k(
             &path.display().to_string(),
             0,
@@ -522,17 +476,6 @@ fn doubled(wave: &[f32]) -> Vec<f32> {
     [wave, wave].concat()
 }
 
-/// The corpus directory, or the reason the check cannot run.
-fn corpus_dir() -> Option<std::path::PathBuf> {
-    match corpus::dir() {
-        Ok(dir) => Some(dir),
-        Err(error) => {
-            println!("skip: {error:#}");
-            None
-        }
-    }
-}
-
 /// **The synthesis round trip:** the render — read back through the product's own
 /// transcription call, which resamples it to 16 kHz and conditions it as the application
 /// does — is heard through to the text's closing words, and does not run away: no more
@@ -550,25 +493,12 @@ fn corpus_dir() -> Option<std::path::PathBuf> {
 /// whole render said twice reaches the ending with every phrase at ×2 and only the length
 /// rule catches it.
 #[test]
-#[ignore = "needs both model pairs and the reference voice; run by hand"]
+#[ignore = "needs both model pairs; run by hand"]
 fn the_render_is_heard_through_to_the_texts_end() {
-    let Some(voice) = voice() else {
-        return;
-    };
-    // The rules were measured on the pinned voice's render: another voice input is a
-    // different render, whose ending and bounds nothing here has measured, so the check
-    // says why it did not run instead of failing on the substitution.
-    if !reference::voice_is_pinned() {
-        println!(
-            "skip: {} does not name the voice the round trip was measured with",
-            loader::VOICE_WAV_ENV
-        );
-        return;
-    }
     let Some(synthesis) = pair(Role::Synthesis) else {
         return;
     };
-    let mut engine = Synthesis::new(synthesis, &voice).expect("the synthesis path");
+    let mut engine = Synthesis::new(synthesis).expect("the synthesis path");
     let wave = engine
         .synthesize(support::TTS_TEXT, SYNTH_SEED)
         .expect("the synthesis call");

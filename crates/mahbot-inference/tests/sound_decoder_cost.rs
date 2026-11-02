@@ -5,8 +5,9 @@
 //! what one graph's arena holds while it runs, and what synthesis costs a served
 //! process in time and physical footprint.
 //!
-//! Run with `MAHBOT_MODELS_DIR=… RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference
-//! --release --test sound_decoder_cost -- --ignored --nocapture <subject>`.
+//! Needs the installed model directory; a machine without it skips. Run with
+//! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --test
+//! sound_decoder_cost -- --ignored --nocapture <subject>`.
 //! Each subject is its own test and wants its own process: the host copies of the
 //! weights a run reads stay in the process's caches, and the three arms that build
 //! graphs by hand never release their pages (only the served path does, inside the
@@ -96,7 +97,7 @@ fn footprint() -> (String, String) {
 }
 
 /// The synthesis pair a subject reads, or `None` after naming what stopped it: every
-/// subject needs the device and `MAHBOT_MODELS_DIR` naming a pair.
+/// subject needs the device and the model directory installed.
 fn pair_or_skip() -> Option<Pair> {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return None;
@@ -392,15 +393,8 @@ fn the_decoders_windows_carry_no_right_margin() {
 #[ignore = "measurement only: three synthesis calls through the library path"]
 fn the_library_path_builds_and_releases_the_decoder() {
     let Some(pair) = pair_or_skip() else { return };
-    let voice = match loader::voice_wav() {
-        Ok(voice) => voice,
-        Err(e) => {
-            eprintln!("skip: {e} — the probe did not run");
-            return;
-        }
-    };
     let t = Tick::now();
-    let mut synthesis = Synthesis::new(Arc::new(pair), &voice).expect("the synthesis object");
+    let mut synthesis = Synthesis::new(Arc::new(pair)).expect("the synthesis object");
     let (now, peak) = footprint();
     println!(
         "census library open_ms={:.1} rss_mb={} footprint={now} peak={peak}",

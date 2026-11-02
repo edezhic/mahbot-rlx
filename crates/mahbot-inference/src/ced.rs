@@ -75,7 +75,7 @@ use crate::graphs;
 use crate::loader::{CedConfig, Model, Store};
 
 /// The tagger file's name. It is an input like every other model: the caller joins
-/// it to the directory the run was pointed at.
+/// it to the one fixed model directory ([`crate::paths::root`]).
 pub const CED_MODEL: &str = "ced-small-f16.gguf";
 
 /// The artefact the labels are taken with, as `(repository, revision, sha256)`:

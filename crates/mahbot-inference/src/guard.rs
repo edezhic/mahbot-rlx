@@ -492,8 +492,8 @@ pub fn free_percent() -> Option<u64> {
 ///
 /// A caller that resolves its inputs from something other than the process
 /// environment passes that lookup in, so a configuration resolved in a test cannot
-/// name the developer's lock. A lookup that names no temp directory either cannot
-/// resolve one: the lock is refused, as the corpus cache's path is.
+/// name the developer's lock. A lookup that names no temp directory cannot resolve
+/// one: the lock is refused, and nothing substitutes for it.
 ///
 /// # Errors
 /// Neither `MAHBOT_LOCK` nor `TMPDIR`, `TMP`, `TEMP` is set, so no shared path exists.

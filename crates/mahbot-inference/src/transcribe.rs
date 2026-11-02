@@ -306,10 +306,10 @@ pub const FILLER_WORDS: usize = 2;
 /// for the answer's length to mean anything.
 pub const FILLER_SECONDS: f64 = 3.0;
 
-/// Generated tokens a chunk may spend per second of its own audio. The pinned
-/// 17.46 s recognition clip generates 3.7 a second, so ten leaves a wide margin
-/// over dense speech; what it stops is a loop — eighteen seconds of solfège once
-/// generated four thousand `la` and cost forty-five seconds of decoding.
+/// Generated tokens a chunk may spend per second of its own audio. Dense speech
+/// generates about 3.7 tokens a second of audio, so ten leaves a wide margin; what it
+/// stops is a loop — eighteen seconds of solfège once generated four thousand `la`
+/// and cost forty-five seconds of decoding.
 pub const CHUNK_TOKENS_PER_S: f64 = 10.0;
 
 /// The floor of a chunk's token budget, so a half-second region can still say a

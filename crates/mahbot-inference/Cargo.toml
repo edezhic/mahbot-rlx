@@ -7,8 +7,9 @@
 # recall, false reactions and false accepts per hour on this crate's own models,
 # and `transcription-corpus` measures the pinned real-audio corpus.
 #
-# Every input path comes from an argument or an environment variable; there is
-# no crate-relative default, because the checkout carries no models.
+# Every input lives at one fixed path per operating system (src/paths.rs); there
+# is no crate-relative default, no environment variable and no argument that names
+# a model, corpus or music path.
 
 [package]
 name = "mahbot-inference"

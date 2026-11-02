@@ -14,12 +14,11 @@
 //! the free-memory floor, with the guard thread watching them while a clip renders.
 //!
 //! A clip is keyed by content — text, seed, sample rate, both TTS files, the
-//! reference voice (or a clone's span) and the synthesis code — so a second build
-//! renders nothing, the enrolled voice's existing clips stay valid, and the one
-//! legitimate rebuild is a change to the generation path itself. Once the
-//! generation is complete the build sweeps every corpus a recorded build has
-//! superseded; the rule, and the cache-sharing trade it implies, are stated with
-//! the bench's corpus docs ([`crate::bench`]).
+//! embedded speaker (or a clone's span) and the synthesis code — so a second build
+//! renders nothing and the one legitimate rebuild is a change to the generation
+//! path itself. Once the generation is complete the build sweeps every corpus a
+//! recorded build has superseded; the rule, and the cache-sharing trade it implies,
+//! are stated with the bench's corpus docs ([`crate::bench`]).
 //!
 //! The counts are stated on two named bases: the corpus [`audio::plan`] lists, and
 //! the clip reads this invocation made, each one either reused or rendered. The two
@@ -54,7 +53,7 @@ pub fn main_entry() {
 /// Render every clip a measurement needs, then exit.
 ///
 /// # Errors
-/// A missing or malformed input; a pinned voice recording that is missing or no
+/// A missing or malformed input; a pinned corpus recording that is missing or no
 /// longer hashes to its pin; a corpus record or build manifest that cannot be read;
 /// a pool that cannot fill the voices asked for; a synthesis failure; the
 /// resident-set or swap ceiling. No report is written: the build's product is the
@@ -114,7 +113,7 @@ fn run() -> Result<()> {
         "[wake-word build] models {} · corpus {} · cache {} · {} verification voices · \
          ceiling {} MiB · swap growth {} MiB · no wall-clock bound (a build is not a \
          measurement) · lock {}",
-        cfg.models_label(),
+        cfg.models.display(),
         cfg.corpus.display(),
         cfg.cache.display(),
         cfg.voices,
@@ -179,7 +178,7 @@ impl Account {
     /// manifest that cannot be interpreted, both refuse here — naming what is wrong —
     /// rather than after hours of synthesis whose cost would then be unknown.
     fn new(cache: &Path, generation: String, started: std::time::Instant) -> Self {
-        let refusal = super::prepare_cache(cache)
+        let refusal = super::prepare_cache()
             .and_then(|()| audio::read_build_manifest(cache, &generation).map(|_| ()))
             .err();
         Self {

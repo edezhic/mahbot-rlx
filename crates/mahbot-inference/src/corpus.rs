@@ -10,6 +10,7 @@
 //! its pin before it is read, so a row names a recording whose bytes are the ones
 //! the record describes.
 //!
+//! The corpus lives at one fixed path per operating system ([`crate::paths`]).
 //! The corpus run is its own mode, started by hand like the bench:
 //! `cargo run --release -p mahbot-inference --features bench --bin
 //! transcription-corpus`. One row per pinned recording, each in a process of its
@@ -28,9 +29,6 @@ use crate::report::{self, Stopwatch};
 use crate::run::{self, Reading};
 use crate::transcribe::Transcriber;
 
-/// Where the corpus lives on the machine that supplies it.
-pub const ENV: &str = "MAHBOT_FAPH_CORPUS";
-
 /// Marks a child of the corpus run: it measures the one row its argument names.
 const ROW_CHILD: &str = "MAHBOT_CORPUS_ROW";
 
@@ -39,27 +37,32 @@ pub(crate) fn files() -> &'static [(&'static str, &'static str, u64)] {
     crate::bench::REAL_AUDIO_FILES
 }
 
-/// The corpus directory, from [`ENV`] — no default: the checkout carries no audio.
+/// The corpus directory ([`crate::paths::corpus`]), or the error naming it.
 pub fn dir() -> Result<PathBuf> {
-    match std::env::var_os(ENV) {
-        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
-        _ => bail!("{ENV} is not set — point it at the pinned real-audio corpus"),
-    }
+    crate::paths::require_dir(crate::paths::corpus(), "pinned corpus")
 }
 
 /// One recording's entry in the listing — its canonical name, SHA-256 and byte size —
 /// or the reason the name is not in it. The one lookup over the pinned table, so a
 /// name is matched and pinned by the same code.
-fn pinned(name: &str) -> Result<&'static (&'static str, &'static str, u64)> {
+fn entry(name: &str) -> Result<&'static (&'static str, &'static str, u64)> {
     files()
         .iter()
         .find(|(path, _, _)| *path == name)
         .with_context(|| format!("`{name}` is not one of the pinned corpus recordings"))
 }
 
+/// One pinned recording, resolved against the corpus directory and checked against
+/// its pin before it is read.
+pub fn pinned(name: &str) -> Result<PathBuf> {
+    let path = dir()?.join(name);
+    verify_file(&path, name)?;
+    Ok(path)
+}
+
 /// Check one file against its pin: the size first, then the SHA-256.
 pub fn verify_file(path: &Path, name: &str) -> Result<()> {
-    let (_, sha256, bytes) = *pinned(name)?;
+    let (_, sha256, bytes) = *entry(name)?;
     let len = std::fs::metadata(path)
         .with_context(|| format!("cannot read the pinned corpus file {}", path.display()))?
         .len();
@@ -106,8 +109,7 @@ fn print_rows(rows: &[Reading]) {
 /// cold (the process starts with no models loaded), then again warm.
 fn measure(index: usize, bounds: Bounds) -> Result<Reading> {
     let (name, _, _) = files()[index];
-    let path = dir()?.join(name);
-    verify_file(&path, name)?;
+    let path = pinned(name)?;
 
     let t = Stopwatch::start();
     let mut transcriber = Transcriber::open_product(bounds.max_rss_mib)?;
@@ -194,10 +196,7 @@ fn table(rows: &[Reading]) -> Result<String> {
 /// the recordings were read from.
 fn compose(rows: &[Reading]) -> Result<(String, String)> {
     let table = table(rows)?;
-    let inputs = dir().map_or_else(
-        |_| String::new(),
-        |dir| format!("- corpus: `{}`\n", measurements::short_path(&dir)),
-    );
+    let inputs = format!("- corpus: `{}`\n", crate::paths::corpus().display());
     Ok((format!("{}\n\n{}", table.trim_end(), caption(rows)), inputs))
 }
 

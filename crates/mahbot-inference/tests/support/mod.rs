@@ -288,20 +288,6 @@ pub fn listen_answer(pair: &std::sync::Arc<Pair>, path: &std::path::Path) -> Ans
     }
 }
 
-/// The listen witness: the pins compared against the walk's own reading, through
-/// the reference's one rule. Answers whether every pin held — `false` prints which
-/// one moved — and the pinned-clip check asserts on it after refusing a walk over an
-/// input that is not the recorded clip.
-pub fn witness_listen(answer: &Answer) -> bool {
-    mahbot_inference::reference::check_listen(
-        answer.frames,
-        answer.prompt_rows,
-        answer.generated.len(),
-        answer.digest,
-        &answer.text,
-    )
-}
-
 /// The one-shot path's conditioning: drop a loud, non-speech opening, then lift a
 /// quiet recording with the crate's one gain rule. Both are time-preserving or
 /// the walk is not of this audio; the product's segmented path conditions the whole
@@ -392,19 +378,27 @@ pub fn steps_for(packed: u64, target: u64) -> usize {
     ((target / packed.max(1)) as usize).clamp(1, MAX_STEPS)
 }
 
-/// The music pool, verified pin by pin, or the reason the caller cannot run: a pool
-/// directory that is not named is an absent corpus and the caller says why it did not
-/// run, while a pool the run was pointed at and that fails to verify is a broken
-/// provision and panics here rather than reading unverified audio.
+/// The music pool, verified pin by pin, or `None` with the reason printed when the
+/// pool is not installed. A pool that is present and does not match its pins is a
+/// broken installation, not material that is absent: it fails naming the file and
+/// the path, because a silent skip here would darken a ground-truth gate.
 pub fn pool() -> Option<Vec<std::path::PathBuf>> {
     if let Err(error) = mahbot_inference::music::dir() {
         println!("skip: {error:#}");
         return None;
     }
-    Some(
-        mahbot_inference::music::verify()
-            .unwrap_or_else(|error| panic!("the music pool: {error:#}")),
-    )
+    Some(mahbot_inference::music::verify().unwrap_or_else(|error| panic!("{error:#}")))
+}
+
+/// One pinned corpus recording, verified against its pin before it is read, or
+/// `None` with the reason printed when the corpus is not installed. A corpus that is
+/// installed but does not hold the pinned bytes fails: the same rule as [`pool`].
+pub fn recording(name: &str) -> Option<std::path::PathBuf> {
+    if let Err(error) = mahbot_inference::corpus::dir() {
+        println!("skip: {error:#}");
+        return None;
+    }
+    Some(mahbot_inference::corpus::pinned(name).unwrap_or_else(|error| panic!("{error:#}")))
 }
 
 impl Call {

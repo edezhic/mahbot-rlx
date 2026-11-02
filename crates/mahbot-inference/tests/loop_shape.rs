@@ -7,7 +7,7 @@
 //! packed weights are re-read.
 //!
 //! Every test whose name ends in `_with_models` needs the model files: without
-//! `MAHBOT_MODELS_DIR` `pair` prints why and the body does not run. That is a
+//! the installed model directory `pair` prints why and the body does not run. That is a
 //! skip by environment — this checkout carries no models, so a host without them
 //! cannot execute the gate at all — the same class as
 //! `rlx_ir::env::skip_unless_device`. The run-report switch is the opposite case:
@@ -27,14 +27,11 @@ mod support;
 
 fn pair(role: Role) -> Option<Arc<Pair>> {
     let Ok(dir) = loader::models_dir() else {
-        eprintln!(
-            "skip: {} is not set — the graph shapes need a model",
-            loader::MODELS_DIR_ENV
-        );
+        eprintln!("skip: the model directory is not installed — the graph shapes need a model");
         return None;
     };
-    // An incomplete pair is the same environment skip as no directory at all: a
-    // checkout does not carry the models, so this gate says it did not run.
+    // An incomplete pair is a skip like an absent directory: a checkout does not
+    // carry the models, so this gate says it did not run.
     match Pair::of_role(role) {
         Ok(pair) => Some(Arc::new(pair)),
         Err(err) => {
@@ -414,8 +411,8 @@ fn the_recognition_prompt_is_twelve_grouped_row_tiles() {
 
 /// The code-predictor frame's multiplies, counted and priced — the figures the
 /// frame census is reconciled against, printed rather than asserted because they
-/// are a census of one model's graph. Ignored by default and skipped without
-/// `MAHBOT_MODELS_DIR`, like every `_with_models` case here.
+/// are a census of one model's graph. Ignored by default and skipped without the
+/// installed model directory, like every `_with_models` case here.
 ///
 /// It prints what the census needs and none of which can be inferred from
 /// another: the multiply sites the graph has (packed and f32 apart), the ones that

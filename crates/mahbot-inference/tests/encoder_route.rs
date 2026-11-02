@@ -14,7 +14,7 @@
 //! `tests/encoder_qkv.rs` prices the two projections and needs a second arm, and
 //! `tests/wake_pair_cost.rs` prices the batched pass against two single ones; this needs the
 //! shipped one, and runs under a bare `cargo test`. Model- and device-dependent, so without
-//! `MAHBOT_MODELS_DIR` or a wgpu adapter it says why it skipped.
+//! the installed model directory or a wgpu adapter it says why it skipped.
 
 use mahbot_inference::graphs;
 use mahbot_inference::listen::{GROUP, MEL_FRAMES, PAIR};

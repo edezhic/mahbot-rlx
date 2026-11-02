@@ -6,13 +6,14 @@
 //! path — one batched pass against two one-window passes — and whether the pair's
 //! embeddings are the single-window pass's.
 //!
-//! Run with `MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… cargo test -p mahbot-inference
-//! --release --test wake_pair_cost -- --ignored --nocapture`, after `just throttle`.
+//! Needs the recognition pair and the pinned corpus recording; a machine without
+//! them skips. Run with `cargo test -p mahbot-inference --release --test
+//! wake_pair_cost -- --ignored --nocapture`, after `just throttle`.
 //!
 //! Both arms run the product's own front ends ([`Listener::embed_pair`] and
-//! [`Listener::embed`]) over the same two consecutive windows of the pinned voice —
-//! the windows the detector pairs, one scoring stride apart — so the comparison
-//! prices the batching and not an arrangement of the arithmetic. Rounds alternate
+//! [`Listener::embed`]) over the same two consecutive windows of the pinned corpus
+//! recording — the windows the detector pairs, one scoring stride apart — so the
+//! comparison prices the batching and not an arrangement of the arithmetic. Rounds alternate
 //! which arm runs first; the medians, the median of the paired differences and the
 //! rounds the pair won are what the run prints.
 //!
@@ -27,7 +28,7 @@ use std::sync::Arc;
 
 use mahbot_inference::host::wav_mono_16k;
 use mahbot_inference::listen::{self, Listener};
-use mahbot_inference::loader::{self, Pair, Role};
+use mahbot_inference::loader::{Pair, Role};
 use mahbot_inference::stand::WAKE_OFFSET;
 use mahbot_inference::wake::cosine;
 use rlx_ir::Tick;
@@ -49,16 +50,17 @@ fn a_pair_pass_against_two_single_window_passes() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
-    let Ok(voice) = loader::voice_wav() else {
-        eprintln!(
-            "skipped: {} is not set — the pair pass was not priced",
-            loader::VOICE_WAV_ENV
-        );
+    let Some(recording) = support::recording(mahbot_inference::stand::RECOGNITION_RECORDING) else {
+        eprintln!("skipped: the pinned corpus is not installed — the pair pass was not priced");
         return;
     };
     let read = |offset: usize| {
-        wav_mono_16k(&voice.display().to_string(), offset, listen::WINDOW_SAMPLES)
-            .expect("the pinned voice")
+        wav_mono_16k(
+            &recording.display().to_string(),
+            offset,
+            listen::WINDOW_SAMPLES,
+        )
+        .expect("the pinned corpus recording")
     };
     let first = read(WAKE_OFFSET);
     let second = read(WAKE_OFFSET + listen::SCORE_STRIDE_SAMPLES);

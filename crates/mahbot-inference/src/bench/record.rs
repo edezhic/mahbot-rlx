@@ -14,7 +14,6 @@ use super::config::BenchConfig;
 use super::rate;
 use super::sets;
 use super::voices;
-use crate::measurements;
 
 /// The per-stream rows, on the console: the voice subset warning, each selected
 /// voice's identity, the similarity witness, one line per voice on each side, the
@@ -523,36 +522,23 @@ pub(super) fn block(report: &Value) -> String {
 }
 
 /// The bench's inputs, as the provenance block's bullets: where the run read them
-/// from — the locations the stand and corpus records name too, so a reader can
-/// point a re-run at the same material — then every model file and every
+/// from — the static root the stand and corpus records name too, so a reader can
+/// check a re-run read the same material — then every model file and every
 /// verification voice, with its size and SHA-256.
 pub(super) fn record_inputs(cfg: &BenchConfig, report: &Value) -> String {
     let mut body = String::new();
-    match &cfg.models {
-        Some(dir) => body.push_str(&format!("- models: `{}`\n", measurements::short_path(dir))),
-        None => body.push_str(
-            "- models: per-role files, named by `--asr-body`, `--asr-sound`, `--tts-body` and \
-             `--tts-sound`\n",
-        ),
-    }
-    body.push_str(&format!(
-        "- corpus: `{}`\n",
-        measurements::short_path(&cfg.corpus)
-    ));
+    body.push_str(&format!("- models: `{}`\n", cfg.models.display()));
+    body.push_str(&format!("- corpus: `{}`\n", cfg.corpus.display()));
     let models = report.get("models");
     let pin = |section: &str, key: Option<&str>| -> Option<&Value> {
         let node = models?.get(section)?;
         key.map_or(Some(node), |key| node.get(key))
     };
-    // The voice's bullet states its location — it is the one input that lives
-    // outside the model directory — and every other file its name there.
-    let voice = measurements::short_path(&cfg.voice);
-    for (role, location, value) in [
-        ("ASR body", None, pin("recognition", Some("body"))),
-        ("ASR sound", None, pin("recognition", Some("sound"))),
-        ("TTS body", None, pin("synthesis", Some("body"))),
-        ("TTS sound", None, pin("synthesis", Some("sound"))),
-        ("voice", Some(voice.as_str()), pin("voice_wav", None)),
+    for (role, value) in [
+        ("ASR body", pin("recognition", Some("body"))),
+        ("ASR sound", pin("recognition", Some("sound"))),
+        ("TTS body", pin("synthesis", Some("body"))),
+        ("TTS sound", pin("synthesis", Some("sound"))),
     ] {
         // One behaviour for an absent pin: the bullet is written and names the
         // absence, whether the report has no pin or a pin without the figure.
@@ -565,14 +551,10 @@ pub(super) fn record_inputs(cfg: &BenchConfig, report: &Value) -> String {
             .and_then(Value::as_u64)
             .map(|bytes| format!("{bytes} bytes"))
             .unwrap_or_else(|| UNAVAILABLE.to_string());
-        let file = location.map_or_else(
-            || {
-                pin.get("file")
-                    .and_then(Value::as_str)
-                    .unwrap_or(UNAVAILABLE)
-            },
-            |path| path,
-        );
+        let file = pin
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or(UNAVAILABLE);
         body.push_str(&format!(
             "- {role}: `{file}` · {bytes} · sha256 {}\n",
             pin.get("sha256")

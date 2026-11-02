@@ -457,6 +457,15 @@ pub(crate) fn record_run(mode: Mode) {
     }
 
     let bounds = bounds(label);
+    // Which files this run reads, on stderr: stdout carries the one-JSON-line row
+    // protocol and gains nothing.
+    eprintln!(
+        "{label}: models {} · corpus {} · music {} · wake-corpus {}",
+        crate::paths::root().display(),
+        crate::paths::corpus().display(),
+        crate::paths::music().display(),
+        crate::paths::wake_corpus().display(),
+    );
     // The lock is taken before the rows, whatever the run will be allowed to write:
     // screening decides whether a record is written, never whether the device is
     // shared, and a run under a raised bound measures exactly like any other.

@@ -5,8 +5,9 @@
 //! projections, as three separate packed passes against one wide pass over the same
 //! bytes concatenated (`graphs::block`'s `qkv_fused`).
 //!
-//! Run with `MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… RLX_ALLOW_THROTTLE=1 cargo test
-//! -p mahbot-inference --release --test encoder_qkv -- --ignored --nocapture <subject>`.
+//! Needs the installed model directory and the pinned corpus recording; a machine
+//! without them skips. Run with `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference
+//! --release --test encoder_qkv -- --ignored --nocapture <subject>`.
 //! One subject per process (`wake_window`, `tail_cells`): the device keeps what a subject
 //! built, and each holds two spellings of the encoder's weights.
 //!
@@ -311,14 +312,14 @@ fn time_arms(
 
 /// The pinned recording's window the wake row embeds, as the product reads it.
 fn window_slice() -> Option<Vec<f32>> {
-    let path = loader::voice_wav().ok();
-    let samples = path.and_then(|p| {
-        host::wav_mono_16k(&p.display().to_string(), WAKE_OFFSET, WINDOW_SAMPLES).ok()
-    });
+    let path = support::recording(mahbot_inference::stand::RECOGNITION_RECORDING)?;
+    let samples = host::wav_mono_16k(&path.display().to_string(), WAKE_OFFSET, WINDOW_SAMPLES).ok();
     match samples {
         Some(s) if s.len() == WINDOW_SAMPLES => Some(s),
         _ => {
-            eprintln!("skipped: no wake window under the voice recording — nothing to measure");
+            eprintln!(
+                "skipped: no wake window in the pinned corpus recording — nothing to measure"
+            );
             None
         }
     }

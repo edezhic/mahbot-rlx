@@ -7,7 +7,7 @@
 //!
 //! **What it pins.** Not a golden vector — there is none for this model here —
 //! but the thing a tagger is *for*, on a corpus whose split is ground truth
-//! (`~/.mahbot/asr_audio/sources.md`): every vocal clip's five best labels name
+//! (the pool's own `sources.md`): every vocal clip's five best labels name
 //! a voice, the a cappella solfège recording is not tagged as an instrument,
 //! none of the four instrumental clips is tagged as speech, and at least one of
 //! them is tagged as music or an instrument. Around those assertions the run
@@ -34,10 +34,10 @@
 //! label, not a cosine. It says nothing about a device without wgpu (it skips)
 //! and nothing about another CED checkpoint — the pins below name one file.
 //!
-//! **When it runs.** The test ends in `_with_models`. It needs the pinned GGUF
-//! under `MAHBOT_MODELS_DIR` and the eight clips under `MAHBOT_ASR_MUSIC`, plus a
-//! wgpu adapter; without any of them it prints why and returns, and an input the
-//! run was pointed at that is not what it names fails.
+//! **When it runs.** The test ends in `_with_models`. It needs the pinned GGUF in
+//! the installed model directory and the eight clips in the installed music pool,
+//! plus a wgpu adapter; without any of them it prints why and returns, and an input
+//! that is present and is not what it names fails.
 
 use std::path::PathBuf;
 
@@ -49,9 +49,9 @@ use mahbot_inference::report;
 
 mod support;
 
-/// The model directory: `MAHBOT_MODELS_DIR`'s, or the reason this gate cannot run.
-/// The crate's tests skip on an absent variable and say so; a variable that is set
-/// and names something this gate cannot use is a mis-provisioned run, and fails.
+/// The installed model directory, or the reason this gate cannot run. An absent
+/// tree or an absent model file is a skip and says so; a file that exists and does
+/// not open is a mis-provisioned run, and fails.
 fn models_dir() -> Option<PathBuf> {
     let dir = match loader::models_dir() {
         Ok(dir) => dir,
@@ -62,11 +62,8 @@ fn models_dir() -> Option<PathBuf> {
     };
     let path = dir.join(CED_MODEL);
     if !path.is_file() {
-        panic!(
-            "{} is set and {} is not on this machine",
-            loader::MODELS_DIR_ENV,
-            path.display()
-        );
+        println!("skip: {} is not installed", path.display());
+        return None;
     }
     Some(dir)
 }

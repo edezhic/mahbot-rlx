@@ -321,14 +321,14 @@ fn pretokenize(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// Needs the synthesis pair in `MAHBOT_MODELS_DIR`; without it the test
-    /// prints that it did not run and returns, so it proves nothing here.
+    /// Needs the synthesis pair installed; without it the test prints that it did
+    /// not run and returns, so it proves nothing here.
     #[test]
     fn qwen3_tts_known_phrase() {
         // The models are inputs, not repository content: a machine without them
         // skips this check instead of failing on a path the checkout lacks.
         let Ok(dir) = crate::loader::models_dir() else {
-            eprintln!("skipped: {} is not set", crate::loader::MODELS_DIR_ENV);
+            eprintln!("skipped: the model directory is not installed");
             return;
         };
         let Some((body, _)) = crate::loader::pair_files(crate::loader::Role::Synthesis) else {

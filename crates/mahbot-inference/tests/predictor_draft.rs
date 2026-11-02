@@ -21,9 +21,9 @@
 //! collect if the frames were independent, which they are not ([`graphs`]'
 //! `tts_code_predictor_frame`).
 //!
-//! Run with `MAHBOT_MODELS_DIR=… MAHBOT_VOICE_WAV=… RLX_ALLOW_THROTTLE=1 cargo
-//! test -p mahbot-inference --release --test predictor_draft -- --ignored
-//! --nocapture`.
+//! Needs the synthesis pair installed; a machine without it skips. Run with
+//! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --test
+//! predictor_draft -- --ignored --nocapture`.
 
 use std::sync::Arc;
 
@@ -110,7 +110,7 @@ fn shape_ms(scheme: QuantScheme, k: usize, n: usize, packed: u64) -> (f64, f64) 
 }
 
 #[test]
-#[ignore = "measurement only: needs the synthesis pair and the pinned voice"]
+#[ignore = "measurement only: needs the synthesis pair"]
 fn the_predictor_frame_its_chain_and_the_stacks_ratio() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
@@ -129,31 +129,19 @@ fn the_predictor_frame_its_chain_and_the_stacks_ratio() {
             return;
         }
     };
-    let voice = match loader::voice_wav() {
-        Ok(voice) => voice,
-        Err(e) => {
-            eprintln!("skip: {e} — the probe did not run");
-            return;
-        }
-    };
 
     // The shipped walk's waveform, through the library path the bench's corpus
     // synthesis uses. Nothing here pins the waveform: a render is as long as its text,
     // and what it says is judged by the words the recogniser hears from it
     // (`reference.rs` carries that rule, and the finiteness and the PCM range are the
     // hard gates). The sample count is the reading this prints.
-    let mut synthesis =
-        Synthesis::new(pair.clone(), &voice).expect("compile the synthesis pipeline");
+    let mut synthesis = Synthesis::new(pair.clone()).expect("compile the synthesis pipeline");
     let t = Tick::now();
     let wave = synthesis
         .synthesize(support::TTS_TEXT, SEED)
         .expect("the shipped walk's sound half");
     let synth_ms = Tick::now().elapsed_ns(t) as f64 / 1e6;
-    println!(
-        "draft wave samples={} voice_pinned={} synth_ms={synth_ms:.1}",
-        wave.len(),
-        mahbot_inference::reference::voice_is_pinned(),
-    );
+    println!("draft wave samples={} synth_ms={synth_ms:.1}", wave.len());
     drop(synthesis);
 
     // The frame's own arrangement: its shapes, its time and its steps by kind. The fold's

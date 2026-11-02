@@ -62,8 +62,7 @@ pub(crate) enum Missing {
 /// What a measurement tells an engineer who finds a clip missing: the one
 /// instruction, worded once, for both the pre-flight and the per-clip refusal.
 pub(crate) const BUILD_FIRST: &str = "a measurement never renders, and a corpus build does: \
-     `cargo run --release -p mahbot-inference --features bench --bin wake-word-build -- <the same \
-     model, voice and corpus inputs>`";
+     `cargo run --release -p mahbot-inference --features bench --bin wake-word-build`";
 
 /// One synthesised-and-cached TTS front end. It owns the run's guards so a
 /// cache miss — the only phase that can be long — stops at the next clip.
@@ -75,8 +74,6 @@ pub(crate) const BUILD_FIRST: &str = "a measurement never renders, and a corpus 
 /// graphs before building the next.
 pub(crate) struct Synth {
     pair: Arc<Pair>,
-    /// The enrolled reference the owner's renders are built from.
-    voice: PathBuf,
     cache: PathBuf,
     synthesis_hash: String,
     /// What a cache miss does: the build renders it, a measurement stops and names
@@ -97,7 +94,6 @@ pub(crate) struct Synth {
 impl Synth {
     pub(crate) fn new(
         pair: Arc<Pair>,
-        voice: PathBuf,
         cache: PathBuf,
         synthesis_hash: String,
         missing: Missing,
@@ -107,7 +103,6 @@ impl Synth {
     ) -> Self {
         Self {
             pair,
-            voice,
             cache,
             synthesis_hash,
             missing,
@@ -267,12 +262,11 @@ impl Synth {
             .is_some_and(|(built, _)| *built == wanted);
         if !resident {
             self.pipeline = None;
-            let path = speaker
-                .voice()
-                .map_or_else(|| self.voice.clone(), |voice| voice.wav.clone());
-            let built = Synthesis::new(Arc::clone(&self.pair), &path).with_context(|| {
-                format!("cannot build the synthesis path for {}", speaker.name())
-            })?;
+            let built = match speaker.voice() {
+                None => Synthesis::new(Arc::clone(&self.pair)),
+                Some(voice) => Synthesis::with_reference(Arc::clone(&self.pair), &voice.wav),
+            }
+            .with_context(|| format!("cannot build the synthesis path for {}", speaker.name()))?;
             self.pipeline = Some((wanted, built));
         }
         Ok(&mut self.pipeline.as_mut().expect("just built").1)
@@ -497,12 +491,13 @@ pub(crate) fn sweep(
 
 /// Deterministic cache key for one synthesised utterance: text, seed, sample
 /// rate and the synthesis model's own hash — both TTS files' digests and the
-/// reference voice's, because the voice WAV is part of every prompt.
+/// synthesis code's, which carries the embedded speaker, because the speaker is
+/// part of every prompt.
 ///
-/// A clone voice adds its span's identity after the code hash. The enrolled
-/// voice passes none, so its key is the one its cached renders were stored under
-/// and they stay valid; no clone can be served another voice's audio — or the
-/// owner's.
+/// A clone voice adds its span's identity after the code hash; the enrolled voice
+/// passes none, so it is the code hash alone that decides whether its cached
+/// renders are reused. No clone can be served another voice's audio — or the
+/// enrolled one's.
 fn cache_key(
     text: &str,
     seed: u64,
@@ -1539,9 +1534,8 @@ mod tests {
         assert_ne!(base, cache_key("hey mahbot", 7, 24_000, "other", None));
         assert_eq!(base.len(), 64);
 
-        // The enrolled voice's key is byte for byte the historical one, so the
-        // renders already cached under it stay valid; a clone adds its own span
-        // and no two voices share an entry.
+        // A clone adds its own span and no two voices share an entry; the enrolled
+        // voice passes none, so the code hash alone decides its clips.
         let clone_a = cache_key("hey mahbot", 7, 24_000, "model", Some("a:0.00:15.00"));
         let clone_b = cache_key("hey mahbot", 7, 24_000, "model", Some("b:0.00:15.00"));
         assert_ne!(base, clone_a);

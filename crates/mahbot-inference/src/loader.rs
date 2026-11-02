@@ -17,7 +17,8 @@
 //! and checks the GGUF header/offset layout the parser hands it.
 //!
 //! Nothing here writes to the model files: they are opened read-only and
-//! mmapped.
+//! mmapped. The directory they live in is one fixed path per operating system
+//! ([`crate::paths`]), not an input.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,33 +28,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use rlx_gguf::{GgmlType, GgufFile, MetaValue, bytes_for_public};
 use rlx_ir::quant::QuantScheme;
 
-/// The directory holding the five model files. The path is an input: the
-/// checkout carries no models, so there is no crate-relative default.
-pub const MODELS_DIR_ENV: &str = "MAHBOT_MODELS_DIR";
-
-/// The recorded 16 kHz voice reference the ear, recognition and synthesis read.
-pub const VOICE_WAV_ENV: &str = "MAHBOT_VOICE_WAV";
-
-/// The model directory from [`MODELS_DIR_ENV`], or the error naming it.
+/// The one directory holding the five model files ([`crate::paths::ROOT`]), or the
+/// error naming it. The directory is provisioned by hand; a missing one is an
+/// error, never a created directory and never a substitute.
 pub fn models_dir() -> Result<PathBuf> {
-    env_dir(MODELS_DIR_ENV, "the model directory")
-}
-
-/// The voice reference from [`VOICE_WAV_ENV`], or the error naming it.
-pub fn voice_wav() -> Result<PathBuf> {
-    match std::env::var_os(VOICE_WAV_ENV) {
-        Some(v) if !v.is_empty() => Ok(PathBuf::from(v)),
-        _ => Err(anyhow!(
-            "{VOICE_WAV_ENV} is not set — point it at the 16 kHz mono voice reference WAV"
-        )),
-    }
-}
-
-fn env_dir(name: &str, what: &str) -> Result<PathBuf> {
-    match std::env::var_os(name) {
-        Some(v) if !v.is_empty() => Ok(PathBuf::from(v)),
-        _ => Err(anyhow!("{name} is not set — point it at {what}")),
-    }
+    crate::paths::require_dir(crate::paths::root(), "model")
 }
 
 /// What a tensor is, as far as loading rules are concerned.

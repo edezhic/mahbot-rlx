@@ -90,16 +90,9 @@ pub const CLIPS: &[Clip] = &[
     },
 ];
 
-/// Where the pool lives on the machine that supplies it.
-pub const DIR_ENV: &str = "MAHBOT_ASR_MUSIC";
-
-/// The pool's directory, from [`DIR_ENV`] (no default: the checkout carries no
-/// audio).
+/// The pool's directory ([`crate::paths::music`]), or the error naming it.
 pub fn dir() -> Result<PathBuf> {
-    match std::env::var_os(DIR_ENV) {
-        Some(v) if !v.is_empty() => Ok(PathBuf::from(v)),
-        _ => bail!("{DIR_ENV} is not set — point it at the music pool's directory"),
-    }
+    crate::paths::require_dir(crate::paths::music(), "music pool")
 }
 
 /// Every pinned clip present with its size and sha256 — the same gate the models

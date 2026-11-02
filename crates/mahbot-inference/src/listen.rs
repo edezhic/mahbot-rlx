@@ -41,9 +41,8 @@ const _: () = assert!(WINDOW_SAMPLES == MEL_FRAMES * graphs::MEL_HOP);
 /// most a fire can be resolved later than a one-window pass would resolve it.
 pub const SCORE_STRIDE_SAMPLES: usize = 16 * graphs::MEL_HOP;
 
-/// The most audio the harnesses that read the pinned clip take: 30 s (3 000 mel
-/// frames). The clip is 17.46 s, so this is the harness's own bound on a voice file
-/// that is not the pinned one — not a limit of the reading path, which cuts any
+/// The most audio the harnesses that read a pinned recording take: 30 s (3 000 mel
+/// frames) — a bound on the fixture, not a limit of the reading path, which cuts any
 /// length into pieces.
 pub const PASS_SAMPLES: usize = 30 * SAMPLE_RATE as usize;
 
@@ -53,8 +52,8 @@ pub const ASR_MAX_NEW: usize = 2_048;
 
 /// The recognition prompt's fixed ends, in the tokenizer's own ids: 3 head rows
 /// and 6 text rows before the encoder's audio rows, 6 tail rows after them. The
-/// audio count is the piece's (80 rows for each piece of the recorded 17.46 s
-/// reference), so the prompt's length is not a constant.
+/// audio count is the piece's (80 rows for a 640-frame piece), so the prompt's
+/// length is not a constant.
 pub const ASR_HEAD_IDS: [usize; 3] = [151644, 8948, 198];
 pub const ASR_TEXT_IDS: [usize; 6] = [151645, 198, 151644, 872, 198, 151669];
 pub const ASR_TAIL_IDS: [usize; 6] = [151670, 151645, 198, 151644, 77091, 198];
@@ -64,8 +63,8 @@ pub const ASR_EOS: usize = 151645;
 /// recogniser identifies the language itself, and on noisy speech it answers
 /// `language None` and stops, so the whole chunk comes back empty — one 26.8 s voice
 /// message did, and every one of its pieces. With the tag supplied the model transcribes
-/// the audio's own language regardless of it (the pinned Russian clip returns its pinned
-/// words under an English tag) and the tag never reaches a transcript: everything up to
+/// the audio's own language regardless of it (a tag naming another language does not
+/// translate the answer) and the tag never reaches a transcript: everything up to
 /// [`ASR_TEXT`] is stripped. Only a chunk the tagger calls speech or singing *and* whose
 /// loudness varies the way speech does is told the language
 /// ([`crate::transcribe::SPEECH_SPREAD_DB`]); every other chunk gets the prompt the
@@ -1213,17 +1212,17 @@ mod tests {
     /// depend on which slot of the group it took.
     ///
     /// The tree carries no models, so no gate can run this: it is opt-in on both
-    /// `MAHBOT_MODELS_DIR` and `MAHBOT_GROUP_PARITY=1`, and the second exists so a
-    /// plain `cargo test` in a shell that has the first does not compile seven
-    /// graphs (~1.5 GiB of device work) by accident. Run it deliberately with
-    /// `MAHBOT_MODELS_DIR=<dir> MAHBOT_GROUP_PARITY=1 cargo test -p
-    /// mahbot-inference --lib a_grouped_pass`.
+    /// the models being installed and `MAHBOT_GROUP_PARITY=1`, and the second
+    /// exists so a plain `cargo test` in a shell that has the models does not
+    /// compile seven graphs (~1.5 GiB of device work) by accident. Run it
+    /// deliberately with `MAHBOT_GROUP_PARITY=1 cargo test -p mahbot-inference --lib
+    /// a_grouped_pass`.
     #[test]
     fn a_grouped_pass_matches_the_single_window_pass() {
         let Ok(models) = crate::loader::models_dir() else {
             eprintln!(
-                "skipped: {} is not set, so the grouped-pass equivalence was not checked",
-                crate::loader::MODELS_DIR_ENV
+                "skipped: the model directory is not installed, so the grouped-pass equivalence \
+                 was not checked"
             );
             return;
         };
@@ -1236,10 +1235,7 @@ mod tests {
         }
         use crate::loader::Role;
         let Some((body, sound)) = crate::loader::pair_files(Role::Recognition) else {
-            eprintln!(
-                "skipped: {} names no ASR pair",
-                crate::loader::MODELS_DIR_ENV
-            );
+            eprintln!("skipped: the loader names no ASR pair");
             return;
         };
         let (body, sound) = (models.join(body), models.join(sound));
