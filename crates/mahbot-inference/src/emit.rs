@@ -7,7 +7,7 @@
 //! Every graph in this crate is assembled on `rlx-flow`: `ModelFlow` carries the
 //! topology, a [`LayerStage`](rlx_flow::LayerStage) per graph emits the blocks
 //! through `FlowCtx`'s emission surface and `HirMut`'s op set, and the loader
-//! above supplies the weights. Three weight paths:
+//! above supplies the weights. Four weight paths:
 //!
 //! * **body and sound** rank-2 tensors (`Store::Packed`) — the file's own
 //!   packed bytes through [`WeightSource::take_packed`], so
@@ -18,6 +18,9 @@
 //!   on the host and multiplied as a `MatMul` whose weight is an f16 `Param`, for
 //!   a file that is f16 end to end (`crate::ced`'s tagger). The packed route is
 //!   every other file's.
+//! * **packed row tables** ([`row_table`]) — a table the graph reads a few rows
+//!   at a time keeps the file's own Q8_0 bytes and the rows are gathered and
+//!   dequantised on device; any other scheme is widened to f32 and gathered.
 //!
 //! A `name#step` key is a stacked tensor read one step at a time (the code
 //! predictor's fifteen LM heads), and takes the same paths on its slice.
@@ -52,7 +55,7 @@ use rlx_flow::{FlowCtx, GgufPackedLinear, WeightSource};
 use rlx_gguf::bytes_for_public;
 use rlx_ir::hir::{HirGraphExt, HirMut};
 use rlx_ir::op::{Activation, MaskKind, PadMode, ReduceOp};
-use rlx_ir::{DType, HirNodeId, HirOp, Op, Shape};
+use rlx_ir::{DType, Dim, HirNodeId, HirOp, Op, Shape};
 
 use crate::loader::{self, Model, Store};
 
@@ -726,8 +729,8 @@ pub fn f32_param(
 }
 
 /// A prefix of a tensor's values (the first `count` of its own order): how
-/// `position_embd` contributes only the positions a window needs, and how a
-/// stacked codebook gives up one level. One leaf a name, as [`f32_param`].
+/// `position_embd` contributes only the positions a window needs. One leaf a
+/// name, as [`f32_param`].
 pub fn prefix_param(
     ctx: &mut FlowCtx<'_>,
     model: &Model,
@@ -1041,6 +1044,106 @@ pub fn gather(ctx: &mut FlowCtx<'_>, table: HirNodeId, indices: HirNodeId) -> Hi
     h(ctx).gather_(table, indices, 0)
 }
 
+/// A table the graph reads by row: the file's packed bytes read on device, or the
+/// f32 image [`loader::row_route`] widens it to.
+pub enum Table {
+    /// A `U8` param of the file's own bytes, gathered and dequantised on device.
+    Packed {
+        node: HirNodeId,
+        geometry: loader::PackedRows,
+    },
+    /// One f32 param of the whole table, gathered by index.
+    Widened(HirNodeId),
+}
+
+/// The parameter a packed row table is declared as: one `U8` lane per byte of the
+/// file's own packed bytes. [`row_table`] declares exactly this, so its route and
+/// length are pinned by a test that needs no model; that the frame graph declares
+/// *this* parameter is `tests/loop_shape.rs`'s model-gated case.
+pub fn packed_table_param(geometry: &loader::PackedRows) -> Shape {
+    Shape::new(&[geometry.bytes], DType::U8)
+}
+
+/// The table `name`, served the way [`loader::row_route`] decides. The packed arm
+/// declares a `Param` of the file's own bytes, bound at compile time like any packed
+/// weight; the widened arm is one f32 param of `[rows, cols]`. The packed route has
+/// no host fallback — see [`gather_rows`].
+pub fn row_table(ctx: &mut FlowCtx<'_>, model: &Arc<Model>, name: &str) -> Result<Table> {
+    let p = model.plan(name)?;
+    match loader::row_route(p) {
+        loader::Rows::Packed(geometry) => {
+            // The `\0q` key is what makes this a packed parameter: the compile
+            // binds its bytes from the file ([`bound_weight`]) and skips the read
+            // when the device already holds them.
+            let key = format!("{name}\0q");
+            let shape = packed_table_param(&geometry);
+            note_origin(name, model);
+            if let Some(node) = declared_param(ctx, &key, &shape) {
+                return Ok(Table::Packed { node, geometry });
+            }
+            let bytes = serve_packed(&key, model, geometry.bytes);
+            let node = ctx.synth_typed_param(&key, bytes, shape);
+            Ok(Table::Packed { node, geometry })
+        }
+        loader::Rows::Widened { rows, cols } => {
+            Ok(Table::Widened(f32_param(ctx, model, name, &[rows, cols])?))
+        }
+    }
+}
+
+/// `bias` rows into `table`, gathered: the one call each stage makes, on either
+/// route. `bias` is the level's first row (`level * vocab`).
+///
+/// The packed route is an `Op::Custom`, so the memory planner's host-indexing pin —
+/// which matches op *variants* — cannot see it, and a frame graph that loses its last
+/// `Gather` plans with tighter slot reuse: one `narrow_split` copy per block-level
+/// instead of the absorbed fold (`tests/loop_shape.rs` pins the count). It also has no
+/// host fallback — it addresses the arena absolutely, so a binding window smaller than
+/// the arena refuses the compile.
+pub fn gather_rows(
+    ctx: &mut FlowCtx<'_>,
+    table: &Table,
+    indices: HirNodeId,
+    bias: usize,
+) -> HirNodeId {
+    match table {
+        Table::Packed { node, geometry } => {
+            // The op's wire format: `[cols, rows, bias]`, u32 each. The scheme is not
+            // in it — the route serves Q8_0 and nothing else, which the kernel's own
+            // block geometry is written for.
+            let mut attrs = Vec::with_capacity(12);
+            for v in [geometry.cols as u32, geometry.rows as u32, bias as u32] {
+                attrs.extend_from_slice(&v.to_le_bytes());
+            }
+            // The output is the indices' own shape with the table's width appended:
+            // one row out per index in.
+            let mut dims = ctx.hir().node(indices).shape.dims().to_vec();
+            dims.push(Dim::Static(geometry.cols));
+            let out = Shape::from_dims(&dims, DType::F32);
+            ctx.hir().mir(
+                Op::Custom {
+                    name: "mahbot.gather_packed".to_string(),
+                    num_inputs: 2,
+                    attrs,
+                },
+                vec![*node, indices],
+                out,
+            )
+        }
+        Table::Widened(node) => {
+            // The bias folds into a constant only when it is not zero: level 0's
+            // gather is the common case and pays nothing for it.
+            let idx = if bias == 0 {
+                indices
+            } else {
+                let at = constant(ctx, &[1], bias as f32);
+                add(ctx, indices, at)
+            };
+            gather(ctx, *node, idx)
+        }
+    }
+}
+
 /// An elementwise activation the sound stages need beyond the body's set
 /// (`ReLU`/`tanh`/`sigmoid`/`sqrt` in the speaker encoder; `Log` in the mel
 /// front's log10).
@@ -1100,25 +1203,6 @@ pub fn linear_slice(values: &[f32], step: usize, k: usize, n: usize) -> Vec<f32>
         }
     }
     out
-}
-
-/// One table of a stacked `[d, rows, steps]` file tensor: step `step`'s
-/// `[rows, d]` table in row-major order (`d` fastest) — already the layout
-/// `Gather` reads rows in (the code predictor's per-step code embeddings and
-/// the RVQ codebooks).
-pub fn table_slice(values: &[f32], step: usize, rows: usize, cols: usize) -> Vec<f32> {
-    values[step * rows * cols..(step + 1) * rows * cols].to_vec()
-}
-
-/// A `Param` node for values the stage built itself (a slice, a table).
-pub fn sliced_param(
-    ctx: &mut FlowCtx<'_>,
-    name: &str,
-    step: usize,
-    values: Vec<f32>,
-    dims: &[usize],
-) -> HirNodeId {
-    synth_param(ctx, &format!("{name}#{step}"), values, dims)
 }
 
 /// A `Param` node for values the stage computed itself, under its own name —

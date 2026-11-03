@@ -15,14 +15,14 @@ use crate::kernels::{
     FftButterflyStageParams, FmaParams, FramesParams, FusedConvBiasActParams,
     FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams,
     GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
-    GatherBwdParams, GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams,
-    GruParams, Im2Col2dParams, IndexingNdParams, LayerNorm2dParams, LayerNormBwdParams,
-    LayerNormParams, LstmParams, Mamba2Params, MatmulQkvParams, MaxPool2dBwdParams,
-    MaxPool3dBwdParams, NarrowConcatParams, NarrowSplitParams, NormRopeParams, Pool1dParams,
-    Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QuantI8Params, ReduceParams,
-    ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, SampleParams,
-    ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams, SceParams,
-    SelectiveScanParams, SnakeBetaParams, SoftmaxParams, TopKParams, TransposeParams,
+    GatherBwdParams, GatherPackedParams, GatherParams, GroupNormBwdParams, GroupNormParams,
+    GroupedMatmulParams, GruParams, Im2Col2dParams, IndexingNdParams, LayerNorm2dParams,
+    LayerNormBwdParams, LayerNormParams, LstmParams, Mamba2Params, MatmulQkvParams,
+    MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams, NarrowSplitParams, NormRopeParams,
+    Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QuantI8Params,
+    ReduceParams, ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
+    SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams,
+    SceParams, SelectiveScanParams, SnakeBetaParams, SoftmaxParams, TopKParams, TransposeParams,
     UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
 };
 
@@ -598,6 +598,12 @@ pub(crate) enum Step {
     },
     GatherAxis {
         params: GatherAxisParams,
+    },
+    /// Rows out of a packed GGUF Q8_0 table, dequantised on device — the
+    /// `mahbot.gather_packed` route (`kernels/gather_packed.wgsl`). An ordinary
+    /// device step: no host round trip, no submission of its own.
+    GatherPacked {
+        params: GatherPackedParams,
     },
     Attention {
         params: AttentionParams,
@@ -1598,6 +1604,10 @@ impl Step {
             | Step::RopeBackward { .. }
             | Step::CumsumBackward { .. }
             | Step::GatherBackward { .. } => false,
+            // Only `n_idx` is a bucket axis (the gathered rows); the table's own
+            // geometry is not, so this scales exactly as `Step::Gather` does and
+            // must not veto the gate for the rest of the schedule.
+            Step::GatherPacked { .. } => true,
             // The `meta` strides are baked from the full shape, so shrinking the
             // thread count alone would decompose flat positions against the
             // wrong extents. Same call as the CUDA/ROCm launches, which skip
@@ -1685,6 +1695,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ConcatHostPieces { .. } => "concat_host_pieces",
         Step::Gather { .. } => "gather",
         Step::GatherAxis { .. } => "gather_axis",
+        Step::GatherPacked { .. } => "gather_packed",
         // The two-sided band kernel is a different pipeline from the fused
         // entry's (`kernels::attention_band_kernel`, picked from the mask kind),
         // so the schedule report names it rather than folding it into
@@ -1945,6 +1956,9 @@ pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
         //
         // `Frames` is a producer in that same shape: one dispatch writing the
         // whole frame matrix an elementwise front-end reads back.
+        //
+        // `GatherPacked` is `Gather`'s device twin — it writes f32 rows a following
+        // elementwise step reads — so it is a producer on the same terms.
         Step::Binary { .. }
         | Step::SnakeBeta { .. }
         | Step::Unary { .. }
@@ -1960,6 +1974,7 @@ pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
                     | Step::MatmulQkv { .. }
                     | Step::BufferCopy { .. }
                     | Step::Gather { .. }
+                    | Step::GatherPacked { .. }
                     | Step::Frames { .. }
                     | Step::Reduce { .. }
             )

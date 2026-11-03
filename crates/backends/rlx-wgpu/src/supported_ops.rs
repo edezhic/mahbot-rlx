@@ -392,8 +392,8 @@ pub fn routes_to_cpu_host(op: &rlx_ir::Op) -> bool {
 /// `Op::Custom` is absent too, and for a different reason: a custom WGSL kernel
 /// binds the window relative to the op's operands by contract (see
 /// `crate::wgpu_gpu_custom`), so it re-bases like any other windowed kernel.
-/// The one absolute path under it — the built-in `umap.knn` GPU step — carries
-/// its own guard in the lowering arm.
+/// The absolute paths under it — the built-in `umap.knn` GPU step and mahbot's
+/// `mahbot.gather_packed` — carry their own guards in the lowering arms.
 pub const ABSOLUTE_OFFSET_KINDS: &[OpKind] = &[
     OpKind::AttentionBackward,
     OpKind::Sample,

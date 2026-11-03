@@ -176,7 +176,7 @@
 //!
 //! What separates the forms is the dispatch's column count, not its tile: in
 //! window A the same per-workgroup work reads 41.6 GB/s at 2 048 columns and 81.9
-//! at 49 152. One predictor frame is sixteen levels, 1 465 dispatch slots (348 of
+//! at 49 152. One predictor frame is sixteen levels, 878 dispatch slots (348 of
 //! them multiplies) over 1 341 MiB, so the frame's next step is how many
 //! dispatches it issues, not the shape of any one of them.
 //!

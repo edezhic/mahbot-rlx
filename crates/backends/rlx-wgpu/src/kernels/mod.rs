@@ -129,6 +129,9 @@ pub const FRAMES_WORKGROUP: u32 = 64;
 pub const GATHER_WGSL: &str = include_str!("gather.wgsl");
 pub const GATHER_SPLIT_WGSL: &str = include_str!("gather_split.wgsl");
 pub const GATHER_AXIS_WGSL: &str = include_str!("gather_axis.wgsl");
+/// Rows out of a packed GGUF Q8_0 table, dequantised on device — see the
+/// shader's header and `lower.rs`'s `mahbot.gather_packed` arm.
+pub const GATHER_PACKED_WGSL: &str = include_str!("gather_packed.wgsl");
 pub const ATTENTION_WGSL: &str = include_str!("attention.wgsl");
 /// Banded (windowed) attention — the body [`attention_band_kernel`] prefixes
 /// with the tile constants [`attention_band_form_at`] derives for the adapter's
@@ -1313,6 +1316,29 @@ pub struct GatherAxisParams {
     pub table_off: u32,
     pub idx_off: u32,
     pub out_off: u32,
+}
+
+/// Layout for `mahbot.gather_packed`: rows out of a packed GGUF Q8_0 table,
+/// dequantised on device (see `gather_packed.wgsl`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct GatherPackedParams {
+    /// Number of indices, i.e. output rows.
+    pub n_idx: u32,
+    /// Elements per row — a whole number of Q8_0 blocks.
+    pub cols: u32,
+    /// Table rows, for clamping an out-of-range index.
+    pub rows: u32,
+    /// Q8_0 blocks per row, `cols / 32`.
+    pub blocks_per_row: u32,
+    /// Byte offset of the packed table inside its own binding.
+    pub tbl_byte_off: u32,
+    /// Offset of the f32-encoded indices, in arena words.
+    pub idx_off: u32,
+    /// Offset of the output, in arena words.
+    pub out_off: u32,
+    /// Added to each index before truncation.
+    pub idx_bias: f32,
 }
 
 /// Layout for fused SDPA.
@@ -3077,6 +3103,7 @@ static FRAMES: OnceLock<Kernel> = OnceLock::new();
 static GATHER: OnceLock<Kernel> = OnceLock::new();
 static GATHER_SPLIT: OnceLock<Kernel> = OnceLock::new();
 static GATHER_AXIS: OnceLock<Kernel> = OnceLock::new();
+static GATHER_PACKED: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_DECODE_MERGE: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_DECODE: OnceLock<Kernel> = OnceLock::new();
@@ -4443,6 +4470,24 @@ pub fn frames_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn gather_kernel(device: &wgpu::Device) -> &'static Kernel {
     GATHER.get_or_init(|| build_kernel(device, "rlx-wgpu gather", GATHER_WGSL, "gather"))
+}
+/// Rows out of a packed GGUF Q8_0 table, dequantised on device — the one
+/// device step behind `mahbot.gather_packed` (see `gather_packed.wgsl`).
+///
+/// Binding 2 is declared read_write, not read-only: an arena-resident packed
+/// table makes bindings 0 and 2 the same buffer, and wgpu's usage scope treats
+/// a read-only + read-write pair on one buffer as a conflict while rw+rw is
+/// legal. `build_kernel_3_with(.., false)` is that access mode.
+pub fn gather_packed_kernel(device: &wgpu::Device) -> &'static Kernel {
+    GATHER_PACKED.get_or_init(|| {
+        build_kernel_3_with(
+            device,
+            "rlx-wgpu gather_packed",
+            GATHER_PACKED_WGSL,
+            "gather_packed",
+            false,
+        )
+    })
 }
 /// Split-binding gather: table (ro) + uniform + idx (ro) + out (rw, separate
 /// buffer). For >4 GiB arenas where the embedding output lies outside the

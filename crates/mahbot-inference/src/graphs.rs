@@ -2115,7 +2115,8 @@ fn emit_predictor_blocks(
 pub const PREDICTOR_HEAD_WEIGHT: &str = "a.gen.code.head.weight";
 
 /// A constant F32 tensor from its values — the frame walk's per-level RoPE
-/// tables and masks, and the gather's slot offset.
+/// tables and masks. [`emit::constant`] is the same node for one repeated
+/// scalar; this one carries arbitrary values.
 fn f32_values(ctx: &mut FlowCtx<'_>, dims: &[usize], values: &[f32]) -> HirNodeId {
     assert_eq!(values.len(), dims.iter().product::<usize>());
     let mut data = Vec::with_capacity(values.len() * 4);
@@ -2205,6 +2206,8 @@ impl LayerStage for CodePredictorFrameStage {
         // The code table is one `[steps, vocab, d_talker]` stack; flattening the
         // first two axes makes a level's row a plain leading-axis gather, which
         // is the one embedding lookup this backend serves without a transpose.
+        // It is read from its packed Q8_0 bytes, dequantised as the row is
+        // gathered, so no f32 image of the stack is built.
         let p = model.plan("a.gen.code.embd.weight")?.clone();
         let (d_embd, vocab, slots) = (p.ggml_shape[0], p.ggml_shape[1], p.ggml_shape[2]);
         assert_eq!(
@@ -2224,12 +2227,7 @@ impl LayerStage for CodePredictorFrameStage {
             "the LM head projects {head_out} rows, the code table has {vocab} rows per \
              level; a wider head would gather another level's row"
         );
-        let table = emit::f32_param(
-            ctx,
-            model,
-            "a.gen.code.embd.weight",
-            &[slots * vocab, d_talker],
-        )?;
+        let table = emit::row_table(ctx, model, "a.gen.code.embd.weight")?;
 
         // Each block's key/value plane: level 0 seeds `[its row; zeros]` and
         // every later level appends one row into it, so the cache is never
@@ -2247,10 +2245,7 @@ impl LayerStage for CodePredictorFrameStage {
             } else {
                 // `s == 1` drew `ids[0]`, so level `s` embeds level `s - 1`'s
                 // code from slot `s - 2`.
-                let at = ((s - 2) * vocab) as f32;
-                let at = f32_values(ctx, &[1], &[at]);
-                let idx = emit::add(ctx, ids[s - 2], at);
-                emit::gather(ctx, table, idx)
+                emit::gather_rows(ctx, &table, ids[s - 2], (s - 2) * vocab)
             };
             let (cos, sin) = crate::host::rope_tables_at(s, 1, head_dim, 1e6);
             let cos: Vec<f32> = cos.iter().map(|v| *v as f32).collect();
@@ -2652,7 +2647,9 @@ fn kv_tail(
 /// and projected together, and the two projections add up.
 ///
 /// Rows are read **by index** — a codebook is a lookup, not a nearest-neighbour
-/// search — which is what keeps `ArgMin` out of the decoding path.
+/// search — which is what keeps `ArgMin` out of the decoding path. The tables are
+/// read from their packed Q8_0 bytes, dequantised as the rows are gathered, so no
+/// f32 image of either is built.
 pub struct QuantDecodeStage {
     pub model: Arc<Model>,
     /// Frames; the codes arrive level-major (`16 × frames` numbers), exactly
@@ -2672,21 +2669,16 @@ impl LayerStage for QuantDecodeStage {
     ) -> Result<(FlowValue, StageArtifacts)> {
         let model = &self.model;
         let frames = self.frames;
-        let first = model.plan("a.gen.wav.quant.first.codebook.weight")?.clone();
-        let (vocab, d) = (first.dims[0], first.dims[1]);
+        let p = model.plan("a.gen.wav.quant.first.codebook.weight")?;
+        let (vocab, d) = (p.dims[0], p.dims[1]);
         let out_dim = model
             .plan("a.gen.wav.quant.first.out_proj.weight")?
             .in_out()
             .1;
 
-        let table = emit::f32_param(
-            ctx,
-            model,
-            "a.gen.wav.quant.first.codebook.weight",
-            &[vocab, d],
-        )?;
+        let first = emit::row_table(ctx, model, "a.gen.wav.quant.first.codebook.weight")?;
         let ids = emit::narrow(ctx, input.hir_id(), 0, 0, frames);
-        let sem = emit::gather(ctx, table, ids);
+        let sem = emit::gather_rows(ctx, &first, ids, 0);
         let sem = emit::linear(
             ctx,
             &FlowValue::new(sem, Shape::new(&[frames, d], DType::F32)),
@@ -2696,21 +2688,11 @@ impl LayerStage for QuantDecodeStage {
         let levels = model
             .plan("a.gen.wav.quant.rest.codebook.weight")?
             .ggml_shape[2];
-        let rest = model
-            .f32_file_order("a.gen.wav.quant.rest.codebook.weight")?
-            .0;
+        let rest = emit::row_table(ctx, model, "a.gen.wav.quant.rest.codebook.weight")?;
         let mut acc: Option<HirNodeId> = None;
         for level in 0..levels {
-            let t = emit::table_slice(&rest, level, vocab, d);
-            let node = emit::sliced_param(
-                ctx,
-                "a.gen.wav.quant.rest.codebook.weight",
-                level,
-                t,
-                &[vocab, d],
-            );
             let ids = emit::narrow(ctx, input.hir_id(), 0, (level + 1) * frames, frames);
-            let e = emit::gather(ctx, node, ids);
+            let e = emit::gather_rows(ctx, &rest, ids, level * vocab);
             acc = Some(match acc {
                 None => e,
                 Some(a) => emit::add(ctx, a, e),
@@ -3754,6 +3736,35 @@ pub fn stream_bytes(graph: &rlx_ir::Graph) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{FRONT_WINDOW, front_lengths, windows};
+
+    /// The three sound tables the graphs read by row are declared by
+    /// `emit::row_table`, never as an f32 image — the revert a plain run can see,
+    /// since the graphs that read them need the sound file (see [`emit::gather_rows`]
+    /// for what a model-free check cannot reach).
+    #[test]
+    fn the_row_tables_are_declared_by_the_packed_route_and_never_as_f32_images() {
+        let src: String = include_str!("graphs.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for name in [
+            "a.gen.code.embd.weight",
+            "a.gen.wav.quant.rest.codebook.weight",
+            "a.gen.wav.quant.first.codebook.weight",
+        ] {
+            assert!(
+                src.contains(&format!("emit::row_table(ctx,model,\"{name}\")")),
+                "`{name}` is not declared by `emit::row_table`"
+            );
+            // The revert this guards: widening the table again. It adds an
+            // `f32_param` call, which this sees whatever the row-table call looks
+            // like.
+            assert!(
+                !src.contains(&format!("f32_param(ctx,model,\"{name}\"")),
+                "`{name}` is declared as an f32 image — it is a packed row table"
+            );
+        }
+    }
 
     /// The codec's windows tile the part: every frame falls in exactly one core, a
     /// core sits inside its span, no span leaves the part or reaches more than one

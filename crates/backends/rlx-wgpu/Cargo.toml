@@ -518,6 +518,10 @@ name = "gather_index_bias"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "gather_packed_parity"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "spd_host_parity"
 required-features = ["backend-tests"]
 

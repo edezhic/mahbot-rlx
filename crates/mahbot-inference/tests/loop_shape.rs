@@ -21,7 +21,7 @@ use mahbot_inference::graphs;
 use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::reference::LISTEN_PIECE_PROMPT_ROWS;
 use rlx_flow::BuiltModel;
-use rlx_ir::Op;
+use rlx_ir::{DType, Op};
 
 mod support;
 
@@ -201,7 +201,9 @@ fn the_synthesis_body_schedule_has_no_row_copy_with_models() {
 /// transpose, one in-place `KvAppend` per block and cache at every projecting
 /// level (level 0 seeds each block's plane with a concat instead), and no
 /// layer-axis narrow. Its schedule carries no `buffer_copy` and no `host_op`
-/// either: each append already stands at the row its attention reads. The two
+/// either: each append already stands at the row its attention reads. The code
+/// table is the file's own Q8_0 bytes — a `U8` parameter of 66 846 720 bytes
+/// gathered by `mahbot.gather_packed`, not a 251 658 240-byte f32 image. The two
 /// counters are read from the backend's process-global
 /// `device_submit_count` / `device_wait_count` after the compile and upload,
 /// around two frames of the compiled graph.
@@ -235,6 +237,23 @@ fn a_predictor_frame_is_one_fence_and_one_submission_per_encode_chunk_with_model
     )
     .expect("compile the predictor frame");
     let graph = &frame.runner.graph;
+    let table = graph
+        .nodes()
+        .iter()
+        .find(|n| matches!(&n.op, Op::Param { name } if name == "a.gen.code.embd.weight\0q"))
+        .expect("the code table is a parameter of the frame graph");
+    assert_eq!(
+        (table.shape.dtype(), table.shape.num_elements()),
+        (DType::U8, Some(66_846_720)),
+        "the code table is the file's packed bytes, not an f32 image"
+    );
+    assert!(
+        graph
+            .nodes()
+            .iter()
+            .any(|n| matches!(&n.op, Op::Custom { name, .. } if name == "mahbot.gather_packed")),
+        "the table's rows are gathered and dequantised on device"
+    );
     assert_eq!(
         input_names(graph),
         ["hidden", "code0_embed"],
@@ -311,13 +330,16 @@ fn a_predictor_frame_is_one_fence_and_one_submission_per_encode_chunk_with_model
     );
     assert_eq!(count("rope"), 0, "no rope keeps a dispatch of its own");
     // Level 0's project-in reads two of its three parts, so that one keeps its
-    // two `narrow`s; every other split is absorbed by the pair it feeds.
+    // two `narrow`s.
+    assert_eq!(count("narrow"), 2, "the one partial split stays decomposed");
+    // Every other split is one copy per block-level, 75 a frame: the fold that
+    // absorbed it into the norm+rope pair is refused now that the frame has no
+    // plain `Gather` for the planner to pin (`emit::gather_rows` says why).
     assert_eq!(
         count("narrow_split"),
-        0,
-        "the split that feeds a pair rides in the pair's dispatch"
+        blocks * steps,
+        "one split dispatch per block of the projecting levels"
     );
-    assert_eq!(count("narrow"), 2, "the one partial split stays decomposed");
     let seeds: Vec<u64> = (0..steps as u64).map(|k| 12345 + k).collect();
     assert!(
         frame.runner.set_sample_seeds(&seeds),
@@ -347,7 +369,7 @@ fn a_predictor_frame_is_one_fence_and_one_submission_per_encode_chunk_with_model
     // Submissions are the encode chunks, not the frame and not the multiplies: the
     // backend hands one encoder on every `RLX_WGPU_ENCODE_CHUNK` steps so that a
     // chunk's execution overlaps the next one's encode (`run.rs`'s own doc has the
-    // measurement). One per frame would expose the whole 1 465-step encode with the
+    // measurement). One per frame would expose the whole 878-step encode with the
     // device idle; one per multiply (348 a frame) is the shape the join removed.
     let per_frame = rlx_wgpu::device_submit_count() / 2;
     assert!(
@@ -430,7 +452,7 @@ fn the_recognition_prompt_is_twelve_grouped_row_tiles() {
 /// live 348 is exactly what the frame dispatches. The backend lowering of the flow
 /// graph still emits all 351 steps, so the other half of the method is the frame's
 /// own schedule: `RLX_WGPU_SCHEDULE=1 ./target/release/mahbot-inference 4` prints
-/// one 1 465-step graph with `348 × dequant_matmul_gguf`, `79 × attention` and
+/// one 878-step graph with `348 × dequant_matmul_gguf`, `79 × attention` and
 /// `79 × fused_swiglu` — the same one instance short, dropped as dead work rather
 /// than shared or reused.
 ///

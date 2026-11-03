@@ -169,6 +169,19 @@ impl FlowCtx<'_> {
         id
     }
 
+    /// A `Param` whose bytes are not f32 — a packed blob the graph's own op reads as
+    /// bytes. The dtype is the shape's, so a caller cannot declare one dtype and
+    /// stage another; the bytes reach the session through `typed_params`, not
+    /// [`Self::synth_param`]'s f32 map.
+    pub fn synth_typed_param(&mut self, name: &str, bytes: Vec<u8>, shape: Shape) -> HirNodeId {
+        let dtype = shape.dtype();
+        let id = self.hir().param(name, shape);
+        self.state
+            .typed_params
+            .push((name.to_string(), bytes, dtype));
+        id
+    }
+
     pub fn synth_zeros(&mut self, name: &str, len: usize) -> HirNodeId {
         self.synth_param(name, vec![0f32; len], Shape::new(&[len], DType::F32))
     }
@@ -293,8 +306,7 @@ impl FlowCtx<'_> {
         } = packed;
         let wq_key = format!("{weight_key}\0q");
         let wq_shape = Shape::new(&[w_q.len()], DType::U8);
-        let wq_id = self.hir().param(&wq_key, wq_shape);
-        self.state.typed_params.push((wq_key, w_q, DType::U8));
+        let wq_id = self.synth_typed_param(&wq_key, w_q, wq_shape);
         self.state
             .packed_linears
             .insert(weight_key.to_string(), (wq_id, out_dim, scheme));
@@ -351,10 +363,8 @@ impl FlowCtx<'_> {
                 ..
             } = packed;
             let wq_key = format!("{key}\0q");
-            let wq = self
-                .hir()
-                .param(&wq_key, Shape::new(&[w_q.len()], DType::U8));
-            self.state.typed_params.push((wq_key, w_q, DType::U8));
+            let shape = Shape::new(&[w_q.len()], DType::U8);
+            let wq = self.synth_typed_param(&wq_key, w_q, shape);
             return Ok(LinearWeight::Packed {
                 wq,
                 out_dim,
@@ -404,10 +414,8 @@ impl FlowCtx<'_> {
                     }
                     let out_dim: usize = dims.iter().sum();
                     let wq_key = format!("{}\0fused", keys[0]);
-                    let wq = self
-                        .hir()
-                        .param(&wq_key, Shape::new(&[bytes.len()], DType::U8));
-                    self.state.typed_params.push((wq_key, bytes, DType::U8));
+                    let shape = Shape::new(&[bytes.len()], DType::U8);
+                    let wq = self.synth_typed_param(&wq_key, bytes, shape);
                     Ok(FusedProj::Fused {
                         weight: LinearWeight::Packed {
                             wq,
@@ -422,10 +430,8 @@ impl FlowCtx<'_> {
                     let mut ws = Vec::with_capacity(keys.len());
                     for (i, p) in parts.into_iter().enumerate() {
                         let wq_key = format!("{}\0q", keys[i]);
-                        let wq = self
-                            .hir()
-                            .param(&wq_key, Shape::new(&[p.w_q.len()], DType::U8));
-                        self.state.typed_params.push((wq_key, p.w_q, DType::U8));
+                        let shape = Shape::new(&[p.w_q.len()], DType::U8);
+                        let wq = self.synth_typed_param(&wq_key, p.w_q, shape);
                         ws.push(LinearWeight::Packed {
                             wq,
                             out_dim: p.out_dim,

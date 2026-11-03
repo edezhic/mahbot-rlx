@@ -29,36 +29,37 @@ use crate::kernels::{
     FftButterflyStageParams, FmaParams, FramesParams, FusedConvBiasActParams,
     FusedResidualLnParams, FusedResidualLnTeeParams, FusedResidualRmsNormParams, FusedSwiGLUParams,
     GatedDeltaNetParams, GatedResidualBackwardParams, GatedResidualParams, GatherAxisParams,
-    GatherBwdParams, GatherParams, GroupNormBwdParams, GroupNormParams, GroupedMatmulParams,
-    GruParams, Im2Col2dParams, IndexingNdParams, Kernel, LayerNorm2dParams, LayerNormBwdParams,
-    LayerNormParams, LstmParams, Mamba2Params, MatmulParams, MatmulQkvParams, MaxPool2dBwdParams,
-    MaxPool3dBwdParams, NarrowConcatParams, NarrowSplitParams, NormRopeParams, Pool1dParams,
-    Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QUANT_I8_MAX_CHAN, QuantI8Params,
-    ReduceParams, ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
-    SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams,
-    SceParams, SelectiveScanParams, SnakeBetaParams, SoftmaxParams, TopKParams, TransposeParams,
-    UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams, activation_backward_kernel,
-    ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
-    attention_kernel, attention_mask_kernel, axial_rope2d_kernel, batch_elementwise_region_kernel,
-    batch_norm_inference_bwd_beta_kernel, batch_norm_inference_bwd_gamma_kernel,
-    batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_c64_kernel,
-    binary_kernel, cast_f32_to_f16_kernel, cast_kernel, compare_kernel, complex_cast_kernel,
-    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, concat_many_kernel,
-    concat_vec4_kernel, conjugate_c64_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel,
-    conv1d_implicit_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
-    conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel,
-    copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
-    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
-    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
-    fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
-    fma_kernel, frames_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel,
-    fused_residual_ln_tee_kernel, fused_residual_ln_tee_vec4_kernel,
-    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
-    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
-    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_elements_kernel, gather_kernel,
-    gather_nd_kernel, gather_split_kernel, group_norm_backward_beta_kernel,
-    group_norm_backward_gamma_kernel, group_norm_backward_input_kernel, group_norm_kernel,
-    grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
+    GatherBwdParams, GatherPackedParams, GatherParams, GroupNormBwdParams, GroupNormParams,
+    GroupedMatmulParams, GruParams, Im2Col2dParams, IndexingNdParams, Kernel, LayerNorm2dParams,
+    LayerNormBwdParams, LayerNormParams, LstmParams, Mamba2Params, MatmulParams, MatmulQkvParams,
+    MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams, NarrowSplitParams, NormRopeParams,
+    Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QUANT_I8_MAX_CHAN,
+    QuantI8Params, ReduceParams, ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
+    RopeParams, SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams,
+    SceBwdParams, SceParams, SelectiveScanParams, SnakeBetaParams, SoftmaxParams, TopKParams,
+    TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
+    activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
+    argmax_kernel, attention_bwd_kernel, attention_kernel, attention_mask_kernel,
+    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
+    batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
+    batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
+    cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
+    complex_norm_sq_kernel, concat_kernel, concat_many_kernel, concat_vec4_kernel,
+    conjugate_c64_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_implicit_kernel,
+    conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
+    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, copy_sanitize_kernel,
+    cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
+    dequant_matmul_mlx_kernel, dequantize_i8_kernel, elementwise_region_kernel,
+    elementwise_region_spatial_kernel, expand_kernel, fake_quantize_fixed_kernel,
+    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel, frames_kernel,
+    fused_conv_bias_act_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
+    fused_residual_ln_tee_vec4_kernel, fused_residual_rms_norm_kernel, fused_swiglu_kernel,
+    gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
+    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel,
+    gather_elements_kernel, gather_kernel, gather_nd_kernel, gather_packed_kernel,
+    gather_split_kernel, group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
+    group_norm_backward_input_kernel, group_norm_kernel, grouped_matmul_kernel, gru_kernel,
+    im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
     layernorm_kernel, layernorm_vec4_kernel, lead_pack_uniform, lstm_kernel, mamba2_kernel,
     matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
@@ -12325,6 +12326,194 @@ pub(crate) fn compile_static_inner(
                             k,
                         });
                     }
+                }
+                "mahbot.gather_packed" => {
+                    // Rows out of a PACKED GGUF Q8_0 table, dequantised as they are
+                    // read: `out[i, c] = dequant(table[idx[i]])`, one device step
+                    // (`kernels/gather_packed.wgsl`), no staging and no submission
+                    // of its own.
+                    let table_id = node.inputs[0];
+                    let idx_id = node.inputs[1];
+                    assert!(
+                        attrs.len() == 12,
+                        "rlx-wgpu: REFUSED (mahbot.gather_packed attributes): the op takes exactly \
+                         12 attribute bytes [cols, rows, bias], got {}",
+                        attrs.len()
+                    );
+                    let attr =
+                        |i: usize| u32::from_le_bytes(attrs[i * 4..i * 4 + 4].try_into().unwrap());
+                    let (cols, rows, bias) = (attr(0), attr(1), attr(2));
+                    // Q8_0 only — the scheme is not on the wire because the route serves
+                    // no other, and every other scheme's block geometry would give a
+                    // plausible wrong `row_bytes`, i.e. a silently misread table.
+                    let scheme = rlx_ir::QuantScheme::GgufQ8_0;
+                    // `num_elements` is a byte count only for a `U8` table: an f32 one
+                    // declared at the same length would pass every guard below and be
+                    // read as Q8_0 blocks. Nothing else checks it (the IR verifier does
+                    // not know a custom op's contract).
+                    assert!(
+                        graph.node(table_id).shape.dtype() == rlx_ir::DType::U8,
+                        "rlx-wgpu: REFUSED (mahbot.gather_packed table dtype): the table must be a \
+                         U8 parameter of packed bytes, got {:?}",
+                        graph.node(table_id).shape.dtype()
+                    );
+                    assert!(
+                        rows > 0 && cols > 0,
+                        "rlx-wgpu: REFUSED (mahbot.gather_packed geometry): the table declares \
+                         rows={rows}, cols={cols}; a zero row leaves an index nothing to clamp \
+                         to, and a zero width writes no element. This route refuses the table \
+                         rather than dispatch a step that reads or writes nothing."
+                    );
+                    // A row has to be whole Q8_0 blocks: `gguf_row_bytes` and the
+                    // kernel's block count both truncate, so a ragged width would
+                    // leave every row's tail stale.
+                    let block_elems = scheme.gguf_block_size() as usize;
+                    assert!(
+                        (cols as usize).is_multiple_of(block_elems),
+                        "rlx-wgpu: REFUSED (mahbot.gather_packed row width): a row of {cols} elements \
+                         is not a whole number of Q8_0 blocks ({block_elems}), so the row has no \
+                         packed stride. Widen the table and gather the widened table instead."
+                    );
+                    let blocks_per_row = (cols as usize / block_elems) as u32;
+                    let row_bytes = blocks_per_row as u64 * scheme.gguf_block_bytes() as u64;
+                    let table_bytes = graph.node(table_id).shape.num_elements().unwrap_or(0) as u64;
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    // The row stride the kernel applies has to be the one the
+                    // tensor actually has: a mismatch reads every row after the
+                    // first from the wrong bytes, and Q8_0 garbage is plausible
+                    // weight data.
+                    assert!(
+                        table_bytes == rows as u64 * row_bytes,
+                        "rlx-wgpu: REFUSED (mahbot.gather_packed row stride): the table declares \
+                         {table_bytes} bytes, but the attrs' geometry (rows={rows}, cols={cols}, \
+                         row_bytes={row_bytes}) is {} bytes — the packed row stride does not \
+                         match the tensor",
+                        rows as u64 * row_bytes
+                    );
+                    // One storage-binding window, or nothing: a windowed read of a
+                    // packed table would stride into the wrong rows silently. The
+                    // window is the one the bind group is given below, not the table's
+                    // own length: the binding starts at the table's 256-byte-aligned
+                    // base, so it can be up to 255 bytes longer.
+                    let table_tag = arena.offset(table_id);
+                    let (t_buf, t_raw) = arena.resolve_w(table_tag);
+                    const TBL_ALIGN: u64 = 256;
+                    let t_base = (t_raw as u64 / TBL_ALIGN) * TBL_ALIGN;
+                    let t_needed = (t_raw as u64 + table_bytes - t_base).max(4);
+                    // The size the bind group is actually handed — rounded up to 4
+                    // and clamped to the buffer's capacity — so a table inside the
+                    // rounding is refused here rather than by a raw wgpu validation
+                    // error.
+                    let t_bind = aligned_bind_size(t_needed, t_base, t_buf.size());
+                    assert!(
+                        t_bind.is_some_and(|s| s.get() <= max_binding),
+                        "rlx-wgpu: REFUSED (mahbot.gather_packed binding window): the table is \
+                         bound as {} bytes ({table_bytes} of it, from base {t_base}) and does not \
+                         fit one storage-binding window ({max_binding}) — this route refuses \
+                         rather than read the wrong bytes. Widen the table, or gather it on a \
+                         backend whose binding window is larger.",
+                        t_bind.map_or(0, |s| s.get())
+                    );
+                    // The indices and the output are addressed by ABSOLUTE arena
+                    // offset, so only the whole arena bound at base zero is
+                    // correct. Refuse here, by this route's name, rather than let
+                    // the generic bind-window assert speak for it.
+                    assert!(
+                        arena.binds_whole_at_base_zero(max_binding),
+                        "rlx-wgpu: REFUSED (mahbot.gather_packed arena window): this route reads the \
+                         indices and writes the output by ABSOLUTE arena offset, so it needs the \
+                         whole arena bound at base zero; this arena ({} bytes, sharded={}) does \
+                         not fit one binding window ({max_binding}) or is striped. Unstripe it, \
+                         or move the graph to a backend that can.",
+                        arena.size,
+                        arena.is_sharded()
+                    );
+                    // A table parked in the weight buffer can straddle two weight
+                    // shards: `resolve_w` returns the shard it starts in and the
+                    // binding clamps to that shard's end, so the shader would read
+                    // zeros past the boundary. Neither placement path crosses a
+                    // boundary today (`from_plan_split` spills a table wider than a
+                    // shard into the act arena, and `plan_weight_placements` skips a
+                    // shard it does not fit), so this cannot fire as things stand —
+                    // it is here because the failure it prevents is a silent read of
+                    // zeros, not an error.
+                    if crate::buffer::is_weight_off(table_tag) {
+                        let raw = crate::buffer::raw_weight_off(table_tag);
+                        let shard = arena.weight_shard_size;
+                        assert!(
+                            shard == 0
+                                || table_bytes == 0
+                                || raw / shard == (raw + table_bytes as usize - 1) / shard,
+                            "rlx-wgpu: REFUSED (mahbot.gather_packed weight shards): the packed table \
+                             ({table_bytes} bytes at weight offset {raw}) straddles two weight \
+                             shards (shard size {shard}) and this route binds it whole. Raise the \
+                             shard cap, or widen the table."
+                        );
+                    }
+                    let idx_dims = graph.node(idx_id).shape.dims();
+                    let n_idx: u32 = idx_dims.iter().map(|d| d.unwrap_static() as u32).product();
+                    // The dispatch writes `n_idx * cols` f32 words into the node's
+                    // planned slot: a graph declaring a smaller output would spill
+                    // into the next planned occupant.
+                    assert!(
+                        node.shape.num_elements() == Some(n_idx as usize * cols as usize),
+                        "rlx-wgpu: REFUSED (mahbot.gather_packed output shape): the node declares {:?} \
+                         elements, but gathering {n_idx} rows of {cols} elements writes {}",
+                        node.shape.num_elements(),
+                        n_idx as usize * cols as usize
+                    );
+                    // The shader's table offsets are relative to the 256-byte-aligned
+                    // base `t_base` the binding starts at, whatever buffer it is in.
+                    let params = GatherPackedParams {
+                        n_idx,
+                        cols,
+                        rows,
+                        blocks_per_row,
+                        tbl_byte_off: (t_raw as u64 - t_base) as u32,
+                        // Indices and output are activations in the arena window
+                        // bound at base zero; `arena_local_off_f32` panics on a
+                        // weight-tagged id, which is the guard wanted here.
+                        idx_off: arena_local_off_f32(&arena, idx_id, 0),
+                        out_off: arena_local_off_f32(&arena, node.id, 0),
+                        idx_bias: bias as f32,
+                    };
+                    schedule.push(Step::GatherPacked { params });
+                    let gk = gather_packed_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<GatherPackedParams>());
+                    let (bind_buf, bind_local) = arena_bind_buf(&arena, 0);
+                    let arena_bytes = (arena.size as u64).min(bind_buf.size()).max(256);
+                    let bg = dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("rlx-wgpu gather_packed bg"),
+                        layout: &gk.bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: bind_buf,
+                                    offset: bind_local,
+                                    size: aligned_bind_size(
+                                        arena_bytes,
+                                        bind_local,
+                                        bind_buf.size(),
+                                    ),
+                                }),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: u.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: t_buf,
+                                    offset: t_base,
+                                    size: t_bind,
+                                }),
+                            },
+                        ],
+                    });
+                    uniforms.push(u);
+                    bind_groups.push(bg);
                 }
                 "gdino.ms_deform_attn" => {
                     let in_offs: Vec<(u32, u32)> = node

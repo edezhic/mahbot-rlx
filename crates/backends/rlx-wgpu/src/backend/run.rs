@@ -46,7 +46,7 @@ use crate::kernels::{
     fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
     gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
     gather_backward_acc_kernel, gather_backward_zero_kernel, gather_elements_kernel, gather_kernel,
-    gather_nd_kernel, gather_split_kernel, group_norm_backward_beta_kernel,
+    gather_nd_kernel, gather_packed_kernel, gather_split_kernel, group_norm_backward_beta_kernel,
     group_norm_backward_gamma_kernel, group_norm_backward_input_kernel, group_norm_kernel,
     grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
@@ -1190,6 +1190,14 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::GatherPacked { params } => {
+                        // Only the gathered-row count scales; the table's geometry
+                        // (see `safe_for_active_extent`).
+                        let mut p = *params;
+                        p.n_idx = scale(p.n_idx);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::Attention { params, .. } => {
                         // PLAN L1: scale seq_q + seq_k. Stride fields
                         // (seq_q_stride / seq_k_stride) stay at the
@@ -1658,7 +1666,7 @@ impl WgpuExecutable {
         // Steps one batch encodes before submitting it and carrying on in a fresh
         // encoder. Encoding is host work, so a batch that carries one encoder to
         // the end of the schedule pays all of it with the device idle: the code
-        // predictor's frame (1 465 steps) exposed its whole encode before the first
+        // predictor's frame (878 steps) exposed its whole encode before the first
         // dispatch ran. Chunked, the encode of chunk n+1 overlaps the execution of
         // chunk n, and only one chunk's encode is exposed. Bit-exact by
         // construction - dispatch order, arena and barriers are unchanged, only the
@@ -2906,6 +2914,23 @@ impl WgpuExecutable {
                                 pass.set_pipeline(&gk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
                                 let (gx, gy, gz) = dispatch_dims(total_s, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::GatherPacked { params } => {
+                                // One thread per Q8_0 block of the output; only the
+                                // gathered-row count is active-extent scaled.
+                                let total = scale(params.n_idx) * params.blocks_per_row;
+                                if total == 0 {
+                                    if step_owns_slot(step) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let gk = gather_packed_kernel(&dev.device);
+                                pass.set_pipeline(&gk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::Attention { params, .. } => {

@@ -48,7 +48,9 @@ pub enum Class {
     /// VQ codebook — decoded by index, not by nearest-neighbour search.
     Codebook,
     /// A per-level stack (`a.gen.code.head.weight` / `…embd.weight`, last axis
-    /// 15): one slice per depth level, never a matmul weight as a whole.
+    /// 15): one slice per depth level, never a matmul weight as a whole. Each
+    /// slice is read on its own — the head as a packed linear, the embedding
+    /// table by row.
     Stacked,
     /// 2-D/3-D convolution kernel (`[C_out, C_in, k…]`).
     Conv,
@@ -68,10 +70,13 @@ pub enum Store {
     /// F16 in the file: widened to F32 on the host.
     F16Widened,
     /// Quantized, kept as the file's own packed bytes; the graph multiplies
-    /// through `Op::DequantMatMul` and the backend reserves scratch for it.
+    /// through `Op::DequantMatMul` and the backend reserves scratch for it. A
+    /// table read by row rather than multiplied takes [`row_route`] instead,
+    /// which decides from the file's type and geometry and not from this tag.
     Packed,
     /// Quantized, unpacked to F32 on the host and multiplied as a plain
-    /// `MatMul` — the path the sound stage's non-linear tensors take.
+    /// `MatMul` — the path the sound stage's non-linear tensors take. A table
+    /// read by row is served by [`row_route`] whatever this tag says.
     HostDequant,
     /// Quantized, unpacked to **f16** on the host and multiplied as a plain
     /// `MatMul` whose weight is an f16 `Param` — the tagger's route for its
@@ -98,6 +103,85 @@ impl Plan {
     pub fn in_out(&self) -> (usize, usize) {
         (self.ggml_shape[0], self.ggml_shape[1])
     }
+
+    /// One tensor planned under [`Model::open`]'s store rule: the file's own
+    /// packed bytes for a quantised weight, the host's f32 for the sound file's
+    /// non-linear tensors, and no re-quantisation anywhere.
+    fn of(name: String, ggml_shape: Vec<usize>, file: GgmlType, sound: bool) -> Result<Plan> {
+        let rank = ggml_shape.len();
+        let class = classify(&name, rank);
+        let dims = ggml_shape.iter().rev().copied().collect();
+        let store = match quant_of(file) {
+            Some(_) if sound && rank != 2 => Store::HostDequant,
+            Some(_) => Store::Packed,
+            None => match file {
+                GgmlType::F32 => Store::F32File,
+                // F16 is never declared as F16: it is widened on the host. The
+                // file's f16 tensors are convolved or multiplied, never read by
+                // row, so [`row_route`] does not serve them — their shapes are the
+                // reason, not a missing route.
+                GgmlType::F16 | GgmlType::BF16 => Store::F16Widened,
+                other => bail!("tensor {name} has unhandled type {}", other.name()),
+            },
+        };
+        Ok(Plan {
+            name,
+            ggml_shape,
+            dims,
+            file,
+            class,
+            store,
+        })
+    }
+}
+
+/// A table the graph reads a few rows at a time, and how it is served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rows {
+    /// The file's own packed bytes, gathered and dequantised on the device.
+    Packed(PackedRows),
+    /// The f32 image to widen to, `[rows, cols]`. [`row_route`] widens only at an
+    /// arm that states why the packed route cannot serve the table.
+    Widened { rows: usize, cols: usize },
+}
+
+/// The geometry of a packed table read by row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedRows {
+    pub rows: usize,
+    pub cols: usize,
+    /// The packed length, `rows` whole rows of Q8_0 blocks.
+    pub bytes: usize,
+}
+
+/// How a table the graph reads by row is served.
+///
+/// Q8_0 only, because that is the one scheme whose device dequantisation is
+/// **exact** — an f16 scale times an i8 fits an f32 significand — so the route
+/// leaves the audio unchanged rather than merely close. Every other table is
+/// widened to f32 deliberately, for the reason its arm states.
+pub fn row_route(plan: &Plan) -> Rows {
+    // The widened image is the table's own shape: a rank-1 tensor is one row, and
+    // a rank-0 one — which no GGUF carries — a single element.
+    let (rows, cols) = match plan.dims.split_last() {
+        Some((cols, lead)) => (lead.iter().product(), *cols),
+        None => (1, 1),
+    };
+    if plan.file != GgmlType::Q8_0 {
+        // A K-quant's device dequant is not exact, so it would move the audio.
+        return Rows::Widened { rows, cols };
+    }
+    let block = QuantScheme::GgufQ8_0;
+    let (block_elems, block_bytes) = (
+        block.gguf_block_size() as usize,
+        block.gguf_block_bytes() as usize,
+    );
+    if !cols.is_multiple_of(block_elems) {
+        // A row that is not whole blocks has no packed stride of its own.
+        return Rows::Widened { rows, cols };
+    }
+    let bytes = rows * (cols / block_elems * block_bytes);
+    Rows::Packed(PackedRows { rows, cols, bytes })
 }
 
 /// Quantized types that travel as packed bytes.
@@ -428,32 +512,7 @@ impl Model {
         // file is re-quantised here.
         let mut plans: Vec<Plan> = Vec::with_capacity(file.tensors.len());
         for t in file.tensors.values() {
-            let rank = t.shape.len();
-            let class = classify(&t.name, rank);
-            let dims: Vec<usize> = t.shape.iter().rev().copied().collect();
-            let store = match quant_of(t.dtype) {
-                Some(_) => {
-                    if sound && rank != 2 {
-                        Store::HostDequant
-                    } else {
-                        Store::Packed
-                    }
-                }
-                None => match t.dtype {
-                    GgmlType::F32 => Store::F32File,
-                    // F16 is never declared as F16: it is widened on the host.
-                    GgmlType::F16 | GgmlType::BF16 => Store::F16Widened,
-                    other => bail!("tensor {} has unhandled type {}", t.name, other.name()),
-                },
-            };
-            plans.push(Plan {
-                name: t.name.clone(),
-                ggml_shape: t.shape.clone(),
-                dims,
-                file: t.dtype,
-                class,
-                store,
-            });
+            plans.push(Plan::of(t.name.clone(), t.shape.clone(), t.dtype, sound)?);
         }
         plans.sort_by(|a, b| a.name.cmp(&b.name));
         let by_name = plans
@@ -1247,5 +1306,95 @@ impl Pair {
         }
 
         Ok(Self { body, sound })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tensor's plan, built by the same rule [`Model::open`] plans the sound
+    /// file with — so the fixture cannot drift from it.
+    fn sound_plan(name: &str, ggml_shape: &[usize]) -> Plan {
+        Plan::of(name.to_string(), ggml_shape.to_vec(), GgmlType::Q8_0, true)
+            .expect("a Q8_0 tensor plans")
+    }
+
+    /// The three Q8_0 tables the sound graph reads by row are served as the
+    /// file's packed bytes, and the parameter each route declares is one `U8` lane
+    /// per byte — the dtype and the length, never an f32 image four times the
+    /// size. This is the regression: widening them again is 272 MiB of f32 where
+    /// 72 MiB of bytes do the same job.
+    #[test]
+    fn the_code_tables_are_served_as_their_packed_bytes_not_an_f32_image() {
+        use rlx_ir::DType;
+
+        let cases: [(&str, &[usize], PackedRows); 3] = [
+            (
+                "a.gen.code.embd.weight",
+                &[2048, 2048, 15],
+                PackedRows {
+                    rows: 30_720,
+                    cols: 2_048,
+                    bytes: 66_846_720,
+                },
+            ),
+            (
+                "a.gen.wav.quant.rest.codebook.weight",
+                &[256, 2048, 15],
+                PackedRows {
+                    rows: 30_720,
+                    cols: 256,
+                    bytes: 8_355_840,
+                },
+            ),
+            (
+                "a.gen.wav.quant.first.codebook.weight",
+                &[256, 2048],
+                PackedRows {
+                    rows: 2_048,
+                    cols: 256,
+                    bytes: 557_056,
+                },
+            ),
+        ];
+        for (name, ggml_shape, want) in cases {
+            let plan = sound_plan(name, ggml_shape);
+            assert_eq!(row_route(&plan), Rows::Packed(want), "{name}");
+            let param = crate::emit::packed_table_param(&want);
+            assert_eq!(
+                (param.dtype(), param.num_elements()),
+                (DType::U8, Some(want.bytes)),
+                "{name}: the parameter is the file's packed bytes"
+            );
+        }
+    }
+
+    /// A table the packed route cannot serve is widened to its own `[rows, cols]`
+    /// image, never read at a stride that is not its own: another scheme, and a row
+    /// that is not whole Q8_0 blocks.
+    #[test]
+    fn a_table_the_route_cannot_serve_is_widened() {
+        let q4 = Plan::of(
+            "a.gen.code.embd.weight".to_string(),
+            vec![2048, 2048, 15],
+            GgmlType::Q4K,
+            true,
+        )
+        .expect("a Q4_K tensor plans");
+        assert_eq!(
+            row_route(&q4),
+            Rows::Widened {
+                rows: 30_720,
+                cols: 2_048
+            },
+            "a K-quant is not exact on device"
+        );
+        let ragged = sound_plan("a.gen.code.embd.weight", &[100, 2]);
+        assert_eq!(
+            row_route(&ragged),
+            Rows::Widened { rows: 2, cols: 100 },
+            "a row of 100 elements is not whole Q8_0 blocks"
+        );
     }
 }
