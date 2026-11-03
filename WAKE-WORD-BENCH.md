@@ -9,7 +9,7 @@
 | positives (pooled) | 61/550 (11.1 %) |
 | false accepts | 2 events · 2.4773/h over VAD-active speech (0.807 h) · 1.8756/h over wall-clock audio (1.066 h) · one event = 1.2386/h |
 | derived point | floor 0.7500 · fire factor 0.3520 · static bar 1.0560 · reset 0.3344 |
-| wall clock | 710.2 s |
+| wall clock | 710.0 s |
 | peak resident | 2.02GiB |
 
 One complete run: recall and false reactions in each of the eleven voices, and the false accepts per hour over the pinned real-audio corpus.
@@ -48,20 +48,18 @@ Pooled over 11 voices: 104 clips each, not 1144 independent trials.
 
 Pooled over 11 voices: 50 clips each, not 550 independent utterances.
 
-_Measured 2026-11-01 07:08 UTC._
+_Measured 2026-11-02 23:42 UTC._
 - machine: arm64 · Apple M3 Pro
 - device: Apple M3 Pro (Metal)
 - profile: release
-- code: 033bc236 change-sha256 48cf4514e1bbc8d7 (the commit and the SHA-256 of the tree's difference from it, `STAND.md`, `TRANSCRIPTION-CORPUS.md`, `WAKE-WORD-BENCH.md`, `crates/backends/rlx-mlx-sys` left out)
+- code: d2750edb change-sha256 889347fba2202e3e (the commit and the SHA-256 of the tree's difference from it, `STAND.md`, `TRANSCRIPTION-CORPUS.md`, `WAKE-WORD-BENCH.md`, `crates/backends/rlx-mlx-sys` left out)
 - command: cargo bench -p mahbot-inference --features bench --bench wake_word -- --report <file>
-- run form: RLX_ALLOW_THROTTLE=1
-- models: `~/.mahbot/userspaces/admin/models`
-- corpus: `~/.mahbot/faph_corpus`
+- models: `/Users/Shared/MahBot/models`
+- corpus: `/Users/Shared/MahBot/models/corpus/real-audio`
 - ASR body: `Qwen3-ASR-1.7B-Q4_K_M.gguf` · 1282435552 bytes · sha256 3893b8926065bbff3da7586d21d8711a9b4fa4fa8f12cd0cefad58e31b2660b6
 - ASR sound: `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf` · 355709344 bytes · sha256 46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d
 - TTS body: `Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf` · 1035965280 bytes · sha256 8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129
 - TTS sound: `mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` · 446422912 bytes · sha256 6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2
-- voice: `~/.mahbot/userspaces/admin/assets/rlx-4bit-tts/voice-sample.wav` · 558764 bytes · sha256 0ca6c18b9189381dcdad83d26814f73b3f4d2d26dea6892371c2177d30e72ace
 - voice01: `speech/librivox/speech-librivox-0002.wav` · 11.40 s + 15.00 s · sha256 f907f96e69eb8e680c86964f63ff570d2c24458beacd7d94520c44b2a5c10868
 - voice02: `speech/librivox/speech-librivox-0039.wav` · 2.80 s + 15.00 s · sha256 41fb73636b15dc76815fff9f816c97e897d2d920acef4b89097f8f05fe682fca
 - voice03: `speech/librivox/speech-librivox-0094.wav` · 14.80 s + 15.00 s · sha256 b529147404ffd239df9a5eaddfe19e7130393fb756e4f56f4ee85d68cd63cc7d

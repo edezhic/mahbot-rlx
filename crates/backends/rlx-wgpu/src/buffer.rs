@@ -564,7 +564,7 @@ fn f16_shadow_write_end(f32_byte_offset: usize, f32_byte_len: usize) -> usize {
 /// weight window — which starts at a 256-byte-aligned offset and reads a few bytes
 /// past the data — still fits a mirror whose last weight ends on the buffer's last
 /// byte. Two alignment steps cover both ends of `f16_weight_bind_range`'s
-/// rounding. See the allocation in [`Arena::from_plan`].
+/// rounding. Sized in [`Arena::from_plan`], allocated in `F16Mirror::get`.
 const F16_MIRROR_WINDOW_SLACK: usize = 2 * 256;
 
 /// Size the f16 side buffer so every planned slot's padded upload fits.
@@ -575,6 +575,35 @@ fn f16_shadow_arena_size(plan: &MemoryPlan) -> usize {
         .max()
         .unwrap_or(0)
         .max(1)
+}
+
+/// Whether this device and geometry admit an f16 mirror at all. This is the guard
+/// that refuses one, and a reader cannot widen it, so allocating lazily never
+/// becomes a way around the refusal. `disabled` is `RLX_WGPU_NO_F16_SHADOW`.
+fn mirror_admitted(
+    features: wgpu::Features,
+    max_buf: usize,
+    sharded: bool,
+    disabled: bool,
+) -> bool {
+    features.contains(wgpu::Features::SHADER_F16)
+        && !disabled
+        // VirtIO / DX12 often expose only ~2 GiB buffers *and* a small total GPU
+        // budget — a full-size f16 mirror OOMs next to weights.
+        && max_buf > (2usize << 30)
+        // Discrete Vulkan/DX12 Kitten paths host Int8 dequant and do not need a
+        // 2 GiB f16 mirror — that alone OOMs 12 GiB cards next to a sharded act
+        // arena. Skip unless `RLX_WGPU_F16_WEIGHTS=1`.
+        && (!sharded
+            || rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS")
+            || !crate::device::coop_discrete_backend())
+}
+
+/// Whether a node at `off` with `len` bytes has its whole f16 image inside a
+/// `mirror_bytes`-byte mirror. A weight-buffer offset lives in another byte space,
+/// which the mirror is not laid out against, so it never fits.
+fn f16_range_fits(off: usize, len: usize, mirror_bytes: usize) -> bool {
+    !is_weight_off(off) && (off / 2).saturating_add(len / 2) <= mirror_bytes
 }
 
 /// Bytes reserved at the end of every shard for cross-stripe staging copies.
@@ -1405,6 +1434,79 @@ pub(crate) fn kv_row_dst(base: usize, pos: usize, row_bytes: usize) -> usize {
     base + pos * row_bytes
 }
 
+/// The f16 mirror of the arena — the f16 shadow a matmul weight is read from: a
+/// second buffer holding an f16 image of the values uploaded into the f32 arena,
+/// at half the byte offset (`f16_off = f32_off / 2`), so a multiply with an
+/// f16-typed weight reads it at half the bandwidth.
+///
+/// **Planned at construction, allocated by the first reader**, and this type is
+/// what keeps that honest: a graph whose selected steps never read the mirror
+/// never allocates one, which is most of them. The readers are `MatmulCompute::F16`
+/// — the one arm `compile::lower` *selects* on `param_fits_f16_mirror` — and the
+/// cooperative families `Coop16` / `CoopF16F32Acc` / `CoopF16Vk`, plus `F16W`
+/// under `RLX_WGPU_F16_WEIGHTS`, which merely *require* it when they build their
+/// bind group, together with the f16 pre-pass that feeds them. Each takes the
+/// buffer from [`Arena::f16_mirror`] at that moment and nothing else ever asks.
+///
+/// *Admission* and *size* are frozen at construction; the contents are not.
+///
+/// * Admission is [`Arena::from_plan`]'s — `SHADER_F16`, no
+///   `RLX_WGPU_NO_F16_SHADOW`, a `max_buffer_size` above 2 GiB, and not a sharded
+///   arena on a discrete adapter. A reader never widens it, so lazily allocating
+///   cannot become a way around a refusal: [`Self::get`] answers `None` exactly as
+///   the absent buffer used to.
+/// * Size is planned because `param_fits_f16_mirror` answers a route decision
+///   from it, and that decision is taken during lowering — before any reader
+///   asks, so before there is an allocation to read a size from.
+/// * Contents are the uploads made *after* the first reader asked. Every reader
+///   asks during compile, before any `write_f32` upload, so a mirror that exists
+///   holds every value written through [`Arena::write_f32`].
+pub(crate) struct F16Mirror {
+    /// The planned byte size, `None` when this arena refuses a mirror at all.
+    planned: Option<usize>,
+    /// The buffer itself, created by the first reader.
+    buffer: OnceLock<wgpu::Buffer>,
+}
+
+impl F16Mirror {
+    /// A mirror of `size` bytes, to be allocated by the first reader.
+    fn admitted(size: usize) -> Self {
+        Self {
+            planned: Some(size),
+            buffer: OnceLock::new(),
+        }
+    }
+
+    /// No mirror: this arena's device, geometry or switches refuse one.
+    pub(crate) fn refused() -> Self {
+        Self {
+            planned: None,
+            buffer: OnceLock::new(),
+        }
+    }
+
+    /// The mirror, materialised now. Every caller of this is a reader; writers go
+    /// through [`Self::allocated`], so an upload alone never creates the buffer.
+    /// The device is the caller's: this backend has one process-global device, so
+    /// the first caller's is every caller's.
+    fn get(&self, device: &wgpu::Device) -> Option<&wgpu::Buffer> {
+        let size = self.planned?;
+        Some(self.buffer.get_or_init(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("rlx-wgpu arena f16"),
+                size: size as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        }))
+    }
+
+    /// The mirror only if a reader has already materialised it.
+    fn allocated(&self) -> Option<&wgpu::Buffer> {
+        self.buffer.get()
+    }
+}
+
 /// One contiguous *logical* arena + per-node byte offsets. Lives for the
 /// entire executable graph's lifetime.
 ///
@@ -1420,15 +1522,10 @@ pub struct Arena {
     pub extra_shards: Vec<wgpu::Buffer>,
     /// Bytes per shard (0 = unsharded single buffer of [`Self::size`]).
     pub shard_size: usize,
-    /// Optional shadow buffer holding f16 versions of every value
-    /// written via `write_f32`. Sized at half the arena byte budget
-    /// (each f32 element pairs with an f16 element at the same logical
-    /// index — i.e. f16_off = f32_off / 2). Created only when the
-    /// device exposes the `SHADER_F16` feature; matmul kernels with
-    /// f16-typed B input bind both `buffer` (for f32 activations) and
-    /// `f16_buffer` (for f16 weights). Halves global memory traffic
-    /// on the dominant matmul reads.
-    pub f16_buffer: Option<wgpu::Buffer>,
+    /// The f16 mirror of the values uploaded through [`Arena::write_f32`], at half
+    /// the byte offset. Planned here, allocated by the first reader — see
+    /// [`F16Mirror`] for what keeps one alive.
+    pub(crate) f16_mirror: F16Mirror,
     /// Optional PACKED-BF16 weight side-buffer (raw bf16 bits, 2 per u32
     /// word). Holds `Op::MatMul` weight params whose IR dtype is BF16 that
     /// would otherwise widen to f32 in `buffer`. Indexed by the SAME logical
@@ -1875,24 +1972,17 @@ impl Arena {
             }
         };
 
-        // Mirror f16 shadow buffer: half the byte size since each f32
-        // slot maps to an f16 slot at the same logical element index.
-        // On arenas larger than one bind window, allocate a capped f16
-        // buffer (≤ max_storage_buffer_binding_size) so matmul can use
-        // f16_weight_bind_range instead of staging multi‑GiB weights.
-        //
-        // Discrete Vulkan/DX12 Kitten paths host Int8 dequant and do not need
-        // a 2 GiB f16 mirror — that alone OOMs 12 GiB cards next to a sharded
-        // act arena. Skip unless `RLX_WGPU_F16_WEIGHTS=1`.
-        let want_f16 = device.features().contains(wgpu::Features::SHADER_F16)
-            && !rlx_ir::env::flag("RLX_WGPU_NO_F16_SHADOW")
-            // VirtIO / DX12 often expose only ~2 GiB buffers *and* a small
-            // total GPU budget — a full-size f16 mirror OOMs next to weights.
-            && max_buf > (2usize << 30)
-            && (shard_size == 0
-                || rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS")
-                || !crate::device::coop_discrete_backend());
-        let f16_buffer = if want_f16 {
+        // The f16 mirror: half the byte size since each f32 slot maps to an f16
+        // slot at the same logical element index, capped at one binding window.
+        // Planned here and allocated by the first reader ([`F16Mirror`]) — a graph
+        // whose selected arms never read it pays nothing for it.
+        let admits_f16 = mirror_admitted(
+            device.features(),
+            max_buf,
+            shard_size != 0,
+            rlx_ir::env::flag("RLX_WGPU_NO_F16_SHADOW"),
+        );
+        let f16_mirror = if admits_f16 {
             // Never larger than the f16 image of the plan itself. The mirror is
             // addressed by logical offset / 2, so a plan-sized buffer holds every
             // range a binding can legitimately ask for, and `f16_shadow_bind_range`
@@ -1914,14 +2004,9 @@ impl Arena {
             // 64-wide f16 weight), not a refusal.
             let f16_size =
                 (f16_shadow_arena_size(&plan) + F16_MIRROR_WINDOW_SLACK).min(max_binding);
-            Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("rlx-wgpu arena f16"),
-                size: f16_size.max(256) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }))
+            F16Mirror::admitted(f16_size.max(256))
         } else {
-            None
+            F16Mirror::refused()
         };
         let mut offsets = HashMap::with_capacity(plan.assignments.len());
         let mut lens = HashMap::with_capacity(plan.assignments.len());
@@ -1934,7 +2019,7 @@ impl Arena {
             buffer,
             extra_shards,
             shard_size,
-            f16_buffer,
+            f16_mirror,
             bf16_weight_buffer: None,
             bf16_packed_nodes: HashSet::new(),
             offsets,
@@ -2907,20 +2992,23 @@ impl Arena {
         moved
     }
 
-    /// Whether this node's f16 mirror fits in the capped f16 shadow buffer.
+    /// The f16 mirror, materialised now. `None` means the arena refused one
+    /// ([`F16Mirror`] states why it may); an admitted arena answers `Some` however
+    /// often it is asked, so a caller asking is a reader. Never call this on a path
+    /// that would not read the mirror — the call *is* the reader.
+    pub(crate) fn f16_mirror(&self, device: &wgpu::Device) -> Option<&wgpu::Buffer> {
+        self.f16_mirror.get(device)
+    }
+
+    /// Whether this node's f16 mirror range fits inside the mirror this arena
+    /// plans — read from the plan, never from whether a reader has materialised
+    /// the buffer, because `compile::lower` chooses between the f16 arm and the
+    /// f32 one on this answer, before any allocation exists to ask.
     pub fn param_fits_f16_mirror(&self, id: NodeId) -> bool {
-        let Some(f16) = &self.f16_buffer else {
+        let Some(mirror_bytes) = self.f16_mirror.planned else {
             return false;
         };
-        // Weight-buffer params use a separate byte space; the f16 shadow is
-        // laid out against *arena* offsets, so tagged offs never fit there.
-        let off = self.offset(id);
-        if is_weight_off(off) {
-            return false;
-        }
-        let f16_off = off / 2;
-        let f16_bytes = self.len_of(id) / 2;
-        f16_off.saturating_add(f16_bytes) <= f16.size() as usize
+        f16_range_fits(self.offset(id), self.len_of(id), mirror_bytes)
     }
 
     /// Override the actual data length (in bytes) for a node — what the node
@@ -2931,10 +3019,10 @@ impl Arena {
 
     /// Write f32 data into the node's slot. The queue performs an
     /// async transfer; subsequent kernel dispatches on the same queue
-    /// see the new bytes. When the device supports SHADER_F16, also
-    /// downcasts and writes the same data into the f16 shadow buffer
-    /// at offset `f32_offset / 2` — so matmul kernels with f16 weight
-    /// bindings can read directly from there at half the bandwidth.
+    /// see the new bytes. When the f16 mirror has been materialised, the same data
+    /// is downcast into it at offset `f32_offset / 2`, so matmul kernels with f16
+    /// weight bindings read it at half the bandwidth. An upload never materialises
+    /// the mirror: writing it is not reading it.
     pub fn write_f32(&self, queue: &wgpu::Queue, id: NodeId, data: &[f32]) {
         let off = self.offset(id);
         // PACKED-BF16 params live ONLY in `bf16_weight_buffer`; do not widen
@@ -3108,13 +3196,14 @@ impl Arena {
         queue.write_buffer(buf, packed_off as u64, bytes);
     }
 
-    /// Downcast host f32 data into the f16 shadow buffer at `id`'s slot.
-    pub fn write_f16_shadow(&self, queue: &wgpu::Queue, id: NodeId, data: &[f32]) {
-        self.write_f16_shadow_at(queue, self.offset(id), data);
-    }
-
+    /// Downcast host f32 data into the f16 mirror at `off` — only when a reader
+    /// has already materialised it, because an upload is not a read.
+    ///
+    /// Skipping an unmaterialised mirror is correct only because every reader asks
+    /// during compile, before any `write_f32` upload: a mirror materialised later
+    /// would hold every *later* write and none of the earlier ones.
     fn write_f16_shadow_at(&self, queue: &wgpu::Queue, off: usize, data: &[f32]) {
-        if let Some(f16_buf) = &self.f16_buffer {
+        if let Some(f16_buf) = self.f16_mirror.allocated() {
             let f16_off = off / 2;
             let mut f16_data: Vec<half::f16> =
                 data.iter().map(|&v| half::f16::from_f32(v)).collect();
@@ -3783,20 +3872,101 @@ mod tests {
         // Three f32 elements → six f16 bytes, padded to eight for wgpu
         // COPY_BUFFER_ALIGNMENT. The old `arena_size / 2` sizing was two
         // bytes short at this slot boundary.
-        let mut assignments = HashMap::new();
-        assignments.insert(
-            NodeId(0),
-            BufferSlot {
-                offset: 32,
-                size: 12,
-            },
+        assert_eq!(f16_shadow_arena_size(&plan_of(&[(NodeId(0), 32, 12)])), 24);
+    }
+
+    /// The mirror is a plan first and an allocation second: a compiled path that
+    /// never reads it pays nothing, and the answer a route decision takes from it
+    /// (`param_fits_f16_mirror`) is the plan's — so materialising the buffer cannot
+    /// move a graph from one arm to another.
+    #[test]
+    fn the_f16_mirror_is_planned_before_it_is_allocated() {
+        let Some(dev) = test_device() else { return };
+        let arena = Arena::from_plan(&dev.device, &plan_of(&[(NodeId(0), 0, 4096)]));
+        if arena.f16_mirror.planned.is_none() {
+            eprintln!("skip: this adapter or switch refuses an f16 mirror");
+            return;
+        }
+        assert!(
+            arena.f16_mirror.allocated().is_none(),
+            "construction must not allocate a mirror nothing has read"
         );
-        let plan = MemoryPlan {
-            arena_size: 44,
+        assert!(
+            arena.param_fits_f16_mirror(NodeId(0)),
+            "a 4 KiB slot at offset 0 fits the mirror planned for it"
+        );
+        let first = arena
+            .f16_mirror(&dev.device)
+            .expect("an admitted arena gives its first reader a mirror");
+        let second = arena
+            .f16_mirror(&dev.device)
+            .expect("and every later reader the same one");
+        assert!(
+            std::ptr::eq(first, second),
+            "the second reader allocated a second mirror"
+        );
+        assert!(
+            arena.param_fits_f16_mirror(NodeId(0)),
+            "the route decision's answer moved when the mirror was materialised"
+        );
+    }
+
+    /// A node's range fits only while its whole f16 image is inside the mirror, and
+    /// a weight-buffer offset never does: that byte space is not what the mirror is
+    /// laid out against.
+    #[test]
+    fn a_range_fits_the_mirror_only_up_to_its_planned_size() {
+        let mib = 1024 * 1024;
+        assert!(f16_range_fits(0, 4096, 4096));
+        // 2 KiB of offset plus 2 KiB of data still lands inside 4 KiB.
+        assert!(f16_range_fits(4096, 4096, 4096));
+        // The same node one slot later does not.
+        assert!(!f16_range_fits(4096, 8192, 4096));
+        assert!(!f16_range_fits(mib, 4 * mib, mib));
+        // A weight-buffer param lives in the other buffer and never fits.
+        assert!(!f16_range_fits(WEIGHT_BUF_TAG, 4096, mib));
+    }
+
+    /// The admission terms are the refusal no caller may widen: no `SHADER_F16`,
+    /// a `max_buffer_size` at or under 2 GiB, or `RLX_WGPU_NO_F16_SHADOW` set, and
+    /// the arena plans no mirror at all.
+    #[test]
+    fn the_mirror_is_admitted_only_on_its_own_terms() {
+        let gib = 1usize << 30;
+        let f16 = wgpu::Features::SHADER_F16;
+        assert!(!mirror_admitted(
+            wgpu::Features::empty(),
+            8 * gib,
+            false,
+            false
+        ));
+        assert!(!mirror_admitted(f16, 2 * gib, false, false));
+        assert!(!mirror_admitted(f16, 8 * gib, false, true));
+        assert!(mirror_admitted(f16, 8 * gib, false, false));
+    }
+
+    fn test_device() -> Option<&'static crate::device::WgpuDevice> {
+        if rlx_ir::env::skip_unless_device("wgpu", true, crate::is_available()) {
+            return None;
+        }
+        Some(crate::device::wgpu_device().expect("rlx-wgpu: device gone"))
+    }
+
+    /// One `(node, offset, size)` per slot, in a plan of exactly their span. A
+    /// weight-buffer offset is measured untagged, since it names a byte in the
+    /// other buffer.
+    fn plan_of(slots: &[(NodeId, usize, usize)]) -> MemoryPlan {
+        let mut assignments = HashMap::new();
+        let mut arena_size = 0;
+        for &(id, offset, size) in slots {
+            assignments.insert(id, BufferSlot { offset, size });
+            arena_size = arena_size.max(raw_weight_off(offset).saturating_add(size));
+        }
+        MemoryPlan {
+            arena_size,
             assignments,
             schedule: vec![],
-        };
-        assert_eq!(f16_shadow_arena_size(&plan), 24);
+        }
     }
 }
 

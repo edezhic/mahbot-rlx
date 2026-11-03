@@ -996,7 +996,7 @@ impl WgpuExecutable {
             buffer: placeholder,
             extra_shards: Vec::new(),
             shard_size: 0,
-            f16_buffer: None,
+            f16_mirror: crate::buffer::F16Mirror::refused(),
             bf16_weight_buffer: None,
             bf16_packed_nodes: std::collections::HashSet::new(),
             offsets: HashMap::new(),
@@ -2882,8 +2882,31 @@ fn f16_shadow_bind_range(arena_base: u64, arena_size: u64, f16_buf_bytes: u64) -
     (base, size)
 }
 
-/// Window into `f16_buffer` for matmul weight reads (`params.b_off` is in
-/// f16-element indices, matching the f32 arena word index).
+/// [`f16_weight_bind_range`] as a binding resource: the f16 mirror window a matmul
+/// weight reads, with `b_off` rebased onto it.
+fn f16_weight_binding<'a>(
+    dev: &wgpu::Device,
+    f16_buf: &'a wgpu::Buffer,
+    b_off: u32,
+    k: u32,
+    n: u32,
+    batch: u32,
+    b_batch_stride: u32,
+) -> (wgpu::BindingResource<'a>, u32) {
+    let (base, size, rebased) =
+        f16_weight_bind_range(dev, f16_buf.size(), b_off, k, n, batch, b_batch_stride);
+    (
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: f16_buf,
+            offset: base,
+            size: NonZeroU64::new(size),
+        }),
+        rebased,
+    )
+}
+
+/// Window into the f16 mirror ([`Arena::f16_mirror`]) for matmul weight reads
+/// (`params.b_off` is in f16-element indices, matching the f32 arena word index).
 fn f16_weight_bind_range(
     dev: &wgpu::Device,
     f16_buf_bytes: u64,
@@ -5672,21 +5695,9 @@ fn build_matmul_qkv_coop_f16_vk_bind_group(
     b_off: u32,
 ) -> (wgpu::BindGroup, u32) {
     let f16_buf = arena
-        .f16_buffer
-        .as_ref()
+        .f16_mirror(device)
         .expect("CoopF16Vk QKV requires SHADER_F16 f16 shadow arena");
-    let (f16_res, rebased_b) = {
-        let (base, size, rebased) =
-            f16_weight_bind_range(device, f16_buf.size(), b_off, k, n, 1, 0);
-        (
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: f16_buf,
-                offset: base,
-                size: NonZeroU64::new(size),
-            }),
-            rebased,
-        )
-    };
+    let (f16_res, rebased_b) = f16_weight_binding(device, f16_buf, b_off, k, n, 1, 0);
     (
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rlx-wgpu matmul_qkv_coop_f16_vk bg"),
@@ -5720,10 +5731,12 @@ fn build_matmul_qkv_coop_f16_vk_bind_group(
 /// f16 buffer so coop matmul kernels can read operands as f16.
 ///
 /// `dst` names the buffer and the f16-element offset to write at; `None` is the
-/// weight mirror (`arena.f16_buffer`), which is indexed by the same logical
-/// element as the arena window, so the offset is the source's own. The dense
-/// attention route passes its own operand buffer, whose regions are packed from
-/// element 0 (see the route's arm in `compile::lower`).
+/// weight mirror ([`Arena::f16_mirror`]), which is indexed by the same logical
+/// element as the arena window, so the offset is the source's own — and which is
+/// materialised here, because a pre-pass that feeds a mirror-reading kernel is
+/// itself a reader. The dense attention route passes its own operand buffer,
+/// whose regions are packed from element 0 (see the route's arm in
+/// `compile::lower`).
 #[allow(clippy::too_many_arguments)]
 fn push_cast_f32_to_f16_step(
     device: &wgpu::Device,
@@ -5743,11 +5756,12 @@ fn push_cast_f32_to_f16_step(
         Some(k) => *k,
         None => return, // device lacks SHADER_F16; fall through, dispatch will skip
     };
-    let mirror = arena.f16_buffer.as_ref();
     let (f16_buf, f16_base, f16_size) = match dst {
         Some((b, _)) => (b, 0, b.size()),
         None => {
-            let Some(b) = mirror else { return };
+            let Some(b) = arena.f16_mirror(device) else {
+                return;
+            };
             let (base, size) = f16_shadow_bind_range(arena_base, arena_size, b.size());
             (b, base, size)
         }
@@ -5871,27 +5885,15 @@ fn build_matmul_bind_group(
             b_off,
         );
     }
-    let f16_bind = |b_off: u32| -> (wgpu::BindingResource<'_>, u32) {
-        let f16_buf = arena
-            .f16_buffer
-            .as_ref()
-            .expect("f16 weight bind without f16_buffer");
-        let (base, size, rebased) =
-            f16_weight_bind_range(device, f16_buf.size(), b_off, k, n, batch, b_batch_stride);
-        (
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: f16_buf,
-                offset: base,
-                size: NonZeroU64::new(size),
-            }),
-            rebased,
-        )
-    };
+    // The f16 arms below bind the mirror, so they are the reason it exists: each
+    // materialises it through `Arena::f16_mirror` *after* its own kernel check, so
+    // an arm that cannot be built never allocates one.
     if compute_precision == MatmulCompute::CoopF16Vk
-        && let (Some(coop_vk), Some(_f16_buf)) =
-            (matmul_coop_f16_vulkan_kernel(device), &arena.f16_buffer)
+        && let Some(coop_vk) = matmul_coop_f16_vulkan_kernel(device)
+        && let Some(f16_buf) = arena.f16_mirror(device)
     {
-        let (f16_res, rebased_b) = f16_bind(b_off);
+        let (f16_res, rebased_b) =
+            f16_weight_binding(device, f16_buf, b_off, k, n, batch, b_batch_stride);
         return (
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rlx-wgpu matmul_coop_f16_vulkan bg"),
@@ -5988,12 +5990,11 @@ fn build_matmul_bind_group(
     }
     if b_is_param
         && compute_precision == MatmulCompute::CoopF16F32Acc
-        && let (Some(_f16_buf), Some(f16acc)) = (
-            &arena.f16_buffer,
-            crate::kernels::matmul_coop_f16_f32acc_kernel(device),
-        )
+        && let Some(f16acc) = crate::kernels::matmul_coop_f16_f32acc_kernel(device)
+        && let Some(f16_buf) = arena.f16_mirror(device)
     {
-        let (f16_res, rebased_b) = f16_bind(b_off);
+        let (f16_res, rebased_b) =
+            f16_weight_binding(device, f16_buf, b_off, k, n, batch, b_batch_stride);
         // The same 3-binding layout as `matmul_coop16`: A is read from the f32
         // arena and downcast inside the kernel, so it has no binding of its own.
         return (
@@ -6024,9 +6025,11 @@ fn build_matmul_bind_group(
     }
     if b_is_param
         && compute_precision == MatmulCompute::Coop16
-        && let (Some(_f16_buf), Some(coop)) = (&arena.f16_buffer, mm_coop)
+        && let Some(coop) = mm_coop
+        && let Some(f16_buf) = arena.f16_mirror(device)
     {
-        let (f16_res, rebased_b) = f16_bind(b_off);
+        let (f16_res, rebased_b) =
+            f16_weight_binding(device, f16_buf, b_off, k, n, batch, b_batch_stride);
         // 3-binding layout — A is staged from arena (f32) through
         // workgroup-shared memory inside the kernel, no separate
         // f16 binding for A.
@@ -6058,9 +6061,11 @@ fn build_matmul_bind_group(
     }
     if b_is_param
         && compute_precision == MatmulCompute::F16
-        && let (Some(_f16_buf), Some(f16c)) = (&arena.f16_buffer, mm_f16c)
+        && let Some(f16c) = mm_f16c
+        && let Some(f16_buf) = arena.f16_mirror(device)
     {
-        let (f16_res, rebased_b) = f16_bind(b_off);
+        let (f16_res, rebased_b) =
+            f16_weight_binding(device, f16_buf, b_off, k, n, batch, b_batch_stride);
         return (
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rlx-wgpu matmul_f16_compute bg"),
@@ -6090,9 +6095,11 @@ fn build_matmul_bind_group(
     let f16w_opt_in = rlx_ir::env::flag("RLX_WGPU_F16_WEIGHTS");
     if b_is_param
         && f16w_opt_in
-        && let (Some(_f16_buf), Some(f16w)) = (&arena.f16_buffer, mm_f16w)
+        && let Some(f16w) = mm_f16w
+        && let Some(f16_buf) = arena.f16_mirror(device)
     {
-        let (f16_res, rebased_b) = f16_bind(b_off);
+        let (f16_res, rebased_b) =
+            f16_weight_binding(device, f16_buf, b_off, k, n, batch, b_batch_stride);
         return (
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rlx-wgpu matmul_f16w bg"),
