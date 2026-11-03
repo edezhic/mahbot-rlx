@@ -2,14 +2,42 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The enrolled voice, as a vector.
+//! The pinned voice, as a vector, and the one derivation of another from a recording.
 //!
-//! It is the ECAPA-TDNN speaker embedding, taken once with this crate's own speaker
-//! encoder and embedded here. Nothing reads a recording to speak: [`crate::synth`]
-//! prompts the talker with these numbers, so a synthesis call carries no audio input
-//! and builds no speaker-encoder graph. A different voice is a different constant,
-//! not a file.
+//! Nothing reads a recording to speak: [`crate::synth`] prompts the talker with
+//! [`SPEAKER_EMBED`], so a synthesis call carries no audio input and builds no
+//! speaker-encoder graph. A different voice is a different vector, not a file.
+//! [`embed`] is the one derivation of such a vector: the bench's clone spans and
+//! a capture of a new pinned voice both call it.
 
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Result, anyhow, bail};
+
+use crate::graphs::{self, Compiled};
+use crate::host;
+use crate::loader::Pair;
+
+/// The pinned voice: the ECAPA-TDNN speaker embedding of one read-speech utterance
+/// from a public research corpus — a male reader, mono, 16 kHz, 17.46 s — taken once
+/// with this crate's own speaker encoder: the recording resampled to
+/// [`crate::synth::SAMPLE_RATE`] (24 kHz), the host mel front end over it
+/// ([`crate::host::mel_24k`]), and one [`crate::graphs::speaker_encoder`] pass. Each
+/// value is the encoder's f32 printed in its shortest round-trip form, so the vector
+/// is stored exactly: no rounding anywhere.
+///
+/// The source of the utterance is not named here, and this vector cannot be
+/// re-derived from anything the crate holds. Capturing from a different recording
+/// yields a different voice — expected, not a mistake. To capture another one, write
+/// a throwaway binary that opens the synthesis pair, calls [`embed`] on the recording
+/// and prints each value with `{:?}` (shortest round-trip), paste the values here and
+/// delete the binary.
+///
+/// The vector is 2 048 wide, the width a 1.7B talker is conditioned on: a 0.6B
+/// synthesis pair, whose talker is 1 024 wide, can no longer be driven through
+/// [`crate::synth::Synthesis::new`] at all, and a same-width 1.7B pair simply speaks
+/// in this voice.
 #[rustfmt::skip]
 pub const SPEAKER_EMBED: [f32; 2048] = [
     -0.017757636, 0.018410532, -0.011844918, 0.04186924, -0.12985034, -0.042894173,
@@ -355,3 +383,28 @@ pub const SPEAKER_EMBED: [f32; 2048] = [
     -0.11107692, -0.06265981, 0.06611495, 0.0024762377, 0.112402275, -0.029893894,
     -0.1166281, -0.039063662,
 ];
+
+/// The speaker vector of one recording: read whole, resampled to
+/// [`crate::synth::SAMPLE_RATE`], mel front end, ECAPA-TDNN. The one derivation
+/// from audio to a vector — the bench's clone spans and a capture both call it, and
+/// it lives in a module the synthesis cache's source key hashes
+/// (`bench::config`'s `SYNTHESIS_SOURCES`), so a change here invalidates every
+/// cached clip rather than serving the previous voice's.
+pub fn embed(pair: &Arc<Pair>, wav: &Path) -> Result<Vec<f32>> {
+    let path = wav.display().to_string();
+    let audio = host::wav_mono(&path, crate::synth::SAMPLE_RATE, 0, usize::MAX)
+        .map_err(|error| anyhow!("the recording `{path}`: {error}"))?;
+    if audio.is_empty() {
+        bail!("the recording `{path}` is empty");
+    }
+    let (mel, frames) = host::mel_24k(&audio);
+    let mut speaker = Compiled::new(
+        rlx_runtime::Device::Gpu,
+        graphs::speaker_encoder(pair.sound.clone(), frames, pair.body.config().d)?,
+    )?;
+    let mut embed = speaker.run_slices(&[("mel", &mel)]);
+    embed
+        .drain(..)
+        .next()
+        .ok_or_else(|| anyhow!("the speaker encoder returned no embedding for `{path}`"))
+}

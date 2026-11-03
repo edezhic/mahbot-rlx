@@ -252,8 +252,9 @@ impl Synth {
     }
 
     /// The pipeline for `speaker`, built on first use and replaced when the voice
-    /// changes. The previous one is dropped before the next is built, so two
-    /// checkpoints' graphs are never resident at once.
+    /// changes. A clone's vector is derived from its span before the engine is built
+    /// ([`crate::speaker::embed`]). The previous pipeline is dropped before the next
+    /// is built, so two checkpoints' graphs are never resident at once.
     fn pipeline(&mut self, speaker: &Speaker) -> Result<&mut Synthesis> {
         let wanted = speaker.cache_id();
         let resident = self
@@ -264,7 +265,11 @@ impl Synth {
             self.pipeline = None;
             let built = match speaker.voice() {
                 None => Synthesis::new(Arc::clone(&self.pair)),
-                Some(voice) => Synthesis::with_reference(Arc::clone(&self.pair), &voice.wav),
+                Some(voice) => {
+                    crate::speaker::embed(&self.pair, &voice.wav).and_then(|embedding| {
+                        Synthesis::with_embedding(Arc::clone(&self.pair), embedding)
+                    })
+                }
             }
             .with_context(|| format!("cannot build the synthesis path for {}", speaker.name()))?;
             self.pipeline = Some((wanted, built));
@@ -1115,8 +1120,8 @@ impl Category {
 }
 
 /// One clip a measurement needs: the speaker it is rendered in, the text, the
-/// seed, the tag its label carries, and — for the owner's non-wake speech — the
-/// SNR its second, noisy embedding is scored at.
+/// seed, the tag its label carries, and — for the enrolled voice's non-wake
+/// speech — the SNR its second, noisy embedding is scored at.
 ///
 /// One list drives the corpus build and the measurement's own clip construction,
 /// so a seed, a label or a phrase cannot drift between what is rendered and what
@@ -1128,7 +1133,7 @@ pub(crate) struct Request {
     pub seed: u64,
     pub tag: &'static str,
     /// `Some(snr_db)` when the clip contributes a second embedding under brown
-    /// noise at that SNR — the owner-negative cell of the calibration pool.
+    /// noise at that SNR — the non-wake cell of the calibration pool.
     pub noise_snr_db: Option<f32>,
 }
 
@@ -1202,18 +1207,18 @@ pub(crate) fn enrolment_variants() -> Vec<Request> {
 }
 
 /// The calibration pool: the enrolled voice's non-wake speech (scored twice, the
-/// second time under brown noise at [`sets::OWNER_NEGATIVE_SNR_DB`]), then the
+/// second time under brown noise at [`sets::NON_WAKE_SNR_DB`]), then the
 /// confusable and unrelated bands.
 pub(crate) fn calibration_requests() -> Vec<Request> {
     let mut requests = phrase_requests(
         &Speaker::Enrolled,
-        sets::OWNER_NEGATIVE_PHRASES,
-        sets::OWNER_NEGATIVE_SEEDS_PER_PHRASE,
-        sets::OWNER_NEGATIVE_SEED_BASE,
-        "owner",
+        sets::NON_WAKE_PHRASES,
+        sets::NON_WAKE_SEEDS_PER_PHRASE,
+        sets::NON_WAKE_SEED_BASE,
+        "nonwake",
     );
     for request in &mut requests {
-        request.noise_snr_db = Some(sets::OWNER_NEGATIVE_SNR_DB);
+        request.noise_snr_db = Some(sets::NON_WAKE_SNR_DB);
     }
     requests.extend(phrase_requests(
         &Speaker::Enrolled,

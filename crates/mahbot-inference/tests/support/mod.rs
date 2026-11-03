@@ -288,6 +288,18 @@ pub fn listen_answer(pair: &std::sync::Arc<Pair>, path: &std::path::Path) -> Ans
     }
 }
 
+/// The pinned clip's reading against its witness: the one comparison, so the check
+/// and the figures it prints cannot disagree.
+pub fn witness_listen(answer: &Answer) -> bool {
+    mahbot_inference::reference::check_listen(
+        answer.frames,
+        answer.prompt_rows,
+        answer.generated.len(),
+        answer.digest,
+        &answer.text,
+    )
+}
+
 /// The one-shot path's conditioning: drop a loud, non-speech opening, then lift a
 /// quiet recording with the crate's one gain rule. Both are time-preserving or
 /// the walk is not of this audio; the product's segmented path conditions the whole

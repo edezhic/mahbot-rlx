@@ -6,7 +6,7 @@
 //! matrices, and the pinned real-audio subset. Everything here is a constant so
 //! two runs differ only in the models they were given.
 //!
-//! The seed bands are disjoint by construction: enrolment 100–109, owner
+//! The seed bands are disjoint by construction: enrolment 100–109, non-wake
 //! negatives 9000–9029, confusable negatives 1000+, unrelated negatives 2000+,
 //! detection confusables 800/810, detection unrelated 900/910, held-out recall
 //! 3000–3039, command-plus-speech 3100–3109, phrase-in-passing 3200–3207,
@@ -29,9 +29,9 @@ pub(crate) const NUM_ENROLLMENT_VARIANTS: usize = 10;
 /// Seeds `ENROLLMENT_SEED_BASE..+NUM_ENROLLMENT_VARIANTS`.
 pub(crate) const ENROLLMENT_SEED_BASE: u64 = 100;
 
-/// Owner negatives: the enrolled voice saying something that is not the wake
-/// phrase. Disjoint from every other phrase list.
-pub(crate) const OWNER_NEGATIVE_PHRASES: &[&str] = &[
+/// The enrolled voice's non-wake speech: phrases that are not the wake phrase.
+/// Disjoint from every other phrase list.
+pub(crate) const NON_WAKE_PHRASES: &[&str] = &[
     "please stop",
     "i am going out",
     "where are my keys",
@@ -43,11 +43,11 @@ pub(crate) const OWNER_NEGATIVE_PHRASES: &[&str] = &[
     "i need to buy new shoes",
     "turn down the music please",
 ];
-pub(crate) const OWNER_NEGATIVE_SEEDS_PER_PHRASE: usize = 3;
-pub(crate) const OWNER_NEGATIVE_SEED_BASE: u64 = 9000;
-/// The bounded low-SNR cell added per owner-negative clip: brown noise at this
+pub(crate) const NON_WAKE_SEEDS_PER_PHRASE: usize = 3;
+pub(crate) const NON_WAKE_SEED_BASE: u64 = 9000;
+/// The bounded low-SNR cell added per non-wake clip: brown noise at this
 /// SNR on the VAD-gated speech.
-pub(crate) const OWNER_NEGATIVE_SNR_DB: f32 = 10.0;
+pub(crate) const NON_WAKE_SNR_DB: f32 = 10.0;
 
 /// Confusable near-misses for the negative pools.
 pub(crate) const CONFUSABLE_PHRASES: &[&str] = &[
@@ -628,7 +628,7 @@ mod tests {
     fn the_phrase_lists_match_their_bands() {
         assert_eq!(CONFUSABLE_PHRASES.len(), 28);
         assert_eq!(UNRELATED_PHRASES.len(), 20);
-        assert_eq!(OWNER_NEGATIVE_PHRASES.len(), 10);
+        assert_eq!(NON_WAKE_PHRASES.len(), 10);
         assert_eq!(PHRASE_IN_PASSING_PHRASES.len(), 8);
         assert_eq!(COMMAND_PLUS_SPEECH_PHRASES.len(), 10);
         assert_eq!(
@@ -666,7 +666,7 @@ mod tests {
                 COMMAND_PLUS_SPEECH_SEED_BASE + 10,
             ),
             (PHRASE_IN_PASSING_SEED_BASE, PHRASE_IN_PASSING_SEED_BASE + 8),
-            (OWNER_NEGATIVE_SEED_BASE, OWNER_NEGATIVE_SEED_BASE + 30),
+            (NON_WAKE_SEED_BASE, NON_WAKE_SEED_BASE + 30),
             (
                 audio::CONDITIONING_NOISE_SEED_BASE,
                 audio::CONDITIONING_NOISE_SEED_BASE + NUM_ENROLLMENT_VARIANTS as u64,

@@ -485,8 +485,9 @@ fn hash_code(hasher: &mut Sha256, source: &[u8]) {
 }
 
 /// Every source a synthesised clip's bytes depend on: the synthesis path, the
-/// graph builders and the emitters under it, the embedded speaker and the text
-/// and audio plumbing that turns a phrase into that path's inputs. A module
+/// graph builders and the emitters under it, the embedded speaker and the one
+/// derivation from audio to a speaker vector ([`crate::speaker::embed`]), and the
+/// text and audio plumbing that turns a phrase into that path's inputs. A module
 /// added to the path belongs here too.
 const SYNTHESIS_SOURCES: &[&[u8]] = &[
     include_bytes!("../synth.rs"),

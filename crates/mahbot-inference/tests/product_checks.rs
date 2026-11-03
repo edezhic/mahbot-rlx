@@ -11,6 +11,7 @@
 //! * instrumental music yields no transcribed text;
 //! * a paste onset at a seam lands within one detector hop, and whole-input
 //!   conditioning is time-preserving;
+//! * the pinned corpus clip's transcript and digest, reported as a witness;
 //! * the long recordings are read as what was said, through both reading paths;
 //! * the synthesis round trip — that the hearing reaches the text's closing words and
 //!   does not run away, with a control for each way it can fail.
@@ -263,6 +264,28 @@ fn a_paste_onset_lands_within_one_detector_hop() {
         "both copies conditioned at the same gain, so no level was compared"
     );
     assert_eq!(moved, 0, "a gain is time-preserving and moved a boundary");
+}
+
+/// **The pinned corpus clip's transcript and digest, reported as a witness.** The
+/// rule is the sentence, not the hash: a moved digest is printed and the check
+/// carries on, as long as the words still read as the pin. The witness pins one
+/// clip; a check that cannot read it says why it did not run rather than walking a
+/// different input.
+#[test]
+#[ignore = "needs the models and the pinned corpus; run by hand"]
+fn the_pinned_clip_reads_as_its_witness() {
+    let Some(asr) = pair(Role::Recognition) else {
+        return;
+    };
+    let Some(clip) = support::recording(reference::LISTEN_CLIP) else {
+        return;
+    };
+    let answer = support::listen_answer(&asr, &clip);
+    assert!(
+        support::witness_listen(&answer),
+        "the pinned clip no longer reads as its witness: {:?}",
+        answer.text
+    );
 }
 
 /// What the engine says about long real audio, and the audio it says it about: a corpus

@@ -5,11 +5,11 @@
 //! The synthetic verification voices: clones cut from single-reader corpus
 //! recordings the false-accept phase never measures.
 //!
-//! A clone's only per-voice input is the speaker embedding of its reference audio
-//! ([`crate::synth::Synthesis::with_reference`] embeds the whole file), so a voice
-//! *is* the recording and the span taken out of it, not a name: the span is cached
-//! as a 16 kHz WAV and every clip rendered from it carries the span's own identity
-//! in its cache key, so one voice's audio can never stand in for another's.
+//! A clone's only per-voice input is the speaker embedding of its span's audio
+//! ([`crate::speaker::embed`] embeds the whole span), so a voice *is* the recording
+//! and the span taken out of it, not a name: the span is cached as a 16 kHz WAV and
+//! every clip rendered from it carries the span's own identity in its cache key, so
+//! one voice's audio can never stand in for another's.
 //!
 //! Selection walks [`sets::VERIFICATION_POOL`] in its pinned order and takes the
 //! first [`sets::NUM_VERIFICATION_VOICES`] whose two-sentence render comes back
@@ -28,7 +28,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use crate::graphs::{self, Compiled};
+use crate::graphs;
 use crate::host;
 use crate::listen;
 use crate::loader::Pair;
@@ -325,7 +325,7 @@ pub(crate) fn select(
     // candidate the check rejected has nothing to witness.
     let embeddings: Vec<Vec<f32>> = voices
         .iter()
-        .map(|voice| reference_embedding(tts, &voice.wav))
+        .map(|voice| crate::speaker::embed(tts, &voice.wav))
         .collect::<Result<_>>()?;
     let similarity = pairwise(&embeddings);
     Ok(Selection {
@@ -582,31 +582,6 @@ fn is_whole_span(path: &Path, samples: usize) -> bool {
         && &header[8..12] == b"WAVE"
         && data == samples as u64 * 2
         && meta.len() == HEADER as u64 + data
-}
-
-/// The reference embedding a clone is built from. It repeats what
-/// [`crate::synth::Synthesis::with_reference`] does with the reference audio — the
-/// speaker encoder over the 24 kHz mel — rather than reading the pipeline's field,
-/// because the modules that produce clips are part of the corpus cache key: a
-/// code change there would invalidate every cached render.
-fn reference_embedding(tts: &Arc<Pair>, wav: &Path) -> Result<Vec<f32>> {
-    let path = wav.display().to_string();
-    let audio = host::wav_mono(&path, synth::SAMPLE_RATE, 0, usize::MAX)
-        .map_err(|error| anyhow!("speaker audio `{path}`: {error}"))?;
-    if audio.is_empty() {
-        bail!("the voice span `{path}` is empty");
-    }
-    let (mel, frames) = host::mel_24k(&audio);
-    let cfg = tts.body.config();
-    let mut speaker = Compiled::new(
-        rlx_runtime::Device::Gpu,
-        graphs::speaker_encoder(tts.sound.clone(), frames, cfg.d)?,
-    )?;
-    let mut embed = speaker.run_slices(&[("mel", &mel)]);
-    embed
-        .drain(..)
-        .next()
-        .ok_or_else(|| anyhow!("the speaker encoder returned no embedding for `{path}`"))
 }
 
 fn pairwise(embeddings: &[Vec<f32>]) -> Vec<(usize, usize, f32)> {

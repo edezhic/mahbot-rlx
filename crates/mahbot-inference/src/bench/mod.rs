@@ -1049,7 +1049,7 @@ fn enroll(synth: &mut Synth, listener: &mut listen::Listener) -> Result<(Enrollm
     }
     let prototype = consistency(&utterances)?;
 
-    // Ambient → the pinned calibration pool (owner, confusable, unrelated), from
+    // Ambient → the pinned calibration pool (non-wake, confusable, unrelated), from
     // the same request list the plan pre-flights and the build renders.
     let mut negatives = audio::ambient_negatives(listener)?;
     negatives.extend(audio::calibration_negatives(synth, listener)?);

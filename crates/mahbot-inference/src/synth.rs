@@ -6,7 +6,7 @@
 //! sound half.
 //!
 //! The graphs whose shapes do not depend on the request are built and compiled
-//! once ([`Synthesis::new`] — the embedded speaker and the code predictor's whole
+//! once ([`Synthesis::new`] — the pinned speaker and the code predictor's whole
 //! sixteen-level frame as one graph). The prompt and body graphs are built on a
 //! length they have not seen and kept while a request lands within a bucket of that
 //! length. The sound half's graphs belong to the call that builds them: built for a
@@ -17,7 +17,6 @@
 //! frames the talker produced — as many as the text takes to say, since the render runs
 //! to end-of-speech rather than to a frame budget.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
@@ -332,50 +331,40 @@ pub struct Synthesis {
     build_ms: f64,
 }
 
-/// The speaker vector of a reference WAV: read whole, resampled to 24 kHz, mel
-/// front end, ECAPA-TDNN. The bench's clone voices only — the product's voice is
-/// [`crate::speaker::SPEAKER_EMBED`].
-fn embed_reference(pair: &Arc<Pair>, cfg: &Config, wav: &Path) -> Result<Vec<f32>> {
-    let path = wav.display().to_string();
-    let audio = host::wav_mono(&path, SAMPLE_RATE, 0, usize::MAX)
-        .map_err(|e| anyhow!("speaker audio `{path}`: {e}"))?;
-    if audio.is_empty() {
-        return Err(anyhow!("speaker audio `{path}` is empty"));
-    }
-    let (mel, frames) = host::mel_24k(&audio);
-    let mut speaker = Compiled::new(
-        rlx_runtime::Device::Gpu,
-        graphs::speaker_encoder(pair.sound.clone(), frames, cfg.d)?,
-    )?;
-    let mut embed = speaker.run_slices(&[("mel", &mel)]);
-    embed
-        .drain(..)
-        .next()
-        .ok_or_else(|| anyhow!("the speaker encoder returned no embedding"))
-}
-
 impl Synthesis {
-    /// The product's synthesis path: the enrolled voice is [`crate::speaker`]'s
-    /// constant, so no recording is read and no speaker-encoder graph is built.
-    /// The code predictor's whole sixteen-level frame and the speaker's numbers are
-    /// compiled once; the prompt and body graphs are built on first use and reused
-    /// while a request's length stays within a bucket of the one they were built for
-    /// (`Synthesis::prefill`, `Synthesis::body`); the sound half's graphs are built
-    /// and given back inside the call that runs them.
+    /// The product's synthesis path: the pinned voice is
+    /// [`crate::speaker::SPEAKER_EMBED`], so no recording is read and no
+    /// speaker-encoder graph is built. The code predictor's whole sixteen-level frame
+    /// and the speaker's numbers are compiled once; the prompt and body graphs are
+    /// built on first use and reused while a request's length stays within a bucket of
+    /// the one they were built for (`Synthesis::prefill`, `Synthesis::body`); the sound
+    /// half's graphs are built and given back inside the call that runs them.
     pub fn new(pair: Arc<Pair>) -> Result<Self> {
-        Self::build(pair, None)
+        Self::with_embedding(pair, crate::speaker::SPEAKER_EMBED.to_vec())
     }
 
-    /// The bench's clone voices: a speaker embedded from the span cut for that
-    /// clone, so a verification voice is its recording. The product never takes
-    /// this path.
-    pub fn with_reference(pair: Arc<Pair>, wav: &Path) -> Result<Self> {
-        Self::build(pair, Some(wav))
-    }
-
-    fn build(pair: Arc<Pair>, reference: Option<&Path>) -> Result<Self> {
-        let tokenizer = Tokenizer::from_model(&pair.body)?;
+    /// A caller that already holds a speaker vector — the bench's clone voices, whose
+    /// vector comes from a corpus span ([`crate::speaker::embed`]), and
+    /// [`Synthesis::new`] with the pinned one. The vector must be as wide as the
+    /// talker's prompt row, or the call is refused before any graph is built.
+    pub fn with_embedding(pair: Arc<Pair>, speaker_embed: Vec<f32>) -> Result<Self> {
         let cfg = pair.body.config().clone();
+        // The prompt adds the vector to `token_embd.weight`'s pad row, which is the
+        // talker's own width (`cfg.d`) — the same value `generate` builds the prompt
+        // with. A vector of another width cannot be conditioned on at all, so it is
+        // refused here, before any graph exists.
+        if speaker_embed.len() != cfg.d {
+            bail!(
+                "pair `{}` + `{}`: the speaker vector is {} wide — expected the \
+                 talker's {}-wide prompt row (`token_embd.weight`'s pad row)",
+                pair.body.path.display(),
+                pair.sound.path.display(),
+                speaker_embed.len(),
+                cfg.d
+            );
+        }
+
+        let tokenizer = Tokenizer::from_model(&pair.body)?;
         // A render's length is the text's, bounded by the talker's context: a file that
         // states none cannot say how long a render may run.
         let context = pair.body.context_length()?;
@@ -387,18 +376,6 @@ impl Synthesis {
         let steps = graphs::code_predictor_steps(&pair.sound)?;
         let capacity_pred = steps + 1;
         let (d_talker, _) = pair.sound.code_proj_widths()?;
-
-        let speaker_embed = match reference {
-            None => crate::speaker::SPEAKER_EMBED.to_vec(),
-            Some(path) => embed_reference(&pair, &cfg, path)?,
-        };
-        if speaker_embed.len() != cfg.d {
-            bail!(
-                "the speaker vector is {} wide, the talker's d is {}",
-                speaker_embed.len(),
-                cfg.d
-            );
-        }
 
         // The draw seed is a uniform word, not a pipeline constant: the graph is
         // built once with a neutral default and every frame rewrites the seeds

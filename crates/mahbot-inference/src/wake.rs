@@ -5,8 +5,8 @@
 //! The wake decision: enrolment prototype, negative calibration and the
 //! rolling/adaptive score.
 //!
-//! Enrolment builds a prototype from the owner's windows, a negative pool fixes
-//! the cosine floor, and the rolling decision scores each window against that
+//! Enrolment builds a prototype from the enrolled voice's windows, a negative pool
+//! fixes the cosine floor, and the rolling decision scores each window against that
 //! prototype with this crate's own encoder ([`crate::listen`]). The cosine
 //! scale is absolute for a given model, but the floor is derived from the
 //! negative pool measured against *that* prototype — thresholds do not transfer
