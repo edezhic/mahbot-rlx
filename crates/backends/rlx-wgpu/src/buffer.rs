@@ -3332,18 +3332,20 @@ impl Arena {
         out
     }
 
-    /// Whether a write that lands in the shared weight buffer can be skipped, and the
-    /// count of what was skipped when it is.
+    /// Whether the weight bytes at `byte_off` are already in the shared weight buffer,
+    /// written by a compile of the same scope — the predicate
+    /// [`Self::skip_weight_write`] decides on, asked without counting a skip so a caller
+    /// that only holds a copy to hand it over can ask before it materialises one.
     ///
     /// Yes only when all of these hold: this arena adopted the shared entry for a
     /// declared scope, the live entry for that scope is still the one it adopted
     /// (generation unchanged — a re-created entry means these bytes are not where this
-    /// arena thinks), the entry's [`slots`](SharedWeightBuffers::slots) name this same
-    /// scope for exactly this offset, and this arena has not written that offset
-    /// itself. The last clause is what keeps a param re-set on the same executable
-    /// landing: the scope asserts that *another* compile for the same model wrote the
-    /// same bytes, not that this one may drop the write.
-    fn skip_weight_write(&self, byte_off: usize, len: usize) -> bool {
+    /// arena thinks), the entry's slots name this same scope for exactly this offset,
+    /// and this arena has not written that offset itself. The last clause is the subtle
+    /// one: a slot says that *another* compile for the same model wrote these bytes, so
+    /// this one may drop the write — it does not say this arena may, and a second write
+    /// to the same offset by the arena that placed them has to land.
+    pub(crate) fn weight_write_resident(&self, byte_off: usize) -> bool {
         let Some((key, generation)) = self.weight_share else {
             return false;
         };
@@ -3362,9 +3364,15 @@ impl Arena {
             return false;
         }
         let guard = shared_weights().lock().unwrap_or_else(|e| e.into_inner());
-        let resident = guard.get(&key).is_some_and(|shared| {
+        guard.get(&key).is_some_and(|shared| {
             shared.generation == generation && shared.slots.get(&raw) == Some(&scope)
-        });
+        })
+    }
+
+    /// Whether a write that lands in the shared weight buffer can be skipped, and the
+    /// count of what was skipped when it is ([`Self::weight_write_resident`]).
+    fn skip_weight_write(&self, byte_off: usize, len: usize) -> bool {
+        let resident = self.weight_write_resident(byte_off);
         if resident {
             SHARED_WEIGHT_SKIPPED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
             SHARED_WEIGHT_SKIPPED_WRITES.fetch_add(1, Ordering::Relaxed);
@@ -3401,10 +3409,30 @@ impl Arena {
     ///
     /// The one place a write into the shared weight buffer is *decided*: every weight
     /// upload — `write_f32`'s weight-tagged branch, `set_param_bytes`, a parameter's raw
-    /// bytes — arrives here, so the sharing check below covers all of them. A path that
-    /// called `queue.write_buffer` on [`Self::weight_buffer`] directly would re-upload
-    /// silently and defeat the sharing with no sign of it.
+    /// bytes — arrives here or at `write_bytes_recording`, so the sharing check below
+    /// covers all of them. A path that called `queue.write_buffer` on
+    /// [`Self::weight_buffer`] directly would re-upload silently and defeat the sharing
+    /// with no sign of it.
     pub fn write_bytes_range(&self, queue: &wgpu::Queue, byte_off: usize, data: &[u8]) {
+        self.write_bytes_recording(queue, byte_off, data, Some(byte_off));
+    }
+
+    /// [`Self::write_bytes_range`], with the scope's claim made for `record` — the offset
+    /// the shared pool keys the parameter by — instead of the write's own start. `None`
+    /// writes the bytes and claims nothing.
+    ///
+    /// What a caller writing one piece of a parameter it does not hold whole passes, with
+    /// `Some(base)` only on the piece that completes it: "resident" means the parameter is
+    /// whole, so a compile that fails between two pieces must leave the next one writing
+    /// them all, not multiplying over the ones that never landed. A `record` outside the
+    /// weight buffer claims nothing: only a parked parameter has a slot in the pool.
+    pub(crate) fn write_bytes_recording(
+        &self,
+        queue: &wgpu::Queue,
+        byte_off: usize,
+        data: &[u8],
+        record: Option<usize>,
+    ) {
         if data.is_empty() {
             return;
         }
@@ -3448,8 +3476,8 @@ impl Arena {
             queue.write_buffer(buf, local as u64, &data[off..off + n]);
             off += n;
         }
-        if weight {
-            self.record_weight_write(byte_off);
+        if let Some(at) = record.filter(|&at| is_weight_off(at)) {
+            self.record_weight_write(at);
         }
     }
 }

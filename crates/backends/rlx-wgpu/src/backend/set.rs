@@ -137,6 +137,79 @@ impl WgpuExecutable {
         }
     }
 
+    /// Where a partial write, or a residency question about one, finds `name`: the offset
+    /// its storage starts at (weight-buffer-tagged where it is parked) and the storage's own
+    /// record. `None` when the schedule is still unresolved, the parameter is not in it, or
+    /// no arena recorded the parameter's storage.
+    fn param_storage(&self, name: &str) -> Option<(usize, crate::buffer::ParamStorage)> {
+        if self.unresolved.is_some() {
+            return None;
+        }
+        let &id = self.param_offsets.get(name)?;
+        if !self.arena.has(id) {
+            return None;
+        }
+        let base = self.arena.offset(id);
+        Some((base, self.arena.param_storage_at(base)?))
+    }
+
+    /// Upload one piece of a raw-bytes Param, `byte_offset` bytes into its storage —
+    /// what a caller that never holds the whole parameter writes it with. Returns
+    /// `false` when this graph cannot take a piece: it is still waiting to resolve its
+    /// shapes (a dynamic schedule replays its parameters when it resolves), no such
+    /// parameter is in this schedule, the parameter's storage is not on record, or the
+    /// piece runs past it.
+    ///
+    /// Both the bound and the completion test are the parameter's *storage* bytes, not the
+    /// plan's f32 slot: a packed U8/I8 parameter holds one byte per element where the slot
+    /// counts four, so a bound taken from the slot would admit a piece four times the
+    /// parameter's length — written past its end into whatever the weight buffer placed
+    /// next — and a completion test against it would never fire.
+    ///
+    /// Only the piece that completes the parameter claims it for the scope
+    /// (`Arena::write_bytes_recording`), so a caller that stops between pieces leaves
+    /// the next compile uploading all of them rather than skipping a parameter that is
+    /// only partly there.
+    pub fn set_param_range(&mut self, name: &str, byte_offset: usize, data: &[u8]) -> bool {
+        let Some((base, storage)) = self.param_storage(name) else {
+            return false;
+        };
+        let (Some(end), Some(at)) = (
+            byte_offset.checked_add(data.len()),
+            base.checked_add(byte_offset),
+        ) else {
+            return false;
+        };
+        if end > storage.bytes {
+            return false;
+        }
+        self.invalidate_static_weight_packs();
+        let dev = wgpu_device().expect("rlx-wgpu: device gone");
+        self.arena.write_bytes_recording(
+            &dev.queue,
+            at,
+            data,
+            (end == storage.bytes).then_some(base),
+        );
+        true
+    }
+
+    /// Whether `name`'s bytes were already put there by another compile of this scope, so a
+    /// caller holding a copy only to hand it over may drop it instead of uploading. `len` is
+    /// the parameter's storage length in bytes, the same figure [`Self::set_param_range`]
+    /// measures completion against; a length the parameter does not have answers `false`,
+    /// which costs the caller the upload rather than refusing it. Only a parameter parked in
+    /// the shared weight buffer can answer yes; one that lives in the activation arena has no
+    /// slot to check.
+    pub fn param_resident(&self, name: &str, len: usize) -> bool {
+        let Some((off, storage)) = self.param_storage(name) else {
+            return false;
+        };
+        crate::buffer::is_weight_off(off)
+            && storage.bytes == len
+            && self.arena.weight_write_resident(off)
+    }
+
     /// Upload a raw BF16 weight byte stream (`ne*2` bytes, native LE) for a
     /// param the compiled arena stores PACKED in `bf16_weight_buffer`. Returns
     /// `true` iff handled here (param is packed) — no host bf16→f32 widen and

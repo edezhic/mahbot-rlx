@@ -100,6 +100,12 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     fn set_param(&mut self, name: &str, data: &[f32]) {
         self.inner.set_param(name, data);
     }
+    fn param_resident(&self, name: &str, len: usize) -> bool {
+        self.inner.param_resident(name, len)
+    }
+    fn set_param_range(&mut self, name: &str, byte_offset: usize, data: &[u8]) -> bool {
+        self.inner.set_param_range(name, byte_offset, data)
+    }
     fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         self.inner.run(inputs)
     }

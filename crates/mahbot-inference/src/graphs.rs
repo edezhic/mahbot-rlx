@@ -59,9 +59,9 @@ pub struct BlkSpec {
 /// sequence every other graph here uses, and the graph it emits is unchanged.
 ///
 /// `qkv_fused` takes the block's three attention input projections from the one wide
-/// blob the graph's load-time fuse concatenated (`{p}.qkv.fused`) instead of three passes
-/// over the three tensors: the same bytes, read in one pass and split back into q/k/v
-/// along the output rows.
+/// parameter the graph's fuse joins (`{p}.qkv.fused`) instead of three passes over the
+/// three tensors: the same bytes, read in one pass and split back into q/k/v along the
+/// output rows.
 pub fn block(
     ctx: &mut FlowCtx<'_>,
     model: &Model,
@@ -89,7 +89,7 @@ pub fn block(
         (b.kv_heads * b.head_dim) as i64,
     ];
 
-    // The three projections: one fused packed pass over the blob the load-time fuse built
+    // The three projections: one fused packed pass over the wide parameter the fuse joins
     // when the file's q/k/v share one, three separate passes when they cannot. The biases
     // ride outside the multiply, as the caller adds them below.
     let [q_mm, k_mm, v_mm] = if qkv_fused {
@@ -423,10 +423,9 @@ pub struct EncoderTail {
     pub frames: usize,
     /// Independent windows in the pass; each carries its own `tokens` rows.
     pub batch: usize,
-    /// The blocks' three attention input projections were fused into one blob at load
-    /// time, so every block reads q/k/v as one wide packed pass; false means each block
-    /// reads them as three separate passes. The shipped `mmproj` fuses, so its encoder
-    /// never takes that form.
+    /// The blocks' three attention input projections share one wide packed parameter, so
+    /// every block reads q/k/v as one pass; false means each block reads them as three
+    /// separate passes. The shipped `mmproj` fuses, so its encoder never takes that form.
     pub qkv_fused: bool,
 }
 
@@ -746,12 +745,12 @@ pub struct BodyStateStage {
     /// declared row is wider, so one `feed_kv_row` carries every row of a block
     /// instead of one submission per row.
     pub packed_feed: bool,
-    /// q/k/v were fused at load time under `*.qkv.fused`; gate+up under
+    /// q/k/v share the one wide parameter `*.qkv.fused`; gate+up share
     /// `*.gate_up.fused`. The two are separate flags because on Q4_K_M `v` is
     /// Q6_K while `q`/`k` are Q4_K: q/k/v cannot share one packed scheme, while
     /// gate+up can.
     pub fused: bool,
-    /// gate+up were fused at load time under `*.gate_up.fused`.
+    /// gate+up share the one wide parameter `*.gate_up.fused`.
     pub fused_gate_up: bool,
 }
 
@@ -1128,46 +1127,27 @@ impl LayerStage for BodyStateStage {
 /// The three attention input projections' names inside a block.
 const QKV_PARTS: [&str; 3] = ["attn_q", "attn_k", "attn_v"];
 
-/// Fuse one projection (q/k/v or gate/up) for the whole graph or not at all: the
-/// decision is taken for every layer before the first blob is built, so a graph that
-/// cannot fuse it parks nothing for the layers it would have taken.
-///
-/// A fuse can still be refused per layer after the graph-level decision — a stacked
-/// tensor's step, say. The layers before the refusal keep the blobs already built in
-/// the process cache while the graph is then built without them; that residue is
-/// bounded by one projection of one graph and is the price of deciding before building
-/// rather than parking a second spelling of every layer, which is what the alternative
-/// costs.
+/// Fuse one projection (q/k/v or gate/up) for the whole graph or not at all. A fuse is a
+/// plan recorded per layer, not bytes, so a refusal part-way leaves plans no graph asks for
+/// and nothing built — the caller then builds the separate projections.
 ///
 /// `prefix` is the blocks' own name prefix (`""` for the body, `a.gen.code.` for the
 /// code predictor, `a.` for the audio encoder), so both layouts of one file ask the
-/// weight pool for the same blob names.
+/// weight pool for the same joined parameter names.
 fn fuse_projection(
     weights: &mut LoaderWeights,
     layers: usize,
     prefix: &str,
     parts: &[&str],
-    blob: &str,
+    joined: &str,
 ) -> Result<bool> {
-    let keys = |i: usize| -> Vec<String> {
-        parts
+    for i in 0..layers {
+        let keys: Vec<String> = parts
             .iter()
             .map(|p| format!("{prefix}blk.{i}.{p}.weight"))
-            .collect()
-    };
-    for i in 0..layers {
-        let keys = keys(i);
+            .collect();
         let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        if !weights.can_fuse(&refs)? {
-            return Ok(false);
-        }
-    }
-    for i in 0..layers {
-        let keys = keys(i);
-        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        // A layer the fuse refused changes the answer for the whole graph: the layers are
-        // then built without a blob that was not made.
-        if !weights.fuse_packed(&format!("{prefix}blk.{i}.{blob}.fused"), &refs)? {
+        if !weights.fuse_packed(&format!("{prefix}blk.{i}.{joined}.fused"), &refs)? {
             return Ok(false);
         }
     }
@@ -1176,8 +1156,8 @@ fn fuse_projection(
 
 /// Fuse the body's two projections, each for the whole graph or not at all
 /// ([`fuse_projection`]). The two flags are **independent** — on the pinned Q4_K_M body
-/// `attn_v` is Q6_K, so q/k/v cannot share one blob while gate+up can, and coupling
-/// them would park both spellings of every ffn and put two copies of it on the device.
+/// `attn_v` is Q6_K, so q/k/v cannot share one parameter while gate+up can, and coupling
+/// them would put both spellings of every ffn on the device.
 fn fuse_layer_projections(
     weights: &mut LoaderWeights,
     layers: usize,
@@ -1201,9 +1181,9 @@ pub fn body_new_rows_head_chain(
 ) -> Result<BuiltModel> {
     let cfg = model.config().clone();
     let mut weights = LoaderWeights::new(model.clone());
-    // The same fused projections the decode graph parks, name for name: the two layouts of
-    // one body then ask the weight pool for the same tensors, so the device holds the body
-    // once for a prefill and a decode of it
+    // The same fused projections the decode graph fuses, name for name: the two layouts of
+    // one body then ask the weight pool for the same parameters, so the device holds the
+    // body once for a prefill and a decode of it
     // ([`rlx_wgpu::buffer::set_param_sharing_scope`]).
     let (fused, fused_gate_up) = fuse_layer_projections(&mut weights, cfg.layers, "")?;
     let flow = ModelFlow::new(format!("body_rows_{m}_p{prefix}_h{head}"))
@@ -2174,10 +2154,10 @@ pub struct CodePredictorFrameStage {
     pub capacity: usize,
     /// Projecting levels: `steps` codes follow level 0's `code0`.
     pub steps: usize,
-    /// q/k/v were fused at load time under `*.qkv.fused`.
+    /// q/k/v share the one wide parameter `*.qkv.fused`.
     pub fused: bool,
-    /// gate+up were fused at load time under `*.gate_up.fused` — a separate flag, because a
-    /// body whose `attn_v` is another scheme still fuses its ffn.
+    /// gate+up share `*.gate_up.fused` — a separate flag, because a body whose `attn_v` is
+    /// another scheme still fuses its ffn.
     pub fused_gate_up: bool,
     pub sampler: SampleSpec,
 }
@@ -2775,9 +2755,10 @@ fn bump(submits: u64, waits: u64) {
 }
 
 /// Restores the compile's thread-local state when it ends, however it ends: the
-/// weight-sharing scope the next compile must not inherit, and the origin record of
-/// the build that just finished. A compile that failed with a `?` would otherwise
-/// leave both behind and change how the next build behaves.
+/// weight-sharing scope the next compile must not inherit, and the build records of the
+/// build that just finished (its origins, placeholders, fused plans and bound files). A
+/// compile that failed with a `?` would otherwise leave them behind and change how the next
+/// build behaves.
 struct DeclaredScope;
 
 impl Drop for DeclaredScope {
@@ -2785,6 +2766,55 @@ impl Drop for DeclaredScope {
         rlx_runtime::set_param_sharing_scope("");
         emit::clear_origins();
     }
+}
+
+/// Bind a fused projection's parameter from the model file's own tensors: each part is read
+/// into `scratch` and written at its own offset, so the concatenation never exists on the
+/// host — the one joined copy is the device's.
+///
+/// Nothing is read when the device already holds the parameter, which is the rule for a
+/// second layout of one body: the rung ladder and a warm call both ask for the same joined
+/// parameter, and the bytes a previous compile placed are the bytes it wants. A part is
+/// claimed for the scope only by the write that completes the parameter, so a read that
+/// fails part-way leaves the next compile writing every piece instead of skipping the ones
+/// that never landed.
+///
+/// No route in this tree reaches the refusal: every product call site compiles for
+/// `Device::Gpu`, and a body's graphs are fully shaped, so a range write either lands or the
+/// parameter was never in the schedule. It exists for the backend that cannot serve a piece
+/// (the CPU's non-F32 storage, Metal's separate weight buffer) or a schedule still waiting to
+/// resolve its shapes: those say so by name, because the alternative is assembling the
+/// joined bytes on the host — the peak this binding exists to remove.
+fn bind_fused(
+    device: Device,
+    session: &mut rlx_runtime::CompiledGraph,
+    name: &str,
+    fused: emit::Fused,
+    len: usize,
+    scratch: &mut Vec<u8>,
+) -> Result<()> {
+    if session.param_resident(name, len) {
+        return Ok(());
+    }
+    let mut at = 0usize;
+    for part in &fused.parts {
+        fused.model.read_into(part, scratch)?;
+        // The whole parameter is never assembled to hand over instead: that copy is the
+        // peak this binding exists to avoid, so a backend that cannot take a piece says so.
+        if !session.set_param_range(name, at, scratch) {
+            bail!(
+                "the fused projection `{name}` cannot be written in pieces: {device:?} \
+                 refused the range write at byte {at} (no partial parameter write on this \
+                 backend, or no such parameter in the compiled schedule) — and the joined \
+                 bytes are not materialised on the host to hand over whole"
+            );
+        }
+        at += scratch.len();
+    }
+    if at != len {
+        bail!("the fused projection `{name}` joins {at} bytes, its parameter is {len}");
+    }
+    Ok(())
 }
 
 /// Compile a built flow and run it.
@@ -2836,9 +2866,9 @@ impl Runner {
         // the map before its clone goes to the device, not after the map has been
         // walked whole.
         // Where each parameter's bytes really are, for the ones the build did not carry
-        // (`emit`): a weight the process already read is bound from memory, and a packed
-        // tensor from the model file — a read the write skip then makes free, when the
-        // shape's slots already hold the model's bytes.
+        // (`emit`): a weight the process already read is bound from memory; a packed
+        // tensor from the model file, or — for a fused projection — part by part out of
+        // it; and a parameter the device already holds is not read for at all.
         let origins = emit::take_origins();
         // One message for both ways a placeholder's bytes can be missing: a record released
         // by `emit::clear_weight_caches` and a build whose record never reached this compile
@@ -2867,11 +2897,23 @@ impl Runner {
         // ([`rlx_gguf::GgufFile::read_tensor_bytes_into`]).
         let mut scratch: Vec<u8> = Vec::new();
         while let Some((name, bytes, dt)) = built.typed_params.pop() {
-            if let Some(blob) = emit::blob_weight(&origins, &name) {
-                session.set_param_typed(&name, &blob, dt);
-            } else if let Some((model, key)) = emit::mapped_weight(&origins, &name) {
-                model.read_into(&key, &mut scratch)?;
-                session.set_param_typed(&name, &scratch, dt);
+            if let Some(fused) = emit::fused_of(&name) {
+                bind_fused(
+                    device,
+                    &mut session,
+                    &name,
+                    fused,
+                    bytes.len(),
+                    &mut scratch,
+                )?;
+            } else if let Some((model, key)) = emit::bound_weight(&name) {
+                // The read is only worth making when the write it feeds would land: a
+                // second layout of one body asks for the same parameter, and the device
+                // already holds it ([`CompiledGraph::param_resident`]).
+                if !session.param_resident(&name, bytes.len()) {
+                    model.read_into(&key, &mut scratch)?;
+                    session.set_param_typed(&name, &scratch, dt);
+                }
             } else if emit::is_placeholder(&name) {
                 return Err(unresolved(&name));
             } else {

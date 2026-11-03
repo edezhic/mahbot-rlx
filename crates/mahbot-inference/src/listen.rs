@@ -12,7 +12,7 @@
 //! takes the same front end cut in two (`GroupFront`): the conv front per window,
 //! the encoder tail and the projector once for a group of windows.
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 
@@ -315,8 +315,13 @@ impl Rung {
 /// chunk of a rung runs the same `[RUNG_CAPACITY]`-deep body. Held beside the clips rather
 /// than inside one because the rungs come and go with the chunk groups, and this graph does
 /// not: it is the pair's, not a rung's.
-fn decode_slot() -> &'static Mutex<Option<(Arc<Pair>, Arc<Shared>)>> {
-    static DECODE: OnceLock<Mutex<Option<(Arc<Pair>, Arc<Shared>)>>> = OnceLock::new();
+///
+/// The pair is held **weakly**: the graph is what a warm call reuses, and it must not keep
+/// a model file mapped after its last user has dropped it. A caller that opens the pair
+/// again gets a new decode graph, because a second `Pair` over the same files is a second
+/// set of weights.
+fn decode_slot() -> &'static Mutex<Option<(Weak<Pair>, Arc<Shared>)>> {
+    static DECODE: OnceLock<Mutex<Option<(Weak<Pair>, Arc<Shared>)>>> = OnceLock::new();
     DECODE.get_or_init(|| Mutex::new(None))
 }
 
@@ -325,12 +330,12 @@ fn shared_decode(pair: &Arc<Pair>) -> Result<Arc<Shared>> {
     if let Some((held, decode)) = guard.as_ref() {
         // Pointer identity, not the file path: a second `Pair` opened over the same files
         // is a second set of weights, and its graphs are not this one's.
-        if Arc::ptr_eq(held, pair) {
+        if held.upgrade().is_some_and(|held| Arc::ptr_eq(&held, pair)) {
             return Ok(Arc::clone(decode));
         }
     }
     let decode = Shared::new(decode_graph(pair, RUNG_CAPACITY)?);
-    *guard = Some((Arc::clone(pair), Arc::clone(&decode)));
+    *guard = Some((Arc::downgrade(pair), Arc::clone(&decode)));
     Ok(decode)
 }
 
@@ -797,7 +802,8 @@ pub(crate) struct Clip<'a> {
 
 /// The prompt's prefill graph: the whole body over `prompt_rows` rows, logits only on the
 /// last, with the fused qkv and gate/up projections the decode graph also uses — the same
-/// blob names, so the device's weight pool holds one copy of the body for both layouts.
+/// parameter names, so the device's weight pool holds one copy of the body for both
+/// layouts.
 fn prefill_graph(pair: &Arc<Pair>, prompt_rows: usize) -> Result<Compiled> {
     graphs::body_new_rows_head_chain(pair.body.clone(), prompt_rows, 0, true)
         .and_then(|m| graphs::Compiled::new(rlx_runtime::Device::Gpu, m))

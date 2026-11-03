@@ -422,11 +422,21 @@ pub trait ExecutableGraph: Send {
 
     /// Incrementally write raw `data` into a named param starting `byte_offset`
     /// bytes into its storage. Returns true if the backend performed the partial
-    /// write; false means "unsupported / not applicable" and the caller must fall
-    /// back to a whole-buffer [`Self::set_param_typed`]. Lets a large packed
-    /// residency buffer (paged MoE experts) upload only the ONE changed slot
-    /// instead of re-copying the whole buffer each step. Default: unsupported.
+    /// write; false means "this graph cannot take a piece" — a caller that never
+    /// holds the whole parameter writes it in pieces with this, and a caller that
+    /// receives `false` from here has no whole buffer to fall back on. Default:
+    /// unsupported.
     fn set_param_range(&mut self, _name: &str, _byte_offset: usize, _data: &[u8]) -> bool {
+        false
+    }
+
+    /// Whether the named parameter's bytes were already put there by another compile of the
+    /// same scope, so a caller holding a copy only to hand it over may drop it instead of
+    /// uploading.
+    ///
+    /// `len` is the parameter's storage length in bytes. `false` by default: a backend that
+    /// cannot answer is never told it may skip a write.
+    fn param_resident(&self, _name: &str, _len: usize) -> bool {
         false
     }
 

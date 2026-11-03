@@ -163,28 +163,6 @@ unsafe extern "C" {
     fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut RusageInfoV4) -> i32;
 }
 
-/// Return the pages freed so far to the OS. macOS keeps them in the malloc
-/// zones, so a process that drops one phase and builds the next can peak at the
-/// sum of the phases; the pressure call hands those pages back and the next
-/// phase allocates from what the OS has. Platforms that return memory on free
-/// do nothing here.
-pub fn release_free() {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        // Twice, with a short settle: the first call starts returning pages, the
-        // second catches what the allocator released in between. Without this the
-        // post-run RSS depends on which phase happened to trigger the last free.
-        malloc_zone_pressure_relief(core::ptr::null_mut(), 0);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        malloc_zone_pressure_relief(core::ptr::null_mut(), 0);
-    }
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn malloc_zone_pressure_relief(zone: *mut core::ffi::c_void, goal: usize) -> usize;
-}
-
 /// The two memory figures one row carries, from the platform's accounting: the
 /// figure at rest and the process's lifetime peak.
 #[derive(Clone, Copy, Debug)]

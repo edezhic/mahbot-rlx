@@ -664,8 +664,8 @@ impl CompiledGraph {
 
     /// Incrementally write raw `data` into a named param starting `byte_offset`
     /// bytes into its storage. Returns true if the backend did the partial write;
-    /// false → caller must fall back to a whole-buffer [`Self::set_param_typed`].
-    /// Used by paged-MoE residency to upload only the changed expert slot.
+    /// false → this graph cannot take a piece (see the backend's `set_param_range`).
+    /// A caller that never holds the whole parameter writes it in pieces with this.
     pub fn set_param_range(&mut self, name: &str, byte_offset: usize, data: &[u8]) -> bool {
         if let Some(st) = self.staging.as_mut() {
             let mut done = false;
@@ -680,6 +680,30 @@ impl CompiledGraph {
         } else {
             self.inner.set_param_range(name, byte_offset, data)
         }
+    }
+
+    /// Whether a named parameter's bytes are already on the device — the question a
+    /// caller asks before it materialises a copy it only holds to hand over
+    /// ([`Self::set_param_typed`]). `false` when no graph of this executable takes the
+    /// parameter, or when any graph that does cannot say its bytes are there.
+    pub fn param_resident(&self, name: &str, len: usize) -> bool {
+        let Some(st) = self.staging.as_ref() else {
+            return self.inner.param_resident(name, len);
+        };
+        let mut asked = false;
+        if st.prepare_params.contains(name) {
+            asked = true;
+            if !st.prepare.param_resident(name, len) {
+                return false;
+            }
+        }
+        if st.main_params.contains(name) {
+            asked = true;
+            if !self.inner.param_resident(name, len) {
+                return false;
+            }
+        }
+        asked
     }
 
     /// Finish param upload — warms backend caches when supported.

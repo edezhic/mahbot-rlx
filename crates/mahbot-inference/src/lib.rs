@@ -42,19 +42,19 @@ pub mod wake;
 
 /// Give back every process-wide copy of the models this crate keeps: the decode graph a
 /// resident pair holds, the process's mel graphs, the host copies of the weights and the
-/// device's shared weight pool. A long-lived caller that has finished a pass calls this to
-/// return the memory; the next call recompiles and re-reads, so it is a cost, not a state
-/// change. Nothing that survives a completed call grows without a bound — the host caches
-/// are keyed by tensor and the pool by scope — so this is how a process gets *down* from
-/// that bound, not what makes it bounded. A rung's own graphs are not part of this: they
-/// belong to the call that built them and are already gone when it returns.
+/// device's shared weight pool. A long-lived caller that has finished a pass drops them
+/// here; the next call recompiles and re-reads, so it is a cost, not a state change.
+/// Nothing that survives a completed call grows without a bound — the host caches are keyed
+/// by tensor and the pool by scope — so this is how a process gets *down* from that bound,
+/// not what makes it bounded. A rung's own graphs are not part of this: they belong to the
+/// call that built them and are already gone when it returns.
 ///
-/// The pages the release freed are handed back to the OS too: macOS keeps them in the
-/// malloc zones, so a process that drops one half and builds the next peaks at their sum
-/// unless the release also returns them.
+/// What this does not do is hand the freed pages back to the operating system: measured on
+/// macOS 26.5/arm64, neither dropping a 378 MiB `Vec` nor `malloc_zone_pressure_relief`
+/// returns one, so what keeps the footprint down is not keeping a copy, not releasing one
+/// later.
 pub fn release_process_memory() {
     listen::clear_graph_caches();
     emit::clear_weight_caches();
     rlx_wgpu::buffer::clear_shared_weights();
-    report::release_free();
 }

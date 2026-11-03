@@ -26,7 +26,7 @@ use crate::graphs::{Compiled, DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, windows};
 use crate::loader::{Config, Head, Pair};
 use crate::report::Stopwatch;
 use crate::tokenizer::Tokenizer;
-use crate::{graphs, host, report};
+use crate::{graphs, host};
 
 /// Waveform rate the sound half produces.
 pub const SAMPLE_RATE: u32 = 24_000;
@@ -871,8 +871,7 @@ impl Synthesis {
         let mut left = vec![0f32; wave_d_tfm * (wave_k - 1)];
         // The front's graphs live only until this loop has run: dropped before the
         // first stage group is built, they cannot sit beside the decoder's arenas and
-        // set the peak at their sum. `release_free` hands their pages back too — macOS
-        // keeps a freed one in its zone until something asks for it.
+        // set the peak at their sum.
         let mut front = graphs::FrontGraphs::build(device, &sound, frames, front_group.clone())?;
         for (a, b) in windows(frames, FRONT_WINDOW, 0)
             .into_iter()
@@ -944,7 +943,6 @@ impl Synthesis {
         }
         self.build_ms += front.built_ms();
         drop(front);
-        report::release_free();
 
         // The distinct window lengths the part runs, the same for every stage group.
         let mut lengths: Vec<usize> = parts.iter().map(|&(p0, p1, _, _)| p1 - p0).collect();
@@ -999,10 +997,7 @@ impl Synthesis {
             }
             wave = stitched;
             // Every graph of this group went with its length, so no two groups can
-            // coexist. The pages go here too, before the next group asks for its own:
-            // macOS keeps a freed page in its zone until something asks for it, so
-            // without this the footprint would read the sum where the arenas are gone.
-            report::release_free();
+            // coexist.
         }
 
         let expected = frames * graphs::samples_per_frame();

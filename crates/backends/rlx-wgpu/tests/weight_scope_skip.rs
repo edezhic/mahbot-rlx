@@ -3,26 +3,36 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! A second compile for the same declared model skips re-uploading the weights the
-//! first one placed in the shared weight buffer.
+//! first one placed in the shared weight buffer — and a caller can ask before it
+//! materialises a copy (`WgpuExecutable::param_resident`), or write a parameter it never
+//! holds whole one piece at a time (`WgpuExecutable::set_param_range`).
 //!
 //! `RLX_WGPU_ALL_PARAMS_WEIGHT` parks every parameter in the weight buffer — the one
 //! buffer the sharing is about — and the scope `set_param_sharing_scope` installs is a
 //! process-global, so the cases here take turns behind one lock rather than running in
-//! parallel. Each asks the same two questions around a second compile: what
-//! `shared_weight_skip_stats` moved, and whether the second executable still computes
+//! parallel. The skip-counting cases ask the same two questions around a second compile:
+//! what `shared_weight_skip_stats` moved, and whether the second executable still computes
 //! the first one's answer. The second question is the one that matters — a skip that
 //! skipped bytes no compile wrote would read as a win on the counter alone.
 //!
-//! Every graph here is a set of `Cumsum`s over parked `F32` parameters, which is a
+//! Most graphs here are a set of `Cumsum`s over parked `F32` parameters, which is a
 //! geometry whose route proves the parking: a parked operand sends `Op::Cumsum` to the
 //! generic host route, so `ceiling_hosted_steps() >= params` says every parameter really
 //! is where this test thinks it is — without it, "nothing was skipped" would also be
-//! true of parameters that never reached the weight buffer at all.
+//! true of parameters that never reached the weight buffer at all. The packed case is a
+//! `DequantMatMul` over a `U8` parameter instead, the geometry a fused projection has:
+//! one byte per element in the weight buffer where the plan's f32 slot counts four. There
+//! the residency answer is itself the proof of parking, since a parameter in the
+//! activation arena can never answer yes.
 
+use rlx_ir::op::Op;
+use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Shape};
 use rlx_wgpu::backend::WgpuExecutable;
 use rlx_wgpu::buffer::{set_param_sharing_scope, shared_weight_skip_stats};
 use std::sync::{Mutex, MutexGuard};
+
+mod common;
 
 const ROWS: usize = 4;
 const COLS: usize = 64;
@@ -459,6 +469,193 @@ fn a_new_or_longer_parameter_is_appended_and_still_computes() {
         longer.run(&[]),
         longer_out,
         "appending a different length must not move the bytes the longer executable binds"
+    );
+
+    release();
+}
+
+/// A caller that holds a parameter's bytes only to hand them over asks
+/// `param_resident` first and drops them instead: the answer must be exactly the one
+/// `set_param` would act on — no before this scope has uploaded, yes after — and a
+/// name or a length the weight buffer does not hold answers no.
+#[test]
+fn a_parameter_already_in_the_shared_buffer_answers_resident() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let _exclusive = exclusive();
+    park_every_param();
+    set_param_sharing_scope("weight-scope/resident-ask");
+
+    let mut exe = WgpuExecutable::compile(two_param_graph());
+    assert!(
+        exe.ceiling_hosted_steps() >= 2,
+        "both parked parameters must reach the host route ({} hosted)",
+        exe.ceiling_hosted_steps()
+    );
+    assert!(
+        !exe.param_resident("a", PARAM_BYTES as usize),
+        "nothing has been uploaded for this scope yet"
+    );
+    exe.set_param("a", &param_data(0.0));
+    exe.set_param("b", &param_data(1.0));
+
+    // A second compile of the same model binds the bytes the first one placed, so its
+    // caller may skip materialising them — which is the whole point of the question.
+    let second = WgpuExecutable::compile(two_param_graph());
+    assert!(
+        second.param_resident("a", PARAM_BYTES as usize)
+            && second.param_resident("b", PARAM_BYTES as usize),
+        "both parameters are in the buffer this scope owns"
+    );
+    assert!(
+        !second.param_resident("not-a-parameter", PARAM_BYTES as usize),
+        "a name no graph of this executable takes is not resident"
+    );
+    assert!(
+        !second.param_resident("a", PARAM_BYTES as usize + 4),
+        "a length the buffer does not hold is not resident"
+    );
+
+    // Another model's compile must not be told its weights are already there.
+    set_param_sharing_scope("weight-scope/resident-ask-other");
+    let other = WgpuExecutable::compile(two_param_graph());
+    assert!(
+        !other.param_resident("a", PARAM_BYTES as usize),
+        "a different scope has uploaded nothing"
+    );
+
+    release();
+}
+
+/// A parameter written in pieces computes what one write of the whole thing does — the
+/// route a caller takes when it never holds the whole parameter, one part of the model
+/// file at a time. The pieces are `set_param_range`'s own offsets, in bytes.
+#[test]
+fn a_parameter_written_in_pieces_computes_what_one_write_does() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let _exclusive = exclusive();
+    park_every_param();
+    set_param_sharing_scope("weight-scope/pieces");
+
+    let mut exe = WgpuExecutable::compile(two_param_graph());
+    assert!(
+        exe.ceiling_hosted_steps() >= 2,
+        "both parked parameters must reach the host route ({} hosted)",
+        exe.ceiling_hosted_steps()
+    );
+    let a = param_data(0.0);
+    let b = param_data(1.0);
+    // The first parameter whole, the second in two halves: a piece that landed at the
+    // wrong offset, or a second piece that overwrote the first, moves the running sum.
+    exe.set_param("a", &a);
+    let (first, second) = b.split_at(b.len() / 2);
+    assert!(exe.set_param_range("b", 0, bytemuck::cast_slice(first)));
+    // Half a parameter is not a parameter: a compile that stopped between two pieces must
+    // leave the next one writing every piece, not skipping the rows that never landed.
+    assert!(
+        !WgpuExecutable::compile(two_param_graph()).param_resident("b", b.len() * 4),
+        "a parameter only half written is not resident"
+    );
+    assert!(exe.set_param_range("b", first.len() * 4, bytemuck::cast_slice(second)));
+    assert!(
+        WgpuExecutable::compile(two_param_graph()).param_resident("b", b.len() * 4),
+        "the piece that completes the parameter is the one that claims it"
+    );
+    assert!(
+        !exe.set_param_range("b", b.len() * 4, &[0u8; 4]),
+        "a piece past the parameter's end is refused, not written out of bounds"
+    );
+    assert_eq!(
+        exe.run(&[]),
+        want_outputs(),
+        "a parameter written in pieces must compute what one write of it computes"
+    );
+
+    release();
+}
+
+/// Q8_0 packs 32 elements into 34 bytes, so a `[N, K]` weight of this geometry occupies
+/// `W_BYTES` bytes in the weight buffer: one per element of the `U8` parameter, where the
+/// plan's f32 slot counts four.
+const K: usize = 256;
+const N: usize = 2;
+const W_BYTES: usize = (K / 32) * 34 * N;
+
+/// One `DequantMatMul` over a packed `U8` parameter — the geometry a fused projection has,
+/// and the one a length taken from the plan's f32 slot measures wrong.
+fn packed_weight_graph() -> Graph {
+    let mut g = Graph::new("weight-scope-packed");
+    let x = g.param("x", Shape::new(&[1, K], DType::F32));
+    let w = g.param("w", Shape::new(&[W_BYTES], DType::U8));
+    let y = g.add_node(
+        Op::DequantMatMul {
+            scheme: QuantScheme::GgufQ8_0,
+        },
+        vec![x, w],
+        Shape::new(&[1, N], DType::F32),
+    );
+    g.set_outputs(vec![y]);
+    g
+}
+
+fn activation_row() -> Vec<f32> {
+    (0..K).map(|i| (i as f32 * 0.017).sin()).collect()
+}
+
+#[test]
+fn a_packed_parameter_is_measured_in_its_own_storage_bytes() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let _exclusive = exclusive();
+    park_every_param();
+    set_param_sharing_scope("weight-scope/packed");
+
+    let bytes = common::packed_gguf_bytes(rlx_gguf::GgmlType::Q8_0, K, N);
+    assert_eq!(bytes.len(), W_BYTES, "the fixture is the parameter's size");
+    let mut exe = WgpuExecutable::compile(packed_weight_graph());
+    exe.set_param("x", &activation_row());
+    assert!(
+        !exe.param_resident("w", W_BYTES),
+        "nothing has written the parameter yet"
+    );
+    let (first, second) = bytes.split_at(W_BYTES / 2);
+    assert!(exe.set_param_range("w", 0, first));
+    assert!(
+        !WgpuExecutable::compile(packed_weight_graph()).param_resident("w", W_BYTES),
+        "half a packed parameter is not resident"
+    );
+    assert!(exe.set_param_range("w", first.len(), second));
+    // The parameter's storage is one byte per element. Measured against the plan's f32 slot
+    // instead, this never answers yes, and every compile of the body then re-reads and
+    // re-uploads the whole joined parameter.
+    assert!(
+        WgpuExecutable::compile(packed_weight_graph()).param_resident("w", W_BYTES),
+        "the completing piece claims a packed parameter at its storage length"
+    );
+    assert!(
+        !WgpuExecutable::compile(packed_weight_graph()).param_resident("w", W_BYTES * 4),
+        "a length the parameter does not have is not resident"
+    );
+    assert!(
+        !exe.set_param_range("w", W_BYTES, &[0u8; 4]),
+        "a piece past the parameter's end is refused, not written into the weight beside it"
+    );
+    let pieces = exe.run(&[]);
+
+    // The same bytes in one write, under a scope of its own so neither compile skips: a
+    // piece that landed at the wrong offset moves the multiply's answer.
+    set_param_sharing_scope("weight-scope/packed-whole");
+    let mut whole = WgpuExecutable::compile(packed_weight_graph());
+    whole.set_param("x", &activation_row());
+    whole.set_param_bytes("w", &bytes);
+    assert_eq!(
+        pieces,
+        whole.run(&[]),
+        "a packed parameter written in pieces must compute what one write of it computes"
     );
 
     release();
