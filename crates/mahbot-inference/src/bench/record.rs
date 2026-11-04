@@ -513,6 +513,20 @@ pub(super) fn block(report: &Value) -> String {
     figure_row!(body, "peak resident", [
         bytes = report.get("peak_rss_bytes"),
     ] => crate::report::human(bytes as u64));
+    // The GPU half is absent by construction here: the resident set cannot see
+    // pages allocated for the GPU. The report names the absence and its reason.
+    row(
+        &mut body,
+        "peak resident (GPU)",
+        report
+            .get("peak_gpu_unmeasured")
+            .and_then(Value::as_str)
+            .map(|reason| format!("{} — {reason}", crate::report::NOT_MEASURED)),
+    );
+    body.push_str(&format!(
+        "\nPeak resident is the resident set's high-water mark for the whole run. {}\n",
+        crate::report::RESIDENT_GPU
+    ));
     body.push_str(
         "\nOne complete run: recall and false reactions in each of the eleven voices, and the \
          false accepts per hour over the pinned real-audio corpus.\n\n",

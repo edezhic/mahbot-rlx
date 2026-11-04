@@ -12,11 +12,12 @@
 //! * **wake word** — two consecutive windows of the pinned corpus recording through
 //!   the ear path in one batched pass to a score.
 //!
-//! Every row carries four numbers: cold time (the process starts with no models
+//! Every row carries the same figures: cold time (the process starts with no models
 //! loaded and the call loads them), warm time (the models already resident),
 //! resting memory (after the cold call, with what it keeps still resident) and peak
-//! memory (the highest the process reaches). Spread is not recorded; diagnostics go
-//! to the console and never enter the file.
+//! memory (the highest the process reaches) — each memory figure a pair, the
+//! system's share and the GPU's. Spread is not recorded; diagnostics go to the
+//! console and never enter the file.
 //!
 //! `mahbot-inference` with no arguments is the complete run: it takes the heavy
 //! run's lock, spawns one child per row and writes `STAND.md`. `mahbot-inference
@@ -428,22 +429,32 @@ fn cold_warm(row: &Row, same: bool, what: &str) {
 
 fn print_rows(readings: &[Reading]) {
     for reading in readings {
-        let [cold, warm, resting, peak] = cells(reading);
+        let [
+            cold,
+            warm,
+            resting_system,
+            resting_gpu,
+            peak_system,
+            peak_gpu,
+        ] = cells(reading);
         println!(
-            "{:<58} cold={cold:>8} warm={warm:>8} resting={resting:>9} peak={peak:>9} {}",
+            "{:<58} cold={cold:>8} warm={warm:>8} resting_system={resting_system:>9} \
+             resting_gpu={resting_gpu:>9} peak_system={peak_system:>9} peak_gpu={peak_gpu:>9} {}",
             label(reading),
             reading.diagnostics(),
         );
     }
 }
 
-/// A row's four figures, as its console line and its table entry both state them.
-fn cells(reading: &Reading) -> [String; 4] {
+/// A row's six figures, as its console line and its table entry both state them.
+fn cells(reading: &Reading) -> [String; 6] {
     [
         report::fmt_ms(reading.cold_ms),
         report::fmt_ms(reading.warm_ms),
-        reading.memory.now_text(),
-        reading.memory.peak_text(),
+        reading.memory.system_now_text(),
+        reading.memory.gpu_now_text(),
+        reading.memory.system_peak_text(),
+        reading.memory.gpu_peak_text(),
     ]
 }
 
@@ -452,7 +463,7 @@ fn label(reading: &Reading) -> &str {
     row(&reading.row).map_or(reading.row.as_str(), |row| row.label)
 }
 
-/// The record's caption: what the four figures are, and what the memory figures
+/// The record's caption: what the row's figures are, and what the memory figures
 /// are measured with — the basis read off the rows themselves.
 fn caption(readings: &[Reading]) -> String {
     let basis = report::Basis::of(readings.iter().map(|reading| reading.memory.footprint));
@@ -464,13 +475,23 @@ fn caption(readings: &[Reading]) -> String {
     )
 }
 
-/// The record's one table: a row per product shape and the four figures it carries.
+/// The record's one table: a row per product shape and the six figures it carries.
 fn table(readings: &[Reading]) -> String {
-    let mut table = String::from("| row | cold | warm | resting | peak |\n|---|---|---|---|---|\n");
+    let mut table = String::from(
+        "| row | cold | warm | resting system | resting GPU | peak system | peak GPU |\n\
+         |---|---|---|---|---|---|---|\n",
+    );
     for reading in readings {
-        let [cold, warm, resting, peak] = cells(reading);
+        let [
+            cold,
+            warm,
+            resting_system,
+            resting_gpu,
+            peak_system,
+            peak_gpu,
+        ] = cells(reading);
         table.push_str(&format!(
-            "| {} | {cold} | {warm} | {resting} | {peak} |\n",
+            "| {} | {cold} | {warm} | {resting_system} | {resting_gpu} | {peak_system} | {peak_gpu} |\n",
             label(reading),
         ));
     }
@@ -558,6 +579,8 @@ mod tests {
             memory: report::Memory {
                 now: Some(2 << 30),
                 peak: Some(3 << 30),
+                gpu_now: Some(1 << 30),
+                gpu_peak: Some(1_536 << 20),
                 footprint: true,
             },
             detail: run::detail([("frames", json!(330)), ("digest", json!("deadbeef"))]),
@@ -569,6 +592,8 @@ mod tests {
         assert_eq!(parsed.warm_ms, printed.warm_ms);
         assert_eq!(parsed.memory.now, printed.memory.now);
         assert_eq!(parsed.memory.peak, printed.memory.peak);
+        assert_eq!(parsed.memory.gpu_now, printed.memory.gpu_now);
+        assert_eq!(parsed.memory.gpu_peak, printed.memory.gpu_peak);
         assert!(parsed.memory.footprint);
         assert_eq!(parsed.detail, printed.detail);
     }
@@ -578,14 +603,22 @@ mod tests {
         // No `cold_ms`.
         assert!(
             Reading::parse(
-                r#"{"row":"wake","warm_ms":2,"resting_bytes":3,"peak_bytes":4,"memory":"footprint"}"#
+                r#"{"row":"wake","warm_ms":2,"resting_bytes":3,"peak_bytes":4,"resting_gpu_bytes":5,"peak_gpu_bytes":6,"memory":"footprint"}"#
+            )
+            .is_err()
+        );
+        // No GPU half: a pair that silently lost one side would print a system
+        // figure as the whole footprint.
+        assert!(
+            Reading::parse(
+                r#"{"row":"wake","cold_ms":1,"warm_ms":2,"resting_bytes":3,"peak_bytes":4,"memory":"footprint"}"#
             )
             .is_err()
         );
         // A memory basis this binary never prints.
         assert!(
             Reading::parse(
-                r#"{"row":"wake","cold_ms":1,"warm_ms":2,"resting_bytes":3,"peak_bytes":4,"memory":"physical"}"#
+                r#"{"row":"wake","cold_ms":1,"warm_ms":2,"resting_bytes":3,"peak_bytes":4,"resting_gpu_bytes":5,"peak_gpu_bytes":6,"memory":"physical"}"#
             )
             .is_err()
         );
@@ -593,7 +626,8 @@ mod tests {
     }
 
     /// A figure no platform reading supplied is a dash, never a zero; a figure that
-    /// was read is stated under its own heading.
+    /// was read is stated under its own heading, and a GPU figure nobody measured
+    /// says so instead of reading as a zero.
     #[test]
     fn the_table_states_every_figure_and_a_missing_one_as_a_dash() {
         let readings = [
@@ -602,6 +636,8 @@ mod tests {
                 report::Memory {
                     now: Some(2 << 30),
                     peak: Some(3 << 30),
+                    gpu_now: Some(512 << 20),
+                    gpu_peak: Some(1 << 30),
                     footprint: true,
                 },
             ),
@@ -610,22 +646,29 @@ mod tests {
                 report::Memory {
                     now: None,
                     peak: None,
+                    gpu_now: None,
+                    gpu_peak: None,
                     footprint: false,
                 },
             ),
         ];
         let table = table(&readings);
         let mut lines = table.lines();
-        assert_eq!(lines.next(), Some("| row | cold | warm | resting | peak |"));
-        assert_eq!(lines.next(), Some("|---|---|---|---|---|"));
+        assert_eq!(
+            lines.next(),
+            Some("| row | cold | warm | resting system | resting GPU | peak system | peak GPU |")
+        );
+        assert_eq!(lines.next(), Some("|---|---|---|---|---|---|---|"));
         let body: Vec<&str> = lines.collect();
         assert_eq!(
             body[0],
-            "| recognition, short voice message (10 s) | 2.00s | 1.00s | 2.00GiB | 3.00GiB |"
+            "| recognition, short voice message (10 s) | 2.00s | 1.00s | 1.50GiB | 512.0MiB | \
+             2.00GiB | 1.00GiB |"
         );
         assert_eq!(
             body[1],
-            "| recognition, typical voice message (30 s) | 2.00s | 1.00s | - | - |"
+            "| recognition, typical voice message (30 s) | 2.00s | 1.00s | - | not measured | - | \
+             not measured |"
         );
     }
 }

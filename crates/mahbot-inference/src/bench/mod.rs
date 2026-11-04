@@ -330,7 +330,7 @@ pub fn run() -> Result<()> {
             "[wake-word] real audio: {} files, {:.2} h audio ({:.2} h speech, {:.2} h VAD-active), \
              {} FA events · {:.4}/h over VAD-active speech (the headline's denominator), \
              {:.4}/h over wall-clock audio · one stream · {:.1}s wall · \
-             peak={}",
+             peak={} · peak GPU {} — {}",
             real.files_fed,
             real.audio_hours,
             real.speech_hours,
@@ -340,6 +340,8 @@ pub fn run() -> Result<()> {
             real.events as f64 / real.audio_hours,
             real.wall_secs,
             crate::report::shown(crate::report::peak_rss()),
+            crate::report::NOT_MEASURED,
+            GPU_UNMEASURED,
         );
     }
     // The repository's own record, written from the same JSON this run wrote.
@@ -382,6 +384,11 @@ pub fn run() -> Result<()> {
 /// The status of the benchmark itself — the only one whose numbers the record
 /// states. One name for the producer and the gate, so they cannot desynchronize.
 const COMPLETE: &str = "complete";
+
+/// Why the bench has no GPU half of its memory pair: its base is the resident set.
+/// The report carries this reason and the record prints it in the cell; it is the
+/// clause [`crate::report::RESIDENT_GPU`] opens with, so the two cannot disagree.
+const GPU_UNMEASURED: &str = "the resident set cannot see pages allocated for the GPU";
 
 /// The one classification that drives the report, the console and the record.
 ///
@@ -1009,6 +1016,10 @@ fn report_json(
     }
     report.insert("wall_clock_secs".into(), json!(wall_clock_secs));
     report.insert("peak_rss_bytes".into(), json!(crate::report::peak_rss()));
+    // The pair's GPU half is absent by construction: the base above cannot see it.
+    // The report names the absence and why, rather than a null a reader could take
+    // for a zero.
+    report.insert("peak_gpu_unmeasured".into(), json!(GPU_UNMEASURED));
     Value::Object(report)
 }
 
@@ -1635,6 +1646,7 @@ mod tests {
             "derived point",
             "wall clock",
             "peak resident",
+            "peak resident (GPU)",
         ] {
             assert!(
                 body.contains(&format!("| {row} | {} |", record::UNAVAILABLE)),
@@ -1948,6 +1960,16 @@ mod tests {
         );
         assert!(
             body.contains("| peak resident | ") && body.contains("| wall clock | 287.9 s |"),
+            "{body}"
+        );
+        // The GPU half of the memory pair is not measured, and the cell says why
+        // rather than reading as a zero or repeating the system figure.
+        assert!(
+            body.contains(&format!(
+                "| peak resident (GPU) | {} — {} |",
+                crate::report::NOT_MEASURED,
+                crate::bench::GPU_UNMEASURED
+            )),
             "{body}"
         );
         // The record is tables, their captions and the provenance block: the method

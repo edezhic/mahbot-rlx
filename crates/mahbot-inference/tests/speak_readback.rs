@@ -98,7 +98,7 @@ fn speak_and_read_back(text: &str) {
         "the waveform leaves the PCM range: max|y|={}",
         report::sci(report::max_abs(&wave))
     );
-    println!("  synthesis footprint {}", memory.peak_text());
+    println!("  synthesis footprint {}", report::shown(memory.peak));
     // The read-back is a second pair: give the synthesis half's weights back before
     // the recogniser's are asked for.
     drop(engine);

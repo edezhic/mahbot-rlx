@@ -246,7 +246,7 @@ fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String
 }
 
 /// One row's figures as its child prints them and its parent reads them back: the
-/// four numbers every product row carries, and the diagnostics behind them.
+/// numbers every product row carries, and the diagnostics behind them.
 pub(crate) struct Reading {
     /// The row's machine name, the token its table entry is found by.
     pub(crate) row: String,
@@ -266,6 +266,8 @@ impl Reading {
             "warm_ms": self.warm_ms,
             "resting_bytes": self.memory.now,
             "peak_bytes": self.memory.peak,
+            "resting_gpu_bytes": self.memory.gpu_now,
+            "peak_gpu_bytes": self.memory.gpu_peak,
             "memory": if self.memory.footprint { "footprint" } else { "resident" },
             "detail": self.detail,
         })
@@ -323,6 +325,8 @@ impl Reading {
             memory: Memory {
                 now: bytes("resting_bytes")?,
                 peak: bytes("peak_bytes")?,
+                gpu_now: bytes("resting_gpu_bytes")?,
+                gpu_peak: bytes("peak_gpu_bytes")?,
                 footprint,
             },
             detail,
@@ -434,6 +438,11 @@ pub(crate) fn record_run(mode: Mode) {
     // record before it reads its arguments, so a run refused on a bad argument still
     // clears a killed predecessor's temporary.
     let row_child = std::env::var_os(marker).is_some();
+    if row_child {
+        // The GPU peak's window: from the first thing a row's process does until the
+        // lifetime maximum is read in `Memory::finish`. The parent measures no row.
+        crate::report::sample_gpu();
+    }
     if !row_child {
         if let Err(error) = record.prepare() {
             eprintln!("{label}: {error:#}");

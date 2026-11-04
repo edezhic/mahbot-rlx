@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! What every measured row needs: a stopwatch, the process's memory as the
-//! platform accounts for it, an answer's digest, and the labels the numbers are
-//! printed with. Nothing here decides **what** is measured.
+//! platform accounts for it (and the sampler that observes the GPU's share of it),
+//! an answer's digest, and the labels the numbers are printed with. Nothing here
+//! decides **what** is measured.
 
-use std::time::Instant;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 pub struct Stopwatch(Instant);
 
@@ -84,27 +86,32 @@ pub fn resident_rss() -> Option<u64> {
         .map(|kb| kb * 1024)
 }
 
+/// The platform's page-based accounting of this process at one instant: the
+/// physical footprint, its lifetime maximum, and the part of the footprint the
+/// platform tags as graphics.
+#[derive(Clone, Copy)]
+struct Vm {
+    footprint: u64,
+    /// The same ledger's lifetime maximum: no later drop can lower it. `None` where
+    /// the platform's accounting is too old to carry the ledger's peak.
+    peak: Option<u64>,
+    /// Graphics-tagged pages inside the footprint, compressed pages included — the
+    /// platform's own itemisation of the GPU's share of it. `None` where the
+    /// platform's accounting is too old to carry the tag ledgers.
+    gpu: Option<u64>,
+}
+
 /// The process's physical footprint: `(now, lifetime maximum)`, as the platform
 /// accounts for it, or `None` where the platform supplies no such reading.
 ///
 /// The resident set cannot see memory allocated for the GPU on a unified-memory
 /// machine, so the recorded figures come from here and fall back to
 /// [`resident_rss`] only where the platform has no such reading. macOS answers
-/// through `proc_pid_rusage`: `ri_phys_footprint` and
-/// `ri_lifetime_max_phys_footprint`, which no later drop can lower.
+/// through `task_info(TASK_VM_INFO)`: `phys_footprint` and
+/// `ledger_phys_footprint_peak`, which no later drop can lower.
 #[cfg(target_os = "macos")]
 pub fn footprint() -> Option<(u64, u64)> {
-    let mut info = std::mem::MaybeUninit::<RusageInfoV4>::zeroed();
-    // SAFETY: `info` is a properly aligned `rusage_info_v4`, the flavour that
-    // fills exactly that layout, and the call only writes into it.
-    let rc =
-        unsafe { proc_pid_rusage(std::process::id() as i32, RUSAGE_INFO_V4, info.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    // SAFETY: a zero return means the call filled the whole structure.
-    let info = unsafe { info.assume_init() };
-    Some((info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint))
+    vm().and_then(|vm| vm.peak.map(|peak| (vm.footprint, peak)))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -112,63 +119,238 @@ pub fn footprint() -> Option<(u64, u64)> {
     None
 }
 
-/// `proc_pid_rusage`'s `rusage_info_v4`: the layout of `sys/resource.h`, kept
-/// whole because the call writes all of it and reads none of its padding.
+/// [`footprint`] with the platform's split of it: `ledger_tag_graphics_footprint`
+/// plus its compressed twin are the graphics-tagged pages credited into the
+/// footprint, and they nest inside it by construction.
 #[cfg(target_os = "macos")]
-#[repr(C)]
-struct RusageInfoV4 {
-    ri_uuid: [u8; 16],
-    ri_user_time: u64,
-    ri_system_time: u64,
-    ri_pkg_idle_wkups: u64,
-    ri_interrupt_wkups: u64,
-    ri_pageins: u64,
-    ri_wired_size: u64,
-    ri_resident_size: u64,
-    ri_phys_footprint: u64,
-    ri_proc_start_abstime: u64,
-    ri_proc_exit_abstime: u64,
-    ri_child_user_time: u64,
-    ri_child_system_time: u64,
-    ri_child_pkg_idle_wkups: u64,
-    ri_child_interrupt_wkups: u64,
-    ri_child_pageins: u64,
-    ri_child_elapsed_abstime: u64,
-    ri_diskio_bytesread: u64,
-    ri_diskio_byteswritten: u64,
-    ri_cpu_time_qos_default: u64,
-    ri_cpu_time_qos_maintenance: u64,
-    ri_cpu_time_qos_background: u64,
-    ri_cpu_time_qos_utility: u64,
-    ri_cpu_time_qos_legacy: u64,
-    ri_cpu_time_qos_user_initiated: u64,
-    ri_cpu_time_qos_user_interactive: u64,
-    ri_billed_system_time: u64,
-    ri_serviced_system_time: u64,
-    ri_logical_writes: u64,
-    ri_lifetime_max_phys_footprint: u64,
-    ri_instructions: u64,
-    ri_cycles: u64,
-    ri_billed_energy: u64,
-    ri_serviced_energy: u64,
-    ri_interval_max_phys_footprint: u64,
-    ri_runnable_time: u64,
+fn vm() -> Option<Vm> {
+    let mut info = TaskVmInfo::default();
+    let mut count = (std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<i32>()) as u32;
+    // SAFETY: `info` is zeroed and `count` states its size in 32-bit words, the unit
+    // `task_info` writes in; the call writes at most that many words and reports how
+    // many it wrote.
+    let rc = unsafe {
+        task_info(
+            mach_task_self_,
+            TASK_VM_INFO,
+            (&raw mut info).cast(),
+            &mut count,
+        )
+    };
+    if rc != 0 || count < VM_INFO_PHYS_FOOTPRINT_COUNT {
+        return None;
+    }
+    // The peak and the graphics ledgers share the revision the tags arrived with.
+    let (peak, gpu) = if count >= VM_INFO_TAGS_COUNT {
+        (
+            u64::try_from(info.ledger_phys_footprint_peak).ok(),
+            u64::try_from(
+                info.ledger_tag_graphics_footprint + info.ledger_tag_graphics_footprint_compressed,
+            )
+            .ok(),
+        )
+    } else {
+        (None, None)
+    };
+    Some(Vm {
+        footprint: info.phys_footprint,
+        peak,
+        gpu,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn vm() -> Option<Vm> {
+    None
+}
+
+/// `task_vm_info_data_t`'s prefix, as `mach/task_info.h` lays it out: the fields
+/// this crate reads end at the graphics ledgers, and the kernel's own tail is kept
+/// as bytes so the buffer the call writes into is its full size. The header packs
+/// the struct to four bytes, which is why it is `packed(4)` here too: a natural
+/// layout rounds 372 bytes up to 376 and asks the kernel for a word more than it
+/// has. The kernel fills only the fields its revision has, which `count` reports.
+#[cfg(target_os = "macos")]
+#[repr(C, packed(4))]
+#[derive(Clone, Copy, Default)]
+struct TaskVmInfo {
+    virtual_size: u64,
+    region_count: i32,
+    page_size: i32,
+    resident_size: u64,
+    resident_size_peak: u64,
+    device: u64,
+    device_peak: u64,
+    internal: u64,
+    internal_peak: u64,
+    external: u64,
+    external_peak: u64,
+    reusable: u64,
+    reusable_peak: u64,
+    purgeable_volatile_pmap: u64,
+    purgeable_volatile_resident: u64,
+    purgeable_volatile_virtual: u64,
+    compressed: u64,
+    compressed_peak: u64,
+    compressed_lifetime: u64,
+    phys_footprint: u64,
+    min_address: u64,
+    max_address: u64,
+    ledger_phys_footprint_peak: i64,
+    ledger_purgeable_nonvolatile: i64,
+    ledger_purgeable_novolatile_compressed: i64,
+    ledger_purgeable_volatile: i64,
+    ledger_purgeable_volatile_compressed: i64,
+    ledger_tag_network_nonvolatile: i64,
+    ledger_tag_network_nonvolatile_compressed: i64,
+    ledger_tag_network_volatile: i64,
+    ledger_tag_network_volatile_compressed: i64,
+    ledger_tag_media_footprint: i64,
+    ledger_tag_media_footprint_compressed: i64,
+    ledger_tag_media_nofootprint: i64,
+    ledger_tag_media_nofootprint_compressed: i64,
+    ledger_tag_graphics_footprint: i64,
+    ledger_tag_graphics_footprint_compressed: i64,
+    ledger_tag_graphics_nofootprint: i64,
+    ledger_tag_graphics_nofootprint_compressed: i64,
+    ledger_tag_neural_footprint: i64,
+    ledger_tag_neural_footprint_compressed: i64,
+    ledger_tag_neural_nofootprint: i64,
+    ledger_tag_neural_nofootprint_compressed: i64,
+    limit_bytes_remaining: u64,
+    decompressions: i32,
+    /// `ledger_swapins`, `ledger_tag_neural_nofootprint_total` and
+    /// `ledger_tag_neural_nofootprint_peak` — three eight-byte fields this crate does
+    /// not read.
+    tail: [u8; 24],
 }
 
 #[cfg(target_os = "macos")]
-const RUSAGE_INFO_V4: i32 = 4;
+const TASK_VM_INFO: u32 = 22;
+/// The count at which `phys_footprint` is present (`TASK_VM_INFO_REV1_COUNT`).
+#[cfg(target_os = "macos")]
+const VM_INFO_PHYS_FOOTPRINT_COUNT: u32 = 38;
+/// The count at which the tag ledgers are present (`TASK_VM_INFO_REV3_COUNT`).
+#[cfg(target_os = "macos")]
+const VM_INFO_TAGS_COUNT: u32 = 84;
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
-    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut RusageInfoV4) -> i32;
+    /// The calling task's own port: the kernel's `mach_task_self_` global.
+    static mach_task_self_: u32;
+    fn task_info(target_task: u32, flavor: u32, info: *mut i32, count: *mut u32) -> i32;
 }
 
-/// The two memory figures one row carries, from the platform's accounting: the
-/// figure at rest and the process's lifetime peak.
+/// How often the GPU sampler reads the platform's split. The shortest row's warm
+/// call is tens of milliseconds, so this samples it many times over; each read is one
+/// `task_info` call.
+const GPU_SAMPLE_PERIOD: Duration = Duration::from_millis(1);
+
+/// The process's GPU peak, once [`sample_gpu`] has started it.
+static GPU_SAMPLER: OnceLock<Sampler> = OnceLock::new();
+
+/// Start the GPU sampler: the highest graphics-tagged reading the platform reports,
+/// from this call until [`Memory::finish`] stops it. A row's process calls this as
+/// early as it can — before the arguments are read and long before the cold call —
+/// because the total peak it sits beside is a process-lifetime maximum. Idempotent.
+///
+/// The sampler and the peak it takes are **process-wide**: one window, one reading,
+/// consumed by the first [`Memory::finish`] on a footprint basis. That is why the
+/// stand and the corpus measure one row per process — a process measuring two rows
+/// would give the second the first one's window.
+pub(crate) fn sample_gpu() {
+    // Only macOS answers with a split; elsewhere the thread could never sample one.
+    if cfg!(target_os = "macos") {
+        GPU_SAMPLER.get_or_init(Sampler::start);
+    }
+}
+
+/// What the sampler thread and its owner share: the stop flag and the highest
+/// graphics-tagged reading so far, absent until the first one is taken.
+#[derive(Default)]
+struct State {
+    stop: bool,
+    peak: Option<u64>,
+}
+
+struct Sampler {
+    state: Arc<Mutex<State>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Sampler {
+    fn start() -> Self {
+        let state = Arc::new(Mutex::new(State::default()));
+        let thread = {
+            let state = Arc::clone(&state);
+            std::thread::Builder::new()
+                .name("gpu-peak".into())
+                .spawn(move || {
+                    loop {
+                        let mut state = lock(&state);
+                        if state.stop {
+                            break;
+                        }
+                        if let Some(gpu) = vm().and_then(|vm| vm.gpu) {
+                            state.peak = Some(state.peak.map_or(gpu, |peak| peak.max(gpu)));
+                        }
+                        drop(state);
+                        std::thread::sleep(GPU_SAMPLE_PERIOD);
+                    }
+                })
+                .ok()
+        };
+        Self {
+            state,
+            thread: Mutex::new(thread),
+        }
+    }
+
+    /// Stop the thread and give back the highest reading it took, or `None` where it
+    /// never saw a GPU figure — never a zero nobody measured. Idempotent: a second
+    /// call joins nothing and answers the same reading.
+    fn finish(&self) -> Option<u64> {
+        lock(&self.state).stop = true;
+        if let Some(thread) = lock(&self.thread).take() {
+            let _ = thread.join();
+        }
+        lock(&self.state).peak
+    }
+}
+
+/// A lock whose contents survive another thread's panic: a sampler that died must
+/// not turn a reading it already took into a panic here.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The GPU peak the sampler observed, stopping it: `None` where no sampler ran or
+/// the platform never reported a GPU figure.
+fn gpu_peak() -> Option<u64> {
+    GPU_SAMPLER.get().and_then(Sampler::finish)
+}
+
+/// The memory figures one row carries, from the platform's accounting: the figure
+/// at rest and the process's lifetime peak, each a pair — the system's share and
+/// the GPU's.
 #[derive(Clone, Copy, Debug)]
 pub struct Memory {
+    /// The whole figure at rest: the footprint where the platform supplies it, the
+    /// resident set where it does not.
     pub now: Option<u64>,
     pub peak: Option<u64>,
+    /// Graphics-tagged pages inside `now`, from the same platform call, so the pair
+    /// sums to it. `None` where the basis cannot see GPU pages.
+    pub gpu_now: Option<u64>,
+    /// The highest graphics-tagged reading over the window ending at `peak`: the
+    /// sampler's maximum, with the split read at `peak`'s own instant folded in, so a
+    /// run that started no sampler still carries the reading taken there. The window is
+    /// the process's, not the row's: every `finish` in one process answers the same
+    /// reading. `None` where the basis cannot see GPU pages, never a zero nobody
+    /// measured.
+    pub gpu_peak: Option<u64>,
     /// The physical footprint where the platform supplies it, the resident set
     /// where it does not.
     pub footprint: bool,
@@ -180,44 +362,88 @@ impl Memory {
     /// only ever read after them.
     #[must_use]
     pub fn take() -> Self {
-        match footprint() {
-            Some((now, _)) => Self {
-                now: Some(now),
+        match vm() {
+            Some(vm) => Self {
+                now: Some(vm.footprint),
                 peak: None,
+                gpu_now: vm.gpu,
+                gpu_peak: None,
                 footprint: true,
             },
             None => Self {
                 now: resident_rss(),
                 peak: None,
+                gpu_now: None,
+                gpu_peak: None,
                 footprint: false,
             },
         }
     }
 
-    /// The same reading with its lifetime peak, taken after the timed work. The
-    /// peak comes from the basis [`Memory::take`] recorded, so one row never mixes
-    /// the platform's footprint with the resident set.
+    /// The same reading with its lifetime peak, taken after the timed work, and the
+    /// GPU peak the sampler observed over the same lifetime. The peaks come from the
+    /// basis [`Memory::take`] recorded, so one row never mixes the platform's
+    /// footprint with the resident set.
     #[must_use]
     pub fn finish(self) -> Self {
+        if !self.footprint {
+            // Nothing to pair a GPU reading with here, and the sampler is left alone:
+            // its window may still serve whatever this process measures next.
+            return Self {
+                peak: peak_rss(),
+                gpu_peak: None,
+                ..self
+            };
+        }
+        // The sampler is stopped and joined first, so no sample lands after the peak is
+        // read; the split from that read is folded in, so the window still reaches the
+        // peak's instant. Nothing is observed between the last sample and it — that gap
+        // is what makes this an observed maximum.
+        let sampled = gpu_peak();
+        let vm = vm();
         Self {
-            peak: if self.footprint {
-                footprint().map(|(_, peak)| peak)
-            } else {
-                peak_rss()
-            },
+            peak: vm.and_then(|vm| vm.peak),
+            gpu_peak: sampled.max(vm.and_then(|vm| vm.gpu)),
             ..self
         }
     }
 
+    /// The system's share at rest: the whole figure minus the GPU-tagged pages read
+    /// with it, so the pair always sums to the figure the surface carries.
     #[must_use]
-    pub fn now_text(&self) -> String {
-        shown(self.now)
+    pub fn system_now_text(&self) -> String {
+        shown(
+            self.now
+                .map(|total| total - pair_gpu(self.gpu_now, self.now).unwrap_or(0)),
+        )
+    }
+
+    /// The system's share at peak: the lifetime maximum minus the highest GPU
+    /// reading — a subtraction of two maxima, not a peak of its own.
+    #[must_use]
+    pub fn system_peak_text(&self) -> String {
+        shown(
+            self.peak
+                .map(|total| total - pair_gpu(self.gpu_peak, self.peak).unwrap_or(0)),
+        )
     }
 
     #[must_use]
-    pub fn peak_text(&self) -> String {
-        shown(self.peak)
+    pub fn gpu_now_text(&self) -> String {
+        measured(pair_gpu(self.gpu_now, self.now))
     }
+
+    #[must_use]
+    pub fn gpu_peak_text(&self) -> String {
+        measured(pair_gpu(self.gpu_peak, self.peak))
+    }
+}
+
+/// The GPU half of a pair, held inside its total: the platform's ledger reads are
+/// not atomic, so a torn reading can put it a page above, and a pair that does not
+/// sum would be worse than a page of rounding.
+fn pair_gpu(gpu: Option<u64>, total: Option<u64>) -> Option<u64> {
+    gpu.map(|gpu| total.map_or(gpu, |total| gpu.min(total)))
 }
 
 /// The basis a table's memory figures were taken on — the platform's physical
@@ -252,35 +478,99 @@ impl Basis {
         }
     }
 
-    /// What the figures are, in the one sentence every caption that carries them
-    /// uses: the two readings count different things, and a platform without the
-    /// footprint falls back to the resident set.
+    /// What the figures are and what their pair means, as the caption under a table
+    /// states it: the accounting each half comes from, what it includes and cannot
+    /// see, how the two were taken, and what the pair means on this machine. Every
+    /// arm is composed from the same sentences, so a mixed table's caption cannot
+    /// drift from the uniform ones'.
     #[must_use]
-    pub(crate) fn caption(self) -> &'static str {
+    pub(crate) fn caption(self) -> String {
         match self {
-            Self::Footprint => {
-                "Memory is the process's physical footprint as the platform accounts for \
-                 it (`phys_footprint`), which is the only reading that sees memory allocated for \
-                 the GPU: the resident set counts different things and is not comparable. \
-                 Resting is taken once the cold call has returned and before the warm \
-                 call; peak is the process's lifetime maximum."
-            }
-            Self::Resident => {
-                "Memory is the process's resident set, because this platform supplies no \
-                 physical-footprint reading: resting is the set at the moment the cold call has \
-                 returned and before the warm call, and peak is the kernel's lifetime maximum of \
-                 the same set. The resident set counts a different thing from the footprint, so \
-                 these figures are not comparable with one taken where the platform supplies it."
-            }
-            Self::Mixed => {
-                "Memory is the process's physical footprint on the rows the platform supplied \
-                 one, and the resident set on the rows it did not: the two count different things \
-                 and are not comparable with each other. Resting is taken once the cold call has \
-                 returned and before the warm call; peak is the process's lifetime maximum."
-            }
+            Self::Footprint => [
+                FOOTPRINT_BASE,
+                PAIR,
+                OUTSIDE_PAIR,
+                PEAK,
+                SYSTEM_AT_PEAK,
+                UNIFIED,
+            ]
+            .join(" "),
+            Self::Resident => [RESIDENT_BASE, RESIDENT_GPU, BASES_DIFFER].join(" "),
+            Self::Mixed => [
+                MIXED_BASE,
+                PAIR,
+                OUTSIDE_PAIR,
+                RESIDENT_GPU,
+                PEAK,
+                SYSTEM_AT_PEAK,
+                UNIFIED,
+            ]
+            .join(" "),
         }
     }
 }
+
+/// The physical footprint's own definition: what the base counts and what lies
+/// outside it.
+const FOOTPRINT_BASE: &str = "Memory is the process's physical footprint as the platform \
+     accounts for it (`phys_footprint`), the only reading that sees memory allocated for the \
+     GPU; it counts dirty pages, page tables and IOKit mappings, and clean file-backed pages — \
+     a read-only model mapping, say — are outside it.";
+
+/// How the pair is read, and what each half holds.
+const PAIR: &str = "On a footprint row, the resting figure is a pair read from one \
+     `task_info(TASK_VM_INFO)` call, so the two halves sum to the footprint: system is the \
+     footprint minus the pages the platform tags as graphics, which also holds IOKit mappings, \
+     compressed pages, page tables and any pages tagged for something other than graphics, and \
+     is not a CPU-only reading; GPU is those graphics-tagged pages, which include buffers the \
+     host can also map and staging allocations, and is not the GPU's working set.";
+
+/// What the platform books outside both halves.
+const OUTSIDE_PAIR: &str = "Graphics-tagged pages the platform books outside the footprint \
+     (`ledger_tag_graphics_nofootprint`) are in neither number, and GPU memory the platform \
+     books as an IOKit mapping without a graphics tag cannot be separated from the system \
+     figure.";
+
+/// When the two readings are taken, and what the peak beside the maximum is.
+const PEAK: &str = "Resting is taken once the cold call has returned and before the warm \
+     call; peak is that figure's lifetime maximum. On a footprint row, the GPU peak beside it \
+     is the highest graphics-tagged reading a sampler thread took every millisecond or so from \
+     the first moment the row's process could start it until that maximum was read — an \
+     observed maximum, so a spike before then or between two samples is not in it, and the two \
+     halves were not taken at the same instant.";
+
+/// Why the system figure at peak can sit below the one at rest.
+const SYSTEM_AT_PEAK: &str = "On a row whose pair is measured, a system figure at peak below \
+     the one at rest is legitimate: the GPU share can grow more than the total between rest and \
+     peak, and the figure is the lifetime maximum minus the highest GPU reading — a subtraction \
+     of two maxima, not a peak of anything — so a GPU spike the sampler missed makes it too \
+     large and a GPU reading taken at another instant can make it too small.";
+
+/// What the pair means here, and what the same reading would be elsewhere.
+const UNIFIED: &str = "Memory is unified on this machine, so where both halves are measured \
+     they divide one pool rather than two budgets; on a machine with separate video memory this \
+     reading would report the host-visible graphics share, not that machine's video memory.";
+
+/// The resident set's own definition, for the platform that supplies no footprint.
+const RESIDENT_BASE: &str = "Memory is the process's resident set, because this platform \
+     supplies no physical-footprint reading: resting is the set at the moment the cold call has \
+     returned and before the warm call, and peak is the kernel's lifetime maximum of the same \
+     set.";
+
+/// Why a resident row has no GPU half. The wake bench's record states the same
+/// sentence, and its GPU cell carries the clause this one opens with.
+pub(crate) const RESIDENT_GPU: &str = "The resident set cannot see pages allocated for the \
+     GPU, so a resident row's GPU cell is not measured — not zero, and not the system figure \
+     repeated — and there the two do not split one pool.";
+
+/// The resident set and the footprint are different quantities.
+const BASES_DIFFER: &str = "The resident set counts a different thing from the footprint, so \
+     these figures are not comparable with one taken where the platform supplies it.";
+
+/// A table that holds both bases, which are not comparable with each other.
+const MIXED_BASE: &str = "Memory is the process's physical footprint on the rows the platform \
+     supplied one and the resident set on the rows it did not: the two count different things \
+     and are not comparable with each other.";
 
 /// One byte count as the record writes it, and `-` for a figure nobody took: a
 /// zero would read as the reading of a live process.
@@ -300,6 +590,16 @@ pub fn human(bytes: u64) -> String {
     } else {
         format!("{bytes}B")
     }
+}
+
+/// The words a cell carries when nobody measured the figure. A measured zero is a
+/// reading, and [`human`] renders it as `0B`.
+pub const NOT_MEASURED: &str = "not measured";
+
+/// One GPU figure as the record writes it: a byte count — `0B` included, because a
+/// measured zero is a reading — or [`NOT_MEASURED`].
+fn measured(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| NOT_MEASURED.to_string(), human)
 }
 
 /// Milliseconds, in the unit the reports use.
@@ -358,21 +658,81 @@ pub fn digest(values: &[f32]) -> u64 {
 mod tests {
     use super::*;
 
-    /// The platform's footprint is a live reading, and its lifetime maximum is at
-    /// least the current one. macOS supplies both; elsewhere the fallback is the
-    /// resident set, which the caption names.
+    /// The platform's footprint is a live reading and its lifetime maximum is at least
+    /// the current one. macOS supplies both plus the graphics split; elsewhere the
+    /// fallback is the resident set, which the caption names. The split is not asserted
+    /// against the footprint here: [`pair_gpu`] exists because a torn ledger read can
+    /// put it a page above, and a test that demanded otherwise would flake on the
+    /// condition the pair is built to absorb.
     #[test]
     fn the_memory_reading_comes_from_the_platform() {
-        match footprint() {
-            Some((now, peak)) => {
-                assert!(now > 1024 * 1024, "a live process holds bytes: {now}");
-                assert!(peak >= now, "the maximum cannot trail the current reading");
+        match vm() {
+            Some(vm) => {
+                assert!(
+                    vm.footprint > 1024 * 1024,
+                    "a live process holds bytes: {}",
+                    vm.footprint
+                );
+                if let Some(peak) = vm.peak {
+                    assert!(
+                        peak >= vm.footprint,
+                        "the maximum cannot trail the current reading"
+                    );
+                }
                 assert!(Basis::Footprint.caption().contains("physical footprint"));
             }
             None => {
+                assert!(footprint().is_none());
                 assert!(Basis::Resident.caption().contains("resident set"));
             }
         }
+    }
+
+    /// The pair sums to the figure the surface carries, and a measured zero stays
+    /// distinguishable from an absent reading.
+    #[test]
+    fn the_pair_sums_and_a_zero_is_a_reading() {
+        let measured = Memory {
+            now: Some(2 << 30),
+            peak: Some(3 << 30),
+            gpu_now: Some(512 << 20),
+            gpu_peak: Some(1 << 30),
+            footprint: true,
+        };
+        assert_eq!(measured.system_now_text(), "1.50GiB");
+        assert_eq!(measured.gpu_now_text(), "512.0MiB");
+        assert_eq!(measured.system_peak_text(), "2.00GiB");
+        assert_eq!(measured.gpu_peak_text(), "1.00GiB");
+
+        let zero = Memory {
+            gpu_now: Some(0),
+            gpu_peak: Some(0),
+            ..measured
+        };
+        assert_eq!(zero.gpu_now_text(), "0B");
+        assert_eq!(zero.system_now_text(), "2.00GiB");
+
+        let absent = Memory {
+            gpu_now: None,
+            gpu_peak: None,
+            ..measured
+        };
+        assert_eq!(absent.gpu_now_text(), NOT_MEASURED);
+        assert_ne!(zero.gpu_now_text(), absent.gpu_now_text());
+        assert_eq!(absent.system_now_text(), "2.00GiB");
+    }
+
+    /// The FFI mirror is the kernel's own size: 372 bytes, 93 words. A natural
+    /// layout would round up to 376 and ask the kernel for a word more than it has,
+    /// which it logs on every call.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_kernel_layout_is_the_sdk_layout() {
+        assert_eq!(std::mem::size_of::<TaskVmInfo>(), 372);
+        assert_eq!(
+            std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<i32>(),
+            93
+        );
     }
 
     /// The caption describes the basis its rows were taken on, so a table that

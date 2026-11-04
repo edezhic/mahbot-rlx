@@ -151,13 +151,15 @@ fn print_table(rows: &[Reading]) -> Result<()> {
     for row in rows {
         let (seconds, per_second) = figures(row)?;
         println!(
-            "{} audio_s={seconds:.3} s_per_audio_s={per_second:.3} cold={} warm={} resting={} \
-             peak={}",
+            "{} audio_s={seconds:.3} s_per_audio_s={per_second:.3} cold={} warm={} \
+             resting_system={} resting_gpu={} peak_system={} peak_gpu={}",
             row.row,
             report::fmt_ms(row.cold_ms),
             report::fmt_ms(row.warm_ms),
-            row.memory.now_text(),
-            row.memory.peak_text(),
+            row.memory.system_now_text(),
+            row.memory.gpu_now_text(),
+            row.memory.system_peak_text(),
+            row.memory.gpu_peak_text(),
         );
     }
     Ok(())
@@ -178,15 +180,18 @@ fn caption(rows: &[Reading]) -> String {
 /// The record's one table: a row per pinned recording and the figures it carries.
 fn table(rows: &[Reading]) -> Result<String> {
     let mut table = String::from(
-        "| recording | audio s | s per audio s | resting | peak |\n|---|---|---|---|---|\n",
+        "| recording | audio s | s per audio s | resting system | resting GPU | peak system | peak \
+         GPU |\n|---|---|---|---|---|---|---|\n",
     );
     for row in rows {
         let (seconds, per_second) = figures(row)?;
         table.push_str(&format!(
-            "| `{}` | {seconds:.1} | {per_second:.3} | {} | {} |\n",
+            "| `{}` | {seconds:.1} | {per_second:.3} | {} | {} | {} | {} |\n",
             row.row,
-            row.memory.now_text(),
-            row.memory.peak_text(),
+            row.memory.system_now_text(),
+            row.memory.gpu_now_text(),
+            row.memory.system_peak_text(),
+            row.memory.gpu_peak_text(),
         ));
     }
     Ok(table)
@@ -215,7 +220,8 @@ mod tests {
     }
 
     /// The record's table names the recording, its length, its time per audio
-    /// second, and the two memory figures — and a figure nobody measured is a dash.
+    /// second, and the pair for each memory figure — and a figure nobody measured is
+    /// a dash while a GPU half nobody measured says so.
     #[test]
     fn the_table_states_the_rate_and_both_memory_figures() {
         let rows = [
@@ -224,6 +230,8 @@ mod tests {
                 report::Memory {
                     now: Some(2 << 30),
                     peak: Some(3 << 30),
+                    gpu_now: Some(512 << 20),
+                    gpu_peak: Some(1 << 30),
                     footprint: true,
                 },
             ),
@@ -232,6 +240,8 @@ mod tests {
                 report::Memory {
                     now: None,
                     peak: None,
+                    gpu_now: None,
+                    gpu_peak: None,
                     footprint: false,
                 },
             ),
@@ -240,9 +250,12 @@ mod tests {
         let mut lines = table.lines();
         assert_eq!(
             lines.next(),
-            Some("| recording | audio s | s per audio s | resting | peak |")
+            Some(
+                "| recording | audio s | s per audio s | resting system | resting GPU | peak \
+                 system | peak GPU |"
+            )
         );
-        assert_eq!(lines.next(), Some("|---|---|---|---|---|"));
+        assert_eq!(lines.next(), Some("|---|---|---|---|---|---|---|"));
         let body: Vec<&str> = lines.collect();
         assert!(
             body[0].contains("`speech/librivox/speech-librivox-0027.wav`"),
@@ -251,10 +264,14 @@ mod tests {
         );
         assert!(body[0].contains("| 318.0 | 0.040 |"), "{}", body[0]);
         assert!(
-            body[0].contains("2.00GiB") && body[0].contains("3.00GiB"),
+            body[0].contains("| 1.50GiB | 512.0MiB | 2.00GiB | 1.00GiB |"),
             "{}",
             body[0]
         );
-        assert!(body[1].ends_with("| - | - |"), "{}", body[1]);
+        assert!(
+            body[1].ends_with("| - | not measured | - | not measured |"),
+            "{}",
+            body[1]
+        );
     }
 }
