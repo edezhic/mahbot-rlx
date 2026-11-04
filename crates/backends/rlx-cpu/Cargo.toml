@@ -1,6 +1,6 @@
 [package]
-name = "rlx-cpu"
-version.workspace      = true
+name = "mahbot-rlx-cpu"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "CPU backend for RLX — SIMD kernels, BLAS dispatch, thread pool, arena executor"
@@ -9,8 +9,8 @@ license.workspace      = true
 keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-cpu"
 # `blas` is on by default and links the platform CBLAS (Accelerate on
 # macOS, OpenBLAS elsewhere). Disable with `--no-default-features` to
 # build a pure-Rust scalar fallback — slow, but useful on hosts that
@@ -22,6 +22,10 @@ documentation.workspace = true
 # Honours `MKL_ROOT` to locate the import library; otherwise relies on
 # the system linker search path. macOS is unaffected and continues to
 # use Accelerate.
+
+[lib]
+name = "rlx_cpu"
+
 [features]
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-cpu --features backend-tests`.
 backend-tests = []

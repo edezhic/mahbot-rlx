@@ -1,15 +1,15 @@
 [package]
-name = "rlxsl"
-version.workspace = true
+name = "mahbot-rlxsl"
+version = "0.2.18-mahbot.1"
 edition.workspace = true
 rust-version.workspace = true
 description = "Scalar-expression manifest + per-language emitters for RLX's warm-tier unary-activation kernels (single source for WGSL/CUDA/MSL/GLSL/OpenCL activation math, forward + auto-differentiated backward)."
 authors.workspace = true
 license.workspace = true
-repository.workspace = true
+repository = "https://github.com/edezhic/mahbot-rlx"
 keywords.workspace      = true
 categories.workspace    = true
-documentation.workspace = true
+documentation = "https://docs.rs/mahbot-rlxsl"
 readme                  = "README.md"
 
 [dependencies]
@@ -31,5 +31,6 @@ rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
 
 [lib]
+name = "rlxsl"
 # No doctests in this crate: the empty stage was pure rustdoc cost.
 doctest = false

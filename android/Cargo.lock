@@ -240,8 +240,6 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af491d569909a7e4dee0ad7db7f5341fef5c614d5b8ec8cf765732aba3cff681"
 dependencies = [
- "serde",
- "termcolor",
  "unicode-width",
 ]
 
@@ -682,6 +680,186 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
+name = "mahbot-rlx-autodiff"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "half",
+ "mahbot-rlx-fusion",
+ "mahbot-rlx-ir",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "mahbot-rlx-compile"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-fusion",
+ "mahbot-rlx-ir",
+]
+
+[[package]]
+name = "mahbot-rlx-cpu"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "half",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-unfuse",
+ "rayon",
+ "strum_macros",
+]
+
+[[package]]
+name = "mahbot-rlx-driver"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "half",
+ "mahbot-rlx-ir",
+]
+
+[[package]]
+name = "mahbot-rlx-fusion"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "mahbot-rlx-ir",
+]
+
+[[package]]
+name = "mahbot-rlx-gguf"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "half",
+ "libc",
+ "mahbot-rlx-ir",
+ "memmap2",
+ "rayon",
+]
+
+[[package]]
+name = "mahbot-rlx-gpu-dispatch"
+version = "0.2.18-mahbot.1"
+
+[[package]]
+name = "mahbot-rlx-gpu-host"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "bytemuck",
+ "half",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+]
+
+[[package]]
+name = "mahbot-rlx-ir"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "aes 0.9.1",
+ "bincode",
+ "serde",
+ "serde_json",
+ "smallvec",
+]
+
+[[package]]
+name = "mahbot-rlx-macros"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "mahbot-rlx-mlx-io"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "anyhow",
+ "half",
+ "libc",
+ "mahbot-rlx-ir",
+ "memmap2",
+ "npyz",
+ "rayon",
+ "safetensors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mahbot-rlx-opt"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-fusion",
+ "mahbot-rlx-ir",
+]
+
+[[package]]
+name = "mahbot-rlx-runtime"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "anyhow",
+ "half",
+ "inventory",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-driver",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-macros",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-wgpu",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mahbot-rlx-unfuse"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "mahbot-rlx-ir",
+]
+
+[[package]]
+name = "mahbot-rlx-wgpu"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "bytemuck",
+ "half",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-gpu-host",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-unfuse",
+ "mahbot-rlxsl",
+ "pollster",
+ "serde",
+ "serde_json",
+ "wgpu",
+]
+
+[[package]]
+name = "mahbot-rlxsl"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "mahbot-rlx-ir",
+]
 
 [[package]]
 name = "memchr"
@@ -1146,190 +1324,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
-name = "rlx-autodiff"
-version = "0.2.18"
-dependencies = [
- "half",
- "rlx-fusion",
- "rlx-ir",
- "thiserror 2.0.19",
-]
-
-[[package]]
-name = "rlx-compile"
-version = "0.2.18"
-dependencies = [
- "rlx-autodiff",
- "rlx-fusion",
- "rlx-ir",
-]
-
-[[package]]
-name = "rlx-cpu"
-version = "0.2.18"
-dependencies = [
- "half",
- "rayon",
- "rlx-gguf",
- "rlx-ir",
- "rlx-mlx-io",
- "rlx-opt",
- "strum_macros",
-]
-
-[[package]]
-name = "rlx-driver"
-version = "0.2.18"
-dependencies = [
- "half",
- "rlx-ir",
-]
-
-[[package]]
-name = "rlx-fusion"
-version = "0.2.18"
-dependencies = [
- "rlx-ir",
-]
-
-[[package]]
-name = "rlx-gguf"
-version = "0.2.18"
-dependencies = [
- "anyhow",
- "bytemuck",
- "half",
- "libc",
- "memmap2",
- "rayon",
-]
-
-[[package]]
-name = "rlx-gpu-dispatch"
-version = "0.2.18"
-
-[[package]]
-name = "rlx-gpu-host"
-version = "0.2.18"
-dependencies = [
- "bytemuck",
- "half",
- "rlx-compile",
- "rlx-cpu",
- "rlx-gpu-dispatch",
- "rlx-ir",
- "rlx-mlx-io",
-]
-
-[[package]]
-name = "rlx-ir"
-version = "0.2.18"
-dependencies = [
- "aes 0.9.1",
- "bincode",
- "serde",
- "serde_json",
- "smallvec",
-]
-
-[[package]]
 name = "rlx-jni"
 version = "0.2.18"
 dependencies = [
  "jni",
- "rlx-ir",
- "rlx-runtime",
-]
-
-[[package]]
-name = "rlx-macros"
-version = "0.2.18"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "rlx-mlx-io"
-version = "0.2.18"
-dependencies = [
- "anyhow",
- "half",
- "libc",
- "memmap2",
- "npyz",
- "rayon",
- "rlx-ir",
- "safetensors",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rlx-opt"
-version = "0.2.18"
-dependencies = [
- "rlx-autodiff",
- "rlx-compile",
- "rlx-fusion",
- "rlx-ir",
-]
-
-[[package]]
-name = "rlx-runtime"
-version = "0.2.18"
-dependencies = [
- "anyhow",
- "half",
- "inventory",
- "rayon",
- "rlx-compile",
- "rlx-cpu",
- "rlx-driver",
- "rlx-gguf",
- "rlx-gpu-dispatch",
- "rlx-ir",
- "rlx-macros",
- "rlx-opt",
- "rlx-wgpu",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rlx-unfuse"
-version = "0.2.18"
-dependencies = [
- "rlx-ir",
-]
-
-[[package]]
-name = "rlx-wgpu"
-version = "0.2.18"
-dependencies = [
- "bytemuck",
- "half",
- "pollster",
- "rlx-compile",
- "rlx-cpu",
- "rlx-gguf",
- "rlx-gpu-dispatch",
- "rlx-gpu-host",
- "rlx-ir",
- "rlx-opt",
- "rlx-unfuse",
- "rlxsl",
- "serde",
- "serde_json",
- "wgpu",
-]
-
-[[package]]
-name = "rlxsl"
-version = "0.2.18"
-dependencies = [
- "rlx-ir",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
 ]
 
 [[package]]
@@ -1518,15 +1518,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "termcolor"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
-dependencies = [
- "winapi-util",
-]
-
-[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1705,7 +1696,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "js-sys",
  "log",
- "naga",
  "parking_lot",
  "portable-atomic",
  "profiling",

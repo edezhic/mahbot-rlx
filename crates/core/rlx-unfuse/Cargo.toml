@@ -1,6 +1,6 @@
 [package]
-name = "rlx-unfuse"
-version.workspace      = true
+name = "mahbot-rlx-unfuse"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Shared IR-level unfusion/decompose pass for the GPU-family backends (CUDA/ROCm/wgpu), parameterized by a per-backend DecomposePolicy."
@@ -8,13 +8,14 @@ authors.workspace      = true
 license.workspace      = true
 keywords.workspace     = true
 categories.workspace   = true
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-unfuse"
 readme                  = "README.md"
 [dependencies]
 rlx-ir = { workspace = true }
 
 [lib]
+name = "rlx_unfuse"
 # No unit tests in this target: the empty harness was pure launch cost.
 test = false
 # No doctests in this crate: the empty stage was pure rustdoc cost.

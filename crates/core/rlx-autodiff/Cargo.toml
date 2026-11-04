@@ -1,6 +1,6 @@
 [package]
-name = "rlx-autodiff"
-version.workspace      = true
+name = "mahbot-rlx-autodiff"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "JAX-shaped transforms for RLX MIR — autodiff, JVP/HVP, vmap"
@@ -9,8 +9,11 @@ license.workspace      = true
 keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-autodiff"
+
+[lib]
+name = "rlx_autodiff"
 
 [dependencies]
 rlx-ir = { workspace = true }

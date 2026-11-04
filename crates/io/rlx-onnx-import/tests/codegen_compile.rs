@@ -162,7 +162,7 @@ fn emitted_codegen_compiles_and_runs() {
          [[bin]]\nname = \"harness\"\npath = \"src/main.rs\"\n\n\
          [dependencies]\n\
          rlx-onnx-import = {{ path = \"{}\" }}\n\
-         rlx-ir = {{ path = \"{}\" }}\n\n\
+         rlx-ir = {{ package = \"mahbot-rlx-ir\", path = \"{}\" }}\n\n\
          [workspace]\n",
         workspace_crate("rlx-onnx-import"),
         workspace_crate("rlx-ir"),

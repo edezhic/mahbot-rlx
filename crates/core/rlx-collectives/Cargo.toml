@@ -19,7 +19,7 @@ rlx-ir = { workspace = true }
 # out of the build so it cross-compiles to aarch64 (Raspberry Pi / qemu),
 # where no OpenBLAS exists. (rlx-runtime already links platform BLAS for the
 # actual matmul path where it's wanted.)
-rlx-cpu = { path = "../../backends/rlx-cpu", version = "0.2.18", default-features = false }
+rlx-cpu = { package = "mahbot-rlx-cpu", path = "../../backends/rlx-cpu", version = "0.2.18-mahbot.1", default-features = false }
 rlx-driver = { workspace = true }
 
 [features]
@@ -44,17 +44,17 @@ coreml = ["rlx-runtime/coreml"]
 # right after rlx-collectives in the same tier (7). cargo strips path-only
 # dev-deps from the published manifest, so this never resolves against
 # crates.io and needs no per-release pin bump.
-rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cpu"] }
+rlx-runtime = { package = "mahbot-rlx-runtime", path = "../rlx-runtime", default-features = false, features = ["cpu"] }
 # The coordinator/worker mode ships serialized IR graphs over the wire, so the
 # example needs rlx-ir's serde derives + a JSON codec (dev-only).
-rlx-ir = { path = "../rlx-ir", features = ["serialize"] }
+rlx-ir = { package = "mahbot-rlx-ir", path = "../rlx-ir", features = ["serialize"] }
 # `WEIGHTS_FMT=q8` demo: quantize + write a GGUF stage weight that the worker
 # loads packed and runs through a DequantMatMul graph (pure Rust, dev-only).
-rlx-gguf = { path = "../../io/rlx-gguf" }
+rlx-gguf = { package = "mahbot-rlx-gguf", path = "../../io/rlx-gguf" }
 # `grad()` for the collective-VJP structural tests. Path-only (no version):
 # rlx-autodiff has no dependency on rlx-collectives, so this adds no cycle, and
 # cargo strips path-only dev-deps from the published manifest.
-rlx-autodiff = { path = "../rlx-autodiff" }
+rlx-autodiff = { package = "mahbot-rlx-autodiff", path = "../rlx-autodiff" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `dist_job` example: read the job description from a TOML config file.
@@ -66,7 +66,7 @@ toml = "0.8"
 # crate's own features now (see [features]) so a bare macOS `cargo test`
 # compiles neither — `dist_node` on Apple asks for them:
 # `cargo run -p rlx-collectives --features metal,coreml --example dist_node`.
-rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["gpu"] }
+rlx-runtime = { package = "mahbot-rlx-runtime", path = "../rlx-runtime", default-features = false, features = ["gpu"] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
 # Kept as upstream wrote it: `dist_node`'s `autofleet` lane calls
@@ -78,7 +78,7 @@ rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["
 # ranks to Device::{Cuda,Rocm,Xdna,Cpu} — NVIDIA GPUs, ROCm GPUs, an XDNA NPU.
 # All build driverless (cudarc/hip are dlopen'd; xdna is libc/libloading), so
 # the union is portable across CUDA and ROCm hosts alike.
-rlx-runtime = { path = "../rlx-runtime", default-features = false, features = ["cuda", "rocm", "xdna", "cpu"] }
+rlx-runtime = { package = "mahbot-rlx-runtime", path = "../rlx-runtime", default-features = false, features = ["cuda", "rocm", "xdna", "cpu"] }
 # `autofleet` runs the NPU's INT8 GEMM lane directly through rlx-xdna when an
 # overlay is configured (INT8/fixed-shape → not an f32-mesh rank).
 rlx-xdna = { path = "../../backends/rlx-xdna", features = ["xrt", "direct"] }

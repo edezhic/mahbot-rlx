@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 
 [dependencies.rlx-gguf]
+package = "mahbot-rlx-gguf"
 path = ".."
 
 # Own workspace so the main rlx workspace ignores this crate entirely

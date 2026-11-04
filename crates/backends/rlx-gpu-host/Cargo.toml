@@ -1,6 +1,6 @@
 [package]
-name = "rlx-gpu-host"
-version.workspace      = true
+name = "mahbot-rlx-gpu-host"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Backend-agnostic host-fallback kernels (D2H → CPU → H2D) shared by RLX GPU backends (rlx-cuda / rlx-rocm)."
@@ -9,8 +9,11 @@ license.workspace      = true
 keywords = ["gpu", "cpu", "fallback", "rlx", "kernels"]
 categories.workspace   = true
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-gpu-host"
+
+[lib]
+name = "rlx_gpu_host"
 
 [dependencies]
 # The actual host compute lives in rlx-cpu; this crate only owns the

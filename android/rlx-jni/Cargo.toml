@@ -22,5 +22,5 @@ path = "examples/gen_mnist_assets.rs"
 
 [dependencies]
 jni = "0.21"
-rlx-ir = { path = "../../crates/core/rlx-ir" }
-rlx-runtime = { path = "../../crates/core/rlx-runtime", default-features = false }
+rlx-ir = { package = "mahbot-rlx-ir", path = "../../crates/core/rlx-ir" }
+rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../crates/core/rlx-runtime", default-features = false }

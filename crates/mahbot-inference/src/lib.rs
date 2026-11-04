@@ -12,7 +12,7 @@
 //! transcription's labels come from and [`vad`] the voice-activity detector both
 //! it and the wake path decide on. [`stand`] is the measurement stand
 //! (`mahbot-inference` binary), [`corpus`] the transcription corpus run
-//! (`transcription-corpus` binary) and [`bench`] the wake-word bench, whose corpus
+//! (`transcription-corpus` binary) and [`bench`](mod@bench) the wake-word bench, whose corpus
 //! the `wake-word-build` binary renders. Every input lives at one fixed path per
 //! operating system ([`paths`]); nothing is configured, and the one directory the
 //! crate creates is `wake-corpus/` below that root.

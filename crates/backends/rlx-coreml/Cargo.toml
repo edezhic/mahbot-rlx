@@ -34,7 +34,7 @@ bytemuck = { version = "1", features = ["derive"] }
 # rlx-cpu is the cross-platform CPU backend: host-fallback execution for ops
 # CoreML can't run, plus the collective host-delegate kernels. Available on
 # every platform (not Apple-only), so `host_exec` / `collective` build anywhere.
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.18", default-features = false }
+rlx-cpu = { package = "mahbot-rlx-cpu", path = "../rlx-cpu", version = "0.2.18-mahbot.1", default-features = false }
 
 [build-dependencies]
 prost-build = "0.13"
@@ -49,7 +49,7 @@ cc = "1"
 # Back-edge: rlx-runtime (tier 7) publishes AFTER rlx-coreml (tier 5).
 # PATH-ONLY (no `version`) so cargo strips it from the published manifest
 # and `cargo publish -p rlx-coreml` doesn't resolve runtime against crates.io.
-rlx-runtime = { path = "../../core/rlx-runtime", features = ["coreml", "training"] }
+rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime", features = ["coreml", "training"] }
 
 [lints]
 workspace = true

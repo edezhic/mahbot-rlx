@@ -1,6 +1,6 @@
 [package]
-name = "rlx-compile"
-version.workspace      = true
+name = "mahbot-rlx-compile"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "HIR → MIR → LIR compile pipeline for RLX"
@@ -9,8 +9,11 @@ license.workspace      = true
 keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-compile"
+
+[lib]
+name = "rlx_compile"
 
 [features]
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-compile --features backend-tests`.

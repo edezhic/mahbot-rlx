@@ -1,6 +1,6 @@
 [package]
-name = "rlx-dduf"
-version.workspace      = true
+name = "mahbot-rlx-dduf"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "RLX — load HuggingFace DDUF (.dduf) ZIP packages of nested safetensors + JSON."
@@ -9,8 +9,8 @@ license.workspace      = true
 keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-dduf"
 
 [dependencies]
 anyhow = "1"
@@ -31,5 +31,6 @@ rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
 
 [lib]
+name = "rlx_dduf"
 # No doctests in this crate: the empty stage was pure rustdoc cost.
 doctest = false

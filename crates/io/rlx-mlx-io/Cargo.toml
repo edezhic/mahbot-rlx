@@ -1,6 +1,6 @@
 [package]
-name = "rlx-mlx-io"
-version.workspace      = true
+name = "mahbot-rlx-mlx-io"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "RLX — load MLX weight layouts (mlx-community safetensors dirs, .npz/.npy) including affine / mxfp dequant."
@@ -9,8 +9,8 @@ license.workspace      = true
 keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-mlx-io"
 
 [dependencies]
 anyhow = "1"
@@ -27,7 +27,7 @@ rlx-ir = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 # Path-only: run packed Linear via Session (published manifest strips this).
-rlx-runtime = { path = "../../core/rlx-runtime", default-features = false, features = ["cpu"] }
+rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime", default-features = false, features = ["cpu"] }
 
 [lints]
 workspace = true
@@ -69,5 +69,6 @@ name = "synth_affine_session"
 required-features = ["backend-tests"]
 
 [lib]
+name = "rlx_mlx_io"
 # No doctests in this crate: the empty stage was pure rustdoc cost.
 doctest = false

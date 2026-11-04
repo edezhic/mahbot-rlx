@@ -20,7 +20,7 @@
 //! recorded build has superseded; the rule, and the cache-sharing trade it implies,
 //! are stated with the bench's corpus docs ([`crate::bench`]).
 //!
-//! The counts are stated on two named bases: the corpus [`audio::plan`] lists, and
+//! The counts are stated on two named bases: the corpus `audio::plan` lists, and
 //! the clip reads this invocation made, each one either reused or rendered. The two
 //! differ when the voice selection renders a candidate's probes and then rejects it
 //! — that is work the plan does not list — so it shows up in the reads and never

@@ -330,7 +330,7 @@ pub fn wav_mono_16k(path: &str, offset: usize, max_samples: usize) -> Result<Vec
 /// A WAV's declared sample rate and its sample frames, read from its `fmt ` and
 /// `data` chunk headers — seeking past the chunks in between rather than reading the
 /// audio — so a caller can refuse an input too large to hold before it holds it. The
-/// walk is [`wav_layout`], the same one the reader decodes with, so the count is the one
+/// walk is `wav_layout`, the same one the reader decodes with, so the count is the one
 /// the read will produce: the last `data` chunk, its declared length clamped to the bytes
 /// the file holds.
 pub fn wav_header(path: &str) -> Result<(u32, u64)> {

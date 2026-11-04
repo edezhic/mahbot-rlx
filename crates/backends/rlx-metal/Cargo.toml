@@ -79,7 +79,7 @@ half = "2"
 # `version`): cargo strips path-only dev-deps from the published manifest, so
 # `cargo publish -p rlx-metal` never resolves runtime against crates.io. The
 # path dep wins for local/workspace tests.
-rlx-runtime = { path = "../../core/rlx-runtime", features = ["metal"] }
+rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime", features = ["metal"] }
 rlx-gguf = { workspace = true }
 rlx-cpu = { workspace = true }
 rlx-autodiff = { workspace = true }

@@ -2858,19 +2858,325 @@ checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
 name = "mahbot-inference"
-version = "0.2.18"
+version = "0.2.18-mahbot.1"
 dependencies = [
  "anyhow",
  "earshot",
  "half",
+ "mahbot-rlx-flow",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
+ "mahbot-rlx-wgpu",
  "rand 0.9.5",
- "rlx-flow",
- "rlx-gguf",
- "rlx-ir",
- "rlx-runtime",
- "rlx-wgpu",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "mahbot-rlx-autodiff"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "half",
+ "mahbot-rlx-fusion",
+ "mahbot-rlx-ir",
+ "rlx",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "mahbot-rlx-compile"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-fusion",
+ "mahbot-rlx-ir",
+]
+
+[[package]]
+name = "mahbot-rlx-cpu"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "criterion",
+ "gemm",
+ "half",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-unfuse",
+ "rayon",
+ "serde",
+ "strum_macros",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "mahbot-rlx-dduf"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "half",
+ "safetensors",
+ "serde_json",
+ "tempfile",
+ "zip 2.4.2",
+]
+
+[[package]]
+name = "mahbot-rlx-driver"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "half",
+ "iroh",
+ "mahbot-rlx-ir",
+ "mdns-sd",
+ "mpi-rs",
+ "tokio",
+]
+
+[[package]]
+name = "mahbot-rlx-flow"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "anyhow",
+ "half",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "mahbot-rlx-fusion"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+]
+
+[[package]]
+name = "mahbot-rlx-gguf"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "half",
+ "libc",
+ "mahbot-rlx-ir",
+ "memmap2",
+ "rayon",
+ "tempfile",
+]
+
+[[package]]
+name = "mahbot-rlx-gpu-dispatch"
+version = "0.2.18-mahbot.1"
+
+[[package]]
+name = "mahbot-rlx-gpu-host"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "bytemuck",
+ "half",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+]
+
+[[package]]
+name = "mahbot-rlx-ir"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "aes 0.9.3",
+ "bincode",
+ "serde",
+ "serde_json",
+ "smallvec",
+]
+
+[[package]]
+name = "mahbot-rlx-macros"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "mahbot-rlx-mlx-io"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "anyhow",
+ "half",
+ "libc",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
+ "memmap2",
+ "npyz",
+ "rayon",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "mahbot-rlx-nemo"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "anyhow",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-torch-ckpt",
+ "serde_yaml",
+ "tempfile",
+]
+
+[[package]]
+name = "mahbot-rlx-opt"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-fusion",
+ "mahbot-rlx-ir",
+]
+
+[[package]]
+name = "mahbot-rlx-pkg"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "bincode",
+ "chacha20poly1305",
+ "criterion",
+ "mahbot-rlx-dduf",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-nemo",
+ "memmap2",
+ "rand_core 0.6.4",
+ "rayon",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "ureq 2.12.1",
+ "xxhash-rust",
+ "zip 2.4.2",
+ "zstd 0.13.3",
+]
+
+[[package]]
+name = "mahbot-rlx-runtime"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "anyhow",
+ "half",
+ "inventory",
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-dduf",
+ "mahbot-rlx-driver",
+ "mahbot-rlx-flow",
+ "mahbot-rlx-fusion",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-macros",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-pkg",
+ "mahbot-rlx-wgpu",
+ "mahbot-rlxsl",
+ "memmap2",
+ "rayon",
+ "rlx-coreml",
+ "rlx-cuda",
+ "rlx-egpu",
+ "rlx-fpga",
+ "rlx-hwprofile",
+ "rlx-linalg",
+ "rlx-metal",
+ "rlx-mlx",
+ "rlx-oneapi",
+ "rlx-optim",
+ "rlx-qnn",
+ "rlx-rocm",
+ "rlx-sparse",
+ "rlx-tpu",
+ "rlx-vulkan",
+ "rlx-xdna",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mahbot-rlx-torch-ckpt"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "half",
+ "tempfile",
+]
+
+[[package]]
+name = "mahbot-rlx-unfuse"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "mahbot-rlx-ir",
+]
+
+[[package]]
+name = "mahbot-rlx-wgpu"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "bytemuck",
+ "half",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-gpu-host",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
+ "mahbot-rlx-unfuse",
+ "mahbot-rlxsl",
+ "naga 29.0.4",
+ "pollster",
+ "rlx",
+ "serde",
+ "serde_json",
+ "wgpu",
+]
+
+[[package]]
+name = "mahbot-rlxsl"
+version = "0.2.18-mahbot.1"
+dependencies = [
+ "libm",
+ "mahbot-rlx-ir",
+ "naga 29.0.4",
 ]
 
 [[package]]
@@ -4499,18 +4805,18 @@ version = "0.2.18"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "mahbot-rlx-dduf",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-nemo",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-pkg",
+ "mahbot-rlx-runtime",
  "numpy",
  "pyo3",
- "rlx-dduf",
  "rlx-fpga",
- "rlx-gguf",
  "rlx-gguf-convert",
- "rlx-ir",
- "rlx-mlx-io",
- "rlx-nemo",
- "rlx-opt",
- "rlx-pkg",
- "rlx-runtime",
 ]
 
 [[package]]
@@ -4830,38 +5136,27 @@ name = "rlx"
 version = "0.2.18"
 dependencies = [
  "anyhow",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-driver",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-macros",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
  "rlx-bench",
  "rlx-collectives",
  "rlx-cortexm",
- "rlx-cpu",
- "rlx-driver",
  "rlx-fpga",
  "rlx-geo",
- "rlx-gguf",
  "rlx-gguf-convert",
- "rlx-ir",
  "rlx-linalg",
- "rlx-macros",
  "rlx-onnx",
- "rlx-opt",
  "rlx-optim",
  "rlx-peft",
  "rlx-rng",
- "rlx-runtime",
  "rlx-sparse",
  "rlx-tensor",
  "rlx-umap",
-]
-
-[[package]]
-name = "rlx-autodiff"
-version = "0.2.18"
-dependencies = [
- "half",
- "rlx",
- "rlx-fusion",
- "rlx-ir",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4873,17 +5168,17 @@ dependencies = [
  "bincode",
  "chacha20poly1305",
  "half",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-dduf",
+ "mahbot-rlx-fusion",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-pkg",
+ "mahbot-rlx-runtime",
  "memmap2",
  "rand_core 0.6.4",
- "rlx-compile",
- "rlx-dduf",
- "rlx-fusion",
- "rlx-gguf",
- "rlx-ir",
- "rlx-mlx-io",
  "rlx-onnx-import",
- "rlx-pkg",
- "rlx-runtime",
  "safetensors",
  "serde",
  "serde_json",
@@ -4894,12 +5189,12 @@ dependencies = [
 name = "rlx-bbo"
 version = "0.2.18"
 dependencies = [
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
  "rand 0.8.8",
  "rand_distr",
- "rlx-ir",
- "rlx-opt",
  "rlx-optim",
- "rlx-runtime",
  "serde",
  "serde_json",
  "tempfile",
@@ -4909,23 +5204,23 @@ dependencies = [
 name = "rlx-bench"
 version = "0.2.18"
 dependencies = [
- "rlx-cpu",
- "rlx-driver",
- "rlx-fusion",
- "rlx-gguf",
- "rlx-ir",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-driver",
+ "mahbot-rlx-fusion",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
+ "mahbot-rlx-wgpu",
  "rlx-mlx",
- "rlx-opt",
- "rlx-runtime",
- "rlx-wgpu",
 ]
 
 [[package]]
 name = "rlx-cerebras"
 version = "0.2.18"
 dependencies = [
- "rlx-ir",
- "rlx-opt",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
  "tempfile",
 ]
 
@@ -4933,9 +5228,9 @@ dependencies = [
 name = "rlx-check"
 version = "0.2.18"
 dependencies = [
- "rlx-ir",
- "rlx-macros",
- "rlx-runtime",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-macros",
+ "mahbot-rlx-runtime",
  "serde_json",
 ]
 
@@ -4943,25 +5238,16 @@ dependencies = [
 name = "rlx-collectives"
 version = "0.2.18"
 dependencies = [
- "rlx-autodiff",
- "rlx-cpu",
- "rlx-driver",
- "rlx-gguf",
- "rlx-ir",
- "rlx-runtime",
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-driver",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
  "rlx-xdna",
  "serde",
  "serde_json",
  "toml 0.8.23",
-]
-
-[[package]]
-name = "rlx-compile"
-version = "0.2.18"
-dependencies = [
- "rlx-autodiff",
- "rlx-fusion",
- "rlx-ir",
 ]
 
 [[package]]
@@ -4971,24 +5257,24 @@ dependencies = [
  "bytemuck",
  "cc",
  "half",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
  "prost",
  "prost-build",
  "protoc-bin-vendored",
- "rlx-cpu",
- "rlx-gguf",
- "rlx-ir",
- "rlx-mlx-io",
- "rlx-opt",
- "rlx-runtime",
 ]
 
 [[package]]
 name = "rlx-corpus"
 version = "0.2.18"
 dependencies = [
- "rlx-ir",
- "rlx-opt",
- "rlx-runtime",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
 ]
 
 [[package]]
@@ -4999,29 +5285,10 @@ version = "0.2.18"
 name = "rlx-cortexm-trainer"
 version = "0.2.18"
 dependencies = [
- "rlx-autodiff",
- "rlx-cpu",
- "rlx-ir",
- "rlx-opt",
-]
-
-[[package]]
-name = "rlx-cpu"
-version = "0.2.18"
-dependencies = [
- "criterion",
- "gemm",
- "half",
- "rayon",
- "rlx-gguf",
- "rlx-gpu-dispatch",
- "rlx-ir",
- "rlx-mlx-io",
- "rlx-opt",
- "rlx-unfuse",
- "serde",
- "strum_macros",
- "toml 0.8.23",
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
 ]
 
 [[package]]
@@ -5032,31 +5299,18 @@ dependencies = [
  "cc",
  "cudarc",
  "libloading 0.8.9",
- "rlx-autodiff",
- "rlx-cpu",
- "rlx-gguf",
- "rlx-gpu-dispatch",
- "rlx-gpu-host",
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-gpu-host",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
+ "mahbot-rlx-unfuse",
  "rlx-gpu-kernels",
- "rlx-ir",
- "rlx-opt",
- "rlx-runtime",
- "rlx-unfuse",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "rlx-dduf"
-version = "0.2.18"
-dependencies = [
- "anyhow",
- "bytemuck",
- "half",
- "safetensors",
- "serde_json",
- "tempfile",
- "zip 2.4.2",
 ]
 
 [[package]]
@@ -5065,25 +5319,13 @@ version = "0.2.18"
 dependencies = [
  "anyhow",
  "libc",
- "rlx-driver",
- "rlx-gguf",
- "rlx-ir",
- "rlx-runtime",
+ "mahbot-rlx-driver",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
  "serde",
  "serde_json",
  "toml 0.8.23",
-]
-
-[[package]]
-name = "rlx-driver"
-version = "0.2.18"
-dependencies = [
- "half",
- "iroh",
- "mdns-sd",
- "mpi-rs",
- "rlx-ir",
- "tokio",
 ]
 
 [[package]]
@@ -5091,7 +5333,7 @@ name = "rlx-egpu"
 version = "0.2.18"
 dependencies = [
  "libc",
- "rlx-ir",
+ "mahbot-rlx-ir",
  "sha2 0.10.9",
 ]
 
@@ -5099,8 +5341,8 @@ dependencies = [
 name = "rlx-extend"
 version = "0.2.18"
 dependencies = [
- "rlx-flow",
- "rlx-ir",
+ "mahbot-rlx-flow",
+ "mahbot-rlx-ir",
 ]
 
 [[package]]
@@ -5108,10 +5350,10 @@ name = "rlx-fdm"
 version = "0.2.18"
 dependencies = [
  "bytemuck",
- "rlx-autodiff",
- "rlx-cpu",
- "rlx-ir",
- "rlx-runtime",
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
  "rlx-sparse",
  "serde",
  "serde_json",
@@ -5125,43 +5367,18 @@ version = "0.2.18"
 name = "rlx-ffi"
 version = "0.2.18"
 dependencies = [
- "rlx-autodiff",
- "rlx-ir",
- "rlx-runtime",
-]
-
-[[package]]
-name = "rlx-flow"
-version = "0.2.18"
-dependencies = [
- "anyhow",
- "half",
- "memmap2",
- "rlx-gguf",
- "rlx-ir",
- "rlx-opt",
- "rlx-runtime",
- "serde",
- "serde_json",
- "toml 0.8.23",
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
 ]
 
 [[package]]
 name = "rlx-fpga"
 version = "0.2.18"
 dependencies = [
+ "mahbot-rlx-ir",
  "rlx-cortexm",
- "rlx-ir",
  "tempfile",
-]
-
-[[package]]
-name = "rlx-fusion"
-version = "0.2.18"
-dependencies = [
- "rlx-cpu",
- "rlx-ir",
- "rlx-opt",
 ]
 
 [[package]]
@@ -5169,25 +5386,11 @@ name = "rlx-geo"
 version = "0.2.18"
 dependencies = [
  "bytemuck",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-wgpu",
  "pollster",
- "rlx-cpu",
- "rlx-ir",
- "rlx-wgpu",
  "wgpu",
-]
-
-[[package]]
-name = "rlx-gguf"
-version = "0.2.18"
-dependencies = [
- "anyhow",
- "bytemuck",
- "half",
- "libc",
- "memmap2",
- "rayon",
- "rlx-ir",
- "tempfile",
 ]
 
 [[package]]
@@ -5197,37 +5400,20 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "half",
- "rlx-gguf",
- "rlx-nemo",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-nemo",
  "rlx-onnx-import",
  "safetensors",
  "tempfile",
 ]
 
 [[package]]
-name = "rlx-gpu-dispatch"
-version = "0.2.18"
-
-[[package]]
-name = "rlx-gpu-host"
-version = "0.2.18"
-dependencies = [
- "bytemuck",
- "half",
- "rlx-compile",
- "rlx-cpu",
- "rlx-gpu-dispatch",
- "rlx-ir",
- "rlx-mlx-io",
-]
-
-[[package]]
 name = "rlx-gpu-kernels"
 version = "0.2.18"
 dependencies = [
- "rlx-gpu-dispatch",
- "rlx-ir",
- "rlxsl",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-ir",
+ "mahbot-rlxsl",
 ]
 
 [[package]]
@@ -5249,31 +5435,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlx-ir"
-version = "0.2.18"
-dependencies = [
- "aes 0.9.3",
- "bincode",
- "serde",
- "serde_json",
- "smallvec",
-]
-
-[[package]]
 name = "rlx-js"
 version = "0.2.18"
 dependencies = [
+ "mahbot-rlx-dduf",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-nemo",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-pkg",
+ "mahbot-rlx-runtime",
  "quickrs-core",
- "rlx-dduf",
- "rlx-gguf",
  "rlx-gguf-convert",
- "rlx-ir",
- "rlx-mlx-io",
- "rlx-nemo",
- "rlx-opt",
  "rlx-optim",
- "rlx-pkg",
- "rlx-runtime",
  "rlx-text",
  "serde_json",
 ]
@@ -5282,35 +5457,26 @@ dependencies = [
 name = "rlx-lbm"
 version = "0.2.18"
 dependencies = [
- "rlx-ir",
- "rlx-runtime",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
 ]
 
 [[package]]
 name = "rlx-linalg"
 version = "0.2.18"
 dependencies = [
- "rlx-cpu",
- "rlx-ir",
-]
-
-[[package]]
-name = "rlx-macros"
-version = "0.2.18"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-ir",
 ]
 
 [[package]]
 name = "rlx-megakernel"
 version = "0.2.18"
 dependencies = [
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
  "rlx-corpus",
- "rlx-ir",
- "rlx-opt",
- "rlx-runtime",
 ]
 
 [[package]]
@@ -5319,19 +5485,19 @@ version = "0.2.18"
 dependencies = [
  "bytemuck",
  "half",
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-gpu-host",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
+ "mahbot-rlxsl",
  "objc",
  "rayon",
- "rlx-autodiff",
- "rlx-cpu",
- "rlx-gguf",
- "rlx-gpu-dispatch",
- "rlx-gpu-host",
- "rlx-ir",
- "rlx-mlx-io",
- "rlx-opt",
  "rlx-optim",
- "rlx-runtime",
- "rlxsl",
  "safetensors",
  "serde",
  "serde_json",
@@ -5344,35 +5510,17 @@ version = "0.2.18"
 dependencies = [
  "half",
  "libc",
- "rlx-autodiff",
- "rlx-cpu",
- "rlx-driver",
- "rlx-gguf",
- "rlx-ir",
- "rlx-mlx-io",
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-driver",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
  "rlx-mlx-sys",
- "rlx-opt",
- "rlx-runtime",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "rlx-mlx-io"
-version = "0.2.18"
-dependencies = [
- "anyhow",
- "half",
- "libc",
- "memmap2",
- "npyz",
- "rayon",
- "rlx-ir",
- "rlx-runtime",
- "safetensors",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -5384,29 +5532,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlx-nemo"
-version = "0.2.18"
-dependencies = [
- "anyhow",
- "rlx-ir",
- "rlx-torch-ckpt",
- "serde_yaml",
- "tempfile",
-]
-
-[[package]]
 name = "rlx-oneapi"
 version = "0.2.18"
 dependencies = [
  "half",
  "libloading 0.8.9",
- "rlx-compile",
- "rlx-cpu",
- "rlx-gpu-host",
- "rlx-ir",
- "rlx-opt",
- "rlx-unfuse",
- "rlxsl",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-gpu-host",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-unfuse",
+ "mahbot-rlxsl",
 ]
 
 [[package]]
@@ -5415,10 +5552,10 @@ version = "0.2.18"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
  "ort",
- "rlx-ir",
  "rlx-onnx-import",
- "rlx-runtime",
  "serde_json",
 ]
 
@@ -5427,12 +5564,12 @@ name = "rlx-onnx-conformance"
 version = "0.2.18"
 dependencies = [
  "anyhow",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
  "ort",
- "rlx-compile",
- "rlx-ir",
  "rlx-onnx-import",
- "rlx-opt",
- "rlx-runtime",
  "serde_json",
  "tempfile",
 ]
@@ -5444,11 +5581,11 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "half",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
  "protobuf",
- "rlx-cpu",
- "rlx-ir",
  "rlx-onnx-proto",
- "rlx-runtime",
  "safetensors",
  "serde",
  "serde_json",
@@ -5468,21 +5605,11 @@ version = "0.2.18"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-fusion",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
  "parquet",
- "rlx-autodiff",
- "rlx-fusion",
- "rlx-ir",
- "rlx-runtime",
-]
-
-[[package]]
-name = "rlx-opt"
-version = "0.2.18"
-dependencies = [
- "rlx-autodiff",
- "rlx-compile",
- "rlx-fusion",
- "rlx-ir",
 ]
 
 [[package]]
@@ -5496,37 +5623,9 @@ dependencies = [
 name = "rlx-peft"
 version = "0.2.18"
 dependencies = [
- "rlx-cpu",
- "rlx-ir",
- "rlx-runtime",
-]
-
-[[package]]
-name = "rlx-pkg"
-version = "0.2.18"
-dependencies = [
- "anyhow",
- "argon2",
- "bincode",
- "chacha20poly1305",
- "criterion",
- "memmap2",
- "rand_core 0.6.4",
- "rayon",
- "rlx-dduf",
- "rlx-gguf",
- "rlx-ir",
- "rlx-mlx-io",
- "rlx-nemo",
- "safetensors",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "ureq 2.12.1",
- "xxhash-rust",
- "zip 2.4.2",
- "zstd 0.13.3",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
 ]
 
 [[package]]
@@ -5534,10 +5633,10 @@ name = "rlx-qnn"
 version = "0.2.18"
 dependencies = [
  "cc",
- "rlx-gguf",
- "rlx-ir",
- "rlx-mlx-io",
- "rlx-opt",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-opt",
  "tempfile",
 ]
 
@@ -5545,11 +5644,11 @@ dependencies = [
 name = "rlx-rl"
 version = "0.2.18"
 dependencies = [
- "rlx-autodiff",
- "rlx-compile",
- "rlx-ir",
- "rlx-opt",
- "rlx-runtime",
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
 ]
 
 [[package]]
@@ -5562,75 +5661,26 @@ version = "0.2.18"
 dependencies = [
  "cc",
  "libloading 0.8.9",
- "rlx-cpu",
- "rlx-gguf",
- "rlx-gpu-dispatch",
- "rlx-gpu-host",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-gpu-host",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
+ "mahbot-rlx-unfuse",
  "rlx-gpu-kernels",
- "rlx-ir",
- "rlx-opt",
- "rlx-runtime",
- "rlx-unfuse",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "rlx-runtime"
-version = "0.2.18"
-dependencies = [
- "anyhow",
- "half",
- "inventory",
- "memmap2",
- "rayon",
- "rlx-autodiff",
- "rlx-compile",
- "rlx-coreml",
- "rlx-cpu",
- "rlx-cuda",
- "rlx-dduf",
- "rlx-driver",
- "rlx-egpu",
- "rlx-flow",
- "rlx-fpga",
- "rlx-fusion",
- "rlx-gguf",
- "rlx-gpu-dispatch",
- "rlx-hwprofile",
- "rlx-ir",
- "rlx-linalg",
- "rlx-macros",
- "rlx-metal",
- "rlx-mlx",
- "rlx-mlx-io",
- "rlx-oneapi",
- "rlx-opt",
- "rlx-optim",
- "rlx-pkg",
- "rlx-qnn",
- "rlx-rocm",
- "rlx-sparse",
- "rlx-tpu",
- "rlx-vulkan",
- "rlx-wgpu",
- "rlx-xdna",
- "rlxsl",
- "safetensors",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "rlx-sparse"
 version = "0.2.18"
 dependencies = [
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-ir",
  "rayon",
- "rlx-cpu",
- "rlx-ir",
  "rlx-metal",
  "rlx-mlx",
 ]
@@ -5639,12 +5689,12 @@ dependencies = [
 name = "rlx-tensor"
 version = "0.2.18"
 dependencies = [
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-macros",
+ "mahbot-rlx-runtime",
  "ndarray 0.16.1",
- "rlx-autodiff",
- "rlx-ir",
- "rlx-macros",
  "rlx-optim",
- "rlx-runtime",
  "trybuild",
 ]
 
@@ -5653,22 +5703,12 @@ name = "rlx-text"
 version = "0.2.18"
 dependencies = [
  "anyhow",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-runtime",
  "minijinja",
- "rlx-gguf",
- "rlx-runtime",
  "serde",
  "serde_json",
  "tokenizers",
-]
-
-[[package]]
-name = "rlx-torch-ckpt"
-version = "0.2.18"
-dependencies = [
- "anyhow",
- "flate2",
- "half",
- "tempfile",
 ]
 
 [[package]]
@@ -5677,10 +5717,10 @@ version = "0.2.18"
 dependencies = [
  "anyhow",
  "half",
- "rlx-cpu",
- "rlx-ir",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
  "rlx-onnx-import",
- "rlx-runtime",
  "safetensors",
  "serde",
  "serde_json",
@@ -5691,17 +5731,17 @@ name = "rlx-tpu"
 version = "0.2.18"
 dependencies = [
  "libloading 0.8.9",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-fusion",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-mlx-io",
+ "mahbot-rlx-opt",
  "prost",
  "prost-build",
  "prost-types",
  "protoc-bin-vendored",
- "rlx-compile",
- "rlx-cpu",
- "rlx-fusion",
- "rlx-gguf",
- "rlx-ir",
- "rlx-mlx-io",
- "rlx-opt",
 ]
 
 [[package]]
@@ -5710,19 +5750,19 @@ version = "0.2.18"
 dependencies = [
  "crossbeam-channel",
  "ctrlc",
+ "mahbot-rlx-autodiff",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-driver",
+ "mahbot-rlx-gguf",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
  "mnist",
  "rand 0.9.5",
  "rayon",
- "rlx-autodiff",
- "rlx-compile",
- "rlx-cpu",
- "rlx-driver",
- "rlx-gguf",
- "rlx-ir",
  "rlx-metal",
  "rlx-mlx",
  "rlx-optim",
- "rlx-runtime",
  "safetensors",
  "serde",
  "serde_json",
@@ -5730,21 +5770,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlx-unfuse"
-version = "0.2.18"
-dependencies = [
- "rlx-ir",
-]
-
-[[package]]
 name = "rlx-vq"
 version = "0.2.18"
 dependencies = [
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-runtime",
  "rayon",
- "rlx-cpu",
- "rlx-ir",
  "rlx-metal",
- "rlx-runtime",
 ]
 
 [[package]]
@@ -5754,41 +5787,17 @@ dependencies = [
  "ash",
  "bytemuck",
  "half",
+ "mahbot-rlx-compile",
+ "mahbot-rlx-cpu",
+ "mahbot-rlx-gpu-dispatch",
+ "mahbot-rlx-gpu-host",
+ "mahbot-rlx-ir",
+ "mahbot-rlx-opt",
+ "mahbot-rlx-runtime",
+ "mahbot-rlx-unfuse",
+ "mahbot-rlxsl",
  "naga 29.0.4",
  "rlx",
- "rlx-compile",
- "rlx-cpu",
- "rlx-gpu-dispatch",
- "rlx-gpu-host",
- "rlx-ir",
- "rlx-opt",
- "rlx-runtime",
- "rlx-unfuse",
- "rlxsl",
-]
-
-[[package]]
-name = "rlx-wgpu"
-version = "0.2.18"
-dependencies = [
- "bytemuck",
- "half",
- "naga 29.0.4",
- "pollster",
- "rlx",
- "rlx-compile",
- "rlx-cpu",
- "rlx-gguf",
- "rlx-gpu-dispatch",
- "rlx-gpu-host",
- "rlx-ir",
- "rlx-opt",
- "rlx-runtime",
- "rlx-unfuse",
- "rlxsl",
- "serde",
- "serde_json",
- "wgpu",
 ]
 
 [[package]]
@@ -5797,16 +5806,7 @@ version = "0.2.18"
 dependencies = [
  "libc",
  "libloading 0.8.9",
- "rlx-ir",
-]
-
-[[package]]
-name = "rlxsl"
-version = "0.2.18"
-dependencies = [
- "libm",
- "naga 29.0.4",
- "rlx-ir",
+ "mahbot-rlx-ir",
 ]
 
 [[package]]

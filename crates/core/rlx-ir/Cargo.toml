@@ -1,6 +1,6 @@
 [package]
-name = "rlx-ir"
-version.workspace      = true
+name = "mahbot-rlx-ir"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Tensor IR for the RLX ML compiler — standalone, serializable, optimizable"
@@ -9,8 +9,12 @@ license.workspace      = true
 keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-ir"
+
+[lib]
+name = "rlx_ir"
+
 [dependencies]
 smallvec = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"], optional = true }

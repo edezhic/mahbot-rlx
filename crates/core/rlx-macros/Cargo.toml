@@ -1,6 +1,6 @@
 [package]
-name = "rlx-macros"
-version.workspace      = true
+name = "mahbot-rlx-macros"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "RLX proc macros — #[rlx_model] for AOT-compiled ML models"
@@ -9,9 +9,11 @@ license.workspace      = true
 keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-macros"
+
 [lib]
+name = "rlx_macros"
 proc-macro = true
 
 [dependencies]

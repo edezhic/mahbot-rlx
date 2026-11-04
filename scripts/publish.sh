@@ -2,39 +2,42 @@
 # RLX — versatile ML compiler + runtime.
 # Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 # SPDX-License-Identifier: MIT OR Apache-2.0
-# scripts/publish.sh — workspace-wide publish driver for rlx.
+# scripts/publish.sh — publish driver for the fork's own crates.
 #
-# Walks the dep graph in tier order (leaves first), publishing one
-# crate at a time with rate-limit-respecting delays AND active
-# polling of the sparse index until each just-published version is
-# resolvable. This combination is what keeps the script safe to
-# leave running unattended:
+# Publishes the crates this fork owns (`SCOPE` below) in dependency-tier order,
+# one at a time with rate-limit-respecting delays AND active polling of the
+# sparse index until each just-published version is resolvable. This combination
+# is what keeps the script safe to leave running unattended:
 #
-#   * Hard rate-limit floor: a `MIN_INTERVAL` sleep (default 65 s,
-#     above the documented "1 new crate per minute" + "1 version per
-#     minute" crates.io throttle).
+#   * Registry buckets: crates.io allows a burst of 5 brand-new names and then
+#     one every 10 minutes, and a burst of 30 new versions of existing names and
+#     then one a minute (https://crates.io/docs/rate-limits). The wait before
+#     each upload follows the bucket that upload draws from — a brand-new name
+#     is paced at `NEW_CRATE_REFILL`, a new version at `NEW_VERSION_REFILL` —
+#     so the driver never plans an upload the registry is certain to refuse. An
+#     unreadable index and a resumed run both take the slower reading.
+#     `MIN_INTERVAL` is only the settle floor inside a burst.
 #   * Active readiness check: after every successful `cargo publish`,
 #     poll `https://index.crates.io/<partition>/<crate>` until the
 #     just-uploaded version appears. Until that happens, the next
 #     crate's `cargo publish` would either 404 on dep resolution or
 #     get stale metadata.
 #   * Skip published: before each upload, resolve that crate's effective
-#     version from its Cargo.toml (`version = "…"` or
-#     `version.workspace = true` → workspace.package). Skip only when
-#     *that* version is already on the sparse index — so a crate bumped
-#     to 0.2.2 is still published even when 0.2.1 is on crates.io.
-#     Use `--no-skip-published` to force an upload attempt anyway.
+#     version from its Cargo.toml. Skip only when *that* version is already on
+#     the sparse index — so a crate bumped to 0.2.2 is still published even
+#     when 0.2.1 is on crates.io. Use `--no-skip-published` to force an upload.
 #   * Registry HTTP errors (429, 408, 5xx, timeouts): parse cargo output as
 #     it finishes, sleep until crates.io's "try again after <GMT>" when
 #     present (+ pad), else status-specific backoff — then retry the same
 #     crate automatically until it uploads. --max-retries 0 (default) never
-#     gives up on retryable codes.
+#     gives up on retryable codes. The status is read from what cargo prints:
+#     `(status 429 …)` or `(429 …)`, depending on the release.
 #   * Missing registry deps: poll the sparse index for the dependency,
 #     then retry (no manual --start-crate for index lag).
 #
-# Crates.io documented limits (as of 2026-05):
-#   * New crates:        1 per minute   (10 per 10 min)
-#   * New versions:      1 per minute   (30 per 10 min)
+# Crates.io documented limits (https://crates.io/docs/rate-limits):
+#   * New crates:        burst 5, then 1 per 10 minutes
+#   * New versions:      burst 30, then 1 per minute
 #   * Sparse-index serve: typically <30 s, occasionally up to ~5 min
 #
 # Default flow:
@@ -51,26 +54,40 @@
 #      before issuing the next publish. After the last crate of a
 #      tier the loop additionally sleeps `BETWEEN_DELAY` to let
 #      downstream crates' dep resolution catch up.
-#   4. Crates marked `publish = false` (pyrlx, rlx-cortexm-trainer) are
-#      skipped automatically by cargo — this script lists
-#      the rest. Keep the `SKIPPED` array below in sync with them:
-#      `validate_tier_coverage` requires every workspace member to be either
-#      in a tier or in `SKIPPED`.
+#   4. `SCOPE` below is the publication tooling's ground truth: the crates this
+#      fork owns, under fork package names at the fork version. `TIERS` must
+#      cover exactly it, every name in it must be a workspace package, and every
+#      crate in it must be publishable — `validate_scope` enforces all three.
+#      Nothing else in the workspace is uploaded from here.
+#
+# Staging (no registry, no upload):
+#
+#   scripts/publish.sh --stage [DIR]                # default: $TMPDIR/mahbot-publish-store
+#
+#   `cargo package --offline` produces one archive per crate in tier order,
+#   each resolved against the archives staged before it: the local store stands
+#   in for the registry, so every crate in `SCOPE` yields an archive without a
+#   registry contact. Every archive is then extracted and built from itself —
+#   `mahbot-inference` runs its own test suite. See `docs/fork-publishing.md`,
+#   including the one stated limitation: `mahbot-rlx-runtime`'s optional
+#   out-of-scope backends keep upstream's names.
 #
 # Usage:
 #
+#   scripts/publish.sh --stage                      # local archives, no upload
+#   scripts/publish.sh --stage /tmp/store           # …into a chosen directory
 #   scripts/publish.sh --dry-run                    # safe — no upload
 #   scripts/publish.sh --list                       # tier order + per-crate versions
 #   scripts/publish.sh --plan                       # crates needing publish only
 #   scripts/publish.sh --no-gate                    # skip fmt/clippy/test
 #   scripts/publish.sh --yes                        # skip confirm prompt
 #   scripts/publish.sh --start-tier 3               # resume from tier 3
-#   scripts/publish.sh --start-crate rlx-runtime    # resume from a crate
-#   scripts/publish.sh --min-interval 90            # rate-limit floor (sec)
+#   scripts/publish.sh --start-crate mahbot-rlx-runtime  # resume from a crate
+#   scripts/publish.sh --min-interval 90            # settle floor inside a burst (sec)
 #   scripts/publish.sh --between-delay 120          # between-tier extra (sec)
 #   scripts/publish.sh --poll-interval 10           # index-poll interval
 #   scripts/publish.sh --poll-timeout 600           # index-poll cap (sec)
-#   scripts/publish.sh --max-retries 5              # cap 429 backoff retries (0 = unlimited)
+#   scripts/publish.sh --max-retries 5              # cap registry retries (0 = unlimited)
 #   scripts/publish.sh --rate-limit-pad 15          # pad after server retry-after
 #   scripts/publish.sh --no-skip-published          # upload even if version exists
 #   scripts/publish.sh --no-verify                  # skip cargo's local rebuild
@@ -89,11 +106,11 @@
 #   that fails until their leaf deps actually exist on crates.io at
 #   the new version. The script's --dry-run mode handles this by
 #   recording the resolution-failure crates separately at the end —
-#   metadata + packaging are still validated for them. The only
-#   pre-publish step that can fully dry-run is tier 0 (no RLX path
-#   deps). Run `scripts/publish.sh --list` to print the full tier
-#   order; `validate_publish_order` checks every `[dependencies]` path
-#   dep against that order before publishing.
+#   metadata + packaging are still validated for them. `--stage` is the
+#   mode that demonstrates readiness without a registry at all. Run
+#   `scripts/publish.sh --list` to print the full tier order;
+#   `validate_scope` checks every dependency against that order before
+#   publishing.
 #
 # Environment:
 #
@@ -110,115 +127,93 @@ NO_VERIFY=0
 NO_POLL=0
 SKIP_PUBLISHED=1
 ASSUME_YES=0
-MIN_INTERVAL=65          # rate-limit safety floor (sec)
+MIN_INTERVAL=65          # settle floor between uploads inside a burst (sec)
+NEW_CRATE_BURST=5        # brand-new names allowed back to back
+NEW_CRATE_REFILL=600     # …then one every 10 minutes (sec)
+NEW_VERSION_BURST=30     # new versions of existing names allowed back to back
+NEW_VERSION_REFILL=60    # …then one a minute (sec)
 BETWEEN_DELAY=90         # extra sleep at tier boundaries (sec)
 POLL_INTERVAL=10         # index poll cadence (sec)
 POLL_TIMEOUT=600         # max time we'll wait for the index (sec)
-MAX_RETRIES=0            # 429 backoff cap when retry-after unparsed (0 = unlimited)
+MAX_RETRIES=0            # cap on registry retries per crate (0 = unlimited)
 RATE_LIMIT_PAD=15        # extra seconds after server "try again after" time
 START_TIER=0
 START_CRATE=""
 LAST_PUBLISH_ERR=""      # temp log from the last failed publish attempt
+STAGING=0
+STAGE_DIR=""             # `--stage [DIR]`; empty means the default below
 
-# Crates with `publish = false` in their Cargo.toml (cargo skips them;
-# listed here for tier-coverage validation only).
+# The crates this fork owns: exactly what its product paths use, under fork
+# package names at the fork version. This array is the ground truth the gates
+# read — `TIERS` must cover exactly it, every name must be a workspace package,
+# and every crate in it must be publishable. Everything else in the workspace
+# keeps upstream's identity and is never uploaded from here.
 #
-# This is a hand-copy of what the manifests already say, so it drifts: rlx-js
-# joined the workspace with `publish = false` and was never added here, and the
-# symptom was a confusing "TIERS missing workspace crates: rlx-js" — a demand
-# for a tier for a crate cargo will never publish. `validate_tier_coverage`
-# now diffs this list against `cargo metadata` and fails loudly on divergence,
-# so the next addition cannot reproduce that.
-SKIPPED=(
+# Written out a second time rather than flattened out of `TIERS` on purpose: the
+# gate compares the two lists, so a crate dropped from `TIERS` fails here instead
+# of silently shrinking the set a run would publish.
+SCOPE=(
+    mahbot-rlx-ir
+    mahbot-rlxsl
+    mahbot-rlx-gguf
+    mahbot-rlx-torch-ckpt
+    mahbot-rlx-nemo
+    mahbot-rlx-gpu-dispatch
+    mahbot-rlx-macros
+    mahbot-rlx-dduf
+    mahbot-rlx-unfuse
+    mahbot-rlx-flow
+    mahbot-rlx-fusion
+    mahbot-rlx-driver
+    mahbot-rlx-mlx-io
+    mahbot-rlx-autodiff
+    mahbot-rlx-pkg
+    mahbot-rlx-compile
+    mahbot-rlx-opt
+    mahbot-rlx-cpu
+    mahbot-rlx-gpu-host
+    mahbot-rlx-wgpu
+    mahbot-rlx-runtime
     mahbot-inference
-    pyrlx
-    rlx-cortexm-trainer
-    rlx-corpus
-    rlx-js
-    rlx-megakernel
 )
 
-# Tier definitions. Each array entry is a single tier; space-separated
-# crate names within. Order within a tier matters when one member
-# depends on another in the same tier (e.g. rlx-ir before rlx-flow).
-# Publish order: `cargo publish` resolves every path dep in `[dependencies]`
-# and `[dev-dependencies]` (including optional) against crates.io. Within
-# a tier, list deps before dependents (e.g. rlx-cpu before rlx-metal).
+# The fork version every crate in `SCOPE` carries. A prerelease on purpose: a
+# version differing from upstream's only in build metadata is rejected by the
+# registry.
+FORK_VERSION="0.2.18-mahbot.1"
+
+# Tier definitions. Each array entry is a single tier; space-separated crate
+# names within. Order within a tier matters when one member depends on another
+# in the same tier. `cargo publish` resolves every versioned dependency —
+# normal, build and dev, optional included — against the registry, so a crate
+# must follow everything it names; path-only dev-deps (no `version =`) are
+# stripped from the packaged manifest and impose no order.
 #
-# Test-only cycles on later-tier crates (rlx-metal's dev-dep on rlx-runtime,
-# and rlx-autodiff/rlx-wgpu's dev-deps on the umbrella `rlx`) are declared
-# PATH-ONLY with no `version =` field. cargo strips path-only dev-deps from the
-# published manifest entirely, so `cargo publish` never resolves them against
-# crates.io and they need no per-release pin bump — the path still wins for
-# local `cargo test`. (Older releases pinned these to the previously-published
-# version, which lagged one release on every bump; path-only removes that
-# maintenance.) rlx-runtime's optional-dep on rlx-metal still tracks the
-# workspace version — publish metal first, wait for the index, then runtime.
+# Leaves first: ir, rlxsl (its build-dep), the weight-format readers, the
+# dependency-free dispatch table and proc macros.
+#   - rlx-unfuse / rlx-flow / rlx-fusion / rlx-driver / rlx-mlx-io sit on rlx-ir.
+#   - rlx-autodiff (rlx-ir + rlx-fusion) and rlx-pkg (ir + the weight readers).
+#   - rlx-compile (ir + fusion + optional autodiff), then rlx-opt (compile).
+#   - rlx-cpu and rlx-gpu-host precede rlx-wgpu, which takes both; rlxsl is its
+#     build-dependency and rides tier 0.
+#   - rlx-runtime names every in-scope crate above it (ir, driver, opt, macros,
+#     compile, gguf, gpu-dispatch, cpu, wgpu, pkg, mlx-io, dduf) and its
+#     versioned dev-deps (autodiff, flow, fusion, rlxsl, compile).
+#   - mahbot-inference names rlx-flow, rlx-gguf, rlx-ir, rlx-runtime and
+#     rlx-wgpu: the product path, last.
 #
-# rlx-tensor sits just after rlx-runtime: its [dependencies] are rlx-ir,
-# rlx-optim, rlx-autodiff (all earlier tiers) and an optional rlx-runtime
-# (the `eval` backend), so it must follow runtime; the umbrella `rlx`
-# optional-dep's rlx-tensor (`tensor` feature), so it lands before `rlx`.
-#
-# rlx-collectives depends on rlx-ir, rlx-driver, and rlx-cpu — publish
-# after the backend tier, before rlx-runtime (dev-deps on runtime only).
-#
-# rlx-vulkan/rlx-oneapi/rlx-qnn/rlx-cerebras are backends that rlx-runtime
-# optionally depends on, so they ride in the backend tier (after rlx-cpu,
-# which rlx-vulkan/rlx-oneapi depend on).
-# rlx-webgl and rlx-web are excluded from the workspace, so they are not
-# published and are therefore absent from TIERS.
-#
-# rlx-torch-import's [dependencies] are rlx-ir plus optional rlx-cpu,
-# rlx-runtime (the `runtime` default feature) and rlx-onnx-import (the `onnx`
-# feature). Optional deps are still resolved by cargo publish, so it has to
-# follow rlx-onnx-import — it rides in the same tier, listed right after it.
-# rlx-unfuse (rlx-ir) rides tier 1; rlx-extend (rlx-ir/rlx-flow) tier 2.
-# rlx-hwprofile / rlx-onnx-proto are dep-free leaves (tier 0). rlx-gpu-host
-# (rlx-cpu/rlx-ir/rlx-compile) is consumed by the GPU backends, so it sits in
-# the backend tier right after rlx-cpu and before rlx-cuda/rlx-rocm/rlx-wgpu.
-# rlx-check (rlx-runtime) follows runtime. rlx-ffi (rlx-runtime) rides the
-# same tier; its rlx-autodiff dev-dep is path-only so publish never resolves it.
-# New-crate placements (all pinned to the workspace version):
-#   rlxsl (rlx-ir) is a BUILD-dependency of rlx-gpu-kernels (tier 0) and the
-#     GPU backends, so it rides tier 0 *before* rlx-gpu-kernels. Its dir has no
-#     hyphen, so validate_publish_order's `rlx-*` glob skips it — cargo publish
-#     still enforces the order, so keep it first.
-#   rlx-dduf / rlx-hub are dep-free leaves → tier 0. rlx-mlx-io (rlx-ir) → tier 1.
-#   rlx-pkg (rlx-ir/rlx-gguf/rlx-nemo/rlx-mlx-io/rlx-dduf) → tier 2. rlx-runtime
-#     now has [dependencies] on rlx-pkg/rlx-mlx-io/rlx-dduf (+ optional rlx-xdna),
-#     so all four must precede tier 7 — they do.
-#   rlx-xdna (rlx-ir) is an optional rlx-runtime backend → backend tier 5.
-#   rlx-distributed (rlx-ir/rlx-runtime/rlx-driver) follows runtime → tier 8.
-#   rlx-geo (opt rlx-ir/rlx-cpu/rlx-wgpu) and rlx-bake (rlx-compile/rlx-pkg/opt
-#     rlx-onnx-import+rlx-runtime) both need the backend/onnx tiers → tier 9.
-#   rlx-gpu-dispatch (no deps) must precede rlx-gpu-kernels, which now depends
-#     on it, and precedes every GPU backend — Metal and wgpu take the dispatch
-#     table without the CUDA/HIP sources. Same tier 0, listed first.
-#   rlx-rng has NO dependencies at all (not even rlx-ir) → tier 0. rlx-peft
-#     depends on rlx-ir + rlx-runtime (+ a rlx-cpu dev-dep) → tier 8. It briefly
-#     carried an rlx-linalg dependency that no source file ever imported, which
-#     would have pinned it a tier lower for nothing.
-#   rlx-opscope now publishes (tier 9, after rlx-runtime). It was publish=false,
-#     which forced seven rlx-models crates onto a cross-workspace
-#     `path = "../../../rlx/…"` dev-dependency — and since Cargo resolves
-#     dev-dependencies at lock time regardless of features, that made a sibling
-#     `rlx` checkout mandatory just to load that workspace.
+# The out-of-scope crates this fork does not publish are absent on purpose;
+# mahbot-rlx-runtime's optional backends still resolve upstream, which
+# `validate_scope` reports and docs/fork-publishing.md states.
 TIERS=(
-    "rlx-ir rlxsl rlx-gguf rlx-torch-ckpt rlx-nemo rlx-gpu-dispatch rlx-gpu-kernels rlx-mlx-sys rlx-macros rlx-cortexm rlx-optim rlx-hwprofile rlx-onnx-proto rlx-dduf rlx-hub rlx-fem rlx-rng"
-    "rlx-unfuse rlx-flow rlx-fusion rlx-driver rlx-mlx-io"
-    "rlx-autodiff rlx-extend rlx-pkg"
-    "rlx-compile"
-    "rlx-opt"
-    "rlx-cpu rlx-gpu-host rlx-wgpu rlx-cuda rlx-rocm rlx-mlx rlx-coreml rlx-tpu rlx-fpga rlx-vulkan rlx-oneapi rlx-qnn rlx-cerebras rlx-xdna rlx-egpu"
-    "rlx-metal"
-    "rlx-collectives rlx-runtime"
-    "rlx-tensor rlx-onnx-import rlx-torch-import rlx-bbo rlx-check rlx-ffi rlx-distributed rlx-opscope rlx-peft"
-    "rlx-sparse rlx-linalg rlx-umap rlx-vq rlx-text rlx-gguf-convert rlx-onnx-conformance rlx-geo rlx-bake"
-    "rlx-onnx"
-    "rlx-fdm rlx-lbm rlx-bench"
-    "rlx-rl"
-    "rlx"
+    "mahbot-rlx-ir mahbot-rlxsl mahbot-rlx-gguf mahbot-rlx-torch-ckpt mahbot-rlx-nemo mahbot-rlx-gpu-dispatch mahbot-rlx-macros mahbot-rlx-dduf"
+    "mahbot-rlx-unfuse mahbot-rlx-flow mahbot-rlx-fusion mahbot-rlx-driver mahbot-rlx-mlx-io"
+    "mahbot-rlx-autodiff mahbot-rlx-pkg"
+    "mahbot-rlx-compile"
+    "mahbot-rlx-opt"
+    "mahbot-rlx-cpu mahbot-rlx-gpu-host mahbot-rlx-wgpu"
+    "mahbot-rlx-runtime"
+    "mahbot-inference"
 )
 
 usage() {
@@ -234,6 +229,10 @@ usage() {
 while (( $# > 0 )); do
     case "$1" in
         --dry-run)        DRY_RUN=1; shift ;;
+        --stage)          STAGING=1
+                          if (( $# > 1 )) && [[ "$2" != -* ]]; then STAGE_DIR="$2"; shift; fi
+                          shift ;;
+        --stage=*)        STAGE_DIR="${1#--stage=}"; STAGING=1; shift ;;
         --list)           LIST_ONLY=1; shift ;;
         --plan)           PLAN_ONLY=1; shift ;;
         --no-gate)        NO_GATE=1; shift ;;
@@ -268,254 +267,137 @@ green()  { printf "\033[32m%s\033[0m\n" "$*"; }
 yellow() { printf "\033[33m%s\033[0m\n" "$*"; }
 bold()   { printf "\033[1m%s\033[0m\n" "$*"; }
 
-validate_tier_coverage() {
-    local -a listed=() missing=() extra=()
-    local name tier c s
-
-    for tier in "${TIERS[@]}"; do
-        for c in $tier; do
-            listed+=("$c")
-        done
-    done
-
-    if ! command -v jq >/dev/null 2>&1; then
-        yellow "jq not found — skipping tier coverage check (install jq to enable)."
-        return 0
-    fi
-
-    # Guard the hand-copy above against the manifests. `publish = false` is the
-    # ground truth; `SKIPPED` only restates it, and a restatement that nobody
-    # checks is a restatement that drifts. Compare the two sorted sets and say
-    # exactly which way they disagree, because the downstream symptom ("TIERS
-    # missing workspace crates") points at the wrong file entirely.
-    local derived_unpub listed_unpub
-    derived_unpub=$(
-        cargo metadata --no-deps --format-version 1 2>/dev/null \
-            | jq -r '.workspace_members[] as $m | .packages[]
-                     | select(.id == $m)
-                     | select(.publish != null and (.publish | length == 0))
-                     | .name' \
-            | sort
-    )
-    listed_unpub=$(printf '%s\n' "${SKIPPED[@]}" | sort)
-    if [[ "$derived_unpub" != "$listed_unpub" ]]; then
-        red "SKIPPED is out of sync with the manifests' \`publish = false\` set:"
-        while IFS= read -r n; do
-            [[ -n "$n" ]] && red "  + $n  has publish = false but is not in SKIPPED"
-        done < <(comm -23 <(printf '%s\n' "$derived_unpub") <(printf '%s\n' "$listed_unpub"))
-        while IFS= read -r n; do
-            [[ -n "$n" ]] && red "  - $n  is in SKIPPED but is publishable"
-        done < <(comm -13 <(printf '%s\n' "$derived_unpub") <(printf '%s\n' "$listed_unpub"))
-        exit 1
-    fi
-
-    while IFS= read -r name; do
-        [[ -z "$name" ]] && continue
-        for s in "${SKIPPED[@]}"; do
-            if [[ "$name" == "$s" ]]; then
-                continue 2
-            fi
-        done
-        local found=0
-        for c in "${listed[@]}"; do
-            if [[ "$name" == "$c" ]]; then
-                found=1
-                break
-            fi
-        done
-        if (( ! found )); then
-            missing+=("$name")
-        fi
-    done < <(
-        cargo metadata --no-deps --format-version 1 2>/dev/null \
-            | jq -r '.workspace_members[] as $m | .packages[] | select(.id == $m) | .name'
-    )
-
-    for c in "${listed[@]}"; do
-        local found=0
-        while IFS= read -r name; do
-            [[ "$name" == "$c" ]] && found=1 && break
-        done < <(
-            cargo metadata --no-deps --format-version 1 2>/dev/null \
-                | jq -r '.workspace_members[] as $m | .packages[] | select(.id == $m) | .name'
-        )
-        if (( ! found )); then
-            extra+=("$c")
-        fi
-    done
-
-    if (( ${#missing[@]} > 0 )); then
-        red "publish.sh TIERS missing workspace crates: ${missing[*]}"
-        exit 1
-    fi
-    if (( ${#extra[@]} > 0 )); then
-        red "publish.sh TIERS list unknown workspace crates: ${extra[*]}"
-        exit 1
-    fi
-}
-
-validate_tier_coverage
-
-# Every rlx-* path dep in [dependencies] must appear in an earlier tier
-# (or the same tier, listed before this crate). Dev-dependencies are skipped
-# here because the test-only back-edges — rlx-metal → rlx-runtime, and
-# rlx-autodiff / rlx-wgpu → the umbrella `rlx` — are declared PATH-ONLY (no
-# `version =` field). cargo strips path-only dev-deps from the published
-# manifest, so `cargo publish` never resolves them against crates.io and they
-# need no per-release pin bump. Add a `version =` to one of those back-edges
-# and it immediately starts gating the publish order — keep them path-only.
-validate_publish_order() {
+# ── Gates ───────────────────────────────────────────────────────
+#
+# One gate, because both questions — does the tier list cover the scope, and
+# does the order resolve — are answered from the same metadata. It reads
+# `cargo metadata`, so it sees the manifests rather than a hand-copy of them. A
+# gate that cannot see the crates must not pass: a missing python3 or a metadata
+# failure is a hard error, never a skip.
+validate_scope() {
     if ! command -v python3 >/dev/null 2>&1; then
-        yellow "python3 not found — skipping publish-order check (install python3 to enable)."
-        return 0
+        red "python3 not found — cannot validate the publish scope."
+        exit 1
     fi
-    local err
-    err="$(python3 - "$PWD" 2>&1 <<'PY'
-import re, sys
+    local err notes rc=0
+    err="$(python3 - "$PWD" "$FORK_VERSION" "${SCOPE[*]}" "${TIERS[@]}" 2>&1 <<'PY'
+import json, subprocess, sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-script = (root / "scripts/publish.sh").read_text()
-m = re.search(r'TIERS=\(\n((?:\s+"[^"]+"\n)+)\)', script)
-if not m:
-    print("could not parse TIERS from publish.sh")
+fork_version = sys.argv[2]
+scope = sys.argv[3].split()
+tiers = [tier.split() for tier in sys.argv[4:]]
+
+try:
+    meta = json.loads(subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+        cwd=root, capture_output=True, text=True, check=True,
+    ).stdout)
+except Exception as error:  # any failure here is a gate failure
+    print(f"cargo metadata failed: {error}")
     sys.exit(2)
-tier_lines = re.findall(r'"([^"]+)"', m.group(1))
-crate_tier = {}
-for i, line in enumerate(tier_lines):
-    for j, c in enumerate(line.split()):
-        crate_tier[c] = (i, j)
 
-def table_body(text: str, header_re: str):
-    for hm in re.finditer(header_re, text):
-        start = hm.end()
-        nxt = re.search(r"(?m)^\[", text[start:])
-        yield text[start : start + (nxt.start() if nxt else len(text))]
+members = set(meta["workspace_members"])
+packages = {p["name"]: p for p in meta["packages"] if p["id"] in members}
 
-def dep_lines(body: str):
-    for line in body.splitlines():
-        s = line.strip()
-        if s.startswith("#"):
-            continue
-        m2 = re.match(r"^(rlx[a-z0-9-]*)\s*=\s*(.*)$", s)
-        if m2:
-            yield m2.group(1), m2.group(2)
+problems = []
+notes = []
+position = {}
 
-# rlx-* entries in [workspace.dependencies] that carry a `version` field. A
-# member writing `{ workspace = true }` inherits that version, so cargo keeps
-# the dep in the published manifest and resolves it against crates.io.
-ws_versioned = {
-    name
-    for body in table_body((root / "Cargo.toml").read_text(),
-                           r"(?m)^\[workspace\.dependencies\]")
-    for name, rhs in dep_lines(body)
-    if "version" in rhs
-}
+for tier_index, tier in enumerate(tiers):
+    for slot, name in enumerate(tier):
+        if name in position:
+            problems.append(f"{name} is listed twice in TIERS")
+        position[name] = (tier_index, slot)
+        if name not in scope:
+            problems.append(f"{name} is in TIERS but not in SCOPE — the fork does not own that name")
+        if name not in packages:
+            problems.append(f"{name} is in TIERS but is not a workspace package")
 
-def parse_rlx_deps(toml_path: Path) -> set[str]:
-    # Every rlx-* dep cargo publish resolves against crates.io: [dependencies]
-    # AND target-cfg dependencies (e.g. rlx-metal on Apple); optional deps too.
-    text = toml_path.read_text()
-    deps: set[str] = set()
-    for body in table_body(text, r"(?m)^\[(?:dependencies|target\.[^\]]+\.dependencies)\]"):
-        for name, _rhs in dep_lines(body):
-            deps.add(name)
-    return deps
-
-def parse_resolved_rlx_dev_deps(toml_path: Path) -> set[str]:
-    # [dev-dependencies] are only exempt while they are PATH-ONLY: cargo strips
-    # those from the published manifest. A dev-dep carrying a `version` (directly
-    # or inherited via `{ workspace = true }`) IS resolved against crates.io, so
-    # it gates publish order exactly like a normal dep. Missing this is what let
-    # the rlx-flow dev-dep `rlx-opt = { workspace = true }` reach a real publish
-    # run and fail there with "candidate versions found which did not match".
-    text = toml_path.read_text()
-    deps: set[str] = set()
-    for body in table_body(text, r"(?m)^\[(?:dev-dependencies|target\.[^\]]+\.dev-dependencies)\]"):
-        for name, rhs in dep_lines(body):
-            inherits = re.search(r"\bworkspace\s*=\s*true\b", rhs) and name in ws_versioned
-            if "version" in rhs or inherits:
-                deps.add(name)
-    return deps
-
-# Crates excluded from the workspace (native-only fork, upstream-owned): not
-# published, so the coverage check must not demand a tier for them.
-EXCLUDED = {"rlx-web", "rlx-webgl"}
-
-violations: list[str] = []
-for toml in sorted(root.glob("crates/*/rlx-*/Cargo.toml")) + [root / "crates/rlx/Cargo.toml"]:
-    name = toml.parent.name
-    if name in EXCLUDED:
+for name in scope:
+    package = packages.get(name)
+    if name not in position:
+        problems.append(f"{name} is in SCOPE but missing from TIERS")
+    if package is None:
+        problems.append(f"{name} is in SCOPE but is not a workspace package")
         continue
-    if name.endswith("-trainer"):
-        continue
-    if re.search(r"^publish\s*=\s*false", toml.read_text(), re.M):
-        continue
-    if name not in crate_tier:
-        violations.append(f"{name} is publishable but missing from TIERS")
-        continue
-    my_tier, my_pos = crate_tier[name]
-    for dep in sorted(parse_rlx_deps(toml)):
-        if dep not in crate_tier:
-            violations.append(f"{name}: path dep {dep} is not listed in TIERS")
-            continue
-        dep_tier, dep_pos = crate_tier[dep]
-        if dep_tier > my_tier or (dep_tier == my_tier and dep_pos >= my_pos):
-            violations.append(
-                f"{name} (tier {dep_tier} pos {dep_pos} needs {dep} before it): "
-                f"publish {dep} before {name}"
-            )
-    for dep in sorted(parse_resolved_rlx_dev_deps(toml)):
-        if dep not in crate_tier:
-            continue
-        dep_tier, dep_pos = crate_tier[dep]
-        if dep_tier > my_tier or (dep_tier == my_tier and dep_pos >= my_pos):
-            violations.append(
-                f"{name}: dev-dep {dep} carries a `version` (tier {dep_tier} "
-                f"publishes after {name} tier {my_tier}) — cargo publish will try "
-                f"to resolve it on crates.io. Make it path-only: "
-                f'{dep} = {{ path = "..." }}'
-            )
+    if package.get("publish") == []:
+        problems.append(f"{name} is in SCOPE but its manifest says `publish = false`")
+    if package["version"] != fork_version:
+        problems.append(f"{name} is at {package['version']}, not the fork version {fork_version}")
+    if package.get("repository") != "https://github.com/edezhic/mahbot-rlx":
+        problems.append(f"{name} does not declare the fork's repository")
+    if package.get("documentation") != f"https://docs.rs/{name}":
+        problems.append(f"{name} does not declare its own documentation page")
 
-if violations:
-    for v in violations:
-        print(v)
+for name in scope:
+    package = packages.get(name)
+    if package is None or name not in position:
+        continue
+    mine = position[name]
+    for dep in package["dependencies"]:
+        dep_name = dep["name"]
+        if dep_name in scope:
+            # Path-only dev-deps are stripped from the packaged manifest, so
+            # they impose no order.
+            if dep["kind"] == "dev" and dep["req"] == "*":
+                continue
+            if dep_name in position and position[dep_name] >= mine:
+                problems.append(
+                    f"{name} (tier {mine[0]}) needs {dep_name} staged earlier "
+                    f"(tier {position[dep_name][0]})"
+                )
+        elif dep_name.startswith("rlx"):
+            # The upstream family. Anything the product configuration resolves
+            # from it is a defect; an optional backend is the stated limitation.
+            path_only = dep["req"] == "*"
+            if dep["kind"] == "dev":
+                if not path_only:
+                    problems.append(
+                        f"{name}: dev-dep {dep_name} carries a version, so publishing "
+                        f"would resolve the upstream family — make it path-only"
+                    )
+            elif dep["optional"]:
+                notes.append(f"{name}: optional {dep_name} resolves the upstream family when enabled")
+            else:
+                problems.append(
+                    f"{name} depends on upstream {dep_name} in its product configuration"
+                )
+
+if problems:
+    for problem in problems:
+        print(problem)
     sys.exit(1)
+
+for note in notes:
+    print(f"note: {note}")
 PY
-)" || true
+)" || rc=$?
+    # Exit 1 is the script's own "the scope does not match"; anything else — a
+    # killed interpreter included — means the gate never reached a verdict.
+    if (( rc > 1 )); then
+        red "The publish scope gate could not run (python3 exit $rc)."
+        [[ -n "$err" ]] && printf '%s\n' "$err" >&2
+        exit 1
+    fi
+    notes="$(printf '%s\n' "$err" | grep '^note: ' || true)"
+    err="$(printf '%s\n' "$err" | grep -v '^note: ' || true)"
+    if [[ -n "$notes" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && yellow "  ${line#note: }"
+        done <<< "$notes"
+    fi
     if [[ -n "$err" ]]; then
-        red "Publish tier order does not match Cargo.toml path dependencies:"
+        red "The publish scope does not match the manifests:"
         while IFS= read -r line; do
             [[ -n "$line" ]] && red "  $line"
         done <<< "$err"
-        red "Fix scripts/publish.sh TIERS (or drop path deps from [dependencies])."
         exit 1
     fi
 }
 
-validate_publish_order
-
-# Extract the workspace version once so the index-readiness check
-# knows what to look for. Stops at the next `[…]` header so we don't
-# accidentally read a version line from another table.
-WORKSPACE_VERSION="$(awk '
-    BEGIN              { in_block = 0 }
-    /^\[workspace\.package\]/ { in_block = 1; next }
-    /^\[/              { in_block = 0; next }
-    in_block && $1 == "version" {
-        # Line looks like:  version       = "0.2.0"
-        match($0, /"[^"]+"/)
-        if (RSTART > 0) {
-            v = substr($0, RSTART + 1, RLENGTH - 2)
-            print v
-            exit
-        }
-    }
-' Cargo.toml)"
-if [[ -z "$WORKSPACE_VERSION" ]]; then
-    echo "could not parse [workspace.package].version from Cargo.toml" >&2
-    exit 1
-fi
+validate_scope
 
 # ── Sparse-index helpers (needed for per-crate skip/plan checks) ─
 sparse_index_path() {
@@ -536,67 +418,37 @@ check_index() {
     local crate="$1"
     local version="$2"
     local url="https://index.crates.io/$(sparse_index_path "$crate")"
-    local body
-    body="$(curl -fsS --max-time 10 "$url" 2>/dev/null || true)"
-    if [[ -z "$body" ]]; then
-        return 2
-    fi
+    local answer code body
+    answer="$(curl -sS --max-time 10 -w '\n%{http_code}' "$url" 2>/dev/null || true)"
+    code="${answer##*$'\n'}"
+    body="${answer%$'\n'*}"
+    case "$code" in
+        404) return 2 ;;   # the name is not on the index at all
+        200) ;;
+        *)   return 3 ;;   # the index could not be read; not a classification
+    esac
     if printf '%s' "$body" | grep -Fq "\"vers\":\"$version\""; then
         return 0
     fi
     return 1
 }
 
-# Returns 0 if <crate>@<version> is already on the sparse index.
-version_on_crates_io() {
-    check_index "$1" "$2"
-}
-
-# Per-crate effective publish versions (explicit `version =` or workspace default).
+# Per-crate publish versions, read from the manifests cargo itself resolved.
 CRATE_VERSIONS_FILE=""
 
 load_crate_versions() {
-    local all_crates="" tier c
-    for tier in "${TIERS[@]}"; do
-        for c in $tier; do
-            all_crates+="$c "
-        done
-    done
-
     CRATE_VERSIONS_FILE="$(mktemp)"
-    python3 - "$PWD" "$WORKSPACE_VERSION" "$all_crates" <<'PY' > "$CRATE_VERSIONS_FILE"
-import re, sys
-from pathlib import Path
+    python3 - "$PWD" "${SCOPE[*]}" <<'PY' > "$CRATE_VERSIONS_FILE"
+import json, subprocess, sys
 
-root = Path(sys.argv[1])
-workspace_version = sys.argv[2]
-crates = sys.argv[3].split()
-
-def crate_toml(crate: str) -> Path:
-    # Umbrella `rlx` lives directly under crates/; every other crate lives
-    # under crates/<group>/<crate>/ after the crate regrouping. (Nested
-    # sub-crates like the cortexm trainer aren't in TIERS, so a one-level
-    # group search is enough.)
-    direct = root / "crates" / crate / "Cargo.toml"
-    if direct.is_file():
-        return direct
-    matches = sorted(root.glob(f"crates/*/{crate}/Cargo.toml"))
-    if matches:
-        return matches[0]
-    raise SystemExit(f"could not find Cargo.toml for {crate}")
-
-def effective_version(crate: str) -> str:
-    toml = crate_toml(crate)
-    text = toml.read_text()
-    if re.search(r"^version\.workspace\s*=\s*true", text, re.M):
-        return workspace_version
-    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
-    if m:
-        return m.group(1)
-    raise SystemExit(f"could not parse version in {toml}")
-
-for crate in crates:
-    print(f"{crate}\t{effective_version(crate)}")
+scope = sys.argv[2].split()
+meta = json.loads(subprocess.run(
+    ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+    cwd=sys.argv[1], capture_output=True, text=True, check=True,
+).stdout)
+by_name = {p["name"]: p for p in meta["packages"]}
+for name in scope:
+    print(f'{name}\t{by_name[name]["version"]}')
 PY
 }
 
@@ -620,7 +472,7 @@ crates_needing_publish() {
     for tier in "${TIERS[@]}"; do
         for c in $tier; do
             ver="$(crate_version "$c")"
-            if ! version_on_crates_io "$c" "$ver"; then
+            if ! check_index "$c" "$ver"; then
                 echo "$c@$ver"
             fi
         done
@@ -628,43 +480,23 @@ crates_needing_publish() {
 }
 
 list_tiers() {
-    local check_index="${1:-0}"
-    bold "Publish order ([workspace.package] version $WORKSPACE_VERSION):"
+    local with_index="${1:-0}"
+    bold "Publish order (fork packages, version $FORK_VERSION):"
     local i=0 tier c ver suffix
     for tier in "${TIERS[@]}"; do
         echo "  tier $i:"
         for c in $tier; do
             ver="$(crate_version "$c")"
             suffix=""
-            if (( check_index )); then
-                if version_on_crates_io "$c" "$ver"; then
-                    suffix="  (on crates.io)"
-                else
-                    suffix="  (needs publish)"
-                fi
-            elif [[ "$ver" != "$WORKSPACE_VERSION" ]]; then
-                suffix="  (explicit version)"
+            if (( with_index )) && check_index "$c" "$ver"; then
+                suffix="  (already on crates.io)"
             fi
             echo "    - $c@$ver$suffix"
         done
-        ((i++))
+        i=$(( i + 1 ))
     done
     echo
-    bold "Skipped (publish = false):"
-    for s in "${SKIPPED[@]}"; do
-        case "$s" in
-            pyrlx)
-                echo "  - pyrlx                    (PyPI via maturin)"
-                ;;
-            rlx-cortexm-trainer)
-                echo "  - rlx-cortexm-trainer      (binary tool; nested under crates/backends/rlx-cortexm/trainer)"
-                ;;
-            *)
-                echo "  - $s"
-                ;;
-        esac
-    done
-    echo "  - rlx-cortexm-firmware     (no_std firmware binary; not a workspace member)"
+    echo "  Nothing else in this workspace is published from here."
 }
 
 print_publish_plan() {
@@ -685,6 +517,224 @@ print_publish_plan() {
         echo "  - $entry"
     done
 }
+
+# ── Local staging: readiness without a registry ──────────────────
+#
+# `cargo package --offline` produces one archive per crate, each resolved
+# against the archives staged before it, so the store stands in for the
+# registry:
+#
+#   <store>/crates/<pkg>-<ver>.crate   the archives
+#   <store>/src/<pkg>-<ver>/           unpacked, what the patches point at
+#   <store>/fork.toml                  [patch.crates-io] for everything staged
+#   <store>/target/                    cargo's packaging target directory
+#   <store>/build/<pkg>-<ver>/         a fresh extraction, built from itself
+#
+# The plan is the tier order with the out-of-scope crates the scope still
+# resolves inserted before the crate that needs them. Those stand-ins are the
+# stated limitation: `mahbot-rlx-runtime` keeps its optional out-of-scope
+# backends (rlx-metal, rlx-cuda, …) under upstream names, so its archive has to
+# resolve the upstream family. Staging them from this tree only lets that
+# resolution finish offline — the packaged manifests still name the registry
+# packages, and a consumer who enables one of those features pulls upstream.
+# They are never verified as deliverables and never uploaded. See
+# docs/fork-publishing.md.
+STAGE_DEFAULT="${TMPDIR:-/tmp}/mahbot-publish-store"
+
+# One [patch.crates-io] line per staged archive, rewritten whole.
+write_fork_patch() {
+    printf '[patch.crates-io]\n' > "$1"
+    local c
+    if (( ${#PATCHED[@]} )); then
+        for c in "${PATCHED[@]}"; do
+            printf '%s = { path = "%s/src/%s-%s" }\n' \
+                "${c%@*}" "$STORE" "${c%@*}" "${c#*@}" >> "$1"
+        done
+    fi
+}
+
+# The flat staging plan: `<scope|stand-in>\t<package>\t<version>` per line, each
+# package after everything it resolves from the registry.
+staging_plan() {
+    python3 - "$PWD" "${SCOPE[*]}" "${TIERS[@]}" <<'PY'
+import json, subprocess, sys
+
+root = sys.argv[1]
+scope = sys.argv[2].split()
+tiers = [tier.split() for tier in sys.argv[3:]]
+
+meta = json.loads(subprocess.run(
+    ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+    cwd=root, capture_output=True, text=True, check=True,
+).stdout)
+packages = {p["name"]: p for p in meta["packages"]}
+
+plan = []
+seen = set()
+
+def visit(name):
+    if name in seen:
+        return
+    seen.add(name)
+    for dep in packages[name]["dependencies"]:
+        dep_name = dep["name"]
+        if dep["kind"] == "dev" or dep_name in scope or dep_name not in packages:
+            continue
+        visit(dep_name)
+    plan.append(("scope" if name in scope else "stand-in", name))
+
+for tier in tiers:
+    for name in tier:
+        visit(name)
+
+for kind, name in plan:
+    print(f"{kind}\t{name}\t{packages[name]['version']}")
+PY
+}
+
+# The packaged manifest must name the package and carry no path dependency: a
+# path in it would mean the archive cannot stand alone.
+check_archive() {
+    local manifest="$1" crate="$2" version="$3"
+    python3 - "$manifest" "$crate" "$version" <<'PY'
+import re, sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text()
+name, version = sys.argv[2], sys.argv[3]
+
+def table(header: str) -> str:
+    match = re.search(rf"(?ms)^\[{re.escape(header)}\][^\n]*\n(.*?)(?=^\[|\Z)", text)
+    return match.group(1) if match else ""
+
+problems = []
+if not re.search(rf'(?m)^name = "{re.escape(name)}"$', text):
+    problems.append(f"packaged name is not {name}")
+if not re.search(rf'(?m)^version = "{re.escape(version)}"$', text):
+    problems.append(f"packaged version is not {version}")
+for header in re.findall(r"(?m)^\[((?:target\.[^\]]+\.)?(?:dev-|build-)?dependencies(?:\.[^\]]+)?)\]", text):
+    if re.search(r"(?m)^path = ", table(header)):
+        problems.append(f"[{header}] carries a path dependency")
+if problems:
+    for problem in problems:
+        print(f"{name}: {problem}")
+    sys.exit(1)
+PY
+}
+
+stage_one() {
+    local kind="$1" crate="$2" version="$3" archive log
+    bold ">> packaging $crate@$version ($kind)"
+    log="$STORE/package-$crate.log"
+    if ! cargo package --package "$crate" --no-verify --allow-dirty --offline \
+            --target-dir "$STORE/target" --config "$STORE/fork.toml" \
+            > "$log" 2>&1; then
+        red "packaging $crate failed:"
+        tail -20 "$log"
+        exit 1
+    fi
+    archive="$STORE/target/package/$crate-$version.crate"
+    if [[ ! -f "$archive" ]]; then
+        red "cargo packaged $crate but left no archive at $archive"
+        exit 1
+    fi
+    cp "$archive" "$STORE/crates/"
+    rm -rf "${STORE:?}/src/$crate-$version"
+    mkdir -p "$STORE/src/$crate-$version"
+    tar -xzf "$archive" -C "$STORE/src/$crate-$version" --strip-components=1
+    if ! check_archive "$STORE/src/$crate-$version/Cargo.toml" "$crate" "$version"; then
+        red "$crate: the packaged manifest is not standalone"
+        exit 1
+    fi
+    PATCHED+=("$crate@$version")
+    write_fork_patch "$STORE/fork.toml"
+}
+
+stage_archives() {
+    mkdir -p "$STORE"/{crates,src,target,build}
+    PATCHED=()
+    write_fork_patch "$STORE/fork.toml"
+    local kind crate version plan rc=0
+    plan="$(staging_plan)" || rc=$?
+    if (( rc != 0 )) || [[ -z "$plan" ]]; then
+        red "The staging plan could not be read from cargo metadata (exit $rc)."
+        exit 1
+    fi
+    while IFS=$'\t' read -r kind crate version; do
+        [[ -z "$crate" ]] && continue
+        stage_one "$kind" "$crate" "$version"
+    done <<< "$plan"
+}
+
+# Build each archive from itself, with nothing of the repository beside it but
+# the store. `mahbot-inference` runs its own test suite there, which is the
+# acceptance its packaged form has to meet.
+verify_archives() {
+    local tier crate dir log failed=0
+    for tier in "${TIERS[@]}"; do
+        for crate in $tier; do
+            dir="$STORE/build/$crate-$FORK_VERSION"
+            log="$STORE/build-$crate.log"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            tar -xzf "$STORE/crates/$crate-$FORK_VERSION.crate" -C "$dir" --strip-components=1
+            local -a run=(build)
+            if [[ "$crate" == "mahbot-inference" ]]; then run=(test); fi
+            bold ">> ${run[0]} $crate from its own archive"
+            if ( cd "$dir" && cargo "${run[@]}" --offline \
+                    --config "$STORE/fork.toml" > "$log" 2>&1 ); then
+                green "   ok"
+            else
+                red "   FAILED to ${run[0]} from its own archive:"
+                grep -E '^error' "$log" | head -5 || true
+                failed=1
+            fi
+        done
+    done
+    return "$failed"
+}
+
+stage_all() {
+    STORE="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' \
+        "${STAGE_DIR:-$STAGE_DEFAULT}")"
+    # Packaging under a patch table makes cargo record those patches in the
+    # workspace lock (`[[patch.unused]]` and a rewritten dependency graph), so
+    # the run puts back the lock it found however it ends.
+    LOCK_BACKUP="$(mktemp)"
+    cp Cargo.lock "$LOCK_BACKUP"
+    trap 'cp "$LOCK_BACKUP" Cargo.lock; rm -f "$LOCK_BACKUP" "${CRATE_VERSIONS_FILE:-}"' EXIT
+    local workspace_root
+    workspace_root="$(pwd -P)"
+    if [[ "$STORE" == "/" ]]; then
+        red "the store must not be the filesystem root."
+        exit 1
+    fi
+    case "$STORE/" in
+        "$workspace_root"/*)
+            red "the store must live outside the workspace — cargo would adopt the"
+            red "extracted archives into it and refuse to build them from themselves."
+            exit 1
+            ;;
+    esac
+    mkdir -p "$STORE"
+    bold "Staging the fork's crates into $STORE"
+    echo
+    stage_archives
+    echo
+    bold "Building every archive from itself"
+    verify_archives || {
+        red "At least one archive does not build from itself — see the logs in $STORE."
+        exit 1
+    }
+    echo
+    green "Staged ${#SCOPE[@]} fork archives and $(( ${#PATCHED[@]} - ${#SCOPE[@]} )) resolution stand-ins; every fork archive builds from itself."
+    yellow "Nothing was uploaded."
+}
+
+if (( STAGING )); then
+    stage_all
+    exit 0
+fi
 
 if (( LIST_ONLY )); then
     list_tiers 1
@@ -775,8 +825,8 @@ fi
 #
 # Names are always lower-case and hyphens are kept verbatim. See
 # https://doc.rust-lang.org/cargo/reference/registry-index.html
-# (sparse_index_path, check_index, version_on_crates_io are defined
-# above for per-crate skip/plan checks.)
+# (sparse_index_path, check_index are defined above for per-crate skip/plan
+# checks.)
 
 # Block until check_index says we're good or the timeout trips.
 wait_for_index() {
@@ -812,7 +862,8 @@ missing_registry_dep_name() {
     local err_file="$1"
     grep -oE 'no matching package named `[^`]+`' "$err_file" 2>/dev/null \
         | head -1 \
-        | sed -E 's/no matching package named `([^`]+)`/\1/'
+        | sed -E 's/no matching package named `([^`]+)`/\1/' \
+        || true
 }
 
 # True when cargo says this version was uploaded already.
@@ -822,14 +873,21 @@ is_already_exists_error() {
     grep -qiE 'already exists on crates\.io|already exists on the registry' "$err_file"
 }
 
-# Last HTTP status from a `status NNN` line in cargo/crates.io output (e.g. 429).
+# The HTTP status cargo reported. A registry error prints it parenthesised —
+# `(status 429 Too Many Requests)` or, in releases that format the
+# `http::StatusCode` directly, `(429 Too Many Requests)` — and the non-JSON
+# response path prints `got 429`. The right boundary admits end of line: the
+# shortest form ends there.
 registry_http_status_from_log() {
-    local err_file="$1"
+    local err_file="$1" status
     [[ -f "$err_file" ]] || return 0
-    grep -oiE 'status [0-9]{3}' "$err_file" 2>/dev/null \
-        | tail -1 \
-        | grep -oE '[0-9]{3}' \
-        || true
+    status="$(grep -oiE '\((status )?[0-9]{3}([^0-9]|$)' "$err_file" 2>/dev/null \
+        | tail -1 | grep -oE '[0-9]{3}' || true)"
+    if [[ -z "$status" ]]; then
+        status="$(grep -oiE 'got [0-9]{3}([^0-9]|$)' "$err_file" 2>/dev/null \
+            | tail -1 | grep -oE '[0-9]{3}' || true)"
+    fi
+    printf '%s\n' "$status"
 }
 
 # Transient registry / network failures — retry after a computed wait.
@@ -867,12 +925,13 @@ registry_status_default_wait() {
     esac
 }
 
-# Seconds to wait before retrying a registry error.
-# Prints: wait_seconds parsed_flag http_status
-#   parsed_flag=1 → wait derived from server retry window or status default
+# How long to wait before retrying a registry error, the HTTP status cargo
+# reported (0 when it named none), and the server's own window as printed
+# (empty when it named none).
+# Prints: wait_seconds http_status server_window
 registry_retry_wait_seconds() {
     local err_file="$1"
-    local when epoch now wait parsed=0 status
+    local when epoch now wait status
     status="$(registry_http_status_from_log "$err_file")"
     wait="$(registry_status_default_wait "$status")"
 
@@ -880,29 +939,27 @@ registry_retry_wait_seconds() {
         grep -oiE '(please )?try again after [A-Za-z]{3}, [0-9]+ [A-Za-z]+ [0-9]+ [0-9:]+ GMT' \
             "$err_file" 2>/dev/null \
             | tail -1 \
-            | sed -E 's/^[Pp]lease [Tt]ry again after //; s/^[Tt]ry again after //'
+            | sed -E 's/^[Pp]lease [Tt]ry again after //; s/^[Tt]ry again after //' \
+            || true
     )"
     if [[ -n "$when" ]]; then
         epoch="$(http_date_to_epoch "$when" || true)"
         if [[ -n "${epoch:-}" ]]; then
             now="$(date -u '+%s')"
             wait=$(( epoch - now + RATE_LIMIT_PAD ))
-            parsed=1
             if (( wait < MIN_INTERVAL )); then
                 wait=$MIN_INTERVAL
             fi
             if (( wait > 86400 )); then
                 wait=86400
             fi
-            echo "$wait $parsed ${status:-0}"
-            return 0
-        fi
-        if grep -qiE 'try again after|published too many new crates' "$err_file"; then
+        else
+            # A real window this `date` cannot parse: fall back to the doubled
+            # settle floor and still report it.
             wait=$(( MIN_INTERVAL * 2 ))
-            parsed=1
-            echo "$wait $parsed ${status:-0}"
-            return 0
         fi
+        echo "$wait ${status:-0} $when"
+        return 0
     fi
 
     local retry_after
@@ -913,16 +970,11 @@ registry_retry_wait_seconds() {
             || true
     )"
     if [[ -n "$retry_after" ]]; then
-        wait=$(( retry_after + RATE_LIMIT_PAD ))
-        parsed=1
-        echo "$wait $parsed ${status:-0}"
+        echo "$(( retry_after + RATE_LIMIT_PAD )) ${status:-0}"
         return 0
     fi
 
-    if is_retryable_registry_error "$err_file"; then
-        parsed=1
-    fi
-    echo "$wait $parsed ${status:-0}"
+    echo "$wait ${status:-0}"
 }
 
 # Sleep with a single live countdown line — easier to watch than
@@ -944,6 +996,53 @@ DRY_RUN_PASS=()
 DRY_RUN_FAIL=()
 ALREADY_ON_CRATES_IO=()
 PUBLISHED_THIS_RUN=()
+NEW_CRATES_UPLOADED=0
+NEW_VERSIONS_UPLOADED=0
+# A resumed run continues a process whose uploads spent a bucket this one never
+# saw, so it starts as if each burst were used: the first upload waits one
+# refill instead of firing one the registry is likely to refuse.
+if (( START_TIER > 0 )) || [[ -n "$START_CRATE" ]]; then
+    NEW_CRATES_UPLOADED=$NEW_CRATE_BURST
+    NEW_VERSIONS_UPLOADED=$NEW_VERSION_BURST
+fi
+
+# 0 = this version is on the index, 1 = the name is but this version is not,
+# 2 = the name is not on the index at all. An unreadable index is reported as
+# 2: with the bucket unknown, a first-time name (ten minutes a refill) is the
+# reading that cannot be too fast.
+crate_index_state() {
+    local state=0
+    check_index "$1" "$2" || state=$?
+    if (( state == 3 )); then
+        yellow "  index unreachable for $1 — pacing as a new crate name" >&2
+        state=2
+    fi
+    echo "$state"
+}
+
+# Wait out the bucket the next upload draws from. crates.io refills a brand-new
+# name every ten minutes after its burst of five, and a new version of an
+# existing name every minute after its burst of thirty; inside a burst the only
+# wait is the settle floor.
+pace_before_upload() {
+    local state="$1" bucket count burst refill
+    if (( state == 2 )); then
+        bucket="new crate"
+        count=$NEW_CRATES_UPLOADED
+        burst=$NEW_CRATE_BURST
+        refill=$NEW_CRATE_REFILL
+    else
+        bucket="new version"
+        count=$NEW_VERSIONS_UPLOADED
+        burst=$NEW_VERSION_BURST
+        refill=$NEW_VERSION_REFILL
+    fi
+    if (( count >= burst )); then
+        sleep_with_countdown "$refill" "$bucket bucket spent — registry refill"
+    elif (( count > 0 )); then
+        sleep_with_countdown "$MIN_INTERVAL" "settle between uploads"
+    fi
+}
 
 publish_one_attempt() {
     local crate="$1"
@@ -951,25 +1050,6 @@ publish_one_attempt() {
     args+=("--package" "$crate")
     if (( DRY_RUN )); then
         args+=("--dry-run" "--allow-dirty")
-    fi
-    # rlx-mlx-sys vendors MLX as a git submodule pinned to a clean upstream
-    # commit, and `build.rs` applies the tracked `patches/` to that working
-    # tree before CMake configures — so merely BUILDING the crate leaves three
-    # files modified and `cargo publish` refuses with "files in the working
-    # directory contain changes that were not yet committed into git".
-    #
-    # The dirt is build output, not uncommitted work: the patches themselves
-    # are tracked, and the fix cannot live as a submodule commit because
-    # `git submodule update` would discard it and the parent repo would never
-    # record it. Published 0.2.16 shipped these sources pre-patched for the
-    # same reason, and `apply_vendor_patches` is idempotent (it tries
-    # `git apply --check --reverse` first), so a consumer building from the
-    # tarball detects them as already applied and skips.
-    #
-    # Scoped to this one crate on purpose. A blanket `--allow-dirty` would let
-    # genuinely uncommitted work ship silently from any of the other 70-odd.
-    if [[ "$crate" == "rlx-mlx-sys" ]]; then
-        args+=("--allow-dirty")
     fi
     if (( NO_VERIFY )); then
         args+=("--no-verify")
@@ -1011,10 +1091,10 @@ publish_one_attempt() {
 # 0 = published (or dry-run ok), 1 = hard failure, 2 = already on crates.io
 publish_one() {
     local crate="$1"
+    local bucket_refill="$2"
     local version
     version="$(crate_version "$crate")"
     local attempt=1
-    local backoff=$MIN_INTERVAL
     local missing_dep_attempts=0
     while true; do
         # `|| rc=$?` keeps `set -e` from aborting on non-zero returns (42/44).
@@ -1060,49 +1140,36 @@ publish_one() {
             exit 1
         fi
         if (( rc == 42 )); then
-            local wait_sec=$MIN_INTERVAL parsed=0 http_status=0 when_human=""
+            # rc 42 is only returned for an error `is_retryable_registry_error`
+            # recognized, so a wait is always available here; the bucket refill
+            # is the conservative seed if the log went missing.
+            local wait_sec=$bucket_refill http_status=0 when_human=""
             if [[ -n "${LAST_PUBLISH_ERR:-}" && -f "$LAST_PUBLISH_ERR" ]]; then
-                read -r wait_sec parsed http_status < <(registry_retry_wait_seconds "$LAST_PUBLISH_ERR")
-                if grep -qiE 'try again after' "$LAST_PUBLISH_ERR"; then
-                    when_human="$(
-                        grep -oiE '(please )?try again after [A-Za-z]{3}, [0-9]+ [A-Za-z]+ [0-9]+ [0-9:]+ GMT' \
-                            "$LAST_PUBLISH_ERR" 2>/dev/null \
-                            | tail -1 \
-                            | sed -E 's/^[Pp]lease [Tt]ry again after //; s/^[Tt]ry again after //'
-                    )"
-                fi
+                read -r wait_sec http_status when_human \
+                    < <(registry_retry_wait_seconds "$LAST_PUBLISH_ERR")
                 rm -f "$LAST_PUBLISH_ERR"
                 LAST_PUBLISH_ERR=""
             fi
-            if (( parsed )); then
-                if (( http_status > 0 )); then
-                    yellow "  crates.io HTTP $http_status for $crate — waiting ${wait_sec}s then retry (automatic)."
-                else
-                    yellow "  registry transient error for $crate — waiting ${wait_sec}s then retry (automatic)."
-                fi
-                if [[ -n "$when_human" ]]; then
-                    yellow "    server window ends: $when_human (+${RATE_LIMIT_PAD}s pad)"
-                fi
-                attempt=1
-                backoff=$MIN_INTERVAL
-            else
-                if (( MAX_RETRIES > 0 && attempt > MAX_RETRIES )); then
-                    red "Publish failed for $crate after $MAX_RETRIES registry retries."
-                    red "Re-run with --start-crate $crate to resume later."
-                    exit 1
-                fi
-                wait_sec=$backoff
-                if (( MAX_RETRIES > 0 )); then
-                    yellow "  registry retry for $crate (attempt $attempt/$MAX_RETRIES) — backoff ${wait_sec}s."
-                else
-                    yellow "  registry retry for $crate (attempt $attempt) — backoff ${wait_sec}s."
-                fi
-                backoff=$(( backoff * 2 ))
-                if (( backoff > 600 )); then
-                    backoff=600
-                fi
-                attempt=$(( attempt + 1 ))
+            # A 429 means the bucket is empty: an upload before its refill is a
+            # certain refusal, whatever window the server named — none, or one
+            # already elapsed and clamped to the settle floor.
+            if (( http_status == 429 )) && (( wait_sec < bucket_refill )); then
+                wait_sec=$bucket_refill
             fi
+            if (( MAX_RETRIES > 0 && attempt > MAX_RETRIES )); then
+                red "Publish failed for $crate after $MAX_RETRIES registry retries."
+                red "Re-run with --start-crate $crate to resume later."
+                exit 1
+            fi
+            if (( http_status > 0 )); then
+                yellow "  crates.io HTTP $http_status for $crate — waiting ${wait_sec}s then retry (automatic)."
+            else
+                yellow "  registry transient error for $crate — waiting ${wait_sec}s then retry (automatic)."
+            fi
+            if [[ -n "$when_human" ]]; then
+                yellow "    server window ends: $when_human (+${RATE_LIMIT_PAD}s pad)"
+            fi
+            attempt=$(( attempt + 1 ))
             sleep_with_countdown "$wait_sec" "crates.io registry cooldown"
             continue
         fi
@@ -1139,22 +1206,23 @@ for tier_idx in "${!TIERS[@]}"; do
             skip_until_crate=""
         fi
 
-        # Already on crates.io at this crate's local version — no upload.
-        if (( SKIP_PUBLISHED )) && (( ! DRY_RUN )); then
-            if version_on_crates_io "$crate" "$version"; then
+        # One index reading answers both questions: skip when this version is
+        # already there, and which bucket an upload would draw from.
+        index_state=-1
+        if (( ! DRY_RUN )); then
+            index_state="$(crate_index_state "$crate" "$version")"
+            if (( SKIP_PUBLISHED )) && (( index_state == 0 )); then
                 green "  skip $crate@$version (already on crates.io)"
                 ALREADY_ON_CRATES_IO+=("$crate@$version")
                 continue
             fi
+            pace_before_upload "$index_state"
         fi
 
-        # Rate-limit floor only between actual uploads (not after skips).
-        if (( published_in_tier > 0 )) && (( ! DRY_RUN )); then
-            sleep_with_countdown "$MIN_INTERVAL" "rate-limit floor"
-        fi
-
+        bucket_refill=$NEW_VERSION_REFILL
+        if (( index_state == 2 )); then bucket_refill=$NEW_CRATE_REFILL; fi
         pub_rc=0
-        publish_one "$crate" || pub_rc=$?
+        publish_one "$crate" "$bucket_refill" || pub_rc=$?
         if (( pub_rc == 2 )); then
             ALREADY_ON_CRATES_IO+=("$crate@$version")
             continue
@@ -1164,6 +1232,11 @@ for tier_idx in "${!TIERS[@]}"; do
         fi
 
         PUBLISHED_THIS_RUN+=("$crate@$version")
+        if (( index_state == 2 )); then
+            NEW_CRATES_UPLOADED=$(( NEW_CRATES_UPLOADED + 1 ))
+        else
+            NEW_VERSIONS_UPLOADED=$(( NEW_VERSIONS_UPLOADED + 1 ))
+        fi
         published_in_tier=$(( published_in_tier + 1 ))
 
         # Post-publish: poll the index until the new version is
@@ -1179,6 +1252,15 @@ for tier_idx in "${!TIERS[@]}"; do
         sleep_with_countdown "$BETWEEN_DELAY" "between-tier (let crates.io index settle)"
     fi
 done
+
+if [[ -n "$skip_until_crate" ]]; then
+    if [[ " ${TIERS[*]} " == *" $skip_until_crate "* ]]; then
+        red "--start-crate $skip_until_crate sits below --start-tier $START_TIER — nothing was published."
+    else
+        red "--start-crate $skip_until_crate is not in TIERS — nothing was published."
+    fi
+    exit 1
+fi
 
 if (( DRY_RUN )); then
     echo

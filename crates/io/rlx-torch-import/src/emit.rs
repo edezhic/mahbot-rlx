@@ -708,8 +708,8 @@ description = "RLX native model generated from a PyTorch model by rlx-torch-impo
 anyhow = "1"
 half = "2"
 safetensors = "0.7"
-rlx-ir = {{ path = "{ir}", features = ["serialize"] }}
-rlx-runtime = {{ path = "{rt}", default-features = false, features = ["cpu"] }}
+rlx-ir = {{ package = "mahbot-rlx-ir", path = "{ir}", features = ["serialize"] }}
+rlx-runtime = {{ package = "mahbot-rlx-runtime", path = "{rt}", default-features = false, features = ["cpu"] }}
 {extra_deps}
 
 [features]
@@ -755,7 +755,10 @@ pub fn emit_crate(
         }
         EmitStyle::Flow => {
             let flow = rlx_root.join("crates/core/rlx-flow");
-            let dep = format!("rlx-flow = {{ path = {:?} }}", flow.display());
+            let dep = format!(
+                "rlx-flow = {{ package = \"mahbot-rlx-flow\", path = {:?} }}",
+                flow.display()
+            );
             (
                 emit_cargo_toml(crate_name, rlx_root, &dep),
                 crate::emit_styles::flow_lib_rs(lo),

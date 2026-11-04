@@ -57,7 +57,7 @@ fn main() {
     .collect();
 
     let json = serde_json::json!({
-        "crate": "rlx-runtime",
+        "crate": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
         "backends": backends,
     });

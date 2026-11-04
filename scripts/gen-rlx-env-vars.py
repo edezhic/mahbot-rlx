@@ -283,7 +283,7 @@ def cargo_registry_markdown() -> str | None:
                 "run",
                 "-q",
                 "-p",
-                "rlx-ir",
+                "mahbot-rlx-ir",
                 "--example",
                 "env_registry_dump",
             ],

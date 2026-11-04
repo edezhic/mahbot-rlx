@@ -13,14 +13,14 @@
 
 [package]
 name = "mahbot-inference"
-version.workspace      = true
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "MahBot inference: ear, recognition, synthesis and transcription, end to end, on our own models."
 authors.workspace      = true
 license.workspace      = true
-repository.workspace   = true
-publish = false
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-inference"
 # Three binaries: without this, a bare `cargo run -p mahbot-inference --features bench`
 # is ambiguous. The stand is the product entry point.
 default-run = "mahbot-inference"

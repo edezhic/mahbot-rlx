@@ -83,13 +83,13 @@ if [[ "$NUMERICAL" -eq 1 ]]; then
     DEFAULT_CMD=(bash -c "
         set -e
         cargo test -p rlx-tpu --release --features backend-tests -- --test-threads=1 --nocapture
-        cargo test -p rlx-runtime --release --features cpu,tpu,backend-tests \
+        cargo test -p mahbot-rlx-runtime --release --features cpu,tpu,backend-tests \
             --test tpu_compile_cache -- --test-threads=1 --nocapture
-        cargo test -p rlx-runtime --release --features cpu,tpu,backend-tests \
+        cargo test -p mahbot-rlx-runtime --release --features cpu,tpu,backend-tests \
             --test tpu_real_model_parity -- --test-threads=1 --nocapture
-        cargo test -p rlx-runtime --release --features cpu,tpu,backend-tests \
+        cargo test -p mahbot-rlx-runtime --release --features cpu,tpu,backend-tests \
             --test tpu_cpu_speed -- --test-threads=1 --nocapture
-        cargo test -p rlx-runtime --release --features cpu,tpu,backend-tests \
+        cargo test -p mahbot-rlx-runtime --release --features cpu,tpu,backend-tests \
             --test cpu_perf_diag -- --test-threads=1 --nocapture
     ")
 else

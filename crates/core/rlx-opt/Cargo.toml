@@ -1,6 +1,6 @@
 [package]
-name = "rlx-opt"
-version.workspace      = true
+name = "mahbot-rlx-opt"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "RLX optimizer facade — fusion, autodiff, and compile pipelines"
@@ -9,8 +9,8 @@ license.workspace      = true
 keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-opt"
 
 [features]
 default = ["compile", "training"]
@@ -33,6 +33,7 @@ rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
 
 [lib]
+name = "rlx_opt"
 # No unit tests in this target: the empty harness was pure launch cost.
 test = false
 # No doctests in this crate: the empty stage was pure rustdoc cost.

@@ -35,7 +35,7 @@ mod tests {
     #[test]
     fn manifest_parses_and_includes_cpu() {
         let m = BackendsManifest::current();
-        assert_eq!(m.crate_name, "rlx-runtime");
+        assert_eq!(m.crate_name, env!("CARGO_PKG_NAME"));
         assert!(m.backends.iter().any(|b| b == "cpu"));
     }
 }

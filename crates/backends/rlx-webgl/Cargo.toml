@@ -26,7 +26,7 @@ rlx-fusion = { workspace = true }
 # build (and the CPU executor errors on a collective there). `default-features
 # = false` drops the platform BLAS link (collectives don't GEMM).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rlx-cpu = { path = "../rlx-cpu", version = "0.2.18", default-features = false }
+rlx-cpu = { package = "mahbot-rlx-cpu", path = "../rlx-cpu", version = "0.2.18-mahbot.1", default-features = false }
 
 # WebGL2 runtime — wasm only.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -53,7 +53,7 @@ web-sys = { version = "0.3.95", features = [
 # published AFTER rlx-webgl (tier 5). cargo strips path-only dev-deps from the
 # published manifest, so this never resolves against crates.io and needs no
 # per-release pin bump.
-rlx-runtime = { path = "../../core/rlx-runtime" }
+rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime" }
 
 # Native-only: registers the `collective.*` op extensions + CPU kernels so the
 # exec_cpu `Op::Custom` host-delegate can be tested end-to-end without a network

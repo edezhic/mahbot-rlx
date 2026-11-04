@@ -1,6 +1,6 @@
 [package]
-name = "rlx-wgpu"
-version.workspace      = true
+name = "mahbot-rlx-wgpu"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Cross-platform GPU backend for RLX via wgpu (Metal/Vulkan/DX12)"
@@ -9,8 +9,12 @@ license.workspace      = true
 keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-wgpu"
+
+[lib]
+name = "rlx_wgpu"
+
 [features]
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-wgpu --features backend-tests`.
 backend-tests = []
@@ -38,7 +42,7 @@ rlx-ir = { workspace = true }
 # Shape-keyed kernel-variant dispatch table, shared with CUDA/ROCm/Metal.
 rlx-gpu-dispatch = { workspace = true }
 rlx-unfuse = { workspace = true }
-rlx-opt = { path = "../../core/rlx-opt", version = "0.2.18", default-features = false, features = ["compile"] }
+rlx-opt = { package = "mahbot-rlx-opt", path = "../../core/rlx-opt", version = "0.2.18-mahbot.1", default-features = false, features = ["compile"] }
 rlx-compile = { workspace = true }
 rlx-cpu = { workspace = true, features = ["splat"] }
 rlx-gpu-host = { workspace = true }
@@ -70,7 +74,7 @@ naga = { version = "29", features = ["wgsl-in", "msl-out"] }
 # published last. cargo strips path-only dev-deps from the published manifest,
 # so this never resolves against crates.io and needs no per-release pin bump.
 rlx = { path = "../../rlx", default-features = false, features = ["cpu", "gpu"] }
-rlx-runtime = { path = "../../core/rlx-runtime", features = ["gpu"] }
+rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime", features = ["gpu"] }
 rlx-gguf = { workspace = true }
 rlx-ir = { workspace = true }
 half = "2"

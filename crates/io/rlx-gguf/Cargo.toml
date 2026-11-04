@@ -1,6 +1,6 @@
 [package]
-name = "rlx-gguf"
-version.workspace      = true
+name = "mahbot-rlx-gguf"
+version                = "0.2.18-mahbot.1"
 edition.workspace      = true
 rust-version.workspace = true
 description = "GGUF v1/v2/v3 parser + dequantization to f32. Standalone — no rlx-* deps unless the `ir` feature is on."
@@ -9,8 +9,12 @@ license.workspace      = true
 keywords.workspace     = true
 categories.workspace   = true
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-gguf"
+
+[lib]
+name = "rlx_gguf"
+
 [dependencies]
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }

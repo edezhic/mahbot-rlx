@@ -8,7 +8,7 @@
 #   1. `cargo test -p rlx-tpu --release --features backend-tests` — host-agnostic
 #      unit/check + (when LIBTPU_PATH is set, which it is in this image) the
 #      pjrt_roundtrip + pjrt_bench tests against the real plugin.
-#   2. `cargo test -p rlx-runtime --features cpu,tpu,backend-tests` —
+#   2. `cargo test -p mahbot-rlx-runtime --features cpu,tpu,backend-tests` —
 #      compile-cache integration test that exercises Device::Tpu
 #      through Session.
 #   3. `validate_hlo.py` — round-trips emitted HLO bytes through
@@ -29,9 +29,9 @@ cargo test -p rlx-tpu --release --features backend-tests -- --nocapture --test-t
 
 echo
 echo "═══════════════════════════════════════════════════════"
-echo "[2/3] cargo test -p rlx-runtime --features cpu,tpu,backend-tests"
+echo "[2/3] cargo test -p mahbot-rlx-runtime --features cpu,tpu,backend-tests"
 echo "═══════════════════════════════════════════════════════"
-cargo test -p rlx-runtime --release --features cpu,tpu,backend-tests \
+cargo test -p mahbot-rlx-runtime --release --features cpu,tpu,backend-tests \
     --test tpu_compile_cache -- --nocapture --test-threads=1
 
 echo
