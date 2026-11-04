@@ -163,8 +163,7 @@ exclude = [
 # `rlx-gpu-dispatch` / `rlx-gpu-host` crates and the `rlx-mlx-io` weight-layout
 # reader — none of them is a backend. A bare `cargo build` / `check` / `clippy`
 # covers these crates and no others; the whole-set gates name `--workspace`
-# explicitly (`just build`, `just lint`, the pre-commit hook's workspace branch,
-# the publish pre-flight).
+# explicitly (`just build`, `just lint`, the pre-commit hook's workspace branch).
 #
 # Trade-off, accepted knowingly: a crate added upstream lands silently OUTSIDE
 # this contour until it is listed here, and a member removed or renamed upstream

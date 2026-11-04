@@ -42,11 +42,14 @@
 #
 # Default flow:
 #
-#   1. Pre-flight: cargo fmt --all -- --check,
-#      cargo clippy --workspace --all-targets --features backend-tests -- -D warnings,
-#      cargo test --workspace --release --no-fail-fast --features backend-tests.
-#      Aborts if any fails.
-#   2. Confirm prompt (skip with --yes).
+#   1. Pre-flight over the fork's own contour — the `default-members` selection
+#      in Cargo.toml, which already includes `mahbot-inference` — and nothing
+#      else: `cargo fmt --check`, `cargo clippy --all-targets --features
+#      backend-tests -- -D warnings`, `cargo test --release --no-fail-fast
+#      --features backend-tests`, each over that selection. Aborts if any fails.
+#      The out-of-scope backends are never built, so their test suites are never
+#      run: a defect in code this fork does not ship cannot stop a release.
+#   2. Confirm prompt (skip with --yes; a run with nothing to read refuses).
 #   3. Per tier, publish each crate sequentially. After each crate:
 #        a. wait for the sparse index to report the new version
 #           (poll interval `POLL_INTERVAL`, hard cap `POLL_TIMEOUT`),
@@ -80,7 +83,7 @@
 #   scripts/publish.sh --list                       # tier order + per-crate versions
 #   scripts/publish.sh --plan                       # crates needing publish only
 #   scripts/publish.sh --no-gate                    # skip fmt/clippy/test
-#   scripts/publish.sh --yes                        # skip confirm prompt
+#   scripts/publish.sh --yes                        # confirm without a prompt (needed when stdin is closed)
 #   scripts/publish.sh --start-tier 3               # resume from tier 3
 #   scripts/publish.sh --start-crate mahbot-rlx-runtime  # resume from a crate
 #   scripts/publish.sh --min-interval 90            # settle floor inside a burst (sec)
@@ -749,14 +752,40 @@ if (( PLAN_ONLY )); then
 fi
 
 # ── Pre-flight gates ────────────────────────────────────────────
-if (( ! NO_GATE )); then
-    bold "[1/3] cargo fmt --check"
-    cargo fmt --all -- --check
+#
+# The packages a bare `cargo` invocation builds: the `default-members` selection
+# in Cargo.toml, which already includes `mahbot-inference`. Read from the
+# metadata, so the gates cannot drift from the manifest.
+contour_packages() {
+    python3 - <<'PY'
+import json, subprocess
 
-    bold "[2/3] cargo clippy --workspace --all-targets --features backend-tests -- -D warnings"
+meta = json.loads(subprocess.run(
+    ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+    capture_output=True, text=True, check=True,
+).stdout)
+selected = set(meta["workspace_default_members"])
+print("\n".join(sorted(p["name"] for p in meta["packages"] if p["id"] in selected)))
+PY
+}
+
+if (( ! NO_GATE )); then
+    # `clippy` and `test` take the contour by default; `cargo fmt` takes only an
+    # explicit package list (bare, at the workspace root, it formats every
+    # member), so the contour is passed to it by name.
+    FMT_ARGS=()
+    while IFS= read -r name; do FMT_ARGS+=(-p "$name"); done < <(contour_packages)
+    if (( ${#FMT_ARGS[@]} == 0 )); then
+        red "The fork's contour could not be read from cargo metadata."
+        exit 1
+    fi
+    bold "[1/3] cargo fmt --check (the fork's contour)"
+    cargo fmt "${FMT_ARGS[@]}" -- --check
+
+    bold "[2/3] cargo clippy --all-targets --features backend-tests -- -D warnings"
     # `backend-tests`: the default test selection is a fast smoke set;
     # a release gate wants every target.
-    cargo clippy --workspace --all-targets --features backend-tests -- -D warnings
+    cargo clippy --all-targets --features backend-tests -- -D warnings
 
     # --no-fail-fast: cargo stops at the first failing *binary* otherwise, so a
     # single early break hides every later crate's result. A release gate wants
@@ -764,8 +793,8 @@ if (( ! NO_GATE )); then
     #
     # --features backend-tests: the default test selection is a fast smoke set;
     # a release gate wants everything, so ask for the gated test targets back.
-    bold "[3/3] cargo test --workspace --release --no-fail-fast --features backend-tests"
-    cargo test --workspace --release --no-fail-fast --features backend-tests
+    bold "[3/3] cargo test --release --no-fail-fast --features backend-tests"
+    cargo test --release --no-fail-fast --features backend-tests
     green "Pre-flight gates passed."
 fi
 
@@ -804,7 +833,14 @@ fi
 echo
 
 if (( ! ASSUME_YES )); then
-    read -p "Continue? [y/N] " -n 1 -r
+    # A closed stdin is not "no terminal": a piped answer and a run driven over a
+    # remote shell both work. What cannot be answered is a stdin with nothing
+    # left to read — `read` fails there, and under `set -e` that used to end the
+    # run silently, leaving the operator believing something else happened.
+    if ! read -p "Continue? [y/N] " -n 1 -r; then
+        red "stdin is closed: nothing can answer the confirmation. Pass --yes to publish without confirming." >&2
+        exit 1
+    fi
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         red "Aborted."
