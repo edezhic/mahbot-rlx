@@ -88,16 +88,6 @@ const _: () = assert!(
     FRAME_RUNGS[FRAME_RUNGS.len() - 1]
         >= (CUT_SECONDS * RATE as usize + CUT_EARLY_HOPS * HOP_SAMPLES) / crate::graphs::MEL_HOP
 );
-/// The least spread, in dB, that the frame loudness of a chunk must have before the
-/// recognition prompt declares a language for it: the tenth to the ninetieth percentile
-/// of its 20 ms frame energies. Speech and singing vary by tens of dB over a few
-/// seconds — pauses, syllables, breaths — while a steady signal (noise, a hum, a drone)
-/// stays within a few. A steady span is still sent to the recogniser; it is only not
-/// *told* the language, so the model's own "no speech" answer stands for it, which is
-/// what keeps a hallucinated transcript off audio that holds no words.
-pub const SPEECH_SPREAD_DB: f32 = 11.0;
-/// The frame the spread is measured over: 20 ms at [`RATE`].
-const SPREAD_FRAME: usize = 320;
 /// The longest word overlap [`overlap_words`] reports: an overlap longer than a region
 /// can end with is not a seam's.
 const OVERLAP_WORDS: usize = 6;
@@ -431,29 +421,6 @@ fn rung_frames(frames: usize) -> Result<usize> {
         })
 }
 
-/// The spread of a chunk's frame loudness, in dB: the tenth to the ninetieth percentile
-/// of its [`SPREAD_FRAME`] frame energies. See [`SPEECH_SPREAD_DB`].
-fn spread_db(audio: &[f32], span: Span) -> f32 {
-    let mut levels: Vec<f32> =
-        Vec::with_capacity(span.end.saturating_sub(span.start) / SPREAD_FRAME + 1);
-    let mut at = span.start;
-    while at + SPREAD_FRAME <= span.end.min(audio.len()) {
-        let energy: f32 = audio[at..at + SPREAD_FRAME]
-            .iter()
-            .map(|v| v * v)
-            .sum::<f32>()
-            / SPREAD_FRAME as f32;
-        levels.push(10.0 * energy.max(1e-12).log10());
-        at += SPREAD_FRAME;
-    }
-    if levels.is_empty() {
-        return 0.0;
-    }
-    levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let at = |f: f64| levels[((levels.len() - 1) as f64 * f) as usize];
-    at(0.9) - at(0.1)
-}
-
 /// `audio` truncated (or zero-padded) to exactly `samples` samples — the
 /// `frames * 160` a rung's graph takes.
 fn pad_to(audio: &[f32], samples: usize) -> Vec<f32> {
@@ -712,34 +679,19 @@ impl Transcriber {
                 spans.push(span);
             }
         }
-        // Each chunk's own label, from the span it was cut out of: it decides whether the
-        // recogniser is given the language (`SPEECH_LABELS`) or left to answer with its
-        // own.
-        let mut chunk_list: Vec<Span> = Vec::new();
-        let mut chunk_labels: Vec<Option<String>> = Vec::new();
-        for span in spans {
-            let label = span_labels.get(&span).cloned().flatten();
-            for piece in cut(span, audio16) {
-                chunk_list.push(piece);
-                chunk_labels.push(label.clone());
-            }
-        }
+        let chunk_list: Vec<Span> = spans
+            .into_iter()
+            .flat_map(|span| cut(span, audio16))
+            .collect();
         let plan = tile_indexed(&chunk_list, audio16.len());
 
         // Each chunk read once, on its own prompt, and its words kept only where the guards
-        // stand behind them. The prompt's language rows come from the chunk's own tagger
-        // label and its own loudness dynamics: a speech or singing chunk that varies the way
-        // speech does is told the language, and everything else — instrumental music, a noise
-        // span the detector called speech, a drone — is left to the model, because a steady
-        // signal asked for a language answers with a generic word rather than words.
+        // stand behind them.
         let answers: Vec<Option<String>> =
-            read_pieces(&self.pair, &self.tokenizer, audio16, &chunk_list, |index| {
-                chunk_labels[index].as_deref().is_some_and(speaks_words)
-                    && spread_db(audio16, chunk_list[index]) >= SPEECH_SPREAD_DB
-            })?
-            .into_iter()
-            .map(|(_, answer)| answer)
-            .collect();
+            read_pieces(&self.pair, &self.tokenizer, audio16, &chunk_list)?
+                .into_iter()
+                .map(|(_, answer)| answer)
+                .collect();
 
         // The plan's regions, each with the answer that speaks for it: a speech
         // region takes its own chunk's transcript (the plan carries the index, so
@@ -864,8 +816,7 @@ impl Transcriber {
 /// sees more than [`CUT_SECONDS`] plus the cut's search window. It is the cut and the
 /// guards of the product's plan; what it does not have is the two front ends — the
 /// detector's speech spans, which is why the pieces divide the input rather than the
-/// speech, and the tagger's labels, which are why no piece is withheld and no language
-/// is declared.
+/// speech, and the tagger's labels, which are why no piece is withheld.
 ///
 /// A cut input's words are kept only when the guards stand behind them ([`guard`], and a
 /// walk that ran out of its own budget is not a reading either); a piece they refuse
@@ -873,10 +824,6 @@ impl Transcriber {
 /// filled with plausible-sounding ones. An input that fits one piece is read by the
 /// single pass exactly as it always was — same graphs, same text, and no guard, because a
 /// piece that short is the reading the caller has always had.
-///
-/// The prompt declares no language: that decision needs the tagger's label, which this
-/// path does not have, and a language declared over a steady signal is a confident wrong
-/// transcript. The model identifies the language itself, as it always has here.
 ///
 /// `audio` must be a whole number of mel hops: a piece is read from exactly `frames ·
 /// MEL_HOP` samples. [`listen::recognise`] truncates to whole hops before calling this.
@@ -891,9 +838,9 @@ pub(crate) fn read_whole(
     };
     let pieces = cut(whole, &audio);
     if pieces.len() == 1 {
-        return listen::Clip::once(pair, tokenizer, frames_of(audio.len()))?.run(audio, None);
+        return listen::Clip::once(pair, tokenizer, frames_of(audio.len()))?.run(audio);
     }
-    let readings = read_pieces(pair, tokenizer, &audio, &pieces, |_| false)?;
+    let readings = read_pieces(pair, tokenizer, &audio, &pieces)?;
     Ok(listen::Walk::pieces(frames_of(audio.len()), readings))
 }
 
@@ -908,15 +855,11 @@ pub(crate) fn read_whole(
 /// the plan, so the readings are put back in the chunk's own order before they are returned
 /// — a reading attached to its neighbour's region would hold the region times right and the
 /// text wrong.
-///
-/// `told` decides each chunk's prompt: `true` adds the language rows, `false` leaves the
-/// model to answer with its own language or with none.
 fn read_pieces(
     pair: &Arc<Pair>,
     tokenizer: &Tokenizer,
     audio: &[f32],
     chunks: &[Span],
-    told: impl Fn(usize) -> bool,
 ) -> Result<Vec<(listen::Walk, Option<String>)>> {
     let mut shapes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (index, chunk) in chunks.iter().enumerate() {
@@ -935,10 +878,7 @@ fn read_pieces(
             // happens, is still in the words.
             clip.set_max_new(chunk_budget(seconds));
             let walk = clip
-                .run(
-                    chunk_audio(audio, chunk, *frames),
-                    told(index).then_some(listen::ASR_LANGUAGE_IDS),
-                )
+                .run(chunk_audio(audio, chunk, *frames))
                 .with_context(|| format!("transcribing samples {}..{}", chunk.start, chunk.end))?;
             // A walk that ran out of its own budget was circling, not reading: the words it
             // did produce are not a reading of the chunk either.
@@ -1011,12 +951,8 @@ pub fn overlap_words(previous: &str, text: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// The tagger's labels that say the audio there is *speech or singing* — the two
-/// families where the recogniser is given the language in its prompt
-/// ([`listen::ASR_LANGUAGE_IDS`]) instead of being left to identify it. Every song
-/// rule's clips are here; every instrumental music class is not, because a declared
-/// language over an orchestra produces a confident, wrong transcript, which is the one
-/// thing the music pool must never see.
+/// The tagger's labels that say the audio there is *speech or singing*. With
+/// `MUSIC_LABELS` these are the classes a region may hold words in (`bears_words`).
 pub const SPEECH_LABELS: &[&str] = &[
     "Speech",
     "Male speech, man speaking",
@@ -1046,9 +982,8 @@ pub const SPEECH_LABELS: &[&str] = &[
     "Lullaby",
 ];
 
-/// The word-bearing music classes the song rule offers to the recogniser. Separated from
-/// [`SPEECH_LABELS`] because the two families are used for different decisions — a music
-/// class may hold words but never speaks them.
+/// The word-bearing music classes the song rule offers to the recogniser: a music class
+/// may hold words but never speaks them ([`bears_words`] takes both families).
 const MUSIC_LABELS: &[&str] = &[
     "Ambient music",
     "Angry music",
@@ -1094,23 +1029,15 @@ const MUSIC_LABELS: &[&str] = &[
     "Wedding music",
 ];
 
-/// Whether a tagger label says the audio there is speech or singing.
-fn speaks_words(label: &str) -> bool {
-    let name = label.trim();
-    SPEECH_LABELS
-        .iter()
-        .any(|class| name.eq_ignore_ascii_case(class))
-}
-
 /// Whether a tagger label says the audio there can hold words: a speech or singing class
 /// ([`SPEECH_LABELS`]) or one of the word-bearing music ones ([`MUSIC_LABELS`]), matched
 /// on the name the file carries.
 fn bears_words(label: &str) -> bool {
     let name = label.trim();
-    MUSIC_LABELS
+    SPEECH_LABELS
         .iter()
-        .any(|word| name.eq_ignore_ascii_case(word))
-        || speaks_words(name)
+        .chain(MUSIC_LABELS)
+        .any(|class| name.eq_ignore_ascii_case(class))
 }
 
 /// The tagger's label for a region: the windows overlapping it, weighted by how
@@ -2066,30 +1993,5 @@ mod tests {
                 "every piece a cut leaves has a rung"
             );
         }
-    }
-
-    #[test]
-    fn loudness_spread_tells_a_steady_signal_from_a_modulated_one() {
-        // A steady level is what a noise span the detector called speech looks like: no
-        // p10-to-p90 spread, so no declared language for it.
-        let steady = vec![0.1f32; SPREAD_FRAME * 200];
-        let span = Span {
-            start: 0,
-            end: steady.len(),
-        };
-        assert!(
-            spread_db(&steady, span) < SPEECH_SPREAD_DB,
-            "a constant level has no spread"
-        );
-        // Syllables: a quiet and a loud frame alternating is tens of dB.
-        let mut syllables = vec![0.0f32; SPREAD_FRAME * 200];
-        for (i, frame) in syllables.chunks_mut(SPREAD_FRAME).enumerate() {
-            let level = if i % 2 == 0 { 0.005 } else { 0.5 };
-            frame.fill(level);
-        }
-        assert!(
-            spread_db(&syllables, span) >= SPEECH_SPREAD_DB,
-            "a modulated signal spreads past the gate"
-        );
     }
 }

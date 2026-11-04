@@ -58,21 +58,11 @@ pub const ASR_HEAD_IDS: [usize; 3] = [151644, 8948, 198];
 pub const ASR_TEXT_IDS: [usize; 6] = [151645, 198, 151644, 872, 198, 151669];
 pub const ASR_TAIL_IDS: [usize; 6] = [151670, 151645, 198, 151644, 77091, 198];
 pub const ASR_EOS: usize = 151645;
-/// The three tokens a recognition answer opens with — `language English <asr_text>`,
-/// written **into the prompt** by the transcription path instead of being generated. The
-/// recogniser identifies the language itself, and on noisy speech it answers
-/// `language None` and stops, so the whole chunk comes back empty — one 26.8 s voice
-/// message did, and every one of its pieces. With the tag supplied the model transcribes
-/// the audio's own language regardless of it (a tag naming another language does not
-/// translate the answer) and the tag never reaches a transcript: everything up to
-/// [`ASR_TEXT`] is stripped. Only a chunk the tagger calls speech or singing *and* whose
-/// loudness varies the way speech does is told the language
-/// ([`crate::transcribe::SPEECH_SPREAD_DB`]); every other chunk gets the prompt the
-/// one-shot path uses, whose answer is the model's own. That boundary is what keeps a
-/// declared language from putting a confident transcript on a steady signal.
-pub const ASR_LANGUAGE_IDS: [usize; 3] = [11528, 6364, 151704];
-/// The `<asr_text>` token the transcript follows; also the marker a zero-shot answer's
-/// language tag ends with.
+/// The `<asr_text>` token a recognition answer's own language tag ends with: the
+/// recogniser writes `language <name> <asr_text>` and the transcript follows, so
+/// everything up to this marker is stripped (`Clip::run`). A `language None` answer —
+/// what unintelligible or non-speech audio gets — leaves nothing after the marker, and
+/// the chunk comes back with nothing read.
 pub const ASR_TEXT: usize = 151704;
 
 /// The ASR config's `eos_token_id` is 151645; 151643 is the vocabulary's
@@ -81,6 +71,12 @@ pub const ASR_EOS_ALSO: usize = 151643;
 
 pub fn is_asr_eos(id: usize) -> bool {
     id == ASR_EOS || id == ASR_EOS_ALSO
+}
+
+/// The prompt's length in rows for a piece of `tokens` audio rows: [`ASR_HEAD_IDS`],
+/// [`ASR_TEXT_IDS`], the piece's own rows and [`ASR_TAIL_IDS`].
+fn prompt_len(tokens: usize) -> usize {
+    ASR_HEAD_IDS.len() + ASR_TEXT_IDS.len() + tokens + ASR_TAIL_IDS.len()
 }
 
 /// The front end's three graphs for one frame count: mel, encoder and projector.
@@ -261,14 +257,13 @@ impl Front {
 /// counts it ever compiles — each compiled once, held for the chunks that need it, and
 /// dropped with the last of them ([`Clip::rung`]) instead of for the life of the process.
 struct Rung {
-    /// The pair these graphs were built over, and the pair a prefill compiled for a later
-    /// chunk of the same rung is built over too.
+    /// The pair every graph of this rung was built over.
     pair: Arc<Pair>,
     front: Front,
-    /// The prompt prefill, one per prompt length: the prompt carries three declared
-    /// language rows or not at all, and the two lengths are two graphs. A variant the
-    /// rung's chunks never ask for is never compiled.
-    prefills: Mutex<HashMap<usize, Arc<Mutex<Compiled>>>>,
+    /// The prompt prefill, compiled the first time one of the rung's chunks asks for it
+    /// and kept for the rung's life. Every chunk of a rung has the rung's own prompt
+    /// length, so a rung never holds a second one.
+    prefill: Mutex<Option<Arc<Mutex<Compiled>>>>,
     /// The decode graph: one per pair, shared by every rung of the ladder, because the
     /// capacity is one value for all of them. A step is weight-read bound, so the
     /// attention reading a few more masked rows costs a fraction of the step, and a
@@ -279,11 +274,10 @@ struct Rung {
 }
 
 /// The capacity every rung's decode graph is compiled at: the longest rung's prompt rows —
-/// 3 head + 6 text + 768/8 = 96 audio + 6 tail = 111, or 114 with the three declared language
-/// rows — plus the most tokens a chunk of the longest piece may generate
-/// ([`crate::transcribe::CHUNK_TOKENS_PER_S`] over the 7.5 s a cut can leave = 76).
-/// 190 at the worst, rounded up to the next multiple of eight. A walk that outgrows it grows
-/// its own graph, as any clip does.
+/// 3 head + 6 text + 768/8 = 96 audio + 6 tail = 111 — plus the most tokens a chunk of the
+/// longest piece may generate ([`crate::transcribe::CHUNK_TOKENS_PER_S`] over the 7.5 s a
+/// cut can leave = 76). 187 at the worst, rounded up to the next multiple of eight. A walk
+/// that outgrows it grows its own graph, as any clip does.
 const RUNG_CAPACITY: usize = 192;
 
 impl Rung {
@@ -291,22 +285,24 @@ impl Rung {
         Ok(Self {
             pair: Arc::clone(pair),
             front: Front::build(pair, frames, 1)?,
-            prefills: Mutex::new(HashMap::new()),
+            prefill: Mutex::new(None),
             decode: shared_decode(pair)?,
             tokens: graphs::asr_tokens(frames),
         })
     }
 
-    /// This rung's prefill for `prompt_rows`, compiled the first time one of the rung's
-    /// chunks asks for that length and kept for the rung's life. Built over this rung's
-    /// own pair, so every graph of one rung is one pair's.
-    fn prefill(&self, prompt_rows: usize) -> Result<Arc<Mutex<Compiled>>> {
-        let mut guard = self.prefills.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(prefill) = guard.get(&prompt_rows) {
+    /// This rung's prefill, compiled on the first ask and kept for the rung's life. Built
+    /// over this rung's own pair, so every graph of one rung is one pair's.
+    fn prefill(&self) -> Result<Arc<Mutex<Compiled>>> {
+        let mut guard = self.prefill.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(prefill) = guard.as_ref() {
             return Ok(Arc::clone(prefill));
         }
-        let prefill = Arc::new(Mutex::new(prefill_graph(&self.pair, prompt_rows)?));
-        guard.insert(prompt_rows, Arc::clone(&prefill));
+        let prefill = Arc::new(Mutex::new(prefill_graph(
+            &self.pair,
+            prompt_len(self.tokens),
+        )?));
+        *guard = Some(Arc::clone(&prefill));
         Ok(prefill)
     }
 }
@@ -774,7 +770,7 @@ pub(crate) struct Clip<'a> {
     /// prefill.
     front: Option<Front>,
     /// The rung this clip runs on, when it is a ladder chunk: the rung's front end and
-    /// prefills are the ones the clip runs, so it builds neither and leaves `front` empty.
+    /// prefill are the ones the clip runs, so it builds neither and leaves `front` empty.
     /// The clip owns the rung, so the rung's graphs go with it. A clip of its own leaves
     /// this `None`.
     shared: Option<Rung>,
@@ -786,7 +782,6 @@ pub(crate) struct Clip<'a> {
     cfg: Config,
     frames: usize,
     tokens: usize,
-    prompt_rows: usize,
     hkv: usize,
     capacity: usize,
     /// `false` for a one-shot clip: the front end goes as soon as it has run.
@@ -838,7 +833,7 @@ impl<'a> Clip<'a> {
     }
 
     /// A chunk of a **rung** of the transcription ladder: the rung is built by this call and
-    /// the clip owns it, so the front end, the prefills and their arenas are given back when
+    /// the clip owns it, so the front end, the prefill and their arenas are given back when
     /// the clip is dropped after the group's last chunk. The decode graph and the mel graph
     /// are not the rung's — the pair and the process keep those — so they outlive the drop.
     pub(crate) fn rung(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
@@ -858,7 +853,6 @@ impl<'a> Clip<'a> {
             cfg,
             frames,
             tokens,
-            prompt_rows: ASR_HEAD_IDS.len() + ASR_TEXT_IDS.len() + tokens + ASR_TAIL_IDS.len(),
             hkv,
             capacity: RUNG_CAPACITY,
             reuse_front: true,
@@ -876,7 +870,7 @@ impl<'a> Clip<'a> {
         let tokens = graphs::asr_tokens(frames);
         let cfg = pair.body.config().clone();
         let hkv = cfg.kv_heads * cfg.head_dim;
-        let prompt_rows = ASR_HEAD_IDS.len() + ASR_TEXT_IDS.len() + tokens + ASR_TAIL_IDS.len();
+        let prompt_rows = prompt_len(tokens);
         // The compiled capacity starts one bucket above the prompt and grows only as
         // the walk fills it; a capacity fixed at the token budget would make every
         // step's attention read thousands of masked rows.
@@ -892,7 +886,6 @@ impl<'a> Clip<'a> {
             cfg,
             frames,
             tokens,
-            prompt_rows,
             hkv,
             capacity,
             reuse_front,
@@ -902,15 +895,11 @@ impl<'a> Clip<'a> {
     }
 
     /// One chunk of 16 kHz mono audio: exactly `frames * graphs::MEL_HOP` samples (the
-    /// caller truncates or pads before calling). `declared` is the three language rows
-    /// written into the prompt instead of being generated, or `None` to leave the
-    /// recogniser its own answer — the prompt is three rows longer with them, and the two
-    /// lengths are two prefills.
-    pub(crate) fn run(
-        &mut self,
-        mut audio: Vec<f32>,
-        declared: Option<[usize; ASR_LANGUAGE_IDS.len()]>,
-    ) -> Result<Walk> {
+    /// caller truncates or pads before calling). The prompt declares no language: the
+    /// recogniser writes its own `language <name> <asr_text>` tag and the transcript
+    /// follows it, so the answer's language is the audio's and the tag never reaches a
+    /// transcript — everything up to [`ASR_TEXT`] is stripped.
+    pub(crate) fn run(&mut self, mut audio: Vec<f32>) -> Result<Walk> {
         let frames = self.frames;
         audio.truncate(frames * graphs::MEL_HOP);
         let cfg = self.cfg.clone();
@@ -918,7 +907,7 @@ impl<'a> Clip<'a> {
         let vocab = match cfg.head {
             Head::Separate { vocab, .. } | Head::Tied { vocab, .. } => vocab,
         };
-        let prompt_rows = self.prompt_rows + declared.map_or(0, |ids| ids.len());
+        let prompt_rows = prompt_len(self.tokens);
         let mut capacity = self.capacity;
         let mut build_ms = std::mem::take(&mut self.owed_ms);
 
@@ -958,12 +947,6 @@ impl<'a> Clip<'a> {
                 *id,
             ));
         }
-        if let Some(declared) = &declared {
-            let at = ASR_HEAD_IDS.len() + ASR_TEXT_IDS.len() + self.tokens + ASR_TAIL_IDS.len();
-            for (i, id) in declared.iter().enumerate() {
-                text_ids.push((at + i, *id));
-            }
-        }
         let picks: Vec<(usize, usize)> = text_ids.iter().map(|(_, id)| (0, *id)).collect();
         let rows = self
             .pair
@@ -991,7 +974,7 @@ impl<'a> Clip<'a> {
         let mut p = match &self.shared {
             Some(rung) => {
                 let t = report::Stopwatch::start();
-                let prefill = rung.prefill(prompt_rows)?;
+                let prefill = rung.prefill()?;
                 build_ms += t.ms();
                 prefill
                     .lock()

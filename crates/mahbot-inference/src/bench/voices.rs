@@ -389,7 +389,7 @@ fn check(
         };
         let (probe, truncated) = probe_audio(samples);
         let heard = clip
-            .run(probe, None)
+            .run(probe)
             .with_context(|| {
                 format!(
                     "the intelligibility probe `{}` for {}",
