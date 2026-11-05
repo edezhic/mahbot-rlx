@@ -9,8 +9,8 @@
 | positives (pooled) | 61/550 (11.1 %) |
 | false accepts | 2 events · 2.4773/h over VAD-active speech (0.807 h) · 1.8756/h over wall-clock audio (1.066 h) · one event = 1.2386/h |
 | derived point | floor 0.7500 · fire factor 0.3520 · static bar 1.0560 · reset 0.3344 |
-| wall clock | 700.4 s |
-| peak resident | 1.64GiB |
+| wall clock | 703.2 s |
+| peak resident | 1.16GiB |
 | peak resident (GPU) | not measured — the resident set cannot see pages allocated for the GPU |
 
 Peak resident is the resident set's high-water mark for the whole run. The resident set cannot see pages allocated for the GPU, so a resident row's GPU cell is not measured — not zero, and not the system figure repeated — and there the two do not split one pool.
@@ -51,11 +51,11 @@ Pooled over 11 voices: 104 clips each, not 1144 independent trials.
 
 Pooled over 11 voices: 50 clips each, not 550 independent utterances.
 
-_Measured 2026-11-04 02:56 UTC._
+_Measured 2026-11-04 23:34 UTC._
 - machine: arm64 · Apple M3 Pro
 - device: Apple M3 Pro (Metal)
 - profile: release
-- code: 602bd0f0 change-sha256 43562001cf4c4135 (the commit and the SHA-256 of the tree's difference from it, `STAND.md`, `TRANSCRIPTION-CORPUS.md`, `WAKE-WORD-BENCH.md`, `crates/backends/rlx-mlx-sys` left out)
+- code: 441eb601 change-sha256 de9c18543f961550 (the commit and the SHA-256 of the tree's difference from it, `STAND.md`, `TRANSCRIPTION-CORPUS.md`, `WAKE-WORD-BENCH.md`, `crates/backends/rlx-mlx-sys` left out)
 - command: cargo bench -p mahbot-inference --features bench --bench wake_word -- --report <file>
 - models: `/Users/Shared/MahBot/models`
 - corpus: `/Users/Shared/MahBot/models/corpus/real-audio`

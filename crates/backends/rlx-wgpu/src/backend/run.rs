@@ -727,6 +727,10 @@ impl WgpuExecutable {
             report.open(Phase::Compile, 0, &self.schedule);
             self.lazy_compile_for_inputs(inputs);
         }
+        // After the lazy compile, so a deferred graph's replayed weights are a load like
+        // any other; from here the run keeps the submission shape it has, and what it
+        // writes is flushed by its own submissions.
+        let _upload = crate::buffer::RunGuard::enter();
         report.open(Phase::Stage, 0, &self.schedule);
         let dev = wgpu_device().expect("rlx-wgpu: device gone");
         self.stage_gpu_handle_inputs(dev, inputs);

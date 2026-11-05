@@ -564,6 +564,9 @@ required-features = ["backend-tests"]
 [[test]]
 name = "weight_scope_skip"
 required-features = ["backend-tests"]
+[[test]]
+name = "weight_upload_bound"
+required-features = ["backend-tests"]
 
 [[test]]
 name = "wgpu_fft_q_ingraph"

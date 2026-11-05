@@ -539,12 +539,14 @@ const PEAK: &str = "Resting is taken once the cold call has returned and before 
      observed maximum, so a spike before then or between two samples is not in it, and the two \
      halves were not taken at the same instant.";
 
-/// Why the system figure at peak can sit below the one at rest.
-const SYSTEM_AT_PEAK: &str = "On a row whose pair is measured, a system figure at peak below \
-     the one at rest is legitimate: the GPU share can grow more than the total between rest and \
-     peak, and the figure is the lifetime maximum minus the highest GPU reading — a subtraction \
-     of two maxima, not a peak of anything — so a GPU spike the sampler missed makes it too \
-     large and a GPU reading taken at another instant can make it too small.";
+/// What the system figure at peak is — a derived column — and why it can sit below
+/// the one at rest.
+const SYSTEM_AT_PEAK: &str = "The system figure at peak is derived, not measured: it is the \
+     lifetime maximum of the whole figure minus the highest GPU reading, a subtraction of two \
+     maxima, and is not a peak of anything on its own. A system figure at peak below the one at \
+     rest is therefore legitimate — the GPU share can grow more than the total between rest and \
+     peak — and a GPU spike the sampler missed makes the derived figure too large, while a GPU \
+     reading taken at another instant can make it too small.";
 
 /// What the pair means here, and what the same reading would be elsewhere.
 const UNIFIED: &str = "Memory is unified on this machine, so where both halves are measured \

@@ -18,7 +18,7 @@ use rlx_opt::memory::MemoryPlan;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Process-wide reuse of weight buffers across prefill/decode compiles.
 /// Prefill + decode each used to allocate a full ~2 GiB weight copy and OOM
@@ -157,6 +157,69 @@ pub fn shared_weight_bytes() -> usize {
         .values()
         .map(SharedWeightBuffers::resident_bytes)
         .sum()
+}
+
+/// The most a load may write into device buffers before a submission is forced.
+///
+/// `queue.write_buffer` stages every write in a buffer of exactly the written size and
+/// keeps it until the next submission, so a graph whose whole weight set is written
+/// before anything is submitted holds that set twice — the device peak of a cold call
+/// is then the model's size, not what it computes with. Every write is cut into pieces
+/// this size, so the intermediate stays at roughly two pieces whatever the parameters
+/// are sized.
+pub const UPLOAD_PIECE_BYTES: usize = 128 << 20;
+
+/// Bytes written into device buffers since the last submission, over every arena and
+/// every compile: one product call opens several graphs, and their uploads reach the
+/// device as one intermediate, so a per-arena budget would let them add up again.
+static UPLOAD_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// How many runs are on the stack, over every thread. The bound is about loading: a
+/// run's own submissions flush what it writes, and one injected between its steps would
+/// split a call that has the submission shape it has — so a write made while any run is
+/// in progress is neither counted nor flushed.
+static RUN_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+/// Marks the body of a run for [`UPLOAD_PIECE_BYTES`]'s accounting.
+#[must_use = "the guard must live for the body of the run"]
+pub(crate) struct RunGuard;
+
+impl RunGuard {
+    pub(crate) fn enter() -> Self {
+        if RUN_DEPTH.fetch_add(1, Ordering::Relaxed) == 0 {
+            // The run's first submission flushes whatever a load left in flight.
+            UPLOAD_IN_FLIGHT.store(0, Ordering::Relaxed);
+        }
+        Self
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        RUN_DEPTH.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// `queue.write_buffer`, keeping the upload in flight under [`UPLOAD_PIECE_BYTES`]: a
+/// piece that would go past the bound submits what is pending first, which is what
+/// releases the staging buffers held for it. The arena's own path already cuts at 64 MiB
+/// (`write_bytes_recording`'s shard math), so its writes arrive one piece per call and
+/// cross the bound between calls; a whole-image write is cut here. A write made while a
+/// run is on the stack is left to that run's own submissions.
+fn write_upload(queue: &wgpu::Queue, dst: &wgpu::Buffer, offset: u64, data: &[u8]) {
+    for (i, piece) in data.chunks(UPLOAD_PIECE_BYTES).enumerate() {
+        if RUN_DEPTH.load(Ordering::Relaxed) == 0 {
+            let pending = UPLOAD_IN_FLIGHT.fetch_add(piece.len(), Ordering::Relaxed);
+            if pending + piece.len() > UPLOAD_PIECE_BYTES {
+                // This piece is the one that crosses the bound: submit what is pending,
+                // and count only the bytes the piece itself leaves in flight.
+                UPLOAD_IN_FLIGHT.store(piece.len(), Ordering::Relaxed);
+                crate::backend::note_device_submit();
+                queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
+            }
+        }
+        queue.write_buffer(dst, offset + (i * UPLOAD_PIECE_BYTES) as u64, piece);
+    }
 }
 
 /// Derive a scope id from a label: FNV-1a, with the low bit set so a label never
@@ -3193,7 +3256,7 @@ impl Arena {
         if packed_off.saturating_add(bytes.len()) > buf.size() as usize {
             return;
         }
-        queue.write_buffer(buf, packed_off as u64, bytes);
+        write_upload(queue, buf, packed_off as u64, bytes);
     }
 
     /// Downcast host f32 data into the f16 mirror at `off` — only when a reader
@@ -3216,7 +3279,7 @@ impl Arena {
             }
             let f16_bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(f16_data.as_ptr() as *const u8, f16_byte_len) };
-            queue.write_buffer(f16_buf, f16_off as u64, f16_bytes);
+            write_upload(queue, f16_buf, f16_off as u64, f16_bytes);
         }
     }
 
@@ -3473,7 +3536,7 @@ impl Arena {
                 break;
             }
             let (buf, local) = self.resolve_w(byte_off + off);
-            queue.write_buffer(buf, local as u64, &data[off..off + n]);
+            write_upload(queue, buf, local as u64, &data[off..off + n]);
             off += n;
         }
         if let Some(at) = record.filter(|&at| is_weight_off(at)) {
