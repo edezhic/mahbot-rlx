@@ -63,11 +63,11 @@ pub const LISTEN_MOVED_WORDS: usize = 2;
 /// returned: each region's bounds, its read flag and its transcript or label. A
 /// witness, not a gate: the row prints the two side by side.
 pub const STAND_RECOGNITION_SHORT_SHA256: &str =
-    "9f86db8f384e0534b912fd5ccdea9fca7e98b43faadf61ad53cd44be5afa33f3";
+    "ddb855ce801c62184f7bdbee892b89ca60ebb1d08b4569d89fc302f720039ce3";
 pub const STAND_RECOGNITION_TYPICAL_SHA256: &str =
-    "d85b1f85aa309a811ba6a7d7654ef5793c49e7b7166a1ce187a8ed743a98ef28";
+    "6ed1d9df14dab90f1270019200fa8dc2fedb14f08152beb46ae14cc81dba87b4";
 pub const STAND_RECOGNITION_LONG_SHA256: &str =
-    "9a306f23337517fc774856f9350b3f115b0252cae9a8c3eab39a56503fdcf9ce";
+    "34cc9d8329eeb0600be7d65612b158a631f7ef0d8055d11118f77a10fe8fcae2";
 
 /// The stand's two synthesis rows at their draw seed: `digest(&waveform)` and
 /// the waveform's length. A witness, not a gate.
