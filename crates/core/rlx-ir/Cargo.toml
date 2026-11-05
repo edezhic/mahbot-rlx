@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-ir"
-version                = "0.2.18-mahbot.1"
+version                = "0.2.18-mahbot.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Tensor IR for the RLX ML compiler — standalone, serializable, optimizable"

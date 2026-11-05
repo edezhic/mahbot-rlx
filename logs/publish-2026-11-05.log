@@ -1,0 +1,93 @@
+[33m  mahbot-rlx-runtime: optional rlx-cuda resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-egpu resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-fpga resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-hwprofile resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-mlx resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-oneapi resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-optim resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-qnn resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-rocm resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-tpu resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-vulkan resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-xdna resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-coreml resolves the upstream family when enabled[0m
+[33m  mahbot-rlx-runtime: optional rlx-metal resolves the upstream family when enabled[0m
+[1mPublish order (fork packages, version 0.2.18-mahbot.2):[0m
+  tier 0:
+    - mahbot-rlx-ir@0.2.18-mahbot.2
+    - mahbot-rlxsl@0.2.18-mahbot.2
+    - mahbot-rlx-gguf@0.2.18-mahbot.2
+    - mahbot-rlx-torch-ckpt@0.2.18-mahbot.2
+    - mahbot-rlx-nemo@0.2.18-mahbot.2
+    - mahbot-rlx-gpu-dispatch@0.2.18-mahbot.2
+    - mahbot-rlx-macros@0.2.18-mahbot.2
+    - mahbot-rlx-dduf@0.2.18-mahbot.2
+  tier 1:
+    - mahbot-rlx-unfuse@0.2.18-mahbot.2
+    - mahbot-rlx-flow@0.2.18-mahbot.2
+    - mahbot-rlx-fusion@0.2.18-mahbot.2
+    - mahbot-rlx-driver@0.2.18-mahbot.2
+    - mahbot-rlx-mlx-io@0.2.18-mahbot.2
+  tier 2:
+    - mahbot-rlx-autodiff@0.2.18-mahbot.2
+    - mahbot-rlx-pkg@0.2.18-mahbot.2
+  tier 3:
+    - mahbot-rlx-compile@0.2.18-mahbot.2
+  tier 4:
+    - mahbot-rlx-opt@0.2.18-mahbot.2
+  tier 5:
+    - mahbot-rlx-cpu@0.2.18-mahbot.2
+    - mahbot-rlx-gpu-host@0.2.18-mahbot.2
+    - mahbot-rlx-wgpu@0.2.18-mahbot.2
+  tier 6:
+    - mahbot-rlx-runtime@0.2.18-mahbot.2
+  tier 7:
+    - mahbot-inference@0.2.18-mahbot.2
+
+  Nothing else in this workspace is published from here.
+
+[1mCrates needing publish (22):[0m
+  - mahbot-rlx-ir@0.2.18-mahbot.2
+  - mahbot-rlxsl@0.2.18-mahbot.2
+  - mahbot-rlx-gguf@0.2.18-mahbot.2
+  - mahbot-rlx-torch-ckpt@0.2.18-mahbot.2
+  - mahbot-rlx-nemo@0.2.18-mahbot.2
+  - mahbot-rlx-gpu-dispatch@0.2.18-mahbot.2
+  - mahbot-rlx-macros@0.2.18-mahbot.2
+  - mahbot-rlx-dduf@0.2.18-mahbot.2
+  - mahbot-rlx-unfuse@0.2.18-mahbot.2
+  - mahbot-rlx-flow@0.2.18-mahbot.2
+  - mahbot-rlx-fusion@0.2.18-mahbot.2
+  - mahbot-rlx-driver@0.2.18-mahbot.2
+  - mahbot-rlx-mlx-io@0.2.18-mahbot.2
+  - mahbot-rlx-autodiff@0.2.18-mahbot.2
+  - mahbot-rlx-pkg@0.2.18-mahbot.2
+  - mahbot-rlx-compile@0.2.18-mahbot.2
+  - mahbot-rlx-opt@0.2.18-mahbot.2
+  - mahbot-rlx-cpu@0.2.18-mahbot.2
+  - mahbot-rlx-gpu-host@0.2.18-mahbot.2
+  - mahbot-rlx-wgpu@0.2.18-mahbot.2
+  - mahbot-rlx-runtime@0.2.18-mahbot.2
+  - mahbot-inference@0.2.18-mahbot.2
+
+[33mMode: REAL PUBLISH — uploads to crates.io.[0m
+[33mRate-limit floor:      65s between publishes.[0m
+[33mBetween-tier extra:    90s after each tier.[0m
+[33mIndex polling:         every 10s, hard cap 600s per crate.[0m
+[33mRegistry retries:        auto-wait + retry until success (unlimited).[0m
+[33mRetry-after parsing:     HTTP-date + status-specific backoff (+15s pad).[0m
+[33mAlready on crates.io:    skip when local version matches index.[0m
+[33mCARGO_REGISTRY_TOKEN not set — relying on `cargo login` credentials.[0m
+
+[1m── Tier 0 ────────────────────────────────────────[0m
+[1m>> cargo publish --package mahbot-rlx-ir[0m
+    Updating crates.io index
+error: 2 files in the working directory contain changes that were not yet committed into git:
+
+Cargo.toml
+crates/core/rlx-ir/Cargo.toml
+
+to proceed despite this and include the uncommitted changes, pass the `--allow-dirty` flag
+[31m  last cargo log: /var/folders/b2/p_kp3s71371bcwv6mwmy8frh0000gn/T/tmp.dnXri8o5T0[0m
+[31mPublish failed for mahbot-rlx-ir (non-retryable, exit 1).[0m
+[31mRe-run with --start-crate mahbot-rlx-ir (or a later one) to resume.[0m

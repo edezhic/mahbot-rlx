@@ -13,7 +13,7 @@
 
 [package]
 name = "mahbot-inference"
-version                = "0.2.18-mahbot.1"
+version                = "0.2.18-mahbot.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "MahBot inference: ear, recognition, synthesis and transcription, end to end, on our own models."

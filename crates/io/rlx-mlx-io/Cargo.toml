@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-mlx-io"
-version                = "0.2.18-mahbot.1"
+version                = "0.2.18-mahbot.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "RLX — load MLX weight layouts (mlx-community safetensors dirs, .npz/.npy) including affine / mxfp dequant."

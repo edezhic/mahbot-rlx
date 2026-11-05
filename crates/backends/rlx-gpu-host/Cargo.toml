@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-gpu-host"
-version                = "0.2.18-mahbot.1"
+version                = "0.2.18-mahbot.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Backend-agnostic host-fallback kernels (D2H → CPU → H2D) shared by RLX GPU backends (rlx-cuda / rlx-rocm)."

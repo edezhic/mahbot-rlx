@@ -183,7 +183,7 @@ SCOPE=(
 # The fork version every crate in `SCOPE` carries. A prerelease on purpose: a
 # version differing from upstream's only in build metadata is rejected by the
 # registry.
-FORK_VERSION="0.2.18-mahbot.1"
+FORK_VERSION="0.2.18-mahbot.2"
 
 # Tier definitions. Each array entry is a single tier; space-separated crate
 # names within. Order within a tier matters when one member depends on another

@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-opt"
-version                = "0.2.18-mahbot.1"
+version                = "0.2.18-mahbot.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "RLX optimizer facade — fusion, autodiff, and compile pipelines"

@@ -2858,7 +2858,7 @@ checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
 name = "mahbot-inference"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "anyhow",
  "earshot",
@@ -2875,7 +2875,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-autodiff"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "half",
  "mahbot-rlx-fusion",
@@ -2886,7 +2886,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-compile"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "mahbot-rlx-autodiff",
  "mahbot-rlx-fusion",
@@ -2895,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-cpu"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "criterion",
  "gemm",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-dduf"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2927,7 +2927,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-driver"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "half",
  "iroh",
@@ -2939,7 +2939,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-flow"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "anyhow",
  "half",
@@ -2955,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-fusion"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "mahbot-rlx-cpu",
  "mahbot-rlx-ir",
@@ -2964,7 +2964,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-gguf"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2978,11 +2978,11 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-gpu-dispatch"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 
 [[package]]
 name = "mahbot-rlx-gpu-host"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "bytemuck",
  "half",
@@ -2995,7 +2995,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-ir"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "aes 0.9.3",
  "bincode",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-macros"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3015,7 +3015,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-mlx-io"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "anyhow",
  "half",
@@ -3033,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-nemo"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "anyhow",
  "mahbot-rlx-ir",
@@ -3044,7 +3044,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-opt"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "mahbot-rlx-autodiff",
  "mahbot-rlx-compile",
@@ -3054,7 +3054,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-pkg"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3082,7 +3082,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-runtime"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "anyhow",
  "half",
@@ -3131,7 +3131,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-torch-ckpt"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "anyhow",
  "flate2",
@@ -3141,14 +3141,14 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-unfuse"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "mahbot-rlx-ir",
 ]
 
 [[package]]
 name = "mahbot-rlx-wgpu"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "bytemuck",
  "half",
@@ -3172,7 +3172,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlxsl"
-version = "0.2.18-mahbot.1"
+version = "0.2.18-mahbot.2"
 dependencies = [
  "libm",
  "mahbot-rlx-ir",

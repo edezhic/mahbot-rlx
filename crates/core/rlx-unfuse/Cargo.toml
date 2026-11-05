@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-unfuse"
-version                = "0.2.18-mahbot.1"
+version                = "0.2.18-mahbot.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Shared IR-level unfusion/decompose pass for the GPU-family backends (CUDA/ROCm/wgpu), parameterized by a per-backend DecomposePolicy."

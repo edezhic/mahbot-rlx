@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-torch-ckpt"
-version                = "0.2.18-mahbot.1"
+version                = "0.2.18-mahbot.2"
 edition.workspace      = true
 rust-version.workspace = true
 description = "RLX — native reader for PyTorch `torch.save` checkpoints (.pt / .pth / pytorch_model.bin): ZIP index + pickle + dtype decode, no libtorch."
