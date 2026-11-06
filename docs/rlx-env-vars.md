@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 669  
+**Registered names:** 670  
 **Unregistered mentions (migration leftovers):** 102
 
 ## Groups
@@ -38,7 +38,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [rocm](#rocm) — 31
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
-- [wgpu](#wgpu) — 101
+- [wgpu](#wgpu) — 102
 - [xdna](#xdna) — 11
 
 ## compile
@@ -747,6 +747,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_FORCE_INPUT_UPLOAD` | Bisect | Bool | Backend(wgpu) | Re-upload graph inputs every run instead of reusing device copies |
 | `RLX_WGPU_GATHER_SPLIT` | Internal | Bool | Backend(wgpu) | Split Gather into per-slice dispatches |
 | `RLX_WGPU_GDN_HOST` | Public | Bool | Backend(wgpu) | Force GatedDeltaNet host fallback on wgpu (skip WGSL) |
+| `RLX_WGPU_GEMM_COOP_DISABLE` | Bisect | Bool | Backend(wgpu) | Bisect lever: puts every multi-row packed (`Op::DequantMatMul`) multiply back on the row-grouped tile instead of the cooperative-matrix tile, which is the route those shapes had before that arm existed |
 | `RLX_WGPU_GEMV_ILP` | Bisect | Bool | Backend(wgpu) | One-row packed GEMV: the subgroup arm's ILP entry (WIDE_ILP columns a subgroup, an independent accumulator each) instead of one column a subgroup; 0 re-takes that form's saving |
 | `RLX_WGPU_GEMV_IN_PLACE` | Bisect | Bool | Backend(wgpu) | One-row packed GEMV output: store the row straight into the arena slot instead of a pooled slab plus a copy dispatch (0 restores the slab, which is how the saving is re-taken) |
 | `RLX_WGPU_GEMV_POOL` | Bisect | Bool | Backend(wgpu) | Reuse a one-row packed multiply's uniform buffer and bind group across frames instead of creating, writing and grouping them every dispatch; 0 rebuilds them each time |

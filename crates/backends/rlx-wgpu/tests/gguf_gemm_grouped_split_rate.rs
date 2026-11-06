@@ -122,8 +122,8 @@
 
 mod common;
 
+use rlx_ir::DType;
 use rlx_ir::quant::QuantScheme;
-use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{CompiledGraph, Device, Session};
 use rlx_wgpu::gguf_gpu::{
     DequantMatmulRoutes, gguf_row_bytes, grouped_base_geometry, grouped_chunk_geometry,
@@ -283,31 +283,6 @@ static CELLS: [Cell; 15] = [
 const ROUNDS: usize = 5;
 const CALLS_PER_ROUND: usize = 3;
 
-/// The cell's graph: [`STEPS`] grouped multiplies, each over its own parameter and
-/// all of them over one input matrix.
-fn cell_graph(cell: &Cell, packed_bytes: usize) -> Graph {
-    let mut g = Graph::new("wgpu_gguf_gemm_grouped_split_rate");
-    let x = g.input("x", Shape::new(&[cell.m, cell.k], DType::F32));
-    let mut outs = Vec::with_capacity(STEPS);
-    for s in 0..STEPS {
-        let w = g.param(format!("w{s}"), Shape::new(&[packed_bytes], DType::U8));
-        outs.push(g.add_node(
-            Op::DequantMatMul {
-                scheme: cell.scheme,
-            },
-            vec![x, w],
-            Shape::new(&[cell.m, cell.n], DType::F32),
-        ));
-    }
-    g.set_outputs(outs);
-    g
-}
-
-/// One call's steps share this matrix — see the module doc.
-fn input_matrix(m: usize, k: usize) -> Vec<f32> {
-    common::ramp(m, k, 0.017)
-}
-
 /// One cell built, warmed, censused and asserted — held alive for the whole run
 /// rather than built and dropped on its own, so the rounds can interleave it with
 /// every other cell (the module doc's "Interleaving, and the aggregate
@@ -396,11 +371,19 @@ fn build(cell: &'static Cell, dev: &rlx_wgpu::device::WgpuDevice) -> Option<Read
         cell.label
     );
 
-    let mut compiled = Session::new(Device::Gpu).compile(cell_graph(cell, packed.len()));
+    let mut compiled = Session::new(Device::Gpu).compile(common::rate_cell_graph(
+        "wgpu_gguf_gemm_grouped_split_rate",
+        cell.scheme,
+        cell.m,
+        cell.k,
+        cell.n,
+        packed.len(),
+        STEPS,
+    ));
     for s in 0..STEPS {
         compiled.set_param_typed(&format!("w{s}"), &packed, DType::U8);
     }
-    let x = input_matrix(cell.m, cell.k);
+    let x = common::rate_input_matrix(cell.m, cell.k);
 
     let warm = compiled.run(&[("x", &x)]);
     assert_eq!(warm.len(), STEPS, "{}: one output per step", cell.label);
@@ -470,7 +453,7 @@ fn report(r: &Ready) {
     let (x_groups, y_groups, split) = r.grid;
     let (base_x, base_y) = r.base_grid;
     let per_call_ms = &r.per_call_ms;
-    let min_ms = per_call_ms.iter().cloned().fold(f64::MAX, f64::min);
+    let min_ms = common::least(per_call_ms);
     let med_ms = common::median(per_call_ms);
     let max_ms = per_call_ms.iter().cloned().fold(0.0f64, f64::max);
     // The rates: the tensor read once (`at_the_weight`) and every row group
@@ -532,6 +515,12 @@ fn gguf_grouped_split_rate_at_the_body_shapes() {
         return;
     }
     common::refuse_under_run_report();
+    // This file measures the *row-grouped* geometry, and every one of its cells is
+    // a shape the cooperative tile would take instead: the pin is what keeps each
+    // printed figure work that geometry did. The cooperative tile's own rate is
+    // `gguf_gemm_prefill_rate.rs`'s, over the product's row counts.
+    let _grouped_only =
+        rlx_ir::env::RuntimeOverrides::install(Some(("RLX_WGPU_GEMM_COOP_DISABLE", "1")));
     let Some(dev) = wgpu_device() else {
         eprintln!("skip: wgpu unavailable");
         return;

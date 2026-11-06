@@ -66,7 +66,8 @@
 //! two rows the decomposed attention and the grouped multiply — and it is four
 //! orders of magnitude below the effect a visible future candidate has. And the pass
 //! has one form per row count on this adapter: the packed multiply takes the
-//! row-grouped f32 GEMM at every multi-row count (`grouped:169` at 2..9 rows) and
+//! row-grouped f32 GEMM at every multi-row count this file runs (`grouped:169` at
+//! 2..9 rows — the cooperative-matrix tile it also has needs 22 rows or more) and
 //! the per-row kernel at one (`per_row:169`), and the tree's only cooperative
 //! attention arrangement starts at 2 048 query rows, so this shape has no
 //! capability-gated second number. Bytes per accepted token is computed from the
@@ -417,7 +418,7 @@ struct Pass {
     max_ms: f64,
     submits: (u64, u64),
     kinds: String,
-    routes: (u64, u64, u64, u64, u64),
+    routes: (u64, u64, u64, u64, u64, u64),
     finite: bool,
     readback: usize,
     /// Row moves the step's feeds carry, `rows · 2 · layers` of them.
@@ -506,7 +507,7 @@ fn pass_cost(pair: &Pair, capacity: usize, rows: usize) -> Result<Pass, String> 
         max_ms: support::greatest(&warm),
         submits: (c.0 - c0.0, c.1 - c0.1),
         kinds,
-        routes: (r.grouped, r.per_row, r.q1_0_gemm, r.scratch, r.host),
+        routes: (r.grouped, r.coop, r.per_row, r.q1_0_gemm, r.scratch, r.host),
         finite,
         readback,
         feeds: rows * graphs::plane_feed_moves(cfg.layers),
@@ -632,7 +633,7 @@ fn decide(pair: &Pair, answer: &support::Answer, curves: &[Curve]) {
                 println!(
                     "census pass rows={} build_ms={:.1} feeds={} feed_calls={} cold_ms={:.3} \
                      warm_ms={:.3} min_ms={:.3} max_ms={:.3} submits={}/{} readback={} finite={} \
-                     routes=grouped:{} per_row:{} q1_0:{} scratch:{} host:{} kinds={}",
+                     routes=grouped:{} coop:{} per_row:{} q1_0:{} scratch:{} host:{} kinds={}",
                     p.rows,
                     p.build_ms,
                     p.feeds,
@@ -650,6 +651,7 @@ fn decide(pair: &Pair, answer: &support::Answer, curves: &[Curve]) {
                     p.routes.2,
                     p.routes.3,
                     p.routes.4,
+                    p.routes.5,
                     p.kinds,
                 );
                 assert!(p.finite, "rows={} wrote a non-finite logit", p.rows);
@@ -762,8 +764,8 @@ fn decide(pair: &Pair, answer: &support::Answer, curves: &[Curve]) {
             Ok(p) => {
                 println!(
                     "census pass diagnostic rows={rows} capacity={short} warm_ms={:.3} \
-                     routes=grouped:{} per_row:{} kinds={}",
-                    p.warm_ms, p.routes.0, p.routes.1, p.kinds
+                     routes=grouped:{} coop:{} per_row:{} kinds={}",
+                    p.warm_ms, p.routes.0, p.routes.1, p.routes.2, p.kinds
                 );
                 tiny[rows] = p.warm_ms;
             }

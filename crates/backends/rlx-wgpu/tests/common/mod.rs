@@ -7,8 +7,8 @@
 //! with the two timing loops ([`time_rounds`], one cell alone, and
 //! [`time_round_robin`], round-robin across a cell set) that the harnesses using
 //! them — `gguf_one_row_stream_rate`, `gguf_gemm_grouped_weight_reuse`,
-//! `gguf_gemm_grouped_split_rate` and `gguf_gemm_grouped_loop_rate` — time their
-//! calls with, plus the parity
+//! `gguf_gemm_grouped_split_rate`, `gguf_gemm_grouped_loop_rate` and
+//! `gguf_gemm_prefill_rate` — time their calls with, plus the parity
 //! helpers, the conv-transpose-2d route levers together with the pair bound its
 //! pins derive their bar from and the six real decoder geometries those pins and
 //! the route harness both read, the bounded child re-exec harness ([`rerun_self`])
@@ -24,6 +24,8 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use rlx_ir::quant::QuantScheme;
+use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_wgpu::backend::ATTENTION_DECOMPOSE_MIN_Q;
 use rlx_wgpu::kernels::AttentionRoutes;
 
@@ -49,6 +51,46 @@ pub fn data(n: usize, step: f32, cos: bool) -> Vec<f32> {
 /// at these shapes: a max-abs, never a relative error, so a diffuse softmax leaving
 /// the output small cannot loosen it.
 pub const ATTENTION_BAR: f32 = 1e-6;
+
+/// The bar the cooperative-matrix packed GEMM tile is held to against the CPU
+/// reference. Its operands are f16 — the activations are downcast as they land in
+/// the workgroup stage and the packed weight is decoded to f16 — so it computes
+/// the f32 product with both operands rounded to an 11-bit mantissa.
+/// `matmul_f16_f32acc_parity` decomposes exactly that error for the tree's other
+/// f16-operand kernel and holds the total against the true f32 product to
+/// `TOTAL_BAR` = 5e-2; this is the same absolute bar, paired with
+/// [`COOP_REL_BAR`], and every cell prints the band it was actually measured at.
+pub const COOP_BAR: f32 = 5e-2;
+/// ...and the relative floor it is also held to, which is the one that binds on a
+/// cell whose output is not of order one. f16 operand rounding is a *relative*
+/// effect, so an absolute bar alone would call a correct result wrong at a
+/// magnitude the cell itself prints: measured over the cooperative cells the
+/// relative error lands at 3e-4 .. 1.2e-3, so this is 4x the worst reading.
+pub const COOP_REL_BAR: f32 = 5e-3;
+/// The bar a packed multiply that did **not** take the cooperative tile is held to:
+/// what every route in this crate used before that tile existed.
+pub const PACKED_BAR: f32 = 1e-2;
+
+/// The scale a bar is stated against: the largest magnitude in `reference`.
+pub fn magnitude(v: &[f32]) -> f32 {
+    v.iter().fold(0.0f32, |a, x| a.max(x.abs()))
+}
+
+/// [`COOP_BAR`] floored by [`COOP_REL_BAR`] at a cell's own output scale.
+pub fn coop_bar_at(reference_scale: f32) -> f32 {
+    COOP_BAR.max(reference_scale * COOP_REL_BAR)
+}
+
+/// The bar a packed-multiply cell is held to, from the census of what ran: the
+/// cooperative tile's two bars at `reference_scale` where that tile served the call,
+/// [`PACKED_BAR`] on every other route.
+pub fn packed_bar_at(took_coop: bool, reference_scale: f32) -> f32 {
+    if took_coop {
+        coop_bar_at(reference_scale)
+    } else {
+        PACKED_BAR
+    }
+}
 
 /// The wgpu adapter this process runs on, for the figures that are the band
 /// module's own: the workgroup width it is built with and the storage its key
@@ -89,6 +131,45 @@ pub fn band_key_block(head_dim: u32) -> usize {
         dev.device.limits().max_compute_workgroup_storage_size,
         rlx_wgpu::kernels::attention_band_threads(&dev.device),
     ) as usize
+}
+
+/// `v`'s smallest figure, for the rate harnesses' "best of" readings.
+pub fn least(v: &[f64]) -> f64 {
+    v.iter().cloned().fold(f64::MAX, f64::min)
+}
+
+/// One rate harness's cell graph: `steps` identical packed multiplies over one
+/// input matrix, each over its own parameter — the shape a prefill's own graph
+/// runs them in rather than `steps` submissions of one, which is what makes a
+/// call's steps ride one batch join.
+pub fn rate_cell_graph(
+    name: &str,
+    scheme: QuantScheme,
+    m: usize,
+    k: usize,
+    n: usize,
+    packed_bytes: usize,
+    steps: usize,
+) -> Graph {
+    let mut g = Graph::new(name);
+    let x = g.input("x", Shape::new(&[m, k], DType::F32));
+    let mut outs = Vec::with_capacity(steps);
+    for s in 0..steps {
+        let w = g.param(format!("w{s}"), Shape::new(&[packed_bytes], DType::U8));
+        outs.push(g.add_node(
+            Op::DequantMatMul { scheme },
+            vec![x, w],
+            Shape::new(&[m, n], DType::F32),
+        ));
+    }
+    g.set_outputs(outs);
+    g
+}
+
+/// The matrix every step of one rate call reads, at the ramp rate those harnesses
+/// share.
+pub fn rate_input_matrix(m: usize, k: usize) -> Vec<f32> {
+    ramp(m, k, 0.017)
 }
 
 /// `v`'s median: the element at `len / 2` of a sorted **copy**, so an even-length
@@ -384,7 +465,7 @@ pub fn refuse_under_run_report() {
 /// once for every harness here that re-execs a child (`run_report.rs`,
 /// `hosted_audio_step_placement.rs`); `buffer_copy_batch_join.rs` guards the same
 /// routing set with an assertion instead of clearing it.
-pub const CLEARED_SWITCHES: [&str; 39] = [
+pub const CLEARED_SWITCHES: [&str; 40] = [
     "RLX_WGPU_SNAPSHOT",
     "RLX_BENCH_DISPATCH_ONLY",
     "RLX_WGPU_ALL_PARAMS_WEIGHT",
@@ -405,6 +486,7 @@ pub const CLEARED_SWITCHES: [&str; 39] = [
     "RLX_WGPU_MAX_BIND_MB",
     Q1_0_BISECT,
     Q8_0_BISECT,
+    "RLX_WGPU_GEMM_COOP_DISABLE",
     "RLX_WGPU_Q8_0_BLOCK_WORDS",
     "RLX_WGPU_GEMV_WIDE",
     "RLX_WGPU_GEMV_IN_PLACE",

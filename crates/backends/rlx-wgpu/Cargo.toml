@@ -68,7 +68,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-# MSL/HLSL inspection for `examples/dump_msl.rs` — see that file. Dev-only.
+# WGSL parsing for `examples/dump_msl.rs` (MSL/HLSL inspection — see that file) and
+# for the in-lib shader gates that validate a source before a device sees it, e.g.
+# `gguf_gpu.rs`'s `coop_shader_validates_and_pins_the_geometry`. Dev-only.
 naga = { version = "29", features = ["wgsl-in", "msl-out"] }
 # Path-only (no version): test-only cycle on the umbrella crate, which is
 # published last. cargo strips path-only dev-deps from the published manifest,
@@ -379,6 +381,10 @@ required-features = ["backend-tests"]
 
 [[test]]
 name = "gguf_gemm_parked_weight"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_gemm_prefill_rate"
 required-features = ["backend-tests"]
 
 [[test]]

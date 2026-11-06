@@ -16,10 +16,16 @@
 //! column, the lane partials combined by `subgroupAdd`), which is the default:
 //! `RLX_WGPU_GEMV_WIDE=0`, or `=shared`, restores the tiled arm, and the shader
 //! header carries what the two measured; Q1_0 keeps the original one-thread-per-column
-//! arm on the scalar X view. For `m > 1` Q4_K / Q6_K / Q8_0 use the row-grouped GEMM
-//! (`encode_dequant_matmul_gguf_gemm_grouped`): one pass over each packed
-//! weight tile per group of 8 rows, instead of the per-row GEMV's one full pass
-//! over the weight per row. Its `k` gate is the scheme's own packing block
+//! arm on the scalar X view. For `m > 1` Q4_K / Q6_K / Q8_0 use a fused tiled GEMM
+//! in one of two forms, both encoded by `encode_dequant_matmul_gguf_gemm_tiled`:
+//! the **cooperative** tile (`dequant_gemm_coop_gguf.wgsl`) — the packed weight
+//! decoded into a workgroup f16 stage and multiplied by the hardware matrix units
+//! with an f32 accumulator, 32-row tiles — and, as the portable fallback and for
+//! every shape the cooperative tile refuses, the **row-grouped** one: one pass over
+//! each packed weight tile per group of 8 rows, instead of the per-row GEMV's one full pass
+//! over the weight per row. Which tile a call takes is [`coop_gemm_admits`]'s
+//! answer, and `RLX_WGPU_GEMM_COOP_DISABLE=1` stands the cooperative one down.
+//! The grouped tile's `k` gate is the scheme's own packing block
 //! ([`grouped_k_ok`]): the K-quants' block is the staged tile itself, while Q8_0's
 //! 32-element one lets a row end inside a tile — the `dequant_gemm_q8_0` entry
 //! point's staged-tile loop stops at the last whole block of such a row and stages
@@ -301,11 +307,14 @@ pub enum DequantMatmulPath {
     /// ([`encode_dequant_matmul_gguf_into`]) instead of letting the call submit
     /// on its own. Its schemes are [`gemv_tiled_supports_scheme`]'s.
     OneRowDevice,
-    /// The row-grouped GEMM at `m > 1` — the multi-row half of
+    /// The fused multi-row GEMM at `m > 1` — the multi-row half of
     /// [`Self::OneRowDevice`]'s route for the K-quants, and Q8_0's own
     /// multi-row arm, both encoded the same way
     /// ([`encode_dequant_matmul_gguf_into`]) instead of letting the call submit on
-    /// its own. For the tiled schemes the `k` gate is inherited from the `fused`
+    /// its own. Which of the two tiles serves it — the cooperative one or the
+    /// row-grouped one — is [`coop_gemm_admits`]'s answer, taken by the encoder
+    /// because it needs the device; this ladder is device-free, so its answer names
+    /// the arm and not the tile. For the tiled schemes the `k` gate is inherited from the `fused`
     /// term of [`select_path`], which for them *is* their own packing block — so an
     /// admitted call cannot fall to the per-row loop, whose tiled arm floors `k` to
     /// whole blocks. For Q8_0, whose own 32-element block is one of the eight the
@@ -443,6 +452,12 @@ pub(crate) enum DequantMatmulRoute {
     /// chunk the Q4_K entry point splits reads each block's 16-byte header twice,
     /// its quant bytes still once.
     Grouped,
+    /// Fused GEMM through the hardware matrix units: the packed weight is decoded
+    /// into a workgroup f16 stage and multiplied by a cooperative MMA with an f32
+    /// accumulator (`dequant_gemm_coop_gguf.wgsl`). Same shape of weight traffic
+    /// as [`Self::Grouped`] — one pass per 32-row tile — with the arithmetic on
+    /// the matrix units instead of f32 scalars.
+    Coop,
     /// One fused GEMV dispatch per output row (decode `m == 1`, or a fallback).
     PerRow,
     /// Tiled Q1_0 GEMM (one-bit scheme, `m > 1`).
@@ -457,6 +472,7 @@ pub(crate) enum DequantMatmulRoute {
 #[derive(Debug, Clone, Copy)]
 pub struct DequantMatmulRoutes {
     pub grouped: u64,
+    pub coop: u64,
     pub per_row: u64,
     pub q1_0_gemm: u64,
     pub scratch: u64,
@@ -468,6 +484,7 @@ pub struct DequantMatmulRoutes {
 /// name its counter — forgetting one is a compile error, not an index past the
 /// last element.
 static ROUTE_GROUPED: AtomicU64 = AtomicU64::new(0);
+static ROUTE_COOP: AtomicU64 = AtomicU64::new(0);
 static ROUTE_PER_ROW: AtomicU64 = AtomicU64::new(0);
 static ROUTE_Q1_0_GEMM: AtomicU64 = AtomicU64::new(0);
 static ROUTE_SCRATCH: AtomicU64 = AtomicU64::new(0);
@@ -476,8 +493,9 @@ static ROUTE_HOST: AtomicU64 = AtomicU64::new(0);
 impl DequantMatmulRoute {
     /// Every variant, for the union below and for [`reset_route_counts`] — the one
     /// list the compiler does not check (`counter`/`defers_host_read` are exhaustive).
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Grouped,
+        Self::Coop,
         Self::PerRow,
         Self::Q1_0Gemm,
         Self::Scratch,
@@ -487,6 +505,7 @@ impl DequantMatmulRoute {
     fn counter(self) -> &'static AtomicU64 {
         match self {
             DequantMatmulRoute::Grouped => &ROUTE_GROUPED,
+            DequantMatmulRoute::Coop => &ROUTE_COOP,
             DequantMatmulRoute::PerRow => &ROUTE_PER_ROW,
             DequantMatmulRoute::Q1_0Gemm => &ROUTE_Q1_0_GEMM,
             DequantMatmulRoute::Scratch => &ROUTE_SCRATCH,
@@ -499,6 +518,7 @@ impl DequantMatmulRoute {
         match self {
             // Device-resident: the operand is read inside the route's own step.
             DequantMatmulRoute::Grouped
+            | DequantMatmulRoute::Coop
             | DequantMatmulRoute::PerRow
             | DequantMatmulRoute::Q1_0Gemm
             | DequantMatmulRoute::Scratch => false,
@@ -534,6 +554,7 @@ pub fn route_counts() -> DequantMatmulRoutes {
     let n = |r: DequantMatmulRoute| r.counter().load(Ordering::Relaxed);
     DequantMatmulRoutes {
         grouped: n(DequantMatmulRoute::Grouped),
+        coop: n(DequantMatmulRoute::Coop),
         per_row: n(DequantMatmulRoute::PerRow),
         q1_0_gemm: n(DequantMatmulRoute::Q1_0Gemm),
         scratch: n(DequantMatmulRoute::Scratch),
@@ -836,7 +857,7 @@ pub fn grouped_scheme_supported(scheme_id: u32) -> bool {
 /// has a kernel for that scheme ([`grouped_scheme_supported`]) and `k` is a whole
 /// number of its **own packing blocks**, the granularity its entry point's weight
 /// loop reads. The arm's `k` gate, asked by [`select_path`] of the shape it is
-/// handed and by `encode_dequant_matmul_gguf_gemm_grouped` of the one it is about
+/// handed and by `encode_dequant_matmul_gguf_gemm_tiled` of the one it is about
 /// to dispatch, so a call the ladder admits cannot then be declined for its
 /// contraction. The scheme term is folded in rather than left to the caller, so the
 /// answer is defined for any id: [`scheme_from_id`] panics on one no table carries.
@@ -865,6 +886,131 @@ fn grouped_gemm_kernel(scheme_id: u32, device: &wgpu::Device) -> Option<&'static
         .find(|(id, _)| *id == scheme_id)
         .map(|(_, kernel)| kernel(device))
 }
+
+/// Which multi-row packed-weight GEMM an encode takes.
+///
+/// Both are the same route in the ladder's terms — device-only, scratch-free, one
+/// pass over each packed weight tile per row tile — and both are encoded by
+/// `encode_dequant_matmul_gguf_gemm_tiled`; they differ in the tile, the entry
+/// point and what the arithmetic runs on. [`Self::Grouped`] is the portable one
+/// and the fallback: f32 scalars, one per output row, 8-row tiles. [`Self::Coop`]
+/// is the hardware-matrix-unit form (`dequant_gemm_coop_gguf.wgsl`), which exists
+/// only on a device that reports the cooperative-matrix feature and passes
+/// `crate::coop_probe` — on DX12, which exposes no cooperative matrices, the
+/// grouped tile is what runs.
+#[derive(Clone, Copy)]
+enum GemmTile {
+    Grouped,
+    Coop,
+}
+
+impl GemmTile {
+    /// This tile's entry point for `scheme_id`, or `None` for a scheme it has no
+    /// arm for — the `None` declining the call rather than waving the scheme
+    /// through, since an id served by another scheme's entry point would decode
+    /// wrong values instead of failing.
+    fn kernel(self, scheme_id: u32, device: &wgpu::Device) -> Option<&'static Kernel> {
+        match self {
+            GemmTile::Grouped => grouped_gemm_kernel(scheme_id, device),
+            GemmTile::Coop => crate::kernels::dequant_gemm_coop_kernel(scheme_id, device),
+        }
+    }
+}
+
+/// The rows one column chunk's output slab holds for this tile: the call's own
+/// `m`, except that the cooperative tile writes whole 32-row tiles and so is given
+/// a slab of 32 rows below that, of which only its `m` valid ones are copied out.
+///
+/// One home because both sides of the route need it: the encoder sizes the slab and
+/// the column budget with it, and [`coop_gemm_admits`] asks the column-chunk
+/// question at the same rows.
+fn slab_row_count(tile: GemmTile, m: usize) -> usize {
+    match tile {
+        GemmTile::Grouped => m,
+        GemmTile::Coop => m.max(crate::kernels::COOP_GEMM_TILE_M as usize),
+    }
+}
+
+/// Whether the cooperative-matrix tile serves this call — the encoder's own
+/// question, asked of the same terms it applies.
+///
+/// The shape terms: `tiled_scheme_ok` (block layout, whole packing blocks in `k`
+/// — which makes `k % 16 == 0` a consequence rather than a term — a column to
+/// write, Q8_0's lever), then at most a third of the rows the
+/// dispatch covers being rounding — the tile's row floor, 22, comes out of that
+/// term rather than being stated beside it (`COOP_GEMM_MAX_PAD_DIVISOR`) — plus
+/// `ncols % 128 == 0` (whole column tiles, which a cooperative store cannot mask)
+/// and the whole call in one column chunk (`grouped_dispatch_cols` at
+/// `slab_row_count`, both of that rule's budgets), which is also the grid floor
+/// [`COOP_MIN_WORKGROUPS`] is read against. The device terms: the entry point
+/// builds (`GemmTile::kernel`, which is where `SHADER_F16`,
+/// `EXPERIMENTAL_COOPERATIVE_MATRIX` and the workgroup-storage size are refused),
+/// and `crate::coop_probe` has established that this operand convention computes
+/// `a·b` on the adapter rather than a transposition.
+///
+/// `RLX_WGPU_GEMM_COOP_DISABLE=1` is the bisect lever: it puts every call back on
+/// the grouped tile, which is the route that shape had before this tile existed.
+///
+/// Public because a measurement that reports *which* tile a call took has to ask
+/// the same question the encoder asks, and re-deriving these terms in a test is
+/// the kind of second statement that drifts. What it cannot see is the arena: the
+/// activation window's shard, its binding size and its 16-byte alignment, and the
+/// weight window's 4- or 2-byte alignment, are properties of where the planner put
+/// the buffers rather than of the shape. The ladder has already established those
+/// for any call that reaches the fused multi-row arm ([`select_path`] asks
+/// `x_window_vec4_ok` and `grouped_k_ok`), so a call this admits is not declined
+/// for them in a graph the backend compiled. The operand layout is the shared
+/// f16/f32-accumulator kernel's, reproduced index for index, and `coop_probe`
+/// establishes that convention rather than this kernel's own dispatch: an adapter
+/// whose cooperative lowering departs from it is caught by the parity test on that
+/// adapter, not before the first call.
+pub fn coop_gemm_admits(
+    m: usize,
+    k: usize,
+    n: usize,
+    scheme_id: u32,
+    device: &wgpu::Device,
+) -> bool {
+    let tile_m = crate::kernels::COOP_GEMM_TILE_M as usize;
+    let tile_n = crate::kernels::COOP_GEMM_TILE_N as usize;
+    let rows = m.div_ceil(tile_m) * tile_m;
+    let workgroups = n.div_ceil(tile_n) * (rows / tile_m);
+    tiled_scheme_ok(scheme_id, k, n)
+        && n.is_multiple_of(tile_n)
+        && rows - m <= rows / COOP_GEMM_MAX_PAD_DIVISOR
+        && workgroups >= COOP_MIN_WORKGROUPS
+        && !rlx_ir::env::flag("RLX_WGPU_GEMM_COOP_DISABLE")
+        && GemmTile::Coop.kernel(scheme_id, device).is_some()
+        && crate::coop_probe::f16_f32acc_path_ok()
+        && grouped_dispatch_cols(device, scheme_id, slab_row_count(GemmTile::Coop, m), k) >= n
+}
+
+/// At most one row in this many of the cooperative tile's dispatch may be past
+/// `m`: the tile covers `ceil(m / 32) * 32` rows and spends the difference on
+/// nothing.
+///
+/// The bound is what keeps a short, wide call off the tile. Its rate is 1.26-1.67x
+/// the row-grouped one on the product's own cells (the table in
+/// `dequant_gemm_coop_gguf.wgsl`'s header), so a call whose row count is rounded by
+/// more than about a third spends more arithmetic than the rate buys back — 16 rows
+/// would be padded to 32, doubling the work. A third leaves every product row count
+/// inside it (31 and 47 are 3 % and 27 %) and puts the tile's row floor at 22, which
+/// is also why no separate `m >= 16` term is needed.
+const COOP_GEMM_MAX_PAD_DIVISOR: usize = 3;
+
+/// The fewest workgroups a cooperative-tile dispatch must have, from measurement.
+///
+/// The tile is 32 rows by 128 columns, so a narrow projection at a short prompt
+/// leaves few: the encoder's `ffn_down` (m = 96, n = 1 024) is 24, and the body's
+/// `o` projection at the 128-frame rung (m = 31, n = 2 048) 16. Every one of those
+/// loses to the row-grouped tile, whose four times the row groups fill the device
+/// where one 32-row tile per column block does not; the body's `o` at m = 95
+/// (n = 2 048, 48 workgroups) is where the cooperative tile turns 1.33x ahead. So
+/// the floor is 48, and a call below it is the row-grouped tile's.
+///
+/// The wake word's two-window encoder pass (m ≈ 20) is below both this floor and
+/// `COOP_GEMM_MAX_PAD_DIVISOR`'s row floor, so it is the grouped tile's twice over.
+pub const COOP_MIN_WORKGROUPS: usize = 48;
 
 /// Whether a row-grouped GEMM call's X window begins on a four-element group,
 /// which is what that kernel's `vec4` X reads need. The encoder rounds the window
@@ -1402,14 +1548,14 @@ pub fn encode_dequant_matmul_gguf_into_pass(
         note_route(DequantMatmulRoute::Q1_0Gemm);
         return true;
     }
-    // Batched, any scheme this kernel set covers: one row-grouped GEMM per weight
-    // tile, instead of the per-row loop below re-streaming the whole packed weight
-    // per row. Which schemes it has an entry point for is decided inside, before
-    // any size math. Falling back is driven by what can be *encoded* (X window),
-    // never by the weight window merely exceeding the binding limit — that case is
-    // N-chunked inside.
-    if m > 1
-        && encode_dequant_matmul_gguf_gemm_grouped(
+    // The hardware-matrix-unit arm, above the portable one: same route in the
+    // ladder's terms, the arithmetic on the cooperative units instead of f32
+    // scalars. Admitted only where the device builds it and `coop_probe` has
+    // established its operand convention, so the grouped arm below stays the
+    // fallback everywhere else — and `RLX_WGPU_GEMM_COOP_DISABLE=1` stands it
+    // down whole.
+    if coop_gemm_admits(m, k, n, scheme_id, device)
+        && encode_dequant_matmul_gguf_gemm_tiled(
             arena,
             device,
             queue,
@@ -1421,6 +1567,32 @@ pub fn encode_dequant_matmul_gguf_into_pass(
             x_byte_off,
             w_byte_off,
             out_byte_off,
+            GemmTile::Coop,
+        )
+    {
+        note_route(DequantMatmulRoute::Coop);
+        return true;
+    }
+    // Batched, any scheme this kernel set covers: one row-grouped GEMM per weight
+    // tile, instead of the per-row loop below re-streaming the whole packed weight
+    // per row. Which schemes it has an entry point for is decided inside, before
+    // any size math. Falling back is driven by what can be *encoded* (X window),
+    // never by the weight window merely exceeding the binding limit — that case is
+    // N-chunked inside.
+    if m > 1
+        && encode_dequant_matmul_gguf_gemm_tiled(
+            arena,
+            device,
+            queue,
+            pass,
+            m,
+            k,
+            n,
+            scheme_id,
+            x_byte_off,
+            w_byte_off,
+            out_byte_off,
+            GemmTile::Grouped,
         )
     {
         note_route(DequantMatmulRoute::Grouped);
@@ -2098,13 +2270,62 @@ pub fn grouped_dispatch_cols(device: &wgpu::Device, scheme_id: u32, m: usize, k:
     grouped_cols_per_chunk(gguf_row_bytes(scheme_id, k), gguf_max_bind(device), m)
 }
 
-/// Fused multi-row GGUF packed-weight GEMM for Q4_K / Q6_K / Q8_0 into `enc` (no
-/// submit).
+/// The terms both fused tiles require of a call before the encoder encodes either:
+/// the scheme's own block layout matching the pair its entry points are written
+/// against, a whole number of packing blocks in `k` ([`grouped_k_ok`], the
+/// granularity both weight loops read), a column to write, and Q8_0's bisect lever
+/// off — which stands down both tiles, since the slab it names is the route that
+/// scheme had before them. Whether the scheme has an *entry point* is the caller's
+/// own first term ([`GemmTile::kernel`]) rather than one stated here, because each
+/// tile has its own set.
 ///
-/// One pass over each packed weight tile per group of `TM = 8` rows, instead of
+/// Its answer is the shape's and one lever's, with no device state behind it, which
+/// is what lets [`coop_gemm_admits`] be the same statement the encoder makes rather
+/// than a second one that drifts from it.
+fn tiled_scheme_ok(scheme_id: u32, k: usize, n: usize) -> bool {
+    // Bisect escape hatch, a lowering only: it puts a Q8_0 call back on the
+    // scratch slab, which is this scheme's route before the arms at all and still
+    // its route for every shape they decline. The default build takes the arm —
+    // obtaining it never needs this switch. Mirrors the Q1_0 GEMM's
+    // (`RLX_WGPU_Q1_0_GEMM_DISABLE`) and Metal's Q8_0 GEMM's.
+    if scheme_id == 20 && rlx_ir::env::flag("RLX_WGPU_Q8_0_GEMM_DISABLE") {
+        return false;
+    }
+    // A whole number of this scheme's own packing blocks: the granularity the
+    // weight loop reads, and what the staged tile's barrier pair is written
+    // around. Q8_0's 32-element blocks let a row end inside a staged tile, which
+    // that entry point's own loop handles; the K-quants' block is the tile, so
+    // this is the whole-tile gate they have always had. Asked through the ladder's
+    // own predicate rather than restated, so a call it admits is never declined
+    // here for its contraction — and asked first, because it carries the scheme
+    // term and is false for an id neither tile has an entry point for, where
+    // `scheme_from_id` below would panic.
+    if !grouped_k_ok(scheme_id, k) || n == 0 {
+        return false;
+    }
+    // The entries hardcode their scheme's block layout; if one stops matching the
+    // pair its entry point is written against, fall back rather than stride the
+    // kernel wrongly.
+    let scheme = scheme_from_id(scheme_id);
+    let block_elems = scheme.gguf_block_size() as usize; // 256 (Q4_K/Q6_K) | 32 (Q8_0)
+    let block_bytes = scheme.gguf_block_bytes() as usize; // 144 | 210 | 34
+    match scheme_id {
+        20 => block_elems == 32 && block_bytes == 34,
+        _ => block_elems == 256 && (block_bytes == 144 || block_bytes == 210),
+    }
+}
+
+/// Fused multi-row GGUF packed-weight GEMM for Q4_K / Q6_K / Q8_0 into `enc` (no
+/// submit), in either tile ([`GemmTile`]).
+///
+/// [`GemmTile::Grouped`] — the portable one, and the fallback — makes one pass
+/// over each packed weight tile per group of `TM = 8` rows, instead of
 /// the per-row GEMV's one full pass over the whole weight per row — its Q4_K entry
 /// point's split chunk excepted, where the quant bytes still pass once but each
-/// block's 16-byte header passes twice (the paragraph below). `n` is split
+/// block's 16-byte header passes twice (the paragraph below).
+/// [`GemmTile::Coop`] makes the same one pass per 32-row tile and puts the
+/// arithmetic on the hardware matrix units. Both bind the same four windows and
+/// share every byte of the arithmetic below the tile: `n` is split
 /// into column chunks that fit `max_storage_buffer_binding_size` (and the
 /// weight buffer's shard), so a weight parked in [`Arena::weight_buffer`] — or
 /// one whose window is larger than the binding limit — still takes this path.
@@ -2139,7 +2360,7 @@ pub fn grouped_dispatch_cols(device: &wgpu::Device, scheme_id: u32, m: usize, k:
 /// `m*n*4` output bytes row by row — or, for a scheme with no per-row arm, the
 /// scratch slab, so the fallback is correct either way.
 #[allow(clippy::too_many_arguments)]
-fn encode_dequant_matmul_gguf_gemm_grouped(
+fn encode_dequant_matmul_gguf_gemm_tiled(
     arena: &Arena,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -2151,49 +2372,18 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
     x_byte_off: usize,
     w_byte_off: usize,
     out_byte_off: usize,
+    tile: GemmTile,
 ) -> bool {
     debug_assert!(
         m > 1,
         "m == 1 goes through encode_dequant_matmul_gguf_gemv_one"
     );
-    // The schemes [`GROUPED_SCHEMES`] covers, decided before any size math — so a
-    // fourth is one entry in that list, and no other scheme reaches the block-size
-    // check below. The `None` arm declines the call rather than waving the scheme
-    // through: an id that fell back to the Q6_K entry point would decode wrong
-    // values, not fail.
-    let Some(dk) = grouped_gemm_kernel(scheme_id, device) else {
+    // The scheme-level terms both tiles share, before any size math — one
+    // statement, [`tiled_scheme_ok`], which the cooperative admission asks too.
+    let Some(dk) = tile.kernel(scheme_id, device) else {
         return false;
     };
-    // Bisect escape hatch, a lowering only: it puts a Q8_0 call back on the
-    // scratch slab, which is this scheme's route before the arm at all and still
-    // its route for every shape the arm declines. The default build takes the arm
-    // below — obtaining it never needs this switch. Mirrors the Q1_0 GEMM's
-    // (`RLX_WGPU_Q1_0_GEMM_DISABLE`) and Metal's Q8_0 GEMM's.
-    if scheme_id == 20 && rlx_ir::env::flag("RLX_WGPU_Q8_0_GEMM_DISABLE") {
-        return false;
-    }
-    let scheme = scheme_from_id(scheme_id);
-    let block_elems = scheme.gguf_block_size() as usize; // 256 (Q4_K/Q6_K) | 32 (Q8_0)
-    let block_bytes = scheme.gguf_block_bytes() as usize; // 144 | 210 | 34
-    // The entries above hardcode this geometry; if a scheme's block layout ever
-    // stops matching the pair its entry point is written against, fall back
-    // rather than stride the kernel wrongly.
-    let geometry_ok = match scheme_id {
-        20 => block_elems == 32 && block_bytes == 34,
-        _ => block_elems == 256 && (block_bytes == 144 || block_bytes == 210),
-    };
-    if !geometry_ok {
-        return false;
-    }
-    // A whole number of this scheme's own packing blocks: the granularity the
-    // weight loop reads, and — for every arm here — what the staged tile's barrier
-    // pair is written around. Q8_0's 32-element blocks let a row end inside a
-    // staged tile, which that entry point's own loop handles; the K-quants' block
-    // is the tile, so this is the whole-tile gate they have always had. Asked
-    // through the ladder's own predicate rather than restated, so a call it admits
-    // is never declined here for its contraction (`block_elems` above is this
-    // scheme's copy of what [`grouped_k_ok`] divides by).
-    if !grouped_k_ok(scheme_id, k) || n == 0 {
+    if !tiled_scheme_ok(scheme_id, k, n) {
         return false;
     }
     let row_bytes = gguf_row_bytes(scheme_id, k); // packed weight bytes per column
@@ -2224,21 +2414,28 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
     let x_vec4_off = ((x0 - x_base) / 16) as u32;
 
     // Columns per chunk, from both budgets: the bound weight window and the
-    // whole-bound output slab (m * ncols * 4). Bounding the slab rather than
-    // only the weight is what keeps a wide-n, large-m head inside the limit. The
+    // whole-bound output slab (`slab_rows * ncols * 4`). Bounding the slab rather
+    // than only the weight is what keeps a wide-n, large-m head inside the limit. The
     // rule is [`grouped_cols_per_chunk`]'s, which the split-rate measurement also
     // reads through [`grouped_dispatch_cols`], so a shape this encoder dispatches
     // whole is one that cell prints as one chunk.
-    if (m as u64) * 4 > max_bind {
+    //
+    // The slab's row count is also the row count the column budget is measured
+    // against: the cooperative tile writes whole 32-row tiles, so a call below that
+    // is given a slab of 32 rows and only its `m` valid ones are copied out.
+    // `coop_gemm_admits` asks the same question at the same rows, through
+    // [`slab_row_count`].
+    let slab_rows = slab_row_count(tile, m);
+    if (slab_rows as u64) * 4 > max_bind {
         return false; // no column chunk's slab could be bound
     }
-    let n_chunk_max = grouped_cols_per_chunk(row_bytes, max_bind, m).min(n);
+    let n_chunk_max = grouped_cols_per_chunk(row_bytes, max_bind, slab_rows).min(n);
 
-    // Slab bytes for one chunk: `m * ncols * 4` out of the pooled output buffer,
-    // which is process-global and only grows. It is scratch the arena plan does
-    // not account for — nothing reserves it, `dequant_gguf_scratch_bytes` included
-    // — so `pooled_out_buf_bytes` is what reports it.
-    let out_slab = (m * n_chunk_max * 4) as u64;
+    // Slab bytes for one chunk: `slab_rows * ncols * 4` out of the pooled output
+    // buffer, which is process-global and only grows. It is scratch the arena plan
+    // does not account for — nothing reserves it, `dequant_gguf_scratch_bytes`
+    // included — so `pooled_out_buf_bytes` is what reports it.
+    let out_slab = (slab_rows * n_chunk_max * 4) as u64;
 
     let mut ok = true;
     with_pooled_out_buf(device, out_slab, |out_buf| {
@@ -2297,8 +2494,16 @@ fn encode_dequant_matmul_gguf_gemm_grouped(
 
             // The grid this chunk dispatches, and whether the Q4_K entry point
             // runs the split geometry over it — the encoder's one answer to both
-            // ([`grouped_chunk_geometry`]).
-            let (x_groups, y_groups, split) = grouped_chunk_geometry(scheme_id, m, n_chunk);
+            // ([`grouped_chunk_geometry`]). The cooperative tile has no split arm:
+            // its own tile is 32 rows by 128 columns, which is a grid the shapes it
+            // admits fill without one.
+            let (x_groups, y_groups, split) = match tile {
+                GemmTile::Grouped => grouped_chunk_geometry(scheme_id, m, n_chunk),
+                GemmTile::Coop => {
+                    let (x, y) = crate::kernels::coop_gemm_gguf_grid(m as u32, n_chunk as u32);
+                    (x, y, false)
+                }
+            };
 
             let p = DequantGemmGgufParams {
                 m: m as u32,
@@ -3147,6 +3352,95 @@ mod tests {
         ] {
             assert_ne!(base, other, "{what} must distinguish two dispatches");
         }
+    }
+
+    /// The cooperative tile's shader, validated and tied to the Rust constants it
+    /// shares. Two jobs, both device-free, and both here rather than in an
+    /// integration test so that `cargo test -p mahbot-rlx-wgpu` — which is what CI
+    /// runs, without `backend-tests` — is where they execute.
+    ///
+    /// The first job is the only witness of the file at all: `dequant_gemm_coop_kernel`
+    /// swallows a build panic and answers `None`, which the admission reads as "this
+    /// device cannot run the tile" and the route test prints as a skip. A WGSL
+    /// mistake would otherwise silently put every prefill back on the row-grouped
+    /// tile — a ~1.5x regression no test fails on.
+    ///
+    /// The second is the geometry: `kernels::COOP_GEMM_TILE_M` / `_N` / `_K` is one
+    /// home, read by the dispatch grid, by [`coop_gemm_admits`]'s terms and by the
+    /// output slab the encoder sizes, while the shader declares its own `TM` / `TN` /
+    /// `TK`. A lone edit of any one of them would describe a kernel that no longer
+    /// runs, and the slab's own row floor ([`slab_row_count`]) would then under-size
+    /// it, letting the cooperative store — which cannot be masked — write past the
+    /// output.
+    #[test]
+    fn coop_shader_validates_and_pins_the_geometry() {
+        let wgsl = crate::kernels::DEQUANT_GEMM_COOP_GGUF_WGSL;
+        let module = naga::front::wgsl::parse_str(wgsl).expect("wgsl parse");
+        // Validated with exactly the two capabilities the shader's `enable` lines
+        // ask for and no others: an arm reaching for a third would compile here and
+        // fail only on a device that provides less.
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::SHADER_FLOAT16
+                | naga::valid::Capabilities::COOPERATIVE_MATRIX,
+        )
+        .validate(&module)
+        .expect("wgsl validate with f16 and cooperative matrices");
+        // One entry point per scheme: routing Q4_K through the Q6_K entry (or a
+        // scheme with no entry at all) would decode garbage rather than fail.
+        let names: Vec<&str> = module
+            .entry_points
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        for want in [
+            "dequant_gemm_coop_q4k",
+            "dequant_gemm_coop_q6k",
+            "dequant_gemm_coop_q8_0",
+        ] {
+            assert!(
+                names.contains(&want),
+                "missing entry point {want}: {names:?}"
+            );
+        }
+        assert_eq!(names.len(), 3, "unexpected extra entry points: {names:?}");
+        for want in [
+            format!("const TM: u32 = {}u;", crate::kernels::COOP_GEMM_TILE_M),
+            format!("const TN: u32 = {}u;", crate::kernels::COOP_GEMM_TILE_N),
+            format!("const TK: u32 = {}u;", crate::kernels::COOP_GEMM_TILE_K),
+        ] {
+            assert!(wgsl.contains(&want), "expected `{want}` in the shader");
+        }
+        // The four subgroups are the workgroup's own quartering, and `SG_COLS` is
+        // what makes each one write its own columns of the tile.
+        assert_eq!(
+            crate::kernels::COOP_GEMM_TILE_N / 4,
+            32,
+            "the tile is four 32-wide subgroups, so a subgroup owns TN / 4 columns"
+        );
+        // `stage_a` gives each invocation exactly one four-element group of the A
+        // panel, which is why it has no loop: a workgroup that is not
+        // `TM * TK / 4` wide would leave part of the panel unstaged, and the MMAs
+        // read all of it.
+        for entry in &module.entry_points {
+            assert_eq!(
+                entry.workgroup_size,
+                [
+                    crate::kernels::COOP_GEMM_TILE_M * crate::kernels::COOP_GEMM_TILE_K / 4,
+                    1,
+                    1
+                ],
+                "{}: one invocation per four-element A group",
+                entry.name
+            );
+        }
+        // The grid covers whole tiles on both axes, which is what a store that
+        // cannot be masked needs; 95 rows is the product's typical prefill.
+        assert_eq!(
+            crate::kernels::coop_gemm_gguf_grid(95, 12288),
+            (96, 3),
+            "95 rows are three 32-row tiles, 12 288 columns 96 column tiles"
+        );
     }
 
     /// The row-grouped GEMM's geometry is written twice — `GROUPED_THREADS` /

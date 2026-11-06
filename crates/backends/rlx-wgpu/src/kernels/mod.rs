@@ -303,6 +303,7 @@ fn gemv_subgroup_probe(
 "#;
 pub const DEQUANT_GEMM_Q1_0_WGSL: &str = include_str!("dequant_gemm_q1_0.wgsl");
 pub const DEQUANT_GEMM_GGUF_WGSL: &str = include_str!("dequant_gemm_gguf.wgsl");
+pub const DEQUANT_GEMM_COOP_GGUF_WGSL: &str = include_str!("dequant_gemm_coop_gguf.wgsl");
 pub const FUSED_RESIDUAL_LN_WGSL: &str = include_str!("fused_residual_ln.wgsl");
 pub const FUSED_RESIDUAL_LN_TEE_VEC4_WGSL: &str = include_str!("fused_residual_ln_tee_vec4.wgsl");
 pub const FUSED_RESIDUAL_LN_TEE_WGSL: &str = include_str!("fused_residual_ln_tee.wgsl");
@@ -3169,6 +3170,9 @@ static DEQUANT_GEMM_Q4K: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q6K: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q8_0: OnceLock<Kernel> = OnceLock::new();
 static DEQUANT_GEMM_Q8_0_REASSEMBLY: OnceLock<Kernel> = OnceLock::new();
+static DEQUANT_GEMM_COOP_Q4K: OnceLock<Option<Kernel>> = OnceLock::new();
+static DEQUANT_GEMM_COOP_Q6K: OnceLock<Option<Kernel>> = OnceLock::new();
+static DEQUANT_GEMM_COOP_Q8_0: OnceLock<Option<Kernel>> = OnceLock::new();
 static MATMUL_BT: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN: OnceLock<Kernel> = OnceLock::new();
 static FUSED_RESIDUAL_LN_TEE: OnceLock<Kernel> = OnceLock::new();
@@ -5759,6 +5763,80 @@ pub fn dequant_gemm_q8_0_reassembly_kernel(device: &wgpu::Device) -> &'static Ke
         )
     })
 }
+
+/// Rows, columns and contraction elements one workgroup of
+/// `dequant_gemm_coop_gguf.wgsl` covers — its `TM` / `TN` / `TK`, which its own
+/// header states and `gguf_gpu.rs`'s `coop_shader_validates_and_pins_the_geometry`
+/// pins against the shader text. Every Rust statement of this tile reads these
+/// three, so the dispatch grid, the admission terms and the output slab cannot
+/// drift from each other.
+pub(crate) const COOP_GEMM_TILE_M: u32 = 32;
+pub(crate) const COOP_GEMM_TILE_N: u32 = 128;
+pub(crate) const COOP_GEMM_TILE_K: u32 = 16;
+
+/// Workgroup storage `dequant_gemm_coop_gguf.wgsl` declares: two 1 KiB ping-pong
+/// A panels, a 4 KiB decoded-weight stage and the 256 B of zero lanes the
+/// accumulators are seeded from. Named here because the kernel getters refuse a
+/// device below it rather than letting `create_compute_pipeline` fail.
+const COOP_GEMM_GGUF_STORAGE: u32 =
+    2 * COOP_GEMM_TILE_M * COOP_GEMM_TILE_K * 2 + COOP_GEMM_TILE_K * COOP_GEMM_TILE_N * 2 + 256;
+
+/// The dispatch grid [`dequant_gemm_coop_kernel`] wants for a call: whole tiles on
+/// both axes, `(ceil(ncols / TN), ceil(m / TM))`. Public because a measurement
+/// that prints the grid a cell dispatched has to read the encoder's own answer
+/// rather than restate it.
+pub fn coop_gemm_gguf_grid(m: u32, ncols: u32) -> (u32, u32) {
+    (
+        ncols.div_ceil(COOP_GEMM_TILE_N),
+        m.div_ceil(COOP_GEMM_TILE_M),
+    )
+}
+
+/// The packed-weight GEMM through the hardware matrix units (Q4_K / Q6_K / Q8_0,
+/// the multi-row form): the weight is decoded from its packed bytes into a
+/// workgroup f16 stage and multiplied with an f32 cooperative accumulator. `None`
+/// for a scheme this file has no entry point for, or a device that cannot build it
+/// — the cooperative-matrix form needs `SHADER_F16`,
+/// `EXPERIMENTAL_COOPERATIVE_MATRIX` and `COOP_GEMM_GGUF_STORAGE` of workgroup
+/// storage. Whether the built kernel computes `a·b` rather than a transposition is
+/// `crate::coop_probe`'s question, asked by the caller.
+///
+/// The build's panic is swallowed into `None` rather than propagated, because a
+/// device refusing a pipeline is a fact the route has to answer with the row-grouped
+/// tile. That makes a *WGSL* mistake indistinguishable from an unsupported device
+/// here, so `gguf_gpu.rs`'s `coop_shader_validates_and_pins_the_geometry` parses and
+/// validates the same source with naga, device-free and inside `cargo test -p`:
+/// a shader that cannot compile fails there instead of quietly putting every
+/// prefill back on the row-grouped tile.
+pub fn dequant_gemm_coop_kernel(scheme_id: u32, device: &wgpu::Device) -> Option<&'static Kernel> {
+    let (cell, entry) = match scheme_id {
+        0 => (&DEQUANT_GEMM_COOP_Q4K, "dequant_gemm_coop_q4k"),
+        2 => (&DEQUANT_GEMM_COOP_Q6K, "dequant_gemm_coop_q6k"),
+        20 => (&DEQUANT_GEMM_COOP_Q8_0, "dequant_gemm_coop_q8_0"),
+        _ => return None,
+    };
+    let feats = device.features();
+    if !feats.contains(wgpu::Features::SHADER_F16)
+        || !feats.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        || device.limits().max_compute_workgroup_storage_size < COOP_GEMM_GGUF_STORAGE
+    {
+        return None;
+    }
+    cell.get_or_init(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            build_kernel_ro_u_ro_rw(
+                device,
+                "rlx-wgpu dequant_gemm_coop_gguf",
+                DEQUANT_GEMM_COOP_GGUF_WGSL,
+                entry,
+                false,
+            )
+        }))
+        .ok()
+    })
+    .as_ref()
+}
+
 pub fn fused_residual_ln_kernel(device: &wgpu::Device) -> &'static Kernel {
     FUSED_RESIDUAL_LN.get_or_init(|| {
         build_kernel(

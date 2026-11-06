@@ -70,10 +70,11 @@ pub const STAND_RECOGNITION_LONG_SHA256: &str =
     "34cc9d8329eeb0600be7d65612b158a631f7ef0d8055d11118f77a10fe8fcae2";
 
 /// The stand's two synthesis rows at their draw seed: `digest(&waveform)` and
-/// the waveform's length. A witness, not a gate.
-pub const STAND_SYNTH_SHORT_DIGEST: u64 = 0x2b28_d437_6a94_7067;
+/// the waveform's length. A witness, not a gate — the round trip (the render
+/// resampled and re-recognised, [`round_trip`]) is the gate.
+pub const STAND_SYNTH_SHORT_DIGEST: u64 = 0xa40d_4875_5a6b_b9c4;
 pub const STAND_SYNTH_SHORT_SAMPLES: usize = 44_160;
-pub const STAND_SYNTH_TYPICAL_DIGEST: u64 = 0x213d_9b26_4c44_bebb;
+pub const STAND_SYNTH_TYPICAL_DIGEST: u64 = 0x9bdc_52c5_8a14_6cfe;
 pub const STAND_SYNTH_TYPICAL_SAMPLES: usize = 172_800;
 
 /// The stand's wake row: the cosine the pair pass's first window answers against a

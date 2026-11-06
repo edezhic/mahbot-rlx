@@ -290,7 +290,7 @@ fn assert_device_routes(r: &rlx_wgpu::gguf_gpu::DequantMatmulRoutes, what: &str)
         "{what}: a packed multiply took the host route: {r:?}"
     );
     assert!(
-        r.per_row + r.grouped + r.q1_0_gemm + r.scratch > 0,
+        r.per_row + r.grouped + r.coop + r.q1_0_gemm + r.scratch > 0,
         "{what}: no packed multiply took a device route: {r:?}"
     );
 }

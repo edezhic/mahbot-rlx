@@ -107,12 +107,7 @@ fn assert_signal(v: &[f32], what: &str) {
 /// relative figure says something about a call's values and not only about its shape.
 fn cross_route(moved: &[f32], reference: &[f32]) -> (f32, f32) {
     let max_abs = common::max_abs_diff(moved, reference);
-    (max_abs, max_abs / magnitude(reference))
-}
-
-/// A reference output's magnitude — the denominator of [`cross_route`]'s figure.
-fn magnitude(v: &[f32]) -> f32 {
-    v.iter().fold(0.0f32, |a, x| a.max(x.abs()))
+    (max_abs, max_abs / common::magnitude(reference))
 }
 
 /// One `DequantMatMul` of `scheme` over a packed weight of `w_bytes`, and the node
@@ -1188,7 +1183,7 @@ fn a_misaligned_x_window_is_not_read_as_vec4() {
 
         assert_signal(&on_device, "the aligned reference");
         let max_abs = common::max_abs_diff(&via_host, &on_device);
-        let scale = magnitude(&on_device);
+        let scale = common::magnitude(&on_device);
         eprintln!(
             "misaligned X window vs aligned ({scheme:?}): max_abs={max_abs:e} ref_scale={scale:e}"
         );
@@ -1262,7 +1257,7 @@ fn harness_size_parked_weight_matches_the_per_row_path() {
         );
         let one = rows.read_f32(&dev.device, &dev.queue, y1);
         assert_signal(&one, "the per-row arm's reference");
-        scale = scale.max(magnitude(&one));
+        scale = scale.max(common::magnitude(&one));
         worst = worst.max(common::max_abs_diff(&grouped[r * n..(r + 1) * n], &one));
     }
     rlx_ir::env::unset("RLX_WGPU_MAX_BIND_MB");

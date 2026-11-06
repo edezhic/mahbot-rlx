@@ -3500,6 +3500,15 @@
         layer: EnvLayer::Backend("wgpu"),
     },
     EnvVarEntry {
+        name: "RLX_WGPU_GEMM_COOP_DISABLE",
+        group: "wgpu",
+        summary: "Bisect lever: puts every multi-row packed (`Op::DequantMatMul`) multiply back on the row-grouped tile instead of the cooperative-matrix tile, which is the route those shapes had before that arm existed",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Bisect,
+        aliases: &[],
+        layer: EnvLayer::Backend("wgpu"),
+    },
+    EnvVarEntry {
         name: "RLX_WGPU_GEMV_IN_PLACE",
         group: "wgpu",
         summary: "One-row packed GEMV output: store the row straight into the arena slot instead of a pooled slab plus a copy dispatch (0 restores the slab, which is how the saving is re-taken)",

@@ -11,9 +11,15 @@
 //!
 //! The row-grouped packed multiply's own loop, numbered for the one question this
 //! measurement exists to answer: how much of a many-row call is its loop and how
-//! much is the packed weight's traffic. The number is the **demand** — the bytes
-//! the call's row
-//! groups move over the weight (`groups x weight`), over the call's time, i.e. the
+//! much is the packed weight's traffic. Both of its phases (m = 234 and m = 219) are
+//! shapes the cooperative-matrix tile admits, so the test pins
+//! `RLX_WGPU_GEMM_COOP_DISABLE=1` and every figure below is the row-grouped tile's;
+//! each call's census is asserted before it is timed, so a lever that stopped
+//! reaching the encoder fails here rather than printing the other tile's numbers
+//! under these headings. The cooperative tile's own rate is
+//! `gguf_gemm_prefill_rate.rs`'s. The number is
+//! the **demand** — the bytes the call's row groups move over the weight
+//! (`groups x weight`), over the call's time, i.e. the
 //! rate the weight would have to stream at for its own traffic to account for the
 //! call — read against this machine's streaming read ceiling
 //! ([`rlx_wgpu::bandwidth::stream_ceiling`], the same probe the stand's weight-stream
@@ -101,7 +107,7 @@ use common::data;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
-use rlx_wgpu::gguf_gpu::{gguf_row_bytes, grouped_base_geometry};
+use rlx_wgpu::gguf_gpu::{gguf_row_bytes, grouped_base_geometry, reset_route_counts, route_counts};
 use rlx_wgpu::gguf_host::gguf_scheme_id;
 
 /// Best-of-7 µs of one packed multiply call, its input an input node so the graph
@@ -137,6 +143,20 @@ fn call_us(scheme: QuantScheme, m: usize, k: usize, n: usize) -> f64 {
         let out = c.run(&[("x", &xv)]).remove(0);
         assert_eq!(out.len(), m * n, "output width at m={m} k={k} n={n}");
     };
+    // The census, before the timing: the lever at the top of the test is only an
+    // assumption until the encoder is seen to honour it, and every figure this file
+    // prints is the row-grouped tile's. The fixed-term call below runs this too, so
+    // the assertion covers it as well.
+    reset_route_counts();
+    one();
+    let routes = route_counts();
+    assert_eq!(
+        (routes.grouped, routes.coop, routes.per_row, routes.host),
+        (1, 0, 0, 0),
+        "m={m} k={k} n={n}: the pinned lever must leave one row-grouped call and nothing \
+         else — a figure measured here is this route's work, so a call that took another \
+         is not this file's to print: {routes:?}"
+    );
     for _ in 0..2 {
         one();
     }
@@ -300,6 +320,12 @@ fn the_loop_with_the_weight_resident() {
         return;
     }
     common::refuse_under_run_report();
+    // This file measures the **row-grouped** tile's loop, so every call it times has
+    // to be that tile's: `RLX_WGPU_GEMM_COOP_DISABLE=1` stands the cooperative tile
+    // down whole, and both of this file's phases (m = 234 and 219) are shapes it
+    // admits. The cooperative tile's own rate is `gguf_gemm_prefill_rate.rs`'s.
+    let _grouped_only =
+        rlx_ir::env::RuntimeOverrides::install(Some(("RLX_WGPU_GEMM_COOP_DISABLE", "1")));
     let floor = floor_us();
     let ceiling_gbs = match rlx_wgpu::bandwidth::stream_ceiling() {
         Ok(c) => c.read_gb_s,

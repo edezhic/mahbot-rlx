@@ -220,9 +220,9 @@ fn measure_scheme(scheme: &Scheme, k: usize, n: usize, ms: &[usize]) {
 
     for &(m, ref v) in &measured {
         let r = &v.routes;
-        let want = if m == 1 { (0, 1) } else { (1, 0) };
+        let want = if m == 1 { (0, 0, 1) } else { (0, 1, 0) };
         assert_eq!(
-            (r.grouped, r.per_row),
+            (r.coop, r.grouped, r.per_row),
             want,
             "m={m} must take {}: {r:?}",
             if m == 1 {
@@ -301,6 +301,12 @@ fn a_row_group_reuses_the_packed_weight() {
     // Q4_K side.
     let (k, n) = (7168usize, 202048usize);
     rlx_ir::env::set("RLX_WGPU_MAX_BIND_MB", "256");
+    // This file measures the **row-grouped** tile, so every multi-row call has to be
+    // that tile's. Its own width (`n = 202048`, not a multiple of 128) keeps the
+    // cooperative tile out today, but that is a property of the cell set rather than
+    // of the route: the lever makes it the route's.
+    let _grouped_only =
+        rlx_ir::env::RuntimeOverrides::install(Some(("RLX_WGPU_GEMM_COOP_DISABLE", "1")));
     measure_scheme(&Q4K, k, n, &[1, 2, 3, 4, 8, 96, 276]);
     measure_scheme(&Q6K, k, n, &[1, 2, 4, 8]);
 

@@ -48,6 +48,8 @@
 //! out-slab behind its `Mutex`, the `Device`/`Queue` a `Session` shares), so the
 //! device tests here run in parallel as they always have. Do not add a lock.
 
+mod common;
+use common::{COOP_REL_BAR, coop_bar_at};
 use rlx_ir::op::{Activation, BinaryOp};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
@@ -321,6 +323,27 @@ const ROUTE_HOST: &str = "host dequant (k is not a whole number of GGUF blocks, 
 /// own is even asked).
 const ROUTE_HOST_NO_SLAB: &str = "host dequant (the graph booked no in-arena f32 scratch slab)";
 
+/// The cooperative-matrix tile's route, as the encoder reports it — the multi-row
+/// fused GEMM whose weight is decoded into a workgroup f16 stage and multiplied by
+/// the hardware matrix units with an f32 accumulator.
+const ROUTE_COOP: &str = "cooperative-matrix fused GEMM (32 rows/tile, 128 columns, the packed weight \
+     decoded into a workgroup f16 stage, f32 accumulator; one weight read per 32-row tile, no scratch)";
+
+/// The packing block a scheme's kernel reads, as every route string states it.
+fn blocks(scheme: QuantScheme) -> String {
+    format!(
+        "{}-elem/{}-byte blocks",
+        scheme.gguf_block_size(),
+        scheme.gguf_block_bytes()
+    )
+}
+
+/// [`ROUTE_COOP`] at one scheme's packing block — the route string a cell of that
+/// scheme prints.
+fn coop_route(scheme: QuantScheme) -> String {
+    format!("{ROUTE_COOP}; {}", blocks(scheme))
+}
+
 /// The route the wgpu encoder takes for a packed `DequantMatMul`, derived from
 /// the runtime selector: `gguf_gpu::select_path` (whose tiled one-row arm is
 /// `gemv_one_row_device_ok`), the ladder the run path calls, and
@@ -348,11 +371,7 @@ const ROUTE_HOST_NO_SLAB: &str = "host dequant (the graph booked no in-arena f32
 fn wgpu_route(scheme: QuantScheme, m: usize, k: usize, arena_scratch_reserved: bool) -> String {
     // Block geometry, so each printed route states the blocks the kernel reads.
     let block_elems = scheme.gguf_block_size() as usize;
-    let blocks = format!(
-        "{}-elem/{}-byte blocks",
-        scheme.gguf_block_size(),
-        scheme.gguf_block_bytes()
-    );
+    let blocks = blocks(scheme);
     if scheme == QuantScheme::GgufQ8_0 {
         // Q8_0's device arms are the tiled one-row kernel, at exactly one row over
         // this scheme's own 32-element blocks, and the row-grouped GEMM: one pass
@@ -413,9 +432,12 @@ fn wgpu_route(scheme: QuantScheme, m: usize, k: usize, arena_scratch_reserved: b
     }
     let aligned = k.is_multiple_of(block_elems);
     match scheme {
-        // Q4_K / Q6_K: the change point is m == 1 (decode GEMV) vs m > 1
-        // (row-grouped GEMM) — the latter only when k is a whole number of
-        // 256-element blocks.
+        // Q4_K / Q6_K: the change point is m == 1 (decode GEMV) against the
+        // multi-row tiles, and this mirror models the row-grouped one of those —
+        // the tile a call keeps where `coop_gemm_admits` declines it, which is why
+        // `route_of` asks the predicate before it asks this function — with the
+        // grouped arm reachable only when k is a whole number of 256-element
+        // blocks.
         QuantScheme::GgufQ4K | QuantScheme::GgufQ6K if m == 1 => {
             format!(
                 "{ROUTE_PER_ROW}; {blocks}; one row per call, for a k that is a multiple of four"
@@ -541,9 +563,10 @@ struct CaseReport {
 const BARE_GRAPH_CONTEXT: &str = "bare single packed matmul (no norm/activation to fuse)";
 /// The model-class graph's graph: what wgpu does with a real block.
 const MODEL_GRAPH_CONTEXT: &str = "packed matmuls stay their own steps (never common-IR); \
-     elementwise/mul ops fuse into the surrounding segments; Q4_K/Q6_K and Q8_0 take the fused \
-     row-grouped GEMM at m > 1 and the tiled one-row arm at m = 1, which materialize no f32 image, \
-     so the one in-arena dequant scratch the eight Q5_K/Q8_0 nodes share is read by the Q5_K nodes \
+     elementwise/mul ops fuse into the surrounding segments; above one row Q4_K/Q6_K and Q8_0 take \
+     the cooperative-matrix GEMM where its shape terms admit it and the fused row-grouped GEMM as \
+     its fallback, at m = 1 the tiled one-row arm — none of them materializing an f32 image — so \
+     the one in-arena dequant scratch the eight Q5_K/Q8_0 nodes share is read by the Q5_K nodes \
      and by the Q8_0 nodes only where their arms refuse";
 
 impl CaseReport {
@@ -603,7 +626,7 @@ fn run_case(cell: &Cell) -> CaseReport {
         m,
         k,
         n,
-        tol,
+        tol: bar,
         label,
     } = cell.clone();
 
@@ -639,12 +662,38 @@ fn run_case(cell: &Cell) -> CaseReport {
     // accepts (Q4_K/Q6_K/Q1_0), so an unaligned-k Q4_K node at m > 1 runs on the
     // host — the k=384 cell below — yet still books nothing.
     let scratch_graph_max = rlx_wgpu::gguf_gpu::dequant_gguf_scratch_bytes(&g);
+    // Which multi-row tile the encoder would pick, asked of the encoder — the
+    // device terms (`coop_probe`, the kernel's own build, its bisect lever) are not
+    // something a route string derived from the scheme could state. Its row term is
+    // at most a third of the dispatched rows over a 32-row tile, so it cannot admit
+    // a call below 22 rows and no `m > 1` term is needed in front of it.
+    let coop = rlx_wgpu::gguf_gpu::coop_gemm_admits(
+        m,
+        k,
+        n,
+        rlx_wgpu::gguf_host::gguf_scheme_id(scheme),
+        &rlx_wgpu::wgpu_device()
+            .expect("a wgpu device: this test skips without one")
+            .device,
+    );
+    let route = if coop {
+        coop_route(scheme)
+    } else {
+        wgpu_route(scheme, m, k, scratch_graph_max > 0)
+    };
+    // The cooperative tile's two bars at this cell's own output scale, and the
+    // cell's own bar on every other route.
+    let tol = if coop {
+        coop_bar_at(measured.cpu_max)
+    } else {
+        bar
+    };
     let report = CaseReport {
         scheme: format!("{scheme:?}"),
         m,
         weight_shape: format!("[k={k}, n={n}]"),
         label: label.clone(),
-        route: wgpu_route(scheme, m, k, scratch_graph_max > 0),
+        route,
         graph_context: BARE_GRAPH_CONTEXT.to_string(),
         packed_bytes,
         f32_image_bytes: k * n * 4,
@@ -695,6 +744,62 @@ fn wgpu_gguf_dequant_matmul_prefill_matches_cpu() {
             21,
             640,
             2048,
+            1e-2,
+        ),
+        // The mahbot product's own prefill row counts: `tokens + 15` over its six
+        // frame rungs, i.e. 31 / 47 / 63 / 79 / 95 / 111, of which 95 is the
+        // typical seven-second piece. At `n = 2 048` the two shortest are below the
+        // cooperative tile's grid floor and run the row-grouped one, while 95 and
+        // 111 — three and four whole 32-row tiles — run the cooperative one, so
+        // these four cells cover both tiles at the product's own row counts.
+        // (`gguf_matmul_route.rs` carries the sub-tile case, m = 31 against the
+        // body's widest projection.)
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            31,
+            2048,
+            2048,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            47,
+            2048,
+            2048,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            95,
+            2048,
+            2048,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            111,
+            2048,
+            2048,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ6K,
+            rlx_gguf::GgmlType::Q6K,
+            95,
+            6144,
+            2048,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ8_0,
+            rlx_gguf::GgmlType::Q8_0,
+            96,
+            1024,
+            4096,
             1e-2,
         ),
         // Batched prefill sizes: the row-grouped GEMM covers 2..~276 rows, and
@@ -1258,8 +1363,21 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
         (&[], 128, 256, 640, 1e-2),   // grouped side, wide n
         (&[], 64, 2048, 512, 1e-2),   // key width 2048
         (&[], 192, 1024, 2048, 1e-2), // hundreds of rows + low-thousands width
-        (&[], 1, 256, 640, 1e-2),     // 2-D decode
-        (&[1], 1, 2048, 640, 1e-2),   // 3-D single-token decode: [1,1,k] -> [1,1,n]
+        // The cooperative tile's sub-32-row path: the lowest row count the product's
+        // prefill actually runs (`listen::prompt_len` on the first frame rung), at
+        // the widest output width it runs there (12 288 columns, the body's fused
+        // gate/up). The width and not the depth — `k` is one K-quant superblock, so
+        // the cell stays small, and the geometry it is here for (the 32-row slab and
+        // the A panel) is the tile's rather than `k`'s. The tile writes whole 32-row
+        // tiles, so this is the one shape where its output slab is taller than the
+        // call; `stage_a`'s clamp to `m - 1` is what keeps its A panel inside the X
+        // window. 12 288 columns is 96 workgroups, twice `COOP_MIN_WORKGROUPS`, so
+        // Q4_K/Q6_K/Q8_0 take the tile here; Q5_K has an entry point for neither
+        // tile and stays on the scratch slab, which its own cell comment above
+        // records.
+        (&[], 31, 256, 12288, 1e-2),
+        (&[], 1, 256, 640, 1e-2),   // 2-D decode
+        (&[1], 1, 2048, 640, 1e-2), // 3-D single-token decode: [1,1,k] -> [1,1,n]
     ];
     for &(scheme, ggml, sname) in schemes {
         for &(batch, m, k, n, tol) in shapes {
@@ -1302,21 +1420,39 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
     ] {
         let block = build_mlp_block(batch, m, H, I, LAYERS, &mut weight_cache);
         let label = format!("model mlp-block {LAYERS}L batch={batch:?} m={m} H={H} I={I}");
-        // Q4_K (o-projection, k=H) and Q6_K (up, k=H) sit on the change point:
-        // m=1 is the decode (per-row GEMV) side, m>=2 the row-grouped side.
-        // Q8_0 (down, k=I=4096) sits on its own change point too — m=1 the tiled
-        // one-row arm (4096 being a whole number of its 32-element blocks), m>=2
-        // the row-grouped GEMM, k being a whole number of those same blocks there
-        // — while Q5_K (gate, k=H) has only its single scratch route at every m.
-        // Every projection has k a whole number of blocks, so the slab's presence
-        // only affects the qualifier the unaligned-k arm would print, and it is
-        // the block's own reservation.
+        // Q4_K (o-projection, k=H, n=H) and Q6_K (up, k=H, n=I) sit on the change
+        // point: m=1 is the decode (per-row GEMV) side, and above one row the route
+        // is `coop_gemm_admits`'s answer — the cooperative tile where the block's own
+        // shape admits it (it does at m=96 and 192 on this host), the row-grouped
+        // GEMM otherwise. Q8_0 (down, k=I=4096) sits on its own change point too —
+        // m=1 the tiled one-row arm (4096 being a whole number of its 32-element
+        // blocks), above it the same two tiles — while Q5_K (gate, k=H) has only
+        // its single scratch route at every m. Every projection has k a whole
+        // number of blocks, so the slab's presence only affects the qualifier the
+        // unaligned-k arm would print, and it is the block's own reservation.
+        //
+        // Each projection's `(k, n)` is passed rather than derived: the o-projection
+        // is the one whose `k` and `n` are both `H`, so an `if k == I { H } else { I }`
+        // reads its width as `I` and reports the cooperative tile for a call the
+        // block ran row-grouped — and the same answer selects this block's bar.
         let scratch_reserved = block.mem.scratch_graph_max > 0;
+        let route_of = |scheme: QuantScheme, k: usize, n: usize| -> String {
+            if rlx_wgpu::gguf_gpu::coop_gemm_admits(
+                m,
+                k,
+                n,
+                rlx_wgpu::gguf_host::gguf_scheme_id(scheme),
+                &rlx_wgpu::wgpu_device().expect("a wgpu device").device,
+            ) {
+                return coop_route(scheme);
+            }
+            wgpu_route(scheme, m, k, scratch_reserved)
+        };
         let mut routes = [
-            wgpu_route(QuantScheme::GgufQ5K, m, H, scratch_reserved),
-            wgpu_route(QuantScheme::GgufQ6K, m, H, scratch_reserved),
-            wgpu_route(QuantScheme::GgufQ8_0, m, I, scratch_reserved),
-            wgpu_route(QuantScheme::GgufQ4K, m, H, scratch_reserved),
+            route_of(QuantScheme::GgufQ5K, H, I),
+            route_of(QuantScheme::GgufQ6K, H, I),
+            route_of(QuantScheme::GgufQ8_0, I, H),
+            route_of(QuantScheme::GgufQ4K, H, H),
         ]
         .to_vec();
         routes.sort();
@@ -1332,17 +1468,41 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
         // Per-m parity tolerance. The block's residual stream reaches |y| in the
         // low thousands (two un-normalized MLP expansions, no downstream norm), so
         // no grid-cell absolute bound holds here. Measured max_abs / cpu_max
-        // (relative):
-        //   m=1 (3-D) 2.69e-3 / 1617 = 1.7e-6
-        //   m=96      2.25e-2 / 2939 = 7.6e-6
-        //   m=192     2.87e-2 / 2940 = 9.8e-6
-        // The two multi-row cells sit on the same ~1e-5 relative floor — the
-        // absolute value tracks cpu_max, not the route, and m=1 an order below it now
-        // that its Q8_0 down-projection takes the one-row arm — so one absolute bound
-        // with >=1.7x headroom over the largest measured side is the honest form,
-        // PAIRED with the relative bound asserted below. What actually bounds the
-        // fused GEMV/GEMM and the scratch-dequant accumulation is the relative error.
-        let tol = 5e-2f32;
+        // (relative), this build:
+        //   m=1 (3-D) 2.6e-6
+        //   m=96      4.3e-4
+        //   m=192     1.0e-3
+        // The two multi-row cells sit on f16 operand rounding rather than on
+        // accumulation order: the cooperative tile serves the packed projections that
+        // have an entry point for it (Q5_K does not), and its operands are f16 — the
+        // activations downcast as they land in the workgroup stage, the packed weight
+        // decoded to f16 — which is a *relative* effect, so both read ~1e-3 of their
+        // own scale. m=96 reads lower than m=192 because fewer of its projections
+        // reach the tile at those rows: the two narrow ones (`n = 1 024`, 24
+        // workgroups at three row tiles) are under `COOP_MIN_WORKGROUPS` and keep the
+        // row-grouped tile, which is still f32. Before the tile existed the same two
+        // cells read 7.6e-6 and 9.8e-6, which is what the f32 accumulation order of
+        // the arms they then took produced. The single-row cell is an order below
+        // both: it keeps the tiled one-row arm, and the tile cannot admit one row at
+        // all.
+        //
+        // So the absolute figure tracks cpu_max, not the route, and what actually
+        // bounds a cell — the fused GEMV/GEMM and the scratch-dequant accumulation
+        // alike — is its relative error. A block any of whose projections took the
+        // cooperative tile is held to `common::COOP_BAR` floored by
+        // `common::COOP_REL_BAR` at its own scale; a block whose projections all
+        // stayed off that tile keeps the original 5e-2 absolute paired with the
+        // 1e-4 gross-divergence ceiling. The block's own routes are what decides
+        // which, so a device without cooperative matrices, or a run under the
+        // bisect lever, is held to the tighter bar rather than to a tile it never
+        // took.
+        let coop_tile = routes.iter().any(|r| r.starts_with(ROUTE_COOP));
+        let tol = if coop_tile {
+            coop_bar_at(measured.cpu_max)
+        } else {
+            5e-2f32
+        };
+        let rel_bar = if coop_tile { COOP_REL_BAR } else { 1e-4 };
         let report = CaseReport {
             scheme: "Q5K/Q6K/Q8_0/Q4K".to_string(),
             m,
@@ -1359,12 +1519,13 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
         report.print();
         assert_measured(&report.label, &report.measured, tol);
         // The absolute bound above scales with |y|, so the per-element error is
-        // also asserted against the reference magnitude: every observed cell sits
-        // at ~1e-5 relative, and 1e-4 is the gross-divergence ceiling.
+        // also asserted against the reference magnitude, and `rel_bar` is the ceiling
+        // that binds: 1e-4 where the block stayed off the cooperative tile, and the
+        // f16 operand rounding's own relative bar where it did not.
         let rel = report.measured.max_abs / report.measured.cpu_max.max(1e-30);
         assert!(
-            rel <= 1e-4,
-            "{}: max_abs is {rel:.3e} of the reference magnitude, over 1e-4",
+            rel <= rel_bar,
+            "{}: max_abs is {rel:.3e} of the reference magnitude, over {rel_bar:.1e}",
             report.label
         );
         if !mem_printed {

@@ -8,11 +8,27 @@
 //! is a single route with a shape of its own, which is readable the same way
 //! (`gguf_gpu::gemv_one_row_shape`).
 //!
+//! Above one row a call is one fused GEMM dispatch — never a row loop — and there
+//! are two tiles for it: the cooperative-matrix one (`dequant_gemm_coop_gguf.wgsl`,
+//! the packed weight decoded into a workgroup f16 stage and multiplied on the
+//! hardware matrix units with an f32 accumulator) and the portable row-grouped
+//! one. Which serves a call is `gguf_gpu::coop_gemm_admits`'s answer — a shape
+//! below its terms, a call wider than one column chunk, or a device that cannot
+//! build the kernel keeps the row-grouped tile — so the censuses below ask that
+//! predicate for the shape rather than naming a tile. The cooperative tile's
+//! operands are f16, so its error is relative to the output scale: every parity
+//! check that can land on it is held to [`common::COOP_BAR`] floored by
+//! [`common::COOP_REL_BAR`] at that cell's own scale, and the routes that stay off
+//! it to the 1e-2 every packed multiply in this crate uses
+//! ([`common::PACKED_BAR`]). [`common::packed_bar_at`] is that choice in one
+//! statement, keyed on the census of what the cell ran — the bar describes the
+//! arithmetic that produced the number, not the arithmetic the predicate expected.
+//!
 //! The same counters pin Q8_0's change point: the byte-per-weight form's one row
 //! is the tiled kernel's own block-keyed branch, and above one row, over whole
-//! 32-element packing blocks of its own, it takes the row-grouped GEMM instead of
-//! the slab — that arm's weight loop reads the scheme's blocks, and the 256-element
-//! tile it stages is eight of them, so a row may end inside a tile. The A/B block
+//! 32-element packing blocks of its own, it takes a fused multi-row GEMM instead of
+//! the slab — the row-grouped tile's weight loop reads the scheme's blocks, and the
+//! 256-element tile it stages is eight of them, so a row may end inside a tile. The A/B block
 //! below measures such a call against the slab it used to take, at the shapes the
 //! packed steps actually multiply, and *reports* the figures (its
 //! `[rlx-gguf-q8-0-gemm]` lines) — the asserts there are the route, the recorded
@@ -42,7 +58,7 @@
 //! override reached the encoder at all: an A/B that changes nothing proves nothing.
 
 mod common;
-use common::{max_abs_diff, refuse_under_q8_0_bisect, refuse_under_run_report};
+use common::{max_abs_diff, packed_bar_at, refuse_under_q8_0_bisect, refuse_under_run_report};
 use rlx_compile::memory::plan_memory_f32_uniform;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
@@ -57,17 +73,34 @@ use rlx_wgpu::gguf_gpu::{
 };
 use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts, wgpu_device};
 
-/// Whether a Q8_0 call takes the scheme's one fused arm — the row-grouped GEMM —
-/// rather than the dequant slab: more than one row, and a `k` that is a whole
-/// number of this scheme's own 32-element packing blocks
-/// (`QuantScheme::GgufQ8_0.gguf_block_size()`), which is the granularity that arm's
-/// weight loop reads. Not the 256-element staged tile the arm shares with the
-/// K-quant entries, which is eight of those blocks: a whole number of blocks can
-/// end inside a tile. Both terms are exercised by the shape grid below — its k=384
-/// cell is 12 whole blocks and 1.5 tiles, so it is the off-tile cell that pins the
-/// block term rather than the tile, which is what keeps this falsifiable there —
-/// while the A/B block's grid states the literal it is left with, its 128 / 288 /
-/// 896 cells the class's own boundaries.
+/// Whether the cooperative tile serves this exact shape on this adapter — asked of
+/// the encoder's own predicate, never restated here: its terms include device ones
+/// (`coop_probe`, the kernel's own build, the bisect lever) that no shape literal
+/// can state. `n` is the call's output width, which is what its column-chunk term
+/// reads.
+fn coop_admits(scheme: QuantScheme, m: usize, k: usize, n: usize) -> bool {
+    let dev = wgpu_device().expect("a wgpu device: this test skips without one");
+    rlx_wgpu::gguf_gpu::coop_gemm_admits(
+        m,
+        k,
+        n,
+        rlx_wgpu::gguf_host::gguf_scheme_id(scheme),
+        &dev.device,
+    )
+}
+
+/// Whether a Q8_0 call takes a fused multi-row GEMM — the cooperative tile where
+/// [`coop_admits`] admits the shape, the row-grouped one otherwise — rather than
+/// the dequant slab: more than one row, and a `k` that is a whole number of this
+/// scheme's own 32-element packing blocks
+/// (`QuantScheme::GgufQ8_0.gguf_block_size()`), which is the granularity the
+/// row-grouped tile's weight loop reads. Not the 256-element staged tile the arm
+/// shares with the K-quant entries, which is eight of those blocks: a whole number
+/// of blocks can end inside a tile. Both terms are exercised by the shape grid
+/// below — its k=384 cell is 12 whole blocks and 1.5 tiles, so it is the off-tile
+/// cell that pins the block term rather than the tile, which is what keeps this
+/// falsifiable there — while the A/B block's grid states the literal it is left
+/// with, its 128 / 288 / 896 cells the class's own boundaries.
 fn q8_0_byte_direct(m: usize, k: usize) -> bool {
     m > 1 && k.is_multiple_of(QuantScheme::GgufQ8_0.gguf_block_size() as usize)
 }
@@ -210,18 +243,28 @@ fn run(device: Device, g: Graph, packed: &[u8], x: &[f32]) -> Vec<f32> {
     c.run(&[("x", x)]).remove(0)
 }
 
-/// Brackets one call — reset, run, snapshot — so the route is this call's own.
-fn route_of(scheme: QuantScheme, ggml: rlx_gguf::GgmlType, m: usize) -> DequantMatmulRoutes {
-    let (g, packed, x) = case(scheme, ggml, m, 256, 64);
+/// Brackets one call — reset, run, snapshot — so the route is this call's own. The
+/// second half of the pair is the encoder's own answer for the shape it built
+/// ([`coop_admits`]), so a caller's expectation names the tile the predicate
+/// implies rather than one picked here.
+fn route_of(
+    scheme: QuantScheme,
+    ggml: rlx_gguf::GgmlType,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (DequantMatmulRoutes, bool) {
+    let (g, packed, x) = case(scheme, ggml, m, k, n);
     reset_route_counts();
     let _ = run(Device::Gpu, g, &packed, &x);
-    route_counts()
+    (route_counts(), coop_admits(scheme, m, k, n))
 }
 
 /// One row of a Q8_0 call driven straight from this shape's plan, through
 /// `run_dequant_matmul_gguf_gpu` — the entry point this scheme's one-row calls
 /// took before the tiled arm's own 8-bit branch, i.e. the slab arrangement the
-/// A/B's lever cannot reach at `m == 1` (it lowers the row-grouped encoder alone).
+/// A/B's lever cannot reach at `m == 1` (it stands both multi-row tiles down and
+/// nothing else).
 /// Returns the leg's output, its own route census, and the two device counters
 /// over the leg *including its readback* — the A side of the bracket is a graph
 /// run, whose readback is inside the window its counters are read over, so a leg
@@ -301,7 +344,7 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     let step_by_step = rlx_ir::env::flag("RLX_WGPU_ONE_OP_PER_PASS");
 
     // m == 1 keeps today's single-row path.
-    let one = route_of(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 1);
+    let (one, _) = route_of(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 1, 256, 64);
     assert_eq!(
         (one.per_row, one.grouped),
         (1, 0),
@@ -309,26 +352,29 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     );
 
     // Any m > 1 — including 2 and 3, the lowest sizes that must be served — takes
-    // the grouped path, up to the ~96 rows the model bodies use and the ~276 of the
-    // widest matrices.
+    // one fused multi-row dispatch, up to the ~96 rows the model bodies use and the
+    // ~276 of the widest matrices. Which of the two tiles takes it is the encoder's
+    // own answer for the shape: at these cells' 64 columns the cooperative tile's
+    // 128-column term refuses every row count, so it is the row-grouped one — and
+    // the one-row arm is what must not appear at any of them.
     for m in [2usize, 3, 4, 5, 6, 7, 8, 9, 96, 276] {
-        let c = route_of(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, m);
+        let (c, coop) = route_of(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, m, 256, 64);
         assert_eq!(
-            (c.grouped, c.per_row),
-            (1, 0),
-            "Q4_K m={m} must be one grouped dispatch: {c:?}"
+            (c.coop, c.grouped, c.per_row),
+            if coop { (1, 0, 0) } else { (0, 1, 0) },
+            "Q4_K m={m} must be one fused multi-row dispatch: {c:?}"
         );
     }
     for m in [2usize, 4, 96] {
-        let c = route_of(QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K, m);
+        let (c, coop) = route_of(QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K, m, 256, 64);
         assert_eq!(
-            (c.grouped, c.per_row),
-            (1, 0),
-            "Q6_K m={m} must be one grouped dispatch: {c:?}"
+            (c.coop, c.grouped, c.per_row),
+            if coop { (1, 0, 0) } else { (0, 1, 0) },
+            "Q6_K m={m} must be one fused multi-row dispatch: {c:?}"
         );
     }
     // The one-bit scheme keeps its own multi-row GEMM.
-    let q1 = route_of(QuantScheme::GgufQ1_0, rlx_gguf::GgmlType::Q1_0, 4);
+    let (q1, _) = route_of(QuantScheme::GgufQ1_0, rlx_gguf::GgmlType::Q1_0, 4, 256, 64);
     assert_eq!(
         (q1.q1_0_gemm, q1.grouped),
         (1, 0),
@@ -336,22 +382,26 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     );
     // A scheme with no fused kernel still takes the host / scratch route — the
     // case the compile-time report shows as native because the op is claimed.
-    let q5 = route_of(QuantScheme::GgufQ5_0, rlx_gguf::GgmlType::Q5_0, 4);
+    let q5 = route_of(QuantScheme::GgufQ5_0, rlx_gguf::GgmlType::Q5_0, 4, 256, 64).0;
     assert_eq!(q5.host + q5.scratch, 1, "Q5_0 route: {q5:?}");
 
     // Q4_K parity at a second shape (k=256, n=640), m=1 against m=96, against the
     // CPU reference. The routes for these two cells are asserted by the shape grid
-    // below, alongside every other shape; this loop is what pins their parity.
+    // below, alongside every other shape; this loop is what pins their parity, at
+    // the bar the census of each cell says it is held to.
     for m in [1usize, 96] {
         let scheme = QuantScheme::GgufQ4K;
         let (g, packed, x) = case(scheme, rlx_gguf::GgmlType::Q4K, m, 256, 640);
+        reset_route_counts();
         let gpu = run(Device::Gpu, g.clone(), &packed, &x);
+        let took_coop = route_counts().coop > 0;
         let cpu = run(Device::Cpu, g, &packed, &x);
         let max_abs = max_abs_diff(&gpu, &cpu);
-        eprintln!("{scheme:?} m={m} k=256 n=640: max_abs={max_abs:.6e}");
+        let tol = packed_bar_at(took_coop, common::magnitude(&cpu));
+        eprintln!("{scheme:?} m={m} k=256 n=640: max_abs={max_abs:.6e} tol={tol:.6e}");
         assert!(
-            max_abs <= 1e-2,
-            "{scheme:?} m={m}: max_abs {max_abs} > 1e-2"
+            max_abs <= tol,
+            "{scheme:?} m={m}: max_abs {max_abs} > {tol}"
         );
     }
 
@@ -368,15 +418,16 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // here to reach — a fused family whose k is not a whole number of blocks, which
     // books no slab for the selector to fall back into). Q8_0 changes at `m == 1`
     // too: one row of the tiled kernel's 8-bit branch, over this scheme's own
-    // 32-element blocks, below; the row-grouped GEMM above, reading the packed
+    // 32-element blocks, below; a fused multi-row GEMM above — the cooperative tile
+    // where it admits the shape, the row-grouped one otherwise — reading the packed
     // weight in place at any `k` that is a whole number of those same blocks — so
     // the 256-element staged tile that arm stages, eight blocks, is not what the
     // split turns on: the k=384 cell is 12 whole blocks and 1.5 tiles and is grouped
     // while the K-quants' cells at that same k fall to the host. That term's
     // negative is the `k = 100` cell of the device-free ladder pin above; no cell of
     // this grid is off it, since no packed weight carries a partial block. Q4_K /
-    // Q6_K change at `m == 1` the same way: one per-row GEMV below, one row-grouped
-    // dispatch above.
+    // Q6_K change at `m == 1` the same way: one per-row GEMV below, one fused
+    // multi-row dispatch above.
     //
     // The model-class graph's own widths (H=1024, I=4096) are counter-checked here
     // in both regimes rather than only derived: gate/up is k=1024→n=4096, down is
@@ -440,7 +491,7 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             reset_route_counts();
             let gpu = run(Device::Gpu, g.clone(), &packed, &x);
             let c = route_counts();
-            // `Debug` is the backend's own census — all five counters, rather than
+            // `Debug` is the backend's own census — all six counters, rather than
             // one name picked for them.
             eprintln!(
                 "[rlx-gguf-route] scheme={scheme:?} m={m} k={k} n={n} batch={batch:?} route={c:?}"
@@ -448,41 +499,53 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             let fused = matches!(scheme, QuantScheme::GgufQ4K | QuantScheme::GgufQ6K);
             let aligned = k.is_multiple_of(scheme.gguf_block_size() as usize);
             // Q8_0's one-row arm is the tiled kernel's 8-bit branch, over this
-            // scheme's own 32-element blocks; its multi-row one is the GEMM, whose
-            // gate is those same blocks rather than the 256-element staged tile it
-            // stages eight of. Off either of them the slab is all there is.
+            // scheme's own 32-element blocks; its multi-row one is a fused GEMM,
+            // whose gate is those same blocks rather than the 256-element staged tile
+            // it stages eight of. Off either of them the slab is all there is.
             let byte_direct = scheme == QuantScheme::GgufQ8_0 && q8_0_byte_direct(m, k);
             let one_row = scheme == QuantScheme::GgufQ8_0 && q8_0_one_row(m, k);
             // The one-row term: `fused` is where a K-quant's `m == 1` lands, and
             // Q8_0's is the scheme term above, whose block is its own 32 elements.
             let one_row_arm = m == 1 && (fused || one_row);
+            // Which of the two multi-row tiles serves this shape, asked of the
+            // encoder's own predicate rather than named here: its terms are the
+            // shape's and the device's, and a literal would be a second statement of
+            // them. One fused dispatch either way.
+            let fused_tile = if coop_admits(scheme, m, k, n) {
+                (1, 0, 0, 0, 0)
+            } else {
+                (0, 1, 0, 0, 0)
+            };
             let want = match (fused, byte_direct, one_row_arm, aligned) {
-                (_, true, ..) => (1, 0, 0, 0), // Q8_0 m>1, whole-block k: the grouped GEMM
-                (_, _, true, _) => (0, 1, 0, 0), // the tiled arm at one row: the K-quants, and Q8_0's own branch
-                (false, false, ..) => (0, 0, 1, 0), // Q5_K / Q8_0 off its arms: the slab
+                // Q8_0 m>1, whole-block k: the fused multi-row GEMM, not a row loop.
+                (_, true, ..) => fused_tile,
+                (_, _, true, _) => (0, 0, 1, 0, 0), // the tiled arm at one row: the K-quants, and Q8_0's own branch
+                (false, false, ..) => (0, 0, 0, 1, 0), // Q5_K / Q8_0 off its arms: the slab
                 // Decode takes one row per call so long as k is a multiple of
                 // four (the tiled arm's `vec4` X read); the block gate is the
                 // m > 1 GEMM's.
-                (true, _, false, true) => (1, 0, 0, 0),
-                (true, _, false, false) => (0, 0, 0, 1), // host fallback: no slab booked, no row slicing
+                (true, _, false, true) => fused_tile,
+                (true, _, false, false) => (0, 0, 0, 0, 1), // host fallback: no slab booked, no row slicing
             };
             assert_eq!(
-                (c.grouped, c.per_row, c.scratch, c.host),
+                (c.coop, c.grouped, c.per_row, c.scratch, c.host),
                 want,
                 "{scheme:?} m={m} k={k} n={n} batch={batch:?}: {c:?}"
             );
             // The host fallback's numbers are checked here as well as its counter:
             // the row slices are invalid and a broken staging would show as a wrong
             // or non-finite value, not as a wrong counter. So are the cells that
-            // left the slab for Q8_0's arms — the grouped GEMM's, whose first
-            // evidence against the CPU reference is the grid's own shapes rather
-            // than only the packed steps' the throughput block below uses, and the
-            // one-row branch's, whose block stride a counter cannot see either.
-            if want == (0, 0, 0, 1) || byte_direct || one_row {
+            // left the slab for Q8_0's arms — the fused multi-row GEMM's, whose
+            // first evidence against the CPU reference is the grid's own shapes
+            // rather than only the packed steps' the throughput block below uses,
+            // and the one-row branch's, whose block stride a counter cannot see
+            // either.
+            if want == (0, 0, 0, 0, 1) || byte_direct || one_row {
                 let cpu = run(Device::Cpu, g, &packed, &x);
                 let max_abs = max_abs_diff(&gpu, &cpu);
+                let tol = packed_bar_at(c.coop > 0, common::magnitude(&cpu));
                 eprintln!(
-                    "{}{scheme:?} m={m} k={k} n={n}: max_abs={max_abs:.6e}",
+                    "{}{scheme:?} m={m} k={k} n={n}: max_abs={max_abs:.6e} tol={tol:.6e}",
                     if byte_direct {
                         "byte-direct "
                     } else if one_row {
@@ -492,11 +555,187 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
                     }
                 );
                 assert!(
-                    max_abs <= 1e-2,
-                    "{scheme:?} m={m} k={k} n={n}: max_abs {max_abs} > 1e-2"
+                    max_abs <= tol,
+                    "{scheme:?} m={m} k={k} n={n}: max_abs {max_abs} > {tol}"
                 );
             }
         }
+    }
+
+    // The cooperative tile at the product's own prefill shapes: the row counts the
+    // packed steps multiply (`tokens + 15` over its six frame rungs, of which 95 is
+    // the typical seven-second piece), the body's own widest projections, and one
+    // 8-bit cell. `m = 31` is the sub-tile case — one 32-row tile serving a call one
+    // row short of it, into the 32-row slab the encoder gives it, so the surplus row
+    // lands in scratch rather than past the output. What is pinned is the *census*:
+    // the backend's own counter reports `coop == 1` and `grouped == 0`, not a route
+    // string derived from the predicate.
+    //
+    // Gated on the encoder's own predicate for the shape, so an adapter without
+    // cooperative matrices (DX12) or one whose `coop_probe` refuses the operand
+    // convention prints the reason and skips: the tile is an optimisation, and the
+    // grouped fallback is what the grid above covers.
+    for &(scheme, ggml, m, k, n) in &[
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            95usize,
+            2048usize,
+            2048,
+        ),
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            111,
+            2048,
+            2048,
+        ),
+        (
+            QuantScheme::GgufQ6K,
+            rlx_gguf::GgmlType::Q6K,
+            95,
+            6144,
+            2048,
+        ),
+        (
+            QuantScheme::GgufQ8_0,
+            rlx_gguf::GgmlType::Q8_0,
+            96,
+            1024,
+            4096,
+        ),
+        // The two shortest rungs at the body's widest projection: `m = 31` is the
+        // sub-tile case (one 32-row tile serving a call one row short of it, into
+        // the 32-row slab the encoder gives it, so the surplus row lands in scratch
+        // rather than past the output).
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            31,
+            2048,
+            12288,
+        ),
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            47,
+            2048,
+            12288,
+        ),
+    ] {
+        if !coop_admits(scheme, m, k, n) {
+            let dev = wgpu_device().expect("a wgpu device: this test skips without one");
+            eprintln!(
+                "[rlx-gguf-coop] {scheme:?} m={m} k={k} n={n}: the cooperative tile does \
+                 not admit this shape on this adapter (kernel_buildable={} probe={}) — \
+                 skipping. A kernel_buildable=false on an adapter that has cooperative \
+                 matrices is a WGSL defect, and `gguf_gpu.rs`'s \
+                 `coop_shader_validates_and_pins_the_geometry` is the gate that fails on it \
+                 rather than skipping here",
+                rlx_wgpu::kernels::dequant_gemm_coop_kernel(
+                    rlx_wgpu::gguf_host::gguf_scheme_id(scheme),
+                    &dev.device
+                )
+                .is_some(),
+                rlx_wgpu::coop_probe::f16_f32acc_path_ok(),
+            );
+            continue;
+        }
+        // The census only: these are the parity suite's own cells, and its cells are
+        // where the values are checked. What this binary adds is that the encoder is
+        // *seen* to take the tile at them.
+        let (g, packed, x) = case(scheme, ggml, m, k, n);
+        reset_route_counts();
+        let _ = run(Device::Gpu, g, &packed, &x);
+        let c = route_counts();
+        eprintln!(
+            "[rlx-gguf-coop] {scheme:?} m={m} k={k} n={n}: coop={} grouped={}",
+            c.coop, c.grouped
+        );
+        assert_eq!(
+            (c.coop, c.grouped),
+            (1, 0),
+            "{scheme:?} m={m} k={k} n={n}: the cooperative tile must be the census: {c:?}"
+        );
+    }
+
+    // The grid floor, from the other side: a shape whose 32-row tile leaves too few
+    // workgroups to fill the device is the row-grouped tile's, whose four times the
+    // row groups are. These are the product's own narrow cases — the body's `o`
+    // projection at the two shortest rungs (`m = 31` and `47` against `n = 2 048`:
+    // 16 and 32 workgroups) and the wake word's two-window encoder pass (`m = 20`
+    // against the `ffn`'s `n = 4 096`: 32). Each is asserted both ways: the
+    // predicate refuses it, and the census is the grouped tile — so a floor moved
+    // without re-measuring shows up here rather than as a slower product.
+    for &(scheme, ggml, m, k, n) in &[
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            31usize,
+            2048usize,
+            2048,
+        ),
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            47,
+            2048,
+            2048,
+        ),
+        (
+            QuantScheme::GgufQ8_0,
+            rlx_gguf::GgmlType::Q8_0,
+            20,
+            1024,
+            4096,
+        ),
+    ] {
+        let (grid_x, grid_y) = rlx_wgpu::kernels::coop_gemm_gguf_grid(m as u32, n as u32);
+        assert!(
+            !coop_admits(scheme, m, k, n),
+            "{scheme:?} m={m} k={k} n={n}: {} workgroups is below the cooperative \
+             tile's floor of {}",
+            grid_x * grid_y,
+            rlx_wgpu::gguf_gpu::COOP_MIN_WORKGROUPS
+        );
+        let (g, packed, x) = case(scheme, ggml, m, k, n);
+        reset_route_counts();
+        let _ = run(Device::Gpu, g, &packed, &x);
+        let c = route_counts();
+        assert_eq!(
+            (c.coop, c.grouped),
+            (0, 1),
+            "{scheme:?} m={m} k={k} n={n}: below the grid floor the row-grouped tile \
+             must be the census: {c:?}"
+        );
+    }
+
+    // The row-rounding floor, from both sides. The tile covers `ceil(m / 32) * 32`
+    // rows and spends the difference on nothing, so the admission refuses a call
+    // whose rounding is more than a third of its dispatch — even when the grid is
+    // wide enough for the workgroup floor, which is why these cells sit at the
+    // body's widest projection (96 workgroups, twice that floor). 21 and 22 rows
+    // straddle the term exactly: 11 rows past `m` out of 32 is more than a third,
+    // 10 is not.
+    for &(m, admitted) in &[(21usize, false), (22usize, true)] {
+        let (scheme, ggml) = (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K);
+        let (k, n) = (2048usize, 12288usize);
+        assert_eq!(
+            coop_admits(scheme, m, k, n),
+            admitted,
+            "{scheme:?} m={m} k={k} n={n}: {} of the 32-row dispatch's rows are past \
+             `m`, and the admission allows at most a third",
+            32 - m
+        );
+        let (g, packed, x) = case(scheme, ggml, m, k, n);
+        reset_route_counts();
+        let _ = run(Device::Gpu, g, &packed, &x);
+        let c = route_counts();
+        assert_eq!(
+            (c.coop, c.grouped),
+            if admitted { (1, 0) } else { (0, 1) },
+            "{scheme:?} m={m} k={k} n={n}: the census must follow the rounding term: {c:?}"
+        );
     }
 
     // A weight window wider than the binding limit must be N-chunked (the
@@ -523,22 +762,31 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     for &(scheme, ggml, m, k) in chunked {
         let (g, packed, x) = case(scheme, ggml, m, k, 16384);
         rlx_ir::env::set("RLX_WGPU_MAX_BIND_MB", "1");
+        // Asked inside the bracket: the predicate's column-chunk term is this cap's,
+        // so the answer is the one this run's encoder saw. A call split across
+        // chunks cannot take the cooperative tile, which wants the whole call in one.
+        let coop = coop_admits(scheme, m, k, 16384);
         reset_route_counts();
         let gpu = run(Device::Gpu, g.clone(), &packed, &x);
         let c = route_counts();
         let cpu = run(Device::Cpu, g, &packed, &x);
         rlx_ir::env::unset("RLX_WGPU_MAX_BIND_MB");
         assert_eq!(
-            (c.grouped, c.per_row),
-            (1, 0),
+            (c.coop, c.grouped, c.per_row),
+            if coop { (1, 0, 0) } else { (0, 1, 0) },
             "{scheme:?} m={m} k={k}: a weight window over the binding limit must still \
-             be grouped: {c:?}"
+             be one fused multi-row dispatch, and a chunked one is the row-grouped tile: \
+             {c:?}"
         );
         let max_abs = max_abs_diff(&gpu, &cpu);
-        eprintln!("chunked-window {scheme:?} m={m} k={k} n=16384: max_abs={max_abs:.6e}");
+        let tol = packed_bar_at(c.coop > 0, common::magnitude(&cpu));
+        eprintln!(
+            "chunked-window {scheme:?} m={m} k={k} n=16384: max_abs={max_abs:.6e} \
+             tol={tol:.6e}"
+        );
         assert!(
-            max_abs <= 1e-2,
-            "chunked-window {scheme:?} m={m} k={k}: max_abs {max_abs} > 1e-2"
+            max_abs <= tol,
+            "chunked-window {scheme:?} m={m} k={k}: max_abs {max_abs} > {tol}"
         );
     }
 
@@ -883,13 +1131,15 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // those widths, since a row-grouped kernel can lose above the rows it was built
     // for.
     //
-    // Both sides are one build and one instrument: A is the default route, B is
-    // the same call with `RLX_WGPU_Q8_0_GEMM_DISABLE=1`, which is the dequant slab
-    // — this scheme's route before the multi-row arm, at every m above one. That
-    // switch lowers the row-grouped encoder and nothing else, so the single-row arm
-    // is out of its reach: at m=1 both sides are that arm (the ~1 ratio it records,
-    // and its census below), and that arm's own expansion — the slab this scheme's
-    // one-row calls used to take — is driven from the plan instead. The two sides
+    // Both sides are one build and one instrument: A is the default route — the
+    // cooperative tile where it admits the shape, the row-grouped one otherwise —
+    // and B is the same call with `RLX_WGPU_Q8_0_GEMM_DISABLE=1`, which is the
+    // dequant slab — this scheme's route before the multi-row arms, at every m
+    // above one. That switch stands both fused tiles down and nothing else, so the
+    // single-row arm is out of its reach: at m=1 both sides are that arm (the ~1
+    // ratio it records, and its census below), and that arm's own expansion — the
+    // slab this scheme's one-row calls used to take — is driven from the plan
+    // instead. The two sides
     // share one compiled graph, one arena and one uploaded weight, and each side's
     // own census below proves which route it ran. The calls alternate A/B within a
     // round rather than running one side at a time: this crate's A/B protocol notes
@@ -962,8 +1212,9 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             // slab, whose `dequant_gguf` and `matmul_bt` submit again (hence the four
             // against the one it prints, on an adapter that fuses the readback; a
             // separate readback adds its own to both sides). At the m=1 control both
-            // sides are this scheme's one-row arm — the lever lowers the grouped
-            // encoder alone — so that cell's ratio is ~1 and its two censuses agree:
+            // sides are this scheme's one-row arm, which the lever does not reach —
+            // it stands the two multi-row tiles down, and a one-row call takes
+            // neither — so that cell's ratio is ~1 and its two censuses agree:
             // the record that the single-row arm has no lever to be lowered by, and
             // why its own slab leg below is driven from the plan instead.
             reset_route_counts();
@@ -984,26 +1235,31 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             // Only the arm is lowered: a call with no slab behind it must not
             // change route with the switch either, so this is exact for both.
             //
-            // Every multi-row cell of this grid is admitted and the m=1 control is
-            // not — that cell is this scheme's own one-row arm, which the lever does
-            // not reach — so the expectation is the ladder's terms as a literal
-            // rather than a restatement of them: each `k` in the grid is a whole
-            // number of this scheme's own 32-element blocks, which is the admission's
-            // `k` term, the planner aligns the X window, and the plan books this
-            // scheme's slab unconditionally. The 128 / 288 / 896 cells are off the
-            // 256-element staged tile that arm stages eight blocks of, and are still
-            // admitted: the tile is not the gate. A lane that stops being admitted at
-            // one of these shapes must re-point this literal deliberately; it fails
-            // the census below rather than skipping the block's own checks.
+            // Every multi-row cell of this grid is admitted by one of the two fused
+            // tiles and the m=1 control is not — that cell is this scheme's own
+            // one-row arm, which the lever does not reach. Which of the two takes the
+            // A side is asked of the encoder's own predicate for the shape rather
+            // than named: each `k` here is a whole number of this scheme's own
+            // 32-element blocks, which is the admission's `k` term, the planner
+            // aligns the X window, and the plan books this scheme's slab
+            // unconditionally. B is the slab, because the lever stands both tiles
+            // down. The 128 / 288 / 896 cells are off the 256-element staged tile,
+            // and are still admitted: the tile is not the gate.
             let direct_arm = m > 1;
+            let coop = coop_admits(QuantScheme::GgufQ8_0, m, k, n);
             assert_eq!(
                 (
-                    a.per_row, a.grouped, a.scratch, b.per_row, b.grouped, b.scratch
+                    a.coop, a.per_row, a.grouped, a.scratch, b.coop, b.per_row, b.grouped,
+                    b.scratch
                 ),
                 if direct_arm {
-                    (0, 1, 0, 0, 0, 1)
+                    if coop {
+                        (1, 0, 0, 0, 0, 0, 0, 1)
+                    } else {
+                        (0, 0, 1, 0, 0, 0, 0, 1)
+                    }
                 } else {
-                    (1, 0, 0, 1, 0, 0)
+                    (0, 1, 0, 0, 0, 1, 0, 0)
                 },
                 "Q8_0 m={m} k={k} n={n}: the arm must be the default route and the \
                  switch must lower it to the slab above one row, while the single-row \
@@ -1080,25 +1336,35 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
                 // arm replaced — a route-against-route check, independent of the
                 // test's weight scale, that catches the stride and the byte
                 // unpack of the arm's own read. The CPU reference is the op's
-                // declared reference; same absolute 1e-2 every packed-multiply
-                // check in this crate uses. The CPU side runs for the packed steps'
-                // own rows (m <= 72) only: past them the grid above and
-                // `gguf_dequant_matmul_prefill_parity.rs` carry the same
-                // comparison at their own shapes.
+                // declared reference. Both are held to the bar the census above says
+                // this cell's tile has: the cooperative tile's two bars where it
+                // served the call, the 1e-2 every other route keeps otherwise. The
+                // CPU side runs for the packed steps' own rows (m <= 72) only: past
+                // them the grid above and `gguf_dequant_matmul_prefill_parity.rs`
+                // carry the same comparison at their own shapes.
                 let vs_slab = max_abs_diff(&direct, &slab);
-                eprintln!("byte-direct Q8_0 m={m} k={k} n={n}: vs_slab_max_abs={vs_slab:.6e}");
+                let slab_tol = packed_bar_at(a.coop > 0, common::magnitude(&slab));
+                eprintln!(
+                    "byte-direct Q8_0 m={m} k={k} n={n}: vs_slab_max_abs={vs_slab:.6e} \
+                     tol={slab_tol:.6e}"
+                );
                 assert!(
-                    vs_slab <= 1e-2,
-                    "byte-direct Q8_0 m={m} k={k} n={n}: {vs_slab} from the slab route"
+                    vs_slab <= slab_tol,
+                    "byte-direct Q8_0 m={m} k={k} n={n}: {vs_slab} from the slab route, \
+                     over {slab_tol}"
                 );
                 if m <= 72 {
                     let (gc, _, _) = case(QuantScheme::GgufQ8_0, rlx_gguf::GgmlType::Q8_0, m, k, n);
                     let cpu = run(Device::Cpu, gc, &packed, &x);
                     let max_abs = max_abs_diff(&direct, &cpu);
-                    eprintln!("byte-direct Q8_0 m={m} k={k} n={n}: vs_cpu_max_abs={max_abs:.6e}");
+                    let tol = packed_bar_at(a.coop > 0, common::magnitude(&cpu));
+                    eprintln!(
+                        "byte-direct Q8_0 m={m} k={k} n={n}: vs_cpu_max_abs={max_abs:.6e} \
+                         tol={tol:.6e}"
+                    );
                     assert!(
-                        max_abs <= 1e-2,
-                        "byte-direct Q8_0 m={m} k={k} n={n}: max_abs {max_abs} > 1e-2"
+                        max_abs <= tol,
+                        "byte-direct Q8_0 m={m} k={k} n={n}: max_abs {max_abs} > {tol}"
                     );
                 }
             }
