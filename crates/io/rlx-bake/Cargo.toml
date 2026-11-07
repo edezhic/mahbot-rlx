@@ -36,8 +36,10 @@ rlx-ir = { workspace = true, features = ["serialize"] }
 rlx-compile = { workspace = true }
 rlx-fusion = { workspace = true }
 rlx-gguf = { workspace = true }
-rlx-pkg = { workspace = true }
-rlx-mlx-io = { workspace = true }
+# libzstd for warm/cold tiers: real compression levels when baking (rlx-pkg's
+# pure-Rust encoder only has its fastest level).
+rlx-pkg = { workspace = true, features = ["write", "convert", "parallel", "zstd-native"] }
+rlx-mlx-io = { workspace = true, features = ["io"] }
 rlx-dduf = { workspace = true }
 rlx-onnx-import = { workspace = true, optional = true }
 rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime", version = "0.2.18-mahbot.2", optional = true, default-features = true }
@@ -59,7 +61,7 @@ rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime",
 [[test]]
 name = "onnx_to_rlxp"
 path = "tests/onnx_to_rlxp.rs"
-required-features = ["onnx"]
+required-features = ["onnx", "backend-tests"]
 
 [[example]]
 name = "mnist_train_bake"

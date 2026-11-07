@@ -32,6 +32,7 @@ default = []
 apple = ["rlx-runtime/apple"]
 gpu = ["rlx-runtime/gpu"]
 metal = ["rlx-runtime/metal"]
+coreml = ["rlx-runtime/coreml"]
 vulkan = ["rlx-runtime/vulkan"]
 cuda = ["rlx-runtime/cuda"]
 rocm = ["rlx-runtime/rocm"]
@@ -70,3 +71,4 @@ required-features = ["backend-tests"]
 [lib]
 # No doctests in this crate: the empty stage was pure rustdoc cost.
 doctest = false
+

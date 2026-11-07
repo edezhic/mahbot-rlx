@@ -14,7 +14,7 @@ use rlx_xdna::aie::{Eltwise, emit_eltwise, emit_eltwise_multicol};
 use std::time::Instant;
 
 fn env(k: &str, d: &str) -> String {
-    std::env::var(k).unwrap_or_else(|_| d.to_string())
+    rlx_ir::env::read(k).unwrap_or_else(|_| d.to_string())
 }
 
 fn main() {
@@ -44,8 +44,9 @@ fn main() {
     );
 
     // 2) COMPILE it with the native aiecc (no Python).
-    let aiecc = std::env::var("AIECC").expect("set AIECC (.../mlir_aie/bin/aiecc)");
-    let peano = std::env::var("PEANO").expect("set PEANO (.../llvm-aie)");
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let aiecc = tc.aiecc_str();
+    let peano = tc.peano_str();
     let tmp = format!("/tmp/rlx_elt_{}", op.name());
     std::fs::create_dir_all(&tmp).ok();
     let mlir_path = format!("{tmp}/aie.mlir");

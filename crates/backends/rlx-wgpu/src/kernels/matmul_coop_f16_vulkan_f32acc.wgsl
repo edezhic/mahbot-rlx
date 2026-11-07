@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 // RLX — f16 A/B with f32 cooperative accumulator (RTX tensor-core path).
 // Single f32 acc over full K — matches sequential f16 product → f32 sum ref.
 
@@ -10,41 +13,23 @@ enable f16;
 //
 // ── COOPERATIVE-MATRIX LAYOUT CONVENTION (read before editing) ──────────────
 //
-// naga's shared WGSL frontend sets `row_major = function_name.ends_with("T")`,
-// so `coopLoad`/`coopLoadT` differ by one bool. That bool reaches the two
-// backends as DIFFERENT THINGS: the MSL backend passes it to Metal's
-// `simdgroup_load(..., transpose_matrix)`, the SPIR-V backend turns it into
-// `RowMajorKHR`/`ColumnMajorKHR` on `OpCooperativeMatrixLoadKHR`. Identical
-// WGSL therefore does NOT mean identical behaviour on Metal and Vulkan.
+// naga sets `row_major = function_name.ends_with("T")`: on SPIR-V `coopLoadT` /
+// `coopStoreT` are `RowMajorKHR` and the plain forms `ColumnMajorKHR`. A, B and
+// the output tile are all row-major here (`a_ptr + r*k`, `b_ptr + r*n`,
+// `tile[r*TILE + c]`), so every load and store is the `T` form — the same
+// spelling the Metal kernels (`matmul_coop_f32.wgsl`, `matmul_coop16.wgsl`) use.
 //
-// This is measured, not inferred. The Metal kernels
-// (`matmul_coop_f32.wgsl`, `matmul_qkv_coop_f32.wgsl`, `matmul_coop16.wgsl`)
-// needed `coopLoadT` + `coopStoreT` on EVERY operand; with the plain forms they
-// computed `b·a` instead of `a·b` (near-orthogonal for unrelated matrices —
-// the cos 0.016 "orthogonal garbage" that kept Metal CoopF32 opt-in for a long
-// time). The Vulkan convention in this file — `coopLoad` on A, `coopLoadT` on B
-// — was then tried on Metal and is WRONG there: it leaves only the first column
-// of each 8x8 tile correct and zeroes the rest. So the two conventions are
-// genuinely different and must NOT be unified. These Vulkan kernels were
-// deliberately left alone.
+// Measured on an RTX 3080 Ti (Vulkan, VK_KHR_cooperative_matrix) with the
+// non-commuting probe in `src/coop_probe.rs`, over all eight load/store
+// combinations: only `coopLoadT` on A and B with `coopStoreT` computes `a·b`.
+// The spelling this family shipped with (`coopLoad` on A, `coopStore` on the
+// tile) failed it in every variant, so the runtime probe had been refusing the
+// whole path on that device.
 //
-// This file holds the REFERENCE Vulkan convention (`coopLoad` on A,
-// `coopLoadT` on B), established on RTX hardware. Note that its `_widen`
-// sibling uses `coopLoad` on B against the same pointer and stride, which
-// contradicts this file. Which of the two runs is measured, not chosen by size
-// (`coop_probe::f16_vk_widen_choice`), so the size rule is only a tie-break.
-// See the ⚠ block in `matmul_coop_f16_vulkan_widen.wgsl`; one of the two is
-// wrong.
-//
-// HOW THIS IS HANDLED NOW: `src/coop_probe.rs` runs a non-commuting GEMM probe
-// through this kernel on the actual device, once per process, and
-// `derive_matmul_compute` / `pick_coop_f16_vk_matmul` believe the result. If
-// this shader computes `a·b` here it is used; if it does not, it is reported
-// ineligible and the caller falls back to the portable tiled matmul — slower,
-// correct. So the open question above can no longer produce wrong numbers on
-// any device, including ones no developer machine can reach. It is still worth
-// settling on real hardware, because the answer decides whether the fast path
-// is available at all; `tests/coop_self_check.rs` prints the verdict per kernel.
+// The `_widen` siblings read B with `coopLoad` and were picked for `n > 768`.
+// A layout does not depend on N, and that form computes `a·bᵀ`. They now match
+// their base kernels token for token (save the entry point) and stay only
+// because the size-based selection still names them.
 enable wgpu_cooperative_matrix;
 
 struct Params {
@@ -61,7 +46,7 @@ struct Params {
     has_bias: u32,
     bias_off: u32,
     act_id: u32,
-    _p0: u32,
+    a_off_f16: u32,  // A in the f16 window (`a_off` is the f32 arena's)
     _p1: u32,
     _p2: u32,
 };
@@ -74,25 +59,43 @@ const TILE: u32 = 16u;
 
 var<workgroup> f32_tile: array<f32, 256>;
 
+// Exact GELU — A&S 7.1.26 erf, the same as `matmul.wgsl` / `matmul_coop_f32.wgsl`
+// and rlx-cpu's `scalar_gelu`. Opcode 9 (`Activation::Gelu`) is the EXACT form;
+// only opcode 11 (`GeluApprox`) is the tanh form. This kernel used to map both
+// to tanh, so a fused matmul+bias+GELU here drifted ~3e-4 from CPU at |x|≈2–3.
+fn gelu_erf(x: f32) -> f32 {
+    let arg = x * 0.70710678118654752;
+    let s = select(-1.0, 1.0, arg >= 0.0);
+    let xa = abs(arg);
+    let t = rlx_div_rn(1.0, fma(0.3275911, xa, 1.0));
+    // explicit fma: an uncontracted chain is contracted differently by
+    // different shader compilers
+    let poly = t * fma(t, fma(t, fma(t, fma(t, 1.061405429, -1.453152027), 1.421413741),
+                -0.284496736), 0.254829592);
+    let e = s * fma(-poly, rlx_exp(-xa * xa), 1.0);
+    return 0.5 * x * (1.0 + e);
+}
+
 fn apply_act(v_in: f32) -> f32 {
     var v = v_in;
     if (params.act_id == 0xFFFFu) { return v; }
     switch (params.act_id) {
         case 0u: { v = max(v, 0.0); }
-        case 1u: { v = 1.0 / (1.0 + exp(-clamp(v, -88.0, 88.0))); }
-        case 2u: { v = tanh(clamp(v, -15.0, 15.0)); }
-        case 5u: { v = sqrt(v); }
+        case 1u: { v = rlx_div_rn(1.0, 1.0 + rlx_exp(-clamp(v, -88.0, 88.0))); }
+        case 2u: { v = rlx_tanh(clamp(v, -15.0, 15.0)); }
+        case 5u: { v = rlx_sqrt_rn(v); }
         case 7u: { v = -v; }
         case 8u: { v = abs(v); }
-        case 9u, 11u: {
+        case 9u: { v = gelu_erf(v); }
+        case 11u: {
             let c = 0.7978845608028654;
             let x3 = v * v * v;
-            let inner = clamp(c * (v + 0.044715 * x3), -15.0, 15.0);
-            v = 0.5 * v * (1.0 + tanh(inner));
+            let inner = clamp(c * fma(0.044715, x3, v), -15.0, 15.0);
+            v = 0.5 * v * (1.0 + rlx_tanh(inner));
         }
         case 10u: {
             let nx = clamp(-v, -88.0, 88.0);
-            v = v / (1.0 + exp(nx));
+            v = rlx_div_rn(v, 1.0 + rlx_exp(nx));
         }
         default: {}
     }
@@ -110,7 +113,7 @@ fn matmul_coop_f16_vulkan_f32acc(
     let tile_row = wid.x * TILE;
     let tile_col = wid.y * TILE;
 
-    let a_base = params.a_off + bz * params.a_batch_stride;
+    let a_base = params.a_off_f16 + bz * params.a_batch_stride;
     let b_base = params.b_off + bz * params.b_batch_stride;
     let c_base = params.c_off + bz * params.c_batch_stride;
 
@@ -121,7 +124,7 @@ fn matmul_coop_f16_vulkan_f32acc(
         let a_ptr = a_base + tile_row * params.k + k_off;
         let b_ptr = b_base + k_off * params.n + tile_col;
         let a_tile: coop_mat16x16<f16, A> =
-            coopLoad<coop_mat16x16<f16, A>>(&arena_f16[a_ptr], params.k);
+            coopLoadT<coop_mat16x16<f16, A>>(&arena_f16[a_ptr], params.k);
         let b_tile: coop_mat16x16<f16, B> =
             coopLoadT<coop_mat16x16<f16, B>>(&arena_f16[b_ptr], params.n);
         acc = coopMultiplyAdd(a_tile, b_tile, acc);
@@ -129,7 +132,7 @@ fn matmul_coop_f16_vulkan_f32acc(
     }
 
     let lane = lid.x;
-    coopStore(acc, &f32_tile[0], TILE);
+    coopStoreT(acc, &f32_tile[0], TILE);
     workgroupBarrier();
 
     for (var i: u32 = 0u; i < 4u; i = i + 1u) {

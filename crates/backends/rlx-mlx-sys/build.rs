@@ -252,6 +252,10 @@ fn main() {
         println!("cargo:rerun-if-env-changed={var}");
     }
     println!("cargo:rerun-if-env-changed=RLX_MLX_JOBS");
+    println!("cargo:rerun-if-env-changed=RLX_MLX_CCACHE");
+    println!("cargo:rerun-if-env-changed=RLX_MLX_NO_CCACHE");
+    println!("cargo:rerun-if-env-changed=CMAKE_CXX_COMPILER_LAUNCHER");
+    println!("cargo:rerun-if-env-changed=CMAKE_C_COMPILER_LAUNCHER");
 
     let mut mlx_cfg = cmake::Config::new(&mlx_src);
     mlx_cfg
@@ -313,14 +317,16 @@ fn main() {
         deploy
     });
 
-    let use_ccache = (is_macos || apple_embedded.is_some())
-        && env_flag("RLX_MLX_NO_CCACHE") != Some(true)
-        && Command::new("ccache")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-    mlx_cfg.define("MLX_USE_CCACHE", if use_ccache { "ON" } else { "OFF" });
+    // MLX's own lookup knows only ccache; set the launcher ourselves so
+    // sccache works too, and keep MLX's lookup off so it cannot replace it.
+    mlx_cfg.define("MLX_USE_CCACHE", "OFF");
+    if target_os != "windows" {
+        if let Some(launcher) = compiler_launcher() {
+            for lang in ["C", "CXX", "CUDA"] {
+                mlx_cfg.define(format!("CMAKE_{lang}_COMPILER_LAUNCHER"), &launcher);
+            }
+        }
+    }
 
     apply_cmake_parallelism(&mut mlx_cfg);
 
@@ -341,7 +347,7 @@ fn main() {
         if let Some(tk) = &cuda {
             println!(
                 "cargo:warning=rlx-mlx-sys: building MLX CUDA backend ({cmake_build_type}) with \
-                 {}; first compile can take ~1h — use ccache + keep RLX_MLX_CUDA=1 stable",
+                 {}; first compile can take ~1h — install sccache or ccache + keep RLX_MLX_CUDA=1 stable",
                 tk.describe()
             );
             mlx_cfg.define("MLX_BUILD_CUDA", "ON");
@@ -739,6 +745,57 @@ fn apply_cmake_parallelism(cfg: &mut cmake::Config) {
         if !jobs.is_empty() {
             cfg.env("CMAKE_BUILD_PARALLEL_LEVEL", jobs);
         }
+    }
+}
+
+/// The compiler cache for MLX's C++/CUDA sources: `RLX_MLX_CCACHE`
+/// (`sccache`, `ccache`, a path, or `off`), else the environment's
+/// `CMAKE_CXX_COMPILER_LAUNCHER` / `CMAKE_C_COMPILER_LAUNCHER`, else sccache,
+/// else ccache — the first one that runs. Not used on Windows: the Visual Studio generator the
+/// `cmake` crate picks there ignores compiler launchers.
+fn compiler_launcher() -> Option<String> {
+    let runs = |exe: &str| {
+        Command::new(exe)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if env_flag("RLX_MLX_NO_CCACHE") == Some(true) {
+        return None;
+    }
+    match env::var("RLX_MLX_CCACHE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(_) if env_flag("RLX_MLX_CCACHE") == Some(false) => None,
+        Some(v) => {
+            let v = v.trim().to_string();
+            if runs(&v) {
+                Some(v)
+            } else {
+                println!(
+                    "cargo:warning=rlx-mlx-sys: RLX_MLX_CCACHE={v} does not run; \
+                     building MLX without a compiler cache"
+                );
+                None
+            }
+        }
+        // The machine's own launcher (`[env] CMAKE_CXX_COMPILER_LAUNCHER` in
+        // cargo's config, e.g. kache) wins over a guess: picking sccache here
+        // when `c++` is already a cache shim whose fallback is sccache makes
+        // the sccache server wait on itself, and the MLX build hangs.
+        None => ["CMAKE_CXX_COMPILER_LAUNCHER", "CMAKE_C_COMPILER_LAUNCHER"]
+            .into_iter()
+            .filter_map(|k| env::var(k).ok())
+            .map(|v| v.trim().to_string())
+            .find(|v| !v.is_empty() && runs(v))
+            .or_else(|| {
+                ["sccache", "ccache"]
+                    .into_iter()
+                    .find(|exe| runs(exe))
+                    .map(str::to_string)
+            }),
     }
 }
 

@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 //
 // Scaled dot-product attention backward ([B, H, S, D] or strided layouts).
 // `wrt`: 0 = dQ, 1 = dK, 2 = dV.
@@ -73,11 +76,11 @@ fn softmax_row(scores: ptr<function, array<f32, MAX_ATTN_SEQ>>, seq_k: u32) {
     }
     var sum: f32 = 0.0;
     for (var s: u32 = 0u; s < seq_k; s = s + 1u) {
-        let e = exp((*scores)[s] - m);
+        let e = rlx_exp((*scores)[s] - m);
         (*scores)[s] = e;
         sum = sum + e;
     }
-    let inv = 1.0 / max(sum, 1e-30);
+    let inv = rlx_div_rn(1.0, max(sum, 1e-30));
     for (var s: u32 = 0u; s < seq_k; s = s + 1u) {
         (*scores)[s] = (*scores)[s] * inv;
     }
@@ -203,3 +206,4 @@ fn attention_bwd(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
         }
     }
 }
+

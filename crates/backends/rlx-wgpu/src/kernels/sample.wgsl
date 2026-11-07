@@ -127,8 +127,8 @@ fn gumbel_score(p: f32, i: u32, ctr: u32, key: vec2<u32>) -> f32 {
     let rng2 = threefry2x32_20(vec2<u32>(ctr, i), key);
     // The high 24 bits as a uniform on [0, 1); `1e-30` guards the log of a zero.
     let u: f32 = f32(rng2.x >> 8u) / 16777216.0;
-    let g: f32 = -log(-log(max(u, 1e-30)));
-    return log(p) + g;
+    let g: f32 = -rlx_log(-rlx_log(max(u, 1e-30)));
+    return rlx_log(p) + g;
 }
 
 /// The workgroup width of every entry point in this module, written once: the
@@ -261,7 +261,7 @@ fn sample_one_coop(lane: u32) {
     let sbase = params.scratch_off;
     let temp = bitcast<f32>(params.temp_bits);
     let top_p = bitcast<f32>(params.top_p_bits);
-    let inv_temp = 1.0 / max(temp, 1e-6);
+    let inv_temp = rlx_div_rn(1.0, max(temp, 1e-6));
 
     // 1. Apply temperature into scratch; row max.
     var local_max: f32 = NEG_INF;
@@ -274,7 +274,7 @@ fn sample_one_coop(lane: u32) {
 
     // 2. exp into scratch, then the sum in index order on lane 0.
     for (var i: u32 = lane; i < inner; i = i + LANES) {
-        arena[sbase + i] = exp(arena[sbase + i] - m);
+        arena[sbase + i] = rlx_exp(arena[sbase + i] - m);
     }
     storageBarrier();
     if (lane == 0u) {
@@ -289,7 +289,7 @@ fn sample_one_coop(lane: u32) {
     // the storage accesses need their own barrier — `workgroupBarrier` orders
     // the workgroup address space only.
     storageBarrier();
-    let inv_sum = 1.0 / wg_one;
+    let inv_sum = rlx_div_rn(1.0, wg_one);
     for (var i: u32 = lane; i < inner; i = i + LANES) {
         arena[sbase + i] = arena[sbase + i] * inv_sum;
     }
@@ -343,7 +343,7 @@ fn sample_one_coop(lane: u32) {
         // Lane 0 restored/zeroed the scratch; the scaling loop reads the
         // elements other lanes wrote, so order the storage accesses too.
         storageBarrier();
-        let inv_new = 1.0 / max(wg_one, 1e-12);
+        let inv_new = rlx_div_rn(1.0, max(wg_one, 1e-12));
         for (var i: u32 = lane; i < inner; i = i + LANES) {
             arena[sbase + i] = arena[sbase + i] * inv_new;
         }
@@ -419,7 +419,7 @@ fn sample_one_staged(lane: u32) {
     let base = params.in_off;
     let temp = bitcast<f32>(params.temp_bits);
     let top_p = bitcast<f32>(params.top_p_bits);
-    let inv_temp = 1.0 / max(temp, 1e-6);
+    let inv_temp = rlx_div_rn(1.0, max(temp, 1e-6));
     let need_filter = (params.top_k > 0u) || (top_p < 1.0 && top_p > 0.0);
     let k_limit = select(inner, params.top_k, params.top_k > 0u);
     // A picked set that fits `PICK_MAX` is recorded, and the restore sum and the
@@ -438,14 +438,14 @@ fn sample_one_staged(lane: u32) {
 
     // 2. exp into the staged row, then the sum in index order on lane 0.
     for (var i: u32 = lane; i < inner; i = i + LANES) {
-        row[i] = exp(row[i] - m);
+        row[i] = rlx_exp(row[i] - m);
     }
     workgroupBarrier();
     if (lane == 0u) {
         wg_one = staged_sum(inner);
     }
     workgroupBarrier();
-    let inv_sum = 1.0 / wg_one;
+    let inv_sum = rlx_div_rn(1.0, wg_one);
     for (var i: u32 = lane; i < inner; i = i + LANES) {
         row[i] = row[i] * inv_sum;
     }
@@ -543,7 +543,7 @@ fn sample_one_staged(lane: u32) {
             row[i] = select(0.0, -v - SENTINEL_EPS, v < 0.0);
         }
         workgroupBarrier();
-        let inv_new = 1.0 / max(wg_one, 1e-12);
+        let inv_new = rlx_div_rn(1.0, max(wg_one, 1e-12));
         for (var i: u32 = lane; i < inner; i = i + LANES) {
             row[i] = row[i] * inv_new;
         }
@@ -607,7 +607,7 @@ fn sample(
     let sbase = params.scratch_off + row_idx * params.inner;
     let temp = bitcast<f32>(params.temp_bits);
     let top_p = bitcast<f32>(params.top_p_bits);
-    let inv_temp = 1.0 / max(temp, 1e-6);
+    let inv_temp = rlx_div_rn(1.0, max(temp, 1e-6));
 
     // 1. Apply temperature into scratch; track row max. The logits at
     //    `base` stay read-only.
@@ -620,11 +620,11 @@ fn sample(
     // 2. exp / sum → probabilities (scratch slot).
     var sum_e: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-        let e = exp(arena[sbase + i] - m);
+        let e = rlx_exp(arena[sbase + i] - m);
         arena[sbase + i] = e;
         sum_e = sum_e + e;
     }
-    let inv_sum = 1.0 / sum_e;
+    let inv_sum = rlx_div_rn(1.0, sum_e);
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
         arena[sbase + i] = arena[sbase + i] * inv_sum;
     }
@@ -669,7 +669,7 @@ fn sample(
                 arena[sbase + i] = 0.0;
             }
         }
-        let inv_new = 1.0 / max(new_sum, 1e-12);
+        let inv_new = rlx_div_rn(1.0, max(new_sum, 1e-12));
         for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
             arena[sbase + i] = arena[sbase + i] * inv_new;
         }

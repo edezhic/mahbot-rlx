@@ -733,3 +733,131 @@ fn the_one_row_uniform_record_is_the_size_the_shader_declares() {
         "the host record and the shader's `struct Params` ({words} words) must be one layout"
     );
 }
+
+/// The `const <name>: u32 = <n>u;` a shader declares, as a number.
+fn const_u32(src: &str, name: &str) -> u32 {
+    let head = format!("const {name}: u32 = ");
+    let at = src
+        .find(&head)
+        .unwrap_or_else(|| panic!("no `{head}` in the shader"));
+    let tail = &src[at + head.len()..];
+    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("`{name}` is not a plain integer: {tail:.20}"))
+}
+
+/// The fused entry points are the other half of the hazard the one-row arms are
+/// pinned for. They carry **no `scheme_id` word** — each entry point decodes one
+/// scheme's packing, and the scheme is whichever entry the host dispatched — so
+/// there is no `params.scheme_id` branch to parse and a scheme pointed at another
+/// scheme's entry decodes its packed bytes at the wrong block stride and returns
+/// numbers rather than zeros. What is pinned instead is the other end of the same
+/// agreement: the entry point each routed scheme's getter names
+/// ([`rlx_wgpu::gguf_gpu::grouped_scheme_entry`]), that the shader really declares
+/// it, and that the block geometry that entry point's reader is written against
+/// is the scheme's own.
+///
+/// The four fused shaders' *sets* of entry points are pinned too, because an
+/// entry name that does not exist is silent here: `dequant_gemm_coop_kernel`
+/// builds inside `catch_unwind` and answers `None`, so a typo in one of its names
+/// puts every prefill on the row-grouped tile — slower, and reported nowhere.
+#[test]
+fn each_fused_entry_point_is_the_one_its_scheme_is_routed_to() {
+    use rlx_ir::quant::QuantScheme;
+
+    // The row-grouped GEMM: (scheme id, entry point, block elements, block bytes).
+    // A pin, not a re-derivation — `GROUPED_SCHEMES` is both the ladder's
+    // admission and the encoder's dispatch, and the two numbers beside each entry
+    // are the scheme's own packing, which is what the entry's reader strides by.
+    const GROUPED: [(u32, &str, u32, u32); 3] = [
+        (0, "dequant_gemm_q4k", 256, 144),
+        (2, "dequant_gemm_q6k", 256, 210),
+        (20, "dequant_gemm_q8_0", 32, 34),
+    ];
+    let grouped_entries = branches_by_entry(rlx_wgpu::kernels::DEQUANT_GEMM_GGUF_WGSL);
+    for (id, entry, block_elems, block_bytes) in GROUPED {
+        assert_eq!(
+            rlx_wgpu::gguf_gpu::grouped_scheme_entry(id),
+            Some(entry),
+            "scheme {id} is routed to a different entry point than this pin names"
+        );
+        assert!(
+            grouped_entries.contains_key(entry),
+            "scheme {id} is routed to `{entry}`, which `dequant_gemm_gguf.wgsl` does \
+             not declare: {:?}",
+            grouped_entries.keys().collect::<Vec<_>>()
+        );
+        let scheme = QuantScheme::from_gpu_dequant_scheme_id(id).expect("a registered id");
+        assert_eq!(
+            (scheme.gguf_block_size(), scheme.gguf_block_bytes()),
+            (block_elems, block_bytes),
+            "{scheme:?} (id {id}) packs {block_elems} elements into {block_bytes} bytes \
+             — a change here has to reach `{entry}`'s reader"
+        );
+    }
+    // The set is exactly those three: a scheme added to it without an entry point
+    // of its own is the drift this whole file exists to catch.
+    let supported: Vec<u32> = (0u32..=64)
+        .filter(|id| rlx_wgpu::gguf_gpu::grouped_scheme_supported(*id))
+        .collect();
+    assert_eq!(supported, GROUPED.map(|(id, ..)| id).to_vec());
+
+    // The two numbers the Q8_0 entry's own reader is written against, and the
+    // staged tile the K-quants' is: read out of the shader, not restated.
+    let gemm = rlx_wgpu::kernels::DEQUANT_GEMM_GGUF_WGSL;
+    assert_eq!(
+        (
+            const_u32(gemm, "Q8_0_BLK_ELEMS"),
+            const_u32(gemm, "Q8_0_BLK_BYTES")
+        ),
+        (
+            QuantScheme::GgufQ8_0.gguf_block_size(),
+            QuantScheme::GgufQ8_0.gguf_block_bytes()
+        ),
+        "the Q8_0 entry point's block is not the scheme's"
+    );
+    assert_eq!(
+        const_u32(gemm, "BLK_ELEMS"),
+        QuantScheme::GgufQ4K.gguf_block_size(),
+        "the K-quant entries' staged tile is not their scheme's block"
+    );
+    assert_eq!(
+        QuantScheme::GgufQ4K.gguf_block_size(),
+        QuantScheme::GgufQ6K.gguf_block_size(),
+        "one staged tile serves both K-quant entries"
+    );
+
+    // The cooperative tile: one entry point per scheme it serves, and nothing
+    // else. Its ids are `dequant_gemm_coop_kernel`'s own match arms, which a
+    // device-free test cannot enumerate — but every name it can return has to
+    // exist here, or the build panics into `None` and the tile silently never runs.
+    let coop: Vec<String> = branches_by_entry(rlx_wgpu::kernels::DEQUANT_GEMM_COOP_GGUF_WGSL)
+        .into_keys()
+        .collect();
+    assert_eq!(
+        coop,
+        [
+            "dequant_gemm_coop_q4k",
+            "dequant_gemm_coop_q6k",
+            "dequant_gemm_coop_q8_0"
+        ],
+        "the cooperative tile's entry points changed — `dequant_gemm_coop_kernel` \
+         names them"
+    );
+
+    // Q1_0's multi-row arm, whose scheme has no grouped entry: `gemv_supports_scheme`
+    // admits it at every row and `select_path` sends `m > 1` here.
+    let q1_0: Vec<String> = branches_by_entry(rlx_wgpu::kernels::DEQUANT_GEMM_Q1_0_WGSL)
+        .into_keys()
+        .collect();
+    assert_eq!(
+        q1_0,
+        ["dequant_gemm_q1_0"],
+        "the Q1_0 GEMM's entry point changed — the encoder names it"
+    );
+    assert!(
+        rlx_wgpu::gguf_gpu::gemv_supports_scheme(24),
+        "Q1_0 is this entry point's scheme and must be routed to the fused ladder"
+    );
+}

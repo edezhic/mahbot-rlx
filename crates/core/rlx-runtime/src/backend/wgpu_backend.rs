@@ -14,7 +14,8 @@ impl Backend for WgpuBackend {
 
     fn compile(&self, graph: Graph, options: &CompileOptions) -> Box<dyn ExecutableGraph> {
         use rlx_opt::pass::Pass as _;
-        let graph = rlx_opt::LowerControlFlow.run(graph);
+        // `Op::If` → primitives; `Op::While` runs as a host loop.
+        let graph = rlx_opt::LowerIf.run(graph);
         let graph = rlx_opt::legalize_or_rewrite_for_backend(graph, rlx_wgpu::SUPPORTED_OPS)
             .unwrap_or_else(|errors| {
                 panic!("{}", rlx_opt::format_legalize_error("wgpu", &errors));
@@ -140,6 +141,12 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         self.inner.read_gpu_handle(name)
     }
+    fn save_inputs(&mut self, names: &[&str]) -> bool {
+        self.inner.save_inputs(names)
+    }
+    fn restore_inputs(&mut self) -> bool {
+        self.inner.restore_inputs()
+    }
     fn read_gpu_handle_row(&self, name: &str, row: usize, row_inner: usize) -> Option<Vec<f32>> {
         self.inner.read_gpu_handle_row(name, row, row_inner)
     }
@@ -260,6 +267,24 @@ impl ExecutableGraph for WgpuExecutableWrapper {
             )
             .map(|(v, dt)| (narrow_to_dtype(&v, dt), dt))
             .collect()
+    }
+
+    fn share_params_from(&mut self, src: &dyn ExecutableGraph) -> bool {
+        let Some(src) = src
+            .executable_as_any()
+            .and_then(|a| a.downcast_ref::<WgpuExecutableWrapper>())
+        else {
+            return false;
+        };
+        self.inner.share_weights_from(&src.inner)
+    }
+
+    fn executable_as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn executable_as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 
     fn clone_box(&self) -> Box<dyn ExecutableGraph> {

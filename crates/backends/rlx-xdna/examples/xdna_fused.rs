@@ -15,12 +15,13 @@ use rlx_xdna::npu_gemm::NpuIo;
 use std::time::Instant;
 
 fn env(k: &str, d: &str) -> String {
-    std::env::var(k).unwrap_or_else(|_| d.to_string())
+    rlx_ir::env::read(k).unwrap_or_else(|_| d.to_string())
 }
 
 fn build(name: &str, mlir: &str) -> (String, Vec<u32>) {
-    let aiecc = std::env::var("AIECC").expect("set AIECC");
-    let peano = std::env::var("PEANO").expect("set PEANO");
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let aiecc = tc.aiecc_str();
+    let peano = tc.peano_str();
     let tmp = format!("/tmp/rlx_fuse_{name}");
     std::fs::create_dir_all(&tmp).ok();
     let mp = format!("{tmp}/aie.mlir");

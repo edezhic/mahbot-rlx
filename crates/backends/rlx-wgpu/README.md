@@ -106,7 +106,7 @@ kernels, pure Rust deps — no FFI, no submodules.
   workgroup f16 stage and multiplied by the hardware matrix units with an f32
   accumulator, 32-row tiles; admitted at `m >= 22` — the tile's 32-row rounding may
   spend at most a third of the dispatch on rows past `m` — with `n % 128 == 0`,
-  `k % 16 == 0`, one column chunk and at least 48 workgroups), and the row-grouped
+  `k % 16 == 0`, one column chunk and at least 24 workgroups), and the row-grouped
   GEMM — the fallback, and the
   route everywhere without them — reads each packed weight tile's quant bytes once
   per group of 8 rows instead of once per row (`RLX_WGPU_GEMM_COOP_DISABLE=1` puts
@@ -146,6 +146,8 @@ quantized matmul, etc.) — see [docs/op-coverage.md](../../../docs/op-coverage.
 GGUF `DequantMatMul` follows the `select_path` ladder — the fused windowed
 kernels, or `dequant_gguf` + `matmul_bt` when arena scratch fits; otherwise
 CPU dequant via `gguf_host`. MoE grouped GGUF remains host-only on WGPU.
+`Op::DoubleSingle` (f64 as `(hi, lo)` f32 pairs, `double_single.wgsl`) runs
+native.
 
 `Op::WelchPeaks` / `Op::LogMel` / `Op::LogMelBackward` run in a deferred tail when their
 lowering picks the host step (`step_is_tail_host`: `Step::WelchPeaksHost` / `LogMelHost` /
@@ -172,6 +174,36 @@ Or via [`rlx`](https://crates.io/crates/rlx)'s `gpu` feature.
 When a wgpu adapter is available, `rlx_wgpu::calibrate::Calibration::load_or_measure()`
 benchmarks a 512³ matmul and caches results at `~/.cache/rlx/wgpu-calib-<adapter>.json`.
 Feeds `WgpuCostModel` in `rlx-runtime` for backend ranking.
+
+## Matmul kernel selection
+
+Plain WGSL, no extensions, before any cooperative-matrix path:
+
+- **Decode (`m ≤ 4`) → `matmul_gemv`.** A 256-thread workgroup owns 64
+  adjacent columns and splits K eight ways, so B is read in coalesced row
+  segments and up to four A rows share each load. The 32×32-tile `matmul`
+  spent 31/32 of its work on padding rows at `m = 1`. Columns per workgroup
+  follow the output width (`RLX_WGPU_GEMV_COLS=64|32|16|8` pins it);
+  `RLX_WGPU_NO_GEMV=1` turns the path off.
+- **Wide tiles → `matmul_wide_vec4`** (default): the 64×64 tile with `vec4`
+  tile storage and a `vec4` FMA inner loop, measured 2.8× `matmul_wide` on an
+  M4 Pro and bit-identical to it. `RLX_WGPU_WIDE_STD=1` / `RLX_WGPU_WIDE_NV=1`
+  pin the older scalar kernels.
+- **GGUF.** Packed weights are read in place in the arena, one route per shape
+  (see "GGUF dequant" above for the full ladder): `m > 1` takes the fused tiled
+  GEMM — Q1_0 its own, Q4_K/Q6_K/Q8_0 the cooperative 32-row tile where the
+  device admits it and the row-grouped 8-row tile everywhere else — and `m = 1`
+  the tiled per-row GEMV. `RLX_WGPU_Q8_0_GEMM_DISABLE=1` returns a Q8_0 call to
+  the dequant scratch slab, and `RLX_WGPU_Q1_0_GEMM_DISABLE=1` does the same for
+  Q1_0.
+- **f16 weight mirror.** A large f32 weight is read from its f16 shadow only
+  when it can't share a storage binding with its activations (VirtIO / DX12 cap
+  bindings near 2 GiB); `RLX_WGPU_F16_MIRROR=1` uses the shadow anyway, for the
+  bandwidth.
+
+Per-shape choices come from `rlx-gpu-dispatch`; shipped per-arch rows load
+below the user cache (`RLX_GPU_NO_SHIPPED_TUNING=1` skips them), and
+`examples/wgpu_tune_dispatch.rs` measures new ones.
 
 ## Cooperative-matrix matmul (Vulkan / Metal)
 
@@ -412,6 +444,7 @@ of that same one-node run — nothing in the tree prints one.
 | `RLX_WGPU_HOST_EAGER_H2D=1` | Write every HostOp/Conv output to the device immediately (default: defer until Expand/Concat/GPU/readback) |
 | `RLX_WGPU_HOST_MATMUL=1` | Pack MatMul as HostOp |
 | `RLX_WGPU_CONV_HOST=1` | Force the Conv2d / transposed-conv host paths |
+| `RLX_WGPU_STEP_PROFILE=1` | Per-step GPU timestamps, one op per pass; prints a table every `RLX_WGPU_STEP_PROFILE_EVERY` runs (default 32). Ranks steps; not production timing |
 
 **Discrete Vulkan/DX12 (Kitten NSF):** Binary/Activation/Where/Fma, norms,
 Expand/Concat/Transpose/Narrow, and Conv stay on the host (SPIR-V elementwise

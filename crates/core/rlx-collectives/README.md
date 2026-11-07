@@ -64,7 +64,7 @@ g.set_outputs(vec![y]);
 | Validation            | Tensor-parallel matmul, Megatron SwiGLU MLP, and a Qwen3 decoder-layer shard vs. a hand-computed reference; run end-to-end over TCP across two machines (arm64 macOS ↔ x86_64 Linux) and on emulated aarch64 under QEMU |
 | Transport             | In-process threads + TCP `NetTransport` — multi-node **exercised** cross-machine and on emulated aarch64 (Raspberry-Pi-class). Bandwidth-optimal ring, typed (f16/bf16/i8) reductions, bounded-staleness federated averaging, and NAT-friendly dial-out live in [`rlx-driver`]'s `ProcessGroup`. |
 
-## Quick start: a distributed job in one file
+## Getting started: a distributed job in one file
 
 `examples/dist_job.rs` + `examples/rlx-dist.toml` are the minimal way to run
 distributed **training** or **inference** across a network of nodes — predefined
@@ -79,7 +79,7 @@ The `[net] discovery` key selects how nodes find each other:
 
 | `discovery`  | How peers are found                                            | Scope |
 |--------------|----------------------------------------------------------------|-------|
-| `static`     | hand-listed `peers = ["ip:port", …]`, one per rank             | any (you address them) |
+| `static`     | hand-listed `peers = ["ip:port", …]`, one per rank (IPv4, `[v6]:port`, or `[fe80::1%en0]:port`) | any (you address them) |
 | `mdns`       | zero-config — coordinator advertises, workers browse (Bonjour/Avahi) | one LAN (`--features mdns`) |
 | `rendezvous` | workers unicast a query to `coordinator` (LAN IP / `host.docker.internal` / Tailscale name) | across NAT / networks |
 

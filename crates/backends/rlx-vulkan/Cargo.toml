@@ -156,3 +156,8 @@ required-features = ["backend-tests"]
 [lib]
 # No doctests in this crate: the empty stage was pure rustdoc cost.
 doctest = false
+
+[[test]]
+name = "stop_gradient_slot"
+required-features = ["backend-tests"]
+

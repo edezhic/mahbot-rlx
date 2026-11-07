@@ -207,10 +207,12 @@ fn mel_then_device_graph() -> Graph {
     g
 }
 
-/// The refused arrangement whose consumer is an ordinary host step: `ArgMax` lowers
-/// to `Step::ArgReduceHost` unconditionally, so the argmax reads the mel's slot
-/// while the step that would have written it is still deferred. The mel is an output
-/// as well, so the slot the argmax reads is the one this fixture reads back.
+/// The refused arrangement whose consumer is a builtin GPU kernel: `ArgMax` lowers to
+/// the `argreduce` kernel (`Step::WgpuGpuKernel`) whenever its operand and its output
+/// share one arena window, which every argmax over an activation does — it takes
+/// `Step::ArgReduceHost` only where they do not. So the kernel reads the mel's slot
+/// while the step that would have written it is still deferred. The mel is an output as
+/// well, so the slot the kernel reads is the one this fixture reads back.
 fn mel_then_argmax_graph() -> Graph {
     let mut g = Graph::new("wgpu_hosted_audio_mel_then_argmax");
     let spec = g.input("spec", Shape::new(&[FRAMES, 2 * N_FFT], DType::F32));
@@ -437,8 +439,9 @@ fn hosted_audio_steps_are_walked_only_where_the_route_can_reach_them() {
     // The refused placements, and the names their refusals must carry — a refusal has
     // to be about the arrangement it names, and these are the ones it names.
     // `mel_only` has no device step anywhere, so its deferred mel is not reached from
-    // a batch; `mel_then_device` puts a `binary` after the mel; `mel_then_argmax`'s
-    // consumer is the unconditional `Step::ArgReduceHost`.
+    // a batch; `mel_then_device` puts a `binary` after the mel; `mel_then_argmax` puts
+    // the builtin arg-reduce kernel after it — a device step of the other kind this
+    // route lowers (`Step::WgpuGpuKernel`, not `Step::ArgReduceHost`).
     assert_refused(
         mel_only_graph(),
         &["log_mel_host", "it is the first step of the schedule"],
@@ -447,10 +450,15 @@ fn hosted_audio_steps_are_walked_only_where_the_route_can_reach_them() {
     // the later device step's own uniform write, `index out of bounds: the len is 2 but
     // the index is 2`.
     assert_refused(mel_then_device_graph(), &["binary", "log_mel_host"]);
-    // The host consumer after the deferred mel: before the guard it read the mel's
-    // never-written slot as 24 zeros against a finite host log-mel, argmax `[0,0,0]`
-    // against `[7,7,7]`.
-    assert_refused(mel_then_argmax_graph(), &["argreduce_host", "log_mel_host"]);
+    // The kernel consumer after the deferred mel: the same arrangement with the argmax
+    // in place of the `binary`, so the refusal must name the kernel step. (While
+    // `ArgMax` lowered to `Step::ArgReduceHost` this fixture read the mel's
+    // never-written slot as 24 zeros against a finite host log-mel; see the guard's own
+    // record.)
+    assert_refused(
+        mel_then_argmax_graph(),
+        &["wgpu_gpu_kernel", "log_mel_host"],
+    );
 
     // The arrangements this route serves: each runs, and each checks its own output
     // against the host function the route itself calls. A run that cannot advance
@@ -463,7 +471,7 @@ fn hosted_audio_steps_are_walked_only_where_the_route_can_reach_them() {
             COPY_THEN_MEL,
         ] {
             let (ok, stderr) =
-                common::rerun_self(FILTER, MARKER, fixture, &common::CLEARED_SWITCHES, extra);
+                common::rerun_self(FILTER, MARKER, fixture, &common::cleared_switches(), extra);
             assert!(ok, "the `{fixture}` child failed:\n{stderr}");
         }
     };
@@ -486,7 +494,7 @@ fn hosted_audio_steps_are_walked_only_where_the_route_can_reach_them() {
             FILTER,
             MARKER,
             DEVICE_THEN_MEL,
-            &common::CLEARED_SWITCHES,
+            &common::cleared_switches(),
             &[(switch, "1")],
         );
         assert!(
@@ -505,7 +513,7 @@ fn hosted_audio_steps_are_walked_only_where_the_route_can_reach_them() {
         FILTER,
         MARKER,
         COPY_THEN_MEL,
-        &common::CLEARED_SWITCHES,
+        &common::cleared_switches(),
         &[("RLX_WGPU_HOST_BUFFER_COPY", "1")],
     );
     assert!(
@@ -521,7 +529,7 @@ fn hosted_audio_steps_are_walked_only_where_the_route_can_reach_them() {
         FILTER,
         MARKER,
         DEVICE_THEN_MEL,
-        &common::CLEARED_SWITCHES,
+        &common::cleared_switches(),
         &[(common::RUN_REPORT_SWITCH, "1")],
     );
     assert!(ok, "the `{DEVICE_THEN_MEL}` census child failed:\n{stderr}");

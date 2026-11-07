@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 // Fused (residual add + optional bias add) + LayerNorm.
 //
 //   y = layer_norm(x + residual + [bias])
@@ -71,7 +74,7 @@ fn fused_residual_ln(
     let in_base  = params.in_off       + row * params.inner;
     let res_base = params.residual_off + row * params.inner;
     let out_base = params.out_off      + row * params.inner;
-    let n_inv = 1.0 / f32(params.inner);
+    let n_inv = rlx_div_rn(1.0, f32(params.inner));
     let eps = bitcast<f32>(params.eps_bits);
     let with_bias = params.has_bias != 0u;
 
@@ -112,7 +115,7 @@ fn fused_residual_ln(
     workgroupBarrier();
     tree_sum(tid);
     let var_ = scratch[0] * n_inv;
-    let inv_std = inverseSqrt(var_ + eps);
+    let inv_std = rlx_rsqrt_rn(var_ + eps);
 
     // Pass 2: normalize, scale, shift in place — each lane over its own lanes.
     i = tid;
@@ -124,3 +127,4 @@ fn fused_residual_ln(
         i = i + 64u;
     }
 }
+

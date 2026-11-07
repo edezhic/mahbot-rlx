@@ -1569,6 +1569,26 @@ pub(crate) enum Step {
         inner: u32,
         q_max_bits: u32,
     },
+    /// `Op::DoubleSingle` (`double_single.cu`, shared with CUDA): f64 as
+    /// (hi, lo) f32 pairs.
+    DoubleSingle {
+        args: rlx_gpu_kernels::DfArgs,
+    },
+    /// Native `Op::RoundToFormat` (`round_to_format.cu`); `mode` 0 none,
+    /// 1 per-tensor (`amax_off`), 2 per block.
+    RoundToFormat {
+        in_off: u32,
+        amax_off: u32,
+        out_off: u32,
+        n: u32,
+        last_dim: u32,
+        block: u32,
+        mode: u32,
+        man_bits: i32,
+        emin: i32,
+        emax: i32,
+        max_bits: u32,
+    },
     /// Native `Op::FakeQuantize` PerBatch (derive scale from max abs).
     FakeQuantizePerBatch {
         in_off: u32,
@@ -1936,6 +1956,8 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::LayerNormBackwardGamma { .. } => "rlx::LayerNormBackwardGamma",
         Step::FakeQuantizeFixed { .. } => "rlx::FakeQuantizeFixed",
         Step::FakeQuantizePerBatch { .. } => "rlx::FakeQuantizePerBatch",
+        Step::RoundToFormat { .. } => "rlx::RoundToFormat",
+        Step::DoubleSingle { .. } => "rlx::DoubleSingle",
         Step::FakeQuantizeEma { .. } => "rlx::FakeQuantizeEma",
         Step::QuantizeI8 { .. } => "rlx::QuantizeI8",
         Step::DequantizeI8 { .. } => "rlx::DequantizeI8",
@@ -3093,6 +3115,20 @@ pub(crate) fn step_offsets(step: &Step) -> (Vec<u32>, Vec<u32>) {
         Step::FakeQuantizePerBatch {
             in_off, out_off, ..
         } => (vec![*in_off], vec![*out_off]),
+        Step::DoubleSingle { args } => (vec![args.a_off, args.b_off], vec![args.out_off]),
+        Step::RoundToFormat {
+            in_off,
+            amax_off,
+            out_off,
+            mode,
+            ..
+        } => {
+            let mut r = vec![*in_off];
+            if *mode == 1 {
+                r.push(*amax_off);
+            }
+            (r, vec![*out_off])
+        }
         Step::FakeQuantizeEma {
             in_off,
             scale_off,
@@ -3306,6 +3342,56 @@ pub(crate) fn fuse_elementwise_chains(schedule: Vec<Step>) -> Vec<Step> {
 }
 
 impl Step {
+    /// True when every arena offset this step passes is an f32-element index
+    /// (`byte / 4`) computed and used in 32-bit math that stays below 2^32
+    /// elements — so it is correct in an arena up to 16 GiB, not just 4 GiB.
+    /// Audited per variant (host conversion in `compile.rs` + its kernel);
+    /// anything not listed is refused past 4 GiB.
+    ///
+    /// Audited 2026-10-27 for the Qwen3 LoRA training graph: every field is
+    /// built as `arena.offset(..) / 4`, the kernels index `float*` with
+    /// `unsigned int`, and the vendor-GEMM paths widen to `u64` before `* 4`.
+    /// The RmsNormBackward* steps and RopeBackward hold `u64` byte offsets and pass
+    /// `byte / 4` to `unsigned int` parameters (HIP reads the low 4 bytes).
+    pub fn offsets_reach_16_gib(&self) -> bool {
+        matches!(
+            self,
+            Step::ActivationBackward { .. }
+                | Step::Attention { .. }
+                | Step::AttentionBackward { .. }
+                | Step::Binary { .. }
+                | Step::Concat { .. }
+                // conv2d*.cu / conv_bias_act_epilogue.cu index f32 elements
+                // with products bounded by their own tensors; the backward
+                // steps keep u64 byte offsets and pass `bytes / 4`; MIOpen
+                // pointers are built in u64.
+                | Step::Conv2d { .. }
+                | Step::Conv2dBackwardInput { .. }
+                | Step::Conv2dBackwardWeight { .. }
+                | Step::Expand { .. }
+                | Step::Gather { .. }
+                // gated_residual.cu: element offsets, `mod_base + col` < gate size.
+                | Step::GatedResidual { .. }
+                | Step::LayerNorm { .. }
+                | Step::Matmul { .. }
+                | Step::Narrow { .. }
+                | Step::Reduce { .. }
+                | Step::RmsNormBackwardInput { .. }
+                | Step::RmsNormBackwardGamma { .. }
+                | Step::RmsNormBackwardBeta { .. }
+                | Step::Rope { .. }
+                | Step::RopeBackward { .. }
+                | Step::ScatterAddAcc { .. }
+                | Step::ScatterAddZero { .. }
+                // softmax.cu: `in_off + base + j * stride` < in_off + tensor size.
+                | Step::Softmax { .. }
+                | Step::SoftmaxCrossEntropyBackward { .. }
+                | Step::SoftmaxCrossEntropyWithLogits { .. }
+                | Step::Transpose { .. }
+                | Step::Unary { .. }
+        )
+    }
+
     /// True when this Step variant honors active-extent dispatch (PLAN L1).
     /// Initial coverage matches rlx-cuda's: simple element-wise +
     /// reductions + softmax + LayerNorm + cumsum. Matmul and the
@@ -3351,8 +3437,17 @@ impl Step {
             // change drops the captured graph in `set_rng`, so a captured
             // Philox/Zero fill never replays a stale seed.
             Step::RngNormal { .. } | Step::RngUniform { .. } => rng_on_device,
-            Step::GatedDeltaNet { .. }
-            | Step::Llada2GroupLimitedGate { .. }
+            // With its state carried in the arena (a decode step's) it is one
+            // kernel launch (`run.rs`); the host fallback, any other shape,
+            // downloads its operands mid-run. Ruling them all out kept every
+            // Qwen3.5 stage — a delta-net in each linear-attention layer —
+            // from being captured at all.
+            Step::GatedDeltaNet {
+                use_carry,
+                state_size,
+                ..
+            } => gdn_on_device(*use_carry, *state_size),
+            Step::Llada2GroupLimitedGate { .. }
             | Step::MsDeformAttnHost { .. }
             | Step::CollectiveHost { .. }
             | Step::UmapKnn { .. }
@@ -3378,6 +3473,13 @@ impl Step {
             _ => true,
         }
     }
+}
+
+/// Whether a `GatedDeltaNet` step runs as one GPU kernel (its state carried
+/// in the arena, at most 1024 wide): `run.rs` takes that path for exactly
+/// these, and only these can be captured.
+pub(crate) fn gdn_on_device(use_carry: bool, state_size: u32) -> bool {
+    use_carry && state_size <= 1024
 }
 
 pub(crate) fn schedule_graph_capture_safe(schedule: &[Step], rng_on_device: bool) -> bool {

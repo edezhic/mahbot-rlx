@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 // LayerNorm and RmsNorm fused into one kernel via op flag. Both
 // reduce along the last axis (feature dim).
 //
@@ -61,7 +64,7 @@ fn norm(
     let tid = lid.x;
     let in_base  = params.in_off  + row * params.inner;
     let out_base = params.out_off + row * params.inner;
-    let n_inv = 1.0 / f32(params.inner);
+    let n_inv = rlx_div_rn(1.0, f32(params.inner));
     let eps = bitcast<f32>(params.eps_bits);
 
     // ── Pass 1: mean = Σx / n (tree). ──
@@ -98,7 +101,7 @@ fn norm(
 
     // ── Pass 3: normalize (each thread strides over its lanes). ──
     if (params.op == 0u) {
-        let inv_std = inverseSqrt(dev_mean + eps);
+        let inv_std = rlx_rsqrt_rn(dev_mean + eps);
         var j: u32 = tid;
         loop {
             if (j >= params.inner) { break; }
@@ -110,7 +113,7 @@ fn norm(
     } else {
         // mean(x²) = mean((x − mean)²) + mean². `+ beta` matches the CPU oracle
         // (RmsNorm carries beta; the lower now passes the real beta input).
-        let inv_rms = inverseSqrt(dev_mean + mean * mean + eps);
+        let inv_rms = rlx_rsqrt_rn(dev_mean + mean * mean + eps);
         var j: u32 = tid;
         loop {
             if (j >= params.inner) { break; }
@@ -121,3 +124,4 @@ fn norm(
         }
     }
 }
+

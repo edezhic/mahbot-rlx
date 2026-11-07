@@ -50,6 +50,10 @@ egpu            = ["rlx-runtime/egpu"]
 blas-accelerate = ["rlx-runtime/blas-accelerate", "rlx-tensor?/eval-blas"]
 blas-mkl        = ["rlx-runtime/blas-mkl",         "rlx-tensor?/eval"]
 blas-openblas   = ["rlx-runtime/blas-openblas",    "rlx-tensor?/eval"]
+# std's float math → rlx-libm's Rust ports for the whole executable (no C libm).
+rust-libm       = ["rlx-runtime/rust-libm"]
+# No native libraries: pure-Rust GEMM / vector math and `rust-libm`.
+pure-rust       = ["rlx-runtime/pure-rust"]
 
 # ── Optional re-exports of companion crates ─────────────────────
 # Off by default — `rlx::gguf` / etc. only show up when enabled.
@@ -128,19 +132,19 @@ rlx-linalg  = { workspace = true, optional = true }
 # it should not pull rlx-cpu's BLAS linkage in for someone who did not ask
 # for the CPU backend. `rlx/cpu` gives rlx-cpu its normal features anyway.
 rlx-cpu     = { package = "mahbot-rlx-cpu", path = "../backends/rlx-cpu", version = "0.2.18-mahbot.2", optional = true, default-features = false }
-rlx-umap    = { path = "../numerics/rlx-umap", version = "0.2.18", optional = true, default-features = false, features = ["cpu", "graph"] }
+rlx-umap    = { path = "../numerics/rlx-umap", version = "0.2.20", optional = true, default-features = false, features = ["cpu", "graph"] }
 # default-features = false: rlx-peft's own `cpu` default would forward
 # rlx-runtime/cpu and quietly pick a backend for a consumer who did not ask for
 # one. Enabling `rlx/cpu` gives it the same cpu-enabled rlx-runtime anyway.
-rlx-peft    = { path = "../numerics/rlx-peft", version = "0.2.18", optional = true, default-features = false }
+rlx-peft    = { path = "../numerics/rlx-peft", version = "0.2.20", optional = true, default-features = false }
 rlx-rng     = { workspace = true, optional = true }
-rlx-geo     = { path = "../numerics/rlx-geo", version = "0.2.18", optional = true, default-features = false, features = ["cpu"] }
+rlx-geo     = { path = "../numerics/rlx-geo", version = "0.2.20", optional = true, default-features = false, features = ["cpu"] }
 rlx-optim   = { workspace = true, optional = true }
 # rlx-cortexm is `no_std` by default; we want the host-side parity
 # kernels (the `std` feature) when re-exported from the prelude.
-rlx-cortexm = { path = "../backends/rlx-cortexm", version = "0.2.18", optional = true, default-features = false, features = ["std"] }
+rlx-cortexm = { path = "../backends/rlx-cortexm", version = "0.2.20", optional = true, default-features = false, features = ["std"] }
 rlx-fpga    = { workspace = true, optional = true }
-rlx-onnx    = { path = "../io/rlx-onnx", version = "0.2.18", optional = true, default-features = true }
+rlx-onnx    = { path = "../io/rlx-onnx", version = "0.2.20", optional = true, default-features = true }
 # `rlx::Result` / `rlx::Error` type aliases. Every workspace crate
 # already pulls anyhow in transitively (rlx-runtime, rlx-gguf), so this
 # adds no real bytes — just makes the alias
@@ -155,6 +159,13 @@ workspace = true
 # enable the cross-platform ones plus all companion modules. Users
 # browsing https://docs.rs/rlx see the full IR / opt / runtime API
 # along with `rlx::gguf`, `rlx::bench`, `rlx::sparse`, `rlx::linalg`.
+# README examples are doctests (`cargo test -p rlx --doc --features
+# cpu,tensor,optim`); the extension example uses `rlx-extend`. Path-only so
+# `cargo publish -p rlx` does not resolve it against crates.io.
+[dev-dependencies]
+rlx-extend = { path = "../core/rlx-extend" }
+anyhow = "1"
+
 [package.metadata.docs.rs]
 features      = ["cpu", "tensor", "gpu", "gguf", "bench", "sparse", "linalg", "geo", "peft", "rng", "splat", "cortexm", "fpga", "optim", "distributed"]
 rustdoc-args  = ["--cfg", "docsrs"]

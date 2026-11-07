@@ -208,7 +208,7 @@ fn lever(side: &str) -> RuntimeOverrides {
 /// The cells. A `static` rather than a `const` so a cell built up front can hold
 /// the entry it was built from for the whole run, the registry outliving every
 /// borrow of it.
-static CELLS: [Cell; 12] = [
+static CELLS: [Cell; 16] = [
     // The fused `qkv` of a body layer at the 80-audio-row rung (m = 95): the
     // projection every layer runs first, over the 2048-wide hidden.
     Cell {
@@ -226,6 +226,40 @@ static CELLS: [Cell; 12] = [
         m: 95,
         k: 2048,
         n: 2048,
+    },
+    // The shortest row count the product's prefill reaches — a single 32-row
+    // tile — at the three column counts its projections land on. These are the
+    // cells the cooperative tile's workgroup floor is read at: 8, 16 and 32
+    // workgroups, one per `n / 128`.
+    Cell {
+        label: "q4k o m31 k2048 n1024",
+        scheme: QuantScheme::GgufQ4K,
+        m: 31,
+        k: 2048,
+        n: 1024,
+    },
+    Cell {
+        label: "q4k o m31 k2048 n2048",
+        scheme: QuantScheme::GgufQ4K,
+        m: 31,
+        k: 2048,
+        n: 2048,
+    },
+    Cell {
+        label: "q4k o m31 k2048 n4096",
+        scheme: QuantScheme::GgufQ4K,
+        m: 31,
+        k: 2048,
+        n: 4096,
+    },
+    // 24 workgroups: three 32-row tiles over 1 024 columns, the encoder's
+    // `ffn_down` shape in the body's scheme.
+    Cell {
+        label: "q4k o m95 k2048 n1024",
+        scheme: QuantScheme::GgufQ4K,
+        m: 95,
+        k: 2048,
+        n: 1024,
     },
     // The fused `gate_up`: twice the 6144-wide MLP, and the widest `n` a body
     // dispatch covers at these rows — half of the four projections' arithmetic.

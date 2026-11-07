@@ -16,6 +16,10 @@ documentation.workspace = true
 name = "rlx_rng"
 path = "src/lib.rs"
 
+[dependencies]
+# glibc's logf/sincosf in pure Rust: the Linux torch reference, also on wasm
+rlx-libm = { workspace = true }
+
 [lints]
 workspace = true
 
@@ -25,7 +29,18 @@ rustdoc-args   = ["--cfg", "docsrs"]
 [features]
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-rng --features backend-tests`.
 backend-tests = []
+# Platform C libm for rlx-libm's `reference` (macOS-exact NumPy/SciPy); off = pure Rust.
+libm = ["rlx-libm/libm"]
+
+[dev-dependencies]
+# The test fixtures are torch on macOS arm64: tests compute with its libm.
+rlx-libm = { workspace = true, features = ["libm"] }
 
 [[test]]
 name = "streams"
 required-features = ["backend-tests"]
+
+[[test]]
+name = "torch_bernoulli"
+required-features = ["backend-tests"]
+

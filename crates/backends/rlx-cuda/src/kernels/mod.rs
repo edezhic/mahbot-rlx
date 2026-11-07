@@ -95,7 +95,7 @@ fn dump_kernel(dir: &str, entry: &str, src: &str, ptx_src: &str) {
 fn cuda_include_dirs() -> Vec<String> {
     let mut out = Vec::new();
     for k in ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"] {
-        if let Ok(p) = std::env::var(k) {
+        if let Ok(p) = rlx_ir::env::read(k) {
             out.push(format!("{p}/include"));
         }
     }
@@ -474,6 +474,12 @@ kernel_cache!(
     "cast_f32_to_half"
 );
 kernel_cache!(
+    WIDEN_HALF_TO_F32,
+    widen_half_to_f32_kernel,
+    CAST_F32_TO_HALF_CU,
+    "widen_half_to_f32"
+);
+kernel_cache!(
     SCALED_QUANT_SCALE,
     scaled_quant_scale_kernel,
     SCALED_LOWP_CU,
@@ -639,6 +645,18 @@ kernel_cache!(
     "fake_quantize_perbatch"
 );
 kernel_cache!(
+    ROUND_TO_FORMAT,
+    round_to_format_kernel,
+    ROUND_TO_FORMAT_CU,
+    "round_to_format"
+);
+kernel_cache!(
+    DOUBLE_SINGLE,
+    double_single_kernel,
+    DOUBLE_SINGLE_CU,
+    "double_single"
+);
+kernel_cache!(
     FAKE_QUANTIZE_EMA,
     fake_quantize_ema_kernel,
     FAKE_QUANTIZE_CU,
@@ -777,6 +795,13 @@ kernel_cache!(
     attention_warp_kernel,
     ATTENTION_WARP_CU,
     "attention_warp"
+);
+// Split-KV decode variant (one block per row) — same source file.
+kernel_cache!(
+    ATTENTION_WARP_SPLIT,
+    attention_warp_split_kernel,
+    ATTENTION_WARP_CU,
+    "attention_warp_split"
 );
 kernel_cache!(
     ATTENTION_BWD,
@@ -921,6 +946,18 @@ kernel_cache!(
     dequant_matmul_gguf_g8_gemv_kernel,
     DEQUANT_MATMUL_GGUF_CU,
     "dequant_matmul_gguf_g8_gemv"
+);
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_GEMV_ELEM,
+    dequant_matmul_gguf_gemv_elem_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_gemv_elem"
+);
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_GEMV_ROWS,
+    dequant_matmul_gguf_gemv_rows_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_gemv_rows"
 );
 kernel_cache!(
     DEQUANT_MATMUL_GGUF_Q4K_GEMV,

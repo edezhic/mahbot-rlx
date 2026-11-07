@@ -646,7 +646,11 @@ pub fn try_lower_with_constants(
                     Some(Activation::GeluApprox) => mg.gelu_approx(&withbias),
                     Some(Activation::Gelu) => mg.gelu(&withbias),
                     Some(Activation::Silu) => mg.silu(&withbias),
-                    Some(Activation::Relu) | None => withbias,
+                    // ReLU used to share the `None` arm here, so a fused
+                    // matmul+bias+relu lowered to MPSGraph returned the
+                    // pre-activation values (negatives and all).
+                    Some(Activation::Relu) => mg.relu(&withbias),
+                    None => withbias,
                     _ => return None,
                 }
             }
@@ -851,6 +855,37 @@ pub fn try_lower_with_constants(
                 let rank = node.shape.rank() as i32;
                 let pos_axis = if *axis < 0 { rank + *axis } else { *axis };
                 mg.layer_norm(x, g, b, &[pos_axis], *eps)
+            }
+            Op::GroupNorm { num_groups, eps } => {
+                // [N, C, spatial...] → [N, G, (C/G)·spatial]; two-pass mean /
+                // variance per group (as the `group_norm` thunk computes it),
+                // back to the input shape, then per-channel γ, β.
+                let x = node_to_tensor.get(&node.inputs[0])?;
+                let g = node_to_tensor.get(&node.inputs[1])?;
+                let b = node_to_tensor.get(&node.inputs[2])?;
+                let dims: Vec<usize> = node
+                    .shape
+                    .dims()
+                    .iter()
+                    .map(|d| d.unwrap_static())
+                    .collect();
+                if dims.len() < 2 || *num_groups == 0 || !dims[1].is_multiple_of(*num_groups) {
+                    return None;
+                }
+                let (n, c) = (dims[0], dims[1]);
+                let per_group = dims[1..].iter().product::<usize>() / *num_groups;
+                let xg = mg.reshape(x, &[n, *num_groups, per_group]);
+                let mean = mg.reduce_mean(&xg, &[2]);
+                let diff = mg.sub(&xg, &mean);
+                let var = mg.reduce_mean(&mg.mul(&diff, &diff), &[2]);
+                let eps_t = mg.constant_scalar(*eps);
+                let inv = mg.rsqrt(&mg.add(&var, &eps_t));
+                let normed = mg.reshape(&mg.mul(&diff, &inv), &dims);
+                let mut cshape = vec![1usize; dims.len()];
+                cshape[1] = c;
+                let gamma = mg.reshape(g, &cshape);
+                let beta = mg.reshape(b, &cshape);
+                mg.add(&mg.mul(&normed, &gamma), &beta)
             }
             Op::RmsNorm { axis, eps } => {
                 let x = node_to_tensor.get(&node.inputs[0])?;
@@ -1181,6 +1216,23 @@ pub fn try_lower_with_constants(
                 let v = node_to_tensor.get(&node.inputs[2])?;
                 let q_shape = shape_dims(graph, node.inputs[0])?;
                 let k_shape = shape_dims(graph, node.inputs[1])?;
+                // K / V with fewer heads than Q (GQA left to the kernel,
+                // `rlx_ir::retarget::gqa_native_attention`): the reshapes
+                // below take every input to `num_heads` heads. The thunk
+                // path indexes the shared heads itself.
+                let numel = |s: &[usize]| s.iter().product::<usize>();
+                if q_shape.len() == 3
+                    && k_shape.len() == 3
+                    && numel(&k_shape) / k_shape[1].max(1) != numel(&q_shape) / q_shape[1].max(1)
+                {
+                    if trace {
+                        eprintln!(
+                            "[mpsgraph] bail attention on shared K/V heads: node {}",
+                            node.id
+                        );
+                    }
+                    return None;
+                }
                 // Direct 4D [B, H, S, D] or [B, S, H, D] → SDPA (macOS 14.4+).
                 if q_shape.len() == 4 {
                     let scale = score_scale.unwrap_or(1.0 / (*head_dim as f32).sqrt());

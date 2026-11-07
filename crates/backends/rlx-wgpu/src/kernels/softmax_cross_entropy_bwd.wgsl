@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 // Softmax cross-entropy backward (integer labels), one thread per row:
 //   dlogits[n,c] = (softmax(logits[n])[c] - [c==label]) * d_loss[n]
 
@@ -33,16 +36,17 @@ fn softmax_cross_entropy_backward(@builtin(global_invocation_id) gid: vec3<u32>,
 
     var s: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-        s = s + exp(arena[lbase + i] - m);
+        s = s + rlx_exp(arena[lbase + i] - m);
     }
-    let inv = 1.0 / s;
+    let inv = rlx_div_rn(1.0, s);
     let scale = arena[params.d_loss_off + row];
     let label = u32(arena[params.labels_off + row]);
     let label_c = min(label, params.inner - 1u);
 
     for (var k: u32 = 0u; k < params.inner; k = k + 1u) {
-        let p = exp(arena[lbase + k] - m) * inv;
+        let p = rlx_exp(arena[lbase + k] - m) * inv;
         let oh = select(0.0, 1.0, k == label_c);
         arena[obase + k] = (p - oh) * scale;
     }
 }
+

@@ -214,8 +214,15 @@ fn the_split_that_feeds_a_pair_rides_in_its_dispatch() {
     assert_eq!(got[2], &data[q + k..], "the leftover piece is a copy");
 }
 
+/// The pieces of one row are contiguous views, not copies. The merged compiler's
+/// `pure_view_offset` treats a `Narrow` whose leading dims are all unit — not only
+/// axis 0 — as a pure view, and the lowering elides the self-copy it would
+/// otherwise emit, so the three pieces of one `[1, q+k+v]` row cost no dispatch at
+/// all. This pin used to require one `narrow_split` dispatch for them; it now
+/// asserts that neither `narrow_split` nor `narrow` appears, and the CPU comparison
+/// remains the gate on the bytes.
 #[test]
-fn the_pieces_of_one_row_are_cut_in_one_dispatch() {
+fn the_pieces_of_one_row_cost_no_dispatch() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;
@@ -239,8 +246,8 @@ fn the_pieces_of_one_row_are_cut_in_one_dispatch() {
     let got = gpu.run(&[("x", &data)]);
     assert_eq!(
         names.iter().filter(|n| **n == "narrow_split").count(),
-        1,
-        "the three pieces are one dispatch ({names:?})"
+        0,
+        "the pieces are views, not a split dispatch ({names:?})"
     );
     assert_eq!(
         names.iter().filter(|n| **n == "narrow").count(),
@@ -362,7 +369,7 @@ fn a_tapped_norm_keeps_its_own_steps() {
 ///
 /// The lever is process-global, so the child gets it alone — the same re-exec the
 /// crate's other switch pins use.
-const KNOB_MARKER: &str = "RLX_NORM_ROPE_KNOB_FIXTURE";
+const KNOB_MARKER: &str = "RLX_NORM_ROPE_KNOB_FIXTURE"; // env-lint: ignore — the child's own re-exec key, not a switch
 const KNOB_FIXTURE: &str = "host_norm";
 
 #[test]
@@ -372,7 +379,7 @@ fn a_hosted_norm_stands_the_fold_down() {
             "a_hosted_norm_stands_the_fold_down",
             KNOB_MARKER,
             KNOB_FIXTURE,
-            &common::CLEARED_SWITCHES,
+            &common::cleared_switches(),
             // `RLX_WGPU_GPU_NORM` takes precedence inside `should_pack_host_op`,
             // so the host decision is only this case's when both are pinned.
             &[("RLX_WGPU_HOST_NORM", "1"), ("RLX_WGPU_GPU_NORM", "0")],

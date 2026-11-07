@@ -136,7 +136,7 @@
 
 mod common;
 
-use common::{Q8_0_BISECT, RUN_REPORT_SWITCH, max_abs_diff};
+use common::{Q8_0_BISECT, max_abs_diff};
 use rlx_ir::op::Activation;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, GraphExt, Op, Shape};
@@ -599,36 +599,19 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
     }
     let _route = common::route_lock();
 
-    // A `const` so the list is one place. Mode mismatch, not a route defect: each
-    // of these changes what a submission or a wait means for a forward pass, or
-    // moves this graph's routing/sharding, so the integers below would be
-    // measuring another mode. `RLX_WGPU_ONE_OP_PER_PASS` is the one knob this pin
-    // supports — it selects the unjoined expectation. `RLX_WGPU_CONCAT_HOST`,
-    // `RLX_WGPU_FORCE_HOST`, `RLX_WGPU_HOST_BUFFER_COPY`,
-    // `RLX_WGPU_MAX_BIND_MB` and the 8-bit scheme's bisect lever (whose own
-    // refusal leg is bracket 9) are set and unset inside their own brackets, below.
-    const GUARDED: [&str; 14] = [
-        "RLX_WGPU_SNAPSHOT",
-        "RLX_BENCH_DISPATCH_ONLY",
-        "RLX_WGPU_ALL_PARAMS_WEIGHT",
-        "RLX_WGPU_HOST_EAGER_H2D",
-        "RLX_WGPU_HOST_BUFFER_COPY",
-        "RLX_WGPU_CONCAT_HOST",
-        "RLX_WGPU_FORCE_HOST",
-        "RLX_WGPU_HOST_MATMUL",
-        "RLX_DEBUG_NANS",
-        "RLX_WGPU_DISCRETE_HOST",
-        "RLX_WGPU_SHARD_GPU",
-        "RLX_WGPU_ALLOW_SHARD",
-        RUN_REPORT_SWITCH,
-        Q8_0_BISECT,
-    ];
-    for key in GUARDED {
+    // Mode mismatch, not a route defect: each guarded switch changes what a
+    // submission or a wait means for a forward pass, or moves this graph's
+    // routing/sharding, so the integers below would be measuring another mode. The
+    // list is derived from the registry (`common::guarded_switches`); the 8-bit
+    // scheme's bisect lever and the step-by-step mode are the two knobs this pin
+    // supports, and the 8-bit one's own refusal leg is bracket 9.
+    for key in common::guarded_switches(&[Q8_0_BISECT, "RLX_WGPU_ONE_OP_PER_PASS"]) {
         assert!(
             !rlx_ir::env::flag(key),
             "{key} changes the submission/wait shape of a forward pass; unset it to run this pin"
         );
     }
+    common::pin_tuning_cache_off("gguf-batch-join");
 
     // The counts of a knob-forced arrangement were measured on the unified-memory leg.
     // A discrete adapter's own rule (`wgpu_prefer_structure_host` includes
@@ -851,8 +834,8 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
     let (q8_graph, q8_packed, q8_dense, q8_x) = interleaved_n(JoinScheme::Q8_0, BUCKET, N);
     // The arena does not grow — read as what it is: a plan identity, not a witness of
     // the arrangement. The arena is sized by the planner alone, and the executable's is
-    // that plan plus the planner's fixed tail slack; read against the K-quant graph's
-    // identical term, the slack cancels and what the identity compares is the two plans.
+    // that plan plus the planner's fixed tail slack; read against a graph the *same*
+    // planner sized, the slack cancels and what the identity compares is the two plans.
     // It pins that the admission's slab-booking term (`dequant_gguf_scratch_bytes`, a
     // *plan* fact about the graph — the premise asserted below) is the only thing the
     // 8-bit graph adds, and that the joined and the unjoined arrangement of the same
@@ -860,18 +843,29 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
     // nothing of the arrangement an encode takes, so it holds identically for both — the
     // counted pair below and the identity against the unjoined run are what witness the
     // join.
+    //
+    // The reference arm has to be taken under one planner with the measured one, and the
+    // two graphs no longer share a planner by themselves: a graph that books a dequant
+    // slab keeps the flat plan — which is this scheme, so the 8-bit figure below is its
+    // production arena — while a scratch-free graph that binds its packed weights in
+    // place takes `Arena::from_plan_split_opts`, whose compact re-plan moves the arena
+    // 23168 B below the flat one (`backend/compile/lower.rs`'s `packed_in_place`). The
+    // K-quant graph is that second kind, so the reference is compiled with
+    // `RLX_WGPU_PACKED_IN_ARENA` — the admission's own opt-out — set, which puts it on
+    // the flat plan too; that lever moves nothing in the arm this bracket is about.
     let q8_plan = rlx_compile::memory::plan_memory_f32_uniform(&q8_graph, 64).arena_size
         + rlx_wgpu::gguf_gpu::dequant_gguf_scratch_bytes(&q8_graph);
     let kq_arena = {
         let (kq_graph, ..) = interleaved_n(JoinScheme::KQuant, BUCKET, N);
         let kq_plan = rlx_compile::memory::plan_memory_f32_uniform(&kq_graph, 64).arena_size
             + rlx_wgpu::gguf_gpu::dequant_gguf_scratch_bytes(&kq_graph);
+        let _flat = rlx_ir::env::RuntimeOverrides::install(Some(("RLX_WGPU_PACKED_IN_ARENA", "1")));
         WgpuExecutable::compile(kq_graph).test_arena_bytes() as i64 - kq_plan as i64
     };
     let q8_arena = WgpuExecutable::compile(q8_graph.clone()).test_arena_bytes();
     eprintln!(
         "[rlx-gguf-join] q8-0 arena: exe={q8_arena} B (plan {q8_plan} B, slack {} B) \
-         against the K-quant slack {kq_arena} B",
+         against the K-quant slack {kq_arena} B, both under the flat plan",
         q8_arena as i64 - q8_plan as i64
     );
     // The premise that gives that identity its meaning: the plan really books this
@@ -886,8 +880,8 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
         q8_arena as i64 - q8_plan as i64,
         kq_arena,
         "the 8-bit graph's arena beyond its own plan — the slab it books included — \
-         must be the same tail slack the K-quant graph reads: the admission and the \
-         join may add no arena bytes"
+         must be the same tail slack the K-quant graph reads under that same plan: the \
+         admission and the join may add no arena bytes"
     );
     // Pin (c) again, for the scheme the refinement added: the mode changes how the
     // work is submitted, not the route or the arithmetic.
@@ -1387,6 +1381,7 @@ fn a_packed_multiply_survives_rebinding_the_dynamic_row_axis() {
     // The route counters are process-global, and the counter pin above brackets
     // them; one of the two tests in this binary at a time.
     let _route = common::route_lock();
+    common::pin_tuning_cache_off("gguf-batch-join");
     const K: usize = 1024;
     const N: usize = 1024;
     let (graph, w_bytes) = dynamic_row_packed_multiply(K, N);

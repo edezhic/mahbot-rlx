@@ -30,6 +30,11 @@ name = "rlx_cpu"
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-cpu --features backend-tests`.
 backend-tests = []
 default = ["blas"]
+# Parity with NumPy / SciPy / torch: the accurate f32 tier (`vmath::vv*`
+# outside Accelerate builds) and the FFT twiddles use rlx-libm's reference
+# ports (add `rlx-libm/libm` for Apple's own libm on macOS). Off (default):
+# `fastmath` (NEON, <= 1.33 ulp over all f32) and the pure-Rust `libm` crate.
+parity = []
 blas = []
 blas-mkl = ["blas"]
 # Route sgemm_auto through the `gemm` crate (the same CPU BLAS candle
@@ -44,6 +49,33 @@ parity-gemm = ["dep:gemm"]
 # QKᵀ) on an AVX2 core. Small-m products keep the loop, which is faster there.
 # No effect when a real BLAS is linked.
 portable-gemm = ["dep:gemm"]
+# No native libraries at all: overrides `blas` (no Accelerate / OpenBLAS /
+# MKL link), vector exp/tanh/log in Rust instead of Accelerate's vForce, the
+# `gemm` crate's pure-Rust kernels for GEMM, rlx-ir's BNNS stubs, and
+# `rust-libm`.
+pure-rust = ["portable-gemm", "amx-sme", "rlx-ir/pure-rust", "rust-libm"]
+# std's float math (`f64::sin`, `f32::exp`, `%`, …) in every crate of the
+# binary runs rlx-libm's Rust ports (glibc 2.43's rounding) instead of the
+# platform's C libm: rlx-libm defines the C symbols (`export-glibc`). For
+# executables: a cdylib (pyrlx, the C ABI) would export `sin` & co. to its
+# host process, and a parity test against NumPy on macOS would see glibc's
+# rounding instead of Apple's.
+rust-libm = ["rlx-libm/export-glibc"]
+# The wasm build's arithmetic on every target, for runs that must round the
+# same on macOS, Linux and in a browser: no vendor BLAS (GEMM is the in-order
+# fused-multiply-add chain the relaxed-SIMD wasm kernel computes), and the
+# AVX2-mirror / portable arms instead of the NEON and AVX kernels. Slower;
+# pair with rlx-libm's `export-glibc` so libm rounds the same too. On a wasm
+# engine whose `relaxed_madd` does not fuse (or without relaxed-simd: Safari)
+# the GEMM's FMAs are exact software ones, ~7x slower there.
+#
+# Prefer the run-time switch, `RLX_CPU_PORTABLE=1` or
+# `rlx_cpu::config::set_portable(true)` before the first compile (the mode is
+# then fixed for the process): the same arithmetic, bit for bit
+# (`rlx-runtime/tests/cpu_portable_digest.rs`), without the feature unifying
+# into every other crate of the build. This feature additionally compiles the
+# native kernels and the vendor BLAS out (smaller, and on for good).
+portable = []
 # x86-64 AVX2 int8 decode GEMVs (`m == 1`) for Q4_K / Q5_K / Q6_K / Q8_0 /
 # Q4_0 / Q4_1, which otherwise dequantize each block to f32 before the dot.
 # Rounds the activation to int8 like llama.cpp, so it is not bit-identical to
@@ -51,6 +83,11 @@ portable-gemm = ["dep:gemm"]
 # Takes effect where decode reaches the packed kernel: BLAS-less builds, or a
 # thrashing dequant cache.
 int8-gemv = []
+# Inter-thunk parallelism: runs of thunks with exact arena access summaries are
+# levelled by byte-range conflicts and each level runs concurrently on the
+# pool. Targets dispatch-bound schedules (decode, small models) where single
+# kernels cannot fill the cores. `RLX_CPU_WAVES=0` disables it at run time.
+wave-exec = []
 # 3D Gaussian splat (`Op::GaussianSplatRender*`) — executors registered from `rlx-splat`.
 splat = []
 
@@ -78,6 +115,19 @@ amx-sme = []
 
 [dependencies]
 rlx-ir = { workspace = true }
+rlx-fastmath = { workspace = true }
+rlx-pocketfft = { workspace = true }
+# The reference platform's sin/cos for FFT twiddles (std's on wasm is Rust's
+# own libm, which matches neither the Linux nor the Apple reference).
+# Bit-exact reference math for parity (feature `parity`); the default is
+# rlx-cpu's own vectorized `fastmath`.
+# glibc 2.43 libm in pure Rust: the reference ports under `parity`, and the
+# portable arithmetic's scalar libm, so it does not depend on the host libm.
+rlx-libm = { workspace = true }
+# the Linux x86-64 reference BLAS/LAPACK (non-Apple fallbacks of numpy_blas)
+rlx-linux-ref = { workspace = true }
+# Double-single (df) host arithmetic — the reference every df kernel matches.
+rlxsl = { workspace = true }
 rlx-opt = { workspace = true }
 # `simple_broadcast` — the per-operand `(rep, len)` a broadcast reads through.
 # The host route (`thunk::scan::eval_single_op_f32`) needs it to compute the same
@@ -87,7 +137,7 @@ rlx-unfuse = { workspace = true }
 # schemes so packed weight bytes can stay in the arena until matmul
 # time instead of round-tripping through f32 at load.
 rlx-gguf = { workspace = true, features = ["ir"] }
-rlx-mlx-io = { workspace = true }
+rlx-mlx-io = { workspace = true, default-features = false }  # dequant kernels only
 # F16/BF16 conversion for the CastDtype thunk (and any future
 # half-precision kernel work). Already in the workspace via
 # rlx-runtime / rlx-metal.
@@ -101,6 +151,10 @@ rayon = "1.10"
 strum_macros = "0.28"
 # Optional same-as-candle CPU sgemm; gated behind `parity-gemm`.
 gemm = { version = "0.19", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# Shared-memory weight pages across executables (`shared_params`).
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
@@ -193,3 +247,32 @@ required-features = ["backend-tests"]
 [[test]]
 name = "sgemm_general_strided"
 required-features = ["backend-tests"]
+
+[[example]]
+name = "wave_bench"
+required-features = ["wave-exec"]
+
+[[test]]
+name = "attention_row_blocked"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pool_width_claimed"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "pool_width_single"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "portable_latch"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "reproducible_gemm"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "wave_exec"
+required-features = ["backend-tests"]
+

@@ -43,7 +43,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 rlx-ir = { workspace = true, optional = true }
 rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime", version = "0.2.18-mahbot.2", default-features = false, features = ["cpu"], optional = true }
-rlx-sparse = { path = "../rlx-sparse", version = "0.2.18", default-features = false, features = ["cpu"], optional = true }
+rlx-sparse = { path = "../rlx-sparse", version = "0.2.20", default-features = false, features = ["cpu"], optional = true }
 rlx-cpu = { workspace = true, optional = true }
 rlx-autodiff = { workspace = true, optional = true }
 
@@ -55,11 +55,11 @@ bytemuck = "1"
 
 [[test]]
 name = "io_arch_json"
-required-features = ["io"]
+required-features = ["io", "backend-tests"]
 
 [[test]]
 name = "ir_dense_solve"
-required-features = ["ir"]
+required-features = ["ir", "backend-tests"]
 
 [[test]]
 name = "sparse_parity"
@@ -83,7 +83,7 @@ required-features = ["nonlinear", "backend-tests"]
 
 [[test]]
 name = "rlx_sparse_pcg"
-required-features = ["rlx-sparse"]
+required-features = ["rlx-sparse", "backend-tests"]
 
 [[example]]
 name = "inverse_design"
@@ -107,19 +107,19 @@ required-features = ["reference", "backend-tests"]
 
 [[test]]
 name = "io_mesh_json"
-required-features = ["io"]
+required-features = ["io", "backend-tests"]
 
 [[test]]
 name = "mir_opt_hook"
-required-features = ["ir"]
+required-features = ["ir", "backend-tests"]
 
 [[test]]
 name = "mir_sparse_pcg"
-required-features = ["ir", "rlx-sparse"]
+required-features = ["ir", "rlx-sparse", "backend-tests"]
 
 [[test]]
 name = "mir_sparse_autodiff"
-required-features = ["ir", "rlx-sparse"]
+required-features = ["ir", "rlx-sparse", "backend-tests"]
 
 [[test]]
 name = "mesh_goals"
@@ -143,11 +143,11 @@ required-features = ["nonlinear", "backend-tests"]
 
 [[test]]
 name = "fused_e2e"
-required-features = ["ir", "rlx-sparse"]
+required-features = ["ir", "rlx-sparse", "backend-tests"]
 
 [[test]]
 name = "fused_autodiff_opt"
-required-features = ["fuse"]
+required-features = ["fuse", "backend-tests"]
 
 [lints]
 workspace = true
@@ -176,3 +176,4 @@ required-features = ["backend-tests"]
 [[test]]
 name = "vault_dome"
 required-features = ["backend-tests"]
+

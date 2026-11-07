@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 // 2D NCHW conv fused with the bias + activation (+ optional residual) epilogue:
 //   y = act(conv(x, w) + bias[c] + residual)
 // Native replacement for the CPU host round-trip wgpu used for FusedConvBiasAct.
@@ -32,9 +35,11 @@ struct Params {
 fn erf_approx(x: f32) -> f32 {
     // Abramowitz–Stegun 7.1.26 (matches conv_bias_act_epilogue.comp).
     let z = abs(x);
-    let t = 1.0 / (1.0 + 0.3275911 * z);
-    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
-        - 0.284496736) * t + 0.254829592) * t * exp(-z * z);
+    let t = rlx_div_rn(1.0, fma(0.3275911, z, 1.0));
+    // explicit fma: an uncontracted chain is contracted differently by
+    // different shader compilers
+    let p = fma(fma(fma(fma(1.061405429, t, -1.453152027), t, 1.421413741), t, -0.284496736), t, 0.254829592) * t;
+    let y = fma(-p, rlx_exp(-z * z), 1.0);
     return select(-y, y, x >= 0.0);
 }
 
@@ -50,21 +55,21 @@ fn apply_act(v_in: f32, id: u32) -> f32 {
     if (id == 0xFFFFu) { return v; }
     switch (id) {
         case 0u: { v = max(v, 0.0); }
-        case 1u: { v = 1.0 / (1.0 + exp(-clamp(v, -88.0, 88.0))); }
-        case 2u: { v = tanh(clamp(v, -15.0, 15.0)); }
-        case 5u: { v = sqrt(v); }
+        case 1u: { v = rlx_div_rn(1.0, 1.0 + rlx_exp(-clamp(v, -88.0, 88.0))); }
+        case 2u: { v = rlx_tanh(clamp(v, -15.0, 15.0)); }
+        case 5u: { v = rlx_sqrt_rn(v); }
         case 7u: { v = -v; }
         case 8u: { v = abs(v); }
         case 9u: { v = gelu_erf(v); }
         case 10u: {
             let nx = clamp(-v, -88.0, 88.0);
-            v = v / (1.0 + exp(nx));
+            v = rlx_div_rn(v, 1.0 + rlx_exp(nx));
         }
         case 11u: {
             let c = 0.7978845608028654;
             let x3 = v * v * v;
-            let inner = clamp(c * (v + 0.044715 * x3), -15.0, 15.0);
-            v = 0.5 * v * (1.0 + tanh(inner));
+            let inner = clamp(c * fma(0.044715, x3, v), -15.0, 15.0);
+            v = 0.5 * v * (1.0 + rlx_tanh(inner));
         }
         default: {}
     }

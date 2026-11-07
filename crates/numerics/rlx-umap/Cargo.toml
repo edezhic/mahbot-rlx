@@ -145,7 +145,7 @@ required-features = ["full", "backend-tests"]
 
 [[test]]
 name = "optim_adapter"
-required-features = ["optim"]
+required-features = ["optim", "backend-tests"]
 
 [[test]]
 name = "knn_fit_parity"
@@ -205,3 +205,4 @@ required-features = ["backend-tests"]
 [[test]]
 name = "wgpu_fit_smoke"
 required-features = ["backend-tests"]
+

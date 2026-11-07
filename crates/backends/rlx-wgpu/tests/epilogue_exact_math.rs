@@ -1,0 +1,173 @@
+// RLX — versatile ML compiler + runtime.
+// Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! The fused matmul / conv epilogues (`apply_act`) divide through rlxsl's
+//! `rlx_div_rn` and exponentiate through `rlx_exp`, and spell the erf
+//! polynomial with explicit `fma`. A raw WGSL `/` or `exp`, or a plain
+//! `a * b + c` chain is compiled differently by native wgpu and by a browser's
+//! WebGPU on the same Metal GPU: BCG-FM's squeeze-excite sigmoid (an `m = 1`
+//! gemv epilogue) and every fused GELU moved by ULPs between them. The kernels
+//! call the helpers and `kernel_module` appends rlxsl's one definition (pinned
+//! in `kernels::fast_math_tests`); the normalization, softmax and attention
+//! kernels call the same ones.
+//!
+//! The directory holds nineteen epilogue shaders, not upstream's eighteen:
+//! `matmul_coop_f16_f32acc.wgsl` is this fork's cooperative f16-in-f32-accumulator
+//! multiply, which upstream deleted but the attention routing and `backend/run.rs`
+//! still dispatch, so it stays and the pin counts it.
+
+use std::path::Path;
+
+/// The body of `fn <name>(…) -> f32 { … }` in `src`, braces included.
+fn body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+    let start = src.find(&format!("fn {name}("))?;
+    let open = start + src[start..].find('{')?;
+    let mut depth = 0usize;
+    for (i, ch) in src[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&src[open..=open + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `src` calls the builtin `name(` (not a helper ending in it).
+fn calls_builtin(src: &str, name: &str) -> bool {
+    src.match_indices(&format!("{name}("))
+        .any(|(i, _)| !src[..i].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+#[test]
+fn every_epilogue_divides_exactly_and_fuses_its_polynomials() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let src = std::fs::read_to_string(&path).unwrap_or_default();
+        if !name.ends_with(".wgsl") {
+            continue;
+        }
+        // no kernel carries its own copy of a helper
+        assert!(
+            !src.contains("fn epi_"),
+            "{name}: a private helper copy is back"
+        );
+        // elementwise_region's `apply_activation` is the generated rlxsl math
+        if !src.contains("fn apply_act(") {
+            continue;
+        }
+        seen += 1;
+        let act = body(&src, "apply_act").unwrap();
+        for h in ["rlx_div_rn(", "rlx_exp("] {
+            assert!(act.contains(h), "{name}: apply_act does not call {h}…)");
+        }
+        for raw in [
+            "1.0 / (1.0 + exp",
+            "v / (1.0 + exp",
+            "1.0 / (1.0 + 0.3275911",
+            "1.0 - poly *",
+            "0.044715 * x3)",
+        ] {
+            assert!(
+                !src.contains(raw),
+                "{name}: `{raw}…` is back (inexact `/` or a contractible chain)"
+            );
+        }
+        assert!(
+            !calls_builtin(&src, "exp"),
+            "{name}: calls the builtin `exp` (its rounding depends on the math mode)"
+        );
+    }
+    assert_eq!(seen, 19, "the epilogue shaders moved; update this test");
+}
+
+/// The normalization, softmax and attention kernels (forward and backward) take
+/// `1/n`, `1/sqrt`, `exp` and `log` from rlxsl's helpers: a raw `/`,
+/// `inverseSqrt`, `exp` or `log` rounds by the math mode, and LayerNorm alone
+/// moved BIOT's first token embedding.
+#[test]
+fn norm_softmax_attention_kernels_use_the_exact_helpers() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
+    for name in [
+        "layernorm.wgsl",
+        "fused_residual_ln.wgsl",
+        "fused_residual_ln_tee.wgsl",
+        "fused_residual_rms_norm.wgsl",
+        "ada_layer_norm.wgsl",
+        "softmax.wgsl",
+        "attention.wgsl",
+        "layer_norm_backward.wgsl",
+        "rms_norm_backward.wgsl",
+        "ada_layer_norm_backward.wgsl",
+        "attention_bwd.wgsl",
+        "softmax_cross_entropy.wgsl",
+        "softmax_cross_entropy_bwd.wgsl",
+        "group_norm.wgsl",
+        "group_norm_backward.wgsl",
+    ] {
+        let src = std::fs::read_to_string(dir.join(name)).unwrap();
+        assert!(
+            !calls_builtin(&src, "inverseSqrt"),
+            "{name}: raw inverseSqrt"
+        );
+        assert!(!calls_builtin(&src, "exp"), "{name}: raw exp");
+        assert!(!calls_builtin(&src, "log"), "{name}: raw log");
+        assert!(!src.contains("1.0 / "), "{name}: raw `1.0 / …`");
+    }
+}
+
+/// rlxsl's WGSL `erf` (gelu in the elementwise kernels) uses explicit `fma`,
+/// and its `exp` is the helper's.
+#[test]
+fn generated_wgsl_erf_is_fused() {
+    let gelu = rlxsl::emit_activation(rlx_ir::op::Activation::Gelu, rlxsl::Lang::Wgsl);
+    let text = format!("{gelu:?}");
+    assert!(
+        text.contains("fma("),
+        "rlxsl's WGSL gelu lost its explicit fma: {text}"
+    );
+    assert!(
+        text.contains("rlx_exp("),
+        "rlxsl's WGSL gelu calls the builtin exp: {text}"
+    );
+}
+
+/// The GPU FFT kernels take their twiddles from rlxsl's `rlx_sin` / `rlx_cos`
+/// and their angles from `rlx_div_rn`, and spell every complex multiply with an
+/// explicit `fma`: the builtins and a plain `a*b - c*d` round by the compiler's
+/// math mode, so native wgpu (Apple fast math) and a browser (safe math) ran
+/// the same `Native` FFT to different bits.
+#[test]
+fn fft_kernels_are_math_mode_independent() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
+    for name in [
+        "fft_gpu.wgsl",
+        "fft_gpu_big.wgsl",
+        "fft_gpu_multirow.wgsl",
+        "fft_gpu_r4_16k.wgsl",
+    ] {
+        let src = std::fs::read_to_string(dir.join(name)).unwrap();
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for f in ["sin", "cos"] {
+            assert!(!calls_builtin(&code, f), "{name}: raw {f}");
+        }
+        assert!(!code.contains(" / f32("), "{name}: a raw float division");
+        assert!(
+            !code.contains("a.x * b.x - a.y * b.y"),
+            "{name}: a contractible complex multiply"
+        );
+    }
+}

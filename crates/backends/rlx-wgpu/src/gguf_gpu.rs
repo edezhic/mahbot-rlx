@@ -95,6 +95,46 @@ pub fn gemv_supports_scheme(scheme_id: u32) -> bool {
     matches!(scheme_id, 0 | 2 | 24)
 }
 
+/// Whether `graph` has packed (U8/I8) params and every one of them is only
+/// the weight operand of a GGUF matmul the fused GEMV runs on the GPU — the
+/// one consumer that binds the weight buffer in place. Anything else reading
+/// a packed param (a view, a gather, a host-dequant scheme) would have to
+/// stage it through the host.
+pub fn packed_weights_bind_in_place(graph: &Graph) -> bool {
+    use std::collections::HashSet;
+    let packed: HashSet<rlx_ir::NodeId> = graph
+        .nodes()
+        .iter()
+        .filter(|n| {
+            matches!(n.op, Op::Param { .. })
+                && matches!(n.shape.dtype(), rlx_ir::DType::U8 | rlx_ir::DType::I8)
+        })
+        .map(|n| n.id)
+        .collect();
+    if packed.is_empty() || graph.outputs.iter().any(|o| packed.contains(o)) {
+        return false;
+    }
+    graph.nodes().iter().all(|node| {
+        let reads_packed = node.inputs.iter().any(|i| packed.contains(i));
+        if !reads_packed {
+            return true;
+        }
+        let Op::DequantMatMul { scheme } = &node.op else {
+            return false;
+        };
+        if !scheme.is_gguf() {
+            return false;
+        }
+        let id = crate::gguf_host::gguf_scheme_id(*scheme);
+        // Q1_0 (24) prefers a tiled GEMM for m > 1 that is not weight-buffer aware.
+        gemv_supports_scheme(id)
+            && id != 24
+            && node.inputs.len() >= 2
+            && !packed.contains(&node.inputs[0])
+            && node.inputs[2..].iter().all(|i| !packed.contains(i))
+    })
+}
+
 /// Whether the tiled one-row kernel (`dequant_gemv_tiled`) has a branch for this
 /// scheme: the K-quants, whose 256-element blocks this arm reads through
 /// 32-element units (what a unit *is* differs per scheme — see its shader
@@ -779,7 +819,7 @@ fn note_gemv_one_row_shape(
 /// adding a scheme id without a branch (or a branch without listing it here)
 /// fails the tests rather than shipping a silent mis-decode.
 pub fn kernel_supports_scheme(scheme_id: u32) -> bool {
-    matches!(scheme_id, 0..=29)
+    matches!(scheme_id, 0..=31)
 }
 
 /// Max f32 scratch for dequantized weights `[n, k]` across all GGUF ops.
@@ -832,16 +872,26 @@ fn slab_bytes_for(scheme: rlx_ir::quant::QuantScheme, k: usize, n: usize) -> usi
     (k * n) / block_elems * block_bytes
 }
 
-/// The schemes the row-grouped GEMM serves, each with the kernel that carries
-/// it. The one place that set is named: [`grouped_gemm_kernel`] is this list read
+/// The schemes the row-grouped GEMM serves, each with the entry point of
+/// `dequant_gemm_gguf.wgsl` that carries it and the getter that builds that entry.
+/// The one place that set is named: [`grouped_gemm_kernel`] is this list read
 /// with a device and [`grouped_scheme_supported`] is it read without one, so the
 /// ladder that admits a multi-row call of a scheme and the encoder that dispatches
 /// it cannot drift into admitting a scheme no kernel would run — a drift that
 /// would stride the wrong entry point's format rather than fail.
-const GROUPED_SCHEMES: [(u32, fn(&wgpu::Device) -> &'static Kernel); 3] = [
-    (0, dequant_gemm_q4k_kernel),
-    (2, dequant_gemm_q6k_kernel),
-    (20, dequant_gemm_q8_0_kernel),
+///
+/// The entry name is carried here, not just inside the getter, because these
+/// entry points have no `scheme_id` word: the scheme is whichever entry point the
+/// host dispatched, so a scheme pointed at another scheme's entry decodes its
+/// packed bytes at the wrong block stride and returns numbers. Naming it makes
+/// that a device-free check — [`grouped_scheme_entry`] against the shader's own
+/// entry points in `tests/gguf_kernel_scheme_coverage.rs`.
+const GROUPED_SCHEMES: [(u32, &str, fn(&wgpu::Device) -> &'static Kernel); 3] = [
+    (0, "dequant_gemm_q4k", dequant_gemm_q4k_kernel),
+    (2, "dequant_gemm_q6k", dequant_gemm_q6k_kernel),
+    // The getter's other arm is `dequant_gemm_q8_0_reassembly`, the same body over
+    // the block reader `RLX_WGPU_Q8_0_BLOCK_WORDS=0` keeps — not a second route.
+    (20, "dequant_gemm_q8_0", dequant_gemm_q8_0_kernel),
 ];
 
 /// Whether the row-grouped GEMM has an arm for `scheme_id` — the `GROUPED_SCHEMES`
@@ -850,7 +900,16 @@ const GROUPED_SCHEMES: [(u32, fn(&wgpu::Device) -> &'static Kernel); 3] = [
 /// `tests/gguf_kernel_scheme_coverage.rs` pins the list itself, over every
 /// registered id.
 pub fn grouped_scheme_supported(scheme_id: u32) -> bool {
-    GROUPED_SCHEMES.iter().any(|(id, _)| *id == scheme_id)
+    GROUPED_SCHEMES.iter().any(|(id, _, _)| *id == scheme_id)
+}
+
+/// The `dequant_gemm_gguf.wgsl` entry point `GROUPED_SCHEMES` runs for
+/// `scheme_id`, or `None` for a scheme the row-grouped GEMM has no arm for.
+pub fn grouped_scheme_entry(scheme_id: u32) -> Option<&'static str> {
+    GROUPED_SCHEMES
+        .iter()
+        .find(|(id, _, _)| *id == scheme_id)
+        .map(|(_, entry, _)| *entry)
 }
 
 /// Whether the row-grouped GEMM covers a contraction `k` of `scheme_id`: the arm
@@ -883,8 +942,8 @@ pub fn grouped_k_ok(scheme_id: u32, k: usize) -> bool {
 fn grouped_gemm_kernel(scheme_id: u32, device: &wgpu::Device) -> Option<&'static Kernel> {
     GROUPED_SCHEMES
         .iter()
-        .find(|(id, _)| *id == scheme_id)
-        .map(|(_, kernel)| kernel(device))
+        .find(|(id, _, _)| *id == scheme_id)
+        .map(|(_, _, kernel)| kernel(device))
 }
 
 /// Which multi-row packed-weight GEMM an encode takes.
@@ -1001,16 +1060,31 @@ const COOP_GEMM_MAX_PAD_DIVISOR: usize = 3;
 /// The fewest workgroups a cooperative-tile dispatch must have, from measurement.
 ///
 /// The tile is 32 rows by 128 columns, so a narrow projection at a short prompt
-/// leaves few: the encoder's `ffn_down` (m = 96, n = 1 024) is 24, and the body's
-/// `o` projection at the 128-frame rung (m = 31, n = 2 048) 16. Every one of those
-/// loses to the row-grouped tile, whose four times the row groups fill the device
-/// where one 32-row tile per column block does not; the body's `o` at m = 95
-/// (n = 2 048, 48 workgroups) is where the cooperative tile turns 1.33x ahead. So
-/// the floor is 48, and a call below it is the row-grouped tile's.
+/// leaves few, and the tile's one pass over the packed weight per 32-row group
+/// only pays once enough workgroups are in flight to keep the device busy.
+/// Measured with `gguf_gemm_prefill_rate`'s round-robin pair (grouped ÷ coop, so
+/// above 1 is the cooperative tile's) over the cells the boundary runs through:
+///
+/// | workgroups | cell | grouped ÷ coop |
+/// |---|---|---|
+/// | 8 | `q4k o m31 k2048 n1024` | 0.55x |
+/// | 16 | `q4k o m31 k2048 n2048` | 0.83x |
+/// | 24 | `q4k o m95 k2048 n1024` | 1.04x |
+/// | 24 | `q8_0 enc-down m96 k4096 n1024` | 1.17x |
+/// | 32 | `q4k o m31 k2048 n4096` | 1.14x |
+/// | 48 | `q4k o m95 k2048 n2048` | 1.37x |
+///
+/// So the floor is 24: every product cell at or above it wins, and the two below
+/// it (the body's `o` at the 128-frame rung, 16, and a 1 024-column projection at
+/// one row tile, 8) lose by more than a fifth. A tile dispatch's workgroup count
+/// is `ceil(n / 128) · ceil(m / 32)`, so 17 to 23 are reachable in general; every
+/// width this product multiplies is a multiple of 1 024, so its `ceil(n / 128)`
+/// is a multiple of eight and no product cell lands inside that gap. The exact
+/// floor within it is unmeasured and free to move with the first shape that does.
 ///
 /// The wake word's two-window encoder pass (m ≈ 20) is below both this floor and
 /// `COOP_GEMM_MAX_PAD_DIVISOR`'s row floor, so it is the grouped tile's twice over.
-pub const COOP_MIN_WORKGROUPS: usize = 48;
+pub const COOP_MIN_WORKGROUPS: usize = 24;
 
 /// Whether a row-grouped GEMM call's X window begins on a four-element group,
 /// which is what that kernel's `vec4` X reads need. The encoder rounds the window

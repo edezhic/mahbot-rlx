@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{CLEARED_SWITCHES, packed_gguf_weight, rerun_self, route_lock};
+use common::{cleared_switches, packed_gguf_weight, rerun_self, route_lock};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, GraphExt, Op, Shape};
 use rlx_runtime::{Device, Session};
@@ -164,7 +164,7 @@ fn a_parked_table_reads_the_same_rows() {
             "a_parked_table_reads_the_same_rows",
             MARKER,
             "1",
-            &CLEARED_SWITCHES,
+            &cleared_switches(),
             &[("RLX_WGPU_ALL_PARAMS_WEIGHT", "1"), ("RLX_WGPU_DEBUG", "1")],
         );
         assert!(ok, "the parked-table case failed: {log}");

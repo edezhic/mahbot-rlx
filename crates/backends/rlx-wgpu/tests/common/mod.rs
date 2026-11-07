@@ -13,7 +13,7 @@
 //! pins derive their bar from and the six real decoder geometries those pins and
 //! the route harness both read, the bounded child re-exec harness ([`rerun_self`])
 //! that a case which has to run in its own process waits on with a deadline, the
-//! switch set those children clear ([`CLEARED_SWITCHES`]), the pins' own refusal
+//! switch set those children clear ([`cleared_switches`]), the pins' own refusal
 //! and the route-counter lock at the end of the file.
 //! `tests/common/` is not a test target of its own; each test binary pulls it in with
 //! `mod common;`.
@@ -398,10 +398,6 @@ pub fn assert_close_under(label: &str, arm: &str, got: &[f32], want: &[f32]) -> 
 /// routes, joined intervals or counted pairs it would move refuse on it.
 pub const Q8_0_BISECT: &str = "RLX_WGPU_Q8_0_GEMM_DISABLE";
 
-/// The 1-bit GGUF scheme's bisect lever, spelled here for [`Q8_0_BISECT`]'s reason: it
-/// takes that scheme's multiplies off its fused device kernel (`gguf_gpu`).
-pub const Q1_0_BISECT: &str = "RLX_WGPU_Q1_0_GEMM_DISABLE";
-
 /// Refuse when the 8-bit scheme's bisect lever is set: the lever is read where that
 /// call is encoded, so under it a call this tree routes on the grouped device arm
 /// answers the slab instead — another routing mode, not a defect in the pin.
@@ -456,57 +452,142 @@ pub fn refuse_under_run_report() {
     );
 }
 
-/// The switches that move this crate's routing — which of a fixture's steps runs where,
-/// whether a step is a device step at all, whether a packed multiply joins the batch, which
-/// fusion is expanded at the lowering, whether a masked key's reads are stood down, and
-/// whether the run reports its own figures — cleared on every re-exec'd child before the
-/// case's own switches are applied, so what a child reads is the case's environment and
-/// never the operator's. A case that is *about* one of them sets it again by name. Spelled
-/// once for every harness here that re-execs a child (`run_report.rs`,
-/// `hosted_audio_step_placement.rs`); `buffer_copy_batch_join.rs` guards the same
-/// routing set with an assertion instead of clearing it.
-pub const CLEARED_SWITCHES: [&str; 40] = [
-    "RLX_WGPU_SNAPSHOT",
-    "RLX_BENCH_DISPATCH_ONLY",
-    "RLX_WGPU_ALL_PARAMS_WEIGHT",
-    "RLX_WGPU_HOST_EAGER_H2D",
-    "RLX_WGPU_HOST_BUFFER_COPY",
-    "RLX_WGPU_CONCAT_HOST",
-    "RLX_WGPU_FORCE_HOST",
-    "RLX_WGPU_HOST_MATMUL",
-    "RLX_WGPU_HOST_NORM",
-    "RLX_WGPU_GPU_NORM",
-    "RLX_WGPU_DISCRETE_HOST",
-    "RLX_WGPU_SHARD_CAP_MIB",
-    "RLX_WGPU_SHARD_STAGE_MIB",
-    "RLX_WGPU_SHARD_GPU",
-    "RLX_WGPU_ALLOW_SHARD",
-    "RLX_WGPU_ONE_OP_PER_PASS",
-    "RLX_WGPU_ENCODE_CHUNK",
-    "RLX_WGPU_MAX_BIND_MB",
-    Q1_0_BISECT,
-    Q8_0_BISECT,
-    "RLX_WGPU_GEMM_COOP_DISABLE",
-    "RLX_WGPU_Q8_0_BLOCK_WORDS",
-    "RLX_WGPU_GEMV_WIDE",
-    "RLX_WGPU_GEMV_IN_PLACE",
-    "RLX_WGPU_GEMV_ILP",
-    "RLX_WGPU_GEMV_POOL",
-    "RLX_WGPU_TRANSPOSE_HOST",
-    "RLX_WGPU_NO_SNAKE_BETA",
-    "RLX_WGPU_NO_GATHER_INDEX_BIAS",
-    "RLX_WGPU_NO_LN_TEE",
-    "RLX_WGPU_NO_NORM_ROPE",
-    "RLX_WGPU_NO_FUSED_SWIGLU",
-    "RLX_WGPU_NO_FUSED_RESIDUAL_RMS",
-    "RLX_WGPU_NO_ATTN_MASK_SKIP",
-    "RLX_WGPU_ATTN_DENSE_ONE_ROW",
-    "RLX_WGPU_CONV_IM2COL",
-    "RLX_WGPU_CONV_IMPLICIT",
-    "RLX_WGPU_ATTENTION_BAND_F32",
-    "RLX_WGPU_NO_DENSE_COOP",
-    RUN_REPORT_SWITCH,
+/// The switches a re-exec'd child must **inherit** rather than clear: the device layer
+/// decides which device it runs on, and `RLX_REQUIRE_DEVICE` decides whether a missing
+/// one is a failure. Clearing either would let a case that asked for the GPU quietly
+/// answer on the CPU and pass. The device layer is read from the registry rather than
+/// listed, so a device-layer switch added upstream is inherited without this file being
+/// touched; `RLX_REQUIRE_DEVICE` is registered in a group of its own and is the one name
+/// here that has to be spelled.
+fn inherited(entry: &rlx_ir::env_registry::EnvVarEntry) -> bool {
+    matches!(entry.layer, rlx_ir::env_registry::EnvLayer::Device)
+        || entry.name == "RLX_REQUIRE_DEVICE"
+}
+
+/// Every registered switch except [`inherited`] — which of a fixture's steps runs
+/// where, whether a step is a device step at all, whether a packed multiply joins the
+/// batch, which fusion is expanded at the lowering, whether a masked key's reads are
+/// stood down, how the arena is planned, which dispatch tuning row is read, and whether
+/// the run reports its own figures — cleared on every re-exec'd child before the case's
+/// own switches are applied, so what a child reads is the case's environment and never
+/// the operator's. A case that is *about* one of them sets it again by name.
+///
+/// Read from [`rlx_ir::env_registry`] rather than kept as a list: every switch this
+/// crate reads is registered there (`just check-rlx-env-vars` enforces it), so a route
+/// that grows one is cleared without this file being touched. Debug and dump switches
+/// are cleared with the rest, which costs nothing and cannot pin a child to an
+/// operator's tracing. Spelled once for every harness here that re-execs a child
+/// (`run_report.rs`, `hosted_audio_step_placement.rs`, `gather_packed_parity.rs`,
+/// `kv_append_in_place.rs`, `norm_rope_fusion.rs`). Pins that run **in-process** do
+/// not clear anything — a child's environment is not theirs to rewrite — so they
+/// refuse over [`guarded_switches`] and redirect the one switch whose unset default
+/// is a real file ([`pin_tuning_cache_off`]).
+pub fn cleared_switches() -> Vec<&'static str> {
+    rlx_ir::env_registry::REGISTRY
+        .iter()
+        .filter(|entry| !inherited(entry))
+        .flat_map(|entry| std::iter::once(entry.name).chain(entry.aliases.iter().copied()))
+        .collect()
+}
+
+/// Switches in this backend's own group that only report: a dump, a trace, a log, a
+/// schedule print, a plan report. They cannot move what a pin reads, so a pin that
+/// refuses under an operator's environment does not refuse under these.
+///
+/// The `DUMP_` family is a prefix; the rest are named. Nothing with a `DBG_` or
+/// `DEBUG_` prefix is excluded by rule — `RLX_WGPU_DBG_COUNTERS` is the run report,
+/// which a pin *does* refuse under, and the rest are read one by one.
+const REPORTING: &[&str] = &[
+    "RLX_WGPU_ACTIVE_TRACE",
+    "RLX_WGPU_ARENA_REPORT",
+    "RLX_WGPU_COOP_PROBE_VERBOSE",
+    "RLX_WGPU_DEBUG_OP_HIST",
+    "RLX_WGPU_DBG_HOST_OP",
+    "RLX_WGPU_DBG_TRANSPOSE",
+    "RLX_WGPU_FEED_TRACE",
+    "RLX_WGPU_HAZARD_REPORT",
+    "RLX_WGPU_PRINT_LIMITS",
+    "RLX_WGPU_QUIET_SHARD",
+    "RLX_WGPU_ROW_TABS",
+    "RLX_WGPU_SCHEDULE",
+    "RLX_WGPU_SHARD_LOG",
+    "RLX_WGPU_SNAPSHOT_WATCH",
+    "RLX_WGPU_STRIPE_VERBOSE",
+    "RLX_WGPU_TEE_VETO_LOG",
 ];
+
+/// Switches outside this backend's group that still move a schedule: the fusion
+/// passes, the arena plan, whether a packed multiply joins the batch, whether a
+/// nan scan runs, and what a submission means. Kept short because it is the only
+/// part of [`guarded_switches`] that is written down rather than derived.
+///
+/// `RLX_GPU_TUNING_CACHE` is deliberately absent: refusing under it only catches
+/// an operator who set it explicitly, while the ambient default
+/// (`~/.cache/rlx-wgpu/dispatch-tuning.tsv`) is read either way. A pin is safe
+/// only once the path is pointed somewhere that cannot exist, which is
+/// [`pin_tuning_cache_off`]'s job.
+const CROSS_CUTTING: &[&str] = &[
+    "RLX_ARENA_NO_REUSE",
+    "RLX_BENCH_DISPATCH_ONLY",
+    "RLX_DEBUG_NANS",
+    "RLX_DISPATCH_REPORT",
+    "RLX_PIN_OUTPUT_ANCESTORS",
+];
+
+/// The dump family's prefix: a family of switches, not one this file reads.
+const DUMP_PREFIX: &str = "RLX_WGPU_DUMP_"; // env-lint: ignore
+
+/// The switches a pin that runs **in-process** refuses under, rather than clearing
+/// them the way [`rerun_self`] clears a child's: everything this backend registers
+/// (`group = "wgpu"`, which is where a route switch lands), plus [`CROSS_CUTTING`],
+/// minus [`REPORTING`] and minus the pin's own `own`.
+///
+/// Derived from the registry so a route that adds a switch is guarded without this
+/// file being touched. The exclusions are the hand-kept part, and they fail in the
+/// safe direction: a reporting switch left out makes a pin refuse something benign,
+/// where a routing switch left out would let it run under a switch that moved its
+/// reading.
+pub fn guarded_switches(own: &[&str]) -> Vec<&'static str> {
+    let derived = rlx_ir::env_registry::REGISTRY
+        .iter()
+        .filter(|entry| entry.group == "wgpu")
+        .flat_map(|entry| std::iter::once(entry.name).chain(entry.aliases.iter().copied()))
+        .filter(|name| {
+            !own.contains(name) && !REPORTING.contains(name) && !name.starts_with(DUMP_PREFIX)
+        });
+    derived.chain(CROSS_CUTTING.iter().copied()).collect()
+}
+
+/// Point the persisted dispatch tuning table at a name that cannot exist, so an
+/// in-process pin reads the shipped rows and the compile-time cascade rather than
+/// an operator's overrides. [`rerun_self`] does the same for a child through the
+/// environment; a pin that runs in this process has to do it itself.
+///
+/// The pin then *performs* the read rather than assuming it got there first:
+/// [`rlx_wgpu::tuning::ensure_tuning_cache_loaded`] runs at most once and blocks
+/// while another thread is inside it, so this either loads under the redirect or
+/// waits for a sibling's load and sees its final count. What it asserts is the
+/// property that matters — that nothing of the operator's was applied
+/// ([`rlx_wgpu::tuning::tuning_overrides_applied`]) — which a machine with no cache
+/// file satisfies however the cases interleave.
+pub fn pin_tuning_cache_off(tag: &str) {
+    // Read before the redirect: this is the file the process would have loaded, and
+    // it is what the failure message has to name.
+    let operator = rlx_wgpu::tuning::tuning_cache_path();
+    rlx_ir::env::set(
+        TUNING_CACHE_SWITCH,
+        absent_tuning_cache(tag).to_string_lossy(),
+    );
+    rlx_wgpu::tuning::ensure_tuning_cache_loaded();
+    assert_eq!(
+        rlx_wgpu::tuning::tuning_overrides_applied(),
+        0,
+        "pin_tuning_cache_off({tag:?}): this process already applied dispatch tuning \
+         overrides from {}, so the pin cannot protect its readings — move that file \
+         aside and re-run",
+        operator.map_or_else(|| "<no path>".to_string(), |p| p.display().to_string())
+    );
+}
 
 /// The arrangement every layer of a many-layer attention chain is expected to
 /// take: a single query row is the decode-shaped form whatever its key count
@@ -882,12 +963,31 @@ pub fn route_lock() -> MutexGuard<'static, ()> {
 /// regression that makes a run spin hung the gate instead of failing it.
 pub const CHILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// The one cleared switch whose *unset* default is a real file on this machine:
+/// removing it does not hand the child "no tuning", it hands it
+/// `$XDG_CACHE_HOME/rlx-wgpu/dispatch-tuning.tsv` — whatever the operator last
+/// measured — and a route pin then reads an arrangement it never asked for. Pointed at
+/// a name that cannot exist instead, so the child loads no overrides at all.
+const TUNING_CACHE_SWITCH: &str = "RLX_GPU_TUNING_CACHE";
+
+/// The value that switch takes when the table is to be read from nowhere: a name
+/// under the temp directory that no writer creates. Shared by [`rerun_self`]'s
+/// child and [`pin_tuning_cache_off`]'s in-process pin so the two cannot drift
+/// into redirecting the table in two different ways.
+fn absent_tuning_cache(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("rlx-wgpu-{tag}-no-tuning-cache.tsv"))
+}
+
 /// Run this test binary again as a child running the test `filter`, for the fixture
 /// `fixture_var` = `fixture`, `env` set and `cleared` removed, and wait for it **with a
 /// deadline** ([`CHILD_BUDGET`]) — a child that outlives it is killed and the case panics
 /// with the stderr it managed to print, so a run that cannot advance reports instead of
 /// spinning. Its stderr is captured through a file in the temp directory rather than a
 /// pipe, so the child cannot deadlock on a full pipe. Returns `(exited cleanly, stderr)`.
+///
+/// [`TUNING_CACHE_SWITCH`] is redirected rather than merely removed; everything else in
+/// `cleared` is removed, and `env` is applied last so a case that is *about* a switch
+/// still wins.
 ///
 /// The child prints `"{fixture_var} {fixture}"` as soon as it takes its fixture branch (see
 /// each harness's own child path), and this waits for that line in the captured stderr: a
@@ -913,6 +1013,10 @@ pub fn rerun_self(
     for key in cleared {
         cmd.env_remove(key);
     }
+    cmd.env(
+        TUNING_CACHE_SWITCH,
+        absent_tuning_cache(&format!("child-{}", std::process::id())),
+    );
     for (key, value) in env {
         cmd.env(key, value);
     }

@@ -1,0 +1,53 @@
+[package]
+name = "rlx-libm"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "glibc 2.43's libm (x86_64 FMA variants) reproduced bit-for-bit in pure Rust: exp, log, pow, trig, inverse trig, hyperbolic, erf, gamma, f32 and f64"
+authors.workspace      = true
+license.workspace      = true
+keywords = ["libm", "glibc", "math", "parity"]
+categories = ["science", "mathematics"]
+repository.workspace   = true
+documentation.workspace = true
+
+[lib]
+name = "rlx_libm"
+path = "src/lib.rs"
+
+[dependencies]
+# None: every function is this crate's own Rust.
+
+[dev-dependencies]
+# None. The musl second opinion (the real `libm` crate) lives in
+# `tools/vs-musl`, its own workspace: rlx patches crates.io's `libm` with
+# rlx-libm (`crates/numerics/libm-shim`), so in this workspace `libm` is us.
+
+[features]
+default = ["std"]
+# `std`'s hardware `sqrt` / `floor` / `mul_add` (instructions, not libm
+# calls). Off: the same correctly rounded operations in Rust, for `no_std`.
+std = []
+# wasm32: define the `fma` symbol with `fma_emulated`, replacing the slow
+# software fma behind every `f64::mul_add` in the binary.
+wasm-fma = []
+# wasm32: define the glibc 2.43 ports (exp / log / pow / sin / cos / tan / …
+# and their f32 forms, `src/wasm_glibc.rs`), replacing compiler-builtins' weak
+# musl ones for the whole binary, so std's float math in every crate rounds as
+# on Linux.
+wasm-glibc = []
+# Every target: define every ported symbol (the `wasm-glibc` set plus the
+# rest of glibc 2.43's float math rlx ports — atan2, acos…tgamma, the f32
+# CORE-MATH set — and `sincos` / `__sincos_stret`, which LLVM merges a sin and
+# cos of one argument into), so std's float math in every crate of the binary
+# rounds the same on macOS, Linux and wasm. For binaries only: it replaces the
+# platform libm for the whole program (a NumPy-on-macOS parity test would then
+# see glibc's rounding).
+export-glibc = []
+# The platform's C libm (Apple's libSystem) for `reference` on Apple
+# targets, so ports agree bit for bit with NumPy / SciPy / torch running on
+# macOS. Off: the pure-Rust ports (glibc's algorithms) everywhere.
+libm = ["std"]
+
+[lints]
+workspace = true

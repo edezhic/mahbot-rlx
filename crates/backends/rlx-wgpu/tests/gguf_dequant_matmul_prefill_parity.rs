@@ -714,6 +714,35 @@ fn wgpu_gguf_dequant_matmul_prefill_matches_cpu() {
         return;
     }
     let cases: &[(QuantScheme, rlx_gguf::GgmlType, usize, usize, usize, f32)] = &[
+        // Q8_0 at several rows: 64 rows, ragged rows and columns, and a FLUX.1
+        // projection at 160 px. Which multi-row tile serves each cell — the
+        // cooperative 32-row one or the row-grouped 8-row one — is
+        // `coop_gemm_admits`'s answer at its own shape, and `run_case` takes that
+        // tile's bar.
+        (
+            QuantScheme::GgufQ8_0,
+            rlx_gguf::GgmlType::Q8_0,
+            64,
+            256,
+            64,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ8_0,
+            rlx_gguf::GgmlType::Q8_0,
+            21,
+            96,
+            70,
+            1e-2,
+        ),
+        (
+            QuantScheme::GgufQ8_0,
+            rlx_gguf::GgmlType::Q8_0,
+            228,
+            3072,
+            9216,
+            1e-2,
+        ),
         (
             QuantScheme::GgufQ4K,
             rlx_gguf::GgmlType::Q4K,
@@ -1371,7 +1400,7 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
         // the A panel) is the tile's rather than `k`'s. The tile writes whole 32-row
         // tiles, so this is the one shape where its output slab is taller than the
         // call; `stage_a`'s clamp to `m - 1` is what keeps its A panel inside the X
-        // window. 12 288 columns is 96 workgroups, twice `COOP_MIN_WORKGROUPS`, so
+        // window. 12 288 columns is 96 workgroups, four times `COOP_MIN_WORKGROUPS`, so
         // Q4_K/Q6_K/Q8_0 take the tile here; Q5_K has an entry point for neither
         // tile and stays on the scratch slab, which its own cell comment above
         // records.
@@ -1470,21 +1499,21 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
         // no grid-cell absolute bound holds here. Measured max_abs / cpu_max
         // (relative), this build:
         //   m=1 (3-D) 2.6e-6
-        //   m=96      4.3e-4
+        //   m=96      1.0e-3
         //   m=192     1.0e-3
         // The two multi-row cells sit on f16 operand rounding rather than on
         // accumulation order: the cooperative tile serves the packed projections that
         // have an entry point for it (Q5_K does not), and its operands are f16 — the
         // activations downcast as they land in the workgroup stage, the packed weight
         // decoded to f16 — which is a *relative* effect, so both read ~1e-3 of their
-        // own scale. m=96 reads lower than m=192 because fewer of its projections
-        // reach the tile at those rows: the two narrow ones (`n = 1 024`, 24
-        // workgroups at three row tiles) are under `COOP_MIN_WORKGROUPS` and keep the
-        // row-grouped tile, which is still f32. Before the tile existed the same two
-        // cells read 7.6e-6 and 9.8e-6, which is what the f32 accumulation order of
-        // the arms they then took produced. The single-row cell is an order below
-        // both: it keeps the tiled one-row arm, and the tile cannot admit one row at
-        // all.
+        // own scale. Both row counts put three of the block's four projections on the
+        // tile, the narrow `n = 1 024` pair included: at three row tiles they are 24
+        // workgroups, `COOP_MIN_WORKGROUPS` itself, and took the tile once the floor
+        // moved down from 48. So the two cells differ by the extra layer's
+        // accumulation rather than by route. Before the tile existed they read
+        // 7.6e-6 and 9.8e-6, which is what the f32 accumulation order of the arms
+        // they then took produced. The single-row cell is three orders below both: it
+        // keeps the tiled one-row arm, and the tile cannot admit one row at all.
         //
         // So the absolute figure tracks cpu_max, not the route, and what actually
         // bounds a cell — the fused GEMV/GEMM and the scratch-dequant accumulation

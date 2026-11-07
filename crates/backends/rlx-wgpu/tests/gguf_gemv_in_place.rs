@@ -127,15 +127,19 @@ fn a_one_row_multiply_stores_into_the_arena_and_allocates_no_output_slab() {
          into the arena and allocate no slab"
     );
 
-    // The refusing geometry: the row's slot sits 128 bytes below X, so the
-    // align-down window a storage binding needs would reach into the row the same
-    // dispatch reads. The guard must refuse and the pooled slab must appear. The
-    // 128-byte slip is the arena plan's (`k = 256, n = 640`), not this file's: if
-    // the plan's byte layout moves enough to place this slot on a 256-byte boundary
-    // the row would store again and this assertion would read the plan, not the
-    // guard — the resolver's own refusal is pinned device-free in `gguf_gpu`, by
+    // The refusing geometry: the out slot is `[1, n]` with `n * 4` *not* a multiple
+    // of the 256-byte storage alignment, so the slot X is placed in starts 64 bytes
+    // past one — and X's own binding base rounds down to that boundary, reaching
+    // back into the row this dispatch writes. The guard must refuse and the pooled
+    // slab must appear. Both terms are the arena plan's, not this file's: the
+    // split admission gives the out slot offset 0 (it is the larger of the two) and
+    // X the slot after it, so the refusal holds exactly while `n % 64 != 0` — at the
+    // `n = 640` this fixture used to carry, `n * 4` is 256-aligned, X's base lands on
+    // the slot's end, and the guard correctly admits the store (the row then stores
+    // and this assertion would read the plan, not the guard). The resolver's own
+    // refusal is pinned device-free in `gguf_gpu`, by
     // `a_row_inside_a_storage_block_brings_the_slot_below_it_into_the_window`.
-    let (k, n) = (256usize, 640usize);
+    let (k, n) = (256usize, 656usize);
     let (g, packed, x) = case(1, k, n);
     let _ = run(Device::Gpu, g, &packed, &x);
     eprintln!(

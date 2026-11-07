@@ -224,10 +224,12 @@ fn gelu_erf(x: f32) -> f32 {
     let arg = x * 0.70710678118654752;
     let s = select(-1.0, 1.0, arg >= 0.0);
     let xa = abs(arg);
-    let t = 1.0 / (1.0 + 0.3275911 * xa);
-    let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
-                + t * (-1.453152027 + t * 1.061405429))));
-    let e = s * (1.0 - poly * exp(-xa * xa));
+    let t = rlx_div_rn(1.0, fma(0.3275911, xa, 1.0));
+    // explicit fma: an uncontracted chain is contracted differently by
+    // different shader compilers
+    let poly = t * fma(t, fma(t, fma(t, fma(t, 1.061405429, -1.453152027), 1.421413741),
+                -0.284496736), 0.254829592);
+    let e = s * fma(-poly, rlx_exp(-xa * xa), 1.0);
     return 0.5 * x * (1.0 + e);
 }
 
@@ -236,21 +238,21 @@ fn apply_act(v_in: f32) -> f32 {
     if (params.act_id == 0xFFFFu) { return v; }
     switch (params.act_id) {
         case 0u: { v = max(v, 0.0); }
-        case 1u: { v = 1.0 / (1.0 + exp(-clamp(v, -88.0, 88.0))); }
-        case 2u: { v = tanh(clamp(v, -15.0, 15.0)); }
-        case 5u: { v = sqrt(v); }
+        case 1u: { v = rlx_div_rn(1.0, 1.0 + rlx_exp(-clamp(v, -88.0, 88.0))); }
+        case 2u: { v = rlx_tanh(clamp(v, -15.0, 15.0)); }
+        case 5u: { v = rlx_sqrt_rn(v); }
         case 7u: { v = -v; }
         case 8u: { v = abs(v); }
         case 9u: { v = gelu_erf(v); }
         case 11u: {
             let c = 0.7978845608028654;
             let x3 = v * v * v;
-            let inner = clamp(c * (v + 0.044715 * x3), -15.0, 15.0);
-            v = 0.5 * v * (1.0 + tanh(inner));
+            let inner = clamp(c * fma(0.044715, x3, v), -15.0, 15.0);
+            v = 0.5 * v * (1.0 + rlx_tanh(inner));
         }
         case 10u: {
             let nx = clamp(-v, -88.0, 88.0);
-            v = v / (1.0 + exp(nx));
+            v = rlx_div_rn(v, 1.0 + rlx_exp(nx));
         }
         default: {}
     }

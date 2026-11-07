@@ -85,28 +85,21 @@ fn pow2i(e: i32) -> f32 {
     return bitcast<f32>(u32(e + 127) << 23u);
 }
 
-// Correctly-rounded a/b.
-//
-// NOT a bare `/`: Metal compiles with fast math on by default, which lowers f32
-// division to a reciprocal-multiply. That is up to 1 ULP off, and it is not a
-// cosmetic 1 ULP — the scale it produces multiplies every element of a block, so
-// `amax / max_finite` came out 0x3bdb6db8 on the GPU against the oracle's
-// 0x3bdb6db7 and the whole tensor shifted with it. (Measured on the wgpu/Metal
-// backend; the same hazard exists wherever a driver defaults to fast math.)
-//
-// One Newton step fixes it: `fma` forms the residual `a - b*q` exactly, and
-// correcting by `r/b` lands on the correctly-rounded quotient — the second
-// divide's own error is second order.
-fn div_rn(a: f32, b: f32) -> f32 {
-    let q = a / b;
-    let r = fma(-b, q, a);
-    return q + r / b;
-}
+// The scale's division goes through `rlx_div_rn` — rlxsl's correctly-rounded
+// divide, appended by `kernel_module` — and NOT through a bare `/`: Metal
+// compiles with fast math on by default, which lowers f32 division to a
+// reciprocal-multiply. That is up to 1 ULP off, and it is not a cosmetic 1 ULP —
+// the scale it produces multiplies every element of a block, so `amax /
+// max_finite` came out 0x3bdb6db8 on the GPU against the oracle's 0x3bdb6db7 and
+// the whole tensor shifted with it. (Measured on the wgpu/Metal backend; the same
+// hazard exists wherever a driver defaults to fast math.)
 
 fn is_nan(v: f32) -> bool { return v != v; }
-fn is_inf(v: f32) -> bool { return abs(v) > 3.4028235e38; }
+fn is_inf(v: f32) -> bool { return abs(v) > 0x1.fffffep+127f; }
 fn is_finite(v: f32) -> bool { return !is_nan(v) && !is_inf(v); }
-fn quiet_nan() -> f32 { return bitcast<f32>(0x7fc00000u); }
+// `seed` is any runtime value: a NaN bit pattern built from constants alone is
+// a const-expression, which Tint (Chrome/Dawn WebGPU) rejects outright.
+fn quiet_nan(seed: u32) -> f32 { return bitcast<f32>(0x7fc00000u | (seed & 0u)); }
 // Built from bits rather than by overflowing a literal: naga's GLSL front end
 // rejects a constant-folded infinity outright, and the two ports are kept
 // spelled the same on purpose.
@@ -161,14 +154,14 @@ fn decode_lowp(fmt: u32, code: u32) -> f32 {
     let max_exp = (1u << e_bits) - 1u;
 
     if (fnuz) {
-        if (sign_bit != 0u && exp == 0u && mant == 0u) { return quiet_nan(); }
+        if (sign_bit != 0u && exp == 0u && mant == 0u) { return quiet_nan(mant); }
     } else if (has_inf) {
         if (exp == max_exp) {
             if (mant == 0u) { return signed_inf(sign); }
-            return quiet_nan();
+            return quiet_nan(mant);
         }
     } else if (e4m3ocp) {
-        if (exp == max_exp && mant == ((1u << m_bits) - 1u)) { return quiet_nan(); }
+        if (exp == max_exp && mant == ((1u << m_bits) - 1u)) { return quiet_nan(mant); }
     }
 
     let m_div = f32(1u << m_bits);
@@ -225,7 +218,7 @@ fn encode_lowp(fmt: u32, x_in: f32) -> u32 {
     }
     let n_codes = 1u << code_width(fmt);
     var best = 0u;
-    var best_err = 3.4028235e38;
+    var best_err = 0x1.fffffep+127f;
     var best_lsb = 1u;
     for (var c = 0u; c < n_codes; c = c + 1u) {
         let v = decode_lowp(fmt, c);
@@ -242,7 +235,7 @@ fn encode_lowp(fmt: u32, x_in: f32) -> u32 {
 }
 
 fn e8m0(b: u32) -> f32 {
-    if (b == 0xFFu) { return quiet_nan(); }
+    if (b == 0xFFu) { return quiet_nan(b); }
     // Same as `bitcast<f32>(b << 23)`; written via pow2i to keep the
     // "no transcendentals in the codec" rule visible in one place.
     return pow2i(i32(b) - 127);
@@ -318,7 +311,7 @@ fn scaled_quant_scale(@builtin(global_invocation_id) gid: vec3<u32>,
         for (var i = 0u; i < n; i = i + 1u) {
             amax = max(amax, abs(arena[params.a_byte_off + i]));
         }
-        arena[params.a_scale_byte_off / 4u] = select(1.0, div_rn(amax, maxf), amax > 0.0);
+        arena[params.a_scale_byte_off / 4u] = select(1.0, rlx_div_rn(amax, maxf), amax > 0.0);
         return;
     }
 
@@ -347,7 +340,7 @@ fn scaled_quant_scale(@builtin(global_invocation_id) gid: vec3<u32>,
         for (var c = lo; c < hi; c = c + 1u) {
             amax = max(amax, abs(arena[params.a_byte_off + r * params.cols + c]));
         }
-        let s = select(1.0, div_rn(amax, maxf), amax > 0.0);
+        let s = select(1.0, rlx_div_rn(amax, maxf), amax > 0.0);
         if (params.scale_mode == 1u) {
             out[lane] = f32_to_e8m0(s);
         } else {
@@ -385,7 +378,7 @@ fn scaled_quantize(@builtin(global_invocation_id) gid: vec3<u32>,
         let r = i / params.cols;
         let c = i % params.cols;
         let s = read_scale(params.a_scale_byte_off, r, c, nblk);
-        let v = select(0.0, div_rn(arena[params.a_byte_off + i], s), s != 0.0);
+        let v = select(0.0, rlx_div_rn(arena[params.a_byte_off + i], s), s != 0.0);
         out[lane] = encode_lowp(params.a_fmt, v);
     }
     wr_word(word, out);

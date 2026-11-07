@@ -39,6 +39,8 @@ rlxsl = { workspace = true }
 
 [dependencies]
 rlx-ir = { workspace = true }
+# Double-single prelude for `Op::DoubleSingle` (same EFT library as Metal).
+rlxsl = { workspace = true }
 # Shape-keyed kernel-variant dispatch table, shared with CUDA/ROCm/Metal.
 rlx-gpu-dispatch = { workspace = true }
 rlx-unfuse = { workspace = true }
@@ -570,6 +572,7 @@ required-features = ["backend-tests"]
 [[test]]
 name = "weight_scope_skip"
 required-features = ["backend-tests"]
+
 [[test]]
 name = "weight_upload_bound"
 required-features = ["backend-tests"]
@@ -581,3 +584,100 @@ required-features = ["backend-tests"]
 [[test]]
 name = "wgsl_uniform_control_flow"
 required-features = ["backend-tests"]
+
+[[test]]
+name = "conv3d_k3"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv3d_tiled_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coop_f16_vk_wide_after_host_step"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coop_f32_edge_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "conv3d_argmax_fold"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "epilogue_exact_math"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fast_math_option"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "folds_on_striped_arena"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fused_matmul_bias_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "half_activations"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "host_buffer_copy_flush"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "host_kv_append_host_reader"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "large_dispatch_backward"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "layer_norm_backward_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "matmul_gemv_in_order"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "numeric_helpers_range"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "parked_weight_matmul_over_bind_cap"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "prelu_op"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "qkv_split_sink_alias"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "static_pack_skip_rerun"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "strided_bmm_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "transpose_output"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "two_window_striped"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "unpool_max"
+required-features = ["backend-tests"]
+

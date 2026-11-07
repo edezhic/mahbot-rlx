@@ -38,6 +38,9 @@ struct Staging {
 /// allocation per call.
 pub struct CompiledGraph {
     inner: Box<dyn ExecutableGraph>,
+    /// Trailing outputs a [`crate::taps`] tap appended at compile time:
+    /// stripped from every run and handed to the tap. 0 for ordinary graphs.
+    tap_extra: usize,
     device: Device,
     /// Optional param-invariant prepare stage (None = ordinary graph).
     staging: Option<Box<Staging>>,
@@ -53,6 +56,80 @@ pub struct CompiledGraph {
     /// Empty means "not known" (e.g. compiled straight from HIR), in which case
     /// the f32 fast path is taken unchanged.
     io_dtypes: HashMap<String, rlx_ir::DType>,
+    /// Round weights to a number format as they are uploaded (see
+    /// [`CompileOptions::number_format`](crate::CompileOptions::number_format)).
+    /// `None` uploads them as given.
+    upload_rounding: Option<UploadRounding>,
+    /// F64 inputs / params / outputs lowered to double-single pairs
+    /// (`rlx_compile::lower_f64`); converted here so callers keep passing f64
+    /// (or f32) values.
+    df: Option<DfBoundary>,
+    /// Params the graph declares F64 that callers upload as f32 or narrower
+    /// (`NumberFormat::F64` promoted them); widened on upload.
+    widened: std::collections::HashSet<String>,
+    /// The declared inputs / params, for checking what callers feed
+    /// ([`crate::io_check`]). `None` when the graph was not at hand.
+    io: Option<Box<crate::io_check::IoSpec>>,
+    /// The unbound-names warning has been considered (first run only).
+    io_checked: bool,
+}
+
+/// Which boundary values of a [`CompiledGraph`] are double-single pairs
+/// standing for F64.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DfBoundary {
+    pub inputs: std::collections::HashSet<String>,
+    pub params: std::collections::HashSet<String>,
+    pub outputs: Vec<usize>,
+}
+
+impl DfBoundary {
+    fn f32_pairs(v: &[f32]) -> Vec<f32> {
+        v.iter().flat_map(|&x| [x, 0.0]).collect()
+    }
+    fn f64_bytes_pairs(b: &[u8]) -> Vec<u8> {
+        let v: Vec<f64> = b
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
+            .collect();
+        rlx_ir::double_single::split_f64(&v)
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect()
+    }
+    fn pairs_to_f64_bytes(b: &[u8]) -> Vec<u8> {
+        let p: Vec<f32> = b
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        rlx_ir::double_single::join_f64(&p)
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect()
+    }
+}
+
+/// Weight rounding applied on upload: one format, and the row length of each
+/// rounded param (blocks never cross a row).
+#[derive(Debug, Clone)]
+pub(crate) struct UploadRounding {
+    pub format: rlx_ir::FloatFormat,
+    pub scaling: rlx_ir::FormatScaling,
+    pub row_len: HashMap<String, usize>,
+}
+
+impl UploadRounding {
+    /// Rounded copy of `data` for `name`, or `None` when `name` is not rounded.
+    fn apply(&self, name: &str, data: &[f32]) -> Option<Vec<f32>> {
+        let row = *self.row_len.get(name)?;
+        let mut v = data.to_vec();
+        self.format.round_slice_scaled(&mut v, self.scaling, row);
+        Some(v)
+    }
 }
 
 impl Clone for CompiledGraph {
@@ -61,8 +138,14 @@ impl Clone for CompiledGraph {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone_box(),
+            tap_extra: self.tap_extra,
             device: self.device,
             io_dtypes: self.io_dtypes.clone(),
+            upload_rounding: self.upload_rounding.clone(),
+            df: self.df.clone(),
+            widened: self.widened.clone(),
+            io: self.io.clone(),
+            io_checked: self.io_checked,
             staging: self.staging.as_ref().map(|s| {
                 Box::new(Staging {
                     prepare: s.prepare.clone(),
@@ -79,13 +162,217 @@ impl Clone for CompiledGraph {
 }
 
 impl CompiledGraph {
+    /// Round the params named in `rounding` on every later upload.
+    pub(crate) fn set_upload_rounding(&mut self, rounding: Option<UploadRounding>) {
+        self.upload_rounding = rounding;
+    }
+
+    /// Widen the named params to f64 on upload (see [`Self::widened`]).
+    pub(crate) fn set_widened_params(&mut self, names: Vec<String>) {
+        self.widened = names.into_iter().collect();
+    }
+
+    /// Convert the boundary values `df` names between f64 and df pairs.
+    pub(crate) fn set_df_boundary(&mut self, df: Option<DfBoundary>) {
+        self.df = df;
+    }
+
+    fn df_input(&self, name: &str) -> bool {
+        self.df.as_ref().is_some_and(|d| d.inputs.contains(name))
+    }
+
+    fn df_param(&self, name: &str) -> bool {
+        self.df.as_ref().is_some_and(|d| d.params.contains(name))
+    }
+
+    /// `run` / `run_typed` for a graph with double-single boundary values.
+    fn run_df(&mut self, inputs: &[(&str, &[u8], rlx_ir::DType)]) -> Vec<(Vec<u8>, rlx_ir::DType)> {
+        use rlx_ir::DType;
+        let owned: Vec<(&str, Vec<u8>, DType)> = inputs
+            .iter()
+            .map(|&(n, b, dt)| match (self.df_input(n), dt) {
+                (true, DType::F64) => (n, DfBoundary::f64_bytes_pairs(b), DType::F32),
+                (true, DType::F32) => {
+                    let v: Vec<f32> = b
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
+                        .collect();
+                    let p = DfBoundary::f32_pairs(&v);
+                    (
+                        n,
+                        p.iter().flat_map(|x| x.to_le_bytes()).collect(),
+                        DType::F32,
+                    )
+                }
+                (true, other) => panic!("input `{n}` is F64; fed as {other:?}"),
+                (false, _) => (n, b.to_vec(), dt),
+            })
+            .collect();
+        let typed: Vec<(&str, &[u8], DType)> = owned
+            .iter()
+            .map(|(n, b, d)| (*n, b.as_slice(), *d))
+            .collect();
+        self.ensure_prepared();
+        let outs = self.inner.run_typed(&typed);
+        let df_outs = self
+            .df
+            .as_ref()
+            .map(|d| d.outputs.clone())
+            .unwrap_or_default();
+        outs.into_iter()
+            .enumerate()
+            .map(|(i, (b, dt))| match df_outs.contains(&i) {
+                true => (DfBoundary::pairs_to_f64_bytes(&b), DType::F64),
+                false => (b, dt),
+            })
+            .collect()
+    }
+
     pub(crate) fn new(inner: Box<dyn ExecutableGraph>, device: Device) -> Self {
         Self {
             inner,
+            tap_extra: 0,
             device,
             staging: None,
             io_dtypes: HashMap::new(),
+            upload_rounding: None,
+            df: None,
+            widened: Default::default(),
+            io: None,
+            io_checked: false,
         }
+    }
+
+    /// Record the declared boundary checked by [`Self::run`] /
+    /// [`Self::set_param`] (see [`crate::io_check`]).
+    pub(crate) fn set_io_spec(&mut self, spec: crate::io_check::IoSpec) {
+        self.io = Some(Box::new(spec));
+    }
+
+    /// Check one call's inputs; on the first run, warn once about inputs and
+    /// params left unbound.
+    /// [`Self::check_run`] for an `&[f32]` call: each buffer's length as an
+    /// element count (a complex input carries two `f32`s per element).
+    fn check_f32_run(&mut self, inputs: &[(&str, &[f32])]) -> Result<(), crate::io_check::IoError> {
+        let elems: Vec<(&str, Option<usize>)> = inputs
+            .iter()
+            .map(|(n, d)| {
+                let len = match self.io.as_ref() {
+                    Some(io) => io.f32_elems(n, d.len()),
+                    None => d.len(),
+                };
+                (*n, Some(len))
+            })
+            .collect();
+        self.check_run(elems.into_iter())
+    }
+
+    fn check_run<'a>(
+        &mut self,
+        inputs: impl Iterator<Item = (&'a str, Option<usize>)> + Clone,
+    ) -> Result<(), crate::io_check::IoError> {
+        let Some(io) = self.io.as_mut() else {
+            return Ok(());
+        };
+        io.check_inputs(inputs.clone())?;
+        if !self.io_checked {
+            self.io_checked = true;
+            // The prepare stage's boundary values are fed by this wrapper, not
+            // the caller.
+            if let Some(st) = self.staging.as_ref() {
+                for b in &st.boundary {
+                    io.mark_input_bound(b);
+                }
+            }
+            io.warn_unbound_once(inputs.map(|(n, _)| n));
+        }
+        Ok(())
+    }
+
+    /// [`Self::run`] that returns a misnamed input or a wrong-length buffer
+    /// as an error instead of panicking.
+    pub fn try_run(
+        &mut self,
+        inputs: &[(&str, &[f32])],
+    ) -> Result<Vec<Vec<f32>>, crate::io_check::IoError> {
+        let inputs = self.upload_param_inputs(inputs)?;
+        self.check_f32_run(&inputs)?;
+        let outs = self.run_untapped(&inputs);
+        Ok(crate::taps::on_run(outs, self.tap_extra))
+    }
+
+    /// The graph's declared inputs (name, dtype, static shape), sorted by
+    /// name — what [`Self::run`] expects. Empty when compiled without the
+    /// graph at hand (e.g. straight from HIR).
+    pub fn inputs(&self) -> Vec<crate::io_check::TensorInfo> {
+        self.io
+            .as_ref()
+            .map(|io| io.input_infos())
+            .unwrap_or_default()
+    }
+
+    /// The graph's declared params, sorted by name — what
+    /// [`Self::set_param`] takes.
+    pub fn params(&self) -> Vec<crate::io_check::TensorInfo> {
+        self.io
+            .as_ref()
+            .map(|io| io.param_infos())
+            .unwrap_or_default()
+    }
+
+    /// The graph's outputs in the order [`Self::run`] returns them; `name`
+    /// is the one given with [`rlx_ir::Graph::name_output`] (empty if none).
+    pub fn outputs(&self) -> Vec<crate::io_check::TensorInfo> {
+        self.io
+            .as_ref()
+            .map(|io| io.output_infos().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The position in [`Self::run`]'s result of the output named `name`.
+    pub fn output_index(&self, name: &str) -> Result<usize, crate::io_check::IoError> {
+        match self.io.as_ref() {
+            Some(io) => io.output_index(name),
+            None => Err(crate::io_check::IoError::UnknownOutput {
+                name: name.to_string(),
+                closest: Vec::new(),
+            }),
+        }
+    }
+
+    /// Declare inputs / params that are meant to read zeros when not given
+    /// (an empty KV-cache state, an unused bias), so the first `run` does not
+    /// warn about them and [`Self::check_bindings`] accepts them.
+    pub fn allow_unbound(&mut self, names: &[&str]) {
+        if let Some(io) = self.io.as_mut() {
+            for n in names {
+                io.mark_input_bound(n);
+                let _ = io.note_param(n, None);
+            }
+        }
+    }
+
+    /// Inputs `supplied` would leave unbound and params never set, as an
+    /// error; `Ok` when everything the graph declares is bound.
+    pub fn check_bindings(&self, supplied: &[&str]) -> Result<(), crate::io_check::IoError> {
+        let Some(io) = self.io.as_ref() else {
+            return Ok(());
+        };
+        match io.unbound(supplied.iter().copied()) {
+            crate::io_check::IoError::Unbound { inputs, params }
+                if inputs.is_empty() && params.is_empty() =>
+            {
+                Ok(())
+            }
+            e => Err(e),
+        }
+    }
+
+    /// How many trailing outputs a tap appended (see [`crate::taps`]).
+    pub(crate) fn set_tap_extra(&mut self, n: usize) {
+        self.tap_extra = n;
     }
 
     /// Record the declared dtype of each named `Input` / `Param`.
@@ -179,9 +466,58 @@ impl CompiledGraph {
         self.inner.wgpu_step_names()
     }
 
+    /// [`Self::set_param`] that returns a wrong-length upload as an error
+    /// instead of panicking.
+    pub fn try_set_param(
+        &mut self,
+        name: &str,
+        data: &[f32],
+    ) -> Result<(), crate::io_check::IoError> {
+        if let Some(io) = self.io.as_ref() {
+            let elems = if self.df_param(name) {
+                data.len() * 2
+            } else {
+                data.len()
+            };
+            io.check_param_len(name, elems)?;
+        }
+        self.set_param(name, data);
+        Ok(())
+    }
+
     /// Set a named parameter (model weight).
     /// Call once per parameter after compilation.
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
+        // A double-single param's declared shape carries the (hi, lo) pair
+        // axis; the caller uploads one value per f64 element.
+        let elems = if self.df_param(name) {
+            data.len() * 2
+        } else {
+            data.len()
+        };
+        if let Some(io) = self.io.as_mut()
+            && let Err(e) = io.note_param(name, Some(elems))
+        {
+            panic!("{e}");
+        }
+        if self.df_param(name) {
+            let pairs = DfBoundary::f32_pairs(data);
+            self.inner.set_param(name, &pairs);
+            return;
+        }
+        if self.widened.contains(name) {
+            let wide: Vec<u8> = data
+                .iter()
+                .flat_map(|&x| (x as f64).to_le_bytes())
+                .collect();
+            self.set_param_typed(name, &wide, rlx_ir::DType::F64);
+            return;
+        }
+        let rounded = self
+            .upload_rounding
+            .as_ref()
+            .and_then(|r| r.apply(name, data));
+        let data = rounded.as_deref().unwrap_or(data);
         // A narrower-than-f32 weight needs converting, not reinterpreting:
         // `set_param` writes the bytes as given, and 4 bytes of f32 read as two
         // halves silently doubles the element count.
@@ -206,6 +542,61 @@ impl CompiledGraph {
     /// Execute the graph with named inputs.
     /// Returns one `Vec<f32>` per graph output (copies from arena).
     pub fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        let inputs = match self.upload_param_inputs(inputs) {
+            Ok(rest) => rest,
+            Err(e) => panic!("{e}"),
+        };
+        if let Err(e) = self.check_f32_run(&inputs) {
+            panic!("{e}");
+        }
+        let outs = self.run_untapped(&inputs);
+        crate::taps::on_run(outs, self.tap_extra)
+    }
+
+    /// Upload any *param* passed to `run` with [`Self::set_param`] and return
+    /// the real inputs. Backends ignore a param name among the inputs, so a
+    /// loop feeding its weights through `run` used to compute with stale ones.
+    fn upload_param_inputs<'a>(
+        &mut self,
+        inputs: &[(&'a str, &'a [f32])],
+    ) -> Result<Vec<(&'a str, &'a [f32])>, crate::io_check::IoError> {
+        let Some(io) = self.io.as_ref() else {
+            return Ok(inputs.to_vec());
+        };
+        let (params, rest): (Vec<_>, Vec<_>) =
+            inputs.iter().partition(|(n, _)| io.is_param_only(n));
+        for (n, d) in &params {
+            io.check_param_len(n, d.len())?;
+        }
+        for (n, d) in params {
+            self.set_param(n, d);
+        }
+        Ok(rest)
+    }
+
+    fn run_untapped(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
+        self.try_run_untapped(inputs)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Self::run_untapped`] with the backend's [`ExecutableGraph::try_run`]
+    /// on the plain paths (the dataflow and narrowed paths still panic).
+    fn try_run_untapped(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>, String> {
+        if self.df.is_some() {
+            let bytes: Vec<(&str, Vec<u8>)> = inputs
+                .iter()
+                .map(|(n, v)| (*n, v.iter().flat_map(|x| x.to_le_bytes()).collect()))
+                .collect();
+            let typed: Vec<(&str, &[u8], rlx_ir::DType)> = bytes
+                .iter()
+                .map(|(n, b)| (*n, b.as_slice(), rlx_ir::DType::F32))
+                .collect();
+            return Ok(self
+                .run_df(&typed)
+                .into_iter()
+                .map(|(b, dt)| crate::backend::widen_bytes_to_f32(&b, dt))
+                .collect());
+        }
         // Any input declared narrower than f32 has to be converted before it
         // reaches the backend. `run_typed` is the path that carries a dtype per
         // input; nine backends implement it. Only taken when a narrow boundary
@@ -214,7 +605,7 @@ impl CompiledGraph {
             .iter()
             .any(|(n, _)| self.narrow_boundary(n).is_some())
         {
-            return self.run_narrowed(inputs);
+            return Ok(self.run_narrowed(inputs));
         }
         self.ensure_prepared();
         match self.staging.as_ref() {
@@ -225,9 +616,9 @@ impl CompiledGraph {
                 for (name, vals) in st.boundary.iter().zip(st.values.iter()) {
                     merged.push((name.as_str(), vals.as_slice()));
                 }
-                self.inner.run(&merged)
+                self.inner.try_run(&merged)
             }
-            _ => self.inner.run(inputs),
+            _ => self.inner.try_run(inputs),
         }
     }
 
@@ -254,6 +645,49 @@ impl CompiledGraph {
             .into_iter()
             .map(|(bytes, dt)| crate::backend::widen_bytes_to_f32(&bytes, dt))
             .collect()
+    }
+
+    /// Start a run whose outputs [`Self::collect`] takes later, where the
+    /// backend can (WebGL2), so the caller works while the GPU does. `None`:
+    /// not here (another backend, or a graph with staged weights, taps or
+    /// narrowed inputs) — run it.
+    pub fn submit(&mut self, inputs: &[(&str, &[f32])]) -> Option<Result<(), String>> {
+        if self.df.is_some() || self.tap_extra != 0 || self.staging.is_some() {
+            return None;
+        }
+        if inputs
+            .iter()
+            .any(|(n, _)| self.narrow_boundary(n).is_some())
+        {
+            return None;
+        }
+        let inputs = match self.upload_param_inputs(inputs) {
+            Ok(i) => i,
+            Err(e) => return Some(Err(e.to_string())),
+        };
+        if let Err(e) = self.check_f32_run(&inputs) {
+            return Some(Err(e.to_string()));
+        }
+        self.inner.try_submit(&inputs)
+    }
+
+    /// [`Self::submit`] with the inputs as IEEE half bits, where the
+    /// backend can take them so (WebGL2); the buffers come back for the next
+    /// run. `None`: not here — submit or run in f32.
+    #[allow(clippy::type_complexity)]
+    pub fn submit_half(
+        &mut self,
+        inputs: Vec<(String, Vec<u16>)>,
+    ) -> Option<Result<Vec<(String, Vec<u16>)>, String>> {
+        if self.df.is_some() || self.tap_extra != 0 || self.staging.is_some() {
+            return None;
+        }
+        self.inner.try_submit_half(inputs)
+    }
+
+    /// The outputs of the oldest [`Self::submit`]ted run.
+    pub fn collect(&mut self) -> Result<Vec<Vec<f32>>, String> {
+        self.inner.try_collect()
     }
 
     /// Run and read back only selected outputs (logits-only decode on MLX).
@@ -316,7 +750,11 @@ impl CompiledGraph {
     /// graph input with the matching name.
     /// Returns true if the backend supports persistent handles.
     pub fn bind_handle(&mut self, name: &str, data: &[f32]) -> bool {
-        self.inner.bind_handle(name, data)
+        let ok = self.inner.bind_handle(name, data);
+        if ok && let Some(io) = self.io.as_mut() {
+            io.mark_input_bound(name);
+        }
+        ok
     }
 
     /// Read the current contents of a persistent buffer.
@@ -338,7 +776,11 @@ impl CompiledGraph {
     /// GPU-resident input handle: bound here and kept on the device across runs
     /// (no-op where the backend has none).
     pub fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
-        self.inner.bind_gpu_handle(name, data)
+        let ok = self.inner.bind_gpu_handle(name, data);
+        if ok && let Some(io) = self.io.as_mut() {
+            io.mark_input_bound(name);
+        }
+        ok
     }
 
     /// Rewrite the draw seeds of the graph's `Sample` steps, in schedule order —
@@ -384,6 +826,17 @@ impl CompiledGraph {
 
     pub fn read_gpu_handle(&self, name: &str) -> Option<Vec<f32>> {
         self.inner.read_gpu_handle(name)
+    }
+
+    /// Copy the named inputs' device contents aside (wgpu) so
+    /// [`Self::restore_inputs`] can put them back. False when unsupported.
+    pub fn save_inputs(&mut self, names: &[&str]) -> bool {
+        self.inner.save_inputs(names)
+    }
+
+    /// Put back what [`Self::save_inputs`] copied aside.
+    pub fn restore_inputs(&mut self) -> bool {
+        self.inner.restore_inputs()
     }
 
     /// Read one row from a resident GPU input handle without full-tensor D2H.
@@ -548,7 +1001,11 @@ impl CompiledGraph {
         if self.device != src.device {
             return false;
         }
-        self.inner.copy_params_from(src.inner.as_ref())
+        let ok = self.inner.copy_params_from(src.inner.as_ref());
+        if ok && let Some(io) = self.io.as_mut() {
+            io.mark_all_params();
+        }
+        ok
     }
 
     /// Share `src`'s packed weight buffer (retain, not copy) instead of uploading
@@ -558,7 +1015,17 @@ impl CompiledGraph {
         if self.device != src.device {
             return false;
         }
-        self.inner.share_params_from(src.inner.as_ref())
+        let ok = self.inner.share_params_from(src.inner.as_ref());
+        if ok && let Some(io) = self.io.as_mut() {
+            io.mark_all_params();
+        }
+        ok
+    }
+
+    /// Whether param `name` already holds its values (a weight shared with
+    /// an executable that bound it): a binder may skip it.
+    pub fn param_already_set(&self, name: &str) -> bool {
+        self.inner.param_already_set(name)
     }
 
     /// Run, refresh GPU handle from output, return that output vector.
@@ -649,6 +1116,42 @@ impl CompiledGraph {
     /// natively) on the way in. Lets callers feed F16/BF16 weights
     /// without a host-side cast.
     pub fn set_param_typed(&mut self, name: &str, data: &[u8], dtype: rlx_ir::DType) {
+        if let Some(io) = self.io.as_mut() {
+            let _ = io.note_param(name, None);
+        }
+        if self.df_param(name) {
+            let pairs = match dtype {
+                rlx_ir::DType::F64 => DfBoundary::f64_bytes_pairs(data),
+                _ => {
+                    let wide = crate::backend::widen_bytes_to_f32(data, dtype);
+                    DfBoundary::f32_pairs(&wide)
+                        .iter()
+                        .flat_map(|x| x.to_le_bytes())
+                        .collect()
+                }
+            };
+            self.inner.set_param_typed(name, &pairs, rlx_ir::DType::F32);
+            return;
+        }
+        if self.widened.contains(name) && dtype != rlx_ir::DType::F64 {
+            let wide: Vec<u8> = crate::backend::widen_bytes_to_f32(data, dtype)
+                .iter()
+                .flat_map(|&x| (x as f64).to_le_bytes())
+                .collect();
+            self.set_param_typed(name, &wide, rlx_ir::DType::F64);
+            return;
+        }
+        // Float weights are rounded through f32 and stored back in `dtype`;
+        // packed / integer weights are already in their own format.
+        let rounded = match &self.upload_rounding {
+            Some(r) if dtype.is_float() => {
+                let wide = crate::backend::widen_bytes_to_f32(data, dtype);
+                r.apply(name, &wide)
+                    .map(|v| crate::backend::narrow_f32_to_bytes(&v, dtype))
+            }
+            _ => None,
+        };
+        let data = rounded.as_deref().unwrap_or(data);
         if let Some(st) = self.staging.as_mut() {
             if st.prepare_params.contains(name) {
                 st.prepare.set_param_typed(name, data, dtype);
@@ -667,6 +1170,20 @@ impl CompiledGraph {
     /// false → this graph cannot take a piece (see the backend's `set_param_range`).
     /// A caller that never holds the whole parameter writes it in pieces with this.
     pub fn set_param_range(&mut self, name: &str, byte_offset: usize, data: &[u8]) -> bool {
+        if let Some(io) = self.io.as_mut() {
+            let _ = io.note_param(name, None);
+        }
+        // A partial write of a rounded weight cannot be block-rounded on its
+        // own; send the caller to the whole-buffer path, which rounds (and
+        // widens a param promoted to f64, whose bytes the caller sizes as f32).
+        if self.widened.contains(name)
+            || self
+                .upload_rounding
+                .as_ref()
+                .is_some_and(|r| r.row_len.contains_key(name))
+        {
+            return false;
+        }
         if let Some(st) = self.staging.as_mut() {
             let mut done = false;
             if st.prepare_params.contains(name) {
@@ -686,24 +1203,37 @@ impl CompiledGraph {
     /// caller asks before it materialises a copy it only holds to hand over
     /// ([`Self::set_param_typed`]). `false` when no graph of this executable takes the
     /// parameter, or when any graph that does cannot say its bytes are there.
+    ///
+    /// A query, and only a query: a caller that skips the write because of it must
+    /// then say so with [`Self::mark_param_bound`], where the skip happens.
     pub fn param_resident(&self, name: &str, len: usize) -> bool {
-        let Some(st) = self.staging.as_ref() else {
-            return self.inner.param_resident(name, len);
-        };
-        let mut asked = false;
-        if st.prepare_params.contains(name) {
-            asked = true;
-            if !st.prepare.param_resident(name, len) {
-                return false;
+        if let Some(st) = self.staging.as_ref() {
+            let mut asked = false;
+            let mut there = true;
+            if st.prepare_params.contains(name) {
+                asked = true;
+                there = st.prepare.param_resident(name, len);
             }
-        }
-        if st.main_params.contains(name) {
-            asked = true;
-            if !self.inner.param_resident(name, len) {
-                return false;
+            if there && st.main_params.contains(name) {
+                asked = true;
+                there = self.inner.param_resident(name, len);
             }
+            asked && there
+        } else {
+            self.inner.param_resident(name, len)
         }
-        asked
+    }
+
+    /// Record that `name`'s bytes are already on the device although no `set_param*`
+    /// call put them there — a graph served from a shared weight buffer, which asks
+    /// [`Self::param_resident`] and skips the write. Without this the unbound
+    /// diagnostic names a parameter that is bound and correct, and an operator learns
+    /// to ignore the one check that exists to catch a genuinely unbound one.
+    pub fn mark_param_bound(&mut self, name: &str) {
+        if let Some(io) = self.io.as_mut() {
+            // `None`: no element count to check, so there is nothing here to reject.
+            let _ = io.note_param(name, None);
+        }
     }
 
     /// Finish param upload — warms backend caches when supported.
@@ -720,6 +1250,30 @@ impl CompiledGraph {
         &mut self,
         inputs: &[(&str, &[u8], rlx_ir::DType)],
     ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
+        let elems: Vec<(&str, Option<usize>)> = inputs
+            .iter()
+            .map(|(n, b, dt)| {
+                let e = self
+                    .io
+                    .as_ref()
+                    .and_then(|io| io.typed_elems(n, b.len(), *dt));
+                (*n, e)
+            })
+            .collect();
+        if let Err(e) = self.check_run(elems.iter().copied()) {
+            panic!("{e}");
+        }
+        let outs = self.run_typed_untapped(inputs);
+        crate::taps::on_run_typed(outs, self.tap_extra)
+    }
+
+    fn run_typed_untapped(
+        &mut self,
+        inputs: &[(&str, &[u8], rlx_ir::DType)],
+    ) -> Vec<(Vec<u8>, rlx_ir::DType)> {
+        if self.df.is_some() {
+            return self.run_df(inputs);
+        }
         self.ensure_prepared();
         self.inner.run_typed(inputs)
     }
@@ -738,6 +1292,44 @@ impl CompiledGraph {
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    /// A parameter whose bytes are already on the device is not reported as unbound,
+    /// and the question that establishes it does not decide that by itself: a `false`
+    /// leaves the diagnostic alone, and the caller marks the skip where it happens.
+    ///
+    /// The wgpu half of this — that a second graph in one weight scope answers `true`
+    /// — is pinned by `weight_scope_skip.rs`; the CPU backend answers `false` for
+    /// every parameter, which is why the marking is exercised here rather than there.
+    #[test]
+    #[cfg(feature = "cpu")]
+    fn a_parameter_marked_bound_is_not_reported_unbound() {
+        let mut g = Graph::new("pooled_param");
+        let w = g.param("w", Shape::new(&[2], DType::F32));
+        g.set_outputs(vec![w]);
+        let mut compiled = Session::new(Device::Cpu).compile(g);
+
+        let unbound = |c: &CompiledGraph| {
+            let IoError::Unbound { params, .. } =
+                c.io.as_ref().unwrap().unbound(std::iter::empty::<&str>())
+            else {
+                unreachable!("no unbound input was left unsupplied")
+            };
+            params
+        };
+        assert_eq!(unbound(&compiled), ["w"]);
+        assert!(
+            !compiled.param_resident("w", 8),
+            "the CPU backend holds no parameter residency"
+        );
+        assert_eq!(
+            unbound(&compiled),
+            ["w"],
+            "asking must not mark a parameter the device does not hold"
+        );
+
+        compiled.mark_param_bound("w");
+        assert!(unbound(&compiled).is_empty());
+    }
 
     #[test]
     #[cfg(feature = "cpu")]

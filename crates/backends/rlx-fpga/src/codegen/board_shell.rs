@@ -8,6 +8,9 @@
 //! `board_top.sv` that maps board pins → `top` ports. Pin names are
 //! parameters so a real board PCF/LPF can override them.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use crate::codegen::Artifact;
 use crate::codegen::io_ports::sanitize_port;
 use crate::export_config::{HwTarget, IoConfig};
@@ -34,7 +37,11 @@ pub fn collect_board_shell(model: &Model, hw: &HwTarget, io: &IoConfig) -> Optio
             board: Some(board), ..
         } => Some(Artifact {
             rel_path: "board_top.sv".into(),
-            content: crate::codegen::uart::emit_uart_board_top(model, io, *board),
+            content: crate::codegen::uart::emit_uart_board_top(model, io, board.shell()),
+        }),
+        HwTarget::Lattice(board) => Some(Artifact {
+            rel_path: "board_top.sv".into(),
+            content: crate::codegen::uart::emit_uart_board_top(model, io, board.shell()),
         }),
         HwTarget::Xilinx7 { board: None, .. } => Some(Artifact {
             rel_path: "board_top.sv".into(),

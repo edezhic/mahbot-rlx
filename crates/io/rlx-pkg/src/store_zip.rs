@@ -7,7 +7,7 @@
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek};
 use std::path::Path;
 
 /// Absolute byte range of an uncompressed STORE member inside a zip file.
@@ -18,12 +18,14 @@ pub struct MemberRange {
 }
 
 /// Write a ZIP64-capable archive with all members stored uncompressed.
+#[cfg(feature = "write")]
 pub fn write_store_zip(
     path: impl AsRef<Path>,
     members: &[(String, Vec<u8>)],
 ) -> Result<BTreeMap<String, MemberRange>> {
     let path = path.as_ref();
     let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    use std::io::Write;
     let mut zip = zip::ZipWriter::new(file);
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored)
@@ -40,26 +42,42 @@ pub fn write_store_zip(
 }
 
 /// Map each STORE member name → absolute data offset / length in `path`.
+#[cfg(feature = "write")]
 pub fn resolve_store_ranges(path: impl AsRef<Path>) -> Result<BTreeMap<String, MemberRange>> {
     let path = path.as_ref();
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut archive =
-        zip::ZipArchive::new(file).with_context(|| format!("zip {}", path.display()))?;
+    resolve_store_ranges_in(file, &path.display().to_string())
+}
+
+/// [`resolve_store_ranges`] over any seekable reader — the package's own bytes
+/// (mapped or owned), so nothing is opened twice and no path is needed.
+pub fn resolve_store_ranges_in<R: Read + Seek>(
+    reader: R,
+    label: &str,
+) -> Result<BTreeMap<String, MemberRange>> {
+    let mut archive = zip::ZipArchive::new(reader).with_context(|| format!("zip {label}"))?;
     let mut out = BTreeMap::new();
     for i in 0..archive.len() {
         let mut zf = archive
             .by_index(i)
             .with_context(|| format!("zip index {i}"))?;
-        let name = zf.name().to_string();
+        let name = zf
+            .name()
+            .with_context(|| format!("zip index {i} name"))?
+            .to_string();
         if zf.compression() != zip::CompressionMethod::Stored {
             bail!("member {name} is not STORE; mmap requires uncompressed payloads");
         }
         let length = zf.size();
         let header_start = zf.header_start();
-        // Touch the reader so the crate resolves `data_start`.
+        // Touch the reader so the crate resolves `data_start`. zip 9 returns it
+        // as an `Option`, `None` until the local header has actually been read,
+        // which is exactly what this probe forces.
         let mut probe = [0u8; 1];
         let _ = zf.read(&mut probe);
-        let data_offset = zf.data_start();
+        let data_offset = zf
+            .data_start()
+            .with_context(|| format!("member {name} has no resolved data offset"))?;
         // Ensure we didn't mis-parse empty files.
         let _ = header_start;
         out.insert(

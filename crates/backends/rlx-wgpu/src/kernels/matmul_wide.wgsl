@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 // Wide-tile matmul variant: 32×64 output tile, 4×8 register block.
 //
 // Same 8×8 = 64-thread workgroup as `matmul.wgsl`, but each thread holds
@@ -48,25 +51,43 @@ const WG_N: u32 = 8u;     // TILE_N / RN
 var<workgroup> tile_a: array<array<f32, 16>, 32>;  // [TILE_M][TILE_K]
 var<workgroup> tile_b: array<array<f32, 64>, 16>;  // [TILE_K][TILE_N]
 
+// Exact GELU — A&S 7.1.26 erf, the same as `matmul.wgsl` / `matmul_coop_f32.wgsl`
+// and rlx-cpu's `scalar_gelu`. Opcode 9 (`Activation::Gelu`) is the EXACT form;
+// only opcode 11 (`GeluApprox`) is the tanh form. This kernel used to map both
+// to tanh, so a fused matmul+bias+GELU here drifted ~3e-4 from CPU at |x|≈2–3.
+fn gelu_erf(x: f32) -> f32 {
+    let arg = x * 0.70710678118654752;
+    let s = select(-1.0, 1.0, arg >= 0.0);
+    let xa = abs(arg);
+    let t = rlx_div_rn(1.0, fma(0.3275911, xa, 1.0));
+    // explicit fma: an uncontracted chain is contracted differently by
+    // different shader compilers
+    let poly = t * fma(t, fma(t, fma(t, fma(t, 1.061405429, -1.453152027), 1.421413741),
+                -0.284496736), 0.254829592);
+    let e = s * fma(-poly, rlx_exp(-xa * xa), 1.0);
+    return 0.5 * x * (1.0 + e);
+}
+
 fn apply_act(v_in: f32) -> f32 {
     var v = v_in;
     switch (params.act_id) {
         case 0xFFFFu: {}
         case 0u: { v = max(v, 0.0); }
-        case 1u: { v = 1.0 / (1.0 + exp(-clamp(v, -88.0, 88.0))); }
-        case 2u: { v = tanh(clamp(v, -15.0, 15.0)); }
-        case 5u: { v = sqrt(v); }
+        case 1u: { v = rlx_div_rn(1.0, 1.0 + rlx_exp(-clamp(v, -88.0, 88.0))); }
+        case 2u: { v = rlx_tanh(clamp(v, -15.0, 15.0)); }
+        case 5u: { v = rlx_sqrt_rn(v); }
         case 7u: { v = -v; }
         case 8u: { v = abs(v); }
-        case 9u, 11u: {
+        case 9u: { v = gelu_erf(v); }
+        case 11u: {
             let c = 0.7978845608028654;
             let x3 = v * v * v;
-            let inner = clamp(c * (v + 0.044715 * x3), -15.0, 15.0);
-            v = 0.5 * v * (1.0 + tanh(inner));
+            let inner = clamp(c * fma(0.044715, x3, v), -15.0, 15.0);
+            v = 0.5 * v * (1.0 + rlx_tanh(inner));
         }
         case 10u: {
             let nx = clamp(-v, -88.0, 88.0);
-            v = v / (1.0 + exp(nx));
+            v = rlx_div_rn(v, 1.0 + rlx_exp(nx));
         }
         default: {}
     }

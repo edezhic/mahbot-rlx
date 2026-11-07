@@ -25,7 +25,9 @@ struct Params {
     x_off: u32,
     dy_off: u32,
     dx_off: u32,
-    _pad0: u32,
+    // nonzero: the store is `max(dx, x)` (`unfuse::UNPOOL_MAX`: an unpool
+    // maxed with the pool's own input, as FastSurfer's decoders do)
+    with_max: u32,
     _pad1: u32,
     _pad2: u32,
     _pad3: u32,
@@ -34,9 +36,15 @@ struct Params {
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>              params: Params;
 
+// A large dispatch spills into y (`dispatch_dims`: past 65535 workgroups);
+// reading `gid.x` alone left all but the first row of workgroups repeating
+// the first — FastSurfer's full-size unpool at a batch of 4 and up.
 @compute @workgroup_size(256, 1, 1)
-fn maxpool3d_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn maxpool3d_backward(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) ngs: vec3<u32>,
+) {
+    let idx = gid.x + gid.y * ngs.x * 256u;
     let total = params.n * params.c * params.d * params.h * params.w;
     if (idx >= total) {
         return;
@@ -107,6 +115,9 @@ fn maxpool3d_backward(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
         }
+    }
+    if (params.with_max != 0u) {
+        acc = max(acc, arena[params.x_off + idx]);
     }
     arena[params.dx_off + idx] = acc;
 }

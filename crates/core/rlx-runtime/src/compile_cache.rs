@@ -42,6 +42,14 @@ pub struct CacheRunInput<'a> {
     pub row_inner: Option<usize>,
 }
 
+/// Run `f` under [`crate::with_param_sharing_scope`] when `scope` is set.
+fn scoped<R>(scope: &Option<String>, f: impl FnOnce() -> R) -> R {
+    match scope {
+        Some(label) => crate::with_param_sharing_scope(label, f),
+        None => f(),
+    }
+}
+
 pub struct CompileCache {
     device: Device,
     capacity: usize,
@@ -61,6 +69,8 @@ pub struct CompileCache {
     /// costs a full copy each, which for an f32 0.6B model measured ~4.6 GB per
     /// prefill graph against 2.4 GB of actual weights.
     weight_donor: Option<u64>,
+    /// [`crate::with_param_sharing_scope`] label every compile runs under.
+    param_scope: Option<String>,
 }
 
 impl CompileCache {
@@ -84,7 +94,17 @@ impl CompileCache {
             entries: Vec::with_capacity(capacity),
             order: VecDeque::with_capacity(capacity),
             weight_donor: None,
+            param_scope: None,
         }
+    }
+
+    /// Compile every entry under [`crate::with_param_sharing_scope`]`(label)`:
+    /// on backends that share by scope (Metal; CUDA with
+    /// `RLX_CUDA_SHARED_PARAMS=1`), this cache's executables — and any other
+    /// executable compiled under the same label, in another cache — hold one
+    /// copy of each weight. Every entry must then be the same model's weights.
+    pub fn set_param_sharing_scope(&mut self, label: Option<String>) {
+        self.param_scope = label;
     }
 
     /// Compile if not present, then return a mutable reference. The borrow
@@ -112,7 +132,7 @@ impl CompileCache {
         if let Some(p) = &self.policy {
             session = session.with_policy(p.clone());
         }
-        let compiled = session.compile_with(build(), options);
+        let compiled = scoped(&self.param_scope, || session.compile_with(build(), options));
 
         // Evict FIFO if at capacity.
         if self.entries.len() >= self.capacity
@@ -234,9 +254,10 @@ impl CompileCache {
         if let Some(p) = &self.policy {
             session = session.with_policy(p.clone());
         }
-        let compiled = session
-            .compile_hir_with(build(), options)
-            .expect("HIR lower/compile in compile cache");
+        let compiled = scoped(&self.param_scope, || {
+            session.compile_hir_with(build(), options)
+        })
+        .expect("HIR lower/compile in compile cache");
 
         if self.entries.len() >= self.capacity
             && let Some(evict_key) = self.order.pop_front()
@@ -343,6 +364,8 @@ pub struct BucketedCompileCache {
     /// bucket to receive a real weight upload records itself here; later buckets
     /// with a byte-identical layout retain its buffer instead of duplicating it.
     weight_donor_upper: Option<u64>,
+    /// [`crate::with_param_sharing_scope`] label every compile runs under.
+    param_scope: Option<String>,
     /// Monotonic access counter driving LRU eviction of large buckets.
     clock: u64,
 }
@@ -399,6 +422,15 @@ fn device_has_discrete_vram(dev: Device) -> bool {
 impl BucketedCompileCache {
     pub fn new(device: Device, buckets: Vec<Range<u64>>) -> Self {
         Self::with_policy(device, buckets, None)
+    }
+
+    /// Compile every entry under [`crate::with_param_sharing_scope`]`(label)`:
+    /// on backends that share by scope (Metal; CUDA with
+    /// `RLX_CUDA_SHARED_PARAMS=1`), this cache's executables — and any other
+    /// executable compiled under the same label, in another cache — hold one
+    /// copy of each weight. Every entry must then be the same model's weights.
+    pub fn set_param_sharing_scope(&mut self, label: Option<String>) {
+        self.param_scope = label;
     }
 
     /// Power-of-two ladder over `[1, max]`, with extents
@@ -527,6 +559,7 @@ impl BucketedCompileCache {
             policy,
             buckets,
             weight_donor_upper: None,
+            param_scope: None,
             clock: 0,
         }
     }
@@ -635,7 +668,9 @@ impl BucketedCompileCache {
             if let Some(p) = &self.policy {
                 session = session.with_policy(p.clone());
             }
-            self.buckets[idx].compiled = Some(session.compile_with(build(upper), options));
+            self.buckets[idx].compiled = Some(scoped(&self.param_scope, || {
+                session.compile_with(build(upper), options)
+            }));
         }
         Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))
     }
@@ -664,9 +699,10 @@ impl BucketedCompileCache {
             if let Some(p) = &self.policy {
                 session = session.with_policy(p.clone());
             }
-            let compiled = session
-                .compile_hir_with(build(upper), options)
-                .expect("HIR lower/compile in bucketed cache");
+            let compiled = scoped(&self.param_scope, || {
+                session.compile_hir_with(build(upper), options)
+            })
+            .expect("HIR lower/compile in bucketed cache");
             self.buckets[idx].compiled = Some(compiled);
         }
         Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))
@@ -769,8 +805,8 @@ impl BucketedCompileCache {
     /// each rung holds its own copy of the weights, and on a model split
     /// across machines — which is to say a model that did not fit — that is
     /// the dominant memory cost. It is a property of the backend, not of the
-    /// model: `share_params_from` defaults to doing nothing and only Metal
-    /// and MLX override it.
+    /// model: `share_params_from` defaults to doing nothing and only Metal,
+    /// MLX and wgpu (packed GGUF weights) override it.
     pub fn params_shared(&self) -> bool {
         self.weight_donor_upper.is_some()
     }
@@ -1095,7 +1131,7 @@ impl BucketedCompileCache {
             if let Some(p) = &self.policy {
                 session = session.with_policy(p.clone());
             }
-            let compiled = session.compile_with(graph, options);
+            let compiled = scoped(&self.param_scope, || session.compile_with(graph, options));
             self.buckets[idx].compiled = Some(compiled);
             // Every bucket of a model compiles from the same weights and differs
             // only in its KV extent, so retaining a sibling's uploaded buffer
@@ -1170,15 +1206,36 @@ impl BucketedCompileCache {
             if let Some(p) = &self.policy {
                 session = session.with_policy(p.clone());
             }
-            let mut compiled = session.compile_with(graph, options);
-            for (name, data) in params {
-                compiled.set_param(&name, &data);
+            self.buckets[idx].compiled = Some(scoped(&self.param_scope, || {
+                session.compile_with(graph, options)
+            }));
+            // Share a sibling rung's weights where the backend can, as
+            // `ensure_graph_with_params` does; the packed blobs are the bulk of
+            // what each rung would otherwise hold a copy of.
+            let has_other_donor = self
+                .buckets
+                .iter()
+                .enumerate()
+                .any(|(i, b)| i != idx && b.compiled.is_some());
+            if has_other_donor && self.try_share_params_from_donor(upper) {
+                self.buckets[idx].resident_bytes = 0;
+            } else {
+                let compiled = self.buckets[idx].compiled.as_mut().expect("just inserted");
+                // A weight another executable bound under the sharing scope
+                // already holds these values.
+                for (name, data) in params {
+                    if !compiled.param_already_set(&name) {
+                        compiled.set_param(&name, &data);
+                    }
+                }
+                for (name, data) in &packed {
+                    if !compiled.param_already_set(name) {
+                        compiled.set_param_typed(name, data, rlx_ir::DType::U8);
+                    }
+                }
+                self.buckets[idx].resident_bytes = bytes;
             }
-            for (name, data) in &packed {
-                compiled.set_param_typed(name, data, rlx_ir::DType::U8);
-            }
-            self.buckets[idx].compiled = Some(compiled);
-            self.buckets[idx].resident_bytes = bytes;
+            self.set_weight_donor(upper);
         }
         self.touch(idx);
         Some((upper, self.buckets[idx].compiled.as_mut().unwrap()))
@@ -1207,8 +1264,7 @@ impl BucketedCompileCache {
             if let Some(p) = &self.policy {
                 session = session.with_policy(p.clone());
             }
-            let mut compiled = session
-                .compile_hir_with(hir, options)
+            let mut compiled = scoped(&self.param_scope, || session.compile_hir_with(hir, options))
                 .expect("HIR lower/compile in ensure_hir_with_params");
             for (name, data) in params {
                 compiled.set_param(&name, &data);
@@ -1346,18 +1402,6 @@ impl DynamicDimCompileCache {
         if let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
             return Ok(&mut self.entries[idx].1);
         }
-        if self.template.is_none() {
-            let mut template_opts = options.clone();
-            template_opts.dim_binding = None;
-            let pipe = crate::stages::pipeline_for(self.device, &template_opts);
-            self.template = Some(pipe.compile_hir(build_hir())?);
-        }
-        let template = self.template.as_ref().expect("template just set");
-        let mut spec_opts = options.clone();
-        spec_opts.dim_binding = None;
-        let pipe = crate::stages::pipeline_for(self.device, &spec_opts);
-        let specialized = template.specialize(&pipe, binding);
-        let backend = crate::registry::backend_for(self.device).expect("backend registered");
         let mut compile_opts = options.clone();
         compile_opts.dim_binding = None;
         if compile_opts.policy.is_none() {
@@ -1365,8 +1409,29 @@ impl DynamicDimCompileCache {
                 compile_opts = compile_opts.policy(p.clone());
             }
         }
-        let executable = backend.compile_lir(specialized.lir, &compile_opts);
-        let compiled = CompiledGraph::new(executable, self.device);
+        let compiled = if crate::model_pipeline::needs_mir_route(options) {
+            crate::model_pipeline::compile_bound_mir(
+                self.device,
+                build_hir,
+                binding,
+                &compile_opts,
+            )?
+        } else {
+            if self.template.is_none() {
+                let mut template_opts = options.clone();
+                template_opts.dim_binding = None;
+                let pipe = crate::stages::pipeline_for(self.device, &template_opts);
+                self.template = Some(pipe.compile_hir(build_hir())?);
+            }
+            let template = self.template.as_ref().expect("template just set");
+            let mut spec_opts = options.clone();
+            spec_opts.dim_binding = None;
+            let pipe = crate::stages::pipeline_for(self.device, &spec_opts);
+            let specialized = template.specialize(&pipe, binding);
+            let backend = crate::registry::backend_for(self.device).expect("backend registered");
+            let executable = backend.compile_lir(specialized.lir, &compile_opts);
+            CompiledGraph::new(executable, self.device)
+        };
 
         if self.entries.len() >= self.capacity
             && let Some(evict_key) = self.order.pop_front()
@@ -2136,9 +2201,7 @@ mod tests {
         if path.exists() {
             let _ = fs::remove_file(&path);
         }
-        unsafe {
-            env::set_var("RLX_TRACE_PERFETTO", &path);
-        }
+        rlx_ir::env::set("RLX_TRACE_PERFETTO", path.to_string_lossy());
 
         // Build + run a small CPU graph — Add → Relu (no fusion macros).
         let f = DType::F32;

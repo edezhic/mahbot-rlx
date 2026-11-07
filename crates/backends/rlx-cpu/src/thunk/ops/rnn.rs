@@ -448,6 +448,9 @@ pub(crate) fn compile_scan(
         // Body invariants: 1 + num_xs Op::Inputs in NodeId order
         // — first declared is the carry, rest are x_t_i. Single
         // graph output (the next carry), same shape as carry.
+        // Compiled as any graph is: integer storage kept, claimed fused ops
+        // expanded (an I32 gather index otherwise read as f32 bits).
+        let body = &crate::expand::prepare_graph_for_thunks(Graph::clone(body));
         let body_plan = rlx_opt::memory::plan_memory(body);
         let _body_arena_size = body_plan.arena_size;
         // Snapshot per-input byte offsets before plan_memory
@@ -636,6 +639,9 @@ pub(crate) fn compile_scan_backward(
         //   * Remaining Inputs sorted by NodeId — first is the
         //     carry mirror, rest are x_t_i mirrors in body's
         //     original Op::Input declaration order.
+        // Compiled as any graph is: integer storage kept, claimed fused ops
+        // expanded (an I32 gather index otherwise read as f32 bits).
+        let body_vjp = &crate::expand::prepare_graph_for_thunks(Graph::clone(body_vjp));
         let body_plan = rlx_opt::memory::plan_memory(body_vjp);
         let body_offsets: HashMap<NodeId, usize> = body_plan
             .assignments
@@ -741,6 +747,9 @@ pub(crate) fn compile_scan_backward(
         // by the AD pass via `forward_body: Some(_)`.
         let (fb_schedule, fb_init, fb_carry_in_off, fb_output_off, fb_x_offs) = if is_recursive {
             let fb = forward_body.as_ref().unwrap();
+            // Compiled as any graph is: integer storage kept, claimed fused ops
+            // expanded (an I32 gather index otherwise read as f32 bits).
+            let fb = &crate::expand::prepare_graph_for_thunks(Graph::clone(fb));
             let fb_plan = rlx_opt::memory::plan_memory(fb);
             let fb_offsets: HashMap<NodeId, usize> = fb_plan
                 .assignments
@@ -859,6 +868,9 @@ pub(crate) fn compile_scan_backward_xs(
         // body_vjp's outputs (from `grad(body, [carry, xs_0, ..., xs_{num_xs-1}])`):
         //   outputs[0]      = dcarry
         //   outputs[1 + i]  = dx_t_i
+        // Compiled as any graph is: integer storage kept, claimed fused ops
+        // expanded (an I32 gather index otherwise read as f32 bits).
+        let body_vjp = &crate::expand::prepare_graph_for_thunks(Graph::clone(body_vjp));
         let body_plan = rlx_opt::memory::plan_memory(body_vjp);
         let body_offsets: HashMap<NodeId, usize> = body_plan
             .assignments
@@ -963,6 +975,9 @@ pub(crate) fn compile_scan_backward_xs(
         // Mirrors the same code path in the ScanBackward arm.
         let (fb_schedule, fb_init, fb_carry_in_off, fb_output_off, fb_x_offs) = if is_recursive {
             let fb = forward_body.as_ref().unwrap();
+            // Compiled as any graph is: integer storage kept, claimed fused ops
+            // expanded (an I32 gather index otherwise read as f32 bits).
+            let fb = &crate::expand::prepare_graph_for_thunks(Graph::clone(fb));
             let fb_plan = rlx_opt::memory::plan_memory(fb);
             let fb_offsets: HashMap<NodeId, usize> = fb_plan
                 .assignments
@@ -1813,6 +1828,26 @@ pub fn check_rnn_lens(op: &str, checks: &[(&str, usize, usize)]) -> Result<(), S
     Ok(())
 }
 
+/// `Σ a[j]·b[j]` with four independent accumulators (vectorizes to NEON /
+/// SSE); the recurrent mat-vec of the LSTM cell.
+#[inline]
+fn dot4(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut acc = [0f32; 4];
+    let (ac, ar) = a[..n].as_chunks::<4>();
+    let (bc, br) = b[..n].as_chunks::<4>();
+    for (x, y) in ac.iter().zip(bc) {
+        for l in 0..4 {
+            acc[l] = x[l].mul_add(y[l], acc[l]);
+        }
+    }
+    let mut s = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    for (x, y) in ar.iter().zip(br) {
+        s = x.mul_add(*y, s);
+    }
+    s
+}
+
 /// Reference / host-fallback entry for `Op::Lstm` (multi-layer,
 /// optionally bidirectional, optional decode carry). Gate order i, f, g,
 /// o. Shared by the CPU backend and the CUDA / ROCm / wgpu / Metal host
@@ -1879,6 +1914,18 @@ pub unsafe fn execute_lstm_f32(
                 let h0p = bptr + h0 + ld * batch * hidden * 4;
                 let c0p = bptr + c0 + ld * batch * hidden * 4;
 
+                // The input projection has no recurrence: one GEMM over every
+                // (batch, t) row, `zin = x · W_ihᵀ + b`, on the BLAS / SME
+                // path. Only `W_hh · h` stays inside the time loop.
+                let rows = batch * seq;
+                let mut zin = vec![0f32; rows * four_h];
+                crate::blas::sgemm_bt(li_ref, wih, &mut zin, rows, in_l, four_h, 1.0);
+                for row in zin.chunks_exact_mut(four_h) {
+                    for (z, &bv) in row.iter_mut().zip(bs) {
+                        *z += bv;
+                    }
+                }
+                let zin_ref: &[f32] = &zin;
                 crate::pool::par_range(batch, |b| {
                     let lo = lo_ptr as *mut f32;
                     let mut h = vec![0f32; hidden];
@@ -1898,18 +1945,9 @@ pub unsafe fn execute_lstm_f32(
                     let mut z = vec![0f32; four_h];
                     for step in 0..seq {
                         let t = if dir == 0 { step } else { seq - 1 - step };
-                        let x_t = &li_ref[(b * seq + t) * in_l..(b * seq + t + 1) * in_l];
+                        let zt = &zin_ref[(b * seq + t) * four_h..(b * seq + t + 1) * four_h];
                         for r in 0..four_h {
-                            let wr = &wih[r * in_l..(r + 1) * in_l];
-                            let mut acc = bs[r];
-                            for j in 0..in_l {
-                                acc += wr[j] * x_t[j];
-                            }
-                            let hr = &whh[r * hidden..(r + 1) * hidden];
-                            for (j, &hj) in h.iter().enumerate() {
-                                acc += hr[j] * hj;
-                            }
-                            z[r] = acc;
+                            z[r] = zt[r] + dot4(&whh[r * hidden..(r + 1) * hidden], &h);
                         }
                         for k in 0..hidden {
                             let i_g = sigmoid(z[k]);

@@ -15,7 +15,7 @@ use rlx_xdna::compile::{OverlaySpec, compile_overlay};
 use rlx_xdna::npu_gemm::NpuRun3;
 
 fn envn(k: &str, d: &str) -> usize {
-    std::env::var(k)
+    rlx_ir::env::read(k)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| d.parse().unwrap())
@@ -24,10 +24,8 @@ fn envn(k: &str, d: &str) -> usize {
 fn main() {
     let (seq, d) = (envn("SEQ", "32"), envn("D", "32"));
     let sd = seq * d;
-    let (aiecc, peano) = (
-        std::env::var("AIECC").unwrap(),
-        std::env::var("PEANO").unwrap(),
-    );
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let (aiecc, peano) = (tc.aiecc_str(), tc.peano_str());
 
     let mlir = emit_attention(seq, d, 1, 1.0 / (d as f32).sqrt(), false);
     println!(

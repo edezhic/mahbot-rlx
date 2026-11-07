@@ -51,11 +51,12 @@
 // (13 %). So the two rungs the tile gains least on are the two most rounded, which is
 // what `COOP_GEMM_MAX_PAD_DIVISOR` in `gguf_gpu.rs` is the floor of.
 //
-// The encoder's own rate for one shape the tile refuses is the file's other
-// reading: `q8_0 enc-down` at m 96 k 4096 n 1024 is eight column tiles by three
-// row tiles — 24 workgroups, under `COOP_MIN_WORKGROUPS` — so both sides run the
-// row-grouped tile and the pair reads 1.00x: a repeatability witness rather than a
-// comparison.
+// The encoder's own rate is the file's other reading, and it is the one that moved
+// the floor: `q8_0 enc-down` at m 96 k 4096 n 1024 is eight column tiles by three
+// row tiles — 24 workgroups, `COOP_MIN_WORKGROUPS` itself — so it ran the
+// row-grouped tile while the floor was 48 and the pair read 1.00x, a repeatability
+// witness rather than a comparison. At the floor of 24 it takes the cooperative
+// tile and the pair reads 1.17x.
 //
 // The end-to-end figure the tile buys is the recognition stand row (`STAND.md`'s
 // `recognition.typical`): 3.2 s warm, against 3.53 s for the same row with

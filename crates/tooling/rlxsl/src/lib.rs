@@ -33,6 +33,7 @@
 pub mod binary;
 pub mod compare;
 pub mod dw;
+pub mod exact;
 
 use rlx_ir::op::Activation;
 use std::collections::HashMap;
@@ -864,6 +865,26 @@ fn cse(sx: &Sx) -> Sx {
 pub fn activation_grad_expr(act: Activation) -> Sx {
     match act {
         Activation::Round => lit(1.0),
+        // silu' = s·(1 + x·(1 − s)), s = σ(x). The differentiated forward,
+        // `(c − x·e) / c²` with `c = 1 + e`, `e = exp(−x)`, overflows both
+        // terms to inf for x ∈ [−88, −85] (x·e past f32::MAX) and returns
+        // inf/inf = NaN there — one such activation poisons a whole backward.
+        // This form keeps every term finite (s underflows toward 0 instead).
+        // σ' = s·(1 − s): differentiating 1/(1 + e^{−x}) gives e^{−x}/(1 + e^{−x})²,
+        // inf/inf = NaN once e^{−x} overflows (x below about −88).
+        Activation::Sigmoid => let_(
+            "s",
+            div(lit(1.0), add(lit(1.0), exp(clamp(neg(x()), -88.0, 88.0)))),
+            mul(var("s"), add(lit(1.0), neg(var("s")))),
+        ),
+        Activation::Silu => let_(
+            "s",
+            div(lit(1.0), add(lit(1.0), exp(clamp(neg(x()), -88.0, 88.0)))),
+            mul(
+                var("s"),
+                add(lit(1.0), mul(x(), add(lit(1.0), neg(var("s"))))),
+            ),
+        ),
         _ => cse(&simplify(&diff(&inline_lets(&activation_expr(act))))),
     }
 }
@@ -894,24 +915,31 @@ impl Lang {
         match (self, i) {
             (_, Intr::Exp) => match self {
                 Cuda => "expf",
+                // WGSL's `exp` rounds by the compiler's math mode; see `exact`.
+                Wgsl => "rlx_exp",
                 _ => "exp",
             },
             (_, Intr::Log) => match self {
                 Cuda => "logf",
+                // WGSL's `log` rounds by the compiler's math mode; see `exact`.
+                Wgsl => "rlx_log",
                 _ => "log",
             },
             (_, Intr::Sqrt) => match self {
                 Cuda => "sqrtf",
+                // WGSL's `sqrt` is not correctly rounded; see `exact`.
+                Wgsl => "rlx_sqrt_rn",
                 _ => "sqrt",
             },
             (_, Intr::Rsqrt) => match self {
-                Wgsl => "inverseSqrt",
+                Wgsl => "rlx_rsqrt_rn",
                 Cuda => "rsqrtf",
                 Msl | OpenCl => "rsqrt",
                 Glsl => "inversesqrt",
             },
             (_, Intr::Tanh) => match self {
                 Cuda => "tanhf",
+                Wgsl => "rlx_tanh",
                 _ => "tanh",
             },
             (_, Intr::Sin) => match self {
@@ -1032,6 +1060,12 @@ fn render(sx: &Sx, lang: Lang, stmts: &mut Vec<String>) -> String {
         Sx::Add(a, b) => format!("({} + {})", go(a, stmts), go(b, stmts)),
         Sx::Sub(a, b) => format!("({} - {})", go(a, stmts), go(b, stmts)),
         Sx::Mul(a, b) => format!("({} * {})", go(a, stmts), go(b, stmts)),
+        // WGSL `/` is not correctly rounded (2.5 ULP; Metal fast math is a
+        // reciprocal multiply), so `Recip`, `Sigmoid`, `Silu`, ... route through
+        // the exact helper every WGSL shader prepends (`exact`).
+        Sx::Div(a, b) if lang == Lang::Wgsl => {
+            format!("rlx_div_rn({}, {})", go(a, stmts), go(b, stmts))
+        }
         Sx::Div(a, b) => format!("({} / {})", go(a, stmts), go(b, stmts)),
         Sx::Max(a, b) => format!("{}({}, {})", lang.fmax(), go(a, stmts), go(b, stmts)),
         Sx::Min(a, b) => format!("{}({}, {})", lang.fmin(), go(a, stmts), go(b, stmts)),
@@ -1044,14 +1078,37 @@ fn render(sx: &Sx, lang: Lang, stmts: &mut Vec<String>) -> String {
                 _ => format!("clamp({ae}, {lo}, {hi})"),
             }
         }
-        Sx::Call(Intr::Erf, a) => match lang {
-            // CUDA / OpenCL expose a scalar erf builtin (hardware-accurate).
-            Lang::Cuda => format!("erff({})", go(a, stmts)),
-            Lang::OpenCl => format!("erf({})", go(a, stmts)),
-            // MSL / WGSL / GLSL have NO erf builtin → substitute the A&S 7.1.26
-            // polynomial expansion (the math still lives once, here).
-            Lang::Msl | Lang::Wgsl | Lang::Glsl => render(&erf_ansatz((**a).clone()), lang, stmts),
-        },
+        Sx::Call(Intr::Erf, a) => {
+            match lang {
+                // CUDA / OpenCL expose a scalar erf builtin (hardware-accurate).
+                Lang::Cuda => format!("erff({})", go(a, stmts)),
+                Lang::OpenCl => format!("erf({})", go(a, stmts)),
+                // MSL / WGSL / GLSL have NO erf builtin → substitute the A&S 7.1.26
+                // polynomial expansion (the math still lives once, here).
+                // WGSL spells the polynomial with explicit `fma`: shader compilers
+                // contract a plain `a * b + c` chain differently (Chrome's WebGPU
+                // and native wgpu on the same Metal GPU disagreed by up to 37 ULP
+                // in gelu), and an explicit `fma` is fused everywhere.
+                Lang::Wgsl => {
+                    let ae = go(a, stmts);
+                    let l = |v: f32| fmt_lit(v, lang);
+                    stmts.push(format!("let _ea = {ae};"));
+                    stmts.push("let _ex = abs(_ea);".to_string());
+                    stmts.push(format!(
+                        "let _et = rlx_div_rn({}, fma({}, _ex, {}));",
+                        l(1.0),
+                        l(0.3275911),
+                        l(1.0)
+                    ));
+                    stmts.push(format!(
+                    "let _ep = fma(fma(fma(fma({}, _et, {}), _et, {}), _et, {}), _et, {}) * _et;",
+                    l(1.061_405_4), l(-1.453_152_1), l(1.421_413_8), l(-0.284_496_72), l(0.254_829_6)
+                ));
+                    format!("(sign(_ea) * fma(-_ep, rlx_exp(-(_ex * _ex)), {}))", l(1.0))
+                }
+                Lang::Msl | Lang::Glsl => render(&erf_ansatz((**a).clone()), lang, stmts),
+            }
+        }
         Sx::Call(Intr::Sign, a) if lang == Lang::Cuda => {
             // CUDA has no scalar `sign`; reproduce WGSL semantics (sign(0)==0).
             let ae = go(a, stmts);
@@ -1116,11 +1173,14 @@ pub fn emit_case_body(act: Activation, lang: Lang, assign: &str) -> String {
 
 /// Which canonical activation-opcode scheme the target's kernel switch uses.
 /// A backend property, not a language one: `ReluFirst` = CUDA / wgpu / ROCm
-/// forward; `GeluFirst` = Vulkan / oneAPI forward (see `rlx_ir::opcodes`).
+/// forward; `GeluFirst` = Vulkan / oneAPI forward (see `rlx_ir::opcodes`);
+/// `Region` = the `sub` code a fused elementwise-region chain step carries
+/// (`rlx_ir::region_encode::activation_sub`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpcodeScheme {
     ReluFirst,
     GeluFirst,
+    Region,
 }
 
 /// Activations sorted by their opcode under `scheme` (`(opcode, activation)`).
@@ -1131,6 +1191,7 @@ fn cases(scheme: OpcodeScheme) -> Vec<(u32, Activation)> {
             let id = match scheme {
                 OpcodeScheme::ReluFirst => a.opcode_relu_first(),
                 OpcodeScheme::GeluFirst => a.opcode_gelu_first(),
+                OpcodeScheme::Region => rlx_ir::region_encode::activation_sub(a),
             };
             (id, a)
         })
@@ -1313,6 +1374,39 @@ pub fn opencl_activation_backward_module() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Activations defined on every real must have a finite gradient on every
+    /// finite input: one NaN in a backward poisons every gradient after it
+    /// (the old SiLU derivative returned NaN for x ∈ [−88, −85]).
+    #[test]
+    fn total_activation_gradients_stay_finite() {
+        let total = [
+            Activation::Silu,
+            Activation::Sigmoid,
+            Activation::Tanh,
+            Activation::Gelu,
+            Activation::GeluApprox,
+            Activation::Relu,
+        ];
+        for act in total {
+            let mut x = -120.0f32;
+            while x <= 120.0 {
+                let g = eval_activation_grad(act, x);
+                assert!(g.is_finite(), "{act:?}' ({x}) = {g}");
+                x += 0.125;
+            }
+        }
+        // And SiLU's is the true derivative: s·(1 + x·(1 − s)).
+        for x in [-87.0f64, -86.0, -20.0, -1.0, 0.0, 0.5, 3.0, 30.0] {
+            let s = 1.0 / (1.0 + (-x).exp());
+            let want = s * (1.0 + x * (1.0 - s));
+            let got = eval_activation_grad(Activation::Silu, x as f32) as f64;
+            assert!(
+                (got - want).abs() <= 1e-6 * want.abs().max(1.0),
+                "silu'({x}) = {got}, want {want}"
+            );
+        }
+    }
+
     use super::*;
 
     // Independent reference math (std-lib), restated here so the manifest AST is
@@ -1413,7 +1507,7 @@ mod tests {
         // truth (measured ~5e-7). This is the real precision guard — the 5e-3
         // parity tolerance elsewhere exists only to absorb cross-vendor GPU
         // intrinsic differences, and would NOT catch a coarser polynomial here.
-        let true_erf = |x: f64| libm::erf(x);
+        let true_erf = |x: f64| rlx_libm::erf(x);
         let true_gelu = |x: f64| 0.5 * x * (1.0 + true_erf(x / std::f64::consts::SQRT_2));
         let true_gelu_grad = |x: f64| {
             let phi = 0.5 * (1.0 + true_erf(x / std::f64::consts::SQRT_2));
@@ -1495,7 +1589,7 @@ mod tests {
         }
         // Spot-check per-language intrinsic spelling.
         let r = OpcodeScheme::ReluFirst;
-        assert!(wgsl_activation_module(r).contains("inverseSqrt"));
+        assert!(wgsl_activation_module(r).contains("rlx_rsqrt_rn(x)"));
         assert!(cuda_activation_module(r).contains("rsqrtf"));
         assert!(msl_activation_module(r).contains("rsqrt"));
         assert!(glsl_activation_module(r).contains("inversesqrt"));
@@ -1603,23 +1697,34 @@ mod tests {
     #[test]
     fn wgsl_modules_validate_in_naga() {
         let validate = |module: &str, call: &str| {
-            let src = format!(
-                "{module}\n\
+            // The modules call the numeric helpers; a shader prepends one set
+            // once — exact by default, fast under rlx-wgpu's `set_fast_math`.
+            for helpers in [
+                exact::wgsl_numeric_helpers(),
+                exact::wgsl_fast_numeric_helpers(),
+            ] {
+                let src = format!(
+                    "{helpers}{module}\n\
                  @group(0) @binding(0) var<storage, read_write> o: array<f32>;\n\
                  @compute @workgroup_size(1)\n\
                  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{\n\
                  {call}\n}}\n"
-            );
-            let m = naga::front::wgsl::parse_str(&src)
-                .unwrap_or_else(|e| panic!("generated WGSL failed to parse: {e:?}\n{src}"));
-            naga::valid::Validator::new(
-                naga::valid::ValidationFlags::all(),
-                naga::valid::Capabilities::all(),
-            )
-            .validate(&m)
-            .unwrap_or_else(|e| panic!("generated WGSL failed validation: {e:?}"));
+                );
+                let m = naga::front::wgsl::parse_str(&src)
+                    .unwrap_or_else(|e| panic!("generated WGSL failed to parse: {e:?}\n{src}"));
+                naga::valid::Validator::new(
+                    naga::valid::ValidationFlags::all(),
+                    naga::valid::Capabilities::all(),
+                )
+                .validate(&m)
+                .unwrap_or_else(|e| panic!("generated WGSL failed validation: {e:?}"));
+            }
         };
-        for scheme in [OpcodeScheme::ReluFirst, OpcodeScheme::GeluFirst] {
+        for scheme in [
+            OpcodeScheme::ReluFirst,
+            OpcodeScheme::GeluFirst,
+            OpcodeScheme::Region,
+        ] {
             validate(
                 &wgsl_activation_module(scheme),
                 "o[gid.x] = rlx_activation_apply(gid.x, o[gid.x]);",
@@ -1696,9 +1801,10 @@ mod tests {
             1,
             "silu backward must call exp once, got:\n{full}"
         );
+        // The shared σ is bound once: hoisted by CSE, or the override's own `s`.
         assert!(
-            !stmts.is_empty() && full.contains("_cse0"),
-            "expected hoisted CSE temporaries:\n{full}"
+            !stmts.is_empty() && (full.contains("_cse0") || full.contains("let s")),
+            "expected the shared term bound once:\n{full}"
         );
         // Sigmoid (3× exp) and gelu (repeated x·√½) must also collapse.
         let (s2, e2) = emit_activation_grad(Activation::Sigmoid, Lang::Cuda);

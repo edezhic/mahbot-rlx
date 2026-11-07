@@ -27,7 +27,7 @@ rlx-ir = { workspace = true }
 rlx-opt = { workspace = true }
 # Host-side GGUF / MLX dequant fallback for the off-path quant schemes.
 rlx-gguf = { workspace = true }
-rlx-mlx-io = { workspace = true }
+rlx-mlx-io = { workspace = true, default-features = false }  # dequant kernels only
 prost = "0.13"
 half = "2"
 bytemuck = { version = "1", features = ["derive"] }
@@ -147,3 +147,20 @@ required-features = ["backend-tests"]
 [lib]
 # No doctests in this crate: the empty stage was pure rustdoc cost.
 doctest = false
+
+[[test]]
+name = "apple_only_tests_are_gated"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_bn_chain"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_fft_dft"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "coreml_transpose_reduce"
+required-features = ["backend-tests"]
+

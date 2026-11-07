@@ -14,34 +14,35 @@ use crate::host_staging::F32HostSlot;
 use crate::kernels::{
     activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
     argmax_kernel, attention_bwd_kernel, attention_kernel, attention_row_kernel,
-    attention_warp_kernel, attention_wmma_d128_kernel, attention_wmma_kernel, axial_rope2d_kernel,
-    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
-    batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
-    batch_norm_inference_kernel, binary_broadcast_kernel, binary_c64_kernel, binary_kernel,
-    compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel, complex_norm_sq_kernel,
-    concat_kernel, conjugate_c64_kernel, conv_bias_act_epilogue_kernel, conv_transpose2d_kernel,
-    conv_transpose3d_kernel, conv1d_kernel, conv2d_backward_input_kernel,
-    conv2d_backward_weight_kernel, conv2d_kernel, conv3d_backward_input_kernel,
-    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, copy_sanitize_kernel,
-    cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    dequant_matmul_mlx_gemm_kernel, dequant_matmul_mlx_gemv_kernel, dequant_matmul_mlx_kernel,
-    dequantize_i8_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw, elementwise_region_kernel,
-    expand_kernel, fake_quantize_backward_kernel, fake_quantize_ema_kernel,
-    fake_quantize_fixed_kernel, fake_quantize_lsq_bwd_scale_kernel, fake_quantize_lsq_bwd_x_kernel,
-    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel, fused_attn_kernel,
-    fused_binary_unary_kernel, fused_residual_ln_kernel, fused_residual_rms_norm_kernel,
-    fused_swiglu_kernel, gated_delta_net_kernel, gated_residual_backward_kernel,
-    gated_residual_kernel, gather_axis_kernel, gather_backward_kernel, gather_elements_kernel,
-    gather_kernel, gather_nd_kernel, group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel,
-    group_norm_bwd_input_kernel, group_norm_kernel, grouped_matmul_kernel, im2col_kernel,
-    interpolate3d_kernel, kimi_delta_chunk_kernel, kv_append_kernel, layer_norm_bwd_gamma_kernel,
+    attention_warp_kernel, attention_warp_split_kernel, attention_wmma_d128_kernel,
+    attention_wmma_kernel, axial_rope2d_kernel, batch_elementwise_region_kernel,
+    batch_norm_inference_bwd_beta_kernel, batch_norm_inference_bwd_gamma_kernel,
+    batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_broadcast_kernel,
+    binary_c64_kernel, binary_kernel, compare_kernel, complex_cast_kernel,
+    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, conjugate_c64_kernel,
+    conv_bias_act_epilogue_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_kernel,
+    conv2d_backward_input_kernel, conv2d_backward_weight_kernel, conv2d_kernel,
+    conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel,
+    copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
+    dequant_matmul_kernel, dequant_matmul_mlx_gemm_kernel, dequant_matmul_mlx_gemv_kernel,
+    dequant_matmul_mlx_kernel, dequantize_i8_kernel, dispatch_grid_1d, dispatch_grid_prologue_nchw,
+    elementwise_region_kernel, expand_kernel, fake_quantize_backward_kernel,
+    fake_quantize_ema_kernel, fake_quantize_fixed_kernel, fake_quantize_lsq_bwd_scale_kernel,
+    fake_quantize_lsq_bwd_x_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
+    fma_kernel, fused_attn_kernel, fused_binary_unary_kernel, fused_residual_ln_kernel,
+    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
+    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
+    gather_backward_kernel, gather_elements_kernel, gather_kernel, gather_nd_kernel,
+    group_norm_bwd_beta_kernel, group_norm_bwd_gamma_kernel, group_norm_bwd_input_kernel,
+    group_norm_kernel, grouped_matmul_kernel, im2col_kernel, interpolate3d_kernel,
+    kimi_delta_chunk_kernel, kv_append_kernel, layer_norm_bwd_gamma_kernel,
     layer_norm_bwd_input_kernel, layer_norm2d_kernel, layernorm_kernel, matmul_epilogue_kernel,
     matmul_kernel, matmul_kernel_tiled, matmul_tma_kernel, matmul_wmma_kernel,
     maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, pad_kernel, pool1d_kernel,
     pool2d_kernel, pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel,
     reduce_kernel, relu_backward_kernel, resize_nearest_2x_kernel, rms_norm_backward_kernel,
-    rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
-    scatter_add_acc_kernel, scatter_add_zero_kernel, scatter_elements_kernel,
+    rms_norm_bwd_zero_kernel, rope_backward_kernel, rope_kernel, round_to_format_kernel,
+    sample_kernel, scatter_add_acc_kernel, scatter_add_zero_kernel, scatter_elements_kernel,
     scatter_nd_reduce_kernel, selective_scan_kernel, slice_kernel,
     softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
     softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
@@ -1048,7 +1049,19 @@ impl CudaExecutable {
                     has_bias,
                     bias_off_f32,
                     act_id,
+                    b_half,
                 } => {
+                    if let Some((src_byte_off, dt)) = *b_half {
+                        widen_half_weight(
+                            &self.ctx,
+                            &mut self.arena,
+                            &stream,
+                            src_byte_off,
+                            *b_off_f32,
+                            (*k as u64) * (*n as u64),
+                            dt,
+                        );
+                    }
                     // Opt-in Hopper TMA GEMM (`RLX_CUDA_TMA` on sm_90). Only
                     // eligible shapes route here; everything else falls through
                     // to the cuBLAS cascade below. Bias/activation go through the
@@ -2674,21 +2687,45 @@ impl CudaExecutable {
                     // Without this the table could name `AttentionRow` and be
                     // silently ignored — a dead variant in a table is worse than
                     // no table.
+                    let legacy_row = rlx_ir::env::flag("RLX_CUDA_LEGACY_ATTENTION_ROW");
+                    let table_choice = rlx_gpu_kernels::dispatch::resolve_attention(
+                        crate::backend::gpu_arch(&self.ctx),
+                        *batch as usize,
+                        *heads as usize,
+                        seq_q_eff as usize,
+                    );
                     let use_warp = use_row_final
-                        && !rlx_ir::env::flag("RLX_CUDA_LEGACY_ATTENTION_ROW")
+                        && !legacy_row
                         && !matches!(
-                            rlx_gpu_kernels::dispatch::resolve_attention(
-                                crate::backend::gpu_arch(&self.ctx),
-                                *batch as usize,
-                                *heads as usize,
-                                seq_q_eff as usize,
-                            ),
+                            table_choice,
                             rlx_gpu_kernels::dispatch::Choice::AttentionRow
                                 | rlx_gpu_kernels::dispatch::Choice::AttentionScalar
                         );
+                    // Split-KV decode: when `batch * heads * seq_q` is too few
+                    // rows to fill the device, one block per row divides seq_k
+                    // across its groups (`attention_warp_split`). Replaces both
+                    // the flash kernel and `attention_warp` at those shapes; only
+                    // under `Auto`, and a tuned Row/Scalar table entry still wins.
+                    // `RLX_CUDA_ATTENTION_KV_SPLITS=<n>` pins the group count
+                    // (0 = off).
+                    let split_groups = if wmma_kind == 0
+                        && pol == AttentionVariant::Auto
+                        && !legacy_row
+                        && table_choice == rlx_gpu_kernels::dispatch::Choice::AttentionWarp
+                    {
+                        rlx_gpu_kernels::attention_kv_split_groups(
+                            batch * heads * seq_q_eff,
+                            seq_k_eff,
+                            *head_dim,
+                            crate::runtime_config().attention_kv_splits,
+                        )
+                    } else {
+                        0
+                    };
                     let mut launcher = stream.launch_builder(match wmma_kind {
                         1 => &attention_wmma_kernel(&self.ctx).function,
                         2 => &attention_wmma_d128_kernel(&self.ctx).function,
+                        _ if split_groups > 0 => &attention_warp_split_kernel(&self.ctx).function,
                         _ if use_warp => &attention_warp_kernel(&self.ctx).function,
                         _ if use_row_final => &attention_row_kernel(&self.ctx).function,
                         _ => &attention_kernel(&self.ctx).function,
@@ -2725,7 +2762,16 @@ impl CudaExecutable {
                         .arg(o_head_stride)
                         .arg(o_seq_stride)
                         .arg(softcap_bits);
-                    let cfg = if use_warp {
+                    let cfg = if split_groups > 0 {
+                        LaunchConfig {
+                            grid_dim: (batch * heads * seq_q_eff, 1, 1),
+                            block_dim: (split_groups * 32, 1, 1),
+                            shared_mem_bytes: rlx_gpu_kernels::attention_kv_split_smem_bytes(
+                                split_groups,
+                                *head_dim,
+                            ),
+                        }
+                    } else if use_warp {
                         // One 32-lane group per query row; 4 groups per block.
                         // Groups are carved from threadIdx.x (not the hardware
                         // warp), so the same geometry is correct on AMD
@@ -3449,6 +3495,25 @@ impl CudaExecutable {
                             &self.ctx,
                             &stream,
                             self.arena.f32_buf_mut(),
+                            *n as usize,
+                            *k as usize,
+                            *scheme_id,
+                            *x_byte_off as usize,
+                            *w_byte_off as usize,
+                            *out_byte_off as usize,
+                        );
+                    } else if crate::gguf_gpu::gguf_gemv_rows_supported(
+                        *scheme_id,
+                        m_s as usize,
+                        *k as usize,
+                    ) && !crate::gguf_gpu::gguf_fused_m1_env_disabled()
+                    {
+                        // A verify step's 2–4 rows: the GEMV, each row as at m = 1.
+                        crate::gguf_gpu::run_dequant_matmul_gguf_gemv_rows(
+                            &self.ctx,
+                            &stream,
+                            self.arena.f32_buf_mut(),
+                            m_s as usize,
                             *n as usize,
                             *k as usize,
                             *scheme_id,
@@ -5729,6 +5794,68 @@ impl CudaExecutable {
                         launcher
                             .launch(cfg)
                             .expect("rlx-cuda: fake_quantize_fixed launch failed");
+                    }
+                }
+                Step::DoubleSingle { args } => {
+                    if args.len > 0 {
+                        let kernel = crate::kernels::double_single_kernel(&self.ctx);
+                        let (grid, block_dim) = dispatch_grid_1d(args.len, 256);
+                        let mut launcher = stream.launch_builder(&kernel.function);
+                        let arg = crate::backend::helpers::DfArg(*args);
+                        launcher.arg(self.arena.f32_buf_mut()).arg(&arg);
+                        unsafe {
+                            launcher
+                                .launch(LaunchConfig {
+                                    grid_dim: (grid, 1, 1),
+                                    block_dim: (block_dim, 1, 1),
+                                    shared_mem_bytes: 0,
+                                })
+                                .expect("rlx-cuda: double_single launch failed");
+                        }
+                    }
+                }
+                Step::RoundToFormat {
+                    in_off,
+                    amax_off,
+                    out_off,
+                    n,
+                    last_dim,
+                    block,
+                    mode,
+                    man_bits,
+                    emin,
+                    emax,
+                    max_bits,
+                } => {
+                    let kernel = round_to_format_kernel(&self.ctx);
+                    let threads = if *mode >= 2 {
+                        (*n / (*last_dim).max(1)) * (*last_dim).max(1).div_ceil((*block).max(1))
+                    } else {
+                        *n
+                    };
+                    let (grid, block_dim) = dispatch_grid_1d(threads.max(1), 256);
+                    let mut launcher = stream.launch_builder(&kernel.function);
+                    launcher
+                        .arg(self.arena.f32_buf_mut())
+                        .arg(n)
+                        .arg(last_dim)
+                        .arg(block)
+                        .arg(mode)
+                        .arg(man_bits)
+                        .arg(emin)
+                        .arg(emax)
+                        .arg(max_bits)
+                        .arg(in_off)
+                        .arg(amax_off)
+                        .arg(out_off);
+                    unsafe {
+                        launcher
+                            .launch(LaunchConfig {
+                                grid_dim: (grid, 1, 1),
+                                block_dim: (block_dim, 1, 1),
+                                shared_mem_bytes: 0,
+                            })
+                            .expect("rlx-cuda: round_to_format launch failed");
                     }
                 }
                 Step::FakeQuantizePerBatch {
@@ -8271,5 +8398,42 @@ impl CudaExecutable {
             unsafe { self.ctx.enable_event_tracking() };
         }
         self.outputs_from_staging_plan(&plan)
+    }
+}
+
+/// Widen a 2-B weight (`Step::Matmul::b_half`) into the f32 scratch at
+/// `dst_off_f32`, on `stream` ahead of the GEMM that reads it.
+fn widen_half_weight(
+    ctx: &Arc<CudaContext>,
+    arena: &mut crate::arena::Arena,
+    stream: &Arc<cudarc::driver::CudaStream>,
+    src_byte_off: u64,
+    dst_off_f32: u32,
+    n_elems: u64,
+    dt: crate::arena::HalfDtype,
+) {
+    let kernel = crate::kernels::widen_half_to_f32_kernel(ctx);
+    let base = {
+        let (p, _g) = arena.f32_buf_mut().device_ptr_mut(stream);
+        p
+    };
+    let src = base + src_byte_off;
+    let dst = base + dst_off_f32 as u64 * 4;
+    let dtype: u32 = match dt {
+        crate::arena::HalfDtype::F16 => 0,
+        crate::arena::HalfDtype::Bf16 => 1,
+    };
+    let blocks = n_elems.div_ceil(256).clamp(1, 65_535) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut launcher = stream.launch_builder(&kernel.function);
+    launcher.arg(&src).arg(&dst).arg(&n_elems).arg(&dtype);
+    unsafe {
+        launcher
+            .launch(cfg)
+            .expect("rlx-cuda: widen_half_to_f32 launch failed");
     }
 }

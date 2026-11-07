@@ -17,8 +17,8 @@
 //!   does not run away, with a control for each way it can fail.
 //!
 //! Needs the installed static tree — the models, the pinned corpus and the music pool.
-//! Run with `cargo test -p mahbot-inference --release --test product_checks --
-//! --ignored --nocapture`. A test whose input is absent prints why and returns.
+//! Run with `just test-product-checks`, which is deliberately in neither gate. A
+//! test whose input is absent prints why and returns.
 
 use std::sync::Arc;
 

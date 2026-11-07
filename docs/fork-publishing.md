@@ -7,9 +7,13 @@ itself is described at the end.
 
 ## The set
 
-Twenty-two crates, each at the fork version `0.2.18-mahbot.1` (a prerelease:
-a version that differs from upstream's only in build metadata is rejected by
-the registry).
+Twenty-two crates, each at the fork version (a prerelease: a version that
+differs from upstream's only in build metadata is rejected by the registry).
+The number lives in one place, `FORK_VERSION` in
+[`scripts/fork-rename.py`](../scripts/fork-rename.py) — the release process
+bumps it there, re-runs the script to stamp every manifest, and
+`scripts/publish.sh` reads it from the same file rather than restating it.
+`python3 scripts/fork-rename.py --check` fails if any manifest disagrees.
 
 | package | source |
 |---|---|

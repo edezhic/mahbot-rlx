@@ -36,10 +36,14 @@ the CUDA backend added an hour+ to every clean `cargo build` on WSL rigs.
 2. Use **debug** cargo profile for iteration — `build.rs` maps `cargo build`
    → CMake `Debug` (much faster nvcc when CUDA is enabled).
 
-3. Install **ccache** (MLX enables it automatically when found):
+3. Install **sccache** or **ccache**. `build.rs` uses the first one it finds
+   (sccache first) for MLX's C++ and CUDA sources, so a rebuilt `OUT_DIR` — a
+   new target dir, a feature or profile change, a CI runner — recompiles from
+   the cache. `RLX_MLX_CCACHE=sccache|ccache|<path>|off` picks one; not used on
+   Windows (the Visual Studio generator ignores compiler launchers).
 
    ```sh
-   sudo apt-get install ccache
+   sudo apt-get install ccache        # or: cargo install sccache
    ```
 
 4. Pin parallel nvcc jobs if WSL OOMs or thrashes:

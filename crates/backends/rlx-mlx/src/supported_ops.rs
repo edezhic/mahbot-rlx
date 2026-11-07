@@ -151,6 +151,9 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // variants. Closes the last gap vs `rlx_cpu::SUPPORTED_OPS`.
         FakeQuantize,
         FakeQuantizeBackward,
+        RoundToFormat,
+        // f64 as (hi, lo) f32 pairs, through `fast::metal_kernel`.
+        DoubleSingle,
         // User-registered custom ops dispatched through
         // `rlx_mlx::op_registry`. Lowering looks up the
         // registered `MlxKernel` and calls its `execute` method

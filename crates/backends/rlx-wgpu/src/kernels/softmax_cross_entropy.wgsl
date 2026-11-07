@@ -37,11 +37,11 @@ fn softmax_cross_entropy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin
     var dot: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
         let v = arena[lbase + i];
-        s = s + exp(v - m);
+        s = s + rlx_exp(v - m);
         dot = dot + arena[tbase + i] * v;
     }
 
-    arena[params.out_off + row] = (m + log(s)) - dot;
+    arena[params.out_off + row] = (m + rlx_log(s)) - dot;
 }
 
 @compute @workgroup_size(64)
@@ -57,10 +57,13 @@ fn softmax_cross_entropy_with_logits(@builtin(global_invocation_id) gid: vec3<u3
 
     var s: f32 = 0.0;
     for (var i: u32 = 0u; i < params.inner; i = i + 1u) {
-        s = s + exp(arena[lbase + i] - m);
+        s = s + rlx_exp(arena[lbase + i] - m);
     }
 
     let label = u32(arena[params.targets_off + row]);
     let label_c = min(label, params.inner - 1u);
-    arena[params.out_off + row] = (m + log(s)) - arena[lbase + label_c];
+    arena[params.out_off + row] = (m + rlx_log(s)) - arena[lbase + label_c];
 }
+
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).

@@ -40,11 +40,17 @@ pub use backend::{
     device_submit_count, device_wait_count, norm_vec4_count, reset_device_counts,
     reset_norm_vec4_count, reset_vec4_move_count, vec4_move_count,
 };
+#[cfg(not(target_family = "wasm"))]
+pub mod step_profile;
+#[cfg(target_family = "wasm")]
+#[path = "step_profile_wasm.rs"]
+pub mod step_profile;
 pub mod supported_ops;
 pub mod tuning;
 pub use supported_ops::SUPPORTED_OPS;
 pub mod bandwidth;
 pub mod buffer;
+pub mod builtin_gpu_kernels;
 pub mod calibrate;
 pub mod collective_host;
 pub mod config;
@@ -59,6 +65,7 @@ pub mod coop_f16_vk;
 pub mod coop_probe;
 pub mod custom_host;
 pub mod device;
+pub use device::{fast_math, set_fast_math};
 pub mod fft_dispatch;
 pub mod fft_host;
 pub mod gdn_host;
@@ -97,4 +104,7 @@ pub fn is_available() -> bool {
     device::wgpu_device().is_some()
 }
 
+pub use buffer::{arena_binding_limit, planned_arena_bytes, planned_largest_tensor_bytes};
+#[cfg(target_family = "wasm")]
+pub use device::init_wgpu_device;
 pub use device::{is_vulkan_available, select_vulkan_backend, shader_f16_supported, wgpu_device};

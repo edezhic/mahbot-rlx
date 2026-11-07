@@ -159,8 +159,10 @@ impl MetalExecutable {
             let threshold = rlx_ir::env::var("RLX_MPSGRAPH_MIN_FLOPS")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(1_000_000);
-            // BF16-weight matmul is only correct on MPS (the thunk Sgemm has no
-            // bf16 kernel); force it there even below the FLOP threshold.
+            // A plan with BF16-weight matmuls runs on MPS even below the FLOP
+            // threshold: measured on Qwen3-0.6B, the thunk path (which unpacks
+            // each bf16 weight into a reused scratch, `Sgemm { b_bf16 }`) saved
+            // only 4% peak memory and decoded 2.9x slower.
             if force || self.has_bf16_matmul || self.estimated_max_flops() >= threshold {
                 let t0 = Instant::now();
                 self.run_via_mps_graph();
@@ -173,7 +175,7 @@ impl MetalExecutable {
             let threshold = rlx_ir::env::var("RLX_MPSGRAPH_MIN_FLOPS")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(1_000_000);
-            // See full-plan gate above: bf16-weight matmul must go through MPS.
+            // See the full-plan gate above.
             if force || self.has_bf16_matmul || self.estimated_max_flops() >= threshold {
                 let t0 = Instant::now();
                 self.run_via_mps_hybrid();
@@ -1650,13 +1652,66 @@ impl MetalExecutable {
                     n,
                     dt,
                     b_f16,
+                    b_bf16,
                     a_f16,
                     ta,
                     tb,
                 } => {
                     use crate::thunk::HalfFlag;
-                    let (a, b, c, m, kk, n, dt, b_f16, a_f16, ta, tb) =
+                    let (a, mut b, c, m, kk, n, dt, b_f16, a_f16, ta, tb) =
                         (*a, *b, *c, *m, *kk, *n, *dt, *b_f16, *a_f16, *ta, *tb);
+                    if *b_bf16 && !ta && !tb && matches!(dt, HalfFlag::F32) {
+                        // Decode-sized M: read the bf16 weight in-kernel.
+                        let ms = scale(m) as usize;
+                        if ms == 0 {
+                            continue;
+                        }
+                        let (a_buf, a_off) = self.resolve_off(a);
+                        let (b_buf, b_off) = self.resolve_off(b);
+                        let (c_buf, c_off) = self.resolve_off(c);
+                        if crate::blas::metal_sgemm_bf16w_small_bufs(
+                            e!(),
+                            a_buf,
+                            a_off,
+                            b_buf,
+                            b_off,
+                            c_buf,
+                            c_off,
+                            ms,
+                            kk as usize,
+                            n as usize,
+                        ) {
+                            continue;
+                        }
+                    }
+                    if *b_bf16 {
+                        // Unpack the packed BF16 weight into the dequant scratch
+                        // (sized for it at compile time) and GEMM on that.
+                        let len = kk * n;
+                        let (src_buf, src_off) = self.resolve_off(b);
+                        let enc = e!();
+                        enc.set_compute_pipeline_state(&k.bf16_unpack_f32);
+                        enc.set_buffer(0, Some(src_buf), src_off as u64);
+                        enc.set_buffer(
+                            1,
+                            Some(&self.arena.buffer),
+                            self.dequant_scratch_off as u64,
+                        );
+                        enc.set_bytes(2, 4, &len as *const u32 as *const _);
+                        enc.dispatch_threads(
+                            crate::mtl::MTLSize {
+                                width: len as u64,
+                                height: 1,
+                                depth: 1,
+                            },
+                            crate::mtl::MTLSize {
+                                width: 256u64.min(len as u64).max(1),
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                        b = self.dequant_scratch_off;
+                    }
                     let m_scaled = scale(m);
                     if m_scaled == 0 {
                         continue;
@@ -2760,6 +2815,41 @@ impl MetalExecutable {
                                 nu,
                             );
                         }
+                    } else if !matches!(dt, HalfFlag::F16)
+                        && !rlx_ir::env::flag("RLX_METAL_BMM_MPS")
+                    {
+                        // One dispatch for the whole batch (grid z). The
+                        // per-matrix MPS loop below costs an encoder switch
+                        // per matrix — B*H of them for multi-head attention.
+                        let enc = e!();
+                        enc.set_compute_pipeline_state(&k.bmm_simd_4x4);
+                        enc.set_buffer(0, Some(&self.arena.buffer), *a as u64);
+                        enc.set_buffer(1, Some(&self.arena.buffer), *b as u64);
+                        enc.set_buffer(2, Some(&self.arena.buffer), *c as u64);
+                        let dims = [mu as u32, ku as u32, nu as u32];
+                        for (slot, v) in dims.iter().enumerate() {
+                            enc.set_bytes(3 + slot as u64, 4, v as *const u32 as *const _);
+                        }
+                        // uint3 is 16-byte sized/aligned in MSL constant space.
+                        let strides: [u32; 4] = [
+                            (a_stride / elem) as u32,
+                            (b_stride / elem) as u32,
+                            (c_stride / elem) as u32,
+                            0,
+                        ];
+                        enc.set_bytes(6, 16, strides.as_ptr() as *const _);
+                        enc.dispatch_thread_groups(
+                            crate::mtl::MTLSize {
+                                width: nu.div_ceil(32) as u64,
+                                height: mu.div_ceil(32) as u64,
+                                depth: b_ as u64,
+                            },
+                            crate::mtl::MTLSize {
+                                width: 512,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
                     } else {
                         // End any open compute encoder; MPS opens its own.
                         end_msl!();
@@ -3253,6 +3343,7 @@ impl MetalExecutable {
                     num_idx,
                     trailing,
                     dt,
+                    idx_dt,
                 } => {
                     let num_idx = scale(*num_idx);
                     if num_idx == 0 {
@@ -3274,6 +3365,7 @@ impl MetalExecutable {
                             num_idx,
                             *trailing,
                             *dt,
+                            *idx_dt,
                         );
                     }
                 }
@@ -3446,6 +3538,41 @@ impl MetalExecutable {
                         encode_copy(e!(), k, &self.arena.buffer, s, d, lanes as u32, dt);
                     }
                 }
+                Thunk::DynamicUpdateSlice {
+                    src,
+                    dst,
+                    start,
+                    start_kind,
+                    outer,
+                    extent,
+                    rows,
+                    row_bytes,
+                } => {
+                    let enc = e!();
+                    let pso = &k.dynamic_update_slice;
+                    enc.set_compute_pipeline_state(pso);
+                    enc.set_buffer(0, Some(&self.arena.buffer), 0);
+                    let offs = [*src as u64, *dst as u64, *start as u64];
+                    for (i, o) in offs.iter().enumerate() {
+                        enc.set_bytes(1 + i as u64, 8, o as *const u64 as *const _);
+                    }
+                    let p = [*outer, *extent, *rows, *row_bytes / 2, *start_kind];
+                    enc.set_bytes(4, 20, p.as_ptr() as *const _);
+                    let n = u64::from(*outer) * u64::from(*rows) * u64::from(*row_bytes / 2);
+                    let tg = pso.thread_execution_width().min(n.max(1));
+                    enc.dispatch_threads(
+                        crate::mtl::MTLSize {
+                            width: n,
+                            height: 1,
+                            depth: 1,
+                        },
+                        crate::mtl::MTLSize {
+                            width: tg,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
                 Thunk::AttentionBackwardAll {
                     q,
                     k: kk,
@@ -3548,6 +3675,14 @@ impl MetalExecutable {
                             *wrt,
                         );
                     } else {
+                        // The CPU reference reads Q/K/V/dY from the arena, so
+                        // the GPU work that wrote them must have run: without
+                        // this, a dY computed earlier in the same command
+                        // buffer read as zeros, and so did every gradient.
+                        end_msl!();
+                        cmd_buf.commit();
+                        cmd_buf.wait_until_completed();
+                        cmd_buf = dev.queue.new_command_buffer().to_owned();
                         let bhsd = *bhsd != 0;
                         let q_len = if bhsd {
                             b * nh * sq * dh
@@ -4752,6 +4887,7 @@ impl MetalExecutable {
                     );
                 }
                 Thunk::Softmax {
+                    src,
                     data,
                     rows,
                     cols,
@@ -4761,7 +4897,7 @@ impl MetalExecutable {
                     if rows == 0 {
                         continue;
                     }
-                    encode_softmax(e!(), k, &self.arena.buffer, *data, rows, *cols, *dt);
+                    encode_softmax(e!(), k, &self.arena.buffer, *src, *data, rows, *cols, *dt);
                 }
                 Thunk::SoftmaxCrossEntropyDense {
                     logits,
@@ -5171,6 +5307,43 @@ impl MetalExecutable {
                         *chan_dim,
                         inner,
                         *q_max,
+                    );
+                }
+                Thunk::DoubleSingle {
+                    op,
+                    plan,
+                    a,
+                    b,
+                    dst,
+                } => {
+                    let a = self.resolve_off(*a);
+                    let b = b.map(|b| self.resolve_off(b)).unwrap_or(a);
+                    encode_double_single(e!(), k, op, plan, a, b, self.resolve_off(*dst));
+                }
+                Thunk::RoundToFormat {
+                    src,
+                    amax,
+                    dst,
+                    n,
+                    last_dim,
+                    block,
+                    mode,
+                    format,
+                } => {
+                    if *n == 0 {
+                        continue;
+                    }
+                    encode_round_to_format(
+                        e!(),
+                        k,
+                        self.resolve_off(*src),
+                        amax.map(|a| self.resolve_off(a)),
+                        self.resolve_off(*dst),
+                        *n,
+                        *last_dim,
+                        *block,
+                        *mode,
+                        *format,
                     );
                 }
                 Thunk::FakeQuantizePerBatch {
@@ -5703,6 +5876,12 @@ impl MetalExecutable {
                                 );
                             }
                         } else {
+                            // Host kernel over the arena: the GPU work that
+                            // wrote its inputs must have run first.
+                            end_msl!();
+                            cmd_buf.commit();
+                            cmd_buf.wait_until_completed();
+                            cmd_buf = dev.queue.new_command_buffer().to_owned();
                             let arena_ptr = self.arena.buffer.contents() as *mut u8;
                             let in_views: Vec<(&[u8], &rlx_ir::Shape)> = inputs
                                 .iter()
@@ -7751,6 +7930,19 @@ impl MetalExecutable {
                         && k_u.is_multiple_of(256)
                         && matches!(scheme, rlx_ir::QuantScheme::GgufQ8_0)
                         && !rlx_ir::env::flag("RLX_METAL_Q8_0_GEMM_DISABLE");
+                    // Simdgroup-matrix Q8_0 GEMM: dequantizes each block once
+                    // per 64×64 tile. M4 Pro, k=3072 (ms, xs vs sg): m=32
+                    // 0.76/0.81, m=64 1.52/0.90, m=96 2.20/1.52, m=228
+                    // 5.94/2.82 — so it takes over from 48 rows, and above the
+                    // fused cap it replaces dequant-to-f32-scratch + MPS (a
+                    // full f32 copy of every matrix per call). Off-switch:
+                    // RLX_METAL_Q8_0_GEMM_SG_DISABLE.
+                    let use_q8_0_mm_sg = use_gpu_dequant
+                        && m_u >= 48
+                        && k_u.is_multiple_of(32)
+                        && matches!(scheme, rlx_ir::QuantScheme::GgufQ8_0)
+                        && !rlx_ir::env::flag("RLX_METAL_Q8_0_GEMM_DISABLE")
+                        && !rlx_ir::env::flag("RLX_METAL_Q8_0_GEMM_SG_DISABLE");
                     let use_fused_q5k_mm_xs = use_gpu_dequant
                         && m_u > 1
                         && m_u <= q4k_gemm_max_m
@@ -7819,6 +8011,16 @@ impl MetalExecutable {
                     // that. Without this the 27B re-materializes every weight
                     // to f32 per token: ~90% of decode on the thunk profile.
                     // Off-switch: RLX_METAL_PTQ1_0_FUSED_DISABLE=1.
+                    // Fused Fp8E4m3B128 decode GEMV (HF fp8 checkpoints). Decode
+                    // only; lockstep with `dequant_gguf_scratch_bytes`.
+                    let use_fused_fp8b128_mv = use_gpu_dequant
+                        && m_u == 1
+                        && k_u.is_multiple_of(128)
+                        && matches!(
+                            scheme,
+                            rlx_ir::QuantScheme::Fp8E4m3B128 | rlx_ir::QuantScheme::Fp8E5m2B128
+                        )
+                        && !rlx_ir::env::flag("RLX_METAL_FP8B128_FUSED_DISABLE");
                     let use_fused_ptq1_0_mv = use_gpu_dequant
                         && m_u == 1
                         && k_u.is_multiple_of(128)
@@ -7832,11 +8034,20 @@ impl MetalExecutable {
                     let needs_scratch = !(use_fused_q1_0_mv
                         || use_fused_q1_0_mm
                         || use_fused_g8_0_mv
-                        || use_fused_ptq1_0_mv);
+                        || use_fused_ptq1_0_mv
+                        || use_fused_fp8b128_mv);
                     if !use_gpu_dequant
                         || (needs_scratch && self.dequant_scratch_off == 0)
                         || !has_metal_dequant_kernel(*scheme)
                     {
+                        // The host kernel reads the weight out of the arena;
+                        // compile only externalizes weights whose every path
+                        // stays on the GPU (`metal_encoder_binds_weight_buffer`).
+                        assert!(
+                            !crate::thunk::is_weight_off(*w_q),
+                            "{scheme:?} weight lives in the weight buffer but this \
+                             DequantMatMul took the host path"
+                        );
                         deferred_host.push(DeferredHostOp::DequantMatMulGguf {
                             x: *x,
                             w_q: *w_q,
@@ -7876,6 +8087,22 @@ impl MetalExecutable {
                     } else if use_q8_0_mv_sg {
                         let enc = e!();
                         encode_q8_0_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
+                    } else if use_fused_fp8b128_mv {
+                        let (w_buf, w_raw) = self.resolve_off(*w_q);
+                        let enc = e!();
+                        let e5 = matches!(scheme, rlx_ir::QuantScheme::Fp8E5m2B128);
+                        encode_fp8b128_mv_f32_sg(
+                            enc,
+                            k,
+                            &self.arena.buffer,
+                            w_buf,
+                            *x,
+                            w_raw,
+                            *dst,
+                            k_u,
+                            n_u,
+                            e5,
+                        );
                     } else if use_q4_0_mv_sg {
                         let enc = e!();
                         encode_q4_0_mv_f32_sg(enc, k, &self.arena.buffer, *x, *w_q, *dst, k_u, n_u);
@@ -7920,6 +8147,19 @@ impl MetalExecutable {
                         encode_qk_mm_f32_xs(
                             enc,
                             &k.q4k_mm_f32_xs,
+                            &self.arena.buffer,
+                            *x,
+                            *w_q,
+                            *dst,
+                            m_u,
+                            k_u,
+                            n_u,
+                        );
+                    } else if use_q8_0_mm_sg {
+                        let enc = e!();
+                        encode_q8_0_mm_f32_sg(
+                            enc,
+                            k,
                             &self.arena.buffer,
                             *x,
                             *w_q,
@@ -8153,12 +8393,14 @@ impl MetalExecutable {
                             n_u,
                         );
                     } else {
+                        let (w_buf, w_raw) = self.resolve_off(*w_q);
                         let enc = e!();
                         encode_dequant_gguf(
                             enc,
                             k,
                             &self.arena.buffer,
-                            *w_q,
+                            w_buf,
+                            w_raw,
                             self.dequant_scratch_off,
                             *scheme,
                             k_u,
@@ -8673,8 +8915,12 @@ impl MetalExecutable {
                         // different order (~1e-5 per row), which a recurrence (e.g.
                         // qwen3.5 GDN delta-rule) then amplifies — this flag makes a
                         // batched forward bit-match sequential decode (slow; exact).
-                        let force_gemv =
-                            *m > 1 && rlx_ir::env::flag("RLX_METAL_DEQUANT_FORCE_GEMV");
+                        // A few rows (a speculative verify step's 2–4 tokens)
+                        // go the same way by default: the GEMM's tiles are
+                        // nearly empty there, and a Qwen3.5-0.8B Q8_0 verify
+                        // stage ran 2.5x faster per row through the GEMV.
+                        let force_gemv = *m > 1
+                            && (*m <= 4 || rlx_ir::env::flag("RLX_METAL_DEQUANT_FORCE_GEMV"));
                         if *m == 1 || force_gemv {
                             crate::prefill_stats::record_dequant_gemv();
                             if rlx_ir::env::flag("RLX_METAL_PREFILL_TRACE") {

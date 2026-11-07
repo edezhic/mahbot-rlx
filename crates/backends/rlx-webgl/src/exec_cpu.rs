@@ -6,7 +6,7 @@
 //! shaders mirror — it is unit-tested against RLX's own CPU autodiff/runtime,
 //! which verifies the planner + numerics without a browser.
 
-use crate::plan::{Act, Bin, Cmp, LeafSource, PAD, Plan, Red, Step};
+use crate::plan::{Act, Bin, Cmp, LeafSource, PAD, Plan, Red, ScatterRed, Step};
 use crate::{Result, WebglError};
 use std::collections::HashMap;
 
@@ -26,7 +26,65 @@ pub(crate) fn act_f(act: Act, x: f32) -> f32 {
         Act::Cos => x.cos(),
         Act::Silu => x / (1.0 + (-x).exp()),
         Act::Recip => 1.0 / x,
+        Act::Gelu => 0.5 * x * (1.0 + erf_as(x * std::f32::consts::FRAC_1_SQRT_2)),
+        Act::GeluApprox => 0.5 * x * (1.0 + gelu_tanh_arg(x).tanh()),
+        Act::Softplus => softplus(x),
+        Act::Tan => x.tan(),
+        Act::Atan => x.atan(),
+        Act::Round => x.round_ties_even(),
+        Act::Floor => x.floor(),
+        Act::Ceil => x.ceil(),
+        Act::Sign => sign0(x),
+        Act::Elu => {
+            if x > 0.0 {
+                x
+            } else {
+                x.exp() - 1.0
+            }
+        }
+        Act::Erf => erf_as(x),
+        Act::HardSwish => x * (x + 3.0).clamp(0.0, 6.0) / 6.0,
+        Act::HardSigmoid => (x / 6.0 + 0.5).clamp(0.0, 1.0),
+        Act::Mish => x * softplus(x).tanh(),
+        Act::Softsign => x / (1.0 + x.abs()),
+        Act::LogSigmoid => x.min(0.0) - (-x.abs()).exp().ln_1p(),
     }
+}
+
+fn softplus(x: f32) -> f32 {
+    x.max(0.0) + (-x.abs()).exp().ln_1p()
+}
+
+/// `sign` with `sign(0) = 0` (GLSL `sign`; Rust's `signum(0.0)` is 1).
+fn sign0(x: f32) -> f32 {
+    if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+/// `1` strictly inside `(lo, hi)`, else `0` — the derivative of a clamp.
+fn inside(v: f32, lo: f32, hi: f32) -> f32 {
+    if v > lo && v < hi { 1.0 } else { 0.0 }
+}
+
+/// `erf` by Abramowitz–Stegun 7.1.26 — the formula the GLSL uses.
+pub(crate) fn erf_as(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
+    let p = t
+        * (0.254_829_6
+            + t * (-0.284_496_74 + t * (1.421_413_8 + t * (-1.453_152_1 + t * 1.061_405_4))));
+    (1.0 - p * (-x * x).exp()).copysign(x)
+}
+
+const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+
+/// `√(2/π)·(x + 0.044715·x³)`, clamped so `tanh` stays finite in GLSL too.
+fn gelu_tanh_arg(x: f32) -> f32 {
+    (SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).clamp(-15.0, 15.0)
 }
 
 /// Pointwise activation derivative `f'(x)`. Mirrored exactly by the GLSL.
@@ -60,7 +118,91 @@ pub(crate) fn act_df(act: Act, x: f32) -> f32 {
             s + x * s * (1.0 - s)
         }
         Act::Recip => -1.0 / (x * x),
+        Act::Gelu => {
+            let pdf = (-0.5 * x * x).exp() * 0.398_942_3;
+            0.5 * (1.0 + erf_as(x * std::f32::consts::FRAC_1_SQRT_2)) + x * pdf
+        }
+        Act::GeluApprox => {
+            let t = gelu_tanh_arg(x).tanh();
+            0.5 * (1.0 + t)
+                + 0.5 * x * (1.0 - t * t) * SQRT_2_OVER_PI * (1.0 + 3.0 * 0.044_715 * x * x)
+        }
+        Act::Softplus => 1.0 / (1.0 + (-x).exp()),
+        Act::Tan => {
+            let c = x.cos();
+            1.0 / (c * c)
+        }
+        Act::Atan => 1.0 / (1.0 + x * x),
+        Act::Round => 1.0,
+        Act::Floor | Act::Ceil | Act::Sign => 0.0,
+        Act::Elu => {
+            if x > 0.0 {
+                1.0
+            } else {
+                x.exp()
+            }
+        }
+        Act::Erf => std::f32::consts::FRAC_2_SQRT_PI * (-x * x).exp(),
+        Act::HardSwish => ((x + 3.0).clamp(0.0, 6.0) + x * inside(x, -3.0, 3.0)) / 6.0,
+        Act::HardSigmoid => inside(x, -3.0, 3.0) / 6.0,
+        Act::Mish => {
+            let t = softplus(x).tanh();
+            t + x * (1.0 - t * t) / (1.0 + (-x).exp())
+        }
+        Act::Softsign => {
+            let d = 1.0 + x.abs();
+            1.0 / (d * d)
+        }
+        Act::LogSigmoid => 1.0 / (1.0 + x.exp()),
     }
+}
+
+/// A runtime index `f` (f32-encoded): rounded; with `wrap > 0` a negative one
+/// counts from the end and the result is clamped to `[0, wrap)`. Mirrored by
+/// the GLSL.
+fn wrap_index(f: f32, wrap: u32) -> i64 {
+    let mut ix = (f + 0.5).floor() as i64;
+    if wrap > 0 {
+        if ix < 0 {
+            ix += wrap as i64;
+        }
+        ix = ix.clamp(0, wrap as i64 - 1);
+    }
+    ix
+}
+
+/// Output lane `i` of one [`Step::FftStage`] pass. Mirrored by the GLSL.
+fn fft_stage_lane(
+    x: &[f32],
+    tw: &[f32],
+    i: usize,
+    n: usize,
+    ns: usize,
+    in_block: bool,
+    out_block: bool,
+) -> f32 {
+    let (row, l) = (i / (2 * n), i % (2 * n));
+    let (k, comp) = if out_block {
+        (l % n, l / n)
+    } else {
+        (l / 2, l % 2)
+    };
+    let lane = |e: usize, c: usize| row * 2 * n + if in_block { c * n + e } else { 2 * e + c };
+    let jm = k % ns;
+    let j = (k / (2 * ns)) * ns + jm;
+    let (ar, ai) = (x[lane(j, 0)], x[lane(j, 1)]);
+    let (br, bi) = (x[lane(j + n / 2, 0)], x[lane(j + n / 2, 1)]);
+    let (wr, wi) = (tw[2 * (ns - 1 + jm)], tw[2 * (ns - 1 + jm) + 1]);
+    let (tr, ti) = (br * wr - bi * wi, br * wi + bi * wr);
+    let s = if (k % (2 * ns)) < ns { 1.0 } else { -1.0 };
+    if comp == 0 { ar + s * tr } else { ai + s * ti }
+}
+
+/// A scatter's runtime index: rounded, a negative one `+ wrap` (no clamp — an
+/// out-of-range index lands nowhere). Mirrored by the GLSL.
+fn scatter_index(f: f32, wrap: u32) -> i64 {
+    let ix = (f + 0.5).floor() as i64;
+    if ix < 0 { ix + wrap as i64 } else { ix }
 }
 
 /// Execute `plan` with the given named inputs/params; returns one vector per
@@ -154,17 +296,29 @@ pub fn run_cpu(plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> 
                 }
                 vals[*out] = o;
             }
-            Step::MatMul { out, a, b, m, k, n } => {
-                let mut o = vec![0f32; m * n];
+            Step::MatMul {
+                out,
+                a,
+                b,
+                m,
+                k,
+                n,
+                batch,
+                b_batched,
+            } => {
+                let mut o = vec![0f32; batch * m * n];
                 {
                     let (av, bv) = (&vals[*a], &vals[*b]);
-                    for i in 0..*m {
-                        for j in 0..*n {
-                            let mut s = 0f32;
-                            for l in 0..*k {
-                                s += av[i * k + l] * bv[l * n + j];
+                    for bi in 0..*batch {
+                        let (ao, bo) = (bi * m * k, if *b_batched { bi * k * n } else { 0 });
+                        for i in 0..*m {
+                            for j in 0..*n {
+                                let mut s = 0f32;
+                                for l in 0..*k {
+                                    s += av[ao + i * k + l] * bv[bo + l * n + j];
+                                }
+                                o[bi * m * n + i * n + j] = s;
                             }
-                            o[i * n + j] = s;
                         }
                     }
                 }
@@ -324,12 +478,122 @@ pub fn run_cpu(plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> 
                 which,
                 base,
                 axis_stride,
+                wrap,
             } => {
                 let n = plan.slot_len[*out];
                 let mut o = vec![0f32; n];
                 for i in 0..n {
-                    let ix = vals[*indices][which[i] as usize].round() as usize;
-                    o[i] = vals[*table][base[i] as usize + ix * *axis_stride as usize];
+                    let ix = wrap_index(vals[*indices][which[i] as usize], *wrap);
+                    o[i] = vals[*table][base[i] as usize + ix as usize * *axis_stride as usize];
+                }
+                vals[*out] = o;
+            }
+            Step::ScatterRuntime {
+                out,
+                data,
+                updates,
+                indices,
+                ibase,
+                ubase,
+                key,
+                count,
+                istride,
+                ustride,
+                wrap,
+                red,
+            } => {
+                let n = plan.slot_len[*out];
+                let mut o = match data {
+                    Some(d) => vals[*d].clone(),
+                    None => vec![0f32; n],
+                };
+                for i in 0..n {
+                    if ibase[i] == PAD {
+                        continue;
+                    }
+                    for j in 0..*count {
+                        let ix = vals[*indices][ibase[i] as usize + j * istride];
+                        if scatter_index(ix, *wrap) == key[i] as i64 {
+                            let u = vals[*updates][ubase[i] as usize + j * ustride];
+                            o[i] = match red {
+                                ScatterRed::Replace => u,
+                                ScatterRed::Add => o[i] + u,
+                                ScatterRed::Mul => o[i] * u,
+                                ScatterRed::Max => o[i].max(u),
+                                ScatterRed::Min => o[i].min(u),
+                            };
+                        }
+                    }
+                }
+                vals[*out] = o;
+            }
+            Step::FftStage {
+                out,
+                src,
+                tw,
+                n,
+                ns,
+                in_block,
+                out_block,
+                scale,
+            } => {
+                let (x, w) = (&vals[*src], &vals[*tw]);
+                let mut o = vec![0f32; plan.slot_len[*out]];
+                for (i, ov) in o.iter_mut().enumerate() {
+                    *ov = fft_stage_lane(x, w, i, *n, *ns, *in_block, *out_block) * scale;
+                }
+                vals[*out] = o;
+            }
+            Step::Host { out, inputs, op } => {
+                let ins: Vec<&[f32]> = inputs.iter().map(|&i| vals[i].as_slice()).collect();
+                vals[*out] = op.run(&ins)?;
+            }
+            Step::Linalg {
+                out,
+                a,
+                b,
+                n,
+                nrhs,
+                batch,
+                op,
+            } => {
+                let r = crate::linalg::run(
+                    *op,
+                    &vals[*a],
+                    b.map(|b| vals[b].as_slice()),
+                    *n,
+                    *nrhs,
+                    *batch,
+                );
+                vals[*out] = r;
+            }
+            Step::SortAxis {
+                out,
+                src,
+                outer: _,
+                len,
+                inner,
+                k,
+                descending,
+                indices,
+            } => {
+                let n = plan.slot_len[*out];
+                let x = &vals[*src];
+                let mut o = vec![0f32; n];
+                for (i, ov) in o.iter_mut().enumerate() {
+                    let (row, p, ii) = (i / (k * inner), (i / inner) % k, i % inner);
+                    let at = |j: usize| x[(row * len + j) * inner + ii];
+                    // The element of rank `p`: `rank(j)` = how many sort before it.
+                    let before = |a: f32, ia: usize, v: f32, j: usize| {
+                        (if *descending { a > v } else { a < v }) || (a == v && ia < j)
+                    };
+                    for j in 0..*len {
+                        let v = at(j);
+                        if (0..*len).filter(|&q| before(at(q), q, v, j)).count() == p {
+                            *ov = if *indices { j as f32 } else { v };
+                            break;
+                        }
+                    }
                 }
                 vals[*out] = o;
             }
@@ -433,6 +697,262 @@ pub fn run_cpu(plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> 
                 let o = run_custom_collective(name, &vals[*input], plan.slot_len[*out], attrs)?;
                 vals[*out] = o;
             }
+            Step::Conv3d {
+                out,
+                x,
+                w,
+                bias,
+                n,
+                cin,
+                din,
+                cout,
+                dout,
+                k,
+                stride,
+                pad,
+                dil,
+                groups,
+                act,
+            } => {
+                let (xv, wv) = (&vals[*x], &vals[*w]);
+                let bv = bias.map(|b| &vals[b]);
+                let (cin_g, cout_g) = (cin / groups, cout / groups);
+                let in_vol = din[0] * din[1] * din[2];
+                let out_vol = dout[0] * dout[1] * dout[2];
+                let mut o = vec![0f32; plan.slot_len[*out]];
+                for (lin, slot) in o.iter_mut().enumerate().take(n * cout * out_vol) {
+                    // the GL shader's order, so the sums round alike
+                    let ow = lin % dout[2];
+                    let oh = lin / dout[2] % dout[1];
+                    let od = lin / (dout[2] * dout[1]) % dout[0];
+                    let co = lin / out_vol % cout;
+                    let ni = lin / (out_vol * cout);
+                    let g = co / cout_g;
+                    let mut s = bv.map_or(0.0, |b| b[co]);
+                    for ci in 0..cin_g {
+                        let x_base = (ni * cin + g * cin_g + ci) * in_vol;
+                        let w_base = (co * cin_g + ci) * k[0] * k[1] * k[2];
+                        for kd in 0..k[0] {
+                            let Some(id) = (od * stride[0] + kd * dil[0])
+                                .checked_sub(pad[0])
+                                .filter(|&v| v < din[0])
+                            else {
+                                continue;
+                            };
+                            for kh in 0..k[1] {
+                                let Some(ih) = (oh * stride[1] + kh * dil[1])
+                                    .checked_sub(pad[1])
+                                    .filter(|&v| v < din[1])
+                                else {
+                                    continue;
+                                };
+                                for kw in 0..k[2] {
+                                    let Some(iw) = (ow * stride[2] + kw * dil[2])
+                                        .checked_sub(pad[2])
+                                        .filter(|&v| v < din[2])
+                                    else {
+                                        continue;
+                                    };
+                                    s += xv[x_base + (id * din[1] + ih) * din[2] + iw]
+                                        * wv[w_base + (kd * k[1] + kh) * k[2] + kw];
+                                }
+                            }
+                        }
+                    }
+                    *slot = act.map_or(s, |a| act_f(a, s));
+                }
+                vals[*out] = o;
+            }
+            Step::ArgAxis {
+                out,
+                src,
+                outer,
+                len,
+                inner,
+                is_max,
+            } => {
+                let sv = &vals[*src];
+                let mut o = vec![0f32; plan.slot_len[*out]];
+                for (oi, slot) in o.iter_mut().enumerate().take(outer * inner) {
+                    let (a, i) = (oi / inner, oi % inner);
+                    let base = a * len * inner + i;
+                    let (mut best, mut at) = (sv[base], 0);
+                    for j in 1..*len {
+                        let v = sv[base + j * inner];
+                        if (*is_max && v > best) || (!*is_max && v < best) {
+                            (best, at) = (v, j);
+                        }
+                    }
+                    *slot = at as f32;
+                }
+                vals[*out] = o;
+            }
+            Step::Conv1ArgMax {
+                out,
+                x,
+                w,
+                bias,
+                n,
+                cin,
+                cout,
+                spatial,
+            } => {
+                let (xv, wv) = (&vals[*x], &vals[*w]);
+                let bv = bias.map(|b| &vals[b]);
+                let mut o = vec![0f32; plan.slot_len[*out]];
+                for (oi, slot) in o.iter_mut().enumerate().take(n * spatial) {
+                    let (ni, p) = (oi / spatial, oi % spatial);
+                    let (mut best, mut at) = (f32::NEG_INFINITY, 0);
+                    for co in 0..*cout {
+                        let mut s = bv.map_or(0.0, |b| b[co]);
+                        for ci in 0..*cin {
+                            s += xv[(ni * cin + ci) * spatial + p] * wv[co * cin + ci];
+                        }
+                        if co == 0 || s > best {
+                            (best, at) = (s, co);
+                        }
+                    }
+                    *slot = at as f32;
+                }
+                vals[*out] = o;
+            }
+            Step::GroupNorm {
+                out,
+                x,
+                gamma,
+                beta,
+                n,
+                c,
+                groups,
+                spatial,
+                eps,
+                act,
+            } => {
+                let (xv, gv, bv) = (&vals[*x], &vals[*gamma], &vals[*beta]);
+                let run = c / groups * spatial;
+                let mut o = vec![0f32; plan.slot_len[*out]];
+                for ng in 0..n * groups {
+                    let seg = &xv[ng * run..(ng + 1) * run];
+                    let mean = seg.iter().map(|&v| v as f64).sum::<f64>() / run as f64;
+                    let var =
+                        seg.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / run as f64;
+                    let inv = 1.0 / (var + *eps as f64).sqrt();
+                    for (j, &v) in seg.iter().enumerate() {
+                        let ch = (ng % groups) * (c / groups) + j / spatial;
+                        let y = ((v as f64 - mean) * inv) as f32 * gv[ch] + bv[ch];
+                        o[ng * run + j] = act.map_or(y, |a| act_f(a, y));
+                    }
+                }
+                vals[*out] = o;
+            }
+            Step::Broadcast {
+                out,
+                src,
+                out_dims,
+                in_strides,
+            } => {
+                let sv = &vals[*src];
+                let n: usize = out_dims.iter().product();
+                let mut o = vec![0f32; plan.slot_len[*out]];
+                for (lin, slot) in o.iter_mut().enumerate().take(n) {
+                    let (mut rest, mut at) = (lin, 0);
+                    for k in (0..out_dims.len()).rev() {
+                        at += rest % out_dims[k] * in_strides[k];
+                        rest /= out_dims[k];
+                    }
+                    *slot = sv[at];
+                }
+                vals[*out] = o;
+            }
+            Step::Splat { out, src } => {
+                vals[*out] = vec![vals[*src][0]; plan.slot_len[*out]];
+            }
+            Step::Copy { out, src } => {
+                let mut o = vals[*src].clone();
+                o.resize(plan.slot_len[*out], 0.0);
+                vals[*out] = o;
+            }
+            Step::Concat {
+                out,
+                a,
+                b,
+                outer,
+                a_len,
+                b_len,
+            } => {
+                let mut o = Vec::with_capacity(plan.slot_len[*out]);
+                for r in 0..*outer {
+                    o.extend_from_slice(&vals[*a][r * a_len..(r + 1) * a_len]);
+                    o.extend_from_slice(&vals[*b][r * b_len..(r + 1) * b_len]);
+                }
+                o.resize(plan.slot_len[*out], 0.0);
+                vals[*out] = o;
+            }
+            Step::Pool3d {
+                out,
+                src,
+                nc,
+                din,
+                dout,
+                k,
+                stride,
+                pad,
+                is_max,
+            } => {
+                let sv = &vals[*src];
+                let (iv, ov) = (din[0] * din[1] * din[2], dout[0] * dout[1] * dout[2]);
+                let mut o = vec![0f32; plan.slot_len[*out]];
+                for (lin, slot) in o.iter_mut().enumerate().take(nc * ov) {
+                    let (c, q) = (lin / ov, lin % ov);
+                    let at = [q / (dout[1] * dout[2]), q / dout[2] % dout[1], q % dout[2]];
+                    let mut acc = if *is_max { f32::NEG_INFINITY } else { 0.0 };
+                    for kd in 0..k[0] {
+                        for kh in 0..k[1] {
+                            for kw in 0..k[2] {
+                                let pos = [
+                                    at[0] * stride[0] + kd,
+                                    at[1] * stride[1] + kh,
+                                    at[2] * stride[2] + kw,
+                                ];
+                                let Some(p) = (0..3)
+                                    .map(|a| pos[a].checked_sub(pad[a]).filter(|&v| v < din[a]))
+                                    .collect::<Option<Vec<_>>>()
+                                else {
+                                    continue;
+                                };
+                                let v = sv[c * iv + (p[0] * din[1] + p[1]) * din[2] + p[2]];
+                                acc = if *is_max { acc.max(v) } else { acc + v };
+                            }
+                        }
+                    }
+                    // an average divides by the whole window, padding
+                    // included, as rlx-cpu does
+                    *slot = if *is_max {
+                        acc
+                    } else {
+                        acc / (k[0] * k[1] * k[2]) as f32
+                    };
+                }
+                vals[*out] = o;
+            }
+            Step::Resize3d {
+                out,
+                src,
+                nc,
+                din,
+                dout,
+            } => {
+                let sv = &vals[*src];
+                let (iv, ov) = (din[0] * din[1] * din[2], dout[0] * dout[1] * dout[2]);
+                let mut o = vec![0f32; plan.slot_len[*out]];
+                for (lin, slot) in o.iter_mut().enumerate().take(nc * ov) {
+                    let (c, q) = (lin / ov, lin % ov);
+                    let at = [q / (dout[1] * dout[2]), q / dout[2] % dout[1], q % dout[2]];
+                    let p = [0, 1, 2].map(|a| (at[a] * din[a] / dout[a]).min(din[a] - 1));
+                    *slot = sv[c * iv + (p[0] * din[1] + p[1]) * din[2] + p[2]];
+                }
+                vals[*out] = o;
+            }
         }
     }
 
@@ -451,7 +971,7 @@ pub fn run_cpu(plan: &Plan, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>> 
 /// `NetTransport`) is built on `std::net` TCP sockets, which do not exist on
 /// wasm32/browser — so on wasm this returns a clear error instead of pretending
 /// to run a collective. See the module docs.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn run_custom_collective(
     name: &str,
     input: &[f32],
@@ -474,7 +994,7 @@ fn run_custom_collective(
 
 /// On wasm there is no TCP transport for the process group, so collectives
 /// cannot run. Report that plainly rather than fabricating a result.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 fn run_custom_collective(
     name: &str,
     _input: &[f32],
@@ -490,14 +1010,14 @@ fn run_custom_collective(
 
 /// Reinterpret an `f32` slice as bytes (little-endian, native layout). The host
 /// helper reads it back through the same `f32`-alignment contract.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn bytemuck_cast(s: &[f32]) -> &[u8] {
     // SAFETY: `f32` has no invalid bit patterns; `[f32]` → `[u8]` is a valid
     // reinterpret and the resulting slice covers exactly `len * 4` bytes.
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 fn bytemuck_cast_mut(s: &mut [f32]) -> &mut [u8] {
     let len = std::mem::size_of_val(s);
     // SAFETY: as above; mutable reinterpret of `[f32]` → `[u8]`.
@@ -533,6 +1053,7 @@ mod tests {
             slot_dims: vec![(1, 3); 3],
             slot_len: vec![3; 3],
             outputs: vec![2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(&plan, &[("a", &[1.0, 5.0, 3.0]), ("b", &[2.0, 2.0, 2.0])]).unwrap();
         assert_eq!(out[0], vec![1.0, 0.0, 0.0]);
@@ -564,6 +1085,7 @@ mod tests {
             slot_dims: vec![(1, 3); 4],
             slot_len: vec![3; 4],
             outputs: vec![3],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(
             &plan,
@@ -608,6 +1130,7 @@ mod tests {
             slot_dims: vec![(1, 4); 3],
             slot_len: vec![4; 3],
             outputs: vec![2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(
             &plan,
@@ -643,6 +1166,7 @@ mod tests {
             slot_dims: vec![(1, 4), (1, 2), (1, 4)],
             slot_len: vec![4, 2, 4],
             outputs: vec![2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(&plan, &[("a", &[1.0, 2.0, 3.0, 4.0]), ("b", &[10.0, 20.0])]).unwrap();
         assert_eq!(out[0], vec![11.0, 22.0, 13.0, 24.0]);
@@ -674,6 +1198,7 @@ mod tests {
             slot_dims: vec![(1, 2); 3],
             slot_len: vec![2; 3],
             outputs: vec![2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(&plan, &[("a", &[1.0, 2.0]), ("b", &[3.0, 4.0])]).unwrap();
         assert!((out[0][0] - 0.44).abs() < 1e-6 && (out[0][1] - 0.08).abs() < 1e-6);
@@ -704,6 +1229,7 @@ mod tests {
             slot_dims: vec![(1, 3), (1, 6), (1, 3)],
             slot_len: vec![3, 6, 3],
             outputs: vec![1, 2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(&plan, &[("x", &[1.0, 2.0, 3.0])]).unwrap();
         assert_eq!(out[0], vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0]);
@@ -735,6 +1261,7 @@ mod tests {
             slot_dims: vec![(1, 4), (1, 8), (1, 4)],
             slot_len: vec![4, 8, 4],
             outputs: vec![1, 2],
+            slot_origin: Vec::new(),
         };
         let out = run_cpu(&plan, &[("z", &[1.0, 2.0, 3.0, 4.0])]).unwrap();
         assert_eq!(out[0], vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0]);
@@ -747,7 +1274,7 @@ mod tests {
     // kernel needs no process group, so this exercises the full wiring
     // (build_plan → Step::Custom → host delegate → registered kernel) without a
     // network. This path is native-only: on wasm there is no TCP transport.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn collective_copy_to_parallel_host_delegate() {
         use crate::build_plan;

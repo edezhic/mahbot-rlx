@@ -15,6 +15,7 @@
 
 use crate::infer::GraphExt as _;
 use crate::op::Activation;
+use crate::prelude::*;
 use crate::{DType, Graph, NodeId, fft::FftNorm};
 
 /// Analysis window applied to each frame before the FFT.
@@ -30,9 +31,18 @@ pub enum WindowKind {
     Blackman,
 }
 
+/// `cos` for window coefficients: rlx-libm's reference under `parity` (std's
+/// is musl on wasm, so a browser would bake different windows).
+fn cosf(x: f32) -> f32 {
+    #[cfg(feature = "parity")]
+    return rlx_libm::reference::sincosf(x).1;
+    #[cfg(not(feature = "parity"))]
+    x.cos()
+}
+
 impl WindowKind {
     fn coeffs(self, n: usize) -> Vec<f32> {
-        use std::f32::consts::PI;
+        use core::f32::consts::PI;
         if n == 1 {
             return vec![1.0];
         }
@@ -42,10 +52,10 @@ impl WindowKind {
                 let t = i as f32 / d;
                 match self {
                     WindowKind::Rectangular => 1.0,
-                    WindowKind::Hann => 0.5 - 0.5 * (2.0 * PI * t).cos(),
-                    WindowKind::Hamming => 0.54 - 0.46 * (2.0 * PI * t).cos(),
+                    WindowKind::Hann => 0.5 - 0.5 * cosf(2.0 * PI * t),
+                    WindowKind::Hamming => 0.54 - 0.46 * cosf(2.0 * PI * t),
                     WindowKind::Blackman => {
-                        0.42 - 0.5 * (2.0 * PI * t).cos() + 0.08 * (4.0 * PI * t).cos()
+                        0.42 - 0.5 * cosf(2.0 * PI * t) + 0.08 * cosf(4.0 * PI * t)
                     }
                 }
             })
@@ -163,7 +173,10 @@ impl Graph {
     ) -> NodeId {
         let bp = self.band_power(x, sample_rate, bands);
         // 2πe
-        let c = self.constant(2.0 * std::f64::consts::PI * std::f64::consts::E, DType::F32);
+        let c = self.constant(
+            2.0 * core::f64::consts::PI * core::f64::consts::E,
+            DType::F32,
+        );
         let scaled = self.mul(bp, c);
         let logv = self.log_eps(scaled, 1e-8);
         let half = self.constant(0.5, DType::F32);

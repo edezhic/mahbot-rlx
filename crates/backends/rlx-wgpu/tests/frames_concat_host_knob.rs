@@ -63,8 +63,13 @@ fn the_concat_host_knob_stands_the_fold_down() {
     );
     assert_eq!(
         census.get("narrow"),
+        None,
+        "the per-frame narrows are zero-copy views and cost no step; census {census:?}"
+    );
+    assert_eq!(
+        census.get("concat"),
         Some(&n_frames),
-        "the per-frame steps must be the ones left; census {census:?}"
+        "the per-frame concat steps must be the ones left; census {census:?}"
     );
     // The lever only takes the concat off its direct window path: on this adapter it
     // comes back as a device concat staged through scratch, so what replaces the

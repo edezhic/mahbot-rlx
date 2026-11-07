@@ -343,7 +343,21 @@ pub(crate) struct AttentionGeometry {
 /// `RLX_WGPU_ATTN_DENSE_ONE_ROW` lowers the floor to one query row: the fused
 /// walk is the step's own form there, so the arm prices that form against the
 /// decomposed arrangement (the same numbers, another summation order).
+/// `RLX_WGPU_NO_ATTN_DECOMPOSE` is the other bisect: every step keeps its fused
+/// one-row-per-workgroup walk, which is how the many-row arrangement is priced
+/// against it at a shape either one can serve.
+///
+/// That pricing, at the ASR encoder's geometry (24 blocks, 16 heads, 10 query
+/// rows, `head_dim` 64): forcing the fused walk builds 518 steps instead of 614
+/// and runs the encoder **11 % slower** — 20.86 ms against 18.77 ms, median of
+/// nine warm passes — because the many-row arrangement puts the 10×10 score
+/// multiplies on the tiled matmul kernel, where the fused walk's 160 scalar
+/// workgroups each walk the whole key sequence alone. So the many-row form is
+/// what this shape takes, and the fused walk stays as the form below the floor.
 pub(crate) fn decompose_attention(g: &AttentionGeometry) -> bool {
+    if rlx_ir::env::flag("RLX_WGPU_NO_ATTN_DECOMPOSE") {
+        return false;
+    }
     let min_q = if rlx_ir::env::flag("RLX_WGPU_ATTN_DENSE_ONE_ROW") {
         1
     } else {

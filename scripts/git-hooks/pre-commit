@@ -10,6 +10,15 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
+# The two layers this fork re-applies on every upstream sync — the package rename
+# and the narrow test contour — are checked whenever a manifest or one of the
+# layer scripts is staged (see `docs/fork-sync.md` §2/§3). Cheap, and it is the
+# only thing that notices a sync that forgot to re-apply them.
+if git diff --cached --name-only | grep -qE '(^|/)Cargo\.toml$|^scripts/fork-'; then
+  python3 scripts/fork-rename.py --check
+  python3 scripts/fork-test-gating.py --check
+fi
+
 STAGED="$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.rs$' || true)"
 if [[ -z "$STAGED" ]]; then
   exit 0
@@ -21,6 +30,9 @@ while IFS= read -r f; do
   case "$f" in
     */vendor/*|crates/backends/rlx-mlx-sys/vendor/*) continue ;;
     crates/bindings/rlx-web/*|crates/backends/rlx-webgl/*) continue ;;
+    # Excluded from the workspace, so `cargo -p pyrlx` would not resolve; its
+    # sources stay in the tree for the next sync and nothing builds them.
+    crates/bindings/pyrlx/*) continue ;;
   esac
   FILES+=("$f")
 done <<<"$STAGED"
@@ -65,16 +77,16 @@ done <<<"$RESOLVED"
 ROOT_PKG_LIST="$(printf '%s' "$ROOT_PKGS" | sed '/^$/d')"
 ROOT_PKG_COUNT="$(printf '%s\n' "$ROOT_PKG_LIST" | grep -c . || true)"
 
-echo "[pre-commit] clippy -D warnings (${ROOT_PKG_LIST:-whole workspace})"
+echo "[pre-commit] clippy -D warnings (${ROOT_PKG_LIST:-whole contour})"
 # `backend-tests` is what builds the gated test targets (see the `test` recipe
 # in the root Justfile). cargo accepts the flag only when a selected package
 # declares it, so derive those package names from the manifests — a hand-kept
 # list would silently stop linting newly gated targets. The names come from each
 # manifest's own `[package] name`, not its directory: the two need not match.
-# The workspace-wide branches below pass the flag unconditionally, since the
-# virtual workspace root accepts it — and they name `--workspace`, because the
-# default selection is this fork's contour (`default-members` in Cargo.toml),
-# not the whole set: this hook lints what `just lint` lints.
+# The branches below pass the flag unconditionally, since naming no package makes
+# the virtual workspace root the selection and it accepts the flag. They name no
+# package, because the default selection is this fork's contour (`default-members`
+# in Cargo.toml) and not the whole set: this hook lints what `just lint` lints.
 GATED="$(
   git ls-files -- '*Cargo.toml' | while IFS= read -r m; do
     grep -qE 'required-features *=.*backend-tests' "$m" || continue
@@ -83,13 +95,16 @@ GATED="$(
 )"
 
 if [[ "$ROOT_PKG_COUNT" -eq 0 ]]; then
-  # Lint the whole workspace only when nothing mapped to a package at all; if all
+  # Lint the whole contour only when nothing mapped to a package at all; if all
   # staged Rust lives in nested workspaces there is nothing to lint here.
   if [[ -z "$NESTED_PKGS" ]]; then
-    cargo clippy --workspace --all-targets --features backend-tests -- -D warnings
+    cargo clippy --all-targets --features backend-tests -- -D warnings
   fi
 elif [[ "$ROOT_PKG_COUNT" -gt 12 ]]; then
-  cargo clippy --workspace --all-targets --features backend-tests -- -D warnings
+  # Many packages: still the default contour, not `--workspace` — naming no
+  # package is exactly what `just lint` does, and the twenty-one upstream members
+  # this fork does not build stay out of the routine loop.
+  cargo clippy --all-targets --features backend-tests -- -D warnings
 else
   ARGS=()
   FEAT=""

@@ -4,6 +4,9 @@
 // Packed AdaLayerNorm backward: out = [dx ∥ dscale ∥ dshift] (1-D floats).
 // Launch: grid=(mod_rows,1,1), block=(256,1,1).
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 struct Params {
     mod_rows: u32,
     seq_per_mod: u32,
@@ -36,7 +39,12 @@ fn wg_sum(tid: u32, val: f32, bsz: u32) -> f32 {
         workgroupBarrier();
         stride = stride >> 1u;
     }
-    return partial_sum[0];
+    let total = partial_sum[0];
+    // Called back-to-back: without this barrier the next call's write of
+    // `partial_sum[0]` races the other lanes' read of this total (same defect
+    // as layer_norm_backward.wgsl's `workgroup_sum`).
+    workgroupBarrier();
+    return total;
 }
 
 @compute @workgroup_size(256)
@@ -52,7 +60,7 @@ fn ada_layer_norm_backward(
     let nx = params.mod_rows * params.seq_per_mod * inner;
     let mod_len = params.mod_rows * inner;
     let mod_base = m * inner;
-    let n_inv = 1.0 / f32(inner);
+    let n_inv = rlx_div_rn(1.0, f32(inner));
     let eps = bitcast<f32>(params.eps_bits);
     let do_ln = params.layer_norm != 0u;
 
@@ -102,9 +110,9 @@ fn ada_layer_norm_backward(
                 i += bsz;
             }
             let sum_sq = wg_sum(tid, local_sq, bsz);
-            inv = inverseSqrt(sum_sq * n_inv + eps);
+            inv = rlx_rsqrt_rn(sum_sq * n_inv + eps);
         } else {
-            inv = inverseSqrt(sum_x2 * n_inv + eps);
+            inv = rlx_rsqrt_rn(sum_x2 * n_inv + eps);
         }
 
         var local_sy: f32 = 0.0;
@@ -147,3 +155,4 @@ fn ada_layer_norm_backward(
         workgroupBarrier();
     }
 }
+

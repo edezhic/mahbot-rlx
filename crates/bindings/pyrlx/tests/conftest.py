@@ -1,16 +1,15 @@
 # RLX — versatile ML compiler + runtime.
 # Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""Ensure tests import the maturin package under ``python/``, not the repo
-directory namespace at ``pyrlx/`` (which has no ``Graph`` binding)."""
+"""This fork does not build the Python binding.
 
-from __future__ import annotations
+``crates/bindings/pyrlx`` is excluded from the workspace (see `exclude` in the
+root `Cargo.toml`), so nothing here produces an extension and every module in
+this directory fails at collection on `import pyrlx`. They stay on disk so the
+next upstream sync merges against them rather than over a hole;
+`binding_not_built_test.py` is what runs instead, and it asserts the exclusion
+itself rather than a binding that does not exist.
+"""
 
-import sys
-from pathlib import Path
+collect_ignore_glob = ["test_*.py"]
 
-_PYTHON_PKG_ROOT = Path(__file__).resolve().parents[1] / "python"
-if _PYTHON_PKG_ROOT.is_dir():
-    root = str(_PYTHON_PKG_ROOT)
-    if root not in sys.path:
-        sys.path.insert(0, root)

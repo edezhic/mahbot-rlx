@@ -37,3 +37,8 @@ rlx-cpu = { package = "mahbot-rlx-cpu", path = "../rlx-cpu", features = ["portab
 
 [profile.release]
 debug = 1
+
+# The `libm` naga and num-traits depend on, answered by rlx-libm (as in the
+# main workspace): no musl copy in the build.
+[patch.crates-io]
+libm = { path = "../../numerics/libm-shim" }

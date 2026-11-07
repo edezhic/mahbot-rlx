@@ -193,6 +193,8 @@ pub const SUPPORTED_OPS: &[OpKind] = &[
     OpKind::ScaledDequantize,
     // Native FakeQuantize Fixed/PerBatch; EMA + LSQ/Backward stay HostOp.
     OpKind::FakeQuantize,
+    OpKind::RoundToFormat,
+    OpKind::DoubleSingle,
     OpKind::FakeQuantizeBackward,
     OpKind::FakeQuantizeLSQ,
     OpKind::FakeQuantizeLSQBackwardX,

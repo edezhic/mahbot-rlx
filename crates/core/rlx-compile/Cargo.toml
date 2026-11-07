@@ -68,3 +68,8 @@ required-features = ["backend-tests"]
 [[test]]
 name = "plan_check_real_graphs"
 required-features = ["backend-tests"]
+
+[[test]]
+name = "dequant_input_pin"
+required-features = ["backend-tests"]
+

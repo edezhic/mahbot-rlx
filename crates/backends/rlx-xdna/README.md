@@ -45,18 +45,29 @@ A Linux host with the `amdxdna` driver (Ryzen AI), plus two userspace toolchains
 2. The native **MLIR-AIE** compiler (`aiecc`) + **Peano** (`llvm-aie`) — used to
    compile op overlays on demand (no Python).
 
+The user also needs read/write on `/dev/accel/accelN` (the `render` group) and
+a locked-memory limit large enough for XRT's buffers (the distro default 8 MiB
+fails with `EAGAIN`; e.g. `@render - memlock unlimited` in
+`/etc/security/limits.d/`). `rlx_xdna::diagnostic()` reports each of these;
+`host_blockers()` lists just the blocking ones (an XDNA 2 part, an unwritable
+device node), and `aie_geometry()` reads the array's columns, rows and AIE
+version from the driver.
+
 Point the env at them:
 
 ```sh
 export XILINX_XRT=…/xrt LD_LIBRARY_PATH=$XILINX_XRT/lib:$LD_LIBRARY_PATH
 
-# rlx's OWN C-ABI shim over XRT's C++ API — build it once. This is *not*
+# rlx's OWN C-ABI shim over XRT's C++ API. Leave RLX_XDNA_SHIM unset and rlx
+# builds it on first use (`$CXX`/`c++` against the detected XRT; needs the XRT
+# headers, e.g. `libxrt-dev`) into ~/.cache/rlx-xdna. To build it yourself — or
+# with RLX_XDNA_NO_SHIM_BUILD=1 — point RLX_XDNA_SHIM at it. This is *not*
 # XRT's libxrt_driver_xdna.so; pointing RLX_XDNA_SHIM at that dlopens fine and
 # then fails with `undefined symbol: rlx_xdna_io_open`.
-g++ -O2 -fPIC -shared -std=c++17 -I$XILINX_XRT/include \
-    -o librlx_xdna_shim.so crates/backends/rlx-xdna/csrc/xrt_gemm_shim.cpp \
-    -L$XILINX_XRT/lib -Wl,-rpath,$XILINX_XRT/lib -lxrt_coreutil
-export RLX_XDNA_SHIM=$PWD/librlx_xdna_shim.so
+#   g++ -O2 -fPIC -shared -std=c++17 -I$XILINX_XRT/include \
+#       -o librlx_xdna_shim.so crates/backends/rlx-xdna/csrc/xrt_gemm_shim.cpp \
+#       -L$XILINX_XRT/lib -Wl,-rpath,$XILINX_XRT/lib -lxrt_coreutil
+#   export RLX_XDNA_SHIM=$PWD/librlx_xdna_shim.so
 
 # `aiecc` must be the NATIVE ELF (~212 MB), not the `aiecc.py` wrapper. A pip
 # `mlir_aie` install puts it at <site-packages>/mlir_aie/bin/aiecc, and Peano at
@@ -66,6 +77,12 @@ export AIECC=…/mlir_aie/bin/aiecc PEANO=…/llvm-aie
 # since bin/aiecc there isn't at <mlir_aie>/bin:
 export RLX_XDNA_AIE_INCLUDE=…/site-packages/mlir_aie/include
 ```
+
+The AIE dialect syntax changed in mlir-aie 1.4.0 (`aie.dma_bd` keyword form)
+and 1.4.3 (`!aie.objectfifosubview` removed). rlx reads the installed version
+from the wheel's `mlir_aie-*.dist-info` and rewrites its emitted MLIR to match;
+a source build without dist-info is inferred from the `aiecc` CLI. Override
+with `RLX_XDNA_AIE_DIALECT=<version>` (e.g. `1.3`, `1.4.4`).
 
 Sanity-check the two bundled parity suites (each result is compared to the CPU
 backend and prints `all NPU graph ops match CPU ✓`):
@@ -145,16 +162,67 @@ over 40 steps, gradient computed on the NPU).
   weights are pre-tiled + cached in `set_param`, dynamic weights (backward) re-tiled
   per run.
 - **Elementwise tiles** stream in chunks ≤ 2048 elems (64 KB tile memory).
+- **Where the time goes** (xdna-npu-toolkit's profiling on the same Phoenix
+  NPU): once buffers are pooled, a GEMM dispatch is ~99% NPU compute, so fusing
+  ops into one overlay recovers only ~3–12%. Kernel efficiency (tile shape,
+  MMUL utilization) is the bigger lever.
+- **Versus the CPU:** same-precision CPU bf16 beat that NPU by 1.9–2.7× on
+  transformer models, so `Device::Xdna` sits *after* `Cpu` in the automatic
+  device order — choose it explicitly for power/offload, not throughput.
 
 ## Limitations
 
 - **INT8/BF16 only for matmul** — no native f32 datapath, so f32 GEMMs are
   quantized (cosine ≈ 0.99). Everything else runs in scalar f32 and is bit-exact.
-- **Reduce is last-axis only.** Use `keep_dim: true` so a scalar loss/reduce stays
-  rank-1 — a **rank-0** tensor has no last axis and the kernels reject it.
-- **Chains** are limited by the NPU's concurrent hardware-context count (~5–6): a
-  deep graph runs through a bounded LRU pool of contexts (`RLX_XDNA_CHAIN_CAP`,
-  default 4), re-opening evicted contexts from cache.
+  `Session::new_with_precision(Device::Xdna, Precision::BF16)` instead runs
+  matmuls through the vendor `bf16_f32` microkernel (operands rounded to bf16,
+  f32 accumulation, 32×32 tiles) — closer to f32, half the int8 MAC rate.
+  **Not yet validated on hardware** (only host-side packing is tested).
+- **mlir-aie versions:** the matmul kernel is read from `aie_kernels/aie2/mm.cc`
+  (≤ v1.4.3) or `aie_kernels/linalg/mm.cc` (v1.4.4+, where `zero_*` is
+  supplied by rlx since the vendor moved it to a separate `zero.cc`).
+- **Host steps.** Inside a compiled XDNA graph, a node the NPU kernels do
+  not cover runs on the host (rlx's CPU backend, bit-exact with `Device::Cpu`)
+  instead of failing the graph. That includes:
+  - a data-movement op larger than one AIE tile's memory (the copy kernels
+    stage the whole tensor in a 64 KB tile; on this shared-memory APU a host
+    copy is also faster than a DMA round trip);
+  - a configuration the kernels do not implement (a reduce over a non-last
+    axis, a batched matmul with a batched weight, a multi-axis tile, expand or
+    reverse);
+  - a kernel aiecc cannot place in tile memory.
+
+  Each op kind that falls back prints one `[rlx-xdna] … runs on the host`
+  line saying why. `RLX_XDNA_STRICT=1` turns that back into a hard error.
+  Binary ops with a broadcast operand stay on the NPU: the operand is
+  broadcast on the host and the kernel runs at full size. A matmul
+  `[..., m, k] · [k, n]` folds its leading axes into `m`.
+- **Conv** lowers to `Im2Col` (host) + NPU GEMM in `rlx-compile`'s rewrite
+  (`LowerConvIm2col`). A depthwise conv (one input channel per group) becomes
+  im2col, multiply and sum; other groups become a batched product.
+- **Chains** are limited by the NPU's AIE columns (4 on Phoenix / Hawk Point).
+  A deep graph runs through a bounded LRU pool of contexts
+  (`RLX_XDNA_CHAIN_CAP`, default = the budget), re-opening evicted contexts
+  from cache. The budget (`RLX_XDNA_MAX_CONTEXTS`, default 4) is
+  process-wide. A chain that needs a context closes its own idle ones first,
+  then another compiled graph's (a training loop holds a forward graph and a
+  gradient graph). A context the driver refuses, because a multi-column GEMM
+  holds the columns, is retried after one more is closed.
+- **Failed dispatches.** Every NPU command wait is bounded
+  (`RLX_XDNA_WAIT_MS`, default 10 000; `0` = forever): an overrun is aborted
+  and the call fails instead of blocking in the driver. A failed step is
+  retried once on a fresh context, then runs on the host for the rest of the
+  graph's life. The usual cause is runtime suspend: the NPU suspends after
+  5 s idle (`power/control = auto`, e.g. during a stretch of host steps), and
+  on resume the driver restarts every context; that restart can fail
+  (`aie2_hwctx_restart: Config cu failed` in the kernel log), leaving the
+  context dead. `echo on | sudo tee /sys/bus/pci/devices/<npu>/power/control`
+  keeps the NPU awake for long jobs.
+- **Overlay cache.** A finished matmul overlay build (`/tmp/rlx_xdna_mk_*`,
+  marked `built`) is reused, so an evicted context re-opens from the cached
+  `k.xclbin` without rerunning clang++ and aiecc.
+- **XDNA 1 only.** The kernels target Phoenix / Hawk Point `npu1`; an XDNA 2
+  (Strix-class) part is reported unavailable rather than failing at load.
 - **Pool / Im2Col / Quantize / Dequantize** are host-computed (coverage so vision
   and int8 graphs *run*); the perf-critical GEMM stays on the NPU.
 - **Training:** one `wrt` per compiled graph (a multi-output grad returns only the
@@ -162,8 +230,10 @@ over 40 steps, gradient computed on the NPU).
   are approximate (cosine ≈ 0.99, fine for SGD); the optimizer step is host-side.
 - **Attention** is standard multi-head + causal; GQA/MQA is handled by upstream
   KV-expansion (no separate `num_kv_heads` on the op).
-- **No CPU fallback.** A missing runtime/overlay is a hard `XdnaError`, never a
-  silent CPU masquerade — the device either does the work or says it can't.
+- **No silent device fallback.** A missing runtime/overlay is a hard
+  `XdnaError`, never a CPU masquerade. Per-node host steps (above) happen
+  only with a working NPU, each kind is named on stderr, and
+  `RLX_XDNA_STRICT=1` forbids them.
 - **`direct` path is parked** — see below.
 
 ## The `direct` path (parked)

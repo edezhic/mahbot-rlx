@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 // GroupNorm (NCHW) backward. Matches CPU `training_bwd::group_norm_backward_*`.
 // One thread per (batch, group) for dx; single-thread serial for dgamma/dbeta.
 
@@ -33,7 +36,7 @@ fn group_norm_bwd_input(@builtin(global_invocation_id) gid: vec3<u32>) {
     let plane = params.c * spatial;
     let cpg = params.c / params.num_groups;
     let count = f32(cpg * spatial);
-    let n_inv = 1.0 / count;
+    let n_inv = rlx_div_rn(1.0, count);
     let eps = bitcast<f32>(params.eps_bits);
     let c0 = g * cpg;
     let b_base = bn * plane;
@@ -56,7 +59,7 @@ fn group_norm_bwd_input(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     var_ = var_ * n_inv;
-    let inv_std = inverseSqrt(var_ + eps);
+    let inv_std = rlx_rsqrt_rn(var_ + eps);
 
     var s_sy: f32 = 0.0;
     var s_sxh: f32 = 0.0;
@@ -96,7 +99,7 @@ fn group_norm_bwd_gamma(@builtin(global_invocation_id) gid: vec3<u32>) {
     let plane = params.c * spatial;
     let cpg = params.c / params.num_groups;
     let count = f32(cpg * spatial);
-    let n_inv = 1.0 / count;
+    let n_inv = rlx_div_rn(1.0, count);
     let eps = bitcast<f32>(params.eps_bits);
 
     for (var ch: u32 = 0u; ch < params.c; ch = ch + 1u) {
@@ -124,7 +127,7 @@ fn group_norm_bwd_gamma(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
             var_ = var_ * n_inv;
-            let inv_std = inverseSqrt(var_ + eps);
+            let inv_std = rlx_rsqrt_rn(var_ + eps);
             for (var c: u32 = 0u; c < cpg; c = c + 1u) {
                 let gi = c0 + c;
                 let x_base = params.x_off + b_base + gi * spatial;
@@ -160,3 +163,4 @@ fn group_norm_bwd_beta(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 }
+

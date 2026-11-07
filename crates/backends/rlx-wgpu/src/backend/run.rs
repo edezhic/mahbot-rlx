@@ -38,7 +38,7 @@ use crate::kernels::{
     conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
     conv3d_backward_weight_kernel, conv3d_ctile_kernel, conv3d_kernel, copy_kernel,
     copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
-    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
+    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel, double_single_kernel,
     elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
     fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
     fma_kernel, frames_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel,
@@ -53,15 +53,16 @@ use crate::kernels::{
     layernorm_kernel, layernorm_vec4_kernel, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
     matmul_coop_f16_f32acc_kernel, matmul_coop_f16_vulkan_active_kernel,
     matmul_coop_f16_vulkan_kernel, matmul_coop_f32_active_kernel, matmul_coop_f32_direct_kernel,
-    matmul_coop16_kernel, matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_kernel,
-    matmul_qkv_coop_f16_vk_active_kernel, matmul_qkv_coop_f16_vk_kernel,
-    matmul_qkv_coop_f32_kernel, matmul_qkv_kernel, matmul_wide_active_kernel, matmul_wide_kernel,
-    maxpool2d_backward_kernel, maxpool3d_backward_kernel, narrow_kernel, narrow_split_kernel,
-    narrow_vec4_kernel, norm_rope_kernel, note_attention_band_route,
-    note_attention_decomposed_route, note_attention_route, pool1d_kernel, pool2d_kernel,
-    pool3d_kernel, q_conv2d_kernel, q_matmul_kernel, quantize_i8_kernel, reduce_kernel,
-    reverse_kernel, rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel,
-    rope_backward_kernel, rope_kernel, sample_kernel, scaled_dequantize_kernel,
+    matmul_coop_f32_kernel_for, matmul_coop16_kernel, matmul_f16_compute_kernel,
+    matmul_f16w_kernel, matmul_gemv_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
+    matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
+    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
+    maxpool3d_backward_kernel, narrow_kernel, narrow_split_kernel, narrow_vec4_kernel,
+    norm_rope_kernel, note_attention_band_route, note_attention_decomposed_route,
+    note_attention_route, pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel,
+    q_matmul_kernel, quantize_i8_kernel, reduce_kernel, resize_nearest2x_kernel, reverse_kernel,
+    rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel,
+    rope_kernel, round_to_format_kernel, sample_kernel, scaled_dequantize_kernel,
     scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel, scaled_quant_scale_kernel,
     scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel,
     selective_scan_kernel, snake_beta_kernel, softmax_cross_entropy_backward_kernel,
@@ -457,7 +458,23 @@ impl WgpuExecutable {
     /// a graph with small outputs returns via the "tiny" path and never armed,
     /// silently rebuilding its constant weight packs on every run. Routing all
     /// five through one helper is what keeps that from drifting apart again.
+    /// First step at or after `i` that this run will execute: static-once
+    /// weight packs are skipped once armed, so the host/GPU transition logic
+    /// must decide on what actually runs next, not on the raw schedule.
+    fn next_live_step(&self, mut i: usize) -> usize {
+        while i < self.schedule.len()
+            && self.static_once_done
+            && self.static_once_steps.contains(&i)
+            && step_runs_on_host(&self.schedule[i])
+        {
+            i += 1;
+        }
+        i
+    }
+
     fn arm_static_once(&mut self) {
+        // Every readback return passes through here once its GPU work is done.
+        crate::step_profile::end_run();
         if !rlx_compile::memory::static_weight_pack_skip_enabled() {
             return;
         }
@@ -505,9 +522,26 @@ impl WgpuExecutable {
             return;
         };
         let total = self.schedule.len();
-        eprintln!("[wgpu-snapshot] replaying {total} steps, reading each node as it is produced");
+        // Cost is O(n^2) dispatches, which is fine for a few hundred nodes and
+        // is not fine for a model: AXON's 3392 steps are ~5.8M dispatches, and
+        // the divergence that needed finding was at step 58. `RLX_WGPU_SNAPSHOT_FROM`
+        // / `_TO` bound the replay to a step window, which costs O(window * n)
+        // instead — the prefix still runs in full, so every value read is the one
+        // the graph really computed; only the reporting is narrowed.
+        let from = rlx_ir::env::parse_or::<usize>("RLX_WGPU_SNAPSHOT_FROM", 0).max(1);
+        let to = rlx_ir::env::parse_or::<usize>("RLX_WGPU_SNAPSHOT_TO", total).min(total);
+        if from > 1 || to < total {
+            eprintln!(
+                "[wgpu-snapshot] replaying steps {from}..={to} of {total} \
+                 (window set by RLX_WGPU_SNAPSHOT_FROM/_TO)"
+            );
+        } else {
+            eprintln!(
+                "[wgpu-snapshot] replaying {total} steps, reading each node as it is produced"
+            );
+        }
         self.in_snapshot = true;
-        for k in 1..=total {
+        for k in from..=to {
             // `Step` is not `Clone`, so stop the loop by index rather than by
             // rebuilding a truncated schedule — which also keeps the bind-group
             // and uniform indices identical to the full run.
@@ -622,6 +656,65 @@ impl WgpuExecutable {
         self.schedule
             .iter()
             .any(|s| super::step_runs_on_host(s) || super::step_is_tail_host(s))
+    }
+
+    /// Like [`Self::requires_host_execution`], but only steps that make the
+    /// host WAIT on the GPU (map a buffer, compute on the CPU). A GGUF matmul
+    /// that takes the fused GEMV only encodes and submits its own dispatches,
+    /// so the browser can run it: the queue orders it like any GPU step.
+    /// A `BufferCopy` the run loop encodes as a plain GPU copy (see
+    /// [`buffer_copy_gpu_window`]) rather than staging through the host.
+    fn buffer_copy_is_gpu_only(&self, step: &Step) -> bool {
+        let Step::BufferCopy {
+            src_byte_off,
+            dst_byte_off,
+            bytes,
+        } = *step
+        else {
+            return false;
+        };
+        if weight_to_act_copy(src_byte_off, dst_byte_off)
+            || buffer_copy_two_windows(&self.arena, src_byte_off, dst_byte_off, u64::from(bytes))
+                .is_some()
+        {
+            return true;
+        }
+        crate::device::wgpu_device().is_some_and(|dev| {
+            buffer_copy_gpu_window(
+                &self.arena,
+                src_byte_off,
+                dst_byte_off,
+                u64::from(bytes),
+                dev.device.limits().max_storage_buffer_binding_size,
+            )
+            .is_some()
+        })
+    }
+
+    pub fn blocks_on_host(&self) -> bool {
+        if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+            for s in &self.schedule {
+                if let Step::BufferCopy {
+                    src_byte_off,
+                    dst_byte_off,
+                    bytes,
+                } = *s
+                    && !self.buffer_copy_is_gpu_only(s)
+                {
+                    eprintln!(
+                        "[rlx-wgpu] host buffer_copy {src_byte_off:#x} -> {dst_byte_off:#x} ({bytes} B), sharded {} shard {}",
+                        self.arena.is_sharded(),
+                        self.arena.shard_size
+                    );
+                }
+            }
+        }
+        self.schedule.iter().any(|s| {
+            (super::step_runs_on_host(s)
+                && !gguf_step_is_gpu_only(s, self.active_extent, self.dequant_scratch_off)
+                && !self.buffer_copy_is_gpu_only(s))
+                || super::step_is_tail_host(s)
+        })
     }
 
     /// What this schedule asks the host to do, and which of those asks are
@@ -909,7 +1002,8 @@ impl WgpuExecutable {
                             has_bias: *has_bias,
                             bias_off: *bias_off_f32,
                             act_id: *act_id,
-                            _pad0: 0,
+                            // CoopF16Vk only: A's offset in its f16 window.
+                            _pad0: self.coop_f16_vk_a_off.get(&step_i).copied().unwrap_or(0),
                             _pad1: 0,
                             _pad2: 0,
                         };
@@ -1328,6 +1422,13 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::ResizeNearest2x { params } => {
+                        let mut p = *params;
+                        p.planes = scale(p.planes);
+                        p.n_total = p.planes * 4 * p.h * p.w;
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
                     Step::AxialRope2d { params } => {
                         let mut p = *params;
                         p.batch = scale(p.batch);
@@ -1353,6 +1454,20 @@ impl WgpuExecutable {
                         }
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    Step::RoundToFormat { params } => {
+                        let mut p = *params;
+                        p.n = scale(p.n);
+                        dev.queue
+                            .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
+                    }
+                    // Static shapes only (`lower_f64` rejects dynamic dims).
+                    Step::DoubleSingle { params } => {
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
                     }
                     Step::Conv2d { params } | Step::Conv2dTiled { params } => {
                         let mut p = *params;
@@ -1604,6 +1719,13 @@ impl WgpuExecutable {
                         dev.queue
                             .write_buffer(&self.uniforms[gpu_ui], 0, bytemuck::bytes_of(&p));
                     }
+                    Step::MatmulStrided { params } => {
+                        dev.queue.write_buffer(
+                            &self.uniforms[gpu_ui],
+                            0,
+                            bytemuck::bytes_of(params),
+                        );
+                    }
                     // Raw-GPU custom op: its storage params buffer is written at
                     // compile time (mapped_at_creation) with static, window-
                     // relative offsets — no active-extent scaling. No-op here so
@@ -1643,6 +1765,8 @@ impl WgpuExecutable {
 
         // Encode + submit.
         let mm_k = matmul_kernel(&dev.device);
+        let mm_gemv = matmul_gemv_kernel(&dev.device);
+        let no_gemv = rlx_ir::env::flag("RLX_WGPU_NO_GEMV");
         let mm_w_active = matmul_wide_active_kernel(&dev.device);
         let mm_f16w = matmul_f16w_kernel(&dev.device);
         let mm_bf16w = matmul_bf16w_kernel(&dev.device);
@@ -1665,8 +1789,10 @@ impl WgpuExecutable {
         // slots (the source of nondeterministic deep-graph results on wgpu).
         // The snapshot needs exactly one step per submitted pass so it can stop
         // after a chosen step and read what that step produced.
-        let one_op_per_pass =
-            rlx_ir::env::flag("RLX_WGPU_ONE_OP_PER_PASS") || self.snapshot_stop.is_some();
+        let one_op_per_pass = rlx_ir::env::flag("RLX_WGPU_ONE_OP_PER_PASS")
+            || self.snapshot_stop.is_some()
+            || crate::step_profile::active();
+        crate::step_profile::begin_run();
         // Steps one batch encodes before submitting it and carrying on in a fresh
         // encoder. Encoding is host work, so a batch that carries one encoder to
         // the end of the schedule pays all of it with the device idle: the code
@@ -1743,6 +1869,24 @@ impl WgpuExecutable {
                 && self.step_breaks_batch(step_i, &scale, one_op_per_pass, &host_cache, dev);
             if !starting_on_host {
                 report.open(Phase::Encode, step_i, &self.schedule);
+                // Deferred host writes must reach the device before any GPU
+                // step reads them. The end-of-host-step flush below does this,
+                // but the hosted `BufferCopy` branch `continue`s past it — so
+                // a KV append deferred its row, the next section encoded the
+                // layer's attention against the old cache, and the row landed
+                // one host step too late (wrong decode on discrete NVIDIA,
+                // where every copy is hosted). Flush at the section start
+                // instead, which no host branch can skip. `write_buffer` is
+                // applied before this section's submit, so no poll is needed.
+                if host_cache.has_deferred_writes() {
+                    let mut a = crate::host_stage::WgpuArena {
+                        arena: &self.arena,
+                        device: &dev.device,
+                        queue: &dev.queue,
+                        size_bytes: 0,
+                    };
+                    host_cache.flush_to_device(&mut a);
+                }
                 let mut enc = match pending_enc.take() {
                     Some(enc) => enc,
                     None => {
@@ -1764,7 +1908,14 @@ impl WgpuExecutable {
                 };
                 let pass_start = step_i;
                 {
-                    let mut pass = report.begin_pass(&mut enc);
+                    let mut pass = if crate::step_profile::active() {
+                        enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("rlx-wgpu compute pass"),
+                            timestamp_writes: crate::step_profile::pass_writes(),
+                        })
+                    } else {
+                        report.begin_pass(&mut enc)
+                    };
                     while step_i < self.schedule.len() {
                         if step_is_tail_host(&self.schedule[step_i]) {
                             step_i += 1;
@@ -1776,7 +1927,7 @@ impl WgpuExecutable {
                                 step_i += 1;
                                 continue;
                             }
-                            if step_owns_slot(step) {
+                            if !matches!(step, Step::FftGpu { .. }) {
                                 gpu_bi += 1;
                             }
                             step_i += 1;
@@ -1861,7 +2012,7 @@ impl WgpuExecutable {
                                 // identity there.
                                 let m_s = scale(*m);
                                 if m_s == 0 {
-                                    if step_owns_slot(step) {
+                                    if !matches!(step, Step::FftGpu { .. }) {
                                         gpu_bi += 1;
                                     }
                                     step_i += 1;
@@ -1877,7 +2028,7 @@ impl WgpuExecutable {
                                     );
                                 pass.set_bind_group(
                                     0,
-                                    coop_f16_vk_bind_group(self, gpu_bi, coop_f16_wide),
+                                    coop_f16_vk_bind_group(self, step_i, gpu_bi, coop_f16_wide),
                                     &[],
                                 );
                                 // Kernel selection priority:
@@ -1955,6 +2106,19 @@ impl WgpuExecutable {
                                             *n,
                                             *batch,
                                         );
+                                    } else if let Some(k32) = (m_s.is_multiple_of(32)
+                                        && n.is_multiple_of(32)
+                                        && crate::kernels::coop_f16_vk_use_f32acc(&dev.device))
+                                    .then(crate::coop_probe::f16_vk_32_kernel)
+                                    .flatten()
+                                    {
+                                        // 32×32 block per subgroup, 2×2 tiles: same
+                                        // bindings and params as the f32-accumulator
+                                        // 16×16 kernel below, and reached only once
+                                        // `coop_probe` has established that it
+                                        // computes `a·b` on this adapter.
+                                        pass.set_pipeline(&k32.pipeline);
+                                        pass.dispatch_workgroups(m_s / 32, n / 32, *batch);
                                     } else {
                                         let n_eff = scale(*n);
                                         let coop_vk = matmul_coop_f16_vulkan_active_kernel(
@@ -2025,6 +2189,15 @@ impl WgpuExecutable {
                                         m_s.div_ceil(32),
                                         *batch,
                                     );
+                                } else if m_s <= 4 && !no_gemv {
+                                    let cols = crate::kernels::gemv_cols_for(*n);
+                                    let k = if cols == 32 {
+                                        mm_gemv
+                                    } else {
+                                        crate::kernels::matmul_gemv_kernel_cols(&dev.device, cols)
+                                    };
+                                    pass.set_pipeline(&k.pipeline);
+                                    pass.dispatch_workgroups(n.div_ceil(cols), 1, *batch);
                                 } else if m_s >= 32 && *n >= 64 {
                                     // Wide path: whole row tiles, then one remainder tile for the rows
                                     // the tile grid would otherwise round up — so a 96-row node computes
@@ -2053,6 +2226,18 @@ impl WgpuExecutable {
                                         *batch,
                                     );
                                 }
+                            }
+                            Step::MatmulStrided { params } => {
+                                let sk =
+                                    crate::kernels::matmul_coop_f32_strided_kernel(&dev.device)
+                                        .expect("matmul_coop_f32_strided needs cooperative matrix");
+                                pass.set_pipeline(&sk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                pass.dispatch_workgroups(
+                                    params.n.div_ceil(32),
+                                    params.m.div_ceil(32),
+                                    params.batch,
+                                );
                             }
                             Step::Binary { params } => {
                                 let n_s = scale(params.n);
@@ -2308,14 +2493,67 @@ impl WgpuExecutable {
                                     step_i += 1;
                                     continue;
                                 }
-                                let gk = group_norm_kernel(&dev.device);
-                                pass.set_pipeline(&gk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                // One workgroup (64 threads) per (batch, group)
-                                // → tree reduction over the group's elements.
-                                let (gx, gy, gz) =
-                                    dispatch_dims(params.groups_total.saturating_mul(64), 64);
-                                pass.dispatch_workgroups(gx, gy, gz);
+                                if params.chunks > 1 {
+                                    // `chunks` workgroups per group: partials,
+                                    // then the write, then the partials' head
+                                    let [partial, apply, head] = if params.half != 0 {
+                                        // half-packed in and out: the overrides
+                                        [
+                                            "group_norm_partial",
+                                            "group_norm_apply",
+                                            "group_norm_head",
+                                        ]
+                                        .map(|e| {
+                                            crate::kernels::half_kernel(
+                                                &dev.device,
+                                                e,
+                                                params.split != 0,
+                                                params.half,
+                                            )
+                                        })
+                                    } else if params.split != 0 {
+                                        // the output its own binding
+                                        [
+                                            "group_norm_partial",
+                                            "group_norm_apply",
+                                            "group_norm_head",
+                                        ]
+                                        .map(|e| crate::kernels::two_window_kernel(&dev.device, e))
+                                    } else {
+                                        let k =
+                                            crate::kernels::group_norm_split_kernels(&dev.device);
+                                        [&k[0], &k[1], &k[2]]
+                                    };
+                                    let wgs = params.groups_total.saturating_mul(params.chunks);
+                                    for (k, n) in
+                                        [(partial, wgs), (apply, wgs), (head, params.groups_total)]
+                                    {
+                                        pass.set_pipeline(&k.pipeline);
+                                        let (gx, gy, gz) =
+                                            dispatch_dims(n.saturating_mul(256), 256);
+                                        pass.dispatch_workgroups(gx, gy, gz);
+                                    }
+                                } else {
+                                    let gk = if params.half != 0 {
+                                        crate::kernels::half_kernel(
+                                            &dev.device,
+                                            "group_norm",
+                                            params.split != 0,
+                                            params.half,
+                                        )
+                                    } else if params.split != 0 {
+                                        crate::kernels::two_window_kernel(&dev.device, "group_norm")
+                                    } else {
+                                        group_norm_kernel(&dev.device)
+                                    };
+                                    pass.set_pipeline(&gk.pipeline);
+                                    // One workgroup (256 threads) per (batch, group)
+                                    // → tree reduction over the group's elements.
+                                    let (gx, gy, gz) =
+                                        dispatch_dims(params.groups_total.saturating_mul(256), 256);
+                                    pass.dispatch_workgroups(gx, gy, gz);
+                                }
                             }
                             Step::LayerNorm2d { params } => {
                                 if params.positions == 0 || params.c == 0 {
@@ -2467,8 +2705,8 @@ impl WgpuExecutable {
                                     let zk = gather_backward_zero_kernel(&dev.device);
                                     pass.set_pipeline(&zk.pipeline);
                                     pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                    let (gx, _, _) = dispatch_dims(total, 256);
-                                    pass.dispatch_workgroups(gx, 1, 1);
+                                    let (gx, gy, gz) = dispatch_dims(total, 256);
+                                    pass.dispatch_workgroups(gx, gy, gz);
                                 }
                                 let ak = gather_backward_acc_kernel(&dev.device);
                                 pass.set_pipeline(&ak.pipeline);
@@ -3288,6 +3526,46 @@ impl WgpuExecutable {
                                 let (gx, gy, gz) = dispatch_dims(total_s, 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
+                            Step::ResizeNearest2x { params } => {
+                                let total = scale(params.planes) * 4 * params.h * params.w;
+                                if total == 0 {
+                                    gpu_bi += 1;
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let pk = resize_nearest2x_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(total, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::RoundToFormat { params } => {
+                                let n_s = scale(params.n);
+                                if n_s == 0 {
+                                    if step_owns_slot(step) {
+                                        gpu_bi += 1;
+                                    }
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let pk = round_to_format_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(params.threads(n_s), 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
+                            Step::DoubleSingle { params } => {
+                                if params.len == 0 {
+                                    gpu_bi += 1;
+                                    step_i += 1;
+                                    continue;
+                                }
+                                let pk = crate::kernels::double_single_kernel(&dev.device);
+                                pass.set_pipeline(&pk.pipeline);
+                                pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
+                                let (gx, gy, gz) = dispatch_dims(params.len, 64);
+                                pass.dispatch_workgroups(gx, gy, gz);
+                            }
                             Step::Argmax { params } => {
                                 let outer_s = scale(params.outer);
                                 if outer_s == 0 {
@@ -3300,7 +3578,8 @@ impl WgpuExecutable {
                                 let amk = argmax_kernel(&dev.device);
                                 pass.set_pipeline(&amk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let (gx, gy, gz) = dispatch_dims(outer_s, 64);
+                                // One 256-thread workgroup per row.
+                                let (gx, gy, gz) = dispatch_dims(outer_s.saturating_mul(64), 64);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::Pool2d { params } => {
@@ -3383,7 +3662,8 @@ impl WgpuExecutable {
                                 let c_in_per_g = params.c_in / params.groups.max(1);
                                 let total =
                                     params.c_out * c_in_per_g * params.kd * params.kh * params.kw;
-                                let (gx, gy, gz) = dispatch_dims(total, 256);
+                                // one workgroup per weight element (see the kernel)
+                                let (gx, gy, gz) = dispatch_dims(total, 1);
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::GroupNormBackwardInput { params } => {
@@ -3606,7 +3886,140 @@ impl WgpuExecutable {
                                 let tiled = params.groups <= 1
                                     && !rlx_ir::env::flag("RLX_WGPU_CONV3D_SCALAR");
                                 let spatial = params.d_out * params.h_out * params.w_out;
-                                let (ck, total) = if tiled {
+                                // and four W positions per thread
+                                // (`conv3d_ctile_w4`; 1.6-1.8× on 3-D
+                                // segmentation nets for two, a further
+                                // ~25% on MindGrab for four, same sums).
+                                // `RLX_WGPU_CONV3D_W2=1` for two W,
+                                // `RLX_WGPU_CONV3D_NO_W2=1` for one.
+                                let w1 = rlx_ir::env::flag("RLX_WGPU_CONV3D_NO_W2");
+                                let w2 = !w1 && rlx_ir::env::flag("RLX_WGPU_CONV3D_W2");
+                                // eight output channels a thread past four
+                                // (`conv3d_ctile_w4c8`): half the input
+                                // reads; 1.85 → 1.25 s of MindGrab's convs
+                                // on an M4 Pro, same sums.
+                                // `RLX_WGPU_CONV3D_NO_C8=1` for four.
+                                let c8 = !w1
+                                    && !w2
+                                    && params.c_out > 4
+                                    && !rlx_ir::env::flag("RLX_WGPU_CONV3D_NO_C8");
+                                let w4_total = |tile: u32| {
+                                    n_s * params.c_out.div_ceil(tile)
+                                        * params.d_out
+                                        * params.h_out
+                                        * params.w_out.div_ceil(4)
+                                };
+                                // a 2-D 3×3 (`conv3d_k3_c8`): the weights
+                                // in workgroup memory, a row's inputs read
+                                // once for its three taps; 2.5-8× the
+                                // eight-channel tile on FastSurfer's layers.
+                                // `RLX_WGPU_CONV3D_NO_K3=1` for that tile.
+                                // Workgroups are whole: the channel tile
+                                // is the workgroup's, not the thread's.
+                                // (and always for a folded input PReLU or
+                                // `max`: no other kernel applies them)
+                                let k3 = params.in_prelu != 0
+                                    || params.res_max != 0
+                                    || (c8
+                                        && params.is_k3()
+                                        && params.act != crate::unfuse::ARGMAX_ACT
+                                        && params.act != crate::unfuse::TOPK_ACT
+                                        && !rlx_ir::env::flag("RLX_WGPU_CONV3D_NO_K3"));
+                                let k3_total = || {
+                                    params.c_out.div_ceil(8)
+                                        * (n_s
+                                            * params.d_out
+                                            * params.h_out
+                                            * params.w_out.div_ceil(4))
+                                        .div_ceil(64)
+                                        * 64
+                                };
+                                let (ck, total) = if params.half != 0 {
+                                    // half-packed input or output
+                                    // (`pack_half_activations`): the
+                                    // argmax head, or the eight- / four-
+                                    // channel tile (only eight stores
+                                    // halves), with the overrides
+                                    let two = params.split != 0;
+                                    let k = |e| {
+                                        crate::kernels::half_kernel(
+                                            &dev.device,
+                                            e,
+                                            two,
+                                            params.half,
+                                        )
+                                    };
+                                    if params.act == crate::unfuse::ARGMAX_ACT {
+                                        (k("conv3d_argmax"), n_s * spatial)
+                                    } else if params.act == crate::unfuse::TOPK_ACT {
+                                        (k("conv3d_topk"), n_s * spatial)
+                                    } else if k3 {
+                                        (k("conv3d_k3_c8"), k3_total())
+                                    } else if params.c_out > 4 {
+                                        (k("conv3d_ctile_w4c8"), w4_total(8))
+                                    } else {
+                                        (k("conv3d_ctile_w4"), w4_total(4))
+                                    }
+                                } else if params.split != 0 {
+                                    // the output its own binding
+                                    let k = |e| crate::kernels::two_window_kernel(&dev.device, e);
+                                    if params.act == crate::unfuse::ARGMAX_ACT {
+                                        (k("conv3d_argmax"), n_s * spatial)
+                                    } else if params.act == crate::unfuse::TOPK_ACT {
+                                        (k("conv3d_topk"), n_s * spatial)
+                                    } else if w2 {
+                                        (
+                                            k("conv3d_ctile_w2"),
+                                            n_s * params.c_out.div_ceil(4)
+                                                * params.d_out
+                                                * params.h_out
+                                                * params.w_out.div_ceil(2),
+                                        )
+                                    } else if w1 {
+                                        (
+                                            k("conv3d_ctile"),
+                                            n_s * params.c_out.div_ceil(4) * spatial,
+                                        )
+                                    } else if k3 {
+                                        (k("conv3d_k3_c8"), k3_total())
+                                    } else if c8 {
+                                        (k("conv3d_ctile_w4c8"), w4_total(8))
+                                    } else {
+                                        (k("conv3d_ctile_w4"), w4_total(4))
+                                    }
+                                } else if params.act == crate::unfuse::TOPK_ACT {
+                                    // `CONV3D_TOPK`: one thread a voxel
+                                    (
+                                        crate::kernels::conv3d_topk_kernel(&dev.device),
+                                        n_s * spatial,
+                                    )
+                                } else if params.act == crate::unfuse::ARGMAX_ACT {
+                                    // `fold_conv_argmax`: one thread a voxel
+                                    (
+                                        crate::kernels::conv3d_argmax_kernel(&dev.device),
+                                        n_s * spatial,
+                                    )
+                                } else if tiled && k3 {
+                                    (crate::kernels::conv3d_k3_c8_kernel(&dev.device), k3_total())
+                                } else if tiled && c8 {
+                                    (
+                                        crate::kernels::conv3d_ctile_w4c8_kernel(&dev.device),
+                                        w4_total(8),
+                                    )
+                                } else if tiled && !w1 && !w2 {
+                                    (
+                                        crate::kernels::conv3d_ctile_w4_kernel(&dev.device),
+                                        w4_total(4),
+                                    )
+                                } else if tiled && w2 {
+                                    (
+                                        crate::kernels::conv3d_ctile_w2_kernel(&dev.device),
+                                        n_s * params.c_out.div_ceil(4)
+                                            * params.d_out
+                                            * params.h_out
+                                            * params.w_out.div_ceil(2),
+                                    )
+                                } else if tiled {
                                     (
                                         conv3d_ctile_kernel(&dev.device),
                                         n_s * params.c_out.div_ceil(4) * spatial,
@@ -4027,7 +4440,7 @@ impl WgpuExecutable {
                                     );
                                 pass.set_bind_group(
                                     0,
-                                    coop_f16_vk_bind_group(self, gpu_bi, qkv_coop_wide),
+                                    coop_f16_vk_bind_group(self, step_i, gpu_bi, qkv_coop_wide),
                                     &[],
                                 );
                                 match kind {
@@ -4135,6 +4548,9 @@ impl WgpuExecutable {
                                 step_name(step)
                             );
                         }
+                        if crate::step_profile::active() {
+                            crate::step_profile::label_last(profile_label(step));
+                        }
                         step_i += 1;
                         pass_dispatched = true;
                         enc_steps += 1;
@@ -4206,20 +4622,6 @@ impl WgpuExecutable {
                     pending_enc = Some(enc);
                     continue;
                 }
-                // `step_runs_on_host` on purpose, not `step_breaks_batch`: the two
-                // agree here. A call the join branch consumed never reaches this site;
-                // one whose encode refused it does, and both predicates answer false
-                // for it — its own step is host-classified, and `step_needs_pass_flush`
-                // has no arm for a tail-host step kind and is false for every
-                // `DequantMatmulGguf` arm, so no drain is asked for here either way. A
-                // *joined copy* can be the `prev` step this reads: on a Vulkan/DX12-class
-                // adapter that arm then asks for the drain, which stands in for the
-                // boundary the copy's own submission used to provide (see
-                // `step_breaks_batch`'s doc).
-                let needs_f16_drain = step_i < self.schedule.len()
-                    && !step_runs_on_host(&self.schedule[step_i])
-                    && step_i > 0
-                    && step_needs_pass_flush(&self.schedule[step_i], &self.schedule[step_i - 1]);
                 let gpu_schedule_done = step_i >= self.schedule.len();
                 let skip_readback =
                     rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY") || self.dispatch_only;
@@ -4251,6 +4653,7 @@ impl WgpuExecutable {
                         );
                         let map_rx = schedule_readback_map(&mut enc, tiny.buffer(), &layout);
                         crate::backend::note_device_submit();
+                        crate::step_profile::resolve(&mut enc);
                         let sub = dev.queue.submit(std::iter::once(enc.finish()));
                         report.open(Phase::Wait, step_i, &self.schedule);
                         wait_readback_map(&dev.device, sub, &map_rx, layout.total_bytes);
@@ -4282,6 +4685,7 @@ impl WgpuExecutable {
                     }
                 }
                 crate::backend::note_device_submit();
+                crate::step_profile::resolve(&mut enc);
                 let main_submission = dev.queue.submit(std::iter::once(enc.finish()));
                 if defer_tail {
                     report.open(Phase::Wait, step_i, &self.schedule);
@@ -4354,11 +4758,12 @@ impl WgpuExecutable {
                         }
                     }
                 }
-                if needs_f16_drain {
-                    report.open(Phase::Wait, step_i, &self.schedule);
-                    crate::backend::note_device_wait();
-                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
-                }
+                // A pass split by `step_needs_pass_flush` (an f32→f16 mirror
+                // feeding a CoopF16Vk matmul) needs no CPU wait: the encoder
+                // was submitted above, and the queue runs the next submission
+                // after it. The wait that used to sit here was a full GPU round
+                // trip per coop matmul — 14 of 20 ms per run for an 8-layer
+                // 512×768 chain on an RTX 3080 Ti.
                 // A joined call — a packed multiply or a device-route copy — is
                 // host-classified but is not a host sync here; `step_breaks_batch`'s
                 // doc has the site list. This is also the one place where the
@@ -4497,6 +4902,65 @@ impl WgpuExecutable {
                     let dst = *dst_byte_off;
                     let nbytes = *bytes as u64;
                     let src_is_weight = crate::buffer::is_weight_off(src as usize);
+                    let dst_is_weight = crate::buffer::is_weight_off(dst as usize);
+                    // Weight → arena: two distinct buffers, so a plain GPU copy is
+                    // legal. This used to take the host round trip below — a
+                    // blocking readback + re-upload per copy, 56 per Qwen3-0.6B
+                    // decode step, which made host syncs the dominant decode
+                    // cost on wgpu. Deferred mirror writes keep the old path
+                    // (they must land first and are flushed there). `buffer_copy_route`
+                    // hosts a weight-tagged operand because a copy kernel cannot reach
+                    // the weight buffer through an arena binding, so this is the one
+                    // form of that copy the route cannot see.
+                    if src_is_weight
+                        && !dst_is_weight
+                        && !host_cache.has_deferred_writes()
+                        && !rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
+                    {
+                        self.arena.copy_weight_to_act(
+                            &dev.device,
+                            &dev.queue,
+                            src as usize,
+                            dst as usize,
+                            nbytes as usize,
+                        );
+                        // The mirror is keyed by offset and an older, longer
+                        // entry can span `dst`; with no deferred writes pending,
+                        // dropping the read mirror is free of data loss.
+                        host_cache.clear();
+                        step_i += 1;
+                        continue;
+                    }
+                    // A copy between two stripes of a striped arena: no single
+                    // window covers both operands, so `buffer_copy_route` declines
+                    // it and the copy kernel takes the destination's own window.
+                    // Its own submission, like the single-window arm below.
+                    if !host_cache.has_deferred_writes()
+                        && let Some(windows) =
+                            buffer_copy_two_windows(&self.arena, src, dst, nbytes)
+                    {
+                        let mut enc =
+                            dev.device
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("rlx-wgpu two-window copy"),
+                                });
+                        encode_two_window_copy(
+                            &self.arena,
+                            dev,
+                            &mut enc,
+                            src,
+                            dst,
+                            nbytes,
+                            windows,
+                        );
+                        crate::backend::note_device_submit();
+                        dev.queue.submit(std::iter::once(enc.finish()));
+                        crate::backend::note_device_wait();
+                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                        host_cache.invalidate(dst as usize);
+                        step_i += 1;
+                        continue;
+                    }
                     // The route this arm runs by — `buffer_copy_route_now`'s doc has
                     // why it is the same answer the batch boundary joined on.
                     let route = self
@@ -4509,14 +4973,16 @@ impl WgpuExecutable {
                         let data = if let Some(hit) = host_cache.get_arc_covering(src_u, n_f32) {
                             hit[..n_f32].to_vec()
                         } else {
-                            if host_cache.is_dirty(src_u) {
+                            // Any deferred write inside the source range, not
+                            // only one keyed at `src` (see `flush_range`).
+                            if host_cache.has_deferred_writes() {
                                 let mut a = crate::host_stage::WgpuArena {
                                     arena: &self.arena,
                                     device: &dev.device,
                                     queue: &dev.queue,
                                     size_bytes: 0,
                                 };
-                                host_cache.flush_offset(&mut a, src_u);
+                                host_cache.flush_range(&mut a, src_u, nbytes as usize);
                             }
                             let bytes_host = self.arena.read_bytes_range(
                                 &dev.device,
@@ -5398,7 +5864,7 @@ impl WgpuExecutable {
                         &dev.queue,
                         name,
                         in_specs,
-                        *out_byte_off as usize,
+                        *out_byte_off,
                         out_shape,
                         attrs,
                     );
@@ -6063,6 +6529,13 @@ impl WgpuExecutable {
             if bypasses_host_cache {
                 clear_mirror(&mut host_cache, &self.arena, dev);
             }
+            // Same reasoning after the step: a submit-only GEMV left nothing on
+            // the host for the next GPU section to wait for.
+            let submit_only = gguf_step_is_gpu_only(
+                &self.schedule[step_i],
+                self.active_extent,
+                self.dequant_scratch_off,
+            );
             step_i += 1;
             // Host paths stage with `queue.write_buffer` (no submit). Flush
             // deferred mirrors before the next GPU compute pass so kernels see
@@ -6080,17 +6553,30 @@ impl WgpuExecutable {
             // boundary here and leaves the door unfired. A joined *packed multiply*
             // is the arm that still needs the flush: nothing in its route consults
             // the mirror.
-            if step_i < self.schedule.len() {
+            //
+            // Look past the static-once steps the loop top is about to skip.
+            // Deciding on the raw next step was wrong whenever that step is a
+            // skipped weight pack: a host Silu followed by the (skipped)
+            // ConcatHost of a fused QKV/adaLN weight saw "host next, no flush",
+            // then landed straight on a GPU matmul whose pass clears the mirror,
+            // dropping the deferred host outputs unflushed. A later host step
+            // then read that slot's previous tenant from the device — run 1
+            // exact, every later run wrong (MontageFlow's final layer on
+            // discrete Vulkan with matmul-bias fusion off).
+            let next_i = self.next_live_step(step_i);
+            if next_i < self.schedule.len() {
                 // A joined packed multiply or a joined device-route copy is the
                 // next batch's device work: it reads what this host step wrote, so
                 // the mirror reaches the device (and the device is polled) before
                 // the batch runs — the same door a plain device step goes through.
-                if !self.step_breaks_batch(step_i, &scale, one_op_per_pass, &host_cache, dev) {
+                if !self.step_breaks_batch(next_i, &scale, one_op_per_pass, &host_cache, dev) {
                     if host_cache.has_deferred_writes() {
                         deliver_deferred(&mut host_cache, &self.arena, dev);
                     }
                     crate::backend::note_device_wait();
-                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                    if !submit_only {
+                        let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                    }
                     // Keep mirrors until GPU actually runs (cleared when
                     // `pass_dispatched` on the next host sync).
                 }
@@ -6100,7 +6586,9 @@ impl WgpuExecutable {
                 let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
             } else {
                 crate::backend::note_device_wait();
-                let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                if !submit_only {
+                    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
+                }
             }
         }
 
@@ -6117,10 +6605,12 @@ impl WgpuExecutable {
 
         self.debug_scans_after_run(dev);
 
-        if rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY") {
-            if !self.static_once_done && !self.static_once_steps.is_empty() {
-                self.static_once_done = true;
-            }
+        // `dispatch_only` (the browser's `run_async`, which reads back itself
+        // without blocking) must stop here too: a schedule that ENDS on a host
+        // step — a GGUF LM head — never reaches the GPU-section early return,
+        // and the blocking read below spins forever on wasm's single thread.
+        if rlx_ir::env::flag("RLX_BENCH_DISPATCH_ONLY") || self.dispatch_only {
+            self.arm_static_once();
             return self
                 .graph
                 .outputs
@@ -6131,18 +6621,33 @@ impl WgpuExecutable {
                 })
                 .collect();
         }
-        if !self.static_once_done && !self.static_once_steps.is_empty() {
-            self.static_once_done = true;
+        self.arm_static_once();
+        // A schedule that ends on a host step reads back here, not in the GPU
+        // section, so the handle feeds have to be made here too. Without them a
+        // resident trainer's `p' / m' / v'` never reached the next step's
+        // inputs: on NVIDIA Vulkan, where this graph's last step is host-staged,
+        // `b` never moved and the Adam moments froze after step 1, while Metal
+        // (ending on a GPU step) was exact.
+        if !self.gpu_handle_feeds.is_empty() {
+            let mut enc = dev
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rlx-wgpu handle feeds after host tail"),
+                });
+            self.propagate_gpu_handle_feeds_on_gpu(dev, &mut enc);
+            dev.queue.submit(std::iter::once(enc.finish()));
         }
         report.open(Phase::Readback, step_i, &self.schedule);
-        let out_ids: Vec<_> = self.graph.outputs.clone();
-        read_f32_many_pooled(
+        let plan = self.readback_plan();
+        let out_ids: Vec<_> = plan.iter().map(|&i| self.graph.outputs[i]).collect();
+        let partial = read_f32_many_pooled(
             &self.arena,
             &dev.device,
             &dev.queue,
             &out_ids,
             &mut self.readback_staging,
-        )
+        );
+        self.pack_readback_outputs(&plan, partial)
     }
 }
 
@@ -6252,4 +6757,206 @@ fn wgpu_rng_dispatch(
     crate::backend::note_device_wait();
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     host_cache.invalidate(dst as usize);
+}
+
+/// A `DequantMatmulGguf` step that will take the scratch-free fused GEMV —
+/// the same condition the executor uses to pick it — rather than a path that
+/// reads the arena back to the CPU.
+/// The bind window `(base, size)` for a `BufferCopy` that can run as a plain
+/// Source and destination windows of a copy between two stripes of a striped
+/// arena (a two-window conv's weights, staged from where the planner put
+/// them into its input's stripe), each inside its stripe so they are
+/// disjoint; `None` unless that is the case. Copied by `copy` with the
+/// destination its own binding ([`crate::kernels::two_window_kernel`]) —
+/// `copy_buffer_to_buffer` cannot copy within one buffer, and the host path
+/// blocks (the browser refuses it).
+fn buffer_copy_two_windows(
+    arena: &crate::buffer::Arena,
+    src: u64,
+    dst: u64,
+    nbytes: u64,
+) -> Option<((u64, u64), (u64, u64))> {
+    if !arena.is_sharded()
+        || nbytes == 0
+        || crate::buffer::is_weight_off(src as usize)
+        || crate::buffer::is_weight_off(dst as usize)
+        || crate::device::coop_discrete_backend()
+        || rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
+        || rlx_ir::env::flag("RLX_WGPU_NO_TWO_WINDOW")
+    {
+        return None;
+    }
+    let s = arena.shard_size as u64;
+    let (sa, sb) = (src / s, (src + nbytes - 1) / s);
+    let (da, db) = (dst / s, (dst + nbytes - 1) / s);
+    if sa != sb || da != db || sa == da {
+        return None;
+    }
+    let win = |lo: u64| {
+        let base = lo / 256 * 256;
+        let size = (lo + nbytes - base).div_ceil(256) * 256;
+        (base, size.min((lo / s + 1) * s - base))
+    };
+    Some((win(src), win(dst)))
+}
+
+/// Encode a [`buffer_copy_two_windows`] copy into `enc`.
+fn encode_two_window_copy(
+    arena: &crate::buffer::Arena,
+    dev: &crate::device::WgpuDevice,
+    enc: &mut wgpu::CommandEncoder,
+    src: u64,
+    dst: u64,
+    nbytes: u64,
+    (w0, w1): ((u64, u64), (u64, u64)),
+) {
+    let elems = (nbytes / 4).max(1) as u32;
+    let p = CopyParams {
+        n: elems,
+        in_off: ((src - w0.0) / 4) as u32,
+        out_off: ((dst - w1.0) / 4) as u32,
+        _p0: 0,
+        _p1: 0,
+        _p2: 0,
+        _p3: 0,
+        _p4: 0,
+    };
+    let ck = crate::kernels::two_window_kernel(&dev.device, "copy");
+    let u = dev.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rlx-wgpu two-window copy uniform"),
+        size: std::mem::size_of::<CopyParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    dev.queue.write_buffer(&u, 0, bytemuck::bytes_of(&p));
+    let bg = super::bind_two_windows(&dev.device, ck, arena, w0, w1, &u);
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("rlx-wgpu two-window copy pass"),
+        ..Default::default()
+    });
+    pass.set_pipeline(&ck.pipeline);
+    pass.set_bind_group(0, &bg, &[]);
+    let (gx, gy, gz) = dispatch_dims(elems, 64);
+    pass.dispatch_workgroups(gx, gy, gz);
+}
+
+/// A copy of a parked weight into the activation arena (a two-window conv's
+/// weights, staged beside its input): two distinct buffers, so a plain
+/// `copy_buffer_to_buffer` in the run's encoder. `RLX_WGPU_HOST_BUFFER_COPY`
+/// keeps the host path.
+fn weight_to_act_copy(src: u64, dst: u64) -> bool {
+    crate::buffer::is_weight_off(src as usize)
+        && !crate::buffer::is_weight_off(dst as usize)
+        && !rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
+}
+
+/// GPU copy within the activation arena, or `None` when it has to stage
+/// through the host: an operand in the weight buffer, a sharded arena, a span
+/// wider than one storage binding, a discrete cooperative-matrix backend, or
+/// `RLX_WGPU_HOST_BUFFER_COPY`. The same decision the step's own GPU path
+/// makes, minus pending host writes — which a step encoded mid-section never
+/// has.
+fn buffer_copy_gpu_window(
+    arena: &crate::buffer::Arena,
+    src: u64,
+    dst: u64,
+    nbytes: u64,
+    max_binding: u64,
+) -> Option<(u64, u64)> {
+    if crate::buffer::is_weight_off(src as usize)
+        || crate::buffer::is_weight_off(dst as usize)
+        || arena.is_sharded()
+        || crate::device::coop_discrete_backend()
+        || rlx_ir::env::flag("RLX_WGPU_HOST_BUFFER_COPY")
+    {
+        return None;
+    }
+    let lo = src.min(dst);
+    let hi = src.saturating_add(nbytes).max(dst.saturating_add(nbytes));
+    if hi.saturating_sub(lo) > max_binding {
+        return None;
+    }
+    // The window must cover [base, hi] with `base` floored to 256 B (≤ lo);
+    // sizing from `lo` instead clips a copy that straddles a 256 B boundary.
+    let mut base = (lo / 256) * 256;
+    let span = hi.saturating_sub(base).max(1);
+    let size = (span.div_ceil(256) * 256).max(256).min(max_binding);
+    if base.saturating_add(size) > arena.size as u64 {
+        base = ((arena.size as u64).saturating_sub(size) / 256) * 256;
+    }
+    Some((base, size))
+}
+
+/// Whether a `DequantMatmulGguf` step leaves its work on the device — the
+/// question [`Self::blocks_on_host`] and the run loop's `submit_only` ask.
+///
+/// The answer is the ladder's own ([`crate::gguf_gpu::select_path`]), which is
+/// what the executor dispatches on, so a step this calls device work is one the
+/// arm will not hand to [`crate::gguf_host`]. It used to restate the ladder's
+/// terms instead, and the restatement was not the same statement: `m == 1` is
+/// true of *every* scheme's single row, including Q5_K's and the block-FP8
+/// ids', which the ladder sends to the host whenever no dequant slab is booked.
+/// `Host` is the only answer that reads the arena back to the CPU, and it is the
+/// one this now tests for.
+fn gguf_step_is_gpu_only(
+    step: &Step,
+    active_extent: Option<(usize, usize)>,
+    scratch_off: usize,
+) -> bool {
+    let Step::DequantMatmulGguf {
+        m,
+        k,
+        scheme_id,
+        x_byte_off,
+        ..
+    } = step
+    else {
+        return false;
+    };
+    let m = match active_extent {
+        Some((a, u)) if u > 0 => (*m as usize * a).div_ceil(u).min(*m as usize),
+        _ => *m as usize,
+    };
+    crate::gguf_gpu::select_path(
+        m,
+        *k as usize,
+        *scheme_id,
+        *x_byte_off as usize,
+        scratch_off,
+    ) != crate::gguf_gpu::DequantMatmulPath::Host
+}
+
+/// Step-profile label: the step kind, plus the shape for the kinds whose cost
+/// depends on it (`RLX_WGPU_STEP_PROFILE`).
+fn profile_label(step: &Step) -> &'static str {
+    match step {
+        Step::Matmul {
+            m,
+            k,
+            n,
+            batch,
+            compute_precision,
+            ..
+        } => {
+            crate::step_profile::intern(format!("matmul {batch}x{m}x{k}x{n} {compute_precision:?}"))
+        }
+        Step::Attention { params, .. } => crate::step_profile::intern(format!(
+            "attention q{} k{} h{} d{}",
+            params.seq_q, params.seq_k, params.heads, params.head_dim
+        )),
+        Step::Narrow { params } => crate::step_profile::intern(format!(
+            "narrow total{} o{} i{} ax{}->{}@{}",
+            params.total,
+            params.outer,
+            params.inner,
+            params.axis_in_size,
+            params.axis_out_size,
+            params.start
+        )),
+        Step::Concat { params } => crate::step_profile::intern(format!(
+            "concat total{} o{} i{} ax{}->{}",
+            params.total, params.outer, params.inner, params.axis_in_size, params.axis_out_size
+        )),
+        other => step_name(other),
+    }
 }

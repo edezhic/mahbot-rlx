@@ -17,6 +17,7 @@ ones. docs.rs builds one crate at a time with that crate's
 Usage:
   python3 scripts/check-rustdoc.py              # all publishable crates
   python3 scripts/check-rustdoc.py rlx-tensor   # just these
+  python3 scripts/check-rustdoc.py --contour    # the fork's default build set only
   python3 scripts/check-rustdoc.py --keep-going # report every crate, not just the first bad one
 """
 
@@ -33,8 +34,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # Warnings rustdoc emits that are not the crate's fault. A build-script `cargo:warning`
-# is printed by rustdoc runs too, and ours say "kernels not built on this host".
-NOISE = re.compile(r"^warning: [a-z0-9-]+@\d")
+# is printed by rustdoc runs too, and ours say "kernels not built on this host"; and
+# cargo's own manifest lints (`unused manifest key`, `generated N warning`) arrive on the
+# same stream, where counting them would report a hundred diagnostics for one bad link.
+NOISE = re.compile(
+    r"^(warning: [a-z0-9-]+@\d"
+    r"|warning: (workspace \(manifest\)|`[^`]+` \(manifest\)|\S*Cargo\.toml:) )"
+)
 
 
 def metadata() -> dict:
@@ -66,13 +72,21 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("crates", nargs="*", help="only these packages (default: all publishable)")
     ap.add_argument("--keep-going", action="store_true", help="do not stop at the first bad crate")
+    ap.add_argument(
+        "--contour",
+        action="store_true",
+        help="only the fork's default build set (the root manifest's `default-members`)",
+    )
     args = ap.parse_args()
 
     md = metadata()
+    contour = set(md.get("workspace_default_members") or [])
     targets: list[tuple[str, list[str]]] = []
     skipped: list[str] = []
     for pkg in sorted(md["packages"], key=lambda p: p["name"]):
         if args.crates and pkg["name"] not in args.crates:
+            continue
+        if args.contour and pkg["id"] not in contour:
             continue
         flags = docsrs_args(pkg)
         if flags is None:

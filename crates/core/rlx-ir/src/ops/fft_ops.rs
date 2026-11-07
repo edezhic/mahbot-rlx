@@ -10,6 +10,7 @@
 //! the underlying `Op::Fft` nodes via thunks or host fallback.
 
 use crate::infer::GraphExt as _;
+use crate::prelude::*;
 use crate::{DType, Graph, NodeId, Op, Shape, fft::FftNorm};
 
 impl Graph {
@@ -131,14 +132,15 @@ impl Graph {
         let batch: usize = (0..last).map(|i| xs.dim(i).unwrap_static()).product();
 
         // Host-build the [n, n/2+1] DFT matrices in f64, baked as f32 constants.
-        let two_pi = 2.0 * std::f64::consts::PI;
+        let two_pi = 2.0 * core::f64::consts::PI;
         let mut cos_m = vec![0f32; n * n_freq];
         let mut nsin_m = vec![0f32; n * n_freq];
         for t in 0..n {
             for k in 0..n_freq {
                 let ang = two_pi * (k as f64) * (t as f64) / (n as f64);
-                cos_m[t * n_freq + k] = ang.cos() as f32;
-                nsin_m[t * n_freq + k] = -(ang.sin() as f32);
+                let (s, c) = sin_cos(ang);
+                cos_m[t * n_freq + k] = c as f32;
+                nsin_m[t * n_freq + k] = -(s as f32);
             }
         }
         let cos = self.const_f32_tensor(cos_m, &[n, n_freq]);
@@ -393,6 +395,15 @@ impl Graph {
             Shape::scalar(DType::F32),
         )
     }
+}
+
+/// `(sin, cos)` for host-built DFT matrices: rlx-libm's reference under
+/// `parity` (std's is musl on wasm, so a browser would bake different ones).
+fn sin_cos(x: f64) -> (f64, f64) {
+    #[cfg(feature = "parity")]
+    return (rlx_libm::reference::sin(x), rlx_libm::reference::cos(x));
+    #[cfg(not(feature = "parity"))]
+    (x.sin(), x.cos())
 }
 
 #[cfg(test)]

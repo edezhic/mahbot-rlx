@@ -22,8 +22,6 @@ use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts};
 
 mod common;
 
-use common::RUN_REPORT_SWITCH;
-
 /// Rows in the cache, the row width, and where the new row lands: a non-zero offset
 /// inside a long-lived slot, as in `buffer_copy_batch_join.rs`.
 const CAP: usize = 64;
@@ -31,27 +29,12 @@ const W: usize = 64;
 const POS: usize = CAP - 2;
 
 /// The knobs that would change this graph's node residency or routing — and so the
-/// number of slots the scan reads — or what a submission or a wait means. The
-/// sibling counter pins guard the same set; `RLX_DEBUG_NANS` and its alias are this
-/// pin's own switches, set and unset inside it.
-const GUARDED: [&str; 16] = [
-    "RLX_WGPU_SNAPSHOT",
-    "RLX_BENCH_DISPATCH_ONLY",
-    "RLX_WGPU_ALL_PARAMS_WEIGHT",
-    "RLX_WGPU_HOST_EAGER_H2D",
-    "RLX_WGPU_HOST_BUFFER_COPY",
-    "RLX_WGPU_CONCAT_HOST",
-    "RLX_WGPU_FORCE_HOST",
-    "RLX_WGPU_HOST_MATMUL",
-    "RLX_DEBUG_NANS",
-    "RLX_WGPU_NAN_TRACE",
-    "RLX_WGPU_DISCRETE_HOST",
-    "RLX_WGPU_SHARD_CAP_MIB",
-    "RLX_WGPU_SHARD_STAGE_MIB",
-    "RLX_WGPU_SHARD_GPU",
-    "RLX_WGPU_ALLOW_SHARD",
-    RUN_REPORT_SWITCH,
-];
+/// number of slots the scan reads — or what a submission or a wait means. Derived
+/// from the registry; this pin owns none, since its own two switches are set and
+/// unset inside it and must not be pre-set by an operator either.
+fn guarded() -> Vec<&'static str> {
+    common::guarded_switches(&[])
+}
 
 /// A row write into an existing cache slot — `KvAppend`'s lower on this backend —
 /// as the schedule's only step, so the copy is what the run ends with.
@@ -76,13 +59,14 @@ fn a_copy_ending_graph_is_still_scanned() {
     }
     // This pin owns the scan's own switches, so its two readings cannot be mixed up
     // with an operator's; the rest would move what the readings count.
-    for key in GUARDED {
+    for key in guarded() {
         assert!(
             !rlx_ir::env::flag(key),
             "{key} changes this graph's residency, routing or submission shape; unset \
              it to run this pin"
         );
     }
+    common::pin_tuning_cache_off("buffer-copy-nan-scan");
 
     let g = kv_row_graph();
     // The premise: the row write is the schedule's last step, so the run returns

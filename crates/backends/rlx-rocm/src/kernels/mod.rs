@@ -585,6 +585,14 @@ kernel_cache!(
     "softmax_cross_entropy_backward"
 );
 kernel_cache!(LAYERNORM, layernorm_kernel, LAYERNORM_CU, "rlx_norm");
+// The shared gated delta-net recurrence (CUDA's): one block per
+// (batch, head), one thread per state row.
+kernel_cache!(
+    GATED_DELTA_NET,
+    gated_delta_net_kernel,
+    GATED_DELTA_NET_CU,
+    "gated_delta_net"
+);
 kernel_cache!(
     LAYER_NORM_BWD_INPUT,
     layer_norm_bwd_input_kernel,
@@ -608,6 +616,18 @@ kernel_cache!(
     fake_quantize_perbatch_kernel,
     FAKE_QUANTIZE_CU,
     "fake_quantize_perbatch"
+);
+kernel_cache!(
+    ROUND_TO_FORMAT,
+    round_to_format_kernel,
+    ROUND_TO_FORMAT_CU,
+    "round_to_format"
+);
+kernel_cache!(
+    DOUBLE_SINGLE,
+    double_single_kernel,
+    DOUBLE_SINGLE_CU,
+    "double_single"
 );
 kernel_cache!(
     FAKE_QUANTIZE_EMA,
@@ -728,6 +748,13 @@ kernel_cache!(
     ATTENTION_WARP_CU,
     "attention_warp"
 );
+// Split-KV decode variant (one block per row) — same source file.
+kernel_cache!(
+    ATTENTION_WARP_SPLIT,
+    attention_warp_split_kernel,
+    ATTENTION_WARP_CU,
+    "attention_warp_split"
+);
 kernel_cache!(
     ATTENTION_BWD,
     attention_bwd_kernel,
@@ -833,6 +860,21 @@ kernel_cache!(
     dequant_matmul_gguf_q4k_gemv_kernel,
     DEQUANT_MATMUL_GGUF_CU,
     "dequant_matmul_gguf_q4k_gemv"
+);
+// Element-strided decode GEMV for Q8_0 / Q4_K / Q6_K (all threads busy at
+// any k; the Q4_K kernel above idles all but k/256 of them).
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_GEMV_ELEM,
+    dequant_matmul_gguf_gemv_elem_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_gemv_elem"
+);
+// The same GEMV for a verify step's 2–4 rows.
+kernel_cache!(
+    DEQUANT_MATMUL_GGUF_GEMV_ROWS,
+    dequant_matmul_gguf_gemv_rows_kernel,
+    DEQUANT_MATMUL_GGUF_CU,
+    "dequant_matmul_gguf_gemv_rows"
 );
 kernel_cache!(SAMPLE, sample_kernel, SAMPLE_CU, "sample");
 // On-device Philox4×32-10 RNG (shared `rng_philox.cu`, bit-matched to
@@ -1114,6 +1156,7 @@ pub fn prewarm_all(ctx: &Arc<RocmContext>) {
     let _ = attention_kernel(ctx);
     let _ = attention_row_kernel(ctx);
     let _ = attention_warp_kernel(ctx);
+    let _ = attention_warp_split_kernel(ctx);
     let _ = kv_append_kernel(ctx);
     let _ = attention_bwd_kernel(ctx);
     let _ = argmax_kernel(ctx);

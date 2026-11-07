@@ -29,7 +29,7 @@ rlx-fusion = { workspace = true }
 rlx-cpu = { package = "mahbot-rlx-cpu", path = "../rlx-cpu", version = "0.2.18-mahbot.2", default-features = false }
 
 # WebGL2 runtime — wasm only.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+[target.'cfg(target_family = "wasm")'.dependencies]
 wasm-bindgen = "0.2.118"
 js-sys = "0.3.95"
 web-sys = { version = "0.3.95", features = [
@@ -45,6 +45,7 @@ web-sys = { version = "0.3.95", features = [
     "WebGlUniformLocation",
     "WebGlVertexArrayObject",
     "Window",
+    "console",
 ] }
 
 [dev-dependencies]
@@ -59,7 +60,12 @@ rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime" 
 # exec_cpu `Op::Custom` host-delegate can be tested end-to-end without a network
 # (the copy_to_parallel kernel is a pure identity copy, needs no process group).
 # Path-only test dep — stripped from the published manifest.
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# In-browser tests of the GL shaders themselves (`tests/gl_conv_parity.rs`):
+# `wasm-pack`-free, run with wasm-bindgen-test-runner (see that file).
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 rlx-collectives = { path = "../../core/rlx-collectives" }
 
 [features]
@@ -96,3 +102,28 @@ required-features = ["backend-tests"]
 [lib]
 # No doctests in this crate: the empty stage was pure rustdoc cost.
 doctest = false
+
+[[test]]
+name = "gl_conv_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gl_layout_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "host_fallback_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "long_rows"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "ops3_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "texture_limit"
+required-features = ["backend-tests"]
+

@@ -466,14 +466,26 @@ fn a_supplied_prologue_region_resizes_the_input_its_prologue_input_names() {
     assert_matches(&got, &want, Activation::Round, "supplied prologue operand");
 }
 
-/// The one region kind the expansion machinery declines, so the only one the lowering's
-/// refusal can see: a `BatchElementwiseRegion` whose input count contradicts its own
-/// `num_batch_inputs`, which `DecomposeFusionRegions` copies through untouched.
+/// The structural half of the region guard, which is the half still reachable: a
+/// `BatchElementwiseRegion` whose input count contradicts its own `num_batch_inputs`,
+/// copied through untouched by `DecomposeFusionRegions`, is refused by name rather than
+/// lowered onto operands it does not have.
 ///
 /// Fed to the direct entry point, because `Session::compile`'s verifier rejects such a
-/// node in a debug build and the device path here is release. Refusing loudly is the
-/// point: the alternative is an activation the kernel has no arm for, computed as its
-/// own input.
+/// node in a debug build and the device path here is release.
+///
+/// This check used to be aimed at the *activation-coverage* half of that guard: it
+/// carried `Recip`, the one code the wgsl region kernel was once missing, and expected
+/// the arm to refuse with "no arm for that code". That premise is gone. The kernel's
+/// dispatch is now generated from the `rlxsl` manifest — `rlx_activation_apply` — so
+/// `WGSL_REGION_KERNEL_ACTIVATION_SUBS` covers all 29 activations,
+/// `first_unimplemented_activation` never finds one, and
+/// `crate::unfuse::expand_unimplemented_regions` therefore never expands anything.
+/// "The kernel has no arm for this code" is unreachable for any real `Activation`, and
+/// what remains is the structural contradiction: the lowering indexes `node.inputs[i]`
+/// for `i` in `0..num_batch_inputs`, which panicked on the index instead of refusing.
+/// Refusing loudly is the point: the alternative is a region computed over operands it
+/// never declared.
 #[test]
 fn a_region_the_expansion_cannot_reach_is_refused_rather_than_computed() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
@@ -512,8 +524,15 @@ fn a_region_the_expansion_cannot_reach_is_refused_rather_than_computed() {
         .or_else(|| raised.downcast_ref::<&str>().map(|s| s.to_string()))
         .unwrap_or_default();
     assert!(
-        message.contains("Recip") && message.contains("no arm for that code"),
-        "the refusal must name the activation and the kernel's missing arm; got: {message}"
+        message.contains("REFUSED (batch region operand count)"),
+        "the refusal must be this backend's own, not a panic from an index: got: {message}"
+    );
+    assert!(
+        message.contains(&format!("{out:?}"))
+            && message.contains("num_batch_inputs=2")
+            && message.contains("has 1 operand"),
+        "the refusal must name the region, the slice count it declares and the one it has; \
+         got: {message}"
     );
     assert!(
         message.contains("no switch on this backend"),

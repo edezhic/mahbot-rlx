@@ -15,7 +15,7 @@ use rlx_xdna::npu_gemm::NpuGemm;
 use std::time::Instant;
 
 fn env(k: &str, d: &str) -> usize {
-    std::env::var(k)
+    rlx_ir::env::read(k)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| d.parse().unwrap())
@@ -33,8 +33,9 @@ fn main() {
     );
 
     // 2) COMPILE via native aiecc (no Python).
-    let aiecc = std::env::var("AIECC").expect("set AIECC");
-    let peano = std::env::var("PEANO").expect("set PEANO");
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let aiecc = tc.aiecc_str();
+    let peano = tc.peano_str();
     let tmp = "/tmp/rlx_mm_emit";
     std::fs::create_dir_all(tmp).ok();
     let mp = format!("{tmp}/aie.mlir");

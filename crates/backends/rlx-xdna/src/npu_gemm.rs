@@ -23,6 +23,54 @@ use std::ffi::{CString, c_char, c_int, c_void};
 
 use crate::XdnaError;
 
+/// NPU hardware contexts open right now through this module's handles
+/// ([`NpuGemm`], [`NpuIo`], [`NpuMm32`], [`NpuRun3`]); each holds one from
+/// `open` until drop.
+static OPEN_CONTEXTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Hardware contexts currently open in this process (see [`max_contexts`]).
+pub fn open_contexts() -> usize {
+    OPEN_CONTEXTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many hardware contexts this process should hold at once:
+/// `RLX_XDNA_MAX_CONTEXTS`, default 4. `amdxdna` caps concurrent contexts per
+/// process (4 measured on Phoenix by xdna-npu-toolkit), and a context past the
+/// cap fails to open rather than queueing, so callers that cache contexts (the
+/// runtime's chain executor) evict their idle ones before reaching it.
+pub fn max_contexts() -> usize {
+    rlx_ir::env::var("RLX_XDNA_MAX_CONTEXTS")
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
+
+fn context_opened() {
+    OPEN_CONTEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn context_closed() {
+    OPEN_CONTEXTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The error for a shim `*_open` that returned null. Names the open-context
+/// count when it is at the budget — the likeliest cause, and one XRT's own
+/// stderr message does not spell out.
+fn open_failed(symbol: &str) -> XdnaError {
+    let (open, max) = (open_contexts(), max_contexts());
+    let hint = if open >= max {
+        format!(
+            "; {open} NPU hardware contexts already open in this process (budget {max}, \
+             RLX_XDNA_MAX_CONTEXTS) — drop compiled XDNA graphs you no longer need"
+        )
+    } else {
+        String::new()
+    };
+    XdnaError(format!(
+        "{symbol} returned null (XRT error on stderr){hint}"
+    ))
+}
+
 type OpenFn = unsafe extern "C" fn(
     *const c_char, // xclbin path
     *const u32,    // instruction stream (u32 words)
@@ -40,8 +88,7 @@ type CloseFn = unsafe extern "C" fn(*mut c_void);
 
 fn resolve_shim(shim_path: &str) -> Result<String, XdnaError> {
     if shim_path.is_empty() {
-        rlx_ir::env::var("RLX_XDNA_SHIM")
-            .ok_or_else(|| XdnaError("no shim path (set RLX_XDNA_SHIM or pass shim_path)".into()))
+        crate::shim_path().map_err(XdnaError)
     } else {
         Ok(shim_path.to_string())
     }
@@ -50,6 +97,21 @@ fn resolve_shim(shim_path: &str) -> Result<String, XdnaError> {
 /// A persistent INT8-GEMM context on the NPU (device/xclbin/hw_context/kernel +
 /// resident BOs held open). Create once, [`run`](Self::run) many times; the
 /// expensive setup is paid only in [`open`](Self::open).
+/// Pass the per-command wait bound to a freshly loaded shim:
+/// `RLX_XDNA_WAIT_MS` (default 10 000; `0` waits forever). A command that
+/// overruns it is aborted and its call fails instead of hanging the process.
+fn configure_shim(lib: &libloading::Library) {
+    type SetWait = unsafe extern "C" fn(u32);
+    // SAFETY: the symbol, when present, is the shim's `void(unsigned)` setter.
+    if let Ok(f) = unsafe { lib.get::<SetWait>(b"rlx_xdna_set_wait_ms") } {
+        let ms = rlx_ir::env::var("RLX_XDNA_WAIT_MS")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10_000);
+        // SAFETY: plain value setter, no pointers.
+        unsafe { f(ms) };
+    }
+}
+
 pub struct NpuGemm {
     // Fields drop in declaration order *after* `Drop::drop` runs, so `close_fn`
     // (called in drop) still sees `_lib` mapped. Keep `_lib` last for clarity.
@@ -81,6 +143,7 @@ impl NpuGemm {
         let shim = resolve_shim(shim_path)?;
         let lib = unsafe { libloading::Library::new(&shim) }
             .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
+        configure_shim(&lib);
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
@@ -115,10 +178,9 @@ impl NpuGemm {
             )
         };
         if handle.is_null() {
-            return Err(XdnaError(
-                "rlx_xdna_gemm_open returned null (XRT error on stderr)".into(),
-            ));
+            return Err(open_failed("rlx_xdna_gemm_open"));
         }
+        context_opened();
         Ok(Self {
             handle,
             run_fn,
@@ -207,6 +269,7 @@ impl NpuGemm {
 impl Drop for NpuGemm {
     fn drop(&mut self) {
         unsafe { (self.close_fn)(self.handle) }
+        context_closed();
     }
 }
 
@@ -240,6 +303,7 @@ impl NpuIo {
         let shim = resolve_shim(shim_path)?;
         let lib = unsafe { libloading::Library::new(&shim) }
             .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
+        configure_shim(&lib);
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
@@ -257,10 +321,9 @@ impl NpuIo {
         let xclbin_c = CString::new(xclbin_path).unwrap();
         let handle = unsafe { open_fn(xclbin_c.as_ptr(), insts.as_ptr(), insts.len(), n as c_int) };
         if handle.is_null() {
-            return Err(XdnaError(
-                "rlx_xdna_io_open returned null (XRT error on stderr)".into(),
-            ));
+            return Err(open_failed("rlx_xdna_io_open"));
         }
+        context_opened();
         Ok(Self {
             handle,
             run_fn,
@@ -301,6 +364,7 @@ impl NpuIo {
 impl Drop for NpuIo {
     fn drop(&mut self) {
         unsafe { (self.close_fn)(self.handle) }
+        context_closed();
     }
 }
 
@@ -407,7 +471,9 @@ impl NpuIoBf16 {
         // `Vec<u16>` does not promise. Little-endian keeps element order.
         let bf: Vec<u16> = input.iter().map(|&f| f32_to_bf16(f)).collect();
         let as_i32: Vec<i32> = bf
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i32::from(c[0]) | (i32::from(c[1]) << 16))
             .collect();
         debug_assert_eq!(as_i32.len(), self.n / 2);
@@ -455,6 +521,7 @@ impl NpuMm32 {
         let shim = resolve_shim(shim_path)?;
         let lib = unsafe { libloading::Library::new(&shim) }
             .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
+        configure_shim(&lib);
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
@@ -480,10 +547,9 @@ impl NpuMm32 {
             )
         };
         if handle.is_null() {
-            return Err(XdnaError(
-                "rlx_xdna_mm32_open returned null (XRT error on stderr)".into(),
-            ));
+            return Err(open_failed("rlx_xdna_mm32_open"));
         }
+        context_opened();
         Ok(Self {
             handle,
             run_fn,
@@ -510,6 +576,7 @@ impl NpuMm32 {
 impl Drop for NpuMm32 {
     fn drop(&mut self) {
         unsafe { (self.close_fn)(self.handle) }
+        context_closed();
     }
 }
 
@@ -548,6 +615,7 @@ impl NpuRun3 {
         let shim = resolve_shim(shim_path)?;
         let lib = unsafe { libloading::Library::new(&shim) }
             .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
+        configure_shim(&lib);
         let sym = |name: &[u8]| -> Result<*mut c_void, XdnaError> {
             unsafe { lib.get::<*mut c_void>(name) }
                 .map(|s| *s)
@@ -573,10 +641,9 @@ impl NpuRun3 {
             )
         };
         if handle.is_null() {
-            return Err(XdnaError(
-                "rlx_xdna_run3_open returned null (XRT error on stderr)".into(),
-            ));
+            return Err(open_failed("rlx_xdna_run3_open"));
         }
+        context_opened();
         Ok(Self {
             handle,
             run_fn,
@@ -611,6 +678,7 @@ impl NpuRun3 {
 impl Drop for NpuRun3 {
     fn drop(&mut self) {
         unsafe { (self.close_fn)(self.handle) }
+        context_closed();
     }
 }
 
@@ -638,6 +706,7 @@ pub fn run_passthrough(
     let shim = resolve_shim(shim_path)?;
     let lib = unsafe { libloading::Library::new(&shim) }
         .map_err(|e| XdnaError(format!("dlopen {shim}: {e}")))?;
+    configure_shim(&lib);
     let f = unsafe { lib.get::<PassthroughFn>(b"rlx_xdna_run_passthrough") }
         .map_err(|e| XdnaError(format!("shim symbol rlx_xdna_run_passthrough: {e}")))?;
     let xclbin_c = CString::new(xclbin_path).unwrap();

@@ -20,7 +20,12 @@ fn main() {
     unsafe {
         std::env::set_var("PROTOC", protoc);
     }
+    // Ordered maps: prost encodes a HashMap field in its (per-process random)
+    // iteration order, so the same model serialised to different bytes in
+    // every process and the compiled-model cache, keyed by those bytes,
+    // never hit.
     prost_build::Config::new()
+        .btree_map(["."])
         .compile_protos(&["proto/coreml.proto"], &["proto"])
         .expect("prost-build: compile_protos failed");
     println!("cargo:rerun-if-changed=proto/coreml.proto");
@@ -43,5 +48,40 @@ fn main() {
         println!("cargo:rerun-if-changed=csrc/coreml_shim.h");
         println!("cargo:rustc-link-lib=framework=CoreML");
         println!("cargo:rustc-link-lib=framework=Foundation");
+        // The shim's `@available` checks compile to
+        // `___isPlatformVersionAtLeast`, which lives in clang's runtime
+        // (`libclang_rt.<os>.a`). Rust links with `-nodefaultlibs`, so name it
+        // here. It used to arrive only when rlx-mlx-sys was also linked; a
+        // CoreML-without-MLX build failed with an undefined symbol.
+        if target_os == "macos" {
+            link_clang_rt("osx");
+        }
+    }
+}
+
+/// Add `libclang_rt.<variant>.a` from the active clang to the link line.
+fn link_clang_rt(variant: &str) {
+    let libname = format!("libclang_rt.{variant}.a");
+    let out = std::process::Command::new("clang")
+        .arg(format!("--print-file-name={libname}"))
+        .output();
+    let path = match out {
+        Ok(o) if o.status.success() => {
+            std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim())
+        }
+        _ => {
+            println!("cargo:warning=rlx-coreml: could not run `clang --print-file-name={libname}`");
+            return;
+        }
+    };
+    match path.parent() {
+        Some(dir) if path.is_file() => {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=clang_rt.{variant}");
+        }
+        _ => println!(
+            "cargo:warning=rlx-coreml: {libname} not found ({})",
+            path.display()
+        ),
     }
 }

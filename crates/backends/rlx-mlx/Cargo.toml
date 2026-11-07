@@ -26,6 +26,7 @@ native-mxfp = []
 [dependencies]
 rlx-mlx-sys = { workspace = true }
 rlx-ir = { workspace = true }
+rlxsl = { workspace = true }
 rlx-driver = { workspace = true }
 rlx-opt = { workspace = true }
 rlx-gguf = { workspace = true }
@@ -130,3 +131,4 @@ required-features = ["backend-tests"]
 [[test]]
 name = "q1_0_ondevice_parity"
 required-features = ["backend-tests"]
+

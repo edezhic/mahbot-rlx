@@ -1,0 +1,39 @@
+[package]
+name = "rlx-signal"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+description = "scipy.signal reproduced bit-for-bit: Butterworth design, zpk2sos, lfilter/sosfilt (+zi, filtfilt), firwin and cosine windows"
+authors.workspace      = true
+license.workspace      = true
+keywords = ["scipy", "signal", "iir", "fir", "parity"]
+categories = ["science", "mathematics"]
+readme                 = "README.md"
+repository.workspace   = true
+documentation.workspace = true
+
+[lib]
+name = "rlx_signal"
+path = "src/lib.rs"
+
+[dependencies]
+# NumPy's LAPACK entry points (`np.linalg.solve` in `lfilter_zi`)
+rlx-cpu = { workspace = true }
+rlx-numpy = { workspace = true }
+# the reference platform's libm (glibc's off Apple: Linux and wasm agree)
+rlx-libm = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+rustdoc-args   = ["--cfg", "docsrs"]
+
+[features]
+# Platform C libm for rlx-libm's `reference` (macOS-exact NumPy/SciPy); off = pure Rust.
+libm = ["rlx-libm/libm"]
+
+# The test fixtures are SciPy on macOS arm64: tests compute with its libm.
+# (Library builds default to the pure-Rust ports; see rlx-libm `libm`.)
+[dev-dependencies]
+rlx-libm = { workspace = true, features = ["libm"] }

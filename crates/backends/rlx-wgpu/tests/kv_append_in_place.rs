@@ -755,7 +755,7 @@ fn a_striped_arena_still_computes_its_row() {
         FILTER,
         MARKER,
         FIXTURE,
-        &common::CLEARED_SWITCHES,
+        &common::cleared_switches(),
         &[
             ("RLX_WGPU_SHARD_CAP_MIB", "2"),
             ("RLX_WGPU_SHARD_STAGE_MIB", "1"),

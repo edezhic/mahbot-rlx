@@ -23,9 +23,2867 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ## [Unreleased]
 
+### Fixed
+
+- `rlx_libm::reference::*` now honours `platform::use_linux_reference()`.
+  Before, on Apple targets with the `libm` feature it chose Apple's libm at
+  compile time, so the runtime switch never reached it. A browser/native
+  comparison showed the cost: exgb's native `portable` build on macOS computed
+  Apple's `logf` on 55 of 12288 probe inputs, against the browser's glibc
+  values. The Apple arms (`apple_or!`, `erfc`, `cexp`, `csqrt`) now take the
+  system libm only while `apple_reference()` holds; `sincos` and
+  `sincosf_merged` only while `macos_reference()` holds. Pinned by
+  `tests/linux_reference_switch.rs`, which fails with the switch ignored.
+- `flt32.rs`: `zeroinfnan` and `powf`'s special-case tests double `u32` bit
+  patterns as glibc does, relying on wrapping. Debug builds panicked on every
+  negative input. They now use `wrapping_mul`, which computes what release
+  builds already did. The same pattern in `dbl64.rs` (line 256) still panics
+  in debug builds.
+- `rlx-onnx-import` now decodes BFLOAT16 initializers. The vendored schema has
+  no BFLOAT16 variant, so `data_type` read as `UNDEFINED`, the
+  `FLOAT | UNDEFINED` arm in `tensor_to_f32` matched first, and the BF16 arm
+  below it never ran — every BF16 weight failed the import. The arm now runs
+  first on the raw ONNX number. Pinned by
+  `bfloat16_initializer_survives_parse_and_decodes`.
+
+### Security
+
+- `rlx-onnx-proto` / `rlx-onnx-import`: `protobuf` 1.7.5 → 3.7.2, fixing
+  CVE-2019-15544 (GHSA-mh6h-f25p-98f8, uncontrolled memory consumption) and
+  CVE-2025-53605 (GHSA-2gh3-rmm4-6rq5, crash from uncontrolled recursion);
+  both are reachable by parsing an untrusted `.onnx` file. `src/onnx.rs` is
+  regenerated from `onnx.proto`, recovered from the 1.x bindings' embedded
+  descriptor, so the schema is unchanged; `regen/` reproduces it byte-for-byte
+  with the pure-Rust parser (no `protoc`). The 3.x API replaces `get_*`
+  getters with public fields and plain getters (`ModelProto::ir_version()`),
+  and nested types move into modules (`tensor_proto::DataType`).
+  `prepare_onnx_file` output is identical before and after on 17 real models,
+  external-data ones included.
+
+## [0.2.20] — 2026-11-02
+
+### Added
+
+- `rlx_libm::aarch64::{expf, exp2, exp10, cbrt, hypot}`: glibc 2.43 as built
+  for Linux aarch64, the five functions where it rounds differently from the
+  x86-64 build the root functions reproduce. `expf` / `exp10` take `k` from
+  `round` (aarch64's `TOINT_INTRINSICS`, ties away from zero) instead of the
+  shift trick; `exp2` / `exp10` / `cbrt` are fused the way gcc fuses them
+  there (x86-64 has no `-mfma` build of these); `hypot` uses the
+  `__FP_FAST_FMA` kernel. Every other export is the same on both builds.
+- `rlx-libm` verification against glibc 2.43 on both builds (Ubuntu 26.04's
+  2.43-2ubuntu2.4: x86-64 on a Linux rig, aarch64 in an arm64 container),
+  zero tolerance:
+  - `tests/glibc_2_43_vectors.rs` replays hashed glibc outputs for **every**
+    exported function (was 41; now also `exp`/`log`/`pow`/`sin`/`cos`/`tan`,
+    `expm1`/`log1p`/`erfc`, `expf`/`logf`/`sinf`/`cosf`/`tanhf`, `fma`/`fmaf`,
+    `fmod`/`fdim`, the rounding functions, `sincos`, trig arguments up to
+    2^1023) on any OS, and `every_export_has_glibc_vectors` fails on an export
+    without them.
+  - `tools/glibc-exhaustive`: each one-argument f32 port against glibc on all
+    2^32 inputs, writing hashes that `tests/f32_exhaustive.rs`
+    (`just test-libm-exhaustive`, ~7 min) re-checks on any OS; `--f64 N`
+    samples the f64 ports. Result: all 32 f32 functions equal on every input
+    on both builds; all 35 f64 functions equal on 10 M samples each.
+  - `just test-libm` (in `just ci`): no_std, `export-glibc`, `libm`, the shim
+    and `just test-libm-vs-musl`, the musl comparison, now a standalone tool
+    (`tools/vs-musl`) so the workspace's `libm` patch does not replace it.
+- `rust-libm` feature (`rlx-cpu`, `rlx-runtime`, `rlx`; part of `pure-rust`,
+  which `rlx-runtime` and `rlx` now forward): std's float methods in every
+  crate of an executable (`f64::sin`, `f32::exp`, `%`, …) run rlx-libm's Rust
+  ports instead of the platform's C libm, through `export-glibc`, which now
+  also defines every libcall std emits: `fmod`/`fmodf` (`%`), `fdim`, `fma` /
+  `fmaf`, and on x86-64 without SSE4.1 `floor`/`ceil`/`trunc`/`round`/`rint` /
+  `roundeven`. `tests/export_glibc.rs` checks std's methods equal the ports.
+  For executables only (a cdylib would export `sin` to its host process).
+- `crates/numerics/libm-shim` and `[patch.crates-io] libm`: the `libm` that
+  naga and num-traits (via `half`) depend on is answered by rlx-libm, so no
+  musl copy is in the dependency tree.
+- `rlx-libm` has no dependencies and builds `no_std` (`std` feature, on by
+  default): pure-Rust correctly rounded `sqrt`, exact `floor`/`ceil`/`trunc` /
+  `round`/`rint`, `fmod`, `fdim` and their f32 forms, the correctly rounded
+  `fmaf` and the integer `fma_exact`. rlx-ir's and rlx-mcu's `no_std` float
+  math, rlx-cpu's f64 `erf` and FFT twiddles and rlx-spectral's windows / mel
+  scales use them instead of the `libm` crate.
+- `rlx_libm::reference::{asin, cexp, csqrt, sincosf_merged}`; rlx-special,
+  rlx-signal and rlx-rng reach Apple's libm only through `reference` (with the
+  `libm` feature) instead of `extern "C"` / std calls.
+- `rlx-libm`: the rest of glibc 2.43's float math in pure Rust — CORE-MATH's
+  correctly rounded `lgamma`/`lgamma_r`/`tgamma`, `atanh`/`asinh`/`acosh`,
+  IBM's `atan`/`atan2`/`asin`/`acos`, `tanh`/`cbrt`/`cosh`/`sinh`/`log10` /
+  `exp2`/`exp10`/`erf`, and f32 `powf`/`exp2f`/`exp10f`/`log2f`/`hypotf` /
+  `atan2f` plus the CORE-MATH f32 set (`acosf` … `tgammaf`).
+- `rlx-cpu`: the portable arithmetic as a run-time switch, `RLX_CPU_PORTABLE=1`
+  or `rlx_cpu::config::set_portable(true)` before the first compile (then
+  fixed for the process): bit-identical to the `portable` feature without
+  unifying it into other crates. `rlx-runtime/tests/cpu_portable_digest.rs`
+  pins one digest on macOS arm64 and Linux x86-64, feature and switch alike.
+- `rlx-ir`: `RLX_REPRODUCIBLE=1` / `set_reproducible`: automatic device
+  selection takes the CPU and the CPU backend one kernel per op on any host
+  (no calibrated BLAS-vs-NEON split, no core-count-dependent GEMM split).
+- `rlx_runtime::taps::NodeDigests` and `first_divergence`: record every tapped
+  node's digest in one run and name the first node where another run differs
+  (`subset` taps only a region's boundary).
+- `just update-mlx [REF] [--build]` (`rlx-mlx-sys/scripts/update-mlx.sh`):
+  moves the vendored MLX to a release tag, `main` or any ref, re-applying and
+  checking rlx's patches.
+- `rlx-wgpu`: `with_numeric_helpers` appends rlxsl's WGSL helpers
+  (`rlxsl/src/wgsl/numeric_helpers.wgsl`, or the fast twin under
+  `set_fast_math`) to any shader that calls them; 32 kernels' private copies
+  (1752 lines) are gone. New `rlx_log` (≤ 1 ULP, subnormal inputs) and
+  `rlx_tanh` (≤ 2 ULP); cross-entropy, sampling, RNG, recurrent and
+  scan kernels use the exact helpers instead of raw builtins.
+- `rlx-wgpu/patches/wgpu-hal-30-metal-math-mode.patch`: Metal safe math,
+  measured, not applied (+37 % on elementwise kernels; fixes only `sin` /
+  `cos` / `pow`).
+
+- `rlx-ir`: `FftPolicy` (`set_fft_policy`, env `RLX_FFT`), the FFT every
+  default `Op::Fft` runs, so a downstream task picks speed or reproducibility
+  without touching the model: `native` (each backend's own, the default),
+  `portable`, `scipy`, `pocketfft-nofma`. `Session::compile` resolves it
+  (`apply_fft_policy`), the autodiff backward FFTs included; an `Op::Fft`
+  built with an explicit algorithm keeps it.
+- `FftAlgo::PORTABLE`: pocketfft as the Linux x86-64 SciPy wheel (no FMA,
+  new `FftTwiddles::Linux`: glibc's `cos`/`sin` through rlx-libm and the x87
+  angle and norm on every host). The CPU runs its row kernel, every other
+  device the elementwise lowering (IEEE `add`/`mul` only), so it is the same
+  bits everywhere: measured equal on the CPU, wgpu, Metal and MLX
+  (`tests/fft_algo.rs`), and on macOS arm64 and Linux x86-64.
+- `rlx-pocketfft`: `Twiddles::Linux` and `norm_fct_as` (the `long double`
+  fixed by the caller).
+- `rlx-cpu`: `pool::set_wasm_threads`: a shared-memory (`+atomics`) wasm
+  build splits its kernels over a rayon pool of Web Workers the page started
+  (wasm-bindgen-rayon); otherwise wasm stays inline. Rows only, so the
+  results do not change with the thread count (measured: exgb cells equal on
+  1 and 8 threads, 1.95x faster training at 8).
+
+- `rlx-cpu`: a `portable` feature, the wasm build's arithmetic on every
+  target, so a CPU run rounds the same on macOS, Linux and in a browser. No
+  vendor BLAS is linked (`cblas_sgemm` is `sgemm_fused`: per element the
+  in-order fused-multiply-add chain the relaxed-SIMD wasm kernel computes,
+  pinned by `portable_gemm_is_the_in_order_fma_chain`); aarch64 leaves its
+  NEON kernels and Accelerate vForce, and x86-64 its AVX kernels and
+  thresholds, for the arms wasm takes (the build script sets `rlx_cpu_neon` /
+  `rlx_cpu_x86` only without it). Off by default: features unify across a
+  workspace, and it is slower. Measured with exgb: BCG-FM's CPU encoder
+  equal to the browser at all 437 nodes on macOS and on Linux x86-64, and
+  every op of exgb-web's CPU probe.
+- `rlx-libm`: an `export-glibc` feature, `wasm-glibc`'s symbols on every
+  target (plus `sincos` / `__sincos_stret`, which LLVM merges a sin and cos
+  into), and the functions with no glibc port (`powf`, `atan2`, `tanh`, …)
+  from the `libm` crate on every target including wasm. On macOS the ported
+  functions then hash equal to glibc 2.43's over 10^6 inputs each. For
+  binaries: it replaces the platform libm for the whole program.
+- `rlx-libm::platform`: which platform's reference the ports reproduce.
+  `apple_reference()` is true on Apple targets until `use_linux_reference()`
+  switches the process to the Linux x86-64 one (the arm wasm always takes):
+  rlx-pocketfft (contraction, `__sincos_stret` twiddles, the x87 angle),
+  rlx-signal, rlx-special and rlx-rng consult it. Native rlx-pocketfft then
+  equals the wasm build on every tested length.
+- `rlx-runtime`: `taps::NodeHashes`, a tap that makes every computed node an
+  extra output and hashes it, to find the first node where two runs of a
+  model (a browser and a native build) disagree.
+- `rlx-runtime`: `taps::enter`, a `with_tap` scope as a guard, for a caller
+  that compiles across an `await`; and `fit_batch_within` (an explicit arena
+  budget) with `WGPU_32BIT_ARENA_LIMIT`, so a 64-bit caller can fit the batch
+  the browser fits.
+
+- `rlx-libm`: `tanhf`, glibc's. Since 2.41 that is CORE-MATH's, correctly
+  rounded, and `tanh` in double rounded once matches it on all 2^32 inputs
+  (checked against glibc 2.43). `reference::tanhf` uses it off Apple; it was
+  musl's.
+- `rlx-libm`: a `wasm-glibc` feature. On wasm32 it defines `expf`, `logf`,
+  `log1pf`, `tanhf`, `sinf`, `cosf`, `exp`, `log`, `log2`, `pow`, `sin`,
+  `cos`, `tan`, `expm1`, `log1p`, `hypot` and `erfc` with the glibc ports,
+  replacing compiler-builtins' weak musl definitions for the whole binary, so
+  std's float math in every crate rounds as on Linux. Each port was checked
+  against glibc 2.43 on x86-64: the f32 ones on all 2^32 inputs, the f64 ones
+  on 3.2·10^8 samples each, with 0 mismatches. Without it, std math on wasm
+  differed from glibc on up to 13% of inputs (`hypot`).
+- `rlx-cpu` on wasm built with relaxed-simd: the hardware fused multiply-add.
+  `f32x4.relaxed_madd` may be fused or not depending on the engine, so a
+  startup probe checks it against the exact `fmaf` on a double-rounding case
+  and on subnormal results. When it is fused, the AVX2 mirrors use it: same
+  bits, and faster than even the old inexact loops (GELU 0.85 ns per element vs
+  16 ns emulated, LayerNorm 0.32 vs 2.3, softmax 0.65 vs 9.3). The GEMM also
+  uses it, so each element of C becomes the in-order FMA chain the GPU kernels
+  compute: 1.3–1.9× over the simd128 tiles (`Aᵀ·B` 59 GF/s, `A·Bᵀ` 70). When
+  it is not fused, nothing changes. CPU training in Chrome (ShallowConvNet,
+  EEGNet, DeepConvNet) runs 1.2–1.3× faster than the plain simd128 build.
+  Fused matmul bits differ from the plain build's, so a trained model's score
+  can move (DeepConvNet 0.636 → 0.650); the elementwise ops stay bit-identical.
+  Tests cover both paths, including a mutation check of each.
+- `rlx-cpu` wasm GEMM: the last `n % 8` columns (all of them when n < 8, as
+  in many conv products) run four rows to a vector, with every tail column's
+  sum in flight at once. They used to run one element at a time, slower than
+  the old loops (256×4×576: 3.4 GF/s, now 9.2; with hardware FMA 1.4, now 8.2).
+- `rlx-cpu`: a simd128 GEMM for wasm32 (no BLAS there). A 4 × 8 tile of C
+  stays in registers, and B is packed into 8-column panels. Each element is
+  still summed over `k` in order from the same start value, so results are
+  bit-identical to the scalar fallback loops; only speed changes. Transposed-B
+  products (attention `Q·Kᵀ`) run 4.5× faster, plain `A·B` 1.2×. Products with
+  fewer than 8 rows keep the old row-streaming loop.
+- `rlx-text`: `tool_plan`, which works out from the request text which tools a
+  chat request needs and checks each round of tool calls against that plan. The
+  host lists its tools with the phrases that call for each (`ToolIntent`), plus
+  any tool whose result a step needs first.
+  - `plan` turns a request into ordered steps; a step's prerequisite is planned
+    ahead of it.
+  - `ToolPlan::hint` is a prompt block that lists each step as a call the model
+    can copy.
+  - `ToolPlan::review_round` returns the planned calls the model skipped and
+    the calls to hold back because an input isn't in yet.
+  - `ToolPlan::follow_up` tells the model to make the held-back calls once
+    their inputs arrive.
+  - Triggers match whole words. `#n` stands for any number, and `+`, `*`, `×`
+    and `%` read as "plus", "times", "times" and "percent".
+  - A trigger doesn't count when a negator comes up to four words before it
+    ("don't check my calendar", "without looking at my calendar").
+  - `ToolIntent::unless` lists phrases that cancel an intent: "I'm in Paris,
+    what's the weather here?" doesn't need the user's location.
+  - `DirectAnswer` marks questions the model should answer from what it
+    knows (translations, arithmetic, "who wrote …"). `plan_with` collects
+    them, `review_round` returns the unplanned calls to tools they rule out
+    (`RoundReview::drop`), and `ToolPlan::direct_note` tells the model to
+    answer directly.
+
+  Small models need this on multi-part requests. Qwen3.5-0.8B answered "check
+  my calendar and tell me the time" with only the clock, and searched for the
+  literal words "my city".
+- `rlx-libm`: `log1pf` (glibc's, which is CORE-MATH's correctly rounded one
+  since 2.41: `log1p` in double rounded once, plus a 9-entry table for the
+  inputs where that double-rounds; 0 mismatches against glibc 2.43 over all
+  2^32 inputs) and `reference::log1pf`.
+- `rlx-ir`: a `parity` feature. Spectral windows and the exact-rDFT matrices
+  are host-built constants; under `parity` their cos / sin come from
+  `rlx_libm::reference`, so a wasm build (std there is musl, which differs
+  from Apple on 6768 of 524799 Hann-window arguments) bakes the platform
+  reference's bits. Off: std, as before.
+- `rlx-spectral`: spectral front-ends in pure Rust, generic over precision
+  (`Float`: f32, f64): `FftPlan` (Stockham radix 8/4/2/3/5, Bluestein for other
+  primes) and `RealFftPlan`; Hann / Hamming / Povey windows; framing
+  (centered reflect, snip-edges) with Kaldi DC removal / preemphasis; Slaney /
+  HTK / Kaldi mel filterbanks in Hz or mel space, applied sparsely; the
+  `WhisperLogMel` and `KaldiFbank` (SeamlessM4T `input_features`) pipelines.
+  An n = 400 FFT (whisper's) runs 2.8 µs (rustfft: 3.5); powers of two are
+  still 1.75–2.1× behind rustfft's SIMD kernels.
+- `rlx-fastmath`: accurate vectorized f32 `exp` / `log` / `tanh` (NEON;
+  ≤ 1.07 / 0.84 / 1.33 ulp over all 2^32 inputs, NEON lanes = scalar). exp
+  0.67 ns/element against Accelerate's `vvexpf` 0.77 and the platform libm
+  2.5; rlx-cpu re-exports it as `rlx_cpu::fastmath`.
+- rlx-cpu feature `parity`: rlx-libm's reference ports for the accurate
+  vector math outside Accelerate builds and the FFT twiddles. Default:
+  `fastmath`, and rlx-libm's ports for scalar math.
+- rlx-libm feature `libm` (forwarded by rlx-special, rlx-signal,
+  rlx-pocketfft, rlx-rng, rlx-linux-ref; rlx-cpu takes `parity` instead): Apple's libm for `reference` (and the
+  merged `__sincos_stret`, now `reference::sincos`, that pocketfft's
+  `AppleSinCos` twiddles use). **Default is now the pure-Rust ports on every
+  target**: on macOS, results equal the Linux reference's algorithms instead of
+  Apple's (they differ in 0.05–38 % of inputs by ≤ 7 ulp, `examples/
+  ports_vs_platform`). The SciPy-on-macOS fixture suites of
+  rlx-special / rlx-signal / rlx-pocketfft enable `libm` for their tests.
+- `rlx-cpu` feature `pure-rust` (with `rlx-ir/pure-rust`): no native library in
+  the build even when `blas` is on — no Accelerate / OpenBLAS / MKL link, vector
+  exp/tanh/log in Rust instead of vForce, BNNS compiled to its stubs. GEMMs go
+  to the SME2 kernel (`amx-sme`, now the default there; `RLX_CPU_SME=0` turns it
+  off) or the `gemm` crate. The BLAS-less `cblas_sgemm` shim routes strided /
+  transposed products to SME2 too. On an M4 Pro, SME2 runs whisper-sized GEMMs
+  5–10× faster than the `gemm` crate and about 2–3× slower than Accelerate.
+- `rlx-text` builds HF `tokenizers` with its pure-Rust
+  `fancy-regex` backend on every target (Oniguruma, a C library, is gone):
+  LLaMA 3.2's tokenizer gives identical ids to Python `tokenizers` 0.22.2 on
+  46783 texts / 2.37M tokens, Unicode stress strings included.
+- Distributed inference lays a step out by its IO as well as its compute.
+  `split_function_cut` moves each cut up to 25% of its share to where the
+  fewest bytes cross. `StepLayout::argmax` reduces logits to token ids before
+  splitting. `exchange_speeds_links` / `probe_links` measure every pair's
+  latency and bandwidth at the speed exchange. With `StepLayout::links`,
+  `InferJob::start_with_layout` orders the workers by the estimated step time;
+  stages carry `prev` / `next`. `dist_node ARGMAX=1 TOPOLOGY=1`. A Qwen3.5
+  verify step over 5 nodes sent ~12 MB a pass across its hops and now sends
+  ~40 KB.
+- Distributed inference calibrates itself: stages report their compute time
+  in the values they pass on, and `InferJob::calibrate` re-plans the layout
+  (order and cuts) from measured per-rank speeds. It re-deploys the stages
+  mid-job when the estimate improves (`StagePlan::index`, a `RESTAGE`
+  marker, `deploy`). `dist_node TOPOLOGY=1` runs it before decoding.
+- Mesh links over Bluetooth LE: `rlx_driver::ble` (feature `ble`, on the
+  `webbluetooth` crate) bridges TCP to an L2CAP channel. `serve` is the node
+  side, a node given `RLX_BLE_SERVE`; `bridge` is the launcher's
+  (`via = "ble"`, `cargo-rlx --features ble`). The iOS app (`BLE=1`) carries
+  `NSBluetoothAlwaysUsageDescription`. mm4 ↔ iPad: ~125 ms one-way, ~24 KB/s.
+  The link probe now times 64 KiB first and 4 MiB only on a link fast enough,
+  rather than taking minutes on this one.
+- `scripts/publish.sh --dry-run` changes nothing in the tree (its format gate
+  names the files a real run would format) and runs one `cargo publish
+  --workspace --dry-run`. That verifies every crate, non-leaf ones included,
+  against the workspace's unpublished versions; older cargo falls back to the
+  per-crate walk. Dry and real runs check every package against crates.io's
+  10 MB limit (a real run before uploading anything), and the dry run lists
+  crates whose version is already on crates.io. Tiers now include rlx-libm,
+  rlx-fastmath, rlx-linux-ref and rlx-spectral. rlx-linalg's package leaves
+  out its two 34 MB NumPy fixtures, which put it at 14.3 MiB; rlx-libm no
+  longer names a README it doesn't have.
+- `ios/deploy-node.sh`: one command builds the node app and installs it on
+  every attached iOS device, or the ones named. It builds the Rust node for
+  devices only (new `build-xcframework.sh --device-only`, one build instead
+  of three for iOS), builds the app once for any iOS device, and keeps the
+  app build incremental. `build-xcframework.sh` no longer stops silently
+  after packaging when a simulator target was not built.
+- Persistent distributed workers: `cargo rlx dist --persist` (or
+  `job.persist`, `MODE=model`) keeps every worker rank up between runs and
+  launches only rank 0 again. A worker started with the same settings is
+  found and reused, its log followed to the end of its part in the job;
+  `--restart`, `--build` and `--sync` start them again. A worker (`dist_node
+  PERSIST=1`, the iOS app with `PERSIST=1`) keeps its stage, compiled and
+  with its weights. `deploy` waits for each worker's answer and sends weights
+  only where the plan differs (`InferJob::kept`). The speed exchange plans by
+  the last job's speeds while every rank is on the same device and no
+  worker's new measurement is more than 3× off them, so probe noise (2× on
+  an iPad) does not move the split. A worker drops a kept stage before
+  receiving a different one (holding both got an iPad app killed), and a
+  calibration restage reuses an unchanged stage instead of resending it.
+  Calibrated layouts carry over to the next job: plans record the speeds and
+  order they were laid out by (`StagePlan::layout`, `PlannedLayout`), workers
+  remember them, and a steady exchange returns them (order in
+  `Links::order`). Speeds are planned at f32 precision, the exchange's.
+  New `InferJob::calibrate_for(…, steps)`: a re-layout is made only where
+  its estimated saving over `steps` requests beats moving the changed
+  stages' weights. `dist_node` uses it and reports the stage deploy time
+  apart from calibration.
+- A mesh dial now gives up in real time: each connection attempt is bounded
+  (2 s), and the retry budget (`RLX_CONNECT_WAIT`, 10 s) is wall-clock time
+  rather than a try count. A peer whose SYNs went unanswered blocked each
+  plain `connect` for over a minute, so a 5-node job hung for its whole
+  30-minute timeout instead of failing; the error now names the address.
+- A mesh rank accepts until every expected rank has said hello, not until a
+  count of connections arrived. A persistent worker from the run before,
+  still dialing until it was replaced, announced its rank before the new
+  process did; counted twice, it left rank 0's connection unaccepted, and
+  rank 0 waited at the first barrier until the job's timeout. A rank heard
+  again replaces its earlier connection (whose closing marks no one lost),
+  and a connection that sends no valid hello in 10 s is dropped rather than
+  failing the mesh.
+- `cargo rlx dist --persist` stops every worker a run replaces, on every
+  host and device, and waits until each is gone before it starts any. Started
+  side by side, a new worker could dial the process it was about to replace
+  on another node (an iPad's old app while `devicectl` was still relaunching
+  it), hand that one its hello, and then wait forever for the rank it had
+  lost. (`Launch::stop`; on iOS, `devicectl … terminate --kill` by the app's
+  process.)
+- `RLX_STAGE_KEEP_WARM=1`: a distributed worker keeps its device busy while
+  its stage waits for the next request. An integrated GPU otherwise powers
+  down between requests. amd's 780M stage went 21.1 → 11.2 ms a step (31.6 ms
+  before `power_dpm_force_performance_level = high`); the iPads and a
+  discrete GPU didn't gain, so it's opt-in, per host.
+- ROCm: a carried-state `GatedDeltaNet` (one kernel) no longer rules out
+  hipGraph capture (`RLX_ROCM_EXEC=graph`), which had excluded every Qwen3.5
+  stage. It didn't speed up amd's stage, which wasn't launch-bound.
+- GGUF decode GEMV (CUDA/ROCm): each row's 32 lanes sum with register
+  shuffles instead of shared memory and five block barriers, and a
+  16-byte-aligned `x` is read with vector loads. Bit-identical. New
+  `rocm_gguf_gemv_bench` (µs and weight GB/s per Qwen3.5 shape, an output-bit
+  hash, `--gap-ms` / `--warm` / `--spin` for idle-GPU effects) and a ROCm
+  Q8_0 test against an f64 reference. New
+  `RLX_CONNECT_WAIT` (seconds a mesh dial keeps trying, `0` = no limit); the
+  BLE advertisement starts once per process.
+- `cargo rlx dist`: a `via` value naming `local` (`msi = "local"`) routes that
+  link through a relay the launcher runs, the host dialing it (an iPad over
+  its cable, onward over the Mac's wired link).
+- `cargo rlx dist`: a host's `via` table (host → address) says how its ranks
+  reach others; `via = "usb"` joins `local` and a wired iPad over the cable,
+  resolved at launch to the iPad's USB link-local address and the Mac's end.
+  `RLX_MESH_REVERSE` (`0-1,0-4`, set by the launcher for those pairs) has the
+  higher rank of a pair open its connection: an iPad accepts none over USB-C
+  but can open one.
+- Speculative decoding across the cluster: a `generate` entry's `verify`
+  step (`generate.verify`: its function and token count) runs the last token
+  and a draft head's guess at once. `InferJob::decode_verify` keeps both rows
+  of a right guess and retries a wrong one with the right token, so the tokens
+  are greedy one-token decoding's; `decode_local_verify` is the unsplit
+  reference, `DecodeEntry::feeds_n` a multi-token step's inputs. A stage step
+  run under `KEEP` holds its state update until the next step keeps or drops
+  it, and a step may append several cache rows. `dist_node MODE=model
+  SPECULATE=1`. Qwen3.5-0.8B Q8_0 over Metal + CUDA + ROCm, same tokens as one
+  CPU: 1.2–1.5x on prose and on code (the range is load on the Metal node).
+- CUDA and ROCm `dequant_matmul_gguf_gemv_rows`: Q8_0 / Q4_K / Q5_K / Q6_K
+  matmuls of 2–4 rows (a verify step's) through the element-strided GEMV, each
+  weight chunk decoded once for every row, each row bit for bit the `m = 1`
+  kernel's (tested against the reference and against each row alone). They
+  went through the f32 dequant slab and BLAS before.
+- Metal runs dequant matmuls of 2–4 rows as the GEMV per row by default
+  (`RLX_METAL_DEQUANT_FORCE_GEMV` now only adds larger `m`): a Qwen3.5 verify
+  stage's matmuls ran 2.5x faster that way, and match one-token decoding.
+- A `generate` entry may name a draft head's logits (`draft_logits`: the
+  output holding, e.g., Qwen3.5's MTP guess at the token after next).
+  `model::distributed::DecodeEntry::draft` reads it, and
+  `decode_local_drafts` runs the unsplit reference with each step's draft.
+- `rlx_libm::expf` and `reference::expf`: glibc's `expf` (the `-mfma` x86-64
+  variant), bit-exact against glibc on all 2^32 inputs.
+- `RLX_WGPU_DUMP_WGSL=<dir>` (native): write every shader module rlx-wgpu
+  creates to `<dir>/<hash>.wgsl`, to put the exact sources through another
+  compiler (e.g. the browser's).
+- `rlx_libm::reference::sincosf` (Apple's `sinf`/`cosf` on Apple, glibc's port
+  elsewhere).
+- rlx-wgpu test `no_wgsl_declaration_uses_a_reserved_word`: WGSL reserves
+  words such as `active` that naga accepts and Tint rejects.
+- Nodes advertise themselves over Bonjour/Avahi as `_rlx-node._tcp` (TXT:
+  platform, devices, mem_gb, version): `rlx_driver::mdns`,
+  `dist_node MODE=advertise`, `cargo rlx nodes [advertise]`, and
+  `addr = "mdns"` hosts in cluster files. Rendezvous servers advertise
+  `_rlx-rdv._tcp`, which `RENDEZVOUS=auto` browses. The iOS node app
+  publishes its own record through `NetService`.
+- CUDA and ROCm run decode-shaped (`m = 1`) GGUF matmuls for Q8_0, Q4_K, Q5_K
+  and Q6_K with one fused kernel (`dequant_matmul_gguf_gemv_elem`, shared
+  `.cu`): 32 threads per row, 8 rows per block, 8 weights per thread per
+  step. Q8_0 and Q5_K (and Q6_K on ROCm) used to unpack the whole weight to f32
+  every step, and ROCm's Q4_K kernel kept 4 of 128 threads busy at k = 1024.
+  On a Radeon 780M a 3584×1024 matmul went from 15.7 ms to 0.21 ms (Q6_K),
+  21 ms to 0.28 ms (Q5_K), 2.0 ms to 0.28 ms (Q4_K). Qwen3.5-0.8B split over
+  mm4 + msi + amd + iPad: Q8_0 4.8 → 13–15 steps/s, Q4_K_M 2.3 → 11.1.
+  `RLX_GGUF_GEMV_ELEM=0` restores the older Q4_K/Q5_K/Q6_K paths. Parity:
+  `dequant_matmul_gguf_gemv_{cuda,rocm}_matches_cpu`.
+- `cargo rlx dist` starts an `ios_device` host's app with `-nodename` when
+  its `addr = "mdns"` record is not on the LAN yet, then resolves it.
+- `RLX_STAGE_PROFILE=1`: distributed inference stages report state in / run /
+  state out per step. Stage weights ship as bf16 when that is exact (a BF16
+  checkpoint), f32 otherwise.
+- Distributed decoding of stateful steps: `InferJob::start_with_state` /
+  `decode`, `decode_entry`, `decode_local`, and `StagePlan::state`. Each
+  stage keeps its own layers' recurrent state and KV cache. `dist_node
+  TASK=generate` uses it for a package whose `generate` entry has `state`.
+  Qwen3.5-0.8B ran on mm4 + msi + amd + iPad, matching one CPU
+  (logits 3.3e-6). Workers and rank 0 report per-step compute, send and
+  wait times, with the first step (kernels compiling) reported apart.
+- Distributed stages ship each param in the dtype its graph declares:
+  bf16/f16 as stored, packed GGUF blocks (Q8_0, Q4_K_M behind
+  `DequantMatMul`) as raw bytes, bound with `set_param_typed`. Qwen3.5-0.8B
+  Q8_0 and Q4_K_M ran split over mm4 + msi + amd + iPad with tokens matching
+  one CPU.
+- `TrainOptions::lr_scaling` (`none` | `sqrt` | `linear`) and `warmup` scale
+  the learning rate with each update's samples (`--lr-scaling` in
+  rlx-vision-bench, `LR_SCALING` / `WARMUP` in dist_node). CIFAR-10 with
+  CPU+GPU+ANE lanes went from ~54% to 69.75% in 6 epochs, against 71.77% for
+  GPU only.
+- A rank's training lanes work-steal micro-batches from one queue, so a lane
+  slowed mid-run hands its share to the others. The sum stays in batch order
+  up to 256 MB of buffered gradients.
+- `dist_node VERIFY=1` adds a teacher-forced logit comparison (worst relative
+  error, plus the reference's margin wherever the top token differs).
+  rlx-vision-bench builds with Core ML on macOS and evaluates on the ANE.
+- `TrainJob::eval_loss` and `dist_node MODE=model TASK=train
+  HELDOUT=<text.txt>`: held-out loss and perplexity before and after a
+  distributed run.
+- `cargo rlx dist` passes an iOS rank's `RLX_*` variables to the app
+  (`devicectl --environment-variables`). `RLX_TRAIN_LANES = "metal,cpu"` runs
+  the iPad's CPU and GPU together, like every other node. MNIST on 4 machines
+  with CPU+GPU lanes ran at 6.6× the throughput of GPU-only, and reached 95.87%
+  in 6.5 s with the learning rate scaled.
+- `dist::trainserve_worker`, and rlx-ffi `mode = "trainserve"`: a phone is a
+  worker for cluster-options training jobs (`rlx-vision-bench --coordinate
+  --cluster`). The iOS app stays open between jobs. The launcher reads its
+  `-logfile` through `devicectl device copy from` instead of `--console`,
+  which killed the app when the session ended.
+- An iPhone/iPad attached to the launching Mac can be a cluster host
+  (`ios_device` in a cluster file). Its rank runs the iOS node app through
+  `devicectl`. rlx-ffi gained `mode = "model"` (feature `model`), so a phone
+  serves `dist_node MODE=model` inference and training, plus
+  `rlx_node_advert`. A real iPad ran a Qwen3-0.6B pipeline stage and a
+  SmolLM2-135M LoRA training lane beside mm4, msi and amd.
+- `model::distributed::{worker, exchange_speeds, gemm_gflops}`: one source
+  for the collective sequence every `MODE=model` rank runs.
+
+- Training lane fallback in `run_train_group`: a device lane that cannot
+  compile or run the graph (GPU out of memory, busy with another job, a
+  backend limit) is dropped and its micro-batches move to another lane, or to
+  a CPU lane when none is left, with the cluster's plan unchanged.
+  `RLX_TRAIN_LANE_FAULT` injects a failure for tests. A `model::distributed`
+  inference stage whose GPU panics is likewise rebuilt on the CPU and the
+  request is retried.
+- `model::distributed::{train_job_text, text_samples, package_codec}`:
+  `dist_node MODE=model` takes a text `PROMPT` and a text `DATA=*.txt`
+  through the package's own tokenizer, and prints generated text.
+
+- `cargo rlx dist <cluster.toml>`: one command launches a distributed job on
+  every rank of a cluster file (several ranks per host, one per device), with
+  `--sync`, `--build`, `--retries`, `--timeout`, prefixed output, and the whole
+  job stopped when any rank fails. No processes are left behind on remote hosts.
+- `rlx_runtime::dist::run_train_group` + `TrainOptions`: gradient accumulation,
+  a bf16/f16 gradient wire, compute/communication overlap, per-lane
+  throughput balancing, local SGD, ZeRO-1 momentum sharding, and per-epoch
+  checkpoint/resume. Selected by `TrainSpec.options`; `dist_node
+  MODE=trainserve` and `rlx-vision-bench --coordinate --cluster …` use it.
+  `device: "all"` now means one lane per physical unit; a list pins lanes;
+  `RLX_TRAIN_LANES` overrides per node. On mm4 + msi + amd, MNIST reached
+  96.8% in 16.8 s against 95.35% in 24.6 s before.
+- Streaming pipeline inference: `planner::split_layers`,
+  `planner::recommend_inference`, `dist::pipeline_run` /
+  `serve_stage_stream`, and 16-bit activations (`send_activation_as`).
+  `dist_node MODE=pipestream` runs it planned from the live mesh: 2.65× over one
+  batch across 7 devices.
+- TCP and UDP rendezvous (`RENDEZVOUS=tcp://…` / `udp://…`, `RANK=auto`) and
+  zero-config `RENDEZVOUS=auto` (rank 0 announces itself by broadcast +
+  multicast). Collectives over QUIC/UDP with `TRANSPORT=quic`
+  (`IrohTransport::connect_lan`, `iroh` feature). Every combination was
+  verified on the 3-node mesh.
+- Train and infer in any number format across a cluster:
+  `TrainOptions::number_format` and `StageSpec::number_format` take any
+  `NumberFormat` (`f64`, `f64x2`, `tf32`, `bf16`, `f16`, `f8e4m3`, … ,
+  `weights/activations`), with f32 master weights and loss scaling for narrow
+  formats that backs off on overflow. `rlx-vision-bench --number-format`,
+  `dist_node PS_FORMAT=`. `tf32` is a new `FloatFormat` alias (e8m10).
+- Gradient wire `WireDtype::Auto` (the new default) uses bf16 with error
+  feedback when the measured link is bandwidth-bound, else f32. Activation
+  `Auto` sends f16 per message when the values fit, else bf16. Metrics now
+  report `wire`, `wire_bytes`, and `wire_rel_err`.
+- Distributed training and inference of **any** `.rlxp` package:
+  `rlx_runtime::model::distributed` (`describe`, `train_job` → `TrainJob::run`,
+  `InferJob::{start, run, generate}`, `serve` for workers) and
+  `dist_node MODE=model` (`TASK=info|infer|generate|train`). Inference splits
+  the function by measured rank speed and streams requests. Training builds a
+  `TrainSpec` from the package trainer's options (LoRA, globs, SAE). New:
+  `TrainSpec::frozen`, an AdamW `TrainOptions::optimizer` (ZeRO and
+  checkpoints included), integer safetensors datasets, `#i` output names, and
+  `TrainMetrics::skipped`. Qwen3-0.6B generates across Metal + CUDA + ROCm
+  identically to one CPU.
+- `CompileOptions::half_casts` / `RLX_HALF_CASTS=widen|round`. Execution
+  widens half graphs to f32, so a `Cast` to f16/bf16 kept the f32 value; with
+  `round` it rounds to the format first, on every backend. The default
+  (`widen`) is unchanged. Also `TrainOptions::half_casts` and
+  `StageSpec::round_half_casts()` for distributed jobs.
+- `dist_node MODE=dtypes`: a per-device table of GFLOP/s and error vs f64 for
+  f32/f16/bf16 matmuls, plus an accumulation-order probe and a cast-rounding
+  probe.
+- f64 training runs end to end on CPU (native), Metal, CUDA, ROCm, and wgpu
+  (double-single). New: CPU f64 kernels for `Mean`, softmax cross-entropy,
+  its backward, and `relu_backward`. Double-single forms for ReLU, `Mean`,
+  softmax cross-entropy (log via one Newton step on an f32 seed), its
+  backward, and `relu_backward`.
+- `ProcessGroup::reduce_scatter_owned` / `all_gather_owned` / `owned_range`.
+- `RLX_COLLECTIVE_TIMEOUT`: bound any single collective wait.
+
+- IPv6 for distributed nodes. `PEERS`, `dist_job` `peers`, and the
+  `rlx-distributed` hostfile/RPC accept `[v6]:port` and link-local addresses
+  scoped by interface name (`[fe80::1%en0]:port`), via the new
+  `rlx_driver::resolve_addr`. Mesh discovery (`DISCOVER=1`) also announces by
+  IPv6 multicast (`ff02::7266`) on a dual-stack socket. The star coordinator
+  listens dual-stack, `DISCOVER_HOST` takes an IPv6 literal, and `local_ip()`
+  falls back to IPv6. Windows keeps IPv4 wildcard binds. Verified on a
+  Metal + CUDA + ROCm 3-node mesh over IPv4, global IPv6 and link-local, with
+  identical pipeline (5.22e-8) and MNIST data-parallel (95.35%) results. See
+  [docs/distributed.md](docs/distributed.md#ipv6).
+- Opt-in fast GPU arithmetic for wgpu, including the browser's WebGPU:
+  `rlx_runtime::set_gpu_fast_math(true)` (or `rlx_wgpu::set_fast_math`),
+  called before the first GPU compile. It swaps the correctly-rounded `/`,
+  `sqrt` and `1/sqrt` for the native WGSL operators; `fmod` stays exact.
+  Exact remains the default. The switch costs bit-identity but not
+  accuracy:
+
+  | Device | `/` off | `sqrt` off | EEGNet score bits | Kitten corr vs CPU |
+  |---|---|---|---|---|
+  | M4 Pro | 27% of quotients, ≤1 ULP | 27% of roots, ≤1 ULP | `3f192f68` | 0.7470 (exact 0.7468) |
+  | RTX 3080 Ti | 29% of quotients, ≤2 ULP | 17% of roots, ≤1 ULP | `3f192f68` | 0.9997 (exact 0.9997) |
+
+  EEGNet's score bits are the same as with exact math and on the CPU. No
+  speedup was measurable on EEGNet in either run order (3.67 s vs 3.68 s on
+  the M4 Pro; 6.4 s both ways on the RTX). The tests are
+  `fast_math_option` and `every_helper_shader_carries_the_exact_block_once`.
+  The second pins the string swap the switch relies on.
+
+### Changed
+
+- rlx-wgpu on Windows uses DX12 only. It used to ask wgpu for DX12 or
+  Vulkan, so wgpu could pick a Vulkan adapter: a second GPU API with its own
+  drivers and numerics. Set `WGPU_BACKEND=vulkan` or use `Device::Vulkan` to
+  run on Vulkan.
+- rlx-wgpu no longer uses software adapters: Windows' WARP renderer and
+  Mesa's llvmpipe/lavapipe, which wgpu picks only when there is no real GPU.
+  They run the shaders on the CPU, slower than rlx-cpu and with different
+  numerics, yet counted as an available GPU, so a fallback chain such as
+  CUDA → wgpu → CPU stopped at wgpu on a machine with no GPU. rlx-wgpu now
+  reports no device there and callers reach the CPU backend.
+  `RLX_WGPU_ALLOW_SOFTWARE=1` restores the old behaviour, for testing the GPU
+  path without a GPU.
+- rlx-wgpu on discrete Vulkan/DX12 (NVIDIA) now runs elementwise, norm and
+  structural ops on the GPU, as on Metal. They used to run on the CPU there as
+  a workaround for a KittenTTS failure whose real causes, the stripe-addressing
+  bugs below, are now fixed. On an RTX 3080 Ti, EEGNet takes 6.4 s instead of
+  295 s, with the same score bits (`3f192f68`, as on the CPU), and Kitten's
+  waveform correlates 0.9997 with the CPU. `RLX_WGPU_DISCRETE_HOST=1` restores
+  the old routing. Arenas split past the binding limit still host these ops
+  unless `RLX_WGPU_SHARD_GPU=1`.
+- `WireDtype::Auto` sends activation messages up to 1 MiB as f32 (was f16
+  whenever in range). They are latency-bound, so f16 saved little, and its
+  rounding flipped a near-tied greedy token in a split Qwen3 decode.
+
+### Fixed
+
+- Workspace manifests: `rlx-mlx-io` and `rlx-pkg` were asked for with
+  `default-features = false` (the backends' "dequant kernels only", rlx-runtime's
+  package reader), which Cargo ignores when the workspace entry keeps its
+  defaults, so every backend built rlx-mlx-io's loaders (npyz, zip,
+  safetensors) and rlx-runtime all of rlx-pkg; nightly Cargo rejects it
+  outright (rlx-ps5 failed to load). The workspace entries now drop default
+  features and the crates that want them name them.
+- android and rlx-ps5 (their own workspaces) carry the `libm` patch too.
+- `rlx-mlx-sys`: the MLX build hung when `c++` is a compiler-cache shim whose
+  fallback is sccache (kache): the build script picked sccache as CMake's
+  launcher too, so the sccache server waited on itself. It now takes the
+  environment's `CMAKE_CXX_COMPILER_LAUNCHER` / `CMAKE_C_COMPILER_LAUNCHER`
+  (cargo `[env]`) before guessing sccache or ccache.
+- `rlx-libm`: the pure-Rust `sqrt` (used without `std`) returned NaN for
+  `+inf`.
+- `rlx-libm` tests: the Linux glibc references went through std or
+  `extern "C"`, which a Rust binary can bind to compiler-builtins' musl copies
+  (`log1pf_hard_cases_are_glibcs` compared against musl) or, with
+  `export-glibc`, to the ports themselves. They now look glibc up by `dlsym`
+  (`src/sys.rs`, validation only).
+- `rlx-ir`: the `no_std` build (`just check-no-std`) broke on `FftPolicy`'s
+  process-wide store; the policy functions are now `std`-only.
+- A transpose that a matmul folds into its GEMM flag was elided even when it
+  was also a graph output, so it was never written (any tapped graph): the CPU
+  read-back crashed in debug builds and returned garbage in release. Shared
+  check in `rlx-compile/src/memory.rs` and Metal's opt-in fold.
+- `rlx-cpu`: the in-place vector math (`vvexpf` & co. on one buffer) cast a
+  `&mut` slice to a shared one (aliasing UB); it now stages 256-float blocks.
+- `rlx-wgpu`: `rlx_div_rn` lost its correction under Metal's subnormal flush
+  (2806 of 65 536 small-dividend pairs 1 ULP off); `rlx_exp` built subnormal
+  results through `ldexp`, which the flush zeroed. Both now match the browser.
+- `rlx-cpu`: plain wasm (no relaxed-simd) GEMM takes the fused software FMA
+  path the portable mode specifies, chosen at run time.
+- `rlxsl`: `rlx_div_rn` was not correctly rounded near a midpoint. Its one
+  correction step rounds the correction before adding it, so the result kept
+  the first quotient's rounding: native Metal's fast-math `1 / 1.99999988`
+  stayed 0.5 where Chrome's gave 0.50000006 (BCG-FM's squeeze-excite sigmoid
+  at `x = 1.19e-7`). A midpoint test against the neighbour on the remainder's
+  side now settles it (`div_is_correctly_rounded_near_midpoints`, 2^16
+  near-midpoint quotients on the GPU; fails without the test).
+- `rlxsl`: WGSL `exp` is `rlx_exp` (Cody–Waite reduction, an `fma`
+  polynomial, `ldexp`; within 1 ULP, 99% correctly rounded) instead of the
+  builtin, whose rounding follows the compiler's math mode (Apple's fast math
+  natively, safe math in Chrome).
+- `rlx-wgpu`: LayerNorm, the fused residual LayerNorm / RMSNorm kernels,
+  AdaLN, softmax and attention took `1/n`, `1/sqrt` and `exp` from the WGSL
+  builtins, which round by the math mode: BIOT's first LayerNorm differed
+  between native wgpu and Chrome on the same GPU. They (and the backward,
+  cross-entropy and group-norm kernels) now call rlxsl's exact helpers
+  (`rlx_div_rn`, `rlx_rsqrt_rn`, `rlx_exp`, `rlx_log`), which
+  `kernel_module` appends once; `tests/epilogue_exact_math.rs` pins that no
+  kernel calls the builtins.
+- `rlx-cpu`: the AVX2 mirror's `vvexpf` / `vvtanhf` copied a buffer onto
+  itself when called in place (a `copy_nonoverlapping` of overlapping ranges;
+  the debug precondition check aborted `vvsigmoidf` on the mirror arm).
+
+- `rlx-wgpu`: the fused matmul / conv epilogues (`apply_act` in 18 shaders)
+  computed sigmoid and SiLU with a raw WGSL `/`, and GELU's erf with a plain
+  `a * b + c` chain. Neither is portable: native wgpu and Chrome's WebGPU on
+  the same Mac GPU disagreed by ULPs (a BCG-FM squeeze-excite sigmoid in an
+  `m = 1` gemv; every fused GELU, up to 180 ULP). The epilogues now divide
+  through rlxsl's correctly-rounded `rlx_div_rn` (pinned by
+  `tests/epilogue_exact_math.rs`) and use explicit `fma` in the erf
+  polynomial and the tanh-GELU cubic. rlxsl's WGSL `erf` (GELU in the
+  elementwise kernels, up to 37 ULP apart) does the same.
+- `rlx-wgpu` on 32-bit targets (the browser): the GPU arena may use 3 GiB of
+  offsets, up from 2. Weight-buffer offsets used to be tagged with bit 31,
+  which halved what an arena could address while WebGPU binds 4 GiB, and
+  `rlx_runtime::fit_batch` then halved training minibatches. CFSPMNet's
+  2.67 GB arena trained at batch 8 in Chrome and 16 natively, so its score
+  differed. Weight-buffer offsets now start at 3 GiB (`buffer::tag32`, tested
+  on the host), and the weight buffer gets the top 1 GiB (it had 2); an offset
+  past that panics with a message. `device_arena_limit(Gpu)` on 32-bit is
+  3 GiB. Every tensor's end, not just its start, is checked against the split.
+- `rlx-webgl`: tensors larger than a texture plan. A row longer than
+  `MAX_TEXTURE_SIZE` (a training graph's flat gradient vector, millions long)
+  is laid out wide like a tall slot. Matmul, softmax, LayerNorm and RmsNorm
+  read their operands by linear index when a slot is widened (the natural
+  layout keeps the old direct fetch), so the planner no longer pins their slots
+  to the natural layout: an im2col matmul with 59392 rows and a 59392-long `K`
+  now plan within 16384 texels. Tested in Chrome (`tests/gl_layout_parity.rs`,
+  with a mutation check) and natively (`tests/long_rows.rs`). Training conv
+  decoders on WebGL is still out of reach: the planner's per-element gather
+  index tables for a ShallowConvNet training graph at batch 32 peak near 30 GB.
+- `rlx-cpu` on wasm / riscv: GELU, bias-GELU, SiLU, the fast `exp` / `tanh`,
+  softmax and LayerNorm now compute exactly what the x86-64 AVX2+FMA kernels
+  compute: the same fused multiply-adds, eight-lane reductions folded in the
+  kernels' order, and the kernels' own tails. A wasm run of these ops now
+  equals the Linux x86-64 run bit for bit; before, it matched on 25–96% of
+  elements. The new mirrors (`avx2_mirror`) are tested against the AVX2 kernels
+  on x86-64.
+- `rlx-cpu` on wasm: f32 fused multiply-adds are now exact. compiler-builtins'
+  software `fmaf` rounds twice when the result is a float subnormal (wrong on
+  half of the constructed cases), and it is slow. The replacement `fmaf` uses
+  double arithmetic, a TwoSum correction at float midpoints, and explicit
+  rounding on the 2^-149 grid; it is checked against hardware FMA. A 4-lane
+  simd128 version takes that slow path only for midpoint or subnormal lanes.
+  End to end, a 12-layer transformer forward costs the same as with the
+  previous inexact loops (27.5 vs 27.9 ms).
+- `rlx-wgpu`: an `m <= 4` f32 matmul now rounds like every other matmul
+  kernel. `matmul_gemv` split K eight ways and added the partial sums, so up
+  to four rows came out a few ULP away from the same rows at `m >= 5`
+  (`matmul.wgsl`) and from Metal's CoopF32, which both sum K in order. Native
+  Metal takes CoopF32 for these shapes; a browser has no cooperative matrix
+  and fell to the split gemv, so a model gave different numbers in Chrome
+  than natively (`rlx-bcgfm`'s squeeze-excite `[N, 42]·[42, 10]`: 7531 of
+  20480 features bit-identical, now all 20480). The default gemv is now one
+  thread per column with K in order (`RLX_WGPU_GEMV_COLS=64`, four loads in
+  flight per step); the split forms (32 / 16 / 8) are used under
+  `set_fast_math(true)` or when pinned. Test:
+  `rlx-wgpu/tests/matmul_gemv_in_order.rs` (fails with the old form pinned).
+
+- `rlx-text`: chat templates now see `loop.previtem` / `loop.nextitem`
+  (minijinja's `adjacent_loop_items` feature), and a message passed to a
+  template tests true and iterates its keys. Before, every message object
+  enumerated as empty, so it tested false: Qwen3.5's
+  `{% if loop.previtem and loop.previtem.role != "tool" %}` never opened the
+  `<|im_start|>user` turn around a tool result (the model read the result as
+  part of its own reply), and `{% for name in tool_call.arguments %}` rendered
+  no parameters.
+- `rlx-text`: more Hugging Face chat templates render. Checked against every
+  GGUF template on the dev machine: all 11 distinct ones render, and the 9 with
+  a tool section render a full tool round.
+  - Dict arguments support Python's `.items()`, `.keys()` and `.values()`.
+    d1 / LFM2 templates iterate tool-call arguments that way and failed to
+    render any tool round.
+  - Printing a dict gives Python's `str()` form, `{'city': 'Paris'}`, which
+    matches HF's `apply_chat_template`. It used to print `{...}`.
+  - `strftime_now(fmt)` exists (UTC). Llama 3.x, Granite and Mistral Small
+    templates call it when no `date_string` is passed.
+  - `{% break %}` and `{% continue %}` compile (minijinja's `loop_controls`).
+- Metal: `sdpa_prefill_fa3_d64` (opt-in, `RLX_METAL_PREFILL_FA3=1`, or
+  `=64` for 64 query rows per threadgroup) is the head_dim-64 FA2 prefill
+  kernel reworked:
+  - separate K and V tiles, so a key step needs two threadgroup barriers
+    instead of four;
+  - simdgroup barriers around the per-simdgroup softmax;
+  - Q pre-scaled by `scale * log2(e)`, with an `exp2` softmax;
+  - the key-padding mask read once per key instead of once per row;
+  - with `=64`, half the K/V traffic.
+  At V-JEPA2 ViT-g's shape (22 heads, 8192 tokens, head_dim 64), it is
+  15% (32 rows) and 26% (64 rows) faster per call than FA2, measured in both
+  orders. The output is within 9.6e-8 of FA2's. On a full ViT-g clip with
+  `metal:f16`, the end-to-end change was within run-to-run noise, so it stays
+  opt-in. Tests: `tests/metal_prefill_fa3_parity.rs` covers every mask kind,
+  both layouts, GQA, cross lengths, ragged tails, batch 2 and softcap against
+  the CPU, and asserts that the switch changes the output.
+  `RLX_METAL_ATTN_TRACE=1` now prints the kernel `encode_sdpa` picked. The
+  thunk-level `PATH=non-flash (base atomic sdpa_decode_m1)` line also prints
+  for prefill, which the FA2 kernel serves.
+- CoreML: under a mixed-precision policy the Neural Engine took no ops of a
+  ViT block; with `AlwaysF16` it now takes all of them. Four fixes:
+  - `AutoMixedPrecision::with_f16_attention(true)`, which the CoreML
+    backend sets, lets `Op::Attention` follow the policy. It stays pinned to
+    f32 by default, because Metal has no f16 attention kernel.
+  - The attention lowering declares its transposes, reshapes and scores in
+    the operands' dtype; they were hardcoded to f32.
+  - The Custom-mask bias is built in the mask's dtype, and in f16 it uses a
+    scale of 3e4 instead of 1e9. In f16, 1e9 is inf, so every kept key would
+    have computed 0 * inf = NaN.
+  - f32 scalar operands are converted to f16 for every op whose output is
+    f16, not only in blanket f16 mode.
+  `RLX_COREML_PLAN=1` prints MLComputePlan's placement after each load.
+  `RLX_COREML_PLAN_OPS=1` adds a per-operator breakdown with cost shares,
+  and `RLX_COREML_PLAN_CPU_NAMES=1` names each op placed on the CPU.
+- CoreML: `RLX_COREML_W8=1` (opt-in, lossy) stores 2-D f16 weights as int8
+  with a per-row f16 scale (`constexpr_blockwise_shift_scale`, which moves
+  the model to the iOS 18 opset). On V-JEPA2 ViT-g it was slower on both the
+  GPU (178-183 ms against 145-150 ms per block) and the Neural Engine.
+- CoreML: the compiled-model cache (`$TMPDIR/rlx-coreml-cache`) never hit.
+  It is keyed by a hash of the serialised model, and prost encoded the
+  protobuf map fields in `HashMap` order, which differs per process. So every
+  process wrote the full `.mlpackage` again, recompiled it and added a new
+  cache entry; 472 entries (24 GB) had built up. The protobuf maps are now
+  `BTreeMap`s (`.btree_map(["."])`). V-JEPA2 ViT-g's first CoreML GPU run
+  in a new process went from 106 s to 12 s. The shim now publishes a cache
+  entry with an atomic rename. Without that, two threads compiling the same
+  model could see a half-copied entry and delete it under the writer; that
+  failed `coreml_quant` in 2 of 6 cold runs, and 0 of 5 after the fix.
+- CoreML: a weight that is only read through a `cast` to f16, as mixed
+  precision leaves weights, is baked as an f16 blob const and the cast becomes
+  an alias. Before, CoreML folded each cast into an inline f16 tensor, and
+  MPSGraph printed every one as text on each load
+  (`MILToMLIRRewriter::getLocationForOp` → `IROperation::ToString`); that was
+  about 40 s of V-JEPA2's load.
+- CoreML f16 mode (`RLX_COREML_F16=1` / `Precision::F16`): scalar operands
+  built as f32 immediates (LayerNorm's eps, rsqrt's epsilon, ...) are now
+  emitted as f16. Before, CoreML refused to load the model: "In 'ios16.add'
+  operations, tensors parameter x[0], parameter y[0] ... must have the same
+  data type". f16 mode is still incomplete for attention graphs: about 100
+  lowering sites declare f32 output shapes, so V-JEPA2 then fails at an
+  attention `reshape`. Mixed precision (`PrecisionPolicy`) works.
+- Metal: a `FusedMatMulBiasAct { Relu }` lowered to MPSGraph dropped the ReLU
+  (`mps_graph_lower` matched it with the `None` arm), so any graph that took the
+  full-MPSGraph path returned matmul + bias with its negatives intact — off by
+  ~1.0 relative. Pinned by `mpsgraph_fused_linear_applies_relu`
+  (`rlx-metal/tests/attention_block_kernels_parity.rs`).
+- SME2 kernels (`rlx_sme_fmopa_panel`, `_smopa_32x32_i8`, `_bfmopa_32x32`)
+  clobbered the caller's d8–d15: `smstart` / `smstop` zero every SIMD&FP
+  register and those are callee-saved under AAPCS64, so floats live across
+  the call came back as 0 (the SME tests failed with a tolerance of 0). They
+  are now saved around streaming mode.
+- `transposed_fallback_matches_the_scalar_loop_bit_for_bit` asserted bit
+  equality for shapes `portable-gemm` sends to the blocked kernel; those get an
+  error bound now, the loop-nest shapes stay bit-exact.
+- A mesh rank with a static peer list listened only on its own entry's
+  address, so a peer that reached it by another (an iPad over USB-C, a
+  link-local IPv6) was refused. `TcpTransport::bind` now listens on every
+  local address at that port.
+- `cargo rlx dist` and iOS: a peer list holding an IPv6 address reached the
+  app empty, since `UserDefaults` parses each launch argument as a property
+  list and a leading `[` is not a string; such values now go as quoted plist
+  strings. Its log polling also no longer prints `head: illegal line count`
+  when no new lines arrived.
+- rlx-unfuse dropped a `MaskKind::Bias` attention's mask when it promoted the
+  attention to rank 4 (ROCm and every rank-4-only policy): the kernel then
+  indexed a fourth input that was not there, so a multi-token verify step
+  failed to compile on ROCm and ran on the CPU. The bias now goes through like
+  a custom mask.
+- rlx-flow `gather_last_token_dynamic` declared its own I32 `last_token_idx`
+  input next to the one a flow had declared under the same name; only one is
+  bound, so whatever read the flow's (Qwen3.5's MTP head) read zeros, i.e.
+  position 0. The stage now reuses a declared input, cast to I32.
+- Browser WebGPU: an activation arena of 2 GiB or more misread its upper
+  offsets as weight-buffer offsets ("weight-tagged off without
+  weight_buffer"): on 32-bit targets `WEIGHT_BUF_TAG` is bit 31.
+  `arena_budget::device_arena_limit(Gpu)` reports 2 GiB there, so
+  `fit_batch` keeps training graphs under it, and `WgpuArena::from_plan`
+  refuses a plan with a tensor (or the scratch zone) starting at or past 2 GiB
+  with a message instead.
+- Browser WebGPU: every FFT ran as a no-op. `fft_inner` returned early on
+  `local_invocation_id` before a `workgroupBarrier()`, which fails WGSL's
+  uniformity analysis; Chrome's compiler (Tint) rejects it, and with it every
+  entry point in `fft_gpu.wgsl`, while naga accepts it. The FFT output stayed
+  zero, so FFT-fronted models (exgb's brainrvq, corticalssm, eegformer)
+  embedded every trial to the same vector. Out-of-tile threads now skip the
+  work but reach every barrier; native results are unchanged.
+- rlx-cpu's FFT twiddles call `rlx_libm::reference::{sin, cos, sincosf}`
+  instead of std. On wasm, std is Rust's own libm; the reference is glibc's
+  (Linux) and Apple's (macOS) libm, so the browser computes what Linux does.
+  Native results are unchanged: a new rlx-libm test checks, on Linux, that the
+  ports equal glibc bit for bit on every twiddle angle up to n = 2^16.
+- `CompiledGraph::run_async` / `run_read_outputs_async` (wasm) now do what
+  `run` does: upload params passed as inputs, check the inputs, prepare and
+  feed staged weights (awaiting the prepare graph), and strip a tap's outputs
+  and hand them to it. They used to pass the inputs straight to the backend.
+- A distributed split of a stateful step could cut a layer between its state
+  update and the update's readers (attention over the appended KV cache). The
+  stage kept the update as its cache and never sent it, so the next rank
+  failed with "stage input … never arrived", or the job refused the split.
+  The split now keeps each state's reads, update and the update's readers on
+  one stage, and each stage's share is taken from the cost still left when it
+  starts, so a stage held past its share no longer leaves the next one empty.
+
+- rlx-rocm claimed `GatedDeltaNet` but ran it on the host (download, CPU
+  recurrence, upload): 512 ms a launch on a 780M for Qwen3.5-0.8B's 16 heads
+  × 128². With the state carried, it now launches the shared GPU kernel, as
+  CUDA does: amd's half of the model went from 2,171 ms to 65 ms a step.
+
+- Opening a referenced GGUF package spent minutes reparsing the GGUF header
+  (with its tokenizer vocabulary) once per param. `PackageWeights` now keeps
+  the opened files: Qwen3.5-0.8B's stages ship in 20 s instead of 197–427 s.
+- rlx-qwen35's `.rlxp` export refused GGUFs with MTP heads ("refusing to take
+  MTP weight"). The export's loader now includes them; the decode step does
+  not use them.
+
+- rlx-wgpu shaders failed to compile in Chrome, so every WebGPU graph in
+  the browser ran nothing. WGSL makes a float constant outside `f32`'s finite
+  range a shader-creation error. Chrome's compiler (Tint) enforces that;
+  naga, which every native test uses, silently rounds such a literal and
+  accepts it.
+  - `3.4028235e38` and `3.40282347e38` are both slightly above `f32::MAX`. That
+    hit the exact-division helper and the softmax, scan, scaled-low-precision,
+    indexing and UMAP kernels. They now use `0x1.fffffep+127f`.
+  - The exact `sqrt`/`fmod` helpers and the double-word `exp` built NaN and
+    infinity as constant `bitcast<f32>(0x7fc00000u)`, which Tint rejects as
+    non-finite. They now derive them from a runtime value; the bits are
+    unchanged.
+  - The GLSL division helper's `f32::MAX` is now spelled as its exact decimal.
+
+  `no_wgsl_float_constant_is_outside_the_f32_range` scans every kernel and
+  generated shader for both patterns. Found by running exgb in headless
+  Chrome.
+- A synchronous `run` of a WebGPU graph in the browser waited forever: the
+  readback completes only once control returns to the event loop, which the
+  synchronous call is blocking (an exgb sweep sat at 0% CPU in Chrome). It now
+  panics with the way out: await `CompiledGraph::run_async`, or compile the
+  graph for the CPU.
+- A Core ML (`ane`) training lane slowed a cluster job about 3×. Core ML
+  recompiles on every parameter upload, and the balancer's probe never
+  uploaded any, so it planned that lane a full share. The probe now uploads
+  the trained params before each timed step, and a balanced plan sits out a
+  lane more than 8× slower than its rank's fastest (`SLOW_LANE`). The probe
+  also zero-fills params before the first upload, which Core ML requires
+  ("missing param"). Unavailable lanes in `RLX_TRAIN_LANES` are named and
+  skipped. `ios/build-xcframework.sh --model` builds with unwinding panics, so
+  iOS lane fallback works.
+
+- The mDNS advertiser published its host record as `<name>.local`, so
+  `NAME=msi` on the machine called msi claimed Avahi's own hostname. Avahi
+  settled the conflict by renaming the machine (`msi` became `msi-2`, and
+  macOS's `mm4` became `mm4-2`). The record is now `rlx-<name>-<pid>.local`.
+
+- `ios/build-xcframework.sh` exported every Apple platform's deployment
+  target at once, and clang refused to compile rlx-coreml's ObjC shim under
+  `--apple`. Each target now gets only its own.
+
+- CUDA and ROCm int8 `Quantize` returned -128 for huge positive inputs:
+  1e30 / scale was cast to `int` before clamping, and that out-of-range
+  conversion gives INT_MIN on NVIDIA. The shared quantize, `QMatMul` and
+  `QConv2d` kernels now clamp in float first (NaN goes to 0, matching
+  Rust's `as i32`). `wgpu_quant_i8_parity` now holds CUDA and ROCm to its
+  exact gates too.
+- rlx-cuda stored the int8 quantize and quantized-matmul byte offsets as
+  `u32`, which wraps in an arena past 4 GiB. They now fail loudly instead.
+- rlx-wgpu gave wrong results once a graph's arena outgrew the device's
+  storage-binding limit. KittenTTS's waveform on an RTX 3080 Ti was all
+  zeros: a 3.2 GB arena against 2 GiB bindings. Past the limit the arena is
+  split into stripes and every parameter is parked in a separate weight
+  buffer, and several lowerings did not handle that:
+  - The fused `x·W + b` matmul kept operand offsets from before staging
+    moved its window.
+  - `ConvTranspose2d`/`3d`, the int8 `DequantMatMul`, and the host-delegated
+    custom ops (`Step::CustomHost`, e.g. `onnx.QMatMulBaked`) stored a parked
+    weight's offset as `u32`. That drops the weight-buffer tag, so they read
+    unrelated activations. The first two now run on the host when an operand
+    is parked or too large for that path, and `CustomHost` offsets are now
+    `usize`.
+  - `Compare`, `Where` and `Fma` staged operands into the arena-wide scratch
+    area, which lies in another stripe. They also moved their window there
+    even when nothing needed staging, so Kitten's attention mask (`Eq` of two
+    zero tensors) came out all false. They now stage into the output
+    stripe's own reserve and keep the window unless an operand is actually
+    outside it.
+  - Sixteen other host-lowered ops (`GroupNormHost`, `LayerNorm2dHost`, the FFT,
+    LogMel, LSTM, `Reverse`, `ArgMax`/`ArgMin`, `AxialRope2d`, … steps) also
+    kept absolute offsets as `u32`; `GroupNorm` with parked gamma/beta was
+    off by 3.4. These ops now run as a generic `HostOp` when an operand is
+    parked or past 4 GiB. Four custom-op host steps (LLaDA2 gate, UMAP kNN,
+    `MsDeformAttn`, collectives) refuse such operands with a panic instead.
+  - 31 kernels (`Cumsum`, `TopK`, `Pool`, `BatchNormInference`, the
+    scaled-quant ops, the norm/rope/gather backward ops, …) bind only the
+    output's window but address operands by absolute arena offset, which is
+    right only when that window starts at 0 and holds every operand. Off
+    stripe 0, or on a parked param, they read the wrong data (a cumsum of a
+    parked param came back wrong in all 128 elements). They now run as a
+    `HostOp` in that case.
+  - The "bind window clamped on a sharded arena" warning fired for the last
+    stripe's whole-stripe window, which only drops addresses past the end of
+    the arena. It now fires only when the clamp cuts off live bytes.
+
+  `RLX_WGPU_MAX_BIND_MB` now caps the binding limit the device is created
+  with, so this regime reproduces on any adapter.
+  `parked_weight_matmul_over_bind_cap` covers each case. It runs once with
+  the default policy and once with `RLX_WGPU_SHARD_GPU=1`, which puts
+  `Where`/`Fma` on the GPU, and each case fails when its fix is reverted.
+- The AOT cache served LIR compiled from a different graph whenever a key was
+  reused: `AotCache::compile_hir_cached`/`compile_graph_cached` trusted the
+  caller's key alone. KittenTTS's probe keys (`probe_cpu`, `probe_dev`) name
+  neither the device nor the graph. Two CPU compiles of the same model in
+  one process therefore disagreed (waveform correlation 0.73): one loaded a
+  stale entry. Each entry now records a fingerprint of its input (device,
+  compile options, and the graph's ops, attributes, shapes, edges and
+  constant bytes). A mismatch, or an entry from before this change, is
+  recompiled and overwritten. Parameter values are not fingerprinted, only
+  their names and lengths.
+
+- Metal's attention backward returned zero dQ, dK and dV for `[B, H, S, D]`
+  inputs whenever dY was computed earlier in the same graph (any autodiff
+  loss). That layout takes the CPU reference, which read the arena before
+  the GPU had written dY. It now waits for the GPU first, and so does the
+  in-graph quantized-matmul host path, which had the same gap.
+  `attention_gradients_through_a_computed_dy_match_the_cpu` checks every
+  device.
+- rlx-rocm refused any arena past 4 GiB. Now it refuses only graphs with a
+  step that isn't audited for 32-bit element offsets, which reach 16 GiB,
+  and names those steps. The audit covers the 22 step kinds a transformer's
+  LoRA training uses, and it found that the RMSNorm backward steps
+  truncated their byte offsets to 32 bits. amd's 780M now trains a Qwen3-0.6B
+  LoRA replica (a 6.7 GB arena), matching the CPU-lane run, and
+  `arena_past_4gib` (opt-in, `BIG_ARENA_TEST=1`) checks a 4.4 GiB training
+  step against the CPU to ~1e-8.
+
+- ROCm on an APU (Radeon 780M, gfx1103) of a multi-node host could fail
+  mid-run with `HipError(719)` and a GPU reset. The kernel log showed `MES
+  failed to respond to msg=REMOVE_QUEUE … Failed to evict process queues`.
+  The kernel's NUMA balancing made amdgpu evict the process's GPU queues,
+  and the firmware hung doing it. rlx-rocm now opts the process out
+  (`MPOL_LOCAL` before `hipInit`; `RLX_ROCM_NUMA_GUARD=0` turns that off).
+  A generate stage run right after training failed 5 times in 6 before
+  the fix and 0 in 4 after it. `cargo rlx doctor` reports the host setup as
+  RLX-ROCM-003.
+
+- SiLU and Sigmoid backward could return NaN for inputs near −88 in the
+  rlxsl-generated kernels (`exp(−x)` overflowed to inf in the auto-derived
+  gradient, and inf·0 gave NaN). On Metal this made Qwen3 LoRA training on Metal produce all-NaN
+  gradients. rlxsl now emits the closed forms `s·(1 + x·(1 − s))` and
+  `s·(1 − s)` with the exponent clamped. `activation_backward_extreme_inputs`
+  covers every device.
+- A balanced training plan could ask a fast lane for more samples than the
+  dataset holds and fail. The shares now shrink together to fit.
+
+- A crashed rank hung the whole job. A receive waiting on a peer whose
+  connection ended now fails and names the rank, on TCP and on QUIC. A receive
+  from a rank with no link fails at once. A QUIC rank that sent its last
+  message and exited could drop it; streams are now flushed and acknowledged
+  on drop. A QUIC dial to a peer that is not up yet no longer waits out the
+  handshake timeout.
+- `RLX_PUSH_DATA` / `RLX_WORKER_DEVICE` no longer warn as unknown variables.
+- `run_train_group` now fails, naming the lanes, when every sync's gradient is
+  non-finite. It used to skip every update silently.
+- `set_param` on a double-single (f64-on-GPU) parameter failed its length
+  check: it counted the (hi, lo) pair axis.
+- Mesh discovery (`DISCOVER=1`) could hang: a rank that found every peer sent
+  5 back-to-back announcements and stopped, so a peer that missed them waited
+  forever. Announcements now go out on a 100 ms timer with a `done` flag, and a
+  finished rank keeps announcing until every peer reports done (at most 3 s).
+- `MarkElementwiseRegions` admitted any broadcast operand whose element count
+  divides the output's, but region kernels read it at `gid % len`: a
+  per-channel `[1,C,1,1]` against `[N,C,H,W]` was read along the innermost
+  axis. With `RLX_KEEP_ELEMENTWISE_REGIONS=1` a batch-norm affine came out
+  wrong in 70 of 120 elements on CPU and wgpu alike. Only scalar, dense and
+  trailing-slice operands join a region now.
+- wgpu and native Vulkan `Div` were not correctly rounded: WGSL and Vulkan
+  GLSL promise only 2.5 ULP for `/`, and on Metal (MoltenVK for Vulkan)
+  18,681 of 65,556 quotients came out 1 ULP off rlx-cpu. The
+  generated binary kernel now corrects the quotient with an exact `fma`
+  residual (scaled for quotients below `2^-100`, whose correction Metal would
+  flush), and returns `x/0`, `x/inf`, `inf/x`, NaN and overflow unchanged.
+- wgpu and native Vulkan `Mod` were `a - b * trunc(a / b)`, wrong once the
+  quotient outgrows 24 bits, often with the wrong sign (`-42166.227 %
+  0.000107623026` gave `3.0e-3` for `-9.6e-5`). Both are now an exact
+  shift-subtract `fmod` that keeps the sign of a zero dividend.
+- The wgpu fused elementwise-region kernel had its own copy of the binary op
+  math, still using the approximate `/`. Region steps now call the same
+  generated `rlx_binary_apply` as the standalone kernel.
+- wgpu `Sqrt` and `Rsqrt` were not correctly rounded on Metal (18,667 and
+  17,131 of 65,544 off by 1 ULP), and batch norm's `1 / sqrt(var + eps)` was
+  1 ULP off on NVIDIA: its Newton step repaired Metal's approximate root but
+  moved NVIDIA's exact one (`backward_input_matches_cpu_bit_exactly` failed
+  there). New `rlxsl::exact` holds correctly-rounded `rlx_div_rn`,
+  `rlx_sqrt_rn` and `rlx_rsqrt_rn` (the hardware result, corrected from exact
+  `fma` remainders), shared by the binary, activation and batch-norm shaders.
+  All three are bit-exact against rlx-cpu on both Metal and NVIDIA.
+- The wgpu fused elementwise-region kernel had its own activation switch:
+  `Round` and `Recip` (both region-fusable) fell through to `return x`, so a
+  kept region skipped them, and `Sqrt`/`Rsqrt` were uncorrected. Region steps
+  now run the generated rlxsl manifest under a new `OpcodeScheme::Region`
+  (the `activation_sub` numbering), and every WGSL division inside an
+  activation expression (`Recip`, `Sigmoid`, `Silu`, ...) uses
+  `rlx_div_rn`. The generated modules no longer embed the exact helpers;
+  build.rs prepends them once per shader.
+- rlx-onnx-import: a rank-3 `Resize` was viewed through `ensure_nchw_4d`'s
+  BLC-vs-NCL size guess, which read KittenTTS's
+  `/decoder/decode.3/upsample` (`[1, 1090, 512] → [1, 1090, 1024]`) as BLC,
+  transposed it and upsampled the channel axis. It is now viewed as
+  `[N, C, 1, L]` in ONNX order (Resize's scales name the axes).
+- rlx-onnx-import: an `output_shape_fix` that changes the element count was
+  lowered to a `Reshape`, which since reshape started checking element counts
+  panicked the whole import (KittenTTS failed to load on every device), and
+  before that read past its input. It is now a kernel-less
+  `onnx_import.shape_relabel:<node>` custom op: free when dead, a compile
+  error naming the node when live.
+- The host-op replay of `Binary`, `Where` and `Fma` (rlx-cpu
+  `eval_single_op_f32`) read a broadcast operand at `i % len`, along the wrong
+  axis for a per-channel `[1,C,1]` against `[N,C,T]`. On discrete NVIDIA,
+  where wgpu hosts every elementwise op, a batch-norm affine gave `0.21` for
+  `2.28`. Operands are now read at `(i / rep) % len`; a broadcast no single
+  `(rep, len)` describes takes the shape-aware thunk path.
+- wgpu built `matmul_coop16` (8×8×8 f16 cooperative matrices) on any adapter
+  with cooperative-matrix support. An RTX 3080 Ti offers only 16×16 and 16×8
+  shapes, so the kernel failed its self-check under every load/store
+  convention. It is now built only when the adapter reports 8×8×8 f16, and an
+  unbuilt kernel is no longer reported as a failed self-check (nor trusted
+  under `RLX_WGPU_NO_COOP_PROBE`).
+- The Vulkan/DX12 f16 cooperative matmuls (`RLX_WGPU_COOP_F16_VK_ENABLE=1`)
+  never produced `a·b`; on an RTX 3080 Ti the self-check refused all four and
+  every matmul fell back. Two bugs:
+  - Layout. naga lowers `coopLoadT`/`coopStoreT` to SPIR-V `RowMajorKHR`, and
+    A, B and the output tile are row-major, but the kernels loaded A and stored
+    the tile with the column-major forms. Of all eight load/store combinations
+    only all-`T` passes. The `_widen` variants, which also loaded B
+    column-major and were picked for `n > 768`, are now identical to their
+    base kernels.
+  - Offsets. A and B are both read from the f16 shadow, but the binding was a
+    window around B alone while A's offset was relative to the f32 arena
+    window, so A was read from the wrong place: 32×16×32 came out ~100× off.
+    The binding now covers both and A's f16 offset travels in its own
+    parameter. The f32→f16 cast step had the same mismatch (its f16 window is
+    aligned separately) and now has its own destination offset.
+
+  Output now matches a reference on f16-rounded inputs to 3e-7–1.5e-6 (K up
+  to 3072). Against f32 CPU it differs by 3e-3–1e-2, the f16 input rounding the
+  opt-in accepts.
+- The CoopF16Vk wide-f32 fallback looked up its bind group by `gpu_bi` but had
+  stored it by schedule index. Host steps advance only the latter, so on
+  discrete NVIDIA (where elementwise ops are host steps) any earlier ReLU made
+  the fallback bind another step's group and wgpu panicked with a validation
+  error. It is now looked up by schedule index
+  (`coop_f16_vk_wide_after_host_step`).
+
+### Performance
+
+- CPU attention over long sequences (score matrix past `RLX_SDPA_BLOCK_MIN`,
+  4M) runs row-blocked: one task per (batch, head, ~1M-score block of query
+  rows) with a per-worker buffer, instead of a `q_s × k_s` matrix per head —
+  and the executor no longer allocates and zeroes `batch·heads·S²` floats per
+  run (4.3 GB for V-JEPA2's 8192 tokens). Masks: none, per-key, additive bias.
+- SME2 packing: A panels and transposed B in L1-sized blocks, B tiles packed in
+  parallel (it was serial while the workers waited). Bit-identical.
+- Metal lowers `Op::GroupNorm` to MPSGraph (reshape to `[N, G, C/G·spatial]`,
+  two-pass mean / variance, per-channel γ, β — the `group_norm` thunk's math),
+  so graphs containing one now take the full-MPSGraph path instead of falling
+  back to per-op thunks. EEG-DINO (GroupNorm in its patch-embedding convs)
+  went from 1.3–1.4× slower than MLX to 0.74–0.97× (round-robin, M4, shared
+  GPU). Pinned by `rlx-metal/tests/mpsgraph_group_norm_parity.rs`.
+- Metal multi-head attention and ragged projections (EEG-DINO: d_model 200,
+  8 heads of 25, 191 tokens; M4). Output bits unchanged; each path has an
+  opt-out. Pinned by `rlx-metal/tests/attention_block_kernels_parity.rs`.
+  - f32 `BatchedSgemm` is one `bmm_simd_4x4` dispatch (batch on grid z) instead
+    of one MPS matmul per matrix — B·H encoder switches per attention matmul.
+    Interleaved minimum, EEG-DINO Small batch 8: 152 → 16.5 ms.
+    `RLX_METAL_BMM_MPS=1` restores the MPS loop.
+  - f32 `Softmax` runs out of place (`softmax_lastax_out`) instead of a full
+    Copy + in-place pass, and keeps the row in registers when it fits.
+  - `[B,S,H,Dh] <-> [B,H,S,Dh]` transposes copy in output order
+    (`transpose_swap12_trail_rows_f32`); the 3-D kernel put the contiguous axis
+    on grid z. `RLX_METAL_TRANSPOSE_TRAIL_3D=1`.
+- wgpu on Metal takes CoopF32 for f32 matmuls with K % 8 != 0, N % 32 != 0 or
+  an activation right operand (`matmul_coop_f32_edge.wgsl`); these fell to the
+  scalar tiled kernel. Full B tiles load directly and only the ragged tile /
+  K tail is zero-padded through workgroup memory (the branch goes through
+  `workgroupUniformLoad` — naga rejects coop loads under a plain uniform `if`).
+  Split-QKV keeps its aligned-Param contract. `RLX_WGPU_NO_COOP_F32_EDGE=1`.
+  Pinned by `rlx-wgpu/tests/coop_f32_edge_parity.rs`.
+- wgpu multi-head attention reads Q / Kᵀ / V straight from the qkv projection
+  and writes the merged heads in place: `unfuse::fold_strided_bmm` rewrites a
+  batched matmul whose operands are `narrow → reshape → transpose → reshape`
+  copies (and whose output feeds `reshape → transpose → reshape`) into an
+  `rlx_wgpu.strided_bmm` custom node over the base tensors, run by
+  `matmul_coop_f32_strided.wgsl`. The base tensors become the node's inputs,
+  so the planner keeps qkv alive across the softmax. EEG-DINO: 3 narrows +
+  4 transposes per layer gone, bits unchanged, wgpu/MLX 1.9–3.0× → 1.4–2.5×.
+  Metal backend + cooperative matrix only; `RLX_WGPU_NO_STRIDED_BMM=1`.
+  Pinned by `rlx-wgpu/tests/strided_bmm_parity.rs`.
+- wgpu `Softmax` keeps rows of ≤ 512 elements in registers: one read and one
+  `exp` per element instead of three reads and two, same Kahan merges, bits
+  unchanged.
+- SME2 f32 GEMM packs A and B straight from their strides
+  (`sme::sme_sgemm_strided`): transposed / strided products no longer take an
+  extra full copy of both operands, and A panels are read along contiguous
+  rows. Bit-identical (each output is a sequential fused multiply-add, pinned
+  by `sme_is_sequential_fma_bit_exact` / `sme_strided_route_is_sequential_fma`).
+  `RLX_CPU_SME_THREADS` sets its worker count (default: the pool).
+- f32 LSTM: the input projection is one GEMM over all timesteps (BLAS / SME)
+  and the recurrent mat-vec uses four accumulators — pyannote's VAD 3.8–4.9×
+  faster, its frame scores within the same distance of whisperX's (4.8e-7 on a
+  100 s file) and every segment unchanged.
+- wgpu runs `ArgMax` / `ArgMin` and `Reverse` on the GPU (they were host
+  steps). A host step makes a run wait on the GPU mid-graph, which the
+  browser cannot do, so any WebGPU model with an argmax or a flip fell back to
+  the CPU there. The new `rlx.argreduce` and `rlx.reverse` kernels
+  (`builtin_gpu_kernels`) dispatch through the existing `WgpuGpuKernel` step,
+  using offsets into a window that holds both tensors. Reverse needs 4-byte
+  elements. Either op stays a host step if its tensors cannot share a window
+  (a parked param, different stripes). Argreduce is rlx-cpu's sequential
+  first-wins scan, so it matches bit for bit: ties keep the first index, a NaN
+  never wins, a leading NaN keeps index 0.
+  `wgpu_argreduce_reverse_parity` checks argmax and argmin on every axis, with
+  tied maxima in every row group, and five reverse cases, and asserts no host
+  steps remain. It fails on a last-wins kernel. Eight exgb encoders that had
+  stayed on the CPU in the browser now run on WebGPU.
+- An exact `f64` fused multiply-add for wasm, which has no FMA instruction:
+  `rlx_libm::fma_emulated`. It builds the correctly rounded `a·b + c` from
+  about 30 `f64` operations (Dekker's product, TwoSum and a round-to-odd add;
+  Boldo & Melquiond 2008). Zeros take an exact shortcut, and inputs outside
+  `2^±450` or non-finite fall back to `fma_exact` (integer, exact). With the `wasm-fma`
+  feature it also defines the `fma` symbol, replacing the software `fma`
+  behind every `f64::mul_add` in a wasm binary with no call-site changes.
+  Under V8, a fused `f64` multiply-add drops from 11.6 to 5.8 ns (plain
+  multiply-add: 2.6 ns). It matches the M4's hardware FMA bit for bit on
+  8.4 M stress cases (cancellation, rounding ties, zeros, range edges, all
+  special values), and matches `libm::fma` inside wasm on 3 M more.
+- `rlx_linux_ref::openblas::dgemm_ab` packs A's rows and B's columns
+  contiguously, advances four output columns together, and on wasm inlines
+  the exact FMA instead of calling it. Every element keeps its arithmetic
+  (the same k blocks, accumulator chain and fused operations); the Haswell
+  OpenBLAS fixtures still pass and fail when the new path is altered. In the
+  browser, exgb's BENDR linear probe went from 278 s to about 205 s with
+  identical score bits. Most of the remaining time is `dsyevd`'s exact
+  eigensolve on the 1536-wide embedding.
+- wgpu: rlx's own kernels compile without naga's forced loop bounding (bounds
+  checks stay on). The guard kept Metal from unrolling the tiled matmul's
+  fixed loops: `matmul` 32×128×2 went from 440 µs to 37 µs per dispatch.
+  User shaders keep the fully checked path.
+- wgpu: a `Binary` reads a broadcast operand straight from the `Expand`'s
+  source through its `(rep, len)` indexing, and `Expand`s left unread are
+  dropped. EEGNet's training step: 216 → 185 dispatches, arena 83 → 75 MiB.
+- wgpu: the conv weight-gradient kernel steps its output-position decode by
+  carries instead of four integer divisions per multiply-add, about 3× faster
+  on EEGNet's temporal conv, bit-identical output.
+- wgpu CoopF16Vk (opt-in f16 tensor-core matmul): a pass split between an
+  f32→f16 mirror and the coop matmul also waited on the CPU for the GPU to go
+  idle — a full round trip per chained matmul, 14 of 20 ms per run of an
+  8-layer 512×768 chain on an RTX 3080 Ti. The split stays; the wait is gone
+  (the queue already orders the submissions).
+- wgpu CoopF16Vk: new `matmul_coop_f16_vulkan_f32acc_32`, one subgroup per
+  32×32 block with 2×2 register-blocked 16×16 tiles, used when M and N are
+  multiples of 32 and the device self-check passes it. The 16×16 kernel ran
+  64 invocations, i.e. two NVIDIA subgroups computing the same tile, and reused
+  no fragment. On an RTX 3080 Ti (shared with another job), 8 chained layers:
+
+  | shape | f32 | coop before | coop now |
+  |---|---|---|---|
+  | 512×768×768 | 5.9 ms | 20.6 ms | 3.4 ms |
+  | 2048×768×768 | 14.9 ms | 29.7 ms | 12.0 ms |
+  | 2048×768×3072 | 40.7 ms | 85.0 ms | 25.7 ms |
+  | 4096×1024×1024 | 40.9 ms | 88.0 ms | 33.0 ms |
+
+## [0.2.19] — 2026-10-24
+
+### Added
+
+- `rlx-numpy::torch`: torch CPU float32/float64 reductions bit-for-bit (`sum_f32`,
+  `sum_f64`, `sum_rows_f32/_f64`, `mean_f32`). These follow ATen's `cascade_sum`: 4/2
+  lanes on arm64, ILP 4, a 4-level cascade. Also `exp_f32`, which is SLEEF's `xexpf`,
+  the exp torch calls on arm64 (libm `expf` differs in about 1 value in 10). Pinned
+  against torch 2.11.
+- `rlx-numpy::npy`: float32 `.npy` read/write.
+- `rlx-linalg::lsap::linear_sum_assignment`: a port of SciPy's `rectangular_lsap`,
+  including its tie rules.
+- `rlx-linalg::algos::eigh_torch` / `eigh_torch_f32`: `torch.linalg.eigh`'s spelling,
+  LAPACK `?syevd` on the lower triangle, with eigenvectors in columns. The f32 version is
+  bit-identical to torch 2.11 on macOS. Backed by the new `rlx-cpu::blas::ssyevd` and
+  `dsyevd_uplo`.
+- `rlx-rng::torch`: `normal_tensor_f64` (the double `normal_fill`), plus `Init`,
+  `random_int64`, `epoch_permutation` and `dropout_mask`. The last four moved here from
+  an exg crate: torch default initialisers and the `DataLoader(shuffle=True)` stream.
+- `rlx-optim::clip_grad_norm_torch`: `torch.nn.utils.clip_grad_norm_` exactly
+  (`max/(total + 1e-6)`, clamped at 1, always applied).
+
+- **`rlx_runtime::placement`: measured device placement for concurrent jobs**, moved from
+  exg's moabb crate. `measured_device(key, candidate, time_step)` times a few real steps of
+  the caller's workload on the cost model's GPU pick and on the CPU, keeps the GPU only at a
+  1.5× margin, and decides once per key for the process (`RLX_PLACEMENT_CACHE` remembers
+  decisions across runs; `RLX_PLACEMENT=static` / `RLX_FORCE_DEVICE` skip it). `gpu_slot`
+  shares a GPU among concurrent jobs, optionally capped (`RLX_GPU_JOBS`); it nests on one
+  thread, gives a placement probe the GPU to itself, and records the devices each thread
+  compiled for (`take_devices_used`). Written after the cost model put EEGConformer's
+  training graph on Metal at 20–99 s per 64 steps against 1.7 s on the CPU. Tests moved
+  with it.
+- **`rlx_runtime::job_slots::JobSlots`: a first-come-first-served pool bounding concurrent
+  jobs by count and memory**, moved from exgb. With `gate_memory`, the next job waits while
+  RSS plus the measured growth per running job would exceed the soft memory budget; a job
+  always starts on an idle pool, so it never deadlocks. Tests: the memory gate, and the
+  count cap under 12 threads.
+
+- **Graph outputs have names.** `Graph::name_output(i, "logits")` /
+  `set_named_outputs([("logits", y), …])`, and `CompiledGraph::outputs()`
+  (name, dtype, static shape, in `run` order) / `output_index("logits")`,
+  which names the closest outputs when there is no match. Optimizer passes
+  keep output positions, so a name still finds its output after fusion has
+  renumbered the nodes behind it. ONNX imports keep the model's output names
+  (through HIR, `HirModule::output_names`). `.rlxmodel` writes them as
+  `return %lm_head as logits`. `extract`, `parallel` and `sequential` carry
+  them. In every binding: `name_output` / `output_names` on graphs,
+  `outputs()` / `output_index()` on `Compiled`.
+
+- **Bindings report boundary and compile errors by kind.** Every language's
+  `Compiled` (Python, JS, C, Swift and the other generated bindings) now goes
+  through `try_run` / `try_set_param` / `try_compile`. A misspelled input or a
+  wrong-length buffer is a `Type` error (`ValueError` in Python, `TypeError` in
+  JS, `RLX_ERR_TYPE` in C) that names it. Before, it ran on zeros or failed
+  with an opaque panic. New `Compiled` rows: `inputs()`, `params()`,
+  `check_bindings(names)`, `allow_unbound(names)`. See
+  [docs/bindings.md](docs/bindings.md).
+
+- **README examples are doctests** (`just check-readme`, part of `just ci`):
+  every Rust block in the README is now a complete program that compiles and
+  asserts its result, using only the `rlx` crate. Several were fragments with
+  undefined variables, imported crates the prelude already covers, or called
+  `std::env::set_var` (unsafe in edition 2024); the training example could not
+  have trained (see **Fixed**). New [`docs/troubleshooting.md`](docs/troubleshooting.md)
+  — errors by message, wrong numbers on one device, NaN, slowness. README crate
+  list now covers all 85 workspace crates.
+
+- **Caller mistakes at the `CompiledGraph` boundary are errors, by name.**
+  A misspelled input (`the graph has no input `token` (did you mean
+  `tokens`?)`), or a buffer whose length is not a static input's or param's
+  shape, used to compute on the arena's zeros and return plausible numbers; it
+  now panics in `run` / `run_typed` / `set_param`, and the new
+  `CompiledGraph::try_run` returns it as an `IoError`. Inputs left unsupplied
+  and params never set are named in a one-time warning (some callers rely on
+  them reading zero); `check_bindings` returns them as an error and
+  `allow_unbound` declares the ones meant to read zeros (an empty KV state). Unknown
+  *param* names stay accepted (loading a full checkpoint into a subgraph).
+  `inputs()` / `params()` list the declared boundary (name, dtype, shape).
+  A cache that an `Op::KvAppend` writes into takes any whole number of its
+  rows: decode graphs declare a spare row for the in-place write
+  (`rlx_flow::blocks::kv_spare_rows`) and are fed only the filled ones. The
+  whole `rlx-runtime` CPU suite runs unchanged with the checks on, as do the
+  Gemma and Qwen3 decode tests in rlx-models. The unbound warning stays a
+  warning: it fired in none of about 350 rlx-models tests across 12 model
+  families.
+
+- **`Session::try_new` / `try_compile` / `try_compile_with`** return a
+  `CompileError` — `Invalid` (the full IR verifier, run up front, so errors
+  name the caller's graph rather than the first pass), `DeviceUnavailable`
+  (not built in, or absent with the backend's reason), `Unsupported` (node
+  and op the device cannot lower), or `Backend` — instead of panicking.
+
+- **`rlx_stablehlo::export_specializations`** — one symbolic graph exported
+  at several `DimBinding`s as functions `@main_<suffix>` in one module (prefill
+  buckets); with parameters, all functions share one weight file.
+  `DimBinding::with` and `FromIterator<(u32, usize)>`.
+
+- **`SimplifyTransposes`** (`rlx_compile`; opt-in
+  `CompileOptions::simplify_transposes` / `RLX_SIMPLIFY_TRANSPOSES`, default
+  off). Removes identity transposes, composes chains, folds transposes of
+  constants, and sinks a transpose through single-use elementwise ops when that
+  makes it cancel another. On imported Supertonic TTS models it removes 35–38%
+  of transposes (duration predictor 49→31, text encoder 80→50, vocoder 34→22)
+  with bit-identical outputs on CPU and Metal; transformer and CNN imports have
+  none to remove. No reliable speedup measured yet (host load ~80 during the
+  runs), hence off by default. `rlx-onnx-import --example transpose_census
+  [--run] [--device D]` reproduces the census.
+
+- **StableHLO weights as IREE parameters** — `StableHloOptions::with_parameters`
+  emits weights as `util.global` + `#flow.parameter.named`, read from a file at
+  load time (`write_safetensors` writes one). Int8 weights export as `i8`
+  tensors dequantized in the module. Both are in the IREE round trip.
+
+- **StableHLO / IREE export** — new crate `rlx-stablehlo` and
+  `ExportTarget::StableHlo` (`rlx-runtime` feature `stablehlo`). Graphs go
+  through the TPU backend's preparation and rlx → HLO lowering and are printed
+  as StableHLO MLIR (`model.mlir` + `model.signature.json`) for `iree-compile
+  --iree-input-type=stablehlo`. NCHW convolutions export without transposes.
+  `tests/iree_roundtrip.rs` compiles and runs seven graphs — MLP, conv + pool,
+  embedding/LayerNorm/shape ops, RmsNorm, batched matmul, and Llama and BERT
+  layers built through `rlx-flow` — under IREE (llvm-cpu) and matches rlx CPU,
+  with an op-by-op bisect on mismatch. It found the five bugs under **Fixed**.
+
+- **Known failures as data** (`rlx_ir::known_failures`). A case a backend is
+  known to get wrong is a line in `tests/known_failures/<test>.txt` —
+  `case device[@os] issue [note]`, issue required — instead of a skip: it still
+  runs, its failure is reported as known, and once it passes the test fails
+  until the entry is removed. `RLX_RUN_KNOWN_FAILURES`,
+  `RLX_KNOWN_FAILURES_ISSUE`, `RLX_KNOWN_FAILURES_REPORT` (JSON lines) and
+  `RLX_KNOWN_FAILURES_DIR` (rig-local lists); `just known-failures
+  list|update` applies a report to the files. Wired into `fd_backward_gate`
+  and `gpu_filters_parity`. See `docs/adr/0005-known-failures-as-data.md`.
+
+- **`cargo rlx debug`** (`rlx_runtime::debug::debug_graph`): runs a graph on a
+  device and on CPU with the same deterministic feeds and classifies the
+  result (`unsupported-op`, `compile-panic`, `run-panic`, `non-finite`,
+  `mismatch`, …). `--probe` reruns with one compile option changed at a time
+  (fusion off, regions unfused, F32, common-IR kernels, no constant folding, no
+  MPSGraph); `--bisect` exposes every op and names the first that diverges,
+  flagging one that reads only graph inputs. On the known Metal BF16-input
+  defect it names the `Narrow` reading the input, with every probe failing.
+
+- **Fusions-must-fire test** (`rlx-runtime/tests/fusions_fire_on_model_blocks.rs`):
+  Llama and BERT blocks built through `rlx-flow`, compiled on every registered
+  device, with exact fused-op counts plus two controls (the block still emits
+  the pattern; with fusion off none of the fused ops appear), and checks that
+  `fuse()` and `supported_for_target` agree with each backend's real claims.
+
+- **`ExpertPager::with_prefetch_cap(fraction)`** and `PagerStats::{prefetched,
+  prefetch_skipped, prefetch_used, prefetch_wasted}`: bound how much of the
+  cache unconsumed prefetches may hold, and see whether prefetching pays.
+  Default unchanged (no cap beyond the budget).
+
+- **Architecture decision records** in `docs/adr/`.
+
+- **`RLX_POISON_ARENA=1`**: CPU scratch starts as `0xFF` bytes (NaN, −1)
+  instead of zeros — at allocation and at the per-run reset — so an output
+  nothing wrote reads NaN instead of a plausible zero. The whole `rlx-runtime`
+  CPU suite passes with it on, so CPU kernels do not depend on zeroed scratch;
+  it found the two test defects under **Fixed**.
+
+- **`Model::run` on a language model takes media beside `input_ids`** (a
+  tensor named as the entry's media kind, a speaker vector): the prompt's
+  logits with each medium spliced in at its placeholder token
+  (`prefill_with_media`); the next run, the context grown, goes on from its
+  cache. A package program drives a speaker-conditioned LM through
+  `entry.run` this way (KittenTTS 2).
+- **`tokenizer.encode` with `special: false`** for package programs: the
+  text's ids alone (`TextCodec::encode_plain`), none of the special tokens
+  the tokenizer's template adds around them — ChatterBox's wraps every text
+  in `[EXAGGERATION] [START] … [STOP] [START_SPEECH] [START_SPEECH]`, which
+  its program builds itself.
+- **`rlx_program::run_body`**: a function run with the request body the
+  host reads — `from`, `keep` and `dims` together, which `run_with` and
+  `run_sized` each send one part of. A prompt graph whose caches have as
+  many rows as the program asks (no input's shape says) keeps them in
+  slots (MetaVoice).
+- **Training a package** (`rlx_runtime::model::trainer`, features
+  `model-io` + `training`): `open_trainer(path, options)` trains any
+  function of an `.rlxp` with nothing about the model it is — its symbols
+  sized (`dims`), a loss (`{output}`, `{cross_entropy: {logits, labels,
+  mask?}}`, `{mse: {output, target}}`), the params (`"all"`, `{params:
+  [globs]}`, `{lora: {targets, rank, alpha}}`, or `{sae: {tap, width, l1}}`
+  on one activation, the base frozen) and AdamW, on `ResidentTrainer`. A
+  package's model block may hold the same object as `train`, its defaults.
+  `save_adapter` writes LoRA factors as an adapter package (each update in
+  the layout its tensor is stored, transposed references included), which
+  opens as the trained model; `save_sae` writes the SAE as a package of its
+  own (`h` → `features`, `reconstruction`); `save` writes a full fine-tune
+  as the package with the trained values held. Integer inputs (token ids)
+  are fed as f32 and cast in the graph. `prepare` gives any trainer the
+  graph, the trainable names and the starting values, and `Saver` writes
+  the results back. Tests `package_training`.
+- **An SAE spliced into a package as it opens** (open option `sae: "<sae
+  package>"` or `{path, mode}`): `replace` (default) feeds each function's
+  tap through the SAE so the model runs on its reconstruction; `features`
+  leaves the model as it was and adds the output `sae.features`. Test
+  `package_training`.
+- **`Trainer.from_package` / `Trainer.save_package`** in every binding
+  (`api.idl`; rlx-capi `rlx_trainer_from_package` /
+  `rlx_trainer_save_package`, rlx-js `Trainer.fromPackage` /
+  `savePackage`, pyrlx `Trainer.from_package` / `save_package`, Swift and
+  the generated languages): the bindings' trainer (its optimizers,
+  freezing, resident path, checkpoints) on a package's function. Test
+  `rlx-bind/tests/package_trainer.rs`.
+- **Every op kind round-trips through `.rlxmodel`**: test
+  `every_op_kind_round_trips` prints and reads back a graph of each
+  `sample_ops` kind, so a new op the text format cannot carry fails there.
+- **Package program inputs read from the weights**: a run's body
+  `weights: {input: [tensor, …]}` feeds each input the named tensors of the
+  package's weights, read for that run and stacked as the input declares
+  them (`WeightCache::bytes` now reads a safetensors tensor's bytes as
+  stored). A program routes a mixture of experts this way: Drama 3's 32 GB
+  of FP8 experts are read eight at a time, none bound to a function.
+- **Symbolic fits of a symbol twice beside another** (`rlx_ir::dynamic`):
+  a dim `2·s − 1` or `2·s − l` (a flow decoder's relative positions over a
+  prompt's and a generation's tokens, a prompt's mel frames padded to them)
+  is derived when no fit with each symbol once is; test
+  `a_dim_of_a_symbol_twice_and_another_is_derived`.
+- **The `sample` host service for package programs.** A program sends
+  logits (`[n]` f32) and the sampling options (`seed`, `step`,
+  `temperature`, `top_p`, `top_k`, …) and gets back `{id}`, drawn by the
+  runtime's sampler chain from the stream `seed + step` (the argmax when
+  greedy). Orpheus's program applies its own repetition penalty, then samples
+  through it.
+
+- **Batched, differentiable ReEig/LogEig on the CPU** (`rlx_cpu::spd_batched`).
+  `spectral_batched(g, x, batch, n, eps, Re | Log)` emits two custom ops:
+  `spd.matfn_batched` (`[B,n,n]` → packed `Y ‖ λ ‖ U`, one f64 LAPACK `dsyevd`
+  per matrix, rayon over the batch, f32 or f64 graphs) and its Loewner
+  (Daleckii–Krein) backward, which reuses the forward's eigendecomposition.
+  GPU backends run both through their host-kernel fallback, bit-identical to
+  the CPU on Metal, MLX and wgpu. It replaces the graph Jacobi scan
+  (`spd_*_batched`) for training: TensorCSPNet and GraphCSPNet train ~6×
+  faster. Tests `rlx-runtime/tests/spd_batched_native.rs`: forward vs host f64
+  (4e-8), gradient vs finite differences (1e-7; the Jacobi path is 1e-5) and
+  vs autodiff through Jacobi on symmetric parts (8e-6), and the GPU backends.
+  The raw gradients of the two paths differ (0.85 here) in how they split
+  `dX + dXᵀ` between the triangles, which a symmetric input cannot see.
+  It also covers `√`, `1/√` and powers (`BatchedSpectral::{Sqrt, InvSqrt,
+  Pow}`), each against finite differences (≤ 1.2e-7), and a
+  `SpectralBatchedExt::spd_native` method as the drop-in for the Jacobi
+  builders.
+  Every function's gradient is the derivative of `f(max(λ, ε))`, zero where
+  the floor clamps, as the Jacobi builders compute it. For `Log` that differs
+  from the native single-matrix `Op::LogEig` (`1/max`), which matters when
+  `Log` at ε = 1e-4 stands for ReEig∘LogEig; the test clamps part of the
+  spectrum, and `1/max` fails it.
+- **A program runs its package's other entries.** The host service
+  `entry.run` runs an entry of the package (by name or kind) on tensors
+  with options, as `Model::run` — a `generate` entry generates ids — so an
+  LM-and-codec TTS is one package: the LM's entries, the codec's graphs, a
+  program between. Generation's `seed_per_step` option draws each sampled
+  token from its own stream (`seed + step`, history empty), as rlx-qwen3's
+  `sample_token_at` does.
+- **Generalizing from many sizes.** `rlx_ir::dynamic::generalize_many`
+  fits through the first two builds and keeps, of the fits, the one
+  through every other — dims and attributes both, including those the same
+  at the first two (a quotient can be: `⌈37/16⌉ = ⌈46/16⌉`). Of quotients
+  as small, a power-of-two divisor is taken.
+- **Quotient derived dims.** A `SymDef` may divide, rounding down, and add
+  a second symbol (`inner`, `div`, `plus`, `plus_scale`; `.rlxmodel`
+  `(audio)/256+1`, `(t+1)/2`, `(audio*-1+255)/256+frames*1-1`): an STFT's
+  frames, a strided conv's, a decoder's frames past a prompt's.
+  `generalize_checked` fits them through its third size (a quotient alone
+  first, then the smallest offset), and refuses sizes two symbols step in
+  proportion across, which no fit can tell apart.
+- **Programs size symbols by name.** `rlx_program::run_sized` (a request's
+  `dims: {name: size}`) sizes a symbol no input carries.
+- **Scaled symbolic attributes.** A `SymAttr` is the size times `scale`
+  plus `offset` (`.rlxmodel` `start: seq*-1+1000`): a start that falls as
+  the size grows, a relative position table read around its middle
+  (ZipVoice's and LuxTTS' encoders).
+- **Square derived dims; generalizing from three sizes.** A derived dim
+  (`rlx_ir::dynamic::SymDef`) may be a square with a linear term
+  (`SymDef::linear`; `.rlxmodel` `f32[seq*seq*2+seq-1]`), what an
+  attention's relative positions flatten to (VITS, Piper's encoder).
+  `rlx_ir::dynamic::generalize_checked` takes the graph at a third size
+  and keeps, of the fits through the first two, the one through it — two
+  sizes cannot tell `96·seq − 480` from a square.
+- **Programs: a package's host logic as WebAssembly** (`rlx-program`, and
+  rlx-runtime's feature `program`). An entry of kind `program` names a
+  wasm module (built with `rlx-program`'s guest SDK) that answers the
+  model's tasks — `run`, `transcribe`, `synthesize`, `embed`, `generate`,
+  `chat`, `score` — and calls back for the package's functions (each
+  specialized to its inputs' shapes and compiled once per shape, on the
+  model's device; outputs kept in host-side slots so caches never cross
+  into the module), its files and tokenizers. Run by `wasmi`, an
+  interpreter, so it works where JIT does not (iOS, watchOS). For what a
+  graph says badly: phonemizers, FST and beam searches, entropy decoders,
+  a model's own decode loop.
+- **Programs read the package's files.** A program built for
+  `wasm32-wasip1` gets a read-only WASI filesystem of the package's
+  sidecars at `/package` (in memory, nothing of the host's), so `std::fs`
+  code — espeak-ng reading its dictionaries — runs as is. A package of a
+  program alone keeps its model block in `model.json`.
+- **`transcribe` for a front end symbolic in the audio's length.**
+  `audio_multiple` pads the audio to whole frames, the stages read the real
+  length as `audio_samples`, and `token_budget: {per_second, extra}` sets
+  the decode length from the audio's. Its stages open from their own
+  handle on the package (as `synthesize`'s do), so a symbolic one keeps
+  its weights. A no-step decoder's `prefill.inputs` take `{context: …}`
+  feeds, and a function symbolic in their length (an encoder's) is
+  specialized to it when it runs, compiled once per length.
+- **`Op::While` loops at run time, unbounded or not.** It was unrolled to
+  `max_iterations` everywhere, so a loop with no bound could not run at all.
+  The CPU now compiles its `cond` and `body` once and loops
+  (`rlx_cpu::thunk::{Thunk::While, execute_while}`); Metal, CUDA, ROCm and
+  wgpu run it through their one-op host fallback (`HostOp`). `LowerIf`
+  (inline `Op::If` alone) replaces `LowerControlFlow` on those backends and
+  in the fusion pipeline when the backend claims `While`
+  (`DecomposePolicy::while_native` for the GPU decompose pass); the others
+  still unroll. Checked on CPU, Metal and wgpu against a host loop
+  (`rlx-runtime/tests/while_runtime_loop.rs`: a data-dependent count, a
+  bound, a false start); CUDA and ROCm compile-checked.
+- **Several entries in one package, as one model.** An entry's key is its
+  name and its kind its `kind` field (or the name, as before), so a
+  package holds several entries of any kinds. Opened, it is one model:
+  each task goes to the entry of its kind (`embed`, `chat`, `transcribe`,
+  …) and `run` to the entry whose inputs are the tensors given. The first
+  entry opens with the package, the others when first asked for. The open
+  option `entry` opens one by name. `rlxp::{entries_of, entry_of_kind}`;
+  the feature `entry.kind` keeps an older rlx from missing a named entry.
+- **`rlx-search`** (re-exported as `rlx_runtime::search`): host-side sequence
+  search shared by every decoder, dependency-free. `argmax` / `top_k` /
+  `log_softmax` with one tie rule (lowest index); beam search as a stepping
+  state machine (`BeamSearch::advance`, callers own and reorder their KV by
+  `Step::parents`) with the Hugging Face rule (`BeamConfig::new`) and
+  `openai/whisper`'s (`BeamConfig::whisper`) as presets plus `Constraint`
+  masks; CTC greedy, streaming prefix beam (`PrefixBeam`), and the CTC
+  trellis `ctc::forward` over the `Log` / `Tropical` semirings; monotonic
+  Viterbi alignment. `lm::beam_search`, `lm::argmax_u32` and
+  `samplers::argmax_logits` now delegate to it, so greedy decode and the
+  sampler chain get the lane-parallel `argmax`: 46 µs vs 164 µs on a
+  151,936-entry row (Apple M-series, release). Verified token-identical to
+  the previous `lm::beam_search` and to a transcription of `openai/whisper`'s
+  `BeamSearchDecoder` over 600 scripted models each.
+
+- **`dynamic::generalize_with`**: a derived dim's offset may exceed its
+  scale (a convolution's padding: `4·frames + 6`) when the caller checks
+  the result at a third size; and an attribute may be a derived symbol's
+  size (a slice as long as a padded dim), not only a base symbol's.
+- **Packages with no decode step.** A `generate` entry with a `prefill` and
+  no `functions` runs its prompt function over the whole context for each
+  token, as a runner with no cache does, so a language model whose only
+  graph is a full-sequence forward (Llama 4, MiniMax M3) runs from a
+  package. `prefill.functions` lists one prompt function per length, for a
+  graph not symbolic in its length.
+- **A held tensor of the wrong size fails the open**: `PackageWeights::bind`
+  checks each held tensor against the shape its param declares. It was
+  bound silently, and a package written wrong ran with the wrong values.
+- **Prompt-cache snapshots for packages.** A package's language model
+  (`GraphLm`) takes `LmRunner::export_session` / `restore_session` /
+  `prefill_logits_reusing`: its caches (read back from the executable when
+  they live there) and the tokens in them, restored by the next step, so a
+  prompt sharing a snapshot's prefix runs only its new tokens.
+- **`rlx-pkg inspect` shows the model**: who wrote it and who may read it,
+  its symbols by name, each function's inputs, outputs, params and
+  variables, its entries, and its weight sources.
+- **Chat templates with `{% generation %}`** (Hugging Face's assistant-mask
+  tag, LFM2's and SmolLM3's templates) compile: the tag renders its body, as
+  transformers does. A package with such a template failed to open.
+- **Combine and split graphs: `rlx_ir::compose`, in every binding.**
+  `Graph::splice` copies one graph into another, binding named inputs *or
+  params* to existing nodes (a weight tied under another name); same-named
+  leaves are shared after a kind and shape check, or kept apart with
+  `Splice::prefix`; `Splice::adapt_shapes` re-infers shapes from bound
+  operands. `compose::parallel` / `compose::sequential` build on it.
+  `Graph::partition` (any order-respecting node→part assignment, named
+  `__boundary.<id>` tensors), `Graph::split_at` and `Graph::components` all
+  return a `Partition` of self-contained graphs that `merge` reassembles;
+  `Graph::extract` takes one subgraph. Variables and symbolic attributes are
+  carried through. Works under `no_std`. Bound in Python (`pyrlx.splice`,
+  `parallel`, `sequential`, `extract`, `Partition`), JS (`rlx.*`), C
+  (`rlx_splice`, `rlx_partition_*`) and every generated language. See
+  [`docs/graph-compose.md`](docs/graph-compose.md).
+- **`no_std` graph verification: rlx-ir core and rlx-fpga.** rlx-ir has a
+  default-on `std` feature; with `--no-default-features` it builds as `no_std` +
+  `alloc` and keeps the graph / op / shape / verify core (`RLX_*` switches read
+  as unset, the custom-op registry is empty, float math comes from `libm`).
+  rlx-fpga's `no_std` build now works (it never compiled before, GitHub #7):
+  Model → `optimize` (still checked by `rlx_ir::verify`) → in-memory
+  `collect_artifacts`; graph import/export and file emission stay on `std`.
+  `just check-no-std` (in `just ci`) builds rlx-ir, rlx-cortexm and rlx-fpga for
+  `thumbv7em-none-eabihf` and runs their host tests without default features.
+- **XDNA bf16 matmul (opt-in, not yet hardware-validated).**
+  `Session::new_with_precision(Device::Xdna, Precision::BF16)` runs matmuls
+  through mlir-aie's `bf16_f32` microkernel (bf16 operands, f32 accumulation)
+  instead of per-channel int8. Host-side tile packing is tested against the
+  kernel's tile contract; the NPU path has not run yet.
+- **XDNA host checks and live geometry.** `rlx_xdna::host_blockers()` (XDNA 2
+  part, `/dev/accel/accelN` not read/write for the user), `aie_geometry()`
+  (columns/rows/AIE version from the driver), and a memlock warning in
+  `diagnostic()`. `RLX_XDNA_MAX_CONTEXTS` (default 4) bounds the NPU hardware
+  contexts a process holds; chains evict idle ones to stay under it.
+
+- **rlx-distributed: addressed layer pipeline building blocks** (lifted from
+  `rlx-kimi-k3`'s pipeline):
+  - `rpc` — request/reply over TCP whose server sends heartbeat frames while a
+    request runs, so a client bounds every read: a peer silent for
+    `RpcOptions::timeout` is an error naming it, a slow request is not. `serve`
+    runs an `RpcHandler` with one thread per connection (a health probe is never
+    stuck behind an idle client), returns handler errors and panics as messages
+    and keeps serving; `OP_SHUTDOWN` stops it and closes idle connections.
+    `Enc` / `Dec` are the checked little-endian payload codec (incl. lists of
+    `f32` vectors).
+  - `stages` — `StageSpec` (an address and its layer range), `plan_stages` (even,
+    explicit counts, or `w:` weights, on `LayerSplit`), `validate_stages` (refuses
+    stages that do not tile the model), `parse_stages`.
+  - `cluster::sizing` — roofline step timing: `NodeSpec` with presets, a model's
+    `StepWork` (dense / expert FLOPs and bytes, disk-served expert share, pipeline
+    boundary and all-to-all bytes), and `time_step` for pipeline (micro-batches in
+    flight) and expert-parallel layouts, with the bottleneck resource.
+
+- **`.rlxmodel`: rlx IR as text, and its stable encoding
+  (`rlx_ir::rlxmodel`, feature `serialize`).** A graph prints as
+  `%2 = MatMul %0, %1 : f32[1, 2]`, and every op and attribute is written as
+  the `Op` variant itself, by name: `Reshape{new_shape: [1, -1]}`,
+  `Activation(Gelu)`. Nested `If` / `While` / `Scan` bodies print as
+  `graph @… { … }` blocks. Values keep `nan`, `±inf` and exact floats, and
+  bytes print as `b64"…"`. The file starts with `rlxmodel 1` / `opset 1`,
+  and a file from a newer version is refused rather than misread. Every op
+  round-trips to identical bytes (`tests/rlxmodel_every_op.rs`, in
+  `just check-ops`), and `tests/fixtures/opset1.rlxmodel` keeps the format
+  readable across later `Op` changes. `.rlxp` packages now store their graph
+  this way (`rlxmodel_v1`, readable as `graph/model.rlxmodel` in a directory
+  pack), and bincode packages from earlier versions still open. A
+  100k-node graph is 6.8 MB of text (bincode: 9.3 MB) and reads in 129 ms.
+  - **Versions in the file.** `rlx 0.2.18` records the writer.
+    `requires 0.2.19` makes an older rlx refuse the file, with a message
+    saying so. `model {name: "…", version: "…", …}` is the model's own block:
+    its name and version, plus whatever its runtime reads. All three are
+    optional, and files without them read as before (`rlxmodel::Module`).
+  - **A package holds a whole model.** It can store several graphs
+    (`WriteOptions::extra_graphs`, `Package::module`) and the model block
+    (`WriteOptions::model`, `requires_rlx`). The `rlxp` provider reports
+    the model's `name`, `version`, writer version and functions in
+    `info().metadata`.
+  - **Weights by reference.** The model block's `weights: [{uri, prefix?,
+    map?}]` names where each param the package doesn't hold comes from:
+    `safetensors://`, `gguf://`, `rlxp://` and the other `resolve_weight_uri`
+    schemes, with relative paths beside the package. A param found nowhere
+    fails the open with its name, instead of running on zeros. Only f32
+    params bind this way so far.
+  - **Model cards.** The model block's `authors`, `license` (SPDX, one or
+    a list), `repository`, `homepage` and `card` (the full Markdown model
+    card) have accessors on `Module` and appear in `Model.info().metadata`.
+    A multi-line text prints verbatim as a `"""` block, and the block prints
+    one field per line, name first and card last.
+  - **Entries: an `embed` method from the package alone.** A model block's
+    `entries.embed` gives the encoder graphs, which are buckets at
+    `[batch, seq]`, the tokenizer (`sidecar:` or a path), each input's role,
+    the position offset and the pooling. The `rlxp` provider then answers
+    `embed(texts)` with no provider code. Tokenizers load through
+    `model::set_tokenizer_loader`, which the bindings set to rlx-text's
+    (`rlx_text::install_model_tokenizer`). Referenced weights may be
+    transposed (`map: {p: {tensor, transpose: true}}`). rlx-models'
+    `rlx-embed` exports BERT / XLM-R checkpoints this way
+    (`export::export_rlxp`): multilingual-e5-base becomes an 89 MB package
+    that references 125 of its 149 params. Opened by rlx alone, from Rust
+    or Python, it embeds within 2e-7 (cosine ≥ 0.9999995) of rlx-models' own
+    embedder.
+  - **Symbolic graphs: one graph for every size.** Named symbolic dims
+    (`dims {seq: 0}` in the header; shapes read `f32[1, seq]`), and
+    symbolic integer attributes: an op field that is a symbol plus a
+    constant, written in place (`KvAppend{axis: 1, pos: upper}`,
+    `start: seq-1`). The table lives on `Graph` (`sym_attrs`), skipped by
+    serde so bincode packages still read. `rlx_ir::dynamic::specialize`
+    binds the symbols, writes those attributes, re-derives `Reshape` /
+    `Expand` targets from the bound shapes, and re-infers. The deferred
+    dynamic-shape compile now uses it, where before it re-inferred from
+    stale targets. `dynamic::generalize(a, b, sizes)` turns two static
+    builds of a model into one symbolic graph, and an error names any node
+    that isn't symbolic. Entries run a symbolic function at the `sizes`
+    they list. multilingual-e5 (`encode`) and Qwen3-0.6B (`decode`) now
+    export as one graph each instead of six and four. They give the same
+    vectors, within 2e-7, and the same 24 greedy tokens as before.
+  - **Readable `.rlxmodel`.** Values print by their node's name
+    (`%q_proj`, `%model.layers.0.self_attn.k_proj.weight`) where it is a
+    unique label, else by position. Inputs and params named like their
+    value print as `%x = input` / `%w = param`, and optional fields that
+    are `none` are left out. Labels are checked on read: a number must be
+    its position, a name defined once, and a reference to a value above.
+    Files written before still read, and every op still round-trips to
+    identical bytes.
+  - **Constants and variables in `.rlxmodel`.** A small constant reads as
+    its values (`%iota = const [0, 1, 2, 3] : f32[4]`, exact for f32/f64
+    and integers, NaN bits included), and a larger one stays base64.
+    Variables (`Graph::vars`) are inputs whose next value is an output:
+    `%past_k_0 = var : …` with `return …, %past_k_0 = %k_0`.
+    `stateful_decode` declares a step's caches as variables, and a
+    `generate` entry then needs no `state` pairs. Exporters drop the
+    builder's provenance and shared node names (`tidy`), so a layer reads
+    `%83 = MatMul %82, %model.layers.0.self_attn.q_proj.weight : f32[1, 1, 2048]`.
+    A long `return` lists one value per line, and long objects in the
+    model block break one field per line. `generalize` keeps a `Reshape` /
+    `Expand` target symbolic (`new_shape: [1, cap, 8, 128]`) instead of
+    showing the size it was probed at. A stateful step's written caches read
+    `%past_k_0.next` and its first output `%logits`. A weight reference
+    that is the param's own tensor, transposed, is just
+    `{transpose: true}`.
+  - **Decode state in the graph.** `rlx_ir::stateful::stateful_decode`
+    gives a symbolic decode step a `position` input. RoPE rows become a
+    `Gather` from held tables, the mask is computed in-graph
+    (`iota[0..cap] <= position`, through a symbolic `Narrow` length), and
+    each `KvAppend` becomes a `ScatterNd` at the position. The caches it
+    returns are its next inputs. The `generate` entry gains
+    `position` feeds and `state_update: "replace"`. `stateful::rebuild` is
+    the general node-by-node rewriter it uses.
+  - **A stateful step's caches stay in the executable.** A `generate`
+    entry whose step keeps its caches as variables binds them once
+    (`bind_gpu_handle`) and copies only the new row each step
+    (`feed_kv_row`), reading back just the logits. The host used to pass
+    every cache in and read it back whole each token: 56 × `cap` rows of
+    4 KB each way for Qwen3-0.6B, ~0.9 GB a token at `cap` 4097. When the
+    context outgrows a step, its caches move to the longer one, and a new
+    generation keeps the longer step rather than recompiling the shorter.
+    A backend that keeps no handles falls back to the host path.
+  - **Derived symbols.** A dim that is a multiple of a symbol plus a
+    constant (`seq*16`, `seq+1`) is a symbol of its own,
+    `rlx_ir::dynamic::SymDef`, bound wherever its base is. `generalize`
+    finds them (its offset no larger than its scale, so `seq²` flattened is
+    refused), and `.rlxmodel` writes them in place: `f32[seq*16, 128]`.
+    Qwen3's prompt graph, which flattens `[seq, heads, head_dim]`, now
+    generalizes.
+  - **`Op::DynamicUpdateSlice { axis }`.** `operand` with `update`
+    written at a `start` read when the graph runs (JAX's
+    `dynamic_update_slice_in_dim`; start clamped as JAX clamps), its output
+    aliasing `operand`. Native on CPU and Metal (one kernel reads the start
+    on the GPU); `rlx_fusion::lower_dynamic_update_slice` gives every other
+    backend a `ScatterNd`. `stateful_decode` writes cache rows with it
+    instead of `ScatterNd`, which Metal runs on the host: 56 GPU round trips
+    a token for Qwen3-0.6B, each copying the cache. With it the exported
+    Qwen3 step (f16 weights) decodes at ~14 ms a token on an M4 Pro, ahead
+    of `Qwen3Runner`'s ~16 ms, and its first token (the prefill) takes
+    ~34 ms against ~155 ms. `tests/dynamic_update_slice_backends.rs`
+    checks CPU, Metal, MLX and wgpu against a computed reference.
+  - **Package builds for a device.** `rlx-pkg build <in> -o <out> --target
+    metal --target cpu` (`rlx_pkg::build::build_for_targets`) adds a
+    rewritten version of each function, `step:metal` beside `step`, and a
+    model opened on that device runs it (else the portable one). Recipes
+    (`TargetRecipe::for_target`): Metal f16 matmul weights and attention on
+    the shared K/V heads; CPU the attention only. The rewrites are
+    `rlx_ir::retarget::{matmul_weights_as, gqa_native_attention, prune}`,
+    which keep a function's variables and symbols. Weights and sidecars are
+    copied byte for byte, and referenced weight paths rebased.
+    `rlx_pkg::Package::sidecar_ids` lists a package's sidecars.
+  - **Vulkan `barrier()` only synchronized a sub-group.** naga's GLSL front
+    end parses `barrier()` with every barrier flag, sub-group included, and
+    its SPIR-V writer takes the sub-group flag for a sub-group *execution*
+    scope. Each warp then waited only for itself before reading shared tiles
+    the others were still writing: on NVIDIA `scaled_lowp_matmul` was wrong
+    from row 8 of every 16-row tile (e4m3 cosine 0.87 against the CPU; MoltenVK
+    happened to keep warps in step). `build.rs` now drops the sub-group flag
+    from workgroup barriers before emitting SPIR-V, for every shader. The
+    Philox normal-stream gate is relative above 1 and absolute below, at
+    1e-5: Box–Muller scales a last-ULP `cos` difference by up to ~4, which
+    NVIDIA shows near zero crossings (Vulkan promises `cos` to 2^-11). The
+    whole `rlx-vulkan` suite passes on an RTX 3080 Ti and on MoltenVK.
+  - **Vulkan dropped a `KvAppend` whose row came from the GPU.** The
+    executor's two run loops consumed a host copy that directly followed GPU
+    work without running it (copies used to come only before a dispatch), so
+    the cache kept its old row — and the build-segments loop also left every
+    later step's barrier info one off. `Qwen3Runner` on Vulkan decoded
+    garbage after its first token (and differently each run), while
+    `kv_append_backends`, whose rows are graph inputs, passed. Both loops
+    now leave such a copy to the loop head; `Qwen3Runner` on Vulkan matches
+    the CPU's 40 tokens on an RTX 3080 Ti, and
+    `kv_append_writes_a_row_computed_on_the_device` covers the case.
+  - **Attention with fewer K/V heads than Q (grouped-query) was wrong on
+    CUDA and Vulkan.** `Op::Attention` takes K / V with fewer heads; the
+    CPU, Metal and wgpu kernels index a query head's K/V head, but the CUDA
+    (and so ROCm, which shares them) and Vulkan kernels read K / V as
+    `num_heads` heads and returned a wrong tensor, no error (0.62 / 0.72 off
+    on an 8-over-2 case, RTX 3080 Ti). MLX and Metal's MPSGraph lowering
+    aborted on it. CUDA, ROCm, Vulkan and MLX now repeat shared heads first
+    (`rlx_fusion::expand_shared_kv::ExpandSharedKvHeads`, at each crate's
+    own compile entry), and MPSGraph hands such attention to the thunks.
+    `tests/gqa_native_attention_backends.rs` checks every backend against the
+    broadcast graph on the CPU: all within 1.8e-7 (CUDA, Vulkan, wgpu on
+    msi; Metal, MLX, wgpu here). The package builds' shared-head rewrite
+    (`rlx_ir::retarget::gqa_native_attention`) is what found it.
+  - **Referenced weights bind in their param's dtype.** An f16 / bf16
+    param takes a checkpoint tensor converted once, two bytes an element,
+    instead of failing (only f32 params bound before); held weights convert
+    the same way. The host keeps them in that dtype too. The Qwen3 exporter's
+    `weight_dtype` declares the matmul weights f16 or bf16
+    (`rlx_core::package_export::matmul_weights_as`).
+  - **A prefill function.** A `generate` entry's `prefill` runs a whole
+    prompt at once, padded to the shortest of its sizes that holds it, and
+    seeds the step's caches from its K/V outputs; `last` picks the row whose
+    logits it returns. Longer prompts and continuations go through the step
+    one token at a time. The Qwen3 exporter writes one (sizes 16, 64, 256),
+    checked against a build at a third length. Each executable holds its own copy
+    of the weights, so the prefill beside the step doubles them (2 × ~4 GB
+    for Qwen3-0.6B in f32); the open option `prefill: "release"` frees it
+    after each prompt, at a compile per prompt. On CUDA with
+    `RLX_CUDA_SHARED_PARAMS=1` the two map one copy instead: the package
+    compiles in its own sharing scope
+    (`rlx_runtime::with_param_sharing_scope`, which restores the caller's),
+    and Qwen3-0.6B's package takes 5.4 GB of GPU memory rather than 8.3 GB
+    (RTX 3080 Ti; same tokens, chat "Paris").
+  - **State kinds, packed references, speech recognition.** A `generate`
+    entry's state is `rows`, `append` or `replace` (recurrent state, taken
+    whole; a step with only that has no length limit), per state or by
+    `state_kinds`. A U8 / I8 param referenced from a GGUF binds the
+    tensor's bytes as stored (`WeightCache::bytes`), so K-quant weights stay
+    packed. A `transcribe` entry runs `stages` (functions reading and naming
+    values; a stage's `package` takes its function from another package, so
+    an audio front end is exported once and shared), then a decoder that is
+    a `generate` entry's loop with `{context: …}` inputs, a prompt,
+    `stop_ids`, `suppress_ids` and `begin_suppress_ids`. In rlx-models:
+    `rlx-qwen35` exports a Qwen3.5 GGUF (3.9 MB package, same tokens as
+    `Qwen35Runner` on CPU and Metal) and `rlx-whisper` a Whisper checkpoint
+    with its log-mel front end as a graph (2e-5 from `pcm_to_log_mel`; the
+    same transcript as `WhisperRunner`). `Op::LogMel`'s doc now says it
+    floors each frame at its own max, which is not Whisper's.
+  - **Pipelines and image models.** A `pipeline` entry is stages alone:
+    `Model.run` takes named tensors, runs the stages and returns named
+    outputs. Stages, here and in `transcribe`, can be symbolic in their
+    inputs' dims. They are specialized to the shapes they are given and
+    compiled once per shape. A `"<value>#shape"` source feeds a value's
+    dims as numbers, input tensors of any number type are converted to the
+    graph's dtype, and a stage's `device` runs it elsewhere.
+    `Opened::take_graph` returns a function as packaged. In rlx-models:
+    `rlx-siglip2` exports a fixed-resolution SigLIP 2 image tower. Its
+    preprocessing is a graph that is symbolic in the image's height and
+    width: Pillow's antialiased bilinear resize in Pillow's fixed point,
+    exact in f32. On the test images it is closer to Pillow than the
+    hand-written preprocessing (1 vs 227 of 150,528 values off at 300×200),
+    and it can be exported as its own package that runs alone. Embeddings
+    match `Siglip2Runner::encode_image` on CPU and Metal (cosine ≥
+    0.999996). Whisper's front-end package runs alone too.
+  - **Context past the exported sizes.** A `generate` entry with
+    `max_context` grows its symbolic step past `sizes`. When the context
+    outgrows every listed size, the step is specialized at twice the
+    longest cache, capped at `max_context`, with each symbol's offset from
+    the cache length kept. `Opened::{specialize_at, specialize}` replace
+    `take_function`'s inline specialization. In rlx-models,
+    `rlx-qwen3`'s `ExportOptions::max_context` sizes the RoPE tables and
+    sets the entry. Qwen3-0.6B exported with one 16-token size produces
+    `Qwen3Runner`'s 40 tokens on Metal, and the same ids on CUDA (checked
+    against those, as the runner did not fit beside another GPU tenant).
+    Also on CUDA (RTX 3080 Ti): the SigLIP 2 package (cosine ≥ 0.99999 to
+    the runner), the Qwen3.5 package (chat "Paris") and Whisper's package
+    (the CPU transcript).
+  - **Batch generation from a package.** `Model::generate_batch` and
+    `LmRunner::generate_batch` (by default one after another). A
+    `generate` entry naming its step's batch symbol (`batch`) decodes the
+    prompts together. The sequences run in lockstep from position 0,
+    prompts of any lengths, each ending at its own stop id; a stateful
+    step keeps the caches resident and feeds each sequence's new row.
+    `rlx_ir::stateful` accepts a batched step: table rows and the mask
+    repeat over the batch, and the cache write is a `DynamicUpdateSlice`
+    at any batch. `rlx_flow::blocks::with_kv_append_any_batch` builds such
+    a step with `KvAppend` past batch 1, for that rewrite. `rlx-qwen3`
+    exports its step symbolic in the batch too (`ExportOptions::batch`,
+    default on). Three prompts give exactly the text each gives alone on
+    CPU, Metal and CUDA, in about half the time (Metal 300 vs 664 ms; CPU
+    1.30 vs 2.59 s; CUDA 498 vs 1030 ms). Batch 8 decodes at 254 tok/s on
+    Metal (317 built for Metal), against 67 for one sequence.
+    `generate_batch` is forwarded by every model and runner wrapper
+    (`Stamped`, `Box<dyn LmRunner>`, `HostDriven`); a wrapper that
+    forwarded only `generate_text` had made every batch run one by one,
+    which equality checks alone did not catch. A runtime test now checks
+    that the batched path ran. With `prefill: "release"` the batched step
+    is freed after each batch. A batch runs its prompts' shared length less
+    one through the prefill function for each sequence, seeding the
+    batch's caches (open option `batch_prefill`, on by default). Four
+    200-token prompts on Metal: 1.26 s, against 10.3 s a token a step.
+  - **Beam search.** `num_beams` / `length_penalty` on any text model.
+    One algorithm (`rlx_runtime::lm::beam_search`, ties broken the same
+    way everywhere) under `LmRunner::generate_beam`. By default each
+    hypothesis is extended by its own `predict_logits`. A package with a
+    batch symbol keeps the hypotheses as the sequences of its batched
+    step, prompt once, caches reordered after each step. Batched and
+    one-by-one give the same text, on a toy package (2-4 beams) and on
+    Qwen3-0.6B (CPU, Metal, CUDA). On Metal 3 beams take 328 ms vs 4.3 s.
+    Open option `batched: false` takes the one-by-one paths. In
+    `prefill: "release"` mode a batch prefills before its step compiles,
+    and the single-sequence step is freed meanwhile: three executables
+    had run CUDA out of memory beside another GPU tenant.
+  - **Packages say which entry features they use.** Writing a package
+    records `features` (each entry and each of its keys, `generate.check`, …)
+    in its model block. An rlx opening one that uses a feature it lacks
+    refuses it by name ("uses generate.teleport that this rlx (0.2.18) does
+    not run; update rlx") rather than run without it
+    (`rlxp::FEATURES`, `rlxp::features_of`). Format and opset versions
+    (`requires`, `opset`) were already checked.
+  - **Input / output contracts.** A `pipeline` entry's `inputs` and
+    `outputs` may be contracts, `{name, kind, dtype, shape, …}` with
+    anything else a caller needs (`color: "rgb"`, `sample_rate`). `info()`
+    gives the typed specs and, under `metadata.inputs` / `outputs`, the
+    contracts. `run` refuses a tensor of another rank or static size, and
+    `embed`, `generate` and `transcribe` describe theirs (text; audio with
+    its sample rate). The SigLIP 2 and Whisper exporters declare theirs
+    (u8 RGB `[height, width, 3]`; 30 s of 16 kHz mono).
+  - **Generation defaults, tools, JSON output.**
+    - A `generate` entry's `generation` (from `generation_config.json`:
+      `do_sample`, `temperature`, `top_p`, `top_k`, `min_p`,
+      `repetition_penalty`, `max_new_tokens`) fills in what a caller leaves
+      out of `generate_text`, `chat` and `generate_batch`. `do_sample: false`
+      stays greedy. `run` with ids keeps its own defaults.
+    - `TextCodec::apply_chat_template_json` renders JSON messages (an
+      assistant turn's `tool_calls`, a tool turn's `tool_call_id`) with
+      `tools`, `enable_thinking` and `add_generation_prompt`; `chat`
+      passes them through. A template with no `tools` branch refuses tools
+      rather than drop them.
+    - `response_format: "json"` (or `{"type": "json_object"}`) keeps the
+      reply to one JSON value: each step, of the 256 likeliest tokens, only
+      those whose text continues a JSON prefix may be picked
+      (`model::json_prefix::JsonPrefix`), and a stop token only once the
+      value is whole.
+    - Qwen3-0.6B: `{"city": "Paris"}` in JSON mode; told about a
+      `get_weather` tool, it calls it with `{"city": "Paris"}`.
+  - **Loops in a pipeline.** A `pipeline` entry may run `stages`, then a
+    `loop: {stages, steps, schedule, until}`, then `finish` stages. Each
+    step sees `step` and `steps`, and its value from each `schedule` list
+    (a diffusion's timesteps, a sampler's sigmas). The loop's outputs
+    replace earlier values, and it ends early once the `until` value is
+    true. The `steps` option overrides the count, and the `seed` option
+    is a value for stages that draw noise. All the stages share one
+    weight set. Tested with Newton's iteration for √2, stopping when it
+    converges.
+  - **Images (and other media) in a prompt.** A `generate` entry's `media`
+    gives an `embed` function (ids to embeddings), a prefill that takes
+    embeddings (padded to listed `sizes`), and `kinds` (`image: {token,
+    input, stages, output}`). `Model::generate_with_media(prompt, media,
+    options)` (and `LmRunner::prefill_with_media`) works like this: each
+    run of a kind's placeholder token takes the next medium, expanded to
+    as many positions as its embedding has rows; the media rows replace
+    those positions in the prompt's embedding; the prefill seeds the
+    caches; decoding continues by tokens.
+  - **Multimodal RoPE (Qwen-VL).** `media.mrope: {sections, layout, cos,
+    sin}` gives each token a `(t, h, w)` position (an image's rows its grid,
+    from `kinds.<kind>.grid.patch`) and the prefill each token's RoPE rows
+    (`rope_cos` / `rope_sin`), frequencies by section (Qwen2/2.5-VL) or
+    interleaved (Qwen3-VL). Decoding goes on from one past the image's
+    largest position: `rlx_ir::stateful::StatefulDecode::rope_offset` reads
+    the tables at `position + rope_offset`, the decode input feed
+    `rope_offset` supplies it (and a host-fed table row is taken there).
+  - **Graphs symbolic in a product of sizes.** A derived dim may be the
+    product of two symbols times a scale plus an offset (`h*w*4`;
+    `SymDef::times`, written `h*w*4` in `.rlxmodel` text). `generalize`
+    tries pairs of symbols when no single one fits, and binding works both
+    ways: a bound derived dim (an image's `h*32` rows) binds its base, so a
+    stage is specialized from its inputs' shapes alone. The Qwen3-VL and
+    Qwen2.5-VL vision towers are now one graph each for every image size,
+    their position tables, patch order, RoPE rows and window masks
+    computed in the graph from the grid.
+  - **Images of any size.** `media.kinds.<kind>.resize: {multiple,
+    min_pixels, max_pixels}` resizes a `u8 [height, width, 3]` image as
+    Qwen-VL's processor does (`model::image_resize::smart_resize`, Python
+    rounding) with an antialiased bicubic that matches torchvision's
+    `uint8` resize value for value (`resize_rgb8_bicubic`; int16 weights at
+    the widest precision that fits, rows first, each pass rounded).
+    Qwen2.5-VL-3B and Qwen3-VL-2B on 448×448 and 500×375 images (the
+    latter resized to 364×504 / 384×512): `transformers`' text, CPU and
+    Metal.
+  - **Weights stream, and fit.** Measured on Qwen2.5-VL-3B (CPU, exact
+    `/usr/bin/time -l` footprints), the run was 74 GB at its peak on a
+    64 GB machine — the OOM kills.
+    - Binding reads each tensor's byte range from its safetensors file (the
+      `WeightCache` held whole files, 7 GB here), and `PackageWeights` no
+      longer keeps every resolved weight beside the backend's copy.
+    - Open option `weight_dtype: "f16" | "bf16" | "auto"` narrows matmul
+      weights as they bind; the CPU now keeps a half weight read only as a
+      matmul's right operand packed (`promote_to_f32_keeping_half_weights`;
+      its `SgemmF16` / `SgemmBf16` read it), where it used to widen it back.
+    - A package opened narrower or short of memory compiles without the
+      weight-concatenating fusions (`FusionOptions::no_weight_concat`, the
+      `RLX_NO_WEIGHT_CONCAT_FUSION` env as a compile option): their packed
+      QKV / gate-up weights were a resident second copy of ~65% of a
+      transformer's weights.
+    - `prefill: "release"` also frees media stages (and the step before a
+      media prompt), and is the default when the functions' f32 copies
+      would not fit in half the memory (`"keep"` opts out).
+    - Metal keeps f16 weights and embedding tables half: its compile
+      promotes a graph with any half node to f32, and the half rows of a
+      half embedding table widened every weight of the step and the text
+      prefill back (`prepare_f32_exec_graph_keeping_half_matmul_weights`;
+      bf16 still widens, Metal has no bf16 storage). The table's gather
+      stays a half row copy, read through a new `gather_axis0_h_fidx`
+      kernel: `gather_axis0_h` read the ids as half, but the arena holds
+      integer ids as f32 (`Thunk::Gather.idx_dt` picks). Qwen2.5-VL-3B's
+      whole test on Metal with `weight_dtype: "f16"`: 36.9 → 21.1 GB peak.
+      A video's tower compiles once for all its frame pairs under `prefill:
+      "release"`.
+    - **One copy of each weight across Metal executables.** A package's
+      decode step, prompt prefill and media prefill each held their own
+      weights. Under a sharing scope (`with_param_sharing_scope`; every
+      package compile now runs under its own) the Metal weight buffer is a
+      page-aligned VM region wrapped no-copy, and each weight in it is an
+      owned Mach memory entry from a process-wide registry
+      (`rlx_metal::shared_weights`, by scope, name, dtype and size): later
+      executables map the same pages and skip binding them
+      (`CompiledGraph::param_already_set`). Owned entries are charged to
+      the footprint once however often mapped (plain shared anonymous pages
+      are charged per mapping — what iOS's limit counts). Under a scope the
+      weight buffer may pass 4 GiB; such an executable stays off MPSGraph,
+      whose binds fail there. Whole tests on Metal (images, video, text),
+      peak: Qwen3-VL-2B f32 39.9 → 16.4 GB, f16 22.5 → 8.9 GB; Qwen2.5-VL-3B
+      f32 36.8 → 22.5 GB, f16 21.1 → 12.3 GB — the same logits and text, and
+      faster (mapped weights are not read again).
+      `RLX_METAL_SHARED_WEIGHTS=0` keeps a copy per executable.
+    - A dropped Metal executable gives its memory back. Compiling to
+      MPSGraph made autoreleased objects (the lowered graph, its
+      executable, the arrays bound to the arena) that retain the arena;
+      on a thread with no autorelease pool they lived until the thread
+      exited, so each compile-and-drop kept its whole arena (6 cycles of a
+      128 MiB weight: +775 MiB, now 0). Each compile now runs in its own
+      pool, and the no-copy view MPSGraph binds at an offset is released.
+      Qwen2.5-VL-3B f32 test on Metal: 22.5 → 16.4 GB shared, 36.8 →
+      30.7 GB unshared; the released stages' memory now returns.
+    - A package compiles lean (no weight-concat packs) also when its
+      functions' f32 params times 1.7 — the packs measured — would pass
+      half the memory: Qwen3-VL-2B's f32 test on Metal 43.1 → 32.1 GB, and
+      faster (73 → 56 s).
+    - One step of Qwen2.5-VL-3B: 24 GB → 11.3 GB (f16); a prompt with an
+      image 24 → 14.6 GB. Its whole test (two images, then text): 74 GB →
+      34 GB as opened (now lean and releasing by itself), 20 GB with
+      `weight_dtype: "f16"`, the same text.
+  - **Per-medium extra rows.** `media.kinds.<kind>.rows: [names]`: further
+    outputs of the kind's stages, laid out like its embedding, reach the
+    prefill as `[1, seq, width]` values, zeros but at each medium's
+    positions (Qwen3-VL's deepstack features).
+  - **Video.** `media.kinds.<kind>.frames: {patch, layout, t_step}` takes
+    `u8 [frames, height, width, 3]`, runs the kind's stages `patch` frames
+    at a time (the last repeated to fill a group), and lays the groups out
+    as one placeholder run each (`"runs"`, Qwen3-VL) or as one run with
+    group `g` at time position `g · t_step` (`"joined"`, Qwen2.5-VL).
+    `resize.over_frames` bounds a video's pixels over all its frames
+    (`image_resize::smart_resize_frames`, Qwen3-VL's video rule).
+  - **Half embedding tables.** `weight_dtype` now narrows embedding tables
+    too (`rlx_ir::retarget::embedding_tables_as`: the table f16/bf16, each
+    gathered row widened); the CPU keeps a table read only by
+    `Gather{axis: 0}` packed and widens just the rows it gathers
+    (`Thunk::Gather.table_half`).
+  - **Qwen3-family MoE MLP in rlx-flow.** `Qwen3Moe` on a decoder layer
+    spec: router softmax, top-k, optional renormalization, then each slot's
+    experts through two `GroupedMatMul`s. It reads the fused expert tensors
+    in either orientation (the original `[E, H, 2I]` or transformers 5's
+    `[E, 2I, H]`) or per-expert linears.
+  - **Sliding-window masks in a stateful step.**
+    `StatefulDecode::windows: [(input, window)]`: further mask inputs, each
+    the step's mask admitting only `position - window < key`, computed from
+    the same `iota` (rlx-flow's Gemma decode layer reads one by name,
+    `GemmaDecodeLayerSpec::mask_input`). The rewrite now makes one param
+    node per name: a second `iota` node was left unbound (a backend binds a
+    name once), so the plain mask compared zeros and admitted every key.
+  - **Batched prefill functions.** `generate.prefill.batches: [{function,
+    batch}]`: the prompt function at fixed batch sizes. `generate_batch`
+    runs its prompts' shared prefix through the smallest that holds them in
+    one call instead of one after another (`batch × seq` products keep it
+    from being one symbolic function). The Qwen3 exporter adds batch 2, 4
+    and 8 (`ExportOptions::prefill_batches`); three prompts decode to the
+    same text.
+  - **Speech synthesis entry.** `synthesize: {tokenizer, template,
+    sample_rate, stages, voices, decoder, token_offset, codebook,
+    output}`. The text, tokenized into the template's `{text}`, is the
+    value `ids`, and a `voice` vector is taken from `voices` (option
+    `voice`). Then either stages make the audio straight from the ids, or
+    a `decoder` (a `generate` entry, greedy or sampled) writes codec
+    tokens first, and their ids, less `token_offset`, within `codebook`,
+    are the value `codes` the stages decode. It is a `text-to-speech`
+    model (`synthesize`).
+  - **Weights: checksums, adapters, quantized storage.**
+    - A weight source may carry the file's `size` (checked on every open:
+      "the weights changed under it") and `sha256` (checked with the open
+      option `verify_weights: true`). `rlxp::weight_source` writes both,
+      and the Qwen3, Qwen3.5, Whisper, SigLIP 2 and BERT exporters use it.
+    - Adapter packages: `rlxp::save_adapter(path, name, base,
+      [LoraUpdate{tensor, rank, a, b, scale}])` writes `{adapter: {base,
+      lora}}`. Opening one opens its base with `W + scale · B·A` merged
+      into each named checkpoint tensor (or held param) as the weights
+      bind, and adapters stack.
+    - `rlxp::quantize_package(in, out, GgufQ8_0 | GgufQ4_0)` stores a
+      package's f32 matmul weights quantized in it. Each `MatMul(x, w)`
+      becomes a `DequantMatMul` over `w`'s GGUF blocks, read from
+      wherever `w` was. Qwen3-0.6B, from 2.4 GB of f32 weights: Q8_0 is
+      636 MB with the same 40 greedy tokens, Q4_0 is 338 MB (chat
+      "Paris"; its tokens part from f32's after the first).
+    - `rlx_pkg::build::rebase_weight_uris` is now public.
+  - **Serving: a draft model, continuous batching.**
+    - The open option `draft: "<package>"` gives speculative decoding a
+      draft model, a package with the same vocabulary, instead of prompt
+      lookup. Its greedy guesses come from its own cache, rolled back
+      (`truncate`) to where it and the context agree. With the package as
+      its own draft, Qwen3-0.6B gives the same 40 tokens.
+    - Continuous batching: `LmRunner::serve_open(slots)`,
+      `serve_add(prompt)`, `serve_step()` (each slot's next token once its
+      prompt is in), `serve_remove(slot)`. Requests join and leave between
+      steps.
+      - Every slot runs at the batch's position, from its own start row:
+        `rlx_ir::stateful` takes a `starts` input, and the mask admits
+        `starts[b] ..= position`. RoPE depends only on the distance
+        between positions, so a late start computes what a start at 0
+        does.
+      - When the batch reaches the end of its cache, each request's rows
+        move back so they all end together. Its keys are rotated back by
+        the rows they moved, `R(-δ)`, using the entry's
+        `rope: {cos, sin, style, head_dim, keys}`, which the Qwen3
+        exporter writes.
+      - On Qwen3-0.6B: B joins A's batch ten steps in, A leaves, and the
+        32-row cache moves back. Each request gets exactly its solo
+        tokens (CPU and Metal).
+  - **Rerankers: a `score` entry.** `Model::score(query, passages,
+    options)` returns one relevance score per passage, for a
+    `"text-ranking"` model. `TextRanking` + `text_ranking_model` adapt a
+    provider's own, and `run` takes a `query` and `passage` text tensors
+    and returns `scores`. A package's `score: {functions, sizes,
+    tokenizer, inputs, position_offset, label, activation}` runs each pair
+    as the tokenizer pairs it (`TextCodec::encode_pair`: ids and segment
+    ids, the new input role `token_types`). The pair goes through an
+    encoder whose output is `[batch, labels]` logits. `label` picks the
+    column, and `activation: "sigmoid"` maps it into (0, 1). A pair too long for the
+    longest function loses the end of its passage. `embed` and `score`
+    share one encoder runner. rlx-embed's `export::export_reranker_rlxp`
+    appends the classifier head (BERT's pooler + `classifier`, or RoBERTa's
+    `classifier.dense` + `out_proj`) to the encoder graph:
+    ms-marco-MiniLM-L6-v2 scores within 2e-6 of `transformers` (CPU,
+    Metal).
+  - **Llama, Mistral and Qwen2 checkpoints through the Qwen3 exporter.**
+    The family comes from `config.json`'s `model_type`. A config that
+    does not mention `qk_norm` defaults it off for those types. Scaled
+    RoPE (`rope_scaling`) is refused rather than built wrong.
+    SmolLM2-135M exports and greedy-decodes the same 20 tokens as
+    `transformers`, alone and in a batch (CPU, Metal).
+  - **Speculative decoding (prompt lookup).** A `generate` entry's `check`
+    function runs several tokens after its cache (the last token, then a
+    draft). With the open option `speculative: true`, greedy decoding
+    drafts what followed the context's latest 3-, 2- or 1-gram, checks it
+    in one run, and keeps the draft as far as the model agrees, plus the
+    model's own pick. The tokens are the same as one at a time.
+    `rlx_ir::stateful` takes such a step: `concat(cache, rows)` becomes a
+    `DynamicUpdateSlice` of all the rows, the tables give
+    `position..position + tokens`, and the mask is a bias letting token `i`
+    see keys `0..=position + i`. rlx-flow's Qwen3 decode layer takes
+    several tokens (per-head norm over them, a bias mask);
+    `rlx_qwen3::flow::build_qwen3_check_built` builds the check, and the
+    exporter adds it (`ExportOptions::speculate`, 3 by default). Qwen3-0.6B
+    on Metal: the same 40 tokens in 680 ms against 891 ms.
+  - **Metal: bias attention in the tiled prefill kernel.** An additive bias
+    (`MaskKind::Bias`) fell to `sdpa_long`, one thread per head: a
+    4-token check's attention took 70 ms a step. `sdpa_prefill_fa` (and
+    its MMA variant) now adds the bias. Checked against the CPU with 4
+    queries over 37 keys on Metal, MLX and wgpu.
+  - **Metal: a few rows of f32 matmul read the weights once.**
+    `gemv_f32_splitk_rows` runs m = 2-4 as the split-K GEMV a single row
+    uses: each weight is read once for every row, with the same 32-way K
+    split and order, so each row is bit-identical to that row alone. The
+    tiled sgemm had reread the weights and cost 2× a single decode step at
+    m = 2-4. Now a batch-2 step costs 1.18× and batch 4 1.51×. At m = 8,
+    two passes lost to the sgemm (38 vs 31 ms), so the limit is 4.
+    `RLX_METAL_GEMV_ROWS=0` opts out.
+  - **`DynamicUpdateSlice` lowers at any batch.** The `ScatterNd`
+    lowering (CUDA, ROCm, Vulkan, wgpu, MLX) indexes every position
+    before the axis, so a batched cache `[batch, cap, width]` writes each
+    sequence's rows; it covered batch 1 only, and CUDA rejected a batched
+    stateful step. Checked against the reference on CPU, Metal, MLX, wgpu,
+    CUDA and Vulkan.
+  - **Open options for packages.** `stage_devices` sets a stage's device
+    over its entry's; `max_context` lowers a package's; `context_growth`
+    sets how much a grown step grows (2).
+  - **`rlx_ir::env` reads are cached.** Every `RLX_*` read went to the
+    override map and then `getenv`, allocating the key and the value: ~80-100
+    ns each, and backends read their switches per dispatch (92 reads in
+    Metal's encoder, 54 in CUDA's run loop; 844 call sites read 581 keys).
+    Values are now resolved once and kept; `flag` / `var` / `parse_or` take
+    17-24 ns, with no allocation for `flag`, `flag_or`, `parse_or` and
+    `is_unset`. `set`, `remove`, `unset`, `clear_overrides` and
+    `RuntimeOverrides` empty the cache; `rlx_ir::env::reload()` does it for
+    code that changes `RLX_*` variables with `std::env::set_var` after
+    reading them (the PS5 node, which seeds them from its config file).
+    One read path: `rlx_ir::env` resolves a key through the registry
+    (canonical spelling, aliases, a deprecated name's replacement) on its
+    first read and caches the result, so every reader gets alias and
+    deprecation handling; `env_registry::{var, flag, parse_or}` forward to
+    it (`flag_or` keeps the registry's declared default) and its copy of the
+    truthy parser is gone. rlx-wgpu's FFT switches and the Cortex-M trainer
+    read flags with `env::flag` instead of private helpers that accepted
+    fewer spellings (`RLX_FFT_WGPU_ONCHIP=yes` was off).
+  - **`prefill_device`: the prompt on another device.** The open option
+    `{"prefill_device": "cpu"}` runs a package's prefill on the CPU and
+    hands its K/V rows to the step's caches on the model's device, keeping
+    the prefill's weight copy out of GPU memory. It is a memory lever, not
+    a speed one: the first token is slower at every prompt length, and the
+    gap grows with the prompt (Qwen3-0.6B, best of five, same tokens):
+
+    | prompt | Metal | CPU prefill | CUDA | CPU prefill |
+    |-------:|------:|------------:|-----:|------------:|
+    | 16     | 25 ms | 77 ms       | 21 ms | 155 ms     |
+    | 64     | 128 ms | 323 ms     | 33 ms | 456 ms     |
+    | 250    | 120 ms | 393 ms     | 116 ms | 2656 ms   |
+
+    (M4 Pro; RTX 3080 Ti shared with another job.) On CUDA,
+    `RLX_CUDA_SHARED_PARAMS=1` saves the same memory without the cost.
+    `rlx-qwen3`'s `tests/prefill_device_bench.rs` (opt-in,
+    `RLX_BENCH_PREFILL=1`) measures it; each run takes a different prompt,
+    since the same prompt again is a continuation of the cache and returns
+    its first token without running anything.
+  - **Hugging Face model cards.** The model block's `card_data` holds a
+    card's metadata under the Hub's own keys (`license`, `language`,
+    `tags`, `datasets`, `base_model`, `pipeline_tag`, `model-index`, …), and
+    `card` holds its Markdown body. Exporters read a checkpoint's
+    `README.md` into them (`add_huggingface_card`, which parses the YAML
+    front matter). `rlxp::huggingface_readme` writes a Hub `README.md` back
+    from a package. Both are in `Model.info().metadata`.
+  - **Entries: a language model from the package alone.**
+    `entries.generate` declares the decode functions (one per cache
+    capacity), what feeds each input (the token, a row of a held table, the
+    bucket's mask, a cache), which output updates each cache, the stop ids,
+    and the chat template. The `rlxp` provider then runs it as an
+    `LmRunner`, so `chat`, `generate_text` and `generate` (greedy or
+    sampled) work with no provider code. A continuation feeds only its new
+    tokens. Tokenizer loaders now also take the chat setup
+    (`TokenizerLoader = fn(&[u8], &Value)`), and rlx-text renders the
+    template. rlx-models' `rlx-qwen3` exports Hugging Face checkpoints this
+    way (`export::export_rlxp`): Qwen3-0.6B becomes a 4.9 MB package with a
+    4096-token context that references 311 of its 313 params. Opened by rlx
+    alone, it greedy-decodes the same 24 tokens as `Qwen3Runner` and
+    answers `chat` from the model's own template, from Rust and Python.
+    The shared matcher that splits params into referenced and held ones
+    lives in `rlx-models-core`'s `package_export`.
+  - **`dist::WeightCache` reads a safetensors file once.** It used to
+    re-read the whole file for every tensor. For a 1.1 GB checkpoint with
+    200 tensors, that was about 220 GB of reads.
+  - **`NaN` and `±inf` in `rlx_ir::text`.** They used to print as JSON
+    `null`, which didn't read back. An op holding one now prints in the
+    `.rlxmodel` value syntax (`Clamp{min: -inf, max: nan}(%0)`), which the
+    parser also accepts. Every other op prints as before. `.rlxmodel` keeps
+    a non-canonical NaN's exact bits (`nan(0xffc00000)`).
+- **Linked model plugins, for iOS, Android, wasm and consoles.** These
+  platforms can't load a plugin at run time, so the same plugin crate links
+  into the app's library instead. A plugin lists its providers once:
+  `export_model_plugin!("name", [A, B])`, and an entry may carry a `#[cfg]`.
+  The host names its plugins with `link_model_plugins!` (rlx-runtime feature
+  `linked-plugins`), and the app calls `rlx_link_model_plugins()` once
+  (Swift: `linkModelPlugins()`). That call keeps the providers in a static
+  library whatever the build profile. Before this, a C linker silently
+  dropped their start-up registrations unless the library was built with fat
+  LTO. Linked builds also leave out each plugin's `rlx_model_plugin_v1`
+  symbol, so several plugins can share one fat-LTO library, where before
+  they failed with "symbol multiply defined". `ios/build-xcframework.sh
+  --capi-crate` packages such a library as `RLX.xcframework`. On those
+  targets rlx no longer scans `~/.rlx/plugins`, and the "no provider" error
+  says how to link one. The built-in `rlxp` provider is now registered in
+  code, not at start-up.
+- **Models from any provider, in every language: `rlx_runtime::model`.** A
+  `Model` opens a model by path or id and runs it by name, with named, typed
+  tensors. Language models also get `generate`, `generate_text` and
+  `predict_logits`, with sampling options. Providers register with
+  `register_provider!`. The built-in `rlxp` provider runs a graph saved with
+  `save_model` on any device. Plugins are `cdylib`s exporting a C table
+  (`rlx_model_plugin_v1`, ABI 1), loaded from `RLX_MODEL_PLUGINS` or
+  `load_model_plugin`, so a model collection downstream of rlx reaches every
+  binding without rlx depending on it. `rlx-model-plugin` is the reference
+  plugin and authoring guide. Every binding gets `Model`, `model_providers`,
+  `load_model_plugin` and `save_model` from `api.idl`, plus a sixth `models`
+  example. The example is checked in all 25 languages: natively, under
+  `RLX_TEST_DOCKER=1`, and in the Python, JS, Swift and C suites.
+- **Task methods: `chat`, `transcribe`, `synthesize`, `embed`.** `Model`
+  answers each task with one call, in every binding. Making a model runnable
+  takes one task trait (`SpeechToText`, `TextToSpeech`, `TextEmbedding`, or
+  `LmRunner` for text) plus a declarative `Provider` with `Claim`s: by id,
+  prefix, GGUF `general.architecture`, HF `model_type`, file name or
+  extension. `chat` applies the tokenizer's chat template
+  (`TextCodec::apply_chat_template`). Plugins in `~/.rlx/plugins` load with
+  no setting needed, and a method called on the wrong kind of model names the
+  one that fits. The tasks travel as named tensors over `run`, so plugin ABI 1
+  is unchanged.
+- **C and C++ on microcontrollers: `rlx-micro`.** The C ABI of `rlx-cortexm`'s
+  INT8 kernels (conv2d, dense, max-pool, ReLU, argmax, quantize) and its MNIST
+  model. It is `no_std`, never allocates, and needs no OS or libc. Calls
+  check buffer sizes and return a status instead of trapping. Ships
+  `rlx_micro.h`, a freestanding C++ `rlx/micro.hpp` (no exceptions, heap or
+  STL), C/C++ examples, and Cortex-M start-up, semihosting and linker-script
+  files. The firmware is 24.9 KB flash / 10.8 KB RAM. `cargo test -p rlx-micro`
+  runs the examples on the host and bare-metal on a Cortex-M4 under QEMU
+  (`mps2-an386`).
+- **One op table generates every language binding: `rlx-bind`, `rlx-capi`,
+  `rlx-bindgen`, and Swift.** `crates/bindings/rlx-bind` holds the graph
+  builders as one table (`for_each_graph_op!`, ~200 rows) plus the runtime as
+  plain Rust (`Session`, `Compiled`, `Trainer`, `Optimizer`, tokenizer,
+  sampler, `check`, devices, GGUF, RLXP, weight loaders). rlx-js and pyrlx now
+  expand that table at compile time instead of keeping two hand-written copies,
+  and wrap the shared runtime. `crates/bindings/rlx-capi` is a C ABI over the
+  same surface (`include/rlx.h`, 366 functions) for any FFI language;
+  `crates/tooling/rlx-bindgen` generates its `rlx_graph_*` glue and its header
+  (parsed from the crate, so it cannot drift), the Swift `Graph` methods, the
+  `.pyi` `Graph` stubs and `docs/bindings-api.md`. `crates/bindings/rlx-swift`
+  is a SwiftPM package on the C ABI whose runtime classes are generated too
+  (see the next entry), with `RLXError.kind` and an XCTest suite (`swift test`);
+  `ios/build-xcframework.sh --capi [--apple]` packages the static library as
+  `RLX.xcframework` (iOS + macOS) and `RLX_XCFRAMEWORK=1` builds the package on
+  it, for apps. Adding an op is one table row and
+  `just gen-bindings`; `just check-bindings` (in `just ci`) fails on stale
+  output, and an `ir_drift` test fails when rlx-ir gains a builder the table
+  does not reach. C and Swift (example + XCTest, and a check that every C
+  function has a Swift wrapper) run end to end in `cargo test -p rlx-capi`. See
+  `docs/bindings.md`.
+- **A runtime API table keeps every binding one-to-one.**
+  `crates/bindings/rlx-bind/src/api.idl` lists every runtime class member and
+  function — sessions, `FlexibleSession`, `Runner` / `Router`, autodiff,
+  `check`, devices, GGUF, weights, RLXP, training, text, distributed — with
+  argument and return kinds and its name in Python, JS, C and Swift.
+  `rlx-bindgen` checks each row against the exported C function's parameter
+  types (and each C function against a row) and generates
+  `rlx-swift/Sources/RLX/API.swift` from the rows; only the callback loop and
+  the in-place optimizer step are hand-written. rlx-js and pyrlx test the table
+  both ways (every row is exported, every export is a row or a listed host
+  helper). Filling the gaps it found added `parse_device`, `FlexibleSession`,
+  `Runner.from_env` / `fastest` / `resolve` / `set_params` / `run_on` /
+  `run_chain` / `run_with_inputs`, `Router.from_env` / `devices` / `run_on` /
+  `set_params` / `set_param_typed`, `Gguf.architecture` / `metadata_value`,
+  `convert_to_gguf` and `export_fpga` to the C ABI and Swift; `Graph.clone` /
+  `is_consumed`, `load_weights` and `to_rlxp` to Python and JS where they were
+  missing; and `rlx_trainer_freeze` / `unfreeze` in place of `set_frozen`.
+  `load_weights` also takes `"safetensors"`. The name map is in
+  `docs/bindings-api.md`.
+- **Distributed nodes from every binding.** `rlx_bind::runtime::dist::Group`
+  (and `Group` in Python, JS and Swift, `rlx_group_*` in C) joins a mesh of rlx
+  nodes: `connect` / `from_env`, `send` / `recv`, `all_reduce`, `all_gather`,
+  `broadcast`, `barrier`, and the ship-graph protocol — `collect_caps`,
+  `ship_stage` / `serve_worker` / `send_activation` / `recv_activation` for
+  pipelined inference, `ship_train` / `run_train` / `serve_trainer` for
+  data-parallel training — plus `loopback_peers` for running every rank on one
+  machine. Python releases the GIL in each blocking call, so ranks can be
+  threads.
+- **Fifteen more generated languages.** C++ (`rlx-cpp`, header-only RAII,
+  designated-initializer options), Node.js / TypeScript (`rlx-node`, koffi, a
+  `.d.ts`), Kotlin (`rlx-kotlin`, generated JNI glue — the JVM and Android),
+  Dart / Flutter (`rlx-dart`, `dart:ffi`), Lua (`rlx-lua`, a C module), MATLAB /
+  GNU Octave (`rlx-matlab`, one MEX gateway + a `+rlx` package), R (`rlx-r`,
+  `.Call`), PHP (`rlx-php`, FFI), Nim (`rlx-nim`), D (`rlx-d`), V (`rlx-v`),
+  Haskell (`rlx-haskell`, `foreign import ccall`), OCaml (`rlx-ocaml`, C
+  stubs), Elixir (`rlx-elixir`, dirty NIFs) and Odin (`rlx-odin`). Each is
+  printed by `rlx-bindgen` from the same lowered IR, has a README, a test
+  suite and the five examples printing the same numbers, and runs in
+  `cargo test -p rlx-capi --test ffi_languages` — natively, or with
+  `RLX_TEST_DOCKER=1` in the language's container against a Linux build of
+  the library (`just linux-capi-volume`).
+- **Go, Java, C#, Ruby, Julia and Zig bindings, all generated.** `rlx-bindgen`
+  lowers both tables into one typed view of the C ABI (`src/ir.rs`, every
+  function checked against its exported signature) and prints each language
+  from it: `crates/bindings/rlx-go` (cgo; `…Opts` structs, `(T, error)`),
+  `rlx-java` (the FFM API, Java 22+; no JNI), `rlx-csharp` (P/Invoke, .NET 8+),
+  `rlx-ruby` (stdlib Fiddle, no gems), `rlx-julia` (`@ccall gc_safe`, no
+  dependencies) and `rlx-zig` (`@cImport`, Zig 0.16). Each has every C
+  function, a README, a test suite and the same five examples printing the
+  same numbers as Python, JS and Swift; `cargo test -p rlx-capi --test
+  ffi_languages` runs them all (C# in the .NET SDK container with
+  `RLX_TEST_DOTNET_DOCKER=1` when `dotnet` is absent). The C ABI gains
+  `rlx_{u32s,f32s,bytes}_release` for FFIs that cannot pass a struct by value.
+- **The same five examples in Python, JavaScript and Swift.** `inference`,
+  `training`, `loading`, `distributed` and `backends` live in each package
+  (`pyrlx/examples/`, `rlx-js/examples/`, `rlx-swift/Examples/` as
+  `rlx-example-*` products) and print the same numbers; each binding's tests
+  run them (the JS distributed example as a real three-process mesh, the Swift
+  and Python ones as three threads). `crates/bindings/README.md` indexes every
+  language's package and examples, and the top-level README links it. The C
+  example moved to `rlx-capi/examples/train_linear.c`.
+- **The JS (`rlx-js`) and Python (`pyrlx`) bindings now reach the whole
+  `rlx_ir::Graph` builder surface.** JS grows from 101 to 205 `Graph` methods
+  (all chainable through `rlx.dsl`), Python from ~60 to ~200: conv 1d/3d and
+  transposed variants, pooling, interpolation, attention with a bias / v-dim /
+  score scale / logit softcap, RoPE `style` (`neox` / `gptj`), batch / adaLN /
+  fused residual norms, LSTM / GRU / RNN, Mamba-2, Gated DeltaNet, `scan` over
+  a body graph, scatter / gather ND, per-channel and block-scaled quantization,
+  `dequantMatmul` (int8, MLX, GGUF K- and IQ-quants), VQ, KAN splines,
+  FIR / IIR / SOS / Hilbert DSP, spectral features and SPD manifold layers.
+  `activation` / `binary` in both read `Activation::ALL` / `BinaryOp::ALL`, so
+  every IR activation and binary op is reachable by name. Python also gains
+  what only JS had — `check`, precision policies, `Trainer` / `Optimizer`, the
+  `rlx-text` tokenizer / sampler / chat-template layer, `verify_rlxp` — and JS
+  gains `directionalNthGrad` and `check`'s `budget` switch. Trainer checkpoints
+  share one GGUF layout across both.
+
+### Changed
+
+- **`supported_for_target` now matches every backend's real `SUPPORTED_OPS`**
+  on the kinds that gate fusion (new `FUSION_GATING_KINDS`), and
+  `FusionOptions::for_target` unfuses regions for CUDA/ROCm as the runtime does.
+  The hand-copied lists had drifted — CUDA/ROCm lacked `FusedSwiGLU`, Metal
+  `FusedAttentionBlock`, all of them `While`/`Fft`/`WelchPeaks`/
+  `FusedConvBiasAct` — so `fuse(g, target)`, benchmarks, and an `rlx-metal`
+  compile without an explicit claim set fused differently from the backend.
+  Runtime compiles already passed the real claims and are unaffected.
+
+- **`ExpertPager::prefetch` is no longer a demand read**: it does not move
+  `hits`/`misses` (it used to inflate `hit_rate`), only refreshes an
+  already-resident expert, and tracks what it admitted as speculative.
+
+- **XDNA tiled GEMM cuts each activation tile once per K-block** instead of
+  once per (N-block, K-block) in the resident-weight path; same accumulation
+  order, so bit-identical by construction. Compiles; not yet run on the NPU.
+
+- **`Device::Xdna` comes after `Cpu` in automatic device selection.** A
+  Phoenix NPU measured 1.9–2.7× slower than same-precision CPU bf16 on
+  transformer models, so `fastest_device()` no longer picks it; select it
+  explicitly.
+- **A `Session` on an unavailable XDNA / eGPU device says why.** The panic now
+  carries the backend's diagnostic (missing env var, path, library, toolchain
+  error) instead of "no such device/driver was found".
+
+- **Both bindings now share one implementation, so a few behaviours line up.**
+  pyrlx `CompiledGraph.run` refuses non-f32 outputs (as rlx-js always did)
+  instead of reinterpreting their bytes — use `run_typed` or `cast`. A Rust
+  panic inside a pyrlx call is a `RuntimeError`, not pyo3's `PanicException`
+  (a `BaseException` that `except Exception` misses). Unknown optimizer and
+  sampling options are an error in rlx-js too. pyrlx `dequant_gguf` handles
+  every GGUF type (F16 / BF16 were refused), and `GgufFile.metadata()` returns
+  arrays as lists rather than a debug string. JS `Gguf.info().dtype` reads
+  `"Q4_K"` (the GGML name) rather than `"Q4K"`. Graph builders gained the
+  other binding's spellings: JS `eq` / `ne` / `lt` / `le` / `gt` / `ge`,
+  Python `ifft`, `le_`, `node_count`, `name`, `fused_residual_layer_norm`; JS
+  `Runner` gained `runOn` / `runTry` / `runChain`, JS `Gguf` `tensorBytes` /
+  `architecture`.
+
+- **rlx-cuda: `RLX_CUDA_PARITY=1` now also keeps cuDNN's forward conv on the
+  GEMM algorithms.** cuDNN's heuristic picks WINOGRAD for most 3×3 convs. Even
+  in strict FP32 math (`CUDNN_FMA_MATH`), its transform loses about 10× in
+  accuracy. CLEF's VQGAN `conv_in` weight-gradient was 1.05e-4 off PyTorch with
+  WINOGRAD and 1.06e-5 with IMPLICIT_PRECOMP_GEMM. The default (non-parity) path
+  is unchanged.
+
+- **Rust builds can share an sccache cache; two settings decide whether it ever
+  hits.** `docs/development.md` gains a *Build cache* section. `incremental =
+  false` is required — sccache forwards `-C incremental` compilations to rustc
+  uncached — and `CARGO_TARGET_DIR` must not be exported, because the
+  environment variable is part of sccache's Rust cache key: varying it misses
+  every time, while the identical directory change passed as `--target-dir`
+  hits. Measured 2026-10-16 on a box that had run sccache for months through
+  `CARGO_TARGET_DIR`-exporting scripts and sat at a 0.00% Rust hit rate against
+  83% for C/C++. `rlx-onnx-import`'s `tests/codegen_compile.rs` now passes
+  `--target-dir` rather than setting the variable, keeping its isolated target
+  dir without defeating the cache. The MLX C++/CUDA build was already cached
+  (`RLX_MLX_CCACHE`); only Rust was uncovered.
+
+### Fixed
+
+- **`FuseSwiGLUDualMatmul` on batched weights**: a `silu(x·Wg)·(x·Wu)`
+  with `[B, K, N]` weights (an expert per batch row) was concatenated as if
+  2-D, declaring a `[B, 2N]` weight the operands give as `[B, K, 2N]`; the
+  pass now fuses `[K, N]` weights only (test
+  `only_two_dimensional_weights_fuse`).
+- **Backend calibration could be re-measured mid-process.** rlx-metal, rlx-cuda and rlx-mlx
+  saved their calibration with `fs::write` (truncate, then write) and re-read the file on every
+  cost-model query. A concurrent reader that caught the file empty or half-written measured
+  again, with timing-dependent numbers, so two device queries in one process could disagree.
+  The calibration is now loaded once per process (`OnceLock`) and saved write-then-rename.
+
+- **ONNX `ArgMax` / `ArgMin` / `MaxPool` indices imported as invalid IR.**
+  The importer declared `Op::ArgMax` itself `i64` (ONNX's index type), but the
+  IR op returns f32-encoded indices, so the verifier rejected any model with
+  an argmax and it could not compile in a debug build (the conformance
+  `gqa_layernorm` fixture). It now emits the f32 op, widening a
+  half-precision input first, and casts the indices to i64
+  (`tests/arg_reduce_indices.rs`).
+
+- **A param passed to `run` was ignored**, so a training loop that fed its
+  updated weights through `run` (as the README's example did) kept computing
+  with the old ones. `run` / `try_run` now upload a param name with
+  `set_param`.
+
+- **An invalid input graph was blamed on the first pass that changed it.**
+  Debug builds re-verify after each pass; an error the input already had read
+  `IR verifier failed at after pass `select_peaks_only_outputs``. It now reads
+  `the input graph (already invalid before any pass …)`; inputs a lowering
+  pass legitimately repairs (`LowerIf`) still compile.
+
+- **TPU `Op::Rope` rotated only the first head, and ignored `n_rot` and
+  `style`.** The lowering treated the last axis as one head, so on a packed
+  `[B, S, H·D]` tensor it emitted a shape-inconsistent module; partial rotary
+  and GPT-J pairing were silently NeoX full-width. Rewritten to the CPU
+  semantics (per head, first `n_rot` dims, NeoX or GPT-J pairing, per-position
+  or per-token tables); `RopeBackward` shares it with `sin` negated, so GPT-J
+  gradients now lower instead of asserting.
+
+- **TPU `RmsNorm` dropped `beta`** — the defect fixed on the other backends
+  earlier; TPU had been missed.
+
+- **TPU `Attention` with `MaskKind::Custom` added the mask to the scores**
+  instead of treating it as the `[B, S_k]` keep-mask the IR defines (`< 0.5`
+  ignored). A 0/1 padding mask masked nothing.
+
+- **Fusions absorbed producers that were also graph outputs.**
+  `FuseMatMulBiasAct`, `FuseConvBiasAct`/`FuseConvAffineAct` and
+  `FuseMatMulResidual` checked one consumer with `users().len() == 1` rather
+  than `has_single_use`, so an exported matmul returned `x·w + b` on CPU.
+
+- **CPU returned zeros for an exported `Narrow` feeding `Attention` or
+  `Rope`.** The thunk rewrites that read the parent buffer with a row stride
+  turn the Narrow into a Nop when it has one reader, and did not count the
+  caller reading a graph output.
+
+- **`jvp_hvp_third_regression` asserted the bug it was named after.** It
+  checked that `jvp(hvp(f))` returns zero rather than the third derivative —
+  the behaviour the `tangent_<name>_2` collision fix removed — and kept
+  passing because it fed only `tangent_x`, so the outer tangent read the
+  arena's zeros. Under `RLX_POISON_ARENA` it read NaN. It now feeds both
+  tangents and requires `6.0`, matching `nth_order_grad`.
+
+- **`lstm_autodiff` never wrote graph constants into its arena** (it drives
+  thunks directly, bypassing the runtime that does). It passed only while
+  every constant in the unfused LSTM is zero.
+
+- **`ExpertPager::prefetch` counted as cache hits and misses**, inflating
+  `PagerStats::hit_rate` — the number that decides whether paging is viable.
+
+- **CPU conv weight gradients were not deterministic.** The parallel
+  `Conv2dBackwardWeight` path added each chunk's partial gradient under a
+  lock, in finishing order, so the f32 sum could change between two runs of
+  the same graph. Chunks are now added in chunk order: bit-identical runs for a
+  given thread count. Test `rlx-runtime/tests/conv_dw_deterministic.rs` (10
+  runs, plus an f64 reference); the old reduction fails it on the second run.
+  The conv batch loops also take a work-aware grain (`pool::grain_for`).
+- **`RLX_WORKERS` could be silently ignored.** The global rayon pool is built
+  at the first kernel; if the host program used rayon before that, rayon's
+  default pool stood and the setting had no effect. rlx-cpu now says so when
+  `RLX_WORKERS` is set and cannot apply.
+- **`process_rss_bytes()` returned 0 on macOS.** It called the legacy
+  `TASK_BASIC_INFO` with a `repr(C)` mirror of a struct the SDK declares under
+  `#pragma pack(4)`, and read a resident size of 0. So `memory_headroom_bytes`
+  was always the whole budget and `would_exceed_soft_budget` never fired on
+  macOS. It now reads `MACH_TASK_BASIC_INFO` into a naturals buffer. Test
+  `process_rss_is_the_real_resident_size` (touching 64 MiB must show up).
+- **Memory plan: a folded transpose's input died too early.** A 2-D
+  transpose read only by a matmul is folded into the GEMM's flag (never
+  executed; the matmul reads its input), but liveness ended that input's
+  life at the transpose. With two `transpose(x) @ w` branches whose `x` are
+  computed, the second branch's tensor took the first's freed slot before
+  the first matmul read it — off by hundreds, silently (an ISTFT head,
+  `re @ cos + im @ sin`). The input now lives until the matmul. Test
+  `rlx-runtime/tests/folded_transpose_liveness.rs`.
+- **wgpu: a skipped static weight pack dropped deferred host writes, so
+  every run after the first was wrong.** After a host step, the run loop
+  flushes the host mirror only if the *next* step is a GPU step. It decided
+  on the raw schedule, so when the next step was a static-once host `Concat`
+  (a fused QKV/adaLN weight, skipped from run 2 on), it kept deferring. It
+  then landed on a GPU matmul whose pass cleared the mirror with the writes
+  still unflushed, and a later host op read its input slot's previous
+  tenant from the device. Run 1 was exact, later runs were wrong (cosine
+  −0.12 on `rlx-montageflow`'s final layer, discrete Vulkan with
+  matmul-bias fusion off). The lookahead now skips the steps the loop is
+  about to skip. The test `rlx-wgpu/tests/static_pack_skip_rerun.rs`
+  reproduces it on Metal via `RLX_WGPU_FORCE_HOST=1` and fails with the fix
+  reverted. Separately, two of the five static-once arming sites set the
+  flag directly, so `RLX_STATIC_WEIGHT_PACK=0` did not disable the skip
+  for a graph that ends on a host step. All five now go through
+  `arm_static_once`.
+- **wgpu: the wide-matmul GELU epilogue used the tanh form for exact GELU.**
+  `matmul_wide`, `matmul_wide_vec4`, `matmul_wide_nv`, `matmul_f16w` and
+  the four `matmul_coop_f16_vulkan*` kernels mapped activation code 9
+  (`GeluErf`) and 11 (`GeluApprox`) both to the tanh approximation. That is
+  about 6e-5 per transformer block wherever the fused matmul+bias+GELU
+  kernel was picked: discrete Vulkan, rank-3 inputs. Code 9 now evaluates
+  erf, the same way `matmul.wgsl` does. Test
+  `rlx-wgpu/tests/fused_matmul_bias_parity.rs` drives pre-activations
+  across [-4, 4]. It fails at 1.2e-4 with `matmul_wide_vec4` reverted.
+- **ONNX import: a negative `Pad` crops.** ONNX defines a negative pad as
+  a crop; the importer stubbed such a `Pad` with zeros. VITS' relative
+  attention pads its position embeddings by `len − 5`, below zero for a
+  sequence under five, so a short Piper input ran every attention layer on
+  zero embeddings, silently. Test `rlx-onnx-import/tests/pad_negative.rs`.
+- **`shared_weights` footprint test read a `u64` off its alignment** (an
+  `i32` buffer from `task_info`): a debug build aborted the whole
+  `rlx-metal` test binary. Read unaligned.
+- **A CPU `Scan` body gathered row 0 at any integer index.** The CPU
+  compiled scan bodies (forward, backward, and the recompute between
+  checkpoints) without the preparation every other graph gets
+  (`prepare_graph_for_thunks`): an I32 index was read as f32 bits, about
+  3e-45, so a gather in a body took its first row, and a claimed fused op
+  in a body would have run as a no-op. TEN-VAD's exported pitch track (its
+  Viterbi backtrack gathers by state) found it; regression test
+  `rlx-runtime/tests/scan_body_integer_index.rs`.
+- **`.rlxmodel`: an attribute naming a derived symbol pointed at another.**
+  The reader numbers each derived dim anew, past every symbol the header
+  declares; an attribute (`Narrow.len: frames*8-7`) kept the number
+  `generalize` gave it. With the header declaring a symbol the graph does
+  not use (a pipeline's `codebooks`), the slice read its length from the
+  next derived dim and the specialized graph failed its shape check. The
+  writer now names each such attribute by the reader's number.
+- **`inline_into` / autodiff `merge_subgraph` declared a param twice.** An
+  unbound param or input re-emitted as a new leaf even when the target already
+  had one of that name — a scan backward merging its body per step got one
+  `Param` per step, and binding by name reaches only one of them. Both are now
+  `Graph::splice`, which shares the existing leaf (and errors on a kind or
+  shape clash instead).
+- **XDNA detection failed silently (GitHub #5).** Each missing
+  `RLX_XDNA_*` variable or nonexistent path is now named, the toolchain probe
+  reports the compiler's error, and an absent NPU lists what `/sys/class/accel`
+  held. `RLX_XDNA_XCLBIN` / `RLX_XDNA_INSTS` are registered (and documented)
+  env vars. The device node is reported at `/dev/accel/accelN` (was
+  `/dev/accelN`), and the XRT search covers `/usr/lib` (Arch) and `/usr/lib64`.
+- **XDNA matmul kernel build broke on mlir-aie v1.4.4.** The vendor kernel moved
+  to `aie_kernels/linalg/mm.cc` and dropped its `zero_*` functions; rlx now
+  reads either layout and supplies `zero_<type>` when absent.
+
+- **`ExpandSharedKvHeads` rebuilt every graph.** The pass copied each
+  graph node by node even when no attention had shared K/V heads. It now
+  returns the graph as is.
+- **(rlx-models) GPU-resident K/V lost rows on CUDA; batch > 1 Whisper
+  broken everywhere.** A decode step that returns its caches as
+  `concat(past, new)` has its new row last; the handle feed copied only the
+  rows before it, so every new row inside a bucket was dropped
+  (`WhisperRunner` on CUDA looped "the capital of the capital of …").
+  `rlx-models-core::gpu_kv` now keeps the handles by a per-model
+  `KvLayout`. `InPlace` copies the leading rows, as before. `AppendLast`
+  moves only each sequence's new row (`feed_kv_row`) and reads a bucket's
+  last row from the output. `Detect`, the default, reads the layout off
+  the step's shapes when it compiles, so callers that weren't changed
+  (Gemma, Qwen3-TTS, LocateAnything) get the right one. Whisper declares
+  `AppendLast`. Batch > 1 was also wrong on every device, host path
+  included:
+  - the host helpers padded and compacted `[batch, past, kv]` caches as
+    one block (`pad_kv_sequences` pads each sequence; the compaction is
+    per sequence);
+  - the cross K/V install asserted at batch > 1;
+  - Whisper broadcast one position row over a batch that gathers one per
+    sequence;
+  - Whisper fed one mask row for `[batch, upper + 1]`.
+
+  Two regions decoded together now transcribe as each does alone, on CPU
+  and on CUDA, with resident K/V on and off.
+
+- **CPU: I32 / U32 / I64 tensors meant different numbers to different
+  kernels.** Casts, scans, the fixed-point FFT and custom ops read integers
+  as integers; arithmetic, compare, reduce and gather indices computed in
+  f32 over the same bytes; and `run()` wrote I32 as f32 bits and I64 as half
+  an 8-byte slot. So a cast after an integer multiply returned `1065353216`
+  for `1`, token ids fed through `run_typed` all selected row 0, and any I64
+  input through `run()` was garbage. Integers are now stored as integers
+  throughout. A CPU pass (`rlx_cpu::int_storage`) casts around each
+  f32-computing op that touches one (gather: only its indices; reduce over
+  I64: through f64), and `run()` writes and reads I32 / U32 / I64 as
+  integers. `tests/cpu_integer_storage.rs` checks 8 ops × 3 dtypes × both
+  feeds.
+- **Metal: a view of a parameter read from offset `usize::MAX` once the
+  weights were split out.** With large weights packed into their own buffer
+  (`RLX_METAL_WEIGHT_SPLIT_MIN`), the activation arena is planned without
+  params, and a pure view rooted at one (a `Narrow` at 0, a `Reshape`, a
+  same-dtype `Cast`) got no offset at all. A stateful decode step's mask
+  (`iota[0..cap] <= position`) read back as all ones, so the exported Qwen3
+  package attended to every cache row and diverged after the first token.
+  Views now take their root's offset in the arena. `tests/metal_view_offsets.rs`
+  fails without the fix; the Qwen3 package now decodes the same 24 tokens as
+  `Qwen3Runner` on Metal.
+- **rlx-cpu: `Concat` of 1- and 2-byte element types.** The CPU `Concat`
+  thunk moved 4-byte words whatever the dtype, so a bf16 / f16 / u8 / i8 /
+  bool concat came out with half its elements missing and rows interleaved
+  (bf16 `[a | b]` read back as `[a1, a3, a5, b1, …, 0, 0]`), silently. It
+  surfaced through `FuseSharedInputMatMul`, which concatenates the weights of
+  matmuls sharing an input: a model holding bf16 weights (gate + up of an MLP)
+  computed garbage on CPU while every single-matmul test passed. Half types now
+  go through `Thunk::ConcatHalf` (packed params and widened activations are
+  different layouts, so inputs are widened to f32, assembled, and a packed
+  output rounded back); other 1- and 2-byte types through a raw byte copy
+  (`Thunk::ConcatBytes`). Test: `rlx-runtime/tests/concat_narrow_dtypes.rs`.
+
+- **rlx-coreml: training graphs with bias gradients segfaulted (Apple BNNS
+  defect, now avoided).** CoreML's CPU engine mis-executes
+  `transpose → reduce → transpose`. It reads out of bounds inside
+  `BNNSGraphContextExecute_v2` (SIGSEGV/SIGBUS), or at some shapes silently
+  returns wrong sums: `[3,32,32]` summed over two axes was off by 98. This
+  reproduces with coremltools and no rlx code (macOS 26.6.2), on every
+  compute-unit setting. rlx-autodiff's sum-to-shape emits exactly this chain for
+  every bias gradient. The new `hybrid::hoist_transpose_out_of_reduce` pass
+  rewrites `reduce(transpose(x, p), A)` as `reduce(x, p[A])` plus a reshape, or a
+  transpose after the reduce, so the pattern can't form. Regression test:
+  `rlx-coreml/tests/coreml_transpose_reduce.rs`. Its bias-gradient cases crash
+  without the pass, and two breakages of the rewrite are each caught.
+
+- **rlx-coreml: a MIL segment could declare an input it never used.** The hybrid
+  plan can hand a segment an `Input` whose readers all live in other segments,
+  and CoreML refuses to load that model ("Error in declaring input d_output with
+  error -1"). `build_mil_subgraph` now leaves such an input out, unless it's the
+  segment's only input: a model with no inputs makes CoreML's E5 runtime throw
+  and silently fall back to another engine. With both fixes, CLEF's three
+  training stages run on CoreML at torch-gradient parity (≤2e-5).
+
+- **rlx-vulkan: `StopGradient` outputs were never written.** The lowering treated
+  `StopGradient` as a no-op view, like `Reshape`. But the memory planner
+  (`rlx_compile::memory::pure_view_offset`) aliases only `Reshape`, same-dtype
+  `Cast` and axis-0 `Narrow`, so `StopGradient` owns a slot, and every reader got
+  stale bytes. It now copies when the slots differ. Found porting CLEF: the VQ
+  codebook loss `‖sg(z) − q‖²` read as exactly 0, and real-weight T5 overflowed
+  to inf, because the softmax max-shift `x − sg(max x)` subtracted 0. rlx-cuda and
+  rlx-rocm alias `StopGradient` in their own arenas and were not affected.
+  Regression test: `rlx-vulkan/tests/stop_gradient_slot.rs`, which fails on the
+  old lowering (reads 0.0 for 9.0).
+
+- **rlx-wgpu: LayerNorm backward was wrong on most transformer shapes.** The
+  kernel had two defects. First, the workgroup reduction is called back-to-back
+  with no barrier after the read, so lane 0's next write raced the other lanes'
+  read: a 64×64 input failed while 65×64 passed. Second, `dgamma` only covered
+  the first 64 columns, so any hidden size above 64 got wrong gamma gradients
+  for column 64 onward. `ada_layer_norm_backward` had the same reduction race.
+  Found porting CLEF, whose Stage-I/II gradients were off by up to 8 % on wgpu
+  only. Regression test: `tests/layer_norm_backward_parity.rs`.
+- **rlx-wgpu: `StopGradient` is now lowered**, as the forward identity it is
+  (Metal already did this). `supported_ops` advertised the op, so any graph
+  containing one was accepted and then panicked in `lower.rs`.
+- **`rlx-js`: a resident trainer loading a checkpoint aborted the host.**
+  `Trainer.load` size-checked each parameter against the host path's weight
+  copy, which the resident (on-device AdamW) path leaves empty, so the index
+  panicked outside any guard; and the weights it would have restored were
+  rebuilt from that same empty copy. A host checkpoint now resumes on the
+  resident path (`a_checkpoint_resumes_on_the_resident_path`, Metal).
+- **`pyrlx`: `rlx.load_rlxp` (as documented) and the other RLXP / weight
+  loaders raised `AttributeError`** — compiled into the extension but never
+  re-exported from the package.
+
+### Performance
+
+- **Graph compile no longer dominates small training runs** (rlx-compile, rlx-runtime, rlx-cpu).
+  A CPU profile of exgb's 16-cell test sweep (small EEG decoders, a fresh compile per fold)
+  had 24.6 % of busy time in graph compilation. Three costs, none of which touches
+  arithmetic (the sweep's results are bit-identical before and after):
+  - `CpuExecutable::restore_arena_baseline` rebuilt the persistent byte ranges (a scan of
+    every node plus a sort) at the start of every run, so every training step. They follow
+    from the compiled layout, so they are now computed once and recomputed only when
+    `arena_handles` changes. Test `arena_keep_ranges` fails if that invalidation is dropped.
+  - `is_elidable_matmul_transpose` scanned the whole graph for each 2-D transpose, which is
+    quadratic in a training graph with one per weight. The planner and the CPU thunk compiler
+    now ask a `ReaderIndex` built in one pass. `the_reader_index_agrees_with_the_scan`
+    compares it with the scan on every node.
+  - The planner's placement loop sorted the time-overlapping buffers for every buffer it
+    placed. `placed` is now kept sorted by offset, giving the same sequence without the sort.
+    `plan_sweep_matches_candidate_scan_with_long_lived_branches` and
+    `a_gap_filled_below_an_earlier_buffer_is_respected` check every offset against the cubic
+    candidate scan, planned with reuse on. The earlier test planned with every buffer pinned
+    to the end, so nothing was reused and no ordering bug could show.
+
+  - `FusionReport::scan`, built on every compile even with no report requested, called
+    `Graph::users` (a whole-graph scan) for every matmul. It now uses a users index built in
+    one pass. `the_users_index_matches_graph_users` checks it node for node.
+
+  After: compile 8.2 % of busy time (the planner sorts, the transpose check and the
+  per-step range rebuild are gone from the profile). Wall time on the shared, loaded
+  machine was too noisy to state a speedup.
+- **Faster conv im2col gathers, bit-identical** (rlx-cpu). The forward gather (`im2col`,
+  `im2col_par`, now sharing one `fill_col_row`) zeroes each output row's padding and copies
+  its in-bounds range, one slice at stride 1, instead of a bounds test per element: 2–20×
+  faster on EEGNet/ShallowConvNet shapes, slower only on toy rows a few values wide. The
+  weight-gradient gather (`im2col_rows_layout`) does the same for kernels 16 taps wide or
+  more (2–4.5× faster on temporal convs) and keeps its original per-element loop for
+  narrower ones. Routing every kernel through the copy was 2–3× slower on 1-wide kernels
+  (EEGNet's spatial conv, 1×1), where each copy is a library call for one value. That was a
+  first version, caught when the end-to-end profile showed the time moving into `memmove`.
+  The buffers are identical, so every GEMM sees the same input. Tests compare both gathers
+  with the original loops bit for bit over more than 500 and 600 stride, padding, dilation
+  and kernel shapes; an off-by-one in either range fails them. `gather_timing` /
+  `forward_gather_timing` (ignored) time them against the originals. 1-wide kernels (EEGNet's
+  spatial conv, 1×1) then got their own branch in the weight-gradient gather: the
+  kernel rows' input offsets are worked out once per output row and the single input
+  column is checked once per position. About 2× faster on the spatial conv, 0.5–0.8× the old
+  time on 1×1 in 5 of 6 timings. Same buffer: `rows_layout_matches_the_original_loop` covers
+  it, and an off-by-one in its column fails it.
+- **`col2im` (conv input gradient) 6–9× faster, bit-identical** (rlx-cpu). The scatter-add
+  ran a bounds test per position; the in-bounds outputs of each row are one range that
+  depends on the kernel column alone (`wo_range`, now shared with the forward gather). At
+  stride 1 it adds them as one slice. Every input element receives the same additions in
+  the same order. `col2im_matches_the_per_element_loop` compares it with the original over
+  more than 600 shapes, accumulating into a non-zero gradient, and an off-by-one in the
+  slice offset fails it. Timed on EEGNet/ShallowConvNet shapes in `forward_gather_timing`:
+  0.11–0.18× the old time, and 0.5–0.66× on rows a few values wide.
+- **Reductions over a non-last axis 12–14× faster, bit-identical** (rlx-cpu). `Thunk::Reduce`
+  reduced each output on its own, reading its strip with stride `inner`, which is a cache
+  miss per element when the reduced axis isn't last: batch means, gradients summed over the
+  batch. The kernel is now `reduce_into`: it accumulates whole contiguous rows of `inner`
+  outputs at a time, each output still seeing the same operations in the same order (f64
+  for Sum/Mean). Last-axis reductions (`inner == 1`) keep a scalar loop and their speed
+  (0.97–1.02×). `reduce_into_matches_the_strided_loop` compares it with the original kernel
+  bit for bit for all five ops, serial and parallel, over shapes whose chunks cross outer
+  boundaries, with NaN, ±0 and ±1e17 against 1.0 (so a sum in any other order lands on
+  different bits, even in f64). Reversing the accumulation order fails it. Timed in
+  `reduce_timing` (ignored).
+- **Conv bias broadcasts take the per-channel fill** (rlx-cpu). `Thunk::Transpose`'s
+  per-channel fast path (`[C]` to `[N,C,H,W]`) required a zero stride on every axis but the
+  channel's. A bias reshaped `[1,C,1,1]` and expanded to `[N,C,1,W]` carries stride 1 on its
+  size-1 height axis, so every EEG temporal conv's bias fell through to the per-element
+  index walk. A per-thunk profile (`RLX_PROFILE_THUNKS`) of EEGNet + ShallowConvNet put
+  Transpose at 22.9 % of thunk time, and a shape trace put 88 % of that on this one
+  pattern. Size-1 axes now count as unused, whatever their stride. Same values (a copy).
+  Test `expand_channel_broadcast` checks the broadcast against the definition, bit for bit,
+  over the traced shapes; corrupting the fast path's channel index fails it.
+- **Binary ops: parallel same-shape NEON, and a held-scalar path** (rlx-cpu,
+  `Thunk::BinaryFull`), bit-identical. A shape trace of EEGNet + ShallowConvNet found the
+  same-shape NEON Add/Mul loop running on one thread for 2.4 M-element tensors (538 µs a
+  call), and `x op scalar` going through the per-element broadcast index walk at 0.6–0.9
+  elements/ns. The NEON loop now splits a large tensor across threads, each element still
+  getting one IEEE add or multiply. A 1-element operand on either side is held in a plain
+  loop. The three f32 loops share one op table (`f32_op!`) instead of three copies of the
+  14-op match. Test `binary_elementwise_paths` checks Add/Sub/Mul/Div/Max/Min, same-shape
+  and scalar on either side, at 7 / 1000 / 2.4 M elements, against per-element arithmetic
+  bit for bit. A wrong chunk offset or scalar operand fails it.
+
+- **Metal: BF16-weight decode matmuls read the weight in-kernel.** A
+  `Sgemm { b_bf16 }` with M ≤ 4 used to unpack the whole bf16 weight into an
+  f32 scratch on every call and run the f32 GEMM — 5 bytes moved per weight,
+  3× slower than storing f32. New `gemv_bf16w_splitk8` (8 columns per thread,
+  16-byte loads, 16-way K split; `_n64` variant with a 64-column tile and
+  64-way split for narrow N), `gemv_bf16w_splitk` (even N) and
+  `sgemm_bf16w_small_m` (M 2–4). Fish S2-Pro decode step on an M4 Pro:
+  f32 312 ms → unpacked bf16 961 ms → in-kernel bf16 ~110 ms, at 9 GB instead
+  of 25. Bit-exact widening; `RLX_METAL_BF16W_DISABLE=1` restores the unpack
+  path. Pinned by rlx-models' `half_weights_match_f32_math_at_decode_shapes`.
+- **Metal: contiguous mid-axis concat.** With one outer row (a KV cache plus
+  its new rows) each segment is a single block; it is now copied as `float4`s
+  (`copy_f32x4`) instead of one element per thread with three div/mods. Fish
+  S2-Pro at 4096 cached rows, where the 72 per-step concats took 76 ms of a
+  265 ms step: 284 → 217 ms per step (best of 4 batches; shared machine).
+- **`samplers::TopP`** sorts only a growing top prefix (64, 256, 1024, …) of
+  the probabilities until it reaches `p`, instead of every finite one; the
+  prefix is in exactly the full sort's order, so the kept set is identical
+  (`top_p_prefix_search_matches_a_full_sort`). `TopP`, `TypicalP` and
+  `sorted_desc` sort with `total_cmp` + index ties (same order as before, no
+  panic on NaN). Through `rlx_qwen3::sample_token_at` at temperature 0.7 /
+  top-p 0.95 on a 151,936-entry row: 2.7 ms → 1.0 ms per token (Apple
+  M-series, release).
+
 ## [0.2.18] — 2026-10-15
 
 ### Added
+
+- **Emulated number formats (`CompileOptions::number_format`).** A graph can
+  run as `f64`, double-single `f64x2`, or any binary float format from `f16`
+  down to 4-bit minifloats (`bf16`, `f8e4m3`, `f6e2m3`, `f4e2m1`, custom
+  `fNeXmY`), parsed from text such as `"f4e2m1@b16"`. For the narrow formats,
+  `rlx_compile::emulate_float_format` inserts the new `Op::RoundToFormat` after
+  the weights and after every op that produces a float tensor, with no scale,
+  one per tensor, or one per block (`FormatScaling`; MX 32-element blocks by
+  default at 8 bits and below), so every value a consumer reads is
+  representable in the format while arithmetic inside an op still accumulates
+  in `f32`. `FloatFormat::round` (ties to even, saturating, power-of-two
+  scales) is the one definition: the op is native on CPU, Metal, MLX, CUDA,
+  ROCm, wgpu and Vulkan (Core ML runs it on the host), and
+  `rlx-runtime/tests/number_format.rs` checks every backend bit-identical to
+  the CPU kernel.
+
+- **sccache for the MLX build (`rlx-mlx-sys`).** MLX's C++ and CUDA sources
+  now compile through sccache when it is installed, else ccache, on macOS,
+  iOS-family targets and Linux; `RLX_MLX_CCACHE=sccache|ccache|<path>|off`
+  chooses. Linux builds used no compiler cache at all before, although the
+  README said MLX picked up ccache by itself — so every new `OUT_DIR`
+  recompiled the CUDA kernels from scratch (~1 h).
 
 - **Checkpoint files and adapters for flow weights (`rlx-flow`).** With the new
   default-off `formats` feature, `formats::SafetensorsSource` (one file or a
@@ -4414,7 +7272,9 @@ HuggingFace reference), a high-level **`rlx::run`** runner API, a
 
 Initial release. Tracked at [git history root].
 
-[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.18...HEAD
+[Unreleased]: https://github.com/MIT-RLX/rlx/compare/v0.2.20...HEAD
+[0.2.20]: https://github.com/MIT-RLX/rlx/compare/v0.2.19...v0.2.20
+[0.2.19]: https://github.com/MIT-RLX/rlx/compare/v0.2.18...v0.2.19
 [0.2.18]: https://github.com/MIT-RLX/rlx/compare/v0.2.17...v0.2.18
 [0.2.17]: https://github.com/MIT-RLX/rlx/compare/v0.2.16...v0.2.17
 [0.2.16]: https://github.com/MIT-RLX/rlx/compare/v0.2.15...v0.2.16

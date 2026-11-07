@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // RMSNorm backward (row = last-axis slice). wrt: 0=dx, 1=dgamma, 2=dbeta.
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 struct Params {
     outer: u32,
     inner: u32,
@@ -26,7 +29,7 @@ fn rms_norm_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x_base = params.x_off + row * params.inner;
     let dy_base = params.dy_off + row * params.inner;
     let out_base = params.out_off + row * params.inner;
-    let n_inv = 1.0 / f32(params.inner);
+    let n_inv = rlx_div_rn(1.0, f32(params.inner));
     let eps = bitcast<f32>(params.eps_bits);
 
     var dot: f32 = 0.0;
@@ -39,7 +42,7 @@ fn rms_norm_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
         sumsq = sumsq + xv * xv;
     }
     dot = dot * n_inv;
-    let inv_r = inverseSqrt(sumsq * n_inv + eps);
+    let inv_r = rlx_rsqrt_rn(sumsq * n_inv + eps);
     // Cross term is inv_r³ (inv_r2 here, ·inv_r below), not inv_r⁴ — drop the stray 1/r.
     let inv_r2 = inv_r * inv_r;
     for (var i: u32 = 0u; i < params.inner; i++) {
@@ -55,7 +58,7 @@ fn rms_norm_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn rms_norm_bwd_param(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x != 0u || params.inner == 0u) { return; }
     let eps = bitcast<f32>(params.eps_bits);
-    let n_inv = 1.0 / f32(params.inner);
+    let n_inv = rlx_div_rn(1.0, f32(params.inner));
     for (var i: u32 = 0u; i < params.inner; i++) {
         arena[params.out_off + i] = 0.0;
     }
@@ -67,7 +70,7 @@ fn rms_norm_bwd_param(@builtin(global_invocation_id) gid: vec3<u32>) {
             let xv = arena[x_base + i];
             sumsq = sumsq + xv * xv;
         }
-        let inv_r = inverseSqrt(sumsq * n_inv + eps);
+        let inv_r = rlx_rsqrt_rn(sumsq * n_inv + eps);
         if (params.wrt == 1u) {
             for (var i: u32 = 0u; i < params.inner; i++) {
                 let xv = arena[x_base + i];
@@ -82,3 +85,4 @@ fn rms_norm_bwd_param(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 }
+

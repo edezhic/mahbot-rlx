@@ -17,7 +17,7 @@ rlx-ir = { workspace = true }
 rlx-macros = { workspace = true, optional = true }
 rlx-runtime = { package = "mahbot-rlx-runtime", path = "../rlx-runtime", version = "0.2.18-mahbot.2", default-features = false, optional = true }
 rlx-autodiff = { workspace = true, optional = true }
-rlx-optim = { workspace = true, optional = true }
+rlx-optim = { workspace = true, optional = true, features = ["parallel"] }
 ndarray = { version = "0.16", optional = true }
 
 [features]
@@ -54,6 +54,10 @@ eval-blas = ["eval", "rlx-runtime/blas-accelerate"]
 ndarray = ["dep:ndarray"]
 eval-cuda = ["eval", "rlx-runtime/cuda"]
 eval-rocm = ["eval", "rlx-runtime/rocm"]
+# AMD XDNA (Ryzen AI NPU) and native Vulkan, for `.on(Device::Xdna | Device::Vulkan)`
+# and `Func::train_step_*_on` there.
+eval-xdna = ["eval", "rlx-runtime/xdna"]
+eval-vulkan = ["eval", "rlx-runtime/vulkan"]
 # Training: a `Func::train_step` that runs value+grad and applies an
 # `rlx_optim` optimizer to the bound params. Implies autodiff + eval.
 optim = ["autodiff", "eval", "dep:rlx-optim"]
@@ -177,3 +181,8 @@ required-features = ["backend-tests"]
 [[test]]
 name = "ui"
 required-features = ["backend-tests"]
+
+[[test]]
+name = "data_parallel"
+required-features = ["backend-tests"]
+

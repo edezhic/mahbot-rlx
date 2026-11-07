@@ -2776,6 +2776,10 @@ fn bind_fused(
     scratch: &mut Vec<u8>,
 ) -> Result<()> {
     if session.param_resident(name, len) {
+        // The bytes are already there, so no `set_param*` call will record this name;
+        // say so here, where the write is skipped, or the unbound diagnostic reports
+        // a parameter that is bound and correct.
+        session.mark_param_bound(name);
         return Ok(());
     }
     let mut at = 0usize;
@@ -2892,7 +2896,9 @@ impl Runner {
                 // The read is only worth making when the write it feeds would land: a
                 // second layout of one body asks for the same parameter, and the device
                 // already holds it ([`CompiledGraph::param_resident`]).
-                if !session.param_resident(&name, bytes.len()) {
+                if session.param_resident(&name, bytes.len()) {
+                    session.mark_param_bound(&name);
+                } else {
                     model.read_into(&key, &mut scratch)?;
                     session.set_param_typed(&name, &scratch, dt);
                 }

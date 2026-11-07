@@ -2,12 +2,15 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 // Single-pass online-softmax SDPA (FlashAttention v1 inner-row form).
 // One thread per (batch, head, q_row); each thread walks the K dimension
 // exactly once, maintaining a running (m, l, O[D]) tuple:
 //
 //   m_new = max(m, s)
-//   e_old = exp(m - m_new); e_cur = exp(s - m_new)
+//   e_old = rlx_exp(m - m_new); e_cur = rlx_exp(s - m_new)
 //   l     = e_old · l + e_cur
 //   O[d]  = e_old · O[d] + e_cur · V[s][d]
 //   m     = m_new
@@ -242,8 +245,8 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
 
         // Online softmax update.
         let m_new = max(m, score);
-        let e_old = exp(m - m_new);
-        let e_cur = exp(score - m_new);
+        let e_old = rlx_exp(m - m_new);
+        let e_cur = rlx_exp(score - m_new);
         l = e_old * l + e_cur;
         // V rows are `hd_v` wide (v_seq_stride already reflects that width).
         let v_base = v_bh + s * params.v_seq_stride;
@@ -255,7 +258,7 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
 
     // Normalize and emit `hd_v`-wide output rows. l is guaranteed > 0
     // (at least one finite score).
-    let inv_l = 1.0 / l;
+    let inv_l = rlx_div_rn(1.0, l);
     for (var d: u32 = 0u; d < hd_v; d = d + 1u) {
         arena[o_base + d] = o[d] * inv_l;
     }
@@ -292,7 +295,7 @@ fn decode_geom() -> DecodeGeom {
 // pair and `split` picks the `splits`-th of its disjoint key ranges. Every lane
 // keeps its own running (m, l, O[]) over the keys it walks, and the merge at the
 // bottom is the same online-softmax rebase the serial kernel does serially: a
-// lane whose partial sits below the merged max contributes exp(m - max) of its
+// lane whose partial sits below the merged max contributes `rlx_exp(m - max)` of its
 // own weighting. Only lane 0's reduction of a 64-lane array differs in shape
 // from the serial form — at this width a barrier tree is not worth it.
 @compute @workgroup_size(DECODE_LANES)
@@ -425,8 +428,8 @@ fn attention_decode(
             score = mask_score(score, cap, s, q_abs, params.mask_kind, params.window, mask_v);
         }
         let m_new = max(m, score);
-        let e_old = exp(m - m_new);
-        let e_cur = exp(score - m_new);
+        let e_old = rlx_exp(m - m_new);
+        let e_cur = rlx_exp(score - m_new);
         // A key below the running max by more than f32's exponent adds nothing:
         // `e_old` is exactly 1 (m did not move) and `e_cur` is exactly 0, so
         // `l` and `O` are unchanged bit for bit for a finite V. Skipping it also
@@ -477,7 +480,7 @@ fn attention_decode(
         dec_pub[0] = mm;
     }
     workgroupBarrier();
-    let w = exp(m - dec_pub[0]);
+    let w = rlx_exp(m - dec_pub[0]);
     dec_lane[lid] = w * l;
     workgroupBarrier();
     if (lid == 0u) {
@@ -486,7 +489,7 @@ fn attention_decode(
         dec_pub[1] = ll;
     }
     workgroupBarrier();
-    let inv_l = 1.0 / dec_pub[1];
+    let inv_l = rlx_div_rn(1.0, dec_pub[1]);
 
     // Output: value dims in DECODE_DIM_CHUNK-wide passes. A split writes its
     // `(m, l, O)` partial unnormalised for the merge entry instead of dividing.
@@ -550,7 +553,7 @@ fn attention_decode_merge(
         var ll = 0.0;
         for (var c: u32 = 0u; c < splits; c = c + 1u) {
             let p = part_base + c * part_stride;
-            ll = ll + exp(attention_parts[p] - mm) * attention_parts[p + 1u];
+            ll = ll + rlx_exp(attention_parts[p] - mm) * attention_parts[p + 1u];
         }
         dec_pub[0] = mm;
         // A row no key reached keeps the serial kernel's l = 1, O = 0.
@@ -558,12 +561,12 @@ fn attention_decode_merge(
     }
     workgroupBarrier();
     let mm = dec_pub[0];
-    let inv_l = 1.0 / dec_pub[1];
+    let inv_l = rlx_div_rn(1.0, dec_pub[1]);
     for (var d: u32 = lid; d < hd_v; d = d + DECODE_LANES) {
         var acc = 0.0;
         for (var c: u32 = 0u; c < splits; c = c + 1u) {
             let p = part_base + c * part_stride;
-            acc = acc + exp(attention_parts[p] - mm) * attention_parts[p + 2u + d];
+            acc = acc + rlx_exp(attention_parts[p] - mm) * attention_parts[p + 2u + d];
         }
         arena[o_base + d] = acc * inv_l;
     }

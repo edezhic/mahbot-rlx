@@ -92,6 +92,9 @@ impl RocmExecutable {
         // Running it here — the single entrance to this crate's compile —
         // covers every caller, not just the runtime backend wrapper.
         let graph = LowerNonLastAxisReduce.run(crate::unfuse::unfuse(graph));
+        // The attention kernels read K / V as `num_heads` heads: repeat shared
+        // ones (grouped-query attention) first, or they return a wrong tensor.
+        let graph = rlx_opt::rlx_fusion::expand_shared_kv::ExpandSharedKvHeads.run(graph);
 
         let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
         let mut plan = plan_f32_uniform(&graph, 16);
@@ -111,19 +114,19 @@ impl RocmExecutable {
         //
         // It is not sufficient on its own. The *shared* kernels are mixed: 115
         // offset parameters are `unsigned long long` and 479 are still
-        // `unsigned int`, so an op of the second kind truncates inside the
-        // kernel signature no matter how wide the host field is. Until those are
-        // audited per op, refuse the whole case rather than let the safe ops
-        // through and corrupt the rest — silent corruption at the end of a graph
-        // is far worse than a stop.
+        // `unsigned int`. Most of those count f32 elements (`byte / 4`), so
+        // they reach 16 GiB, but some ops pass byte offsets, which wrap past
+        // 4 GiB inside the kernel signature no matter how wide the host field
+        // is. So an arena past 4 GiB is refused unless every scheduled step is
+        // one audited for element offsets (`Step::offsets_reach_16_gib`),
+        // checked once the schedule is built — silent corruption at the end
+        // of a graph is far worse than a stop.
+        let arena_past_4gib = plan.arena_size > u32::MAX as usize;
         assert!(
-            plan.arena_size <= u32::MAX as usize,
-            "rlx-rocm: arena is {} bytes, past 4 GiB. Host-side offsets are u64, \
-             but {} of this backend's shared kernels still declare `unsigned int` \
-             offset parameters and would wrap inside the kernel. Split the graph \
-             until those signatures are widened.",
-            plan.arena_size,
-            "479"
+            plan.arena_size / 4 <= u32::MAX as usize,
+            "rlx-rocm: arena is {} bytes, past 16 GiB: f32-element offsets are \
+             `unsigned int` in the shared kernels. Split the graph.",
+            plan.arena_size
         );
         let mut arena = Arena::from_plan(&ctx, &plan);
         for node in graph.nodes() {
@@ -2049,7 +2052,7 @@ impl RocmExecutable {
                         out_off: (arena.offset(node.id) / 4) as u32,
                     });
                 }
-                Op::Fft { inverse, norm } => {
+                Op::Fft { inverse, norm, .. } => {
                     let in_id = node.inputs[0];
                     let in_shape = graph.node(in_id).shape.clone();
                     let meta = rlx_ir::fft::fft_meta(&in_shape);
@@ -2542,7 +2545,9 @@ impl RocmExecutable {
                         desc: rlx_cpu::rlx_scan_host_desc!(graph, node, |id| arena.offset(id)),
                     });
                 }
-                Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } => {
+                // `Op::While`: a loop at run time on the host (rlx-cpu's
+                // `Thunk::While`), unbounded or not.
+                Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } | Op::While { .. } => {
                     schedule.push(Step::HostOp {
                         desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
                     });
@@ -3088,6 +3093,60 @@ impl RocmExecutable {
                         rows,
                         h,
                         eps_bits: eps.to_bits(),
+                    });
+                }
+                Op::DoubleSingle(op) => {
+                    let dims = |id: rlx_ir::NodeId| -> Vec<usize> {
+                        graph
+                            .node(id)
+                            .shape
+                            .dims()
+                            .iter()
+                            .map(|d| d.unwrap_static())
+                            .collect()
+                    };
+                    let ins: Vec<Vec<usize>> = node.inputs.iter().map(|&i| dims(i)).collect();
+                    let refs: Vec<&[usize]> = ins.iter().map(|v| v.as_slice()).collect();
+                    let plan =
+                        rlx_ir::double_single::DfPlan::from_pair_shapes(op, &refs, &dims(node.id))
+                            .unwrap_or_else(|e| panic!("rlx-rocm: {e}"));
+                    let mut args = rlx_gpu_kernels::DfArgs::from_plan(op, &plan);
+                    args.a_off = (arena.offset(node.inputs[0]) / 4) as u32;
+                    args.b_off = node
+                        .inputs
+                        .get(1)
+                        .map_or(args.a_off, |&b| (arena.offset(b) / 4) as u32);
+                    args.out_off = (arena.offset(node.id) / 4) as u32;
+                    schedule.push(Step::DoubleSingle { args });
+                }
+                Op::RoundToFormat { format, scaling } => {
+                    use rlx_ir::FormatScaling;
+                    let (mode, block) = match scaling {
+                        FormatScaling::None => (0u32, 1u32),
+                        FormatScaling::PerTensor => (1, 1),
+                        FormatScaling::Block(b) => (2, (*b).max(1)),
+                        FormatScaling::FineBlock(b) => (3, (*b).max(1)),
+                    };
+                    schedule.push(Step::RoundToFormat {
+                        in_off: (arena.offset(node.inputs[0]) / 4) as u32,
+                        amax_off: node
+                            .inputs
+                            .get(1)
+                            .map_or(0, |&a| (arena.offset(a) / 4) as u32),
+                        out_off: (arena.offset(node.id) / 4) as u32,
+                        n: node.shape.num_elements().unwrap() as u32,
+                        last_dim: node
+                            .shape
+                            .dims()
+                            .last()
+                            .map_or(1, |d| d.unwrap_static())
+                            .max(1) as u32,
+                        block,
+                        mode,
+                        man_bits: format.man_bits as i32,
+                        emin: format.emin(),
+                        emax: format.emax(),
+                        max_bits: format.max_normal.to_bits(),
                     });
                 }
                 Op::FakeQuantize {
@@ -3729,15 +3788,16 @@ impl RocmExecutable {
                     let h = x_shape.dim(x_shape.rank() - 1).unwrap_static() as u32;
                     let rows = (x_shape.num_elements().unwrap() / h.max(1) as usize) as u32;
                     let eps_bits = eps.to_bits();
-                    let off = |i: usize| arena.offset(node.inputs[i]) as u32;
+                    // Byte offsets stay u64: a u32 here wrapped past 4 GiB.
+                    let off = |i: usize| arena.offset(node.inputs[i]) as u64;
                     let common = (off(0), off(1), off(2), off(3), rows, h, eps_bits);
                     match &node.op {
                         Op::RmsNormBackwardInput { .. } => {
                             schedule.push(Step::RmsNormBackwardInput {
-                                x_byte_off: common.0 as u64,
-                                gamma_byte_off: common.1 as u64,
-                                beta_byte_off: common.2 as u64,
-                                dy_byte_off: common.3 as u64,
+                                x_byte_off: common.0,
+                                gamma_byte_off: common.1,
+                                beta_byte_off: common.2,
+                                dy_byte_off: common.3,
                                 dx_byte_off: arena.offset(node.id) as u64,
                                 rows: common.4,
                                 h: common.5,
@@ -3746,10 +3806,10 @@ impl RocmExecutable {
                         }
                         Op::RmsNormBackwardGamma { .. } => {
                             schedule.push(Step::RmsNormBackwardGamma {
-                                x_byte_off: common.0 as u64,
-                                gamma_byte_off: common.1 as u64,
-                                beta_byte_off: common.2 as u64,
-                                dy_byte_off: common.3 as u64,
+                                x_byte_off: common.0,
+                                gamma_byte_off: common.1,
+                                beta_byte_off: common.2,
+                                dy_byte_off: common.3,
                                 dgamma_byte_off: arena.offset(node.id) as u64,
                                 rows: common.4,
                                 h: common.5,
@@ -3758,10 +3818,10 @@ impl RocmExecutable {
                         }
                         Op::RmsNormBackwardBeta { .. } => {
                             schedule.push(Step::RmsNormBackwardBeta {
-                                x_byte_off: common.0 as u64,
-                                gamma_byte_off: common.1 as u64,
-                                beta_byte_off: common.2 as u64,
-                                dy_byte_off: common.3 as u64,
+                                x_byte_off: common.0,
+                                gamma_byte_off: common.1,
+                                beta_byte_off: common.2,
+                                dy_byte_off: common.3,
                                 dbeta_byte_off: arena.offset(node.id) as u64,
                                 rows: common.4,
                                 h: common.5,
@@ -4253,6 +4313,25 @@ impl RocmExecutable {
                     }
                 }
             }
+        }
+
+        if arena_past_4gib {
+            let mut bad: Vec<&str> = schedule
+                .iter()
+                .filter(|s| !s.offsets_reach_16_gib())
+                .map(super::step::step_name)
+                .collect();
+            bad.sort_unstable();
+            bad.dedup();
+            assert!(
+                bad.is_empty(),
+                "rlx-rocm: arena is {} bytes, past 4 GiB, and these steps are not \
+                 audited for offsets past 4 GiB (some pass byte offsets as \
+                 `unsigned int`, which would wrap): {}. Split the graph, or run it \
+                 on another device.",
+                plan.arena_size,
+                bad.join(", ")
+            );
         }
 
         // Host staging is sized by LANE count, not element count: a complex

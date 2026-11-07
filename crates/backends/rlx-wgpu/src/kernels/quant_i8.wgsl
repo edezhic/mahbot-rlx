@@ -21,8 +21,9 @@
 //   * **`x * (1/s)`, not `x / s`.** The CPU kernel computes `inv_scale =
 //     1.0 / scales[c]` once and multiplies. Dividing instead differs by an ULP,
 //     which is enough to move a value across a rounding boundary and change the
-//     code. `div_rn` supplies the correctly-rounded reciprocal, since Metal's
-//     fast math would otherwise approximate even that.
+//     code. `rlx_div_rn` (rlxsl's correctly-rounded divide, appended by
+//     `kernel_module`) supplies the reciprocal, since Metal's fast math would
+//     otherwise approximate even that.
 //   * **round-half-AWAY, not WGSL's `round`.** Rust's `f32::round` breaks ties
 //     away from zero; WGSL's `round` breaks them to even. Quantization lands on
 //     exact halves constantly (any `x` that is an odd multiple of `s/2`), so the
@@ -69,14 +70,6 @@ fn wr_word(byte_off: u32, bytes: vec4<u32>) {
     arena[byte_off / 4u] = bitcast<f32>(packed);
 }
 
-// Correctly-rounded a/b — Metal's fast math lowers `/` to a reciprocal
-// multiply, up to 1 ULP off. `fma` forms the residual exactly.
-fn div_rn(a: f32, b: f32) -> f32 {
-    let q = a / b;
-    let r = fma(-b, q, a);
-    return q + r / b;
-}
-
 // Rust `f32::round`: ties away from zero.
 fn round_half_away(x: f32) -> f32 {
     let sgn = f32(x > 0.0) - f32(x < 0.0);
@@ -96,7 +89,7 @@ fn quantize_one(i: u32) -> u32 {
     let c = chan_of(i);
     let s = bitcast<f32>(affine_at(2u * c));
     let zp = i32(affine_at(2u * c + 1u));
-    let inv = div_rn(1.0, s);
+    let inv = rlx_div_rn(1.0, s);
     // Clamp in FLOAT before the int conversion. WGSL leaves `i32(f)` undefined
     // for an out-of-range `f`, and even where it saturates, adding `zp` to
     // `i32::MAX` wraps. ±1e9 is far outside the i8 range, so anything beyond it

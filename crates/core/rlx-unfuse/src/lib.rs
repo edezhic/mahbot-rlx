@@ -52,10 +52,17 @@ pub trait DecomposePolicy {
             | Op::FusedAttentionBlock { .. }
             | Op::FusedTransformerLayer { .. }
             | Op::DotGeneral { .. }
-            | Op::If { .. }
-            | Op::While { .. } => true,
+            | Op::If { .. } => true,
+            Op::While { .. } => !self.while_native(),
             _ => false,
         }
+    }
+
+    /// Keep `Op::While` for a loop at run time (the one-op host fallback,
+    /// rlx-cpu's `Thunk::While`), unbounded or not. Default: unroll it to
+    /// `max_iterations`.
+    fn while_native(&self) -> bool {
+        false
     }
 
     /// Keep `Op::FusedSwiGLU` intact for a native fused kernel (CUDA/ROCm).
@@ -278,7 +285,20 @@ pub fn unfuse(graph: Graph, policy: &dyn DecomposePolicy) -> Graph {
                 wrt,
             } => {
                 let q_dims = graph.node(node.inputs[0]).shape.dims();
-                if policy.promote_attention_backward() && q_dims.len() == 3 {
+                // The kernel indexes `[B, H, S, D]`. Rank-3 `[B, S, H·D]` and
+                // rank-4 BSHD `[B, S, H, D]` (the layout `attention_geom`
+                // detects when axis 1 is not the head count) are transposed in
+                // and the gradient transposed back; a BSHD tensor read as BHSD
+                // attends across heads instead of positions.
+                let bshd4 = q_dims.len() == 4
+                    && !rlx_ir::attention_layout::attention_geom(
+                        &graph.node(node.inputs[0]).shape,
+                        &graph.node(node.inputs[1]).shape,
+                        *num_heads,
+                        *head_dim,
+                    )
+                    .bhsd;
+                if policy.promote_attention_backward() && (q_dims.len() == 3 || bshd4) {
                     expand_attention_backward_rank3(
                         &mut out,
                         &graph,
@@ -534,7 +554,30 @@ fn needs_attn_rank3_promotion(
 ) -> bool {
     let is_attn = matches!(node.op, Op::Attention { .. })
         || (policy.promote_attention_backward() && matches!(node.op, Op::AttentionBackward { .. }));
-    is_attn && graph.node(node.inputs[0]).shape.rank() == 3
+    if !is_attn {
+        return false;
+    }
+    let q = &graph.node(node.inputs[0]).shape;
+    if q.rank() == 3 {
+        return true;
+    }
+    // A rank-4 BSHD backward is transposed to the kernel's BHSD too.
+    match &node.op {
+        Op::AttentionBackward {
+            num_heads,
+            head_dim,
+            ..
+        } if q.rank() == 4 => {
+            !rlx_ir::attention_layout::attention_geom(
+                q,
+                &graph.node(node.inputs[1]).shape,
+                *num_heads,
+                *head_dim,
+            )
+            .bhsd
+        }
+        _ => false,
+    }
 }
 
 // ── Expansions ───────────────────────────────────────────────────
@@ -1541,11 +1584,14 @@ fn expand_attention_rank3(
 
         let bhsd = Shape::new(&[batch, num_heads, seq_q, head_dim], dtype);
         let mut attn_inputs = vec![q4, k4, v4];
-        if matches!(mask_kind, MaskKind::Custom) {
+        // A `Bias` mask too: dropping it left the kernel indexing a fourth
+        // input that was not there (a multi-token verify step's causal bias).
+        if matches!(mask_kind, MaskKind::Custom | MaskKind::Bias) {
             // BERT passes [B, S]; the kernel reads [B, H, S_q, S_k]. We reshape
             // the mask through Reshape + Expand to broadcast across heads and
             // queries (additive padding mask: same per (q, k) pair regardless
-            // of which head or which query position it gates).
+            // of which head or which query position it gates). A `Bias` is
+            // usually that shape already.
             let mask_id = new_inputs[3];
             let mask_dims: Vec<usize> = src
                 .node(orig_inputs[3])
@@ -1739,11 +1785,14 @@ fn expand_attention_backward_rank3(
         vec![grad4],
         Shape::new(&[batch, seq_wrt, num_heads, head_dim], dtype),
     );
-    out.reshape(
-        bsd,
-        vec![batch as i64, seq_wrt as i64, (num_heads * head_dim) as i64],
-        out_shape.clone(),
-    )
+    // Back to the caller's layout: `[B, S, H·D]`, or `[B, S, H, D]` when the
+    // inputs were rank-4 BSHD (both have the sequence on axis 1).
+    let target: Vec<i64> = out_shape
+        .dims()
+        .iter()
+        .map(|d| d.unwrap_static() as i64)
+        .collect();
+    out.reshape(bsd, target, out_shape.clone())
 }
 
 /// Inline a sub-graph into `out`, binding the sub-graph's `Op::Input`
@@ -1932,4 +1981,47 @@ fn make_zero_const(out: &mut Graph, dims: &[usize], dtype: DType) -> NodeId {
         vec![],
         Shape::new(dims, DType::F32),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlx_ir::DType;
+
+    struct Defaults;
+    impl DecomposePolicy for Defaults {}
+
+    /// A rank-3 attention with an additive `[B, H, S_q, S_k]` bias, promoted
+    /// to rank 4 for a kernel that takes nothing else, keeps its bias.
+    #[test]
+    fn rank4_promotion_keeps_a_bias_mask() {
+        let f = |d: &[usize]| Shape::new(d, DType::F32);
+        let mut g = Graph::new("verify");
+        let q = g.input("q", f(&[1, 2, 8]));
+        let k = g.input("k", f(&[1, 5, 8]));
+        let v = g.input("v", f(&[1, 5, 8]));
+        let bias = g.input("bias", f(&[1, 4, 2, 5]));
+        let a = g.add_node(
+            Op::Attention {
+                num_heads: 4,
+                head_dim: 2,
+                v_head_dim: None,
+                mask_kind: MaskKind::Bias,
+                score_scale: None,
+                attn_logit_softcap: None,
+            },
+            vec![q, k, v, bias],
+            f(&[1, 2, 8]),
+        );
+        g.set_outputs(vec![a]);
+        let out = unfuse(g, &Defaults);
+        let attn: Vec<_> = out
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n.op, Op::Attention { .. }))
+            .collect();
+        assert_eq!(attn.len(), 1);
+        assert_eq!(attn[0].inputs.len(), 4, "the bias input was dropped");
+        assert!(rlx_ir::verify::verify_all(&out).is_empty());
+    }
 }

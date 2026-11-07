@@ -309,24 +309,11 @@ fn assert_exact(got: &[Vec<f32>], want: &[Vec<f32>], what: &str) {
 /// The knobs that would change what a submission or a wait means for a forward
 /// pass, or move these graphs' routing (the shard knobs stripe the arena, which
 /// hosts every copy) — so an operator's environment cannot flip the pins instead
-/// of tripping this guard.
-const GUARDED: [&str; 15] = [
-    "RLX_WGPU_SNAPSHOT",
-    "RLX_BENCH_DISPATCH_ONLY",
-    "RLX_WGPU_ALL_PARAMS_WEIGHT",
-    "RLX_WGPU_HOST_EAGER_H2D",
-    "RLX_DEBUG_NANS",
-    "RLX_WGPU_CONCAT_HOST",
-    "RLX_WGPU_FORCE_HOST",
-    "RLX_WGPU_HOST_MATMUL",
-    "RLX_WGPU_HOST_BUFFER_COPY",
-    "RLX_WGPU_DISCRETE_HOST",
-    "RLX_WGPU_SHARD_CAP_MIB",
-    "RLX_WGPU_SHARD_STAGE_MIB",
-    "RLX_WGPU_SHARD_GPU",
-    "RLX_WGPU_ALLOW_SHARD",
-    common::RUN_REPORT_SWITCH,
-];
+/// of tripping this guard. Derived from the registry; `RLX_WGPU_ONE_OP_PER_PASS`
+/// is this pin's own switch and is the one it supports.
+fn guarded() -> Vec<&'static str> {
+    common::guarded_switches(&["RLX_WGPU_ONE_OP_PER_PASS"])
+}
 
 /// One test fn on purpose — see the module doc.
 #[test]
@@ -335,12 +322,13 @@ fn a_device_route_row_write_rides_the_enclosing_batch_and_the_host_route_still_s
         eprintln!("skip: wgpu unavailable");
         return;
     }
-    for key in GUARDED {
+    for key in guarded() {
         assert!(
             !rlx_ir::env::flag(key),
             "{key} changes the submission/wait shape of a forward pass; unset it to run this pin"
         );
     }
+    common::pin_tuning_cache_off("buffer-copy-batch-join");
     // `RLX_WGPU_ONE_OP_PER_PASS` is the one mode this pin supports: it makes the
     // join inert, which is the reading of the self-submitting shape below.
     let step_by_step = rlx_ir::env::flag("RLX_WGPU_ONE_OP_PER_PASS");

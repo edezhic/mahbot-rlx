@@ -42,22 +42,23 @@ pub struct HwModel {
 }
 
 impl HwModel {
-    /// The constants for this target: chosen by `cfg`, nothing measured.
-    pub const fn platform() -> Self {
-        // Platform-calibrated constants
-        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-        let model = HwModel {
-            neon_flops: 72e9,            // ~72 GFLOP/s NEON FMA throughput (M4 Pro P-core)
-            blas_flops: 1000e9,          // ~1 TFLOP/s AMX peak (effective varies with tile fill)
-            blas_overhead_ns: 500.0,     // ~0.5µs per cblas_sgemm call
-            par_for_overhead_ns: 5000.0, // ~5µs spin-wait dispatch
-            l1_bytes: 65536,             // 64KB L1d
-            l2_bytes: 4 * 1024 * 1024,   // 4MB L2 per core
-            mem_bw: 50.0,                // ~50 GB/s = 50 B/ns
-        };
-
-        #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
-        let model = HwModel {
+    /// The constants for this target: chosen by `cfg`, nothing measured. A
+    /// portable run takes the model a portable build compiles in, so the kernel
+    /// choices (and with them the arithmetic) are its too.
+    pub fn platform() -> Self {
+        #[cfg(all(rlx_cpu_neon, target_vendor = "apple"))]
+        if !crate::config::portable() {
+            return HwModel {
+                neon_flops: 72e9,            // ~72 GFLOP/s NEON FMA throughput (M4 Pro P-core)
+                blas_flops: 1000e9, // ~1 TFLOP/s AMX peak (effective varies with tile fill)
+                blas_overhead_ns: 500.0, // ~0.5µs per cblas_sgemm call
+                par_for_overhead_ns: 5000.0, // ~5µs spin-wait dispatch
+                l1_bytes: 65536,    // 64KB L1d
+                l2_bytes: 4 * 1024 * 1024, // 4MB L2 per core
+                mem_bw: 50.0,       // ~50 GB/s = 50 B/ns
+            };
+        }
+        HwModel {
             neon_flops: 32e9,
             blas_flops: 200e9,
             blas_overhead_ns: 300.0,
@@ -65,16 +66,19 @@ impl HwModel {
             l1_bytes: 32768,
             l2_bytes: 1024 * 1024,
             mem_bw: 30.0,
-        };
-
-        model
+        }
     }
 
     // ── Dispatch decisions ──────────────────────────────────────────
 
     /// Should we use NEON sgemm instead of BLAS for this matrix multiply?
     /// Returns true when BLAS overhead dominates the compute.
+    /// Never under [`rlx_ir::reproducible`]: the calibrated estimate is
+    /// the host's, so which kernel (and summation order) a shape gets would be.
     pub fn prefer_neon_sgemm(&self, m: usize, k: usize, n: usize) -> bool {
+        if rlx_ir::reproducible::reproducible() {
+            return false;
+        }
         let flops = 2.0 * m as f64 * k as f64 * n as f64;
         let blas_time = flops / self.blas_flops + self.blas_overhead_ns * 1e-9;
         let neon_time = flops / self.neon_flops;
@@ -131,11 +135,9 @@ impl HwModel {
     }
 }
 
-/// `HwModel::platform` is `cfg`-chosen constants with nothing probed at runtime,
-/// so there is no lazy cell behind this.
-static MODEL: HwModel = HwModel::platform();
-
 /// Global hardware model singleton.
 pub fn hw_model() -> &'static HwModel {
-    &MODEL
+    use std::sync::OnceLock;
+    static MODEL: OnceLock<HwModel> = OnceLock::new();
+    MODEL.get_or_init(HwModel::platform)
 }

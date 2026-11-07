@@ -134,6 +134,26 @@ fn inputs() -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
 
 use std::collections::BTreeMap;
 
+/// The fixture's `alpha` at the length the graph declares: the per-channel vector
+/// [`inputs`] builds, repeated across the inner axis when the graph declares the
+/// full-shape `[1, C, 1, L]` operand the refusal test asks for. `set_param` checks
+/// a parameter's length against its declared shape, so the fixture has to supply
+/// the shape it wrote.
+fn alpha_values(g: &Graph, per_channel: Vec<f32>) -> Vec<f32> {
+    let declared = g
+        .param_id("alpha")
+        .and_then(|id| g.node(id).shape.num_elements())
+        .unwrap_or(per_channel.len());
+    if declared == per_channel.len() {
+        per_channel
+    } else {
+        per_channel
+            .iter()
+            .flat_map(|&a| std::iter::repeat_n(a, declared / per_channel.len()))
+            .collect()
+    }
+}
+
 /// The same graph with all of its outputs, in graph order.
 fn run_gpu_all(g: Graph, switch: Option<bool>) -> (BTreeMap<&'static str, usize>, Vec<Vec<f32>>) {
     if let Some(on) = switch {
@@ -141,7 +161,12 @@ fn run_gpu_all(g: Graph, switch: Option<bool>) -> (BTreeMap<&'static str, usize>
     }
     let has_bias = g.param_id("bias").is_some();
     let has_conv = g.param_id("conv").is_some();
+    // A fixture built only out of parameters (the parked-addend graph) declares
+    // no `x` input, and `CompiledGraph::run` rejects an input the graph does not
+    // declare.
+    let has_x = g.input_id("x").is_some();
     let (x, alpha, beta, bias) = inputs();
+    let alpha = alpha_values(&g, alpha);
     let mut exe = WgpuExecutable::compile(g);
     exe.set_param("alpha", &alpha);
     exe.set_param("beta", &beta);
@@ -152,7 +177,12 @@ fn run_gpu_all(g: Graph, switch: Option<bool>) -> (BTreeMap<&'static str, usize>
         exe.set_param("conv", &x);
     }
     let kinds = exe.step_kind_counts();
-    (kinds, exe.run(&[("x", &x)]))
+    let declared: Vec<(&str, &[f32])> = if has_x {
+        vec![("x", x.as_slice())]
+    } else {
+        Vec::new()
+    };
+    (kinds, exe.run(&declared))
 }
 
 /// The step kinds one arm compiles to, and its first output. `switch` installs
@@ -167,7 +197,9 @@ fn run_gpu(g: Graph, switch: Option<bool>) -> (BTreeMap<&'static str, usize>, Ve
 fn run_cpu_all(g: Graph) -> Vec<Vec<f32>> {
     let has_bias = g.param_id("bias").is_some();
     let has_conv = g.param_id("conv").is_some();
+    let has_x = g.input_id("x").is_some();
     let (x, alpha, beta, bias) = inputs();
+    let alpha = alpha_values(&g, alpha);
     let mut s = Session::new(Device::Cpu).compile(g);
     s.set_param("alpha", &alpha);
     s.set_param("beta", &beta);
@@ -177,7 +209,12 @@ fn run_cpu_all(g: Graph) -> Vec<Vec<f32>> {
     if has_conv {
         s.set_param("conv", &x);
     }
-    s.run(&[("x", &x)])
+    let declared: Vec<(&str, &[f32])> = if has_x {
+        vec![("x", x.as_slice())]
+    } else {
+        Vec::new()
+    };
+    s.run(&declared)
 }
 
 /// The same graph on the CPU backend, as this file's reference.
@@ -381,7 +418,9 @@ fn a_folded_add_that_is_an_output_keeps_its_step() {
 /// A parked addend takes the fold down: `conv` lives in the weight buffer, whose
 /// tagged offsets are a different byte space from the arena's, so the range guard
 /// cannot answer and refuses. The Add keeps its step, the snake still folds, and
-/// the numbers are the CPU backend's.
+/// the numbers are the CPU backend's. The graph is all parameters and declares no
+/// input, so it is run with none — `CompiledGraph::run` rejects an input the graph
+/// does not declare.
 #[test]
 fn a_parked_addend_declines_the_bias_fold() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
@@ -473,7 +512,10 @@ fn a_grid_past_the_dispatch_cap_keeps_the_five_steps() {
 
 /// A full-shape `alpha` is not the pattern: the kernel reads `alpha[c]` as word
 /// `c` of a `[C]`-long region, so a `[1, C, 1, L]` operand is refused and the
-/// chain keeps its five steps — which still compute the answer.
+/// chain keeps its five steps — which still compute the answer. The fixture
+/// supplies the `C·L` values that shape declares (the per-channel vector repeated
+/// across the inner axis), since `set_param` now checks a parameter's length
+/// against its declared shape.
 #[test]
 fn a_full_shape_alpha_keeps_the_five_steps() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {

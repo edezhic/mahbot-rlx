@@ -51,7 +51,13 @@
 //      key loops as well reads 656 ms; the `part_s` reduce's dependent chain
 //      (below) another ~80 ms. Nothing here is Apple-specific — the same naga
 //      output feeds Vulkan and DX12 — but the ratios are this rig's, and a
-//      backend whose compiler already unrolls would gain less.
+//      backend whose compiler already unrolls would gain less. The expansion is
+//      *not* made redundant by turning that termination guard off at the module
+//      (`kernels::kernel_module` does, for this crate's shaders): at this
+//      kernel's shape the guard on reads 1 333 ms, off 30.6 ms, a hand-written
+//      counted loop 30.2 ms, and the expanded form 11.6 ms — the guard costs
+//      most of the ground, and what is left is the local arrays going to
+//      registers once no loop index survives.
 //   2. The Q/O slices are `vec4<f32>` and the score's dot product is four
 //      independent accumulation chains. One scalar accumulator per row was the
 //      first form of this kernel — a chain of `DPER` dependent FMAs, one per

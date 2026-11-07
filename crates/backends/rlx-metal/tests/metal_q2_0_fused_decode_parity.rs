@@ -150,7 +150,11 @@ fn reference(gate_p: &[u8], up_p: &[u8], down_p: &[u8], r: &[f32]) -> Vec<f32> {
 }
 
 fn check(label: &str) {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
@@ -191,15 +195,16 @@ fn q2_0_fused_decode_mlp_matches_reference() {
 /// carry it. Guards the fallback the fused paths are compared against.
 #[test]
 fn q2_0_unfused_decode_mlp_matches_reference() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
-    // SAFETY: single-threaded test process; read once at first encode.
-    unsafe {
-        std::env::set_var("RLX_METAL_Q2_0_FUSED_DISABLE", "1");
-        std::env::set_var("RLX_METAL_Q2_DUAL_DISABLE", "1");
-    }
+    rlx_ir::env::set("RLX_METAL_Q2_0_FUSED_DISABLE", "1");
+    rlx_ir::env::set("RLX_METAL_Q2_DUAL_DISABLE", "1");
     check("fusions disabled");
 }
 
@@ -207,13 +212,14 @@ fn q2_0_unfused_decode_mlp_matches_reference() {
 /// `q2_0_dot16` replaced. If the two disagree, the rewrite is wrong.
 #[test]
 fn q2_0_scalar_inner_loop_matches_reference() {
-    if rlx_ir::env::skip_unless_device("metal", true, rlx_runtime::is_available(Device::Metal)) {
+    if rlx_ir::env::skip_unless_device(
+        "metal",
+        cfg!(target_os = "macos"),
+        rlx_runtime::is_available(Device::Metal),
+    ) {
         eprintln!("skip: Metal unavailable");
         return;
     }
-    // SAFETY: single-threaded test process; read once at first encode.
-    unsafe {
-        std::env::set_var("RLX_METAL_Q2_0_SCALAR", "1");
-    }
+    rlx_ir::env::set("RLX_METAL_Q2_0_SCALAR", "1");
     check("scalar inner loop");
 }

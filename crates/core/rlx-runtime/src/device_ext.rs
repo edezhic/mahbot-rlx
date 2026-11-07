@@ -27,12 +27,16 @@ pub(crate) const DEVICE_PRIORITY: &[Device] = &[
     Device::Metal,
     Device::Ane,
     Device::Hexagon,
-    Device::Xdna,
     Device::Egpu,
     Device::Gpu,
     Device::Vulkan,
     Device::DirectX,
     Device::Cpu,
+    // After the CPU: an XDNA 1 (Phoenix) NPU measured 1.9-2.7x slower than
+    // same-precision CPU bf16 on transformer workloads (xdna-npu-toolkit), and
+    // rlx runs f32 matmuls there int8-quantized. It is a power/offload target,
+    // picked by asking for it (or an explicit `prefer`), not for throughput.
+    Device::Xdna,
 ];
 
 /// Check whether `device` has a compiled-in backend or has been
@@ -91,10 +95,26 @@ pub fn trim_accelerator_arena_pool(device: Device) {
 /// on a headless box where the feature IS on and there is simply no adapter.
 pub fn feature_compiled(device: Device) -> bool {
     match device {
-        Device::Cpu => true,
-        Device::Metal => cfg!(feature = "metal"),
+        // Was `true` unconditionally while `is_available` checks the feature,
+        // so a build without `cpu` panicked with "the `cpu` feature is enabled
+        // but no such device was found" — the opposite of the fix it needed.
+        Device::Cpu => cfg!(feature = "cpu"),
+        // Host-gated like `is_available`'s fallback below: workspace feature
+        // unification turns `metal`/`coreml` on in a Linux build while the
+        // backend crates themselves are Apple-only dependencies. Reporting
+        // them as compiled there made `skip_unless_device` panic under
+        // `RLX_REQUIRE_DEVICE` on Linux rigs, and `cargo rlx doctor` call a
+        // backend the binary does not contain "unavailable".
+        Device::Metal => cfg!(all(
+            feature = "metal",
+            target_vendor = "apple",
+            not(target_os = "watchos")
+        )),
         Device::Mlx => cfg!(feature = "mlx"),
-        Device::Ane => cfg!(feature = "ane"),
+        Device::Ane => cfg!(all(
+            any(feature = "coreml", feature = "ane"),
+            target_vendor = "apple"
+        )),
         Device::Cuda => cfg!(feature = "cuda"),
         Device::Rocm => cfg!(feature = "rocm"),
         Device::Xdna => cfg!(feature = "xdna"),
@@ -242,6 +262,23 @@ pub fn detected_unavailable_devices() -> Vec<(Device, String)> {
     out
 }
 
+/// Why a compiled-in `device` is not available, when its backend can say
+/// (XDNA, eGPU: the env var, path, library or toolchain that is missing).
+/// `None` for backends without a diagnostic. Feeds the [`crate::Session`]
+/// "not available" panic, which otherwise could only say "no device found".
+pub fn unavailable_reason(device: Device) -> Option<String> {
+    let _ = device;
+    #[cfg(feature = "xdna")]
+    if device == Device::Xdna {
+        return Some(rlx_xdna::diagnostic());
+    }
+    #[cfg(feature = "egpu")]
+    if device == Device::Egpu {
+        return Some(rlx_egpu::diagnostic());
+    }
+    None
+}
+
 /// Intersection of [`available_devices`] and [`supports_graph`]. Use with
 /// [`crate::GraphDevices`] or [`crate::DevicePolicy`] to restrict the set.
 pub fn devices_for(graph: &Graph) -> Vec<Device> {
@@ -253,9 +290,14 @@ pub fn devices_for(graph: &Graph) -> Vec<Device> {
 /// Probes `DEVICE_PRIORITY` in order (TPU → CUDA → ROCm → MLX → Metal → …
 /// → CPU). Use this when you want a sensible default `Session` target without
 /// building a graph first. For workload-specific selection, prefer
-/// [`crate::cost::fastest_device_for`].
+/// [`crate::cost::fastest_device_for`]. Under [`rlx_ir::reproducible`] it is
+/// the CPU: the host's GPUs do not pick.
 pub fn fastest_device() -> Device {
-    fastest_among(&available_devices())
+    let available = available_devices();
+    if rlx_ir::reproducible::reproducible() && available.contains(&Device::Cpu) {
+        return Device::Cpu;
+    }
+    fastest_among(&available)
 }
 
 /// Pick the highest-priority entry from `candidates` (see `DEVICE_PRIORITY`).
@@ -757,5 +799,18 @@ mod tests {
             assert!(is_available(d));
             assert!(supports_graph(d, &g));
         }
+    }
+}
+
+#[cfg(test)]
+mod feature_compiled_tests {
+    use super::*;
+
+    /// The CPU needs no hardware probe, so "compiled" and "available" must
+    /// agree; when they disagreed the panic message named the wrong fix.
+    #[test]
+    fn cpu_feature_compiled_matches_availability() {
+        assert_eq!(feature_compiled(Device::Cpu), is_available(Device::Cpu));
+        assert_eq!(feature_compiled(Device::Cpu), cfg!(feature = "cpu"));
     }
 }

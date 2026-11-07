@@ -10,15 +10,19 @@
 
 pub mod chat;
 pub mod detokenize;
+pub mod model_codec;
 pub mod sampling;
 pub mod tokenizer;
 pub mod tool_parse;
+pub mod tool_plan;
 
 pub use chat::{
     ChatMessage, ChatRenderOptions, ChatTemplate, ChatTemplateSource, auto_chat_template,
 };
 pub use detokenize::{StreamingDetokenizer, incremental_emit};
+pub use model_codec::{ModelTokenizer, install_model_tokenizer, model_tokenizer};
 pub use rlx_runtime::SampleOpts;
 pub use sampling::{argmax, sample_next};
 pub use tokenizer::{TokenizerHandle, decode_ids, load_tokenizer};
 pub use tool_parse::{ToolCall, ToolFormat};
+pub use tool_plan::{DirectAnswer, PlannedCall, PlannedStep, RoundReview, ToolIntent, ToolPlan};

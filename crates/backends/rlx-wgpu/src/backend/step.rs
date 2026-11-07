@@ -18,11 +18,12 @@ use crate::kernels::{
     GatherBwdParams, GatherPackedParams, GatherParams, GroupNormBwdParams, GroupNormParams,
     GroupedMatmulParams, GruParams, Im2Col2dParams, IndexingNdParams, LayerNorm2dParams,
     LayerNormBwdParams, LayerNormParams, LstmParams, Mamba2Params, MatmulQkvParams,
-    MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams, NarrowSplitParams, NormRopeParams,
-    Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QuantI8Params,
-    ReduceParams, ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams,
-    SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams,
-    SceParams, SelectiveScanParams, SnakeBetaParams, SoftmaxParams, TopKParams, TransposeParams,
+    MatmulStridedParams, MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams,
+    NarrowSplitParams, NormRopeParams, Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams,
+    QMatMulParams, QuantI8Params, ReduceParams, ResizeNearest2xParams, ReverseParams,
+    RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, RoundToFormatParams, SampleParams,
+    ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams, SceParams,
+    SelectiveScanParams, SnakeBetaParams, SoftmaxParams, TopKParams, TransposeParams,
     UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
 };
 
@@ -45,9 +46,10 @@ pub(crate) struct CastF32ToF16Params {
     pub src_off: u32,
     pub len: u32,
     /// f16-element offset into whichever f16 buffer this step binds: the weight
-    /// mirror, where it equals `src_off` (the mirror's index is the arena's), or
-    /// the dense attention route's own operand buffer, where it is that buffer's
-    /// region start.
+    /// mirror, whose window starts at `f16_base_elem` rather than at element 0, so
+    /// the mirror index is `src_off - f16_base_elem`; or the dense attention
+    /// route's own operand buffer, whose regions are packed from element 0, so the
+    /// index is that buffer's region start.
     pub dst_off: u32,
     /// A scalar applied on the way through, bitcast: `0` is "none" (the value is
     /// written as it is). The dense attention route folds the score scale into
@@ -1065,9 +1067,21 @@ pub(crate) enum Step {
         theta: f32,
         repeat_factor: u32,
     },
+    /// Native WGSL `Op::ResizeNearest2x` (NCHW nearest 2× upsample).
+    ResizeNearest2x {
+        params: ResizeNearest2xParams,
+    },
     /// Native WGSL `Op::AxialRope2d`.
     AxialRope2d {
         params: AxialRope2dParams,
+    },
+    /// Native WGSL `Op::RoundToFormat`.
+    RoundToFormat {
+        params: RoundToFormatParams,
+    },
+    /// Native WGSL `Op::DoubleSingle`.
+    DoubleSingle {
+        params: crate::kernels::DoubleSingleParams,
     },
     /// Native WGSL `Op::FakeQuantize` Fixed (scale input).
     FakeQuantizeFixed {
@@ -1154,8 +1168,9 @@ pub(crate) enum Step {
     /// reference, and writes the result back. See `crate::custom_host`.
     CustomHost {
         name: String,
-        in_specs: Vec<(u32, rlx_ir::Shape)>, // (byte_off, shape)
-        out_byte_off: u32,
+        // `usize`, not `u32`: a parked param's offset carries `WEIGHT_BUF_TAG`.
+        in_specs: Vec<(usize, rlx_ir::Shape)>, // (byte_off, shape)
+        out_byte_off: usize,
         out_shape: rlx_ir::Shape,
         attrs: Vec<u8>,
     },
@@ -1300,6 +1315,11 @@ pub(crate) enum Step {
     MatmulQkv {
         params: MatmulQkvParams,
         kind: MatmulQkvKind,
+    },
+    /// Batched matmul reading A / B through strided views
+    /// (`matmul_coop_f32_strided`); lowered from `crate::unfuse::STRIDED_BMM`.
+    MatmulStrided {
+        params: MatmulStridedParams,
     },
     /// `fused_residual_ln_tee` — does (Add → LN) but writes the sum to
     /// a separate arena slot (the eliminated Add's old slot). Fires
@@ -1446,8 +1466,11 @@ impl Step {
             | Step::Conv3dBackwardInput { .. }
             | Step::Conv3dBackwardWeight { .. }
             | Step::AxialRope2d { .. }
+            | Step::ResizeNearest2x { .. }
             | Step::FakeQuantizeFixed { .. }
             | Step::FakeQuantizePerBatch { .. }
+            | Step::RoundToFormat { .. }
+            | Step::DoubleSingle { .. }
             | Step::GroupNormBackwardInput { .. }
             | Step::GroupNormBackwardGamma { .. }
             | Step::GroupNormBackwardBeta { .. }
@@ -1526,6 +1549,8 @@ impl Step {
             // strides are baked at compile time, scaling m only adjusts
             // the per-thread bound check.
             Step::MatmulQkv { .. } => true,
+            // Strides are fixed at compile time from the full shapes.
+            Step::MatmulStrided { .. } => false,
             Step::CastF32ToF16 { .. } => true,
             // Attention: WGSL kernel uses `seq_q_stride`/`seq_k_stride`
             // (full extent, set at compile time) for per-(batch, head)
@@ -1757,7 +1782,10 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::ArgReduceHost { .. } => "argreduce_host",
         Step::AxialRope2dHost { .. } => "axial_rope2d_host",
         Step::AxialRope2d { .. } => "axial_rope2d",
+        Step::ResizeNearest2x { .. } => "resize_nearest2x",
         Step::FakeQuantizeFixed { .. } => "fake_quantize_fixed",
+        Step::RoundToFormat { .. } => "round_to_format",
+        Step::DoubleSingle { .. } => "double_single",
         Step::FakeQuantizePerBatch { .. } => "fake_quantize_perbatch",
         Step::GroupNormBackwardInput { .. } => "group_norm_backward_input",
         Step::GroupNormBackwardGamma { .. } => "group_norm_backward_gamma",
@@ -1829,6 +1857,7 @@ pub(crate) fn step_name(step: &Step) -> &'static str {
         Step::AdaLayerNormBackward { .. } => "ada_layer_norm_backward",
         Step::GatedResidualBackward { .. } => "gated_residual_backward",
         Step::MatmulQkv { .. } => "matmul_qkv",
+        Step::MatmulStrided { .. } => "matmul_strided",
         Step::ElementwiseRegion { .. } => "elementwise_region",
         Step::BatchElementwiseRegion { .. } => "batch_elementwise_region",
     }
@@ -2004,9 +2033,14 @@ pub(crate) fn step_needs_pass_flush(step: &Step, prev: &Step) -> bool {
 /// * `mel_then_device` (`[binary, log_mel_host, binary]`): **exit 101 in <0.1 s**, panic
 ///   `src/backend/run.rs:931:57: index out of bounds: the len is 2 but the index is 2` —
 ///   the later device step's own uniform write runs past the vector.
-/// * `mel_then_argmax` (`[binary, log_mel_host, argreduce_host]`): **returned**, its
+/// * `mel_then_argmax` (`[binary, log_mel_host, wgpu_gpu_kernel]`): **returned**, its
 ///   consumer reading 24 zeros for the mel where the host log-mel of that spectrum is
-///   finite (1.016…1.483), and an argmax of `[0,0,0]` where the host's is `[7,7,7]`.
+///   finite (1.016…1.483), and an argmax of `[0,0,0]` where the host's is `[7,7,7]` —
+///   the reading this fixture gave while `ArgMax` lowered to `Step::ArgReduceHost`
+///   unconditionally. It now lowers to the builtin arg-reduce GPU kernel — a *device*
+///   step, since the operand and the output share one arena window — so the arrangement
+///   is `mel_then_device`'s with that kernel in place of the `binary`, and the refusal
+///   names the kernel.
 /// * `device_then_mel` under `RLX_WGPU_ONE_OP_PER_PASS=1` and under
 ///   `RLX_WGPU_SNAPSHOT=1`: **never returned**, killed at a 40 s bound; the snapshot run
 ///   printed its step-0 line and then stalled.

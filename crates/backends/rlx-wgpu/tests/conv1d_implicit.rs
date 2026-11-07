@@ -208,13 +208,7 @@ fn route_switches() {
     rlx_ir::env::set("RLX_WGPU_CONV_IM2COL", "1");
     rlx_ir::env::set("RLX_WGPU_CONV_IMPLICIT", "1");
     rlx_ir::env::set("RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL", "16");
-    rlx_ir::env::set(
-        "RLX_GPU_TUNING_CACHE",
-        std::env::temp_dir()
-            .join("rlx-conv1d-implicit-absent.tsv")
-            .to_string_lossy()
-            .into_owned(),
-    );
+    common::pin_tuning_cache_off("conv1d-implicit");
 }
 
 /// The two guards every cell here shares: an adapter at all, and one that can

@@ -37,8 +37,15 @@ throttle-warn:
 # Build the whole workspace (release) — `--workspace` is explicit, not
 # decorative: a bare `cargo build` here means this fork's default contour,
 # which excludes the backends it does not develop (see `default-members` in
-# Cargo.toml). A gate that is meant to cover the whole set has to say so.
+# Cargo.toml). `build-workspace` is the whole-set gate, run once per upstream
+# sync rather than on every routine build.
 build:
+    cargo build --release
+
+# Every member, including the backends and the embedded crates this fork does
+# not build routinely. Slow and toolchain-dependent: the sync gate, not a
+# development loop.
+build-workspace:
     cargo build --release --workspace
 
 # Build with everything turned on (Metal, kernel-trace, nan-check).
@@ -49,6 +56,11 @@ build-all:
 # Requires `git submodule update --init rlx-mlx-sys/vendor/mlx`.
 build-mlx:
     cargo build --release -p rlx-mlx
+
+# Move vendor/mlx to an upstream ref (default: newest release tag; `main` for
+# the tip) and re-apply rlx-mlx-sys/patches. `--build` builds rlx-mlx-sys after.
+update-mlx *ARGS:
+    {{justfile_directory()}}/crates/backends/rlx-mlx-sys/scripts/update-mlx.sh {{ARGS}}
 
 # Run rlx-mlx tests (matmul+add parity check, both eager and lazy modes).
 test-mlx:
@@ -300,6 +312,11 @@ test:
         JOBS=$(( CPUS < 4 ? CPUS : 4 ))
         cargo test --release -j "$JOBS"
     else
+        # One test target that fails to compile aborts the whole workspace
+        # run, `--no-fail-fast` or not — on the Linux rig that was seven
+        # ungated Apple-only tests, and zero tests ran. Build every target
+        # first so the report names all of them.
+        cargo build --release --tests --keep-going -j "$CPUS"
         cargo test --release -j "$CPUS" -- --test-threads="$CPUS"
     fi
     # The default run builds each selected crate with its DEFAULT features, so
@@ -308,6 +325,47 @@ test:
     # is the case in tree; keep it in the gate.
     cargo test --release -p rlx-lbm --features ir,backend-tests
     just test-debug-verifier restricted
+
+# Every member, once per upstream sync (see `docs/fork-sync.md`): the whole-set
+# counterpart of `test`. No package selection, so the backends and the embedded
+# crates are compiled and run here and nowhere else. Three things it does not do:
+# `cargo test --workspace` builds each package with its DEFAULT features, so a
+# target behind `required-features` is still skipped — `test-gpu` and the
+# per-backend recipes are what build those; `rlx-mlx-sys` / `rlx-mlx` are excluded
+# because this fork's contour does not ship the MLX backend, which is a permanent
+# decision and not a reading of the checkout — the vendored submodule being
+# present does not put them back; and six of upstream's own tests need a dataset
+# or a toolchain this host does not have, so they are skipped by name rather than
+# left to redden the gate. A gate that is red out of the box is not a gate: a sync
+# reads the red as a regression and chases it.
+#
+# `--skip` matches a test *name*, not a file, which is why the list below is
+# six names rather than three targets. Each carries what it wants in the comment
+# beside it; run one by hand on a rig that has the prerequisite.
+# `--no-fail-fast` so anything else still reports.
+test-workspace:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CPUS={{cpus}}
+    excl="--exclude rlx-mlx-sys --exclude rlx-mlx"
+    skip=""
+    # MNIST IDX files at `RLX_MNIST_DIR`.
+    skip="$skip --skip audit_pair_switch_graft_and_answer"
+    skip="$skip --skip read_tasks_hide_the_answer_and_score_it"
+    skip="$skip --skip steer_task_scores_both_halves"
+    # A Ruby whose `Fiddle` has `TYPE_INT32_T`.
+    skip="$skip --skip ruby_binding_tests_and_examples"
+    # A Swift compiler that can type-check the examples.
+    skip="$skip --skip the_swift_examples_run_against_the_c_abi"
+    skip="$skip --skip the_swift_test_suite_passes"
+    if [[ "$(uname -s)" == Darwin ]]; then
+        JOBS=$(( CPUS < 4 ? CPUS : 4 ))
+        cargo test --release -j "$JOBS" --workspace $excl --no-fail-fast -- $skip
+    else
+        cargo build --release --workspace --tests --keep-going $excl -j "$CPUS"
+        cargo test --release -j "$CPUS" --workspace $excl --no-fail-fast -- \
+            --test-threads="$CPUS" $skip
+    fi
 
 # Run the IR-verifier-bearing tests in a DEBUG profile.
 #
@@ -352,11 +410,18 @@ test-debug-verifier mode="full":
     cargo test -p mahbot-rlx-runtime --features "$FEATURES" -j 4 --no-fail-fast
 
 # GPU backends + runtime feature tests for the host platform.
-# Darwin: Metal, MLX, wgpu, Vulkan (MoltenVK), `cpu,apple` runtime, third-order.
-# Linux: wgpu, Vulkan, optional CUDA/ROCm via `test-third-order-gpu` / `test-rocm`.
+# Darwin: Metal, wgpu, CoreML, third-order.
+# Linux: wgpu, optional CUDA/ROCm via `test-third-order-gpu` / `test-rocm`.
+# MLX is not here: this fork's contour does not ship it, so neither this recipe
+# nor `test-workspace` builds `-p rlx-mlx` whatever the checkout contains.
 # When `$RLX_HF_CACHE` (or `~/.cache/rlx/hf`) already holds an mlx-community
 # checkout, Metal's `metal_hf_mlx_one_linear` runs without `RLX_HF_MLX=1`.
 # Cold download: `RLX_HF_MLX=1 just test-gpu`.
+#
+# The Vulkan rows are not here: they need a Vulkan ICD, which this fork does not
+# ship and which `ci-workspace` cannot assume, so they live in `test-vulkan`
+# instead. That keeps this recipe — and the whole-set gate that runs it — green
+# on a host with only Metal and wgpu.
 test-gpu:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -367,24 +432,22 @@ test-gpu:
     case "$(uname -s)" in
       Darwin)
         cargo test --release -p rlx-metal --features backend-tests -j "$JOBS"
-        cargo test --release -p rlx-mlx --features backend-tests -j "$JOBS"
         cargo test --release -p mahbot-rlx-wgpu --features backend-tests -j "$JOBS"
-        cargo test --release -p rlx-vulkan --features backend-tests -j "$JOBS"
-        cargo test --release -p mahbot-rlx-runtime --features cpu,apple,vulkan,backend-tests \
-          --test vulkan_parity --test vulkan_dequant_grouped_matmul --test vulkan_dequant_moe_weights
+        # Apple backends spelled out rather than as `apple`, which implies `mlx`:
+        # this fork does not ship the MLX backend, so the test gates do not
+        # select it (see the `exclude` note in Cargo.toml and `docs/fork-sync.md`
+        # §3 — the whole-set build and lint recipes still cover the members).
+        # Metal, portable-wgpu-on-Metal and CoreML are what `apple` adds on top.
         # `-p rlx-sparse`: this row runs the whole rlx-runtime suite, including
-        # the `*_sparse_ops` targets that register rlx-sparse's Metal/MLX
-        # kernels. `apple` covers those backends for the rlx-runtime half; the
-        # extra `metal,mlx` tokens are for the rlx-sparse half of `-p`, which
-        # needs its own features (see rlx-runtime's `metal` feature comment).
-        cargo test --release -p mahbot-rlx-runtime -p rlx-sparse --features cpu,apple,metal,mlx,backend-tests -j "$JOBS"
-        just test-mlx
+        # the `*_sparse_ops` targets that register rlx-sparse's Metal kernels.
+        # The `metal` token is for the rlx-sparse half of `-p`, which needs its
+        # own features (see rlx-runtime's `metal` feature comment).
+        cargo test --release -p mahbot-rlx-runtime -p rlx-sparse --features cpu,metal,gpu,coreml,backend-tests -j "$JOBS"
         just test-third-order-gpu
         just check-corpus-device
         ;;
       *)
         cargo test --release -p mahbot-rlx-wgpu --features backend-tests -j "$CPUS" -- --test-threads="$CPUS"
-        cargo test --release -p rlx-vulkan --features backend-tests -j "$CPUS" -- --test-threads="$CPUS"
         cargo test --release -p mahbot-rlx-runtime --features cpu,gpu,backend-tests -j "$CPUS" -- --test-threads="$CPUS"
         just test-third-order-gpu
         if cargo check -p mahbot-rlx-runtime --features cpu,cuda,gpu --quiet 2>/dev/null; then
@@ -393,6 +456,28 @@ test-gpu:
         fi
         just test-rocm
         just check-corpus-device
+        ;;
+    esac
+
+# The Vulkan rows, on their own: `rlx-vulkan` is its own `ash` instance with
+# embedded SPIR-V, distinct from wgpu's Vulkan adapter, and it needs a Vulkan ICD
+# registered (`MoltenVK` on macOS, the loader alone is not enough). Deliberately
+# not in `ci-workspace` — a whole-set gate has to be green on a host without one.
+# Run it on a rig: `just test-gpu test-vulkan`.
+test-vulkan:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    CPUS={{cpus}}
+    JOBS=$(( CPUS < 4 ? CPUS : 4 ))
+    export RLX_REQUIRE_DEVICE="{{require_device}}"
+    case "$(uname -s)" in
+      Darwin)
+        cargo test --release -p rlx-vulkan --features backend-tests -j "$JOBS"
+        cargo test --release -p mahbot-rlx-runtime --features cpu,metal,gpu,coreml,vulkan,backend-tests \
+          --test vulkan_parity --test vulkan_dequant_grouped_matmul --test vulkan_dequant_moe_weights
+        ;;
+      *)
+        cargo test --release -p rlx-vulkan --features backend-tests -j "$CPUS" -- --test-threads="$CPUS"
         ;;
     esac
 
@@ -445,23 +530,6 @@ js-lora *ARGS:
 #        just js FEATURES=metal ... -- extra args for the script
 js SCRIPT *ARGS:
     cargo run -q -p rlx-js --features "{{env('FEATURES', 'cpu,gguf')}}" --bin rlx-js -- {{SCRIPT}} {{ARGS}}
-
-# pyrlx: build extension into crates/bindings/pyrlx/.venv (first run) and run pytest.
-test-pyrlx:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd "{{justfile_directory()}}/crates/bindings/pyrlx"
-    # Set up on what is actually MISSING, not on whether `.venv/` exists. The
-    # directory test meant a venv left half-built by an interrupted run — or one
-    # predating a dependency being added to this list — was never repaired, and
-    # the recipe then failed forever on that machine with `No module named
-    # pytest`. That is how `just ci` was failing here.
-    [[ -x .venv/bin/python ]] || python3 -m venv .venv
-    .venv/bin/python -m pytest --version >/dev/null 2>&1 \
-        || .venv/bin/pip install -q maturin numpy pytest safetensors
-    .venv/bin/python -c 'import pyrlx' >/dev/null 2>&1 \
-        || .venv/bin/maturin develop --features cpu,gguf-convert
-    .venv/bin/python -m pytest tests/ -q
 
 # PyTorch → RLX: convert a torch model file to an RLX bundle + generated crate.
 # `MODEL` is a .py exposing `model` + `example_inputs` (or get_model()/build()).
@@ -524,12 +592,15 @@ fmt:
 # feature-gated code has landed unlinted here before. `lint-features` covers the
 # combinations this host can actually build.
 lint: lint-features
-    # `--workspace`: this gate is meant to cover the whole set, and the default
-    # selection is only this fork's contour (see `default-members` in
-    # Cargo.toml). Naming no package would silently narrow the lint too.
+    # Naming no package means this fork's default contour (see
+    # `default-members` in Cargo.toml); `lint-workspace` is the whole-set gate.
     # `backend-tests`: the default test selection is a fast smoke set, and
     # `required-features` hides every gated target from `--all-targets` too —
     # without it they would not be type-checked by `just lint` at all.
+    cargo clippy --all-targets --features backend-tests -- -D warnings
+
+# Every member, once per upstream sync (see `docs/fork-sync.md`).
+lint-workspace: lint-features
     cargo clippy --workspace --all-targets --features backend-tests -- -D warnings
 
 # Clippy the feature combinations `--all-targets` alone cannot reach.
@@ -557,8 +628,8 @@ lint-features:
     }
     case "$(uname -s)" in
       Darwin)
-        lint "rlx-runtime cpu,apple,vulkan" -p mahbot-rlx-runtime --features cpu,apple,vulkan,backend-tests
-        lint "rlx-corpus apple,vulkan"      -p rlx-corpus  --features apple,vulkan,backend-tests
+        lint "rlx-runtime cpu,metal,coreml,gpu,vulkan" -p mahbot-rlx-runtime --features cpu,metal,coreml,gpu,vulkan,backend-tests
+        lint "rlx-corpus metal,coreml,gpu,vulkan"      -p rlx-corpus  --features metal,coreml,gpu,vulkan,backend-tests
         lint "rlx-ir test-support"          -p mahbot-rlx-ir      --features test-support,backend-tests
         # The AMX/SME/BNNS paths are opt-in and default-OFF, so nothing else
         # here compiles them. `amx-bnns` shipped with a Result-vs-Option arm
@@ -634,9 +705,154 @@ gen-op-coverage:
 check-op-coverage:
     python3 scripts/gen-op-coverage.py --check
 
+# Regenerate the bindings derived from rlx-bind's op table: the C ABI glue
+# (rlx-capi/src/graph_ops.rs), rlx.h, Swift's GraphOps.swift, the Graph
+# section of pyrlx's .pyi, and docs/bindings-api.md. rlx-js and pyrlx expand
+# the table at compile time and need no step. See docs/bindings.md.
+gen-bindings:
+    cargo run -q -p rlx-bindgen
+
+# Standalone binding releases (docs/releasing-bindings.md). The workspace
+# version in Cargo.toml is the one source: stamp it into every binding
+# manifest after a bump, and `check-binding-versions` (in `just ci-workspace`)
+# fails on drift.
+sync-binding-versions:
+    python3 scripts/bindings_release.py versions
+
+check-binding-versions:
+    python3 scripts/bindings_release.py versions --check
+
+# Package every binding with prebuilt librlx_capi under natives/<platform>/
+# (the release workflow does this for five platforms). Locally, for this host:
+#   just package-bindings              # builds rlx-capi, stages into ./dist
+package-bindings natives="" out="dist":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    natives="{{natives}}"
+    if [[ -z "$natives" ]]; then
+      cargo build --release -p rlx-capi
+      case "$(uname -s)-$(uname -m)" in
+        Darwin-arm64) plat=macos-arm64 ;; Darwin-x86_64) plat=macos-x64 ;;
+        Linux-aarch64) plat=linux-arm64 ;; Linux-x86_64) plat=linux-x64 ;;
+        *) echo "unknown host; pass natives=<dir>" >&2; exit 1 ;;
+      esac
+      natives="$(mktemp -d)"
+      mkdir -p "$natives/$plat"
+      cp target/release/librlx_capi.* "$natives/$plat/"
+    fi
+    python3 scripts/bindings_release.py stage --natives "$natives" --out {{out}} --build
+
+# Fail if any generated binding is stale (an op-table or rlx-capi change
+# without `just gen-bindings`).
+check-bindings:
+    cargo run -q -p rlx-bindgen -- --check
+
+# Every generated FFI binding (Go, Java, C#, Ruby, Julia, Zig, C++, Node,
+# Kotlin, Dart, Lua, Octave, R, PHP, Nim, D, V, Haskell, OCaml, Elixir, Odin):
+# its tests and its five examples, against a fresh librlx_capi. A language
+# without a local toolchain is skipped, or with RLX_TEST_DOCKER=1 runs in its
+# container image (after `just linux-capi-volume`).
+test-ffi-bindings:
+    cargo test -p rlx-capi --test ffi_languages -- --test-threads=1
+
+# A Linux build of librlx_capi (and the reference model plugin) in the
+# `rlx-linux-target` Docker volume, for the container runs of
+# test-ffi-bindings (RLX_TEST_DOCKER=1).
+linux-capi-volume:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    lock="$(mktemp)"; cp Cargo.lock "$lock"
+    docker run --rm -v "$PWD":/src:ro -v "$lock":/src/Cargo.lock -v rlx-linux-target:/target \
+        -v rlx-cargo-registry:/usr/local/cargo/registry -w /src -e CARGO_TARGET_DIR=/target \
+        rust:latest cargo build -p rlx-capi -p rlx-model-plugin
+    rm -f "$lock"
+
+# Package the C ABI as RLX.xcframework (iOS + macOS, Metal) for Swift apps,
+# then run the Swift test suite on it. See crates/bindings/rlx-swift/README.md.
+swift-xcframework:
+    ios/build-xcframework.sh --capi --apple
+    RLX_XCFRAMEWORK=1 swift test --package-path crates/bindings/rlx-swift
+
 # Print the curated RLX_* environment catalog (high-signal options only).
 env-catalog:
     cargo run -q -p mahbot-rlx-ir --example env_catalog
+
+# rlx-libm's ports against musl's independent algorithms (the real `libm`
+# crate). A standalone workspace: rlx patches crates.io's `libm` with
+# rlx-libm (`crates/numerics/libm-shim`), so the workspace has only that one.
+test-libm-vs-musl:
+    CARGO_TARGET_DIR=target/vs-musl cargo test --release --manifest-path crates/numerics/rlx-libm/tools/vs-musl/Cargo.toml
+
+# rlx-libm against glibc 2.43 in every configuration the workspace `cargo test`
+# skips: no_std, `export-glibc` (std's float methods are the ports), the
+# Apple reference (`libm`), plus the musl second opinion. The hashed vectors
+# (`tests/glibc_2_43_vectors.rs`) cover every exported function on both
+# x86-64 and aarch64 glibc and fail on an export without vectors.
+test-libm: test-libm-vs-musl
+    cargo test --release -p rlx-libm
+    cargo test --release -p rlx-libm --no-default-features
+    cargo test --release -p rlx-libm --features export-glibc
+    cargo test --release -p rlx-libm --features libm,export-glibc
+    cargo test --release -p libm
+
+# Every one-argument f32 port on all 2^32 inputs against the stored glibc
+# hashes (x86-64 and aarch64), on any OS; minutes on every core. Regenerate
+# the hashes on Linux with `tools/glibc-exhaustive` (it lists mismatches).
+test-libm-exhaustive:
+    cargo test --release -p rlx-libm --test f32_exhaustive -- --ignored --test-threads=1 --nocapture
+
+# rlx-fpga once claimed `no_std` while depending on std-only rlx-ir, and no
+# gate built it that way, so nothing noticed (GitHub issue #7).
+# no_std crates (rlx-ir core, rlx-cortexm, rlx-fpga) build for bare metal + host tests
+check-no-std:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    t=thumbv7em-none-eabihf
+    rustup target list --installed | grep -qx "$t" || rustup target add "$t"
+    cargo clippy -p mahbot-rlx-ir -p rlx-cortexm -p rlx-fpga -p rlx-mcu --no-default-features --target "$t" -- -D warnings
+    # `rlx-micro` is checked with its defaults, not without: its halting
+    # `#[panic_handler]` is the `panic-handler` default feature, and a bare-metal
+    # staticlib without one fails codegen — which is the gate working, not a defect
+    # to silence with an allow.
+    cargo clippy -p rlx-micro --target "$t" -- -D warnings
+    # Host side: every test/example target must still build (std-only ones gate
+    # themselves on the `std` feature) and the no_std library tests must pass.
+    # rlx-ir's integration tests use the full IR, so only its unit tests run here.
+    cargo clippy -p rlx-fpga --no-default-features --all-targets -- -D warnings
+    cargo clippy -p mahbot-rlx-ir --no-default-features --lib -- -D warnings
+    cargo clippy -p mahbot-rlx-ir --no-default-features --lib --profile test -- -D warnings
+    cargo test -p rlx-fpga --no-default-features
+    cargo test -p mahbot-rlx-ir --no-default-features --lib
+
+# README Rust examples as doctests (`crates/rlx`'s `ReadmeDoctests`): the
+# first code a reader copies must compile and give the numbers it claims.
+check-readme:
+    cargo test -p rlx --doc --features cpu,tensor,optim
+
+# Known-failures lists (`tests/known_failures/*.txt`, see rlx_ir::known_failures).
+#   just known-failures list
+#   RLX_KNOWN_FAILURES_REPORT=/tmp/kf.jsonl just test-gpu
+#   just known-failures update /tmp/kf.jsonl --issue owner/repo#N
+known-failures *args:
+    python3 scripts/known-failures.py {{args}}
+
+# Toolchain version matrix (scripts/toolchain_matrix.toml): every supported
+# external toolchain version, each on its rig in a fresh TMPDIR.
+#   just toolchain-matrix                 # run all, print a table
+#   just toolchain-matrix --only xdna     # one device or component
+#   just toolchain-matrix --update        # record results in tested_toolchains.tsv
+toolchain-matrix *args:
+    python3 scripts/toolchain_matrix.py {{args}}
+
+# Exit 1 when an upstream toolchain (mlir-aie, XRT, …) has a release newer than
+# anything the matrix has tested — run it nightly / before a release.
+toolchain-upstream:
+    python3 scripts/toolchain_matrix.py --upstream
+
+# Regenerate docs/known-issues.md from rlx-runtime's known-issue table
+# (`doctor/known_issues.rs`); a unit test fails while it is stale.
+gen-known-issues:
+    cargo run -q -p rlx-check --bin cargo-rlx -- doctor --known --markdown > docs/known-issues.md
 
 # Regenerate docs/rlx-env-vars.md from the env registry (+ leftover mentions).
 gen-rlx-env-vars:
@@ -662,8 +878,13 @@ check-corpus-device:
     set -euo pipefail
     export RLX_REQUIRE_DEVICE="{{require_device}}"
     case "$(uname -s)" in
-      Darwin) FEATURES="apple,vulkan" ;;
-      *)      FEATURES="gpu,vulkan" ;;
+      # `apple` would imply `mlx`, which this fork does not ship, and `vulkan`
+      # needs an ICD it does not ship either — so the Apple backends are named
+      # one by one. `metal` and `coreml` are not `default-members`; they are here
+      # because `test-gpu`'s Darwin row builds them, and the once-per-sync device
+      # gate should cover what the routine GPU gate builds.
+      Darwin) FEATURES="metal,coreml,gpu" ;;
+      *)      FEATURES="gpu" ;;
     esac
     cargo test -p rlx-corpus --features "$FEATURES,backend-tests" --test device_gate -- --nocapture
 
@@ -697,7 +918,11 @@ check-example-names:
 check-doc-links:
     python3 scripts/check-doc-links.py
 
-# rustdoc gate, wired into `just ci`.
+# rustdoc gate over every publishable crate, wired into `just ci-workspace`.
+#
+# `just ci` runs `check-rustdoc-contour` instead — the same script over the
+# default contour, which is what the routine loop needs; this one is the
+# once-per-sync whole set.
 #
 # Per-crate, with each crate's own `[package.metadata.docs.rs]` features —
 # because that is what docs.rs builds. `cargo doc --workspace` uses ONE unified
@@ -709,6 +934,13 @@ check-doc-links:
 # Usage: `just check-rustdoc` or `just check-rustdoc rlx-tensor` for one crate.
 check-rustdoc *CRATES:
     python3 scripts/check-rustdoc.py --keep-going {{CRATES}}
+
+# The same gate over the fork's own build set, which is what `just ci` runs: the
+# contour is what this fork maintains, and the twenty-one members upstream ships
+# that it does not build have no reason to hold up a routine run. `--contour`
+# reads `default-members` from cargo rather than repeating the list here.
+check-rustdoc-contour:
+    python3 scripts/check-rustdoc.py --contour --keep-going
 
 # Dual-license header gate, wired into `just ci`.
 #
@@ -807,6 +1039,8 @@ check-apple:
 # nothing else in the tree runs these.
 check-ops:
     cargo test -p mahbot-rlx-ir --features test-support,backend-tests --test arity_exhaustive
+    # Every op through `.rlxmodel` text, and the opset 1 fixture still reads.
+    cargo test -p mahbot-rlx-ir --features test-support,serialize,backend-tests --test rlxmodel_every_op
     # Declared arity vs. what backends actually index — the only check here
     # that compares the table against reality rather than against itself.
     # `--lib` runs the scanner's own regression tests: every early version of
@@ -992,15 +1226,54 @@ android-e2e *ARGS:
 run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
-# Quick basic test of the workspace: build + test + lint + fast smokes.
-ci: build test fmt-check lint check-rlx-env-vars check-example-names check-doc-links check-rustdoc check-license-headers check-corpus check-wgsl-uniform test-pyrlx test-third-order-gpu test-rocm leak-check validate-metal-bindings
+# The routine gate: this fork's default contour (`default-members` in
+# Cargo.toml) plus the gates that only exist here. `build`, `test` and `lint`
+# name no package, so they cover the contour and not the twenty-one upstream
+# members this fork deliberately does not build. `check-corpus` and
+# `test-third-order-cpu` stay here because every package they name *is* a default
+# member — narrowing the contour was about the members this fork does not build,
+# and neither drags any of them in. `check-rustdoc-contour` is the same gate over
+# the contour rather than all eighty-four publishable crates. The Python binding
+# is outside all of it: `crates/bindings/pyrlx` is `exclude`d from the workspace,
+# so nothing builds it and no gate runs its tests — though gates do read files
+# inside it, and `just torch-import` runs its pure-Python front-end (the `exclude`
+# comment in Cargo.toml is the list).
+# `ci-workspace` is the whole-set gate, run once per upstream sync (see
+# `docs/fork-sync.md`).
+ci: build test fmt-check lint check-fork-layers check-rlx-env-vars check-example-names check-doc-links check-license-headers check-wgsl-uniform check-op-coverage check-corpus test-third-order-cpu check-rustdoc-contour
+# Everything, once per upstream sync: the routine gate above plus every member
+# upstream ships — the Apple/NVIDIA/AMD/Intel/TPU/embedded backends, the no_std
+# crates and the bindings. Slow and toolchain-dependent, which is why the routine
+# loop above stays narrow. It depends on `ci` so it cannot fall behind it, and it
+# names `test-gpu` because that is the recipe that builds the targets behind
+# `required-features` — a bare `cargo test --workspace` skips every one of them.
+#
+# Every recipe named here needs nothing beyond the Rust toolchain and the
+# contour's own devices, so the gate is green on whatever host a sync runs on —
+# `RLX_REQUIRE_DEVICE=1` makes a backend that skips for want of a device a
+# failure, not a pass. The recipes that need something else are in `ci-rig`: HIP,
+# `leaks`, `xcrun metal`, a crates.io fetch for the real `libm`, and a Vulkan ICD.
+ci-workspace: ci build-workspace test-workspace lint-workspace check-no-std check-readme check-rustdoc check-corpus-device check-bindings check-binding-versions test-third-order-gpu test-gpu
+# The whole-set gate's toolkit rows, run on a rig rather than a developer machine:
+# HIP for `test-rocm`, `leaks` for `leak-check`, `xcrun metal` for
+# `validate-metal-bindings`, an ICD for `test-vulkan`, and a crates.io fetch for
+# `test-libm` — its comparison workspace depends on the real `libm`, which the
+# root `[patch.crates-io]` shadows inside the workspace itself. `ci-workspace`
+# does not name any of them — a gate that cannot pass on the machine it is run on
+# teaches people to ignore gates.
+ci-rig: ci-workspace test-vulkan test-libm test-rocm leak-check validate-metal-bindings
+# The two layers this fork re-applies on every sync — the package rename and the
+# narrow test contour — checked rather than trusted (see `docs/fork-sync.md` §2/§3).
+check-fork-layers:
+    python3 scripts/fork-rename.py --check
+    python3 scripts/fork-test-gating.py --check
 
 # ROCm compile check + graph_devices parity (tests skip when HIP unavailable).
 #
-# Deliberately does NOT set `require_device`: this recipe is in `just ci`, which
-# runs on developer machines where rlx-rocm compiles fine and no AMD GPU exists
-# — exactly the case the flag is designed to fail. A rig gets it from rig.sh
-# (RIG_REQUIRE_DEVICE), where "the device should be here" is actually true.
+# Sets no `require_device` itself: the compile check and the lib tests pass where
+# no AMD GPU exists, which is every developer machine. On a Linux rig `test-gpu`
+# calls this with `RLX_REQUIRE_DEVICE=1` already exported, so a row that skips for
+# want of a device fails there instead of reporting `ok`.
 test-rocm:
     cargo check -p mahbot-rlx-runtime --features cpu,rocm
     cargo test -p rlx-rocm --lib
@@ -1024,19 +1297,27 @@ test-hip-cpu-validate:
             cargo test -p rlx-cuda --features hip-cpu-validate,backend-tests
             cargo test -p rlx-rocm --features hip-cpu-validate,backend-tests'
 
-# Higher-order AD: CPU tests + GPU parity (Apple backends on macOS, wgpu elsewhere).
+# Higher-order AD, CPU only — no device, so this is part of the routine gate
+# (`just ci`) rather than the GPU parity run below it.
+test-third-order-cpu:
+    cargo test -p mahbot-rlx-runtime --release --features cpu,backend-tests --test nth_order_grad
+
+# Higher-order AD: GPU parity (Apple backends on macOS, wgpu elsewhere).
 test-third-order-gpu:
     #!/usr/bin/env bash
     set -euo pipefail
     export RLX_REQUIRE_DEVICE="{{require_device}}"
-    cargo test -p mahbot-rlx-runtime --release --features cpu,backend-tests --test nth_order_grad
     case "$(uname -s)" in
       Darwin)
-        cargo test -p mahbot-rlx-runtime --release --features cpu,apple,backend-tests \
+        # `apple` would be the shorter spelling, but it implies `mlx` and this
+        # fork does not ship the MLX backend; the per-device suites are
+        # `cfg`-gated on `metal`/`mlx` anyway, so naming the backends is what
+        # selects them.
+        cargo test -p mahbot-rlx-runtime --release --features cpu,metal,gpu,coreml,backend-tests \
           --test higher_order_low_precision_parity
-        cargo test -p mahbot-rlx-runtime --release --features cpu,apple,backend-tests \
+        cargo test -p mahbot-rlx-runtime --release --features cpu,metal,gpu,coreml,backend-tests \
           --test third_order_gpu_parity --test directional_nth_gpu_parity
-        cargo test -p mahbot-rlx-runtime --release --features cpu,apple,backend-tests \
+        cargo test -p mahbot-rlx-runtime --release --features cpu,metal,gpu,coreml,backend-tests \
           --test higher_order_decompose_parity -- --test-threads=1 ;;
       *)
         cargo test -p mahbot-rlx-runtime --release --features cpu,gpu,backend-tests \
@@ -1142,3 +1423,15 @@ mahbot-transcription-corpus *ARGS:
 # `-D warnings`.
 lint-mahbot:
     cargo clippy -p mahbot-inference --features bench --all-targets -- -D warnings
+
+# The product checks the stand never runs: every one is `#[ignore]`d, so no
+# routine command reaches them. A check whose input is absent prints why and
+# returns, so this is safe on a machine with no installed tree.
+#
+# Deliberately not in `ci` or `ci-workspace`: a product check is a claim about
+# behaviour, and one of them (`a_paste_onset_lands_within_one_detector_hop`) is a
+# known-stale expectation the cut policy superseded — a gate that is red by
+# construction teaches the operator to skip the gate. A sync runs this by hand
+# (`docs/fork-sync.md` §10) and reads what it says.
+test-product-checks:
+    cargo test --release -p mahbot-inference --features bench --test product_checks -- --ignored --nocapture

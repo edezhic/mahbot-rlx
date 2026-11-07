@@ -71,10 +71,20 @@ pub const STAND_RECOGNITION_LONG_SHA256: &str =
 
 /// The stand's two synthesis rows at their draw seed: `digest(&waveform)` and
 /// the waveform's length. A witness, not a gate — the round trip (the render
-/// resampled and re-recognised, [`round_trip`]) is the gate.
-pub const STAND_SYNTH_SHORT_DIGEST: u64 = 0xa40d_4875_5a6b_b9c4;
+/// resampled and re-recognised, [`round_trip`]) is the gate, and it still reads
+/// the text back.
+///
+/// Re-pinned at the 0.2.20 sync, same sample counts as before: the engine's
+/// arithmetic and routing both moved under the same graphs. Arithmetic:
+/// the correctly-rounded `exp`/`rcp` helpers the register-resident softmax now
+/// uses, `fold_strided_bmm`, and the dense-attention transposes. Routing: the
+/// packed multiply's cooperative tile is now admitted from 24 workgroups instead
+/// of 48 (`gguf_gpu::COOP_MIN_WORKGROUPS`), so the talker's `n = 1 024`
+/// projections take it and sum in a different order. Nothing in the product's own
+/// graphs changed.
+pub const STAND_SYNTH_SHORT_DIGEST: u64 = 0x8d7c_9665_b717_18d7;
 pub const STAND_SYNTH_SHORT_SAMPLES: usize = 44_160;
-pub const STAND_SYNTH_TYPICAL_DIGEST: u64 = 0x9bdc_52c5_8a14_6cfe;
+pub const STAND_SYNTH_TYPICAL_DIGEST: u64 = 0x5a54_f2e4_ee60_8966;
 pub const STAND_SYNTH_TYPICAL_SAMPLES: usize = 172_800;
 
 /// The stand's wake row: the cosine the pair pass's first window answers against a

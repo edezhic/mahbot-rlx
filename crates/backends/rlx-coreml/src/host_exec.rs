@@ -66,7 +66,10 @@ pub fn is_host_op(op: &Op) -> bool {
         // Full-coverage host fallbacks (no MIL arm, or CPU-only kernels).
         // Fma / fused epilogues / FakeQuantize / Conv3d(with Param weights)
         // lower to MIL — see `mil::{activation,conv_pool,matmul,norm,quant}`.
-        Op::FakeQuantizeLSQ { .. }
+        // RoundToFormat: bit-level rounding (no MIL arm); the CPU kernel is
+        // the reference, so the host run is exact by construction.
+        Op::RoundToFormat { .. }
+        | Op::FakeQuantizeLSQ { .. }
         | Op::FakeQuantizeLSQBackwardX { .. }
         | Op::FakeQuantizeLSQBackwardScale { .. }
         | Op::ElementwiseRegion { .. }
@@ -257,7 +260,7 @@ pub fn run_host_node(
             .ok_or_else(|| CoremlError::Runtime(format!("host_exec: missing value for v{}", nid.0)))
     };
     match &node.op {
-        Op::Fft { inverse, norm } => {
+        Op::Fft { inverse, norm, .. } => {
             let x = load(node.inputs[0])?;
             // The FFT row is the innermost dim (real-block layout: first N real,
             // second N imag → row = 2N). Deriving it from x.len() collapses the

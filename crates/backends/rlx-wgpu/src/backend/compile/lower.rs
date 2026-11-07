@@ -32,34 +32,34 @@ use crate::kernels::{
     GatherBwdParams, GatherPackedParams, GatherParams, GroupNormBwdParams, GroupNormParams,
     GroupedMatmulParams, GruParams, Im2Col2dParams, IndexingNdParams, Kernel, LayerNorm2dParams,
     LayerNormBwdParams, LayerNormParams, LstmParams, Mamba2Params, MatmulParams, MatmulQkvParams,
-    MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams, NarrowSplitParams, NormRopeParams,
-    Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams, QMatMulParams, QUANT_I8_MAX_CHAN,
-    QuantI8Params, ReduceParams, ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams,
-    RopeParams, SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams,
-    SceBwdParams, SceParams, SelectiveScanParams, SnakeBetaParams, SoftmaxParams, TopKParams,
-    TransposeParams, UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams,
-    activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
-    argmax_kernel, attention_bwd_kernel, attention_kernel, attention_mask_kernel,
-    axial_rope2d_kernel, batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
-    batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
-    batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
-    cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
-    complex_norm_sq_kernel, concat_kernel, concat_many_kernel, concat_vec4_kernel,
-    conjugate_c64_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_implicit_kernel,
-    conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
-    conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel, copy_sanitize_kernel,
-    cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel, dequant_matmul_kernel,
-    dequant_matmul_mlx_kernel, dequantize_i8_kernel, elementwise_region_kernel,
-    elementwise_region_spatial_kernel, expand_kernel, fake_quantize_fixed_kernel,
-    fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel, fma_kernel, frames_kernel,
-    fused_conv_bias_act_kernel, fused_residual_ln_kernel, fused_residual_ln_tee_kernel,
-    fused_residual_ln_tee_vec4_kernel, fused_residual_rms_norm_kernel, fused_swiglu_kernel,
-    gated_delta_net_kernel, gated_residual_backward_kernel, gated_residual_kernel,
-    gather_axis_kernel, gather_backward_acc_kernel, gather_backward_zero_kernel,
-    gather_elements_kernel, gather_kernel, gather_nd_kernel, gather_packed_kernel,
-    gather_split_kernel, group_norm_backward_beta_kernel, group_norm_backward_gamma_kernel,
-    group_norm_backward_input_kernel, group_norm_kernel, grouped_matmul_kernel, gru_kernel,
-    im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
+    MatmulStridedParams, MaxPool2dBwdParams, MaxPool3dBwdParams, NarrowConcatParams,
+    NarrowSplitParams, NormRopeParams, Pool1dParams, Pool2dParams, Pool3dParams, QConv2dParams,
+    QMatMulParams, QUANT_I8_MAX_CHAN, QuantI8Params, ReduceParams, ResizeNearest2xParams,
+    ReverseParams, RmsNormBwdParams, RnnParams, RopeBwdParams, RopeParams, RoundToFormatParams,
+    SampleParams, ScaledGroupedMatmulParams, ScaledLowpParams, ScatterAddParams, SceBwdParams,
+    SceParams, SelectiveScanParams, SnakeBetaParams, SoftmaxParams, TopKParams, TransposeParams,
+    UmapKnnParams, UnaryParams, WelchPeaksGpuParams, WhereParams, activation_backward_kernel,
+    ada_layer_norm_backward_kernel, ada_layer_norm_kernel, argmax_kernel, attention_bwd_kernel,
+    attention_kernel, attention_mask_kernel, axial_rope2d_kernel, batch_elementwise_region_kernel,
+    batch_norm_inference_bwd_beta_kernel, batch_norm_inference_bwd_gamma_kernel,
+    batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_c64_kernel,
+    binary_kernel, cast_f32_to_f16_kernel, cast_kernel, compare_kernel, complex_cast_kernel,
+    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, concat_many_kernel,
+    concat_vec4_kernel, conjugate_c64_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel,
+    conv1d_implicit_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
+    conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_kernel, copy_kernel,
+    copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
+    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
+    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
+    fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
+    fma_kernel, frames_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel,
+    fused_residual_ln_tee_kernel, fused_residual_ln_tee_vec4_kernel,
+    fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
+    gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
+    gather_backward_acc_kernel, gather_backward_zero_kernel, gather_elements_kernel, gather_kernel,
+    gather_nd_kernel, gather_packed_kernel, gather_split_kernel, group_norm_backward_beta_kernel,
+    group_norm_backward_gamma_kernel, group_norm_backward_input_kernel, group_norm_kernel,
+    grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
     layernorm_kernel, layernorm_vec4_kernel, lead_pack_uniform, lstm_kernel, mamba2_kernel,
     matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
@@ -69,15 +69,15 @@ use crate::kernels::{
     matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
     maxpool3d_backward_kernel, narrow_kernel, narrow_split_kernel, narrow_vec4_kernel,
     norm_rope_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel,
-    q_matmul_kernel, quantize_i8_kernel, reduce_kernel, reverse_kernel, rms_norm_backward_kernel,
-    rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel, rope_kernel, sample_kernel,
-    scaled_dequantize_kernel, scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel,
-    scaled_quant_scale_kernel, scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel,
-    scatter_nd_reduce_kernel, selective_scan_kernel, snake_beta_kernel,
-    softmax_cross_entropy_backward_kernel, softmax_cross_entropy_kernel,
-    softmax_cross_entropy_with_logits_kernel, softmax_kernel, topk_kernel, transpose_kernel,
-    transpose_vec4_kernel, umap_knn_kernel, unary_f16_mirror_kernel, unary_kernel,
-    welch_peaks_gpu_kernel, where_kernel,
+    q_matmul_kernel, quantize_i8_kernel, reduce_kernel, resize_nearest2x_kernel, reverse_kernel,
+    rms_norm_backward_kernel, rms_norm_backward_param_kernel, rnn_kernel, rope_backward_kernel,
+    rope_kernel, round_to_format_kernel, sample_kernel, scaled_dequantize_kernel,
+    scaled_grouped_matmul_decode_kernel, scaled_matmul_decode_kernel, scaled_quant_scale_kernel,
+    scaled_quantize_kernel, scatter_add_kernel, scatter_elements_kernel, scatter_nd_reduce_kernel,
+    selective_scan_kernel, snake_beta_kernel, softmax_cross_entropy_backward_kernel,
+    softmax_cross_entropy_kernel, softmax_cross_entropy_with_logits_kernel, softmax_kernel,
+    topk_kernel, transpose_kernel, transpose_vec4_kernel, umap_knn_kernel, unary_f16_mirror_kernel,
+    unary_kernel, welch_peaks_gpu_kernel, where_kernel,
 };
 use rlx_gpu_dispatch::indexing::{KernelKind as IndexKind, Reduction as IndexReduction};
 use rlx_ir::dynamic::{bind_graph, has_dynamic_dims, infer_bindings_from_f32_inputs, same_binding};
@@ -94,6 +94,309 @@ use crate::backend::WgpuExecutable;
 /// truncate+saturate on the f32-uniform arena). Endpoints are the exact int
 /// range; `i32::MAX`/`u32::MAX`/i64 bounds are not f32-representable and round
 /// to the nearest f32 (an inherent arena limit at the extreme int values).
+/// Re-express a bind-window offset recorded while the window started at `at`
+/// against the final window start `base`.
+///
+/// Where the hand-staged elementwise arms (`Compare`, `Where`, `Fma`) copy an operand
+/// that lies outside the output's window. A striped arena binds the output's
+/// whole stripe, so its own stage reserve is always addressable; the global
+/// `scratch_off` is in some other stripe. Those arms used to stage there and
+/// then rebase the window onto the arena tail even when nothing needed
+/// staging — every offset then pointed into the wrong stripe, and KittenTTS's
+/// attention mask (`Compare(Eq)` of two zeros) came out all false under a
+/// 2 GiB binding limit.
+fn elementwise_stage_slot(arena: &Arena, base: u64) -> u64 {
+    if arena.is_sharded() {
+        arena.shard_stage_off(base as usize) as u64
+    } else {
+        arena.scratch_off as u64
+    }
+}
+
+/// Placing a later operand can move the window: staging a weight parked in the
+/// separate weight buffer copies it into the scratch tail and widens the window
+/// down to cover the copy. An offset taken before that is relative to the old
+/// start. The fused matmul+bias lowering placed A, then B, then the bias, and
+/// kept A's and B's offsets as they were, so once the arena outgrew the
+/// binding limit (all params parked) every `x·W + b` read the wrong rows —
+/// KittenTTS on a 2 GiB-binding RTX came out silent.
+fn rebase_window_off_f32(off: u32, at: u64, base: u64) -> u32 {
+    let abs = at + off as u64 * 4;
+    assert!(
+        abs >= base,
+        "rlx-wgpu: bind window moved past an operand placed earlier ({abs} < {base})"
+    );
+    ((abs - base) / 4) as u32
+}
+
+/// Can `node` use a whole-arena host step (`Step::ConvTranspose2d`,
+/// `Step::ConvTranspose3dHost`)? Those copy the activation arena to the host
+/// and address that copy with `u32` byte offsets. A weight parked in the
+/// separate weight buffer carries the `WEIGHT_BUF_TAG` high bit, and `as u32`
+/// truncated it to an address inside unrelated activations — KittenTTS's
+/// iSTFT ConvTranspose read garbage weights and its waveform came out silent
+/// once the arena outgrew a 2 GiB binding. Offsets past 4 GiB truncate the same
+/// way. Such nodes take the packed `HostOp`, which resolves both.
+fn whole_arena_host_ok(arena: &crate::buffer::Arena, node: &rlx_ir::Node) -> bool {
+    node.inputs
+        .iter()
+        .chain(std::iter::once(&node.id))
+        .all(|&id| {
+            if !arena.has(id) {
+                return true;
+            }
+            let off = arena.offset(id);
+            !crate::buffer::is_weight_off(off) && off + arena.len_of(id) <= u32::MAX as usize
+        })
+}
+
+/// Ops whose lowering emits a host step holding absolute `u32` byte offsets.
+/// See the guard at the top of the node loop; the ops whose own arm decides what
+/// to do with such an operand — staging it or refusing it by name — are carved
+/// out by [`stages_out_of_window_operands`]. `ConvTranspose3d` checks
+/// [`whole_arena_host_ok`] in its own arm.
+fn lowers_to_u32_offset_host_step(op: &Op) -> bool {
+    crate::unfuse::group_norm_act(op).is_some()
+        || matches!(
+            op,
+            Op::Fft { .. }
+                | Op::FftQ { .. }
+                | Op::WelchPeaks { .. }
+                | Op::LogMel
+                | Op::LogMelBackward
+                | Op::Im2Col { .. }
+                | Op::RngNormal { .. }
+                | Op::RngUniform { .. }
+                | Op::Lstm { .. }
+                | Op::GroupNorm { .. }
+                | Op::LayerNorm2d { .. }
+                | Op::ResizeNearest2x
+                | Op::Reverse { .. }
+                | Op::ArgMax { .. }
+                | Op::ArgMin { .. }
+                | Op::AxialRope2d { .. }
+        )
+}
+
+/// Whether `op`'s own arm decides what becomes of an operand
+/// [`whole_arena_host_ok`] rejects — a parameter parked in the weight buffer, or
+/// one past the 4 GiB a `u32` byte offset can hold — rather than the generic
+/// `HostOp` the guard would emit instead.
+///
+/// Two kinds of arm answer for themselves, and the guard at the top of the node
+/// loop must stay out of the way of both:
+///
+/// * the arm **stages** the operand. The arms below resolve their operands
+///   through `arena_off_in_bind_window` / `window_offsets`, which copy an
+///   out-of-window operand into the bind window's staging reserve (and refuse by
+///   name when it does not fit). That is the fork's device route.
+/// * the arm **refuses the operand by name**. `Op::Fft` and `Op::FftQ` have no
+///   route that can address one at all: every step either op has — the device
+///   step and the whole-arena host step alike — carries an offset that drops the
+///   `WEIGHT_BUF_TAG`, so a parked operand would be read out of the activation
+///   arena, and the host step's 32-bit byte offsets truncate past 4 GiB. Each arm
+///   says so itself (`REFUSED (parked FFT operand)`, `REFUSED (FFT arena too
+///   large)`, `REFUSED (FftQ geometry)`); hosting them would replace that named
+///   refusal with a route that cannot compute the op either.
+///
+/// Every other op in [`lowers_to_u32_offset_host_step`] lowers to a step that
+/// keeps absolute `u32` offsets, so the guard still applies to it.
+///
+/// The conditional entries are the arms whose device route is itself behind a
+/// route preference. When that preference sends the op to its whole-arena host
+/// step — which carries `u32` offsets and does not stage — the answer is `false`,
+/// so the guard hosts the operand instead of letting the step read a truncated
+/// address. `Op::LayerNorm2d` and `Op::Reverse` need no such condition: their
+/// host step refuses such an operand by name
+/// (`assert_byte_offset_host_route`), so either route is safe.
+fn stages_out_of_window_operands(op: &Op, arena: &crate::buffer::Arena) -> bool {
+    if crate::unfuse::group_norm_act(op).is_some() {
+        // The folded group norm stages gamma/beta on its device arm, which is
+        // behind `!wgpu_prefer_host_norm`; the host step it falls back to stages
+        // nothing.
+        return !wgpu_prefer_host_norm(arena);
+    }
+    match op {
+        // Both arms stage every out-of-window operand through `window_offsets`.
+        Op::LayerNorm2d { .. } | Op::Reverse { .. } => true,
+        // Neither arm stages, and neither has a route that could: both refuse a
+        // parked or past-4 GiB operand by name, which is the answer the caller
+        // must be left to see.
+        Op::Fft { .. } | Op::FftQ { .. } => true,
+        // The device arm stages; the whole-arena host step it falls back to does
+        // not, so it keeps the guard.
+        Op::ResizeNearest2x | Op::AxialRope2d { .. } => !wgpu_prefer_structure_host(arena),
+        _ => false,
+    }
+}
+
+/// Whether this node has to run as a generic `HostOp` — the form that stages each
+/// operand on its own and resolves a parked or past-4 GiB address — instead of the
+/// step its op would otherwise lower to.
+///
+/// Two things force it: a GPU lowering that addresses operands by absolute arena
+/// offset it cannot express ([`lowers_with_absolute_offsets`],
+/// [`absolute_offsets_ok`]), or a `u32`-offset host step whose window is not the
+/// whole arena ([`lowers_to_u32_offset_host_step`], [`whole_arena_host_ok`]). An
+/// arm can answer for itself instead, and the two that do are different kinds of
+/// predicate. [`stages_out_of_window_operands`] is a per-op table, consulted only
+/// in the `u32` term, of ops whose own step stages what falls outside its window —
+/// an op that gains such a route changes its own row there and nothing else.
+/// [`two_window_ok`] is an arena-and-geometry answer, consulted for either term, of
+/// whether the striped arena's two-window route serves this node at all — a new arm
+/// that needs it asks it a new question rather than gaining a row.
+fn must_run_as_generic_host_op(
+    device: &wgpu::Device,
+    op: &Op,
+    node: &rlx_ir::Node,
+    arena: &crate::buffer::Arena,
+    graph: &Graph,
+) -> bool {
+    let absolute_offsets_wrong =
+        lowers_with_absolute_offsets(op) && !absolute_offsets_ok(device, arena, node);
+    let u32_offsets_wrong = lowers_to_u32_offset_host_step(op)
+        && !whole_arena_host_ok(arena, node)
+        && !stages_out_of_window_operands(op, arena);
+    (absolute_offsets_wrong || u32_offsets_wrong) && !two_window_ok(arena, node, graph)
+}
+
+/// Ops whose GPU lowering binds the output's arena window
+/// (`bind_op_output_window`) but passes absolute `arena.offset / 4` element
+/// offsets. Past the binding limit the window starts at its stripe, so for
+/// any op outside stripe 0 — or reading a parked param — those offsets point
+/// at the wrong data. See [`absolute_offsets_ok`].
+fn lowers_with_absolute_offsets(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::AttentionBackward { .. }
+            | Op::Sample { .. }
+            | Op::Pool { .. }
+            | Op::Cumsum { .. }
+            | Op::CumProd { .. }
+            | Op::CumMax { .. }
+            | Op::SelectiveScan { .. }
+            | Op::Mamba2 { .. }
+            | Op::Gru { .. }
+            | Op::Rnn { .. }
+            | Op::BatchNormInference { .. }
+            | Op::BatchNormInferenceBackwardInput { .. }
+            | Op::BatchNormInferenceBackwardGamma { .. }
+            | Op::BatchNormInferenceBackwardBeta
+            | Op::Quantize { .. }
+            | Op::QMatMul { .. }
+            | Op::QConv2d { .. }
+            | Op::ScaledQuantScale { .. }
+            | Op::ScaledQuantize { .. }
+            | Op::ScaledDequantize { .. }
+            | Op::ScaledMatMul { .. }
+            | Op::GroupedMatMul
+            | Op::ScaledGroupedMatMul { .. }
+            | Op::TopK { .. }
+            | Op::ScatterAdd { .. }
+            | Op::RmsNormBackwardInput { .. }
+            | Op::LayerNormBackwardInput { .. }
+            | Op::LayerNormBackwardGamma { .. }
+            | Op::RopeBackward { .. }
+            | Op::CumsumBackward { .. }
+            | Op::GatherBackward { .. }
+    )
+}
+
+/// Whether absolute element offsets address `node`'s operands correctly
+/// inside the output's bind window: no parked param, the window starts at 0,
+/// and every operand ends inside it.
+fn absolute_offsets_ok(
+    device: &wgpu::Device,
+    arena: &crate::buffer::Arena,
+    node: &rlx_ir::Node,
+) -> bool {
+    let ids: Vec<NodeId> = node
+        .inputs
+        .iter()
+        .chain(std::iter::once(&node.id))
+        .copied()
+        .filter(|&id| arena.has(id))
+        .collect();
+    if ids
+        .iter()
+        .any(|&id| crate::buffer::is_weight_off(arena.offset(id)))
+    {
+        return false;
+    }
+    let (base, size) = arena_window_for_nodes(device, arena, &[node.id]);
+    base == 0
+        && ids
+            .iter()
+            .all(|&id| (arena.offset(id) + arena.len_of(id)) as u64 <= size)
+}
+
+/// A bind window holding all of `ids`, when a kernel can address them in it:
+/// none is a parked param, they sit in one stripe, and the span fits a
+/// binding. `None` sends the op to its host step.
+fn builtin_gpu_window(
+    device: &wgpu::Device,
+    arena: &crate::buffer::Arena,
+    ids: &[NodeId],
+) -> Option<(u64, u64)> {
+    if ids
+        .iter()
+        .any(|&id| !arena.has(id) || crate::buffer::is_weight_off(arena.offset(id)))
+    {
+        return None;
+    }
+    if arena.is_sharded() {
+        let s = arena.shard_size;
+        let first = arena.offset(ids[0]) / s;
+        if ids.iter().any(|&id| {
+            arena.offset(id) / s != first || (arena.offset(id) + arena.len_of(id) - 1) / s != first
+        }) {
+            return None;
+        }
+    }
+    let lo = ids.iter().map(|&id| arena.offset(id)).min()? as u64;
+    let hi = ids
+        .iter()
+        .map(|&id| arena.offset(id) + arena.len_of(id))
+        .max()? as u64;
+    if hi - lo > device.limits().max_storage_buffer_binding_size {
+        return None;
+    }
+    let (base, size) = arena_window_for_nodes(device, arena, ids);
+    ids.iter()
+        .all(|&id| {
+            let o = arena.offset(id) as u64;
+            o >= base && o + arena.len_of(id) as u64 <= base + size && (o - base).is_multiple_of(4)
+        })
+        .then_some((base, size))
+}
+
+/// Push a [`crate::builtin_gpu_kernels`] kernel as a `WgpuGpuKernel` step.
+#[allow(clippy::too_many_arguments)]
+fn push_builtin_gpu_kernel(
+    device: &wgpu::Device,
+    arena: &crate::buffer::Arena,
+    name: &str,
+    params: &[u32],
+    out_elems: u32,
+    base: u64,
+    size: u64,
+    schedule: &mut Vec<Step>,
+    uniforms: &mut Vec<wgpu::Buffer>,
+    bind_groups: &mut Vec<wgpu::BindGroup>,
+) {
+    crate::builtin_gpu_kernels::ensure_registered();
+    let gk = crate::wgpu_gpu_custom::lookup(name).expect("built-in kernel registered");
+    let kernel = crate::wgpu_gpu_custom::get_or_build_pipeline(device, &*gk);
+    let pbuf = crate::wgpu_gpu_custom::make_params_buffer(device, params);
+    let bg = bind_arena_window(device, kernel.as_ref(), arena, base, size, &pbuf);
+    schedule.push(Step::WgpuGpuKernel {
+        name: name.to_string(),
+        workgroups: gk.workgroups(out_elems),
+    });
+    uniforms.push(pbuf);
+    bind_groups.push(bg);
+}
+
 fn int_range_f32(dt: rlx_ir::DType) -> (f32, f32) {
     match dt {
         rlx_ir::DType::I8 => (i8::MIN as f32, i8::MAX as f32),
@@ -251,18 +554,12 @@ fn patch_region_cast_subs(chain: &[rlx_ir::op::ChainStep], chain_enc: &mut [u32]
 /// True when SPIR-V paths should host-fallback.
 ///
 /// Virtually-sharded arenas (NVIDIA 2 GiB bind) force host for most ops.
-/// Discrete Vulkan/DX12 no longer blankets every op through host (that was
-/// ~20 s/chunk on Kitten 32 k wave graphs); instead:
-/// - Elementwise Binary/Where/Fma/Activation → host on discrete (SPIR-V still
-///   collapses Kitten NSF; peak ~0.05 if left on GPU) — see
-///   [`should_pack_host_op`].
-/// - Structural Expand/Concat/Transpose/Narrow/Conv → host on discrete — see
-///   [`wgpu_prefer_structure_host`] / [`wgpu_prefer_conv_host`].
-/// Metal keeps GPU kernels. Opt out of hosting with `RLX_WGPU_SHARD_GPU=1`.
-/// Force full discrete hosting with `RLX_WGPU_DISCRETE_HOST=1` (via
-/// [`wgpu_prefer_host_fallback`] for norms/sharded paths). `LayerNorm2d` and
-/// `Reverse` do not consult the adapter-kind term at all — see
-/// [`wgpu_prefer_host_fallback_agnostic`].
+/// Discrete Vulkan/DX12 runs elementwise, norm and structural ops on the GPU
+/// like Metal does. `RLX_WGPU_DISCRETE_HOST=1` hosts them instead
+/// ([`crate::device::discrete_hosts_ops`]): elementwise via
+/// [`should_pack_host_op`], Expand/Concat/Transpose/Narrow/Conv via
+/// [`wgpu_prefer_structure_host`] / [`wgpu_prefer_conv_host`]. Virtually
+/// sharded arenas still host unless `RLX_WGPU_SHARD_GPU=1`.
 fn wgpu_prefer_host_fallback(arena: &crate::buffer::Arena) -> bool {
     if rlx_ir::env::flag("RLX_WGPU_FORCE_HOST") {
         return true;
@@ -299,14 +596,41 @@ fn wgpu_prefer_host_fallback_agnostic(arena: &crate::buffer::Arena) -> bool {
     arena.is_sharded()
 }
 
-/// Expand / Concat / Transpose / Narrow: host on discrete Vulkan/DX12 even when
-/// the arena is unsharded (GPU paths collapse Kitten NSF). Also when virtually
-/// sharded / `RLX_WGPU_FORCE_HOST`.
+/// `Op::ResizeNearest2x`, bare or wrapped alone in a `TransformRegion`.
+fn is_resize_nearest2x(op: &Op) -> bool {
+    match op {
+        Op::ResizeNearest2x => true,
+        Op::TransformRegion { steps, .. } => {
+            steps.len() == 1
+                && matches!(
+                    steps[0],
+                    rlx_ir::op::TransformStep::ResizeNearest2x(rlx_ir::op::ChainOperand::Input(0))
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Expand / Concat / Transpose / Narrow: host when virtually sharded, under
+/// `RLX_WGPU_FORCE_HOST`, or on discrete Vulkan/DX12 with
+/// `RLX_WGPU_DISCRETE_HOST=1`.
 fn wgpu_prefer_structure_host(arena: &crate::buffer::Arena) -> bool {
     if rlx_ir::env::flag("RLX_WGPU_SHARD_GPU") {
         return false;
     }
-    wgpu_prefer_host_fallback(arena) || crate::device::coop_discrete_backend()
+    wgpu_prefer_host_fallback(arena) || crate::device::discrete_hosts_ops()
+}
+
+/// Whether a lever named a host route outright, as opposed to the route being
+/// merely preferred by the arena's geometry (a sharded arena, a discrete adapter).
+///
+/// The distinction decides what an operand the host route cannot address does: a
+/// route preferred by geometry yields to the device route, which stages such an
+/// operand into its bind window, while a route a lever named is obeyed — the host
+/// step's own refusal is then the honest answer, because the caller asked for a
+/// route that cannot serve it.
+fn host_route_forced(levers: &[&str]) -> bool {
+    levers.iter().any(|name| rlx_ir::env::flag(name))
 }
 
 /// Ops routed to packed [`Step::HostOp`] when hosting is required.
@@ -359,6 +683,58 @@ fn op_straddles_shards(arena: &crate::buffer::Arena, node: &rlx_ir::Node, graph:
         );
     }
     true
+}
+
+/// Whether `node` runs on the GPU with its input and output in separate
+/// windows ([`crate::kernels::two_window_kernel`]) on a striped arena: an
+/// ungrouped conv3d (plain, folded, LeakyReLU, or the argmax head) or a group
+/// norm. Each tensor lies inside one stripe; an op whose input and output do
+/// not share one used to run on the host — every layer of MindGrab under a
+/// 1 GiB binding. `RLX_WGPU_NO_TWO_WINDOW` turns it off.
+fn two_window_ok(arena: &crate::buffer::Arena, node: &rlx_ir::Node, graph: &Graph) -> bool {
+    if !arena.is_sharded() || rlx_ir::env::flag("RLX_WGPU_NO_TWO_WINDOW") {
+        return false;
+    }
+    // the weights are staged into the input stripe's reserve: there must be
+    // a stripe beyond it (a reserve as large as the stripe overlaps the
+    // tensors — 3% of labels wrong in `folds_on_striped_arena`)
+    if crate::buffer::shard_stage_reserve() >= arena.shard_size {
+        return false;
+    }
+    let conv = crate::unfuse::conv3d_geometry(&node.op).is_some_and(|g| g.3 <= 1)
+        && node.inputs.len() >= 2;
+    let norm = crate::unfuse::group_norm_act(&node.op).is_some();
+    // each activation operand inside one stripe
+    let one_stripe = |id: NodeId| {
+        let o = arena.offset(id);
+        crate::buffer::is_weight_off(o)
+            || arena
+                .straddles_shards(&[(o, 1), (o + arena.len_of(id).max(1) - 1, 1)])
+                .is_none()
+    };
+    let f32 = |id: NodeId| {
+        graph.node(id).shape.dtype() == rlx_ir::DType::F32 || crate::unfuse::is_half(graph.node(id))
+    };
+    // and clear of its stripe's stage reserve: a tensor past the stripe's
+    // usable part gets a stripe of its own, reserve and all
+    // (`snap_plan_to_shards_ex`), and the weights staged there would
+    // overwrite its end (6% of a 1.1 MB input's conv wrong at 2 MiB stripes,
+    // 1 MiB reserve)
+    let clear_of_reserve = |id: NodeId| {
+        let o = arena.offset(id);
+        if crate::buffer::is_weight_off(o) {
+            return true;
+        }
+        let end = o + arena.len_of(id).max(1);
+        end <= arena.shard_stage_off(o) || o >= arena.shard_stage_end(o)
+    };
+    (conv || norm)
+        && f32(node.id)
+        && one_stripe(node.id)
+        && node
+            .inputs
+            .iter()
+            .all(|&i| f32(i) && one_stripe(i) && clear_of_reserve(i))
 }
 
 fn should_pack_host_op(
@@ -419,7 +795,10 @@ fn should_pack_host_op(
     // straddle and is not caught here: `should_host_at_ceiling` runs before this
     // whole function and hosts it whenever the arena cannot be bound whole at
     // base zero, also ahead of the `RLX_WGPU_SHARD_GPU` opt-out.
-    if arena.is_sharded() && op_straddles_shards(arena, node, graph) {
+    if arena.is_sharded()
+        && !two_window_ok(arena, node, graph)
+        && op_straddles_shards(arena, node, graph)
+    {
         return true;
     }
     if rlx_ir::env::flag("RLX_WGPU_SHARD_GPU") {
@@ -439,21 +818,20 @@ fn should_pack_host_op(
         if rlx_ir::env::flag("RLX_WGPU_GPU_NORM") {
             return false;
         }
-        // Norms: host on discrete NVIDIA (unsharded Kitten still needs this)
-        // and whenever the arena is virtually sharded.
+        // Norms: host whenever the arena is virtually sharded, or on discrete
+        // Vulkan/DX12 under `RLX_WGPU_DISCRETE_HOST=1`.
         return wgpu_prefer_host_fallback(arena)
-            || crate::device::coop_discrete_backend()
+            || crate::device::discrete_hosts_ops()
             || rlx_ir::env::flag("RLX_WGPU_HOST_NORM");
     }
     if matches!(
         op,
         Op::Binary(_) | Op::Where | Op::Fma | Op::Activation(_) | Op::GatedResidual
     ) {
-        // Elementwise SPIR-V still collapses Kitten NSF on discrete NVIDIA
-        // (peak ~0.05) even with MatMul→Binary pass flushes and Expand hosted.
-        // Host on discrete / sharded; Metal keeps GPU kernels. Force GPU
-        // elementwise (unsafe for Kitten) with RLX_WGPU_SHARD_GPU=1.
-        return wgpu_prefer_host_fallback(arena) || crate::device::coop_discrete_backend();
+        // Host on sharded arenas (and on discrete Vulkan/DX12 only under
+        // `RLX_WGPU_DISCRETE_HOST=1`); `RLX_WGPU_SHARD_GPU=1` keeps them on
+        // the GPU in both cases.
+        return wgpu_prefer_host_fallback(arena) || crate::device::discrete_hosts_ops();
     }
     false
 }
@@ -1032,6 +1410,19 @@ fn parked_operand_report(arena: &Arena) -> String {
     )
 }
 
+/// Workgroups per group for the native group norm: one per 16 Ki elements,
+/// at most 256 (one partial per thread when they are combined). A norm whose
+/// output overlaps its input keeps one: the split kernels park partials in
+/// the output before the input is read in full.
+/// `RLX_WGPU_GROUP_NORM_ONE_WG=1` keeps one everywhere.
+fn group_norm_chunks(span: u32, in_byte: usize, out_byte: usize, out_bytes: usize) -> u32 {
+    let overlap = in_byte < out_byte + out_bytes && out_byte < in_byte + out_bytes;
+    if overlap || rlx_ir::env::flag("RLX_WGPU_GROUP_NORM_ONE_WG") {
+        return 1;
+    }
+    span.div_ceil(16 << 10).clamp(1, 256)
+}
+
 /// Whether `Op::GroupNorm` must fall back to the whole-arena host step.
 ///
 /// Mirrors the LayerNorm/RmsNorm policy in [`wgpu_prefer_host_fallback`]:
@@ -1060,19 +1451,25 @@ fn wgpu_prefer_host_norm2d(arena: &crate::buffer::Arena) -> bool {
     wgpu_prefer_host_fallback_agnostic(arena) || rlx_ir::env::flag("RLX_WGPU_HOST_NORM")
 }
 
-/// Conv2d SPIR-V is still wrong on discrete NVIDIA even for unsharded arenas
-/// (Kitten vocoder 1×L "2d" convs → NSF mush). Keep hosting independently of
-/// [`wgpu_prefer_host_fallback`]. Both transposed convs are gated by this too —
-/// `Op::ConvTranspose3d`'s device step sits behind it as well, and
-/// `Op::ConvTranspose2d` follows the sibling under the same gate.
+/// Conv2d hosts with the structural ops, or alone under `RLX_WGPU_CONV_HOST`.
 fn wgpu_prefer_conv_host(arena: &crate::buffer::Arena) -> bool {
     wgpu_prefer_structure_host(arena) || rlx_ir::env::flag("RLX_WGPU_CONV_HOST")
 }
 
+thread_local! {
+    /// Set when a node only the GPU kernels run ([`crate::unfuse::is_folded`])
+    /// was about to be replayed on the host.
+    static FOLDED_HOSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A `Step::HostOp` that also carries which of `node`'s operands are a *parameter's*
 /// storage, by the graph — the predicate the plan-time check uses, so the run-time net
-/// (`scan_host::assert_host_reads_fit`) and it cannot disagree.
+/// (`scan_host::assert_host_reads_fit`) and it cannot disagree. Every `HostOp` site goes
+/// through here, so each one also records what it is about to replay ([`note_host_reads`]):
+/// a node only the GPU kernels know how to compute restarts the compile without the folds
+/// rather than being replayed wrong.
 fn host_op_step(graph: &Graph, node: &rlx_ir::Node, arena: &Arena) -> Step {
+    note_host_reads(graph, node);
     Step::HostOp {
         desc: rlx_cpu::rlx_host_op_desc!(graph, node, |id| arena.offset(id)),
         param_operands: node
@@ -1388,9 +1785,61 @@ fn detect_frames_pattern(
     (skip, plans)
 }
 
+/// A node about to run on the host: if the GPU kernels alone know its form
+/// (a fold) or its storage (a packed half tensor, in or out), `compile`
+/// starts again without the folds and packing.
+fn note_host_reads(graph: &Graph, node: &rlx_ir::Node) {
+    let half = crate::unfuse::is_half(node)
+        || node
+            .inputs
+            .iter()
+            .any(|&i| crate::unfuse::is_half(graph.node(i)));
+    if half {
+        if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+            eprintln!(
+                "[rlx-wgpu] half-packed {:?} node {} would host",
+                node.op.kind(),
+                node.id.0
+            );
+        }
+        FOLDED_HOSTED.with(|f| f.set(true));
+    }
+    if crate::unfuse::is_folded(node) {
+        if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+            eprintln!(
+                "[rlx-wgpu] folded {:?} node {} would host",
+                node.op.kind(),
+                node.id.0
+            );
+        }
+        FOLDED_HOSTED.with(|f| f.set(true));
+    }
+}
+
 pub(crate) fn compile_static_inner(
     graph: Graph,
     rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+) -> crate::backend::WgpuExecutable {
+    // The activation folds are GPU-kernel forms. Where a folded node would
+    // leave the GPU (a striped arena hosts ops whose operands span stripes),
+    // compile again without them: the host replays the plain ops correctly,
+    // and that op is slow either way.
+    FOLDED_HOSTED.with(|f| f.set(false));
+    let exe = compile_static_with(graph.clone(), rng.clone(), true);
+    if !FOLDED_HOSTED.with(|f| f.replace(false)) {
+        return exe;
+    }
+    if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+        eprintln!("[rlx-wgpu] a folded activation would run on the host: compiling without folds");
+    }
+    drop(exe);
+    compile_static_with(graph, rng, false)
+}
+
+fn compile_static_with(
+    graph: Graph,
+    rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
+    folds: bool,
 ) -> crate::backend::WgpuExecutable {
     let dev = wgpu_device().expect("rlx-wgpu: no compatible adapter found");
 
@@ -1412,16 +1861,26 @@ pub(crate) fn compile_static_inner(
     // regular arena slot. CPU/Metal/MLX lower the fused variants
     // directly with bespoke kernels; we choose simplicity over peak
     // throughput here.
-    let graph = crate::unfuse::unfuse(graph);
+    let graph = crate::unfuse::unfuse_with(graph, folds);
     // Regions this kernel's `apply_activation` would silently compute as their own
     // input, back on primitives before anything lowers them (see the hook's docs).
     let graph = crate::unfuse::expand_unimplemented_regions(graph);
     // Elide the redundant reshapes unfuse/matmul-lowering emit — they alias
     // parents and block the planner's slot reuse (see collapse_reshapes).
     let graph = crate::unfuse::collapse_reshapes(graph);
-    // The runtime path legalises `Op::Binary` broadcasts before fusion; peel the
-    // copies the f32 kernel reads itself, so they are not a step or a slot.
-    let graph = crate::unfuse::elide_binary_broadcast_expands(graph);
+    // Let broadcast `Binary` operands read through `(rep, len)` rather than a
+    // materialised `Expand` (see fold_expand_into_binary).
+    let graph = crate::unfuse::fold_expand_into_binary(graph);
+    // Multi-head attention matmuls read Q / Kᵀ / V through strided views of the
+    // qkv projection instead of narrow + transpose copies (Metal coop only).
+    let graph = if matches!(dev.backend, wgpu::Backend::Metal)
+        && crate::kernels::matmul_coop_f32_strided_kernel(&dev.device).is_some()
+        && !rlx_ir::env::flag("RLX_WGPU_NO_STRIDED_BMM")
+    {
+        crate::unfuse::fold_strided_bmm(graph)
+    } else {
+        graph
+    };
 
     if rlx_ir::env::flag("RLX_WGPU_DEBUG_OP_HIST") {
         let mut hist: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -1433,8 +1892,21 @@ pub(crate) fn compile_static_inner(
         eprintln!("rlx-wgpu op histogram: {sorted:?}");
     }
 
-    // f32-uniform slots + liveness reuse (pairwise `[n,n]` graphs).
-    let mut plan = plan_f32_uniform(&graph, 16);
+    // conv/norm activations as f16, two to a word (`RLX_WGPU_HALF_ACTIVATIONS`);
+    // a packed tensor bound for the host restarts without folds or packing
+    let graph = if folds {
+        crate::unfuse::maybe_pack_half(graph)
+    } else {
+        crate::unfuse::set_half_packed(false);
+        graph
+    };
+    // f32-uniform slots + liveness reuse (pairwise `[n,n]` graphs); a packed
+    // graph's halves at two bytes (the hybrid planner)
+    let mut plan = if crate::unfuse::half_packed() {
+        crate::buffer::plan_hybrid(&graph, 16)
+    } else {
+        plan_f32_uniform(&graph, 16)
+    };
     // The shared planner only allocates a slot when its byte size is non-zero
     // (`rlx_compile::memory`), so a tensor with a zero-length dimension gets no entry at all —
     // LuxTTS's flow decoder builds an `Expand [0,1,512]`. Every arena lookup in this backend
@@ -1595,13 +2067,30 @@ pub(crate) fn compile_static_inner(
             .nodes()
             .iter()
             .any(|node| matches!(&node.op, rlx_ir::Op::DequantMatMul { .. }));
+    // Weight-buffer offsets start at `WEIGHT_BUF_TAG`: on wasm32 that is
+    // 3 GiB, so an arena crossing it would read its own offsets as weight
+    // offsets. Split before it can — a no-op on 64-bit.
+    let split_at = max_bind.min(crate::buffer::WEIGHT_BUF_TAG as u64);
+    // Packed GGUF weights read only by the fused GEMV can also live in the
+    // weight buffer when the arena is small: the GEMV binds it in place, and
+    // a second executable over the same weights (another decode rung, the
+    // prefill graph) can then adopt it (`share_weights_from`) instead of
+    // holding a copy of its own. Not when a tail scratch zone was reserved
+    // above — `from_plan_split` re-plans the activations and would not keep it.
+    let packed_in_place = !rlx_ir::env::flag("RLX_WGPU_PACKED_IN_ARENA")
+        && dequant_scratch == 0
+        && gdn_scratch == 0
+        && rnn_gru_scratch == 0
+        && crate::gguf_gpu::packed_weights_bind_in_place(&graph);
     let mut arena = if rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
         || shares_params
-        || (plan.arena_size + scratch_bytes) as u64 > max_bind
+        || (plan.arena_size + scratch_bytes) as u64 > split_at
     {
         // This constructor has the graph, so it records the parameter-storage bounds
         // itself, from the compact plan it re-plans and places the parameters under.
         Arena::from_plan_split(&dev.device, &plan, &graph, scratch_bytes)
+    } else if packed_in_place {
+        Arena::from_plan_split_opts(&dev.device, &plan, &graph, scratch_bytes, false)
     } else {
         // This one never sees a graph, so its record is taken here: one recording per
         // arena, both plans covered.
@@ -1617,6 +2106,37 @@ pub(crate) fn compile_static_inner(
     let kv_in_place = arena.finish_plan(&graph, max_bind);
     if kv_in_place > 0 && rlx_ir::env::flag("RLX_WGPU_SCHEDULE") {
         eprintln!("[rlx-wgpu] kv rows written in place (copy elided): {kv_in_place}");
+    }
+    if rlx_ir::env::flag("RLX_WGPU_ARENA_REPORT") {
+        eprintln!(
+            "[rlx-wgpu] arena build: plan {} + scratch {} vs split_at {} -> size {} sharded {}",
+            plan.arena_size,
+            scratch_bytes,
+            split_at,
+            arena.size,
+            arena.is_sharded()
+        );
+    }
+    // Override slot lengths with the actual elem*4 byte counts so
+    // readback returns the right element count (slots may be
+    // padded for alignment).
+    for node in graph.nodes() {
+        let elems = node.shape.num_elements().unwrap_or(0);
+        // Actual byte length = (# of f32 lanes) × 4. Real/int/bool tensors are
+        // widened to exactly ONE f32 lane per element (→ `elems * 4`). Complex
+        // tensors genuinely occupy MULTIPLE f32 lanes — C64 = 2 lanes (8 B),
+        // C128 = 4 lanes (16 B) — so `elems * 4` would truncate the slot and
+        // drop the imaginary (and df64 lo) lanes on readback / aliasing copies.
+        let dt = node.shape.dtype();
+        let actual = if dt.is_complex() {
+            elems * dt.size_bytes()
+        } else if crate::unfuse::is_half(node) {
+            // two halves to a word (`pack_half_activations`)
+            (elems * 2).div_ceil(4) * 4
+        } else {
+            elems * 4
+        };
+        arena.set_actual_len(node.id, actual);
     }
 
     // Initialize Constants directly into the arena. The wgpu arena is f32-
@@ -1709,6 +2229,7 @@ pub(crate) fn compile_static_inner(
     let mut meta_buffers: Vec<wgpu::Buffer> = Vec::new();
     let mut coop_f16_b_param: HashMap<u32, String> = HashMap::new();
     let mut coop_f16_vk_wide_bind_groups: HashMap<usize, wgpu::BindGroup> = HashMap::new();
+    let mut coop_f16_vk_a_off: HashMap<usize, u32> = HashMap::new();
     let mm_w_active_compile = matmul_wide_active_kernel(&dev.device);
 
     let coop_f16_vk_mirror_acts = collect_coop_f16_vk_mirror_activations(&graph, &dev.device);
@@ -1833,7 +2354,24 @@ pub(crate) fn compile_static_inner(
                     arena_tensors_overlap(&arena, n.id, t)
                 })
             };
-            let unsafe_slot = live_across(q) || live_across(k) || live_across(v);
+            // The three sinks must also be disjoint from EACH OTHER, which
+            // `live_across` cannot see: it excludes q, k and v from its scan by
+            // construction, so an aliasing *among* them reads as safe. They
+            // alias routinely. A `qkv_heads` helper emits
+            // `narrow(q) → reshape → transpose → narrow(k) → …`, so each narrow
+            // dies at its own transpose, one step before the next is born — and
+            // the planner, correctly for the unfused order, hands all three the
+            // same offset. Fused, one dispatch writes Q, K and V into those same
+            // bytes at once, so all three heads end up holding a race-dependent
+            // mix of one projection. AXON (`MannasAI/axon-eeg`) is the repro:
+            // `block0_attn` at cos 0.61–0.80 varying run to run, with the three
+            // narrows all at arena offset 278969856 and Q and K coming back with
+            // an identical max. Exact under `RLX_ARENA_NO_REUSE=1`, which is
+            // what made it look like an arena bug — the plan was always valid.
+            let sinks_alias = arena_tensors_overlap(&arena, q, k)
+                || arena_tensors_overlap(&arena, q, v)
+                || arena_tensors_overlap(&arena, k, v);
+            let unsafe_slot = sinks_alias || live_across(q) || live_across(k) || live_across(v);
             if !unsafe_slot {
                 qkv_split.insert(parent_id, qkv);
             }
@@ -2065,6 +2603,32 @@ pub(crate) fn compile_static_inner(
             &mut narrow_split_skip,
         )
     };
+
+    // ── Post-fold write-set hazard check ─────────────────────────────
+    // `report_slot_hazards` near the top of this function runs on the graph and
+    // the plan, which is to say BEFORE any fold below has been chosen. Every
+    // step's write set there is the slot its own node owns, so a fold that
+    // writes slots belonging to *other* nodes is structurally invisible to it —
+    // and that is the whole bug class. On AXON it reported 66 write-after-read
+    // hazards, 0 of them not view-explained, while the split-QKV elision was
+    // writing Q, K and V into one shared offset.
+    //
+    // Every fold that writes a slot it does not own registers its targets here,
+    // and one check covers all of them. The first thing it checks is the
+    // cheapest and the one nobody thought to: that a fold's own targets do not
+    // alias EACH OTHER. `live_across` scans every other tensor live across the
+    // fold's step and excludes q/k/v from that scan by construction, so three
+    // sinks on one offset read as safe.
+    let fold_writes: Vec<(NodeId, Vec<NodeId>, &'static str)> = qkv_split
+        .iter()
+        .map(|(&parent, &(q, k, v))| (parent, vec![q, k, v], "split-QKV elision"))
+        .chain(
+            ln_to_tee
+                .iter()
+                .map(|(&ln, &(_, _, _, _, sum))| (ln, vec![sum], "residual-LN tee")),
+        )
+        .collect();
+    report_fold_write_hazards(&graph, &arena, &fold_writes);
 
     let mut coop_f16_host_activations: Vec<(NodeId, Activation, String)> = Vec::new();
     let mut static_once_steps: HashSet<usize> = HashSet::new();
@@ -2359,6 +2923,13 @@ pub(crate) fn compile_static_inner(
         // ergonomic in the loop, so inline the bind-group build
         // when each step is emitted below.
         let elems = node.shape.num_elements().unwrap_or(0) as u32;
+        // A parked param's offset carries `WEIGHT_BUF_TAG` (bit 62) and a past-4 GiB
+        // activation's does not fit a `u32` either, so a step that keeps the offset as
+        // a word drops the high bits and reads whatever sits at the remainder.
+        if must_run_as_generic_host_op(&dev.device, &node.op, node, &arena, &graph) {
+            schedule.push(host_op_step(&graph, node, &arena));
+            continue;
+        }
         match &node.op {
             Op::Input { .. } | Op::Param { .. } | Op::Constant { .. } => continue,
             // Virtually-sharded arenas: SPIR-V windowed elementwise / matmul /
@@ -2505,9 +3076,10 @@ pub(crate) fn compile_static_inner(
                     n,
                 );
                 if b_is_param
-                    && b_bytes > ARENA_STAGE_CAP
+                    && b_bytes > arena_stage_cap()
                     && arena.param_fits_f16_mirror(b_id)
                     && !rlx_ir::env::flag("RLX_WGPU_NO_F16_MIRROR")
+                    && f16_mirror_needed(&dev.device, &arena, &[node.id, a_id, b_id])
                     // A genuine BF16 weight is stored f32 in the arena and must
                     // stay bit-exact — reading it from the f16 shadow would drop
                     // bf16's exponent range. Keep it on the F32 path.
@@ -2554,7 +3126,7 @@ pub(crate) fn compile_static_inner(
                 if param_anchor {
                     arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                 }
-                if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
+                if b_is_param && b_bytes > arena_stage_cap() && b_in_arena {
                     // Large act-arena params stage into the bind window via
                     // `arena_off_in_bind_window` below. Weight-buffer params
                     // are tagged and skipped here. Do not assert in-window —
@@ -2581,7 +3153,7 @@ pub(crate) fn compile_static_inner(
                     // it into the f16 weight window.
                     (arena.offset(b_id) / 4) as u32
                 } else if b_is_param
-                    && b_bytes > ARENA_STAGE_CAP
+                    && b_bytes > arena_stage_cap()
                     && arena_tensor_in_window(&arena, b_id, base, size)
                 {
                     arena_local_off_f32(&arena, b_id, base)
@@ -2621,11 +3193,9 @@ pub(crate) fn compile_static_inner(
                     &mut bind_groups,
                     &mm_cast,
                     compute_precision,
-                    a_off_f32,
                     m,
                     k,
                     batch,
-                    b_off_f32,
                     n,
                 );
                 schedule.push(Step::Matmul {
@@ -2647,14 +3217,16 @@ pub(crate) fn compile_static_inner(
                     compute_precision,
                 });
                 let b_off_global = (arena.offset(b_id) / 4) as u32;
-                let b_off_bind = if b_is_param
+                let b_off_bind = if b_is_param && compute_precision == MatmulCompute::Bf16Packed {
+                    // bf16 elements into the packed side buffer, whose bytes
+                    // mirror the arena's (see `Arena::bf16_weight_buffer`).
+                    (arena.offset(b_id) / 2) as u32
+                } else if b_is_param
                     && matches!(
                         compute_precision,
-                        MatmulCompute::Coop16
-                            | MatmulCompute::CoopF16Vk
-                            | MatmulCompute::F16
-                            | MatmulCompute::Bf16Packed
-                    ) {
+                        MatmulCompute::Coop16 | MatmulCompute::CoopF16Vk | MatmulCompute::F16
+                    )
+                {
                     b_off_global
                 } else {
                     b_off_f32
@@ -2667,6 +3239,11 @@ pub(crate) fn compile_static_inner(
                     compute_precision,
                 );
                 let u = emit_uniform(std::mem::size_of::<MatmulParams>());
+                let a_f16 = (
+                    arena.offset(a_id) as u64 / 4,
+                    (batch.max(1) as u64 - 1) * a_bs as u64 + m as u64 * k as u64,
+                );
+                let mut a_off_f16 = 0u32;
                 let (bg, b_off_adj) = build_matmul_bind_group(
                     &dev.device,
                     mm_k,
@@ -2688,6 +3265,8 @@ pub(crate) fn compile_static_inner(
                     batch,
                     b_off_bind,
                     b_bs,
+                    a_f16,
+                    &mut a_off_f16,
                 );
                 if let Some(Step::Matmul { b_off_f32, .. }) = schedule.last_mut() {
                     *b_off_f32 = b_off_adj;
@@ -2695,6 +3274,7 @@ pub(crate) fn compile_static_inner(
                 uniforms.push(u);
                 bind_groups.push(bg);
                 if compute_precision == MatmulCompute::CoopF16Vk {
+                    coop_f16_vk_a_off.insert(schedule.len() - 1, a_off_f16);
                     coop_f16_vk_wide_bind_groups.insert(
                         schedule.len() - 1,
                         bind_arena_window(
@@ -2983,12 +3563,21 @@ pub(crate) fn compile_static_inner(
                 let b_len = arena.len_of(b_id) as u64;
                 let a_in = a_src >= base && a_src + a_len <= base + size;
                 let b_in = b_src >= base && b_src + b_len <= base + size;
-                let a_dst = arena.scratch_off as u64;
+                let a_dst = elementwise_stage_slot(&arena, base);
                 let a_aligned = a_len.div_ceil(256) * 256;
                 let b_dst = a_dst + a_aligned;
-                if a_dst < base || b_dst + b_len > base + size {
+                if (!a_in || !b_in)
+                    && !arena.is_sharded()
+                    && (a_dst < base || b_dst + b_len > base + size)
+                {
                     base = (arena.size as u64).saturating_sub(size);
                     base = (base / 256) * 256;
+                }
+                if (!a_in || !b_in) && arena.is_sharded() {
+                    assert!(
+                        b_dst + b_len <= arena.shard_stage_end(base as usize) as u64,
+                        "rlx-wgpu: Compare staging overruns the stripe's stage reserve"
+                    );
                 }
                 let a_off = if a_in {
                     arena_local_off_f32(&arena, a_id, base)
@@ -3092,6 +3681,87 @@ pub(crate) fn compile_static_inner(
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
+            // `PRELU`: one pass, the unary kernel with the slope in `_p0`
+            // (`PRELU_TENSOR_OP`: the slope a tensor, its offset in `_p0`)
+            Op::Custom { name, attrs, .. } if name == crate::unfuse::PRELU => {
+                let word = |k: usize| {
+                    u32::from_le_bytes(attrs[4 * k..4 * k + 4].try_into().expect("PRELU attrs"))
+                };
+                let slope = node.inputs.get(1).copied();
+                let in_id = node.inputs[0];
+                let win_ids: Vec<NodeId> = [node.id, in_id].into_iter().chain(slope).collect();
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win_ids,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                // the slope first: staging it may move the window
+                let slope_off = slope.map(|sl| {
+                    arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        sl,
+                        &mut base,
+                        &mut size,
+                    )
+                });
+                let in_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    in_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = match slope_off {
+                    None => UnaryParams {
+                        n: elems,
+                        in_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        op: crate::unfuse::PRELU_OP,
+                        _p0: word(0),
+                        _p1: 0,
+                        _p2: 0,
+                        _p3: 0,
+                    },
+                    Some(slope_off) => UnaryParams {
+                        n: elems,
+                        in_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        op: crate::unfuse::PRELU_TENSOR_OP,
+                        _p0: slope_off,
+                        _p1: word(0),
+                        _p2: word(1),
+                        _p3: 0,
+                    },
+                };
+                schedule.push(Step::Unary {
+                    params: p,
+                    f16_mirror: false,
+                });
+                let u = emit_uniform(std::mem::size_of::<UnaryParams>());
+                let bg = bind_arena_window(&dev.device, uk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
             Op::Where => {
                 let (mut base, size) = arena_window_for_nodes(&dev.device, &arena, &[node.id]);
                 let cond_id = node.inputs[0];
@@ -3106,14 +3776,23 @@ pub(crate) fn compile_static_inner(
                 let cond_in = cond_src >= base && cond_src + cond_len <= base + size;
                 let x_in = x_src >= base && x_src + x_len <= base + size;
                 let y_in = y_src >= base && y_src + y_len <= base + size;
-                let cond_dst = arena.scratch_off as u64;
+                let cond_dst = elementwise_stage_slot(&arena, base);
                 let cond_aligned = cond_len.div_ceil(256) * 256;
                 let x_dst = cond_dst + cond_aligned;
                 let x_aligned = x_len.div_ceil(256) * 256;
                 let y_dst = x_dst + x_aligned;
-                if cond_dst < base || y_dst + y_len > base + size {
+                if (!cond_in || !x_in || !y_in)
+                    && !arena.is_sharded()
+                    && (cond_dst < base || y_dst + y_len > base + size)
+                {
                     base = (arena.size as u64).saturating_sub(size);
                     base = (base / 256) * 256;
+                }
+                if (!cond_in || !x_in || !y_in) && arena.is_sharded() {
+                    assert!(
+                        y_dst + y_len <= arena.shard_stage_end(base as usize) as u64,
+                        "rlx-wgpu: Where staging overruns the stripe's stage reserve"
+                    );
                 }
                 let cond_off = if cond_in {
                     arena_local_off_f32(&arena, cond_id, base)
@@ -3185,14 +3864,23 @@ pub(crate) fn compile_static_inner(
                 let a_in = a_src >= base && a_src + a_len <= base + size;
                 let b_in = b_src >= base && b_src + b_len <= base + size;
                 let c_in = c_src >= base && c_src + c_len <= base + size;
-                let a_dst = arena.scratch_off as u64;
+                let a_dst = elementwise_stage_slot(&arena, base);
                 let a_aligned = a_len.div_ceil(256) * 256;
                 let b_dst = a_dst + a_aligned;
                 let b_aligned = b_len.div_ceil(256) * 256;
                 let c_dst = b_dst + b_aligned;
-                if a_dst < base || c_dst + c_len > base + size {
+                if (!a_in || !b_in || !c_in)
+                    && !arena.is_sharded()
+                    && (a_dst < base || c_dst + c_len > base + size)
+                {
                     base = (arena.size as u64).saturating_sub(size);
                     base = (base / 256) * 256;
+                }
+                if (!a_in || !b_in || !c_in) && arena.is_sharded() {
+                    assert!(
+                        c_dst + c_len <= arena.shard_stage_end(base as usize) as u64,
+                        "rlx-wgpu: Fma staging overruns the stripe's stage reserve"
+                    );
                 }
                 let a_off = if a_in {
                     arena_local_off_f32(&arena, a_id, base)
@@ -3384,6 +4072,26 @@ pub(crate) fn compile_static_inner(
                         chain.len()
                     );
                 }
+                // The arm below stages one operand per slice, so a declared slice count
+                // above the node's real operand count would index past `node.inputs` — an
+                // index panic, which is not a refusal. A well-formed region is expanded
+                // before it reaches this arm (plain and prologue regions by
+                // `crate::unfuse::expand_unimplemented_regions`, the batch one by
+                // `DecomposeFusionRegions`); what arrives with the two counts disagreeing
+                // is a malformed region nothing expands, and the honest answer is to name
+                // it rather than run it on shifted operands.
+                assert!(
+                    n <= node.inputs.len(),
+                    "rlx-wgpu: REFUSED (batch region operand count): {id:?} declares \
+                     num_batch_inputs={n} but has {operands} operand(s) — this arm stages one \
+                     input per slice and slice {last} has none to stage. A well-formed region \
+                     is expanded before it reaches this arm, so this one cannot be, and there \
+                     is no switch on this backend that makes it run: the graph has to be \
+                     built with one operand per slice.",
+                    id = node.id,
+                    operands = node.inputs.len(),
+                    last = n - 1,
+                );
                 let slice_shape = rlx_ir::batch_region_slice_shape(&node.shape);
                 assert_region_modulus_expressible(&graph, node);
                 let slice_elems = rlx_ir::batch_region_slice_elems(&node.shape, n)
@@ -3987,7 +4695,8 @@ pub(crate) fn compile_static_inner(
                 {
                     let gamma_is_param = tensor_is_graph_param(&graph, &param_offsets, gamma_id);
                     let gamma_bytes = arena.len_of(gamma_id) as u64;
-                    let frlt_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > ARENA_STAGE_CAP {
+                    let frlt_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > arena_stage_cap()
+                    {
                         vec![gamma_id, node.id, h_id, delta_id, beta_id, sum_id]
                     } else {
                         vec![node.id, h_id, delta_id, gamma_id, beta_id, sum_id]
@@ -4145,7 +4854,7 @@ pub(crate) fn compile_static_inner(
                 };
                 let gamma_is_param = tensor_is_graph_param(&graph, &param_offsets, gamma_id);
                 let gamma_bytes = arena.len_of(gamma_id) as u64;
-                let ln_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > ARENA_STAGE_CAP {
+                let ln_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > arena_stage_cap() {
                     vec![gamma_id, node.id, in_id]
                 } else {
                     let mut v = vec![node.id, in_id];
@@ -4336,7 +5045,11 @@ pub(crate) fn compile_static_inner(
                 bind_groups.push(bg);
             }
 
-            Op::Reshape { .. } => {
+            // `StopGradient` is the identity in the forward pass (the AD pass
+            // handles the gradient cut upstream, as in rlx-metal's lowering).
+            // `supported_ops` already advertised it, so a graph containing one
+            // was accepted and then panicked here.
+            Op::Reshape { .. } | Op::StopGradient => {
                 // A row of the mel front-end's framing: a view of a frame narrow
                 // whose value `Step::Frames` writes into the concat's slot
                 // directly, so the row's own slot is never read. Skipped before
@@ -4786,6 +5499,19 @@ pub(crate) fn compile_static_inner(
                     .product::<u32>()
                     .max(1);
                 let axis_in = in_shape[*axis].unwrap_static() as u32;
+                // The planner aliases a contiguous narrow (only size-1 dims
+                // before `axis`) into its parent's slot, so the copy below would
+                // write the slice onto itself. Skip it — but only when the arena
+                // really placed it there (f32-uniform lanes; complex excluded).
+                if outer == 1
+                    && !node.shape.dtype().is_complex()
+                    && rlx_compile::memory::is_pure_view(&graph, node)
+                    && arena.has(node.id)
+                    && arena.has(in_id)
+                    && arena.offset(node.id) == arena.offset(in_id) + *start * inner as usize * 4
+                {
+                    continue;
+                }
                 if wgpu_prefer_structure_host(&arena) {
                     let lanes = match node.shape.dtype() {
                         rlx_ir::DType::C64 => 2,
@@ -5688,6 +6414,9 @@ pub(crate) fn compile_static_inner(
                                 batch_bh,
                                 b_off,
                                 k * n,
+                                // A-side mirror unused: both operands are the attention scratch.
+                                (0, 0),
+                                &mut 0u32,
                             );
                             uniforms.push(u);
                             bind_groups.push(bg);
@@ -5988,6 +6717,9 @@ pub(crate) fn compile_static_inner(
                             batch_bh,
                             b_off,
                             k * n,
+                            // A-side mirror unused: both operands are the attention scratch.
+                            (0, 0),
+                            &mut 0u32,
                         );
                         uniforms.push(u);
                         bind_groups.push(bg);
@@ -6615,7 +7347,7 @@ pub(crate) fn compile_static_inner(
                 let batch = total / (seq * last as u32).max(1);
                 let cos_is_param = tensor_is_graph_param(&graph, &param_offsets, cos_id);
                 let cos_bytes = arena.len_of(cos_id) as u64;
-                let rope_win: Vec<NodeId> = if cos_is_param && cos_bytes > ARENA_STAGE_CAP {
+                let rope_win: Vec<NodeId> = if cos_is_param && cos_bytes > arena_stage_cap() {
                     vec![cos_id, sin_id, node.id, x_id]
                 } else {
                     vec![node.id, x_id, cos_id, sin_id]
@@ -6993,7 +7725,7 @@ pub(crate) fn compile_static_inner(
                     rlx_ir::DType::C128 => 4,
                     _ => 1,
                 };
-                let gather_win: Vec<NodeId> = if table_is_param && table_bytes > ARENA_STAGE_CAP {
+                let gather_win: Vec<NodeId> = if table_is_param && table_bytes > arena_stage_cap() {
                     vec![table_id, node.id, idx_id]
                 } else {
                     vec![node.id, idx_id, table_id]
@@ -7107,6 +7839,19 @@ pub(crate) fn compile_static_inner(
                 let a_id = node.inputs[0];
                 let b_id = node.inputs[1];
                 let bias_id = node.inputs[2];
+                // An arena past the binding limit parks every param in the
+                // weight buffer; when the staged W/bias cannot share a window
+                // with x and the output, host the op (KittenTTS on a 2 GiB-
+                // binding RTX read W from outside the binding: silent audio).
+                if !super::super::parked_operands_reachable(
+                    &dev.device,
+                    &arena,
+                    &[node.id, a_id],
+                    &[b_id, bias_id],
+                ) {
+                    schedule.push(host_op_step(&graph, node, &arena));
+                    continue;
+                }
                 let a_shape = graph.node(a_id).shape.dims();
                 let b_shape = graph.node(b_id).shape.dims();
                 let out_shape = node.shape.dims();
@@ -7152,9 +7897,10 @@ pub(crate) fn compile_static_inner(
                     n,
                 );
                 if b_is_param
-                    && b_bytes > ARENA_STAGE_CAP
+                    && b_bytes > arena_stage_cap()
                     && arena.param_fits_f16_mirror(b_id)
                     && !rlx_ir::env::flag("RLX_WGPU_NO_F16_MIRROR")
+                    && f16_mirror_needed(&dev.device, &arena, &[node.id, a_id, b_id])
                     // A genuine BF16 weight is stored f32 in the arena and must
                     // stay bit-exact — reading it from the f16 shadow would drop
                     // bf16's exponent range. Keep it on the F32 path.
@@ -7173,9 +7919,18 @@ pub(crate) fn compile_static_inner(
                     );
                 if mqk_eligible && let Some(&(q_id, k_id_n, v_id)) = qkv_split.get(&node.id) {
                     let head_width = n / 3;
+                    // `matmul_qkv_coop_f32` keeps the original CoopF32 contract
+                    // (Param B, k%8, n%32 on Metal). CoopF32 now also covers
+                    // unaligned / activation-B matmuls via the edge kernel, which
+                    // has no split-QKV twin — those take the F32 split kernel.
+                    let qkv_coop_f32_ok = b_is_param
+                        && (!matches!(
+                            crate::device::wgpu_device().map(|d| d.backend),
+                            Some(wgpu::Backend::Metal)
+                        ) || crate::kernels::coop_f32_metal_aligned(k, n));
                     let qkv_kind = match compute_precision {
                         MatmulCompute::CoopF16Vk => MatmulQkvKind::CoopF16Vk,
-                        MatmulCompute::CoopF32 => MatmulQkvKind::CoopF32,
+                        MatmulCompute::CoopF32 if qkv_coop_f32_ok => MatmulQkvKind::CoopF32,
                         _ => MatmulQkvKind::F32,
                     };
                     let b_in_arena = !matmul_b_from_f16(compute_precision, b_is_param);
@@ -7193,7 +7948,7 @@ pub(crate) fn compile_static_inner(
                     if param_anchor {
                         arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                     }
-                    if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
+                    if b_is_param && b_bytes > arena_stage_cap() && b_in_arena {
                         // Staging via arena_off_in_bind_window — no in-window assert
                         // (VirtIO/DX12 ~2 GiB caps leave large F32 params outside).
                         let _ = arena.offset(b_id);
@@ -7256,7 +8011,7 @@ pub(crate) fn compile_static_inner(
                     let b_off_f32 = if !b_in_arena {
                         (arena.offset(b_id) / 4) as u32
                     } else if b_is_param
-                        && b_bytes > ARENA_STAGE_CAP
+                        && b_bytes > arena_stage_cap()
                         && arena_tensor_in_window(&arena, b_id, base, size)
                     {
                         arena_local_off_f32(&arena, b_id, base)
@@ -7286,15 +8041,9 @@ pub(crate) fn compile_static_inner(
                         &mut bind_groups,
                         &mm_cast,
                         compute_precision,
-                        a_off,
                         m,
                         k,
                         1,
-                        if qkv_kind == MatmulQkvKind::CoopF16Vk {
-                            b_off_global
-                        } else {
-                            b_off_f32
-                        },
                         n,
                     );
                     let p = MatmulQkvParams {
@@ -7340,7 +8089,7 @@ pub(crate) fn compile_static_inner(
                             let mqk = matmul_qkv_coop_f16_vk_kernel(&dev.device).expect(
                                 "coop f16 matmul_qkv kernel: feature was checked but missing",
                             );
-                            let (bg, b_off_adj) = build_matmul_qkv_coop_f16_vk_bind_group(
+                            let (bg, b_off_adj, a_off_f16) = build_matmul_qkv_coop_f16_vk_bind_group(
                                 &dev.device,
                                 mqk,
                                 &arena,
@@ -7350,9 +8099,13 @@ pub(crate) fn compile_static_inner(
                                 k,
                                 n,
                                 p.b_off,
+                                (arena.offset(a_id) as u64 / 4, m as u64 * k as u64),
                             );
                             if let Some(Step::MatmulQkv { params, .. }) = schedule.last_mut() {
                                 params.b_off = b_off_adj;
+                                // A's offset in the f16 window (`a_off` stays the
+                                // f32 window's, for the wide f32 fallback).
+                                params._p0 = a_off_f16;
                             }
                             bg
                         }
@@ -7406,7 +8159,7 @@ pub(crate) fn compile_static_inner(
                     if param_anchor {
                         arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
                     }
-                    if b_is_param && b_bytes > ARENA_STAGE_CAP && b_in_arena {
+                    if b_is_param && b_bytes > arena_stage_cap() && b_in_arena {
                         // Staging via arena_off_in_bind_window — no in-window assert
                         // (VirtIO/DX12 ~2 GiB caps leave large F32 params outside).
                         let _ = arena.offset(b_id);
@@ -7422,10 +8175,11 @@ pub(crate) fn compile_static_inner(
                         &mut base,
                         &mut size,
                     );
+                    let a_at = base;
                     let b_off_f32 = if !b_in_arena {
                         (arena.offset(b_id) / 4) as u32
                     } else if b_is_param
-                        && b_bytes > ARENA_STAGE_CAP
+                        && b_bytes > arena_stage_cap()
                         && arena_tensor_in_window(&arena, b_id, base, size)
                     {
                         arena_local_off_f32(&arena, b_id, base)
@@ -7442,6 +8196,7 @@ pub(crate) fn compile_static_inner(
                             &mut size,
                         )
                     };
+                    let b_at = base;
                     let bias_off_f32 = arena_off_in_bind_window(
                         &graph,
                         &param_offsets,
@@ -7453,6 +8208,13 @@ pub(crate) fn compile_static_inner(
                         &mut base,
                         &mut size,
                     );
+                    // Placing B or the bias may have moved the window.
+                    let a_off_f32 = rebase_window_off_f32(a_off_f32, a_at, base);
+                    let b_off_f32 = if b_in_arena {
+                        rebase_window_off_f32(b_off_f32, b_at, base)
+                    } else {
+                        b_off_f32
+                    };
                     let b_off_global = (arena.offset(b_id) / 4) as u32;
                     let b_off_bind = if b_is_param
                         && matches!(
@@ -7475,11 +8237,9 @@ pub(crate) fn compile_static_inner(
                         &mut bind_groups,
                         &mm_cast,
                         compute_precision,
-                        a_off_f32,
                         m,
                         k,
                         1,
-                        b_off_bind,
                         n,
                     );
                     schedule.push(Step::Matmul {
@@ -7508,6 +8268,8 @@ pub(crate) fn compile_static_inner(
                         compute_precision,
                     );
                     let u = emit_uniform(std::mem::size_of::<MatmulParams>());
+                    let a_f16 = (arena.offset(a_id) as u64 / 4, m as u64 * k as u64);
+                    let mut a_off_f16 = 0u32;
                     let (bg, b_off_adj) = build_matmul_bind_group(
                         &dev.device,
                         mm_k,
@@ -7529,6 +8291,8 @@ pub(crate) fn compile_static_inner(
                         1,
                         b_off_bind,
                         0,
+                        a_f16,
+                        &mut a_off_f16,
                     );
                     if let Some(Step::Matmul { b_off_f32, .. }) = schedule.last_mut() {
                         *b_off_f32 = b_off_adj;
@@ -7536,6 +8300,7 @@ pub(crate) fn compile_static_inner(
                     uniforms.push(u);
                     bind_groups.push(bg);
                     if compute_precision == MatmulCompute::CoopF16Vk {
+                        coop_f16_vk_a_off.insert(schedule.len() - 1, a_off_f16);
                         coop_f16_vk_wide_bind_groups.insert(
                             schedule.len() - 1,
                             bind_arena_window(
@@ -8351,8 +9116,14 @@ pub(crate) fn compile_static_inner(
                             // silently drop a bias if that contract changes.
                             bias_off,
                             has_bias,
-                            _p1: 0,
-                            _p2: 0,
+                            act: 0,
+                            alpha: 0,
+                            split: 0,
+                            half: 0,
+                            in_prelu: 0,
+                            in_alpha: 0,
+                            res_max: 0,
+                            res_off: 0,
                         };
                         schedule.push(Step::Conv3d { params: p3 });
                         let ck = conv3d_kernel(&dev.device);
@@ -8376,7 +9147,7 @@ pub(crate) fn compile_static_inner(
                 groups,
                 activation,
                 has_residual,
-            } => {
+            } if kernel_size.len() != 3 => {
                 // Native 2D conv fused with the bias + optional-residual + act
                 // epilogue: y = act(conv(x,w) + bias[c] + residual). Replaces the
                 // CPU host round-trip; conv body matches conv2d.wgsl bit-for-bit.
@@ -8543,6 +9314,9 @@ pub(crate) fn compile_static_inner(
                 });
             }
 
+            // Conv2d backward runs on the GPU as the native Conv3d backward
+            // kernels with a depth of 1 (d = kd = sd = dd = 1, pd = 0) — no
+            // D2H → CPU → H2D round trip per training step.
             Op::Conv2dBackwardWeight {
                 kernel_size,
                 stride,
@@ -8550,29 +9324,85 @@ pub(crate) fn compile_static_inner(
                 dilation,
                 groups,
             } => {
-                let x_shape = &graph.node(node.inputs[0]).shape;
-                let dy_shape = &graph.node(node.inputs[1]).shape;
-                schedule.push(Step::Conv2dBackwardWeightHost {
-                    x_byte_off: arena.offset(node.inputs[0]) as u32,
-                    dy_byte_off: arena.offset(node.inputs[1]) as u32,
-                    dw_byte_off: arena.offset(node.id) as u32,
+                let x_id = node.inputs[0];
+                let dy_id = node.inputs[1];
+                let x_shape = &graph.node(x_id).shape;
+                let dy_shape = &graph.node(dy_id).shape;
+                let win = vec![node.id, x_id, dy_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let x_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    x_id,
+                    &mut base,
+                    &mut size,
+                );
+                let dy_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    dy_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = Conv3dBwdWeightParams {
                     n: x_shape.dim(0).unwrap_static() as u32,
                     c_in: x_shape.dim(1).unwrap_static() as u32,
+                    d: 1,
                     h: x_shape.dim(2).unwrap_static() as u32,
                     w: x_shape.dim(3).unwrap_static() as u32,
                     c_out: dy_shape.dim(1).unwrap_static() as u32,
+                    d_out: 1,
                     h_out: dy_shape.dim(2).unwrap_static() as u32,
                     w_out: dy_shape.dim(3).unwrap_static() as u32,
+                    kd: 1,
                     kh: kernel_size[0] as u32,
                     kw: kernel_size[1] as u32,
+                    sd: 1,
                     sh: stride.first().copied().unwrap_or(1) as u32,
                     sw: stride.get(1).copied().unwrap_or(1) as u32,
+                    pd: 0,
                     ph: padding.first().copied().unwrap_or(0) as u32,
                     pw: padding.get(1).copied().unwrap_or(0) as u32,
+                    dd: 1,
                     dh: dilation.first().copied().unwrap_or(1) as u32,
-                    dw_dil: dilation.get(1).copied().unwrap_or(1) as u32,
+                    dw: dilation.get(1).copied().unwrap_or(1) as u32,
                     groups: (*groups).max(1) as u32,
-                });
+                    x_off,
+                    dy_off,
+                    dw_off: arena_local_off_f32(&arena, node.id, base),
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
+                };
+                schedule.push(Step::Conv3dBackwardWeight { params: p });
+                let sk = conv3d_backward_weight_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<Conv3dBwdWeightParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
             }
 
             Op::Conv2dBackwardInput {
@@ -8583,29 +9413,85 @@ pub(crate) fn compile_static_inner(
                 groups,
             } => {
                 // inputs [dy, w]; output dx [n, c_in, h, w_in].
-                let dy_shape = &graph.node(node.inputs[0]).shape;
+                let dy_id = node.inputs[0];
+                let w_id = node.inputs[1];
+                let dy_shape = &graph.node(dy_id).shape;
                 let dx_shape = &node.shape;
-                schedule.push(Step::Conv2dBackwardInputHost {
-                    dy_byte_off: arena.offset(node.inputs[0]) as u32,
-                    w_byte_off: arena.offset(node.inputs[1]) as u32,
-                    dx_byte_off: arena.offset(node.id) as u32,
+                let win = vec![node.id, dy_id, w_id];
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let dy_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    dy_id,
+                    &mut base,
+                    &mut size,
+                );
+                let w_off = arena_off_in_bind_window(
+                    &graph,
+                    &param_offsets,
+                    &dev.device,
+                    &arena,
+                    &mut schedule,
+                    &mut scratch,
+                    w_id,
+                    &mut base,
+                    &mut size,
+                );
+                let p = Conv3dBwdInputParams {
                     n: dx_shape.dim(0).unwrap_static() as u32,
                     c_in: dx_shape.dim(1).unwrap_static() as u32,
+                    d: 1,
                     h: dx_shape.dim(2).unwrap_static() as u32,
-                    w_in: dx_shape.dim(3).unwrap_static() as u32,
+                    w: dx_shape.dim(3).unwrap_static() as u32,
                     c_out: dy_shape.dim(1).unwrap_static() as u32,
+                    d_out: 1,
                     h_out: dy_shape.dim(2).unwrap_static() as u32,
                     w_out: dy_shape.dim(3).unwrap_static() as u32,
+                    kd: 1,
                     kh: kernel_size[0] as u32,
                     kw: kernel_size[1] as u32,
+                    sd: 1,
                     sh: stride.first().copied().unwrap_or(1) as u32,
                     sw: stride.get(1).copied().unwrap_or(1) as u32,
+                    pd: 0,
                     ph: padding.first().copied().unwrap_or(0) as u32,
                     pw: padding.get(1).copied().unwrap_or(0) as u32,
+                    dd: 1,
                     dh: dilation.first().copied().unwrap_or(1) as u32,
-                    dw_dil: dilation.get(1).copied().unwrap_or(1) as u32,
+                    dw: dilation.get(1).copied().unwrap_or(1) as u32,
                     groups: (*groups).max(1) as u32,
-                });
+                    dy_off,
+                    w_off,
+                    dx_off: arena_local_off_f32(&arena, node.id, base),
+                    _p0: 0,
+                    _p1: 0,
+                    _p2: 0,
+                };
+                schedule.push(Step::Conv3dBackwardInput { params: p });
+                let sk = conv3d_backward_input_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<Conv3dBwdInputParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
             }
 
             Op::Interpolate3d { .. } => {
@@ -8670,7 +9556,7 @@ pub(crate) fn compile_static_inner(
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
-            Op::Fft { inverse, norm } => {
+            Op::Fft { inverse, norm, .. } => {
                 let in_id = node.inputs[0];
                 let in_shape = graph.node(in_id).shape.clone();
                 let meta = rlx_ir::fft::fft_meta(&in_shape);
@@ -9499,7 +10385,20 @@ pub(crate) fn compile_static_inner(
             } => {
                 let in_shape = &graph.node(node.inputs[0]).shape;
                 let out_shape = &node.shape;
-                if wgpu_prefer_conv_host(&arena) {
+                // A preference for the host route is a preference among routes that
+                // work. Its 32-bit arena offsets cannot serve a parked parameter or an
+                // arena past `u32::MAX` (the refusal below), while the device step
+                // stages such an operand into its bind window — so those geometries
+                // take the device route even where the host route is preferred, which
+                // is the plan that parks every parameter on a sharded arena.
+                let host_unaddressable = (any_parked_operand(&arena, node)
+                    || arena.size > u32::MAX as usize)
+                    && !host_route_forced(&[
+                        "RLX_WGPU_CONV_HOST",
+                        "RLX_WGPU_FORCE_HOST",
+                        "RLX_WGPU_DISCRETE_HOST",
+                    ]);
+                if wgpu_prefer_conv_host(&arena) && !host_unaddressable {
                     // Host route: the compact BLAS-backed staging, forced here by the lever
                     // or the structure-host preference — and the one route whose 32-bit arena
                     // byte offsets cannot serve a parked parameter or an arena past u32::MAX,
@@ -9707,8 +10606,14 @@ pub(crate) fn compile_static_inner(
                         out_off: arena_local_off_f32(&arena, node.id, base),
                         bias_off: 0,
                         has_bias: 0,
-                        _p1: 0,
-                        _p2: 0,
+                        act: 0,
+                        alpha: 0,
+                        split: 0,
+                        half: 0,
+                        in_prelu: 0,
+                        in_alpha: 0,
+                        res_max: 0,
+                        res_off: 0,
                     };
                     // The tiled GEMM serves the family it is proven for (see
                     // `conv_transpose2d_tiled_fits`); the gather serves the rest.
@@ -9729,17 +10634,45 @@ pub(crate) fn compile_static_inner(
                     bind_groups.push(bg);
                 }
             }
-            Op::Conv3d {
-                stride,
-                padding,
-                dilation,
-                groups,
-            } => {
+            // A rank-5 `FusedConvBiasAct` or `CONV3D_LEAKY` here carries the
+            // activation `fold_conv_activation` folded into it; the conv3d
+            // shaders apply it in their store.
+            op @ (Op::Conv3d { .. } | Op::FusedConvBiasAct { .. } | Op::Custom { .. })
+                if crate::unfuse::conv3d_geometry(op).is_some() =>
+            {
+                let (stride, padding, dilation, groups, act, alpha) =
+                    crate::unfuse::conv3d_geometry(op).unwrap();
+                let in_prelu = crate::unfuse::conv3d_in_prelu(op);
+                // a fourth input: the `max` taken in the store
+                let res_id = crate::unfuse::conv3d_max_residual(op).then(|| node.inputs[3]);
+                let (stride, padding, dilation, groups) = (&stride, &padding, &dilation, &groups);
                 let in_id = node.inputs[0];
                 let w_id = node.inputs[1];
-                let win_ids = [node.id, in_id, w_id];
                 let max_binding = dev.device.limits().max_storage_buffer_binding_size;
-                let fits = arena_span_bytes(&arena, &win_ids) <= max_binding;
+                let span: Vec<NodeId> = [node.id, in_id, w_id].into_iter().chain(res_id).collect();
+                let acts: Vec<NodeId> = [node.id, in_id].into_iter().chain(res_id).collect();
+                let fits = arena_span_bytes(&arena, &span) <= max_binding
+                    && !arena_span_crosses_shard(&arena, &acts);
+                // a folded `max` reads a third activation in the output's
+                // window: past one binding, compile again without the folds
+                // (this compile is dropped: nothing of the node is emitted)
+                if res_id.is_some() && !fits {
+                    FOLDED_HOSTED.with(|f| f.set(true));
+                    continue;
+                }
+                // input and output in different stripes: each its own window
+                // (`two_window_kernel`), the weights staged beside the input
+                let two = !fits && res_id.is_none() && two_window_ok(&arena, node, &graph);
+                if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+                    eprintln!(
+                        "[rlx-wgpu] conv3d node {}: fits {fits} two {two} in@{} out@{} sharded {}",
+                        node.id.0,
+                        arena.offset(in_id),
+                        arena.offset(node.id),
+                        arena.is_sharded()
+                    );
+                }
+                let win_ids: Vec<NodeId> = if two { vec![in_id, w_id] } else { span.clone() };
                 let mut scratch = arena.scratch_off as u64;
                 let (mut base, mut size, param_anchor) = arena_multi_op_window(
                     &dev.device,
@@ -9750,8 +10683,15 @@ pub(crate) fn compile_static_inner(
                     &mut scratch,
                     &win_ids,
                 );
-                arena_expand_bind_window(&arena, &win_ids, &mut base, &mut size, max_binding);
-                if !fits && !param_anchor {
+                if two {
+                    // the input's own stripe (the helper above can anchor on
+                    // another), its stage reserve taking the weights
+                    (base, size) = arena_window_for_nodes(&dev.device, &arena, &[in_id]);
+                    arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
+                } else {
+                    arena_expand_bind_window(&arena, &win_ids, &mut base, &mut size, max_binding);
+                }
+                if !fits && !param_anchor && !two {
                     base =
                         arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
                 }
@@ -9777,10 +10717,23 @@ pub(crate) fn compile_static_inner(
                     &mut base,
                     &mut size,
                 );
-                let out_off = arena_local_off_f32(&arena, node.id, base);
+                let out_win = two.then(|| arena_window_for_nodes(&dev.device, &arena, &[node.id]));
                 let in_shape = graph.node(in_id).shape.dims();
                 let w_shape = graph.node(w_id).shape.dims();
+                // a `CONV3D_ARGMAX` writes `[n, d, h, w]`: its channels are the
+                // weight's, its spatial dims the output's last three
                 let out_shape = node.shape.dims();
+                let argmax = act == crate::unfuse::ARGMAX_ACT;
+                // a `CONV3D_TOPK` writes `[n, 2k + 1, d, h, w]`: channels the
+                // weight's too
+                let topk = act == crate::unfuse::TOPK_ACT;
+                let (c_out, out_sp) = if argmax {
+                    (w_shape[0], &out_shape[1..4])
+                } else if topk {
+                    (w_shape[0], &out_shape[2..5])
+                } else {
+                    (out_shape[1], &out_shape[2..5])
+                };
                 // A third input is the per-output-channel bias, folded into
                 // the conv's store — see `fold_conv_bias_into_conv3d`.
                 let (bias_off, has_bias) = match node.inputs.get(2) {
@@ -9800,16 +10753,39 @@ pub(crate) fn compile_static_inner(
                     ),
                     None => (0u32, 0u32),
                 };
+                // staging the bias may have moved the input's window
+                let in_off = if two && arena_tensor_in_window(&arena, in_id, base, size) {
+                    arena_local_off_f32(&arena, in_id, base)
+                } else {
+                    in_off
+                };
+                let res_off = res_id.map(|r| {
+                    arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        r,
+                        &mut base,
+                        &mut size,
+                    )
+                });
+                let out_off = match out_win {
+                    Some((b1, _)) => arena_local_off_f32(&arena, node.id, b1),
+                    None => arena_local_off_f32(&arena, node.id, base),
+                };
                 let p3 = Conv3dParams {
                     n: in_shape[0].unwrap_static() as u32,
                     c_in: in_shape[1].unwrap_static() as u32,
-                    c_out: out_shape[1].unwrap_static() as u32,
+                    c_out: c_out.unwrap_static() as u32,
                     d: in_shape[2].unwrap_static() as u32,
                     h: in_shape[3].unwrap_static() as u32,
                     w: in_shape[4].unwrap_static() as u32,
-                    d_out: out_shape[2].unwrap_static() as u32,
-                    h_out: out_shape[3].unwrap_static() as u32,
-                    w_out: out_shape[4].unwrap_static() as u32,
+                    d_out: out_sp[0].unwrap_static() as u32,
+                    h_out: out_sp[1].unwrap_static() as u32,
+                    w_out: out_sp[2].unwrap_static() as u32,
                     kd: w_shape[2].unwrap_static() as u32,
                     kh: w_shape[3].unwrap_static() as u32,
                     kw: w_shape[4].unwrap_static() as u32,
@@ -9828,13 +10804,28 @@ pub(crate) fn compile_static_inner(
                     out_off,
                     bias_off,
                     has_bias,
-                    _p1: 0,
-                    _p2: 0,
+                    act,
+                    alpha: alpha.to_bits(),
+                    split: two as u32,
+                    half: crate::unfuse::is_half(graph.node(in_id)) as u32
+                        | (crate::unfuse::is_half(node) as u32) << 1,
+                    in_prelu: in_prelu.is_some() as u32,
+                    in_alpha: in_prelu.unwrap_or(0.0).to_bits(),
+                    res_max: res_off.is_some() as u32,
+                    res_off: res_off.unwrap_or(0),
                 };
                 schedule.push(Step::Conv3d { params: p3 });
-                let ck = conv3d_kernel(&dev.device);
                 let u = emit_uniform(std::mem::size_of::<Conv3dParams>());
-                let bg = bind_arena_window(&dev.device, ck, &arena, base, size, &u);
+                let bg = match out_win {
+                    Some((b1, s1)) => {
+                        let k = crate::kernels::two_window_kernel(&dev.device, "conv3d_ctile_w4");
+                        bind_two_windows(&dev.device, k, &arena, (base, size), (b1, s1), &u)
+                    }
+                    None => {
+                        let ck = conv3d_kernel(&dev.device);
+                        bind_arena_window(&dev.device, ck, &arena, base, size, &u)
+                    }
+                };
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
@@ -9873,7 +10864,9 @@ pub(crate) fn compile_static_inner(
                 let dw = dilation[2] as u32;
                 let groups_u = (*groups).max(1) as u32;
 
-                if wgpu_prefer_conv_host(&arena) {
+                if wgpu_prefer_conv_host(&arena) && !whole_arena_host_ok(&arena, node) {
+                    schedule.push(host_op_step(&graph, node, &arena));
+                } else if wgpu_prefer_conv_host(&arena) {
                     schedule.push(Step::ConvTranspose3dHost {
                         src_byte_off: arena.offset(in_id) as u32,
                         weight_byte_off: arena.offset(w_id) as u32,
@@ -9970,8 +10963,14 @@ pub(crate) fn compile_static_inner(
                         out_off: arena_local_off_f32(&arena, node.id, base),
                         bias_off: 0,
                         has_bias: 0,
-                        _p1: 0,
-                        _p2: 0,
+                        act: 0,
+                        alpha: 0,
+                        split: 0,
+                        half: 0,
+                        in_prelu: 0,
+                        in_alpha: 0,
+                        res_max: 0,
+                        res_off: 0,
                     };
                     schedule.push(Step::ConvTranspose3d { params: p3 });
                     let sk = conv_transpose3d_kernel(&dev.device);
@@ -9981,7 +10980,14 @@ pub(crate) fn compile_static_inner(
                     bind_groups.push(bg);
                 }
             }
-            Op::GroupNorm { num_groups, eps } if !wgpu_prefer_host_norm(&arena) => {
+            // `GROUP_NORM_ACT` is a group norm carrying the activation that
+            // read it (`fold_norm_activation`), applied in its write-back.
+            op @ (Op::GroupNorm { .. } | Op::Custom { .. })
+                if crate::unfuse::group_norm_act(op).is_some()
+                    && (!wgpu_prefer_host_norm(&arena) || two_window_ok(&arena, node, &graph)) =>
+            {
+                let (num_groups, eps, act) = crate::unfuse::group_norm_act(op).unwrap();
+                let (num_groups, eps) = (&num_groups, &eps);
                 // Native WGSL kernel: one workgroup per (batch, group). The
                 // host step below mirrors the WHOLE arena per norm, which is
                 // ruinous on any graph with more than a couple of them.
@@ -9997,7 +11003,7 @@ pub(crate) fn compile_static_inner(
 
                 let gamma_is_param = tensor_is_graph_param(&graph, &param_offsets, gamma_id);
                 let gamma_bytes = arena.len_of(gamma_id) as u64;
-                let gn_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > ARENA_STAGE_CAP {
+                let gn_win: Vec<NodeId> = if gamma_is_param && gamma_bytes > arena_stage_cap() {
                     vec![gamma_id, node.id, in_id]
                 } else {
                     let mut v = vec![node.id, in_id];
@@ -10008,7 +11014,16 @@ pub(crate) fn compile_static_inner(
                     v
                 };
                 let max_binding = dev.device.limits().max_storage_buffer_binding_size;
-                let gn_fits = arena_span_bytes(&arena, &gn_win) <= max_binding;
+                let gn_fits = arena_span_bytes(&arena, &gn_win) <= max_binding
+                    && !arena_span_crosses_shard(&arena, &[node.id, in_id]);
+                // input and output in different stripes: the output its own
+                // window (`two_window_kernel`)
+                let two = !gn_fits && two_window_ok(&arena, node, &graph);
+                let gn_win: Vec<NodeId> = if two {
+                    gn_win.into_iter().filter(|&i| i != node.id).collect()
+                } else {
+                    gn_win
+                };
                 let mut scratch = arena.scratch_off as u64;
                 let (mut base, mut size, param_anchor) = arena_multi_op_window(
                     &dev.device,
@@ -10019,7 +11034,11 @@ pub(crate) fn compile_static_inner(
                     &mut scratch,
                     &gn_win,
                 );
-                if !gn_fits && !param_anchor {
+                if two {
+                    (base, size) = arena_window_for_nodes(&dev.device, &arena, &[in_id]);
+                    arena_ensure_scratch_for_window(&arena, &mut scratch, base, size);
+                }
+                if !gn_fits && !param_anchor && !two {
                     base =
                         arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
                 }
@@ -10074,28 +11093,50 @@ pub(crate) fn compile_static_inner(
                 } else {
                     beta_off
                 };
+                let out_win = two.then(|| arena_window_for_nodes(&dev.device, &arena, &[node.id]));
                 let p = GroupNormParams {
                     groups_total: n * g,
                     group_elems: (c / g) * h * w,
                     in_off,
-                    out_off: arena_local_off_f32(&arena, node.id, base),
+                    out_off: arena_local_off_f32(&arena, node.id, out_win.map_or(base, |w| w.0)),
                     gamma_off,
                     beta_off,
                     eps_bits: eps.to_bits(),
                     num_groups: g,
                     c,
                     hw: h * w,
-                    _pad0: 0,
-                    _pad1: 0,
+                    act: act.map_or(0, |a| activation_op_id(a) + 1),
+                    chunks: group_norm_chunks(
+                        (c / g) * h * w,
+                        arena.offset(in_id),
+                        arena.offset(node.id),
+                        arena.len_of(node.id),
+                    ),
+                    split: two as u32,
+                    half: crate::unfuse::is_half(graph.node(in_id)) as u32
+                        | (crate::unfuse::is_half(node) as u32) << 1,
                 };
                 schedule.push(Step::GroupNorm { params: p });
-                let gk = group_norm_kernel(&dev.device);
                 let u = emit_uniform(std::mem::size_of::<GroupNormParams>());
-                let bg = bind_arena_window(&dev.device, gk, &arena, base, size, &u);
+                let bg = match out_win {
+                    Some(w1) => {
+                        let k = crate::kernels::two_window_kernel(&dev.device, "group_norm");
+                        bind_two_windows(&dev.device, k, &arena, (base, size), w1, &u)
+                    }
+                    None => {
+                        let gk = group_norm_kernel(&dev.device);
+                        bind_arena_window(&dev.device, gk, &arena, base, size, &u)
+                    }
+                };
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
-            Op::GroupNorm { num_groups, eps } => {
+            op @ (Op::GroupNorm { .. } | Op::Custom { .. })
+                if crate::unfuse::group_norm_act(op).is_some() =>
+            {
+                let (num_groups, eps, act) = crate::unfuse::group_norm_act(op).unwrap();
+                let (num_groups, eps) = (&num_groups, &eps);
+                note_host_reads(&graph, node);
                 // NCHW: x [n,c,h,w], gamma/beta [c]. Host step (schedule-only).
                 let in_shape = &graph.node(node.inputs[0]).shape;
                 schedule.push(Step::GroupNormHost {
@@ -10110,6 +11151,28 @@ pub(crate) fn compile_static_inner(
                     num_groups: *num_groups as u32,
                     eps: *eps,
                 });
+                // ... and a folded activation in place on the GPU
+                if let Some(a) = act {
+                    let (base, size) = arena_window_for_nodes(&dev.device, &arena, &[node.id]);
+                    let off = arena_local_off_f32(&arena, node.id, base);
+                    schedule.push(Step::Unary {
+                        params: UnaryParams {
+                            n: elems,
+                            in_off: off,
+                            out_off: off,
+                            op: activation_op_id(a),
+                            _p0: 0,
+                            _p1: 0,
+                            _p2: 0,
+                            _p3: 0,
+                        },
+                        f16_mirror: false,
+                    });
+                    let u = emit_uniform(std::mem::size_of::<UnaryParams>());
+                    let bg = bind_arena_window(&dev.device, uk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
             }
             Op::LayerNorm2d { eps } => {
                 let in_id = node.inputs[0];
@@ -10148,7 +11211,18 @@ pub(crate) fn compile_static_inner(
                 // tree reduction over the channel axis. `RLX_WGPU_HOST_NORM`
                 // takes the host step and `RLX_WGPU_GPU_NORM` this one; the
                 // adapter kind is not consulted (see `wgpu_prefer_host_norm2d`).
-                if !wgpu_prefer_host_norm2d(&arena)
+                //
+                // A preference for the host route is a preference among routes that
+                // work, not a reason to refuse: the host step cannot address a parked
+                // operand or an arena past `u32::MAX` (`assert_byte_offset_host_route`
+                // refuses both), while this step stages such an operand into its
+                // window. So the geometries the host route cannot express take the
+                // device route even where the host route is preferred — which is
+                // exactly the plan that parks every parameter on a striped arena.
+                let host_unaddressable = (any_parked_operand(&arena, node)
+                    || arena.size > u32::MAX as usize)
+                    && !host_route_forced(&["RLX_WGPU_HOST_NORM", "RLX_WGPU_FORCE_HOST"]);
+                if (!wgpu_prefer_host_norm2d(&arena) || host_unaddressable)
                     && param_operands_are_lane_readable(&graph, &arena, node)
                 {
                     // gamma/beta can sit far from the activations, or be parked
@@ -10163,16 +11237,17 @@ pub(crate) fn compile_static_inner(
 
                     let gamma_is_param = tensor_is_graph_param(&graph, &param_offsets, gamma_id);
                     let gamma_bytes = arena.len_of(gamma_id) as u64;
-                    let win: Vec<NodeId> = if gamma_is_param && gamma_bytes > ARENA_STAGE_CAP {
-                        vec![gamma_id, node.id, in_id]
-                    } else {
-                        let mut v = vec![node.id, in_id];
-                        if gamma_is_param {
-                            v.push(gamma_id);
-                            v.push(beta_id);
-                        }
-                        v
-                    };
+                    let win: Vec<NodeId> =
+                        if gamma_is_param && gamma_bytes > crate::backend::arena_stage_cap() {
+                            vec![gamma_id, node.id, in_id]
+                        } else {
+                            let mut v = vec![node.id, in_id];
+                            if gamma_is_param {
+                                v.push(gamma_id);
+                                v.push(beta_id);
+                            }
+                            v
+                        };
                     let (base, size, offsets) = window_offsets(
                         &dev.device,
                         &arena,
@@ -10223,17 +11298,71 @@ pub(crate) fn compile_static_inner(
                     eps: *eps,
                 });
             }
-            Op::ResizeNearest2x => {
-                // NCHW nearest 2× upsample. Host step (schedule-only).
-                let in_shape = &graph.node(node.inputs[0]).shape;
-                schedule.push(Step::ResizeNearest2xHost {
-                    src_byte_off: arena.offset(node.inputs[0]) as u32,
-                    dst_byte_off: arena.offset(node.id) as u32,
-                    n: in_shape.dim(0).unwrap_static() as u32,
-                    c: in_shape.dim(1).unwrap_static() as u32,
-                    h: in_shape.dim(2).unwrap_static() as u32,
-                    w: in_shape.dim(3).unwrap_static() as u32,
-                });
+            // NCHW nearest 2× upsample, bare or as the single-step
+            // TransformRegion the region-marking pass wraps it into.
+            Op::ResizeNearest2x | Op::TransformRegion { .. } if is_resize_nearest2x(&node.op) => {
+                let in_id = node.inputs[0];
+                let in_shape = &graph.node(in_id).shape;
+                let n = in_shape.dim(0).unwrap_static() as u32;
+                let c = in_shape.dim(1).unwrap_static() as u32;
+                let h = in_shape.dim(2).unwrap_static() as u32;
+                let w = in_shape.dim(3).unwrap_static() as u32;
+                if wgpu_prefer_structure_host(&arena) {
+                    schedule.push(Step::ResizeNearest2xHost {
+                        src_byte_off: arena.offset(in_id) as u32,
+                        dst_byte_off: arena.offset(node.id) as u32,
+                        n,
+                        c,
+                        h,
+                        w,
+                    });
+                } else {
+                    let win = vec![node.id, in_id];
+                    let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                    let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                    let mut scratch = arena.scratch_off as u64;
+                    let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &mut scratch,
+                        &win,
+                    );
+                    if !fits && !param_anchor {
+                        base = arena_bind_window_covering_scratch_if_needed(
+                            &arena, base, size, scratch,
+                        );
+                    }
+                    let in_off = arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        in_id,
+                        &mut base,
+                        &mut size,
+                    );
+                    let p = ResizeNearest2xParams {
+                        n_total: n * c * 4 * h * w,
+                        planes: n * c,
+                        h,
+                        w,
+                        in_off,
+                        out_off: arena_local_off_f32(&arena, node.id, base),
+                        _p0: 0,
+                        _p1: 0,
+                    };
+                    schedule.push(Step::ResizeNearest2x { params: p });
+                    let sk = resize_nearest2x_kernel(&dev.device);
+                    let u = emit_uniform(std::mem::size_of::<ResizeNearest2xParams>());
+                    let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
             }
             Op::Reverse { axes } => {
                 let in_id = node.inputs[0];
@@ -10260,12 +11389,18 @@ pub(crate) fn compile_static_inner(
                 // route (which indexes what the arena stores). The flip is a pure
                 // permutation, so `Op::Reverse` carries no parameter of its own —
                 // `param_operands_are_lane_readable` still guards a graph that
-                // feeds it one.
+                // feeds it one. Same rule as the norm above: the host route cannot
+                // address a parked operand or an arena past `u32::MAX`, so those
+                // geometries take the device route even where the host route is
+                // preferred.
+                let host_unaddressable = (any_parked_operand(&arena, node)
+                    || arena.size > u32::MAX as usize)
+                    && !host_route_forced(&["RLX_WGPU_FORCE_HOST", "RLX_WGPU_DISCRETE_HOST"]);
                 if !in_shape.dtype().is_complex()
                     && !node.shape.dtype().is_complex()
                     && total > 0
                     && total <= u32::MAX as u64
-                    && !wgpu_prefer_host_fallback_agnostic(&arena)
+                    && (!wgpu_prefer_host_fallback_agnostic(&arena) || host_unaddressable)
                     && param_operands_are_lane_readable(&graph, &arena, node)
                 {
                     // Source strides over the full shape (the output has the
@@ -10398,6 +11533,40 @@ pub(crate) fn compile_static_inner(
                     .map(|i| in_shape.dim(i).unwrap_static())
                     .product::<usize>()
                     .max(1);
+                // The GPU kernel when input and output share a window (see
+                // `builtin_gpu_kernels`), else a host step.
+                if let Some((base, size)) =
+                    builtin_gpu_window(&dev.device, &arena, &[node.id, node.inputs[0]])
+                {
+                    let rel = |id: NodeId| ((arena.offset(id) as u64 - base) / 4) as u32;
+                    let n = (outer * inner) as u32;
+                    let is_max = matches!(node.op, Op::ArgMax { .. }) as u32;
+                    let params = [
+                        rel(node.id),
+                        n,
+                        1,
+                        0,
+                        rel(node.inputs[0]),
+                        (outer * reduced * inner) as u32,
+                        outer as u32,
+                        reduced as u32,
+                        inner as u32,
+                        is_max,
+                    ];
+                    push_builtin_gpu_kernel(
+                        &dev.device,
+                        &arena,
+                        crate::builtin_gpu_kernels::ARGREDUCE,
+                        &params,
+                        n,
+                        base,
+                        size,
+                        &mut schedule,
+                        &mut uniforms,
+                        &mut bind_groups,
+                    );
+                    continue;
+                }
                 schedule.push(Step::ArgReduceHost {
                     src_byte_off: arena.offset(node.inputs[0]) as u32,
                     dst_byte_off: arena.offset(node.id) as u32,
@@ -10559,11 +11728,12 @@ pub(crate) fn compile_static_inner(
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
-            Op::MaxPool3dBackward {
-                kernel_size,
-                stride,
-                padding,
-            } => {
+            // (and an `UNPOOL_MAX`: the same, maxed with `x` in the store)
+            op @ (Op::MaxPool3dBackward { .. } | Op::Custom { .. })
+                if crate::unfuse::maxpool3d_backward_geometry(op).is_some() =>
+            {
+                let (kernel_size, stride, padding, with_max) =
+                    crate::unfuse::maxpool3d_backward_geometry(op).unwrap();
                 let x_id = node.inputs[0];
                 let dy_id = node.inputs[1];
                 let x_shape = &graph.node(x_id).shape;
@@ -10628,7 +11798,7 @@ pub(crate) fn compile_static_inner(
                     x_off,
                     dy_off,
                     dx_off: arena_local_off_f32(&arena, node.id, base),
-                    _pad0: 0,
+                    with_max: with_max as u32,
                     _pad1: 0,
                     _pad2: 0,
                     _pad3: 0,
@@ -11881,6 +13051,133 @@ pub(crate) fn compile_static_inner(
                 uniforms.push(u);
                 bind_groups.push(bg);
             }
+            Op::DoubleSingle(op) => {
+                let dims = |id: NodeId| -> Vec<usize> {
+                    graph
+                        .node(id)
+                        .shape
+                        .dims()
+                        .iter()
+                        .map(|d| d.unwrap_static())
+                        .collect()
+                };
+                let ins: Vec<Vec<usize>> = node.inputs.iter().map(|&i| dims(i)).collect();
+                let refs: Vec<&[usize]> = ins.iter().map(|v| v.as_slice()).collect();
+                let plan =
+                    rlx_ir::double_single::DfPlan::from_pair_shapes(op, &refs, &dims(node.id))
+                        .unwrap_or_else(|e| panic!("rlx-wgpu: {e}"));
+                let mut win = vec![node.id];
+                win.extend(node.inputs.iter().copied());
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let mut window_off = |id| {
+                    arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        id,
+                        &mut base,
+                        &mut size,
+                    )
+                };
+                let a_off = window_off(node.inputs[0]);
+                let b_off = node.inputs.get(1).map_or(a_off, |&b| window_off(b));
+                let mut p = crate::kernels::DoubleSingleParams::from_plan(op, &plan);
+                p.a_off = a_off;
+                p.b_off = b_off;
+                p.out_off = arena_local_off_f32(&arena, node.id, base);
+                schedule.push(Step::DoubleSingle { params: p });
+                let sk = crate::kernels::double_single_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<crate::kernels::DoubleSingleParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
+            Op::RoundToFormat { format, scaling } => {
+                use rlx_ir::FormatScaling;
+                let in_id = node.inputs[0];
+                let (mode, block) = match scaling {
+                    FormatScaling::None => (0u32, 1u32),
+                    FormatScaling::PerTensor => (1, 1),
+                    FormatScaling::Block(b) => (2, *b),
+                    FormatScaling::FineBlock(b) => (3, *b),
+                };
+                let mut win = vec![node.id, in_id];
+                win.extend(node.inputs.get(1).copied());
+                let max_binding = dev.device.limits().max_storage_buffer_binding_size;
+                let fits = arena_span_bytes(&arena, &win) <= max_binding;
+                let mut scratch = arena.scratch_off as u64;
+                let (mut base, mut size, param_anchor) = arena_multi_op_window(
+                    &dev.device,
+                    &arena,
+                    &graph,
+                    &param_offsets,
+                    &mut schedule,
+                    &mut scratch,
+                    &win,
+                );
+                if !fits && !param_anchor {
+                    base =
+                        arena_bind_window_covering_scratch_if_needed(&arena, base, size, scratch);
+                }
+                let mut window_off = |id| {
+                    arena_off_in_bind_window(
+                        &graph,
+                        &param_offsets,
+                        &dev.device,
+                        &arena,
+                        &mut schedule,
+                        &mut scratch,
+                        id,
+                        &mut base,
+                        &mut size,
+                    )
+                };
+                let in_off = window_off(in_id);
+                let amax_off = node.inputs.get(1).map_or(0, |&a| window_off(a));
+                let p = RoundToFormatParams {
+                    n: node.shape.num_elements().unwrap() as u32,
+                    last_dim: node
+                        .shape
+                        .dims()
+                        .last()
+                        .map_or(1, |d| d.unwrap_static())
+                        .max(1) as u32,
+                    block,
+                    mode,
+                    man_bits: format.man_bits as i32,
+                    emin: format.emin(),
+                    emax: format.emax(),
+                    max_normal: format.max_normal,
+                    in_off,
+                    amax_off,
+                    out_off: arena_local_off_f32(&arena, node.id, base),
+                    _pad: 0,
+                };
+                schedule.push(Step::RoundToFormat { params: p });
+                let sk = round_to_format_kernel(&dev.device);
+                let u = emit_uniform(std::mem::size_of::<RoundToFormatParams>());
+                let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                uniforms.push(u);
+                bind_groups.push(bg);
+            }
             Op::FakeQuantize {
                 bits,
                 axis,
@@ -12014,7 +13311,9 @@ pub(crate) fn compile_static_inner(
                     desc: rlx_cpu::rlx_scan_host_desc!(graph, node, |id| arena.offset(id)),
                 });
             }
-            Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } => {
+            // `Op::While` too: a loop at run time on the host (rlx-cpu's
+            // `Thunk::While`), unbounded or not.
+            Op::ScanBackward { .. } | Op::ScanBackwardXs { .. } | Op::While { .. } => {
                 schedule.push(host_op_step(&graph, node, &arena));
             }
             Op::ScatterNd { .. }
@@ -12249,6 +13548,75 @@ pub(crate) fn compile_static_inner(
                 emit(p, which);
             }
             Op::Custom { name, attrs, .. } => match name.as_str() {
+                crate::unfuse::STRIDED_BMM => {
+                    // Batched matmul reading A / B straight from their base
+                    // tensors through strided views (`fold_strided_bmm`).
+                    let v = crate::unfuse::StridedBmm::decode(attrs);
+                    let (a_id, b_id) = (node.inputs[0], node.inputs[1]);
+                    // The node's shape may be the folded output layout; the
+                    // matmul dims travel in the attrs.
+                    let (batch, m, n) = (v.batch, v.m, v.n);
+                    let ids = [node.id, a_id, b_id];
+                    let mut scratch = arena.scratch_off as u64;
+                    let (mut base, mut size, _anchor) = arena_multi_op_window(
+                        &dev.device,
+                        &arena,
+                        &graph,
+                        &param_offsets,
+                        &mut schedule,
+                        &mut scratch,
+                        &ids,
+                    );
+                    for id in ids {
+                        let _ = arena_off_in_bind_window(
+                            &graph,
+                            &param_offsets,
+                            &dev.device,
+                            &arena,
+                            &mut schedule,
+                            &mut scratch,
+                            id,
+                            &mut base,
+                            &mut size,
+                        );
+                    }
+                    for id in ids {
+                        assert!(
+                            arena_tensor_in_window(&arena, id, base, size),
+                            "rlx-wgpu strided_bmm: operand {id:?} outside the bind window"
+                        );
+                    }
+                    let local = |id| arena_local_off_f32(&arena, id, base);
+                    let p = MatmulStridedParams {
+                        m,
+                        k: v.k,
+                        n,
+                        batch,
+                        b2: v.b2,
+                        c_off: local(node.id) + v.c[0],
+                        c_s0: v.c[1],
+                        c_s1: v.c[2],
+                        a_off: local(a_id) + v.a[0],
+                        a_s0: v.a[1],
+                        a_s1: v.a[2],
+                        a_sr: v.a[3],
+                        a_sc: v.a[4],
+                        b_off: local(b_id) + v.b[0],
+                        b_s0: v.b[1],
+                        b_s1: v.b[2],
+                        b_sr: v.b[3],
+                        b_sc: v.b[4],
+                        c_sr: v.c[3],
+                        c_sc: v.c[4],
+                    };
+                    schedule.push(Step::MatmulStrided { params: p });
+                    let sk = crate::kernels::matmul_coop_f32_strided_kernel(&dev.device)
+                        .expect("fold_strided_bmm runs only with cooperative matrix");
+                    let u = emit_uniform(std::mem::size_of::<MatmulStridedParams>());
+                    let bg = bind_arena_window(&dev.device, sk, &arena, base, size, &u);
+                    uniforms.push(u);
+                    bind_groups.push(bg);
+                }
                 "llada2.group_limited_gate" => {
                     let sig_id = node.inputs[0];
                     let route_id = node.inputs[1];
@@ -12256,6 +13624,13 @@ pub(crate) fn compile_static_inner(
                     let mut attr_buf = [0u8; 20];
                     let n = attrs.len().min(20);
                     attr_buf[..n].copy_from_slice(&attrs[..n]);
+                    // Its step keeps `u32` byte offsets: refuse a parked or >4 GiB operand
+                    // rather than read the truncated address.
+                    assert!(
+                        whole_arena_host_ok(&arena, node),
+                        "rlx-wgpu: Llada2GroupLimitedGate cannot address a parked or >4 GiB operand (node {:?})",
+                        node.id
+                    );
                     schedule.push(Step::Llada2GroupLimitedGate {
                         sig_byte_off: arena.offset(sig_id) as u32,
                         route_byte_off: arena.offset(route_id) as u32,
@@ -12319,6 +13694,13 @@ pub(crate) fn compile_static_inner(
                         uniforms.push(u);
                         bind_groups.push(bg);
                     } else {
+                        // Its step keeps `u32` byte offsets: refuse a parked or >4 GiB operand
+                        // rather than read the truncated address.
+                        assert!(
+                            whole_arena_host_ok(&arena, node),
+                            "rlx-wgpu: UmapKnnHost cannot address a parked or >4 GiB operand (node {:?})",
+                            node.id
+                        );
                         schedule.push(Step::UmapKnnHost {
                             pairwise_byte_off: pw_off,
                             out_byte_off: out_off,
@@ -12525,6 +13907,13 @@ pub(crate) fn compile_static_inner(
                         })
                         .collect();
                     let out_bytes = (node.shape.num_elements().unwrap() * 4) as u32;
+                    // Its step keeps `u32` byte offsets: refuse a parked or >4 GiB operand
+                    // rather than read the truncated address.
+                    assert!(
+                        whole_arena_host_ok(&arena, node),
+                        "rlx-wgpu: MsDeformAttnHost cannot address a parked or >4 GiB operand (node {:?})",
+                        node.id
+                    );
                     schedule.push(Step::MsDeformAttnHost {
                         in_offs,
                         out_byte_off: arena.offset(node.id) as u32,
@@ -12539,6 +13928,13 @@ pub(crate) fn compile_static_inner(
                     let in_id = node.inputs[0];
                     let in_bytes = (graph.node(in_id).shape.num_elements().unwrap() * 4) as u32;
                     let out_bytes = (node.shape.num_elements().unwrap() * 4) as u32;
+                    // Its step keeps `u32` byte offsets: refuse a parked or >4 GiB operand
+                    // rather than read the truncated address.
+                    assert!(
+                        whole_arena_host_ok(&arena, node),
+                        "rlx-wgpu: CollectiveHost cannot address a parked or >4 GiB operand (node {:?})",
+                        node.id
+                    );
                     schedule.push(Step::CollectiveHost {
                         name: n.to_string(),
                         in_byte_off: arena.offset(in_id) as u32,
@@ -12590,15 +13986,15 @@ pub(crate) fn compile_static_inner(
                     // Generic host-delegate: any onnx.* op with a registered
                     // rlx-cpu reference kernel but no wgpu shader. Stage the
                     // operands off-GPU (dtype-aware) and run the CPU reference.
-                    let in_specs: Vec<(u32, rlx_ir::Shape)> = node
+                    let in_specs: Vec<(usize, rlx_ir::Shape)> = node
                         .inputs
                         .iter()
-                        .map(|&id| (arena.offset(id) as u32, graph.node(id).shape.clone()))
+                        .map(|&id| (arena.offset(id), graph.node(id).shape.clone()))
                         .collect();
                     schedule.push(Step::CustomHost {
                         name: other.to_string(),
                         in_specs,
-                        out_byte_off: arena.offset(node.id) as u32,
+                        out_byte_off: arena.offset(node.id),
                         out_shape: node.shape.clone(),
                         attrs: attrs.clone(),
                     });
@@ -13536,7 +14932,17 @@ pub(crate) fn compile_static_inner(
                 } else if matches!(
                     scheme,
                     QuantScheme::Int8Block { .. } | QuantScheme::Int8BlockAsym { .. }
-                ) && crate::device::coop_discrete_backend()
+                ) && (crate::device::coop_discrete_backend()
+                    // The GPU kernel below takes `u32` f32-word offsets; a
+                    // parked weight's tagged offset (or one past 16 GiB)
+                    // truncated to an unrelated arena address and the matmul
+                    // read garbage — zeros for KittenTTS's predictor once its
+                    // arena outgrew the binding limit. The host step takes u64
+                    // offsets and resolves the weight buffer.
+                    || node.inputs.iter().chain(std::iter::once(&node.id)).any(|&id| {
+                        let off = arena.offset(id);
+                        crate::buffer::is_weight_off(off) || off / 4 > u32::MAX as usize
+                    }))
                 {
                     // Discrete Vulkan/DX12: SPIR-V Int8 dequant is wrong on
                     // NVIDIA (Kitten NSF mush). Host like rlx-vulkan non-GGUF.
@@ -14088,15 +15494,11 @@ pub(crate) fn compile_static_inner(
                 });
             }
 
-            Op::If { .. } | Op::While { .. } => {
-                // Should be unreachable: unfuse.rs inlines both branches
-                // (If) or unrolls max_iterations (While) into the parent
-                // graph using primitive ops + Where for the gating. If
-                // we hit this arm, the unfusion pass has a gap.
-                panic!(
-                    "rlx-wgpu: Op::If/While leaked past unfusion pass — \
-                        check unfuse.rs::expand_if / expand_while"
-                );
+            Op::If { .. } => {
+                // Should be unreachable: `LowerIf` inlines both branches into
+                // the parent graph with a `Where`. If we hit this arm, that
+                // pass did not run.
+                panic!("rlx-wgpu: Op::If leaked past LowerIf");
             }
             Op::RngNormal {
                 mean,
@@ -14128,28 +15530,6 @@ pub(crate) fn compile_static_inner(
                     high: *high,
                     key: *key,
                     op_seed: *op_seed,
-                });
-            }
-            // Standalone nearest 2× upsample: the region-marking pass wraps
-            // a bare `Op::ResizeNearest2x` into a single-step TransformRegion.
-            // Route that to the host resize helper (mirrors the bare arm).
-            Op::TransformRegion { steps, .. }
-                if steps.len() == 1
-                    && matches!(
-                        steps[0],
-                        rlx_ir::op::TransformStep::ResizeNearest2x(
-                            rlx_ir::op::ChainOperand::Input(0)
-                        )
-                    ) =>
-            {
-                let in_shape = &graph.node(node.inputs[0]).shape;
-                schedule.push(Step::ResizeNearest2xHost {
-                    src_byte_off: arena.offset(node.inputs[0]) as u32,
-                    dst_byte_off: arena.offset(node.id) as u32,
-                    n: in_shape.dim(0).unwrap_static() as u32,
-                    c: in_shape.dim(1).unwrap_static() as u32,
-                    h: in_shape.dim(2).unwrap_static() as u32,
-                    w: in_shape.dim(3).unwrap_static() as u32,
                 });
             }
             other => panic!(
@@ -14282,6 +15662,7 @@ pub(crate) fn compile_static_inner(
         coop_f16_b_param,
         coop_f16_vk_wide_b: HashSet::new(),
         coop_f16_vk_wide_bind_groups,
+        coop_f16_vk_a_off,
         coop_f16_host_activations,
         stashed_params: HashMap::new(),
         readback_staging: None,
@@ -14290,6 +15671,7 @@ pub(crate) fn compile_static_inner(
         fft_gpu_steps,
         gpu_handles: HashMap::new(),
         gpu_handle_feeds: HashMap::new(),
+        saved_inputs: None,
         gpu_handle_resident: HashSet::new(),
         kv_row_feeds: HashMap::new(),
         kv_feed_staging: None,
@@ -14304,6 +15686,88 @@ pub(crate) fn compile_static_inner(
         attention_window_declines,
         attention_band_declines,
         attention_dense_coop_declines,
+    }
+}
+
+/// Check the write targets a fold claims against each other.
+///
+/// Shares `rlx_compile::memory::ByteRange` with the planner's own verifier, so
+/// there is one definition of "these bytes overlap" rather than a per-pass
+/// reimplementation — the seven existing guards disagree about whether to
+/// compare offsets or ranges, and an offset comparison cannot see a partial
+/// overlap at all.
+///
+/// `RLX_WGPU_HAZARD_STRICT=1` turns a finding into a panic, which is what CI
+/// should run: a hazard that only prints is a hazard that ships as a plausible
+/// cosine (AXON was 0.61–0.80 varying run to run; `rlx-eegdm` was 0.994).
+fn report_fold_write_hazards(
+    graph: &Graph,
+    arena: &Arena,
+    folds: &[(NodeId, Vec<NodeId>, &'static str)],
+) {
+    use rlx_compile::memory::{ByteRange, ScheduleHazard, StepIo, schedule_hazards};
+    let span = |id: NodeId| -> Option<ByteRange> {
+        let len = arena.len_of(id);
+        (len != 0).then(|| ByteRange {
+            off: arena.offset(id),
+            len,
+        })
+    };
+    let kind = |id: NodeId| -> String {
+        graph
+            .nodes()
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| format!("{:?}", n.op.kind()))
+            .unwrap_or_else(|| format!("{id:?}"))
+    };
+    // The overlap search itself is `rlx_compile::memory::schedule_hazards`, not a
+    // local loop. Each fold becomes a one-step schedule whose write set is the
+    // slots it actually writes, and `ScheduleHazard::AliasedWrites` is the
+    // finding — so this file contributes the *facts* (which fold writes which
+    // slots) and contributes no second opinion about what a hazard is. That
+    // separation is the whole point: the previous seven guards each embedded
+    // their own, and they disagreed.
+    let mut found = 0usize;
+    for (parent, targets, what) in folds {
+        let writes: Vec<ByteRange> = targets.iter().filter_map(|&t| span(t)).collect();
+        let step = StepIo {
+            label: what,
+            writes,
+            ..Default::default()
+        };
+        for hz in schedule_hazards(std::slice::from_ref(&step)) {
+            let ScheduleHazard::AliasedWrites { range, .. } = hz else {
+                continue;
+            };
+            found += 1;
+            let at: Vec<String> = targets
+                .iter()
+                .filter(|&&t| span(t).is_some_and(|r| r.overlaps(&range)))
+                .map(|&t| {
+                    let r = span(t).unwrap_or_default();
+                    format!("{} [{},{})", kind(t), r.off, r.end())
+                })
+                .collect();
+            eprintln!(
+                "[rlx-wgpu] FOLD-ALIAS {what} on {} ({parent:?}): {} {} share bytes \
+                 [{},{}) — one dispatch writes them all",
+                kind(*parent),
+                at.len(),
+                if at.len() == 1 { "target" } else { "targets" },
+                range.off,
+                range.end(),
+            );
+            for t in &at {
+                eprintln!("[rlx-wgpu]              {t}");
+            }
+        }
+    }
+    if found > 0 && rlx_ir::env::flag("RLX_WGPU_HAZARD_STRICT") {
+        panic!(
+            "[rlx-wgpu] {found} fold write-target alias(es); RLX_WGPU_HAZARD_STRICT=1 is set. \
+             A fold must not write two of its own targets into the same bytes."
+        );
     }
 }
 
@@ -14326,10 +15790,16 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
         .enumerate()
         .map(|(i, id)| (*id, i))
         .collect();
+    // One shared predicate rather than two inline interval comparisons: the
+    // half-open/zero-length-empty convention now comes from
+    // `rlx_ir::arena_range`, which is where every other overlap test in the tree
+    // gets it. The old `(lo, hi)` tuples already behaved this way — a zero-size
+    // slot gave `(off, off)` and `off < off` is false — so this is a rename, not
+    // a change.
     let span = |id: NodeId| {
         plan.assignments
             .get(&id)
-            .map(|s| (s.offset, s.offset + s.size))
+            .map(|s| rlx_ir::arena_range::ByteRange::new(s.offset, s.size))
     };
     let kind = |id: NodeId| {
         graph
@@ -14356,17 +15826,19 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
             continue;
         };
         for &input in &node.inputs {
-            let (Some((lo, hi)), Some(&ipos)) = (span(input), pos.get(&input)) else {
+            let (Some(ir), Some(&ipos)) = (span(input), pos.get(&input)) else {
                 continue;
             };
+            let (lo, hi) = (ir.off, ir.end());
             for (&writer, &wpos) in &pos {
                 if writer == input || writer == consumer || wpos <= ipos || wpos >= cpos {
                     continue;
                 }
-                let Some((wlo, whi)) = span(writer) else {
+                let Some(wr) = span(writer) else {
                     continue;
                 };
-                if wlo < hi && lo < whi {
+                let (wlo, whi) = (wr.off, wr.end());
+                if wr.overlaps(&ir) {
                     found += 1;
                     if !is_view(writer) && !is_view(input) {
                         real_hazards += 1;
@@ -14403,17 +15875,19 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
         if is_view(consumer) {
             continue;
         }
-        let Some((olo, ohi)) = span(consumer) else {
+        let Some(or) = span(consumer) else {
             continue;
         };
+        let (olo, ohi) = (or.off, or.end());
         for &input in &node.inputs {
             if input == consumer {
                 continue;
             }
-            let Some((ilo, ihi)) = span(input) else {
+            let Some(ir2) = span(input) else {
                 continue;
             };
-            if olo < ihi && ilo < ohi {
+            let (ilo, ihi) = (ir2.off, ir2.end());
+            if or.overlaps(&ir2) {
                 inplace += 1;
                 if inplace <= 20 {
                     eprintln!(
@@ -14434,4 +15908,31 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
         "[rlx-wgpu] hazard scan: {found} write-after-read hazard(s) ({real_hazards} not view-explained), {inplace} in-place          output/input overlap(s) over {} scheduled nodes",
         plan.schedule.len()
     );
+}
+
+/// Whether a large f32 weight has to be read from its f16 shadow.
+///
+/// The shadow exists for adapters whose storage binding cannot hold the
+/// weight together with the activations it multiplies (VirtIO / DX12 cap
+/// bindings near 2 GiB). It halves the weight's precision, so taking it
+/// whenever a weight passed `arena_stage_cap()` cost every big matmul ~1e-3
+/// relative error even where one f32 window covers everything — a 2048 ×
+/// 158 241 LM head on wgpu-Metal (4 GiB bindings) moved its logits by 5e-3.
+/// Now only when the span of `ids` exceeds the binding limit, or when
+/// `RLX_WGPU_F16_MIRROR=1` asks for the bandwidth saving anyway.
+fn f16_mirror_needed(device: &wgpu::Device, arena: &crate::buffer::Arena, ids: &[NodeId]) -> bool {
+    if rlx_ir::env::flag("RLX_WGPU_F16_MIRROR") {
+        return true;
+    }
+    let lo = ids
+        .iter()
+        .map(|&id| arena.offset(id) as u64)
+        .min()
+        .unwrap_or(0);
+    let hi = ids
+        .iter()
+        .map(|&id| arena.offset(id) as u64 + arena.len_of(id) as u64)
+        .max()
+        .unwrap_or(0);
+    hi.saturating_sub(lo / 256 * 256) > device.limits().max_storage_buffer_binding_size
 }

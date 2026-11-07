@@ -16,6 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use bytemuck::{Pod, Zeroable};
 pub const MATMUL_WGSL: &str = include_str!("matmul.wgsl");
 pub const MATMUL_BF16W_WGSL: &str = include_str!("matmul_bf16w.wgsl");
+pub const MATMUL_GEMV_WGSL: &str = include_str!("matmul_gemv.wgsl");
 pub const MATMUL_WIDE_WGSL: &str = include_str!("matmul_wide.wgsl");
 pub const MATMUL_WIDE_NV_WGSL: &str = include_str!("matmul_wide_nv.wgsl");
 pub const MATMUL_WIDE_VEC4_WGSL: &str = include_str!("matmul_wide_vec4.wgsl");
@@ -25,12 +26,17 @@ pub const MATMUL_COOP16_WGSL: &str = include_str!("matmul_coop16.wgsl");
 pub const MATMUL_COOP_F16_F32ACC_WGSL: &str = include_str!("matmul_coop_f16_f32acc.wgsl");
 pub const MATMUL_COOP_F32_WGSL: &str = include_str!("matmul_coop_f32.wgsl");
 pub const MATMUL_COOP_F32_DIRECT_WGSL: &str = include_str!("matmul_coop_f32_direct.wgsl");
+pub const MATMUL_COOP_F32_EDGE_WGSL: &str = include_str!("matmul_coop_f32_edge.wgsl");
+pub const MATMUL_COOP_F32_STRIDED_WGSL: &str = include_str!("matmul_coop_f32_strided.wgsl");
 pub const MATMUL_COOP_F32_PORTABLE_WGSL: &str = include_str!("matmul_coop_f32_portable.wgsl");
 pub const MATMUL_COOP_F16_VULKAN_WGSL: &str = include_str!("matmul_coop_f16_vulkan.wgsl");
 pub const MATMUL_COOP_F16_VULKAN_WIDEN_WGSL: &str =
     include_str!("matmul_coop_f16_vulkan_widen.wgsl");
 pub const MATMUL_COOP_F16_VULKAN_F32ACC_WGSL: &str =
     include_str!("matmul_coop_f16_vulkan_f32acc.wgsl");
+/// 32×32-block, 2×2 register-blocked variant of the f32-accumulator kernel.
+pub const MATMUL_COOP_F16_VULKAN_F32ACC_32_WGSL: &str =
+    include_str!("matmul_coop_f16_vulkan_f32acc_32.wgsl");
 pub const MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC_WGSL: &str =
     include_str!("matmul_coop_f16_vulkan_widen_f32acc.wgsl");
 pub const MATMUL_QKV_COOP_F16_VK_WGSL: &str = include_str!("matmul_qkv_coop_f16_vk.wgsl");
@@ -69,7 +75,7 @@ pub const LAYERNORM_VEC4_WGSL: &str = include_str!("layernorm_vec4.wgsl");
 pub const NORM_ROPE_WGSL: &str = include_str!("norm_rope.wgsl");
 pub const NARROW_SPLIT_WGSL: &str = include_str!("narrow_split.wgsl");
 pub const CONCAT_MANY_WGSL: &str = include_str!("concat_many.wgsl");
-pub const GROUP_NORM_WGSL: &str = include_str!("group_norm.wgsl");
+pub const GROUP_NORM_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/group_norm.wgsl"));
 pub const LAYER_NORM2D_WGSL: &str = include_str!("layer_norm2d.wgsl");
 pub const RMS_NORM_BWD_WGSL: &str = include_str!("rms_norm_backward.wgsl");
 pub const LAYER_NORM_BWD_WGSL: &str = include_str!("layer_norm_backward.wgsl");
@@ -107,7 +113,8 @@ pub const COMPLEX_CAST_WGSL: &str = include_str!("complex_cast.wgsl");
 pub const BINARY_C64_WGSL: &str = include_str!("binary_c64.wgsl");
 pub const COMPLEX_WIRINGER_WGSL: &str = include_str!("complex_wirtinger.wgsl");
 pub const FFT_BUTTERFLY_STAGE_WGSL: &str = include_str!("fft_butterfly_stage.wgsl");
-pub const ELEMENTWISE_REGION_WGSL: &str = include_str!("elementwise_region.wgsl");
+pub const ELEMENTWISE_REGION_WGSL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/elementwise_region.wgsl"));
 pub const TRANSPOSE_WGSL: &str = include_str!("transpose.wgsl");
 /// Vector sibling of `transpose.wgsl` — see the shader's own header for its
 /// three modes and when the lowering takes each.
@@ -162,7 +169,8 @@ pub const Q_MATMUL_WGSL: &str = include_str!("q_matmul.wgsl");
 /// Real INT8 `Op::QConv2d` (i32 accumulate + float requantize).
 pub const Q_CONV2D_WGSL: &str = include_str!("q_conv2d.wgsl");
 /// `Op::BatchNormInference` and its three backwards (channels-last).
-pub const BATCH_NORM_INFERENCE_WGSL: &str = include_str!("batch_norm_inference.wgsl");
+pub const BATCH_NORM_INFERENCE_WGSL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/batch_norm_inference.wgsl"));
 pub const ARGMAX_WGSL: &str = include_str!("argmax.wgsl");
 pub const POOL2D_WGSL: &str = include_str!("pool2d.wgsl");
 pub const CONV2D_WGSL: &str = include_str!("conv2d.wgsl");
@@ -172,8 +180,27 @@ pub const CONV1D_IMPLICIT_WGSL: &str = include_str!("conv1d_implicit.wgsl");
 pub const POOL1D_WGSL: &str = include_str!("pool1d.wgsl");
 pub const POOL3D_WGSL: &str = include_str!("pool3d.wgsl");
 pub const CONV1D_WGSL: &str = include_str!("conv1d.wgsl");
-pub const CONV3D_WGSL: &str = include_str!("conv3d.wgsl");
-pub const CONV3D_CTILE_WGSL: &str = include_str!("conv3d_ctile.wgsl");
+pub const CONV3D_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/conv3d.wgsl"));
+pub const CONV3D_CTILE_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/conv3d_ctile.wgsl"));
+/// `conv3d_ctile.wgsl` writing its output to binding 2 (see [`two_window_kernel`]).
+pub const CONV3D_CTILE_SPLIT_WGSL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/conv3d_ctile_split.wgsl"));
+/// `copy.wgsl` from binding 0 into binding 2: a copy between stripes.
+pub const COPY_TWO_WINDOW_WGSL: &str = r#"
+struct Params { n: u32, in_off: u32, out_off: u32, _p0: u32, _p1: u32, _p2: u32, _p3: u32, _p4: u32, };
+@group(0) @binding(0) var<storage, read_write> arena: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> dst: array<f32>;
+@compute @workgroup_size(64)
+fn copy(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
+    let i = gid.x + gid.y * ngs.x * 64u;
+    if (i >= params.n) { return; }
+    dst[params.out_off + i] = arena[params.in_off + i];
+}
+"#;
+/// `group_norm.wgsl` writing (and reading back) its output in binding 2.
+pub const GROUP_NORM_SPLIT_WGSL: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/group_norm_split.wgsl"));
 pub const CONV_TRANSPOSE3D_WGSL: &str = include_str!("conv_transpose3d.wgsl");
 pub const CONV_TRANSPOSE2D_TILED_WGSL: &str = include_str!("conv_transpose2d_tiled.wgsl");
 
@@ -199,7 +226,10 @@ pub(crate) fn conv_transpose2d_tiled_grid(w_out: u32, sw: u32, c_out: u32) -> [u
 }
 pub const GROUP_NORM_BWD_WGSL: &str = include_str!("group_norm_backward.wgsl");
 pub const AXIAL_ROPE2D_WGSL: &str = include_str!("axial_rope2d.wgsl");
+pub const RESIZE_NEAREST2X_WGSL: &str = include_str!("resize_nearest2x.wgsl");
 pub const FAKE_QUANTIZE_WGSL: &str = include_str!("fake_quantize.wgsl");
+pub const ROUND_TO_FORMAT_WGSL: &str = include_str!("round_to_format.wgsl");
+pub const DOUBLE_SINGLE_WGSL: &str = include_str!("double_single.wgsl");
 pub const SCATTER_ADD_WGSL: &str = include_str!("scatter_add.wgsl");
 pub const TOPK_WGSL: &str = include_str!("topk.wgsl");
 pub const WELCH_PEAKS_GPU_WGSL: &str = include_str!("welch_peaks_gpu.wgsl");
@@ -611,7 +641,8 @@ pub struct MaxPool3dBwdParams {
     pub x_off: u32,
     pub dy_off: u32,
     pub dx_off: u32,
-    pub _pad0: u32,
+    /// Nonzero: the store is `max(dx, x)` (`unfuse::UNPOOL_MAX`).
+    pub with_max: u32,
     pub _pad1: u32,
     pub _pad2: u32,
     pub _pad3: u32,
@@ -704,6 +735,22 @@ pub struct GroupNormBwdParams {
     pub _p1: u32,
 }
 
+/// Layout for `resize_nearest2x.wgsl` (NCHW nearest 2× upsample). 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ResizeNearest2xParams {
+    /// Output elements: `planes * 4 * h * w`.
+    pub n_total: u32,
+    /// `n * c`.
+    pub planes: u32,
+    pub h: u32,
+    pub w: u32,
+    pub in_off: u32,
+    pub out_off: u32,
+    pub _p0: u32,
+    pub _p1: u32,
+}
+
 /// Layout for AxialRope2d. 48 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -720,6 +767,130 @@ pub struct AxialRope2dParams {
     pub in_off: u32,
     pub out_off: u32,
     pub n_total: u32,
+}
+
+/// Layout for `Op::DoubleSingle` (`double_single.wgsl`); offsets are f32
+/// indices into the bound arena window.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable, Default)]
+pub struct DoubleSingleParams {
+    pub len: u32,
+    pub rank: u32,
+    pub op: u32,
+    pub k: u32,
+    pub m: u32,
+    pub n: u32,
+    pub a_batch: u32,
+    pub b_batch: u32,
+    pub red_len: u32,
+    pub kept_rank: u32,
+    pub red_rank: u32,
+    pub kind: u32,
+    pub a_off: u32,
+    pub b_off: u32,
+    pub out_off: u32,
+    pub _pad: u32,
+    pub d0: [u32; 8],
+    pub s0: [u32; 8],
+    pub s1: [u32; 8],
+    pub d1: [u32; 8],
+    pub s2: [u32; 8],
+}
+
+impl DoubleSingleParams {
+    /// Kernel parameters for `plan` (offsets filled in by the caller).
+    pub fn from_plan(
+        op: &rlx_ir::double_single::DfOp,
+        plan: &rlx_ir::double_single::DfPlan,
+    ) -> Self {
+        use rlx_ir::double_single::DfPlan;
+        let mut p = Self::default();
+        match plan {
+            DfPlan::Elementwise {
+                len,
+                rank,
+                out_dims,
+                a_strides,
+                b_strides,
+            } => {
+                p.kind = 0;
+                p.len = *len as u32;
+                p.rank = *rank as u32;
+                p.op = op.code();
+                p.d0 = *out_dims;
+                p.s0 = *a_strides;
+                p.s1 = *b_strides;
+            }
+            DfPlan::MatMul {
+                batch,
+                m,
+                k,
+                n,
+                a_batch,
+                b_batch,
+            } => {
+                p.kind = 1;
+                p.len = (batch * m * n) as u32;
+                p.m = *m as u32;
+                p.k = *k as u32;
+                p.n = *n as u32;
+                p.a_batch = *a_batch as u32;
+                p.b_batch = *b_batch as u32;
+            }
+            DfPlan::Sum {
+                out_len,
+                red_len,
+                kept_rank,
+                kept_dims,
+                kept_strides,
+                red_rank,
+                red_dims,
+                red_strides,
+            } => {
+                p.kind = 2;
+                p.op = op.code();
+                p.len = *out_len as u32;
+                p.red_len = *red_len as u32;
+                p.kept_rank = *kept_rank as u32;
+                p.red_rank = *red_rank as u32;
+                p.d0 = *kept_dims;
+                p.s0 = *kept_strides;
+                p.d1 = *red_dims;
+                p.s2 = *red_strides;
+            }
+        }
+        p
+    }
+}
+
+/// Layout for `Op::RoundToFormat`. 48 bytes; `mode`: 0 none, 1 per-tensor, 2 block.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct RoundToFormatParams {
+    pub n: u32,
+    pub last_dim: u32,
+    pub block: u32,
+    pub mode: u32,
+    pub man_bits: i32,
+    pub emin: i32,
+    pub emax: i32,
+    pub max_normal: f32,
+    pub in_off: u32,
+    pub amax_off: u32,
+    pub out_off: u32,
+    pub _pad: u32,
+}
+
+impl RoundToFormatParams {
+    /// Threads to launch: one per element, or one per block in mode 2.
+    pub fn threads(&self, n: u32) -> u32 {
+        if self.mode >= 2 {
+            let ld = self.last_dim.max(1);
+            (n / ld) * ld.div_ceil(self.block.max(1))
+        } else {
+            n
+        }
+    }
 }
 
 /// Layout for FakeQuantize (Fixed / PerBatch). 32 bytes.
@@ -753,8 +924,19 @@ pub struct GroupNormParams {
     pub num_groups: u32,
     pub c: u32,
     pub hw: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
+    /// Activation applied in the write-back: `0` none, else
+    /// `opcode_relu_first + 1` — see `fold_norm_activation`.
+    pub act: u32,
+    /// Workgroups per group; above 1 the split kernels run
+    /// ([`group_norm_split_kernels`]).
+    pub chunks: u32,
+    /// Nonzero: the output is its own binding ([`two_window_kernel`]),
+    /// `out_off` relative to it. Not read by the shaders.
+    pub split: u32,
+    /// Bit 0: the input is half-packed, bit 1: the output
+    /// (`unfuse::pack_half_activations`). Selects the pipeline's `IN_HALF` /
+    /// `OUT_HALF` overrides; not read by the shaders.
+    pub half: u32,
 }
 
 /// Layout for the native NCHW `LayerNorm2d` kernel. Mirrors the WGSL `Params`;
@@ -2027,6 +2209,35 @@ pub struct MatmulQkvParams {
     pub _p4: u32,
 }
 
+/// `matmul_coop_f32_strided` uniform: `C[z] = A[z]·B[z]`, where element
+/// (z, r, c) of A, B and C each lives at
+/// `off + (z / b2)·s0 + (z % b2)·s1 + r·sr + c·sc`. All offsets / strides are
+/// f32 elements, offsets relative to the bind window. 80 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct MatmulStridedParams {
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+    pub batch: u32,
+    pub b2: u32,
+    pub c_off: u32,
+    pub c_s0: u32,
+    pub c_s1: u32,
+    pub a_off: u32,
+    pub a_s0: u32,
+    pub a_s1: u32,
+    pub a_sr: u32,
+    pub a_sc: u32,
+    pub b_off: u32,
+    pub b_s0: u32,
+    pub b_s1: u32,
+    pub b_sr: u32,
+    pub b_sc: u32,
+    pub c_sr: u32,
+    pub c_sc: u32,
+}
+
 /// Layout for FusedResidualRmsNorm (same bind layout as FusedResidualLN).
 pub type FusedResidualRmsNormParams = FusedResidualLnParams;
 
@@ -2423,8 +2634,41 @@ pub struct Conv3dParams {
     /// and the full-size `Add` that consumed it.
     pub bias_off: u32,
     pub has_bias: u32,
-    pub _p1: u32,
-    pub _p2: u32,
+    /// Activation applied in the store: `0` none, else
+    /// `opcode_relu_first + 1` — see `fold_conv_activation`.
+    pub act: u32,
+    /// LeakyReLU's slope (f32 bits) when `act == unfuse::LEAKY_ACT`.
+    pub alpha: u32,
+    /// Nonzero: the output is its own binding ([`two_window_kernel`]),
+    /// `out_off` relative to it. Not read by the shaders.
+    pub split: u32,
+    /// Bit 0: the input is half-packed, bit 1: the output
+    /// (`unfuse::pack_half_activations`). Selects the pipeline's `IN_HALF` /
+    /// `OUT_HALF` overrides; not read by the shaders.
+    pub half: u32,
+    /// Nonzero: each input value goes through a PReLU of slope `in_alpha`
+    /// (f32 bits) as it is loaded — `conv3d_k3_c8` only (`unfuse::CONV3D_K3`).
+    pub in_prelu: u32,
+    pub in_alpha: u32,
+    /// Nonzero: the store takes the `max` with the tensor at `res_off`, of the
+    /// output's shape (before the activation) — `conv3d_k3_c8` only. With
+    /// the two above, 144 bytes: the WGSL struct's size (a multiple of 16).
+    pub res_max: u32,
+    pub res_off: u32,
+}
+
+impl Conv3dParams {
+    /// A 2-D 3×3 conv over each slice of the depth — kernel `[1, 3, 3]`,
+    /// stride 1, padding `[0, 1, 1]`, no dilation, ungrouped, past four
+    /// output channels: `conv3d_k3_c8`'s shape.
+    pub fn is_k3(&self) -> bool {
+        (self.kd, self.kh, self.kw) == (1, 3, 3)
+            && (self.sd, self.sh, self.sw) == (1, 1, 1)
+            && (self.dd, self.dh, self.dw) == (1, 1, 1)
+            && (self.pd, self.ph, self.pw) == (0, 1, 1)
+            && self.groups <= 1
+            && self.c_out > 4
+    }
 }
 
 /// Lazy-init container for a compute pipeline + its bind-group layout.
@@ -2457,6 +2701,109 @@ impl Kernel {
     }
 }
 
+/// With `RLX_WGPU_DUMP_WGSL=<dir>` (native only), write every shader module
+/// this crate creates to `<dir>/<hash>.wgsl`, its label on the first line —
+/// so the exact sources can be put through another compiler (the browser's
+/// Tint rejects some WGSL that naga accepts; see `fft_gpu.wgsl`'s `fft_inner`).
+pub(crate) fn dump_wgsl(label: &str, wgsl: &str) {
+    #[cfg(not(target_family = "wasm"))]
+    if let Some(dir) = rlx_ir::env::var_os("RLX_WGPU_DUMP_WGSL") {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        wgsl.hash(&mut h);
+        let path = std::path::Path::new(&dir).join(format!("{:016x}.wgsl", h.finish()));
+        if !path.exists() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(&path, format!("// {label}\n{wgsl}"));
+        }
+    }
+    #[cfg(target_family = "wasm")]
+    let _ = (label, wgsl);
+}
+
+/// `wgsl` with rlxsl's numeric helpers (`rlx_div_rn`, `rlx_sqrt_rn`,
+/// `rlx_rsqrt_rn`, `rlx_exp`, `rlx_log`) defined once: appended when it calls
+/// them without defining them — module-scope declarations are order-free in
+/// WGSL, and the end is past any `enable` directive — or, for the shaders
+/// build.rs assembles with the exact block already in, kept. Fast math
+/// ([`crate::device::set_fast_math`]) takes the native-operator block instead,
+/// either way, so it reaches every kernel.
+pub(crate) fn with_numeric_helpers(wgsl: &str) -> std::borrow::Cow<'_, str> {
+    with_numeric_helpers_as(wgsl, crate::device::fast_math())
+}
+
+fn with_numeric_helpers_as(wgsl: &str, fast_math: bool) -> std::borrow::Cow<'_, str> {
+    let (exact, fast) = (
+        rlxsl::exact::wgsl_numeric_helpers(),
+        rlxsl::exact::wgsl_fast_numeric_helpers(),
+    );
+    if wgsl.contains("fn rlx_div_rn(") {
+        return if fast_math {
+            wgsl.replace(exact, fast).into()
+        } else {
+            wgsl.into()
+        };
+    }
+    let calls = rlxsl::exact::WGSL_HELPER_NAMES
+        .iter()
+        .any(|h| wgsl.contains(&format!("{h}(")));
+    if calls {
+        format!("{wgsl}\n{}", if fast_math { fast } else { exact }).into()
+    } else {
+        wgsl.into()
+    }
+}
+
+/// Compile one of this crate's own kernels: rlxsl's numeric helpers injected
+/// ([`with_numeric_helpers`]), the source optionally dumped ([`dump_wgsl`]), the
+/// module built through the **trusted** path with loop bounding off — the SAFETY
+/// note below carries the termination audit. User shaders (`wgpu_gpu_custom`)
+/// never come through here and keep the guard.
+pub(crate) fn kernel_module(device: &wgpu::Device, label: &str, wgsl: &str) -> wgpu::ShaderModule {
+    let wgsl = with_numeric_helpers(wgsl);
+    let wgsl = wgsl.as_ref();
+    dump_wgsl(label, wgsl);
+    let descriptor = wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    };
+    // Loop bounding is off for this crate's own kernels. naga's forced bounding
+    // wraps every loop in an iteration counter, which also keeps a fixed-trip
+    // accumulator loop from unrolling: upstream measured the tiled matmul at
+    // 440 µs against 37 µs at 32×128×2 on Metal with the guard on, and this tree
+    // measures the stand's rows 8-9% faster with it off (recognition 30 s
+    // 3.19 → 2.91 s, synthesis typical 4.25 → 3.92 s, wake 31.6 → 24.2 ms, warm,
+    // paired takes). The one place it was paid for by hand here —
+    // `attention_band.wgsl`, whose loops are expanded so the driver keeps them in
+    // registers — is unaffected either way.
+    //
+    // SAFETY: the only relaxed check is loop bounding, and **every loop in this
+    // crate's WGSL terminates on a bound it reads from its params or a constant.**
+    // That is a property of the whole set, so it is audited as one: of the 117
+    // `loop {` blocks across `src/kernels/*.wgsl`, every `break` is guarded by a
+    // comparison, and the ones that are not an obvious `i >= params.n` /
+    // `k < K` counter fall into three shapes, none of which can stall —
+    //
+    //   * a halving tree reduction, `if (stride == 0u) { break; }` with
+    //     `stride = stride >> 1u` (or `/ 2u`) from a constant power-of-two start,
+    //     so it ends in `log2(start)` iterations;
+    //   * an early exit inside a loop that also carries a counted bound, where the
+    //     counter increments every iteration (`sample.wgsl`'s `done`,
+    //     `best < 0.0`, `!found` and `cum >= top_p`, all inside
+    //     `if (picked_count >= k_limit) { break; }`);
+    //   * a sentinel walk that steps a signed index toward zero
+    //     (`if (j < 0) { break; }`).
+    //
+    // No loop's exit depends on a value it computes. `wgpu_gpu_custom`
+    // (user-supplied WGSL) does NOT come through this function and keeps the
+    // guard — a user shader is not this crate's to prove terminating.
+    let checks = wgpu::ShaderRuntimeChecks {
+        force_loop_bounding: false,
+        ..wgpu::ShaderRuntimeChecks::checked()
+    };
+    unsafe { device.create_shader_module_trusted(descriptor, checks) }
+}
+
 /// Build a 4-binding compute kernel: storage(rw) / uniform / storage(ro)
 /// / storage(rw). `transpose_vec4.wgsl` is its user: binding 0 is the `vec4`
 /// arena (modes 1/2), binding 1 params, binding 2 the axis metadata, and
@@ -2470,10 +2817,7 @@ fn build_kernel_4(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -2554,10 +2898,7 @@ fn build_kernel_3_with(
     entry_point: &'static str,
     parts_read_only: bool,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -2631,10 +2972,7 @@ fn build_kernel_ro_u_ro_rw(
     entry_point: &'static str,
     in_place_arena: bool,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let storage = |read_only: bool| wgpu::BindingType::Buffer {
         ty: wgpu::BufferBindingType::Storage { read_only },
         has_dynamic_offset: false,
@@ -2703,10 +3041,7 @@ fn build_kernel_ro_u_rw(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let storage = |read_only: bool| wgpu::BindingType::Buffer {
         ty: wgpu::BufferBindingType::Storage { read_only },
         has_dynamic_offset: false,
@@ -2764,10 +3099,7 @@ fn build_kernel_cast_f32_to_f16(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -2826,10 +3158,7 @@ fn build_kernel_f32_rw_uniform_f16_rw(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -2888,10 +3217,7 @@ fn build_kernel_coop_f16_vk(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -2961,10 +3287,7 @@ fn build_kernel(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -3016,10 +3339,13 @@ static MATMUL_COOP16: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F16_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
 static MATMUL_COOP_F32: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F32_DIRECT: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP_F32_EDGE: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP_F32_STRIDED: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F32_PORTABLE: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN_WIDEN: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_COOP_F16_VULKAN_F32ACC_32: OnceLock<Option<Kernel>> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
 static CAST_F32_TO_F16: OnceLock<Kernel> = OnceLock::new();
 static BINARY: OnceLock<Kernel> = OnceLock::new();
@@ -3049,14 +3375,18 @@ static GROUP_NORM_BWD_INPUT: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM_BWD_GAMMA: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM_BWD_BETA: OnceLock<Kernel> = OnceLock::new();
 static AXIAL_ROPE2D: OnceLock<Kernel> = OnceLock::new();
+static RESIZE_NEAREST2X: OnceLock<Kernel> = OnceLock::new();
 static FAKE_QUANTIZE_FIXED: OnceLock<Kernel> = OnceLock::new();
 static FAKE_QUANTIZE_PERBATCH: OnceLock<Kernel> = OnceLock::new();
+static ROUND_TO_FORMAT: OnceLock<Kernel> = OnceLock::new();
+static DOUBLE_SINGLE: OnceLock<Kernel> = OnceLock::new();
 static LAYERNORM: OnceLock<Kernel> = OnceLock::new();
 static LAYERNORM_VEC4: OnceLock<Kernel> = OnceLock::new();
 static NORM_ROPE: OnceLock<Kernel> = OnceLock::new();
 static NARROW_SPLIT: OnceLock<Kernel> = OnceLock::new();
 static CONCAT_MANY: OnceLock<Kernel> = OnceLock::new();
 static GROUP_NORM: OnceLock<Kernel> = OnceLock::new();
+static GROUP_NORM_SPLIT: OnceLock<[Kernel; 3]> = OnceLock::new();
 static LAYER_NORM2D: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD: OnceLock<Kernel> = OnceLock::new();
 static RMS_NORM_BWD_PARAM: OnceLock<Kernel> = OnceLock::new();
@@ -3141,6 +3471,12 @@ static POOL3D: OnceLock<Kernel> = OnceLock::new();
 static CONV1D: OnceLock<Kernel> = OnceLock::new();
 static CONV3D: OnceLock<Kernel> = OnceLock::new();
 static CONV3D_CTILE: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_CTILE_W2: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_CTILE_W4: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_CTILE_W4C8: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_K3_C8: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_ARGMAX: OnceLock<Kernel> = OnceLock::new();
+static CONV3D_TOPK: OnceLock<Kernel> = OnceLock::new();
 static CONV_TRANSPOSE3D: OnceLock<Kernel> = OnceLock::new();
 static CONV_TRANSPOSE2D: OnceLock<Kernel> = OnceLock::new();
 static CONV_TRANSPOSE2D_TILED: OnceLock<Kernel> = OnceLock::new();
@@ -3191,6 +3527,80 @@ static MATMUL_QKV_COOP_F16_VK_WIDEN_F32ACC: OnceLock<Option<Kernel>> = OnceLock:
 
 pub fn matmul_kernel(device: &wgpu::Device) -> &'static Kernel {
     MATMUL.get_or_init(|| build_kernel(device, "rlx-wgpu matmul", MATMUL_WGSL, "matmul"))
+}
+/// `matmul_gemv` with `cols` columns per 256-thread workgroup and K split
+/// `256 / cols` ways inside it. The shipped shader is the `cols = 32` case.
+///
+/// `cols = 64` is the exact form: a 64-thread workgroup, one thread per
+/// column, K summed in order (`KSPLIT = 1`), so it rounds like `matmul.wgsl`
+/// and CoopF32. The split forms (32 / 16 / 8) add K in a different order.
+///
+/// Fewer columns per workgroup means `n / cols` more workgroups: at a narrow
+/// output (`n = 1024`, decode down/o projections) the 32-column form launches
+/// 32 workgroups — ~1.6 per M4 Pro core — and runs at ~60 GB/s while the wide
+/// `n = 6144` projection reaches ~150. Same single-pass reduction, no scratch.
+pub fn matmul_gemv_kernel_cols(device: &wgpu::Device, cols: u32) -> &'static Kernel {
+    static V64: OnceLock<Kernel> = OnceLock::new();
+    static V16: OnceLock<Kernel> = OnceLock::new();
+    static V8: OnceLock<Kernel> = OnceLock::new();
+    let (cell, label) = match cols {
+        64 => (&V64, "rlx-wgpu matmul_gemv exact"),
+        16 => (&V16, "rlx-wgpu matmul_gemv c16"),
+        8 => (&V8, "rlx-wgpu matmul_gemv c8"),
+        _ => return matmul_gemv_kernel(device),
+    };
+    cell.get_or_init(|| {
+        let ksplit = if cols == 64 { 1 } else { 256 / cols };
+        let src = MATMUL_GEMV_WGSL
+            .replace(
+                "const COLS: u32 = 32u;",
+                &format!("const COLS: u32 = {cols}u;"),
+            )
+            .replace(
+                "const KSPLIT: u32 = 8u;",
+                &format!("const KSPLIT: u32 = {ksplit}u;"),
+            )
+            .replace(
+                "var<workgroup> partial: array<array<f32, 32>, 32>;",
+                &format!(
+                    "var<workgroup> partial: array<array<f32, {cols}>, {}>;",
+                    ksplit * 4
+                ),
+            )
+            .replace(
+                "@compute @workgroup_size(32, 8)",
+                &format!("@compute @workgroup_size({cols}, {ksplit})"),
+            );
+        build_kernel(device, label, &src, "matmul_gemv")
+    })
+}
+
+/// Columns per workgroup for a decode GEMV of output width `n`.
+///
+/// 64, the in-order form, unless fast math is on
+/// ([`crate::device::set_fast_math`]), which takes the faster 32-column
+/// split-K form. `RLX_WGPU_GEMV_COLS` (64 / 32 / 16 / 8) pins it.
+pub fn gemv_cols_for(n: u32) -> u32 {
+    if let Some(c) = rlx_ir::env::var("RLX_WGPU_GEMV_COLS").and_then(|v| v.parse::<u32>().ok())
+        && matches!(c, 8 | 16 | 32 | 64)
+    {
+        return c;
+    }
+    let _ = n;
+    if crate::device::fast_math() { 32 } else { 64 }
+}
+
+/// `m ≤ 4` matrix-vector product (decode) — see `matmul_gemv.wgsl`.
+pub fn matmul_gemv_kernel(device: &wgpu::Device) -> &'static Kernel {
+    static MATMUL_GEMV: OnceLock<Kernel> = OnceLock::new();
+    MATMUL_GEMV.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu matmul_gemv",
+            MATMUL_GEMV_WGSL,
+            "matmul_gemv",
+        )
+    })
 }
 pub fn matmul_wide_kernel(device: &wgpu::Device) -> &'static Kernel {
     MATMUL_WIDE.get_or_init(|| {
@@ -3300,6 +3710,7 @@ pub fn matmul_coop16_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     let feats = device.features();
     if !feats.contains(wgpu::Features::SHADER_F16)
         || !feats.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        || !crate::device::coop_f16_8x8_supported()
     {
         return None;
     }
@@ -3408,6 +3819,62 @@ pub fn matmul_coop_f32_direct_kernel(device: &wgpu::Device) -> Option<&'static K
         )
     }))
 }
+/// Edge-tolerant Metal CoopF32 (`matmul_coop_f32_edge.wgsl`): any K / N, B may
+/// be an activation. Same bind layout and grid as [`matmul_coop_f32_kernel`].
+pub fn matmul_coop_f32_edge_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !device
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    {
+        return None;
+    }
+    Some(MATMUL_COOP_F32_EDGE.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu matmul_coop_f32_edge",
+            MATMUL_COOP_F32_EDGE_WGSL,
+            "matmul_coop_f32_edge",
+        )
+    }))
+}
+/// `matmul_coop_f32_strided.wgsl` — batched matmul reading A and B through
+/// strided views (see [`MatmulStridedParams`]). Metal + cooperative matrix only.
+pub fn matmul_coop_f32_strided_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !device
+        .features()
+        .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    {
+        return None;
+    }
+    Some(MATMUL_COOP_F32_STRIDED.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu matmul_coop_f32_strided",
+            MATMUL_COOP_F32_STRIDED_WGSL,
+            "matmul_coop_f32_strided",
+        )
+    }))
+}
+/// True when the aligned Metal CoopF32 kernel can take this shape directly.
+pub fn coop_f32_metal_aligned(k: u32, n: u32) -> bool {
+    k.is_multiple_of(8) && n.is_multiple_of(32)
+}
+/// The CoopF32 kernel for one matmul. The bind group (built at compile time)
+/// and the pipeline (set at dispatch) must both come from here so they agree.
+pub fn matmul_coop_f32_kernel_for(
+    device: &wgpu::Device,
+    k: u32,
+    n: u32,
+) -> Option<&'static Kernel> {
+    if matches!(
+        crate::device::wgpu_device().map(|d| d.backend),
+        Some(wgpu::Backend::Metal)
+    ) && !coop_f32_metal_aligned(k, n)
+    {
+        return matmul_coop_f32_edge_kernel(device);
+    }
+    matmul_coop_f32_active_kernel(device)
+}
 /// Portable 8×8 coop f32 matmul (`coopLoad`, 8×8 workgroups) — the discrete
 /// Vulkan form; DX12 exposes no cooperative matrices.
 pub fn matmul_coop_f32_portable_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
@@ -3446,6 +3913,25 @@ fn coop_f16_vk_device_ready(device: &wgpu::Device) -> bool {
 
 fn coop_f16_vk_f32acc_device_ready(device: &wgpu::Device) -> bool {
     coop_f16_vk_device_ready(device) && crate::device::coop_f16_16x16_f32_acc_supported()
+}
+
+/// The 32×32-block f32-accumulator coop kernel (one subgroup, 2×2 tiles). Same
+/// bind layout and params as [`matmul_coop_f16_vulkan_f32acc_kernel`]; dispatch
+/// `(m / 32, n / 32, batch)`, so M and N must be multiples of 32.
+pub fn matmul_coop_f16_vulkan_f32acc_32_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
+    if !coop_f16_vk_f32acc_device_ready(device) {
+        return None;
+    }
+    MATMUL_COOP_F16_VULKAN_F32ACC_32
+        .get_or_init(|| {
+            try_build_kernel_coop_f16_vk(
+                device,
+                "rlx-wgpu matmul_coop_f16_vulkan_f32acc_32",
+                MATMUL_COOP_F16_VULKAN_F32ACC_32_WGSL,
+                "matmul_coop_f16_vulkan_f32acc_32",
+            )
+        })
+        .as_ref()
 }
 
 pub fn matmul_coop_f16_vulkan_f32acc_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
@@ -3940,6 +4426,16 @@ pub fn group_norm_backward_beta_kernel(device: &wgpu::Device) -> &'static Kernel
         )
     })
 }
+pub fn resize_nearest2x_kernel(device: &wgpu::Device) -> &'static Kernel {
+    RESIZE_NEAREST2X.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu resize_nearest2x",
+            RESIZE_NEAREST2X_WGSL,
+            "resize_nearest2x",
+        )
+    })
+}
 pub fn axial_rope2d_kernel(device: &wgpu::Device) -> &'static Kernel {
     AXIAL_ROPE2D.get_or_init(|| {
         build_kernel(
@@ -3967,6 +4463,26 @@ pub fn fake_quantize_perbatch_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu fake_quantize_perbatch",
             FAKE_QUANTIZE_WGSL,
             "fake_quantize_perbatch",
+        )
+    })
+}
+pub fn double_single_kernel(device: &wgpu::Device) -> &'static Kernel {
+    DOUBLE_SINGLE.get_or_init(|| {
+        // Guarded prelude: wgpu compiles Metal shaders with fast math on.
+        let src = format!(
+            "{}\n{DOUBLE_SINGLE_WGSL}",
+            rlxsl::dw::wgsl_fast_math_guarded()
+        );
+        build_kernel(device, "rlx-wgpu double_single", &src, "double_single")
+    })
+}
+pub fn round_to_format_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ROUND_TO_FORMAT.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu round_to_format",
+            ROUND_TO_FORMAT_WGSL,
+            "round_to_format",
         )
     })
 }
@@ -4013,6 +4529,144 @@ pub fn norm_rope_kernel(device: &wgpu::Device) -> &'static Kernel {
     NORM_ROPE
         .get_or_init(|| build_kernel(device, "rlx-wgpu norm_rope", NORM_ROPE_WGSL, "norm_rope"))
 }
+/// A conv3d (`conv3d_ctile*`, `conv3d_argmax`), group-norm or `copy` entry point
+/// whose output is its own binding: binding 0 the window holding the input
+/// (and the staged weights), 1 the parameters, 2 the output's window. For an
+/// arena striped past one storage binding, where an op's input and output lie
+/// in different stripes and no single window holds both. The two windows are
+/// disjoint ranges of the arena, so both may be writable storage.
+pub fn two_window_kernel(device: &wgpu::Device, entry: &'static str) -> &'static Kernel {
+    static KERNELS: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, &'static Kernel>>,
+    > = OnceLock::new();
+    let map = KERNELS.get_or_init(Default::default);
+    let mut map = map.lock().unwrap();
+    map.entry(entry).or_insert_with(|| {
+        let src = if entry == "copy" {
+            COPY_TWO_WINDOW_WGSL
+        } else if entry.starts_with("group_norm") {
+            GROUP_NORM_SPLIT_WGSL
+        } else {
+            CONV3D_CTILE_SPLIT_WGSL
+        };
+        let module = kernel_module(device, "rlx-wgpu two-window", src);
+        let storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let entry_of = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty,
+            count: None,
+        };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rlx-wgpu two-window"),
+            entries: &[
+                entry_of(0, storage),
+                entry_of(
+                    1,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                entry_of(2, storage),
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rlx-wgpu two-window"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Box::leak(Box::new(Kernel { pipeline, bgl }))
+    })
+}
+
+/// A conv3d or group-norm entry point for half-packed activations
+/// (`unfuse::pack_half_activations`): the pipeline's `IN_HALF` / `OUT_HALF`
+/// overrides from `half` (bit 0 / bit 1), on one binding (`arena` + uniform)
+/// or two windows (`two`, [`two_window_kernel`]'s layout). The same shader
+/// source; the compiler folds the branches away.
+pub fn half_kernel(
+    device: &wgpu::Device,
+    entry: &'static str,
+    two: bool,
+    half: u32,
+) -> &'static Kernel {
+    type Key = (&'static str, bool, u32);
+    static KERNELS: OnceLock<std::sync::Mutex<std::collections::HashMap<Key, &'static Kernel>>> =
+        OnceLock::new();
+    let map = KERNELS.get_or_init(Default::default);
+    let mut map = map.lock().unwrap();
+    map.entry((entry, two, half)).or_insert_with(|| {
+        let norm = entry.starts_with("group_norm");
+        let src = match (norm, two) {
+            (true, true) => GROUP_NORM_SPLIT_WGSL,
+            (true, false) => GROUP_NORM_WGSL,
+            (false, true) => CONV3D_CTILE_SPLIT_WGSL,
+            (false, false) => CONV3D_CTILE_WGSL,
+        };
+        let module = kernel_module(device, "rlx-wgpu half", src);
+        let storage = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let entry_of = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty,
+            count: None,
+        };
+        let uniform = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let entries = [
+            entry_of(0, storage),
+            entry_of(1, uniform),
+            entry_of(2, storage),
+        ];
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rlx-wgpu half"),
+            entries: if two { &entries[..] } else { &entries[..2] },
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("rlx-wgpu half"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let constants = [
+            ("IN_HALF", f64::from(half & 1)),
+            ("OUT_HALF", f64::from((half >> 1) & 1)),
+        ];
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants,
+                ..Default::default()
+            },
+            cache: None,
+        });
+        Box::leak(Box::new(Kernel { pipeline, bgl }))
+    })
+}
+
 pub fn group_norm_kernel(device: &wgpu::Device) -> &'static Kernel {
     GROUP_NORM
         .get_or_init(|| build_kernel(device, "rlx-wgpu group_norm", GROUP_NORM_WGSL, "group_norm"))
@@ -4025,6 +4679,32 @@ pub fn layer_norm2d_kernel(device: &wgpu::Device) -> &'static Kernel {
             LAYER_NORM2D_WGSL,
             "layer_norm2d",
         )
+    })
+}
+/// `group_norm.wgsl`'s split form — partial, apply, head — for a norm whose
+/// `GroupNormParams::chunks > 1`; same bind-group layout as [`group_norm_kernel`].
+pub fn group_norm_split_kernels(device: &wgpu::Device) -> &'static [Kernel; 3] {
+    GROUP_NORM_SPLIT.get_or_init(|| {
+        [
+            build_kernel(
+                device,
+                "rlx-wgpu group_norm_partial",
+                GROUP_NORM_WGSL,
+                "group_norm_partial",
+            ),
+            build_kernel(
+                device,
+                "rlx-wgpu group_norm_apply",
+                GROUP_NORM_WGSL,
+                "group_norm_apply",
+            ),
+            build_kernel(
+                device,
+                "rlx-wgpu group_norm_head",
+                GROUP_NORM_WGSL,
+                "group_norm_head",
+            ),
+        ]
     })
 }
 pub fn rms_norm_backward_kernel(device: &wgpu::Device) -> &'static Kernel {
@@ -4380,10 +5060,7 @@ fn build_kernel_region(
     wgsl: &str,
     entry_point: &'static str,
 ) -> Kernel {
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-    });
+    let module = kernel_module(device, label, wgsl);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
         entries: &[
@@ -5440,6 +6117,72 @@ pub fn conv3d_ctile_kernel(device: &wgpu::Device) -> &'static Kernel {
         )
     })
 }
+pub fn conv3d_ctile_w2_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_CTILE_W2.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_ctile_w2",
+            CONV3D_CTILE_WGSL,
+            "conv3d_ctile_w2",
+        )
+    })
+}
+pub fn conv3d_ctile_w4_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_CTILE_W4.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_ctile_w4",
+            CONV3D_CTILE_WGSL,
+            "conv3d_ctile_w4",
+        )
+    })
+}
+pub fn conv3d_ctile_w4c8_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_CTILE_W4C8.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_ctile_w4c8",
+            CONV3D_CTILE_WGSL,
+            "conv3d_ctile_w4c8",
+        )
+    })
+}
+/// A 2-D 3×3 conv (kernel `[1, 3, 3]`, stride 1, padding `[0, 1, 1]`), its
+/// weights in workgroup memory; see [`Conv3dParams::is_k3`].
+pub fn conv3d_k3_c8_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_K3_C8.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_k3_c8",
+            CONV3D_CTILE_WGSL,
+            "conv3d_k3_c8",
+        )
+    })
+}
+/// A 1×1×1 conv3d keeping each voxel's `k` best output channels
+/// (`Conv3dParams::act == TOPK_ACT`; see `unfuse::CONV3D_TOPK`).
+pub fn conv3d_topk_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_TOPK.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_topk",
+            CONV3D_CTILE_WGSL,
+            "conv3d_topk",
+        )
+    })
+}
+/// A 1×1×1 conv3d and the argmax over its output channels in one pass
+/// (`Conv3dParams::act == ARGMAX_ACT`; see `unfuse::fold_conv_argmax`).
+pub fn conv3d_argmax_kernel(device: &wgpu::Device) -> &'static Kernel {
+    CONV3D_ARGMAX.get_or_init(|| {
+        build_kernel(
+            device,
+            "rlx-wgpu conv3d_argmax",
+            CONV3D_CTILE_WGSL,
+            "conv3d_argmax",
+        )
+    })
+}
 pub fn conv_transpose3d_kernel(device: &wgpu::Device) -> &'static Kernel {
     CONV_TRANSPOSE3D.get_or_init(|| {
         build_kernel(
@@ -5657,10 +6400,7 @@ pub fn dequant_gemv_gguf_wide_ilp_kernel(device: &wgpu::Device) -> &'static Kern
 pub fn gguf_subgroup_probe_kernel(device: &wgpu::Device) -> &'static Kernel {
     GGUF_SUBGROUP_PROBE.get_or_init(|| {
         let label = "rlx-wgpu gguf subgroup probe";
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(GGUF_SUBGROUP_PROBE_WGSL.into()),
-        });
+        let module = kernel_module(device, label, GGUF_SUBGROUP_PROBE_WGSL);
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some(label),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -6022,6 +6762,14 @@ mod tests {
         WideGrid, WideVariant, conv_transpose2d_tiled_grid, wide_grid,
     };
 
+    /// Parse one of this crate's kernels exactly as [`super::kernel_module`] builds
+    /// it: with the numeric helpers injected, so a shader that calls `rlx_div_rn` /
+    /// `rlx_log` parses here rather than failing on a name the module supplies.
+    fn parse_kernel(name: &str, src: &str) -> naga::Module {
+        let src = super::with_numeric_helpers_as(src, false);
+        naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{name}: {e:?}"))
+    }
+
     /// The widths the band route admits are the same at both workgroup widths the
     /// kernel builds: 256 (the floor every conforming adapter launches) and 512
     /// (the add-on). This is what keeps the device-free plan — which answers at
@@ -6072,7 +6820,7 @@ mod tests {
     /// spelling is what this tree cannot re-take.
     #[test]
     fn frames_shader_matches_its_dispatch_geometry() {
-        let module = naga::front::wgsl::parse_str(FRAMES_WGSL).expect("wgsl parse");
+        let module = parse_kernel("frames.wgsl", FRAMES_WGSL);
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -6114,7 +6862,7 @@ mod tests {
     /// graph reaches a one-row draw.
     #[test]
     fn sample_shader_matches_its_dispatch_geometry() {
-        let module = naga::front::wgsl::parse_str(SAMPLE_WGSL).expect("wgsl parse");
+        let module = parse_kernel("sample.wgsl", SAMPLE_WGSL);
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -6138,7 +6886,7 @@ mod tests {
     /// machine whose graph reaches the folded step.
     #[test]
     fn snake_beta_shader_matches_its_dispatch_geometry() {
-        let module = naga::front::wgsl::parse_str(SNAKE_BETA_WGSL).expect("wgsl parse");
+        let module = parse_kernel("snake_beta.wgsl", SNAKE_BETA_WGSL);
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -6167,9 +6915,7 @@ mod tests {
                 FUSED_RESIDUAL_LN_TEE_VEC4_WGSL,
             ),
         ] {
-            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| {
-                panic!("{name}: {e:?}");
-            });
+            let module = parse_kernel(name, src);
             naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),
                 naga::valid::Capabilities::empty(),
@@ -6201,8 +6947,7 @@ mod tests {
     #[test]
     fn coop_f16_f32acc_shader_parses_and_validates() {
         let src = super::MATMUL_COOP_F16_F32ACC_WGSL;
-        let module = naga::front::wgsl::parse_str(src)
-            .unwrap_or_else(|e| panic!("matmul_coop_f16_f32acc.wgsl: {e:?}"));
+        let module = parse_kernel("matmul_coop_f16_f32acc.wgsl", src);
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::SHADER_FLOAT16
@@ -6283,7 +7028,7 @@ mod tests {
     /// device that provides less.
     #[test]
     fn conv_transpose2d_tiled_shader_matches_its_dispatch_geometry() {
-        let module = naga::front::wgsl::parse_str(CONV_TRANSPOSE2D_TILED_WGSL).expect("wgsl parse");
+        let module = parse_kernel("conv_transpose2d_tiled.wgsl", CONV_TRANSPOSE2D_TILED_WGSL);
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -6329,7 +7074,7 @@ mod tests {
     /// few rows) or a padded one (reaching rows the full grid already stored).
     #[test]
     fn wide_matmul_shader_matches_its_dispatch_geometry() {
-        let module = naga::front::wgsl::parse_str(MATMUL_WIDE_VEC4_WGSL).expect("wgsl parse");
+        let module = parse_kernel("matmul_wide_vec4.wgsl", MATMUL_WIDE_VEC4_WGSL);
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::empty(),
@@ -6467,18 +7212,19 @@ mod tests {
         }
     }
 
-    /// The activation codes `apply_activation` actually has an arm for, read out of
-    /// the kernel's own source. The scan is scoped to that one function: the same file's
-    /// `apply_binary` / `apply_cast` / `apply_compare` arms share the `sub == Nu` shape,
-    /// and a file-wide scan would conflate their code spaces.
+    /// The activation codes `rlx_activation_apply` — the generated dispatch
+    /// `apply_activation` forwards to — has a `case` for, read out of the kernel's own
+    /// source. The scan is scoped to that one function: the same file's
+    /// `rlx_binary_apply` shares the `case Nu:` shape, and a file-wide scan would
+    /// conflate their code spaces.
     fn kernel_activation_subs(src: &str) -> Vec<u32> {
         let body = src
-            .split_once("fn apply_activation(")
-            .expect("apply_activation in the region kernel")
+            .split_once("fn rlx_activation_apply(")
+            .expect("the generated activation dispatch in the region kernel")
             .1;
         let body = body.split("\nfn ").next().unwrap();
         let mut subs: Vec<u32> = body
-            .split("sub == ")
+            .split("case ")
             .skip(1)
             .filter_map(|rest| rest.split('u').next()?.trim().parse::<u32>().ok())
             .collect();
@@ -6540,5 +7286,76 @@ mod tests {
             "the split's partial stride is `2 + pad` on both sides, so the host's pad \
              and the shader's `DECODE_DIM_CHUNK` are one number"
         );
+    }
+}
+
+#[cfg(test)]
+mod fast_math_tests {
+    use super::*;
+
+    /// `set_fast_math` works by replacing the exact helper block with the fast
+    /// one in `kernel_module`. That is a string match: if a shader stopped
+    /// embedding the helpers verbatim, fast math would silently be a no-op for
+    /// it. Every shader that calls them must carry the exact block once.
+    #[test]
+    fn every_helper_shader_carries_the_exact_block_once() {
+        let exact = rlxsl::exact::wgsl_numeric_helpers();
+        for (name, src) in [
+            ("unary", UNARY_WGSL),
+            ("binary", BINARY_WGSL),
+            ("activation_backward", ACTIVATION_BACKWARD_WGSL),
+            ("elementwise_region", ELEMENTWISE_REGION_WGSL),
+            ("batch_norm_inference", BATCH_NORM_INFERENCE_WGSL),
+        ] {
+            assert_eq!(
+                src.matches(exact).count(),
+                1,
+                "{name} must embed the exact helpers once"
+            );
+            let fast = with_numeric_helpers_as(src, true);
+            assert!(!fast.contains("rlxsl::exact — correctly-rounded"), "{name}");
+            assert_eq!(fast.matches("fn rlx_div_rn").count(), 1, "{name}");
+        }
+    }
+
+    /// The hand-written kernels call the helpers without defining them;
+    /// `kernel_module` appends one block — exact, or the fast one under
+    /// `set_fast_math` — and leaves a shader that calls none alone.
+    #[test]
+    fn hand_written_kernels_get_the_helpers_appended_once() {
+        let exact = rlxsl::exact::wgsl_numeric_helpers();
+        let fast = rlxsl::exact::wgsl_fast_numeric_helpers();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
+        let mut calling = 0;
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_none_or(|x| x != "wgsl") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).unwrap();
+            let name = p.file_name().unwrap().to_string_lossy();
+            for h in rlxsl::exact::WGSL_HELPER_NAMES {
+                assert!(
+                    !src.contains(&format!("fn {h}(")),
+                    "{name} defines its own {h}"
+                );
+            }
+            let calls = rlxsl::exact::WGSL_HELPER_NAMES
+                .iter()
+                .any(|h| src.contains(&format!("{h}(")));
+            let (e, f) = (
+                with_numeric_helpers_as(&src, false),
+                with_numeric_helpers_as(&src, true),
+            );
+            if calls {
+                calling += 1;
+                assert_eq!(e.matches(exact).count(), 1, "{name}");
+                assert_eq!(f.matches(fast).count(), 1, "{name}");
+            } else {
+                assert_eq!(e, src.as_str(), "{name}");
+                assert_eq!(f, src.as_str(), "{name}");
+            }
+        }
+        assert!(calling >= 32, "only {calling} kernels call the helpers");
     }
 }

@@ -70,7 +70,7 @@ impl Drop for MoeResidencyGuard {
 /// Contiguous AVX2 Add/Mul/Sub. Large buffers are split across Rayon so we
 /// keep SIMD *and* multi-core (serial AVX2 alone lost to 16-wide scalar rayon
 /// on F5-TTS DiT residuals).
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[inline]
 fn binary_contig_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp) -> bool {
     if !std::arch::is_x86_feature_detected!("avx2") {
@@ -95,7 +95,7 @@ fn binary_contig_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp) -> bool 
             op,
         )
     };
-    if len >= 8192 && crate::pool::num_threads() > 1 {
+    if crate::pool::should_parallelize(len) {
         crate::pool::par_for(len, crate::pool::chunk_floor(len), &|off, cnt| {
             run(off, off + cnt);
         });
@@ -121,7 +121,7 @@ fn binary_contig_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp) -> bool 
 /// # Safety
 /// Caller has checked `is_x86_feature_detected!("avx2")`, `op` is one of
 /// Add/Sub/Mul, and `[i0, i1)` is in bounds of all three buffers.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn binary_contig_avx2(
@@ -160,7 +160,7 @@ unsafe fn binary_contig_avx2(
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(rlx_cpu_x86))]
 #[inline]
 #[allow(dead_code)]
 fn binary_contig_f32(_l: &[f32], _r: &[f32], _o: &mut [f32], _op: BinaryOp) -> bool {
@@ -179,7 +179,7 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
     let r_ptr = r.as_ptr() as usize;
     let o_ptr = o.as_mut_ptr() as usize;
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(rlx_cpu_x86)]
     let use_avx2 = rl >= 8
         && rl.is_multiple_of(8)
         && matches!(op, BinaryOp::Add | BinaryOp::Mul | BinaryOp::Sub)
@@ -189,7 +189,7 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
         let l = l_ptr as *const f32;
         let r = r_ptr as *const f32;
         let o = o_ptr as *mut f32;
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(rlx_cpu_x86)]
         if use_avx2 {
             // SAFETY: AVX2 + `rl % 8 == 0` + Add/Sub/Mul all checked in
             // `use_avx2`; rows `[row0, row1)` are within `rows`.
@@ -221,7 +221,7 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
             }
         }
     };
-    if rows >= 4 && crate::pool::num_threads() > 1 && len >= 8192 {
+    if rows >= 4 && crate::pool::should_parallelize(len) {
         crate::pool::par_for(rows, 1, &|off, cnt| run_rows(off, off + cnt));
     } else {
         run_rows(0, rows);
@@ -238,7 +238,7 @@ fn binary_row_bcast_f32(l: &[f32], r: &[f32], o: &mut [f32], op: BinaryOp, rl: u
 /// Caller has checked `is_x86_feature_detected!("avx2")`, that `rl` is a
 /// non-zero multiple of 8, that `op` is one of Add/Sub/Mul, and that rows
 /// `[row0, row1)` are in bounds of all three buffers.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn binary_row_bcast_avx2(
@@ -330,6 +330,40 @@ fn arena_ranges_overlap(a: usize, a_elems: usize, c: usize, c_elems: usize) -> b
     a < c + c_elems * 4 && c < a + a_elems * 4
 }
 
+/// `Thunk::Sgemm`, operands clamped to the arena and staged through a
+/// temporary when one sits inside the destination (see [`arena_ranges_overlap`]).
+pub(crate) fn exec_sgemm(t: &Thunk, base: *mut u8, arena_len: usize, trace: bool) {
+    let Thunk::Sgemm { a, b, c, m, k, n } = t else {
+        unreachable!()
+    };
+    let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+    if trace {
+        eprintln!("[sgemm] m={m} k={k} n={n} a={} b={} c={}", *a, *b, *c);
+    }
+    let c_len = m.saturating_mul(n);
+    let a_len = m.saturating_mul(k);
+    let b_len = k.saturating_mul(n);
+    let max_a = (arena_len.saturating_sub(*a)) / 4;
+    let max_b = (arena_len.saturating_sub(*b)) / 4;
+    let max_c = (arena_len.saturating_sub(*c)) / 4;
+    let a_len = a_len.min(max_a);
+    let b_len = b_len.min(max_b);
+    let c_len = c_len.min(max_c);
+    unsafe {
+        let a_sl = sl(*a, base, a_len);
+        let b_sl = sl(*b, base, b_len);
+        let c_sl = sl_mut(*c, base, c_len);
+        if arena_ranges_overlap(*a, a_len, *c, c_len) || arena_ranges_overlap(*b, b_len, *c, c_len)
+        {
+            let mut tmp = vec![0.0f32; c_len];
+            crate::blas::sgemm_auto(a_sl, b_sl, &mut tmp, m, k, n);
+            c_sl.copy_from_slice(&tmp);
+        } else {
+            crate::blas::sgemm_auto(a_sl, b_sl, c_sl, m, k, n);
+        }
+    }
+}
+
 /// The same range test where only the slices are in hand.
 ///
 /// The batched matmul paths build their per-item slices from raw pointers, so
@@ -346,23 +380,70 @@ fn slices_overlap(a: &[f32], c: &[f32]) -> bool {
     a0 < c1 && c0 < a1
 }
 
+/// Coalesce a broadcast's axes without changing its element → (lhs, rhs)
+/// index map: drop size-1 axes, then fold each axis into the one outside it
+/// when `stride[outer] == stride[inner] * size[inner]` for both operands.
+fn coalesce_bcast_axes(dims: &[u32], ls: &[u32], rs: &[u32]) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let (mut d, mut l, mut r) = (
+        Vec::with_capacity(dims.len()),
+        Vec::with_capacity(dims.len()),
+        Vec::<u32>::with_capacity(dims.len()),
+    );
+    for ax in 0..dims.len() {
+        let (sz, la, ra) = (dims[ax], ls[ax], rs[ax]);
+        if sz == 1 {
+            continue;
+        }
+        if let (Some(dl), Some(pl), Some(pr)) = (d.last_mut(), l.last_mut(), r.last_mut()) {
+            let merged = u64::from(*dl) * u64::from(sz);
+            if u64::from(*pl) == u64::from(la) * u64::from(sz)
+                && u64::from(*pr) == u64::from(ra) * u64::from(sz)
+                && merged <= u64::from(u32::MAX)
+            {
+                (*dl, *pl, *pr) = (merged as u32, la, ra);
+                continue;
+            }
+        }
+        d.push(sz);
+        l.push(la);
+        r.push(ra);
+    }
+    (d, l, r)
+}
+
 pub fn execute_thunks(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
-    // `RLX_CPU_EXEC_IN_POOL`: run the whole schedule on a pool worker. Called
+    // Run the whole schedule on a pool worker (default; `RLX_CPU_EXEC_IN_POOL=0`
+    // opts out). Called
     // from outside the pool, every parallel kernel parks this thread until the
     // workers finish and then waits for it to be woken — per GEMV, per
     // attention, ~225 times per decoded token. On a worker the kernels' joins
     // spin instead, and this thread's share of the work is done by the worker
     // it runs on. Thread-local kernel state (MoE residency masks, counters)
     // then lives on that worker.
-    if exec_in_pool() && rayon::current_thread_index().is_none() && crate::pool::num_threads() > 1 {
+    if exec_in_pool()
+        && rayon::current_thread_index().is_none()
+        && crate::pool::num_threads() > 1
+        && !waits_on_peers(schedule)
+    {
         return rayon::scope(|_| execute_thunks_here(schedule, arena_buf));
     }
     execute_thunks_here(schedule, arena_buf)
 }
 
+/// A schedule with a kernel that blocks on other ranks stays on the caller's
+/// thread (see [`crate::op_registry::CpuKernel::waits_on_peers`]).
+fn waits_on_peers(schedule: &ThunkSchedule) -> bool {
+    schedule
+        .thunks
+        .iter()
+        .any(|t| matches!(t, Thunk::CustomOp { kernel, .. } if kernel.waits_on_peers()))
+}
+
 fn exec_in_pool() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| rlx_ir::env::flag("RLX_CPU_EXEC_IN_POOL"))
+    // On by default: measured on GraphCSPNet training (many small kernels per
+    // step), 124.6 s → 50.0 s wall, system time 81 s → 48 s.
+    *ON.get_or_init(|| rlx_ir::env::flag_or("RLX_CPU_EXEC_IN_POOL", true))
 }
 
 fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
@@ -420,8 +501,44 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             (mb.max(b), ms.max(s), mh.max(h), md.max(d))
         });
     let (max_batch, max_seq, max_heads, _max_dh) = max_sdpa;
-    let max_units = max_batch * max_heads;
-    let mut sdpa_scores = vec![0f32; max_units * max_seq * max_seq];
+    let _ = (max_batch, max_seq, max_heads);
+    // Heads whose score matrix is large run row-blocked with per-worker
+    // buffers (`sdpa_row_blocked`): they need none of this up-front scratch,
+    // which for long sequences would be gigabytes zeroed on every run.
+    let sdpa_need = thunks
+        .iter()
+        .filter_map(|t| match t {
+            Thunk::Attention {
+                batch,
+                seq,
+                kv_seq,
+                heads,
+                mask_kind,
+                bhsd,
+                head_dim,
+                v_head_dim,
+                ..
+            } => {
+                let (b, q, k, h) = (
+                    *batch as usize,
+                    *seq as usize,
+                    *kv_seq as usize,
+                    *heads as usize,
+                );
+                if sdpa_row_blocked(q, k, *mask_kind, *bhsd)
+                    && sdpa_sme_blocks(q, k, *head_dim as usize, *v_head_dim as usize)
+                {
+                    Some(0)
+                } else {
+                    let s = q.max(k);
+                    Some(b * h * s * s)
+                }
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let mut sdpa_scores = vec![0f32; sdpa_need];
 
     // Pre-allocate fused layer buffers (reused across all 12+ layers — zero malloc per layer)
     let fl = thunks
@@ -468,7 +585,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     if trace_thunks {
         eprintln!(
             "[thunk] prealloc max_h={max_h} sdpa={} fl_m={fl_m} fl_h={fl_h} fl_int={fl_int}",
-            max_units * max_seq * max_seq
+            sdpa_need
         );
     }
     let profile = rlx_ir::env::var_os("RLX_PROFILE_THUNKS").is_some();
@@ -528,7 +645,35 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             }
         }
     }
+    // Waves (`wave-exec`): independent runs of thunks execute level by level
+    // on the pool. Off under every per-thunk diagnostic, which assumes order.
+    #[cfg(feature = "wave-exec")]
+    let waves = (crate::thunk::waves_enabled()
+        && !profile
+        && !trace_thunks
+        && !write_trace
+        && watch.is_none())
+    .then(|| crate::thunk::plan_for(schedule).clone());
+    #[cfg(feature = "wave-exec")]
+    let (mut wave_cursor, mut wave_until) = (0usize, 0usize);
     for i in 0..len {
+        #[cfg(feature = "wave-exec")]
+        if let Some(plan) = waves.as_deref() {
+            if i < wave_until {
+                continue;
+            }
+            if let Some(end) = crate::thunk::try_run_segment(
+                plan,
+                &mut wave_cursor,
+                i,
+                thunks,
+                base,
+                arena_buf.len(),
+            ) {
+                wave_until = end;
+                continue;
+            }
+        }
         if profile {
             if let Some((pn, pt)) = prof_prev.take() {
                 profile_record(pn, pt.elapsed());
@@ -570,36 +715,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             Thunk::LogMelBackward { .. } => exec_log_mel_backward(thunk, base),
             Thunk::WelchPeaks { .. } => exec_welch_peaks(thunk, base),
             Thunk::CustomFn { .. } => exec_custom_fn(thunk, base),
-            Thunk::Sgemm { a, b, c, m, k, n } => {
-                let (m, k, n) = (*m as usize, *k as usize, *n as usize);
-                if trace_thunks {
-                    eprintln!("[sgemm] m={m} k={k} n={n} a={} b={} c={}", *a, *b, *c);
-                }
-                let c_len = m.saturating_mul(n);
-                let a_len = m.saturating_mul(k);
-                let b_len = k.saturating_mul(n);
-                let arena_len = arena_buf.len();
-                let max_a = (arena_len.saturating_sub(*a)) / 4;
-                let max_b = (arena_len.saturating_sub(*b)) / 4;
-                let max_c = (arena_len.saturating_sub(*c)) / 4;
-                let a_len = a_len.min(max_a);
-                let b_len = b_len.min(max_b);
-                let c_len = c_len.min(max_c);
-                unsafe {
-                    let a_sl = sl(*a, base, a_len);
-                    let b_sl = sl(*b, base, b_len);
-                    let c_sl = sl_mut(*c, base, c_len);
-                    if arena_ranges_overlap(*a, a_len, *c, c_len)
-                        || arena_ranges_overlap(*b, b_len, *c, c_len)
-                    {
-                        let mut tmp = vec![0.0f32; c_len];
-                        crate::blas::sgemm_auto(a_sl, b_sl, &mut tmp, m, k, n);
-                        c_sl.copy_from_slice(&tmp);
-                    } else {
-                        crate::blas::sgemm_auto(a_sl, b_sl, c_sl, m, k, n);
-                    }
-                }
-            }
+            Thunk::Sgemm { .. } => exec_sgemm(thunk, base, arena_buf.len(), trace_thunks),
 
             Thunk::SgemmHalf {
                 a,
@@ -843,15 +959,18 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     let b_full = sl(*b, base, b_elems);
                     let c_full = sl_mut(*c, base, c_elems);
                     // Parallelize independent batch GEMMs with Rayon (BLAS
-                    // stays 1-thread per worker). Serial for tiny batches.
-                    if b_ >= 2 && crate::pool::num_threads() > 1 {
+                    // stays 1-thread per worker). Each task gets enough GEMMs
+                    // to be worth a hand-off: SPD layers multiply batches of
+                    // tiny C×C matrices, and one per task drowned in wake-ups.
+                    let grain = crate::pool::grain_for(m_ * k_ * n_);
+                    if b_ >= 2 * grain && crate::pool::num_threads() > 1 {
                         let a_ptr = a_full.as_ptr() as usize;
                         let b_ptr = b_full.as_ptr() as usize;
                         let c_ptr = c_full.as_mut_ptr() as usize;
                         let a_len = a_full.len();
                         let b_len = b_full.len();
                         let c_len = c_full.len();
-                        crate::pool::par_for(b_, 1, &|off, cnt| {
+                        crate::pool::par_for(b_, grain, &|off, cnt| {
                             for bi in off..off + cnt {
                                 let a0 = bi * a_bstride;
                                 let b0 = bi * b_bstride;
@@ -1313,6 +1432,11 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             }
             Thunk::ConjugateC64 { .. } => exec_conjugate_c64(thunk, base),
             Thunk::ActivationC64 { .. } => exec_activation_c64(thunk, base),
+            Thunk::While {
+                plan,
+                inputs,
+                output,
+            } => unsafe { super::execute_while(base, plan, inputs, *output) },
             Thunk::Scan { .. } => exec_scan(thunk, base),
             Thunk::ScanBackward {
                 body_vjp,
@@ -1628,10 +1752,25 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         let o = sl_mut_i64(*dst, base, len);
                         // Same fused-index + hoisted-op + parallel treatment as
                         // the f32 path below (bit-exact; elements independent).
-                        let rank = out_dims_bcast.len();
-                        let odb = &out_dims_bcast[..];
-                        let lstr = &bcast_lhs_strides[..];
-                        let rstr = &bcast_rhs_strides[..];
+                        // Coalesced axes (size-1 dropped, contiguous pairs
+                        // merged): the same index map, fewer div/mods, and a
+                        // long innermost row — `[128,4,1]` walks as one 512 row.
+                        let (odb_c, lstr_c, rstr_c);
+                        let (odb, lstr, rstr) = if out_dims_bcast.is_empty() {
+                            (
+                                &out_dims_bcast[..],
+                                &bcast_lhs_strides[..],
+                                &bcast_rhs_strides[..],
+                            )
+                        } else {
+                            (odb_c, lstr_c, rstr_c) = coalesce_bcast_axes(
+                                out_dims_bcast,
+                                bcast_lhs_strides,
+                                bcast_rhs_strides,
+                            );
+                            (&odb_c[..], &lstr_c[..], &rstr_c[..])
+                        };
+                        let rank = odb.len();
                         let idx = |i: usize| -> (usize, usize) {
                             if rank == 0 {
                                 let li = if ll == 1 { 0 } else { i % ll };
@@ -1653,12 +1792,15 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         macro_rules! bini64 {
                             ($f:expr) => {{
                                 let f = $f;
-                                if len >= 8192 {
+                                if crate::pool::should_parallelize(len) {
                                     use rayon::prelude::*;
-                                    o.par_iter_mut().enumerate().for_each(|(i, out)| {
-                                        let (li, ri) = idx(i);
-                                        *out = f(l[li], r[ri]);
-                                    });
+                                    o.par_iter_mut()
+                                        .enumerate()
+                                        .with_min_len(crate::pool::chunk_floor(len))
+                                        .for_each(|(i, out)| {
+                                            let (li, ri) = idx(i);
+                                            *out = f(l[li], r[ri]);
+                                        });
                                 } else {
                                     for i in 0..len {
                                         let (li, ri) = idx(i);
@@ -1692,34 +1834,82 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         let l = sl(*lhs, base, ll);
                         let r = sl(*rhs, base, rl);
                         let o = sl_mut(*dst, base, len);
+                        // The f32 binary ops, once: `$m!(closure)` per op.
+                        macro_rules! f32_op {
+                            ($m:ident) => {
+                                match op {
+                                    BinaryOp::Add => $m!(|a: f32, b: f32| a + b),
+                                    BinaryOp::Sub => $m!(|a: f32, b: f32| a - b),
+                                    BinaryOp::Mul => $m!(|a: f32, b: f32| a * b),
+                                    BinaryOp::Div => $m!(|a: f32, b: f32| a / b),
+                                    BinaryOp::Max => $m!(|a: f32, b: f32| a.max(b)),
+                                    BinaryOp::Min => $m!(|a: f32, b: f32| a.min(b)),
+                                    BinaryOp::Pow => $m!(|a: f32, b: f32| a.powf(b)),
+                                    BinaryOp::Mod => $m!(|a: f32, b: f32| a % b),
+                                    BinaryOp::Atan2 => $m!(|a: f32, b: f32| a.atan2(b)),
+                                    BinaryOp::BitAnd => {
+                                        $m!(|a: f32, b: f32| ((a as i64) & (b as i64)) as f32)
+                                    }
+                                    BinaryOp::BitOr => {
+                                        $m!(|a: f32, b: f32| ((a as i64) | (b as i64)) as f32)
+                                    }
+                                    BinaryOp::BitXor => {
+                                        $m!(|a: f32, b: f32| ((a as i64) ^ (b as i64)) as f32)
+                                    }
+                                    BinaryOp::Shl => $m!(|a: f32, b: f32| (a as i64)
+                                        .wrapping_shl(b as u32)
+                                        as f32),
+                                    BinaryOp::Shr => $m!(|a: f32, b: f32| (a as i64)
+                                        .wrapping_shr(b as u32)
+                                        as f32),
+                                }
+                            };
+                        }
                         if ll == len && rl == len {
-                            #[cfg(target_arch = "aarch64")]
+                            #[cfg(rlx_cpu_neon)]
                             if matches!(op, BinaryOp::Add | BinaryOp::Mul) {
                                 use std::arch::aarch64::*;
-                                let chunks = len / 4;
-                                for c in 0..chunks {
-                                    let off = c * 4;
-                                    let vl = vld1q_f32(l.as_ptr().add(off));
-                                    let vr = vld1q_f32(r.as_ptr().add(off));
-                                    let res = match op {
-                                        BinaryOp::Add => vaddq_f32(vl, vr),
-                                        BinaryOp::Mul => vmulq_f32(vl, vr),
-                                        _ => unreachable!(),
-                                    };
-                                    vst1q_f32(o.as_mut_ptr().add(off), res);
-                                }
-                                for i in (chunks * 4)..len {
-                                    o[i] = match op {
-                                        BinaryOp::Add => l[i] + r[i],
-                                        BinaryOp::Mul => l[i] * r[i],
-                                        _ => unreachable!(),
-                                    };
+                                // one IEEE add/mul per element, whichever lane or
+                                // thread does it; parallel over chunks of a large
+                                // tensor (it was serial: 2.4 M elements, 538 µs)
+                                let add = matches!(op, BinaryOp::Add);
+                                let kernel = |l: &[f32], r: &[f32], o: &mut [f32]| {
+                                    let n = o.len();
+                                    let chunks = n / 4;
+                                    for c in 0..chunks {
+                                        let off = c * 4;
+                                        let vl = vld1q_f32(l.as_ptr().add(off));
+                                        let vr = vld1q_f32(r.as_ptr().add(off));
+                                        let res = if add {
+                                            vaddq_f32(vl, vr)
+                                        } else {
+                                            vmulq_f32(vl, vr)
+                                        };
+                                        vst1q_f32(o.as_mut_ptr().add(off), res);
+                                    }
+                                    for i in (chunks * 4)..n {
+                                        o[i] = if add { l[i] + r[i] } else { l[i] * r[i] };
+                                    }
+                                };
+                                if crate::pool::should_parallelize(len) {
+                                    use rayon::prelude::*;
+                                    let chunk = crate::pool::chunk_floor(len).next_multiple_of(4);
+                                    o.par_chunks_mut(chunk).enumerate().for_each(|(k, oc)| {
+                                        let off = k * chunk;
+                                        kernel(
+                                            &l[off..off + oc.len()],
+                                            &r[off..off + oc.len()],
+                                            oc,
+                                        );
+                                    });
+                                } else {
+                                    kernel(l, r, o);
                                 }
                                 continue;
                             }
                             // x86: contiguous same-shape Add/Mul/Sub — AVX2 when
                             // available, else a plain parallel loop (no N-D index walk).
-                            #[cfg(target_arch = "x86_64")]
+                            #[cfg(rlx_cpu_x86)]
                             if matches!(op, BinaryOp::Add | BinaryOp::Mul | BinaryOp::Sub) {
                                 let used = binary_contig_f32(l, r, o, *op);
                                 if used {
@@ -1731,11 +1921,12 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                             macro_rules! bin_contig {
                                 ($f:expr) => {{
                                     let f = $f;
-                                    if len >= 8192 {
+                                    if crate::pool::should_parallelize(len) {
                                         use rayon::prelude::*;
                                         o.par_iter_mut()
                                             .zip(l.par_iter())
                                             .zip(r.par_iter())
+                                            .with_min_len(crate::pool::chunk_floor(len))
                                             .for_each(|((out, a), b)| *out = f(*a, *b));
                                     } else {
                                         for i in 0..len {
@@ -1744,32 +1935,45 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     }
                                 }};
                             }
-                            match op {
-                                BinaryOp::Add => bin_contig!(|a: f32, b: f32| a + b),
-                                BinaryOp::Sub => bin_contig!(|a: f32, b: f32| a - b),
-                                BinaryOp::Mul => bin_contig!(|a: f32, b: f32| a * b),
-                                BinaryOp::Div => bin_contig!(|a: f32, b: f32| a / b),
-                                BinaryOp::Max => bin_contig!(|a: f32, b: f32| a.max(b)),
-                                BinaryOp::Min => bin_contig!(|a: f32, b: f32| a.min(b)),
-                                BinaryOp::Pow => bin_contig!(|a: f32, b: f32| a.powf(b)),
-                                BinaryOp::Mod => bin_contig!(|a: f32, b: f32| a % b),
-                                BinaryOp::Atan2 => bin_contig!(|a: f32, b: f32| a.atan2(b)),
-                                BinaryOp::BitAnd => {
-                                    bin_contig!(|a: f32, b: f32| ((a as i64) & (b as i64)) as f32)
-                                }
-                                BinaryOp::BitOr => {
-                                    bin_contig!(|a: f32, b: f32| ((a as i64) | (b as i64)) as f32)
-                                }
-                                BinaryOp::BitXor => {
-                                    bin_contig!(|a: f32, b: f32| ((a as i64) ^ (b as i64)) as f32)
-                                }
-                                BinaryOp::Shl => bin_contig!(|a: f32, b: f32| (a as i64)
-                                    .wrapping_shl(b as u32)
-                                    as f32),
-                                BinaryOp::Shr => bin_contig!(|a: f32, b: f32| (a as i64)
-                                    .wrapping_shr(b as u32)
-                                    as f32),
+                            f32_op!(bin_contig);
+                            continue;
+                        }
+                        // One operand is a single value (`x − mean`, a clamp):
+                        // a plain loop with it held, instead of the index walk
+                        // below (0.6–0.9 elements/ns there). Whatever the
+                        // broadcast dims say, a 1-element operand maps every
+                        // index to its one value, and an operand as long as the
+                        // output is not broadcast, so it is read in order.
+                        if (rl == 1 && ll == len) || (ll == 1 && rl == len) {
+                            let r_scalar = rl == 1;
+                            macro_rules! bin_scalar {
+                                ($f:expr) => {{
+                                    let f = $f;
+                                    let run = |off: usize, out: &mut [f32]| {
+                                        if r_scalar {
+                                            let b = r[0];
+                                            for (o, a) in out.iter_mut().zip(&l[off..]) {
+                                                *o = f(*a, b);
+                                            }
+                                        } else {
+                                            let a = l[0];
+                                            for (o, b) in out.iter_mut().zip(&r[off..]) {
+                                                *o = f(a, *b);
+                                            }
+                                        }
+                                    };
+                                    if crate::pool::should_parallelize(len) {
+                                        use rayon::prelude::*;
+                                        let chunk = crate::pool::chunk_floor(len);
+                                        o.par_chunks_mut(chunk)
+                                            .enumerate()
+                                            .for_each(|(k, oc)| run(k * chunk, oc));
+                                    } else {
+                                        run(0, o);
+                                    }
+                                }};
                             }
+                            f32_op!(bin_scalar);
                             continue;
                         }
                         // Trailing-row broadcast: rhs tiles every `rl` elements
@@ -1799,10 +2003,25 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         //   2) hoist the op-match out of the per-element loop
                         //      (one branch per call, not per element);
                         //   3) parallelize across cores for large outputs.
-                        let rank = out_dims_bcast.len();
-                        let odb = &out_dims_bcast[..];
-                        let lstr = &bcast_lhs_strides[..];
-                        let rstr = &bcast_rhs_strides[..];
+                        // Coalesced axes (size-1 dropped, contiguous pairs
+                        // merged): the same index map, fewer div/mods, and a
+                        // long innermost row — `[128,4,1]` walks as one 512 row.
+                        let (odb_c, lstr_c, rstr_c);
+                        let (odb, lstr, rstr) = if out_dims_bcast.is_empty() {
+                            (
+                                &out_dims_bcast[..],
+                                &bcast_lhs_strides[..],
+                                &bcast_rhs_strides[..],
+                            )
+                        } else {
+                            (odb_c, lstr_c, rstr_c) = coalesce_bcast_axes(
+                                out_dims_bcast,
+                                bcast_lhs_strides,
+                                bcast_rhs_strides,
+                            );
+                            (&odb_c[..], &lstr_c[..], &rstr_c[..])
+                        };
+                        let rank = odb.len();
                         let idx = |i: usize| -> (usize, usize) {
                             if rank == 0 {
                                 let li = if ll == 1 { 0 } else { i % ll };
@@ -1821,15 +2040,47 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 (li, ri)
                             }
                         };
+                        // Row walk: one coord decomposition per innermost
+                        // row, then stride steps along it. Same (li, ri) pairs
+                        // as `idx`, so bit-exact; the per-element div/mod was
+                        // the top self-time in TensorCSPNet's scan backward.
+                        let n_in = if rank > 0 { odb[rank - 1] as usize } else { 0 };
+                        let row_walk = n_in > 1 && len.is_multiple_of(n_in);
+                        let (ls_in, rs_in) = if rank > 0 {
+                            (lstr[rank - 1] as usize, rstr[rank - 1] as usize)
+                        } else {
+                            (0, 0)
+                        };
                         macro_rules! binf32 {
                             ($f:expr) => {{
                                 let f = $f;
-                                if len >= 8192 {
+                                if row_walk {
+                                    let row = |(k, out): (usize, &mut [f32])| {
+                                        let (l0, r0) = idx(k * n_in);
+                                        for (j, o) in out.iter_mut().enumerate() {
+                                            *o = f(l[l0 + j * ls_in], r[r0 + j * rs_in]);
+                                        }
+                                    };
+                                    if crate::pool::should_parallelize(len) {
+                                        use rayon::prelude::*;
+                                        o.par_chunks_mut(n_in)
+                                            .enumerate()
+                                            .with_min_len(
+                                                (crate::pool::chunk_floor(len) / n_in).max(1),
+                                            )
+                                            .for_each(row);
+                                    } else {
+                                        o.chunks_mut(n_in).enumerate().for_each(row);
+                                    }
+                                } else if crate::pool::should_parallelize(len) {
                                     use rayon::prelude::*;
-                                    o.par_iter_mut().enumerate().for_each(|(i, out)| {
-                                        let (li, ri) = idx(i);
-                                        *out = f(l[li], r[ri]);
-                                    });
+                                    o.par_iter_mut()
+                                        .enumerate()
+                                        .with_min_len(crate::pool::chunk_floor(len))
+                                        .for_each(|(i, out)| {
+                                            let (li, ri) = idx(i);
+                                            *out = f(l[li], r[ri]);
+                                        });
                                 } else {
                                     for i in 0..len {
                                         let (li, ri) = idx(i);
@@ -1838,32 +2089,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 }
                             }};
                         }
-                        match op {
-                            BinaryOp::Add => binf32!(|a: f32, b: f32| a + b),
-                            BinaryOp::Sub => binf32!(|a: f32, b: f32| a - b),
-                            BinaryOp::Mul => binf32!(|a: f32, b: f32| a * b),
-                            BinaryOp::Div => binf32!(|a: f32, b: f32| a / b),
-                            BinaryOp::Max => binf32!(|a: f32, b: f32| a.max(b)),
-                            BinaryOp::Min => binf32!(|a: f32, b: f32| a.min(b)),
-                            BinaryOp::Pow => binf32!(|a: f32, b: f32| a.powf(b)),
-                            BinaryOp::Mod => binf32!(|a: f32, b: f32| a % b),
-                            BinaryOp::Atan2 => binf32!(|a: f32, b: f32| a.atan2(b)),
-                            BinaryOp::BitAnd => {
-                                binf32!(|a: f32, b: f32| ((a as i64) & (b as i64)) as f32)
-                            }
-                            BinaryOp::BitOr => {
-                                binf32!(|a: f32, b: f32| ((a as i64) | (b as i64)) as f32)
-                            }
-                            BinaryOp::BitXor => {
-                                binf32!(|a: f32, b: f32| ((a as i64) ^ (b as i64)) as f32)
-                            }
-                            BinaryOp::Shl => {
-                                binf32!(|a: f32, b: f32| (a as i64).wrapping_shl(b as u32) as f32)
-                            }
-                            BinaryOp::Shr => {
-                                binf32!(|a: f32, b: f32| (a as i64).wrapping_shr(b as u32) as f32)
-                            }
-                        }
+                        f32_op!(binf32)
                     }
                 }
             }
@@ -2252,8 +2478,9 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     // (`dots_by_key_lanes`); past the threshold it is taken
                     // only without a BLAS, at a 512-row bucket ~11 ms of a
                     // ~30 ms step on three cores.
-                    #[cfg(target_arch = "x86_64")]
-                    if b == 1
+                    #[cfg(rlx_cpu_x86)]
+                    if !crate::config::portable()
+                        && b == 1
                         && q_s == 1
                         && nh > 1
                         && (k_s <= cfg.sdpa_seq_threshold || cfg!(not(rlx_cpu_blas)))
@@ -2328,9 +2555,9 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     if b == 1 && q_s.max(k_s) <= cfg.sdpa_seq_threshold {
                         // ── Sequential NEON path (zero overhead) ──
                         let scores = &mut sdpa_scores[..ss];
-                        #[cfg(target_arch = "aarch64")]
+                        #[cfg(rlx_cpu_neon)]
                         let neon_chunks = dh / 4;
-                        #[cfg(target_arch = "aarch64")]
+                        #[cfg(rlx_cpu_neon)]
                         let neon_chunks_v = dh_v / 4;
 
                         for bi in 0..b {
@@ -2341,30 +2568,31 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let q_off = bi * q_s * qrs + qi * qrs + hi * dh;
                                     for ki in 0..k_s {
                                         let k_off = bi * k_s * krs + ki * krs + kv_hi * dh;
-                                        #[cfg(target_arch = "aarch64")]
-                                        let mut dot;
-                                        #[cfg(not(target_arch = "aarch64"))]
                                         let mut dot = 0f32;
-                                        #[cfg(target_arch = "aarch64")]
-                                        {
-                                            use std::arch::aarch64::*;
-                                            let mut acc = vdupq_n_f32(0.0);
-                                            for c in 0..neon_chunks {
-                                                let vq =
-                                                    vld1q_f32(q_data.as_ptr().add(q_off + c * 4));
-                                                let vk =
-                                                    vld1q_f32(k_data.as_ptr().add(k_off + c * 4));
-                                                acc = vfmaq_f32(acc, vq, vk);
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let mut acc = vdupq_n_f32(0.0);
+                                                for c in 0..neon_chunks {
+                                                    let vq = vld1q_f32(
+                                                        q_data.as_ptr().add(q_off + c * 4),
+                                                    );
+                                                    let vk = vld1q_f32(
+                                                        k_data.as_ptr().add(k_off + c * 4),
+                                                    );
+                                                    acc = vfmaq_f32(acc, vq, vk);
+                                                }
+                                                dot = vaddvq_f32(acc);
+                                                for d in (neon_chunks * 4)..dh {
+                                                    dot += q_data[q_off + d] * k_data[k_off + d];
+                                                }
+                                            },
+                                            {
+                                                for d in 0..dh {
+                                                    dot += q_data[q_off + d] * k_data[k_off + d];
+                                                }
                                             }
-                                            dot = vaddvq_f32(acc);
-                                            for d in (neon_chunks * 4)..dh {
-                                                dot += q_data[q_off + d] * k_data[k_off + d];
-                                            }
-                                        }
-                                        #[cfg(not(target_arch = "aarch64"))]
-                                        for d in 0..dh {
-                                            dot += q_data[q_off + d] * k_data[k_off + d];
-                                        }
+                                        );
                                         scores[qi * k_s + ki] = dot * scale;
                                         // Inner-loop Custom mask check —
                                         // Causal / SlidingWindow / None
@@ -2402,35 +2630,173 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                         let sc = scores[qi * k_s + ki];
                                         if sc > score_thr {
                                             let v_off = bi * k_s * vrs + ki * vrs + kv_hi * dh_v;
-                                            #[cfg(target_arch = "aarch64")]
-                                            {
-                                                use std::arch::aarch64::*;
-                                                let vsc = vdupq_n_f32(sc);
-                                                for c in 0..neon_chunks_v {
-                                                    let off = c * 4;
-                                                    let vo = vld1q_f32(
-                                                        out_data.as_ptr().add(o_off + off),
-                                                    );
-                                                    let vv =
-                                                        vld1q_f32(v_data.as_ptr().add(v_off + off));
-                                                    vst1q_f32(
-                                                        out_data.as_mut_ptr().add(o_off + off),
-                                                        vfmaq_f32(vo, vsc, vv),
-                                                    );
+                                            neon_or!(
+                                                {
+                                                    use std::arch::aarch64::*;
+                                                    let vsc = vdupq_n_f32(sc);
+                                                    for c in 0..neon_chunks_v {
+                                                        let off = c * 4;
+                                                        let vo = vld1q_f32(
+                                                            out_data.as_ptr().add(o_off + off),
+                                                        );
+                                                        let vv = vld1q_f32(
+                                                            v_data.as_ptr().add(v_off + off),
+                                                        );
+                                                        vst1q_f32(
+                                                            out_data.as_mut_ptr().add(o_off + off),
+                                                            vfmaq_f32(vo, vsc, vv),
+                                                        );
+                                                    }
+                                                    // scalar tail if dh_v not a multiple of 4
+                                                    for d in (neon_chunks_v * 4)..dh_v {
+                                                        out_data[o_off + d] +=
+                                                            sc * v_data[v_off + d];
+                                                    }
+                                                },
+                                                {
+                                                    for d in 0..dh_v {
+                                                        out_data[o_off + d] +=
+                                                            sc * v_data[v_off + d];
+                                                    }
                                                 }
-                                                // scalar tail if dh_v not a multiple of 4
-                                                for d in (neon_chunks_v * 4)..dh_v {
-                                                    out_data[o_off + d] += sc * v_data[v_off + d];
-                                                }
-                                            }
-                                            #[cfg(not(target_arch = "aarch64"))]
-                                            for d in 0..dh_v {
-                                                out_data[o_off + d] += sc * v_data[v_off + d];
-                                            }
+                                            );
                                         }
                                     }
                                 }
                             }
+                        }
+                    } else if sdpa_row_blocked(q_s, k_s, *mask_kind, bhsd)
+                        && sdpa_sme_blocks(q_s, k_s, dh, dh_v)
+                    {
+                        // ── Row-blocked path (long sequences, SME2) ──
+                        // One task per (batch, head): Kᵀ and V packed once,
+                        // then blocks of query rows whose scores stay
+                        // cache-sized (instead of a q_s×k_s matrix per head).
+                        // Each product is the SME kernel's sequential FMA per
+                        // element, so this equals the strided path bit for bit.
+                        #[cfg(rlx_cpu_amx_sme)]
+                        {
+                            use crate::intrinsics::apple_amx::sme::{
+                                PackedB, StridedMat, pack_b, sme_sgemm_packed_with,
+                            };
+                            let bq = sdpa_row_block(q_s, k_s);
+                            let n_qb = q_s.div_ceil(bq);
+                            let q_addr = q_data.as_ptr() as usize;
+                            let k_addr = k_data.as_ptr() as usize;
+                            let v_addr = v_data.as_ptr() as usize;
+                            let m_addr = mask_data.as_ptr() as usize;
+                            let o_addr = out_data.as_mut_ptr() as usize;
+                            // 1. Kᵀ and V of every (batch, KV head), packed once.
+                            let n_kv = b * nkv;
+                            let mut packed: Vec<Option<(PackedB, PackedB)>> =
+                                (0..n_kv).map(|_| None).collect();
+                            let pk_addr = packed.as_mut_ptr() as usize;
+                            crate::pool::par_for(n_kv, 1, &|off, cnt| {
+                                for j in off..off + cnt {
+                                    let (bi, kv_hi) = (j / nkv, j % nkv);
+                                    let k_start =
+                                        (k_addr as *const f32).add(bi * k_s * krs + kv_hi * dh);
+                                    let v_start =
+                                        (v_addr as *const f32).add(bi * k_s * vrs + kv_hi * dh_v);
+                                    // B for Q·Kᵀ is Kᵀ (dh × k_s); B for S·V is V (k_s × dh_v)
+                                    let kp = pack_b(
+                                        dh,
+                                        k_s,
+                                        StridedMat {
+                                            ptr: k_start,
+                                            rs: 1,
+                                            cs: krs,
+                                        },
+                                    );
+                                    let vp = pack_b(
+                                        k_s,
+                                        dh_v,
+                                        StridedMat {
+                                            ptr: v_start,
+                                            rs: vrs,
+                                            cs: 1,
+                                        },
+                                    );
+                                    // SAFETY: slot j is written by this task only.
+                                    *(pk_addr as *mut Option<(PackedB, PackedB)>).add(j) =
+                                        Some((kp, vp));
+                                }
+                            });
+                            let packed_ref: &[Option<(PackedB, PackedB)>] = &packed;
+                            // 2. Every (batch, head, query block) as one flat parallel loop;
+                            //    each product on its task's thread.
+                            crate::pool::par_for(b * nh * n_qb, 1, &|off, cnt| {
+                                let mut sc = vec![0f32; bq * k_s];
+                                for idx in off..off + cnt {
+                                    let qb = idx % n_qb;
+                                    let bh = idx / n_qb;
+                                    let (bi, hi) = (bh / nh, bh % nh);
+                                    let (kp, vp) =
+                                        packed_ref[bi * nkv + hi / group].as_ref().unwrap();
+                                    let q0 = qb * bq;
+                                    let rows = bq.min(q_s - q0);
+                                    let sc = &mut sc[..rows * k_s];
+                                    let q_start = (q_addr as *const f32)
+                                        .add(bi * q_s * qrs + q0 * qrs + hi * dh);
+                                    let o_start = (o_addr as *mut f32)
+                                        .add(bi * q_s * hs_v + q0 * hs_v + hi * dh_v);
+                                    sme_sgemm_packed_with(
+                                        1,
+                                        rows,
+                                        StridedMat {
+                                            ptr: q_start,
+                                            rs: qrs,
+                                            cs: 1,
+                                        },
+                                        kp,
+                                        sc.as_mut_ptr(),
+                                        k_s,
+                                        scale,
+                                        0.0,
+                                    );
+                                    match mask_kind {
+                                        rlx_ir::op::MaskKind::Custom => {
+                                            let mask_bi = std::slice::from_raw_parts(
+                                                (m_addr as *const f32).add(bi * k_s),
+                                                k_s,
+                                            );
+                                            for ki in 0..k_s {
+                                                if mask_bi[ki] < mask_thr {
+                                                    for qi in 0..rows {
+                                                        sc[qi * k_s + ki] = mask_neg;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        rlx_ir::op::MaskKind::Bias => {
+                                            let bias = std::slice::from_raw_parts(
+                                                (m_addr as *const f32)
+                                                    .add((bi * nh + hi) * q_s * k_s + q0 * k_s),
+                                                rows * k_s,
+                                            );
+                                            for i in 0..rows * k_s {
+                                                sc[i] += bias[i];
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    crate::kernels::neon_softmax(sc, rows, k_s);
+                                    sme_sgemm_packed_with(
+                                        1,
+                                        rows,
+                                        StridedMat {
+                                            ptr: sc.as_ptr(),
+                                            rs: k_s,
+                                            cs: 1,
+                                        },
+                                        vp,
+                                        o_start,
+                                        hs_v,
+                                        1.0,
+                                        0.0,
+                                    );
+                                }
+                            });
                         }
                     } else {
                         // ── Parallel strided BLAS path (high throughput) ──
@@ -2600,7 +2966,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     //    are read-only. Serial per-head SDPA lost ~3× to the
                     //    unfused Attention thunk (which is per-head parallel) on
                     //    wide heads — e.g. MoonViT 12×128 @ seq 64.
-                    #[cfg(target_arch = "aarch64")]
+                    #[cfg(rlx_cpu_neon)]
                     let neon_chunks = d_h / 4;
                     let qkv_ptr = qkv.as_ptr() as usize;
                     let out_ptr = attn_out.as_mut_ptr() as usize;
@@ -2657,26 +3023,28 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                             dot += qr1 * kr1 + qr2 * kr2;
                                         }
                                     } else {
-                                        #[cfg(target_arch = "aarch64")]
-                                        {
-                                            use std::arch::aarch64::*;
-                                            let mut acc = vdupq_n_f32(0.0);
-                                            for c in 0..neon_chunks {
-                                                let vq =
-                                                    vld1q_f32(qkv.as_ptr().add(q_base + c * 4));
-                                                let vk =
-                                                    vld1q_f32(qkv.as_ptr().add(k_base + c * 4));
-                                                acc = vfmaq_f32(acc, vq, vk);
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let mut acc = vdupq_n_f32(0.0);
+                                                for c in 0..neon_chunks {
+                                                    let vq =
+                                                        vld1q_f32(qkv.as_ptr().add(q_base + c * 4));
+                                                    let vk =
+                                                        vld1q_f32(qkv.as_ptr().add(k_base + c * 4));
+                                                    acc = vfmaq_f32(acc, vq, vk);
+                                                }
+                                                dot = vaddvq_f32(acc);
+                                                for d in (neon_chunks * 4)..d_h {
+                                                    dot += qkv[q_base + d] * qkv[k_base + d];
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    dot += qkv[q_base + d] * qkv[k_base + d];
+                                                }
                                             }
-                                            dot = vaddvq_f32(acc);
-                                            for d in (neon_chunks * 4)..d_h {
-                                                dot += qkv[q_base + d] * qkv[k_base + d];
-                                            }
-                                        }
-                                        #[cfg(not(target_arch = "aarch64"))]
-                                        for d in 0..d_h {
-                                            dot += qkv[q_base + d] * qkv[k_base + d];
-                                        }
+                                        );
                                     }
                                     let mut sv = dot * scale;
                                     let pos_masked = match mask_kind_c {
@@ -2704,24 +3072,27 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let sc = scores[qi * s + ki];
                                     if sc > score_thr {
                                         let v_base = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
-                                        #[cfg(target_arch = "aarch64")]
-                                        {
-                                            use std::arch::aarch64::*;
-                                            let vsc = vdupq_n_f32(sc);
-                                            for c in 0..neon_chunks {
-                                                let o = c * 4;
-                                                let vo = vld1q_f32(out.add(o_base + o));
-                                                let vv = vld1q_f32(qkv.as_ptr().add(v_base + o));
-                                                vst1q_f32(
-                                                    out.add(o_base + o),
-                                                    vfmaq_f32(vo, vsc, vv),
-                                                );
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let vsc = vdupq_n_f32(sc);
+                                                for c in 0..neon_chunks {
+                                                    let o = c * 4;
+                                                    let vo = vld1q_f32(out.add(o_base + o));
+                                                    let vv =
+                                                        vld1q_f32(qkv.as_ptr().add(v_base + o));
+                                                    vst1q_f32(
+                                                        out.add(o_base + o),
+                                                        vfmaq_f32(vo, vsc, vv),
+                                                    );
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    *out.add(o_base + d) += sc * qkv[v_base + d];
+                                                }
                                             }
-                                        }
-                                        #[cfg(not(target_arch = "aarch64"))]
-                                        for d in 0..d_h {
-                                            *out.add(o_base + d) += sc * qkv[v_base + d];
-                                        }
+                                        );
                                     }
                                 }
                             }
@@ -2774,7 +3145,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let id = *int_dim as usize;
                 let scale = (d_h as f32).powf(-0.5);
                 let _half = d_h / 2;
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(rlx_cpu_neon)]
                 let neon_chunks = d_h / 4;
                 unsafe {
                     let inp = sl(*hidden, base, m * h);
@@ -2807,27 +3178,26 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 for ki in 0..s {
                                     let q_base = bi * s * 3 * h + qi * 3 * h + hi * d_h;
                                     let k_base = bi * s * 3 * h + ki * 3 * h + h + hi * d_h;
-                                    #[cfg(target_arch = "aarch64")]
-                                    let dot;
-                                    #[cfg(not(target_arch = "aarch64"))]
                                     let mut dot = 0f32;
-                                    #[cfg(target_arch = "aarch64")]
-                                    {
-                                        use std::arch::aarch64::*;
-                                        let mut acc = vdupq_n_f32(0.0);
-                                        for c in 0..neon_chunks {
-                                            acc = vfmaq_f32(
-                                                acc,
-                                                vld1q_f32(qkv.as_ptr().add(q_base + c * 4)),
-                                                vld1q_f32(qkv.as_ptr().add(k_base + c * 4)),
-                                            );
+                                    neon_or!(
+                                        {
+                                            use std::arch::aarch64::*;
+                                            let mut acc = vdupq_n_f32(0.0);
+                                            for c in 0..neon_chunks {
+                                                acc = vfmaq_f32(
+                                                    acc,
+                                                    vld1q_f32(qkv.as_ptr().add(q_base + c * 4)),
+                                                    vld1q_f32(qkv.as_ptr().add(k_base + c * 4)),
+                                                );
+                                            }
+                                            dot = vaddvq_f32(acc);
+                                        },
+                                        {
+                                            for d in 0..d_h {
+                                                dot += qkv[q_base + d] * qkv[k_base + d];
+                                            }
                                         }
-                                        dot = vaddvq_f32(acc);
-                                    }
-                                    #[cfg(not(target_arch = "aarch64"))]
-                                    for d in 0..d_h {
-                                        dot += qkv[q_base + d] * qkv[k_base + d];
-                                    }
+                                    );
                                     sc[qi * s + ki] = dot * scale;
                                     if mk[bi * s + ki] < mask_thr {
                                         sc[qi * s + ki] = mask_neg;
@@ -2844,26 +3214,28 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let w = sc[qi * s + ki];
                                     if w > score_thr {
                                         let v = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
-                                        #[cfg(target_arch = "aarch64")]
-                                        {
-                                            use std::arch::aarch64::*;
-                                            let vw = vdupq_n_f32(w);
-                                            for c in 0..neon_chunks {
-                                                let off = c * 4;
-                                                vst1q_f32(
-                                                    attn.as_mut_ptr().add(o + off),
-                                                    vfmaq_f32(
-                                                        vld1q_f32(attn.as_ptr().add(o + off)),
-                                                        vw,
-                                                        vld1q_f32(qkv.as_ptr().add(v + off)),
-                                                    ),
-                                                );
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let vw = vdupq_n_f32(w);
+                                                for c in 0..neon_chunks {
+                                                    let off = c * 4;
+                                                    vst1q_f32(
+                                                        attn.as_mut_ptr().add(o + off),
+                                                        vfmaq_f32(
+                                                            vld1q_f32(attn.as_ptr().add(o + off)),
+                                                            vw,
+                                                            vld1q_f32(qkv.as_ptr().add(v + off)),
+                                                        ),
+                                                    );
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    attn[o + d] += w * qkv[v + d];
+                                                }
                                             }
-                                        }
-                                        #[cfg(not(target_arch = "aarch64"))]
-                                        for d in 0..d_h {
-                                            attn[o + d] += w * qkv[v + d];
-                                        }
+                                        );
                                     }
                                 }
                             }
@@ -2880,28 +3252,30 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         h,
                         h,
                     );
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        use std::arch::aarch64::*;
-                        let chunks_h = (m * h) / 4;
-                        for c in 0..chunks_h {
-                            let off = c * 4;
-                            vst1q_f32(
-                                res.as_mut_ptr().add(off),
-                                vaddq_f32(
-                                    vld1q_f32(res.as_ptr().add(off)),
-                                    vld1q_f32(inp.as_ptr().add(off)),
-                                ),
-                            );
+                    neon_or!(
+                        {
+                            use std::arch::aarch64::*;
+                            let chunks_h = (m * h) / 4;
+                            for c in 0..chunks_h {
+                                let off = c * 4;
+                                vst1q_f32(
+                                    res.as_mut_ptr().add(off),
+                                    vaddq_f32(
+                                        vld1q_f32(res.as_ptr().add(off)),
+                                        vld1q_f32(inp.as_ptr().add(off)),
+                                    ),
+                                );
+                            }
+                            for i in (chunks_h * 4)..(m * h) {
+                                res[i] += inp[i];
+                            }
+                        },
+                        {
+                            for i in 0..m * h {
+                                res[i] += inp[i];
+                            }
                         }
-                        for i in (chunks_h * 4)..(m * h) {
-                            res[i] += inp[i];
-                        }
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    for i in 0..m * h {
-                        res[i] += inp[i];
-                    }
+                    );
 
                     // LN1 (fused residual already done above — just normalize)
                     let g1 = sl(*ln1_g, base, h);
@@ -2930,28 +3304,30 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         id,
                         h,
                     );
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        use std::arch::aarch64::*;
-                        let chunks_h = (m * h) / 4;
-                        for c in 0..chunks_h {
-                            let off = c * 4;
-                            vst1q_f32(
-                                res.as_mut_ptr().add(off),
-                                vaddq_f32(
-                                    vld1q_f32(res.as_ptr().add(off)),
-                                    vld1q_f32(normed.as_ptr().add(off)),
-                                ),
-                            );
+                    neon_or!(
+                        {
+                            use std::arch::aarch64::*;
+                            let chunks_h = (m * h) / 4;
+                            for c in 0..chunks_h {
+                                let off = c * 4;
+                                vst1q_f32(
+                                    res.as_mut_ptr().add(off),
+                                    vaddq_f32(
+                                        vld1q_f32(res.as_ptr().add(off)),
+                                        vld1q_f32(normed.as_ptr().add(off)),
+                                    ),
+                                );
+                            }
+                            for i in (chunks_h * 4)..(m * h) {
+                                res[i] += normed[i];
+                            }
+                        },
+                        {
+                            for i in 0..m * h {
+                                res[i] += normed[i];
+                            }
                         }
-                        for i in (chunks_h * 4)..(m * h) {
-                            res[i] += normed[i];
-                        }
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    for i in 0..m * h {
-                        res[i] += normed[i];
-                    }
+                    );
 
                     // LN2 → output
                     let g2 = sl(*ln2_g, base, h);
@@ -2998,7 +3374,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                 let id = *int_dim as usize;
                 let scale = (d_h as f32).powf(-0.5);
                 let half_dh = d_h / 2;
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(rlx_cpu_neon)]
                 let neon_chunks = d_h / 4;
                 unsafe {
                     let inp = sl(*hidden, base, m * h);
@@ -3061,26 +3437,28 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     let w = sc[qi * s + ki];
                                     if w > score_thr {
                                         let v = bi * s * 3 * h + ki * 3 * h + 2 * h + hi * d_h;
-                                        #[cfg(target_arch = "aarch64")]
-                                        {
-                                            use std::arch::aarch64::*;
-                                            let vw = vdupq_n_f32(w);
-                                            for c in 0..neon_chunks {
-                                                let off = c * 4;
-                                                vst1q_f32(
-                                                    attn.as_mut_ptr().add(o + off),
-                                                    vfmaq_f32(
-                                                        vld1q_f32(attn.as_ptr().add(o + off)),
-                                                        vw,
-                                                        vld1q_f32(qkv.as_ptr().add(v + off)),
-                                                    ),
-                                                );
+                                        neon_or!(
+                                            {
+                                                use std::arch::aarch64::*;
+                                                let vw = vdupq_n_f32(w);
+                                                for c in 0..neon_chunks {
+                                                    let off = c * 4;
+                                                    vst1q_f32(
+                                                        attn.as_mut_ptr().add(o + off),
+                                                        vfmaq_f32(
+                                                            vld1q_f32(attn.as_ptr().add(o + off)),
+                                                            vw,
+                                                            vld1q_f32(qkv.as_ptr().add(v + off)),
+                                                        ),
+                                                    );
+                                                }
+                                            },
+                                            {
+                                                for d in 0..d_h {
+                                                    attn[o + d] += w * qkv[v + d];
+                                                }
                                             }
-                                        }
-                                        #[cfg(not(target_arch = "aarch64"))]
-                                        for d in 0..d_h {
-                                            attn[o + d] += w * qkv[v + d];
-                                        }
+                                        );
                                     }
                                 }
                             }
@@ -3148,7 +3526,10 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             Thunk::FusedSwiGLU { .. } => exec_fused_swi_g_l_u(thunk, base),
             Thunk::Concat { .. } => exec_concat(thunk, base),
             Thunk::KvAppend { .. } => exec_kv_append(thunk, base),
+            Thunk::DynamicUpdateSlice { .. } => exec_dynamic_update_slice(thunk, base),
             Thunk::ConcatF64 { .. } => exec_concat_f64(thunk, base),
+            Thunk::ConcatHalf { .. } => exec_concat_half(thunk, base),
+            Thunk::ConcatBytes { .. } => exec_concat_bytes(thunk, base),
             Thunk::Compare {
                 lhs,
                 rhs,
@@ -4002,6 +4383,8 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
             Thunk::Quantize { .. } => exec_quantize(thunk, base),
             Thunk::Dequantize { .. } => exec_dequantize(thunk, base),
             Thunk::FakeQuantize { .. } => exec_fake_quantize(thunk, base),
+            Thunk::RoundToFormat { .. } => exec_round_to_format(thunk, base),
+            Thunk::DoubleSingle { .. } => exec_double_single(thunk, base),
             Thunk::ActivationBackward { .. } => exec_activation_backward(thunk, base),
             Thunk::ActivationBackwardF64 { .. } => exec_activation_backward_f64(thunk, base),
             Thunk::FakeQuantizeLSQ { .. } => exec_fake_quantize_l_s_q(thunk, base),
@@ -4134,10 +4517,14 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         } else {
                             let inp = sl(*src, base, in_total);
                             let out = sl_mut(*dst, base, total);
+                            // a size-1 axis is never stepped along, so its stride
+                            // is whatever the layout said (`[N,C,1,W]` from a
+                            // `[1,C,1,1]` bias arrives with stride 1 there)
+                            let unused = |d: usize| in_strides[d] == 0 || out_dims[d] == 1;
                             if rank == 4
-                                && in_strides[0] == 0
-                                && in_strides[2] == 0
-                                && in_strides[3] == 0
+                                && unused(0)
+                                && unused(2)
+                                && unused(3)
                                 && in_strides[1] != 0
                             {
                                 // Per-channel broadcast out[n,c,h,w] = in[c*sc] — how
@@ -4145,6 +4532,9 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 // recompute in the backward graph). Fill each (n,c)
                                 // plane with its scalar instead of an N-D index walk
                                 // over every element; parallel over the channel-batch.
+                                // Before size-1 axes counted as unused, EEGNet's and
+                                // ShallowConvNet's `[N,C,1,W]` biases took the index
+                                // walk: 88 % of their transpose time.
                                 let d1 = out_dims[1] as usize;
                                 let sc = in_strides[1] as usize;
                                 let plane = (out_dims[2] as usize) * (out_dims[3] as usize);
@@ -4445,7 +4835,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
 /// dependency on one accumulator (an add latency per element); here eight keys
 /// run in the eight lanes of one AVX register, fed by an 8×8 transpose of
 /// their rows.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 pub(super) fn dots_by_key_lanes(
     q: &[f32],
     k: &[f32],
@@ -4486,7 +4876,7 @@ pub(super) fn dots_by_key_lanes(
 
 /// Eight [`dots_by_key_lanes`] dots, one per lane. `q.len()` is a multiple
 /// of 8.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[target_feature(enable = "avx")]
 unsafe fn dot8_avx(q: &[f32], rows: [&[f32]; 8]) -> [f32; 8] {
     use std::arch::x86_64::*;
@@ -4539,4 +4929,110 @@ unsafe fn dot8_avx(q: &[f32], rows: [&[f32]; 8]) -> [f32; 8] {
 pub(crate) fn exec_nop(t: &Thunk) {
     let Thunk::Nop = t else { unreachable!() };
     {}
+}
+
+/// Score-matrix size above which an attention head runs row-blocked
+/// (`RLX_SDPA_BLOCK_MIN`, default 4M floats = 16 MB): every mask that needs
+/// no query position (none, per-key `Custom`, additive `Bias`), `[B, S, H, D]`.
+pub(crate) fn sdpa_row_blocked(
+    q_s: usize,
+    k_s: usize,
+    mask: rlx_ir::op::MaskKind,
+    bhsd: bool,
+) -> bool {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let min = *MIN.get_or_init(|| {
+        rlx_ir::env::var("RLX_SDPA_BLOCK_MIN")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1 << 22)
+    });
+    !bhsd
+        && q_s.saturating_mul(k_s) > min
+        && matches!(
+            mask,
+            rlx_ir::op::MaskKind::None | rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::Bias
+        )
+}
+
+/// Query rows per block: ~2M scores (8 MB), a multiple of 32 (the SME tile).
+/// Only the SME row-blocked attention path uses it.
+#[cfg(rlx_cpu_amx_sme)]
+pub(crate) fn sdpa_row_block(q_s: usize, k_s: usize) -> usize {
+    let rows = ((1usize << 21) / k_s.max(1)).max(32) / 32 * 32;
+    rows.clamp(32, q_s.max(1))
+}
+
+/// The row-blocked attention path runs on SME2 (packed Kᵀ / V reused across
+/// blocks): only when that route is compiled in, enabled, and takes both
+/// products at block size — so it is also what the per-head path would use.
+/// (Re-packing per block through a generic GEMM was measured 1.5× slower than
+/// the per-head path on V-JEPA2-giant.)
+pub(crate) fn sdpa_sme_blocks(q_s: usize, k_s: usize, dh: usize, dh_v: usize) -> bool {
+    #[cfg(all(rlx_cpu_amx_sme, not(rlx_cpu_blas)))]
+    {
+        use crate::intrinsics::apple_amx::sme::{dispatch_enabled, worth_sme};
+        let bq = sdpa_row_block(q_s, k_s);
+        dispatch_enabled()
+            && worth_sme(bq, dh, k_s)
+            && worth_sme(bq, k_s, dh_v)
+            && worth_sme(q_s, dh, k_s)
+            && worth_sme(q_s, k_s, dh_v)
+    }
+    #[cfg(not(all(rlx_cpu_amx_sme, not(rlx_cpu_blas))))]
+    {
+        let _ = (q_s, k_s, dh, dh_v);
+        false
+    }
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    use super::coalesce_bcast_axes;
+
+    fn index_map(dims: &[u32], ls: &[u32], rs: &[u32]) -> Vec<(usize, usize)> {
+        let n: usize = dims.iter().map(|&d| d as usize).product();
+        (0..n)
+            .map(|i| {
+                let (mut rem, mut li, mut ri) = (i, 0usize, 0usize);
+                for ax in (0..dims.len()).rev() {
+                    let c = rem % dims[ax] as usize;
+                    rem /= dims[ax] as usize;
+                    li += c * ls[ax] as usize;
+                    ri += c * rs[ax] as usize;
+                }
+                (li, ri)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coalescing_keeps_the_index_map() {
+        // Shapes seen in TensorCSPNet / GraphCSPNet training, plus edge cases.
+        let cases: &[(&[u32], &[u32], &[u32])] = &[
+            (&[128, 4, 4], &[16, 4, 1], &[0, 4, 1]),
+            (&[128, 4, 1], &[0, 0, 0], &[4, 1, 0]),
+            (&[128, 4, 1], &[4, 1, 0], &[0, 0, 0]),
+            (&[128, 4, 4], &[4, 1, 0], &[0, 4, 1]),
+            (&[128, 8, 8], &[0, 8, 1], &[64, 8, 1]),
+            (&[128, 4, 4], &[16, 4, 1], &[4, 1, 0]),
+            (&[32], &[1], &[0]),
+            (&[1, 1, 1], &[0, 0, 0], &[0, 0, 0]),
+            (&[3, 1, 5], &[5, 0, 1], &[0, 0, 1]),
+            (&[2, 3, 4, 5], &[60, 20, 5, 1], &[0, 5, 0, 1]),
+        ];
+        for &(d, l, r) in cases {
+            let (cd, cl, cr) = coalesce_bcast_axes(d, l, r);
+            assert!(cd.len() <= d.len());
+            assert_eq!(
+                index_map(&cd, &cl, &cr),
+                index_map(d, l, r),
+                "{d:?} {l:?} {r:?}"
+            );
+        }
+        // `[128,4,1]` with a broadcast scalar walks as one 512-element row.
+        assert_eq!(
+            coalesce_bcast_axes(&[128, 4, 1], &[4, 1, 0], &[0, 0, 0]).0,
+            vec![512]
+        );
+    }
 }

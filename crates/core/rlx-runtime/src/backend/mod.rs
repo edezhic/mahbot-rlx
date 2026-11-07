@@ -177,6 +177,25 @@ pub fn widen_bytes_to_f32(data: &[u8], dtype: rlx_ir::DType) -> Vec<f32> {
 /// backend that stores the native dtype would emit. Used by `run_typed`
 /// to keep the byte-level output contract identical across backends.
 #[allow(dead_code)]
+fn narrow_half(v: &[f32], f: impl Fn(f32) -> u16 + Sync) -> Vec<u8> {
+    let mut bytes = vec![0u8; v.len() * 2];
+    let fill = |(dst, src): (&mut [u8], &[f32])| {
+        for (d, &x) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+            d.copy_from_slice(&f(x).to_le_bytes());
+        }
+    };
+    if v.len() >= 1 << 20 {
+        use rayon::prelude::*;
+        bytes
+            .par_chunks_mut(1 << 17)
+            .zip(v.par_chunks(1 << 16))
+            .for_each(fill);
+    } else {
+        fill((&mut bytes, v));
+    }
+    bytes
+}
+
 pub fn narrow_f32_to_bytes(v: &[f32], dt: rlx_ir::DType) -> Vec<u8> {
     use rlx_ir::DType;
     match dt {
@@ -187,20 +206,10 @@ pub fn narrow_f32_to_bytes(v: &[f32], dt: rlx_ir::DType) -> Vec<u8> {
             }
             bytes
         }
-        DType::F16 => {
-            let mut bytes = Vec::with_capacity(v.len() * 2);
-            for &x in v {
-                bytes.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
-            }
-            bytes
-        }
-        DType::BF16 => {
-            let mut bytes = Vec::with_capacity(v.len() * 2);
-            for &x in v {
-                bytes.extend_from_slice(&half::bf16::from_f32(x).to_le_bytes());
-            }
-            bytes
-        }
+        // Large weights narrow in parallel (a 12B bf16 checkpoint is ~24 GB
+        // of these); elementwise, so bit-identical to the serial loop.
+        DType::F16 => narrow_half(v, |x| half::f16::from_f32(x).to_bits()),
+        DType::BF16 => narrow_half(v, |x| half::bf16::from_f32(x).to_bits()),
         DType::F64 => {
             let mut bytes = Vec::with_capacity(v.len() * 8);
             for &x in v {
@@ -457,6 +466,37 @@ pub trait ExecutableGraph: Send {
     /// Execute the graph with named inputs. Returns output data (copies from arena).
     fn run(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>>;
 
+    /// [`Self::run`] that returns a failure of the device itself (a browser
+    /// context it cannot create, a lost context) as an error instead of
+    /// panicking, so a caller can run on another backend. Default: `run`.
+    fn try_run(&mut self, inputs: &[(&str, &[f32])]) -> Result<Vec<Vec<f32>>, String> {
+        Ok(self.run(inputs))
+    }
+
+    /// Start a run without waiting for its outputs, for a backend that can
+    /// (WebGL2: the read-back into pixel-pack buffers): the caller prepares
+    /// the next run meanwhile and takes these with [`Self::try_collect`].
+    /// `None`: not supported here — use [`Self::try_run`].
+    fn try_submit(&mut self, _inputs: &[(&str, &[f32])]) -> Option<Result<(), String>> {
+        None
+    }
+
+    /// [`Self::try_submit`] with the inputs as IEEE half bits (WebGL2:
+    /// R16F textures, half the bytes to send). The buffers come back for the
+    /// caller's next run. `None`: not supported here.
+    #[allow(clippy::type_complexity)]
+    fn try_submit_half(
+        &mut self,
+        _inputs: Vec<(String, Vec<u16>)>,
+    ) -> Option<Result<Vec<(String, Vec<u16>)>, String>> {
+        None
+    }
+
+    /// The outputs of the oldest [`Self::try_submit`]ted run.
+    fn try_collect(&mut self) -> Result<Vec<Vec<f32>>, String> {
+        Err("nothing submitted".into())
+    }
+
     /// Like [`Self::run`] but only read back outputs at `read_indices`.
     /// GPU handle feeds still update for every output. Default: all outputs.
     fn run_read_outputs(
@@ -610,6 +650,18 @@ pub trait ExecutableGraph: Send {
 
     fn read_gpu_handle(&self, _name: &str) -> Option<Vec<f32>> {
         None
+    }
+
+    /// Copy the named inputs' device contents aside so [`Self::restore_inputs`]
+    /// can put them back — recurrent state a step updates in place. False
+    /// when the backend has no device-side copy (keep a host copy instead).
+    fn save_inputs(&mut self, _names: &[&str]) -> bool {
+        false
+    }
+
+    /// Put back what [`Self::save_inputs`] copied aside.
+    fn restore_inputs(&mut self) -> bool {
+        false
     }
 
     /// Read one row from a resident GPU input handle without full-tensor D2H.
@@ -778,6 +830,15 @@ pub trait ExecutableGraph: Send {
     /// fully populated. See `rlx_metal::MetalExecutable::share_weights_from`.
     fn share_params_from(&mut self, src: &dyn ExecutableGraph) -> bool {
         let _ = src;
+        false
+    }
+
+    /// Whether param `name` already holds its values: its storage is a
+    /// copy another executable of the same weights made and bound
+    /// (`rlx_metal::shared_weights`), so binding it again would only
+    /// re-read the same bytes.
+    fn param_already_set(&self, name: &str) -> bool {
+        let _ = name;
         false
     }
 

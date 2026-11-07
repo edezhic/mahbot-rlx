@@ -36,11 +36,13 @@ use crate::Device;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+mod cluster_train;
 mod diagnostics;
 mod inference;
 pub mod node;
 mod training;
 
+pub use cluster_train::*;
 pub use diagnostics::*;
 pub use inference::*;
 pub use training::*;
@@ -60,6 +62,11 @@ pub struct WeightRef {
     /// `DequantMatMul` graph for the stage.
     #[serde(default)]
     pub packed: bool,
+}
+
+/// `resolve_device` for callers outside `dist` (the package jobs).
+pub fn resolve_device_pub(spec: &str) -> Device {
+    resolve_device(spec)
 }
 
 fn resolve_device(spec: &str) -> Device {
@@ -85,14 +92,14 @@ fn split_frag(rest: &str) -> Result<(&str, &str), String> {
 
 /// Error for a scheme this build recognises but cannot read.
 ///
-/// `rlxp://`, `mlx://`, `npz://` and `dduf://` come from the `model-io`
-/// feature; a node build drops it (see rlx-runtime's Cargo.toml). Saying
-/// "unsupported scheme" there would send the reader hunting for a typo in a
-/// URI that is perfectly well formed, so name the feature instead.
+/// `rlxp://` comes from the `rlxp` feature, `mlx://`, `npz://` and `dduf://`
+/// from `model-io`; a node build drops them (see rlx-runtime's Cargo.toml).
+/// Saying "unsupported scheme" there would send the reader hunting for a typo
+/// in a URI that is perfectly well formed, so name the feature instead.
 #[cfg(not(feature = "model-io"))]
-fn needs_model_io(scheme: &str) -> String {
+fn needs_feature(scheme: &str, feature: &str) -> String {
     format!(
-        "weight URI scheme `{scheme}` needs rlx-runtime's `model-io` feature,          which this build does not have. gguf://, safetensors:// and file://          work without it."
+        "weight URI scheme `{scheme}` needs rlx-runtime's `{feature}` feature,          which this build does not have. gguf://, safetensors:// and file://          work without it."
     )
 }
 
@@ -127,18 +134,18 @@ pub fn resolve_weight_uri(uri: &str) -> Result<Vec<f32>, String> {
             .map_err(|e| e.to_string())?;
         Ok(data)
     } else if let Some(_rest) = uri.strip_prefix("rlxp://") {
-        #[cfg(feature = "model-io")]
+        #[cfg(feature = "rlxp")]
         {
             let (path, tensor) = split_frag(_rest)?;
             let pack = rlx_pkg::Package::open(path).map_err(|e| e.to_string())?;
             pack.tensor_f32(tensor).map_err(|e| e.to_string())
         }
-        #[cfg(not(feature = "model-io"))]
-        Err(needs_model_io("rlxp"))
-    } else if let Some(rest) = uri.strip_prefix("safetensors://") {
-        let (path, tensor) = split_frag(rest)?;
-        let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-        read_safetensors_f32(&bytes, tensor)
+        #[cfg(not(feature = "rlxp"))]
+        Err(needs_feature("rlxp", "rlxp"))
+    } else if uri.starts_with("safetensors://") {
+        // The one tensor's bytes, not the file's.
+        let mut cache = WeightCache::new();
+        cache.f32(uri)
     } else if let Some(_rest) = uri
         .strip_prefix("mlx://")
         .or_else(|| uri.strip_prefix("npz://"))
@@ -153,7 +160,7 @@ pub fn resolve_weight_uri(uri: &str) -> Result<Vec<f32>, String> {
                 .ok_or_else(|| format!("tensor not found in mlx weights: {tensor}"))
         }
         #[cfg(not(feature = "model-io"))]
-        Err(needs_model_io("mlx/npz"))
+        Err(needs_feature("mlx/npz", "model-io"))
     } else if let Some(_rest) = uri.strip_prefix("dduf://") {
         #[cfg(feature = "model-io")]
         {
@@ -164,7 +171,7 @@ pub fn resolve_weight_uri(uri: &str) -> Result<Vec<f32>, String> {
                 .map_err(|e| e.to_string())
         }
         #[cfg(not(feature = "model-io"))]
-        Err(needs_model_io("dduf"))
+        Err(needs_feature("dduf", "model-io"))
     } else if let Some(path) = uri.strip_prefix("file://") {
         let b = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
         Ok(b.as_chunks::<4>()
@@ -200,14 +207,14 @@ pub fn resolve_weight_bytes(uri: &str) -> Result<Vec<u8>, String> {
         }
         Ok(bytes)
     } else if let Some(_rest) = uri.strip_prefix("rlxp://") {
-        #[cfg(feature = "model-io")]
+        #[cfg(feature = "rlxp")]
         {
             let (path, tensor) = split_frag(_rest)?;
             let pack = rlx_pkg::Package::open(path).map_err(|e| e.to_string())?;
             pack.tensor_bytes(tensor).map_err(|e| e.to_string())
         }
-        #[cfg(not(feature = "model-io"))]
-        Err(needs_model_io("rlxp"))
+        #[cfg(not(feature = "rlxp"))]
+        Err(needs_feature("rlxp", "rlxp"))
     } else if let Some(path) = uri.strip_prefix("file://") {
         std::fs::read(path).map_err(|e| format!("read {path}: {e}"))
     } else {
@@ -223,7 +230,11 @@ pub fn resolve_weight_bytes(uri: &str) -> Result<Vec<u8>, String> {
 #[derive(Default)]
 pub struct WeightCache {
     gguf: HashMap<String, rlx_gguf::GgufFile>,
-    #[cfg(feature = "model-io")]
+    /// `.safetensors` files by their header, parsed once: each tensor is
+    /// then read alone from its byte range, so a bind never holds a file's
+    /// whole contents (a 3B checkpoint is 7 GB) beside the weights it makes.
+    safetensors: HashMap<String, (std::fs::File, u64, serde_json::Value)>,
+    #[cfg(feature = "rlxp")]
     rlxp: HashMap<String, rlx_pkg::Package>,
 }
 
@@ -241,7 +252,7 @@ impl WeightCache {
         Ok(&self.gguf[path])
     }
 
-    #[cfg(feature = "model-io")]
+    #[cfg(feature = "rlxp")]
     fn rlxp_pack(&mut self, path: &str) -> Result<&rlx_pkg::Package, String> {
         if !self.rlxp.contains_key(path) {
             let p = rlx_pkg::Package::open(path).map_err(|e| e.to_string())?;
@@ -260,17 +271,32 @@ impl WeightCache {
                 .map_err(|e| e.to_string())?;
             Ok(data)
         } else if let Some(_rest) = uri.strip_prefix("rlxp://") {
-            #[cfg(feature = "model-io")]
+            #[cfg(feature = "rlxp")]
             {
                 let (path, tensor) = split_frag(_rest)?;
                 self.rlxp_pack(path)?
                     .tensor_f32(tensor)
                     .map_err(|e| e.to_string())
             }
-            #[cfg(not(feature = "model-io"))]
-            Err(needs_model_io("rlxp"))
-        } else if uri.starts_with("safetensors://")
-            || uri.starts_with("file://")
+            #[cfg(not(feature = "rlxp"))]
+            Err(needs_feature("rlxp", "rlxp"))
+        } else if let Some(rest) = uri.strip_prefix("safetensors://") {
+            let (path, tensor) = split_frag(rest)?;
+            if !self.safetensors.contains_key(path) {
+                let opened = open_safetensors(path)?;
+                self.safetensors.insert(path.to_string(), opened);
+            }
+            let (file, data_start, header) = self.safetensors.get_mut(path).expect("just opened");
+            let (dtype, start, end) = safetensors_entry(header, tensor)?;
+            let mut raw = vec![0u8; end - start];
+            {
+                use std::io::{Read, Seek, SeekFrom};
+                file.seek(SeekFrom::Start(*data_start + start as u64))
+                    .and_then(|_| file.read_exact(&mut raw))
+                    .map_err(|e| format!("read {tensor} from {path}: {e}"))?;
+            }
+            decode_safetensors_f32(&dtype, &raw)
+        } else if uri.starts_with("file://")
             || uri.starts_with("mlx://")
             || uri.starts_with("npz://")
             || uri.starts_with("dduf://")
@@ -291,15 +317,30 @@ impl WeightCache {
                 .ok_or_else(|| format!("tensor not found: {tensor}"))?;
             Ok(g.tensor_bytes(t).map_err(|e| e.to_string())?.to_vec())
         } else if let Some(_rest) = uri.strip_prefix("rlxp://") {
-            #[cfg(feature = "model-io")]
+            #[cfg(feature = "rlxp")]
             {
                 let (path, tensor) = split_frag(_rest)?;
                 self.rlxp_pack(path)?
                     .tensor_bytes(tensor)
                     .map_err(|e| e.to_string())
             }
-            #[cfg(not(feature = "model-io"))]
-            Err(needs_model_io("rlxp"))
+            #[cfg(not(feature = "rlxp"))]
+            Err(needs_feature("rlxp", "rlxp"))
+        } else if let Some(rest) = uri.strip_prefix("safetensors://") {
+            // The tensor's bytes as stored (FP8 experts, block scales).
+            let (path, tensor) = split_frag(rest)?;
+            if !self.safetensors.contains_key(path) {
+                let opened = open_safetensors(path)?;
+                self.safetensors.insert(path.to_string(), opened);
+            }
+            let (file, data_start, header) = self.safetensors.get_mut(path).expect("just opened");
+            let (_, start, end) = safetensors_entry(header, tensor)?;
+            let mut raw = vec![0u8; end - start];
+            use std::io::{Read, Seek, SeekFrom};
+            file.seek(SeekFrom::Start(*data_start + start as u64))
+                .and_then(|_| file.read_exact(&mut raw))
+                .map_err(|e| format!("read {tensor} from {path}: {e}"))?;
+            Ok(raw)
         } else {
             resolve_weight_bytes(uri)
         }
@@ -338,19 +379,29 @@ fn f16_to_f32(h: u16) -> f32 {
     if sign == 1 { -v } else { v }
 }
 
-/// Minimal safetensors reader: `[u64 header_len][JSON header][data]`; returns
-/// the named tensor as f32 (F32 / F16 / BF16). No external crate needed.
-fn read_safetensors_f32(buf: &[u8], name: &str) -> Result<Vec<f32>, String> {
-    if buf.len() < 8 {
-        return Err("safetensors file too small".into());
-    }
-    let hlen = u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize;
-    let header = buf
-        .get(8..8 + hlen)
-        .ok_or("safetensors: truncated header")?;
-    let data = &buf[8 + hlen..];
-    let v: serde_json::Value = serde_json::from_slice(header).map_err(|e| e.to_string())?;
-    let t = v
+/// A `.safetensors` file (`[u64 header_len][JSON header][data]`) opened by
+/// its header: the file, where its data
+/// starts, and the header (each tensor's dtype and byte range).
+fn open_safetensors(path: &str) -> Result<(std::fs::File, u64, serde_json::Value), String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len)
+        .map_err(|e| format!("read {path}: {e}"))?;
+    let hlen = u64::from_le_bytes(len);
+    let mut header = vec![0u8; hlen as usize];
+    file.read_exact(&mut header)
+        .map_err(|_| format!("{path}: truncated safetensors header"))?;
+    let v: serde_json::Value = serde_json::from_slice(&header).map_err(|e| e.to_string())?;
+    Ok((file, 8 + hlen, v))
+}
+
+/// `name`'s dtype and byte range in a safetensors header.
+fn safetensors_entry(
+    header: &serde_json::Value,
+    name: &str,
+) -> Result<(String, usize, usize), String> {
+    let t = header
         .get(name)
         .ok_or_else(|| format!("tensor not found: {name}"))?;
     let dtype = t.get("dtype").and_then(|d| d.as_str()).ok_or("no dtype")?;
@@ -358,11 +409,22 @@ fn read_safetensors_f32(buf: &[u8], name: &str) -> Result<Vec<f32>, String> {
         .get("data_offsets")
         .and_then(|o| o.as_array())
         .ok_or("no data_offsets")?;
-    let start = off[0].as_u64().ok_or("bad data_offsets")? as usize;
-    let end = off[1].as_u64().ok_or("bad data_offsets")? as usize;
-    let raw = data
-        .get(start..end)
-        .ok_or("safetensors: data_offsets out of range")?;
+    let start = off
+        .first()
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("bad data_offsets")? as usize;
+    let end = off
+        .get(1)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("bad data_offsets")? as usize;
+    if end < start {
+        return Err("safetensors: data_offsets out of order".into());
+    }
+    Ok((dtype.to_string(), start, end))
+}
+
+/// A safetensors tensor's bytes as f32.
+fn decode_safetensors_f32(dtype: &str, raw: &[u8]) -> Result<Vec<f32>, String> {
     Ok(match dtype {
         "F32" => raw
             .as_chunks::<4>()
@@ -382,6 +444,55 @@ fn read_safetensors_f32(buf: &[u8], name: &str) -> Result<Vec<f32>, String> {
             .iter()
             .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect(),
+        // Datasets: token ids, labels, masks, f64 features.
+        "F64" => raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c) as f32)
+            .collect(),
+        "I64" => raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c) as f32)
+            .collect(),
+        "I32" => raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c) as f32)
+            .collect(),
+        "U32" => raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c) as f32)
+            .collect(),
+        "I16" => raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c) as f32)
+            .collect(),
+        "U16" => raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c) as f32)
+            .collect(),
+        "I8" => raw.iter().map(|&b| b as i8 as f32).collect(),
+        "U8" | "BOOL" => raw.iter().map(|&b| b as f32).collect(),
+        "F8_E4M3" | "F8_E5M2" => {
+            let fmt = if dtype == "F8_E4M3" {
+                rlx_ir::quant::ScaledFormat::F8E4M3
+            } else {
+                rlx_ir::quant::ScaledFormat::F8E5M2
+            };
+            let mut out = vec![0.0f32; raw.len()];
+            rlx_ir::lowp_codec::decode_slice(fmt, raw, &mut out);
+            out
+        }
         other => return Err(format!("unsupported safetensors dtype: {other}")),
     })
 }
@@ -407,6 +518,24 @@ mod tests {
         let got = resolve_weight_uri(&format!("safetensors://{}#w", path.display())).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(got, vals);
+    }
+
+    #[test]
+    fn resolve_safetensors_fp8() {
+        // 1.0, -2.0, 448 (max finite) in E4M3; 1.0, -inf in E5M2.
+        let data = [0x38u8, 0xc0, 0x7e, 0x3c, 0xfc];
+        let header = r#"{"a":{"dtype":"F8_E4M3","shape":[3],"data_offsets":[0,3]},"b":{"dtype":"F8_E5M2","shape":[2],"data_offsets":[3,5]}}"#;
+        let mut buf = (header.len() as u64).to_le_bytes().to_vec();
+        buf.extend_from_slice(header.as_bytes());
+        buf.extend_from_slice(&data);
+        let path =
+            std::env::temp_dir().join(format!("rlx_dist_fp8_{}.safetensors", std::process::id()));
+        std::fs::write(&path, &buf).unwrap();
+        let a = resolve_weight_uri(&format!("safetensors://{}#a", path.display())).unwrap();
+        let b = resolve_weight_uri(&format!("safetensors://{}#b", path.display())).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(a, [1.0, -2.0, 448.0]);
+        assert_eq!(b, [1.0, f32::NEG_INFINITY]);
     }
 
     #[test]
@@ -465,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "model-io")]
+    #[cfg(feature = "rlxp")]
     fn resolve_rlxp_f32() {
         use rlx_ir::op::BinaryOp;
         use rlx_ir::{DType, Graph, Shape};

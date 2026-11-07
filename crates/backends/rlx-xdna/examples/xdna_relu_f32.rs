@@ -16,7 +16,7 @@ use rlx_xdna::npu_gemm::{NpuIoBf16, NpuIoF32, bf16_to_f32, f32_to_bf16};
 use std::time::Instant;
 
 fn env(k: &str, d: &str) -> String {
-    std::env::var(k).unwrap_or_else(|_| d.to_string())
+    rlx_ir::env::read(k).unwrap_or_else(|_| d.to_string())
 }
 
 fn main() {
@@ -40,8 +40,9 @@ fn main() {
     );
 
     // 2) COMPILE via native aiecc (no Python).
-    let aiecc = std::env::var("AIECC").expect("set AIECC");
-    let peano = std::env::var("PEANO").expect("set PEANO");
+    let tc = rlx_xdna::toolchain::toolchain().unwrap_or_else(|e| panic!("{e}"));
+    let aiecc = tc.aiecc_str();
+    let peano = tc.peano_str();
     let tmp = "/tmp/rlx_relu_f32";
     std::fs::create_dir_all(tmp).ok();
     let mp = format!("{tmp}/aie.mlir");

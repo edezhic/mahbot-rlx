@@ -58,3 +58,4 @@ required-features = ["backend-tests"]
 [lib]
 # No unit tests in this target: the empty harness was pure launch cost.
 test = false
+

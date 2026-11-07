@@ -312,16 +312,33 @@ fn a_predictor_frame_is_one_fence_and_one_submission_per_encode_chunk_with_model
         layer_narrows, 0,
         "the cache is appended in place, not re-sliced per level"
     );
-    // The rows the appends write are the rows the attention reads: no copy step,
-    // and no host step standing in for one, on the frame the product compiles.
+    // The rows the appends write are the rows the attention reads, on the frame
+    // the product compiles. Upstream's `Narrow`-as-view moved one of the two
+    // rows per block-level off a `narrow_split` of its own slot and onto the
+    // append's copy: the fused q/k/v projection's row is a view of the fused
+    // tensor, so the row cannot be given a slot of its own for the placement to
+    // move. One dispatch either way and the same bytes move, so the copy is not
+    // a regression — but the other row is still placed in place, and neither
+    // form may leave the device.
     let names = frame
         .runner
         .schedule_step_names()
         .expect("the wgpu backend reports its schedule");
-    assert_no_row_copy(&names, census(graph).0, "predictor frame");
+    let count = |name: &str| names.iter().filter(|n| **n == name).count();
+    assert_eq!(
+        count("buffer_copy"),
+        blocks * steps,
+        "one row per block-level is a view of the fused projection and needs its copy; \
+         the other is placed in place, so a second copy here is the placement lost"
+    );
+    assert_eq!(
+        count("narrow_split"),
+        0,
+        "the fused projection's row is a view, not a split dispatch of its own"
+    );
+    assert_eq!(count("host_op"), 0, "no row write left the device");
     // The fused qkv's row is cut and its q/k head norms and rotations ride in the
     // same dispatch — one step a block-level where the decompose emits seven.
-    let count = |name: &str| names.iter().filter(|n| **n == name).count();
     // Every block-level's q/k norm+rope pair is one step.
     assert_eq!(
         count("norm_rope"),
@@ -329,17 +346,11 @@ fn a_predictor_frame_is_one_fence_and_one_submission_per_encode_chunk_with_model
         "one fused norm+rope step per block-level"
     );
     assert_eq!(count("rope"), 0, "no rope keeps a dispatch of its own");
-    // Level 0's project-in reads two of its three parts, so that one keeps its
-    // two `narrow`s.
-    assert_eq!(count("narrow"), 2, "the one partial split stays decomposed");
-    // Every other split is one copy per block-level, 75 a frame: the fold that
-    // absorbed it into the norm+rope pair is refused now that the frame has no
-    // plain `Gather` for the planner to pin (`emit::gather_rows` says why).
-    assert_eq!(
-        count("narrow_split"),
-        blocks * steps,
-        "one split dispatch per block of the projecting levels"
-    );
+    // Every split of the fused q/k/v projection is a view: its leading dims are
+    // one, so the planner aliases it into the fused tensor and the backend emits
+    // no step for it — including level 0's project-in, which reads two of its
+    // three parts.
+    assert_eq!(count("narrow"), 0, "no split keeps a dispatch of its own");
     let seeds: Vec<u64> = (0..steps as u64).map(|k| 12345 + k).collect();
     assert!(
         frame.runner.set_sample_seeds(&seeds),

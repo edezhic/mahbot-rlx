@@ -102,7 +102,7 @@
 #   re-run with `--start-crate <name>` (or `--start-tier N`) to pick
 #   up where you stopped. Already-published crates aren't revisited.
 #
-# Dry-run limitations:
+# Dry run:
 #
 #   `cargo publish --dry-run` does a full local rebuild + dep
 #   resolution against crates.io. For NON-LEAF crates (tier ≥ 1)
@@ -182,8 +182,12 @@ SCOPE=(
 
 # The fork version every crate in `SCOPE` carries. A prerelease on purpose: a
 # version differing from upstream's only in build metadata is rejected by the
-# registry.
-FORK_VERSION="0.2.18-mahbot.2"
+# registry. Asked of `scripts/fork-rename.py` rather than parsed out of its
+# source, which is where it is written down and where `--check` verifies every
+# manifest against it — a second literal here is a second source of truth, and
+# the two drift.
+FORK_VERSION="$(python3 "$(dirname "$0")/fork-rename.py" --print-version)"
+[[ -n "$FORK_VERSION" ]] || { echo "publish.sh: cannot read FORK_VERSION from scripts/fork-rename.py" >&2; exit 1; }
 
 # Tier definitions. Each array entry is a single tier; space-separated crate
 # names within. Order within a tier matters when one member depends on another
@@ -902,11 +906,13 @@ missing_registry_dep_name() {
         || true
 }
 
-# True when cargo says this version was uploaded already.
+# True when cargo says this version was uploaded already. crates.io's current
+# wording is "crate version `X` is already uploaded" (400); older cargo / server
+# versions said "already exists".
 is_already_exists_error() {
     local err_file="$1"
     [[ -f "$err_file" ]] || return 1
-    grep -qiE 'already exists on crates\.io|already exists on the registry' "$err_file"
+    grep -qiE 'already exists on crates\.io|already exists on the registry|version `[^`]+` is already uploaded' "$err_file"
 }
 
 # The HTTP status cargo reported. A registry error prints it parenthesised —
@@ -1026,6 +1032,97 @@ sleep_with_countdown() {
     done
     printf "\r  %s — done.                  \n" "$label"
 }
+
+# ── Package sizes ───────────────────────────────────────────────
+# crates.io refuses an upload over 10 MB (10 MiB). Reads a `cargo package` /
+# `cargo publish` log ("Packaging <crate> v…" then "Packaged N files, … (X
+# compressed)") and prints `<crate> <bytes>` for every package over the limit;
+# returns 1 if there is one.
+UPLOAD_LIMIT=$(( 10 * 1024 * 1024 ))
+oversized_packages() {
+    python3 - "$1" "$UPLOAD_LIMIT" <<'PY'
+import re, sys
+log, limit = open(sys.argv[1], errors="replace").read(), int(sys.argv[2])
+units = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
+crate, over = None, False
+for line in log.splitlines():
+    m = re.match(r"\s*Packaging (\S+) v", line)
+    if m:
+        crate = m.group(1)
+        continue
+    m = re.search(r"\(([0-9.]+)(B|KiB|MiB|GiB) compressed\)", line)
+    if m and crate:
+        size = float(m.group(1)) * units[m.group(2)]
+        if size > limit:
+            print(f"{crate} {size / (1 << 20):.1f} MiB")
+            over = True
+        crate = None
+sys.exit(1 if over else 0)
+PY
+}
+
+# Crates the log reports as already on crates.io at their version.
+already_published_in_log() {
+    grep -oE 'crate [A-Za-z0-9_-]+@[0-9][^ ]* already exists on crates.io index' "$1" \
+        | awk '{print $2}' | sort -u
+}
+
+if (( ! DRY_RUN )); then
+    bold "Package sizes (cargo package --workspace --no-verify)"
+    size_log="$(mktemp)"
+    cargo package --workspace --no-verify --allow-dirty >"$size_log" 2>&1 || {
+        tail -20 "$size_log"; red "cargo package failed."; exit 1; }
+    if ! over="$(oversized_packages "$size_log")"; then
+        red "Over crates.io's 10 MB upload limit — nothing uploaded:"
+        printf '    %s\n' "$over"
+        red "Trim the package (\`exclude = [...]\` in its [package])."
+        exit 1
+    fi
+    rm -f "$size_log"
+    green "  every package is under the 10 MB limit."
+fi
+
+# ── Dry run: the whole workspace at once ────────────────────────
+if (( DRY_RUN )) && cargo publish --help 2>/dev/null | grep -q -- '--workspace'; then
+    args=(--workspace --dry-run --allow-dirty)
+    if (( NO_VERIFY )); then
+        args+=(--no-verify)
+    fi
+    bold ">> cargo publish ${args[*]}"
+    dry_log="$(mktemp)"
+    set +e
+    cargo publish "${args[@]}" 2>&1 | tee "$dry_log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    echo
+    bold "Dry-run summary:"
+    packaged="$(grep -cE '^\s+Packaged ' "$dry_log" || true)"
+    verified="$(grep -cE '^\s+Verifying ' "$dry_log" || true)"
+    failed=0
+    if (( rc != 0 )); then
+        red "  cargo publish --dry-run failed:"
+        grep -E '^error' -A4 "$dry_log" | head -20 | sed 's/^/    /'
+        failed=1
+    else
+        green "  packaged ${packaged}, rebuilt from the package ${verified}."
+    fi
+    if ! over="$(oversized_packages "$dry_log")"; then
+        red "  over crates.io's 10 MB upload limit:"
+        printf '    %s\n' "$over"
+        failed=1
+    fi
+    published="$(already_published_in_log "$dry_log")"
+    if [[ -n "$published" ]]; then
+        yellow "  already on crates.io at this version ($(echo "$published" | wc -l | tr -d ' ')) — their changes ship only after a version bump:"
+        echo "$published" | sed 's/^/    ○ /'
+    fi
+    rm -f "$dry_log"
+    if (( failed )); then
+        exit 1
+    fi
+    green "Dry run passed."
+    exit 0
+fi
 
 # ── Walk tiers ──────────────────────────────────────────────────
 DRY_RUN_PASS=()

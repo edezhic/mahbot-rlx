@@ -126,6 +126,8 @@ pub const SUPPORTED_OPS: &[rlx_ir::OpKind] = {
         // Native Fixed + PerBatch; LSQ forward reuses Fixed; LSQ bwd + STE
         // FakeQuantizeBackward + INT8 Quantize/Dequantize are native kernels.
         FakeQuantize,
+        RoundToFormat,
+        DoubleSingle,
         FakeQuantizeLSQ,
         FakeQuantizeLSQBackwardX,
         FakeQuantizeLSQBackwardScale,
@@ -256,6 +258,7 @@ pub fn routes_to_cpu_host(op: &rlx_ir::Op) -> bool {
             | Op::Scan { .. }
             | Op::ScanBackward { .. }
             | Op::ScanBackwardXs { .. }
+            | Op::While { .. }
             // `Step::CpuIndexing`. These four now have on-device kernels
             // (`Step::IndexingNd`, shared with CUDA), so this is the *residual*
             // host route: the shapes `rlx_gpu_host::indexing_plan` declines —

@@ -31,10 +31,10 @@ impl Backend for CpuBackend {
         use rlx_opt::pass::Pass as _;
         static ONNX_KERNELS: std::sync::Once = std::sync::Once::new();
         ONNX_KERNELS.call_once(rlx_cpu::onnx_ref::register_onnx_reference_kernels);
-        // Claimed `Op::If` / `Op::While` → primitives before legalize (CPU has
-        // no native sub-graph executor). Also runs again in the fusion
-        // pipeline; no-op when neither op is present.
-        let graph = rlx_opt::LowerControlFlow.run(graph);
+        // Claimed `Op::If` → primitives before legalize; `Op::While` stays, a
+        // loop at run time (`Thunk::While`). Also runs again in the fusion
+        // pipeline; no-op when no `If` is present.
+        let graph = rlx_opt::LowerIf.run(graph);
         // Lower f32 SPD-manifold ops (ReEig/LogEig/BiMap/SpdBatchNorm) to the
         // graph-primitive Jacobi eigensolver BEFORE legalize — like If/While,
         // the CPU backend has no f32 SPD kernel (the native ones are f64
@@ -78,7 +78,7 @@ impl Backend for CpuBackend {
 
         let io_manifest = cpu_low_precision::IoDtypeManifest::from_graph(&fused);
         let exec_graph = if cpu_low_precision::needs_f32_exec(&fused) {
-            cpu_low_precision::promote_to_f32(fused)
+            cpu_low_precision::promote_to_f32_keeping_half_weights(fused)
         } else {
             fused
         };
@@ -116,6 +116,7 @@ impl Backend for CpuBackend {
             plan,
             io_manifest,
             options.rng,
+            cfg.arena_alignment,
         ))
     }
 
@@ -142,7 +143,7 @@ impl Backend for CpuBackend {
         let io_manifest = cpu_low_precision::IoDtypeManifest::from_graph(&graph);
         let promote = cpu_low_precision::needs_f32_exec(&graph);
         let exec_graph = if promote {
-            cpu_low_precision::promote_to_f32(graph)
+            cpu_low_precision::promote_to_f32_keeping_half_weights(graph)
         } else {
             graph
         };
@@ -181,7 +182,7 @@ impl Backend for CpuBackend {
         } else {
             None
         };
-        let exe = build_cpu_executable(exec_graph, plan, io_manifest, options.rng);
+        let exe = build_cpu_executable(exec_graph, plan, io_manifest, options.rng, alignment);
         if let Some(t2) = t2 {
             eprintln!("[compile_lir] build_thunks={:?}", t2.elapsed());
         }
@@ -194,13 +195,43 @@ fn build_cpu_executable(
     plan: MemoryPlan,
     io_manifest: cpu_low_precision::IoDtypeManifest,
     rng: rlx_ir::RngOptions,
+    alignment: usize,
 ) -> CpuExecutable {
     // Claim the process-wide Rayon pool at RLX's width before any other Rayon
     // user in the process (weight widening, third-party tokenizers, …) can size
     // it first — the width is fixed for the process at that point and a CPU
     // graph is the earliest proof that RLX work is coming.
     crate::backend::claim_cpu_pool();
-    let mut arena = Arena::from_plan(plan);
+    // Under a param-sharing scope, large weights live on pages shared with the
+    // scope's other executables; otherwise the plan's own arena.
+    let mut shared_present = std::collections::HashSet::new();
+    let shared = rlx_cpu::shared_params::scope()
+        .filter(|_| rlx_cpu::shared_params::SUPPORTED)
+        .and_then(|scope| {
+            let (plan, slots) = shared_weight_plan(&graph, &plan, alignment)?;
+            let keys: Vec<(String, u8, usize, usize)> = slots
+                .iter()
+                .map(|(name, nbytes, off)| (name.clone(), 0, *nbytes, *off))
+                .collect();
+            let (arena, present) = Arena::from_plan_shared(plan, &scope, &keys)?;
+            for ((name, _, _), here) in slots.iter().zip(present) {
+                if here {
+                    shared_present.insert(param_of_key(name).to_string());
+                }
+            }
+            if rlx_ir::env::flag("RLX_VERBOSE") {
+                eprintln!(
+                    "[rlx-cpu] shared weights: {} of {} mapped from another executable",
+                    shared_present.len(),
+                    slots.len()
+                );
+            }
+            Some(arena)
+        });
+    let mut arena = match shared {
+        Some(a) => a,
+        None => Arena::from_plan(plan),
+    };
     let mut input_ids = HashMap::new();
     let mut param_ids = HashMap::new();
     let mut node_dtypes: HashMap<NodeId, DType> = HashMap::new();
@@ -303,7 +334,154 @@ fn build_cpu_executable(
         moe_resident_layers: None,
         moe_topk_capture: None,
         baseline_written: false,
+        keep_ranges: None,
+        shared_present,
     }
+}
+
+/// Smallest weight worth a shared slot (each is rounded up to whole pages).
+const SHARED_WEIGHT_MIN: usize = 256 * 1024;
+
+/// Ops that only read their weight operand, so a weight they share across
+/// executables is never written through another's arena.
+fn reads_weight_only(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::MatMul
+            | Op::DotGeneral { .. }
+            | Op::Gather { .. }
+            | Op::DequantMatMul { .. }
+            | Op::DequantGroupedMatMul { .. }
+            | Op::GroupedMatMul
+            | Op::Transpose { .. }
+    )
+}
+
+/// The registry key of a shared weight: its name and dtype.
+fn shared_key(name: &str, dtype: DType) -> String {
+    format!("{name}\u{1f}{dtype:?}")
+}
+
+fn param_of_key(key: &str) -> &str {
+    key.split('\u{1f}').next().unwrap_or(key)
+}
+
+/// Re-lay `full` (a plan with params) for a shared-weight arena: activations
+/// planned without params, then the small params, then each large read-only
+/// weight on its own page-aligned slot. Returns the plan and the shared slots
+/// as `(key, bytes, offset)`, or `None` when there is nothing to share.
+fn shared_weight_plan(
+    graph: &Graph,
+    full: &MemoryPlan,
+    alignment: usize,
+) -> Option<(MemoryPlan, Vec<(String, usize, usize)>)> {
+    let views = memory::collect_view_aliases(graph);
+    // Every reader of a param, looking through views of it.
+    // A view that writes its root's slot in place (`KvAppend`,
+    // `DynamicUpdateSlice`) disqualifies the root like any other writer.
+    let mut readers_ok: HashMap<NodeId, bool> = HashMap::new();
+    for node in graph.nodes() {
+        if let Some(&(root, _)) = views.get(&node.id) {
+            if matches!(node.op, Op::KvAppend { .. } | Op::DynamicUpdateSlice { .. }) {
+                readers_ok.insert(root, false);
+            }
+            continue;
+        }
+        for &i in &node.inputs {
+            let root = views.get(&i).map_or(i, |&(r, _)| r);
+            if matches!(graph.node(root).op, Op::Param { .. }) {
+                *readers_ok.entry(root).or_insert(true) &= reads_weight_only(&node.op);
+            }
+        }
+    }
+    let is_output = |id: NodeId| {
+        graph
+            .outputs
+            .iter()
+            .any(|&o| views.get(&o).map_or(o, |&(r, _)| r) == id)
+    };
+    let shared: Vec<&rlx_ir::Node> = graph
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n.op, Op::Param { .. }))
+        .filter(|n| {
+            full.assignments
+                .get(&n.id)
+                .is_some_and(|s| s.size >= SHARED_WEIGHT_MIN)
+        })
+        .filter(|n| readers_ok.get(&n.id).copied().unwrap_or(false) && !is_output(n.id))
+        .collect();
+    if shared.is_empty() {
+        return None;
+    }
+    // The shared weights go first, in name order, so every executable of the
+    // scope holding the same weights holds them at the same offsets. Kernels
+    // that key per-weight state on the arena offset (the dequant cache's f32
+    // copies of packed weights) then share it too, instead of keeping one per
+    // executable.
+    let mut shared = shared;
+    shared.sort_by(|a, b| match (&a.op, &b.op) {
+        (Op::Param { name: x }, Op::Param { name: y }) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    });
+    let page = rlx_cpu::shared_params::page_size();
+    let mut plan = memory::plan_memory_native_in_order_params(graph, alignment, false);
+    let mut slots = Vec::with_capacity(shared.len());
+    let mut weights_end = 0usize;
+    let mut placed = HashMap::new();
+    for node in &shared {
+        let size = full.assignments[&node.id].size;
+        let Op::Param { name } = &node.op else {
+            unreachable!()
+        };
+        slots.push((shared_key(name, node.shape.dtype()), size, weights_end));
+        placed.insert(
+            node.id,
+            memory::BufferSlot {
+                offset: weights_end,
+                size,
+            },
+        );
+        weights_end += size.next_multiple_of(page);
+    }
+    // Activations after them (a whole number of pages, so alignment holds).
+    for slot in plan.assignments.values_mut() {
+        slot.offset += weights_end;
+    }
+    plan.assignments.extend(placed);
+    let shared_ids: std::collections::HashSet<NodeId> = shared.iter().map(|n| n.id).collect();
+    let align = alignment.max(64);
+    let mut tail = plan.arena_size + weights_end;
+    for node in graph.nodes() {
+        if !matches!(node.op, Op::Param { .. }) || shared_ids.contains(&node.id) {
+            continue;
+        }
+        if let Some(slot) = full.assignments.get(&node.id) {
+            tail = tail.next_multiple_of(align);
+            plan.assignments.insert(
+                node.id,
+                memory::BufferSlot {
+                    offset: tail,
+                    size: slot.size,
+                },
+            );
+            tail += slot.size;
+        }
+    }
+    // Views of a param borrow its (moved) slot.
+    for (&view, &(root, off)) in &views {
+        if matches!(graph.node(root).op, Op::Param { .. })
+            && let (Some(r), Some(v)) = (plan.assignments.get(&root), full.assignments.get(&view))
+        {
+            let slot = memory::BufferSlot {
+                offset: r.offset + off,
+                size: v.size,
+            };
+            plan.assignments.insert(view, slot);
+        }
+    }
+    plan.arena_size = tail;
+    Some((plan, slots))
 }
 
 #[derive(Clone)]
@@ -354,6 +532,15 @@ struct CpuExecutable {
     /// allocates a full params clone — catastrophic for multi-GB models).
     /// `set_param`/`set_param_typed` reset it to `false`.
     baseline_written: bool,
+    /// The persistent byte ranges `restore_arena_baseline` keeps, sorted. They
+    /// follow from the compiled layout and the persistent set alone, so they
+    /// are computed on the first run instead of every run (a scan of every
+    /// graph node plus a sort, per training step); cleared whenever
+    /// `arena_handles` changes, which is the only part of the set that can.
+    keep_ranges: Option<Vec<(usize, usize)>>,
+    /// Params whose shared pages another executable had already filled
+    /// ([`rlx_cpu::shared_params`]), so binding them again is redundant.
+    shared_present: std::collections::HashSet<String>,
 }
 
 unsafe impl Send for CpuExecutable {}
@@ -575,7 +762,7 @@ impl CpuExecutable {
         let elem_size = dtype.size_bytes();
         let max_elems = (buf.len() - off) / elem_size;
         unsafe {
-            write_typed_from_f32(buf.as_mut_ptr().add(off), dtype, data, max_elems);
+            write_f32_as(buf.as_mut_ptr().add(off), dtype, data, max_elems);
         }
     }
 
@@ -590,7 +777,7 @@ impl CpuExecutable {
         let off = self.arena.byte_offset(id) + start * dtype.size_bytes();
         let buf = self.arena.raw_buf_mut();
         unsafe {
-            write_typed_from_f32(buf.as_mut_ptr().add(off), dtype, data, data.len());
+            write_f32_as(buf.as_mut_ptr().add(off), dtype, data, data.len());
         }
     }
 
@@ -601,7 +788,7 @@ impl CpuExecutable {
         let off = self.arena.byte_offset(id);
         let buf = self.arena.raw_buf();
         let n_elems = self.graph.node(id).shape.num_elements().unwrap_or(0);
-        unsafe { read_typed_to_f32(buf.as_ptr().add(off), dtype, n_elems) }
+        unsafe { read_as_f32(buf.as_ptr().add(off), dtype, n_elems) }
     }
 
     /// `len` elements of a node's arena buffer starting at element `start`,
@@ -614,7 +801,7 @@ impl CpuExecutable {
         let dtype = self.storage_dtype(id);
         let off = self.arena.byte_offset(id) + start * dtype.size_bytes();
         let buf = self.arena.raw_buf();
-        Some(unsafe { read_typed_to_f32(buf.as_ptr().add(off), dtype, len) })
+        Some(unsafe { read_as_f32(buf.as_ptr().add(off), dtype, len) })
     }
 
     /// Write inputs and execute: persistent handles first (they act as default
@@ -646,7 +833,9 @@ impl CpuExecutable {
                 && self.arena.has_buffer(id)
             {
                 self.write_input(id, data);
-                self.arena_handles.remove(name);
+                if self.arena_handles.remove(name) {
+                    self.keep_ranges = None;
+                }
             }
         }
 
@@ -680,6 +869,10 @@ impl CpuExecutable {
 }
 
 impl ExecutableGraph for CpuExecutable {
+    fn param_already_set(&self, name: &str) -> bool {
+        self.shared_present.contains(name)
+    }
+
     fn capabilities(&self) -> crate::ExecutableCapabilities {
         crate::ExecutableCapabilities {
             clone: true,
@@ -735,8 +928,13 @@ impl ExecutableGraph for CpuExecutable {
         // The bytes go in verbatim, and the signature carries no dtype to check
         // them against. A param that AMP rewrote to F16/BF16 would be silently
         // corrupted by F32 bytes, so refuse anything but F32 storage and let
-        // the caller take the whole-buffer path, which does convert.
-        if self.node_dtypes.get(&id).copied().unwrap_or(DType::F32) != DType::F32 {
+        // the caller take the whole-buffer path, which does convert. U8 is the
+        // exception: a packed quant blob is stored byte for byte, so a slot
+        // write of packed expert bytes (paged GGUF MoE) is exact.
+        if !matches!(
+            self.node_dtypes.get(&id).copied().unwrap_or(DType::F32),
+            DType::F32 | DType::U8
+        ) {
             return false;
         }
         // Bound to the PARAM, not to the arena: params sit in a shared buffer,
@@ -832,7 +1030,9 @@ impl ExecutableGraph for CpuExecutable {
         // as the input. If the graph also writes back to this name (via
         // an output binding pattern), read_handle returns the latest.
         self.handles.insert(name.to_string(), data.to_vec());
-        self.arena_handles.remove(name);
+        if self.arena_handles.remove(name) {
+            self.keep_ranges = None;
+        }
         true
     }
 
@@ -851,7 +1051,9 @@ impl ExecutableGraph for CpuExecutable {
             && self.arena.has_buffer(id)
         {
             self.write_input(id, data);
-            self.arena_handles.insert(name.to_string());
+            if self.arena_handles.insert(name.to_string()) {
+                self.keep_ranges = None;
+            }
         }
         true
     }
@@ -1222,9 +1424,6 @@ impl CpuExecutable {
     }
 
     fn restore_arena_baseline(&mut self) {
-        // Persistent slots (params + constants) — never zeroed.
-        let persistent = self.persistent_ids();
-
         // Write compile-time constants into the arena once (a fresh arena is
         // zero-initialized; params are already resident via set_param).
         if !self.baseline_written {
@@ -1259,35 +1458,48 @@ impl CpuExecutable {
         // `num_elements` and leaves the padding dirty. The cost stays O(arena −
         // params): for a 7B the params dominate the arena and are skipped, so
         // the swept region is tiny.
-        let mut keep: Vec<(usize, usize)> = self
-            .graph
-            .nodes()
-            .iter()
-            .filter_map(|node| {
-                let id = node.id;
-                if !persistent.contains(&id) || !self.arena.has_buffer(id) {
-                    return None;
-                }
-                let dtype = self.node_dtypes.get(&id).copied().unwrap_or(DType::F32);
-                let nbytes = node.shape.num_elements().unwrap_or(0) * dtype.size_bytes();
-                let off = self.arena.byte_offset(id);
-                Some((off, off + nbytes))
-            })
-            .collect();
-        keep.sort_unstable();
+        if self.keep_ranges.is_none() {
+            // Persistent slots (params + constants) — never zeroed.
+            let persistent = self.persistent_ids();
+            let mut keep: Vec<(usize, usize)> = self
+                .graph
+                .nodes()
+                .iter()
+                .filter_map(|node| {
+                    let id = node.id;
+                    if !persistent.contains(&id) || !self.arena.has_buffer(id) {
+                        return None;
+                    }
+                    let dtype = self.node_dtypes.get(&id).copied().unwrap_or(DType::F32);
+                    let nbytes = node.shape.num_elements().unwrap_or(0) * dtype.size_bytes();
+                    let off = self.arena.byte_offset(id);
+                    Some((off, off + nbytes))
+                })
+                .collect();
+            keep.sort_unstable();
+            self.keep_ranges = Some(keep);
+        }
+        let keep = self.keep_ranges.as_deref().unwrap_or_default();
 
+        // `RLX_POISON_ARENA=1`: scratch starts as 0xFF (NaN) instead of zero,
+        // so an output nothing wrote — a host-fallback no-op, say — reads NaN.
+        let fill = if rlx_ir::env::flag("RLX_POISON_ARENA") {
+            0xFF
+        } else {
+            0
+        };
         let buf = self.arena.raw_buf_mut();
         let len = buf.len();
         let mut cursor = 0usize;
-        for (start, end) in keep {
+        for &(start, end) in keep {
             let start = start.min(len);
             if cursor < start {
-                buf[cursor..start].fill(0);
+                buf[cursor..start].fill(fill);
             }
             cursor = cursor.max(end.min(len));
         }
         if cursor < len {
-            buf[cursor..len].fill(0);
+            buf[cursor..len].fill(fill);
         }
     }
 
@@ -1346,5 +1558,57 @@ impl CpuExecutable {
             );
             buf[off..off + data.len()].copy_from_slice(data);
         }
+    }
+}
+
+/// `src` written into a slot of `dtype`. On this backend an I32 / U32 / I64
+/// tensor holds its integers as integers (`rlx_cpu::int_storage`), so f32
+/// values for one are converted, not written as f32 bits; every other dtype
+/// is as `write_typed_from_f32`.
+///
+/// # Safety
+/// `dst` must have room for `max_elems` elements of `dtype`.
+unsafe fn write_f32_as(dst: *mut u8, dtype: DType, src: &[f32], max_elems: usize) {
+    let n = src.len().min(max_elems);
+    match dtype {
+        DType::I32 => {
+            let d = dst as *mut i32;
+            for (i, v) in src[..n].iter().enumerate() {
+                unsafe { d.add(i).write_unaligned(*v as i32) };
+            }
+        }
+        DType::U32 => {
+            let d = dst as *mut u32;
+            for (i, v) in src[..n].iter().enumerate() {
+                unsafe { d.add(i).write_unaligned(*v as u32) };
+            }
+        }
+        // An I64 slot is 8 bytes: an f32 there was half a value.
+        DType::I64 => {
+            let d = dst as *mut i64;
+            for (i, v) in src[..n].iter().enumerate() {
+                unsafe { d.add(i).write_unaligned(*v as i64) };
+            }
+        }
+        _ => unsafe { write_typed_from_f32(dst, dtype, src, max_elems) },
+    }
+}
+
+/// `n` elements of a `dtype` slot as f32; the inverse of [`write_f32_as`].
+///
+/// # Safety
+/// `src` must hold `n` elements of `dtype`.
+unsafe fn read_as_f32(src: *const u8, dtype: DType, n: usize) -> Vec<f32> {
+    match dtype {
+        DType::I32 => (0..n)
+            .map(|i| unsafe { (src as *const i32).add(i).read_unaligned() } as f32)
+            .collect(),
+        DType::U32 => (0..n)
+            .map(|i| unsafe { (src as *const u32).add(i).read_unaligned() } as f32)
+            .collect(),
+        DType::I64 => (0..n)
+            .map(|i| unsafe { (src as *const i64).add(i).read_unaligned() } as f32)
+            .collect(),
+        _ => unsafe { read_typed_to_f32(src, dtype, n) },
     }
 }

@@ -141,13 +141,7 @@ fn route_switches() {
     rlx_ir::env::set("RLX_WGPU_IM2COL_MIN_SPATIAL", "100");
     rlx_ir::env::set("RLX_WGPU_IM2COL_MIN_COUT", "64");
     rlx_ir::env::set("RLX_WGPU_IM2COL_MIN_K", "1");
-    rlx_ir::env::set(
-        "RLX_GPU_TUNING_CACHE",
-        std::env::temp_dir()
-            .join("rlx-conv-batched-im2col-absent.tsv")
-            .to_string_lossy()
-            .into_owned(),
-    );
+    common::pin_tuning_cache_off("conv-batched-im2col");
     rlx_wgpu::reload_runtime_config();
 }
 

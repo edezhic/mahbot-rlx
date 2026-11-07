@@ -17,6 +17,7 @@
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// This device's key in the shared dispatch table, with the persisted tuning
 /// cache guaranteed loaded.
@@ -57,14 +58,35 @@ pub fn tuning_cache_path() -> Option<PathBuf> {
     Some(base.join("rlx-wgpu").join("dispatch-tuning.tsv"))
 }
 
+/// Overrides the persisted cache contributed, recorded by
+/// [`ensure_tuning_cache_loaded`].
+static OVERRIDES_APPLIED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many persisted overrides this process applied. Zero is the state a harness
+/// that pins [`tuning_cache_path`] away wants to hold: the shipped rows and the
+/// compile-time cascade, and nothing an operator stored.
+///
+/// Read it after [`ensure_tuning_cache_loaded`] rather than before: that call
+/// performs the read if nothing has, and blocks while another thread is inside it,
+/// so the figure it leaves behind is the final one.
+pub fn tuning_overrides_applied() -> usize {
+    OVERRIDES_APPLIED.load(Ordering::Relaxed)
+}
+
 /// Read the persisted overrides into the process table. Runs at most once.
 ///
 /// Failures are silent by design: an unreadable or newer-format cache must
 /// degrade to the compile-time defaults — here, `cost::pick_sgemm`'s existing
 /// cascade — rather than take the process down. `RLX_VERBOSE` reports counts.
 pub fn ensure_tuning_cache_loaded() {
+    /// Set once the read below has run.
     static LOADED: OnceLock<()> = OnceLock::new();
+
     LOADED.get_or_init(|| {
+        // Shipped per-arch rows first; the user cache below overrides them.
+        if !rlx_ir::env::flag("RLX_GPU_NO_SHIPPED_TUNING") {
+            rlx_gpu_dispatch::shipped::load();
+        }
         let Some(path) = tuning_cache_path() else {
             return;
         };
@@ -72,6 +94,7 @@ pub fn ensure_tuning_cache_loaded() {
             return;
         };
         let report = rlx_gpu_dispatch::dispatch::load_overrides(&text);
+        OVERRIDES_APPLIED.store(report.applied, Ordering::Relaxed);
         if rlx_ir::env::flag("RLX_VERBOSE") {
             eprintln!(
                 "rlx-wgpu: dispatch tuning cache {}: {} applied, {} skipped",

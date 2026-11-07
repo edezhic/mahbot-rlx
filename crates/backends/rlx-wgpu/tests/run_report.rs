@@ -355,7 +355,7 @@ fn run_case(fixture: &str, env: &[(&str, &str)]) -> String {
         "a_run_reports_where_its_time_went",
         MARKER,
         fixture,
-        &common::CLEARED_SWITCHES,
+        &common::cleared_switches(),
         env,
     );
     assert!(ok, "the child failed:\n{stderr}");

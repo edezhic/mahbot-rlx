@@ -31,11 +31,11 @@ rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime",
 
 [[test]]
 name = "graph_stream"
-required-features = ["ir"]
+required-features = ["ir", "backend-tests"]
 
 [[test]]
 name = "lane_reset"
-required-features = ["ir"]
+required-features = ["ir", "backend-tests"]
 
 [lints]
 workspace = true
@@ -48,3 +48,4 @@ all-features   = false
 [[test]]
 name = "invariants"
 required-features = ["backend-tests"]
+

@@ -11,6 +11,8 @@ categories.workspace   = true
 readme                 = "README.md"
 repository.workspace   = true
 documentation.workspace = true
+# Language bindings ship from the repo (and their own package managers), not crates.io.
+publish = false
 
 [lib]
 # No doctests in this crate: the empty stage was pure rustdoc cost.

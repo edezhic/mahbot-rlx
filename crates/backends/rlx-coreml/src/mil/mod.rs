@@ -7,7 +7,7 @@
 // `proto::Model` ready to serialise into a `.mlpackage`. No FFI, so this
 // builds and unit-tests on any host.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use rlx_ir::op::{CmpOp, ReduceOp, ScatterNdReduction};
 use rlx_ir::{DType, Graph, NodeId, Op, Shape};
@@ -149,7 +149,7 @@ fn io_feature_shape(shape: &Shape) -> Shape {
 /// the two maps (quantized weights are host-dequantized to f32 here).
 pub fn lower_graph(
     graph: &Graph,
-    params: &HashMap<String, Vec<f32>>,
+    params: &std::collections::HashMap<String, Vec<f32>>,
     typed_params: &TypedParams,
 ) -> Result<LoweredProgram> {
     lower_graph_with_options(graph, params, typed_params, &LowerOptions::default())
@@ -157,7 +157,7 @@ pub fn lower_graph(
 
 pub fn lower_graph_with_options(
     graph: &Graph,
-    params: &HashMap<String, Vec<f32>>,
+    params: &std::collections::HashMap<String, Vec<f32>>,
     typed_params: &TypedParams,
     opts: &LowerOptions,
 ) -> Result<LoweredProgram> {
@@ -169,19 +169,21 @@ pub fn lower_graph_with_options(
 /// Per-node value name + the proto pieces accumulated during the walk.
 struct LowerCtx<'a> {
     graph: &'a Graph,
-    params: &'a HashMap<String, Vec<f32>>,
+    params: &'a std::collections::HashMap<String, Vec<f32>>,
     typed_params: &'a TypedParams,
     opts: LowerOptions,
     /// NodeId → MIL value name.
-    names: HashMap<u32, String>,
+    names: BTreeMap<u32, String>,
     func_inputs: Vec<proto::NamedValueType>,
     operations: Vec<proto::Operation>,
+    /// Params baked as f16 consts because every use is a `cast` to f16.
+    half_params: std::collections::HashSet<u32>,
     inputs: Vec<IoTensor>,
-    used_feature_names: HashMap<String, u32>,
+    used_feature_names: BTreeMap<String, u32>,
     /// Bool-node id → the name of its already-emitted `{name}_f32m` cast, so a
     /// bool tensor reused as a numeric operand (VITS masks feed many ops) is
     /// cast once — re-emitting would redefine the MIL I/O name.
-    numeric_casts: HashMap<u32, String>,
+    numeric_casts: BTreeMap<u32, String>,
     /// `Op::Narrow` nodes at a non-zero offset that feed an `Op::Reshape`.
     /// Lowered as `gather` rather than `slice_by_size` — see the note in the
     /// `Op::Narrow` arm.
@@ -346,7 +348,7 @@ fn narrow_nodes_feeding_reshape_inner(
 impl<'a> LowerCtx<'a> {
     pub(crate) fn new(
         graph: &'a Graph,
-        params: &'a HashMap<String, Vec<f32>>,
+        params: &'a std::collections::HashMap<String, Vec<f32>>,
         typed_params: &'a TypedParams,
         opts: LowerOptions,
     ) -> Self {
@@ -355,12 +357,13 @@ impl<'a> LowerCtx<'a> {
             params,
             typed_params,
             opts,
-            names: HashMap::new(),
+            names: BTreeMap::new(),
             func_inputs: Vec::new(),
             operations: Vec::new(),
+            half_params: Default::default(),
             inputs: Vec::new(),
-            used_feature_names: HashMap::new(),
-            numeric_casts: HashMap::new(),
+            used_feature_names: BTreeMap::new(),
+            numeric_casts: BTreeMap::new(),
             narrow_needs_gather: narrow_nodes_feeding_reshape(graph),
             narrow_unsupported: narrow_nodes_miscompiled_through_elementwise(graph),
             blob: crate::mlpackage::BlobWriter::new(),
@@ -451,21 +454,79 @@ impl<'a> LowerCtx<'a> {
             }
             Op::Param { name } => {
                 if let Some(data) = self.params.get(name) {
-                    let shape = if self.opts.float_dtype == DType::F16
+                    // Mixed precision leaves weights as f32 params, each read
+                    // only through a `cast` to f16. Bake those as f16 blob
+                    // consts (the casts become aliases): CoreML folds
+                    // cast(const) into an inline f16 immediate, and MPSGraph
+                    // then prints every such tensor as text on each load
+                    // (`MILToMLIRRewriter::getLocationForOp` →
+                    // `IROperation::ToString`) — over a minute for V-JEPA2 ViT-g.
+                    let half_only = node.shape.dtype() == DType::F32 && {
+                        let users = self.graph.users(id);
+                        !users.is_empty()
+                            && users.iter().all(|&u| {
+                                matches!(self.graph.node(u).op, Op::Cast { to: DType::F16 })
+                            })
+                    };
+                    let shape = if (self.opts.float_dtype == DType::F16 || half_only)
                         && node.shape.dtype() == DType::F32
                     {
                         node.shape.clone().with_dtype(DType::F16)
                     } else {
                         node.shape.clone()
                     };
-                    let op = make_const_float(
-                        &mut self.blob,
-                        &out_name,
-                        &shape,
-                        data,
-                        self.opts.float_dtype,
-                    )?;
-                    self.operations.push(op);
+                    let fdt = if half_only {
+                        DType::F16
+                    } else {
+                        self.opts.float_dtype
+                    };
+                    // RLX_COREML_W8=1: store 2-D f16 weights as int8 with one f16
+                    // scale per row (symmetric), dequantized by CoreML at load
+                    // (`constexpr_blockwise_shift_scale`, iOS 18).
+                    let w8 = half_only
+                        && node.shape.rank() == 2
+                        && rlx_ir::env::var("RLX_COREML_W8").as_deref() == Some("1");
+                    if w8 {
+                        let d0 = dim_static(&node.shape, 0)?;
+                        let d1 = dim_static(&node.shape, 1)?;
+                        let mut q = vec![0i8; d0 * d1];
+                        let mut sc = vec![0f32; d0];
+                        for r in 0..d0 {
+                            let row = &data[r * d1..(r + 1) * d1];
+                            let amax = row.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                            // The f16 scale is what CoreML multiplies by: quantize with it.
+                            let s =
+                                half::f16::from_f32(if amax > 0.0 { amax / 127.0 } else { 1.0 })
+                                    .to_f32();
+                            sc[r] = s;
+                            for (o, &v) in q[r * d1..(r + 1) * d1].iter_mut().zip(row) {
+                                *o = (v / s).round().clamp(-127.0, 127.0) as i8;
+                            }
+                        }
+                        let qn = format!("{out_name}_q8");
+                        self.operations
+                            .push(make_const_i8(&mut self.blob, &qn, &[d0, d1], &q)?);
+                        let sn = format!("{out_name}_s8");
+                        self.operations.push(make_const_float(
+                            &mut self.blob,
+                            &sn,
+                            &Shape::new(&[d0, 1], DType::F16),
+                            &sc,
+                            DType::F16,
+                        )?);
+                        self.emit(
+                            "constexpr_blockwise_shift_scale",
+                            &out_name,
+                            &shape,
+                            vec![("data", bind_name(&qn)), ("scale", bind_name(&sn))],
+                        )?;
+                    } else {
+                        let op = make_const_float(&mut self.blob, &out_name, &shape, data, fdt)?;
+                        self.operations.push(op);
+                    }
+                    if half_only {
+                        self.half_params.insert(id.0);
+                    }
                     self.names.insert(id.0, out_name);
                 } else if let Some((bytes, dtype)) = self.typed_params.get(name) {
                     // Quantized weight bytes (I8/U8 packing) are host-dequantized
@@ -517,8 +578,11 @@ impl<'a> LowerCtx<'a> {
                 // declare the const as F32 so downstream f32 ops accept it. Bool
                 // constants stay bool (make_const bakes them as inline bool immediates
                 // for `select` conds).
+                // F16 constants stay F16 (`make_const` writes f16 storage): an f16
+                // graph declares its inputs f16, so an f32-retyped constant made
+                // e.g. `matmul(x: f16, W: f32)` and CoreML refused to load the model.
                 let cshape = match node.shape.dtype() {
-                    DType::Bool | DType::F32 => node.shape.clone(),
+                    DType::Bool | DType::F32 | DType::F16 => node.shape.clone(),
                     _ => node.shape.clone().with_dtype(DType::F32),
                 };
                 let op = make_const(&mut self.blob, &out_name, &cshape, &floats)?;
@@ -921,6 +985,11 @@ impl<'a> LowerCtx<'a> {
                     *attn_logit_softcap,
                     &out_name,
                 )?;
+            }
+            Op::Cast { to: DType::F16 } if self.half_params.contains(&node.inputs[0].0) => {
+                // The param is already an f16 const (see `Op::Param`).
+                let x = self.val(node.inputs[0]);
+                self.names.insert(id.0, x);
             }
             Op::Cast { to } => {
                 let x = self.val(node.inputs[0]);
@@ -1593,7 +1662,7 @@ impl<'a> LowerCtx<'a> {
             inputs: blk_inputs(self)?,
             outputs: vec![cond_out],
             operations: vec![cond_op],
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
         };
 
         // --- body block: build into a fresh op list + name scope ---
@@ -1667,16 +1736,16 @@ impl<'a> LowerCtx<'a> {
             inputs: blk_inputs(self)?,
             outputs: vec![new_i, new_carry],
             operations: body_ops,
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
         };
 
         // --- while_loop op: loop_vars=[i0, carry]; outputs=[final_i, carry] ---
         let final_i = format!("{out_name}_fi");
-        let mut attrs = HashMap::new();
+        let mut attrs = BTreeMap::new();
         attrs.insert("name".to_string(), scalar_str(out_name));
         let while_op = proto::Operation {
             r#type: "while_loop".to_string(),
-            inputs: HashMap::from([("loop_vars".to_string(), bind_names(&[i0_name, init_carry]))]),
+            inputs: BTreeMap::from([("loop_vars".to_string(), bind_names(&[i0_name, init_carry]))]),
             outputs: vec![
                 named_value_type(&final_i, &f32s)?,
                 named_value_type(out_name, &carry_shape)?,
@@ -1932,10 +2001,12 @@ impl<'a> LowerCtx<'a> {
         // models at specification version ≥ 9 (iOS 18 / macOS 15). Ordinary
         // graphs stay at CoreML6 so existing behavior is unchanged.
         let needs_ios18 = self.inputs.is_empty()
-            || self
-                .operations
-                .iter()
-                .any(|op| op.r#type == "constexpr_lut_to_dense");
+            || self.operations.iter().any(|op| {
+                matches!(
+                    op.r#type.as_str(),
+                    "constexpr_lut_to_dense" | "constexpr_blockwise_shift_scale"
+                )
+            });
         let (opset, spec_version) = if needs_ios18 {
             (OPSET_IOS18, SPEC_VERSION_IOS18)
         } else {
@@ -1955,29 +2026,43 @@ impl<'a> LowerCtx<'a> {
             }
         }
 
+        // In f16 mode every float tensor is f16, but scalar operands built
+        // with `scalar_f32` (LayerNorm's eps, rsqrt's epsilon, activation
+        // constants, ...) are still f32 immediates, and MIL rejects an op whose
+        // operands differ in dtype ("tensors parameter x[0], parameter y[0]
+        // ... must have the same data type").
+        // Under a mixed-precision policy the same holds per op: an op whose
+        // output is f16 takes f16 scalars.
+        let all_f16 = self.opts.float_dtype == DType::F16;
+        for op in self.operations.iter_mut() {
+            if all_f16 || outputs_f16(op) {
+                f16_scalar_immediates(op);
+            }
+        }
+
         let block = proto::Block {
             inputs: vec![],
             outputs: output_names,
             operations: self.operations,
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
         };
-        let mut block_specializations = HashMap::new();
+        let mut block_specializations = BTreeMap::new();
         block_specializations.insert(opset.to_string(), block);
 
         let function = proto::Function {
             inputs: self.func_inputs,
             opset: opset.to_string(),
             block_specializations,
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
         };
-        let mut functions = HashMap::new();
+        let mut functions = BTreeMap::new();
         functions.insert("main".to_string(), function);
 
         let program = proto::Program {
             version: 1,
             functions,
             doc_string: String::new(),
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
         };
 
         let description = proto::ModelDescription {
@@ -2104,5 +2189,102 @@ mod narrow_fold_tests {
         let out = g.reshape_(mid, vec![4, 128, 16]);
         g.set_outputs(vec![out]);
         assert!(narrow_nodes_miscompiled_through_elementwise(&g).is_empty());
+    }
+}
+
+/// True if any output of `op` is declared as an f16 tensor.
+fn outputs_f16(op: &proto::Operation) -> bool {
+    use proto::value_type::Type;
+    op.outputs.iter().any(|o| {
+        matches!(
+            o.r#type.as_ref().and_then(|t| t.r#type.as_ref()),
+            Some(Type::TensorType(t)) if t.data_type == proto::DataType::Float16 as i32
+        )
+    })
+}
+
+/// Rewrite the rank-0 f32 immediates bound to `op`'s inputs (and to the ops of
+/// its nested blocks) as f16, for [`LowerOptions::float_dtype`] `F16`.
+pub(crate) fn f16_scalar_immediates(op: &mut proto::Operation) {
+    use proto::argument::binding::Binding;
+    use proto::tensor_value::Value as Tv;
+    use proto::value::Value;
+    use proto::value::immediate_value::Value as Iv;
+    let f32_scalar = value_type(&scalar_shape(DType::F32)).unwrap();
+    for arg in op.inputs.values_mut() {
+        for b in arg.arguments.iter_mut() {
+            let Some(Binding::Value(v)) = b.binding.as_mut() else {
+                continue;
+            };
+            if v.r#type.as_ref() != Some(&f32_scalar) {
+                continue;
+            }
+            let Some(Value::ImmediateValue(iv)) = v.value.as_ref() else {
+                continue;
+            };
+            let Some(Iv::Tensor(t)) = iv.value.as_ref() else {
+                continue;
+            };
+            let Some(Tv::Floats(f)) = t.value.as_ref() else {
+                continue;
+            };
+            let [x] = f.values[..] else { continue };
+            let h = half::f16::from_f32(x).to_bits().to_le_bytes().to_vec();
+            *v = immediate(
+                proto::TensorValue {
+                    value: Some(Tv::Bytes(proto::tensor_value::RepeatedBytes { values: h })),
+                },
+                value_type(&scalar_shape(DType::F16)).unwrap(),
+            );
+        }
+    }
+    for block in op.blocks.iter_mut() {
+        for inner in block.operations.iter_mut() {
+            f16_scalar_immediates(inner);
+        }
+    }
+}
+
+#[cfg(test)]
+mod f16_scalar_tests {
+    use super::*;
+
+    #[test]
+    fn f16_mode_lowers_scalar_operands_as_f16() {
+        let op = simple_op(
+            "add",
+            "v",
+            &Shape::new(&[2], DType::F16),
+            vec![("x", bind_name("a")), ("y", bind_value(scalar_f32(1e-5)))],
+        )
+        .unwrap();
+        let mut op = op;
+        f16_scalar_immediates(&mut op);
+        let proto::argument::binding::Binding::Value(v) =
+            op.inputs["y"].arguments[0].binding.as_ref().unwrap()
+        else {
+            panic!("y is not a value")
+        };
+        assert_eq!(
+            v.r#type,
+            Some(value_type(&scalar_shape(DType::F16)).unwrap())
+        );
+        let proto::value::Value::ImmediateValue(iv) = v.value.as_ref().unwrap() else {
+            panic!()
+        };
+        // `Tensor` is the only kind of immediate value: an irrefutable pattern.
+        let proto::value::immediate_value::Value::Tensor(t) = iv.value.as_ref().unwrap();
+        let proto::tensor_value::Value::Bytes(b) = t.value.as_ref().unwrap() else {
+            panic!("not f16 bytes")
+        };
+        assert_eq!(
+            b.values,
+            half::f16::from_f32(1e-5).to_bits().to_le_bytes().to_vec()
+        );
+        // `x` (a name binding) is left alone.
+        assert!(matches!(
+            op.inputs["x"].arguments[0].binding,
+            Some(proto::argument::binding::Binding::Name(_))
+        ));
     }
 }

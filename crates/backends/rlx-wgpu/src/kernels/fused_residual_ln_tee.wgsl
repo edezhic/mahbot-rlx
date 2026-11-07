@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 // FusedResidualLN / FusedResidualRmsNorm with a "tee" output (`is_rms`): writes BOTH (h + residual + [bias])
 // AND LN(h + residual + [bias]) to two separate arena slots. Used when
 // the sum has multiple consumers downstream (the LN AND a later residual
@@ -74,7 +77,7 @@ fn fused_residual_ln_tee(
     let res_base = params.residual_off + row * params.inner;
     let sum_base = params.sum_off      + row * params.inner;
     let out_base = params.ln_out_off   + row * params.inner;
-    let n_inv = 1.0 / f32(params.inner);
+    let n_inv = rlx_div_rn(1.0, f32(params.inner));
     let eps = bitcast<f32>(params.eps_bits);
     let with_bias = params.has_bias != 0u;
 
@@ -118,8 +121,8 @@ fn fused_residual_ln_tee(
     // large DC offset pre-norm transformer activations carry.
     let rms_only = params.is_rms != 0u;
     let inv_scale = select(
-        inverseSqrt(var_ + eps),
-        inverseSqrt(var_ + mean * mean + eps),
+        rlx_rsqrt_rn(var_ + eps),
+        rlx_rsqrt_rn(var_ + mean * mean + eps),
         rms_only,
     );
 
@@ -137,3 +140,4 @@ fn fused_residual_ln_tee(
         i = i + 64u;
     }
 }
+

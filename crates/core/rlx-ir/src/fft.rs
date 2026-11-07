@@ -9,6 +9,7 @@
 //! that implements `Op::Fft`. Graph-level signal-processing helpers
 //! (`rfft`, `irfft`, `stft`, …) live in [`crate::ops::fft_ops`].
 
+use crate::prelude::*;
 use crate::{DType, Shape};
 
 /// Normalization mode for `Op::Fft`.
@@ -62,6 +63,186 @@ impl FftNorm {
             other => panic!("fft: unknown FftNorm tag {other}"),
         }
     }
+}
+
+/// Which algorithm `Op::Fft` runs, and so how its result is rounded. Every choice
+/// computes the same DFT; they differ in the last bits.
+///
+/// * **`Native`** — RLX's own radix-2/4 Cooley–Tukey (powers of two) and
+///   Bluestein (other lengths). The default; every backend implements it.
+/// * **`PocketFft`** — pocketfft's mixed-radix FFTPACK passes, the library behind
+///   `scipy.fft` and `torch.fft` on CPU, reproduced operation for operation (see
+///   `rlx-pocketfft`). [`FftContraction`] and [`FftTwiddles`] pick the build being
+///   matched; `FftAlgo::SCIPY` is SciPy's macOS arm64 wheel, bit-identical. CPU
+///   runs a native row kernel; every other backend gets it lowered to elementwise
+///   passes (`rlx_fusion::lower_pocketfft`), bit-identical to the CPU wherever
+///   `Binary`/`Fma` round as IEEE does (measured: Metal, MLX, wgpu) but several
+///   times slower than that backend's native FFT (one dispatch per pass op).
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FftAlgo {
+    #[default]
+    Native,
+    PocketFft {
+        contraction: FftContraction,
+        twiddles: FftTwiddles,
+    },
+}
+
+impl FftAlgo {
+    /// pocketfft as SciPy / torch (CPU) build it for this target.
+    pub const SCIPY: FftAlgo = FftAlgo::PocketFft {
+        contraction: FftContraction::Platform,
+        twiddles: FftTwiddles::Platform,
+    };
+    /// pocketfft built without FMA (an x86-64 SSE2 baseline build).
+    pub const POCKETFFT_NO_FMA: FftAlgo = FftAlgo::PocketFft {
+        contraction: FftContraction::None,
+        twiddles: FftTwiddles::Separate,
+    };
+    /// The same bits on every host and every device: pocketfft as the Linux
+    /// x86-64 SciPy wheel computes it (no FMA, glibc twiddles, x87 angle). The
+    /// CPU runs its row kernel; any other backend the elementwise lowering,
+    /// which uses only IEEE `add` / `mul` (no `Fma`), so it is exact wherever
+    /// those are, GPUs, NPUs and the browser included.
+    pub const PORTABLE: FftAlgo = FftAlgo::PocketFft {
+        contraction: FftContraction::None,
+        twiddles: FftTwiddles::Linux,
+    };
+}
+
+/// Which FFT an `Op::Fft` built with [`FftAlgo::Native`] (the default every
+/// graph builder uses) runs, chosen for the whole process: speed or the same
+/// bits across devices is the downstream task's call, not the model's.
+///
+/// * **`Native`** — each backend's own FFT (the fastest; its rounding is the
+///   backend's: GPU twiddles from the device's `sin` / `cos`).
+/// * **`Portable`** — [`FftAlgo::PORTABLE`]: bit-identical on every backend.
+/// * **`Scipy`** — [`FftAlgo::SCIPY`]: `scipy.fft` on this platform.
+/// * **`Algo(a)`** — any other [`FftAlgo`].
+///
+/// An `Op::Fft` built with an explicit non-native algorithm keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FftPolicy {
+    #[default]
+    Native,
+    Portable,
+    Scipy,
+    Algo(FftAlgo),
+}
+
+impl FftPolicy {
+    /// The algorithm a `Native` `Op::Fft` runs under this policy.
+    pub fn algo(self) -> FftAlgo {
+        match self {
+            FftPolicy::Native => FftAlgo::Native,
+            FftPolicy::Portable => FftAlgo::PORTABLE,
+            FftPolicy::Scipy => FftAlgo::SCIPY,
+            FftPolicy::Algo(a) => a,
+        }
+    }
+
+    /// `native`, `portable`, `scipy` or `pocketfft-nofma`.
+    pub fn parse(s: &str) -> Option<FftPolicy> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "native" | "" => Some(FftPolicy::Native),
+            "portable" => Some(FftPolicy::Portable),
+            "scipy" => Some(FftPolicy::Scipy),
+            "pocketfft-nofma" => Some(FftPolicy::Algo(FftAlgo::POCKETFFT_NO_FMA)),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+static FFT_POLICY: std::sync::OnceLock<std::sync::Mutex<FftPolicy>> = std::sync::OnceLock::new();
+
+#[cfg(feature = "std")]
+fn fft_policy_cell() -> &'static std::sync::Mutex<FftPolicy> {
+    FFT_POLICY.get_or_init(|| {
+        let p = crate::env::var("RLX_FFT")
+            .and_then(|v| FftPolicy::parse(&v))
+            .unwrap_or_default();
+        std::sync::Mutex::new(p)
+    })
+}
+
+#[cfg(feature = "std")]
+/// The process's [`FftPolicy`] (`RLX_FFT`, else [`FftPolicy::Native`]).
+pub fn fft_policy() -> FftPolicy {
+    *fft_policy_cell().lock().unwrap()
+}
+
+#[cfg(feature = "std")]
+/// Set the process's [`FftPolicy`]; graphs compiled from now on use it.
+pub fn set_fft_policy(p: FftPolicy) {
+    *fft_policy_cell().lock().unwrap() = p;
+}
+
+#[cfg(feature = "std")]
+/// `algo` under the process's policy: a `Native` choice becomes the policy's.
+pub fn resolve_fft_algo(algo: FftAlgo) -> FftAlgo {
+    if algo == FftAlgo::Native {
+        fft_policy().algo()
+    } else {
+        algo
+    }
+}
+
+#[cfg(feature = "std")]
+/// Rewrite every `Op::Fft` of `graph` built with [`FftAlgo::Native`] to the
+/// process's policy. Returns how many changed (none under `Native`).
+pub fn apply_fft_policy(graph: &mut crate::Graph) -> usize {
+    let algo = fft_policy().algo();
+    if algo == FftAlgo::Native {
+        return 0;
+    }
+    let mut n = 0;
+    for node in graph.nodes_mut() {
+        if let crate::op::Op::Fft {
+            algo: ref mut a, ..
+        } = node.op
+            && *a == FftAlgo::Native
+        {
+            *a = algo;
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Whether pocketfft's `x ± a*b` expressions are fused.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FftContraction {
+    /// What SciPy's wheel for this target does: `Clang` on Apple targets, `None`
+    /// elsewhere (the Linux x86-64 wheel is an SSE2 baseline build — measured: no FMA
+    /// instruction in `pypocketfft*.so`).
+    #[default]
+    Platform,
+    /// Where clang `-ffp-contract=on` fuses (one scalar expression, left product
+    /// first) — arm64 builds, and x86-64 builds with FMA.
+    Clang,
+    /// Never; every product rounded.
+    None,
+}
+
+/// How pocketfft's twiddle `cos(a)`, `sin(a)` pairs are evaluated.
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FftTwiddles {
+    /// What a clang build does on this target (`AppleSinCos` on macOS, else
+    /// `Separate`).
+    #[default]
+    Platform,
+    /// One `__sincos_stret` per angle, as clang merges them on Darwin. macOS only;
+    /// elsewhere `Separate`, which can differ in the last bit.
+    AppleSinCos,
+    /// Separate `cos` / `sin` calls to this target's libm.
+    Separate,
+    /// The Linux x86-64 SciPy build's twiddles on every host (glibc's `cos` /
+    /// `sin` through rlx-libm's ports, the x87 angle): the same bits everywhere.
+    Linux,
 }
 
 /// Next power of two ≥ `n` (`n == 0` → `1`).

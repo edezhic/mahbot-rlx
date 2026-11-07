@@ -489,12 +489,14 @@ pub fn encode_elementwise_region_meta(
 /// numbering.
 ///
 /// The kernel is `rlx-wgpu`'s `kernels/elementwise_region.wgsl` — one source, three
-/// entry points. Its `apply_activation` ends in `return x`, so a code it has no arm
-/// for computes the *identity* of its input instead of the activation, with no error
-/// and a plausible value. [`crate::op::Activation::region_fusable`] keeps eleven codes
-/// out of regions for that reason, but it is shared by every backend and so cannot
-/// speak for this one kernel: it leaves the rounding code and the reciprocal in, and
-/// the kernel has neither.
+/// entry points. Its `apply_activation` forwards to `rlx_activation_apply`, the
+/// dispatch `build.rs` generates from the single `rlxsl` scalar-expression manifest
+/// with one `case` per [`crate::op::Activation::ALL`] variant and `default: return
+/// x`. So every code [`activation_sub`] can produce has an arm, and the set is all
+/// of them. It stays a declared set rather than a constant `true` because it is
+/// what keeps a future kernel — or a manifest edit that drops a variant — from
+/// silently computing that activation as its own input: the code would fall to the
+/// `default`, with no error and a plausible value.
 ///
 /// This is the set every region path on the labels that run that kernel consults,
 /// through the ambient judgement the compile pipeline installs around the fusion passes
@@ -504,8 +506,10 @@ pub fn encode_elementwise_region_meta(
 /// to the kernel's own arms by an in-crate unit test in `rlx-wgpu`
 /// (`kernels::tests::declared_region_activation_codes_match_the_kernel_arms`), which
 /// parses this constant and that kernel source and requires them to agree.
-pub const WGSL_REGION_KERNEL_ACTIVATION_SUBS: &[u32] =
-    &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16];
+pub const WGSL_REGION_KERNEL_ACTIVATION_SUBS: &[u32] = &[
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28,
+];
 
 /// The first activation step in `chain` whose code `subs` has no arm for — the step
 /// that would silently be computed as its own input.

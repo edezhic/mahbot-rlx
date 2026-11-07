@@ -62,7 +62,7 @@ pub use embed::EmbedStage;
 pub use embed_scale::EmbedScaleStage;
 pub use gather_decode_rope::GatherDecodeRopeStage;
 pub use gather_from_input::{GatherAddStage, GatherFromInputStage};
-pub use gather_last_token::GatherLastTokenStage;
+pub use gather_last_token::{GatherLastTokenStage, gather_rows_axis1};
 pub use gdn_scan::GdnScanStage;
 pub use geglu::GeGluStage;
 pub use gelu_ffn::{FfnActivation, GeluFfnStage};
@@ -74,7 +74,9 @@ pub use gemma_layer::{
     gemma2_layer_mask,
 };
 pub use gemma_rms_norm::GemmaRmsNormStage;
-pub use kv_cache::{NO_INPLACE_KV, append_kv_row, kv_append_can_alias, kv_spare_rows};
+pub use kv_cache::{
+    NO_INPLACE_KV, append_kv_row, kv_append_can_alias, kv_spare_rows, with_kv_append_any_batch,
+};
 pub use layer_norm::LayerNormStage;
 pub use layer_scale::LayerScaleStage;
 pub use linear::LinearStage;
@@ -87,8 +89,8 @@ pub use llama_layer::{
 };
 pub use lm_head::LmHeadStage;
 pub use logit_softcap::LogitSoftcapStage;
-pub use mla_attn::{MlaAttnPrefillSpec, MlaAttnPrefillStage};
-pub use moe::MoeFfnStage;
+pub use mla_attn::{MlaAttnDecodeStage, MlaAttnPrefillSpec, MlaAttnPrefillStage};
+pub use moe::{MoeFfnStage, Qwen3Moe};
 pub use nomic_layer::{NomicEncoderLayerSpec, NomicEncoderLayerStage};
 pub use qwen3_decode_layer::{Qwen3DecodeLayerSpec, Qwen3DecodeLayerStage};
 pub use qwen3_decoder::{Qwen3DecoderSpec, Qwen3DecoderStage};
@@ -101,7 +103,7 @@ pub use repeat::RepeatStage;
 pub use residual::{ResidualAddStage, ResidualSaveStage};
 pub use rms_norm::RmsNormStage;
 pub use rope::RopeTablesStage;
-pub use self_attn::{SelfAttnPrefillSpec, SelfAttnPrefillStage};
+pub use self_attn::{HeadNormSpec, SelfAttnPrefillSpec, SelfAttnPrefillStage};
 pub use spd::{BiMapStage, LogEigStage, ReEigStage, SpdBatchNormStage};
 pub use swiglu::SwiGluStage;
 pub use transformer_encoder_layer::transformer_encoder_layer;

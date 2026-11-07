@@ -699,14 +699,26 @@ pub const SHARD_STAGE_RESERVE: usize = 768 * 1024 * 1024;
 /// would explode the geometry is refused loudly and cheaply instead.
 pub const MAX_SHARDS: usize = 64;
 
-/// Effective stage reserve (see [`SHARD_STAGE_RESERVE`]).
+/// The stage reserve on a 32-bit target (the browser). Its whole logical
+/// arena must stay below 3 GiB ([`WEIGHT_BUF_TAG`]; it was 2 GiB), and 768 MiB a
+/// stripe did not leave room: MindGrab's 1.29 GB plan under a 1 GiB binding
+/// snapped to 4.03 GB of stripes and the compile panicked. 64 MiB is what the
+/// ≤ 2 GiB-buffer adapters already get (`compile`'s scratch tail).
+pub const WASM_STAGE_RESERVE: usize = 64 * 1024 * 1024;
+
+/// Effective stage reserve (see [`SHARD_STAGE_RESERVE`], [`WASM_STAGE_RESERVE`]).
 pub fn shard_stage_reserve() -> usize {
+    let default = if cfg!(target_pointer_width = "32") {
+        WASM_STAGE_RESERVE
+    } else {
+        SHARD_STAGE_RESERVE
+    };
     if let Some(raw) = rlx_ir::env::var("RLX_WGPU_SHARD_STAGE_MIB") {
         if let Ok(mib) = raw.parse::<usize>() {
             return (mib.max(1) * 1024 * 1024).min(SHARD_STAGE_RESERVE);
         }
     }
-    SHARD_STAGE_RESERVE
+    default
 }
 
 /// Device shard capacity, honouring `RLX_WGPU_SHARD_CAP_MIB`.
@@ -842,6 +854,17 @@ pub(crate) fn weight_param_bytes(dt: rlx_ir::DType, ne: usize) -> usize {
     }
 }
 
+/// An activation's slot in the f32-uniform arena: four bytes an element, or
+/// two for a half-packed one (`unfuse::pack_half_activations`), in words.
+fn act_slot_bytes(node: &rlx_ir::Node) -> usize {
+    let ne = node.shape.num_elements().unwrap_or(0).max(1);
+    if crate::unfuse::is_half(node) {
+        (ne * 2).div_ceil(4) * 4
+    } else {
+        ne * 4
+    }
+}
+
 /// The slot the plan assigned each node — the bytes a staged read of that node's
 /// operand has to fit.
 ///
@@ -952,7 +975,7 @@ fn param_storage_bounds(
     let storage = |id: NodeId| -> Option<usize> {
         weight_offsets
             .get(&id)
-            .map(|w| w | WEIGHT_BUF_TAG)
+            .map(|w| tag_weight_off(*w))
             .or_else(|| offsets.get(&id).copied())
     };
     let mut bounds: HashMap<usize, ParamStorage> = HashMap::new();
@@ -1591,10 +1614,13 @@ pub struct Arena {
     pub(crate) f16_mirror: F16Mirror,
     /// Optional PACKED-BF16 weight side-buffer (raw bf16 bits, 2 per u32
     /// word). Holds `Op::MatMul` weight params whose IR dtype is BF16 that
-    /// would otherwise widen to f32 in `buffer`. Indexed by the SAME logical
-    /// element index as `buffer` (bf16 element i ↔ f32 element i), so the
-    /// packed matmul kernel (`matmul_bf16w`) reads B at `b_off` = the global
-    /// arena f32-word index and byte offset `f32_byte_off / 2`. Written by
+    /// would otherwise widen to f32 in `buffer`. A param's packed bytes sit at
+    /// its own ARENA BYTE OFFSET (the planner gives a BF16 param a native
+    /// 2 B/elem slot, so those ranges never overlap), and `matmul_bf16w` reads
+    /// B at `b_off = arena_byte_off / 2` bf16 elements. (It used to sit at
+    /// `arena_byte_off / 2`, the "bf16 element i ↔ f32 element i" layout of an
+    /// f32-wide slot — with 2 B slots the second BF16 weight landed inside the
+    /// first one's packed range, so any graph with two of them was wrong.) Written by
     /// [`Arena::write_bf16_packed`] (and mirrored from [`Arena::write_f32`]);
     /// the shader unpacks `bitcast<f32>(bits << 16)`. Allocated on first
     /// [`Arena::register_bf16_packed`]. Halves B read bandwidth AND avoids the
@@ -1655,6 +1681,24 @@ pub struct Arena {
     pub(crate) param_slots: HashMap<usize, ParamStorage>,
 }
 
+/// In the browser a dropped `wgpu::Buffer` keeps its GPU memory until the
+/// JS garbage collector finds the `GPUBuffer`: a model run in windows, or
+/// run again, piles up arenas of a GB or more each (iOS kills the tab). Free
+/// the activations at once. (Weight buffers can be adopted by another
+/// executable — `adopt_weights` — so they are left to the collector.)
+#[cfg(target_family = "wasm")]
+impl Drop for Arena {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        for b in &self.extra_shards {
+            b.destroy();
+        }
+        if let Some(b) = &self.f16_buffer {
+            b.destroy();
+        }
+    }
+}
+
 /// How to bind a storage window onto an [`Arena`] (possibly sharded).
 pub struct ArenaBindSpec<'a> {
     pub buffer: &'a wgpu::Buffer,
@@ -1665,22 +1709,95 @@ pub struct ArenaBindSpec<'a> {
     pub rebase: u64,
 }
 
-/// High bit tagging a byte offset as living in [`Arena::weight_buffer`] rather
-/// than the main arena buffer. Real arena offsets are < 4 GiB, so a high bit is
-/// free. On 64-bit use bit 62; on a 32-bit target (`usize` = 32 bits, `1 << 62`
-/// overflows) use bit 31 — a 32-bit arena is far below 2 GiB.
+/// Where offsets into [`Arena::weight_buffer`] start, as opposed to the main
+/// arena buffer: a weight-buffer offset is `WEIGHT_BUF_TAG + raw`, and every
+/// arena offset is below it. On 64-bit that is bit 62 (arena offsets are far
+/// below it). On 32-bit wasm, where `usize` has 32 bits, it is 3 GiB
+/// ([`tag32`]): the arena gets the lower 3 GiB (it used to be split at bit 31,
+/// which cut browser arenas to 2 GiB when WebGPU binds 4 GiB, and halved
+/// minibatches native training fits) and the weight buffer the top 1 GiB.
 #[cfg(target_pointer_width = "64")]
 pub const WEIGHT_BUF_TAG: usize = 1usize << 62;
 #[cfg(not(target_pointer_width = "64"))]
-pub const WEIGHT_BUF_TAG: usize = 1usize << 31;
+pub const WEIGHT_BUF_TAG: usize = tag32::BASE as usize;
+
+/// The 32-bit offset split, on `u32` so the 64-bit host tests it too.
+pub mod tag32 {
+    /// First weight-buffer offset: arena offsets lie in `[0, BASE)`, weight
+    /// offsets in `[BASE, 2^32)`.
+    pub const BASE: u32 = 0xC000_0000;
+    #[inline]
+    pub fn is_weight(off: u32) -> bool {
+        off >= BASE
+    }
+    /// The weight-buffer byte offset of a tagged offset; an untagged one is
+    /// returned as is (callers ask of either kind).
+    #[inline]
+    pub fn raw(off: u32) -> u32 {
+        if off >= BASE { off - BASE } else { off }
+    }
+    /// Tag weight-buffer offset `w` (below `2^32 - BASE`).
+    #[inline]
+    pub fn tag(w: u32) -> u32 {
+        assert!(
+            w < u32::MAX - BASE,
+            "rlx-wgpu: weight-buffer offset {w} past the 1 GiB a 32-bit target addresses"
+        );
+        BASE + w
+    }
+}
+
+#[cfg(test)]
+mod tag32_tests {
+    use super::tag32::{BASE, is_weight, raw, tag};
+
+    /// The 32-bit split: every arena offset below 3 GiB reads as an arena
+    /// offset (bit 31 used to claim 2..3 GiB), every tagged one round-trips,
+    /// and an arena offset passes through `raw` unchanged.
+    #[test]
+    fn arena_gets_three_gib_and_weights_round_trip() {
+        for off in [0u32, 4, 0x7fff_fffc, 0x8000_0000, 0xa000_0000, BASE - 4] {
+            assert!(!is_weight(off), "{off:#x} is an arena offset");
+            assert_eq!(raw(off), off);
+        }
+        for w in [0u32, 16, 0x1000_0000, 0x3fff_fff0] {
+            let t = tag(w);
+            assert!(is_weight(t));
+            assert_eq!(raw(t), w);
+            // a byte inside a weight tensor stays a weight offset
+            assert_eq!(raw(t + 8), w + 8);
+        }
+        assert_eq!(BASE, 0xC000_0000);
+    }
+
+    #[test]
+    #[should_panic(expected = "past the 1 GiB")]
+    fn weight_offsets_past_one_gib_are_refused() {
+        tag(0x4000_0000);
+    }
+}
 
 #[inline]
 pub fn is_weight_off(off: usize) -> bool {
-    off & WEIGHT_BUF_TAG != 0
+    #[cfg(target_pointer_width = "64")]
+    return off & WEIGHT_BUF_TAG != 0;
+    #[cfg(not(target_pointer_width = "64"))]
+    tag32::is_weight(off as u32)
 }
 #[inline]
 pub fn raw_weight_off(off: usize) -> usize {
-    off & !WEIGHT_BUF_TAG
+    #[cfg(target_pointer_width = "64")]
+    return off & !WEIGHT_BUF_TAG;
+    #[cfg(not(target_pointer_width = "64"))]
+    (tag32::raw(off as u32) as usize)
+}
+/// Tag weight-buffer offset `w` (see [`WEIGHT_BUF_TAG`]).
+#[inline]
+pub fn tag_weight_off(w: usize) -> usize {
+    #[cfg(target_pointer_width = "64")]
+    return w | WEIGHT_BUF_TAG;
+    #[cfg(not(target_pointer_width = "64"))]
+    (tag32::tag(w as u32) as usize)
 }
 
 /// Whether this device runs Expand/Concat/Transpose/Narrow on the *host*.
@@ -1692,11 +1809,11 @@ pub fn raw_weight_off(off: usize) -> usize {
 /// nondeterministically, and only on backends that host: Metal keeps these on
 /// the GPU, which is why it presented as a family of Vulkan-only DSP/eig/pad
 /// bugs rather than one allocator issue.
-fn hosts_structural_ops() -> bool {
+pub fn hosts_structural_ops() -> bool {
     if rlx_ir::env::flag("RLX_WGPU_SHARD_GPU") {
         return false;
     }
-    rlx_ir::env::flag("RLX_WGPU_FORCE_HOST") || crate::device::coop_discrete_backend()
+    rlx_ir::env::flag("RLX_WGPU_FORCE_HOST") || crate::device::discrete_hosts_ops()
 }
 
 /// Tell the planner about it before every plan — the device is resolved lazily,
@@ -1767,6 +1884,12 @@ impl Arena {
         arena.scratch_bytes = scratch_aligned;
         // After possible shard-boundary repack, scratch is the last zone.
         arena.scratch_off = arena.size.saturating_sub(scratch_aligned);
+        assert!(
+            cfg!(target_pointer_width = "64") || arena.size <= WEIGHT_BUF_TAG,
+            "rlx-wgpu: the scratch zone ends at {:.2} GiB; a 32-bit target addresses \
+             the arena below 3 GiB only (the top 1 GiB of offsets is the weight buffer's)",
+            arena.size as f64 / (1u64 << 30) as f64,
+        );
         arena
     }
 
@@ -1839,6 +1962,27 @@ impl Arena {
     }
 
     pub fn from_plan(device: &wgpu::Device, plan: &MemoryPlan) -> Self {
+        // On 32-bit targets an offset at or past `WEIGHT_BUF_TAG` (3 GiB)
+        // reads as a weight-buffer offset (in the browser that surfaced as
+        // "weight-tagged off without weight_buffer"), so every byte of every
+        // tensor, not just its start, must lie below it.
+        if cfg!(not(target_pointer_width = "64")) {
+            let top = plan
+                .assignments
+                .values()
+                .map(|s| s.offset + s.size)
+                .max()
+                .unwrap_or(0);
+            assert!(
+                top <= WEIGHT_BUF_TAG,
+                "rlx-wgpu: this {:.2} GiB activation arena places tensors up to {:.2} GiB; \
+                 a 32-bit target addresses the arena below 3 GiB only (the top 1 GiB of \
+                 offsets is the weight buffer's). Use a smaller batch \
+                 (`rlx_runtime::arena_budget::fit_batch` stays under it) or the CPU.",
+                plan.arena_size as f64 / (1u64 << 30) as f64,
+                top as f64 / (1u64 << 30) as f64,
+            );
+        }
         let max_buf = device.limits().max_buffer_size as usize;
         let max_binding = device.limits().max_storage_buffer_binding_size as usize;
         // 256-byte alignment for storage-buffer bind offsets.
@@ -2048,7 +2192,7 @@ impl Arena {
         let f16_mirror = if admits_f16 {
             // Never larger than the f16 image of the plan itself. The mirror is
             // addressed by logical offset / 2, so a plan-sized buffer holds every
-            // range a binding can legitimately ask for, and `f16_shadow_bind_range`
+            // range a binding can legitimately ask for, and `f16_weight_bind_range`
             // clamps whatever a caller asks for to the buffer it actually got.
             //
             // A fixed single-window mirror at the device's binding limit (about
@@ -2115,6 +2259,21 @@ impl Arena {
         graph: &Graph,
         scratch_bytes: usize,
     ) -> Self {
+        Self::from_plan_split_opts(device, plan, graph, scratch_bytes, true)
+    }
+
+    /// [`Self::from_plan_split`]; `global_share` lets the weight buffer be
+    /// reused by any later executable whose weight layout fingerprint matches
+    /// (`RLX_WGPU_SHARE_WEIGHTS`). Without it the buffer is this arena's own,
+    /// and only an explicit `WgpuExecutable::share_weights_from` hands it on —
+    /// a layout match alone cannot tell two checkpoints of the same shape apart.
+    pub fn from_plan_split_opts(
+        device: &wgpu::Device,
+        plan: &MemoryPlan,
+        graph: &Graph,
+        scratch_bytes: usize,
+        global_share: bool,
+    ) -> Self {
         use rlx_ir::Op;
         let _ = plan;
         // Start from a COMPACT activations-only plan (params unassigned), then
@@ -2123,12 +2282,20 @@ impl Arena {
         // does NOT shrink the arena (the planner aliases the persistent packed
         // weights onto low offsets and leaves an activation at the high offset),
         // so we re-plan without params to actually compact it.
-        let mut new_plan = rlx_compile::memory::plan_memory_with_dequant_guard(
-            graph,
-            16,
-            rlx_compile::memory::GuardedPlanner::F32UniformNoParams,
-            dequant_route_defers_host_read(),
-        );
+        // A half-packed graph is planned at its own widths; the guarded planner has
+        // no no-params hybrid variant, and its `Hybrid` allocates the params this
+        // split arena must place itself, so the hybrid branch keeps the plain
+        // no-params planner (its dequant fallback is the conservative default).
+        let mut new_plan = if crate::unfuse::half_packed() {
+            rlx_compile::memory::plan_memory_hybrid_no_params(graph, 16)
+        } else {
+            rlx_compile::memory::plan_memory_with_dequant_guard(
+                graph,
+                16,
+                rlx_compile::memory::GuardedPlanner::F32UniformNoParams,
+                dequant_route_defers_host_read(),
+            )
+        };
         let a = 16usize;
         let mut weight_offsets: HashMap<NodeId, usize> = HashMap::new();
         let mut weight_cursor = 0usize;
@@ -2173,9 +2340,15 @@ impl Arena {
             HashSet::new()
         };
         let park_for_sharing = !fused_params.is_empty() && param_bytes_est <= weight_shard_cap;
+        // A generic op reads a parked f32 param through a host copy into the
+        // act window; in the browser that copy would wait on a buffer map the
+        // single thread can never deliver (the page spins forever). There, park
+        // only packed quant — the fused GEMV binds the weight buffer in place.
+        let host_staging_ok = !cfg!(target_family = "wasm");
         let park_all_params = rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
             || park_for_sharing
-            || ((new_plan.arena_size + param_bytes_est + scratch_aligned) > bind_cap
+            || (host_staging_ok
+                && (new_plan.arena_size + param_bytes_est + scratch_aligned) > bind_cap
                 // Multi-shard weight buffers (~2 GiB × N) OOM on VirtIO/WARP
                 // and other adapters whose *total* GPU budget is ≈ one
                 // `max_buffer_size`. Only park-all when everything fits in one
@@ -2185,7 +2358,7 @@ impl Arena {
             // one bind window, parking only the >512 MiB F32 tensors leaves
             // the rest in the act arena → multi-×2 GiB act shards + weight
             // OOM. If all params fit in one weight buffer, park them all.
-            || (param_bytes_est <= weight_shard_cap && max_buf <= (2usize << 30));
+            || (host_staging_ok && param_bytes_est <= weight_shard_cap && max_buf <= (2usize << 30));
         // Prefer parking the largest params first so lm_head / embeddings land
         // in the weight buffer when only a subset fits. Tie-break by param
         // name (not NodeId) so prefill/decode graphs pack identically and can
@@ -2196,7 +2369,20 @@ impl Arena {
             if new_plan.assignments.contains_key(&node.id) {
                 continue;
             }
-            if rlx_compile::memory::is_pure_view(graph, node) {
+            // `is_pure_view` excludes the two ops that alias a parent's storage but
+            // still write into it, so it is not the right filter here: a `KvAppend`
+            // would fall through to the "give it a fresh slot" arm below and hold a
+            // whole copy of the cache it only ever writes one row into. Their slot is
+            // the alias pass's (`collect_view_aliases` resolves them through
+            // `pure_view_offset` like any other view), and `place_kv_rows_in_place`
+            // needs the append to sit *inside* its cache's storage to elide the row
+            // copy — a fresh slot silently keeps that copy on every layer.
+            if rlx_compile::memory::is_pure_view(graph, node)
+                || matches!(
+                    &node.op,
+                    Op::KvAppend { .. } | Op::DynamicUpdateSlice { .. }
+                )
+            {
                 continue;
             }
             let ne = node.shape.num_elements().unwrap_or(0).max(1);
@@ -2221,7 +2407,7 @@ impl Arena {
         // packing only >512 MiB params into the weight buffer leaves the rest
         // in the act arena → multi-shard act + weight OOMs. Fill the single
         // weight shard with any param while room remains (largest first).
-        let fill_weight_shard = max_buf <= (2usize << 30);
+        let fill_weight_shard = host_staging_ok && max_buf <= (2usize << 30);
         let mut named_weight_slots: Vec<(String, usize, usize)> = Vec::new();
         // Parameters this compile parks in the weight buffer. A declared scope places
         // them by name afterwards, against the one entry its scope owns; every other
@@ -2358,12 +2544,11 @@ impl Arena {
                     next.push(id);
                     continue;
                 };
-                let ne = graph.node(id).shape.num_elements().unwrap_or(0).max(1);
                 new_plan.assignments.insert(
                     id,
                     rlx_opt::memory::BufferSlot {
                         offset: root_slot.offset + off,
-                        size: ne * 4,
+                        size: act_slot_bytes(graph.node(id)),
                     },
                 );
             }
@@ -2375,16 +2560,16 @@ impl Arena {
             {
                 continue;
             }
-            let ne = node.shape.num_elements().unwrap_or(0).max(1);
+            let bytes = act_slot_bytes(node);
             tail = tail.div_ceil(a) * a;
             new_plan.assignments.insert(
                 node.id,
                 rlx_opt::memory::BufferSlot {
                     offset: tail,
-                    size: ne * 4,
+                    size: bytes,
                 },
             );
-            tail += ne * 4;
+            tail += bytes;
         }
         new_plan.arena_size = tail;
         if rlx_ir::env::flag("RLX_WGPU_DEBUG") {
@@ -2424,8 +2609,14 @@ impl Arena {
             // binds but can never skip a write, so only an identical layout is safe to
             // share. A scoped compile that reached this point had its entry refuse to
             // grow and keeps its allocation to itself.
+            //
+            // `global_share` is the caller's own opt-out (`from_plan_split_opts`): a
+            // compile whose weight buffer an executable adopts explicitly
+            // (`share_weights_from`) must not also publish it here, where a later
+            // compile of the same layout would bind it unseen.
+            let global_share = global_share && share_weights_enabled();
             let key = (0u64, fp);
-            let reused = if scope == 0 && share_weights_enabled() {
+            let reused = if scope == 0 && global_share {
                 let guard = shared_weights().lock().unwrap_or_else(|e| e.into_inner());
                 match guard.get(&key) {
                     Some(shared)
@@ -2451,7 +2642,7 @@ impl Arena {
                 None => {
                     let shards =
                         create_private_weight_shards(device, weight_cursor, weight_shard_cap);
-                    if scope == 0 && share_weights_enabled() {
+                    if scope == 0 && global_share {
                         let mut guard = shared_weights().lock().unwrap_or_else(|e| e.into_inner());
                         // A layout that never compiles again must not hold its weight
                         // allocation for the life of the process: past the entry cap or
@@ -2578,6 +2769,20 @@ impl Arena {
         None
     }
 
+    /// End of the stage reserve that [`Self::shard_stage_off`] starts: the
+    /// reserve, clamped to the stripe. A reserve wider than the stripe (the
+    /// default reserve against a test-lowered `RLX_WGPU_SHARD_CAP_MIB`, or a
+    /// large `RLX_WGPU_SHARD_STAGE_MIB`) otherwise "contains" addresses in later
+    /// stripes, and a staged copy placed there is outside the bound stripe.
+    pub fn shard_stage_end(&self, logical_off: usize) -> usize {
+        if !self.is_sharded() {
+            return self.scratch_off + self.scratch_bytes;
+        }
+        let s = self.shard_size;
+        let shard_end = ((logical_off / s) * s + s).min(self.size);
+        (self.shard_stage_off(logical_off) + shard_stage_reserve()).min(shard_end)
+    }
+
     /// Logical byte offset of the staging reserve for the shard that contains
     /// `logical_off` (end of that stripe minus [`shard_stage_reserve`]).
     pub fn shard_stage_off(&self, logical_off: usize) -> usize {
@@ -2655,6 +2860,69 @@ impl Arena {
         }
         crate::backend::note_device_submit();
         queue.submit(std::iter::once(enc.finish()));
+    }
+
+    /// GPU copy of `bytes` from a weight-tagged offset into the activation
+    /// arena. The weight buffer is a different `wgpu::Buffer` from the arena,
+    /// so a direct `copy_buffer_to_buffer` is legal — no staging bounce and,
+    /// unlike the host round trip it replaces, no `poll(wait)` per copy.
+    /// Split wherever either side crosses a shard. Queue-ordered against the
+    /// passes submitted before and after it.
+    pub fn copy_weight_to_act(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        src_tagged: usize,
+        dst_off: usize,
+        bytes: usize,
+    ) {
+        if bytes == 0 {
+            return;
+        }
+        assert!(is_weight_off(src_tagged) && !is_weight_off(dst_off));
+        assert!(
+            raw_weight_off(src_tagged).is_multiple_of(4)
+                && dst_off.is_multiple_of(4)
+                && bytes.is_multiple_of(4),
+            "rlx-wgpu: copy_weight_to_act needs 4-byte alignment"
+        );
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("rlx-wgpu weight→arena copy"),
+        });
+        self.encode_weight_to_act(&mut enc, src_tagged, dst_off, bytes);
+        queue.submit(std::iter::once(enc.finish()));
+    }
+
+    /// [`Self::copy_weight_to_act`] into `enc`, between compute passes: the
+    /// queue orders it with the dispatches around it, so the host does not
+    /// wait (in the browser, where it cannot).
+    pub fn encode_weight_to_act(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        src_tagged: usize,
+        dst_off: usize,
+        bytes: usize,
+    ) {
+        let mut done = 0usize;
+        while done < bytes {
+            let (src_buf, src_local) = self.resolve_w(src_tagged + done);
+            let (dst_buf, dst_local) = self.resolve_act(dst_off + done);
+            let mut chunk = bytes - done;
+            if self.weight_shard_size > 0 {
+                chunk = chunk.min(self.weight_shard_size - src_local % self.weight_shard_size);
+            }
+            if self.is_sharded() && self.shard_size > 0 {
+                chunk = chunk.min(self.shard_size - dst_local % self.shard_size);
+            }
+            enc.copy_buffer_to_buffer(
+                src_buf,
+                src_local as u64,
+                dst_buf,
+                dst_local as u64,
+                chunk as u64,
+            );
+            done += chunk;
+        }
     }
 
     pub fn resolve_act(&self, global_off: usize) -> (&wgpu::Buffer, usize) {
@@ -2805,7 +3073,7 @@ impl Arena {
 
     pub fn offset(&self, id: NodeId) -> usize {
         if let Some(&w) = self.weight_offsets.get(&id) {
-            w | WEIGHT_BUF_TAG
+            tag_weight_off(w)
         } else {
             *self.offsets.get(&id).unwrap_or_else(|| {
                 panic!("rlx-wgpu arena: no offset for node {id:?} (not in arena or weight buffer)")
@@ -3180,9 +3448,8 @@ impl Arena {
     /// unsharded arena params (callers gate on [`Self::bf16_packed_eligible`]).
     pub fn register_bf16_packed(&mut self, device: &wgpu::Device, id: NodeId) {
         if self.bf16_weight_buffer.is_none() {
-            // Half the arena: bf16 element i pairs with f32 element i, so the
-            // packed buffer must span up to the highest weight element index.
-            let bytes = (self.size / 2).max(256);
+            // Spans the arena: packed bytes sit at the param's arena byte offset.
+            let bytes = self.size.max(256);
             self.bf16_weight_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rlx-wgpu arena bf16 packed weights"),
                 size: bytes as u64,
@@ -3208,7 +3475,7 @@ impl Arena {
         let max_binding = device.limits().max_storage_buffer_binding_size as usize;
         // Whole packed buffer is bound at offset 0 (global bf16 indexing), so
         // it must fit one binding.
-        (self.size / 2).max(256) <= max_binding
+        self.size.max(256) <= max_binding
     }
 
     /// Write raw bf16 weight bytes for `id` into the packed side-buffer.
@@ -3222,7 +3489,7 @@ impl Arena {
     }
 
     /// Downcast host f32 → bf16 and write into the packed side-buffer at the
-    /// slot for f32-byte-offset `off` (packed byte offset `off / 2`).
+    /// param's arena byte offset `off`.
     fn write_bf16_packed_at(&self, queue: &wgpu::Queue, off: usize, data: &[f32]) {
         let mut bytes: Vec<u8> = Vec::with_capacity(data.len() * 2);
         for &v in data {
@@ -3231,9 +3498,9 @@ impl Arena {
         self.write_bf16_packed_bytes_at(queue, off, &bytes);
     }
 
-    /// Write a raw bf16 byte stream into the packed side-buffer. The packed
-    /// slot begins at byte `off / 2` (bf16 element i ↔ f32 element i). Pads to
-    /// a u32-word boundary so the shader's `array<u32>` view is well-formed.
+    /// Write a raw bf16 byte stream into the packed side-buffer at the param's
+    /// arena byte offset `off`. Pads to a u32-word boundary so the shader's
+    /// `array<u32>` view is well-formed.
     ///
     /// A per-compile buffer, never the shared weight buffer, so the weight
     /// sharing check does not apply here: these bytes are re-uploaded on every
@@ -3242,7 +3509,7 @@ impl Arena {
         let Some(buf) = &self.bf16_weight_buffer else {
             return;
         };
-        let packed_off = off / 2; // f32 byte off → bf16 byte off (parallel index)
+        let packed_off = off;
         // Round the write up to a multiple of 4 bytes (one u32 word) so a
         // trailing odd bf16 element still lands in a fully-written word.
         let mut owned;
@@ -3500,8 +3767,8 @@ impl Arena {
             return;
         }
         const CHUNK: usize = 64 * 1024 * 1024;
-        // Weight-buffer uploads must not use act-shard boundary math — the high
-        // WEIGHT_BUF_TAG bit would make `% shard_size` nonsense and truncate.
+        // Weight-buffer uploads must not use act-shard boundary math — the
+        // WEIGHT_BUF_TAG base would make `% shard_size` nonsense and truncate.
         let weight = is_weight_off(byte_off);
         if weight && self.skip_weight_write(byte_off, data.len()) {
             return;
@@ -3536,7 +3803,18 @@ impl Arena {
                 break;
             }
             let (buf, local) = self.resolve_w(byte_off + off);
-            write_upload(queue, buf, local as u64, &data[off..off + n]);
+            let piece = &data[off..off + n];
+            if n.is_multiple_of(4) {
+                write_upload(queue, buf, local as u64, piece);
+            } else {
+                // `write_buffer` sizes must be multiples of 4 (a packed Q6_K
+                // tensor of one block is 210 bytes). Slots start 4-aligned,
+                // so the bytes up to the next multiple are this slot's own
+                // padding: zero-fill them.
+                let mut tail = piece.to_vec();
+                tail.resize(n.next_multiple_of(4), 0);
+                write_upload(queue, buf, local as u64, &tail);
+            }
             off += n;
         }
         if let Some(at) = record.filter(|&at| is_weight_off(at)) {
@@ -3549,6 +3827,14 @@ impl Arena {
 pub struct ReadbackStaging {
     buffer: wgpu::Buffer,
     capacity: usize,
+}
+
+/// Freed at once in the browser, like [`Arena`]'s activations.
+#[cfg(target_family = "wasm")]
+impl Drop for ReadbackStaging {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+    }
 }
 
 /// Fixed 256 B MAP_READ staging for scalar (≤16 B) readback — avoids
@@ -4442,4 +4728,54 @@ mod operand_stageability_tests {
             "a one-byte parameter keeps its native slot, and what the rule refuses"
         );
     }
+}
+
+/// The arena `graph` plans to on this backend — the passes `compile` runs
+/// before planning, then its planner — without a device — and the scratch
+/// tail every compile reserves (at least 64 MiB).
+///
+/// Compared with [`arena_binding_limit`], it says whether a compile would keep
+/// the arena in one storage binding. Past that the arena is striped and any
+/// op whose operands span two stripes runs on the host, much slower.
+pub fn planned_arena_bytes(graph: Graph) -> usize {
+    let (g, plan) = planned(graph);
+    plan.arena_size + crate::backend::compute_scratch_bytes(&g).div_ceil(16) * 16
+}
+
+/// The largest single tensor's slot [`planned_arena_bytes`] would give it: an
+/// arena past one binding is striped, and each tensor must fit a stripe.
+pub fn planned_largest_tensor_bytes(graph: Graph) -> usize {
+    let (g, plan) = planned(graph);
+    g.nodes()
+        .iter()
+        .filter(|n| !matches!(n.op, rlx_ir::Op::Param { .. }))
+        .filter_map(|n| plan.assignments.get(&n.id).map(|a| a.size))
+        .max()
+        .unwrap_or(0)
+}
+
+fn planned(graph: Graph) -> (Graph, MemoryPlan) {
+    let g = crate::unfuse::unfuse(graph);
+    let g = crate::unfuse::collapse_reshapes(g);
+    let g = crate::unfuse::fold_expand_into_binary(g);
+    let g = crate::unfuse::maybe_pack_half(g);
+    let plan = if crate::unfuse::half_packed() {
+        plan_hybrid(&g, 16)
+    } else {
+        plan_f32_uniform(&g, 16)
+    };
+    crate::unfuse::set_half_packed(false);
+    (g, plan)
+}
+
+/// The largest arena this device holds in one storage binding: its
+/// `maxStorageBufferBindingSize` (and `maxBufferSize`), and in wasm below the
+/// 3 GiB of [`WEIGHT_BUF_TAG`]. `None` before the device is up.
+pub fn arena_binding_limit() -> Option<u64> {
+    let l = crate::device::wgpu_device()?.device.limits();
+    Some(
+        l.max_storage_buffer_binding_size
+            .min(l.max_buffer_size)
+            .min(WEIGHT_BUF_TAG as u64),
+    )
 }

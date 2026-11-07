@@ -6,7 +6,8 @@
 //!
 //! # Load path
 //!
-//! 1. [`Package::open`] — mmap file / shards, parse TOC (JSON or bincode)
+//! 1. [`Package::open`] — mmap file / shards (read them where there is no mmap:
+//!    wasm32), parse TOC (JSON or bincode); or [`Package::from_bytes`]
 //! 2. [`Package::advise_hot_willneed`] — optional `madvise(WILLNEED)` on hot ranges
 //! 3. [`Package::graph`] — deserialize MIR; fill **hot** stripped Constants
 //! 4. [`Package::bind_warm_and_cold`] — optional late bind of compressed weights
@@ -43,20 +44,53 @@ pub enum MaterializeMode {
     None,
 }
 
+/// A package file's bytes: memory-mapped, or owned where there is no mmap
+/// (wasm32) or the bytes came from elsewhere ([`Package::from_bytes`]).
+#[derive(Debug)]
+pub enum Bytes {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(m) => m,
+            Self::Owned(v) => v,
+        }
+    }
+}
+
+impl Bytes {
+    /// Map `path`; read it whole if this platform cannot map files.
+    fn of_file(path: &Path) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: read-only map of a local package file for the Package lifetime.
+        match unsafe { Mmap::map(&file) } {
+            Ok(m) => Ok(Self::Mapped(m)),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(Self::Owned(
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+            )),
+            Err(e) => Err(e).with_context(|| format!("mmap {}", path.display())),
+        }
+    }
+}
+
 /// Where package members are served from.
 #[derive(Debug)]
 pub enum MemberSource {
-    /// Flat `RLXPFLAT` single-file mmap.
-    Flat { path: PathBuf, map: Mmap },
-    /// Unpacked directory tree with per-shard mmaps.
+    /// Flat `RLXPFLAT` single file (`path` is empty for [`Package::from_bytes`]).
+    Flat { path: PathBuf, map: Bytes },
+    /// Unpacked directory tree with per-shard maps.
     Dir {
         root: PathBuf,
-        shard_maps: BTreeMap<String, Mmap>,
+        shard_maps: BTreeMap<String, Bytes>,
     },
-    /// ZIP64 STORE archive.
+    /// ZIP64 STORE archive (`path` is empty for [`Package::from_bytes`]).
     Zip {
         path: PathBuf,
-        map: Mmap,
+        map: Bytes,
         ranges: BTreeMap<String, MemberRange>,
     },
 }
@@ -82,19 +116,27 @@ impl Package {
         if path.is_dir() {
             return Self::open_dir(path);
         }
-        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        // SAFETY: read-only map of a local package file for the Package lifetime.
-        let map =
-            unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?;
+        Self::open_bytes(path, Bytes::of_file(path)?)
+    }
+
+    /// Open a flat or ZIP package held in memory — fetched in a browser, say,
+    /// where there is no filesystem to open it from.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        Self::open_bytes(Path::new(""), Bytes::Owned(bytes))
+    }
+
+    fn open_bytes(path: &Path, map: Bytes) -> Result<Self> {
         if flat::is_flat_magic(&map) {
             Self::open_flat(path, map)
         } else if map.len() >= 4 && &map[..2] == b"PK" {
             Self::open_zip_mapped(path, map)
         } else {
-            bail!(
-                "{} is not a flat RLXPFLAT, ZIP, or package directory",
-                path.display()
-            )
+            let what = if path.as_os_str().is_empty() {
+                "these bytes are".into()
+            } else {
+                format!("{} is", path.display())
+            };
+            bail!("{what} not a flat RLXPFLAT, ZIP, or package directory")
         }
     }
 
@@ -129,7 +171,7 @@ impl Package {
         }
     }
 
-    fn open_flat(path: &Path, map: Mmap) -> Result<Self> {
+    fn open_flat(path: &Path, map: Bytes) -> Result<Self> {
         let view = FlatView::parse(&map)?;
         let weights = Some(view.weights_index());
         let placement = view.placement()?;
@@ -170,11 +212,7 @@ impl Package {
                 if shard_maps.contains_key(&t.shard) {
                     continue;
                 }
-                let p = dir.join(&t.shard);
-                let f = File::open(&p).with_context(|| format!("open shard {}", p.display()))?;
-                // SAFETY: read-only map of a package shard for the Package lifetime.
-                let map = unsafe { Mmap::map(&f) }
-                    .with_context(|| format!("mmap shard {}", p.display()))?;
+                let map = Bytes::of_file(&dir.join(&t.shard))?;
                 shard_maps.insert(t.shard.clone(), map);
             }
         }
@@ -192,8 +230,8 @@ impl Package {
         ))
     }
 
-    fn open_zip_mapped(path: &Path, map: Mmap) -> Result<Self> {
-        let ranges = store_zip::resolve_store_ranges(path)?;
+    fn open_zip_mapped(path: &Path, map: Bytes) -> Result<Self> {
+        let ranges = store_zip::resolve_store_ranges_in(std::io::Cursor::new(&map[..]), "package")?;
         let manifest_bytes = store_zip::read_member_from_map(&map, &ranges, "rlx.json")
             .context("rlx.json in package")?;
         let manifest: Manifest =
@@ -241,10 +279,22 @@ impl Package {
 
     /// Like [`Self::graph`] with an explicit materialize mode.
     pub fn graph_with(&self, mode: MaterializeMode) -> Result<Graph> {
+        Ok(self.module_with(mode)?.graphs.remove(0))
+    }
+
+    /// Every stored graph, the main one first, with the `.rlxmodel` header:
+    /// the model block, and the rlx versions that wrote it and may read it.
+    /// A package from before modules is one graph and no model block.
+    pub fn module(&self) -> Result<rlx_ir::rlxmodel::Module> {
+        self.module_with(MaterializeMode::HotOnly)
+    }
+
+    /// Like [`Self::module`] with an explicit materialize mode.
+    pub fn module_with(&self, mode: MaterializeMode) -> Result<rlx_ir::rlxmodel::Module> {
         if !self.has_graph() {
             bail!("package has no embedded graph (weight-only / encoding=none)");
         }
-        let mut g: Graph = match &self.source {
+        let mut module = match &self.source {
             MemberSource::Flat { map, .. } => {
                 let (off, len) = self.flat_graph.context("flat graph missing")?;
                 if len == 0 {
@@ -255,15 +305,20 @@ impl Package {
                     .checked_add(len as usize)
                     .context("flat graph range")?;
                 let bytes = map.get(start..end).context("flat graph slice")?;
-                bincode::deserialize(bytes).context("deserialize flat graph")?
+                decode_graph(&self.manifest.graph.encoding, bytes)?
             }
             MemberSource::Dir { .. } | MemberSource::Zip { .. } => {
                 let bytes = self.member_bytes(&self.manifest.graph.path)?;
-                bincode::deserialize(&bytes).context("deserialize graph/mir.bin")?
+                decode_graph(&self.manifest.graph.encoding, &bytes)?
             }
         };
-        self.materialize_graph_weights(&mut g, mode)?;
-        Ok(g)
+        if module.graphs.is_empty() {
+            bail!("package graph member holds no graph");
+        }
+        for g in &mut module.graphs {
+            self.materialize_graph_weights(g, mode)?;
+        }
+        Ok(module)
     }
 
     fn materialize_graph_weights(&self, g: &mut Graph, mode: MaterializeMode) -> Result<()> {
@@ -342,27 +397,53 @@ impl Package {
                 return;
             }
             match &self.source {
-                MemberSource::Flat { map, .. } => {
+                MemberSource::Flat {
+                    map: Bytes::Mapped(map),
+                    ..
+                } => {
                     let abs = (self.flat_data_start + offset) as usize;
                     let _ = map.advise_range(memmap2::Advice::WillNeed, abs, len);
                 }
                 MemberSource::Dir { shard_maps, .. } => {
-                    if let Some(map) = shard_maps.get(shard) {
+                    if let Some(Bytes::Mapped(map)) = shard_maps.get(shard) {
                         let _ = map.advise_range(memmap2::Advice::WillNeed, offset as usize, len);
                     }
                 }
-                MemberSource::Zip { map, ranges, .. } => {
+                MemberSource::Zip {
+                    map: Bytes::Mapped(map),
+                    ranges,
+                    ..
+                } => {
                     if let Some(r) = ranges.get(shard) {
                         let abs = r.data_offset as usize + offset as usize;
                         let _ = map.advise_range(memmap2::Advice::WillNeed, abs, len);
                     }
                 }
+                // owned bytes are already resident
+                _ => {}
             }
         }
         #[cfg(not(unix))]
         {
             let _ = (shard, offset, length);
         }
+    }
+
+    /// Every sidecar's id and media type (when the manifest records one),
+    /// to read with [`Self::sidecar`] or copy into another package.
+    pub fn sidecar_ids(&self) -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(String, Option<String>)> = self
+            .manifest
+            .sidecars
+            .iter()
+            .map(|s| (s.id.clone(), s.media_type.clone()))
+            .collect();
+        for (id, ..) in &self.flat_sidecars {
+            if !out.iter().any(|(i, _)| i == id) {
+                out.push((id.clone(), None));
+            }
+        }
+        out
     }
 
     /// Sidecar bytes by id (decompresses cold sidecars).
@@ -643,4 +724,21 @@ fn load_placement_zip(
     let bytes = store_zip::read_member_from_map(map, ranges, path)?;
     let pl: Placement = serde_json::from_slice(bytes).context("parsing placement.json")?;
     Ok(Some(pl))
+}
+
+/// The stored graphs in their manifest `encoding`: `.rlxmodel` text, or the
+/// bincode of packages written before it (one graph).
+fn decode_graph(encoding: &str, bytes: &[u8]) -> Result<rlx_ir::rlxmodel::Module> {
+    match encoding {
+        crate::manifest::GRAPH_RLXMODEL => {
+            let text = std::str::from_utf8(bytes).context("graph is not UTF-8 text")?;
+            rlx_ir::rlxmodel::read_module(text).context("read graph")
+        }
+        crate::manifest::GRAPH_BINCODE => bincode::deserialize::<Graph>(bytes)
+            .map(|g| rlx_ir::rlxmodel::Module::new(vec![g]))
+            .context(
+                "read graph (bincode_graph_v1: readable only by the rlx version that wrote it)",
+            ),
+        other => bail!("unsupported graph encoding {other:?}"),
+    }
 }

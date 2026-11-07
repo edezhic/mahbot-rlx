@@ -17,6 +17,8 @@ name = "rlx_fusion"
 
 [dependencies]
 rlx-ir = { workspace = true }
+# `lower_pocketfft`: the pocketfft plan (factors, twiddles) the GPU lowering replays.
+rlx-pocketfft = { workspace = true }
 
 [dev-dependencies]
 # Textual-IR fixtures (`tests/text_fixtures.rs`) need rlx-ir's serde derives.
@@ -37,6 +39,11 @@ rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
 
 [features]
+default = []
+# `ParallelizeAffineScan`: rewrite a `Scan` whose body is a diagonal affine
+# recurrence (`h = a*h + b`) into a log-depth prefix scan of tensor ops.
+# Not bit-identical to the sequential loop (different association order).
+assoc-scan = []
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-fusion --features backend-tests`.
 backend-tests = []
 
@@ -63,3 +70,20 @@ required-features = ["backend-tests"]
 [[test]]
 name = "trigger_kinds_are_honest"
 required-features = ["backend-tests"]
+
+[[test]]
+name = "assoc_scan_parity"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "exported_interior_values_survive_fusion"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "fused_swiglu_unfuse_order"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gdn_unfuse_carry_state"
+required-features = ["backend-tests"]
+

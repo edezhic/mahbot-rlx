@@ -130,6 +130,13 @@ pub struct MetalHwModel {
 
 impl MetalHwModel {
     fn detect() -> Self {
+        Self::detect_with(true)
+    }
+
+    /// `use_calibration = false` keeps the per-family defaults even when this
+    /// machine has a calibration cache — for tests that check the model's
+    /// arithmetic, not whatever the last calibration run measured.
+    fn detect_with(use_calibration: bool) -> Self {
         let dev = metal_device();
         let (name, unified) = match dev {
             Some(d) => (d.name.clone(), d.has_unified_memory),
@@ -165,7 +172,12 @@ impl MetalHwModel {
         // metal_calibrate` (or via `Calibration::measure()` directly).
         // The cache file is keyed by GPU registry ID, so it's portable across runs.
         let dev_id = dev.map(|d| d.registry_id).unwrap_or(0);
-        if let Some(cal) = crate::calibrate::Calibration::load(dev_id) {
+        let cal = if use_calibration {
+            crate::calibrate::Calibration::load(dev_id)
+        } else {
+            None
+        };
+        if let Some(cal) = cal {
             simd_4x4_flops = cal.sgemm_simd_4x4_flops;
             // A cache written before this field existed deserialises it as 0.0;
             // keep the arch default rather than dividing by zero.
@@ -769,7 +781,10 @@ mod tests {
     #[test]
     fn the_cascade_never_picks_a_variant_its_own_cost_model_beats() {
         with_clean_dispatch(|| {
-            let m = MetalHwModel::detect();
+            // The family defaults: a calibration cache written on a busy GPU
+            // skews the variant throughputs by 3x and more, which made this
+            // test's verdict depend on when the machine last calibrated.
+            let m = MetalHwModel::detect_with(false);
             let candidates = [
                 SgemmVariant::Simd4x4,
                 SgemmVariant::Simd64,
@@ -945,6 +960,9 @@ mod tests {
     /// for the next test whichever way `f` exits.
     fn with_clean_dispatch(f: impl FnOnce()) {
         let _g = SGEMM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Fire the one-shot cache/shipped-row load NOW: if `pick_sgemm` fired it
+        // inside `f`, it would reinstall those overrides after this clear.
+        let _ = crate::tuning::gpu_arch();
         rlx_gpu_dispatch::dispatch::clear_overrides();
         rlx_ir::env::unset("RLX_METAL_SGEMM_VARIANT");
         rlx_ir::env::unset("RLX_METAL_SGEMM_PRECISE");

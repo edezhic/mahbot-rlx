@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 enable f16;
 
 // Matmul with f16 weight storage. EXPERIMENTAL — currently slower
@@ -72,25 +75,43 @@ const RN: u32 = 4u;
 var<workgroup> tile_a: array<array<f32, 16>, 32>;
 var<workgroup> tile_b: array<array<f32, 32>, 16>;
 
+// Exact GELU — A&S 7.1.26 erf, the same as `matmul.wgsl` / `matmul_coop_f32.wgsl`
+// and rlx-cpu's `scalar_gelu`. Opcode 9 (`Activation::Gelu`) is the EXACT form;
+// only opcode 11 (`GeluApprox`) is the tanh form. This kernel used to map both
+// to tanh, so a fused matmul+bias+GELU here drifted ~3e-4 from CPU at |x|≈2–3.
+fn gelu_erf(x: f32) -> f32 {
+    let arg = x * 0.70710678118654752;
+    let s = select(-1.0, 1.0, arg >= 0.0);
+    let xa = abs(arg);
+    let t = rlx_div_rn(1.0, fma(0.3275911, xa, 1.0));
+    // explicit fma: an uncontracted chain is contracted differently by
+    // different shader compilers
+    let poly = t * fma(t, fma(t, fma(t, fma(t, 1.061405429, -1.453152027), 1.421413741),
+                -0.284496736), 0.254829592);
+    let e = s * fma(-poly, rlx_exp(-xa * xa), 1.0);
+    return 0.5 * x * (1.0 + e);
+}
+
 fn apply_act(v_in: f32) -> f32 {
     var v = v_in;
     if (params.act_id == 0xFFFFu) { return v; }
     switch (params.act_id) {
         case 0u: { v = max(v, 0.0); }
-        case 1u: { v = 1.0 / (1.0 + exp(-clamp(v, -88.0, 88.0))); }
-        case 2u: { v = tanh(clamp(v, -15.0, 15.0)); }
-        case 5u: { v = sqrt(v); }
+        case 1u: { v = rlx_div_rn(1.0, 1.0 + rlx_exp(-clamp(v, -88.0, 88.0))); }
+        case 2u: { v = rlx_tanh(clamp(v, -15.0, 15.0)); }
+        case 5u: { v = rlx_sqrt_rn(v); }
         case 7u: { v = -v; }
         case 8u: { v = abs(v); }
-        case 9u, 11u: {
+        case 9u: { v = gelu_erf(v); }
+        case 11u: {
             let c = 0.7978845608028654;
             let x3 = v * v * v;
-            let inner = clamp(c * (v + 0.044715 * x3), -15.0, 15.0);
-            v = 0.5 * v * (1.0 + tanh(inner));
+            let inner = clamp(c * fma(0.044715, x3, v), -15.0, 15.0);
+            v = 0.5 * v * (1.0 + rlx_tanh(inner));
         }
         case 10u: {
             let nx = clamp(-v, -88.0, 88.0);
-            v = v / (1.0 + exp(nx));
+            v = rlx_div_rn(v, 1.0 + rlx_exp(nx));
         }
         default: {}
     }
@@ -155,9 +176,15 @@ fn matmul_f16w(
             let global_k = t * TILE_K + k_local;
             let n_local_base = lc * RN;
             let global_col_base = wid.x * TILE_N + n_local_base;
-            if (in_batch && global_k < params.k && global_col_base + 3u < params.n) {
-                let f16_off = b_base + global_k * params.n + global_col_base;
-                let v: vec4<f16> = weights[f16_off / 4u];
+            // The vec4 load reads elements `4·⌊off/4⌋ … +3`, which are this
+            // thread's four columns only when `off` is itself a multiple of 4.
+            // With `n` not divisible by 4 that fails on three rows in four and
+            // the load silently returns a neighbour row's weights (a 158 241-
+            // wide LM head came back with |Δ| ≈ 1), so check it per row.
+            let f16_off_vec = b_base + global_k * params.n + global_col_base;
+            if (in_batch && global_k < params.k && global_col_base + 3u < params.n
+                && (f16_off_vec % 4u) == 0u) {
+                let v: vec4<f16> = weights[f16_off_vec / 4u];
                 let vf: vec4<f32> = vec4<f32>(v);
                 tile_b[k_local][n_local_base + 0u] = vf.x;
                 tile_b[k_local][n_local_base + 1u] = vf.y;

@@ -70,6 +70,8 @@ pub enum CoopKernel {
     /// buffer). The Metal convention, and the only one of these whose tile spans
     /// more than one subgroup.
     F16F32Acc,
+    /// `matmul_coop_f16_vulkan_f32acc_32` — 32×32 block per subgroup.
+    F16Vk32,
 }
 
 /// Where the probe has to place `A` and `B` for this shader's bind group.
@@ -125,6 +127,16 @@ fn plan(which: CoopKernel) -> Plan {
             operands: Operands::ArenaF32PlusF16Weights,
             rel_tol: 2e-2,
         },
+        // 32×32 block; grid is (m/32, n/32). Two blocks each way and two K
+        // steps, so block placement and the K loop are both exercised.
+        CoopKernel::F16Vk32 => Plan {
+            m: 64,
+            k: 32,
+            n: 64,
+            grid: (2, 2),
+            operands: Operands::ArenaF16PlusF32Out,
+            rel_tol: 2e-2,
+        },
         // 16×16 tile; grid is (m/16, n/16).
         CoopKernel::F16Vk { .. } => Plan {
             m: 32,
@@ -166,7 +178,9 @@ fn params_bytes(m: u32, k: u32, n: u32, a_off: u32, b_off: u32, c_off: u32) -> [
         0,
         0,      // has_bias, bias_off
         0xFFFF, // act_id = none
-        0,
+        // The F16Vk kernels read A at `a_off_f16`; the probe binds one buffer
+        // from offset 0, so it is `a_off` there. Padding for every other kernel.
+        a_off,
         0,
         0,
     ];
@@ -215,6 +229,12 @@ pub fn verified(device: &wgpu::Device, queue: &wgpu::Queue, which: CoopKernel) -
     if let Some(&hit) = cache.lock().unwrap().get(&which) {
         return hit;
     }
+    // Not built on this adapter (missing feature or unsupported coop shape):
+    // nothing to check, and nothing to trust — even under the opt-out below.
+    if kernel_for(device, which).is_none() {
+        cache.lock().unwrap().insert(which, false);
+        return false;
+    }
     // `RLX_WGPU_NO_COOP_PROBE=1` skips the check and trusts the kernels. Only
     // useful for measuring the probe's own cost, or to re-observe a known-bad
     // kernel while debugging it.
@@ -240,6 +260,7 @@ fn kernel_for(device: &wgpu::Device, which: CoopKernel) -> Option<&'static Kerne
         CoopKernel::F32Metal => k::matmul_coop_f32_kernel(device),
         CoopKernel::F32Portable => k::matmul_coop_f32_portable_kernel(device),
         CoopKernel::Coop16 => k::matmul_coop16_kernel(device),
+        CoopKernel::F16Vk32 => k::matmul_coop_f16_vulkan_f32acc_32_kernel(device),
         CoopKernel::F16Vk {
             widen: false,
             f32acc: false,
@@ -277,9 +298,10 @@ pub fn probe_source(
     entry: &str,
 ) -> Option<bool> {
     let operands = plan(which).operands;
+    let wgsl = crate::kernels::with_numeric_helpers(wgsl);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("rlx-wgpu coop probe (ad-hoc)"),
-        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        source: wgpu::ShaderSource::Wgsl(wgsl.as_ref().into()),
     });
     let bgl = probe_bgl(device, operands);
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -608,6 +630,14 @@ pub fn f16_vk_widen_choice(n: u32, f32acc: bool) -> Option<bool> {
         return Some(!preferred);
     }
     None
+}
+
+/// The 32×32-block f32-accumulator kernel, when it is built here and computes
+/// `a·b`. Callers still owe it M and N divisible by 32.
+pub fn f16_vk_32_kernel() -> Option<&'static Kernel> {
+    let (device, queue) = dq()?;
+    let k = crate::kernels::matmul_coop_f16_vulkan_f32acc_32_kernel(device)?;
+    verified(device, queue, CoopKernel::F16Vk32).then_some(k)
 }
 
 /// Is any `matmul_coop_f16_vulkan*` variant trustworthy for this `n`?

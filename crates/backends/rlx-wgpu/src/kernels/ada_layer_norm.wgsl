@@ -15,6 +15,9 @@
 // tree. Every pass uses the same lane mapping (index ≡ lane mod 64), so arena
 // elements are only touched by the lane that owns them.
 
+// `rlx_div_rn`, `rlx_exp`, …: rlxsl's correctly-rounded helpers, appended by
+// `kernel_module` (`with_numeric_helpers`).
+
 struct Params {
     outer: u32,
     inner: u32,
@@ -84,7 +87,7 @@ fn ada_layer_norm(
     let in_base = params.in_off + row * params.inner;
     let out_base = params.out_off + row * params.inner;
     let mod_base = mod_base_for_row(row, params.inner);
-    let n_inv = 1.0 / f32(params.inner);
+    let n_inv = rlx_div_rn(1.0, f32(params.inner));
     let eps = bitcast<f32>(params.eps_bits);
     let do_ln = params.layer_norm != 0u;
 
@@ -139,11 +142,11 @@ fn ada_layer_norm(
         scratch[tid] = sum_sq;
         workgroupBarrier();
         tree_sum(tid);
-        inv = inverseSqrt(scratch[0] * n_inv + eps);
+        inv = rlx_rsqrt_rn(scratch[0] * n_inv + eps);
     } else {
         // Σx² stays the one-pass form this kernel has always used (the RMS
         // branch does not recentre), now tree-combined across the lanes.
-        inv = inverseSqrt(scratch[0] * n_inv + eps);
+        inv = rlx_rsqrt_rn(scratch[0] * n_inv + eps);
     }
 
     // Pass 2: modulate — each lane over its own lanes.
@@ -157,3 +160,4 @@ fn ada_layer_norm(
         i = i + 64u;
     }
 }
+

@@ -622,6 +622,16 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             2048,
             12288,
         ),
+        // The cell the workgroup floor's own move crossed: the body's `o` projection
+        // at the 47-row rung is 32 workgroups, refused while the floor was 48 and
+        // taken at 24. The below-floor loop further down pins the other side.
+        (
+            QuantScheme::GgufQ4K,
+            rlx_gguf::GgmlType::Q4K,
+            47,
+            2048,
+            2048,
+        ),
     ] {
         if !coop_admits(scheme, m, k, n) {
             let dev = wgpu_device().expect("a wgpu device: this test skips without one");
@@ -660,13 +670,20 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     }
 
     // The grid floor, from the other side: a shape whose 32-row tile leaves too few
-    // workgroups to fill the device is the row-grouped tile's, whose four times the
-    // row groups are. These are the product's own narrow cases — the body's `o`
-    // projection at the two shortest rungs (`m = 31` and `47` against `n = 2 048`:
-    // 16 and 32 workgroups) and the wake word's two-window encoder pass (`m = 20`
-    // against the `ffn`'s `n = 4 096`: 32). Each is asserted both ways: the
-    // predicate refuses it, and the census is the grouped tile — so a floor moved
-    // without re-measuring shows up here rather than as a slower product.
+    // workgroups to fill the device is the row-grouped tile's. These are the
+    // product's own narrow cases — the body's `o` projection at the shortest rung
+    // (`m = 31` against `n = 2 048`: 16 workgroups), a 1 024-column projection at
+    // one row tile (`m = 31` against `n = 1 024`: 8), and the wake word's two-window
+    // encoder pass (`m = 20` against `n = 2 048`: 16). Each is asserted both ways:
+    // the predicate refuses it, and the census is the grouped tile — so a floor
+    // moved without re-measuring shows up here rather than as a slower product. The
+    // 8-workgroup cell is one of the two readings the floor was set on, so dropping
+    // it would leave that reading unpinned.
+    //
+    // The cell the floor's own move crossed sits in the admits loop above: the
+    // body's `o` at the next rung (`m = 47` against `n = 2 048`, 32 workgroups) is
+    // refused at 48 and taken at 24. The two loops are the two sides of that
+    // boundary.
     for &(scheme, ggml, m, k, n) in &[
         (
             QuantScheme::GgufQ4K,
@@ -678,16 +695,16 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         (
             QuantScheme::GgufQ4K,
             rlx_gguf::GgmlType::Q4K,
-            47,
+            31,
             2048,
-            2048,
+            1024,
         ),
         (
             QuantScheme::GgufQ8_0,
             rlx_gguf::GgmlType::Q8_0,
             20,
             1024,
-            4096,
+            2048,
         ),
     ] {
         let (grid_x, grid_y) = rlx_wgpu::kernels::coop_gemm_gguf_grid(m as u32, n as u32);
@@ -714,9 +731,9 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // rows and spends the difference on nothing, so the admission refuses a call
     // whose rounding is more than a third of its dispatch — even when the grid is
     // wide enough for the workgroup floor, which is why these cells sit at the
-    // body's widest projection (96 workgroups, twice that floor). 21 and 22 rows
-    // straddle the term exactly: 11 rows past `m` out of 32 is more than a third,
-    // 10 is not.
+    // body's widest projection (96 workgroups, four times that floor). 21 and 22
+    // rows straddle the term exactly: 11 rows past `m` out of 32 is more than a
+    // third, 10 is not.
     for &(m, admitted) in &[(21usize, false), (22usize, true)] {
         let (scheme, ggml) = (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K);
         let (k, n) = (2048usize, 12288usize);

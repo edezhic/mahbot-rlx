@@ -45,3 +45,7 @@ required-features = ["backend-tests"]
 rustdoc-args   = ["--cfg", "docsrs"]
 all-features   = false
 features       = ["ir"]
+
+[[test]]
+name = "from_bytes"
+required-features = ["backend-tests"]

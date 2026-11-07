@@ -47,6 +47,24 @@ fn read_w_i8(rel: u32) -> i32 {
     return select(i32(b), i32(b) - 256, b >= 128u);
 }
 
+// One OCP FP8 code to f32 by building its bits — exact, no exp2: E4M3 (`e5`
+// false; only S.1111.111 is NaN) or E5M2 (IEEE-like inf / NaN at exponent 31).
+fn dq_fp8(c: u32, e5: bool) -> f32 {
+    var v: f32;
+    if (e5) {
+        let e = (c >> 2u) & 31u;
+        let m = c & 3u;
+        v = select(bitcast<f32>(((e + 112u) << 23u) | (m << 21u)), f32(m) * 1.52587890625e-05, e == 0u);
+        if (e == 31u) { v = bitcast<f32>(select(0x7FC00000u, 0x7F800000u, m == 0u)); }
+    } else {
+        let e = (c >> 3u) & 15u;
+        let m = c & 7u;
+        v = select(bitcast<f32>(((e + 120u) << 23u) | (m << 20u)), f32(m) * 0.001953125, e == 0u);
+        if ((c & 0x7Fu) == 0x7Fu) { v = bitcast<f32>((c & 0u) | 0x7FC00000u); }
+    }
+    return select(v, -v, (c & 0x80u) != 0u);
+}
+
 fn dq_read_bf16(rel: u32) -> f32 {
     // bf16 is the top 16 bits of an f32: shift into place and bitcast.
     return bitcast<f32>((read_w(rel) | (read_w(rel + 1u) << 8u)) << 16u);
@@ -59,8 +77,8 @@ fn dq_read_f16(rel: u32) -> f32 {
     let mant = bits & 0x3FFu;
     var v: f32;
     if (exp == 0u) { v = f32(mant) / 1024.0 * exp2(-14.0); }
-    else if (exp == 31u) { v = select(0.0, bitcast<f32>(0x7f800000u), mant == 0u); }
-    else { v = (1.0 + f32(mant) / 1024.0) * exp2(f32(i32(exp) - 15)); }
+    else if (exp == 31u) { v = bitcast<f32>(select(0u, 0x7f800000u, mant == 0u)); }
+    else { v = (1.0 + f32(mant) / 1024.0) * ldexp(1.0, i32(exp) - 15); }
     return select(v, -v, sign != 0u);
 }
 
@@ -113,7 +131,8 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         && params.scheme_id != 19u && params.scheme_id != 20u
         && params.scheme_id != 21u && params.scheme_id != 22u && params.scheme_id != 23u
         && params.scheme_id != 24u && params.scheme_id != 25u
-        && params.scheme_id != 28u && params.scheme_id != 29u) {
+        && params.scheme_id != 28u && params.scheme_id != 29u
+        && params.scheme_id != 30u && params.scheme_id != 31u) {
         let dst_base = params.dst_f32_off + gid * 256u;
 
         if (params.scheme_id == 3u) {
@@ -637,8 +656,8 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
             let mant = sc_u16 & 0x3FFu;
             var d: f32;
             if (exp_v == 0u) { d = f32(mant) / 1024.0 * exp2(-14.0); }
-            else if (exp_v == 31u) { d = select(0.0, bitcast<f32>(0x7f800000u), mant == 0u); }
-            else { d = (1.0 + f32(mant) / 1024.0) * exp2(f32(i32(exp_v) - 15)); }
+            else if (exp_v == 31u) { d = bitcast<f32>(select(0u, 0x7f800000u, mant == 0u)); }
+            else { d = (1.0 + f32(mant) / 1024.0) * ldexp(1.0, i32(exp_v) - 15); }
             if (sign != 0u) { d = -d; }
             var y = 0u;
             var qs_walk = 0u;
@@ -739,6 +758,19 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         for (var j: u32 = 0u; j < 128u; j = j + 1u) {
             let q = (read_w(qs_rel + (j >> 2u)) >> ((j & 3u) * 2u)) & 3u;
             arena[dst_base + j] = f32(i32(q) - 1) * d;
+        }
+        return;
+    }
+
+    if (params.scheme_id == 30u || params.scheme_id == 31u) {
+        // FP8 block (HF fp8 / DeepSeek-V3): f32 scale | 128 codes (132 bytes /
+        // 128 elems), E4M3 (30) or E5M2 (31); see `dq_fp8`.
+        let e5 = params.scheme_id == 31u;
+        let off = gid * 132u;
+        let s = bitcast<f32>(read_w(off) | (read_w(off + 1u) << 8u) | (read_w(off + 2u) << 16u) | (read_w(off + 3u) << 24u));
+        let dst_base = params.dst_f32_off + gid * 128u;
+        for (var j: u32 = 0u; j < 128u; j = j + 1u) {
+            arena[dst_base + j] = dq_fp8(read_w(off + 4u + j), e5) * s;
         }
         return;
     }
@@ -864,7 +896,7 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         let e = read_w(off);
         var s: f32;
         if (e == 0xFFu) { s = 0.0; }
-        else { s = exp2(f32(i32(u32(e)) - 127)); }
+        else { s = ldexp(1.0, i32(u32(e)) - 127); }
         let qs_rel = off + 1u;
         let dst_base = params.dst_f32_off + gid * 32u;
         for (var j: u32 = 0u; j < 32u / 2u; j = j + 1u) {
@@ -890,7 +922,7 @@ fn dequant_gguf(@builtin(global_invocation_id) gid3: vec3<u32>) {
         } else if (exp_v == 0x0Fu && mant == 0x7u) {
             s = 0.0;
         } else {
-            s = (1.0 + f32(mant) / 8.0) * exp2(f32(i32(exp_v) - 7));
+            s = (1.0 + f32(mant) / 8.0) * ldexp(1.0, i32(exp_v) - 7);
         }
         if (sign_b != 0u) { s = -s; }
         let qs_rel = off + 1u;

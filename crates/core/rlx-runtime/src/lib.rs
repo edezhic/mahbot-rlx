@@ -65,6 +65,57 @@ pub fn set_param_sharing_scope(label: &str) {
     let _ = label;
 }
 
+/// `f` with [`set_param_sharing_scope`]`(label)` in force, the scope before
+/// it restored after: for a model that compiles its graphs at different times
+/// (a package's prompt function and decode step), alongside other models
+/// with their own scopes. The scope is process-wide, so compiles on other
+/// threads during `f` see it too.
+pub fn with_param_sharing_scope<R>(label: &str, f: impl FnOnce() -> R) -> R {
+    // CPU: large read-only weights on pages shared by the scope's executables
+    // (`rlx_cpu::shared_params`); `RLX_CPU_SHARED_WEIGHTS=0` keeps a copy each.
+    #[cfg(feature = "cpu")]
+    let cpu_before = rlx_ir::env::var_result("RLX_CPU_SHARED_WEIGHTS")
+        .map_or(true, |v| v != "0")
+        .then(|| {
+            let before = rlx_cpu::shared_params::scope();
+            rlx_cpu::shared_params::set_scope(Some(label.to_string()));
+            before
+        });
+    // Metal: one copy of each weight across the scope's executables, on
+    // unified memory (`rlx_metal::shared_weights`); `RLX_METAL_SHARED_WEIGHTS=0`
+    // keeps a copy per executable.
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
+    let metal_before = rlx_ir::env::var_result("RLX_METAL_SHARED_WEIGHTS")
+        .map_or(true, |v| v != "0")
+        .then(|| {
+            let before = rlx_metal::shared_weights::scope();
+            rlx_metal::shared_weights::set_scope(Some(label.to_string()));
+            before
+        });
+    #[cfg(feature = "cuda")]
+    let out = {
+        let before = rlx_cuda::vmem::scope();
+        rlx_cuda::vmem::set_scope_from_label(label);
+        let out = f();
+        rlx_cuda::vmem::set_scope(before);
+        out
+    };
+    #[cfg(not(feature = "cuda"))]
+    let out = {
+        let _ = label;
+        f()
+    };
+    #[cfg(all(feature = "metal", target_vendor = "apple", not(target_os = "watchos")))]
+    if let Some(before) = metal_before {
+        rlx_metal::shared_weights::set_scope(before);
+    }
+    #[cfg(feature = "cpu")]
+    if let Some(before) = cpu_before {
+        rlx_cpu::shared_params::set_scope(before);
+    }
+    out
+}
+
 pub mod aot_cache;
 pub mod attn_mask;
 pub mod backend;
@@ -74,6 +125,12 @@ pub mod check;
 pub mod compile_cache;
 pub mod compile_config;
 pub mod compiled;
+pub mod debug;
+pub mod io_check;
+pub mod job_slots;
+pub use io_check::{IoError, TensorInfo};
+pub mod try_compile;
+pub use try_compile::CompileError;
 // On-device (ANE) gradient-based training + MLUpdateTask eligibility probe.
 #[cfg(all(feature = "coreml", feature = "training"))]
 pub mod coreml_training;
@@ -89,6 +146,7 @@ pub mod device_parse;
 pub mod device_policy;
 /// Ship-graph distributed execution (build the worker once, run any model).
 pub mod dist;
+pub mod doctor;
 pub mod expert_pool;
 pub mod export;
 pub mod graph_io;
@@ -99,6 +157,10 @@ pub mod hwprofile_select;
 // Depends on `hwprofile_select::device_vram_bytes`, so it carries the same gate.
 #[cfg(feature = "hwprofile")]
 pub mod arena_budget;
+pub mod binding_limit;
+pub use binding_limit::{
+    binding_arena_bytes, binding_largest_tensor_bytes, device_binding_limit, device_stripe_reserve,
+};
 pub mod jacfwd;
 pub mod kernel_trace;
 pub mod kv_cache;
@@ -108,6 +170,7 @@ pub mod kv_metrics;
 pub mod kv_retention;
 pub mod lora_scheduler;
 pub mod memory_estimate;
+pub mod model;
 pub mod model_pipeline;
 pub mod moe_expert_store;
 // Pure `tracing` facade (no backend dependency) — always present so
@@ -118,8 +181,9 @@ pub mod onnx_active;
 pub mod op_registry;
 pub mod options;
 pub mod paged_kv;
-#[cfg(feature = "model-io")]
+#[cfg(feature = "rlxp")]
 pub mod pkg;
+pub mod placement;
 pub mod precision;
 pub mod precompile;
 pub mod quantized_kv;
@@ -133,6 +197,7 @@ pub mod session;
 pub mod shard_placement;
 pub mod stages;
 pub mod subgraph;
+pub mod taps;
 pub mod trace;
 /// Device-resident training: the optimizer update fused into the graph.
 #[cfg(feature = "training")]
@@ -152,6 +217,8 @@ pub mod graph_devices;
 pub mod hetero;
 pub mod hwinfo;
 pub mod lm;
+/// Host sequence search: argmax/top-k, beam search, CTC, forced alignment.
+pub use rlx_search as search;
 pub mod logit_verify;
 pub mod nan_check;
 pub mod phase;
@@ -172,7 +239,10 @@ pub use rlx_driver::{
 // Collective ops (plan #12).
 pub use aot_cache::{AotCache, AotCacheError};
 #[cfg(feature = "hwprofile")]
-pub use arena_budget::{arena_budget, device_arena_limit, fit_batch, plan_arena_bytes};
+pub use arena_budget::{
+    WGPU_32BIT_ARENA_LIMIT, arena_budget, device_arena_limit, fit_batch, fit_batch_within,
+    plan_arena_bytes,
+};
 pub use backend::{Backend, ExecutableGraph, compile_hir, compile_module};
 pub use backends_manifest::BackendsManifest;
 pub use capabilities::ExecutableCapabilities;
@@ -207,7 +277,7 @@ pub use device_policy::{
     DeviceCandidate, DeviceFallbackError, DevicePickStrategy, DevicePolicy, advisory_capabilities,
     device_chain_from_env, device_chain_from_env_key, device_from_env, device_from_env_key,
     device_report, devices_for_with_policy, resolve_device, resolve_device_chain,
-    run_with_fallback,
+    run_with_fallback, training_devices,
 };
 pub use device_router::DeviceRouter;
 pub use expert_pool::{
@@ -242,7 +312,7 @@ pub use memory_estimate::{
     would_exceed_soft_budget,
 };
 pub use model_pipeline::ModelCompilePipeline;
-pub use options::CompileOptions;
+pub use options::{CompileOptions, HalfCasts};
 pub use precision::Precision;
 pub use reflect::{ModelReflection, load_hir_template_with_extensions, specialize_entry};
 pub use registry::{BackendFactory, backend_for, register_backend, registered_devices};
@@ -282,7 +352,7 @@ pub use rlx_cpu::moe_residency::MoeResidencyStats;
 #[cfg(not(feature = "cpu"))]
 #[derive(Debug, Clone, Default)]
 pub struct MoeResidencyStats;
-#[cfg(feature = "model-io")]
+#[cfg(feature = "rlxp")]
 pub use pkg::{
     compile_rlxp, compile_rlxp_bind_params, compile_rlxp_with, load_rlxp_graph,
     load_rlxp_placement, open_rlxp, tensors_for_rank, weight_names_for_rank,
@@ -312,7 +382,7 @@ pub use rlx_ir::env::{self, RlxEnv, RuntimeOverrides};
 pub use rlx_ir::{EnvVarDoc, format_env_catalog, public_catalog_docs as ENV_CATALOG};
 /// `.rlxp` package types — re-exported so `open_rlxp`’s return type is nameable
 /// without a direct `rlx-pkg` dependency.
-#[cfg(feature = "model-io")]
+#[cfg(feature = "rlxp")]
 pub use rlx_pkg::{MaterializeMode, Package, Placement};
 pub use session::Session;
 pub use stages::{
@@ -352,7 +422,25 @@ pub use rlx_ir::{
     RngOptions, Shape, WeightBlock, apply_hir_extensions, register_hir_extension,
     registered_hir_extensions,
 };
+/// Number formats for [`CompileOptions::number_format`].
+pub use rlx_ir::{FloatFormat, FormatScaling, NumberFormat};
+/// The graph rewrite behind [`CompileOptions::number_format`], for callers that
+/// apply it to part of a graph themselves (a training forward before autodiff).
+pub use rlx_opt::rlx_compile::emulate_format;
 
 // Re-export proc macro
 pub use rlx_macros::pipeline_schedule;
 pub use rlx_macros::rlx_model;
+
+/// Opt the wgpu backend (`Device::Gpu`, including the browser's WebGPU) into
+/// fast arithmetic: native WGSL `/`, `sqrt` and `1/sqrt` instead of the
+/// correctly-rounded forms, so GPU results are no longer bit-identical to the
+/// CPU (within about 1 ULP on Metal). Exact is the default. Call before the
+/// first GPU compile; see `rlx_wgpu::set_fast_math`. Without the `gpu`
+/// feature this does nothing.
+pub fn set_gpu_fast_math(on: bool) {
+    #[cfg(feature = "gpu")]
+    rlx_wgpu::set_fast_math(on);
+    #[cfg(not(feature = "gpu"))]
+    let _ = on;
+}

@@ -36,7 +36,14 @@ const HEAD_DIM: usize = 128;
 
 /// FNV-1a 64 of the decode output on `PINNED_ADAPTER`. Any change to it is a
 /// changed rounding, not a tolerance question.
-const PINNED_DIGEST: u64 = 0x4a8b_4aa1_ea1f_dcb7;
+///
+/// Re-pinned by the 0.2.20 sync, from `0x4a8b_4aa1_ea1f_dcb7`: upstream replaced
+/// this kernel's softmax with the register-resident form, and the same change put
+/// the correctly-rounded `rlx_exp` / `rlx_rcp` helpers in place of WGSL's native
+/// `exp` / `1.0/x`. The output still agrees with the CPU reference to
+/// `max_abs ≈ 1.35e-7` on the same shape, so this is the helpers' rounding
+/// landing in the last bits rather than a change of computation.
+const PINNED_DIGEST: u64 = 0x5a73_8a91_bd04_e719;
 /// The adapter the digest was taken on, by its exact name: another adapter — an
 /// M2, a later Metal version — may round `exp` differently, so the pin asserts
 /// only where it was recorded.

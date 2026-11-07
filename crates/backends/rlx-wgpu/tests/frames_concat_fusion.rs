@@ -33,14 +33,13 @@
 //!   values: a source with rows of its own, a row `reshape` that permutes them, a
 //!   hop the rows do not share, a row with a second consumer, a graph-output row, a
 //!   complex source (its values read as the lane view the element-wise kernel would
-//!   have moved), a parameter framing the concat arm bakes, a destination the plan
-//!   places on the source's live bytes, and one graph carrying a foldable framing
-//!   *beside* a refused one, so a refusal cannot take the foldable one's route with
-//!   it. Route only, and this is the note that says so: a zero-length leading dim,
-//!   whose destination has no elements — its values are empty whatever the route
-//!   does — so its premise is the source's element count and its reading the census.
-//!   In its own binary, because its class needs one slot per tensor to be the clause
-//!   that decides: a source the split-QKV fold rewrites
+//!   have moved), a parameter framing the concat arm bakes, and one graph carrying
+//!   a foldable framing *beside* a refused one, so a refusal cannot take the
+//!   foldable one's route with it. Route only, and this is the note that says so: a
+//!   zero-length leading dim, whose destination has no elements — its values are
+//!   empty whatever the route does — so its premise is the source's element count
+//!   and its reading the census. In its own binary, because its class needs one slot
+//!   per tensor to be the clause that decides: a source the split-QKV fold rewrites
 //!   (`frames_split_qkv_source.rs`).
 //!
 //!   Read-verified rather than pinned, and this is the note that says so: the
@@ -51,8 +50,13 @@
 //!   defers a graph with dynamic dims before lowering, so the clause is a guard
 //!   rather than a route here), and the rows' range (each row is a `narrow` of the
 //!   source and the hop is uniform, so the widest row is the last one and its own
-//!   validity is the clause). The fold is a fold or nothing: a refused graph keeps
-//!   its per-frame steps and still computes the right matrix.
+//!   validity is the clause). The destination on the source's live bytes is no
+//!   longer reachable: a last-axis `Narrow` over unit leading dims is a pure view,
+//!   so the source stays live through the concat and the plan cannot place the
+//!   destination on its bytes — `a_source_read_by_the_fold_stays_live_to_the_concat`
+//!   pins that placement. The fold is a fold or nothing: a refused graph keeps its
+//!   per-frame route — zero-copy narrows and the concat's own steps — and still
+//!   computes the right matrix.
 //!
 //! * **the mode the fold's step replaced** — the fold is taken only where the
 //!   trimmed axis is the one a caller buckets: the frame axis, which is the only
@@ -571,8 +575,9 @@ fn a_consumer_of_the_fused_frames_reaches_the_cpu_answer() {
 }
 
 /// Two near-misses that are not the pattern: a hop the rows do not share, and a
-/// frame sliced for a second purpose. Both keep their per-frame steps and their
-/// values.
+/// frame sliced for a second purpose. Both keep their per-frame narrows — now
+/// zero-copy views, so they cost no step of their own — and their concat step, and
+/// their values.
 #[test]
 fn a_near_miss_keeps_the_per_frame_steps_and_the_matrix() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
@@ -599,8 +604,9 @@ fn a_near_miss_keeps_the_per_frame_steps_and_the_matrix() {
     );
     assert_eq!(
         (census.get("narrow").copied(), concat_steps(&census)),
-        (Some(n_frames), 1),
-        "the per-frame steps must be the ones left, the concat in one dispatch; census {census:?}"
+        (None, 1),
+        "the per-frame narrows are zero-copy views, so the concat is the only step left; census \
+         {census:?}"
     );
     let sig = signal(t);
     let got = WgpuExecutable::compile(g).run(&[("x", &sig)]).remove(0);
@@ -635,8 +641,9 @@ fn a_near_miss_keeps_the_per_frame_steps_and_the_matrix() {
     );
     assert_eq!(
         (census.get("narrow").copied(), concat_steps(&census)),
-        (Some(n_frames), 1),
-        "the per-frame steps must be the ones left, the concat in one dispatch; census {census:?}"
+        (None, 1),
+        "the per-frame narrows are zero-copy views, so the concat is the only step left; census \
+         {census:?}"
     );
     let got = WgpuExecutable::compile(g).run(&[("x", &sig)]).remove(0);
     assert_bit_identical(
@@ -726,7 +733,8 @@ fn a_builder_framing_over_an_input_feeds_a_consumer_with_the_cpus_answer() {
 /// frame where it stands, and the folded dispatch writes the frame matrix rather
 /// than the row the graph promises — so a consumer of that output would read a slot
 /// nothing wrote, which is the signature this stage's safety is about. The row keeps
-/// its per-frame steps, and the exposed output is the frame they write.
+/// its per-frame narrow — now a zero-copy view, so no step of its own — the concat
+/// keeps its step, and the exposed output is the frame they write.
 #[test]
 fn a_graph_output_row_refuses_the_fold() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
@@ -758,8 +766,9 @@ fn a_graph_output_row_refuses_the_fold() {
     );
     assert_eq!(
         (census.get("narrow").copied(), concat_steps(&census)),
-        (Some(n_frames), 1),
-        "the per-frame steps must be the ones left, the concat in one dispatch; census {census:?}"
+        (None, 1),
+        "the per-frame narrows are zero-copy views, so the concat is the only step left; census \
+         {census:?}"
     );
     let sig = signal(t);
     let got = WgpuExecutable::compile(g).run(&[("x", &sig)]);
@@ -1075,6 +1084,8 @@ fn a_zero_length_leading_dim_keeps_the_per_frame_steps() {
 /// Two framings of one source in one graph, one the fold takes and one it refuses:
 /// the walk is per concat, so a refusal must not take the foldable framing's route
 /// with it — and each of the two matrices must still be the one its own rows say.
+/// The refused framing's per-frame narrows are zero-copy views, so the only step it
+/// keeps is its own concat.
 #[test]
 fn a_foldable_framing_beside_a_refused_one_keeps_its_own_route() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
@@ -1109,8 +1120,9 @@ fn a_foldable_framing_beside_a_refused_one_keeps_its_own_route() {
     );
     assert_eq!(
         census.get("narrow"),
-        Some(&n_frames),
-        "the refused framing keeps one narrow per frame; census {census:?}"
+        None,
+        "the refused framing's per-frame narrows are zero-copy views and cost no step; census \
+         {census:?}"
     );
     let sig = signal(t);
     let got = WgpuExecutable::compile(g).run(&[("x", &sig)]);
@@ -1126,19 +1138,18 @@ fn a_foldable_framing_beside_a_refused_one_keeps_its_own_route() {
     );
 }
 
-/// The source's own live range: the plan can place a tensor on the source's bytes
-/// once its last reader is done, and this fold reads the source at the *concat*,
-/// later than that reader. The fixture is the reachable form of the case: an
-/// op-output source `[1, t]` whose last-axis narrows are copies — an inner-axis
-/// narrow never aliases its source, whatever the hop, so the source dies at its last
-/// narrow — with the hop wider than a frame, which makes the source wider than the
-/// destination and is what lets the planner reuse its slot for the destination, on
-/// the source's own head, where one dispatch would read words it has already
-/// written. Nothing here argues that placement: the plan below is what asserts it.
-/// The leading dim is a unit, so the rows rule does not cover this graph and this
-/// clause is the one that refuses it.
+/// The source's own live range under zero-copy views. This fixture used to be the
+/// refusal for a destination the planner placed on the source's own bytes: its
+/// last-axis narrows were copies, so the source died at its last narrow, the
+/// concat's destination reused its slot, and a folded read would have seen the
+/// destination's writes. The merged compiler's `pure_view_offset` makes a last-axis
+/// `Narrow` over unit leading dims a pure view, so the narrows alias the source and
+/// the planner keeps it live through the concat: the destination lands beside it,
+/// never on it, and the fold is taken. The pin is that placement and the values —
+/// the two slots must not overlap, one `frames` step and no `narrow` must be the
+/// whole schedule, and the matrix is the source's own values.
 #[test]
-fn a_destination_on_the_sources_bytes_refuses_the_fold() {
+fn a_source_read_by_the_fold_stays_live_to_the_concat() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         eprintln!("no wgpu adapter — skipping");
         return;
@@ -1160,14 +1171,12 @@ fn a_destination_on_the_sources_bytes_refuses_the_fold() {
     assert_eq!(
         g.node(src).shape.dims()[0].unwrap_static(),
         1,
-        "premise: the source has no rows of its own, or the rows rule below is what refuses this \
-         graph instead of the clause this pin is about"
+        "premise: the source has no rows of its own, so the rows rule does not refuse this graph"
     );
     assert!(
         hop > frame_len,
         "premise: a hop wider than a frame, so the source is wider than the destination and the \
-         planner can hand the source's own slot to the destination; that it did so is asserted \
-         from the plan below, not argued here"
+         planner has a slot to reuse; that it does not reuse it is asserted from the plan below"
     );
     let slots = planned_slots(&g, &[src, frames]);
     let (s, d) = (
@@ -1175,9 +1184,9 @@ fn a_destination_on_the_sources_bytes_refuses_the_fold() {
         slots[1].expect("premise: the destination has a slot"),
     );
     assert!(
-        d.0 < s.0 + s.1 && s.0 < d.0 + d.1,
-        "premise: the plan must place the destination on the source's bytes for this to be the \
-         case; src {}..{}, destination {}..{}",
+        !(d.0 < s.0 + s.1 && s.0 < d.0 + d.1),
+        "the view narrows keep the source live to the concat, so the destination must not be \
+         placed on its bytes; src {}..{}, destination {}..{}",
         s.0,
         s.0 + s.1,
         d.0,
@@ -1187,13 +1196,13 @@ fn a_destination_on_the_sources_bytes_refuses_the_fold() {
     let census = device_census(&g);
     assert_eq!(
         census.get("frames"),
-        None,
-        "a destination on the source's live bytes must not fold; census {census:?}"
+        Some(&1),
+        "the fold is taken now that the source is live at the concat; census {census:?}"
     );
     assert_eq!(
         census.get("narrow"),
-        Some(&n_frames),
-        "the refused framing keeps its per-frame steps; census {census:?}"
+        None,
+        "the per-frame narrows are zero-copy views and cost no step; census {census:?}"
     );
 
     let sig = signal(t);
@@ -1202,7 +1211,7 @@ fn a_destination_on_the_sources_bytes_refuses_the_fold() {
     assert_bit_identical(
         &got,
         &reference(&src_values, 1, t, &uniform_starts(n_frames, hop), frame_len),
-        "the refused framing is still the source's own values",
+        "the folded framing is the source's own values",
     );
 }
 

@@ -48,13 +48,30 @@ kernels. Canonical helpers live in `rlx-gpu-host`
 | 27 | `GgufFV5B` | 256 | 260 |
 | 28 | `GgufG8_0` | 32 | 16 |
 | 29 | `GgufPtq1_0` | 128 | 28 |
+| 30 | `Fp8E4m3B128` | 128 | 132 |
+| 31 | `Fp8E5m2B128` | 128 | 132 |
+
+`Fp8E4m3B128` / `Fp8E5m2B128` are not GGML types: they are the HF `fp8` /
+DeepSeek-V3 block layout (FP8 E4M3 / E5M2 codes, one f32 scale per 128 along K) packed into
+self-contained `f32 scale | 128 codes` blocks so it rides this path.
+`rlx_flow::formats::SafetensorsSource::fp8_packed` produces it from a
+safetensors checkpoint; the codec is `rlx_ir::lowp_codec::fp8_b128`.
+
+On Metal these are the only packed schemes that may live in the external
+weight buffer by default, so one copy serves every executable of a sharing
+scope (`rlx_runtime::with_param_sharing_scope`): both of their encode paths —
+`fp8b128_mv_f32_sg` and `dequant_gguf` — take the weight as its own buffer
+binding (`resolve_off`), and requiring GPU dequant rules out the host
+fallback, which reads the activation arena. See `is_shareable_fp8_weight` in
+`rlx-metal/src/backend/compile.rs`; another scheme can join once every path it
+takes binds the weight the same way.
 
 ⚠️ **Adding a scheme takes two edits per backend, not one.** Each
 `dequant_gguf` kernel opens with a guard that routes everything *except* an
 explicit list of small-block ids into a 256-element branch:
 
 ```c
-if (scheme_id != 6u && ... && scheme_id != 28u && scheme_id != 29u) { /* 256-elem */ }
+if (scheme_id != 6u && ... && scheme_id != 30u && scheme_id != 31u) { /* 256-elem */ }
 ```
 
 A new sub-256 scheme needs its id added to that exclusion list as well as its
@@ -63,7 +80,10 @@ own branch — three copies, in
 (shared with ROCm) and `rlx-wgpu/src/kernels/dequant_gguf.wgsl`. Miss the
 guard and the branch is unreachable: the weights decode through the wrong
 block geometry and the model degrades silently. Vulkan has no `dequant_gguf`
-path and needs neither.
+path and needs neither. wgpu has a third edit: `gguf_gpu::kernel_supports_scheme`
+lists the branched ids, and an id outside it quietly takes the host
+dequant (correct, but D2H/H2D per call); `tests/gguf_kernel_scheme_coverage.rs`
+checks the list against the WGSL branches.
 
 Note also that backends treat "has an id" as "has an on-device branch" —
 `rlx_metal::has_metal_dequant_kernel` is literally
@@ -89,9 +109,9 @@ once per device context on Metal/CUDA/ROCm/WGPU.
 | Backend | GPU dequant | Fused GEMV (`m = 1`) | On-device constexpr (ANE) | Host / compile fallback |
 |---------|-------------|----------------------|----------------------------|-------------------------|
 | **CPU** | — | block-wise fused matmul in `rlx-cpu::gguf_matmul` | — | always available |
-| **Metal** | `dequant_gguf.msl` → MPS sgemm | Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M | MIL `mul`+`sub` for K/IQ/TQ/MX (see ANE) | `RLX_METAL_DEQUANT_GPU_DISABLE=1` |
-| **CUDA / ROCm** | `dequant_gguf.cu` → BLAS | — | — | same disable pattern |
-| **WGPU** | `select_path` ladder: fused windowed kernels (`dequant_gemv_gguf` at one row, `dequant_gemm_gguf` / `dequant_gemm_q1_0` above), else `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | Q4_K, Q6_K, Q8_0 at `m == 1` (one subgroup per output column reducing inside it, the same per-scheme decode, a Q4_K row of two or more `qs` groups a lane decoding a whole group a step; `RLX_WGPU_GEMV_WIDE=shared` falls back to one workgroup per two output columns with its lanes splitting each column's contraction, Q8_0's unit its own 32-element block, so a row holds `k / 32` of them). A chunk of 1 024 columns or more whose columns are a whole number of its workgroups takes that arm's wider entry — two contiguous columns per subgroup, an accumulator each, one X read between them — and `RLX_WGPU_GEMV_ILP=0` restores the one-column entry, which a narrow Q6_K chunk (a row of two 32-element units a lane) keeps below 2 048 columns (its per-dispatch uniform and bind group are cached across frames; `RLX_WGPU_GEMV_POOL=0` rebuilds them); Q1_0 (one thread per column at `m == 1`, a tiled GEMM above). At `m > 1` Q4_K/Q6_K **and Q8_0** take the fused cooperative tile on a device with cooperative matrices (`dequant_gemm_coop_gguf.wgsl`: the packed weight decoded into a workgroup f16 stage and multiplied by the hardware matrix units with an f32 accumulator, 32-row tiles, admitted at `m >= 22` — its 32-row rounding may spend at most a third of the dispatch on rows past `m` — with `n % 128 == 0`, `k % 16 == 0`, one column chunk and at least 48 workgroups of dispatch), else the row-grouped GEMM, which is the fallback and the route everywhere without them (e.g. DX12) and whose Q4_K entry splits a starved dispatch's columns across two threads each; `RLX_WGPU_GEMM_COOP_DISABLE=1` is the bisect lever | — | `gguf_host` for a sharded arena, a parked weight, or a refused slab |
+| **Metal** | `dequant_gguf.msl` → MPS sgemm | Q4_K, Q4_0, Q4_1, Q8_0, IQ4NL, IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M (2–4 rows: the GEMV per row) | MIL `mul`+`sub` for K/IQ/TQ/MX (see ANE) | `RLX_METAL_DEQUANT_GPU_DISABLE=1` |
+| **CUDA / ROCm** | `dequant_gguf.cu` → BLAS | Q8_0, Q4_K, Q5_K, Q6_K (`dequant_matmul_gguf_gemv_elem`; 2–4 rows, a verify step's, `dequant_matmul_gguf_gemv_rows`, each row as at `m = 1`); CUDA also Q1_0, Q2_0, G8_0 | — | same disable pattern |
+| **WGPU** | `select_path` ladder: fused windowed kernels (`dequant_gemv_gguf` at one row, `dequant_gemm_gguf` / `dequant_gemm_q1_0` above), else `dequant_gguf.wgsl` → `matmul_bt`; grouped MoE GPU | Q4_K, Q6_K, Q8_0 at `m == 1` (one subgroup per output column reducing inside it, the same per-scheme decode, a Q4_K row of two or more `qs` groups a lane decoding a whole group a step; `RLX_WGPU_GEMV_WIDE=shared` falls back to one workgroup per two output columns with its lanes splitting each column's contraction, Q8_0's unit its own 32-element block, so a row holds `k / 32` of them). A chunk of 1 024 columns or more whose columns are a whole number of its workgroups takes that arm's wider entry — two contiguous columns per subgroup, an accumulator each, one X read between them — and `RLX_WGPU_GEMV_ILP=0` restores the one-column entry, which a narrow Q6_K chunk (a row of two 32-element units a lane) keeps below 2 048 columns (its per-dispatch uniform and bind group are cached across frames; `RLX_WGPU_GEMV_POOL=0` rebuilds them); Q1_0 (one thread per column at `m == 1`, a tiled GEMM above). At `m > 1` Q4_K/Q6_K **and Q8_0** take the fused cooperative tile on a device with cooperative matrices (`dequant_gemm_coop_gguf.wgsl`: the packed weight decoded into a workgroup f16 stage and multiplied by the hardware matrix units with an f32 accumulator, 32-row tiles, admitted at `m >= 22` — its 32-row rounding may spend at most a third of the dispatch on rows past `m` — with `n % 128 == 0`, `k % 16 == 0`, one column chunk and at least 24 workgroups of dispatch), else the row-grouped GEMM, which is the fallback and the route everywhere without them (e.g. DX12) and whose Q4_K entry splits a starved dispatch's columns across two threads each; `RLX_WGPU_GEMM_COOP_DISABLE=1` is the bisect lever | — | `gguf_host` for a sharded arena, a parked weight, or a refused slab |
 | **ANE (CoreML)** | hybrid host segments | — | MIL `mul` + optional `sub` | `RLX_COREML_HOST_DEQUANT=1` |
 | **TPU** | — | — | — | host dequant at HLO emit (`Constant`, `quant_param_bindings`, or runtime `set_param_typed` on deferred Param) |
 | **MLX** | Q1_0 on-device (`dequant_q1_0.metal`); other GGUF host dequant + cache | — | — | `RLX_MLX_GGUF_HOST_FALLBACK=1` / `RLX_MLX_Q1_HOST=1` |
@@ -334,6 +354,7 @@ Non-GGUF schemes still use the in-HLO `convert + scale/zp tile + dot` path.
 | Variable | Backend | Effect |
 |----------|---------|--------|
 | `RLX_METAL_DEQUANT_GPU_DISABLE=1` | Metal | Force CPU GGUF dequant |
+| `RLX_GGUF_GEMV_ELEM=0` | CUDA / ROCm | Q4_K / Q6_K decode GEMV on the older block-strided kernels, Q5_K on dequant + matmul (Q8_0 keeps the element-strided kernel) |
 | `RLX_METAL_Q4K_FUSED_DISABLE=1` | Metal | Disable Q4_K fused GEMV |
 | `RLX_METAL_Q4K_SG_DISABLE=1` | Metal | Disable simdgroup Q4_K GEMV |
 | `RLX_METAL_Q40_FUSED_DISABLE=1` | Metal | Disable Q4_0 fused GEMV |
@@ -401,7 +422,8 @@ w = f.dequant_tensor("token_embd.weight")
 
 Build with `maturin develop --features cpu,gguf-convert` (default). Optional
 `gguf-onnx` / `gguf-pt` cargo features for ONNX / PyTorch checkpoints.
-Tests: `crates/bindings/pyrlx/tests/test_gguf_*.py`; `just test-pyrlx`.
+Tests: `crates/bindings/pyrlx/tests/test_gguf_*.py` — this fork excludes that
+crate from the workspace, so they are upstream's and are not built or run here.
 7. Parity test (Metal / WGPU / runtime integration as appropriate).
 8. Refresh this doc and [op-coverage.md](op-coverage.md).
 ## License

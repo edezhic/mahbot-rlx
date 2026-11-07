@@ -17,7 +17,8 @@
 //! bake, env toggles): [`docs/gguf-backend-paths.md`](../../docs/gguf-backend-paths.md).
 
 use crate::NodeId;
-use std::collections::HashMap;
+use crate::collections::HashMap;
+use crate::prelude::*;
 
 /// How a tensor is quantized. Mirrors the schemes RLX needs for LLM
 /// inference on Apple Silicon: blockwise int8 (GPTQ-style),
@@ -154,6 +155,24 @@ pub enum QuantScheme {
     /// matmul against them is only correct if the activation gets the
     /// matching `prism.hadamard` transform first.
     GgufPtq1_0,
+    /// A GGUF `BF16` tensor kept as its own 2-byte values instead of being
+    /// widened to f32 — the upper half of an f32, so exact. Consumed by
+    /// `Op::DequantMatMul` like a GGUF block quant whose block is one element
+    /// (two inputs, GGUF row order `[out, in]`; [`Self::is_gguf`] is true).
+    /// It has no shared `gpu_dequant_scheme_id`: rlx-cpu and rlx-wgpu (under
+    /// a backend-local id) read it, other backends reject it.
+    GgufBF16,
+    /// FP8 **E4M3** weights with one f32 scale per 128 elements along K —
+    /// the HF `fp8` / DeepSeek-V3 / Qwen3-FP8 block layout (128×128 blocks
+    /// repeat their scale down the rows; per-channel and per-tensor scales
+    /// repeat it along K). Each 132-byte block is `f32 scale | 128 codes`,
+    /// row-major `[out, in]` like a GGUF block quant, so it rides that path
+    /// ([`Self::is_gguf`]); it is not a GGML type. `w = decode(code)·scale`.
+    /// Pack and dequant: [`crate::lowp_codec::fp8_b128`].
+    Fp8E4m3B128,
+    /// [`Self::Fp8E4m3B128`] with FP8 **E5M2** codes (wider range, one
+    /// mantissa bit fewer). Same 132-byte block.
+    Fp8E5m2B128,
 }
 
 /// Single source of truth for GGUF → GPU `dequant_gguf` scheme ids.
@@ -243,6 +262,8 @@ impl QuantScheme {
             Self::GgufFV5B => 81,   // 260 bytes / 256 elems × 8 = 8.125 bpe
             Self::GgufG8_0 => 40,   // 16 bytes / 32 elems × 8 = 4.0 bpe
             Self::GgufPtq1_0 => 17, // 28 bytes / 128 elems × 8 = 1.75 bpe
+            Self::GgufBF16 => 160,
+            Self::Fp8E4m3B128 | Self::Fp8E5m2B128 => 82, // 132 / 128 × 8 = 8.25 bpe
         }
     }
 
@@ -290,6 +311,8 @@ impl QuantScheme {
         // without them reads the weights as zeros and degrades the model
         // silently rather than failing.
         (GgufPtq1_0, 29),
+        (Fp8E4m3B128, 30),
+        (Fp8E5m2B128, 31),
     }
 
     /// True if this scheme requires a per-block scale tensor on the side.
@@ -403,6 +426,8 @@ impl QuantScheme {
             Self::GgufQ2_0 => 128,
             Self::GgufG8_0 => 32,
             Self::GgufPtq1_0 => 128,
+            Self::GgufBF16 => 1,
+            Self::Fp8E4m3B128 | Self::Fp8E5m2B128 => 128,
             _ => 0,
         }
     }
@@ -440,6 +465,8 @@ impl QuantScheme {
             Self::GgufFV5B => 260,  // f32 s + 256 int8 (256 elems)
             Self::GgufG8_0 => 16,   // 4 bf16 scales + 32×2-bit codes (32 elems)
             Self::GgufPtq1_0 => 28, // 24B qs + 2B qh base-3 trits + f16 scale (128 elems)
+            Self::GgufBF16 => 2,
+            Self::Fp8E4m3B128 | Self::Fp8E5m2B128 => 132, // f32 scale + 128 FP8 codes
             _ => 0,
         }
     }
@@ -481,12 +508,15 @@ impl QuantScheme {
                 | Self::GgufFV5B
                 | Self::GgufG8_0
                 | Self::GgufPtq1_0
+                | Self::GgufBF16
+                | Self::Fp8E4m3B128
+                | Self::Fp8E5m2B128
         )
     }
 }
 
-impl std::fmt::Display for QuantScheme {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for QuantScheme {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Int8Block { block_size } => write!(f, "int8/{block_size}"),
             Self::Int8BlockAsym { block_size } => write!(f, "int8a/{block_size}"),
@@ -530,6 +560,9 @@ impl std::fmt::Display for QuantScheme {
             Self::GgufFV5B => write!(f, "gguf_fv5b"),
             Self::GgufG8_0 => write!(f, "gguf_g8_0"),
             Self::GgufPtq1_0 => write!(f, "gguf_ptq1_0"),
+            Self::GgufBF16 => write!(f, "gguf_bf16"),
+            Self::Fp8E4m3B128 => write!(f, "fp8e4m3_b128"),
+            Self::Fp8E5m2B128 => write!(f, "fp8e5m2_b128"),
         }
     }
 }
@@ -801,8 +834,8 @@ impl ScaledFormat {
     }
 }
 
-impl std::fmt::Display for ScaledFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ScaledFormat {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = match self {
             Self::F8E4M3 => "f8e4m3",
             Self::F8E5M2 => "f8e5m2",
@@ -831,7 +864,7 @@ impl std::fmt::Display for ScaledFormat {
     }
 }
 
-impl std::str::FromStr for ScaledFormat {
+impl core::str::FromStr for ScaledFormat {
     type Err = String;
 
     /// Parse a format name. The seven named formats (`"f8e4m3"`, `"f4e2m1"`,
@@ -929,8 +962,8 @@ impl ScaleLayout {
     }
 }
 
-impl std::fmt::Display for ScaleLayout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ScaleLayout {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::PerTensor => write!(f, "per_tensor"),
             Self::BlockMxE8M0 { block } => write!(f, "mx_e8m0/{block}"),
@@ -939,7 +972,7 @@ impl std::fmt::Display for ScaleLayout {
     }
 }
 
-impl std::str::FromStr for ScaleLayout {
+impl core::str::FromStr for ScaleLayout {
     type Err = String;
 
     /// Parse a scale-layout name: `"per_tensor"`, `"mx"` (32-element E8M0
@@ -1017,7 +1050,9 @@ mod tests {
     #[test]
     fn gpu_dequant_scheme_id_is_stable() {
         use QuantScheme::*;
-        assert_eq!(QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS.len(), 30);
+        assert_eq!(QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS.len(), 32);
+        assert_eq!(Fp8E4m3B128.gpu_dequant_scheme_id(), Some(30));
+        assert_eq!(Fp8E5m2B128.gpu_dequant_scheme_id(), Some(31));
         for &(scheme, id) in QuantScheme::GPU_DEQUANT_SCHEME_ID_PAIRS {
             assert_eq!(scheme.gpu_dequant_scheme_id(), Some(id), "{scheme:?}");
             assert_eq!(

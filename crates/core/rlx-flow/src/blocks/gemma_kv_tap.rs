@@ -32,6 +32,9 @@ pub struct GemmaKvTapStage {
     pub n_rot: usize,
     pub rope_table: Option<String>,
     pub k_eq_v: bool,
+    /// Per-head K (and V) norms, as in the attention block; the cache must
+    /// hold the same K/V the attention computes.
+    pub head_norm: Option<super::HeadNormSpec>,
     pub outputs: Arc<Mutex<Vec<rlx_ir::HirNodeId>>>,
 }
 
@@ -50,6 +53,7 @@ impl GemmaKvTapStage {
             n_rot: head_dim,
             rope_table: None,
             k_eq_v: false,
+            head_norm: None,
             outputs: sink,
         }
     }
@@ -73,6 +77,12 @@ impl GemmaKvTapStage {
         self.k_eq_v = true;
         self
     }
+
+    /// Normalize K (and V) per head before caching — Gemma 3/4.
+    pub fn with_head_norm(mut self, norm: super::HeadNormSpec) -> Self {
+        self.head_norm = Some(norm);
+        self
+    }
 }
 
 impl BlockStage for GemmaKvTapStage {
@@ -80,11 +90,20 @@ impl BlockStage for GemmaKvTapStage {
         let lp = &self.layer_prefix;
         let (cos, sin) = super::self_attn::resolve_rope_handles(ctx, self.rope_table.as_deref())?;
 
-        let k_w = ctx.load_param(&format!("{lp}.self_attn.k_proj.weight"), true)?;
+        let k_w = ctx.load_matrix(&format!("{lp}.self_attn.k_proj.weight"), true)?;
         let v_w = if self.k_eq_v {
             None
         } else {
-            Some(ctx.load_param(&format!("{lp}.self_attn.v_proj.weight"), true)?)
+            Some(ctx.load_matrix(&format!("{lp}.self_attn.v_proj.weight"), true)?)
+        };
+
+        let norms = match &self.head_norm {
+            Some(n) => Some(super::self_attn::LoadedHeadNorms::load(
+                ctx,
+                n,
+                self.head_dim,
+            )?),
+            None => None,
         };
 
         let mut gb = HirMut::new(ctx.hir());
@@ -93,6 +112,10 @@ impl BlockStage for GemmaKvTapStage {
         let v = match v_w {
             Some(w) => gb.mm(input.id, w),
             None => k,
+        };
+        let (k, v) = match &norms {
+            Some(n) => (n.k(&mut gb, k), n.v(&mut gb, v)),
+            None => (k, v),
         };
         let k_rope = gb.rope_n(k, cos, sin, self.head_dim, self.n_rot);
 

@@ -39,6 +39,10 @@ pub struct GemmaDecodeLayerSpec {
     pub mask: MaskKind,
     pub score_scale: Option<f32>,
     pub attn_logit_softcap: Option<f32>,
+    /// With `use_custom_mask`: the named value (`state.named`) this layer
+    /// masks with instead of the step's mask, a sliding layer's windowed
+    /// one. `None` ⇒ the step's.
+    pub mask_input: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,10 +112,22 @@ impl BlockStage for GemmaDecodeLayerStage {
             Shape::new(&[in_ln_len], DType::F32),
         );
 
-        let pre_ffn_key = if matches!(
-            style,
-            GemmaLayerStyle::Gemma2 | GemmaLayerStyle::Gemma3 | GemmaLayerStyle::Gemma4
-        ) {
+        // Gemma 2/3/4 normalize the attention output before the residual add.
+        let post_attn_norm = if style.sandwich_norms() {
+            let key = format!("{lp}.post_attention_layernorm");
+            let w = ctx.load_param(&format!("{key}.weight"), false)?;
+            let len = norm_len(ctx, w)?;
+            let ones = ctx.synth_param(
+                &format!("{key}.ones"),
+                vec![1.0f32; len],
+                Shape::new(&[len], DType::F32),
+            );
+            Some((w, ones))
+        } else {
+            None
+        };
+
+        let pre_ffn_key = if style.sandwich_norms() {
             format!("{lp}.pre_feedforward_layernorm")
         } else {
             format!("{lp}.post_attention_layernorm")
@@ -124,10 +140,7 @@ impl BlockStage for GemmaDecodeLayerStage {
             Shape::new(&[pre_ffn_len], DType::F32),
         );
 
-        let post_ffn = if matches!(
-            style,
-            GemmaLayerStyle::Gemma2 | GemmaLayerStyle::Gemma3 | GemmaLayerStyle::Gemma4
-        ) {
+        let post_ffn = if style.sandwich_norms() {
             let post_key = format!("{lp}.post_feedforward_layernorm");
             let w = ctx.load_param(&format!("{post_key}.weight"), false)?;
             let len = norm_len(ctx, w)?;
@@ -141,17 +154,32 @@ impl BlockStage for GemmaDecodeLayerStage {
             None
         };
 
-        let q_w = ctx.load_param(&format!("{lp}.self_attn.q_proj.weight"), true)?;
-        let k_w = ctx.load_param(&format!("{lp}.self_attn.k_proj.weight"), true)?;
+        let q_w = ctx.load_matrix(&format!("{lp}.self_attn.q_proj.weight"), true)?;
+        let k_w = ctx.load_matrix(&format!("{lp}.self_attn.k_proj.weight"), true)?;
         let v_w = if spec.k_eq_v {
             None
         } else {
-            Some(ctx.load_param(&format!("{lp}.self_attn.v_proj.weight"), true)?)
+            Some(ctx.load_matrix(&format!("{lp}.self_attn.v_proj.weight"), true)?)
         };
-        let o_w = ctx.load_param(&format!("{lp}.self_attn.o_proj.weight"), true)?;
-        let gate_w = ctx.load_param(&format!("{lp}.mlp.gate_proj.weight"), true)?;
-        let up_w = ctx.load_param(&format!("{lp}.mlp.up_proj.weight"), true)?;
-        let down_w = ctx.load_param(&format!("{lp}.mlp.down_proj.weight"), true)?;
+        let o_w = ctx.load_matrix(&format!("{lp}.self_attn.o_proj.weight"), true)?;
+        let gate_w = ctx.load_matrix(&format!("{lp}.mlp.gate_proj.weight"), true)?;
+        let up_w = ctx.load_matrix(&format!("{lp}.mlp.up_proj.weight"), true)?;
+        let down_w = ctx.load_matrix(&format!("{lp}.mlp.down_proj.weight"), true)?;
+
+        let head_norms = match style.head_norm(lp, spec.eps) {
+            Some(n) => Some(super::self_attn::LoadedHeadNorms::load(
+                ctx,
+                &n,
+                spec.head_dim,
+            )?),
+            None => None,
+        };
+        // See `gemma_prefill_layer_composed`: Gemma 4's per-layer output scalar.
+        let layer_scalar = if style == GemmaLayerStyle::Gemma4 {
+            ctx.load_param(&format!("{lp}.layer_scalar"), false).ok()
+        } else {
+            None
+        };
 
         let past_k = decode.past_k[self.layer_idx];
         let past_v = decode.past_v[self.layer_idx];
@@ -176,6 +204,13 @@ impl BlockStage for GemmaDecodeLayerStage {
             (decode.cos, decode.sin)
         };
 
+        // A layer's own mask (a sliding layer's windowed one), by name.
+        let named_mask = match spec.mask_input.as_deref() {
+            Some(name) => Some(ctx.state.named.get(name).copied().ok_or_else(|| {
+                anyhow::anyhow!("Gemma decode layer masks with `{name}`, which is not bound")
+            })?),
+            None => None,
+        };
         let mut gb = HirMut::new(ctx.hir());
         let in_gamma = gb.add(in_ln_ones, in_ln_w);
         let normed_in = gb.rms_norm(input.id, in_gamma, zero_beta, spec.eps);
@@ -184,6 +219,10 @@ impl BlockStage for GemmaDecodeLayerStage {
         let v = match v_w {
             Some(w) => gb.mm(normed_in, w),
             None => k,
+        };
+        let (q, k, v) = match &head_norms {
+            Some(n) => (n.q(&mut gb, q), n.k(&mut gb, k), n.v(&mut gb, v)),
+            None => (q, k, v),
         };
         let q_rope = gb.rope_n(q, decode_cos, decode_sin, spec.head_dim, spec.n_rot);
         let k_rope = gb.rope_n(k, decode_cos, decode_sin, spec.head_dim, spec.n_rot);
@@ -210,10 +249,30 @@ impl BlockStage for GemmaDecodeLayerStage {
 
         let attn_shape = shape::attention_shape(gb.shape(q_rope));
         let attn = if spec.use_custom_mask {
-            let mask = decode
-                .mask
-                .ok_or_else(|| anyhow::anyhow!("custom mask requested but not bound"))?;
-            gb.attention_(q_rope, k_rep, v_rep, mask, spec.num_heads, spec.head_dim)
+            let mask = match named_mask {
+                Some(m) => m,
+                None => decode
+                    .mask
+                    .ok_or_else(|| anyhow::anyhow!("custom mask requested but not bound"))?,
+            };
+            if spec.score_scale.is_none() && spec.attn_logit_softcap.is_none() {
+                gb.attention_(q_rope, k_rep, v_rep, mask, spec.num_heads, spec.head_dim)
+            } else {
+                // Gemma 2's `query_pre_attn_scalar` and logit soft-cap hold
+                // under the caller's mask too.
+                gb.0.mir(
+                    rlx_ir::ops::attention::attention_kind_op(
+                        spec.num_heads,
+                        spec.head_dim,
+                        None,
+                        MaskKind::Custom,
+                        spec.score_scale,
+                        spec.attn_logit_softcap,
+                    ),
+                    vec![q_rope, k_rep, v_rep, mask],
+                    attn_shape,
+                )
+            }
         } else {
             gb.attention_kind_opts(
                 q_rope,
@@ -228,7 +287,11 @@ impl BlockStage for GemmaDecodeLayerStage {
             )
         };
 
-        let attn_out = gb.mm(attn, o_w);
+        let mut attn_out = gb.mm(attn, o_w);
+        if let Some((w, ones)) = post_attn_norm {
+            let gamma = gb.add(ones, w);
+            attn_out = gb.rms_norm(attn_out, gamma, zero_beta, spec.eps);
+        }
         let post_attn = gb.add(input.id, attn_out);
 
         let pre_gamma = gb.add(pre_ffn_ones, pre_ffn_w);
@@ -244,7 +307,10 @@ impl BlockStage for GemmaDecodeLayerStage {
             h = gb.rms_norm(h, post_gamma, zero_beta, spec.eps);
         }
 
-        let out_id = gb.add(post_attn, h);
+        let mut out_id = gb.add(post_attn, h);
+        if let Some(scalar) = layer_scalar {
+            out_id = gb.mul(out_id, scalar);
+        }
         Ok(Some(ctx.wrap(out_id, spec.hidden_shape.clone())))
     }
 }
