@@ -123,6 +123,15 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     fn bind_gpu_handle(&mut self, name: &str, data: &[f32]) -> bool {
         self.inner.bind_gpu_handle(name, data)
     }
+    fn write_gpu_handle_rows(
+        &mut self,
+        name: &str,
+        row: usize,
+        row_elems: usize,
+        rows: &[f32],
+    ) -> bool {
+        self.inner.write_gpu_handle_rows(name, row, row_elems, rows)
+    }
     fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
         self.inner.register_kv_row_feed(handle_name, output_index)
     }

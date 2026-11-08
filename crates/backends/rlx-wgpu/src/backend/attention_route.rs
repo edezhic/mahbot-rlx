@@ -234,14 +234,12 @@ pub(crate) const ATTENTION_DECOMPOSE_MAX_HEAD_DIM: u32 = 512;
 /// allocation this backend does not have.
 ///
 /// [`crate::backend::compute_scratch_bytes`]
-/// raises the tail reserve to an admitted plan's own [`AttentionPlan::scratch_bytes`],
-/// so the cap is what decides admission and the 64 MiB floor stays the minimum
-/// every graph is guaranteed — no graph is sized below the plan it takes. The
-/// floor is not moved with the cap: a 512 MiB tail on every graph makes a
-/// small-shard arena stripe a tail it never writes and refuse on the stripe bound
-/// (`sharded_arena`'s forced-small-shard case), for no gain. The cap is therefore
-/// safe only because the floor still sizes every graph to the plan it takes; a cap
-/// moved without that reserve would admit a plan eight times the guaranteed tail.
+/// books an admitted plan's own [`AttentionPlan::scratch_bytes`] as the tail, so
+/// every admitted plan is sized by itself and this cap is what decides admission —
+/// the floor under the tail is gone. The cap is not turned into a floor every graph
+/// pays: a 512 MiB tail on every graph makes a small-shard arena stripe a tail it
+/// never writes and refuse on the stripe bound (`sharded_arena`'s forced-small-shard
+/// case), for no gain.
 ///
 /// Measured on an 8 192-key pass at four `(batch, head)` tiles (Apple M3 Pro /
 /// Metal): 362.6 s under the 64 MiB cap against tens of seconds under this one,

@@ -20,10 +20,16 @@ use crate::buffer::{Arena, ReadbackStaging, TinyReadbackStaging};
 use crate::device::wgpu_device;
 use crate::kernels::{GatherParams, Kernel, gather_split_kernel, matmul_coop_f16_vulkan_kernel};
 
-/// Compute the maximum tail-scratch bytes any single op needs across
-/// the graph: `Op::LayerNormBackwardGamma`'s partial sums, norm staging,
-/// and `Op::Sample`'s per-row working area (it reads its logits and must
-/// not overwrite them).
+/// The largest tail working area any single op in `graph` claims: norm
+/// staging (gamma/beta copied next to the activations), `Op::LayerNormBackwardGamma`'s
+/// partial sums, `Op::Sample`'s per-row area (it reads its logits and must not
+/// overwrite them), an admitted attention plan's own `scratch_bytes()`, and the
+/// fixed slot `Compare`/`Where`/`Fma` copy an out-of-window `Op::Param` into.
+///
+/// This is what the ops claim, not insurance: a graph that binds whole gets exactly
+/// this much tail. The arena adds the two reserves only it can size — a parked
+/// parameter's staging copy and a far operand's — from the arena it builds; see
+/// [`crate::buffer::Arena::from_plan_split_opts`], which is where that rule lives.
 pub(crate) fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
     const ROWS_PER_WG: u32 = 16;
     let mut max_bytes = 0usize;
@@ -92,19 +98,41 @@ pub(crate) fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
         if attn > max_bytes {
             max_bytes = attn;
         }
+        // `Compare`, `Where` and `Fma` copy an operand that lies outside the
+        // output's window into a *fixed* slot at `Arena::scratch_off`
+        // (`elementwise_stage_slot` in `compile/lower.rs`), operand `i` at
+        // `scratch_off + Σ align(len_j)` over the ones before it. Book the whole aligned
+        // operand sum: a staged operand's destination depends on every earlier operand's
+        // length, and with a zero tail the slot would sit at arena offset 0 and clobber
+        // live data. Only an operand in a parameter's storage can be outside the window
+        // when the arena binds whole — an activation is always in it — so that is what
+        // enters the arm (`buffer::is_parameter_storage`, the planner's view chain).
+        //
+        // The trade: when one operand is a parameter's but the parameter stayed in the
+        // activation arena, nothing stages and this still books every operand's slot.
+        // The lowering lays the slots out cumulatively, so which one moves is not
+        // knowable here, and a graph with none of these three ops — or none with such
+        // an operand — pays nothing at all.
+        if matches!(&node.op, Op::Compare(_) | Op::Where | Op::Fma)
+            && node
+                .inputs
+                .iter()
+                .any(|&i| crate::buffer::is_parameter_storage(graph, i))
+        {
+            let mut bytes = 0usize;
+            for &input in &node.inputs {
+                // The slot the copy lands in is the operand's own
+                // (`buffer::actual_slot_bytes`); a graph that reaches here is static —
+                // `compile_rng` defers one with a dynamic dim — so every operand has a
+                // count.
+                bytes += crate::buffer::actual_slot_bytes(graph.node(input)).div_ceil(256) * 256;
+            }
+            if bytes > max_bytes {
+                max_bytes = bytes;
+            }
+        }
     }
-    // Reserve extra scratch for staging small far-apart operands when the
-    // arena exceeds wgpu's binding window. This keeps compile-time simple
-    // and avoids per-op scratch sizing plumbing.
-    //
-    // The floor is the minimum every graph is guaranteed, not the route's cap:
-    // an admitted plan raises `max_bytes` to its own `scratch_bytes()` above.
-    // Raising the floor instead would make every graph reserve (and, under a
-    // small shard cap, stripe) the cap-sized tail it never writes, and
-    // `sharded_arena`'s forced-small-shard case then refuses on the stripe bound.
-    // The measurements behind the cap live on
-    // `attention_route::ATTENTION_DECOMPOSE_MAX_SCRATCH_BYTES`.
-    max_bytes.max(64 * 1024 * 1024)
+    max_bytes
 }
 
 /// Shared ephemeral state for `Op::GatedDeltaNet` with `carry_state=false`
@@ -1488,20 +1516,27 @@ impl WgpuExecutable {
     }
 
     /// The `(byte_off, byte_len)` of one arena row of the slot `id`, bounded by
-    /// the extent it declares — the one place a row's arena address is computed,
-    /// so the KV feed's row and the two read paths cannot disagree on which
-    /// bytes a row is. A slot this executable does not hold declares no rows, so
-    /// every row of it is out of extent.
+    /// the extent it declares — [`Self::arena_span_range`] with the row's own
+    /// address and width, so the KV feed's row and the read paths cannot disagree
+    /// on which bytes a row is.
     fn arena_row_range(&self, id: NodeId, row: usize, row_inner: usize) -> Option<(usize, usize)> {
-        let (start, end) = Self::row_bounds(row, row_inner)?;
-        if end > self.extent_elems(id) {
+        self.arena_span_range(id, row.checked_mul(row_inner)?, row_inner)
+    }
+
+    /// The `(byte_off, byte_len)` of `len` f32 at `start` of the slot `id`, bounded
+    /// by the extent it declares: the one place an arena span's address and bounds
+    /// are computed, so the row feed, the reads and the row write cannot disagree
+    /// about which bytes are a slot's. A slot this executable does not hold declares
+    /// no rows, so every span of it is out of extent.
+    fn arena_span_range(&self, id: NodeId, start: usize, len: usize) -> Option<(usize, usize)> {
+        if len == 0 {
+            return None;
+        }
+        if start.checked_add(len)? > self.extent_elems(id) {
             return None;
         }
         let f32_bytes = std::mem::size_of::<f32>();
-        Some((
-            self.arena.offset(id) + start * f32_bytes,
-            row_inner * f32_bytes,
-        ))
+        Some((self.arena.offset(id) + start * f32_bytes, len * f32_bytes))
     }
 
     /// Read one row (`row_inner` f32 elements at `row`) of a named handle,
@@ -3178,6 +3213,9 @@ fn arena_off_in_window_or_stage(
             }
             *base = win_shard * s;
             *size = s.min(max_binding).max(256);
+            // The last stripe is shorter than `shard_size`, so a whole-stripe
+            // window over-requests past the buffer there.
+            arena_clamp_bind_window(arena, base, size);
             arena_ensure_scratch_for_window(arena, scratch, *base, *size);
             let stage_begin = arena.shard_stage_off(*base as usize) as u64;
             let stage_end = arena.shard_stage_end(*base as usize) as u64;
@@ -6336,9 +6374,9 @@ mod conv_route_decision_tests {
     }
 
     /// The col reservation is sized from the shapes the floor admits and dropped by
-    /// the two caps the planner applies, over a tail floored at 64 MiB. The binding
-    /// half is driven with a caller-supplied limit, so it is reachable without an
-    /// adapter under the arena.
+    /// the two caps the planner applies, over the tail the graph's own ops claim. The
+    /// binding half is driven with a caller-supplied limit, so it is reachable without
+    /// an adapter under the arena.
     #[test]
     fn the_col_reservation_follows_the_shape_and_the_binding_window() {
         let (band, col_elems) = band_graph();
@@ -6374,9 +6412,10 @@ mod conv_route_decision_tests {
             conv_graph(c_in, im2col_min_cout() as usize, [1, w], [5, 5], [2, 2]);
         assert!(huge_elems.expect("floor-clearing shape") * 4 > CONV_IM2COL_MAX_COL_BYTES);
         assert_eq!(conv_im2col_scratch_bytes(&huge, 0, u64::MAX, false), 0);
-        // …and the tail the panel is reserved in is floored at 64 MiB, the base every
-        // recorded `expected_col_delta` in the route harness is measured against.
-        assert_eq!(compute_scratch_bytes(&band), 64 * 1024 * 1024);
+        // …and the fixture graph's ops claim no tail of their own: it is one conv
+        // node over an input and a parameter, none of which stages a working area,
+        // so the col panel is the whole of its tail.
+        assert_eq!(compute_scratch_bytes(&band), 0);
     }
 
     /// The panel reservation is one panel per image: the batch axis is the panel's
@@ -6603,5 +6642,92 @@ mod conv_route_decision_tests {
             [3, 3],
             [1, 1],
         )
+    }
+}
+
+#[cfg(test)]
+mod staged_operand_tests {
+    use super::*;
+    use rlx_ir::{DType, GraphExt, Shape};
+
+    /// The `Compare`/`Where`/`Fma` staging arm: these three arms copy an operand that
+    /// lies outside the output's window into a fixed slot at the arena tail, so the
+    /// whole aligned operand sum is booked. An operand that is a parameter *or a view
+    /// of one* enters the arm — the lowering stages it by where it sits, not by what
+    /// its node is called — while a graph whose operands are all activations pays
+    /// nothing.
+    #[test]
+    fn a_staged_elementwise_operand_is_booked() {
+        const N: usize = 1000;
+        let aligned = |elems: usize| (elems * 4).div_ceil(256) * 256;
+        let flat = Shape::new(&[N], DType::F32);
+        let square = Shape::new(&[10, 100], DType::F32);
+        // The operand `Compare` reads against an activation: the activation itself, a
+        // parameter, or a rank-2 view of a parameter.
+        let build = |operand: &str| {
+            let mut g = Graph::new("staged_operand");
+            let a = g.input("a", square.clone());
+            let b = g.input("b", square.clone());
+            let p = g.param(
+                "p",
+                if operand == "view" {
+                    flat.clone()
+                } else {
+                    square.clone()
+                },
+            );
+            let x = match operand {
+                "activation" => b,
+                "parameter" => p,
+                "view" => g.reshape_(p, vec![10, 100]),
+                other => panic!("no operand {other:?}"),
+            };
+            g.add_node(
+                Op::Compare(rlx_ir::op::CmpOp::Eq),
+                vec![a, x],
+                Shape::new(&[10, 100], DType::Bool),
+            );
+            g
+        };
+        assert_eq!(
+            compute_scratch_bytes(&build("activation")),
+            0,
+            "two activations are inside the window the arena binds whole"
+        );
+        assert_eq!(
+            compute_scratch_bytes(&build("parameter")),
+            2 * aligned(N),
+            "a parameter operand is staged past its neighbour"
+        );
+        assert_eq!(
+            compute_scratch_bytes(&build("view")),
+            2 * aligned(N),
+            "a view of a parameter is staged exactly as the parameter is"
+        );
+        // `Where` carries three operands, so its slot covers all three.
+        let mut g = Graph::new("staged_where");
+        let c = g.input("c", Shape::new(&[N], DType::Bool));
+        let a = g.input("a", flat.clone());
+        let p = g.param("p", flat.clone());
+        g.add_node(Op::Where, vec![c, a, p], Shape::new(&[N], DType::F32));
+        assert_eq!(compute_scratch_bytes(&g), 3 * aligned(N));
+
+        // A narrowed view of a parameter is a parameter's storage by the planner's own
+        // view chain, and that is the rule the arm keys on — a predicate that walked only
+        // cast/reshape/transpose would miss it and stage onto a zero tail.
+        let mut g = Graph::new("staged_narrow");
+        let a = g.input("a", flat.clone());
+        let p = g.param("p", Shape::new(&[2 * N], DType::F32));
+        let v = g.narrow_(p, 0, N, N);
+        g.add_node(
+            Op::Compare(rlx_ir::op::CmpOp::Eq),
+            vec![a, v],
+            Shape::new(&[N], DType::Bool),
+        );
+        assert_eq!(
+            compute_scratch_bytes(&g),
+            2 * aligned(N),
+            "a narrowed view of a parameter is booked like the parameter itself"
+        );
     }
 }

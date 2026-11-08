@@ -222,8 +222,8 @@ const CONV1X7: [BodyConv; 15] = [
     // The same slot-0 lift as `overlap-slot0`, but in the band the previous floor move
     // (2048 → 800) opened: out 1000 clears the 800 floor, so this row leaves the `one_d`
     // tiled route for the materialised one (`overlap-slot0`'s 4000 was already im2col at
-    // the old floor, so it cannot census that move). Col 1 792 000 B — under the 64 MiB
-    // base scratch, so it costs the arena nothing.
+    // the old floor, so it cannot census that move). Col 1 792 000 B, the whole of
+    // this row's tail now that no floor sits under it.
     BodyConv {
         label: "lift-slot0-l1000",
         c_in: 64,
@@ -386,11 +386,9 @@ const CONV1X1: [BodyConv; 5] = [
 ///
 /// `map-3x3-29x29-c32` is the smallest ordinary one: extent 841 just over the floor
 /// of 800, `c_in*kh*kw` 288 just over the K floor, `c_out` on its floor.
-/// `map-3x3-40x40` is the ordinary case (spatial 1600, col 3.7 MB — under the 64 MiB
-/// base scratch, so the shape costs the arena nothing); `map-5x5-30x30-c1024` carries
-/// the same band with a col panel past that base (`c_in*kh*kw*spatial*4` = 92 MB), so
-/// its reservation does grow the tail, by `col − 64 MiB`, exactly as any qualifying
-/// conv above the floor already did.
+/// `map-3x3-40x40` is the ordinary case (spatial 1600, col 3.7 MB, its whole tail);
+/// `map-5x5-30x30-c1024` carries the same band with a larger col panel
+/// (`c_in*kh*kw*spatial*4` = 92 MB), exactly as any qualifying conv above the floor.
 const CONV2D: [BodyConv; 4] = [
     BodyConv {
         label: "map-3x3-29x29-c32",
@@ -434,7 +432,7 @@ const CONV2D: [BodyConv; 4] = [
     // stride-1 or a unit-height lift, and the mirrored relabel can never serve two real
     // taps (it needs `kernel_size[0] == 1`), so without this row the materialised route
     // has no coverage at all for a strided padded map. Col 576 × 208 × 4 = 479 232 B,
-    // under the 64 MiB base scratch, so the shape costs the arena nothing.
+    // the whole of the shape's tail.
     BodyConv {
         label: "map-3x3-s2-31x25-c64",
         c_in: 64,
@@ -858,42 +856,51 @@ fn fmt_delta(d: f32) -> String {
 }
 
 /// The arena bytes each row's col reservation costs, recorded from a run of this
-/// harness rather than recomputed here: the tail scratch is `max(existing, col)`,
-/// and `compute_scratch_bytes` floors the existing half at 64 MiB, so a col under
-/// that base costs nothing and a larger one costs `col − 64 MiB`. A row that
+/// harness rather than recomputed here: the tail is `max(what the graph's own ops
+/// claim, col)`, and each fixture is one conv node with no op that claims a tail, so
+/// a shape-qualifying conv costs exactly its own col, 256-byte aligned. A row that
 /// qualifies for no accelerated route by shape reserves nothing. The reservation's
-/// arithmetic — the col a shape gives, both caps the planner applies to it and the
-/// 64 MiB tail base — is pinned device-free by `backend::conv_route_decision_tests`;
-/// what the numbers below add is that arithmetic against these exact fixtures. An
-/// unlisted label panics rather than recording a silent zero, so a renamed or added
-/// fixture cannot assert nothing.
+/// arithmetic — the col a shape gives and both caps the planner applies to it — is
+/// pinned device-free by `backend::conv_route_decision_tests`; what the numbers
+/// below add is that arithmetic against these exact fixtures. An unlisted label
+/// panics rather than recording a silent zero, so a renamed or added fixture cannot
+/// assert nothing.
 fn expected_col_delta(label: &str) -> u64 {
     match label {
-        // 86 016 000 B col − 64 MiB.
-        "dense-l16000" => 18_907_136,
-        // 92 160 000 B col − 64 MiB, the in-band 2-D map.
-        "map-5x5-30x30-c1024" => 25_051_136,
-        // Nothing to reserve — the col fits the 64 MiB base tail, the shape's gates
-        // leave it off every accelerated route and no col is asked of it at all, or the
-        // implicit route takes the shape and the reservation subtracts its class
-        // (`conv_im2col_col_elems`), which a class row pays nothing for.
+        // 192·1·7·16 000·4 = 86 016 000 B col.
+        "dense-l16000" => 86_016_000,
+        // 1024·5·5·900·4 = 92 160 000 B col, the in-band 2-D map.
+        "map-5x5-30x30-c1024" => 92_160_000,
+        // 768·1·7·800·4 = 17 203 200 B col.
+        "dense-l800" => 17_203_200,
+        // 384·1·7·4 000·4 = 43 008 000 B col, the same as `overlap-slot0`.
+        "dense-l4000" | "overlap-slot0" => 43_008_000,
+        // 1 024·1·7·100·4 = 2 867 200 B col.
+        "entry-l100" => 2_867_200,
+        // 64·7·1·1 000·4 = 1 792 000 B col.
+        "lift-slot0-l1000" => 1_792_000,
+        // 384·1·7·794·4 = 8 537 088 B col (the dilated tap's 794 output length).
+        "mirror-dilated-d2" => 8_537_088,
+        // 64·1·7·600·4 = 1 075 200 B col.
+        "refuse-height-pad" => 1_075_200,
+        // 32·3·3·841·4 = 968 832 B col, 256-aligned to 968 960.
+        "map-3x3-29x29-c32" => 968_960,
+        // 64·3·3·1 600·4 = 3 686 400 B col.
+        "map-3x3-40x40" => 3_686_400,
+        // 64·3·3·208·4 = 479 232 B col.
+        "map-3x3-s2-31x25-c64" => 479_232,
+        // Nothing to reserve — the shape's gates leave it off every accelerated
+        // route (a depthwise group, a 1×1 tap, a channel count under the floor, or
+        // a sub-bar pointwise shape), or the implicit route takes the shape and the
+        // reservation subtracts its class (`conv_im2col_col_elems`), which a class
+        // row pays nothing for.
         "dense-l48000"
-        | "dense-l800"
-        | "dense-l4000"
-        | "map-3x3-29x29-c32"
-        | "map-3x3-40x40"
-        | "map-3x3-s2-31x25-c64"
-        | "lift-slot0-l1000"
         | "mirror-projection"
         | "mirror-strided-s2"
-        | "mirror-dilated-d2"
         | "mirror-dilated-narrow-c32"
-        | "refuse-height-pad"
-        | "refuse-height-pad-narrow-c32"
-        | "overlap-slot0"
-        | "entry-l100"
         | "depthwise-l50"
         | "depthwise-l100"
+        | "refuse-height-pad-narrow-c32"
         | "l800"
         | "l4000"
         | "l16000"
@@ -901,6 +908,15 @@ fn expected_col_delta(label: &str) -> u64 {
         | "sub-bar-l3000" => 0,
         other => panic!("no recorded col delta for {other:?} — the body shape list grew"),
     }
+}
+
+/// The arena growth the parked arm records. Both arms set
+/// `RLX_WGPU_ALL_PARAMS_WEIGHT`, whose parked staging reserve is the same tail on both
+/// (`max(claim, STAGED_OPERAND_MAX, widest parked parameter)` — one figure for these
+/// fixtures), so the delta is the shape's own col less that tail — the per-shape
+/// table's figure, not a second one.
+fn parked_col_delta(label: &str) -> u64 {
+    expected_col_delta(label).saturating_sub(64 << 20)
 }
 
 /// One row of a per-shape table.
@@ -1012,13 +1028,12 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
             );
             // The memory half of the switch, pinned on every row against the delta
             // recorded for it in `expected_col_delta` — nothing is recomputed here. A
-            // shape-qualifying conv costs the col panel above the 64 MiB base
-            // `compute_scratch_bytes` floors the existing tail at; every other row
-            // costs nothing, which is why the moved decoder shape's own col leaves the
-            // arena alone while an in-band col over that base does grow it. A failure
-            // here on an adapter whose `max_storage_buffer_binding_size` cannot take
-            // the col says the accelerated routes are off on that adapter — loud, not
-            // silent.
+            // shape-qualifying conv costs its own col panel, the whole of the tail
+            // now that no floor sits under it; every other row costs nothing, which
+            // is why a 1×1 or depthwise shape leaves the arena alone while any
+            // qualifying col grows it. A failure here on an adapter whose
+            // `max_storage_buffer_binding_size` cannot take the col says the
+            // accelerated routes are off on that adapter — loud, not silent.
             assert_eq!(
                 pair.on_arena - pair.off_arena,
                 expected_col_delta(shape.label),
@@ -1163,25 +1178,24 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     // (4) the shape-decided col reservation, seen where its route does not run: a
     // parked weight keeps the qualifying conv on the previous `conv2d` route, yet the
     // arena still holds the reservation the switch grants by *shape* alone — the same
-    // recorded deltas `expected_col_delta` holds (a col under the 64 MiB base scratch
-    // costs nothing, a larger one costs `col − 64 MiB`), which is also why the whole
-    // Conv1x7 family's arena grows by the largest col alone rather than by the sum of
-    // them. This is also the arm where `im2col_fallbacks()` is non-zero; the count is
+    // recorded deltas `expected_col_delta` holds (a shape-qualifying col is the whole
+    // of the tail, a non-qualifying one nothing), which is also why the whole Conv1x7
+    // family's arena grows by the largest col alone rather than by the sum of them.
+    // This is also the arm where `im2col_fallbacks()` is non-zero; the count is
     // printed here, and `conv_routes_parked_weight.rs` asserts both of its arms.
     //
-    // `dense-l16000` carries the over-the-base col here rather than `dense-l48000`: the
+    // `dense-l16000` carries the largest col here rather than `dense-l48000`: the
     // latter is the implicit route's class, its panel reservation is subtracted, and a
     // parked weight only moves it from one no-panel route to another — the pairing this
     // arm exists for needs a shape the reservation still books.
     let big = row(&CONV1X7, "dense-l16000");
     // The row this default moves: its col reservation is new — before the move the shape
-    // took the direct kernel and reserved nothing — and it still costs the arena nothing
-    // because its col leaves the 64 MiB base scratch alone (`dense-l800` keeps the
-    // reservation the previous move gave it).
+    // took the direct kernel and reserved nothing — and it costs the arena that col
+    // now that no floor sits under the tail.
     let moved = row(&CONV1X7, "entry-l100");
     // The band's own parked row — a 2-D map the previous floor move admitted, whose col
-    // panel is past the 64 MiB base — so the combination "parked, in the band, col over
-    // the base" is pinned too rather than only its two halves.
+    // panel is the largest of the band — so the combination "parked, in the band, col
+    // reserved" is pinned too rather than only its two halves.
     let in_band = row(&CONV2D, "map-5x5-30x30-c1024");
     let parked_pair = |shape: &BodyConv| {
         rlx_ir::env::set("RLX_WGPU_ALL_PARAMS_WEIGHT", "1");
@@ -1204,7 +1218,7 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
             fmt_counts(&off_counts),
             fmt_counts(&on_counts),
             on_b - off_b,
-            expected_col_delta(shape.label),
+            parked_col_delta(shape.label),
             on.exe.im2col_fallbacks()
         );
         assert_eq!(
@@ -1215,7 +1229,7 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         );
         assert_eq!(
             on_b - off_b,
-            expected_col_delta(shape.label),
+            parked_col_delta(shape.label),
             "{}: a shape-qualifying conv pays the col reservation even where its route does \
              not run",
             shape.label

@@ -536,19 +536,17 @@ impl Synthesis {
             .get(2)
             .filter(|v| v.len() >= kv_span)
             .ok_or_else(|| anyhow!("the talker prefill returned no prompt values"))?;
-        let graphs::PlaneCache {
-            k: k_cache,
-            v: v_cache,
-            mut mask,
-        } = graphs::seed_plane_cache(layers, capacity, prompt_rows, self.hkv, k_rows, v_rows);
-        if !body.runner.resident_cache_planes(&k_cache, &v_cache) {
-            return Err(anyhow!("the talker refused the resident K/V cache"));
-        }
-        // The device holds the cache from here, and the rows this render writes go
-        // straight to it through the row feed: the host's planes are the prompt's seed
-        // only, and keeping them would park that copy for the whole loop.
-        drop(k_cache);
-        drop(v_cache);
+        // The prompt's rows go straight from the prefill's output into the body's own
+        // arena slots: the device holds the cache from here, and the rows this render
+        // writes go to it through the row feed, so no host plane is kept.
+        let mut mask = body.runner.resident_cache_planes(
+            layers,
+            capacity,
+            prompt_rows,
+            self.hkv,
+            k_rows,
+            v_rows,
+        )?;
 
         // The code predictor: **one** graph for the whole sixteen-level frame —
         // the head-less body at level 0, every projecting level with its own
@@ -589,12 +587,12 @@ impl Synthesis {
                 break;
             }
             if written == capacity {
-                let (cap, grown) = self.grow_body(capacity, body)?;
+                let (cap, grown, grown_mask) = self.grow_body(capacity, body)?;
                 body = grown;
                 capacity = cap;
                 // The mask keeps its key order: history first, then the spare row the
                 // step's own row is appended to, now at `cap`.
-                mask = graphs::resident_mask(written, cap);
+                mask = grown_mask;
             }
             let mut frame_codes = vec![code0];
             let code0_embed = self
@@ -777,23 +775,27 @@ impl Synthesis {
     }
 
     /// [`Synthesis::take_body`]'s graph grown by one [`graphs::CACHE_BUCKET`]: the
-    /// rows the render has written move from the graph's own planes into a fresh pair
-    /// of `capacity + CACHE_BUCKET` and the rest stays zero, so the rows the render
-    /// reads are the same rows. The graph is consumed and dropped before the
-    /// replacement is compiled; the two would otherwise park their planes at once.
-    fn grow_body(&mut self, capacity: usize, graph: Compiled) -> Result<(usize, Compiled)> {
-        // Every row of the old cache is live: growth happens at the one point the
-        // render has written all of them.
+    /// rows the render has written move from the old graph's planes into the new one's
+    /// — one readback, then a write per plane — and the rest of the fresh arena stays
+    /// zero, so the rows the render reads are the same rows. Answers the grown graph's
+    /// mask. The old graph is dropped before its replacement is compiled, so the peak
+    /// holds one compiled body.
+    fn grow_body(
+        &mut self,
+        capacity: usize,
+        graph: Compiled,
+    ) -> Result<(usize, Compiled, Vec<f32>)> {
         let grown = capacity + graphs::CACHE_BUCKET;
-        let (k, v) = graphs::lift_planes(&graph, self.cfg.layers, self.hkv, capacity, grown)?;
+        // Every row of the old cache is live here; read them out before the
+        // replacement is compiled, so the old arena is dropped first and the peak holds
+        // one compiled body.
+        let rows = graph
+            .runner
+            .read_plane_rows(self.cfg.layers, self.hkv, capacity)?;
         drop(graph);
         let mut compiled = self.compile_body(grown)?;
-        if !compiled.runner.resident_cache_planes(&k, &v) {
-            return Err(anyhow!(
-                "the talker refused the resident K/V cache at capacity {grown}"
-            ));
-        }
-        Ok((grown, compiled))
+        compiled.runner.write_plane_rows(self.cfg.layers, &rows)?;
+        Ok((grown, compiled, graphs::resident_mask(capacity, grown)))
     }
 
     /// The sound half: codes → codebook → wave transformer → DAC, windowed to

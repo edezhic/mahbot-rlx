@@ -637,6 +637,27 @@ pub trait ExecutableGraph: Send {
         false
     }
 
+    /// Write `rows` f32 into a bound graph input's own arena slot at `row`, keeping
+    /// no host copy, and mark the handle device-resident — the write counterpart of
+    /// [`Self::read_gpu_handle_row`], for a cache whose seed rows are another graph's
+    /// output. `row_elems` is one row's width. The write is bounded by the slot's own
+    /// extent — the same address and extent [`Self::read_gpu_handle_rows`] answers
+    /// under — and it touches only the rows it is given: the rows above them hold
+    /// whatever the slot already held, which is zero in a fresh arena and the previous
+    /// write's values in one that has been written before.
+    ///
+    /// Default: unsupported, so a backend without resident handles refuses rather
+    /// than silently dropping the rows.
+    fn write_gpu_handle_rows(
+        &mut self,
+        _name: &str,
+        _row: usize,
+        _row_elems: usize,
+        _rows: &[f32],
+    ) -> bool {
+        false
+    }
+
     fn has_gpu_handle(&self, _name: &str) -> bool {
         false
     }

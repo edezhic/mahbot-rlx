@@ -380,4 +380,33 @@ impl WgpuExecutable {
         self.gpu_handles.entry(name.to_string()).or_default();
         true
     }
+
+    /// See `rlx_runtime::ExecutableGraph::write_gpu_handle_rows` for the contract. The
+    /// write is bounded by `arena_span_range`, the same address and the same extent the
+    /// reads use.
+    pub fn write_gpu_handle_rows(
+        &mut self,
+        name: &str,
+        row: usize,
+        row_elems: usize,
+        rows: &[f32],
+    ) -> bool {
+        let Some(&id) = self.input_offsets.get(name) else {
+            return false;
+        };
+        let Some((off, _)) = row
+            .checked_mul(row_elems)
+            .and_then(|start| self.arena_span_range(id, start, rows.len()))
+        else {
+            return false;
+        };
+        let Some(dev) = wgpu_device() else {
+            return false;
+        };
+        self.arena
+            .write_bytes_range(&dev.queue, off, bytemuck::cast_slice(rows));
+        // Rows in the arena are what the read family resolves, and an emptied host
+        // mirror is what stops `stage_gpu_handle_inputs` writing over them.
+        self.prepare_resident_gpu_handle(name)
+    }
 }

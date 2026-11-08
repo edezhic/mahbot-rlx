@@ -612,3 +612,45 @@ fn a_recompile_drops_the_resident_marks_the_arena_went_with() {
         "a handle whose rows went with the rebuilt arena still reported as held"
     );
 }
+
+#[test]
+fn a_resident_write_lands_in_the_rows_the_slot_holds_and_nowhere_else() {
+    if skip() {
+        return;
+    }
+    let mut exe = resident_caches();
+    let before = exe.read_gpu_handle_rows(&[("cache_b", 0, W), ("cache_b", ROWS_B - 1, W)]);
+    // The same refusals the matching read makes, so a write cannot reach a slot the
+    // read would not: a name this executable does not hold, a row at the extent, and
+    // a span that starts inside and runs past it.
+    assert!(
+        !exe.write_gpu_handle_rows("not_here", 0, W, &rows(1, 0.0)),
+        "a write to a name this executable does not hold reported success"
+    );
+    assert!(
+        !exe.write_gpu_handle_rows("cache_b", ROWS_B, W, &rows(1, 0.0)),
+        "a write to a row past the slot's extent reported success"
+    );
+    assert!(
+        !exe.write_gpu_handle_rows("cache_b", ROWS_B - 1, W, &rows(2, 0.0)),
+        "a write whose span runs past the slot's extent reported success"
+    );
+    assert_eq!(
+        exe.read_gpu_handle_rows(&[("cache_b", 0, W), ("cache_b", ROWS_B - 1, W)]),
+        before,
+        "a refused write moved the rows it could not reach"
+    );
+
+    // In extent, the rows land where they were asked to and read back from there —
+    // not from the host mirror the binding left behind.
+    let written = rows(1, 700.0);
+    assert!(
+        exe.write_gpu_handle_rows("cache_b", ROWS_B - 1, W, &written),
+        "a write to the slot's last row was refused"
+    );
+    assert_eq!(
+        exe.read_gpu_handle_rows(&[("cache_b", ROWS_B - 1, W)])[0].as_deref(),
+        Some(written.as_slice()),
+        "the row a resident write landed in did not read back as written"
+    );
+}

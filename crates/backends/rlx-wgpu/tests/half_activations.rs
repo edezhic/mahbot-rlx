@@ -119,12 +119,14 @@ fn packed_halves_match_f32_closely_and_shrink_the_arena() {
     );
     rlx_ir::env::clear_overrides();
 
-    // the activations (not the 64 MiB scratch) about halve, over the labels
-    // alone (an output's producers stay f32)
-    let scratch = 64usize << 20;
+    // the activations about halve, over the labels alone (an output's producers
+    // stay f32). Both arms plan the same graph structure, so `compute_scratch_bytes`
+    // gives each the same tail and `planned_arena_bytes` adds it to both: the same
+    // `t` on each side is absorbed, not cancelled, and `half * 10 < full * 7` holds
+    // while `3t < 2 * activations`.
     eprintln!("  arena {full_bytes} → {half_bytes} bytes");
     assert!(
-        (half_bytes - scratch) * 10 < (full_bytes - scratch) * 7,
+        half_bytes * 10 < full_bytes * 7,
         "{full_bytes} → {half_bytes}"
     );
     let (mut worst, mut scale) = (0f32, 0f32);

@@ -448,15 +448,18 @@ fn pass_cost(pair: &Pair, capacity: usize, rows: usize) -> Result<Pass, String> 
         .ok_or("the schedule names no step")?;
     let kinds = support::step_census(&names);
     let plane = graphs::plane_rows(capacity, rows);
-    let k: Vec<Vec<f32>> = (0..cfg.layers)
-        .map(|_| support::ramped_row(plane * hkv))
+    let k: Vec<f32> = (0..cfg.layers)
+        .flat_map(|_| support::ramped_row(plane * hkv))
         .collect();
-    let v: Vec<Vec<f32>> = (0..cfg.layers)
-        .map(|_| support::ramped_row(plane * hkv))
+    let v: Vec<f32> = (0..cfg.layers)
+        .flat_map(|_| support::ramped_row(plane * hkv))
         .collect();
-    if !compiled.runner.resident_cache_planes(&k, &v) {
-        return Err("the device refused the resident planes".into());
-    }
+    // The whole plane is the seed — every row ramped so the step reads a non-zero
+    // cache — and it goes straight into the graph's own slots.
+    compiled
+        .runner
+        .resident_cache_planes(cfg.layers, capacity, plane, hkv, &k, &v)
+        .map_err(|e| format!("the device refused the resident planes: {e:#}"))?;
     // The device holds the planes now; dropping the host copies keeps the arm's
     // peak at its weights.
     drop(k);
@@ -928,13 +931,13 @@ fn parity(pair: &Pair, capacity: usize) -> Result<(f32, f32, usize), String> {
     let (d, hkv, layers) = (cfg.d, cfg.kv_heads * cfg.head_dim, cfg.layers);
     let vocab = cost_vocab(pair);
     let read = [graphs::plane_step_logits(layers)];
-    let ramp = |rows: usize| -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let ramp = |rows: usize| -> (Vec<f32>, Vec<f32>) {
         (
             (0..layers)
-                .map(|_| support::ramped_row(rows * hkv))
+                .flat_map(|_| support::ramped_row(rows * hkv))
                 .collect(),
             (0..layers)
-                .map(|_| support::ramped_row(rows * hkv))
+                .flat_map(|_| support::ramped_row(rows * hkv))
                 .collect(),
         )
     };
@@ -945,9 +948,16 @@ fn parity(pair: &Pair, capacity: usize) -> Result<(f32, f32, usize), String> {
         .map_err(|e| format!("build: {e:#}"))?;
     let mut one =
         graphs::Compiled::new(Device::Gpu, built).map_err(|e| format!("compile: {e:#}"))?;
-    if !one.runner.resident_cache_planes(&planes.0, &planes.1) {
-        return Err("the device refused the resident planes".into());
-    }
+    one.runner
+        .resident_cache_planes(
+            cfg.layers,
+            capacity,
+            capacity + 1,
+            hkv,
+            &planes.0,
+            &planes.1,
+        )
+        .map_err(|e| format!("the device refused the resident planes: {e:#}"))?;
     drop(planes);
     let (cos1, sin1) = host::rope_tables_at(capacity, 1, cfg.head_dim, cfg.rope_base as f64);
     let expected = row_logits(
@@ -968,9 +978,9 @@ fn parity(pair: &Pair, capacity: usize) -> Result<(f32, f32, usize), String> {
         .map_err(|e| format!("build: {e:#}"))?;
     let mut two =
         graphs::Compiled::new(Device::Gpu, built).map_err(|e| format!("compile: {e:#}"))?;
-    if !two.runner.resident_cache_planes(&planes.0, &planes.1) {
-        return Err("the device refused the resident planes".into());
-    }
+    two.runner
+        .resident_cache_planes(cfg.layers, capacity, capacity, hkv, &planes.0, &planes.1)
+        .map_err(|e| format!("the device refused the resident planes: {e:#}"))?;
     drop(planes);
     let (cos2, sin2) = host::rope_tables_at(capacity, 2, cfg.head_dim, cfg.rope_base as f64);
     let row = support::ramped_row(d);

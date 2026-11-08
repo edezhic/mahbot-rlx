@@ -533,10 +533,15 @@ fn the_synthesis_loops_per_shape_rate_census_with_models() {
         let body = graphs::body_capacity_chain_planes(pair.body.clone(), CELL_FRAMES)
             .expect("build the plane-cache decode body");
         let mut body = graphs::Compiled::new(Device::Gpu, body).expect("compile the body");
-        let k = vec![vec![0f32; (CELL_FRAMES + 1) * hkv]; layers];
-        let v = vec![vec![0f32; (CELL_FRAMES + 1) * hkv]; layers];
+        // The census's planes are zeros, and a fresh arena slot is zero-filled: one
+        // zero row per layer is the whole seed, and every row above it reads zero as
+        // the old full-plane binding did.
+        let k = vec![0f32; layers * hkv];
+        let v = vec![0f32; layers * hkv];
         assert!(
-            body.runner.resident_cache_planes(&k, &v),
+            body.runner
+                .resident_cache_planes(layers, CELL_FRAMES, 1, hkv, &k, &v)
+                .is_ok(),
             "the body took the resident plane cache"
         );
         body

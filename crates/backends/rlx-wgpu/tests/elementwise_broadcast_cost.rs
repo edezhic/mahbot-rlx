@@ -273,9 +273,9 @@ fn part_b(label: &str, legalised: &Graph, peeled: Graph) {
     );
     eprintln!(
         "  peel_exe.test_arena_bytes() = {} B ({:.2} MiB) against the planner's peeled {plan_after} B \
-         ({:+} B): the executable's arena is the plan plus the lowering's tail scratch \
-         (`compute_scratch_bytes` floors it at 64 MiB), so a fixed offset — the delta is what \
-         compares",
+         ({:+} B): the executable's arena is the plan plus the tail the graph's ops claim \
+         (`compute_scratch_bytes`, with no floor under it), so a fixed offset — the delta is \
+         what compares",
         peel_exe.test_arena_bytes(),
         mib(peel_exe.test_arena_bytes()),
         peel_exe.test_arena_bytes() as i64 - plan_after as i64

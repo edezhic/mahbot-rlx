@@ -1327,45 +1327,6 @@ pub fn plane_rows(capacity: usize, rows: usize) -> usize {
     capacity + usize::from(rows == 1)
 }
 
-/// A talker plane cache seeded from its prompt: one `[capacity + 1, hkv]` K and
-/// V plane per layer — the attention's row layout already — with the prefill's
-/// `[layers, prompt_rows, hkv]` rows scattered in, and a mask with the prompt's
-/// rows and the spare query slot at `capacity` set.
-pub struct PlaneCache {
-    pub k: Vec<Vec<f32>>,
-    pub v: Vec<Vec<f32>>,
-    pub mask: Vec<f32>,
-}
-
-/// Build the talker's planes and mask before its first step. The prompt's rows
-/// come from the prefill's layer-major output, one row at a time; every step
-/// after the prefill writes one row of its own through the registered feed.
-pub fn seed_plane_cache(
-    layers: usize,
-    capacity: usize,
-    prompt_rows: usize,
-    hkv: usize,
-    k_rows: &[f32],
-    v_rows: &[f32],
-) -> PlaneCache {
-    let mut k: Vec<Vec<f32>> = (0..layers)
-        .map(|_| vec![0f32; (capacity + 1) * hkv])
-        .collect();
-    let mut v: Vec<Vec<f32>> = (0..layers)
-        .map(|_| vec![0f32; (capacity + 1) * hkv])
-        .collect();
-    for l in 0..layers {
-        for r in 0..prompt_rows {
-            let dst = r * hkv;
-            let src = (l * prompt_rows + r) * hkv;
-            k[l][dst..dst + hkv].copy_from_slice(&k_rows[src..src + hkv]);
-            v[l][dst..dst + hkv].copy_from_slice(&v_rows[src..src + hkv]);
-        }
-    }
-    let mask = resident_mask(prompt_rows, capacity);
-    PlaneCache { k, v, mask }
-}
-
 /// The attention mask of a `capacity`-row resident cache with `written` rows behind
 /// it: history first, then the spare row a one-row step appends its own row to, at
 /// `capacity`.
@@ -1376,33 +1337,16 @@ pub fn resident_mask(written: usize, capacity: usize) -> Vec<f32> {
     mask
 }
 
-/// The rows a resident cache has written, lifted out of a compiled graph's own planes
-/// into fresh `grown`-row planes for the graph that replaces it: the first `written`
-/// rows of every layer's K and V plane move in a plain row copy and the rest stays
-/// zero, so the grown cache reads the rows the old one wrote. The caller compiles the
-/// replacement from these, registers them, and drops the host copy.
-pub fn lift_planes(
-    graph: &Compiled,
-    layers: usize,
-    hkv: usize,
-    written: usize,
-    grown: usize,
-) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
-    let live = written * hkv;
-    let mut k: Vec<Vec<f32>> = (0..layers).map(|_| vec![0f32; (grown + 1) * hkv]).collect();
-    let mut v: Vec<Vec<f32>> = (0..layers).map(|_| vec![0f32; (grown + 1) * hkv]).collect();
-    for l in 0..layers {
-        for (name, planes) in [("k", &mut k), ("v", &mut v)] {
-            let plane = graph
-                .runner
-                .read_plane(&format!("{name}{l}"))
-                .ok_or_else(|| {
-                    anyhow!("the resident {name}{l} plane is not readable at row {written}")
-                })?;
-            planes[l][..live].copy_from_slice(&plane[..live]);
-        }
-    }
-    Ok((k, v))
+/// The resident plane handle for `kind` (`"k"` or `"v"`) of layer `l` — the name the
+/// decode body's inputs carry and the row feeds register.
+fn plane_name(kind: &str, l: usize) -> String {
+    format!("{kind}{l}")
+}
+
+/// Both of layer `l`'s plane handles, K then V — the order
+/// [`Runner::read_plane_rows`] answers in.
+fn plane_names(l: usize) -> [String; 2] {
+    [plane_name("k", l), plane_name("v", l)]
 }
 
 // ── the TTS speaker encoder (ECAPA-TDNN, the `mmproj` voice half) ──
@@ -2953,41 +2897,131 @@ impl Runner {
         self.session.run(inputs)
     }
 
-    /// A plane cache: each layer's [`plane_rows`] rows are a resident handle of its
-    /// own, registered to this graph's own new-row output. The output order is the
-    /// stage's: the main output, this graph's K rows (one per layer), then its V
-    /// rows.
-    pub fn resident_cache_planes(&mut self, k: &[Vec<f32>], v: &[Vec<f32>]) -> bool {
-        if k.len() != v.len() {
-            return false;
+    /// Seed a decode graph's per-layer K/V planes from a prefill's `[layers,
+    /// prompt_rows, hkv]` rows and hook each plane to this graph's own new-row output.
+    /// The rows go from the prefill's output straight into the arena slots the graph
+    /// reads — no host plane is allocated — and the answer is the attention mask of the
+    /// rows written.
+    ///
+    /// The seed is `layers · prompt_rows · hkv` f32, layer-major, the prefill's output
+    /// layout, and only those first values of `k_rows`/`v_rows` are read: a prefill that
+    /// comes back longer than the layers it serves is not an error, its excess is
+    /// ignored. A seed shorter than that is, and the two halves have to be the same
+    /// length.
+    ///
+    /// The rows above the prompt are whatever the slots already held — zero in a fresh
+    /// arena, a previous clip's rows when a cached graph is re-seeded — so the mask, not
+    /// the zeros, is what keeps them out of the answer.
+    pub fn resident_cache_planes(
+        &mut self,
+        layers: usize,
+        capacity: usize,
+        prompt_rows: usize,
+        hkv: usize,
+        k_rows: &[f32],
+        v_rows: &[f32],
+    ) -> Result<Vec<f32>> {
+        let span = prompt_rows * hkv;
+        let seed = layers * span;
+        if span == 0 || k_rows.len() != v_rows.len() || k_rows.len() < seed {
+            bail!(
+                "the resident cache seed is not `[{layers}, {prompt_rows}, {hkv}]` rows \
+                 ({} and {} values)",
+                k_rows.len(),
+                v_rows.len()
+            );
         }
-        for (gi, rows) in k.iter().enumerate() {
-            if !self.session.bind_gpu_handle(&format!("k{gi}"), rows) {
-                return false;
+        for l in 0..layers {
+            let src = l * span;
+            self.write_layer_planes(l, &k_rows[src..src + span], &v_rows[src..src + span])?;
+        }
+        self.register_plane_feeds(layers)?;
+        Ok(resident_mask(prompt_rows, capacity))
+    }
+
+    /// The live rows of every `k{l}`/`v{l}` plane, `k0,v0,k1,v1,…`, each plane's rows
+    /// `0..written`. One batched readback whatever the layer count — one device round
+    /// trip. This and [`Self::write_plane_rows`] are the pair a capacity rebuild moves
+    /// the cache with: read out of the old graph, write into the one that replaces it.
+    ///
+    /// No product input reaches a rebuild — the answers the product produces stay inside
+    /// the compiled capacity — so the pair is exercised by `tests/plane_rebuild.rs` and
+    /// the draft-acceptance parity arms, not by a stand row.
+    pub fn read_plane_rows(
+        &self,
+        layers: usize,
+        hkv: usize,
+        written: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        if written == 0 {
+            bail!("a plane read of no rows has nothing to answer");
+        }
+        let names: Vec<String> = (0..layers).flat_map(plane_names).collect();
+        let requests: Vec<(&str, usize, usize)> = names
+            .iter()
+            .map(|name| (name.as_str(), 0, written * hkv))
+            .collect();
+        names
+            .iter()
+            .zip(self.session.read_gpu_handle_rows(&requests))
+            .map(|(name, answer)| {
+                answer.ok_or_else(|| {
+                    anyhow!(
+                        "the resident {name} plane does not hold the rows 0..{written} asked for"
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Write [`Self::read_plane_rows`]'s rows, in its order and count, into this
+    /// graph's planes and hook each one to its own new-row output. The rows above the
+    /// ones handed in are left as they were — zero in a fresh arena, the previous
+    /// cache's rows in one that has already been written.
+    pub fn write_plane_rows(&mut self, layers: usize, rows: &[Vec<f32>]) -> Result<()> {
+        if rows.len() != 2 * layers {
+            bail!(
+                "the resident planes take {} rows, not {}",
+                2 * layers,
+                rows.len()
+            );
+        }
+        for (l, pair) in rows.chunks_exact(2).enumerate() {
+            self.write_layer_planes(l, &pair[0], &pair[1])?;
+        }
+        self.register_plane_feeds(layers)
+    }
+
+    /// Write one layer's `k{l}` and `v{l}` rows into their plane slots.
+    fn write_layer_planes(&mut self, l: usize, k: &[f32], v: &[f32]) -> Result<()> {
+        for (kind, rows) in [("k", k), ("v", v)] {
+            let name = plane_name(kind, l);
+            // `row_elems` only scales the row index, which is 0 here: the plane is one
+            // span.
+            if !self
+                .session
+                .write_gpu_handle_rows(&name, 0, rows.len(), rows)
+            {
+                return Err(anyhow!("the resident {name} plane refused its rows"));
             }
         }
-        for (gi, rows) in v.iter().enumerate() {
-            if !self.session.bind_gpu_handle(&format!("v{gi}"), rows) {
-                return false;
-            }
-        }
+        Ok(())
+    }
+
+    /// Hook each layer's `k{l}`/`v{l}` plane to this graph's own new-row output. The
+    /// stage publishes the step's K rows then its V rows after its main output, so
+    /// the feeds are that output order.
+    fn register_plane_feeds(&mut self, layers: usize) -> Result<()> {
         let base = 1; // the graph's main output
-        let n = k.len();
-        for gi in 0..n {
-            if !self
-                .session
-                .register_kv_row_feed(&format!("k{gi}"), base + gi)
-            {
-                return false;
-            }
-            if !self
-                .session
-                .register_kv_row_feed(&format!("v{gi}"), base + n + gi)
-            {
-                return false;
+        for l in 0..layers {
+            for (kind, output) in [("k", base + l), ("v", base + layers + l)] {
+                let name = plane_name(kind, l);
+                if !self.session.register_kv_row_feed(&name, output) {
+                    return Err(anyhow!("the resident {name} plane refused its row feed"));
+                }
             }
         }
-        true
+        Ok(())
     }
 
     /// One plane-cache step: run, read only `read`, and fold each layer's new
@@ -3028,15 +3062,6 @@ impl Runner {
             }
         }
         Some(out)
-    }
-
-    /// The whole current contents of a resident plane input, read back from the
-    /// device. The bucket rebuilds are the callers — the recognition decode's and
-    /// the talker's: the planes live on the device between steps, so a larger
-    /// capacity's planes are filled from the smaller ones' live rows here, not from
-    /// the host mirror the row feed emptied.
-    pub fn read_plane(&self, name: &str) -> Option<Vec<f32>> {
-        self.session.read_gpu_handle(name)
     }
 }
 

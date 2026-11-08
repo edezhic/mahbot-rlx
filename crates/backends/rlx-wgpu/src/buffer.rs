@@ -102,6 +102,11 @@ impl SharedWeightBuffers {
 /// handful of them pin several GiB for the life of the process. A further allocation
 /// evicts the **oldest** entries — [`SharedWeightBuffers::generation`] order, never the
 /// one being allocated for, whose buffers the compile in flight is about to use.
+///
+/// Three GiB is not raised for the MahBot models. With both of them resident at once
+/// the pool sits at nine tenths of it, but the product never has both in one process:
+/// a stand row takes one model, and the checks that use both drop one and release its
+/// pool before opening the other.
 const MAX_SHARED_WEIGHT_SCOPES: usize = 8;
 const MAX_SHARED_WEIGHT_BYTES: usize = 3 << 30;
 
@@ -699,12 +704,34 @@ pub const SHARD_STAGE_RESERVE: usize = 768 * 1024 * 1024;
 /// would explode the geometry is refused loudly and cheaply instead.
 pub const MAX_SHARDS: usize = 64;
 
-/// The stage reserve on a 32-bit target (the browser). Its whole logical
-/// arena must stay below 3 GiB ([`WEIGHT_BUF_TAG`]; it was 2 GiB), and 768 MiB a
-/// stripe did not leave room: MindGrab's 1.29 GB plan under a 1 GiB binding
-/// snapped to 4.03 GB of stripes and the compile panicked. 64 MiB is what the
-/// ≤ 2 GiB-buffer adapters already get (`compile`'s scratch tail).
-pub const WASM_STAGE_RESERVE: usize = 64 * 1024 * 1024;
+/// The stage reserve a small budget gets: the bound `from_plan_split_opts` caps the
+/// reserve at on ≤ 2 GiB-buffer adapters (VirtIO, DX12 WARP), where a full 768 MiB on top
+/// of a nearly-full arena does not fit.
+pub const SMALL_STAGE_RESERVE: usize = 64 * 1024 * 1024;
+
+/// The stage reserve on a 32-bit target (the browser). Its whole logical arena must stay
+/// below 3 GiB ([`WEIGHT_BUF_TAG`]; it was 2 GiB), and 768 MiB a stripe did not leave
+/// room: MindGrab's 1.29 GB plan under a 1 GiB binding snapped to 4.03 GB of stripes and
+/// the compile panicked — so the browser gets the small-budget reserve.
+pub const WASM_STAGE_RESERVE: usize = SMALL_STAGE_RESERVE;
+
+/// The widest operand the elementwise staging arms will copy — `Compare`, `Where` and
+/// `Fma` refuse one past it in `compile/lower.rs` — and therefore the tail a split arena
+/// books when it parks a non-packed parameter in the weight buffer.
+///
+/// An op that binds the activation arena reaches a parameter in the weight buffer only
+/// through a copy into the arena's tail — or into a stripe's reserve, once the arena is
+/// striped — so a parameter past this width is kept in the activation arena while the two
+/// still fit one bind window, and this floor is booked only by a graph that parks
+/// something narrower.
+///
+/// Packed `U8`/`I8` parameters are exempt: the arms that read one bind the weight buffer
+/// directly instead of copying (the fused GEMV, the packed gather, `DequantMatMul`), and
+/// the generic host route refuses a raw-stored encoding outright ([`unstageable_reason`]).
+/// So a graph that parks only packed parameters books no floor, and an op that stages a
+/// packed parameter into the tail instead is not covered by one — such an op has to be
+/// added to that refusal.
+pub(crate) const STAGED_OPERAND_MAX: usize = 64 * 1024 * 1024;
 
 /// Effective stage reserve (see [`SHARD_STAGE_RESERVE`], [`WASM_STAGE_RESERVE`]).
 pub fn shard_stage_reserve() -> usize {
@@ -862,6 +889,24 @@ fn act_slot_bytes(node: &rlx_ir::Node) -> usize {
         (ne * 2).div_ceil(4) * 4
     } else {
         ne * 4
+    }
+}
+
+/// The bytes a node's slot actually holds — [`act_slot_bytes`], except that a complex
+/// tensor keeps every lane (`C64` two words, `C128` four) instead of one, and an empty
+/// tensor holds nothing (the planner still gives it a word; this record must not). What
+/// `compile` writes as the slot's length and what a scratch claim for a copy of that
+/// slot must book, from one expression.
+pub(crate) fn actual_slot_bytes(node: &rlx_ir::Node) -> usize {
+    let Some(ne) = node.shape.num_elements() else {
+        return 0;
+    };
+    if ne == 0 {
+        0
+    } else if node.shape.dtype().is_complex() {
+        ne * node.shape.dtype().size_bytes()
+    } else {
+        act_slot_bytes(node)
     }
 }
 
@@ -2313,7 +2358,11 @@ impl Arena {
         // heuristic, which is not what that knob is for.
         let max_buf = device.limits().max_buffer_size as usize;
         let weight_shard_cap = effective_shard_cap(device);
-        let scratch_aligned = scratch_bytes.div_ceil(16) * 16;
+        let mut scratch_aligned = scratch_bytes.div_ceil(16) * 16;
+        // The widest non-packed parameter this arena parks in the weight buffer. A
+        // generic op reaches one only by staging a copy into the tail
+        // (`arena_off_in_window_or_stage`), so the tail below has to hold it.
+        let mut parked_staging = 0usize;
         let mut param_bytes_est = 0usize;
         for node in graph.nodes() {
             if matches!(&node.op, Op::Param { .. }) {
@@ -2417,21 +2466,15 @@ impl Arena {
         let shared_scope = param_sharing_declared();
         for (id, ne, nbytes, dt, is_param, name) in park_candidates {
             let packed_quant = matches!(dt, rlx_ir::DType::U8 | rlx_ir::DType::I8);
-            // A generic op reaches a weight-buffer param only by staging a copy
-            // into the act bind window, and that copy has to fit the scratch
-            // reserve. Parking a param bigger than the reserve is therefore a
-            // dead end: `arena_off_in_window_or_stage` can only panic on it.
-            // Keep such a param in the act arena instead, as long as the act
-            // arena still fits one bind window — that is strictly better than
-            // both alternatives (a panic, or a reserve grown to hundreds of MiB
-            // that every graph then pays for). Packed U8/I8 quant is exempt:
-            // fused GEMV binds the weight buffer directly and never stages.
-            //
-            // Qwen3-0.6B F32 is the case that needs this — its 622 MiB tied
-            // lm_head and embedding are far past any sane reserve, while the
-            // activations are ~1.2 GiB, so both fit the act arena comfortably.
-            let unstageable = !packed_quant && nbytes > scratch_aligned;
-            let act_after = tail.div_ceil(a) * a + nbytes + scratch_aligned;
+            // A parameter past [`STAGED_OPERAND_MAX`] is a dead end in the weight buffer
+            // (its doc has the rule), so keep it in the activation arena while the two
+            // still fit one bind window — Qwen3-0.6B's 622 MiB tied lm_head beside 1.2 GiB
+            // of activations. Judged against the floor rather than the claim this call was
+            // handed, so the decision does not flip on what the graph's own ops claim —
+            // but not against the post-loop stripe reserve, which can leave a parameter
+            // kept here beside a tail hundreds of MiB larger than the one it was judged by.
+            let unstageable = !packed_quant && nbytes > STAGED_OPERAND_MAX;
+            let act_after = tail.div_ceil(a) * a + nbytes + scratch_aligned.max(STAGED_OPERAND_MAX);
             let keep_in_act = unstageable && act_after <= bind_cap;
             let to_weight = is_param
                 && !keep_in_act
@@ -2454,6 +2497,9 @@ impl Arena {
                     continue;
                 }
                 if shared_scope {
+                    if !packed_quant {
+                        parked_staging = parked_staging.max(nbytes);
+                    }
                     weight_candidates.push((id, ne, nbytes, name));
                     continue;
                 }
@@ -2470,6 +2516,9 @@ impl Arena {
                     );
                     tail += ne * 4;
                     continue;
+                }
+                if !packed_quant {
+                    parked_staging = parked_staging.max(nbytes);
                 }
                 named_weight_slots.push((name, nbytes, weight_cursor));
                 weight_offsets.insert(id, weight_cursor);
@@ -2572,6 +2621,37 @@ impl Arena {
             tail += bytes;
         }
         new_plan.arena_size = tail;
+        // The tail this arena needs, sized from the arena it just built: at least the
+        // floor a staged operand is refused past ([`STAGED_OPERAND_MAX`]), and the widest
+        // parked parameter for one that had to be parked past it.
+        //
+        // The floor is booked even when every parked parameter is far narrower, because a
+        // tail is one bump cursor rather than a slot per operand: an op that stages two
+        // operands needs their sum. Only the `Compare`/`Where`/`Fma` arm books a sum
+        // (`compute_scratch_bytes`); `LayerNorm2d`'s parked gamma and beta share the
+        // cursor, and a tail narrower than the two wraps the second copy over the first —
+        // wrong numbers, not a panic.
+        //
+        // On a striped arena staging lands in the stripe's reserve, not here, so this zone
+        // is dead bytes there. It is booked anyway: the striping decision is made from the
+        // arena this tail is part of.
+        if parked_staging > 0 {
+            scratch_aligned = scratch_aligned.max(STAGED_OPERAND_MAX.max(parked_staging));
+        }
+        if (tail as u64).saturating_add(scratch_aligned as u64) > bind_cap as u64 {
+            // On ~2 GiB max_buffer adapters (VirtIO/DX12), a full 768 MiB stage on
+            // top of a nearly-full act arena + weight buffer OOMs — keep a modest
+            // tail; `RLX_WGPU_SHARD_STAGE_MIB` still overrides.
+            let full = shard_stage_reserve();
+            let reserve = if max_buf <= (2usize << 30)
+                && rlx_ir::env::var("RLX_WGPU_SHARD_STAGE_MIB").is_none()
+            {
+                full.min(SMALL_STAGE_RESERVE)
+            } else {
+                full
+            };
+            scratch_aligned = scratch_aligned.max(reserve);
+        }
         if rlx_ir::env::flag("RLX_WGPU_DEBUG") {
             eprintln!(
                 "[rlx-wgpu split] weight_params={} weight_buf={:.3}GiB act_arena={:.3}GiB all_params={}",
@@ -2581,7 +2661,7 @@ impl Arena {
                 rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT"),
             );
         }
-        let mut arena = Self::from_plan_with_scratch(device, &new_plan, scratch_bytes);
+        let mut arena = Self::from_plan_with_scratch(device, &new_plan, scratch_aligned);
         if let Some(allocation) = weight_allocation {
             arena.weight_buffer = allocation.shards.first().cloned();
             arena.weight_extra_shards = allocation.shards[1..].to_vec();
@@ -4731,8 +4811,9 @@ mod operand_stageability_tests {
 }
 
 /// The arena `graph` plans to on this backend — the passes `compile` runs
-/// before planning, then its planner — without a device — and the scratch
-/// tail every compile reserves (at least 64 MiB).
+/// before planning, then its planner — without a device, plus the tail the
+/// graph's own ops claim (`crate::backend::compute_scratch_bytes`). The staging
+/// reserve is device-dependent and is not part of this device-free answer.
 ///
 /// Compared with [`arena_binding_limit`], it says whether a compile would keep
 /// the arena in one storage binding. Past that the arena is striped and any

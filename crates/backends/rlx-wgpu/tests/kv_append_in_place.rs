@@ -703,7 +703,9 @@ fn a_cache_root_whose_appends_disagree_on_axis_keeps_the_copy() {
 /// row's values, the host route that says the straddle), not the refusal itself:
 /// that is `Arena::binds_whole_at_base_zero`'s, and the placement asks it rather
 /// than a second spelling. A lowered shard cap reaches the geometry without a
-/// multi-gigabyte plan; the arena's own size is what exceeds it.
+/// multi-gigabyte plan; the arena's own size is what exceeds it, and the cache
+/// fills one stripe exactly, so the row it appends lands in the next one and the
+/// two operands straddle.
 ///
 /// Its own process, because the cap is a process-global switch and a sibling test
 /// must not see it.
@@ -717,7 +719,7 @@ fn a_striped_arena_still_computes_its_row() {
         eprintln!("{MARKER} {fixture}");
         assert_eq!(fixture, FIXTURE);
         let mut g = Graph::new("kv_append_striped");
-        let cache = g.input("cache", Shape::new(&[512, 512], DType::F32));
+        let cache = g.input("cache", Shape::new(&[1024, 512], DType::F32));
         let x = g.input("x", Shape::new(&[1, 512], DType::F32));
         let row = g.add_node(
             Op::Activation(Activation::Relu),
@@ -725,9 +727,9 @@ fn a_striped_arena_still_computes_its_row() {
             Shape::new(&[1, 512], DType::F32),
         );
         let out = g.add_node(
-            Op::KvAppend { axis: 0, pos: 511 },
+            Op::KvAppend { axis: 0, pos: 1023 },
             vec![cache, row],
-            Shape::new(&[512, 512], DType::F32),
+            Shape::new(&[1024, 512], DType::F32),
         );
         g.set_outputs(vec![out]);
         let mut exe = WgpuExecutable::compile(g);
@@ -739,10 +741,10 @@ fn a_striped_arena_still_computes_its_row() {
         );
         let xv: Vec<f32> = (0..512).map(|i| (i as f32) * 0.5 - 100.0).collect();
         let got = exe
-            .run(&[("cache", &ramp(512 * 512, 0.0)), ("x", &xv)])
+            .run(&[("cache", &ramp(1024 * 512, 0.0)), ("x", &xv)])
             .remove(0);
-        let mut want = ramp(512 * 512, 0.0);
-        for (w, v) in want[511 * 512..512 * 512].iter_mut().zip(&xv) {
+        let mut want = ramp(1024 * 512, 0.0);
+        for (w, v) in want[1023 * 512..1024 * 512].iter_mut().zip(&xv) {
             *w = v.max(0.0);
         }
         assert_eq!(got, want, "the striped geometry still writes the spare row");

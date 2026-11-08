@@ -2023,32 +2023,18 @@ fn compile_static_with(
     } else {
         0
     };
-    let scratch_bytes = {
-        let max_bind = dev.device.limits().max_storage_buffer_binding_size;
-        let max_buf = dev.device.limits().max_buffer_size;
-        // Large unsharded arenas (> storage bind cap) stage far operands into
-        // a dedicated tail so `scratch_off` is not stuck at `arena.size`.
-        // On ~2 GiB max_buffer adapters (VirtIO/DX12), a full 768 MiB stage
-        // on top of a nearly-full act arena + weight buffer OOMs — keep a
-        // modest tail; `RLX_WGPU_SHARD_STAGE_MIB` still overrides.
-        let stage = if (plan.arena_size as u64) > max_bind {
-            let full = crate::buffer::shard_stage_reserve();
-            if max_buf <= (2u64 << 30) && rlx_ir::env::var("RLX_WGPU_SHARD_STAGE_MIB").is_none() {
-                full.min(64 * 1024 * 1024)
-            } else {
-                full
-            }
-        } else {
-            0
-        };
-        base_scratch_bytes.max(conv_col_scratch).max(stage)
-    };
+    // What the graph's own ops claim from the tail (`compute_scratch_bytes`). The
+    // arena adds whatever staging *it* needs on top — a parked parameter's copy, or a
+    // far operand's when it does not bind whole — from the arena it actually builds
+    // (`Arena::from_plan_split_opts`, whose `scratch_bytes` is the answer). An
+    // unsplit arena is `plan` itself and is only built when the plan fits one
+    // binding, so it needs no reserve of its own.
+    let claimed = base_scratch_bytes.max(conv_col_scratch);
     // When the single-buffer arena would exceed the storage bind limit (or
     // max_buffer_size), split params into a separate weight buffer so the act
     // arena stays compact. Needed for NVIDIA ~2 GiB binds (Qwen3 F32 GGUF /
     // safetensors) and 27B-class packed GGUF. Only fused GGUF GEMV binds the
     // weight buffer directly; other ops stage params into the act window.
-    let max_buf = dev.device.limits().max_buffer_size;
     let max_bind = dev.device.limits().max_storage_buffer_binding_size;
     // Use the split/view-alias planner when the arena exceeds one storage bind
     // window (not only when it exceeds max_buffer_size). On Metal we raise
@@ -2084,21 +2070,20 @@ fn compile_static_with(
         && crate::gguf_gpu::packed_weights_bind_in_place(&graph);
     let mut arena = if rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
         || shares_params
-        || (plan.arena_size + scratch_bytes) as u64 > split_at
+        || (plan.arena_size + claimed) as u64 > split_at
     {
         // This constructor has the graph, so it records the parameter-storage bounds
         // itself, from the compact plan it re-plans and places the parameters under.
-        Arena::from_plan_split(&dev.device, &plan, &graph, scratch_bytes)
+        Arena::from_plan_split(&dev.device, &plan, &graph, claimed)
     } else if packed_in_place {
-        Arena::from_plan_split_opts(&dev.device, &plan, &graph, scratch_bytes, false)
+        Arena::from_plan_split_opts(&dev.device, &plan, &graph, claimed, false)
     } else {
         // This one never sees a graph, so its record is taken here: one recording per
         // arena, both plans covered.
-        let mut flat = Arena::from_plan_with_scratch(&dev.device, &plan, scratch_bytes);
+        let mut flat = Arena::from_plan_with_scratch(&dev.device, &plan, claimed);
         flat.record_param_storage(&graph);
         flat
     };
-    let _ = max_buf;
     // Record the plan's actual byte lengths and place the body frame's KV rows on
     // the cache rows they are copied to — the copy step then does not exist instead
     // of being scheduled better. This is the last mutation of the plan: every byte
@@ -2111,32 +2096,19 @@ fn compile_static_with(
         eprintln!(
             "[rlx-wgpu] arena build: plan {} + scratch {} vs split_at {} -> size {} sharded {}",
             plan.arena_size,
-            scratch_bytes,
+            arena.scratch_bytes,
             split_at,
             arena.size,
             arena.is_sharded()
         );
     }
-    // Override slot lengths with the actual elem*4 byte counts so
-    // readback returns the right element count (slots may be
-    // padded for alignment).
+    // Override slot lengths with the actual byte counts so readback returns the right
+    // element count (slots may be padded for alignment). `buffer::actual_slot_bytes`
+    // is the one expression: real/int/bool tensors are widened to exactly ONE f32 lane
+    // per element, complex ones keep every lane (C64 two, C128 four), a half-packed
+    // one two bytes.
     for node in graph.nodes() {
-        let elems = node.shape.num_elements().unwrap_or(0);
-        // Actual byte length = (# of f32 lanes) × 4. Real/int/bool tensors are
-        // widened to exactly ONE f32 lane per element (→ `elems * 4`). Complex
-        // tensors genuinely occupy MULTIPLE f32 lanes — C64 = 2 lanes (8 B),
-        // C128 = 4 lanes (16 B) — so `elems * 4` would truncate the slot and
-        // drop the imaginary (and df64 lo) lanes on readback / aliasing copies.
-        let dt = node.shape.dtype();
-        let actual = if dt.is_complex() {
-            elems * dt.size_bytes()
-        } else if crate::unfuse::is_half(node) {
-            // two halves to a word (`pack_half_activations`)
-            (elems * 2).div_ceil(4) * 4
-        } else {
-            elems * 4
-        };
-        arena.set_actual_len(node.id, actual);
+        arena.set_actual_len(node.id, crate::buffer::actual_slot_bytes(node));
     }
 
     // Initialize Constants directly into the arena. The wgpu arena is f32-
@@ -3582,7 +3554,7 @@ fn compile_static_with(
                 let a_off = if a_in {
                     arena_local_off_f32(&arena, a_id, base)
                 } else {
-                    if a_len > 64 * 1024 * 1024 {
+                    if a_len > crate::buffer::STAGED_OPERAND_MAX as u64 {
                         panic!("rlx-wgpu: Compare staging operand A too large ({a_len} bytes)");
                     }
                     schedule.push(Step::BufferCopy {
@@ -3595,7 +3567,7 @@ fn compile_static_with(
                 let b_off = if b_in {
                     arena_local_off_f32(&arena, b_id, base)
                 } else {
-                    if b_len > 64 * 1024 * 1024 {
+                    if b_len > crate::buffer::STAGED_OPERAND_MAX as u64 {
                         panic!("rlx-wgpu: Compare staging operand B too large ({b_len} bytes)");
                     }
                     schedule.push(Step::BufferCopy {
@@ -3797,7 +3769,7 @@ fn compile_static_with(
                 let cond_off = if cond_in {
                     arena_local_off_f32(&arena, cond_id, base)
                 } else {
-                    if cond_len > 64 * 1024 * 1024 {
+                    if cond_len > crate::buffer::STAGED_OPERAND_MAX as u64 {
                         panic!("rlx-wgpu: Where staging cond too large ({cond_len} bytes)");
                     }
                     schedule.push(Step::BufferCopy {
@@ -3810,7 +3782,7 @@ fn compile_static_with(
                 let x_off = if x_in {
                     arena_local_off_f32(&arena, x_id, base)
                 } else {
-                    if x_len > 64 * 1024 * 1024 {
+                    if x_len > crate::buffer::STAGED_OPERAND_MAX as u64 {
                         panic!("rlx-wgpu: Where staging x too large ({x_len} bytes)");
                     }
                     schedule.push(Step::BufferCopy {
@@ -3823,7 +3795,7 @@ fn compile_static_with(
                 let y_off = if y_in {
                     arena_local_off_f32(&arena, y_id, base)
                 } else {
-                    if y_len > 64 * 1024 * 1024 {
+                    if y_len > crate::buffer::STAGED_OPERAND_MAX as u64 {
                         panic!("rlx-wgpu: Where staging y too large ({y_len} bytes)");
                     }
                     schedule.push(Step::BufferCopy {
@@ -3885,7 +3857,7 @@ fn compile_static_with(
                 let a_off = if a_in {
                     arena_local_off_f32(&arena, a_id, base)
                 } else {
-                    if a_len > 64 * 1024 * 1024 {
+                    if a_len > crate::buffer::STAGED_OPERAND_MAX as u64 {
                         panic!("rlx-wgpu: Fma staging a too large ({a_len} bytes)");
                     }
                     schedule.push(Step::BufferCopy {
@@ -3898,7 +3870,7 @@ fn compile_static_with(
                 let b_off = if b_in {
                     arena_local_off_f32(&arena, b_id, base)
                 } else {
-                    if b_len > 64 * 1024 * 1024 {
+                    if b_len > crate::buffer::STAGED_OPERAND_MAX as u64 {
                         panic!("rlx-wgpu: Fma staging b too large ({b_len} bytes)");
                     }
                     schedule.push(Step::BufferCopy {
@@ -3911,7 +3883,7 @@ fn compile_static_with(
                 let c_off = if c_in {
                     arena_local_off_f32(&arena, c_id, base)
                 } else {
-                    if c_len > 64 * 1024 * 1024 {
+                    if c_len > crate::buffer::STAGED_OPERAND_MAX as u64 {
                         panic!("rlx-wgpu: Fma staging c too large ({c_len} bytes)");
                     }
                     schedule.push(Step::BufferCopy {

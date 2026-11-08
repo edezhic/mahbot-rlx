@@ -783,6 +783,19 @@ impl CompiledGraph {
         ok
     }
 
+    /// [`ExecutableGraph::write_gpu_handle_rows`]: `false` when the backend holds no
+    /// such slot. Not an input binding, so the `io` bookkeeping
+    /// [`Self::bind_gpu_handle`] does not apply.
+    pub fn write_gpu_handle_rows(
+        &mut self,
+        name: &str,
+        row: usize,
+        row_elems: usize,
+        rows: &[f32],
+    ) -> bool {
+        self.inner.write_gpu_handle_rows(name, row, row_elems, rows)
+    }
+
     /// Rewrite the draw seeds of the graph's `Sample` steps, in schedule order —
     /// the per-run knob a compiled sampling graph needs, because `Op::Sample`'s
     /// seed is a uniform word rather than a pipeline constant. Answers false, and

@@ -998,13 +998,7 @@ impl<'a> Clip<'a> {
         // layout, and the step's own row is appended in-graph.
         // `mask[0..written]` is the history the decode may attend to;
         // `mask[capacity]` is the one query slot, not a cache row.
-        let graphs::PlaneCache {
-            k: mut k_cache,
-            v: mut v_cache,
-            mut mask,
-        } = graphs::seed_plane_cache(cfg.layers, capacity, prompt_rows, hkv, &p[1], &p[2]);
         let mut next = argmax(&p[3][..vocab]) as usize;
-        p.clear();
         let mut decode = match &self.decode {
             Some(decode) => Arc::clone(decode),
             None => {
@@ -1019,16 +1013,18 @@ impl<'a> Clip<'a> {
         // builds is nobody else's, so it needs no lock of its own.
         let held = Arc::clone(&decode);
         let _walk = held.walk();
-        if !decode
-            .graph()
-            .runner
-            .resident_cache_planes(&k_cache, &v_cache)
-        {
-            return Err(anyhow!("resident cache refused"));
-        }
-        for rows in k_cache.iter_mut().chain(v_cache.iter_mut()) {
-            rows.clear();
-        }
+        // The prompt's rows go straight from the prefill's output into the decode's
+        // own arena slots: the device holds the cache from here, and the rows this
+        // walk writes go to it through the row feed, so no host plane is kept.
+        let mut mask = decode.graph().runner.resident_cache_planes(
+            cfg.layers,
+            capacity,
+            prompt_rows,
+            hkv,
+            &p[1],
+            &p[2],
+        )?;
+        p.clear();
         let mut generated: Vec<usize> = Vec::new();
         let mut written = prompt_rows;
         let mut decode_times: Vec<f64> = Vec::new();
@@ -1071,35 +1067,30 @@ impl<'a> Clip<'a> {
             next = argmax(&o[0][..vocab]) as usize;
             mask[written] = 1.0;
             written += 1;
-            // A compiled graph's attention reads its whole `[capacity + 1]` plane,
-            // so the cache grows by one bucket when the live rows reach it: the
-            // written rows move in a plain row copy, the rest stays zero, and the
-            // mask is rebuilt with the same key order (history, then the spare row
-            // now at `cap`). The arithmetic and the graph are unchanged.
+            // A compiled graph's attention reads its whole `[capacity + 1]` plane, so
+            // the cache grows by one bucket when the live rows reach it: the written
+            // rows move to the grown graph (one readback, then a write per plane), the
+            // rest of the fresh arena stays zero, and the mask is rebuilt with the same
+            // key order (history, then the spare row now at `cap`). The arithmetic and
+            // the graph are unchanged.
             if written == capacity && !is_asr_eos(next) && generated.len() < max_new {
+                // This walk holds its graph's lock through the rebuild, so the old arena
+                // outlives the copy and the two overlap for the whole compile. The rows
+                // are read out first, and no host plane is kept beyond that one buffer.
+                let rows = decode
+                    .graph()
+                    .runner
+                    .read_plane_rows(cfg.layers, hkv, written)?;
                 let cap = capacity + graphs::CACHE_BUCKET;
-                let (k_new, v_new) =
-                    graphs::lift_planes(&decode.graph(), cfg.layers, hkv, written, cap)?;
-                k_cache = k_new;
-                v_cache = v_new;
-                mask = graphs::resident_mask(written, cap);
                 let t = report::Stopwatch::start();
-                let grown = decode_graph(&self.pair, cap)?;
+                let mut grown = decode_graph(&self.pair, cap)?;
                 build_ms += t.ms();
+                grown.runner.write_plane_rows(cfg.layers, &rows)?;
+                mask = graphs::resident_mask(written, cap);
                 // A grown capacity is this clip's own: a rung keeps the pair's one graph,
                 // which its other chunks still run. The walk lock is still held, so nothing
                 // else is inside the graph this replaces.
                 decode = Shared::new(grown);
-                if !decode
-                    .graph()
-                    .runner
-                    .resident_cache_planes(&k_cache, &v_cache)
-                {
-                    return Err(anyhow!("resident cache refused at capacity {cap}"));
-                }
-                for rows in k_cache.iter_mut().chain(v_cache.iter_mut()) {
-                    rows.clear();
-                }
                 capacity = cap;
             }
         }
