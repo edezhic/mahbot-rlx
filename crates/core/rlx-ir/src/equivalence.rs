@@ -33,6 +33,12 @@
 //! every field of every present and future variant participates automatically,
 //! with no `Hash`/`Eq` bound on `Op` and no per-op key function to keep in sync.
 //!
+//! [`Op::Constant`] is the one exception: `Debug` renders its payload as one
+//! decimal number per byte, so hashing it that way made a fingerprint's cost
+//! grow with the payload rather than with the graph — 5 KiB per frame on the
+//! mel front end, paid four times per compile. It is hashed from its bytes
+//! instead.
+//!
 //! Nested bodies are handled explicitly rather than falling out of `Debug`:
 //! an op that carries subgraphs is hashed as a *body-free surrogate* (bodies
 //! blanked via [`Op::subgraphs_mut`]) followed by a recursive hash of each
@@ -45,10 +51,10 @@
 //!
 //! Fingerprints are stable within a process and across processes for a given
 //! build, but they are **not** a persistence format: they ride on `Debug`
-//! output and on `DefaultHasher`, either of which may shift between compiler
-//! or crate versions. Use them for caching, change detection and test
-//! assertions — not for on-disk artifacts. [`crate::serialize`] is the
-//! durable format.
+//! output, on constant payload bytes and on `DefaultHasher`, any of which may
+//! shift between compiler or crate versions. Use them for caching, change
+//! detection and test assertions — not for on-disk artifacts.
+//! [`crate::serialize`] is the durable format.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as _;
@@ -117,6 +123,14 @@ const SEP: u8 = 0xff;
 
 /// Hash one [`Op`] (including any nested bodies) into `h`.
 pub fn hash_op_into<H: Hasher>(op: &Op, cfg: IgnoreConfig, h: &mut H) {
+    // Leaf, so no body handling. `Quantize`'s `scales` would pay the same cost;
+    // it keeps its rendering because nothing builds a large one.
+    if let Op::Constant { data } = op {
+        h.write(b"Constant");
+        data.hash(h);
+        h.write_u8(SEP);
+        return;
+    }
     let bodies = op.subgraphs();
     if bodies.is_empty() {
         // Fast path — no clone, no allocation, whole payload via Debug.
@@ -226,6 +240,10 @@ pub fn ops_deep_eq(a: &Op, b: &Op, cfg: IgnoreConfig) -> bool {
     }
 
     if a_bodies.is_empty() {
+        // Rendering, not the hashed form: this is the exact comparison, where the
+        // payload has to be read either way. The compile path never sends a
+        // constant here — its only caller is CSE, which value-numbers interior
+        // nodes, and a `Constant` is a leaf.
         return format!("{a:?}") == format!("{b:?}");
     }
 
@@ -368,6 +386,28 @@ mod tests {
         assert_eq!(a, b, "Graph::eq is documented-shallow");
         assert!(!a.structurally_eq(&b, IgnoreConfig::SEMANTIC));
         assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn constant_payload_change_is_detected() {
+        // The payload is no longer rendered into the fingerprint, so this is the
+        // bar that change has to clear: one differing byte is still a change.
+        let with = |len: usize, last: u8| {
+            let mut data = vec![0u8; len];
+            *data.last_mut().unwrap() = last;
+            let mut g = Graph::new("c");
+            let n = g.add_node(
+                Op::Constant { data },
+                vec![],
+                Shape::new(&[len / 4], DType::F32),
+            );
+            g.set_outputs(vec![n]);
+            g
+        };
+
+        assert_eq!(with(64, 7).fingerprint(), with(64, 7).fingerprint());
+        assert_ne!(with(64, 7).fingerprint(), with(64, 8).fingerprint());
+        assert!(!with(64, 7).structurally_eq(&with(64, 8), IgnoreConfig::SEMANTIC));
     }
 
     #[test]
