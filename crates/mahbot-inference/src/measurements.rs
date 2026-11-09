@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::source::rust_code;
+
 /// A record file, and the one mode that writes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Record {
@@ -28,8 +30,8 @@ pub enum Record {
 }
 
 impl Record {
-    /// Every record, so a path that must speak of all of them — the digest's
-    /// exclusions, a test — cannot be written against three names and miss a fourth.
+    /// Every record, so a test that must speak of all of them cannot be written
+    /// against three names and miss a fourth.
     pub const ALL: [Self; 3] = [Self::Stand, Self::TranscriptionCorpus, Self::WakeWordBench];
 
     /// The file's name at the workspace root.
@@ -120,9 +122,9 @@ impl Record {
     }
 }
 
-/// Replace `record` whole: its heading, its body — the table or tables, each with
-/// a short caption under it — and the provenance block its inputs build. A mode
-/// owns one file, so this is the only write path.
+/// Replace `record` whole: its heading, its body — the table or tables — and the
+/// provenance block its inputs build. A mode owns one file, so this is the only
+/// write path.
 pub fn write(record: Record, body: &str, inputs: &str) -> Result<()> {
     write_at(&record.path()?, record, body, &provenance(record, inputs))
 }
@@ -368,12 +370,10 @@ fn provenance(record: Record, inputs: &str) -> String {
     body.push_str(&format!("- profile: {}\n", profile()));
     let load = load();
     if !load.is_empty() {
-        body.push_str(&format!(
-            "- load: {load} (1, 5 and 15 minutes when the record was written)\n"
-        ));
+        body.push_str(&format!("- load: {load} (1m · 5m · 15m)\n"));
     }
     body.push_str(&format!(
-        "- code: {} (the commit and the SHA-256 of the tree's difference from it, {})\n",
+        "- code: {} ({})\n",
         code_state(),
         exclusions_note(),
     ));
@@ -413,13 +413,12 @@ fn run_form() -> String {
 }
 
 /// The code state the numbers were taken at: `git describe --always` plus the
-/// SHA-256 of what the tree holds beyond its commit, so a reader can reconstruct
-/// the content that produced a figure from the two. The digest is appended
-/// whenever git can answer, and a clean tree's is the stable empty-diff constant;
-/// when git cannot, the line carries the describe state alone rather than
-/// inventing a figure. `git describe --dirty` counts the vendored MLX submodule,
-/// which `change_digest` excludes, so the marker and the digest would otherwise
-/// disagree about what "dirty" means.
+/// SHA-256 of the tree's content, so a reader can identify the code that produced a
+/// figure. The commit is only a pointer to where the numbers came from; the digest
+/// is the identity, and it is taken over content rather than over a difference from
+/// the commit, so two different clean trees do not share it. When git cannot answer
+/// or a file cannot be read, the line carries `tree-sha256 unavailable` rather than
+/// inventing a figure or silently omitting the token.
 fn code_state() -> String {
     let describe = std::process::Command::new("git")
         .args(["describe", "--always"])
@@ -430,141 +429,178 @@ fn code_state() -> String {
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "no commit".to_string());
-    match change_digest() {
-        Some(digest) => format!("{describe} change-sha256 {digest}"),
-        None => describe,
+    match tree_digest(exclusions()) {
+        Some(digest) => format!("{describe} tree-sha256 {digest}"),
+        // A digest that could not be taken is named, never omitted: a missing token
+        // would read as a record written before the rule existed.
+        None => format!("{describe} tree-sha256 unavailable"),
     }
 }
 
-/// The paths [`change_digest`] leaves out: the three records — each mode's own file is
-/// the figure, not part of the code that produced it — and the vendored MLX checkout,
-/// which is not this fork's content. One list, derived from [`Record::ALL`] and
-/// printed beside the figure it produces.
-fn exclusions() -> Vec<&'static str> {
-    Record::ALL
-        .into_iter()
-        .map(Record::file)
-        .chain(["crates/backends/rlx-mlx-sys"])
-        .collect()
+/// What the content digest leaves out, and why: a document is prose about the tree
+/// rather than an input to a figure (the three records are Markdown too), no file
+/// under a `tests` directory or in a `tests.rs` module runs in a measuring binary,
+/// and the vendored MLX checkout is not this fork's content. One list, printed beside
+/// the figure it produces; [`excluded`] matches it.
+fn exclusions() -> &'static [&'static str] {
+    &["*.md", "tests", "tests.rs", "crates/backends/rlx-mlx-sys"]
 }
 
-/// [`exclusions`] as the provenance line's parenthetical.
+/// [`exclusions`] as the provenance line's parenthetical: the rule the digest is
+/// computed by, including the transforms that cannot be read out of a path list.
 fn exclusions_note() -> String {
     let names: Vec<String> = exclusions()
         .iter()
         .map(|path| format!("`{path}`"))
         .collect();
-    format!("{} left out", names.join(", "))
+    format!(
+        "SHA-256 of the tree's content, not a difference from the commit: every file \
+         git tracks or lists as untracked and not ignored is read (ignored build \
+         output is not; a tracked file deleted from the worktree is marked absent); in \
+         Rust sources comments are stripped (literals respected), `#[cfg(test)]` and \
+         `#[cfg(all(test, ...))]` items are cut, and whitespace outside literals is \
+         collapsed; {} and writer temporaries are left out; an unreadable file leaves \
+         the digest unavailable",
+        names.join(", ")
+    )
 }
 
-/// SHA-256 over what the tree holds beyond its commit: `git diff HEAD --binary`
-/// with [`exclusions`] left out — the digest names the *code* that produced a
-/// figure, and the record is the figure — plus every untracked, non-ignored
-/// file's path and bytes, since an added source file the index has not seen is
-/// part of that code too. A writer's leftover temporary is not content: it is left
-/// out by the rule that recognizes it (`leftover`). First 16 hex characters.
-/// `None` when git cannot answer; the caller then records the describe state alone
-/// rather than inventing a figure.
-fn change_digest() -> Option<String> {
-    tree_digest(&exclusions())
+/// Whether `path` is left out by one of `exclude`'s rules: an exact path or directory
+/// prefix, a `*.md` suffix, a `tests` path component, or a `tests.rs` name.
+fn excluded(path: &str, exclude: &[&str]) -> bool {
+    if Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(leftover)
+        .is_some()
+    {
+        return true;
+    }
+    exclude.iter().any(|rule| match *rule {
+        "*.md" => path.ends_with(".md"),
+        "tests" => path.split('/').any(|component| component == "tests"),
+        "tests.rs" => path == "tests.rs" || path.ends_with("/tests.rs"),
+        rule => path == rule || path.starts_with(&format!("{rule}/")),
+    })
 }
 
-/// [`change_digest`] over an explicit exclusion set — so the test can recompute the
-/// figure from the rule the record prints, through this same plumbing.
+/// SHA-256 over the tree's content, with [`exclusions`] and [`rust_code`] applied,
+/// first 16 hex characters. Every tracked file and every untracked, non-ignored
+/// file is read; a tracked file missing from the worktree is marked absent, so a
+/// deletion moves the digest rather than reading as the complete tree. A file that
+/// is there but cannot be read — a broken symlink included — fails the whole digest
+/// rather than dropping out of it. `None` when git cannot list the tree or a file
+/// cannot be read: the caller then names the digest unavailable, never a digest of a
+/// tree it could not read.
 fn tree_digest(exclude: &[&str]) -> Option<String> {
     use sha2::{Digest as _, Sha256};
 
-    // From the repository's root, not this crate's directory: a `Path`-relative
-    // pathspec and `ls-files`' own output would otherwise both stop at the crate, and
-    // the digest would cover this crate's difference only.
+    // A path is followed by its state and, for a file, its bytes: a deletion, a
+    // directory (a gitlink) and an empty file are three different things.
+    const ABSENT: u8 = 0;
+    const FILE: u8 = 1;
+    const DIRECTORY: u8 = 2;
+
+    // From the repository's root, not this crate's directory: `ls-files` run in the
+    // crate would cover this crate only.
     let root = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .ok()?;
     let root = PathBuf::from(String::from_utf8(root.stdout).ok()?.trim().to_string());
-    let args: Vec<String> = ["diff", "HEAD", "--binary", "--", "."]
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .chain(exclude.iter().map(|path| format!(":(exclude){path}")))
-        .collect();
-    let diff = std::process::Command::new("git")
-        .args(&args)
+    // NUL-separated: a path may hold any other byte. `--cached` lists the index, so
+    // a worktree deletion is still listed; the metadata check below marks it absent.
+    let listed = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .current_dir(&root)
         .output()
         .ok()?;
-    if !diff.status.success() {
+    if !listed.status.success() {
         return None;
     }
-    let untracked = std::process::Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard"])
-        .current_dir(&root)
-        .output()
-        .ok()?;
-    if !untracked.status.success() {
-        return None;
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(&diff.stdout);
-    let untracked = untracked_paths(&untracked.stdout)?
-        .into_iter()
-        .filter(|path| !exclude.contains(&path.as_str()))
-        .filter(|path| {
-            !Path::new(path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(leftover)
-                .is_some()
-        })
+    let mut paths: Vec<String> = std::str::from_utf8(&listed.stdout)
+        .ok()?
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
         .collect();
-    hash_untracked(&mut hasher, &root, untracked);
-    Some(hex(&hasher.finalize())[..16].to_string())
-}
-
-/// `git ls-files --others --exclude-standard` output as a path list.
-fn untracked_paths(bytes: &[u8]) -> Option<Vec<String>> {
-    Some(
-        std::str::from_utf8(bytes)
-            .ok()?
-            .lines()
-            .filter(|path| !path.is_empty())
-            .map(str::to_string)
-            .collect(),
-    )
-}
-
-/// Feed each untracked path and its bytes into `hasher`, sorted so the digest
-/// does not depend on the order git lists them. A file that cannot be read
-/// (permissions, a directory the listing caught) contributes its path and a
-/// marker rather than dropping the whole digest to `None`: the digest exists to
-/// identify content, and answering "no change" for a tree it merely could not
-/// read is the one answer it must not give. Streamed, like [`sha256_file`], so an
-/// untracked artifact of any size costs a fixed buffer rather than its own length
-/// in memory.
-fn hash_untracked(hasher: &mut sha2::Sha256, root: &Path, mut paths: Vec<String>) {
-    use sha2::Digest as _;
-
     paths.sort_unstable();
+    paths.dedup();
+
+    // Only a Rust source is held whole, because only it is lexed; every other file
+    // streams through this fixed buffer, so a large untracked artifact costs a
+    // constant here — the process writing a memory record must not allocate a
+    // file-sized buffer to finish its own bookkeeping.
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut hasher = Sha256::new();
     for path in paths {
+        if excluded(&path, exclude) {
+            continue;
+        }
         hasher.update(path.as_bytes());
         hasher.update([0]);
-        match std::fs::File::open(root.join(&path)) {
-            Ok(mut file) => {
-                let mut buf = vec![0u8; 1 << 20];
-                loop {
-                    match std::io::Read::read(&mut file, &mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => hasher.update(&buf[..n]),
-                        Err(_) => {
-                            hasher.update(b"<unreadable>");
-                            break;
-                        }
-                    }
-                }
+        let full = root.join(&path);
+        // `symlink_metadata` does not follow: a path that is not there at all is a
+        // deletion and is marked, while a symlink that exists is a file the digest
+        // must read (a broken one fails it below).
+        let link = match std::fs::symlink_metadata(&full) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                hasher.update([ABSENT]);
+                continue;
             }
-            Err(_) => hasher.update(b"<unreadable>"),
+            Err(_) => return None,
+        };
+        if link.is_dir()
+            || (link.file_type().is_symlink()
+                && std::fs::metadata(&full).is_ok_and(|target| target.is_dir()))
+        {
+            // A gitlink (submodule) or a symlink to a directory: no file bytes.
+            hasher.update([DIRECTORY]);
+            continue;
+        }
+        let mut file = match std::fs::File::open(&full) {
+            Ok(file) => file,
+            // The path existed a moment ago; if it cannot be opened now, the digest
+            // must fail rather than drop a file it could not read.
+            Err(_) => return None,
+        };
+        hasher.update([FILE]);
+        if path.ends_with(".rs") {
+            let mut bytes = Vec::new();
+            if std::io::Read::read_to_end(&mut file, &mut bytes).is_err() {
+                return None;
+            }
+            let content = rust_code(&bytes);
+            hasher.update(&content);
+            hasher.update(
+                u64::try_from(content.len())
+                    .unwrap_or(u64::MAX)
+                    .to_le_bytes(),
+            );
+        } else {
+            let mut len = 0u64;
+            loop {
+                let n = match std::io::Read::read(&mut file, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return None,
+                };
+                len += n as u64;
+                hasher.update(&buf[..n]);
+            }
+            hasher.update(len.to_le_bytes());
         }
     }
+    Some(hex(&hasher.finalize())[..16].to_string())
 }
 
 /// Hex SHA-256 of a file's bytes, streamed so a multi-gigabyte model file is not
@@ -604,6 +640,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::Basis;
 
     /// A directory of this test's own — so a sweep that names no target cannot reach a
     /// file another program left in the shared temp directory — removed whole when it
@@ -658,9 +695,10 @@ mod tests {
             .then_some(root)
     }
 
-    /// Each checked-in record opens with the heading its own mode writes, so a
-    /// hand-edited file cannot contradict the code that owns it. The files live in
-    /// the repository, not in the crate, so a copy outside the checkout skips this.
+    /// Each checked-in record opens with the heading its own mode writes, and nothing
+    /// else on that line, so a hand-edited file cannot contradict the code that owns
+    /// it. The files live in the repository, not in the crate, so a copy outside the
+    /// checkout skips this.
     #[test]
     fn every_record_opens_with_its_own_heading() {
         let Some(root) = repository_root() else {
@@ -671,8 +709,9 @@ mod tests {
             let path = root.join(record.file());
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            assert!(
-                text.starts_with(record.heading()),
+            assert_eq!(
+                text.lines().next().map(str::trim),
+                Some(record.heading()),
                 "{} does not open with `{}`",
                 path.display(),
                 record.heading()
@@ -680,15 +719,16 @@ mod tests {
         }
     }
 
-    /// The provenance line names the content, not only the commit, and the rule it
-    /// prints is the rule it computes: a reader who applies the exclusions the printed
-    /// rule names — read out of the rule itself, not out of `exclusions` — must arrive
-    /// at the figure the line carries. A copy outside the checkout carries no
-    /// records, so it skips; in the repository a tree git cannot read has nothing to
-    /// pin, so the check fails rather than passing quietly.
-    /// Device-free, and it reads the tree instead of writing into it.
+    /// The `code_state` digest is taken over the tree's content, and the rule the
+    /// provenance line prints names every path the digest excludes, so the rule a
+    /// record states is the rule the code applies. The transforms the rule states are
+    /// the stripper's, covered by the tests in `source`; hand-reproducibility of the
+    /// whole digest is deliberately not claimed. A copy outside the checkout carries
+    /// no records, so it skips; in the repository a tree git cannot read has nothing
+    /// to pin, so the check fails rather than passing quietly. Device-free, and it
+    /// reads the tree instead of writing into it.
     #[test]
-    fn the_provenance_line_carries_the_digest_of_the_trees_difference() {
+    fn the_code_state_carries_the_digest_of_the_trees_content() {
         if repository_root().is_none() {
             eprintln!("skipped: no records beside this crate");
             return;
@@ -696,22 +736,180 @@ mod tests {
         let state = code_state();
         eprintln!("code_state: {state}");
         let (_describe, digest) = state
-            .split_once(" change-sha256 ")
+            .split_once(" tree-sha256 ")
             .expect("git must answer inside the repository");
         assert_eq!(digest.len(), 16, "16 hex characters: {state}");
         assert!(
             digest.chars().all(|c| c.is_ascii_hexdigit()),
             "hexadecimal: {state}"
         );
-
         let rule = exclusions_note();
-        let named: Vec<&str> = rule.split('`').skip(1).step_by(2).collect();
-        assert!(!named.is_empty(), "the rule names its exclusions: {rule}");
-        assert_eq!(
-            digest,
-            tree_digest(&named).expect("git must answer"),
-            "the rule the record prints must reproduce the digest it sits beside: {rule}"
+        for path in exclusions() {
+            assert!(
+                rule.contains(&format!("`{path}`")),
+                "the printed rule names `{path}`: {rule}"
+            );
+        }
+    }
+
+    /// The digest leaves out the three records, every Markdown document, every
+    /// `tests/` directory, every `tests.rs` module and the vendored backend, and a
+    /// writer's leftover temporary; a source file under `src/` is content.
+    #[test]
+    fn the_digest_excludes_documents_tests_and_the_vendored_backend() {
+        let rule = exclusions();
+        for record in Record::ALL {
+            assert!(
+                excluded(record.file(), rule),
+                "{} is not excluded",
+                record.file()
+            );
+        }
+        for path in [
+            "README.md",
+            "docs/records.md",
+            "crates/mahbot-inference/tests/product_checks.rs",
+            "crates/core/rlx-ir/src/rlxmodel/tests.rs",
+            "crates/backends/rlx-mlx-sys/src/lib.rs",
+            "STAND.md.tmp-12",
+        ] {
+            assert!(excluded(path, rule), "{path} is not excluded");
+        }
+        for path in [
+            "crates/mahbot-inference/src/measurements.rs",
+            "crates/backends/rlx-wgpu/src/kernels/matmul.wgsl",
+            "Cargo.toml",
+            "crates/mahbot-inference/benches/wake_word.rs",
+        ] {
+            assert!(!excluded(path, rule), "{path} is excluded");
+        }
+    }
+
+    /// A record is headings, tables, status tokens and provenance fields: no caption,
+    /// narrative, note or footer. The writers produce that shape; this checks the
+    /// checked-in files too, so nothing can put prose back by hand.
+    #[test]
+    fn the_records_carry_tables_and_provenance_only() {
+        let Some(root) = repository_root() else {
+            eprintln!("skipped: no records beside this crate");
+            return;
+        };
+        let rule = exclusions_note();
+        for record in Record::ALL {
+            let path = root.join(record.file());
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            assert_eq!(
+                prose(&text, &rule),
+                None,
+                "{} is not a numbers-only record",
+                record.file()
+            );
+            let memory = text
+                .split_once("_Measured ")
+                .expect("prose found a provenance block")
+                .1
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("- memory: "));
+            let valid = [
+                Basis::Footprint.field(),
+                Basis::Resident.field(),
+                Basis::Mixed.field(),
+            ];
+            assert!(
+                memory.is_some_and(|token| valid.contains(&token)),
+                "{} does not name its memory basis: {memory:?}",
+                record.file()
+            );
+        }
+    }
+
+    /// Why `text` is not a numbers-only record, or `None` when it is one. A body line
+    /// is blank, a table row or a heading; a sentence terminator anywhere in a body or
+    /// provenance line is prose; a `code:` parenthetical is exempt only when it is
+    /// exactly `rule`, and a `run form:` value is exempt because an environment
+    /// variable is arbitrary text. The terminator set is deliberately this small: a
+    /// gate cannot tell a short value from a sentence.
+    fn prose(text: &str, rule: &str) -> Option<String> {
+        let Some((body, provenance)) = text.split_once("_Measured ") else {
+            return Some("no provenance block".to_string());
+        };
+        for line in body.lines() {
+            let line = line.trim();
+            if !(line.is_empty() || line.starts_with('|') || line.starts_with('#')) {
+                return Some(format!("prose: `{line}`"));
+            }
+            if terminator(line) {
+                return Some(format!("sentence: `{line}`"));
+            }
+        }
+        for line in format!("_Measured {provenance}").lines() {
+            let line = line.trim();
+            if !(line.is_empty() || line.starts_with("_Measured ") || line.starts_with("- ")) {
+                return Some(format!("prose in provenance: `{line}`"));
+            }
+            if let Some(value) = line.strip_prefix("- code: ") {
+                if let Some((head, note)) = value.split_once(" (") {
+                    let note = note.strip_suffix(')').unwrap_or(note);
+                    if note != rule {
+                        return Some(format!(
+                            "a digest rule that is not the printed one: `{line}`"
+                        ));
+                    }
+                    if terminator(head) {
+                        return Some(format!("sentence in the code field: `{line}`"));
+                    }
+                } else if terminator(value) {
+                    return Some(format!("sentence in the code field: `{line}`"));
+                }
+            } else if let Some(value) = line.strip_prefix("_Measured ") {
+                // The timestamp's own closing period is the italic's, not prose.
+                let value = value.strip_suffix('_').unwrap_or(value);
+                let value = value.strip_suffix('.').unwrap_or(value);
+                if terminator(value) {
+                    return Some(format!("sentence in the timestamp: `{line}`"));
+                }
+            } else if line.starts_with("- run form: ") {
+                // The value is whatever an environment variable held during a
+                // legitimate take, so it is exempt like the `code:` rule.
+            } else if terminator(line) {
+                return Some(format!("sentence in provenance: `{line}`"));
+            }
+        }
+        None
+    }
+
+    /// Whether `text` carries a sentence terminator — the one shape no unit, status
+    /// token or label in these files takes.
+    fn terminator(text: &str) -> bool {
+        text.contains(". ") || text.contains("; ")
+    }
+
+    /// The gate's jobs: a heading is allowed, a sentence in a body or provenance line
+    /// is rejected, a `code:` parenthetical is accepted only when it is the printed
+    /// rule, and a `run form:` value is exempt.
+    #[test]
+    fn the_prose_gate_accepts_a_heading_and_rejects_a_sentence_or_another_rule() {
+        let rule = exclusions_note();
+        let good = format!(
+            "# Stand\n\n## Voices\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n_Measured now._\n\
+             - code: abc tree-sha256 0123456789abcdef ({rule})\n- memory: footprint\n"
         );
+        assert_eq!(prose(&good, &rule), None);
+
+        let old_rule = "# Stand\n\n_Measured now._\n- code: abc change-sha256 0123456789abcdef \
+                        (the commit and the SHA-256 of the tree's difference from it, left out)\n\
+                        - memory: footprint\n";
+        assert!(prose(old_rule, &rule).is_some());
+
+        let sentence = "# Stand\n\n| a sentence. Another sentence. |\n|---|---|\n\n_Measured now._\n\
+                        - memory: footprint\n";
+        assert!(prose(sentence, &rule).is_some());
+
+        // A run form is an environment variable's value, whatever it holds.
+        let run_form = "# Stand\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n_Measured now._\n\
+                        - run form: RLX_TRACE=a. b\n- memory: footprint\n";
+        assert_eq!(prose(run_form, &rule), None);
     }
 
     /// A write replaces the file whole: there are no sections, so a later write
@@ -723,24 +921,24 @@ mod tests {
         write_at(
             &path,
             Record::Stand,
-            "| a |\n|---|\n\ncaption one",
+            "| a |\n|---|\n\nbody one",
             "- code: one",
         )
         .expect("first write");
         write_at(
             &path,
             Record::Stand,
-            "| b |\n|---|\n\ncaption two",
+            "| b |\n|---|\n\nbody two",
             "- code: two",
         )
         .expect("second write");
         let text = std::fs::read_to_string(&path).expect("the file");
         assert!(
-            text.starts_with("# Stand\n\n| b |\n|---|\n\ncaption two"),
+            text.starts_with("# Stand\n\n| b |\n|---|\n\nbody two"),
             "{text}"
         );
         assert!(
-            !text.contains("caption one") && !text.contains("| a |"),
+            !text.contains("body one") && !text.contains("| a |"),
             "{text}"
         );
     }

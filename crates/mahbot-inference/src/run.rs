@@ -20,7 +20,7 @@ use anyhow::{Context as _, Result, bail};
 use serde_json::{Map, Value};
 
 use crate::guard::{Bounds, Deadline, EXIT_STOPPED, MemoryCeiling, RunLock, Watch, lock_path};
-use crate::report::Memory;
+use crate::report::{Basis, Memory};
 
 /// The row a parent is waiting on, while it runs. A parent that leaves with its row
 /// still measuring leaves a multi-gigabyte process on the device with the lock
@@ -268,7 +268,7 @@ impl Reading {
             "peak_bytes": self.memory.peak,
             "resting_gpu_bytes": self.memory.gpu_now,
             "peak_gpu_bytes": self.memory.gpu_peak,
-            "memory": if self.memory.footprint { "footprint" } else { "resident" },
+            "memory": Basis::of([self.memory.footprint]).field(),
             "detail": self.detail,
         })
         .to_string()
@@ -313,10 +313,17 @@ impl Reading {
             .and_then(Value::as_object)
             .with_context(|| "the reading has no `detail`")?
             .clone();
-        let footprint = match string("memory")? {
-            "footprint" => true,
-            "resident" => false,
-            other => bail!("the reading's `memory` is `{other}`, not `footprint` or `resident`"),
+        let token = string("memory")?;
+        let footprint = if token == Basis::Footprint.field() {
+            true
+        } else if token == Basis::Resident.field() {
+            false
+        } else {
+            bail!(
+                "the reading's `memory` is `{token}`, not `{}` or `{}`",
+                Basis::Footprint.field(),
+                Basis::Resident.field()
+            );
         };
         Ok(Self {
             row: string("row")?.to_string(),

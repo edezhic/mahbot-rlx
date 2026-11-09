@@ -472,8 +472,9 @@ fn pair_gpu(gpu: Option<u64>, total: Option<u64>) -> Option<u64> {
 
 /// The basis a table's memory figures were taken on — the platform's physical
 /// footprint, the resident set where the platform supplied none, or both across
-/// the rows. It is read off the rows themselves, so a caption describes the
-/// figures under it rather than the machine the caption is printed on.
+/// the rows. It is read off the rows themselves, so a record's `- memory:` field
+/// describes the figures under it rather than the machine the field is printed on.
+/// The definitions live in `docs/records.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Basis {
     Footprint,
@@ -483,7 +484,7 @@ pub(crate) enum Basis {
 
 impl Basis {
     /// The basis the rows carrying these `footprint` flags were taken on. No rows
-    /// means no figure for a caption to qualify — a table nobody filled has nothing a
+    /// means no figure for a field to qualify — a table nobody filled has nothing a
     /// fallback could describe — so the platform's own reading is the one named.
     #[must_use]
     pub(crate) fn of(rows: impl IntoIterator<Item = bool>) -> Self {
@@ -502,101 +503,19 @@ impl Basis {
         }
     }
 
-    /// What the figures are and what their pair means, as the caption under a table
-    /// states it: the accounting each half comes from, what it includes and cannot
-    /// see, how the two were taken, and what the pair means on this machine. Every
-    /// arm is composed from the same sentences, so a mixed table's caption cannot
-    /// drift from the uniform ones'.
+    /// The token a record's `- memory:` field carries. A table whose rows disagree
+    /// names `mixed`; the two bases are then not comparable, and each row's own basis
+    /// is what a reader has to go by. Every writer spells the token through this
+    /// method; the checked-in records carry `footprint` and `resident`.
     #[must_use]
-    pub(crate) fn caption(self) -> String {
+    pub(crate) fn field(self) -> &'static str {
         match self {
-            Self::Footprint => [
-                FOOTPRINT_BASE,
-                PAIR,
-                OUTSIDE_PAIR,
-                PEAK,
-                SYSTEM_AT_PEAK,
-                UNIFIED,
-            ]
-            .join(" "),
-            Self::Resident => [RESIDENT_BASE, RESIDENT_GPU, BASES_DIFFER].join(" "),
-            Self::Mixed => [
-                MIXED_BASE,
-                PAIR,
-                OUTSIDE_PAIR,
-                RESIDENT_GPU,
-                PEAK,
-                SYSTEM_AT_PEAK,
-                UNIFIED,
-            ]
-            .join(" "),
+            Self::Footprint => "footprint",
+            Self::Resident => "resident",
+            Self::Mixed => "mixed",
         }
     }
 }
-
-/// The physical footprint's own definition: what the base counts and what lies
-/// outside it.
-const FOOTPRINT_BASE: &str = "Memory is the process's physical footprint as the platform \
-     accounts for it (`phys_footprint`), the only reading that sees memory allocated for the \
-     GPU; it counts dirty pages, page tables and IOKit mappings, and clean file-backed pages — \
-     a read-only model mapping, say — are outside it.";
-
-/// How the pair is read, and what each half holds.
-const PAIR: &str = "On a footprint row, the resting figure is a pair read from one \
-     `task_info(TASK_VM_INFO)` call, so the two halves sum to the footprint: system is the \
-     footprint minus the pages the platform tags as graphics, which also holds IOKit mappings, \
-     compressed pages, page tables and any pages tagged for something other than graphics, and \
-     is not a CPU-only reading; GPU is those graphics-tagged pages, which include buffers the \
-     host can also map and staging allocations, and is not the GPU's working set.";
-
-/// What the platform books outside both halves.
-const OUTSIDE_PAIR: &str = "Graphics-tagged pages the platform books outside the footprint \
-     (`ledger_tag_graphics_nofootprint`) are in neither number, and GPU memory the platform \
-     books as an IOKit mapping without a graphics tag cannot be separated from the system \
-     figure.";
-
-/// When the two readings are taken, and what the peak beside the maximum is.
-const PEAK: &str = "Resting is taken once the cold call has returned and before the warm \
-     call; peak is that figure's lifetime maximum. On a footprint row, the GPU peak beside it \
-     is the highest graphics-tagged reading a sampler thread took every millisecond or so from \
-     the first moment the row's process could start it until that maximum was read — an \
-     observed maximum, so a spike before then or between two samples is not in it, and the two \
-     halves were not taken at the same instant.";
-
-/// What the system figure at peak is — a derived column — and why it can sit below
-/// the one at rest.
-const SYSTEM_AT_PEAK: &str = "The system figure at peak is derived, not measured: it is the \
-     lifetime maximum of the whole figure minus the highest GPU reading, a subtraction of two \
-     maxima, and is not a peak of anything on its own. A system figure at peak below the one at \
-     rest is therefore legitimate — the GPU share can grow more than the total between rest and \
-     peak — and a GPU spike the sampler missed makes the derived figure too large, while a GPU \
-     reading taken at another instant can make it too small.";
-
-/// What the pair means here, and what the same reading would be elsewhere.
-const UNIFIED: &str = "Memory is unified on this machine, so where both halves are measured \
-     they divide one pool rather than two budgets; on a machine with separate video memory this \
-     reading would report the host-visible graphics share, not that machine's video memory.";
-
-/// The resident set's own definition, for the platform that supplies no footprint.
-const RESIDENT_BASE: &str = "Memory is the process's resident set, because this platform \
-     supplies no physical-footprint reading: resting is the set at the moment the cold call has \
-     returned and before the warm call, and peak is the kernel's lifetime maximum of the same \
-     set.";
-
-/// Why a resident row has no GPU half. The wake bench's record states the same
-/// sentence, and its GPU cell carries the clause this one opens with.
-pub(crate) const RESIDENT_GPU: &str = "The resident set cannot see pages allocated for the \
-     GPU, so a resident row's GPU cell is not measured — not zero, and not the system figure \
-     repeated — and there the two do not split one pool.";
-
-/// The resident set and the footprint are different quantities.
-const BASES_DIFFER: &str = "The resident set counts a different thing from the footprint, so \
-     these figures are not comparable with one taken where the platform supplies it.";
-
-/// A table that holds both bases, which are not comparable with each other.
-const MIXED_BASE: &str = "Memory is the process's physical footprint on the rows the platform \
-     supplied one and the resident set on the rows it did not: the two count different things \
-     and are not comparable with each other.";
 
 /// One byte count as the record writes it, and `-` for a figure nobody took: a
 /// zero would read as the reading of a live process.
@@ -686,7 +605,7 @@ mod tests {
 
     /// The platform's footprint is a live reading and its lifetime maximum is at least
     /// the current one. macOS supplies both plus the graphics split; elsewhere the
-    /// fallback is the resident set, which the caption names. The split is not asserted
+    /// fallback is the resident set, which the field names. The split is not asserted
     /// against the footprint here: [`pair_gpu`] exists because a torn ledger read can
     /// put it a page above, and a test that demanded otherwise would flake on the
     /// condition the pair is built to absorb.
@@ -705,11 +624,9 @@ mod tests {
                         "the maximum cannot trail the current reading"
                     );
                 }
-                assert!(Basis::Footprint.caption().contains("physical footprint"));
             }
             None => {
                 assert!(footprint().is_none());
-                assert!(Basis::Resident.caption().contains("resident set"));
             }
         }
     }
@@ -761,15 +678,13 @@ mod tests {
         );
     }
 
-    /// The caption describes the basis its rows were taken on, so a table that
-    /// mixed the two says so.
+    /// The field describes the basis its rows were taken on, so a table that mixed
+    /// the two says so.
     #[test]
     fn the_basis_folds_its_rows() {
         assert_eq!(Basis::of([true, true]), Basis::Footprint);
         assert_eq!(Basis::of([false, false]), Basis::Resident);
         assert_eq!(Basis::of([true, false]), Basis::Mixed);
-        assert_ne!(Basis::Mixed.caption(), Basis::Footprint.caption());
-        assert_ne!(Basis::Mixed.caption(), Basis::Resident.caption());
     }
 
     /// [`human`] is the one byte-count rendering the records use: a whole count in

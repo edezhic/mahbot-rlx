@@ -14,7 +14,7 @@ new bytes in the page cache only.
 
 The temp name is the record writer's own rule, `<target>.tmp-<pid>` (see
 `measurements::temporary` in `crates/mahbot-inference`), which the tree digest's
-leftover filter recognizes and leaves out of the change-sha256 — so an interrupted
+leftover filter recognizes and leaves out of the tree-sha256 — so an interrupted
 walk leaves nothing the digest sees, though nothing sweeps a manifest's temporary
 the way a record run sweeps its own. A walk that raises removes its own on the way
 out.

@@ -166,7 +166,8 @@ struct Rows<'a> {
     /// The non-speech clips that fired, as the report names them.
     non_speech_fired: Vec<&'a str>,
     /// The nodes the rows came from: both sides' `set` cells and the speech node, so
-    /// a printer that states a caption reads them without walking the report again.
+    /// a printer that builds a header or a pooled label reads them without walking the
+    /// report again.
     set: Option<&'a Value>,
     speech: Option<&'a Value>,
     positives_set: Option<&'a Value>,
@@ -285,7 +286,8 @@ impl<'a> Rows<'a> {
 
 /// One side's overall, with the set it divides: the figure, the per-voice clip
 /// count, the distinct texts and the voice count. One rendering, printed by the
-/// console and by both tables, so the pooled nature is stated wherever the number is.
+/// console's pooled line and by the record's pooled row label, so the pooled nature
+/// is stated wherever the number is.
 struct Pooled {
     fired: usize,
     of: usize,
@@ -334,20 +336,9 @@ impl Pooled {
         cell_of(self.fired, self.of)
     }
 
-    /// `Pooled over 11 voices: 104 clips each, not 1144 independent trials.` — the
-    /// one line a table states under its pooled row, where the figure itself is
-    /// already in the row above. It opens with the pooled row's own words, so it
-    /// reads as that row's caveat rather than as a title for the next table, and it
-    /// states the per-voice count once, because the row above already divides by it.
-    fn note(&self) -> String {
-        format!(
-            "Pooled over {} voices: {} clips each, not {} independent {}.",
-            self.voices, self.clips_per_voice, self.of, self.unit
-        )
-    }
-
     /// `pooled over 104 clips (56 distinct texts) across 11 voices, not 1144
-    /// independent trials` — the clause the metric row states after its figure.
+    /// independent trials` — the clause the console's pooled line states after its
+    /// figure.
     fn clause(&self) -> String {
         format!(
             "pooled over {} clips ({} distinct texts) across {} voices, not {} independent {}",
@@ -356,9 +347,19 @@ impl Pooled {
     }
 
     /// `54/1144 (4.7 %) — pooled over …` — the figure with its clause, for the
-    /// console and the record's metric row.
+    /// console.
     fn line(&self) -> String {
         format!("{} — {}", self.cell(), self.clause())
+    }
+
+    /// `pooled over 11 voices · 104 clips each` — the record's pooled row label. It
+    /// states the pooling and the per-voice count that make the pooled figure not a
+    /// count of independent trials, without a sentence under the table.
+    fn label(&self) -> String {
+        format!(
+            "pooled over {} voices · {} clips each",
+            self.voices, self.clips_per_voice
+        )
     }
 }
 
@@ -429,7 +430,7 @@ pub(super) fn block(report: &Value) -> String {
         speech_clips = set.and_then(|node| node.get("speech_clips")),
         non_speech_clips = set.and_then(|node| node.get("non_speech_clips")),
         voices = set.and_then(|node| node.get("voices")),
-    ] => format!("{total} clips — {speech_clips} speech across {voices} voices, {non_speech_clips} non-speech in a stream of their own"));
+    ] => format!("{total} clips · {speech_clips} speech · {voices} voices · {non_speech_clips} non-speech"));
     // Both pooled rows and their tables read the same `Pooled` figures: one
     // rendering of the pooled claim, in three places that cannot disagree.
     let rows = Rows::read(report);
@@ -438,13 +439,7 @@ pub(super) fn block(report: &Value) -> String {
         "negative overall (pooled speech)",
         rows.negatives_pooled.as_ref().map(Pooled::cell),
     );
-    row(
-        &mut body,
-        "non-speech",
-        rows.non_speech
-            .as_ref()
-            .map(|cell| format!("{cell} — silence and noise, measured apart")),
-    );
+    row(&mut body, "non-speech", rows.non_speech.clone());
     row(
         &mut body,
         "positives (pooled)",
@@ -514,33 +509,33 @@ pub(super) fn block(report: &Value) -> String {
         bytes = report.get("peak_rss_bytes"),
     ] => crate::report::human(bytes as u64));
     // The GPU half is absent by construction here: the resident set cannot see
-    // pages allocated for the GPU. The report names the absence and its reason.
+    // pages allocated for the GPU. The report carries the reason; the record's cell
+    // is the status token alone.
     row(
         &mut body,
         "peak resident (GPU)",
         report
             .get("peak_gpu_unmeasured")
-            .and_then(Value::as_str)
-            .map(|reason| format!("{} — {reason}", crate::report::NOT_MEASURED)),
-    );
-    body.push_str(&format!(
-        "\nPeak resident is the resident set's high-water mark for the whole run. {}\n",
-        crate::report::RESIDENT_GPU
-    ));
-    body.push_str(
-        "\nOne complete run: recall and false reactions in each of the eleven voices, and the \
-         false accepts per hour over the pinned real-audio corpus.\n\n",
+            .map(|_| crate::report::NOT_MEASURED.to_string()),
     );
     push_voice_tables(&mut body, &rows);
     body
 }
 
-/// The bench's inputs, as the provenance block's bullets: where the run read them
-/// from — the static root the stand and corpus records name too, so a reader can
-/// check a re-run read the same material — then every model file and every
-/// verification voice, with its size and SHA-256.
+/// The bench's inputs, as the provenance block's bullets: the run's status and the
+/// memory basis its figures were taken on, where the run read them from — the static
+/// root the stand and corpus records name too, so a reader can check a re-run read
+/// the same material — then every model file and every verification voice, with its
+/// size and SHA-256.
 pub(super) fn record_inputs(cfg: &BenchConfig, report: &Value) -> String {
     let mut body = String::new();
+    body.push_str(&format!("- run: {}\n", text(report.get("status"))));
+    // The bench's base is the resident set: `peak_rss` is the only memory reading it
+    // takes, so the GPU half is absent rather than a second budget.
+    body.push_str(&format!(
+        "- memory: {}\n",
+        crate::report::Basis::Resident.field()
+    ));
     body.push_str(&format!("- models: `{}`\n", cfg.models.display()));
     body.push_str(&format!("- corpus: `{}`\n", cfg.corpus.display()));
     let models = report.get("models");
@@ -595,12 +590,11 @@ pub(super) fn record_inputs(cfg: &BenchConfig, report: &Value) -> String {
 }
 
 /// The record's per-voice tables: one row per stream on each side and the pooled
-/// row, each table followed by its caption — the pooled row's own caveat, built by
-/// [`Pooled::note`], never a heading that also repeats a count. Captions,
-/// denominators and distinct-text counts are read out of each side's own `set` cell,
-/// so a phrase-list edit moves them without an edit here; each voice's recording and
-/// span are stated once, in the provenance bullets above. The rows themselves are the
-/// [`Rows`] the console prints, so the report is walked once for both surfaces.
+/// row, whose label states the pooling and the per-voice count. Denominators and
+/// distinct-text counts are read out of each side's own `set` cell, so a phrase-list
+/// edit moves them without an edit here; each voice's recording and span are stated
+/// once, in the provenance bullets above. The rows themselves are the [`Rows`] the
+/// console prints, so the report is walked once for both surfaces.
 fn push_voice_tables(body: &mut String, rows: &Rows<'_>) {
     let mut header = String::from("| voice |");
     let mut rule = String::from("|---|");
@@ -627,7 +621,10 @@ fn push_voice_tables(body: &mut String, rows: &Rows<'_>) {
             row.overall
         ));
     }
-    let mut line = format!("| pooled over {} voices |", rows.set_cell("voices"));
+    let mut line = format!(
+        "| {} |",
+        pooled_row_label(rows.negatives_pooled.as_ref(), rows.set_cell("voices"))
+    );
     for category in Category::SPEECH {
         line.push_str(&format!(
             " {} |",
@@ -644,12 +641,6 @@ fn push_voice_tables(body: &mut String, rows: &Rows<'_>) {
             .map_or_else(|| UNAVAILABLE.to_string(), Pooled::cell)
     ));
     body.push_str(&line);
-    body.push_str(&format!(
-        "{}\n\n",
-        rows.negatives_pooled
-            .as_ref()
-            .map_or_else(|| UNAVAILABLE.to_string(), Pooled::note)
-    ));
 
     body.push_str("| voice | detected | of | rate |\n|---|---|---|---|\n");
     for row in &rows.positives {
@@ -660,12 +651,15 @@ fn push_voice_tables(body: &mut String, rows: &Rows<'_>) {
         Pooled::columns,
     );
     body.push_str(&format!(
-        "| pooled over {} voices | {pooled} |\n\n{}\n\n",
-        rows.positive_cell("voices"),
-        rows.positives_pooled
-            .as_ref()
-            .map_or_else(|| UNAVAILABLE.to_string(), Pooled::note)
+        "| {} | {pooled} |\n",
+        pooled_row_label(rows.positives_pooled.as_ref(), rows.positive_cell("voices"))
     ));
+}
+
+/// The pooled row's label: the `Pooled` figures when the report carries them, and
+/// the voice count alone when it does not.
+fn pooled_row_label(pooled: Option<&Pooled>, voices: String) -> String {
+    pooled.map_or_else(|| format!("pooled over {voices} voices"), Pooled::label)
 }
 
 /// A report count as text, or [`UNAVAILABLE`].

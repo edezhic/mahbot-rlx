@@ -3,19 +3,15 @@
 | metric | value |
 |---|---|
 | corpus | 1956 clips |
-| negatives | 1161 clips — 1144 speech across 11 voices, 17 non-speech in a stream of their own |
+| negatives | 1161 clips · 1144 speech · 11 voices · 17 non-speech |
 | negative overall (pooled speech) | 54/1144 (4.7 %) |
-| non-speech | 0/17 (0.0 %) — silence and noise, measured apart |
+| non-speech | 0/17 (0.0 %) |
 | positives (pooled) | 61/550 (11.1 %) |
 | false accepts | 2 events · 2.4773/h over VAD-active speech (0.807 h) · 1.8756/h over wall-clock audio (1.066 h) · one event = 1.2386/h |
 | derived point | floor 0.7500 · fire factor 0.3520 · static bar 1.0560 · reset 0.3344 |
 | wall clock | 521.7 s |
 | peak resident | 936.3MiB |
-| peak resident (GPU) | not measured — the resident set cannot see pages allocated for the GPU |
-
-Peak resident is the resident set's high-water mark for the whole run. The resident set cannot see pages allocated for the GPU, so a resident row's GPU cell is not measured — not zero, and not the system figure repeated — and there the two do not split one pool.
-
-One complete run: recall and false reactions in each of the eleven voices, and the false accepts per hour over the pinned real-audio corpus.
+| peak resident (GPU) | not measured |
 
 | voice | phonetic near-misses (56) | unrelated sentences (40) | wake phrase inside a sentence (8) | overall (104) |
 |---|---|---|---|---|
@@ -30,9 +26,7 @@ One complete run: recall and false reactions in each of the eleven voices, and t
 | voice08 | 0/56 (0.0 %) | 0/40 (0.0 %) | 0/8 (0.0 %) | 0/104 (0.0 %) |
 | voice09 | 0/56 (0.0 %) | 0/40 (0.0 %) | 0/8 (0.0 %) | 0/104 (0.0 %) |
 | voice10 | 6/56 (10.7 %) | 0/40 (0.0 %) | 1/8 (12.5 %) | 7/104 (6.7 %) |
-| pooled over 11 voices | 40/616 (6.5 %) | 11/440 (2.5 %) | 3/88 (3.4 %) | 54/1144 (4.7 %) |
-
-Pooled over 11 voices: 104 clips each, not 1144 independent trials.
+| pooled over 11 voices · 104 clips each | 40/616 (6.5 %) | 11/440 (2.5 %) | 3/88 (3.4 %) | 54/1144 (4.7 %) |
 
 | voice | detected | of | rate |
 |---|---|---|---|
@@ -47,17 +41,17 @@ Pooled over 11 voices: 104 clips each, not 1144 independent trials.
 | voice08 | 0 | 50 | 0.0 % |
 | voice09 | 0 | 50 | 0.0 % |
 | voice10 | 8 | 50 | 16.0 % |
-| pooled over 11 voices | 61 | 550 | 11.1 % |
-
-Pooled over 11 voices: 50 clips each, not 550 independent utterances.
+| pooled over 11 voices · 50 clips each | 61 | 550 | 11.1 % |
 
 _Measured 2026-11-09 14:06 UTC._
 - machine: arm64 · Apple M3 Pro
 - device: Apple M3 Pro (Metal)
 - profile: release
-- load: 0.90 · 1.54 · 2.21 (1, 5 and 15 minutes when the record was written)
-- code: ec916ae4 change-sha256 664a09f94975d73d (the commit and the SHA-256 of the tree's difference from it, `STAND.md`, `TRANSCRIPTION-CORPUS.md`, `WAKE-WORD-BENCH.md`, `crates/backends/rlx-mlx-sys` left out)
+- load: 0.90 · 1.54 · 2.21 (1m · 5m · 15m)
+- code: ec916ae4 change-sha256 664a09f94975d73d
 - command: cargo bench -p mahbot-inference --features bench --bench wake_word -- --report <file>
+- run: complete
+- memory: resident
 - models: `/Users/Shared/MahBot/models`
 - corpus: `/Users/Shared/MahBot/models/corpus/real-audio`
 - ASR body: `Qwen3-ASR-1.7B-Q4_K_M.gguf` · 1282435552 bytes · sha256 3893b8926065bbff3da7586d21d8711a9b4fa4fa8f12cd0cefad58e31b2660b6

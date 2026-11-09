@@ -443,6 +443,11 @@ impl Inputs {
     /// embedded speaker alters what the same text produces, and a stored clip must
     /// not outlive it. It is compiled in rather than read from the tree, so a
     /// binary run outside the checkout still knows the code it was built from.
+    ///
+    /// The code is hashed through [`crate::source::rust_code`], the one literal-aware
+    /// lexer the record digest uses too; its doc states what is stripped. A corpus
+    /// rendered under a different rule does not match this key, so the next corpus
+    /// build (`wake-word-build`) re-renders it; a measurement never renders.
     pub(crate) fn synthesis_hash(&self) -> String {
         let mut hasher = Sha256::new();
         for digest in [&self.tts_body.sha256, &self.tts_sound.sha256] {
@@ -450,37 +455,10 @@ impl Inputs {
             hasher.update([0u8]);
         }
         for source in SYNTHESIS_SOURCES {
-            hash_code(&mut hasher, source);
+            hasher.update(crate::source::rust_code(source));
             hasher.update([0u8]);
         }
         hex(&hasher.finalize())
-    }
-}
-
-/// Hash the code lines of one source module, so a comment edit does not
-/// invalidate the corpus.
-///
-/// Everything from the first column-0 `#[cfg(test)]` item on is skipped: a test
-/// module never runs in a synthesising binary, and it is the last item in every
-/// module in [`SYNTHESIS_SOURCES`]. A test-only edit therefore costs nothing,
-/// while any change to code that can reach a sample does. The attribute has to
-/// start in the first column to count, which is what tells a module-level item
-/// apart from an attribute inside a function.
-fn hash_code(hasher: &mut Sha256, source: &[u8]) {
-    for line in source.split(|&byte| byte == b'\n') {
-        let start = line
-            .iter()
-            .position(|byte| !byte.is_ascii_whitespace())
-            .unwrap_or(line.len());
-        let code = &line[start..];
-        if start == 0 && code.starts_with(b"#[cfg(test)]") {
-            break;
-        }
-        if code.is_empty() || code.starts_with(b"//") {
-            continue;
-        }
-        hasher.update(code);
-        hasher.update(b"\n");
     }
 }
 
@@ -622,24 +600,44 @@ mod tests {
             .collect()
     }
 
-    /// The synthesis key is code-only: comment edits and test modules stay out of
-    /// it, while a change to code that can reach a sample moves it.
+    /// The synthesis key covers both TTS files and the code sources, and is stable for
+    /// the same inputs; the code component's comment and test-module stripping is
+    /// `source`'s test.
     #[test]
-    fn the_synthesis_key_ignores_comments_and_test_modules() {
-        let key = |source: &[u8]| {
-            let mut hasher = Sha256::new();
-            hash_code(&mut hasher, source);
-            hex(&hasher.finalize())
+    fn the_synthesis_key_covers_the_code_and_both_tts_files() {
+        let inputs = |body: &str, sound: &str| {
+            let pin = |digest: &str| Pin {
+                path: PathBuf::from("x"),
+                bytes: 0,
+                sha256: digest.to_string(),
+            };
+            Inputs {
+                asr_body: pin("asr-body"),
+                asr_sound: pin("asr-sound"),
+                tts_body: pin(body),
+                tts_sound: pin(sound),
+            }
         };
-        let base = key(b"fn a() {}\n// note\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n");
-        let commented =
-            key(b"fn a() {}\n// other note\n#[cfg(test)]\nmod tests {\n    use std::x;\n}\n");
-        assert_eq!(base, commented, "comments and test modules stay out");
+        let base = inputs("body", "sound").synthesis_hash();
+        assert_eq!(base, inputs("body", "sound").synthesis_hash(), "stable");
         assert_ne!(
             base,
-            key(b"fn a() { 1.0 }\n#[cfg(test)]\nmod tests {}\n"),
-            "a code change moves the key"
+            inputs("other", "sound").synthesis_hash(),
+            "the body moves the key"
         );
+        assert_ne!(
+            base,
+            inputs("body", "other").synthesis_hash(),
+            "the sound moves the key"
+        );
+        // The key is more than the two model files: the code sources are hashed into
+        // it too, so dropping that part of `synthesis_hash` is caught here.
+        let mut files = Sha256::new();
+        for digest in ["body", "sound"] {
+            files.update(digest.as_bytes());
+            files.update([0u8]);
+        }
+        assert_ne!(base, hex(&files.finalize()), "the code sources contribute");
     }
 
     /// One temp directory for the run's own outputs, and the argument list that

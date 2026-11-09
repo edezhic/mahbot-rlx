@@ -386,8 +386,8 @@ pub fn run() -> Result<()> {
 const COMPLETE: &str = "complete";
 
 /// Why the bench has no GPU half of its memory pair: its base is the resident set.
-/// The report carries this reason and the record prints it in the cell; it is the
-/// clause [`crate::report::RESIDENT_GPU`] opens with, so the two cannot disagree.
+/// The report carries this reason and the console prints it; the record's GPU cell
+/// is the `not measured` token.
 const GPU_UNMEASURED: &str = "the resident set cannot see pages allocated for the GPU";
 
 /// The one classification that drives the report, the console and the record.
@@ -1896,25 +1896,21 @@ mod tests {
         assert!(!body.contains(record::UNAVAILABLE), "{body}");
         assert!(body.contains("| corpus | 1956 clips |"), "{body}");
         assert!(
-            body.contains(
-                "| negatives | 1161 clips — 1144 speech across 11 voices, 17 \
-                           non-speech in a stream of their own |"
-            ),
+            body.contains("| negatives | 1161 clips · 1144 speech · 11 voices · 17 non-speech |"),
             "{body}"
         );
         assert!(
             body.contains("| negative overall (pooled speech) | 33/1144 (2.9 %) |"),
             "{body}"
         );
-        assert!(body.contains("| non-speech | 1/17 (5.9 %)"), "{body}");
+        assert!(body.contains("| non-speech | 1/17 (5.9 %) |"), "{body}");
         assert!(
             body.contains("| positives (pooled) | 440/550 (80.0 %) |"),
             "{body}"
         );
         // One row per voice on each side, with its own denominators, and the
-        // pooled row below them.
-        // Each table's caption sits under it and is the pooled row's own caveat: no
-        // repeated count, and no heading that reads as the next table's caption.
+        // pooled row below them. The pooled row's label states the pooling and the
+        // per-voice count; no sentence follows the table.
         assert!(
             !body.contains("Negatives by voice") && !body.contains("Positives by voice"),
             "{body}"
@@ -1935,20 +1931,11 @@ mod tests {
             "{inputs}"
         );
         assert!(
-            body.contains("| pooled over 11 voices | 22/616 (3.6 %)"),
+            body.contains("| pooled over 11 voices · 104 clips each | 22/616 (3.6 %)"),
             "{body}"
         );
         assert!(
-            body.contains("| pooled over 11 voices | 440 | 550 | 80.0 % |"),
-            "{body}"
-        );
-        // Each table's pooled figure carries one short line, not a method paragraph.
-        assert!(
-            body.contains("Pooled over 11 voices: 104 clips each, not 1144 independent trials."),
-            "{body}"
-        );
-        assert!(
-            body.contains("Pooled over 11 voices: 50 clips each, not 550 independent utterances."),
+            body.contains("| pooled over 11 voices · 50 clips each | 440 | 550 | 80.0 % |"),
             "{body}"
         );
         assert!(
@@ -1962,18 +1949,18 @@ mod tests {
             body.contains("| peak resident | ") && body.contains("| wall clock | 287.9 s |"),
             "{body}"
         );
-        // The GPU half of the memory pair is not measured, and the cell says why
-        // rather than reading as a zero or repeating the system figure.
+        // The GPU half of the memory pair is not measured: the cell is the status
+        // token, not a zero, not the system figure and not a sentence.
         assert!(
             body.contains(&format!(
-                "| peak resident (GPU) | {} — {} |",
-                crate::report::NOT_MEASURED,
-                crate::bench::GPU_UNMEASURED
+                "| peak resident (GPU) | {} |",
+                crate::report::NOT_MEASURED
             )),
             "{body}"
         );
-        // The record is tables, their captions and the provenance block: the method
-        // prose, the witness sentence and the corpus's own cost stay on the console.
+        // The record is tables and the provenance block: the method prose, the
+        // definitions, the witness sentence and the corpus's own cost stay on the
+        // console.
         for prose in [
             "**What these numbers are.**",
             "**The voices.**",
@@ -1984,6 +1971,12 @@ mod tests {
             "| corpus build",
             "| corpus cache",
             "clip reads reused",
+            "Peak resident is the resident set",
+            "One complete run",
+            "in a stream of their own",
+            "silence and noise, measured apart",
+            "not 1144 independent",
+            "not 550 independent",
         ] {
             assert!(
                 !body.contains(prose),

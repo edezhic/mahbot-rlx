@@ -174,12 +174,7 @@ pub fn main_entry() {
         name: |index| ROWS[index].name,
         measure: |index, bounds| measure(&ROWS[index], bounds),
         print: print_rows,
-        compose: |readings| {
-            Ok((
-                format!("{}\n\n{}", table(readings).trim_end(), caption(readings)),
-                inputs_note(),
-            ))
-        },
+        compose: |readings| Ok((table(readings), inputs_note(readings))),
     });
 }
 
@@ -463,18 +458,6 @@ fn label(reading: &Reading) -> &str {
     row(&reading.row).map_or(reading.row.as_str(), |row| row.label)
 }
 
-/// The record's caption: what the row's figures are, and what the memory figures
-/// are measured with — the basis read off the rows themselves.
-fn caption(readings: &[Reading]) -> String {
-    let basis = report::Basis::of(readings.iter().map(|reading| reading.memory.footprint));
-    format!(
-        "Each row is a product shape measured in a process of its own. Cold is the process with \
-         no models loaded and the call that loads them; warm is the same call with the models \
-         already resident. {}",
-        basis.caption()
-    )
-}
-
 /// The record's one table: a row per product shape and the six figures it carries.
 fn table(readings: &[Reading]) -> String {
     let mut table = String::from(
@@ -498,12 +481,15 @@ fn table(readings: &[Reading]) -> String {
     table
 }
 
-/// The run's inputs, as bullets a reader can reproduce the rows from: the static
-/// paths themselves, never dropped — a record that omits the material it exists to
-/// name would be worse than one that refuses to be written.
-fn inputs_note() -> String {
+/// The run's inputs and its memory basis, as bullets a reader can reproduce the rows
+/// from: the static paths themselves, never dropped — a record that omits the
+/// material it exists to name would be worse than one that refuses to be written —
+/// and the basis the memory columns were taken on.
+fn inputs_note(readings: &[Reading]) -> String {
+    let basis = report::Basis::of(readings.iter().map(|reading| reading.memory.footprint));
     format!(
-        "- models: `{}`\n- corpus: `{}`\n",
+        "- memory: {}\n- models: `{}`\n- corpus: `{}`\n",
+        basis.field(),
         crate::paths::root().display(),
         crate::paths::corpus().display()
     )

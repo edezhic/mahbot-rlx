@@ -165,19 +165,6 @@ fn print_table(rows: &[Reading]) -> Result<()> {
     Ok(())
 }
 
-/// The record's caption: what one call per recording costs, and what the memory
-/// figures are measured with — the basis read off the rows themselves.
-fn caption(rows: &[Reading]) -> String {
-    let basis = report::Basis::of(rows.iter().map(|row| row.memory.footprint));
-    format!(
-        "The pinned real-audio corpus, one call per recording, each measured in a process of its \
-         own. Time per second of audio is the warm call — the models already resident — divided \
-         by the recording's own length. Two takes are comparable only at the same load, which \
-         the provenance states where the machine reports one. {}",
-        basis.caption()
-    )
-}
-
 /// The record's one table: a row per pinned recording and the figures it carries.
 fn table(rows: &[Reading]) -> Result<String> {
     let mut table = String::from(
@@ -198,12 +185,17 @@ fn table(rows: &[Reading]) -> Result<String> {
     Ok(table)
 }
 
-/// The record's body and its input bullets: one table, its caption, and the corpus
-/// the recordings were read from.
+/// The record's body and its input bullets: one table, the memory basis the columns
+/// were taken on, and the corpus the recordings were read from.
 fn compose(rows: &[Reading]) -> Result<(String, String)> {
     let table = table(rows)?;
-    let inputs = format!("- corpus: `{}`\n", crate::paths::corpus().display());
-    Ok((format!("{}\n\n{}", table.trim_end(), caption(rows)), inputs))
+    let basis = report::Basis::of(rows.iter().map(|row| row.memory.footprint));
+    let inputs = format!(
+        "- memory: {}\n- corpus: `{}`\n",
+        basis.field(),
+        crate::paths::corpus().display()
+    );
+    Ok((table, inputs))
 }
 
 #[cfg(test)]

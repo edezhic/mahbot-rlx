@@ -32,6 +32,7 @@ pub mod paths;
 pub mod reference;
 pub mod report;
 mod run;
+mod source;
 pub mod speaker;
 pub mod stand;
 pub mod synth;
