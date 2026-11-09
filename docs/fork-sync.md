@@ -224,6 +224,8 @@ merge action.
 - ladder-rung and sound-window release mid-call
 - the lazy f16 arena mirror
 - release of host weight duplicates
+- the parameter host stash kept only for the cooperative host-activation mirror that
+  reads it, with a clone taking its parameters off the device instead
 - packed codec tables read as stored
 - the scope-keyed shared weight pool with re-upload skipping
 - KV-append copy elision

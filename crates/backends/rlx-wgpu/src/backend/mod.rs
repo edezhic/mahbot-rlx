@@ -597,7 +597,13 @@ pub struct WgpuExecutable {
     coop_f16_vk_a_off: HashMap<usize, u32>,
     /// CoopF16Vk activation operands mirrored on the host each `run()` (f32+f16).
     coop_f16_host_activations: Vec<(NodeId, Activation, String)>,
-    /// Last `set_param` f32 payload per name (for host activation mirrors).
+    /// Last `set_param` f32 payload per name, for the host activation mirror — and for
+    /// nothing else: [`Self::host_mirror_reads`] is the whole list of names this map ever
+    /// holds, and `clone_for_cache` reads its parameters off the device instead. Empty
+    /// wherever the mirror it feeds is empty, which is every adapter without the CoopF16Vk
+    /// route (`collect_coop_f16_vk_mirror_activations` builds it only there): a host copy
+    /// kept for it on any other adapter is retained for the life of the process and never
+    /// read.
     stashed_params: HashMap<String, Vec<f32>>,
     /// Reused output readback staging (avoids per-run buffer alloc).
     readback_staging: Option<ReadbackStaging>,
@@ -975,6 +981,16 @@ impl WgpuExecutable {
         self.coop_f16_vk_wide_bind_groups = fresh.coop_f16_vk_wide_bind_groups;
         self.coop_f16_vk_a_off = fresh.coop_f16_vk_a_off;
         self.coop_f16_host_activations = fresh.coop_f16_host_activations;
+        // A recompile can resolve to a schedule the mirror no longer reads a tensor of
+        // (a binding that is no longer CoopF16Vk-eligible), so the stash follows the list
+        // it exists for rather than keeping a copy nothing will read.
+        let mirrored: HashSet<&str> = self
+            .coop_f16_host_activations
+            .iter()
+            .map(|(_, _, src)| src.as_str())
+            .collect();
+        self.stashed_params
+            .retain(|name, _| mirrored.contains(name.as_str()));
         // The one-row packed multiply's setup cache holds bind groups over this
         // executable's previous arena, weight buffer and slab; its key carries no
         // buffer identity, so an entry would dispatch against a dead arena and keep
@@ -1662,21 +1678,25 @@ impl WgpuExecutable {
     }
 
     /// Clone into an independent executable (recompiles from the stored graph).
+    ///
+    /// Parameters come off the device rather than out of the host stash, which is no
+    /// clone's record (`stashed_params`).
     pub fn clone_for_cache(&self) -> Self {
         let graph = self
             .unresolved
             .clone()
             .unwrap_or_else(|| self.graph.clone());
         let mut exe = Self::compile_rng(graph, self.rng());
-        for (k, v) in &self.stashed_params {
-            exe.set_param(k, v);
-        }
+        // A graph that has not resolved its shapes holds its parameters in the pending
+        // set, not in an arena, so those are replayed by hand — the same two sets
+        // `replay_pending_params` writes.
         for (k, v) in &self.pending_params {
             exe.set_param(k, v);
         }
         for (k, v) in &self.pending_param_bytes {
             exe.set_param_bytes(k, v);
         }
+        exe.copy_params_from(self);
         for (k, v) in &self.gpu_handles {
             // An emptied mirror is not a handle: its rows became resident and the
             // arena stayed with the parent, so a clone must not report it as held.

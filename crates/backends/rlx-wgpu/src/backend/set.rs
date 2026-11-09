@@ -84,7 +84,7 @@ impl WgpuExecutable {
     pub fn set_param(&mut self, name: &str, data: &[f32]) {
         self.invalidate_static_weight_packs();
         const STASH_MAX_BYTES: usize = 16 * 1024 * 1024;
-        if data.len() * 4 <= STASH_MAX_BYTES {
+        if self.host_mirror_reads(name) && data.len() * 4 <= STASH_MAX_BYTES {
             self.stashed_params.insert(name.to_string(), data.to_vec());
         }
         if self.coop_f16_vk {
@@ -100,6 +100,98 @@ impl WgpuExecutable {
         {
             self.arena.write_f32(&dev.queue, id, data);
         }
+    }
+
+    /// Whether the cooperative host-activation mirror reads `name`: the source tensor each
+    /// mirrored activation's input carries ([`WgpuExecutable::coop_f16_host_activations`]).
+    fn host_mirror_reads(&self, name: &str) -> bool {
+        self.coop_f16_host_activations
+            .iter()
+            .any(|(_, _, src)| src == name)
+    }
+
+    /// The bytes this executable keeps as a host copy of its parameters for the
+    /// cooperative host-activation mirror — zero wherever that route does not exist,
+    /// which is the observable form of the decision not to keep one.
+    pub fn host_param_stash_bytes(&self) -> usize {
+        self.stashed_params.values().map(|v| v.len() * 4).sum()
+    }
+
+    /// Give this executable the parameter bytes `other` holds on the device.
+    ///
+    /// What moves is read off `other`'s arena and uploaded through the path its dtype
+    /// has: an f32 slot through [`Self::set_param`], so whatever the upload leaves beside
+    /// the bytes (the f16 mirror, the oscillation verdict, the stash a mirrored activation
+    /// reads) comes out as the parent's upload left it; a packed blob through
+    /// [`Self::set_param_bytes`]. A readback stages a buffer as wide as the parameter, so
+    /// one wider than the adapter's `max_buffer_size` cannot be copied at all — where the
+    /// 16 MiB stash this replaces skipped it in silence.
+    ///
+    /// Left alone: a name one of the two arenas cannot hold the parameter's own bytes for
+    /// (the parent never bound it, another storage tightened the bound, or this clone has
+    /// no slot for it); a bf16-packed weight, whose bytes are in a side buffer only its
+    /// own writer fills — a hole this copy inherits from the stash, which
+    /// [`Self::set_param_bf16_packed`] never fed either; and a parameter the shared weight
+    /// buffer already holds for this scope.
+    pub(super) fn copy_params_from(&mut self, other: &Self) {
+        let Some(dev) = wgpu_device() else {
+            return;
+        };
+        for (name, &src_id) in &other.param_offsets {
+            let Some(&dst_id) = self.param_offsets.get(name) else {
+                continue;
+            };
+            if !other.arena.has(src_id) || !self.arena.has(dst_id) {
+                continue;
+            }
+            if other.arena.is_bf16_packed(src_id) || self.arena.is_bf16_packed(dst_id) {
+                continue;
+            }
+            // What moves is the parameter's own storage — from its declared type and
+            // element count, not from the plan's f32 slot (a packed parameter holds one byte
+            // per element where the slot counts four, so a copy of the slot would run into
+            // the next one) and not from `param_storage`'s bound, which a second storage
+            // reaching the same offset tightens: an f32 read of a length that bound cut below
+            // a word would panic in the decode, and a shorter aligned one would copy a
+            // truncated parameter. A bound either side records that cannot hold the
+            // parameter's own bytes is refused rather than cut to fit.
+            let (Some((src_off, src_storage)), Some((_, dst_storage))) =
+                (other.param_storage(name), self.param_storage(name))
+            else {
+                continue;
+            };
+            let node = other.graph.node(src_id);
+            let (Some(ne), dtype) = (node.shape.num_elements(), node.shape.dtype()) else {
+                continue;
+            };
+            let len = crate::buffer::weight_param_bytes(dtype, ne);
+            if len == 0 || len > src_storage.bytes || len > dst_storage.bytes {
+                continue;
+            }
+            // A mirrored name defeats the pool skip: its payload must be on the host,
+            // where the pool cannot put it.
+            if !self.host_mirror_reads(name) && self.param_resident(name, len) {
+                continue;
+            }
+            if dtype == rlx_ir::DType::F32 {
+                let words = other
+                    .arena
+                    .read_f32_ranges(&dev.device, &dev.queue, &[(src_off, len)])
+                    .pop()
+                    .expect("one answer per range asked");
+                self.set_param(name, &words);
+            } else {
+                let bytes = other
+                    .arena
+                    .read_bytes_range(&dev.device, &dev.queue, src_off, len);
+                self.set_param_bytes(name, &bytes);
+            }
+        }
+        // The oscillation probe's verdict travels with the weights it was made about;
+        // without it the clone would take the cooperative route where its parent fell
+        // back to wide f32.
+        self.coop_f16_vk_wide_b
+            .clone_from(&other.coop_f16_vk_wide_b);
     }
 
     /// Buffer an f32 param for the replay. The dirty mark is set here, with the

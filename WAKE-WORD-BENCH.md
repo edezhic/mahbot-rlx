@@ -9,8 +9,8 @@
 | positives (pooled) | 61/550 (11.1 %) |
 | false accepts | 2 events · 2.4773/h over VAD-active speech (0.807 h) · 1.8756/h over wall-clock audio (1.066 h) · one event = 1.2386/h |
 | derived point | floor 0.7500 · fire factor 0.3520 · static bar 1.0560 · reset 0.3344 |
-| wall clock | 532.7 s |
-| peak resident | 940.3MiB |
+| wall clock | 521.7 s |
+| peak resident | 936.3MiB |
 | peak resident (GPU) | not measured — the resident set cannot see pages allocated for the GPU |
 
 Peak resident is the resident set's high-water mark for the whole run. The resident set cannot see pages allocated for the GPU, so a resident row's GPU cell is not measured — not zero, and not the system figure repeated — and there the two do not split one pool.
@@ -51,11 +51,12 @@ Pooled over 11 voices: 104 clips each, not 1144 independent trials.
 
 Pooled over 11 voices: 50 clips each, not 550 independent utterances.
 
-_Measured 2026-11-07 22:42 UTC._
+_Measured 2026-11-09 14:06 UTC._
 - machine: arm64 · Apple M3 Pro
 - device: Apple M3 Pro (Metal)
 - profile: release
-- code: a7e7cb7e change-sha256 a5177b96afd8fa65 (the commit and the SHA-256 of the tree's difference from it, `STAND.md`, `TRANSCRIPTION-CORPUS.md`, `WAKE-WORD-BENCH.md`, `crates/backends/rlx-mlx-sys` left out)
+- load: 0.90 · 1.54 · 2.21 (1, 5 and 15 minutes when the record was written)
+- code: ec916ae4 change-sha256 664a09f94975d73d (the commit and the SHA-256 of the tree's difference from it, `STAND.md`, `TRANSCRIPTION-CORPUS.md`, `WAKE-WORD-BENCH.md`, `crates/backends/rlx-mlx-sys` left out)
 - command: cargo bench -p mahbot-inference --features bench --bench wake_word -- --report <file>
 - models: `/Users/Shared/MahBot/models`
 - corpus: `/Users/Shared/MahBot/models/corpus/real-audio`
@@ -73,5 +74,3 @@ _Measured 2026-11-07 22:42 UTC._
 - voice08: `speech/librivox/speech-librivox-0089.wav` · 13.80 s + 15.00 s · sha256 cf8dfec778ea249d67282b7a7396fa954d212280ff44cb723cdb45e15f2ed01b
 - voice09: `speech/librivox/speech-librivox-0129.wav` · 40.60 s + 15.00 s · sha256 75252026b534c7bb730c44cb721e6c7105220cbf1b4023eee9c7d5af40256adf
 - voice10: `speech/librivox/speech-librivox-0065.wav` · 5.90 s + 15.00 s · sha256 725adb1ab5289dbcd8c8016285ae34890c96ac4f150995f20d078a1cfd1ecbf3
-
-_Not re-taken on 2026-11-09 with the compile-path change: these figures are recall and false accepts, not timings, and that change moves no decision — the wake score and every digest are unchanged. A change that cannot move a run's numbers does not re-run it. Re-rendering its corpus is a deliberate hours-long operation of its own._

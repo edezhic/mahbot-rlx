@@ -634,6 +634,10 @@ name = "host_kv_append_host_reader"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "host_param_stash"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "large_dispatch_backward"
 required-features = ["backend-tests"]
 

@@ -547,6 +547,9 @@ impl Synthesis {
             k_rows,
             v_rows,
         )?;
+        // The seed is the prefill's and nothing else reads it: released here rather than
+        // held to the end of the render, as the recognition path releases its own.
+        drop(p);
 
         // The code predictor: **one** graph for the whole sixteen-level frame —
         // the head-less body at level 0, every projecting level with its own

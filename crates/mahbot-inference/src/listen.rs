@@ -964,7 +964,7 @@ impl<'a> Clip<'a> {
             ("cos".into(), cos.iter().map(|v| *v as f32).collect()),
             ("sin".into(), sin.iter().map(|v| *v as f32).collect()),
         ];
-        let mut p = match &self.shared {
+        let p = match &self.shared {
             Some(rung) => {
                 let t = report::Stopwatch::start();
                 let prefill = rung.prefill()?;
@@ -1017,7 +1017,9 @@ impl<'a> Clip<'a> {
             &p[1],
             &p[2],
         )?;
-        p.clear();
+        // `drop` as the synthesis path drops its own seed — `clear` frees the planes
+        // too, so what this buys is the two walks agreeing about one object.
+        drop(p);
         let mut generated: Vec<usize> = Vec::new();
         let mut written = prompt_rows;
         let mut decode_times: Vec<f64> = Vec::new();
