@@ -704,7 +704,7 @@ pub const SHARD_STAGE_RESERVE: usize = 768 * 1024 * 1024;
 /// would explode the geometry is refused loudly and cheaply instead.
 pub const MAX_SHARDS: usize = 64;
 
-/// The stage reserve a small budget gets: the bound `from_plan_split_opts` caps the
+/// The stage reserve a small budget gets: the bound `from_compact_plan_split` caps the
 /// reserve at on ≤ 2 GiB-buffer adapters (VirtIO, DX12 WARP), where a full 768 MiB on top
 /// of a nearly-full arena does not fit.
 pub const SMALL_STAGE_RESERVE: usize = 64 * 1024 * 1024;
@@ -1907,6 +1907,26 @@ pub fn plan_hybrid(graph: &Graph, align: usize) -> MemoryPlan {
     )
 }
 
+/// The activations-only plan a split arena is laid out under: every `Op::Param`
+/// left unassigned for [`Arena::from_compact_plan_split`] to place. A half-packed
+/// graph is planned at its own widths; the guarded planner has no no-params hybrid
+/// variant, and its `Hybrid` allocates the params this split arena must place
+/// itself, so the hybrid branch keeps the plain no-params planner (its dequant
+/// fallback is the conservative default).
+pub fn compact_plan(graph: &Graph) -> MemoryPlan {
+    note_structural_hosting();
+    if crate::unfuse::half_packed() {
+        rlx_compile::memory::plan_memory_hybrid_no_params(graph, 16)
+    } else {
+        rlx_compile::memory::plan_memory_with_dequant_guard(
+            graph,
+            16,
+            rlx_compile::memory::GuardedPlanner::F32UniformNoParams,
+            dequant_route_defers_host_read(),
+        )
+    }
+}
+
 impl Arena {
     /// Build an arena from a memory plan with an extra tail scratch zone
     /// of `scratch_bytes` reserved past the plan's arena_size. Useful for
@@ -2290,6 +2310,13 @@ impl Arena {
         }
     }
 
+    /// Build a split arena for `graph`, planning its activations compactly here: the
+    /// graph-only convenience for a caller that has no plan. A caller that already
+    /// planned passes that plan to [`Self::from_compact_plan_split`] and pays no plan.
+    pub fn from_plan_split(device: &wgpu::Device, graph: &Graph, scratch_bytes: usize) -> Self {
+        Self::from_compact_plan_split(device, compact_plan(graph), graph, scratch_bytes, true)
+    }
+
     /// Build an arena that keeps large params in a SEPARATE `weight_buffer`
     /// so the activation arena stays under wgpu's `max_buffer_size` / bind
     /// caps. Packed U8/I8 quant always goes there; F32/F16 params larger than
@@ -2298,53 +2325,46 @@ impl Arena {
     /// F32 params stay in the act buffer. `offset()` returns a WEIGHT_BUF_TAG-
     /// tagged offset for weight-buffer params; fused GGUF GEMV binds them
     /// directly, other ops stage into the act window.
-    pub fn from_plan_split(
+    ///
+    /// `plan` is the activation layout and is taken by value, because the parameters
+    /// are placed into it here: it must be activations only, with no `Op::Param`
+    /// assigned ([`compact_plan`]). A full plan is not a substitute — the planner
+    /// aliases the persistent packed weights onto low offsets and leaves an activation
+    /// at the high offset, so relocating from one does not shrink the arena.
+    /// `global_share` lets the weight buffer be reused by any later
+    /// executable whose weight layout fingerprint matches (`RLX_WGPU_SHARE_WEIGHTS`);
+    /// without it the buffer is this arena's own, and only an explicit
+    /// `WgpuExecutable::share_weights_from` hands it on — a layout match alone cannot
+    /// tell two checkpoints of the same shape apart.
+    pub fn from_compact_plan_split(
         device: &wgpu::Device,
-        plan: &MemoryPlan,
-        graph: &Graph,
-        scratch_bytes: usize,
-    ) -> Self {
-        Self::from_plan_split_opts(device, plan, graph, scratch_bytes, true)
-    }
-
-    /// [`Self::from_plan_split`]; `global_share` lets the weight buffer be
-    /// reused by any later executable whose weight layout fingerprint matches
-    /// (`RLX_WGPU_SHARE_WEIGHTS`). Without it the buffer is this arena's own,
-    /// and only an explicit `WgpuExecutable::share_weights_from` hands it on —
-    /// a layout match alone cannot tell two checkpoints of the same shape apart.
-    pub fn from_plan_split_opts(
-        device: &wgpu::Device,
-        plan: &MemoryPlan,
+        mut plan: MemoryPlan,
         graph: &Graph,
         scratch_bytes: usize,
         global_share: bool,
     ) -> Self {
         use rlx_ir::Op;
-        let _ = plan;
-        // Start from a COMPACT activations-only plan (params unassigned), then
-        // place every param: packed quant weights (U8/I8) → dedicated weight
-        // buffer; everything else → arena tail. Relocating from the full plan
-        // does NOT shrink the arena (the planner aliases the persistent packed
-        // weights onto low offsets and leaves an activation at the high offset),
-        // so we re-plan without params to actually compact it.
-        // A half-packed graph is planned at its own widths; the guarded planner has
-        // no no-params hybrid variant, and its `Hybrid` allocates the params this
-        // split arena must place itself, so the hybrid branch keeps the plain
-        // no-params planner (its dequant fallback is the conservative default).
-        let mut new_plan = if crate::unfuse::half_packed() {
-            rlx_compile::memory::plan_memory_hybrid_no_params(graph, 16)
-        } else {
-            rlx_compile::memory::plan_memory_with_dequant_guard(
-                graph,
-                16,
-                rlx_compile::memory::GuardedPlanner::F32UniformNoParams,
-                dequant_route_defers_host_read(),
-            )
-        };
+        // Every parameter is placed below; one the plan already holds would be placed
+        // twice. The call sites hold only because `packed_in_place` implies `flag_split`,
+        // so the invariant is checked rather than assumed. A zero-length slot is not a
+        // placement — it is the caller's fixup for a tensor the planner skipped, and the
+        // placement loop skips it in turn.
+        assert!(
+            graph
+                .nodes()
+                .iter()
+                .all(|node| !matches!(&node.op, Op::Param { .. })
+                    || plan
+                        .assignments
+                        .get(&node.id)
+                        .is_none_or(|slot| slot.size == 0)),
+            "rlx-wgpu: `from_compact_plan_split` places every parameter itself; its plan \
+             must leave them unassigned (`compact_plan`)"
+        );
         let a = 16usize;
         let mut weight_offsets: HashMap<NodeId, usize> = HashMap::new();
         let mut weight_cursor = 0usize;
-        let mut tail = new_plan.arena_size;
+        let mut tail = plan.arena_size;
         // If activations + all params would exceed the storage bind limit,
         // park every param in the weight buffer so the act arena stays in one
         // bind window. Otherwise NVIDIA virtual-shards (~2 GiB stripes), which
@@ -2397,7 +2417,7 @@ impl Arena {
         let park_all_params = rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
             || park_for_sharing
             || (host_staging_ok
-                && (new_plan.arena_size + param_bytes_est + scratch_aligned) > bind_cap
+                && (plan.arena_size + param_bytes_est + scratch_aligned) > bind_cap
                 // Multi-shard weight buffers (~2 GiB × N) OOM on VirtIO/WARP
                 // and other adapters whose *total* GPU budget is ≈ one
                 // `max_buffer_size`. Only park-all when everything fits in one
@@ -2415,7 +2435,7 @@ impl Arena {
         let mut park_candidates: Vec<(NodeId, usize, usize, rlx_ir::DType, bool, String)> =
             Vec::new();
         for node in graph.nodes() {
-            if new_plan.assignments.contains_key(&node.id) {
+            if plan.assignments.contains_key(&node.id) {
                 continue;
             }
             // `is_pure_view` excludes the two ops that alias a parent's storage but
@@ -2486,7 +2506,7 @@ impl Arena {
                 if nbytes > weight_shard_cap {
                     // Fall through to act arena — caller must stage per op.
                     tail = tail.div_ceil(a) * a;
-                    new_plan.assignments.insert(
+                    plan.assignments.insert(
                         id,
                         rlx_opt::memory::BufferSlot {
                             offset: tail,
@@ -2507,7 +2527,7 @@ impl Arena {
                 // Single-shard budget: spill to act once the weight buffer is full.
                 if weight_cursor.saturating_add(nbytes) > weight_shard_cap {
                     tail = tail.div_ceil(a) * a;
-                    new_plan.assignments.insert(
+                    plan.assignments.insert(
                         id,
                         rlx_opt::memory::BufferSlot {
                             offset: tail,
@@ -2525,7 +2545,7 @@ impl Arena {
                 weight_cursor += nbytes;
             } else {
                 tail = tail.div_ceil(a) * a;
-                new_plan.assignments.insert(
+                plan.assignments.insert(
                     id,
                     rlx_opt::memory::BufferSlot {
                         offset: tail,
@@ -2559,7 +2579,7 @@ impl Arena {
                 }
                 None => {
                     weight_cursor = place_private_weights(
-                        &mut new_plan,
+                        &mut plan,
                         &mut tail,
                         &weight_candidates,
                         &mut weight_offsets,
@@ -2579,7 +2599,7 @@ impl Arena {
             guard -= 1;
             let mut next = Vec::new();
             for id in pending {
-                if new_plan.assignments.contains_key(&id) || weight_offsets.contains_key(&id) {
+                if plan.assignments.contains_key(&id) || weight_offsets.contains_key(&id) {
                     continue;
                 }
                 let Some(&(root, off)) = aliases.get(&id) else {
@@ -2589,11 +2609,11 @@ impl Arena {
                     weight_offsets.insert(id, w_off + off);
                     continue;
                 }
-                let Some(root_slot) = new_plan.assignments.get(&root).cloned() else {
+                let Some(root_slot) = plan.assignments.get(&root).cloned() else {
                     next.push(id);
                     continue;
                 };
-                new_plan.assignments.insert(
+                plan.assignments.insert(
                     id,
                     rlx_opt::memory::BufferSlot {
                         offset: root_slot.offset + off,
@@ -2605,13 +2625,12 @@ impl Arena {
         }
         // Any remaining unassigned node (shouldn't happen) gets a fresh slot.
         for node in graph.nodes() {
-            if new_plan.assignments.contains_key(&node.id) || weight_offsets.contains_key(&node.id)
-            {
+            if plan.assignments.contains_key(&node.id) || weight_offsets.contains_key(&node.id) {
                 continue;
             }
             let bytes = act_slot_bytes(node);
             tail = tail.div_ceil(a) * a;
-            new_plan.assignments.insert(
+            plan.assignments.insert(
                 node.id,
                 rlx_opt::memory::BufferSlot {
                     offset: tail,
@@ -2620,7 +2639,7 @@ impl Arena {
             );
             tail += bytes;
         }
-        new_plan.arena_size = tail;
+        plan.arena_size = tail;
         // The tail this arena needs, sized from the arena it just built: at least the
         // floor a staged operand is refused past ([`STAGED_OPERAND_MAX`]), and the widest
         // parked parameter for one that had to be parked past it.
@@ -2657,11 +2676,11 @@ impl Arena {
                 "[rlx-wgpu split] weight_params={} weight_buf={:.3}GiB act_arena={:.3}GiB all_params={}",
                 weight_offsets.len(),
                 weight_cursor as f64 / (1u64 << 30) as f64,
-                new_plan.arena_size as f64 / (1u64 << 30) as f64,
+                plan.arena_size as f64 / (1u64 << 30) as f64,
                 rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT"),
             );
         }
-        let mut arena = Self::from_plan_with_scratch(device, &new_plan, scratch_aligned);
+        let mut arena = Self::from_plan_with_scratch(device, &plan, scratch_aligned);
         if let Some(allocation) = weight_allocation {
             arena.weight_buffer = allocation.shards.first().cloned();
             arena.weight_extra_shards = allocation.shards[1..].to_vec();
@@ -2690,7 +2709,7 @@ impl Arena {
             // share. A scoped compile that reached this point had its entry refuse to
             // grow and keeps its allocation to itself.
             //
-            // `global_share` is the caller's own opt-out (`from_plan_split_opts`): a
+            // `global_share` is the caller's own opt-out (`from_compact_plan_split`): a
             // compile whose weight buffer an executable adopts explicitly
             // (`share_weights_from`) must not also publish it here, where a later
             // compile of the same layout would bind it unseen.

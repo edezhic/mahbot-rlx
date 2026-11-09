@@ -172,7 +172,8 @@ fn caption(rows: &[Reading]) -> String {
     format!(
         "The pinned real-audio corpus, one call per recording, each measured in a process of its \
          own. Time per second of audio is the warm call — the models already resident — divided \
-         by the recording's own length. {}",
+         by the recording's own length. Two takes are comparable only at the same load, which \
+         the provenance states where the machine reports one. {}",
         basis.caption()
     )
 }

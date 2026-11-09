@@ -21,6 +21,30 @@ impl Stopwatch {
     }
 }
 
+/// One graph's construction and compile, timed into `RLX_WGPU_COMPILE_REPORT` beside the
+/// backend's own line ([`rlx_wgpu::compile_report`]): `build` is the flow's graph
+/// construction and `compile` is everything from HIR conversion to the last parameter
+/// upload. The difference between the two lines is the fusion pipeline and the upload —
+/// the backend's phases are the second line's. Without the switch this is
+/// [`crate::graphs::Compiled::new`] with the build timed. The device is fixed to
+/// [`rlx_runtime::Device::Gpu`] rather than passed in: nothing in this crate compiles for
+/// another backend.
+pub(crate) fn compiled(
+    kind: &str,
+    build: impl FnOnce() -> anyhow::Result<rlx_flow::BuiltModel>,
+) -> anyhow::Result<crate::graphs::Compiled> {
+    let t = Stopwatch::start();
+    let built = build()?;
+    let build_ms = t.ms();
+    let t = Stopwatch::start();
+    let compiled = crate::graphs::Compiled::new(rlx_runtime::Device::Gpu, built)?;
+    if rlx_wgpu::compile_report::enabled() {
+        let compile_ms = t.ms();
+        eprintln!("[compile {kind}] build={build_ms:.2}ms compile={compile_ms:.2}ms");
+    }
+    Ok(compiled)
+}
+
 /// The process's true high-water resident set, maintained by the kernel.
 /// On macOS `ru_maxrss` is bytes; on Linux it is KiB. This is the peak over the
 /// whole process lifetime, not the RSS left at the end of the run.

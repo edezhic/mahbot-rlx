@@ -386,7 +386,11 @@ fn the_one_row_device_guard_requires_a_vec4_addressable_x_window() {
 /// the route will be does not perturb [`rlx_wgpu::gguf_gpu::route_counts`].
 #[test]
 fn select_path_is_exact_for_the_joined_device_arms() {
-    use rlx_wgpu::gguf_gpu::{DequantMatmulPath, select_path};
+    use rlx_wgpu::gguf_gpu::{DequantMatmulPath, DequantSlab, select_path};
+
+    fn at(offset: usize) -> DequantSlab {
+        DequantSlab::At(std::num::NonZeroUsize::new(offset).unwrap())
+    }
 
     // The boundary's predicate is a total function of the variant, so it is pinned
     // once, over all five. The ladder's answers for the calls are pinned after it,
@@ -418,11 +422,11 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     // is enough: the arm's guard is about addressability, not block geometry.
     for (name, id) in [("Q4_K", 0u32), ("Q6_K", 2)] {
         for k in [256usize, 384] {
-            for scratch_off in [0usize, 4096] {
+            for slab in [DequantSlab::None, at(4096)] {
                 assert_eq!(
-                    select_path(1, k, id, 64, scratch_off),
+                    select_path(1, k, id, 64, slab),
                     DequantMatmulPath::OneRowDevice,
-                    "{name} (id {id}) m=1 k={k} scratch_off={scratch_off}: an \
+                    "{name} (id {id}) m=1 k={k} slab={slab:?}: an \
                      addressable one-row window is device-only and must join the \
                      enclosing batch"
                 );
@@ -434,7 +438,7 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     // — but is not the tiled arm, so it must not be joined.
     for k in [256usize, 384] {
         assert_eq!(
-            select_path(1, k, 24, 64, 0),
+            select_path(1, k, 24, 64, DequantSlab::None),
             DequantMatmulPath::FusedArm,
             "Q1_0 (24) m=1 k={k}: the bare guard passes but the scheme is not the \
              tiled arm, so the ladder must say Fused"
@@ -451,11 +455,11 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     for (name, id) in [("Q4_K", 0u32), ("Q6_K", 2)] {
         for m in [2usize, 13] {
             for k in [256usize, 2048] {
-                for scratch_off in [0usize, 4096] {
+                for slab in [DequantSlab::None, at(4096)] {
                     assert_eq!(
-                        select_path(m, k, id, 64, scratch_off),
+                        select_path(m, k, id, 64, slab),
                         DequantMatmulPath::GroupedDevice,
-                        "{name} (id {id}) m={m} k={k} scratch_off={scratch_off}: a \
+                        "{name} (id {id}) m={m} k={k} slab={slab:?}: a \
                          whole number of blocks above one row is the row-grouped GEMM"
                     );
                 }
@@ -463,11 +467,29 @@ fn select_path_is_exact_for_the_joined_device_arms() {
         }
     }
 
+    // The third slab state — the request without an address — admits the row-grouped
+    // arm, which reads the weight in place, and nothing else: a call that arm does not
+    // take answers the host, never the scratch arm. `DequantSlab` is the rule for all
+    // three states.
+    for id in [0u32, 2] {
+        assert_eq!(
+            select_path(4, 256, id, 64, DequantSlab::Wanted),
+            DequantMatmulPath::GroupedDevice,
+            "id {id} m=4 k=256 with a slab the arena has no address for: the request \
+             alone admits the row-grouped GEMM"
+        );
+        assert_eq!(
+            select_path(4, 384, id, 64, DequantSlab::Wanted),
+            DequantMatmulPath::Host,
+            "id {id} m=4 k=384 with no address: nothing to dequantize into, so the host"
+        );
+    }
+
     // The negative half — the calls that share the arm but must stay *out* of the
     // admission. Both a multi-row window the arm's `vec4` X read cannot address ...
     for id in [0u32, 2] {
         assert_eq!(
-            select_path(4, 256, id, 4, 0),
+            select_path(4, 256, id, 4, DequantSlab::None),
             DequantMatmulPath::FusedArm,
             "id {id} m=4 with a 4-byte-aligned X window: not addressable as vec4, \
              so the boundary must not join it"
@@ -476,7 +498,7 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     // ... and Q1_0 above one row, which passes the bare guard but is not the tiled
     // arm.
     assert_eq!(
-        select_path(4, 256, 24, 64, 0),
+        select_path(4, 256, 24, 64, DequantSlab::None),
         DequantMatmulPath::FusedArm,
         "Q1_0 (24) m=4: the bare guard passes but the scheme is not the tiled arm, \
          so the ladder must say Fused"
@@ -486,7 +508,7 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     // blocks: the scratch / host fallback, never the grouped device route.
     for id in [0u32, 2] {
         assert_eq!(
-            select_path(4, 384, id, 64, 4096),
+            select_path(4, 384, id, 64, at(4096)),
             DequantMatmulPath::ScratchArm,
             "id {id} m=4 k=384 with a slab: not a whole number of blocks, so the \
              scratch entry point — `ScratchArm` names the entry point, not the \
@@ -494,7 +516,7 @@ fn select_path_is_exact_for_the_joined_device_arms() {
              arm's per-row loop (`route_counts` is the arbiter)"
         );
         assert_eq!(
-            select_path(4, 384, id, 64, 0),
+            select_path(4, 384, id, 64, DequantSlab::None),
             DequantMatmulPath::Host,
             "id {id} m=4 k=384 with no slab: nothing to dequantize into, so the host"
         );
@@ -509,10 +531,22 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     // is the packing block and not the arm's 256-element staged tile, so its cells
     // run through a single block up to several tiles.
     let q8_0 = rlx_wgpu::gguf_host::gguf_scheme_id(rlx_ir::quant::QuantScheme::GgufQ8_0);
+    assert_eq!(
+        select_path(4, 256, q8_0, 64, DequantSlab::Wanted),
+        DequantMatmulPath::GroupedDevice,
+        "a booked slab with no address must still admit the row-grouped arm, which \
+         never touches it"
+    );
+    assert_eq!(
+        select_path(4, 100, q8_0, 64, DequantSlab::Wanted),
+        DequantMatmulPath::Host,
+        "Q8_0 (id {q8_0}) m=4 k=100 with a booked slab and no address: the grouped arm \
+         declines the partial block and the scratch arm has nowhere to write, so the host"
+    );
     for k in [32usize, 128, 256, 288, 384, 896, 2048] {
         for m in [2usize, 4, 13] {
             assert_eq!(
-                select_path(m, k, q8_0, 64, 4096),
+                select_path(m, k, q8_0, 64, at(4096)),
                 DequantMatmulPath::GroupedDevice,
                 "Q8_0 (id {q8_0}) m={m} k={k} with a slab: a multi-row call over whole \
                  32-element blocks of this scheme's own (any multiple of 32, not only \
@@ -528,21 +562,21 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     // device-free ladder can exercise the gate — the same reason the one-row arm's
     // `k = 100` cell below is device-free-only.
     assert_eq!(
-        select_path(4, 100, q8_0, 64, 4096),
+        select_path(4, 100, q8_0, 64, at(4096)),
         DequantMatmulPath::ScratchArm,
         "Q8_0 (id {q8_0}) m=4 k=100 with a slab: 100 is not a whole number of \
          32-element blocks, so the grouped arm is not asked and the slab stands"
     );
     // A window the grouped kernel's `vec4` X read cannot address ...
     assert_eq!(
-        select_path(4, 256, q8_0, 4, 4096),
+        select_path(4, 256, q8_0, 4, at(4096)),
         DequantMatmulPath::ScratchArm,
         "Q8_0 (id {q8_0}) m=4 with a 4-byte-aligned X window and a slab: the grouped \
          kernel reads X as `vec4`, so the slab stands"
     );
     // ... no slab to dequantize into ...
     assert_eq!(
-        select_path(4, 256, q8_0, 64, 0),
+        select_path(4, 256, q8_0, 64, DequantSlab::None),
         DequantMatmulPath::Host,
         "Q8_0 (id {q8_0}) m=4 with no slab: nothing to dequantize into, so the host"
     );
@@ -550,7 +584,7 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     // keyed on this scheme's own 32-element block, joined on its shape terms
     // alone ...
     assert_eq!(
-        select_path(1, 256, q8_0, 64, 4096),
+        select_path(1, 256, q8_0, 64, at(4096)),
         DequantMatmulPath::OneRowDevice,
         "Q8_0 (id {q8_0}) m=1 with a slab: the 8-bit scheme's single row is the \
          tiled arm's own block-keyed branch, over whole 32-element blocks, so it \
@@ -561,7 +595,7 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     // today's slab answer stands. The format never carries a partial block with
     // real packed bytes, so only this device-free ladder can exercise the gate.
     assert_eq!(
-        select_path(1, 100, q8_0, 64, 4096),
+        select_path(1, 100, q8_0, 64, at(4096)),
         DequantMatmulPath::ScratchArm,
         "Q8_0 (id {q8_0}) m=1 k=100 with a slab: 100 is not a whole number of \
          32-element blocks, so the one-row arm is not asked and the slab stands"
@@ -571,17 +605,15 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     // K-quants' one-row arm produces for that window, pinned at the end of this
     // test.
     assert_eq!(
-        select_path(1, 256, q8_0, 4, 4096),
+        select_path(1, 256, q8_0, 4, at(4096)),
         DequantMatmulPath::FusedArm,
         "Q8_0 (id {q8_0}) m=1 with a 4-byte-aligned X window: not addressable as \
          vec4, so the boundary must not join it"
     );
-    // ... and no slab booked at all, which the one-row arm does not read: it is
-    // admitted on its shape terms alone, exactly as the K-quants' is
-    // (`select_path(1, 256, 0, 64, 0)` is `OneRowDevice` today) — the slab is not
-    // a term of it.
+    // ... and no slab at all, which the one-row arm does not read: it is admitted on its
+    // shape terms alone, exactly as the K-quants' is — the slab is not a term of it.
     assert_eq!(
-        select_path(1, 256, q8_0, 64, 0),
+        select_path(1, 256, q8_0, 64, DequantSlab::None),
         DequantMatmulPath::OneRowDevice,
         "Q8_0 (id {q8_0}) m=1 with no slab: the one-row arm's terms are its own \
          blocks and the X window, so the booking cannot keep it out"
@@ -589,7 +621,7 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     // ... and a row count of zero, which is not above one row either, nor the new
     // term's `m == 1` exactly.
     assert_eq!(
-        select_path(0, 256, q8_0, 64, 4096),
+        select_path(0, 256, q8_0, 64, at(4096)),
         DequantMatmulPath::ScratchArm,
         "Q8_0 (id {q8_0}) m=0 with a slab: a row count of zero is not `m > 1` and \
          not the one-row arm's `m == 1`, so the slab stands"
@@ -600,13 +632,13 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     let q5_0 = rlx_wgpu::gguf_host::gguf_scheme_id(rlx_ir::quant::QuantScheme::GgufQ5_0);
     for m in [1usize, 4] {
         assert_eq!(
-            select_path(m, 256, q5_0, 64, 4096),
+            select_path(m, 256, q5_0, 64, at(4096)),
             DequantMatmulPath::ScratchArm,
             "Q5_0 (id {q5_0}) m={m}: no fused and no grouped kernel, so a booked slab \
              means scratch"
         );
         assert_eq!(
-            select_path(m, 256, q5_0, 64, 0),
+            select_path(m, 256, q5_0, 64, DequantSlab::None),
             DequantMatmulPath::Host,
             "Q5_0 (id {q5_0}) m={m}: no kernel at all and no slab, so the host"
         );
@@ -635,7 +667,7 @@ fn select_path_is_exact_for_the_joined_device_arms() {
     // host route.
     for id in [0u32, 2] {
         assert_eq!(
-            select_path(1, 256, id, 4, 0),
+            select_path(1, 256, id, 4, DequantSlab::None),
             DequantMatmulPath::FusedArm,
             "id {id} m=1 with a 4-byte-aligned X window: not addressable as vec4, \
              so the boundary must not join it"

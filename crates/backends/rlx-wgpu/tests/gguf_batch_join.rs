@@ -142,7 +142,7 @@ use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Dim, Graph, GraphExt, Op, Shape};
 use rlx_runtime::{Device, Session};
 use rlx_wgpu::backend::WgpuExecutable;
-use rlx_wgpu::gguf_gpu::{reset_route_counts, route_counts};
+use rlx_wgpu::gguf_gpu::{DequantSlab, reset_route_counts, route_counts};
 use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts};
 
 /// The compiled bucket. One row is what the models run at, so this is the
@@ -191,6 +191,10 @@ fn packed_q8_0(k: usize, n: usize) -> Vec<u8> {
 /// Deterministic values for an `n`-element tensor or parameter.
 fn feed(n: usize, step: f32) -> Vec<f32> {
     (0..n).map(|i| ((i as f32) * step).sin()).collect()
+}
+
+fn at(offset: usize) -> DequantSlab {
+    DequantSlab::At(std::num::NonZeroUsize::new(offset).unwrap())
 }
 
 /// The rebind fixture: `relu(dq(x) · w)` over `x: [Dynamic(0), k]` and a packed
@@ -848,7 +852,7 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
     // two graphs no longer share a planner by themselves: a graph that books a dequant
     // slab keeps the flat plan — which is this scheme, so the 8-bit figure below is its
     // production arena — while a scratch-free graph that binds its packed weights in
-    // place takes `Arena::from_plan_split_opts`, whose compact re-plan moves the arena
+    // place takes `Arena::from_plan_split`, whose compact plan moves the arena
     // 23168 B below the flat one (`backend/compile/lower.rs`'s `packed_in_place`). The
     // K-quant graph is that second kind, so the reference is compiled with
     // `RLX_WGPU_PACKED_IN_ARENA` — the admission's own opt-out — set, which puts it on
@@ -980,7 +984,7 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
             K,
             rlx_wgpu::gguf_host::gguf_scheme_id(QuantScheme::GgufQ8_0),
             16,
-            4096
+            at(4096)
         ),
         rlx_wgpu::gguf_gpu::DequantMatmulPath::GroupedDevice,
         "the 8-bit scheme's bisect lever is outside the ladder by construction, so \

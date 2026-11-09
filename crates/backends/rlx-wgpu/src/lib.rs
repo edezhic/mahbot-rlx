@@ -53,6 +53,7 @@ pub mod buffer;
 pub mod builtin_gpu_kernels;
 pub mod calibrate;
 pub mod collective_host;
+pub mod compile_report;
 pub mod config;
 pub use config::{
     WgpuRuntimeConfig, install_runtime_config, reload_runtime_config, runtime_config,

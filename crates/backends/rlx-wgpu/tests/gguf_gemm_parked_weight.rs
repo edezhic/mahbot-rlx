@@ -62,7 +62,7 @@ use rlx_ir::{DType, Graph, NodeId, Op, Shape};
 use rlx_wgpu::backend::PassMarks;
 use rlx_wgpu::buffer::{Arena, is_weight_off, raw_weight_off};
 use rlx_wgpu::gguf_gpu::{
-    DequantMatmulPath, DequantMatmulRoutes, dequant_gguf_scratch_bytes,
+    DequantMatmulPath, DequantMatmulRoutes, DequantSlab, dequant_gguf_scratch_bytes,
     encode_dequant_matmul_gguf_into, reset_route_counts, route_counts,
     run_dequant_matmul_gguf_gemv_rows, run_dequant_matmul_gguf_gpu, select_path,
 };
@@ -72,6 +72,10 @@ use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts};
 use std::sync::Mutex;
 
 mod common;
+
+fn at(offset: usize) -> DequantSlab {
+    DequantSlab::At(std::num::NonZeroUsize::new(offset).unwrap())
+}
 
 /// The backend's device counters are process-global, and every test in this binary
 /// dispatches — so the tests take this lock in turn. That is the discipline
@@ -134,8 +138,7 @@ fn one_weight_graph(
 /// `from_plan_split` with this graph, asserting the packed weight landed in the
 /// weight buffer rather than the act arena.
 fn parked_arena(dev: &rlx_wgpu::device::WgpuDevice, g: &Graph, w: NodeId) -> Arena {
-    let plan = plan_memory_f32_uniform(g, 16);
-    let arena = Arena::from_plan_split(&dev.device, &plan, g, 0);
+    let arena = Arena::from_plan_split(&dev.device, g, 0);
     assert!(
         arena.weight_buffer.is_some() && is_weight_off(arena.offset(w)),
         "a packed quant param must be parked in the weight buffer"
@@ -259,7 +262,7 @@ fn assert_q8_admission(
         "the plan must book a dequant slab for this graph, got {booking}"
     );
     let scheme = gguf_scheme_id(QuantScheme::GgufQ8_0);
-    let joined_path = select_path(m, k, scheme, x_off, booking);
+    let joined_path = select_path(m, k, scheme, x_off, at(booking));
     assert_eq!(
         joined_path, want,
         "a single-row 8-bit call is the tiled arm and a multi-row one the grouped \
@@ -270,7 +273,7 @@ fn assert_q8_admission(
         "the admission's answer for this call must be one of the two device-only arms"
     );
     assert_eq!(
-        select_path(m, k, scheme, other_arena_x_off, booking),
+        select_path(m, k, scheme, other_arena_x_off, at(booking)),
         joined_path,
         "{blind} must not enter the admission's answer (X windows {x_off:#x} and \
          {other_arena_x_off:#x})"
@@ -703,7 +706,7 @@ impl<'a> Arrangement<'a> {
                 self.scheme,
                 self.x_off,
                 self.w_off,
-                self.booking,
+                at(self.booking),
                 self.y_off,
                 marks,
             );
@@ -726,7 +729,7 @@ impl<'a> Arrangement<'a> {
                 self.scheme,
                 self.plain.offset(self.case.x_in),
                 self.plain.offset(self.case.w),
-                self.booking,
+                at(self.booking),
                 self.plain.offset(self.case.y),
                 marks,
             );

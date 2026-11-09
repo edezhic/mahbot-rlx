@@ -454,6 +454,33 @@ pub fn classify(name: &str, rank: usize) -> Class {
     }
 }
 
+/// `src` in `[rows, cols]` order (`cols` fastest) as `[cols, rows]` (`rows`
+/// fastest), blocked so a tile's read and write both stay in cache: the naive
+/// double loop is one strided store per element, and on the 7.5 M-element
+/// `a.conv_out.weight` that store alone was about 40 ms of the build that reads
+/// it — the blocked loop's is about 5 ms. Only a build that reads the weight
+/// reaches this, and the process keeps the dequantised copy from the weight's second
+/// ask on (`emit::worth_keeping`), so a recognition call pays one read.
+pub(crate) fn transpose(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut dst = vec![0f32; rows * cols];
+    const BLOCK: usize = 32;
+    for c0 in (0..cols).step_by(BLOCK) {
+        let c1 = (c0 + BLOCK).min(cols);
+        for r0 in (0..rows).step_by(BLOCK) {
+            let r1 = (r0 + BLOCK).min(rows);
+            // The destination run is contiguous, so the store vectorises; the
+            // source run strides one column and stays inside the same 4 KiB tile.
+            for c in c0..c1 {
+                let drow = c * rows;
+                for r in r0..r1 {
+                    dst[drow + r] = src[r * cols + c];
+                }
+            }
+        }
+    }
+    dst
+}
+
 impl Model {
     /// The code predictor's entry: `(talker width, predictor width)`. The 1.7B
     /// sound file carries `a.gen.code.proj_in.weight`, which takes the talker's
@@ -764,13 +791,7 @@ impl Model {
         }
         let (k, n) = p.in_out();
         let (vals, _) = self.f32_file_order(name)?;
-        let mut out = vec![0f32; k * n];
-        for j in 0..n {
-            for i in 0..k {
-                out[i * n + j] = vals[j * k + i];
-            }
-        }
-        Ok((out, k, n))
+        Ok((transpose(&vals, n, k), k, n))
     }
 
     /// The same weight as **f16** bytes, in the same layout — what
@@ -1396,5 +1417,28 @@ mod tests {
             Rows::Widened { rows: 2, cols: 100 },
             "a row of 100 elements is not whole Q8_0 blocks"
         );
+    }
+
+    /// The blocked transpose is the index math the two call sites depend on, and they
+    /// pass their arguments in opposite orders (`Model::linear_f32` from the file's
+    /// `[out, in]` to the matmul's `[in, out]`, `emit`'s `take_read` the other way), so
+    /// a swapped argument reads as a correct-looking square. Three rows by two columns
+    /// is not square; 33×2 and 2×33 each cross one tile boundary, so the block walk's
+    /// clamp on each axis is exercised.
+    #[test]
+    fn the_transpose_moves_the_fastest_axis() {
+        // `[rows = 3, cols = 2]`: three rows of two, `cols` fastest.
+        let src = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        assert_eq!(transpose(&src, 3, 2), vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
+        // And back: `[rows = 2, cols = 3]`, so the transpose is an involution.
+        assert_eq!(transpose(&transpose(&src, 3, 2), 2, 3), src.to_vec());
+        // A row-tile boundary: 33 rows is a full 32-row tile plus one.
+        let tall: Vec<f32> = (0..66).map(|i| i as f32).collect();
+        let got = transpose(&tall, 33, 2);
+        assert!((0..33).all(|r| got[r] == tall[2 * r] && got[33 + r] == tall[2 * r + 1]));
+        // A column-tile boundary: 33 columns is a full 32-column tile plus one.
+        let wide: Vec<f32> = (0..66).map(|i| i as f32).collect();
+        let got = transpose(&wide, 2, 33);
+        assert!((0..33).all(|c| got[2 * c] == wide[c] && got[2 * c + 1] == wide[33 + c]));
     }
 }

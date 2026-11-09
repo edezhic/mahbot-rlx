@@ -43,19 +43,21 @@ fn every_encoder_block_takes_one_wide_projection() {
         }
     };
     let blocks = pair.sound.clip().layers;
-    let cases = [
-        (
-            "the wake window's whole encoder",
-            graphs::asr_encoder(pair.sound.clone(), MEL_FRAMES, 1),
-        ),
-        (
-            "the batching tail, sixteen windows in one pass",
-            graphs::asr_encoder_tail(pair.sound.clone(), MEL_FRAMES, GROUP),
-        ),
+    // Each graph is built and compiled in turn, never two builds before one compile:
+    // the build's weight records (`emit`) live for the one compile that follows, and a
+    // second build in between replaces them — the encoder's host f32 weights would then
+    // have no resolvable bytes and the compile refuses rather than run on zeros.
+    let cases: [(&str, fn(&Pair) -> anyhow::Result<rlx_flow::BuiltModel>); 2] = [
+        ("the wake window's whole encoder", |pair| {
+            graphs::asr_encoder(pair.sound.clone(), MEL_FRAMES, 1)
+        }),
+        ("the batching tail, sixteen windows in one pass", |pair| {
+            graphs::asr_encoder_tail(pair.sound.clone(), MEL_FRAMES, GROUP)
+        }),
     ];
-    for (label, built) in cases {
-        let compiled = graphs::Compiled::new(Device::Gpu, built.expect("the encoder builds"))
-            .expect("the encoder compiles");
+    for (label, build) in cases {
+        let built = build(&pair).expect("the encoder builds");
+        let compiled = graphs::Compiled::new(Device::Gpu, built).expect("the encoder compiles");
         let names = compiled
             .schedule_step_names()
             .expect("the wgpu backend exposes its schedule");

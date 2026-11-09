@@ -365,7 +365,7 @@ fn coop_route(scheme: QuantScheme) -> String {
 /// term, which the ladder's own term consults.)
 ///
 /// `arena_scratch_reserved` is the caller's statement of the graph-level fact the
-/// lowerer tests as `dequant_scratch_off != 0`, taken from the graph's own
+/// lowerer tests as a slab address, taken from the graph's own
 /// reservation (`gguf_gpu::dequant_gguf_scratch_bytes`) rather than decided here —
 /// it is what separates the host fallback from the slab on the unaligned-`k` arm.
 fn wgpu_route(scheme: QuantScheme, m: usize, k: usize, arena_scratch_reserved: bool) -> String {
@@ -447,8 +447,8 @@ fn wgpu_route(scheme: QuantScheme, m: usize, k: usize, arena_scratch_reserved: b
             format!("{ROUTE_GROUPED}; {blocks}; k%256==0")
         }
         // Unaligned k with a slab booked elsewhere in the graph: the op dequantizes
-        // into it instead of crossing to the host (the lowerer's
-        // `dequant_scratch_off != 0` branch). No cell in this file builds that graph.
+        // into it instead of crossing to the host (the lowerer's slab-address branch).
+        // No cell in this file builds that graph.
         QuantScheme::GgufQ4K | QuantScheme::GgufQ6K if arena_scratch_reserved => {
             format!("{ROUTE_SCRATCH}; {blocks}; unaligned k, so no fused GEMM")
         }

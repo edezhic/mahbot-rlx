@@ -417,17 +417,19 @@ fn serve_packed(key: &str, model: &Arc<Model>, len: usize) -> Vec<u8> {
     vec![0u8; len]
 }
 
-/// Host f32 the process has already read for `key`, with the shape it is bound at.
-fn cached_f32(model: &Model, key: &str) -> Option<(Arc<Vec<f32>>, Vec<usize>)> {
+/// The shape the process has already read `key` at, if it has: the compile binds the
+/// kept copy ([`host_weight`]), so a rebuild carries the shape and no values.
+fn cached_dims(model: &Model, key: &str) -> Option<Vec<usize>> {
     let key = (model.path.display().to_string(), key.to_string());
     let guard = cached().lock().ok()?;
-    let kept = guard.get(&key)?;
-    Some((Arc::clone(&kept.values), kept.dims.clone()))
+    Some(guard.get(&key)?.dims.clone())
 }
 
 /// Keep `values` for the rest of the process and hand back the placeholder the build
-/// carries in their place; a weight too small to be worth an entry is handed over as it
-/// is, and then the compile binds the build's own values.
+/// carries in their place — empty, because the compile binds the kept copy
+/// ([`host_weight`]) and a zeroed buffer of the weight's size would be allocated and
+/// never read; a weight too small to be worth an entry is handed over as it is, and
+/// then the compile binds the build's own values.
 fn serve_f32(
     model: &Model,
     key: &str,
@@ -449,7 +451,7 @@ fn serve_f32(
         );
     }
     note_placeholder(key);
-    (vec![0f32; shared.len()], dims)
+    (Vec::new(), dims)
 }
 
 /// Split a `name#step` key: a stacked tensor (`[k, n, steps]`, the code
@@ -474,11 +476,12 @@ impl WeightSource for LoaderWeights {
         } else {
             key.to_string()
         };
-        if let Some((values, dims)) = cached_f32(&self.model, &cached_key) {
+        if let Some(dims) = cached_dims(&self.model, &cached_key) {
             // The compile binds the kept values, not this placeholder
-            // (`graphs::Runner::compile`).
+            // (`graphs::Runner::compile`), so it is empty rather than a zeroed copy
+            // of the weight the build would allocate and the compile never read.
             note_placeholder(&cached_key);
-            return Ok((vec![0f32; values.len()], dims));
+            return Ok((Vec::new(), dims));
         }
         let (vals, dims) = self.take_read(key, transpose)?;
         Ok(serve_f32(&self.model, &cached_key, vals, dims))
@@ -554,13 +557,7 @@ impl LoaderWeights {
             // fastest — the one place the file's element order is rearranged.
             let (vals, k, n) = self.model.linear_f32(key)?;
             if transpose {
-                let mut out = vec![0f32; k * n];
-                for i in 0..k {
-                    for j in 0..n {
-                        out[j * k + i] = vals[i * n + j];
-                    }
-                }
-                return Ok((out, vec![n, k]));
+                return Ok((crate::loader::transpose(&vals, k, n), vec![n, k]));
             }
             return Ok((vals, vec![k, n]));
         }
@@ -1193,16 +1190,11 @@ pub fn pad_axis(
 /// One 2-D slice of a stacked `[k, n, steps]` file tensor, rearranged into the
 /// layout `MatMul` wants (`[k, n]` row-major, `n` fastest) — the same move
 /// [`Model::linear_f32`](crate::loader::Model::linear_f32) makes for a whole
-/// weight, one step at a time (the code predictor's per-step LM heads).
+/// weight, one step at a time (the code predictor's per-step LM heads), through the
+/// same blocked transpose so a wide head does not pay a strided store per element.
 pub fn linear_slice(values: &[f32], step: usize, k: usize, n: usize) -> Vec<f32> {
     let base = step * k * n;
-    let mut out = vec![0f32; k * n];
-    for j in 0..n {
-        for i in 0..k {
-            out[i * n + j] = values[base + j * k + i];
-        }
-    }
-    out
+    crate::loader::transpose(&values[base..base + k * n], n, k)
 }
 
 /// A `Param` node for values the stage computed itself, under its own name —

@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 828  
+**Registered names:** 829  
 **Unregistered mentions (migration leftovers):** 107
 
 ## Groups
@@ -40,7 +40,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
 - [webgl](#webgl) — 2
-- [wgpu](#wgpu) — 130
+- [wgpu](#wgpu) — 131
 - [xdna](#xdna) — 20
 
 ## compile
@@ -842,6 +842,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_ARENA_REPORT` | Internal | Bool | Backend(wgpu) | Report which tensors dominate the activation arena after planning |
 | `RLX_WGPU_ATTENTION_BAND_F32` | Bisect | Bool | Backend(wgpu) | Stage the two-sided band attention kernel's K/V tiles in f32 instead of f16 (the f32 form is also the fallback without SHADER_F16) |
 | `RLX_WGPU_ATTN_DENSE_ONE_ROW` | Bisect | Bool | Backend(wgpu) | Admit the many-row dense attention arrangement from one query row |
+| `RLX_WGPU_COMPILE_REPORT` | Internal | Bool | Backend(wgpu) | Print a compile's phase breakdown: unfuse, plan, arena, init, steps (the schedule and its bind groups), and restarts when the lowering compiled twice |
 | `RLX_WGPU_CONCAT_HOST` | Bisect | Bool | Backend(wgpu) | Run Concat on the host instead of a wgpu kernel |
 | `RLX_WGPU_CONV3D_NO_C8` | Bisect | Bool | Backend(wgpu) | Tile Conv3D over four output channels per thread instead of eight (conv3d_ctile_w4, not conv3d_ctile_w4c8) |
 | `RLX_WGPU_CONV3D_NO_K3` | Bisect | Bool | Backend(wgpu) | Run 2-D 3x3 Conv3D (kernel [1,3,3], pad [0,1,1]) on the eight-channel tile instead of conv3d_k3_c8 (weights in workgroup memory) |

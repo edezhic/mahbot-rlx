@@ -73,3 +73,5 @@ _Measured 2026-11-07 22:42 UTC._
 - voice08: `speech/librivox/speech-librivox-0089.wav` · 13.80 s + 15.00 s · sha256 cf8dfec778ea249d67282b7a7396fa954d212280ff44cb723cdb45e15f2ed01b
 - voice09: `speech/librivox/speech-librivox-0129.wav` · 40.60 s + 15.00 s · sha256 75252026b534c7bb730c44cb721e6c7105220cbf1b4023eee9c7d5af40256adf
 - voice10: `speech/librivox/speech-librivox-0065.wav` · 5.90 s + 15.00 s · sha256 725adb1ab5289dbcd8c8016285ae34890c96ac4f150995f20d078a1cfd1ecbf3
+
+_Not re-taken on 2026-11-09 with the compile-path change: these figures are recall and false accepts, not timings, and that change moves no decision — the wake score and every digest are unchanged. A change that cannot move a run's numbers does not re-run it. Re-rendering its corpus is a deliberate hours-long operation of its own._

@@ -2747,6 +2747,37 @@ fn bind_fused(
     Ok(())
 }
 
+/// The one message for the parameter [`bind_route`] answers `None` for: a record released
+/// by `emit::clear_weight_caches` and a build whose record never reached this compile
+/// (built on another thread, or two builds interleaved) leave the same thing behind, and
+/// this compile cannot tell them apart.
+fn unresolved(name: &str) -> anyhow::Error {
+    anyhow!(
+        "the weight `{name}` was handed over as a placeholder and its bytes cannot \
+         be resolved in this process: no build record names them (`emit`'s weight \
+         caches were released after the graph was built, or the build and the compile \
+         are not the same build) — the graph is not run on zeros"
+    )
+}
+
+/// The bytes one parameter binds, or `None` when it is a placeholder this compile cannot
+/// resolve: no values with elements in the graph is a placeholder, either recorded by
+/// `emit` or never reaching this compile.
+fn bind_route<'a>(
+    values: &'a [f32],
+    kept: Option<&'a Arc<Vec<f32>>>,
+    placeholder: bool,
+    holds_bytes: bool,
+) -> Option<&'a [f32]> {
+    if let Some(shared) = kept {
+        return Some(shared);
+    }
+    if placeholder || (values.is_empty() && holds_bytes) {
+        return None;
+    }
+    Some(values)
+}
+
 /// Compile a built flow and run it.
 ///
 /// The flow's own outputs are taken apart by hand: `BuiltModel` keeps the f32
@@ -2789,6 +2820,8 @@ impl Runner {
             .into_hir()
             .ok_or_else(|| anyhow!("flow built a non-HIR module"))?;
         let graph = rlx_ir::hir_to_graph(hir)?;
+        // The whole `Session::compile`: the fusion pipeline above the backend plus the
+        // backend compile, whose own phases `RLX_WGPU_COMPILE_REPORT` prints separately.
         let mut session = Session::new(device).compile(graph.clone());
         // Upload and release one tensor at a time: the flow hands over the whole
         // weight map at once, but holding all of it while the device receives its
@@ -2800,24 +2833,29 @@ impl Runner {
         // tensor from the model file, or — for a fused projection — part by part out of
         // it; and a parameter the device already holds is not read for at all.
         let origins = emit::take_origins();
-        // One message for both ways a placeholder's bytes can be missing: a record released
-        // by `emit::clear_weight_caches` and a build whose record never reached this compile
-        // (built on another thread, or two builds interleaved) leave the same thing behind,
-        // and this compile cannot tell them apart.
-        let unresolved = |name: &str| {
-            anyhow!(
-                "the weight `{name}` was handed over as a placeholder and its bytes cannot \
-                 be resolved in this process: no build record names them (`emit`'s weight \
-                 caches were released after the graph was built, or the build and the compile \
-                 are not the same build) — the graph is not run on zeros"
-            )
-        };
+        // The graph's half of [`bind_route`]'s placeholder rule, walked once for the whole
+        // upload rather than once per parameter.
+        let holds_bytes: std::collections::HashSet<&str> = graph
+            .nodes()
+            .iter()
+            .filter_map(|node| match &node.op {
+                Op::Param { name } if node.shape.num_elements().unwrap_or(0) > 0 => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
         while let Some(name) = built.params.keys().next().cloned() {
             let values = built.params.remove(&name).expect("key just read");
-            match emit::host_weight(&origins, &name) {
-                Some(shared) => session.set_param(&name, &shared),
-                None if emit::is_placeholder(&name) => return Err(unresolved(&name)),
-                None => session.set_param(&name, &values),
+            let kept = emit::host_weight(&origins, &name);
+            match bind_route(
+                &values,
+                kept.as_ref(),
+                emit::is_placeholder(&name),
+                holds_bytes.contains(name.as_str()),
+            ) {
+                Some(values) => session.set_param(&name, values),
+                None => return Err(unresolved(&name)),
             }
         }
         // One scratch for the packed tensors, reused: the file's bytes are `pread` into it
@@ -3852,5 +3890,34 @@ mod tests {
         assert_eq!(front_lengths(FRONT_WINDOW), (72, None));
         assert_eq!(front_lengths(FRONT_WINDOW + 1), (72, Some(72)));
         assert_eq!(front_lengths(330), (72, Some(72)));
+    }
+
+    /// A parameter the build handed over empty is this crate's own `unresolved` error when
+    /// the graph gives it elements, and the build's values only when it really holds
+    /// nothing — the route that keeps a released weight from running the graph on zeros.
+    #[test]
+    fn an_empty_parameter_with_elements_is_unresolved_rather_than_run_on_zeros() {
+        use super::bind_route;
+
+        let kept = std::sync::Arc::new(vec![1.0f32]);
+        assert!(matches!(
+            bind_route(&[], Some(&kept), false, true),
+            Some(values) if values == [1.0]
+        ));
+        assert!(bind_route(&[1.0], None, true, true).is_none());
+        assert!(bind_route(&[], None, false, true).is_none());
+        assert!(matches!(
+            bind_route(&[], None, false, false),
+            Some(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bind_route(&[1.0], None, false, true),
+            Some(values) if values == [1.0]
+        ));
+        let message = format!("{:#}", super::unresolved("a.conv_out.weight"));
+        assert!(
+            message.contains("a.conv_out.weight") && message.contains("not run on zeros"),
+            "{message}"
+        );
     }
 }

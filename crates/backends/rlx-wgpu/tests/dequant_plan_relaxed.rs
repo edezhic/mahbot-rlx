@@ -23,8 +23,10 @@
 //!
 //! **Globals.** The device test pins `RLX_WGPU_HAZARD_REPORT`,
 //! `RLX_WGPU_ALL_PARAMS_WEIGHT` and the planner knobs in its own body, and the
-//! plan site writes the global `PIN_HOST_STRUCTURE`; the other test here is
-//! device-free and reads none of them.
+//! plan site writes the global `PIN_HOST_STRUCTURE`. The zero-length test's constructor
+//! reads `RLX_WGPU_ALL_PARAMS_WEIGHT` too — it decides which parameters park — but its
+//! assertion (the arena builds at all) holds under either value, so the two may run
+//! beside each other; the device-free test reads none of them.
 //!
 //! **Why no run takes the host route.** It needs packed f32 scratch past
 //! `max_buffer_size`, so the premise rests on the route classification in
@@ -35,6 +37,7 @@
 mod common;
 
 use rlx_compile::memory::{GuardedPlanner, plan_memory_with_dequant_guard};
+use rlx_ir::op::Activation;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, GraphExt, NodeId, Op, Shape};
 use rlx_runtime::{CompiledGraph, Device, Session};
@@ -420,7 +423,7 @@ fn the_relaxed_plan_runs_both_arena_routes_and_matches_cpu() {
     // bytes, same inputs, so the results must be bit-identical. (The knob is read
     // by the split planner's constructor only, so it goes back off right after.)
     rlx_ir::env::set("RLX_WGPU_ALL_PARAMS_WEIGHT", "1");
-    // The parked route's own plan site: `Arena::from_plan_split` re-plans the
+    // The parked route's own plan site: `Arena::from_plan_split` plans the
     // activations compactly before parking the parameters, so the plan it lays
     // the arena out under — `size` minus the scratch zone — is the relaxed
     // compact golden. Reverting that call site to
@@ -430,8 +433,7 @@ fn the_relaxed_plan_runs_both_arena_routes_and_matches_cpu() {
     // and under `RLX_WGPU_ALL_PARAMS_WEIGHT=1` every param parks, so only
     // activations are left in the arena.
     let dev = rlx_wgpu::wgpu_device().expect("wgpu device (checked above)");
-    let split_arena =
-        rlx_wgpu::buffer::Arena::from_plan_split(&dev.device, &relaxed, &g, 16 * 1024);
+    let split_arena = rlx_wgpu::buffer::Arena::from_plan_split(&dev.device, &g, 16 * 1024);
     let split_plan = split_arena.size - split_arena.scratch_bytes;
     eprintln!(
         "parked route compact activation plan: {split_plan} B (relaxed acts {})",
@@ -559,4 +561,42 @@ fn the_relaxed_plan_runs_both_arena_routes_and_matches_cpu() {
         b_max - b_min
     );
     eprintln!("parked / in-arena median step ratio: {ratio:.3}");
+}
+
+/// A zero-element parameter is one the planner skips: the compile's own fixup gives it a
+/// zero-length slot so every arena lookup resolves, and the split constructor places every
+/// parameter itself. That slot must not read as a placement, or a model with a zero-length
+/// weight could not build a split arena at all.
+#[test]
+fn a_zero_length_parameter_still_builds_a_split_arena() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        eprintln!("skip: wgpu unavailable");
+        return;
+    }
+    let dev = rlx_wgpu::wgpu_device().expect("wgpu device (checked above)");
+    let mut g = Graph::new("wgpu_zero_length_param");
+    let x = g.input("x", Shape::new(&[2, 4], F));
+    let empty = g.param("empty", Shape::new(&[0, 4], F));
+    let y = g.add_node(
+        Op::Activation(Activation::Relu),
+        vec![x],
+        Shape::new(&[2, 4], F),
+    );
+    g.set_outputs(vec![y]);
+    assert!(
+        g.nodes().iter().any(|n| n.id == empty
+            && matches!(&n.op, Op::Param { name } if name == "empty")
+            && n.shape.num_elements() == Some(0)),
+        "the graph must carry the zero-element parameter this test is about"
+    );
+    let mut plan = rlx_wgpu::buffer::compact_plan(&g);
+    plan.assignments.insert(
+        empty,
+        rlx_compile::memory::BufferSlot { offset: 0, size: 0 },
+    );
+    let arena = rlx_wgpu::buffer::Arena::from_compact_plan_split(&dev.device, plan, &g, 0, true);
+    assert!(
+        arena.size > 0,
+        "a zero-length parameter must not block a split arena"
+    );
 }

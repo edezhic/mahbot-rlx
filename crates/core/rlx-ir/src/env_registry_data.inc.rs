@@ -3905,6 +3905,15 @@
         layer: EnvLayer::Backend("wgpu"),
     },
     EnvVarEntry {
+        name: "RLX_WGPU_COMPILE_REPORT",
+        group: "wgpu",
+        summary: "Print a compile's phase breakdown: unfuse, plan, arena, init, steps (the schedule and its bind groups), and restarts when the lowering compiled twice",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Internal,
+        aliases: &[],
+        layer: EnvLayer::Backend("wgpu"),
+    },
+    EnvVarEntry {
         name: "RLX_WGPU_CONCAT_HOST",
         group: "wgpu",
         summary: "Run Concat on the host instead of a wgpu kernel",

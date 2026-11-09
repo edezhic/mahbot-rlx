@@ -124,7 +124,7 @@ impl WgpuExecutable {
             *k as usize,
             *scheme_id,
             *x_byte_off as usize,
-            self.dequant_scratch_off,
+            self.dequant_slab,
         )
         .is_provably_device_only()
     }
@@ -711,7 +711,7 @@ impl WgpuExecutable {
         }
         self.schedule.iter().any(|s| {
             (super::step_runs_on_host(s)
-                && !gguf_step_is_gpu_only(s, self.active_extent, self.dequant_scratch_off)
+                && !gguf_step_is_gpu_only(s, self.active_extent, self.dequant_slab)
                 && !self.buffer_copy_is_gpu_only(s))
                 || super::step_is_tail_host(s)
         })
@@ -5151,7 +5151,7 @@ impl WgpuExecutable {
                         kk,
                         *scheme_id,
                         *x_byte_off as usize,
-                        self.dequant_scratch_off,
+                        self.dequant_slab,
                     );
                     if path == crate::gguf_gpu::DequantMatmulPath::Host {
                         crate::gguf_gpu::note_route(crate::gguf_gpu::DequantMatmulRoute::Host);
@@ -5174,12 +5174,13 @@ impl WgpuExecutable {
                         // `is_weight_off` short-circuits are the reason it must see them
                         // — they stand in front of the per-row loop it delegates to. A
                         // scratch answer is any call the gates above keep out of the two
-                        // device arms with a slab booked: a single row of a scheme
-                        // neither the fused entry point nor the tiled one-row arm serves,
-                        // a contraction that is not a whole number of the scheme's own
-                        // packing blocks, a multi-row call of a scheme neither arm
-                        // serves, and an X window the grouped GEMM's `vec4` reads
-                        // cannot address.
+                        // device arms and the arena has an address for
+                        // ([`crate::gguf_gpu::DequantSlab`]); the same call without one is
+                        // `Host`. Those gates are: a single row of a scheme neither the
+                        // fused entry point nor the tiled one-row arm serves, a
+                        // contraction that is not a whole number of the scheme's own
+                        // packing blocks, a multi-row call of a scheme neither arm serves,
+                        // and an X window the grouped GEMM's `vec4` reads cannot address.
                         // Everything else is tried in the fused entry point, and one it
                         // does not run falls to the same recompute below.
                         let ran = path != crate::gguf_gpu::DequantMatmulPath::ScratchArm
@@ -5207,7 +5208,7 @@ impl WgpuExecutable {
                                 *scheme_id,
                                 *x_byte_off as usize,
                                 *w_byte_off as usize,
-                                self.dequant_scratch_off,
+                                self.dequant_slab,
                                 *out_byte_off as usize,
                                 &mut report.marks(),
                             );
@@ -5328,7 +5329,11 @@ impl WgpuExecutable {
                     idx_byte_off,
                     out_byte_off,
                 } => {
-                    if self.dequant_scratch_off > 0 {
+                    // This arm dequantizes each expert into the slab, so it needs the
+                    // address, not just the booking; without one the host recompute
+                    // below stands in.
+                    if let crate::gguf_gpu::DequantSlab::At(scratch_off) = self.dequant_slab {
+                        let scratch_off = scratch_off.get();
                         crate::gguf_gpu::run_dequant_grouped_matmul_gguf_gpu(
                             &self.arena,
                             &dev.device,
@@ -5341,7 +5346,7 @@ impl WgpuExecutable {
                             *x_byte_off as usize,
                             *w_byte_off as usize,
                             *idx_byte_off as usize,
-                            self.dequant_scratch_off,
+                            scratch_off,
                             *out_byte_off as usize,
                             &mut report.marks(),
                         );
@@ -6534,7 +6539,7 @@ impl WgpuExecutable {
             let submit_only = gguf_step_is_gpu_only(
                 &self.schedule[step_i],
                 self.active_extent,
-                self.dequant_scratch_off,
+                self.dequant_slab,
             );
             step_i += 1;
             // Host paths stage with `queue.write_buffer` (no submit). Flush
@@ -6892,16 +6897,12 @@ fn buffer_copy_gpu_window(
 ///
 /// The answer is the ladder's own ([`crate::gguf_gpu::select_path`]), which is
 /// what the executor dispatches on, so a step this calls device work is one the
-/// arm will not hand to [`crate::gguf_host`]. It used to restate the ladder's
-/// terms instead, and the restatement was not the same statement: `m == 1` is
-/// true of *every* scheme's single row, including Q5_K's and the block-FP8
-/// ids', which the ladder sends to the host whenever no dequant slab is booked.
-/// `Host` is the only answer that reads the arena back to the CPU, and it is the
-/// one this now tests for.
+/// arm will not hand to [`crate::gguf_host`]. `Host` is the only answer that
+/// reads the arena back to the CPU, and it is the one this tests for.
 fn gguf_step_is_gpu_only(
     step: &Step,
     active_extent: Option<(usize, usize)>,
-    scratch_off: usize,
+    slab: crate::gguf_gpu::DequantSlab,
 ) -> bool {
     let Step::DequantMatmulGguf {
         m,
@@ -6917,13 +6918,8 @@ fn gguf_step_is_gpu_only(
         Some((a, u)) if u > 0 => (*m as usize * a).div_ceil(u).min(*m as usize),
         _ => *m as usize,
     };
-    crate::gguf_gpu::select_path(
-        m,
-        *k as usize,
-        *scheme_id,
-        *x_byte_off as usize,
-        scratch_off,
-    ) != crate::gguf_gpu::DequantMatmulPath::Host
+    crate::gguf_gpu::select_path(m, *k as usize, *scheme_id, *x_byte_off as usize, slab)
+        != crate::gguf_gpu::DequantMatmulPath::Host
 }
 
 /// Step-profile label: the step kind, plus the shape for the kinds whose cost

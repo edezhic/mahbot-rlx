@@ -141,10 +141,9 @@ fn mel_graph(frames: usize, bins: usize, batch: usize) -> Result<Arc<Mutex<Compi
         guard.1.push_back((frames, bins, batch));
         return Ok(graph);
     }
-    let graph = Arc::new(Mutex::new(Compiled::new(
-        rlx_runtime::Device::Gpu,
-        graphs::mel_frontend(frames, bins, batch)?,
-    )?));
+    let graph = Arc::new(Mutex::new(crate::report::compiled("mel", || {
+        graphs::mel_frontend(frames, bins, batch)
+    })?));
     while guard.0.len() >= MEL_GRAPH_ENTRIES {
         let Some(oldest) = guard.1.pop_front() else {
             break;
@@ -163,14 +162,12 @@ impl Front {
         let tokens = graphs::asr_tokens(frames);
         let samples = graphs::MEL_HOP * frames;
         let mel = mel_graph(frames, pair.sound.clip().mel_bins, batch)?;
-        let encoder = Arc::new(Mutex::new(Compiled::new(
-            rlx_runtime::Device::Gpu,
-            graphs::asr_encoder(pair.sound.clone(), frames, batch)?,
-        )?));
-        let projector = Arc::new(Mutex::new(Compiled::new(
-            rlx_runtime::Device::Gpu,
-            graphs::projector_chain(pair.clone(), batch * tokens)?,
-        )?));
+        let encoder = Arc::new(Mutex::new(crate::report::compiled("encoder", || {
+            graphs::asr_encoder(pair.sound.clone(), frames, batch)
+        })?));
+        let projector = Arc::new(Mutex::new(crate::report::compiled("projector", || {
+            graphs::projector_chain(pair.clone(), batch * tokens)
+        })?));
         Ok(Self {
             mel,
             encoder,
@@ -371,22 +368,16 @@ impl GroupFront {
         let batch = batch.max(1);
         let tokens = graphs::asr_tokens(frames);
         let bins = pair.sound.clip().mel_bins;
-        let mel = Compiled::new(
-            rlx_runtime::Device::Gpu,
-            graphs::mel_frontend(frames, bins, 1)?,
-        )?;
-        let convs = Compiled::new(
-            rlx_runtime::Device::Gpu,
-            graphs::asr_encoder_front(pair.sound.clone(), frames)?,
-        )?;
-        let tail = Compiled::new(
-            rlx_runtime::Device::Gpu,
-            graphs::asr_encoder_tail(pair.sound.clone(), frames, batch)?,
-        )?;
-        let projector = Compiled::new(
-            rlx_runtime::Device::Gpu,
-            graphs::projector_chain(pair.clone(), batch * tokens)?,
-        )?;
+        let mel = crate::report::compiled("mel-group", || graphs::mel_frontend(frames, bins, 1))?;
+        let convs = crate::report::compiled("encoder-convs", || {
+            graphs::asr_encoder_front(pair.sound.clone(), frames)
+        })?;
+        let tail = crate::report::compiled("encoder-tail", || {
+            graphs::asr_encoder_tail(pair.sound.clone(), frames, batch)
+        })?;
+        let projector = crate::report::compiled("projector-group", || {
+            graphs::projector_chain(pair.clone(), batch * tokens)
+        })?;
         Ok(Self {
             mel,
             convs,
@@ -800,17 +791,19 @@ pub(crate) struct Clip<'a> {
 /// parameter names, so the device's weight pool holds one copy of the body for both
 /// layouts.
 fn prefill_graph(pair: &Arc<Pair>, prompt_rows: usize) -> Result<Compiled> {
-    graphs::body_new_rows_head_chain(pair.body.clone(), prompt_rows, 0, true)
-        .and_then(|m| graphs::Compiled::new(rlx_runtime::Device::Gpu, m))
-        .context("prompt build")
+    crate::report::compiled("prefill", || {
+        graphs::body_new_rows_head_chain(pair.body.clone(), prompt_rows, 0, true)
+    })
+    .context("prompt build")
 }
 
 /// The decode graph for one compiled capacity: the whole body, one row per step,
 /// on the per-layer plane cache.
 fn decode_graph(pair: &Arc<Pair>, capacity: usize) -> Result<Compiled> {
-    graphs::body_capacity_chain_planes(pair.body.clone(), capacity)
-        .and_then(|m| graphs::Compiled::new(rlx_runtime::Device::Gpu, m))
-        .context("decode build")
+    crate::report::compiled("decode", || {
+        graphs::body_capacity_chain_planes(pair.body.clone(), capacity)
+    })
+    .context("decode build")
 }
 
 impl<'a> Clip<'a> {

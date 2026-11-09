@@ -66,12 +66,16 @@ use rlx_runtime::{Device, Session};
 use rlx_wgpu::backend::PassMarks;
 use rlx_wgpu::buffer::Arena;
 use rlx_wgpu::gguf_gpu::{
-    DequantMatmulPath, DequantMatmulRoutes, GemvOneRowShape, dequant_gguf_scratch_bytes,
-    gemv_ilp_cols_per_wg, gemv_ilp_serves_chunk, gemv_one_row_shape, gemv_subgroup_width,
-    gemv_wide_cols_per_wg, reset_gemv_one_row_shape, reset_route_counts, route_counts,
-    run_dequant_matmul_gguf_gpu, select_path,
+    DequantMatmulPath, DequantMatmulRoutes, DequantSlab, GemvOneRowShape,
+    dequant_gguf_scratch_bytes, gemv_ilp_cols_per_wg, gemv_ilp_serves_chunk, gemv_one_row_shape,
+    gemv_subgroup_width, gemv_wide_cols_per_wg, reset_gemv_one_row_shape, reset_route_counts,
+    route_counts, run_dequant_matmul_gguf_gpu, select_path,
 };
 use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts, wgpu_device};
+
+fn at(offset: usize) -> DequantSlab {
+    DequantSlab::At(std::num::NonZeroUsize::new(offset).unwrap())
+}
 
 /// Whether the cooperative tile serves this exact shape on this adapter — asked of
 /// the encoder's own predicate, never restated here: its terms include device ones
@@ -184,7 +188,7 @@ fn the_q8_0_shape_expectation_agrees_with_the_ladder() {
                 DequantMatmulPath::ScratchArm
             };
             assert_eq!(
-                select_path(m, k, scheme, 64, 4096),
+                select_path(m, k, scheme, 64, at(4096)),
                 want,
                 "Q8_0 m={m} k={k}: the grid's expectation and the ladder's own answer \
                  must agree"
@@ -308,7 +312,7 @@ fn one_row_slab_leg(
         rlx_wgpu::gguf_host::gguf_scheme_id(QuantScheme::GgufQ8_0),
         x_off,
         w_off,
-        arena.scratch_off,
+        at(arena.scratch_off),
         y_off,
         &mut PassMarks::none(),
     );
@@ -320,6 +324,65 @@ fn one_row_slab_leg(
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
     (y_row, routes, submits, waits)
+}
+
+/// A call that would dequantize into the slab recomputes on the host where the arena has
+/// no address for one: the `DequantSlab::Wanted` state, which this fixture hands in over
+/// a flat arena that booked a slab. Both legs must produce the same numbers, and only the
+/// addressable one may record the scratch route. Its own fn, invoked from the end of the
+/// route-census test rather than standing as a second test: the route counters are
+/// process-global, so two tests reading them in parallel would each see the other's calls.
+fn a_slabless_arena_recomputes_on_the_host() {
+    let dev = wgpu_device().expect("a wgpu device: this test skips without one");
+    let (k, n) = (100usize, 8usize);
+    let (g, packed, x) = case(QuantScheme::GgufQ8_0, rlx_gguf::GgmlType::Q8_0, 4, k, n);
+    let (x_in, w, y) = (
+        g.input_id("x").expect("x input"),
+        g.param_id("w").expect("w param"),
+        g.outputs[0],
+    );
+    let plan = plan_memory_f32_uniform(&g, 16);
+    let arena = Arena::from_plan_with_scratch(&dev.device, &plan, dequant_gguf_scratch_bytes(&g));
+    arena.write_bytes_range(&dev.queue, arena.offset(w), &packed);
+    arena.write_f32(&dev.queue, x_in, &x);
+    let (x_off, w_off, y_off) = (arena.offset(x_in), arena.offset(w), arena.offset(y));
+    assert!(arena.scratch_off > 0, "the fixture must book a slab");
+    let leg = |slab: DequantSlab| {
+        reset_route_counts();
+        run_dequant_matmul_gguf_gpu(
+            &arena,
+            &dev.device,
+            &dev.queue,
+            4,
+            k,
+            n,
+            rlx_wgpu::gguf_host::gguf_scheme_id(QuantScheme::GgufQ8_0),
+            x_off,
+            w_off,
+            slab,
+            y_off,
+            &mut PassMarks::none(),
+        );
+        let routes = route_counts();
+        let bytes = arena.read_bytes_range(&dev.device, &dev.queue, y_off, n * 4);
+        let out: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        (out, routes)
+    };
+    let (with_slab, slab_routes) = leg(at(arena.scratch_off));
+    let (without_slab, host_routes) = leg(DequantSlab::Wanted);
+    assert_eq!(slab_routes.scratch, 1, "the addressable leg takes the slab");
+    assert_eq!(
+        host_routes.host, 1,
+        "the slab-less leg recomputes on the host"
+    );
+    let drift = max_abs_diff(&with_slab, &without_slab);
+    assert!(
+        drift <= 1e-5,
+        "the host recompute must produce the slab arm's own numbers, drifted {drift:e}"
+    );
 }
 
 /// One test fn on purpose — see the module doc.
@@ -1601,4 +1664,8 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         pooled > 0 && pooled <= 256 * 1024 * 1024,
         "pooled out slab {pooled} bytes must be reported and inside the 256 MiB cap"
     );
+
+    // Same test, not a second one: the route counters are process-global, so two
+    // tests reading them in parallel would each see the other's calls.
+    a_slabless_arena_recomputes_on_the_host();
 }

@@ -192,16 +192,18 @@ Otherwise Q4_1+ fall through with wrong block stride.
 
 ## WGPU
 
-1. `select_path(m, k, scheme_id, x_byte_off, scratch_off)` is the ladder's one
-   answer for a call — `OneRowDevice` / `GroupedDevice` / `FusedArm` /
-   `ScratchArm` / `Host`. It names the *entry point*, not the route the run
-   records: the fused and scratch arms may still hand the call to `gguf_host`,
-   and `ScratchArm` covers a Q8_0 call the shape gates keep out of the two device
-   arms — its own entry point applies the same gates, so that call lands on the
-   slab. The two device-only answers — `OneRowDevice` and `GroupedDevice`, the
-   tiled arm at one row and the row-grouped GEMM at more than one — are also the
-   batch boundary's join set: the run encodes such a call into the caller's
-   enclosing batch instead of letting it submit on its own.
+1. `select_path(m, k, scheme_id, x_byte_off, slab)` is the ladder's one answer for a
+   call — `OneRowDevice` / `GroupedDevice` / `FusedArm` / `ScratchArm` / `Host`. It
+   names the *entry point*, not the route the run records: the fused and scratch arms
+   may still hand the call to `gguf_host`, and `ScratchArm` covers a Q8_0 call the
+   shape gates keep out of the two device arms — its own entry point applies the same
+   gates, so that call lands on the slab where the arena has an address for it, and on
+   the host where it does not. `slab` is `DequantSlab`: `None`, `Wanted` or
+   `At(address)`, the three states a caller can be in, with the rule for each on the
+   type. The two device-only answers — `OneRowDevice` and `GroupedDevice`, the tiled
+   arm at one row and the row-grouped GEMM at more than one — are also the batch
+   boundary's join set: the run encodes such a call into the caller's enclosing batch
+   instead of letting it submit on its own.
 2. **Fused windowed kernels** (no f32 scratch, shard-safe) — the `FusedArm` entry
    point, and `OneRowDevice`, its one-row case:
    - `dequant_gemv_gguf.wgsl` at one row: Q4_K / Q6_K / Q8_0 take the

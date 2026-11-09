@@ -1820,20 +1820,28 @@ pub(crate) fn compile_static_inner(
     graph: Graph,
     rng: std::sync::Arc<std::sync::RwLock<rlx_ir::RngOptions>>,
 ) -> crate::backend::WgpuExecutable {
+    // The backend's phase ledger, printed on drop however this compile ends. The caller
+    // that owns the whole compile — construction above it, the upload below it — prints
+    // its own line beside it (`RLX_WGPU_COMPILE_REPORT`).
+    let _bracket = crate::compile_report::Bracket::open();
     // The activation folds are GPU-kernel forms. Where a folded node would
     // leave the GPU (a striped arena hosts ops whose operands span stripes),
     // compile again without them: the host replays the plain ops correctly,
     // and that op is slow either way.
     FOLDED_HOSTED.with(|f| f.set(false));
     let exe = compile_static_with(graph.clone(), rng.clone(), true);
-    if !FOLDED_HOSTED.with(|f| f.replace(false)) {
-        return exe;
+    if FOLDED_HOSTED.with(|f| f.replace(false)) {
+        if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
+            eprintln!(
+                "[rlx-wgpu] a folded activation would run on the host: compiling without folds"
+            );
+        }
+        crate::compile_report::restart();
+        drop(exe);
+        compile_static_with(graph, rng, false)
+    } else {
+        exe
     }
-    if rlx_ir::env::flag("RLX_WGPU_STRIPE_VERBOSE") {
-        eprintln!("[rlx-wgpu] a folded activation would run on the host: compiling without folds");
-    }
-    drop(exe);
-    compile_static_with(graph, rng, false)
 }
 
 fn compile_static_with(
@@ -1847,6 +1855,8 @@ fn compile_static_with(
     // and fence. Read it here, where the graph already says a one-row packed
     // multiply will run, so it never lands inside the first run's submission
     // bracket — a run that counts its own submits would otherwise read one high.
+    // Before the first phase opens, so the dispatch it may submit is not billed to
+    // the pass beside it (`other` carries it).
     if graph
         .nodes()
         .iter()
@@ -1854,6 +1864,7 @@ fn compile_static_with(
     {
         crate::gguf_gpu::prime_gemv_subgroup_probe(&dev.device);
     }
+    let mut mark = crate::compile_report::Phase::start("unfuse");
 
     // Decompose composed/fused ops (FusedMatMulBiasAct, LoraMatMul,
     // FusedAttentionBlock, FusedTransformerLayer, ...) into primitive
@@ -1881,6 +1892,8 @@ fn compile_static_with(
     } else {
         graph
     };
+    drop(mark);
+    mark = crate::compile_report::Phase::start("plan");
 
     if rlx_ir::env::flag("RLX_WGPU_DEBUG_OP_HIST") {
         let mut hist: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -1900,9 +1913,49 @@ fn compile_static_with(
         crate::unfuse::set_half_packed(false);
         graph
     };
+    // A split arena keeps the activations in one bind window and the parameters
+    // elsewhere, laid out under a compact, activations-only plan; the flat arena is
+    // `plan` itself. Every flag-driven split is known here, before a plan exists, so a
+    // full plan is only computed when the flat arena is built.
+    let max_bind = dev.device.limits().max_storage_buffer_binding_size;
+    // A declared sharing scope means this model compiles more than one graph, and only a
+    // parked parameter lives in the weight buffer a later compile can skip uploading
+    // (`set_param_sharing_scope`). A graph with no parameter has nothing to park, and
+    // re-planning it through the split pass is pure cost.
+    let shares_params = crate::buffer::param_sharing_declared()
+        && graph
+            .nodes()
+            .iter()
+            .any(|node| matches!(&node.op, rlx_ir::Op::DequantMatMul { .. }));
+    // Weight-buffer offsets start at `WEIGHT_BUF_TAG`: on wasm32 that is
+    // 3 GiB, so an arena crossing it would read its own offsets as weight
+    // offsets. Split before it can — a no-op on 64-bit.
+    let split_at = max_bind.min(crate::buffer::WEIGHT_BUF_TAG as u64);
+    let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
+    // Ephemeral GatedDeltaNet state (`carry_state=false`) — shared across
+    // layers like Metal/CUDA. Host fallback allocates on the CPU heap.
+    let gdn_scratch = gdn_ephemeral_state_bytes(&graph);
+    // Ping-pong scratch (pair) for native multi-layer GRU / Elman RNN
+    // intermediate layer outputs; shared across ops like gdn_scratch.
+    let rnn_gru_scratch = rnn_gru_scratch_bytes(&graph);
+    // Packed GGUF weights read only by the fused GEMV can also live in the
+    // weight buffer when the arena is small: the GEMV binds it in place, and
+    // a second executable over the same weights (another decode rung, the
+    // prefill graph) can then adopt it (`share_weights_from`) instead of
+    // holding a copy of its own. Not when the graph needs a tail scratch zone
+    // (the sizes just above): the split arena is laid out under its own plan.
+    let packed_in_place = !rlx_ir::env::flag("RLX_WGPU_PACKED_IN_ARENA")
+        && dequant_scratch == 0
+        && gdn_scratch == 0
+        && rnn_gru_scratch == 0
+        && crate::gguf_gpu::packed_weights_bind_in_place(&graph);
+    let split_shared = rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT") || shares_params;
+    let flag_split = split_shared || packed_in_place;
     // f32-uniform slots + liveness reuse (pairwise `[n,n]` graphs); a packed
-    // graph's halves at two bytes (the hybrid planner)
-    let mut plan = if crate::unfuse::half_packed() {
+    // graph's halves at two bytes (the hybrid planner).
+    let mut plan = if flag_split {
+        crate::buffer::compact_plan(&graph)
+    } else if crate::unfuse::half_packed() {
         crate::buffer::plan_hybrid(&graph, 16)
     } else {
         plan_f32_uniform(&graph, 16)
@@ -1961,49 +2014,31 @@ fn compile_static_with(
             eprintln!("    {op:<22} {n:>4} slots  {:.2} GiB", gib(*bytes));
         }
     }
-    let dequant_scratch = crate::gguf_gpu::dequant_gguf_scratch_bytes(&graph);
-    let dequant_scratch_off = if dequant_scratch > 0 {
-        let aligned = plan.arena_size.div_ceil(16) * 16;
-        let new_size = aligned + dequant_scratch.div_ceil(16) * 16;
+    // The three tail zones. A flat arena carries them past the plan's own slots, so the
+    // plan grows by each in turn and the offsets are the addresses the run writes them
+    // at; a split arena has no tail, so two of the zones are refused there and the
+    // third is booked without an address (both below; [`crate::gguf_gpu::DequantSlab`]
+    // is the rule for the third).
+    let mut tail = plan.arena_size;
+    let mut tail_zone = |bytes: usize| {
+        if bytes == 0 {
+            return 0;
+        }
+        let aligned = tail.div_ceil(16) * 16;
+        let new_size = aligned + bytes.div_ceil(16) * 16;
         if (new_size as u64) <= dev.device.limits().max_buffer_size {
-            plan.arena_size = new_size;
+            tail = new_size;
             aligned
         } else {
             0
         }
-    } else {
-        0
     };
-    // Ephemeral GatedDeltaNet state (`carry_state=false`) — shared across
-    // layers like Metal/CUDA. Host fallback allocates on the CPU heap.
-    let gdn_scratch = gdn_ephemeral_state_bytes(&graph);
-    let gdn_scratch_off = if gdn_scratch > 0 {
-        let aligned = plan.arena_size.div_ceil(16) * 16;
-        let new_size = aligned + gdn_scratch.div_ceil(16) * 16;
-        if (new_size as u64) <= dev.device.limits().max_buffer_size {
-            plan.arena_size = new_size;
-            aligned
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-    // Ping-pong scratch (pair) for native multi-layer GRU / Elman RNN
-    // intermediate layer outputs; shared across ops like gdn_scratch.
-    let rnn_gru_scratch = rnn_gru_scratch_bytes(&graph);
-    let rnn_gru_scratch_off = if rnn_gru_scratch > 0 {
-        let aligned = plan.arena_size.div_ceil(16) * 16;
-        let new_size = aligned + rnn_gru_scratch.div_ceil(16) * 16;
-        if (new_size as u64) <= dev.device.limits().max_buffer_size {
-            plan.arena_size = new_size;
-            aligned
-        } else {
-            0
-        }
-    } else {
-        0
-    };
+    let slab_off = tail_zone(dequant_scratch);
+    let gdn_scratch_off = tail_zone(gdn_scratch);
+    let rnn_gru_scratch_off = tail_zone(rnn_gru_scratch);
+    if !flag_split {
+        plan.arena_size = tail;
+    }
     // Pre-walk to compute the max scratch any single op needs — see
     // `compute_scratch_bytes` for the ops that claim a slice of the tail.
     let base_scratch_bytes = compute_scratch_bytes(&graph);
@@ -2014,69 +2049,67 @@ fn compile_static_with(
     let conv_col_scratch = if crate::backend::conv_routes_enabled() {
         let implicit_live =
             conv_implicit_enabled() && crate::kernels::conv1d_implicit_supported(&dev.device);
-        conv_im2col_scratch_bytes(
-            &graph,
-            plan.arena_size,
-            dev.device.limits().max_storage_buffer_binding_size,
-            implicit_live,
-        )
+        // `plan.arena_size` is the activation arena either way — compact when the flags
+        // already split, the full plan's when they did not — and the panel lands in the
+        // activation window, so the figure is the right one for this gate. A split graph
+        // may therefore reserve a panel on a small-bind adapter where the full plan's
+        // figure used to refuse it: the panel is appended to the arena it was judged
+        // against, and the route it enables is the faster one.
+        conv_im2col_scratch_bytes(&graph, plan.arena_size, max_bind, implicit_live)
     } else {
         0
     };
     // What the graph's own ops claim from the tail (`compute_scratch_bytes`). The
     // arena adds whatever staging *it* needs on top — a parked parameter's copy, or a
     // far operand's when it does not bind whole — from the arena it actually builds
-    // (`Arena::from_plan_split_opts`, whose `scratch_bytes` is the answer). An
+    // (`Arena::from_compact_plan_split`, whose `scratch_bytes` is the answer). An
     // unsplit arena is `plan` itself and is only built when the plan fits one
     // binding, so it needs no reserve of its own.
     let claimed = base_scratch_bytes.max(conv_col_scratch);
-    // When the single-buffer arena would exceed the storage bind limit (or
-    // max_buffer_size), split params into a separate weight buffer so the act
-    // arena stays compact. Needed for NVIDIA ~2 GiB binds (Qwen3 F32 GGUF /
-    // safetensors) and 27B-class packed GGUF. Only fused GGUF GEMV binds the
-    // weight buffer directly; other ops stage params into the act window.
-    let max_bind = dev.device.limits().max_storage_buffer_binding_size;
-    // Use the split/view-alias planner when the arena exceeds one storage bind
-    // window (not only when it exceeds max_buffer_size). On Metal we raise
-    // max_buffer_size to ~40 GiB so F5 fits in one buffer, but Param→Reshape
-    // views still need the split pass or they stay zeroed and DiT collapses.
-    // `RLX_WGPU_ALL_PARAMS_WEIGHT` is what makes that planner park EVERY parameter,
-    // as its name says; without the flag reaching this decision, the parked-operand
-    // half of `should_host_at_ceiling` would only be reachable on adapters whose plan
-    // happens to exceed the bind window.
-    // A declared sharing scope means this model compiles more than one graph, and only a
-    // parked parameter lives in the weight buffer a later compile can skip uploading
-    // (`set_param_sharing_scope`). A graph with no parameter has nothing to park, and
-    // re-planning it through the split pass is pure cost.
-    let shares_params = crate::buffer::param_sharing_declared()
-        && graph
-            .nodes()
-            .iter()
-            .any(|node| matches!(&node.op, rlx_ir::Op::DequantMatMul { .. }));
-    // Weight-buffer offsets start at `WEIGHT_BUF_TAG`: on wasm32 that is
-    // 3 GiB, so an arena crossing it would read its own offsets as weight
-    // offsets. Split before it can — a no-op on 64-bit.
-    let split_at = max_bind.min(crate::buffer::WEIGHT_BUF_TAG as u64);
-    // Packed GGUF weights read only by the fused GEMV can also live in the
-    // weight buffer when the arena is small: the GEMV binds it in place, and
-    // a second executable over the same weights (another decode rung, the
-    // prefill graph) can then adopt it (`share_weights_from`) instead of
-    // holding a copy of its own. Not when a tail scratch zone was reserved
-    // above — `from_plan_split` re-plans the activations and would not keep it.
-    let packed_in_place = !rlx_ir::env::flag("RLX_WGPU_PACKED_IN_ARENA")
-        && dequant_scratch == 0
-        && gdn_scratch == 0
-        && rnn_gru_scratch == 0
-        && crate::gguf_gpu::packed_weights_bind_in_place(&graph);
-    let mut arena = if rlx_ir::env::flag("RLX_WGPU_ALL_PARAMS_WEIGHT")
-        || shares_params
-        || (plan.arena_size + claimed) as u64 > split_at
-    {
+    drop(mark);
+    mark = crate::compile_report::Phase::start("arena");
+    // The size-triggered split: the one branch the flags did not settle, and the only
+    // place a second plan can appear. Its two terms are the same quantity only when the
+    // flags split (`plan` is compact then); a flag-silent graph's plan also holds the
+    // parameters, so the test fires earlier than an activation-only one would. Both
+    // answers build the same arena, and the earlier one is the safe direction.
+    let plan_arena_size = plan.arena_size;
+    let split = split_shared || (plan_arena_size + claimed) as u64 > split_at;
+    // The three states, decided here: no request; a request this arena cannot address
+    // (`split`, or a flat tail zone `tail_zone` could not fit and so answered `0`); and
+    // the address it booked. The rule for each state is on
+    // [`crate::gguf_gpu::DequantSlab`].
+    let slab = if dequant_scratch == 0 {
+        crate::gguf_gpu::DequantSlab::None
+    } else if split || slab_off == 0 {
+        crate::gguf_gpu::DequantSlab::Wanted
+    } else {
+        crate::gguf_gpu::DequantSlab::At(
+            std::num::NonZeroUsize::new(slab_off).expect("tail_zone booked a non-zero address"),
+        )
+    };
+    let mut arena = if split {
+        // A stated residual: no in-tree graph reaches this refusal, and such a graph has
+        // no way to keep a sharing scope.
+        if gdn_scratch > 0 || rnn_gru_scratch > 0 {
+            panic!(
+                "rlx-wgpu: this graph needs {gdn_scratch} B of gated-delta state and \
+                 {rnn_gru_scratch} B of GRU/RNN ping-pong scratch in the arena tail, and a \
+                 split arena has none — the run would write past the buffer. Such a graph \
+                 needs the flat arena: keep it out of a parameter sharing scope and off \
+                 RLX_WGPU_ALL_PARAMS_WEIGHT, and small enough for one storage-buffer binding."
+            );
+        }
+        let base = if flag_split {
+            plan
+        } else {
+            crate::buffer::compact_plan(&graph)
+        };
         // This constructor has the graph, so it records the parameter-storage bounds
-        // itself, from the compact plan it re-plans and places the parameters under.
-        Arena::from_plan_split(&dev.device, &plan, &graph, claimed)
+        // itself, from the compact plan it places the parameters under.
+        Arena::from_compact_plan_split(&dev.device, base, &graph, claimed, true)
     } else if packed_in_place {
-        Arena::from_plan_split_opts(&dev.device, &plan, &graph, claimed, false)
+        Arena::from_compact_plan_split(&dev.device, plan, &graph, claimed, false)
     } else {
         // This one never sees a graph, so its record is taken here: one recording per
         // arena, both plans covered.
@@ -2095,7 +2128,7 @@ fn compile_static_with(
     if rlx_ir::env::flag("RLX_WGPU_ARENA_REPORT") {
         eprintln!(
             "[rlx-wgpu] arena build: plan {} + scratch {} vs split_at {} -> size {} sharded {}",
-            plan.arena_size,
+            plan_arena_size,
             arena.scratch_bytes,
             split_at,
             arena.size,
@@ -2110,6 +2143,8 @@ fn compile_static_with(
     for node in graph.nodes() {
         arena.set_actual_len(node.id, crate::buffer::actual_slot_bytes(node));
     }
+    drop(mark);
+    mark = crate::compile_report::Phase::start("init");
 
     // Initialize Constants directly into the arena. The wgpu arena is f32-
     // uniform (4 bytes/elem; integer inputs are widened on upload), so integer
@@ -2163,6 +2198,8 @@ fn compile_static_with(
             arena.write_bytes_range(&dev.queue, arena.offset(node.id), &bytes[..bytes_to_write]);
         }
     }
+    drop(mark);
+    mark = crate::compile_report::Phase::start("steps");
 
     let mut input_offsets = HashMap::new();
     let mut param_offsets = HashMap::new();
@@ -15608,11 +15645,12 @@ fn compile_static_with(
     // `assert_hosted_audio_step_placement`.
     assert_hosted_audio_step_placement(&schedule);
     let coop_f16_vk = schedule_uses_coop_f16_vk(&schedule);
+    drop(mark);
 
     crate::backend::WgpuExecutable {
         graph,
         arena,
-        dequant_scratch_off,
+        dequant_slab: slab,
         gdn_scratch_off,
         schedule,
         step_nodes,
@@ -15907,4 +15945,68 @@ fn f16_mirror_needed(device: &wgpu::Device, arena: &crate::buffer::Arena, ids: &
         .max()
         .unwrap_or(0);
     hi.saturating_sub(lo / 256 * 256) > device.limits().max_storage_buffer_binding_size
+}
+
+/// The producer's three-way decision: the same slab-requesting graph books an address in a
+/// flat arena and none under a parameter-sharing scope, which splits it.
+#[cfg(test)]
+mod slab_state_tests {
+    use super::*;
+    use crate::gguf_gpu::DequantSlab;
+
+    /// Clears the sharing scope and the shared weight pool however the test ends, so a
+    /// failed assertion cannot leave either behind for the rest of the binary.
+    struct Cleanup;
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            crate::buffer::set_param_sharing_scope("");
+            crate::buffer::clear_shared_weights();
+        }
+    }
+
+    #[test]
+    fn the_dequant_slab_state_follows_the_arena() {
+        if rlx_ir::env::skip_unless_device("wgpu", true, crate::is_available()) {
+            return;
+        }
+        // The flat leg needs `ALL_PARAMS_WEIGHT` off and the scoped leg needs sharing
+        // on; both are pinned thread-locally, so an ambient setting cannot invert either.
+        let _flat = rlx_ir::env::scoped("RLX_WGPU_ALL_PARAMS_WEIGHT", "0");
+        let _shared = rlx_ir::env::scoped("RLX_WGPU_SHARE_WEIGHTS", "1");
+        let _cleanup = Cleanup;
+        let flat = crate::backend::WgpuExecutable::compile(slab_graph());
+        assert!(
+            matches!(flat.dequant_slab, DequantSlab::At(_)),
+            "a flat arena books the requested slab an address: {:?}",
+            flat.dequant_slab
+        );
+        drop(flat);
+        crate::buffer::set_param_sharing_scope("slab-state/parameter-sharing");
+        let split = crate::backend::WgpuExecutable::compile(slab_graph());
+        assert!(
+            matches!(split.dequant_slab, DequantSlab::Wanted),
+            "a sharing scope splits the arena, which books the request no address: {:?}",
+            split.dequant_slab
+        );
+    }
+
+    /// A `[4, 100] × [8, 100]ᵀ` Q8_0 multiply: the graph requests the slab
+    /// (`dequant_gguf_scratch_bytes` books it), and the shape is small enough to plan.
+    fn slab_graph() -> Graph {
+        let (m, k, n) = (4usize, 100usize, 8usize);
+        let w: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.011).sin() * 0.5).collect();
+        let packed = rlx_gguf::quantize(&w, rlx_gguf::GgmlType::Q8_0).expect("quantize");
+        let mut g = Graph::new("slab_state");
+        let x = g.input("x", rlx_ir::Shape::new(&[m, k], rlx_ir::DType::F32));
+        let w = g.param("w", rlx_ir::Shape::new(&[packed.len()], rlx_ir::DType::U8));
+        let y = g.add_node(
+            Op::DequantMatMul {
+                scheme: rlx_ir::quant::QuantScheme::GgufQ8_0,
+            },
+            vec![x, w],
+            rlx_ir::Shape::new(&[m, n], rlx_ir::DType::F32),
+        );
+        g.set_outputs(vec![y]);
+        g
+    }
 }

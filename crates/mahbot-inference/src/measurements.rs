@@ -330,6 +330,33 @@ fn profile() -> String {
     }
 }
 
+/// The machine's load average when the record is written, as the kernel states it, or
+/// empty where it cannot be read. A figure taken under another process's load is not
+/// comparable with one taken on a quiet machine, and two records cannot be subtracted
+/// without knowing which is which — so the take states it.
+#[must_use]
+fn load() -> String {
+    let raw = std::process::Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        // Linux's procps `sysctl` fails with empty stdout; without this the empty
+        // success short-circuits the fallback that exists for exactly that platform.
+        .filter(|text| !text.is_empty())
+        .or_else(|| std::fs::read_to_string("/proc/loadavg").ok());
+    // Both forms lead with the three figures; macOS wraps them in `{ }` and Linux
+    // appends a `running/total` pair, neither of which is one.
+    let figures: Vec<&str> = raw
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|word| word.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        .take(3)
+        .collect();
+    figures.join(" · ")
+}
+
 /// The one provenance block every record carries: when and where the row was taken,
 /// from what code, under which switches, by which invocation, and the run's own
 /// input pins. `inputs` is `record`'s own bullets — the material the rows read.
@@ -339,6 +366,12 @@ fn provenance(record: Record, inputs: &str) -> String {
     body.push_str(&format!("- machine: {}\n", machine()));
     body.push_str(&format!("- device: {}\n", device()));
     body.push_str(&format!("- profile: {}\n", profile()));
+    let load = load();
+    if !load.is_empty() {
+        body.push_str(&format!(
+            "- load: {load} (1, 5 and 15 minutes when the record was written)\n"
+        ));
+    }
     body.push_str(&format!(
         "- code: {} (the commit and the SHA-256 of the tree's difference from it, {})\n",
         code_state(),

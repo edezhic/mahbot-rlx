@@ -29,7 +29,7 @@ use crate::kernels::{GatherParams, Kernel, gather_split_kernel, matmul_coop_f16_
 /// This is what the ops claim, not insurance: a graph that binds whole gets exactly
 /// this much tail. The arena adds the two reserves only it can size — a parked
 /// parameter's staging copy and a far operand's — from the arena it builds; see
-/// [`crate::buffer::Arena::from_plan_split_opts`], which is where that rule lives.
+/// [`crate::buffer::Arena::from_compact_plan_split`], which is where that rule lives.
 pub(crate) fn compute_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
     const ROWS_PER_WG: u32 = 16;
     let mut max_bytes = 0usize;
@@ -520,8 +520,9 @@ fn conv_im2col_scratch_bytes(
 pub struct WgpuExecutable {
     graph: Graph,
     arena: Arena,
-    /// Byte offset of GGUF dequant scratch slab (0 when host fallback).
-    dequant_scratch_off: usize,
+    /// What this graph and this arena say about the GGUF dequant slab — the three states
+    /// of [`crate::gguf_gpu::DequantSlab`], whose own documentation is the rule.
+    dequant_slab: crate::gguf_gpu::DequantSlab,
     /// Byte offset of ephemeral GatedDeltaNet state (`carry_state=false`).
     gdn_scratch_off: usize,
     schedule: Vec<Step>,
@@ -944,7 +945,7 @@ impl WgpuExecutable {
         // unresolved+binding state for the next round.
         self.graph = fresh.graph;
         self.arena = fresh.arena;
-        self.dequant_scratch_off = fresh.dequant_scratch_off;
+        self.dequant_slab = fresh.dequant_slab;
         self.gdn_scratch_off = fresh.gdn_scratch_off;
         self.schedule = fresh.schedule;
         self.ceiling_hosted = fresh.ceiling_hosted;
@@ -1054,7 +1055,7 @@ impl WgpuExecutable {
         Self {
             graph: graph.clone(),
             arena,
-            dequant_scratch_off: 0,
+            dequant_slab: crate::gguf_gpu::DequantSlab::None,
             gdn_scratch_off: 0,
             schedule: Vec::new(),
             step_nodes: Vec::new(),

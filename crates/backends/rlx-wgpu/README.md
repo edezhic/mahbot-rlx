@@ -30,6 +30,12 @@ kernels, pure Rust deps — no FFI, no submodules.
   rows of several slots in one submission and one map, which is the shape a
   decode step's resident-KV rows leave through. Env: `RLX_WGPU_SHARD_LOG=1`.
   Packed quant weights may live in a separate `weight_buffer` (`from_plan_split`).
+  That arena is laid out under a compact, activations-only plan, so it carries no
+  tail scratch zone: a graph whose ops need one — a gated-delta's ephemeral state,
+  a multi-layer GRU/RNN's ping-pong pair — is refused loudly at plan time, and a
+  GGUF dequant slab is booked there in the `DequantSlab::Wanted` state (whose own
+  documentation is the rule), so a call that would dequantize into it recomputes on
+  the host instead of writing over a live slot.
   Physical striping is **unsupported and opt-in only** (`RLX_WGPU_ALLOW_SHARD=1`,
   which warns uncutably on every striping decision), and the stripe count is
   bounded (`MAX_SHARDS`): a shrunken `RLX_WGPU_SHARD_CAP_MIB` that would split an
@@ -437,6 +443,7 @@ of that same one-node run — nothing in the tree prints one.
 | `RLX_WGPU_NO_PACKED_BSHD_ATTN=1` | Disable packed QKV attention stride path |
 | `RLX_WGPU_DUMP_NODES=1` | Per-node max-abs dump after run (debug) |
 | `RLX_WGPU_DBG_COUNTERS=1` | Per-run report of where the run's time went, plus the step/uniform/bind-group census (see below) |
+| `RLX_WGPU_COMPILE_REPORT=1` | Per-compile phase breakdown — the backend's `unfuse`/`plan`/`arena`/`init`/`steps` (the schedule and its bind groups) and `restarts` when the lowering compiled twice, plus the caller's own `build`/`compile` line (`compile_report`) |
 | `RLX_WGPU_FORCE_HOST=1` | Host-fallback all risky SPIR-V paths |
 | `RLX_WGPU_SHARD_GPU=1` | Opt out of discrete/sharded host packing (unsafe for Kitten NSF) |
 | `RLX_WGPU_DISCRETE_HOST=1` | Extra discrete hosting via `wgpu_prefer_host_fallback` |

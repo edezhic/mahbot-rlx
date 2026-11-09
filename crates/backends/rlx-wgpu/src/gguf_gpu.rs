@@ -61,6 +61,7 @@
 //!
 //! Full matrix: [docs/gguf-backend-paths.md](../../../docs/gguf-backend-paths.md).
 
+use std::num::NonZeroUsize;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -385,14 +386,14 @@ pub enum DequantMatmulPath {
     /// window the tiled arm refuses — which that entry point hands to
     /// [`crate::gguf_host`] and records as the host route.
     FusedArm,
-    /// The dequant-scratch entry point ([`run_dequant_matmul_gguf_gpu`]) with a
-    /// slab booked — the answer for the calls the ladder's gates keep out of
-    /// [`DequantMatmulPath::GroupedDevice`]: a contraction that is not a whole
-    /// number of the scheme's own packing blocks, an X window its `vec4` reads
-    /// cannot address, a single row of a scheme no one-row arm carries, or a
-    /// multi-row call of a scheme neither the grouped GEMM nor the fused entry point
-    /// serves (both of the latter two only when the slab is booked; with none they
-    /// answer [`DequantMatmulPath::Host`]).
+    /// The dequant-scratch entry point ([`run_dequant_matmul_gguf_gpu`]) with an
+    /// address to dequantize into — the answer for the calls the ladder's gates keep
+    /// out of [`DequantMatmulPath::GroupedDevice`]: a contraction that is not a whole
+    /// number of the scheme's own packing blocks, an X window its `vec4` reads cannot
+    /// address, a single row of a scheme no one-row arm carries, or a multi-row call
+    /// of a scheme neither the grouped GEMM nor the fused entry point serves (both of
+    /// the latter two only where the arena has that address; a graph that asks for a
+    /// slab without one answers [`DequantMatmulPath::Host`]).
     /// That entry point's own arms decide next — dequant scratch + `matmul_bt`, the
     /// row-grouped GEMM, the fused arm's per-row loop, or [`crate::gguf_host`] when
     /// it refuses the call — and its grouped and fused arms apply the very gates
@@ -420,10 +421,29 @@ impl DequantMatmulPath {
     }
 }
 
+/// What a caller knows about the GGUF dequant slab: its three states.
+#[derive(Debug, Clone, Copy)]
+pub enum DequantSlab {
+    /// The graph asks for no slab ([`dequant_gguf_scratch_bytes`] is zero).
+    None,
+    /// The graph asks for one and this arena has no address for it: a split arena has
+    /// no tail, and a flat one whose tail zone does not fit the maximum buffer size
+    /// books none. The row-grouped arm is admitted by the request; the scratch arm is
+    /// not.
+    Wanted,
+    /// The address this arena keeps the slab at, which the scratch arm writes a
+    /// dequantized weight into. Never zero: the tail starts past the plan's live slots.
+    At(NonZeroUsize),
+}
+
 /// The ladder's selection for one call, callable from anywhere the caller has the
-/// step's shape and the plan's dequant slab offset. `m` is the ROW COUNT IN USE
-/// (the step arm's active-extent-scaled one), `k` the contraction width, and
-/// `scratch_off` the slab the plan booked (0 when it booked none).
+/// step's shape and what it knows of the dequant slab. `m` is the ROW COUNT IN USE
+/// (the step arm's active-extent-scaled one), `k` the contraction width.
+///
+/// The slab's request admits the row-grouped arm, which reads the weight in place; its
+/// address admits the scratch arm, the only reader of it. So [`DequantSlab::Wanted`] —
+/// the request with no address — answers [`DequantMatmulPath::Host`] for a call the
+/// grouped arm does not admit, rather than writing a dequantized weight over a live slot.
 ///
 /// Deliberately pure, and deliberately blind: it reads no device, no adapter
 /// limit, no arena and no lever beyond the inputs above, so a caller may ask it
@@ -435,7 +455,7 @@ pub fn select_path(
     k: usize,
     scheme_id: u32,
     x_byte_off: usize,
-    scratch_off: usize,
+    slab: DequantSlab,
 ) -> DequantMatmulPath {
     // The step arm's own selector, verbatim: the fused entry point serves the
     // K-quants and Q1_0 — the former at one row, the latter at any row — and
@@ -447,19 +467,21 @@ pub fn select_path(
             || k.is_multiple_of(scheme_from_id(scheme_id).gguf_block_size() as usize)))
         || one_row_arm_ok(scheme_id, m, k);
     if !fused {
-        // The scratch entry point's own ladder, split: a multi-row call of a scheme
-        // the row-grouped GEMM serves, with the slab the plan booked behind it, over
-        // whole packing blocks of that scheme ([`grouped_k_ok`], which carries the
-        // scheme term too) and an X window its `vec4` reads can address, is
-        // device-only work whose arm a caller can encode itself. Every other call
-        // keeps today's answer: a single-row form off its arm's own shapes, a
-        // contraction off the scheme's blocks or a multi-row call of a scheme neither
-        // the row-grouped GEMM nor the fused entry point serves (the slab), no slab
-        // at all (the host).
-        if scratch_off > 0 && m > 1 && grouped_k_ok(scheme_id, k) && x_window_vec4_ok(x_byte_off) {
+        // A multi-row call of a scheme the row-grouped GEMM serves, with a slab asked
+        // for (that arm reads the weight in place and needs no address), over whole
+        // packing blocks of that scheme ([`grouped_k_ok`], which carries the scheme
+        // term too) and an X window its `vec4` reads can address: device-only work
+        // whose arm a caller can encode itself.
+        // Every other call is the scratch arm where this arena has an address to write
+        // the dequantized weight at, and the host where it has none.
+        if !matches!(slab, DequantSlab::None)
+            && m > 1
+            && grouped_k_ok(scheme_id, k)
+            && x_window_vec4_ok(x_byte_off)
+        {
             return DequantMatmulPath::GroupedDevice;
         }
-        return if scratch_off > 0 {
+        return if matches!(slab, DequantSlab::At(_)) {
             DequantMatmulPath::ScratchArm
         } else {
             DequantMatmulPath::Host
@@ -843,10 +865,11 @@ pub fn dequant_gguf_scratch_bytes(graph: &Graph) -> usize {
             //
             // Q8_0 keeps its booking: the slab is this scheme's route for the
             // one-row calls the tiled arm's own block gate keeps out and for every
-            // shape its grouped arm declines, and `select_path` reads the reservation
-            // as the plan's willingness to reserve memory — the term that also admits
-            // a multi-row call of this scheme to the grouped arm and to the batch
-            // boundary's join. Dropping it would send those calls to the host
+            // shape its grouped arm declines. This reservation is the graph's
+            // *request* — [`DequantSlab::Wanted`], or `At` where the arena has an
+            // address — which also admits a multi-row call of this scheme to the grouped
+            // arm and to the batch boundary's join; the address is the arena's, not the
+            // graph's. Dropping the reservation would send those calls to the host
             // instead, which is a regression, not a saving.
             if gemv_supports_scheme(crate::gguf_host::gguf_scheme_id(*scheme)) {
                 continue;
@@ -1236,6 +1259,11 @@ fn dispatch_matmul_bt(
 /// windowed GEMV for a one-row K-quant, the row-grouped GEMM for a multi-row
 /// K-quant or Q8_0 — and otherwise `dequant_gguf` into arena scratch, then
 /// `C = X @ W^T` via matmul_bt.
+///
+/// `slab` carries the request and the address ([`DequantSlab`]). Every arm above runs
+/// on the request alone; only the scratch fallback needs the address, so a call that
+/// would reach it recomputes on the host instead of writing a dequantized weight over
+/// a live slot.
 pub fn run_dequant_matmul_gguf_gpu(
     arena: &Arena,
     device: &wgpu::Device,
@@ -1246,13 +1274,13 @@ pub fn run_dequant_matmul_gguf_gpu(
     scheme_id: u32,
     x_byte_off: usize,
     w_byte_off: usize,
-    scratch_byte_off: usize,
+    slab: DequantSlab,
     out_byte_off: usize,
     marks: &mut PassMarks<'_>,
 ) {
-    // Windowed GEMV covers the sharded / split-weight case; this scratch+matmul_bt
-    // path still assumes one contiguous arena bind.
-    if arena.is_sharded() || crate::buffer::is_weight_off(w_byte_off) {
+    // Every "not on this route" answer below is the same recompute, so it is written
+    // once.
+    let host = || {
         note_route(DequantMatmulRoute::Host);
         crate::gguf_host::run_dequant_matmul_gguf(
             arena,
@@ -1266,6 +1294,11 @@ pub fn run_dequant_matmul_gguf_gpu(
             w_byte_off,
             out_byte_off,
         );
+    };
+    // Windowed GEMV covers the sharded / split-weight case; this scratch+matmul_bt
+    // path still assumes one contiguous arena bind.
+    if arena.is_sharded() || crate::buffer::is_weight_off(w_byte_off) {
+        host();
         return;
     }
     // Q4_K/Q6_K/Q1_0: scratch-free windowed kernels — one submit from this fused
@@ -1336,22 +1369,17 @@ pub fn run_dequant_matmul_gguf_gpu(
     // No WGSL branch for this scheme → host dequant. Without this the kernel
     // would run, match nothing, and leave the scratch untouched (= zeros).
     if !kernel_supports_scheme(scheme_id) {
-        note_route(DequantMatmulRoute::Host);
-        crate::gguf_host::run_dequant_matmul_gguf(
-            arena,
-            device,
-            queue,
-            m,
-            k,
-            n,
-            scheme_id,
-            x_byte_off,
-            w_byte_off,
-            out_byte_off,
-        );
+        host();
         return;
     }
 
+    // The slab is this entry point's fallback, not a statement of the route, so the
+    // arms above run without one; here it is the address or nothing.
+    let DequantSlab::At(scratch_byte_off) = slab else {
+        host();
+        return;
+    };
+    let scratch_byte_off = scratch_byte_off.get();
     note_route(DequantMatmulRoute::Scratch);
     let scheme = scheme_from_id(scheme_id);
     let block_elems = scheme.gguf_block_size() as usize;
