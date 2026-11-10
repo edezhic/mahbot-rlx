@@ -24,8 +24,9 @@ impl Stopwatch {
 /// One graph's construction and compile, timed into `RLX_WGPU_COMPILE_REPORT` beside the
 /// backend's own line ([`rlx_wgpu::compile_report`]): `build` is the flow's graph
 /// construction and `compile` is everything from HIR conversion to the last parameter
-/// upload. The difference between the two lines is the fusion pipeline and the upload —
-/// the backend's phases are the second line's. Without the switch this is
+/// upload. The difference between the two lines is the fusion pipeline; the `upload=`
+/// figures are [`crate::graphs::Upload`]'s, which is where the split from `compile` is
+/// explained. The backend's phases are the second line's. Without the switch this is
 /// [`crate::graphs::Compiled::new`] with the build timed. The device is fixed to
 /// [`rlx_runtime::Device::Gpu`] rather than passed in: nothing in this crate compiles for
 /// another backend.
@@ -40,7 +41,14 @@ pub(crate) fn compiled(
     let compiled = crate::graphs::Compiled::new(rlx_runtime::Device::Gpu, built)?;
     if rlx_wgpu::compile_report::enabled() {
         let compile_ms = t.ms();
-        eprintln!("[compile {kind}] build={build_ms:.2}ms compile={compile_ms:.2}ms");
+        let upload = compiled.upload();
+        eprintln!(
+            "[compile {kind}] build={build_ms:.2}ms compile={compile_ms:.2}ms \
+             upload={:.2}ms {:.1}MiB {:.2}GB/s",
+            upload.ms,
+            upload.bytes as f64 / (1 << 20) as f64,
+            upload.gb_per_s(),
+        );
     }
     Ok(compiled)
 }

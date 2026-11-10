@@ -21,8 +21,9 @@
 //! ([`crate::paths`]), not an input.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rlx_gguf::{GgmlType, GgufFile, MetaValue, bytes_for_public};
@@ -379,6 +380,9 @@ pub struct Model {
     pub ced: Option<CedConfig>,
     pub plans: Vec<Plan>,
     by_name: HashMap<String, usize>,
+    /// The read-only descriptor [`Model::with_mapped`]'s per-tensor windows are mapped
+    /// from, and the file's length; taken on the first upload.
+    source: OnceLock<(File, u64)>,
 }
 
 fn meta_u32(file: &GgufFile, key: &str) -> Option<u32> {
@@ -558,6 +562,7 @@ impl Model {
             ced: None,
             plans,
             by_name,
+            source: OnceLock::new(),
         })
     }
 
@@ -629,6 +634,7 @@ impl Model {
             ced: Some(ced),
             plans,
             by_name,
+            source: OnceLock::new(),
         })
     }
 
@@ -703,27 +709,103 @@ impl Model {
             .ok_or_else(|| anyhow!("`{name}`: {} elements are not whole blocks", t.n_elements()))
     }
 
-    /// The tensor's own bytes into `buf` with `pread`, so the checkpoint's pages never enter
-    /// the process's resident set behind the copy the device holds
-    /// ([`GgufFile::read_tensor_bytes_into`]). `buf` is grown and overwritten rather than
-    /// cleared, so one scratch reused across tensors pays at most the largest of them; a
-    /// file that cannot be read that way falls back to the mapping, which does clear it.
-    pub fn read_into(&self, name: &str, buf: &mut Vec<u8>) -> Result<()> {
+    /// The tensor's own bytes with `pread`, so the checkpoint's pages never enter the
+    /// process's resident set behind the copy the device holds
+    /// ([`GgufFile::read_tensor_bytes_into`]); a file with an owned backing — no source
+    /// path to read from — hands its bytes over directly.
+    ///
+    /// For the bytes a packed upload feeds to the device, [`Self::with_mapped`] is the
+    /// route: this one pays a copy into a fresh buffer first.
+    pub fn raw(&self, name: &str) -> Result<Vec<u8>> {
         let t = self
             .file
             .get(name)
             .ok_or_else(|| anyhow!("tensor `{name}` is not in {}", self.path.display()))?;
-        if !self.file.read_tensor_bytes_into(t, buf)? {
-            buf.clear();
-            buf.extend_from_slice(self.file.tensor_bytes(t)?);
+        let mut bytes = Vec::new();
+        if !self.file.read_tensor_bytes_into(t, &mut bytes)? {
+            bytes = self.file.tensor_bytes(t)?.to_vec();
         }
-        Ok(())
+        Ok(bytes)
     }
 
-    pub fn raw(&self, name: &str) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        self.read_into(name, &mut bytes)?;
-        Ok(bytes)
+    /// One tensor's bytes, handed to `write` from a window of the file mapped for the
+    /// length of that write — the source a packed upload is fed from.
+    ///
+    /// The window is released when `write` returns, so the resident cost is the tensor being
+    /// written rather than the checkpoint behind the copy the device takes. Borrowing the
+    /// reader's own whole-file mapping instead would keep the whole checkpoint resident
+    /// ([`GgufFile::release_mapped_pages`]); the window's own price, 198 map/release pairs
+    /// over a body, is inside the row's noise.
+    ///
+    /// It replaces a `pread` into a scratch the size of the largest tensor (243.4 MiB on the
+    /// ASR body, 170.3 on the TTS one), so the write reads the page cache in place instead of a
+    /// second copy of it and no host copy of a checkpoint is ever held. Measured here against
+    /// this commit without the route — one discarded warm-up round per binary, then 15
+    /// alternating paired takes: the body's 1050 MiB decode upload falls from **208.6 ms to
+    /// 175.4 ms** (5.28 → 6.28 GB/s) and the recognition cold row by **42.9 ms** (1527.9 →
+    /// 1484.9), every round negative against a 36.2 ms round spread; the 353 MiB encoder
+    /// upload is unchanged (55.7 → 56.5 ms), the warm rows are unchanged (1068.8 → 1068.4 ms)
+    /// and the row's total peak footprint falls by 252.5 MiB (2755.4 → 2502.9). The TTS
+    /// body's 811.9 MiB prompt upload — the other removed scratch's graph — reads 143.3 ms
+    /// (5.94 GB/s) with the checkpoint in the page cache and 404.5 ms (2.10 GB/s) cold.
+    pub fn with_mapped<R>(&self, name: &str, write: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        let t = self
+            .file
+            .get(name)
+            .ok_or_else(|| anyhow!("tensor `{name}` is not in {}", self.path.display()))?;
+        let nbytes = bytes_for_public(t.dtype, t.n_elements())
+            .ok_or_else(|| anyhow!("`{name}`: {} elements are not whole blocks", t.n_elements()))?;
+        // An owned backing ([`GgufFile::from_bytes`]) already holds the bytes in the
+        // process; only the mmap path has pages to keep out of it.
+        if nbytes == 0 || self.file.src_path().is_none() {
+            return Ok(write(self.file.tensor_bytes(t)?));
+        }
+        let (file, file_len) = self.window_source()?;
+        let start = self
+            .file
+            .data_offset()
+            .checked_add(t.offset)
+            .ok_or_else(|| anyhow!("`{name}`: file offset overflow"))?;
+        let end = start
+            .checked_add(nbytes as u64)
+            .ok_or_else(|| anyhow!("`{name}`: file offset overflow"))?;
+        // A window past the end of the file would map zero-filled pages instead of the
+        // tensor, which the reader refuses for the same reason: the graph is not run on zeros.
+        if end > file_len {
+            bail!(
+                "`{name}` ends at byte {end} of {} bytes — the checkpoint is truncated",
+                file_len
+            );
+        }
+        // SAFETY: a read-only window of a file opened read-only and never written; the
+        // tensor's bytes lie inside it and the map is dropped before this returns. Another
+        // process truncating the file is UB — the caveat the reader's whole-file mapping
+        // carries too.
+        let window = unsafe {
+            memmap2::MmapOptions::new()
+                .offset(start)
+                .len(nbytes)
+                .map(file)
+        }
+        .with_context(|| format!("mapping `{name}` out of {}", self.path.display()))?;
+        Ok(write(&window[..]))
+    }
+
+    /// The descriptor the per-tensor windows are mapped from and the file's length, taken
+    /// on the first upload: one read-only handle serves every tensor, as the reader's own
+    /// `pread` handle does.
+    fn window_source(&self) -> Result<(&File, u64)> {
+        if let Some((file, len)) = self.source.get() {
+            return Ok((file, *len));
+        }
+        let file =
+            File::open(&self.path).with_context(|| format!("opening {}", self.path.display()))?;
+        let len = file
+            .metadata()
+            .with_context(|| format!("sizing {}", self.path.display()))?
+            .len();
+        let (file, len) = self.source.get_or_init(|| (file, len));
+        Ok((file, *len))
     }
 
     /// The tensor as F32 values in the file's own flat order (which is also the
@@ -1440,5 +1522,104 @@ mod tests {
         let wide: Vec<f32> = (0..66).map(|i| i as f32).collect();
         let got = transpose(&wide, 2, 33);
         assert!((0..33).all(|c| got[2 * c] == wide[c] && got[2 * c + 1] == wide[33 + c]));
+    }
+
+    /// A model over `path` with no plans: enough for the byte routes, which ask the file
+    /// rather than the plan.
+    fn probe_model(path: &Path) -> Model {
+        Model {
+            path: path.to_path_buf(),
+            file: GgufFile::from_path_mmap(path).expect("the probe file opens"),
+            role: None,
+            sound: false,
+            config: None,
+            clip: None,
+            ced: None,
+            plans: Vec::new(),
+            by_name: HashMap::new(),
+            source: OnceLock::new(),
+        }
+    }
+
+    /// The window route hands over exactly the bytes the `pread` route does — including a
+    /// tensor at a non-zero offset, which is what the file-offset arithmetic joins — and both
+    /// refusals fire: a window past the end of the file, and an offset the parser stored
+    /// without checking that would wrap the join.
+    #[test]
+    fn a_mapped_window_serves_the_tensors_own_bytes() {
+        use rlx_gguf::GgufWriter;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mahbot-loader-mapped-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("a probe directory");
+        let path = dir.join("probe.gguf");
+
+        let first: Vec<u8> = (0..512u32).flat_map(u32::to_le_bytes).collect();
+        let second: Vec<u8> = (0..384u32)
+            .map(|i| i * 7 + 1)
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut w = GgufWriter::new();
+        w.set_arch("probe");
+        w.add_tensor_bytes("first.weight", vec![512], GgmlType::F32, first.clone())
+            .expect("a dense tensor");
+        w.add_tensor_bytes("second.weight", vec![384], GgmlType::F32, second.clone())
+            .expect("a dense tensor");
+        w.write_to_path(&path).expect("the probe file writes");
+
+        let model = probe_model(&path);
+        for (name, want) in [("first.weight", &first), ("second.weight", &second)] {
+            assert_eq!(&model.raw(name).expect("the read route"), want, "{name}");
+            let window = model
+                .with_mapped(name, <[u8]>::to_vec)
+                .expect("the window route");
+            assert_eq!(&window, want, "{name}");
+        }
+
+        let whole = std::fs::metadata(&path)
+            .expect("the probe file's size")
+            .len();
+        // The map above must go before the file is cut: a live mapping of a truncated file
+        // is the UB the SAFETY note on the window names.
+        drop(model);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("the probe file reopens")
+            .set_len(whole - 8)
+            .expect("the probe file truncates");
+        let err = probe_model(&path)
+            .with_mapped("second.weight", |_| ())
+            .expect_err("a window past the end of the file");
+        assert!(format!("{err:#}").contains("truncated"), "{err:#}");
+
+        // A header offset the parser stores without checking wraps the join, so the
+        // arithmetic must refuse it rather than map a window at a bogus position.
+        let mut header: Vec<u8> = Vec::new();
+        header.extend_from_slice(b"GGUF");
+        header.extend_from_slice(&3u32.to_le_bytes());
+        header.extend_from_slice(&1u64.to_le_bytes());
+        header.extend_from_slice(&0u64.to_le_bytes());
+        header.extend_from_slice(&11u64.to_le_bytes());
+        header.extend_from_slice(b"huge.weight");
+        header.extend_from_slice(&1u32.to_le_bytes());
+        header.extend_from_slice(&512u64.to_le_bytes());
+        header.extend_from_slice(&(GgmlType::F32 as u32).to_le_bytes());
+        header.extend_from_slice(&u64::MAX.to_le_bytes());
+        header.resize(header.len().div_ceil(32) * 32 + 32, 0);
+        let corrupt = dir.join("corrupt.gguf");
+        std::fs::write(&corrupt, &header).expect("the corrupt probe file writes");
+        let err = probe_model(&corrupt)
+            .with_mapped("huge.weight", |_| ())
+            .expect_err("an offset past the end of the file");
+        assert!(format!("{err:#}").contains("overflow"), "{err:#}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

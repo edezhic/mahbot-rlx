@@ -46,6 +46,8 @@ required-features = ["bench"]
 [dependencies]
 # The parser under the model loader: GGUF header, metadata, raw tensor bytes, dequant.
 rlx-gguf = { workspace = true }
+# One window of a model file, mapped per tensor and released with the write it feeds.
+memmap2 = "0.9"
 # Graph IR + HIR builder (`HirMut`, `HirGraphExt`) used by the emitted blocks.
 rlx-ir = { workspace = true }
 # Block assembly line: `ModelFlow` / `FlowCtx` / `WeightSource` — the graphs are built on it.

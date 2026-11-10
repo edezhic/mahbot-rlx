@@ -2694,9 +2694,9 @@ impl Drop for DeclaredScope {
     }
 }
 
-/// Bind a fused projection's parameter from the model file's own tensors: each part is read
-/// into `scratch` and written at its own offset, so the concatenation never exists on the
-/// host — the one joined copy is the device's.
+/// Bind a fused projection's parameter from the model file's own tensors: each part is
+/// written at its own offset out of a window of the file, so the concatenation never exists
+/// on the host — the one joined copy is the device's. Answers the bytes it wrote.
 ///
 /// Nothing is read when the device already holds the parameter, which is the rule for a
 /// second layout of one body: the rung ladder and a warm call both ask for the same joined
@@ -2717,21 +2717,22 @@ fn bind_fused(
     name: &str,
     fused: emit::Fused,
     len: usize,
-    scratch: &mut Vec<u8>,
-) -> Result<()> {
+) -> Result<u64> {
     if session.param_resident(name, len) {
         // The bytes are already there, so no `set_param*` call will record this name;
         // say so here, where the write is skipped, or the unbound diagnostic reports
         // a parameter that is bound and correct.
         session.mark_param_bound(name);
-        return Ok(());
+        return Ok(0);
     }
     let mut at = 0usize;
     for part in &fused.parts {
-        fused.model.read_into(part, scratch)?;
-        // The whole parameter is never assembled to hand over instead: that copy is the
-        // peak this binding exists to avoid, so a backend that cannot take a piece says so.
-        if !session.set_param_range(name, at, scratch) {
+        let (landed, piece) = fused.model.with_mapped(part, |bytes| {
+            // The whole parameter is never assembled to hand over instead: that copy is the
+            // peak this binding exists to avoid, so a backend that cannot take a piece says so.
+            (session.set_param_range(name, at, bytes), bytes.len())
+        })?;
+        if !landed {
             bail!(
                 "the fused projection `{name}` cannot be written in pieces: {device:?} \
                  refused the range write at byte {at} (no partial parameter write on this \
@@ -2739,12 +2740,12 @@ fn bind_fused(
                  bytes are not materialised on the host to hand over whole"
             );
         }
-        at += scratch.len();
+        at += piece;
     }
     if at != len {
         bail!("the fused projection `{name}` joins {at} bytes, its parameter is {len}");
     }
-    Ok(())
+    Ok(len as u64)
 }
 
 /// The one message for the parameter [`bind_route`] answers `None` for: a record released
@@ -2792,6 +2793,29 @@ pub struct Runner {
     session: rlx_runtime::CompiledGraph,
     /// The compiled graph itself — this crate's source for the arena.
     pub graph: rlx_ir::Graph,
+    upload: Upload,
+}
+
+/// What a compile's parameter upload cost: its wall clock and the bytes it handed to
+/// the device. The compile bracket in [`crate::report`] lumps the upload into itself, so
+/// this is the only figure that separates the copy from the lowering — and the only one
+/// that reads the copy's rate, which is what a change of the bytes' source moves. It is
+/// zero on a compile whose parameters the device already held.
+#[derive(Clone, Copy)]
+pub(crate) struct Upload {
+    pub(crate) ms: f64,
+    pub(crate) bytes: u64,
+}
+
+impl Upload {
+    /// The copy's rate in GB/s, or 0 for an upload that wrote nothing.
+    #[must_use]
+    pub(crate) fn gb_per_s(self) -> f64 {
+        if self.ms <= 0.0 {
+            return 0.0;
+        }
+        self.bytes as f64 / (self.ms * 1e6)
+    }
 }
 
 impl Runner {
@@ -2845,6 +2869,8 @@ impl Runner {
                 _ => None,
             })
             .collect();
+        let mut uploaded = 0u64;
+        let upload_start = Stopwatch::start();
         while let Some(name) = built.params.keys().next().cloned() {
             let values = built.params.remove(&name).expect("key just read");
             let kept = emit::host_weight(&origins, &name);
@@ -2854,26 +2880,18 @@ impl Runner {
                 emit::is_placeholder(&name),
                 holds_bytes.contains(name.as_str()),
             ) {
-                Some(values) => session.set_param(&name, values),
+                Some(values) => {
+                    session.set_param(&name, values);
+                    uploaded += (values.len() * 4) as u64;
+                }
                 None => return Err(unresolved(&name)),
             }
         }
-        // One scratch for the packed tensors, reused: the file's bytes are `pread` into it
-        // rather than borrowed from the mapping, so a checkpoint's pages never join the
-        // process's resident set behind the copy the device takes. Reused and grown, never
-        // cleared, so the resident cost is the largest single tensor
-        // ([`rlx_gguf::GgufFile::read_tensor_bytes_into`]).
-        let mut scratch: Vec<u8> = Vec::new();
+        // The packed tensors are fed to the device out of the file's mapping, one tensor at
+        // a time; `Model::with_mapped` carries the price and the residency rule.
         while let Some((name, bytes, dt)) = built.typed_params.pop() {
             if let Some(fused) = emit::fused_of(&name) {
-                bind_fused(
-                    device,
-                    &mut session,
-                    &name,
-                    fused,
-                    bytes.len(),
-                    &mut scratch,
-                )?;
+                uploaded += bind_fused(device, &mut session, &name, fused, bytes.len())?;
             } else if let Some((model, key)) = emit::bound_weight(&name) {
                 // The read is only worth making when the write it feeds would land: a
                 // second layout of one body asks for the same parameter, and the device
@@ -2881,16 +2899,25 @@ impl Runner {
                 if session.param_resident(&name, bytes.len()) {
                     session.mark_param_bound(&name);
                 } else {
-                    model.read_into(&key, &mut scratch)?;
-                    session.set_param_typed(&name, &scratch, dt);
+                    model.with_mapped(&key, |bytes| session.set_param_typed(&name, bytes, dt))?;
+                    uploaded += bytes.len() as u64;
                 }
             } else if emit::is_placeholder(&name) {
                 return Err(unresolved(&name));
             } else {
                 session.set_param_typed(&name, &bytes, dt);
+                uploaded += bytes.len() as u64;
             }
         }
-        Ok(Self { session, graph })
+        let upload = Upload {
+            ms: upload_start.ms(),
+            bytes: uploaded,
+        };
+        Ok(Self {
+            session,
+            graph,
+            upload,
+        })
     }
 
     /// Point the frame graph's `Sample` steps at this frame's draw seeds, in
@@ -3126,6 +3153,13 @@ impl Compiled {
     /// The run step: one pass on the compiled graph.
     pub fn run(&mut self, inputs: &[(String, Vec<f32>)]) -> Vec<Vec<f32>> {
         self.runner.run(inputs)
+    }
+
+    /// What this graph's parameter upload cost — the copy's share of the compile
+    /// bracket, and its rate.
+    #[must_use]
+    pub(crate) fn upload(&self) -> Upload {
+        self.runner.upload
     }
 
     /// One pass with borrowed inputs: the caller owns the state buffers and must

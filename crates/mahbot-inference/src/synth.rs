@@ -386,10 +386,9 @@ impl Synthesis {
             temperature,
             seed: 0,
         };
-        let frame = Compiled::new(
-            rlx_runtime::Device::Gpu,
-            graphs::tts_code_predictor_frame(pair.sound.clone(), capacity_pred, sampler)?,
-        )?;
+        let frame = crate::report::compiled("tts-frame", || {
+            graphs::tts_code_predictor_frame(pair.sound.clone(), capacity_pred, sampler)
+        })?;
 
         Ok(Self {
             pair,
@@ -474,7 +473,6 @@ impl Synthesis {
             pad,
             ..
         } = prompt;
-        let device = rlx_runtime::Device::Gpu;
         if self
             .prefill
             .as_ref()
@@ -484,10 +482,9 @@ impl Synthesis {
             // below: the two would otherwise be resident at once.
             self.prefill = None;
             let t = Stopwatch::start();
-            let compiled = Compiled::new(
-                device,
-                graphs::body_new_rows_head_chain(self.pair.body.clone(), prompt_rows, 0, true)?,
-            )?;
+            let compiled = crate::report::compiled("tts-prefill", || {
+                graphs::body_new_rows_head_chain(self.pair.body.clone(), prompt_rows, 0, true)
+            })?;
             self.build_ms += t.ms();
             self.prefill = Some((prompt_rows, compiled));
         }
@@ -769,10 +766,9 @@ impl Synthesis {
     /// A talker graph at `capacity` rows, its compile counted into [`Synthesis::build_ms`].
     fn compile_body(&mut self, capacity: usize) -> Result<Compiled> {
         let t = Stopwatch::start();
-        let compiled = Compiled::new(
-            rlx_runtime::Device::Gpu,
-            graphs::body_capacity_chain_planes(self.pair.body.clone(), capacity)?,
-        )?;
+        let compiled = crate::report::compiled("tts-body", || {
+            graphs::body_capacity_chain_planes(self.pair.body.clone(), capacity)
+        })?;
         self.build_ms += t.ms();
         Ok(compiled)
     }
