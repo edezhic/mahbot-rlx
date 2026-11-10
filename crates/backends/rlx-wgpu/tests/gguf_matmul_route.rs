@@ -66,10 +66,10 @@ use rlx_runtime::{Device, Session};
 use rlx_wgpu::backend::PassMarks;
 use rlx_wgpu::buffer::Arena;
 use rlx_wgpu::gguf_gpu::{
-    DequantMatmulPath, DequantMatmulRoutes, DequantSlab, GemvOneRowShape,
-    dequant_gguf_scratch_bytes, gemv_ilp_cols_per_wg, gemv_ilp_serves_chunk, gemv_one_row_shape,
-    gemv_subgroup_width, gemv_wide_cols_per_wg, reset_gemv_one_row_shape, reset_route_counts,
-    route_counts, run_dequant_matmul_gguf_gpu, select_path,
+    DequantMatmulPath, DequantMatmulRoutes, DequantSlab, GEMV_WIDE_COLS_PER_WG, GEMV_WIDE_ILP,
+    GemvOneRowShape, dequant_gguf_scratch_bytes, gemv_ilp_cols_per_wg, gemv_ilp_serves_chunk,
+    gemv_one_row_shape, gemv_subgroup_width, gemv_wide_cols_per_wg, reset_gemv_one_row_shape,
+    reset_route_counts, route_counts, run_dequant_matmul_gguf_gpu, select_path,
 };
 use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts, wgpu_device};
 
@@ -118,17 +118,23 @@ fn q8_0_one_row(m: usize, k: usize) -> bool {
 }
 /// The one-row arm's dispatch geometry, and the columns one workgroup of it
 /// covers: the tiled arm's two columns on 32 threads, or one of the subgroup
-/// arm's entries — `GEMV_WIDE_THREADS / subgroup_width` columns on 128, times
-/// `GEMV_WIDE_ILP` for the pair. The subgroup arm is the default, so the cells
-/// below pin the *chunking rule* against whichever arm ran rather than assuming
-/// one.
+/// arm's entries — `GEMV_WIDE_COLS_PER_WG` columns on 128, times `GEMV_WIDE_ILP`
+/// for the pair, the same at every subgroup width. The subgroup arm is the
+/// default, so the cells below pin the *chunking rule* against whichever arm ran
+/// rather than assuming one.
 fn one_row_geometry(shape: &GemvOneRowShape) -> usize {
     let cols = shape.cols_per_workgroup;
     if subgroup_arm(shape) {
         assert_eq!(shape.threads_per_workgroup, 128, "{shape:?}");
-        assert!(
-            cols >= 1 && 128 % cols == 0,
-            "the subgroup arm serves 128 / subgroup_width columns, whole: {shape:?}"
+        let want_cols = if shape.arm == 1 {
+            GEMV_WIDE_COLS_PER_WG * GEMV_WIDE_ILP
+        } else {
+            GEMV_WIDE_COLS_PER_WG
+        };
+        assert_eq!(
+            cols, want_cols,
+            "the subgroup arm covers GEMV_WIDE_COLS_PER_WG columns per workgroup, \
+             GEMV_WIDE_ILP times that on the pair: {shape:?}"
         );
     } else {
         assert_eq!(
@@ -1015,18 +1021,16 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // (H=1024 and I=6144 columns) and at the contraction lengths those
     // projections have, in the 2-D `[1, k]` form and the 3-D `[1, 1, k]`
     // single-token form those calls take. What is recorded is the arrangement
-    // actually used — one workgroup per two output columns, with the workgroup's
-    // 32 lanes splitting each of those columns' contractions over its 32-element
-    // units — so `workgroups` is `ceil(n / 2)` and
-    // `workgroups x cols_per_workgroup` is a *ceiling* on the width the dispatch
-    // covered, not that width: a chunk of odd width has its last workgroup's
-    // second column off the end, for which nothing is computed and whose store is
-    // skipped. The product is then within one workgroup's span of the width asked
-    // for, which is the "no tile row is computed and discarded" half — no row and
-    // no column is ever dropped, and no more than a workgroup's worth of the
-    // dispatch is beyond the width. The 8-bit scheme's own branch of the same arm
-    // is driven at those widths too, its 32-element blocks standing in for the
-    // K-quants' 256-element tile.
+    // actually used — by default the subgroup arm: `GEMV_WIDE_COLS_PER_WG` output
+    // columns per 128-invocation workgroup, each reduced by one whole subgroup,
+    // the columns an id does not reach taken in further steps — so `workgroups` is
+    // `ceil(n / cols_per_workgroup)` and `workgroups x cols_per_workgroup` is a
+    // *ceiling* on the width the dispatch covered, not that width: the last
+    // workgroup's columns past the chunk compute nothing and skip their store.
+    // The product is then within one workgroup's span of the width asked for,
+    // which is the "no tile row is computed and discarded" half. The 8-bit
+    // scheme's own branch of the same arm is driven at those widths too, its
+    // 32-element blocks standing in for the K-quants' 256-element tile.
     for (scheme, ggml) in [
         (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K),
         (QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K),
@@ -1069,20 +1073,16 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
                     "{scheme:?} m=1 k={k} n={n} batch={batch:?}: {counts:?}"
                 );
                 if subgroup_arm(&shape) {
-                    // The subgroups arm's own constants, pinned here: `dequant_gemv_wide`
-                    // runs `GEMV_WIDE_THREADS` threads, one whole subgroup per output
-                    // column, so the columns a workgroup serves are
-                    // `GEMV_WIDE_THREADS / subgroup_width` and must divide the thread
-                    // count, and the dispatch is one workgroup per that many columns.
+                    // The subgroup arm's own constants, pinned here: `dequant_gemv_wide`
+                    // runs `GEMV_WIDE_THREADS` threads and covers `GEMV_WIDE_COLS_PER_WG`
+                    // output columns per workgroup — each reduced by one whole subgroup,
+                    // the same at every subgroup width — and the dispatch is `ceil(n /
+                    // that)` for the one-column entry and `n / (that * GEMV_WIDE_ILP)`
+                    // for the pair.
                     assert_eq!(
                         shape.threads_per_workgroup, 128,
                         "{scheme:?} k={k} n={n} batch={batch:?}: the wide arm runs \
                          GEMV_WIDE_THREADS threads per workgroup: {shape:?}"
-                    );
-                    assert!(
-                        shape.cols_per_workgroup > 0 && 128 % shape.cols_per_workgroup == 0,
-                        "{scheme:?} k={k} n={n} batch={batch:?}: the wide arm serves one \
-                         whole subgroup per column, so its columns must divide 128: {shape:?}"
                     );
                     assert_eq!(
                         shape.workgroups,
@@ -1591,9 +1591,9 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     }
 
     // The same arm when the output is wider than one dispatch dimension's cap:
-    // a workgroup serves this arm's own output columns (two on the tiled arm, the
-    // probed subgroup count on the one-column entrance, four times that on the ILP
-    // one), and 65535 is the WebGPU floor for a dimension
+    // a workgroup serves this arm's own output columns — `GEMV_WIDE_COLS_PER_WG`
+    // (four) on the subgroup arm's one-column entrance and `GEMV_WIDE_ILP` times
+    // that on its pair entry — and 65535 is the WebGPU floor for a dimension
     // (`max_compute_workgroups_per_dimension`), so one dispatch covers at most
     // `65535 * its own cols_per_workgroup` columns and a wider output has to be
     // another chunk of the same arm. Reaching the cap in one dispatch is a wgpu
@@ -1603,10 +1603,14 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // the packed rows, which the CPU parity pins.
     {
         // One cap width plus a two-column remainder: over the cap on either arm (the
-        // tiled arm covers 131 070, the subgroup arm 262 140), so the split is
-        // exercised whichever one runs. The cut itself comes from the library, so a
-        // change to it moves this expectation with it.
-        let (k, n) = (256usize, 262_142usize);
+        // tiled arm covers 131 070; the subgroup arm's one-column entry covers
+        // GEMV_WIDE_COLS_PER_WG columns a workgroup, so 65535 times that, and its
+        // pair entry GEMV_WIDE_ILP times it again), and the chunking rule's cap is
+        // written against the narrower one-column entry, so `65_535 *
+        // GEMV_WIDE_COLS_PER_WG` is the figure and two columns past it is over it.
+        // The split is exercised whichever entry runs. The cut itself comes from
+        // the library, so a change to it moves this expectation with it.
+        let (k, n) = (256usize, 65_535 * GEMV_WIDE_COLS_PER_WG as usize + 2);
         let (g, packed, x) = case(QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K, 1, k, n);
         reset_route_counts();
         reset_gemv_one_row_shape();

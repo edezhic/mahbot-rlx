@@ -12,12 +12,13 @@
 //! each column's contraction over 32-element units of the packed weight, X read
 //! four elements at a time and shared across those columns; for Q8_0 that unit
 //! is its own whole 32-element block) — or, on a device whose subgroup width the
-//! probe reads, the subgroup arm (`dequant_gemv_wide`: one subgroup per output
-//! column, the lane partials combined by `subgroupAdd`), which is the default:
-//! `RLX_WGPU_GEMV_WIDE=0`, or `=shared`, restores the tiled arm, and the shader
-//! header carries what the two measured; Q1_0 keeps the original one-thread-per-column
-//! arm on the scalar X view. For `m > 1` Q4_K / Q6_K / Q8_0 use a fused tiled GEMM
-//! in one of two forms, both encoded by `encode_dequant_matmul_gguf_gemm_tiled`:
+//! probe reads, the subgroup arm (`dequant_gemv_wide`: each output column reduced
+//! by one whole subgroup, the lane partials combined by `subgroupAdd`), which is
+//! the default: `RLX_WGPU_GEMV_WIDE=0`, or `=shared`, restores the tiled arm, and
+//! the shader header carries what the two measured; Q1_0 keeps the original
+//! one-thread-per-column arm on the scalar X view. For `m > 1` Q4_K / Q6_K / Q8_0
+//! use a fused tiled GEMM in one of two forms, both encoded by
+//! `encode_dequant_matmul_gguf_gemm_tiled`:
 //! the **cooperative** tile (`dequant_gemm_coop_gguf.wgsl`) — the packed weight
 //! decoded into a workgroup f16 stage and multiplied by the hardware matrix units
 //! with an f32 accumulator, 32-row tiles — and, as the portable fallback and for
@@ -169,13 +170,16 @@ fn gemv_wide_enabled() -> bool {
 /// and cached.
 ///
 /// `AdapterInfo` only reports bucketed sizes (`subgroup_min_size`/
-/// `subgroup_max_size`; Metal says 4..64), and the wide one-row arm maps output
-/// columns onto whole subgroups, so the number itself is needed: it is the
-/// divisor that says how many columns a 128-invocation workgroup covers and the
-/// stride a lane walks a column's units by. The probe is one invocation of
-/// `GGUF_SUBGROUP_PROBE_WGSL`, dispatched and mapped back on the spot; see
-/// `src/coop_probe.rs` for why this crate asks the device rather than trusting a
-/// compile-time constant.
+/// `subgroup_max_size`; Metal says 4..64), and the host needs the number for two
+/// decisions of its own: whether to admit the arm at all — it takes one only where
+/// a 128-invocation workgroup divides into whole subgroups — and which column
+/// floor the pair entry has, since a narrow Q6_K chunk is a row of two 32-element
+/// units a lane (`k / 32 == 2 * width`). It does *not* say how many columns a
+/// workgroup covers — `GEMV_WIDE_COLS_PER_WG` does, at every width — nor is it
+/// handed to the shader, which reads the dispatched pipeline's own
+/// `subgroup_size`. The probe is one invocation of `GGUF_SUBGROUP_PROBE_WGSL`,
+/// dispatched and mapped back on the spot; see `src/coop_probe.rs` for why this
+/// crate asks the device rather than trusting a compile-time constant.
 ///
 /// `None` when the device does not carry [`wgpu::Features::SUBGROUP`] (the probe
 /// shader names subgroup built-ins, so it is never created there). A probed read
@@ -203,12 +207,19 @@ pub fn gemv_subgroup_probe(device: &wgpu::Device) -> Option<(u32, u32)> {
     })
 }
 
-/// [`gemv_subgroup_probe`]'s width alone, when it is one the wide arm can use: a
-/// width that does not divide the arm's 128 threads would leave a workgroup's
-/// last subgroup spanning past the group, so such a width refuses the arm and
-/// the shared-memory entry runs instead.
+/// [`gemv_subgroup_probe`]'s width alone, when the wide arm is admitted at it: one
+/// where the arm's 128 threads divide into whole subgroups. The walk covers a
+/// workgroup's columns at any width (see [`GEMV_WIDE_COLS_PER_WG`]), so this is
+/// the arm's admission policy — the geometry it was measured on — rather than a
+/// requirement of the shader: any other width keeps the shared-memory entry.
 pub fn gemv_subgroup_width(device: &wgpu::Device) -> Option<u32> {
-    let (size, _count) = gemv_subgroup_probe(device)?;
+    gemv_subgroup_width_for(gemv_subgroup_probe(device))
+}
+
+/// [`gemv_subgroup_width`] for a given probe result, without a device — the arm's
+/// admission, in one place.
+fn gemv_subgroup_width_for(probe: Option<(u32, u32)>) -> Option<u32> {
+    let (size, _count) = probe?;
     (size > 0 && GEMV_WIDE_THREADS.is_multiple_of(size)).then_some(size)
 }
 
@@ -226,12 +237,18 @@ pub(crate) fn prime_gemv_subgroup_probe(device: &wgpu::Device) {
 }
 
 /// Output columns one workgroup of the wide arm covers, when this device admits
-/// it: `GEMV_WIDE_THREADS / subgroup_size`, one whole subgroup per column.
+/// it: [`GEMV_WIDE_COLS_PER_WG`], the same at every subgroup width.
 pub fn gemv_wide_cols_per_wg(device: &wgpu::Device) -> Option<u32> {
     if !gemv_wide_enabled() {
         return None;
     }
-    gemv_subgroup_width(device).map(|sg| GEMV_WIDE_THREADS / sg)
+    gemv_wide_cols_per_wg_for(gemv_subgroup_probe(device))
+}
+
+/// [`gemv_wide_cols_per_wg`]'s figure for a given probe result, without a device:
+/// the arm's constant wherever the probe admits the arm, whatever width it read.
+fn gemv_wide_cols_per_wg_for(probe: Option<(u32, u32)>) -> Option<u32> {
+    gemv_subgroup_width_for(probe).map(|_| GEMV_WIDE_COLS_PER_WG)
 }
 
 static GEMV_SUBGROUP: OnceLock<Option<(u32, u32)>> = OnceLock::new();
@@ -653,11 +670,47 @@ const GEMV_LEGACY_THREADS: u32 = 64;
 
 /// Threads one workgroup of the one-row **subgroup** arm runs: the shader's
 /// `dequant_gemv_wide` `@workgroup_size` and its `WIDE_THREADS`. The workgroup
-/// covers `GEMV_WIDE_THREADS / subgroup_width` output columns — one whole
-/// subgroup each — so at this machine's probed width of 32 it covers four, twice
-/// the tiled arm's two. `tests/gguf_one_row_stream_rate.rs` carries what the arm
-/// reads at the model's geometries against the tiled arm's figure.
+/// covers [`GEMV_WIDE_COLS_PER_WG`] output columns at any width — one whole
+/// subgroup each, four where the tiled arm covers two, and one step of the walk
+/// at the 32-wide subgroup this arm was measured on.
+/// `tests/gguf_one_row_stream_rate.rs` carries what the arm reads at the model's
+/// geometries against the tiled arm's figure.
 const GEMV_WIDE_THREADS: u32 = 128;
+
+/// Output columns one workgroup of the one-row **subgroup** arm covers: the
+/// shader's `WIDE_COLS`, and what the encoder sizes the dispatch grid with.
+///
+/// A constant, not `GEMV_WIDE_THREADS / subgroup_size`. The width belongs to the
+/// pipeline the driver builds, and this layer can report only the adapter's
+/// declared range (`subgroup_min_size`/`subgroup_max_size`) — there is no way to
+/// ask a pipeline what width it got. Vulkan's `VK_EXT_subgroup_size_control` lets
+/// the implementation choose a width per pipeline, so a grid sized from the
+/// probed width is a guess. Where the kernel's width comes out wider than the
+/// guess, the columns past it are reached by no workgroup and are never written:
+/// no error, no guard, results that are finite and plausible. The shader
+/// therefore walks its workgroup's columns by subgroup stride, so every workgroup
+/// covers these columns at any width, and a dispatch covers the grid's worth of
+/// them. The narrower direction was never wrong (the ranges still tile, the extra
+/// workgroups are empty), which is why the probed width is still what admits the
+/// arm.
+///
+/// Four is what a 128-invocation workgroup covers at the 32-wide subgroup the
+/// arm was measured on, so the walk is one step and the dispatch is the one the
+/// width-derived figure used to produce. It does not follow a narrower or wider
+/// device: a 64-wide one gives each subgroup two of the four columns — four on
+/// the pair entry, the columns-per-subgroup width
+/// `tests/gguf_one_row_stream_rate.rs` measured as worse than two — and a
+/// narrower one fills one subgroup a column and idles the rest: four of the
+/// workgroup's eight subgroups at 16 wide, four of sixteen at 8, four of
+/// thirty-two at 4. Those widths are inside Metal's declared 4..64 range, and no
+/// adapter of a width other than 32 is reachable in this workspace
+/// (`docs/known-issues.md` RLX-WGPU-002 carries that risk).
+/// Sizing the grid from the adapter's maximum width instead would halve this
+/// figure on the measured machine, and the dispatch cap is this figure times
+/// `GEMV_MAX_WORKGROUPS`, so it would split the recognition head's widest output
+/// into two dispatches — a permanent cost on every backend to work around a
+/// number the host does not need to know.
+pub const GEMV_WIDE_COLS_PER_WG: u32 = 4;
 
 /// Output columns one **subgroup** of the ILP form takes: the shader's
 /// `WIDE_ILP`, and the multiplier of the columns a workgroup covers. One column
@@ -735,9 +788,10 @@ const GEMV_TILED_COLS_PER_WG: u32 = 2;
 /// Most workgroups one dispatch may have along a dimension — the WebGPU floor
 /// (`max_compute_workgroups_per_dimension`), which every backend honours. Every
 /// one-row arm is chunked to it at its own width: `GEMV_TILED_COLS_PER_WG` output
-/// columns per workgroup on the tiled arm, `GEMV_WIDE_THREADS / subgroup_width`
-/// on the subgroup arm, and `GEMV_LEGACY_THREADS` on the one-thread-per-column
-/// arm — so the column cap is this times whatever width the arm records.
+/// columns per workgroup on the tiled arm, `GEMV_WIDE_COLS_PER_WG` on the
+/// subgroup arm (and `GEMV_WIDE_ILP` times that on its pair entry), and
+/// `GEMV_LEGACY_THREADS` on the one-thread-per-column arm — so the column cap is
+/// this times whatever width the arm records.
 const GEMV_MAX_WORKGROUPS: usize = 65535;
 
 /// The shape the one-row packed multiply actually issued, recorded per call.
@@ -754,9 +808,9 @@ const GEMV_MAX_WORKGROUPS: usize = 65535;
 pub struct GemvOneRowShape {
     /// Output columns one workgroup serves — the width of the entry that ran.
     /// `GEMV_TILED_COLS_PER_WG` (two) on the tiled arm; on the subgroup arm
-    /// `GEMV_WIDE_THREADS / subgroup_width` (four at this machine's width of 32)
-    /// for the one-column entry and `GEMV_WIDE_ILP` times that for the ILP entry,
-    /// which serves the chunks at or above [`GEMV_ILP_MIN_COLS`]; `64` while the
+    /// [`GEMV_WIDE_COLS_PER_WG`] for the one-column entry and [`GEMV_WIDE_ILP`]
+    /// times that for the ILP entry, which serves the chunks at or above
+    /// [`GEMV_ILP_MIN_COLS`] — the same at every subgroup width; `64` while the
     /// arm is one thread per output column.
     pub cols_per_workgroup: u32,
     /// Threads one workgroup runs. On the tiled and subgroup arms they split each
@@ -809,7 +863,9 @@ pub fn reset_gemv_one_row_shape() {
 /// rounded up to a whole workgroup — a *ceiling*, not an equality: a workgroup
 /// whose last column is off the end of the chunk computes nothing for it (that
 /// column's accumulator — or its whole subgroup — stays zero) and skips that
-/// store, so no row or column is ever discarded. (The legacy arm's last
+/// store. The grid is `ceil(chunk / the arm's own columns)` and each workgroup
+/// covers its own columns at every subgroup width, so that ceiling is the only
+/// slack: no column of the chunk is left unreached. (The legacy arm's last
 /// workgroup rounds up to 64 columns the same way.) `arm` names which entry ran —
 /// the encoder's own id for it, so the record and the setup cache's key cannot
 /// disagree about which reduction is being described.
@@ -2015,9 +2071,10 @@ fn gguf_window_budget(max_bind: u64) -> u64 {
 /// window ([`gguf_window_budget`]) and the dispatch-dimension cap, which counts
 /// workgroups and so reaches `GEMV_MAX_WORKGROUPS * cols_per_wg` columns.
 /// `cols_per_wg` is the arm's own width — `GEMV_TILED_COLS_PER_WG` on the tiled
-/// arm, `GEMV_WIDE_THREADS / subgroup_width` on the subgroup arm, and
+/// arm, [`GEMV_WIDE_COLS_PER_WG`] on the subgroup arm, and
 /// `GEMV_LEGACY_THREADS` (one thread per column) on the arm that keeps the
-/// original shape.
+/// original shape — and none of them is a function of the device's subgroup
+/// width.
 ///
 /// The encoder chunks its N loop by this and
 /// [`gemv_one_row_dispatches`] reports it, so the rule has one spelling.
@@ -2030,8 +2087,8 @@ fn gemv_one_row_cols_per_chunk(row_bytes: u64, max_bind: u64, cols_per_wg: usize
 }
 
 /// The ILP entry's columns per workgroup on `device`, when the arm admits it:
-/// `GEMV_WIDE_ILP` times a subgroup's width, behind `RLX_WGPU_GEMV_ILP`. One
-/// spelling for the encoder, [`gemv_one_row_dispatches`] and a measurement's
+/// `GEMV_WIDE_ILP` times [`GEMV_WIDE_COLS_PER_WG`], behind `RLX_WGPU_GEMV_ILP`.
+/// One spelling for the encoder, [`gemv_one_row_dispatches`] and a measurement's
 /// rows, so the chunk cut and the entry it is cut for are sized from the same
 /// number.
 pub fn gemv_ilp_cols_per_wg(device: &wgpu::Device, scheme_id: u32) -> Option<u32> {
@@ -2099,7 +2156,7 @@ fn chunk_cols(budget: usize, ilp_cols: Option<u32>) -> usize {
 }
 
 /// Output columns one workgroup covers on the **narrowest** entry of the arm this
-/// scheme's one-row call takes on `device`: one subgroup per column on the
+/// scheme's one-row call takes on `device`: [`GEMV_WIDE_COLS_PER_WG`] on the
 /// subgroup arm, else the tiled arm's two, else the legacy arm's one thread per
 /// column. The ILP entry serves [`GEMV_WIDE_ILP`] times that on a chunk wide
 /// enough to pay, so the grid cap below is written against this number — the
@@ -2970,14 +3027,15 @@ fn encode_dequant_matmul_gguf_gemv_one_into_out(
         "rlx-wgpu gguf gemv: x window {x_size} > max_bind {max_bind}"
     );
     // Three arms, one route: the subgroup arm gives each whole subgroup one
-    // output column (four columns to a workgroup at this machine's width) and
-    // reduces inside it — or `WIDE_ILP` columns a subgroup, one accumulator each;
-    // the tiled arm gives each workgroup `GEMV_TILED_COLS_PER_WG` output
-    // columns and splits each column's contraction over its threads; the original
-    // gives one thread per column, 64 columns to a workgroup. Which one ran is
-    // recorded — see [`gemv_one_row_shape`] — and `RLX_WGPU_GEMV_WIDE=0|shared`
-    // refuses the subgroup arm so the workgroup-memory one is exercised where
-    // subgroups are present.
+    // output column (four columns to a workgroup, walked by subgroup stride, at
+    // any width) and reduces inside it — or `WIDE_ILP` columns a subgroup, one
+    // accumulator each; the tiled arm gives each workgroup
+    // `GEMV_TILED_COLS_PER_WG` output columns and splits each column's
+    // contraction over its threads; the original gives one thread per column, 64
+    // columns to a workgroup. Which one ran is recorded — see
+    // [`gemv_one_row_shape`] — and `RLX_WGPU_GEMV_WIDE=0|shared` refuses the
+    // subgroup arm so the workgroup-memory one is exercised where subgroups are
+    // present.
     let tiled = gemv_tiled_supports_scheme(scheme_id);
     // The kernel is picked from `wide_cols` and the chunk cut from the same two
     // sources — the probe and the scheme — so the width the chunking rule divides
@@ -3012,8 +3070,9 @@ fn encode_dequant_matmul_gguf_gemv_one_into_out(
                 (n_chunk / ic as usize) as u32,
                 1,
             ),
-            // One whole subgroup per output column; the last workgroup rounds up
-            // and its off-the-end subgroup returns before `subgroupAdd`.
+            // Each of the workgroup's columns reduced by one whole subgroup, the
+            // columns walked by subgroup stride; the last workgroup rounds up and
+            // its off-the-end column breaks the walk before `subgroupAdd`.
             (None, Some(cols)) => (
                 dequant_gemv_gguf_wide_kernel(device),
                 cols,
@@ -3405,11 +3464,11 @@ pub fn run_dequant_grouped_matmul_gguf_gpu(
 mod tests {
     use super::{
         DequantGemvGgufParams, GEMV_ILP_MIN_COLS, GEMV_TILED_COLS_PER_WG, GEMV_TILED_THREADS,
-        GEMV_WIDE_ILP, GEMV_WIDE_THREADS, GROUPED_ROWS, GROUPED_SPLIT_COLS, GROUPED_STAGE_ELEMS,
-        GROUPED_THREADS, bound_window, chunk_cols, gemv_in_place_out_ok,
-        gemv_one_row_cols_per_chunk, gemv_setup_key, gemv_weight_window, gemv_wide_enabled,
-        gguf_row_bytes, grouped_chunk_geometry, grouped_cols_per_chunk, in_place_out_span,
-        in_place_window_clear, round16, windows_overlap,
+        GEMV_WIDE_COLS_PER_WG, GEMV_WIDE_ILP, GEMV_WIDE_THREADS, GROUPED_ROWS, GROUPED_SPLIT_COLS,
+        GROUPED_STAGE_ELEMS, GROUPED_THREADS, bound_window, chunk_cols, gemv_in_place_out_ok,
+        gemv_one_row_cols_per_chunk, gemv_setup_key, gemv_weight_window, gemv_wide_cols_per_wg_for,
+        gemv_wide_enabled, gguf_row_bytes, grouped_chunk_geometry, grouped_cols_per_chunk,
+        in_place_out_span, in_place_window_clear, round16, windows_overlap,
     };
 
     /// The setup cache is served on the key alone — there is no second check at the
@@ -3747,10 +3806,10 @@ mod tests {
     }
 
     /// The subgroup arm's geometry is written twice the same way: the encoder
-    /// sizes its dispatch from `GEMV_WIDE_THREADS / subgroup_width`, and the
-    /// shader declares its own `@workgroup_size` plus the three lines that map an
-    /// invocation onto a column, name the reduction and place the store. Read
-    /// both spellings here so the fast, device-free gate sees them.
+    /// sizes its dispatch from [`GEMV_WIDE_COLS_PER_WG`], and the shader declares
+    /// its own `@workgroup_size` plus the lines that walk a workgroup's columns
+    /// by subgroup stride, name the reduction and place the store. Read both
+    /// spellings here so the fast, device-free gate sees them.
     ///
     /// It also pins the module split the arm forced: the shared-memory entry
     /// points are created on every device, so the text they are built from must
@@ -3805,12 +3864,19 @@ mod tests {
         );
         for want in [
             format!("const WIDE_THREADS: u32 = {GEMV_WIDE_THREADS}u;"),
-            "let cols = WIDE_THREADS / sg;".to_string(),
+            format!("const WIDE_COLS: u32 = {GEMV_WIDE_COLS_PER_WG}u;"),
+            // The walk's stride is the workgroup's own subgroup count — rounded
+            // up, so a width that does not divide `WIDE_THREADS` gives every
+            // subgroup id its own columns instead of aliasing another's — clamped
+            // so it can never be zero, and its bound is the constant above: every
+            // workgroup covers that many columns at any width.
+            "let nsub = max((WIDE_THREADS + sg - 1u) / sg, 1u);".to_string(),
+            "for (var c = sgid; c < WIDE_COLS; c = c + nsub) {".to_string(),
             // The column comes from `subgroup_id`, the builtin that is defined to
             // be the subgroup's index, not from `local_invocation_id / sg`, which
             // WGSL leaves unrelated to it.
             "@builtin(subgroup_id) sgid: u32,".to_string(),
-            "let j = wid.x * cols + sgid;".to_string(),
+            "let j = wid.x * WIDE_COLS + c;".to_string(),
             // And the decode is the tiled arm's — one function per scheme — so the
             // two arms cannot drift apart in block addressing or scale decode.
             "for (var u = sid; u < nu; u = u + sg)".to_string(),
@@ -3823,9 +3889,10 @@ mod tests {
             assert!(full.contains(&want), "expected `{want}` in the shader");
         }
 
-        // The ILP entry: the host sizes its grid from `GEMV_WIDE_ILP` and the
-        // shader takes that many columns a subgroup, so the two spellings must be
-        // one number — a mismatch writes columns twice or never.
+        // The ILP entry: the host sizes its grid from `GEMV_WIDE_ILP` times the
+        // columns constant and the shader takes that many columns a subgroup over
+        // the same walk, so the two spellings must be one number — a mismatch
+        // writes columns twice or never.
         let ilp = module
             .entry_points
             .iter()
@@ -3838,12 +3905,12 @@ mod tests {
         );
         for want in [
             format!("const WIDE_ILP: u32 = {GEMV_WIDE_ILP}u;"),
-            "let j = wid.x * (cols * WIDE_ILP) + sgid * WIDE_ILP;".to_string(),
-            // The tail guard: the host cuts chunks to whole ILP workgroups, but the
-            // grid is sized from the probed width while this entry reads the
-            // dispatch-time one, so a disagreement must skip a column rather than
-            // store past the chunk's window.
-            "if (j + WIDE_ILP > params.n) { return; }".to_string(),
+            "let j = wid.x * (WIDE_COLS * WIDE_ILP) + c * WIDE_ILP;".to_string(),
+            // The walk's own end: the host cuts chunks to whole ILP workgroups, so
+            // an admitted chunk never needs it; it bounds a chunk that is not one,
+            // and it is a bound on the walk, not a mitigation for a width the host
+            // guessed wrong — the walk covers the workgroup's columns at any width.
+            "if (j + WIDE_ILP > params.n) { break; }".to_string(),
             // Every scheme the ILP entry carries, decoding both of its columns:
             // each loop's decode request and accumulate, not just Q8_0's, so a
             // scheme left on the one-column `second = false` path goes red here.
@@ -3863,11 +3930,141 @@ mod tests {
             1,
             "the Q4_K cover's gate belongs in `dq_q4k_cover`, once"
         );
+        // The walk's stride belongs to both entries, once each: an entry left on
+        // `WIDE_THREADS / sg` would alias two subgroup ids onto one column at a
+        // width that does not divide the workgroup.
+        assert_eq!(
+            full.matches("let nsub = max((WIDE_THREADS + sg - 1u) / sg, 1u);")
+                .count(),
+            2,
+            "both subgroup entries step their walk by the rounded-up subgroup count"
+        );
         // `total` is the `vec2` pair and nothing beyond it: a third column would
         // need a third component the entry does not have.
         assert!(
             !full.contains("j + 2u") && full.contains("var acc = vec2<f32>(0.0);"),
             "the ILP entry covers WIDE_ILP = {GEMV_WIDE_ILP} columns only"
+        );
+    }
+
+    /// How many times each column of a chunk is written, modelled from the two
+    /// halves of the arm's geometry: the host's grid, `ceil(n / cols_per_wg)`
+    /// workgroups, and the shader's walk — subgroup `sgid` taking column
+    /// `wid * cols_per_wg + c * unit` for `c = sgid, sgid + stride, …` below
+    /// `walk_cols`.
+    ///
+    /// `ids` is the hardware's, not the shader's choice: a 128-invocation
+    /// workgroup at width `sg` has `ceil(WIDE_THREADS / sg)` subgroups, the last
+    /// one partial but still carrying its own `subgroup_id`. `stride` is the step
+    /// the shader's walk takes. Coverage needs the second to equal the first, and
+    /// the property below is what a stride that is not the count does to a chunk;
+    /// the shader's own text is held by `wide_gemv_geometry_matches_the_shader`.
+    ///
+    /// `sg` is the width the *pipeline* got, which the host cannot read (see
+    /// `GEMV_WIDE_COLS_PER_WG`), so the property below is asserted at every width,
+    /// not at the one the probe read.
+    fn column_writes(n: usize, cols_per_wg: u32, walk_cols: u32, unit: u32, sg: u32) -> Vec<u32> {
+        let ids = GEMV_WIDE_THREADS.div_ceil(sg).max(1); // the hardware's subgroup count
+        let stride = GEMV_WIDE_THREADS.div_ceil(sg).max(1); // the shader's `nsub`
+        let grid = (n as u32).div_ceil(cols_per_wg);
+        let mut writes = vec![0u32; n];
+        for wid in 0..grid {
+            for sgid in 0..ids {
+                let mut c = sgid;
+                while c < walk_cols {
+                    let j = wid * cols_per_wg + c * unit;
+                    if j as usize + unit as usize > n {
+                        break;
+                    }
+                    for w in &mut writes[j as usize..j as usize + unit as usize] {
+                        *w += 1;
+                    }
+                    c += stride;
+                }
+            }
+        }
+        writes
+    }
+
+    /// Every output column of a chunk is written exactly once by some workgroup at
+    /// **every** subgroup width the pipeline can get — dividing `WIDE_THREADS` or
+    /// not — with the grid sized from the arm's constant: no column left
+    /// unreached, and none written twice. A grid sized from the probed width
+    /// instead cannot promise that, and the negative control at the end is that
+    /// failure.
+    #[test]
+    fn the_wide_arm_writes_every_column_once_at_every_subgroup_width() {
+        // The host's half of the geometry: the figure is the constant for every
+        // width the probe admits, and the arm is refused where the width does not
+        // divide the workgroup.
+        for probe in [1u32, 2, 4, 8, 16, 32, 64, 128] {
+            assert_eq!(
+                gemv_wide_cols_per_wg_for(Some((probe, GEMV_WIDE_THREADS / probe))),
+                Some(GEMV_WIDE_COLS_PER_WG),
+                "a {probe}-wide probe must size the grid from the constant"
+            );
+        }
+        assert_eq!(
+            gemv_wide_cols_per_wg_for(Some((3, 42))),
+            None,
+            "a width the 128-invocation workgroup does not divide must refuse the arm"
+        );
+        let cols = GEMV_WIDE_COLS_PER_WG;
+        let covered = |writes: &[u32], n: usize, sg: u32, entry: &str| {
+            let missed = writes.iter().filter(|w| **w != 1).count();
+            assert!(
+                missed == 0,
+                "{entry} at a {sg}-wide subgroup does not write every column of a \
+                 {n}-column chunk exactly once: {missed} are missed or written twice"
+            );
+        };
+        // Every width, dividing `WIDE_THREADS` or not: a stride that is not the
+        // workgroup's subgroup count aliases two ids onto one column, and only a
+        // non-dividing width shows it.
+        for sg in [1u32, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 48, 64, 96, 128] {
+            for n in [1usize, 3, 4, 5, 8, 17, 128, 1_024, 6_145] {
+                covered(
+                    &column_writes(n, cols, cols, 1, sg),
+                    n,
+                    sg,
+                    "the one-column entry",
+                );
+            }
+            // The pair entry's chunks are whole numbers of its workgroups — the
+            // admission its trailing guard relies on.
+            let span = cols * GEMV_WIDE_ILP;
+            for n in [1_024usize, 2_048, 6_144] {
+                covered(
+                    &column_writes(n, span, cols, GEMV_WIDE_ILP, sg),
+                    n,
+                    sg,
+                    "the pair entry",
+                );
+            }
+        }
+        // The negative control: the derivation this constant replaced, replayed as
+        // the shader had it. The host sized the grid from the probe's quotient
+        // (`WIDE_THREADS / 32` = 4) while each subgroup took the single column
+        // `sgid` of a span the shader derived from its *own* width
+        // (`WIDE_THREADS / 64` = 2), so half the chunk — its tail included — is
+        // reached by no workgroup: the failure this constant removes, which the
+        // model above has to be able to see.
+        let (probe_cols, kernel_cols) = (GEMV_WIDE_THREADS / 32, GEMV_WIDE_THREADS / 64);
+        let mut pre_fix = vec![0u32; 1_024];
+        for wid in 0..(1_024u32).div_ceil(probe_cols) {
+            for sgid in 0..kernel_cols {
+                pre_fix[(wid * kernel_cols + sgid) as usize] += 1;
+            }
+        }
+        assert_eq!(
+            pre_fix.iter().filter(|w| **w == 1).count(),
+            512,
+            "a 32-wide probe against a 64-wide kernel must leave half a 1 024-column \
+             chunk unwritten"
+        );
+        assert!(
+            pre_fix[1_022] == 0 && pre_fix[1_023] == 0,
+            "the chunk's top columns are the ones no workgroup reaches"
         );
     }
 

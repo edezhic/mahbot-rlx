@@ -7,9 +7,8 @@
 //! Every resolved GitHub issue becomes a row here, so the next user on the
 //! same setup gets the answer from `cargo rlx doctor` instead of filing a new
 //! issue. An entry with a [`KnownIssue::detect`] check is diagnosed
-//! automatically from [`HostFacts`]; one without (build-time failures, which
-//! happen before `doctor` can run) is listed by `cargo rlx doctor --known` and
-//! in `docs/known-issues.md` so its symptom text is searchable.
+//! automatically from [`HostFacts`]; one without is listed by `cargo rlx doctor
+//! --known` and in `docs/known-issues.md` so its symptom text is searchable.
 //!
 //! Every `detect` check has a fake-host test below, and `docs/known-issues.md`
 //! is generated from this table (`just gen-known-issues`, checked by a test).
@@ -49,7 +48,8 @@ pub struct KnownIssue {
     pub cause: &'static str,
     /// What to do — commands where there are commands.
     pub fix: &'static str,
-    /// Diagnose from host facts; `None` for build-time issues.
+    /// Diagnose from host facts; `None` when no host fact can observe it — a
+    /// build-time failure, or a risk accepted on a backend this host cannot run.
     pub detect: Option<fn(&HostFacts) -> bool>,
 }
 
@@ -321,6 +321,24 @@ pub static ISSUES: &[KnownIssue] = &[
         detect: Some(|f| f.wgpu_host_routed),
     },
     KnownIssue {
+        id: "RLX-WGPU-002",
+        title: "the one-row packed multiply is unexercised on DX12 and on Vulkan",
+        severity: Severity::Info,
+        symptom: "wgpu on DX12 or Vulkan: the one-row packed multiply has never run here",
+        cause: "Accepted risk, not a defect report. The one-row packed multiply's grid and \
+                column walk are independent of the subgroup width by construction — \
+                GEMV_WIDE_COLS_PER_WG in crates/backends/rlx-wgpu/src/gguf_gpu.rs carries \
+                the argument — which is what a backend that picks a width per pipeline \
+                (Vulkan's VK_EXT_subgroup_size_control) needs, and no host can ask a \
+                pipeline what width it got. Neither backend is reachable here (no DX12 \
+                rig, no Vulkan ICD), so the behaviour there rests on that construction and \
+                on device-free tests, not on a run.",
+        fix: "Nothing to do: the grid is complete at every width. If a one-row packed \
+              multiply returns a wrong value on DX12 or Vulkan, report it with `cargo rlx \
+              doctor --report`.",
+        detect: None,
+    },
+    KnownIssue {
         id: "RLX-VULKAN-001",
         title: "Vulkan backend built, but no Vulkan driver (ICD) installed",
         severity: Severity::Error,
@@ -432,8 +450,10 @@ pub fn markdown() -> String {
          Generated from [`known_issues.rs`](../crates/core/rlx-runtime/src/doctor/known_issues.rs) \
          — do not edit by hand; run `just gen-known-issues`.\n\n\
          `cargo rlx doctor` detects the entries marked *detected* on your machine and \
-         prints the fix. Build-time entries stop the build before `doctor` can run; \
-         search this page for the error text.\n\n",
+         prints the fix. Entries marked *not detected* are listed without a check — a \
+         build-time failure that stops the build before `doctor` can run, or a risk \
+         accepted on a backend this host cannot exercise; search this page for the \
+         error text.\n\n",
     );
     s.push_str("| Id | Severity | Title | |\n|----|----------|-------|---|\n");
     for i in ISSUES {
@@ -446,7 +466,7 @@ pub fn markdown() -> String {
             how = if i.detect.is_some() {
                 "detected"
             } else {
-                "build time"
+                "not detected"
             },
         ));
     }

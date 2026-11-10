@@ -307,8 +307,8 @@ pub const DEQUANT_GEMV_GGUF_WIDE_WGSL: &str = include_str!("dequant_gemv_gguf.wg
 /// one 128-invocation workgroup (the wide arm's width) holds.
 ///
 /// `AdapterInfo::subgroup_min_size`/`max_size` are buckets (Metal reports 4..64),
-/// and the wide one-row arm maps columns onto whole subgroups, so it needs the
-/// number itself. Two built-in values give it: `subgroup_size` and
+/// and the wide one-row arm is admitted on the number itself, so the host needs
+/// it. Two built-in values give it: `subgroup_size` and
 /// `num_subgroups`. Dispatched once per process, mapped back by
 /// `gguf_gpu::gemv_subgroup_probe`; only built on a device that carries
 /// `Features::SUBGROUP`, so naming the built-ins in this module is safe.
@@ -2778,9 +2778,9 @@ pub(crate) fn kernel_module(device: &wgpu::Device, label: &str, wgsl: &str) -> w
     // registers — is unaffected either way.
     //
     // SAFETY: the only relaxed check is loop bounding, and **every loop in this
-    // crate's WGSL terminates on a bound it reads from its params or a constant.**
-    // That is a property of the whole set, so it is audited as one: of the 117
-    // `loop {` blocks across `src/kernels/*.wgsl`, every `break` is guarded by a
+    // crate's WGSL makes guaranteed progress toward its own exit test.** That is
+    // a property of the whole set, so it is audited as one: of the 117 `loop {`
+    // blocks across `src/kernels/*.wgsl`, every `break` is guarded by a
     // comparison, and the ones that are not an obvious `i >= params.n` /
     // `k < K` counter fall into three shapes, none of which can stall —
     //
@@ -2794,9 +2794,20 @@ pub(crate) fn kernel_module(device: &wgpu::Device, label: &str, wgsl: &str) -> w
     //   * a sentinel walk that steps a signed index toward zero
     //     (`if (j < 0) { break; }`).
     //
-    // No loop's exit depends on a value it computes. `wgpu_gpu_custom`
-    // (user-supplied WGSL) does NOT come through this function and keeps the
-    // guard — a user shader is not this crate's to prove terminating.
+    // What a counter is stepped by is positive, so a counted exit test is reached
+    // in at most as many iterations as its span: a literal; a `const`; a product
+    // or quotient of those (`LANES`, `TG`, and `matmul_wide_vec4.wgsl`'s
+    // `4u * tile_m`, `tile_m` being `FULL_M` or `TAIL_M` at that function's two
+    // call sites); the `subgroup_size` builtin, which a subgroup's definition
+    // makes at least one; a `max(…, 1u)`-clamped ceiling quotient of the
+    // workgroup size by that builtin (`dequant_gemv_gguf.wgsl`'s column walk,
+    // whose bound is its `WIDE_COLS` const); or `params.splits`, which the run
+    // sets from `attention_decode_key_splits` — a function that asserts it is at
+    // least one, as the shader's own division by it requires. The one *kind* of
+    // self-derived stride is the halving reduction's shifted `stride`, whose exit
+    // test is that value reaching zero. `wgpu_gpu_custom` (user-supplied WGSL)
+    // does NOT come through this function and keeps the guard — a user shader is
+    // not this crate's to prove terminating.
     let checks = wgpu::ShaderRuntimeChecks {
         force_loop_bounding: false,
         ..wgpu::ShaderRuntimeChecks::checked()
@@ -6356,9 +6367,9 @@ pub fn dequant_gemv_gguf_tiled_kernel(device: &wgpu::Device) -> &'static Kernel 
         )
     })
 }
-/// The subgroup-reduction entry of `dequant_gemv_gguf.wgsl`: one subgroup per
-/// output column, `GEMV_WIDE_THREADS` invocations per workgroup, the lane
-/// partials combined by `subgroupAdd`.
+/// The subgroup-reduction entry of `dequant_gemv_gguf.wgsl`: each output column
+/// reduced by one whole subgroup, `GEMV_WIDE_THREADS` invocations per workgroup,
+/// the lane partials combined by `subgroupAdd`.
 ///
 /// Built from [`DEQUANT_GEMV_GGUF_WIDE_WGSL`] (the whole file) rather than
 /// [`DEQUANT_GEMV_GGUF_WGSL`] (the file up to this arm's marker): only the wide

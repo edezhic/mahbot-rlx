@@ -192,10 +192,11 @@ tempted to re-litigate both.
 `create_shader_module_trusted` with `force_loop_bounding: false`; user WGSL
 (`wgpu_gpu_custom`) does not come through it and keeps the guard. The opt-out is
 an `unsafe` API, so the argument for it is part of the code: every loop in this
-crate's WGSL terminates on a bound read from its params or a constant, audited
-over the whole set (the three shapes that are not an obvious counter are listed
-in `kernel_module`'s comment). Re-audit it whenever a kernel gains a loop whose
-exit depends on a value it computes.
+crate's WGSL makes guaranteed progress toward its own exit test, audited over
+the whole set (the three shapes that are not an obvious counter, and what a
+stride may be, are listed in `kernel_module`'s comment). Re-audit it whenever a
+kernel gains a loop whose exit test, or the stride that reaches it, is computed
+rather than read.
 
 The one place the guard was paid for by hand — `attention_band.wgsl`, whose
 loops are expanded so the driver keeps them in registers — keeps that expansion.

@@ -64,13 +64,12 @@
 //   * `dequant_gemv_wide` (Q4_K, Q6_K, Q8_0): the same 32-element unit and the
 //     same per-scheme decode as `dequant_gemv_tiled` — except a Q4_K row that
 //     gives a lane two or more `qs` groups, which hand it one whole group a step
-//     (`dq_q4k_group`) — with one **subgroup** per output column (128 invocations
-//     per workgroup, four subgroups at a probed width of 32) and the lane partials
-//     combined by `subgroupAdd`. Below the
-//     marker at the end of this file, because a module that mentions a subgroup
-//     built-in anywhere is refused by wgpu on a device without
-//     `Features::SUBGROUP` — and the two entry points above must still be
-//     creatable there.
+//     (`dq_q4k_group`) — each output column reduced by one whole **subgroup**
+//     (128 invocations per workgroup, four columns a workgroup) and the lane
+//     partials combined by `subgroupAdd`. Below the marker at the end of this
+//     file, because a module that mentions a subgroup built-in anywhere is
+//     refused by wgpu on a device without `Features::SUBGROUP` — and the two
+//     entry points above must still be creatable there.
 //
 // Lane partials of `dequant_gemv_tiled` are combined by a fixed-order tree per
 // column in `red`: deterministic, and no floating-point atomics (absent on some
@@ -78,29 +77,32 @@
 //
 // # The subgroup arm, and why its width is probed
 //
-// The wide arm maps one output column onto one subgroup, so the shader has to
-// know how wide a subgroup is in order to say which column an invocation
-// belongs to and how far a lane strides through the row. `AdapterInfo` only
-// buckets that number (`subgroup_min_size`/`max_size`; Metal reports 4..64), so
-// the value is measured once per process by a probe workgroup
-// (`GGUF_SUBGROUP_PROBE_WGSL` in `kernels/mod.rs`, cached by
-// `gguf_gpu::gemv_subgroup_probe`) and handed to this entry as
-// `@builtin(subgroup_size)`; the host reads the same probe to size the grid with
-// `128 / sg` columns per workgroup. A width that does not divide 128, a device
-// without `Features::SUBGROUP`, or `RLX_WGPU_GEMV_WIDE=0|shared` keeps the
-// shared-memory arm above — the fallback is `dequant_gemv_tiled` itself, not a
-// third entry point: both arms call the same `dq_*_unit` decode, so what differs
-// between them is the reduction alone.
+// The wide arm reduces each output column inside one subgroup, so the shader has
+// to know how wide a subgroup is in order to say how far a lane strides through
+// the row — it reads that from its own pipeline's `@builtin(subgroup_size)`, not
+// from the host. `AdapterInfo` only buckets the number (`subgroup_min_size`/
+// `max_size`; Metal reports 4..64), so the host measures it once per process with
+// a probe workgroup (`GGUF_SUBGROUP_PROBE_WGSL` in `kernels/mod.rs`, cached by
+// `gguf_gpu::gemv_subgroup_probe`) to admit the arm; a width that does not divide
+// 128, a device without `Features::SUBGROUP`, or `RLX_WGPU_GEMV_WIDE=0`/`shared`
+// keeps the shared-memory arm above — the fallback is `dequant_gemv_tiled` itself,
+// not a third entry point: both arms call the same `dq_*_unit` decode, so what
+// differs between them is the reduction alone.
+//
+// The width does *not* say which columns a workgroup covers: that is `WIDE_COLS`
+// below — the host's `GEMV_WIDE_COLS_PER_WG` — at every width, because the width
+// belongs to the pipeline the driver builds and no host can read it. The
+// workgroup walks its own columns by subgroup stride for that reason;
+// `GEMV_WIDE_COLS_PER_WG`'s doc in `gguf_gpu.rs` carries the argument.
 //
 // On this machine (Apple M3 Pro, wgpu over Metal, 2026-10-21) the probe reads
 // subgroup_size=32 with four subgroups in a 128-invocation workgroup, so a wide
-// workgroup covers four
-// output columns with 32 lanes each — half the workgroups and twice the lanes
-// per column the tiled arm issues, and one X read per column instead of one per
-// two. Measured through `tests/gguf_one_row_stream_rate.rs` in one session, five
-// tiled runs against four wide runs interleaved, min GB/s (median of the runs'
-// own minima; the per-form spread within a run is 1-30 %, so a ±5 % cell is not
-// a difference):
+// workgroup covers four output columns with 32 lanes each — half the workgroups
+// and twice the lanes per column the tiled arm issues, and one X read per column
+// instead of one per two. Measured through `tests/gguf_one_row_stream_rate.rs` in
+// one session, five tiled runs against four wide runs interleaved, min GB/s
+// (median of the runs' own minima; the per-form spread within a run is 1-30 %, so
+// a ±5 % cell is not a difference):
 //
 // | form (scheme, k, n)                     | tiled | wide  |
 // |-----------------------------------------|-------|-------|
@@ -759,11 +761,12 @@ fn dequant_gemv_tiled(
 //
 // # What this arm is
 //
-// One subgroup per output column. `@workgroup_size` is 128 (the Rust side's
-// `GEMV_WIDE_THREADS`), so at the probed width `sg` a workgroup covers
-// `128 / sg` columns — four on this machine, where the tiled arm covers two —
-// and every lane of a column's subgroup walks that column's 32-element units by
-// `sg` instead of by `LANES`. The per-scheme decode is the tiled arm's:
+// Each output column is reduced by one whole subgroup. `@workgroup_size` is 128
+// (the Rust side's `GEMV_WIDE_THREADS`) and a workgroup covers `WIDE_COLS`
+// columns — four, where the tiled arm covers two — handing them to its subgroups
+// by id and taking the ones its id does not reach in further steps; every lane of
+// a column's subgroup walks that column's 32-element units by `sg` instead of by
+// `LANES`. The per-scheme decode is the tiled arm's:
 // `dq_q6k_unit` / `dq_q8_0_unit` above, called with this arm's lane stride, so
 // the accumulated products are the same numbers in the same per-lane order; only
 // the final combination differs (a `subgroupAdd` tree instead of `red`'s fixed
@@ -781,16 +784,23 @@ fn dequant_gemv_tiled(
 // one reduction against another and not a second kernel body.
 //
 // Threads one workgroup of `dequant_gemv_wide` runs — this entry's
-// `@workgroup_size`, the Rust side's `GEMV_WIDE_THREADS`, and the numerator of
-// the `columns per workgroup = this / sg` the host sizes the grid with.
+// `@workgroup_size` and the Rust side's `GEMV_WIDE_THREADS`.
 // `gguf_gpu::tests::wide_gemv_geometry_matches_the_shader` ties the two
 // spellings together.
 const WIDE_THREADS: u32 = 128u;
 
-// One subgroup per output column. A lane's index within its column's subgroup is
-// `subgroup_invocation_id`, the column is the workgroup's base plus
-// `subgroup_id` — both guaranteed builtins with a defined relation to the
-// subgroup, where `local_invocation_id / sg` is only what they happen to equal.
+// Output columns one workgroup of either entry covers — the Rust side's
+// `GEMV_WIDE_COLS_PER_WG`, and the bound of the walk that hands them out. Four
+// is the figure the 32-wide subgroup this arm was measured on gives a
+// 128-invocation workgroup, and the walk keeps it four at any width; the header
+// above says why it is not `WIDE_THREADS / sg`.
+const WIDE_COLS: u32 = 4u;
+
+// One whole subgroup reduces each output column. A lane's index within its
+// column's subgroup is `subgroup_invocation_id`, and a column is the workgroup's
+// base plus one the walk below gives it — both guaranteed builtins with a
+// defined relation to the subgroup, where `local_invocation_id / sg` is only what
+// they happen to equal.
 @compute @workgroup_size(WIDE_THREADS)
 fn dequant_gemv_wide(
     @builtin(workgroup_id) wid: vec3<u32>,
@@ -799,39 +809,47 @@ fn dequant_gemv_wide(
     @builtin(subgroup_invocation_id) sid: u32,
 ) {
     g_w_off = params.w_byte_off;
-    let cols = WIDE_THREADS / sg;
-    let j = wid.x * cols + sgid;
-    // A whole subgroup shares `j`, so the tail column leaves the dispatch with
-    // every lane of its subgroup inactive — no lane reaches `subgroupAdd` alone.
-    if (j >= params.n) { return; }
+    // The workgroup's columns, by subgroup stride: its subgroup count, rounded up
+    // so that a width which does not divide `WIDE_THREADS` still gives each
+    // `subgroup_id` its own columns instead of aliasing a lower id's. `max(1u)` is
+    // the loop's termination — a stride of zero would never advance — and the
+    // bound is the constant above.
+    let nsub = max((WIDE_THREADS + sg - 1u) / sg, 1u);
     let nbk = params.k / 256u;        // K-quant blocks per weight row
     let nu = nbk * 8u;                // 32-element units per K-quant row
     let xb4 = params.x_f32_off / 4u;  // X as vec4 groups (see `xarr4`)
-    // Q4_K's 144-byte stride keeps its words 4-aligned; Q6_K (210 B) and Q8_0
-    // (34 B) straddle groups, which `read_w16` assembles, as in the tiled arm.
-    var acc = 0.0;
+    for (var c = sgid; c < WIDE_COLS; c = c + nsub) {
+        let j = wid.x * WIDE_COLS + c;
+        // A whole subgroup shares `j`, so the tail column leaves the walk with
+        // every lane of its subgroup inactive — no lane reaches `subgroupAdd`
+        // alone.
+        if (j >= params.n) { break; }
+        var acc = 0.0;
 
-    if (params.scheme_id == 0u) {
-        acc = acc + dq_q4k_cover(j, sid, sg, nbk, xb4, false).x;
-    } else if (params.scheme_id == 2u) {
-        for (var u = sid; u < nu; u = u + sg) {
-            acc = acc + dq_q6k_unit(j, u, nbk, xb4, false).x;
+        // Q4_K's 144-byte stride keeps its words 4-aligned; Q6_K (210 B) and Q8_0
+        // (34 B) straddle groups, which `read_w16` assembles, as in the tiled arm.
+        if (params.scheme_id == 0u) {
+            acc = acc + dq_q4k_cover(j, sid, sg, nbk, xb4, false).x;
+        } else if (params.scheme_id == 2u) {
+            for (var u = sid; u < nu; u = u + sg) {
+                acc = acc + dq_q6k_unit(j, u, nbk, xb4, false).x;
+            }
+        } else if (params.scheme_id == 20u) {
+            let q8blk = params.k / 32u;
+            for (var u = sid; u < q8blk; u = u + sg) {
+                acc = acc + dq_q8_0_unit(j, u, q8blk, xb4, false).x;
+            }
         }
-    } else if (params.scheme_id == 20u) {
-        let q8blk = params.k / 32u;
-        for (var u = sid; u < q8blk; u = u + sg) {
-            acc = acc + dq_q8_0_unit(j, u, q8blk, xb4, false).x;
-        }
+
+        // The reduction: a subgroup tree, stored by the subgroup's first
+        // invocation. No `workgroupBarrier` and no workgroup storage — the lanes
+        // of a column are its own subgroup, so the tree never leaves it. The
+        // order is the hardware's, not the tiled arm's fixed five steps;
+        // `tests/gguf_gemv_wide_arm.rs` bounds that difference against the CPU
+        // reference instead of asserting identity.
+        let total = subgroupAdd(acc);
+        if (sid == 0u) { outarr[params.out_f32_off + j] = total; }
     }
-
-    // The reduction: a subgroup tree, stored by the subgroup's first
-    // invocation. No `workgroupBarrier` and no workgroup storage — the lanes of
-    // a column are its own subgroup, so the tree never leaves it. The order is
-    // the hardware's, not the tiled arm's fixed five steps;
-    // `tests/gguf_gemv_wide_arm.rs` bounds that difference against the CPU
-    // reference instead of asserting identity.
-    let total = subgroupAdd(acc);
-    if (sid == 0u) { outarr[params.out_f32_off + j] = total; }
 }
 
 // Columns per subgroup in `dequant_gemv_wide_ilp` — the host's `GEMV_WIDE_ILP`
@@ -845,15 +863,14 @@ const WIDE_ILP: u32 = 2u;
 // Here one subgroup takes `WIDE_ILP` contiguous columns with an independent
 // accumulator per column, the pair sharing its X read through the decode's
 // `second` argument — two columns' weight legs outstanding at once, and
-// `WIDE_THREADS / sg * WIDE_ILP` columns a workgroup. Why the width is two and
-// what it measured is `gguf_gpu::GEMV_WIDE_ILP`'s and the route record's.
+// `WIDE_COLS * WIDE_ILP` columns a workgroup. Why the width is two and what it
+// measured is `gguf_gpu::GEMV_WIDE_ILP`'s and the route record's.
 //
 // The host dispatches this entry only for a chunk whose column count is a whole
-// number of `WIDE_THREADS / sg * WIDE_ILP`; every other chunk keeps the entry
-// above. That arithmetic is not trusted here: like the entry above, this one
-// reads the dispatch-time `sg` while the host sizes the grid from the probed
-// width, so the tail guard below skips a column the two disagree about instead
-// of storing past the chunk's output window.
+// number of `WIDE_COLS * WIDE_ILP`; every other chunk keeps the entry above. The
+// walk is that entry's — `WIDE_COLS` groups of `WIDE_ILP` columns, handed to the
+// subgroups by id — so the chunk is covered at any width, and the guard inside
+// the walk only bounds the chunk's own end.
 @compute @workgroup_size(WIDE_THREADS)
 fn dequant_gemv_wide_ilp(
     @builtin(workgroup_id) wid: vec3<u32>,
@@ -862,33 +879,35 @@ fn dequant_gemv_wide_ilp(
     @builtin(subgroup_invocation_id) sid: u32,
 ) {
     g_w_off = params.w_byte_off;
-    let cols = WIDE_THREADS / sg;
-    let j = wid.x * (cols * WIDE_ILP) + sgid * WIDE_ILP;
-    // A whole subgroup shares `j` and stores all `WIDE_ILP` columns, so a group
-    // that starts past the chunk leaves with every lane inactive — no lane
-    // reaches `subgroupAdd` alone.
-    if (j + WIDE_ILP > params.n) { return; }
+    let nsub = max((WIDE_THREADS + sg - 1u) / sg, 1u);  // the entry above's stride
     let nbk = params.k / 256u;
     let nu = nbk * 8u;
     let xb4 = params.x_f32_off / 4u;
-    var acc = vec2<f32>(0.0);
+    for (var c = sgid; c < WIDE_COLS; c = c + nsub) {
+        let j = wid.x * (WIDE_COLS * WIDE_ILP) + c * WIDE_ILP;
+        // A whole subgroup shares `j` and stores all `WIDE_ILP` columns, so a
+        // group that starts past the chunk leaves the walk with every lane
+        // inactive — no lane reaches `subgroupAdd` alone.
+        if (j + WIDE_ILP > params.n) { break; }
+        var acc = vec2<f32>(0.0);
 
-    if (params.scheme_id == 0u) {
-        acc = acc + dq_q4k_cover(j, sid, sg, nbk, xb4, true);
-    } else if (params.scheme_id == 2u) {
-        for (var u = sid; u < nu; u = u + sg) {
-            acc = acc + dq_q6k_unit(j, u, nbk, xb4, true);
+        if (params.scheme_id == 0u) {
+            acc = acc + dq_q4k_cover(j, sid, sg, nbk, xb4, true);
+        } else if (params.scheme_id == 2u) {
+            for (var u = sid; u < nu; u = u + sg) {
+                acc = acc + dq_q6k_unit(j, u, nbk, xb4, true);
+            }
+        } else if (params.scheme_id == 20u) {
+            let q8blk = params.k / 32u;
+            for (var u = sid; u < q8blk; u = u + sg) {
+                acc = acc + dq_q8_0_unit(j, u, q8blk, xb4, true);
+            }
         }
-    } else if (params.scheme_id == 20u) {
-        let q8blk = params.k / 32u;
-        for (var u = sid; u < q8blk; u = u + sg) {
-            acc = acc + dq_q8_0_unit(j, u, q8blk, xb4, true);
-        }
-    }
 
-    let total = subgroupAdd(acc);
-    if (sid == 0u) {
-        outarr[params.out_f32_off + j] = total.x;
-        outarr[params.out_f32_off + j + 1u] = total.y;
+        let total = subgroupAdd(acc);
+        if (sid == 0u) {
+            outarr[params.out_f32_off + j] = total.x;
+            outarr[params.out_f32_off + j + 1u] = total.y;
+        }
     }
 }

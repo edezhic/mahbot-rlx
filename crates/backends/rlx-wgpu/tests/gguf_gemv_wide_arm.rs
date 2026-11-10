@@ -93,9 +93,9 @@ fn the_subgroup_arm_matches_the_cpu_reference_on_every_scheme_it_carries() {
     // admission edges (`n` exactly at its floor, and a chunk above the floor that is
     // not a whole number of its workgroups, which the narrow entry serves) and an
     // `n` below the floor, which the floor rejects. The off-width chunk is 4 100
-    // because it sits 4 columns off a whole workgroup at any subgroup width this
-    // crate has probed (4 mod 8 at 32, 4 mod 16 at 16); a value that divided by the
-    // width would silently take the ILP entry and drop this case.
+    // because it sits 4 columns off the pair entry's whole workgroups (4 mod 8),
+    // which the pair's width is at every subgroup width; a value that divided by
+    // it would silently take the pair entry and drop this case.
     let shapes = [
         (1024usize, 1024usize),
         (2048usize, 2048usize),

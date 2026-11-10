@@ -379,7 +379,7 @@ fn run_doctor(args: &[String]) -> ExitCode {
                     if k.detect.is_some() {
                         ", detected"
                     } else {
-                        ", build time"
+                        ", not detected"
                     },
                     k.title,
                     k.symptom,

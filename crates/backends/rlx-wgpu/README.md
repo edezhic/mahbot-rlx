@@ -92,20 +92,22 @@ kernels, pure Rust deps — no FFI, no submodules.
   `dequant_gemm_gguf.wgsl` + `gguf_gpu.rs`: `select_path` picks the fused
   windowed kernels for Q4_K/Q6_K/Q1_0 (scratch-free, shard-safe). At `m == 1`
   Q4_K/Q6_K/Q8_0 take a tiled per-row GEMV arm (one workgroup per two output
-  columns, its lanes splitting each column's contraction over 32-element units of
-  the packed weight, one X read four elements at a time shared across them) —
-  or, the default, a subgroup-reduction arm of the same decode
-  (one subgroup per output column, `GEMV_WIDE_THREADS` invocations per workgroup,
-  the column read from `subgroup_id`; a Q4_K row that gives a lane two or more of
-  its `qs` groups decodes a whole group a step; `RLX_WGPU_GEMV_WIDE=shared` restores
-  the workgroup-memory arm). A chunk of 1 024 columns or more whose columns are a
-  whole number of its workgroups takes that arm's wider entry — two contiguous
-  columns per subgroup with an independent accumulator each, so a lane keeps two
-  rows of packed weight in flight and the pair shares one X read — and
-  `RLX_WGPU_GEMV_ILP=0` restores the one-column entry. A narrow Q6_K chunk — a row
-  of two 32-element units a lane — raises that floor to 2 048 columns. Each
-  dispatch's uniform and
-  bind group are kept across frames (`RLX_WGPU_GEMV_POOL=0` rebuilds them) — while
+  columns, its lanes splitting each column's contraction over 32-element units
+  of the packed weight, one X read four elements at a time shared across them) —
+  or, the default, a subgroup-reduction arm of the same decode (each output
+  column reduced by one whole subgroup, `GEMV_WIDE_THREADS` invocations per
+  workgroup; a workgroup covers `GEMV_WIDE_COLS_PER_WG` columns, handing them to
+  its subgroups by `subgroup_id` and taking the ones an id does not reach in
+  further steps, so the grid does not depend on the subgroup width; a Q4_K row
+  that gives a lane two or more of its `qs` groups decodes a whole group a step;
+  `RLX_WGPU_GEMV_WIDE=shared` restores the workgroup-memory arm). A chunk of
+  1 024 columns or more whose columns are a whole number of its workgroups takes
+  that arm's wider entry — two contiguous columns per subgroup with an
+  independent accumulator each, so a lane keeps two rows of packed weight in
+  flight and the pair shares one X read — and `RLX_WGPU_GEMV_ILP=0` restores the
+  one-column entry. A narrow Q6_K chunk — a row of two 32-element units a lane —
+  raises that floor to 2 048 columns. Each dispatch's uniform and bind group are
+  kept across frames (`RLX_WGPU_GEMV_POOL=0` rebuilds them) — while
   Q1_0 keeps one thread per column reading X one element at a time; for `m > 1`
   Q4_K/Q6_K **and Q8_0** a device with cooperative matrices takes the fused
   cooperative tile (`dequant_gemm_coop_gguf.wgsl`: the packed weight decoded into a

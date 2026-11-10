@@ -714,11 +714,12 @@ fn one_row_packed_stream_rate() {
     );
     // The wide arm's width is measured, not assumed: report what the probe read,
     // and whether the arm is therefore admissible on this adapter.
+    let cols = rlx_wgpu::gguf_gpu::gemv_wide_cols_per_wg(&dev.device);
     match rlx_wgpu::gguf_gpu::gemv_subgroup_probe(&dev.device) {
         Some((sg, n)) => eprintln!(
             "[one-row packed stream] subgroup probe: subgroup_size={sg} num_subgroups={n} \
              wide_cols_per_workgroup={}",
-            128 / sg
+            cols.map_or_else(|| "arm refused".to_owned(), |c| c.to_string())
         ),
         None => eprintln!(
             "[one-row packed stream] subgroup probe: none (no SUBGROUP feature, or the \

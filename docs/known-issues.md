@@ -2,7 +2,7 @@
 
 Generated from [`known_issues.rs`](../crates/core/rlx-runtime/src/doctor/known_issues.rs) — do not edit by hand; run `just gen-known-issues`.
 
-`cargo rlx doctor` detects the entries marked *detected* on your machine and prints the fix. Build-time entries stop the build before `doctor` can run; search this page for the error text.
+`cargo rlx doctor` detects the entries marked *detected* on your machine and prints the fix. Entries marked *not detected* are listed without a check — a build-time failure that stops the build before `doctor` can run, or a risk accepted on a backend this host cannot exercise; search this page for the error text.
 
 | Id | Severity | Title | |
 |----|----------|-------|---|
@@ -24,14 +24,15 @@ Generated from [`known_issues.rs`](../crates/core/rlx-runtime/src/doctor/known_i
 | [RLX-CUDA-002](#rlx-cuda-002) | error | NVRTC (CUDA runtime compiler) not found | detected |
 | [RLX-CUDA-003](#rlx-cuda-003) | error | CUDA backend built, but no NVIDIA driver loaded | detected |
 | [RLX-WGPU-001](#rlx-wgpu-001) | info | wgpu on Vulkan/DX12 runs elementwise ops on the host | detected |
+| [RLX-WGPU-002](#rlx-wgpu-002) | info | the one-row packed multiply is unexercised on DX12 and on Vulkan | not detected |
 | [RLX-VULKAN-001](#rlx-vulkan-001) | error | Vulkan backend built, but no Vulkan driver (ICD) installed | detected |
 | [RLX-ENV-001](#rlx-env-001) | warning | An RLX_* variable is set that nothing reads | detected |
 | [RLX-CHECK-001](#rlx-check-001) | error | A device failed its check run | detected |
-| [RLX-BUILD-001](#rlx-build-001) | error | cargo older than 1.99 rejects the workspace manifests | build time |
-| [RLX-BUILD-002](#rlx-build-002) | error | Linking libpython fails in a cargo build | build time |
-| [RLX-BUILD-003](#rlx-build-003) | error | OpenBLAS not installed | build time |
-| [RLX-BUILD-004](#rlx-build-004) | error | MLX submodule not checked out | build time |
-| [RLX-BUILD-005](#rlx-build-005) | error | ONNX Runtime prebuilt needs glibc 2.38+ | build time |
+| [RLX-BUILD-001](#rlx-build-001) | error | cargo older than 1.99 rejects the workspace manifests | not detected |
+| [RLX-BUILD-002](#rlx-build-002) | error | Linking libpython fails in a cargo build | not detected |
+| [RLX-BUILD-003](#rlx-build-003) | error | OpenBLAS not installed | not detected |
+| [RLX-BUILD-004](#rlx-build-004) | error | MLX submodule not checked out | not detected |
+| [RLX-BUILD-005](#rlx-build-005) | error | ONNX Runtime prebuilt needs glibc 2.38+ | not detected |
 
 ## RLX-XDNA-001
 
@@ -176,6 +177,14 @@ Generated from [`known_issues.rs`](../crates/core/rlx-runtime/src/doctor/known_i
 - **Symptom:** `most wgpu schedule steps are host_op (RLX_DISPATCH_REPORT=1)`
 - **Cause:** Deliberate: elementwise SPIR-V produced wrong model output on discrete NVIDIA, so wgpu host-routes those ops on every Vulkan/DX12 adapter (integrated ones too). Results are correct but slower.
 - **Fix:** Prefer Device::Cuda or Device::Vulkan on this GPU. RLX_WGPU_SHARD_GPU=1 forces GPU elementwise if you want to measure it.
+
+## RLX-WGPU-002
+
+**the one-row packed multiply is unexercised on DX12 and on Vulkan** (info)
+
+- **Symptom:** `wgpu on DX12 or Vulkan: the one-row packed multiply has never run here`
+- **Cause:** Accepted risk, not a defect report. The one-row packed multiply's grid and column walk are independent of the subgroup width by construction — GEMV_WIDE_COLS_PER_WG in crates/backends/rlx-wgpu/src/gguf_gpu.rs carries the argument — which is what a backend that picks a width per pipeline (Vulkan's VK_EXT_subgroup_size_control) needs, and no host can ask a pipeline what width it got. Neither backend is reachable here (no DX12 rig, no Vulkan ICD), so the behaviour there rests on that construction and on device-free tests, not on a run.
+- **Fix:** Nothing to do: the grid is complete at every width. If a one-row packed multiply returns a wrong value on DX12 or Vulkan, report it with `cargo rlx doctor --report`.
 
 ## RLX-VULKAN-001
 
