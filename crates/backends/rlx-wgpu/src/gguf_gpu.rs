@@ -172,7 +172,8 @@ fn gemv_wide_enabled() -> bool {
 /// `AdapterInfo` only reports bucketed sizes (`subgroup_min_size`/
 /// `subgroup_max_size`; Metal says 4..64), and the host needs the number for two
 /// decisions of its own: whether to admit the arm at all — it takes one only where
-/// a 128-invocation workgroup divides into whole subgroups — and which column
+/// a 128-invocation workgroup divides into whole subgroups, which its per-column
+/// reduction requires ([`gemv_subgroup_width`]) — and which column
 /// floor the pair entry has, since a narrow Q6_K chunk is a row of two 32-element
 /// units a lane (`k / 32 == 2 * width`). It does *not* say how many columns a
 /// workgroup covers — `GEMV_WIDE_COLS_PER_WG` does, at every width — nor is it
@@ -208,10 +209,24 @@ pub fn gemv_subgroup_probe(device: &wgpu::Device) -> Option<(u32, u32)> {
 }
 
 /// [`gemv_subgroup_probe`]'s width alone, when the wide arm is admitted at it: one
-/// where the arm's 128 threads divide into whole subgroups. The walk covers a
-/// workgroup's columns at any width (see [`GEMV_WIDE_COLS_PER_WG`]), so this is
-/// the arm's admission policy — the geometry it was measured on — rather than a
-/// requirement of the shader: any other width keeps the shared-memory entry.
+/// where the arm's 128 threads divide into whole subgroups.
+///
+/// That dividing condition is the shader's requirement on the width, not a
+/// preference for the geometry the arm was measured on. The column walk is
+/// width-independent (see [`GEMV_WIDE_COLS_PER_WG`]); the per-column reduction is
+/// not, because a lane strides a column's units by the nominal `subgroup_size` and
+/// `subgroupAdd` combines one subgroup. A width that does not divide the workgroup
+/// would leave the last subgroup partly populated while it still reports the
+/// nominal width — its lanes stride as if the missing invocations were there, so
+/// the units only they would have reached are never read, and the reduction
+/// combines the invocations that exist. The column's contraction then comes out
+/// wrong: finite, plausible and silent. Any other width keeps the shared-memory
+/// entry.
+///
+/// What admits the arm is the *probe* pipeline's width, the only one a host can
+/// read. An implementation that picks a width per pipeline (Vulkan's
+/// `VK_EXT_subgroup_size_control`) may give the arm's own pipeline another, and the
+/// requirement holds of that width too.
 pub fn gemv_subgroup_width(device: &wgpu::Device) -> Option<u32> {
     gemv_subgroup_width_for(gemv_subgroup_probe(device))
 }
@@ -670,8 +685,8 @@ const GEMV_LEGACY_THREADS: u32 = 64;
 
 /// Threads one workgroup of the one-row **subgroup** arm runs: the shader's
 /// `dequant_gemv_wide` `@workgroup_size` and its `WIDE_THREADS`. The workgroup
-/// covers [`GEMV_WIDE_COLS_PER_WG`] output columns at any width — one whole
-/// subgroup each, four where the tiled arm covers two, and one step of the walk
+/// covers [`GEMV_WIDE_COLS_PER_WG`] output columns at any width — one subgroup
+/// each, four where the tiled arm covers two, and one step of the walk
 /// at the 32-wide subgroup this arm was measured on.
 /// `tests/gguf_one_row_stream_rate.rs` carries what the arm reads at the model's
 /// geometries against the tiled arm's figure.
@@ -690,9 +705,12 @@ const GEMV_WIDE_THREADS: u32 = 128;
 /// no error, no guard, results that are finite and plausible. The shader
 /// therefore walks its workgroup's columns by subgroup stride, so every workgroup
 /// covers these columns at any width, and a dispatch covers the grid's worth of
-/// them. The narrower direction was never wrong (the ranges still tile, the extra
-/// workgroups are empty), which is why the probed width is still what admits the
-/// arm.
+/// them.
+///
+/// That is the walk alone. The per-column reduction is not width-independent — it
+/// strides a column's units by the nominal `subgroup_size` and combines one
+/// subgroup — so the arm is admitted only where the probed width divides the
+/// workgroup; [`gemv_subgroup_width`] states that requirement.
 ///
 /// Four is what a 128-invocation workgroup covers at the 32-wide subgroup the
 /// arm was measured on, so the walk is one step and the dispatch is the one the
@@ -3957,12 +3975,17 @@ mod tests {
     /// workgroup at width `sg` has `ceil(WIDE_THREADS / sg)` subgroups, the last
     /// one partial but still carrying its own `subgroup_id`. `stride` is the step
     /// the shader's walk takes. Coverage needs the second to equal the first, and
-    /// the property below is what a stride that is not the count does to a chunk;
-    /// the shader's own text is held by `wide_gemv_geometry_matches_the_shader`.
+    /// the property below is what a stride that is not the count does to a chunk.
+    /// The two coincide in the shipped code, and
+    /// `wide_gemv_geometry_matches_the_shader` pins the shader's `nsub` to that
+    /// expression — a divergence fails there, not here.
     ///
     /// `sg` is the width the *pipeline* got, which the host cannot read (see
-    /// `GEMV_WIDE_COLS_PER_WG`), so the property below is asserted at every width,
-    /// not at the one the probe read.
+    /// `GEMV_WIDE_COLS_PER_WG`), so the sweep below covers widths the arm is never
+    /// dispatched at as well as the dividing ones. What it models is the walk's
+    /// coverage, the half that does not depend on the width — not the arm's
+    /// correctness at those widths, which needs whole subgroups and is the
+    /// admission's job (`gemv_subgroup_width`).
     fn column_writes(n: usize, cols_per_wg: u32, walk_cols: u32, unit: u32, sg: u32) -> Vec<u32> {
         let ids = GEMV_WIDE_THREADS.div_ceil(sg).max(1); // the hardware's subgroup count
         let stride = GEMV_WIDE_THREADS.div_ceil(sg).max(1); // the shader's `nsub`
@@ -3987,11 +4010,10 @@ mod tests {
     }
 
     /// Every output column of a chunk is written exactly once by some workgroup at
-    /// **every** subgroup width the pipeline can get — dividing `WIDE_THREADS` or
-    /// not — with the grid sized from the arm's constant: no column left
-    /// unreached, and none written twice. A grid sized from the probed width
-    /// instead cannot promise that, and the negative control at the end is that
-    /// failure.
+    /// **every** subgroup width — dividing `WIDE_THREADS` or not — with the grid
+    /// sized from the arm's constant: no column left unreached, and none written
+    /// twice. A grid sized from the probed width instead cannot promise that, and
+    /// the negative control at the end is that failure.
     #[test]
     fn the_wide_arm_writes_every_column_once_at_every_subgroup_width() {
         // The host's half of the geometry: the figure is the constant for every
