@@ -61,7 +61,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -657,7 +657,11 @@ impl GgufFile {
         Self::header_from_reader(&mut cur)
     }
 
-    fn from_reader_inner<R: Read + Seek>(r: &mut R, read_data: bool) -> Result<Self> {
+    fn from_reader_inner<R: Read + Seek>(inner: &mut R, read_data: bool) -> Result<Self> {
+        // The header is read one scalar at a time, so an unbuffered `File` pays a
+        // syscall per scalar: 266 ms of the recognition body's cold row, 18 ms here.
+        let r = &mut BufReader::new(inner);
+
         let magic = read_u32(r)?;
         if magic != GGUF_MAGIC {
             bail!("not a GGUF file (magic {magic:#x})");
@@ -755,6 +759,11 @@ impl GgufFile {
         if read_data {
             r.seek(SeekFrom::Current(pad as i64))?;
             r.read_to_end(&mut data)?;
+        } else {
+            // Hand a header-only caller its reader back at the header end: the
+            // buffer above has read ahead, and dropping it would leave the caller
+            // past that point.
+            r.seek(SeekFrom::Start(pos))?;
         }
 
         Ok(Self {
@@ -2268,6 +2277,97 @@ mod tests {
         let buf = vec![0u8; 16];
         let mut c = Cursor::new(buf);
         assert!(GgufFile::from_reader(&mut c).is_err());
+    }
+
+    /// Counts the reads the parser makes of the reader it was given — one per
+    /// scalar when the header is not buffered.
+    struct Counting<R> {
+        inner: R,
+        reads: usize,
+    }
+
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            self.inner.read(buf)
+        }
+    }
+
+    impl<R: Seek> Seek for Counting<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// The tensor the fixtures carry: recognizable bytes, so a parse that hands the
+    /// reader back somewhere other than the header end is visible in what follows.
+    const TENSOR_DATA: [u8; 32] = *b"mahbot-gguf-header-parse-test!!!";
+
+    /// A header wider than one buffer refill: a 4096-entry tokenizer table plus a
+    /// tensor, the shape a body file's header has.
+    fn wide_header() -> Vec<u8> {
+        let mut w = GgufWriter::new();
+        w.set_arch("llama");
+        w.set_meta(
+            "tokenizer.ggml.tokens",
+            MetaValue::Array(
+                (0..4096)
+                    .map(|i| MetaValue::String(format!("token-{i}")))
+                    .collect(),
+            ),
+        );
+        w.add_tensor_bytes("w", vec![8], GgmlType::F32, TENSOR_DATA.to_vec())
+            .unwrap();
+        let mut out = Cursor::new(Vec::new());
+        w.write(&mut out).unwrap();
+        out.into_inner()
+    }
+
+    /// The header goes through a buffer: a parse that regresses to one read per
+    /// scalar makes thousands of reads here instead of a handful.
+    #[test]
+    fn header_parse_reads_in_bulk() {
+        let mut counting = Counting {
+            inner: Cursor::new(wide_header()),
+            reads: 0,
+        };
+        let f = GgufFile::header_from_reader(&mut counting).unwrap();
+        match f.metadata.get("tokenizer.ggml.tokens") {
+            Some(MetaValue::Array(items)) => assert_eq!(items.len(), 4096),
+            other => panic!("tokenizer table did not survive the parse: {other:?}"),
+        }
+        assert!(
+            counting.reads < 100,
+            "the header parse made {} reads: it is reading one scalar at a time",
+            counting.reads
+        );
+    }
+
+    /// A header-only parse hands the reader back at the header end, not at the
+    /// buffer's read-ahead point: a caller may keep reading from it.
+    #[test]
+    fn header_only_parse_leaves_the_reader_at_the_header_end() {
+        let mut r = Cursor::new(wide_header());
+        let f = GgufFile::header_from_reader(&mut r).unwrap();
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        // What follows the reader is the alignment padding and then the tensor bytes
+        // themselves.
+        assert!(
+            rest.ends_with(&TENSOR_DATA),
+            "the tensor data does not follow the reader: the read-ahead was not given back"
+        );
+        let pad = rest.len() - TENSOR_DATA.len();
+        assert!(
+            rest[..pad].iter().all(|b| *b == 0),
+            "the {pad} bytes between the reader and the tensor data are not alignment padding"
+        );
+        assert!(
+            pad < f.alignment as usize,
+            "{pad} bytes before the tensor data, more than the {}-byte alignment: the reader is \
+             not at the header end",
+            f.alignment
+        );
     }
 
     #[test]

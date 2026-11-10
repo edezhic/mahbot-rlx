@@ -227,6 +227,7 @@ merge action.
 - the parameter host stash kept only for the cooperative host-activation mirror that
   reads it, with a clone taking its parameters off the device instead
 - packed codec tables read as stored
+- the buffered GGUF header parse (upstream reads one scalar per `read` syscall)
 - the scope-keyed shared weight pool with re-upload skipping
 - KV-append copy elision
 - the ceiling policy as a whole-arena verdict
