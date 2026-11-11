@@ -307,6 +307,10 @@ test:
     # compiled here at all. (Linux x86_64 excepted: rlx-collectives' retained
     # upstream dev-dependency row still pulls CUDA / ROCm / XDNA into this run.)
     # `just test-gpu` and the backend recipes below are what build the rest.
+    # `mahbot-inference` gates ten more targets this way, behind its own
+    # `hand-run` feature rather than `backend-tests`: every test in them is
+    # `#[ignore]`d, so ungated this run links and executes ten binaries that run
+    # nothing. `just test-workspace` and `just lint` enable that feature.
     if [[ "$(uname -s)" == Darwin ]]; then
         # A few parallel test binaries is enough; more contended Apple GPU.
         JOBS=$(( CPUS < 4 ? CPUS : 4 ))
@@ -339,6 +343,11 @@ test:
 # left to redden the gate. A gate that is red out of the box is not a gate: a sync
 # reads the red as a regression and chases it.
 #
+# One gated set is reached on purpose: `mahbot-inference`'s ten hand-run targets
+# are behind that crate's `hand-run` feature so the routine run does not link
+# binaries that execute nothing, and `--features mahbot-inference/hand-run` below
+# is what keeps this whole-set run's coverage where it was.
+#
 # `--skip` matches a test *name*, not a file, which is why the list below is
 # six names rather than three targets. Each carries what it wants in the comment
 # beside it; run one by hand on a rig that has the prerequisite.
@@ -348,6 +357,7 @@ test-workspace:
     set -euo pipefail
     CPUS={{cpus}}
     excl="--exclude rlx-mlx-sys --exclude rlx-mlx"
+    feat="--features mahbot-inference/hand-run"
     skip=""
     # MNIST IDX files at `RLX_MNIST_DIR`.
     skip="$skip --skip audit_pair_switch_graft_and_answer"
@@ -360,10 +370,10 @@ test-workspace:
     skip="$skip --skip the_swift_test_suite_passes"
     if [[ "$(uname -s)" == Darwin ]]; then
         JOBS=$(( CPUS < 4 ? CPUS : 4 ))
-        cargo test --release -j "$JOBS" --workspace $excl --no-fail-fast -- $skip
+        cargo test --release -j "$JOBS" --workspace $excl $feat --no-fail-fast -- $skip
     else
-        cargo build --release --workspace --tests --keep-going $excl -j "$CPUS"
-        cargo test --release -j "$CPUS" --workspace $excl --no-fail-fast -- \
+        cargo build --release --workspace --tests --keep-going $excl $feat -j "$CPUS"
+        cargo test --release -j "$CPUS" --workspace $excl $feat --no-fail-fast -- \
             --test-threads="$CPUS" $skip
     fi
 
@@ -596,12 +606,13 @@ lint: lint-features
     # `default-members` in Cargo.toml); `lint-workspace` is the whole-set gate.
     # `backend-tests`: the default test selection is a fast smoke set, and
     # `required-features` hides every gated target from `--all-targets` too —
-    # without it they would not be type-checked by `just lint` at all.
-    cargo clippy --all-targets --features backend-tests -- -D warnings
+    # without it they would not be type-checked by `just lint` at all. `hand-run`
+    # is the same for `mahbot-inference`'s ten hand-run targets.
+    cargo clippy --all-targets --features backend-tests,hand-run -- -D warnings
 
 # Every member, once per upstream sync (see `docs/fork-sync.md`).
 lint-workspace: lint-features
-    cargo clippy --workspace --all-targets --features backend-tests -- -D warnings
+    cargo clippy --workspace --all-targets --features backend-tests,hand-run -- -D warnings
 
 # Clippy the feature combinations `--all-targets` alone cannot reach.
 #
@@ -1247,6 +1258,8 @@ ci: build test fmt-check lint check-fork-layers check-rlx-env-vars check-example
 # loop above stays narrow. It depends on `ci` so it cannot fall behind it, and it
 # names `test-gpu` because that is the recipe that builds the targets behind
 # `required-features` — a bare `cargo test --workspace` skips every one of them.
+# `test-workspace` names the one feature it has to (`mahbot-inference/hand-run`,
+# see that recipe); every other gated set is `test-gpu`'s.
 #
 # Every recipe named here needs nothing beyond the Rust toolchain and the
 # contour's own devices, so the gate is green on whatever host a sync runs on —
@@ -1419,10 +1432,10 @@ mahbot-transcription-corpus *ARGS:
     cargo run --release -p mahbot-inference --features bench --bin transcription-corpus -- {{ARGS}}
 
 # No other recipe compiles the bench target (whose `harness = false` means an
-# executing gate would run a measurement), so this is the one that sees it under
-# `-D warnings`.
+# executing gate would run a measurement); the hand-run targets are also in
+# `just lint`, and this recipe is the crate's whole set under `-D warnings`.
 lint-mahbot:
-    cargo clippy -p mahbot-inference --features bench --all-targets -- -D warnings
+    cargo clippy -p mahbot-inference --features bench,hand-run --all-targets -- -D warnings
 
 # The product checks the stand never runs: every one is `#[ignore]`d, so no
 # routine command reaches them. A check whose input is absent prints why and
@@ -1434,4 +1447,4 @@ lint-mahbot:
 # construction teaches the operator to skip the gate. A sync runs this by hand
 # (`docs/fork-sync.md` §10) and reads what it says.
 test-product-checks:
-    cargo test --release -p mahbot-inference --features bench --test product_checks -- --ignored --nocapture
+    cargo test --release -p mahbot-inference --features hand-run --test product_checks -- --ignored --nocapture

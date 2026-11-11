@@ -14,8 +14,8 @@
 //! checked too — the one request that is refused rather than rendered.
 //!
 //! Needs both model pairs installed; a machine without them skips. Run with
-//! `cargo test -p mahbot-inference --release --test speak_readback -- --ignored
-//! --nocapture --test-threads 1`.
+//! `cargo test -p mahbot-inference --release --features hand-run --test speak_readback
+//! -- --ignored --nocapture --test-threads 1`.
 //! Each subject holds a synthesis pair and then a recognition pair with the tagger,
 //! releasing the first before opening the second. The doubled render alone peaks at
 //! about 5.5 GiB of physical footprint and the three in one process peak higher than

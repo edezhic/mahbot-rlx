@@ -6,8 +6,8 @@
 //! process in time and physical footprint.
 //!
 //! Needs the installed model directory; a machine without it skips. Run with
-//! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --test
-//! sound_decoder_cost -- --ignored --nocapture <subject>`.
+//! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --features
+//! hand-run --test sound_decoder_cost -- --ignored --nocapture <subject>`.
 //! Each subject is its own test and wants its own process: the host copies of the
 //! weights a run reads stay in the process's caches, and the three arms that build
 //! graphs by hand never release their pages (only the served path does, inside the

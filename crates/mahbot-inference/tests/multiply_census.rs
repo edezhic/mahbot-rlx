@@ -4,8 +4,8 @@
 
 //! Measurement only and `#[ignore]`d: the synthesis loop's per-shape rate census.
 //! Needs the installed model directory; without it prints why and returns. Run with
-//! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --test
-//! multiply_census -- --ignored --nocapture`.
+//! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --features
+//! hand-run --test multiply_census -- --ignored --nocapture`.
 //! `frame_share_ms` is each family's bytes at the frame's own measured aggregate
 //! rate — a per-side constant, so within a side ordering by it is ordering by
 //! bytes. A packed multiply's own in-frame time is not attributable: it dispatches

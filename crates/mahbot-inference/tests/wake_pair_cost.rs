@@ -7,8 +7,8 @@
 //! embeddings are the single-window pass's.
 //!
 //! Needs the recognition pair and the pinned corpus recording; a machine without
-//! them skips. Run with `cargo test -p mahbot-inference --release --test
-//! wake_pair_cost -- --ignored --nocapture`, after `just throttle`.
+//! them skips. Run with `cargo test -p mahbot-inference --release --features
+//! hand-run --test wake_pair_cost -- --ignored --nocapture`, after `just throttle`.
 //!
 //! Both arms run the product's own front ends ([`Listener::embed_pair`] and
 //! [`Listener::embed`]) over the same two consecutive windows of the pinned corpus

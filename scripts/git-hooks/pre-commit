@@ -78,19 +78,24 @@ ROOT_PKG_LIST="$(printf '%s' "$ROOT_PKGS" | sed '/^$/d')"
 ROOT_PKG_COUNT="$(printf '%s\n' "$ROOT_PKG_LIST" | grep -c . || true)"
 
 echo "[pre-commit] clippy -D warnings (${ROOT_PKG_LIST:-whole contour})"
-# `backend-tests` is what builds the gated test targets (see the `test` recipe
-# in the root Justfile). cargo accepts the flag only when a selected package
-# declares it, so derive those package names from the manifests — a hand-kept
-# list would silently stop linting newly gated targets. The names come from each
-# manifest's own `[package] name`, not its directory: the two need not match.
-# The branches below pass the flag unconditionally, since naming no package makes
-# the virtual workspace root the selection and it accepts the flag. They name no
+# `backend-tests` and `hand-run` are what build the gated test targets (see the
+# `test` recipe in the root Justfile and `crates/mahbot-inference/Cargo.toml`).
+# cargo accepts a feature flag only when a selected package declares it, so derive
+# which package needs which from the manifests — a hand-kept list would silently
+# stop linting newly gated targets. The names come from each manifest's own
+# `[package] name`, not its directory: the two need not match.
+# The branches below pass both flags unconditionally, since naming no package makes
+# the virtual workspace root the selection and it accepts them. They name no
 # package, because the default selection is this fork's contour (`default-members`
 # in Cargo.toml) and not the whole set: this hook lints what `just lint` lints.
 GATED="$(
   git ls-files -- '*Cargo.toml' | while IFS= read -r m; do
-    grep -qE 'required-features *=.*backend-tests' "$m" || continue
-    awk -F'"' '/^\[package\]/{p=1} p && /^name *=/{print $2; exit}' "$m"
+    feats="$(grep -oE 'required-features *=.*' "$m" |
+      grep -oE '(backend-tests|hand-run)' | sort -u | tr '\n' ',' |
+      sed 's/,$//' || true)"
+    [[ -n "$feats" ]] || continue
+    awk -F'"' -v f="$feats" \
+      '/^\[package\]/{p=1} p && /^name *=/{print $2 "\t" f; exit}' "$m"
   done
 )"
 
@@ -98,23 +103,28 @@ if [[ "$ROOT_PKG_COUNT" -eq 0 ]]; then
   # Lint the whole contour only when nothing mapped to a package at all; if all
   # staged Rust lives in nested workspaces there is nothing to lint here.
   if [[ -z "$NESTED_PKGS" ]]; then
-    cargo clippy --all-targets --features backend-tests -- -D warnings
+    cargo clippy --all-targets --features backend-tests,hand-run -- -D warnings
   fi
 elif [[ "$ROOT_PKG_COUNT" -gt 12 ]]; then
   # Many packages: still the default contour, not `--workspace` — naming no
   # package is exactly what `just lint` does, and the twenty-one upstream members
   # this fork does not build stay out of the routine loop.
-  cargo clippy --all-targets --features backend-tests -- -D warnings
+  cargo clippy --all-targets --features backend-tests,hand-run -- -D warnings
 else
   ARGS=()
-  FEAT=""
+  NEED_BT=""
+  NEED_HR=""
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
     ARGS+=(-p "$p")
-    if grep -qxF "$p" <<<"$GATED"; then
-      FEAT="--features backend-tests"
-    fi
+    f="$(awk -F'\t' -v pkg="$p" '$1 == pkg { print $2 }' <<<"$GATED")"
+    case "$f" in *backend-tests*) NEED_BT=1 ;; esac
+    case "$f" in *hand-run*) NEED_HR=1 ;; esac
   done <<<"$ROOT_PKG_LIST"
+  FEAT=""
+  if [[ -n "$NEED_BT" ]]; then FEAT="backend-tests"; fi
+  if [[ -n "$NEED_HR" ]]; then FEAT="${FEAT:+$FEAT,}hand-run"; fi
+  if [[ -n "$FEAT" ]]; then FEAT="--features $FEAT"; fi
   cargo clippy "${ARGS[@]}" $FEAT --all-targets -- -D warnings
 fi
 

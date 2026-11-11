@@ -45,10 +45,11 @@
 #   1. Pre-flight over the fork's own contour — the `default-members` selection
 #      in Cargo.toml, which already includes `mahbot-inference` — and nothing
 #      else: `cargo fmt --check`, `cargo clippy --all-targets --features
-#      backend-tests -- -D warnings`, `cargo test --release --no-fail-fast
-#      --features backend-tests`, each over that selection. Aborts if any fails.
-#      The out-of-scope backends are never built, so their test suites are never
-#      run: a defect in code this fork does not ship cannot stop a release.
+#      backend-tests,hand-run -- -D warnings`, `cargo test --release
+#      --no-fail-fast --features backend-tests,hand-run`, each over that
+#      selection. Aborts if any fails. The out-of-scope backends are never built,
+#      so their test suites are never run: a defect in code this fork does not
+#      ship cannot stop a release.
 #   2. Confirm prompt (skip with --yes; a run with nothing to read refuses).
 #   3. Per tier, publish each crate sequentially. After each crate:
 #        a. wait for the sparse index to report the new version
@@ -786,19 +787,20 @@ if (( ! NO_GATE )); then
     bold "[1/3] cargo fmt --check (the fork's contour)"
     cargo fmt "${FMT_ARGS[@]}" -- --check
 
-    bold "[2/3] cargo clippy --all-targets --features backend-tests -- -D warnings"
-    # `backend-tests`: the default test selection is a fast smoke set;
-    # a release gate wants every target.
-    cargo clippy --all-targets --features backend-tests -- -D warnings
+    bold "[2/3] cargo clippy --all-targets --features backend-tests,hand-run -- -D warnings"
+    # `backend-tests` and `hand-run`: the default test selection is a fast smoke
+    # set; a release gate wants every target.
+    cargo clippy --all-targets --features backend-tests,hand-run -- -D warnings
 
     # --no-fail-fast: cargo stops at the first failing *binary* otherwise, so a
     # single early break hides every later crate's result. A release gate wants
     # the whole picture in one run; the non-zero exit still aborts the publish.
     #
-    # --features backend-tests: the default test selection is a fast smoke set;
-    # a release gate wants everything, so ask for the gated test targets back.
-    bold "[3/3] cargo test --release --no-fail-fast --features backend-tests"
-    cargo test --release --no-fail-fast --features backend-tests
+    # --features backend-tests,hand-run: the default test selection is a fast
+    # smoke set; a release gate wants everything, so ask for the gated test
+    # targets back.
+    bold "[3/3] cargo test --release --no-fail-fast --features backend-tests,hand-run"
+    cargo test --release --no-fail-fast --features backend-tests,hand-run
     green "Pre-flight gates passed."
 fi
 

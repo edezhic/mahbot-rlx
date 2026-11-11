@@ -22,8 +22,8 @@
 //! `tts_code_predictor_frame`).
 //!
 //! Needs the synthesis pair installed; a machine without it skips. Run with
-//! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --test
-//! predictor_draft -- --ignored --nocapture`.
+//! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --features
+//! hand-run --test predictor_draft -- --ignored --nocapture`.
 
 use std::sync::Arc;
 

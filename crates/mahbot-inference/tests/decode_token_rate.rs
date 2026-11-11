@@ -7,8 +7,8 @@
 //! rather than asserting every time.
 //!
 //! ```text
-//! cargo test -p mahbot-inference --release --test decode_token_rate \
-//!     -- --ignored --nocapture
+//! cargo test -p mahbot-inference --release --features hand-run \
+//!     --test decode_token_rate -- --ignored --nocapture
 //! ```
 //!
 //! **Measurement only.** Nothing here pins a millisecond or a byte rate; the

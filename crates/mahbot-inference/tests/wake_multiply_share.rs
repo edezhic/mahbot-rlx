@@ -9,8 +9,8 @@
 //!
 //! Needs the installed model directory and the pinned corpus recording; a machine
 //! without them skips. Run with `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference
-//! --release --test wake_multiply_share -- --ignored --nocapture`, after `just
-//! throttle`.
+//! --release --features hand-run --test wake_multiply_share -- --ignored --nocapture`,
+//! after `just throttle`.
 //!
 //! **The instrument is the backend's own device clock**, never a wall clock: the
 //! child runs the product's paired pass ([`Listener::embed_pair`] — two scoring

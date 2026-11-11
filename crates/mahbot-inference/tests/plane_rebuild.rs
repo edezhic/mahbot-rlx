@@ -10,7 +10,8 @@
 //! grown graph's rows above them stay zero.
 //!
 //! Needs the installed model directory. Run with
-//! `cargo test --release -p mahbot-inference --test plane_rebuild -- --ignored --nocapture`.
+//! `cargo test --release -p mahbot-inference --features hand-run --test plane_rebuild
+//! -- --ignored --nocapture`.
 
 use std::sync::Arc;
 

@@ -25,9 +25,13 @@ documentation          = "https://docs.rs/mahbot-inference"
 # is ambiguous. The stand is the product entry point.
 default-run = "mahbot-inference"
 
+# The stand. `test = false`: its `main` is one delegation with no test in it, and
+# `cargo test` would otherwise link a harness that executes nothing. A test added
+# here drops this line.
 [[bin]]
 name = "mahbot-inference"
 path = "src/main.rs"
+test = false
 
 # The corpus run: the pinned real-audio recordings through the product's
 # transcription call, one row per recording. Deliberate, never automatic.
@@ -77,9 +81,61 @@ workspace = true
 # The wake-word bench, its corpus build and the transcription corpus run are
 # deliberate, never automatic: without this feature none of them is built.
 bench = []
+# The ten hand-run targets below. Every test in them is `#[ignore]`d, so a routine
+# `cargo test` would link and execute ten binaries that run nothing (207 MiB) and
+# pay each one's first-execution assessment; with the bin's `test = false` above,
+# that is 11 of the contour's 69 test binaries, so behind this feature the routine
+# run is 58. The feature is also what keeps them buildable, type-checked and
+# runnable: `just lint` and `just lint-mahbot` enable it, `just test-workspace`
+# enables it so the whole-set gate still reaches them, and each file's own doc
+# comment carries the command that runs it (`product_checks` names `just
+# test-product-checks`).
+hand-run = []
 
 [[bench]]
 name = "wake_word"
 harness = false
 # Kept out of a bare `cargo bench`: the run takes minutes and is started by hand.
 required-features = ["bench"]
+
+# The hand-run targets: `required-features` is what keeps a test target out of the
+# routine run while `cargo test --features hand-run --test <name>` still selects it.
+[[test]]
+name = "decode_token_rate"
+required-features = ["hand-run"]
+
+[[test]]
+name = "encoder_qkv"
+required-features = ["hand-run"]
+
+[[test]]
+name = "multiply_census"
+required-features = ["hand-run"]
+
+[[test]]
+name = "plane_rebuild"
+required-features = ["hand-run"]
+
+[[test]]
+name = "predictor_draft"
+required-features = ["hand-run"]
+
+[[test]]
+name = "product_checks"
+required-features = ["hand-run"]
+
+[[test]]
+name = "sound_decoder_cost"
+required-features = ["hand-run"]
+
+[[test]]
+name = "speak_readback"
+required-features = ["hand-run"]
+
+[[test]]
+name = "wake_multiply_share"
+required-features = ["hand-run"]
+
+[[test]]
+name = "wake_pair_cost"
+required-features = ["hand-run"]

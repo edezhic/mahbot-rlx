@@ -659,7 +659,7 @@ core model-agnostic.
 cargo build --release                         # this fork's contour: cpu + wgpu
 cargo build --release --workspace             # every member, all backends
 cargo build --release --features metal,mlx    # apple silicon GPU
-cargo test  --release --workspace --features backend-tests   # full workspace suite
+cargo test  --release --workspace --features backend-tests,hand-run   # full workspace suite
 ```
 
 A bare `cargo build` / `cargo test` at the root operates on this fork's

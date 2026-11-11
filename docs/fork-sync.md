@@ -98,7 +98,11 @@ Two things that whole-set run does not cover by itself. `test-workspace` is
 `cargo test --workspace`, which builds each member at its *default* features, so
 a target behind `required-features = "backend-tests"` is still skipped — the wgpu
 integration suite among them. `test-gpu` is what builds those, which is why
-`ci-workspace` names it.
+`ci-workspace` names it. `test-workspace` names one feature itself —
+`--features mahbot-inference/hand-run` — because that crate's ten hand-run
+targets were part of the whole-set run before they were gated (its manifest says
+why), and a whole-set run that stopped reaching them would lose coverage without
+saying so.
 
 `ci-workspace` has to be green on whatever host a sync happens to run on. A gate
 that is red out of the box is not a gate — a sync reads the red as a regression
