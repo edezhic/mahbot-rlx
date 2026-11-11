@@ -267,6 +267,11 @@ numbers:
   never against one take: this column moves by more between two takes of one
   unchanged binary than a sync is likely to move it.
 
+One change, a batched multi-row decode, asked for a decision on total peak. It did not
+ship, so the rule that total peak must not be higher stands unweakened. The figures are in
+[batched-decode.md](batched-decode.md), not here, and the next proposal needs its own
+measurement.
+
 ## 8. Records are files, and the comparison is paired takes
 
 `STAND.md`, `TRANSCRIPTION-CORPUS.md` and `WAKE-WORD-BENCH.md` at the repo root
