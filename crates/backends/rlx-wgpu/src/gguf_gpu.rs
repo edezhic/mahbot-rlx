@@ -1145,13 +1145,11 @@ pub fn coop_gemm_admits(
 /// `m`: the tile covers `ceil(m / 32) * 32` rows and spends the difference on
 /// nothing.
 ///
-/// The bound is what keeps a short, wide call off the tile. Its rate is 1.26-1.67x
-/// the row-grouped one on the product's own cells (the table in
-/// `dequant_gemm_coop_gguf.wgsl`'s header), so a call whose row count is rounded by
-/// more than about a third spends more arithmetic than the rate buys back — 16 rows
-/// would be padded to 32, doubling the work. A third leaves every product row count
-/// inside it (31 and 47 are 3 % and 27 %) and puts the tile's row floor at 22, which
-/// is also why no separate `m >= 16` term is needed.
+/// The bound is what keeps a short, wide call off the tile. A call whose row count is
+/// rounded by more than about a third spends more arithmetic than the rate buys back
+/// — 16 rows would be padded to 32, doubling the work. A third leaves every product
+/// row count inside it (31 and 47 are 3 % and 27 %) and puts the tile's row floor at
+/// 22, which is also why no separate `m >= 16` term is needed.
 const COOP_GEMM_MAX_PAD_DIVISOR: usize = 3;
 
 /// The fewest workgroups a cooperative-tile dispatch must have, from measurement.
@@ -1160,16 +1158,16 @@ const COOP_GEMM_MAX_PAD_DIVISOR: usize = 3;
 /// leaves few, and the tile's one pass over the packed weight per 32-row group
 /// only pays once enough workgroups are in flight to keep the device busy.
 /// Measured with `gguf_gemm_prefill_rate`'s round-robin pair (grouped ÷ coop, so
-/// above 1 is the cooperative tile's) over the cells the boundary runs through:
+/// above 1 is the cooperative tile's). The 8 and 16 rows are from the take that
+/// retired the floor of 8, so they predate the header cache; the 24 and 32 rows are
+/// the current take:
 ///
 /// | workgroups | cell | grouped ÷ coop |
 /// |---|---|---|
 /// | 8 | `q4k o m31 k2048 n1024` | 0.55x |
 /// | 16 | `q4k o m31 k2048 n2048` | 0.83x |
-/// | 24 | `q4k o m95 k2048 n1024` | 1.04x |
-/// | 24 | `q8_0 enc-down m96 k4096 n1024` | 1.17x |
-/// | 32 | `q4k o m31 k2048 n4096` | 1.14x |
-/// | 48 | `q4k o m95 k2048 n2048` | 1.37x |
+/// | 24 | `q4k o m95 k2048 n1024` | 1.15x |
+/// | 32 | `q4k o m31 k2048 n4096` | 1.22x |
 ///
 /// So the floor is 24: every product cell at or above it wins, and the two below
 /// it (the body's `o` at the 128-frame rung, 16, and a 1 024-column projection at

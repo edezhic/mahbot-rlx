@@ -43,6 +43,7 @@ use crate::graphs;
 use crate::host;
 use crate::listen;
 use crate::loader::{Pair, Role};
+use crate::report;
 use crate::tokenizer::Tokenizer;
 use crate::vad;
 
@@ -648,13 +649,16 @@ impl Transcriber {
         } else {
             audio16
         };
+        let t_tag = report::Stopwatch::start();
         let mel = self
             .tagger
             .log_mel(signal)
             .context("the tagger's log-mel")?;
         let tags = self.tagger.tags(&mel).context("the tagger's windows")?;
+        let tagger_ms = t_tag.ms();
 
         // Where the speech is, how it is cut, and how the cuts tile the input.
+        let t_plan = report::Stopwatch::start();
         let mut detector = earshot::Detector::default();
         let mask = vad::speech_mask(audio16, &mut detector);
         let mut spans = Vec::new();
@@ -684,14 +688,33 @@ impl Transcriber {
             .flat_map(|span| cut(span, audio16))
             .collect();
         let plan = tile_indexed(&chunk_list, audio16.len());
+        let vad_ms = t_plan.ms();
 
         // Each chunk read once, on its own prompt, and its words kept only where the guards
         // stand behind them.
-        let answers: Vec<Option<String>> =
-            read_pieces(&self.pair, &self.tokenizer, audio16, &chunk_list)?
-                .into_iter()
-                .map(|(_, answer)| answer)
-                .collect();
+        let (walk, answers) = read_pieces(&self.pair, &self.tokenizer, audio16, &chunk_list)?;
+        // The recognition phase split, on stderr when `MAHBOT_PHASE_SPLIT` is set: the
+        // front, prefill and decode are separate graphs, summed by `Walk::pieces`. The
+        // value is read truthily, as `rlx_ir::env::flag` spells it: `=0`, `=false`,
+        // `=off` and `=no` are off.
+        let split = std::env::var("MAHBOT_PHASE_SPLIT").is_ok_and(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        });
+        if split {
+            let decode_ms: f64 = walk.decode_times.iter().sum();
+            eprintln!(
+                "phases: tagger {tagger_ms:.1} ms · vad+plan {vad_ms:.1} ms · encoder front \
+                 {:.1} ms · prefill {:.1} ms · decode {decode_ms:.1} ms over {} tokens · build \
+                 {:.1} ms",
+                walk.front_ms,
+                walk.prefill_ms,
+                walk.decode_times.len(),
+                walk.build_ms,
+            );
+        }
 
         // The plan's regions, each with the answer that speaks for it: a speech
         // region takes its own chunk's transcript (the plan carries the index, so
@@ -840,13 +863,13 @@ pub(crate) fn read_whole(
     if pieces.len() == 1 {
         return listen::Clip::once(pair, tokenizer, frames_of(audio.len()))?.run(audio);
     }
-    let readings = read_pieces(pair, tokenizer, &audio, &pieces)?;
-    Ok(listen::Walk::pieces(frames_of(audio.len()), readings))
+    Ok(read_pieces(pair, tokenizer, &audio, &pieces)?.0)
 }
 
-/// Every chunk of a plan read once, in the plan's own order, each with its guarded reading
-/// — `None` where the guards refuse it or the walk ran out of its own budget, so a refused
-/// piece contributes no words.
+/// Every chunk of a plan read once, in the plan's own order: the joined walk
+/// ([`listen::Walk::pieces`]) and the chunks' guarded readings — `None` where the
+/// guards refuse one or the walk ran out of its own budget, so a refused piece
+/// contributes no words.
 ///
 /// The chunks are grouped by the rung their graphs are compiled at, so a plan whose chunks
 /// share a rung — most of them, since a full piece is always the same length — compiles
@@ -860,7 +883,7 @@ fn read_pieces(
     tokenizer: &Tokenizer,
     audio: &[f32],
     chunks: &[Span],
-) -> Result<Vec<(listen::Walk, Option<String>)>> {
+) -> Result<(listen::Walk, Vec<Option<String>>)> {
     let mut shapes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (index, chunk) in chunks.iter().enumerate() {
         shapes.entry(chunk_frames(*chunk)?).or_default().push(index);
@@ -892,7 +915,9 @@ fn read_pieces(
         drop(clip);
     }
     readings.sort_unstable_by_key(|&(index, _)| index);
-    Ok(readings.into_iter().map(|(_, reading)| reading).collect())
+    let pieces: Vec<(listen::Walk, Option<String>)> =
+        readings.into_iter().map(|(_, reading)| reading).collect();
+    Ok(listen::Walk::pieces(frames_of(audio.len()), pieces))
 }
 
 /// The frame count a chunk's graphs are compiled at: its own length rounded up to the

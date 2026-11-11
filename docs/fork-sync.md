@@ -304,6 +304,10 @@ Comparing a sync against the previous take:
 is how a take can be checked without editing the tree; a subset run
 (`mahbot-inference 0 3`) prints its rows and writes nothing.
 
+`MAHBOT_PHASE_SPLIT=1` prints one recognition call's phase split — tagger, VAD and
+plan, encoder front, prompt prefill and decode — on stderr. No record carries it:
+the six-row stand measures whole calls.
+
 ## 9. Re-pin, do not widen
 
 Numerical results move, because upstream changes arithmetic and a sync changes

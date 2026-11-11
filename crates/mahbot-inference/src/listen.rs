@@ -670,15 +670,27 @@ pub struct Walk {
     pub values: Vec<f32>,
     /// Milliseconds spent building graphs.
     pub build_ms: f64,
+    /// Milliseconds the front end ran — its mel, encoder and projector graphs, the
+    /// phase between the audio and the prompt prefill — the waits for their shared
+    /// graphs' locks included.
+    pub front_ms: f64,
+    /// Milliseconds the prompt prefill ran, the wait for a shared graph's lock
+    /// included.
+    pub prefill_ms: f64,
     /// One entry per generated token: the row's own price.
     pub decode_times: Vec<f64>,
 }
 
 impl Walk {
     /// One reading from the pieces' own, in piece order: the lists concatenated, the counts
-    /// and the build time summed, `capacity` the widest any piece's decode grew to, `next`
-    /// the last piece's, and `text` the readings the caller kept, a space between.
-    pub(crate) fn pieces(frames: usize, pieces: Vec<(Walk, Option<String>)>) -> Walk {
+    /// and the three phase times summed, `capacity` the widest any piece's decode grew to,
+    /// `next` the last piece's, and `text` the readings the caller kept, a space between.
+    /// The pieces' answers come back too, in the same order, so a caller that needs them
+    /// does not clone them out of the input.
+    pub(crate) fn pieces(
+        frames: usize,
+        pieces: Vec<(Walk, Option<String>)>,
+    ) -> (Walk, Vec<Option<String>>) {
         let mut read = Walk {
             frames,
             prompt_rows: 0,
@@ -689,11 +701,16 @@ impl Walk {
             text: String::new(),
             values: Vec::new(),
             build_ms: 0.0,
+            front_ms: 0.0,
+            prefill_ms: 0.0,
             decode_times: Vec::new(),
         };
         let mut readings: Vec<String> = Vec::new();
+        let mut answers = Vec::with_capacity(pieces.len());
         for (walk, answer) in pieces {
             read.build_ms += walk.build_ms;
+            read.front_ms += walk.front_ms;
+            read.prefill_ms += walk.prefill_ms;
             read.prompt_rows += walk.prompt_rows;
             read.capacity = read.capacity.max(walk.capacity);
             read.truncated |= walk.truncated;
@@ -701,12 +718,13 @@ impl Walk {
             read.values.extend(walk.values);
             read.decode_times.extend(walk.decode_times);
             read.next = walk.next;
-            if let Some(answer) = answer {
+            if let Some(answer) = &answer {
                 readings.push(answer.trim().to_string());
             }
+            answers.push(answer);
         }
         read.text = readings.join(" ");
-        read
+        (read, answers)
     }
 }
 
@@ -904,23 +922,29 @@ impl<'a> Clip<'a> {
         let mut capacity = self.capacity;
         let mut build_ms = std::mem::take(&mut self.owed_ms);
 
-        let projected = match &self.shared {
-            Some(rung) => rung.front.run(audio)?,
+        let (projected, front_ms) = match &self.shared {
+            Some(rung) => {
+                let t = report::Stopwatch::start();
+                let out = rung.front.run(audio)?;
+                (out, t.ms())
+            }
             None => {
                 if self.front.is_none() {
                     let t = report::Stopwatch::start();
                     self.front = Some(Front::build(&self.pair, frames, 1).context("front build")?);
                     build_ms += t.ms();
                 }
+                let t = report::Stopwatch::start();
                 let out = self
                     .front
                     .as_ref()
                     .expect("the front end was built just above")
                     .run(audio)?;
+                let ms = t.ms();
                 if !self.reuse_front {
                     self.front = None;
                 }
-                out
+                (out, ms)
             }
         };
 
@@ -964,15 +988,17 @@ impl<'a> Clip<'a> {
             ("cos".into(), cos.iter().map(|v| *v as f32).collect()),
             ("sin".into(), sin.iter().map(|v| *v as f32).collect()),
         ];
-        let p = match &self.shared {
+        let (p, prefill_ms) = match &self.shared {
             Some(rung) => {
                 let t = report::Stopwatch::start();
                 let prefill = rung.prefill()?;
                 build_ms += t.ms();
-                prefill
+                let t = report::Stopwatch::start();
+                let out = prefill
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .run(&inputs)
+                    .run(&inputs);
+                (out, t.ms())
             }
             None => {
                 let mut prefill = {
@@ -981,9 +1007,11 @@ impl<'a> Clip<'a> {
                     build_ms += t.ms();
                     prefill
                 };
+                let t = report::Stopwatch::start();
                 let p = prefill.run(&inputs);
+                let ms = t.ms();
                 drop(prefill);
-                p
+                (p, ms)
             }
         };
         // The decode is one whole-body graph on a per-layer plane cache: each
@@ -1113,6 +1141,8 @@ impl<'a> Clip<'a> {
             text,
             values,
             build_ms,
+            front_ms,
+            prefill_ms,
             decode_times,
         })
     }
@@ -1159,9 +1189,11 @@ mod tests {
             text: String::new(),
             values: vec![next as f32],
             build_ms: 10.0,
+            front_ms: 2.0,
+            prefill_ms: 3.0,
             decode_times: vec![1.0],
         };
-        let read = Walk::pieces(
+        let (read, answers) = Walk::pieces(
             192,
             vec![
                 (piece(95, 16, 7, false), Some("first".to_string())),
@@ -1170,9 +1202,16 @@ mod tests {
                 (piece(95, 8, 11, false), Some("third".to_string())),
             ],
         );
+        assert_eq!(
+            answers,
+            [Some("first".to_string()), None, Some("third".to_string())],
+            "the answers come back in piece order"
+        );
         assert_eq!(read.frames, 192);
         assert_eq!(read.prompt_rows, 280);
         assert_eq!(read.build_ms, 30.0);
+        assert_eq!(read.front_ms, 6.0, "the pieces' front ends, summed");
+        assert_eq!(read.prefill_ms, 9.0, "the pieces' prefills, summed");
         assert_eq!(read.capacity, 32, "the widest piece's decode");
         assert_eq!(read.next, 11, "the last piece's");
         assert!(read.truncated, "one piece ran out");

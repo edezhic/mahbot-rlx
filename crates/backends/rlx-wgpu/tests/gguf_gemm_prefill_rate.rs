@@ -34,9 +34,8 @@
 //! A cell's two sides are timed in **adjacent rounds of the same process**, not in
 //! two runs with the lever toggled between them. This box's per-round spread on
 //! these cells runs to 95 % on the shortest rung, so a run-to-run difference of the
-//! size the pair is here to report — the cooperative tile is 1.26-1.67x the
-//! row-grouped one on these cells, `dequant_gemm_coop_gguf.wgsl`'s header table — is
-//! not resolvable across two runs at all, while within one window it is a ratio of
+//! size the pair is here to report (per `dequant_gemm_coop_gguf.wgsl`'s header table)
+//! is not resolvable across two runs at all, while within one window it is a ratio of
 //! two figures taken under the same load, in the same round-robin, on the same graph.
 //!
 //! The lever is **read per call, by the encoder, at run time**: `coop_gemm_admits`
@@ -106,7 +105,7 @@
 //! it is used: a cell's two sides land in **adjacent turns of the same round**, so
 //! the ratio is two figures taken under the same load in one window rather than two
 //! runs' difference — this box's per-round spread on these cells runs to 95 % on the
-//! shortest rung, so the 1.26-1.67x the pair reports is not resolvable across two
+//! shortest rung, so the ratio the pair reports is not resolvable across two
 //! runs at all. Holding both sides alive costs `STEPS x packed_bytes` of device
 //! memory each, summed, which the file prints before the timed rounds.
 //!

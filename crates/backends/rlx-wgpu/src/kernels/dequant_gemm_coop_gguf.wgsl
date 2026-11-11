@@ -18,56 +18,59 @@
 //
 // `dequant_gemm_gguf.wgsl` accumulates in f32 scalars, one per output row, and is
 // limited by that arithmetic: at the row counts the product's prompt prefill
-// actually runs (31-111 rows, 95 typical) it measures 0.94-1.42 TFLOP/s on the
-// stand's M3 Pro across the three schemes. That is about a quarter of this
-// adapter's f32 peak and it is not a memory limit — the same measurement shows the
-// weight bytes accounting for at most a third of the call. This entry point moves
-// the accumulation onto the matrix units, whose f16-operand/f32-accumulator form
-// measures 3.07-3.66 TFLOP/s on the same adapter (`matmul_coop_f16_f32acc.wgsl`'s
-// header carries that table), and keeps the weight in its packed form: the decode
-// happens per staged tile, in workgroup memory, so no f16 copy of the weight is
-// ever materialised in device memory.
+// actually runs (31-111 rows, 95 typical) it measures 0.99-1.51 TFLOP/s on the
+// stand's M3 Pro across the three schemes. It is not a memory limit — the same
+// measurement shows the weight bytes accounting for at most a third of the call.
+// This entry point moves the accumulation onto the matrix units, whose
+// f16-operand/f32-accumulator form measures 3.07-3.66 TFLOP/s at m 8192 on the same
+// adapter (`matmul_coop_f16_f32acc.wgsl`'s header carries that table), and keeps the
+// weight in its packed form: the decode happens per staged tile, in workgroup memory,
+// so no f16 copy of the weight is ever materialised in device memory.
 //
 // ── WHAT IT MEASURES ────────────────────────────────────────────────────────
 //
 // `tests/gguf_gemm_prefill_rate.rs`, Apple M3 Pro, release, the **pair** — both
-// tiles on the same cells in adjacent rounds of one process, median of five rounds
-// of three calls — TFLOP/s at the product's own prefill row counts, this entry point
-// against `dequant_gemm_gguf.wgsl`'s row-grouped tile:
+// tiles on the same cells in adjacent rounds of one process, the `median_TFLOPs` of
+// five rounds of three calls, one take (a re-take moves a rate by a few percent and a
+// ratio by up to a tenth) — TFLOP/s at the product's own prefill row counts, this
+// entry point against `dequant_gemm_gguf.wgsl`'s row-grouped tile:
 //
-//   q4k qkv      m 95 k 2048 n  4096    1.92   against 1.33   (1.44x)
-//   q4k o        m 95 k 2048 n  2048    1.62   against 1.22   (1.33x)
-//   q4k gate/up  m 95 k 2048 n 12288    2.34   against 1.42   (1.65x)
-//   q6k down     m 95 k 6144 n  2048    1.57   against 0.94   (1.67x)
-//   q8_0 enc     m 96 k 1024 n  4096    1.73   against 1.11   (1.56x)
-//   q4k gate/up  m 31/47/63/79/95/111   1.86 / 1.72 / 2.23 / 1.99 / 2.34 / 2.12
-//                                        against 1.33 / 1.37 / 1.39 / 1.41 / 1.42 / 1.42
-//                                        (1.40x / 1.26x / 1.60x / 1.41x / 1.65x / 1.49x)
+//   q4k qkv      m 95 k 2048 n  4096    2.24   against 1.42   (1.58x)
+//   q4k o        m 95 k 2048 n  2048    1.86   against 1.29   (1.44x)
+//   q4k gate/up  m 95 k 2048 n 12288    2.68   against 1.51   (1.77x)
+//   q6k down     m 95 k 6144 n  2048    1.74   against 0.99   (1.76x)
+//   q8_0 enc     m 96 k 1024 n  4096    1.86   against 1.10   (1.69x)
+//   q4k gate/up  m 31/47/63/79/95/111   2.16 / 1.99 / 2.56 / 2.29 / 2.69 / 2.44
+//                                        against 1.42 / 1.44 / 1.49 / 1.49 / 1.50 / 1.51
+//                                        (1.52x / 1.38x / 1.72x / 1.54x / 1.79x / 1.62x)
 //
-// The sawtooth in that last row is the 32-row tile's own, and the ratio tracks it
-// almost exactly: 31, 63 and 95 rows are one, two and three whole tiles (3 %, 2 % and
-// 1 % of the dispatch spent on rows past `m`), while 47 and 79 round up to two and
-// three tiles of a 64- and 96-row dispatch (27 % and 18 %), and 111 to four of a 128
-// (13 %). So the two rungs the tile gains least on are the two most rounded, which is
-// what `COOP_GEMM_MAX_PAD_DIVISOR` in `gguf_gpu.rs` is the floor of.
+// The sawtooth in that last row is the 32-row tile's own: 31, 63 and 95 rows are one,
+// two and three whole tiles (3 %, 2 % and 1 % of the dispatch spent on rows past `m`),
+// while 47 and 79 round up to two and three tiles of a 64- and 96-row dispatch (27 %
+// and 18 %), and 111 to four of a 128 (13 %). The m 95 sweep cell is a second
+// independent build of the same shape — the harness's repeatability witness, 2.69
+// against the table's 2.68. The endpoint is what the floor rests on: 47, the most
+// rounded, is the weakest rung at 1.38x, which is what `COOP_GEMM_MAX_PAD_DIVISOR` in
+// `gguf_gpu.rs` is the floor of.
 //
 // The encoder's own rate is the file's other reading, and it is the one that moved
 // the floor: `q8_0 enc-down` at m 96 k 4096 n 1024 is eight column tiles by three
 // row tiles — 24 workgroups, `COOP_MIN_WORKGROUPS` itself — so it ran the
 // row-grouped tile while the floor was 48 and the pair read 1.00x, a repeatability
 // witness rather than a comparison. At the floor of 24 it takes the cooperative
-// tile and the pair reads 1.17x.
+// tile and the pair reads 1.21x.
 //
 // The end-to-end figure the tile buys is the recognition stand row (`STAND.md`'s
-// `recognition.typical`): 3.2 s warm, against 3.53 s for the same row with
-// `RLX_WGPU_GEMM_COOP_DISABLE=1`. The prompt prefill is ~28 % of that call.
+// `recognition.typical`): about 0.4 s faster warm with the tile than with
+// `RLX_WGPU_GEMM_COOP_DISABLE=1` (3.04 s warm, median of three alternating takes
+// each). The prompt prefill is about a quarter of that call, which is why the tile's
+// 1.77x on the cell reaches the row as ~12 %.
 //
-// That is short of the 3.07-3.66 the 64-row cooperative form reaches, and the
-// reason is structural rather than a tuning miss: a 32-row tile over a 6 KiB
-// workgroup budget allows 16 accumulators per subgroup where the 64-row form
-// allows 32, and both terms are the ones `matmul_coop_f16_f32acc.wgsl` measures as
-// the lever. Trading the row tile back up to 64 buys the rate and spends more than
-// it on the rounding (below), which is why this form is the one shipped.
+// The row outcome of the header cache is smaller: its +5-6 % on the cell reaches
+// recognition long as about 1.2 % by median (0.3 % paired) against a round spread of
+// about 5 %. The prompt prefill is 24 % of the long row and the in-shader decode is
+// 14 % of the cell, so even removing the whole decode caps at ~3.4 % at the row. The
+// cell win is real; the row move is inside the noise.
 //
 // ── THE TILE ────────────────────────────────────────────────────────────────
 //
@@ -76,19 +79,23 @@
 // sub-tiles, 16 f32 accumulators per subgroup, one decoded column per thread. The
 // load-to-MMA ratio is 8/TM + 8/TN_s = 0.5 per MMA.
 //
-// Four subgroups rather than two, measured: the same 32×128 tile over two
-// subgroups (32 accumulators each, ratio 0.375) read 1.91 TFLOP/s on the gate/up
-// cell, and over four read 2.34 — the wider accumulator file does not pay for the
-// warps it costs. What the warps buy is latency hiding at the 6 KiB of workgroup
-// storage below, and it is the term this form is most sensitive to.
+// Four subgroups rather than two, measured: the same 32×128 tile over two subgroups
+// (32 accumulators each, ratio 0.375) is 1.22x slower on the gate/up cell — the
+// wider accumulator file does not pay for the warps it costs. What the warps buy is
+// latency hiding at the 6 KiB of workgroup storage below, and it is the term this
+// form is most sensitive to.
 //
 // The row tile is 32 and not 64 because the shapes are 22-111 rows: a 64-row tile
 // rounds a 95-row prompt up to 128 rows of arithmetic, which is 35 % of the work
-// spent on nothing. A 32-row tile rounds it to 96 — and the encoder clamps the
-// last tile's row base to `m - 32` rather than rounding, so a tile never reaches
-// past the output tensor and the overlap is recomputed rather than written. The
-// row tile cannot go below 32: 16 rows per subgroup would put the load-to-MMA
-// ratio at 0.75 and halve the arithmetic each staged weight tile is reused for.
+// spent on nothing. It is not a constant bump either: a 64-row A stage is two
+// ping-pong 64x16 f16 panels, 4 KiB against today's 2 KiB, which puts the tile at
+// 8 448 B — past the 8 KiB residency cliff below — so a taller row tile is a
+// restructuring of the operand stage, not a loop bound. A 32-row tile rounds it to
+// 96 — and the encoder clamps the last tile's row base to `m - 32` rather than
+// rounding, so a tile never reaches past the output tensor and the overlap is
+// recomputed rather than written. The row tile cannot go below 32: 16 rows per
+// subgroup would put the load-to-MMA ratio at 0.75 and halve the arithmetic each
+// staged weight tile is reused for.
 //
 // ── WHAT IT COSTS IN WORKGROUP STORAGE ──────────────────────────────────────
 //
@@ -104,12 +111,34 @@
 // the bank period lost for the same reason: on the two-subgroup form this one
 // replaced it read 21.5 against 20.0 ms.
 //
-// ── THE DECODE'S SHARE ──────────────────────────────────────────────────────
+// ── THE DECODE'S SHARE, AND WHAT A CHEAPER UNPACK BUYS ───────────────────────
 //
-// Per stage a workgroup decodes 16 × 128 weights — 16 per thread for Q4_K, four
-// packed words — and runs 4 × 4 × 4 × 2 = 128 MMAs, 32 per subgroup. Removing the
-// decode's global loads whole leaves the cell at 2.4 TFLOP/s against 2.34 with
-// them, so the decode is not what bounds this form; the matrix units are.
+// A variant of THIS kernel whose decode stores a constant — same tile, barriers and
+// stores, no packed reads and no unpack — is the decode's ceiling: at m 95 k 2048
+// n 12288 it read **3.11 TFLOP/s against the shipped 2.68**, so the decode is about
+// 14 % of the cell and the only lever left at this shape — the tile and its two
+// barriers per stage are already inside that 3.11. The distance beyond it to the
+// dense form's 3.07-3.66 (a different kernel over a half-precision mirror at m 8192)
+// is m and operand, not this tile. The Q6_K `down` cell is dearest (2.53 against
+// 1.74, 31 %); the encoder's Q8_0 cells sit at 14-23 %. The variant is not in the
+// tree; reproduce it by replacing each `decode_b_*` body's `b_put` argument with
+// `vec4(1.0)`, which leaves the tile, the barriers and the stores untouched.
+//
+// The cheap part is the per-block header, which the row-grouped entry hoists per block
+// and this form recomputed per stage before the cache below. Caching it (`hdr_*`,
+// keyed on the block's byte offset) is worth **+5-6 % on every Q4_K cell and +3-5 %
+// on Q6_K/Q8_0**, bit-exact, and it is what this form ships; the table above is a
+// post-cache take. The rest does not yield to a cheaper spelling: a `vec4` Q6_K unpack
+// measured 0, issuing the stage's loads a stage ahead measured 0, and caching the
+// per-sub-block `(scale, min)` pair — eight more f32 registers — read 2.55 against
+// 2.68. The header cache above is not a counterexample: it spends registers to remove
+// *global loads*, a per-block cost amortised over the block's stages (sixteen for the
+// 256-element blocks, two for Q8_0's 32). Spending registers to remove per-stage
+// arithmetic is what loses here — the residue is the decode's register footprint, not
+// its instruction count. Reaching the ceiling needs the decode's operands out of
+// registers, and no lever tried gets them there: the one obvious place to spend, more
+// workgroup memory (a second B panel, above), is measured slower because the extra
+// 4 KiB crosses the 8 KiB residency cliff.
 //
 // ── LAYOUT CONVENTION (read before editing) ─────────────────────────────────
 //
@@ -331,6 +360,28 @@ fn b_put(k0: u32, col: u32, v: vec4<f32>) {
     b_stage[(k0 + 3u) * B_STRIDE + col] = f16(v.w);
 }
 
+// A block's header, cached across the stages that read it. `off` is constant for
+// every stage inside one packing block — 16 of them for the two K-quants, two for
+// Q8_0 — and the stage loop below would otherwise re-read and re-parse it per
+// stage. The row-grouped entry point already hoists it per block; this carries the
+// same fact to the cooperative one, where a stage's decode is between two barriers
+// and every instruction in it is on the critical path. Keyed on the byte offset (a
+// stage of one block has one offset; a different block changes it), and holding
+// only the block-invariant part: Q4_K's `d`, `dmin` and three scale words, Q6_K's
+// and Q8_0's `d`. The per-sub-block constants are still derived per stage.
+//
+// The three decoders share one cache, which is sound only because exactly one
+// scheme decodes per dispatch and a thread's `off` names one block of one column:
+// an arm that decoded two schemes, or a second weight operand with its own offset
+// base, would reuse another scheme's header and return wrong weights rather than
+// fail. A second operand needs its own `hdr_*` set.
+var<private> hdr_off: u32 = 0xFFFFFFFFu;
+var<private> hdr_d: f32;
+var<private> hdr_dmin: f32;
+var<private> hdr_scw0: u32;
+var<private> hdr_scw1: u32;
+var<private> hdr_scw2: u32;
+
 /// Q4_K: 144 bytes / 256 elements. The stage covers half of one 32-element
 /// sub-block, whose 16 weights are four packed words' low nibbles (an even
 /// sub-block) or high nibbles (an odd one).
@@ -341,9 +392,18 @@ fn decode_b_q4k(k_off: u32, wcol: u32, bcol: u32) {
     let t = within / 32u;
     let half = within % 32u;                 // 0 or 16
     let off = (wcol * nbk + b) * 144u;
-    let d = f16_bits_to_f32(read_u32(off) & 0xFFFFu);
-    let dmin = f16_bits_to_f32(read_u32(off) >> 16u);
-    let sm = q4k_scale_min(read_u32(off + 4u), read_u32(off + 8u), read_u32(off + 12u), t);
+    if (hdr_off != off) {
+        hdr_off = off;
+        let h = read_u32(off);
+        hdr_d = f16_bits_to_f32(h & 0xFFFFu);
+        hdr_dmin = f16_bits_to_f32(h >> 16u);
+        hdr_scw0 = read_u32(off + 4u);
+        hdr_scw1 = read_u32(off + 8u);
+        hdr_scw2 = read_u32(off + 12u);
+    }
+    let d = hdr_d;
+    let dmin = hdr_dmin;
+    let sm = q4k_scale_min(hdr_scw0, hdr_scw1, hdr_scw2, t);
     // `q4k_nibbles` yields `nibble / DQ_UNORM`; folding the divisor into the two
     // per-sub-block constants keeps each weight to one `fma`, as the row-grouped
     // entry's arms do.
@@ -367,7 +427,11 @@ fn decode_b_q6k(k_off: u32, wcol: u32, bcol: u32) {
     let q = (within % 128u) / 32u;
     let half = within % 32u;                 // 0 or 16
     let off = (wcol * nbk + b) * 210u;
-    let d = dq_read_f16(off + 208u);
+    if (hdr_off != off) {
+        hdr_off = off;
+        hdr_d = dq_read_f16(off + 208u);
+    }
+    let d = hdr_d;
     let sc = d * f32(read_w_i8(off + 192u + h * 8u + half / 16u + 2u * q));
     let ql = off + h * 64u + (q % 2u) * 32u + half;
     let qh = off + 128u + h * 32u + half;
@@ -384,7 +448,11 @@ fn decode_b_q8_0(k_off: u32, wcol: u32, bcol: u32) {
     let b = k_off / 32u;
     let half = k_off % 32u;                  // 0 or 16
     let off = (wcol * nbk + b) * 34u;
-    let d = dq_read_f16(off);
+    if (hdr_off != off) {
+        hdr_off = off;
+        hdr_d = dq_read_f16(off);
+    }
+    let d = hdr_d;
     let dq = vec4<f32>(d * DQ_UNORM);
     let bias = vec4<f32>(-Q8_0_BIAS * d);
     let qs = off + 2u + half;
