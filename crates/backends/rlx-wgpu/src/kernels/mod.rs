@@ -303,6 +303,81 @@ pub const DEQUANT_GEMV_GGUF_WGSL: &str = {
 /// The whole `dequant_gemv_gguf.wgsl`: the two shared-memory entry points and the
 /// subgroup arm below the marker (see [`DEQUANT_GEMV_GGUF_WGSL`]).
 pub const DEQUANT_GEMV_GGUF_WIDE_WGSL: &str = include_str!("dequant_gemv_gguf.wgsl");
+/// The f16 decode's hardware spelling, spliced over the software block the two
+/// constants above carry between the `dq_f16` markers on a device whose shader
+/// compiler admits it — see [`dequant_gemv_gguf_wgsl`]. Inline rather than a
+/// `.wgsl` file: it is a fragment, not a module.
+const DEQUANT_GEMV_GGUF_F16_WGSL: &str = r#"// <<< dq_f16
+fn dq_read_f16_pair(word: u32) -> vec2<f32> {
+    return unpack2x16float(word);
+}
+
+fn dq_read_f16(rel: u32) -> f32 {
+    return unpack2x16float(read_w(rel) | (read_w(rel + 1u) << 8u)).x;
+}
+// >>> dq_f16
+"#;
+
+/// The text between `source`'s `dq_f16` markers.
+///
+/// A `find` where [`marker_at`] cuts at compile time: this cut's answer depends on
+/// the adapter, so it cannot be a `const`, and it runs once per kernel build behind
+/// a `OnceLock`. The text it returns is validated by `gguf_gpu`'s
+/// `one_row_sources_match_the_shader_geometry_and_capabilities`.
+fn dq_f16_block(source: &'static str) -> &'static str {
+    const OPEN: &str = "// <<< dq_f16\n";
+    const CLOSE: &str = "// >>> dq_f16\n";
+    let start = source.find(OPEN).expect("the dq_f16 marker's open line") + OPEN.len();
+    let end = start
+        + source[start..]
+            .find(CLOSE)
+            .expect("the dq_f16 marker's close line");
+    &source[start..end]
+}
+
+/// Which spelling of the f16 decode pair a source carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum F16Decode {
+    /// `dq_f16_bits`: exact for every finite value, subnormals included, and no
+    /// device capability.
+    Software,
+    /// `unpack2x16float`: one instruction per pair, admitted only under
+    /// `SHADER_FLOAT16_IN_FLOAT32`.
+    Hardware,
+}
+
+/// The one-row packed multiply's source for [`F16Decode`]'s spelling, whole
+/// (`wide`) or up to the subgroup marker: the constants above with the f16 decode
+/// block replaced by [`DEQUANT_GEMV_GGUF_F16_WGSL`]'s hardware pair where
+/// [`F16Decode::Hardware`].
+pub(crate) fn gemv_gguf_source(wide: bool, f16: F16Decode) -> std::borrow::Cow<'static, str> {
+    let base = if wide {
+        DEQUANT_GEMV_GGUF_WIDE_WGSL
+    } else {
+        DEQUANT_GEMV_GGUF_WGSL
+    };
+    if f16 == F16Decode::Software {
+        return base.into();
+    }
+    base.replace(dq_f16_block(base), dq_f16_block(DEQUANT_GEMV_GGUF_F16_WGSL))
+        .into()
+}
+
+/// [`gemv_gguf_source`] for this process's adapter: the hardware spelling where
+/// [`crate::device::shader_f16_in_f32_supported`] says its shader compiler admits
+/// the unpack builtin, the software pair where it does not. The answer comes from
+/// the singleton, not the caller's device (`Device` exposes no downlevel flags), on
+/// the crate's one-device-per-process rule — the argument
+/// [`crate::device::device_queue`] makes.
+pub(crate) fn dequant_gemv_gguf_wgsl(wide: bool) -> std::borrow::Cow<'static, str> {
+    let f16 = if crate::device::shader_f16_in_f32_supported() {
+        F16Decode::Hardware
+    } else {
+        F16Decode::Software
+    };
+    gemv_gguf_source(wide, f16)
+}
+
 /// The shader that reads the adapter's real subgroup width and how many of them
 /// one 128-invocation workgroup (the wide arm's width) holds.
 ///
@@ -6344,10 +6419,11 @@ pub fn matmul_bt_kernel(device: &wgpu::Device) -> &'static Kernel {
 }
 pub fn dequant_gemv_gguf_kernel(device: &wgpu::Device) -> &'static Kernel {
     DEQUANT_GEMV_GGUF.get_or_init(|| {
+        let source = dequant_gemv_gguf_wgsl(false);
         build_kernel_ro_u_ro_rw(
             device,
             "rlx-wgpu dequant_gemv_gguf",
-            DEQUANT_GEMV_GGUF_WGSL,
+            &source,
             "dequant_gemv",
             true,
         )
@@ -6358,10 +6434,11 @@ pub fn dequant_gemv_gguf_kernel(device: &wgpu::Device) -> &'static Kernel {
 /// column's contraction.
 pub fn dequant_gemv_gguf_tiled_kernel(device: &wgpu::Device) -> &'static Kernel {
     DEQUANT_GEMV_GGUF_TILED.get_or_init(|| {
+        let source = dequant_gemv_gguf_wgsl(false);
         build_kernel_ro_u_ro_rw(
             device,
             "rlx-wgpu dequant_gemv_gguf_tiled",
-            DEQUANT_GEMV_GGUF_WGSL,
+            &source,
             "dequant_gemv_tiled",
             true,
         )
@@ -6371,18 +6448,19 @@ pub fn dequant_gemv_gguf_tiled_kernel(device: &wgpu::Device) -> &'static Kernel 
 /// reduced by one whole subgroup, `GEMV_WIDE_THREADS` invocations per workgroup,
 /// the lane partials combined by `subgroupAdd`.
 ///
-/// Built from [`DEQUANT_GEMV_GGUF_WIDE_WGSL`] (the whole file) rather than
-/// [`DEQUANT_GEMV_GGUF_WGSL`] (the file up to this arm's marker): only the wide
-/// module names a subgroup built-in, and wgpu refuses such a module without
-/// `Features::SUBGROUP`. The caller reaches this constructor only after
-/// `gguf_gpu::gemv_subgroup_probe` has read a width on a device carrying the
+/// Built from the whole file ([`DEQUANT_GEMV_GGUF_WIDE_WGSL`], with the f16 block
+/// spliced where the adapter admits it) rather than the prefix up to this arm's
+/// marker: only the wide module names a subgroup built-in, and wgpu refuses such a
+/// module without `Features::SUBGROUP`. The caller reaches this constructor only
+/// after `gguf_gpu::gemv_subgroup_probe` has read a width on a device carrying the
 /// feature.
 pub fn dequant_gemv_gguf_wide_kernel(device: &wgpu::Device) -> &'static Kernel {
     DEQUANT_GEMV_GGUF_WIDE.get_or_init(|| {
+        let source = dequant_gemv_gguf_wgsl(true);
         build_kernel_ro_u_ro_rw(
             device,
             "rlx-wgpu dequant_gemv_gguf_wide",
-            DEQUANT_GEMV_GGUF_WIDE_WGSL,
+            &source,
             "dequant_gemv_wide",
             true,
         )
@@ -6396,10 +6474,11 @@ pub fn dequant_gemv_gguf_wide_kernel(device: &wgpu::Device) -> &'static Kernel {
 /// workgroups.
 pub fn dequant_gemv_gguf_wide_ilp_kernel(device: &wgpu::Device) -> &'static Kernel {
     DEQUANT_GEMV_GGUF_WIDE_ILP.get_or_init(|| {
+        let source = dequant_gemv_gguf_wgsl(true);
         build_kernel_ro_u_ro_rw(
             device,
             "rlx-wgpu dequant_gemv_gguf_wide_ilp",
-            DEQUANT_GEMV_GGUF_WIDE_WGSL,
+            &source,
             "dequant_gemv_wide_ilp",
             true,
         )

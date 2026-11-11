@@ -407,6 +407,25 @@ pub(crate) fn device_queue() -> Option<&'static wgpu::Queue> {
     wgpu_device().map(|d| &d.queue)
 }
 
+/// Whether the shader compiler admits 16-bit floats inside 32-bit arithmetic —
+/// naga's `SHADER_FLOAT16_IN_FLOAT32`, the capability `unpack2x16float` needs.
+///
+/// Not the same bit as `Features::SHADER_F16`, which gates the `f16` *type*: wgpu
+/// maps the unpack builtin's capability from the adapter's
+/// `DownlevelFlags::SHADER_F16_IN_F32` (`wgpu-naga-bridge`'s
+/// `features_to_naga_capabilities`), and `Device` exposes no downlevel flags, so
+/// this reads the singleton's adapter — the same one-device-per-process argument
+/// [`device_queue`] makes. `false` without a device, which selects the spelling
+/// that needs no capability.
+pub(crate) fn shader_f16_in_f32_supported() -> bool {
+    wgpu_device().is_some_and(|d| {
+        d.adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::SHADER_F16_IN_F32)
+    })
+}
+
 static FAST_MATH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Opt into fast WGSL arithmetic: `/`, `sqrt` and `1/sqrt` use the native

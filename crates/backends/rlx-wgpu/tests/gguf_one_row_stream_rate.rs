@@ -180,30 +180,41 @@
 //! them multiplies) over 1 341 MiB, so the frame's next step is how many
 //! dispatches it issues, not the shape of any one of them.
 //!
-//! # The conforming binding layout
+//! # The weight binding's granularity, measured
 //!
 //! The one-row arm used to bind the X window twice and the weight window twice
 //! (as `array<f32>`/`array<vec4<f32>>` and `array<u32>`/`array<vec4<u32>>`), which
 //! WebGPU's "bind groups alias a writable resource" rule forbids and this driver
-//! happens not to enforce. Each window is now bound once, the weight as a single
-//! `array<vec4<u32>>` every scheme reads in 16-byte legs (`read_w16`), so the
-//! comparison below measures the scalar-word layout that change replaced.
+//! happens not to enforce. Each window is now bound once. Which *granularity* that
+//! one weight binding uses is a separate question, and it was answered by a paired
+//! A/B in one session: the same shader, one build with `@binding(2)` declared
+//! `array<u32>` (a 16-byte leg assembled from whole words) and one with
+//! `array<vec4<u32>>` (the leg fetched as one 16-byte group), alternated six times
+//! per form with the order reversed every other round, warm-up discarded, median of
+//! the paired differences.
 //!
-//! **That comparison is not resolvable from this cell**, and it is recorded as
-//! bounded rather than measured. Across two windows of the same day the Q4_K forms'
-//! medians read 4-12 % lower after it (4-bit FFN gate 69.8 → 67.1, predictor block
-//! 60.9 → 53.4, wide n 78.9 → 72.0, widened x8 102.0 → 81.6), while the Q6_K and
-//! Q8_0 forms, whose read paths it did not touch then, read unchanged (6-bit
-//! recognition head 79.0 → 78.9, 8-bit predictor down 38.9 → 38.3). Two windows
-//! cannot separate a 5-10 % kernel cost from this machine's per-form drift, which the
-//! narrow forms show at up to 30 %, and no paired A/B against the old layout was
-//! taken — it would need the old shader built beside the new one. What is measured on
-//! the largest consumer is the cell: the talker body, half Q4_K by bytes, went 20.33 →
-//! 21.32 ms a frame (+4.9 %) between the same two windows. Reading a block's header
-//! from workgroup memory instead (as the word view did, four header words per block
-//! down to one) was implemented, found flat to negative — the eight lanes of a block
-//! issue those words at identical addresses inside one wave, which the memory system
-//! already coalesces — and reverted.
+//! The group read is **ahead on Q4_K** by 2.2-4.5 % (4-bit FFN gate +3.2, widened
+//! x8 +3.4, predictor block +3.2, wide n +2.2, attention k/v +3.9, FFN down +2.6,
+//! gate+up body +4.5): its 144-byte block stride keeps every leg on a 16-byte
+//! boundary, so one group read is exactly one leg. It is **behind on Q6_K by
+//! 6.9-14.3 %** (attention v -14.3, FFN down -10.8, output head -9.5, recognition
+//! head -6.9) and **on Q8_0 by 1.3-10.8 %** (predictor down -10.8, width 3072 -6.7,
+//! head -5.9, ffn down -4.1, width 4096 -4.0, gate+up -3.9, attn_out -3.8,
+//! block k=2048 -2.9, widened x8 -1.3): their 210- and 34-byte strides put a leg off
+//! a 16-byte boundary, where a group read fetches two groups for one leg while the word
+//! form fetches only the words the leg straddles. On the harness's token figure —
+//! `token_ms` at its written fill — the word form is 0.34 ms ahead in a 13.5 ms token
+//! (paired, six rounds with the order reversed every other round), so the module binds
+//! words. That is the mechanism, not a comparison: the stride decides the alignment,
+//! and the alignment decides which granularity over-fetches.
+//! The kernel header's `token_ms` figure and per-form cells answer a different
+//! question — the three changes against `bda1d348` — and are a later take in another
+//! session, so neither is a second reading of this figure or of these cells.
+//!
+//! Reading a block's header from workgroup memory instead (as the word view did,
+//! four header words per block down to one) was implemented, found flat to negative
+//! — the eight lanes of a block issue those words at identical addresses inside one
+//! wave, which the memory system already coalesces — and reverted.
 //!
 //! # The per-call floor against the per-step stream
 //!

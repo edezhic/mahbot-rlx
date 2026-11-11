@@ -2,57 +2,52 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! A packed weight whose **last row ends off a 16-byte boundary** still computes its
-//! tail column.
+//! A packed weight whose **last row's last access ends two bytes past its rows**
+//! still computes its tail column.
 //!
-//! The one-row multiply decodes a block as 16-byte legs (`read_w16`), and a leg that
-//! does not start on a group boundary is assembled from the two groups it straddles,
-//! so the fetch of a block's last leg reaches one group past the bytes it consumes.
-//! The weight binding is therefore cut on a 16-byte boundary from the last row's end
-//! (`gguf_gpu::gemv_weight_window`), and the weight buffer under it has to end on one
-//! too: `Arena::from_plan_split` sizes it and its shards that way. A window clamped to a
-//! four-byte-rounded buffer instead (which is what the weight buffer used to be) leaves
-//! that second group outside the binding — where a robust access answers zeros, and the
-//! tail column reads a zero scale.
+//! `gguf_gpu::gemv_weight_window` carries the reach and why the cut is 16 rather than
+//! 4. This file is the fixture for it, in both crossing shapes: **seven** 210-byte Q6_K
+//! rows (1 470 bytes) and **three** 34-byte Q8_0 blocks (102 bytes), each ending two
+//! bytes off a word boundary. Reverting the round-up makes this file die at bind-group
+//! creation with
+//! `Effective buffer binding size 1470 for storage buffers is expected to align to 4`,
+//! which is what makes the fixtures non-vacuous.
 //!
-//! Q6_K's 210-byte rows are what make the case reachable: six of them are 1 260 bytes,
-//! so the last row's packed bytes end 12 bytes into a group. A packed `U8` param of this
-//! size is parked in the weight buffer (`Arena::from_plan_split` puts a param there until
-//! it outgrows one weight shard), so that is the buffer whose sizing this pins — and it
-//! used to be rounded to four bytes, which is exactly the 1 260-byte end above.
-//! Reverting that rounding turns this case into `gemv_weight_window`'s refusal rather
-//! than a wrong tail column, which is the loud failure the assertion is for. Nothing
-//! about the served models is needed to see it, and nothing about them is claimed
-//! here — this file is the fixture, not a measurement.
+//! A packed `U8` param of this size is parked in the weight buffer
+//! (`Arena::from_plan_split` puts a param there until it outgrows one weight shard),
+//! so that is the buffer whose sizing this pins. Nothing about the served models is
+//! needed to see it, and nothing about them is claimed here — this file is the
+//! fixture, not a measurement.
 mod common;
 
 use common::max_abs_diff;
+use rlx_gguf::GgmlType;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
 use rlx_runtime::{Device, Session};
 
-/// One Q6_K `[n, k]` weight, its packed bytes and its `[1, k]` activation row. `k` is
-/// a whole number of the scheme's 256-element blocks, so the packed weight is
-/// `210 * k / 256 * n` bytes.
-fn case(k: usize, n: usize) -> (Graph, Vec<u8>, Vec<f32>) {
+/// One packed `[n, k]` weight, its bytes and its `[1, k]` activation row. `k` is a
+/// whole number of the scheme's blocks, so the packed weight is `row_bytes * n`. The
+/// scheme comes from the packing type rather than a second argument, so a fixture
+/// cannot name one scheme and pack another.
+fn case(ggml: GgmlType, k: usize, n: usize) -> (Graph, Vec<u8>, Vec<f32>, QuantScheme) {
+    let scheme = rlx_gguf::quant_scheme(ggml).expect("a packed-quant dtype");
     let w_row: Vec<f32> = (0..k * n)
         .map(|i| ((i as f32) * 0.011).sin() * 0.5)
         .collect();
-    let packed = rlx_gguf::quantize(&w_row, rlx_gguf::GgmlType::Q6K).expect("quantize");
+    let packed = rlx_gguf::quantize(&w_row, ggml).expect("quantize");
     let x: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.017).sin()).collect();
 
     let mut g = Graph::new("wgpu_gguf_gemv_tail");
     let x_in = g.input("x", Shape::new(&[1, k], DType::F32));
     let w = g.param("w", Shape::new(&[packed.len()], DType::U8));
     let y = g.add_node(
-        Op::DequantMatMul {
-            scheme: QuantScheme::GgufQ6K,
-        },
+        Op::DequantMatMul { scheme },
         vec![x_in, w],
         Shape::new(&[1, n], DType::F32),
     );
     g.set_outputs(vec![y]);
-    (g, packed, x)
+    (g, packed, x, scheme)
 }
 
 fn run(device: Device, g: Graph, packed: &[u8], x: &[f32]) -> Vec<f32> {
@@ -61,50 +56,75 @@ fn run(device: Device, g: Graph, packed: &[u8], x: &[f32]) -> Vec<f32> {
     c.run(&[("x", x)]).remove(0)
 }
 
-#[test]
-fn a_weight_whose_last_row_ends_off_16_computes_its_tail_column() {
-    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
-        return;
-    }
-    // `k = 256` is one Q6_K block, so the rows are 210 bytes each and six of them are
-    // 1 260: the premise of the fixture, asserted rather than assumed — a quantizer
-    // that padded a row to 16 would make the case vacuous.
-    let (k, n) = (256usize, 6usize);
-    let (g, packed, x) = case(k, n);
-    assert_eq!(packed.len(), 210 * n, "Q6_K's row stride");
-    assert_ne!(
-        packed.len() % 16,
-        0,
-        "the fixture needs a weight whose last row ends off a 16-byte boundary"
+/// One fixture: `n` rows of `row_bytes`, ending two bytes off a word boundary, which
+/// the one-row device arm must serve and match the CPU on.
+fn tail_column_survives_a_crossing_last_access(
+    ggml: GgmlType,
+    k: usize,
+    n: usize,
+    row_bytes: usize,
+) {
+    let (g, packed, x, scheme) = case(ggml, k, n);
+    // The premise, asserted rather than assumed: a row stride that padded to 16, or a
+    // count that ended the rows 4-aligned, would make the case vacuous.
+    assert_eq!(packed.len(), row_bytes * n, "{scheme:?}: the row stride");
+    assert_eq!(
+        packed.len() % 4,
+        2,
+        "{scheme:?}: the fixture needs the rows to end two bytes off a word boundary, \
+         or their last access stays inside them"
     );
 
     let cpu = run(Device::Cpu, g.clone(), &packed, &x);
-    // Which arm answered: the record is written by the one-row device route only, so
-    // an empty record would mean this case fell back to the host and pinned nothing.
+    // Which arm answered, per cell: the record is written by the one-row device route
+    // only, and it is cleared here, so a value left by another cell cannot satisfy the
+    // assertion. The recorded dispatch must also cover this fixture's width, which ties
+    // the record to this cell's call rather than to any one-row dispatch at all.
     rlx_wgpu::gguf_gpu::reset_gemv_one_row_shape();
     let gpu = run(Device::Gpu, g, &packed, &x);
+    let shape = rlx_wgpu::gguf_gpu::gemv_one_row_shape().unwrap_or_else(|| {
+        panic!(
+            "{scheme:?}: the one-row device arm must serve this shape, or the tail \
+             column is computed by a route whose window this file does not pin"
+        )
+    });
     assert!(
-        rlx_wgpu::gguf_gpu::gemv_one_row_shape().is_some(),
-        "the one-row device arm must serve this shape, or the tail column is computed \
-         by a route whose window this file does not pin"
+        (shape.workgroups * shape.cols_per_workgroup) as usize >= n,
+        "{scheme:?}: the recorded dispatch covers {} columns, short of the fixture's {n}",
+        shape.workgroups * shape.cols_per_workgroup
     );
     assert!(
         gpu.iter().all(|v| v.is_finite()),
-        "the tail column left a non-finite value: {gpu:?}"
+        "{scheme:?}: the tail column left a non-finite value: {gpu:?}"
     );
     let diff = max_abs_diff(&gpu, &cpu);
     assert!(
         diff <= 1e-2,
-        "a weight whose last row ends off 16 must still compute its tail column — the \
-         window is cut on the 16-byte boundary, not at the row's last byte (max|diff| \
-         {diff:e}, gpu {gpu:?}, cpu {cpu:?})"
+        "{scheme:?}: a weight whose last access reads one word past its rows must \
+         still compute its tail column — the window is cut on the 16-byte boundary, \
+         not at the row's last byte (max|diff| {diff:e}, gpu {gpu:?}, cpu {cpu:?})"
     );
     // The last row is the one the window's end covers: name it, so a failure is never
     // read as a general parity drift.
     assert!(
         (gpu[n - 1] - cpu[n - 1]).abs() <= 1e-2,
-        "the last column (the row at the window's end) read {} against the CPU's {}",
+        "{scheme:?}: the last column (the row at the window's end) read {} against \
+         the CPU's {}",
         gpu[n - 1],
         cpu[n - 1]
     );
+}
+
+#[test]
+fn a_weight_whose_last_access_crosses_the_row_end_computes_its_tail_column() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
+        return;
+    }
+    // One `#[test]` on purpose, as in `gguf_gemv_wide_arm`: the shape record read
+    // above is process-global, so a second cell overwrites it — each cell clears it
+    // before its dispatch and the width assertion ties the record to its own call.
+    // The two crossing shapes: the last Q6_K row's `d`, and the last Q8_0 block's
+    // second quant leg.
+    tail_column_survives_a_crossing_last_access(GgmlType::Q6K, 256, 7, 210);
+    tail_column_survives_a_crossing_last_access(GgmlType::Q8_0, 32, 3, 34);
 }

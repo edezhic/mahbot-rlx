@@ -24,8 +24,9 @@
 //       - Q8_0: one whole block — its 32 i8 quants and the f16 `d` at their head
 //         — so a row holds `k / 32` units rather than the K-quants' eight per
 //         256-element block, and this branch counts them itself. Its 34-byte
-//         block stride puts every odd block's `d` and quants two bytes off a word
-//         boundary, which `read_w16`'s two-group assembly covers.
+//         stride puts one of the block's two fields two bytes off a word boundary
+//         in every block, so both are fetched from whole words (`read_w` keeps one
+//         byte; `read_w16` carries which field and the word count).
 //       - Q6_K: the 16-byte half of a quarter's 32-byte `ql` span, read at BOTH
 //         of that span's nibble sets — byte `t` of the span holds element `t` of
 //         quarter `q` in one nibble and of quarter `q ^ 2` in the other, so the
@@ -40,24 +41,78 @@
 //         mins then cancel against partial sums belonging to different scales:
 //         that cover overshoots the one-row parity bar the k=256 cell of
 //         `tests/gguf_batch_join.rs` asserts (1e-2). The sub-block cover is kept
-//         for this scheme. Its header is one 16-byte leg per unit (`read_w16`)
+//         for this scheme. Its header is one 16-byte read per unit (`read_w16`)
 //         instead of the six or seven one-byte loads it replaced: the block is
-//         144 bytes, so that leg sits on a group boundary and requests the whole
-//         header — once per unit, eight times per block, header bytes requested
-//         up and loads down.
+//         144 bytes, so that read sits 4-aligned and requests the whole header —
+//         once per unit, eight times per block, header bytes requested up and
+//         loads down.
 //
 //     Each scheme's block header is read from that scheme's own layout: Q4_K's
-//     16-byte header (two f16s then 12 scale/min bytes) as the four words of one
-//     16-byte leg parsed with shifts, Q6_K's (an f16 `d` and 16 i8 scales) and
-//     Q8_0's (an f16 `d` and its quants) as legs whose bytes are picked, with `d`
-//     read exactly at its two. Every leg is read 16 bytes at a time (`read_w16`) and
-//     assembled across two groups where its offset is not a group boundary — the
-//     blocks are 144, 210 and 34 bytes, so Q6_K's and Q8_0's legs land at two.
+//     16-byte header (two f16s then 12 scale/min bytes) as four words parsed with
+//     shifts, Q6_K's (an f16 `d` and 16 i8 scales) and Q8_0's (an f16 `d` and its
+//     quants) as words whose bytes are picked, with `d`'s value assembled from its
+//     two bytes.
+//
+//     Every 16-byte leg is assembled from whole `array<u32>` words by `read_w16`,
+//     whose doc carries the block strides and the word count.
+//     `tests/gguf_one_row_stream_rate.rs` carries the measured granularity of that
+//     binding, the per-form take behind it and the granularity take's own `token_ms`;
+//     the `token_ms` below is this change's.
 //
 //     The device work a one-row multiply issues is the row's own
 //     `columns x contraction`: at the model widths (1024…6144 columns) the
 //     one-thread-per-column shape left only 16…96 workgroups, far below what
 //     those widths can occupy.
+//
+//     What the decode costs now, on the token figure of
+//     `crates/mahbot-inference/tests/decode_token_rate.rs` — the whole 28-layer step
+//     at its shipped shape mix. Both legs are that harness's binary, which reads no
+//     model file, alternating from one directory in one session: `bda1d348` before (a
+//     `git worktree add <dir> bda1d348` reproduces it), this tree after — eight rounds,
+//     the order reversed every other round, one warm-up per binary discarded. The
+//     levels are the medians of the eight rounds per leg — **14.81 ms before, 13.35 ms
+//     after** — and the paired statistic is the median of the per-round differences,
+//     **−1.46 ms**, or **−9.8 %** as the median of the per-round ratios. The per-form
+//     stream rates, paired the same way over six rounds (levels are the medians of the
+//     runs' minima, the percentage the median of the per-round ratios): Q6_K's
+//     recognition head 118.8 → 133.9 GB/s (+12.6 %), the talker body's Q4_K gate+up
+//     98.6 → 108.6 (+9.8 %), every form faster (+0.9 % on the widened Q8_0 to +21.5 %
+//     on the predictor's narrow down), and the narrow attention k/v pair 61.6 → 63.2
+//     (+4.9 %) inside that form's own 23 % spread, so not a difference. The head is the
+//     widest dispatch the token issues (18 992 workgroups against the narrow
+//     multiplies' 128), so its level is a per-run best on the one form where dispatch
+//     width is not the limit — not a sustained rate, and not a level the narrow forms
+//     could reach by the same means.
+//
+//     Memory: the synthesis-typical row's peak moved 736.8 → 748.0 MiB system and
+//     1.99 → 2.06 GiB GPU, its resting pair did not (733.2 → 732.8 MiB, 1.50 GiB
+//     either side), and both peaks are inside the record's take-to-take spread — its
+//     eleven takes in the pair format read 736.8–836.2 MiB and 1.92–2.30 GiB, total
+//     2 722–3 181 MiB against this take's 2 857. Peak columns are sampled maxima that
+//     `docs/fork-sync.md` §8 says do not discriminate per take, so this is the
+//     sampler's movement, not an allocation the shader could add.
+//
+//     Two mechanisms are in play and this take does not separate them: the f16 scale
+//     decode, whose software form runs an `exp2` on the subnormal arm a Q6_K block's
+//     `d` almost always takes, and the vectorized spans, whose unpack-and-fma form is
+//     what the Q4_K and Q6_K inner loops now cost.
+//
+//     What still holds the narrow shapes in the old band is the dispatch width, not
+//     the decode — `tests/gguf_one_row_stream_rate.rs` carries that sweep. An
+//     intra-subgroup K-split is not the lever: it makes the already-narrow shapes
+//     narrower in the column direction while adding reduction work, and batching
+//     several of the token's narrow multiplies into one dispatch is what would move
+//     them. Preparing the packed weights for these models' fixed shape mix attacks the
+//     other half — a 2-byte-offset leg's word loads become one, and a block's
+//     header leaves the per-lane path, at the same byte count, for Q6_K and Q8_0 only
+//     (Q4_K's 144-byte stride is already 16-aligned) — and would move only the forms
+//     already in the band. It is deferred; its preparation is one pass over the models'
+//     1.05 GiB of packed weights, memcpy-bound so of the order of 0.3 s, which lands on
+//     the cold row unless cached to a derived file outside the read-only model root.
+//
+//     The wake path never reaches this arm: it scores the encoder and the tagger at
+//     more than one row on the grouped and cooperative routes, so the wake bench is
+//     not a gate on this kernel.
 //   * `dequant_gemv` (Q1_0): one thread per output column, as before. The 1-bit
 //     scheme's blocks are 128 elements with an 8-element sign byte, a different
 //     element/byte mapping than either K-quant, so it keeps this shape.
@@ -172,32 +227,34 @@ struct Params {
 // X shifted.
 @group(0) @binding(0) var<storage, read_write>  xarr4: array<vec4<f32>>;
 @group(0) @binding(1) var<uniform>              params: Params;
-// The packed weight window, 16 bytes at a time. Each scheme's decode reads a
-// block as a few contiguous 16-byte legs — Q4_K's header and its `qs` half, Q6_K's
-// `ql`/`qh` halves and its scale row, Q8_0's `d`-plus-quants — so one `vec4<u32>`
-// fetch carries what four word fetches carried before. The block strides put those
-// legs at a 4-byte (Q4_K's 144) or 2-byte (Q6_K's 210, Q8_0's 34) offset, so a leg
-// that does not start on a group boundary is assembled from the two groups it
-// straddles (`read_w16`), and byte-granular reads pick a byte out of their group.
-@group(0) @binding(2) var<storage, read_write>  warr4: array<vec4<u32>>;
+// The packed weight window, one 4-byte word at a time. Each scheme's decode reads
+// a block as a few contiguous 16-byte legs — Q4_K's header and its `qs` half,
+// Q6_K's `ql`/`qh` halves and its scale row, Q8_0's `d`-plus-quants — through
+// `read_w16`, which assembles a leg from whole words (its doc carries the block
+// strides and the word count). The header above carries the mechanism behind word
+// granularity and points at its measurement.
+@group(0) @binding(2) var<storage, read_write>  warr: array<u32>;
 @group(0) @binding(3) var<storage, read_write>  outarr: array<f32>;
 
 
 // The weight window's byte offset, set once at the top of every entry from
-// `params.w_byte_off`. The read helpers below index `warr4` through it.
+// `params.w_byte_off`. The read helpers below index `warr` through it.
 var<private> g_w_off: u32;
 
-// Component `n` of the 16-byte group pair `(a, b)` — one group's four words, then
-// the next group's — so `n` 0…7 walks two consecutive groups.
-fn wcomp(a: vec4<u32>, b: vec4<u32>, n: u32) -> u32 {
-    if (n >= 4u) { return b[n - 4u]; }
-    return a[n];
-}
-
-// The 16 packed-weight bytes at `rel` as four words. A leg on a group boundary is
-// the group itself; otherwise the two groups it straddles are fetched once each and
-// the words assembled from them — one 16-byte fetch per group instead of one 4-byte
-// fetch per word.
+// The 16 packed-weight bytes at `rel` as four words: the leg's four words when
+// `g_w_off + rel` is 4-aligned, and the five words it straddles when it is only
+// 2-aligned, assembled by shifts.
+//
+// Which legs land at two follows from the block strides and a 4-aligned window base
+// (the shipped row strides are all multiples of 16, so `g_w_off` is too). A Q8_0 block
+// is 34 bytes — a two-byte `d`, then its 32 quants — so block `b` starts at 34b:
+// 4-aligned for an even `b`, whose `d` is then word-aligned and whose quants (at +2
+// and +18) are two bytes off, and two bytes off for an odd `b`, whose `d` is then
+// 2-aligned and whose quants are word-aligned. So a Q8_0 quant leg is five words on an
+// even block and four on an odd one, and `d`'s two bytes are inside one word either
+// way. A Q6_K block is 210 bytes, so every odd block's legs land at two: four words on
+// an even block and five on an odd one. Q4_K's 144 bytes are a multiple of four, so its
+// legs never do.
 //
 // `g_w_off + rel` must be **even**: an odd leg would take the 2-aligned branch below
 // and shift every word by 16 bits. Every call site holds it — the block strides are
@@ -206,25 +263,20 @@ fn wcomp(a: vec4<u32>, b: vec4<u32>, n: u32) -> u32 {
 // of the contract, not something the picker repairs.
 fn read_w16(rel: u32) -> vec4<u32> {
     let abs = g_w_off + rel;
-    let a = warr4[abs >> 4u];
-    if ((abs & 15u) == 0u) { return a; }
-    let b = warr4[(abs >> 4u) + 1u];
-    let k = (abs >> 2u) & 3u;
-    // A 4-aligned leg keeps each word whole; a 2-aligned one (Q6_K's and Q8_0's
-    // odd blocks) takes each word's halves from two adjacent groups.
-    if ((abs & 3u) == 0u) {
-        return vec4<u32>(wcomp(a, b, k), wcomp(a, b, k + 1u),
-                         wcomp(a, b, k + 2u), wcomp(a, b, k + 3u));
-    }
-    return vec4<u32>((wcomp(a, b, k) >> 16u) | (wcomp(a, b, k + 1u) << 16u),
-                     (wcomp(a, b, k + 1u) >> 16u) | (wcomp(a, b, k + 2u) << 16u),
-                     (wcomp(a, b, k + 2u) >> 16u) | (wcomp(a, b, k + 3u) << 16u),
-                     (wcomp(a, b, k + 3u) >> 16u) | (wcomp(a, b, k + 4u) << 16u));
+    let w = abs >> 2u;
+    let a = warr[w];
+    let b = warr[w + 1u];
+    let c = warr[w + 2u];
+    let d = warr[w + 3u];
+    if ((abs & 3u) == 0u) { return vec4<u32>(a, b, c, d); }
+    let e = warr[w + 4u];
+    return vec4<u32>((a >> 16u) | (b << 16u), (b >> 16u) | (c << 16u),
+                     (c >> 16u) | (d << 16u), (d >> 16u) | (e << 16u));
 }
 
 fn read_w(rel: u32) -> u32 {
     let abs = g_w_off + rel;
-    return (warr4[abs >> 4u][(abs >> 2u) & 3u] >> ((abs & 3u) * 8u)) & 0xffu;
+    return (warr[abs >> 2u] >> ((abs & 3u) * 8u)) & 0xffu;
 }
 
 // Byte `i` (0…15) of one `read_w16` leg, sign-extended: Q6_K's block carries its
@@ -235,6 +287,28 @@ fn wbyte_i8(v: vec4<u32>, i: u32) -> i32 {
     return select(i32(b), i32(b) - 256, b >= 128u);
 }
 
+// A block's f16 scale, and the (scale, min) pair at the head of a Q4_K header.
+// The decode below has a second spelling, `DEQUANT_GEMV_GGUF_F16_WGSL` in
+// `kernels/mod.rs`: `unpack2x16float`, one instruction per pair, spliced over the
+// markers below on an adapter whose shader compiler admits it — the flag, and why it
+// is not `Features::SHADER_F16`, are `device::shader_f16_in_f32_supported`'s. The
+// software form stays the one every device compiles, this multiply being the decode
+// path of every product model.
+//
+// The hardware form is not bit-equivalent: WGSL lets a target flush an intermediate
+// of a Data Unpacking built-in to zero, and the f16 value being unpacked is that
+// intermediate, so a flushing target would decode a subnormal `d` as zero — for
+// Q6_K, a whole block at zero rather than a rounding — and `unpack2x16float` returns
+// a NaN payload as NaN where `dq_f16_bits` maps it to zero (a weight scale is never
+// one). Metal does not flush here, and the evidence stops at that adapter: the
+// one-row parity cell's drift (`gguf_gemv_wide_arm`, max abs 1.5e-5…7.6e-5 against
+// its 1e-2 bar) and the stand's and corpus's `equal=true` digests are both Metal
+// readings.
+// <<< dq_f16
+// One binary16 bit pattern as f32, in software: exact for every finite value,
+// subnormals included, and free of any device capability. The normal arm is one
+// `ldexp`; the subnormal arm — the one a Q6_K block's `d` takes almost always, its
+// scale sitting below f16's smallest normal — is an `exp2`.
 fn dq_f16_bits(bits: u32) -> f32 {
     let sign = (bits >> 15u) & 1u;
     let exp = (bits >> 10u) & 0x1Fu;
@@ -246,9 +320,14 @@ fn dq_f16_bits(bits: u32) -> f32 {
     return select(v, -v, sign != 0u);
 }
 
+fn dq_read_f16_pair(word: u32) -> vec2<f32> {
+    return vec2<f32>(dq_f16_bits(word & 0xffffu), dq_f16_bits(word >> 16u));
+}
+
 fn dq_read_f16(rel: u32) -> f32 {
     return dq_f16_bits(read_w(rel) | (read_w(rel + 1u) << 8u));
 }
+// >>> dq_f16
 
 // The (scale, min) pair of one Q4_K sub-block, out of the block header's one 16-byte
 // leg. After the two f16s (word `h0`, the block's `d` and
@@ -275,36 +354,45 @@ fn dq_q4k_sc_min(h1: u32, h2: u32, h3: u32, j: u32) -> vec2<u32> {
 
 // The four weights one Q4_K `qs` word carries for a unit's element set, `i`-th
 // first, dotted against that set's four X elements: the word and the set's one
-// vector load are consumed together.
-fn dq_q4k_span(word: u32, sh: u32, xv: vec4<f32>, d: f32, m: f32) -> f32 {
-    return xv.x * (d * f32((word >> sh) & 0x0Fu) - m)
-         + xv.y * (d * f32((word >> (8u + sh)) & 0x0Fu) - m)
-         + xv.z * (d * f32((word >> (16u + sh)) & 0x0Fu) - m)
-         + xv.w * (d * f32((word >> (24u + sh)) & 0x0Fu) - m);
+// vector load are consumed together. The nibbles come out of `unpack4x8unorm`
+// (one mask plus one unpack for four fields) as `nibble / 255`, so the caller
+// folds that divisor into the sub-block's scale once (`du`) and the min into one
+// vector (`nm`), and the whole span is one `fma` and one `dot` — the same trick,
+// and the same numerics, as the grouped Q4_K entry's `q4k_nibbles`
+// (`dequant_gemm_gguf.wgsl`). A per-element `d * f32(nibble) - m` costs four
+// shifts, four masks, four conversions and eight float ops for the same four
+// values.
+fn dq_q4k_span(word: u32, sh: u32, xv: vec4<f32>, du: vec4<f32>, nm: vec4<f32>) -> f32 {
+    return dot(xv, fma(unpack4x8unorm((word >> sh) & 0x0F0F0F0Fu), du, nm));
 }
+
+// `unpack4x8unorm`'s divisor, folded back into a sub-block's `d` once.
+const DQ_UNORM: f32 = 255.0;
 
 // The same for one Q6_K element set: `ql`/`qh` word pair, four low bits from
 // `ql`, two high bits from `qh`, biased by 32, times that set's scale. The four
 // elements' fields sit in the same byte of both words, so each word is masked
-// once and the two halves merged into one word before the four are unpacked.
+// once and the two halves merged into one word before the four are unpacked —
+// `unpack4x8unorm` then gives them as `byte / 255` and one `fma` puts the 255 and
+// the 32 bias back, so the four weights cost one unpack, one `fma` and one `dot`
+// instead of four shifts, four conversions and four subtracts. The `d` and the
+// set's scale are one multiply after the dot, as before.
 fn dq_q6k_span(qlw: u32, qhw: u32, sh: u32, qbits: u32, xv: vec4<f32>, scl: f32) -> f32 {
     let q = ((qlw >> sh) & 0x0F0F0F0Fu) | (((qhw >> qbits) & 0x03030303u) << 4u);
-    let q0 = f32(i32(q & 0xFFu) - 32);
-    let q1 = f32(i32((q >> 8u) & 0xFFu) - 32);
-    let q2 = f32(i32((q >> 16u) & 0xFFu) - 32);
-    let q3 = f32(i32(q >> 24u) - 32);
-    return (xv.x * q0 + xv.y * q1 + xv.z * q2 + xv.w * q3) * scl;
+    let w = fma(unpack4x8unorm(q), vec4<f32>(DQ_UNORM), vec4<f32>(-32.0));
+    return dot(xv, w) * scl;
 }
 
 // The same for one Q8_0 element set: the four signed quants of the `qs` word at
 // `w`, scaled by the block's `d` and multiplied against that set's four X
 // elements. The word is biased by 0x80 and read through `unpack4x8unorm` — exact,
-// where a signed unpack clamps the lowest quant (-128) at -1.0 — and the 255 and
-// the bias fold back out in one `fma`, the trick the grouped Q8_0 entry's
-// `q8_0_quants` uses (`dequant_gemm_gguf.wgsl`).
+// where a signed unpack clamps the lowest quant (-128) at -1.0 — and the unorm
+// divisor and the bias fold back out in one `fma`, the trick the grouped Q8_0
+// entry's `q8_0_quants` uses (`dequant_gemm_gguf.wgsl`).
 fn dq_q8_0_span(word: u32, xv: vec4<f32>, d: f32) -> f32 {
-    let q = fma(unpack4x8unorm(word ^ 0x80808080u), vec4<f32>(d * 255.0), vec4<f32>(-128.0 * d));
-    return xv.x * q.x + xv.y * q.y + xv.z * q.z + xv.w * q.w;
+    let q = fma(unpack4x8unorm(word ^ 0x80808080u), vec4<f32>(d * DQ_UNORM),
+                vec4<f32>(-128.0 * d));
+    return dot(xv, q);
 }
 
 // Packed bytes one block of each scheme occupies — what each branch offsets its
@@ -328,30 +416,34 @@ const Q8_0_BLK_BYTES: u32 = 34u;
 fn dq_q4k_unit(j0: u32, u: u32, nbk: u32, xb4: u32, second: bool) -> vec2<f32> {
     // Sub-block `sb = u % 8` of block `u / 8`: its 32 elements are one nibble set
     // of byte `l` of the block's 32-byte `qs` group `sb / 2` — the low nibble for
-    // even `sb`, the high one for odd — one 16-byte leg each. The block's header
+    // even `sb`, the high one for odd — one 16-byte read each. The block's header
     // (`d`/`dmin` as two f16s, then 12 scale/min bytes) is its first 16 bytes, so
-    // it is one leg too; a 144-byte block stride keeps both on group boundaries.
+    // it is one read too; a 144-byte block stride keeps both 4-aligned.
     let off0 = (j0 * nbk + u / 8u) * Q4_K_BLK_BYTES;
     let sb = u % 8u;
     let h = read_w16(off0);
+    let dm0 = dq_read_f16_pair(h.x);
     let sm0 = dq_q4k_sc_min(h.y, h.z, h.w, sb);
-    let d0 = dq_f16_bits(h.x & 0xFFFFu) * f32(sm0.x);
-    let m0 = dq_f16_bits(h.x >> 16u) * f32(sm0.y);
     let qs0 = off0 + 16u + 32u * (sb / 2u);
     let q0a = read_w16(qs0);
     let q0b = read_w16(qs0 + 16u);
     let e4 = u * 8u;
     let sh = select(0u, 4u, (sb % 2u) == 1u);
-    var d1 = 0.0;
-    var m1 = 0.0;
+    // The sub-block's two constants in the forms the span consumes: `d` with
+    // `unpack4x8unorm`'s divisor folded in, and the min negated.
+    let du0 = vec4<f32>(dm0.x * f32(sm0.x) * DQ_UNORM);
+    let nm0 = vec4<f32>(-dm0.y * f32(sm0.y));
+    var du1 = vec4<f32>(0.0);
+    var nm1 = vec4<f32>(0.0);
     var q1a = vec4<u32>(0u);
     var q1b = vec4<u32>(0u);
     if (second) {
         let off1 = off0 + nbk * Q4_K_BLK_BYTES;
         let g = read_w16(off1);
+        let dm1 = dq_read_f16_pair(g.x);
         let sm1 = dq_q4k_sc_min(g.y, g.z, g.w, sb);
-        d1 = dq_f16_bits(g.x & 0xFFFFu) * f32(sm1.x);
-        m1 = dq_f16_bits(g.x >> 16u) * f32(sm1.y);
+        du1 = vec4<f32>(dm1.x * f32(sm1.x) * DQ_UNORM);
+        nm1 = vec4<f32>(-dm1.y * f32(sm1.y));
         let qs1 = off1 + 16u + 32u * (sb / 2u);
         q1a = read_w16(qs1);
         q1b = read_w16(qs1 + 16u);
@@ -365,22 +457,22 @@ fn dq_q4k_unit(j0: u32, u: u32, nbk: u32, xb4: u32, second: bool) -> vec2<f32> {
     if (second) {
         for (var w: u32 = 0u; w < 4u; w = w + 1u) {
             let xv = xarr4[xb4 + e4 + w];
-            acc0 = acc0 + dq_q4k_span(q0a[w], sh, xv, d0, m0);
-            acc1 = acc1 + dq_q4k_span(q1a[w], sh, xv, d1, m1);
+            acc0 = acc0 + dq_q4k_span(q0a[w], sh, xv, du0, nm0);
+            acc1 = acc1 + dq_q4k_span(q1a[w], sh, xv, du1, nm1);
         }
         for (var w: u32 = 0u; w < 4u; w = w + 1u) {
             let xv = xarr4[xb4 + e4 + 4u + w];
-            acc0 = acc0 + dq_q4k_span(q0b[w], sh, xv, d0, m0);
-            acc1 = acc1 + dq_q4k_span(q1b[w], sh, xv, d1, m1);
+            acc0 = acc0 + dq_q4k_span(q0b[w], sh, xv, du0, nm0);
+            acc1 = acc1 + dq_q4k_span(q1b[w], sh, xv, du1, nm1);
         }
     } else {
         for (var w: u32 = 0u; w < 4u; w = w + 1u) {
             let xv = xarr4[xb4 + e4 + w];
-            acc0 = acc0 + dq_q4k_span(q0a[w], sh, xv, d0, m0);
+            acc0 = acc0 + dq_q4k_span(q0a[w], sh, xv, du0, nm0);
         }
         for (var w: u32 = 0u; w < 4u; w = w + 1u) {
             let xv = xarr4[xb4 + e4 + 4u + w];
-            acc0 = acc0 + dq_q4k_span(q0b[w], sh, xv, d0, m0);
+            acc0 = acc0 + dq_q4k_span(q0b[w], sh, xv, du0, nm0);
         }
     }
     return vec2<f32>(acc0, acc1);
@@ -402,35 +494,35 @@ fn dq_q4k_group(j0: u32, g: u32, nbk: u32, xb4: u32, second: bool) -> vec2<f32> 
     let off0 = (j0 * nbk + g / 4u) * Q4_K_BLK_BYTES;
     let gi = g % 4u;
     let h = read_w16(off0);
-    let dblk = dq_f16_bits(h.x & 0xFFFFu);
-    let mblk = dq_f16_bits(h.x >> 16u);
+    let dm0 = dq_read_f16_pair(h.x);
     let sm0 = dq_q4k_sc_min(h.y, h.z, h.w, 2u * gi);
     let sm1 = dq_q4k_sc_min(h.y, h.z, h.w, 2u * gi + 1u);
-    let d0 = dblk * f32(sm0.x);
-    let m0 = mblk * f32(sm0.y);
-    let d0o = dblk * f32(sm1.x);
-    let m0o = mblk * f32(sm1.y);
     let qs0 = off0 + 16u + 32u * gi;
     let q0a = read_w16(qs0);
     let q0b = read_w16(qs0 + 16u);
     let e4 = 16u * g;
-    var d1 = 0.0;
-    var m1 = 0.0;
-    var d1o = 0.0;
-    var m1o = 0.0;
+    // Both sub-blocks' constants, in the forms the span consumes (see
+    // `dq_q4k_unit`).
+    let du0 = vec4<f32>(dm0.x * f32(sm0.x) * DQ_UNORM);
+    let nm0 = vec4<f32>(-dm0.y * f32(sm0.y));
+    let du0o = vec4<f32>(dm0.x * f32(sm1.x) * DQ_UNORM);
+    let nm0o = vec4<f32>(-dm0.y * f32(sm1.y));
+    var du1 = vec4<f32>(0.0);
+    var nm1 = vec4<f32>(0.0);
+    var du1o = vec4<f32>(0.0);
+    var nm1o = vec4<f32>(0.0);
     var q1a = vec4<u32>(0u);
     var q1b = vec4<u32>(0u);
     if (second) {
         let off1 = off0 + nbk * Q4_K_BLK_BYTES;
         let h1 = read_w16(off1);
-        let dblk1 = dq_f16_bits(h1.x & 0xFFFFu);
-        let mblk1 = dq_f16_bits(h1.x >> 16u);
+        let dm1 = dq_read_f16_pair(h1.x);
         let sm10 = dq_q4k_sc_min(h1.y, h1.z, h1.w, 2u * gi);
         let sm11 = dq_q4k_sc_min(h1.y, h1.z, h1.w, 2u * gi + 1u);
-        d1 = dblk1 * f32(sm10.x);
-        m1 = mblk1 * f32(sm10.y);
-        d1o = dblk1 * f32(sm11.x);
-        m1o = mblk1 * f32(sm11.y);
+        du1 = vec4<f32>(dm1.x * f32(sm10.x) * DQ_UNORM);
+        nm1 = vec4<f32>(-dm1.y * f32(sm10.y));
+        du1o = vec4<f32>(dm1.x * f32(sm11.x) * DQ_UNORM);
+        nm1o = vec4<f32>(-dm1.y * f32(sm11.y));
         let qs1 = off1 + 16u + 32u * gi;
         q1a = read_w16(qs1);
         q1b = read_w16(qs1 + 16u);
@@ -447,31 +539,31 @@ fn dq_q4k_group(j0: u32, g: u32, nbk: u32, xb4: u32, second: bool) -> vec2<f32> 
         for (var w: u32 = 0u; w < 4u; w = w + 1u) {
             let xe = xarr4[xb4 + e4 + w];
             let xo = xarr4[xb4 + e4 + 8u + w];
-            acc0 = acc0 + dq_q4k_span(q0a[w], 0u, xe, d0, m0);
-            acc0o = acc0o + dq_q4k_span(q0a[w], 4u, xo, d0o, m0o);
-            acc1 = acc1 + dq_q4k_span(q1a[w], 0u, xe, d1, m1);
-            acc1o = acc1o + dq_q4k_span(q1a[w], 4u, xo, d1o, m1o);
+            acc0 = acc0 + dq_q4k_span(q0a[w], 0u, xe, du0, nm0);
+            acc0o = acc0o + dq_q4k_span(q0a[w], 4u, xo, du0o, nm0o);
+            acc1 = acc1 + dq_q4k_span(q1a[w], 0u, xe, du1, nm1);
+            acc1o = acc1o + dq_q4k_span(q1a[w], 4u, xo, du1o, nm1o);
         }
         for (var w: u32 = 0u; w < 4u; w = w + 1u) {
             let xe = xarr4[xb4 + e4 + 4u + w];
             let xo = xarr4[xb4 + e4 + 12u + w];
-            acc0 = acc0 + dq_q4k_span(q0b[w], 0u, xe, d0, m0);
-            acc0o = acc0o + dq_q4k_span(q0b[w], 4u, xo, d0o, m0o);
-            acc1 = acc1 + dq_q4k_span(q1b[w], 0u, xe, d1, m1);
-            acc1o = acc1o + dq_q4k_span(q1b[w], 4u, xo, d1o, m1o);
+            acc0 = acc0 + dq_q4k_span(q0b[w], 0u, xe, du0, nm0);
+            acc0o = acc0o + dq_q4k_span(q0b[w], 4u, xo, du0o, nm0o);
+            acc1 = acc1 + dq_q4k_span(q1b[w], 0u, xe, du1, nm1);
+            acc1o = acc1o + dq_q4k_span(q1b[w], 4u, xo, du1o, nm1o);
         }
     } else {
         for (var w: u32 = 0u; w < 4u; w = w + 1u) {
             let xe = xarr4[xb4 + e4 + w];
             let xo = xarr4[xb4 + e4 + 8u + w];
-            acc0 = acc0 + dq_q4k_span(q0a[w], 0u, xe, d0, m0);
-            acc0o = acc0o + dq_q4k_span(q0a[w], 4u, xo, d0o, m0o);
+            acc0 = acc0 + dq_q4k_span(q0a[w], 0u, xe, du0, nm0);
+            acc0o = acc0o + dq_q4k_span(q0a[w], 4u, xo, du0o, nm0o);
         }
         for (var w: u32 = 0u; w < 4u; w = w + 1u) {
             let xe = xarr4[xb4 + e4 + 4u + w];
             let xo = xarr4[xb4 + e4 + 12u + w];
-            acc0 = acc0 + dq_q4k_span(q0b[w], 0u, xe, d0, m0);
-            acc0o = acc0o + dq_q4k_span(q0b[w], 4u, xo, d0o, m0o);
+            acc0 = acc0 + dq_q4k_span(q0b[w], 0u, xe, du0, nm0);
+            acc0o = acc0o + dq_q4k_span(q0b[w], 4u, xo, du0o, nm0o);
         }
     }
     return vec2<f32>(acc0 + acc0o, acc1 + acc1o);
@@ -518,7 +610,12 @@ fn dq_q6k_unit(j0: u32, u: u32, nbk: u32, xb4: u32, second: bool) -> vec2<f32> {
     let qlb0 = off0 + h * 64u + (q % 2u) * 32u + 16u * rh;
     let qhb0 = off0 + 128u + h * 32u + 16u * rh;
     // The block's 16 i8 scales are one 16-byte leg, and the f16 `d` after it the
-    // two bytes after that leg — read exactly, so no access here leaves the block.
+    // two bytes after that leg. The scales leg never leaves the block — it spans
+    // 192–207, and a 2-aligned block's fetch stops at 209, the block's last byte — but
+    // `d` is two bytes, each taken out of a whole word (`read_w` fetches four and
+    // keeps one), so on a 4-aligned block the higher byte's word spans 208–211: two
+    // bytes past the block, still inside the row except at its last block, which is
+    // the reach the Rust side's 16-byte weight window covers (`gemv_weight_window`).
     let sc0 = read_w16(off0 + 192u);
     let d0 = dq_read_f16(off0 + 208u);
     let slo0 = d0 * f32(wbyte_i8(sc0, h * 8u + 2u * q + rh));
@@ -560,12 +657,10 @@ fn dq_q6k_unit(j0: u32, u: u32, nbk: u32, xb4: u32, second: bool) -> vec2<f32> {
 
 // The same for Q8_0, whose unit IS its block: the f16 `d` at the block's head and
 // its 32 i8 quants, so the row holds `q8blk = k / 32` units and the caller counts
-// them itself rather than through the K-quants' `nbk * 8`. Its 34-byte stride is
-// not a multiple of four, so half the (column, block) pairs put their quants two
-// bytes off a word boundary, and both 16-byte quant legs of a block are assembled
-// from the two groups they straddle. The second leg reaches up to 14 bytes past the
-// block's own 34, which is the over-read the Rust side's weight window covers: it
-// is cut on a 16-byte boundary (`gemv_weight_window`), not at the row's last byte.
+// them itself rather than through the K-quants' `nbk * 8`. Its 34-byte stride is not
+// a multiple of four, so a quant leg straddles a word boundary on every other block
+// (`read_w16` derives which, and the word count), and reaches at most two bytes past
+// the block's own 34 — the reach `gemv_weight_window`'s cut covers.
 fn dq_q8_0_unit(j0: u32, u: u32, q8blk: u32, xb4: u32, second: bool) -> vec2<f32> {
     let off0 = (j0 * q8blk + u) * Q8_0_BLK_BYTES;
     let d0 = dq_read_f16(off0);
@@ -688,8 +783,8 @@ fn dequant_gemv_tiled(
     let lane = lid.x;
     let xb4 = params.x_f32_off / 4u;  // X as vec4 groups (see `xarr4`)
     // Every scheme reads its packed blocks in 16-byte legs (`read_w16`): Q4_K's
-    // 144-byte stride keeps them on group boundaries, and the two 2-aligned strides
-    // (Q6_K's 210, Q8_0's 34) are assembled from the two groups a leg straddles.
+    // 144-byte stride keeps them 4-aligned, and Q6_K's 210 and Q8_0's 34 put a leg
+    // two bytes off a word boundary on every other block (`read_w16`'s doc derives it).
     var acc0 = 0.0;
     var acc1 = 0.0;
 
@@ -785,8 +880,8 @@ fn dequant_gemv_tiled(
 //
 // Threads one workgroup of `dequant_gemv_wide` runs — this entry's
 // `@workgroup_size` and the Rust side's `GEMV_WIDE_THREADS`.
-// `gguf_gpu::tests::wide_gemv_geometry_matches_the_shader` ties the two
-// spellings together.
+// `gguf_gpu::tests::one_row_sources_match_the_shader_geometry_and_capabilities`
+// ties the two spellings together.
 const WIDE_THREADS: u32 = 128u;
 
 // Output columns one workgroup of either entry covers — the Rust side's
@@ -826,8 +921,8 @@ fn dequant_gemv_wide(
         if (j >= params.n) { break; }
         var acc = 0.0;
 
-        // Q4_K's 144-byte stride keeps its words 4-aligned; Q6_K (210 B) and Q8_0
-        // (34 B) straddle groups, which `read_w16` assembles, as in the tiled arm.
+        // Q4_K's 144-byte stride keeps its legs 4-aligned; Q6_K (210 B) and Q8_0
+        // (34 B) straddle words, which `read_w16` assembles, as in the tiled arm.
         if (params.scheme_id == 0u) {
             acc = acc + dq_q4k_cover(j, sid, sg, nbk, xb4, false).x;
         } else if (params.scheme_id == 2u) {
@@ -854,7 +949,8 @@ fn dequant_gemv_wide(
 
 // Columns per subgroup in `dequant_gemv_wide_ilp` — the host's `GEMV_WIDE_ILP`
 // sizes its grid from the same number, and
-// `gguf_gpu::tests::wide_gemv_geometry_matches_the_shader` ties the spellings.
+// `gguf_gpu::tests::one_row_sources_match_the_shader_geometry_and_capabilities`
+// ties the spellings.
 const WIDE_ILP: u32 = 2u;
 
 // The one-column-per-subgroup entry above leaves each lane one or two loads of

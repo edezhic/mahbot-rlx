@@ -2869,20 +2869,17 @@ fn bound_window(local: u64, raw_end: u64, buf_size: u64) -> (u64, u64) {
 }
 
 /// The weight binding's size for one chunk of the one-row multiply's rows, relative
-/// to the window's own base: cut on a **16-byte boundary**, which is what the kernel
-/// reads — a block is decoded as 16-byte legs (`read_w16`), and a leg off a group
-/// boundary is assembled from the two groups it straddles, so the last leg's second
-/// group lies one group past it. `round16` of the last row's end therefore *covers*
-/// that fetch (no access leaves it, at any scheme's stride), and a window clamped
-/// below the round-up would leave the group outside the binding, where a robust
-/// access zeroes it and the tail column silently reads a zero scale.
+/// to the window's own base: [`round16`] of the last row's end, the boundary the
+/// weight buffer, its shards and the activation arena end on.
 ///
-/// So the buffer under it has to end on a 16-byte multiple: the weight buffer and
-/// its shards are sized that way, and the activation arena's own round-up is
-/// `Arena::from_plan`'s (a packed weight keeps its native width under
-/// `plan_f32_uniform`, so it can be the slot the arena ends on). This asserts the
-/// invariant where the window is cut rather than clamping to whatever the buffer
-/// has, because a clamp is the silent wrong tail column.
+/// The reach is at most two bytes past that end: every arm's last access includes the
+/// last block's last byte, and under the 34-, 210- and 18-byte strides a 4-aligned
+/// block start — an even block index — leaves that byte one past a word boundary, so
+/// the word that holds it ends two bytes later. A four-byte cut would cover the read;
+/// the cut stays at 16 because that is where the buffer already ends and the alias
+/// guard must measure the same window the kernel writes.
+///
+/// `tests/gguf_gemv_tail_window.rs` is the fixture for the Q6_K and Q8_0 crossings.
 fn gemv_weight_window(w0: u64, chunk_bytes: u64, w_base: u64, w_buf_size: u64) -> u64 {
     let need = round16(w0 + chunk_bytes - w_base);
     let avail = w_buf_size.saturating_sub(w_base);
@@ -3833,9 +3830,11 @@ mod tests {
     /// points are created on every device, so the text they are built from must
     /// not contain the arm's subgroup built-ins — a module that names one is
     /// refused without `wgpu::Features::SUBGROUP` (`Capabilities::SUBGROUP` to
-    /// naga), and the fallback for such a device *is* those entry points.
+    /// naga), and the fallback for such a device *is* those entry points. The same
+    /// holds for the f16 decode: the shared source must validate with no
+    /// capabilities at all, and the spliced one with exactly the unpack builtin's.
     #[test]
-    fn wide_gemv_geometry_matches_the_shader() {
+    fn one_row_sources_match_the_shader_geometry_and_capabilities() {
         let shared = crate::kernels::DEQUANT_GEMV_GGUF_WGSL;
         let full = crate::kernels::DEQUANT_GEMV_GGUF_WIDE_WGSL;
         assert!(
@@ -3858,6 +3857,25 @@ mod tests {
         .validate(&module)
         .expect("the shared-memory arms must validate without the SUBGROUP capability");
 
+        // The f16 decode is the other capability the shared arms must not depend
+        // on, and the multiply runs on adapters that do not carry it
+        // (`device::shader_f16_in_f32_supported` names the flag). The validation
+        // above is what proves the software block is capability-free; that the
+        // splice is wired is what the two spellings differing proves.
+        let hw = crate::kernels::gemv_gguf_source(false, crate::kernels::F16Decode::Hardware);
+        assert_ne!(
+            hw.as_ref(),
+            shared,
+            "the hardware spelling must be the software one with the f16 block spliced"
+        );
+        let hw_module = naga::front::wgsl::parse_str(&hw).expect("spliced wgsl parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32,
+        )
+        .validate(&hw_module)
+        .expect("the hardware f16 spelling must validate with the f16 capability alone");
+
         let module = naga::front::wgsl::parse_str(full).expect("wgsl parse");
         // The wide arm's own validity, which `parse_str` alone does not establish:
         // a module that names a subgroup built-in also has to validate with the
@@ -3870,6 +3888,21 @@ mod tests {
         )
         .validate(&module)
         .expect("the subgroup arm must validate with the SUBGROUP capability");
+        // And the same module as a device carrying both features builds it: the
+        // f16 splice and the subgroup arm in one source.
+        let hw_full = crate::kernels::gemv_gguf_source(true, crate::kernels::F16Decode::Hardware);
+        let hw_full_module = naga::front::wgsl::parse_str(&hw_full).expect("spliced wgsl parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::SUBGROUP
+                | naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32,
+        )
+        .validate(&hw_full_module)
+        .expect("the wide module must validate with SUBGROUP and the f16 capability");
+
+        // Which of them a build takes is the gate's decision, and only a device can
+        // answer it; asking the gate here would create the process-global device this
+        // file deliberately stays off. This test pins the two sources, not the choice.
         let wide = module
             .entry_points
             .iter()
@@ -3965,6 +3998,189 @@ mod tests {
         );
     }
 
+    /// The software f16 spelling executes on this adapter and agrees with `half` and
+    /// with the hardware spelling wherever the adapter carries the capability.
+    ///
+    /// The gate picks by capability, so a capable device builds the hardware source
+    /// and no other test runs the software pair — a portable fallback nothing executes
+    /// is not a fallback. Both sources get a probe entry point spliced on that decodes
+    /// all 65 536 binary16 patterns: both halves of each word through
+    /// `dq_read_f16_pair`, and `dq_read_f16`'s two-byte read at a 4-aligned and at a
+    /// 2-aligned offset — the two alignments a Q6_K or Q8_0 block's `d` lands on. Every
+    /// output is compared with `half`'s conversion, and the two spellings with each
+    /// other. The hardware half is skipped where the adapter lacks
+    /// `DownlevelFlags::SHADER_F16_IN_F32`, since `unpack2x16float` is not admissible
+    /// there and the software half is exactly what such an adapter runs.
+    ///
+    /// The one class where the two spellings differ — a NaN payload — is the shader's
+    /// decode doc; it is asserted rather than skipped, so the divergence cannot be
+    /// forgotten.
+    #[test]
+    fn both_f16_spellings_match_half() {
+        const N: u32 = 65_536;
+        // `warr[i]` carries pattern `i` in its low half and its complement in the high
+        // one, so one sweep covers every pattern in both. `dq_read_f16(4i)` reads the
+        // low half's two bytes back out through `read_w` at a 4-aligned offset, and
+        // `dq_read_f16(4i + 2)` the high half's at a 2-aligned one. The offsets come
+        // from `N` so the probe and the host cannot disagree.
+        let probe = format!(
+            r#"
+@compute @workgroup_size(64)
+fn dq_f16_probe(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x;
+    if (i >= {N}u) {{ return; }}
+    let pair = dq_read_f16_pair(warr[i]);
+    outarr[i] = pair.x;
+    outarr[{N}u + i] = pair.y;
+    outarr[{n2}u + i] = dq_read_f16(4u * i);
+    outarr[{n3}u + i] = dq_read_f16(4u * i + 2u);
+}}
+"#,
+            n2 = 2 * N,
+            n3 = 3 * N
+        );
+        if rlx_ir::env::skip_unless_device("wgpu", true, crate::is_available()) {
+            return;
+        }
+        let handle = crate::device::wgpu_device()
+            .expect("a device, since `skip_unless_device` did not skip this test");
+        let (device, queue) = (&handle.device, &handle.queue);
+
+        let words: Vec<u8> = (0..N)
+            .flat_map(|i| (i | ((!i & 0xffff) << 16)).to_le_bytes())
+            .collect();
+        let out_bytes = 4 * u64::from(N) * 4;
+        let buffer = |label: &str, size: u64, usage: wgpu::BufferUsages| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        // The probe touches only the weight and output windows, so the pipeline's
+        // inferred layout carries those two bindings and no others.
+        let warr = buffer(
+            "f16 spelling probe w",
+            words.len() as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        queue.write_buffer(&warr, 0, &words);
+        let out = buffer(
+            "f16 spelling probe out",
+            out_bytes,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
+        let readback = buffer(
+            "f16 spelling probe readback",
+            out_bytes,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+
+        let run = |spelling| -> Vec<f32> {
+            let source = crate::kernels::gemv_gguf_source(false, spelling);
+            let module = crate::kernels::kernel_module(
+                device,
+                "rlx-wgpu f16 spelling probe",
+                &format!("{source}\n{probe}"),
+            );
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rlx-wgpu f16 spelling probe"),
+                layout: None,
+                module: &module,
+                entry_point: Some("dq_f16_probe"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rlx-wgpu f16 spelling probe bg"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: warr.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: out.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rlx-wgpu f16 spelling probe"),
+            });
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rlx-wgpu f16 spelling probe"),
+                    ..Default::default()
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(N / 64, 1, 1);
+            }
+            enc.copy_buffer_to_buffer(&out, 0, &readback, 0, out_bytes);
+            queue.submit([enc.finish()]);
+            readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("the f16 spelling probe's fence");
+            let data = readback
+                .slice(..)
+                .get_mapped_range()
+                .expect("the f16 spelling probe's readback");
+            let values = data
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")))
+                .collect();
+            drop(data);
+            readback.unmap();
+            values
+        };
+
+        let software = run(crate::kernels::F16Decode::Software);
+        let hardware = crate::device::shader_f16_in_f32_supported()
+            .then(|| run(crate::kernels::F16Decode::Hardware));
+        let reference = |bits: u32| half::f16::from_bits(bits as u16).to_f32();
+        let n = N as usize;
+        for i in 0..n {
+            let low = i as u32;
+            let high = !low & 0xffff;
+            for (at, bits) in [(i, low), (n + i, high), (2 * n + i, low), (3 * n + i, high)] {
+                let want = reference(bits);
+                let soft = software[at];
+                if want.is_nan() {
+                    assert_eq!(soft, 0.0, "the software decode of NaN 0x{bits:04x} at {at}");
+                } else {
+                    assert_eq!(
+                        soft.to_bits(),
+                        want.to_bits(),
+                        "software 0x{bits:04x} at {at}"
+                    );
+                }
+                let Some(hard) = hardware.as_ref().map(|h| h[at]) else {
+                    continue;
+                };
+                if want.is_nan() {
+                    assert!(
+                        hard.is_nan(),
+                        "the hardware decode of NaN 0x{bits:04x} at {at}"
+                    );
+                } else {
+                    assert_eq!(
+                        hard.to_bits(),
+                        want.to_bits(),
+                        "hardware 0x{bits:04x} at {at}"
+                    );
+                    assert_eq!(
+                        soft.to_bits(),
+                        hard.to_bits(),
+                        "the spellings differ at {at}"
+                    );
+                }
+            }
+        }
+    }
+
     /// How many times each column of a chunk is written, modelled from the two
     /// halves of the arm's geometry: the host's grid, `ceil(n / cols_per_wg)`
     /// workgroups, and the shader's walk — subgroup `sgid` taking column
@@ -3977,8 +4193,8 @@ mod tests {
     /// the shader's walk takes. Coverage needs the second to equal the first, and
     /// the property below is what a stride that is not the count does to a chunk.
     /// The two coincide in the shipped code, and
-    /// `wide_gemv_geometry_matches_the_shader` pins the shader's `nsub` to that
-    /// expression — a divergence fails there, not here.
+    /// `one_row_sources_match_the_shader_geometry_and_capabilities` pins the shader's
+    /// `nsub` to that expression — a divergence fails there, not here.
     ///
     /// `sg` is the width the *pipeline* got, which the host cannot read (see
     /// `GEMV_WIDE_COLS_PER_WG`), so the sweep below covers widths the arm is never
@@ -4210,34 +4426,32 @@ mod tests {
     }
 
     /// The one-row multiply's weight window ends on the 16-byte boundary above the
-    /// last row's packed bytes, because the kernel's last leg fetch reaches one group
-    /// past them; a buffer that cannot give that group is refused instead of bound.
-    /// Q6_K's 210-byte rows are the case that makes it visible — six of them are 1 260
-    /// bytes, which the weight buffer's old four-byte rounding would have ended at
-    /// exactly, 12 bytes short of the group.
+    /// last row's packed bytes, for the reason [`gemv_weight_window`] records. This is
+    /// the seven-row Q6_K fixture's arithmetic; the Q8_0 shape is
+    /// `tests/gguf_gemv_tail_window.rs`'s.
     #[test]
     fn the_weight_window_ends_on_a_16_byte_boundary() {
         // The window is the round-up, from the base, whatever the base is.
-        assert_eq!(gemv_weight_window(0, 6 * 210, 0, 1_264), 1_264);
+        assert_eq!(gemv_weight_window(0, 7 * 210, 0, 1_472), 1_472);
         // A weight parked past a 256-byte block base: the length covers its own
         // rows from the base, so the base's slack is included and the end is still
-        // on a group boundary.
-        assert_eq!(gemv_weight_window(2_500, 6 * 210, 2_304, 4_096), 1_456);
-        // A weight that fits with whole groups to spare adds nothing: the window is
+        // on a 16-byte boundary.
+        assert_eq!(gemv_weight_window(2_500, 7 * 210, 2_304, 4_096), 1_680);
+        // A weight that fits with whole blocks to spare adds nothing: the window is
         // the rows, not the buffer.
-        assert_eq!(gemv_weight_window(0, 6 * 210, 0, 4_096), 1_264);
+        assert_eq!(gemv_weight_window(0, 7 * 210, 0, 4_096), 1_472);
     }
 
-    /// The refusal: a weight buffer that ends off a 16-byte boundary — what the
-    /// buffer's four-byte rounding used to produce — takes the last leg's second
-    /// group outside the binding, where a robust access answers zeros and the tail
-    /// column reads a zero scale. The window cut says so rather than clamping.
+    /// The refusal: a weight buffer that ends at the last row's own byte leaves the
+    /// word that row's last access reads outside the binding, and is not even
+    /// four-aligned, so wgpu would refuse the binding rather than read it. The window
+    /// cut says so rather than clamping.
     #[test]
     #[should_panic(expected = "16-byte multiple")]
     fn a_weight_buffer_that_ends_off_16_is_refused() {
-        // 1 260 bytes of Q6_K rows in a buffer rounded to four bytes: no group for
-        // the last leg.
-        gemv_weight_window(0, 6 * 210, 0, 1_260);
+        // 1 470 bytes of Q6_K rows in a buffer that ends there: no word for the
+        // `d` the last block reads.
+        gemv_weight_window(0, 7 * 210, 0, 1_470);
     }
 
     /// The knob's spelling: `1`/`true` (and unset, the measured default) admit the

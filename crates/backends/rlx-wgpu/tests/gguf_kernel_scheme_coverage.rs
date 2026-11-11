@@ -219,13 +219,14 @@ fn one_row_entry_points_parse_and_validate() {
     assert_eq!(sizes["dequant_gemv"], [64, 1, 1], "legacy thread count");
 
     // How each arm reads the packed weight is part of the shape the one-row route
-    // reports: both decoded arms read it 16 bytes at a time (`read_w16`) and pick
-    // bytes out of the leg they fetched, where a word-at-a-time read cost one fetch
-    // per word — the per-lane instruction count this latency-bound arm's rate
-    // follows. The arm that keeps one thread per column still reads bytes. Both
-    // one-row arms share one decode per scheme (`dq_q4k_unit` / `dq_q6k_unit` /
-    // `dq_q8_0_unit`), so the spelling pins below read those bodies rather than
-    // either entry point's.
+    // reports: both decoded arms read it in 16-byte legs (`read_w16`), the unit the
+    // decode consumes, and pick bytes out of the leg they fetched — the arm that
+    // keeps one thread per column still reads bytes. The leg is the logical unit, not
+    // a fetch-width claim: `tests/gguf_one_row_stream_rate.rs` measured the 16-byte
+    // group *binding* behind the word one on both formats whose stride puts a leg off
+    // a word boundary, which is why the binding is words. Both one-row arms share one
+    // decode per scheme (`dq_q4k_unit` / `dq_q6k_unit` / `dq_q8_0_unit`), so the
+    // spelling pins below read those bodies rather than either entry point's.
     let wgsl = rlx_wgpu::kernels::DEQUANT_GEMV_GGUF_WGSL;
     let q4k = fn_body(wgsl, "dq_q4k_unit");
     let q6k = fn_body(wgsl, "dq_q6k_unit");
@@ -252,12 +253,13 @@ fn one_row_entry_points_parse_and_validate() {
         4,
         "byte-wise reads: the definition, `dq_read_f16`'s two, and the legacy arm's one"
     );
-    // Q4_K's 144-byte stride puts its header and both `qs` halves on group
-    // boundaries and off the second column's, so the body is six leg reads and no
-    // word assembly. A word-at-a-time read computes bit-identical values, so no
-    // parity or digest test can see this path change; like the reads above, this
-    // file pins the spelling. One site, because the decode is one body both arms
-    // call (it used to be two — one per column — inside the tiled arm).
+    // Q4_K's 144-byte stride puts its header and both columns' two `qs` halves on
+    // 16-byte boundaries, so the body is six leg reads and no leg straddles a word.
+    // The leg is the decode's unit, assembled by `read_w16` from whole words, so the
+    // *binding's* granularity changes no value here: no parity or digest test can see
+    // that path change, and, like the reads above, this file pins the spelling. One
+    // site, because the decode is one body both arms call (it used to be two — one per
+    // column — inside the tiled arm).
     assert_eq!(
         q4k.matches("read_w16(").count(),
         6,
@@ -293,9 +295,12 @@ fn one_row_entry_points_parse_and_validate() {
         [0, 1, 2, 3],
         "the one-row module binds each operand window once: X, params, weight, out"
     );
+    // The weight is bound once, as words — the granularity `gguf_one_row_stream_rate.rs`
+    // measured. A second declaration of it would already break the count above; the
+    // type is what this pins.
     assert!(
-        !wgsl.contains("warr:") && !wgsl.contains("xarr:"),
-        "a second view of a bound window is the aliasing defect, not an optimisation"
+        wgsl.contains("warr: array<u32>"),
+        "the weight window is bound once, as words"
     );
 }
 
