@@ -6959,6 +6959,30 @@ mod tests {
         )
         .validate(&module)
         .expect("sample.wgsl validates under the WebGPU baseline");
+        // The one-row draw's whole scratch — the staged row, the selection tree's
+        // lists, the reductions and the picked set — is workgroup storage, so it is
+        // what a device's 16 384 B WebGPU baseline has to hold. This machine grants
+        // 32 KiB, so a layout over the baseline would pass here and fail on a
+        // baseline device; the sum is checked instead of asked of the adapter. naga
+        // reports each variable's own size, not the padded block, and every one of
+        // them is at most 16-byte aligned, so the real block is the sum plus a few
+        // tens of bytes.
+        const BASELINE_WORKGROUP_STORAGE: u32 = 16_384;
+        let mut layouter = naga::proc::Layouter::default();
+        layouter
+            .update(module.to_ctx())
+            .expect("sample.wgsl's types lay out");
+        let mut bytes = 0u32;
+        for (_, var) in module.global_variables.iter() {
+            if var.space == naga::AddressSpace::WorkGroup {
+                bytes += layouter[var.ty].size;
+            }
+        }
+        assert!(
+            bytes < BASELINE_WORKGROUP_STORAGE,
+            "sample.wgsl's workgroup storage is {bytes} B, not under the \
+             {BASELINE_WORKGROUP_STORAGE} B WebGPU baseline"
+        );
         assert!(
             SAMPLE_WGSL.contains(&format!("const LANES: u32 = {SAMPLE_LANES}u;")),
             "sample.wgsl must declare `LANES` from `SAMPLE_LANES` ({SAMPLE_LANES})"

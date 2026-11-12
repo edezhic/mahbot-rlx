@@ -240,6 +240,7 @@ merge action.
   backend's custom lowering, the dequant-guarded memory plan, sample seeds, and
   the stream-ceiling probe
 - the mel and decode graph caches
+- the sampler's branchless candidate order and its single-pass retained-set assembly
 - the sixteen-window grouped encoder pass
 - capacity-bucketed body planes and plane seeding
 - f16 parameters for the tagger

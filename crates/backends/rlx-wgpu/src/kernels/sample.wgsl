@@ -167,10 +167,12 @@ var<workgroup> wg_one: f32;
 // two serial reductions are the only lane-0 work left.
 var<workgroup> row: array<f32, STAGE>;
 // The selection tree's per-lane candidate lists, and the picked indices of a
-// draw whose `k_limit` fits `PICK_MAX` (ascending, so the restore sums them in
-// the serial pass's own order).
+// draw whose `k_limit` fits `PICK_MAX`: `picks` in the order they were picked —
+// which is the total order, descending — and `sel` the same set ascending by
+// index, the order the restore sums them in.
 var<workgroup> wg4: array<Cand, LANES>;
 var<workgroup> picks: array<u32, PICK_MAX>;
+var<workgroup> sel: array<u32, PICK_MAX>;
 
 /// The best **value** over the workgroup: higher wins, and on an exact tie the
 /// **lower index** wins — the serial scan's `v > best` order. The index is
@@ -207,41 +209,41 @@ fn wg_best(lane: u32, value: f32, index: u32) -> f32 {
 // yields four picks, and a round costs the same as the single-pick reduce it
 // replaces.
 
+/// The total order of the selection, written with `|` and `&` rather than `||` and
+/// `&&`: WGSL's short-circuit operators lower to a function-local flag and an
+/// `if`/`else` (naga's `lower::logical`), so each of the scan's and the tree's
+/// per-candidate comparisons became control flow. `&`/`|` on `bool` are the same two
+/// comparisons without the branch.
 fn cand_better(av: f32, ai: u32, bv: f32, bi: u32) -> bool {
-    return av > bv || (av == bv && ai < bi);
+    return (av > bv) | ((av == bv) & (ai < bi));
 }
 
 fn cand_empty() -> Cand {
     return Cand(array<f32, 4>(-1.0, -1.0, -1.0, -1.0), array<u32, 4>(0u, 0u, 0u, 0u));
 }
 
-/// Insert one candidate into a list that is already in order: the newcomer takes
-/// the tail if it beats it, then bubbles up while it beats the one above. The list
-/// stays the four best of what has been offered, which is what the merge relies on.
+/// Insert one candidate into a list that is already in order. The newcomer's rank
+/// is how many of the four are better than it; everything from that rank down shifts
+/// one place and the newcomer takes the slot, so the list stays the four best of what
+/// has been offered — which is what the merge relies on — and a rank of four moves
+/// nothing. A rank and a `select` a slot rather than nested `if`s: the tree runs four
+/// of these per level and the branches diverged per lane.
 fn cand_push(c: Cand, v: f32, i: u32) -> Cand {
-    var r = c;
-    if (!cand_better(v, i, r.v[3], r.i[3])) { return r; }
-    r.v[3] = v;
-    r.i[3] = i;
-    if (cand_better(r.v[3], r.i[3], r.v[2], r.i[2])) {
-        let tv1 = r.v[2];
-        let ti1 = r.i[2];
-        r.v[2] = r.v[3]; r.i[2] = r.i[3];
-        r.v[3] = tv1; r.i[3] = ti1;
-        if (cand_better(r.v[2], r.i[2], r.v[1], r.i[1])) {
-            let tv2 = r.v[1];
-            let ti2 = r.i[1];
-            r.v[1] = r.v[2]; r.i[1] = r.i[2];
-            r.v[2] = tv2; r.i[2] = ti2;
-            if (cand_better(r.v[1], r.i[1], r.v[0], r.i[0])) {
-                let tv3 = r.v[0];
-                let ti3 = r.i[0];
-                r.v[0] = r.v[1]; r.i[0] = r.i[1];
-                r.v[1] = tv3; r.i[1] = ti3;
-            }
-        }
-    }
-    return r;
+    var r: u32 = 0u;
+    r = r + select(0u, 1u, cand_better(c.v[0], c.i[0], v, i));
+    r = r + select(0u, 1u, cand_better(c.v[1], c.i[1], v, i));
+    r = r + select(0u, 1u, cand_better(c.v[2], c.i[2], v, i));
+    r = r + select(0u, 1u, cand_better(c.v[3], c.i[3], v, i));
+    var o = c;
+    o.v[3] = select(select(c.v[3], v, r == 3u), c.v[2], r <= 2u);
+    o.i[3] = select(select(c.i[3], i, r == 3u), c.i[2], r <= 2u);
+    o.v[2] = select(select(c.v[2], v, r == 2u), c.v[1], r <= 1u);
+    o.i[2] = select(select(c.i[2], i, r == 2u), c.i[1], r <= 1u);
+    o.v[1] = select(select(c.v[1], v, r == 1u), c.v[0], r == 0u);
+    o.i[1] = select(select(c.i[1], i, r == 1u), c.i[0], r == 0u);
+    o.v[0] = select(c.v[0], v, r == 0u);
+    o.i[0] = select(c.i[0], i, r == 0u);
+    return o;
 }
 
 fn cand_merge(a: Cand, b: Cand) -> Cand {
@@ -414,6 +416,21 @@ fn staged_sum(n: u32) -> f32 {
 /// they compute — and a WGSL `ptr` is bound to one address space, so a helper
 /// cannot take the arena and the staged row as one parameter; the passes are
 /// therefore spelled twice rather than shared.
+///
+/// The product's draw here is a 2 048-wide row at `top_k` 50, `top_p` 1: thirteen
+/// rounds of four picks, 234.7 µs end to end (`RLX_BENCH_DISPATCH_ONLY=1`) against
+/// 79.2 µs for the same draw with the filter off — 155 µs of selection, and it was
+/// not the round count. The pick loop kept `picks` sorted by index as it went, a
+/// serial chain of workgroup accesses on lane 0 that grew with the set: appending
+/// instead and ranking the set once afterwards takes 70 µs of it off. The candidate
+/// list's nested `if`s and its short-circuit comparison cost 8 more (see
+/// `cand_better`, `cand_push`). What is left is 73 µs — about 6 µs a round — so the
+/// round count is no longer what a draw pays for, and a wider or a lazily refilled
+/// per-lane list would buy nothing: a round's tree is six levels of four pushes
+/// whatever the list width, so its work is six levels times the pick count either
+/// way. Each arm is the median of nine rounds of twenty draws, min over three such
+/// rounds, one process, at `tests/sample_staged_paths.rs`; on the tree this lands,
+/// the `top_k` 50 arm reads 153–156 µs and the `top_k` 4 arm 82–83 µs across takes.
 fn sample_one_staged(lane: u32) {
     let inner = params.inner;
     let base = params.in_off;
@@ -465,11 +482,11 @@ fn sample_one_staged(lane: u32) {
             var c = cand_empty();
             for (var i: u32 = lane; i < inner; i = i + LANES) {
                 let v = row[i];
-                // The tail test is inline: a candidate that cannot enter the list
-                // must not cost a `Cand` copy, and most of the row cannot.
-                if (v >= 0.0 && cand_better(v, i, c.v[3], c.i[3])) {
-                    c = cand_push(c, v, i);
-                }
+                // An already-picked element is stored negative, and `-2.0` cannot
+                // beat the `-1.0` of an empty slot, so it costs a push that moves
+                // nothing. Keeping the test out of the loop is what lets the push
+                // stay branchless.
+                c = cand_push(c, select(-2.0, v, v >= 0.0), i);
             }
             wg4[lane] = c;
             workgroupBarrier();
@@ -497,16 +514,7 @@ fn sample_one_staged(lane: u32) {
                 if (lane == 0u) {
                     row[i] = -v - SENTINEL_EPS;
                     if (recording) {
-                        // Keep `picks` ascending by index: the restore sum then adds
-                        // the selected values in the serial pass's own order.
-                        var at: u32 = picked_count;
-                        loop {
-                            if (at == 0u) { break; }
-                            if (picks[at - 1u] < i) { break; }
-                            picks[at] = picks[at - 1u];
-                            at = at - 1u;
-                        }
-                        picks[at] = i;
+                        picks[picked_count] = i;
                     }
                 }
                 cum = cum + v;
@@ -518,6 +526,21 @@ fn sample_one_staged(lane: u32) {
             }
             workgroupBarrier();
         }
+        // The picks arrived in the total order, descending; the restore sum is an
+        // ascending-index chain. Each lane ranks its own pick against the whole
+        // retained set and scatters it, so `sel` is that set in the serial pass's
+        // own order — one comparison each, and no serial insertion.
+        if (recording) {
+            for (var j: u32 = lane; j < picked_count; j = j + LANES) {
+                let i = picks[j];
+                var rank: u32 = 0u;
+                for (var k: u32 = 0u; k < picked_count; k = k + 1u) {
+                    rank = rank + select(0u, 1u, picks[k] < i);
+                }
+                sel[rank] = i;
+            }
+        }
+        workgroupBarrier();
         // Restore the selected set and zero the rest — summed in index order on
         // lane 0, exactly as the serial pass does, with the writes spread over the
         // workgroup. The selected set is all the sum visits when it was recorded.
@@ -525,7 +548,7 @@ fn sample_one_staged(lane: u32) {
             var new_sum: f32 = 0.0;
             if (recording) {
                 for (var j: u32 = 0u; j < picked_count; j = j + 1u) {
-                    new_sum = new_sum + (-row[picks[j]] - SENTINEL_EPS);
+                    new_sum = new_sum + (-row[sel[j]] - SENTINEL_EPS);
                 }
             } else {
                 for (var i: u32 = 0u; i < inner; i = i + 1u) {
@@ -558,7 +581,7 @@ fn sample_one_staged(lane: u32) {
     var best_i: u32 = 0u;
     if (need_filter && recording) {
         for (var j: u32 = lane; j < picked_count; j = j + LANES) {
-            let i = picks[j];
+            let i = sel[j];
             let p = row[i];
             if (p <= 0.0) { continue; }
             let score = gumbel_score(p, i, 0u, key);
