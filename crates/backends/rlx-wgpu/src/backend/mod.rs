@@ -6373,7 +6373,7 @@ fn build_matmul_bind_group(
 /// plain `cargo test` gate rather than only under `--features backend-tests`.
 /// The rows are sized from the *effective* floors (`im2col_min_*()`, the env the
 /// lowering reads), so they hold at the shipped values and across the lever's measured
-/// range (`RLX_WGPU_IM2COL_MIN_SPATIAL` 100..48000); a floor far outside that range is
+/// range (`RLX_WGPU_IM2COL_MIN_SPATIAL` 1..48000); a floor far outside that range is
 /// outside this claim. A row that deliberately pins a shipped constant says so in place.
 #[cfg(test)]
 mod conv_route_decision_tests {
@@ -6385,7 +6385,7 @@ mod conv_route_decision_tests {
     #[test]
     fn the_pointwise_bar_is_frozen_against_the_im2col_floors() {
         // 128 × 3000 = 384 000 — under this bar, but over what the two floors admit
-        // once the spatial floor is 100 (256 × 100 = 25 600), so an admission test
+        // at the shipped spatial floor of 1 (256 × 1 = 256), so an admission test
         // re-coupled to them would take this shape.
         assert!(!pointwise_admitted(128, 3000));
         assert!(pointwise_admitted(256, 2048), "the bar itself");
@@ -6424,7 +6424,7 @@ mod conv_route_decision_tests {
             "an unlimited window reserves it whatever the plan costs"
         );
         // The hard cap drops a col past it even where the window would take it. The map is
-        // `(2 × the spatial floor).max(64)` wide — 200 at the shipped 100 — with enough
+        // `(2 × the spatial floor).max(64)` wide — 64 at the shipped 1 — with enough
         // channels to clear the K floor and to push the panel past the cap at that extent.
         let w = (im2col_min_spatial() * 2).max(64) as usize;
         let c_in = (im2col_min_k().div_ceil(25) as usize)
@@ -6526,24 +6526,42 @@ mod conv_route_decision_tests {
     /// to the floor is admitted and one shorter is refused — no multiplier, margin or
     /// rounding. Sized from the effective floors, so the documented
     /// `RLX_WGPU_IM2COL_MIN_SPATIAL` A/B lever moves both rows with it.
+    ///
+    /// At the shipped floor of 1 there is no extent shorter than the floor to refuse
+    /// (a conv cannot have an empty output), so the admission of the floor's own
+    /// extent is the whole of what the comparison can be asked. The shipped value
+    /// itself is [`the_shipped_floor_is_one`]'s row.
     #[test]
     fn the_spatial_floor_admits_exactly_its_own_extent() {
         let floor = im2col_min_spatial() as usize;
-        if floor < 2 {
-            // A floor of 0 or 1 admits every extent there is, so there is no two-sided
-            // boundary to state, and `floor - 1` would be a degenerate width.
-            return;
-        }
+        let extent = floor.max(1);
         let c_in = (im2col_min_k().div_ceil(7) as usize).max(64);
         let c_out = im2col_min_cout() as usize;
-        let (_, on_the_floor) = conv_graph(c_in, c_out, [1, floor], [1, 7], [0, 3]);
+        let (_, on_the_floor) = conv_graph(c_in, c_out, [1, extent], [1, 7], [0, 3]);
         assert_eq!(
             on_the_floor,
-            Some(c_in as u64 * 7 * floor as u64),
-            "out {floor} is the floor itself"
+            Some(c_in as u64 * 7 * extent as u64),
+            "out {extent} is the floor itself"
         );
-        let (_, one_short) = conv_graph(c_in, c_out, [1, floor - 1], [1, 7], [0, 3]);
-        assert_eq!(one_short, None, "one output shorter is under the floor");
+        if floor >= 2 {
+            let (_, one_short) = conv_graph(c_in, c_out, [1, floor - 1], [1, 7], [0, 3]);
+            assert_eq!(one_short, None, "one output shorter is under the floor");
+        }
+    }
+
+    /// The shipped value of the spatial floor: a raise of the default fails here instead
+    /// of silently taking the synthesis front's newly admitted shapes back to the direct
+    /// kernel. Whether a given extent is admitted is the boundary test's own question (it
+    /// reads the effective floor); this row pins the value, and a run that exports the
+    /// documented `RLX_WGPU_IM2COL_MIN_SPATIAL` bisect lever is measuring the lever rather
+    /// than the default, so it skips instead of reddening a bisect.
+    #[test]
+    fn the_shipped_floor_is_one() {
+        if let Some(floor) = rlx_ir::env::var("RLX_WGPU_IM2COL_MIN_SPATIAL") {
+            eprintln!("skip: RLX_WGPU_IM2COL_MIN_SPATIAL={floor} is a bisect, not the default");
+            return;
+        }
+        assert_eq!(im2col_min_spatial(), 1, "the shipped default");
     }
 
     /// The reservation and the 1×1 route are two decisions, which is what lets the

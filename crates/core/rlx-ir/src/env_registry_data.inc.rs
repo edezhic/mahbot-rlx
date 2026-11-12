@@ -4339,7 +4339,7 @@
     EnvVarEntry {
         name: "RLX_WGPU_IM2COL_MIN_SPATIAL",
         group: "wgpu",
-        summary: "Minimum spatial extent before im2col is used (default 100; the 1×1 pointwise route has its own bar)",
+        summary: "Minimum spatial extent before im2col is used (default 1, so every extent; the K, channel and group floors still gate, and the 1×1 pointwise route has its own bar)",
         kind: EnvKind::U64,
         stability: EnvStability::Bisect,
         aliases: &[],

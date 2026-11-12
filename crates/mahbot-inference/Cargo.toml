@@ -81,10 +81,10 @@ workspace = true
 # The wake-word bench, its corpus build and the transcription corpus run are
 # deliberate, never automatic: without this feature none of them is built.
 bench = []
-# The ten hand-run targets below. Every test in them is `#[ignore]`d, so a routine
-# `cargo test` would link and execute ten binaries that run nothing (207 MiB) and
+# The eleven hand-run targets below. Every test in them is `#[ignore]`d, so a routine
+# `cargo test` would link and execute eleven binaries that run nothing (227 MiB) and
 # pay each one's first-execution assessment; with the bin's `test = false` above,
-# that is 11 of the contour's 69 test binaries, so behind this feature the routine
+# that is 12 of the contour's 70 test binaries, so behind this feature the routine
 # run is 58. The feature is also what keeps them buildable, type-checked and
 # runnable: `just lint` and `just lint-mahbot` enable it, `just test-workspace`
 # enables it so the whole-set gate still reaches them, and each file's own doc
@@ -130,6 +130,10 @@ required-features = ["hand-run"]
 
 [[test]]
 name = "speak_readback"
+required-features = ["hand-run"]
+
+[[test]]
+name = "synthesis_front_route"
 required-features = ["hand-run"]
 
 [[test]]

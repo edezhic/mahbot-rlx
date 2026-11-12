@@ -138,7 +138,7 @@ fn route_switches() {
     rlx_ir::env::set("RLX_WGPU_CONV_IM2COL", "1");
     // The shipped spatial/channel floors, spelled so an operator's lever cannot decide
     // these rows; the K floor is the one this file lowers (see the doc comment).
-    rlx_ir::env::set("RLX_WGPU_IM2COL_MIN_SPATIAL", "100");
+    rlx_ir::env::set("RLX_WGPU_IM2COL_MIN_SPATIAL", "1");
     rlx_ir::env::set("RLX_WGPU_IM2COL_MIN_COUT", "64");
     rlx_ir::env::set("RLX_WGPU_IM2COL_MIN_K", "1");
     common::pin_tuning_cache_off("conv-batched-im2col");

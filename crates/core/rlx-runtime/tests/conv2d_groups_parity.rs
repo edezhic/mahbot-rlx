@@ -175,10 +175,10 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
         ),
         // The 2-D map the previous wgpu im2col spatial floor move (2048 → 800)
         // admitted: 40×40 = 1600 output elements lies inside `[800, 2048)`, so on that
-        // backend this row takes the materialised im2col route and stays there under the
-        // default of 100 — it is not a row of the band `[100, 800)` that default opens.
-        // It is the 2-D half of the band's regression surface: the unit-height body rows
-        // below reach the floor only through the length axis.
+        // backend this row takes the materialised im2col route and stayed there when the
+        // default came down to 100 — it is not a row of the band `[100, 800)` that
+        // default opened. It is the 2-D half of the band's regression surface: the
+        // unit-height body rows below reach the floor only through the length axis.
         (
             "band-3x3-40x40",
             Cfg {
@@ -195,8 +195,8 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
             },
         ),
         // The encoder's third input conv: real 2-D taps on a padded map with a stride of
-        // 2, output 16×13 = 208 — strictly inside the band the wgpu im2col floor's default
-        // of 100 opens, and the only case here that reaches an accelerated route with a
+        // 2, output 16×13 = 208 — inside the band the wgpu im2col floor's earlier default
+        // of 100 opened, and the only case here that reaches an accelerated route with a
         // stride other than one on a padded map (every other accelerated case is stride-1
         // or a unit-height lift, and the mirrored relabel can never serve two real taps).
         // On wgpu this row exercises the materialised route's strided gather.
@@ -333,7 +333,7 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
         ),
         // 1×7 dense, the shape the decoder body's `blk.*.res.*.conv1` presents: out 800
         // was the im2col spatial floor's own boundary under the default of 800, and every
-        // dense row here now clears the floor of 100 ⇒ im2col.
+        // dense row here now clears the floor of 1 ⇒ im2col.
         (
             "dense-1x7-l800",
             Cfg {
@@ -384,7 +384,7 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
                 groups: 1,
             },
         ),
-        // ... and with dilation: out 794 now clears the im2col spatial floor (100), so
+        // ... and with dilation: out 794 clears the im2col spatial floor (1), so
         // the materialised route would take it — `c_out = 32` deliberately stays under
         // that route's 64-channel floor, which the relabel does not test, and keeps this
         // case on the *mirrored* relabel with a non-unit `dh`: the one relabel field the
@@ -408,8 +408,8 @@ fn cfgs() -> Vec<(&'static str, Cfg)> {
             },
         ),
         // The body's entry shape: its output length 100 is the wgpu im2col spatial
-        // floor's own extent at its inclusive lower bound, so this is the decoder entry
-        // shape the floor's new default of 100 serves with the materialised route.
+        // floor's extent under the default of 100 that admitted it, so this is the
+        // decoder entry shape the floor serves with the materialised route.
         (
             "entry-1x7-l100",
             Cfg {

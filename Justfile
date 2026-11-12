@@ -307,9 +307,9 @@ test:
     # compiled here at all. (Linux x86_64 excepted: rlx-collectives' retained
     # upstream dev-dependency row still pulls CUDA / ROCm / XDNA into this run.)
     # `just test-gpu` and the backend recipes below are what build the rest.
-    # `mahbot-inference` gates ten more targets this way, behind its own
+    # `mahbot-inference` gates eleven more targets this way, behind its own
     # `hand-run` feature rather than `backend-tests`: every test in them is
-    # `#[ignore]`d, so ungated this run links and executes ten binaries that run
+    # `#[ignore]`d, so ungated this run links and executes eleven binaries that run
     # nothing. `just test-workspace` and `just lint` enable that feature.
     if [[ "$(uname -s)" == Darwin ]]; then
         # A few parallel test binaries is enough; more contended Apple GPU.
@@ -343,7 +343,7 @@ test:
 # left to redden the gate. A gate that is red out of the box is not a gate: a sync
 # reads the red as a regression and chases it.
 #
-# One gated set is reached on purpose: `mahbot-inference`'s ten hand-run targets
+# One gated set is reached on purpose: `mahbot-inference`'s eleven hand-run targets
 # are behind that crate's `hand-run` feature so the routine run does not link
 # binaries that execute nothing, and `--features mahbot-inference/hand-run` below
 # is what keeps this whole-set run's coverage where it was.
@@ -607,7 +607,7 @@ lint: lint-features
     # `backend-tests`: the default test selection is a fast smoke set, and
     # `required-features` hides every gated target from `--all-targets` too —
     # without it they would not be type-checked by `just lint` at all. `hand-run`
-    # is the same for `mahbot-inference`'s ten hand-run targets.
+    # is the same for `mahbot-inference`'s eleven hand-run targets.
     cargo clippy --all-targets --features backend-tests,hand-run -- -D warnings
 
 # Every member, once per upstream sync (see `docs/fork-sync.md`).

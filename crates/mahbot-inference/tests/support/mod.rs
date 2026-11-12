@@ -186,7 +186,7 @@ pub fn ramped_inputs(graph: &Graph) -> Vec<(String, Vec<f32>)> {
 }
 
 /// One run of a compiled frame, in milliseconds.
-fn frame_once(compiled: &mut graphs::Compiled, inputs: &[(String, Vec<f32>)]) -> f64 {
+pub fn frame_once(compiled: &mut graphs::Compiled, inputs: &[(String, Vec<f32>)]) -> f64 {
     let start = Tick::now();
     compiled.runner.run(inputs);
     Tick::now().elapsed_ns(start) as f64 / 1e6
@@ -204,6 +204,29 @@ pub fn step_census(names: &[&'static str]) -> String {
         .map(|(k, v)| format!("{k}:{v}"))
         .collect::<Vec<_>>()
         .join("+")
+}
+
+/// One compiled graph's [`step_census`]: the route it took, in one line.
+pub fn schedule_census(compiled: &graphs::Compiled) -> String {
+    step_census(&compiled.schedule_step_names().expect("a compiled schedule"))
+}
+
+/// Two runs' outputs against each other: how many elements differ, and the largest
+/// absolute difference. Zero differing elements is bit-identity.
+pub fn output_difference(a: &[Vec<f32>], b: &[Vec<f32>]) -> (usize, f32) {
+    assert_eq!(a.len(), b.len(), "both arms produce the same outputs");
+    let mut differing = 0;
+    let mut worst = 0.0f32;
+    for (x, y) in a.iter().zip(b) {
+        assert_eq!(x.len(), y.len(), "both arms' outputs have one width");
+        for (u, v) in x.iter().zip(y) {
+            if u.to_bits() != v.to_bits() {
+                differing += 1;
+                worst = worst.max((u - v).abs());
+            }
+        }
+    }
+    (differing, worst)
 }
 
 /// The packed multiplies one audio-encoder block dispatches: four when its three attention

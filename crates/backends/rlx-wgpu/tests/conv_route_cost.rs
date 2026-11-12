@@ -23,11 +23,14 @@
 //!
 //! The im2col spatial floor and the 1×1 route's admission bar are two decisions, not
 //! one: the 1×1 bar is the frozen `256 × 2048` product the two once shared
-//! (`backend::POINTWISE_MIN_COL_ELEMS`), so the floor's default of 100 moves every
-//! non-pointwise shape whose output clears it — the band `[100, 800)` wholesale, the
-//! extent the old default of 800 refused — onto the materialised route, moves nothing
-//! at or above 800, and leaves every 1×1 shape exactly where it was (that bar is
-//! unchanged).
+//! (`backend::POINTWISE_MIN_COL_ELEMS`), so the floor's default of 1 clears the spatial
+//! bar for every non-pointwise shape with real taps, whatever its extent — the K (256)
+//! and channel (64) floors still refuse the shapes they always did, this file's
+//! `c_out`-32 rows among them — and leaves every 1×1 shape exactly where it was (that bar
+//! is unchanged). The one row here whose extent the earlier defaults (800, then 100)
+//! refused is `depthwise-l50`, and its groups keep it off every accelerated route at any
+//! floor — so no row's route moves with the floor, and the same table is asserted under
+//! either value.
 //!
 //! Nothing here asserts a duration: `run()` includes submission, the device wait and
 //! the readback, so a reading is mostly that fixed floor. Only facts that can be
@@ -40,9 +43,9 @@
 //! its reservation, parked or not.
 //!
 //! The rows whose predecessor route was the direct kernel — the three long-standing
-//! `Conv2d` rows, `entry-l100`, `refuse-height-pad` and the strided band row this default
-//! adds — are the rows whose off column *is* their before side, so their ratio is the
-//! row's own. `mirror-dilated-d2` is not such a row: this floor moved it off the
+//! `Conv2d` rows, `entry-l100`, `refuse-height-pad` and the strided band row the 100
+//! default added — are the rows whose off column *is* their before side, so their ratio is
+//! the row's own. `mirror-dilated-d2` is not such a row: that floor moved it off the
 //! `conv2d_tiled` relabel, so its off column (the direct kernel) overstates the win, and
 //! it is measured a third time with the floor put back through the lever the run itself
 //! pulls (`predecessor_pair`, `RLX_WGPU_IM2COL_MIN_SPATIAL`), which prints the route it
@@ -88,9 +91,9 @@ struct BodyConv {
 }
 
 /// The 7-tap (`Conv1x7`) family: the dense shapes with the length taps in slot 1
-/// (`entry-l100` is the boundary pin for the im2col spatial floor — its output
-/// length is the floor itself at its inclusive lower bound, now that `dense-l800`'s
-/// 800 sits far inside it), the two depthwise shapes, the ONNX lift with the taps in
+/// (`entry-l100` is the decoder body's own entry conv — the shape the im2col floor's
+/// earlier default of 100 was defined at, its output length being that value at its
+/// inclusive lower bound), the two depthwise shapes, the ONNX lift with the taps in
 /// slot 0, and the dilated mirrored pair (one censusing the relabel's half of the band,
 /// the other carrying the relabel's dilation axis at the shipped default) — the shapes
 /// the forward-parity suite added plus the dilation axis the mirrored relabel has to
@@ -168,9 +171,9 @@ const CONV1X7: [BodyConv; 15] = [
         d: [1, 1],
         groups: 1,
     },
-    // The decoder body's entry conv, and now the floor's own boundary pin: out 100 is
-    // the im2col spatial floor itself (inclusive) and the shape this move takes off the
-    // direct kernel.
+    // The decoder body's entry conv: the shape the im2col floor's earlier default of 100
+    // was defined at (out 100 is that value, the inclusive lower bound) and the shape
+    // that move took off the direct kernel.
     BodyConv {
         label: "entry-l100",
         c_in: 1024,
@@ -236,7 +239,7 @@ const CONV1X7: [BodyConv; 15] = [
         d: [1, 1],
         groups: 1,
     },
-    // Out 794 now clears the 100 im2col spatial floor, so this row leaves the mirrored
+    // Out 794 clears the im2col spatial floor, so this row leaves the mirrored
     // relabel for the materialised route — the census row for the relabel's half of the
     // band. The row below is the same geometry under the im2col channel floor, and is the
     // shape the forward-parity suite pins.
@@ -273,7 +276,7 @@ const CONV1X7: [BodyConv; 15] = [
     },
     // The mirror must be REFUSED here: the height axis carries padding, so H is a real
     // axis — the relabel would move it onto the length axis and resize the output
-    // (3×200 instead of 200). Out 3×200 = 600 now clears the 100 im2col floor, so this
+    // (3×200 instead of 200). Out 3×200 = 600 clears the im2col floor, so this
     // row leaves the direct kernel for the materialised one and stops discriminating the
     // refusal. The row below keeps that discrimination, on the same refusal.
     BodyConv {
@@ -323,8 +326,8 @@ const CONV1X1: [BodyConv; 5] = [
         groups: 1,
     },
     // The frozen 1×1 bar, seen from below: `c_in × spatial` = 384 000 lies inside
-    // the band the im2col floor's old coupling would admit now that the floor is 100
-    // (256 × 100) and below the 1×1 route's own bar (256 × 2048), so the row must
+    // the band the im2col floor's old coupling would admit now that the floor is 1
+    // (256 × 1) and below the 1×1 route's own bar (256 × 2048), so the row must
     // keep the direct kernel on both arms. Were the 1×1 admission still tied to
     // the im2col floor, it would flip to `conv1x1_gemm` here.
     BodyConv {
@@ -382,7 +385,7 @@ const CONV1X1: [BodyConv; 5] = [
 /// so the 2-D half of the band's blast radius (an ordinary vision conv on a small
 /// map) is this family's job. Three rows were admitted by the previous floor move
 /// (2048 → 800) — extents 841, 1600 and 900, inside `[800, 2048)` — and the strided
-/// row is newly admitted by this default (extent 208, inside `[100, 800)`).
+/// row is the one the 100 default admitted (extent 208, inside `[100, 800)`).
 ///
 /// `map-3x3-29x29-c32` is the smallest ordinary one: extent 841 just over the floor
 /// of 800, `c_in*kh*kw` 288 just over the K floor, `c_out` on its floor.
@@ -428,7 +431,7 @@ const CONV2D: [BodyConv; 4] = [
     },
     // The row this floor admits and no other row carries: the encoder's third input conv
     // — real 2-D taps, a padded map and a stride of 2 — output 16×13 = 208, strictly
-    // inside the band this default opens. Every other accelerated fixture is either
+    // inside the band the 100 default opened. Every other accelerated fixture is either
     // stride-1 or a unit-height lift, and the mirrored relabel can never serve two real
     // taps (it needs `kernel_size[0] == 1`), so without this row the materialised route
     // has no coverage at all for a strided padded map. Col 576 × 208 × 4 = 479 232 B,
@@ -578,8 +581,8 @@ fn conv_route(counts: &BTreeMap<&'static str, usize>) -> &'static str {
 /// a shape whose route silently disappears would otherwise show up only as a
 /// 1.00× row in a harness nobody diffs. The two arms are pinned together, so the
 /// table also states which shapes moved (`overlap`: already accelerated today, onto
-/// the other accelerated route; `entry-l100`: the decoder-body row the new floor is
-/// defined at — its output length is the floor itself; `mirror-dilated-d2` and
+/// the other accelerated route; `entry-l100`: the decoder-body row the 100 default was
+/// defined at — its output length is that value; `mirror-dilated-d2` and
 /// `refuse-height-pad`: the two rows this floor moves onto the materialised route, one
 /// off the relabel and one off the direct kernel (the relabel refuses its padded height),
 /// whose dilation axis and refusal are carried at the shipped default by the
@@ -593,14 +596,14 @@ fn expected_routes(family: &str, label: &str) -> (&'static str, &'static str) {
         ("Conv1x1", "sub-bar-l3000") => ("conv2d", "conv2d"),
         ("Conv1x1", _) => ("conv2d", "conv1x1_gemm"),
         // The 2-D rows in the floor's band — 841, 1600 and 900 admitted by the
-        // previous move, 208 by this default — all move direct → materialised.
+        // previous move, 208 by the 100 default — all move direct → materialised.
         (
             "Conv2d",
             "map-3x3-29x29-c32" | "map-3x3-40x40" | "map-5x5-30x30-c1024" | "map-3x3-s2-31x25-c64",
         ) => ("conv2d", "im2col_gpu"),
-        // The dense body rows: `entry-l100` sits exactly on the 100 im2col spatial
-        // floor — the boundary row for it now that the floor is inclusive there and
-        // `dense-l800`'s 800 is far inside it. The three wider dense rows (768, 384 and
+        // The dense body rows: `entry-l100` sat exactly on the im2col floor's earlier
+        // default of 100 — the boundary row for that default, its comparison inclusive —
+        // and `dense-l800`'s 800 was far inside it. The three wider dense rows (768, 384 and
         // 192 channels) are past the implicit route's 96-channel cap, so the accelerated
         // route they take is still the materialised one.
         (_, "dense-l800" | "dense-l4000" | "dense-l16000" | "entry-l100") => {
@@ -759,8 +762,8 @@ fn measure_pair(scope: &str, bg: &BodyGraph) -> Pair {
     }
 }
 
-/// The floor the third arm puts back — the value this default came down from in the earlier
-/// move, above every row in the band, so those rows' predecessor route there is
+/// The floor the third arm puts back — the value the 100 default came down from in the
+/// earlier move, above every row in the band, so those rows' predecessor route there is
 /// unambiguous. Raising this key above a shape's own output length is how a fixture reaches
 /// the tiled route at the shipped default.
 const PREDECESSOR_FLOOR: usize = 2048;
@@ -1078,7 +1081,7 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     // the dense body conv routes through `im2col_gpu`; the 1×1 pointwise conv emits
     // a `conv1x1_gemm` step (`Step::Matmul { from_conv1x1: true }` — its `m` is the
     // output-channel axis, so scaling `m` would leave channels unwritten) on a shape
-    // the dense probe never measures; and (2b) below, the band this default opens.
+    // the dense probe never measures; and (2b) below, the band the 100 default opened.
     let dense = row(&CONV1X7, "dense-l4000");
     probe_active_extent(
         "dense [1,384,1,4000] k=[1,7], vetoed by im2col_gpu",
@@ -1096,13 +1099,13 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         ["conv2d", "conv1x1_gemm"],
     );
 
-    // (2b) the band this default opens, on a graph whose only conv sits in it — the
-    // measured entry shape, whose extent is the floor itself: the direct kernel it used
+    // (2b) the band the 100 default opened, on a graph whose only conv sits in it — the
+    // measured entry shape, whose extent is that default: the direct kernel it used
     // to take was active-extent safe, the `im2col_gpu` step it now takes is not, so this
     // graph loses the mode.
     let near_floor = row(&CONV1X7, "entry-l100");
     probe_active_extent(
-        "band [entry-l100] (the band this default opens), vetoed by im2col_gpu",
+        "band [entry-l100] (the band the 100 default opened), vetoed by im2col_gpu",
         &build_family(
             "conv_active_extent_band",
             std::slice::from_ref(&near_floor),
@@ -1115,7 +1118,7 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     // *shape* alone, separately from the routing, so it must not leak into graphs
     // whose convolutions never qualify: both arms must plan identically, both for
     // a conv-free graph and for one carrying convolutions that clear no route's
-    // floor (a 1×7 whose spatial now sits exactly on the im2col floor but whose
+    // floor (a 1×7 whose spatial clears the im2col floor but whose
     // `k_total` 8 × 7 = 56 and its 8 channels are far under the K and channel floors,
     // and a 1×1 below the `c_out` floor). One compile per arm gives both halves — step
     // counts and the planned arena — so the `arena=… MiB` schedule lines the lowering

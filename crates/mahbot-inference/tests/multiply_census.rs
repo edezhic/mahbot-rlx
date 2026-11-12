@@ -231,20 +231,6 @@ fn paired_frame(
     (a_ms, b_ms, diffs)
 }
 
-/// The largest difference between two arms' output lists, element for element: a
-/// stand-down's value witness, with the codes themselves compared by the caller.
-fn output_delta(a: &[Vec<f32>], b: &[Vec<f32>]) -> f64 {
-    assert_eq!(a.len(), b.len(), "both arms produce the same outputs");
-    let mut max_abs = 0f64;
-    for (x, y) in a.iter().zip(b) {
-        assert_eq!(x.len(), y.len(), "both arms' outputs have one width");
-        for (u, v) in x.iter().zip(y) {
-            max_abs = max_abs.max((u - v).abs() as f64);
-        }
-    }
-    max_abs
-}
-
 /// One paired window's line: both arms' medians, the paired difference's median and
 /// spread, the stood-down arm's wins, and what the difference is worth over the
 /// cell's own [`CELL_FRAMES`] frames -- a per-frame figure, not a per-level one.
@@ -669,7 +655,8 @@ fn the_synthesis_loops_per_shape_rate_census_with_models() {
         );
         let a_out = arm_outputs(&mut shipped, &shipped_set, &values_in);
         let b_out = arm_outputs(&mut arm, &arm_set, &values_in);
-        let max_abs = output_delta(&a_out, &b_out);
+        // A stand-down's value witness, with the codes themselves compared below.
+        let max_abs = f64::from(support::output_difference(&a_out, &b_out).1);
         assert!(
             a_out
                 .iter()
