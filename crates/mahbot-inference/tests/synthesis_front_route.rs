@@ -42,10 +42,10 @@
 //! and its two arms are given back before the next is built; the one such shape timed
 //! anyway is the speaker encoder at 128 mel frames, the control row where both floors
 //! already took the materialising route.
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::Arc;
 
 use mahbot_inference::graphs::{self, DAC_WINDOW, FRONT_WINDOW};
-use mahbot_inference::loader::{self, Pair, Role};
+use mahbot_inference::loader::{Pair, Role};
 use mahbot_inference::stand;
 use mahbot_inference::tokenizer::Tokenizer;
 use rlx_runtime::Device;
@@ -90,74 +90,26 @@ const ROUNDS: usize = 9;
 /// because those graphs are not where the decision is made.
 const QUIET_ROUNDS: usize = 5;
 
-/// The floor is a process-global lever, so a subject runs alone: a second one in the
-/// same process would build its arms under the other's floor and print plausible
-/// numbers for a route neither arm took. The guard is held for the subject's body, so a
-/// sequential run of both is fine.
-fn solo(subject: &str) -> MutexGuard<'static, ()> {
-    static RUNNING: Mutex<()> = Mutex::new(());
-    match RUNNING.try_lock() {
-        Ok(guard) => guard,
-        Err(TryLockError::WouldBlock) => panic!(
-            "{subject}: another subject of this file is running in this process, and the \
-             floor lever is process-global — name one subject"
-        ),
-        // A subject that panicked has already failed the run; the lock is still held
-        // by nobody, so the next one may proceed.
-        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-    }
-}
-
 /// Run `body` with the floor's key at `floor`, then put the key back to what it held
-/// (unset if it held nothing): a graph it builds keeps the route it was built with, and a
-/// walk it runs compiles and runs under it. The key is process-global, so the restore is
-/// a guard — a panic in the body must not leave the process measuring under a floor
-/// nobody asked for, and a nested call must not drop the outer arm's floor.
+/// (unset if it held nothing). The floor is read from a cached snapshot, so the reload is
+/// part of the lever on both sides of the body: a nested call must not drop the outer
+/// arm's floor, and a panic in the body must not leave the process measuring under a
+/// floor nobody asked for.
 fn at_floor<T>(floor: usize, body: impl FnOnce() -> T) -> T {
     const KEY: &str = "RLX_WGPU_IM2COL_MIN_SPATIAL";
-    struct Restore(Option<String>);
-    impl Drop for Restore {
+    struct Reload;
+    impl Drop for Reload {
         fn drop(&mut self) {
-            match &self.0 {
-                Some(previous) => rlx_ir::env::set(KEY, previous.clone()),
-                None => rlx_ir::env::unset(KEY),
-            }
             rlx_wgpu::reload_runtime_config();
         }
     }
-    let previous = rlx_ir::env::var(KEY);
-    rlx_ir::env::set(KEY, floor.to_string());
-    rlx_wgpu::reload_runtime_config();
-    let _restore = Restore(previous);
-    body()
-}
-
-/// The pair a role reads: files that are not on this machine skip, and a present pair
-/// that will not open fails — a subject that skipped on a broken model would let this
-/// file's evidence vanish while the run read `ok`.
-fn pair_of(role: Role) -> Option<Arc<Pair>> {
-    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
-        return None;
-    }
-    let dir = match loader::models_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("skip: {e:#} — the probe did not run");
-            return None;
-        }
-    };
-    let (body, sound) = loader::pair_files(role).expect("every role is pinned");
-    for name in [body, sound] {
-        let path = dir.join(name);
-        if !path.is_file() {
-            eprintln!("skip: {} is not on this machine", path.display());
-            return None;
-        }
-    }
-    Some(Arc::new(
-        Pair::open(dir.join(body), dir.join(sound))
-            .unwrap_or_else(|e| panic!("{}: {e:#}", dir.display())),
-    ))
+    // Declared before the `with_env` call, so it drops after `with_env`'s own restore
+    // guard has put the key back: the reload must read the restored key, not the floor.
+    let _reload = Reload;
+    support::with_env(KEY, &floor.to_string(), || {
+        rlx_wgpu::reload_runtime_config();
+        body()
+    })
 }
 
 /// The recognition conv front at `frames`.
@@ -167,18 +119,6 @@ fn asr_front(pair: &Arc<Pair>, frames: usize) -> graphs::Compiled {
         graphs::asr_encoder_front(pair.sound.clone(), frames).expect("the conv front"),
     )
     .expect("the conv front compiles")
-}
-
-/// One front-group graph at `frames`.
-fn build_front(pair: &Arc<Pair>, frames: usize) -> graphs::Compiled {
-    graphs::sound_graph(
-        Device::Gpu,
-        &pair.sound,
-        frames,
-        graphs::codec_groups()[0].clone(),
-        0,
-    )
-    .expect("the front's graph")
 }
 
 /// One graph built under both floors and held together: its two censuses and its
@@ -192,26 +132,8 @@ fn paired(label: &str, rounds: usize, build: impl Fn() -> graphs::Compiled) {
     );
     let hi_in = support::filled_inputs(&high.runner.graph, 0.1);
     let lo_in = support::filled_inputs(&low.runner.graph, 0.1);
-    support::frame_once(&mut high, &hi_in);
-    support::frame_once(&mut low, &lo_in);
-    let (mut hi_ms, mut lo_ms, mut deltas) = (Vec::new(), Vec::new(), Vec::new());
-    for round in 0..rounds {
-        // Alternate which arm runs first, so a within-round drift lands on both
-        // arms rather than on the delta; the sign stays high minus low in both
-        // orders.
-        let (h, l) = if round % 2 == 0 {
-            (
-                support::frame_once(&mut high, &hi_in),
-                support::frame_once(&mut low, &lo_in),
-            )
-        } else {
-            let l = support::frame_once(&mut low, &lo_in);
-            (support::frame_once(&mut high, &hi_in), l)
-        };
-        hi_ms.push(h);
-        lo_ms.push(l);
-        deltas.push(h - l);
-    }
+    let (hi_ms, lo_ms, deltas) =
+        support::paired_rounds(rounds, &mut high, &hi_in, &mut low, &lo_in);
     // The value check runs on the deterministic ramp rather than the fill the timing
     // uses: a constant fill cannot show a reordered sum.
     let hi_out = high.run(&support::ramped_inputs(&high.runner.graph));
@@ -259,8 +181,8 @@ fn census_only(label: &str, build: impl Fn() -> graphs::Compiled) {
 #[test]
 #[ignore = "measurement only: prices the synthesis front at every frame count, both floors"]
 fn the_front_costs_its_frames() {
-    let _solo = solo("the_front_costs_its_frames");
-    let Some(pair) = pair_of(Role::Synthesis) else {
+    let _solo = support::solo("the_front_costs_its_frames");
+    let Some(pair) = support::pair_of(Role::Synthesis) else {
         return;
     };
     println!(
@@ -269,7 +191,7 @@ fn the_front_costs_its_frames() {
     );
     for &frames in &LENGTHS {
         paired(&format!("front frames={frames}"), ROUNDS, || {
-            build_front(&pair, frames)
+            support::codec_group(&pair, frames, 0)
         });
     }
 }
@@ -280,12 +202,12 @@ fn the_front_costs_its_frames() {
 #[test]
 #[ignore = "measurement only: what the lower floor admits in the other product graphs"]
 fn what_the_lower_floor_admits_outside_the_front() {
-    let _solo = solo("what_the_lower_floor_admits_outside_the_front");
+    let _solo = support::solo("what_the_lower_floor_admits_outside_the_front");
     let groups = graphs::codec_groups();
     // Each role's rows stand on that role's own pair: a machine with one pair and not
     // the other loses only the half it cannot measure, rather than reporting `ok` for a
     // run that measured nothing.
-    if let Some(recognition) = pair_of(Role::Recognition) {
+    if let Some(recognition) = support::pair_of(Role::Recognition) {
         // The conv front at the shortest and the longest rung, where the census is the
         // whole question, and at the short one-piece inputs the floor newly admits,
         // which are priced because their route does change.
@@ -341,7 +263,7 @@ fn what_the_lower_floor_admits_outside_the_front() {
     // decode graph, and the mel graph maps — outlive the dropped pair, and the synthesis
     // half builds graphs of up to half a gigabyte under them.
     mahbot_inference::release_process_memory();
-    let Some(pair) = pair_of(Role::Synthesis) else {
+    let Some(pair) = support::pair_of(Role::Synthesis) else {
         return;
     };
     // The synthesis stage groups at the spans the stand's part lengths cut: 23 and

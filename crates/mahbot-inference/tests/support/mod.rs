@@ -8,8 +8,10 @@
 
 #![allow(dead_code)] // each binary takes the subset it uses
 
+use std::sync::Arc;
+
 use mahbot_inference::graphs;
-use mahbot_inference::loader::Pair;
+use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::tokenizer::Tokenizer;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape, Tick};
@@ -102,6 +104,85 @@ pub fn assert_run_report_off() {
     );
 }
 
+/// A subject's exclusive hold on the process. The route and floor switches are
+/// process-global, so two subjects building together would each compile under the
+/// other's setting and still print plausible figures. Held for the subject's body, so a
+/// sequential run of both is fine.
+pub fn solo(subject: &str) -> std::sync::MutexGuard<'static, ()> {
+    static RUNNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    match RUNNING.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => panic!(
+            "{subject}: another subject of this file is running in this process, and the \
+             switch it sets is process-global — name one subject"
+        ),
+        // A subject that panicked has already failed the run; the lock is held by nobody,
+        // so the next one may proceed.
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    }
+}
+
+/// Run `body` with the environment `key` at `value`, then put the key back to what it held
+/// (unset if it held nothing): a graph the body builds keeps the route it was built with,
+/// and the key is process-global, so the restore is a guard rather than a trailing line.
+/// A caller whose key is read from a cached snapshot reloads it inside `body`.
+pub fn with_env<T>(key: &str, value: &str, body: impl FnOnce() -> T) -> T {
+    struct Restore(String, Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(previous) => rlx_ir::env::set(&self.0, previous.clone()),
+                None => rlx_ir::env::unset(&self.0),
+            }
+        }
+    }
+    let previous = rlx_ir::env::var(key);
+    rlx_ir::env::set(key, value);
+    let _restore = Restore(key.to_string(), previous);
+    body()
+}
+
+/// The pair a role reads: files that are not on this machine skip, and a present pair
+/// that will not open fails — a subject that skipped on a broken model would let the
+/// harness's evidence vanish while the run read `ok`.
+pub fn pair_of(role: Role) -> Option<Arc<Pair>> {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return None;
+    }
+    let dir = match loader::models_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("skip: {e:#} — the probe did not run");
+            return None;
+        }
+    };
+    let (body, sound) = loader::pair_files(role).expect("every role is pinned");
+    for name in [body, sound] {
+        let path = dir.join(name);
+        if !path.is_file() {
+            eprintln!("skip: {} is not on this machine", path.display());
+            return None;
+        }
+    }
+    Some(Arc::new(
+        Pair::open(dir.join(body), dir.join(sound))
+            .unwrap_or_else(|e| panic!("{}: {e:#}", dir.display())),
+    ))
+}
+
+/// One codec group's graph at `frames` — `graphs::sound_graph` at the group's own stage
+/// range, which is the graph a call builds for that group.
+pub fn codec_group(pair: &Arc<Pair>, frames: usize, group: usize) -> graphs::Compiled {
+    graphs::sound_graph(
+        Device::Gpu,
+        &pair.sound,
+        frames,
+        graphs::codec_groups()[group].clone(),
+        0,
+    )
+    .expect("the codec group's graph")
+}
+
 /// The switches that stand a speech-frame subject down, each with its shipped
 /// value: a compile-time stand-down is `0` (off), a run-time one its on value. Each
 /// frame compile — the predictor arm's and the body's — states all of them, and the
@@ -190,6 +271,34 @@ pub fn frame_once(compiled: &mut graphs::Compiled, inputs: &[(String, Vec<f32>)]
     let start = Tick::now();
     compiled.runner.run(inputs);
     Tick::now().elapsed_ns(start) as f64 / 1e6
+}
+
+/// Two arms timed alternately over `rounds` rounds, one warm-up pass per arm discarded:
+/// the arm that runs first swaps each round, so a within-round drift lands on both arms
+/// rather than on the delta. Returns the per-round figures in the order the two arms are
+/// given, and `first − second` per round — the paired difference the callers read.
+pub fn paired_rounds(
+    rounds: usize,
+    first: &mut graphs::Compiled,
+    first_in: &[(String, Vec<f32>)],
+    second: &mut graphs::Compiled,
+    second_in: &[(String, Vec<f32>)],
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    frame_once(first, first_in);
+    frame_once(second, second_in);
+    let (mut a_ms, mut b_ms, mut deltas) = (Vec::new(), Vec::new(), Vec::new());
+    for round in 0..rounds {
+        let (a, b) = if round % 2 == 0 {
+            (frame_once(first, first_in), frame_once(second, second_in))
+        } else {
+            let b = frame_once(second, second_in);
+            (frame_once(first, first_in), b)
+        };
+        a_ms.push(a);
+        b_ms.push(b);
+        deltas.push(a - b);
+    }
+    (a_ms, b_ms, deltas)
 }
 
 /// A schedule's `Step::Kind:count+…` census, one entry per step kind the schedule

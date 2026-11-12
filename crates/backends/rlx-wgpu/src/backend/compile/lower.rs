@@ -8754,9 +8754,10 @@ fn compile_static_with(
                             // switches, the weight's placement, a whole-arena binding,
                             // the adapter's cooperative matrices. The class is the class
                             // of conv the 6-8 block's dilated 1-D stages are (`96 → 96`,
-                            // `kw = 7`, `d ∈ {1, 3, 9}`) and every shape of that kind:
-                            // one workgroup gathers a column block's k-steps once and
-                            // multiplies every row tile the class admits against them.
+                            // `kw = 7`, `d ∈ {1, 3, 9}`), the 4-6 block's (`192 → 192`) and
+                            // every shape of that kind: one workgroup gathers a column
+                            // block's k-steps once and multiplies every row tile of its own
+                            // row group against them.
                             // `admits` reads one image (its tile carries one), so above a
                             // batch the class's shapes are what the im2col route below
                             // takes instead — and pay the panel it materialises.
@@ -8811,6 +8812,13 @@ fn compile_static_with(
                             // that does not bind in one storage binding. Counted here, where
                             // the decision is made, so none of them is silent and no term added
                             // to the candidate test above can leave the count behind.
+                            //
+                            // The panel term is not a threshold: the tail holds the largest
+                            // panel `conv_im2col_scratch_bytes` books, 256-aligned, so the
+                            // largest conv sits on it — at equality where its col is already
+                            // aligned, as the codec's 384-channel residual's is. A conv that
+                            // needs more than the tail has no panel reserved and keeps the
+                            // direct route, which is the fallback the planner's own doc states.
                             let use_im2col = im2col_candidate
                                 && !use_implicit
                                 && !parked

@@ -310,6 +310,10 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     fn wgpu_step_names(&self) -> Option<Vec<&'static str>> {
         Some(self.inner.test_step_names())
     }
+
+    fn wgpu_scratch_bytes(&self) -> Option<u64> {
+        Some(self.inner.test_scratch_bytes())
+    }
 }
 
 /// Cast every element of a wgpu f32 output buffer down to the

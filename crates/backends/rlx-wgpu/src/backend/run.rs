@@ -3858,15 +3858,19 @@ impl WgpuExecutable {
                                 pass.dispatch_workgroups(gx, gy, gz);
                             }
                             Step::Conv1dImplicit { params } => {
-                                // One workgroup per 32 spatial columns covers every
-                                // output row tile the class admits (three at most), so
-                                // the gathered k-step serves all of them (see
-                                // `conv1d_implicit.wgsl`).
+                                // One workgroup per 32 spatial columns and per row
+                                // group: a group covers the entry's three row tiles, and
+                                // the gathered k-step serves every tile of its own group
+                                // (see `conv1d_implicit.wgsl`).
                                 let ck = conv1d_implicit_kernel(&dev.device)
                                     .expect("conv1d_implicit admission");
                                 pass.set_pipeline(&ck.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                pass.dispatch_workgroups(params.out_len.div_ceil(32), 1, 1);
+                                pass.dispatch_workgroups(
+                                    params.out_len.div_ceil(32),
+                                    params.c_out.div_ceil(CONV_IMPLICIT_ROW_ROWS as u32),
+                                    1,
+                                );
                             }
                             Step::Conv3d { params } => {
                                 let n_s = scale(params.n);

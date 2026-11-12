@@ -4,11 +4,9 @@
 //! Fixtures and measurement scaffolding shared by this crate's tests: the packed
 //! GGUF weight, the activation ramp, the band module's own geometry helpers
 //! ([`band_device`], [`band_rows`], [`band_key_block`]), and the median together
-//! with the two timing loops ([`time_rounds`], one cell alone, and
-//! [`time_round_robin`], round-robin across a cell set) that the harnesses using
-//! them — `gguf_one_row_stream_rate`, `gguf_gemm_grouped_weight_reuse`,
-//! `gguf_gemm_grouped_split_rate`, `gguf_gemm_grouped_loop_rate` and
-//! `gguf_gemm_prefill_rate` — time their calls with, plus the parity
+//! with the three timing loops — [`time_rounds`] (one cell alone),
+//! [`time_round_robin`] (round-robin across a cell set) and [`paired_round_robin`]
+//! (two arms with the order reversed each round) — plus the parity
 //! helpers, the conv-transpose-2d route levers together with the pair bound its
 //! pins derive their bar from and the six real decoder geometries those pins and
 //! the route harness both read, the bounded child re-exec harness ([`rerun_self`])
@@ -138,6 +136,12 @@ pub fn least(v: &[f64]) -> f64 {
     v.iter().cloned().fold(f64::MAX, f64::min)
 }
 
+/// `v`'s largest figure: `least`'s mirror, seeded so an all-negative arm reports its
+/// own bound rather than zero.
+pub fn greatest(v: &[f64]) -> f64 {
+    v.iter().cloned().fold(f64::MIN, f64::max)
+}
+
 /// One rate harness's cell graph: `steps` identical packed multiplies over one
 /// input matrix, each over its own parameter — the shape a prefill's own graph
 /// runs them in rather than `steps` submissions of one, which is what makes a
@@ -220,6 +224,39 @@ pub fn time_round_robin<T>(
         }
     }
     per_call_ms
+}
+
+/// [`time_round_robin`] with the order reversed each round, and the per-round paired
+/// difference beside the two arms' figures: `rounds` rounds of `calls_per_round` calls
+/// per arm, `first` running first on even rounds and second on odd ones, so a
+/// within-round drift lands on both arms rather than on their difference. Returns each
+/// arm's own per-round figures and `first − second` per round — the statistic a paired
+/// cell reads as the median of.
+pub fn paired_round_robin<T>(
+    first: &mut T,
+    second: &mut T,
+    rounds: usize,
+    calls_per_round: usize,
+    mut one_call: impl FnMut(&mut T),
+) -> ([Vec<f64>; 2], Vec<f64>) {
+    let mut per_call = [Vec::with_capacity(rounds), Vec::with_capacity(rounds)];
+    let mut deltas = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        let mut this = [0.0f64; 2];
+        for i in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+            let arm = if i == 0 { &mut *first } else { &mut *second };
+            let start = rlx_runtime::Tick::now();
+            for _ in 0..calls_per_round {
+                one_call(arm);
+            }
+            this[i] =
+                rlx_runtime::Tick::now().elapsed_ns(start) as f64 / calls_per_round as f64 / 1e6;
+        }
+        per_call[0].push(this[0]);
+        per_call[1].push(this[1]);
+        deltas.push(this[0] - this[1]);
+    }
+    (per_call, deltas)
 }
 
 /// Deterministic packed GGUF bytes for a `[k, n]` weight — a fixed f32 ramp

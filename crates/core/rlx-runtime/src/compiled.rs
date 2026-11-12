@@ -466,6 +466,14 @@ impl CompiledGraph {
         self.inner.wgpu_step_names()
     }
 
+    /// The tail scratch this graph's arena reserves past its activation plan — a conv
+    /// route's im2col panel, which the plan does not carry. `None` when the backend
+    /// reports none.
+    #[doc(hidden)]
+    pub fn scratch_bytes(&self) -> Option<u64> {
+        self.inner.wgpu_scratch_bytes()
+    }
+
     /// [`Self::set_param`] that returns a wrong-length upload as an error
     /// instead of panicking.
     pub fn try_set_param(

@@ -130,6 +130,15 @@ impl WgpuExecutable {
         self.arena.size as u64
     }
 
+    /// Test hook: the tail scratch zone's bytes — what a route's panel reservation
+    /// books past the activation plan. [`Self::test_arena_bytes`] adds it to the plan,
+    /// so this is the only accessor that says which half moved; the arena report's
+    /// `plan … + scratch …` line is the same figure on stderr.
+    #[doc(hidden)]
+    pub fn test_scratch_bytes(&self) -> u64 {
+        self.arena.scratch_bytes as u64
+    }
+
     /// Test hook: convs whose shape is the cooperative implicit-GEMM route's class
     /// but which kept the im2col/tiled/direct routing, for one of the terms the
     /// shape does not settle (see the field of the same name). Zero on a graph whose

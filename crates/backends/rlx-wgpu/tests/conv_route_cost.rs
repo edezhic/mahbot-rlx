@@ -603,16 +603,16 @@ fn expected_routes(family: &str, label: &str) -> (&'static str, &'static str) {
         ) => ("conv2d", "im2col_gpu"),
         // The dense body rows: `entry-l100` sat exactly on the im2col floor's earlier
         // default of 100 — the boundary row for that default, its comparison inclusive —
-        // and `dense-l800`'s 800 was far inside it. The three wider dense rows (768, 384 and
-        // 192 channels) are past the implicit route's 96-channel cap, so the accelerated
-        // route they take is still the materialised one.
-        (_, "dense-l800" | "dense-l4000" | "dense-l16000" | "entry-l100") => {
-            ("conv2d", "im2col_gpu")
-        }
-        // …and `dense-l48000` is the implicit route's own class — unit height, 96
-        // channels either way, well past the route's extent floor — so it is the dense
-        // row the implicit route moves off the materialised one.
-        (_, "dense-l48000") => ("conv2d", "conv1d_implicit"),
+        // and `dense-l800`'s 800 was far inside it. The two rows wider than the implicit
+        // route's input bound (768 and 384 channels) are past its class, so the
+        // accelerated route they take is still the materialised one.
+        (_, "dense-l800" | "dense-l4000" | "entry-l100") => ("conv2d", "im2col_gpu"),
+        // …and the two at or under it are the implicit route's own class — unit height,
+        // well past the route's extent floor — so they are the dense rows the implicit
+        // route moves off the materialised one: `dense-l48000` at 96 channels either
+        // way, `dense-l16000` at the widest the class takes, 192. On an adapter that
+        // cannot build the entry, see `without_the_implicit_entry`.
+        (_, "dense-l16000" | "dense-l48000") => ("conv2d", "conv1d_implicit"),
         // The two rows this floor takes off the relabel, one carrying the dilation axis
         // and the other the refusal; the `-narrow-c32` rows carry both on the relabel and
         // on the direct kernel at the shipped default (see their table comments).
@@ -630,6 +630,23 @@ fn expected_routes(family: &str, label: &str) -> (&'static str, &'static str) {
             ("conv2d", "conv2d")
         }
         other => panic!("no expected route for {other:?} — the body shape list grew"),
+    }
+}
+
+/// The `(route, arena growth)` outcomes a class row may show on an adapter whose device
+/// cannot build the implicit entry. The class is stated by shape and the route by the
+/// adapter: without the entry the row is back on the panel, and which panel route it takes
+/// is the binding's to decide — the materialised one where that panel binds beside the
+/// row's arena (`dense-l16000`'s 86 016 000 B does on a 128 MiB binding), the relabel
+/// where it does not (`dense-l48000`'s 129 024 000 B does not) — with the panel's
+/// reservation in the first case and none in the second. Both are the behaviour the
+/// widening took these two rows off, and the reservation is paired with its route here
+/// because that is the half the memory pin is about.
+fn without_the_implicit_entry(label: &str) -> &'static [(&'static str, u64)] {
+    match label {
+        "dense-l16000" => &[("im2col_gpu", 86_016_000), ("conv2d_tiled", 0)],
+        "dense-l48000" => &[("im2col_gpu", 129_024_000), ("conv2d_tiled", 0)],
+        other => panic!("{other:?} is not an implicit-class row"),
     }
 }
 
@@ -870,8 +887,6 @@ fn fmt_delta(d: f32) -> String {
 /// assert nothing.
 fn expected_col_delta(label: &str) -> u64 {
     match label {
-        // 192·1·7·16 000·4 = 86 016 000 B col.
-        "dense-l16000" => 86_016_000,
         // 1024·5·5·900·4 = 92 160 000 B col, the in-band 2-D map.
         "map-5x5-30x30-c1024" => 92_160_000,
         // 768·1·7·800·4 = 17 203 200 B col.
@@ -896,8 +911,10 @@ fn expected_col_delta(label: &str) -> u64 {
         // route (a depthwise group, a 1×1 tap, a channel count under the floor, or
         // a sub-bar pointwise shape), or the implicit route takes the shape and the
         // reservation subtracts its class (`conv_im2col_col_elems`), which a class
-        // row pays nothing for.
-        "dense-l48000"
+        // row pays nothing for on an adapter that can build the entry (one that
+        // cannot is `without_the_implicit_entry`'s).
+        "dense-l16000"
+        | "dense-l48000"
         | "mirror-projection"
         | "mirror-strided-s2"
         | "mirror-dilated-narrow-c32"
@@ -1009,12 +1026,17 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         for shape in shapes {
             let one = build_family(family, std::slice::from_ref(shape), 1);
             let pair = measure_pair(shape.label, &one);
-            let (want_off, mut want_on) = expected_routes(family, shape.label);
-            if want_on == "conv1d_implicit" && !implicit_available {
-                // The class is stated by shape, the route by this adapter's entry:
-                // where it cannot be built the row keeps the relabel it came from.
-                want_on = "conv2d_tiled";
-            }
+            let (want_off, want_on) = expected_routes(family, shape.label);
+            // The route and the col reservation the on arm must show together: one outcome
+            // on every adapter that builds the implicit entry, the row's own panel
+            // fallbacks where it cannot (see `without_the_implicit_entry`).
+            let plain = [(want_on, expected_col_delta(shape.label))];
+            let on_expected: &[(&str, u64)] = if want_on == "conv1d_implicit" && !implicit_available
+            {
+                without_the_implicit_entry(shape.label)
+            } else {
+                &plain
+            };
             assert_eq!(
                 conv_route(&pair.off_counts),
                 want_off,
@@ -1022,26 +1044,23 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
                 shape.label,
                 pair.off_counts
             );
-            assert_eq!(
-                conv_route(&pair.on_counts),
-                want_on,
-                "{}: the on arm must take {want_on} (schedule {:?})",
+            // The memory half of the switch is pinned with the route, against the delta
+            // recorded for the row in `expected_col_delta` — nothing is recomputed here. A
+            // shape-qualifying conv costs its own col panel, the whole of the tail now that
+            // no floor sits under it; every other row costs nothing, which is why a 1×1 or
+            // depthwise shape leaves the arena alone while any qualifying col grows it. A
+            // failure here on an adapter whose `max_storage_buffer_binding_size` cannot
+            // take the col says the accelerated routes are off on that adapter — loud, not
+            // silent.
+            let on = (conv_route(&pair.on_counts), pair.on_arena - pair.off_arena);
+            assert!(
+                on_expected.contains(&on),
+                "{}: the on arm must show one of {on_expected:?} — it took {} and grew the \
+                 arena by {} B (schedule {:?})",
                 shape.label,
+                on.0,
+                on.1,
                 pair.on_counts
-            );
-            // The memory half of the switch, pinned on every row against the delta
-            // recorded for it in `expected_col_delta` — nothing is recomputed here. A
-            // shape-qualifying conv costs its own col panel, the whole of the tail
-            // now that no floor sits under it; every other row costs nothing, which
-            // is why a 1×1 or depthwise shape leaves the arena alone while any
-            // qualifying col grows it. A failure here on an adapter whose
-            // `max_storage_buffer_binding_size` cannot take the col says the
-            // accelerated routes are off on that adapter — loud, not silent.
-            assert_eq!(
-                pair.on_arena - pair.off_arena,
-                expected_col_delta(shape.label),
-                "{}: the arena growth the row's recorded col reservation predicts",
-                shape.label
             );
             // The raised-floor arm: the two rows whose before side the switch's off arm is
             // not, read back through the key plus a reloaded snapshot (the floors are read
@@ -1187,14 +1206,11 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     // This is also the arm where `im2col_fallbacks()` is non-zero; the count is
     // printed here, and `conv_routes_parked_weight.rs` asserts both of its arms.
     //
-    // `dense-l16000` carries the largest col here rather than `dense-l48000`: the
-    // latter is the implicit route's class, its panel reservation is subtracted, and a
-    // parked weight only moves it from one no-panel route to another — the pairing this
-    // arm exists for needs a shape the reservation still books.
-    let big = row(&CONV1X7, "dense-l16000");
-    // The row this default moves: its col reservation is new — before the move the shape
-    // took the direct kernel and reserved nothing — and it costs the arena that col
-    // now that no floor sits under the tail.
+    // `dense-l16000` (192 channels) and `dense-l48000` (96) are the implicit route's
+    // class: their panel reservation is subtracted, and a parked weight only moves them
+    // from one no-panel route to another, so the pairing this arm exists for is the rows
+    // the reservation still books — `dense-l4000` (384, the Conv1x7 family's largest),
+    // the row this default moved, and the band's own 2-D map.
     let moved = row(&CONV1X7, "entry-l100");
     // The band's own parked row — a 2-D map the previous floor move admitted, whose col
     // panel is the largest of the band — so the combination "parked, in the band, col
@@ -1210,7 +1226,7 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         rlx_ir::env::unset("RLX_WGPU_ALL_PARAMS_WEIGHT");
         (off, on)
     };
-    for shape in [dense, moved, big, in_band] {
+    for shape in [dense, moved, in_band] {
         let (off, on) = parked_pair(&shape);
         let (off_counts, on_counts) = (off.exe.step_kind_counts(), on.exe.step_kind_counts());
         let (off_b, on_b) = (off.exe.test_arena_bytes(), on.exe.test_arena_bytes());

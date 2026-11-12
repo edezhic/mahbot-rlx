@@ -99,7 +99,7 @@ Two things that whole-set run does not cover by itself. `test-workspace` is
 a target behind `required-features = "backend-tests"` is still skipped — the wgpu
 integration suite among them. `test-gpu` is what builds those, which is why
 `ci-workspace` names it. `test-workspace` names one feature itself —
-`--features mahbot-inference/hand-run` — because that crate's eleven hand-run
+`--features mahbot-inference/hand-run` — because that crate's twelve hand-run
 targets were part of the whole-set run before they were gated (its manifest says
 why), and a whole-set run that stopped reaching them would lose coverage without
 saying so.

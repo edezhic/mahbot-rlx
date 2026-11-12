@@ -286,11 +286,42 @@ pub(crate) fn conv_implicit_min_spatial() -> u64 {
     )
 }
 
-/// The most output rows the implicit entry's accumulator sets cover — its
-/// `ROW_TILES` sets of `TILE_M` rows, pinned against the shader source by
-/// `the_implicit_class_cap_is_the_entrys_row_tiles`. A wider `c_out` would have
-/// rows no set covers, so the class refuses it on the host.
-pub(crate) const CONV_IMPLICIT_MAX_C_OUT: u64 = 96;
+/// The output rows one row group of the implicit entry covers — its `ROW_TILES`
+/// accumulator sets of `TILE_M` rows, pinned against the shader source by
+/// `the_row_group_is_the_entrys_row_tiles`. The host dispatches one workgroup
+/// per group, `c_out.div_ceil` of this on the grid's `y`, so an output wider than one
+/// group costs a workgroup and not a second set of accumulators.
+pub(crate) const CONV_IMPLICIT_ROW_ROWS: u64 = 96;
+
+/// The widest output the class takes. The entry has no structural output bound — the
+/// host dispatches one workgroup per [`CONV_IMPLICIT_ROW_ROWS`] of `c_out` and the kernel
+/// handles any number of groups — so, like [`CONV_IMPLICIT_MAX_C_IN`], this is a policy
+/// term: two groups is the width of the synthesis codec's 192-channel residuals, the
+/// shapes this class was widened for and measured at. The same block's 384-channel
+/// convs are four groups and would take that group's reservation to zero; they are the
+/// next widening, not this one's, and each step needs its own paired measurement at the
+/// shapes it admits.
+///
+/// What the second group buys that block: at the stand's 90-frame part its stage-4..6
+/// graph reserves 309 657 600 B of im2col panel before the class takes the 192-channel
+/// convs and 154 828 800 B after — the 384-channel conv's panel, the next-largest and
+/// out of this class's reach — and 495 452 160 → 247 726 080 B at the codec's 144-frame
+/// window. The 90-frame graph is also faster: nine alternating paired rounds of the two
+/// routes over the same window (`sound_decoder_scratch`'s
+/// `the_admitted_convs_are_not_slower_than_the_panel_route`) put the route 8.5 to 9.1 ms
+/// ahead by median on quiet takes — more under contention, which the panel arm pays for
+/// in traffic — and no round of any take was slower. The absolute figure follows the
+/// machine, so the sign and the round count are the claim, which is why the routes are
+/// paired at all.
+pub(crate) const CONV_IMPLICIT_MAX_C_OUT: u64 = 192;
+
+/// The widest *input* the class takes. The entry has no structural input bound — it
+/// gathers one input row per k step, whatever `c_in` is, and its cost per output column
+/// is the same `k_total` gather — so this too is a policy term: it is set to the width of
+/// the synthesis codec's 192-channel residuals, and it is deliberately its own constant
+/// so that widening the output side never drags the input side with it, or the other way
+/// round.
+pub(crate) const CONV_IMPLICIT_MAX_C_IN: u64 = 192;
 
 /// The narrowest output the implicit entry takes. The entry multiplies a whole
 /// 32-row tile whatever `c_out` is, so below a tile's rows it multiplies output the
@@ -302,12 +333,13 @@ pub(crate) const CONV_IMPLICIT_MIN_C_OUT: u64 = 4;
 
 /// The shape class the cooperative implicit-GEMM conv is admitted for, in the
 /// terms the `Op::Conv` compile arm's geometry states it: a unit height with every
-/// tap on W and no height padding, one group and one batch, at most 96 input
-/// channels and between [`CONV_IMPLICIT_MIN_C_OUT`] and 96 of output, at or above
-/// the route's own extent floor, and column blocks inside the per-dimension
-/// dispatch cap. The cap on `c_out` is the kernel's own: one workgroup covers every
-/// output row tile, and the accumulator sets it has are three — 96 rows is the
-/// widest output they cover.
+/// tap on W and no height padding, one group and one batch, at most
+/// [`CONV_IMPLICIT_MAX_C_IN`] input channels and between [`CONV_IMPLICIT_MIN_C_OUT`]
+/// and [`CONV_IMPLICIT_MAX_C_OUT`] of output, at or above the route's own extent
+/// floor, and column blocks inside the per-dimension dispatch cap. The two channel
+/// bounds are separate constants because a shape must not enter the class on one
+/// bound's business: the kernel's own term is [`CONV_IMPLICIT_ROW_ROWS`] rows per
+/// workgroup, and the host dispatches one workgroup per group of them.
 ///
 /// The lowering adds the terms the shape does not settle — the route's switches,
 /// the adapter, the weight's placement, the arena's binding — and
@@ -337,7 +369,7 @@ impl ConvImplicitShape {
             && self.ph == 0
             && self.groups == 1
             && self.n == 1
-            && self.c_in <= CONV_IMPLICIT_MAX_C_OUT
+            && self.c_in <= CONV_IMPLICIT_MAX_C_IN
             && self.c_out <= CONV_IMPLICIT_MAX_C_OUT
             && self.c_out >= CONV_IMPLICIT_MIN_C_OUT
             && self.spatial >= conv_implicit_min_spatial()
@@ -6463,11 +6495,11 @@ mod conv_route_decision_tests {
         );
     }
 
-    /// The implicit class's channel bounds are the entry's own: a ceiling because it
-    /// carries three accumulator sets (an output one row past three tiles would have
-    /// rows no set covers) and a floor because below a tile's rows it multiplies
-    /// output the conv does not have. The kernel guards neither, so the refusal has
-    /// to happen here.
+    /// The implicit class's channel bounds as the shape decision reads them: an output
+    /// ceiling, a floor, and an input ceiling that is a separate constant so that a shape
+    /// cannot enter the class on one bound's business. The constants carry what each of
+    /// them is and why; this row pins that `admits` takes the shapes inside all three and
+    /// refuses the ones past any of them.
     #[test]
     fn a_conv_outside_the_implicit_class_channel_bounds_is_refused() {
         let shape = |c_in, c_out| ConvImplicitShape {
@@ -6483,15 +6515,30 @@ mod conv_route_decision_tests {
             n: 1,
             spatial: conv_implicit_min_spatial(),
         };
-        assert!(
-            shape(96, 96).admits(),
-            "three whole row tiles is the ceiling"
-        );
+        for (c_in, c_out) in [
+            (96, 96),
+            (CONV_IMPLICIT_MAX_C_IN, CONV_IMPLICIT_MAX_C_OUT),
+            (CONV_IMPLICIT_MAX_C_IN, 96),
+            (96, CONV_IMPLICIT_MAX_C_OUT),
+            // A second row group whose last tile is partial: the host dispatches two
+            // groups and the second one's tile count is its own rows, not a whole one.
+            (96, 104),
+        ] {
+            assert!(
+                shape(c_in, c_out).admits(),
+                "{c_in}/{c_out} is inside the channel bounds the entry keeps"
+            );
+        }
         assert!(
             shape(96, 4).admits(),
             "four rows is the narrowest output the entry is admitted for"
         );
-        for (c_in, c_out) in [(97, 96), (96, 97), (96, 104), (96, 3), (96, 1)] {
+        for (c_in, c_out) in [
+            (CONV_IMPLICIT_MAX_C_IN + 1, 96),
+            (96, CONV_IMPLICIT_MAX_C_OUT + 1),
+            (96, 3),
+            (96, 1),
+        ] {
             assert!(
                 !shape(c_in, c_out).admits(),
                 "{c_in}/{c_out} is outside the channel bounds the entry keeps"
@@ -6499,16 +6546,21 @@ mod conv_route_decision_tests {
         }
     }
 
-    /// The class's cap restates what the entry covers, so the numbers cannot drift:
-    /// `ROW_TILES` accumulator sets of `TILE_M` rows are exactly the cap, and the
-    /// epilogue stores one row tile per set. Both are read out of the shader source,
-    /// because the kernel guards neither and the host cap is all that keeps a wider
-    /// output away from it.
+    /// The class's row-group term restates what the entry covers, so the numbers cannot
+    /// drift: `ROW_TILES` accumulator sets of `TILE_M` rows are one row group, and the
+    /// epilogue stores one row tile per set. All of them are read out of the shader
+    /// source, because what keeps a shape's rows and stores in step is the host's group
+    /// count on one side and the kernel's own tile count on the other — a half-applied
+    /// widening would write only the first group's rows.
     #[test]
-    fn the_implicit_class_cap_is_the_entrys_row_tiles() {
+    fn the_row_group_is_the_entrys_row_tiles() {
         let src = crate::kernels::CONV1D_IMPLICIT_WGSL;
         assert!(src.contains("const ROW_TILES: u32 = 3u;"), "three sets");
         assert!(src.contains("const TILE_M: u32 = 32u;"), "32 rows a set");
+        assert!(
+            src.contains("const ROW_ROWS: u32 = ROW_TILES * TILE_M;"),
+            "a row group is those sets"
+        );
         let stores = src
             .lines()
             .filter(|l| l.trim_start().starts_with("copy_out("))
@@ -6517,7 +6569,11 @@ mod conv_route_decision_tests {
             stores, 3,
             "the epilogue stores one row tile per accumulator set"
         );
-        assert_eq!(3 * 32, CONV_IMPLICIT_MAX_C_OUT, "the cap is that coverage");
+        assert_eq!(
+            3 * 32,
+            CONV_IMPLICIT_ROW_ROWS,
+            "a row group is that coverage"
+        );
     }
 
     /// The spatial floor's rule, at its own boundary: the quantity is one conv
@@ -6606,6 +6662,111 @@ mod conv_route_decision_tests {
             0,
             "and a route that gathers through the taps books none"
         );
+    }
+
+    /// The synthesis codec's stage-4..6 group — `dac.blk.1`'s three 384-channel dilated
+    /// residuals and `dac.blk.2`'s three 192-channel ones, kernel 7, dilations 1/3/9 —
+    /// reserves the 384-channel panel and nothing more, because the class takes the
+    /// 192-channel ones. Both ends are pinned exactly, at the typical 90-frame length and
+    /// at the codec's 144-frame window.
+    ///
+    /// The group's shapes are restated here rather than read — this crate cannot see the
+    /// codec's graph — so a conv's panel is the formula `c · 7 · out_len · 4` at the two
+    /// widths the block runs, `dac.blk.1` at 160 columns a frame and `dac.blk.2` at 640.
+    /// The figures are therefore absolute and hold at the shipped floors, whose smallest
+    /// extent here is 14 400 columns; a run that exports either floor lever is measuring
+    /// the lever rather than the default, so the row skips instead of reddening a bisect.
+    /// The product graph's own reservation and step census are the model-dependent
+    /// `sound_decoder_scratch`'s.
+    ///
+    /// The last assertion is the one the lowering's `col_bytes <= arena.scratch_bytes`
+    /// depends on: with the class taking the 192-channel convs, the 384-channel conv's
+    /// panel is the whole reservation and it is still an im2col candidate, so both
+    /// figures are pinned beside that candidate check.
+    #[test]
+    fn the_stage_four_to_six_group_reserves_the_384_channel_panel_alone() {
+        for key in [
+            "RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL",
+            "RLX_WGPU_IM2COL_MIN_SPATIAL",
+        ] {
+            if let Some(value) = rlx_ir::env::var(key) {
+                eprintln!("skip: {key}={value} is a bisect, not the default");
+                return;
+            }
+        }
+        /// `(channels, out_len, dilation)`: the group's six residual `conv1`s, in
+        /// the order the block runs them, each square in the channels it hands on.
+        const GROUP: [(usize, usize, usize); 6] = [
+            (384, 14_400, 1),
+            (384, 14_400, 3),
+            (384, 14_400, 9),
+            (192, 57_600, 1),
+            (192, 57_600, 3),
+            (192, 57_600, 9),
+        ];
+        /// The same six at the codec's own 144-frame window: `dac.blk.1` at 23 040
+        /// columns, `dac.blk.2` at 92 160.
+        const GROUP_WINDOW: [(usize, usize, usize); 6] = [
+            (384, 23_040, 1),
+            (384, 23_040, 3),
+            (384, 23_040, 9),
+            (192, 92_160, 1),
+            (192, 92_160, 3),
+            (192, 92_160, 9),
+        ];
+        // The fixture's conv pads symmetrically (`conv2d_spatial_output`'s `in + 2·pad`),
+        // so an input of `out_len − 6·dilation` yields the group's own output length —
+        // the length the panel and the class both read.
+        fn group_graph(convs: &[(usize, usize, usize)]) -> Graph {
+            let mut g = Graph::new("sound_decoder_group_4_6");
+            let mut outs = Vec::new();
+            for (i, &(c, out_len, dilation)) in convs.iter().enumerate() {
+                let pad = 6 * dilation;
+                let l = out_len - pad;
+                let x = g.input(format!("x{i}"), Shape::new(&[1, c, 1, l], DType::F32));
+                let w = g.param(format!("w{i}"), Shape::new(&[c, c, 1, 7], DType::F32));
+                outs.push(g.conv2d(x, w, [1, 7], [1, 1], [0, pad], [1, dilation], 1));
+            }
+            g.set_outputs(outs);
+            g
+        }
+        for (convs, reservation_off, reservation_on) in [
+            (&GROUP[..], 309_657_600, 154_828_800),
+            (&GROUP_WINDOW[..], 495_452_160, 247_726_080),
+        ] {
+            let g = group_graph(convs);
+            assert_eq!(
+                conv_im2col_scratch_bytes(&g, 0, u64::MAX, false),
+                reservation_off,
+                "without the class the 192-channel conv's panel is the largest"
+            );
+            let booked = conv_im2col_scratch_bytes(&g, 0, u64::MAX, true);
+            assert_eq!(
+                booked, reservation_on,
+                "and the class leaves the 384-channel conv's panel alone"
+            );
+            let candidates: Vec<u64> = g
+                .nodes()
+                .iter()
+                .filter(|n| n.inputs.len() >= 2)
+                .filter_map(|n| {
+                    conv_im2col_col_elems(
+                        &n.op,
+                        &g.node(n.inputs[0]).shape,
+                        &g.node(n.inputs[1]).shape,
+                        &n.shape,
+                        true,
+                    )
+                })
+                .map(|elems| elems * 4)
+                .collect();
+            assert_eq!(
+                candidates,
+                vec![reservation_on as u64; 3],
+                "the three 384-channel convs are the group's im2col candidates, each of \
+                 them booking the whole reservation"
+            );
+        }
     }
 
     /// The direct cooperative entry's admission, term by term: the route term keeps

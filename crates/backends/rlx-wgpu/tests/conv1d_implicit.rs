@@ -25,12 +25,23 @@
 //! (`gk < k_total`) rather than left to a host term, so a shape whose `k_total` is
 //! not a multiple of 8 is correct too.
 //!
+//! **The row groups.** One workgroup covers 96 output rows — its three accumulator
+//! sets — and the grid's `y` adds a second group for a wider output, so the last
+//! four cases carry one: 192 rows in `192 → 192` and `100 → 192`, and a partial
+//! second group in `192 → 136` (136 rows) and `192 → 112` (112, one partial tile
+//! past the first group). The two groups are told apart only by which rows each
+//! writes. That is the shape a widening can be wrong in while every narrower case
+//! still passes: a second group never dispatched, or dispatched with the first one's
+//! weight rows, leaves rows 96..191 as the arena held them. The CPU reference reads
+//! every row, so the half that moved is the half that fails. `100 → 192` also pairs
+//! the two groups with a contraction that is not a multiple of the k step's 8 rows.
+//!
 //! **The parity.** Every case is run against the crate's own CPU conv
 //! (`common::unit_conv_cpu_reference` — an `rlx_runtime::Session` on
 //! `Device::Cpu`), and the same graph is compiled a second time under
 //! `RLX_WGPU_CONV_IMPLICIT=0` and held to the same reference. The bar is the
 //! crate's `1e-2` for a route whose accumulation order is not the CPU's: these
-//! contractions are 96–672 deep and the cooperative fragments sum them in their
+//! contractions are 96–1 344 deep and the cooperative fragments sum them in their
 //! own order, so nothing here asserts identity. The switch-off arm is the
 //! statement that the route is *additive* — a graph it takes and a graph it does
 //! not take both keep the answer they had.
@@ -44,8 +55,8 @@
 //! not this file's. The cells after the table run the route the way a real
 //! schedule does: [`a_conv_between_other_steps`] mid-schedule,
 //! [`a_height_padded_unit_tap_conv_is_not_the_route`] at a shape whose `h_out == 1`
-//! holds while its own tap reads outside the input, and the `#[ignore]`d one at
-//! the block's own geometry.
+//! holds while its own tap reads outside the input, and the `#[ignore]`d ones at the
+//! block's own geometry and at the codec's extents.
 //!
 //! Its own test binary: the route switch is process-global and the floor override
 //! is read at compile time, so the cases cannot share a process with any other
@@ -146,6 +157,50 @@ const CASES: &[Case] = &[
         label: "three tiles partial 20/80 kw=5 d=2",
         c_in: 20,
         c_out: 80,
+        l: 1024,
+        kw: 5,
+        dilation: 2,
+        pad: 8,
+    },
+    // Two whole row groups: rows 96..191 are the half a widening that kept one
+    // workgroup's coverage would leave untouched, and the reference reads all of them.
+    Case {
+        label: "two groups 192/192 kw=7 d=9",
+        c_in: 192,
+        c_out: 192,
+        l: 1024,
+        kw: 7,
+        dilation: 9,
+        pad: 54,
+    },
+    // …and a second group whose own last tile is partial, so its tile count is read
+    // from the rows it has left rather than from a whole group's.
+    Case {
+        label: "two groups partial 192/136 kw=7 d=1",
+        c_in: 192,
+        c_out: 136,
+        l: 1024,
+        kw: 7,
+        dilation: 1,
+        pad: 6,
+    },
+    // The narrowest second group there is: one partial tile past the first group's 96
+    // rows, which is the band a widening that only ever dispatched whole groups misses.
+    Case {
+        label: "two groups one tile 192/112 kw=7 d=1",
+        c_in: 192,
+        c_out: 112,
+        l: 1024,
+        kw: 7,
+        dilation: 1,
+        pad: 6,
+    },
+    // Two groups over a contraction that is not a multiple of the k step's 8 rows, so
+    // the group's k tail and its second row group are in play at once.
+    Case {
+        label: "two groups tails 100/192 kw=5 d=2",
+        c_in: 100,
+        c_out: 192,
         l: 1024,
         kw: 5,
         dilation: 2,
@@ -695,6 +750,96 @@ fn conv_implicit_vs_panel_measurement() {
                 bytes as f64 / (ms * 1e-3) / 1e9,
                 flops / (ms * 1e-3) / 1e12,
                 exe.test_arena_bytes() / (1 << 20),
+            );
+        }
+    }
+}
+
+/// The class's second row group, at the shapes and extents the synthesis codec runs it
+/// at: `dac.blk.2`'s three 192-channel dilated residuals, 640 output columns a frame, so
+/// 57 600 at the stand's 90-frame part and 92 160 at the codec's 144-frame window.
+///
+/// The panel route is the one these convolutions take without the second row group, so
+/// the route must beat it at the shape it was admitted for, not only at the 96-channel
+/// block the class was measured on. Arms are paired and the order alternates every
+/// round, because the panel arm's arena carries the panel the route arm does not —
+/// 309 657 600 B at the shorter extent, 495 452 160 B at the longer — and a one-sided
+/// drift would otherwise land on one of them; the figure is the median of the per-round
+/// differences, route minus panel, and a **positive** median fails the cell.
+///
+/// `#[ignore]` for the other cells' reason: it allocates the shape's real operands (42
+/// MiB of input at 57 600 columns, 67 at 92 160, and 1 MiB of weight) and prints the
+/// figures beside the assertion.
+#[test]
+#[ignore = "measurement cell: the class's second row group, at the codec's own extents"]
+fn conv_implicit_vs_panel_at_the_second_row_group() {
+    let _routes = common::route_lock();
+    route_switches();
+    if skip_without_the_route() {
+        return;
+    }
+
+    for n in [57_600usize, 92_160] {
+        for dilation in [1usize, 3, 9] {
+            let case = Case {
+                label: "192/192 kw=7",
+                c_in: 192,
+                c_out: 192,
+                // Chosen so the padded conv's output is `n`.
+                l: n - dilation * 6,
+                kw: 7,
+                dilation,
+                pad: dilation * 6,
+            };
+            let xs = common::fill(case.c_in * case.l, 7, 1, 13, 0.1, -0.6);
+            let ws = common::fill(case.c_out * case.c_in * case.kw, 5, 3, 11, 0.1, -0.5);
+
+            let arm = |implicit: bool| {
+                rlx_ir::env::set("RLX_WGPU_CONV_IMPLICIT", if implicit { "1" } else { "0" });
+                let mut exe = WgpuExecutable::compile(graph(&case));
+                exe.set_param("w", &ws);
+                let steps = exe.test_step_names();
+                assert!(
+                    steps.contains(&"conv1d_implicit") == implicit,
+                    "n = {n}, d = {dilation}: arm {implicit} took {steps:?}"
+                );
+                exe.run(&[("x", &xs)]);
+                exe
+            };
+            let (mut route, mut panel_arm) = (arm(true), arm(false));
+            assert_eq!(
+                route.test_conv_panel_bytes(),
+                (case.c_in * case.kw) as u64 * n as u64 * 4,
+                "the route gathers the panel's own volume"
+            );
+            assert_eq!(
+                panel_arm.test_conv_panel_bytes(),
+                0,
+                "no implicit step, no panel bytes to name"
+            );
+
+            let rounds = 5;
+            let (per_call, deltas) =
+                common::paired_round_robin(&mut route, &mut panel_arm, rounds, 1, |exe| {
+                    exe.run(&[("x", &xs)]);
+                });
+            let (route, panel, delta) = (
+                common::median(&per_call[0]),
+                common::median(&per_call[1]),
+                common::median(&deltas),
+            );
+            println!(
+                "{} d = {dilation} n = {n}: implicit {route:.1} ms, panel {panel:.1} ms, \
+                 delta {delta:+.2} ms (spread {:+.2}..{:+.2}, slower {}/{rounds})",
+                case.label,
+                common::least(&deltas),
+                common::greatest(&deltas),
+                deltas.iter().filter(|d| **d > 0.0).count(),
+            );
+            assert!(
+                delta < 0.0,
+                "d = {dilation} n = {n}: the route is {delta:.2} ms slower than the panel \
+                 route it replaces"
             );
         }
     }

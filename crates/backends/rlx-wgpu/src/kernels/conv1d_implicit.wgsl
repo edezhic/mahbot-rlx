@@ -16,20 +16,31 @@ enable wgpu_cooperative_matrix;
 // cooperative tile the direct entry uses. A is the weight, read from the arena
 // with `coopLoadT` at stride `k_total` exactly as the direct entry reads it.
 //
-// The shape this wins on is the 96-channel decoder block's dilated conv, and its
-// class is capped at 96 output channels — so **one workgroup covers every output
-// row tile**: the gathered 8×32 B step is used by all `ceil(c_out / 32)` row tiles
-// before the next k step overwrites it, and the activation is gathered once per
-// column block rather than once per row tile. The host admits it only for that
-// class — see `ConvImplicitShape` in `backend/mod.rs`, which is also what the
-// panel reservation subtracts.
+// The shape this wins on is the decoder block's dilated residual conv. One workgroup
+// covers a *row group* of `ROW_TILES * TILE_M` output rows: the gathered 8×32 B step
+// is used by all `ceil(c_out / 32)` row tiles of its own group — three at most —
+// before the next k step overwrites it, so the activation is gathered once per column
+// block and group rather than once per row tile. The group is the grid's `y`, so an
+// output wider than one group costs a second workgroup rather than a second set of
+// accumulators — the register footprint, the shared tile and the barrier count are the
+// same at 192 rows as at 96.
 //
-// Three accumulator sets are the ceiling this entry has (`ROW_TILES`): an output wider
-// than `ROW_TILES * TILE_M` rows would have rows no set covers, so the cap is a host
-// term and the kernel carries no guard against it. Everything inside a set is guarded
-// by the tile count instead — the multiply and the store of a set the shape does not
-// reach are skipped, so a narrower output costs a set's registers but not its
-// arithmetic.
+// Three accumulator sets are the ceiling one workgroup has (`ROW_TILES`). The host
+// dispatches one workgroup per row group, and how wide an output the class takes is
+// `CONV_IMPLICIT_MAX_C_OUT` in `backend/mod.rs` — see `ConvImplicitShape` there, which is
+// also what the panel reservation subtracts. Everything inside a set is guarded by the
+// tile count instead — the multiply and the store of a set the shape does not reach are
+// skipped, so a narrower output costs a set's registers but not its arithmetic.
+//
+// A shape inside one row group takes exactly the path this entry had before the
+// groups existed: `wid.y` is 0, so every term below that names the group is a zero
+// addend, the grid's `y` is 1, and the accumulators, gather, barriers and stores are
+// the ones the 96-channel shapes were measured on — 28.9 ms against the panel route's
+// 39.4 ms at 96 channels in and out, kernel 7, dilation 3, 276 480 output columns
+// (`conv_implicit_vs_panel_measurement`, that geometry; the route reads 30.6 ms in the
+// binary before the row groups and 30.8 ms in the one after, five alternating process
+// pairs, while the panel arm moved 42.1 → 42.3 ms over the same pairs — both inside the
+// ±5 % one binary's own takes move by — so widening the class cannot tax them.
 //
 // Three things the gather does that the panel did not have to:
 // * **`(c, tap)` is carried, not divided.** The k index decomposes as
@@ -87,10 +98,13 @@ struct Params {
 const TILE_M: u32 = 32u;
 const TILE_N: u32 = 32u;
 const TILE_K: u32 = 8u;
-// The accumulator sets this entry carries, `TILE_M` rows each: what bounds the output
-// rows it covers. `ConvImplicitShape` refuses a wider `c_out` on the host, so the
-// clamp below states the bound rather than guarding it.
+// The accumulator sets one workgroup carries, `TILE_M` rows each, and the rows they
+// cover together — one row group, which is the grid's `y`. The host dispatches
+// `c_out.div_ceil(ROW_ROWS)` groups and the epilogue stores one row tile per set, so
+// the three numbers are read out of this source by
+// `the_row_group_is_the_entrys_row_tiles`.
 const ROW_TILES: u32 = 3u;
+const ROW_ROWS: u32 = ROW_TILES * TILE_M;
 
 @group(0) @binding(0) var<storage, read_write> arena: array<f32>;
 @group(0) @binding(1) var<uniform>             params: Params;
@@ -100,9 +114,9 @@ const ROW_TILES: u32 = 3u;
 // epilogue's store tile (`[c_out row][spatial column]`, stride `TILE_N`).
 var<workgroup> tile: array<f32, 1024>;
 
-/// One row tile of the shared store tile, out to the output's own extents. The
-/// host admits at most `ROW_TILES * TILE_M` output rows, which is what bounds the
-/// tiles this entry has accumulator sets for.
+/// One row tile of the shared store tile, out to the output's own extents.
+/// `base_row` is the tile's first output row, already absolute — the caller adds its
+/// own row group's origin — so the guard is the conv's `c_out` in both directions.
 fn copy_out(base_row: u32, col_base: u32, j: u32) {
     for (var e: u32 = 0u; e < TILE_M; e = e + 1u) {
         let row = base_row + e;
@@ -120,8 +134,10 @@ fn conv1d_implicit(
 ) {
     let col_base = wid.x * TILE_N;
     let j = lid.x;
-    // The class caps `c_out` at the sets this entry has (`ROW_TILES`).
-    let n_row_tiles = min((params.c_out + TILE_M - 1u) / TILE_M, ROW_TILES);
+    // This workgroup's row group: `wid.y` groups of `ROW_ROWS` rows, the host's grid.
+    let row_base = wid.y * ROW_ROWS;
+    // The tiles this group has left, capped at the sets this entry carries.
+    let n_row_tiles = min((params.c_out - row_base + TILE_M - 1u) / TILE_M, ROW_TILES);
 
     if (j < 2u) {
         for (var s: u32 = 0u; s < 32u; s = s + 1u) {
@@ -187,6 +203,9 @@ fn conv1d_implicit(
     var gk: u32 = 0u;
     var c: u32 = 0u;
     var tap: u32 = 0u;
+    // This group's first weight row — the group origin, loop-invariant, so the three
+    // `a_row` bases below are one addend each rather than a multiply per k step.
+    let w_row = params.w_off + row_base * params.k_total;
 
     let n_tiles = (params.k_total + TILE_K - 1u) / TILE_K;
     for (var t: u32 = 0u; t < n_tiles; t = t + 1u) {
@@ -218,7 +237,7 @@ fn conv1d_implicit(
         let b_1: coop_mat8x8<f32, B> = coopLoadT<coop_mat8x8<f32, B>>(&tile[8u],  TILE_N);
         let b_2: coop_mat8x8<f32, B> = coopLoadT<coop_mat8x8<f32, B>>(&tile[16u], TILE_N);
         let b_3: coop_mat8x8<f32, B> = coopLoadT<coop_mat8x8<f32, B>>(&tile[24u], TILE_N);
-        let a_row = params.w_off + k_off;
+        let a_row = w_row + k_off;
         let a0_0: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&arena[a_row], params.k_total);
         let a0_1: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&arena[a_row + 8u  * params.k_total], params.k_total);
         let a0_2: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&arena[a_row + 16u  * params.k_total], params.k_total);
@@ -240,7 +259,7 @@ fn conv1d_implicit(
         acc_32 = coopMultiplyAdd(a0_3, b_2, acc_32);
         acc_33 = coopMultiplyAdd(a0_3, b_3, acc_33);
         if (n_row_tiles > 1u) {
-            let a_rowb = params.w_off + TILE_M * params.k_total + k_off;
+            let a_rowb = w_row + TILE_M * params.k_total + k_off;
             let a1_0: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&arena[a_rowb], params.k_total);
             let a1_1: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&arena[a_rowb + 8u  * params.k_total], params.k_total);
             let a1_2: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&arena[a_rowb + 16u  * params.k_total], params.k_total);
@@ -263,7 +282,7 @@ fn conv1d_implicit(
             accb_33 = coopMultiplyAdd(a1_3, b_3, accb_33);
         }
         if (n_row_tiles > 2u) {
-            let a_rowc = params.w_off + 2u * TILE_M * params.k_total + k_off;
+            let a_rowc = w_row + 2u * TILE_M * params.k_total + k_off;
             let a2_0: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&arena[a_rowc], params.k_total);
             let a2_1: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&arena[a_rowc + 8u  * params.k_total], params.k_total);
             let a2_2: coop_mat8x8<f32, A> = coopLoadT<coop_mat8x8<f32, A>>(&arena[a_rowc + 16u  * params.k_total], params.k_total);
@@ -309,7 +328,7 @@ fn conv1d_implicit(
     coopStoreT(acc_32, &tile[24u * TILE_N + 16u], TILE_N);
     coopStoreT(acc_33, &tile[24u * TILE_N + 24u], TILE_N);
     workgroupBarrier();
-    copy_out(0u, col_base, j);
+    copy_out(row_base, col_base, j);
     workgroupBarrier();
     if (n_row_tiles > 1u) {
         coopStoreT(accb_00, &tile[0u * TILE_N], TILE_N);
@@ -329,7 +348,7 @@ fn conv1d_implicit(
         coopStoreT(accb_32, &tile[24u * TILE_N + 16u], TILE_N);
         coopStoreT(accb_33, &tile[24u * TILE_N + 24u], TILE_N);
         workgroupBarrier();
-        copy_out(TILE_M, col_base, j);
+        copy_out(row_base + TILE_M, col_base, j);
         workgroupBarrier();
     }
     if (n_row_tiles > 2u) {
@@ -350,6 +369,6 @@ fn conv1d_implicit(
         coopStoreT(accc_32, &tile[24u * TILE_N + 16u], TILE_N);
         coopStoreT(accc_33, &tile[24u * TILE_N + 24u], TILE_N);
         workgroupBarrier();
-        copy_out(2u * TILE_M, col_base, j);
+        copy_out(row_base + 2u * TILE_M, col_base, j);
     }
 }

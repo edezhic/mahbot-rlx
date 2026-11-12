@@ -2935,6 +2935,14 @@ impl Runner {
         self.session.schedule_step_names()
     }
 
+    /// The tail scratch this graph's arena reserves past its activation plan — what a
+    /// conv route's im2col panel books, and the half of the arena `plan_f32_uniform`
+    /// does not show. The arena report's `plan … + scratch …` line is the same figure.
+    /// `None` where the backend does not report one.
+    pub fn arena_scratch_bytes(&self) -> Option<u64> {
+        self.session.scratch_bytes()
+    }
+
     /// One pass with new inputs — the same compiled buffers, refilled.
     pub fn run(&mut self, inputs: &[(String, Vec<f32>)]) -> Vec<Vec<f32>> {
         let ins: Vec<(&str, &[f32])> = inputs
@@ -3171,6 +3179,11 @@ impl Compiled {
     /// [`Runner::schedule_step_names`] on this graph.
     pub fn schedule_step_names(&self) -> Option<Vec<&'static str>> {
         self.runner.schedule_step_names()
+    }
+
+    /// [`Runner::arena_scratch_bytes`] on this graph.
+    pub fn arena_scratch_bytes(&self) -> Option<u64> {
+        self.runner.arena_scratch_bytes()
     }
 }
 

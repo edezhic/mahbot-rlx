@@ -680,9 +680,10 @@ pub(crate) enum Step {
     /// The convolution GEMM routes' implicit form (`conv1d_implicit.wgsl`): the
     /// direct cooperative entry's 32×32 tile with B gathered through the conv's
     /// taps into workgroup memory, so no im2col panel is materialised. One
-    /// workgroup covers every output row tile the class admits, so the gather
-    /// serves all of them. Admitted only for the shape class the route wins in —
-    /// see the `Op::Conv` arm in `compile/lower.rs`.
+    /// workgroup covers one row group — three output row tiles — and the grid's `y`
+    /// adds a second group for a wider output, so the gather serves every tile of
+    /// its own group. Admitted only for the shape class the route wins in — see the
+    /// `Op::Conv` arm in `compile/lower.rs`.
     Conv1dImplicit {
         params: Conv1dImplicitParams,
     },

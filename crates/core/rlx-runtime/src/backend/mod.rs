@@ -1028,6 +1028,16 @@ pub trait ExecutableGraph: Send {
     fn wgpu_step_names(&self) -> Option<Vec<&'static str>> {
         None
     }
+
+    /// The bytes of tail scratch this executable's arena reserves past its activation
+    /// plan — the panel a conv route books, which the plan does not carry. `None` for a
+    /// backend that does not report one.
+    ///
+    /// The arena report's `plan … + scratch …` line is the same figure on stderr; this is
+    /// what lets a gate read it without parsing a log.
+    fn wgpu_scratch_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Backend implementation trait.
