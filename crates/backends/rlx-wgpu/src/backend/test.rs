@@ -122,9 +122,11 @@ impl WgpuExecutable {
             .collect()
     }
 
-    /// Test hook: the planned arena size in bytes — the memory plan's visible
-    /// half, so a test can pin that a route's scratch reservation did not leak
-    /// into a graph whose convolutions never qualify.
+    /// Test hook: the bytes the arena was built at — the activation plan, whatever
+    /// parameters the plan left in it, and the tail scratch a route's panel reservation
+    /// books past it, at the binding alignment. [`Self::test_scratch_bytes`] is the tail
+    /// alone, so this is the only accessor that says the whole arena; the shared weight pool
+    /// and the f16 arena mirror sit outside it.
     #[doc(hidden)]
     pub fn test_arena_bytes(&self) -> u64 {
         self.arena.size as u64

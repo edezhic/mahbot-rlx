@@ -170,6 +170,16 @@ pub fn pair_of(role: Role) -> Option<Arc<Pair>> {
     ))
 }
 
+/// Whether the cooperative implicit-GEMM conv route can run on this adapter at all: the
+/// adapter's cooperative-matrix entry, which [`pair_of`]'s device creation settles. The
+/// route's own switch is a separate term, and each caller pins it on around the graph it
+/// builds. [`pair_of`] has created the device, so this can be asked before the first graph is
+/// built.
+pub fn implicit_route_is_live() -> bool {
+    rlx_wgpu::device::wgpu_device()
+        .is_some_and(|d| rlx_wgpu::kernels::conv1d_implicit_supported(&d.device))
+}
+
 /// One codec group's graph at `frames` — `graphs::sound_graph` at the group's own stage
 /// range, which is the graph a call builds for that group.
 pub fn codec_group(pair: &Arc<Pair>, frames: usize, group: usize) -> graphs::Compiled {

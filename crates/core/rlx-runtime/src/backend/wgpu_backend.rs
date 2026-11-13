@@ -314,6 +314,10 @@ impl ExecutableGraph for WgpuExecutableWrapper {
     fn wgpu_scratch_bytes(&self) -> Option<u64> {
         Some(self.inner.test_scratch_bytes())
     }
+
+    fn wgpu_arena_bytes(&self) -> Option<u64> {
+        Some(self.inner.test_arena_bytes())
+    }
 }
 
 /// Cast every element of a wgpu f32 output buffer down to the

@@ -296,32 +296,60 @@ pub(crate) const CONV_IMPLICIT_ROW_ROWS: u64 = 96;
 /// The widest output the class takes. The entry has no structural output bound — the
 /// host dispatches one workgroup per [`CONV_IMPLICIT_ROW_ROWS`] of `c_out` and the kernel
 /// handles any number of groups — so, like [`CONV_IMPLICIT_MAX_C_IN`], this is a policy
-/// term: two groups is the width of the synthesis codec's 192-channel residuals, the
-/// shapes this class was widened for and measured at. The same block's 384-channel
-/// convs are four groups and would take that group's reservation to zero; they are the
-/// next widening, not this one's, and each step needs its own paired measurement at the
-/// shapes it admits.
+/// term: four groups is the width of the synthesis codec's stage-4..6 block (`dac.blk.1`'s
+/// three 384-channel dilated residuals), the shapes this step was measured at — a further
+/// widening needs its own paired measurement at the shapes it admits. A wider block is out of
+/// this class's reach: the stage-0..4 block's 768-channel residuals would need eight groups,
+/// and at every length the stand runs their output columns sit under the route's extent
+/// floor as well — taking them would mean both widening the class and moving the floor. A
+/// bound of 512 would additionally admit the speaker encoder's five-tap entry conv at
+/// recordings of about 51 seconds and longer, a path with no pinned witness.
 ///
-/// What the second group buys that block: at the stand's 90-frame part its stage-4..6
-/// graph reserves 309 657 600 B of im2col panel before the class takes the 192-channel
-/// convs and 154 828 800 B after — the 384-channel conv's panel, the next-largest and
-/// out of this class's reach — and 495 452 160 → 247 726 080 B at the codec's 144-frame
-/// window. The 90-frame graph is also faster: nine alternating paired rounds of the two
-/// routes over the same window (`sound_decoder_scratch`'s
-/// `the_admitted_convs_are_not_slower_than_the_panel_route`) put the route 8.5 to 9.1 ms
-/// ahead by median on quiet takes — more under contention, which the panel arm pays for
-/// in traffic — and no round of any take was slower. The absolute figure follows the
-/// machine, so the sign and the round count are the claim, which is why the routes are
-/// paired at all.
-pub(crate) const CONV_IMPLICIT_MAX_C_OUT: u64 = 192;
+/// What the width buys is residence, not time. The codec's stage-4..6 group reserves no
+/// im2col panel; with the class taking none of its six convolutions it would book
+/// 309 657 600 B at the stand's 90-frame part, 495 452 160 B at the codec's 144-frame
+/// window and 509 214 720 B at the recurring 148-frame one
+/// (`the_stage_four_to_six_group_reserves_no_panel`). The row's peak is the largest graph
+/// arena a call holds, not this group's, so the group's saving is not the row's: with its
+/// reservation gone the last codec group's arena is the largest, and the row's peak falls
+/// from 372 534 144 B to 311 001 520 B at the 90-frame part (a fall of 61 532 624 B), by
+/// 80 112 080 B at 144 frames and by 81 488 336 B at 148 (`sound_decoder_scratch`'s
+/// `the_row_peaks_on_the_last_group`, which pins both ends of all three). All of it is
+/// Metal-class only: the reservation is subtracted where this class's switch and the
+/// adapter's cooperative-matrix entry agree (`conv_im2col_scratch_bytes`'s `implicit_live`),
+/// so an adapter without the entry books the panel and moves nothing. The stand's 23-frame
+/// part is below the route's extent floor, so the group keeps the panel there and that
+/// row's memory does not move.
+///
+/// The time. Over nine alternating paired rounds the group's six convolutions are 6.6 to
+/// 8.0 ms ahead of the panel route at 90 frames (spread −9.4..−5.2, no round slower in any
+/// take, six takes; 40 to 42 ms ahead at a load average of 6 and above). Per shape, over five
+/// rounds a take: the three 384-channel convolutions this bound adds are 0.26 to 1.56 ms
+/// *behind* each (two shapes, spread −0.7..+2.0, five takes), 0.8 to 4.7 ms a group run for
+/// the three; the 192-channel shapes the class already served are 2.3 to 6.2 ms ahead each
+/// (spread −7.5..−1.9, three takes). Under load the magnitudes widen and the signs hold
+/// (`conv_implicit_vs_panel_at_the_admitted_widths`). At this width the panel is a small
+/// share of either arm's traffic, and the route's strided gather is less efficient than the
+/// panel's bulk reads — the deficit. The output does not move: both routes accumulate over
+/// the same k order with the same cooperative multiply, and the stand's pinned synthesis
+/// digests are unchanged.
+///
+/// A class-shaped conv the lowering declines keeps the direct kernel and is counted
+/// (`conv1d_implicit_declines`, printed by `RLX_WGPU_SCHEDULE`). The terms that can decline
+/// it refuse the panel route as well ([`conv_im2col_scratch_bytes`] names them), so a
+/// declined conv runs the direct kernel it ran before this change too — the class-off arm of
+/// `a_class_shape_with_a_parked_weight_falls_to_the_direct_conv` reads the same steps: no
+/// panel is lost and there is no route it could be slower than.
+pub(crate) const CONV_IMPLICIT_MAX_C_OUT: u64 = 384;
 
 /// The widest *input* the class takes. The entry has no structural input bound — it
 /// gathers one input row per k step, whatever `c_in` is, and its cost per output column
-/// is the same `k_total` gather — so this too is a policy term: it is set to the width of
-/// the synthesis codec's 192-channel residuals, and it is deliberately its own constant
-/// so that widening the output side never drags the input side with it, or the other way
-/// round.
-pub(crate) const CONV_IMPLICIT_MAX_C_IN: u64 = 192;
+/// is the same `k_total` gather — so this too is a policy term: it follows the widest
+/// square shape the class serves, the synthesis codec's 384-channel residuals, whose input
+/// and output widths are the same. It stays its own constant because the two widths are
+/// separate questions — a wider output is one more row group, a wider input a longer
+/// gather — and a shape must not enter the class on one bound's business.
+pub(crate) const CONV_IMPLICIT_MAX_C_IN: u64 = 384;
 
 /// The narrowest output the implicit entry takes. The entry multiplies a whole
 /// 32-row tile whatever `c_out` is, so below a tile's rows it multiplies output the
@@ -336,10 +364,9 @@ pub(crate) const CONV_IMPLICIT_MIN_C_OUT: u64 = 4;
 /// tap on W and no height padding, one group and one batch, at most
 /// [`CONV_IMPLICIT_MAX_C_IN`] input channels and between [`CONV_IMPLICIT_MIN_C_OUT`]
 /// and [`CONV_IMPLICIT_MAX_C_OUT`] of output, at or above the route's own extent
-/// floor, and column blocks inside the per-dimension dispatch cap. The two channel
-/// bounds are separate constants because a shape must not enter the class on one
-/// bound's business: the kernel's own term is [`CONV_IMPLICIT_ROW_ROWS`] rows per
-/// workgroup, and the host dispatches one workgroup per group of them.
+/// floor, and column blocks inside the per-dimension dispatch cap. The kernel's own
+/// term is [`CONV_IMPLICIT_ROW_ROWS`] rows per workgroup, and the host dispatches one
+/// workgroup per group of them.
 ///
 /// The lowering adds the terms the shape does not settle — the route's switches,
 /// the adapter, the weight's placement, the arena's binding — and
@@ -506,9 +533,8 @@ fn conv_im2col_col_elems(
 /// a conv that class takes never writes a panel, so it reserves none. The two
 /// terms the shapes still do not settle — a weight parked in the weight buffer and
 /// an arena that with its panel does not bind — are not known here, and a conv
-/// refused for one of them keeps the direct/tiled route instead of a panel-less
-/// im2col (the count is `im2col_fallbacks`, and the lowering refuses the im2col
-/// route for want of reserved scratch).
+/// refused for one of them keeps the direct/tiled route rather than a panel-less
+/// im2col: `use_im2col` carries both terms, and the count is `im2col_fallbacks`.
 fn conv_im2col_scratch_bytes(
     graph: &Graph,
     planned_arena_size: usize,
@@ -6496,10 +6522,9 @@ mod conv_route_decision_tests {
     }
 
     /// The implicit class's channel bounds as the shape decision reads them: an output
-    /// ceiling, a floor, and an input ceiling that is a separate constant so that a shape
-    /// cannot enter the class on one bound's business. The constants carry what each of
-    /// them is and why; this row pins that `admits` takes the shapes inside all three and
-    /// refuses the ones past any of them.
+    /// ceiling, a floor, and an input ceiling. The constants carry what each of them is and
+    /// why; this row pins that `admits` takes the shapes inside all three and refuses the
+    /// ones past any of them.
     #[test]
     fn a_conv_outside_the_implicit_class_channel_bounds_is_refused() {
         let shape = |c_in, c_out| ConvImplicitShape {
@@ -6523,6 +6548,9 @@ mod conv_route_decision_tests {
             // A second row group whose last tile is partial: the host dispatches two
             // groups and the second one's tile count is its own rows, not a whole one.
             (96, 104),
+            // …and a partial fourth group at the class's widest input: 344 rows is three
+            // whole groups of 96 and 56 rows of a fourth.
+            (CONV_IMPLICIT_MAX_C_IN, CONV_IMPLICIT_MAX_C_OUT - 40),
         ] {
             assert!(
                 shape(c_in, c_out).admits(),
@@ -6666,9 +6694,9 @@ mod conv_route_decision_tests {
 
     /// The synthesis codec's stage-4..6 group — `dac.blk.1`'s three 384-channel dilated
     /// residuals and `dac.blk.2`'s three 192-channel ones, kernel 7, dilations 1/3/9 —
-    /// reserves the 384-channel panel and nothing more, because the class takes the
-    /// 192-channel ones. Both ends are pinned exactly, at the typical 90-frame length and
-    /// at the codec's 144-frame window.
+    /// reserves nothing, because the class takes all six. Both ends are pinned exactly, at
+    /// the typical 90-frame length, at the codec's 144-frame window and at the recurring
+    /// 148-frame one, beside the panel the group would book without the class.
     ///
     /// The group's shapes are restated here rather than read — this crate cannot see the
     /// codec's graph — so a conv's panel is the formula `c · 7 · out_len · 4` at the two
@@ -6677,14 +6705,14 @@ mod conv_route_decision_tests {
     /// extent here is 14 400 columns; a run that exports either floor lever is measuring
     /// the lever rather than the default, so the row skips instead of reddening a bisect.
     /// The product graph's own reservation and step census are the model-dependent
-    /// `sound_decoder_scratch`'s.
+    /// `sound_decoder_scratch`'s, which pins the row's peak arena from the same figures.
     ///
-    /// The last assertion is the one the lowering's `col_bytes <= arena.scratch_bytes`
-    /// depends on: with the class taking the 192-channel convs, the 384-channel conv's
-    /// panel is the whole reservation and it is still an im2col candidate, so both
-    /// figures are pinned beside that candidate check.
+    /// The last assertion is what the lowering's `col_bytes <= arena.scratch_bytes` reads:
+    /// with the class taking both widths the group has no im2col candidate at all, so a
+    /// conv of it that the lowering then declines has no panel to fall back on — the
+    /// fallback the class's own doc states.
     #[test]
-    fn the_stage_four_to_six_group_reserves_the_384_channel_panel_alone() {
+    fn the_stage_four_to_six_group_reserves_no_panel() {
         for key in [
             "RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL",
             "RLX_WGPU_IM2COL_MIN_SPATIAL",
@@ -6694,77 +6722,47 @@ mod conv_route_decision_tests {
                 return;
             }
         }
-        /// `(channels, out_len, dilation)`: the group's six residual `conv1`s, in
-        /// the order the block runs them, each square in the channels it hands on.
-        const GROUP: [(usize, usize, usize); 6] = [
-            (384, 14_400, 1),
-            (384, 14_400, 3),
-            (384, 14_400, 9),
-            (192, 57_600, 1),
-            (192, 57_600, 3),
-            (192, 57_600, 9),
+        // `(dac.blk.1's out_len, dac.blk.2's out_len, the panel the group books without the
+        // class)`: the stand's 90-frame part, the codec's 144-frame window, and the
+        // recurring window a longer part runs — that window plus its four-frame left
+        // margin. `dac.blk.1` is 160 output columns a frame, `dac.blk.2` 640.
+        const LENGTHS: [(usize, usize, usize); 3] = [
+            (14_400, 57_600, 309_657_600),
+            (23_040, 92_160, 495_452_160),
+            (23_680, 94_720, 509_214_720),
         ];
-        /// The same six at the codec's own 144-frame window: `dac.blk.1` at 23 040
-        /// columns, `dac.blk.2` at 92 160.
-        const GROUP_WINDOW: [(usize, usize, usize); 6] = [
-            (384, 23_040, 1),
-            (384, 23_040, 3),
-            (384, 23_040, 9),
-            (192, 92_160, 1),
-            (192, 92_160, 3),
-            (192, 92_160, 9),
-        ];
-        // The fixture's conv pads symmetrically (`conv2d_spatial_output`'s `in + 2·pad`),
-        // so an input of `out_len − 6·dilation` yields the group's own output length —
-        // the length the panel and the class both read.
-        fn group_graph(convs: &[(usize, usize, usize)]) -> Graph {
+        // The group's six residual `conv1`s in the order the block runs them: three at
+        // each width, dilations 1/3/9, square in the channels they hand on. The fixture's
+        // conv pads symmetrically (`conv2d_spatial_output`'s `in + 2·pad`), so an input of
+        // `out_len − 6·dilation` yields the group's own output length — the length the
+        // panel and the class both read.
+        fn group_graph(len_384: usize, len_192: usize) -> Graph {
             let mut g = Graph::new("sound_decoder_group_4_6");
             let mut outs = Vec::new();
-            for (i, &(c, out_len, dilation)) in convs.iter().enumerate() {
-                let pad = 6 * dilation;
-                let l = out_len - pad;
-                let x = g.input(format!("x{i}"), Shape::new(&[1, c, 1, l], DType::F32));
-                let w = g.param(format!("w{i}"), Shape::new(&[c, c, 1, 7], DType::F32));
-                outs.push(g.conv2d(x, w, [1, 7], [1, 1], [0, pad], [1, dilation], 1));
+            for (c, out_len) in [(384, len_384), (192, len_192)] {
+                for dilation in [1usize, 3, 9] {
+                    let pad = 6 * dilation;
+                    let l = out_len - pad;
+                    let i = outs.len();
+                    let x = g.input(format!("x{i}"), Shape::new(&[1, c, 1, l], DType::F32));
+                    let w = g.param(format!("w{i}"), Shape::new(&[c, c, 1, 7], DType::F32));
+                    outs.push(g.conv2d(x, w, [1, 7], [1, 1], [0, pad], [1, dilation], 1));
+                }
             }
             g.set_outputs(outs);
             g
         }
-        for (convs, reservation_off, reservation_on) in [
-            (&GROUP[..], 309_657_600, 154_828_800),
-            (&GROUP_WINDOW[..], 495_452_160, 247_726_080),
-        ] {
-            let g = group_graph(convs);
+        for (len_384, len_192, reservation_off) in LENGTHS {
+            let g = group_graph(len_384, len_192);
             assert_eq!(
                 conv_im2col_scratch_bytes(&g, 0, u64::MAX, false),
                 reservation_off,
                 "without the class the 192-channel conv's panel is the largest"
             );
-            let booked = conv_im2col_scratch_bytes(&g, 0, u64::MAX, true);
             assert_eq!(
-                booked, reservation_on,
-                "and the class leaves the 384-channel conv's panel alone"
-            );
-            let candidates: Vec<u64> = g
-                .nodes()
-                .iter()
-                .filter(|n| n.inputs.len() >= 2)
-                .filter_map(|n| {
-                    conv_im2col_col_elems(
-                        &n.op,
-                        &g.node(n.inputs[0]).shape,
-                        &g.node(n.inputs[1]).shape,
-                        &n.shape,
-                        true,
-                    )
-                })
-                .map(|elems| elems * 4)
-                .collect();
-            assert_eq!(
-                candidates,
-                vec![reservation_on as u64; 3],
-                "the three 384-channel convs are the group's im2col candidates, each of \
-                 them booking the whole reservation"
+                conv_im2col_scratch_bytes(&g, 0, u64::MAX, true),
+                0,
+                "and the class takes every conv of the group"
             );
         }
     }

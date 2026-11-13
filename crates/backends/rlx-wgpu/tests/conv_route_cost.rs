@@ -603,14 +603,15 @@ fn expected_routes(family: &str, label: &str) -> (&'static str, &'static str) {
         ) => ("conv2d", "im2col_gpu"),
         // The dense body rows: `entry-l100` sat exactly on the im2col floor's earlier
         // default of 100 — the boundary row for that default, its comparison inclusive —
-        // and `dense-l800`'s 800 was far inside it. The two rows wider than the implicit
-        // route's input bound (768 and 384 channels) are past its class, so the
-        // accelerated route they take is still the materialised one.
+        // and `dense-l800`'s 800 was far inside it. `dense-l800`'s 768 channels are past
+        // the implicit route's input bound, and `dense-l4000`'s 384 are inside it but under
+        // the route's extent floor (4 000 output columns against 4 800), so the accelerated
+        // route both take is still the materialised one.
         (_, "dense-l800" | "dense-l4000" | "entry-l100") => ("conv2d", "im2col_gpu"),
-        // …and the two at or under it are the implicit route's own class — unit height,
-        // well past the route's extent floor — so they are the dense rows the implicit
-        // route moves off the materialised one: `dense-l48000` at 96 channels either
-        // way, `dense-l16000` at the widest the class takes, 192. On an adapter that
+        // …and the two past the extent floor are the implicit route's own class — unit
+        // height, well past that floor — so they are the dense rows the implicit route
+        // moves off the materialised one: `dense-l48000` at 96 channels either way,
+        // `dense-l16000` at half the width the class takes, 192. On an adapter that
         // cannot build the entry, see `without_the_implicit_entry`.
         (_, "dense-l16000" | "dense-l48000") => ("conv2d", "conv1d_implicit"),
         // The two rows this floor takes off the relabel, one carrying the dilation axis
@@ -995,6 +996,13 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     // adapter decides — so the reading says which adapter it holds for.
     let implicit_available = rlx_wgpu::device::wgpu_device()
         .is_some_and(|d| rlx_wgpu::kernels::conv1d_implicit_supported(&d.device));
+    // `dense-l4000` clears the implicit class's channel bounds and is kept off the route by
+    // its extent floor alone, so a run that exports that floor is measuring the lever
+    // rather than the shipped routing.
+    if let Some(value) = rlx_ir::env::var("RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL") {
+        eprintln!("skip: RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL={value} is a bisect, not the default");
+        return;
+    }
     common::refuse_under_run_report();
     let device = rlx_wgpu::device::adapter_name().unwrap_or_else(|| "wgpu".into());
     eprintln!(
@@ -1206,11 +1214,12 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     // This is also the arm where `im2col_fallbacks()` is non-zero; the count is
     // printed here, and `conv_routes_parked_weight.rs` asserts both of its arms.
     //
-    // `dense-l16000` (192 channels) and `dense-l48000` (96) are the implicit route's
-    // class: their panel reservation is subtracted, and a parked weight only moves them
-    // from one no-panel route to another, so the pairing this arm exists for is the rows
-    // the reservation still books — `dense-l4000` (384, the Conv1x7 family's largest),
-    // the row this default moved, and the band's own 2-D map.
+    // `dense-l16000` (192 channels) and `dense-l48000` (96) are inside the implicit
+    // route's class and above its extent floor: their panel reservation is subtracted, and
+    // a parked weight only moves them from one no-panel route to another. So the pairing
+    // this arm exists for is the rows the reservation still books — `dense-l4000` (384,
+    // inside the class by width but under the floor at 4 000 columns), the row this
+    // default moved, and the band's own 2-D map.
     let moved = row(&CONV1X7, "entry-l100");
     // The band's own parked row — a 2-D map the previous floor move admitted, whose col
     // panel is the largest of the band — so the combination "parked, in the band, col

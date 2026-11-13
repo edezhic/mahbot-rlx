@@ -681,9 +681,9 @@ pub(crate) enum Step {
     /// direct cooperative entry's 32×32 tile with B gathered through the conv's
     /// taps into workgroup memory, so no im2col panel is materialised. One
     /// workgroup covers one row group — three output row tiles — and the grid's `y`
-    /// adds a second group for a wider output, so the gather serves every tile of
-    /// its own group. Admitted only for the shape class the route wins in — see the
-    /// `Op::Conv` arm in `compile/lower.rs`.
+    /// adds one group for every 96 rows of output past the first, so the gather
+    /// serves every tile of its own group. Admitted only for the shape class the
+    /// route wins in — see the `Op::Conv` arm in `compile/lower.rs`.
     Conv1dImplicit {
         params: Conv1dImplicitParams,
     },

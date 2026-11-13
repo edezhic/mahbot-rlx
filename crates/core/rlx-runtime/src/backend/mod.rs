@@ -1038,6 +1038,18 @@ pub trait ExecutableGraph: Send {
     fn wgpu_scratch_bytes(&self) -> Option<u64> {
         None
     }
+
+    /// The bytes this executable's arena was built at — the activation plan, whatever
+    /// parameters the plan left in it, and the tail scratch, at the binding alignment.
+    /// `None` for a backend that does not report one.
+    ///
+    /// Not the plan a caller can compute plus [`Self::wgpu_scratch_bytes`]: the arena's
+    /// plan is its own (it carries the parameters the lowering left in place), and the
+    /// scratch is folded into it 16-byte aligned. The arena report's
+    /// `plan … + scratch … -> size` line is the same figure on stderr.
+    fn wgpu_arena_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Backend implementation trait.

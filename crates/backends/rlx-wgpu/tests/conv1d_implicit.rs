@@ -26,22 +26,23 @@
 //! not a multiple of 8 is correct too.
 //!
 //! **The row groups.** One workgroup covers 96 output rows — its three accumulator
-//! sets — and the grid's `y` adds a second group for a wider output, so the last
-//! four cases carry one: 192 rows in `192 → 192` and `100 → 192`, and a partial
-//! second group in `192 → 136` (136 rows) and `192 → 112` (112, one partial tile
-//! past the first group). The two groups are told apart only by which rows each
-//! writes. That is the shape a widening can be wrong in while every narrower case
-//! still passes: a second group never dispatched, or dispatched with the first one's
-//! weight rows, leaves rows 96..191 as the arena held them. The CPU reference reads
-//! every row, so the half that moved is the half that fails. `100 → 192` also pairs
-//! the two groups with a contraction that is not a multiple of the k step's 8 rows.
+//! sets — and the grid's `y` adds one more group for every 96 rows of output past the
+//! first, so six cases carry them: 192 rows in `192 → 192` and `100 → 192`, a partial
+//! second group in `192 → 136` (136 rows) and `192 → 112` (112, one partial tile past
+//! the first group), and the class's widest output at four groups in `384 → 384` and
+//! `384 → 344` (344, a partial fourth group). The groups are told apart only by which
+//! rows each writes. That is the shape a widening can be wrong in while every narrower
+//! case still passes: a later group never dispatched, or dispatched with the first one's
+//! weight rows, leaves its rows as the arena held them. The CPU reference reads every
+//! row, so the part that moved is the part that fails. `100 → 192` also pairs two groups
+//! with a contraction that is not a multiple of the k step's 8 rows.
 //!
 //! **The parity.** Every case is run against the crate's own CPU conv
 //! (`common::unit_conv_cpu_reference` — an `rlx_runtime::Session` on
 //! `Device::Cpu`), and the same graph is compiled a second time under
 //! `RLX_WGPU_CONV_IMPLICIT=0` and held to the same reference. The bar is the
 //! crate's `1e-2` for a route whose accumulation order is not the CPU's: these
-//! contractions are 96–1 344 deep and the cooperative fragments sum them in their
+//! contractions are 96–2 688 deep and the cooperative fragments sum them in their
 //! own order, so nothing here asserts identity. The switch-off arm is the
 //! statement that the route is *additive* — a graph it takes and a graph it does
 //! not take both keep the answer they had.
@@ -205,6 +206,29 @@ const CASES: &[Case] = &[
         kw: 5,
         dilation: 2,
         pad: 8,
+    },
+    // Four whole row groups: the class's widest output, the width the synthesis codec's
+    // 384-channel residuals take it at. A widening that kept one workgroup's coverage
+    // would write only the first of them, and the reference reads all of them.
+    Case {
+        label: "four groups 384/384 kw=7 d=9",
+        c_in: 384,
+        c_out: 384,
+        l: 256,
+        kw: 7,
+        dilation: 9,
+        pad: 54,
+    },
+    // …and a fourth group whose own last tile is partial, so the group's row bound is
+    // read past the third group as well.
+    Case {
+        label: "four groups partial 384/344 kw=7 d=1",
+        c_in: 384,
+        c_out: 344,
+        l: 256,
+        kw: 7,
+        dilation: 1,
+        pad: 6,
     },
 ];
 
@@ -425,11 +449,18 @@ fn a_height_padded_unit_tap_conv_is_not_the_route() {
 /// The class shape declined at lowering while the route is live: a weight parked in
 /// the weight buffer cannot be addressed by the entry (its word offset drops the
 /// tag), so the conv keeps the direct route — with no panel to fall back to, because
-/// the reservation subtracts this class. The fallback is the guard this pins: the
-/// class books no panel of its own, so any panel is refused by
-/// `col_bytes <= arena.scratch_bytes` and the conv runs direct, to the CPU's answer.
-/// (The tail here is the 64 MiB reserve `RLX_WGPU_ALL_PARAMS_WEIGHT` keeps for the
-/// parked staging path; without that switch a class-only graph books nothing.)
+/// the reservation subtracts this class. Two independent terms keep the panel away: the
+/// class books none for this shape, so `col_bytes <= arena.scratch_bytes` refuses the
+/// im2col route, and `use_im2col` carries the parked term as well. The conv runs direct,
+/// to the CPU's answer. (The tail here is the 64 MiB reserve `RLX_WGPU_ALL_PARAMS_WEIGHT`
+/// keeps for the parked staging path; without that switch a class-only graph books
+/// nothing.) The second arm is the witness that the decline takes no panel away from a
+/// conv that could have had one: the same graph with the class switched off keeps the same
+/// steps. The refusal is the same at either admitted width, so both are exercised: a
+/// 32-channel shape, in the class since its first bound, and the widest one it takes now.
+/// Only the first is compared to the CPU's answer — the parity cell covers the widest at
+/// every admitted width, and this cell reads its route and its count, which is what the
+/// fallback is about.
 #[test]
 fn a_class_shape_with_a_parked_weight_falls_to_the_direct_conv() {
     let _routes = common::route_lock();
@@ -438,47 +469,72 @@ fn a_class_shape_with_a_parked_weight_falls_to_the_direct_conv() {
         return;
     }
 
-    // The class's own tap shape at an extent whose panel (224 × 131 072 × 4 =
-    // 117 MB) is past the parked staging reserve, so im2col cannot take it either.
-    const C: usize = 32;
+    // The class's own tap shape at extents whose panel is past the parked staging
+    // reserve, so im2col cannot take it either: 32 × 7 × 131 072 × 4 = 117 MB and
+    // 384 × 7 × 8 206 × 4 = 88 MB against that reserve's 64 MiB.
     const KW: usize = 7;
-    const L: usize = 131_066;
-    let build = || {
-        let mut g = Graph::new("conv1d_implicit_parked");
-        let x = g.input("x", Shape::new(&[1, C, 1, L], DType::F32));
-        let w = g.param("w", Shape::new(&[C, C, 1, KW], DType::F32));
-        let y = g.conv2d(x, w, [1, KW], [1, 1], [0, 6], [1, 1], 1);
-        g.set_outputs(vec![y]);
-        g
-    };
-    let n_in = C * L;
-    let out_len = L + 12 - (KW - 1);
-    let xs = common::fill(n_in, 7, 1, 13, 0.1, -0.6);
-    let ws = common::fill(C * C * KW, 5, 3, 11, 0.1, -0.5);
-    let want = common::unit_conv_cpu_reference(build(), &xs, &ws);
+    for (c, l, check_against_cpu) in [(32usize, 131_066usize, true), (384, 8_200, false)] {
+        let build = || {
+            let mut g = Graph::new("conv1d_implicit_parked");
+            let x = g.input("x", Shape::new(&[1, c, 1, l], DType::F32));
+            let w = g.param("w", Shape::new(&[c, c, 1, KW], DType::F32));
+            let y = g.conv2d(x, w, [1, KW], [1, 1], [0, 6], [1, 1], 1);
+            g.set_outputs(vec![y]);
+            g
+        };
+        let out_len = l + 12 - (KW - 1);
+        let xs = common::fill(c * l, 7, 1, 13, 0.1, -0.6);
+        let ws = common::fill(c * c * KW, 5, 3, 11, 0.1, -0.5);
+        let want = check_against_cpu.then(|| common::unit_conv_cpu_reference(build(), &xs, &ws));
 
-    rlx_ir::env::set("RLX_WGPU_ALL_PARAMS_WEIGHT", "1");
-    let mut exe = WgpuExecutable::compile(build());
-    exe.set_param("w", &ws);
-    let steps = exe.test_step_names();
-    let declines = exe.test_conv1d_implicit_declines();
-    let panel = exe.test_conv_panel_bytes();
-    let got = exe.run(&[("x", &xs)]).remove(0);
-    rlx_ir::env::set("RLX_WGPU_ALL_PARAMS_WEIGHT", "0");
+        rlx_ir::env::set("RLX_WGPU_ALL_PARAMS_WEIGHT", "1");
+        let mut exe = WgpuExecutable::compile(build());
+        exe.set_param("w", &ws);
+        let steps = exe.test_step_names();
+        let declines = exe.test_conv1d_implicit_declines();
+        let panel = exe.test_conv_panel_bytes();
+        let got = exe.run(&[("x", &xs)]).remove(0);
 
-    assert!(
-        !steps.contains(&"conv1d_implicit"),
-        "a parked weight keeps the route away ({steps:?})"
-    );
-    assert!(
-        steps.contains(&"conv2d"),
-        "and the direct conv is what runs ({steps:?})"
-    );
-    assert_eq!(declines, 1, "the refusal is counted ({steps:?})");
-    assert_eq!(panel, 0, "no implicit step, no panel to name ({steps:?})");
-    let max = common::max_abs_diff(&got, &want);
-    assert!(max < 1e-2, "max|Δ| {max:e} > 1e-2");
-    println!("parked weight: max|Δ| {max:e}, out {out_len}, steps {steps:?}, declines {declines}");
+        assert!(
+            !steps.contains(&"conv1d_implicit"),
+            "c = {c}: a parked weight keeps the route away ({steps:?})"
+        );
+        assert!(
+            steps.contains(&"conv2d"),
+            "c = {c}: and the direct conv is what runs ({steps:?})"
+        );
+        assert_eq!(declines, 1, "c = {c}: the refusal is counted ({steps:?})");
+        assert_eq!(
+            panel, 0,
+            "c = {c}: no implicit step, no panel to name ({steps:?})"
+        );
+        // The panel route is refused for the same term, so this conv never had a panel to
+        // lose: with the class switched off it keeps the direct conv too. That is what
+        // makes the decline free — the reservation subtracts a class whose declines fall
+        // to the route the previous tree already ran.
+        rlx_ir::env::set("RLX_WGPU_CONV_IMPLICIT", "0");
+        let off_steps = {
+            let mut off = WgpuExecutable::compile(build());
+            off.set_param("w", &ws);
+            off.test_step_names()
+        };
+        rlx_ir::env::set("RLX_WGPU_CONV_IMPLICIT", "1");
+        rlx_ir::env::set("RLX_WGPU_ALL_PARAMS_WEIGHT", "0");
+        assert_eq!(
+            off_steps, steps,
+            "c = {c}: a parked weight refuses the panel route as well, so the decline takes \
+             no panel away from a conv that could have had one"
+        );
+        assert_eq!(got.len(), c * out_len, "c = {c}: the conv's whole output");
+        assert!(got.iter().all(|v| v.is_finite()), "c = {c}: finite output");
+        if let Some(want) = want {
+            let max = common::max_abs_diff(&got, &want);
+            assert!(max < 1e-2, "c = {c}: max|Δ| {max:e} > 1e-2");
+            println!("parked weight c = {c}: max|Δ| {max:e}, steps {steps:?}, declines {declines}");
+        } else {
+            println!("parked weight c = {c}: out {out_len}, steps {steps:?}, declines {declines}");
+        }
+    }
 }
 
 /// The route mid-schedule: two implicit convs with other steps between and after
@@ -755,92 +811,112 @@ fn conv_implicit_vs_panel_measurement() {
     }
 }
 
-/// The class's second row group, at the shapes and extents the synthesis codec runs it
-/// at: `dac.blk.2`'s three 192-channel dilated residuals, 640 output columns a frame, so
-/// 57 600 at the stand's 90-frame part and 92 160 at the codec's 144-frame window.
+/// The class's two admitted widths, at the shapes and extents the synthesis codec runs
+/// them at: `dac.blk.2`'s three 192-channel dilated residuals (640 output columns a frame
+/// — 57 600 at the stand's 90-frame part, 92 160 at the codec's 144-frame window) and
+/// `dac.blk.1`'s three 384-channel ones (160 columns a frame — 14 400 at the 90-frame
+/// part, 23 680 at the recurring 148-frame window).
 ///
-/// The panel route is the one these convolutions take without the second row group, so
-/// the route must beat it at the shape it was admitted for, not only at the 96-channel
-/// block the class was measured on. Arms are paired and the order alternates every
-/// round, because the panel arm's arena carries the panel the route arm does not —
-/// 309 657 600 B at the shorter extent, 495 452 160 B at the longer — and a one-sided
-/// drift would otherwise land on one of them; the figure is the median of the per-round
-/// differences, route minus panel, and a **positive** median fails the cell.
+/// Measured here: both widths, at all three dilations, at each of those extents. Measured
+/// elsewhere: the 96-channel shapes, which have their own cell
+/// (`conv_implicit_vs_panel_measurement`). Argued rather than measured: the 64-channel
+/// ones, which are narrower than every shape above and cost the entry the same gather and
+/// the same one workgroup per row group.
 ///
-/// `#[ignore]` for the other cells' reason: it allocates the shape's real operands (42
-/// MiB of input at 57 600 columns, 67 at 92 160, and 1 MiB of weight) and prints the
-/// figures beside the assertion.
+/// Only the width the class already served is gated: it must be *faster* on the route, and
+/// the widening may not tax it. The newly admitted width is **not** faster — it is admitted
+/// for the residence it saves, not for its time; its figure is printed here and its sign
+/// recorded in `CONV_IMPLICIT_MAX_C_OUT`'s comment, which is where the mechanism lives. A bar
+/// over it would be a bar over a regression. The product path's time claim is the whole
+/// group's, in `sound_decoder_scratch`'s `the_group_is_faster_than_the_panel_route`. Arms are
+/// paired and the order alternates every round, because the panel arm's arena carries the
+/// panel the route arm does not and a one-sided drift would otherwise land on one of them;
+/// the figure is the median of the per-round differences, route minus panel.
+///
+/// `#[ignore]` for the other cells' reason: it allocates the shapes' real operands (42
+/// MiB of input at 57 600 columns, 67 at 92 160, 21 at 14 400, 35 at 23 680, and 1–4 MiB
+/// of weight) and prints the figures beside the assertion.
 #[test]
-#[ignore = "measurement cell: the class's second row group, at the codec's own extents"]
-fn conv_implicit_vs_panel_at_the_second_row_group() {
+#[ignore = "measurement cell: the class's two admitted widths, at the codec's own extents"]
+fn conv_implicit_vs_panel_at_the_admitted_widths() {
     let _routes = common::route_lock();
     route_switches();
     if skip_without_the_route() {
         return;
     }
 
-    for n in [57_600usize, 92_160] {
-        for dilation in [1usize, 3, 9] {
-            let case = Case {
-                label: "192/192 kw=7",
-                c_in: 192,
-                c_out: 192,
-                // Chosen so the padded conv's output is `n`.
-                l: n - dilation * 6,
-                kw: 7,
-                dilation,
-                pad: dilation * 6,
-            };
-            let xs = common::fill(case.c_in * case.l, 7, 1, 13, 0.1, -0.6);
-            let ws = common::fill(case.c_out * case.c_in * case.kw, 5, 3, 11, 0.1, -0.5);
+    // `(channels, label, the extents the codec runs that width at, is the route gated to
+    // win)`.
+    const WIDTHS: [(usize, &str, [usize; 2], bool); 2] = [
+        (192, "192/192 kw=7", [57_600, 92_160], true),
+        (384, "384/384 kw=7", [14_400, 23_680], false),
+    ];
+    for (c, label, extents, gated) in WIDTHS {
+        for n in extents {
+            for dilation in [1usize, 3, 9] {
+                let case = Case {
+                    label,
+                    c_in: c,
+                    c_out: c,
+                    // Chosen so the padded conv's output is `n`.
+                    l: n - dilation * 6,
+                    kw: 7,
+                    dilation,
+                    pad: dilation * 6,
+                };
+                let xs = common::fill(case.c_in * case.l, 7, 1, 13, 0.1, -0.6);
+                let ws = common::fill(case.c_out * case.c_in * case.kw, 5, 3, 11, 0.1, -0.5);
 
-            let arm = |implicit: bool| {
-                rlx_ir::env::set("RLX_WGPU_CONV_IMPLICIT", if implicit { "1" } else { "0" });
-                let mut exe = WgpuExecutable::compile(graph(&case));
-                exe.set_param("w", &ws);
-                let steps = exe.test_step_names();
-                assert!(
-                    steps.contains(&"conv1d_implicit") == implicit,
-                    "n = {n}, d = {dilation}: arm {implicit} took {steps:?}"
-                );
-                exe.run(&[("x", &xs)]);
-                exe
-            };
-            let (mut route, mut panel_arm) = (arm(true), arm(false));
-            assert_eq!(
-                route.test_conv_panel_bytes(),
-                (case.c_in * case.kw) as u64 * n as u64 * 4,
-                "the route gathers the panel's own volume"
-            );
-            assert_eq!(
-                panel_arm.test_conv_panel_bytes(),
-                0,
-                "no implicit step, no panel bytes to name"
-            );
-
-            let rounds = 5;
-            let (per_call, deltas) =
-                common::paired_round_robin(&mut route, &mut panel_arm, rounds, 1, |exe| {
+                let arm = |implicit: bool| {
+                    rlx_ir::env::set("RLX_WGPU_CONV_IMPLICIT", if implicit { "1" } else { "0" });
+                    let mut exe = WgpuExecutable::compile(graph(&case));
+                    exe.set_param("w", &ws);
+                    let steps = exe.test_step_names();
+                    assert!(
+                        steps.contains(&"conv1d_implicit") == implicit,
+                        "c = {c}, n = {n}, d = {dilation}: arm {implicit} took {steps:?}"
+                    );
                     exe.run(&[("x", &xs)]);
-                });
-            let (route, panel, delta) = (
-                common::median(&per_call[0]),
-                common::median(&per_call[1]),
-                common::median(&deltas),
-            );
-            println!(
-                "{} d = {dilation} n = {n}: implicit {route:.1} ms, panel {panel:.1} ms, \
-                 delta {delta:+.2} ms (spread {:+.2}..{:+.2}, slower {}/{rounds})",
-                case.label,
-                common::least(&deltas),
-                common::greatest(&deltas),
-                deltas.iter().filter(|d| **d > 0.0).count(),
-            );
-            assert!(
-                delta < 0.0,
-                "d = {dilation} n = {n}: the route is {delta:.2} ms slower than the panel \
-                 route it replaces"
-            );
+                    exe
+                };
+                let (mut route, mut panel_arm) = (arm(true), arm(false));
+                assert_eq!(
+                    route.test_conv_panel_bytes(),
+                    (case.c_in * case.kw) as u64 * n as u64 * 4,
+                    "the route gathers the panel's own volume"
+                );
+                assert_eq!(
+                    panel_arm.test_conv_panel_bytes(),
+                    0,
+                    "no implicit step, no panel bytes to name"
+                );
+
+                let rounds = 5;
+                let (per_call, deltas) =
+                    common::paired_round_robin(&mut route, &mut panel_arm, rounds, 1, |exe| {
+                        exe.run(&[("x", &xs)]);
+                    });
+                let (route, panel, delta) = (
+                    common::median(&per_call[0]),
+                    common::median(&per_call[1]),
+                    common::median(&deltas),
+                );
+                println!(
+                    "{} d = {dilation} n = {n}: implicit {route:.1} ms, panel {panel:.1} ms, \
+                     delta {delta:+.2} ms (spread {:+.2}..{:+.2}, slower {}/{rounds})",
+                    case.label,
+                    common::least(&deltas),
+                    common::greatest(&deltas),
+                    deltas.iter().filter(|d| **d > 0.0).count(),
+                );
+                if gated {
+                    assert!(
+                        delta < 0.0,
+                        "c = {c}, d = {dilation} n = {n}: the route is {delta:.2} ms slower \
+                         than the panel route it replaces"
+                    );
+                }
+            }
         }
     }
 }

@@ -23,7 +23,7 @@ enable wgpu_cooperative_matrix;
 // block and group rather than once per row tile. The group is the grid's `y`, so an
 // output wider than one group costs a second workgroup rather than a second set of
 // accumulators — the register footprint, the shared tile and the barrier count are the
-// same at 192 rows as at 96.
+// same at 384 rows as at 96.
 //
 // Three accumulator sets are the ceiling one workgroup has (`ROW_TILES`). The host
 // dispatches one workgroup per row group, and how wide an output the class takes is

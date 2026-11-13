@@ -2943,6 +2943,13 @@ impl Runner {
         self.session.scratch_bytes()
     }
 
+    /// The bytes this graph's arena was built at — the activation plan, the parameters it
+    /// holds and the tail scratch. The largest arena a call's graphs are built at is the
+    /// call's peak; the shared weight pool and the f16 arena mirror sit outside it.
+    pub fn arena_bytes(&self) -> Option<u64> {
+        self.session.arena_bytes()
+    }
+
     /// One pass with new inputs — the same compiled buffers, refilled.
     pub fn run(&mut self, inputs: &[(String, Vec<f32>)]) -> Vec<Vec<f32>> {
         let ins: Vec<(&str, &[f32])> = inputs
@@ -3184,6 +3191,11 @@ impl Compiled {
     /// [`Runner::arena_scratch_bytes`] on this graph.
     pub fn arena_scratch_bytes(&self) -> Option<u64> {
         self.runner.arena_scratch_bytes()
+    }
+
+    /// [`Runner::arena_bytes`] on this graph.
+    pub fn arena_bytes(&self) -> Option<u64> {
+        self.runner.arena_bytes()
     }
 }
 

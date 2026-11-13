@@ -474,6 +474,13 @@ impl CompiledGraph {
         self.inner.wgpu_scratch_bytes()
     }
 
+    /// The bytes this graph's arena was built at: the activation plan, whatever parameters
+    /// the plan left in it, and the tail scratch. `None` when the backend reports none.
+    #[doc(hidden)]
+    pub fn arena_bytes(&self) -> Option<u64> {
+        self.inner.wgpu_arena_bytes()
+    }
+
     /// [`Self::set_param`] that returns a wrong-length upload as an error
     /// instead of panicking.
     pub fn try_set_param(
