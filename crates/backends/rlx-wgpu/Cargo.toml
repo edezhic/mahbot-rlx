@@ -366,6 +366,10 @@ name = "gguf_dequant_parity"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "gguf_gemm_coop_tail_rate"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "gguf_gemm_gguf_wgsl"
 required-features = ["backend-tests"]
 

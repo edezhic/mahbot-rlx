@@ -58,7 +58,10 @@
 //! override reached the encoder at all: an A/B that changes nothing proves nothing.
 
 mod common;
-use common::{max_abs_diff, packed_bar_at, refuse_under_q8_0_bisect, refuse_under_run_report};
+use common::{
+    max_abs_diff, packed_bar_at, refuse_under_coop_bisect, refuse_under_q8_0_bisect,
+    refuse_under_run_report,
+};
 use rlx_compile::memory::plan_memory_f32_uniform;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
@@ -67,9 +70,10 @@ use rlx_wgpu::backend::PassMarks;
 use rlx_wgpu::buffer::Arena;
 use rlx_wgpu::gguf_gpu::{
     DequantMatmulPath, DequantMatmulRoutes, DequantSlab, GEMV_WIDE_COLS_PER_WG, GEMV_WIDE_ILP,
-    GemvOneRowShape, dequant_gguf_scratch_bytes, gemv_ilp_cols_per_wg, gemv_ilp_serves_chunk,
-    gemv_one_row_shape, gemv_subgroup_width, gemv_wide_cols_per_wg, reset_gemv_one_row_shape,
-    reset_route_counts, route_counts, run_dequant_matmul_gguf_gpu, select_path,
+    GemvOneRowShape, coop_tail_dispatches, dequant_gguf_scratch_bytes, gemv_ilp_cols_per_wg,
+    gemv_ilp_serves_chunk, gemv_one_row_shape, gemv_subgroup_width, gemv_wide_cols_per_wg,
+    reset_coop_tail_dispatches, reset_gemv_one_row_shape, reset_route_counts, route_counts,
+    run_dequant_matmul_gguf_gpu, select_path,
 };
 use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts, wgpu_device};
 
@@ -405,6 +409,10 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
     // lever on and off inside one bracket, and the bars either side of it are the
     // shipped mode's.
     refuse_under_q8_0_bisect();
+
+    // ... and out of the cooperative tile's: the admits loop below reads the predicate
+    // that lever turns off, and the tail census reads dispatches it suppresses.
+    refuse_under_coop_bisect();
 
     // The one mode this binary's submission bars support, read once: the
     // step-by-step lever (`RLX_WGPU_ONE_OP_PER_PASS`) makes the batch join inert,
@@ -776,12 +784,12 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             2048,
         ),
     ] {
-        let (grid_x, grid_y) = rlx_wgpu::kernels::coop_gemm_gguf_grid(m as u32, n as u32);
+        let grid = rlx_wgpu::kernels::coop_gemm_gguf_grid(m as u32, n as u32);
         assert!(
             !coop_admits(scheme, m, k, n),
             "{scheme:?} m={m} k={k} n={n}: {} workgroups is below the cooperative \
              tile's floor of {}",
-            grid_x * grid_y,
+            grid.cols * grid.tiles,
             rlx_wgpu::gguf_gpu::COOP_MIN_WORKGROUPS
         );
         let (g, packed, x) = case(scheme, ggml, m, k, n);
@@ -796,13 +804,99 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
         );
     }
 
-    // The row-rounding floor, from both sides. The tile covers `ceil(m / 32) * 32`
-    // rows and spends the difference on nothing, so the admission refuses a call
-    // whose rounding is more than a third of its dispatch — even when the grid is
-    // wide enough for the workgroup floor, which is why these cells sit at the
-    // body's widest projection (96 workgroups, four times that floor). 21 and 22
-    // rows straddle the term exactly: 11 rows past `m` out of 32 is more than a
-    // third, 10 is not.
+    // The cooperative tile's short last tile, from the encoder's own counter. The tail
+    // is one row group of a `coop` call rather than a route, so what must not move is
+    // the route: `coop` with `grouped == 0` on every cell, and
+    // `coop_tail_dispatches` is what says the short form was encoded. The rows left
+    // after the whole 32-row tiles are 15 at 47, 79 and 111 rows (the product's
+    // 32/64/96-audio-row rungs) and exactly 16 at 48 and 80, so the last row group of
+    // those runs the short form; at 65 rows — a single-piece input's own frame count —
+    // the remainder is one and the short form runs too; at 31, 63 and 95 rows the
+    // remainder is 31 and the whole tiles stand unchanged, so the counter stays zero.
+    //
+    // The lever is pinned on: the encoder reads it where the multiply is encoded, so a
+    // shell that exports it for a bisect would make every `tails` below read zero.
+    let _tail_on =
+        rlx_ir::env::RuntimeOverrides::install(Some(("RLX_WGPU_GEMM_COOP_TAIL_DISABLE", "0")));
+    for &(m, tails) in &[
+        (47usize, 1u64),
+        (79, 1),
+        (111, 1),
+        (48, 1),
+        (80, 1),
+        (65, 1),
+        (31, 0),
+        (63, 0),
+        (95, 0),
+    ] {
+        let (scheme, ggml) = (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K);
+        let (k, n) = (2048usize, 12288usize);
+        // The tail is one row group of a call the tile serves, so an adapter that
+        // refuses the tile (no cooperative matrices, or `coop_probe` declining the
+        // operand convention) has nothing to measure here. The admits loop above is
+        // where that refusal is explained.
+        if !coop_admits(scheme, m, k, n) {
+            eprintln!(
+                "[rlx-gguf-coop-tail] {scheme:?} m={m} k={k} n={n}: the cooperative tile \
+                 does not admit this shape on this adapter — skipping"
+            );
+            continue;
+        }
+        let (g, packed, x) = case(scheme, ggml, m, k, n);
+        reset_route_counts();
+        reset_coop_tail_dispatches();
+        let _ = run(Device::Gpu, g, &packed, &x);
+        let c = route_counts();
+        let seen = coop_tail_dispatches();
+        assert_eq!(
+            (c.coop, c.grouped, seen),
+            (1, 0, tails),
+            "{scheme:?} m={m} k={k} n={n}: {} whole 32-row row groups and {tails} short last \
+             one: {c:?}",
+            m / 32
+        );
+    }
+
+    // The tail's A/B lever: `RLX_WGPU_GEMM_COOP_TAIL_DISABLE=1` restores the full
+    // 32-row last row group, so the short form goes away — and the route does not
+    // move, which is what makes the lever a measurement of the tail rather than of
+    // the tile.
+    {
+        let (scheme, ggml) = (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K);
+        let (m, k, n) = (47usize, 2048usize, 12288usize);
+        if !coop_admits(scheme, m, k, n) {
+            eprintln!(
+                "[rlx-gguf-coop-tail] {scheme:?} m={m} k={k} n={n}: the cooperative tile \
+                 does not admit this shape on this adapter — skipping the lever cell"
+            );
+        } else {
+            let (g, packed, x) = case(scheme, ggml, m, k, n);
+            let _no_tail = rlx_ir::env::RuntimeOverrides::install(Some((
+                "RLX_WGPU_GEMM_COOP_TAIL_DISABLE",
+                "1",
+            )));
+            reset_route_counts();
+            reset_coop_tail_dispatches();
+            let _ = run(Device::Gpu, g, &packed, &x);
+            let c = route_counts();
+            let seen = coop_tail_dispatches();
+            assert_eq!(
+                (c.coop, c.grouped, seen),
+                (1, 0, 0),
+                "{scheme:?} m={m} k={k} n={n}: the lever restores the full last tile and must \
+                 leave the route alone: {c:?}"
+            );
+        }
+    }
+
+    // The row-rounding floor, from both sides. The whole tiles cover `ceil(m / 32) * 32`
+    // rows — the short last tile takes some of that rounding back at the rungs whose
+    // remainder is sixteen or fewer, which is why the term is read at a row count below
+    // 32 where no short tile applies — so the admission refuses a call whose rounding is
+    // more than a third of the dispatch, even when the grid is wide enough for the
+    // workgroup floor, which is why these cells sit at the body's widest projection
+    // (96 workgroups, four times that floor). 21 and 22 rows straddle the term exactly:
+    // 11 rows past `m` out of 32 is more than a third, 10 is not.
     for &(m, admitted) in &[(21usize, false), (22usize, true)] {
         let (scheme, ggml) = (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K);
         let (k, n) = (2048usize, 12288usize);

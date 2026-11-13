@@ -667,6 +667,32 @@ pub(crate) fn note_route(route: DequantMatmulRoute) {
     route.counter().fetch_add(1, Ordering::Relaxed);
 }
 
+/// Cooperative-tile dispatches this process encoded with the short last tile's flag set:
+/// the row group a call runs in the 16-row form when its prompt leaves sixteen rows or
+/// fewer after the whole tiles. Not a route — it is one row group *inside* a
+/// [`DequantMatmulRoute::Coop`] call — so it is counted beside them rather than in
+/// [`DequantMatmulRoutes`], and a measurement that A/Bs the tail reads it instead of
+/// inferring the form from the shape.
+///
+/// What it observes is the encode path: the flag written into the uniform and the
+/// dispatch made from that same decision. Whether the shader honours the field is the
+/// parity suite's question, not this counter's.
+static COOP_TAIL_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// How many short last tiles this process has encoded.
+pub fn coop_tail_dispatches() -> u64 {
+    COOP_TAIL_DISPATCHES.load(Ordering::Relaxed)
+}
+
+/// Zero [`coop_tail_dispatches`] (tests bracketing a single call).
+pub fn reset_coop_tail_dispatches() {
+    COOP_TAIL_DISPATCHES.store(0, Ordering::Relaxed);
+}
+
+fn note_coop_tail() {
+    COOP_TAIL_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Threads one workgroup of a one-row packed multiply runs, per arm: the tiled
 /// arm splits a column's contraction over `GEMV_TILED_THREADS` lanes, one lane per
 /// 32-element unit of the row (a Q4_K sub-block, or half a Q6_K `ql` span read at
@@ -1092,17 +1118,18 @@ fn slab_row_count(tile: GemmTile, m: usize) -> usize {
 ///
 /// The shape terms: `tiled_scheme_ok` (block layout, whole packing blocks in `k`
 /// — which makes `k % 16 == 0` a consequence rather than a term — a column to
-/// write, Q8_0's lever), then at most a third of the rows the
-/// dispatch covers being rounding — the tile's row floor, 22, comes out of that
-/// term rather than being stated beside it (`COOP_GEMM_MAX_PAD_DIVISOR`) — plus
+/// write, Q8_0's lever), then at most a third of the rows the whole tiles cover
+/// being rounding — the tile's row floor, 22, comes out of that term rather than
+/// being stated beside it (`COOP_GEMM_MAX_PAD_DIVISOR`), and the short last tile
+/// takes some of that rounding back without changing the term — plus
 /// `ncols % 128 == 0` (whole column tiles, which a cooperative store cannot mask)
 /// and the whole call in one column chunk (`grouped_dispatch_cols` at
 /// `slab_row_count`, both of that rule's budgets), which is also the grid floor
-/// [`COOP_MIN_WORKGROUPS`] is read against. The device terms: the entry point
-/// builds (`GemmTile::kernel`, which is where `SHADER_F16`,
-/// `EXPERIMENTAL_COOPERATIVE_MATRIX` and the workgroup-storage size are refused),
-/// and `crate::coop_probe` has established that this operand convention computes
-/// `a·b` on the adapter rather than a transposition.
+/// [`COOP_MIN_WORKGROUPS`] is read against. The device terms: the entry point builds
+/// (`GemmTile::kernel`, which is where `SHADER_F16`,
+/// `EXPERIMENTAL_COOPERATIVE_MATRIX` and the workgroup-storage size are refused), and
+/// `crate::coop_probe` has established that this operand convention computes `a·b` on
+/// the adapter rather than a transposition.
 ///
 /// `RLX_WGPU_GEMM_COOP_DISABLE=1` is the bisect lever: it puts every call back on
 /// the grouped tile, which is the route that shape had before this tile existed.
@@ -1141,15 +1168,16 @@ pub fn coop_gemm_admits(
         && grouped_dispatch_cols(device, scheme_id, slab_row_count(GemmTile::Coop, m), k) >= n
 }
 
-/// At most one row in this many of the cooperative tile's dispatch may be past
-/// `m`: the tile covers `ceil(m / 32) * 32` rows and spends the difference on
-/// nothing.
+/// The most rounding a cooperative call may carry: `ceil(m / 32) * 32 - m` must not
+/// exceed a third of the rows the whole tiles cover, which puts the tile's row floor at
+/// 22 — the shortest call it takes.
 ///
-/// The bound is what keeps a short, wide call off the tile. A call whose row count is
-/// rounded by more than about a third spends more arithmetic than the rate buys back
-/// — 16 rows would be padded to 32, doubling the work. A third leaves every product
-/// row count inside it (31 and 47 are 3 % and 27 %) and puts the tile's row floor at
-/// 22, which is also why no separate `m >= 16` term is needed.
+/// Retained at the value it was measured at, against the dispatch the tile makes. The
+/// short last tile (`kernels::CoopGrid`'s `tail`) reduces the padding this term was
+/// compensating for without removing it, and re-deriving the term against the shorter
+/// dispatch would move which calls take the tile — a route change this term is not here
+/// to make. `tests/gguf_gemm_coop_tail_rate.rs` reads what the tail does to the cells the
+/// term admits.
 const COOP_GEMM_MAX_PAD_DIVISOR: usize = 3;
 
 /// The fewest workgroups a cooperative-tile dispatch must have, from measurement.
@@ -2671,12 +2699,24 @@ fn encode_dequant_matmul_gguf_gemm_tiled(
             // runs the split geometry over it — the encoder's one answer to both
             // ([`grouped_chunk_geometry`]). The cooperative tile has no split arm:
             // its own tile is 32 rows by 128 columns, which is a grid the shapes it
-            // admits fill without one.
-            let (x_groups, y_groups, split) = match tile {
-                GemmTile::Grouped => grouped_chunk_geometry(scheme_id, m, n_chunk),
+            // admits fill without one. Its grid also says whether the last row group
+            // is the short tile, which is one more field of the uniform rather than a
+            // dispatch of its own — the two forms' workgroups share one wave.
+            let (x_groups, y_groups, split, tail) = match tile {
+                GemmTile::Grouped => {
+                    let (x, y, split) = grouped_chunk_geometry(scheme_id, m, n_chunk);
+                    (x, y, split, false)
+                }
                 GemmTile::Coop => {
-                    let (x, y) = crate::kernels::coop_gemm_gguf_grid(m as u32, n_chunk as u32);
-                    (x, y, false)
+                    let g = crate::kernels::coop_gemm_gguf_grid(m as u32, n_chunk as u32);
+                    // The grid is the shape's geometry; the lever is applied here, where
+                    // the multiply is encoded.
+                    (
+                        g.cols,
+                        g.tiles,
+                        false,
+                        g.tail && !rlx_ir::env::flag("RLX_WGPU_GEMM_COOP_TAIL_DISABLE"),
+                    )
                 }
             };
 
@@ -2687,7 +2727,9 @@ fn encode_dequant_matmul_gguf_gemm_tiled(
                 x_vec4_off,
                 w_byte_off: (w0 - w_base) as u32,
                 split: split as u32,
-                _p0: 0,
+                // Which row group runs the short tile's form; `u32::MAX` matches none,
+                // which is the whole-tile dispatch this call had before the tail.
+                tail_row: if tail { y_groups - 1 } else { u32::MAX },
                 _p1: 0,
             };
             let u = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2740,6 +2782,9 @@ fn encode_dequant_matmul_gguf_gemm_tiled(
                 pass.set_pipeline(&dk.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(x_groups, y_groups, 1);
+                if tail {
+                    note_coop_tail();
+                }
             }
 
             // Slab rows are [m, n_chunk]; this chunk owns arena columns
@@ -3561,7 +3606,10 @@ mod tests {
         .validate(&module)
         .expect("wgsl validate with f16 and cooperative matrices");
         // One entry point per scheme: routing Q4_K through the Q6_K entry (or a
-        // scheme with no entry at all) would decode garbage rather than fail.
+        // scheme with no entry at all) would decode garbage rather than fail. The
+        // short last tile is a second form of the same entry point, not a second
+        // entry point: its row group is chosen by a uniform field, so a call is one
+        // dispatch whatever its remainder.
         let names: Vec<&str> = module
             .entry_points
             .iter()
@@ -3582,6 +3630,10 @@ mod tests {
             format!("const TM: u32 = {}u;", crate::kernels::COOP_GEMM_TILE_M),
             format!("const TN: u32 = {}u;", crate::kernels::COOP_GEMM_TILE_N),
             format!("const TK: u32 = {}u;", crate::kernels::COOP_GEMM_TILE_K),
+            format!(
+                "const TM_TAIL: u32 = {}u;",
+                crate::kernels::COOP_GEMM_TAIL_M
+            ),
         ] {
             assert!(wgsl.contains(&want), "expected `{want}` in the shader");
         }
@@ -3595,7 +3647,8 @@ mod tests {
         // `stage_a` gives each invocation exactly one four-element group of the A
         // panel, which is why it has no loop: a workgroup that is not
         // `TM * TK / 4` wide would leave part of the panel unstaged, and the MMAs
-        // read all of it.
+        // read all of it. The tail stages half that panel from half the invocations
+        // (`TM_TAIL * TK / 4`) and runs the same workgroup, so its size is this one's.
         for entry in &module.entry_points {
             assert_eq!(
                 entry.workgroup_size,
@@ -3609,11 +3662,47 @@ mod tests {
             );
         }
         // The grid covers whole tiles on both axes, which is what a store that
-        // cannot be masked needs; 95 rows is the product's typical prefill.
+        // cannot be masked needs; 95 rows is the product's typical prefill, and the
+        // six rung row counts are the sweep the tail is read at. The tail is one of
+        // the row groups the tile always dispatched — the last one — so the grid, and
+        // the workgroup count the floor is read against, do not move.
+        use crate::kernels::{CoopGrid, coop_gemm_gguf_grid};
         assert_eq!(
-            crate::kernels::coop_gemm_gguf_grid(95, 12288),
-            (96, 3),
+            coop_gemm_gguf_grid(95, 12288),
+            CoopGrid {
+                cols: 96,
+                tiles: 3,
+                tail: false
+            },
             "95 rows are three 32-row tiles, 12 288 columns 96 column tiles"
+        );
+        for (m, tiles, tail) in [
+            (47u32, 2u32, true),
+            (48, 2, true),
+            (65, 3, true),
+            (111, 4, true),
+            (63, 2, false),
+        ] {
+            let g = coop_gemm_gguf_grid(m, 12288);
+            assert_eq!(
+                (g.cols, g.tiles, g.tail),
+                (96, tiles, tail),
+                "m={m}: {tiles} row groups, the last {}",
+                if tail { "short" } else { "whole" }
+            );
+            assert_eq!(
+                g.tiles,
+                m.div_ceil(32),
+                "m={m}: the short last tile replaces a row group rather than adding one"
+            );
+        }
+        // The grid is pure geometry — the shape's answer, not the shell's — and the lever
+        // is the encoder's, applied where the multiply is encoded.
+        let _lever =
+            rlx_ir::env::RuntimeOverrides::install(Some(("RLX_WGPU_GEMM_COOP_TAIL_DISABLE", "1")));
+        assert!(
+            coop_gemm_gguf_grid(47, 12288).tail,
+            "the grid must not read the lever"
         );
     }
 

@@ -2186,8 +2186,10 @@ pub struct DequantGemmQ10Params {
 /// at column 0 of that chunk. `split` is 1 when the encoder put the Q4_K entry
 /// point on its split geometry (see `gguf_gpu.rs`'s
 /// `GROUPED_SPLIT_MAX_BASE_WORKGROUPS`), 0 for the base one; the Q6_K and Q8_0
-/// entries ignore it. The last two words are padding: a uniform binding size
-/// must be a multiple of 16 bytes.
+/// entries ignore it. `tail_row` is the row group of the cooperative tile that runs
+/// the short last tile's form, `u32::MAX` when the call has none; the row-grouped
+/// entries ignore it. `_p1` is padding: a uniform binding size must be a multiple of
+/// 16 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct DequantGemmGgufParams {
@@ -2197,7 +2199,7 @@ pub struct DequantGemmGgufParams {
     pub x_vec4_off: u32,
     pub w_byte_off: u32,
     pub split: u32,
-    pub _p0: u32,
+    pub tail_row: u32,
     pub _p1: u32,
 }
 
@@ -6604,6 +6606,11 @@ pub(crate) const COOP_GEMM_TILE_M: u32 = 32;
 pub(crate) const COOP_GEMM_TILE_N: u32 = 128;
 pub(crate) const COOP_GEMM_TILE_K: u32 = 16;
 
+/// The rows the short last tile covers — the shader's `TM_TAIL`, half a whole tile: two
+/// row sub-tiles per subgroup, half the A stage and half the MMAs, on the same entry
+/// point and the same bind group.
+pub(crate) const COOP_GEMM_TAIL_M: u32 = 16;
+
 /// Workgroup storage `dequant_gemm_coop_gguf.wgsl` declares: two 1 KiB ping-pong
 /// A panels, a 4 KiB decoded-weight stage and the 256 B of zero lanes the
 /// accumulators are seeded from. Named here because the kernel getters refuse a
@@ -6611,15 +6618,42 @@ pub(crate) const COOP_GEMM_TILE_K: u32 = 16;
 const COOP_GEMM_GGUF_STORAGE: u32 =
     2 * COOP_GEMM_TILE_M * COOP_GEMM_TILE_K * 2 + COOP_GEMM_TILE_K * COOP_GEMM_TILE_N * 2 + 256;
 
-/// The dispatch grid [`dequant_gemm_coop_kernel`] wants for a call: whole tiles on
-/// both axes, `(ceil(ncols / TN), ceil(m / TM))`. Public because a measurement
-/// that prints the grid a cell dispatched has to read the encoder's own answer
-/// rather than restate it.
-pub fn coop_gemm_gguf_grid(m: u32, ncols: u32) -> (u32, u32) {
-    (
-        ncols.div_ceil(COOP_GEMM_TILE_N),
-        m.div_ceil(COOP_GEMM_TILE_M),
-    )
+/// The dispatch [`dequant_gemm_coop_kernel`] makes for a call: whole 32-row tiles on both
+/// axes, except that the last row group may be the short one. Pure geometry — nothing here
+/// reads an environment lever; the encoder applies `RLX_WGPU_GEMM_COOP_TAIL_DISABLE` to
+/// `tail` where it encodes the multiply. Public because a measurement that prints the grid
+/// a cell dispatched has to read it from the module that dispatches rather than restate it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CoopGrid {
+    /// Column tiles: `ceil(ncols / TN)`.
+    pub cols: u32,
+    /// Row groups: `ceil(m / TM)`.
+    pub tiles: u32,
+    /// Whether the last row group is the short `COOP_GEMM_TAIL_M`-row form: the rows left
+    /// after the whole tiles number that or fewer. It is anchored at the prompt's end
+    /// rather than at a tile boundary, so it never grows the output slab; at a remainder
+    /// below sixteen it re-writes the rows the group before it wrote — fifteen at a
+    /// remainder of one.
+    ///
+    /// The recogniser rungs this form serves are 47, 79 and 111 rows (remainder 15) and
+    /// never 31, 63 or 95 (remainder 31); the encoder's projections at 48 and 80 rows land
+    /// on a remainder of exactly sixteen, and a single-piece input runs at whatever frame
+    /// count it has, so every remainder from one to sixteen is reachable wherever the
+    /// admission lets the call through. The smallest remainder-one call is 65 rows: the
+    /// term that caps rounding at a third of the dispatch
+    /// (`gguf_gpu::COOP_GEMM_MAX_PAD_DIVISOR`) puts 33 rows on the row-grouped tile, 31
+    /// rows of rounding against a third of 64.
+    pub tail: bool,
+}
+
+/// `m` rows by `ncols` columns as [`dequant_gemm_coop_kernel`] dispatches them.
+pub fn coop_gemm_gguf_grid(m: u32, ncols: u32) -> CoopGrid {
+    let rem = m % COOP_GEMM_TILE_M;
+    CoopGrid {
+        cols: ncols.div_ceil(COOP_GEMM_TILE_N),
+        tiles: m.div_ceil(COOP_GEMM_TILE_M),
+        tail: rem > 0 && rem <= COOP_GEMM_TAIL_M,
+    }
 }
 
 /// The packed-weight GEMM through the hardware matrix units (Q4_K / Q6_K / Q8_0,

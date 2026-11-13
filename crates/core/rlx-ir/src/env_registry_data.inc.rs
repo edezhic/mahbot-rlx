@@ -4256,6 +4256,15 @@
         layer: EnvLayer::Backend("wgpu"),
     },
     EnvVarEntry {
+        name: "RLX_WGPU_GEMM_COOP_TAIL_DISABLE",
+        group: "wgpu",
+        summary: "Bisect lever: puts the cooperative-matrix tile's last row group back on the full 32 rows instead of the 16-row short form, which is the dispatch those shapes had before the tail existed",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Bisect,
+        aliases: &[],
+        layer: EnvLayer::Backend("wgpu"),
+    },
+    EnvVarEntry {
         name: "RLX_WGPU_GEMV_IN_PLACE",
         group: "wgpu",
         summary: "One-row packed GEMV output: store the row straight into the arena slot instead of a pooled slab plus a copy dispatch (0 restores the slab, which is how the saving is re-taken)",

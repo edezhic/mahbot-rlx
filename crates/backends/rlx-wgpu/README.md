@@ -112,16 +112,16 @@ kernels, pure Rust deps — no FFI, no submodules.
   Q4_K/Q6_K **and Q8_0** a device with cooperative matrices takes the fused
   cooperative tile (`dequant_gemm_coop_gguf.wgsl`: the packed weight decoded into a
   workgroup f16 stage and multiplied by the hardware matrix units with an f32
-  accumulator, 32-row tiles; admitted at `m >= 22` — the tile's 32-row rounding may
-  spend at most a third of the dispatch on rows past `m` — with `n % 128 == 0`,
-  `k % 16 == 0`, one column chunk and at least 24 workgroups), and the row-grouped
-  GEMM — the fallback, and the
-  route everywhere without them — reads each packed weight tile's quant bytes once
-  per group of 8 rows instead of once per row (`RLX_WGPU_GEMM_COOP_DISABLE=1` puts
-  every call back on it) — and that GEMM's Q4_K entry, when a dispatch would be too
-  small to fill the GPU, covers half the columns per workgroup with two threads to
-  each instead, splitting the contraction across them and reading each block's
-  16-byte header twice. That row-grouped arm's
+  accumulator, 32-row tiles whose last row group is a 16-row form when the prompt
+  leaves sixteen rows or fewer; admitted at `m >= 22` — the whole tiles' 32-row
+  rounding may spend at most a third of the dispatch on rows past `m` — with
+  `n % 128 == 0`, `k % 16 == 0`, one column chunk and at least 24 workgroups), and
+  the row-grouped GEMM — the fallback, and the route everywhere without them — reads
+  each packed weight tile's quant bytes once per group of 8 rows instead of once per
+  row (`RLX_WGPU_GEMM_COOP_DISABLE=1` puts every call back on it) — and that GEMM's
+  Q4_K entry, when a dispatch would be too small to fill the GPU, covers half the
+  columns per workgroup with two threads to each instead, splitting the contraction
+  across them and reading each block's 16-byte header twice. That row-grouped arm's
   `k` gate is the scheme's own packing block — Q4_K/Q6_K: 256, which is the staged
   tile itself; Q8_0: 32 — so a Q8_0 row of several tiles plus a block, or of less
   than one tile, takes the arm and joins the enclosing batch: the shader's tail tile

@@ -12,7 +12,9 @@
 // `dequant_gemm_coop_q6k` (scheme 2) and `dequant_gemm_coop_q8_0` (scheme 20) —
 // for the reason `dequant_gemm_gguf.wgsl` gives: an id routed to an entry point
 // with no branch for it matches nothing and reads the weights as zeros instead of
-// failing.
+// failing. The short last tile is a second form of each of them, not a fourth entry
+// point: one uniform field picks the row group that runs it (see "THE SHORT LAST
+// TILE").
 //
 // ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
 //
@@ -35,36 +37,97 @@
 // ratio by up to a tenth) — TFLOP/s at the product's own prefill row counts, this
 // entry point against `dequant_gemm_gguf.wgsl`'s row-grouped tile:
 //
-//   q4k qkv      m 95 k 2048 n  4096    2.24   against 1.42   (1.58x)
-//   q4k o        m 95 k 2048 n  2048    1.86   against 1.29   (1.44x)
-//   q4k gate/up  m 95 k 2048 n 12288    2.68   against 1.51   (1.77x)
-//   q6k down     m 95 k 6144 n  2048    1.74   against 0.99   (1.76x)
-//   q8_0 enc     m 96 k 1024 n  4096    1.86   against 1.10   (1.69x)
-//   q4k gate/up  m 31/47/63/79/95/111   2.16 / 1.99 / 2.56 / 2.29 / 2.69 / 2.44
-//                                        against 1.42 / 1.44 / 1.49 / 1.49 / 1.50 / 1.51
-//                                        (1.52x / 1.38x / 1.72x / 1.54x / 1.79x / 1.62x)
+//   q4k qkv      m 95 k 2048 n  4096    2.30   against 1.43   (1.60x)
+//   q4k o        m 95 k 2048 n  2048    1.88   against 1.32   (1.43x)
+//   q4k gate/up  m 95 k 2048 n 12288    2.68   against 1.51   (1.78x)
+//   q6k down     m 95 k 6144 n  2048    1.75   against 0.99   (1.76x)
+//   q8_0 enc     m 96 k 1024 n  4096    1.88   against 1.12   (1.67x)
+//   q4k gate/up  m 31/47/63/79/95/111   2.19 / 2.28 / 2.59 / 2.48 / 2.68 / 2.58
+//                                        against 1.42 / 1.46 / 1.49 / 1.50 / 1.51 / 1.52
+//                                        (1.54x / 1.56x / 1.74x / 1.65x / 1.78x / 1.70x)
 //
-// The sawtooth in that last row is the 32-row tile's own: 31, 63 and 95 rows are one,
-// two and three whole tiles (3 %, 2 % and 1 % of the dispatch spent on rows past `m`),
-// while 47 and 79 round up to two and three tiles of a 64- and 96-row dispatch (27 %
-// and 18 %), and 111 to four of a 128 (13 %). The m 95 sweep cell is a second
-// independent build of the same shape — the harness's repeatability witness, 2.69
-// against the table's 2.68. The endpoint is what the floor rests on: 47, the most
-// rounded, is the weakest rung at 1.38x, which is what `COOP_GEMM_MAX_PAD_DIVISOR` in
-// `gguf_gpu.rs` is the floor of.
+// The sawtooth in that last row is what the short last tile (below) flattened: without
+// it, 47 and 79 rows round up to two and three whole 32-row tiles of a 64- and 96-row
+// dispatch (27 % and 18 % of it spent on rows past `m`) and 111 to four of a 128 (13 %),
+// while 31, 63 and 95 are one, two and three whole tiles (3 %, 2 % and 1 %). With it the
+// dispatch is 1.5, 2.5 and 3.5 row groups at 47, 79 and 111 and 1, 2 and 3 whole ones
+// at 31, 63 and 95 — the table's rates rise from 1.99/2.29/2.44 to 2.28/2.48/2.58. The
+// m 95 sweep cell is a second independent build of the same shape — the harness's
+// repeatability witness, 2.68 against the table's 2.68. The rung the pad term was set
+// on is now 47 at 1.56x, the second-lowest of the six, and `COOP_GEMM_MAX_PAD_DIVISOR`
+// in `gguf_gpu.rs` is retained at that measured value rather than re-derived: the term
+// decides which calls take the tile, and the tail only reduces the padding it
+// compensates for.
 //
 // The encoder's own rate is the file's other reading, and it is the one that moved
 // the floor: `q8_0 enc-down` at m 96 k 4096 n 1024 is eight column tiles by three
 // row tiles — 24 workgroups, `COOP_MIN_WORKGROUPS` itself — so it ran the
 // row-grouped tile while the floor was 48 and the pair read 1.00x, a repeatability
 // witness rather than a comparison. At the floor of 24 it takes the cooperative
-// tile and the pair reads 1.21x.
+// tile and the pair reads 1.19x.
+//
+// ── THE SHORT LAST TILE ─────────────────────────────────────────────────────
+//
+// `tests/gguf_gemm_coop_tail_rate.rs` is the tail's own pair — the tail against the
+// whole 32-row last tile it replaces, on the same cell in adjacent rounds of one
+// process with the side that runs first alternating round by round, the `median_TFLOPs`
+// of five rounds of three calls, one take — at the row counts whose remainder is
+// fifteen (the product's 32/64/96-audio-row rungs), sixteen, and one (a 400-frame
+// single-piece clip, the largest overlap the rule produces), and at cells the tile
+// serves narrowly:
+//
+//   q4k gate/up m 111 k 2048 n 12288    2.57 against 2.43   (1.06x)
+//   q4k gate/up m  79 k 2048 n 12288    2.50 against 2.29   (1.09x)
+//   q4k gate/up m  47 k 2048 n 12288    2.26 against 1.98   (1.14x)
+//   q4k gate/up m  48 k 2048 n 12288    2.27 against 2.02   (1.12x)
+//   q4k gate/up m  80 k 2048 n 12288    2.49 against 2.31   (1.08x)
+//   q4k gate/up m  65 k 2048 n 12288    2.10 against 1.92   (1.09x)
+//   q4k gate/up m  31/63/95 k 2048 n 12288   2.19 / 2.58 / 2.68 (no tail: the same grid
+//                                        on both sides, this file's floor)
+//   q4k o        m 111 k 2048 n  1024   1.39 against 1.29   (1.07x)
+//   q4k qkv      m  79 k 2048 n  2048   1.62 against 1.61   (1.01x)
+//   q4k o        m  47 k 2048 n  2048   1.26 against 1.14   (1.10x)
+//   q8_0 enc     m  48 k 1024 n  4096   1.41 against 1.35   (1.04x)
+//   q8_0 enc-down m 80 k 4096 n  1024   1.16 against 1.12   (1.03x)
+//   q6k down     m 111 k 6144 n  2048   1.77 against 1.74   (1.02x)
+//
+// Those are one take's figures, and the table is that take's record: the widest cells
+// 1.06x to 1.14x, the narrow ones 1.01x to 1.10x, and the three rungs the tail does not
+// serve dispatching the same grid on both sides, so their ratio is this file's
+// repeatability floor rather than a reading of the tail. A cell whose figure lands inside
+// that range is the floor, not a result; the pair is what separates the two, and the
+// narrow cells sit closest to it because their share of the tail is one row group of
+// three over 8 to 32 column tiles.
+//
+// What a cell reads is what a row group costs, and the tail is not half of one: it is
+// `decode + half the MMAs`, which measures 0.78 of a whole one on the m 111 cell (18.383
+// ms for four whole row groups against 17.383 for three and a tail, so 3.60 ms against
+// 4.60), the decode's share being the 14 % the section below prices. The sixteen rows it
+// drops are therefore worth 0.22 of a row group — 6 % of the dispatch at 111 rows, 11 %
+// at 47 — and that, not the 12.5 % and 25 % the row counts alone promise, is the 1.06x
+// and 1.14x the table reads.
+//
+// The tail is a **second form of the same entry point**, chosen by `params.tail_row` —
+// a uniform field naming the row group that runs it — not a second dispatch. A second
+// dispatch of the same rows measured several times the arithmetic it saved at 8 and 16
+// column tiles (0.57x and 0.73x on the cells above): those grids are one or two waves,
+// so a separate launch pays a whole wave for the tail where co-residency pays only its
+// own workgroups' share. The uniform field is what the encoder already had (`_p0`,
+// padding before this), so nothing is added to the record or to the bind group.
+//
+// The rows the short form computes are the same operands in the same k order over the
+// same f16 stage, so its output does not move — and does not: the parity suite's
+// in-process repeats read `repeat_max_abs = 0` on the tail cells, the pair above
+// compares the two forms' outputs bit for bit on every cell, and the stand's six
+// digests still match their witnesses.
 //
 // The end-to-end figure the tile buys is the recognition stand row (`STAND.md`'s
 // `recognition.typical`): about 0.4 s faster warm with the tile than with
 // `RLX_WGPU_GEMM_COOP_DISABLE=1` (3.04 s warm, median of three alternating takes
 // each). The prompt prefill is about a quarter of that call, which is why the tile's
-// 1.77x on the cell reaches the row as ~12 %.
+// 1.77x on the cell reaches the row as ~12 %. The tail's own move at the row is
+// smaller than that row's take-to-take spread: the prompt prefill is 24 % of the long
+// row and the tail removes about a tenth of it at the rungs it serves, which is ~2 %.
 //
 // The row outcome of the header cache is smaller: its +5-6 % on the cell reaches
 // recognition long as about 1.2 % by median (0.3 % paired) against a round spread of
@@ -90,20 +153,27 @@
 // spent on nothing. It is not a constant bump either: a 64-row A stage is two
 // ping-pong 64x16 f16 panels, 4 KiB against today's 2 KiB, which puts the tile at
 // 8 448 B — past the 8 KiB residency cliff below — so a taller row tile is a
-// restructuring of the operand stage, not a loop bound. A 32-row tile rounds it to
-// 96 — and the encoder clamps the last tile's row base to `m - 32` rather than
-// rounding, so a tile never reaches past the output tensor and the overlap is
-// recomputed rather than written. The row tile cannot go below 32: 16 rows per
-// subgroup would put the load-to-MMA ratio at 0.75 and halve the arithmetic each
-// staged weight tile is reused for.
+// restructuring of the operand stage, not a loop bound. The row tile cannot go below
+// 32 for the whole tiles: 16 rows per subgroup would put the load-to-MMA ratio at
+// 0.75 and halve the arithmetic each staged weight tile is reused for.
+//
+// The last row group is the one exception, and it is 16 rows rather than 32. It writes
+// the call's last sixteen rows, so the output slab keeps exactly the row count it has;
+// what that anchor overlaps, and how the overlap stays exact, is the short form's own
+// note below. Which calls run this form is `kernels::CoopGrid`'s `tail`. It is the same
+// body over half the rows — two row sub-tiles per subgroup, half the A stage, half the
+// MMAs — with the whole B stage, because a staged weight tile is reused for the rows the
+// group has and no fewer: that is why it costs more than half a row group rather than
+// half of one. A call that leaves more than sixteen rows keeps the whole tile, whose
+// padding is what `COOP_GEMM_MAX_PAD_DIVISOR` in `gguf_gpu.rs` is read against.
 //
 // ── WHAT IT COSTS IN WORKGROUP STORAGE ──────────────────────────────────────
 //
-// 2 KiB of A stage (two ping-pong 32×16 f16 panels), 4 KiB of B stage (16 k by
-// 128 columns of decoded f16) and 256 B of zero lanes the accumulators are
-// seeded from: 6 400 B. That is under the 8 KiB at which
-// `dequant_gemm_gguf.wgsl` measures its occupancy cliff (a tile merely *declared*
-// 10 rows deep, identical arithmetic, read 2.2x its 8 KiB time), so two
+// 2 KiB of A stage (two ping-pong 32×16 f16 panels; the short last form stages the
+// first half of each), 4 KiB of B stage (16 k by 128 columns of decoded f16) and 256 B
+// of zero lanes the accumulators are seeded from: 6 400 B. That is under the 8 KiB at
+// which `dequant_gemm_gguf.wgsl` measures its occupancy cliff (a tile merely
+// *declared* 10 rows deep, identical arithmetic, read 2.2x its 8 KiB time), so two
 // workgroups stay resident per core. Both stages are single-buffered deliberately:
 // a second B panel takes the shader to 10.25 KiB for the one barrier per stage it
 // would buy, and measured *slower* (17.8 against 16.3 ms on the gate/up cell) —
@@ -160,17 +230,18 @@
 // The encoder admits a call whose `ncols % 128 == 0` and `k % 16 == 0`, and
 // dispatches `(ceil(ncols / 128), ceil(m / 32))`. Whole tiles on both axes are what
 // a cooperative store requires — it cannot be masked, so a partial tile would write
-// past the output — and the row axis is made whole by clamping the last tile's base
-// to `m - 32` instead of rounding the row count up, so the rows two tiles share are
-// recomputed identically rather than the output being overrun.
+// past the output — and the row axis is made whole by clamping the last whole tile's
+// base to `m - 32`, or by the short form at `m - 16` where `kernels::CoopGrid`'s `tail`
+// is set.
 //
-// The row count is bounded from below by what that rounding costs: the dispatch
-// covers `ceil(m / 32) * 32` rows, and `gguf_gpu.rs`'s `COOP_GEMM_MAX_PAD_DIVISOR`
-// refuses a call where more than a third of them are past `m`, so the shortest call
-// this tile takes is 22 rows. A call under 32 rows runs one tile whose rows past `m`
-// land in the output slab's own surplus — the encoder sizes the slab `max(m, 32)`
-// rows and copies only the valid ones out — and whose A panel is staged with its row
-// clamped to `m - 1`, so neither axis ever reads or writes outside its own extent.
+// The row count is bounded from below by what that rounding costs: without the short
+// form the dispatch covers `ceil(m / 32) * 32` rows, and `gguf_gpu.rs`'s
+// `COOP_GEMM_MAX_PAD_DIVISOR` refuses a call where more than a third of them are past
+// `m`, so the shortest call this tile takes is 22 rows. A call under 32 rows runs one
+// tile whose rows past `m` land in the output slab's own surplus — the encoder sizes
+// the slab `max(m, 32)` rows and copies only the valid ones out — and whose A panel is
+// staged with its row clamped to `m - 1`, so neither axis ever reads or writes outside
+// its own extent.
 //
 // ── THE READERS ─────────────────────────────────────────────────────────────
 //
@@ -189,7 +260,7 @@ enable f16;
 enable wgpu_cooperative_matrix;
 
 /// The uniform is `DequantGemmGgufParams`' layout, shared with the row-grouped
-/// entries so one Rust struct encodes both; `split` and the two pad words are
+/// entries so one Rust struct encodes both; `split` and the second pad word are
 /// unused here.
 struct Params {
     m: u32,
@@ -198,13 +269,18 @@ struct Params {
     x_vec4_off: u32,
     w_byte_off: u32,
     split: u32,
-    _p0: u32,
+    /// The row group that is the short last tile, or `0xFFFFFFFFu` when the call has
+    /// none.
+    tail_row: u32,
     _p1: u32,
 }
 
 const TM: u32 = 32u;   // output rows per workgroup
 const TN: u32 = 128u;  // output columns per workgroup
 const TK: u32 = 16u;   // contraction elements per stage
+/// The last tile's rows when it is the short one: the prompt's last sixteen, so
+/// the dispatch covers `TM_TAIL` rows instead of a whole `TM` one (see the header).
+const TM_TAIL: u32 = 16u;
 /// Columns one subgroup owns: its quarter of the tile, and the quarter it decodes,
 /// one column per lane of its 32 invocations.
 const SG_COLS: u32 = TN / 4u;
@@ -324,25 +400,28 @@ const Q8_0_BIAS: f32 = 128.0;
 
 // ── staging ─────────────────────────────────────────────────────────────────
 
-/// Stage one 32×16 A panel, f32 arena → f16, into ping-pong buffer `buf`. Each
-/// invocation covers four adjacent K columns of one row, so the load is one
-/// `vec4` — the form `matmul_coop_f16_f32acc.wgsl` measures at 2.2 → 3.4 TFLOP/s
-/// against one column per invocation — and the workgroup's 128 invocations are
-/// exactly `TM * A_STRIDE / 4` such groups. The column is always whole (the
-/// encoder admits only whole K stages); the row is clamped to `m - 1` because a
-/// call below 32 rows runs one tile over an X window of exactly `m` rows, and
-/// only the surplus rows of the output slab are the tile's to write.
-fn stage_a(buf: u32, k_off: u32, row_base: u32, lid: u32) {
-    let idx = lid * 4u;
-    let r = idx / TK;
-    let c = idx % TK;
-    let row = min(row_base + r, params.m - 1u);
-    let v = xarr[params.x_vec4_off + row * (params.k >> 2u) + ((k_off + c) >> 2u)];
-    let dst = buf * (TM * A_STRIDE) + r * A_STRIDE + c;
-    a_stage[dst] = f16(v.x);
-    a_stage[dst + 1u] = f16(v.y);
-    a_stage[dst + 2u] = f16(v.z);
-    a_stage[dst + 3u] = f16(v.w);
+/// Stage one A panel, f32 arena → f16, into ping-pong buffer `buf`. Each invocation
+/// covers four adjacent K columns of one row, so the load is one `vec4` — the form
+/// `matmul_coop_f16_f32acc.wgsl` measures at 2.2 → 3.4 TFLOP/s against one column per
+/// invocation — and a whole tile's 128 invocations are exactly `TM * A_STRIDE / 4` such
+/// groups. The short last form stages half a panel: `TM_TAIL` rows, half the invocations
+/// and half the X it reads, the same body over `rows`. The column is always whole (the
+/// encoder admits only whole K stages); the row is clamped to `m - 1` because a call
+/// below 32 rows runs one tile over an X window of exactly `m` rows, and only the
+/// surplus rows of the output slab are the tile's to write.
+fn stage_a(buf: u32, k_off: u32, row_base: u32, lid: u32, rows: u32) {
+    if (lid < rows * TK / 4u) {
+        let idx = lid * 4u;
+        let r = idx / TK;
+        let c = idx % TK;
+        let row = min(row_base + r, params.m - 1u);
+        let v = xarr[params.x_vec4_off + row * (params.k >> 2u) + ((k_off + c) >> 2u)];
+        let dst = buf * (TM * A_STRIDE) + r * A_STRIDE + c;
+        a_stage[dst] = f16(v.x);
+        a_stage[dst + 1u] = f16(v.y);
+        a_stage[dst + 2u] = f16(v.z);
+        a_stage[dst + 3u] = f16(v.w);
+    }
 }
 
 /// The column this invocation decodes: its own lane of its subgroup's quarter, so
@@ -461,15 +540,29 @@ fn decode_b_q8_0(k_off: u32, wcol: u32, bcol: u32) {
     }
 }
 
+/// Stage `k_off`'s sixteen contraction elements into the B stage with the scheme's
+/// reader: `decode` is the arm the entry point's suffix names (`0` Q4_K, `2` Q6_K,
+/// anything else Q8_0). Both row forms read the same stage, so both call this.
+fn decode_b(k_off: u32, decode: u32, wcol: u32, bcol: u32) {
+    if (decode == 0u) { decode_b_q4k(k_off, wcol, bcol); }
+    else if (decode == 2u) { decode_b_q6k(k_off, wcol, bcol); }
+    else { decode_b_q8_0(k_off, wcol, bcol); }
+}
+
 // ── the multiply ────────────────────────────────────────────────────────────
 
-/// The three entry points are one body: `decode` names the scheme's reader, and
-/// everything else — geometry, staging, the MMA loop, the store — is shared.
-fn dequant_gemm_coop(lid: u32, wid: vec3<u32>, decode: u32) {
+/// The whole 32-row tile: the body this file is built around, and the one every row
+/// group runs unless the last one is the short form below. `decode` names the scheme's
+/// reader; geometry, staging, the MMA loop and the store are otherwise shared with that
+/// short form, which is this body over half the rows. WGSL has no array of cooperative
+/// fragments, so the two are written out twice and an edit to one is an edit to both.
+fn dequant_gemm_coop_full(lid: u32, wid: vec3<u32>, decode: u32) {
     let col_base = wid.x * TN;
-    // The last row tile's base is clamped to `m - TM` rather than rounded up: a
+    // The last whole tile's base is clamped to `m - TM` rather than rounded up: a
     // cooperative store cannot be masked, so the tile has to land inside the
-    // output. The overlap rows are recomputed, and recomputing them is
+    // output. The short form below runs the last row group whenever the remainder
+    // allows it, and this body then never sees the clamp bind; without it the
+    // clamp re-writes rows the tile before already wrote, and recomputing them is
     // deterministic — same operands, same k order, same tile — so the two tiles
     // that write them agree bit for bit.
     let row_base = min(wid.y * TM, params.m - min(params.m, TM));
@@ -510,16 +603,14 @@ fn dequant_gemm_coop(lid: u32, wid: vec3<u32>, decode: u32) {
     let colw = col_base + bc;
 
     // Prime A[0] and B[0], then refill A one stage ahead of the MMAs that read it.
-    stage_a(0u, 0u, row_base, lid);
-    if (decode == 0u) { decode_b_q4k(0u, colw, bc); }
-    else if (decode == 2u) { decode_b_q6k(0u, colw, bc); }
-    else { decode_b_q8_0(0u, colw, bc); }
+    stage_a(0u, 0u, row_base, lid, TM);
+    decode_b(0u, decode, colw, bc);
     workgroupBarrier();
 
     for (var t: u32 = 0u; t < n_stages; t = t + 1u) {
         let cur = t % 2u;
         if (t + 1u < n_stages) {
-            stage_a((t + 1u) % 2u, (t + 1u) * TK, row_base, lid);
+            stage_a((t + 1u) % 2u, (t + 1u) * TK, row_base, lid, TM);
         }
         // Two K sub-steps of 8, each the hardware MMA's own K.
         for (var kk: u32 = 0u; kk < TK; kk = kk + 8u) {
@@ -555,9 +646,7 @@ fn dequant_gemm_coop(lid: u32, wid: vec3<u32>, decode: u32) {
         workgroupBarrier();
         if (t + 1u < n_stages) {
             let k_next = (t + 1u) * TK;
-            if (decode == 0u) { decode_b_q4k(k_next, colw, bc); }
-            else if (decode == 2u) { decode_b_q6k(k_next, colw, bc); }
-            else { decode_b_q8_0(k_next, colw, bc); }
+            decode_b(k_next, decode, colw, bc);
         }
         // Publishes the refilled B, and the A panel staged above.
         workgroupBarrier();
@@ -582,6 +671,105 @@ fn dequant_gemm_coop(lid: u32, wid: vec3<u32>, decode: u32) {
     coopStoreT(acc_31, &outarr[dst + 24u * params.ncols + 8u], params.ncols);
     coopStoreT(acc_32, &outarr[dst + 24u * params.ncols + 16u], params.ncols);
     coopStoreT(acc_33, &outarr[dst + 24u * params.ncols + 24u], params.ncols);
+}
+
+/// The short last row group: `dequant_gemm_coop_full`'s body over sixteen rows — two
+/// row sub-tiles per subgroup rather than four, half the A stage and half the MMAs —
+/// anchored at the prompt's last sixteen rows rather than at a whole-tile boundary.
+///
+/// `m - min(m, TM_TAIL)` is inside `[0, m)`, so the slab keeps the row count it has; the
+/// rows the anchor shares with the row group before it are recomputed from the same
+/// operands in the same k order, so the two writes agree bit for bit. Everything else —
+/// the columns a subgroup owns, the decoded B stage, the k loop, the barriers — is the
+/// whole tile's, unchanged.
+fn dequant_gemm_coop_tail(lid: u32, wid: vec3<u32>, decode: u32) {
+    let col_base = wid.x * TN;
+    let row_base = params.m - min(params.m, TM_TAIL);
+    let sg = lid / 32u;
+    let lane = lid % 32u;
+    let sg_col = sg * SG_COLS;
+
+    if (lid < 64u) {
+        zero_lanes[lid] = 0.0;
+    }
+    workgroupBarrier();
+
+    // Eight accumulators — 2 row sub-tiles by 4 column sub-tiles of this subgroup's
+    // quarter — all f32 while A and B stay f16.
+    var acc_00: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&zero_lanes[0], 8u);
+    var acc_01: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&zero_lanes[0], 8u);
+    var acc_02: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&zero_lanes[0], 8u);
+    var acc_03: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&zero_lanes[0], 8u);
+    var acc_10: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&zero_lanes[0], 8u);
+    var acc_11: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&zero_lanes[0], 8u);
+    var acc_12: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&zero_lanes[0], 8u);
+    var acc_13: coop_mat8x8<f32, C> = coopLoadT<coop_mat8x8<f32, C>>(&zero_lanes[0], 8u);
+
+    let n_stages = params.k / TK;
+    let bc = b_col(sg, lane);
+    let colw = col_base + bc;
+
+    stage_a(0u, 0u, row_base, lid, TM_TAIL);
+    decode_b(0u, decode, colw, bc);
+    workgroupBarrier();
+
+    for (var t: u32 = 0u; t < n_stages; t = t + 1u) {
+        let cur = t % 2u;
+        if (t + 1u < n_stages) {
+            stage_a((t + 1u) % 2u, (t + 1u) * TK, row_base, lid, TM_TAIL);
+        }
+        for (var kk: u32 = 0u; kk < TK; kk = kk + 8u) {
+            // Two row sub-tiles where the whole tile loads four: these are that body's
+            // a0/a1, and its a2/a3 are the rows this form has none of.
+            let a0 = coopLoadT<coop_mat8x8<f16, A>>(&a_stage[cur * (TM * A_STRIDE) + 0u * A_STRIDE + kk], A_STRIDE);
+            let a1 = coopLoadT<coop_mat8x8<f16, A>>(&a_stage[cur * (TM * A_STRIDE) + 8u * A_STRIDE + kk], A_STRIDE);
+            let b_row = kk * B_STRIDE + sg_col;
+            let b0 = coopLoadT<coop_mat8x8<f16, B>>(&b_stage[b_row + 0u], B_STRIDE);
+            let b1 = coopLoadT<coop_mat8x8<f16, B>>(&b_stage[b_row + 8u], B_STRIDE);
+            let b2 = coopLoadT<coop_mat8x8<f16, B>>(&b_stage[b_row + 16u], B_STRIDE);
+            let b3 = coopLoadT<coop_mat8x8<f16, B>>(&b_stage[b_row + 24u], B_STRIDE);
+
+            acc_00 = coopMultiplyAdd(a0, b0, acc_00);
+            acc_01 = coopMultiplyAdd(a0, b1, acc_01);
+            acc_02 = coopMultiplyAdd(a0, b2, acc_02);
+            acc_03 = coopMultiplyAdd(a0, b3, acc_03);
+            acc_10 = coopMultiplyAdd(a1, b0, acc_10);
+            acc_11 = coopMultiplyAdd(a1, b1, acc_11);
+            acc_12 = coopMultiplyAdd(a1, b2, acc_12);
+            acc_13 = coopMultiplyAdd(a1, b3, acc_13);
+        }
+        workgroupBarrier();
+        if (t + 1u < n_stages) {
+            let k_next = (t + 1u) * TK;
+            decode_b(k_next, decode, colw, bc);
+        }
+        workgroupBarrier();
+    }
+
+    let dst = row_base * params.ncols + col_base + sg_col;
+    coopStoreT(acc_00, &outarr[dst + 0u * params.ncols + 0u], params.ncols);
+    coopStoreT(acc_01, &outarr[dst + 0u * params.ncols + 8u], params.ncols);
+    coopStoreT(acc_02, &outarr[dst + 0u * params.ncols + 16u], params.ncols);
+    coopStoreT(acc_03, &outarr[dst + 0u * params.ncols + 24u], params.ncols);
+    coopStoreT(acc_10, &outarr[dst + 8u * params.ncols + 0u], params.ncols);
+    coopStoreT(acc_11, &outarr[dst + 8u * params.ncols + 8u], params.ncols);
+    coopStoreT(acc_12, &outarr[dst + 8u * params.ncols + 16u], params.ncols);
+    coopStoreT(acc_13, &outarr[dst + 8u * params.ncols + 24u], params.ncols);
+}
+
+/// The two forms one dispatch runs. `params.tail_row` is the index of the row group
+/// that is the short last tile (`0xFFFFFFFF` when the call has none), so the branch is
+/// uniform across the workgroup — which is what lets each form keep its own barriers —
+/// and the two forms' workgroups are co-resident in one dispatch. That co-residency is
+/// the point: a second dispatch of the short rows instead would pay a whole extra wave
+/// at the column counts where the tile has few workgroups, which measured several
+/// times the arithmetic it saves (`tests/gguf_gemm_coop_tail_rate.rs`).
+fn dequant_gemm_coop(lid: u32, wid: vec3<u32>, decode: u32) {
+    if (params.tail_row == wid.y) {
+        dequant_gemm_coop_tail(lid, wid, decode);
+    } else {
+        dequant_gemm_coop_full(lid, wid, decode);
+    }
 }
 
 @compute @workgroup_size(128, 1, 1)

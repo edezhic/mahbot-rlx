@@ -6,13 +6,16 @@
 //! ([`band_device`], [`band_rows`], [`band_key_block`]), and the median together
 //! with the three timing loops — [`time_rounds`] (one cell alone),
 //! [`time_round_robin`] (round-robin across a cell set) and [`paired_round_robin`]
-//! (two arms with the order reversed each round) — plus the parity
-//! helpers, the conv-transpose-2d route levers together with the pair bound its
-//! pins derive their bar from and the six real decoder geometries those pins and
-//! the route harness both read, the bounded child re-exec harness ([`rerun_self`])
-//! that a case which has to run in its own process waits on with a deadline, the
-//! switch set those children clear ([`cleared_switches`]), the pins' own refusal
-//! and the route-counter lock at the end of the file.
+//! (two arms with the order reversed each round) — plus the rate harnesses' shared
+//! skeleton ([`RateCell`], [`RateSide`], [`rate_cell_fixture`], [`rate_build_side`] and
+//! the two reporters, which the prefill and short-last-tile pairs are both built from),
+//! the parity helpers, the conv-transpose-2d route levers
+//! together with the pair bound its pins derive their bar from and the six real
+//! decoder geometries those pins and the route harness both read, the bounded child
+//! re-exec harness ([`rerun_self`]) that a case which has to run in its own process
+//! waits on with a deadline, the switch set those children clear
+//! ([`cleared_switches`]), the pins' own refusal and the route-counter lock at the end
+//! of the file.
 //! `tests/common/` is not a test target of its own; each test binary pulls it in with
 //! `mod common;`.
 
@@ -24,8 +27,15 @@ use std::sync::{Mutex, MutexGuard};
 
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape};
+use rlx_runtime::{CompiledGraph, Device, Session};
 use rlx_wgpu::backend::ATTENTION_DECOMPOSE_MIN_Q;
-use rlx_wgpu::kernels::AttentionRoutes;
+use rlx_wgpu::gguf_gpu::{
+    DequantMatmulRoutes, coop_tail_dispatches, gguf_row_bytes, grouped_chunk_geometry,
+    grouped_dispatch_cols, reset_coop_tail_dispatches, reset_route_counts, route_counts,
+};
+use rlx_wgpu::gguf_host::gguf_scheme_id;
+use rlx_wgpu::kernels::{AttentionRoutes, coop_gemm_gguf_grid};
+use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts};
 
 /// A deterministic `[m, k]` row-major activation, at `step`'s ramp rate. `step`
 /// stays the caller's because it sets the result's magnitude, which a parity
@@ -174,6 +184,316 @@ pub fn rate_cell_graph(
 /// share.
 pub fn rate_input_matrix(m: usize, k: usize) -> Vec<f32> {
     ramp(m, k, 0.017)
+}
+
+// ── the rate harnesses' shared skeleton ─────────────────────────────────────
+//
+// `gguf_gemm_prefill_rate.rs` and `gguf_gemm_coop_tail_rate.rs` measure one packed
+// multiply's dispatch as a pair of sides over the same cells, and the build, the
+// census and the printed fields are the same in both. What stays in each file is the
+// lever its pair toggles, its cells, and what its ratio means.
+
+/// One rate harness's cell: one packed multiply at one shape, run `steps` times over
+/// one call. Shared so a cell means the same thing in every harness that reads one.
+pub struct RateCell {
+    pub label: &'static str,
+    pub scheme: QuantScheme,
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+}
+
+/// One side of one rate cell: built, warmed, censused and asserted, held alive beside
+/// the other side of its pair while that cell's rounds run.
+pub struct RateSide {
+    /// The entry this was built from: alive in the harness's `CELLS` for the whole run.
+    pub cell: &'static RateCell,
+    /// Which side of the pair this is, as the harness prints it and as its timed
+    /// closure reads it to decide which lever to install.
+    pub side: &'static str,
+    /// The packed bytes one step reads, and the denominator of the printed
+    /// `GBps_at_the_weight`: the fixture's own length.
+    pub packed_bytes_per_step: usize,
+    /// The dispatch this side's route makes: column tiles by row groups, from the
+    /// module that dispatches it.
+    pub cols: u32,
+    pub tiles: u32,
+    /// The short last row group the route's own geometry allows — `None` where it has
+    /// no such form, so the row-grouped arm's line claims no tail it cannot have.
+    pub tail: Option<bool>,
+    /// Short last row groups the census call dispatched: one per step where this
+    /// side's grid has one, zero otherwise.
+    pub tail_dispatches: u64,
+    /// The one route the call's steps took, as [`rate_single_route`] names it.
+    pub route: &'static str,
+    pub routes: DequantMatmulRoutes,
+    pub submits: u64,
+    pub waits: u64,
+    pub steps: usize,
+    pub x: Vec<f32>,
+    pub compiled: CompiledGraph,
+    /// This side's mean ms per call, one entry per round.
+    pub per_call_ms: Vec<f64>,
+}
+
+/// One rate cell's fixture — the packed bytes a step reads, the weight itself and the
+/// activation — after the two checks every such cell has to pass: the weight is one
+/// column chunk of the encoder's own making, and the fixture's length is the encoder's
+/// per-row stride times `n` (the fixture's own shape stated twice, not a check that the
+/// stride has not moved).
+///
+/// `None`: the cell is **named as not one chunk and skipped** rather than measured with
+/// a whole-tensor geometry the encoder does not dispatch — for both of its sides at
+/// once, since the cap is a property of the shape and the device rather than of the
+/// tile. That skip can silently empty a run, so a printed `pairs=0` is no evidence.
+pub fn rate_cell_fixture(
+    prefix: &str,
+    cell: &RateCell,
+    dev: &rlx_wgpu::device::WgpuDevice,
+) -> Option<(Vec<u8>, Vec<f32>)> {
+    let row_bytes = gguf_row_bytes(gguf_scheme_id(cell.scheme), cell.k);
+    let packed_bytes_per_step = cell.n * row_bytes as usize;
+
+    // [`grouped_dispatch_cols`] is the encoder's own column cap, both of its budgets at
+    // once (the bound weight window and the whole-bound output slab), and the device
+    // limit it reads is the one `RLX_WGPU_MAX_BIND_MB` lowers.
+    let chunk_cols =
+        grouped_dispatch_cols(&dev.device, gguf_scheme_id(cell.scheme), cell.m, cell.k);
+    if chunk_cols < cell.n {
+        eprintln!(
+            "{prefix} cell=\"{}\" is not one chunk: the encoder covers {chunk_cols} of its {} \
+             columns per dispatch — skipped rather than measured as a shape whose printed \
+             geometry it is not",
+            cell.label, cell.n
+        );
+        return None;
+    }
+
+    let packed = packed_gguf_weight(cell.scheme, cell.k, cell.n);
+    assert_eq!(
+        packed.len(),
+        packed_bytes_per_step,
+        "{}: the fixture must reproduce the cell's packed bytes",
+        cell.label
+    );
+    let x = rate_input_matrix(cell.m, cell.k);
+    Some((packed, x))
+}
+
+/// The one route a call's steps took, or a panic naming the counts. Which route it is
+/// stays the encoder's answer — a harness reads it out rather than pinning it — but a
+/// call whose steps *disagree* is a routing defect, and a figure averaged over two
+/// routes is not a measurement of either.
+pub fn rate_single_route(
+    cell: &RateCell,
+    side: &str,
+    routes: &DequantMatmulRoutes,
+    steps: usize,
+) -> &'static str {
+    let counts = [
+        ("grouped", routes.grouped),
+        ("coop", routes.coop),
+        ("per_row", routes.per_row),
+        ("q1_0_gemm", routes.q1_0_gemm),
+        ("scratch", routes.scratch),
+        ("host", routes.host),
+    ];
+    let taken: Vec<(&str, u64)> = counts.iter().copied().filter(|(_, n)| *n > 0).collect();
+    assert!(
+        taken.len() == 1 && taken[0].1 == steps as u64,
+        "{} (side={side}): the {steps} steps of one call did not take one route: {taken:?} — a \
+         call whose steps disagree is a routing defect, not a measurement",
+        cell.label
+    );
+    taken[0].0
+}
+
+/// One side of one rate cell: compile, parameterise, warm, assert, census. The caller
+/// installs its lever around this, so it covers the compile as well as the runs — the
+/// encoder reads its levers where the multiply is encoded, not where the graph is
+/// lowered, so nothing rests on where the decision is taken.
+///
+/// The grid comes from the module that dispatches it — the cooperative tile's own
+/// [`coop_gemm_gguf_grid`] for a `coop` call, the row-grouped arm's own
+/// [`grouped_chunk_geometry`] for a `grouped` one — never re-derived here, which is how
+/// the two tiles' grids were once conflated. [`rate_single_route`] has established that
+/// every step took this one route; a route with no such grid cannot be one of these
+/// cells, and saying so is better than printing a geometry that did not run.
+///
+/// Returns the side and the warm-up's per-step outputs: a pair that compares the two
+/// sides' answers holds them until it has.
+pub fn rate_build_side(
+    cell: &'static RateCell,
+    side: &'static str,
+    graph_name: &str,
+    packed: &[u8],
+    x: &[f32],
+    steps: usize,
+) -> (RateSide, Vec<Vec<f32>>) {
+    let mut compiled = Session::new(Device::Gpu).compile(rate_cell_graph(
+        graph_name,
+        cell.scheme,
+        cell.m,
+        cell.k,
+        cell.n,
+        packed.len(),
+        steps,
+    ));
+    for s in 0..steps {
+        compiled.set_param_typed(&format!("w{s}"), packed, DType::U8);
+    }
+
+    let warm = compiled.run(&[("x", x)]);
+    assert_eq!(warm.len(), steps, "{}: one output per step", cell.label);
+    for (s, out) in warm.iter().enumerate() {
+        assert_eq!(
+            out.len(),
+            cell.m * cell.n,
+            "{} (side={side}): step {s} output shape",
+            cell.label
+        );
+        let non_finite = out.iter().filter(|v| !v.is_finite()).count();
+        assert_eq!(
+            non_finite, 0,
+            "{} (side={side}): step {s} produced {non_finite} non-finite values — the fixture's \
+             scale slots are not the finite patterns it writes",
+            cell.label
+        );
+    }
+
+    // The census: which route, how many short last row groups, how many submissions and
+    // waits — one call's own counts, taken outside the timing, and taken while this side
+    // is the only one running.
+    reset_route_counts();
+    reset_coop_tail_dispatches();
+    reset_device_counts();
+    let _ = compiled.run(&[("x", x)]);
+    let routes = route_counts();
+    let tail_dispatches = coop_tail_dispatches();
+    let (submits, waits) = (device_submit_count(), device_wait_count());
+    let route = rate_single_route(cell, side, &routes, steps);
+    let (cols, tiles, tail) = match route {
+        "coop" => {
+            let g = coop_gemm_gguf_grid(cell.m as u32, cell.n as u32);
+            (g.cols, g.tiles, Some(g.tail))
+        }
+        "grouped" => {
+            let (cols, tiles, _) =
+                grouped_chunk_geometry(gguf_scheme_id(cell.scheme), cell.m, cell.n);
+            (cols, tiles, None)
+        }
+        other => panic!(
+            "{} (side={side}): route {other} dispatches no single grid at these shapes — every \
+             rate cell is a multi-row call over whole packing blocks, which the ladder answers \
+             with one of the two fused tiles",
+            cell.label
+        ),
+    };
+
+    (
+        RateSide {
+            cell,
+            side,
+            packed_bytes_per_step: packed.len(),
+            cols,
+            tiles,
+            tail,
+            tail_dispatches,
+            route,
+            routes,
+            submits,
+            waits,
+            steps,
+            x: x.to_vec(),
+            compiled,
+            per_call_ms: Vec::new(),
+        },
+        warm,
+    )
+}
+
+/// One rate cell's record header: the geometry its two sides share.
+pub fn report_rate_cell(prefix: &str, r: &RateSide) {
+    let cell = r.cell;
+    eprintln!(
+        "{prefix} cell=\"{}\" scheme={:?} m={} k={} n={} steps={} packed_bytes_per_step={}",
+        cell.label, cell.scheme, cell.m, cell.k, cell.n, r.steps, r.packed_bytes_per_step,
+    );
+}
+
+/// One side's printed fields: its grid and census, then its per-round figures and its
+/// two rates. `TFLOPs` is `2 * m * k * n * steps / call_seconds`, the rate a prefill is
+/// quoted at, and `GBps_at_the_weight` the tensor read once over the same call; neither
+/// figure is a DRAM counter.
+pub fn report_rate_side(prefix: &str, r: &RateSide) {
+    let cell = r.cell;
+    let workgroups = r.cols * r.tiles;
+    let per_call_ms = &r.per_call_ms;
+    let min_ms = least(per_call_ms);
+    let med_ms = median(per_call_ms);
+    let max_ms = greatest(per_call_ms);
+    let flops = 2.0 * cell.m as f64 * cell.k as f64 * cell.n as f64 * r.steps as f64;
+    let tflops = |call_ms: f64| flops / (call_ms * 1e-3) / 1e12;
+    let gbps =
+        |call_ms: f64| r.packed_bytes_per_step as f64 * r.steps as f64 / (call_ms * 1e-3) / 1e9;
+    let (side, route, routes, submits, waits, tails) = (
+        r.side,
+        r.route,
+        &r.routes,
+        r.submits,
+        r.waits,
+        r.tail_dispatches,
+    );
+
+    let tail = match r.tail {
+        Some(t) => t.to_string(),
+        None => "none".to_string(),
+    };
+    eprintln!(
+        "{prefix} cell=\"{}\" side={side} route={route} routes={routes:?} \
+         grid={}x{}={workgroups} workgroups grid_tail={tail} tail_dispatches={tails} \
+         submits={submits} waits={waits}",
+        cell.label, r.cols, r.tiles,
+    );
+    let per_call = per_call_ms
+        .iter()
+        .map(|v| format!("{v:.3}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let spread = (max_ms - min_ms) / med_ms * 100.0;
+    eprintln!(
+        "{prefix} cell=\"{}\" side={side} per_call_ms=[{per_call}] min_ms={min_ms:.3} \
+         median_ms={med_ms:.3} max_ms={max_ms:.3} spread_pct={spread:.1} \
+         min_TFLOPs={:.2} median_TFLOPs={:.2} min_GBps_at_the_weight={:.1} \
+         median_GBps_at_the_weight={:.1}",
+        cell.label,
+        tflops(min_ms),
+        tflops(med_ms),
+        gbps(min_ms),
+        gbps(med_ms),
+    );
+}
+
+/// One cell's whole record as far as both rate harnesses share it: the cell's header, each
+/// side's line, and the pair's two ratios in one line ending with `meaning`. `label` names
+/// the pair in the printed fields (`median_full_over_tail`), and the ratios are
+/// `first / second`, so above one means the second-named side was the faster of the two.
+pub fn report_rate_pair(
+    prefix: &str,
+    first: &RateSide,
+    second: &RateSide,
+    label: &str,
+    meaning: &str,
+) {
+    report_rate_cell(prefix, first);
+    report_rate_side(prefix, first);
+    report_rate_side(prefix, second);
+    eprintln!(
+        "{prefix} cell=\"{}\" pair= median_{label}={:.2}x min_{label}={:.2}x {meaning}",
+        first.cell.label,
+        median(&first.per_call_ms) / median(&second.per_call_ms),
+        least(&first.per_call_ms) / least(&second.per_call_ms),
+    );
 }
 
 /// `v`'s median: the element at `len / 2` of a sorted **copy**, so an even-length
@@ -443,6 +763,22 @@ pub fn refuse_under_q8_0_bisect() {
         !rlx_ir::env::flag(Q8_0_BISECT),
         "RLX_WGPU_Q8_0_GEMM_DISABLE moves the 8-bit scheme's multiplies off the grouped route; \
          unset it to run this pin"
+    );
+}
+
+/// The cooperative tile's bisect lever, spelled in one place: it puts every multi-row
+/// multiply back on the row-grouped tile, so the pins whose routes or admitted shapes it
+/// would move refuse on it.
+pub const COOP_BISECT: &str = "RLX_WGPU_GEMM_COOP_DISABLE";
+
+/// Refuse when the cooperative tile's bisect lever is set: the lever is read where the
+/// call is encoded, so under it a shape this tree admits to the tile answers the
+/// row-grouped one instead — another routing mode, not a defect in the pin.
+pub fn refuse_under_coop_bisect() {
+    assert!(
+        !rlx_ir::env::flag(COOP_BISECT),
+        "RLX_WGPU_GEMM_COOP_DISABLE puts every multi-row multiply back on the row-grouped \
+         tile; unset it to run this pin"
     );
 }
 

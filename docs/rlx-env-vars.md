@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 829  
+**Registered names:** 830  
 **Unregistered mentions (migration leftovers):** 107
 
 ## Groups
@@ -40,7 +40,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
 - [webgl](#webgl) — 2
-- [wgpu](#wgpu) — 131
+- [wgpu](#wgpu) — 132
 - [xdna](#xdna) — 20
 
 ## compile
@@ -889,6 +889,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_GATHER_SPLIT` | Internal | Bool | Backend(wgpu) | Split Gather into per-slice dispatches |
 | `RLX_WGPU_GDN_HOST` | Public | Bool | Backend(wgpu) | Force GatedDeltaNet host fallback on wgpu (skip WGSL) |
 | `RLX_WGPU_GEMM_COOP_DISABLE` | Bisect | Bool | Backend(wgpu) | Bisect lever: puts every multi-row packed (`Op::DequantMatMul`) multiply back on the row-grouped tile instead of the cooperative-matrix tile, which is the route those shapes had before that arm existed |
+| `RLX_WGPU_GEMM_COOP_TAIL_DISABLE` | Bisect | Bool | Backend(wgpu) | Bisect lever: puts the cooperative-matrix tile's last row group back on the full 32 rows instead of the 16-row short form, which is the dispatch those shapes had before the tail existed |
 | `RLX_WGPU_GEMV_COLS` | Bisect | U64 | Backend(wgpu) | Pin columns per workgroup for wgpu decode GEMV (64 / 32 / 16 / 8) |
 | `RLX_WGPU_GEMV_ILP` | Bisect | Bool | Backend(wgpu) | One-row packed GEMV: the subgroup arm's ILP entry (WIDE_ILP columns a subgroup, an independent accumulator each) instead of one column a subgroup; 0 re-takes that form's saving |
 | `RLX_WGPU_GEMV_IN_PLACE` | Bisect | Bool | Backend(wgpu) | One-row packed GEMV output: store the row straight into the arena slot instead of a pooled slab plus a copy dispatch (0 restores the slab, which is how the saving is re-taken) |

@@ -25,11 +25,13 @@
 //! * `side=grouped` — compiled and run with `RLX_WGPU_GEMM_COOP_DISABLE=1`
 //!   installed, the bisect lever that puts every call back on the row-grouped tile
 //!   (`dequant_gemm_gguf.wgsl`: 8-row tiles, f32 scalars);
-//! * `side=taken` — compiled and run with no lever, so the encoder answers: the
-//!   cooperative-matrix tile (`dequant_gemm_coop_gguf.wgsl`: 32 rows x 128 columns,
-//!   the weight decoded into a workgroup f16 stage and the arithmetic on the
-//!   hardware matrix units) where `gguf_gpu::coop_gemm_admits` admits the shape, the
-//!   row-grouped one otherwise.
+//! * `side=taken` — compiled and run with `RLX_WGPU_GEMM_COOP_DISABLE=0` and
+//!   `RLX_WGPU_GEMM_COOP_TAIL_DISABLE=0` installed, so the encoder answers with both
+//!   bisect levers at their shipped values: the cooperative-matrix tile
+//!   (`dequant_gemm_coop_gguf.wgsl`: 32 rows x 128 columns, the weight decoded into a
+//!   workgroup f16 stage and the arithmetic on the hardware matrix units) where
+//!   `gguf_gpu::coop_gemm_admits` admits the shape, the row-grouped one otherwise — with
+//!   the short last tile its shipped form.
 //!
 //! A cell's two sides are timed in **adjacent rounds of the same process**, not in
 //! two runs with the lever toggled between them. This box's per-round spread on
@@ -116,14 +118,15 @@
 //! # The rates
 //!
 //! `packed_bytes_per_step` is the tensor's own packed bytes — the encoder's own
-//! per-row stride ([`gguf_row_bytes`]) times its column count — and the two printed
-//! rates come from it, as in the split file: `GBps_at_the_weight` is the rate a
+//! per-row stride times its column count — and the two printed rates come from it, as
+//! in the split file: `GBps_at_the_weight` is the rate a
 //! plain read of the same tensor would be quoted at, and `TFLOPs` =
 //! `2 * m * k * n * STEPS / call_seconds` is the arithmetic rate a prefill is
 //! quoted at. Neither is a DRAM counter. The whole weight is read once per row
-//! *tile* — 8 rows on the row-grouped tile, 32 on the cooperative one — so a call's
-//! weight demand is not a comparison across routes; the pair's ratio is a ratio of
-//! times for that reason, the two sides' packed bytes being the same number.
+//! *group* — 8 rows on the row-grouped tile, 32 on the cooperative one, whose last
+//! group may be the 16-row short form — so a call's weight demand is not a comparison
+//! across routes; the pair's ratio is a ratio of times for that reason, the two sides'
+//! packed bytes being the same number.
 //!
 //! # What is asserted, and what is printed
 //!
@@ -133,20 +136,20 @@
 //! stopped reaching the encoder fails here instead of printing a pair of two
 //! cooperative figures. The warm-up's outputs are finite and each is `m * n` long on
 //! both sides, and the fixture's packed length is `n` times the encoder's per-row
-//! stride ([`gguf_row_bytes`]) — the fixture's own shape stated twice, not a check
-//! that the encoder's stride has not moved.
+//! stride — the fixture's own shape stated twice, not a check that the encoder's
+//! stride has not moved.
 //!
 //! Skipped rather than asserted: a cell whose `n` exceeds the encoder's own column
-//! cap ([`grouped_dispatch_cols`]) is named and dropped — for both sides at once,
-//! since the cap is a property of the shape and the device rather than of the tile.
-//! That skip can silently empty the run, so a printed `pairs=0` is no evidence.
+//! cap is named and dropped — for both sides at once, since the cap is a property of
+//! the shape and the device rather than of the tile. That skip can silently empty the
+//! run, so a printed `pairs=0` is no evidence.
 //!
 //! Printed: per cell the geometry, then one line per side with its route, its
-//! census, **the grid that side's route dispatches** — [`coop_gemm_gguf_grid`] for a
-//! cooperative call, [`grouped_chunk_geometry`] for the row-grouped one, read from
-//! the module that dispatches rather than re-derived here — its submissions and
-//! waits, its per-round times and both rates; then the pair's ratio line, which says
-//! in words when the tile was not taken. Not in this file's sight: the dequant
+//! census, **the grid that side's route dispatches** — `coop_gemm_gguf_grid` for a
+//! cooperative call, `grouped_chunk_geometry` for the row-grouped one, both read in
+//! `common` from the modules that dispatch them rather than re-derived here — its
+//! submissions and waits, its per-round times and both rates; then the pair's ratio
+//! line, which says in words when the tile was not taken. Not in this file's sight: the dequant
 //! arithmetic (the parity suites cover values), the per-chunk host work, the later
 //! chunks of a chunked shape, the rest of a prefill's graph around these
 //! projections, and any adapter but the one printed.
@@ -161,30 +164,20 @@
 
 mod common;
 
-use rlx_ir::DType;
 use rlx_ir::env::RuntimeOverrides;
 use rlx_ir::quant::QuantScheme;
-use rlx_runtime::{CompiledGraph, Device, Session};
-use rlx_wgpu::gguf_gpu::{
-    DequantMatmulRoutes, gguf_row_bytes, grouped_chunk_geometry, grouped_dispatch_cols,
-    reset_route_counts, route_counts,
-};
-use rlx_wgpu::gguf_host::gguf_scheme_id;
-use rlx_wgpu::kernels::coop_gemm_gguf_grid;
-use rlx_wgpu::{device_submit_count, device_wait_count, reset_device_counts, wgpu_device};
+use rlx_runtime::Device;
+use rlx_wgpu::wgpu_device;
 
 /// One measured cell; see the module doc's "Cells".
-struct Cell {
-    label: &'static str,
-    scheme: QuantScheme,
-    m: usize,
-    k: usize,
-    n: usize,
-}
+type Cell = common::RateCell;
 
 /// Multiplies per call, for every cell: see the module doc's "Steps, calls and the
 /// batch join".
 const STEPS: usize = 8;
+
+/// Every line this file prints starts here.
+const PREFIX: &str = "[gguf prefill rate]";
 
 /// The two sides of a pair, as printed and as the timed closure reads them.
 const GROUPED: &str = "grouped";
@@ -195,13 +188,22 @@ const TAKEN: &str = "taken";
 /// for the `grouped` side and for nothing else.
 const COOP_LEVER: &str = "RLX_WGPU_GEMM_COOP_DISABLE";
 
-/// [`COOP_LEVER`] installed for one side, `1` on the `grouped` side and `0` on the
+/// The tile's own bisect lever, which restores its full 32-row last row group. Pinned
+/// off on both sides: this file measures the tile as it ships, and an ambient setting
+/// in the measuring shell would silently put the documented table back on the dispatch
+/// the short last tile replaced.
+const TAIL_LEVER: &str = "RLX_WGPU_GEMM_COOP_TAIL_DISABLE";
+
+/// Both levers installed for one side, `1` on the `grouped` side and `0` on the
 /// `taken` one. Both sides pay the same install, so the pair is not one side paying
 /// for a guard the other does not — and stating `0` rather than leaving it unset
-/// means an ambient `RLX_WGPU_GEMM_COOP_DISABLE` in the measuring shell cannot
-/// quietly turn the `taken` side into a second `grouped` one.
+/// means an ambient setting in the measuring shell cannot quietly turn the `taken`
+/// side into a second `grouped` one, or the tile into its pre-tail dispatch.
 fn lever(side: &str) -> RuntimeOverrides {
-    RuntimeOverrides::install(Some((COOP_LEVER, if side == GROUPED { "1" } else { "0" })))
+    RuntimeOverrides::install([
+        (COOP_LEVER, if side == GROUPED { "1" } else { "0" }),
+        (TAIL_LEVER, "0"),
+    ])
 }
 
 /// The cells. A `static` rather than a `const` so a cell built up front can hold
@@ -355,223 +357,59 @@ static CELLS: [Cell; 16] = [
 const ROUNDS: usize = 5;
 const CALLS_PER_ROUND: usize = 3;
 
-/// The one route a call's steps took, or a panic naming the counts: the module
-/// doc's "What is asserted". Which route it is stays the encoder's answer — this
-/// file reads it out rather than pinning it — but a call whose steps *disagree* is
-/// a routing defect, and a figure averaged over two routes is not a measurement of
-/// either.
-fn single_route(cell: &Cell, side: &str, routes: &DequantMatmulRoutes) -> &'static str {
-    let counts = [
-        ("grouped", routes.grouped),
-        ("coop", routes.coop),
-        ("per_row", routes.per_row),
-        ("q1_0_gemm", routes.q1_0_gemm),
-        ("scratch", routes.scratch),
-        ("host", routes.host),
-    ];
-    let taken: Vec<(&str, u64)> = counts.iter().copied().filter(|(_, n)| *n > 0).collect();
-    assert!(
-        taken.len() == 1 && taken[0].1 == STEPS as u64,
-        "{} (side={side}): the {STEPS} steps of one call did not take one route: {taken:?} — a \
-         call whose steps disagree is a routing defect, not a measurement",
-        cell.label
-    );
-    taken[0].0
-}
-
-/// The grid the route that ran dispatches, from the module that dispatches it:
-/// the cooperative tile's own [`coop_gemm_gguf_grid`] for a `coop` call, the
-/// row-grouped arm's own [`grouped_chunk_geometry`] for a `grouped` one — never a
-/// grid re-derived here, which is how the two tiles' grids were once conflated.
-/// [`single_route`] has established that every step of the call took this one
-/// route; a route with no such grid cannot be one of these cells, and saying so is
-/// better than printing a geometry that did not run.
-fn route_grid(cell: &Cell, route: &str) -> (u32, u32) {
-    match route {
-        "coop" => coop_gemm_gguf_grid(cell.m as u32, cell.n as u32),
-        "grouped" => {
-            let (x, y, _) = grouped_chunk_geometry(gguf_scheme_id(cell.scheme), cell.m, cell.n);
-            (x, y)
-        }
-        other => panic!(
-            "{}: route {other} dispatches no single grid at these shapes — every cell here is a \
-             multi-row call over whole packing blocks, which the ladder answers with one of the \
-             two fused tiles",
-            cell.label
-        ),
-    }
-}
-
-/// One side of one cell, built, warmed, censused and asserted — held alive for the
-/// whole run rather than built and dropped on its own, so the rounds can interleave
-/// it with every other side (the module doc's "Interleaving, and the aggregate
-/// footprint").
-struct Ready {
-    /// The entry this was built from: alive in [`CELLS`] for the whole run.
-    cell: &'static Cell,
-    /// [`GROUPED`] or [`TAKEN`]: which of the pair this is, and the one thing the
-    /// timed closure reads to decide whether the lever goes on.
-    side: &'static str,
-    packed_bytes_per_step: usize,
-    /// The grid **this side's route** dispatches, from [`route_grid`].
-    grid: (u32, u32),
-    /// The one route the call's [`STEPS`] steps took, as [`single_route`] names it.
-    route: &'static str,
-    routes: DequantMatmulRoutes,
-    submits: u64,
-    waits: u64,
-    x: Vec<f32>,
-    compiled: CompiledGraph,
-    /// This side's mean ms per call, one entry per round.
-    per_call_ms: Vec<f64>,
-}
-
-/// One cell's pair: the same graph compiled and measured twice, once with the lever
-/// installed and once with the encoder's own answer. Built, warmed and censused
-/// together so both sides of a cell are alive for the same rounds.
-struct Pair {
-    grouped: Ready,
-    taken: Ready,
-}
-
 /// One cell's fixture, then both sides' compile, warm-up, finiteness census and
 /// structural assertions — everything but the timing, which interleaves the sides so
-/// it cannot live here. `None`: the cell was **named as not one chunk and skipped**
+/// it cannot live here. The two sides come back in the order the caller names them,
+/// `grouped` then `taken`. `None`: the cell was **named as not one chunk and skipped**
 /// rather than measured, both of its sides with it, the later cells still being
 /// measured.
-fn build(cell: &'static Cell, dev: &rlx_wgpu::device::WgpuDevice) -> Option<Pair> {
-    // The tensor's own packed bytes — the module doc's numerator — from the
-    // encoder's own per-row stride rather than the scheme's block geometry
-    // restated here.
-    let row_bytes = gguf_row_bytes(gguf_scheme_id(cell.scheme), cell.k);
-    let packed_bytes_per_step = cell.n * row_bytes as usize;
+fn build(cell: &'static Cell, dev: &rlx_wgpu::device::WgpuDevice) -> Option<[common::RateSide; 2]> {
+    let (packed, x) = common::rate_cell_fixture(PREFIX, cell, dev)?;
 
-    // The whole packed weight is one chunk only if the encoder dispatches it as
-    // one: [`grouped_dispatch_cols`] is the encoder's own column cap, both of its
-    // budgets at once (the bound weight window and the whole-bound output slab),
-    // and the device limit it reads is the one `RLX_WGPU_MAX_BIND_MB` lowers. A
-    // shape the encoder would chunk is named here rather than measured with a
-    // whole-tensor geometry it does not dispatch. The cap is a property of the shape
-    // and the device, not of the tile, so it skips both sides at once.
-    let chunk_cols =
-        grouped_dispatch_cols(&dev.device, gguf_scheme_id(cell.scheme), cell.m, cell.k);
-    if chunk_cols < cell.n {
-        eprintln!(
-            "[gguf prefill rate] cell=\"{}\" is not one chunk: the encoder covers {chunk_cols} of \
-             its {} columns per dispatch — skipped rather than measured as a shape whose printed \
-             geometry it is not",
-            cell.label, cell.n
+    let (grouped, _) = {
+        let _lever = lever(GROUPED);
+        let (side, warm) = common::rate_build_side(
+            cell,
+            GROUPED,
+            "wgpu_gguf_gemm_prefill_rate",
+            &packed,
+            &x,
+            STEPS,
         );
-        return None;
-    }
-
-    // The fixture lays out `n` rows of the scheme's own block geometry, and
-    // [`gguf_row_bytes`] is that geometry's own arithmetic on the other side, so
-    // this equality is the fixture stated twice rather than a check that the
-    // encoder's stride has not moved.
-    let packed = common::packed_gguf_weight(cell.scheme, cell.k, cell.n);
-    assert_eq!(
-        packed.len(),
-        packed_bytes_per_step,
-        "{}: the fixture must reproduce the cell's packed bytes",
-        cell.label
-    );
-
-    let x = common::rate_input_matrix(cell.m, cell.k);
-    let grouped = build_side(cell, GROUPED, packed_bytes_per_step, &packed, &x);
-    let taken = build_side(cell, TAKEN, packed_bytes_per_step, &packed, &x);
-    Some(Pair { grouped, taken })
-}
-
-/// One side of a cell: compile, parameterise, warm, assert, census. The `grouped`
-/// side has [`COOP_LEVER`] installed for all of it, because the encoder reads that
-/// lever per call at run time rather than at the lowering; the guard covers the
-/// compile as well, so it does not rest on where the decision is taken.
-fn build_side(
-    cell: &'static Cell,
-    side: &'static str,
-    packed_bytes_per_step: usize,
-    packed: &[u8],
-    x: &[f32],
-) -> Ready {
-    let _lever = lever(side);
-
-    let mut compiled = Session::new(Device::Gpu).compile(common::rate_cell_graph(
-        "wgpu_gguf_gemm_prefill_rate",
-        cell.scheme,
-        cell.m,
-        cell.k,
-        cell.n,
-        packed.len(),
-        STEPS,
-    ));
-    for s in 0..STEPS {
-        compiled.set_param_typed(&format!("w{s}"), packed, DType::U8);
-    }
-
-    let warm = compiled.run(&[("x", x)]);
-    assert_eq!(warm.len(), STEPS, "{}: one output per step", cell.label);
-    for (s, out) in warm.iter().enumerate() {
+        // The lever's effect as a fact rather than an assumption: on the `grouped` side
+        // every step is the row-grouped tile and none is cooperative, so a lever that
+        // stopped reaching the encoder fails here instead of printing a pair of two
+        // cooperative figures.
         assert_eq!(
-            out.len(),
-            cell.m * cell.n,
-            "{} (side={side}): step {s} output shape",
-            cell.label
-        );
-        let non_finite = out.iter().filter(|v| !v.is_finite()).count();
-        assert_eq!(
-            non_finite, 0,
-            "{} (side={side}): step {s} produced {non_finite} non-finite values — the fixture's \
-             scale slots are not the finite patterns it writes",
-            cell.label
-        );
-    }
-
-    // The census: which route, how many submissions and waits — one call's own
-    // counts, taken outside the timing, and taken while this side is the only one
-    // running.
-    reset_route_counts();
-    reset_device_counts();
-    let _ = compiled.run(&[("x", x)]);
-    let routes = route_counts();
-    let (submits, waits) = (device_submit_count(), device_wait_count());
-    let route = single_route(cell, side, &routes);
-
-    // The lever's effect as a fact rather than an assumption: on the `grouped` side
-    // every step is the row-grouped tile and none is cooperative, so a lever that
-    // stopped reaching the encoder fails here instead of printing a pair of two
-    // cooperative figures.
-    if side == GROUPED {
-        assert_eq!(
-            (routes.grouped, routes.coop),
+            (side.routes.grouped, side.routes.coop),
             (STEPS as u64, 0),
-            "{}: the {COOP_LEVER} side is not the row-grouped tile — {routes:?}; the lever is \
-             read by the encoder where the multiply is encoded, so a census that disagrees means \
-             the guard no longer reaches it",
-            cell.label
+            "{}: the {COOP_LEVER} side is not the row-grouped tile — {:?}; the lever is read by \
+             the encoder where the multiply is encoded, so a census that disagrees means the \
+             guard no longer reaches it",
+            cell.label,
+            side.routes
         );
-    }
-
-    Ready {
-        cell,
-        side,
-        packed_bytes_per_step,
-        grid: route_grid(cell, route),
-        route,
-        routes,
-        submits,
-        waits,
-        x: x.to_vec(),
-        compiled,
-        per_call_ms: Vec::with_capacity(ROUNDS),
-    }
+        (side, warm)
+    };
+    let (taken, _) = {
+        let _lever = lever(TAKEN);
+        common::rate_build_side(
+            cell,
+            TAKEN,
+            "wgpu_gguf_gemm_prefill_rate",
+            &packed,
+            &x,
+            STEPS,
+        )
+    };
+    Some([grouped, taken])
 }
 
 /// The timed rounds, round-robin across the sides the module doc describes: one
 /// round gives every side its own [`CALLS_PER_ROUND`] calls back to back before the
 /// next round starts, so a cell's two sides land in adjacent turns and each side's
 /// figures are its own rather than its position's.
-fn run_rounds(sides: &mut [Ready]) {
+fn run_rounds(sides: &mut [common::RateSide]) {
     let per_side = common::time_round_robin(sides, ROUNDS, CALLS_PER_ROUND, |r| {
         // The lever, per call: the encoder reads it where the multiply is encoded,
         // so it has to state this side's answer on every run. The guard costs a few
@@ -585,83 +423,21 @@ fn run_rounds(sides: &mut [Ready]) {
     }
 }
 
-/// One side's printed fields, both rates and its per-round figures.
-fn report_side(r: &Ready) {
-    let cell = r.cell;
-    let (x_groups, y_groups) = r.grid;
-    let per_call_ms = &r.per_call_ms;
-    let min_ms = common::least(per_call_ms);
-    let med_ms = common::median(per_call_ms);
-    let max_ms = per_call_ms.iter().cloned().fold(0.0f64, f64::max);
-    // The rates: the tensor read once (`at_the_weight`) and the arithmetic the
-    // call does over it (`tflops`) — see the module doc for both.
-    let at_the_weight =
-        |call_ms: f64| r.packed_bytes_per_step as f64 * STEPS as f64 / (call_ms * 1e-3) / 1e9;
-    let flops = 2.0 * cell.m as f64 * cell.k as f64 * cell.n as f64 * STEPS as f64;
-    let tflops = |call_ms: f64| flops / (call_ms * 1e-3) / 1e12;
-    let (side, route, routes, submits, waits) = (r.side, r.route, &r.routes, r.submits, r.waits);
-
-    eprintln!(
-        "[gguf prefill rate] cell=\"{}\" side={side} route={route} routes={routes:?} \
-         grid={x_groups}x{y_groups}={} workgroups submits={submits} waits={waits}",
-        cell.label,
-        x_groups * y_groups
-    );
-    eprintln!(
-        "[gguf prefill rate] cell=\"{}\" side={side} per_call_ms=[{}] min_ms={min_ms:.3} \
-         median_ms={med_ms:.3} max_ms={max_ms:.3} spread_pct={:.1} min_TFLOPs={:.2} \
-         median_TFLOPs={:.2} min_GBps_at_the_weight={:.1} \
-         median_GBps_at_the_weight={:.1}",
-        cell.label,
-        per_call_ms
-            .iter()
-            .map(|v| format!("{v:.3}"))
-            .collect::<Vec<_>>()
-            .join(", "),
-        (max_ms - min_ms) / med_ms * 100.0,
-        tflops(min_ms),
-        tflops(med_ms),
-        at_the_weight(min_ms),
-        at_the_weight(med_ms),
-    );
-}
-
 /// One cell's whole record: the geometry it shares, each side's own fields, and the
 /// ratio the pair exists for — with the reason it is not a tile comparison when the
 /// `taken` side did not take the tile.
-fn report_pair(grouped: &Ready, taken: &Ready) {
-    let cell = grouped.cell;
-    eprintln!(
-        "[gguf prefill rate] cell=\"{}\" scheme={:?} m={} k={} n={} steps={} \
-         packed_bytes_per_step={}",
-        cell.label, cell.scheme, cell.m, cell.k, cell.n, STEPS, grouped.packed_bytes_per_step,
-    );
-    report_side(grouped);
-    report_side(taken);
-
-    let grouped_median = common::median(&grouped.per_call_ms);
-    let taken_median = common::median(&taken.per_call_ms);
-    let grouped_min = common::least(&grouped.per_call_ms);
-    let taken_min = common::least(&taken.per_call_ms);
-    let median_ratio = grouped_median / taken_median;
-    let min_ratio = grouped_min / taken_min;
-    if taken.route == "coop" {
-        eprintln!(
-            "[gguf prefill rate] cell=\"{}\" pair= median_grouped_over_taken={median_ratio:.2}x \
-             min_grouped_over_taken={min_ratio:.2}x — the cooperative tile was taken, so this is \
-             the two tiles' rate on this shape in one window",
-            cell.label
-        );
+fn report_pair(grouped: &common::RateSide, taken: &common::RateSide) {
+    let meaning = if taken.route == "coop" {
+        "— the cooperative tile was taken, so this is the two tiles' rate on this shape in one \
+         window"
+            .to_string()
     } else {
-        eprintln!(
-            "[gguf prefill rate] cell=\"{}\" pair= median_grouped_over_taken={median_ratio:.2}x \
-             min_grouped_over_taken={min_ratio:.2}x the tile was not taken: the lever is off, or \
-             the adapter has no cooperative matrices, or the shape is refused — the \"taken\" side \
-             ran the row-grouped tile too, so this ratio is a repeatability witness only, not a \
-             tile comparison",
-            cell.label
-        );
-    }
+        "the tile was not taken: the lever is off, or the adapter has no cooperative matrices, or \
+         the shape is refused — the \"taken\" side ran the row-grouped tile too, so this ratio is \
+         a repeatability witness only, not a tile comparison"
+            .to_string()
+    };
+    common::report_rate_pair(PREFIX, grouped, taken, "grouped_over_taken", &meaning);
 }
 
 /// One test fn on purpose: what it reads is process-global (the route census and
@@ -680,30 +456,27 @@ fn gguf_prefill_rate_at_the_product_shapes() {
         return;
     };
     eprintln!(
-        "[gguf prefill rate] adapter={:?} — this cell's figures hold for this adapter and \
-         machine load only",
+        "{PREFIX} adapter={:?} — this cell's figures hold for this adapter and machine load \
+         only",
         rlx_wgpu::device::adapter_name()
     );
 
     // Every pair built, warmed and censused up front and held for the whole run:
     // that is the interleaving's cost, and the aggregate below is the number the
-    // module doc names.
-    let pairs: Vec<Pair> = CELLS.iter().filter_map(|cell| build(cell, dev)).collect();
-    let mut sides: Vec<Ready> = Vec::with_capacity(pairs.len() * 2);
-    for pair in pairs {
-        // The flatten is `grouped` then `taken` per cell, in [`CELLS`] order — the
-        // order `chunks_exact(2)` below reads back. Both sides of a pair come from
-        // one `build` call on one cell, so the pair's own association is the
-        // constructor's and nothing here re-establishes it.
-        sides.push(pair.grouped);
-        sides.push(pair.taken);
-    }
+    // module doc names. The flatten is `grouped` then `taken` per cell, in [`CELLS`]
+    // order — the order `chunks_exact(2)` below reads back, both sides of a pair
+    // coming from one `build` call on one cell.
+    let mut sides: Vec<common::RateSide> = CELLS
+        .iter()
+        .filter_map(|cell| build(cell, dev))
+        .flatten()
+        .collect();
     let aggregate_packed_bytes: u64 = sides
         .iter()
         .map(|r| r.packed_bytes_per_step as u64 * STEPS as u64)
         .sum();
     eprintln!(
-        "[gguf prefill rate] pairs={} sides={} aggregate_packed_bytes={aggregate_packed_bytes} — \
+        "{PREFIX} pairs={} sides={} aggregate_packed_bytes={aggregate_packed_bytes} — \
          every side held alive at once for the round-robin, so this is twice the single-tile \
          figure; a cell skipped above is named there",
         sides.len() / 2,

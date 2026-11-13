@@ -1405,8 +1405,25 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
         // tile and stays on the scratch slab, which its own cell comment above
         // records.
         (&[], 31, 256, 12288, 1e-2),
-        (&[], 1, 256, 640, 1e-2),   // 2-D decode
-        (&[1], 1, 2048, 640, 1e-2), // 3-D single-token decode: [1,1,k] -> [1,1,n]
+        // The cooperative tile's short last tile, at the same 12 288-column projection
+        // and a key width (2 048) the K-quants' 256-element superblock divides. Three
+        // shapes, one per class of remainder: 47 leaves 15, 48 exactly 16, and 65 — a
+        // 400-frame single-piece clip — one, the largest overlap the rule produces. The
+        // tail body is identical for any number of whole row groups before it, so a
+        // longer prompt repeats one of these rather than adding a class. The last row
+        // group runs the short form over the prompt's LAST sixteen rows, anchored at
+        // `m - 16`, whose overlap rows the group before it already wrote and which are
+        // recomputed; the slab is copied out over `m` rows only, so a short form that
+        // does not run leaves the output's last rows as the slab had them, and one
+        // anchored at a whole-tile boundary instead multiplies the wrong sixteen input
+        // rows into them: the damage is in the last rows and nowhere else. All three
+        // schemes' short form (Q4_K/Q6_K/Q8_0) runs through the scheme loop below; Q5_K
+        // has an entry point for neither tile and stays on the scratch slab.
+        (&[], 47, 2048, 12288, 1e-2), // remainder 15: one row recomputed
+        (&[], 48, 2048, 12288, 1e-2), // remainder 16: no overlap
+        (&[], 65, 2048, 12288, 1e-2), // remainder 1: fifteen rows recomputed
+        (&[], 1, 256, 640, 1e-2),     // 2-D decode
+        (&[1], 1, 2048, 640, 1e-2),   // 3-D single-token decode: [1,1,k] -> [1,1,n]
     ];
     for &(scheme, ggml, sname) in schemes {
         for &(batch, m, k, n, tol) in shapes {

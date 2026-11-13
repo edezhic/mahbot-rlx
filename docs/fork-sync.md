@@ -216,7 +216,7 @@ merge action.
 
 - encode chunking, so chunk n+1's host encode overlaps chunk n's execution
 - the row-grouped 8-row packed GEMM and its split-k arm
-- the cooperative-matrix packed GEMM
+- the cooperative-matrix packed GEMM, and its 16-row short last row group
 - the many-row and split decode attention routes
 - broadcast-`Expand` elision in front of binary ops
 - the mel framing fold
