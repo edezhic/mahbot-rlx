@@ -538,7 +538,12 @@ fn fp8_e5m2_packs_and_hides_its_scale() {
         (p.scheme, p.in_dim, p.out_dim),
         (QuantScheme::Fp8E5m2B128, k, n)
     );
-    let w = rlx_ir::lowp_codec::fp8_b128::dequant_scheme(p.scheme, &p.w_q, n * k).unwrap();
+    let w = rlx_ir::lowp_codec::fp8_b128::dequant_scheme(
+        p.scheme,
+        p.w_q.carried_bytes().expect("the source carries its bytes"),
+        n * k,
+    )
+    .unwrap();
     let (f, _) = src.take("w", false).unwrap();
     assert_eq!(w, f, "packed and unpacked reads agree");
     for (t, v) in w.iter().enumerate() {

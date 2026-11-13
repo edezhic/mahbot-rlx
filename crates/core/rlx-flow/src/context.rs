@@ -349,8 +349,10 @@ impl FlowCtx<'_> {
             ..
         } = packed;
         let wq_key = format!("{weight_key}\0q");
-        let wq_shape = Shape::new(&[w_q.len()], DType::U8);
-        let wq_id = self.synth_typed_param(&wq_key, w_q, wq_shape);
+        // The shape is the blob's length, declared even when the source carries no
+        // bytes ([`PackedBlob`]): it is what the parameter is placed and compared at.
+        let wq_shape = Shape::new(&[w_q.len], DType::U8);
+        let wq_id = self.synth_typed_param(&wq_key, w_q.into_bytes(), wq_shape);
         self.state
             .packed_linears
             .insert(weight_key.to_string(), (wq_id, out_dim, scheme));
@@ -407,8 +409,8 @@ impl FlowCtx<'_> {
                 ..
             } = packed;
             let wq_key = format!("{key}\0q");
-            let shape = Shape::new(&[w_q.len()], DType::U8);
-            let wq = self.synth_typed_param(&wq_key, w_q, shape);
+            let shape = Shape::new(&[w_q.len], DType::U8);
+            let wq = self.synth_typed_param(&wq_key, w_q.into_bytes(), shape);
             return Ok(LinearWeight::Packed {
                 wq,
                 out_dim,
@@ -457,8 +459,19 @@ impl FlowCtx<'_> {
                     let mut dims = Vec::with_capacity(keys.len());
                     let mut bytes = Vec::new();
                     for p in &parts {
+                        // A declared blob has no bytes to join, and the joined parameter
+                        // would be declared at zero length: refused by name rather than
+                        // built at a length nothing can be bound to.
+                        let Some(part) = p.w_q.carried_bytes() else {
+                            anyhow::bail!(
+                                "resolve_linear_fused: `{:?}` is declared packed without \
+                                 carrying its bytes, and the flow concatenates the parts' \
+                                 own bytes",
+                                keys
+                            );
+                        };
                         dims.push(p.out_dim);
-                        bytes.extend_from_slice(&p.w_q);
+                        bytes.extend_from_slice(part);
                     }
                     let out_dim: usize = dims.iter().sum();
                     let wq_key = format!("{}\0fused", keys[0]);
@@ -478,8 +491,8 @@ impl FlowCtx<'_> {
                     let mut ws = Vec::with_capacity(keys.len());
                     for (i, p) in parts.into_iter().enumerate() {
                         let wq_key = format!("{}\0q", keys[i]);
-                        let shape = Shape::new(&[p.w_q.len()], DType::U8);
-                        let wq = self.synth_typed_param(&wq_key, p.w_q, shape);
+                        let shape = Shape::new(&[p.w_q.len], DType::U8);
+                        let wq = self.synth_typed_param(&wq_key, p.w_q.into_bytes(), shape);
                         ws.push(LinearWeight::Packed {
                             wq,
                             out_dim: p.out_dim,

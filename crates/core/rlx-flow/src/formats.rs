@@ -386,7 +386,7 @@ impl WeightSource for SafetensorsSource {
         Ok(self
             .fp8_packed_parts(key, 2)?
             .map(|(w_q, p)| GgufPackedLinear {
-                w_q,
+                w_q: w_q.into(),
                 scheme: p.scheme,
                 in_dim: p.k,
                 out_dim: p.n,
@@ -566,7 +566,7 @@ impl WeightSource for GgufSource {
         Ok(self
             .packed_parts(key, 2)?
             .map(|(w_q, scheme, s)| GgufPackedLinear {
-                w_q,
+                w_q: w_q.into(),
                 scheme,
                 in_dim: s[0],
                 out_dim: s[1],

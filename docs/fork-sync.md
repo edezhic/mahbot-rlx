@@ -234,6 +234,14 @@ merge action.
 - packed codec tables read as stored
 - the buffered GGUF header parse (upstream reads one scalar per `read` syscall)
 - the scope-keyed shared weight pool with re-upload skipping
+- packed parameters declared at their file's own tensor length with no host buffer behind
+  them, and the compile checking that declaration against the file: a zero-length
+  declaration is refused (the file's bytes would land at offset zero with no bound) and so
+  is a length that is not the file's (it appends a second placement of the same tensor to
+  the pool and loses the per-rung skip). The carrier is `rlx_flow::PackedBlob`, the type of
+  `GgufPackedLinear.w_q` in that near-upstream crate: the parameter's shape is derived
+  inside it, so no fork-local channel carries the length, and a sync that touches the
+  struct keeps the fork's field type rather than upstream's `Vec<u8>`
 - KV-append copy elision
 - the ceiling policy as a whole-arena verdict
 - the fork-only core surfaces the product calls: the packed gather op in the

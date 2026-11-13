@@ -127,11 +127,66 @@ impl GgufPackedParams {
 /// One packed linear weight: quantized bytes + bias.
 #[derive(Debug, Clone)]
 pub struct GgufPackedLinear {
-    pub w_q: Vec<u8>,
+    pub w_q: PackedBlob,
     pub scheme: rlx_ir::quant::QuantScheme,
     pub in_dim: usize,
     pub out_dim: usize,
     pub bias: Vec<f32>,
+}
+
+/// A packed (quantised) weight blob: the bytes, or — for a source that binds them at
+/// session time instead — the length they will have.
+///
+/// The length is what the parameter is declared at: `FlowCtx::linear` makes its shape `[len]`
+/// from this blob and nothing else, so a source that carries no bytes has no other channel to
+/// declare the parameter's size. It has to be the file's own tensor length. A source must not
+/// derive it from the scheme's block table: that table is rounded (`QuantScheme`'s
+/// bits-per-element figures are tenths, and Q6_K is 210 bytes per 256 elements where the table
+/// says 66), and a wrong length declares the parameter at the wrong size.
+#[derive(Debug, Clone)]
+pub struct PackedBlob {
+    /// The bytes, when the source carried them: `None` for a declaration, which is what
+    /// makes the two cases distinguishable at every call site that has to join or upload
+    /// them rather than declare them.
+    bytes: Option<Vec<u8>>,
+    /// The blob's byte length: the carried bytes' own length, or the declared one. It is a
+    /// field rather than a getter because it is the whole reason the type exists.
+    pub len: usize,
+}
+
+impl PackedBlob {
+    /// A blob of `len` bytes that this source does not carry: the parameter is declared
+    /// at `len` and its bytes are bound at session time, from wherever the source knows
+    /// them to be. Nothing is allocated, so a build that declares a checkpoint's worth of
+    /// weights pays nothing for them.
+    #[must_use]
+    pub fn declared(len: usize) -> Self {
+        Self { bytes: None, len }
+    }
+
+    /// The bytes, when this blob carries them — `None` for a declaration, so a caller that
+    /// has to concatenate or upload them cannot forget that a source may not have handed
+    /// them over. The declared length stands either way.
+    #[must_use]
+    pub fn carried_bytes(&self) -> Option<&[u8]> {
+        self.bytes.as_deref()
+    }
+
+    /// The bytes as the build hands them to the session — empty for a declaration, whose
+    /// parameter is bound from wherever the source said they are.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes.unwrap_or_default()
+    }
+}
+
+impl From<Vec<u8>> for PackedBlob {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            len: bytes.len(),
+            bytes: Some(bytes),
+        }
+    }
 }
 
 /// A packed **MoE expert bank**: `num_experts` contiguous `[out_dim, in_dim]`

@@ -397,7 +397,7 @@ mod tests {
                 let blocks = (self.in_dim / 256).max(1);
                 let n_bytes = self.out_dim * blocks * 144;
                 Ok(Some(crate::GgufPackedLinear {
-                    w_q: vec![0u8; n_bytes],
+                    w_q: vec![0u8; n_bytes].into(),
                     scheme: QuantScheme::GgufQ4K,
                     in_dim: self.in_dim,
                     out_dim: self.out_dim,
@@ -433,6 +433,68 @@ mod tests {
             .iter()
             .any(|n| matches!(&n.op, HirOp::DequantMatMul { .. }));
         assert!(has_dqmm, "packed linear must emit a DequantMatMul node");
+    }
+
+    /// A source that declares a packed weight's length without carrying its bytes — a
+    /// loader that binds them at session time — still declares the parameter at that
+    /// length: the U8 param's shape is the blob's byte length, and the build allocates
+    /// nothing for it. A zero-length parameter here would disable every re-upload skip
+    /// downstream while the graph kept compiling, which is what this pins.
+    #[test]
+    fn a_declared_packed_blob_declares_its_length_and_carries_no_bytes() {
+        use crate::weight::WeightSource;
+        use rlx_ir::quant::QuantScheme;
+
+        struct Declared {
+            in_dim: usize,
+            out_dim: usize,
+        }
+        impl WeightSource for Declared {
+            fn take(&mut self, key: &str, _t: bool) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
+                Err(anyhow::anyhow!(
+                    "no F32 weight for '{key}' (declared-only source)"
+                ))
+            }
+            fn take_packed(
+                &mut self,
+                _key: &str,
+            ) -> anyhow::Result<Option<crate::GgufPackedLinear>> {
+                let blocks = (self.in_dim / 256).max(1);
+                Ok(Some(crate::GgufPackedLinear {
+                    w_q: crate::PackedBlob::declared(self.out_dim * blocks * 144),
+                    scheme: QuantScheme::GgufQ4K,
+                    in_dim: self.in_dim,
+                    out_dim: self.out_dim,
+                    bias: Vec::new(),
+                }))
+            }
+        }
+
+        let mut w = Declared {
+            in_dim: 256,
+            out_dim: 8,
+        };
+        let built = ModelFlow::new("declared_packed_smoke")
+            .input("x", Shape::new(&[1, 1, 256], DType::F32))
+            .linear("proj.weight", false)
+            .build(&mut w)
+            .unwrap();
+
+        assert_eq!(built.typed_params.len(), 1);
+        let (name, bytes, dtype) = &built.typed_params[0];
+        assert_eq!(name, "proj.weight\0q");
+        assert_eq!(*dtype, DType::U8);
+        assert!(bytes.is_empty(), "the declaration carries no bytes");
+        // The graph, not the HIR: a compile reads the parameter's length off the graph it
+        // compiles, and a conversion that reshaped or dropped the param would leave the
+        // declaration zero-length with nothing failing until the compile's guard ran.
+        let graph = built.into_graph().unwrap();
+        let param = graph
+            .nodes()
+            .iter()
+            .find(|n| matches!(&n.op, rlx_ir::Op::Param { name } if name == "proj.weight\0q"))
+            .expect("the declared blob is a graph parameter");
+        assert_eq!(param.shape.num_elements(), Some(8 * 144));
     }
 
     #[test]

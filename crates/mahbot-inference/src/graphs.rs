@@ -2696,7 +2696,8 @@ impl Drop for DeclaredScope {
 
 /// Bind a fused projection's parameter from the model file's own tensors: each part is
 /// written at its own offset out of a window of the file, so the concatenation never exists
-/// on the host — the one joined copy is the device's. Answers the bytes it wrote.
+/// on the host — the one joined copy is the device's. Answers the bytes it wrote, or `None`
+/// when the device already held the parameter and nothing was written.
 ///
 /// Nothing is read when the device already holds the parameter, which is the rule for a
 /// second layout of one body: the rung ladder and a warm call both ask for the same joined
@@ -2717,13 +2718,13 @@ fn bind_fused(
     name: &str,
     fused: emit::Fused,
     len: usize,
-) -> Result<u64> {
+) -> Result<Option<u64>> {
     if session.param_resident(name, len) {
         // The bytes are already there, so no `set_param*` call will record this name;
         // say so here, where the write is skipped, or the unbound diagnostic reports
         // a parameter that is bound and correct.
         session.mark_param_bound(name);
-        return Ok(0);
+        return Ok(None);
     }
     let mut at = 0usize;
     for part in &fused.parts {
@@ -2745,7 +2746,50 @@ fn bind_fused(
     if at != len {
         bail!("the fused projection `{name}` joins {at} bytes, its parameter is {len}");
     }
-    Ok(len as u64)
+    Ok(Some(len as u64))
+}
+
+/// The byte length a packed parameter is declared at, from the graph's own shape.
+///
+/// A zero is a declaration that lost its length, and a name the graph does not declare as U8
+/// is a graph this compile cannot bind bytes into; both are named errors rather than a write
+/// against a length nothing declared.
+fn declared_len(declared: &std::collections::HashMap<&str, usize>, name: &str) -> Result<usize> {
+    match declared.get(name).copied() {
+        Some(0) => Err(zero_length(name)),
+        Some(len) => Ok(len),
+        None => Err(anyhow!(
+            "the packed parameter `{name}` is not a U8 parameter of the graph, so the file's \
+             bytes have no declared length to be written against"
+        )),
+    }
+}
+
+/// A packed parameter the graph declares at zero bytes: the shape says it exists and holds
+/// nothing, so a write of the file's bytes would land at offset zero with no bound, and a zero
+/// length also disables the per-rung re-upload skip.
+fn zero_length(name: &str) -> anyhow::Error {
+    anyhow!(
+        "the packed parameter `{name}` is declared at zero bytes in the graph: its length was \
+         lost before it reached the graph, and the file's bytes have no storage to be written \
+         against"
+    )
+}
+
+/// The declaration must be the file's own tensor length. A shorter one writes the file's
+/// bytes past the parameter's storage, and any other one appends a second placement of the
+/// same tensor to the shared weight pool, which keys a placement by name and byte count —
+/// neither shows in an output, so the equality is checked rather than assumed.
+fn check_declared(model: &Model, name: &str, key: &str, len: usize) -> Result<()> {
+    let file_len = model.raw_len(key)?;
+    if file_len != len {
+        bail!(
+            "the packed parameter `{name}` is declared {len} bytes and `{key}` is {file_len} \
+             in {}: the declaration must be the file's own tensor length",
+            model.path.display()
+        );
+    }
+    Ok(())
 }
 
 /// The one message for the parameter [`bind_route`] answers `None` for: a record released
@@ -2758,6 +2802,20 @@ fn unresolved(name: &str) -> anyhow::Error {
          be resolved in this process: no build record names them (`emit`'s weight \
          caches were released after the graph was built, or the build and the compile \
          are not the same build) — the graph is not run on zeros"
+    )
+}
+
+/// The same failure for a packed parameter: the graph declares it at `len` bytes and the
+/// build carried none, so the record naming where its bytes are never reached this compile —
+/// a later build on this thread replaced it ([`emit::clear_origins`] runs at every build's
+/// start), or the graph was built on another thread. Writing nothing would leave the
+/// parameter at whatever the arena held while `set_param_typed` recorded it as bound.
+fn unresolved_packed(name: &str, len: usize) -> anyhow::Error {
+    anyhow!(
+        "the packed parameter `{name}` is declared {len} bytes and the build carried none: \
+         the build that declared it is not the build this compile is for (a later build on \
+         this thread replaced its records, or the graph was built on another thread) — the \
+         graph is not run on whatever the arena held"
     )
 }
 
@@ -2796,15 +2854,18 @@ pub struct Runner {
     upload: Upload,
 }
 
-/// What a compile's parameter upload cost: its wall clock and the bytes it handed to
-/// the device. The compile bracket in [`crate::report`] lumps the upload into itself, so
-/// this is the only figure that separates the copy from the lowering — and the only one
-/// that reads the copy's rate, which is what a change of the bytes' source moves. It is
-/// zero on a compile whose parameters the device already held.
+/// What a compile's parameter upload cost: its wall clock, the bytes it handed to the
+/// device, and the bytes the device already held. The compile bracket in [`crate::report`]
+/// lumps the upload into itself, so this is the only figure that separates the copy from the
+/// lowering — and the only one that reads the copy's rate, which is what a change of the
+/// bytes' source moves. `skipped` is the per-rung re-upload skip: a second layout of one body
+/// asks for parameters an earlier compile placed, and the bytes it wants are already there,
+/// so they are neither read nor written.
 #[derive(Clone, Copy)]
 pub(crate) struct Upload {
     pub(crate) ms: f64,
     pub(crate) bytes: u64,
+    pub(crate) skipped: u64,
 }
 
 impl Upload {
@@ -2857,19 +2918,31 @@ impl Runner {
         // tensor from the model file, or — for a fused projection — part by part out of
         // it; and a parameter the device already holds is not read for at all.
         let origins = emit::take_origins();
-        // The graph's half of [`bind_route`]'s placeholder rule, walked once for the whole
-        // upload rather than once per parameter.
-        let holds_bytes: std::collections::HashSet<&str> = graph
-            .nodes()
-            .iter()
-            .filter_map(|node| match &node.op {
-                Op::Param { name } if node.shape.num_elements().unwrap_or(0) > 0 => {
-                    Some(name.as_str())
-                }
-                _ => None,
-            })
-            .collect();
+        // The graph's own declaration of each parameter, walked once for the whole upload
+        // rather than once per parameter: `holds_bytes` is the graph's half of
+        // [`bind_route`]'s placeholder rule, and `declared` is the byte length a packed
+        // parameter is declared at — a U8 shape's element count is its byte count, and the
+        // build carries none to read it from ([`emit::serve_packed`]), so the length the
+        // residency test compares and the pool places the tensor at is the graph's own. A
+        // zero-length declaration is recorded too, so the guard can refuse it.
+        let mut holds_bytes: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut declared: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for node in graph.nodes() {
+            let Op::Param { name } = &node.op else {
+                continue;
+            };
+            let Some(elements) = node.shape.num_elements() else {
+                continue;
+            };
+            if elements > 0 {
+                holds_bytes.insert(name.as_str());
+            }
+            if node.shape.dtype() == DType::U8 {
+                declared.insert(name.as_str(), elements);
+            }
+        }
         let mut uploaded = 0u64;
+        let mut skipped = 0u64;
         let upload_start = Stopwatch::start();
         while let Some(name) = built.params.keys().next().cloned() {
             let values = built.params.remove(&name).expect("key just read");
@@ -2891,20 +2964,38 @@ impl Runner {
         // a time; `Model::with_mapped` carries the price and the residency rule.
         while let Some((name, bytes, dt)) = built.typed_params.pop() {
             if let Some(fused) = emit::fused_of(&name) {
-                uploaded += bind_fused(device, &mut session, &name, fused, bytes.len())?;
+                let len = declared_len(&declared, &name)?;
+                match bind_fused(device, &mut session, &name, fused, len)? {
+                    Some(written) => uploaded += written,
+                    None => skipped += len as u64,
+                }
             } else if let Some((model, key)) = emit::bound_weight(&name) {
+                let len = declared_len(&declared, &name)?;
+                check_declared(&model, &name, &key, len)?;
                 // The read is only worth making when the write it feeds would land: a
                 // second layout of one body asks for the same parameter, and the device
                 // already holds it ([`CompiledGraph::param_resident`]).
-                if session.param_resident(&name, bytes.len()) {
+                if session.param_resident(&name, len) {
                     session.mark_param_bound(&name);
+                    skipped += len as u64;
                 } else {
                     model.with_mapped(&key, |bytes| session.set_param_typed(&name, bytes, dt))?;
-                    uploaded += bytes.len() as u64;
+                    uploaded += len as u64;
                 }
             } else if emit::is_placeholder(&name) {
                 return Err(unresolved(&name));
             } else {
+                // A parameter whose bytes the build carried: a stacked tensor's step slice, an
+                // f16 linear. A U8 one is a declaration, and a lost length or a lost record is
+                // a refusal rather than a write nothing checks.
+                if let Some(&len) = declared.get(name.as_str()) {
+                    if len == 0 {
+                        return Err(zero_length(&name));
+                    }
+                    if bytes.is_empty() {
+                        return Err(unresolved_packed(&name, len));
+                    }
+                }
                 session.set_param_typed(&name, &bytes, dt);
                 uploaded += bytes.len() as u64;
             }
@@ -2912,6 +3003,7 @@ impl Runner {
         let upload = Upload {
             ms: upload_start.ms(),
             bytes: uploaded,
+            skipped,
         };
         Ok(Self {
             session,
@@ -3976,6 +4068,43 @@ mod tests {
         let message = format!("{:#}", super::unresolved("a.conv_out.weight"));
         assert!(
             message.contains("a.conv_out.weight") && message.contains("not run on zeros"),
+            "{message}"
+        );
+    }
+
+    /// A packed parameter the graph declares no length for — at zero bytes, or not as a U8
+    /// parameter at all — is refused by name: a build that dropped the placeholder's buffer
+    /// without carrying its length leaves exactly the first, and a write against a length
+    /// nothing declared is unbounded.
+    #[test]
+    fn a_packed_parameter_with_no_declared_length_is_refused_by_name() {
+        use super::declared_len;
+
+        let declared = std::collections::HashMap::from([("w\0q", 144usize), ("z\0q", 0)]);
+        assert_eq!(declared_len(&declared, "w\0q").unwrap(), 144);
+        let zero = format!("{:#}", declared_len(&declared, "z\0q").unwrap_err());
+        assert!(
+            zero.contains("`z\0q`") && zero.contains("zero bytes"),
+            "{zero}"
+        );
+        let absent = format!("{:#}", declared_len(&declared, "v\0q").unwrap_err());
+        assert!(
+            absent.contains("`v\0q`") && absent.contains("not a U8 parameter"),
+            "{absent}"
+        );
+    }
+
+    /// A declared parameter whose build record never reached the compile is refused with its
+    /// own message, not the placeholder one — the cause is a build that is not this compile's,
+    /// and writing nothing would leave it at whatever the arena held.
+    #[test]
+    fn a_declaration_with_no_build_record_is_refused_with_its_own_message() {
+        let message = format!("{:#}", super::unresolved_packed("w\0q", 144));
+        assert!(
+            message.contains("`w\0q`")
+                && message.contains("144")
+                && message.contains("not the build this compile is for")
+                && !message.contains("placeholder"),
             "{message}"
         );
     }

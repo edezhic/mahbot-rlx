@@ -107,7 +107,14 @@ fn load_moe_packed(
                     w.in_dim
                 );
             }
-            Ok(w.w_q)
+            // A declared blob has no bytes to join into the bank: refused by name rather
+            // than built at a length nothing can be bound to.
+            anyhow::ensure!(
+                w.w_q.carried_bytes().is_some(),
+                "{k}: the expert bank concatenates each slab's own bytes, and this one is \
+                 declared without them"
+            );
+            Ok(w.w_q.into_bytes())
         };
         gu.extend(take("gate", i, hidden)?);
         gu.extend(take("up", i, hidden)?);

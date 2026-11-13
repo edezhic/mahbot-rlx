@@ -24,12 +24,14 @@ impl Stopwatch {
 /// One graph's construction and compile, timed into `RLX_WGPU_COMPILE_REPORT` beside the
 /// backend's own line ([`rlx_wgpu::compile_report`]): `build` is the flow's graph
 /// construction and `compile` is everything from HIR conversion to the last parameter
-/// upload. The difference between the two lines is the fusion pipeline; the `upload=`
-/// figures are [`crate::graphs::Upload`]'s, which is where the split from `compile` is
-/// explained. The backend's phases are the second line's. Without the switch this is
-/// [`crate::graphs::Compiled::new`] with the build timed. The device is fixed to
-/// [`rlx_runtime::Device::Gpu`] rather than passed in: nothing in this crate compiles for
-/// another backend.
+/// upload. The difference between the two lines is the fusion pipeline; the `upload=` and
+/// `skipped=` figures are [`crate::graphs::Upload`]'s, which is where the split from `compile`
+/// is explained. `skipped` is the per-rung re-upload skip: a second layout of one body asks
+/// for parameters an earlier compile already placed, so their bytes are neither read nor
+/// written — the figure that says the skip is still skipping. The backend's phases are the
+/// second line's. Without the switch this is [`crate::graphs::Compiled::new`] with the build
+/// timed. The device is fixed to [`rlx_runtime::Device::Gpu`] rather than passed in: nothing
+/// in this crate compiles for another backend.
 pub(crate) fn compiled(
     kind: &str,
     build: impl FnOnce() -> anyhow::Result<rlx_flow::BuiltModel>,
@@ -44,10 +46,11 @@ pub(crate) fn compiled(
         let upload = compiled.upload();
         eprintln!(
             "[compile {kind}] build={build_ms:.2}ms compile={compile_ms:.2}ms \
-             upload={:.2}ms {:.1}MiB {:.2}GB/s",
+             upload={:.2}ms {:.1}MiB {:.2}GB/s skipped={:.1}MiB",
             upload.ms,
             upload.bytes as f64 / (1 << 20) as f64,
             upload.gb_per_s(),
+            upload.skipped as f64 / (1 << 20) as f64,
         );
     }
     Ok(compiled)

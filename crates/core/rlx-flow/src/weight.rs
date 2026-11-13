@@ -46,6 +46,11 @@ pub trait WeightSource {
     /// both load a projection); implementations should return the same weight
     /// each time. The flow dedups the underlying graph param, so the U8 bytes
     /// are registered only once.
+    ///
+    /// The blob's [`len`](crate::PackedBlob::len) is what the parameter is declared at, so a
+    /// source that binds the bytes at session time instead of carrying them hands over
+    /// [`declared`](crate::PackedBlob::declared) — the file's own tensor length and no
+    /// allocation — and the flow emits the same graph it would have for the bytes.
     fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
         let _ = key;
         Ok(None)
@@ -767,7 +772,7 @@ mod tests {
         }
         fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
             Ok((key == "q").then(|| GgufPackedLinear {
-                w_q: vec![1, 2, 3],
+                w_q: vec![1, 2, 3].into(),
                 scheme: QuantScheme::GgufQ8_0,
                 in_dim: 32,
                 out_dim: 1,

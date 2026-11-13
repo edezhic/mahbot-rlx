@@ -26,21 +26,21 @@
 //! A `name#step` key is a stacked tensor read one step at a time (the code
 //! predictor's fifteen LM heads), and takes the same paths on its slice.
 //!
-//! The large weights do not travel in the build: the packed path hands the flow a
-//! placeholder of the parameter's size and records where the bytes are — the model file, a
-//! fused projection of the file's own tensors — and `graphs::Runner::compile` binds that at
+//! The large weights do not travel in the build: the packed path declares the parameter at
+//! the file's own tensor length and records where the bytes are — the model file, a fused
+//! projection of the file's own tensors — and `graphs::Runner::compile` binds that at
 //! session time. A transcription compiles one graph set per rung of its closed ladder — six
 //! at most for a call, never one per chunk length — and every set binds the same weights,
 //! which is what keeps a second shape's build from copying the body out of the file again: a
-//! parameter the device already holds is neither written nor read for. Neither packed path
-//! keeps a copy on the host: a fused projection is written into its parameter one part at a
-//! time, and a packed one is read from the file only when the device does not hold it yet.
-//! A stacked tensor's step is the exception — it is a slice of a file tensor rather than a
-//! tensor of its own, so the build carries that slice. The host paths carry their bytes too:
-//! what `Store::HostDequant`/`Store::F16Widened` dequantised is kept in `Kept` and handed
-//! over as the build's own param, because a second layout reads it instead of the file, and
-//! an f16 linear's bytes ride in the build too, as the loader narrowed them rather than as
-//! the file stores them ([`Model::linear_f16`]).
+//! parameter the device already holds is neither written nor read for. Nothing packed keeps a
+//! copy on the host, not even a zeroed one: a fused projection is written into its parameter
+//! one part at a time, and a packed one is read from the file only when the device does not
+//! hold it yet. A stacked tensor's step is the exception — it is a slice of a file tensor
+//! rather than a tensor of its own, so the build carries that slice. The host paths carry
+//! their bytes too: what `Store::HostDequant`/`Store::F16Widened` dequantised is kept in
+//! `Kept` and handed over as the build's own param, because a second layout reads it instead
+//! of the file, and an f16 linear's bytes ride in the build too, as the loader narrowed them
+//! rather than as the file stores them ([`Model::linear_f16`]).
 //!
 //! The helpers below also carry the other decisions: 1-D convolutions go
 //! through 2-D with `[k, 1]` (never `[k, k]`, which silently takes the 2-D
@@ -53,7 +53,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
-use rlx_flow::{FlowCtx, GgufPackedLinear, WeightSource};
+use rlx_flow::{FlowCtx, GgufPackedLinear, PackedBlob, WeightSource};
 use rlx_gguf::bytes_for_public;
 use rlx_ir::hir::{HirGraphExt, HirMut};
 use rlx_ir::op::{Activation, MaskKind, PadMode, ReduceOp};
@@ -411,12 +411,17 @@ pub fn host_weight(origins: &HashMap<String, Arc<str>>, name: &str) -> Option<Ar
 }
 
 /// Record the file `key`'s packed placeholder is bound from, and hand back that placeholder:
-/// the parameter has its right size, and the compile reads the file into it
-/// ([`bound_weight`]) — or reads nothing, when the device already holds the bytes.
-fn serve_packed(key: &str, model: &Arc<Model>, len: usize) -> Vec<u8> {
+/// the parameter is declared at the file's own tensor length, and the compile reads the file
+/// into it ([`bound_weight`]) — or reads nothing, when the device already holds the bytes.
+///
+/// The declaration carries no bytes because nothing reads them: the length is the parameter's
+/// shape, the residency test's operand and the shared weight pool's placement key, so
+/// `graphs::Runner::compile` checks it against the file. A buffer behind it would be filled on
+/// every build and never read.
+fn serve_packed(key: &str, model: &Arc<Model>, len: usize) -> PackedBlob {
     note_bound(key, model);
     note_placeholder(key);
-    vec![0u8; len]
+    PackedBlob::declared(len)
 }
 
 /// The shape the process has already read `key` at, if it has: the compile binds the
@@ -499,7 +504,7 @@ impl WeightSource for LoaderWeights {
     fn take_packed(&mut self, key: &str) -> Result<Option<GgufPackedLinear>> {
         note_origin(key, &self.model);
         if let Some(plan) = self.fused.get(key) {
-            // A placeholder of the joined length: the compile writes the file's own
+            // A declaration of the joined length: the compile writes the file's own
             // tensors into it, one part at its own offset, so the concatenation itself
             // never exists on the host ([`Fused`]).
             note_fused(
@@ -511,7 +516,7 @@ impl WeightSource for LoaderWeights {
             );
             note_placeholder(key);
             return Ok(Some(GgufPackedLinear {
-                w_q: vec![0u8; plan.total],
+                w_q: PackedBlob::declared(plan.total),
                 scheme: plan.scheme,
                 in_dim: plan.in_dim,
                 out_dim: plan.out_dim,
@@ -606,7 +611,7 @@ impl LoaderWeights {
             );
         }
         Ok(Some(GgufPackedLinear {
-            w_q: bytes[at..at + per_step].to_vec(),
+            w_q: bytes[at..at + per_step].to_vec().into(),
             scheme,
             in_dim: k,
             out_dim: n,
@@ -1080,8 +1085,8 @@ pub fn row_table(ctx: &mut FlowCtx<'_>, model: &Arc<Model>, name: &str) -> Resul
             if let Some(node) = declared_param(ctx, &key, &shape) {
                 return Ok(Table::Packed { node, geometry });
             }
-            let bytes = serve_packed(&key, model, geometry.bytes);
-            let node = ctx.synth_typed_param(&key, bytes, shape);
+            let blob = serve_packed(&key, model, geometry.bytes);
+            let node = ctx.synth_typed_param(&key, blob.into_bytes(), shape);
             Ok(Table::Packed { node, geometry })
         }
         loader::Rows::Widened { rows, cols } => {
