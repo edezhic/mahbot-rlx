@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-driver"
-version                = "0.2.18-mahbot.2"
+version                = "0.2.18-mahbot.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "RLX driver layer — device handles, arenas, buffers, command streams"

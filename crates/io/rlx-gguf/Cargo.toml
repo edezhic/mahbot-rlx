@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-gguf"
-version                = "0.2.18-mahbot.2"
+version                = "0.2.18-mahbot.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "GGUF v1/v2/v3 parser + dequantization to f32. Standalone — no rlx-* deps unless the `ir` feature is on."

@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-gpu-dispatch"
-version                = "0.2.18-mahbot.2"
+version                = "0.2.18-mahbot.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Shape-keyed GPU kernel-variant dispatch table + tile parameter space shared by every RLX GPU backend."

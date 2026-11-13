@@ -40,7 +40,7 @@ import fork_layers as layers
 
 # The fork's release version. The release process owns this number; a bump
 # happens there, not here.
-FORK_VERSION = "0.2.18-mahbot.2"
+FORK_VERSION = "0.2.18-mahbot.3"
 
 # Directory → package name, for the crates this fork publishes under its own
 # name. Everything else in the tree keeps upstream's name and version.

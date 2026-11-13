@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-compile"
-version                = "0.2.18-mahbot.2"
+version                = "0.2.18-mahbot.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "HIR → MIR → LIR compile pipeline for RLX"

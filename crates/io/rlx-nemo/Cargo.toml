@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-nemo"
-version                = "0.2.18-mahbot.2"
+version                = "0.2.18-mahbot.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "RLX — native loader for NVIDIA NeMo `.nemo` model files (tar + torch.save ckpt + YAML config)."

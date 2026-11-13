@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-wgpu"
-version                = "0.2.18-mahbot.2"
+version                = "0.2.18-mahbot.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Cross-platform GPU backend for RLX via wgpu (Metal/Vulkan/DX12)"
@@ -44,7 +44,7 @@ rlxsl = { workspace = true }
 # Shape-keyed kernel-variant dispatch table, shared with CUDA/ROCm/Metal.
 rlx-gpu-dispatch = { workspace = true }
 rlx-unfuse = { workspace = true }
-rlx-opt = { package = "mahbot-rlx-opt", path = "../../core/rlx-opt", version = "0.2.18-mahbot.2", default-features = false, features = ["compile"] }
+rlx-opt = { package = "mahbot-rlx-opt", path = "../../core/rlx-opt", version = "0.2.18-mahbot.3", default-features = false, features = ["compile"] }
 rlx-compile = { workspace = true }
 rlx-cpu = { workspace = true, features = ["splat"] }
 rlx-gpu-host = { workspace = true }

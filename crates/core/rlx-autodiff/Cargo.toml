@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-autodiff"
-version                = "0.2.18-mahbot.2"
+version                = "0.2.18-mahbot.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "JAX-shaped transforms for RLX MIR — autodiff, JVP/HVP, vmap"

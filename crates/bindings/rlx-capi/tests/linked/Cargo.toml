@@ -12,7 +12,7 @@ crate-type = ["staticlib"]
 
 [dependencies]
 rlx-capi         = { path = "../.." }
-rlx-runtime      = { package = "mahbot-rlx-runtime", path = "../../../../core/rlx-runtime", default-features = false, features = ["linked-plugins"], version = "0.2.18-mahbot.2" }
+rlx-runtime      = { package = "mahbot-rlx-runtime", path = "../../../../core/rlx-runtime", default-features = false, features = ["linked-plugins"], version = "0.2.18-mahbot.3" }
 rlx-model-plugin = { path = "../../../rlx-model-plugin" }
 
 # Not a member of the rlx workspace.

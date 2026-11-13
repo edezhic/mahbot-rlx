@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlxsl"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 edition.workspace = true
 rust-version.workspace = true
 description = "Scalar-expression manifest + per-language emitters for RLX's warm-tier unary-activation kernels (single source for WGSL/CUDA/MSL/GLSL/OpenCL activation math, forward + auto-differentiated backward)."

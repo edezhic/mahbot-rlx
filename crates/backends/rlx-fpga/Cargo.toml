@@ -31,7 +31,7 @@ std = ["rlx-ir/std", "rlx-cortexm/std"]
 rlx-cortexm = { path = "../rlx-cortexm", version = "0.2.20", default-features = false }
 # Not `workspace = true`: an inherited dependency cannot turn default
 # features off, and rlx-ir's default is `std`.
-rlx-ir = { package = "mahbot-rlx-ir", path = "../../core/rlx-ir", version = "0.2.18-mahbot.2", default-features = false }
+rlx-ir = { package = "mahbot-rlx-ir", path = "../../core/rlx-ir", version = "0.2.18-mahbot.3", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
