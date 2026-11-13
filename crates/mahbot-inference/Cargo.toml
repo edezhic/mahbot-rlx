@@ -70,8 +70,8 @@ rand = "0.9"
 # The voice-activity detector: the wake gate, the speech-hours denominator and
 # the transcription path's segmentation (`vad`).
 earshot = "1.2"
-# The f16 image of a packed weight (`Store::F16Linear`): one rounding per value,
-# written as little-endian bits for `set_param_typed(..., DType::F16)`.
+# The f16 image of a `Store::F16Linear` weight: one rounding per value, written as
+# little-endian bits for `set_param_typed(..., DType::F16)`.
 half = "2"
 
 [lints]

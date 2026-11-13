@@ -14,10 +14,11 @@
 //!   `FlowCtx::linear` emits a fused `DequantMatMul`;
 //! * **host** tensors (`Store::HostDequant`, `Store::F16Widened`) — unpacked to
 //!   f32 on the host and multiplied as a plain `MatMul`;
-//! * **f16** linears (`Store::F16Linear`, see [`linear_encoder`]) — kept as f16
-//!   on the host and multiplied as a `MatMul` whose weight is an f16 `Param`, for
-//!   a file that is f16 end to end (`crate::ced`'s tagger). The packed route is
-//!   every other file's.
+//! * **f16** linears (`Store::F16Linear`) — a `MatMul` whose weight is an f16
+//!   `Param`, for the tagger's rank-2 `F16` matrices (`crate::ced`), which the
+//!   loader widens to f32, transposes and narrows back ([`Model::linear_f16`]):
+//!   the route buys a smaller typed image on the host, not a widening avoided.
+//!   The packed route is every other file's.
 //! * **packed row tables** ([`row_table`]) — a table the graph reads a few rows
 //!   at a time keeps the file's own Q8_0 bytes and the rows are gathered and
 //!   dequantised on device; any other scheme is widened to f32 and gathered.
@@ -38,7 +39,8 @@
 //! tensor of its own, so the build carries that slice. The host paths carry their bytes too:
 //! what `Store::HostDequant`/`Store::F16Widened` dequantised is kept in `Kept` and handed
 //! over as the build's own param, because a second layout reads it instead of the file, and
-//! an f16 linear's bytes ride in the build as they came.
+//! an f16 linear's bytes ride in the build too, as the loader narrowed them rather than as
+//! the file stores them ([`Model::linear_f16`]).
 //!
 //! The helpers below also carry the other decisions: 1-D convolutions go
 //! through 2-D with `[k, 1]` (never `[k, k]`, which silently takes the 2-D

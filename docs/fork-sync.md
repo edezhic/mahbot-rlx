@@ -243,7 +243,8 @@ merge action.
 - the sampler's branchless candidate order and its single-pass retained-set assembly
 - the sixteen-window grouped encoder pass
 - capacity-bucketed body planes and plane seeding
-- f16 parameters for the tagger
+- the tagger's rank-2 `F16` matrices as f16 params — a host-image saving, not a
+  device-side one
 
 ## 7. Memory is not a currency for buying speed
 

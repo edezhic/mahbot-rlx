@@ -33,23 +33,36 @@
 //!   rows, so one compile serves every window; [`Tagger::probabilities`] refills
 //!   the input and reads the 527 columns back.
 //!
-//! Weights: the file is `F16` end to end, and the store rule keeps it that way —
-//! [`Store::F16Linear`] declares the 49 matrices as f16 params rather
-//! than widening them on the host, which is what every other graph in this crate
-//! does. What that route does *not* buy here is the cooperative f16 kernel: its
-//! tile wants whole 64-row output tiles, and a window is 252 tokens, so these
-//! multiplies are served by the f32 cooperative form over the f16 weight's f32
-//! image — a deviation from the rule that this model is f16 in compute as well as on
-//! disk, and one this file keeps deliberately rather than by omission: admitting the
-//! f16 tile means padding the token axis to 256, and four tokens of nothing inside
-//! the attention are a different model, not a faster one. Measured on an M3 Pro,
-//! one window costs **17.6 ms** the way it runs against **25.7 ms** with
-//! `RLX_WGPU_MATMUL_F32_ONLY=1` (every multiply on the portable tiled kernel) — and
-//! **14.9 ms** padded. The tagger is a few percent of a transcription pass, so the
-//! 2.7 ms a window would save is not worth an arithmetic the file did not describe.
-//! The graph is compiled with the weight-concat fusion off, which is what keeps an
-//! f16 `Concat` out of it: that node would make the runtime promote the whole graph
-//! to f32 arithmetic.
+//! Weights: 49 of the file's 160 tensors are rank-2 `F16` matrices; the other 111
+//! are `F32` — among them the norms' weights and biases, the attention and MLP
+//! biases, the two position tables, the front end's filterbank and window, the
+//! batch-norm statistics and the patch projection, which alone is nearly half of the
+//! file's f32 bytes. [`Store::F16Linear`] declares those 49 as f16 params — the
+//! only plan in this crate that does. It does not avoid a widening: each matrix is
+//! widened to f32, transposed into `MatMul`'s layout and narrowed back, and the
+//! session widens those bytes again into the f32 arena. What it buys is the size of
+//! the typed image the build hands the session — [`Model::linear_f16`] states it.
+//!
+//! Which kernel serves a multiply is the adapter's answer as much as the shape's.
+//! The cooperative f16 multiply wants whole 64-row output tiles, whole 64-column
+//! tiles and 32-deep K stages, and this device has that kernel — a window is 252
+//! tokens, which is not a multiple of 64 on any device, so these multiplies are
+//! refused there. The blocks' projections run on the f32 cooperative form over the
+//! weight's f32 arena image on this machine, and on the plain tiled kernel wherever
+//! that form is not admitted. The 527-wide head is one row by 527 columns — it
+//! misses the tile's 64-row term and its 64-column term both, so padding the rows
+//! would not admit it — and is served by the plain tiled path, at one row by that
+//! path's vector-matrix arm.
+//!
+//! Admitting the f16 tile would mean padding the token axis to 256, and four
+//! tokens of nothing inside the attention are a different model, not a faster one —
+//! not worth an arithmetic the file did not describe, and there is no padded variant
+//! in the tree to re-measure one with. Measured on an M3 Pro, one window costs
+//! **17.6 ms** the way it runs against **25.7 ms** with `RLX_WGPU_MATMUL_F32_ONLY=1`
+//! (every multiply on the portable tiled kernel). The tagger is a few percent of a
+//! transcription pass. The graph is compiled with the weight-concat fusion off,
+//! which is what keeps an f16 `Concat` out of it: that node would make the runtime
+//! promote the whole graph to f32 arithmetic.
 //!
 //! What this module does **not** establish: that its numbers are the reference
 //! model's. There is no golden fixture for CED here; what `tests/ced_tagger.rs`
@@ -438,9 +451,13 @@ fn position_table(model: &Model, c: &CedConfig) -> Result<Vec<f32>> {
 ///
 /// It is not [`emit::linear_encoder`]: that entry refuses a row count the
 /// cooperative f16 tile does not admit, and a tagger window is 252 tokens, which
-/// is not a multiple of 64. The multiply is still correct on every device — it
-/// lands on the f32 cooperative form over the f16 weight's f32 image — and
-/// refusing it would leave this graph with no route at all.
+/// is not a multiple of 64 — the refusal is the row count's, on every device, not a
+/// device-family limit. Refusing here would leave this graph with no route at all,
+/// so each multiply keeps whatever arm its own geometry and the device admit: the f32
+/// cooperative form over the weight's f32 arena image where it is admitted, the plain
+/// tiled kernel where it is not. The 527-wide head is one row by 527 columns, so it
+/// misses the tile's row term and its column term both, and is on the plain tiled
+/// path — at one row, on that path's vector-matrix arm.
 fn ced_linear(
     ctx: &mut FlowCtx<'_>,
     model: &Model,
@@ -594,7 +611,7 @@ impl LayerStage for TaggerStage {
 ///
 /// The model file is dropped once the graph is compiled and its tables are on the
 /// host — the weights live on the device from then on, and keeping the mapping
-/// would keep 43 MiB of pages resident for nothing.
+/// would keep 41.7 MiB of pages resident for nothing.
 pub struct Tagger {
     config: CedConfig,
     labels: Vec<String>,

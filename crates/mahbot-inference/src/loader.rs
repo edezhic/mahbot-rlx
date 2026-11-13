@@ -79,10 +79,11 @@ pub enum Store {
     /// `MatMul` — the path the sound stage's non-linear tensors take. A table
     /// read by row is served by [`row_route`] whatever this tag says.
     HostDequant,
-    /// Quantized, unpacked to **f16** on the host and multiplied as a plain
-    /// `MatMul` whose weight is an f16 `Param` — the tagger's route for its
-    /// rank-2 F16 matrices. The file's bytes are read once and never
-    /// re-quantised; the packed path stays the default and the fallback.
+    /// F16 in the file, widened to f32, transposed into `MatMul`'s layout and
+    /// narrowed back to f16 on the host ([`Model::linear_f16`]), and multiplied
+    /// as a plain `MatMul` whose weight is an f16 `Param` — the tagger's route
+    /// for its rank-2 F16 matrices. The packed path stays the default and the
+    /// fallback.
     F16Linear,
 }
 
@@ -576,12 +577,14 @@ impl Model {
     ///
     /// The store rule here is the tagger's own: a **rank-2 F16** tensor is kept
     /// as f16 (`Store::F16Linear`), everything F32 stays as the file's bytes, and
-    /// any other F16 goes to the host as f32. This file is f16 end to end — its
-    /// 49 weight matrices are `F16` in the file — which is why the rule exists at
-    /// all: under [`Model::open`]'s rule every one of them would be widened.
-    /// Which bytes a multiply then reads — the f16 halves or their f32 image —
-    /// is the backend's decision per shape; [`crate::ced`] records which of the
-    /// two this tagger's geometry lands on.
+    /// any other F16 goes to the host as f32. The file's rank-2 matrices are `F16`
+    /// and its other tensors are `F32`, which is why the rule exists at all: under
+    /// [`Model::open`]'s rule every one of those matrices would be widened to f32
+    /// and kept that way. What the f16 tag buys is a smaller typed image on the
+    /// host ([`Model::linear_f16`]); the session widens those bytes into the f32
+    /// arena either way, and which kernel multiplies them is the backend's per-shape
+    /// and per-device choice — [`crate::ced`] records the arm this tagger's geometry
+    /// lands on.
     pub fn open_ced(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = GgufFile::from_path_mmap(&path)
@@ -880,13 +883,14 @@ impl Model {
     /// [`Store::F16Linear`] hands the session through
     /// `set_param_typed(name, bytes, DType::F16)`.
     ///
-    /// The dequant is [`linear_f32`](Self::linear_f32)'s, the one the loaders
-    /// already share (`rlx_gguf`'s per-scheme decode), and the narrowing is one
-    /// round per element: f16 carries 11 bits of mantissa against Q8_0's 8 and
-    /// a per-value exponent against Q8_0's per-32 block scale, so this is a
-    /// widening of the file's own precision, not a second quantisation. Peak
-    /// host cost is one weight's f32 image plus its f16 image — 4 B + 2 B per
-    /// element, the largest here being a 1 536 × 384 MLP projection.
+    /// The widening is [`linear_f32`](Self::linear_f32)'s, the one the loaders
+    /// already share (`rlx_gguf`'s per-scheme decode), so each matrix is widened to
+    /// f32, transposed and narrowed back — and that round is exact, every value it
+    /// narrows having come out of an f16 to begin with. What the route changes is
+    /// the size of the image the build carries: the tagger's 49 matrices are
+    /// 40.9 MiB as f16 against 81.8 MiB as f32. That is an image size, not a process
+    /// peak — the f32 images are made one matrix at a time and dropped, while the f16
+    /// images accumulate until the session has bound them, and they are released then.
     pub fn linear_f16(&self, name: &str) -> Result<(Vec<u8>, usize, usize)> {
         let (vals, k, n) = self.linear_f32(name)?;
         let mut bytes = Vec::with_capacity(vals.len() * 2);
