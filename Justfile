@@ -1437,14 +1437,18 @@ mahbot-transcription-corpus *ARGS:
 lint-mahbot:
     cargo clippy -p mahbot-inference --features bench,hand-run --all-targets -- -D warnings
 
-# The product checks the stand never runs: every one is `#[ignore]`d, so no
-# routine command reaches them. A check whose input is absent prints why and
-# returns, so this is safe on a machine with no installed tree.
+# The model-gated targets nothing routine reaches: the product checks the stand
+# never runs and the synthesis census whose arms assert the predictor frame's
+# schedule. Every test is `#[ignore]`d, and one whose input is absent prints why
+# and returns, so this is safe on a machine with no installed tree.
+# `--no-fail-fast` because the census must run even when a check is red.
 #
-# Deliberately not in `ci` or `ci-workspace`: a product check is a claim about
-# behaviour, and one of them (`a_paste_onset_lands_within_one_detector_hop`) is a
-# known-stale expectation the cut policy superseded — a gate that is red by
+# Deliberately not in `ci` or `ci-workspace`: neither target can be a gate — both
+# need the installed tree and a wgpu adapter, and a product check is a claim about
+# behaviour, one of them (`a_paste_onset_lands_within_one_detector_hop`) a
+# known-stale expectation the cut policy superseded. A gate that is red by
 # construction teaches the operator to skip the gate. A sync runs this by hand
 # (`docs/fork-sync.md` §10) and reads what it says.
 test-product-checks:
-    cargo test --release -p mahbot-inference --features hand-run --test product_checks -- --ignored --nocapture
+    cargo test --release -p mahbot-inference --features hand-run --no-fail-fast \
+        --test product_checks --test multiply_census -- --ignored --nocapture

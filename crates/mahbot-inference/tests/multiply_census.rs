@@ -3,24 +3,26 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Measurement only and `#[ignore]`d: the synthesis loop's per-shape rate census.
-//! Needs the installed model directory; without it prints why and returns. Run with
+//! Needs the installed model directory and a wgpu adapter; without either it prints
+//! that it measured nothing and returns. Run with
 //! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --features
-//! hand-run --test multiply_census -- --ignored --nocapture`.
+//! hand-run --test multiply_census -- --ignored --nocapture`, or as one of the two
+//! targets `just test-product-checks` runs.
 //! `frame_share_ms` is each family's bytes at the frame's own measured aggregate
 //! rate — a per-side constant, so within a side ordering by it is ordering by
 //! bytes. A packed multiply's own in-frame time is not attributable: it dispatches
 //! inside a pass the frame's other steps share, so the run report prices the pass.
 //!
 //! **What it does.** It compiles the shipped predictor frame, then stands one
-//! subject down at a time — each non-multiply kind, the packed multiply's two
-//! encode-time arms, and the gather index-add fold — and pairs every arm against the
-//! shipped frame. Three things make an arm a price rather than a print: its schedule
-//! census is **asserted** against the shipped one (equal for an encode-time arm,
-//! moved for every other), its outputs are checked against the shipped frame's on
-//! the same inputs, and its delta comes from paired rounds with the arm that runs
-//! second alternating. A frame's milliseconds, its `loop_ms` over the cell's frames
-//! and `wins` (the rounds the stood-down arm was faster) are what it prints, and
-//! the file states no price of its own.
+//! subject down at a time — each non-multiply kind and the packed multiply's two
+//! encode-time arms — and pairs every arm against the shipped frame. Three things
+//! make an arm a price rather than a print: its schedule census is **asserted**
+//! against the shipped one (equal for an encode-time arm, moved for every other),
+//! its outputs are checked against the shipped frame's on the same inputs, and its
+//! delta comes from paired rounds with the arm that runs second alternating. A
+//! frame's milliseconds, its `loop_ms` over the cell's frames and `wins` (the
+//! rounds the stood-down arm was faster) are what it prints, and the file states no
+//! price of its own.
 //!
 //! **The reconciliation.** `census reconcile` puts the measured frame against the
 //! sums the harness already prints — the multiply stream at the shapes' marginal
@@ -33,10 +35,9 @@
 //! not priced. What each kind's arm does to the graph is in the arms table below.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
 
 use mahbot_inference::graphs;
-use mahbot_inference::loader::{self, Pair, Role};
+use mahbot_inference::loader::Role;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{Graph, NodeId, Op, Tick};
 use rlx_runtime::Device;
@@ -67,23 +68,6 @@ const FRAME_ROUNDS: usize = 5;
 /// this many paired differences either separates a 0.1-0.5 ms effect or bounds
 /// it, and the win count is the sign test that says which.
 const PAIR_ROUNDS: usize = 25;
-
-fn pair(role: Role) -> Option<Arc<Pair>> {
-    let Ok(dir) = loader::models_dir() else {
-        eprintln!("skip: the model directory is not installed — the census needs a model");
-        return None;
-    };
-    match Pair::of_role(role) {
-        Ok(pair) => Some(Arc::new(pair)),
-        Err(err) => {
-            eprintln!(
-                "skip: {} names no pair for this role ({err}) — the census did not run",
-                dir.display()
-            );
-            None
-        }
-    }
-}
 
 /// The tensor a weight site belongs to: `q`'s marker off, then the stacked
 /// tensor's step, then the block index — `a.gen.code.blk.3.gate_up.fused\0q`
@@ -485,10 +469,11 @@ fn side_rows(
 fn the_synthesis_loops_per_shape_rate_census_with_models() {
     // The report's own passes perturb the frame time this census measures.
     support::assert_run_report_off();
-    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
-        return;
-    }
-    let Some(pair) = pair(Role::Synthesis) else {
+    // No adapter or no installed pair is a skip, and this test still reports `ok`:
+    // the line says so, so a pass is not read as a measurement. `pair_of` prints the
+    // reason — the adapter, or the path that is not there.
+    let Some(pair) = support::pair_of(Role::Synthesis) else {
+        println!("census skipped measured=nothing");
         return;
     };
     let ceiling = rlx_wgpu::bandwidth::stream_ceiling().expect("the stream probe runs");
@@ -562,9 +547,6 @@ fn the_synthesis_loops_per_shape_rate_census_with_models() {
     // checked against the shipped frame's on the same inputs. The arms, in table
     // order, and what each stands down:
     //
-    //   gather_index_bias  the gather index-add fold — the one arm a lowering
-    //                      fusion makes, so its stand-down *adds* the fold's step
-    //                      back rather than removing one
     //   residual_ln_tee    `fused_residual_ln_tee` -> a binary add and a
     //                      `layer_norm` each
     //   norm_rope          `norm_rope` -> a norm and a `rope` each
@@ -579,6 +561,13 @@ fn the_synthesis_loops_per_shape_rate_census_with_models() {
     //                      read when the pass is encoded
     //   multiply_inplace   the packed multiply's in-place store, stood down to
     //                      the pooled slab and its copy
+    //
+    // The gather index-add fold is not an arm any more: the predictor's row tables
+    // are served as one `mahbot.gather_packed` dispatch per level with the level's
+    // offset in the op's attributes (`emit::gather_rows`, since the packed
+    // row-table route), so the frame carries no `Gather(Add(idx, c))` and
+    // `RLX_WGPU_NO_GATHER_INDEX_BIAS` moves nothing here. The fold itself is still
+    // pinned by `rlx-wgpu/tests/gather_index_bias.rs`.
     //
     // The sampler is not an arm: `Argmax` is the same dispatch count as `Sample`,
     // so its stand-down would price a kernel rather than a dispatch, and a greedy
@@ -596,12 +585,7 @@ fn the_synthesis_loops_per_shape_rate_census_with_models() {
     // lowering: they change what the frame dispatches, not the schedule it
     // compiled, so the census must be the shipped one.
     const ENCODE_TIME_ARMS: [&str; 2] = ["multiply_setup", "multiply_inplace"];
-    let arms: [(&str, &[(&str, &str)], bool); 9] = [
-        (
-            "gather_index_bias",
-            &[("RLX_WGPU_NO_GATHER_INDEX_BIAS", "1")],
-            true,
-        ),
+    let arms: [(&str, &[(&str, &str)], bool); 8] = [
         ("residual_ln_tee", &[("RLX_WGPU_NO_LN_TEE", "1")], true),
         ("norm_rope", &[("RLX_WGPU_NO_NORM_ROPE", "1")], true),
         ("gated_product", &[("RLX_WGPU_NO_FUSED_SWIGLU", "1")], true),
