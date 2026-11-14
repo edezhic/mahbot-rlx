@@ -749,8 +749,9 @@ impl Model {
     /// 1484.9), every round negative against a 36.2 ms round spread; the 353 MiB encoder
     /// upload is unchanged (55.7 → 56.5 ms), the warm rows are unchanged (1068.8 → 1068.4 ms)
     /// and the row's total peak footprint falls by 252.5 MiB (2755.4 → 2502.9). The TTS
-    /// body's 811.9 MiB prompt upload — the other removed scratch's graph — reads 143.3 ms
-    /// (5.94 GB/s) with the checkpoint in the page cache and 404.5 ms (2.10 GB/s) cold.
+    /// prefill — the other removed scratch's graph — is these windows beside 0.47 MiB of f32
+    /// parameters, and before `request_readahead` below those windows were faulted one page at a
+    /// time: its doc carries what that cost and what the request takes it to.
     pub fn with_mapped<R>(&self, name: &str, write: impl FnOnce(&[u8]) -> R) -> Result<R> {
         let t = self
             .file
@@ -791,6 +792,7 @@ impl Model {
                 .map(file)
         }
         .with_context(|| format!("mapping `{name}` out of {}", self.path.display()))?;
+        request_readahead(file, start, nbytes);
         Ok(write(&window[..]))
     }
 
@@ -900,6 +902,76 @@ impl Model {
         Ok((bytes, k, n))
     }
 }
+
+/// Ask the kernel to start filling the page cache for `[start, start + len)` of `file`,
+/// asynchronously and without copying anything into this process.
+///
+/// A window of a cold file is faulted one 16 KiB page at a time with no readahead, so
+/// [`Model::with_mapped`]'s TTS prefill windows — the 197 packed tensors the graph binds, 811.5
+/// MiB — read in 952–1,002 ms cold (0.85–0.89 GB/s) and in 224–232 ms with the request issued
+/// before each one (3.66–3.78 GB/s). The same tensors' upload through `graphs::Compiled` falls
+/// with it from 1,048 ms with the request taken out (0.81 GB/s) to 242–267 ms, and to 139–156 ms
+/// once the file is resident. It adds no resident memory: the pages it asks for are clean
+/// file-backed pages, which the footprint accounting excludes, and no byte of them enters this
+/// process through it.
+///
+/// The figures are this platform's, taken on an M3 Pro at one-minute load 2.2–8 with residency
+/// asserted at zero over the exact extents immediately before each arm — the request is worth
+/// nothing on a resident file, and the arms mean nothing without the invalidation
+/// (`tests/cold_read.rs` carries the method). Every one of them moves with the load, which the
+/// harness prints beside each take. The warm path pays for it: the prefill's windows read
+/// 1.0–2.0 ms slower with the request, a few per cent of a resident read and well inside the
+/// harness's 10 % bound.
+///
+/// Best-effort by construction: a refusal, an interrupted call or an extent the request
+/// cannot express leaves the read exactly as it was.
+#[cfg(target_os = "macos")]
+fn request_readahead(file: &File, start: u64, len: usize) {
+    use std::os::fd::AsRawFd;
+
+    // `ra_offset` is an `off_t` and `ra_count` an `int`, so an extent the request cannot
+    // express is not requested at all (the largest tensor in this tree is 243.4 MiB).
+    let (Ok(ra_offset), Ok(ra_count)) = (libc::off_t::try_from(start), libc::c_int::try_from(len))
+    else {
+        return;
+    };
+    let advice = libc::radvisory {
+        ra_offset,
+        ra_count,
+    };
+    // SAFETY: an advisory request against a live descriptor this model opened read-only; the
+    // kernel reads the struct and touches nothing of this process's memory.
+    unsafe {
+        libc::fcntl(
+            file.as_raw_fd(),
+            libc::F_RDADVISE,
+            &advice as *const libc::radvisory,
+        )
+    };
+}
+
+/// The Linux arm: `POSIX_FADV_WILLNEED` is the same kind of request — a read into the page
+/// cache, started before the pages are asked for and never copied to user space — though the
+/// kernel reads only as much of it as its own readahead window allows.
+#[cfg(target_os = "linux")]
+fn request_readahead(file: &File, start: u64, len: usize) {
+    use std::os::fd::AsRawFd;
+
+    let (Ok(offset), Ok(len)) = (libc::off_t::try_from(start), libc::off_t::try_from(len)) else {
+        return;
+    };
+    // SAFETY: an advisory request against a live read-only descriptor; it answers its own
+    // error rather than failing the read.
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED);
+    }
+}
+
+/// No request on the remaining platforms: Windows' `PrefetchVirtualMemory` takes mapped
+/// addresses and would fault the pages into this process's own resident set, which is the one
+/// thing this request must not do.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn request_readahead(_file: &File, _start: u64, _len: usize) {}
 
 /// Merge the `{arch}.*` metadata into a typed config.
 fn merge_config(file: &GgufFile, arch: &str) -> Result<Config> {

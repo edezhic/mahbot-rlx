@@ -2843,6 +2843,7 @@ dependencies = [
  "anyhow",
  "earshot",
  "half",
+ "libc",
  "mahbot-rlx-flow",
  "mahbot-rlx-gguf",
  "mahbot-rlx-ir",

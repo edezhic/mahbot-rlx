@@ -2861,17 +2861,18 @@ pub struct Runner {
 /// bytes' source moves. `skipped` is the per-rung re-upload skip: a second layout of one body
 /// asks for parameters an earlier compile placed, and the bytes it wants are already there,
 /// so they are neither read nor written.
+#[doc(hidden)]
 #[derive(Clone, Copy)]
-pub(crate) struct Upload {
-    pub(crate) ms: f64,
-    pub(crate) bytes: u64,
-    pub(crate) skipped: u64,
+pub struct Upload {
+    pub ms: f64,
+    pub bytes: u64,
+    pub skipped: u64,
 }
 
 impl Upload {
     /// The copy's rate in GB/s, or 0 for an upload that wrote nothing.
     #[must_use]
-    pub(crate) fn gb_per_s(self) -> f64 {
+    pub fn gb_per_s(self) -> f64 {
         if self.ms <= 0.0 {
             return 0.0;
         }
@@ -3264,8 +3265,9 @@ impl Compiled {
 
     /// What this graph's parameter upload cost — the copy's share of the compile
     /// bracket, and its rate.
+    #[doc(hidden)]
     #[must_use]
-    pub(crate) fn upload(&self) -> Upload {
+    pub fn upload(&self) -> Upload {
         self.runner.upload
     }
 

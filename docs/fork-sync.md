@@ -99,7 +99,7 @@ Two things that whole-set run does not cover by itself. `test-workspace` is
 a target behind `required-features = "backend-tests"` is still skipped — the wgpu
 integration suite among them. `test-gpu` is what builds those, which is why
 `ci-workspace` names it. `test-workspace` names one feature itself —
-`--features mahbot-inference/hand-run` — because that crate's twelve hand-run
+`--features mahbot-inference/hand-run` — because that crate's thirteen hand-run
 targets were part of the whole-set run before they were gated (its manifest says
 why), and a whole-set run that stopped reaching them would lose coverage without
 saying so.
@@ -253,6 +253,11 @@ merge action.
 - capacity-bucketed body planes and plane seeding
 - the tagger's rank-2 `F16` matrices as f16 params — a host-image saving, not a
   device-side one
+- the readahead request `Model::with_mapped` issues before each window's bytes are read
+  (`F_RDADVISE` on macOS, `POSIX_FADV_WILLNEED` on Linux, a documented no-op elsewhere):
+  it is what keeps a cold upload's file read off the page-fault path, and losing it costs
+  roughly three quarters of a second on a cold prefill read and about as much again on its
+  upload, with no compile error (`loader.rs`, `tests/cold_read.rs`)
 
 ## 7. Memory is not a currency for buying speed
 
