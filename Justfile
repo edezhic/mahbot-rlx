@@ -800,17 +800,17 @@ test-libm-vs-musl:
 # (`tests/glibc_2_43_vectors.rs`) cover every exported function on both
 # x86-64 and aarch64 glibc and fail on an export without vectors.
 test-libm: test-libm-vs-musl
-    cargo test --release -p rlx-libm
-    cargo test --release -p rlx-libm --no-default-features
-    cargo test --release -p rlx-libm --features export-glibc
-    cargo test --release -p rlx-libm --features libm,export-glibc
+    cargo test --release -p mahbot-rlx-libm
+    cargo test --release -p mahbot-rlx-libm --no-default-features
+    cargo test --release -p mahbot-rlx-libm --features export-glibc
+    cargo test --release -p mahbot-rlx-libm --features libm,export-glibc
     cargo test --release -p libm
 
 # Every one-argument f32 port on all 2^32 inputs against the stored glibc
 # hashes (x86-64 and aarch64), on any OS; minutes on every core. Regenerate
 # the hashes on Linux with `tools/glibc-exhaustive` (it lists mismatches).
 test-libm-exhaustive:
-    cargo test --release -p rlx-libm --test f32_exhaustive -- --ignored --test-threads=1 --nocapture
+    cargo test --release -p mahbot-rlx-libm --test f32_exhaustive -- --ignored --test-threads=1 --nocapture
 
 # rlx-fpga once claimed `no_std` while depending on std-only rlx-ir, and no
 # gate built it that way, so nothing noticed (GitHub issue #7).

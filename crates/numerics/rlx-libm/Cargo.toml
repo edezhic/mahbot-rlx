@@ -1,6 +1,6 @@
 [package]
-name = "rlx-libm"
-version.workspace      = true
+name = "mahbot-rlx-libm"
+version                = "0.2.18-mahbot.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "glibc 2.43's libm (x86_64 FMA variants) reproduced bit-for-bit in pure Rust: exp, log, pow, trig, inverse trig, hyperbolic, erf, gamma, f32 and f64"
@@ -8,8 +8,8 @@ authors.workspace      = true
 license.workspace      = true
 keywords = ["libm", "glibc", "math", "parity"]
 categories = ["science", "mathematics"]
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-libm"
 
 [lib]
 name = "rlx_libm"

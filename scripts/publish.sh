@@ -157,6 +157,11 @@ STAGE_DIR=""             # `--stage [DIR]`; empty means the default below
 # gate compares the two lists, so a crate dropped from `TIERS` fails here instead
 # of silently shrinking the set a run would publish.
 SCOPE=(
+    mahbot-rlx-libm
+    mahbot-rlx-fastmath
+    mahbot-rlx-search
+    mahbot-rlx-linux-ref
+    mahbot-rlx-pocketfft
     mahbot-rlx-ir
     mahbot-rlxsl
     mahbot-rlx-gguf
@@ -197,15 +202,19 @@ FORK_VERSION="$(python3 "$(dirname "$0")/fork-rename.py" --print-version)"
 # must follow everything it names; path-only dev-deps (no `version =`) are
 # stripped from the packaged manifest and impose no order.
 #
-# Leaves first: ir, rlxsl (its build-dep), the weight-format readers, the
-# dependency-free dispatch table and proc macros.
+# Leaves first: the numerics crates, ir, rlxsl (its build-dep), the
+# weight-format readers, the dependency-free dispatch table and proc macros.
+#   - rlx-libm precedes rlx-ir (its float math) and rlx-linux-ref, which
+#     precedes rlx-pocketfft (its x87 `long double`); pocketfft precedes
+#     rlx-fusion. rlx-fastmath (rlx-cpu) and rlx-search (rlx-runtime) land in
+#     later tiers, so they constrain nothing inside tier 0.
 #   - rlx-unfuse / rlx-flow / rlx-fusion / rlx-driver / rlx-mlx-io sit on rlx-ir.
 #   - rlx-autodiff (rlx-ir + rlx-fusion) and rlx-pkg (ir + the weight readers).
 #   - rlx-compile (ir + fusion + optional autodiff), then rlx-opt (compile).
 #   - rlx-cpu and rlx-gpu-host precede rlx-wgpu, which takes both; rlxsl is its
 #     build-dependency and rides tier 0.
 #   - rlx-runtime names every in-scope crate above it (ir, driver, opt, macros,
-#     compile, gguf, gpu-dispatch, cpu, wgpu, pkg, mlx-io, dduf) and its
+#     compile, gguf, gpu-dispatch, cpu, wgpu, pkg, mlx-io, dduf, search) and its
 #     versioned dev-deps (autodiff, flow, fusion, rlxsl, compile).
 #   - mahbot-inference names rlx-flow, rlx-gguf, rlx-ir, rlx-runtime and
 #     rlx-wgpu: the product path, last.
@@ -214,7 +223,7 @@ FORK_VERSION="$(python3 "$(dirname "$0")/fork-rename.py" --print-version)"
 # mahbot-rlx-runtime's optional backends still resolve upstream, which
 # `validate_scope` reports and docs/fork-publishing.md states.
 TIERS=(
-    "mahbot-rlx-ir mahbot-rlxsl mahbot-rlx-gguf mahbot-rlx-torch-ckpt mahbot-rlx-nemo mahbot-rlx-gpu-dispatch mahbot-rlx-macros mahbot-rlx-dduf"
+    "mahbot-rlx-libm mahbot-rlx-fastmath mahbot-rlx-search mahbot-rlx-linux-ref mahbot-rlx-pocketfft mahbot-rlx-ir mahbot-rlxsl mahbot-rlx-gguf mahbot-rlx-torch-ckpt mahbot-rlx-nemo mahbot-rlx-gpu-dispatch mahbot-rlx-macros mahbot-rlx-dduf"
     "mahbot-rlx-unfuse mahbot-rlx-flow mahbot-rlx-fusion mahbot-rlx-driver mahbot-rlx-mlx-io"
     "mahbot-rlx-autodiff mahbot-rlx-pkg"
     "mahbot-rlx-compile"

@@ -340,7 +340,7 @@ categories    = ["science", "algorithms", "compilers"]
 # Internal crates — one source of truth for path + version. Members
 # reference these via `{ workspace = true, .. }` (features/optional per-use).
 #
-# The 22 crates the fork's product paths use are published under `mahbot-`
+# The 27 crates the fork's product paths use are published under `mahbot-`
 # names at the fork version `0.2.18-mahbot.3`; each pins that version itself,
 # and everything else keeps upstream's identity. A renamed entry keeps its
 # upstream key — `rlx-ir` below is the `mahbot-rlx-ir` package — so dependency
@@ -386,13 +386,13 @@ rlx-rng = { path = "crates/numerics/rlx-rng", version = "0.2.20" }
 rlx-numpy = { path = "crates/numerics/rlx-numpy", version = "0.2.20" }
 rlx-special = { path = "crates/numerics/rlx-special", version = "0.2.20" }
 rlx-nnpack = { path = "crates/numerics/rlx-nnpack", version = "0.2.20" }
-rlx-pocketfft = { path = "crates/numerics/rlx-pocketfft", version = "0.2.20" }
-rlx-libm = { path = "crates/numerics/rlx-libm", version = "0.2.20" }
-rlx-fastmath = { path = "crates/numerics/rlx-fastmath", version = "0.2.20" }
+rlx-pocketfft = { package = "mahbot-rlx-pocketfft", path = "crates/numerics/rlx-pocketfft", version = "0.2.18-mahbot.3" }
+rlx-libm = { package = "mahbot-rlx-libm", path = "crates/numerics/rlx-libm", version = "0.2.18-mahbot.3" }
+rlx-fastmath = { package = "mahbot-rlx-fastmath", path = "crates/numerics/rlx-fastmath", version = "0.2.18-mahbot.3" }
 rlx-spectral = { path = "crates/numerics/rlx-spectral", version = "0.2.20" }
-rlx-linux-ref = { path = "crates/numerics/rlx-linux-ref", version = "0.2.20" }
+rlx-linux-ref = { package = "mahbot-rlx-linux-ref", path = "crates/numerics/rlx-linux-ref", version = "0.2.18-mahbot.3" }
 rlx-signal = { path = "crates/numerics/rlx-signal", version = "0.2.20" }
-rlx-search = { path = "crates/numerics/rlx-search", version = "0.2.20" }
+rlx-search = { package = "mahbot-rlx-search", path = "crates/numerics/rlx-search", version = "0.2.18-mahbot.3" }
 rlx-macros = { package = "mahbot-rlx-macros", path = "crates/core/rlx-macros", version = "0.2.18-mahbot.3" }
 rlx-metal = { path = "crates/backends/rlx-metal", version = "0.2.20" }
 rlx-mlx = { path = "crates/backends/rlx-mlx", version = "0.2.20" }

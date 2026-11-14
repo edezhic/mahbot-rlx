@@ -7,7 +7,7 @@ itself is described at the end.
 
 ## The set
 
-Twenty-two crates, each at the fork version (a prerelease: a version that
+Twenty-seven crates, each at the fork version (a prerelease: a version that
 differs from upstream's only in build metadata is rejected by the registry).
 The number lives in one place, `FORK_VERSION` in
 [`scripts/fork-rename.py`](../scripts/fork-rename.py) — the release process
@@ -39,6 +39,11 @@ bumps it there, re-runs the script to stamp every manifest, and
 | `mahbot-rlx-dduf` | `crates/io/rlx-dduf` |
 | `mahbot-rlx-torch-ckpt` | `crates/io/rlx-torch-ckpt` |
 | `mahbot-rlxsl` | `crates/tooling/rlxsl` |
+| `mahbot-rlx-libm` | `crates/numerics/rlx-libm` |
+| `mahbot-rlx-fastmath` | `crates/numerics/rlx-fastmath` |
+| `mahbot-rlx-search` | `crates/numerics/rlx-search` |
+| `mahbot-rlx-linux-ref` | `crates/numerics/rlx-linux-ref` |
+| `mahbot-rlx-pocketfft` | `crates/numerics/rlx-pocketfft` |
 
 Every other package in the workspace keeps upstream's name and version and is
 not published from here.

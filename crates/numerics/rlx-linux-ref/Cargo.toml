@@ -1,6 +1,6 @@
 [package]
-name = "rlx-linux-ref"
-version.workspace      = true
+name = "mahbot-rlx-linux-ref"
+version                = "0.2.18-mahbot.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "NumPy/SciPy's Linux x86-64 reference numerics in pure Rust, bit for bit: OpenBLAS 0.3.30 Haswell kernels, its bundled reference LAPACK, x86-simd-sort AVX2 argsort, x87 extended arithmetic"
@@ -8,8 +8,8 @@ authors.workspace      = true
 license.workspace      = true
 keywords = ["openblas", "lapack", "numpy", "scipy", "parity"]
 categories = ["science", "mathematics"]
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-linux-ref"
 
 [lib]
 name = "rlx_linux_ref"

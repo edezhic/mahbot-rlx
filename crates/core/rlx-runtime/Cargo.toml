@@ -301,7 +301,7 @@ serde_json = "1"
 
 [dev-dependencies]
 # `fft_algo`: the reference the CPU pocketfft path must reproduce bit for bit.
-rlx-pocketfft = { workspace = true }
+rlx-pocketfft = { package = "mahbot-rlx-pocketfft", path = "../../numerics/rlx-pocketfft" }
 rlx-autodiff = { workspace = true }
 rlx-fusion = { workspace = true }
 # Warm-tier kernel codegen manifest — the `kernel_dsl_matches_cpu_oracle` test

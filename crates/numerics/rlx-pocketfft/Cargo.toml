@@ -1,6 +1,6 @@
 [package]
-name = "rlx-pocketfft"
-version.workspace      = true
+name = "mahbot-rlx-pocketfft"
+version                = "0.2.18-mahbot.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "scipy.fft (pocketfft) reproduced bit-for-bit in pure Rust, with selectable FMA contraction and twiddle rounding"
@@ -9,8 +9,8 @@ license.workspace      = true
 keywords = ["scipy", "fft", "pocketfft", "parity"]
 categories = ["science", "mathematics"]
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-pocketfft"
 
 [lib]
 name = "rlx_pocketfft"

@@ -5,7 +5,7 @@
 //! With `export-glibc`, std's float methods in the binary are rlx-libm's Rust
 //! ports, not the platform's C libm: every method that lowers to a libcall
 //! (`f64::sin`, `%`, …) gives the port's bits. Run with
-//! `cargo test -p rlx-libm --features export-glibc --test export_glibc`.
+//! `cargo test -p mahbot-rlx-libm --features export-glibc --test export_glibc`.
 #![cfg(feature = "export-glibc")]
 
 use std::hint::black_box as bb;

@@ -12,7 +12,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-rlx-libm = { path = "../.." }
+rlx-libm = { package = "mahbot-rlx-libm", path = "../.." }
 
 [profile.release]
 opt-level = 3

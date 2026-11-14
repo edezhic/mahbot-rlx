@@ -2732,7 +2732,7 @@ dependencies = [
 name = "libm"
 version = "0.2.17"
 dependencies = [
- "rlx-libm",
+ "mahbot-rlx-libm",
 ]
 
 [[package]]
@@ -2838,7 +2838,7 @@ checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
 name = "mahbot-inference"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "anyhow",
  "earshot",
@@ -2856,7 +2856,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-autodiff"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "half",
  "mahbot-rlx-fusion",
@@ -2867,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-compile"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "mahbot-rlx-autodiff",
  "mahbot-rlx-fusion",
@@ -2876,24 +2876,24 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-cpu"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "criterion",
  "gemm",
  "half",
  "libc",
+ "mahbot-rlx-fastmath",
  "mahbot-rlx-gguf",
  "mahbot-rlx-gpu-dispatch",
  "mahbot-rlx-ir",
+ "mahbot-rlx-libm",
+ "mahbot-rlx-linux-ref",
  "mahbot-rlx-mlx-io",
  "mahbot-rlx-opt",
+ "mahbot-rlx-pocketfft",
  "mahbot-rlx-unfuse",
  "mahbot-rlxsl",
  "rayon",
- "rlx-fastmath",
- "rlx-libm",
- "rlx-linux-ref",
- "rlx-pocketfft",
  "serde",
  "strum_macros",
  "toml 0.8.23",
@@ -2901,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-dduf"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-driver"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "futures-executor",
  "half",
@@ -2927,8 +2927,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mahbot-rlx-fastmath"
+version = "0.2.18-mahbot.3"
+
+[[package]]
 name = "mahbot-rlx-flow"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "anyhow",
  "half",
@@ -2944,17 +2948,17 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-fusion"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "mahbot-rlx-cpu",
  "mahbot-rlx-ir",
  "mahbot-rlx-opt",
- "rlx-pocketfft",
+ "mahbot-rlx-pocketfft",
 ]
 
 [[package]]
 name = "mahbot-rlx-gguf"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2968,11 +2972,11 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-gpu-dispatch"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 
 [[package]]
 name = "mahbot-rlx-gpu-host"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "bytemuck",
  "half",
@@ -2985,19 +2989,30 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-ir"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "aes 0.9.4",
  "bincode",
- "rlx-libm",
+ "mahbot-rlx-libm",
  "serde",
  "serde_json",
  "smallvec",
 ]
 
 [[package]]
+name = "mahbot-rlx-libm"
+version = "0.2.18-mahbot.3"
+
+[[package]]
+name = "mahbot-rlx-linux-ref"
+version = "0.2.18-mahbot.3"
+dependencies = [
+ "mahbot-rlx-libm",
+]
+
+[[package]]
 name = "mahbot-rlx-macros"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3006,7 +3021,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-mlx-io"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "anyhow",
  "half",
@@ -3025,7 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-nemo"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "anyhow",
  "mahbot-rlx-ir",
@@ -3036,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-opt"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "mahbot-rlx-autodiff",
  "mahbot-rlx-compile",
@@ -3046,7 +3061,7 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-pkg"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3075,8 +3090,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mahbot-rlx-pocketfft"
+version = "0.2.18-mahbot.3"
+dependencies = [
+ "mahbot-rlx-libm",
+ "mahbot-rlx-linux-ref",
+]
+
+[[package]]
 name = "mahbot-rlx-runtime"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "anyhow",
  "half",
@@ -3096,6 +3119,8 @@ dependencies = [
  "mahbot-rlx-mlx-io",
  "mahbot-rlx-opt",
  "mahbot-rlx-pkg",
+ "mahbot-rlx-pocketfft",
+ "mahbot-rlx-search",
  "mahbot-rlx-wgpu",
  "mahbot-rlxsl",
  "memmap2",
@@ -3110,11 +3135,9 @@ dependencies = [
  "rlx-mlx",
  "rlx-oneapi",
  "rlx-optim",
- "rlx-pocketfft",
  "rlx-program",
  "rlx-qnn",
  "rlx-rocm",
- "rlx-search",
  "rlx-sparse",
  "rlx-stablehlo",
  "rlx-tpu",
@@ -3131,8 +3154,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mahbot-rlx-search"
+version = "0.2.18-mahbot.3"
+
+[[package]]
 name = "mahbot-rlx-torch-ckpt"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "anyhow",
  "flate2",
@@ -3142,14 +3169,14 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-unfuse"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "mahbot-rlx-ir",
 ]
 
 [[package]]
 name = "mahbot-rlx-wgpu"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "bytemuck",
  "half",
@@ -3173,11 +3200,11 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlxsl"
-version = "0.2.18-mahbot.2"
+version = "0.2.18-mahbot.3"
 dependencies = [
  "mahbot-rlx-ir",
+ "mahbot-rlx-libm",
  "naga 29.0.4",
- "rlx-libm",
 ]
 
 [[package]]
@@ -5285,10 +5312,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlx-fastmath"
-version = "0.2.20"
-
-[[package]]
 name = "rlx-fdm"
 version = "0.2.20"
 dependencies = [
@@ -5407,10 +5430,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlx-libm"
-version = "0.2.20"
-
-[[package]]
 name = "rlx-linalg"
 version = "0.2.20"
 dependencies = [
@@ -5419,17 +5438,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlx-linux-ref"
-version = "0.2.20"
-dependencies = [
- "rlx-libm",
-]
-
-[[package]]
 name = "rlx-mcu"
 version = "0.2.20"
 dependencies = [
- "rlx-libm",
+ "mahbot-rlx-libm",
 ]
 
 [[package]]
@@ -5523,7 +5535,7 @@ dependencies = [
 name = "rlx-numpy"
 version = "0.2.20"
 dependencies = [
- "rlx-linux-ref",
+ "mahbot-rlx-linux-ref",
  "serde_json",
 ]
 
@@ -5627,14 +5639,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlx-pocketfft"
-version = "0.2.20"
-dependencies = [
- "rlx-libm",
- "rlx-linux-ref",
-]
-
-[[package]]
 name = "rlx-program"
 version = "0.2.20"
 dependencies = [
@@ -5668,7 +5672,7 @@ dependencies = [
 name = "rlx-rng"
 version = "0.2.20"
 dependencies = [
- "rlx-libm",
+ "mahbot-rlx-libm",
 ]
 
 [[package]]
@@ -5691,15 +5695,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "rlx-search"
-version = "0.2.20"
-
-[[package]]
 name = "rlx-signal"
 version = "0.2.20"
 dependencies = [
  "mahbot-rlx-cpu",
- "rlx-libm",
+ "mahbot-rlx-libm",
  "rlx-numpy",
 ]
 
@@ -5718,15 +5718,15 @@ dependencies = [
 name = "rlx-special"
 version = "0.2.20"
 dependencies = [
- "rlx-libm",
+ "mahbot-rlx-libm",
 ]
 
 [[package]]
 name = "rlx-spectral"
 version = "0.2.20"
 dependencies = [
- "rlx-fastmath",
- "rlx-libm",
+ "mahbot-rlx-fastmath",
+ "mahbot-rlx-libm",
  "rustfft",
 ]
 

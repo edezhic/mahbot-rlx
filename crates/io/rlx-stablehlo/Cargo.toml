@@ -25,9 +25,9 @@ prost = "0.13"
 # Back-edges to crates that publish later: PATH-ONLY (no `version`), so
 # `cargo publish -p rlx-stablehlo` does not resolve them against crates.io.
 [dev-dependencies]
-rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime", features = ["cpu"], version = "0.2.18-mahbot.3" }
+rlx-runtime = { package = "mahbot-rlx-runtime", path = "../../core/rlx-runtime", features = ["cpu"] }
 # Real block graphs (Llama, BERT) for the IREE round trip.
-rlx-flow = { package = "mahbot-rlx-flow", path = "../../core/rlx-flow", version = "0.2.18-mahbot.3" }
+rlx-flow = { package = "mahbot-rlx-flow", path = "../../core/rlx-flow" }
 
 [lints]
 workspace = true

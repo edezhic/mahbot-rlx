@@ -23,7 +23,7 @@ bincode = { version = "1", optional = true }
 aes = "0.9.1"
 # Float math `core` lacks (sqrt/sin/floor/…) for the `no_std` subset, in
 # Rust; under `std` the inherent methods are used. (`std` comes with `parity`.)
-rlx-libm = { path = "../../numerics/rlx-libm", version = "0.2.20", default-features = false }
+rlx-libm = { package = "mahbot-rlx-libm", path = "../../numerics/rlx-libm", version = "0.2.18-mahbot.3", default-features = false }
 
 [features]
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-ir --features backend-tests`.

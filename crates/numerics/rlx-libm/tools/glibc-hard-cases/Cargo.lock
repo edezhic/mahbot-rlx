@@ -6,9 +6,9 @@ version = 4
 name = "glibc-hard-cases"
 version = "0.0.0"
 dependencies = [
- "rlx-libm",
+ "mahbot-rlx-libm",
 ]
 
 [[package]]
-name = "rlx-libm"
-version = "0.2.20"
+name = "mahbot-rlx-libm"
+version = "0.2.18-mahbot.3"

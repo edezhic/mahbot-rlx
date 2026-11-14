@@ -20,7 +20,7 @@ workspace = true
 
 [dev-dependencies]
 # f64 erf truth for the precision guard (glibc 2.43, validated bit-exact)
-rlx-libm = { workspace = true }
+rlx-libm = { package = "mahbot-rlx-libm", path = "../../numerics/rlx-libm" }
 # Validate that the emitted activation/double-single shaders are real, valid
 # shader source: WGSL (wgpu path) via `wgsl-in`, GLSL (native-Vulkan path) via
 # `glsl-in`. CUDA/MSL/OpenCL have no toolchain-free parser, so those emitters are

@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """Apply this fork's package-name layer to every manifest in the tree.
 
-Twenty-one crates are published from here under `mahbot-` names at the fork
+Twenty-six crates are published from here under `mahbot-` names at the fork
 version; every other crate keeps upstream's identity. The layer lives in the
 manifests, not in the source: a dependency key keeps upstream's name, the
 `[workspace.dependencies]` entry names the real package, and each renamed crate
@@ -15,7 +15,7 @@ docs/fork-publishing.md).
 Upstream does not know about any of it, so every sync re-applies it here rather
 than through a hand edit per manifest:
 
-* the twenty-one crates get the fork's `[package] name` and version, and
+* the twenty-six crates get the fork's `[package] name` and version, and
   `mahbot-inference` — this fork's own subject, not a renamed upstream crate —
   gets the version alone;
 * a dependency that names one of them by `path` gains `package = "mahbot-…"`,
@@ -65,6 +65,11 @@ RENAMED = {
     "crates/io/rlx-nemo": "mahbot-rlx-nemo",
     "crates/io/rlx-pkg": "mahbot-rlx-pkg",
     "crates/io/rlx-torch-ckpt": "mahbot-rlx-torch-ckpt",
+    "crates/numerics/rlx-fastmath": "mahbot-rlx-fastmath",
+    "crates/numerics/rlx-libm": "mahbot-rlx-libm",
+    "crates/numerics/rlx-linux-ref": "mahbot-rlx-linux-ref",
+    "crates/numerics/rlx-pocketfft": "mahbot-rlx-pocketfft",
+    "crates/numerics/rlx-search": "mahbot-rlx-search",
     "crates/tooling/rlxsl": "mahbot-rlxsl",
 }
 

@@ -10,7 +10,7 @@ edition = "2024"
 publish = false
 
 [dev-dependencies]
-rlx-libm = { path = "../.." }
+rlx-libm = { package = "mahbot-rlx-libm", path = "../.." }
 libm = "=0.2.16"
 
 [workspace]

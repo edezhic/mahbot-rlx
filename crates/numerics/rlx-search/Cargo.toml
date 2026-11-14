@@ -1,6 +1,6 @@
 [package]
-name = "rlx-search"
-version.workspace      = true
+name = "mahbot-rlx-search"
+version                = "0.2.18-mahbot.3"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Host-side sequence search shared by every decoder: argmax/top-k/log-softmax, beam search, CTC greedy/prefix-beam/forced alignment over log and tropical semirings"
@@ -9,8 +9,8 @@ license.workspace      = true
 keywords = ["beam-search", "ctc", "viterbi", "decoding", "semiring"]
 categories = ["science", "algorithms"]
 readme                 = "README.md"
-repository.workspace   = true
-documentation.workspace = true
+repository             = "https://github.com/edezhic/mahbot-rlx"
+documentation          = "https://docs.rs/mahbot-rlx-search"
 
 [lib]
 name = "rlx_search"

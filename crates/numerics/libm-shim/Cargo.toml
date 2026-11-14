@@ -15,7 +15,7 @@ name = "libm"
 path = "src/lib.rs"
 
 [dependencies]
-rlx-libm = { path = "../rlx-libm", version = "0.2.20", default-features = false }
+rlx-libm = { package = "mahbot-rlx-libm", path = "../rlx-libm", version = "0.2.18-mahbot.3", default-features = false }
 
 [lints]
 workspace = true
