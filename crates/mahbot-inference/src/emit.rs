@@ -579,6 +579,11 @@ impl LoaderWeights {
 
     /// One step of a stacked tensor as f32 in the matmul layout `[k, n]`
     /// (`n` fastest) — the fallback when the stack is not packed.
+    ///
+    /// It reads the whole stack for the one step, because serving these slices properly would
+    /// keep the fifteen of them as f32 for the life of the process — about 126 MB where the
+    /// packed route keeps 33.4 — and this arm is not the product path: every model this crate
+    /// opens stores the head quantised.
     fn take_step(&mut self, name: &str, step: usize) -> Result<(Vec<f32>, Vec<usize>)> {
         let p = self.model.plan(name)?.clone();
         let (k, n) = (p.ggml_shape[0], p.ggml_shape[1]);
@@ -590,6 +595,16 @@ impl LoaderWeights {
     /// The same step, kept packed: the step slice lies contiguously in the
     /// file's order (`[out, in]`, `in` fastest, then the fifteen steps), so the
     /// file's own bytes are handed over without re-quantising or widening.
+    ///
+    /// Read from a window of the slice's own bytes ([`Model::with_mapped_range`]), not from the
+    /// tensor: the fifteen levels each keep 2,228,224 bytes of a 33,423,360-byte stack, and a
+    /// read of the whole stack per level is 501,350,400 bytes off the model file to keep
+    /// 33,423,360 — the frame build's largest single cost, and linear in the level count.
+    /// Measured with both routes in one harness, paired and alternating over three rounds with
+    /// warm pages (`tests/predictor_draft.rs`): the fifteen reads fall from **64.1–64.6 ms to
+    /// 2.5–2.6 ms** and the frame's build from about 65 ms to **3.3 ms**, one pass over the
+    /// stack plus the emission. The resident set is what it was: the same fifteen slices, which
+    /// are the stack.
     fn take_step_packed(&mut self, name: &str, step: usize) -> Result<Option<GgufPackedLinear>> {
         let p = self.model.plan(name)?.clone();
         if p.class != loader::Class::Stacked {
@@ -602,16 +617,15 @@ impl LoaderWeights {
         let Some(per_step) = bytes_for_public(p.file, k * n) else {
             return Ok(None);
         };
-        let bytes = self.model.raw(name)?;
-        let at = step * per_step;
-        if at + per_step > bytes.len() {
-            bail!(
-                "`{name}#{step}`: the file holds {} bytes, step wants {per_step}",
-                bytes.len()
-            );
-        }
+        let at = step
+            .checked_mul(per_step)
+            .ok_or_else(|| anyhow!("`{name}#{step}`: step {step} at {per_step} bytes overflows"))?;
+        // The window refuses a range past the tensor's end, so this read cannot come back short.
+        let bytes = self
+            .model
+            .with_mapped_range(name, at, per_step, <[u8]>::to_vec)?;
         Ok(Some(GgufPackedLinear {
-            w_q: bytes[at..at + per_step].to_vec().into(),
+            w_q: bytes.into(),
             scheme,
             in_dim: k,
             out_dim: n,
@@ -1245,6 +1259,110 @@ fn declared_param(ctx: &mut FlowCtx<'_>, name: &str, shape: &Shape) -> Option<Hi
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    /// The fixture file a test writes, removed however the test ends: an assertion that fails
+    /// would otherwise leave a checkpoint in the shared temp directory.
+    struct Fixture(std::path::PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            Self(std::env::temp_dir().join(format!(
+                "mahbot-step-slice-{}-{nanos}.gguf",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// The code predictor's stacked head is read one step at a time, and each step's bytes have
+    /// to be that step's own: a slice taken from the wrong offset serves another level's
+    /// weights with no error anywhere. The fixture is a Q8_0 stack whose every step is a
+    /// distinct block pattern, so the expected bytes are the payload the fixture wrote rather
+    /// than a figure the product's own output produced — a wrong offset, a slice of the wrong
+    /// length, or a read of the neighbouring level all fail here.
+    #[test]
+    fn a_stacked_tensors_step_is_read_from_its_own_bytes() {
+        use crate::loader::Model;
+        use rlx_flow::WeightSource;
+
+        // The file's order is `[k, n, steps]` with `k` fastest: 64 × 8 elements a step is 16
+        // whole Q8_0 blocks, 544 bytes, and three steps are 1,632.
+        const K: usize = 64;
+        const N: usize = 8;
+        const STEPS: usize = 3;
+        const NAME: &str = "a.gen.code.head.weight";
+        let per_step = rlx_gguf::bytes_for_public(rlx_gguf::GgmlType::Q8_0, K * N)
+            .expect("64×8 elements are whole Q8_0 blocks");
+        // A step's bytes: one block per 32 elements, each block a scale of its own and quants
+        // that move with the block and the step, so no two steps — and no two blocks — can be
+        // confused for one another.
+        let step_bytes = |step: usize| -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(per_step);
+            for block in 0..(K * N / 32) {
+                let scale = half::f16::from_f32((step * 100 + block) as f32);
+                bytes.extend_from_slice(&scale.to_le_bytes());
+                bytes.extend((0..32).map(|i| (step * 32 + block + i) as u8));
+            }
+            bytes
+        };
+        let stacked: Vec<u8> = (0..STEPS).flat_map(step_bytes).collect();
+        let mut writer = rlx_gguf::GgufWriter::new();
+        writer.set_arch("clip");
+        writer
+            .add_tensor_bytes(NAME, vec![K, N, STEPS], rlx_gguf::GgmlType::Q8_0, stacked)
+            .expect("the stack is a valid Q8_0 payload");
+        let path = Fixture::new();
+        writer
+            .write_to_path(&path.0)
+            .expect("the fixture is written");
+        let model = Arc::new(Model::open(&path.0).expect("the fixture opens"));
+        let mut weights = super::LoaderWeights::new(model.clone());
+
+        for step in 0..STEPS {
+            let blob = weights
+                .take_packed(&format!("{NAME}#{step}"))
+                .expect("a step of a packed stack is served")
+                .expect("the stack is packed");
+            assert_eq!(
+                blob.w_q.carried_bytes(),
+                Some(step_bytes(step).as_slice()),
+                "step {step}'s bytes are its own, out of a stack whose steps all differ"
+            );
+        }
+        // The range read on its own, at the last step's offset: the stack's own last bytes, not a
+        // second copy of the first.
+        assert_eq!(
+            model
+                .with_mapped_range(NAME, per_step * (STEPS - 1), per_step, <[u8]>::to_vec)
+                .expect("the last step's range is inside the tensor"),
+            step_bytes(STEPS - 1),
+            "a window of the last step's bytes is that step's bytes"
+        );
+        // A step past the stack and a range past the tensor are both refusals, not a short
+        // slice or another tensor's bytes carried as a weight.
+        let error = weights
+            .take_packed(&format!("{NAME}#{STEPS}"))
+            .expect_err("a step past the stack is refused")
+            .to_string();
+        assert!(
+            error.contains(NAME) && error.contains("past its end"),
+            "the refusal names the tensor and the range: {error}"
+        );
+        assert!(
+            model
+                .with_mapped_range(NAME, per_step * STEPS, 1, |_| ())
+                .is_err(),
+            "a range past the tensor is refused"
+        );
+    }
 
     /// The scope a compile declares is the model the finished build took its weights from,
     /// and the record is emptied by the compile that reads it: a name a later build did not

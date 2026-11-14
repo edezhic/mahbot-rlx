@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Measurement only and `#[ignore]`d: the pinned waveform through the library
-//! path, the shipped predictor frame's time with its steps counted by kind, and
-//! the sixteen-level stack's rate against sixteen single-row reads.
+//! path, the shipped predictor frame's time with its steps counted by kind, the
+//! sixteen-level stack's rate against sixteen single-row reads, and the stack's
+//! per-level slice read against the whole-tensor read it replaced.
 //!
 //! **The waveform.** `Synthesis::synthesize` on the pinned text and seed, printed
 //! against the pinned digest as a witness: a moved digest is recorded and reported,
@@ -20,6 +21,14 @@
 //! single-row reads the serial walk pays — the figure a batched predictor would
 //! collect if the frames were independent, which they are not ([`graphs`]'
 //! `tts_code_predictor_frame`).
+//!
+//! **The read arms.** That stack is one tensor and every level keeps a slice of it:
+//! the pre-fix route read the whole 33,423,360 bytes a level to copy 2,228,224 out,
+//! the shipped one maps the slice's own window. Both arms keep the same bytes and the
+//! emission is the same in both, so the pair — both orders, alternating round by
+//! round — is the measurement of that change. The shipped build is timed behind it
+//! with the pages the arms left resident, and what the whole-tensor route paid is
+//! that build plus the paired difference.
 //!
 //! Needs the synthesis pair installed; a machine without it skips. Run with
 //! `RLX_ALLOW_THROTTLE=1 cargo test -p mahbot-inference --release --features
@@ -107,6 +116,36 @@ fn shape_ms(scheme: QuantScheme, k: usize, n: usize, packed: u64) -> (f64, f64) 
         );
     }
     (ms[0], ms[1])
+}
+
+/// One read arm over every level, in milliseconds: `whole` is the pre-fix route — the
+/// tensor read whole and the level's slice copied out of it — and `false` is the
+/// shipped one, the slice's own window mapped and copied. Each level's slice is kept
+/// in `kept`, as the build keeps it, so the copy is not a dead one the optimiser may
+/// drop; the caller reuses that buffer across rounds.
+fn read_arm(
+    model: &loader::Model,
+    name: &str,
+    steps: usize,
+    per_step: usize,
+    whole: bool,
+    kept: &mut Vec<Vec<u8>>,
+) -> f64 {
+    kept.clear();
+    let t = Tick::now();
+    for step in 0..steps {
+        let at = step * per_step;
+        let slice = if whole {
+            let bytes = model.raw(name).expect("the whole stacked head");
+            bytes[at..at + per_step].to_vec()
+        } else {
+            model
+                .with_mapped_range(name, at, per_step, <[u8]>::to_vec)
+                .expect("one level's slice")
+        };
+        kept.push(slice);
+    }
+    Tick::now().elapsed_ns(t) as f64 / 1e6
 }
 
 #[test]
@@ -242,5 +281,69 @@ fn the_predictor_frame_its_chain_and_the_stacks_ratio() {
          serial_tflops={serial_tflops:.2} stack_16rows_grouped_ms={total_16:.3} \
          stack_speedup={:.2}x stack_tflops={tflops_16:.2}",
         serial / total_16,
+    );
+
+    // The read arms, paired: the stack is one tensor and every level keeps a slice of
+    // it, so the pre-fix route read all of it a level to keep a fifteenth and the
+    // shipped one reads the slice's window. Both arms keep the same bytes — the
+    // emission is identical — which is what makes the pair the measurement of the
+    // change rather than of two different readings.
+    let head = graphs::PREDICTOR_HEAD_WEIGHT;
+    let plan = pair.sound.plan(head).expect("the stacked head's plan");
+    let (k, n) = (plan.ggml_shape[0], plan.ggml_shape[1]);
+    let per_step = rlx_gguf::bytes_for_public(plan.file, k * n).expect("whole blocks");
+    let whole_bytes = pair.sound.raw_len(head).expect("the stacked head's bytes");
+    let (mut whole_ms, mut slice_ms, mut diff_ms) = (Vec::new(), Vec::new(), Vec::new());
+    {
+        let mut kept = Vec::new();
+        for round in 0..ROUNDS {
+            // Both orders, round by round: a monotone drift lands on both arms and
+            // cancels out of the difference instead of being read as the change.
+            let order = if round.is_multiple_of(2) {
+                [true, false]
+            } else {
+                [false, true]
+            };
+            let mut times = [0f64; 2];
+            for whole in order {
+                let ms = read_arm(&pair.sound, head, steps, per_step, whole, &mut kept);
+                if whole {
+                    times[0] = ms;
+                } else {
+                    times[1] = ms;
+                }
+            }
+            whole_ms.push(times[0]);
+            slice_ms.push(times[1]);
+            diff_ms.push(times[1] - times[0]);
+        }
+    }
+    println!(
+        "draft read whole_median_ms={:.1} slice_median_ms={:.1} paired_diff_ms={:+.1} \
+         whole_total_bytes={} slice_total_bytes={} tensor_bytes={whole_bytes} per_step={per_step}",
+        median(&whole_ms),
+        median(&slice_ms),
+        median(&diff_ms),
+        steps * whole_bytes,
+        steps * per_step,
+    );
+
+    // The shipped build, as the confirming figure: the frame graph built and dropped,
+    // never compiled, `ROUNDS` times behind the pages the arms above left resident —
+    // a warm-page-cache figure, and the cold one is `cold_read`'s.
+    let builds: Vec<f64> = (0..ROUNDS)
+        .map(|_| {
+            let t = Tick::now();
+            let built = graphs::tts_code_predictor_frame(pair.sound.clone(), steps + 1, spec)
+                .expect("build the shipped frame");
+            let ms = Tick::now().elapsed_ns(t) as f64 / 1e6;
+            drop(built);
+            ms
+        })
+        .collect();
+    println!(
+        "draft build warm_pages=1 least_ms={:.1} median_ms={:.1}",
+        least(&builds),
+        median(&builds)
     );
 }

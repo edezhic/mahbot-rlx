@@ -732,7 +732,8 @@ impl Model {
     }
 
     /// One tensor's bytes, handed to `write` from a window of the file mapped for the
-    /// length of that write — the source a packed upload is fed from.
+    /// length of that write — the source a packed upload is fed from. The whole tensor:
+    /// [`Self::with_mapped_range`] is the same window over a sub-range of it.
     ///
     /// The window is released when `write` returns, so the resident cost is the tensor being
     /// written rather than the checkpoint behind the copy the device takes. Borrowing the
@@ -753,46 +754,79 @@ impl Model {
     /// parameters, and before `request_readahead` below those windows were faulted one page at a
     /// time: its doc carries what that cost and what the request takes it to.
     pub fn with_mapped<R>(&self, name: &str, write: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        let len = self.raw_len(name)?;
+        self.with_mapped_range(name, 0, len, write)
+    }
+
+    /// The bytes `[at, at + len)` of one tensor, handed to `write` from a window of the file
+    /// mapped for the length of that write — the source a stacked tensor's step slice is read
+    /// from.
+    ///
+    /// The window covers the range and nothing else. One over the whole tensor would fault every
+    /// page of it to copy a slice out, and borrowing the reader's own whole-file mapping instead
+    /// would keep those pages in this process for the rest of its life
+    /// ([`GgufFile::release_mapped_pages`]); this one leaves nothing behind but clean file-backed
+    /// pages the footprint does not count. What the narrow window is worth is measured where the
+    /// range is chosen (`emit::take_step_packed`, whose doc carries the figures).
+    ///
+    /// The range is checked against the tensor's own declared length and the file's, because a
+    /// range past either would be served zeros or another tensor's bytes and neither is a
+    /// weight: a read that cannot deliver the length asked for is a refusal, not a short slice.
+    pub fn with_mapped_range<R>(
+        &self,
+        name: &str,
+        at: usize,
+        len: usize,
+        write: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
         let t = self
             .file
             .get(name)
             .ok_or_else(|| anyhow!("tensor `{name}` is not in {}", self.path.display()))?;
         let nbytes = bytes_for_public(t.dtype, t.n_elements())
             .ok_or_else(|| anyhow!("`{name}`: {} elements are not whole blocks", t.n_elements()))?;
+        let end = at
+            .checked_add(len)
+            .filter(|end| *end <= nbytes)
+            .ok_or_else(|| {
+                anyhow!(
+                    "`{name}` is {nbytes} bytes, so the range [{at}, {}) is past its end",
+                    at.saturating_add(len)
+                )
+            })?;
         // An owned backing ([`GgufFile::from_bytes`]) already holds the bytes in the
         // process; only the mmap path has pages to keep out of it.
-        if nbytes == 0 || self.file.src_path().is_none() {
-            return Ok(write(self.file.tensor_bytes(t)?));
+        if len == 0 || self.file.src_path().is_none() {
+            // `tensor_bytes` checks the tensor's own range against the data segment and the
+            // range above lies inside it, so this slice is always whole.
+            let bytes = self.file.tensor_bytes(t)?;
+            return Ok(write(&bytes[at..end]));
         }
         let (file, file_len) = self.window_source()?;
         let start = self
             .file
             .data_offset()
             .checked_add(t.offset)
+            .and_then(|start| start.checked_add(at as u64))
             .ok_or_else(|| anyhow!("`{name}`: file offset overflow"))?;
-        let end = start
-            .checked_add(nbytes as u64)
+        let stop = start
+            .checked_add(len as u64)
             .ok_or_else(|| anyhow!("`{name}`: file offset overflow"))?;
         // A window past the end of the file would map zero-filled pages instead of the
         // tensor, which the reader refuses for the same reason: the graph is not run on zeros.
-        if end > file_len {
+        if stop > file_len {
             bail!(
-                "`{name}` ends at byte {end} of {} bytes — the checkpoint is truncated",
-                file_len
+                "`{name}`'s range [{at}, {end}) ends at byte {stop} of {file_len} bytes — the \
+                 checkpoint is truncated"
             );
         }
         // SAFETY: a read-only window of a file opened read-only and never written; the
         // tensor's bytes lie inside it and the map is dropped before this returns. Another
         // process truncating the file is UB — the caveat the reader's whole-file mapping
         // carries too.
-        let window = unsafe {
-            memmap2::MmapOptions::new()
-                .offset(start)
-                .len(nbytes)
-                .map(file)
-        }
-        .with_context(|| format!("mapping `{name}` out of {}", self.path.display()))?;
-        request_readahead(file, start, nbytes);
+        let window = unsafe { memmap2::MmapOptions::new().offset(start).len(len).map(file) }
+            .with_context(|| format!("mapping `{name}` out of {}", self.path.display()))?;
+        request_readahead(file, start, len);
         Ok(write(&window[..]))
     }
 
