@@ -76,6 +76,10 @@ crates/backends/rlx-cortexm/trainer/rlx-cortexm/
 # clippy output log (machine-specific absolute paths)
 clippy.log
 
+# machine-specific run transcripts and their pid files (not project artifacts)
+logs/*.log
+logs/*.pid
+
 # DriverKit extension build output (`rlx-egpu/dext/build.sh`, RLX_DEXT_OUT).
 # Holds a signed .dext bundle, the helper binary and the .iig-generated
 # sources — all reproducible from dext/, and none of it belongs in a crate

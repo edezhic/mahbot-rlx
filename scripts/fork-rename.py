@@ -25,11 +25,19 @@ than through a hand edit per manifest:
   for the rest — and the workspace registry (`[workspace.dependencies]`) always
   pins. A path-only entry elsewhere stays path-only: cargo strips it from the
   published archive, which is how a dev-dep back-edge avoids a publish cycle.
+  The exception is a pin that a published archive resolves against the registry
+  for a crate the fork never publishes — the optional out-of-scope backends
+  `mahbot-rlx-runtime` keeps under upstream names. That pin names
+  [`UPSTREAM_VERSION`], the newest release the registry has, because the
+  workspace version is upstream's and may not be released yet.
 
 Idempotent: running it twice changes nothing. Usage: `python3
-scripts/fork-rename.py [--check | --print-version]`; `--check` exits 1 when a
-manifest would change (for a gate) and prints what it would rewrite;
-`--print-version` prints [`FORK_VERSION`] for the release scripts.
+scripts/fork-rename.py [--check | --print-version | --print-upstream-version |
+--selftest]`; `--check` exits 1 when a manifest would change (for a gate) and
+prints what it would rewrite; the two `--print-*` forms print [`FORK_VERSION`]
+and [`UPSTREAM_VERSION`] for the release scripts, whatever state the tree is in;
+`--selftest` asserts the caret arithmetic the publish gate decides on and runs
+the write path over a manifest that needs a rewrite, which `--check` never does.
 """
 
 import os
@@ -41,6 +49,15 @@ import fork_layers as layers
 # The fork's release version. The release process owns this number; a bump
 # happens there, not here.
 FORK_VERSION = "0.2.18-mahbot.3"
+
+# The newest upstream release on the registry. A pin that travels to the registry
+# for a crate the fork never publishes has to name a version that exists there,
+# and the family releases in lockstep, so one number covers it. A caret at this
+# version admits the workspace version — that is what leaves the local build and
+# `Cargo.lock` untouched — and a pin equal to it is the accepted state once
+# upstream has published it; `main` refuses only once the caret stops admitting
+# the workspace version.
+UPSTREAM_VERSION = "0.2.19"
 
 # Directory → package name, for the crates this fork publishes under its own
 # name. Everything else in the tree keeps upstream's name and version.
@@ -78,6 +95,13 @@ RENAMED = {
 # number in its manifest by hand makes it a second source of truth for
 # `FORK_VERSION`; stamped and checked like the rest, with the name left alone.
 VERSION_ONLY = {"crates/mahbot-inference"}
+
+# The directories whose packages this fork publishes, and so the only ones whose
+# dependencies may name a registry package: everything else keeps upstream's
+# identity and is never uploaded from here. `scripts/publish.sh`'s `SCOPE` is the
+# same set as names, in upload order; its gate fails a scoped crate that depends
+# on a `mahbot-…` member this set does not contain.
+PUBLISHED = set(RENAMED) | VERSION_ONLY
 
 DEP_START = re.compile(r"^([ \t]*)([A-Za-z0-9_.-]+)([ \t]*=[ \t]*)\{", re.M)
 PKG_SECTION = re.compile(r"^\[package\][ \t]*$", re.M)
@@ -133,36 +157,78 @@ def field(body, key):
     return m.group(1) if m else None
 
 
-def package_versions(root):
+def relative_dir(root, path):
+    """`path`'s directory, repo-relative and `/`-separated ("" for the root)."""
+    rel = os.path.relpath(os.path.dirname(path), root).replace(os.sep, "/")
+    return "" if rel == "." else rel
+
+
+def workspace_version(root):
+    """The version `[workspace.package]` hands every member that inherits it."""
+    text = layers.read(os.path.join(root, "Cargo.toml"))
+    return field(section_text(text, "[workspace.package]"), "version")
+
+
+def package_versions(root, inherited):
     """Directory (repo-relative) → the version that directory's package carries."""
-    workspace_manifest = os.path.join(root, "Cargo.toml")
-    workspace_version = field(section_text(layers.read(workspace_manifest),
-                                          "[workspace.package]"), "version")
     versions = {}
     for path in layers.manifests(root):
-        text = layers.read(path)
-        body = section_text(text, "[package]")
+        body = section_text(layers.read(path), "[package]")
         if not body:
             continue
         version = field(body, "version")
         if version is None:
             inherit = re.search(r"^[ \t]*version\.workspace[ \t]*=[ \t]*true", body, re.M)
-            version = workspace_version if inherit else None
-        rel = os.path.relpath(os.path.dirname(path), root).replace(os.sep, "/")
-        if rel == ".":
-            rel = ""
+            version = inherited if inherit else None
         if version:
-            versions[rel] = version
+            versions[relative_dir(root, path)] = version
     return versions
 
 
-def rewrite_deps(text, manifest_dir, root, versions):
-    """Apply the layer to every `path = …` dependency entry in one manifest."""
-    edits = []  # (start, end, replacement)
+def entries(text):
+    """Every `key = { … }` dependency entry: `(key, start, end, body)`."""
     for m in DEP_START.finditer(text):
-        open_at = m.end() - 1
-        close_at = match_brace(text, open_at)
-        body = text[open_at:close_at + 1]
+        start = m.end() - 1
+        end = match_brace(text, start) + 1
+        yield m.group(2), start, end, text[start:end]
+
+
+def workspace_registry(root):
+    """Registry key → repo-relative directory of the member its `path` names."""
+    text = layers.read(os.path.join(root, "Cargo.toml"))
+    registry = {}
+    for key, _, _, body in entries(section_text(text, "[workspace.dependencies]")):
+        path = re.search(r'path[ \t]*=[ \t]*"([^"]+)"', body)
+        if path:
+            registry[key] = os.path.normpath(path.group(1)).replace(os.sep, "/")
+    return registry
+
+
+def upstream_keys(root, registry):
+    """Registry keys a published crate inherits from a package the fork never publishes.
+
+    Those are the edges a published archive resolves against the registry, so
+    their pin has to name a version that exists there. Derived rather than
+    listed: a sync that gives the runtime a new optional backend, or brings one
+    of these crates into the fork's own set, moves the key in or out by itself.
+    """
+    keys = set()
+    for path in layers.manifests(root):
+        if relative_dir(root, path) not in PUBLISHED:
+            continue
+        for key, _, _, body in entries(layers.read(path)):
+            if not re.search(r"workspace[ \t]*=[ \t]*true", body):
+                continue
+            target = registry.get(key)
+            if target is not None and target not in PUBLISHED:
+                keys.add(key)
+    return keys
+
+
+def rewrite_deps(text, manifest_dir, root, versions, published, upstream):
+    """Apply the layer to every `path = …` dependency entry in one manifest."""
+    edits = []  # (start, end, replacement) — `entries` already ends past the `}`
+    for key, start, end, body in entries(text):
         path = re.search(r'path[ \t]*=[ \t]*"([^"]+)"', body)
         if not path:
             continue
@@ -175,7 +241,7 @@ def rewrite_deps(text, manifest_dir, root, versions):
         # manifest may be path-only on purpose (a dev-dep with no `version` is
         # stripped from the published archive, which is how the back-edges
         # between tiers avoid a publish cycle), so only an existing pin moves.
-        registry = section_of(text, open_at) == "[workspace.dependencies]"
+        registry = section_of(text, start) == "[workspace.dependencies]"
         new = body
         if rel in RENAMED:
             name = RENAMED[rel]
@@ -184,26 +250,29 @@ def rewrite_deps(text, manifest_dir, root, versions):
                              lambda mm: mm.group(1) + f'"{name}"', new)
             else:
                 new = re.sub(r"^\{[ \t]*", f'{{ package = "{name}", ', new)
-        # A pin, where the manifest carries one, must name the version the
-        # dependency actually is. Path-only entries stay path-only — except in
-        # the workspace registry, which always pins.
-        pinned = rel in RENAMED and (registry or re.search(r'version[ \t]*=', new))
-        if pinned:
-            new = re.sub(r'(version[ \t]*=[ \t]*)"[^"]*"',
-                         lambda mm: mm.group(1) + f'"{FORK_VERSION}"', new)
-            if not re.search(r'version[ \t]*=', new):
-                new = re.sub(r'(path[ \t]*=[ \t]*"[^"]*")',
-                             lambda mm: mm.group(1) + f', version = "{FORK_VERSION}"',
-                             new, count=1)
+        # A pin, where the manifest carries one, names the version the dependency
+        # actually is: the fork's for a crate it publishes — `rewrite_package`
+        # stamps every one of those — and UPSTREAM_VERSION where the pin travels
+        # to the registry for one it never does (the workspace entry a published
+        # crate inherits, or a pin already in a published crate's manifest). The
+        # local version is right everywhere else, because nothing outside this
+        # tree resolves it. Path-only entries stay path-only — except in the
+        # workspace registry, which always pins.
+        carries = re.search(r'version[ \t]*=', new) is not None
+        if rel in PUBLISHED:
+            wanted = FORK_VERSION
+        elif (registry and key in upstream) or (published and carries):
+            wanted = UPSTREAM_VERSION
         else:
-            new = re.sub(r'(version[ \t]*=[ \t]*)"[^"]*"',
-                         lambda mm: mm.group(1) + f'"{versions[rel]}"', new)
-            if registry and not re.search(r'version[ \t]*=', new):
-                new = re.sub(r'(path[ \t]*=[ \t]*"[^"]*")',
-                             lambda mm: mm.group(1) + f', version = "{versions[rel]}"',
-                             new, count=1)
+            wanted = versions[rel]
+        new = re.sub(r'(version[ \t]*=[ \t]*)"[^"]*"',
+                     lambda mm: mm.group(1) + f'"{wanted}"', new)
+        if registry and not carries:
+            new = re.sub(r'(path[ \t]*=[ \t]*"[^"]*")',
+                         lambda mm: mm.group(1) + f', version = "{wanted}"',
+                         new, count=1)
         if new != body:
-            edits.append((open_at, close_at + 1, new))
+            edits.append((start, end, new))
     for start, end, new in reversed(edits):
         text = text[:start] + new + text[end:]
     return text
@@ -211,7 +280,7 @@ def rewrite_deps(text, manifest_dir, root, versions):
 
 def rewrite_package(text, rel):
     """Pin a renamed crate's own name and version, or a version-only crate's version."""
-    if rel not in RENAMED and rel not in VERSION_ONLY:
+    if rel not in PUBLISHED:
         return text
     m = PKG_SECTION.search(text)
     if not m:
@@ -229,22 +298,107 @@ def rewrite_package(text, rel):
     return text[:m.end()] + new + text[end_at:]
 
 
+# What `admits` must say about cargo's caret semantics: the forms the naming
+# layer writes, and the forms it has to refuse to guess at. The pre-flight gate
+# decides whether a release proceeds on this arithmetic, so it is asserted here
+# rather than trusted.
+CARET_CASES = (
+    ("0.2.19", "0.2.20", True),      # a bare version is a caret
+    ("^0.2.19", "0.2.19", True),
+    ("^0.2.19", "0.2.18", False),
+    ("^0.2.20", "0.2.19", False),    # the pin names a newer release than the tree
+    ("^0.2.19", "0.3.0", False),     # a caret stays inside the minor it names
+    ("^1.2.3", "1.9.9", True),
+    ("^1.2.3", "2.0.0", False),
+    ("^0", "0.9.0", True),           # a zero major is its own boundary
+    ("^0", "1.0.0", False),
+    ("^0.0", "0.0.5", True),
+    ("^0.0.3", "0.0.3", True),
+    ("^0.0.3", "0.0.4", False),
+    (">0.2.18", "0.2.19", None),     # not a caret: not read, and not admitted
+    ("~0.2.19", "0.2.19", None),
+    ("0.2.*", "0.2.19", None),
+    ("^0.2.19", "0.2.19-rc.1", None),
+)
+
+
+def selftest():
+    """The caret arithmetic the pre-flight decides on, and the write path.
+
+    The write path matters because `--check` compares and never splices: a splice
+    that eats the newline after an entry passes every gate in the tree while
+    joining that entry to the line below it — a manifest cargo refuses to parse.
+    The contract asserted here is that an entry is replaced by its own new body
+    and nothing else moves, and that a second pass changes nothing.
+    """
+    for requirement, version, want in CARET_CASES:
+        got = layers.admits(requirement, version)
+        if got is not want:
+            print(f"fork-rename selftest: admits({requirement!r}, {version!r}) is {got!r}, "
+                  f"not {want!r}", file=sys.stderr)
+            return 1
+    # The fixture is the root manifest, which is not a published member — the
+    # shape `main` actually walks it in.
+    root, rel = "/tree", ""
+    versions = {"crates/mahbot-inference": FORK_VERSION,
+                "crates/backends/rlx-cuda": "0.0.0",
+                "crates/core/rlx-optim": "0.0.0"}
+    before = (
+        "[workspace.dependencies]\n"
+        'mahbot-inference = { path = "crates/mahbot-inference", version = "0.0.1" }\n'
+        'rlx-cuda = { path = "crates/backends/rlx-cuda", version = "0.0.1" }\n'
+        'rlx-optim = { path = "crates/core/rlx-optim" }\n'
+        "\n[package]\n"
+        'name = "probe"\n'
+    )
+    after = (
+        "[workspace.dependencies]\n"
+        f'mahbot-inference = {{ path = "crates/mahbot-inference", version = "{FORK_VERSION}" }}\n'
+        f'rlx-cuda = {{ path = "crates/backends/rlx-cuda", version = "{UPSTREAM_VERSION}" }}\n'
+        'rlx-optim = { path = "crates/core/rlx-optim", version = "0.0.0" }\n'
+        "\n[package]\n"
+        'name = "probe"\n'
+    )
+    for label, text in (("a rewrite", before), ("a second rewrite", after)):
+        got = rewrite_deps(text, root, root, versions, rel in PUBLISHED, {"rlx-cuda"})
+        if got != after:
+            print(f"fork-rename selftest: {label} produced\n{got!r}\nnot\n{after!r}",
+                  file=sys.stderr)
+            return 1
+    print("fork-rename selftest: the caret arithmetic holds and a rewrite replaces "
+          "the entry and nothing else")
+    return 0
+
+
 def main(argv):
-    # `--print-version` is how the release scripts read the number as a *value*
-    # rather than by parsing this file's source.
-    if "--print-version" in argv[1:]:
-        print(FORK_VERSION)
-        return 0
-    check = "--check" in argv[1:]
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    versions = package_versions(root)
+    # `--print-version` and `--print-upstream-version` are how the release
+    # scripts read the numbers as *values* rather than by parsing this file, so
+    # they answer in whatever state the tree is in: a pin that needs fixing must
+    # not take the version read down with it.
+    for flag, value in (("--print-version", FORK_VERSION),
+                        ("--print-upstream-version", UPSTREAM_VERSION)):
+        if flag in argv[1:]:
+            print(value)
+            return 0
+    # `--selftest` answers before the guard: the arithmetic it pins is what the
+    # guard uses, so a regression there has to be named as such.
+    if "--selftest" in argv[1:]:
+        return selftest()
+    inherited = workspace_version(root)
+    if layers.admits(UPSTREAM_VERSION, inherited) is not True:
+        print(f"UPSTREAM_VERSION {UPSTREAM_VERSION} does not admit the workspace version "
+              f"{inherited}: a local build would take the registry copy", file=sys.stderr)
+        return 1
+    check = "--check" in argv[1:]
+    versions = package_versions(root, inherited)
+    upstream = upstream_keys(root, workspace_registry(root))
     changed = 0
     for path in layers.manifests(root):
-        rel = os.path.relpath(os.path.dirname(path), root).replace(os.sep, "/")
-        if rel == ".":
-            rel = ""
+        rel = relative_dir(root, path)
         text = layers.read(path)
-        new = rewrite_deps(rewrite_package(text, rel), os.path.dirname(path), root, versions)
+        new = rewrite_deps(rewrite_package(text, rel), os.path.dirname(path), root,
+                           versions, rel in PUBLISHED, upstream)
         if new != text:
             changed += 1
             shown = os.path.relpath(path, root)

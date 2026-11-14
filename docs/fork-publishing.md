@@ -98,6 +98,22 @@ and `--offline` forbids a registry contact. The stand-ins never enter the fork's
 archives and are never uploaded; the packaged manifests still name the registry
 packages.
 
+The sixteen optional edges `mahbot-rlx-runtime` declares — the fourteen above
+plus `rlx-program` and `rlx-stablehlo` — are the one place the naming layer does
+not stamp the workspace version: no registry has it, so they name
+`UPSTREAM_VERSION` in [`scripts/fork-rename.py`](../scripts/fork-rename.py) — the
+newest release the registry does have — and a caret requirement there admits the
+workspace version, which leaves a local build and `Cargo.lock` untouched. (The
+three stand-ins that only those edges pull in — `rlx-gpu-kernels`, `rlx-mlx-sys`
+and `rlx-cortexm` — keep the workspace version; nothing the fork uploads names
+them.) `scripts/publish.sh` fails before anything is built or uploaded when such
+an edge names a version nothing published satisfies, or a version the check
+cannot read. That gate reads `UPSTREAM_VERSION` rather than the registry,
+because it has to answer offline: the constant is the claim, and a walk of the
+27 packages is what tests it. `cargo publish` resolves those edges like any
+other, one package at a time, and a package that cannot resolve stops the walk
+with the packages before it already uploaded.
+
 ## Publishing
 
 `scripts/publish.sh --list` prints the tier order and versions,
@@ -107,9 +123,10 @@ brand-new name allows a burst of five and then one per ten minutes, a new
 version a burst of thirty and then one per minute
 (<https://crates.io/docs/rate-limits>). Its `SCOPE` array is the ground truth: a
 tier naming a package the fork does not own, a crate missing from the tiers, a
-crate that is not publishable, a version that is not the fork version, or a
-product-configuration dependency on the upstream family all fail the run before
-anything is built or uploaded.
+crate that is not publishable, a version that is not the fork version, a
+dependency on a `mahbot-…` member outside `SCOPE`, or a product-configuration
+dependency on the upstream family all fail the run before anything is built or
+uploaded.
 
 ## License
 

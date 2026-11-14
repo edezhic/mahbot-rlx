@@ -1277,7 +1277,10 @@ ci-workspace: ci build-workspace test-workspace lint-workspace check-no-std chec
 ci-rig: ci-workspace test-vulkan test-libm test-rocm leak-check validate-metal-bindings
 # The two layers this fork re-applies on every sync — the package rename and the
 # narrow test contour — checked rather than trusted (see `docs/fork-sync.md` §2/§3).
+# `--selftest` runs the rename layer's write path and the caret arithmetic the
+# pre-flight decides on: `--check` only compares, so neither is visible to it.
 check-fork-layers:
+    python3 scripts/fork-rename.py --selftest
     python3 scripts/fork-rename.py --check
     python3 scripts/fork-test-gating.py --check
 

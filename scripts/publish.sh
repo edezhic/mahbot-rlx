@@ -195,6 +195,13 @@ SCOPE=(
 FORK_VERSION="$(python3 "$(dirname "$0")/fork-rename.py" --print-version)"
 [[ -n "$FORK_VERSION" ]] || { echo "publish.sh: cannot read FORK_VERSION from scripts/fork-rename.py" >&2; exit 1; }
 
+# The newest upstream release on the registry, and what the naming layer pins
+# every edge the fork does not publish to — the runtime's optional backends and
+# their helpers. Read from the same file, for the same reason: `validate_scope`
+# judges those pins against it, and a second literal would drift.
+UPSTREAM_VERSION="$(python3 "$(dirname "$0")/fork-rename.py" --print-upstream-version)"
+[[ -n "$UPSTREAM_VERSION" ]] || { echo "publish.sh: cannot read UPSTREAM_VERSION from scripts/fork-rename.py" >&2; exit 1; }
+
 # Tier definitions. Each array entry is a single tier; space-separated crate
 # names within. Order within a tier matters when one member depends on another
 # in the same tier. `cargo publish` resolves every versioned dependency —
@@ -219,9 +226,10 @@ FORK_VERSION="$(python3 "$(dirname "$0")/fork-rename.py" --print-version)"
 #   - mahbot-inference names rlx-flow, rlx-gguf, rlx-ir, rlx-runtime and
 #     rlx-wgpu: the product path, last.
 #
-# The out-of-scope crates this fork does not publish are absent on purpose;
-# mahbot-rlx-runtime's optional backends still resolve upstream, which
-# `validate_scope` reports and docs/fork-publishing.md states.
+# The out-of-scope crates this fork does not publish are absent on purpose.
+# mahbot-rlx-runtime's optional backends still resolve upstream, against the
+# newest release that registry has: `validate_scope` fails the run unless their
+# pins admit it (see UPSTREAM_VERSION above).
 TIERS=(
     "mahbot-rlx-libm mahbot-rlx-fastmath mahbot-rlx-search mahbot-rlx-linux-ref mahbot-rlx-pocketfft mahbot-rlx-ir mahbot-rlxsl mahbot-rlx-gguf mahbot-rlx-torch-ckpt mahbot-rlx-nemo mahbot-rlx-gpu-dispatch mahbot-rlx-macros mahbot-rlx-dduf"
     "mahbot-rlx-unfuse mahbot-rlx-flow mahbot-rlx-fusion mahbot-rlx-driver mahbot-rlx-mlx-io"
@@ -286,8 +294,9 @@ bold()   { printf "\033[1m%s\033[0m\n" "$*"; }
 
 # ── Gates ───────────────────────────────────────────────────────
 #
-# One gate, because both questions — does the tier list cover the scope, and
-# does the order resolve — are answered from the same metadata. It reads
+# One gate, because every question it answers — does the tier list cover the
+# scope, does the order resolve, does every edge a published archive carries name
+# a version the registry has — comes from the same metadata. It reads
 # `cargo metadata`, so it sees the manifests rather than a hand-copy of them. A
 # gate that cannot see the crates must not pass: a missing python3 or a metadata
 # failure is a hard error, never a skip.
@@ -296,15 +305,22 @@ validate_scope() {
         red "python3 not found — cannot validate the publish scope."
         exit 1
     fi
-    local err notes rc=0
-    err="$(python3 - "$PWD" "$FORK_VERSION" "${SCOPE[*]}" "${TIERS[@]}" 2>&1 <<'PY'
+    local err rc=0
+    err="$(python3 - "$PWD" "$FORK_VERSION" "$UPSTREAM_VERSION" "${SCOPE[*]}" "${TIERS[@]}" 2>&1 <<'PY'
 import json, subprocess, sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-fork_version = sys.argv[2]
-scope = sys.argv[3].split()
-tiers = [tier.split() for tier in sys.argv[4:]]
+sys.path.insert(0, str(root / "scripts"))
+try:
+    from fork_layers import admits
+except Exception as error:  # a gate that cannot load its check must not answer
+    print(f"cannot import fork_layers: {error}")
+    sys.exit(2)
+
+fork_version, upstream_version = sys.argv[2], sys.argv[3]
+scope = sys.argv[4].split()
+tiers = [tier.split() for tier in sys.argv[5:]]
 
 try:
     meta = json.loads(subprocess.run(
@@ -319,7 +335,6 @@ members = set(meta["workspace_members"])
 packages = {p["name"]: p for p in meta["packages"] if p["id"] in members}
 
 problems = []
-notes = []
 position = {}
 
 for tier_index, tier in enumerate(tiers):
@@ -366,8 +381,11 @@ for name in scope:
                     f"(tier {position[dep_name][0]})"
                 )
         elif dep_name.startswith("rlx"):
-            # The upstream family. Anything the product configuration resolves
-            # from it is a defect; an optional backend is the stated limitation.
+            # The upstream family: never published from here, so every edge that
+            # reaches the registry has to name a version the registry has. An
+            # optional backend reaches it all the same — `cargo publish` resolves
+            # every versioned dependency, optional included — so a pin that no
+            # published release satisfies is a defect, not a note.
             path_only = dep["req"] == "*"
             if dep["kind"] == "dev":
                 if not path_only:
@@ -376,19 +394,42 @@ for name in scope:
                         f"would resolve the upstream family — make it path-only"
                     )
             elif dep["optional"]:
-                notes.append(f"{name}: optional {dep_name} resolves the upstream family when enabled")
+                if path_only:
+                    problems.append(f"{name}: optional {dep_name} carries no version")
+                else:
+                    admitted = admits(dep["req"], upstream_version)
+                    if admitted is None:
+                        problems.append(
+                            f"{name}: optional {dep_name} carries {dep['req']}, which this "
+                            f"check cannot read — it has to be a caret requirement at the "
+                            f"newest published {dep_name} ({upstream_version})"
+                        )
+                    elif not admitted:
+                        problems.append(
+                            f"{name}: optional {dep_name} is pinned to {dep['req']}, which does "
+                            f"not admit the newest published {dep_name} ({upstream_version})"
+                        )
             else:
                 problems.append(
                     f"{name} depends on upstream {dep_name} in its product configuration"
+                )
+        elif dep_name.startswith("mahbot-") and dep_name in packages:
+            # A renamed workspace member the fork does not upload. A path-only
+            # dev-dep is stripped from the archive and harmless; anything else
+            # either names a package nothing publishes or carries no version,
+            # which cargo refuses to package. Reachable only when this scope and
+            # the naming layer drift apart — the layer derives its own set from
+            # the manifests, so nothing else would notice.
+            if dep["kind"] != "dev" or dep["req"] != "*":
+                problems.append(
+                    f"{name} depends on {dep_name}, which the fork renames but does not "
+                    f"publish — the archive cannot name it"
                 )
 
 if problems:
     for problem in problems:
         print(problem)
     sys.exit(1)
-
-for note in notes:
-    print(f"note: {note}")
 PY
 )" || rc=$?
     # Exit 1 is the script's own "the scope does not match"; anything else — a
@@ -398,14 +439,7 @@ PY
         [[ -n "$err" ]] && printf '%s\n' "$err" >&2
         exit 1
     fi
-    notes="$(printf '%s\n' "$err" | grep '^note: ' || true)"
-    err="$(printf '%s\n' "$err" | grep -v '^note: ' || true)"
-    if [[ -n "$notes" ]]; then
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && yellow "  ${line#note: }"
-        done <<< "$notes"
-    fi
-    if [[ -n "$err" ]]; then
+    if (( rc != 0 )); then
         red "The publish scope does not match the manifests:"
         while IFS= read -r line; do
             [[ -n "$line" ]] && red "  $line"
@@ -1050,6 +1084,7 @@ sleep_with_countdown() {
 # compressed)") and prints `<crate> <bytes>` for every package over the limit;
 # returns 1 if there is one.
 UPLOAD_LIMIT=$(( 10 * 1024 * 1024 ))
+
 oversized_packages() {
     python3 - "$1" "$UPLOAD_LIMIT" <<'PY'
 import re, sys
@@ -1072,6 +1107,27 @@ sys.exit(1 if over else 0)
 PY
 }
 
+# The never-published members — `publish = false` in the manifest — as
+# `--exclude` arguments. `cargo package` resolves a versioned dependency against
+# the registry even when both ends are workspace members, so a member whose
+# dependency is never published aborts the run before it measures anything. Read
+# from the metadata rather than named here: a member upstream marks unpublished
+# is excluded by itself.
+unpublishable_excludes() {
+    python3 - <<'PY'
+import json, subprocess
+
+meta = json.loads(subprocess.run(
+    ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+    capture_output=True, text=True, check=True,
+).stdout)
+members = set(meta["workspace_members"])
+for package in meta["packages"]:
+    if package["id"] in members and package.get("publish") == []:
+        print(f"--exclude={package['name']}")
+PY
+}
+
 # Crates the log reports as already on crates.io at their version.
 already_published_in_log() {
     grep -oE 'crate [A-Za-z0-9_-]+@[0-9][^ ]* already exists on crates.io index' "$1" \
@@ -1079,9 +1135,18 @@ already_published_in_log() {
 }
 
 if (( ! DRY_RUN )); then
-    bold "Package sizes (cargo package --workspace --no-verify)"
+    bold "Package sizes (the publishable members of the workspace)"
+    if ! exclude_list="$(unpublishable_excludes)"; then
+        red "The never-published members could not be read from cargo metadata."
+        exit 1
+    fi
+    excludes=()
+    while IFS= read -r spec; do
+        if [[ -n "$spec" ]]; then excludes+=("$spec"); fi
+    done <<< "$exclude_list"
     size_log="$(mktemp)"
-    cargo package --workspace --no-verify --allow-dirty >"$size_log" 2>&1 || {
+    # The guarded form: bash 3.2 aborts on an empty `"${array[@]}"` under `set -u`.
+    cargo package --workspace ${excludes[@]+"${excludes[@]}"} --no-verify --allow-dirty >"$size_log" 2>&1 || {
         tail -20 "$size_log"; red "cargo package failed."; exit 1; }
     if ! over="$(oversized_packages "$size_log")"; then
         red "Over crates.io's 10 MB upload limit — nothing uploaded:"

@@ -15,6 +15,7 @@ cd "$ROOT"
 # layer scripts is staged (see `docs/fork-sync.md` §2/§3). Cheap, and it is the
 # only thing that notices a sync that forgot to re-apply them.
 if git diff --cached --name-only | grep -qE '(^|/)Cargo\.toml$|^scripts/fork-'; then
+  python3 scripts/fork-rename.py --selftest
   python3 scripts/fork-rename.py --check
   python3 scripts/fork-test-gating.py --check
 fi

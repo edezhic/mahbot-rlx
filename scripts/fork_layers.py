@@ -3,8 +3,9 @@
 # Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
-"""The pieces the fork's two manifest layers share: the walk, the atomic writer, and
-the temp name it writes under.
+"""The pieces this fork's manifest tooling shares: the walk, the atomic writer and the
+temp name it writes under, plus the version arithmetic the naming layer and the publish
+gate both ask.
 
 Both layers rewrite manifests in place. A manifest truncated by an interrupted walk
 is a workspace that no longer parses, so the bytes go to a temporary beside the
@@ -21,6 +22,7 @@ out.
 """
 
 import os
+import re
 
 # Not walked: build output, the vendored MLX tree (a submodule upstream owns), and
 # VCS metadata.
@@ -62,4 +64,33 @@ def write_atomic(path, text):
         except OSError:
             pass
         raise
+
+
+def numbers(version):
+    """The three numeric components of `X.Y.Z`, or None if `version` is not that."""
+    match = re.fullmatch(r"\s*(\d+)\.(\d+)\.(\d+)\s*", version or "")
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def admits(requirement, version):
+    """Whether a caret `requirement` provably admits `version`; None when it cannot be read.
+
+    A bare version is cargo's caret requirement, and the only form the naming
+    layer writes. Anything else — a comparator, a wildcard, a comma list — is not
+    read at all, and comes back as None rather than False: a gate has to fail on
+    what it cannot check, and to say which of the two happened.
+    """
+    match = re.fullmatch(r"\s*\^?\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?\s*", requirement)
+    here = numbers(version)
+    if match is None or here is None:
+        return None
+    groups = match.groups()
+    named = [int(part or 0) for part in groups]
+    # Cargo's compatibility boundary is the leftmost non-zero component the
+    # requirement names, or the last one it names when they are all zero — so
+    # `^0` stays inside the major version and `^0.0` inside the minor.
+    count = sum(part is not None for part in groups)
+    at = next((i for i, part in enumerate(named) if part), count - 1)
+    high = tuple(named[:at] + [named[at] + 1] + [0] * (2 - at))
+    return tuple(named) <= here < high
 
