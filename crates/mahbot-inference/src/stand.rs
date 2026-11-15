@@ -4,20 +4,28 @@
 
 //! The stand: how the models do now.
 //!
-//! One table, six rows, each measured in a process of its own:
+//! One table, seven rows, each measured in a process of its own:
 //!
 //! * **recognition** at a short, a typical and a long voice message — audio in, the
 //!   regions the product's transcription call returns out;
 //! * **synthesis** at a short and a typical text — text in, a 24 kHz waveform out;
-//! * **wake word** — two consecutive windows of the pinned corpus recording through
-//!   the ear path in one batched pass to a score.
+//! * **wake word** — one second of streamed audio through the product's own listening
+//!   loop, once with no speech in it (the background load) and once with speech that
+//!   does not fire (the active load).
 //!
-//! Every row carries the same figures: cold time (the process starts with no models
-//! loaded and the call loads them), warm time (the models already resident),
-//! resting memory (after the cold call, with what it keeps still resident) and peak
-//! memory (the highest the process reaches) — each memory figure a pair, the
-//! system's share and the GPU's. Spread is not recorded; diagnostics go to the
-//! console and never enter the file.
+//! Every row carries the same figures. Cold time is the short-lived command-line path: a
+//! page cache that does not hold the models, so the call loads them — including the
+//! listening rows' bring-up, which maps the pair and compiles the wake graphs. Warm time
+//! is the same call with the models resident and the engine already loaded: a request on an
+//! engine that is up, which is what every request after a daemon's first one costs.
+//! Neither state is inherited from an earlier row or an earlier run — the cold one is made
+//! before its arm and the warm one is checked around it (`cold`) — so a row measures what
+//! it says it measures. The memory columns are a pair — the system's share and the GPU's —
+//! taken after the cold call and before the warm one. Spread is not recorded; diagnostics
+//! go to the console and never enter the file.
+//!
+//! The cold column's method is this platform's, so a run elsewhere is refused before its
+//! first row rather than given a column that means nothing.
 //!
 //! `mahbot-inference` with no arguments is the complete run: it takes the heavy
 //! run's lock, spawns one child per row and writes `STAND.md`. `mahbot-inference
@@ -28,7 +36,7 @@
 //!
 //! Inputs: the five model files and the pinned real-audio corpus, at one fixed
 //! location per operating system ([`crate::paths`]). The three recognition rows and
-//! the wake row's windows are cut from one pinned recording of that corpus. Nothing
+//! the active listening row are cut from one pinned recording of that corpus. Nothing
 //! is configured and nothing is created; a row whose input is missing fails and
 //! names the path.
 
@@ -38,10 +46,13 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, bail};
 use serde_json::json;
 
+use crate::bench::DetectionStream;
+use crate::cold;
 use crate::corpus;
-use crate::guard::Bounds;
+use crate::enrolment;
+use crate::guard::{Bounds, Deadline};
 use crate::listen::{self, Listener};
-use crate::loader::{Pair, Role};
+use crate::loader::{self, Pair, Role};
 use crate::measurements;
 use crate::reference;
 use crate::report::{self, Stopwatch};
@@ -53,9 +64,9 @@ use crate::wake;
 /// Marks a child of the complete run: it measures the one row its argument names.
 const ROW_CHILD: &str = "MAHBOT_STAND_ROW";
 
-/// The pinned recording the three recognition messages are cut from, the wake row's
-/// two windows, and the first of the two long recordings the product checks read
-/// whole: a five-minute speech file of the corpus listing. Named rather than picked
+/// The pinned recording the three recognition messages are cut from, the active
+/// listening row's speech, and the first of the two long recordings the product checks
+/// read whole: a five-minute speech file of the corpus listing. Named rather than picked
 /// out of the listing by position, so a reordering of the bench's table cannot
 /// re-point these rows at other material; `corpus::pinned` holds it to its own pin.
 pub const RECOGNITION_RECORDING: &str = "speech/librivox/speech-librivox-0027.wav";
@@ -72,11 +83,22 @@ const TYPICAL_TEXT: &str = "The weather this morning is quiet and cool, so I wil
 /// short request with it, so it is named here too.
 pub const SYNTH_SEED: u64 = 1;
 
-/// The speech window in the corpus recording: the file's speech starts within the
-/// first second, so the ear starts where there is speech. The reference window is a
-/// later segment of the same recording, used only as the cosine's other side.
+/// The speech window in the corpus recording the active listening row streams: the
+/// file's speech starts within the first second, so the ear starts where there is speech.
 pub const WAKE_OFFSET: usize = 16_000;
-const WAKE_REFERENCE_OFFSET: usize = 60_000;
+
+/// One second of streamed audio, the length both listening rows hold: their warm figures
+/// are the cost of one second at the product's cadence — at most 6.25 windows and 3.125
+/// paired encoder passes.
+const STREAM_SECONDS: usize = 1;
+const STREAM_SAMPLES: usize = STREAM_SECONDS * listen::SAMPLE_RATE as usize;
+
+/// The background row's microphone floor, as a share of full scale and as a seed: far
+/// below speech, so the voice-activity detector decides on every hop and finds none. The
+/// row asserts that it found none, because the row is only the background one while it
+/// is true.
+const IDLE_LEVEL: f32 = 1.0e-3;
+const IDLE_SEED: u64 = 7;
 
 /// What one row measures, and the witness its output is printed against.
 #[derive(Clone, Copy)]
@@ -93,9 +115,45 @@ enum Surface {
         digest: u64,
         samples: usize,
     },
-    /// The score the row was recorded with: the first window of the pair against a
-    /// later window of the same recording.
-    Wake { score: f32 },
+    /// A listening session's audio, and the decisions it must reach.
+    Listening {
+        audio: Audio,
+        witness: reference::WakeWitness,
+    },
+}
+
+/// The audio a listening row streams at 16 kHz: read or generated before the arm is
+/// timed, because audio arrives at a listening session rather than being its work.
+#[derive(Clone, Copy)]
+enum Audio {
+    /// No speech: an idle microphone's floor.
+    Idle,
+    /// Speech that does not fire: the pinned recording from [`WAKE_OFFSET`].
+    Speech,
+}
+
+impl Audio {
+    fn samples(self) -> Result<Vec<f32>> {
+        match self {
+            Self::Idle => Ok(report::pseudo_rand(STREAM_SAMPLES, IDLE_SEED)
+                .into_iter()
+                .map(|sample| sample * IDLE_LEVEL)
+                .collect()),
+            Self::Speech => {
+                let recording = corpus::pinned(RECOGNITION_RECORDING)?;
+                let samples = read(&recording, WAKE_OFFSET, STREAM_SAMPLES)?;
+                if samples.len() < STREAM_SAMPLES {
+                    bail!(
+                        "`{}` holds {} samples at {WAKE_OFFSET}, short of the {STREAM_SAMPLES} \
+                         a listening session streams",
+                        recording.display(),
+                        samples.len()
+                    );
+                }
+                Ok(samples)
+            }
+        }
+    }
 }
 
 /// One row of the table: its machine name, its label, and the product shape it
@@ -106,10 +164,10 @@ struct Row {
     surface: Surface,
 }
 
-const ROWS: [Row; 6] = [
+const ROWS: [Row; 7] = [
     Row {
         name: "recognition.short",
-        label: "recognition, short voice message (10 s)",
+        label: "recognition 10s",
         surface: Surface::Recognition {
             samples: Some(SHORT_SAMPLES),
             witness: reference::STAND_RECOGNITION_SHORT_SHA256,
@@ -117,7 +175,7 @@ const ROWS: [Row; 6] = [
     },
     Row {
         name: "recognition.typical",
-        label: "recognition, typical voice message (30 s)",
+        label: "recognition 30s",
         surface: Surface::Recognition {
             samples: Some(TYPICAL_SAMPLES),
             witness: reference::STAND_RECOGNITION_TYPICAL_SHA256,
@@ -125,7 +183,7 @@ const ROWS: [Row; 6] = [
     },
     Row {
         name: "recognition.long",
-        label: "recognition, long voice message (the whole pinned recording)",
+        label: "recognition 318s",
         surface: Surface::Recognition {
             samples: None,
             witness: reference::STAND_RECOGNITION_LONG_SHA256,
@@ -133,7 +191,7 @@ const ROWS: [Row; 6] = [
     },
     Row {
         name: "synthesis.short",
-        label: "synthesis, short text",
+        label: "synthesis 25 chars",
         surface: Surface::Synthesis {
             text: SHORT_TEXT,
             digest: reference::STAND_SYNTH_SHORT_DIGEST,
@@ -142,7 +200,7 @@ const ROWS: [Row; 6] = [
     },
     Row {
         name: "synthesis.typical",
-        label: "synthesis, typical text",
+        label: "synthesis 129 chars",
         surface: Surface::Synthesis {
             text: TYPICAL_TEXT,
             digest: reference::STAND_SYNTH_TYPICAL_DIGEST,
@@ -150,10 +208,19 @@ const ROWS: [Row; 6] = [
         },
     },
     Row {
-        name: "wake",
-        label: "wake word, two scoring windows in one pass",
-        surface: Surface::Wake {
-            score: reference::STAND_WAKE_SCORE,
+        name: "wake.background",
+        label: "wake background 1s",
+        surface: Surface::Listening {
+            audio: Audio::Idle,
+            witness: reference::STAND_WAKE_BACKGROUND,
+        },
+    },
+    Row {
+        name: "wake.active",
+        label: "wake active 1s",
+        surface: Surface::Listening {
+            audio: Audio::Speech,
+            witness: reference::STAND_WAKE_ACTIVE,
         },
     },
 ];
@@ -166,6 +233,10 @@ fn row(name: &str) -> Option<&'static Row> {
 /// The stand's entry point: the parent walks the closed row list, a child
 /// re-entered with one row index measures that row.
 pub fn main_entry() {
+    if let Err(error) = cold::supported() {
+        eprintln!("stand: {error:#}");
+        std::process::exit(1);
+    }
     run::record_run(run::Mode {
         label: "stand",
         record: measurements::Record::Stand,
@@ -187,7 +258,23 @@ fn measure(row: &Row, bounds: Bounds) -> Result<Reading> {
             digest,
             samples,
         } => synthesis(row, text, digest, samples),
-        Surface::Wake { score } => wake(row, score),
+        Surface::Listening { audio, witness } => listening(row, audio, witness, bounds),
+    }
+}
+
+/// The warm arm's two premises: it faulted no page of the files the cold arm read in from
+/// disk, and it opened no model the cold arm did not — a file first opened inside the arm
+/// would be read cold with nothing watching it. The loader's record is per thread, which is
+/// the shape it needs for two concurrent builds; a row measures on one thread, so nothing it
+/// opens escapes the check.
+fn warm_checked(cache: &cold::Cache, held: &cold::Held) -> Result<()> {
+    cache.assert_no_growth(held)?;
+    match loader::take_opened().as_slice() {
+        [] => Ok(()),
+        [path, ..] => bail!(
+            "`{}` was first opened during the warm arm, so it was not warm",
+            path.display()
+        ),
     }
 }
 
@@ -201,17 +288,25 @@ fn recognition(
     bounds: Bounds,
 ) -> Result<Reading> {
     let recording = corpus::pinned(RECOGNITION_RECORDING)?;
+    let cache = cold::Cache::over_models_root()?;
     let limit = samples.unwrap_or(usize::MAX);
 
+    cache.evict()?;
     let t = Stopwatch::start();
     let mut transcriber = Transcriber::open_product(bounds.max_rss_mib)?;
     let cold = call(&mut transcriber, &recording, limit)?;
     let cold_ms = t.ms();
+    // The warm column's state, taken rather than assumed: the files the cold arm opened,
+    // then the memory reading — so the reading's bitmaps are not in the footprint — then
+    // what the cold arm left of them in the cache; the arm afterwards is shown to have
+    // faulted no page of them in from disk.
+    let opened = loader::take_opened();
     let memory = report::Memory::take();
-
+    let held = cache.reading(opened)?;
     let t = Stopwatch::start();
     let warm = call(&mut transcriber, &recording, limit)?;
     let warm_ms = t.ms();
+    warm_checked(&cache, &held)?;
     cold_warm(row, cold.regions == warm.regions, "regions");
     let digest = answer_digest(&warm);
     let equal = digest == witness;
@@ -258,16 +353,20 @@ fn answer_digest(out: &transcribe::Transcription) -> String {
 
 /// One text through the product's synthesis call, cold and then warm.
 fn synthesis(row: &Row, text: &str, witness: u64, witness_samples: usize) -> Result<Reading> {
+    let cache = cold::Cache::over_models_root()?;
+    cache.evict()?;
     let t = Stopwatch::start();
     let pair = Arc::new(Pair::of_role(Role::Synthesis)?);
     let mut engine = Synthesis::new(pair)?;
     let cold = engine.synthesize(text, SYNTH_SEED)?;
     let cold_ms = t.ms();
+    let opened = loader::take_opened();
     let memory = report::Memory::take();
-
+    let held = cache.reading(opened)?;
     let t = Stopwatch::start();
     let warm = engine.synthesize(text, SYNTH_SEED)?;
     let warm_ms = t.ms();
+    warm_checked(&cache, &held)?;
     cold_warm(
         row,
         cold.len() == warm.len() && report::digest(&cold) == report::digest(&warm),
@@ -309,54 +408,87 @@ fn synthesis(row: &Row, text: &str, witness: u64, witness_samples: usize) -> Res
     })
 }
 
-/// The ear path's own form: two consecutive scoring windows through one batched
-/// pass — the mel front end, the convs, all twenty-four encoder blocks and the
-/// projector — embedded cold and warm and scored against a later window of the
-/// same recording.
-fn wake(row: &Row, witness: f32) -> Result<Reading> {
-    let recording = corpus::pinned(RECOGNITION_RECORDING)?;
-    let first = window(&recording, WAKE_OFFSET)?;
-    // The window the ear scores one stride later: the pair the detector forms.
-    let second = window(&recording, WAKE_OFFSET + listen::SCORE_STRIDE_SAMPLES)?;
+/// One listening session on the product's own loop (`bench::detect`) — the gate, the
+/// spliced windows, the stride, the rolling decision and the flush — cold and then warm
+/// through one listener, which is built once and held: a daemon's form, and the one this
+/// row must not measure a rebuild of.
+fn listening(
+    row: &Row,
+    audio: Audio,
+    witness: reference::WakeWitness,
+    bounds: Bounds,
+) -> Result<Reading> {
+    let cache = cold::Cache::over_models_root()?;
+    let deadline = Deadline::new(bounds.timeout_secs);
 
+    cache.evict()?;
+    // Outside the timed arm: reading the recording is input preparation, not what the row
+    // measures, so it is read here and nothing timed reads it again.
+    let samples = audio.samples()?;
     let t = Stopwatch::start();
+    // The daemon's start-up: the pair mapped, the stored enrolment loaded, and the front
+    // end a session scores through compiled — so an idle session holds the graphs it is
+    // not scoring.
     let pair = Arc::new(Pair::of_role(Role::Recognition)?);
+    let enrollment = enrolment::stand(&pair)?;
     let mut listener = Listener::new(pair);
-    let [primary, neighbour] = listener.embed_pair(&first, &second)?;
+    listener.bring_up()?;
+    let cold = session(&mut listener, &enrollment, &samples, deadline)?;
     let cold_ms = t.ms();
+    let opened = loader::take_opened();
     let memory = report::Memory::take();
-
+    let held = cache.reading(opened)?;
     let t = Stopwatch::start();
-    let [again, against] = listener.embed_pair(&first, &second)?;
+    let warm = session(&mut listener, &enrollment, &samples, deadline)?;
     let warm_ms = t.ms();
-    let non_finite = report::non_finite(&primary)
-        + report::non_finite(&neighbour)
-        + report::non_finite(&again)
-        + report::non_finite(&against);
-    if non_finite != 0 {
-        bail!("the pair's embeddings have {non_finite} non-finite values — no reading");
-    }
-    cold_warm(row, primary == again && neighbour == against, "embeddings");
-    // The score needs a second side: a later window of the same recording, taken
-    // through the same pass as the primary window rather than alone. It is not a
-    // second calibration pass and not timed.
-    let reference = window(&recording, WAKE_REFERENCE_OFFSET)?;
-    let [later, primary_again] = listener.embed_pair(&reference, &first)?;
-    let score = wake::cosine(&primary, &later);
-    let equal = (score - witness).abs() < 5e-5;
-    if !equal {
+    warm_checked(&cache, &held)?;
+
+    if cold != warm {
         eprintln!(
-            "stand: {}: the score moved from its witness ({score:.4} against {witness:.4})",
-            row.name
+            "stand: {}: the cold and warm sessions decided differently ({} against {})",
+            row.name, cold, warm,
         );
     }
-    // The same window in a different slot, beside a different neighbour: a pass that
-    // let one window's rows reach the other's would move this.
-    let neighbour_free = primary_again == primary;
-    if !neighbour_free {
+    match audio {
+        Audio::Idle => {
+            if warm.vad != 0 {
+                bail!(
+                    "the idle session found speech on {} of its {} hops — the background row is \
+                     a session with no speech in it",
+                    warm.vad,
+                    warm.hops
+                );
+            }
+            if warm.windows != 0 {
+                bail!(
+                    "the idle session scored {} windows — nothing of the ear path has work \
+                     without speech",
+                    warm.windows
+                );
+            }
+            if warm.hops == 0 {
+                bail!("the idle session decided on no hop at all — no voice-activity reading");
+            }
+        }
+        Audio::Speech => {
+            if warm.fires != 0 {
+                bail!(
+                    "the active session accepted {} fires in {} s of audio — this row measures \
+                     speech that does not fire",
+                    warm.fires,
+                    STREAM_SECONDS
+                );
+            }
+            if warm.windows == 0 {
+                bail!("the active session scored no window — nothing of the ear path ran");
+            }
+        }
+    }
+    let equal = warm == witness;
+    if !equal {
         eprintln!(
-            "stand: {}: the first window's embedding moved when its neighbour did",
-            row.name
+            "stand: {}: the session moved from its witness ({} against {})",
+            row.name, warm, witness,
         );
     }
     Ok(Reading {
@@ -365,13 +497,34 @@ fn wake(row: &Row, witness: f32) -> Result<Reading> {
         warm_ms,
         memory: memory.finish(),
         detail: run::detail([
-            ("windows", json!(listen::PAIR)),
-            ("dim", json!(primary.len())),
-            ("score", json!(format!("{score:.4}"))),
-            ("witness", json!(format!("{witness:.4}"))),
+            ("seconds", json!(STREAM_SECONDS)),
+            ("session", json!(warm.to_string())),
+            ("witness", json!(witness.to_string())),
             ("equal", json!(equal)),
-            ("neighbour_free", json!(neighbour_free)),
         ]),
+    })
+}
+
+/// One listening session: the product's detection stream over the row's audio, at the
+/// product's two-window pass and flushed at the end of the audio, answering what it
+/// decided. The enrolment is the pinned one — a stored prototype, so building it reads no
+/// model and cannot warm the arm this row exists to time.
+fn session(
+    listener: &mut Listener,
+    enrollment: &wake::Enrollment,
+    samples: &[f32],
+    deadline: Deadline,
+) -> Result<reference::WakeWitness> {
+    let mut stream = DetectionStream::paired(enrollment.clone());
+    stream.feed(samples, listener, deadline, "wake word")?;
+    stream.flush(listener, deadline, "wake word")?;
+    Ok(reference::WakeWitness {
+        hops: stream.hops(),
+        vad: stream.take_vad_hops(),
+        windows: stream.windows(),
+        passes: stream.passes(),
+        fires: stream.take_fires(),
+        scores: stream.scores(),
     })
 }
 
@@ -395,22 +548,6 @@ fn call(
         .with_context(|| format!("transcribing `{}`", path.display()))
 }
 
-/// One 16 kHz window at `offset`, refused when the recording is short: the
-/// ear pads a short slice with silence, and a score against a mostly-zero
-/// embedding is not a reading of the recording.
-fn window(path: &Path, offset: usize) -> Result<Vec<f32>> {
-    let samples = read(path, offset, listen::WINDOW_SAMPLES)?;
-    if samples.len() < listen::WINDOW_SAMPLES {
-        bail!(
-            "`{}` holds {} samples at {offset}, short of the {} a window takes",
-            path.display(),
-            samples.len(),
-            listen::WINDOW_SAMPLES
-        );
-    }
-    Ok(samples)
-}
-
 /// Print a cold/warm difference as a witness: the two calls may take different
 /// cached routes, and the row is still a reading of the product.
 fn cold_warm(row: &Row, same: bool, what: &str) {
@@ -423,6 +560,11 @@ fn cold_warm(row: &Row, same: bool, what: &str) {
 }
 
 fn print_rows(readings: &[Reading]) {
+    let width = readings
+        .iter()
+        .map(|reading| label(reading).len())
+        .max()
+        .unwrap_or(0);
     for reading in readings {
         let [
             cold,
@@ -433,7 +575,7 @@ fn print_rows(readings: &[Reading]) {
             peak_gpu,
         ] = cells(reading);
         println!(
-            "{:<58} cold={cold:>8} warm={warm:>8} resting_system={resting_system:>9} \
+            "{:<width$} cold={cold:>8} warm={warm:>8} resting_system={resting_system:>9} \
              resting_gpu={resting_gpu:>9} peak_system={peak_system:>9} peak_gpu={peak_gpu:>9} {}",
             label(reading),
             reading.diagnostics(),
@@ -509,24 +651,47 @@ mod tests {
         }
     }
 
-    /// A recognition row's label states the length of its own cut, so a changed cut
-    /// cannot leave the record's label claiming another.
+    /// A row's label states the magnitude its surface names — the cut in seconds, the
+    /// text in characters, the stream in seconds — so a changed cut, text or stream
+    /// cannot leave the record's label claiming another. The long row's magnitude is the
+    /// pinned recording's own length, read from the corpus; a machine without it skips
+    /// that one row rather than the check.
     #[test]
-    fn a_recognition_label_states_its_own_cut() {
+    fn a_label_states_its_own_magnitude() {
         for row in &ROWS {
-            let Surface::Recognition {
-                samples: Some(samples),
-                ..
-            } = row.surface
-            else {
-                continue;
-            };
-            let seconds = samples / transcribe::RATE as usize;
-            assert!(
-                row.label.contains(&format!("({seconds} s)")),
-                "`{}` does not state its {seconds} s cut",
-                row.label
-            );
+            match row.surface {
+                Surface::Recognition { samples: None, .. } => {
+                    if corpus::dir().is_err() {
+                        eprintln!("skipped: the pinned corpus is not installed");
+                        continue;
+                    }
+                    let recording = corpus::pinned(RECOGNITION_RECORDING)
+                        .expect("the pinned corpus recording is installed");
+                    let whole = read(&recording, 0, usize::MAX).expect("the recording");
+                    assert_eq!(
+                        row.label,
+                        format!("recognition {}s", whole.len() / transcribe::RATE as usize)
+                    );
+                }
+                Surface::Recognition {
+                    samples: Some(samples),
+                    ..
+                } => assert_eq!(
+                    row.label,
+                    format!("recognition {}s", samples / transcribe::RATE as usize)
+                ),
+                Surface::Synthesis { text, .. } => assert_eq!(
+                    row.label,
+                    format!("synthesis {} chars", text.chars().count())
+                ),
+                Surface::Listening { audio, .. } => {
+                    let mode = match audio {
+                        Audio::Idle => "background",
+                        Audio::Speech => "active",
+                    };
+                    assert_eq!(row.label, format!("wake {mode} {STREAM_SECONDS}s"));
+                }
+            }
         }
     }
 
@@ -648,13 +813,11 @@ mod tests {
         let body: Vec<&str> = lines.collect();
         assert_eq!(
             body[0],
-            "| recognition, short voice message (10 s) | 2.00s | 1.00s | 1.50GiB | 512.0MiB | \
-             2.00GiB | 1.00GiB |"
+            "| recognition 10s | 2.00s | 1.00s | 1.50GiB | 512.0MiB | 2.00GiB | 1.00GiB |"
         );
         assert_eq!(
             body[1],
-            "| recognition, typical voice message (30 s) | 2.00s | 1.00s | - | not measured | - | \
-             not measured |"
+            "| recognition 30s | 2.00s | 1.00s | - | not measured | - | not measured |"
         );
     }
 }

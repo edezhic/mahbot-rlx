@@ -36,6 +36,31 @@ pub fn models_dir() -> Result<PathBuf> {
     crate::paths::require_dir(crate::paths::root(), "model")
 }
 
+thread_local! {
+    /// The model files opened on this thread since the last [`take_opened`]: a measurement
+    /// is checked against what a row actually read, not against the whole root. One entry
+    /// per file, so a host that never takes it holds five paths rather than one per open.
+    static OPENED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The model files opened on this thread since the last call. A caller that establishes a
+/// state over the models root before its work uses this afterwards to check exactly the
+/// files that work opened.
+pub(crate) fn take_opened() -> Vec<PathBuf> {
+    OPENED.with(|opened| std::mem::take(&mut *opened.borrow_mut()))
+}
+
+/// Record a model file this thread opened. A file opened twice is one entry: the record is
+/// what a page-cache reading is taken over, and one reading per file is all it can be.
+fn opened(path: &Path) {
+    OPENED.with(|opened| {
+        let mut opened = opened.borrow_mut();
+        if !opened.iter().any(|known| known == path) {
+            opened.push(path.to_path_buf());
+        }
+    });
+}
+
 /// What a tensor is, as far as loading rules are concerned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Class {
@@ -511,6 +536,7 @@ impl Model {
         let path = path.as_ref().to_path_buf();
         let file = GgufFile::from_path_mmap(&path)
             .with_context(|| format!("open gguf {}", path.display()))?;
+        opened(&path);
 
         let arch = meta_str(&file, "general.architecture")
             .unwrap_or("")
@@ -589,6 +615,7 @@ impl Model {
         let path = path.as_ref().to_path_buf();
         let file = GgufFile::from_path_mmap(&path)
             .with_context(|| format!("open gguf {}", path.display()))?;
+        opened(&path);
         let arch = meta_str(&file, "general.architecture").unwrap_or("");
         if arch != "ced" {
             bail!(

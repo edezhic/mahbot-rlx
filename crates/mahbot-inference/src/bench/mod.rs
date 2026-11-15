@@ -145,6 +145,9 @@ mod real_audio;
 mod record;
 mod sets;
 mod voices;
+
+pub(crate) use detect::DetectionStream;
+
 // `crate::corpus` transcribes the same pinned corpus the false-accept phase feeds,
 // so it is named from there without opening the bench's private modules.
 pub(crate) use sets::REAL_AUDIO_FILES;
@@ -164,7 +167,6 @@ use crate::wake::{self, Enrollment};
 use crate::guard::{Abort, Deadline, EXIT_STOPPED, MemoryCeiling, RunLock, Watch};
 use audio::{Category, Synth};
 use config::BenchConfig;
-use detect::DetectionStream;
 use voices::Speaker;
 
 /// The bench's exit contract, shared with the corpus build and the harnesses that

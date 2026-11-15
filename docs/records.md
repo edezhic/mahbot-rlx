@@ -9,8 +9,8 @@ columns and the figures they carry.
 | column | figure |
 |---|---|
 | `row` | the product shape measured, in a process of its own |
-| `cold` | the call from a process with no models loaded, including loading them |
-| `warm` | the same call with the models already resident |
+| `cold` | the row's work on a machine whose page cache does not hold its input — the short-lived command-line path, which loads the models every time |
+| `warm` | the same work with the models in the page cache and the engine already loaded — a request on an engine that is up |
 | `resting system` | the system share of the physical footprint after the cold call and before the warm call |
 | `resting GPU` | the graphics-tagged share of the same footprint reading |
 | `peak system` | the lifetime maximum of the whole footprint minus the highest GPU reading — a derived figure, not a peak of its own |
@@ -21,6 +21,62 @@ The corpus record's first columns are `recording` in place of `row`, and `audio 
 length) in place of the two time columns; its memory columns are the same. The wake
 record reports `peak resident`, the resident set's high-water mark for the whole
 run.
+
+## The two states, and how they are established
+
+`cold` and `warm` are properties of the machine, not of the process, so the stand
+makes them instead of inheriting them: `src/cold.rs` owns the method, says why it
+is the one that works here, how the state is established over the models root
+rather than over a list of files, how the warm arm is checked around the arm that
+reads it, and what the instrument itself sees fail a row rather than be taken
+wrong. A platform without the method is refused before the run starts rather than
+given a `cold` column that means nothing.
+
+The lazy engine load is in the cold column, because the cold arm is what opens the
+engine and a daemon pays that once: `warm` is a request on an engine that is up,
+which is what every request after the first one costs.
+
+A take is a result only on a machine that is otherwise idle: a parallel build,
+test run or another measurement shares the cores, the GPU and the models, and the
+heavy-run lock covers none of them. The record's `load` line is its own evidence
+of what the machine was doing; a take whose row comes back far from the figure the
+product has established, with the product untouched, is a busy machine rather
+than a change, and is discarded and re-taken instead of recorded.
+
+## The two wake rows
+
+Both rows stream one second of audio through the product's own detection stream
+(`bench::detect`), on one listener brought up the way a daemon brings it up —
+weights mapped, the scoring front end compiled — so neither row measures a
+rebuild.
+
+| row | audio | what it prices |
+|---|---|---|
+| `wake background 1s` | one second with no speech in it | an idle daemon: the voice-activity decision per hop and the ring's housekeeping, and nothing else |
+| `wake active 1s` | one second of speech that does not fire | a daemon while somebody is talking: scoring at the product's cadence, the windows and paired encoder passes `stand::STREAM_SECONDS` derives from the stride |
+
+`warm` is therefore the cost of one second of streamed audio, which is what a
+real-time budget is read against — 1 000 ms of audio per second is the ceiling.
+`cold` is that plus the listener's start-up from a cold cache: the pair read and
+the front end compiled for the first time, the same work in both rows, and on the
+active row the first pass's uploads as well. A fire is cheaper than the active
+row, because it starts a cooldown that skips the gate and the scoring; the active
+row measures the common case, the whole time somebody is talking.
+
+The enrolment and its calibration are a one-time setup outside the product's
+start-up and are in neither column: the stand's is a pinned prototype
+(`src/enrolment.rs`), loaded as a stored enrolment rather than derived, so no
+model is read before the arm. It carries no anti-prototypes, so the decision's
+veto takes its empty branch and its cost — one cosine of the prototype's width per
+anti-prototype, about a tenth of a millisecond per second of audio, a thirteenth
+of a percent of the active row — is not in these figures; a full negative pool
+would also mean shipping stand-in enrolment data the product does not have.
+
+The two rows' memory columns are not comparable with each other: the background
+row's listener has never scored, and reads about two hundred mebibytes more
+graphics-tagged memory than the active row's, which has scored. What holds that
+difference and what retires it is not something these rows establish, and is not
+claimed here.
 
 ## The physical-footprint basis (`- memory: footprint`)
 

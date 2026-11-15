@@ -19,8 +19,10 @@
 
 pub mod bench;
 pub mod ced;
+mod cold;
 pub mod corpus;
 pub mod emit;
+mod enrolment;
 pub mod graphs;
 pub mod guard;
 pub mod host;

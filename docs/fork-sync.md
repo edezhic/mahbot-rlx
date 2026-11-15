@@ -330,7 +330,7 @@ is how a take can be checked without editing the tree; a subset run
 
 `MAHBOT_PHASE_SPLIT=1` prints one recognition call's phase split — tagger, VAD and
 plan, encoder front, prompt prefill and decode — on stderr. No record carries it:
-the six-row stand measures whole calls.
+the seven-row stand measures whole calls.
 
 ## 9. Re-pin, do not widen
 

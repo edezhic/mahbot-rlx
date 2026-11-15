@@ -27,7 +27,7 @@
 //! boundary: the offline phases at the end of a clip's turn and of a file's audio and
 //! its silence gap — the boundaries the sweep's figures were taken with, so no group
 //! spans a feed — and the product's paired stream
-//! ([`with_group`](DetectionStream::with_group) at [`listen::PAIR`]) at the end of the
+//! ([`paired`](DetectionStream::paired)) at the end of the
 //! caller's audio, paying one stride of delay for it: a fire resolves at the feed that
 //! brought its neighbour, never later.
 //!
@@ -113,6 +113,17 @@ pub(crate) struct DetectionStream {
     /// [`listen::GROUP`] where the offline sweep's grouping pays, one where the
     /// set is small enough that the ungrouped order is worth more than the pass.
     group: usize,
+    /// Every hop the detector decided on, speech or not: what an idle stream spends and
+    /// what the background row's witness states. Cumulative for the stream's life.
+    hops: u64,
+    /// Windows this stream embedded, one scoring stride of audio each — a fire drops the
+    /// rest of its group, so a few may not be applied. Cumulative.
+    windows: usize,
+    /// Encoder passes those windows were embedded in. Cumulative.
+    passes: usize,
+    /// A rolling digest of every window's soft score, so a caller can print what the
+    /// decision computed without keeping the scores. Cumulative.
+    scores: u64,
 }
 
 impl DetectionStream {
@@ -122,6 +133,12 @@ impl DetectionStream {
     /// embedded and applied on its own — the recall and false-reaction sets.
     pub(crate) fn warm(enrollment: Enrollment) -> Self {
         Self::with_group(enrollment, 1)
+    }
+
+    /// The product's stream: windows embedded in pairs, the form a listening session
+    /// runs.
+    pub(crate) fn paired(enrollment: Enrollment) -> Self {
+        Self::with_group(enrollment, listen::PAIR)
     }
 
     /// The same stream with its windows embedded in groups of [`listen::GROUP`]:
@@ -153,6 +170,10 @@ impl DetectionStream {
             pending: Vec::new(),
             pending_at: Vec::new(),
             group: group.max(1),
+            hops: 0,
+            windows: 0,
+            passes: 0,
+            scores: crate::reference::SCORE_DIGEST_SEED,
         }
     }
 
@@ -177,12 +198,37 @@ impl DetectionStream {
         self.samples_fed
     }
 
-    /// VAD-positive hops since the last read, for the VAD-active denominator.
+    /// VAD-positive hops since the last read, for the VAD-active denominator. Drains,
+    /// unlike the cumulative counters above.
     pub(crate) fn take_vad_hops(&mut self) -> u64 {
         core::mem::take(&mut self.vad_speech_hops)
     }
 
-    /// Fires accepted since the last read.
+    /// Every hop the detector decided on, speech or not: what an idle stream spends
+    /// and what the background row's witness states.
+    pub(crate) fn hops(&self) -> u64 {
+        self.hops
+    }
+
+    /// Windows embedded, one scoring stride of audio each; a fire drops the rest of its
+    /// group, so a few may not be applied.
+    pub(crate) fn windows(&self) -> usize {
+        self.windows
+    }
+
+    /// Encoder passes those windows were embedded in: one per full group, plus the
+    /// flush's for a lone tail window.
+    pub(crate) fn passes(&self) -> usize {
+        self.passes
+    }
+
+    /// A rolling digest of every window's soft score, in decision order.
+    pub(crate) fn scores(&self) -> u64 {
+        self.scores
+    }
+
+    /// Fires accepted since the last read. Drains, like
+    /// [`take_vad_hops`](Self::take_vad_hops).
     pub(crate) fn take_fires(&mut self) -> usize {
         let fires = self.fires.len();
         self.fires.clear();
@@ -278,6 +324,7 @@ impl DetectionStream {
             }
             self.vad_cursor += HOP_LENGTH;
             self.last_score_sample_count += HOP_LENGTH;
+            self.hops += 1;
         }
         self.segment_silence_hops = hop_count;
         speech_seen
@@ -332,6 +379,8 @@ impl DetectionStream {
         let windows = std::mem::take(&mut self.pending);
         let at = std::mem::take(&mut self.pending_at);
         let embeddings = embed.embed_group(&windows)?;
+        self.windows += windows.len();
+        self.passes += 1;
         self.apply(&embeddings, &at);
         Ok(())
     }
@@ -345,6 +394,7 @@ impl DetectionStream {
         let thresholds = self.enrollment.thresholds;
         for (embedding, &fired_at) in embeddings.iter().zip(at) {
             let total = self.enrollment.soft_score(embedding);
+            self.scores = crate::reference::score_digest(self.scores, total);
             let adaptive_value = if total < self.geometry.reset {
                 self.adaptive
                     .feed(total, &thresholds, self.geometry.static_threshold)
@@ -545,7 +595,7 @@ mod tests {
     #[test]
     fn a_grouped_and_an_ungrouped_stream_decide_alike() {
         let mut ungrouped = stream();
-        let mut grouped = DetectionStream::with_group(enrolment(), listen::GROUP);
+        let mut grouped = DetectionStream::grouped(enrolment());
         // The same four windows, scored at the same stream positions: the second
         // one's rolling sum reaches the threshold.
         let embeddings = vec![vec![1.0f32, 0.0]; 4];
@@ -653,7 +703,7 @@ mod tests {
     fn a_paired_stream_decides_where_an_ungrouped_one_does() {
         let audio = speech(6);
         let mut ungrouped = DetectionStream::warm(enrolment());
-        let mut paired = DetectionStream::with_group(enrolment(), listen::PAIR);
+        let mut paired = DetectionStream::paired(enrolment());
         let mut embed = Prototype { calls: Vec::new() };
 
         let (single, single_hops) = decisions(&mut ungrouped, &mut embed, &audio);
@@ -739,7 +789,7 @@ mod tests {
 
         // Both fronts on the one listener, which is what the product does.
         let mut ungrouped = DetectionStream::warm(enrollment.clone());
-        let mut paired = DetectionStream::with_group(enrollment, listen::PAIR);
+        let mut paired = DetectionStream::paired(enrollment);
         let (single, single_hops) = decisions(&mut ungrouped, &mut listener, &audio);
         let (two, two_hops) = decisions(&mut paired, &mut listener, &audio);
         eprintln!(
@@ -776,7 +826,7 @@ mod tests {
     #[test]
     fn a_paired_stream_holds_one_window_for_its_neighbour() {
         let audio = speech(3);
-        let mut stream = DetectionStream::with_group(enrolment(), listen::PAIR);
+        let mut stream = DetectionStream::paired(enrolment());
         let mut embed = Prototype { calls: Vec::new() };
         let deadline = Deadline::new(600);
         for chunk in audio.chunks(FRAME_LENGTH) {

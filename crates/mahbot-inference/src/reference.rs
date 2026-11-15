@@ -87,17 +87,74 @@ pub const STAND_SYNTH_SHORT_SAMPLES: usize = 44_160;
 pub const STAND_SYNTH_TYPICAL_DIGEST: u64 = 0x5a54_f2e4_ee60_8966;
 pub const STAND_SYNTH_TYPICAL_SAMPLES: usize = 172_800;
 
-/// The stand's wake row: the cosine the pair pass's first window answers against a
-/// later window of [`crate::stand::RECOGNITION_RECORDING`] — the pinned corpus
-/// recording the row reads, at `WAKE_OFFSET` and `WAKE_REFERENCE_OFFSET` of it. A
-/// witness, not a gate.
-///
-/// The two windows go through the encoder in one batched pass, and this reading
-/// is that pass's. It is the one-window pass's to the fourth decimal: a window's mel,
-/// its conv rows and its attention are its own at any batch, which the row's own
-/// `neighbour_free` reading holds — the first window's embedding is bit-identical
-/// when its neighbour changes.
-pub const STAND_WAKE_SCORE: f32 = 0.911_153;
+/// The seed of a session's score digest, and the answer of a session that scored nothing:
+/// the detection stream hashes each window's soft score into it in decision order, so a
+/// changed decision moves the digest even when the timings look normal.
+pub(crate) const SCORE_DIGEST_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Fold one window's soft score into a session's score digest — FNV-1a over the score's
+/// bits, seeded with [`SCORE_DIGEST_SEED`] — so the arithmetic has one home.
+pub(crate) fn score_digest(state: u64, score: f32) -> u64 {
+    (state ^ u64::from(score.to_bits())).wrapping_mul(0x0100_0000_01b3)
+}
+
+/// What one listening row must compute: the decisions its stream reached, printed beside
+/// the run's own so that a silent behavioural change shows up even when the timings look
+/// normal. A witness, not a gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeWitness {
+    /// Every hop the voice-activity detector decided on.
+    pub hops: u64,
+    /// The hops among them where it found speech.
+    pub vad: u64,
+    /// Windows the session embedded.
+    pub windows: usize,
+    /// Encoder passes it spent embedding them: a paired pass embeds two windows at once.
+    pub passes: usize,
+    /// Fires the decision accepted.
+    pub fires: usize,
+    /// A rolling digest of every window's soft score, in decision order; a session that
+    /// scored nothing leaves it at its seed.
+    pub scores: u64,
+}
+
+impl fmt::Display for WakeWitness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "hops={} vad={} windows={} passes={} fires={} scores={:016x}",
+            self.hops, self.vad, self.windows, self.passes, self.fires, self.scores
+        )
+    }
+}
+
+/// The stand's background listening row: one second of an idle microphone's floor through
+/// the product's detection stream. The detector decides on every hop and finds no speech,
+/// so nothing is scored and nothing can fire — what an idle daemon spends, and nothing
+/// else.
+pub const STAND_WAKE_BACKGROUND: WakeWitness = WakeWitness {
+    hops: 58,
+    vad: 0,
+    windows: 0,
+    passes: 0,
+    fires: 0,
+    scores: SCORE_DIGEST_SEED,
+};
+
+/// The stand's active listening row: one second of [`crate::stand::RECOGNITION_RECORDING`]
+/// from [`crate::stand::WAKE_OFFSET`] through the same stream, so scoring runs at the
+/// product's cadence. The enrolment is a different speaker from that recording, so the
+/// session reaches no fire — the cost of the whole time somebody is talking, which is the
+/// common case; a fire would be cheaper, because its cooldown skips the gate and the
+/// scoring.
+pub const STAND_WAKE_ACTIVE: WakeWitness = WakeWitness {
+    hops: 61,
+    vad: 57,
+    windows: 6,
+    passes: 3,
+    fires: 0,
+    scores: 0xd6e1_199d_5652_a159,
+};
 
 /// The text's closing words the round trip demands, in order, at the end of the
 /// hearing: four, the shortest run that still proves the ending. The recogniser is not

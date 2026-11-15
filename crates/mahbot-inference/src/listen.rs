@@ -489,6 +489,17 @@ impl Listener {
         Ok(slot.as_mut().expect("the front end was built just above"))
     }
 
+    /// Build the front end a listening session scores through, so a listener that has not
+    /// scored yet still holds its weights and graphs: what a daemon's start-up leaves it
+    /// with, and what an idle session never asks for itself. The one-window front end is
+    /// the flush's, built when a session ends on a lone window as the product builds it:
+    /// compiling it at start-up instead held 214 MiB more graphics-tagged memory on the
+    /// stand's wake rows, and a listener that never flushes a lone window has no use for it.
+    pub(crate) fn bring_up(&mut self) -> Result<()> {
+        self.front(PAIR)?;
+        Ok(())
+    }
+
     /// `batch` windows of the front end's own length in one pass → one pooled,
     /// unit-length embedding each, in slot order.
     fn embed_windows(&mut self, batch: usize, windows: &[&[f32]]) -> Result<Vec<Vec<f32>>> {

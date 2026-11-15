@@ -8,18 +8,18 @@
 //!
 //! # The zero-residency method
 //!
-//! Nothing in the product purges the page cache, and the stand's cold column is a process
-//! with no models loaded rather than a cold cache — on a machine whose cache is warm the
-//! synthesis cold row does not move at all, so an unchanged `STAND.md` is not a failed
-//! measurement. The reproducible no-root method is an invalidation over a read-only mapping
-//! of the whole model file: `msync(MS_INVALIDATE)` drops its clean pages from the page cache
-//! on this platform, where `madvise(MADV_DONTNEED)` and `MADV_FREE` do not. Residency is then
-//! read from a second, never-faulted mapping of the same file, so a zero is the page cache's
-//! answer rather than the invalidated mapping's own page-table entries; it is asserted over
-//! the exact extents immediately before every arm, printed beside the take, and re-established
-//! between every one of them: a second round on the same file reads in a fraction of the time
-//! because the first round brought the pages in, so paired alternating takes mean nothing
-//! without the invalidation.
+//! Nothing in the product purges the page cache. The stand does, through `src/cold.rs`,
+//! which is this harness's method and carries its reasoning; this file is where it was
+//! proved, and the figures below are its first use. The reproducible no-root method is an
+//! invalidation over a read-only mapping of the whole model file: `msync(MS_INVALIDATE)`
+//! drops its clean pages from the page cache on this platform, where
+//! `madvise(MADV_DONTNEED)` and `MADV_FREE` do not. Residency is then read from a second,
+//! never-faulted mapping of the same file, so a zero is the page cache's answer rather
+//! than the invalidated mapping's own page-table entries; it is asserted over the exact
+//! extents immediately before every arm, printed beside the take, and re-established
+//! between every one of them: a second round on the same file reads in a fraction of the
+//! time because the first round brought the pages in, so paired alternating takes mean
+//! nothing without the invalidation.
 //!
 //! The note in `GgufFile::release_mapped_pages` that these primitives are no-ops on macOS
 //! measured the mapping's resident set, not the page cache; both observations hold, and that
