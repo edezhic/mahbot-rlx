@@ -44,7 +44,7 @@ use crate::host;
 use crate::listen;
 use crate::loader::{Pair, Role};
 use crate::report;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::Decoder;
 use crate::vad;
 
 // ── the plan ────────────────────────────────────────────────────────
@@ -566,7 +566,7 @@ impl Transcription {
 /// graphs and the caches the weights are read through.
 pub struct Transcriber {
     pair: Arc<Pair>,
-    tokenizer: Tokenizer,
+    decoder: Decoder,
     tagger: Tagger,
     /// The resident-set ceiling an input is refused against: the bound the caller's
     /// run is held to, so an input is refused against the figure that run enforces
@@ -575,16 +575,16 @@ pub struct Transcriber {
 }
 
 impl Transcriber {
-    /// Open the tokenizer over `pair` and hold `tagger`. Both are required:
+    /// Open the decoder over `pair` and hold `tagger`. Both are required:
     /// without the tagger a non-speech region could not carry a label, and a region
     /// never comes back empty. `ceiling_mib` is the resident-set bound the run is
     /// held to — [`crate::guard::Bounds::max_rss_mib`] for a run whose bounds were
     /// resolved once.
     pub fn open(pair: Arc<Pair>, tagger: Tagger, ceiling_mib: u64) -> Result<Self> {
-        let tokenizer = Tokenizer::from_model(&pair.body).context("the recognition tokenizer")?;
+        let decoder = Decoder::from_model(&pair.body).context("the recognition decoder")?;
         Ok(Self {
             pair,
-            tokenizer,
+            decoder,
             tagger,
             ceiling: ceiling_mib.saturating_mul(1024 * 1024),
         })
@@ -692,7 +692,7 @@ impl Transcriber {
 
         // Each chunk read once, on its own prompt, and its words kept only where the guards
         // stand behind them.
-        let (walk, answers) = read_pieces(&self.pair, &self.tokenizer, audio16, &chunk_list)?;
+        let (walk, answers) = read_pieces(&self.pair, &self.decoder, audio16, &chunk_list)?;
         // The recognition phase split, on stderr when `MAHBOT_PHASE_SPLIT` is set: the
         // front, prefill and decode are separate graphs, summed by `Walk::pieces`. The
         // value is read truthily, as `rlx_ir::env::flag` spells it: `=0`, `=false`,
@@ -852,7 +852,7 @@ impl Transcriber {
 /// MEL_HOP` samples. [`listen::recognise`] truncates to whole hops before calling this.
 pub(crate) fn read_whole(
     pair: &Arc<Pair>,
-    tokenizer: &Tokenizer,
+    decoder: &Decoder,
     audio: Vec<f32>,
 ) -> Result<listen::Walk> {
     let whole = Span {
@@ -861,9 +861,9 @@ pub(crate) fn read_whole(
     };
     let pieces = cut(whole, &audio);
     if pieces.len() == 1 {
-        return listen::Clip::once(pair, tokenizer, frames_of(audio.len()))?.run(audio);
+        return listen::Clip::once(pair, decoder, frames_of(audio.len()))?.run(audio);
     }
-    Ok(read_pieces(pair, tokenizer, &audio, &pieces)?.0)
+    Ok(read_pieces(pair, decoder, &audio, &pieces)?.0)
 }
 
 /// Every chunk of a plan read once, in the plan's own order: the joined walk
@@ -880,7 +880,7 @@ pub(crate) fn read_whole(
 /// text wrong.
 fn read_pieces(
     pair: &Arc<Pair>,
-    tokenizer: &Tokenizer,
+    decoder: &Decoder,
     audio: &[f32],
     chunks: &[Span],
 ) -> Result<(listen::Walk, Vec<Option<String>>)> {
@@ -891,7 +891,7 @@ fn read_pieces(
     let mut readings: Vec<(usize, (listen::Walk, Option<String>))> =
         Vec::with_capacity(chunks.len());
     for (frames, indexes) in &shapes {
-        let mut clip = listen::Clip::rung(pair, tokenizer, *frames)
+        let mut clip = listen::Clip::rung(pair, decoder, *frames)
             .with_context(|| format!("building the {frames}-frame recognition graphs"))?;
         for &index in indexes {
             let chunk = chunks[index];

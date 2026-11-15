@@ -49,3 +49,7 @@ features       = ["ir"]
 [[test]]
 name = "from_bytes"
 required-features = ["backend-tests"]
+
+[[test]]
+name = "skipped_metadata"
+required-features = ["backend-tests"]

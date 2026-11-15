@@ -24,7 +24,7 @@ use anyhow::{Result, anyhow, bail};
 use crate::graphs::{Compiled, DAC_MARGIN, DAC_WINDOW, FRONT_WINDOW, windows};
 use crate::loader::{Config, Head, Pair};
 use crate::report::Stopwatch;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::Encoder;
 use crate::{graphs, host};
 
 /// Waveform rate the sound half produces.
@@ -291,7 +291,7 @@ impl std::error::Error for Unspoken {}
 /// One compiled synthesis pipeline for one talker pair and one speaker.
 pub struct Synthesis {
     pair: Arc<Pair>,
-    tokenizer: Tokenizer,
+    encoder: Encoder,
     cfg: Config,
     body_vocab: usize,
     hkv: usize,
@@ -364,7 +364,7 @@ impl Synthesis {
             );
         }
 
-        let tokenizer = Tokenizer::from_model(&pair.body)?;
+        let encoder = Encoder::from_model(&pair.body)?;
         // A render's length is the text's, bounded by the talker's context: a file that
         // states none cannot say how long a render may run.
         let context = pair.body.context_length()?;
@@ -392,7 +392,7 @@ impl Synthesis {
 
         Ok(Self {
             pair,
-            tokenizer,
+            encoder,
             cfg,
             body_vocab,
             hkv,
@@ -423,7 +423,7 @@ impl Synthesis {
     /// plausibly need. A shorter audio is never returned as though it were the text.
     pub fn synthesize(&mut self, text: &str, seed: u64) -> Result<Vec<f32>> {
         self.build_ms = 0.0;
-        let text_ids = self.tokenizer.encode(text);
+        let text_ids = self.encoder.encode(text);
         if text_ids.is_empty() {
             return Err(Unspoken::raised(format!(
                 "the tokenizer gave no text tokens for `{text}`"

@@ -33,7 +33,7 @@ use crate::host;
 use crate::listen;
 use crate::loader::Pair;
 use crate::measurements::sha256_file;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::Decoder;
 use crate::{reference, synth, wake};
 
 use super::audio::Synth;
@@ -227,9 +227,9 @@ pub(crate) fn select(
     deadline: Deadline,
     ceiling: MemoryCeiling,
 ) -> Result<Selection> {
-    let tokenizer =
-        Tokenizer::from_model(&asr.body).context("a tokenizer for the intelligibility check")?;
-    let mut clip = listen::Clip::build(asr, &tokenizer, PROBE_FRAMES)
+    let decoder =
+        Decoder::from_model(&asr.body).context("a decoder for the intelligibility check")?;
+    let mut clip = listen::Clip::build(asr, &decoder, PROBE_FRAMES)
         .context("the intelligibility check's recognition path")?;
     deadline.check("voices")?;
     ceiling.check("voices")?;

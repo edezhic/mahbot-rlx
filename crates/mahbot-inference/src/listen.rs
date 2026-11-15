@@ -20,7 +20,7 @@ use crate::graphs::{self, Compiled};
 use crate::host;
 use crate::loader::{Config, Head, Pair};
 use crate::report;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::Decoder;
 
 /// Audio rate the listening path takes.
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -783,7 +783,7 @@ impl Shared {
 /// cut the input and read the pieces through this.
 pub(crate) struct Clip<'a> {
     pair: Arc<Pair>,
-    tokenizer: &'a Tokenizer,
+    decoder: &'a Decoder,
     /// The front end, built with the clip and held across chunks when a caller
     /// transcribes several of them. A one-shot clip ([`Clip::once`]) drops it after
     /// its single run, so the front end's graphs are never resident beside the
@@ -841,8 +841,8 @@ impl<'a> Clip<'a> {
     /// its first `run` and kept, and every `run` compiles its own prefill and drops
     /// it once it has run rather than hold a third graph whose upload carries the
     /// body.
-    pub(crate) fn build(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
-        Self::new(pair, tokenizer, frames, true)
+    pub(crate) fn build(pair: &Arc<Pair>, decoder: &'a Decoder, frames: usize) -> Result<Self> {
+        Self::new(pair, decoder, frames, true)
     }
 
     /// The clip an input that fits one piece is read on ([`recognise`]): [`Clip::build`]'s
@@ -850,15 +850,15 @@ impl<'a> Clip<'a> {
     /// resident beside the prefill. A second `run` on this
     /// clip rebuilds the front end, so a caller with several chunks uses
     /// [`Clip::build`] instead.
-    pub(crate) fn once(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
-        Self::new(pair, tokenizer, frames, false)
+    pub(crate) fn once(pair: &Arc<Pair>, decoder: &'a Decoder, frames: usize) -> Result<Self> {
+        Self::new(pair, decoder, frames, false)
     }
 
     /// A chunk of a **rung** of the transcription ladder: the rung is built by this call and
     /// the clip owns it, so the front end, the prefill and their arenas are given back when
     /// the clip is dropped after the group's last chunk. The decode graph and the mel graph
     /// are not the rung's — the pair and the process keep those — so they outlive the drop.
-    pub(crate) fn rung(pair: &Arc<Pair>, tokenizer: &'a Tokenizer, frames: usize) -> Result<Self> {
+    pub(crate) fn rung(pair: &Arc<Pair>, decoder: &'a Decoder, frames: usize) -> Result<Self> {
         let t = report::Stopwatch::start();
         let rung = Rung::build(pair, frames)?;
         let owed_ms = t.ms();
@@ -868,7 +868,7 @@ impl<'a> Clip<'a> {
         let hkv = cfg.kv_heads * cfg.head_dim;
         Ok(Self {
             pair: Arc::clone(pair),
-            tokenizer,
+            decoder,
             front: None,
             decode: Some(decode),
             shared: Some(rung),
@@ -885,7 +885,7 @@ impl<'a> Clip<'a> {
 
     fn new(
         pair: &Arc<Pair>,
-        tokenizer: &'a Tokenizer,
+        decoder: &'a Decoder,
         frames: usize,
         reuse_front: bool,
     ) -> Result<Self> {
@@ -901,7 +901,7 @@ impl<'a> Clip<'a> {
         let build_ms = front.build_ms();
         Ok(Self {
             pair: Arc::clone(pair),
-            tokenizer,
+            decoder,
             front: Some(front),
             decode: None,
             shared: None,
@@ -1131,8 +1131,8 @@ impl<'a> Clip<'a> {
         let finished = is_asr_eos(next);
         let truncated = !finished && generated.len() >= max_new;
         let text = match generated.iter().position(|&id| id == ASR_TEXT) {
-            Some(at) => self.tokenizer.decode(&generated[at + 1..]),
-            None => self.tokenizer.decode(&generated),
+            Some(at) => self.decoder.decode(&generated[at + 1..]),
+            None => self.decoder.decode(&generated),
         };
         // The digest covers the answer itself, not just its length: the generated
         // ids, the next token that stopped the walk, and the EOS flag.
@@ -1172,14 +1172,14 @@ impl<'a> Clip<'a> {
 /// (`crate::transcribe::read_whole`) — one pass over twenty-six seconds is a loop of
 /// invented words, not a reading — and an input that fits one piece is read by the
 /// single pass exactly as it always was.
-pub fn recognise(pair: &Arc<Pair>, tokenizer: &Tokenizer, audio: Vec<f32>) -> Result<Walk> {
+pub fn recognise(pair: &Arc<Pair>, decoder: &Decoder, audio: Vec<f32>) -> Result<Walk> {
     let frames = audio.len() / graphs::MEL_HOP;
     if frames == 0 {
         bail!("the audio gave no speech");
     }
     let mut audio = audio;
     audio.truncate(frames * graphs::MEL_HOP);
-    crate::transcribe::read_whole(pair, tokenizer, audio)
+    crate::transcribe::read_whole(pair, decoder, audio)
 }
 
 #[cfg(test)]

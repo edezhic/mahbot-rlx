@@ -26,7 +26,7 @@ use mahbot_inference::ced::{CED_MODEL, Tagger};
 use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::synth::{SAMPLE_RATE, Synthesis};
 use mahbot_inference::transcribe::{self, Transcriber};
-use mahbot_inference::{host, listen, music, reference, report, stand, tokenizer::Tokenizer, vad};
+use mahbot_inference::{host, listen, music, reference, report, stand, tokenizer::Decoder, vad};
 
 mod support;
 
@@ -328,8 +328,8 @@ fn long_recordings_are_read_as_what_was_said() {
     let Some((pair, tagger)) = open() else {
         return;
     };
-    let tokenizer = Tokenizer::from_model(&pair.body)
-        .unwrap_or_else(|error| panic!("the recognition tokenizer: {error:#}"));
+    let decoder = Decoder::from_model(&pair.body)
+        .unwrap_or_else(|error| panic!("the recognition decoder: {error:#}"));
     let mut transcriber = Transcriber::open(Arc::clone(&pair), tagger, support::ceiling_mib())
         .expect("the transcriber opens");
     for &(name, seconds, expected) in LONG_READINGS {
@@ -345,7 +345,7 @@ fn long_recordings_are_read_as_what_was_said() {
             seconds * listen::SAMPLE_RATE as usize,
         )
         .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
-        let read = listen::recognise(&pair, &tokenizer, audio.clone())
+        let read = listen::recognise(&pair, &decoder, audio.clone())
             .unwrap_or_else(|error| panic!("the one-shot reading of {name}: {error:#}"));
         println!(
             "one-shot {name} seconds={:.2} frames={} prompt={} generated={} truncated={} \

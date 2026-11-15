@@ -10,7 +10,7 @@
 use std::io::Cursor;
 
 use mahbot_inference::loader::Model;
-use mahbot_inference::tokenizer::Tokenizer;
+use mahbot_inference::tokenizer::{Decoder, Encoder};
 use rlx_gguf::{GgmlType, GgufWriter, MetaValue};
 
 /// The smallest `qwen3tts` body the loader accepts: one layer of width 8 and a
@@ -80,28 +80,85 @@ fn model(w: &GgufWriter) -> Result<Model, String> {
     out
 }
 
-/// The tokenizer a synthetic file opens, or the reason it was refused.
-fn tokenizer(w: &GgufWriter) -> Result<Tokenizer, String> {
-    model(w).and_then(|m| Tokenizer::from_model(&m).map_err(|e| format!("{e:#}")))
+/// The encoder a synthetic file opens, or the reason it was refused.
+fn encoder(w: &GgufWriter) -> Result<Encoder, String> {
+    model(w).and_then(|m| Encoder::from_model(&m).map_err(|e| format!("{e:#}")))
+}
+
+/// The decoder a synthetic file opens, or the reason it was refused.
+fn decoder(w: &GgufWriter) -> Result<Decoder, String> {
+    model(w).and_then(|m| Decoder::from_model(&m).map_err(|e| format!("{e:#}")))
 }
 
 /// The synthetic file itself loads: without this the refusals below could be
 /// failing for an unrelated reason.
 #[test]
 fn the_synthetic_file_loads() {
-    tokenizer(&synthetic(&[])).expect("the baseline file opens");
+    encoder(&synthetic(&[])).expect("the baseline file opens an encoder");
+    decoder(&synthetic(&[])).expect("the baseline file opens a decoder");
 }
 
-/// A present-but-mistyped id is refused rather than read as 0.
+/// Neither half materialises the vocabulary: the open leaves the three tables in
+/// the file, and a path that builds no tokenizer — the ear's — allocates none of
+/// it. A table the file cannot back is still refused, at the open (`rlx-gguf`'s
+/// `skipped_metadata` pins that half).
+#[test]
+fn the_vocabulary_is_left_in_the_file() {
+    let m = model(&synthetic(&[])).expect("the synthetic file opens");
+    for key in [
+        "tokenizer.ggml.tokens",
+        "tokenizer.ggml.token_type",
+        "tokenizer.ggml.merges",
+    ] {
+        assert!(
+            !m.file.metadata.contains_key(key),
+            "`{key}` must not be materialised by the open"
+        );
+        assert!(m.file.skipped(key).is_some(), "`{key}` is in the file");
+    }
+}
+
+/// Each half reads the tables of its own direction out of that mapping.
+#[test]
+fn the_two_halves_read_the_file_they_were_built_from() {
+    let control = |t: &str| MetaValue::String(t.into());
+    let m = model(&synthetic(&[
+        (
+            "tokenizer.ggml.tokens",
+            MetaValue::Array(vec![control("a"), control("<ctrl>"), control("c")]),
+        ),
+        (
+            "tokenizer.ggml.token_type",
+            MetaValue::Array(vec![
+                MetaValue::I32(1),
+                MetaValue::I32(3),
+                MetaValue::I32(1),
+            ]),
+        ),
+    ]))
+    .expect("the synthetic file opens");
+    let decoder = Decoder::from_model(&m).expect("the decoder");
+    assert_eq!(
+        decoder.decode(&[0, 1, 2]),
+        "ac",
+        "control tokens are not text"
+    );
+    let encoder = Encoder::from_model(&m).expect("the encoder");
+    assert_eq!(encoder.encode("a"), vec![0]);
+    assert_eq!(encoder.encode("c"), vec![2]);
+}
+
+/// A present-but-mistyped prompt id is a malformed file: both halves refuse it,
+/// though neither keeps the id.
 #[test]
 fn a_tokenizer_special_that_is_not_an_id_is_refused() {
-    let err = tokenizer(&synthetic(&[(
-        "tokenizer.ggml.bos_token_id",
-        MetaValue::F32(2.0),
-    )]))
-    .err()
-    .expect("a float is not an id");
-    assert!(err.contains("not an unsigned integer"), "{err}");
+    let file = synthetic(&[("tokenizer.ggml.bos_token_id", MetaValue::F32(2.0))]);
+    for err in [
+        encoder(&file).err().expect("a float is not an id"),
+        decoder(&file).err().expect("a float is not an id"),
+    ] {
+        assert!(err.contains("not an unsigned integer"), "{err}");
+    }
 }
 
 /// A context length is read only where it is asked for, and only as a row count: a
@@ -146,13 +203,20 @@ fn a_context_length_is_read_only_where_it_is_asked_for() {
 /// one is: the gate reads a string, and an integer is not a name it can match.
 #[test]
 fn a_tokenizer_rule_set_that_is_not_a_string_is_refused() {
-    let err = tokenizer(&synthetic(&[("tokenizer.ggml.model", MetaValue::U32(1))]))
-        .err()
-        .expect("an integer is not a rule set name");
-    assert!(
-        err.contains("`tokenizer.ggml.model` is missing or not a string"),
-        "{err}"
-    );
+    let file = synthetic(&[("tokenizer.ggml.model", MetaValue::U32(1))]);
+    for err in [
+        encoder(&file)
+            .err()
+            .expect("an integer is not a rule set name"),
+        decoder(&file)
+            .err()
+            .expect("an integer is not a rule set name"),
+    ] {
+        assert!(
+            err.contains("`tokenizer.ggml.model` is missing or not a string"),
+            "{err}"
+        );
+    }
 }
 
 /// A rule set this crate does not implement is refused by name: reading the
@@ -160,26 +224,29 @@ fn a_tokenizer_rule_set_that_is_not_a_string_is_refused() {
 /// different ids under the right model hash.
 #[test]
 fn an_unimplemented_tokenizer_rule_set_is_refused() {
-    let err = tokenizer(&synthetic(&[(
-        "tokenizer.ggml.model",
-        MetaValue::String("llama".into()),
-    )]))
-    .err()
-    .expect("not a rule set this crate reads");
-    assert!(
-        err.contains("llama") && err.contains("does not implement"),
-        "{err}"
-    );
+    let file = synthetic(&[("tokenizer.ggml.model", MetaValue::String("llama".into()))]);
+    for err in [
+        encoder(&file)
+            .err()
+            .expect("not a rule set this crate reads"),
+        decoder(&file)
+            .err()
+            .expect("not a rule set this crate reads"),
+    ] {
+        assert!(
+            err.contains("llama") && err.contains("does not implement"),
+            "{err}"
+        );
+    }
 }
 
 /// The GPT-2 bodies state no `bos` — the TTS file states an `eos` and nothing
-/// else — so an omitted id is 0 there and the file opens.
+/// else — so an omitted id is no reason to refuse the file.
 #[test]
 fn the_gpt2_rule_set_needs_no_bos() {
-    let t = tokenizer(&synthetic(&[(
+    encoder(&synthetic(&[(
         "tokenizer.ggml.eos_token_id",
         MetaValue::U32(154_086),
     )]))
     .expect("the gpt2 rule set reads no bos");
-    assert_eq!((t.bos(), t.eos()), (0, 154_086));
 }

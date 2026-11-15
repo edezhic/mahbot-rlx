@@ -389,6 +389,21 @@ impl Role {
     }
 }
 
+/// The three vocabulary arrays a body file carries. Materialised as
+/// `MetaValue`s they cost 21 MiB of the process's physical footprint — the column
+/// the stand reports — behind one 1.7B body, on every path that opens it: a
+/// 32-byte enum per element, in a table rounded up from 151,936 entries to
+/// 262,144 slots. Nothing outside a tokenizer reads them — the ear path builds no
+/// tokenizer at all, recognition reads only id→text, synthesis only text→id — so
+/// the open leaves them in the file and [`crate::tokenizer::Encoder`] /
+/// [`crate::tokenizer::Decoder`] read them out of the mapping, which the process
+/// is not charged for.
+const VOCABULARY: &[&str] = &[
+    "tokenizer.ggml.tokens",
+    "tokenizer.ggml.merges",
+    "tokenizer.ggml.token_type",
+];
+
 /// A loaded file: mmapped bytes + everything the loader decided about it.
 pub struct Model {
     pub path: PathBuf,
@@ -532,9 +547,13 @@ impl Model {
     }
 
     /// Open a file read-only (mmap) and plan every tensor in it.
+    ///
+    /// The vocabulary tables are left in the mapping rather than parsed into
+    /// metadata — no path of this crate materialises one, and the tokenizer
+    /// reads them back through [`GgufFile::skipped`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = GgufFile::from_path_mmap(&path)
+        let file = GgufFile::from_path_mmap_skipping(&path, VOCABULARY)
             .with_context(|| format!("open gguf {}", path.display()))?;
         opened(&path);
 
@@ -613,7 +632,7 @@ impl Model {
     /// lands on.
     pub fn open_ced(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = GgufFile::from_path_mmap(&path)
+        let file = GgufFile::from_path_mmap_skipping(&path, VOCABULARY)
             .with_context(|| format!("open gguf {}", path.display()))?;
         opened(&path);
         let arch = meta_str(&file, "general.architecture").unwrap_or("");

@@ -5,11 +5,23 @@
 //! The tokenizer that lives in the GGUF itself.
 //!
 //! The Qwen files carry `tokenizer.ggml.tokens` and `tokenizer.ggml.merges` — the
-//! same GPT-2 byte-level BPE the reference uses. This module reads those two
+//! same GPT-2 byte-level BPE the reference uses. [`Encoder`] reads those two
 //! tables and applies them: pre-tokenize, map UTF-8 bytes to the byte-level
 //! alphabet, merge the lowest-ranked adjacent pair until the word is stable, and
-//! look the final pieces up in the vocabulary. Decoding is the reverse, with the
-//! control tokens left out of the text.
+//! look the final pieces up in the vocabulary. [`Decoder`] is the reverse, with
+//! the control tokens left out of the text.
+//!
+//! **One half per path.** Each direction reads its own tables, and each half
+//! builds only those: synthesis encodes and never decodes, recognition decodes
+//! and never encodes — its prompt ids are fixed constants. Measured on the two
+//! 1.7B bodies, opening one and building a whole vocabulary costs 70.9 MiB of
+//! physical footprint on recognition and 71.3 MiB on synthesis; with one half
+//! built, recognition retains 1.8 MiB and synthesis 47.2 MiB.
+//!
+//! The tables themselves are read out of the file's mapping, not from the
+//! metadata [`Model::open`] parsed: the open leaves those three arrays in the
+//! file (see [`rlx_gguf::GgufFile::skipped`]) rather than materialising them, so
+//! the ear path — which builds no tokenizer at all — holds none of it.
 //!
 //! The file names its own rule set in `tokenizer.ggml.model`, and a name this
 //! module does not implement is refused rather than read through the byte
@@ -17,55 +29,51 @@
 //! ids under the right model hash, which no later check would catch. `gpt2` is
 //! the one name this crate reads.
 //!
-//! [`Tokenizer::encode`] never adds the special tokens: a caller states its own
+//! [`Encoder::encode`] never adds the special tokens: a caller states its own
 //! convention around the returned ids.
 
 use std::collections::HashMap;
 
-use anyhow::{Result, anyhow};
-use rlx_gguf::MetaValue;
+use anyhow::{Context, Result, anyhow, bail};
+use rlx_gguf::{MetaValue, Skipped};
 
 use crate::loader::Model;
 
-pub struct Tokenizer {
-    tokens: Vec<String>,
-    token_type: Vec<u32>,
+/// Text → ids: the half the synthesis path reads.
+pub struct Encoder {
     ids: HashMap<String, usize>,
     /// `(left, right) -> rank`; a lower rank is merged first.
     merges: HashMap<(String, String), u32>,
     byte_to_char: [char; 256],
-    char_to_byte: HashMap<char, u8>,
-    bos: usize,
-    eos: usize,
 }
 
-impl Tokenizer {
+/// Ids → text: the half the recognition path reads.
+pub struct Decoder {
+    /// Every token's bytes, mapped out of the byte alphabet at build time and
+    /// concatenated in id order.
+    text: Vec<u8>,
+    /// `starts[i]..starts[i + 1]` is token `i`'s slice of `text`.
+    starts: Vec<u32>,
+    /// The file's `tokenizer.ggml.token_type`, as "is this an ordinary token"
+    /// (`1`): unknown, control, user-defined, unused and byte tokens are not text.
+    ordinary: Vec<bool>,
+}
+
+impl Encoder {
     pub fn from_model(model: &Model) -> Result<Self> {
-        let arrays = |key: &str| -> Result<&[MetaValue]> {
-            model
-                .file
-                .metadata
-                .get(key)
-                .and_then(MetaValue::as_array)
-                .ok_or_else(|| anyhow!("`{key}` is missing"))
-        };
-        let tokens: Vec<String> = arrays("tokenizer.ggml.tokens")?
-            .iter()
-            .map(|v| {
-                v.as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| anyhow!("token is not a string"))
-            })
-            .collect::<Result<_>>()?;
-        let token_type: Vec<u32> = arrays("tokenizer.ggml.token_type")?
-            .iter()
-            .map(|v| v.as_u32().ok_or_else(|| anyhow!("token type is not a u32")))
-            .collect::<Result<_>>()?;
-        let mut merges = HashMap::new();
-        for (rank, item) in arrays("tokenizer.ggml.merges")?.iter().enumerate() {
-            let pair = item
-                .as_str()
-                .ok_or_else(|| anyhow!("merge is not a string"))?;
+        // The rule set is checked before a table is read: a vocabulary this
+        // crate cannot apply is refused without building one.
+        rule_set(model)?;
+        check_specials(model)?;
+        let tokens = table(model, "tokenizer.ggml.tokens")?;
+        let mut ids = HashMap::with_capacity(tokens.count());
+        for (id, token) in tokens.strings()?.enumerate() {
+            ids.insert(token?.to_string(), id);
+        }
+        let pairs = table(model, "tokenizer.ggml.merges")?;
+        let mut merges = HashMap::with_capacity(pairs.count());
+        for (rank, item) in pairs.strings()?.enumerate() {
+            let pair = item?;
             // llama.cpp finds the separator from the second byte on
             // (`strchr(word + 1, ' ')`), so a one-character first token —
             // including `" "` itself — cannot be mistaken for an empty one.
@@ -81,58 +89,11 @@ impl Tokenizer {
                 .entry((pair[..at].to_string(), pair[at + 1..].to_string()))
                 .or_insert(rank as u32);
         }
-        let ids = tokens
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.clone(), i))
-            .collect();
-        let (byte_to_char, char_to_byte) = byte_alphabet();
-        // The file names its own rule set, and another one is not interchangeable:
-        // an unknown name is a vocabulary this crate cannot read, not a reason to
-        // read it through the byte alphabet.
-        let model_kind = model
-            .file
-            .metadata
-            .get("tokenizer.ggml.model")
-            .and_then(MetaValue::as_str)
-            .ok_or_else(|| anyhow!("`tokenizer.ggml.model` is missing or not a string"))?;
-        if model_kind != "gpt2" {
-            return Err(anyhow!(
-                "`tokenizer.ggml.model` is `{model_kind}`, a rule set this crate does not implement"
-            ));
-        }
-        // A present-but-mistyped id is refused rather than read as 0. The bodies
-        // state their own prompt specials, and the TTS body omits `bos`.
-        let special = |key: &str| -> Result<Option<usize>> {
-            match model.file.metadata.get(key) {
-                None => Ok(None),
-                Some(value) => value
-                    .as_u64()
-                    .map(|v| Some(v as usize))
-                    .ok_or_else(|| anyhow!("`{key}` is present but not an unsigned integer")),
-            }
-        };
-        let bos = special("tokenizer.ggml.bos_token_id")?;
-        let eos = special("tokenizer.ggml.eos_token_id")?;
         Ok(Self {
-            tokens,
-            token_type,
             ids,
             merges,
-            byte_to_char,
-            char_to_byte,
-            bos: bos.unwrap_or(0),
-            eos: eos.unwrap_or(0),
+            byte_to_char: byte_to_char(),
         })
-    }
-
-    /// The vocabulary's BOS id.
-    pub fn bos(&self) -> usize {
-        self.bos
-    }
-    /// The vocabulary's EOS id.
-    pub fn eos(&self) -> usize {
-        self.eos
     }
 
     /// Encode text into the model's ids, **without** BOS/EOS. The pre-tokenizer
@@ -180,49 +141,130 @@ impl Tokenizer {
             .filter_map(|w| self.ids.get(&w).copied())
             .collect()
     }
+}
+
+impl Decoder {
+    pub fn from_model(model: &Model) -> Result<Self> {
+        rule_set(model)?;
+        check_specials(model)?;
+        let tokens = table(model, "tokenizer.ggml.tokens")?;
+        let kinds = table(model, "tokenizer.ggml.token_type")?;
+        let back = char_to_byte();
+        // Every token's bytes and nothing else: an upper bound on the decoded
+        // text, reserved once and never regrown.
+        let mut text = Vec::with_capacity(tokens.text_len());
+        let mut ordinary = Vec::with_capacity(kinds.count());
+        let mut starts = Vec::with_capacity(tokens.count() + 1);
+        starts.push(0u32);
+        for token in tokens.strings()? {
+            for ch in token?.chars() {
+                if let Some(&byte) = back.get(&ch) {
+                    text.push(byte);
+                }
+            }
+            starts.push(u32::try_from(text.len()).context("the vocabulary is wider than 4 GiB")?);
+        }
+        for kind in kinds.u32s()? {
+            ordinary.push(kind? == 1);
+        }
+        Ok(Self {
+            text,
+            starts,
+            ordinary,
+        })
+    }
 
     /// The generated text. Control tokens (the chat/audio markers) are skipped;
-    /// every ordinary token goes back through the byte alphabet.
+    /// every ordinary token goes back through the byte alphabet, which
+    /// [`Self::from_model`] already undid.
     pub fn decode(&self, ids: &[usize]) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
-            let Some(tok) = self.tokens.get(id) else {
+            let (Some(&from), Some(&to)) =
+                (self.starts.get(id), self.starts.get(id.saturating_add(1)))
+            else {
                 continue;
             };
-            if self.token_type.get(id).copied().unwrap_or(1) != 1 {
+            if !self.ordinary.get(id).copied().unwrap_or(true) {
                 continue;
             }
-            for ch in tok.chars() {
-                if let Some(&b) = self.char_to_byte.get(&ch) {
-                    bytes.push(b);
-                }
-            }
+            bytes.extend_from_slice(&self.text[from as usize..to as usize]);
         }
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }
 
-fn byte_alphabet() -> ([char; 256], HashMap<char, u8>) {
-    let mut bs: Vec<u8> = (b'!'..=b'~')
+/// A vocabulary table, out of the file's mapping rather than the open's metadata
+/// — see the module doc. Present only when the open deferred that key
+/// ([`Model::open`] defers all three); an open that materialised it, or a file
+/// that writes it as something other than an array, has nothing to serve here and
+/// is refused rather than materialised on demand.
+fn table<'m>(model: &'m Model, key: &str) -> Result<Skipped<'m>> {
+    model
+        .file
+        .skipped(key)
+        .ok_or_else(|| anyhow!("`{key}` is missing or not an array"))
+}
+
+/// The file names its own rule set, and another one is not interchangeable: an
+/// unknown name is a vocabulary this crate cannot read, not a reason to read it
+/// through the byte alphabet.
+fn rule_set(model: &Model) -> Result<()> {
+    let kind = model
+        .file
+        .metadata
+        .get("tokenizer.ggml.model")
+        .and_then(MetaValue::as_str)
+        .ok_or_else(|| anyhow!("`tokenizer.ggml.model` is missing or not a string"))?;
+    if kind != "gpt2" {
+        bail!("`tokenizer.ggml.model` is `{kind}`, a rule set this crate does not implement");
+    }
+    Ok(())
+}
+
+/// A present-but-mistyped prompt id is a malformed file and is refused here. The
+/// ids themselves are not kept: neither half reads them — the talker prompt and
+/// the recognition markers state their own.
+fn check_specials(model: &Model) -> Result<()> {
+    for key in ["tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id"] {
+        if let Some(value) = model.file.metadata.get(key) {
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("`{key}` is present but not an unsigned integer"))?;
+        }
+    }
+    Ok(())
+}
+
+/// The GPT-2 byte-level alphabet: every byte, in the reference's order, paired
+/// with the char that stands for it. `b'!'..=b'~'`, `0xA1..=0xAC` and
+/// `0xAE..=0xFF` stand for themselves; the rest are `U+0100 + n`.
+fn alphabet() -> [(u8, char); 256] {
+    let mut pairs: Vec<(u8, char)> = (b'!'..=b'~')
         .chain(0xA1..=0xAC)
         .chain(0xAE..=0xFF)
+        .map(|b| (b, b as char))
         .collect();
-    let mut cs: Vec<char> = bs.iter().map(|&b| b as char).collect();
     let mut n = 0u32;
     for b in 0u8..=255 {
-        if !bs.contains(&b) {
-            bs.push(b);
-            cs.push(char::from_u32(256 + n).expect("a scalar value"));
+        if !pairs.iter().any(|(known, _)| *known == b) {
+            pairs.push((b, char::from_u32(256 + n).expect("a scalar value")));
             n += 1;
         }
     }
+    pairs.try_into().expect("the alphabet is 256 bytes")
+}
+
+fn byte_to_char() -> [char; 256] {
     let mut map = [char::REPLACEMENT_CHARACTER; 256];
-    let mut back = HashMap::new();
-    for (&b, &c) in bs.iter().zip(&cs) {
+    for (b, c) in alphabet() {
         map[b as usize] = c;
-        back.insert(c, b);
     }
-    (map, back)
+    map
+}
+
+fn char_to_byte() -> HashMap<char, u8> {
+    alphabet().into_iter().map(|(b, c)| (c, b)).collect()
 }
 
 fn pretokenize(text: &str) -> Vec<String> {
@@ -340,7 +382,7 @@ mod tests {
             return;
         }
         let model = Model::open(path).unwrap();
-        let t = Tokenizer::from_model(&model).unwrap();
+        let t = Encoder::from_model(&model).unwrap();
         assert_eq!(
             t.encode("Hello world. This is a test."),
             vec![9707, 1879, 13, 1096, 374, 264, 1273, 13]

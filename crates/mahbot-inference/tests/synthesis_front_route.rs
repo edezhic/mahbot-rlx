@@ -47,7 +47,7 @@ use std::sync::Arc;
 use mahbot_inference::graphs::{self, DAC_WINDOW, FRONT_WINDOW};
 use mahbot_inference::loader::{Pair, Role};
 use mahbot_inference::stand;
-use mahbot_inference::tokenizer::Tokenizer;
+use mahbot_inference::tokenizer::Decoder;
 use rlx_runtime::Device;
 
 mod support;
@@ -229,8 +229,7 @@ fn what_the_lower_floor_admits_outside_the_front() {
         // including the 12-frame cell, where the stride-2 convolution is the one that is
         // newly admitted and a 48-frame walk would not reach it.
         if let Some(path) = support::recording(stand::RECOGNITION_RECORDING) {
-            let tokenizer =
-                Tokenizer::from_model(&recognition.body).expect("the recognition tokenizer");
+            let decoder = Decoder::from_model(&recognition.body).expect("the recognition decoder");
             for &frames in &SHORT_REAL {
                 let mut audio = mahbot_inference::host::wav_mono_16k(
                     &path.display().to_string(),
@@ -241,7 +240,7 @@ fn what_the_lower_floor_admits_outside_the_front() {
                 support::prepare_speech(&mut audio);
                 let walk = |floor: usize| {
                     at_floor(floor, || {
-                        mahbot_inference::listen::recognise(&recognition, &tokenizer, audio.clone())
+                        mahbot_inference::listen::recognise(&recognition, &decoder, audio.clone())
                             .expect("recognising the short input")
                     })
                 };

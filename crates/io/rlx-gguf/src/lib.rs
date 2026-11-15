@@ -479,11 +479,99 @@ impl std::ops::Deref for GgufData {
     }
 }
 
+/// A metadata array a deferring open ([`GgufFile::from_path_mmap_skipping`])
+/// left in the file instead of materialising: where its payload sits and how it
+/// is laid out, with the bytes themselves still in the mapping.
+struct SkippedSpan {
+    /// GGUF type id of one element.
+    ty: u32,
+    count: u64,
+    /// File offset of the first element.
+    offset: u64,
+    /// The payload's byte length.
+    len: u64,
+}
+
+/// One such array, sliced out of the mapping and read on demand.
+#[derive(Clone, Copy)]
+pub struct Skipped<'a> {
+    key: &'a str,
+    bytes: &'a [u8],
+    /// GGUF type id of one element.
+    ty: u32,
+    count: u64,
+    version: u32,
+}
+
+impl<'a> Skipped<'a> {
+    /// How many elements the file declares.
+    pub fn count(self) -> usize {
+        self.count as usize
+    }
+
+    /// The most text a `String` array's payload can hold: its bytes less one
+    /// length prefix per element. A `strings` walk yields at most this much.
+    ///
+    /// Means nothing on another element type — an integer array carries no
+    /// prefixes — so it is only asked of a table whose elements are strings.
+    pub fn text_len(self) -> usize {
+        self.bytes
+            .len()
+            .saturating_sub(len_width(self.version) * self.count as usize)
+    }
+
+    /// Each element of a `String` array. The slices borrow the mapping, so a
+    /// reader that keeps them copies only what it retains.
+    ///
+    /// # Errors
+    /// An array of another element type, refused up front as [`MetaValue::as_str`]
+    /// refuses it on a materialised array — so a zero-element array of the wrong
+    /// type is an error, not an empty walk.
+    pub fn strings(self) -> Result<impl Iterator<Item = Result<&'a str>> + 'a> {
+        if self.ty != TYPE_STRING {
+            bail!("`{}`: element type {} is not a string", self.key, self.ty);
+        }
+        let version = self.version;
+        Ok(self.walk(move |bytes, at| string_at(bytes, at, version)))
+    }
+
+    /// Each element of an integer array, read as [`MetaValue::as_u32`] reads one:
+    /// a negative or an oversized element is refused rather than truncated.
+    ///
+    /// # Errors
+    /// An array of another element type, refused up front as [`MetaValue::as_u32`]
+    /// refuses it on a materialised array.
+    pub fn u32s(self) -> Result<impl Iterator<Item = Result<u32>> + 'a> {
+        let ty = self.ty;
+        let (width, read) = int_reader(ty)
+            .ok_or_else(|| anyhow!("`{}`: element type {ty} is not a u32", self.key))?;
+        Ok(self.walk(move |bytes, at| int_at(bytes, at, width, read)))
+    }
+
+    /// The payload's `count` elements, each read by `element` and named by key on
+    /// error.
+    fn walk<T>(
+        self,
+        mut element: impl FnMut(&'a [u8], &mut usize) -> Result<T> + 'a,
+    ) -> impl Iterator<Item = Result<T>> + 'a {
+        let (bytes, key, mut at, mut left) = (self.bytes, self.key, 0usize, self.count);
+        std::iter::from_fn(move || {
+            if left == 0 {
+                return None;
+            }
+            left -= 1;
+            Some(element(bytes, &mut at).with_context(|| format!("`{key}`")))
+        })
+    }
+}
+
 pub struct GgufFile {
     pub version: u32,
     pub alignment: u64,
     pub metadata: HashMap<String, MetaValue>,
     pub tensors: HashMap<String, GgufTensor>,
+    /// Arrays a deferring open left in the file — see [`Self::skipped`].
+    skipped: HashMap<String, SkippedSpan>,
     /// Tensor-data segment (`data_start` to EOF), owned or mmap-backed.
     data: GgufData,
     /// Byte offset of the data segment within the file (for the mmap path).
@@ -567,6 +655,7 @@ impl GgufFile {
             version: 3,
             alignment: 32,
             metadata: HashMap::new(),
+            skipped: HashMap::new(),
             tensors: HashMap::new(),
             data: GgufData::Owned(Vec::new()),
             data_offset: 0,
@@ -607,7 +696,7 @@ impl GgufFile {
     }
 
     pub fn from_reader<R: Read + Seek>(r: &mut R) -> Result<Self> {
-        Self::from_reader_inner(r, true)
+        Self::from_reader_inner(r, true, &[])
     }
 
     /// Parse only the header (metadata + tensor table) and skip the
@@ -626,7 +715,7 @@ impl GgufFile {
     /// Header-only parse from any [`Read`] + [`Seek`] (e.g. HTTP Range
     /// buffer wrapped in [`std::io::Cursor`]). Does not read tensor data.
     pub fn header_from_reader<R: Read + Seek>(r: &mut R) -> Result<Self> {
-        Self::from_reader_inner(r, false)
+        Self::from_reader_inner(r, false, &[])
     }
 
     /// Parse a whole GGUF already in memory, keeping `bytes` as the data
@@ -657,7 +746,11 @@ impl GgufFile {
         Self::header_from_reader(&mut cur)
     }
 
-    fn from_reader_inner<R: Read + Seek>(inner: &mut R, read_data: bool) -> Result<Self> {
+    fn from_reader_inner<R: Read + Seek>(
+        inner: &mut R,
+        read_data: bool,
+        skip: &[&str],
+    ) -> Result<Self> {
         // The header is read one scalar at a time, so an unbuffered `File` pays a
         // syscall per scalar: 266 ms of the recognition body's cold row, 18 ms here.
         let r = &mut BufReader::new(inner);
@@ -672,11 +765,7 @@ impl GgufFile {
         }
 
         // v1 used u32 counts; v2/v3 use u64. Same field order.
-        let (tensor_count, kv_count) = if version == 1 {
-            (read_u32(r)? as u64, read_u32(r)? as u64)
-        } else {
-            (read_u64(r)?, read_u64(r)?)
-        };
+        let (tensor_count, kv_count) = (read_len(r, version)?, read_len(r, version)?);
 
         // `rlx_ir::env` (where code overrides live) only when the optional
         // `ir` feature links it — this crate does not otherwise need rlx-ir.
@@ -690,11 +779,28 @@ impl GgufFile {
         // file can't trigger a multi-GB up-front alloc. The read loop below is
         // self-bounding — it EOFs on a truncated file long before the cap.
         let mut metadata = HashMap::with_capacity((kv_count as usize).min(1 << 16));
+        // Values the caller asked to leave in the file: where each one sits, so
+        // `Self::skipped` can read it back off the mapping.
+        let mut skipped: HashMap<String, SkippedSpan> = HashMap::new();
         for i in 0..kv_count {
             let pos_before = r.stream_position()?;
             let key = read_string(r, version)?;
             let pos_after_key = r.stream_position()?;
-            let value = read_value(r, version)?;
+            let ty = read_u32(r)?;
+            if ty == TYPE_ARRAY && skip.contains(&key.as_str()) {
+                let span = skip_array(r, version).with_context(|| format!("`{key}`"))?;
+                if trace {
+                    eprintln!(
+                        "[rlx-gguf trace] kv[{i}] pos={pos_before} key={:?} key_end={pos_after_key} val_end={} val=Skipped({} elements)",
+                        key,
+                        r.stream_position()?,
+                        span.count,
+                    );
+                }
+                skipped.insert(key, span);
+                continue;
+            }
+            let value = read_value_of(r, ty, version)?;
             let pos_after_val = r.stream_position()?;
             if trace {
                 eprintln!(
@@ -727,12 +833,7 @@ impl GgufFile {
             // on EOF); real tensors have a tiny rank.
             let mut shape = Vec::with_capacity((n_dims as usize).min(1 << 16));
             for _ in 0..n_dims {
-                let d = if version == 1 {
-                    read_u32(r)? as u64
-                } else {
-                    read_u64(r)?
-                };
-                shape.push(d as usize);
+                shape.push(read_len(r, version)? as usize);
             }
             let dtype_raw = read_u32(r)?;
             let dtype = GgmlType::from_u32_dialect(dtype_raw, dialect)
@@ -772,6 +873,7 @@ impl GgufFile {
             version,
             alignment,
             metadata,
+            skipped,
             tensors,
             data: GgufData::Owned(data),
             data_offset,
@@ -783,11 +885,25 @@ impl GgufFile {
     /// machines — the OS pages tensor bytes on demand and the pages are
     /// reclaimable. `tensor_bytes` / `dequant_f32` work unchanged.
     pub fn from_path_mmap<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::from_path_mmap_skipping(path, &[])
+    }
+
+    /// [`Self::from_path_mmap`], leaving the metadata arrays named in `skip`
+    /// **in the file** instead of materialising them: the header parse still
+    /// walks every element's bytes (so a length the file cannot back is refused
+    /// exactly as a materialised array refuses it), but nothing is allocated and
+    /// the bytes are read back through [`Self::skipped`] from the mapping, which
+    /// the process is not charged for.
+    ///
+    /// A vocabulary is the case this exists for: a body file's token, merge and
+    /// token-type tables are tens of megabytes of `MetaValue`s, and every path
+    /// that opens that body pays them whether or not it reads a token.
+    pub fn from_path_mmap_skipping<P: AsRef<Path>>(path: P, skip: &[&str]) -> Result<Self> {
         let path = path.as_ref();
         let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut gf = {
             let mut r = &f;
-            Self::from_reader_inner(&mut r, false)?
+            Self::from_reader_inner(&mut r, false, skip)?
         };
         // SAFETY: read-only mmap of a file we hold open; callers get
         // immutable `&[u8]` slices. Concurrent external truncation is UB,
@@ -807,6 +923,25 @@ impl GgufFile {
         };
         gf.src_path = Some(path.to_path_buf());
         Ok(gf)
+    }
+
+    /// A metadata array a [`Self::from_path_mmap_skipping`] open left in the
+    /// file. `None` for a key that was materialised or absent, and for a backing
+    /// that does not hold the header bytes (everything but the mmap open).
+    pub fn skipped(&self, key: &str) -> Option<Skipped<'_>> {
+        let (key, span) = self.skipped.get_key_value(key)?;
+        let GgufData::Mmap { map, .. } = &self.data else {
+            return None;
+        };
+        let start = usize::try_from(span.offset).ok()?;
+        let end = start.checked_add(usize::try_from(span.len).ok()?)?;
+        Some(Skipped {
+            key,
+            bytes: map.get(start..end)?,
+            ty: span.ty,
+            count: span.count,
+            version: self.version,
+        })
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &str> {
@@ -1309,12 +1444,22 @@ fn read_bool<R: Read>(r: &mut R) -> Result<bool> {
     Ok(read_u8(r)? != 0)
 }
 
-fn read_string<R: Read>(r: &mut R, version: u32) -> Result<String> {
-    let len = if version == 1 {
-        read_u32(r)? as u64
+/// Bytes one GGUF length or count occupies: 4 in v1, 8 from v2 on.
+fn len_width(version: u32) -> usize {
+    if version == 1 { 4 } else { 8 }
+}
+
+/// A GGUF length or count, read in the width its version gives it.
+fn read_len<R: Read>(r: &mut R, version: u32) -> Result<u64> {
+    if len_width(version) == 4 {
+        Ok(u64::from(read_u32(r)?))
     } else {
-        read_u64(r)?
-    };
+        read_u64(r)
+    }
+}
+
+fn read_string<R: Read>(r: &mut R, version: u32) -> Result<String> {
+    let len = read_len(r, version)?;
     // `len` is untrusted header data — do NOT pre-allocate it (a 20-byte hostile
     // file can claim a u64::MAX length → multi-exabyte alloc / capacity panic).
     // Read up to `len` via `take`, growing only as real bytes arrive, then
@@ -1345,8 +1490,105 @@ fn value_tag(v: &MetaValue) -> &'static str {
     }
 }
 
-fn read_value<R: Read + Seek>(r: &mut R, version: u32) -> Result<MetaValue> {
+/// GGUF metadata value types: a string, and the array that carries a table of
+/// them. Named because the parser, the skipper and the readers all compare
+/// against these two.
+const TYPE_STRING: u32 = 8;
+const TYPE_ARRAY: u32 = 9;
+
+/// Walk an array's payload without materialising it, returning the span it
+/// occupies so a later read can slice it out of the mapping. Every element's
+/// bytes are still read, so a length the file cannot back is refused here
+/// exactly as [`read_value_of`]'s push loop refuses it — nothing is allocated on
+/// the declared count. A string's own encoding is checked where it is read
+/// ([`Skipped::strings`]), not here.
+fn skip_array<R: Read + Seek>(r: &mut R, version: u32) -> Result<SkippedSpan> {
     let ty = read_u32(r)?;
+    let count = read_len(r, version)?;
+    let offset = r.stream_position()?;
+    if ty == TYPE_STRING {
+        // A string's bytes are located only by its own length prefix, so the
+        // payload is measured by walking the prefixes.
+        for _ in 0..count {
+            let n = read_len(r, version)?;
+            drain(r, n)?;
+        }
+    } else {
+        // The same reader a materialising open uses, so an unknown or nested
+        // element type is refused by the one table that defines the widths.
+        for _ in 0..count {
+            read_scalar(r, ty, version)
+                .with_context(|| format!("a {count}-element array of type {ty}"))?;
+        }
+    }
+    let len = r.stream_position()? - offset;
+    Ok(SkippedSpan {
+        ty,
+        count,
+        offset,
+        len,
+    })
+}
+
+/// Discard exactly `len` bytes, refusing a stream that ends first.
+fn drain<R: Read>(r: &mut R, len: u64) -> Result<()> {
+    let got = std::io::copy(&mut r.by_ref().take(len), &mut std::io::sink())?;
+    if got != len {
+        bail!("array truncated: got {got} of {len} bytes");
+    }
+    Ok(())
+}
+
+/// How one integer element of `ty` is read: its width, and how to widen it to a
+/// signed 128-bit so a negative value is refused rather than wrapped — for
+/// exactly the types [`MetaValue::as_u32`] reads.
+fn int_reader(ty: u32) -> Option<(usize, fn(&[u8]) -> i128)> {
+    Some(match ty {
+        4 => (4, |b| {
+            i128::from(u32::from_le_bytes(b.try_into().expect("4 bytes")))
+        }),
+        5 => (4, |b| {
+            i128::from(i32::from_le_bytes(b.try_into().expect("4 bytes")))
+        }),
+        10 => (8, |b| {
+            i128::from(u64::from_le_bytes(b.try_into().expect("8 bytes")))
+        }),
+        _ => return None,
+    })
+}
+
+/// One string out of a skipped `String` array's payload.
+fn string_at<'a>(bytes: &'a [u8], at: &mut usize, version: u32) -> Result<&'a str> {
+    // `read_len` over the slice advances it by exactly the prefix it consumed, so
+    // the version's width is read here and nowhere else.
+    let mut rest = &bytes[*at..];
+    let len = read_len(&mut rest, version)
+        .map_err(|_| anyhow!("the array ends before its next length"))?;
+    let start = bytes.len() - rest.len();
+    let end = usize::try_from(len)
+        .ok()
+        .and_then(|len| start.checked_add(len))
+        .filter(|end| *end <= bytes.len())
+        .ok_or_else(|| anyhow!("a {len}-byte string runs past the array"))?;
+    // The cursor moves past the element either way: a reader that carries on
+    // after a refusal must not decode the next one from inside this one.
+    let s = std::str::from_utf8(&bytes[start..end]).map_err(|e| anyhow!("non-UTF8 string: {e}"));
+    *at = end;
+    s
+}
+
+/// One integer out of a skipped array's payload, read as [`MetaValue::as_u32`]
+/// reads one: a negative or oversized element is refused rather than truncated.
+fn int_at(bytes: &[u8], at: &mut usize, width: usize, read: fn(&[u8]) -> i128) -> Result<u32> {
+    let raw = bytes
+        .get(*at..*at + width)
+        .ok_or_else(|| anyhow!("the array ends before its next element"))?;
+    *at += width;
+    let wide = read(raw);
+    u32::try_from(wide).map_err(|_| anyhow!("element {wide} is not a u32"))
+}
+
+fn read_value_of<R: Read + Seek>(r: &mut R, ty: u32, version: u32) -> Result<MetaValue> {
     Ok(match ty {
         0 => MetaValue::U8(read_u8(r)?),
         1 => MetaValue::I8(read_i8(r)?),
@@ -1356,14 +1598,10 @@ fn read_value<R: Read + Seek>(r: &mut R, version: u32) -> Result<MetaValue> {
         5 => MetaValue::I32(read_i32(r)?),
         6 => MetaValue::F32(read_f32(r)?),
         7 => MetaValue::Bool(read_bool(r)?),
-        8 => MetaValue::String(read_string(r, version)?),
-        9 => {
+        TYPE_STRING => MetaValue::String(read_string(r, version)?),
+        TYPE_ARRAY => {
             let inner_ty = read_u32(r)?;
-            let len = if version == 1 {
-                read_u32(r)? as u64
-            } else {
-                read_u64(r)?
-            };
+            let len = read_len(r, version)?;
             // Untrusted array length → clamp the alloc hint; the push loop reads
             // real bytes and EOFs on a truncated/hostile file.
             let mut out = Vec::with_capacity((len as usize).min(1 << 16));
@@ -1381,7 +1619,7 @@ fn read_value<R: Read + Seek>(r: &mut R, version: u32) -> Result<MetaValue> {
 
 fn read_scalar<R: Read + Seek>(r: &mut R, ty: u32, version: u32) -> Result<MetaValue> {
     // Arrays don't nest (per spec). We re-implement primitive reads
-    // here rather than calling read_value because that one expects a
+    // here rather than calling read_value_of because that one expects a
     // leading type tag.
     Ok(match ty {
         0 => MetaValue::U8(read_u8(r)?),
@@ -1392,11 +1630,11 @@ fn read_scalar<R: Read + Seek>(r: &mut R, ty: u32, version: u32) -> Result<MetaV
         5 => MetaValue::I32(read_i32(r)?),
         6 => MetaValue::F32(read_f32(r)?),
         7 => MetaValue::Bool(read_bool(r)?),
-        8 => MetaValue::String(read_string(r, version)?),
+        TYPE_STRING => MetaValue::String(read_string(r, version)?),
+        TYPE_ARRAY => bail!("nested arrays not allowed in GGUF metadata"),
         10 => MetaValue::U64(read_u64(r)?),
         11 => MetaValue::I64(read_i64(r)?),
         12 => MetaValue::F64(read_f64(r)?),
-        9 => bail!("nested arrays not allowed in GGUF metadata"),
         other => bail!("unknown array element type {other}"),
     })
 }

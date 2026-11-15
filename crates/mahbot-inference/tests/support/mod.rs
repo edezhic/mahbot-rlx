@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use mahbot_inference::graphs;
 use mahbot_inference::loader::{self, Pair, Role};
-use mahbot_inference::tokenizer::Tokenizer;
+use mahbot_inference::tokenizer::Decoder;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape, Tick};
 use rlx_runtime::{Device, Session};
@@ -402,8 +402,8 @@ pub struct Answer {
 /// here is a broken model or device, not an absent input: it panics, because a
 /// check that cannot run must not report a pass.
 pub fn listen_answer(pair: &std::sync::Arc<Pair>, path: &std::path::Path) -> Answer {
-    let tokenizer = Tokenizer::from_model(&pair.body)
-        .unwrap_or_else(|error| panic!("the recognition tokenizer: {error:#}"));
+    let decoder = Decoder::from_model(&pair.body)
+        .unwrap_or_else(|error| panic!("the recognition decoder: {error:#}"));
     let mut audio = mahbot_inference::host::wav_mono_16k(
         &path.display().to_string(),
         0,
@@ -411,7 +411,7 @@ pub fn listen_answer(pair: &std::sync::Arc<Pair>, path: &std::path::Path) -> Ans
     )
     .unwrap_or_else(|error| panic!("reading {}: {error:#}", path.display()));
     prepare_speech(&mut audio);
-    let walk = mahbot_inference::listen::recognise(pair, &tokenizer, audio)
+    let walk = mahbot_inference::listen::recognise(pair, &decoder, audio)
         .unwrap_or_else(|error| panic!("recognising {}: {error:#}", path.display()));
     Answer {
         generated: walk.generated,
