@@ -166,13 +166,25 @@ pub fn shared_weight_bytes() -> usize {
 
 /// The most a load may write into device buffers before a submission is forced.
 ///
-/// `queue.write_buffer` stages every write in a buffer of exactly the written size and
-/// keeps it until the next submission, so a graph whose whole weight set is written
-/// before anything is submitted holds that set twice — the device peak of a cold call
-/// is then the model's size, not what it computes with. Every write is cut into pieces
-/// this size, so the intermediate stays at roughly two pieces whatever the parameters
-/// are sized.
-pub const UPLOAD_PIECE_BYTES: usize = 128 << 20;
+/// Staging outlives its own submission — `settle_uploads` is where that is spelled out — so
+/// a graph whose whole weight set is written before anything is submitted holds that set
+/// twice: the device peak of a cold call is then the model's size, not what it computes
+/// with. Every write is cut into pieces this size and a piece that would go past the bound
+/// submits what is pending, so the driver's intermediate stays at roughly two pieces
+/// whatever the parameters are sized. What a load leaves is one piece plus whatever was in
+/// flight when the last flush fired, which is the residue the load's settle retires.
+///
+/// The size is the peak's own lever, and 16 MiB is where the two costs meet: with the load
+/// settled, the wake background row's resting and peak graphics columns read 465.1 / 495.4
+/// in 16 MiB pieces against 690.9 / 709.5 in 128 MiB ones, with 32 MiB between them
+/// (482.1 / 523.2) and 8 MiB buying 8 MiB of peak and nothing of resting (465.3 / 487.8).
+/// The resting column stops falling at 16 MiB because what a load then leaves behind is
+/// smaller than the platform's own delay in charging freed pages away, so a reading taken
+/// straight after the load sits one such delay above the footprint rather than a whole
+/// piece above it. Nothing on the cold column pays for it — the row's start-up reads
+/// 219–224 ms before and 222–224 ms after, and its encoder's 353 MiB upload 175–185 ms in
+/// 16 MiB pieces against 140–207 ms in 128 MiB ones.
+pub const UPLOAD_PIECE_BYTES: usize = 16 << 20;
 
 /// Bytes written into device buffers since the last submission, over every arena and
 /// every compile: one product call opens several graphs, and their uploads reach the
@@ -206,11 +218,10 @@ impl Drop for RunGuard {
 }
 
 /// `queue.write_buffer`, keeping the upload in flight under [`UPLOAD_PIECE_BYTES`]: a
-/// piece that would go past the bound submits what is pending first, which is what
-/// releases the staging buffers held for it. The arena's own path already cuts at 64 MiB
-/// (`write_bytes_recording`'s shard math), so its writes arrive one piece per call and
-/// cross the bound between calls; a whole-image write is cut here. A write made while a
-/// run is on the stack is left to that run's own submissions.
+/// piece that would go past the bound submits what is pending first, so the driver holds
+/// about one piece rather than the whole weight set. The arena's own path cuts at 64 MiB
+/// (`write_bytes_recording`'s shard math), so a whole-image write is cut here as well. A
+/// write made while a run is on the stack is left to that run's own submissions.
 fn write_upload(queue: &wgpu::Queue, dst: &wgpu::Buffer, offset: u64, data: &[u8]) {
     for (i, piece) in data.chunks(UPLOAD_PIECE_BYTES).enumerate() {
         if RUN_DEPTH.load(Ordering::Relaxed) == 0 {
@@ -225,6 +236,53 @@ fn write_upload(queue: &wgpu::Queue, dst: &wgpu::Buffer, offset: u64, data: &[u8
         }
         queue.write_buffer(dst, offset + (i * UPLOAD_PIECE_BYTES) as u64, piece);
     }
+}
+
+/// Retire the staging a graph's upload leaves on the device.
+///
+/// `queue.write_buffer` stages every write in a buffer of exactly the written size and
+/// frees it only when a *later* submission is triaged; `Queue::submit` maintains
+/// non-blockingly, so a submission does not retire its own staging, and the last piece a
+/// load writes is never submitted at all. A process that loads a model and then idles
+/// therefore holds that piece — a driver-side intermediate of the upload, charged to the
+/// process's graphics footprint — until something runs, which on an idle daemon is
+/// forever. This submits what is pending and waits for it, which is what retires it, so a
+/// load ends at the footprint it will have after its first inference instead of above it.
+///
+/// The wait is the whole point and cannot be traded for a poll: staging is freed by the
+/// triage a *completed* submission reaches, so a submission that is still running keeps
+/// its own. What the process then holds is the footprint its first inference would have
+/// left it at; the rest of the way to what the platform eventually charges is its own
+/// delay in releasing freed pages, which is why [`UPLOAD_PIECE_BYTES`] is small enough for
+/// the residue to be under one of those delays.
+///
+/// Measured on the wake background row at that piece size (resting / peak graphics MiB):
+/// with this settle 465.2 / 495.9, without it 487.0 / 495.5 and 486.9 / 497.1 on two
+/// takes — so it is worth 21.8 MiB of resting and costs nothing on peak, an empty
+/// submission. At 128 MiB pieces it makes no difference to the reading (690.9 either way),
+/// because the residue is then far above that reclaim delay. What the bound leaves behind,
+/// and the sweep that chose it, are [`UPLOAD_PIECE_BYTES`]'s.
+///
+/// Called when a graph's last declared parameter lands, from
+/// [`WgpuExecutable::note_param_written`](crate::backend::WgpuExecutable) — the end of a
+/// load for the graphs a load compiles, the first inference for a deferred one, whose
+/// parameters were buffered until its shapes resolved, and a mid-call rung that writes all
+/// of its parameters (one submission and one wait, at a compile). Three cases end a graph's
+/// upload without it: a write made while any run is on the stack, which is left to that
+/// run's own submissions (`RUN_DEPTH` is process-wide, and this is the rule [`write_upload`]
+/// follows too); a graph whose parameters a caller skipped as already resident, so the set
+/// never completes; and a graph that declares none, which only uploads compile-time
+/// constants. Each leaves at most one piece, the bound [`UPLOAD_PIECE_BYTES`] already keeps,
+/// which the next submission retires.
+pub(crate) fn settle_uploads(dev: &crate::device::WgpuDevice) {
+    if RUN_DEPTH.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    UPLOAD_IN_FLIGHT.store(0, Ordering::Relaxed);
+    crate::backend::note_device_submit();
+    crate::backend::note_device_wait();
+    dev.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
+    let _ = dev.device.poll(wgpu::PollType::wait_indefinitely());
 }
 
 /// Derive a scope id from a label: FNV-1a, with the low bit set so a label never

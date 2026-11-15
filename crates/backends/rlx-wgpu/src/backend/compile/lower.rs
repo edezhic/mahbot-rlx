@@ -15674,6 +15674,7 @@ fn compile_static_with(
         pending_params: HashMap::new(),
         pending_param_bytes: HashMap::new(),
         pending_params_dirty: false,
+        written_params: HashSet::new(),
         active_extent: None,
         uniforms_active_extent: None,
         coop_f16_vk,

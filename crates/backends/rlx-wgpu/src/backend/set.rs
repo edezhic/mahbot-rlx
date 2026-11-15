@@ -100,6 +100,25 @@ impl WgpuExecutable {
         {
             self.arena.write_f32(&dev.queue, id, data);
         }
+        self.note_param_written(name, dev);
+    }
+
+    /// Mark `name` as handed over, and settle the graph's upload once every parameter it
+    /// declares has been — the only signal a load leaves, since `set_param` arrives per
+    /// tensor and nothing marks the last one.
+    ///
+    /// Keyed by node so a parameter costs no allocation. It fires once per graph, not once
+    /// per write: a second write of a name already recorded settles no further, so a weight
+    /// swap pays nothing, and a graph whose parameters a caller skipped as already resident
+    /// never completes the set. What the settle is worth, and the cases that end an upload
+    /// without it, are [`crate::buffer::settle_uploads`]'s.
+    fn note_param_written(&mut self, name: &str, dev: &crate::device::WgpuDevice) {
+        let Some(&id) = self.param_offsets.get(name) else {
+            return;
+        };
+        if self.written_params.insert(id) && self.written_params.len() == self.param_offsets.len() {
+            crate::buffer::settle_uploads(dev);
+        }
     }
 
     /// Whether the cooperative host-activation mirror reads `name`: the source tensor each
@@ -227,6 +246,7 @@ impl WgpuExecutable {
             self.arena
                 .write_bytes_range(&dev.queue, self.arena.offset(id), data);
         }
+        self.note_param_written(name, dev);
     }
 
     /// Where a partial write, or a residency question about one, finds `name`: the offset
@@ -283,6 +303,9 @@ impl WgpuExecutable {
             data,
             (end == storage.bytes).then_some(base),
         );
+        if end == storage.bytes {
+            self.note_param_written(name, dev);
+        }
         true
     }
 
@@ -319,6 +342,7 @@ impl WgpuExecutable {
         if self.arena.has(id) && self.arena.is_bf16_packed(id) {
             let dev = wgpu_device().expect("rlx-wgpu: device gone");
             self.arena.write_bf16_packed(&dev.queue, id, data);
+            self.note_param_written(name, dev);
             true
         } else {
             false

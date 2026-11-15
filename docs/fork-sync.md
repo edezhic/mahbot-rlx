@@ -225,7 +225,8 @@ merge action.
 - packed-multiply and buffer-copy batch joins, tail-host deferral, KV row feed and
   deferred mirror delivery — all in the executor's main run loop, where losing
   one produces no compile error
-- bounded weight upload at 128 MiB in flight
+- bounded weight upload at 16 MiB in flight, and the settle that retires a load's last
+  piece before the process idles
 - ladder-rung and sound-window release mid-call
 - the lazy f16 arena mirror
 - release of host weight duplicates

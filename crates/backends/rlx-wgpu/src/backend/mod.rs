@@ -626,6 +626,10 @@ pub struct WgpuExecutable {
     /// unresolved, so a write at an unchanged binding would never reach the
     /// device without this mark.
     pending_params_dirty: bool,
+    /// The parameters a caller has handed over to this executable, by node — what says a
+    /// graph's load is over, since nothing else marks its end. See
+    /// [`WgpuExecutable::note_param_written`].
+    written_params: HashSet<NodeId>,
     /// Active-extent hint (PLAN L1). When set + every Step in the
     /// safe set, both the uniform write and the dispatch workgroup
     /// count are scaled by `actual / upper`. Otherwise full-extent.
@@ -1145,6 +1149,7 @@ impl WgpuExecutable {
             pending_params: HashMap::new(),
             pending_param_bytes: HashMap::new(),
             pending_params_dirty: false,
+            written_params: HashSet::new(),
             active_extent: None,
             uniforms_active_extent: None,
             coop_f16_vk: false,
