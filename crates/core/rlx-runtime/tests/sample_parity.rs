@@ -68,6 +68,7 @@ const BATCH1_DRAW: (&str, usize, usize, usize, f32, f32, u64) =
 /// skips `need_filter` entirely, so the cooperative top-k scans need a shape of
 /// their own (`top_k=40`, `top_p=1.0`, `temp=0.9`; the loader's default is
 /// `top_k=50` at that temperature).
+#[cfg(feature = "gpu")]
 const FILTERED_DRAW: (usize, f32, f32) = (40, 1.0, 0.9);
 
 #[allow(dead_code)]

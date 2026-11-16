@@ -45,7 +45,8 @@ jobs:
           repository: MIT-RLX/rlx-models
           path: rlx-models
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The tree's pin: the toolchain action does not read rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: wasm32-unknown-unknown
 

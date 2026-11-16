@@ -12,7 +12,7 @@
 //!
 //! Pair with a straight-through estimator (quantize on the forward, identity on
 //! the backward) for QAT-style low-precision training — see
-//! [`Func`](crate::Func)'s QAT helpers / the `rlx-tinystories` `--fake-quant`.
+//! [`Func`]'s QAT helpers / the `rlx-tinystories` `--fake-quant`.
 //!
 //! The [`float_format!`] macro generates a marker type per format with a
 //! `const`-parameterized [`FloatFormat`](crate::lowp::FloatFormat) impl;

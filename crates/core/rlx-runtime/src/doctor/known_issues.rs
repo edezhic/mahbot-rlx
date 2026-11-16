@@ -384,7 +384,8 @@ pub static ISSUES: &[KnownIssue] = &[
         severity: Severity::Error,
         symptom: "`default-features = false` cannot override workspace's `default-features`",
         cause: "Workspace dependency overrides that cargo 1.99 accepts.",
-        fix: "`rustup update stable` (cargo >= 1.99).",
+        fix: "`rust-toolchain.toml` at the tree root names the release: `cargo` below \
+              that root selects it, and rustup installs it on first use.",
         detect: None,
     },
     KnownIssue {

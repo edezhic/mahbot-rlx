@@ -216,7 +216,7 @@ Generated from [`known_issues.rs`](../crates/core/rlx-runtime/src/doctor/known_i
 
 - **Symptom:** ``default-features = false` cannot override workspace's `default-features``
 - **Cause:** Workspace dependency overrides that cargo 1.99 accepts.
-- **Fix:** `rustup update stable` (cargo >= 1.99).
+- **Fix:** `rust-toolchain.toml` at the tree root names the release: `cargo` below that root selects it, and rustup installs it on first use.
 
 ## RLX-BUILD-002
 

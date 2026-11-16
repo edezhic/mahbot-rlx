@@ -1,0 +1,19 @@
+# The compiler this tree is built with — the choice, in one place. `cargo` below
+# this directory obeys it, and the CI jobs name it again because the toolchain
+# action does not read this file. Four things override it on purpose, each
+# saying why beside itself: crates/backends/rlx-ps5/rust-toolchain.toml, the
+# `cargo +nightly` rows in `just check-apple` and `ios/build-xcframework.sh`
+# (all three need nightly's `-Zbuild-std`), and the asan profile in Cargo.toml.
+#
+# It is not the minimum: `rust-version` there is what a member may assume, and
+# it stays where it is — a floor selects nothing, this file names a compiler.
+#
+# `clippy` and `rustfmt` are what the lint and format gates invoke, and a
+# minimal-profile install ships neither. `thumbv7em-none-eabihf` is the target
+# `just check-no-std` builds the bare-metal crates for. A host-only target — the
+# x86-64 macOS cross-lint row — is installed where `just lint` asks for it, not
+# named here, where every checkout and CI runner would fetch that platform's std.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+targets = ["thumbv7em-none-eabihf"]
