@@ -17,7 +17,10 @@
 //! The warm column is that reading the other way round and nothing more: the cold arm of
 //! a row has just read the files the warm arm needs, so the warm arm is checked, not
 //! touched — [`Cache::reading`] records what the cold arm left, and
-//! [`Cache::assert_no_growth`] shows afterwards that the warm arm found it all there.
+//! [`Cache::assert_no_growth`] shows afterwards that the warm arm found it all there. That
+//! reading is taken once the cache has stopped changing ([`Cache::settled`]), because the
+//! upload's request is asynchronous: a page it lands after the reading would be read as the
+//! warm arm faulting it in, which would refuse a correct take.
 //! Faulting the files in would be work the page cache has already done, and it perturbs
 //! the arm it precedes: 3.4 GB of it cost a wake row 20 ms of its next arm.
 //!
@@ -194,7 +197,7 @@ impl Cache {
                     path.display()
                 );
             }
-            let share = self.residency(&path)?;
+            let share = self.settled(&path)?;
             shares.push((path, share));
         }
         Ok(Held { shares })
@@ -222,6 +225,33 @@ impl Cache {
             }
         }
         Ok(())
+    }
+
+    /// What the page cache holds of one file, once it has stopped changing. The upload's request
+    /// is asynchronous, so a page it lands after this reading is growth the warm arm is blamed
+    /// for; two identical readings in a row mean nothing is still arriving. Bounded, so a cache
+    /// that never settles is read as it is rather than refusing the run.
+    ///
+    /// Each poll is a whole-file `mincore` — about eight milliseconds for a body, the walk
+    /// [`Self::assert_no_growth`] measures — so a settled cache costs two of them and the
+    /// forty readings the bound allows cost about half a second per file (thirty-nine 5 ms
+    /// sleeps and forty walks). The wait is here rather than in the product because the doubt
+    /// is the instrument's: the request may legitimately still be in flight when the cold arm
+    /// returns, and only a reader of the page cache can tell. A reader outside this process is
+    /// the one thing it cannot wait out.
+    fn settled(&self, path: &Path) -> Result<Share> {
+        // Whole-file readings taken before the cache is called settled, the first included.
+        const POLLS: usize = 40;
+        let mut last = self.residency(path)?;
+        for _ in 1..POLLS {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let now = self.residency(path)?;
+            if now.resident == last.resident {
+                return Ok(now);
+            }
+            last = now;
+        }
+        Ok(last)
     }
 
     /// What the page cache holds of one file, through a mapping taken for the reading and

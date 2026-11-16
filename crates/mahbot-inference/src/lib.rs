@@ -31,6 +31,7 @@ pub mod loader;
 pub mod measurements;
 pub mod music;
 pub mod paths;
+pub mod readahead;
 pub mod reference;
 pub mod report;
 mod run;

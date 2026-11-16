@@ -27,6 +27,7 @@ use rlx_runtime::{Device, Session};
 
 use crate::emit::{self, LoaderWeights, PairWeights};
 use crate::loader::{Head, Model, Pair};
+use crate::readahead;
 use crate::report::Stopwatch;
 
 // ── generic block: Qwen3 body and CLIP encoder are the same skeleton ──
@@ -2695,59 +2696,20 @@ impl Drop for DeclaredScope {
     }
 }
 
-/// Bind a fused projection's parameter from the model file's own tensors: each part is
-/// written at its own offset out of a window of the file, so the concatenation never exists
-/// on the host — the one joined copy is the device's. Answers the bytes it wrote, or `None`
-/// when the device already held the parameter and nothing was written.
+/// What the device does with one extent's bytes: a packed parameter written whole, or one
+/// part of a fused projection written at its own offset in the joined parameter.
 ///
-/// Nothing is read when the device already holds the parameter, which is the rule for a
-/// second layout of one body: the rung ladder and a warm call both ask for the same joined
-/// parameter, and the bytes a previous compile placed are the bytes it wants. A part is
-/// claimed for the scope only by the write that completes the parameter, so a read that
-/// fails part-way leaves the next compile writing every piece instead of skipping the ones
-/// that never landed.
-///
-/// No route in this tree reaches the refusal: every product call site compiles for
-/// `Device::Gpu`, and a body's graphs are fully shaped, so a range write either lands or the
-/// parameter was never in the schedule. It exists for the backend that cannot serve a piece
-/// (the CPU's non-F32 storage, Metal's separate weight buffer) or a schedule still waiting to
-/// resolve its shapes: those say so by name, because the alternative is assembling the
-/// joined bytes on the host — the peak this binding exists to remove.
-fn bind_fused(
-    device: Device,
-    session: &mut rlx_runtime::CompiledGraph,
-    name: &str,
-    fused: emit::Fused,
-    len: usize,
-) -> Result<Option<u64>> {
-    if session.param_resident(name, len) {
-        // The bytes are already there, so no `set_param*` call will record this name;
-        // say so here, where the write is skipped, or the unbound diagnostic reports
-        // a parameter that is bound and correct.
-        session.mark_param_bound(name);
-        return Ok(None);
-    }
-    let mut at = 0usize;
-    for part in &fused.parts {
-        let (landed, piece) = fused.model.with_mapped(part, |bytes| {
-            // The whole parameter is never assembled to hand over instead: that copy is the
-            // peak this binding exists to avoid, so a backend that cannot take a piece says so.
-            (session.set_param_range(name, at, bytes), bytes.len())
-        })?;
-        if !landed {
-            bail!(
-                "the fused projection `{name}` cannot be written in pieces: {device:?} \
-                 refused the range write at byte {at} (no partial parameter write on this \
-                 backend, or no such parameter in the compiled schedule) — and the joined \
-                 bytes are not materialised on the host to hand over whole"
-            );
-        }
-        at += piece;
-    }
-    if at != len {
-        bail!("the fused projection `{name}` joins {at} bytes, its parameter is {len}");
-    }
-    Ok(Some(len as u64))
+/// The joined bytes never exist on the host — the one joined copy is the device's — so a
+/// fused parameter is bound part by part out of the file's windows, and the parts are claimed
+/// for the weight-sharing scope only once every one of them has landed, whatever order the
+/// walk visits them in: a read that fails part-way leaves the next compile writing every piece
+/// instead of skipping the ones that never landed. No route in this tree reaches the refusal a
+/// backend without a range write answers (every product call site compiles for `Device::Gpu`,
+/// and a body's graphs are fully shaped); it is named at the call site because the alternative
+/// is assembling the joined bytes on the host — the peak this binding exists to remove.
+enum Write {
+    Whole { name: String, dt: DType },
+    Part { name: String, at: usize },
 }
 
 /// The byte length a packed parameter is declared at, from the graph's own shape.
@@ -2764,6 +2726,25 @@ fn declared_len(declared: &std::collections::HashMap<&str, usize>, name: &str) -
              bytes have no declared length to be written against"
         )),
     }
+}
+
+/// Skip a file-backed parameter the device already holds, answering whether it did: a second
+/// layout of one body asks for the same name, and answering it in the plan phase is what makes a
+/// warm compile neither read nor request anything at all. No `set_param*` call records a skipped
+/// name, so it is marked bound here — otherwise the unbound diagnostic reports a parameter that
+/// is bound and correct.
+fn already_held(
+    session: &mut rlx_runtime::CompiledGraph,
+    skipped: &mut u64,
+    name: &str,
+    len: usize,
+) -> bool {
+    if !session.param_resident(name, len) {
+        return false;
+    }
+    session.mark_param_bound(name);
+    *skipped += len as u64;
+    true
 }
 
 /// A packed parameter the graph declares at zero bytes: the shape says it exists and holds
@@ -2962,28 +2943,53 @@ impl Runner {
                 None => return Err(unresolved(&name)),
             }
         }
-        // The packed tensors are fed to the device out of the file's mapping, one tensor at
-        // a time; `Model::with_mapped` carries the price and the residency rule.
-        while let Some((name, bytes, dt)) = built.typed_params.pop() {
+        // The packed tensors: the ones the build carried are written here, and the ones that
+        // come out of the model file become a list of reads that `read_extents` walks in
+        // file order, one group of requests ahead of the copies it feeds. Each read still maps
+        // its own window and releases it when the write returns (`Model::with_mapped_ready`), so
+        // the resident cost stays the tensor being written rather than the group behind it.
+        //
+        // A parameter a previous layout already placed is skipped here, in the plan phase, so a
+        // warm compile neither reads nor requests anything at all ([`already_held`]).
+        let mut reads: Vec<readahead::Extent<Write>> = Vec::new();
+        for (name, bytes, dt) in built.typed_params {
             if let Some(fused) = emit::fused_of(&name) {
                 let len = declared_len(&declared, &name)?;
-                match bind_fused(device, &mut session, &name, fused, len)? {
-                    Some(written) => uploaded += written,
-                    None => skipped += len as u64,
+                if already_held(&mut session, &mut skipped, &name, len) {
+                    continue;
+                }
+                let mut at = 0usize;
+                for part in &fused.parts {
+                    let (start, part_len) = fused.model.file_extent(part)?;
+                    reads.push(readahead::Extent {
+                        model: Arc::clone(&fused.model),
+                        key: part.clone(),
+                        start,
+                        len: part_len,
+                        tag: Write::Part {
+                            name: name.clone(),
+                            at,
+                        },
+                    });
+                    at += part_len as usize;
+                }
+                if at != len {
+                    bail!("the fused projection `{name}` joins {at} bytes, its parameter is {len}");
                 }
             } else if let Some((model, key)) = emit::bound_weight(&name) {
                 let len = declared_len(&declared, &name)?;
                 check_declared(&model, &name, &key, len)?;
-                // The read is only worth making when the write it feeds would land: a
-                // second layout of one body asks for the same parameter, and the device
-                // already holds it ([`CompiledGraph::param_resident`]).
-                if session.param_resident(&name, len) {
-                    session.mark_param_bound(&name);
-                    skipped += len as u64;
-                } else {
-                    model.with_mapped(&key, |bytes| session.set_param_typed(&name, bytes, dt))?;
-                    uploaded += len as u64;
+                if already_held(&mut session, &mut skipped, &name, len) {
+                    continue;
                 }
+                let (start, file_len) = model.file_extent(&key)?;
+                reads.push(readahead::Extent {
+                    model,
+                    key,
+                    start,
+                    len: file_len,
+                    tag: Write::Whole { name, dt },
+                });
             } else if emit::is_placeholder(&name) {
                 return Err(unresolved(&name));
             } else {
@@ -3002,6 +3008,24 @@ impl Runner {
                 uploaded += bytes.len() as u64;
             }
         }
+        readahead::read_extents(&reads, |read, bytes| {
+            match &read.tag {
+                Write::Whole { name, dt } => session.set_param_typed(name, bytes, *dt),
+                Write::Part { name, at } => {
+                    if !session.set_param_range(name, *at, bytes) {
+                        bail!(
+                            "the fused projection `{name}` cannot be written in pieces: \
+                             {device:?} refused the range write at byte {at} (no partial \
+                             parameter write on this backend, or no such parameter in the \
+                             compiled schedule) — and the joined bytes are not materialised on \
+                             the host to hand over whole"
+                        );
+                    }
+                }
+            }
+            uploaded += bytes.len() as u64;
+            Ok(())
+        })?;
         let upload = Upload {
             ms: upload_start.ms(),
             bytes: uploaded,
@@ -3441,7 +3465,11 @@ pub fn samples_per_frame() -> usize {
 /// One graph of the sound half: the front (codes → the RVQ codebook decode → the
 /// wave transformer → the codec's `[1, C, 1, frames]` input) when the group starts
 /// at the codec's input, then the group's own stages.
-fn synthesis_sound_group(
+///
+/// Public because the cold-read harness needs this build without the compile that follows it,
+/// to price what a cold synthesis reads off the sound file — [`sound_graph`] is this build plus
+/// that compile.
+pub fn synthesis_sound_group(
     model: Arc<Model>,
     frames: usize,
     stages: std::ops::Range<usize>,

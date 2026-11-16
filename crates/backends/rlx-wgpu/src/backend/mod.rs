@@ -630,6 +630,11 @@ pub struct WgpuExecutable {
     /// graph's load is over, since nothing else marks its end. See
     /// [`WgpuExecutable::note_param_written`].
     written_params: HashSet<NodeId>,
+    /// The byte ranges of each parameter written piece by piece, keyed by the parameter's
+    /// storage offset: what lets a piece-wise upload complete when the pieces *cover* the
+    /// parameter rather than when the piece holding its last byte happens to land. See
+    /// [`WgpuExecutable::set_param_range`].
+    range_coverage: HashMap<usize, Vec<(usize, usize)>>,
     /// Active-extent hint (PLAN L1). When set + every Step in the
     /// safe set, both the uniform write and the dispatch workgroup
     /// count are scaled by `actual / upper`. Otherwise full-extent.
@@ -1150,6 +1155,7 @@ impl WgpuExecutable {
             pending_param_bytes: HashMap::new(),
             pending_params_dirty: false,
             written_params: HashSet::new(),
+            range_coverage: HashMap::new(),
             active_extent: None,
             uniforms_active_extent: None,
             coop_f16_vk: false,

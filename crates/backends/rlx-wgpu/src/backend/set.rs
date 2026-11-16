@@ -279,9 +279,10 @@ impl WgpuExecutable {
     /// next — and a completion test against it would never fire.
     ///
     /// Only the piece that completes the parameter claims it for the scope
-    /// (`Arena::write_bytes_recording`), so a caller that stops between pieces leaves
-    /// the next compile uploading all of them rather than skipping a parameter that is
-    /// only partly there.
+    /// (`Arena::write_bytes_recording`), and completion is the pieces' *coverage* of the
+    /// storage, not the piece that carries its last byte: a caller that stops between pieces,
+    /// or writes them out of storage order, leaves the next compile uploading all of them
+    /// rather than skipping a parameter that is only partly there.
     pub fn set_param_range(&mut self, name: &str, byte_offset: usize, data: &[u8]) -> bool {
         let Some((base, storage)) = self.param_storage(name) else {
             return false;
@@ -297,15 +298,37 @@ impl WgpuExecutable {
         }
         self.invalidate_static_weight_packs();
         let dev = wgpu_device().expect("rlx-wgpu: device gone");
-        self.arena.write_bytes_recording(
-            &dev.queue,
-            at,
-            data,
-            (end == storage.bytes).then_some(base),
-        );
-        if end == storage.bytes {
+        let completes = self.range_complete(base, storage.bytes, byte_offset, end);
+        self.arena
+            .write_bytes_recording(&dev.queue, at, data, completes.then_some(base));
+        if completes {
             self.note_param_written(name, dev);
         }
+        true
+    }
+
+    /// Whether `[lo, hi)` — offsets into the parameter's storage, not into the arena —
+    /// closes the coverage of the parameter whose storage starts at `base` and is `bytes`
+    /// long, whatever order its pieces arrived in: the union of what this executable has
+    /// written for it must be `[0, bytes)` before it may be claimed. Completion is a property
+    /// of the pieces rather than of which one carries the storage's last byte, so a walk that
+    /// reads the pieces in file order cannot claim a parameter whose earlier piece never
+    /// landed. The ranges are dropped once they have claimed it.
+    fn range_complete(&mut self, base: usize, bytes: usize, lo: usize, hi: usize) -> bool {
+        let ranges = self.range_coverage.entry(base).or_default();
+        ranges.push((lo, hi));
+        ranges.sort_unstable();
+        let mut covered = 0usize;
+        for &(lo, hi) in ranges.iter() {
+            if lo > covered {
+                return false;
+            }
+            covered = covered.max(hi);
+        }
+        if covered != bytes {
+            return false;
+        }
+        self.range_coverage.remove(&base);
         true
     }
 

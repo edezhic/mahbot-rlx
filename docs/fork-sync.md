@@ -234,7 +234,9 @@ merge action.
   reads it, with a clone taking its parameters off the device instead
 - packed codec tables read as stored
 - the buffered GGUF header parse (upstream reads one scalar per `read` syscall)
-- the scope-keyed shared weight pool with re-upload skipping
+- the scope-keyed shared weight pool with re-upload skipping, and the range write that claims a
+  parameter only once its pieces *cover* the parameter's storage — not when the piece holding
+  its last byte lands, an order the upload's file-order walk does not guarantee
 - packed parameters declared at their file's own tensor length with no host buffer behind
   them, and the compile checking that declaration against the file: a zero-length
   declaration is refused (the file's bytes would land at offset zero with no bound) and so
@@ -254,11 +256,21 @@ merge action.
 - capacity-bucketed body planes and plane seeding
 - the tagger's rank-2 `F16` matrices as f16 params — a host-image saving, not a
   device-side one
-- the readahead request `Model::with_mapped` issues before each window's bytes are read
-  (`F_RDADVISE` on macOS, `POSIX_FADV_WILLNEED` on Linux, a documented no-op elsewhere):
+- the readahead request `loader::request_readahead` issues (`F_RDADVISE` on macOS,
+  `POSIX_FADV_WILLNEED` on Linux, a documented no-op elsewhere):
   it is what keeps a cold upload's file read off the page-fault path, and losing it costs
   roughly three quarters of a second on a cold prefill read and about as much again on its
   upload, with no compile error (`loader.rs`, `tests/cold_read.rs`)
+- the upload's read is that same request made in groups, in file order (`readahead::read_extents`,
+  `Model::prefetch`, `Model::with_mapped_ready`): the plan is sorted by file offset, the copies
+  walk forward, and one group of extents — never across a stretch the upload does not read — is
+  asked for one group ahead of the copies it feeds. Asking before the compile, asking for the whole
+  file up front, or asking per window over the old stack order are all worse than this and each is
+  a measured comparison, not a preference; `readahead`'s module doc owns the mechanism and the
+  figures, and the docs of its `GROUP_BYTES` and `SLACK_BYTES` own the sizes and the run counts.
+  `tests/cold_read.rs` prices all three orders in one process. A platform whose advice cannot cover
+  a group keeps the route it had — the reversed walk, each window asking for itself
+  (`loader::covers_a_group`)
 
 ## 7. Memory is not a currency for buying speed
 

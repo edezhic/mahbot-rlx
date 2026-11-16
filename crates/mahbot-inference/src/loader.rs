@@ -750,12 +750,8 @@ impl Model {
 
     /// The tensor's size in bytes, without reading it.
     pub fn raw_len(&self, name: &str) -> Result<usize> {
-        let t = self
-            .file
-            .get(name)
-            .ok_or_else(|| anyhow!("tensor `{name}` is not in {}", self.path.display()))?;
-        bytes_for_public(t.dtype, t.n_elements())
-            .ok_or_else(|| anyhow!("`{name}`: {} elements are not whole blocks", t.n_elements()))
+        let t = self.tensor(name)?;
+        self.tensor_bytes_of(name, t)
     }
 
     /// The tensor's own bytes with `pread`, so the checkpoint's pages never enter the
@@ -763,13 +759,11 @@ impl Model {
     /// ([`GgufFile::read_tensor_bytes_into`]); a file with an owned backing — no source
     /// path to read from — hands its bytes over directly.
     ///
-    /// For the bytes a packed upload feeds to the device, [`Self::with_mapped`] is the
-    /// route: this one pays a copy into a fresh buffer first.
+    /// For the bytes a packed upload feeds to the device, `Model::with_mapped_ready` is the
+    /// route — its request issued once per group of windows, [`crate::readahead::read_extents`]
+    /// — and this one pays a copy into a fresh buffer first.
     pub fn raw(&self, name: &str) -> Result<Vec<u8>> {
-        let t = self
-            .file
-            .get(name)
-            .ok_or_else(|| anyhow!("tensor `{name}` is not in {}", self.path.display()))?;
+        let t = self.tensor(name)?;
         let mut bytes = Vec::new();
         if !self.file.read_tensor_bytes_into(t, &mut bytes)? {
             bytes = self.file.tensor_bytes(t)?.to_vec();
@@ -777,9 +771,10 @@ impl Model {
         Ok(bytes)
     }
 
-    /// One tensor's bytes, handed to `write` from a window of the file mapped for the
-    /// length of that write — the source a packed upload is fed from. The whole tensor:
-    /// [`Self::with_mapped_range`] is the same window over a sub-range of it.
+    /// One tensor's bytes, handed to `write` from a window of the file mapped for the length of
+    /// that write, with the kernel asked for this window on its way in — the route a caller
+    /// reading one tensor at a time takes. The whole tensor: [`Self::with_mapped_range`] is the
+    /// same window over a sub-range of it.
     ///
     /// The window is released when `write` returns, so the resident cost is the tensor being
     /// written rather than the checkpoint behind the copy the device takes. Borrowing the
@@ -800,8 +795,7 @@ impl Model {
     /// parameters, and before `request_readahead` below those windows were faulted one page at a
     /// time: its doc carries what that cost and what the request takes it to.
     pub fn with_mapped<R>(&self, name: &str, write: impl FnOnce(&[u8]) -> R) -> Result<R> {
-        let len = self.raw_len(name)?;
-        self.with_mapped_range(name, 0, len, write)
+        self.window(name, 0, None, true, write)
     }
 
     /// The bytes `[at, at + len)` of one tensor, handed to `write` from a window of the file
@@ -825,12 +819,90 @@ impl Model {
         len: usize,
         write: impl FnOnce(&[u8]) -> R,
     ) -> Result<R> {
-        let t = self
-            .file
+        self.window(name, at, Some(len), true, write)
+    }
+
+    /// [`Self::with_mapped`]'s copy without the window's own request: the route a caller that
+    /// has already asked the kernel for a covering span takes ([`Self::prefetch`], and
+    /// [`crate::readahead::read_extents`], which issues one group of them ahead of the copies).
+    /// A caller that has asked for nothing gets the page-fault path, which is why this is not
+    /// public.
+    pub(crate) fn with_mapped_ready<R>(
+        &self,
+        name: &str,
+        write: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
+        self.window(name, 0, None, false, write)
+    }
+
+    /// The tensor `name` names in this model's file — the one lookup every length and offset
+    /// below is derived from.
+    fn tensor(&self, name: &str) -> Result<&rlx_gguf::GgufTensor> {
+        self.file
             .get(name)
-            .ok_or_else(|| anyhow!("tensor `{name}` is not in {}", self.path.display()))?;
-        let nbytes = bytes_for_public(t.dtype, t.n_elements())
-            .ok_or_else(|| anyhow!("`{name}`: {} elements are not whole blocks", t.n_elements()))?;
+            .ok_or_else(|| anyhow!("tensor `{name}` is not in {}", self.path.display()))
+    }
+
+    /// The bytes `t` occupies, or the refusal a count that is not whole blocks answers.
+    fn tensor_bytes_of(&self, name: &str, t: &rlx_gguf::GgufTensor) -> Result<usize> {
+        let n = t.n_elements();
+        bytes_for_public(t.dtype, n)
+            .ok_or_else(|| anyhow!("`{name}`: {n} elements are not whole blocks"))
+    }
+
+    /// Where `t`'s bytes start in the file and how many there are.
+    fn extent_of(&self, name: &str, t: &rlx_gguf::GgufTensor) -> Result<(u64, u64)> {
+        let start = self
+            .file
+            .data_offset()
+            .checked_add(t.offset)
+            .ok_or_else(|| anyhow!("`{name}`: file offset overflow"))?;
+        Ok((start, self.tensor_bytes_of(name, t)? as u64))
+    }
+
+    /// Where a tensor's bytes start in the file and how many there are: what a caller that
+    /// orders several reads by position needs before it maps any of them. The offset is the
+    /// file's own, the one [`Self::with_mapped_range`] maps a window at.
+    pub fn file_extent(&self, name: &str) -> Result<(u64, u64)> {
+        let t = self.tensor(name)?;
+        self.extent_of(name, t)
+    }
+
+    /// Ask the kernel to start filling the page cache for `[start, start + len)` of this
+    /// model's file, asynchronously and without copying anything into this process — the
+    /// request `request_readahead` makes, for a caller that groups several windows under one
+    /// span.
+    ///
+    /// A model with an owned backing (no source path) has no file to ask and holds its bytes
+    /// already, so that is a no-op: there is nothing to fault and nothing to read ahead of.
+    /// Only a platform whose advice covers a group reaches this at all
+    /// ([`crate::readahead::read_extents`] is the caller, and it asks per window elsewhere).
+    pub(crate) fn prefetch(&self, start: u64, len: u64) -> Result<()> {
+        if self.file.src_path().is_none() {
+            return Ok(());
+        }
+        let (file, _) = self.window_source()?;
+        request_readahead(file, start, len);
+        Ok(())
+    }
+
+    /// One tensor's `[at, at + len)` handed to `write` from a window of the file mapped for
+    /// the length of that write — [`Self::with_mapped_range`]'s body, with `request` deciding
+    /// whether this window asks the kernel for itself or a caller has already asked for a span
+    /// that covers it. A `len` of `None` is the whole tensor.
+    fn window<R>(
+        &self,
+        name: &str,
+        at: usize,
+        len: Option<usize>,
+        request: bool,
+        write: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
+        let t = self.tensor(name)?;
+        let (tensor_start, nbytes) = self.extent_of(name, t)?;
+        let nbytes = usize::try_from(nbytes)
+            .map_err(|_| anyhow!("`{name}`: {} bytes is not an addressable length", nbytes))?;
+        let len = len.unwrap_or(nbytes);
         let end = at
             .checked_add(len)
             .filter(|end| *end <= nbytes)
@@ -849,11 +921,8 @@ impl Model {
             return Ok(write(&bytes[at..end]));
         }
         let (file, file_len) = self.window_source()?;
-        let start = self
-            .file
-            .data_offset()
-            .checked_add(t.offset)
-            .and_then(|start| start.checked_add(at as u64))
+        let start = tensor_start
+            .checked_add(at as u64)
             .ok_or_else(|| anyhow!("`{name}`: file offset overflow"))?;
         let stop = start
             .checked_add(len as u64)
@@ -872,7 +941,9 @@ impl Model {
         // carries too.
         let window = unsafe { memmap2::MmapOptions::new().offset(start).len(len).map(file) }
             .with_context(|| format!("mapping `{name}` out of {}", self.path.display()))?;
-        request_readahead(file, start, len);
+        if request {
+            request_readahead(file, start, len as u64);
+        }
         Ok(write(&window[..]))
     }
 
@@ -983,30 +1054,40 @@ impl Model {
     }
 }
 
+/// Whether one request covers a group of windows on this platform: `F_RDADVISE` reads the whole
+/// span asked for, while the Linux arm is clamped by the kernel to its own readahead window
+/// (~1.2 MiB) and Windows has no call at all — so those two ask per window, exactly as they did
+/// before grouping existed, and [`crate::readahead::read_extents`] keeps the walk they had.
+pub(crate) fn covers_a_group() -> bool {
+    cfg!(target_os = "macos")
+}
+
 /// Ask the kernel to start filling the page cache for `[start, start + len)` of `file`,
 /// asynchronously and without copying anything into this process.
 ///
-/// A window of a cold file is faulted one 16 KiB page at a time with no readahead, so
-/// [`Model::with_mapped`]'s TTS prefill windows — the 197 packed tensors the graph binds, 811.5
-/// MiB — read in 952–1,002 ms cold (0.85–0.89 GB/s) and in 224–232 ms with the request issued
-/// before each one (3.66–3.78 GB/s). The same tensors' upload through `graphs::Compiled` falls
-/// with it from 1,048 ms with the request taken out (0.81 GB/s) to 242–267 ms, and to 139–156 ms
-/// once the file is resident. It adds no resident memory: the pages it asks for are clean
-/// file-backed pages, which the footprint accounting excludes, and no byte of them enters this
-/// process through it.
+/// A window of a cold file is faulted one 16 KiB page at a time with no readahead, so the
+/// upload's TTS prefill windows — the 197 packed tensors the graph binds, 811.5 MiB — read in
+/// 952–1,002 ms cold (0.85–0.89 GB/s) and in 224–232 ms with the request issued before each one
+/// (3.66–3.78 GB/s). The same tensors' upload through `graphs::Compiled` falls from 1,048 ms
+/// with the request taken out (0.81 GB/s) to 242–267 ms, and to 139–156 ms once the file is
+/// resident; the upload now makes that request once per group of extents instead
+/// ([`crate::readahead`], whose doc owns the grouped figures), so the per-window figures above
+/// are what the grouping is measured against. It adds no resident memory: the pages it asks for
+/// are clean file-backed pages, which the footprint accounting excludes, and no byte of them
+/// enters this process through it.
 ///
 /// The figures are this platform's, taken on an M3 Pro at one-minute load 2.2–8 with residency
 /// asserted at zero over the exact extents immediately before each arm — the request is worth
 /// nothing on a resident file, and the arms mean nothing without the invalidation
 /// (`tests/cold_read.rs` carries the method). Every one of them moves with the load, which the
-/// harness prints beside each take. The warm path pays for it: the prefill's windows read
-/// 1.0–2.0 ms slower with the request, a few per cent of a resident read and well inside the
-/// harness's 10 % bound.
+/// harness prints beside each take. A warm compile asks for nothing at all — a parameter the
+/// device already holds never becomes a read, because the plan phase asks `param_resident`
+/// before it builds the list — so the request's cost is the cold read's alone.
 ///
 /// Best-effort by construction: a refusal, an interrupted call or an extent the request
 /// cannot express leaves the read exactly as it was.
 #[cfg(target_os = "macos")]
-fn request_readahead(file: &File, start: u64, len: usize) {
+fn request_readahead(file: &File, start: u64, len: u64) {
     use std::os::fd::AsRawFd;
 
     // `ra_offset` is an `off_t` and `ra_count` an `int`, so an extent the request cannot
@@ -1034,7 +1115,7 @@ fn request_readahead(file: &File, start: u64, len: usize) {
 /// cache, started before the pages are asked for and never copied to user space — though the
 /// kernel reads only as much of it as its own readahead window allows.
 #[cfg(target_os = "linux")]
-fn request_readahead(file: &File, start: u64, len: usize) {
+fn request_readahead(file: &File, start: u64, len: u64) {
     use std::os::fd::AsRawFd;
 
     let (Ok(offset), Ok(len)) = (libc::off_t::try_from(start), libc::off_t::try_from(len)) else {
@@ -1051,7 +1132,7 @@ fn request_readahead(file: &File, start: u64, len: usize) {
 /// addresses and would fault the pages into this process's own resident set, which is the one
 /// thing this request must not do.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn request_readahead(_file: &File, _start: u64, _len: usize) {}
+fn request_readahead(_file: &File, _start: u64, _len: u64) {}
 
 /// Merge the `{arch}.*` metadata into a typed config.
 fn merge_config(file: &GgufFile, arch: &str) -> Result<Config> {

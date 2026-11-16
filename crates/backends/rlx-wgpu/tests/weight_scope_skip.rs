@@ -577,6 +577,46 @@ fn a_parameter_written_in_pieces_computes_what_one_write_does() {
     release();
 }
 
+/// The pieces of a parameter may arrive in any order — a walk that reads a fused projection in
+/// file order writes whichever part sits at the parameter's end first on some files. Completion
+/// is the pieces' *coverage* of the parameter, so the piece carrying its last byte claims
+/// nothing until the rest has landed: the alternative leaves a compile that failed between
+/// pieces having claimed a parameter that is only partly there, and the next compile of the
+/// scope skips it.
+#[test]
+fn a_parameter_is_claimed_by_coverage_not_by_its_last_byte() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let _exclusive = exclusive();
+    park_every_param();
+    set_param_sharing_scope("weight-scope/pieces-out-of-order");
+
+    let mut exe = WgpuExecutable::compile(two_param_graph());
+    exe.set_param("a", &param_data(0.0));
+    let b = param_data(1.0);
+    let (first, second) = b.split_at(b.len() / 2);
+    let probe = WgpuExecutable::compile(two_param_graph());
+    // The tail first: the piece that holds the parameter's last byte.
+    assert!(exe.set_param_range("b", first.len() * 4, bytemuck::cast_slice(second)));
+    assert!(
+        !probe.param_resident("b", b.len() * 4),
+        "the piece carrying the last byte does not claim a parameter whose first half is missing"
+    );
+    assert!(exe.set_param_range("b", 0, bytemuck::cast_slice(first)));
+    assert!(
+        probe.param_resident("b", b.len() * 4),
+        "the pieces now cover the parameter, so it is claimed"
+    );
+    assert_eq!(
+        exe.run(&[]),
+        want_outputs(),
+        "the pieces compute what one write of the whole parameter does, in either order"
+    );
+
+    release();
+}
+
 /// Q8_0 packs 32 elements into 34 bytes, so a `[N, K]` weight of this geometry occupies
 /// `W_BYTES` bytes in the weight buffer: one per element of the `U8` parameter, where the
 /// plan's f32 slot counts four.
