@@ -339,10 +339,11 @@ pub fn block(
 /// Recognition's `mmproj`, split at the point where a group pass wants it: the
 /// three stride-2 `3×3` convs and the flatten ([`EncoderConvs`]), then everything
 /// after them ([`EncoderTail`]) — linear, norm and attention, which one pass can
-/// carry for a whole group. [`asr_encoder`] chains the two into the one graph the
-/// recognition and wake paths run; [`asr_encoder_front`] and
-/// [`asr_encoder_tail`] expose the pieces the bench's grouped pass drives, the front
-/// one window per call and the tail over the whole group.
+/// carry for a whole group. [`asr_encoder`] chains the two into the one graph every
+/// single-chunk path runs — the one-shot reading, the wake window and a ladder rung below
+/// the grouping threshold; [`asr_encoder_front`] and [`asr_encoder_tail`] expose the
+/// pieces a grouped pass drives, the front one window per call and the tail over the
+/// whole group.
 ///
 /// `batch` independent windows ride the convs' own batch axis, one image per panel,
 /// so these three `3×3` convs keep the im2col route they take on their own
@@ -3068,6 +3069,28 @@ impl Runner {
     pub fn run_slices(&mut self, inputs: &[(&str, &[f32])]) -> Vec<Vec<f32>> {
         bump(1, 1);
         self.session.run(inputs)
+    }
+
+    /// Declare this graph's input `name` a device-resident handle: its rows are written by
+    /// [`Self::write_resident_rows`] and the passes that follow supply no input of that
+    /// name. `false` where the compiled graph has no such input, or the backend cannot make
+    /// one resident: the arrangement is unavailable, not pending.
+    pub fn bind_resident_input(&mut self, name: &str) -> bool {
+        self.session.bind_gpu_handle(name, &[])
+    }
+
+    /// Write `rows` into the resident input `name` at row `row`, `row_elems` floats wide.
+    /// A grouped pass gathers its pieces' rows into the graph's own arena slot one piece
+    /// at a time, so the whole group's rows never exist on the host together.
+    pub fn write_resident_rows(
+        &mut self,
+        name: &str,
+        row: usize,
+        row_elems: usize,
+        rows: &[f32],
+    ) -> bool {
+        self.session
+            .write_gpu_handle_rows(name, row, row_elems, rows)
     }
 
     /// Seed a decode graph's per-layer K/V planes from a prefill's `[layers,

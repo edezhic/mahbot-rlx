@@ -8,10 +8,11 @@
 //! [`Listener::embed`] is the wake decision's input — one VAD-gated speech
 //! window through the sound encoder and the projector, mean-pooled and
 //! L2-normalized — and [`Listener::embed_pair`] scores two consecutive windows in
-//! one batched pass, which is the form the detector runs. The real-audio sweep
-//! takes the same front end cut in two (`GroupFront`): the conv front per window,
-//! the encoder tail and the projector once for a group of windows.
-use std::collections::HashMap;
+//! one batched pass, which is the form the detector runs. The real-audio sweep and a
+//! recognition rung with several chunks both take the same front end cut in two
+//! (`GroupFront`): the mel front end and the conv front per window, the encoder tail
+//! and the projector once for a group of windows.
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -256,7 +257,7 @@ impl Front {
 struct Rung {
     /// The pair every graph of this rung was built over.
     pair: Arc<Pair>,
-    front: Front,
+    front: RungFront,
     /// The prompt prefill, compiled the first time one of the rung's chunks asks for it
     /// and kept for the rung's life. Every chunk of a rung has the rung's own prompt
     /// length, so a rung never holds a second one.
@@ -270,6 +271,13 @@ struct Rung {
     tokens: usize,
 }
 
+/// The front end a rung runs: the fused conv+tail graph the one-shot path also uses, or the
+/// grouped front end, whose tail runs once per group of chunks ([`GroupFront`]).
+enum RungFront {
+    Fused(Front),
+    Grouped(GroupFront),
+}
+
 /// The capacity every rung's decode graph is compiled at: the longest rung's prompt rows —
 /// 3 head + 6 text + 768/8 = 96 audio + 6 tail = 111 — plus the most tokens a chunk of the
 /// longest piece may generate ([`crate::transcribe::CHUNK_TOKENS_PER_S`] over the 7.5 s a
@@ -278,10 +286,18 @@ struct Rung {
 const RUNG_CAPACITY: usize = 192;
 
 impl Rung {
-    fn build(pair: &Arc<Pair>, frames: usize) -> Result<Self> {
+    /// One rung of the ladder: its front end and the pair's decode graph. `sizes` are the
+    /// window counts its tail runs at. A rung whose every group is one chunk keeps the fused
+    /// conv+tail graph; anything wider takes the grouped front end.
+    fn build(pair: &Arc<Pair>, frames: usize, sizes: &[usize]) -> Result<Self> {
+        let front = if sizes == [1] {
+            RungFront::Fused(Front::build(pair, frames, 1)?)
+        } else {
+            RungFront::Grouped(GroupFront::build(pair, frames, sizes)?)
+        };
         Ok(Self {
             pair: Arc::clone(pair),
-            front: Front::build(pair, frames, 1)?,
+            front,
             prefill: Mutex::new(None),
             decode: shared_decode(pair)?,
             tokens: graphs::asr_tokens(frames),
@@ -343,76 +359,153 @@ pub(crate) fn clear_graph_caches() {
     mel.1.clear();
 }
 
-/// The same front end cut where a group pass needs it: the conv front runs one
-/// window per call and the tail — `conv_out`, the position table, the 24 CLIP
-/// blocks, `post_ln` — runs over the whole group in one pass, with the projector
-/// after it. That is where the weight reads and the multiplies amortise.
+/// The same front end cut where a group pass needs it: the mel front end and the conv
+/// front run one window per call and the tail — `conv_out`, the position table, the 24
+/// CLIP blocks, `post_ln` — runs over the whole group in one pass, which is where a pass's
+/// fixed cost amortises ([`TAIL_GROUP`] carries the readings).
 ///
-/// The conv front is left one window per call on purpose: `batch` here is the
-/// sweep's sixteen, and the im2col panel a batched conv front reserves is
-/// `batch` panels wide ([`crate::graphs::EncoderConvs`] takes a windows-wide batch
-/// for the pair, where that panel is two). The tail is what sixteen windows share.
+/// The conv front is left one window per call on purpose: its im2col panel would be as wide
+/// as the group ([`crate::graphs::asr_encoder_front`] carries that), and the top rung's front
+/// already books 207 MiB for one window.
+///
+/// The projector is one pass per group: at the top rung a window's own pass is 0.76 ms and a
+/// group of four's is 1.61, and the sweep has no per-window arm at all — its flush runs the
+/// projector at 160 rows, which the cooperative tile admits where ten rows a window would not.
+/// The arena it books at the group's rows is a few MiB beside the tail's tens.
+///
+/// The group's rows are gathered into the tail's own arena slot one window at a time
+/// ([`crate::graphs::Runner::write_resident_rows`]), so the group's rows never exist on the
+/// host together: a group of four is a 12 MB host block, and all 23 top-rung chunks of the long
+/// row would be 68 MB.
+///
+/// A window's rows are its own block of the tail's input and its own sequence in the
+/// block's attention, so its answer does not depend on which slot it took or on what else
+/// the group carries: the three recognition rows' answer digests are byte-identical across
+/// this arrangement and the per-chunk one, and no pinned reading moves.
 pub(crate) struct GroupFront {
-    mel: Compiled,
+    mel: Arc<Mutex<Compiled>>,
     convs: Compiled,
-    tail: Compiled,
-    projector: Compiled,
-    batch: usize,
+    /// One tail and one projector per window count this front is built for: a rung passes its
+    /// group size and, when its last group is shorter, that size too ([`rung_group_size`] is
+    /// where that trade is priced).
+    sizes: BTreeMap<usize, GroupGraphs>,
     tokens: usize,
+    /// Samples one window is, so a window of another length is a named error.
+    samples: usize,
+    /// The projector's row width: what a window's embedding pools over.
     dim: usize,
     flat: usize,
 }
 
+/// One group size's graphs: the encoder tail over `windows` windows and the projector over
+/// `windows * tokens` rows.
+struct GroupGraphs {
+    tail: Compiled,
+    projector: Compiled,
+}
+
 impl GroupFront {
-    pub(crate) fn build(pair: &Arc<Pair>, frames: usize, batch: usize) -> Result<Self> {
-        let batch = batch.max(1);
+    /// The grouped front end over the group sizes `sizes`, each with its own tail and
+    /// projector compile.
+    ///
+    /// The tail's rows are gathered into its own arena slot, which needs the backend to name a
+    /// graph input as resident and write its rows — the one thing this arrangement needs and
+    /// the fused conv+tail graph does not. The build checks the tail names that slot; a
+    /// backend that cannot write it fails at the first write, naming the window, rather than
+    /// reading through an arrangement it cannot serve.
+    pub(crate) fn build(pair: &Arc<Pair>, frames: usize, sizes: &[usize]) -> Result<Self> {
         let tokens = graphs::asr_tokens(frames);
         let bins = pair.sound.clip().mel_bins;
-        let mel = crate::report::compiled("mel-group", || graphs::mel_frontend(frames, bins, 1))?;
+        let mel = mel_graph(frames, bins, 1)?;
         let convs = crate::report::compiled("encoder-convs", || {
             graphs::asr_encoder_front(pair.sound.clone(), frames)
         })?;
-        let tail = crate::report::compiled("encoder-tail", || {
-            graphs::asr_encoder_tail(pair.sound.clone(), frames, batch)
-        })?;
-        let projector = crate::report::compiled("projector-group", || {
-            graphs::projector_chain(pair.clone(), batch * tokens)
-        })?;
+        let mut built = BTreeMap::new();
+        for &size in sizes {
+            let mut tail = crate::report::compiled("encoder-tail", || {
+                graphs::asr_encoder_tail(pair.sound.clone(), frames, size)
+            })?;
+            if !tail.runner.bind_resident_input("flat") {
+                bail!("the {size}-window encoder tail has no `flat` input to gather rows into");
+            }
+            let projector = crate::report::compiled("projector-group", || {
+                graphs::projector_chain(pair.clone(), size * tokens)
+            })?;
+            built.insert(size, GroupGraphs { tail, projector });
+        }
         Ok(Self {
             mel,
             convs,
-            tail,
-            projector,
-            batch,
+            sizes: built,
             tokens,
+            samples: graphs::MEL_HOP * frames,
             dim: pair.sound.clip().projection_dim,
             flat: graphs::flat_width(bins),
         })
     }
 
-    /// `windows.len() <= batch` windows in one tail pass and one projector pass,
-    /// each window's projection taken out of its own token block. Unused group
-    /// slots are zeros and their results are discarded.
+    /// `windows.len()` windows in one tail pass and one projector pass, each window's
+    /// projection taken out of its own token block. A size this front was built for runs at
+    /// exactly that size.
     fn forward_group(&mut self, windows: &[&[f32]]) -> Result<Vec<Vec<f32>>> {
-        let (batch, tokens, flat) = (self.batch, self.tokens, self.flat);
-        let mut rows = Vec::with_capacity(batch * tokens * flat);
-        for slot in 0..batch {
-            match windows.get(slot) {
-                Some(window) => {
-                    let mel = first(self.mel.run_slices(&[("audio", window)]), "mel front end")?;
-                    let front = first(self.convs.run_slices(&[("mel", &mel)]), "conv front")?;
-                    rows.extend_from_slice(&front);
-                }
-                None => rows.resize(rows.len() + tokens * flat, 0.0),
+        if windows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted = windows.len();
+        // A size the front was not built for is padded up to the smallest size it has: the
+        // sweep's flush, which has no rung to size it, and whose extra slots' results are
+        // discarded below.
+        let Some((&size, graphs)) = self.sizes.range_mut(wanted..).next() else {
+            bail!("a group of {wanted} windows in a front end with no tail that wide");
+        };
+        let (tokens, flat, samples) = (self.tokens, self.flat, self.samples);
+        // The mel front end and the conv front, one window per call, straight into the
+        // tail's own input slot. One guard over the loop: the mel graph is the one shared
+        // graph here, and the tail's slot is the only thing a window writes.
+        let mut mel_graph = self.mel.lock().unwrap_or_else(|e| e.into_inner());
+        for (slot, window) in windows.iter().enumerate() {
+            if window.len() != samples {
+                bail!(
+                    "a {}-sample window in a front end built for {samples}",
+                    window.len()
+                );
+            }
+            let mel = first(mel_graph.run_slices(&[("audio", window)]), "mel front end")?;
+            let front = first(self.convs.run_slices(&[("mel", &mel)]), "conv front")?;
+            if front.len() != tokens * flat {
+                bail!(
+                    "the conv front answered {} values for {} rows of {flat}",
+                    front.len(),
+                    tokens
+                );
+            }
+            if !graphs
+                .tail
+                .runner
+                .write_resident_rows("flat", slot * tokens, flat, &front)
+            {
+                bail!("the encoder tail refused window {slot}'s rows");
             }
         }
-        let encoded = first(self.tail.run_slices(&[("flat", &rows)]), "encoder tail")?;
+        if wanted < size {
+            // Every empty slot in one write: the sweep's flush pads fifteen of them at once,
+            // where a write per slot would be fifteen queue writes before the one submit.
+            let zeros = vec![0f32; (size - wanted) * tokens * flat];
+            if !graphs
+                .tail
+                .runner
+                .write_resident_rows("flat", wanted * tokens, flat, &zeros)
+            {
+                bail!("the encoder tail refused its {} empty slots", size - wanted);
+            }
+        }
+        let encoded = first(graphs.tail.run(&[]), "encoder tail")?;
         let projected = first(
-            self.projector.run_slices(&[("features", &encoded)]),
+            graphs.projector.run(&[("features".into(), encoded)]),
             "projector",
         )?;
-        let mut split = split_windows(projected, batch)?;
-        split.truncate(windows.len());
+        let mut split = split_windows(projected, size)?;
+        split.truncate(wanted);
         Ok(split)
     }
 }
@@ -434,6 +527,110 @@ pub const GROUP: usize = 16;
 /// span, and one stride is the delay the ear accepts. The offline sweep, where no
 /// fire has to be on time, buys its amortisation with [`GROUP`].
 pub const PAIR: usize = 2;
+
+/// Pieces one grouped encoder-tail pass carries, at most. A rung's chunks are independent,
+/// and a single 768-frame chunk hands the tail 96 rows: on this machine that pass is
+/// 42.4 ms, 30.0 ms per chunk at four in one pass and 28.3 at eight, with the tail compiled
+/// at the group's own size. What a group buys back is the pass's fixed cost, not the weight
+/// reads — the tail's packed multiplies are already on the cooperative tile at 96 rows, so a
+/// pass reads each weight once whether it carries one chunk or four.
+///
+/// Four is where the saving per byte of arena stops paying. The tail's arena at the top rung
+/// is 39 MiB at one chunk, 61 at four (+22) and 91 at eight (+52): four buys 88 % of eight's
+/// per-chunk saving — 12.4 of the 14.1 ms — for 42 % of its arena, and the last 1.7 ms per
+/// chunk is not worth another 30 MiB of it. Eight is admitted on its arena alone — 91 MiB —
+/// and what a wider cap would cost is the peak column, which `STAND.md` carries.
+///
+/// `STAND.md` and `TRANSCRIPTION-CORPUS.md` carry the arrangement's before/after columns;
+/// [`MIN_TAIL_GROUP`] is where the memory rule's own reading, and what it costs on the
+/// corpus surface, lives.
+///
+/// `MAHBOT_TAIL_GROUP` names the cap for an A/B arm — `1` is the shipped per-chunk
+/// arrangement — so the two arms can be measured alternately. A run with it set writes no
+/// record (`run::screening_reasons`): a take on the arm is not the shipped arrangement's
+/// numbers.
+pub const TAIL_GROUP: usize = 4;
+
+/// The largest cap `MAHBOT_TAIL_GROUP` may name, and the largest group a rung is ever read
+/// at: eight is the widest the memory rule admits ([`TAIL_GROUP`] carries the arena each size
+/// books and the peak column it has to fit). A cap beyond this one is refused rather than
+/// clamped, because a shell value that allocates hundreds of MiB of tail arena is not an A/B
+/// arm.
+pub const MAX_TAIL_GROUP: usize = 8;
+
+/// The fewest chunks a rung is grouped at all with: a rung of one chunk keeps the fused
+/// conv+tail graph, and so does a rung of two.
+///
+/// Resting memory is why, and the 10 s row is the reading: grouped at two — its one
+/// 512-frame rung — it reads 1.798 GiB of resting GPU against the per-chunk arm's 1.785 in
+/// both paired takes, for a warm call the two arms do not tell apart (967.2 ms against 970.0).
+/// Fourteen MiB of a column that may not rise is not bought with a few percent of a 970 ms
+/// row, so the rule is a chunk count and not a lane count.
+///
+/// The deep rows fall instead, because what they stop holding is the fused encoder at their
+/// deep rungs: with the shared weight pool disabled the per-chunk arm reads 2.89 GiB against
+/// the grouped arm's 2.36 on the 30 s row, so the fused graph carries ~530 MiB of weight
+/// placement the split pair does not. A rung grouped at 512 gets none of that back.
+///
+/// `STAND.md` and `TRANSCRIPTION-CORPUS.md` carry the columns. The host column is not
+/// unchanged either: it rises by a few MiB on the long recognition row — the most grouped
+/// rungs — and is flat on the 10 s row, which groups none, so what it holds is the extra graphs
+/// a grouped rung compiles (a tail and a projector per group size, where a fused rung compiled
+/// one) left in the allocator. That is the drift `docs/fork-sync.md` §7 allows, not memory this
+/// arrangement holds. The corpus's resting column is sampled between a row's two calls, in a
+/// process that then exits, so it is what the first call left *allocated* rather than the live
+/// set — and it is not take-stable.
+pub const MIN_TAIL_GROUP: usize = 3;
+
+/// The cap [`TAIL_GROUP`] names for this call — `MAHBOT_TAIL_GROUP`'s own when it is set, the
+/// constant otherwise — and whether the environment named it, which is what screens a take
+/// (`run::screening_reasons`). One resolution answers both questions, and each reader holds
+/// that answer rather than reading the environment again: `run::record_run` refuses and
+/// screens on it, and a [`crate::transcribe::Transcriber`] builds its rungs at the cap it
+/// resolved when it opened. A value that does not parse, or that is above
+/// [`MAX_TAIL_GROUP`], is refused rather than defaulted ([`crate::guard::whole_number`]'s
+/// rule): the arm a take measured is not the one the defaults hold. `1` is the per-chunk arm,
+/// and `2` is the same arrangement, because a rung below [`MIN_TAIL_GROUP`] is not grouped at
+/// any cap.
+///
+/// # Errors
+/// The variable is set and is not a whole number of at least one and at most
+/// [`MAX_TAIL_GROUP`].
+pub(crate) fn tail_group() -> Result<(usize, bool)> {
+    tail_group_of(std::env::var_os("MAHBOT_TAIL_GROUP"))
+}
+
+/// [`tail_group`] over an explicit value, so the parse and the ceiling are testable without
+/// touching the process's environment.
+fn tail_group_of(value: Option<std::ffi::OsString>) -> Result<(usize, bool)> {
+    let named = value.is_some();
+    let cap = crate::guard::whole_number(value, TAIL_GROUP as u64, "MAHBOT_TAIL_GROUP")?;
+    if cap > MAX_TAIL_GROUP as u64 {
+        bail!("MAHBOT_TAIL_GROUP `{cap}` is above the {MAX_TAIL_GROUP}-chunk ceiling");
+    }
+    Ok((cap as usize, named))
+}
+
+/// The group size a rung of `chunks` chunks runs the encoder tail at, under `cap`: as many
+/// windows as the cap allows. A rung's tail work is its chunks' rows however they are split,
+/// so a wider group only buys fewer passes through the weights — the cap, not the rung's
+/// remainder, is what keeps the arena inside the memory rule, and it arrives already bounded
+/// by [`MAX_TAIL_GROUP`] ([`tail_group`] is where the environment is refused).
+///
+/// One is the per-chunk arrangement, and a cap below [`MIN_TAIL_GROUP`] asks for it everywhere.
+///
+/// A rung that does not divide by this size ends in a short group, and that group runs at its
+/// own row count — a second tail graph at that size rather than a full group's lanes with
+/// some of them empty. Over the long row the padding that avoids would be ~80 ms of the ~440
+/// ms of encoder-front time the grouping saves, and the second graph is peak, not resting:
+/// `STAND.md`'s peak column carries what it costs.
+pub(crate) fn rung_group_size(chunks: usize, cap: usize) -> usize {
+    let cap = cap.min(chunks);
+    if cap < MIN_TAIL_GROUP {
+        return 1;
+    }
+    cap
+}
 
 /// The listening path for the ear: the wake decision's embedding, from one window
 /// (the enrolment, the negative pool and the ungrouped streams) or from two
@@ -536,23 +733,13 @@ impl Listener {
 /// sweep's [`GroupFront`], or a [`Listener`] for the ungrouped and paired streams.
 pub(crate) trait Embedder {
     /// Up to [`GROUP`] windows → one embedding each. [`GroupFront`] spends one
-    /// encoder tail pass and one projector pass over the whole group; a
-    /// [`Listener`] pairs two windows in one pass and embeds a lone one alone.
+    /// encoder tail pass and one projector pass over the whole group; a [`Listener`]
+    /// pairs two windows in one pass and embeds a lone one alone.
     fn embed_group(&mut self, windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>>;
 }
 
 impl Embedder for GroupFront {
     fn embed_group(&mut self, windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
-        if windows.is_empty() {
-            return Ok(Vec::new());
-        }
-        if windows.len() > self.batch {
-            return Err(anyhow!(
-                "a group of {} windows in a pipeline built for {}",
-                windows.len(),
-                self.batch
-            ));
-        }
         let windows: Vec<Vec<f32>> = windows.iter().map(|w| trailing_window(w)).collect();
         let refs: Vec<&[f32]> = windows.iter().map(Vec::as_slice).collect();
         let (tokens, dim) = (self.tokens, self.dim);
@@ -772,7 +959,8 @@ impl Shared {
 ///
 /// Three residencies, one per caller. A **ladder chunk** ([`Clip::rung`]) builds the rung of
 /// its frame count and holds it, so a pass compiles each rung once and the rung is given back
-/// when the group of chunks that share it has run. A **caller with several chunks of one
+/// when the group of chunks that share it has run; a rung read in groups runs the grouped front
+/// end, whose tail runs once per group ([`GroupFront`]). A **caller with several chunks of one
 /// length** ([`Clip::build`]) keeps its front end and its decode graph and rebuilds only the
 /// prefill between chunks, because holding all three would keep three compiled graphs whose
 /// uploads carry the body. The **one-shot** clip ([`Clip::once`]) drops the front end as soon
@@ -856,11 +1044,21 @@ impl<'a> Clip<'a> {
 
     /// A chunk of a **rung** of the transcription ladder: the rung is built by this call and
     /// the clip owns it, so the front end, the prefill and their arenas are given back when
-    /// the clip is dropped after the group's last chunk. The decode graph and the mel graph
+    /// the clip is dropped after the rung's last chunk. The decode graph and the mel graph
     /// are not the rung's — the pair and the process keep those — so they outlive the drop.
-    pub(crate) fn rung(pair: &Arc<Pair>, decoder: &'a Decoder, frames: usize) -> Result<Self> {
+    ///
+    /// `sizes` are the window counts the rung's tail runs at ([`rung_group_size`] says how many
+    /// chunks a group carries): `[1]` keeps the fused conv+tail graph, anything wider takes the
+    /// grouped front end. The rung's price is every graph it compiles, so the clock starts
+    /// before the front end is built.
+    pub(crate) fn rung(
+        pair: &Arc<Pair>,
+        decoder: &'a Decoder,
+        frames: usize,
+        sizes: &[usize],
+    ) -> Result<Self> {
         let t = report::Stopwatch::start();
-        let rung = Rung::build(pair, frames)?;
+        let rung = Rung::build(pair, frames, sizes)?;
         let owed_ms = t.ms();
         let decode = Arc::clone(&rung.decode);
         let tokens = rung.tokens;
@@ -922,8 +1120,90 @@ impl<'a> Clip<'a> {
     /// follows it, so the answer's language is the audio's and the tag never reaches a
     /// transcript — everything up to [`ASR_TEXT`] is stripped.
     pub(crate) fn run(&mut self, mut audio: Vec<f32>) -> Result<Walk> {
+        audio.truncate(self.frames * graphs::MEL_HOP);
+        let budget = self.max_new;
+        self.run_group(vec![(audio, budget)])?
+            .pop()
+            .ok_or_else(|| anyhow!("a one-chunk pass answered no walk"))
+    }
+
+    /// `chunks.len()` chunks of one rung in **one** front-end pass: the mel front end and the
+    /// conv front once per chunk, and — on a rung whose front end is grouped — the encoder
+    /// tail and the projector once for the group ([`GroupFront`]), then each chunk's prompt,
+    /// prefill and decode. Each chunk is its audio and its budget together, so the two cannot
+    /// disagree, and one walk comes back per chunk, in order.
+    ///
+    /// The group's front-end time is divided evenly over the chunks it serves, so the phase
+    /// line's sum is still the pass's cost.
+    pub(crate) fn run_group(&mut self, chunks: Vec<(Vec<f32>, usize)>) -> Result<Vec<Walk>> {
+        let (windows, budgets): (Vec<Vec<f32>>, Vec<usize>) = chunks.into_iter().unzip();
+        let (projected, front_ms) = self.front_pass(windows)?;
+        let mut walks = Vec::with_capacity(budgets.len());
+        // `front_pass` answers one projection per window handed in, so the zip is exact.
+        debug_assert_eq!(projected.len(), budgets.len(), "one projection per chunk");
+        for (rows, budget) in projected.into_iter().zip(budgets) {
+            // A chunk's own length bounds what it can say, so a walk capped there cannot
+            // spend a minute looping over eighteen seconds of singing.
+            self.max_new = budget.max(1);
+            walks.push(self.walk(rows, front_ms)?);
+        }
+        Ok(walks)
+    }
+
+    /// The front end over one group: the grouped rung's single pass over `windows`, or — on a
+    /// rung whose tail runs one window, and on a one-shot clip, which drops its front end as
+    /// soon as it has run — the fused encoder one window per pass. One projection per window
+    /// handed in, in the same order.
+    fn front_pass(&mut self, windows: Vec<Vec<f32>>) -> Result<(Vec<Vec<f32>>, f64)> {
         let frames = self.frames;
-        audio.truncate(frames * graphs::MEL_HOP);
+        if let Some(Rung {
+            front: RungFront::Grouped(group),
+            ..
+        }) = &mut self.shared
+        {
+            let refs: Vec<&[f32]> = windows.iter().map(Vec::as_slice).collect();
+            let t = report::Stopwatch::start();
+            let projected = group.forward_group(&refs)?;
+            return Ok((projected, t.ms() / windows.len().max(1) as f64));
+        }
+        // A clip of its own builds its front end on first use and, when it does not keep it,
+        // drops it once it has run; either way the build is owed to the clip, not to the pass.
+        let owns = self.shared.is_none();
+        if owns && self.front.is_none() {
+            let build = report::Stopwatch::start();
+            self.front = Some(Front::build(&self.pair, frames, 1).context("front build")?);
+            self.owed_ms += build.ms();
+        }
+        // One window per pass on an ungrouped front end: a rung's own fused graph, or the one
+        // a clip of its own built just above.
+        let front = if let Some(Rung {
+            front: RungFront::Fused(front),
+            ..
+        }) = &self.shared
+        {
+            front
+        } else {
+            self.front
+                .as_ref()
+                .expect("a clip of its own built its front end above")
+        };
+        let mut projected = Vec::with_capacity(windows.len());
+        let mut ms = 0.0;
+        for window in windows {
+            let t = report::Stopwatch::start();
+            projected.push(front.run(window)?);
+            ms += t.ms();
+        }
+        if owns && !self.reuse_front {
+            self.front = None;
+        }
+        let served = projected.len().max(1) as f64;
+        Ok((projected, ms / served))
+    }
+
+    /// One chunk's prompt, prefill and decode over its projected token rows.
+    fn walk(&mut self, projected: Vec<f32>, front_ms: f64) -> Result<Walk> {
+        let frames = self.frames;
         let cfg = self.cfg.clone();
         let hkv = self.hkv;
         let vocab = match cfg.head {
@@ -932,32 +1212,6 @@ impl<'a> Clip<'a> {
         let prompt_rows = prompt_len(self.tokens);
         let mut capacity = self.capacity;
         let mut build_ms = std::mem::take(&mut self.owed_ms);
-
-        let (projected, front_ms) = match &self.shared {
-            Some(rung) => {
-                let t = report::Stopwatch::start();
-                let out = rung.front.run(audio)?;
-                (out, t.ms())
-            }
-            None => {
-                if self.front.is_none() {
-                    let t = report::Stopwatch::start();
-                    self.front = Some(Front::build(&self.pair, frames, 1).context("front build")?);
-                    build_ms += t.ms();
-                }
-                let t = report::Stopwatch::start();
-                let out = self
-                    .front
-                    .as_ref()
-                    .expect("the front end was built just above")
-                    .run(audio)?;
-                let ms = t.ms();
-                if !self.reuse_front {
-                    self.front = None;
-                }
-                (out, ms)
-            }
-        };
 
         // The prompt: the tokenizer's real rows, with the thirteen audio rows
         // replaced by the encoder's projected features.
@@ -1157,14 +1411,6 @@ impl<'a> Clip<'a> {
             decode_times,
         })
     }
-
-    /// Cap one walk at `max_new` generated tokens. A caller transcribing a bounded
-    /// chunk sets one from the chunk's own length, so a repetition loop cannot cost
-    /// more than the audio it covers — the loop is reported either way, by the
-    /// transcript's words; a single-pass reading keeps the crate's own budget.
-    pub(crate) fn set_max_new(&mut self, max_new: usize) {
-        self.max_new = max_new.max(1);
-    }
 }
 
 /// The one-shot path: any length of 16 kHz mono audio in, its reading out. The input is
@@ -1239,7 +1485,7 @@ mod tests {
     /// The tree carries no models, so no gate can run this: it is opt-in on both
     /// the models being installed and `MAHBOT_GROUP_PARITY=1`, and the second
     /// exists so a plain `cargo test` in a shell that has the models does not
-    /// compile seven graphs (~1.5 GiB of device work) by accident. Run it
+    /// compile the encoder's graphs by accident. Run it
     /// deliberately with `MAHBOT_GROUP_PARITY=1 cargo test -p mahbot-inference --lib
     /// a_grouped_pass`.
     #[test]
@@ -1274,9 +1520,9 @@ mod tests {
         }
         let pair = std::sync::Arc::new(Pair::open(body, sound).expect("open the ASR pair"));
 
-        // Three distinguishable windows, each shorter than the wake window so the
-        // padding path is exercised too.
-        let windows: Vec<Vec<f32>> = (0..3)
+        // Five distinguishable windows, each shorter than the wake window so the
+        // trailing pad is exercised too.
+        let windows: Vec<Vec<f32>> = (0..5)
             .map(|i| {
                 let len = 4_000 + i * 1_500;
                 (0..len)
@@ -1294,24 +1540,33 @@ mod tests {
             |projected: &[f32]| embed_rows(projected, tokens, dim).expect("a window's rows");
         let single = Front::build(&pair, MEL_FRAMES, 1).expect("the single-window front");
         let paired = Front::build(&pair, MEL_FRAMES, PAIR).expect("the pair front");
-        let mut grouped = GroupFront::build(&pair, MEL_FRAMES, GROUP).expect("a group front");
         let padded: Vec<Vec<f32>> = windows.iter().map(|w| trailing_window(w)).collect();
-        let references: Vec<&[f32]> = padded.iter().map(Vec::as_slice).collect();
-        let batched = grouped
-            .forward_group(&references)
-            .expect("the grouped pass");
-        assert_eq!(batched.len(), windows.len());
-
-        for (window, grouped) in windows.iter().zip(batched) {
-            let one = trailing_window(window);
-            let single = single.run(one).expect("the single-window pass");
-            let a = embedding(&single);
-            let b = embedding(&grouped);
-            let cosine: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
-            assert!(
-                cosine > 0.999_9,
-                "a grouped window's embedding matches the single-window pass: cosine {cosine}"
-            );
+        // Every grouped path, each against the single-window pass: a rung that divides into
+        // its group size, a rung whose last group is one window (five chunks at a cap of four
+        // compile tails at four and one), and a size the front was not built for, which is
+        // padded up to the size it has (the sweep's flush).
+        for (sizes, groups) in [
+            (&[windows.len()][..], &[0..windows.len()][..]),
+            (&[1, 4][..], &[0..4, 4..5][..]),
+            (&[GROUP][..], &[0..windows.len()][..]),
+        ] {
+            let mut grouped = GroupFront::build(&pair, MEL_FRAMES, sizes).expect("a group front");
+            for range in groups {
+                let refs: Vec<&[f32]> = padded[range.clone()].iter().map(Vec::as_slice).collect();
+                let batched = grouped.forward_group(&refs).expect("the grouped pass");
+                assert_eq!(batched.len(), range.len());
+                for (window, out) in padded[range.clone()].iter().zip(batched) {
+                    let one = single.run(window.clone()).expect("the single-window pass");
+                    let a = embedding(&one);
+                    let b = embedding(&out);
+                    let cosine: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+                    assert!(
+                        cosine > 0.999_9,
+                        "a grouped window's embedding matches the single-window pass at \
+                         {sizes:?}: cosine {cosine}"
+                    );
+                }
+            }
         }
 
         // The pair pass, under the same rule: two windows in one batched pass, each
@@ -1389,6 +1644,53 @@ mod tests {
             assert!(
                 delta <= 1e-6,
                 "slot {slot}: the batched mel is the window's own mel (max|Δ| {delta:e})"
+            );
+        }
+    }
+
+    /// The group a rung's chunks go through the encoder tail in: as many windows as the cap
+    /// allows and the rung has, never below [`MIN_TAIL_GROUP`] — a rung too small to pay for
+    /// itself keeps the fused graph — and one for the per-chunk arm.
+    #[test]
+    fn a_rung_groups_at_its_cap_until_the_rung_is_smaller() {
+        assert_eq!(rung_group_size(1, 4), 1, "one chunk is not a group");
+        assert_eq!(rung_group_size(2, 8), 1, "nor two, however wide the cap");
+        assert_eq!(rung_group_size(3, 4), 3, "a rung the cap cannot fill");
+        assert_eq!(rung_group_size(23, 4), 4, "twenty-three at a cap of four");
+        assert_eq!(rung_group_size(23, 8), 8, "twenty-three at a cap of eight");
+        assert_eq!(
+            rung_group_size(23, 1),
+            1,
+            "a cap of one is the per-chunk arm"
+        );
+    }
+
+    /// `MAHBOT_TAIL_GROUP`'s parse and its ceiling: the arm a take measured is named, not
+    /// silently replaced by the default — and the same resolution says whether a take is
+    /// screened.
+    #[test]
+    fn the_tail_group_knob_is_named_or_refused() {
+        assert_eq!(
+            tail_group_of(None).unwrap(),
+            (TAIL_GROUP, false),
+            "unset is the shipped arm, and a take under it is the record's"
+        );
+        for (value, cap) in [("1", 1), ("2", 2), ("8", 8)] {
+            assert_eq!(
+                tail_group_of(Some(value.into())).unwrap(),
+                (cap, true),
+                "`{value}` is a cap of {cap}, named"
+            );
+        }
+        for (value, names) in [
+            ("abc", "is not a whole number"),
+            ("0", "at least 1"),
+            ("9", "above the 8-chunk ceiling"),
+        ] {
+            let error = tail_group_of(Some(value.into())).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(names),
+                "`{value}` is refused with `{names}`: {error:#}"
             );
         }
     }

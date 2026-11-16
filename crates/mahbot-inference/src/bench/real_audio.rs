@@ -156,7 +156,7 @@ pub(crate) fn run(
     // its segment window carry from one file into the next, separated by a silent
     // gap, so the sweep is one listener's hearing rather than one per file.
     let mut stream = DetectionStream::grouped(enrollment.clone());
-    let listener = match listen::GroupFront::build(pair, listen::MEL_FRAMES, listen::GROUP) {
+    let listener = match listen::GroupFront::build(pair, listen::MEL_FRAMES, &[listen::GROUP]) {
         Ok(listener) => Some(listener),
         Err(error) => {
             cut = Some(error.context("the real-audio listener did not compile"));

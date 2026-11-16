@@ -274,6 +274,7 @@ fn a_paste_onset_lands_within_one_detector_hop() {
 #[test]
 #[ignore = "needs the models and the pinned corpus; run by hand"]
 fn the_pinned_clip_reads_as_its_witness() {
+    support::assert_tail_group_shipped();
     let Some(asr) = pair(Role::Recognition) else {
         return;
     };
@@ -325,6 +326,7 @@ const LONG_READINGS: &[(&str, usize, &str)] = &[
 #[test]
 #[ignore = "needs the models, the tagger and the pinned corpus; run by hand"]
 fn long_recordings_are_read_as_what_was_said() {
+    support::assert_tail_group_shipped();
     let Some((pair, tagger)) = open() else {
         return;
     };

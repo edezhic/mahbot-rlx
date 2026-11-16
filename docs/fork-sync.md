@@ -333,6 +333,14 @@ is how a take can be checked without editing the tree; a subset run
 plan, encoder front, prompt prefill and decode — on stderr. No record carries it:
 the seven-row stand measures whole calls.
 
+`MAHBOT_TAIL_GROUP=<n>` caps the chunks one grouped encoder-tail pass carries, and
+`1` restores the per-chunk arrangement, so the two arms can be compared on one
+tree. A run with it set writes no record — a take on the arm is not the shipped
+arrangement's numbers — and a value above the ceiling or outside the whole numbers
+is refused by name before any work. The wake bench is not screened by it: its sweep
+groups by `GROUP`, which the variable does not touch. The size and the readings
+behind it live in `crates/mahbot-inference/src/listen.rs`'s `TAIL_GROUP`.
+
 ## 9. Re-pin, do not widen
 
 Numerical results move, because upstream changes arithmetic and a sync changes

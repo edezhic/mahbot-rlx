@@ -104,6 +104,16 @@ pub fn assert_run_report_off() {
     );
 }
 
+/// Refuse to pin a reading under the encoder-tail A/B arm: `MAHBOT_TAIL_GROUP` picks which
+/// arrangement a rung's chunks are read through, so a pin taken with it set compares a
+/// reading against the shipped arm's witness.
+pub fn assert_tail_group_shipped() {
+    assert!(
+        std::env::var_os("MAHBOT_TAIL_GROUP").is_none(),
+        "MAHBOT_TAIL_GROUP selects the encoder-tail A/B arm; unset it to run this pin"
+    );
+}
+
 /// A subject's exclusive hold on the process. The route and floor switches are
 /// process-global, so two subjects building together would each compile under the
 /// other's setting and still print plausible figures. Held for the subject's body, so a

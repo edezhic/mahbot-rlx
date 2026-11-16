@@ -473,6 +473,11 @@ pub(crate) fn record_run(mode: Mode) {
     }
 
     let bounds = bounds(label);
+    // The encoder-tail arm is resolved with the run's other inputs, so a value that is mistyped
+    // or above its ceiling stops the run here — by name, before any work — rather than inside
+    // the first recognition row. The cap itself is held by whoever builds the rungs
+    // (`Transcriber::open`), which resolves it once and does not read the environment again.
+    let tail_arm = tail_arm(label);
     // Which files this run reads, on stderr: stdout carries the one-JSON-line row
     // protocol and gains nothing.
     eprintln!(
@@ -486,14 +491,10 @@ pub(crate) fn record_run(mode: Mode) {
     // screening decides whether a record is written, never whether the device is
     // shared, and a run under a raised bound measures exactly like any other.
     let heavy = Heavy::parent(label, bounds);
-    // A run under a raised bound is screened: it measures and prints like any other,
-    // and the record is what it does not write. Saying so before the rows run is
+    // A run under a raised bound or a route switch is screened: it measures and prints like
+    // any other, and the record is what it does not write. Saying so before the rows run is
     // half of that.
-    let screened = bound_reasons(
-        bounds.timeout_secs,
-        bounds.max_rss_mib,
-        bounds.swap_growth_mib,
-    );
+    let screened = screening_reasons(bounds, tail_arm);
     if !screened.is_empty() {
         refuse_record(label, &screened);
     }
@@ -583,12 +584,43 @@ pub(crate) fn bound_reasons(timeout: u64, max_rss: u64, swap_growth: u64) -> Vec
     reasons
 }
 
+/// Why a run writes no record: [`bound_reasons`], and a route switch that makes the take
+/// something other than the shipped arrangement. `MAHBOT_TAIL_GROUP` picks the encoder-tail
+/// arm, and a record carries the shipped arrangement's numbers only — a take on the A/B arm
+/// is a take of its own, so the variable being set at all (`tail_arm`, from the same
+/// resolution that validated it) screens the run. The wake bench needs no such rule: its
+/// sweep groups by `GROUP`, which the variable does not touch.
+fn screening_reasons(bounds: Bounds, tail_arm: bool) -> Vec<&'static str> {
+    let mut reasons = bound_reasons(
+        bounds.timeout_secs,
+        bounds.max_rss_mib,
+        bounds.swap_growth_mib,
+    );
+    if tail_arm {
+        reasons.push("MAHBOT_TAIL_GROUP selects the encoder-tail A/B arm");
+    }
+    reasons
+}
+
 /// The bounds this process runs under, or the process stopped there: a bound
 /// variable that is set and unparsable must not let the run pass for one held
 /// under the defaults, so the entry point refuses it by name before any work.
 pub(crate) fn bounds(label: &str) -> Bounds {
     match Bounds::from_env() {
         Ok(bounds) => bounds,
+        Err(error) => {
+            eprintln!("{label}: {error:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Whether `MAHBOT_TAIL_GROUP` names the encoder-tail A/B arm, or the process stopped there for
+/// the same reason [`bounds`] refuses: an arm that does not parse must not let a take pass for
+/// the shipped arrangement's.
+fn tail_arm(label: &str) -> bool {
+    match crate::listen::tail_group() {
+        Ok((_, named)) => named,
         Err(error) => {
             eprintln!("{label}: {error:#}");
             std::process::exit(1);
@@ -615,5 +647,21 @@ mod tests {
         assert_eq!(ordered(vec![5, 4, 3, 2, 1, 0], 6), vec![0, 1, 2, 3, 4, 5]);
         assert_eq!(ordered(vec![2, 0], 6), vec![0, 2]);
         assert_eq!(ordered(Vec::new(), 3), vec![0, 1, 2]);
+    }
+
+    /// A take on the encoder-tail A/B arm is not the shipped arrangement's numbers, so it
+    /// writes no record; a take under the defaults does.
+    #[test]
+    fn a_route_switch_screens_the_run() {
+        let shipped = crate::guard::Bounds {
+            timeout_secs: crate::guard::DEFAULT_TIMEOUT_SECS,
+            max_rss_mib: crate::guard::DEFAULT_MAX_RSS_MIB,
+            swap_growth_mib: crate::guard::MAX_SWAP_GROWTH_MIB,
+        };
+        assert!(screening_reasons(shipped, false).is_empty());
+        assert_eq!(
+            screening_reasons(shipped, true),
+            vec!["MAHBOT_TAIL_GROUP selects the encoder-tail A/B arm"]
+        );
     }
 }

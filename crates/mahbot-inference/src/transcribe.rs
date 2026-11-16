@@ -572,6 +572,10 @@ pub struct Transcriber {
     /// run is held to, so an input is refused against the figure that run enforces
     /// rather than against a second read of the environment.
     ceiling: u64,
+    /// The encoder-tail group cap this transcriber builds its rungs at
+    /// ([`listen::tail_group`]), resolved once here beside the ceiling: the arm a call
+    /// measures is the arm the run named, and no chunk of it reads the environment again.
+    tail_cap: usize,
 }
 
 impl Transcriber {
@@ -579,7 +583,9 @@ impl Transcriber {
     /// without the tagger a non-speech region could not carry a label, and a region
     /// never comes back empty. `ceiling_mib` is the resident-set bound the run is
     /// held to — [`crate::guard::Bounds::max_rss_mib`] for a run whose bounds were
-    /// resolved once.
+    /// resolved once. The encoder-tail cap is resolved here as well, so this transcriber's
+    /// rungs are built at one arm and a mistyped `MAHBOT_TAIL_GROUP` stops it before any audio
+    /// is read.
     pub fn open(pair: Arc<Pair>, tagger: Tagger, ceiling_mib: u64) -> Result<Self> {
         let decoder = Decoder::from_model(&pair.body).context("the recognition decoder")?;
         Ok(Self {
@@ -587,6 +593,7 @@ impl Transcriber {
             decoder,
             tagger,
             ceiling: ceiling_mib.saturating_mul(1024 * 1024),
+            tail_cap: listen::tail_group()?.0,
         })
     }
 
@@ -690,29 +697,43 @@ impl Transcriber {
         let plan = tile_indexed(&chunk_list, audio16.len());
         let vad_ms = t_plan.ms();
 
-        // Each chunk read once, on its own prompt, and its words kept only where the guards
-        // stand behind them.
-        let (walk, answers) = read_pieces(&self.pair, &self.decoder, audio16, &chunk_list)?;
         // The recognition phase split, on stderr when `MAHBOT_PHASE_SPLIT` is set: the
-        // front, prefill and decode are separate graphs, summed by `Walk::pieces`. The
-        // value is read truthily, as `rlx_ir::env::flag` spells it: `=0`, `=false`,
-        // `=off` and `=no` are off.
+        // front, prefill and decode are separate graphs, summed by `Walk::pieces`, and the
+        // rung census beside them is what `read_pieces` read — each rung's chunks and the
+        // group size it was compiled at, the number the encoder-tail arrangement is chosen
+        // on, which no record column carries. The value is read truthily, as
+        // `rlx_ir::env::flag` spells it: `=0`, `=false`, `=off` and `=no` are off.
         let split = std::env::var("MAHBOT_PHASE_SPLIT").is_ok_and(|v| {
             !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "" | "0" | "false" | "off" | "no"
             )
         });
+        // Each chunk read once, on its own prompt, and its words kept only where the guards
+        // stand behind them.
+        let Pieces {
+            walk,
+            answers,
+            rungs,
+        } = read_pieces(
+            &self.pair,
+            &self.decoder,
+            audio16,
+            &chunk_list,
+            self.tail_cap,
+            split,
+        )?;
         if split {
             let decode_ms: f64 = walk.decode_times.iter().sum();
             eprintln!(
                 "phases: tagger {tagger_ms:.1} ms · vad+plan {vad_ms:.1} ms · encoder front \
                  {:.1} ms · prefill {:.1} ms · decode {decode_ms:.1} ms over {} tokens · build \
-                 {:.1} ms",
+                 {:.1} ms · rungs {}",
                 walk.front_ms,
                 walk.prefill_ms,
                 walk.decode_times.len(),
                 walk.build_ms,
+                rungs.join(" "),
             );
         }
 
@@ -848,6 +869,12 @@ impl Transcriber {
 /// single pass exactly as it always was — same graphs, same text, and no guard, because a
 /// piece that short is the reading the caller has always had.
 ///
+/// An input long enough to be cut is read by the product's own piece path ([`read_pieces`]),
+/// rung groups and all: it goes through the grouped encoder tail a transcription's chunks
+/// do, so its reading depends on how many pieces share a rung exactly as a transcription's
+/// does. That is the same dependence the path already had on the cut and on the rung, and no
+/// pinned one-shot reading moved when the grouping landed.
+///
 /// `audio` must be a whole number of mel hops: a piece is read from exactly `frames ·
 /// MEL_HOP` samples. [`listen::recognise`] truncates to whole hops before calling this.
 pub(crate) fn read_whole(
@@ -863,13 +890,22 @@ pub(crate) fn read_whole(
     if pieces.len() == 1 {
         return listen::Clip::once(pair, decoder, frames_of(audio.len()))?.run(audio);
     }
-    Ok(read_pieces(pair, decoder, &audio, &pieces)?.0)
+    let cap = listen::tail_group()?.0;
+    Ok(read_pieces(pair, decoder, &audio, &pieces, cap, false)?.walk)
 }
 
-/// Every chunk of a plan read once, in the plan's own order: the joined walk
-/// ([`listen::Walk::pieces`]) and the chunks' guarded readings — `None` where the
-/// guards refuse one or the walk ran out of its own budget, so a refused piece
-/// contributes no words.
+/// One call's readings from [`read_pieces`]: the joined walk, each chunk's guarded reading, and
+/// the rung census the phase line prints — empty unless the caller asked for it.
+struct Pieces {
+    walk: listen::Walk,
+    answers: Vec<Option<String>>,
+    rungs: Vec<String>,
+}
+
+/// Every chunk of a plan read once, in the plan's own order. The census [`Pieces`] carries,
+/// when `census` asks for it, is one `chunks@frames×group` entry per rung, in frame order, built
+/// from the pass's own grouping decision: that is what the phase line prints — the number the
+/// encoder-tail arrangement is chosen on, which no record column carries.
 ///
 /// The chunks are grouped by the rung their graphs are compiled at, so a plan whose chunks
 /// share a rung — most of them, since a full piece is always the same length — compiles
@@ -883,41 +919,84 @@ fn read_pieces(
     decoder: &Decoder,
     audio: &[f32],
     chunks: &[Span],
-) -> Result<(listen::Walk, Vec<Option<String>>)> {
+    cap: usize,
+    census: bool,
+) -> Result<Pieces> {
     let mut shapes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (index, chunk) in chunks.iter().enumerate() {
         shapes.entry(chunk_frames(*chunk)?).or_default().push(index);
     }
     let mut readings: Vec<(usize, (listen::Walk, Option<String>))> =
         Vec::with_capacity(chunks.len());
+    let mut rungs: Vec<String> = Vec::new();
     for (frames, indexes) in &shapes {
-        let mut clip = listen::Clip::rung(pair, decoder, *frames)
+        let group = listen::rung_group_size(indexes.len(), cap);
+        if census {
+            rungs.push(format!("{}@{frames}×{group}", indexes.len()));
+        }
+        let groups: Vec<&[usize]> = indexes.chunks(group).collect();
+        let mut clip = listen::Clip::rung(pair, decoder, *frames, &group_sizes(&groups))
             .with_context(|| format!("building the {frames}-frame recognition graphs"))?;
-        for &index in indexes {
-            let chunk = chunks[index];
-            let seconds = (chunk.end - chunk.start) as f64 / f64::from(RATE);
+        for slice in groups {
             // The chunk's own length bounds what it can say: a walk capped there cannot
             // spend a minute looping over eighteen seconds of singing, and the loop, if it
             // happens, is still in the words.
-            clip.set_max_new(chunk_budget(seconds));
-            let walk = clip
-                .run(chunk_audio(audio, chunk, *frames))
-                .with_context(|| format!("transcribing samples {}..{}", chunk.start, chunk.end))?;
-            // A walk that ran out of its own budget was circling, not reading: the words it
-            // did produce are not a reading of the chunk either.
-            let answer = if walk.truncated {
-                None
-            } else {
-                guard(&walk.text, seconds)
-            };
-            readings.push((index, (walk, answer)));
+            let pass: Vec<(Vec<f32>, usize)> = slice
+                .iter()
+                .map(|&index| {
+                    let chunk = chunks[index];
+                    (
+                        chunk_audio(audio, chunk, *frames),
+                        chunk_budget(span_seconds(chunk)),
+                    )
+                })
+                .collect();
+            // A rung's chunks are interleaved through the plan with other rungs' chunks, so
+            // the group is named by its own first chunk rather than by a sample range that
+            // would hold the chunks between them.
+            let first = chunks[slice[0]];
+            let walks = clip.run_group(pass).with_context(|| {
+                format!(
+                    "transcribing a group of {} chunks of the {frames}-frame rung, the first \
+                     at samples {}..{}",
+                    slice.len(),
+                    first.start,
+                    first.end
+                )
+            })?;
+            for (&index, walk) in slice.iter().zip(walks) {
+                // A walk that ran out of its own budget was circling, not reading, so what it
+                // said is not a reading of the chunk either.
+                let seconds = span_seconds(chunks[index]);
+                let guarded = if walk.truncated {
+                    None
+                } else {
+                    guard(&walk.text, seconds)
+                };
+                readings.push((index, (walk, guarded)));
+            }
         }
         drop(clip);
     }
     readings.sort_unstable_by_key(|&(index, _)| index);
     let pieces: Vec<(listen::Walk, Option<String>)> =
         readings.into_iter().map(|(_, reading)| reading).collect();
-    Ok(listen::Walk::pieces(frames_of(audio.len()), pieces))
+    let (walk, answers) = listen::Walk::pieces(frames_of(audio.len()), pieces);
+    Ok(Pieces {
+        walk,
+        answers,
+        rungs,
+    })
+}
+
+/// The tail sizes a rung's `groups` need, in ascending order: one per distinct group length.
+/// Taken from the same slices the pass runs, so a size the front was built for cannot fall out
+/// of step with the split.
+fn group_sizes(groups: &[&[usize]]) -> Vec<usize> {
+    let mut sizes: Vec<usize> = groups.iter().map(|group| group.len()).collect();
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
 }
 
 /// The frame count a chunk's graphs are compiled at: its own length rounded up to the
@@ -933,6 +1012,11 @@ fn chunk_audio(audio: &[f32], read: Span, frames: usize) -> Vec<f32> {
         audio.get(read.start..read.end).unwrap_or(&[]),
         frames * graphs::MEL_HOP,
     )
+}
+
+/// How long a span of audio is, in seconds: what a chunk's budget and its guard are set from.
+fn span_seconds(span: Span) -> f64 {
+    (span.end - span.start) as f64 / f64::from(RATE)
 }
 
 /// Whether a span may be removed from the recogniser's input rather than transcribed.
@@ -1196,6 +1280,30 @@ mod tests {
             cursor = region.end;
         }
         assert_eq!(total, samples, "the regions cover the input exactly once");
+    }
+
+    /// The tail sizes a rung's groups are built at, and the sizes it therefore runs: one per
+    /// distinct group length. The sizes come from the same slices the pass runs, so they cannot
+    /// disagree with the split.
+    #[test]
+    fn a_rungs_tail_sizes_follow_its_groups() {
+        let sizes = |chunks: usize, group: usize| -> Vec<usize> {
+            let indexes: Vec<usize> = (0..chunks).collect();
+            let groups: Vec<&[usize]> = indexes.chunks(group).collect();
+            group_sizes(&groups)
+        };
+        assert_eq!(sizes(4, 4), [4], "a rung that divides runs one size");
+        assert_eq!(sizes(8, 4), [4], "and so does one with several full groups");
+        assert_eq!(
+            sizes(5, 4),
+            [1, 4],
+            "five chunks at a cap of four end in one"
+        );
+        assert_eq!(sizes(9, 4), [1, 4], "nine too");
+        assert_eq!(sizes(6, 4), [2, 4], "six end in two");
+        assert_eq!(sizes(3, 3), [3], "a rung the cap cannot fill");
+        assert_eq!(sizes(1, 1), [1], "the per-chunk arm is one window");
+        assert_eq!(sizes(7, 8), [7], "a rung narrower than its cap");
     }
 
     #[test]
