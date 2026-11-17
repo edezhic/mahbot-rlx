@@ -34,19 +34,31 @@ throttle:
 throttle-warn:
     {{justfile_directory()}}/scripts/check-throttle.sh --warn
 
-# Build the whole workspace (release) — `--workspace` is explicit, not
-# decorative: a bare `cargo build` here means this fork's default contour,
-# which excludes the backends it does not develop (see `default-members` in
-# Cargo.toml). `build-workspace` is the whole-set gate, run once per upstream
-# sync rather than on every routine build.
+# The binding crates: workspace members, addressable by name, selected by no
+# routine or whole-set build, test or lint recipe.
+#
+# The fork's product is a Rust library plus its measurement binaries, and nothing
+# in either reaches a binding, so the whole-set recipes below name the block in
+# `--exclude` instead of selecting it. `--exclude` and never a pruned `members`:
+# `cargo build -p rlx-capi` has to keep resolving. Nothing under
+# `crates/bindings/` is deleted or edited. `check-bindings` (which does build
+# `rlx-bindgen`) and `check-binding-versions` still read it. See
+# `docs/fork-sync.md` §3.
+bindings_excl := "--exclude rlx-bind --exclude rlx-bindgen --exclude rlx-capi --exclude rlx-ffi --exclude rlx-js --exclude rlx-micro --exclude rlx-model-plugin"
+
+# Build this fork's contour (release) — a bare `cargo build` means the
+# `default-members` in Cargo.toml, which excludes the backends it does not
+# develop.
 build:
     cargo build --release
 
-# Every member, including the backends and the embedded crates this fork does
-# not build routinely. Slow and toolchain-dependent: the sync gate, not a
-# development loop.
+# Every member but the binding crates (`bindings_excl`), including the backends
+# and the embedded crates this fork does not build routinely. `--workspace` is
+# explicit, not decorative: it is what makes this the whole-set gate, run once
+# per upstream sync rather than on every routine build. Slow and
+# toolchain-dependent: the sync gate, not a development loop.
 build-workspace:
-    cargo build --release --workspace
+    cargo build --release --workspace {{bindings_excl}}
 
 # Build with everything turned on (Metal, kernel-trace, nan-check).
 build-all:
@@ -330,18 +342,21 @@ test:
     cargo test --release -p rlx-lbm --features ir,backend-tests
     just test-debug-verifier restricted
 
-# Every member, once per upstream sync (see `docs/fork-sync.md`): the whole-set
-# counterpart of `test`. No package selection, so the backends and the embedded
-# crates are compiled and run here and nowhere else. Three things it does not do:
+# Every member but the binding crates, once per upstream sync (see
+# `docs/fork-sync.md`): the whole-set counterpart of `test`. No package selection
+# beyond the `--exclude`s, so the backends and the embedded crates are compiled
+# and run here and nowhere else. Four things it does not do:
 # `cargo test --workspace` builds each package with its DEFAULT features, so a
 # target behind `required-features` is still skipped — `test-gpu` and the
 # per-backend recipes are what build those; `rlx-mlx-sys` / `rlx-mlx` are excluded
 # because this fork's contour does not ship the MLX backend, which is a permanent
 # decision and not a reading of the checkout — the vendored submodule being
-# present does not put them back; and six of upstream's own tests need a dataset
-# or a toolchain this host does not have, so they are skipped by name rather than
-# left to redden the gate. A gate that is red out of the box is not a gate: a sync
-# reads the red as a regression and chases it.
+# present does not put them back; the binding crates are excluded because the
+# fork ships no bindings (`bindings_excl`, and §3 of `docs/fork-sync.md` for
+# why); and three of upstream's own tests need MNIST IDX files at `RLX_MNIST_DIR`,
+# so they are skipped by name rather than left to redden the gate. A gate that is
+# red out of the box is not a gate: a sync reads the red as a regression and
+# chases it.
 #
 # One gated set is reached on purpose: `mahbot-inference`'s fifteen hand-run targets
 # are behind that crate's `hand-run` feature so the routine run does not link
@@ -349,25 +364,20 @@ test:
 # is what keeps this whole-set run's coverage where it was.
 #
 # `--skip` matches a test *name*, not a file, which is why the list below is
-# six names rather than three targets. Each carries what it wants in the comment
-# beside it; run one by hand on a rig that has the prerequisite.
+# names rather than a target. Each carries what it wants in the comment beside
+# it; run one by hand on a rig that has the prerequisite.
 # `--no-fail-fast` so anything else still reports.
 test-workspace:
     #!/usr/bin/env bash
     set -euo pipefail
     CPUS={{cpus}}
-    excl="--exclude rlx-mlx-sys --exclude rlx-mlx"
+    excl="--exclude rlx-mlx-sys --exclude rlx-mlx {{bindings_excl}}"
     feat="--features mahbot-inference/hand-run"
     skip=""
     # MNIST IDX files at `RLX_MNIST_DIR`.
     skip="$skip --skip audit_pair_switch_graft_and_answer"
     skip="$skip --skip read_tasks_hide_the_answer_and_score_it"
     skip="$skip --skip steer_task_scores_both_halves"
-    # A Ruby whose `Fiddle` has `TYPE_INT32_T`.
-    skip="$skip --skip ruby_binding_tests_and_examples"
-    # A Swift compiler that can type-check the examples.
-    skip="$skip --skip the_swift_examples_run_against_the_c_abi"
-    skip="$skip --skip the_swift_test_suite_passes"
     if [[ "$(uname -s)" == Darwin ]]; then
         JOBS=$(( CPUS < 4 ? CPUS : 4 ))
         cargo test --release -j "$JOBS" --workspace $excl $feat --no-fail-fast -- $skip
@@ -610,9 +620,10 @@ lint: lint-features
     # is the same for `mahbot-inference`'s fifteen hand-run targets.
     cargo clippy --all-targets --features backend-tests,hand-run -- -D warnings
 
-# Every member, once per upstream sync (see `docs/fork-sync.md`).
+# Every member but the binding crates (`bindings_excl`), once per upstream sync
+# (see `docs/fork-sync.md`).
 lint-workspace: lint-features
-    cargo clippy --workspace --all-targets --features backend-tests,hand-run -- -D warnings
+    cargo clippy --workspace {{bindings_excl}} --all-targets --features backend-tests,hand-run -- -D warnings
 
 # Clippy the feature combinations `--all-targets` alone cannot reach.
 #
@@ -1230,10 +1241,13 @@ run-verbose CMD:
 # `docs/fork-sync.md`).
 ci: build test fmt-check lint check-fork-layers check-rlx-env-vars check-example-names check-doc-links check-license-headers check-wgsl-uniform check-op-coverage check-corpus test-third-order-cpu check-rustdoc-contour
 # Everything, once per upstream sync: the routine gate above plus every member
-# upstream ships — the Apple/NVIDIA/AMD/Intel/TPU/embedded backends and the
-# bindings. Slow and toolchain-dependent, which is why the routine loop above
-# stays narrow. It depends on `ci` so it cannot fall behind it, and it
-# names `test-gpu` because that is the recipe that builds the targets behind
+# upstream ships — the Apple/NVIDIA/AMD/Intel/TPU/embedded backends and every
+# other member but the binding crates (`bindings_excl`). The binding block is
+# still read: `check-bindings` renders the derived files and diffs them against
+# the checked-in ones, `check-binding-versions` reads the manifests' version
+# stamps. Slow and toolchain-dependent, which is why the routine loop above stays
+# narrow. It depends on `ci` so it cannot fall behind it, and it names `test-gpu`
+# because that is the recipe that builds the targets behind
 # `required-features` — a bare `cargo test --workspace` skips every one of them.
 # `test-workspace` names the one feature it has to (`mahbot-inference/hand-run`,
 # see that recipe); every other gated set is `test-gpu`'s.

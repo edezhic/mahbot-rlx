@@ -59,13 +59,14 @@ bare `cargo build` on its root manifest compiles every backend — a silent,
 expensive regression in the routine loop rather than in the product.
 
 New upstream members are added to `members` (they are new directories and cannot
-conflict); `default-members` and `exclude` stay exactly as they are. The gates
-follow the same narrowing: `just build` / `just test` / `just lint` are bare, and
-`just build-workspace` / `just test-workspace` / `just lint-workspace` are their
-once-per-sync whole-set counterparts. The narrowing is about the members this
-fork does not build, not about the recipes: a gate over a crate that *is* in the
-contour (`check-corpus`, `test-third-order-cpu`, `check-rustdoc-contour`) belongs
-in the routine loop.
+conflict); `default-members` and `exclude` stay exactly as they are, apart from
+the binding block below. The gates follow the same narrowing: `just build` /
+`just test` / `just lint` are bare, and `just build-workspace` /
+`just test-workspace` / `just lint-workspace` are their once-per-sync whole-set
+counterparts. The narrowing is about the members this fork does not build, not
+about the recipes: a gate over a crate that *is* in the contour
+(`check-corpus`, `test-third-order-cpu`, `check-rustdoc-contour`) belongs in the
+routine loop.
 
 An excluded crate is out of the build, not out of the tree: nothing compiles it
 and no gate runs its tests, but files inside it are still read. `Cargo.toml`'s
@@ -102,9 +103,10 @@ recipes, so it cannot fall behind the routine gate the way a hand-kept parallel
 list does. It runs once, as a sync's own verification.
 
 Two things that whole-set run does not cover by itself. `test-workspace` is
-`cargo test --workspace`, which builds each member at its *default* features, so
-a target behind `required-features = "backend-tests"` is still skipped — the wgpu
-integration suite among them. `test-gpu` is what builds those, which is why
+`cargo test --workspace` with the `--exclude`s its recipe names, which builds
+each member at its *default* features, so a target behind
+`required-features = "backend-tests"` is still skipped — the wgpu integration
+suite among them. `test-gpu` is what builds those, which is why
 `ci-workspace` names it. `test-workspace` names one feature itself —
 `--features mahbot-inference/hand-run` — because that crate's fifteen hand-run
 targets were part of the whole-set run before they were gated (its manifest says
@@ -122,9 +124,9 @@ registered ICD), `test-rocm` (HIP), `leak-check` (`leaks`),
 comparison workspace depends on the real `libm`, which the root
 `[patch.crates-io]` shadows inside the workspace itself). Everything
 `ci-workspace` does name keeps `RLX_REQUIRE_DEVICE=1`: a backend that skips for
-want of a device must not report `ok`. Six of upstream's own tests likewise want a
-dataset or a toolchain a developer machine does not have, so `test-workspace` skips
-them by name; the recipe names each and what it needs.
+want of a device must not report `ok`. Three of upstream's own tests likewise want
+MNIST IDX files at `RLX_MNIST_DIR`, so `test-workspace` skips them by name; the
+recipe names each and what it needs.
 
 `rlx-mlx-sys` / `rlx-mlx` stay members, but the fork does not ship the MLX
 backend — a permanent decision, not a reading of the checkout, and a vendored
@@ -132,10 +134,27 @@ submodule happening to be present does not change it. So: the routine loop skips
 them (`default-members`), `test-workspace` runs neither, and the Apple rows of
 the GPU recipes name `metal` / `coreml` / `gpu` individually rather than `apple`,
 which implies `mlx`. The whole-set *build*, *lint* and *doc* recipes still cover
-them, because a member nothing ever compiles rots — and these had: the merge took
-upstream's `rlx_mlx_shim.cpp`, which passes a `window_size` argument that a newer
-MLX takes, over the vendored MLX v0.32.4 the crate pins, and nothing compiled it
-until `ci-workspace` did. The shim now matches the vendored signature.
+them — the rule is that a member nothing ever compiles rots — and these had: the
+merge took upstream's `rlx_mlx_shim.cpp`, which passes a `window_size` argument
+that a newer MLX takes, over the vendored MLX v0.32.4 the crate pins, and nothing
+compiled it until `ci-workspace` did. The shim now matches the vendored signature.
+
+The binding block is the one exception to that rule. `rlx-bind`, `rlx-bindgen`,
+`rlx-capi`, `rlx-ffi`, `rlx-js`, `rlx-micro` and `rlx-model-plugin` stay members
+and stay addressable by name — `cargo build -p rlx-capi` resolves — but no
+routine or whole-set build, test or lint recipe selects them, and nothing under
+`crates/bindings/` is deleted or edited. The fork's product is a Rust library and
+its measurement binaries; nothing in either reaches a binding, and compiling the
+block was weight on every sync. The coverage this gives up is deliberate and was
+green, not a repair: the C ABI's FFI and Swift targets and the `rlx-js` /
+`rlx-bind` tests now run in no gate. The routine loop loses the two it had
+(`rlx-js`, `rlx-ffi`) through `default-members`; `bindings_excl` in the `Justfile`
+is what keeps the block out of the whole-set recipes. That is `--exclude` and
+never a pruned `members`: pruning would stop `cargo build -p rlx-capi` resolving.
+Two checks still read the block: `check-bindings` builds `rlx-bindgen` (and so
+`rlx-bind`) to render the derived files and diff them against the checked-in
+ones — the drift guard on generated files, once per sync — and
+`check-binding-versions` reads the manifests' version stamps.
 
 ## 4. One implementation per job
 

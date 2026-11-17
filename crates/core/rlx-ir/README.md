@@ -117,7 +117,6 @@ let module = g.module();
 cargo build -p rlx-ir
 cargo test  -p rlx-ir       # lib unit tests
 cargo test  -p rlx-ir --features backend-tests   # arity + lowp + kernel-schedule suites
-just check-no-std           # no_std build for thumbv7em + host tests without std
 ```
 
 ## Status

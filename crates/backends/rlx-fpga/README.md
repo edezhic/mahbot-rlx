@@ -83,7 +83,6 @@ disk, and the sequential target. With `--no-default-features` the crate is
 `no_std` + `alloc`: `Model` → `optimize` (still verified through rlx-ir's
 `no_std` graph/verify core) → in-memory artifacts (`collect_artifacts`), plus
 the reference model and weight packing.
-`just check-no-std` builds it for `thumbv7em-none-eabihf`.
 
 ## License
 

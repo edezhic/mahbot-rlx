@@ -55,6 +55,7 @@ it, or wait out the 600 s idle timeout.
 ```sh
 just build          # build this fork's contour (bare `cargo build`; see Cargo.toml
                     # `default-members`) — `just build-workspace` is every member
+                    # but the binding crates
 just test           # cargo test, fast smoke gate: unit tests + pool-width checks
                     # integration targets: add `--features backend-tests`
                     # also the *selection*: a bare `cargo test` here means this
@@ -73,8 +74,7 @@ just fmt-check      # rustfmt --check
 just install-git-hooks  # pre-commit auto-fmt + clippy
 just ci             # the routine gate: contour build + tests + fmt-check + clippy
                     # + the fork-only gates
-just ci-workspace   # everything the fork's own toolchain can run, once per
-                    # upstream sync (depends on `ci`)
+just ci-workspace   # the whole-set gate, once per upstream sync (depends on `ci`)
 just ci-rig         # `ci-workspace` plus the rows that need a toolkit of their
                     # own: HIP, `leaks`, `xcrun metal`, musl, a Vulkan ICD
 just throttle       # thermal gate before benchmarks

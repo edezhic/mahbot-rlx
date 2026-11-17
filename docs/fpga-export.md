@@ -208,7 +208,7 @@ RTL on a target with no OS: `Model` (e.g. `tinyconv_mnist_from_cortexm`) →
 rlx-ir's `no_std` core) → `collect_artifacts_opt`, which returns the files in
 memory. Graph import (`Model::from_graph`, `prepare_model`), `export_graph`,
 writing the tree to disk (`emit_*`), the sequential target and the CLI need the
-default `std` feature. `just check-no-std` builds it for `thumbv7em-none-eabihf`.
+default `std` feature.
 
 ## See also
 
