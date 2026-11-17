@@ -30,6 +30,7 @@ pub mod listen;
 pub mod loader;
 pub mod measurements;
 pub mod music;
+mod overlap;
 pub mod paths;
 pub mod readahead;
 pub mod reference;

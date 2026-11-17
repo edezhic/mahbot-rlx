@@ -364,7 +364,6 @@ impl Synthesis {
             );
         }
 
-        let encoder = Encoder::from_model(&pair.body)?;
         // A render's length is the text's, bounded by the talker's context: a file that
         // states none cannot say how long a render may run.
         let context = pair.body.context_length()?;
@@ -386,9 +385,18 @@ impl Synthesis {
             temperature,
             seed: 0,
         };
-        let frame = crate::report::compiled("tts-frame", || {
-            graphs::tts_code_predictor_frame(pair.sound.clone(), capacity_pred, sampler)
-        })?;
+        // The vocabulary is built from the pair's body and compiles nothing, so it hides
+        // under the frame's compile (`overlap::opens`); the compile itself stays whole on
+        // this thread.
+        let (encoder, frame) = crate::overlap::opens(
+            "vocabulary",
+            || Encoder::from_model(&pair.body),
+            || {
+                crate::report::compiled("tts-frame", || {
+                    graphs::tts_code_predictor_frame(pair.sound.clone(), capacity_pred, sampler)
+                })
+            },
+        )?;
 
         Ok(Self {
             pair,

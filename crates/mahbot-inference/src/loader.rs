@@ -37,9 +37,10 @@ pub fn models_dir() -> Result<PathBuf> {
 }
 
 thread_local! {
-    /// The model files opened on this thread since the last [`take_opened`]: a measurement
-    /// is checked against what a row actually read, not against the whole root. One entry
-    /// per file, so a host that never takes it holds five paths rather than one per open.
+    /// The model files opened on this thread since the last [`take_opened`] — plus the ones an
+    /// open on another thread read and its caller folded in ([`crate::overlap`]): a measurement
+    /// is checked against what a row actually read, not against the whole root. One entry per
+    /// file, so a host that never takes it holds five paths rather than one per open.
     static OPENED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -52,7 +53,7 @@ pub(crate) fn take_opened() -> Vec<PathBuf> {
 
 /// Record a model file this thread opened. A file opened twice is one entry: the record is
 /// what a page-cache reading is taken over, and one reading per file is all it can be.
-fn opened(path: &Path) {
+pub(crate) fn opened(path: &Path) {
     OPENED.with(|opened| {
         let mut opened = opened.borrow_mut();
         if !opened.iter().any(|known| known == path) {

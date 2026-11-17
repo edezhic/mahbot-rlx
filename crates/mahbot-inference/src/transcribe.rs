@@ -606,7 +606,23 @@ impl Transcriber {
     /// rungs are built at one arm and a mistyped `MAHBOT_TAIL_GROUP` stops it before any audio
     /// is read.
     pub fn open(pair: Arc<Pair>, tagger: Tagger, ceiling_mib: u64) -> Result<Self> {
-        let decoder = Decoder::from_model(&pair.body).context("the recognition decoder")?;
+        let decoder = Self::decoder(&pair)?;
+        Self::with_decoder(pair, decoder, tagger, ceiling_mib)
+    }
+
+    /// The vocabulary, with the one context string a failure to build it carries.
+    fn decoder(pair: &Pair) -> Result<Decoder> {
+        Decoder::from_model(&pair.body).context("the recognition decoder")
+    }
+
+    /// The constructor over a vocabulary already built — [`Self::open`]'s own body, so the
+    /// product's open can build the vocabulary beside the tagger's open rather than after it.
+    fn with_decoder(
+        pair: Arc<Pair>,
+        decoder: Decoder,
+        tagger: Tagger,
+        ceiling_mib: u64,
+    ) -> Result<Self> {
         Ok(Self {
             pair,
             decoder,
@@ -619,10 +635,22 @@ impl Transcriber {
     /// The product's recogniser, opened from the inputs a run resolves: the
     /// recognition pair and the audio tagger every recognition call depends on, and
     /// the resident-set bound the run itself enforces.
+    ///
+    /// The tagger compiles, so it opens whole on its own thread while this one opens the
+    /// pair and builds the vocabulary from it: `overlap::opens` carries the measurement and
+    /// the rule that keeps the overlap sound.
     pub fn open_product(ceiling_mib: u64) -> Result<Self> {
-        let pair = Arc::new(Pair::of_role(Role::Recognition)?);
-        let tagger = Tagger::open(&crate::loader::models_dir()?.join(crate::ced::CED_MODEL))?;
-        Self::open(pair, tagger, ceiling_mib)
+        let tagger_path = crate::loader::models_dir()?.join(crate::ced::CED_MODEL);
+        let (tagger, (pair, decoder)) = crate::overlap::opens(
+            "tagger-open",
+            || Tagger::open(&tagger_path),
+            || {
+                let pair = Arc::new(Pair::of_role(Role::Recognition)?);
+                let decoder = Self::decoder(&pair)?;
+                Ok((pair, decoder))
+            },
+        )?;
+        Self::with_decoder(pair, decoder, tagger, ceiling_mib)
     }
 
     /// Transcribe any length of `audio` at `sample_rate`. Whole input, every

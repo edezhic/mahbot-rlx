@@ -265,8 +265,10 @@ fn measure(row: &Row, bounds: Bounds) -> Result<Reading> {
 /// The warm arm's two premises: it faulted no page of the files the cold arm read in from
 /// disk, and it opened no model the cold arm did not — a file first opened inside the arm
 /// would be read cold with nothing watching it. The loader's record is per thread, which is
-/// the shape it needs for two concurrent builds; a row measures on one thread, so nothing it
-/// opens escapes the check.
+/// the shape it needs for two concurrent builds — but an open may run one side on a worker
+/// (`overlap::opens`: the tagger for a recognition row, the vocabulary for a synthesis one),
+/// and whatever a worker read is folded into this thread's record before the check. So the
+/// gate covers the files the row opened, not the files this thread opened.
 fn warm_checked(cache: &cold::Cache, held: &cold::Held) -> Result<()> {
     cache.assert_no_growth(held)?;
     match loader::take_opened().as_slice() {
