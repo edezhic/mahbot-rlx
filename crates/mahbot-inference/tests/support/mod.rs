@@ -194,7 +194,6 @@ pub fn implicit_route_is_live() -> bool {
 /// range, which is the graph a call builds for that group.
 pub fn codec_group(pair: &Arc<Pair>, frames: usize, group: usize) -> graphs::Compiled {
     graphs::sound_graph(
-        Device::Gpu,
         &pair.sound,
         frames,
         graphs::codec_groups()[group].clone(),

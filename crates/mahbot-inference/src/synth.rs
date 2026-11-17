@@ -836,7 +836,6 @@ impl Synthesis {
         let wave_hkv = wave_heads * wave_hd;
         let wave_k = sound.plan("a.gen.wav.pre_conv.weight")?.ggml_shape[0];
 
-        let device = rlx_runtime::Device::Gpu;
         let prefix = graphs::FRONT_CARRY;
 
         // The wave transformer carries a 72-frame window: 71 K/V frames per
@@ -850,7 +849,7 @@ impl Synthesis {
         // The front's graphs live only until this loop has run: dropped before the
         // first stage group is built, they cannot sit beside the decoder's arenas and
         // set the peak at their sum.
-        let mut front = graphs::FrontGraphs::build(device, &sound, frames, front_group.clone())?;
+        let mut front = graphs::FrontGraphs::build(&sound, frames, front_group.clone())?;
         for (a, b) in windows(frames, FRONT_WINDOW, 0)
             .into_iter()
             .map(|(_, _, a, b)| (a, b))
@@ -951,7 +950,7 @@ impl Synthesis {
             // length, and gone before the next length's is built.
             for &len in &lengths {
                 let t = Stopwatch::start();
-                let mut graph = graphs::sound_graph(device, &sound, len, group.clone(), 0)?;
+                let mut graph = graphs::sound_graph(&sound, len, group.clone(), 0)?;
                 self.build_ms += t.ms();
                 for &(p0, p1, a, b) in &parts {
                     if p1 - p0 != len {

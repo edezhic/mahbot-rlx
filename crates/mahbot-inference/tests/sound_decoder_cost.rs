@@ -42,7 +42,6 @@ use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::report;
 use mahbot_inference::synth::Synthesis;
 use rlx_ir::Tick;
-use rlx_runtime::Device;
 
 mod support;
 
@@ -135,7 +134,6 @@ fn assert_tail_is_not_a_chunk(tail_len: usize) {
 #[ignore = "measurement only: prints what one call pays to build the sound half's graphs"]
 fn the_sound_graphs_are_built_per_stage_group() {
     let Some(pair) = pair_or_skip() else { return };
-    let device = Device::Gpu;
     let groups = graphs::codec_groups();
     let parts = windows(CELL_FRAMES, DAC_WINDOW, DAC_MARGIN);
     let front_set = windows(CELL_FRAMES, FRONT_WINDOW, 0);
@@ -147,7 +145,7 @@ fn the_sound_graphs_are_built_per_stage_group() {
     // Per group, in the order the sound half builds them: the front's set — its first
     // window, then the carried chunk built once the first graph has gone — and then
     // each stage group's graph for every span the part runs.
-    let mut front = graphs::FrontGraphs::build(device, &pair.sound, CELL_FRAMES, groups[0].clone())
+    let mut front = graphs::FrontGraphs::build(&pair.sound, CELL_FRAMES, groups[0].clone())
         .expect("the front's graphs");
     let first_ms = front.built_ms();
     front.pick(FRONT_WINDOW).expect("the carried chunk's graph");
@@ -162,8 +160,8 @@ fn the_sound_graphs_are_built_per_stage_group() {
     for group in &groups[1..] {
         for &len in &spans {
             let t = Tick::now();
-            let graph = graphs::sound_graph(device, &pair.sound, len, group.clone(), 0)
-                .expect("a decoder graph");
+            let graph =
+                graphs::sound_graph(&pair.sound, len, group.clone(), 0).expect("a decoder graph");
             let build_ms = Tick::now().elapsed_ns(t) as f64 / 1e6;
             total_ms += build_ms;
             let arena = rlx_wgpu::buffer::plan_f32_uniform(&graph.runner.graph, 16).arena_size;
@@ -182,7 +180,7 @@ fn the_sound_graphs_are_built_per_stage_group() {
     // its later windows run, never a graph those windows cannot dispatch.
     let carry = graphs::FRONT_CARRY;
     for frames in [FRONT_WINDOW, 100, 2 * FRONT_WINDOW, CELL_FRAMES] {
-        let mut front = graphs::FrontGraphs::build(device, &pair.sound, frames, groups[0].clone())
+        let mut front = graphs::FrontGraphs::build(&pair.sound, frames, groups[0].clone())
             .expect("a front graph");
         let (first, len) = front.pick(0).expect("the first window's graph");
         let arena = rlx_wgpu::buffer::plan_f32_uniform(&first.runner.graph, 16).arena_size;
@@ -215,7 +213,7 @@ fn the_sound_graphs_are_built_per_stage_group() {
         };
         for len in order {
             let t = Tick::now();
-            let g = graphs::sound_graph(device, &pair.sound, len, groups[0].clone(), carry)
+            let g = graphs::sound_graph(&pair.sound, len, groups[0].clone(), carry)
                 .expect("a front graph");
             let ms = Tick::now().elapsed_ns(t) as f64 / 1e6;
             drop(g);
@@ -244,7 +242,6 @@ fn the_sound_graphs_are_built_per_stage_group() {
 #[ignore = "measurement only: prints the padded tail window against a graph of its own length"]
 fn the_fronts_last_window_runs_padded() {
     let Some(pair) = pair_or_skip() else { return };
-    let device = Device::Gpu;
     let front = graphs::codec_groups()[0].clone();
     let part = windows(CELL_FRAMES, FRONT_WINDOW, 0);
     let &(_, _, tail_at, tail_end) = part.last().expect("a part has a window");
@@ -254,10 +251,10 @@ fn the_fronts_last_window_runs_padded() {
     // what the shipped arrangement runs (the padded chunk, the front's carried
     // window) and the graph of the tail's own length it does not build.
     let carry = graphs::FRONT_CARRY;
-    let mut padded = graphs::sound_graph(device, &pair.sound, FRONT_WINDOW, front.clone(), carry)
+    let mut padded = graphs::sound_graph(&pair.sound, FRONT_WINDOW, front.clone(), carry)
         .expect("the padded chunk's graph");
-    let mut tail = graphs::sound_graph(device, &pair.sound, tail_len, front, carry)
-        .expect("the tail's own graph");
+    let mut tail =
+        graphs::sound_graph(&pair.sound, tail_len, front, carry).expect("the tail's own graph");
     println!(
         "census front_tail tail_len={tail_len} chunk={FRONT_WINDOW} carry={carry} \
          rounds={ROUNDS} windows={}",
@@ -307,7 +304,6 @@ fn the_fronts_last_window_runs_padded() {
 #[ignore = "measurement only: prints the decoder's windows with and without their right margin"]
 fn the_decoders_windows_carry_no_right_margin() {
     let Some(pair) = pair_or_skip() else { return };
-    let device = Device::Gpu;
     let groups = graphs::codec_groups();
     // The spans the run makes, and the spans the same windows carried while the
     // right margin was on — four frames more on every window but the part's own
@@ -337,9 +333,9 @@ fn the_decoders_windows_carry_no_right_margin() {
             // One pair's graphs at a time: the probe pairs two windows, so it holds
             // two graphs, and the build that a call's release would answer for is
             // not this arm's subject.
-            let mut a = graphs::sound_graph(device, &pair.sound, *with, group.clone(), 0)
+            let mut a = graphs::sound_graph(&pair.sound, *with, group.clone(), 0)
                 .expect("a padded decoder window");
-            let mut b = graphs::sound_graph(device, &pair.sound, *without, group.clone(), 0)
+            let mut b = graphs::sound_graph(&pair.sound, *without, group.clone(), 0)
                 .expect("a decoder window");
             let (a_in, b_in) = (
                 support::filled_inputs(&a.runner.graph, 0.1),

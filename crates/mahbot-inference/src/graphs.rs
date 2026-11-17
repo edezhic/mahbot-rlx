@@ -3462,6 +3462,16 @@ pub fn samples_per_frame() -> usize {
     dac_stage_io(DAC_STAGES, 1).1
 }
 
+/// The name one sound graph carries: its stage group, its frame count and the K/V prefix
+/// it runs at. The flow's name and the compile report's `kind` are this one string, so a
+/// line names the graph it timed — a second spelling would split one identity in two.
+fn sound_graph_name(stages: &std::ops::Range<usize>, frames: usize, prefix: usize) -> String {
+    format!(
+        "tts_sound_{}_{}_{frames}_p{prefix}",
+        stages.start, stages.end
+    )
+}
+
 /// One graph of the sound half: the front (codes → the RVQ codebook decode → the
 /// wave transformer → the codec's `[1, C, 1, frames]` input) when the group starts
 /// at the codec's input, then the group's own stages.
@@ -3481,11 +3491,7 @@ pub fn synthesis_sound_group(
     let d_out = model.plan("a.gen.wav.tfm.in_proj.weight")?.in_out().0;
     let (ch, l) = dac_stage_io(stages.start, frames);
     let mut weights = LoaderWeights::new(model.clone());
-    let name = format!(
-        "tts_sound_{}_{}_{frames}_p{prefix}",
-        stages.start, stages.end
-    );
-    let flow = ModelFlow::new(name).with_profile(profile());
+    let flow = ModelFlow::new(sound_graph_name(&stages, frames, prefix)).with_profile(profile());
     let flow = if stages.start == 0 {
         flow.input("codes", Shape::new(&[(levels + 1) * frames], DType::F32))
             .layer_stage(QuantDecodeStage {
@@ -3519,17 +3525,42 @@ pub fn synthesis_sound_group(
 /// the front carries. The caller owns it, so it is given back as soon as the windows
 /// that run it are done: one length's before the next length's is built, and a
 /// group's before the next group is.
+///
+/// The sound half's only compile entry point, and it reports (`crate::report::compiled`)
+/// under the flow's own name (`sound_graph_name`): `build=` and `compile=` are printed
+/// apart because only their sum reconciles with the per-call build figure
+/// [`crate::synth::Synthesis`] already exposes, and `build=` alone would read as a much
+/// smaller number than the call paid. The report sits in the build rather than at either
+/// caller: a stage group's graph is built inside the group × the part's window lengths and
+/// the front's carried chunk is picked per window, so a line printed by a caller would be
+/// a line per window instead of one per build — and a second call at the same length, which
+/// rebuilds every one of these graphs, has to print again rather than go quiet.
+///
+/// `upload=` is not the bytes the file declares for the tensors bound here: F16 is widened to
+/// f32 on the host and the codec's non-rank-2 quantised weights are dequantised there, so a
+/// line reads more than its tensors occupy in the file — the front group's ~247 MiB against
+/// 196, the middle group's ~30 against 22, the tail's ~1.3 against 0.9 — before the skip below
+/// takes the front's packed rank-2 tensors back out of it.
+///
+/// `skipped=` is the reading this line exists to make visible, and it says the sound half
+/// skips almost nothing. A sound graph does declare a weight-sharing scope — every parameter
+/// it binds is served from the sound file — so the front group's packed rank-2 tensors are
+/// parked in the shared weight pool and skipped on a rebuild (~56.6 MiB of its ~247). Nothing
+/// else can: the two codec stage groups carry no packed rank-2 tensor at all — their weights
+/// are the codec's convolutions, quantised in the file and dequantised to f32 on the host, and
+/// those f32 parameters are placed in each build's own freshly zeroed arena rather than in the
+/// shared pool. The f32 parameter path never consults residency and is never counted as
+/// skipped, so `skipped=` reads zero for both stage groups on every call, and only the front
+/// group's figure can move.
 pub fn sound_graph(
-    device: rlx_runtime::Device,
     model: &Arc<Model>,
     frames: usize,
     stages: std::ops::Range<usize>,
     prefix: usize,
 ) -> Result<Compiled> {
-    Compiled::new(
-        device,
-        synthesis_sound_group(model.clone(), frames, stages, prefix)?,
-    )
+    crate::report::compiled(&sound_graph_name(&stages, frames, prefix), || {
+        synthesis_sound_group(model.clone(), frames, stages.clone(), prefix)
+    })
 }
 
 /// A part's wave-transformer graphs: the first window at the part's own length and
@@ -3537,7 +3568,6 @@ pub fn sound_graph(
 /// The front's loop owns them, so the first window's graph is gone before the
 /// carried chunk's is built and the front never holds two arenas.
 pub struct FrontGraphs {
-    device: rlx_runtime::Device,
     model: Arc<Model>,
     stages: std::ops::Range<usize>,
     /// The part's first window, at its own length; dropped once the carried chunk
@@ -3569,16 +3599,14 @@ impl FrontGraphs {
     /// Build the first window's graph. The carried chunk's graph is built by the
     /// first window past the first, once the first window's graph has gone.
     pub fn build(
-        device: rlx_runtime::Device,
         model: &Arc<Model>,
         frames: usize,
         stages: std::ops::Range<usize>,
     ) -> Result<Self> {
         let (first_len, next_len) = front_lengths(frames);
         let t = Stopwatch::start();
-        let first = sound_graph(device, model, first_len, stages.clone(), 0)?;
+        let first = sound_graph(model, first_len, stages.clone(), 0)?;
         Ok(Self {
-            device,
             model: Arc::clone(model),
             first: Some(first),
             first_len,
@@ -3610,7 +3638,6 @@ impl FrontGraphs {
                 self.first = None;
                 let t = Stopwatch::start();
                 self.carried = Some(sound_graph(
-                    self.device,
                     &self.model,
                     len,
                     self.stages.clone(),
@@ -4008,7 +4035,22 @@ pub fn stream_bytes(graph: &rlx_ir::Graph) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{FRONT_WINDOW, front_lengths, windows};
+    use super::{DAC_WINDOW, FRONT_CARRY, FRONT_WINDOW, front_lengths, sound_graph_name, windows};
+
+    /// A sound graph's identity is its stage group, its frame count and its K/V prefix —
+    /// the flow's name and the compile report's `kind`, one string for one graph. Each part
+    /// moves the name, so a line cannot be read back to the wrong build.
+    #[test]
+    fn a_sound_graph_is_named_by_its_group_and_geometry() {
+        assert_eq!(
+            sound_graph_name(&(4..6), DAC_WINDOW, 0),
+            "tts_sound_4_6_144_p0"
+        );
+        let front = sound_graph_name(&(0..4), FRONT_WINDOW, 0);
+        assert_ne!(front, sound_graph_name(&(4..6), FRONT_WINDOW, 0));
+        assert_ne!(front, sound_graph_name(&(0..4), 23, 0));
+        assert_ne!(front, sound_graph_name(&(0..4), FRONT_WINDOW, FRONT_CARRY));
+    }
 
     /// The three sound tables the graphs read by row are declared by
     /// `emit::row_table`, never as an f32 image — the revert a plain run can see,

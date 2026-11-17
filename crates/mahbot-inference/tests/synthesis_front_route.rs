@@ -277,7 +277,7 @@ fn what_the_lower_floor_admits_outside_the_front() {
                         group.start, group.end
                     ),
                     || {
-                        graphs::sound_graph(Device::Gpu, &pair.sound, len, group.clone(), 0)
+                        graphs::sound_graph(&pair.sound, len, group.clone(), 0)
                             .expect("a decoder graph")
                     },
                 );
@@ -290,8 +290,7 @@ fn what_the_lower_floor_admits_outside_the_front() {
     // at 480, so they clear either floor and only the census is read here.
     for frames in [3usize, 4] {
         census_only(&format!("stage_group 4..6 frames={frames}"), || {
-            graphs::sound_graph(Device::Gpu, &pair.sound, frames, groups[1].clone(), 0)
-                .expect("a decoder graph")
+            graphs::sound_graph(&pair.sound, frames, groups[1].clone(), 0).expect("a decoder graph")
         });
     }
     // The speaker encoder, whose first convolution is a unit-height lift at the
