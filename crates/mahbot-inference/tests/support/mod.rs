@@ -10,12 +10,64 @@
 
 use std::sync::Arc;
 
+use mahbot_inference::emit::LoaderWeights;
 use mahbot_inference::graphs;
 use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::tokenizer::Decoder;
+use rlx_flow::{BuiltModel, ModelFlow};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape, Tick};
 use rlx_runtime::{Device, Session};
+
+/// The body's first `layers` blocks, built the way the product builds it, with the attention
+/// form given. The helper sets the stage fields `graphs::body_new_rows_head_chain` sets, so a
+/// test can pin an arm the installed file does not take, and plans the joins through
+/// `graphs::fuse_projection` and `graphs::fuse_gate_up` — the product's own naming.
+///
+/// The feed-forward's join is planned and reported, so the stage fuses gate+up exactly when the
+/// file admits it. `None` when the file's schemes cannot join the attention form asked for — the
+/// caller decides whether that is a skip or a failure, since the form is the caller's choice and
+/// the file's to admit. It panics on a name the file does not carry: absence of a model is a
+/// skip, a model that is present but wrong is a failure.
+pub fn body_graph(
+    pair: &Arc<Pair>,
+    fuse: graphs::AttentionFuse,
+    layers: usize,
+    rows: usize,
+    head: bool,
+) -> Option<BuiltModel> {
+    let mut weights = LoaderWeights::new(pair.body.clone());
+    let fused_gate_up =
+        graphs::fuse_gate_up(&mut weights, layers, "").expect("plan the feed-forward join");
+    if let Some((parts, joined)) = fuse.plan() {
+        let planned = graphs::fuse_projection(&mut weights, layers, "", parts, joined)
+            .expect("plan the attention join");
+        if !planned {
+            return None;
+        }
+    }
+    Some(
+        ModelFlow::new(format!("body_{fuse:?}_r{rows}"))
+            .with_profile(graphs::profile())
+            .input("x", Shape::new(&[rows, pair.body.config().d], DType::F32))
+            .layer_stage(graphs::BodyStateStage {
+                model: pair.body.clone(),
+                m: rows,
+                prefix: 0,
+                layers: 0..layers,
+                masked: false,
+                row_first: false,
+                head,
+                plane_cache: false,
+                packed_feed: false,
+                fuse,
+                fused_gate_up,
+            })
+            .output("hidden")
+            .build(&mut weights)
+            .expect("build the body"),
+    )
+}
 
 /// The least of `samples`: the quietest round of one call.
 pub fn least(samples: &[f64]) -> f64 {

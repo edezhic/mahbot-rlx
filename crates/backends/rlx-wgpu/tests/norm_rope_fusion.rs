@@ -10,9 +10,9 @@
 //! folded step reads the norm's operand and writes the rope's slot, so this
 //! asserts both halves:
 //!
-//! * the fold fires — one `norm_rope` step for a two-part (q, k) chain, and none
-//!   where the norm's output has a second reader, which is the admission rule —
-//!   and
+//! * the fold fires — one `norm_rope` step for a two-part (q, k) chain, none where
+//!   the norm's output has a second reader, which is the admission rule, and two
+//!   where one dispatch cannot own the pair and each member folds on its own — and
 //! * wgpu still matches the CPU reference elementwise, at one position and at
 //!   several, so the head-row decode (`pos = row / heads`) and both parts of a
 //!   merged dispatch are exercised.
@@ -295,6 +295,57 @@ fn a_chain_of_views_still_folds() {
         .zip(&want[0])
         .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
     assert!(worst < 1e-5, "the two-view chain drifts by {worst:e}");
+}
+
+/// A pair one dispatch cannot own folds each member on its own. The second member's
+/// operand is the first member's rotation, so one dispatch over both would write the bytes
+/// its neighbour reads: the pair is refused and the two members fold one at a time, where
+/// refusing both would leave two norms and two rotations as four dispatches.
+#[test]
+fn a_pair_one_dispatch_cannot_own_folds_each_member() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        eprintln!("no wgpu adapter — skipping");
+        return;
+    }
+    let rows = 2;
+    let mut g = Graph::new("norm_rope_unsound_pair");
+    let x = g.input("x", Shape::new(&[1, rows, Q_HEADS * HD], F));
+    let gamma_q = g.param("gamma_q", Shape::new(&[HD], F));
+    let gamma_k = g.param("gamma_k", Shape::new(&[HD], F));
+    let beta = g.param("beta", Shape::new(&[HD], F));
+    let cos = g.param("cos", Shape::new(&[rows, HD / 2], F));
+    let sin = g.param("sin", Shape::new(&[rows, HD / 2], F));
+    let q = group(&mut g, x, rows, Q_HEADS, gamma_q, beta, cos, sin);
+    let k = group(&mut g, q, rows, Q_HEADS, gamma_k, beta, cos, sin);
+    g.set_outputs(vec![k]);
+    let data = fill(rows * Q_HEADS * HD, 9);
+    let want = compile(Device::Cpu, g.clone(), rows).run(&[("x", &data)]);
+    let mut gpu = compile(Device::Gpu, g, rows);
+    let names = steps(&gpu);
+    let got = gpu.run(&[("x", &data)]);
+    assert_eq!(
+        names.iter().filter(|n| **n == "norm_rope").count(),
+        2,
+        "each member of a pair one dispatch cannot own folds on its own ({names:?})"
+    );
+    assert_eq!(
+        names.iter().filter(|n| **n == "rope").count(),
+        0,
+        "neither rotation is left standalone ({names:?})"
+    );
+    assert_eq!(
+        names.iter().filter(|n| **n == "layer_norm").count(),
+        0,
+        "neither norm is left standalone ({names:?})"
+    );
+    let worst = got[0]
+        .iter()
+        .zip(&want[0])
+        .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        worst < 1e-5,
+        "the two folds drift from the CPU by {worst:e}"
+    );
 }
 
 /// A view of the norm's output that is also a graph output reads the slot the fold

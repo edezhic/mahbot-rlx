@@ -158,6 +158,20 @@ pub fn is_placeholder(key: &str) -> bool {
     })
 }
 
+/// The names the build being made handed over as placeholders, sorted: what a compile resolves
+/// and what a failed compile clears. `tests/transcribe_build.rs` reads it: its refusal witness
+/// needs the name the refusal should carry without parsing the message.
+pub fn placeholders() -> Vec<String> {
+    let mut names: Vec<String> = PLACEHOLDERS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|names| names.iter().cloned().collect())
+            .unwrap_or_default()
+    });
+    names.sort();
+    names
+}
+
 /// The scope label a model's weights are shared under: its own file path.
 fn origin_label(model: &Model) -> Arc<str> {
     Arc::from(model.path.display().to_string())
@@ -899,36 +913,36 @@ pub fn linear_encoder(
     Ok(ctx.matmul(x, &rlx_flow::FlowValue::new(w, shape)))
 }
 
-/// One fused multiply, split along its output rows into `dims` — q/k/v or
-/// gate/up. The split is a `narrow` per part; the weight pass is one node.
-pub fn linear_fused(
+/// One fused multiply, split along its output rows into `dims` — q/k/v, q/k or gate/up.
+/// The split is a `narrow` per part; the weight pass is one node.
+pub fn linear_fused<const N: usize>(
     ctx: &mut FlowCtx<'_>,
     x: &rlx_flow::FlowValue,
     key: &str,
-    dims: &[usize],
-) -> Result<Vec<HirNodeId>> {
+    dims: [usize; N],
+) -> Result<[HirNodeId; N]> {
     let fused = linear(ctx, x, key)?;
     let axis = ctx.node_shape(fused.hir_id())?.rank() - 1;
-    let mut out = Vec::with_capacity(dims.len());
+    let mut parts = [fused.hir_id(); N];
     let mut start = 0;
-    for &len in dims {
-        out.push(narrow(ctx, fused.hir_id(), axis, start, len));
+    for (part, len) in parts.iter_mut().zip(dims) {
+        *part = narrow(ctx, fused.hir_id(), axis, start, len);
         start += len;
     }
-    Ok(out)
+    Ok(parts)
 }
 
 /// A block's q/k/v out of the one wide parameter a file's fuse joins at
 /// `{p}.qkv.fused`: one packed multiply over the three widths, split back into q, k and v.
-/// A caller whose file cannot fuse takes [`qkv`] instead.
+/// A caller whose file fuses only q and k takes [`linear_fused`] over `{p}.qk.fused` with
+/// `v` on its own, and one whose file fuses neither emits the three [`linear`] calls.
 pub fn qkv_fused(
     ctx: &mut FlowCtx<'_>,
     x: &rlx_flow::FlowValue,
     p: &str,
     widths: [usize; 3],
 ) -> Result<[HirNodeId; 3]> {
-    let parts = linear_fused(ctx, x, &format!("{p}.qkv.fused"), &widths)?;
-    Ok([parts[0], parts[1], parts[2]])
+    linear_fused(ctx, x, &format!("{p}.qkv.fused"), widths)
 }
 
 /// One block's three attention projections as three multiplies, each key through

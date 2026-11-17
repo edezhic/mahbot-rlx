@@ -66,9 +66,9 @@
 //! two rows the decomposed attention and the grouped multiply — and it is four
 //! orders of magnitude below the effect a visible future candidate has. And the pass
 //! has one form per row count on this adapter: the packed multiply takes the
-//! row-grouped f32 GEMM at every multi-row count this file runs (`grouped:169` at
+//! row-grouped f32 GEMM at every multi-row count this file runs (`grouped:141` at
 //! 2..9 rows — the cooperative-matrix tile it also has needs 22 rows or more) and
-//! the per-row kernel at one (`per_row:169`), and the tree's only cooperative
+//! the per-row kernel at one (`per_row:141`), and the tree's only cooperative
 //! attention arrangement starts at 2 048 query rows, so this shape has no
 //! capability-gated second number. Bytes per accepted token is computed from the
 //! reads its rounds take — one a pass, two for a round past eight rows — and the
@@ -1038,10 +1038,9 @@ fn cost_vocab(pair: &Pair) -> usize {
 
 /// The weight stream on its own, cache out of the picture: the prompt graph at
 /// `rows` query rows (`prefix = 0`, the body's own head), warm median. It reads
-/// every base tensor once — gate and up as two multiplies where the plane arm
-/// fuses them (197 ops against that arm's 169, on the same bytes) — so its ratio is
-/// the weight stream's own, measured on the decode's tensors rather than assumed
-/// from one wide multiply.
+/// every base tensor once — the same 141 packed multiplies the decode walks, since
+/// the prompt fuses the same pairs — so its ratio is the weight stream's own,
+/// measured on the decode's tensors rather than assumed from one wide multiply.
 fn weights_cost(pair: &Pair, rows: usize) -> Result<f64, String> {
     let built = graphs::body_new_rows_head_chain(pair.body.clone(), rows, 0, true)
         .map_err(|e| format!("build: {e:#}"))?;

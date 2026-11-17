@@ -20,7 +20,7 @@
 //!
 //! The stand (the `mahbot-inference` binary) measures product calls off the model
 //! files. This harness needs none of them: what it builds is the **shape** of one
-//! decode step — the same 28 layers, the same 169 packed multiplies at the same
+//! decode step — the same 28 layers, the same 141 packed multiplies at the same
 //! `(k, n, scheme)` triples, the same 28 attention calls over
 //! `[1, 363, 8, 128]` key/value planes, and the same logits readback a product
 //! decode step performs. The weights are a deterministic byte ramp
@@ -40,8 +40,7 @@
 //!
 //! | tensor | k | n | scheme | bytes |
 //! | --- | --- | --- | --- | --- |
-//! | `attn_q` | 2048 | 2048 | Q4_K | 2,359,296 |
-//! | `attn_k` | 2048 | 1024 | Q4_K | 1,179,648 |
+//! | `attn_q+k` (fused) | 2048 | 3072 | Q4_K | 3,538,944 |
 //! | `attn_v` | 2048 | 1024 | Q6_K even / Q4_K odd | 1,720,320 / 1,179,648 |
 //! | `attn_output` | 2048 | 2048 | Q4_K | 2,359,296 |
 //! | `gate+up` (fused) | 2048 | 12288 | Q4_K | 14,155,776 |
@@ -92,32 +91,30 @@
 //! becomes. Every value is paired per round against the shipped one, so the pair
 //! prices the per-submission term directly.
 //!
-//! **B — the per-shape arms.** Seven graphs, one per distinct `(k, n, scheme)`
+//! **B — the per-shape arms.** Eight graphs, one per distinct `(k, n, scheme)`
 //! triple the layer walks, each `N` independent copies of one multiply over one
 //! shared input row, `N` set so the call streams at least
 //! [`support::TARGET_BYTES`] — the tree's own convention, so every arm sees one
-//! load. Each arm also carries how many times a token walks that shape: 56 for
-//! `q_or_o` (the query and the output projection are the same triple), 42 for
-//! `k_or_v_q4k` (28 keys plus the 14 layers whose `v` is 4-bit), 28 for
-//! `gate_up`, 14 for each of `v_q6k`, `down_q4k` and `down_q6k`, and 1 for the
-//! head. A compile-time pin holds those copies to the token's 169 packed
-//! multiplies, and the additive
+//! load. Each arm also carries how many times a token walks that shape: 28 each
+//! for `qk_fused` (the joined query and key rows, one multiply) and `o`, 14 each
+//! for `v_q4k` (the layers whose `v` is 4-bit), `v_q6k`, `down_q4k` and
+//! `down_q6k`, 28 for `gate_up`, and 1 for the head. A compile-time pin holds
+//! those copies to the token's 141 packed multiplies, and the additive
 //! floor is the copies times the arm's own per-step time. That floor is
 //! **everything back to back with no dependence and no per-dispatch sharing** —
 //! it is a lower bound on a fantasy machine that has this backend's per-step cost
 //! and none of the frame's structure, not a target.
 //!
-//! Three further calls probe what fusing query and key into one multiply of
-//! their summed width would buy, each streaming the same bytes per copy: the two
-//! separate projections as shipped, the fused multiply alone, and the fused
-//! multiply with the narrow split its emit leaves behind (both pieces are graph
-//! outputs there, so the split's own dispatch is the only thing the last form
-//! adds). Each prints its schedule census, so the dispatch count it costs is
-//! printed beside the time it takes.
+//! Three further calls price the query+key multiply the body ships, each streaming
+//! the same bytes per copy: the two separate projections, the fused multiply alone,
+//! and the fused multiply with the split its emit leaves behind — a cost arm, whose
+//! pieces are graph outputs here and so pay a dispatch the shipped body's do not
+//! (they fold into the `norm_rope`; see `FRAME_STEPS`). Each prints its schedule
+//! census, so the dispatch count it costs is printed beside the time it takes.
 //!
-//! **C — the dependency arm.** The same 28 layers and the same 169 packed
-//! multiplies with the multiply-to-multiply edges cut: `o`, `gate+up` and
-//! `q/k/v` all read the layer's own normed row, so only
+//! **C — the dependency arm.** The same 28 layers and the same 141 packed
+//! multiplies with the multiply-to-multiply edges cut: `o`, `gate+up`, the fused
+//! `q+k` and `v` all read the layer's own normed row, so only
 //! `gate+up → swiglu → down` keeps an edge (it cannot go without dead-coding
 //! the swiglu). Its attention output is added into the running residual so the
 //! 28 attention calls stay in the graph, which is the one node this arm has and
@@ -149,11 +146,11 @@
 //! anything. B prices one shape in isolation, so its rate is the ceiling a
 //! shape's own bytes could reach if the frame gave it the machine alone; the
 //! difference `A − B` is not a per-dispatch cost, because a frame's steps share
-//! passes the shape arm's copies do not. The additive floor sums **seven**
+//! passes the shape arm's copies do not. The additive floor sums **eight**
 //! medians, each weighted by the copies a token walks, and inherits their
 //! spreads, so it prints the envelope of those spreads beside its point value: a
 //! window whose arms were quiet gives a tighter floor than one whose arms were
-//! not, and `A − floor` moves with it. C keeps the frame's bytes and its 169
+//! not, and `A − floor` moves with it. C keeps the frame's bytes and its 141
 //! multiplies and moves only the edges; its unfused norms cost the extra
 //! elementwise steps its own census prints, so read the pair against those. D is
 //! attention in isolation: its planes are never appended to, and the row the
@@ -216,8 +213,14 @@ const TOTAL_PACKED_BYTES: u64 = 1_100_961_792;
 /// The steps the shipped body's decode step compiles to on this backend. Its
 /// equality to the product's step count cannot be re-derived model-free: the
 /// assertion catches a schedule drift inside the frame this file builds, not a
-/// drift between that frame and the shipped body.
-const FRAME_STEPS: usize = 310;
+/// drift between that frame and the shipped body. It moved 310 → 282 when the
+/// body's q and k became one fused multiply: one `dequant_matmul_gguf` per layer
+/// left the schedule, and the two narrows the split leaves fold into the
+/// `norm_rope` that consumes them rather than costing a step of their own. That
+/// fold is what the body's back-to-back norm+rope emission buys — emitting both
+/// qk-norms before both rotations refuses it, which costs 56 steps instead of
+/// saving 28.
+const FRAME_STEPS: usize = 282;
 
 /// Timed rounds; odd, so [`median`] is the middle sample.
 const ROUNDS: usize = 7;
@@ -275,21 +278,20 @@ struct Packed {
     geo: Geo,
 }
 
-/// The six packed weights of one layer, in graph order: q, k, v, o, the fused
-/// gate+up, down.
+/// The five packed weights of one layer, in graph order: the fused q+k, v, o, the
+/// fused gate+up, down.
 ///
 /// `v` is Q6_K on even layers and `down` is Q6_K on odd ones — the Q4_K_M
 /// mixture, which is why q/k/v cannot be one fused multiply: they do not share
 /// a scheme, and the load-time fusion is refused graph-wide rather than per
-/// layer (`emit::fuse_packed`). gate+up does share one, and is emitted as one
-/// multiply narrowed back into two halves.
-fn layer_weights(layer: usize) -> [(&'static str, Geo); 6] {
+/// layer (`emit::fuse_packed`). q+k does share one, and so does gate+up; both are
+/// emitted as one multiply narrowed back into their halves.
+fn layer_weights(layer: usize) -> [(&'static str, Geo); 5] {
     let q4 = |k: usize, n: usize| Geo { k, n, scheme: Q4 };
     let v = if layer.is_multiple_of(2) { Q6 } else { Q4 };
     let down = if layer.is_multiple_of(2) { Q4 } else { Q6 };
     [
-        ("attn_q.weight", q4(D, D)),
-        ("attn_k.weight", q4(D, NKV * HD)),
+        ("qk.fused", q4(D, D + NKV * HD)),
         (
             "attn_v.weight",
             Geo {
@@ -314,7 +316,7 @@ fn layer_weights(layer: usize) -> [(&'static str, Geo); 6] {
 /// Every packed weight of the frame, in graph order — the one list the graph
 /// builder and the upload both walk, so a name cannot drift from its bytes.
 fn plan() -> Vec<Packed> {
-    let mut out = Vec::with_capacity(6 * LAYERS + 1);
+    let mut out = Vec::with_capacity(5 * LAYERS + 1);
     for layer in 0..LAYERS {
         for (suffix, geo) in layer_weights(layer) {
             out.push(Packed {
@@ -458,7 +460,7 @@ fn frame_graph(topo: Topology, plan: &[Packed]) -> (Graph, Vec<F32Param>) {
     let mut state = x;
     for layer in 0..LAYERS {
         let p = format!("blk.{layer}");
-        let w = &plan[6 * layer..6 * layer + 6];
+        let w = &plan[5 * layer..5 * layer + 5];
         let layer_input = match topo {
             Topology::Frame => state,
             Topology::Dependency => x,
@@ -472,9 +474,12 @@ fn frame_graph(topo: Topology, plan: &[Packed]) -> (Graph, Vec<F32Param>) {
             Fill::Ones,
         );
         let h = g.rms_norm(layer_input, gamma, zeros_d, EPS);
-        let q = dequant(&mut g, h, &w[0]);
-        let k = dequant(&mut g, h, &w[1]);
-        let v = dequant(&mut g, h, &w[2]);
+        // The fused q+k, split back into the two projections it joins: the shipped
+        // body's one wide multiply over the joined rows, at the width its file fuses.
+        let qk = dequant(&mut g, h, &w[0]);
+        let q = g.narrow_(qk, 1, 0, D);
+        let k = g.narrow_(qk, 1, D, NKV * HD);
+        let v = dequant(&mut g, h, &w[1]);
 
         let gq = f32_param(
             &mut g,
@@ -517,8 +522,8 @@ fn frame_graph(topo: Topology, plan: &[Packed]) -> (Graph, Vec<F32Param>) {
         let a = g.reshape_(a, vec![1, (NH * HD) as i64]);
 
         let o = match topo {
-            Topology::Frame => dequant(&mut g, a, &w[3]),
-            Topology::Dependency => dequant(&mut g, h, &w[3]),
+            Topology::Frame => dequant(&mut g, a, &w[2]),
+            Topology::Dependency => dequant(&mut g, h, &w[2]),
         };
         state = g.add(state, o);
         if topo == Topology::Dependency {
@@ -545,12 +550,12 @@ fn frame_graph(topo: Topology, plan: &[Packed]) -> (Graph, Vec<F32Param>) {
             zeros_d,
             EPS,
         );
-        let gu = dequant(&mut g, h2, &w[4]);
+        let gu = dequant(&mut g, h2, &w[3]);
         let gate = g.narrow_(gu, 1, 0, FFN);
         let up = g.narrow_(gu, 1, FFN, FFN);
         let act = g.silu(gate);
         let act = g.mul(act, up);
-        let down = dequant(&mut g, act, &w[5]);
+        let down = dequant(&mut g, act, &w[4]);
         state = g.add(state, down);
     }
 
@@ -562,7 +567,7 @@ fn frame_graph(topo: Topology, plan: &[Packed]) -> (Graph, Vec<F32Param>) {
         Fill::Ones,
     );
     let normed = g.rms_norm(state, gamma, zeros_d, EPS);
-    let logits = dequant(&mut g, normed, &plan[6 * LAYERS]);
+    let logits = dequant(&mut g, normed, &plan[5 * LAYERS]);
     g.set_outputs(vec![logits]);
     (g, f32s)
 }
@@ -669,11 +674,18 @@ impl Frame {
     }
 }
 
-/// A frame's schedule census and step total. The 169 packed multiplies and the
-/// 28 attention steps are asserted for both topologies, and the frame's 310-step
+/// A frame's schedule census and step total. The 141 packed multiplies and the
+/// 28 attention steps are asserted for both topologies, and the frame's 282-step
 /// total against the shipped body's own — so a schedule that drifted prints a
 /// failure rather than a plausible new number. A backend that exposes no
 /// schedule prints that and reports zero.
+///
+/// 141 is five per layer plus the head: the fused q+k, `v`, `o`, the fused
+/// gate+up and `down`. Asserted rather than bounded, so a drift in this file's
+/// own frame — a step that left its route, an arm that lost a copy — prints a
+/// failure rather than a plausible new number. What this frame cannot see is the
+/// product's own emission: it is built from `layer_weights`, so a product-side
+/// fallback to three separate projections never reaches it (see `FRAME_STEPS`).
 fn census(frame: &Frame) -> usize {
     let Some(names) = frame.compiled.schedule_step_names() else {
         eprintln!(
@@ -691,8 +703,8 @@ fn census(frame: &Frame) -> usize {
     );
     assert_eq!(
         count("dequant_matmul_gguf"),
-        6 * LAYERS + 1,
-        "the frame's 169 packed multiplies must each be one gguf step — a step \
+        5 * LAYERS + 1,
+        "the frame's 141 packed multiplies must each be one gguf step — a step \
          that left the route would change every byte figure this harness prints"
     );
     assert_eq!(
@@ -737,32 +749,41 @@ fn check_logits(frame: &mut Frame) {
 // ── B: the per-shape arms ──
 
 /// One of the distinct shapes a layer walks, with the label it is reported under
-/// and how many times one token walks it (`q` and `o`, and `k` and the Q4_K `v`,
-/// are the same triple).
+/// and how many times one token walks it (the joined `q+k` is one triple and `o`
+/// another; `v`'s two schemes are two arms).
 struct ShapeArm {
     label: &'static str,
     geo: Geo,
     copies: usize,
 }
 
-const SHAPE_ARMS: [ShapeArm; 7] = [
+const SHAPE_ARMS: [ShapeArm; 8] = [
     ShapeArm {
-        label: "q_or_o",
+        label: "qk_fused",
+        geo: Geo {
+            k: D,
+            n: D + NKV * HD,
+            scheme: Q4,
+        },
+        copies: LAYERS,
+    },
+    ShapeArm {
+        label: "o",
         geo: Geo {
             k: D,
             n: D,
             scheme: Q4,
         },
-        copies: 2 * LAYERS,
+        copies: LAYERS,
     },
     ShapeArm {
-        label: "k_or_v_q4k",
+        label: "v_q4k",
         geo: Geo {
             k: D,
             n: NKV * HD,
             scheme: Q4,
         },
-        copies: LAYERS + LAYERS / 2,
+        copies: LAYERS / 2,
     },
     ShapeArm {
         label: "v_q6k",
@@ -811,7 +832,7 @@ const SHAPE_ARMS: [ShapeArm; 7] = [
     },
 ];
 
-// The arms' weights must cover the token's packed multiplies (`6 × 28 + 1`), so a
+// The arms' weights must cover the token's packed multiplies (`5 × 28 + 1`), so a
 // shape that gains or loses a walk fails here rather than in the floor's number.
 const _: () = assert!({
     let mut copies = 0;
@@ -820,7 +841,7 @@ const _: () = assert!({
         copies += SHAPE_ARMS[i].copies;
         i += 1;
     }
-    copies == 6 * LAYERS + 1
+    copies == 5 * LAYERS + 1
 });
 
 /// Bytes one call streams over milliseconds, in GB/s.
@@ -893,10 +914,10 @@ const QK_FUSED: Geo = Geo {
     scheme: Q4,
 };
 
-/// The three forms the two projections can be emitted in: the two separate
-/// multiplies the shipped graph-wide fusion decision leaves, the one multiply of
-/// their summed width a per-layer fusion would produce, and that multiply with
-/// the narrow split it leaves behind.
+/// The three forms the two projections can be emitted in: the two separate multiplies, the one
+/// multiply of their summed width the body ships, and that multiply with the narrow split its
+/// emit leaves behind — a cost arm, since the shipped body's pieces fold into the `norm_rope`
+/// and cost no step.
 #[derive(Clone, Copy)]
 enum QkForm {
     Split,
@@ -1369,7 +1390,7 @@ fn token_rate() {
     let shapes: Vec<Steps> = SHAPE_ARMS.iter().map(measure_shape).collect();
     // The additive floor: every multiply back to back at its own per-step time,
     // weighted by how often one token walks that shape (a pin taken at compile
-    // time beside the arms). Summing seven medians inherits all seven spreads, so
+    // time beside the arms). Summing eight medians inherits all eight spreads, so
     // the floor is reported three times: at every arm's median, and at every
     // arm's least and greatest.
     let floor = |of: fn(&Steps) -> f64| {
@@ -1395,9 +1416,9 @@ fn token_rate() {
 
     // ── The query and key projections, separate and fused ─────────
     // Three calls at the same bytes per copy: the two separate multiplies, the
-    // fused one, and the fused one with the narrow split it leaves behind. The
-    // last is what a per-layer fusion would actually emit, so the saving it
-    // reports is net of its own dispatch rather than a bound above one.
+    // fused one, and the fused one with the narrow split it leaves behind — a cost
+    // arm, since the shipped body's pieces fold into the `norm_rope`. The saving the
+    // last one reports is therefore net of that dispatch rather than a bound above it.
     let qk_steps = steps_for(QK_FUSED.bytes(), support::TARGET_BYTES);
     let forms = [QkForm::Split, QkForm::Fused, QkForm::FusedSplit];
     let mut probes: Vec<Probe> = forms.iter().map(|f| Probe::qk(*f, qk_steps)).collect();
@@ -1449,8 +1470,8 @@ fn token_rate() {
          fused_ms_per_token={fused_ms:.3} fused_and_split_ms_per_token={fused_split_ms:.3} \
          saving_before_split_ms_per_token={:+.3} \
          saving_net_of_split_ms_per_token={:+.3} narrow_split_cost_ms_per_token={:+.3} \
-         note=\"the two savings are split minus the form, so positive is what a \
-         per-layer q+k fusion would buy; the narrow-split figure is a cost, so \
+         note=\"the two savings are split minus the form, so positive is what the \
+         q+k join buys; the narrow-split figure is a cost, so \
          positive is what the split adds. Each is the median of the per-round paired \
          differences, at the bytes per copy the layer reads\"",
         paired_saving(&qk_samples[0], &qk_samples[1]),

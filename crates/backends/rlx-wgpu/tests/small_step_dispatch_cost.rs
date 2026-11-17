@@ -16,7 +16,7 @@
 //! The fork's decode graphs are chains of small steps: one code-predictor frame
 //! lowers to 878 steps of which only 348 are multiplies (the rest are
 //! `layer_norm`, `rope`, `fused_residual_ln_tee`, `buffer_copy`, `narrow`,
-//! `attention`, `fused_swiglu`), and one talker body frame to 450 with 169
+//! `attention`, `fused_swiglu`), and one talker body frame to 282 with 141
 //! multiplies. Their tensors are one row — 1 024 or 2 048 floats — so a step's
 //! own arithmetic is nothing next to what the device spends per dispatch. This
 //! cell measures that per-dispatch share directly instead of inferring it from a

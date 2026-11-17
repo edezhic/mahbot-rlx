@@ -5073,8 +5073,11 @@ fn all_static_dims(shape: &rlx_ir::Shape) -> Option<Vec<usize>> {
 ///   fold suppresses also a graph output, and
 /// * a cos/sin table one row per position, `head_dim / 2` wide.
 ///
-/// Two members group only when they are adjacent in node order up to pure views
-/// and share the position table.
+/// Two members group only when they are adjacent in node order up to pure views,
+/// share the position table, and one dispatch can own both members' spans. A pair
+/// the dispatch cannot own folds each member on its own rather than neither: the
+/// body's fused q+k prompt graph is such a pair, unsound together and sound member
+/// by member.
 ///
 /// The fold suppresses both the norm's and the rope's own steps, so it is taken
 /// only where they would have stayed on the device: `on_device` is the walk's own
@@ -5253,6 +5256,40 @@ pub(crate) fn detect_norm_rope_pattern(
     let disjoint_or_same =
         |a: Option<(u64, u64)>, b: Option<(u64, u64)>| a == b || spans_disjoint(a, b);
 
+    // One dispatch reads every operand while writing every rope's slot: each written
+    // span must be disjoint (or exactly aliased) with its own member's reads, strictly
+    // disjoint from every other member's, and strictly disjoint from the other written
+    // spans. `c` carries the position table the group shares.
+    let sound = |members: &[&NormRopeMember], c: &Candidate| -> bool {
+        let writes: Vec<_> = members
+            .iter()
+            .map(|m| arena.storage_span(graph, m.rope))
+            .collect();
+        let reads: Vec<Vec<_>> = members
+            .iter()
+            .map(|m| {
+                [m.input, m.gamma, m.beta]
+                    .into_iter()
+                    .chain([c.cos, c.sin])
+                    .map(|id| arena.storage_span(graph, id))
+                    .collect()
+            })
+            .collect();
+        writes.iter().enumerate().all(|(j, &w)| {
+            reads.iter().enumerate().all(|(k, rs)| {
+                rs.iter().all(|&r| {
+                    if k == j {
+                        disjoint_or_same(r, w)
+                    } else {
+                        spans_disjoint(r, w)
+                    }
+                })
+            }) && writes
+                .iter()
+                .enumerate()
+                .all(|(k, &o)| k == j || spans_disjoint(o, w))
+        })
+    };
     let mut groups: HashMap<NodeId, NormRopeGroup> = HashMap::new();
     let mut skip: HashSet<NodeId> = HashSet::new();
     let index = PieceIndex::of(splits);
@@ -5280,86 +5317,58 @@ pub(crate) fn detect_norm_rope_pattern(
                 && next.cos_row_stride == first.cos_row_stride
                 && next.eps_bits == first.eps_bits;
             let merged: HashSet<NodeId> = own.iter().copied().chain(owned(next)).collect();
-            if same && ctx.quiet(first.norm_pos.min(next.norm_pos), next.rope_pos, &merged) {
+            if same
+                && ctx.quiet(first.norm_pos.min(next.norm_pos), next.rope_pos, &merged)
+                && sound(&[&first.member, &next.member], first)
+            {
                 members.push(next.member.clone());
                 own = merged;
                 last = i + 1;
             }
         }
-        if last == i && !ctx.quiet(first.norm_pos, first.rope_pos, &own) {
+        // A merged pair has passed both tests at the merge above; a lone member has not.
+        if last == i
+            && (!ctx.quiet(first.norm_pos, first.rope_pos, &own) || !sound(&[&first.member], first))
+        {
             i += 1;
             continue;
         }
-        // One dispatch reads every operand while writing every rope's slot: each
-        // written span must be disjoint (or exactly aliased) with its own member's
-        // reads and strictly disjoint from every other member's, and strictly
-        // disjoint from the other written spans.
-        let writes: Vec<_> = members
-            .iter()
-            .map(|m| arena.storage_span(graph, m.rope))
-            .collect();
-        let reads: Vec<Vec<_>> = members
-            .iter()
-            .map(|m| {
-                [m.input, m.gamma, m.beta]
-                    .into_iter()
-                    .chain([first.cos, first.sin])
-                    .map(|id| arena.storage_span(graph, id))
-                    .collect()
-            })
-            .collect();
-        let sound = writes.iter().enumerate().all(|(j, &w)| {
-            reads.iter().enumerate().all(|(k, rs)| {
-                rs.iter().all(|&r| {
-                    if k == j {
-                        disjoint_or_same(r, w)
-                    } else {
-                        spans_disjoint(r, w)
-                    }
-                })
-            }) && writes
-                .iter()
-                .enumerate()
-                .all(|(k, &o)| k == j || spans_disjoint(o, w))
-        });
-        if sound {
-            // The split the pair's operands are pieces of, if one dispatch can own
-            // both: the members read the source row at their pieces' starts and
-            // the leftover piece is copied, so the split keeps no step.
-            let absorbed = match ctx.absorbed_split(&members, first.seq, first.inner, &index) {
-                Some((split, emitter)) => {
-                    // The group must still be there: an earlier pair may have
-                    // claimed it, and no step writes a claimed piece.
-                    let Some(gone) = splits.remove(&emitter) else {
-                        i = last + 1;
-                        continue;
-                    };
-                    split_skip.extend(gone.pieces.iter().copied());
-                    Some(split)
-                }
-                None => None,
-            };
-            let emitter = members.last().expect("a group has a member").rope;
-            for m in &members {
-                skip.insert(m.norm);
-                if m.rope != emitter {
-                    skip.insert(m.rope);
-                }
+        // The split the pair's operands are pieces of, if one dispatch can own
+        // both: the members read the source row at their pieces' starts and
+        // the leftover piece is copied, so the split keeps no step.
+        let absorbed = match ctx.absorbed_split(&members, first.seq, first.inner, &index) {
+            Some((split, emitter)) => {
+                // The group must still be there: an earlier pair may have
+                // claimed it, and no step writes a claimed piece.
+                let Some(gone) = splits.remove(&emitter) else {
+                    i = last + 1;
+                    continue;
+                };
+                split_skip.extend(gone.pieces.iter().copied());
+                Some(split)
             }
-            groups.insert(
-                emitter,
-                NormRopeGroup {
-                    members,
-                    seq: first.seq,
-                    inner: first.inner,
-                    cos: first.cos,
-                    sin: first.sin,
-                    cos_row_stride: first.cos_row_stride,
-                    eps_bits: first.eps_bits,
-                    split: absorbed,
-                },
-            );
+            None => None,
+        };
+        let emitter = members.last().expect("a group has a member").rope;
+        for m in &members {
+            skip.insert(m.norm);
+            if m.rope != emitter {
+                skip.insert(m.rope);
+            }
         }
+        groups.insert(
+            emitter,
+            NormRopeGroup {
+                members,
+                seq: first.seq,
+                inner: first.inner,
+                cos: first.cos,
+                sin: first.sin,
+                cos_row_stride: first.cos_row_stride,
+                eps_bits: first.eps_bits,
+                split: absorbed,
+            },
+        );
         i = last + 1;
     }
     (groups, skip)

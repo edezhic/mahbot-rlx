@@ -747,13 +747,47 @@ pub struct BodyStateStage {
     /// declared row is wider, so one `feed_kv_row` carries every row of a block
     /// instead of one submission per row.
     pub packed_feed: bool,
-    /// q/k/v share the one wide parameter `*.qkv.fused`; gate+up share
-    /// `*.gate_up.fused`. The two are separate flags because on Q4_K_M `v` is
-    /// Q6_K while `q`/`k` are Q4_K: q/k/v cannot share one packed scheme, while
-    /// gate+up can.
-    pub fused: bool,
-    /// gate+up share the one wide parameter `*.gate_up.fused`.
+    /// How the block's attention input is emitted; [`AttentionFuse`] says why one form serves
+    /// the whole graph and which one a file takes.
+    pub fuse: AttentionFuse,
+    /// gate+up share the one wide parameter `*.gate_up.fused`. Independent of
+    /// [`BodyStateStage::fuse`]: a file can share the feed-forward's pair and not the
+    /// attention's.
     pub fused_gate_up: bool,
+}
+
+/// How a block's three attention input projections are emitted. One form serves the whole
+/// graph, because a fuse is all-or-nothing over the layers ([`fuse_projection`]).
+///
+/// `Qk` is what both shipped bodies take. `Qkv` needs `attn_v` to share q and k's scheme on
+/// every layer, which the pinned files do not, and `Separate` fires only if q and k stop
+/// sharing theirs: neither is reachable for a shipped file, and both are kept for a file that
+/// makes them reachable. The `Separate` arm is built by `body_qk` and `loop_shape` — the
+/// emission, not the decision that picks it — and `Qkv` has no test at all, because building
+/// it needs a file that admits the three-way join.
+#[derive(Clone, Copy, Debug)]
+pub enum AttentionFuse {
+    /// Three multiplies, each on its own parameter: what a file whose projections share no
+    /// scheme takes.
+    Separate,
+    /// One multiply over `*.qk.fused` with `v` on its own — the pinned body, whose `v` is
+    /// Q6_K on half the layers while q and k are Q4_K on every one.
+    Qk,
+    /// One multiply over `*.qkv.fused`.
+    Qkv,
+}
+
+impl AttentionFuse {
+    /// The parts this form joins and the joined parameter's name, or `None` for the form that
+    /// joins nothing: the one home for the form-to-name mapping, which the product's planning
+    /// and the tests that build one arm by hand both read.
+    pub fn plan(self) -> Option<(&'static [&'static str], &'static str)> {
+        match self {
+            Self::Separate => None,
+            Self::Qk => Some((&QK_PARTS, "qk")),
+            Self::Qkv => Some((&QKV_PARTS, "qkv")),
+        }
+    }
 }
 
 impl LayerStage for BodyStateStage {
@@ -870,35 +904,50 @@ impl LayerStage for BodyStateStage {
             let gamma = emit::f32_param(ctx, model, &format!("{p}.attn_norm.weight"), &[d])?;
             let h = emit::rms_norm(ctx, x, gamma, eps, &[m, d]);
             let lc = |x: HirNodeId| FlowValue::new(x, Shape::new(&[m, d], DType::F32));
-            let (q, k, v) = if self.fused {
-                let [q, k, v] = emit::qkv_fused(ctx, &lc(h), &p, [nh * hd, hkv, hkv])?;
-                (
-                    FlowValue::new(q, Shape::new(&[m, nh * hd], DType::F32)),
-                    FlowValue::new(k, Shape::new(&[m, hkv], DType::F32)),
-                    FlowValue::new(v, Shape::new(&[m, hkv], DType::F32)),
-                )
-            } else {
-                (
+            let (q, k, v) = match self.fuse {
+                AttentionFuse::Qkv => {
+                    let [q, k, v] = emit::qkv_fused(ctx, &lc(h), &p, [nh * hd, hkv, hkv])?;
+                    (
+                        FlowValue::new(q, Shape::new(&[m, nh * hd], DType::F32)),
+                        FlowValue::new(k, Shape::new(&[m, hkv], DType::F32)),
+                        FlowValue::new(v, Shape::new(&[m, hkv], DType::F32)),
+                    )
+                }
+                AttentionFuse::Qk => {
+                    let [q, k] =
+                        emit::linear_fused(ctx, &lc(h), &format!("{p}.qk.fused"), [nh * hd, hkv])?;
+                    (
+                        FlowValue::new(q, Shape::new(&[m, nh * hd], DType::F32)),
+                        FlowValue::new(k, Shape::new(&[m, hkv], DType::F32)),
+                        emit::linear(ctx, &lc(h), &format!("{p}.attn_v.weight"))?,
+                    )
+                }
+                AttentionFuse::Separate => (
                     emit::linear(ctx, &lc(h), &format!("{p}.attn_q.weight"))?,
                     emit::linear(ctx, &lc(h), &format!("{p}.attn_k.weight"))?,
                     emit::linear(ctx, &lc(h), &format!("{p}.attn_v.weight"))?,
-                )
+                ),
             };
 
-            // Per-head qk-norm, then RoPE at the window's own positions.
+            // Per-head qk-norm, then RoPE at the window's own positions. Each
+            // projection's norm and rotation are emitted back to back, with nothing
+            // between them but the layout reshape: the backend folds the pair into one
+            // dispatch only when the window between them holds nothing else
+            // (`detect_norm_rope_pattern`), and emitting both norms before both
+            // rotations costs a dispatch per projection.
             let q3 = vec![1, m as i64, (nh * hd) as i64];
             let kv3 = vec![1, m as i64, hkv as i64];
             let r = emit::reshape(ctx, q.hir_id(), &[(m * nh) as i64, hd as i64]);
             let g = emit::f32_param(ctx, model, &format!("{p}.attn_q_norm.weight"), &[hd])?;
             let r = emit::rms_norm(ctx, r, g, eps, &[m * nh, hd]);
             let q = emit::reshape(ctx, r, &q3);
+            let q = emit::h(ctx).rope(q, cos, sin, hd);
             let r = emit::reshape(ctx, k.hir_id(), &[(m * nkv) as i64, hd as i64]);
             let g = emit::f32_param(ctx, model, &format!("{p}.attn_k_norm.weight"), &[hd])?;
             let r = emit::rms_norm(ctx, r, g, eps, &[m * nkv, hd]);
             let k = emit::reshape(ctx, r, &kv3);
-            let v = emit::reshape(ctx, v.hir_id(), &kv3);
-            let q = emit::h(ctx).rope(q, cos, sin, hd);
             let k = emit::h(ctx).rope(k, cos, sin, hd);
+            let v = emit::reshape(ctx, v.hir_id(), &kv3);
 
             let (q4, k4, v4) = if plane_in.is_some() {
                 // The attention reads `[1, rows, heads, dim]` and the cache is
@@ -995,15 +1044,15 @@ impl LayerStage for BodyStateStage {
             let gamma = emit::f32_param(ctx, model, &format!("{p}.ffn_norm.weight"), &[d])?;
             let h = emit::rms_norm(ctx, x, gamma, eps, &[m, d]);
             let (gate, up) = if self.fused_gate_up {
-                let parts = emit::linear_fused(
+                let [g, u] = emit::linear_fused(
                     ctx,
                     &lc(h),
                     &format!("{p}.gate_up.fused"),
-                    &[cfg.ffn, cfg.ffn],
+                    [cfg.ffn, cfg.ffn],
                 )?;
                 (
-                    FlowValue::new(parts[0], Shape::new(&[m, cfg.ffn], DType::F32)),
-                    FlowValue::new(parts[1], Shape::new(&[m, cfg.ffn], DType::F32)),
+                    FlowValue::new(g, Shape::new(&[m, cfg.ffn], DType::F32)),
+                    FlowValue::new(u, Shape::new(&[m, cfg.ffn], DType::F32)),
                 )
             } else {
                 (
@@ -1129,14 +1178,21 @@ impl LayerStage for BodyStateStage {
 /// The three attention input projections' names inside a block.
 const QKV_PARTS: [&str; 3] = ["attn_q", "attn_k", "attn_v"];
 
-/// Fuse one projection (q/k/v or gate/up) for the whole graph or not at all. A fuse is a
-/// plan recorded per layer, not bytes, so a refusal part-way leaves plans no graph asks for
-/// and nothing built — the caller then builds the separate projections.
+/// The query and key projections alone: the parts of [`AttentionFuse::Qk`]'s join.
+const QK_PARTS: [&str; 2] = ["attn_q", "attn_k"];
+
+/// The gated feed-forward's two projections, which share one scheme on every file.
+const GATE_UP_PARTS: [&str; 2] = ["ffn_gate", "ffn_up"];
+
+/// Fuse one projection (q/k/v, q/k or gate/up) for the whole graph or not at all. A fuse
+/// is a plan recorded per layer, not bytes, so a refusal part-way leaves plans no graph
+/// asks for and nothing built — the caller then builds the separate projections.
 ///
 /// `prefix` is the blocks' own name prefix (`""` for the body, `a.gen.code.` for the
 /// code predictor, `a.` for the audio encoder), so both layouts of one file ask the
-/// weight pool for the same joined parameter names.
-fn fuse_projection(
+/// weight pool for the same joined parameter names. `pub` for the tests that build one
+/// arm of the body by hand, so the naming lives here and nowhere else.
+pub fn fuse_projection(
     weights: &mut LoaderWeights,
     layers: usize,
     prefix: &str,
@@ -1156,20 +1212,51 @@ fn fuse_projection(
     Ok(true)
 }
 
-/// Fuse the body's two projections, each for the whole graph or not at all
-/// ([`fuse_projection`]). The two flags are **independent** — on the pinned Q4_K_M body
-/// `attn_v` is Q6_K, so q/k/v cannot share one parameter while gate+up can, and coupling
-/// them would put both spellings of every ffn on the device.
+/// Plan the gated feed-forward's pair for the whole graph ([`fuse_projection`]): whether the
+/// file admitted it. The pair's two names live here and nowhere else.
+pub fn fuse_gate_up(weights: &mut LoaderWeights, layers: usize, prefix: &str) -> Result<bool> {
+    fuse_projection(weights, layers, prefix, &GATE_UP_PARTS, "gate_up")
+}
+
+/// Fuse the body's projections ([`fuse_projection`]) and return the [`AttentionFuse`] form the
+/// attention input is emitted in, plus whether the feed-forward's gate+up pair joined.
+///
+/// q/k is tried only when q/k/v refused, so a layer's weights are never on the device under
+/// two spellings and both layouts of one body ask the weight pool for the same parameter
+/// names. On the pinned body the value weight does not share q and k's scheme
+/// ([`AttentionFuse::Qk`] has the scheme), so the three-way join refuses and the two-way one
+/// takes: the attention input is two packed multiplies per layer instead of three, in the
+/// prompt and the decode alike.
+///
+/// The long recognition row reads **−291 ms of 27.71 s** warm (−412 ms of 28.36 s cold): the
+/// median of seven alternating paired takes in one session at load average 3.9–5.1, the
+/// separate emission forced by a temporary switch, the per-take spread (−1611…+206 ms) wider
+/// than the median. What corroborates it reproducibly is `decode_token_rate`'s per-token probe
+/// (both forms in one round) and the schedule it buys, pinned there in `FRAME_STEPS`; the value
+/// comparison is `body_qk`'s.
+///
+/// It is not free in the prompt. The join trades 28 packed multiplies for 56 copies of its
+/// two pieces — views at one row, copies above it — and the norm+rope fold steps go 28 → 55:
+/// −28 + 56 + 27 = the 55 extra steps (757 → 812). Those steps' own state is the +819,200 B
+/// (0.045 %) the recognition rows read on the process's resting graphics ledger, where no
+/// arena, weight-pool byte or compute pipeline differs between the forms.
 fn fuse_layer_projections(
     weights: &mut LoaderWeights,
     layers: usize,
-    prefix: &str,
-) -> Result<(bool, bool)> {
-    const GATE_UP: [&str; 2] = ["ffn_gate", "ffn_up"];
-    Ok((
-        fuse_projection(weights, layers, prefix, &QKV_PARTS, "qkv")?,
-        fuse_projection(weights, layers, prefix, &GATE_UP, "gate_up")?,
-    ))
+) -> Result<(AttentionFuse, bool)> {
+    // Widest join first: a refused q/k/v leaves q/k to be tried, and a refused q/k leaves the
+    // three separate projections.
+    let mut fuse = AttentionFuse::Separate;
+    for form in [AttentionFuse::Qkv, AttentionFuse::Qk] {
+        if let Some((parts, joined)) = form.plan()
+            && fuse_projection(weights, layers, "", parts, joined)?
+        {
+            fuse = form;
+            break;
+        }
+    }
+    let gate_up = fuse_gate_up(weights, layers, "")?;
+    Ok((fuse, gate_up))
 }
 
 /// The body on a **growing** cache with the file's own head: `m` prompt rows,
@@ -1187,7 +1274,7 @@ pub fn body_new_rows_head_chain(
     // one body then ask the weight pool for the same parameters, so the device holds the
     // body once for a prefill and a decode of it
     // ([`rlx_wgpu::buffer::set_param_sharing_scope`]).
-    let (fused, fused_gate_up) = fuse_layer_projections(&mut weights, cfg.layers, "")?;
+    let (fuse, fused_gate_up) = fuse_layer_projections(&mut weights, cfg.layers)?;
     let flow = ModelFlow::new(format!("body_rows_{m}_p{prefix}_h{head}"))
         .with_profile(profile())
         .input("x", Shape::new(&[m, cfg.d], DType::F32))
@@ -1201,7 +1288,7 @@ pub fn body_new_rows_head_chain(
             head,
             plane_cache: false,
             packed_feed: false,
-            fused,
+            fuse,
             fused_gate_up,
         })
         .output("hidden");
@@ -1258,7 +1345,7 @@ pub fn body_capacity_chain_planes_rows(
 fn body_planes_graph(model: Arc<Model>, capacity: usize, rows: usize) -> Result<BuiltModel> {
     let cfg = model.config().clone();
     let mut weights = LoaderWeights::new(model.clone());
-    let (fused, fused_gate_up) = fuse_layer_projections(&mut weights, cfg.layers, "")?;
+    let (fuse, fused_gate_up) = fuse_layer_projections(&mut weights, cfg.layers)?;
     let flow = ModelFlow::new(format!("body_capacity_planes_{capacity}_{rows}"))
         .with_profile(profile())
         .input("x", Shape::new(&[rows, cfg.d], DType::F32))
@@ -1272,7 +1359,7 @@ fn body_planes_graph(model: Arc<Model>, capacity: usize, rows: usize) -> Result<
             head: true,
             plane_cache: true,
             packed_feed: false,
-            fused,
+            fuse,
             fused_gate_up,
         })
         .output("hidden");
@@ -2032,11 +2119,11 @@ fn emit_predictor_blocks(
         let gamma = emit::f32_param(ctx, model, &format!("{p}.ln2.weight"), &[d_pred])?;
         let h = emit::rms_norm(ctx, x, gamma, eps, &[m, d_pred]);
         let (gate, up) = if fused_gate_up {
-            let parts =
-                emit::linear_fused(ctx, &lc(h), &format!("{p}.gate_up.fused"), &[ffn, ffn])?;
+            let [g, u] =
+                emit::linear_fused(ctx, &lc(h), &format!("{p}.gate_up.fused"), [ffn, ffn])?;
             (
-                FlowValue::new(parts[0], Shape::new(&[m, ffn], DType::F32)),
-                FlowValue::new(parts[1], Shape::new(&[m, ffn], DType::F32)),
+                FlowValue::new(g, Shape::new(&[m, ffn], DType::F32)),
+                FlowValue::new(u, Shape::new(&[m, ffn], DType::F32)),
             )
         } else {
             (
@@ -2282,7 +2369,8 @@ pub fn tts_code_predictor_frame(
     );
     let mut weights = LoaderWeights::new(model.clone());
     let blocks = model.clip().gen_layers.unwrap_or(0);
-    let (fused, fused_gate_up) = fuse_layer_projections(&mut weights, blocks, "a.gen.code.")?;
+    let fused = fuse_projection(&mut weights, blocks, "a.gen.code.", &QKV_PARTS, "qkv")?;
+    let fused_gate_up = fuse_gate_up(&mut weights, blocks, "a.gen.code.")?;
     let flow = ModelFlow::new("tts_code_frame")
         .with_profile(profile())
         .input("hidden", Shape::new(&[d_talker], DType::F32))

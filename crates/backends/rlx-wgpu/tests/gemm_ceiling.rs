@@ -54,7 +54,7 @@
 //!
 //! `synthesis_ceiling` takes the same accounting to the synthesis loop, whose
 //! dominant work is the same `m = 1` packed multiply: 850 870 272 packed bytes a
-//! frame in the talker body (169 packed Q4_K/Q6_K multiplies) and 1 393 754 112 in
+//! frame in the talker body (141 packed Q4_K/Q6_K multiplies) and 1 393 754 112 in
 //! the code predictor (348 packed Q8_0 ones), over 330 frames of a 26.4 s speech.
 //! What the loop itself reads — its ms a frame, the sound half — belongs to the run
 //! that takes it; no record carries a per-form table. In one window it takes the stream probe's
@@ -100,7 +100,7 @@
 //! own session, so two runs can be read against each other.
 //!
 //! The denominators bound what these geometries cost as one contiguous run over
-//! one shared input row, and **not** what a frame costs — a frame's 169 or 348
+//! one shared input row, and **not** what a frame costs — a frame's 141 or 348
 //! multiplies are distinct calls with the frame's other work between them, none of
 //! which this test executes. So the gap between them and the test's own frames is a
 //! measurement of this harness, not an attribution of the frame's time.

@@ -15,6 +15,7 @@
 //! instead of skipping. The model-free guards live in this file and
 //! `packed_join_submission.rs`, so a gate run without models still executes them.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use mahbot_inference::graphs;
@@ -47,6 +48,24 @@ fn pair(role: Role) -> Option<Arc<Pair>> {
 fn graph_of(built: BuiltModel) -> rlx_ir::Graph {
     let hir = built.module.into_hir().expect("the flow built HIR");
     rlx_ir::hir_to_graph(hir).expect("HIR lowers to a graph")
+}
+
+/// One graph's packed parameter names and its packed-multiply count.
+fn packed(graph: &rlx_ir::Graph) -> (HashSet<&str>, usize) {
+    let params = graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match &node.op {
+            Op::Param { name } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let multiplies = graph
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.op, Op::DequantMatMul { .. }))
+        .count();
+    (params, multiplies)
 }
 
 fn census(graph: &rlx_ir::Graph) -> (usize, usize, usize) {
@@ -423,6 +442,193 @@ fn the_recognition_prompt_graph_contracts_all_its_rows_with_models() {
     assert!(
         over_prompt > 0,
         "the block multiplies contract all prompt rows, so the row-tile guard applies"
+    );
+}
+
+/// Whether a body graph asks for `name` as a packed parameter. The typed map's `\0q` tag is part
+/// of the key, so this is where that convention lives for the gates in this file.
+fn packed_param(params: &HashSet<&str>, name: &str) -> bool {
+    params.contains(format!("{name}\0q").as_str())
+}
+
+/// The feed-forward's multiplies, from the names: one when the file's gate and up joined, two
+/// when they did not. Block 0 speaks for the graph because the join is all-or-nothing over the
+/// layers, like the attention's.
+fn feed_forward_parts(params: &HashSet<&str>) -> usize {
+    if packed_param(params, "blk.0.gate_up.fused") {
+        1
+    } else {
+        2
+    }
+}
+
+/// The attention multiplies one block's parameter names imply: the three-way join is one, the
+/// two-way two, three separate ones three. Asserts the block spells **one** form — the joined
+/// parameter's parts are absent, `v` on its own unless the three-way join took, and q and k
+/// together or not at all — so the count it returns is a count of one spelling.
+fn attention_parts(params: &HashSet<&str>, i: usize) -> usize {
+    let has = |name: &str| packed_param(params, &format!("blk.{i}.{name}"));
+    let (qkv, qk) = (has("qkv.fused"), has("qk.fused"));
+    let (q, k, v) = (
+        has("attn_q.weight"),
+        has("attn_k.weight"),
+        has("attn_v.weight"),
+    );
+    match (qkv, qk) {
+        (true, _) => {
+            assert!(
+                !qk && !q && !k && !v,
+                "block {i}: the three-way join leaves no part or two-way join on its own"
+            );
+            1
+        }
+        (false, true) => {
+            assert!(
+                !q && !k && v,
+                "block {i}: the two-way join leaves `v` on its own and q, k joined"
+            );
+            2
+        }
+        (false, false) => {
+            assert!(
+                q && k && v,
+                "block {i}: with neither join the three projections are their own parameters"
+            );
+            3
+        }
+    }
+}
+
+/// The packed multiplies a body graph's names imply: `parts` for the attention input and
+/// `gate_up` for the feed-forward, plus `o` and `down`, per layer, and the head once.
+fn body_multiplies(parts: usize, gate_up: usize, layers: usize) -> usize {
+    (parts + gate_up + 2) * layers + 1
+}
+
+/// The attention input is emitted in **one** form for the whole graph and in the same form in
+/// both of the body's layouts — the prompt's growing cache and the decode's plane cache — so
+/// the weight pool is asked for one set of parameter names and the device holds the body once
+/// for a prompt and a decode of it.
+///
+/// Which form a file takes is the file's business, not this gate's: a body whose `attn_v`
+/// shares q and k's scheme takes the three-way join, and one whose q and k stop sharing
+/// theirs takes three separate projections. Both shipped bodies take the two-way join, whose
+/// names and count are pinned by building that arm
+/// (`the_body_reads_each_attention_form_under_its_own_names_with_models`);
+/// `graphs::AttentionFuse` records why the other two arms are unreachable for them.
+#[test]
+fn the_body_emits_one_attention_form_in_both_its_layouts_with_models() {
+    for (role, which) in [
+        (Role::Recognition, "recognition"),
+        (Role::Synthesis, "synthesis"),
+    ] {
+        let Some(pair) = pair(role) else {
+            continue;
+        };
+        let layers = pair.body.config().layers;
+        let prompt = graph_of(
+            graphs::body_new_rows_head_chain(pair.body.clone(), LISTEN_PIECE_PROMPT_ROWS, 0, true)
+                .expect("build a piece's prompt graph"),
+        );
+        let decode = graph_of(
+            graphs::body_capacity_chain_planes(pair.body.clone(), 370)
+                .expect("build the plane-cache decode body"),
+        );
+        let mut shipped = None;
+        for (label, graph) in [("prompt", &prompt), ("decode", &decode)] {
+            let (params, multiplies) = packed(graph);
+            let parts = attention_parts(&params, 0);
+            assert!(
+                (1..layers).all(|i| attention_parts(&params, i) == parts),
+                "{which} {label}: one attention form for the whole graph, block by block"
+            );
+            assert_eq!(
+                multiplies,
+                body_multiplies(parts, feed_forward_parts(&params), layers),
+                "{which} {label}: the packed multiplies are the ones the names imply"
+            );
+            assert_eq!(
+                *shipped.get_or_insert(parts),
+                parts,
+                "{which}: the prompt and the decode ask the weight pool for the same attention \
+                 parameters"
+            );
+        }
+    }
+}
+
+/// The two attention forms a shipped body does not take, built directly so this pins the code
+/// and not the installed file's scheme layout, at one row — the names and the count are the
+/// same at any row count, and one row is the cheapest body to build. Each arm's names are read
+/// by `attention_parts`, which is where the spelling of a form is asserted; this only pins that
+/// the form a built stage emits is the one it was built with, and that the count follows it.
+///
+/// Which form a shipped file takes, and why the other two are unreachable for it, is
+/// `graphs::AttentionFuse`'s; the shipped bodies' own form is
+/// `the_body_emits_one_attention_form_in_both_its_layouts_with_models`'s.
+#[test]
+fn the_body_reads_each_attention_form_under_its_own_names_with_models() {
+    let Some(pair) = pair(Role::Recognition) else {
+        return;
+    };
+    let layers = pair.body.config().layers;
+    for (fuse, parts) in [
+        (graphs::AttentionFuse::Qk, 2),
+        (graphs::AttentionFuse::Separate, 3),
+    ] {
+        let Some(graph) = support::body_graph(&pair, fuse, layers, 1, true) else {
+            eprintln!("skip: the recognition file cannot emit the {fuse:?} attention form");
+            continue;
+        };
+        let graph = graph_of(graph);
+        let (params, multiplies) = packed(&graph);
+        assert_eq!(
+            multiplies,
+            body_multiplies(parts, feed_forward_parts(&params), layers),
+            "{fuse:?}: the packed multiplies are the ones the names imply"
+        );
+        for i in 0..layers {
+            assert_eq!(
+                attention_parts(&params, i),
+                parts,
+                "{fuse:?}: block {i} spells the form this arm was built with"
+            );
+        }
+    }
+}
+
+/// The prompt's schedule folds every projection's norm and its rotation into one step: the body
+/// emits the two back to back, so the backend's `norm_rope` admission sees nothing between them.
+/// The reorder this pins against — both norms, then both rotations — costs a dispatch per
+/// projection and a standalone `rope` step of its own. The schedule's total is deliberately not
+/// pinned here: it moves with any backend scheduling change, so the figure lives in
+/// `graphs::fuse_layer_projections`' account of the emission's cost. The decode layout's pin is
+/// `the_synthesis_body_schedule_has_no_row_copy_with_models`'s.
+#[test]
+fn the_prompt_schedule_folds_every_norm_into_its_rope_with_models() {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return;
+    }
+    let Some(pair) = pair(Role::Recognition) else {
+        return;
+    };
+    let layers = pair.body.config().layers;
+    let built =
+        graphs::body_new_rows_head_chain(pair.body.clone(), LISTEN_PIECE_PROMPT_ROWS, 0, true)
+            .expect("build a piece's prompt graph");
+    let compiled =
+        graphs::Compiled::new(rlx_runtime::Device::Gpu, built).expect("compile the prompt body");
+    let names = compiled
+        .schedule_step_names()
+        .expect("the wgpu backend reports its schedule");
+    assert_eq!(
+        names.iter().filter(|n| **n == "rope").count(),
+        0,
+        "no rotation keeps a dispatch of its own: each one is inside its projection's fold"
+    );
+    assert!(
+        names.iter().filter(|n| **n == "norm_rope").count() >= layers,
+        "at least one norm+rope fold per layer: {names:?}"
     );
 }
 

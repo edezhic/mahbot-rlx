@@ -52,6 +52,14 @@ fn an_unresolvable_weight_fails_and_a_failed_build_leaves_nothing_behind() {
     // f32 this process kept. Released between the build and its compile, exactly as a caller
     // that dropped the model would leave them.
     emit::clear_weight_caches();
+    // The build's own placeholder record, read before the compile clears it: which parameters
+    // the refusal must name is the file's answer (the joined q+k on the pinned files, another
+    // join or projection on a file whose scheme layout differs), not a spelling here.
+    let placeholders = emit::placeholders();
+    assert!(
+        !placeholders.is_empty(),
+        "the body's packed weights are placeholders the compile has to resolve"
+    );
     let error = match graphs::Compiled::new(rlx_runtime::Device::Gpu, built) {
         Ok(_) => panic!("a graph whose weights are gone compiled anyway"),
         Err(error) => format!("{error:#}"),
@@ -61,22 +69,26 @@ fn an_unresolvable_weight_fails_and_a_failed_build_leaves_nothing_behind() {
         "the refusal says the bytes were a placeholder: {error}"
     );
     assert!(
-        error.contains("weight `") && error.contains(".weight"),
-        "the refusal names the operand, not just the graph: {error}"
+        placeholders
+            .iter()
+            .any(|name| name.starts_with("blk.0.") && error.contains(name)),
+        "the refusal names the body's first parameter, not just the graph: {error}"
     );
     // The failed compile left nothing behind: a name still marked a placeholder would refuse a
     // later build that carries its own bytes.
-    assert!(
-        !emit::is_placeholder("blk.0.attn_q.weight"),
-        "a failed compile left the build's placeholder record behind"
-    );
+    for name in &placeholders {
+        assert!(
+            !emit::is_placeholder(name),
+            "a failed compile left `{name}` in the build's placeholder record"
+        );
+    }
     // Nothing of the failed build survives it: the same graph, built again, compiles.
     let again = graphs::body_new_rows_head_chain(pair.body.clone(), 8, 0, false)
         .expect("the body builds again");
     let compiled = graphs::Compiled::new(rlx_runtime::Device::Gpu, again)
         .expect("a build after a failed build compiles");
     assert!(
-        emit::scope_of(std::iter::once("blk.0.attn_q.weight")).is_none(),
+        emit::scope_of(placeholders.iter().map(String::as_str)).is_none(),
         "a successful compile left the build's origin record behind"
     );
     drop(compiled);
