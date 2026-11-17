@@ -70,15 +70,20 @@ pub const HANGOVER_HOPS: usize = 25;
 /// piece a cut can leave — [`CUT_SECONDS`] plus the window a cut may search back over —
 /// so no piece is ever truncated to fit.
 pub const FRAME_RUNGS: [usize; 6] = [128, 256, 384, 512, 640, 768];
-/// The length every cut aims at, in seconds: above it this recogniser spends its context
-/// on preamble rather than on the words, and a longer piece costs a quadratic prompt
-/// prefill. A piece is at most this plus [`CUT_EARLY_HOPS`].
+/// The length every cut aims at, in seconds: the longest whole second the ladder's top
+/// rung admits. A piece is at most this plus [`CUT_EARLY_HOPS`] — 7.512 s — under the
+/// rung's 7.68 s, which the check below enforces. Eight seconds is 800 frames, past the
+/// rung before the allowance is even added: the ladder, not a cost reading, is what sets
+/// the value, and it was eight until the ladder arrived.
 ///
-/// Seven is where the two bars meet, measured both ways on the pinned corpus: a chunk
-/// costs about 0.7 s of wall time whatever its length — the prompt's own prefill and a
-/// decode apiece — so a shorter aim multiplies that cost while the recogniser gains only
-/// the hard spans it could not read (five-second pieces read four of them and cost
-/// 125.9 ms per audio second against 98.9 here). The trade is recorded, not tuned away.
+/// Below that ceiling a longer piece is the cheaper one: a five- to seven-second piece costs
+/// 0.4–0.6 s of wall time on the pinned recording, so a shorter aim multiplies that cost
+/// while the recogniser gains only the hard spans it could not read. Nor is prefill the cost
+/// of a longer piece: it grows with a prompt's rows, not with their square, and its total
+/// falls as pieces lengthen because there are fewer of them. What lengthening costs is
+/// words: 690 → 666 → 619 → 599 on the 318 s row as pieces go from 5 s to 12 s. The
+/// stand's recognition witnesses pin the tiling this value leaves, and the trade is
+/// recorded, not tuned away.
 pub const CUT_SECONDS: usize = 7;
 /// How far before its aim a cut may search for a quiet hop (0.5 s). A cut never moves
 /// later than its aim, so the piece count is the span's length alone.
