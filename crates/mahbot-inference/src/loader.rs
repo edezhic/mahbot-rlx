@@ -1364,6 +1364,13 @@ fn merge_ced(file: &GgufFile, arch: &str) -> Result<CedConfig> {
             config.a2db_ref
         );
     }
+    if config.a2db_top_db <= 0.0 {
+        bail!(
+            "metadata key `{arch}.a2db_top_db` is {}: the clamp is `max - top_db`, which only \
+             lowers the floor when it is positive",
+            config.a2db_top_db
+        );
+    }
     if config.pooling != "mean" {
         bail!(
             "metadata key `{arch}.pooling` is `{}`: this graph pools its tokens by mean",

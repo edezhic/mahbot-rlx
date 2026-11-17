@@ -5,7 +5,7 @@
 //! Fusion diagnostics — what fused, what missed, and why.
 
 use rlx_ir::op::{Activation, BinaryOp, RegionPrologue};
-use rlx_ir::{Graph, NodeId, Op, node_label};
+use rlx_ir::{DType, Graph, NodeId, Op, node_label};
 use std::fmt;
 
 /// Why a recognizable fusion pattern was not collapsed.
@@ -13,7 +13,8 @@ use std::fmt;
 pub enum MissReason {
     MultiConsumer,
     NonAddBiasConsumer,
-    BiasRankTooHigh { rank: usize },
+    UnsupportedWeightDtype(DType),
+    BiasRankNotOne { rank: usize },
     UnsupportedEpilogueActivation(Activation),
     SharedMatmulCount { count: usize },
     SwigluGateBeforeUp,
@@ -251,7 +252,11 @@ fn fusion_hint(reason: &MissReason) -> String {
             "single-consumer chain required — clone input or use HirOp::LinearFused".into()
         }
         MissReason::NonAddBiasConsumer => "use linear+bias or HirModule::linear_fused".into(),
-        MissReason::BiasRankTooHigh { .. } => "bias must be rank-1".into(),
+        MissReason::UnsupportedWeightDtype(dtype) => format!(
+            "weight is {dtype:?}; the gate is the pass's, not the graph's — \
+             emit HirOp::Linear with the bias"
+        ),
+        MissReason::BiasRankNotOne { .. } => "bias must be rank-1".into(),
         MissReason::UnsupportedEpilogueActivation(_) => {
             "FuseMatMulBiasAct supports Gelu/Silu only".into()
         }
@@ -319,18 +324,30 @@ fn scan_missed_matmul_bias_act(graph: &Graph) -> Vec<MissedFusion> {
             ));
             continue;
         };
+        // A bias add this pass declines on the weight's dtype, before it looks at
+        // the bias: its epilogue reads the weight as f32.
+        let weight_dtype = graph.shape(node.inputs[1]).dtype();
+        if weight_dtype != DType::F32 {
+            out.push(missed_entry(
+                graph,
+                "matmul_bias_act",
+                mm_id,
+                MissReason::UnsupportedWeightDtype(weight_dtype),
+            ));
+            continue;
+        }
         let bias_id = if add_node.inputs[0] == mm_id {
             add_node.inputs[1]
         } else {
             add_node.inputs[0]
         };
         let bias_rank = graph.shape(bias_id).rank();
-        if bias_rank > 1 {
+        if bias_rank != 1 {
             out.push(missed_entry(
                 graph,
                 "matmul_bias_act",
                 mm_id,
-                MissReason::BiasRankTooHigh { rank: bias_rank },
+                MissReason::BiasRankNotOne { rank: bias_rank },
             ));
             continue;
         }
@@ -477,6 +494,15 @@ mod tests {
         Shape::new(dims, DType::F32)
     }
 
+    /// The reasons a scan names, in report order.
+    fn named(graph: &Graph) -> Vec<MissReason> {
+        FusionReport::scan(graph)
+            .missed
+            .into_iter()
+            .map(|m| m.reason)
+            .collect()
+    }
+
     #[test]
     fn report_counts_fused_ops() {
         use crate::fusion::{FuseSharedInputMatMul, FuseSwiGLU};
@@ -497,6 +523,73 @@ mod tests {
         let report = FusionReport::analyze(&before, &g);
         assert_eq!(report.fused_swiglu, 1);
         assert!(report.nodes_after < report.nodes_before);
+    }
+
+    /// The report names the gate the pass applies. The pass refuses a half-width
+    /// weight before it looks at the bias, so a report that named only the bias sent
+    /// a reader to fix a rank the dtype gate still declines.
+    #[test]
+    fn report_names_the_weight_dtype_before_the_bias_rank() {
+        let mut g = Graph::new("half_weight");
+        let x = g.input("x", f32_shape(&[4, 8]));
+        let w = g.param("w", Shape::new(&[8, 16], DType::F16));
+        // Rank-2: both gates decline this one, and the dtype gate is the first.
+        let b = g.param("b", f32_shape(&[1, 16]));
+        let mm = g.mm(x, w);
+        let out = g.add(mm, b);
+        g.set_outputs(vec![out]);
+        let reasons = named(&g);
+        assert!(
+            reasons.contains(&MissReason::UnsupportedWeightDtype(DType::F16)),
+            "{reasons:?}"
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| matches!(r, MissReason::BiasRankNotOne { .. })),
+            "the bias was named for a multiply the dtype gate refuses first: {reasons:?}"
+        );
+
+        // A half-width weight with no bias add beside it is not this pass's
+        // opportunity: the consumer is named, not the weight.
+        let mut g = Graph::new("half_weight_alone");
+        let x = g.input("x", f32_shape(&[4, 8]));
+        let w = g.param("w", Shape::new(&[8, 16], DType::F16));
+        let mm = g.mm(x, w);
+        let out = g.relu(mm);
+        g.set_outputs(vec![out]);
+        assert_eq!(named(&g), vec![MissReason::NonAddBiasConsumer]);
+
+        // An f32 weight with a rank-2 bias is the rank's, and with a rank-1 bias
+        // nothing is missed — the report is silent on exactly what fuses.
+        let mut g = Graph::new("f32_weight");
+        let x = g.input("x", f32_shape(&[4, 8]));
+        let w = g.param("w", f32_shape(&[8, 16]));
+        let b = g.param("b", f32_shape(&[1, 16]));
+        let mm = g.mm(x, w);
+        let out = g.add(mm, b);
+        g.set_outputs(vec![out]);
+        assert_eq!(named(&g), vec![MissReason::BiasRankNotOne { rank: 2 }]);
+
+        // A scalar bias is the same refusal — the epilogue would add it to one
+        // column of many — so it is named for its rank, not passed over.
+        let mut g = Graph::new("scalar_bias");
+        let x = g.input("x", f32_shape(&[4, 8]));
+        let w = g.param("w", f32_shape(&[8, 16]));
+        let b = g.param("b", f32_shape(&[]));
+        let mm = g.mm(x, w);
+        let out = g.add(mm, b);
+        g.set_outputs(vec![out]);
+        assert_eq!(named(&g), vec![MissReason::BiasRankNotOne { rank: 0 }]);
+
+        let mut g = Graph::new("fusable");
+        let x = g.input("x", f32_shape(&[4, 8]));
+        let w = g.param("w", f32_shape(&[8, 16]));
+        let b = g.param("b", f32_shape(&[16]));
+        let mm = g.mm(x, w);
+        let out = g.add(mm, b);
+        g.set_outputs(vec![out]);
+        assert!(FusionReport::scan(&g).missed.is_empty());
     }
 
     #[test]
