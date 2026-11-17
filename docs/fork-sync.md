@@ -77,6 +77,13 @@ directory reddens four gates. Its `tests/` keeps one stub that asserts the
 exclusion, because a suite that needs the extension cannot run and a missing
 one makes `pytest` exit non-zero on an empty collection.
 
+`.github/workflows/pages.yml` is deleted, not narrowed: it builds the two browser
+crates for `wasm32`, whose `webgpu` / `webgl` features name `rlx-runtime/webgpu`,
+`rlx-runtime/browser` and `rlx-runtime/opengl` — features this fork's runtime does
+not carry, so the dependency does not resolve — and `Cargo.toml`'s `exclude`
+comment is the authority on why nothing builds those crates at all. A sync takes
+the deletion rather than the file.
+
 Integration tests are gated the same way — upstream's wgpu targets are
 auto-discovered, which would silently join them to the routine `cargo test`:
 

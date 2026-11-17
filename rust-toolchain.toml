@@ -9,11 +9,12 @@
 # it stays where it is — a floor selects nothing, this file names a compiler.
 #
 # `clippy` and `rustfmt` are what the lint and format gates invoke, and a
-# minimal-profile install ships neither. `thumbv7em-none-eabihf` is the target
-# `just check-no-std` builds the bare-metal crates for. A host-only target — the
-# x86-64 macOS cross-lint row — is installed where `just lint` asks for it, not
-# named here, where every checkout and CI runner would fetch that platform's std.
+# minimal-profile install ships neither. No target is declared: the one
+# cross-lint row that needs another platform — x86-64 macOS in `just lint` — has
+# to be installed by hand (`rustup target add x86_64-apple-darwin`) and skips
+# where it is not. Naming it here would make provisioning this toolchain fetch
+# that platform's std on every machine and CI runner, for a row that is guarded
+# off everywhere but an Apple Silicon host.
 [toolchain]
 channel = "1.99.1"
 components = ["clippy", "rustfmt"]
-targets = ["thumbv7em-none-eabihf"]

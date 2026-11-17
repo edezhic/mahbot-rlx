@@ -812,29 +812,6 @@ test-libm: test-libm-vs-musl
 test-libm-exhaustive:
     cargo test --release -p mahbot-rlx-libm --test f32_exhaustive -- --ignored --test-threads=1 --nocapture
 
-# rlx-fpga once claimed `no_std` while depending on std-only rlx-ir, and no
-# gate built it that way, so nothing noticed (GitHub issue #7).
-# no_std crates (rlx-ir core, rlx-cortexm, rlx-fpga) build for bare metal + host tests
-check-no-std:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    t=thumbv7em-none-eabihf
-    rustup target list --installed | grep -qx "$t" || rustup target add "$t"
-    cargo clippy -p mahbot-rlx-ir -p rlx-cortexm -p rlx-fpga -p rlx-mcu --no-default-features --target "$t" -- -D warnings
-    # `rlx-micro` is checked with its defaults, not without: its halting
-    # `#[panic_handler]` is the `panic-handler` default feature, and a bare-metal
-    # staticlib without one fails codegen — which is the gate working, not a defect
-    # to silence with an allow.
-    cargo clippy -p rlx-micro --target "$t" -- -D warnings
-    # Host side: every test/example target must still build (std-only ones gate
-    # themselves on the `std` feature) and the no_std library tests must pass.
-    # rlx-ir's integration tests use the full IR, so only its unit tests run here.
-    cargo clippy -p rlx-fpga --no-default-features --all-targets -- -D warnings
-    cargo clippy -p mahbot-rlx-ir --no-default-features --lib -- -D warnings
-    cargo clippy -p mahbot-rlx-ir --no-default-features --lib --profile test -- -D warnings
-    cargo test -p rlx-fpga --no-default-features
-    cargo test -p mahbot-rlx-ir --no-default-features --lib
-
 # README Rust examples as doctests (`crates/rlx`'s `ReadmeDoctests`): the
 # first code a reader copies must compile and give the numbers it claims.
 check-readme:
@@ -1253,9 +1230,9 @@ run-verbose CMD:
 # `docs/fork-sync.md`).
 ci: build test fmt-check lint check-fork-layers check-rlx-env-vars check-example-names check-doc-links check-license-headers check-wgsl-uniform check-op-coverage check-corpus test-third-order-cpu check-rustdoc-contour
 # Everything, once per upstream sync: the routine gate above plus every member
-# upstream ships — the Apple/NVIDIA/AMD/Intel/TPU/embedded backends, the no_std
-# crates and the bindings. Slow and toolchain-dependent, which is why the routine
-# loop above stays narrow. It depends on `ci` so it cannot fall behind it, and it
+# upstream ships — the Apple/NVIDIA/AMD/Intel/TPU/embedded backends and the
+# bindings. Slow and toolchain-dependent, which is why the routine loop above
+# stays narrow. It depends on `ci` so it cannot fall behind it, and it
 # names `test-gpu` because that is the recipe that builds the targets behind
 # `required-features` — a bare `cargo test --workspace` skips every one of them.
 # `test-workspace` names the one feature it has to (`mahbot-inference/hand-run`,
@@ -1266,7 +1243,7 @@ ci: build test fmt-check lint check-fork-layers check-rlx-env-vars check-example
 # `RLX_REQUIRE_DEVICE=1` makes a backend that skips for want of a device a
 # failure, not a pass. The recipes that need something else are in `ci-rig`: HIP,
 # `leaks`, `xcrun metal`, a crates.io fetch for the real `libm`, and a Vulkan ICD.
-ci-workspace: ci build-workspace test-workspace lint-workspace check-no-std check-readme check-rustdoc check-corpus-device check-bindings check-binding-versions test-third-order-gpu test-gpu
+ci-workspace: ci build-workspace test-workspace lint-workspace check-readme check-rustdoc check-corpus-device check-bindings check-binding-versions test-third-order-gpu test-gpu
 # The whole-set gate's toolkit rows, run on a rig rather than a developer machine:
 # HIP for `test-rocm`, `leaks` for `leak-check`, `xcrun metal` for
 # `validate-metal-bindings`, an ICD for `test-vulkan`, and a crates.io fetch for

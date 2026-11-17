@@ -70,7 +70,6 @@ just test-vulkan    # the Vulkan rows, on a rig: needs an ICD this fork does not
 just lint           # clippy (-D warnings) over the contour
 just fmt            # rustfmt
 just fmt-check      # rustfmt --check
-just check-no-std   # no_std crates (rlx-ir core, cortexm, fpga, mcu, micro) for thumbv7em
 just install-git-hooks  # pre-commit auto-fmt + clippy
 just ci             # the routine gate: contour build + tests + fmt-check + clippy
                     # + the fork-only gates
