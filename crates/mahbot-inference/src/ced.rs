@@ -77,7 +77,7 @@
 //! nor the file.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rlx_flow::{FlowCtx, FlowValue, LayerStage, ModelFlow, StageArtifacts};
@@ -129,6 +129,57 @@ pub struct Tag {
     pub end: usize,
     pub index: usize,
     pub score: f32,
+}
+
+// ── the mel's threads ──────────────────────────────────────────────
+
+/// The mel's workers: the machine's logical count, capped at twelve.
+///
+/// The transform is one independent FFT and filterbank fold per frame, so it is the
+/// frames that divide. The useful band is six to twelve threads, and the count that
+/// lands in it is the machine's **logical** one: this machine reports eleven logical
+/// and five performance cores, so a rule built on the performance count would sit
+/// below the band and miss the saving, while past twelve a thread adds nothing to a
+/// transform this size. Measured on an M3 Pro over the pinned 318 s recording (31802
+/// frames, 64 bins): **70.7–72.7 ms** on the calling thread alone, **14.3–16.1 ms** at
+/// eleven workers — medians of interleaved takes in one process.
+///
+/// Below [`MEL_THREAD_MIN_SAMPLES`] the whole transform is under a quarter of a
+/// millisecond — it is 0.22 ms per second of audio — and a spawn costs more than the
+/// work it would share, so the same loop body runs over the whole range on the calling
+/// thread.
+fn mel_threads(samples: usize) -> usize {
+    if samples < MEL_THREAD_MIN_SAMPLES {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MEL_THREADS_MAX)
+}
+
+/// One second of 16 kHz audio: the input below which the mel is not worth a thread.
+const MEL_THREAD_MIN_SAMPLES: usize = 16_000;
+
+/// The most workers the mel uses — the top of the band [`mel_threads`] documents.
+const MEL_THREADS_MAX: usize = 12;
+
+/// Chunks each worker is offered, so a worker that lands on an efficiency core takes
+/// less than a whole thread's share and the slowest core does not set the finish: the
+/// same recording measures 17.8 ms at one chunk per worker against 15.9 ms at four.
+const MEL_CHUNKS_PER_WORKER: usize = 4;
+
+/// The stack one mel worker is given. The body keeps its scratch on the heap (5.1 KiB
+/// at this file's 512-point front end) and recurses nowhere, so the reservation is
+/// small on purpose: it is a figure the recognition call's memory ceiling can count
+/// ([`Tagger::mel_thread_bytes`]) rather than the platform's 2 MiB default.
+const MEL_STACK_BYTES: usize = 128 * 1024;
+
+/// One chunk of the mel's frame range with the columns it writes: `rows[m]` is bin
+/// `m`'s slice of the mel-major buffer, `to - from` values long.
+struct Job<'a> {
+    from: usize,
+    to: usize,
+    rows: Vec<&'a mut [f32]>,
 }
 
 // ── the front end ──────────────────────────────────────────────────
@@ -331,6 +382,10 @@ impl FrontEnd {
     /// finally turned into dB and clamped at `max - top_db` over the whole
     /// utterance — the order torchaudio's `AmplitudeToDB` uses, whose `ref=1.0`
     /// is why there is no offset.
+    ///
+    /// The frames are independent and [`FrontEnd::transform`] spreads them over
+    /// [`mel_threads`]; the dB pass is not, because its floor is one maximum over
+    /// every frame, and it stays on the calling thread over the whole buffer.
     fn log_mel(&self, samples: &[f32]) -> Result<Mel> {
         let pad = self.n_fft / 2;
         if samples.len() <= pad {
@@ -342,37 +397,7 @@ impl FrontEnd {
         }
         let frames = 1 + samples.len() / self.hop;
         let mut values = vec![0f32; self.n_mels * frames];
-        let mut power = vec![0f32; self.n_freqs];
-        let mut frame = vec![0f32; self.n_fft];
-        // Two scratch halves, allocated once for the whole utterance rather than
-        // two per frame.
-        let mut re = vec![0f32; self.fft.half];
-        let mut im = vec![0f32; self.fft.half];
-        // A reflect-padded read: the left pad mirrors `x[pad - i]`, the right one
-        // `x[n - 2 - i]`, and inside the signal it is the signal.
-        let at = |index: usize| -> f32 {
-            let i = index as isize - pad as isize;
-            if i < 0 {
-                samples[(-i) as usize]
-            } else if (i as usize) < samples.len() {
-                samples[i as usize]
-            } else {
-                samples[2 * samples.len() - 2 - i as usize]
-            }
-        };
-        for t in 0..frames {
-            for (j, slot) in frame.iter_mut().enumerate() {
-                *slot = at(t * self.hop + j) * self.window[j];
-            }
-            self.fft.power_into(&frame, &mut power, &mut re, &mut im);
-            for (m, (first, weights)) in self.bands.iter().enumerate() {
-                let mut acc = 0f32;
-                for (w, p) in weights.iter().zip(&power[*first..]) {
-                    acc += w * p;
-                }
-                values[m * frames + t] = acc;
-            }
-        }
+        self.transform(samples, frames, &mut values);
         let mut max_db = f32::NEG_INFINITY;
         for v in values.iter_mut() {
             let db = self.multiplier * v.max(self.amin).log10();
@@ -389,6 +414,111 @@ impl FrontEnd {
             n_mels: self.n_mels,
             floor,
         })
+    }
+
+    /// Every frame's filterbank power into `values`, mel-major: **one** loop body
+    /// ([`FrontEnd::frames_into`]), driven over the whole frame range on the calling
+    /// thread or over contiguous chunks of it on [`mel_threads`] workers.
+    ///
+    /// A chunk owns a frame range and writes that range's columns of every row, so
+    /// the pass is bit-identical to the serial one — the arithmetic per `(bin, frame)`
+    /// is untouched — and needs no second buffer: a frame-major scratch would make the
+    /// writes contiguous and costs the mel's own size again (8.14 MB at 31802 frames
+    /// and 64 bins) for no measured gain. A spawn that fails leaves its chunk in the
+    /// queue, and the calling thread, which is one of the workers, runs it.
+    fn transform(&self, samples: &[f32], frames: usize, values: &mut [f32]) {
+        let workers = mel_threads(samples.len());
+        let chunks = (workers * MEL_CHUNKS_PER_WORKER).min(frames);
+        if workers < 2 || chunks < 2 {
+            let mut rows: Vec<&mut [f32]> = values.chunks_mut(frames).collect();
+            self.frames_into(samples, 0, frames, &mut rows);
+            return;
+        }
+        let per = frames.div_ceil(chunks);
+        let mut jobs: Vec<Job<'_>> = (0..chunks)
+            .map(|k| (k * per, ((k + 1) * per).min(frames)))
+            .filter(|(from, to)| from < to)
+            .map(|(from, to)| Job {
+                from,
+                to,
+                rows: Vec::with_capacity(self.n_mels),
+            })
+            .collect();
+        for row in values.chunks_mut(frames) {
+            let mut rest = row;
+            for job in &mut jobs {
+                let (head, tail) = rest.split_at_mut(job.to - job.from);
+                job.rows.push(head);
+                rest = tail;
+            }
+        }
+        debug_assert_eq!(
+            jobs.iter().map(|job| job.to - job.from).sum::<usize>(),
+            frames,
+            "the mel's chunks tile the frame range: a hole would be a run of zeros, not a panic"
+        );
+        let work = Mutex::new(jobs);
+        std::thread::scope(|scope| {
+            let mut spawned = 0;
+            while spawned + 1 < workers {
+                match std::thread::Builder::new()
+                    .stack_size(MEL_STACK_BYTES)
+                    .spawn_scoped(scope, || self.drain(samples, &work))
+                {
+                    Ok(_) => spawned += 1,
+                    Err(_) => break,
+                }
+            }
+            self.drain(samples, &work);
+        });
+    }
+
+    /// Take chunks until none are left: what each worker runs, and what the calling
+    /// thread runs while they do.
+    fn drain(&self, samples: &[f32], work: &Mutex<Vec<Job<'_>>>) {
+        loop {
+            let Some(mut job) = work.lock().unwrap_or_else(|e| e.into_inner()).pop() else {
+                return;
+            };
+            self.frames_into(samples, job.from, job.to, &mut job.rows);
+        }
+    }
+
+    /// Frames `from..to` of the transform, into the caller's columns: `rows[m][t - from]`
+    /// is bin `m`'s value for frame `t`. The scratch — the windowed frame, its power
+    /// spectrum and the transform's two halves — is this worker's, allocated once for
+    /// its whole chunk rather than once per frame.
+    fn frames_into(&self, samples: &[f32], from: usize, to: usize, rows: &mut [&mut [f32]]) {
+        let pad = self.n_fft / 2;
+        let mut power = vec![0f32; self.n_freqs];
+        let mut frame = vec![0f32; self.n_fft];
+        let mut re = vec![0f32; self.fft.half];
+        let mut im = vec![0f32; self.fft.half];
+        // A reflect-padded read: the left pad mirrors `x[pad - i]`, the right one
+        // `x[n - 2 - i]`, and inside the signal it is the signal.
+        let at = |index: usize| -> f32 {
+            let i = index as isize - pad as isize;
+            if i < 0 {
+                samples[(-i) as usize]
+            } else if (i as usize) < samples.len() {
+                samples[i as usize]
+            } else {
+                samples[2 * samples.len() - 2 - i as usize]
+            }
+        };
+        for t in from..to {
+            for (j, slot) in frame.iter_mut().enumerate() {
+                *slot = at(t * self.hop + j) * self.window[j];
+            }
+            self.fft.power_into(&frame, &mut power, &mut re, &mut im);
+            for (m, (first, weights)) in self.bands.iter().enumerate() {
+                let mut acc = 0f32;
+                for (w, p) in weights.iter().zip(&power[*first..]) {
+                    acc += w * p;
+                }
+                rows[m][t - from] = acc;
+            }
+        }
     }
 }
 
@@ -874,6 +1004,22 @@ impl Tagger {
     /// The whole signal's log-mel, in this file's own front end.
     pub fn log_mel(&self, samples_16k: &[f32]) -> Result<Mel> {
         self.front.log_mel(samples_16k)
+    }
+
+    /// The host bytes the mel's workers reserve beside the mel itself, for an input of
+    /// `samples_16k`: one stack and one frame's scratch per worker (`mel_threads`), and
+    /// the job table's own slice header per bin per chunk. A reservation rather than a
+    /// measurement — the calling thread's stack is counted with the rest — and the
+    /// recognition call's ceiling counts it: these are resident while the mel runs and
+    /// are not one of the buffers a call holds at once.
+    pub fn mel_thread_bytes(&self, samples_16k: usize) -> u64 {
+        let scratch = (self.front.n_fft + self.front.n_freqs + 2 * self.front.fft.half) as u64 * 4;
+        let workers = mel_threads(samples_16k) as u64;
+        let jobs = workers
+            * MEL_CHUNKS_PER_WORKER as u64
+            * self.front.n_mels as u64
+            * std::mem::size_of::<&mut [f32]>() as u64;
+        workers * (MEL_STACK_BYTES as u64 + scratch) + jobs
     }
 
     /// One window's 527-class probabilities, from mel frame `start`.

@@ -45,13 +45,15 @@ pub mod vad;
 pub mod wake;
 
 /// Give back every process-wide copy of the models this crate keeps: the decode graph a
-/// resident pair holds, the process's mel graphs, the host copies of the weights and the
-/// device's shared weight pool. A long-lived caller that has finished a pass drops them
-/// here; the next call recompiles and re-reads, so it is a cost, not a state change.
+/// resident pair holds, the process's mel graphs, the host copies of the weights, the
+/// rotary memo the prompts are built from and the device's shared weight pool. A
+/// long-lived caller that has finished a pass drops them here; the next call recompiles
+/// and re-reads, so it is a cost, not a state change.
 /// Nothing that survives a completed call grows without a bound — the host caches are keyed
-/// by tensor and the pool by scope — so this is how a process gets *down* from that bound,
-/// not what makes it bounded. A rung's own graphs are not part of this: they belong to the
-/// call that built them and are already gone when it returns.
+/// by tensor, the pool by scope and the rotary memo's tables capped by rows — so this is how
+/// a process gets *down* from that bound, not what makes it bounded. A rung's own graphs are
+/// not part of this: they belong to the call that built them and are already gone when it
+/// returns.
 ///
 /// What this does not do is hand the freed pages back to the operating system: measured on
 /// macOS 26.5/arm64, neither dropping a 378 MiB `Vec` nor `malloc_zone_pressure_relief`
@@ -60,5 +62,6 @@ pub mod wake;
 pub fn release_process_memory() {
     listen::clear_graph_caches();
     emit::clear_weight_caches();
+    host::clear_rope_memo();
     rlx_wgpu::buffer::clear_shared_weights();
 }

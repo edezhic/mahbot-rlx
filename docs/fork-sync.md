@@ -341,9 +341,9 @@ Comparing a sync against the previous take:
 is how a take can be checked without editing the tree; a subset run
 (`mahbot-inference 0 3`) prints its rows and writes nothing.
 
-`MAHBOT_PHASE_SPLIT=1` prints one recognition call's phase split — tagger, VAD and
-plan, encoder front, prompt prefill and decode — on stderr. No record carries it:
-the seven-row stand measures whole calls.
+`MAHBOT_PHASE_SPLIT=1` prints one recognition call's phase split — tagger with the
+overlapped mask, the plan, encoder front, prompt prefill and decode — on stderr. No
+record carries it: the seven-row stand measures whole calls.
 
 `MAHBOT_TAIL_GROUP=<n>` caps the chunks one grouped encoder-tail pass carries, and
 `1` restores the per-chunk arrangement, so the two arms can be compared on one

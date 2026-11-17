@@ -95,6 +95,25 @@ const OVERLAP_WORDS: usize = 6;
 
 const HOP_SAMPLES: usize = crate::vad::HOP_LENGTH;
 
+/// One second at [`RATE`]: the input below which the mask is not worth a thread. The
+/// mask is ~0.26 ms per second of audio and a spawn is a few hundredths of a
+/// millisecond, so on a very short input the thread is a material share of the work it
+/// would hide; the caller runs it inline there instead.
+const MASK_OVERLAP_SAMPLES: usize = RATE as usize;
+
+/// The stack the mask thread is given, and all it reserves beside the three buffers
+/// [`Transcriber::need`] counts: `mask_of`'s detector (~8 KiB of `earshot` state) and its
+/// hop frame live on it, and the loop over hops recurses nowhere. Small on purpose, so
+/// the recognition call's ceiling can count the reservation rather than the platform's
+/// 2 MiB default.
+const MASK_STACK_BYTES: usize = 128 * 1024;
+
+/// One input's per-hop speech mask, on a detector of its own: what the mask thread runs
+/// and what the calling thread runs when there is no thread or no need for one.
+fn mask_of(audio: &[f32]) -> Vec<bool> {
+    vad::speech_mask(audio, &mut earshot::Detector::default())
+}
+
 /// A span of the analysed input, in samples.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Span {
@@ -656,18 +675,62 @@ impl Transcriber {
         } else {
             audio16
         };
+        // The voice-activity mask runs on its own thread while the tagger's windows
+        // hold this one. The two use opposite resources — the mask is 82–84 ms of
+        // `earshot` over the whole input, the 62 window passes are ~645 ms of which most
+        // is a blocking wait on the device — so the mask hides under the passes
+        // entirely. Over eight interleaved paired takes of the whole phase on an
+        // M3 Pro (the pinned 318 s recording) the mask alone is worth 80.6 ms and the
+        // mel's own threads 56.5 ms; together they take the phase from 779.8 ms to
+        // 646.8 ms — 133.0 ms, 17.1 %, or 0.47 % of the ~28.5 s long row. The two are
+        // separate stretches of that phase, and the 4.1 ms they give up against their sum
+        // is the mel's workers and the mask sharing the machine for the ~16 ms they
+        // overlap.
+        //
+        // **The premise is Metal's**, and this is the one place in the crate where a
+        // host thread is worth starting beside a device-bound one: a backend that routes
+        // elementwise work to the host keeps the calling thread busy through the same
+        // passes, so a mask thread contends there instead of hiding, and the prize is
+        // not the same. What the thread costs the device is under the take-to-take spread
+        // of the passes themselves: six interleaved takes of the mel and the windows with
+        // a mask looping continuously beside them measured 640.4 ms against 661.3 ms
+        // quiet, and 643.3 against 641.0 ms on a second run — the sign of the difference
+        // is the machine's, not the thread's. A thread blocked on a fence is genuinely
+        // idle, and the mask reads the input once — 20 MB over the whole recording,
+        // nothing beside the device's own traffic.
+        //
+        // Below [`MASK_OVERLAP_SAMPLES`] the thread is a material share of the mask it
+        // hides, and a spawn that fails at all leaves the mask to this thread: nothing
+        // here may fail because a thread did not start.
         let t_tag = report::Stopwatch::start();
-        let mel = self
-            .tagger
-            .log_mel(signal)
-            .context("the tagger's log-mel")?;
-        let tags = self.tagger.tags(&mel).context("the tagger's windows")?;
+        let (tags, mask) = std::thread::scope(|scope| -> Result<_> {
+            let spawned = (audio16.len() >= MASK_OVERLAP_SAMPLES)
+                .then(|| {
+                    std::thread::Builder::new()
+                        .stack_size(MASK_STACK_BYTES)
+                        .spawn_scoped(scope, || mask_of(audio16))
+                })
+                .and_then(std::result::Result::ok);
+            let mel = self
+                .tagger
+                .log_mel(signal)
+                .context("the tagger's log-mel")?;
+            let tags = self.tagger.tags(&mel).context("the tagger's windows")?;
+            // Joined after the passes, which is the whole point: the mask was already
+            // running while they were submitted and waited on.
+            let mask = match spawned {
+                Some(handle) => match handle.join() {
+                    Ok(mask) => mask,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                },
+                None => mask_of(audio16),
+            };
+            Ok((tags, mask))
+        })?;
         let tagger_ms = t_tag.ms();
 
         // Where the speech is, how it is cut, and how the cuts tile the input.
         let t_plan = report::Stopwatch::start();
-        let mut detector = earshot::Detector::default();
-        let mask = vad::speech_mask(audio16, &mut detector);
         let mut spans = Vec::new();
         // One label per surviving span, asked once: it decides whether the span can
         // hold words at all, and it is the label of every region that is the span
@@ -695,14 +758,16 @@ impl Transcriber {
             .flat_map(|span| cut(span, audio16))
             .collect();
         let plan = tile_indexed(&chunk_list, audio16.len());
-        let vad_ms = t_plan.ms();
+        let plan_ms = t_plan.ms();
 
         // The recognition phase split, on stderr when `MAHBOT_PHASE_SPLIT` is set: the
         // front, prefill and decode are separate graphs, summed by `Walk::pieces`, and the
         // rung census beside them is what `read_pieces` read — each rung's chunks and the
         // group size it was compiled at, the number the encoder-tail arrangement is chosen
-        // on, which no record column carries. The value is read truthily, as
-        // `rlx_ir::env::flag` spells it: `=0`, `=false`, `=off` and `=no` are off.
+        // on, which no record column carries. The `tagger+mask` field is the mel, the
+        // window passes and the mask overlapped under them; `plan` is the spans, the cut
+        // and the tiling alone. The value is read truthily, as `rlx_ir::env::flag` spells
+        // it: `=0`, `=false`, `=off` and `=no` are off.
         let split = std::env::var("MAHBOT_PHASE_SPLIT").is_ok_and(|v| {
             !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
@@ -726,7 +791,7 @@ impl Transcriber {
         if split {
             let decode_ms: f64 = walk.decode_times.iter().sum();
             eprintln!(
-                "phases: tagger {tagger_ms:.1} ms · vad+plan {vad_ms:.1} ms · encoder front \
+                "phases: tagger+mask {tagger_ms:.1} ms · plan {plan_ms:.1} ms · encoder front \
                  {:.1} ms · prefill {:.1} ms · decode {decode_ms:.1} ms over {} tokens · build \
                  {:.1} ms · rungs {}",
                 walk.front_ms,
@@ -815,17 +880,29 @@ impl Transcriber {
 
     /// What a whole input of `samples` at [`RATE`] needs of host memory: `samples` of
     /// f32 audio, the tagger's log-mel over them, and `disk` bytes of file while it is
-    /// read — the three buffers the call holds at once.
+    /// read — the three buffers the call holds at once — plus what it runs beside them
+    /// and still holds: the mel's worker stacks and scratch
+    /// ([`Tagger::mel_thread_bytes`]), the mask thread's stack and detector when the
+    /// input is long enough to spawn it, and the rotary memo the process keeps
+    /// ([`host::rope_memo_bytes`]).
     fn need(&self, samples: usize, disk: u64) -> u64 {
         let frames = samples / self.tagger.samples_per_frame().max(1);
+        let mask = if samples >= MASK_OVERLAP_SAMPLES {
+            MASK_STACK_BYTES as u64
+        } else {
+            0
+        };
         disk.saturating_add(samples as u64 * 4)
             .saturating_add(self.tagger.mel_bytes(frames))
+            .saturating_add(self.tagger.mel_thread_bytes(samples))
+            .saturating_add(mask)
+            .saturating_add(crate::host::rope_memo_bytes())
     }
 
     /// The one refusal the ceiling gives, so an input refused before its conversion
     /// and one refused as a file say the same thing — and the `need` figure it prints
-    /// is the one that was just compared with the ceiling, itemised the way it was
-    /// summed (the file's own bytes are part of it only when a file is being read).
+    /// is the one that was just compared with the ceiling, named the way it was summed
+    /// (the file's own bytes are part of it only when a file is being read).
     fn too_large(
         &self,
         need: u64,
@@ -847,7 +924,8 @@ impl Transcriber {
         };
         anyhow::anyhow!(
             "{name} of {:.0} s ({samples} samples at {RATE} Hz) needs ~{} MiB of host memory — \
-             its audio and its tagger log-mel{disk} — past the run's {} MiB resident-set ceiling",
+             its audio, its tagger log-mel, and the threads and rotary memo the call runs \
+             beside them{disk} — past the run's {} MiB resident-set ceiling",
             samples as f64 / f64::from(RATE),
             need / (1024 * 1024),
             self.ceiling / (1024 * 1024),

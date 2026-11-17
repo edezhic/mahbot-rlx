@@ -5,6 +5,8 @@
 //! Host-side pieces the live paths still need: RoPE tables at global positions,
 //! the sampler, and a RIFF/WAVE reader for a 16 kHz recording.
 
+use std::sync::Mutex;
+
 use anyhow::Result;
 
 /// The same, for rows that keep **global** positions `from..from + rows` —
@@ -12,7 +14,54 @@ use anyhow::Result;
 /// row has in the whole sequence, not at its offset inside the window. This is
 /// f64 on purpose: the body's cached walk can reach thousands of positions, and
 /// the graph's f32 synthetic tables (for a whole wave window) would drift.
+///
+/// A request that starts at position zero is a **prefix** table — a prompt's, or a
+/// wave window's first run — and is served from the memo, which is why a
+/// recognition call builds each of its six prompt lengths once instead of once per
+/// piece: 51 pieces over six lengths of 31–111 rows rebuild 3.3 ms of tables a call,
+/// and 0.2 ms from the memo. A request from a non-zero position is one or two rows of
+/// a decode step and is built here: caching those would be a table per position, not
+/// one per shape.
 pub fn rope_tables_at(from: usize, rows: usize, hd: usize, base: f64) -> (Vec<f64>, Vec<f64>) {
+    if hd / 2 == 0 || rows == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    if from == 0 && rows <= ROPE_MEMO_ROWS {
+        return memo_prefix(rows, hd, base);
+    }
+    angles(from, rows, hd, base)
+}
+
+/// The most rows the memo keeps for one `(base, head width)` pair. Every caller's
+/// prefix is a prompt or a wave window — 111 rows is the longest prompt a
+/// 768-frame recognition piece builds — so this is a bound on a shape nothing in the
+/// tree reaches, not a working limit: past it a table is simply built and dropped.
+const ROPE_MEMO_ROWS: usize = 512;
+
+/// One key's prefix tables, `cos`/`sin` over positions `0..cos.len() / half`.
+struct Prefix {
+    base: f64,
+    hd: usize,
+    cos: Vec<f64>,
+    sin: Vec<f64>,
+}
+
+/// The prefix tables this process has built, one entry per `(base, head width)`.
+///
+/// The key is the base and the head width as well as the row count, and it has to be:
+/// the builder serves the recognition body and the talker (both `1e6` at a 128-wide
+/// head, which is why they share an entry), the code predictor (`1e6`) and the wave
+/// head (`1e4`), so a memo keyed on the rung or the row count alone would hand one of
+/// them another's table and nothing would refuse it. The tables are f64 and are
+/// retained for the process's lifetime — 111 KiB for the longest recognition prompt at
+/// a 128-wide head — so [`crate::release_process_memory`] drops them
+/// ([`clear_rope_memo`]) and the recognition call's ceiling counts them
+/// ([`rope_memo_bytes`]).
+static ROPE_MEMO: Mutex<Vec<Prefix>> = Mutex::new(Vec::new());
+
+/// Positions `from..from + rows` of `base`'s table, `hd` values per row — the one
+/// loop body, which the memo's own growth runs over the rows it is missing.
+fn angles(from: usize, rows: usize, hd: usize, base: f64) -> (Vec<f64>, Vec<f64>) {
     let half = hd / 2;
     let mut cos = vec![0f64; rows * half];
     let mut sin = vec![0f64; rows * half];
@@ -25,6 +74,52 @@ pub fn rope_tables_at(from: usize, rows: usize, hd: usize, base: f64) -> (Vec<f6
         }
     }
     (cos, sin)
+}
+
+/// The first `rows` rows of `(hd, base)`'s prefix, grown in place when a longer one
+/// is asked for and copied out at the caller's length.
+fn memo_prefix(rows: usize, hd: usize, base: f64) -> (Vec<f64>, Vec<f64>) {
+    let half = hd / 2;
+    let mut memo = ROPE_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    let at = memo
+        .iter()
+        .position(|p| p.hd == hd && p.base.to_bits() == base.to_bits());
+    let at = at.unwrap_or_else(|| {
+        memo.push(Prefix {
+            base,
+            hd,
+            cos: Vec::new(),
+            sin: Vec::new(),
+        });
+        memo.len() - 1
+    });
+    let cached = &mut memo[at];
+    let have = cached.cos.len() / half;
+    if have < rows {
+        let (cos, sin) = angles(have, rows - have, hd, base);
+        cached.cos.extend_from_slice(&cos);
+        cached.sin.extend_from_slice(&sin);
+    }
+    (
+        cached.cos[..rows * half].to_vec(),
+        cached.sin[..rows * half].to_vec(),
+    )
+}
+
+/// The bytes the rotary memo retains: an input the recognition call's memory ceiling
+/// has to count, because they are resident for the process's lifetime and are not one
+/// of the buffers a call holds.
+pub fn rope_memo_bytes() -> u64 {
+    let memo = ROPE_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    memo.iter()
+        .map(|p| (p.cos.capacity() + p.sin.capacity()) as u64 * 8)
+        .sum()
+}
+
+/// Drop every memoised prefix — [`crate::release_process_memory`]'s host arm. The
+/// next call rebuilds what it needs, so this is a cost, not a state change.
+pub fn clear_rope_memo() {
+    ROPE_MEMO.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 fn threefry2x32_20(c: (u32, u32), k: (u32, u32)) -> (u32, u32) {
@@ -561,5 +656,54 @@ mod tests {
         // 24·2/3 = 16 output samples, at source positions `o · 1.5`.
         assert_eq!(out[1], 1.5);
         assert_eq!(out[2], 3.0);
+    }
+
+    /// The rotary memo's key is the base and the head width as well as the rows: the
+    /// builder is shared by the recognition body, the talker and the wave head, so a
+    /// prefix served from another key's entry is a wrong table that nothing refuses.
+    /// The rows are not the key, which is why a shorter request is the entry's own first
+    /// rows and a longer one grows it.
+    #[test]
+    fn the_rotary_memo_is_keyed_by_base_and_head_width() {
+        let fresh = |from: usize, rows: usize, hd: usize, base: f64| {
+            super::clear_rope_memo();
+            super::rope_tables_at(from, rows, hd, base)
+        };
+        let (long, other_base, other_hd, tail) = (
+            fresh(0, 7, 8, 1e6),
+            fresh(0, 7, 8, 1e4),
+            fresh(0, 7, 4, 1e6),
+            fresh(5, 2, 8, 1e6),
+        );
+        // A short prefix first, so every request below finds an entry to grow or read.
+        super::clear_rope_memo();
+        assert_eq!(super::rope_tables_at(0, 3, 8, 1e6).0.len(), 3 * 4);
+        assert_eq!(
+            super::rope_tables_at(0, 7, 8, 1e6),
+            long,
+            "the grown prefix"
+        );
+        assert_eq!(
+            super::rope_tables_at(0, 7, 8, 1e4),
+            other_base,
+            "the base is part of the key"
+        );
+        assert_eq!(
+            super::rope_tables_at(0, 7, 4, 1e6),
+            other_hd,
+            "the head width is part of the key"
+        );
+        assert_eq!(
+            super::rope_tables_at(5, 2, 8, 1e6),
+            tail,
+            "a non-zero start is not a prefix and is not memoised"
+        );
+        let (cos, sin) = super::rope_tables_at(0, 2, 8, 1e6);
+        assert_eq!(
+            (cos, sin),
+            (long.0[..2 * 4].to_vec(), long.1[..2 * 4].to_vec()),
+            "a shorter request is the entry's own first rows"
+        );
+        super::clear_rope_memo();
     }
 }
