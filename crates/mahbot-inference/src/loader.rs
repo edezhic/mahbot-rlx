@@ -763,13 +763,57 @@ impl Model {
     /// For the bytes a packed upload feeds to the device, `Model::with_mapped_ready` is the
     /// route — its request issued once per group of windows, [`crate::readahead::read_extents`]
     /// — and this one pays a copy into a fresh buffer first.
+    ///
+    /// A tensor at or above `PARALLEL_READ_MIN` is split across several readers instead, where
+    /// the platform has a second `pread` and the machine a second core to give it
+    /// (`read_parallel`).
     pub fn raw(&self, name: &str) -> Result<Vec<u8>> {
         let t = self.tensor(name)?;
+        let (start, n) = self.extent_of(name, t)?;
+        if n >= PARALLEL_READ_MIN
+            && let Some(bytes) = self.raw_parallel(name, start, n)?
+        {
+            return Ok(bytes);
+        }
         let mut bytes = Vec::new();
         if !self.file.read_tensor_bytes_into(t, &mut bytes)? {
             bytes = self.file.tensor_bytes(t)?.to_vec();
         }
         Ok(bytes)
+    }
+
+    /// [`Self::raw`]'s multi-reader route for a tensor big enough to pay for it: `None` for an
+    /// owned backing, which holds its bytes already.
+    #[cfg(unix)]
+    fn raw_parallel(&self, name: &str, start: u64, len: usize) -> Result<Option<Vec<u8>>> {
+        // The reader's own handle — the one the single-`pread` route reads through — so a
+        // checkpoint removed or replaced under a loaded model behaves the same above and below
+        // the threshold: a cached descriptor keeps reading the inode it opened.
+        let Some(file) = self.file.src_handle()? else {
+            return Ok(None);
+        };
+        // A live `fstat`, not `window_source`'s cached length: the cached one is the file as it
+        // was at the first upload, and this check is what names a checkpoint that shrank
+        // underneath a loaded model instead of letting a reader fail on a short read. One
+        // `fstat` per tensor of 8 MiB and up — eight of them in a synthesis call, ~12 µs
+        // against the 41 ms build.
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("sizing {}", self.path.display()))?
+            .len();
+        let stop = start
+            .checked_add(len as u64)
+            .ok_or_else(|| anyhow!("`{name}`: file offset overflow"))?;
+        if stop > file_len {
+            return Err(truncated(name, start, stop, file_len));
+        }
+        read_parallel(file, name, start, len).map(Some)
+    }
+
+    /// `None` on a platform with no second `pread` to give it.
+    #[cfg(not(unix))]
+    fn raw_parallel(&self, _name: &str, _start: u64, _len: usize) -> Result<Option<Vec<u8>>> {
+        Ok(None)
     }
 
     /// One tensor's bytes, handed to `write` from a window of the file mapped for the length of
@@ -852,13 +896,13 @@ impl Model {
     }
 
     /// Where `t`'s bytes start in the file and how many there are.
-    fn extent_of(&self, name: &str, t: &rlx_gguf::GgufTensor) -> Result<(u64, u64)> {
+    fn extent_of(&self, name: &str, t: &rlx_gguf::GgufTensor) -> Result<(u64, usize)> {
         let start = self
             .file
             .data_offset()
             .checked_add(t.offset)
             .ok_or_else(|| anyhow!("`{name}`: file offset overflow"))?;
-        Ok((start, self.tensor_bytes_of(name, t)? as u64))
+        Ok((start, self.tensor_bytes_of(name, t)?))
     }
 
     /// Where a tensor's bytes start in the file and how many there are: what a caller that
@@ -866,7 +910,8 @@ impl Model {
     /// file's own, the one [`Self::with_mapped_range`] maps a window at.
     pub fn file_extent(&self, name: &str) -> Result<(u64, u64)> {
         let t = self.tensor(name)?;
-        self.extent_of(name, t)
+        let (start, n) = self.extent_of(name, t)?;
+        Ok((start, n as u64))
     }
 
     /// Ask the kernel to start filling the page cache for `[start, start + len)` of this
@@ -901,8 +946,6 @@ impl Model {
     ) -> Result<R> {
         let t = self.tensor(name)?;
         let (tensor_start, nbytes) = self.extent_of(name, t)?;
-        let nbytes = usize::try_from(nbytes)
-            .map_err(|_| anyhow!("`{name}`: {} bytes is not an addressable length", nbytes))?;
         let len = len.unwrap_or(nbytes);
         let end = at
             .checked_add(len)
@@ -931,10 +974,7 @@ impl Model {
         // A window past the end of the file would map zero-filled pages instead of the
         // tensor, which the reader refuses for the same reason: the graph is not run on zeros.
         if stop > file_len {
-            bail!(
-                "`{name}`'s range [{at}, {end}) ends at byte {stop} of {file_len} bytes — the \
-                 checkpoint is truncated"
-            );
+            return Err(truncated(name, start, stop, file_len));
         }
         // SAFETY: a read-only window of a file opened read-only and never written; the
         // tensor's bytes lie inside it and the map is dropped before this returns. Another
@@ -1055,12 +1095,153 @@ impl Model {
     }
 }
 
+/// The refusal a tensor read that runs past the end of its file gets: mapping or reading it
+/// would hand the graph zeros, and the graph is not run on zeros. Both callers pass the file
+/// range they were about to read — the whole tensor, or a window's sub-range of it — so the
+/// message names the range it is actually reporting.
+fn truncated(name: &str, start: u64, stop: u64, file_len: u64) -> anyhow::Error {
+    anyhow!(
+        "`{name}`: the read of [{start}, {stop}) runs past the end of a {file_len}-byte file \
+         — the checkpoint is truncated"
+    )
+}
+
 /// Whether one request covers a group of windows on this platform: `F_RDADVISE` reads the whole
 /// span asked for, while the Linux arm is clamped by the kernel to its own readahead window
 /// (~1.2 MiB) and Windows has no call at all — so those two ask per window, exactly as they did
 /// before grouping existed, and [`crate::readahead::read_extents`] keeps the walk they had.
 pub(crate) fn covers_a_group() -> bool {
     cfg!(target_os = "macos")
+}
+
+/// The smallest tensor [`Model::raw`] hands to `read_parallel`, where the platform has more
+/// than one `pread` to give it.
+///
+/// `READ_CHUNK_MIN` already keeps a small tensor on one reader, so this is not about a
+/// thread start: it keeps the many small tensors — read in well under a millisecond each —
+/// off the second route entirely, saving its `fstat` and its length check. The sound half's
+/// decoder weights are 8–72 MiB, so the threshold sits below every one of them.
+///
+/// Deliberately not gated to unix, unlike the two below: `raw` reads it on every platform, and
+/// gating it is exactly what broke the non-unix test build once.
+const PARALLEL_READ_MIN: usize = 8 << 20;
+
+/// The bytes one reader takes. A chunk smaller than this pays more for its thread than the
+/// split saves, so the reader count is `len / READ_CHUNK_MIN` clamped to the machine's cores
+/// and to [`READERS_MAX`].
+#[cfg(unix)]
+const READ_CHUNK_MIN: usize = 4 << 20;
+
+/// The most readers one tensor takes, however many cores the machine has. Eight is the
+/// largest count measured: the 72 MiB decoder weight reads in 10.1 ms on one `pread` and in
+/// 5.9 / 3.8 / 3.2 ms over 2 / 4 / 8 readers (best of 5, on a host at one-minute load
+/// 3.6–4.8), and the pair a front graph reads over 11 was no faster than over 8 (5.2 against
+/// 4.9 ms, median of 5) — so a machine with more cores gains nothing by spending them here,
+/// and the threads are left to the build.
+#[cfg(unix)]
+const READERS_MAX: usize = 8;
+
+/// The bytes of `[start, start + len)` of `name` read by several `pread`s at once. The caller
+/// has already checked that span against the file's length ([`Model::raw_parallel`]).
+///
+/// One `pread` copies at a single core's rate; [`READERS_MAX`] carries the reader-count curve.
+/// What the split is worth is the sound half's build, which is mostly the front group's large
+/// decoder weights read twice in a synthesis call (once per front graph, through
+/// [`Model::f32_file_order`]): the four sound graphs' builds fall from 61.4 ms to 41.2 on the
+/// warm `synthesis.typical` row, five paired takes out of five. Recognition holds almost
+/// nothing this big — the tagger's largest tensor is 1.1 MiB, and the ASR projector file holds
+/// one at 15 MiB — and ten paired takes put `recognition.short` at −1.5 ms cold and +1.1 ms
+/// warm: near neutral, and reported as such. What the build saving is worth end to end is
+/// small: the same row shortens by at most about 15 ms, inside its own take-to-take spread.
+///
+/// **Load and a cold cache.** The split is right for a warm read of a resident file and wrong
+/// either side of it. On a cold page cache the front graph's build reads 61.6–62.3 ms against
+/// 52.8–56.9 ms single-reader (5/5 paired): the read is bounded by the disk, not the copy, and
+/// the readers only add contention. On a loaded host the warm build moves to 45–65 ms and the
+/// paired delta stops reproducing: paired takes taken while a build of this workspace ran on
+/// the same host put the after arm 43.9 ms worse on the row, with two takes ended by the guard
+/// (`EXIT_STOPPED`). The stand runs alone by design and records its load average with every
+/// take, so both are written costs of the idle-warm condition the row prices, not inversions
+/// of it.
+///
+/// The destination is one buffer either way. Each reader fills its own disjoint slice, so
+/// the bytes and their order are the single-`pread` ones and the reader's peak is unchanged
+/// — this buys time with threads, not with memory.
+#[cfg(unix)]
+fn read_parallel(file: &File, name: &str, start: u64, len: usize) -> Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let count = readers_for(len, cores);
+    let mut bytes = vec![0u8; len];
+    // One chunk is one `pread`: the pool and the scope below would only add their setup.
+    if count == 1 {
+        file.read_exact_at(&mut bytes[..], start)
+            .with_context(|| format!("pread tensor {name} at {start}"))?;
+        return Ok(bytes);
+    }
+    let chunk = len.div_ceil(count);
+    let pieces = len.div_ceil(chunk);
+    let drain = |work: &std::sync::Mutex<Vec<(u64, &mut [u8])>>| -> Result<()> {
+        while let Some((at, head)) = next_piece(work) {
+            file.read_exact_at(head, at)
+                .with_context(|| format!("pread tensor {name} at {at}"))?;
+        }
+        Ok(())
+    };
+    {
+        // Each reader takes one chunk off this pool and the calling thread drains what is
+        // left, so a host that refuses a thread loses the parallelism rather than the read
+        // (`ced`'s mel workers drain on the caller for the same reason).
+        let work = std::sync::Mutex::new(
+            bytes
+                .chunks_mut(chunk)
+                .enumerate()
+                .map(|(i, head)| (start + (i * chunk) as u64, head))
+                .collect::<Vec<_>>(),
+        );
+        std::thread::scope(|scope| -> Result<()> {
+            let mut readers = Vec::with_capacity(pieces);
+            while readers.len() + 1 < pieces {
+                match std::thread::Builder::new()
+                    .name("weight-read".to_string())
+                    .spawn_scoped(scope, || drain(&work))
+                {
+                    Ok(reader) => readers.push(reader),
+                    Err(_) => break,
+                }
+            }
+            let own = drain(&work);
+            for reader in readers {
+                reader
+                    .join()
+                    .map_err(|_| anyhow!("a reader of `{name}` panicked"))??;
+            }
+            own
+        })?;
+    }
+    Ok(bytes)
+}
+
+/// How many readers `len` bytes take: one per [`READ_CHUNK_MIN`], clamped to `cores` and to
+/// [`READERS_MAX`], and never fewer than one — a tensor below `READ_CHUNK_MIN` is one `pread`,
+/// whatever the machine has. `cores` is the machine's own at the call site; it is a parameter
+/// so the arithmetic can be held to a given host from a test.
+#[cfg(unix)]
+fn readers_for(len: usize, cores: usize) -> usize {
+    (len / READ_CHUNK_MIN).clamp(1, cores.clamp(1, READERS_MAX))
+}
+
+/// The next chunk to read, taken off the pool of chunks still unread.
+///
+/// The pool's guard cannot escape here: the piece comes back on its own, so the caller's
+/// `pread` runs with the lock released. A guard held across the read serialises every reader
+/// behind the first, which is the whole thing the split exists to avoid — and it looks like
+/// working code, so the shape of this function is what keeps it out.
+#[cfg(unix)]
+fn next_piece<'a>(
+    work: &std::sync::Mutex<Vec<(u64, &'a mut [u8])>>,
+) -> Option<(u64, &'a mut [u8])> {
+    work.lock().unwrap_or_else(|e| e.into_inner()).pop()
 }
 
 /// Ask the kernel to start filling the page cache for `[start, start + len)` of `file`,
@@ -1746,6 +1927,29 @@ mod tests {
         );
     }
 
+    /// The split's reader count, held to hosts of a given size: one reader per
+    /// [`READ_CHUNK_MIN`] and no more, clamped to the machine's cores and to [`READERS_MAX`],
+    /// and never zero — `clamp` panics with its bounds crossed, and a tensor below one chunk is
+    /// a single `pread`. A zero core count is a case only a test can ask for.
+    #[cfg(unix)]
+    #[test]
+    fn the_split_is_one_reader_per_chunk() {
+        assert_eq!(readers_for(READ_CHUNK_MIN - 1, 10), 1, "below one chunk");
+        assert_eq!(readers_for(READ_CHUNK_MIN, 10), 1, "exactly one chunk");
+        assert_eq!(readers_for(12 << 20, 10), 3, "three chunks, three readers");
+        assert_eq!(readers_for(12 << 20, 2), 2, "cores are the ceiling");
+        assert_eq!(
+            readers_for(72 << 20, 32),
+            READERS_MAX,
+            "and so is READERS_MAX"
+        );
+        assert_eq!(
+            readers_for(72 << 20, 0),
+            1,
+            "a zero core count is one reader"
+        );
+    }
+
     /// The blocked transpose is the index math the two call sites depend on, and they
     /// pass their arguments in opposite orders (`Model::linear_f32` from the file's
     /// `[out, in]` to the matmul's `[in, out]`, `emit`'s `take_read` the other way), so
@@ -1787,8 +1991,9 @@ mod tests {
     }
 
     /// The window route hands over exactly the bytes the `pread` route does — including a
-    /// tensor at a non-zero offset, which is what the file-offset arithmetic joins — and both
-    /// refusals fire: a window past the end of the file, and an offset the parser stored
+    /// tensor at a non-zero offset, which is what the file-offset arithmetic joins, and one big
+    /// enough to be split across readers — and all three refusals fire: a window past the end of
+    /// the file, a tensor past it on the multi-reader route, and an offset the parser stored
     /// without checking that would wrap the join.
     #[test]
     fn a_mapped_window_serves_the_tensors_own_bytes() {
@@ -1810,16 +2015,37 @@ mod tests {
             .map(|i| i * 7 + 1)
             .flat_map(u32::to_le_bytes)
             .collect();
+        // Twelve MiB and four bytes: past `PARALLEL_READ_MIN`, so `raw` takes its multi-reader
+        // route, and `len / READ_CHUNK_MIN` is 3. Where the host yields three readers that is a
+        // ragged split — 4,194,306 / 4,194,306 / 4,194,304 — which is the short last chunk
+        // `pieces` and `div_ceil` exist for; where it yields two the chunks are equal and this
+        // checks the route's bytes only.
+        let wide: Vec<u8> = (0..(12 << 20) as u32 / 4 + 1)
+            .map(|i| i.wrapping_mul(2_654_435_761))
+            .flat_map(u32::to_le_bytes)
+            .collect();
+
         let mut w = GgufWriter::new();
         w.set_arch("probe");
         w.add_tensor_bytes("first.weight", vec![512], GgmlType::F32, first.clone())
             .expect("a dense tensor");
         w.add_tensor_bytes("second.weight", vec![384], GgmlType::F32, second.clone())
             .expect("a dense tensor");
+        w.add_tensor_bytes(
+            "wide.weight",
+            vec![wide.len() / 4],
+            GgmlType::F32,
+            wide.clone(),
+        )
+        .expect("a dense tensor");
         w.write_to_path(&path).expect("the probe file writes");
 
         let model = probe_model(&path);
-        for (name, want) in [("first.weight", &first), ("second.weight", &second)] {
+        for (name, want) in [
+            ("first.weight", &first),
+            ("second.weight", &second),
+            ("wide.weight", &wide),
+        ] {
             assert_eq!(&model.raw(name).expect("the read route"), want, "{name}");
             let window = model
                 .with_mapped(name, <[u8]>::to_vec)
@@ -1827,9 +2053,11 @@ mod tests {
             assert_eq!(&window, want, "{name}");
         }
 
-        let whole = std::fs::metadata(&path)
-            .expect("the probe file's size")
-            .len();
+        // The cut is placed inside `second.weight` from the tensor's own extent rather than
+        // from the file's length: a writer's trailing pad after the last tensor would move a
+        // length-relative cut past the tensor it means to shorten, and the refusal below would
+        // then fail with a message about a read that succeeded.
+        let (second_start, second_n) = model.file_extent("second.weight").expect("an extent");
         // The map above must go before the file is cut: a live mapping of a truncated file
         // is the UB the SAFETY note on the window names.
         drop(model);
@@ -1837,12 +2065,22 @@ mod tests {
             .write(true)
             .open(&path)
             .expect("the probe file reopens")
-            .set_len(whole - 8)
+            .set_len(second_start + second_n - 8)
             .expect("the probe file truncates");
         let err = probe_model(&path)
             .with_mapped("second.weight", |_| ())
             .expect_err("a window past the end of the file");
         assert!(format!("{err:#}").contains("truncated"), "{err:#}");
+
+        // The multi-reader route names the truncation too, rather than letting a joined
+        // reader fail with an anonymous short read.
+        #[cfg(unix)]
+        {
+            let err = probe_model(&path)
+                .raw("wide.weight")
+                .expect_err("a tensor past the end of the file");
+            assert!(format!("{err:#}").contains("truncated"), "{err:#}");
+        }
 
         // A header offset the parser stores without checking wraps the join, so the
         // arithmetic must refuse it rather than map a window at a bogus position.

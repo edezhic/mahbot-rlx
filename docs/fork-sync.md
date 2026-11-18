@@ -252,7 +252,9 @@ merge action.
   deferred mirror delivery — all in the executor's main run loop, where losing
   one produces no compile error
 - bounded weight upload at 16 MiB in flight, and the settle that retires a load's last
-  piece before the process idles
+  piece before the process idles — once per graph, not once per call: `settle_uploads`
+  carries the measurement that rejects deferring it over the sound half's four graphs, and
+  `write_upload` the one that rejects coalescing the writes
 - ladder-rung and sound-window release mid-call
 - the lazy f16 arena mirror
 - release of host weight duplicates
@@ -274,8 +276,10 @@ merge action.
 - KV-append copy elision
 - the ceiling policy as a whole-arena verdict
 - the fork-only core surfaces the product calls: the packed gather op in the
-  backend's custom lowering, the dequant-guarded memory plan, sample seeds, and
-  the stream-ceiling probe
+  backend's custom lowering, the dequant-guarded memory plan, sample seeds, the
+  stream-ceiling probe
+- `GgufFile::src_handle` in `rlx-gguf` — the one `pread` descriptor the loader's
+  split reads share with its single-read route
 - the mel and decode graph caches
 - the sampler's branchless candidate order and its single-pass retained-set assembly
 - the sixteen-window grouped encoder pass

@@ -988,7 +988,7 @@ impl GgufFile {
     /// Returns `false` when the file was not opened via [`Self::from_path_mmap`]
     /// (owned backing already holds the bytes, so the caller should just borrow).
     pub fn read_tensor_bytes_into(&self, t: &GgufTensor, buf: &mut Vec<u8>) -> Result<bool> {
-        let Some(path) = self.src_path.as_ref() else {
+        let Some(f) = self.src_handle()? else {
             return Ok(false);
         };
         let n = t.n_elements();
@@ -1005,17 +1005,6 @@ impl GgufFile {
         // instead zeroes only the growth delta, so a reused scratch pays at most
         // the largest single tensor once.
         buf.resize(nbytes, 0);
-        let f = match self.src_file.get() {
-            Some(f) => f,
-            None => {
-                let f =
-                    File::open(path).with_context(|| format!("reopening {}", path.display()))?;
-                // Racing initializers are fine: both handles are read-only on
-                // the same path, and the loser is simply dropped.
-                let _ = self.src_file.set(f);
-                self.src_file.get().expect("src_file just set")
-            }
-        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
@@ -1030,6 +1019,25 @@ impl GgufFile {
             fh.read_exact(buf)?;
         }
         Ok(true)
+    }
+
+    /// The lazily-opened read-only handle [`Self::read_tensor_bytes_into`] reads through, or
+    /// `None` for an owned backing that has no file. A caller reading a tensor itself — in
+    /// several pieces at once — takes this one, so a checkpoint removed or replaced under a
+    /// loaded model behaves the same on both routes: a cached descriptor keeps reading the
+    /// inode it opened, and the two routes are then alike rather than differing by threshold.
+    pub fn src_handle(&self) -> Result<Option<&File>> {
+        let Some(path) = self.src_path.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(f) = self.src_file.get() {
+            return Ok(Some(f));
+        }
+        let f = File::open(path).with_context(|| format!("reopening {}", path.display()))?;
+        // Racing initializers are fine: both handles are read-only on the same path, and the
+        // loser is simply dropped.
+        let _ = self.src_file.set(f);
+        Ok(Some(self.src_file.get().expect("src_file just set")))
     }
 
     /// Drop every tensor `keep` rejects and compact the data segment to the

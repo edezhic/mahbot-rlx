@@ -222,6 +222,20 @@ impl Drop for RunGuard {
 /// about one piece rather than the whole weight set. The arena's own path cuts at 64 MiB
 /// (`write_bytes_recording`'s shard math), so a whole-image write is cut here as well. A
 /// write made while a run is on the stack is left to that run's own submissions.
+///
+/// One call per parameter, not one per run of parameters. `queue.write_buffer` copies the
+/// bytes into a fresh staging buffer at a fixed cost of about 5.4 µs plus a byte-rate that
+/// peaks near 5 GB/s (measured over 64 MiB each: 4 KiB / 256 KiB / 1 MiB / 16 MiB pieces
+/// take 6.3 / 60.4 / 217.6 / 3265 µs). The fixed term is under 6 µs, so a piece costs its
+/// own bytes, and coalescing several parameters into one buffer is not the lever it looks
+/// like: on the sound half's writes in a warm `synthesis.typical` call (876 `write_buffer`
+/// calls over its four graphs) a staging buffer filled to [`UPLOAD_PIECE_BYTES`] before
+/// writing measured a 46.3 ms settle against 6.2–12.7 ms for one write per parameter. A
+/// bigger piece is not what cost that — the table above has one as the faster per byte — but
+/// coalescing pays a full host copy of every byte into the staging buffer before the driver
+/// copies it again, and the arm added exactly that. What a call can save here is the number
+/// of *waits*, not the shape of the writes — and [`settle_uploads`] records why that number
+/// does not come down either.
 fn write_upload(queue: &wgpu::Queue, dst: &wgpu::Buffer, offset: u64, data: &[u8]) {
     for (i, piece) in data.chunks(UPLOAD_PIECE_BYTES).enumerate() {
         if RUN_DEPTH.load(Ordering::Relaxed) == 0 {
@@ -274,6 +288,14 @@ fn write_upload(queue: &wgpu::Queue, dst: &wgpu::Buffer, offset: u64, data: &[u8
 /// never completes; and a graph that declares none, which only uploads compile-time
 /// constants. Each leaves at most one piece, the bound [`UPLOAD_PIECE_BYTES`] already keeps,
 /// which the next submission retires.
+///
+/// **Once per graph, not once per call.** Deferring it to the end of a call that builds
+/// several graphs — the sound half's four, at the warm `synthesis.typical` row — was built
+/// and measured: 8–10 ms off the row against **80 MiB more peak**, on both the system and
+/// the graphics column, and quartering the in-flight bound did not move it. What the wait
+/// retires is not only the staging: a graph's buffers go back to the driver only once the
+/// queue has drained, so without the wait the next graph's arena is placed beside the
+/// previous one's. Memory is not a currency for buying speed, so the deferral was not kept.
 pub(crate) fn settle_uploads(dev: &crate::device::WgpuDevice) {
     if RUN_DEPTH.load(Ordering::Relaxed) != 0 {
         return;
