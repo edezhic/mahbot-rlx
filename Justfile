@@ -34,16 +34,7 @@ throttle:
 throttle-warn:
     {{justfile_directory()}}/scripts/check-throttle.sh --warn
 
-# The binding crates: workspace members, addressable by name, selected by no
-# routine or whole-set build, test or lint recipe.
-#
-# The fork's product is a Rust library plus its measurement binaries, and nothing
-# in either reaches a binding, so the whole-set recipes below name the block in
-# `--exclude` instead of selecting it. `--exclude` and never a pruned `members`:
-# `cargo build -p rlx-capi` has to keep resolving. Nothing under
-# `crates/bindings/` is deleted or edited. `check-bindings` (which does build
-# `rlx-bindgen`) and `check-binding-versions` still read it. See
-# `docs/fork-sync.md` §3.
+# The binding crates, kept out of the whole-set recipes — `docs/fork-sync.md` §3.
 bindings_excl := "--exclude rlx-bind --exclude rlx-bindgen --exclude rlx-capi --exclude rlx-ffi --exclude rlx-js --exclude rlx-micro --exclude rlx-model-plugin"
 
 # Build this fork's contour (release) — a bare `cargo build` means the

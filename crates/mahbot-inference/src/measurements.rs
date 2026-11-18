@@ -316,10 +316,7 @@ fn machine() -> String {
 /// The device the graphs ran on, as the backend named it.
 #[must_use]
 fn device() -> String {
-    rlx_wgpu::device::wgpu_device().map_or_else(
-        || "no wgpu adapter".to_string(),
-        |device| format!("{} ({:?})", device.name, device.backend),
-    )
+    rlx_wgpu::device::adapter_label().unwrap_or_else(|| "no wgpu adapter".to_string())
 }
 
 /// `release` or `debug`.

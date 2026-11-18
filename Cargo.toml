@@ -204,14 +204,7 @@ exclude = [
 # reader — none of them is a backend. A bare `cargo build` / `check` / `clippy`
 # covers these crates and no others.
 #
-# The binding block is absent deliberately: the fork's product is a Rust library
-# plus its measurement binaries, and nothing in either reaches a binding. So
-# `rlx-bind`, `rlx-bindgen`, `rlx-capi`, `rlx-ffi`, `rlx-js`, `rlx-micro` and
-# `rlx-model-plugin` stay members and stay addressable by name, but no routine or
-# whole-set build, test or lint recipe selects them. `docs/fork-sync.md` §3
-# records the exception, and the `Justfile`'s `bindings_excl` keeps them out of
-# the whole-set recipes; the `check-bindings` drift check still builds
-# `rlx-bindgen`.
+# The binding block is not in this contour — `docs/fork-sync.md` §3.
 #
 # Trade-off, accepted knowingly: a crate added upstream lands silently OUTSIDE
 # this contour until it is listed here, and a member removed or renamed upstream

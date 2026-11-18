@@ -301,6 +301,11 @@ merge action.
   `tests/cold_read.rs` prices all three orders in one process. A platform whose advice cannot cover
   a group keeps the route it had — the reversed walk, each window asking for itself
   (`loader::covers_a_group`)
+- the Windows adapter request as two sequential attempts, DX12 first and Vulkan only when the first
+  yields no usable device (`device::fallback_backends` owns why sequential rather than a mask;
+  `device::tests` pins the order and the short-circuit). Unlike the rest of this list it is coverage
+  rather than a measured win — the stand's machine runs neither API. The calibration cache key
+  carries the backend (`device::adapter_label`), so two APIs on one machine cannot swap numbers
 
 ## 7. Memory is not a currency for buying speed
 

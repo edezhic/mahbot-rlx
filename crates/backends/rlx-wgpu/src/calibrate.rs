@@ -92,7 +92,7 @@ impl Calibration {
         if !crate::is_available() {
             return Self::defaults("wgpu-unavailable");
         }
-        let name = crate::device::adapter_name().unwrap_or_else(|| "wgpu".into());
+        let name = crate::device::adapter_label().unwrap_or_else(|| "wgpu".into());
         if let Some(cal) = Self::load(&name) {
             return cal;
         }

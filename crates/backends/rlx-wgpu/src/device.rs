@@ -242,22 +242,43 @@ impl WgpuDevice {
 
     #[cfg(not(target_family = "wasm"))]
     fn new_default() -> Option<Self> {
-        Self::new_with_backends(default_backends())
+        // An explicit `WGPU_BACKEND` names one API and is honoured exactly: the
+        // second attempt is for a machine whose preference is missing, not for a
+        // caller who asked for a HAL.
+        if let Some(backends) = wgpu::Backends::from_env() {
+            return Self::new_with_backends(backends);
+        }
+        first_usable(
+            default_backends(),
+            fallback_backends(),
+            Self::new_with_backends,
+        )
     }
 }
 
+/// Ask `first`, then — only where a fallback is given — the fallback, and return
+/// the first attempt that yields something.
+#[cfg(not(target_family = "wasm"))]
+fn first_usable<T>(
+    first: wgpu::Backends,
+    fallback: Option<wgpu::Backends>,
+    mut attempt: impl FnMut(wgpu::Backends) -> Option<T>,
+) -> Option<T> {
+    if let Some(found) = attempt(first) {
+        return Some(found);
+    }
+    let second = fallback?;
+    eprintln!("[rlx-wgpu] no usable {first:?} device; asking {second:?}");
+    attempt(second)
+}
+
+/// The API this platform asks for first.
 #[cfg(not(target_family = "wasm"))]
 fn default_backends() -> wgpu::Backends {
-    if let Some(b) = wgpu::Backends::from_env() {
-        return b;
-    }
     #[cfg(target_os = "windows")]
     {
-        // DX12 only on Windows: no silent Vulkan fallback onto a second GPU API
-        // with its own drivers and numerics. Without a real DX12 GPU wgpu finds
-        // only WARP, which is skipped (see `new_with_backends`), so there is no
-        // wgpu device and callers use the CPU backend. Opt into Vulkan with
-        // WGPU_BACKEND=vulkan or Device::Vulkan.
+        // DX12 first: the preference this fork has always had on Windows, and
+        // nothing here is measured there to justify reversing it.
         wgpu::Backends::DX12
     }
     #[cfg(target_os = "linux")]
@@ -275,6 +296,20 @@ fn default_backends() -> wgpu::Backends {
     {
         wgpu::Backends::all()
     }
+}
+
+/// The second attempt, where a platform has one: Windows asks Vulkan, already
+/// compiled into the binary, so a machine whose DX12 adapter is missing or cannot
+/// produce a device runs instead of reporting no adapter at all.
+///
+/// Sequential, not a `DX12 | VULKAN` mask: a mask builds the Vulkan instance and
+/// loads its driver stack on every Windows machine, including the ones DX12
+/// already serves, and lets wgpu's own ordering pick between them. No other
+/// platform has a second attempt — Linux asks Vulkan alone, and Apple asks Metal
+/// plus MoltenVK in one instance.
+#[cfg(not(target_family = "wasm"))]
+fn fallback_backends() -> Option<wgpu::Backends> {
+    cfg!(target_os = "windows").then_some(wgpu::Backends::VULKAN)
 }
 
 // SAFETY: wgpu's Device + Queue are documented thread-safe.
@@ -392,9 +427,16 @@ pub fn wgpu_device() -> Option<&'static WgpuDevice> {
     WASM_DEVICE.get().and_then(|d| d.as_ref())
 }
 
-/// Adapter name for calibration cache keys.
+/// The adapter's name, unqualified: what a console line or a diagnostic prints.
+/// On-disk caches and record columns take [`adapter_label`] instead.
 pub fn adapter_name() -> Option<String> {
     wgpu_device().map(|d| d.name.clone())
+}
+
+/// The adapter as one label — its name qualified by the backend that reported
+/// it — for record columns and on-disk caches.
+pub fn adapter_label() -> Option<String> {
+    wgpu_device().map(|d| format!("{} ({:?})", d.name, d.backend))
 }
 
 /// The queue paired with the process-global device.
@@ -545,4 +587,48 @@ pub fn coop_f16_16x16_f32_acc_supported() -> bool {
             && p.ab_type == wgpu::CooperativeScalarType::F16
             && p.cr_type == wgpu::CooperativeScalarType::F32
     })
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+
+    /// A first attempt that yields a device ends the request: the second API's
+    /// driver stack is never loaded on a machine the first serves.
+    #[test]
+    fn a_working_first_attempt_ends_the_request() {
+        let mut asked = Vec::new();
+        let found = first_usable(wgpu::Backends::DX12, Some(wgpu::Backends::VULKAN), |b| {
+            asked.push(b);
+            Some(b)
+        });
+        assert_eq!(found, Some(wgpu::Backends::DX12));
+        assert_eq!(asked, [wgpu::Backends::DX12]);
+    }
+
+    /// A first attempt that yields nothing reaches the fallback, after it.
+    #[test]
+    fn a_failed_first_attempt_reaches_the_fallback() {
+        let mut asked = Vec::new();
+        let found = first_usable(wgpu::Backends::DX12, Some(wgpu::Backends::VULKAN), |b| {
+            asked.push(b);
+            (b == wgpu::Backends::VULKAN).then_some(b)
+        });
+        assert_eq!(found, Some(wgpu::Backends::VULKAN));
+        assert_eq!(asked, [wgpu::Backends::DX12, wgpu::Backends::VULKAN]);
+    }
+
+    /// The pair Windows ships, driven through the order it ships with: DX12
+    /// first, Vulkan second.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_asks_dx12_then_vulkan() {
+        let mut asked = Vec::new();
+        let found = first_usable(default_backends(), fallback_backends(), |b| {
+            asked.push(b);
+            (b == wgpu::Backends::VULKAN).then_some(b)
+        });
+        assert_eq!(found, Some(wgpu::Backends::VULKAN));
+        assert_eq!(asked, [wgpu::Backends::DX12, wgpu::Backends::VULKAN]);
+    }
 }
