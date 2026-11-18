@@ -383,6 +383,15 @@ is refused by name before any work. The wake bench is not screened by it: its sw
 groups by `GROUP`, which the variable does not touch. The size and the readings
 behind it live in `crates/mahbot-inference/src/listen.rs`'s `TAIL_GROUP`.
 
+`MAHBOT_DEVICE=<gpu|cpu|auto>` names the device a run compiles for, read before any
+device is probed: `gpu` and `cpu` force the choice, `auto` (or unset) lets the product
+ask for the graphics device first and continue on the processor where it does not come
+up. A forced choice is honoured exactly — a forced `cpu` run never creates the graphics
+device, a forced `gpu` run on a host without one fails by name — and a value that is
+none of the three is refused by name before any work. Either forced choice, and a run
+that fell back, writes no record. The decision, the fallback and the one line that says
+which device ran live in `crates/mahbot-inference/src/device.rs`.
+
 ## 9. Re-pin, do not widen
 
 Numerical results move, because upstream changes arithmetic and a sync changes

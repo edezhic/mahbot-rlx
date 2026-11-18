@@ -173,6 +173,10 @@ impl BenchConfig {
     /// empty list is the benchmark itself: all three phases, all eleven voices,
     /// inside the default wall-clock, resident and swap-growth bounds. The record
     /// only carries that run.
+    ///
+    /// The device is the caller's to add (`crate::device::screening_reasons`): it is
+    /// the one reason an unforced run knows only after a row has compiled, so it cannot
+    /// be read from a configuration.
     pub(crate) fn screened_reasons(&self) -> Vec<&'static str> {
         let mut reasons = Vec::new();
         if !self.phases.is_full() {

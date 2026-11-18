@@ -186,7 +186,9 @@ pub fn exit_code(error: &anyhow::Error) -> i32 {
 /// enrolment that fails its consistency gate; the wall-clock stop; or the
 /// resident-set ceiling. The report is written for every one of those — a stop
 /// or a failure leaves what it measured, and a run whose denominator measured
-/// nothing writes its report and then exits non-zero.
+/// nothing writes its report and then exits non-zero. The device is the one
+/// exception: a switch this host cannot honour is refused before anything is
+/// measured, so there is nothing to report.
 pub fn run() -> Result<()> {
     let started = Instant::now();
     // The one file this mode owns: the record it prepares is the record it writes.
@@ -200,6 +202,12 @@ pub fn run() -> Result<()> {
     // way, but its path is an input: it is known only now.
     measurements::sweep_beside(cfg.report_path());
     let _lock = RunLock::acquire(&cfg.lock)?;
+    // The switch is read after the record, the arguments, the report's temporary and the
+    // run's lock — the order the stand takes — so a run refused on a bad value is refused
+    // as one: a forced choice is latched here, and a value that is not understood refuses
+    // the run by name before anything is measured. The prefix is this binary's own, so the
+    // line sits with the rest of its console.
+    let asked = resolve_device("[wake-word] ")?;
     let deadline = Deadline::new(cfg.timeout_secs);
     // The swap ceiling the stop enforces comes from `cfg`, never from a second
     // read of the environment.
@@ -261,18 +269,32 @@ pub fn run() -> Result<()> {
         cfg.max_rss_mib,
         cfg.lock.display()
     );
-    for reason in cfg.screened_reasons() {
+    // Said before the rows run, so a long measurement is not started under a bound that
+    // cannot write its record. The device is one reason the list can gain late — an
+    // unforced run knows it only after a row has compiled — so it is read again at the
+    // record gate.
+    let early = screening(&cfg, asked);
+    for reason in &early {
         eprintln!("[wake-word] screened: {reason}");
     }
 
-    let measured = measure(&cfg, deadline, ceiling, &progress);
+    // A panic inside a phase is a failed measurement, not a dead process: the report is
+    // written for a failure too, and the reason names the device the run stopped on.
+    let measured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        measure(&cfg, deadline, ceiling, &progress)
+    }))
+    .unwrap_or_else(|payload| Err(crate::device::stopped(payload.as_ref())));
     // A denominator that measured nothing: a rate with no denominator.
     let unmeasured = match &measured {
         Ok(()) => require_measured(&state(&progress), cfg.phases).err(),
         Err(_) => None,
     };
+    // The device is known only now — a row has compiled — so the reasons are read again
+    // here: a fallback screens the run at this gate, whatever the configuration said
+    // before the rows.
+    let screened = screening(&cfg, asked);
     let (status, stop) = classify(
-        &cfg,
+        &screened,
         &measured,
         unmeasured.as_ref(),
         state(&progress).current,
@@ -378,6 +400,12 @@ pub fn run() -> Result<()> {
             )
         })?;
     } else {
+        // A reason the device added after the rows ran was not said before them.
+        for reason in &screened {
+            if !early.contains(reason) {
+                eprintln!("[wake-word] screened: {reason}");
+            }
+        }
         eprintln!("[wake-word] screened run — no record is written");
     }
     Ok(())
@@ -392,21 +420,50 @@ const COMPLETE: &str = "complete";
 /// is the `not measured` token.
 const GPU_UNMEASURED: &str = "the resident set cannot see pages allocated for the GPU";
 
+/// The reasons this run is screened, the device included: an unforced run knows the device
+/// only after a row has compiled, so the list is read again at the record gate.
+fn screening(cfg: &BenchConfig, asked: crate::device::Asked) -> Vec<&'static str> {
+    let mut reasons = cfg.screened_reasons();
+    if let Some(reason) = crate::device::screening_reasons(asked) {
+        reasons.push(reason);
+    }
+    reasons
+}
+
+/// The bench's device, settled: the prefix is this binary's own console prefix, a switch
+/// that is not understood is a bad invocation (the exit code [`exit_code`] gives a
+/// [`config::Refused`]), and a device the host does not have is a failed run. The parsed
+/// switch comes back, so the screening reads the value this run will run on.
+fn resolve_device(prefix: &str) -> Result<crate::device::Asked> {
+    match crate::device::resolve(prefix) {
+        Ok(asked) => Ok(asked),
+        Err(unusable) => {
+            let error = anyhow!("{}", unusable.message());
+            if unusable.refused() {
+                Err(config::Refused::new(error).into())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 /// The one classification that drives the report, the console and the record.
 ///
 /// `complete` is the benchmark itself: all three phases, all eleven voices, inside
-/// the default wall-clock, resident and swap-growth bounds. A run that measured a
-/// candidate — a subset of the phases, a short voice set, or a larger bound — is
-/// `screened` and never writes the record,
+/// the default wall-clock, resident and swap-growth bounds, on the device the record
+/// prices. A run that measured a candidate — a subset of the phases, a short voice set,
+/// a larger bound or another device — is `screened` and never writes the record,
 /// even when it measured everything; anything that stopped is named with the phase
-/// and the reason.
+/// and the reason. The reasons are the caller's, because the device can add one after
+/// the rows have run.
 fn classify(
-    cfg: &BenchConfig,
+    screened: &[&'static str],
     measured: &Result<()>,
     unmeasured: Option<&anyhow::Error>,
     phase: &'static str,
 ) -> (&'static str, Option<(&'static str, String)>) {
-    let benchmark = cfg.screened_reasons().is_empty();
+    let benchmark = screened.is_empty();
     match (&measured, &unmeasured) {
         (Ok(()), None) if benchmark => (COMPLETE, None),
         (Ok(()), None) => ("screened", None),
@@ -1561,7 +1618,10 @@ mod tests {
     #[test]
     fn a_run_that_prices_a_candidate_is_screened() {
         let benchmark = test_config();
-        assert_eq!(classify(&benchmark, &Ok(()), None, "inputs").0, "complete");
+        assert_eq!(
+            classify(&benchmark.screened_reasons(), &Ok(()), None, "inputs").0,
+            "complete"
+        );
 
         let mut subset = test_config();
         subset.phases = config::Phases {
@@ -1570,7 +1630,7 @@ mod tests {
             real_audio: false,
         };
         assert_eq!(
-            classify(&subset, &Ok(()), None, "inputs").0,
+            classify(&subset.screened_reasons(), &Ok(()), None, "inputs").0,
             "screened",
             "a subset of the phases is a candidate point"
         );
@@ -1578,7 +1638,7 @@ mod tests {
         let mut short = test_config();
         short.voices = 3;
         assert_eq!(
-            classify(&short, &Ok(()), None, "inputs").0,
+            classify(&short.screened_reasons(), &Ok(()), None, "inputs").0,
             "screened",
             "a subset of the voices is a screening run"
         );
@@ -1586,13 +1646,18 @@ mod tests {
         let mut raised = test_config();
         raised.timeout_secs = crate::guard::DEFAULT_TIMEOUT_SECS + 1;
         assert_eq!(
-            classify(&raised, &Ok(()), None, "inputs").0,
+            classify(&raised.screened_reasons(), &Ok(()), None, "inputs").0,
             "screened",
             "a run given a larger wall-clock bound produces no recorded measurement"
         );
 
         let error = anyhow!("no denominator");
-        let (status, stop) = classify(&benchmark, &Ok(()), Some(&error), "real audio");
+        let (status, stop) = classify(
+            &benchmark.screened_reasons(),
+            &Ok(()),
+            Some(&error),
+            "real audio",
+        );
         assert_eq!(status, "incomplete");
         assert_eq!(stop.expect("named").0, "real audio");
     }

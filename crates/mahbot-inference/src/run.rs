@@ -142,7 +142,14 @@ pub(crate) fn child(
         std::process::exit(2);
     };
     let heavy = Heavy::child(label);
-    match measure(*index, heavy.bounds()) {
+    // A row that panics is a row that failed: the child's whole job is to report the one
+    // row it measured, so a refusal after the device was chosen is named here — with the
+    // row and the device it stopped on — rather than ending the process at the layer.
+    let measured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        measure(*index, heavy.bounds())
+    }))
+    .unwrap_or_else(|payload| Err(crate::device::stopped(payload.as_ref())));
+    match measured {
         Ok(reading) => println!("{}", reading.line()),
         Err(error) => {
             println!("row {name} failed={error:#}");
@@ -253,11 +260,34 @@ pub(crate) struct Reading {
     pub(crate) cold_ms: f64,
     pub(crate) warm_ms: f64,
     pub(crate) memory: Memory,
+    /// The device the row ran on, stamped where the reading is built
+    /// ([`Reading::new`]): the parent refuses a record for a take that did not price the
+    /// graphics device.
+    pub(crate) device: String,
     /// What the row is, per surface: regions and gain, frames and digest, a score.
     pub(crate) detail: Map<String, Value>,
 }
 
 impl Reading {
+    /// One row's figures, stamped with the device it ran on — the process's own decision,
+    /// read here so no reading can be built without one.
+    pub(crate) fn new(
+        row: &'static str,
+        cold_ms: f64,
+        warm_ms: f64,
+        memory: Memory,
+        detail: Map<String, Value>,
+    ) -> Self {
+        Self {
+            row: row.to_string(),
+            cold_ms,
+            warm_ms,
+            memory,
+            device: crate::device::label().to_string(),
+            detail,
+        }
+    }
+
     /// The one line a child prints and its parent reads back.
     pub(crate) fn line(&self) -> String {
         serde_json::json!({
@@ -269,6 +299,7 @@ impl Reading {
             "resting_gpu_bytes": self.memory.gpu_now,
             "peak_gpu_bytes": self.memory.gpu_peak,
             "memory": Basis::of([self.memory.footprint]).field(),
+            "device": self.device,
             "detail": self.detail,
         })
         .to_string()
@@ -336,6 +367,7 @@ impl Reading {
                 gpu_peak: bytes("peak_gpu_bytes")?,
                 footprint,
             },
+            device: string("device")?.to_string(),
             detail,
         })
     }
@@ -446,6 +478,10 @@ pub(crate) fn record_run(mode: Mode) {
     // clears a killed predecessor's temporary.
     let row_child = std::env::var_os(marker).is_some();
     if row_child {
+        // The child is the row: its device is settled before the sampler's window opens, so
+        // a run forced onto the processor starts no thread that could only watch a device
+        // it will not use.
+        settle_device(label);
         // The GPU peak's window: from the first thing a row's process does until the
         // lifetime maximum is read in `Memory::finish`. The parent measures no row.
         crate::report::sample_gpu();
@@ -491,11 +527,23 @@ pub(crate) fn record_run(mode: Mode) {
     // screening decides whether a record is written, never whether the device is
     // shared, and a run under a raised bound measures exactly like any other.
     let heavy = Heavy::parent(label, bounds);
+    // The device is settled after the record is prepared, the arguments are read and the
+    // run's lock is held — the order the bench takes, so a run refused on any of them still
+    // leaves the temporary swept, and a forced graphics run does not create the device while
+    // another run waits for the lock.
+    let asked = settle_device(label);
     // A run under a raised bound or a route switch is screened: it measures and prints like
     // any other, and the record is what it does not write. Saying so before the rows run is
-    // half of that.
-    let screened = screening_reasons(bounds, tail_arm);
-    if !screened.is_empty() {
+    // half of that; the other half is the device a row actually ran on, read back from its
+    // reading once the rows are in.
+    let mut screened = screening_reasons(bounds, tail_arm);
+    if let Some(reason) = crate::device::screening_reasons(asked) {
+        screened.push(reason);
+    }
+    // One reading of the early list: the rows can add a reason of their own (the device a
+    // row actually ran on), so the write gate consults both.
+    let unscreened = screened.is_empty();
+    if !unscreened {
         refuse_record(label, &screened);
     }
     let readings = walk(label, &rows, marker, heavy.deadline(), bounds, name);
@@ -504,7 +552,18 @@ pub(crate) fn record_run(mode: Mode) {
     if !complete {
         subset_note(label, readings.len(), total);
     }
-    if complete && screened.is_empty() {
+    // The device is one reason a row can add after the parent's early screening: an
+    // unforced run that fell back is the case that reaches here with nothing said yet, so
+    // it is the case that gets the closing statement too.
+    let unpriced = if unscreened {
+        unpriced(&readings)
+    } else {
+        None
+    };
+    if let Some(reason) = unpriced {
+        refuse_record(label, &[reason]);
+    }
+    if complete && unscreened && unpriced.is_none() {
         // The record is the deliverable, so a run that cannot write it has not finished
         // — and this is the one write path of the two row-walking modes.
         let written = compose(&readings)
@@ -514,6 +573,29 @@ pub(crate) fn record_run(mode: Mode) {
             std::process::exit(1);
         }
     }
+}
+
+/// The run's device, settled before any work: a switch that cannot be honoured stops the
+/// run by name, before it measures anything, and a choice that can be honoured comes back
+/// so the screening reads the value this run will actually run on.
+fn settle_device(label: &'static str) -> crate::device::Asked {
+    match crate::device::resolve(&format!("{label}: ")) {
+        Ok(asked) => asked,
+        Err(unusable) => {
+            eprintln!("{label}: {}", unusable.message());
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Why a measured run writes no record because of the device it ran on: the record prices
+/// the graphics device, and an unforced run that fell back did so after the parent had
+/// already decided it was not screened — the rows are where the device is known.
+fn unpriced(readings: &[Reading]) -> Option<&'static str> {
+    let priced = readings
+        .iter()
+        .all(|reading| reading.device == crate::device::PRICED);
+    (!priced).then_some(crate::device::FALLBACK)
 }
 
 /// Say that a run measured a subset of its rows, and that no record is written.
@@ -589,7 +671,9 @@ pub(crate) fn bound_reasons(timeout: u64, max_rss: u64, swap_growth: u64) -> Vec
 /// arm, and a record carries the shipped arrangement's numbers only — a take on the A/B arm
 /// is a take of its own, so the variable being set at all (`tail_arm`, from the same
 /// resolution that validated it) screens the run. The wake bench needs no such rule: its
-/// sweep groups by `GROUP`, which the variable does not touch.
+/// sweep groups by `GROUP`, which the variable does not touch. The device is the other
+/// route switch: the caller's parsed [`crate::device::Asked`] names the forced choice, and
+/// the fallback half is the process's own state — both are added by the caller.
 fn screening_reasons(bounds: Bounds, tail_arm: bool) -> Vec<&'static str> {
     let mut reasons = bound_reasons(
         bounds.timeout_secs,
@@ -662,6 +746,25 @@ mod tests {
         assert_eq!(
             screening_reasons(shipped, true),
             vec!["MAHBOT_TAIL_GROUP selects the encoder-tail A/B arm"]
+        );
+    }
+
+    /// The device is decided inside the rows, after the parent's early screening: a row
+    /// that ran on the processor is not a priced take, so the run writes no record.
+    #[test]
+    fn a_row_that_ran_on_the_processor_is_not_priced() {
+        let reading = |device: &str| Reading {
+            row: "recognition.short".to_string(),
+            cold_ms: 1.0,
+            warm_ms: 1.0,
+            memory: crate::report::Memory::take(),
+            device: device.to_string(),
+            detail: detail([("regions", Value::from(1))]),
+        };
+        assert!(unpriced(&[reading("gpu"), reading("gpu")]).is_none());
+        assert_eq!(
+            unpriced(&[reading("gpu"), reading("cpu")]),
+            Some(crate::device::FALLBACK)
         );
     }
 }

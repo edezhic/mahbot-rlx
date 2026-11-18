@@ -63,6 +63,9 @@ fn run() -> Result<()> {
     let started = std::time::Instant::now();
     let cfg = BenchConfig::from_env(Mode::Build)?;
     let _lock = RunLock::acquire(&cfg.lock)?;
+    // The switch is read after the arguments and the lock, the order the other binaries
+    // take: a forced graphics run does not create the device while another run holds it.
+    super::resolve_device("[wake-word build] ")?;
     // Resolved before the guard: the generation names the manifest that a stopped
     // build records as well as the one a completed build writes.
     let inputs = super::config::pin_inputs(&cfg)?;

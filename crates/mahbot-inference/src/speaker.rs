@@ -398,10 +398,8 @@ pub fn embed(pair: &Arc<Pair>, wav: &Path) -> Result<Vec<f32>> {
         bail!("the recording `{path}` is empty");
     }
     let (mel, frames) = host::mel_24k(&audio);
-    let mut speaker = Compiled::new(
-        rlx_runtime::Device::Gpu,
-        graphs::speaker_encoder(pair.sound.clone(), frames, pair.body.config().d)?,
-    )?;
+    let graph = graphs::speaker_encoder(pair.sound.clone(), frames, pair.body.config().d)?;
+    let mut speaker = Compiled::new(graph)?;
     let mut embed = speaker.run_slices(&[("mel", &mel)]);
     embed
         .drain(..)

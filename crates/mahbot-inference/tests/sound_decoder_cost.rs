@@ -101,6 +101,7 @@ fn pair_or_skip() -> Option<Pair> {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return None;
     }
+    mahbot_inference::device::pin_gpu();
     if let Err(e) = loader::models_dir() {
         eprintln!("skip: {e} — the probe did not run");
         return None;

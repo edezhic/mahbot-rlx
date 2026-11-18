@@ -26,6 +26,7 @@ fn an_unresolvable_weight_fails_and_a_failed_build_leaves_nothing_behind() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    mahbot_inference::device::pin_gpu();
     let Ok(dir) = loader::models_dir() else {
         eprintln!(
             "skipped: the model directory is not installed, so the build's failure paths were \
@@ -60,7 +61,7 @@ fn an_unresolvable_weight_fails_and_a_failed_build_leaves_nothing_behind() {
         !placeholders.is_empty(),
         "the body's packed weights are placeholders the compile has to resolve"
     );
-    let error = match graphs::Compiled::new(rlx_runtime::Device::Gpu, built) {
+    let error = match graphs::Compiled::new(built) {
         Ok(_) => panic!("a graph whose weights are gone compiled anyway"),
         Err(error) => format!("{error:#}"),
     };
@@ -85,8 +86,7 @@ fn an_unresolvable_weight_fails_and_a_failed_build_leaves_nothing_behind() {
     // Nothing of the failed build survives it: the same graph, built again, compiles.
     let again = graphs::body_new_rows_head_chain(pair.body.clone(), 8, 0, false)
         .expect("the body builds again");
-    let compiled = graphs::Compiled::new(rlx_runtime::Device::Gpu, again)
-        .expect("a build after a failed build compiles");
+    let compiled = graphs::Compiled::new(again).expect("a build after a failed build compiles");
     assert!(
         emit::scope_of(placeholders.iter().map(String::as_str)).is_none(),
         "a successful compile left the build's origin record behind"

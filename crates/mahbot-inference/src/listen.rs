@@ -1597,6 +1597,7 @@ mod tests {
         if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
             return;
         }
+        crate::device::pin_gpu();
         // 128 bins — the recognition front's own — at the wake window's frame count.
         let (frames, bins) = (MEL_FRAMES, 128);
         let samples = graphs::MEL_HOP * frames;
@@ -1613,15 +1614,12 @@ mod tests {
         let quiet = tone(0.05, 220.0);
         let loud = tone(0.9, 660.0);
         let mut batched = Compiled::new(
-            rlx_runtime::Device::Gpu,
             graphs::mel_frontend(frames, bins, PAIR).expect("the batched mel front end"),
         )
         .expect("the batched mel compiles");
-        let mut single = Compiled::new(
-            rlx_runtime::Device::Gpu,
-            graphs::mel_frontend(frames, bins, 1).expect("the mel front end"),
-        )
-        .expect("the mel compiles");
+        let mut single =
+            Compiled::new(graphs::mel_frontend(frames, bins, 1).expect("the mel front end"))
+                .expect("the mel compiles");
         let mut audio = quiet.clone();
         audio.extend_from_slice(&loud);
         let two = batched

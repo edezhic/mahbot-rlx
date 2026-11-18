@@ -21,6 +21,7 @@ pub mod bench;
 pub mod ced;
 mod cold;
 pub mod corpus;
+pub mod device;
 pub mod emit;
 mod enrolment;
 pub mod graphs;

@@ -84,7 +84,6 @@ use rlx_flow::{FlowCtx, FlowValue, LayerStage, ModelFlow, StageArtifacts};
 use rlx_ir::hir::HirGraphExt;
 use rlx_ir::op::{Activation, MaskKind};
 use rlx_ir::{DType, HirNodeId, Shape};
-use rlx_runtime::Device;
 
 use crate::emit::{self, LoaderWeights};
 use crate::graphs;
@@ -918,7 +917,7 @@ pub struct Tagger {
 }
 
 impl Tagger {
-    /// Open the tagger at `path` and compile its graph for the wgpu device.
+    /// Open the tagger at `path` and compile its graph for the device this run chose.
     pub fn open(path: &Path) -> Result<Self> {
         let model = Arc::new(Model::open_ced(path)?);
         let config = model
@@ -958,7 +957,7 @@ impl Tagger {
                 .typed_params
                 .push((plan.name.clone(), bytes, DType::F16));
         }
-        let compiled = graphs::compile_encoder(Device::Gpu, built)?;
+        let compiled = graphs::compile_encoder(built)?;
         drop(model);
         Ok(Self {
             config,

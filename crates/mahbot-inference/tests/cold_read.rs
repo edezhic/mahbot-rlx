@@ -103,7 +103,6 @@ use mahbot_inference::loader::{Model, Role};
 use mahbot_inference::readahead;
 use rlx_flow::BuiltModel;
 use rlx_ir::Tick;
-use rlx_runtime::Device;
 
 mod support;
 
@@ -743,7 +742,7 @@ fn upload_take(
     // otherwise leave the take partly warm, and the device's skip counter would not catch it.
     state.ensure(cold, extents, label);
     let t = Tick::now();
-    let compiled = graphs::Compiled::new(Device::Gpu, built).expect("the prefill graph compiles");
+    let compiled = graphs::Compiled::new(built).expect("the prefill graph compiles");
     let compile_ms = Tick::now().elapsed_ns(t) as f64 / 1e6;
     let upload = compiled.upload();
     println!(

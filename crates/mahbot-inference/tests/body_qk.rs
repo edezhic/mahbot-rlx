@@ -24,7 +24,6 @@
 
 use mahbot_inference::graphs;
 use mahbot_inference::loader::{Pair, Role};
-use rlx_runtime::Device;
 use std::sync::Arc;
 
 mod support;
@@ -47,7 +46,7 @@ const VALUE_BAR: f32 = 1e-5;
 fn arm(pair: &Arc<Pair>, fuse: graphs::AttentionFuse) -> Option<Vec<Vec<f32>>> {
     let cfg = pair.body.config().clone();
     let built = support::body_graph(pair, fuse, 1, ROWS, false)?;
-    let mut runner = graphs::Runner::compile(Device::Gpu, built).expect("compile the layer");
+    let mut runner = graphs::Runner::compile(built).expect("compile the layer");
     let input: Vec<f32> = (0..ROWS * cfg.d)
         .map(|i| ((i as f32) * 0.0007).sin())
         .collect();

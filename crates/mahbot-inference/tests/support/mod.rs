@@ -211,6 +211,7 @@ pub fn pair_of(role: Role) -> Option<Arc<Pair>> {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return None;
     }
+    mahbot_inference::device::pin_gpu();
     let dir = match loader::models_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -293,10 +294,7 @@ pub fn frame_arm(
     let _switch = rlx_ir::env::RuntimeOverrides::install(values.clone());
     let g = graphs::tts_code_predictor_frame(pair.sound.clone(), capacity, sampler)
         .expect("build the frame graph");
-    (
-        graphs::Compiled::new(Device::Gpu, g).expect("compile the frame"),
-        values,
-    )
+    (graphs::Compiled::new(g).expect("compile the frame"), values)
 }
 
 /// One run of a compiled frame, in milliseconds, with the arm's own switch values

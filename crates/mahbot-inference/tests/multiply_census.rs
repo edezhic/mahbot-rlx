@@ -40,7 +40,6 @@ use mahbot_inference::graphs;
 use mahbot_inference::loader::Role;
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{Graph, NodeId, Op, Tick};
-use rlx_runtime::Device;
 
 mod support;
 
@@ -503,7 +502,7 @@ fn the_synthesis_loops_per_shape_rate_census_with_models() {
         let _switch = rlx_ir::env::RuntimeOverrides::install(support::FRAME_SWITCHES);
         let body = graphs::body_capacity_chain_planes(pair.body.clone(), CELL_FRAMES)
             .expect("build the plane-cache decode body");
-        let mut body = graphs::Compiled::new(Device::Gpu, body).expect("compile the body");
+        let mut body = graphs::Compiled::new(body).expect("compile the body");
         // The census's planes are zeros, and a fresh arena slot is zero-filled: one
         // zero row per layer is the whole seed, and every row above it reads zero as
         // the old full-plane binding did.

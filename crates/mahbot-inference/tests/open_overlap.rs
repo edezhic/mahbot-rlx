@@ -74,7 +74,7 @@ fn synthesis_serial(pair: &Arc<Pair>) -> (f64, f64) {
     let t = Tick::now();
     let built =
         graphs::tts_code_predictor_frame(pair.sound.clone(), steps + 1, spec).expect("the frame");
-    let frame = Compiled::new(rlx_runtime::Device::Gpu, built).expect("the frame's compile");
+    let frame = Compiled::new(built).expect("the frame's compile");
     let frame_ms = ms(t);
     drop((frame, encoder));
     (vocab_ms, frame_ms)
@@ -94,6 +94,7 @@ fn the_opens_hide_under_the_tagger_and_the_frame() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    mahbot_inference::device::pin_gpu();
     let dir = match loader::models_dir() {
         Ok(dir) => dir,
         Err(error) => {

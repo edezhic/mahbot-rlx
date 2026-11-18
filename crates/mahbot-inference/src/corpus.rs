@@ -123,13 +123,13 @@ fn measure(index: usize, bounds: Bounds) -> Result<Reading> {
     if cold.regions != warm.regions {
         eprintln!("transcription-corpus: {name}: the cold and warm calls differ (regions)");
     }
-    Ok(Reading {
-        row: name.to_string(),
+    Ok(Reading::new(
+        name,
         cold_ms,
         warm_ms,
-        memory: memory.finish(),
-        detail: run::detail([("audio_s", json!(warm.duration_s()))]),
-    })
+        memory.finish(),
+        run::detail([("audio_s", json!(warm.duration_s()))]),
+    ))
 }
 
 /// One recording's figures: its length in seconds, as its row carried it, and the
@@ -203,13 +203,13 @@ mod tests {
     use super::*;
 
     fn reading(audio_s: f64, memory: report::Memory) -> Reading {
-        Reading {
-            row: files()[0].0.to_string(),
-            cold_ms: 20_000.0,
-            warm_ms: 12_720.0,
+        Reading::new(
+            files()[0].0,
+            20_000.0,
+            12_720.0,
             memory,
-            detail: run::detail([("audio_s", json!(audio_s))]),
-        }
+            run::detail([("audio_s", json!(audio_s))]),
+        )
     }
 
     /// The record's table names the recording, its length, its time per audio

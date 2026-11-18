@@ -48,7 +48,6 @@ use mahbot_inference::graphs::{self, DAC_WINDOW, FRONT_WINDOW};
 use mahbot_inference::loader::{Pair, Role};
 use mahbot_inference::stand;
 use mahbot_inference::tokenizer::Decoder;
-use rlx_runtime::Device;
 
 mod support;
 
@@ -115,7 +114,6 @@ fn at_floor<T>(floor: usize, body: impl FnOnce() -> T) -> T {
 /// The recognition conv front at `frames`.
 fn asr_front(pair: &Arc<Pair>, frames: usize) -> graphs::Compiled {
     graphs::Compiled::new(
-        Device::Gpu,
         graphs::asr_encoder_front(pair.sound.clone(), frames).expect("the conv front"),
     )
     .expect("the conv front compiles")
@@ -300,7 +298,6 @@ fn what_the_lower_floor_admits_outside_the_front() {
     for frames in [16usize, 32, 64, 99, 128] {
         paired(&format!("speaker frames={frames}"), QUIET_ROUNDS, || {
             graphs::Compiled::new(
-                Device::Gpu,
                 graphs::speaker_encoder(pair.sound.clone(), frames, out)
                     .expect("the speaker encoder"),
             )

@@ -154,6 +154,7 @@ fn the_predictor_frame_its_chain_and_the_stacks_ratio() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    mahbot_inference::device::pin_gpu();
     let dir = match loader::models_dir() {
         Ok(dir) => dir,
         Err(e) => {

@@ -318,12 +318,12 @@ fn recognition(
             row.name
         );
     }
-    Ok(Reading {
-        row: row.name.to_string(),
+    Ok(Reading::new(
+        row.name,
         cold_ms,
         warm_ms,
-        memory: memory.finish(),
-        detail: run::detail([
+        memory.finish(),
+        run::detail([
             ("regions", json!(warm.regions.len())),
             ("samples", json!(warm.samples)),
             ("gain", json!(warm.gain)),
@@ -331,7 +331,7 @@ fn recognition(
             ("witness", json!(witness)),
             ("equal", json!(equal)),
         ]),
-    })
+    ))
 }
 
 /// SHA-256 over the call's answer: each region's bounds, its read flag and its
@@ -392,12 +392,12 @@ fn synthesis(row: &Row, text: &str, witness: u64, witness_samples: usize) -> Res
             warm.len(),
         );
     }
-    Ok(Reading {
-        row: row.name.to_string(),
+    Ok(Reading::new(
+        row.name,
         cold_ms,
         warm_ms,
-        memory: memory.finish(),
-        detail: run::detail([
+        memory.finish(),
+        run::detail([
             (
                 "frames",
                 json!(warm.len() / crate::graphs::samples_per_frame()),
@@ -407,7 +407,7 @@ fn synthesis(row: &Row, text: &str, witness: u64, witness_samples: usize) -> Res
             ("witness", json!(format!("{witness:016x}"))),
             ("equal", json!(equal)),
         ]),
-    })
+    ))
 }
 
 /// One listening session on the product's own loop (`bench::detect`) — the gate, the
@@ -493,18 +493,18 @@ fn listening(
             row.name, warm, witness,
         );
     }
-    Ok(Reading {
-        row: row.name.to_string(),
+    Ok(Reading::new(
+        row.name,
         cold_ms,
         warm_ms,
-        memory: memory.finish(),
-        detail: run::detail([
+        memory.finish(),
+        run::detail([
             ("seconds", json!(STREAM_SECONDS)),
             ("session", json!(warm.to_string())),
             ("witness", json!(witness.to_string())),
             ("equal", json!(equal)),
         ]),
-    })
+    ))
 }
 
 /// One listening session: the product's detection stream over the row's audio, at the
@@ -644,13 +644,13 @@ mod tests {
     use super::*;
 
     fn reading(row: &'static Row, memory: report::Memory) -> Reading {
-        Reading {
-            row: row.name.to_string(),
-            cold_ms: 2_000.0,
-            warm_ms: 1_000.0,
+        Reading::new(
+            row.name,
+            2_000.0,
+            1_000.0,
             memory,
-            detail: run::detail([("regions", json!(3))]),
-        }
+            run::detail([("regions", json!(3))]),
+        )
     }
 
     /// A row's label states the magnitude its surface names — the cut in seconds, the
@@ -725,19 +725,19 @@ mod tests {
 
     #[test]
     fn a_reading_round_trips() {
-        let printed = Reading {
-            row: "synthesis.typical".to_string(),
-            cold_ms: 12_345.6,
-            warm_ms: 6_789.0,
-            memory: report::Memory {
+        let printed = Reading::new(
+            "synthesis.typical",
+            12_345.6,
+            6_789.0,
+            report::Memory {
                 now: Some(2 << 30),
                 peak: Some(3 << 30),
                 gpu_now: Some(1 << 30),
                 gpu_peak: Some(1_536 << 20),
                 footprint: true,
             },
-            detail: run::detail([("frames", json!(330)), ("digest", json!("deadbeef"))]),
-        };
+            run::detail([("frames", json!(330)), ("digest", json!("deadbeef"))]),
+        );
         let parsed =
             Reading::parse(&format!("setup line\n{}\n", printed.line())).expect("a reading");
         assert_eq!(parsed.row, printed.row);
@@ -748,6 +748,7 @@ mod tests {
         assert_eq!(parsed.memory.gpu_now, printed.memory.gpu_now);
         assert_eq!(parsed.memory.gpu_peak, printed.memory.gpu_peak);
         assert!(parsed.memory.footprint);
+        assert_eq!(parsed.device, printed.device);
         assert_eq!(parsed.detail, printed.detail);
     }
 

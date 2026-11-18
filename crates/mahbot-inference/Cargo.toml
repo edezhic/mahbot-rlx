@@ -56,8 +56,11 @@ memmap2 = "0.9"
 rlx-ir = { workspace = true }
 # Block assembly line: `ModelFlow` / `FlowCtx` / `WeightSource` — the graphs are built on it.
 rlx-flow = { workspace = true }
-# `gpu` pulls in the wgpu backend.
-rlx-runtime = { workspace = true, features = ["gpu"] }
+# `gpu` pulls in the wgpu backend; `cpu` is named here rather than inherited from the
+# runtime's default feature set, because it is the path a run continues on when no usable
+# graphics device can be obtained (`src/device.rs`) — a build that lost it would lose the
+# fallback silently.
+rlx-runtime = { workspace = true, features = ["gpu", "cpu"] }
 # The wgpu backend itself: the device and adapter name, the shared weight pool's
 # scope and release, and the f16 cooperative-matmul admission the loader asks.
 rlx-wgpu = { workspace = true }

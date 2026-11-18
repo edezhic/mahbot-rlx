@@ -439,8 +439,7 @@ fn pass_cost(pair: &Pair, capacity: usize, rows: usize) -> Result<Pass, String> 
     let built = graphs::body_capacity_chain_planes_rows(pair.body.clone(), capacity, rows)
         .map_err(|e| format!("build: {e:#}"))?;
     let t = report::Stopwatch::start();
-    let mut compiled =
-        graphs::Compiled::new(Device::Gpu, built).map_err(|e| format!("compile: {e:#}"))?;
+    let mut compiled = graphs::Compiled::new(built).map_err(|e| format!("compile: {e:#}"))?;
     let build_ms = t.ms();
     let names = compiled
         .runner
@@ -531,6 +530,7 @@ fn prompt_text_ids() -> Vec<usize> {
 }
 
 fn pair(role: Role) -> Option<Arc<Pair>> {
+    mahbot_inference::device::pin_gpu();
     match Pair::of_role(role) {
         Ok(p) => Some(Arc::new(p)),
         Err(e) => {
@@ -946,8 +946,7 @@ fn parity(pair: &Pair, capacity: usize) -> Result<(f32, f32, usize), String> {
     let planes = ramp(capacity + 1);
     let built = graphs::body_capacity_chain_planes(pair.body.clone(), capacity)
         .map_err(|e| format!("build: {e:#}"))?;
-    let mut one =
-        graphs::Compiled::new(Device::Gpu, built).map_err(|e| format!("compile: {e:#}"))?;
+    let mut one = graphs::Compiled::new(built).map_err(|e| format!("compile: {e:#}"))?;
     one.runner
         .resident_cache_planes(
             cfg.layers,
@@ -976,8 +975,7 @@ fn parity(pair: &Pair, capacity: usize) -> Result<(f32, f32, usize), String> {
     let planes = ramp(capacity);
     let built = graphs::body_capacity_chain_planes_rows(pair.body.clone(), capacity, 2)
         .map_err(|e| format!("build: {e:#}"))?;
-    let mut two =
-        graphs::Compiled::new(Device::Gpu, built).map_err(|e| format!("compile: {e:#}"))?;
+    let mut two = graphs::Compiled::new(built).map_err(|e| format!("compile: {e:#}"))?;
     two.runner
         .resident_cache_planes(cfg.layers, capacity, capacity, hkv, &planes.0, &planes.1)
         .map_err(|e| format!("the device refused the resident planes: {e:#}"))?;
@@ -1044,8 +1042,7 @@ fn cost_vocab(pair: &Pair) -> usize {
 fn weights_cost(pair: &Pair, rows: usize) -> Result<f64, String> {
     let built = graphs::body_new_rows_head_chain(pair.body.clone(), rows, 0, true)
         .map_err(|e| format!("build: {e:#}"))?;
-    let mut compiled =
-        graphs::Compiled::new(Device::Gpu, built).map_err(|e| format!("compile: {e:#}"))?;
+    let mut compiled = graphs::Compiled::new(built).map_err(|e| format!("compile: {e:#}"))?;
     let cfg = pair.body.config();
     let (cos, sin) = host::rope_tables_at(0, rows, cfg.head_dim, cfg.rope_base as f64);
     let inputs = vec![

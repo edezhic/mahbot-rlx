@@ -23,7 +23,6 @@ use rlx_flow::{BuiltModel, FlowCtx, FlowValue, LayerStage, ModelFlow, StageArtif
 use rlx_ir::hir::HirGraphExt;
 use rlx_ir::op::{Activation, MaskKind, PadMode};
 use rlx_ir::{DType, HirNodeId, Op, Shape};
-use rlx_runtime::{Device, Session};
 
 use crate::emit::{self, LoaderWeights, PairWeights};
 use crate::loader::{Head, Model, Pair};
@@ -656,9 +655,9 @@ pub fn profile() -> rlx_flow::CompileProfile {
     p
 }
 
-/// Compile an encoder-style graph — the tagger's ViT — with the weight-concat
-/// fusions off for the one compile that reads the switch, restoring the
-/// process's previous overrides on return.
+/// Compile an encoder-style graph — the tagger's ViT — for the device this run chose,
+/// with the weight-concat fusions off for the one compile that reads the switch,
+/// restoring the process's previous overrides on return.
 ///
 /// `FuseSharedInputMatMul` builds q/k/v — and gate/up — as ONE `Concat` over
 /// the three weights. That takes the multiply's B out of the `Param` role, and
@@ -673,7 +672,7 @@ pub fn profile() -> rlx_flow::CompileProfile {
 /// then differ in fusion as well as precision. The override map has no atomicity
 /// of its own, so a second compile in the same process would see this one's
 /// install or its restore mid-flight.
-pub fn compile_encoder(device: Device, built: BuiltModel) -> Result<Compiled> {
+pub fn compile_encoder(built: BuiltModel) -> Result<Compiled> {
     static FUSION_SCOPE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // The lock is declared before the override, so the override is restored before
     // the lock is released.
@@ -681,7 +680,7 @@ pub fn compile_encoder(device: Device, built: BuiltModel) -> Result<Compiled> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _fusions = rlx_ir::env::RuntimeOverrides::install([("RLX_NO_WEIGHT_CONCAT_FUSION", "1")]);
-    Compiled::new(device, built)
+    Compiled::new(built)
 }
 
 // ── the body with the attention state carried between windows ──────
@@ -2791,10 +2790,10 @@ impl Drop for DeclaredScope {
 /// fused parameter is bound part by part out of the file's windows, and the parts are claimed
 /// for the weight-sharing scope only once every one of them has landed, whatever order the
 /// walk visits them in: a read that fails part-way leaves the next compile writing every piece
-/// instead of skipping the ones that never landed. No route in this tree reaches the refusal a
-/// backend without a range write answers (every product call site compiles for `Device::Gpu`,
-/// and a body's graphs are fully shaped); it is named at the call site because the alternative
-/// is assembling the joined bytes on the host — the peak this binding exists to remove.
+/// instead of skipping the ones that never landed. A backend that answers the range write with
+/// `false` cannot bind a fused parameter this way, and the refusal is named at the call site
+/// rather than worked around, because the alternative is assembling the joined bytes on the
+/// host: the peak this binding exists to remove.
 enum Write {
     Whole { name: String, dt: DType },
     Part { name: String, at: usize },
@@ -2951,7 +2950,7 @@ impl Upload {
 }
 
 impl Runner {
-    pub fn compile(device: Device, mut built: BuiltModel) -> Result<Self> {
+    pub fn compile(mut built: BuiltModel) -> Result<Self> {
         // The build's records live for this compile and nothing else: the guard restores
         // both however the compile leaves — including a `?` out of the lowering or the
         // upload loop, which would otherwise leave the scope installed and the origin
@@ -2976,9 +2975,12 @@ impl Runner {
             .into_hir()
             .ok_or_else(|| anyhow!("flow built a non-HIR module"))?;
         let graph = rlx_ir::hir_to_graph(hir)?;
-        // The whole `Session::compile`: the fusion pipeline above the backend plus the
-        // backend compile, whose own phases `RLX_WGPU_COMPILE_REPORT` prints separately.
-        let mut session = Session::new(device).compile(graph.clone());
+        // The whole compile: the fusion pipeline above the backend plus the backend
+        // compile, whose own phases `RLX_WGPU_COMPILE_REPORT` prints separately. The
+        // device is the run's (`crate::device`): an unforced run decides at this first
+        // compile, and a graphics path that does not come up continues on the
+        // processor before a single parameter is read.
+        let mut session = crate::device::compile(&graph)?;
         // Upload and release one tensor at a time: the flow hands over the whole
         // weight map at once, but holding all of it while the device receives its
         // own copy would put two checkpoints in the process. So the entry leaves
@@ -3103,10 +3105,11 @@ impl Runner {
                     if !session.set_param_range(name, *at, bytes) {
                         bail!(
                             "the fused projection `{name}` cannot be written in pieces: \
-                             {device:?} refused the range write at byte {at} (no partial \
+                             the {} backend refused the range write at byte {at} (no partial \
                              parameter write on this backend, or no such parameter in the \
                              compiled schedule) — and the joined bytes are not materialised on \
-                             the host to hand over whole"
+                             the host to hand over whole",
+                            crate::device::label()
                         );
                     }
                 }
@@ -3387,9 +3390,10 @@ pub struct Compiled {
 
 impl Compiled {
     /// The build step for one graph: emit was the caller's, this lower it, compiles
-    /// it and uploads its params — the price paid once, before any pass.
-    pub fn new(device: Device, built: BuiltModel) -> Result<Self> {
-        let runner = Runner::compile(device, built)?;
+    /// it and uploads its params — the price paid once, before any pass. The device is
+    /// the run's (`crate::device`), so a compile cannot be asked for another.
+    pub fn new(built: BuiltModel) -> Result<Self> {
+        let runner = Runner::compile(built)?;
         Ok(Self { runner })
     }
 

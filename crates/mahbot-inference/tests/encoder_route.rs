@@ -19,7 +19,6 @@
 use mahbot_inference::graphs;
 use mahbot_inference::listen::{GROUP, MEL_FRAMES, PAIR};
 use mahbot_inference::loader::{Pair, Role};
-use rlx_runtime::Device;
 
 mod support;
 
@@ -35,6 +34,7 @@ fn every_encoder_block_takes_one_wide_projection() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    mahbot_inference::device::pin_gpu();
     let pair = match Pair::of_role(Role::Recognition) {
         Ok(pair) => pair,
         Err(error) => {
@@ -57,7 +57,7 @@ fn every_encoder_block_takes_one_wide_projection() {
     ];
     for (label, build) in cases {
         let built = build(&pair).expect("the encoder builds");
-        let compiled = graphs::Compiled::new(Device::Gpu, built).expect("the encoder compiles");
+        let compiled = graphs::Compiled::new(built).expect("the encoder compiles");
         let names = compiled
             .schedule_step_names()
             .expect("the wgpu backend exposes its schedule");
@@ -85,6 +85,7 @@ fn the_conv_front_keeps_its_panel_route_at_the_pairs_batch() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    mahbot_inference::device::pin_gpu();
     let pair = match Pair::of_role(Role::Recognition) {
         Ok(pair) => pair,
         Err(error) => {
@@ -95,7 +96,7 @@ fn the_conv_front_keeps_its_panel_route_at_the_pairs_batch() {
     let encoder_steps = |batch| {
         let built =
             graphs::asr_encoder(pair.sound.clone(), MEL_FRAMES, batch).expect("the encoder builds");
-        let compiled = graphs::Compiled::new(Device::Gpu, built).expect("the encoder compiles");
+        let compiled = graphs::Compiled::new(built).expect("the encoder compiles");
         let names = compiled
             .schedule_step_names()
             .expect("the wgpu backend exposes its schedule");

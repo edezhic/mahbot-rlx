@@ -27,6 +27,7 @@ use rlx_ir::{DType, Op};
 mod support;
 
 fn pair(role: Role) -> Option<Arc<Pair>> {
+    mahbot_inference::device::pin_gpu();
     let Ok(dir) = loader::models_dir() else {
         eprintln!("skip: the model directory is not installed — the graph shapes need a model");
         return None;
@@ -241,7 +242,6 @@ fn a_predictor_frame_is_one_fence_and_one_submission_per_encode_chunk_with_model
     let (d_talker, _) = pair.sound.code_proj_widths().expect("predictor widths");
     let (top_k, top_p, temperature) = pair.body.sampling();
     let mut frame = graphs::Compiled::new(
-        rlx_runtime::Device::Gpu,
         graphs::tts_code_predictor_frame(
             pair.sound.clone(),
             capacity,
@@ -616,8 +616,7 @@ fn the_prompt_schedule_folds_every_norm_into_its_rope_with_models() {
     let built =
         graphs::body_new_rows_head_chain(pair.body.clone(), LISTEN_PIECE_PROMPT_ROWS, 0, true)
             .expect("build a piece's prompt graph");
-    let compiled =
-        graphs::Compiled::new(rlx_runtime::Device::Gpu, built).expect("compile the prompt body");
+    let compiled = graphs::Compiled::new(built).expect("compile the prompt body");
     let names = compiled
         .schedule_step_names()
         .expect("the wgpu backend reports its schedule");

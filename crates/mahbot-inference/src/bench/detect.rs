@@ -741,6 +741,7 @@ mod tests {
         if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
             return;
         }
+        crate::device::pin_gpu();
         if crate::corpus::dir().is_err() {
             eprintln!("skipped: the pinned corpus is not installed");
             return;

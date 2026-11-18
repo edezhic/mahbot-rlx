@@ -56,6 +56,7 @@ fn synthesis_pair() -> Option<Arc<Pair>> {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return None;
     }
+    mahbot_inference::device::pin_gpu();
     match Pair::of_role(Role::Synthesis) {
         Ok(pair) => Some(Arc::new(pair)),
         Err(error) => {

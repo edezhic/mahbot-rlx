@@ -17,12 +17,12 @@ use std::sync::Arc;
 
 use mahbot_inference::graphs::{self, CACHE_BUCKET};
 use mahbot_inference::loader::{Pair, Role};
-use rlx_runtime::Device;
 
 mod support;
 
 /// A pair, or a printed `skip:` when the installed tree has no models.
 fn pair() -> Option<Arc<Pair>> {
+    mahbot_inference::device::pin_gpu();
     match Pair::of_role(Role::Recognition) {
         Ok(p) => Some(Arc::new(p)),
         Err(e) => {
@@ -59,7 +59,7 @@ fn a_rebuilt_cache_carries_the_live_rows_and_nothing_above_them() {
     let build = |capacity: usize| -> graphs::Compiled {
         let built = graphs::body_capacity_chain_planes(pair.body.clone(), capacity)
             .expect("build the plane-cache decode body");
-        graphs::Compiled::new(Device::Gpu, built).expect("compile the plane-cache body")
+        graphs::Compiled::new(built).expect("compile the plane-cache body")
     };
     let mut from = build(CAPACITY);
     let mask = from

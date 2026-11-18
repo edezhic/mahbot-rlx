@@ -150,6 +150,7 @@ fn the_eight_music_clips_are_labelled_by_their_split_with_models() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    mahbot_inference::device::pin_gpu();
     let open = report::Stopwatch::start();
     let mut tagger = Tagger::open(&models.join(CED_MODEL)).expect("the pinned tagger opens");
     let build_ms = open.ms();

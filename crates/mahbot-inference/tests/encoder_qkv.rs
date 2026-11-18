@@ -59,7 +59,6 @@ use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::stand::WAKE_OFFSET;
 use mahbot_inference::wake::cosine;
 use rlx_ir::{DType, Shape, Tick};
-use rlx_runtime::Device;
 
 mod support;
 
@@ -178,10 +177,7 @@ fn assert_only_the_projections(wide: &Compiled, split: &Compiled, blocks: usize)
 /// The encoder the product builds: `qkv_fused` comes from the weight source itself
 /// ([`graphs::asr_encoder`]), so the shipped arm is that builder and not a copy of it.
 fn shipped(pattern: &Arc<Pair>, frames: usize) -> anyhow::Result<Compiled> {
-    Compiled::new(
-        Device::Gpu,
-        graphs::asr_encoder(pattern.sound.clone(), frames, 1)?,
-    )
+    Compiled::new(graphs::asr_encoder(pattern.sound.clone(), frames, 1)?)
 }
 
 /// The same encoder with `qkv_fused` off — the shape a file whose three projections
@@ -205,7 +201,7 @@ fn three_pass(pattern: &Arc<Pair>, frames: usize) -> anyhow::Result<Compiled> {
             qkv_fused: false,
         })
         .output("tokens");
-    Compiled::new(Device::Gpu, flow.build(&mut weights)?)
+    Compiled::new(flow.build(&mut weights)?)
 }
 
 /// The encoder tail over `batch` windows of `frames`: the batching cell's one weight
@@ -236,7 +232,7 @@ fn three_pass_tail(
             qkv_fused: false,
         })
         .output("tokens");
-    Compiled::new(Device::Gpu, flow.build(&mut weights)?)
+    Compiled::new(flow.build(&mut weights)?)
 }
 
 /// One tail cell: `frames` and `batch` — the product's own graph against the same graph
@@ -248,7 +244,6 @@ fn tail_cell(pair: &Arc<Pair>, frames: usize, batch: usize) {
     let rows = ramped_row(rows_count * flat);
     let (mut wide, mut split) = (
         Compiled::new(
-            Device::Gpu,
             graphs::asr_encoder_tail(pair.sound.clone(), frames, batch).expect("the shipped tail"),
         )
         .expect("compile the shipped tail"),
@@ -326,6 +321,7 @@ fn window_slice() -> Option<Vec<f32>> {
 }
 
 fn pair_of_role() -> Option<Arc<Pair>> {
+    mahbot_inference::device::pin_gpu();
     match Pair::of_role(Role::Recognition) {
         Ok(pair) => Some(Arc::new(pair)),
         Err(e) => {
@@ -345,11 +341,9 @@ fn wake_window() {
     let Some(pair) = pair_of_role() else { return };
 
     let bins = pair.sound.clip().mel_bins;
-    let mut mel = Compiled::new(
-        Device::Gpu,
-        graphs::mel_frontend(MEL_FRAMES, bins, 1).expect("the mel front end"),
-    )
-    .expect("compile the mel front end");
+    let mut mel =
+        Compiled::new(graphs::mel_frontend(MEL_FRAMES, bins, 1).expect("the mel front end"))
+            .expect("compile the mel front end");
     let mel = pass(&mut mel, &[("audio", &audio)]);
 
     let (mut wide, mut split) = (
@@ -374,11 +368,9 @@ fn wake_window() {
     // `Listener::embed` ends on.
     let tokens = graphs::asr_tokens(MEL_FRAMES);
     let dim = pair.sound.clip().projection_dim;
-    let mut projector = Compiled::new(
-        Device::Gpu,
-        graphs::projector_chain(pair.clone(), tokens).expect("the projector"),
-    )
-    .expect("compile the projector");
+    let mut projector =
+        Compiled::new(graphs::projector_chain(pair.clone(), tokens).expect("the projector"))
+            .expect("compile the projector");
     let embedding = |rows: &[f32], projector: &mut Compiled| -> Vec<f32> {
         let projected = pass(projector, &[("features", rows)]);
         l2(&mean_pool(&projected, tokens, dim).expect("the projector's rows pool"))

@@ -44,6 +44,7 @@ fn pair_files(
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return None;
     }
+    mahbot_inference::device::pin_gpu();
     let dir = match loader::models_dir() {
         Ok(dir) => dir,
         Err(error) => {

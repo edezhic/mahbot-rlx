@@ -72,6 +72,7 @@ fn the_packed_multiply_share_of_the_pair_pass() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    mahbot_inference::device::pin_gpu();
     if loader::models_dir().is_err() || mahbot_inference::corpus::dir().is_err() {
         eprintln!(
             "skipped: the model directory or the pinned corpus is not installed — the packed \
@@ -141,6 +142,7 @@ fn the_packed_multiply_share_child() {
     if std::env::var_os("MAHBOT_WAKE_SHARE_CHILD").is_none() {
         return;
     }
+    mahbot_inference::device::pin_gpu();
     let pair =
         std::sync::Arc::new(Pair::of_role(Role::Recognition).expect("the recognition pair opens"));
     let recording =

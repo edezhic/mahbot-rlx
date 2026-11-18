@@ -50,6 +50,7 @@ fn a_pair_pass_against_two_single_window_passes() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
         return;
     }
+    mahbot_inference::device::pin_gpu();
     let Some(recording) = support::recording(mahbot_inference::stand::RECOGNITION_RECORDING) else {
         eprintln!("skipped: the pinned corpus is not installed — the pair pass was not priced");
         return;

@@ -30,8 +30,8 @@ impl Stopwatch {
 /// for parameters an earlier compile already placed, so their bytes are neither read nor
 /// written — the figure that says the skip is still skipping. The backend's phases are the
 /// second line's. Without the switch this is [`crate::graphs::Compiled::new`] with the build
-/// timed. The device is fixed to [`rlx_runtime::Device::Gpu`] rather than passed in: nothing
-/// in this crate compiles for another backend.
+/// timed. The device is the one this run chose ([`crate::device::of`]): the graphics device
+/// unless a forced choice or a fallback put the run on the processor.
 pub(crate) fn compiled(
     kind: &str,
     build: impl FnOnce() -> anyhow::Result<rlx_flow::BuiltModel>,
@@ -40,7 +40,7 @@ pub(crate) fn compiled(
     let built = build()?;
     let build_ms = t.ms();
     let t = Stopwatch::start();
-    let compiled = crate::graphs::Compiled::new(rlx_runtime::Device::Gpu, built)?;
+    let compiled = crate::graphs::Compiled::new(built)?;
     if rlx_wgpu::compile_report::enabled() {
         let compile_ms = t.ms();
         let upload = compiled.upload();
@@ -294,8 +294,14 @@ static GPU_SAMPLER: OnceLock<Sampler> = OnceLock::new();
 /// stand and the corpus measure one row per process — a process measuring two rows
 /// would give the second the first one's window.
 pub(crate) fn sample_gpu() {
-    // Only macOS answers with a split; elsewhere the thread could never sample one.
-    if cfg!(target_os = "macos") {
+    // Only macOS answers with a split; elsewhere the thread could never sample one. A run
+    // that was forced onto the processor never creates the graphics device, so it has no
+    // share to sample and starts no thread — a row's process settles its device before it
+    // calls this (`run::record_run`). An unforced run starts the sampler before its first
+    // compile can decide, so a fallback would leave it watching a device the run stopped
+    // using: [`Memory::finish`] states no GPU figure on a processor run, whatever the
+    // sampler saw.
+    if cfg!(target_os = "macos") && crate::device::of() == rlx_runtime::Device::Gpu {
         GPU_SAMPLER.get_or_init(Sampler::start);
     }
 }
@@ -433,11 +439,25 @@ impl Memory {
         // The sampler is stopped and joined first, so no sample lands after the peak is
         // read; the split from that read is folded in, so the window still reaches the
         // peak's instant. Nothing is observed between the last sample and it — that gap
-        // is what makes this an observed maximum.
+        // is what makes this an observed maximum. The sampler is stopped on both paths: an
+        // unforced run starts it before its first compile can decide, so a fallback's
+        // thread is still running here.
+        let on_cpu = crate::device::of() == rlx_runtime::Device::Cpu;
         let sampled = gpu_peak();
         let vm = vm();
+        let peak = vm.and_then(|vm| vm.peak);
+        // A run that ended on the processor states no GPU figure: the fallback's maximum
+        // would price a device the run does not use.
+        if on_cpu {
+            return Self {
+                peak,
+                gpu_now: None,
+                gpu_peak: None,
+                ..self
+            };
+        }
         Self {
-            peak: vm.and_then(|vm| vm.peak),
+            peak,
             gpu_peak: sampled.max(vm.and_then(|vm| vm.gpu)),
             ..self
         }
