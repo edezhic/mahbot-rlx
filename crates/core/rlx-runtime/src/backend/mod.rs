@@ -449,6 +449,14 @@ pub trait ExecutableGraph: Send {
         false
     }
 
+    /// A parameter's bytes have all landed, whichever route wrote them. A backend that shares
+    /// weight pages across a scope records residency here, so a slot is resident because its
+    /// bytes are in it rather than because a mapping of it was made. It is called for the
+    /// routes a backend cannot see whole — a parameter written in pieces, whose last piece is
+    /// the one that completes it; the whole-value routes are the backend's own, and it marks
+    /// those itself.
+    fn mark_param_written(&mut self, _name: &str) {}
+
     /// Called after all params are uploaded (`set_param` / `set_param_typed`).
     /// Backends may warm caches (e.g. Metal QMatMul weight dequant).
     fn finalize_params(&mut self) {}

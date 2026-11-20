@@ -6,22 +6,29 @@
 //! ceiling. A synthesized clip, a corpus file and a detection chunk check the
 //! deadline, and a clip or a corpus file also checks the cheap process figure, so
 //! a run that is out of time or out of memory stops at the next work item instead
-//! of at the end. The system figures (swap growth and free memory) cost two
-//! subprocesses, so they belong to phase and file boundaries — and to `Watch`,
-//! the guard thread, which is what makes the stop hard: it ends the process at
-//! the deadline even when a single device call is blocked, after running the
-//! caller's own stop action (the bench writes its report there).
+//! of at the end. The system figures (swap growth and the machine's free
+//! memory) cost a system call and a subprocess, so they belong to phase and file
+//! boundaries — and to `Watch`, the guard thread, which is what makes the stop hard: it
+//! ends the process at the deadline even when a single device call is blocked, after
+//! running the caller's own stop action (the bench writes its report there).
+//!
+//! The swap arm reads this process's own swap-ins wherever a host reports them and the
+//! machine's used swap where it does not; [`MAX_SWAP_GROWTH_MIB`] states which host produces
+//! which, and why the per-process figure is the one a ceiling on a run wants.
 //!
 //! The resident-set figure comes from `ps`, so on a platform without it the
-//! process arm reads zero and never trips; the swap and free-memory arms report
-//! their own absence. On the platform this tree runs on, all three read.
+//! process arm reads zero and never trips. The system arms are armed only where the platform
+//! has their figures, and an armed swap arm that cannot read its figure stops the run rather
+//! than passing it: an arm that cannot report its own absence is not an arm, and a take it
+//! silently skipped is a take recorded under a bound nobody applied. The free-memory arm is
+//! best-effort, for the reason [`MemoryCeiling::check_system`] gives. On the platform this tree
+//! runs on, all three read.
 //!
 //! The figures are inputs (`--timeout` / `MAHBOT_TIMEOUT_SECS`,
 //! `--max-rss` / `MAHBOT_MAX_RSS_MIB`); the swap-growth ceiling has
-//! `MAHBOT_STAND_MAX_SWAP_MIB` for a reproduction on a busy machine. The
-//! defaults are stated here so a run without them is still bounded, and a
-//! measurement taken under a larger bound is `screened`: it produces no recorded
-//! measurement.
+//! `MAHBOT_STAND_MAX_SWAP_MIB`. The defaults are stated here so a run without them is
+//! still bounded, and a measurement taken under a larger bound is `screened`: it produces
+//! no recorded measurement.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -51,14 +58,33 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 3_600;
 /// no wall clock.
 pub const DEFAULT_MAX_RSS_MIB: u64 = 6_144;
 
-/// Swap **growth since the run started** above which it stops, unless
+/// Swap growth, in MiB, above which the run stops, unless
 /// `MAHBOT_STAND_MAX_SWAP_MIB` names another ceiling — and a measurement taken
-/// under a raised ceiling is `screened`, so it produces no recorded measurement. GPU
-/// allocations on a unified-memory machine are not visible in the process's
-/// resident set, so this is the figure that catches the pressure a sweep creates:
-/// the run that stopped working held 6.9 GiB of an 8.2 GiB swap file while its own
-/// resident set read under 700 MiB. Growth rather than the absolute figure, because
-/// a machine that has swapped before this run started is not this run's doing.
+/// under a raised ceiling is `screened`, so it produces no recorded measurement.
+///
+/// The figure is this module's `swap_reading`, and which one a host produces is a property of
+/// its kernel:
+///
+/// - **macOS**, a kernel that carries the `TASK_VM_INFO` tail: this process's own swap-ins,
+///   from `ledger_swapins`. A byte count ([`report::swap_in_bytes`] states its width and
+///   unit), so the growth is a difference of bytes and is compared against this ceiling in
+///   bytes.
+/// - **macOS**, an older kernel, and **Linux**: the machine's used swap — `vm.swapusage`
+///   (`used =`) and `/proc/meminfo`'s `SwapTotal: - SwapFree:` respectively — read at the same
+///   two moments, so the growth is the machine's.
+/// - **Anywhere else**: neither, so the arm is not armed at all, since there is no reading to
+///   be missing.
+///
+/// The per-process reading is preferred where it exists because the machine-wide figure moves
+/// for reasons that have nothing to do with the run under measurement: another process's pages
+/// going out to swap read as this run's growth, and another process's pages coming back in
+/// shrink the growth this run appears to have spent. A ceiling on a figure the run did not
+/// spend is not a ceiling on the run, and one a neighbour can lower is worse than that.
+///
+/// The arm is held to the **growth**, not to the absolute reading: a process that swapped
+/// before this run started is not this run's doing, and the difference is what
+/// `MemoryCeiling::spent` states on a row, so the figure a row prints is the figure this
+/// ceiling held it to.
 pub const MAX_SWAP_GROWTH_MIB: u64 = 1_024;
 
 /// The swap-growth ceiling `env` names: [`MAX_SWAP_GROWTH_MIB`] unless
@@ -180,6 +206,11 @@ pub enum Abort {
         ceiling: u64,
         unit: Unit,
     },
+    /// A bound could not be applied because the figure it is held to could not be read.
+    Unreadable {
+        phase: &'static str,
+        detail: &'static str,
+    },
 }
 
 /// The unit a memory figure is in — a byte count or a percentage. The two are
@@ -196,7 +227,9 @@ impl Abort {
     #[must_use]
     pub fn phase(&self) -> &'static str {
         match self {
-            Self::Timeout { phase, .. } | Self::Memory { phase, .. } => phase,
+            Self::Timeout { phase, .. }
+            | Self::Memory { phase, .. }
+            | Self::Unreadable { phase, .. } => phase,
         }
     }
 }
@@ -208,6 +241,11 @@ impl std::fmt::Display for Abort {
                 f,
                 "the `{phase}` phase exceeded the {secs} s wall-clock stop"
             ),
+            Self::Unreadable { phase, detail } => write!(
+                f,
+                "the `{phase}` phase cannot read {detail}, so the bound it is held to cannot be \
+                 applied"
+            ),
             Self::Memory {
                 phase,
                 detail,
@@ -217,8 +255,7 @@ impl std::fmt::Display for Abort {
             } => match unit {
                 Unit::Bytes => write!(
                     f,
-                    "the `{phase}` phase reached {} MiB of {detail}, over the {} MiB ceiling — \
-                     stopping before the machine swaps",
+                    "the `{phase}` phase reached {} MiB of {detail}, over the {} MiB ceiling",
                     reading / (1024 * 1024),
                     ceiling / (1024 * 1024)
                 ),
@@ -291,15 +328,17 @@ pub struct MemoryCeiling {
     /// inputs: the bound the console states and the bound the run is held to are
     /// one figure, not two reads of one variable.
     swap_mib: u64,
-    /// The free-memory floor; `None` leaves that arm inactive. Only the feed
-    /// tests do, because they measure accounting, not a run, and must not fail
-    /// because the host is busy.
-    free_floor: Option<u64>,
-    /// Swap in use when the run started. `None` where the platform reported no
-    /// figure: without a baseline the growth cannot be told from the machine's
-    /// pre-existing swap, so the swap arm stays inactive rather than tripping
-    /// on it.
-    swap_start: Option<u64>,
+    /// The swap figure in use when the run started, with the one it was read from.
+    /// `None` where the platform reported no figure: without a baseline the growth
+    /// cannot be told from the machine's pre-existing swap. An armed ceiling refuses on
+    /// a `None` rather than passing.
+    swap_start: Option<SwapReading>,
+    /// Whether the system arms — swap growth and the free-memory floor — are armed. They are
+    /// served by the same platforms, so one field states both: `false` for a test's
+    /// process-only ceiling, and for a platform with no system readings at all. An arm the
+    /// platform cannot serve is not armed, while an armed arm whose figure then cannot be read
+    /// refuses instead of leaving a take recorded under a bound nobody applied.
+    system: bool,
 }
 
 impl MemoryCeiling {
@@ -307,19 +346,35 @@ impl MemoryCeiling {
     /// bounds itself, so the number the run is held to is the number it read.
     #[must_use]
     pub fn with_swap_growth(mib: u64, swap_mib: u64) -> Self {
-        let swap_start = swap_used_bytes();
-        if swap_start.is_none() {
-            eprintln!(
-                "the platform reported no swap figure — the swap-growth guard is inactive; the \
-                 resident-set ceiling still applies"
-            );
-        }
+        // A platform with no system readings has no floor to hold the run to, and an arm it
+        // cannot serve is not armed rather than refused — there is no reading to be missing.
         Self {
             rss_bytes: mib.saturating_mul(1024 * 1024),
             swap_mib,
-            free_floor: Some(MIN_FREE_PERCENT),
-            swap_start,
+            swap_start: swap_reading(),
+            system: system_figures(),
         }
+    }
+
+    /// What the swap arm has spent since this ceiling took its baseline — the growth
+    /// [`Self::check_system`] compares — and the figure it is a growth of. `None` where the
+    /// platform reported no figure at one of the two reads. A row states this, so the figure a
+    /// row carries is the one its own ceiling held it to.
+    #[must_use]
+    pub(crate) fn spent(&self) -> Option<(u64, SwapFigure)> {
+        let start = self.swap_start?;
+        Some((start.growth_to(swap_reading()?)?, start.figure))
+    }
+
+    /// Said where a run takes its ceiling, on a host whose figures the system arms are held to
+    /// and that does not have them: the run is about to be recorded under bounds nobody applies.
+    /// `None` when both arms are armed.
+    #[must_use]
+    pub fn unarmed(&self) -> Option<&'static str> {
+        (!self.system).then_some(
+            "this platform reports neither swap growth nor free memory — no system bound is \
+             applied to this run",
+        )
     }
 
     /// A ceiling with only the process arm, for a test that exercises a work
@@ -329,8 +384,8 @@ impl MemoryCeiling {
         Self {
             rss_bytes: mib.saturating_mul(1024 * 1024),
             swap_mib: MAX_SWAP_GROWTH_MIB,
-            free_floor: None,
             swap_start: None,
+            system: false,
         }
     }
 
@@ -364,63 +419,175 @@ impl MemoryCeiling {
         Ok(())
     }
 
-    /// Swap in use and free system memory. Two process spawns on macOS, so this
-    /// is a phase / file boundary check, not a per-clip one. The swap-growth
-    /// ceiling is the one the run was constructed with, so a reproduction on a
-    /// busy machine can raise the bound without changing the default.
+    /// The run's swap growth and the machine's free memory. A `task_info` call (or one file
+    /// read) and one process spawn, so this is a phase / file boundary check, not a per-clip
+    /// one. The swap-growth ceiling is the one the run was constructed with, so a reproduction
+    /// under a raised bound does not change the default.
+    ///
+    /// An arm the platform cannot serve at all is not armed ([`MemoryCeiling::with_swap_growth`]);
+    /// an armed swap arm whose figure then cannot be read is [`Abort::Unreadable`], which is a
+    /// stop and not a pass. It is an `Abort` because the guard thread acts on those and only
+    /// those — a plain error would be dropped there, and the stand's rows are stopped by nothing
+    /// else. The free-memory arm is the exception, and stays best-effort: its probe is a
+    /// subprocess that fails most easily under exactly the pressure the arm exists to catch, so
+    /// a failed probe leaves the arm unapplied rather than refusing a run the swap arm still
+    /// holds.
+    ///
+    /// # Errors
+    /// Either figure passing its bound, or an armed swap arm's figure no longer being readable.
     pub fn check_system(&self, phase: &'static str) -> Result<()> {
-        if let Some(start) = self.swap_start
-            && let Some(now) = swap_used_bytes()
-        {
-            let growth = now.saturating_sub(start);
-            let ceiling = self.swap_mib.saturating_mul(1024 * 1024);
-            if growth > ceiling {
-                return Err(anyhow::Error::new(Abort::Memory {
-                    phase,
-                    detail: "swap growth since the run started (override MAHBOT_STAND_MAX_SWAP_MIB)",
-                    reading: growth,
-                    ceiling,
-                    unit: Unit::Bytes,
-                }));
-            }
+        if !self.system {
+            // Neither arm is armed: a platform with neither figure has no bound to hold the
+            // run to, and there is no reading to be missing.
+            return Ok(());
         }
-        if let Some(floor) = self.free_floor
-            && let Some(percent) = free_percent()
-            && percent < floor
+        // Which figure a host reports is a property of its kernel, so the baseline and
+        // this check read the same one. A baseline that was never there is a figure that
+        // could not be read; the reason names no figure it did not measure.
+        let unreadable = || {
+            anyhow::Error::new(Abort::Unreadable {
+                phase,
+                detail: "the swap figure",
+            })
+        };
+        let start = self.swap_start.ok_or_else(unreadable)?;
+        let now = swap_reading().ok_or_else(unreadable)?;
+        self.check_swap(start, now, phase)?;
+        if let Some(percent) = free_percent()
+            && percent < MIN_FREE_PERCENT
         {
             return Err(anyhow::Error::new(Abort::Memory {
                 phase,
                 detail: "pressured system memory (free percentage below the floor)",
                 reading: percent,
-                ceiling: floor,
+                ceiling: MIN_FREE_PERCENT,
                 unit: Unit::Percent,
+            }));
+        }
+        Ok(())
+    }
+
+    /// The swap arm on one pair of readings: the ceiling is in MiB and the reading in bytes, and
+    /// both sides of the comparison are bytes here, because the ledger is a byte count and not a
+    /// page count. Taken as arguments rather than read here so a test can drive it with
+    /// controlled figures — the live one is zero on nearly every row, which exercises nothing.
+    fn check_swap(&self, start: SwapReading, now: SwapReading, phase: &'static str) -> Result<()> {
+        // Both readings must be the same figure: a host whose per-process figure is missing on
+        // one of the two calls falls back to the machine's, and a difference across them would
+        // be the growth of two different quantities — a spurious stop in the adverse direction,
+        // and a masked one in the other. A baseline that names a different one is a figure that
+        // cannot be held to this ceiling, and the reason names none it did not measure.
+        let Some(growth) = start.growth_to(now) else {
+            return Err(anyhow::Error::new(Abort::Unreadable {
+                phase,
+                detail: "one swap figure (the host reported two)",
+            }));
+        };
+        let ceiling = self.swap_mib.saturating_mul(1024 * 1024);
+        if growth > ceiling {
+            return Err(anyhow::Error::new(Abort::Memory {
+                phase,
+                detail: now.figure.name(),
+                reading: growth,
+                ceiling,
+                unit: Unit::Bytes,
             }));
         }
         Ok(())
     }
 }
 
-/// Swap in use, in bytes. `None` where the platform has no reading.
-#[must_use]
-pub fn swap_used_bytes() -> Option<u64> {
+/// Which of the two swap figures a reading came from. They are different figures — this
+/// process's own swap-ins, or the machine's used swap — so a stop reason or a row must name
+/// the one that was measured and never call one the other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwapFigure {
+    /// This process's own swap-ins.
+    Process,
+    /// The machine's used swap.
+    Machine,
+}
+
+impl SwapFigure {
+    /// The figure as a memory stop names it: the quantity the row was held to, and the switch
+    /// that sets that ceiling, so the stop says how to reproduce itself.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Process => {
+                "swap this process faulted back in since the run started \
+                 (MAHBOT_STAND_MAX_SWAP_MIB)"
+            }
+            Self::Machine => {
+                "the machine's used swap above where the run started \
+                 (MAHBOT_STAND_MAX_SWAP_MIB)"
+            }
+        }
+    }
+
+    /// The figure as a row's diagnostics line states it.
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Process => "process",
+            Self::Machine => "machine",
+        }
+    }
+}
+
+/// A swap reading with the figure it came from.
+#[derive(Clone, Copy)]
+struct SwapReading {
+    bytes: u64,
+    figure: SwapFigure,
+}
+
+impl SwapReading {
+    /// The growth from `self` to `now`, when both are the same figure. A difference across
+    /// figures is the growth of two quantities — a spurious stop in the adverse direction and
+    /// a masked one in the other — so it is no reading at all.
+    fn growth_to(self, now: Self) -> Option<u64> {
+        (self.figure == now.figure).then(|| now.bytes.saturating_sub(self.bytes))
+    }
+}
+
+/// The swap figure this host produces, with the name of it: the two are read here.
+/// [`MAX_SWAP_GROWTH_MIB`] states which host produces which, and why the per-process one is
+/// the figure a ceiling on a run wants.
+fn swap_reading() -> Option<SwapReading> {
+    report::swap_in_bytes()
+        .map(|bytes| SwapReading {
+            bytes,
+            figure: SwapFigure::Process,
+        })
+        .or_else(|| {
+            system_swap_used().map(|bytes| SwapReading {
+                bytes,
+                figure: SwapFigure::Machine,
+            })
+        })
+}
+
+/// Whether this platform has the two system readings the arms are held to. An arm a platform
+/// cannot serve is not armed — it is not refused either, because there is no reading to be
+/// missing — and a run on such a host says so on the console where it takes its ceiling
+/// ([`MemoryCeiling::unarmed`]), since no column of a record states it.
+fn system_figures() -> bool {
+    cfg!(any(target_os = "macos", target_os = "linux"))
+}
+
+/// Used swap, in bytes, as the machine reports it. `None` where the platform has no reading;
+/// on macOS [`report::swap_in_bytes`] is this process's own figure and this is the
+/// machine-wide one it falls back to.
+fn system_swap_used() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
+        // Read only where the kernel's `task_info` tail is too old to carry `ledger_swapins`:
+        // the per-process figure is the one a ceiling on this run means.
         let out = std::process::Command::new("sysctl")
             .args(["-n", "vm.swapusage"])
             .output()
             .ok()?;
         let text = String::from_utf8(out.stdout).ok()?;
-        // `total = 8192.00M  used = 6904.94M  free = 1287.06M`
-        let used = text.split("used =").nth(1)?.split_whitespace().next()?;
-        let (number, unit) = used.split_at(used.len().checked_sub(1)?);
-        let value: f64 = number.parse().ok()?;
-        let scale = match unit {
-            "G" => 1024.0 * 1024.0 * 1024.0,
-            "M" => 1024.0 * 1024.0,
-            "K" => 1024.0,
-            _ => 1.0,
-        };
-        Some((value * scale) as u64)
+        used_swap_bytes(&text)
     }
     #[cfg(target_os = "linux")]
     {
@@ -440,6 +607,21 @@ pub fn swap_used_bytes() -> Option<u64> {
     {
         None
     }
+}
+
+/// `used` from `vm.swapusage`'s `total = 6144.00M  used = 4566.06M  free = 1577.94M`, in
+/// bytes. A figure the tool did not state is `None` rather than zero: zero would read as a
+/// machine that is not swapping.
+#[cfg(target_os = "macos")]
+fn used_swap_bytes(text: &str) -> Option<u64> {
+    let rest = text.split("used").nth(1)?.trim_start().strip_prefix('=')?;
+    let megabytes: f64 = rest
+        .split_whitespace()
+        .next()?
+        .trim_end_matches('M')
+        .parse()
+        .ok()?;
+    (megabytes >= 0.0).then_some((megabytes * 1024.0 * 1024.0) as u64)
 }
 
 /// System-wide free memory as a percentage. `None` where the platform has no
@@ -675,6 +857,90 @@ mod tests {
         assert_eq!(abort.phase(), "real audio");
     }
 
+    /// The system arms are armed only where the platform has their figures, and an armed arm
+    /// whose figure cannot be read stops the run as an `Abort` — the only kind of error the
+    /// guard thread acts on, so a plain error there would leave the arm unapplied. An arm a
+    /// platform cannot serve is not armed, so the same ceiling passes there because there is
+    /// nothing to be missing.
+    #[test]
+    fn an_armed_arm_that_cannot_read_its_figure_stops_the_run() {
+        let ceiling = MemoryCeiling::with_swap_growth(DEFAULT_MAX_RSS_MIB, MAX_SWAP_GROWTH_MIB);
+        assert_eq!(
+            ceiling.system,
+            system_figures(),
+            "the system arms are armed exactly where the platform has their figures"
+        );
+        assert_eq!(
+            ceiling.unarmed().is_none(),
+            system_figures(),
+            "the notice that no system bound applies is said exactly where none does"
+        );
+        // No baseline is a figure that could not be read, and it is a stop rather than a pass.
+        let mut unread = ceiling;
+        unread.swap_start = None;
+        if !system_figures() {
+            // Nothing armed, so there is no figure to be missing and nothing to refuse.
+            assert!(unread.check_system("recall").is_ok());
+            return;
+        }
+        let error = unread.check_system("recall").expect_err("refused");
+        match error.downcast::<Abort>() {
+            Ok(Abort::Unreadable { phase, detail }) => {
+                assert_eq!(phase, "recall");
+                assert!(detail.contains("swap"), "{detail}");
+            }
+            Ok(other) => panic!("expected an unreadable figure, got {other:?}"),
+            Err(other) => panic!("expected an unreadable figure, got {other:?}"),
+        }
+    }
+
+    /// Two readings of different figures are not a growth: a host whose per-process figure is
+    /// missing on one of the two calls falls back to the machine's, and subtracting one from the
+    /// other would be a spurious stop of a take or a masked one. The mismatch is refused, and the
+    /// reason names no figure it did not measure.
+    #[test]
+    fn a_baseline_from_another_figure_is_refused() {
+        if !system_figures() {
+            return;
+        }
+        let mut ceiling = MemoryCeiling::with_swap_growth(DEFAULT_MAX_RSS_MIB, MAX_SWAP_GROWTH_MIB);
+        let Some(now) = swap_reading() else {
+            return;
+        };
+        let (other, bytes) = match now.figure {
+            SwapFigure::Process => (SwapFigure::Machine, now.bytes),
+            SwapFigure::Machine => (SwapFigure::Process, now.bytes),
+        };
+        ceiling.swap_start = Some(SwapReading {
+            // A baseline well below this reading, so only the figure can refuse it.
+            bytes: bytes.saturating_sub(2 * ceiling.swap_mib * 1024 * 1024),
+            figure: other,
+        });
+        let error = ceiling.check_system("recall").expect_err("refused");
+        match error.downcast::<Abort>() {
+            Ok(Abort::Unreadable { phase, detail }) => {
+                assert_eq!(phase, "recall");
+                assert!(detail.contains("one swap figure"), "{detail}");
+            }
+            Ok(other) => panic!("expected an unreadable figure, got {other:?}"),
+            Err(other) => panic!("expected an unreadable figure, got {other:?}"),
+        }
+    }
+
+    /// The machine-wide fallback reads the form `sysctl` actually prints, and a figure the
+    /// tool did not state is missing rather than zero.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_swapusage_fallback_reads_what_sysctl_prints() {
+        let printed = "total = 6144.00M  used = 4566.06M  free = 1577.94M  (encrypted)\n";
+        assert_eq!(
+            used_swap_bytes(printed),
+            Some((4566.06_f64 * 1024.0 * 1024.0) as u64)
+        );
+        assert_eq!(used_swap_bytes("total = 0.00M  free = 0.00M"), None);
+        assert_eq!(used_swap_bytes(""), None);
+    }
+
     #[test]
     fn a_zero_or_elapsed_deadline_reports_the_phase() {
         let expired = Deadline::new(0);
@@ -709,11 +975,73 @@ mod tests {
             ));
         }
         // The system figures parse into bytes where the platform has them.
-        if let Some(swap) = swap_used_bytes() {
-            assert!(swap < 64 * 1024 * 1024 * 1024, "{swap} bytes of swap");
+        if let Some(swap) = report::swap_in_bytes() {
+            assert!(swap < 64 * 1024 * 1024 * 1024, "{swap} bytes of swap-ins");
         }
         if let Some(percent) = free_percent() {
             assert!(percent <= 100, "{percent}% free");
+        }
+    }
+
+    /// The swap arm's arithmetic on controlled figures, driven through the comparison the run
+    /// actually makes ([`MemoryCeiling::check_swap`]), because a live figure cannot be
+    /// manufactured and every row's reads zero or a few MiB. The ceiling is in MiB and the
+    /// reading in bytes, so both sides are bytes: 64 KiB of swap-ins is 64 KiB against a 1 MiB
+    /// ceiling — read as a page count and multiplied by the page size, the same growth would
+    /// have been a whole gigabyte — and a growth past 4 GiB is still the byte count it is, where
+    /// a four-byte counter would have wrapped to its low half.
+    #[test]
+    fn the_swap_arm_is_the_growth_that_the_ceiling_is_expressed_in() {
+        let at = |bytes: u64| SwapReading {
+            bytes,
+            figure: SwapFigure::Process,
+        };
+        // A 1 MiB ceiling, so the byte conversion is the ceiling's own.
+        let ceiling = MemoryCeiling::with_swap_growth(0, 1);
+        let check = |start: u64, now: u64| ceiling.check_swap(at(start), at(now), "recall");
+        assert!(
+            check(0, 64 * 1024).is_ok(),
+            "64 KiB is under the 1 MiB ceiling"
+        );
+
+        // One byte over the ceiling: the stop states the growth, not the absolute reading.
+        let start = 1 << 20;
+        let error = check(start, start + 1024 * 1024 + 1).expect_err("over the ceiling");
+        match error.downcast::<Abort>() {
+            Ok(Abort::Memory {
+                reading,
+                ceiling,
+                unit: Unit::Bytes,
+                ..
+            }) => {
+                assert_eq!(reading, 1024 * 1024 + 1);
+                assert_eq!(ceiling, 1024 * 1024, "the MiB bound, in the reading's unit");
+            }
+            Ok(other) => panic!("expected a memory stop, got {other:?}"),
+            Err(other) => panic!("expected a memory stop, got {other:?}"),
+        }
+
+        // Past 4 GiB the figure is still the byte count it is: held to a bound above it, the
+        // arm passes, where a four-byte field would have read its low half.
+        let wide = MemoryCeiling::with_swap_growth(0, 8 * 1024);
+        let past_four_gib = (4 << 30) + 4096;
+        assert!(wide.check_swap(at(0), at(past_four_gib), "recall").is_ok());
+
+        // Two readings of different figures are not a growth at all.
+        let error = ceiling
+            .check_swap(
+                at(0),
+                SwapReading {
+                    bytes: 1 << 30,
+                    figure: SwapFigure::Machine,
+                },
+                "recall",
+            )
+            .expect_err("two figures");
+        match error.downcast::<Abort>() {
+            Ok(Abort::Unreadable { detail, .. }) => assert!(detail.contains("one swap figure")),
+            Ok(other) => panic!("expected an unreadable figure, got {other:?}"),
+            Err(other) => panic!("expected an unreadable figure, got {other:?}"),
         }
     }
 

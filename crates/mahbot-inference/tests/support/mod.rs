@@ -14,6 +14,7 @@ use mahbot_inference::emit::LoaderWeights;
 use mahbot_inference::graphs;
 use mahbot_inference::loader::{self, Pair, Role};
 use mahbot_inference::tokenizer::Decoder;
+use mahbot_inference::transcribe::Transcriber;
 use rlx_flow::{BuiltModel, ModelFlow};
 use rlx_ir::quant::QuantScheme;
 use rlx_ir::{DType, Graph, Op, Shape, Tick};
@@ -204,33 +205,51 @@ pub fn with_env<T>(key: &str, value: &str, body: impl FnOnce() -> T) -> T {
     body()
 }
 
-/// The pair a role reads: files that are not on this machine skip, and a present pair
-/// that will not open fails — a subject that skipped on a broken model would let the
-/// harness's evidence vanish while the run read `ok`.
-pub fn pair_of(role: Role) -> Option<Arc<Pair>> {
-    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
-        return None;
-    }
-    mahbot_inference::device::pin_gpu();
+/// One role's pair files through the model directory, or the reason a check cannot run — a file
+/// that is not on this machine is a skip. `also` names the further files the check needs beside
+/// the pair. This is the processor's reader: it neither asks for an adapter nor pins one, so a
+/// machine with no adapter is exactly a machine it must still run on.
+pub fn pair_paths(
+    role: Role,
+    also: &[&str],
+) -> Option<(std::path::PathBuf, &'static str, &'static str)> {
     let dir = match loader::models_dir() {
         Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("skip: {e:#} — the probe did not run");
+        Err(error) => {
+            eprintln!("skip: {error:#}");
             return None;
         }
     };
     let (body, sound) = loader::pair_files(role).expect("every role is pinned");
-    for name in [body, sound] {
+    for name in [body, sound].into_iter().chain(also.iter().copied()) {
         let path = dir.join(name);
         if !path.is_file() {
             eprintln!("skip: {} is not on this machine", path.display());
             return None;
         }
     }
-    Some(Arc::new(
-        Pair::open(dir.join(body), dir.join(sound))
-            .unwrap_or_else(|e| panic!("{}: {e:#}", dir.display())),
-    ))
+    Some((dir, body, sound))
+}
+
+/// [`pair_paths`] for a check whose subject is the graphics device: it asks for an adapter and
+/// pins the run to it, so an instrument never measures whatever device the run chose.
+pub fn graphics_pair_paths(
+    role: Role,
+    also: &[&str],
+) -> Option<(std::path::PathBuf, &'static str, &'static str)> {
+    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
+        return None;
+    }
+    mahbot_inference::device::pin_gpu();
+    pair_paths(role, also)
+}
+
+/// The pair a role reads: files that are not on this machine skip, and a present pair
+/// that will not open fails — a subject that skipped on a broken model would let the
+/// harness's evidence vanish while the run read `ok`.
+pub fn pair_of(role: Role) -> Option<Arc<Pair>> {
+    let (dir, body, sound) = graphics_pair_paths(role, &[])?;
+    Some(open_pair(&dir, body, sound))
 }
 
 /// Whether the cooperative implicit-GEMM conv route can run on this adapter at all: the
@@ -612,6 +631,37 @@ pub fn recording(name: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     Some(mahbot_inference::corpus::pinned(name).unwrap_or_else(|error| panic!("{error:#}")))
+}
+
+/// One role's pair, opened. A pair that is on this machine and does not open is a failure, not
+/// a skip.
+pub fn open_pair(dir: &std::path::Path, body: &str, sound: &str) -> Arc<Pair> {
+    Arc::new(
+        Pair::open(dir.join(body), dir.join(sound))
+            .unwrap_or_else(|error| panic!("{}: {error:#}", dir.display())),
+    )
+}
+
+/// One audio through the product's own transcription call, as the words the recogniser heard:
+/// the regions' texts joined, which is what the rules read. `rate` is the audio's own sample
+/// rate — a synthesis render is 24 kHz and the pinned recordings are 16 kHz, and passing one as
+/// the other reads the wrong thing.
+pub fn heard(transcriber: &mut Transcriber, name: &str, audio: &[f32], rate: u32) -> String {
+    let out = transcriber
+        .transcribe(audio, rate)
+        .unwrap_or_else(|error| panic!("the read-back of {name}: {error:#}"));
+    println!(
+        "hearing {name}: samples={} seconds={:.2} regions={} read={}",
+        audio.len(),
+        audio.len() as f64 / f64::from(rate),
+        out.regions.len(),
+        out.regions.iter().filter(|region| region.read).count(),
+    );
+    out.regions
+        .iter()
+        .filter_map(|region| region.text.as_deref())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl Call {

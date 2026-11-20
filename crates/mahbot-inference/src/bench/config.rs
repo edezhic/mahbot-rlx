@@ -174,9 +174,9 @@ impl BenchConfig {
     /// inside the default wall-clock, resident and swap-growth bounds. The record
     /// only carries that run.
     ///
-    /// The device is the caller's to add (`crate::device::screening_reasons`): it is
-    /// the one reason an unforced run knows only after a row has compiled, so it cannot
-    /// be read from a configuration.
+    /// The device is the caller's to add, and only after the rows have run: the bench has
+    /// no processor record, so a processor take is screened at the record gate, where the
+    /// device is known — it cannot be read from a configuration.
     pub(crate) fn screened_reasons(&self) -> Vec<&'static str> {
         let mut reasons = Vec::new();
         if !self.phases.is_full() {

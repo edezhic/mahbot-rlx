@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use mahbot_inference::ced::{CED_MODEL, Tagger};
-use mahbot_inference::loader::{self, Pair, Role};
+use mahbot_inference::loader::{Pair, Role};
 use mahbot_inference::synth::{SAMPLE_RATE, Synthesis};
 use mahbot_inference::transcribe::{self, Transcriber};
 use mahbot_inference::{host, listen, music, reference, report, stand, tokenizer::Decoder, vad};
@@ -33,57 +33,13 @@ mod support;
 /// The seed the round trip renders `support::TTS_TEXT` with.
 const SYNTH_SEED: u64 = 12_345;
 
-/// One role's pair files through the model directory, or the reason this check
-/// cannot happen: a model that is absent is a skip; one that is present and does
-/// not open is a failure, the same in every check here. `also` names the further
-/// files the check needs beside the pair.
-fn pair_files(
-    role: Role,
-    also: &[&str],
-) -> Option<(std::path::PathBuf, &'static str, &'static str)> {
-    if rlx_ir::env::skip_unless_device("wgpu", true, rlx_wgpu::is_available()) {
-        return None;
-    }
-    mahbot_inference::device::pin_gpu();
-    let dir = match loader::models_dir() {
-        Ok(dir) => dir,
-        Err(error) => {
-            println!("skip: {error:#}");
-            return None;
-        }
-    };
-    let (body, sound) = loader::pair_files(role).expect("every role is pinned");
-    for name in [body, sound].into_iter().chain(also.iter().copied()) {
-        let path = dir.join(name);
-        if !path.is_file() {
-            println!("skip: {} is not on this machine", path.display());
-            return None;
-        }
-    }
-    Some((dir, body, sound))
-}
-
-/// One role's pair, opened.
-fn pair(role: Role) -> Option<Arc<Pair>> {
-    let (dir, body, sound) = pair_files(role, &[])?;
-    Some(open_pair(&dir, body, sound))
-}
-
 /// The recognition pair and the tagger the transcription checks need.
 fn open() -> Option<(Arc<Pair>, Tagger)> {
-    let (dir, body, sound) = pair_files(Role::Recognition, &[CED_MODEL])?;
-    let pair = open_pair(&dir, body, sound);
+    let (dir, body, sound) = support::graphics_pair_paths(Role::Recognition, &[CED_MODEL])?;
+    let pair = support::open_pair(&dir, body, sound);
     let tagger = Tagger::open(&dir.join(CED_MODEL))
         .unwrap_or_else(|error| panic!("{}: {error:#}", dir.join(CED_MODEL).display()));
     Some((pair, tagger))
-}
-
-/// A pair that is on this machine and does not open is a failure, not a skip.
-fn open_pair(dir: &std::path::Path, body: &str, sound: &str) -> Arc<Pair> {
-    Arc::new(
-        Pair::open(dir.join(body), dir.join(sound))
-            .unwrap_or_else(|error| panic!("{}: {error:#}", dir.display())),
-    )
 }
 
 /// **Instrumental music yields no transcribed text.** The music pool's split is
@@ -276,7 +232,7 @@ fn a_paste_onset_lands_within_one_detector_hop() {
 #[ignore = "needs the models and the pinned corpus; run by hand"]
 fn the_pinned_clip_reads_as_its_witness() {
     support::assert_tail_group_shipped();
-    let Some(asr) = pair(Role::Recognition) else {
+    let Some(asr) = support::pair_of(Role::Recognition) else {
         return;
     };
     let Some(clip) = support::recording(reference::LISTEN_CLIP) else {
@@ -434,26 +390,6 @@ fn worst_repeat(text: &str, recording: &str) -> Option<(String, usize, usize)> {
         .max_by_key(|&(_, heard, spoken)| heard.saturating_sub(spoken))
 }
 
-/// One audio through the product's own transcription call, as the words the recogniser
-/// heard: the regions' texts joined, which is what the rules read.
-fn heard(transcriber: &mut Transcriber, name: &str, audio: &[f32]) -> String {
-    let out = transcriber
-        .transcribe(audio, SAMPLE_RATE)
-        .unwrap_or_else(|error| panic!("the read-back of {name}: {error:#}"));
-    println!(
-        "hearing {name}: samples={} seconds={:.2} regions={} read={}",
-        audio.len(),
-        audio.len() as f64 / f64::from(SAMPLE_RATE),
-        out.regions.len(),
-        out.regions.iter().filter(|region| region.read).count(),
-    );
-    out.regions
-        .iter()
-        .filter_map(|region| region.text.as_deref())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// The render cut at a third: a render that stopped early, the text's ending never
 /// reached.
 fn cut_at_a_third(wave: &[f32]) -> Vec<f32> {
@@ -521,7 +457,7 @@ fn doubled(wave: &[f32]) -> Vec<f32> {
 #[test]
 #[ignore = "needs both model pairs; run by hand"]
 fn the_render_is_heard_through_to_the_texts_end() {
-    let Some(synthesis) = pair(Role::Synthesis) else {
+    let Some(synthesis) = support::pair_of(Role::Synthesis) else {
         return;
     };
     let mut engine = Synthesis::new(synthesis).expect("the synthesis path");
@@ -548,7 +484,7 @@ fn the_render_is_heard_through_to_the_texts_end() {
     };
     let mut transcriber =
         Transcriber::open(asr, tagger, support::ceiling_mib()).expect("the transcriber opens");
-    let hearing = heard(&mut transcriber, "render", &wave);
+    let hearing = support::heard(&mut transcriber, "render", &wave, SAMPLE_RATE);
     assert!(
         reference::check_speak_roundtrip(&hearing, support::TTS_TEXT),
         "the render does not pass the round trip"
@@ -559,7 +495,7 @@ fn the_render_is_heard_through_to_the_texts_end() {
         ("a phrase five times", spliced(&wave)),
         ("the render twice", doubled(&wave)),
     ] {
-        let hearing = heard(&mut transcriber, name, &control);
+        let hearing = support::heard(&mut transcriber, name, &control, SAMPLE_RATE);
         let verdict = reference::round_trip(&hearing, support::TTS_TEXT);
         println!("control {name}: {verdict}");
         println!("  heard: {hearing:?}");

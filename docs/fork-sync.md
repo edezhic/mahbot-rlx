@@ -108,7 +108,7 @@ each member at its *default* features, so a target behind
 `required-features = "backend-tests"` is still skipped — the wgpu integration
 suite among them. `test-gpu` is what builds those, which is why
 `ci-workspace` names it. `test-workspace` names one feature itself —
-`--features mahbot-inference/hand-run` — because that crate's fifteen hand-run
+`--features mahbot-inference/hand-run` — because that crate's sixteen hand-run
 targets were part of the whole-set run before they were gated (its manifest says
 why), and a whole-set run that stopped reaching them would lose coverage without
 saying so.
@@ -341,10 +341,10 @@ measurement.
 
 ## 8. Records are files, and the comparison is paired takes
 
-`STAND.md`, `TRANSCRIPTION-CORPUS.md` and `WAKE-WORD-BENCH.md` at the repo root
-are the only place *record* figures live — no ticket log, no separate note. Each
-is rewritten whole by the one run that can produce it, so history in version
-control *is* the record of every take.
+`STAND.md`, `STAND-CPU.md`, `TRANSCRIPTION-CORPUS.md` and `WAKE-WORD-BENCH.md` at
+the repo root are the only place *record* figures live — no ticket log, no
+separate note. Each is rewritten whole by the one run that can produce it, so
+history in version control *is* the record of every take.
 
 A reading that justifies a code decision has one home too, and it is not here:
 the doc comment of the thing it justifies (`COOP_MIN_WORKGROUPS`,
@@ -392,10 +392,18 @@ behind it live in `crates/mahbot-inference/src/listen.rs`'s `TAIL_GROUP`.
 device is probed: `gpu` and `cpu` force the choice, `auto` (or unset) lets the product
 ask for the graphics device first and continue on the processor where it does not come
 up. A forced choice is honoured exactly — a forced `cpu` run never creates the graphics
-device, a forced `gpu` run on a host without one fails by name — and a value that is
-none of the three is refused by name before any work. Either forced choice, and a run
-that fell back, writes no record. The decision, the fallback and the one line that says
-which device ran live in `crates/mahbot-inference/src/device.rs`.
+device, a forced `gpu` run on a host without one fails by name at the first compile — and
+a value that is none of the three is refused by name before any work. A take writes the
+record of the device it ran on, and only that record: a graphics take writes the graphics
+record, a processor take the stand's processor record (`STAND-CPU.md`), and the corpus and
+wake-word bench have no processor record, so a processor take of either writes nothing — the
+screen states it. A forced take is not the shipped arrangement's, so its `device` line names
+the switch that produced it; the `command` line does too wherever the record's command is
+device-dependent, which is the stand's, while the corpus and wake-word bench recipes are
+fixed.
+
+The decision, the fallback and the one line that says which device ran live in
+`crates/mahbot-inference/src/device.rs`.
 
 ## 9. Re-pin, do not widen
 
@@ -421,7 +429,7 @@ trip must still be intelligible, and the wake path must not get worse.
    and the product checks the stand never runs: `just test-product-checks`, which
    is the only thing that reaches those `#[ignore]`d tests. It is not part of
    either gate: read what it says rather than expecting it green.
-8. Re-take the three records whole at one digest (§8), and compare (§8).
+8. Re-take the records whole at one digest (§8), and compare (§8).
 
 ## License
 

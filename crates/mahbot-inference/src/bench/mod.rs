@@ -60,13 +60,13 @@
 //! shared path every heavy run of this crate takes) so a second launch refuses
 //! instead of competing for the same device. A measurement carries a wall-clock
 //! stop (3 600 s by default) and a memory guard covering the process's resident
-//! set, swap growth since the run started and the system's free-memory percentage;
-//! the corpus build carries the memory guard alone, because it has no wall-clock
-//! bound.
+//! set, swap growth since the run started and the system's free-memory
+//! percentage; the corpus build carries the memory guard alone, because it has no
+//! wall-clock bound.
 //!
 //! The work items check the deadline at every clip read, detection chunk and
 //! corpus file, and the cheap process figure at every clip and corpus file;
-//! the two-subprocess system figures run at phase and file boundaries. A guard
+//! the system figures run at phase and file boundaries. A guard
 //! thread watches the wall clock every second and both figures every five, so a
 //! stop fires even while the measuring thread is inside one blocked device call.
 //! A report is written once, by whichever thread gets there first — a stop or a
@@ -196,22 +196,30 @@ pub fn run() -> Result<()> {
     // a killed predecessor's temporary; a redirect that is not a directory fails here,
     // not after a 25-minute run, and never from inside the write.
     let file = crate::measurements::Record::WakeWordBench;
-    file.prepare()?;
+    // The switch is read here, once, and before the record: a forced processor take writes
+    // nothing — the bench has no processor record — so it only reclaims the file a killed
+    // predecessor may have left, while any other take proves it writable, and only the switch
+    // says which. Reading it first also means a value that is not understood is refused as the
+    // unusable input every other bad argument is, before anything is measured. A *fallback* is
+    // only known after a row compiled, and is screened at the gate below.
+    let asked = resolve_device("[wake-word] ")?;
+    if asked == crate::device::Asked::Cpu {
+        file.reclaim();
+    } else {
+        file.prepare()?;
+    }
     let cfg = BenchConfig::from_env(config::Mode::Measure)?;
     // The report is written through the same whole-file writer and is swept the same
     // way, but its path is an input: it is known only now.
     measurements::sweep_beside(cfg.report_path());
     let _lock = RunLock::acquire(&cfg.lock)?;
-    // The switch is read after the record, the arguments, the report's temporary and the
-    // run's lock — the order the stand takes — so a run refused on a bad value is refused
-    // as one: a forced choice is latched here, and a value that is not understood refuses
-    // the run by name before anything is measured. The prefix is this binary's own, so the
-    // line sits with the rest of its console.
-    let asked = resolve_device("[wake-word] ")?;
     let deadline = Deadline::new(cfg.timeout_secs);
     // The swap ceiling the stop enforces comes from `cfg`, never from a second
     // read of the environment.
     let ceiling = MemoryCeiling::with_swap_growth(cfg.max_rss_mib, cfg.swap_growth_mib);
+    if let Some(note) = ceiling.unarmed() {
+        eprintln!("[wake-word] {note}");
+    }
     let progress = Arc::new(Mutex::new(Progress::default()));
     let report = Arc::new(Report::default());
     let watchdog = match Watch::install(
@@ -269,14 +277,20 @@ pub fn run() -> Result<()> {
         cfg.max_rss_mib,
         cfg.lock.display()
     );
-    // Said before the rows run, so a long measurement is not started under a bound that
-    // cannot write its record. The device is one reason the list can gain late — an
-    // unforced run knows it only after a row has compiled — so it is read again at the
-    // record gate.
-    let early = screening(&cfg, asked);
-    for reason in &early {
+    // Said before the rows run rather than after them, so an operator does not learn hours in
+    // that this run cannot write its record — screening decides the record, not the measuring.
+    // The device's own reason is one rule — this mode has no processor record — and it joins
+    // the list at whichever moment the answer is known: a forced processor take here, a
+    // fallback at the gate below.
+    let mut screened = cfg.screened_reasons();
+    if asked == crate::device::Asked::Cpu {
+        screened.push(crate::run::NO_PROCESSOR_RECORD);
+    }
+    for reason in &screened {
         eprintln!("[wake-word] screened: {reason}");
     }
+    // How many reasons have been said; the gate may add one more below, and it is said then.
+    let said = screened.len();
 
     // A panic inside a phase is a failed measurement, not a dead process: the report is
     // written for a failure too, and the reason names the device the run stopped on.
@@ -289,10 +303,12 @@ pub fn run() -> Result<()> {
         Ok(()) => require_measured(&state(&progress), cfg.phases).err(),
         Err(_) => None,
     };
-    // The device is known only now — a row has compiled — so the reasons are read again
-    // here: a fallback screens the run at this gate, whatever the configuration said
-    // before the rows.
-    let screened = screening(&cfg, asked);
+    // The device is known only now — a row has compiled — so a take the product put on the
+    // processor without being told to writes nothing either, for the same reason. The forced
+    // case was stated before the rows; this is the other half of the one rule.
+    if asked != crate::device::Asked::Cpu && crate::device::of() == rlx_runtime::Device::Cpu {
+        screened.push(crate::run::NO_PROCESSOR_RECORD);
+    }
     let (status, stop) = classify(
         &screened,
         &measured,
@@ -390,6 +406,8 @@ pub fn run() -> Result<()> {
     if status == COMPLETE {
         measurements::write(
             file,
+            crate::device::of(),
+            crate::device::arrival(),
             &record::block(&written),
             &record::record_inputs(&cfg, &written),
         )
@@ -401,10 +419,8 @@ pub fn run() -> Result<()> {
         })?;
     } else {
         // A reason the device added after the rows ran was not said before them.
-        for reason in &screened {
-            if !early.contains(reason) {
-                eprintln!("[wake-word] screened: {reason}");
-            }
+        for reason in &screened[said..] {
+            eprintln!("[wake-word] screened: {reason}");
         }
         eprintln!("[wake-word] screened run — no record is written");
     }
@@ -420,43 +436,24 @@ const COMPLETE: &str = "complete";
 /// is the `not measured` token.
 const GPU_UNMEASURED: &str = "the resident set cannot see pages allocated for the GPU";
 
-/// The reasons this run is screened, the device included: an unforced run knows the device
-/// only after a row has compiled, so the list is read again at the record gate.
-fn screening(cfg: &BenchConfig, asked: crate::device::Asked) -> Vec<&'static str> {
-    let mut reasons = cfg.screened_reasons();
-    if let Some(reason) = crate::device::screening_reasons(asked) {
-        reasons.push(reason);
-    }
-    reasons
-}
-
-/// The bench's device, settled: the prefix is this binary's own console prefix, a switch
+/// The bench's device, settled: the prefix is this binary's own console prefix, and a switch
 /// that is not understood is a bad invocation (the exit code [`exit_code`] gives a
-/// [`config::Refused`]), and a device the host does not have is a failed run. The parsed
-/// switch comes back, so the screening reads the value this run will run on.
+/// [`config::Refused`]). What was asked for comes back, because a forced processor take is a
+/// take that writes nothing — knowable here, before the rows, rather than only at the record
+/// gate where a fallback's device is read from the run itself.
 fn resolve_device(prefix: &str) -> Result<crate::device::Asked> {
-    match crate::device::resolve(prefix) {
-        Ok(asked) => Ok(asked),
-        Err(unusable) => {
-            let error = anyhow!("{}", unusable.message());
-            if unusable.refused() {
-                Err(config::Refused::new(error).into())
-            } else {
-                Err(error)
-            }
-        }
-    }
+    crate::device::resolve(prefix)
+        .map_err(|message| config::Refused::new(anyhow!("{message}")).into())
 }
 
 /// The one classification that drives the report, the console and the record.
 ///
 /// `complete` is the benchmark itself: all three phases, all eleven voices, inside
-/// the default wall-clock, resident and swap-growth bounds, on the device the record
-/// prices. A run that measured a candidate — a subset of the phases, a short voice set,
-/// a larger bound or another device — is `screened` and never writes the record,
-/// even when it measured everything; anything that stopped is named with the phase
-/// and the reason. The reasons are the caller's, because the device can add one after
-/// the rows have run.
+/// the default wall-clock, resident and swap-growth bounds, on the graphics device. A
+/// run that measured a candidate — a subset of the phases, a short voice set, a larger
+/// bound or the processor — is `screened` and never writes the record, even when it
+/// measured everything; anything that stopped is named with the phase and the reason.
+/// The reasons are the caller's, because the device can add one after the rows have run.
 fn classify(
     screened: &[&'static str],
     measured: &Result<()>,
@@ -1649,6 +1646,14 @@ mod tests {
             classify(&raised.screened_reasons(), &Ok(()), None, "inputs").0,
             "screened",
             "a run given a larger wall-clock bound produces no recorded measurement"
+        );
+
+        // The bench has no processor record, so a take that ran on the processor is screened
+        // with that one reason alone: the status is what keeps it from writing a record.
+        assert_eq!(
+            classify(&[crate::run::NO_PROCESSOR_RECORD], &Ok(()), None, "inputs").0,
+            "screened",
+            "a take with no record for its device writes nothing"
         );
 
         let error = anyhow!("no denominator");

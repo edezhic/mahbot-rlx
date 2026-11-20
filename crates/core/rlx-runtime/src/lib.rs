@@ -54,33 +54,53 @@
 /// No-op unless a backend that supports sharing is compiled in. Today: `wgpu`,
 /// which skips re-uploading a parameter whose bytes a previous compile for the same
 /// label already placed in the process-wide shared weight buffer (see
-/// `rlx_wgpu::buffer::set_param_sharing_scope`), and CUDA, which shares one VMM
+/// `rlx_wgpu::buffer::set_param_sharing_scope`), the CPU, whose read-only weights
+/// live on pages shared by the scope's executables (`rlx_cpu::shared_params`,
+/// `RLX_CPU_SHARED_WEIGHTS=0` keeps a copy each), and CUDA, which shares one VMM
 /// region per label but only behind `RLX_CUDA_SHARED_PARAMS=1`.
+///
+/// The label reaches the processor **per thread**, because that is the unit a compile
+/// belongs to: a graph is compiled on the thread that declared the scope, and a process-wide
+/// label let a graph compiled for no model inherit whichever one was set last — see
+/// `rlx_cpu::shared_params`. The graphics and CUDA labels stay process-wide.
 pub fn set_param_sharing_scope(label: &str) {
     #[cfg(feature = "cuda")]
     rlx_cuda::vmem::set_scope_from_label(label);
     #[cfg(feature = "gpu")]
     rlx_wgpu::buffer::set_param_sharing_scope(label);
-    #[cfg(not(any(feature = "cuda", feature = "gpu")))]
+    // Without this the processor keeps a private copy of every weight in each
+    // executable's arena — a prefill and a decode of the same body held the model twice.
+    #[cfg(feature = "cpu")]
+    if cpu_sharing() {
+        rlx_cpu::shared_params::set_scope(Some(label.to_string()));
+    }
+    #[cfg(not(any(feature = "cuda", feature = "gpu", feature = "cpu")))]
     let _ = label;
+}
+
+/// The processor's sharing switch, read the way its registry entry declares it:
+/// `EnvKind::BoolOr { default: true }`, so `0`, `false`, `off` and `no` turn it off and
+/// anything else — including nothing at all — leaves it on.
+#[cfg(feature = "cpu")]
+fn cpu_sharing() -> bool {
+    rlx_ir::env::flag_or("RLX_CPU_SHARED_WEIGHTS", true)
 }
 
 /// `f` with [`set_param_sharing_scope`]`(label)` in force, the scope before
 /// it restored after: for a model that compiles its graphs at different times
 /// (a package's prompt function and decode step), alongside other models
-/// with their own scopes. The scope is process-wide, so compiles on other
-/// threads during `f` see it too.
+/// with their own scopes. The graphics and CUDA labels are process-wide, so
+/// compiles on other threads during `f` see them too; the processor's is this
+/// thread's, so two of these may nest without either seeing the other's.
 pub fn with_param_sharing_scope<R>(label: &str, f: impl FnOnce() -> R) -> R {
-    // CPU: large read-only weights on pages shared by the scope's executables
+    // CPU: read-only weights on pages shared by the scope's executables
     // (`rlx_cpu::shared_params`); `RLX_CPU_SHARED_WEIGHTS=0` keeps a copy each.
     #[cfg(feature = "cpu")]
-    let cpu_before = rlx_ir::env::var_result("RLX_CPU_SHARED_WEIGHTS")
-        .map_or(true, |v| v != "0")
-        .then(|| {
-            let before = rlx_cpu::shared_params::scope();
-            rlx_cpu::shared_params::set_scope(Some(label.to_string()));
-            before
-        });
+    let cpu_before = cpu_sharing().then(|| {
+        let before = rlx_cpu::shared_params::scope();
+        rlx_cpu::shared_params::set_scope(Some(label.to_string()));
+        before
+    });
     // Metal: one copy of each weight across the scope's executables, on
     // unified memory (`rlx_metal::shared_weights`); `RLX_METAL_SHARED_WEIGHTS=0`
     // keeps a copy per executable.

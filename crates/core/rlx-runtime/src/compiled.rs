@@ -1264,6 +1264,19 @@ impl CompiledGraph {
         }
     }
 
+    /// Tell the backend a parameter's bytes have all landed, so a backend that shares weight
+    /// pages records residency from the write rather than from the mapping
+    /// ([`crate::backend::ExecutableGraph::mark_param_written`]).
+    pub fn mark_param_written(&mut self, name: &str) {
+        self.ensure_prepared();
+        if let Some(st) = self.staging.as_mut()
+            && st.prepare_params.contains(name)
+        {
+            st.prepare.mark_param_written(name);
+        }
+        self.inner.mark_param_written(name);
+    }
+
     /// Finish param upload — warms backend caches when supported.
     pub fn finalize_params(&mut self) {
         self.ensure_prepared();

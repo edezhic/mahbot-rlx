@@ -310,9 +310,9 @@ test:
     # compiled here at all. (Linux x86_64 excepted: rlx-collectives' retained
     # upstream dev-dependency row still pulls CUDA / ROCm / XDNA into this run.)
     # `just test-gpu` and the backend recipes below are what build the rest.
-    # `mahbot-inference` gates fifteen more targets this way, behind its own
+    # `mahbot-inference` gates sixteen more targets this way, behind its own
     # `hand-run` feature rather than `backend-tests`: every test in them is
-    # `#[ignore]`d, so ungated this run links and executes fifteen binaries that run
+    # `#[ignore]`d, so ungated this run links and executes sixteen binaries that run
     # nothing. `just test-workspace` and `just lint` enable that feature.
     if [[ "$(uname -s)" == Darwin ]]; then
         # A few parallel test binaries is enough; more contended Apple GPU.
@@ -349,7 +349,7 @@ test:
 # red out of the box is not a gate: a sync reads the red as a regression and
 # chases it.
 #
-# One gated set is reached on purpose: `mahbot-inference`'s fifteen hand-run targets
+# One gated set is reached on purpose: `mahbot-inference`'s sixteen hand-run targets
 # are behind that crate's `hand-run` feature so the routine run does not link
 # binaries that execute nothing, and `--features mahbot-inference/hand-run` below
 # is what keeps this whole-set run's coverage where it was.
@@ -608,7 +608,7 @@ lint: lint-features
     # `backend-tests`: the default test selection is a fast smoke set, and
     # `required-features` hides every gated target from `--all-targets` too —
     # without it they would not be type-checked by `just lint` at all. `hand-run`
-    # is the same for `mahbot-inference`'s fifteen hand-run targets.
+    # is the same for `mahbot-inference`'s sixteen hand-run targets.
     cargo clippy --all-targets --features backend-tests,hand-run -- -D warnings
 
 # Every member but the binding crates (`bindings_excl`), once per upstream sync
@@ -1423,17 +1423,28 @@ lint-mahbot:
     cargo clippy -p mahbot-inference --features bench,hand-run --all-targets -- -D warnings
 
 # The model-gated targets nothing routine reaches: the product checks the stand
-# never runs and the synthesis census whose arms assert the predictor frame's
-# schedule. Every test is `#[ignore]`d, and one whose input is absent prints why
-# and returns, so this is safe on a machine with no installed tree.
+# never runs, their processor counterpart (a target of its own, because the
+# device switch they set is process-global) and the synthesis census whose arms
+# assert the predictor frame's schedule. Every test is `#[ignore]`d, and one whose
+# input is absent prints why and returns, so this is safe on a machine with no
+# installed tree.
 # `--no-fail-fast` because the census must run even when a check is red.
 #
-# Deliberately not in `ci` or `ci-workspace`: neither target can be a gate — both
-# need the installed tree and a wgpu adapter, and a product check is a claim about
-# behaviour, one of them (`a_paste_onset_lands_within_one_detector_hop`) a
-# known-stale expectation the cut policy superseded. A gate that is red by
+# The processor target is its own invocation, one test thread at a time: its checks
+# take the process with `support::solo`, which refuses a second subject rather than
+# serialising it, so libtest's default concurrency would panic before a model was
+# read. The two runs are joined so either failing fails the recipe, and both run.
+#
+# Deliberately not in `ci` or `ci-workspace`: no target here can be a gate — all
+# three need the installed tree (two also a wgpu adapter), and a product check is a
+# claim about behaviour, one of them (`a_paste_onset_lands_within_one_detector_hop`)
+# a known-stale expectation the cut policy superseded. A gate that is red by
 # construction teaches the operator to skip the gate. A sync runs this by hand
 # (`docs/fork-sync.md` §10) and reads what it says.
 test-product-checks:
     cargo test --release -p mahbot-inference --features hand-run --no-fail-fast \
-        --test product_checks --test multiply_census -- --ignored --nocapture
+        --test product_checks --test multiply_census -- --ignored --nocapture; \
+    status=$?; \
+    cargo test --release -p mahbot-inference --features hand-run \
+        --test processor_checks -- --ignored --nocapture --test-threads=1 || status=1; \
+    exit $status

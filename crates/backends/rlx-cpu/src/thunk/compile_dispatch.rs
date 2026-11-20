@@ -536,11 +536,10 @@ pub fn compile_thunks_with_rng(
                     u8::from(graph.node(node.inputs[1]).shape.dtype() == rlx_ir::DType::I64);
                 let table_dtype = graph.node(node.inputs[0]).shape.dtype();
                 let table_bytes = table_dtype.size_bytes() as u8;
-                // Packed only where the slot really is 2 B/elem (a half
-                // param), and only into an f32-wide output.
+                // Packed only where the slot really is 2 B/elem (a half param), and only
+                // into an f32-wide output: one width rule, [`slot_is_widened`]'s.
                 let packed = matches!(table_dtype, rlx_ir::DType::F16 | rlx_ir::DType::BF16)
-                    && arena.has_buffer(node.inputs[0])
-                    && !crate::thunk::ops::half_slot_is_widened(graph, arena, node.inputs[0])
+                    && !crate::thunk::ops::slot_is_widened(graph, arena, node.inputs[0])
                     && !matches!(node.shape.dtype(), rlx_ir::DType::F16 | rlx_ir::DType::BF16);
                 let table_half = match table_dtype {
                     rlx_ir::DType::F16 if packed => 1,
@@ -1631,45 +1630,14 @@ pub fn compile_thunks_with_rng(
                     })
                 }
 
-                Thunk::FusedMmBiasAct {
-                    a,
-                    w,
-                    bias,
-                    c,
-                    m,
-                    k,
-                    n,
-                    act,
-                } => {
-                    let (m, k, n) = (m as usize, k as usize, n as usize);
-                    Arc::new(move |base: *mut u8| unsafe {
-                        let out = sl_mut(c, base, m * n);
-                        let bias_v = sl(bias, base, n);
-                        // Match torch `F.linear` / `addmm(bias, A, W)`: seed C
-                        // with broadcast bias, then accumulate A @ W (β=1).
-                        // Separate sgemm + bias_add differs by ~1 ULP and
-                        // breaks hard abs parity against PyTorch.
-                        for row in 0..m {
-                            out[row * n..(row + 1) * n].copy_from_slice(bias_v);
-                        }
-                        crate::blas::sgemm_accumulate(
-                            sl(a, base, m * k),
-                            sl(w, base, k * n),
-                            out,
-                            m,
-                            k,
-                            n,
-                        );
-                        match act {
-                            Some(Activation::Gelu) => {
-                                apply_activation_inplace(out, Activation::Gelu);
-                            }
-                            Some(other) => apply_activation_inplace(out, other),
-                            None => {}
-                        }
+                // One implementation, the interpreter's: this closure is a second entry
+                // point to it, not a second copy of the operand rules.
+                Thunk::FusedMmBiasAct { .. } => {
+                    let thunk = thunk.clone();
+                    Arc::new(move |base: *mut u8| {
+                        crate::thunk::ops::exec_fused_mm_bias_act(&thunk, base);
                     })
                 }
-
                 Thunk::FusedResidualLN {
                     x,
                     res,
@@ -3169,6 +3137,7 @@ pub fn compile_thunks_with_rng(
                         k,
                         n,
                         act: None,
+                        w_kind: HalfKind::F32,
                         ..
                     } => (*a, *w, *bias, true, *k as usize, *n as usize),
                     Thunk::Sgemm { a, b, k, n, .. } => (*a, *b, 0, false, *k as usize, *n as usize),
@@ -3261,6 +3230,7 @@ pub fn compile_thunks_with_rng(
                         k,
                         n,
                         act: None,
+                        w_kind: HalfKind::F32,
                         ..
                     } => (*w, *bias, *c, *k as usize, *n as usize),
                     Thunk::Sgemm { b: w, c, k, n, .. } => (*w, 0, *c, *k as usize, *n as usize),
@@ -3420,13 +3390,18 @@ pub fn compile_thunks_with_rng(
                         bias,
                         n,
                         act: Some(Activation::Gelu),
+                        w_kind: HalfKind::F32,
                         ..
                     } => (*w, *bias, *n),
                     _ => return None,
                 };
                 let (fc2_w, fc2_b) = match ffn2 {
                     Thunk::FusedMmBiasAct {
-                        w, bias, act: None, ..
+                        w,
+                        bias,
+                        act: None,
+                        w_kind: HalfKind::F32,
+                        ..
                     } => (*w, *bias),
                     _ => return None,
                 };

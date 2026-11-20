@@ -1,6 +1,6 @@
 # The records and what their figures mean
 
-The three records are the files the `measurements` module writes; what each run
+The four records are the files the `measurements` module writes; what each run
 records, and when a run writes nothing, is stated there. This file defines the
 columns and the figures they carry.
 
@@ -22,15 +22,40 @@ length) in place of the two time columns; its memory columns are the same. The w
 record reports `peak resident`, the resident set's high-water mark for the whole
 run.
 
+`STAND-CPU.md` is the same stand taken on the processor: the same seven rows and the
+same columns. Its graphics cells are `not measured` — not zero, and not the system
+figure repeated — because a processor run allocates nothing for the graphics device.
+The two records' figures are device-relative, so a cell in one is not comparable with
+the same cell in the other.
+
+Its memory columns are the **anonymous** footprint, and do not include the model. The
+processor reads its weights from files that are shared between the graphs of one model
+(`rlx-cpu`'s weight pool), so those pages are the file's and clean, and the platform's
+footprint figure — which is what these columns report on either device — does not charge
+them to the process. A processor row's `resting` and `peak` therefore price what the row
+allocated for itself, not what it read: a row can hold 1.3 GB of model and report a few
+hundred MiB. The graphics record's columns include the models, because the graphics
+backend's weights are device allocations. That is a second reason the two are not
+comparable cell by cell.
+
+Because they are anonymous only, they also move with what the kernel chooses to keep:
+re-taking the same tree under a different load has moved a row's `resting system` by a
+hundred MiB and more while the model stayed in the page cache. A cell is read against
+the take's own `load:` line, not against the same cell in another take.
+
 ## The two states, and how they are established
 
 `cold` and `warm` are properties of the machine, not of the process, so the stand
 makes them instead of inheriting them: `src/cold.rs` owns the method, says why it
 is the one that works here, how the state is established over the models root
-rather than over a list of files, how the warm arm is checked around the arm that
-reads it, and what the instrument itself sees fail a row rather than be taken
-wrong. A platform without the method is refused before the run starts rather than
-given a `cold` column that means nothing.
+rather than over a list of files, and what the warm arm is read against. The pages
+the warm arm had to fetch are stated on the row's diagnostics line (`warm_reread`),
+not in the record's table, and `stand` refuses a row whose arm fetched more than
+half the pages the cold arm read: the product rebuilds the graphs it released, so
+some read is part of what `warm` prices, but a column that re-read most of the
+model off the disk is a cold measurement wearing a warm label. A platform without
+the method is refused before the run starts rather than given a `cold` column that
+means nothing.
 
 The lazy engine load is in the cold column, because the cold arm is what opens the
 engine and a daemon pays that once: `warm` is a request on an engine that is up,
@@ -42,6 +67,14 @@ heavy-run lock covers none of them. The record's `load` line is its own evidence
 of what the machine was doing; a take whose row comes back far from the figure the
 product has established, with the product untouched, is a busy machine rather
 than a change, and is discarded and re-taken instead of recorded.
+
+A processor take is the exception that proves why that rule is about the machine
+and not about the numbers: the take *is* the load there, and a long row's two arms
+cannot be separated from it. A processor row whose warm figure comes out slower
+than its cold one is therefore not by itself grounds to discard the take — what
+settles it is the page count the row prints. If `warm_reread` shows the warm arm
+did not pull the model back off the disk, the row is warm and the difference
+between the arms is contention, not a cold measurement wearing a warm label.
 
 ## The two wake rows
 
@@ -144,7 +177,11 @@ statement the record makes about it.
 ## Provenance fields
 
 `_Measured ..._` is the take's timestamp. `machine`, `device`, `profile` and
-`command` state where and how it ran; `load` is the kernel's load average when the
+`command` state where and how it ran — `device` names the adapter, or the processor
+with how it was reached (`MAHBOT_DEVICE=cpu`, or no usable graphics device), and a
+forced take names its switch beside the device on either backend, because a forced
+take is not the shipped arrangement's; `command` is the recipe that produced that
+take; `load` is the kernel's load average when the
 record was written, the three figures being the 1, 5 and 15 minute readings
 (`1m · 5m · 15m`), and two takes are comparable only at the same load; `code` is
 the commit and the digest; `memory` is the basis above; `models` and `corpus` name

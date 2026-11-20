@@ -65,7 +65,7 @@ use anyhow::{Context, Result, bail};
 use rlx_ir::{DType, Dim, Graph, Op};
 use serde_json::{Value, json};
 
-use super::rlxp::{Opened, PackageWeights, params_of};
+use super::rlxp::{Opened, PackageWeights, package_scope, params_of};
 use super::{
     ChatMessage, Model, ModelInfo, ModelRequest, Tensor, TensorSpec, TextCodec, TextEmbedding,
     lm_model, text_embedding_model,
@@ -982,7 +982,7 @@ fn graph_lm(request: &ModelRequest, pkg: &mut Opened, entry: &Value) -> Result<G
         buckets,
         compiled: None,
         resident: false,
-        scope: format!("rlxp:{}", pkg.path.display()),
+        scope: package_scope(&pkg.path),
         cache_fresh: false,
         prefill,
         weights: std::mem::replace(&mut pkg.weights, PackageWeights::empty()),

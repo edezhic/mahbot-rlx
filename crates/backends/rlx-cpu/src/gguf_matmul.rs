@@ -396,12 +396,22 @@ fn prefer_cached_blas(k: usize, n: usize, m: usize, scheme: QuantScheme) -> bool
     if rlx_ir::reproducible::reproducible() {
         return true;
     }
-    // Cache pressure skips the cache for every route whose fused arm leaves the
-    // numerics alone — `m > 1`'s generic GEMM, and every single-row scheme but
-    // Q4_K. There the two routes do the same total dequant work and the fused one
-    // skips the bookkeeping. Q4_K's GEMV keeps the cached route whatever the
-    // budget does: `cache_thrashing()` is monotone process state that never
-    // reverts, and its fused arm would quantize the activation.
+    // A cache that is switched off cannot serve any of this: the "cached" route dequantises
+    // the weight into an f32 slab and hands it to BLAS, and with nothing caching that slab the
+    // slab is thrown away and paid for again on the next call. The fused kernel does the same
+    // dequant work without it. That includes Q4_K's single-row GEMV, whose fused arm quantises
+    // the activation — the precision the exception below preserves is worth a cache hit, not a
+    // fresh 42 MB dequant per step. It is also the route the answer depends on: the cached
+    // route sums in another order, so a cache whose thrash latch trips mid-run makes one call
+    // of a process answer differently from the next (`crate::dequant_cache`).
+    if !crate::dequant_cache::cache_enabled() {
+        return false;
+    }
+    // Cache pressure skips the cache for every route whose fused arm leaves the numerics
+    // alone — `m > 1`'s generic GEMM, and every single-row scheme but Q4_K. There the two
+    // routes do the same total dequant work and the fused one skips the bookkeeping. Q4_K's
+    // GEMV keeps the cached route whatever the budget does: `cache_thrashing()` is monotone
+    // process state that never reverts, and its fused arm would quantize the activation.
     if crate::dequant_cache::cache_thrashing() && (m > 1 || !fused_m1_quantizes_activation(scheme))
     {
         return false;

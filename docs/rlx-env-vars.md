@@ -129,7 +129,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_CPU_EXEC_IN_POOL` | Internal | Bool | Backend(cpu) | Run each CPU schedule on a thread-pool worker, so parallel kernels join by spinning instead of parking the caller |
 | `RLX_CPU_MATMUL_F64_ACCUM` | Public | Bool | Backend(cpu) | Accumulate the CPU matmul K-reduction in f64 (precision/validated mode; default-off, vendor-BLAS fast path untouched) |
 | `RLX_CPU_ROW_TABS` | Internal | U64 | Backend(cpu) | Per-row sum of |x| for one node id |
-| `RLX_CPU_SHARED_WEIGHTS` | Bisect | BoolOr | Backend(cpu) | Share one copy of each large weight across a scope's CPU executables on shared-memory pages (default on; set 0 to opt out) |
+| `RLX_CPU_SHARED_WEIGHTS` | Bisect | BoolOr | Backend(cpu) | Share one copy of each read-only weight across a scope's CPU executables, in files of the temp directory (default on; set 0 to opt out) |
 | `RLX_CPU_SME` | Internal | String | Backend(cpu) | Direct ARM SME2 GEMM path (Apple M4+): opt-in with a vendor BLAS, default in `pure-rust` builds (`0` turns it off) |
 | `RLX_CPU_SME_BF16` | Internal | String | Backend(cpu) | Opt in to the native SME bf16 path (Apple M4+) |
 | `RLX_CPU_SME_THREADS` | Internal | String | Backend(cpu) | Worker threads for the f32 SME2 GEMM (default: the CPU pool size) |

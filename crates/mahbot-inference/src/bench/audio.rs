@@ -66,8 +66,8 @@ pub(crate) const BUILD_FIRST: &str = "a measurement never renders, and a corpus 
 
 /// One synthesised-and-cached TTS front end. It owns the run's guards so a
 /// cache miss — the only phase that can be long — stops at the next clip.
-/// The resident-set check runs per clip; the system figures (two subprocesses)
-/// stay at the phase boundaries the caller checks.
+/// The resident-set check runs per clip; the system figures stay at the phase
+/// boundaries the caller checks.
 ///
 /// One pipeline is resident at a time and it is built on demand: a warm corpus
 /// synthesizes nothing, and a run that walks eleven voices drops one voice's

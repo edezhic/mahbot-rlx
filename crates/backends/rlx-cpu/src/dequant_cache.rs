@@ -286,7 +286,7 @@ pub fn cache_thrashing() -> bool {
     }
 }
 
-fn cache_enabled() -> bool {
+pub(crate) fn cache_enabled() -> bool {
     !matches!(
         rlx_ir::env::var("RLX_DEQUANT_CACHE").as_deref(),
         Some("0") | Some("false") | Some("off")

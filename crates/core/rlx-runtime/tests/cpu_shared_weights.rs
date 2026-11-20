@@ -2,12 +2,12 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! CPU executables compiled under one param-sharing scope back their large
+//! CPU executables compiled under one param-sharing scope back their
 //! read-only weights with one set of shared pages (`rlx_cpu::shared_params`).
 //! Two shapes of one model — an embedding gather, a matmul through a reshaped
-//! (view) weight, a transposed weight, and a small bias that stays private —
-//! must match the same graphs compiled without a scope, bit for bit, and the
-//! second executable must find the weights already bound.
+//! (view) weight, a transposed weight, and the bias of a fused matmul — must
+//! match the same graphs compiled without a scope, bit for bit, and the second
+//! executable must find the weights already bound.
 
 use rlx_ir::op::BinaryOp;
 use rlx_ir::*;
@@ -69,13 +69,10 @@ fn shared_cpu_weights_match_private_ones() {
         });
         for (name, data) in &params {
             let present = c.param_already_set(name);
-            // The large weights are shared from the second executable on; the
-            // bias is under the size floor and always private.
-            assert_eq!(
-                present,
-                i > 0 && *name != "bias",
-                "seq {seq}: param_already_set({name})"
-            );
+            // Every read-only weight is shared from the second executable on, the bias
+            // included: `MatMul` + `Add(bias)` fuses into one bias-carrying matmul, so the bias
+            // is a weight of that fused op rather than a second operand of a live `Add`.
+            assert_eq!(present, i > 0, "seq {seq}: param_already_set({name})");
             if !present {
                 c.set_param(name, data);
             }

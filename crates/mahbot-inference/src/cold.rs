@@ -14,15 +14,19 @@
 //! through a second mapping that is never faulted, so a zero is the page cache's answer
 //! rather than the invalidated mapping's own page-table entries.
 //!
-//! The warm column is that reading the other way round and nothing more: the cold arm of
-//! a row has just read the files the warm arm needs, so the warm arm is checked, not
-//! touched — [`Cache::reading`] records what the cold arm left, and
-//! [`Cache::assert_no_growth`] shows afterwards that the warm arm found it all there. That
-//! reading is taken once the cache has stopped changing ([`Cache::settled`]), because the
+//! The warm column is that reading the other way round: the cold arm of a row has just read
+//! the files the warm arm needs, so [`Cache::reading`] records what the page cache holds of
+//! them and [`Cache::grown_during_arm`] says afterwards what the arm had to fetch from disk.
+//! That reading is taken once the cache has stopped changing ([`Cache::settled`]), because the
 //! upload's request is asynchronous: a page it lands after the reading would be read as the
-//! warm arm faulting it in, which would refuse a correct take.
-//! Faulting the files in would be work the page cache has already done, and it perturbs
-//! the arm it precedes: 3.4 GB of it cost a wake row 20 ms of its next arm.
+//! warm arm faulting it in.
+//!
+//! The reading is an observation, not a repair: whatever the cold arm left out of the cache is
+//! exactly what the warm arm will have to fetch, and completing those pages first would leave
+//! a check that can only catch eviction during the arm — the instrument's whole meaning is that
+//! cold is not in the cache and warm is. What a count of fetched pages means for a warm figure,
+//! and the ratio that refuses a take over it, is stated where the count is read: the stand's
+//! warm arm check.
 //!
 //! A [`Cache`] is the models root and a page size, and nothing live: [`Cache::evict`] walks
 //! the root, and every operation maps one file at a time for its own duration, so nothing the
@@ -132,6 +136,13 @@ pub(crate) struct Held {
     shares: Vec<(PathBuf, Share)>,
 }
 
+impl Held {
+    /// The pages of every file the cold arm read: what the warm arm's re-read is a fraction of.
+    pub(crate) fn pages(&self) -> usize {
+        self.shares.iter().map(|(_, share)| share.pages()).sum()
+    }
+}
+
 impl Cache {
     /// The models root, whose files the cold state is established over.
     pub(crate) fn over_models_root() -> Result<Self> {
@@ -180,10 +191,10 @@ impl Cache {
     }
 
     /// What the page cache holds of `opened` — the files the cold arm read, taken rather than
-    /// borrowed — in the order they were given: the reading the warm arm's assertion is made
+    /// borrowed — in the order they were given: the state the warm arm's reading is made
     /// against. A file outside the root the cold state was established over is refused, not
     /// silently left out, and so is an empty set: a row that opened no model has no warm state
-    /// to be checked for.
+    /// to be read.
     pub(crate) fn reading(&self, opened: Vec<PathBuf>) -> Result<Held> {
         if opened.is_empty() {
             bail!("the cold arm opened no model file, so there is no warm state to check");
@@ -197,34 +208,33 @@ impl Cache {
                     path.display()
                 );
             }
-            let share = self.settled(&path)?;
-            shares.push((path, share));
+            shares.push((path.clone(), self.settled(&path)?));
         }
         Ok(Held { shares })
     }
 
-    /// Assert that every page resident after the arm was resident before it: the arm found
-    /// everything it read in the page cache, which is the whole of what a warm column can
-    /// be checked for. Per page, not net — a page dropped and another faulted in would
-    /// balance a count — and taken after the arm, where its page-table walk cannot reach
-    /// the figure (the same walk before the arm costs it about eight milliseconds). A
-    /// reading taken before and after cannot see a page that leaves the cache and comes
-    /// back inside the arm; nothing that reads the cache afterwards can.
-    pub(crate) fn assert_no_growth(&self, held: &Held) -> Result<()> {
+    /// How many pages of the files the cold arm read became resident during the arm: the
+    /// pages it faulted in from disk, which a warm column claims it did not have to. Per
+    /// page, not net — a page dropped and another faulted in would balance a count — and
+    /// taken after the arm, where its page-table walk cannot reach the figure (the same walk
+    /// before the arm costs it about eight milliseconds). A reading taken before and after
+    /// cannot see a page that leaves the cache and comes back inside the arm; nothing that
+    /// reads the cache afterwards can.
+    ///
+    /// One entry per file that was short, as `(path, pages the arm fetched, pages the file
+    /// has)`, in the order the cold arm opened them: the row states each, because a total
+    /// that named only one of them would hide the others. What the stand refuses over this
+    /// count is stated where it reads it.
+    pub(crate) fn grown_during_arm(&self, held: &Held) -> Result<Vec<(PathBuf, usize, usize)>> {
+        let mut short = Vec::new();
         for (path, before) in &held.shares {
             let now = self.residency(path)?;
             let fresh = grown(before, &now);
             if fresh != 0 {
-                bail!(
-                    "`{}`: {fresh} of {} pages became resident during the arm ({} were resident \
-                     before it) — it faulted pages in from disk, so it was not a warm one",
-                    path.display(),
-                    now.pages(),
-                    before.count()
-                );
+                short.push((path.clone(), fresh, now.pages()));
             }
         }
-        Ok(())
+        Ok(short)
     }
 
     /// What the page cache holds of one file, once it has stopped changing. The upload's request
@@ -233,18 +243,20 @@ impl Cache {
     /// that never settles is read as it is rather than refusing the run.
     ///
     /// Each poll is a whole-file `mincore` — about eight milliseconds for a body, the walk
-    /// [`Self::assert_no_growth`] measures — so a settled cache costs two of them and the
-    /// forty readings the bound allows cost about half a second per file (thirty-nine 5 ms
-    /// sleeps and forty walks). The wait is here rather than in the product because the doubt
-    /// is the instrument's: the request may legitimately still be in flight when the cold arm
-    /// returns, and only a reader of the page cache can tell. A reader outside this process is
-    /// the one thing it cannot wait out.
+    /// [`Self::grown_during_arm`] measures — so a settled cache costs two of them and the
+    /// hundred and twenty readings the bound allows cost about two seconds per file
+    /// (a hundred and nineteen 10 ms sleeps and a hundred and twenty walks). The wait is here
+    /// rather than in the product because the doubt is the instrument's: the request may
+    /// legitimately still be in flight when the cold arm returns, and only a reader of the
+    /// page cache can tell. A reader outside this process is the one thing it cannot wait out.
+    /// The bound is generous because a processor arm asks for far more bytes than a graphics
+    /// one and its request can still be arriving a second later.
     fn settled(&self, path: &Path) -> Result<Share> {
         // Whole-file readings taken before the cache is called settled, the first included.
-        const POLLS: usize = 40;
+        const POLLS: usize = 120;
         let mut last = self.residency(path)?;
         for _ in 1..POLLS {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
             let now = self.residency(path)?;
             if now.resident == last.resident {
                 return Ok(now);

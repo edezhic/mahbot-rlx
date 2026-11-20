@@ -207,7 +207,7 @@ pub(crate) fn compile_cast(
         // slot's real width, not by the declared dtype — packing halves into a
         // widened slot reads back as pairs of halves, which is how bf16
         // autocast produced NaN before this.
-        } else if half_slot_is_widened(graph, arena, node.id)
+        } else if slot_is_widened(graph, arena, node.id)
             && matches!(out_dtype, rlx_ir::DType::BF16 | rlx_ir::DType::F16)
             && in_dtype == rlx_ir::DType::F32
         {
@@ -219,7 +219,7 @@ pub(crate) fn compile_cast(
             }
         } else if matches!(in_dtype, rlx_ir::DType::BF16 | rlx_ir::DType::F16)
             && out_dtype == rlx_ir::DType::F32
-            && half_slot_is_widened(graph, arena, node.inputs[0])
+            && slot_is_widened(graph, arena, node.inputs[0])
         {
             // Source is already f32-wide: widening is a copy.
             Thunk::Copy {
@@ -1212,21 +1212,10 @@ pub(crate) fn compile_concat(
             })
             .collect();
         let dst = node_offset(arena, node.id);
-        // Half tensors live packed (2 B) or widened (4 B) depending on the slot,
-        // not the dtype (params stay packed, activations are widened). Any packed
-        // side needs the widen → assemble → round path; the byte copies below
-        // would split each 4-byte word across two halves.
-        let kind = |id: NodeId| {
-            let d = graph.node(id).shape.dtype();
-            let packed = matches!(d, rlx_ir::DType::BF16 | rlx_ir::DType::F16)
-                && arena.has_buffer(id)
-                && !half_slot_is_widened(graph, arena, id);
-            match d {
-                rlx_ir::DType::BF16 if packed => HalfKind::Bf16,
-                rlx_ir::DType::F16 if packed => HalfKind::F16,
-                _ => HalfKind::F32,
-            }
-        };
+        // Any packed side needs the widen → assemble → round path; the byte copies below
+        // would split each 4-byte word across two halves. Each operand's layout is
+        // [`half_slot`]'s one answer, never the declared dtype.
+        let kind = |id: NodeId| half_slot(graph, arena, id);
         let dst_kind = kind(node.id);
         let kinds: Vec<HalfKind> = node.inputs.iter().map(|&i| kind(i)).collect();
         if dst_kind.packed() || kinds.iter().any(|k| k.packed()) {
@@ -3927,13 +3916,19 @@ pub(crate) fn binary_op_f64(op: BinaryOp, a: f64, b: f64) -> f64 {
     }
 }
 
-/// Whether a half-typed node's arena slot is the **widened** 4-byte form.
+/// Whether a half-typed node's arena slot holds the **widened** 4-byte form — the one width
+/// question, asked by every reader of a half operand and by [`half_slot`], which is its answer
+/// as a kind.
 ///
-/// `plan_memory_native_in_order` widens half *activations* (the thunks compute
-/// in f32) and leaves half *params* packed at 2 B. Asking the arena for the
-/// slot's real element width is the only reliable way to tell them apart —
-/// the declared dtype says nothing about the layout.
-pub(crate) fn half_slot_is_widened(
+/// `plan_memory_native_in_order` widens half *activations* (the thunks compute in f32) and
+/// leaves half *weights* packed at 2 B, and the declared dtype says nothing about which a slot
+/// got: only the arena does. A node with no slot to ask — an unfilled placeholder, or an input
+/// the plan never had to place — answers `true`, because nothing there is packed and the f32
+/// arm's own failure is what names it. A half **parameter** is the exception, and its answer is
+/// conservative rather than observed: the backend lays the shared weights out at the file's own
+/// width, so a weight the plan left unplaced has no widened image anywhere and reading its
+/// 2-byte lanes as f32 is the bug this distinction exists to prevent.
+pub(crate) fn slot_is_widened(
     graph: &Graph,
     arena: &crate::arena::Arena,
     id: rlx_ir::NodeId,
@@ -3942,12 +3937,27 @@ pub(crate) fn half_slot_is_widened(
     if !matches!(node.shape.dtype(), rlx_ir::DType::BF16 | rlx_ir::DType::F16) {
         return false;
     }
-    if matches!(node.op, rlx_ir::Op::Param { .. }) {
-        return false;
-    }
     let n = node.shape.num_elements().unwrap_or(0);
     if n == 0 || !arena.has_buffer(id) {
-        return false;
+        return !matches!(node.op, rlx_ir::Op::Param { .. });
     }
     arena.byte_size(id) / n >= 4
+}
+
+/// How a node's arena slot is stored, as the kind to read it with: [`slot_is_widened`]'s
+/// answer, and the packed half otherwise. Every reader of a half operand asks here.
+pub(crate) fn half_slot(
+    graph: &Graph,
+    arena: &crate::arena::Arena,
+    id: rlx_ir::NodeId,
+) -> crate::thunk::HalfKind {
+    let kind = match graph.node(id).shape.dtype() {
+        rlx_ir::DType::BF16 => crate::thunk::HalfKind::Bf16,
+        rlx_ir::DType::F16 => crate::thunk::HalfKind::F16,
+        _ => return crate::thunk::HalfKind::F32,
+    };
+    if slot_is_widened(graph, arena, id) {
+        return crate::thunk::HalfKind::F32;
+    }
+    kind
 }

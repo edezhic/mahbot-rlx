@@ -32,6 +32,12 @@ pub(crate) fn compile_fused_mat_mul_bias_act(
             k: k as u32,
             n: n as u32,
             act: *activation,
+            // Every operand's layout, from the one rule that answers it: the epilogue reads
+            // f32 lanes, so a packed half operand is widened (or dequantised on the fly, for
+            // the weight) before the multiply and rounded back afterwards.
+            a_kind: super::elementwise::half_slot(graph, arena, node.inputs[0]),
+            w_kind: super::elementwise::half_slot(graph, arena, node.inputs[1]),
+            c_kind: super::elementwise::half_slot(graph, arena, node.id),
         }
     }
 }
@@ -147,43 +153,15 @@ pub(crate) fn compile_mat_mul(
                 } else {
                     eff.num_elements().unwrap_or(1) / n.max(1)
                 };
-                // Half-precision RHS: take the packed dequant-on-the-fly GEMM
-                // ONLY when the operand is a `Param`.
-                //
-                // `plan_memory_native_in_order` widens half **activations** to
-                // f32 (they are computed in f32) while half **params** stay
-                // packed at 2 B/elem. So the dtype alone does not say how the
-                // bytes are laid out, and reading a widened activation as
-                // `u16` is reading f32 bytes as pairs of halves. Under bf16
-                // autocast the RHS of a matmul is routinely a cast activation
-                // rather than a weight, which used to panic in
-                // `sgemm_bf16_rhs` ("range end index N out of range for slice
-                // of length 0") or silently compute garbage.
-                //
-                // Drive this off the real SLOT WIDTH rather than `Param`-ness
-                // or the declared dtype. A half tensor lives packed at 2 B/elem
-                // in some slots and widened to f32 in others, and the
-                // dequant-on-the-fly GEMM is correct for exactly one layout:
-                // `A` and `C` f32-wide, `B` packed half. Reading a widened
-                // slot as packed halves (or the reverse) is silent garbage.
-                let is_half =
-                    |d: rlx_ir::DType| matches!(d, rlx_ir::DType::BF16 | rlx_ir::DType::F16);
-                let wide = |id, d: rlx_ir::DType| {
-                    !is_half(d) || super::elementwise::half_slot_is_widened(graph, arena, id)
-                };
-                // `has_buffer` matters: a node with no slot reads back as an
-                // EMPTY slice, and the packed GEMM would index into it
-                // ("range end index 16 out of range for slice of length 0" —
-                // how the bf16 backward graph used to die).
-                let packed = |id, d: rlx_ir::DType| {
-                    is_half(d)
-                        && arena.has_buffer(id)
-                        && !super::elementwise::half_slot_is_widened(graph, arena, id)
-                };
-                let packed_rhs = packed(node.inputs[1], b_shape.dtype());
-                let use_packed_rhs = packed_rhs
-                    && wide(node.inputs[0], a_shape.dtype())
-                    && wide(node.id, shape.dtype());
+                // The dequant-on-the-fly GEMM is correct for exactly one layout: `A` and `C`
+                // f32-wide, `B` packed half. Each operand's layout is `half_slot`'s one answer,
+                // never `Param`-ness or the declared dtype — reading a widened slot as packed
+                // halves (or the reverse) is silent garbage, and under bf16 autocast the RHS of
+                // a matmul is routinely a cast activation rather than a weight.
+                let a_kind = super::elementwise::half_slot(graph, arena, node.inputs[0]);
+                let b_kind = super::elementwise::half_slot(graph, arena, node.inputs[1]);
+                let c_kind = super::elementwise::half_slot(graph, arena, node.id);
+                let use_packed_rhs = b_kind.packed() && !a_kind.packed() && !c_kind.packed();
                 // BF16 weight (rhs) with f32 output → dequant-on-the-fly GEMM
                 // (bf16-resident LM head: half the weight memory traffic).
                 if use_packed_rhs && b_shape.dtype() == rlx_ir::DType::BF16 {
@@ -213,14 +191,6 @@ pub(crate) fn compile_mat_mul(
                 // planner left at 2 B, a packed LHS, or a packed destination)
                 // goes through the general widen→f32-GEMM→round path. The f32
                 // `Sgemm` below would read those 2-byte halves as f32.
-                let kind_of = |id, d: rlx_ir::DType| match d {
-                    rlx_ir::DType::BF16 if packed(id, d) => crate::thunk::HalfKind::Bf16,
-                    rlx_ir::DType::F16 if packed(id, d) => crate::thunk::HalfKind::F16,
-                    _ => crate::thunk::HalfKind::F32,
-                };
-                let a_kind = kind_of(node.inputs[0], a_shape.dtype());
-                let b_kind = kind_of(node.inputs[1], b_shape.dtype());
-                let c_kind = kind_of(node.id, shape.dtype());
                 if a_kind.packed() || b_kind.packed() || c_kind.packed() {
                     return Thunk::SgemmHalf {
                         a: node_offset(arena, node.inputs[0]),
@@ -355,6 +325,11 @@ pub(crate) fn compile_grouped_mat_mul(
     }
 }
 
+/// `c = act(a @ w + bias)` for any layout of the three operands. A packed half operand is
+/// widened before the multiply (or, for the weight, dequantised on the fly) and a packed
+/// destination is rounded after the epilogue, so no operand is ever read as lanes it does not
+/// hold — the rule `compile_mat_mul` applies to its own three, asked here through the same
+/// [`super::elementwise::half_slot`].
 #[inline(always)]
 pub(crate) fn exec_fused_mm_bias_act(t: &Thunk, base: *mut u8) {
     let Thunk::FusedMmBiasAct {
@@ -366,30 +341,64 @@ pub(crate) fn exec_fused_mm_bias_act(t: &Thunk, base: *mut u8) {
         k,
         n,
         act,
+        a_kind,
+        w_kind,
+        c_kind,
     } = t
     else {
         unreachable!()
     };
-    {
-        let (m, k, n) = (*m as usize, *k as usize, *n as usize);
-        unsafe {
-            let out = sl_mut(*c, base, m * n);
-            let bias_v = sl(*bias, base, n);
-            // Match torch `F.linear` / `addmm(bias, A, W)` association order.
-            for row in 0..m {
-                out[row * n..(row + 1) * n].copy_from_slice(bias_v);
-            }
-            crate::blas::sgemm_accumulate_auto(
-                sl(*a, base, m * k),
-                sl(*w, base, k * n),
-                out,
-                m,
-                k,
-                n,
+    let (m, k, n) = (*m as usize, *k as usize, *n as usize);
+    unsafe {
+        let bias_v = sl(*bias, base, n);
+        let a_buf;
+        let a_sl: &[f32] = if a_kind.packed() {
+            a_buf = crate::blas::widen_half_vec(
+                sl_typed::<u16>(*a, base, m * k),
+                *a_kind == HalfKind::Bf16,
             );
-            if let Some(act) = act {
-                apply_activation_inplace(out, *act)
+            &a_buf
+        } else {
+            sl(*a, base, m * k)
+        };
+        let mut out_buf;
+        let out: &mut [f32] = if c_kind.packed() {
+            out_buf = vec![0f32; m * n];
+            &mut out_buf
+        } else {
+            sl_mut(*c, base, m * n)
+        };
+        match w_kind {
+            HalfKind::F32 => {
+                // Match torch `F.linear` / `addmm(bias, A, W)` association order.
+                for row in 0..m {
+                    out[row * n..(row + 1) * n].copy_from_slice(bias_v);
+                }
+                crate::blas::sgemm_accumulate_auto(a_sl, sl(*w, base, k * n), out, m, k, n);
             }
+            kind => {
+                // A packed half weight: the dequant-on-the-fly GEMM writes `C` rather than
+                // accumulating into it, so the bias is added after. That is ~1 ULP from the
+                // f32 arm's association order, which is the price of reading 2 B/elem
+                // weights at all.
+                let b16 = sl_typed::<u16>(*w, base, k * n);
+                if *kind == HalfKind::F16 {
+                    crate::blas::sgemm_f16_rhs(a_sl, b16, out, m, k, n);
+                } else {
+                    crate::blas::sgemm_bf16_rhs(a_sl, b16, out, m, k, n);
+                }
+                crate::blas::bias_add(out, bias_v, m, n);
+            }
+        }
+        if let Some(act) = act {
+            apply_activation_inplace(out, *act);
+        }
+        if c_kind.packed() {
+            crate::blas::round_half_into(
+                out,
+                sl_mut_typed::<u16>(*c, base, m * n),
+                *c_kind == HalfKind::Bf16,
+            );
         }
     }
 }
@@ -457,6 +466,230 @@ pub(crate) fn exec_lora_mat_mul(t: &Thunk, base: *mut u8) {
                 }
             }
             crate::blas::sgemm_accumulate(&tmp, bs, out, m, r, n);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rlx_ir::bytes::AlignedBytes;
+
+    /// The fused multiply's operands as one arena: `a` f32, the weight's bytes,
+    /// `bias` f32 and the `c` slot, each at its own 8-byte-aligned offset.
+    ///
+    /// The backing store is [`AlignedBytes`] rather than `Vec<u8>` because the
+    /// kernels reinterpret these offsets as `&[f32]` and `&[u16]`: an unaligned base
+    /// would make those borrows unsound, not merely slow.
+    fn exec(
+        a: &[f32],
+        w: &[u8],
+        bias: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        w_kind: HalfKind,
+        act: Option<Activation>,
+    ) -> Vec<f32> {
+        let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let (got, _) = exec_layout(
+            &a_bytes,
+            w,
+            bias,
+            m,
+            k,
+            n,
+            HalfKind::F32,
+            w_kind,
+            HalfKind::F32,
+            act,
+        );
+        got
+    }
+
+    /// [`exec`] with each operand's layout spelled out, handing back the destination's bytes as
+    /// they lie in the arena: a packed `a` or `c` is 2 B/element there.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_layout(
+        a: &[u8],
+        w: &[u8],
+        bias: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        a_kind: HalfKind,
+        w_kind: HalfKind,
+        c_kind: HalfKind,
+        act: Option<Activation>,
+    ) -> (Vec<f32>, Vec<u8>) {
+        let align = |at: usize| at.div_ceil(8) * 8;
+        let a_off = 0;
+        let w_off = align(a_off + a.len());
+        let bias_off = align(w_off + w.len());
+        let c_off = align(bias_off + bias.len() * 4);
+        let c_bytes = if c_kind.packed() {
+            m * n * 2
+        } else {
+            m * n * 4
+        };
+        let mut arena = AlignedBytes::zeroed(align(c_off + c_bytes));
+        {
+            let buf = arena.as_mut_slice();
+            buf[a_off..a_off + a.len()].copy_from_slice(a);
+            buf[w_off..w_off + w.len()].copy_from_slice(w);
+            for (i, &v) in bias.iter().enumerate() {
+                buf[bias_off + i * 4..bias_off + i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+            }
+        }
+        let thunk = Thunk::FusedMmBiasAct {
+            a: a_off,
+            w: w_off,
+            bias: bias_off,
+            c: c_off,
+            m: m as u32,
+            k: k as u32,
+            n: n as u32,
+            act,
+            a_kind,
+            w_kind,
+            c_kind,
+        };
+        exec_fused_mm_bias_act(&thunk, arena.as_mut_slice().as_mut_ptr());
+        let bytes = arena.as_mut_slice()[c_off..c_off + c_bytes].to_vec();
+        let got = if c_kind.packed() {
+            bytes
+                .chunks_exact(2)
+                .map(|b| half::f16::from_bits(u16::from_ne_bytes([b[0], b[1]])).to_f32())
+                .collect()
+        } else {
+            arena.as_slice_of::<f32>()[c_off / 4..c_off / 4 + m * n].to_vec()
+        };
+        (got, bytes)
+    }
+
+    /// `a · w + bias`, in f32, with the activation the thunk applies — the
+    /// association order the f32 arm uses (bias first, then the accumulation).
+    fn reference(
+        a: &[f32],
+        w: &[f32],
+        bias: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        act: Option<Activation>,
+    ) -> Vec<f32> {
+        let mut c = vec![0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = bias[j];
+                for p in 0..k {
+                    acc += a[i * k + p] * w[p * n + j];
+                }
+                c[i * n + j] = acc;
+            }
+        }
+        if let Some(act) = act {
+            apply_activation_inplace(&mut c, act);
+        }
+        c
+    }
+
+    /// The weight as f16 bytes, which is how a packed half param lies in the arena.
+    fn halves(w: &[f32]) -> Vec<u8> {
+        w.iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_ne_bytes())
+            .collect()
+    }
+
+    /// The comparison, relative and absolute: both arms of the epilogue reach the
+    /// same product in a different association order, so the bound is the
+    /// reassociation's, not the kernel's.
+    fn assert_close(got: &[f32], want: &[f32], what: &str) {
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-5 * (1.0 + w.abs()),
+                "{what} at {i}: {g} against the reference's {w}"
+            );
+        }
+    }
+
+    /// **A packed half weight takes the dequant-on-the-fly GEMM, not an f32 read of
+    /// its bytes.** `w_kind` is `HalfKind::F16` and the slot holds 2 B/element, as a
+    /// half param does; reading those bytes as f32 lanes gives numbers unrelated to
+    /// the product, which is how the CED tagger's 527-way head saturated at exactly
+    /// 1.0 and withheld most of the speech from the recogniser. The f32 arm is the
+    /// same comparison against its own layout, so the two are held to one reference.
+    #[test]
+    fn a_packed_half_weight_is_multiplied_as_the_halves_it_holds() {
+        // `m` at the widen threshold, `k` a whole number of 8-lane rows, `n` odd so
+        // the tail of the weight row is not a padded one.
+        let (m, k, n) = (4usize, 8usize, 5usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.125 - 1.0).collect();
+        let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 - 2.0).collect();
+        let bias: Vec<f32> = (0..n).map(|j| 0.5 * j as f32 - 1.0).collect();
+
+        // The f16 weight is the rounded one both sides see: the reference reads the
+        // halves back, so the comparison is of the GEMM and not of a rounding.
+        let w_half: Vec<f32> = w.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
+
+        for act in [None, Some(Activation::Gelu)] {
+            let want = reference(&a, &w_half, &bias, m, k, n, act);
+            let packed = exec(&a, &halves(&w), &bias, m, k, n, HalfKind::F16, act);
+            assert_close(&packed, &want, &format!("the packed arm with {act:?}"));
+
+            let f32_bytes: Vec<u8> = w.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let full = exec(&a, &f32_bytes, &bias, m, k, n, HalfKind::F32, act);
+            assert_close(&full, &want, &format!("the f32 arm with {act:?}"));
+        }
+    }
+
+    /// **A packed activation and a packed destination are read and written as the halves they
+    /// hold, too.** The slot rule is one question asked of all three operands, so a graph whose
+    /// lhs or output the planner left at 2 B/element — a half activation under autocast — is
+    /// multiplied rather than reinterpreted. Only the weight was ever guarded, and the other two
+    /// were the same defect waiting for a graph that produced one.
+    #[test]
+    fn a_packed_activation_and_destination_are_read_and_written_as_halves() {
+        let (m, k, n) = (3usize, 8usize, 5usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.125 - 1.0).collect();
+        let w: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.25 - 2.0).collect();
+        let bias: Vec<f32> = (0..n).map(|j| 0.5 * j as f32 - 1.0).collect();
+
+        // The rounded halves both sides see, so the comparison is of the multiply and not of a
+        // rounding: a packed operand holds `half::f16` bits, and the reference reads them back.
+        let a_half: Vec<f32> = a.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
+        let w_half: Vec<f32> = w.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
+
+        for act in [None, Some(Activation::Gelu)] {
+            let want = reference(&a_half, &w_half, &bias, m, k, n, act);
+            for (a_kind, c_kind) in [
+                (HalfKind::F16, HalfKind::F16),
+                (HalfKind::F16, HalfKind::F32),
+                (HalfKind::F32, HalfKind::F16),
+            ] {
+                let a_bytes = if a_kind.packed() {
+                    halves(&a)
+                } else {
+                    a.iter().flat_map(|v| v.to_ne_bytes()).collect()
+                };
+                let (got, _) = exec_layout(
+                    &a_bytes,
+                    &halves(&w),
+                    &bias,
+                    m,
+                    k,
+                    n,
+                    a_kind,
+                    HalfKind::F16,
+                    c_kind,
+                    act,
+                );
+                assert_close(
+                    &got,
+                    &want,
+                    &format!("a={a_kind:?} c={c_kind:?} with {act:?}"),
+                );
+            }
         }
     }
 }

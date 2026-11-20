@@ -36,6 +36,34 @@ pub const MODEL_SIDECAR: &str = "model.json";
 /// Opens `.rlxp` packages that embed a graph.
 pub struct RlxpProvider;
 
+/// The label a package's graphs share weights under: its path, and the identity the file
+/// system gives the file at it.
+///
+/// The path alone is not an identity. A weight is matched inside a scope by name and length,
+/// so a package rewritten in place — same path, same tensor names, same shapes — would hand
+/// the next graph the previous package's bytes, which is a wrong answer with nothing said.
+/// The size and the modification time are what every build tool uses for this and cost one
+/// `stat`; a rewrite that keeps both is not one this can see.
+pub(super) fn package_scope(path: &Path) -> String {
+    let identity = std::fs::metadata(path).ok().and_then(|m| {
+        let modified = m.modified().ok()?;
+        Some((
+            m.len(),
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos(),
+        ))
+    });
+    match identity {
+        Some((len, modified)) => format!("rlxp:{}#{len}:{modified}", path.display()),
+        // Nothing to tell one version of the file from another, so share with nothing: an
+        // empty label is what the processor's pool reads as "no scope", and a label built from
+        // the path alone would hand the next version of the file the previous one's bytes.
+        None => String::new(),
+    }
+}
+
 fn is_package(path: &Path) -> bool {
     let ext = path
         .extension()
@@ -1012,7 +1040,7 @@ impl PackageWeights {
             sources,
             lora: HashMap::new(),
             lean: false,
-            scope: format!("rlxp:{}", package.display()),
+            scope: package_scope(package),
             read_cache: Default::default(),
         })
     }

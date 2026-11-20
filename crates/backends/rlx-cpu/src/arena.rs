@@ -141,6 +141,22 @@ impl Arena {
     /// GPU host fallbacks (`rlx-gpu-host`) use their own buffers and are not
     /// covered.
     pub fn from_plan_filled(plan: MemoryPlan, poison: bool) -> Self {
+        // A mapping rather than a heap buffer. The arena is the largest thing a processor
+        // call allocates — one synthesis call builds six of them — and this platform does
+        // not return a freed large heap block to the process's physical footprint, so a
+        // heap arena's high-water stays charged for the rest of the run while a mapping is
+        // handed back on drop. That is what makes a call's residency the graphs it is
+        // running rather than every graph it has built, which is the rule the stand's
+        // resting column prices. A platform without `mmap` keeps the heap buffer.
+        if let Some(mut mapped) = crate::shared_params::MappedArena::new(plan.arena_size) {
+            if poison {
+                mapped.as_mut_slice().fill(0xFF);
+            }
+            return Self {
+                buf: Store::Mapped(mapped),
+                plan,
+            };
+        }
         let mut buf = AlignedBytes::zeroed(plan.arena_size);
         if poison {
             buf.as_mut_slice().fill(0xFF);
@@ -151,28 +167,27 @@ impl Arena {
         }
     }
 
-    /// [`Self::from_plan`] whose `shared` slots — `(name, dtype tag, bytes,
-    /// offset)`, each offset page-aligned — are backed by the `scope`'s shared
-    /// copy of that weight ([`crate::shared_params`]). Returns the arena and,
-    /// per shared slot, whether its values were already there (another
-    /// executable made the copy). `None` when the platform cannot map shared
-    /// pages; the caller then builds a plain arena.
+    /// [`Self::from_plan`] whose `shared` slots — `(name, bytes, offset)`, each offset
+    /// page-aligned — are backed by the `scope`'s shared copy of that weight
+    /// ([`crate::shared_params`]). Returns the arena and, per shared slot, whether its values
+    /// were already there: `Some(true)` another executable made and wrote the copy, `Some(false)`
+    /// this one must write it, and `None` the slot stayed private because it could not be
+    /// mapped. `None` for the pair when the platform cannot make the mapping at all; the caller
+    /// then builds a plain arena.
     pub fn from_plan_shared(
         plan: MemoryPlan,
         scope: &str,
-        shared: &[(String, u8, usize, usize)],
-    ) -> Option<(Self, Vec<bool>)> {
+        shared: &[(String, usize, usize)],
+    ) -> Option<(Self, Vec<Option<bool>>)> {
         let mut m = crate::shared_params::MappedArena::new(plan.arena_size)?;
         if rlx_ir::env::flag("RLX_POISON_ARENA") {
             m.as_mut_slice().fill(0xFF);
         }
         let mut present = Vec::with_capacity(shared.len());
-        for (name, tag, nbytes, offset) in shared {
-            // A slot that cannot be mapped stays private (and is uploaded).
-            present.push(
-                m.map_shared(scope, name, *tag, *nbytes, *offset)
-                    .unwrap_or(false),
-            );
+        for (name, nbytes, offset) in shared {
+            // `None` is a slot that could not be mapped and stays private (and is uploaded):
+            // it is not a shared slot, so nothing may be recorded about its residency.
+            present.push(m.map_shared(scope, name, *nbytes, *offset));
         }
         Some((
             Self {
@@ -186,6 +201,16 @@ impl Arena {
     /// Total arena size in bytes.
     pub fn size(&self) -> usize {
         self.plan.arena_size
+    }
+
+    /// Record that a shared weight mapped into this arena at `shared` holds its bytes now.
+    /// Answers `false` for an arena that is not mapped or an offset no shared object backs —
+    /// a slot whose mapping failed is private, so nothing may be recorded about it.
+    pub fn mark_shared_written(&mut self, shared: usize) -> bool {
+        match &mut self.buf {
+            Store::Mapped(m) => m.mark_written(shared),
+            Store::Heap(_) => false,
+        }
     }
 
     /// Get a mutable f32 slice for a node's buffer.

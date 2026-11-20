@@ -1250,9 +1250,12 @@ const MUSIC_LABELS: &[&str] = &[
 ];
 
 /// Whether a tagger label says the audio there can hold words: a speech or singing class
-/// ([`SPEECH_LABELS`]) or one of the word-bearing music ones ([`MUSIC_LABELS`]), matched
-/// on the name the file carries.
-fn bears_words(label: &str) -> bool {
+/// ([`SPEECH_LABELS`]) or one of the word-bearing music ones (`MUSIC_LABELS` beside it),
+/// matched on the name the file carries. Public, though hidden from the docs, because a check
+/// of the tagger's answer has to ask the product's own rule rather than a copy of it — a copy
+/// drifts, and this one decides whether a region's audio is withheld from the recogniser.
+#[doc(hidden)]
+pub fn bears_words(label: &str) -> bool {
     let name = label.trim();
     SPEECH_LABELS
         .iter()

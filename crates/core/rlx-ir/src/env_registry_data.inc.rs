@@ -176,7 +176,7 @@
     EnvVarEntry {
         name: "RLX_CPU_SHARED_WEIGHTS",
         group: "cpu",
-        summary: "Share one copy of each large weight across a scope's CPU executables on shared-memory pages (default on; set 0 to opt out)",
+        summary: "Share one copy of each read-only weight across a scope's CPU executables, in files of the temp directory (default on; set 0 to opt out)",
         kind: EnvKind::BoolOr { default: true },
         stability: EnvStability::Bisect,
         aliases: &[],

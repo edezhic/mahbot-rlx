@@ -28,9 +28,11 @@
 //! first row rather than given a column that means nothing.
 //!
 //! `mahbot-inference` with no arguments is the complete run: it takes the heavy
-//! run's lock, spawns one child per row and writes `STAND.md`. `mahbot-inference
-//! N…` measures the named rows only and prints them; it writes no record unless it
-//! measured the whole table, and neither does a run under a bound larger than the
+//! run's lock, spawns one child per row and writes the record of the device the rows ran
+//! on — `STAND.md` on the graphics device, `STAND-CPU.md` on the processor, where every
+//! pinned witness is a graphics number and the row is printed rather than compared.
+//! `mahbot-inference N…` measures the named rows only and prints them; it writes no record
+//! unless it measured the whole table, and neither does a run under a bound larger than the
 //! default (a screened run). A row whose input is missing fails the run and names it.
 //! A row stopped by a guard makes the run exit [`crate::guard::EXIT_STOPPED`].
 //!
@@ -240,6 +242,7 @@ pub fn main_entry() {
     run::record_run(run::Mode {
         label: "stand",
         record: measurements::Record::Stand,
+        processor_record: Some(measurements::Record::StandProcessor),
         marker: ROW_CHILD,
         total: ROWS.len(),
         name: |index| ROWS[index].name,
@@ -262,22 +265,51 @@ fn measure(row: &Row, bounds: Bounds) -> Result<Reading> {
     }
 }
 
-/// The warm arm's two premises: it faulted no page of the files the cold arm read in from
-/// disk, and it opened no model the cold arm did not — a file first opened inside the arm
-/// would be read cold with nothing watching it. The loader's record is per thread, which is
-/// the shape it needs for two concurrent builds — but an open may run one side on a worker
-/// (`overlap::opens`: the tagger for a recognition row, the vocabulary for a synthesis one),
-/// and whatever a worker read is folded into this thread's record before the check. So the
-/// gate covers the files the row opened, not the files this thread opened.
-fn warm_checked(cache: &cold::Cache, held: &cold::Held) -> Result<()> {
-    cache.assert_no_growth(held)?;
+/// The warm column's two premises, checked: nothing the row needs may be first opened inside
+/// the arm, and the arm may not have had to fetch most of the model back off the disk.
+///
+/// The first is a refusal on every device: a file first opened inside the arm would be read
+/// cold with nothing watching it, so a model first opened there is an instrument failure
+/// rather than a figure.
+///
+/// The second is measured and stated on the row, and refused only when it is more than half
+/// the pages the cold arm read: a warm call that re-reads most of the model is priced as a
+/// cold one and would be recorded as a warm figure, so the take is refused and re-taken. The
+/// line is at half rather than at zero because the product releases a call's graphs and the
+/// warm call rebuilds them, so some pages always come back; a row that re-reads most of the
+/// file measured the disk, not the product.
+///
+/// The loader's record is per thread, which is the shape it needs for two concurrent builds —
+/// but an open may run one side on a worker (`overlap::opens`: the tagger for a recognition
+/// row, the vocabulary for a synthesis one), and whatever a worker read is folded into this
+/// thread's record before the check. So the gate covers the files the row opened, not the
+/// files this thread opened.
+fn warm_checked(row: &Row, cache: &cold::Cache, held: &cold::Held) -> Result<usize> {
     match loader::take_opened().as_slice() {
-        [] => Ok(()),
+        [] => {}
         [path, ..] => bail!(
             "`{}` was first opened during the warm arm, so it was not warm",
             path.display()
         ),
     }
+    let grown = cache.grown_during_arm(held)?;
+    let pages: usize = grown.iter().map(|(_, fresh, _)| fresh).sum();
+    let all: usize = held.pages();
+    if pages * 2 > all {
+        bail!(
+            "the warm arm re-read {pages} of the {all} page(s) of the model files — more than \
+             half, so the column is a cold measurement wearing a warm label"
+        );
+    }
+    for (path, fresh, total) in &grown {
+        eprintln!(
+            "stand: {}: the warm arm re-read {fresh} of {total} page(s) of {} ({pages} of {all} \
+             across the row) — the row's warm figure includes that read",
+            row.name,
+            path.display()
+        );
+    }
+    Ok(pages)
 }
 
 /// One voice message through the product's transcription call — the recording read
@@ -300,38 +332,66 @@ fn recognition(
     let cold_ms = t.ms();
     // The warm column's state, taken rather than assumed: the files the cold arm opened,
     // then the memory reading — so the reading's bitmaps are not in the footprint — then
-    // what the cold arm left of them in the cache; the arm afterwards is shown to have
-    // faulted no page of them in from disk.
+    // what the cold arm left of them in the cache. The arm afterwards is measured against
+    // it, and the pages it had to fetch are stated on the row.
     let opened = loader::take_opened();
     let memory = report::Memory::take();
     let held = cache.reading(opened)?;
     let t = Stopwatch::start();
     let warm = call(&mut transcriber, &recording, limit)?;
     let warm_ms = t.ms();
-    warm_checked(&cache, &held)?;
+    let re_read = warm_checked(row, &cache, &held)?;
     cold_warm(row, cold.regions == warm.regions, "regions");
     let digest = answer_digest(&warm);
-    let equal = digest == witness;
-    if !equal {
-        eprintln!(
-            "stand: {}: the answer moved from its witness ({digest} against {witness})",
-            row.name
-        );
-    }
+    let equal = compared(row, digest == witness, || {
+        format!("the answer moved from its witness ({digest} against {witness})")
+    });
+    let mut detail = run::detail([
+        ("regions", json!(warm.regions.len())),
+        ("samples", json!(warm.samples)),
+        ("gain", json!(warm.gain)),
+        ("digest", json!(digest)),
+        ("warm_reread", json!(re_read)),
+    ]);
+    pin(&mut detail, witness, equal);
     Ok(Reading::new(
         row.name,
         cold_ms,
         warm_ms,
         memory.finish(),
-        run::detail([
-            ("regions", json!(warm.regions.len())),
-            ("samples", json!(warm.samples)),
-            ("gain", json!(warm.gain)),
-            ("digest", json!(digest)),
-            ("witness", json!(witness)),
-            ("equal", json!(equal)),
-        ]),
+        detail,
     ))
+}
+
+/// Whether this row's answer is compared with its pinned witness — `None` where it is not,
+/// which is every processor row: the pins are graphics numbers, and the processor's arithmetic
+/// is f32 where the graphics kernels take half paths, so agreement there would pin one
+/// machine's rounding rather than the product. A processor row's correctness is the product's
+/// own checks and the decisions it reaches, not a digest; its answer is still printed, so a
+/// reader can hold it beside the graphics row's console line. A graphics row that moves is
+/// reported here and never adjusted.
+fn compared(row: &Row, equal: bool, moved: impl FnOnce() -> String) -> Option<bool> {
+    if crate::device::of() == rlx_runtime::Device::Cpu {
+        return None;
+    }
+    if !equal {
+        eprintln!("stand: {}: {}", row.name, moved());
+    }
+    Some(equal)
+}
+
+/// The row's pinned witness and whether the answer matched it, where the row has a comparison
+/// at all ([`compared`]): the two fields a record states, written together so neither can
+/// appear without the other.
+fn pin(
+    detail: &mut serde_json::Map<String, serde_json::Value>,
+    witness: &str,
+    equal: Option<bool>,
+) {
+    if let Some(equal) = equal {
+        detail.insert("witness".to_string(), json!(witness));
+        detail.insert("equal".to_string(), json!(equal));
+    }
 }
 
 /// SHA-256 over the call's answer: each region's bounds, its read flag and its
@@ -368,7 +428,7 @@ fn synthesis(row: &Row, text: &str, witness: u64, witness_samples: usize) -> Res
     let t = Stopwatch::start();
     let warm = engine.synthesize(text, SYNTH_SEED)?;
     let warm_ms = t.ms();
-    warm_checked(&cache, &held)?;
+    let re_read = warm_checked(row, &cache, &held)?;
     cold_warm(
         row,
         cold.len() == warm.len() && report::digest(&cold) == report::digest(&warm),
@@ -383,30 +443,33 @@ fn synthesis(row: &Row, text: &str, witness: u64, witness_samples: usize) -> Res
         );
     }
     let digest = report::digest(&warm);
-    let equal = digest == witness && warm.len() == witness_samples;
-    if !equal {
-        eprintln!(
-            "stand: {}: the waveform moved from its witness ({digest:016x} · {} samples against \
+    let equal = compared(
+        row,
+        digest == witness && warm.len() == witness_samples,
+        || {
+            format!(
+                "the waveform moved from its witness ({digest:016x} · {} samples against \
              {witness:016x} · {witness_samples})",
-            row.name,
-            warm.len(),
-        );
-    }
+                warm.len(),
+            )
+        },
+    );
+    let mut detail = run::detail([
+        (
+            "frames",
+            json!(warm.len() / crate::graphs::samples_per_frame()),
+        ),
+        ("samples", json!(warm.len())),
+        ("digest", json!(format!("{digest:016x}"))),
+        ("warm_reread", json!(re_read)),
+    ]);
+    pin(&mut detail, &format!("{witness:016x}"), equal);
     Ok(Reading::new(
         row.name,
         cold_ms,
         warm_ms,
         memory.finish(),
-        run::detail([
-            (
-                "frames",
-                json!(warm.len() / crate::graphs::samples_per_frame()),
-            ),
-            ("samples", json!(warm.len())),
-            ("digest", json!(format!("{digest:016x}"))),
-            ("witness", json!(format!("{witness:016x}"))),
-            ("equal", json!(equal)),
-        ]),
+        detail,
     ))
 }
 
@@ -443,7 +506,7 @@ fn listening(
     let t = Stopwatch::start();
     let warm = session(&mut listener, &enrollment, &samples, deadline)?;
     let warm_ms = t.ms();
-    warm_checked(&cache, &held)?;
+    let re_read = warm_checked(row, &cache, &held)?;
 
     if cold != warm {
         eprintln!(
@@ -486,24 +549,36 @@ fn listening(
             }
         }
     }
-    let equal = warm == witness;
-    if !equal {
-        eprintln!(
-            "stand: {}: the session moved from its witness ({} against {})",
-            row.name, warm, witness,
+    // The pinned answer is a graphics number, and the scores move on the processor — the
+    // *decisions* are what must hold, and they are what the wake path is: every hop, every
+    // window, every pass, every fire. On the processor the decision fields are compared and
+    // the scores digest is reported.
+    let decided = warm.hops == witness.hops
+        && warm.vad == witness.vad
+        && warm.windows == witness.windows
+        && warm.passes == witness.passes
+        && warm.fires == witness.fires;
+    let equal = compared(row, warm == witness, || {
+        format!("the session moved from its witness ({warm} against {witness})")
+    });
+    if crate::device::of() == rlx_runtime::Device::Cpu && !decided {
+        bail!(
+            "{}: the session's decisions moved from the witness ({warm} against {witness})",
+            row.name
         );
     }
+    let mut detail = run::detail([
+        ("seconds", json!(STREAM_SECONDS)),
+        ("session", json!(warm.to_string())),
+        ("warm_reread", json!(re_read)),
+    ]);
+    pin(&mut detail, &witness.to_string(), equal);
     Ok(Reading::new(
         row.name,
         cold_ms,
         warm_ms,
         memory.finish(),
-        run::detail([
-            ("seconds", json!(STREAM_SECONDS)),
-            ("session", json!(warm.to_string())),
-            ("witness", json!(witness.to_string())),
-            ("equal", json!(equal)),
-        ]),
+        detail,
     ))
 }
 

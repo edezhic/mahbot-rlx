@@ -61,6 +61,10 @@ rlx-flow = { workspace = true }
 # graphics device can be obtained (`src/device.rs`) — a build that lost it would lose the
 # fallback silently.
 rlx-runtime = { workspace = true, features = ["gpu", "cpu"] }
+# The processor backend's custom-op registry, for `mahbot.gather_packed`'s kernel
+# (`src/packed.rs`): the model's own op lives with the model code rather than in
+# upstream's crate. Already in the build through `rlx-runtime`'s `cpu` feature.
+rlx-cpu = { workspace = true }
 # The wgpu backend itself: the device and adapter name, the shared weight pool's
 # scope and release, and the f16 cooperative-matmul admission the loader asks.
 rlx-wgpu = { workspace = true }
@@ -90,9 +94,9 @@ workspace = true
 # The wake-word bench, its corpus build and the transcription corpus run are
 # deliberate, never automatic: without this feature none of them is built.
 bench = []
-# The fifteen hand-run targets below. Every test in them is `#[ignore]`d, so a routine
-# `cargo test` would link and execute fifteen binaries that run nothing (311 MiB) and
-# pay each one's first-execution assessment; the contour has 73 test binaries behind
+# The sixteen hand-run targets below. Every test in them is `#[ignore]`d, so a routine
+# `cargo test` would link and execute sixteen binaries that run nothing and pay each
+# one's first-execution assessment; the contour has 74 test binaries behind
 # this feature and 58 without it (the stand's own is `test = false` above, so it is in
 # neither count). The feature is also what keeps them buildable, type-checked and
 # runnable: `just lint` and `just lint-mahbot` enable it, `just test-workspace`
@@ -139,6 +143,10 @@ required-features = ["hand-run"]
 
 [[test]]
 name = "predictor_draft"
+required-features = ["hand-run"]
+
+[[test]]
+name = "processor_checks"
 required-features = ["hand-run"]
 
 [[test]]

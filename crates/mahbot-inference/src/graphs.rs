@@ -2975,6 +2975,9 @@ impl Runner {
             .into_hir()
             .ok_or_else(|| anyhow!("flow built a non-HIR module"))?;
         let graph = rlx_ir::hir_to_graph(hir)?;
+        // This crate's own custom op has to have its processor kernel registered before
+        // the compile that lowers it, and the backend refuses a name with no kernel.
+        crate::packed::register();
         // The whole compile: the fusion pipeline above the backend plus the backend
         // compile, whose own phases `RLX_WGPU_COMPILE_REPORT` prints separately. The
         // device is the run's (`crate::device`): an unforced run decides at this first
@@ -3098,6 +3101,21 @@ impl Runner {
                 uploaded += bytes.len() as u64;
             }
         }
+        // A fused projection lands in pieces, so it is resident once the last part has been
+        // written rather than after each one — and it is the one route the backend cannot mark
+        // itself, since it sees the parts and not the whole. One name per projection, not one
+        // per part: the whole-value routes mark inside `set_param`, which every caller goes
+        // through, and marking a four-part projection four times would re-prepare the session
+        // for nothing.
+        let mut fused_names: Vec<&str> = reads
+            .iter()
+            .filter_map(|read| match &read.tag {
+                Write::Part { name, .. } => Some(name.as_str()),
+                Write::Whole { .. } => None,
+            })
+            .collect();
+        fused_names.sort_unstable();
+        fused_names.dedup();
         readahead::read_extents(&reads, |read, bytes| {
             match &read.tag {
                 Write::Whole { name, dt } => session.set_param_typed(name, bytes, *dt),
@@ -3117,6 +3135,9 @@ impl Runner {
             uploaded += bytes.len() as u64;
             Ok(())
         })?;
+        for name in &fused_names {
+            session.mark_param_written(name);
+        }
         let upload = Upload {
             ms: upload_start.ms(),
             bytes: uploaded,

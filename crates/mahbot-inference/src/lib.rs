@@ -32,6 +32,7 @@ pub mod loader;
 pub mod measurements;
 pub mod music;
 mod overlap;
+mod packed;
 pub mod paths;
 pub mod readahead;
 pub mod reference;
@@ -48,9 +49,9 @@ pub mod wake;
 
 /// Give back every process-wide copy of the models this crate keeps: the decode graph a
 /// resident pair holds, the process's mel graphs, the host copies of the weights, the
-/// rotary memo the prompts are built from and the device's shared weight pool. A
-/// long-lived caller that has finished a pass drops them here; the next call recompiles
-/// and re-reads, so it is a cost, not a state change.
+/// rotary memo the prompts are built from and the device's shared weight pool — the graphics
+/// backend's and the processor's alike. A long-lived caller that has finished a pass drops
+/// them here; the next call recompiles and re-reads, so it is a cost, not a state change.
 /// Nothing that survives a completed call grows without a bound — the host caches are keyed
 /// by tensor, the pool by scope and the rotary memo's tables capped by rows — so this is how
 /// a process gets *down* from that bound, not what makes it bounded. A rung's own graphs are
@@ -66,4 +67,5 @@ pub fn release_process_memory() {
     emit::clear_weight_caches();
     host::clear_rope_memo();
     rlx_wgpu::buffer::clear_shared_weights();
+    rlx_cpu::shared_params::clear();
 }

@@ -647,11 +647,13 @@ fn position_table(model: &Model, c: &CedConfig) -> Result<Vec<f32>> {
 /// matched. The pass would refuse this graph on two gates, and neither holds here:
 ///
 /// * **the weight's declared dtype.** The pass fuses only an `F32` weight, because
-///   its epilogue reads the weight as f32 and a backend that keeps the half bytes
-///   would read garbage. This one stores an `F16` parameter as one f32 lane per
-///   element, and the fused op derives its compute path from the same
-///   `derive_matmul_compute` call as a bare `MatMul` — so it reads the weight out of
-///   the same f32 arena image the unfused multiply read.
+///   its epilogue reads the weight as f32 and a backend that kept the half bytes
+///   would read garbage. The graphics arena widens an `F16` parameter to one f32
+///   lane per element and the fused op derives its compute path from the same
+///   `derive_matmul_compute` call as a bare `MatMul`, so it reads the weight out of
+///   the same f32 image the unfused multiply read. The processor keeps the bytes
+///   packed at 2 B/elem and its fused arm takes the dequant-on-the-fly GEMM, which
+///   is the dispatch a bare `MatMul` takes there too.
 /// * **the epilogue's activation.** The pass folds `Gelu` and `Silu` only, so the
 ///   head's `Sigmoid` would stay a step of its own. Every kernel this graph's shapes
 ///   can select carries the sigmoid arm: `matmul.wgsl`'s `apply_act` and each

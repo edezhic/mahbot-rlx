@@ -205,18 +205,30 @@ fn build_cpu_executable(
     // Under a param-sharing scope, large weights live on pages shared with the
     // scope's other executables; otherwise the plan's own arena.
     let mut shared_present = std::collections::HashSet::new();
+    let mut shared_to_write = std::collections::HashMap::new();
     let shared = rlx_cpu::shared_params::scope()
         .filter(|_| rlx_cpu::shared_params::SUPPORTED)
         .and_then(|scope| {
             let (plan, slots) = shared_weight_plan(&graph, &plan, alignment)?;
-            let keys: Vec<(String, u8, usize, usize)> = slots
+            let keys: Vec<(String, usize, usize)> = slots
                 .iter()
-                .map(|(name, nbytes, off)| (name.clone(), 0, *nbytes, *off))
+                .map(|(name, nbytes, off)| (name.clone(), *nbytes, *off))
                 .collect();
             let (arena, present) = Arena::from_plan_shared(plan, &scope, &keys)?;
-            for ((name, _, _), here) in slots.iter().zip(present) {
-                if here {
-                    shared_present.insert(param_of_key(name).to_string());
+            for ((name, _, offset), here) in slots.iter().zip(present) {
+                match here {
+                    // Another executable of the scope placed and wrote it.
+                    Some(true) => {
+                        shared_present.insert(name.to_string());
+                    }
+                    // This one placed it: its bytes are ours to write, and only then is it
+                    // resident for the scope's next executable. The offset is the slot we
+                    // mapped, which is what residency is recorded against.
+                    Some(false) => {
+                        shared_to_write.insert(name.clone(), *offset);
+                    }
+                    // Private: the mapping failed, so nothing may be recorded about it.
+                    None => {}
                 }
             }
             if rlx_ir::env::flag("RLX_VERBOSE") {
@@ -336,11 +348,9 @@ fn build_cpu_executable(
         baseline_written: false,
         keep_ranges: None,
         shared_present,
+        shared_to_write,
     }
 }
-
-/// Smallest weight worth a shared slot (each is rounded up to whole pages).
-const SHARED_WEIGHT_MIN: usize = 256 * 1024;
 
 /// Ops that only read their weight operand, so a weight they share across
 /// executables is never written through another's arena.
@@ -354,22 +364,28 @@ fn reads_weight_only(op: &Op) -> bool {
             | Op::DequantGroupedMatMul { .. }
             | Op::GroupedMatMul
             | Op::Transpose { .. }
+            // A convolution reads its kernel and writes only its output; the encoder
+            // front's are the f32 weights a processor graph would otherwise re-read.
+            | Op::Conv { .. }
+            | Op::ConvTranspose2d { .. }
+            | Op::Conv3d { .. }
+            | Op::ConvTranspose3d { .. }
+            | Op::PartitionedConv { .. }
+            | Op::QConv2d { .. }
+            | Op::FusedConvBiasAct { .. }
+            | Op::FusedMatMulBiasAct { .. }
+            | Op::FusedMatMulResidual
+            | Op::FusedSwiGLU { .. }
+            | Op::LoraMatMul { .. }
+            | Op::QMatMul { .. }
+            | Op::ScaledMatMul { .. }
     )
 }
 
-/// The registry key of a shared weight: its name and dtype.
-fn shared_key(name: &str, dtype: DType) -> String {
-    format!("{name}\u{1f}{dtype:?}")
-}
-
-fn param_of_key(key: &str) -> &str {
-    key.split('\u{1f}').next().unwrap_or(key)
-}
-
 /// Re-lay `full` (a plan with params) for a shared-weight arena: activations
-/// planned without params, then the small params, then each large read-only
-/// weight on its own page-aligned slot. Returns the plan and the shared slots
-/// as `(key, bytes, offset)`, or `None` when there is nothing to share.
+/// planned without params, then each read-only weight on its own page-aligned
+/// slot, then whatever is left. Returns the plan and the shared slots as
+/// `(key, bytes, offset)`, or `None` when there is nothing to share.
 fn shared_weight_plan(
     graph: &Graph,
     full: &MemoryPlan,
@@ -404,11 +420,10 @@ fn shared_weight_plan(
         .nodes()
         .iter()
         .filter(|n| matches!(n.op, Op::Param { .. }))
-        .filter(|n| {
-            full.assignments
-                .get(&n.id)
-                .is_some_and(|s| s.size >= SHARED_WEIGHT_MIN)
-        })
+        // Every read-only weight, however small. A graph that shares its large weights and
+        // reads its small ones off the file is still a graph that reads the file: measured on
+        // the stand's `recognition.short` row, the warm arm re-read 171 pages of the body
+        // file — the norms and the small heads — with the large weights already in the pool.
         .filter(|n| readers_ok.get(&n.id).copied().unwrap_or(false) && !is_output(n.id))
         .collect();
     if shared.is_empty() {
@@ -434,7 +449,7 @@ fn shared_weight_plan(
         let Op::Param { name } = &node.op else {
             unreachable!()
         };
-        slots.push((shared_key(name, node.shape.dtype()), size, weights_end));
+        slots.push((name.clone(), size, weights_end));
         placed.insert(
             node.id,
             memory::BufferSlot {
@@ -541,11 +556,25 @@ struct CpuExecutable {
     /// Params whose shared pages another executable had already filled
     /// ([`rlx_cpu::shared_params`]), so binding them again is redundant.
     shared_present: std::collections::HashSet<String>,
+    /// The slots this executable is the first to place, by the offset each was mapped at — the
+    /// object it writes is the object it mapped, so residency is recorded against that and
+    /// never looked up again by key.
+    shared_to_write: std::collections::HashMap<String, usize>,
 }
 
 unsafe impl Send for CpuExecutable {}
 
 impl CpuExecutable {
+    /// Tell the shared-weight pool that `name`'s pages hold their bytes now. Only the
+    /// executable that created the object writes them; a later one is told to skip its write
+    /// because of this call, so it is made after the bytes are in and never before.
+    fn mark_shared_written(&mut self, name: &str) {
+        let Some(offset) = self.shared_to_write.get(name) else {
+            return;
+        };
+        self.arena.mark_shared_written(*offset);
+    }
+
     /// `RLX_CPU_ARENA_REPORT=1`: attribute the arena's resident bytes to nodes,
     /// split persistent (Param/Input/Constant — live the whole run) vs scratch,
     /// so a bloated footprint can be traced to specific buffers.
@@ -873,6 +902,16 @@ impl ExecutableGraph for CpuExecutable {
         self.shared_present.contains(name)
     }
 
+    /// The scope's shared pages hold this parameter's bytes: the slot is the scope's own
+    /// extent, so the length adds nothing to the question [`Self::param_already_set`] answers.
+    fn param_resident(&self, name: &str, _len: usize) -> bool {
+        self.param_already_set(name)
+    }
+
+    fn mark_param_written(&mut self, name: &str) {
+        self.mark_shared_written(name);
+    }
+
     fn capabilities(&self) -> crate::ExecutableCapabilities {
         crate::ExecutableCapabilities {
             clone: true,
@@ -909,6 +948,7 @@ impl ExecutableGraph for CpuExecutable {
             unsafe {
                 write_typed_from_f32(buf.as_mut_ptr().add(off), dtype, data, max_elems);
             }
+            self.mark_shared_written(name);
         }
     }
 
@@ -1073,6 +1113,78 @@ impl ExecutableGraph for CpuExecutable {
             .map(<[f32]>::to_vec)
     }
 
+    /// Write `rows` into the resident input `name` at row `row`, `row_elems`
+    /// floats wide — the write counterpart of [`Self::read_gpu_handle_row`], and
+    /// the way a caller seeds a cache whose rows are another graph's output.
+    ///
+    /// Two callers rely on it: the resident K/V plane a recognition decode seeds
+    /// from its prefill (the prefill answers `[layers, prompt_rows, hkv]` and each
+    /// layer's span goes into the plane slot the step reads), and the grouped
+    /// encoder-tail pass's `flat` slot, which gathers its pieces' rows one piece
+    /// at a time.
+    ///
+    /// The processor's copy of this differs from the graphics one in what it costs
+    /// rather than in what it promises: both the mirror and the arena are host
+    /// memory here, so a write is one `memcpy` into each and the padded slot does
+    /// exist on the host. What the incremental form still buys is the caller's
+    /// side — the prefill's output never has to be gathered into one
+    /// `[layers, rows, hkv]` buffer before it is written.
+    ///
+    /// The host mirror is *grown* to the slot's own extent here rather than
+    /// assumed to be there: a caller binds a resident input with
+    /// [`Self::bind_gpu_handle`] and an empty slice — the rows arrive later, one
+    /// write at a time — and the resident-plane path never binds at all, so on the
+    /// first write of either the mirror is empty and the slot's width is the only
+    /// thing that says how long it has to be. Growing it zero-filled keeps the
+    /// untouched rows what the contract says they are: zero in a fresh arena, and
+    /// the previous write's values in one that has been written before.
+    ///
+    /// `false`, with nothing written, when the name is no bound graph input, when
+    /// the slot's extent is not static, when the rows would run past it — a
+    /// truncated write would leave a plane no mask can describe — or when the
+    /// arena holds no slot for the input: the bytes would reach the host mirror
+    /// and nothing else, since `execute`'s handle pass copies only names the
+    /// arena took, so answering `true` would report a write the graph can never
+    /// see.
+    fn write_gpu_handle_rows(
+        &mut self,
+        name: &str,
+        row: usize,
+        row_elems: usize,
+        rows: &[f32],
+    ) -> bool {
+        let Some(&id) = self.input_ids.get(name) else {
+            return false;
+        };
+        if !self.arena.has_buffer(id) {
+            return false;
+        }
+        let Some(extent) = self.graph.node(id).shape.num_elements() else {
+            return false;
+        };
+        let Some(start) = row.checked_mul(row_elems) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(rows.len()) else {
+            return false;
+        };
+        if end > extent {
+            return false;
+        }
+        let mirror = self.handles.entry(name.to_string()).or_default();
+        if mirror.len() < extent {
+            mirror.resize(extent, 0.0);
+        }
+        mirror[start..end].copy_from_slice(rows);
+        self.write_input_elems(id, start, rows);
+        // The keep-ranges are recomputed for the same reason `bind_gpu_handle` does it: a
+        // range the run's baseline restore must keep has just changed.
+        if self.arena_handles.insert(name.to_string()) {
+            self.keep_ranges = None;
+        }
+        true
+    }
+
     fn register_kv_row_feed(&mut self, handle_name: &str, output_index: usize) -> bool {
         self.kv_row_feeds.retain(|(h, _)| h != handle_name);
         self.kv_row_feeds
@@ -1126,6 +1238,39 @@ impl ExecutableGraph for CpuExecutable {
 
     fn rng(&self) -> rlx_ir::RngOptions {
         *self.schedule.rng.read().unwrap()
+    }
+
+    /// Rewrite the draw seeds of this executable's `Sample` steps, in schedule
+    /// order — the one per-run knob a sampling graph needs, since `Op::Sample`'s
+    /// seed is a field of the step and not a compile-time constant.
+    ///
+    /// Answers `false` (writing nothing) when the schedule's `Sample` count is not
+    /// `seeds.len()`, so a graph whose sampler lowered to `Argmax` — greedy draws,
+    /// `temperature <= 0` or `top_k == 1` — is asked with an empty slice rather
+    /// than silently keeping a stale seed it has nowhere to put.
+    ///
+    /// Rewriting the thunk is enough: the executor matches on each `&Thunk` at
+    /// execution time and `exec_sample` takes the `seed` out of the one it is
+    /// handed, and the pre-compiled closure vector beside the thunks — the only
+    /// thing that would capture it by value — has no caller.
+    fn set_sample_seeds(&mut self, seeds: &[u64]) -> bool {
+        let count = self
+            .schedule
+            .thunks
+            .iter()
+            .filter(|t| matches!(t, thunk::Thunk::Sample { .. }))
+            .count();
+        if count != seeds.len() {
+            return false;
+        }
+        let mut i = 0;
+        for t in &mut self.schedule.thunks {
+            if let thunk::Thunk::Sample { seed, .. } = t {
+                *seed = seeds[i];
+                i += 1;
+            }
+        }
+        true
     }
 
     fn set_moe_resident_experts(&mut self, mask: &[bool]) {
@@ -1557,6 +1702,7 @@ impl CpuExecutable {
                 "set_param_bytes: '{name}' would overflow arena slot"
             );
             buf[off..off + data.len()].copy_from_slice(data);
+            self.mark_shared_written(name);
         }
     }
 }
@@ -1610,5 +1756,152 @@ unsafe fn read_as_f32(src: *const u8, dtype: DType, n: usize) -> Vec<f32> {
             .map(|i| unsafe { (src as *const i64).add(i).read_unaligned() } as f32)
             .collect(),
         _ => unsafe { read_typed_to_f32(src, dtype, n) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Device, Session};
+    use rlx_ir::{Graph, Shape};
+
+    /// A compiled sampling graph: `batch` rows of `vocab` logits, one genuine draw
+    /// per row at temperature 1.0 with neither truncation, so the seed is the only
+    /// thing that decides the answer.
+    fn sampling(batch: usize, vocab: usize, seed: u64) -> crate::CompiledGraph {
+        let mut g = Graph::new("sample");
+        let logits = g.input("logits", Shape::new(&[batch, vocab], DType::F32));
+        let y = g.sample(logits, 0, 1.0, 1.0, seed, Shape::new(&[batch], DType::F32));
+        g.set_outputs(vec![y]);
+        Session::new(Device::Cpu).compile(g)
+    }
+
+    /// Logits with a real spread, so a draw is not the same token under every seed.
+    fn logits(batch: usize, vocab: usize) -> Vec<f32> {
+        (0..batch * vocab)
+            .map(|i| ((i % vocab) as f32 * 0.37).sin() * 3.0 + (i / vocab) as f32 * 0.1)
+            .collect()
+    }
+
+    /// **A seed rewrite reaches the `Sample` step, and a count that does not match
+    /// writes nothing.** The seed is a field of the step rather than a pipeline
+    /// constant, so this is the only way a caller changes what a compiled sampling
+    /// graph draws; a rewrite that missed the thunk would keep drawing the seed the
+    /// graph was compiled with, and a refused one that wrote part of its list would
+    /// leave the step on a seed nobody asked for.
+    #[test]
+    fn a_seed_rewrite_reaches_the_sample_step_and_a_wrong_count_writes_nothing() {
+        let (batch, vocab) = (4usize, 64usize);
+        let logits = logits(batch, vocab);
+        let mut exe = sampling(batch, vocab, 7);
+
+        assert!(exe.set_sample_seeds(&[11]), "one seed for one Sample step");
+        let first = exe.run(&[("logits", &logits)]).pop().unwrap();
+        assert!(
+            exe.set_sample_seeds(&[12]),
+            "a second seed for the same step"
+        );
+        let second = exe.run(&[("logits", &logits)]).pop().unwrap();
+        // 4 rows over 64 tokens: a collision here is 64^-4, so equal draws are a
+        // rewrite that did not land rather than a coincidence.
+        assert_ne!(
+            first, second,
+            "the seed did not reach the draw: {first:?} both times"
+        );
+
+        assert!(
+            !exe.set_sample_seeds(&[13, 14]),
+            "two seeds for one Sample step"
+        );
+        let third = exe.run(&[("logits", &logits)]).pop().unwrap();
+        assert_eq!(
+            second, third,
+            "a refused rewrite changed what the step draws"
+        );
+    }
+
+    /// A compiled graph whose only node is the resident input `kv`, declared as the
+    /// output so a run answers the arena's own contents: `[rows, width]`.
+    fn resident(rows: usize, width: usize) -> crate::CompiledGraph {
+        let mut g = Graph::new("resident");
+        let kv = g.input("kv", Shape::new(&[rows, width], DType::F32));
+        g.set_outputs(vec![kv]);
+        Session::new(Device::Cpu).compile(g)
+    }
+
+    /// **A row write grows the mirror to the slot's own extent, and the arena says
+    /// the same thing.** The resident plane a decode seeds from its prefill is
+    /// written one row at a time, and the path never binds, so the mirror is empty on
+    /// the first write and the slot's width is the only thing that says how long it
+    /// has to be — the untouched rows have to read as the zeros it was grown with, and
+    /// a write that would run past the slot has to be refused rather than truncate a
+    /// plane no mask can describe.
+    #[test]
+    fn a_row_write_fills_its_slot_and_a_write_past_the_extent_is_refused() {
+        let (rows, width) = (2usize, 4usize);
+        let mut exe = resident(rows, width);
+
+        assert!(
+            exe.write_gpu_handle_rows("kv", 1, width, &[5.0, 6.0, 7.0, 8.0]),
+            "a row inside the slot"
+        );
+        assert_eq!(
+            exe.read_gpu_handle_row("kv", 0, width).unwrap(),
+            vec![0.0; width],
+            "the row the write did not touch is the zero the mirror was grown with"
+        );
+        assert_eq!(
+            exe.read_gpu_handle_row("kv", 1, width).unwrap(),
+            vec![5.0, 6.0, 7.0, 8.0],
+            "the mirror holds the row that was written"
+        );
+        let mut want = vec![0.0; width];
+        want.extend_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(
+            exe.run(&[]).pop().unwrap(),
+            want,
+            "the arena the step reads holds the written row and zeros elsewhere"
+        );
+
+        // Past the declared extent, by one element and by one row; and a name that
+        // is no bound graph input at all.
+        for (row, data) in [
+            (1usize, vec![1.0f32; width + 1]),
+            (rows, vec![1.0f32; width]),
+        ] {
+            assert!(
+                !exe.write_gpu_handle_rows("kv", row, width, &data),
+                "row {row} with {} elements is past the slot",
+                data.len()
+            );
+        }
+        assert!(
+            !exe.write_gpu_handle_rows("absent", 0, width, &[1.0; 4]),
+            "a name no graph input carries"
+        );
+        assert_eq!(
+            exe.run(&[]).pop().unwrap(),
+            want,
+            "a refused write wrote nothing"
+        );
+    }
+
+    /// **A bound input the plan gave no arena slot is refused, not reported.** The
+    /// handle pass copies only the names the arena took, so a write that reached the
+    /// host mirror alone would answer `true` and change nothing the graph reads — the
+    /// shape of the zeros bug, one layer down.
+    #[test]
+    fn a_row_write_to_an_input_with_no_arena_slot_is_refused() {
+        let (rows, width) = (2usize, 4usize);
+        let mut g = Graph::new("dead");
+        let kv = g.input("kv", Shape::new(&[rows, width], DType::F32));
+        // Bound, named, and read by nothing: the plan assigns it no slot.
+        let _dead = g.input("dead", Shape::new(&[rows, width], DType::F32));
+        g.set_outputs(vec![kv]);
+        let mut exe = Session::new(Device::Cpu).compile(g);
+        assert!(
+            !exe.write_gpu_handle_rows("dead", 0, width, &[1.0; 4]),
+            "a write the arena cannot take"
+        );
     }
 }

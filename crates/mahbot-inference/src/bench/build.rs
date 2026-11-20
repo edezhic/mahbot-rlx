@@ -63,8 +63,6 @@ fn run() -> Result<()> {
     let started = std::time::Instant::now();
     let cfg = BenchConfig::from_env(Mode::Build)?;
     let _lock = RunLock::acquire(&cfg.lock)?;
-    // The switch is read after the arguments and the lock, the order the other binaries
-    // take: a forced graphics run does not create the device while another run holds it.
     super::resolve_device("[wake-word build] ")?;
     // Resolved before the guard: the generation names the manifest that a stopped
     // build records as well as the one a completed build writes.
@@ -72,6 +70,9 @@ fn run() -> Result<()> {
     // No wall-clock stop: this is the deliberate render, not a measurement.
     let deadline = Deadline::unbounded();
     let ceiling = MemoryCeiling::with_swap_growth(cfg.max_rss_mib, cfg.swap_growth_mib);
+    if let Some(note) = ceiling.unarmed() {
+        eprintln!("[wake-word build] {note}");
+    }
     let progress = Arc::new(Mutex::new(Progress::default()));
     let account = Account::new(&cfg.cache, inputs.synthesis_hash(), started);
     // The manifest is read before anything renders, and every terminal path states

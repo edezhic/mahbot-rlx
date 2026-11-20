@@ -2,10 +2,11 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The repository's record: three files at its root, one per measuring surface,
+//! The repository's record: four files at its root, one per measuring surface,
 //! each rewritten whole by the only run that can produce it — `STAND.md` by a
-//! complete main stand run, `TRANSCRIPTION-CORPUS.md` by a complete corpus run,
-//! `WAKE-WORD-BENCH.md` by a complete wake-word bench run.
+//! complete main stand run, `STAND-CPU.md` by a complete stand run on the processor,
+//! `TRANSCRIPTION-CORPUS.md` by a complete corpus run, `WAKE-WORD-BENCH.md` by a
+//! complete wake-word bench run.
 //!
 //! A run writes no other mode's file, and a partial, subset or screened run writes
 //! nothing at all. The files are a record, not a log: history is what version
@@ -25,20 +26,27 @@ use crate::source::rust_code;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Record {
     Stand,
+    StandProcessor,
     TranscriptionCorpus,
     WakeWordBench,
 }
 
 impl Record {
-    /// Every record, so a test that must speak of all of them cannot be written
-    /// against three names and miss a fourth.
-    pub const ALL: [Self; 3] = [Self::Stand, Self::TranscriptionCorpus, Self::WakeWordBench];
+    /// Every record, so a test that must speak of all of them names each one and cannot be
+    /// written against a set that has since grown.
+    pub const ALL: [Self; 4] = [
+        Self::Stand,
+        Self::StandProcessor,
+        Self::TranscriptionCorpus,
+        Self::WakeWordBench,
+    ];
 
     /// The file's name at the workspace root.
     #[must_use]
     pub const fn file(self) -> &'static str {
         match self {
             Self::Stand => "STAND.md",
+            Self::StandProcessor => "STAND-CPU.md",
             Self::TranscriptionCorpus => "TRANSCRIPTION-CORPUS.md",
             Self::WakeWordBench => "WAKE-WORD-BENCH.md",
         }
@@ -49,6 +57,7 @@ impl Record {
     pub const fn heading(self) -> &'static str {
         match self {
             Self::Stand => "# Stand",
+            Self::StandProcessor => "# Stand (processor)",
             Self::TranscriptionCorpus => "# Transcription corpus",
             Self::WakeWordBench => "# Wake-word bench",
         }
@@ -57,7 +66,7 @@ impl Record {
     /// The directory the record goes into: `MAHBOT_MEASUREMENTS` when it names a
     /// directory, otherwise the workspace root of the tree that **compiled** this
     /// binary (`CARGO_MANIFEST_DIR`'s grandparent). A redirect that is not a
-    /// directory would collapse the three modes into one file, so it is refused —
+    /// directory would collapse the four modes into one file, so it is refused —
     /// before a run measures anything, through [`Record::prepare`].
     fn dir() -> Result<PathBuf> {
         let dir = match std::env::var_os("MAHBOT_MEASUREMENTS").filter(|path| !path.is_empty()) {
@@ -82,22 +91,46 @@ impl Record {
     /// for a bench harness is a hashed path in a build directory and for any mode
     /// carries its scratch flags. The input bullets beside it name the material the
     /// run read, which is the rest of what a re-run needs.
-    const fn command(self) -> &'static str {
+    ///
+    /// The recipe states the switch that produced *this* take, so the two stand records cannot
+    /// contradict the `- device:` line beside them: a forced take names the switch, and a take
+    /// that ran on the processor because no graphics device was there names the plain
+    /// invocation a machine without one runs. Only those records are reached that way — the
+    /// corpus run and the bench have no processor record — so the mode is asked first and the
+    /// arrival only where the mode has a device of its own to explain.
+    fn command(self, arrival: Option<crate::device::Arrival>) -> &'static str {
+        use crate::device::Arrival;
         match self {
-            Self::Stand => "cargo run --release -p mahbot-inference",
+            Self::Stand | Self::StandProcessor => match arrival {
+                Some(Arrival::Forced(rlx_runtime::Device::Gpu)) => {
+                    "MAHBOT_DEVICE=gpu cargo run --release -p mahbot-inference"
+                }
+                // The product settles only the two devices the switch can name, so any other
+                // forced device is the processor's recipe by construction.
+                Some(Arrival::Forced(_)) => {
+                    "MAHBOT_DEVICE=cpu cargo run --release -p mahbot-inference"
+                }
+                // No graphics API is enabled on the machine itself, so the plain invocation
+                // is the one that reproduces this take; the switch is only how absence is
+                // produced on a host that has a graphics device.
+                Some(Arrival::Absent | Arrival::Refused) | None => {
+                    "cargo run --release -p mahbot-inference"
+                }
+            },
             Self::TranscriptionCorpus => {
                 "cargo run --release -p mahbot-inference --features bench --bin \
                  transcription-corpus"
             }
             Self::WakeWordBench => {
-                "cargo bench -p mahbot-inference --features bench --bench wake_word -- --report <file>"
+                "cargo bench -p mahbot-inference --features bench --bench wake_word -- \
+                 --report <file>"
             }
         }
     }
 
     /// The provenance line stating the recipe this record is reproduced with.
-    fn command_line(self) -> String {
-        format!("- command: {}\n", self.command())
+    fn command_line(self, arrival: Option<crate::device::Arrival>) -> String {
+        format!("- command: {}\n", self.command(arrival))
     }
 
     /// Take the record a run is about to write: sweep the temporaries no live run is
@@ -120,13 +153,34 @@ impl Record {
             .and_then(|()| std::fs::remove_file(&probe))
             .with_context(|| format!("cannot write {}", path.display()))
     }
+
+    /// Reclaim the temporary a killed run of this record left beside it, and write nothing.
+    /// For a take that knows it writes no record — a forced processor take of a mode without
+    /// one: the sweep cannot fail, while [`Self::prepare`]'s probe can, and a take that writes
+    /// nothing must not be refused over a file.
+    pub fn reclaim(self) {
+        if let Ok(path) = self.path() {
+            sweep_beside(&path);
+        }
+    }
 }
 
 /// Replace `record` whole: its heading, its body — the table or tables — and the
-/// provenance block its inputs build. A mode owns one file, so this is the only
-/// write path.
-pub fn write(record: Record, body: &str, inputs: &str) -> Result<()> {
-    write_at(&record.path()?, record, body, &provenance(record, inputs))
+/// provenance block its inputs build. A record has one writer, so this is the only
+/// write path. `on` is the device the take ran on, stated by the provenance.
+pub(crate) fn write(
+    record: Record,
+    on: rlx_runtime::Device,
+    arrival: Option<crate::device::Arrival>,
+    body: &str,
+    inputs: &str,
+) -> Result<()> {
+    write_at(
+        &record.path()?,
+        record,
+        body,
+        &provenance(record, on, arrival, inputs),
+    )
 }
 
 /// Replace a record file whole. Its previous content is irrelevant: a record is
@@ -313,10 +367,32 @@ fn machine() -> String {
     format!("{arch} · {cpu}")
 }
 
-/// The device the graphs ran on, as the backend named it.
+/// The device the graphs ran on, as the backend named it, and how the run arrived at it where
+/// there is something to explain.
+///
+/// The device is the caller's, not this module's guess: a processor take must not create the
+/// graphics device to name its own provenance. The arrival is the part a reader cannot infer —
+/// a forced take is not the shipped arrangement's, on either device — so it is stated on both:
+/// the switch that forced this one, or the absence of a graphics device that left the processor
+/// as the only one. It reaches the record as a closed token carried from the rows, never as
+/// operator text, and a token this build does not know refuses the record ([`crate::run`]'s
+/// `taken`), so the line always states something the run established.
 #[must_use]
-fn device() -> String {
-    rlx_wgpu::device::adapter_label().unwrap_or_else(|| "no wgpu adapter".to_string())
+fn device(on: rlx_runtime::Device, arrival: Option<crate::device::Arrival>) -> String {
+    if on == rlx_runtime::Device::Cpu {
+        return match arrival {
+            Some(arrival) => format!("cpu ({})", arrival.text()),
+            None => "cpu".to_string(),
+        };
+    }
+    let adapter =
+        rlx_wgpu::device::adapter_label().unwrap_or_else(|| "no wgpu adapter".to_string());
+    // A dash rather than brackets: an adapter is named with its own, so brackets here would
+    // read `Apple M3 Pro (Metal) (MAHBOT_DEVICE=gpu)`.
+    match arrival {
+        Some(arrival) => format!("{adapter} — {}", arrival.text()),
+        None => adapter,
+    }
 }
 
 /// `release` or `debug`.
@@ -360,10 +436,15 @@ fn load() -> String {
 /// from what code, under which switches, by which invocation, and the run's own
 /// input pins. `inputs` is `record`'s own bullets — the material the rows read.
 #[must_use]
-fn provenance(record: Record, inputs: &str) -> String {
+fn provenance(
+    record: Record,
+    on: rlx_runtime::Device,
+    arrival: Option<crate::device::Arrival>,
+    inputs: &str,
+) -> String {
     let mut body = format!("_Measured {}._\n", now());
     body.push_str(&format!("- machine: {}\n", machine()));
-    body.push_str(&format!("- device: {}\n", device()));
+    body.push_str(&format!("- device: {}\n", device(on, arrival)));
     body.push_str(&format!("- profile: {}\n", profile()));
     let load = load();
     if !load.is_empty() {
@@ -374,8 +455,8 @@ fn provenance(record: Record, inputs: &str) -> String {
         code_state(),
         exclusions_note(),
     ));
-    body.push_str(&record.command_line());
-    body.push_str(&run_form());
+    body.push_str(&record.command_line(arrival));
+    body.push_str(&run_form(on));
     body.push_str(inputs);
     body
 }
@@ -385,8 +466,38 @@ fn provenance(record: Record, inputs: &str) -> String {
 /// one — some of them move the numbers. Omitted when none is set. Read as the
 /// platform hands the names over, so a variable that is not UTF-8 cannot take the
 /// record with it.
-fn run_form() -> String {
-    let mut set: Vec<(String, String)> = std::env::vars_os()
+///
+/// Beside them stands the one switch this product sets through the engine's override layer
+/// rather than the environment: the processor's dequantised-weight cache is switched off
+/// in-process when the processor is settled, so a record that read only the environment would
+/// leave the arrangement that shapes every processor row unstated. It is stated from
+/// [`crate::device::dequant_cache_switched_off`] — the decision `settle` took — so the line
+/// carries the switch exactly when the run applied it and never beside an operator variable
+/// that kept the cache on.
+fn run_form(on: rlx_runtime::Device) -> String {
+    let set = run_form_pairs(
+        on,
+        crate::device::dequant_cache_switched_off(),
+        std::env::vars_os(),
+    );
+    if set.is_empty() {
+        return String::new();
+    }
+    let pairs: Vec<String> = set
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    format!("- run form: {}\n", pairs.join(" · "))
+}
+
+/// The pairs [`run_form`] states, sorted: the `RLX_*` / `WGPU_*` variables the run had, and the
+/// processor's cache switch where the run applied it.
+fn run_form_pairs(
+    on: rlx_runtime::Device,
+    cache_off: bool,
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(String, String)> {
+    let mut set: Vec<(String, String)> = vars
         .filter(|(name, _)| {
             let name = name.to_string_lossy();
             name.starts_with("RLX_") || name.starts_with("WGPU_")
@@ -398,15 +509,11 @@ fn run_form() -> String {
             )
         })
         .collect();
-    if set.is_empty() {
-        return String::new();
+    if on == rlx_runtime::Device::Cpu && cache_off {
+        set.push((crate::device::DEQUANT_CACHE.to_string(), "0".to_string()));
     }
     set.sort();
-    let pairs: Vec<String> = set
-        .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect();
-    format!("- run form: {}\n", pairs.join(" · "))
+    set
 }
 
 /// The code state the numbers were taken at: `git describe --always` plus the
@@ -435,7 +542,7 @@ fn code_state() -> String {
 }
 
 /// What the content digest leaves out, and why: a document is prose about the tree
-/// rather than an input to a figure (the three records are Markdown too), no file
+/// rather than an input to a figure (the records are Markdown too), no file
 /// under a `tests` directory or in a `tests.rs` module runs in a measuring binary,
 /// and the vendored MLX checkout is not this fork's content. One list, printed beside
 /// the figure it produces; [`excluded`] matches it.
@@ -681,21 +788,36 @@ mod tests {
         }
     }
 
-    /// The fork's checkout root, when this crate is built inside it. The records
-    /// themselves are the test: a packaged or vendored copy sits under some other
-    /// root and carries none, so both checks below skip there instead of failing.
+    /// The fork's checkout root, or `None` for a tree that ships no record at all — a published
+    /// archive, which has nothing to check. `CARGO_MANIFEST_DIR` is baked in at compile time,
+    /// so the tree that compiled the crate is the one asked, and a checkout is recognised by
+    /// shipping *some* of the four: one that ships some and not others is a failure rather than
+    /// a skip, because otherwise deleting a record would leave this gate green, which is the
+    /// silent skip it exists to remove.
+    ///
+    /// # Panics
+    /// Panics when the tree ships any record but not all four.
     fn repository_root() -> Option<PathBuf> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-        Record::ALL
+        let there = |record: &Record| root.join(record.file()).is_file();
+        if !Record::ALL.iter().any(there) {
+            return None;
+        }
+        let missing: Vec<&str> = Record::ALL
             .iter()
-            .all(|record| root.join(record.file()).is_file())
-            .then_some(root)
+            .filter(|record| !there(record))
+            .map(|record| record.file())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "a record this crate owns is missing from {}: {missing:?}",
+            root.display()
+        );
+        Some(root)
     }
 
     /// Each checked-in record opens with the heading its own mode writes, and nothing
-    /// else on that line, so a hand-edited file cannot contradict the code that owns
-    /// it. The files live in the repository, not in the crate, so a copy outside the
-    /// checkout skips this.
+    /// else on that line, so a hand-edited file cannot contradict the code that owns it.
     #[test]
     fn every_record_opens_with_its_own_heading() {
         let Some(root) = repository_root() else {
@@ -720,16 +842,16 @@ mod tests {
     /// provenance line prints names every path the digest excludes, so the rule a
     /// record states is the rule the code applies. The transforms the rule states are
     /// the stripper's, covered by the tests in `source`; hand-reproducibility of the
-    /// whole digest is deliberately not claimed. A copy outside the checkout carries
-    /// no records, so it skips; in the repository a tree git cannot read has nothing
-    /// to pin, so the check fails rather than passing quietly. Device-free, and it
-    /// reads the tree instead of writing into it.
+    /// whole digest is deliberately not claimed. The records the tree ships are checked
+    /// first — this is the checkout — and a tree git cannot read has nothing to pin, so
+    /// the check fails rather than passing quietly. Device-free, and it reads the tree
+    /// instead of writing into it.
     #[test]
     fn the_code_state_carries_the_digest_of_the_trees_content() {
-        if repository_root().is_none() {
+        let Some(_root) = repository_root() else {
             eprintln!("skipped: no records beside this crate");
             return;
-        }
+        };
         let state = code_state();
         eprintln!("code_state: {state}");
         let (_describe, digest) = state
@@ -749,7 +871,7 @@ mod tests {
         }
     }
 
-    /// The digest leaves out the three records, every Markdown document, every
+    /// The digest leaves out the four records, every Markdown document, every
     /// `tests/` directory, every `tests.rs` module and the vendored backend, and a
     /// writer's leftover temporary; a source file under `src/` is content.
     #[test]
@@ -943,17 +1065,51 @@ mod tests {
     /// Each record states the recipe its own mode is reproduced with, in the line the
     /// provenance block renders from the record alone — a shell invocation, never a
     /// path from the run host, which for a bench harness is a hashed path in a build
-    /// directory and for any mode carries the run's scratch flags.
+    /// directory and for any mode carries the run's scratch flags. The recipe follows the
+    /// arrival, so the processor record states the invocation that produced it.
     #[test]
     fn every_record_names_the_invocation_its_mode_documents() {
-        for record in Record::ALL {
-            let line = record.command_line();
+        use crate::device::Arrival;
+        use rlx_runtime::Device;
+        for (record, arrival) in [
+            (Record::Stand, None),
+            (Record::Stand, Some(Arrival::Forced(Device::Gpu))),
+            (Record::StandProcessor, Some(Arrival::Forced(Device::Cpu))),
+            (Record::StandProcessor, Some(Arrival::Absent)),
+            (
+                Record::TranscriptionCorpus,
+                Some(Arrival::Forced(Device::Gpu)),
+            ),
+            (Record::WakeWordBench, None),
+        ] {
+            let line = record.command_line(arrival);
             assert!(
                 line.starts_with("- command: ") && !line.contains('/'),
                 "{}: {line}",
                 record.file()
             );
         }
+        // A forced take names its switch; a take the machine made happen names the plain
+        // invocation a machine without a graphics device runs.
+        assert_eq!(
+            Record::Stand.command_line(Some(Arrival::Forced(Device::Gpu))),
+            "- command: MAHBOT_DEVICE=gpu cargo run --release -p mahbot-inference\n"
+        );
+        assert_eq!(
+            Record::StandProcessor.command_line(Some(Arrival::Forced(Device::Cpu))),
+            "- command: MAHBOT_DEVICE=cpu cargo run --release -p mahbot-inference\n"
+        );
+        assert_eq!(
+            Record::StandProcessor.command_line(Some(Arrival::Absent)),
+            "- command: cargo run --release -p mahbot-inference\n"
+        );
+        // The corpus run and the bench are never reached through a device switch: a forced
+        // graphics take of either names its own invocation, not the stand's.
+        assert_eq!(
+            Record::WakeWordBench.command_line(Some(Arrival::Forced(Device::Gpu))),
+            "- command: cargo bench -p mahbot-inference --features bench --bench wake_word -- \
+             --report <file>\n"
+        );
     }
 
     /// The naming rule exists once: the name the writer makes for a pid is the name the
@@ -1043,5 +1199,24 @@ mod tests {
 
         assert!(!neighbour.exists(), "a dead writer's neighbour survived");
         assert!(live.exists(), "a live run's in-flight write was swept");
+    }
+
+    /// A record states the processor's cache switch exactly when the run applied it, and never
+    /// beside the operator's own variable that kept the cache on.
+    #[test]
+    fn a_record_states_the_processor_switch_only_where_the_run_applied_it() {
+        fn none() -> std::iter::Empty<(std::ffi::OsString, std::ffi::OsString)> {
+            std::iter::empty()
+        }
+        assert_eq!(
+            run_form_pairs(rlx_runtime::Device::Cpu, true, none()),
+            vec![("RLX_DEQUANT_CACHE".to_string(), "0".to_string())],
+            "the record does not state the arrangement its rows ran under"
+        );
+        // An operator knob kept the cache on, so there is no switch of ours to state — the
+        // line carries their variable and cannot contradict it.
+        assert!(run_form_pairs(rlx_runtime::Device::Cpu, false, none()).is_empty());
+        // The graphics device is not held to it, so its line does not state it.
+        assert!(run_form_pairs(rlx_runtime::Device::Gpu, true, none()).is_empty());
     }
 }

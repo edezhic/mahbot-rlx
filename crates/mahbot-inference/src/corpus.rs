@@ -88,6 +88,7 @@ pub fn main_entry() {
     run::record_run(run::Mode {
         label: "transcription-corpus",
         record: measurements::Record::TranscriptionCorpus,
+        processor_record: None,
         marker: ROW_CHILD,
         total: files().len(),
         name: |index| files()[index].0,

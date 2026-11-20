@@ -627,10 +627,11 @@ impl Model {
     /// and its other tensors are `F32`, which is why the rule exists at all: under
     /// [`Model::open`]'s rule every one of those matrices would be widened to f32
     /// and kept that way. What the f16 tag buys is a smaller typed image on the
-    /// host ([`Model::linear_f16`]); the session widens those bytes into the f32
-    /// arena either way, and which kernel multiplies them is the backend's per-shape
-    /// and per-device choice — [`crate::ced`] records the arm this tagger's geometry
-    /// lands on.
+    /// host ([`Model::linear_f16`]). The bytes reach the device as they are: the
+    /// graphics arena widens them to one f32 lane per element, the processor keeps them
+    /// packed and dequantises them on the fly, and which kernel multiplies them is the
+    /// backend's per-shape and per-device choice — [`crate::ced`] records the arm this
+    /// tagger's geometry lands on.
     pub fn open_ced(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = GgufFile::from_path_mmap_skipping(&path, VOCABULARY)

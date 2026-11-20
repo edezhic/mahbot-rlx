@@ -134,6 +134,9 @@ struct Vm {
     /// platform's own itemisation of the GPU's share of it. `None` where the
     /// platform's accounting is too old to carry the tag ledgers.
     gpu: Option<u64>,
+    /// Bytes faulted back in from the swap file since the task started. `None` where the
+    /// platform's accounting is too old to carry the ledger.
+    swapins: Option<u64>,
 }
 
 /// The process's physical footprint: `(now, lifetime maximum)`, as the platform
@@ -151,6 +154,33 @@ pub fn footprint() -> Option<(u64, u64)> {
 
 #[cfg(not(target_os = "macos"))]
 pub fn footprint() -> Option<(u64, u64)> {
+    None
+}
+
+/// How many bytes this process has faulted back in from the swap file since it started: the
+/// platform's only figure for one process, and the one [`crate::guard::MAX_SWAP_GROWTH_MIB`]
+/// measures a growth of (that doc states which figure a host produces, and why the per-process
+/// one is preferred).
+///
+/// What it counts is narrow on purpose: a page written out to swap and never read again is
+/// not counted, because what costs a row time is the fault back in, not the write out.
+///
+/// The kernel's unit for the ledger is bytes — `ledger_swapins` is an eight-byte field in a
+/// four-byte-packed struct — so the figure is the field itself, read at its own width and
+/// multiplied by nothing. `None` where the platform's accounting is too old to carry the
+/// ledger. Read as a page count, the field would reach the one-gigabyte ceiling after about
+/// 64 KiB of real swap; read four bytes wide, a counter past 4 GiB would read as its low half
+/// and the arm would pass a take that spent gigabytes. The second is silent by construction,
+/// which is why the width is asserted against the kernel's own layout in this module's tests.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn swap_in_bytes() -> Option<u64> {
+    vm()?.swapins
+}
+
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn swap_in_bytes() -> Option<u64> {
     None
 }
 
@@ -191,7 +221,16 @@ fn vm() -> Option<Vm> {
         footprint: info.phys_footprint,
         peak,
         gpu,
+        swapins: swap_in_ledger(&info, count),
     })
+}
+
+/// The swap-ins ledger's own figure, in the unit the kernel counts in — bytes — or `None`
+/// where the kernel's revision is too old to carry the field. The one place the field is read.
+/// A negative value, which only a torn read could produce, reads as zero rather than as 16 EiB.
+#[cfg(target_os = "macos")]
+fn swap_in_ledger(info: &TaskVmInfo, count: u32) -> Option<u64> {
+    (count >= VM_INFO_SWAPINS_COUNT).then(|| info.ledger_swapins.max(0) as u64)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -200,7 +239,7 @@ fn vm() -> Option<Vm> {
 }
 
 /// `task_vm_info_data_t`'s prefix, as `mach/task_info.h` lays it out: the fields
-/// this crate reads end at the graphics ledgers, and the kernel's own tail is kept
+/// this crate reads end at the swap-ins ledger, and the kernel's own tail is kept
 /// as bytes so the buffer the call writes into is its full size. The header packs
 /// the struct to four bytes, which is why it is `packed(4)` here too: a natural
 /// layout rounds 372 bytes up to 376 and asks the kernel for a word more than it
@@ -254,10 +293,15 @@ struct TaskVmInfo {
     ledger_tag_neural_nofootprint_compressed: i64,
     limit_bytes_remaining: u64,
     decompressions: i32,
-    /// `ledger_swapins`, `ledger_tag_neural_nofootprint_total` and
-    /// `ledger_tag_neural_nofootprint_peak` — three eight-byte fields this crate does
-    /// not read.
-    tail: [u8; 24],
+    /// The bytes this task has faulted back in from the swap file since it started — the
+    /// platform's only per-process swap figure, a byte count rather than a page count. The
+    /// kernel declares it `int64_t`, so it is read as eight bytes: the four-byte prefix alone
+    /// is the low half of the field, which wraps at 4 GiB of swap-ins and reads a value with
+    /// its top bit set as zero. The header's four-byte packing is why the field sits at byte
+    /// 348 with the next word's fields after it. See [`swap_in_bytes`].
+    ledger_swapins: i64,
+    /// The rest of the kernel's tail this crate does not read: the rev7 neural counters.
+    tail: [u8; 16],
 }
 
 #[cfg(target_os = "macos")]
@@ -268,6 +312,10 @@ const VM_INFO_PHYS_FOOTPRINT_COUNT: u32 = 38;
 /// The count at which the tag ledgers are present (`TASK_VM_INFO_REV3_COUNT`).
 #[cfg(target_os = "macos")]
 const VM_INFO_TAGS_COUNT: u32 = 84;
+/// The count at which `ledger_swapins` is present (`TASK_VM_INFO_REV6_COUNT`): the eight-byte
+/// field spans bytes 348 to 356, so the kernel has to have written word 89.
+#[cfg(target_os = "macos")]
+const VM_INFO_SWAPINS_COUNT: u32 = 89;
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -706,6 +754,51 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<i32>(),
             93
+        );
+        // `ledger_swapins` is an `int64_t` at byte 348 in `mach/task_info.h`. Declared four
+        // bytes wide it would be the field's low half — a counter that wraps at 4 GiB of
+        // swap-ins and reads a value with its top bit set as zero. The tail is what follows it,
+        // so the two offsets state the field's width.
+        assert_eq!(std::mem::offset_of!(TaskVmInfo, ledger_swapins), 348);
+        assert_eq!(
+            std::mem::offset_of!(TaskVmInfo, tail)
+                - std::mem::offset_of!(TaskVmInfo, ledger_swapins),
+            8
+        );
+    }
+
+    /// The ledger's figure reaches the ceiling as the bytes the kernel counts in, and only
+    /// from the revision that carries the field. A controlled value rather than a live one: a
+    /// fresh process's ledger reads zero, so a live reading would exercise no arithmetic.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_swap_in_figure_is_the_bytes_the_ledger_counts() {
+        let carried = |bytes: i64| TaskVmInfo {
+            ledger_swapins: bytes,
+            ..TaskVmInfo::default()
+        };
+        // Three 16 KiB pages' worth, in bytes: the same field read as a page count and
+        // multiplied by the page size would have made it 768 MiB.
+        assert_eq!(
+            swap_in_ledger(&carried(3 * 16_384), VM_INFO_SWAPINS_COUNT),
+            Some(49_152)
+        );
+        // Past 4 GiB the counter is still the byte count it is: read four bytes wide, the low
+        // half of this value is 4096, and exactly 4 GiB would read as zero.
+        let past_four_gib = (4 << 30) + 4096;
+        assert_eq!(
+            swap_in_ledger(&carried(past_four_gib), VM_INFO_SWAPINS_COUNT),
+            Some(past_four_gib as u64)
+        );
+        assert_eq!(
+            swap_in_ledger(&carried(0), VM_INFO_SWAPINS_COUNT),
+            Some(0),
+            "a process that has not swapped reads zero, which is a reading"
+        );
+        // The revision before it: the field is in the buffer but the kernel did not write it.
+        assert_eq!(
+            swap_in_ledger(&carried(4096), VM_INFO_SWAPINS_COUNT - 1),
+            None
         );
     }
 

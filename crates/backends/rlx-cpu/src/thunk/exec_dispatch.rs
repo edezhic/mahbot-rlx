@@ -635,6 +635,9 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         k,
                         n,
                         act,
+                        a_kind: _,
+                        w_kind: _,
+                        c_kind: _,
                     } => format!(" a={a} w={w} bias={bias} c={c} m={m} k={k} n={n} act={act:?}"),
                     Thunk::Sgemm { a, b, c, m, k, n } => {
                         format!(" a={a} b={b} c={c} m={m} k={k} n={n}")

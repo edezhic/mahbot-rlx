@@ -810,6 +810,17 @@ pub enum Thunk {
         k: u32,
         n: u32,
         act: Option<Activation>,
+        /// How each operand's slot is stored, off the slot rather than the declared
+        /// dtype: the planner keeps a half **param** packed at 2 B/elem while widening
+        /// half **activations**, so a declared dtype does not say how the bytes lie.
+        /// `HalfKind::F32` is the f32 lane the epilogue was written for; a packed half
+        /// operand is widened (or, for the weight, dequantised on the fly) before the
+        /// multiply and rounded back afterwards. Without this the epilogue read the half
+        /// bytes as f32 — the tagger's 49 f16 matrices, whose 527-way head then saturated
+        /// at 1.0 and withheld most of the speech from the recogniser.
+        a_kind: HalfKind,
+        w_kind: HalfKind,
+        c_kind: HalfKind,
     },
     /// out = LN(x + residual + bias, gamma, beta)
     FusedResidualLN {
