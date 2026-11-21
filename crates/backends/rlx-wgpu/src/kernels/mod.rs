@@ -3357,16 +3357,68 @@ fn build_kernel_coop_f16_vk(
     Kernel { pipeline, bgl }
 }
 
-fn try_build_kernel_coop_f16_vk(
+/// A kernel the driver may refuse, as a value instead of the end of the process.
+///
+/// wgpu 30's `create_shader_module` / `create_compute_pipeline` are infallible by
+/// signature: a refusal is reported *synchronously* to the device's error
+/// handler, and this crate installs none on native, so wgpu's default handler
+/// panics. An error scope is what turns that report into a value —
+/// `push_error_scope` opens one, the refusal is delivered to the innermost scope
+/// whose filter matches on this thread, and `pop` hands it back as a future
+/// (`pollster` settles it, as `crate::bandwidth`'s probe does for its own).
+///
+/// Three filters are open at once because a refusal arrives under one of three
+/// names: a module the frontend rejects is `Validation`, a driver that will not
+/// link an otherwise valid pipeline is `Internal` (wgpu-core maps the HAL's
+/// `Linkage`/`EntryPoint` there), and an allocation failure is `OutOfMemory`.
+/// Scopes nest, so they are pushed Validation → Internal → OutOfMemory, and every
+/// one of them is popped, innermost first, whatever it captured — wgpu-core aborts
+/// on a pop out of order, which would be the very end of the process this exists to
+/// prevent.
+///
+/// The `catch_unwind` is the belt for anything the scopes do not catch. It is not
+/// the mechanism, and it discards the payload: the panic's own text still reaches
+/// stderr through the default hook before the unwind is caught, and the driver's own
+/// text is the scope's — between them, that is what a machine nobody here can test
+/// leaves behind when no scope captured anything.
+///
+/// A getter that builds through this answers `None` when the device is not
+/// eligible or the driver refuses, printing one line that names the kernel: a
+/// refusal is a route decision, never the end of the process. The label carries the
+/// `rlx-wgpu ` tag; the line adds none of its own.
+///
+/// The line names no fallback route: which one runs is the admission's decision, and a
+/// copy of it here could only drift from the dispatch that makes it.
+///
+/// Every getter below memoizes this answer, and an admission asks a variant the step's
+/// own dispatch can reach — so a device that refuses every one of them never gets a step
+/// that runs one, and the `.expect()`s at those steps (`backend/compile/lower.rs`,
+/// `backend/run.rs`) cannot panic.
+fn refused_as_none(
     device: &wgpu::Device,
     label: &'static str,
-    wgsl: &str,
-    entry_point: &'static str,
+    build: impl FnOnce() -> Kernel,
 ) -> Option<Kernel> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        build_kernel_coop_f16_vk(device, label, wgsl, entry_point)
-    }))
-    .ok()
+    let [validation, internal, out_of_memory] = [
+        wgpu::ErrorFilter::Validation,
+        wgpu::ErrorFilter::Internal,
+        wgpu::ErrorFilter::OutOfMemory,
+    ]
+    .map(|filter| device.push_error_scope(filter));
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
+    let refused = [out_of_memory, internal, validation]
+        .map(|scope| pollster::block_on(scope.pop()))
+        .into_iter()
+        .flatten()
+        .next();
+    let refusal = match (built, refused) {
+        (Ok(kernel), None) => return Some(kernel),
+        (Ok(_), Some(error)) => format!("the driver refused it ({error})"),
+        (Err(_), Some(error)) => format!("the build panicked, and the driver refused it ({error})"),
+        (Err(_), None) => "the build panicked".to_string(),
+    };
+    eprintln!("{label}: {refusal} — not built on this device");
+    None
 }
 
 fn build_kernel(
@@ -3417,21 +3469,34 @@ fn build_kernel(
     Kernel { pipeline, bgl }
 }
 
+/// [`refused_as_none`] for a builder of this file's shape — `(device, label,
+/// wgsl, entry_point) -> Kernel` — so a getter names its builder once instead of
+/// carrying a wrapper of its own.
+fn try_build(
+    device: &wgpu::Device,
+    label: &'static str,
+    wgsl: &str,
+    entry_point: &'static str,
+    build: fn(&wgpu::Device, &'static str, &str, &'static str) -> Kernel,
+) -> Option<Kernel> {
+    refused_as_none(device, label, || build(device, label, wgsl, entry_point))
+}
+
 static MATMUL: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_WIDE: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_WIDE_NV: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_F16W: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_BF16W: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_F16_COMPUTE: OnceLock<Kernel> = OnceLock::new();
-static MATMUL_COOP16: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP16: OnceLock<Option<Kernel>> = OnceLock::new();
 static MATMUL_COOP_F16_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
-static MATMUL_COOP_F32: OnceLock<Kernel> = OnceLock::new();
-static MATMUL_COOP_F32_DIRECT: OnceLock<Kernel> = OnceLock::new();
-static MATMUL_COOP_F32_EDGE: OnceLock<Kernel> = OnceLock::new();
-static MATMUL_COOP_F32_STRIDED: OnceLock<Kernel> = OnceLock::new();
-static MATMUL_COOP_F32_PORTABLE: OnceLock<Kernel> = OnceLock::new();
-static MATMUL_COOP_F16_VULKAN: OnceLock<Kernel> = OnceLock::new();
-static MATMUL_COOP_F16_VULKAN_WIDEN: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_COOP_F32: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_COOP_F32_DIRECT: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_COOP_F32_EDGE: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_COOP_F32_STRIDED: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_COOP_F32_PORTABLE: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_COOP_F16_VULKAN: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_COOP_F16_VULKAN_WIDEN: OnceLock<Option<Kernel>> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN_F32ACC_32: OnceLock<Option<Kernel>> = OnceLock::new();
 static MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
@@ -3553,7 +3618,7 @@ static POOL2D: OnceLock<Kernel> = OnceLock::new();
 static CONV2D: OnceLock<Kernel> = OnceLock::new();
 static CONV1D_TILED: OnceLock<Kernel> = OnceLock::new();
 static IM2COL2D: OnceLock<Kernel> = OnceLock::new();
-static CONV1D_IMPLICIT: OnceLock<Kernel> = OnceLock::new();
+static CONV1D_IMPLICIT: OnceLock<Option<Kernel>> = OnceLock::new();
 static POOL1D: OnceLock<Kernel> = OnceLock::new();
 static POOL3D: OnceLock<Kernel> = OnceLock::new();
 static CONV1D: OnceLock<Kernel> = OnceLock::new();
@@ -3607,9 +3672,9 @@ static GATED_RESIDUAL: OnceLock<Kernel> = OnceLock::new();
 static ADA_LAYER_NORM_BACKWARD: OnceLock<Kernel> = OnceLock::new();
 static GATED_RESIDUAL_BACKWARD: OnceLock<Kernel> = OnceLock::new();
 static MATMUL_QKV: OnceLock<Kernel> = OnceLock::new();
-static MATMUL_QKV_COOP_F32: OnceLock<Kernel> = OnceLock::new();
-static MATMUL_QKV_COOP_F16_VK: OnceLock<Kernel> = OnceLock::new();
-static MATMUL_QKV_COOP_F16_VK_WIDEN: OnceLock<Kernel> = OnceLock::new();
+static MATMUL_QKV_COOP_F32: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_QKV_COOP_F16_VK: OnceLock<Option<Kernel>> = OnceLock::new();
+static MATMUL_QKV_COOP_F16_VK_WIDEN: OnceLock<Option<Kernel>> = OnceLock::new();
 static MATMUL_QKV_COOP_F16_VK_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
 static MATMUL_QKV_COOP_F16_VK_WIDEN_F32ACC: OnceLock<Option<Kernel>> = OnceLock::new();
 
@@ -3793,7 +3858,8 @@ pub fn matmul_f16_compute_kernel(device: &wgpu::Device) -> Option<&'static Kerne
 /// Lowers to MSL `simdgroup_matrix` on Metal and SPIR-V's
 /// `OpCooperativeMatrixMulAddKHR` on Vulkan. Returns Some only when
 /// the device exposes both `SHADER_F16` and
-/// `EXPERIMENTAL_COOPERATIVE_MATRIX`.
+/// `EXPERIMENTAL_COOPERATIVE_MATRIX`, and the driver actually builds the
+/// pipeline.
 pub fn matmul_coop16_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     let feats = device.features();
     if !feats.contains(wgpu::Features::SHADER_F16)
@@ -3802,14 +3868,17 @@ pub fn matmul_coop16_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     {
         return None;
     }
-    Some(MATMUL_COOP16.get_or_init(|| {
-        build_kernel_3(
-            device,
-            "rlx-wgpu matmul_coop16",
-            MATMUL_COOP16_WGSL,
-            "matmul_coop16",
-        )
-    }))
+    MATMUL_COOP16
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu matmul_coop16",
+                MATMUL_COOP16_WGSL,
+                "matmul_coop16",
+                build_kernel_3,
+            )
+        })
+        .as_ref()
 }
 /// f16 operands with an f32 cooperative accumulator, 64×64 output tile per
 /// 64-thread workgroup (two 32-wide subgroups, each owning a 64×32 half). A is
@@ -3838,15 +3907,13 @@ pub fn matmul_coop_f16_f32acc_kernel(device: &wgpu::Device) -> Option<&'static K
     }
     MATMUL_COOP_F16_F32ACC
         .get_or_init(|| {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                build_kernel_3(
-                    device,
-                    "rlx-wgpu matmul_coop_f16_f32acc",
-                    MATMUL_COOP_F16_F32ACC_WGSL,
-                    "matmul_coop_f16_f32acc",
-                )
-            }))
-            .ok()
+            try_build(
+                device,
+                "rlx-wgpu matmul_coop_f16_f32acc",
+                MATMUL_COOP_F16_F32ACC_WGSL,
+                "matmul_coop_f16_f32acc",
+                build_kernel_3,
+            )
         })
         .as_ref()
 }
@@ -3869,20 +3936,24 @@ pub fn coop_f16_f32acc_grid(m: u32, n: u32) -> (u32, u32) {
 /// `coop_mat8x8<f32>` throughout (lowers to `simdgroup_float8x8` on
 /// Apple). Returns None if the cooperative-matrix feature is missing
 /// OR if the device's WGSL→backend lowering can't compile it (some
-/// implementations only expose half-precision coop matrices).
+/// implementations only expose half-precision coop matrices), and the memoized
+/// `None` is what every admission reads afterwards.
 pub fn matmul_coop_f32_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     let feats = device.features();
     if !feats.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
         return None;
     }
-    Some(MATMUL_COOP_F32.get_or_init(|| {
-        build_kernel(
-            device,
-            "rlx-wgpu matmul_coop_f32",
-            MATMUL_COOP_F32_WGSL,
-            "matmul_coop_f32",
-        )
-    }))
+    MATMUL_COOP_F32
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu matmul_coop_f32",
+                MATMUL_COOP_F32_WGSL,
+                "matmul_coop_f32",
+                build_kernel,
+            )
+        })
+        .as_ref()
 }
 /// The convolution GEMM routes' direct form: the same 32×32 tile as
 /// [`matmul_coop_f32_kernel`], with no workgroup staging and no epilogue pass
@@ -3898,17 +3969,21 @@ pub fn matmul_coop_f32_direct_kernel(device: &wgpu::Device) -> Option<&'static K
     {
         return None;
     }
-    Some(MATMUL_COOP_F32_DIRECT.get_or_init(|| {
-        build_kernel(
-            device,
-            "rlx-wgpu matmul_coop_f32_direct",
-            MATMUL_COOP_F32_DIRECT_WGSL,
-            "matmul_coop_f32_direct",
-        )
-    }))
+    MATMUL_COOP_F32_DIRECT
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu matmul_coop_f32_direct",
+                MATMUL_COOP_F32_DIRECT_WGSL,
+                "matmul_coop_f32_direct",
+                build_kernel,
+            )
+        })
+        .as_ref()
 }
 /// Edge-tolerant Metal CoopF32 (`matmul_coop_f32_edge.wgsl`): any K / N, B may
 /// be an activation. Same bind layout and grid as [`matmul_coop_f32_kernel`].
+/// `None` when the feature is missing or the driver refuses the build.
 pub fn matmul_coop_f32_edge_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     if !device
         .features()
@@ -3916,17 +3991,22 @@ pub fn matmul_coop_f32_edge_kernel(device: &wgpu::Device) -> Option<&'static Ker
     {
         return None;
     }
-    Some(MATMUL_COOP_F32_EDGE.get_or_init(|| {
-        build_kernel(
-            device,
-            "rlx-wgpu matmul_coop_f32_edge",
-            MATMUL_COOP_F32_EDGE_WGSL,
-            "matmul_coop_f32_edge",
-        )
-    }))
+    MATMUL_COOP_F32_EDGE
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu matmul_coop_f32_edge",
+                MATMUL_COOP_F32_EDGE_WGSL,
+                "matmul_coop_f32_edge",
+                build_kernel,
+            )
+        })
+        .as_ref()
 }
 /// `matmul_coop_f32_strided.wgsl` — batched matmul reading A and B through
 /// strided views (see [`MatmulStridedParams`]). Metal + cooperative matrix only.
+/// `None` when the feature is missing or the driver refuses the build, and
+/// `fold_strided_bmm` is only run when this answers `Some`.
 pub fn matmul_coop_f32_strided_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     if !device
         .features()
@@ -3934,14 +4014,17 @@ pub fn matmul_coop_f32_strided_kernel(device: &wgpu::Device) -> Option<&'static 
     {
         return None;
     }
-    Some(MATMUL_COOP_F32_STRIDED.get_or_init(|| {
-        build_kernel(
-            device,
-            "rlx-wgpu matmul_coop_f32_strided",
-            MATMUL_COOP_F32_STRIDED_WGSL,
-            "matmul_coop_f32_strided",
-        )
-    }))
+    MATMUL_COOP_F32_STRIDED
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu matmul_coop_f32_strided",
+                MATMUL_COOP_F32_STRIDED_WGSL,
+                "matmul_coop_f32_strided",
+                build_kernel,
+            )
+        })
+        .as_ref()
 }
 /// True when the aligned Metal CoopF32 kernel can take this shape directly.
 pub fn coop_f32_metal_aligned(k: u32, n: u32) -> bool {
@@ -3964,7 +4047,8 @@ pub fn matmul_coop_f32_kernel_for(
     matmul_coop_f32_active_kernel(device)
 }
 /// Portable 8×8 coop f32 matmul (`coopLoad`, 8×8 workgroups) — the discrete
-/// Vulkan form; DX12 exposes no cooperative matrices.
+/// Vulkan form; DX12 exposes no cooperative matrices. `None` when the feature or
+/// the 8×8 shape is missing, or when the driver refuses the build.
 pub fn matmul_coop_f32_portable_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     let feats = device.features();
     if !feats.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
@@ -3972,14 +4056,17 @@ pub fn matmul_coop_f32_portable_kernel(device: &wgpu::Device) -> Option<&'static
     {
         return None;
     }
-    Some(MATMUL_COOP_F32_PORTABLE.get_or_init(|| {
-        build_kernel(
-            device,
-            "rlx-wgpu matmul_coop_f32_portable",
-            MATMUL_COOP_F32_PORTABLE_WGSL,
-            "matmul_coop_f32_portable",
-        )
-    }))
+    MATMUL_COOP_F32_PORTABLE
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu matmul_coop_f32_portable",
+                MATMUL_COOP_F32_PORTABLE_WGSL,
+                "matmul_coop_f32_portable",
+                build_kernel,
+            )
+        })
+        .as_ref()
 }
 fn coop_f16_vk_device_ready(device: &wgpu::Device) -> bool {
     // Cooperative-matrix f16 matmul is OFF by default — see
@@ -4012,11 +4099,12 @@ pub fn matmul_coop_f16_vulkan_f32acc_32_kernel(device: &wgpu::Device) -> Option<
     }
     MATMUL_COOP_F16_VULKAN_F32ACC_32
         .get_or_init(|| {
-            try_build_kernel_coop_f16_vk(
+            try_build(
                 device,
                 "rlx-wgpu matmul_coop_f16_vulkan_f32acc_32",
                 MATMUL_COOP_F16_VULKAN_F32ACC_32_WGSL,
                 "matmul_coop_f16_vulkan_f32acc_32",
+                build_kernel_coop_f16_vk,
             )
         })
         .as_ref()
@@ -4028,11 +4116,12 @@ pub fn matmul_coop_f16_vulkan_f32acc_kernel(device: &wgpu::Device) -> Option<&'s
     }
     MATMUL_COOP_F16_VULKAN_F32ACC
         .get_or_init(|| {
-            try_build_kernel_coop_f16_vk(
+            try_build(
                 device,
                 "rlx-wgpu matmul_coop_f16_vulkan_f32acc",
                 MATMUL_COOP_F16_VULKAN_F32ACC_WGSL,
                 "matmul_coop_f16_vulkan_f32acc",
+                build_kernel_coop_f16_vk,
             )
         })
         .as_ref()
@@ -4046,11 +4135,12 @@ pub fn matmul_coop_f16_vulkan_widen_f32acc_kernel(
     }
     MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC
         .get_or_init(|| {
-            try_build_kernel_coop_f16_vk(
+            try_build(
                 device,
                 "rlx-wgpu matmul_coop_f16_vulkan_widen_f32acc",
                 MATMUL_COOP_F16_VULKAN_WIDEN_F32ACC_WGSL,
                 "matmul_coop_f16_vulkan_widen_f32acc",
+                build_kernel_coop_f16_vk,
             )
         })
         .as_ref()
@@ -4100,7 +4190,18 @@ fn pick_coop_f16_vk_matmul(
     }
 }
 
-/// Matmul CoopF16Vk kernel for column count `n`.
+/// Matmul CoopF16Vk kernel for column count `n` — the family's single resolution.
+///
+/// The admission (`derive_matmul_compute`), the bind group and the step's own dispatch all
+/// ask this function with the same `n`, so the three cannot disagree about which variant
+/// serves the step: a device that refuses the variant the others resolved refuses it here
+/// for all of them, and the step takes the route its admission resolves instead.
+///
+/// `device` is what the builds and the feature checks read; the operand-order verdict behind
+/// them is the process-global device's, because `coop_probe` needs a queue and wgpu hands one
+/// out only where the device was created. That is this crate's one-device-per-process
+/// assumption (`device.rs`), which the family's own `OnceLock`s already make for it: the
+/// kernels answer for that device whichever one is passed.
 pub fn matmul_coop_f16_vulkan_active_kernel(
     device: &wgpu::Device,
     n: u32,
@@ -4115,18 +4216,23 @@ pub fn matmul_coop_f16_vulkan_active_kernel(
     )
 }
 
+/// The 16×16-tile Vulkan CoopF16 kernel, `coopLoadT` on B. `None` when the device
+/// is not eligible for this family at all, or when the driver refuses the build.
 pub fn matmul_coop_f16_vulkan_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     if !coop_f16_vk_device_ready(device) {
         return None;
     }
-    Some(MATMUL_COOP_F16_VULKAN.get_or_init(|| {
-        build_kernel_coop_f16_vk(
-            device,
-            "rlx-wgpu matmul_coop_f16_vulkan",
-            MATMUL_COOP_F16_VULKAN_WGSL,
-            "matmul_coop_f16_vulkan",
-        )
-    }))
+    MATMUL_COOP_F16_VULKAN
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu matmul_coop_f16_vulkan",
+                MATMUL_COOP_F16_VULKAN_WGSL,
+                "matmul_coop_f16_vulkan",
+                build_kernel_coop_f16_vk,
+            )
+        })
+        .as_ref()
 }
 /// N above which coop may use the row-major B-load variant (`RLX_WGPU_COOP_F16_VK_LARGE_N`).
 pub const COOP_F16_VK_WIDEN_N: u32 = 768;
@@ -4136,18 +4242,24 @@ pub fn coop_f16_vk_widen_b_load(n: u32) -> bool {
     n > COOP_F16_VK_WIDEN_N && !rlx_ir::env::flag("RLX_WGPU_COOP_F16_VK_LOAD_T")
 }
 
+/// The 16×16-tile Vulkan CoopF16 kernel reading B with `coopLoad`. `None` when the
+/// device is not eligible for this family at all, or when the driver refuses the
+/// build.
 pub fn matmul_coop_f16_vulkan_widen_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     if !coop_f16_vk_device_ready(device) {
         return None;
     }
-    Some(MATMUL_COOP_F16_VULKAN_WIDEN.get_or_init(|| {
-        build_kernel_coop_f16_vk(
-            device,
-            "rlx-wgpu matmul_coop_f16_vulkan_widen",
-            MATMUL_COOP_F16_VULKAN_WIDEN_WGSL,
-            "matmul_coop_f16_vulkan_widen",
-        )
-    }))
+    MATMUL_COOP_F16_VULKAN_WIDEN
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu matmul_coop_f16_vulkan_widen",
+                MATMUL_COOP_F16_VULKAN_WIDEN_WGSL,
+                "matmul_coop_f16_vulkan_widen",
+                build_kernel_coop_f16_vk,
+            )
+        })
+        .as_ref()
 }
 pub fn coop_f16_vk_f32acc_available(device: &wgpu::Device) -> bool {
     matmul_coop_f16_vulkan_f32acc_kernel(device).is_some()
@@ -6158,19 +6270,23 @@ pub fn conv1d_implicit_supported(device: &wgpu::Device) -> bool {
 /// instead of materialised as an im2col panel (see the shader header). Metal only,
 /// for the same reason `matmul_coop_f32_direct_kernel` is: the load/store
 /// conventions this entry stands on are the MSL ones. `None` when the device
-/// cannot build it, in which case the conv keeps the im2col/tiled/direct routes.
+/// cannot build it, in which case the conv keeps the im2col/tiled/direct routes,
+/// and the compile arm that admits this route reads the same memoized answer.
 pub fn conv1d_implicit_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     if !conv1d_implicit_supported(device) {
         return None;
     }
-    Some(CONV1D_IMPLICIT.get_or_init(|| {
-        build_kernel(
-            device,
-            "rlx-wgpu conv1d_implicit",
-            CONV1D_IMPLICIT_WGSL,
-            "conv1d_implicit",
-        )
-    }))
+    CONV1D_IMPLICIT
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu conv1d_implicit",
+                CONV1D_IMPLICIT_WGSL,
+                "conv1d_implicit",
+                build_kernel,
+            )
+        })
+        .as_ref()
 }
 pub fn conv1d_tiled_kernel(device: &wgpu::Device) -> &'static Kernel {
     CONV1D_TILED.get_or_init(|| {
@@ -6665,13 +6781,13 @@ pub fn coop_gemm_gguf_grid(m: u32, ncols: u32) -> CoopGrid {
 /// storage. Whether the built kernel computes `a·b` rather than a transposition is
 /// `crate::coop_probe`'s question, asked by the caller.
 ///
-/// The build's panic is swallowed into `None` rather than propagated, because a
-/// device refusing a pipeline is a fact the route has to answer with the row-grouped
-/// tile. That makes a *WGSL* mistake indistinguishable from an unsupported device
-/// here, so `gguf_gpu.rs`'s `coop_shader_validates_and_pins_the_geometry` parses and
-/// validates the same source with naga, device-free and inside `cargo test -p`:
-/// a shader that cannot compile fails there instead of quietly putting every
-/// prefill back on the row-grouped tile.
+/// A device refusing a pipeline is a fact the route has to answer with the
+/// row-grouped tile, so the refusal is `None`. That makes a *WGSL* mistake
+/// indistinguishable from an unsupported device here, so `gguf_gpu.rs`'s
+/// `coop_shader_validates_and_pins_the_geometry` parses and validates the same
+/// source with naga, device-free and inside `cargo test -p`: a shader that cannot
+/// compile fails there instead of quietly putting every prefill back on the
+/// row-grouped tile.
 pub fn dequant_gemm_coop_kernel(scheme_id: u32, device: &wgpu::Device) -> Option<&'static Kernel> {
     let (cell, entry) = match scheme_id {
         0 => (&DEQUANT_GEMM_COOP_Q4K, "dequant_gemm_coop_q4k"),
@@ -6687,7 +6803,7 @@ pub fn dequant_gemm_coop_kernel(scheme_id: u32, device: &wgpu::Device) -> Option
         return None;
     }
     cell.get_or_init(|| {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        refused_as_none(device, "rlx-wgpu dequant_gemm_coop_gguf", || {
             build_kernel_ro_u_ro_rw(
                 device,
                 "rlx-wgpu dequant_gemm_coop_gguf",
@@ -6695,8 +6811,7 @@ pub fn dequant_gemm_coop_kernel(scheme_id: u32, device: &wgpu::Device) -> Option
                 entry,
                 false,
             )
-        }))
-        .ok()
+        })
     })
     .as_ref()
 }
@@ -6785,6 +6900,9 @@ pub fn matmul_qkv_kernel(device: &wgpu::Device) -> &'static Kernel {
     MATMUL_QKV
         .get_or_init(|| build_kernel(device, "rlx-wgpu matmul_qkv", MATMUL_QKV_WGSL, "matmul_qkv"))
 }
+/// The split-QKV f32 cooperative kernel: one dispatch writing Q, K and V straight
+/// into their own slots. `None` when the feature is missing or the driver refuses
+/// the build, and the caller keeps the plain `matmul_qkv`.
 pub fn matmul_qkv_coop_f32_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     if !device
         .features()
@@ -6792,14 +6910,17 @@ pub fn matmul_qkv_coop_f32_kernel(device: &wgpu::Device) -> Option<&'static Kern
     {
         return None;
     }
-    Some(MATMUL_QKV_COOP_F32.get_or_init(|| {
-        build_kernel(
-            device,
-            "rlx-wgpu matmul_qkv_coop_f32",
-            MATMUL_QKV_COOP_F32_WGSL,
-            "matmul_qkv_coop_f32",
-        )
-    }))
+    MATMUL_QKV_COOP_F32
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu matmul_qkv_coop_f32",
+                MATMUL_QKV_COOP_F32_WGSL,
+                "matmul_qkv_coop_f32",
+                build_kernel,
+            )
+        })
+        .as_ref()
 }
 pub fn matmul_qkv_coop_f16_vk_f32acc_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     if !coop_f16_vk_f32acc_device_ready(device) {
@@ -6807,11 +6928,12 @@ pub fn matmul_qkv_coop_f16_vk_f32acc_kernel(device: &wgpu::Device) -> Option<&'s
     }
     MATMUL_QKV_COOP_F16_VK_F32ACC
         .get_or_init(|| {
-            try_build_kernel_coop_f16_vk(
+            try_build(
                 device,
                 "rlx-wgpu matmul_qkv_coop_f16_vk_f32acc",
                 MATMUL_QKV_COOP_F16_VK_F32ACC_WGSL,
                 "matmul_qkv_coop_f16_vk_f32acc",
+                build_kernel_coop_f16_vk,
             )
         })
         .as_ref()
@@ -6825,16 +6947,19 @@ pub fn matmul_qkv_coop_f16_vk_widen_f32acc_kernel(
     }
     MATMUL_QKV_COOP_F16_VK_WIDEN_F32ACC
         .get_or_init(|| {
-            try_build_kernel_coop_f16_vk(
+            try_build(
                 device,
                 "rlx-wgpu matmul_qkv_coop_f16_vk_widen_f32acc",
                 MATMUL_QKV_COOP_F16_VK_WIDEN_F32ACC_WGSL,
                 "matmul_qkv_coop_f16_vk_widen_f32acc",
+                build_kernel_coop_f16_vk,
             )
         })
         .as_ref()
 }
 
+/// The split-QKV twin of [`matmul_coop_f16_vulkan_active_kernel`]: one resolution for the
+/// admission, the bind group and the dispatch.
 pub fn matmul_qkv_coop_f16_vk_active_kernel(
     device: &wgpu::Device,
     n: u32,
@@ -6849,31 +6974,43 @@ pub fn matmul_qkv_coop_f16_vk_active_kernel(
     )
 }
 
+/// The split-QKV 16×16-tile Vulkan CoopF16 kernel reading B with `coopLoadT`.
+/// `None` when the device is not eligible for this family, or when the driver
+/// refuses the build.
 pub fn matmul_qkv_coop_f16_vk_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     if !coop_f16_vk_device_ready(device) {
         return None;
     }
-    Some(MATMUL_QKV_COOP_F16_VK.get_or_init(|| {
-        build_kernel_coop_f16_vk(
-            device,
-            "rlx-wgpu matmul_qkv_coop_f16_vk",
-            MATMUL_QKV_COOP_F16_VK_WGSL,
-            "matmul_qkv_coop_f16_vk",
-        )
-    }))
+    MATMUL_QKV_COOP_F16_VK
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu matmul_qkv_coop_f16_vk",
+                MATMUL_QKV_COOP_F16_VK_WGSL,
+                "matmul_qkv_coop_f16_vk",
+                build_kernel_coop_f16_vk,
+            )
+        })
+        .as_ref()
 }
+/// The split-QKV 16×16-tile Vulkan CoopF16 kernel reading B with `coopLoad`.
+/// `None` when the device is not eligible for this family, or when the driver
+/// refuses the build.
 pub fn matmul_qkv_coop_f16_vk_widen_kernel(device: &wgpu::Device) -> Option<&'static Kernel> {
     if !coop_f16_vk_device_ready(device) {
         return None;
     }
-    Some(MATMUL_QKV_COOP_F16_VK_WIDEN.get_or_init(|| {
-        build_kernel_coop_f16_vk(
-            device,
-            "rlx-wgpu matmul_qkv_coop_f16_vk_widen",
-            MATMUL_QKV_COOP_F16_VK_WIDEN_WGSL,
-            "matmul_qkv_coop_f16_vk_widen",
-        )
-    }))
+    MATMUL_QKV_COOP_F16_VK_WIDEN
+        .get_or_init(|| {
+            try_build(
+                device,
+                "rlx-wgpu matmul_qkv_coop_f16_vk_widen",
+                MATMUL_QKV_COOP_F16_VK_WIDEN_WGSL,
+                "matmul_qkv_coop_f16_vk_widen",
+                build_kernel_coop_f16_vk,
+            )
+        })
+        .as_ref()
 }
 
 #[cfg(test)]
@@ -7117,6 +7254,95 @@ mod tests {
             "the tile is assembled by two 32-wide subgroups from one 64-thread \
              workgroup: `coop_f16_f32acc_admits`' 64x64x32 grid and the probe's \
              single 64-thread launch both assume it"
+        );
+    }
+
+    /// Every cooperative-matrix shader in this crate that no other gate validates
+    /// parses and validates under naga with the capabilities its text asks for —
+    /// cooperative matrices always, f16 where the shader itself enables it.
+    ///
+    /// The shaders are the files under `src/kernels/` that enable the extension, read
+    /// off disk, so a new one is covered the moment it lands.
+    /// `matmul_coop_f16_f32acc.wgsl` and `dequant_gemm_coop_gguf.wgsl` are left out:
+    /// their own gates (`coop_f16_f32acc_shader_parses_and_validates`, and
+    /// `gguf_gpu.rs`'s `coop_shader_validates_and_pins_the_geometry`) validate them
+    /// and pin their geometry, so a second validation would state it twice.
+    ///
+    /// The refusal being a value ([`super::refused_as_none`]) is what makes this
+    /// gate necessary: a wrong shader would otherwise be answered with another
+    /// route and the run would carry on with correct, slower numbers, so a WGSL
+    /// mistake would be indistinguishable from a device that cannot build the
+    /// kernel — and would never appear at all on a machine that can. The failure
+    /// names the file it read.
+    #[test]
+    fn every_cooperative_matrix_shader_parses_and_validates() {
+        // The two shaders whose own gates validate them.
+        const VALIDATED_ELSEWHERE: [&str; 2] =
+            ["dequant_gemm_coop_gguf.wgsl", "matmul_coop_f16_f32acc.wgsl"];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels");
+        let mut validated = 0;
+        for path in std::fs::read_dir(dir)
+            .expect("src/kernels")
+            .map(|entry| entry.expect("a directory entry").path())
+        {
+            let name = path.file_name().expect("a file name").to_string_lossy();
+            if path.extension().is_none_or(|x| x != "wgsl")
+                || VALIDATED_ELSEWHERE.contains(&name.as_ref())
+            {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("a shader source");
+            if !src.contains("enable wgpu_cooperative_matrix;") {
+                continue;
+            }
+            let f16 = src.contains("enable f16;");
+            let mut caps = naga::valid::Capabilities::COOPERATIVE_MATRIX;
+            if f16 {
+                caps |= naga::valid::Capabilities::SHADER_FLOAT16;
+            }
+            let module = parse_kernel(&name, &src);
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
+                .validate(&module)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{name} must validate with cooperative matrices{}: {e:?}",
+                        if f16 { " and f16" } else { "" }
+                    )
+                });
+            validated += 1;
+        }
+        assert!(
+            validated > 0,
+            "the directory walk found the cooperative shaders"
+        );
+    }
+
+    /// The refusal contract's other half, on the device this machine has: a module
+    /// the frontend rejects comes back as `None` instead of reaching wgpu's fatal
+    /// default handler. A driver-side refusal cannot be synthesised, so this is the
+    /// only end-to-end proof of the error-scope mechanism, and it lives here rather
+    /// than in `tests/` because the builder it drives is private. It is the one test in
+    /// this suite that touches a device, and only where one exists: it skips through
+    /// [`rlx_ir::env::skip_unless_device`], so `RLX_REQUIRE_DEVICE=1` cannot report it ok
+    /// without a device and the suite stays device-free on every machine without one.
+    #[test]
+    fn a_refused_shader_is_a_value_on_a_real_device() {
+        if rlx_ir::env::skip_unless_device("wgpu", true, crate::is_available()) {
+            return;
+        }
+        let Some(dev) = crate::device::wgpu_device() else {
+            return;
+        };
+        assert!(
+            super::try_build(
+                &dev.device,
+                "rlx-wgpu refusal probe",
+                "not wgsl",
+                "main",
+                super::build_kernel,
+            )
+            .is_none(),
+            "a module naga rejects must answer None"
         );
     }
 

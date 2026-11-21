@@ -52,11 +52,10 @@ use crate::kernels::{
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
     layernorm_kernel, layernorm_vec4_kernel, lstm_kernel, mamba2_kernel, matmul_bf16w_kernel,
     matmul_coop_f16_f32acc_kernel, matmul_coop_f16_vulkan_active_kernel,
-    matmul_coop_f16_vulkan_kernel, matmul_coop_f32_active_kernel, matmul_coop_f32_direct_kernel,
-    matmul_coop_f32_kernel_for, matmul_coop16_kernel, matmul_f16_compute_kernel,
-    matmul_f16w_kernel, matmul_gemv_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
-    matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
-    matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
+    matmul_coop_f32_active_kernel, matmul_coop_f32_direct_kernel, matmul_coop_f32_kernel_for,
+    matmul_coop16_kernel, matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_gemv_kernel,
+    matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel, matmul_qkv_coop_f32_kernel,
+    matmul_qkv_kernel, matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
     maxpool3d_backward_kernel, narrow_kernel, narrow_split_kernel, narrow_vec4_kernel,
     norm_rope_kernel, note_attention_band_route, note_attention_decomposed_route,
     note_attention_route, pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel,
@@ -1773,7 +1772,6 @@ impl WgpuExecutable {
         let mm_f16c = matmul_f16_compute_kernel(&dev.device);
         let mm_coop = matmul_coop16_kernel(&dev.device);
         let mm_coop_f16acc = matmul_coop_f16_f32acc_kernel(&dev.device);
-        let mm_coop_f16_vk = matmul_coop_f16_vulkan_kernel(&dev.device);
         let mm_coop_f32 = matmul_coop_f32_active_kernel(&dev.device);
         let mm_coop_f32_direct = matmul_coop_f32_direct_kernel(&dev.device);
         let mm_cast = cast_f32_to_f16_kernel(&dev.device);
@@ -2018,8 +2016,19 @@ impl WgpuExecutable {
                                     step_i += 1;
                                     continue;
                                 }
-                                let coop_f16_wide = mm_coop_f16_vk.is_some()
-                                    && *compute_precision == MatmulCompute::CoopF16Vk
+                                // Resolved here so the arm is taken exactly when the
+                                // dispatch has something to run: this is the resolution
+                                // `derive_matmul_compute` admitted through, on the same
+                                // `n`, so a refused variant leaves the cooperative arms
+                                // and the next arm below that admits the step answers it,
+                                // instead of the step reading B outside the bind window.
+                                let coop_f16_vk = match *compute_precision {
+                                    MatmulCompute::CoopF16Vk => {
+                                        matmul_coop_f16_vulkan_active_kernel(&dev.device, *n)
+                                    }
+                                    _ => None,
+                                };
+                                let coop_f16_wide = coop_f16_vk.is_some()
                                     && crate::coop_f16_vk::use_wide_matmul(
                                         *b_off_f32,
                                         *n,
@@ -2094,9 +2103,7 @@ impl WgpuExecutable {
                                         m_s.div_ceil(32),
                                         *batch,
                                     );
-                                } else if mm_coop_f16_vk.is_some()
-                                    && *compute_precision == MatmulCompute::CoopF16Vk
-                                {
+                                } else if let Some(coop_vk) = coop_f16_vk {
                                     if coop_f16_wide {
                                         dispatch_wide_f32_matmul(
                                             &mut pass,
@@ -2120,12 +2127,6 @@ impl WgpuExecutable {
                                         pass.set_pipeline(&k32.pipeline);
                                         pass.dispatch_workgroups(m_s / 32, n / 32, *batch);
                                     } else {
-                                        let n_eff = scale(*n);
-                                        let coop_vk = matmul_coop_f16_vulkan_active_kernel(
-                                            &dev.device,
-                                            n_eff,
-                                        )
-                                        .expect("coop f16 vk kernel missing");
                                         pass.set_pipeline(&coop_vk.pipeline);
                                         pass.dispatch_workgroups(
                                             m_s.div_ceil(16),
@@ -4459,12 +4460,16 @@ impl WgpuExecutable {
                                                 1,
                                             );
                                         } else {
-                                            let n_eff = scale(params.n);
+                                            // On the same column count the grid below
+                                            // dispatches, which is what the widen
+                                            // preference reads.
                                             let mqk = matmul_qkv_coop_f16_vk_active_kernel(
                                                 &dev.device,
-                                                n_eff,
+                                                params.n,
                                             )
-                                            .expect("coop f16 matmul_qkv kernel missing");
+                                            .expect(
+                                                "coop f16 matmul_qkv kernel: admitted by qkv_kind",
+                                            );
                                             pass.set_pipeline(&mqk.pipeline);
                                             pass.dispatch_workgroups(
                                                 m_s.div_ceil(16),
@@ -4474,11 +4479,9 @@ impl WgpuExecutable {
                                         }
                                     }
                                     MatmulQkvKind::CoopF32 => {
-                                        pass.set_pipeline(
-                                            &matmul_qkv_coop_f32_kernel(&dev.device)
-                                                .expect("coop matmul_qkv kernel missing")
-                                                .pipeline,
-                                        );
+                                        let mqk = matmul_qkv_coop_f32_kernel(&dev.device)
+                                            .expect("coop f32 matmul_qkv: admitted by qkv_kind");
+                                        pass.set_pipeline(&mqk.pipeline);
                                         pass.dispatch_workgroups(
                                             params.n.div_ceil(32),
                                             m_s.div_ceil(32),

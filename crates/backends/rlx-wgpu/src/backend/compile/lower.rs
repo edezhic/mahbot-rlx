@@ -62,10 +62,9 @@ use crate::kernels::{
     grouped_matmul_kernel, gru_kernel, im2col2d_kernel, layer_norm_backward_gamma_partial_kernel,
     layer_norm_backward_gamma_reduce_kernel, layer_norm_backward_input_kernel, layer_norm2d_kernel,
     layernorm_kernel, layernorm_vec4_kernel, lead_pack_uniform, lstm_kernel, mamba2_kernel,
-    matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel, matmul_coop_f16_vulkan_kernel,
-    matmul_coop_f32_active_kernel, matmul_coop16_kernel, matmul_f16_compute_kernel,
-    matmul_f16w_kernel, matmul_kernel, matmul_qkv_coop_f16_vk_active_kernel,
-    matmul_qkv_coop_f16_vk_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
+    matmul_bf16w_kernel, matmul_coop_f16_vulkan_active_kernel, matmul_coop_f32_active_kernel,
+    matmul_coop16_kernel, matmul_f16_compute_kernel, matmul_f16w_kernel, matmul_kernel,
+    matmul_qkv_coop_f16_vk_active_kernel, matmul_qkv_coop_f32_kernel, matmul_qkv_kernel,
     matmul_wide_active_kernel, matmul_wide_kernel, maxpool2d_backward_kernel,
     maxpool3d_backward_kernel, narrow_kernel, narrow_split_kernel, narrow_vec4_kernel,
     norm_rope_kernel, pool1d_kernel, pool2d_kernel, pool3d_kernel, q_conv2d_kernel,
@@ -7937,11 +7936,35 @@ fn compile_static_with(
                             crate::device::wgpu_device().map(|d| d.backend),
                             Some(wgpu::Backend::Metal)
                         ) || crate::kernels::coop_f32_metal_aligned(k, n));
+                    // The dispatch's own resolution for this `n`, so a refusal falls back to the
+                    // f32 split instead of binding a variant the dispatch did not take.
+                    let qkv_f16_vk = match compute_precision {
+                        MatmulCompute::CoopF16Vk => {
+                            matmul_qkv_coop_f16_vk_active_kernel(&dev.device, n)
+                        }
+                        _ => None,
+                    };
                     let qkv_kind = match compute_precision {
-                        MatmulCompute::CoopF16Vk => MatmulQkvKind::CoopF16Vk,
-                        MatmulCompute::CoopF32 if qkv_coop_f32_ok => MatmulQkvKind::CoopF32,
+                        MatmulCompute::CoopF16Vk if qkv_f16_vk.is_some() => {
+                            MatmulQkvKind::CoopF16Vk
+                        }
+                        MatmulCompute::CoopF32
+                            if qkv_coop_f32_ok
+                                && crate::kernels::matmul_qkv_coop_f32_kernel(&dev.device)
+                                    .is_some() =>
+                        {
+                            MatmulQkvKind::CoopF32
+                        }
                         _ => MatmulQkvKind::F32,
                     };
+                    // A fallback to the f32 split kernel must not leave the f16
+                    // precision behind: `b_in_arena` derives from it, and that kernel
+                    // reads B from the arena rather than from the f16 mirror.
+                    if compute_precision == MatmulCompute::CoopF16Vk
+                        && qkv_kind != MatmulQkvKind::CoopF16Vk
+                    {
+                        compute_precision = MatmulCompute::F32;
+                    }
                     let b_in_arena = !matmul_b_from_f16(compute_precision, b_is_param);
                     let (mut base, mut size, param_anchor) = arena_matmul_bind_window(
                         &dev.device,
@@ -8086,30 +8109,26 @@ fn compile_static_with(
                         &param_offsets,
                         b_id,
                         p.b_off,
-                        match qkv_kind {
-                            MatmulQkvKind::CoopF16Vk => MatmulCompute::CoopF16Vk,
-                            MatmulQkvKind::CoopF32 => MatmulCompute::CoopF32,
-                            MatmulQkvKind::F32 => MatmulCompute::F32,
-                        },
+                        compute_precision,
                     );
                     let u = emit_uniform(std::mem::size_of::<MatmulQkvParams>());
                     let bg = match qkv_kind {
                         MatmulQkvKind::CoopF16Vk => {
-                            let mqk = matmul_qkv_coop_f16_vk_kernel(&dev.device).expect(
-                                "coop f16 matmul_qkv kernel: feature was checked but missing",
-                            );
-                            let (bg, b_off_adj, a_off_f16) = build_matmul_qkv_coop_f16_vk_bind_group(
-                                &dev.device,
-                                mqk,
-                                &arena,
-                                base,
-                                size,
-                                &u,
-                                k,
-                                n,
-                                p.b_off,
-                                (arena.offset(a_id) as u64 / 4, m as u64 * k as u64),
-                            );
+                            let mqk = qkv_f16_vk
+                                .expect("coop f16 matmul_qkv kernel: admitted by qkv_kind above");
+                            let (bg, b_off_adj, a_off_f16) =
+                                build_matmul_qkv_coop_f16_vk_bind_group(
+                                    &dev.device,
+                                    mqk,
+                                    &arena,
+                                    base,
+                                    size,
+                                    &u,
+                                    k,
+                                    n,
+                                    p.b_off,
+                                    (arena.offset(a_id) as u64 / 4, m as u64 * k as u64),
+                                );
                             if let Some(Step::MatmulQkv { params, .. }) = schedule.last_mut() {
                                 params.b_off = b_off_adj;
                                 // A's offset in the f16 window (`a_off` stays the
@@ -8120,9 +8139,8 @@ fn compile_static_with(
                         }
                         MatmulQkvKind::CoopF32 => bind_arena_window(
                             &dev.device,
-                            matmul_qkv_coop_f32_kernel(&dev.device).expect(
-                                "coop matmul_qkv kernel: hardware feature was checked but kernel missing",
-                            ),
+                            matmul_qkv_coop_f32_kernel(&dev.device)
+                                .expect("coop f32 matmul_qkv kernel: admitted by qkv_kind above"),
                             &arena,
                             base,
                             size,

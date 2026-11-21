@@ -183,27 +183,43 @@ fn gemv_wide_enabled() -> bool {
 /// crate asks the device rather than trusting a compile-time constant.
 ///
 /// `None` when the device does not carry [`wgpu::Features::SUBGROUP`] (the probe
-/// shader names subgroup built-ins, so it is never created there). A probed read
+/// shader names subgroup built-ins, so it is never created there), and `None` on a Metal
+/// device that is not Apple silicon whatever it advertises — that family is where the
+/// reduction is wrong rather than slow, and the gate is
+/// `crate::device::wide_reduction_admitted`'s. A probed read
 /// that does not come back is refused on stderr rather than left as a silent
 /// `None`: the arm is then never taken for the life of the process, and an
 /// undiagnosed refusal would read as "this device has no subgroups".
-/// The answer is the process-global device's: the probe caches into one `OnceLock`
+/// The width is the process-global device's: the probe caches into one `OnceLock`
 /// and submits on the process-global queue, so a second adapter in the same
 /// process would read the first one's width. This crate has one device per process
-/// (`device.rs`), which is why the signature takes the device at all.
+/// (`device.rs`), which is why the signature takes the device at all. The family gate
+/// is not the global's: it answers for the `device` its caller hands it
+/// (`crate::device::wide_reduction_admitted`), and the two are decided together,
+/// once, when the cache is filled.
 pub fn gemv_subgroup_probe(device: &wgpu::Device) -> Option<(u32, u32)> {
-    if !device.features().contains(wgpu::Features::SUBGROUP) {
-        return None;
-    }
-    *GEMV_SUBGROUP.get_or_init(|| match run_subgroup_probe(device) {
-        Some(probed) => Some(probed),
-        None => {
-            eprintln!(
-                "rlx-wgpu: the subgroup probe on {:?} did not complete — the wide one-row \
-                 arm stays off and the shared-memory arm runs",
-                crate::device::adapter_name()
-            );
-            None
+    // Both gates sit inside the cache because this is read several times per dispatch
+    // (`gemv_subgroup_width`, `gemv_wide_cols_per_wg`), and the GPU-family one costs an
+    // `AdapterInfo`. The family gate comes first: on a Metal device that is not Apple
+    // silicon the arm is not taken at all, so the probe that admits it is never
+    // dispatched there (see `crate::device::wide_reduction_admitted`).
+    *GEMV_SUBGROUP.get_or_init(|| {
+        if !crate::device::wide_reduction_admitted(device) {
+            return None;
+        }
+        if !device.features().contains(wgpu::Features::SUBGROUP) {
+            return None;
+        }
+        match run_subgroup_probe(device) {
+            Some(probed) => Some(probed),
+            None => {
+                eprintln!(
+                    "rlx-wgpu: the subgroup probe on {:?} did not complete — the wide one-row \
+                     arm stays off and the shared-memory arm runs",
+                    crate::device::adapter_name()
+                );
+                None
+            }
         }
     })
 }
@@ -819,7 +835,9 @@ pub const GEMV_ILP_Q6K_MIN_COLS: usize = 2048;
 /// shared-memory arm (20 020.8 against 20 502.1 ms, the predictor 38.98 against
 /// 40.39 ms a level), and the session in the shader's header table reads it ahead
 /// on every `Q8_0` form this model's levels issue; `RLX_WGPU_GEMV_WIDE=shared`
-/// restores the workgroup-memory arm.
+/// restores the workgroup-memory arm. The knob chooses between the arms a device
+/// admits — it cannot force the subgroup arm on a Metal GPU that is not Apple
+/// silicon, where [`crate::device::wide_reduction_admitted`] refuses it outright.
 const GEMV_WIDE_DEFAULT: bool = true;
 
 /// Output columns one workgroup of the tiled arm covers. Two, so a workgroup

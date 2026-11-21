@@ -95,6 +95,343 @@ const ADAPTER_OPTIONS: wgpu::RequestAdapterOptions = wgpu::RequestAdapterOptions
     apply_limit_buckets: false,
 };
 
+/// The bytes of the largest single buffer this process will ask the device for, as
+/// [`require_buffer_bytes`] declares them; `0` — no requirement — until it does.
+#[cfg(not(target_family = "wasm"))]
+static REQUIRED_BUFFER_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Declare the largest single buffer this process will ask the device for, before the
+/// device exists.
+///
+/// The figure is the caller's and not this crate's: only the caller knows what it will
+/// build, and `mahbot-inference`'s `LARGEST_BUFFER_BYTES` carries this fork's with its
+/// provenance. Declaring nothing is the same as declaring zero — no requirement — and
+/// leaves the chooser with its capability term; what the number then decides is
+/// `better_candidate`'s rule. A call after the device exists is inert by design:
+/// `mahbot-inference` declares from both its pre-device funnel and its compile path, and
+/// only the first can move the choice.
+#[cfg(not(target_family = "wasm"))]
+pub fn require_buffer_bytes(bytes: u64) {
+    REQUIRED_BUFFER_BYTES.store(bytes, std::sync::atomic::Ordering::Release);
+}
+
+/// How many device features an adapter advertises.
+///
+/// The count, not a name and not a family guess: a name says nothing about what a driver
+/// will accept, and the vendor field is zero on Metal. Two adapters of one machine that
+/// report the same features are indistinguishable to this rule, which is what makes the
+/// tie-break "keep the power preference's own" well defined.
+#[cfg(not(target_family = "wasm"))]
+fn feature_count(features: wgpu::Features) -> u32 {
+    features.bits().0.into_iter().map(u64::count_ones).sum()
+}
+
+/// One adapter as the chooser sees it: what it is, what it advertises, and the largest
+/// buffer it can hold. A struct rather than a `wgpu::Adapter` so the rule below is
+/// device-free and its tests need no GPU.
+#[cfg(not(target_family = "wasm"))]
+struct Candidate {
+    info: wgpu::AdapterInfo,
+    features: u32,
+    max_buffer_size: u64,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Candidate {
+    fn of(adapter: &wgpu::Adapter) -> Self {
+        Self {
+            info: adapter.get_info(),
+            features: feature_count(adapter.features()),
+            max_buffer_size: adapter.limits().max_buffer_size,
+        }
+    }
+
+    /// Whether this candidate holds `required` bytes in one buffer: the shipped route, and
+    /// what the run's largest allocation asks for.
+    fn holds(&self, required: u64) -> bool {
+        self.max_buffer_size >= required
+    }
+
+    /// Whether this candidate can hold `required` bytes at all: in one buffer, or striped
+    /// across at most [`crate::buffer::MAX_SHARDS`] of them.
+    ///
+    /// The bound is the parked weight buffer's alone: it stripes at the adapter's own cap
+    /// with nothing taken off it (the stage reserve is the activation arena's staging tail,
+    /// not the weights'). Holding `required` in one buffer therefore means that buffer needs
+    /// no stripe — not that the whole plan fits, since the activation arena is planned
+    /// separately and may still be refused at the first compile, where the refusal steps down
+    /// to the processor through `mahbot-inference`'s device choice.
+    fn can_hold_striped(&self, required: u64) -> bool {
+        crate::buffer::shard_cap_for(self.max_buffer_size)
+            .saturating_mul(crate::buffer::MAX_SHARDS as u64)
+            >= required
+    }
+}
+
+/// The pick among `candidates`, or `None` to keep `today` — the adapter [`ADAPTER_OPTIONS`]
+/// asks for.
+///
+/// Three terms, in this order. **Room** first: a candidate that cannot hold the run's
+/// largest buffer even striped is out of the running, and one that holds it in a single
+/// buffer beats one that would have to stripe it — the shipped route, and the point of the
+/// rule, because `HighPerformance` on a dual-GPU Mac of the Intel era names the older
+/// discrete part. **Capability** next: among what is left, the most advertised device
+/// features wins, which is how the integrated GPU of such a machine beats the discrete one
+/// that lacks the newer Metal feature set. **Tie**: equal keeps `today`, so a machine whose
+/// GPUs this rule cannot tell apart keeps the adapter it has always used.
+///
+/// `today` is a candidate too, so a machine where nothing else qualifies — including one
+/// where the power preference's own adapter is the only one with room — answers `None` and
+/// changes nothing.
+#[cfg(not(target_family = "wasm"))]
+fn better_candidate(required: u64, today: &Candidate, candidates: &[Candidate]) -> Option<usize> {
+    let score = |candidate: &Candidate| (candidate.holds(required), candidate.features);
+    let mut best = today
+        .can_hold_striped(required)
+        .then(|| (score(today), None));
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !candidate.can_hold_striped(required) {
+            continue;
+        }
+        let candidate_score = score(candidate);
+        if best.is_none_or(|(best_score, _)| candidate_score > best_score) {
+            best = Some((candidate_score, Some(index)));
+        }
+    }
+    best.and_then(|(_, index)| index)
+}
+
+/// Whether this crate will run on an adapter of this description.
+///
+/// Software rasterisers (WARP on Windows, llvmpipe/lavapipe on Linux) report
+/// `DeviceType::Cpu`. They only get picked when there is no real GPU, and they run the
+/// shaders on the CPU: slower than rlx-cpu, with a third set of numerics. Report no wgpu
+/// device instead so callers fall back to the CPU backend (rlx-hwprofile skips them for the
+/// same reason). `RLX_WGPU_ALLOW_SOFTWARE=1` keeps them, for exercising the GPU path on a
+/// machine without a GPU.
+#[cfg(not(target_family = "wasm"))]
+fn usable(info: &wgpu::AdapterInfo) -> bool {
+    info.device_type != wgpu::DeviceType::Cpu || rlx_ir::env::flag("RLX_WGPU_ALLOW_SOFTWARE")
+}
+
+/// [`usable`], saying why not: the refusal is the only trace a software adapter leaves.
+#[cfg(not(target_family = "wasm"))]
+fn usable_or_say(info: &wgpu::AdapterInfo) -> bool {
+    if usable(info) {
+        return true;
+    }
+    eprintln!(
+        "[rlx-wgpu] skipping software adapter {:?} ({:?}); set RLX_WGPU_ALLOW_SOFTWARE=1 to use it",
+        info.name, info.backend
+    );
+    false
+}
+
+/// The limits this crate asks a device for: the adapter's own, with the two windowing
+/// clamps its ops need.
+#[cfg(not(target_family = "wasm"))]
+fn device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    let mut limits = adapter.limits();
+    // When large buffers are enabled, keep storage *bindings* ≤ ~4 GiB so
+    // ops window into the single physical buffer (whole-buffer binds of
+    // >4 GiB returned all-zero F5 DiT outputs on wgpu-Metal).
+    if rlx_ir::env::flag("RLX_WGPU_LARGE_BUFFERS") {
+        const BIND_CAP: u64 = (4u64 << 30) - 256;
+        if limits.max_buffer_size > BIND_CAP {
+            limits.max_storage_buffer_binding_size =
+                limits.max_storage_buffer_binding_size.min(BIND_CAP);
+            limits.max_uniform_buffer_binding_size =
+                limits.max_uniform_buffer_binding_size.min(BIND_CAP);
+        }
+    }
+    // `RLX_WGPU_MAX_BIND_MB` caps the storage-binding size the device is
+    // created with, to exercise the over-the-binding-limit paths (arena
+    // windows, parked weights, staging) on an adapter whose real limit is
+    // larger — e.g. NVIDIA's 2 GiB on a Mac. It already capped the GGUF
+    // path; capping the device makes every path see the same limit.
+    if let Some(mb) = rlx_ir::env::var("RLX_WGPU_MAX_BIND_MB").and_then(|v| v.parse::<u64>().ok()) {
+        let cap = (mb << 20) / 256 * 256;
+        limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.min(cap);
+    }
+    if rlx_ir::env::flag("RLX_WGPU_PRINT_LIMITS") {
+        eprintln!(
+            "[rlx-wgpu] adapter limits: max_buffer_size={:.3}GiB max_storage_binding={:.3}GiB",
+            limits.max_buffer_size as f64 / ((1u64 << 30) as f64),
+            limits.max_storage_buffer_binding_size as f64 / ((1u64 << 30) as f64),
+        );
+    }
+    limits
+}
+
+/// Create the device on `adapter`, with this crate's limits and feature policy; `None` when
+/// the adapter cannot produce one. The adapter is the caller's to keep.
+#[cfg(not(target_family = "wasm"))]
+fn open_device(adapter: &wgpu::Adapter) -> Option<(wgpu::Device, wgpu::Queue)> {
+    let limits = device_limits(adapter);
+    let required_features = required_features_for(adapter);
+    match pollster::block_on(adapter.request_device(&device_descriptor(required_features, limits)))
+    {
+        Ok((device, queue)) => {
+            if rlx_ir::env::flag("RLX_WGPU_PRINT_LIMITS") {
+                let dl = device.limits();
+                eprintln!(
+                    "[rlx-wgpu] device limits: max_buffer_size={:.3}GiB \
+                     max_storage_binding={:.3}GiB",
+                    dl.max_buffer_size as f64 / ((1u64 << 30) as f64),
+                    dl.max_storage_buffer_binding_size as f64 / ((1u64 << 30) as f64),
+                );
+            }
+            Some((device, queue))
+        }
+        Err(e) => {
+            eprintln!(
+                "rlx-wgpu request_device failed on {}: {e}",
+                adapter.get_info().name
+            );
+            None
+        }
+    }
+}
+
+/// The one line [`better_adapter`] prints when there is a choice to make: which adapter was
+/// taken, how many of the machine's adapters can hold the run's buffer, and the term that
+/// decided the pick — room, features, or the power preference's own kept. On a machine nobody
+/// here can test this line is the whole diagnosis, so it is a pure function of the decision
+/// and tested as one.
+#[cfg(not(target_family = "wasm"))]
+fn choice_line(
+    today: &Candidate,
+    chosen: Option<&Candidate>,
+    candidates: &[Candidate],
+    required: u64,
+) -> String {
+    let (name, backend, features) = match chosen {
+        Some(candidate) => (
+            &candidate.info.name,
+            candidate.info.backend,
+            candidate.features,
+        ),
+        None => (&today.info.name, today.info.backend, today.features),
+    };
+    let seen = candidates.len() + 1;
+    let kept = candidates.iter().filter(|c| c.holds(required)).count()
+        + usize::from(today.holds(required));
+    let capacity = if required > 0 {
+        format!(
+            ", {kept} of {seen} can hold the {} MiB the run needs in one buffer",
+            required.div_ceil(1 << 20)
+        )
+    } else {
+        format!(", {seen} candidates")
+    };
+    // The reason names the term that decided the pick. Room first: the power preference's own
+    // may not hold the buffer at all — not even striped, which the score cannot express, both
+    // then reading `holds = false` — or may hold it only by striping. Features otherwise: two
+    // adapters on the same side of that line were compared on features, and the line says so.
+    let reason = match chosen {
+        None => ", the power preference's own",
+        Some(_) if !today.can_hold_striped(required) => {
+            ", the power preference's own cannot hold the run's buffer even striped"
+        }
+        Some(c) if c.holds(required) && !today.holds(required) => {
+            ", the power preference's own cannot hold the run's buffer in one buffer"
+        }
+        Some(_) => ", more features than the power preference's",
+    };
+    format!("[rlx-wgpu] adapter {name} ({backend:?}): {features} features{capacity}{reason}")
+}
+
+/// The adapter to run on *instead of* [`ADAPTER_OPTIONS`]'s own, or `None` to keep it: the
+/// candidate [`better_candidate`] picks among the adapters of the same API.
+///
+/// Scoped to the power preference's own API on purpose: on Apple the request spans Metal and
+/// MoltenVK, and a cross-API pick would move the record's device line and the calibration
+/// cache key on a machine whose API order is a separate decision ([`default_backends`]). The
+/// enumeration is scoped with it, so a machine that has a second backend installed does not
+/// pay to enumerate it. A software rasteriser is not a candidate unless the operator asked
+/// for one ([`usable`]).
+///
+/// A machine with no other usable adapter of this API answers `None` without printing: there
+/// is no choice to explain, which is also what a second adapter of identical info or a
+/// software rasteriser ([`usable`]) leaves it with.
+#[cfg(not(target_family = "wasm"))]
+fn better_adapter(instance: &wgpu::Instance, today: &wgpu::Adapter) -> Option<wgpu::Adapter> {
+    let required = REQUIRED_BUFFER_BYTES.load(std::sync::atomic::Ordering::Acquire);
+    let today_view = Candidate::of(today);
+    let api = wgpu::Backends::from(today_view.info.backend);
+    let mut candidates = Vec::new();
+    let mut adapters = Vec::new();
+    for adapter in pollster::block_on(instance.enumerate_adapters(api)) {
+        let view = Candidate::of(&adapter);
+        if view.info == today_view.info || !usable(&view.info) {
+            continue;
+        }
+        candidates.push(view);
+        adapters.push(adapter);
+    }
+    if candidates.is_empty() {
+        // One adapter of this API: there is no choice to make and nothing to print, so the
+        // machine keeps exactly the behaviour it had.
+        return None;
+    }
+    let chosen = better_candidate(required, &today_view, &candidates);
+    eprintln!(
+        "{}",
+        choice_line(
+            &today_view,
+            chosen.map(|index| &candidates[index]),
+            &candidates,
+            required
+        )
+    );
+    chosen.map(|index| adapters.swap_remove(index))
+}
+
+/// Whether the wide (subgroup) reduction may be taken on `device`.
+///
+/// The one wide reduction in this crate is the packed one-row GEMV's subgroup arm
+/// (`gguf_gpu`'s `dequant_gemv_wide`, admitted by [`gguf_gpu::gemv_subgroup_probe`]'s
+/// width). On Metal it is taken on Apple silicon and nowhere else, because on the Intel
+/// and AMD Macs it produces wrong numbers rather than failing: llama.cpp's Metal backend
+/// disables its simdgroup reduction on all Intel Macs and forces a narrower one on the AMD
+/// parts of this era for exactly that reason. Vega is the same generation and the same
+/// doubt, so the boundary is not "older than Vega" but the GPU family itself — the fork's
+/// rule is that an uncertain signal resolves to the slow-but-correct path, and the
+/// portable arm (`dequant_gemv_tiled`, a workgroup-memory reduction) is that path.
+///
+/// Scoped to the Metal backend explicitly. The same reduction is measured and correct on a
+/// discrete Vulkan adapter (see `GEMV_WIDE_DEFAULT`'s doc), so a name-based test for
+/// "Intel" would switch off a correct arm on an Intel Arc under Vulkan.
+///
+/// The backend is the one `device` reports, not the process-global device's: the probe is
+/// handed a device by its caller, and this crate can hold a second one
+/// (`vulkan_device`), which would otherwise get the answer for the first.
+///
+/// The family signal is the process's own architecture, which is a compile-time fact:
+/// every Apple-silicon Mac runs an `aarch64` build and every Intel Mac an `x86_64` one.
+/// The one case it gets wrong is an `x86_64` build under Rosetta on an Apple-silicon Mac,
+/// where it answers "not Apple silicon" — slower and correct, which is the side the rule
+/// resolves uncertainty to.
+pub(crate) fn wide_reduction_admitted(device: &wgpu::Device) -> bool {
+    let info = device.adapter_info();
+    let admitted = wide_reduction_admitted_on(info.backend, cfg!(target_arch = "aarch64"));
+    if !admitted {
+        // Reached once per process: its only caller fills the probe cache, so the line
+        // cannot repeat.
+        eprintln!(
+            "[rlx-wgpu] adapter {} ({:?}): this binary does not take the wide one-row \
+             reduction on Metal — the portable reduction serves it",
+            info.name, info.backend
+        );
+    }
+    admitted
+}
+
+/// [`wide_reduction_admitted`]'s rule, without a device.
+fn wide_reduction_admitted_on(backend: wgpu::Backend, apple_silicon: bool) -> bool {
+    backend != wgpu::Backend::Metal || apple_silicon
+}
+
 fn device_descriptor(
     required_features: wgpu::Features,
     limits: wgpu::Limits,
@@ -114,76 +451,30 @@ impl WgpuDevice {
     #[cfg(not(target_family = "wasm"))]
     fn new_with_backends(backends: wgpu::Backends) -> Option<Self> {
         let instance = make_instance(backends);
-        let adapter = pollster::block_on(instance.request_adapter(&ADAPTER_OPTIONS)).ok()?;
-
-        let info = adapter.get_info();
-        // Software rasterisers (WARP on Windows, llvmpipe/lavapipe on Linux)
-        // report `DeviceType::Cpu`. They only get picked when there is no real
-        // GPU, and they run the shaders on the CPU: slower than rlx-cpu, with
-        // a third set of numerics. Report no wgpu device instead so callers
-        // fall back to the CPU backend (rlx-hwprofile skips them for the same
-        // reason). RLX_WGPU_ALLOW_SOFTWARE=1 keeps them, for exercising the
-        // GPU path on a machine without a GPU.
-        if info.device_type == wgpu::DeviceType::Cpu
-            && !rlx_ir::env::flag("RLX_WGPU_ALLOW_SOFTWARE")
-        {
-            eprintln!(
-                "[rlx-wgpu] skipping software adapter {:?} ({:?}); set RLX_WGPU_ALLOW_SOFTWARE=1 to use it",
-                info.name, info.backend
-            );
+        let today = pollster::block_on(instance.request_adapter(&ADAPTER_OPTIONS)).ok()?;
+        let (mut adapter, chose_another) = match better_adapter(&instance, &today) {
+            Some(picked) => (picked, true),
+            None => (today.clone(), false),
+        };
+        if !usable_or_say(&adapter.get_info()) {
             return None;
         }
-        let mut limits = adapter.limits();
-        // When large buffers are enabled, keep storage *bindings* ≤ ~4 GiB so
-        // ops window into the single physical buffer (whole-buffer binds of
-        // >4 GiB returned all-zero F5 DiT outputs on wgpu-Metal).
-        if rlx_ir::env::flag("RLX_WGPU_LARGE_BUFFERS") {
-            const BIND_CAP: u64 = (4u64 << 30) - 256;
-            if limits.max_buffer_size > BIND_CAP {
-                limits.max_storage_buffer_binding_size =
-                    limits.max_storage_buffer_binding_size.min(BIND_CAP);
-                limits.max_uniform_buffer_binding_size =
-                    limits.max_uniform_buffer_binding_size.min(BIND_CAP);
+        let (device, queue) = match open_device(&adapter) {
+            Some(opened) => opened,
+            // The adapter this rule picked could not produce a device. The power
+            // preference's own is asked once more, so choosing between two GPUs can never
+            // cost a machine the one that worked before the rule existed.
+            None if chose_another && usable(&today.get_info()) => {
+                eprintln!(
+                    "[rlx-wgpu] the adapter this rule picked could not produce a device; \
+                     asking the power preference's own"
+                );
+                adapter = today;
+                open_device(&adapter)?
             }
-        }
-        // `RLX_WGPU_MAX_BIND_MB` caps the storage-binding size the device is
-        // created with, to exercise the over-the-binding-limit paths (arena
-        // windows, parked weights, staging) on an adapter whose real limit is
-        // larger — e.g. NVIDIA's 2 GiB on a Mac. It already capped the GGUF
-        // path; capping the device makes every path see the same limit.
-        if let Some(mb) =
-            rlx_ir::env::var("RLX_WGPU_MAX_BIND_MB").and_then(|v| v.parse::<u64>().ok())
-        {
-            let cap = (mb << 20) / 256 * 256;
-            limits.max_storage_buffer_binding_size =
-                limits.max_storage_buffer_binding_size.min(cap);
-        }
-        if rlx_ir::env::flag("RLX_WGPU_PRINT_LIMITS") {
-            eprintln!(
-                "[rlx-wgpu] adapter limits: max_buffer_size={:.3}GiB max_storage_binding={:.3}GiB",
-                limits.max_buffer_size as f64 / ((1u64 << 30) as f64),
-                limits.max_storage_buffer_binding_size as f64 / ((1u64 << 30) as f64),
-            );
-        }
-        let required_features = required_features_for(&adapter);
-
-        let (device, queue) = match pollster::block_on(
-            adapter.request_device(&device_descriptor(required_features, limits)),
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("rlx-wgpu request_device failed: {e}");
-                return None;
-            }
+            None => return None,
         };
-        if rlx_ir::env::flag("RLX_WGPU_PRINT_LIMITS") {
-            let dl = device.limits();
-            eprintln!(
-                "[rlx-wgpu] device limits: max_buffer_size={:.3}GiB max_storage_binding={:.3}GiB",
-                dl.max_buffer_size as f64 / ((1u64 << 30) as f64),
-                dl.max_storage_buffer_binding_size as f64 / ((1u64 << 30) as f64),
-            );
-        }
+        let info = adapter.get_info();
 
         Some(Self {
             instance,
@@ -630,5 +921,207 @@ mod tests {
         });
         assert_eq!(found, Some(wgpu::Backends::VULKAN));
         assert_eq!(asked, [wgpu::Backends::DX12, wgpu::Backends::VULKAN]);
+    }
+
+    /// The wide reduction is taken on Apple silicon and nowhere else on Metal, and
+    /// on every other API it is not this rule's to refuse: the same arm is measured
+    /// and correct on a discrete Vulkan adapter, so a family test that also caught
+    /// an Intel Arc under Vulkan would switch off a correct route.
+    #[test]
+    fn the_wide_reduction_is_apple_silicon_only_on_metal() {
+        assert!(!wide_reduction_admitted_on(wgpu::Backend::Metal, false));
+        assert!(wide_reduction_admitted_on(wgpu::Backend::Metal, true));
+        for backend in [
+            wgpu::Backend::Vulkan,
+            wgpu::Backend::Dx12,
+            wgpu::Backend::Gl,
+        ] {
+            assert!(
+                wide_reduction_admitted_on(backend, false),
+                "{backend:?} keeps the arm whatever the process architecture is"
+            );
+        }
+    }
+
+    /// A candidate the rule can name, with the two numbers it reads.
+    fn candidate(name: &str, device_type: wgpu::DeviceType, features: u32, mib: u64) -> Candidate {
+        Candidate {
+            info: wgpu::AdapterInfo {
+                name: name.to_string(),
+                vendor: 0,
+                device: 0,
+                device_type,
+                device_pci_bus_id: String::new(),
+                driver: String::new(),
+                driver_info: String::new(),
+                backend: wgpu::Backend::Metal,
+                subgroup_min_size: 4,
+                subgroup_max_size: 64,
+                transient_saves_memory: None,
+                limit_bucket: None,
+            },
+            features,
+            max_buffer_size: mib << 20,
+        }
+    }
+
+    /// The dual-GPU Mac this rule exists for: the power preference names the older
+    /// discrete part, the integrated one has the newer feature set, and both can hold
+    /// the run's buffer in one buffer — so the one with more features is taken, and the
+    /// line says that. With nothing declared the same candidate wins: the room term is a
+    /// floor, not the rule's reason for existing.
+    #[test]
+    fn the_adapter_with_more_features_wins_when_both_hold_the_buffer() {
+        let today = candidate(
+            "AMD Radeon Pro 5500M",
+            wgpu::DeviceType::DiscreteGpu,
+            20,
+            2048,
+        );
+        let integrated = candidate("Intel UHD 630", wgpu::DeviceType::IntegratedGpu, 24, 1536);
+        let others = std::slice::from_ref(&integrated);
+        assert_eq!(better_candidate(1_050 << 20, &today, others), Some(0));
+        assert_eq!(better_candidate(0, &today, others), Some(0));
+        assert_eq!(
+            choice_line(&today, Some(&integrated), others, 1_050 << 20),
+            "[rlx-wgpu] adapter Intel UHD 630 (Metal): 24 features, 2 of 2 can hold the \
+             1050 MiB the run needs in one buffer, more features than the power preference's"
+        );
+    }
+
+    /// Room is the first term: an adapter that would have to stripe the run's buffer loses
+    /// to one that holds it in one buffer, even against more features — and the line has to
+    /// say that, not claim a feature win it does not have.
+    #[test]
+    fn an_adapter_that_would_stripe_the_buffer_loses_to_one_that_holds_it() {
+        let today = candidate(
+            "AMD Radeon Pro 5500M",
+            wgpu::DeviceType::DiscreteGpu,
+            20,
+            1024,
+        );
+        let integrated = candidate("Intel UHD 630", wgpu::DeviceType::IntegratedGpu, 16, 1536);
+        let others = std::slice::from_ref(&integrated);
+        assert_eq!(better_candidate(1_050 << 20, &today, others), Some(0));
+        assert_eq!(
+            choice_line(&today, Some(&integrated), others, 1_050 << 20),
+            "[rlx-wgpu] adapter Intel UHD 630 (Metal): 16 features, 1 of 2 can hold the \
+             1050 MiB the run needs in one buffer, the power preference's own cannot hold \
+             the run's buffer in one buffer"
+        );
+    }
+
+    /// An adapter that cannot hold the buffer even striped is out of the running, and
+    /// then the power preference's own is kept — or, if it is the one without room, the
+    /// candidate that has it is taken.
+    #[test]
+    fn a_candidate_without_room_even_striped_is_out_of_the_running() {
+        let today = candidate(
+            "AMD Radeon Pro 5500M",
+            wgpu::DeviceType::DiscreteGpu,
+            20,
+            2048,
+        );
+        // 8 MiB × MAX_SHARDS is 512 MiB: not enough for a 1050 MiB buffer.
+        let integrated = candidate("Intel UHD 630", wgpu::DeviceType::IntegratedGpu, 24, 8);
+        assert!(!integrated.can_hold_striped(1_050 << 20));
+        assert_eq!(better_candidate(1_050 << 20, &today, &[integrated]), None);
+        // The same adapter in the power preference's place: it is not in the running, so
+        // the candidate with room is taken whatever it advertises.
+        let small = candidate("AMD Radeon Pro 5500M", wgpu::DeviceType::DiscreteGpu, 20, 8);
+        let room = candidate("Intel UHD 630", wgpu::DeviceType::IntegratedGpu, 16, 1536);
+        assert_eq!(better_candidate(1_050 << 20, &small, &[room]), Some(0));
+        // Neither can hold it, even striped — the case the drop term exists for. Without it
+        // the more-featured candidate would be taken for a run neither GPU can carry, which
+        // is how a machine ends up moved off its working adapter.
+        let other_small = candidate("Intel UHD 630", wgpu::DeviceType::IntegratedGpu, 24, 8);
+        assert_eq!(better_candidate(1_050 << 20, &small, &[other_small]), None);
+    }
+
+    /// Two adapters that would both have to stripe the run's buffer are still compared on
+    /// features, and the one with more is taken.
+    #[test]
+    fn two_adapters_that_both_stripe_are_compared_on_features() {
+        let today = candidate(
+            "AMD Radeon Pro 5500M",
+            wgpu::DeviceType::DiscreteGpu,
+            20,
+            1024,
+        );
+        let integrated = candidate("Intel UHD 630", wgpu::DeviceType::IntegratedGpu, 24, 1024);
+        assert_eq!(
+            better_candidate(1_050 << 20, &today, &[integrated]),
+            Some(0)
+        );
+    }
+
+    /// Both terms equal keeps today's choice, and so does a candidate that is worse on
+    /// both — a machine whose GPUs this rule cannot tell apart does not move.
+    #[test]
+    fn a_tie_keeps_the_power_preferences_own() {
+        let today = candidate("Apple M3 Pro", wgpu::DeviceType::IntegratedGpu, 24, 4096);
+        let same = candidate("Apple M3 Pro", wgpu::DeviceType::IntegratedGpu, 24, 4096);
+        let fewer = candidate("Intel UHD 630", wgpu::DeviceType::IntegratedGpu, 20, 4096);
+        assert_eq!(better_candidate(0, &today, &[same]), None);
+        assert_eq!(better_candidate(0, &today, &[fewer]), None);
+    }
+
+    /// The line a machine leaves behind, in the three shapes the decision has: the power
+    /// preference's own kept, a pick made on features between two adapters that both have to
+    /// stripe the run's buffer, and a pick made on room when the power preference's own
+    /// cannot hold it at all. The wording is the contract — it is all anyone has to diagnose
+    /// such a machine with.
+    #[test]
+    fn the_choice_line_names_the_adapter_and_the_reason() {
+        let today = candidate(
+            "AMD Radeon Pro 5500M",
+            wgpu::DeviceType::DiscreteGpu,
+            20,
+            2048,
+        );
+        let integrated = candidate("Intel UHD 630", wgpu::DeviceType::IntegratedGpu, 24, 1536);
+        let others = std::slice::from_ref(&integrated);
+        // The other candidate cannot hold the run's buffer in one buffer, and a run that
+        // declared none: both end on the adapter the machine has always used.
+        assert_eq!(
+            choice_line(&today, None, others, 2_000 << 20),
+            "[rlx-wgpu] adapter AMD Radeon Pro 5500M (Metal): 20 features, 1 of 2 can hold \
+             the 2000 MiB the run needs in one buffer, the power preference's own"
+        );
+        assert_eq!(
+            choice_line(&today, None, others, 0),
+            "[rlx-wgpu] adapter AMD Radeon Pro 5500M (Metal): 20 features, 2 candidates, \
+             the power preference's own"
+        );
+        // Both would stripe the run's buffer, so the pick was made on features: the line says
+        // that rather than naming a capacity term that decided nothing.
+        let striped_today = candidate(
+            "AMD Radeon Pro 5500M",
+            wgpu::DeviceType::DiscreteGpu,
+            20,
+            1024,
+        );
+        let striped_other = candidate("Intel UHD 630", wgpu::DeviceType::IntegratedGpu, 24, 1024);
+        let striped = std::slice::from_ref(&striped_other);
+        assert_eq!(
+            choice_line(&striped_today, Some(&striped_other), striped, 1_050 << 20),
+            "[rlx-wgpu] adapter Intel UHD 630 (Metal): 24 features, 0 of 2 can hold the 1050 \
+             MiB the run needs in one buffer, more features than the power preference's"
+        );
+        // The power preference's own cannot carry the buffer even striped, so the pick was made
+        // on room — the line must not claim a feature win that decided nothing.
+        let cannot = candidate("AMD Radeon Pro 5500M", wgpu::DeviceType::DiscreteGpu, 20, 8);
+        let striped_only = candidate("Intel UHD 630", wgpu::DeviceType::IntegratedGpu, 16, 1024);
+        assert_eq!(
+            choice_line(
+                &cannot,
+                Some(&striped_only),
+                std::slice::from_ref(&striped_only),
+                1_050 << 20
+            ),
+            "[rlx-wgpu] adapter Intel UHD 630 (Metal): 16 features, 0 of 2 can hold the 1050 \
+             MiB the run needs in one buffer, the power preference's own cannot hold the run's \
+             buffer even striped"
+        );
     }
 }

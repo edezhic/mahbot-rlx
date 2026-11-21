@@ -828,6 +828,14 @@ pub fn shard_stage_reserve() -> usize {
     default
 }
 
+/// The cap a region is striped at on an adapter whose `max_buffer_size` is this: the
+/// adapter's own limit rounded down to the 256-byte multiple every shard offset is placed
+/// at. Pure, so the bound [`MAX_SHARDS`] is checked against is decidable without a device —
+/// [`effective_shard_cap`] is the lesser of this and `RLX_WGPU_SHARD_CAP_MIB`.
+pub(crate) fn shard_cap_for(max_buffer_size: u64) -> u64 {
+    max_buffer_size / 256 * 256
+}
+
 /// Device shard capacity, honouring `RLX_WGPU_SHARD_CAP_MIB`.
 ///
 /// The real cap is the adapter's `max_buffer_size` (4 GiB on discrete Vulkan,
@@ -849,7 +857,7 @@ pub fn shard_stage_reserve() -> usize {
 /// an arena into more stripes than that is refused at plan time — before the
 /// buffers it bounds are created — rather than realized.
 pub fn effective_shard_cap(device: &wgpu::Device) -> usize {
-    let device_cap = ((device.limits().max_buffer_size as usize) / 256) * 256;
+    let device_cap = shard_cap_for(device.limits().max_buffer_size) as usize;
     if let Some(raw) = rlx_ir::env::var("RLX_WGPU_SHARD_CAP_MIB")
         && let Ok(mib) = raw.parse::<usize>()
     {
@@ -1818,7 +1826,7 @@ impl Drop for Arena {
         for b in &self.extra_shards {
             b.destroy();
         }
-        if let Some(b) = &self.f16_buffer {
+        if let Some(b) = self.f16_mirror.allocated() {
             b.destroy();
         }
     }

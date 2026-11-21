@@ -18,7 +18,9 @@ use rlx_ir::{Graph, NodeId, Op};
 
 use crate::buffer::{Arena, ReadbackStaging, TinyReadbackStaging};
 use crate::device::wgpu_device;
-use crate::kernels::{GatherParams, Kernel, gather_split_kernel, matmul_coop_f16_vulkan_kernel};
+use crate::kernels::{
+    GatherParams, Kernel, gather_split_kernel, matmul_coop_f16_vulkan_active_kernel,
+};
 
 /// The largest tail working area any single op in `graph` claims: norm
 /// staging (gamma/beta copied next to the activations), `Op::LayerNormBackwardGamma`'s
@@ -3837,12 +3839,14 @@ fn derive_matmul_compute_default(
         && crate::kernels::matmul_coop_f16_f32acc_kernel(dev).is_some()
         && crate::coop_probe::f16_f32acc_path_ok();
 
+    // Resolved once, here: the same `matmul_coop_f16_vulkan_active_kernel` the bind group and
+    // the step's own dispatch ask, so a refusal cannot reach one of them and not the others.
     let coop_f16_vk_ok = !any_low
         && coop_f16_vk_eligible(dev, m, k, n)
         && b_is_param
         && !mirror_acts.contains(&a_id)
         && !mirror_acts.contains(&b_id)
-        && crate::coop_probe::f16_vk_path_ok(n);
+        && crate::kernels::matmul_coop_f16_vulkan_active_kernel(dev, n).is_some();
 
     // CoopF32 for a multiply whose weight is operand B: `b_is_param` is the
     // cascade's term for that role — it keeps the f16-shadow, packed-bf16 and
@@ -6191,7 +6195,7 @@ fn build_matmul_bind_group(
     // materialises it through `Arena::f16_mirror` *after* its own kernel check, so
     // an arm that cannot be built never allocates one.
     if compute_precision == MatmulCompute::CoopF16Vk
-        && let Some(coop_vk) = matmul_coop_f16_vulkan_kernel(device)
+        && let Some(coop_vk) = matmul_coop_f16_vulkan_active_kernel(device, n)
         && let Some(f16_buf) = arena.f16_mirror(device)
     {
         // A and B both come from the f16 shadow: one window covering both.

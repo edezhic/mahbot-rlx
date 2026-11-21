@@ -79,6 +79,23 @@ const WAY_OUT: &str = " — set MAHBOT_DEVICE=cpu to run this machine on the pro
 /// are the processor's own, and the record states them.
 pub(crate) const DEQUANT_CACHE: &str = "RLX_DEQUANT_CACHE";
 
+/// The largest single device buffer any row of this product asks for, in bytes: the body's
+/// packed weights, parked in one buffer at 256-byte offsets.
+///
+/// The recognition body's `Qwen3-ASR-1.7B-Q4_K_M.gguf` — every packed tensor of it except
+/// the token table, which no graph binds as a parameter — is 1,100,961,792 B in one buffer
+/// (the backend's own `[rlx-wgpu split] weight_params=141 weight_buf=1.025GiB` line on the
+/// `recognition 318s` row; the synthesis body's packed set is 0.79 GiB).
+///
+/// It is what the run asks for in *one* buffer, not a floor on the device: an adapter below
+/// it still runs the body on the backend's striped route. Declared to the graphics layer
+/// before the device exists, from [`resolve`] — the pre-device funnel of every product
+/// process, parent and row child alike — and from [`compile`], where a caller that never
+/// resolved (a bench, a test, a library) still declares it before the first device is
+/// created. Idempotent: the layer stores one number and the second call writes the same one.
+/// `rlx_wgpu::device::require_buffer_bytes` carries what the chooser does with it.
+const LARGEST_BUFFER_BYTES: u64 = 1_100_961_792;
+
 /// [`WAY_OUT`] where the switch is still the operator's to set, and nothing where the
 /// process is pinned: a harness refuses the switch, so naming it would instruct the
 /// operator to do what the harness refuses.
@@ -224,6 +241,7 @@ pub(crate) fn arrival() -> Option<Arrival> {
 /// forced — it never compiles, so it never reaches [`compile`].
 pub(crate) fn resolve(prefix: &str) -> std::result::Result<Asked, String> {
     let _ = PREFIX.set(prefix.to_string());
+    rlx_wgpu::device::require_buffer_bytes(LARGEST_BUFFER_BYTES);
     let asked = asked()?;
     match asked {
         Asked::Cpu => settle(
@@ -278,6 +296,7 @@ fn name(device: Device) -> &'static str {
 /// usable device, or a first graph the graphics layer refuses, moves the whole run to
 /// the processor, which compiles the same graph. Nothing is decided after that.
 pub(crate) fn compile(graph: &Graph) -> Result<CompiledGraph> {
+    rlx_wgpu::device::require_buffer_bytes(LARGEST_BUFFER_BYTES);
     let asked = asked().map_err(|message| anyhow!("{message}"))?;
     match asked {
         // A forced choice is honoured exactly: the processor never asks for the graphics

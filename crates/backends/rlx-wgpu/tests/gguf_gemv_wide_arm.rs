@@ -5,7 +5,7 @@
 //! Execution of the one-row packed multiply's two arms: the subgroup arm —
 //! `dequant_gemv_wide`, the shipped default (`gguf_gpu`'s `GEMV_WIDE_DEFAULT`),
 //! with its ILP entry — and the workgroup-memory arm it falls back to on an adapter
-//! without `Features::SUBGROUP`, reached here with `RLX_WGPU_GEMV_WIDE=shared`.
+//! the subgroup arm is not admitted on, reached here with `RLX_WGPU_GEMV_WIDE=shared`.
 //!
 //! This file is the only gate that *executes* either entry point: every other test
 //! either leaves the knob unset or pins its own parsing (the device-free
@@ -24,9 +24,9 @@
 //!
 //! One `#[test]` on purpose: the override is process-global (`RuntimeOverrides`
 //! installs into one shared map), so a second cell running in parallel in this process
-//! would race it. On a device without `Features::SUBGROUP` the subgroup cells are
-//! reported as skipped and the workgroup-memory arm — the one such a device runs —
-//! is still checked.
+//! would race it. On an adapter the arm is not admitted on — no `Features::SUBGROUP`,
+//! or Metal on a GPU that is not Apple silicon — the subgroup cells are reported as
+//! skipped and the workgroup-memory arm, the one such a device runs, is still checked.
 
 mod common;
 
@@ -121,10 +121,11 @@ fn the_subgroup_arm_matches_the_cpu_reference_on_every_scheme_it_carries() {
     // window that exported it would make these cells assert an environment.
     for (knob, want_wide) in [("1", true), ("shared", false)] {
         let label = knob;
-        if want_wide && !dev.device.features().contains(wgpu::Features::SUBGROUP) {
-            // The subgroup arm can never be admitted here; the fallback below still
-            // runs, so this file keeps covering the arm such a device executes.
-            eprintln!("[gguf-gemv-wide] skipped the subgroup arm: no wgpu::Features::SUBGROUP");
+        if want_wide && width.is_none() {
+            // The subgroup arm is not admitted here — no subgroup of a width it can
+            // use, or Metal on a GPU that is not Apple silicon. The fallback below
+            // still runs, so this file keeps covering the arm such a device executes.
+            eprintln!("[gguf-gemv-wide] skipped the subgroup arm: not admitted on this adapter");
             continue;
         }
         let _knob = rlx_ir::env::RuntimeOverrides::install([
@@ -153,8 +154,7 @@ fn the_subgroup_arm_matches_the_cpu_reference_on_every_scheme_it_carries() {
                 if want_wide {
                     let cols = gemv_wide_cols_per_wg(&dev.device)
                         .expect("the subgroup arm is admitted here");
-                    let sg = gemv_subgroup_width(&dev.device)
-                        .expect("the subgroup arm is admitted here");
+                    let sg = width.expect("the subgroup arm is admitted here");
                     let narrow_q6k = scheme == QuantScheme::GgufQ6K && k / 32 == 2 * sg as usize;
                     let floor = if narrow_q6k {
                         GEMV_ILP_Q6K_MIN_COLS

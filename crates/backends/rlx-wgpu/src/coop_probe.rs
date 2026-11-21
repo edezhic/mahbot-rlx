@@ -241,7 +241,15 @@ pub fn verified(device: &wgpu::Device, queue: &wgpu::Queue, which: CoopKernel) -
     let ok = if rlx_ir::env::flag("RLX_WGPU_NO_COOP_PROBE") {
         true
     } else {
-        run(device, queue, which).unwrap_or(false)
+        // This probe exists to answer *is this kernel usable here*, so any
+        // refusal it meets on the way — a pipeline the driver declines at build,
+        // submit or poll — is that answer, not a second run-failure mechanism.
+        // The panic guard turns the default wgpu handler's fatal report into the
+        // "not trustworthy" verdict the caller already falls back from.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(device, queue, which).unwrap_or(false)
+        }))
+        .unwrap_or(false)
     };
     if !ok {
         eprintln!(
@@ -638,14 +646,4 @@ pub fn f16_vk_32_kernel() -> Option<&'static Kernel> {
     let (device, queue) = dq()?;
     let k = crate::kernels::matmul_coop_f16_vulkan_f32acc_32_kernel(device)?;
     verified(device, queue, CoopKernel::F16Vk32).then_some(k)
-}
-
-/// Is any `matmul_coop_f16_vulkan*` variant trustworthy for this `n`?
-pub fn f16_vk_path_ok(n: u32) -> bool {
-    let Some((device, queue)) = dq() else {
-        return false;
-    };
-    let f32acc = crate::kernels::coop_f16_vk_use_f32acc(device);
-    let _ = queue;
-    f16_vk_widen_choice(n, f32acc).is_some()
 }

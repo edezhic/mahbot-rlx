@@ -61,19 +61,21 @@ The lazy engine load is in the cold column, because the cold arm is what opens t
 engine and a daemon pays that once: `warm` is a request on an engine that is up,
 which is what every request after the first one costs.
 
-A take is a result only on a machine that is otherwise idle: a parallel build,
-test run or another measurement shares the cores, the GPU and the models, and the
-heavy-run lock covers none of them. The record's `load` line is its own evidence
-of what the machine was doing; a take whose row comes back far from the figure the
-product has established, with the product untouched, is a busy machine rather
-than a change, and is discarded and re-taken instead of recorded.
+A record holds one take. A take is dropped only when something makes it *not a
+measurement*, never because of what its cells say: the binary was not built from the
+tree the `code:` line names; a row ran on a device other than the one the record's
+device line names (one arrival — how the run reached that device, settled once — for
+the whole run); a row was stopped by a bound; or a warm arm re-read the pages (the
+rule above). `load:` is not one of those: it is recorded as measured and read as
+context, nothing more. A take on a busy machine that meets none of those conditions *is*
+the record, read by the cell rule above like any other. The take in `STAND.md` is of
+that kind: its `load:` line states the load it was taken at.
 
-A processor take is the exception that proves why that rule is about the machine
-and not about the numbers: the take *is* the load there, and a long row's two arms
-cannot be separated from it. A processor row whose warm figure comes out slower
-than its cold one is therefore not by itself grounds to discard the take — what
-settles it is the page count the row prints. If `warm_reread` shows the warm arm
-did not pull the model back off the disk, the row is warm and the difference
+A processor take is the same rule from the other side: the take *is* the load
+there, and a long row's two arms cannot be separated from it. A processor row
+whose warm figure comes out slower than its cold one is therefore not by itself
+grounds to withhold the record — what settles it is the page count the row prints.
+If the row's `warm_reread` is not above that half, the row is warm and the difference
 between the arms is contention, not a cold measurement wearing a warm label.
 
 ## The two wake rows

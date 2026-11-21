@@ -4294,7 +4294,7 @@
     EnvVarEntry {
         name: "RLX_WGPU_GEMV_WIDE",
         group: "wgpu",
-        summary: "One-row packed GEMV reduction: 1/true/yes/on = subgroup arm (dequant_gemv_wide), 0/false/off/no/shared = workgroup-memory dequant_gemv_tiled; unset keeps the measured default (1)",
+        summary: "One-row packed GEMV reduction: 1/true/yes/on = subgroup arm (dequant_gemv_wide), 0/false/off/no/shared = workgroup-memory dequant_gemv_tiled; unset keeps the measured default (1). The subgroup arm is never taken on a Metal GPU that is not Apple silicon, where it produces wrong results",
         kind: EnvKind::Enum(&["1", "true", "yes", "on", "0", "shared", "false", "off", "no"]),
         stability: EnvStability::Bisect,
         aliases: &[],

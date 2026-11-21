@@ -661,6 +661,13 @@ fn print_rows(readings: &[Reading]) {
 }
 
 /// A row's six figures, as its console line and its table entry both state them.
+///
+/// The resting columns, and why an anonymous reading moves, are `docs/records.md`'s. One fact
+/// is this cell's own: a resting reading can settle at two levels for the same row with its
+/// peak unmoved — a two-decimal boundary, or an allocator that gave a buffer back on one run
+/// and not another — and neither is a footprint change. It is not a licence either: this
+/// column is where a buffer outliving its call shows up, so a step on another row is a
+/// footprint change until it is explained the same way.
 fn cells(reading: &Reading) -> [String; 6] {
     [
         report::fmt_ms(reading.cold_ms),

@@ -139,8 +139,10 @@
 // `max_size`; Metal reports 4..64), so the host measures it once per process with
 // a probe workgroup (`GGUF_SUBGROUP_PROBE_WGSL` in `kernels/mod.rs`, cached by
 // `gguf_gpu::gemv_subgroup_probe`) to admit the arm; a width that does not divide
-// 128, a device without `Features::SUBGROUP`, or `RLX_WGPU_GEMV_WIDE=0`/`shared`
-// keeps the shared-memory arm above — the fallback is `dequant_gemv_tiled` itself,
+// 128, a device without `Features::SUBGROUP`, `RLX_WGPU_GEMV_WIDE=0`/`shared`, or a
+// Metal GPU that is not Apple silicon — where this reduction is wrong rather than
+// slow, and `device::wide_reduction_admitted` refuses it — keeps the shared-memory
+// arm above; the fallback is `dequant_gemv_tiled` itself,
 // not a third entry point: both arms call the same `dq_*_unit` decode, so what
 // differs between them is the reduction alone.
 //

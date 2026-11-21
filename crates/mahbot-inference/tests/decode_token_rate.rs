@@ -208,7 +208,9 @@ const WRITTEN_FIRST: usize = 234;
 /// The rows written by that walk's last generated token.
 const WRITTEN_LAST: usize = 299;
 const EPS: f32 = 1e-6;
-/// The recorded packed bytes one token reads: 28 layers plus the head.
+/// The recorded packed bytes one token reads: 28 layers plus the head. It is the figure the
+/// product declares to the graphics layer as `LARGEST_BUFFER_BYTES` — the same packed set in
+/// one buffer — pinned here so this file's own per-tensor table is checked against it.
 const TOTAL_PACKED_BYTES: u64 = 1_100_961_792;
 /// The steps the shipped body's decode step compiles to on this backend. Its
 /// equality to the product's step count cannot be re-derived model-free: the
