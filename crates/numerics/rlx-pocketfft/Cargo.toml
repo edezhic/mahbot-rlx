@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-pocketfft"
-version                = "0.2.18-mahbot.3"
+version                = "0.2.18-mahbot.4"
 edition.workspace      = true
 rust-version.workspace = true
 description = "scipy.fft (pocketfft) reproduced bit-for-bit in pure Rust, with selectable FMA contraction and twiddle rounding"

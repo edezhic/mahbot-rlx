@@ -48,7 +48,7 @@ import fork_layers as layers
 
 # The fork's release version. The release process owns this number; a bump
 # happens there, not here.
-FORK_VERSION = "0.2.18-mahbot.3"
+FORK_VERSION = "0.2.18-mahbot.4"
 
 # The newest upstream release on the registry. A pin that travels to the registry
 # for a crate the fork never publishes has to name a version that exists there,

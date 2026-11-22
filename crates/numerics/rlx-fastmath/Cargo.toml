@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-fastmath"
-version                = "0.2.18-mahbot.3"
+version                = "0.2.18-mahbot.4"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Accurate vectorized f32 exp / log / tanh in pure Rust (NEON on aarch64): <= 1.33 ulp over every f32, faster than the platform libm"

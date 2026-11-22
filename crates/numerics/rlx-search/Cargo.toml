@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-search"
-version                = "0.2.18-mahbot.3"
+version                = "0.2.18-mahbot.4"
 edition.workspace      = true
 rust-version.workspace = true
 description = "Host-side sequence search shared by every decoder: argmax/top-k/log-softmax, beam search, CTC greedy/prefix-beam/forced alignment over log and tropical semirings"
