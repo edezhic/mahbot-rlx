@@ -1878,7 +1878,9 @@ mod tests {
     /// A persistent worker starts on the first run, is found and reused by
     /// the next (each run ending when the worker logs its job done), and
     /// starts again once its settings change.
-    #[cfg(unix)]
+    ///
+    /// Spawns real processes and waits on them — `backend-tests`: seconds, no product path.
+    #[cfg(all(unix, feature = "backend-tests"))]
     #[test]
     fn a_persistent_worker_is_started_once_then_reused() {
         let dir = std::env::temp_dir().join(format!("rlx-persist-{}", std::process::id()));
@@ -2011,7 +2013,9 @@ mod tests {
 
     /// Rank 0 starts only once every persistent worker says it is up, and a
     /// worker that never does stops the run instead of leaving it waiting.
-    #[cfg(unix)]
+    ///
+    /// Same cost and reason as the row above.
+    #[cfg(all(unix, feature = "backend-tests"))]
     #[test]
     fn rank_0_waits_for_its_persistent_workers() {
         let dir = std::env::temp_dir().join(format!("rlx-ready-{}", std::process::id()));

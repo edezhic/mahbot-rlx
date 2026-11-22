@@ -236,10 +236,10 @@ fn the_processor_reads_the_recording() {
 }
 
 /// **Synthesis on the processor, heard back through the same product.** The stand's short request
-/// at the stand's seed, rendered twice — the two calls must agree in length and waveform digest
-/// (`5450ad6d78c76f77` here), because the first call of a process once answered differently from
-/// every later one — and then heard back through the recognition call, which must reach the
-/// text's closing words exactly as the round trip demands of a graphics render.
+/// at the stand's seed, rendered twice — the two calls must agree in length and waveform digest,
+/// because the first call of a process once answered differently from every later one — and then
+/// heard back through the recognition call, which must reach the text's closing words exactly as
+/// the round trip demands of a graphics render.
 ///
 /// **What it does not establish.** Nothing about the waveform's agreement with the graphics
 /// device's: the processor's numerics are its own.

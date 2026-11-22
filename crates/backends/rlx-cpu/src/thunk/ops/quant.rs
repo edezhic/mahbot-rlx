@@ -3361,7 +3361,11 @@ mod mxfp4x2_matmul_tests {
     }
 }
 
+// A benchmark rather than a check: it prints a table at DeepSeek-V4 dims on the MLX
+// low-precision formats this fork never ships, so its two rows sit behind `backend-tests`
+// and their shared helpers stay compiled either way.
 #[cfg(test)]
+#[cfg_attr(not(feature = "backend-tests"), allow(dead_code, unused_imports))]
 mod amx_matmul_bench {
     use super::matmul_x_wt;
     use std::time::Instant;
@@ -3382,6 +3386,7 @@ mod amx_matmul_bench {
         }
     }
 
+    #[cfg(feature = "backend-tests")]
     #[test]
     fn amx_vs_scalar_dequant_matmul() {
         let k = 4096usize;
@@ -3439,6 +3444,7 @@ mod amx_matmul_bench {
     // For the int8/int4/fp8/nvfp4 quant matmuls, the m>1 AMX path must equal the
     // m==1 scalar path applied row-by-row (same packed bytes) — and be much faster.
     // Uses random valid bytes: we compare two code paths, not vs a "true" dequant.
+    #[cfg(feature = "backend-tests")]
     #[test]
     fn amx_quant_matmul_schemes_m_gt_1() {
         use super::{

@@ -12,6 +12,10 @@ categories.workspace    = true
 documentation = "https://docs.rs/mahbot-rlxsl"
 readme                  = "README.md"
 
+[features]
+# The two lib tests that drive a real toolchain (xcrun metal, a CUDA C++ compile).
+backend-tests = []
+
 [dependencies]
 rlx-ir = { workspace = true }
 

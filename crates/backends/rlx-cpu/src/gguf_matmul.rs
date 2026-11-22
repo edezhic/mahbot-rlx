@@ -10,6 +10,7 @@
 //! (llama.cpp-style); other schemes still fold one 256-element super-block
 //! at a time into stack storage.
 
+use crate::gguf_activation::fused_m1_quantizes_activation;
 use rlx_gguf::QK_K;
 use rlx_gguf::q2_dequant::{Q2_0_BLOCK_BYTES, Q8_0_G128_BYTES, QK2_0};
 use rlx_ir::quant::QuantScheme;
@@ -141,8 +142,10 @@ pub(crate) fn dequant_block(scheme: QuantScheme, block: &[u8], out: &mut [f32; Q
 
 /// Fused dequant + `sgemm_bt` — `out` is zeroed then accumulated.
 ///
-/// Block-fused reference kernel (no full-weight materialization). Opt in via
-/// `RLX_GGUF_MATMUL_LEGACY=1`; default dispatch uses [`gguf_matmul_bt_dispatch`].
+/// Block-fused reference kernel (no full-weight materialization); default dispatch uses
+/// [`gguf_matmul_bt_dispatch`], and [`gguf_matmul_use_legacy`] is the switch that lands
+/// here. A multi-row call leaves for `crate::gguf_tiled` wherever that route takes it:
+/// `crate::gguf_tiled::refusal` is the only list of when it does not.
 pub fn gguf_matmul_bt(
     x: &[f32],
     w_bytes: &[u8],
@@ -248,6 +251,15 @@ fn gguf_matmul_bt_ex(
         && block_elems <= QK_K
         && crate::pool::num_threads() > 1
     {
+        // The crowded multiply: a tile of weight rows dequantised into f32 and
+        // handed to the vendor BLAS, which is the only route here that reaches the
+        // matrix units. `gguf_tiled`'s doc comment carries the reading; the fused
+        // GEMM below keeps the job for every shape and host
+        // `crate::gguf_tiled::refusal` names.
+        if crate::gguf_tiled::admits(m, k, n, scheme) {
+            crate::gguf_tiled::matmul_bt(x, w_bytes, out, m, k, n, scheme);
+            return;
+        }
         gguf_matmul_bt_rows_generic_gemm(
             x,
             w_bytes,
@@ -285,6 +297,22 @@ fn gguf_matmul_bt_ex(
     }
 }
 
+/// Widen one packed weight row into `dst`, one block at a time. `blk` is the
+/// caller's super-block scratch, so a row loop allocates nothing per row.
+pub(crate) fn dequant_row(
+    scheme: QuantScheme,
+    row: &[u8],
+    dst: &mut [f32],
+    block_bytes: usize,
+    block_elems: usize,
+    blk: &mut [f32; QK_K],
+) {
+    for (b, out) in dst.chunks_exact_mut(block_elems).enumerate() {
+        dequant_block(scheme, &row[b * block_bytes..(b + 1) * block_bytes], blk);
+        out.copy_from_slice(&blk[..block_elems]);
+    }
+}
+
 /// `out[mi, j] = x[mi, :] · W[j, :]` with `W` `[n, k]` in GGUF blocks: each
 /// weight row widened once into a buffer, then dotted with every activation
 /// row. Single-threaded; the dot is written so it vectorizes (wasm simd128,
@@ -307,14 +335,7 @@ fn gguf_matmul_bt_rows_dot(
     let mut blk = [0f32; QK_K];
     for j in 0..n {
         let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
-        for (b, dst) in wrow.chunks_exact_mut(block_elems).enumerate() {
-            dequant_block(
-                scheme,
-                &row[b * block_bytes..(b + 1) * block_bytes],
-                &mut blk,
-            );
-            dst.copy_from_slice(&blk[..block_elems]);
-        }
+        dequant_row(scheme, row, &mut wrow, block_bytes, block_elems, &mut blk);
         for mi in 0..m {
             out[mi * n + j] = dot_f32(&x[mi * k..(mi + 1) * k], &wrow);
         }
@@ -339,7 +360,9 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
-/// `true` when `RLX_GGUF_MATMUL_LEGACY=1` — force block-fused [`gguf_matmul_bt`].
+/// `true` when `RLX_GGUF_MATMUL_LEGACY=1` — skip the cached-f32-BLAS arm.
+///
+/// It does not decide the tiled route: `crate::gguf_tiled::refusal` names what does.
 #[inline]
 pub fn gguf_matmul_use_legacy() -> bool {
     matches!(
@@ -367,8 +390,9 @@ const CACHED_BLAS_MIN_WEIGHT_ELEMS: usize = 32 * 32;
 /// keeps decode numerics independent of whether the f32 dequant cache happened
 /// to fit.
 ///
-/// Its only caller is the rayon arm of `gguf_matmul_bt_m1_parallel`.
-fn q4k_exact_gemv() -> bool {
+/// Its callers are the rayon arm of `gguf_matmul_bt_m1_parallel` and the activation
+/// resolution in [`crate::gguf_activation`].
+pub(crate) fn q4k_exact_gemv() -> bool {
     rlx_ir::env::flag("RLX_Q4K_EXACT_GEMV")
 }
 
@@ -376,14 +400,6 @@ fn q4k_fused_decode_min_n() -> usize {
     rlx_ir::env::var("RLX_Q4K_FUSED_MIN_N")
         .and_then(|v| v.parse().ok())
         .unwrap_or(usize::MAX)
-}
-
-/// Whether the fused `m == 1` arm quantizes the activation, i.e. whether
-/// diverting a single-row GEMV to it for speed would change the answer. Only
-/// Q4_K's arm does (to Q8_K); every other scheme runs
-/// `gguf_matmul_bt_m1_rows_generic` over f32 activations.
-fn fused_m1_quantizes_activation(scheme: QuantScheme) -> bool {
-    scheme == QuantScheme::GgufQ4K
 }
 
 #[inline]
@@ -408,10 +424,13 @@ fn prefer_cached_blas(k: usize, n: usize, m: usize, scheme: QuantScheme) -> bool
         return false;
     }
     // Cache pressure skips the cache for every route whose fused arm leaves the numerics
-    // alone — `m > 1`'s generic GEMM, and every single-row scheme but Q4_K. There the two
-    // routes do the same total dequant work and the fused one skips the bookkeeping. Q4_K's
-    // GEMV keeps the cached route whatever the budget does: `cache_thrashing()` is monotone
-    // process state that never reverts, and its fused arm would quantize the activation.
+    // alone: `m > 1`, and every single-row scheme whose arm keeps f32 activations. There
+    // the two routes do the same total dequant work and the fused one skips the
+    // bookkeeping. The schemes whose arm rounds the activation
+    // ([`fused_m1_quantizes_activation`]) keep the cached route whatever the budget does:
+    // `cache_thrashing()` is monotone process state that never reverts, so diverting them
+    // would flip one process's answer part-way through — the defect
+    // `tests/gguf_single_row_cache_pressure.rs` pins.
     if crate::dequant_cache::cache_thrashing() && (m > 1 || !fused_m1_quantizes_activation(scheme))
     {
         return false;
@@ -464,11 +483,12 @@ pub fn gguf_matmul_bt_cached(
     assert_eq!(out.len(), m * n);
     // No linked BLAS: the portable gemm is slower than the fused kernel, so the
     // fused path is the right default here — and the same schemes are admitted to
-    // it as in the BLAS build. Only a single-row scheme whose fused arm quantizes
-    // the activation (`fused_m1_quantizes_activation`) needs a substitute, and it
-    // gets the exact packed kernel rather than a materialized copy: no f32 slab,
-    // no dequant cache, no Q8_K activation. Shape decides that, never the budget.
-    if m == 1 && fused_m1_quantizes_activation(scheme) && k.is_multiple_of(QK_K) {
+    // it as in the BLAS build. Q4_K is the one single-row scheme that needs a
+    // substitute, and it gets the exact packed kernel rather than a materialized
+    // copy: no f32 slab, no dequant cache, no Q8_K activation. (Q6_K's quantizing
+    // arm is already packed-only and needs no BLAS, so it needs none.) Shape
+    // decides that, never the budget.
+    if m == 1 && scheme == QuantScheme::GgufQ4K && k.is_multiple_of(QK_K) {
         q4k_exact_gemv_rows(x, w_bytes, out, k);
         return;
     }
@@ -1065,7 +1085,7 @@ fn gguf_matmul_bt_m1_parallel(
     block_elems: usize,
 ) {
     // Q4_K included, unless the exact f32-activation arm below is asked for.
-    #[cfg(all(feature = "int8-gemv", target_arch = "x86_64"))]
+    #[cfg(all(feature = "int8-gemv", rlx_cpu_x86))]
     if out.len() == n
         && !(scheme == QuantScheme::GgufQ4K && q4k_exact_gemv())
         && crate::int8_gemv::gemv(scheme, x_row, w_bytes, out, k)
@@ -1098,7 +1118,18 @@ fn gguf_matmul_bt_m1_parallel(
             return;
         }
     }
-    // Every other scheme (Q5_K / Q6_K / Q2_K / Q3_K / Q8_0 / IQ*): row-parallel,
+    // Q6_K: the output head and every `ffn_down`, dotted as integers against one
+    // Q8_K-quantised activation row instead of being unpacked to f32 in scalar
+    // code. aarch64 only; x86-64 reaches the same kernel through `int8-gemv`.
+    if scheme == QuantScheme::GgufQ6K
+        && k.is_multiple_of(QK_K)
+        && block_elems == QK_K
+        && out.len() == n
+        && crate::gguf_q6k::gemv(x_row, w_bytes, out, k)
+    {
+        return;
+    }
+    // Every other scheme (Q5_K / Q2_K / Q3_K / Q8_0 / IQ*): row-parallel,
     // division-free generic GEMV whenever `k` is a whole number of blocks.
     if k.is_multiple_of(block_elems) && block_elems <= QK_K && out.len() == n {
         gguf_matmul_bt_m1_rows_generic(x_row, w_bytes, out, k, scheme, block_bytes, block_elems);
@@ -1433,9 +1464,13 @@ fn q4k_scale_min(j: usize, q: &[u8]) -> (u8, u8) {
 /// Cached `dotprod` (ARMv8.2-A) availability — Cortex-A76 (Raspberry Pi 5) /
 /// Apple Silicon / Graviton2+ / most ARM servers have it; Cortex-A72 (Pi 4)
 /// does not. Detected once; the result is a hot-loop branch predictor's dream.
+///
+/// The one feature check for the whole crate: [`crate::gguf_q6k`]'s six-bit row
+/// dot asks the same question, and `RLX_Q4K_NO_DOTPROD=1` pins both to the
+/// baseline arm.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-fn aarch64_has_dotprod() -> bool {
+pub(crate) fn aarch64_has_dotprod() -> bool {
     use std::sync::OnceLock;
     static OK: OnceLock<bool> = OnceLock::new();
     // `RLX_Q4K_NO_DOTPROD=1` forces the baseline path (A/B benchmarking, or a
@@ -1662,8 +1697,8 @@ mod tests {
     /// Asserting it is *tighter than* the Q8_K arm, rather than a fixed epsilon,
     /// keeps the test meaningful if either kernel is retuned.
     ///
-    /// Sets the process-global `RLX_Q4K_EXACT_GEMV` override, which
-    /// `cached_blas_matches_fused_q4k_decode` in this binary may observe.
+    /// `RLX_Q4K_EXACT_GEMV` is scoped to the arm that reads it: this binary runs its
+    /// siblings at once, and `cached_blas_matches_fused_q4k_decode` reads the same switch.
     #[test]
     fn exact_q4k_decode_gemv_beats_the_q8k_arm_on_accuracy() {
         use crate::dequant_cache::clear_dequant_cache;
@@ -1687,7 +1722,7 @@ mod tests {
             .collect();
 
         let run = |exact: bool| {
-            rlx_ir::env::set("RLX_Q4K_EXACT_GEMV", if exact { "1" } else { "0" });
+            let _exact = rlx_ir::env::scoped("RLX_Q4K_EXACT_GEMV", if exact { "1" } else { "0" });
             clear_dequant_cache();
             let mut out = vec![0f32; n];
             gguf_matmul_bt(&x, &packed, &mut out, 1, k, n, QuantScheme::GgufQ4K);
@@ -1695,7 +1730,6 @@ mod tests {
         };
         let q8 = run(false);
         let exact = run(true);
-        rlx_ir::env::unset("RLX_Q4K_EXACT_GEMV");
 
         // Reference: dequantize the packed weights to f32 and dot them in f64 —
         // an independent oracle, and the same one in BLAS and no-BLAS builds.
@@ -1905,37 +1939,50 @@ mod tests {
         }
     }
 
+    /// The tiled route against the block-fused kernel it replaced, for every scheme
+    /// the model bodies carry: both are f32 over the whole `k`, so they may differ
+    /// only in summation order.
     #[test]
-    fn dispatch_matches_legacy_q8k_prefill() {
-        use crate::dequant_cache::clear_dequant_cache;
-        clear_dequant_cache();
-        let k = 256;
-        let n = 4;
-        let m = 2;
-        let scale = 0.5f32;
-        let mut packed = Vec::new();
-        for _ in 0..n {
-            packed.extend_from_slice(&scale.to_le_bytes());
-            for i in 0..QK_K {
-                let q = (i as i32 - 128).clamp(-128, 127) as i8;
-                packed.push(q as u8);
-            }
-            for _ in 0..(QK_K / 16) {
-                packed.extend_from_slice(&0i16.to_le_bytes());
-            }
-        }
+    fn the_tiled_route_agrees_with_the_fused_one() {
+        let (k, n, m) = (1024usize, 8usize, 2usize);
         let x: Vec<f32> = (0..m * k).map(|i| 0.01 * i as f32).collect();
-        let mut legacy = vec![0f32; m * n];
-        let mut dispatched = vec![0f32; m * n];
-        gguf_matmul_bt(&x, &packed, &mut legacy, m, k, n, QuantScheme::GgufQ8K);
-        gguf_matmul_bt_dispatch(&x, &packed, &mut dispatched, m, k, n, QuantScheme::GgufQ8K);
-        for i in 0..legacy.len() {
-            assert!(
-                (legacy[i] - dispatched[i]).abs() < 0.05,
-                "i={i}: {} vs {}",
-                legacy[i],
-                dispatched[i]
-            );
+        for (scheme, ggml) in [
+            (QuantScheme::GgufQ4K, rlx_gguf::GgmlType::Q4K),
+            (QuantScheme::GgufQ5K, rlx_gguf::GgmlType::Q5K),
+            (QuantScheme::GgufQ6K, rlx_gguf::GgmlType::Q6K),
+            (QuantScheme::GgufQ8K, rlx_gguf::GgmlType::Q8K),
+            (QuantScheme::GgufQ8_0, rlx_gguf::GgmlType::Q8_0),
+        ] {
+            let w: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.013).sin()).collect();
+            let packed = rlx_gguf::quantize(&w, ggml).expect("pack the weight");
+            let mut fused = vec![0f32; m * n];
+            let mut tiled = vec![0f32; m * n];
+            // Scoped, not process-wide: this binary runs the rest of the crate's tests
+            // at once, and a sibling reaching the multi-row path would take the fused
+            // route while the override is held. `refusal` reads the switch on this
+            // thread, before any worker is handed work.
+            let _fused_only = rlx_ir::env::scoped("RLX_GGUF_TILED_BLAS", "0");
+            gguf_matmul_bt(&x, &packed, &mut fused, m, k, n, scheme);
+            // A nested guard shadows the `"0"` rather than dropping it: `"1"`, not unset,
+            // so a shell holding `RLX_GGUF_TILED_BLAS=0` cannot compare the fused route
+            // with itself and pass vacuously.
+            let _tiled_only = rlx_ir::env::scoped("RLX_GGUF_TILED_BLAS", "1");
+            if let Some(why) = crate::gguf_tiled::refusal(m, k, n, scheme) {
+                println!("{scheme:?}: {why} — the fused kernel is the only route here");
+                continue;
+            }
+            gguf_matmul_bt(&x, &packed, &mut tiled, m, k, n, scheme);
+            for i in 0..fused.len() {
+                // Both sides are f32 sums over the same `k`; the bound is the
+                // accumulation's own size, and a route that landed a different
+                // product is orders of magnitude past it.
+                assert!(
+                    (fused[i] - tiled[i]).abs() <= 1e-4 * fused[i].abs().max(1.0),
+                    "{scheme:?} i={i}: fused {} vs tiled {}",
+                    fused[i],
+                    tiled[i]
+                );
+            }
         }
     }
 
@@ -2052,7 +2099,7 @@ mod tests {
     }
 
     #[test]
-    fn fused_q8k_matches_full_dequant() {
+    fn a_packed_q8k_multiply_matches_a_full_dequant() {
         let k = 256;
         let n = 4;
         let m = 2;
@@ -2083,8 +2130,12 @@ mod tests {
             }
         }
         for i in 0..fused.len() {
+            // Relative to the magnitude: the two routes sum in different orders, and
+            // the largest difference seen is 1.5e-6 of the result (0.01 at 6745),
+            // which is f32 accumulation over 256 terms — while an unpacking error is
+            // ~1e-2 relative. 1e-5 separates them with margin at both ends.
             assert!(
-                (fused[i] - expected[i]).abs() < 1e-4,
+                (fused[i] - expected[i]).abs() <= 1e-5 * expected[i].abs().max(1.0),
                 "i={i}: {} vs {}",
                 fused[i],
                 expected[i]

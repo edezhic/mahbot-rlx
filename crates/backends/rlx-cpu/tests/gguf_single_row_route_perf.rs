@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Before/after measurement for the single-row packed-multiply routing: per
 //! scheme, what a decode pass costs under a dequant-cache budget far below the
-//! working set, against the fused arm the thrash diversion selects and against
-//! the cache-off accurate route.
+//! working set, against the packed arm a cache-off decode takes and against the
+//! fused arm the thrash diversion selects.
 //!
 //! `#[ignore]`d. Gate it on `just throttle` first, then:
 //!
@@ -22,6 +22,7 @@ mod common;
 use common::{activation, max_rel_err, packed};
 use rlx_cpu::dequant_cache::clear_dequant_cache;
 use rlx_cpu::gguf_matmul::{gguf_matmul_bt, gguf_matmul_bt_dispatch_at};
+use rlx_cpu::routing::quantizes_activation;
 use rlx_gguf::GgmlType;
 use rlx_ir::quant::QuantScheme;
 
@@ -98,33 +99,60 @@ fn single_row_route_perf() {
             gguf_matmul_bt_dispatch_at(&x, &blobs[t], out, 1, K, N, scheme, t * 4096)
         };
         let fused = |t: usize, out: &mut [f32]| gguf_matmul_bt(&x, &blobs[t], out, 1, K, N, scheme);
+        // The packed arm both the cache-off dispatch and the direct fused call
+        // reach. For a scheme whose arm rounds the activation it is the integer
+        // dot, so the row says so and its `max rel err` is that arm's.
+        let rounds = quantizes_activation(scheme);
+        let packed = if rounds {
+            "packed, int8 activations"
+        } else {
+            "packed, accurate"
+        };
 
-        eprintln!("{scheme:?}:");
+        eprintln!("{scheme:?}");
+        // Each arm carries its own switches, scoped to it: a process-wide `set` would
+        // outlive the arm that asked for it and hand the next one a route it never
+        // configured.
         // The working-set-fits case, unchanged by the routing change.
-        rlx_ir::env::set("RLX_DEQUANT_CACHE", "1");
-        rlx_ir::env::set("RLX_DEQUANT_CACHE_MAX_BYTES", UNBOUNDED.to_string());
-        bench("accurate, working set fits", &dispatch);
+        {
+            let _cache = rlx_ir::env::scoped("RLX_DEQUANT_CACHE", "1");
+            let _budget = rlx_ir::env::scoped("RLX_DEQUANT_CACHE_MAX_BYTES", UNBOUNDED.to_string());
+            bench("accurate, working set fits", &dispatch);
+        }
         // The harness's case.
-        rlx_ir::env::set("RLX_DEQUANT_CACHE_MAX_BYTES", BUDGET.to_string());
-        bench("accurate, budget < working set (after)", &dispatch);
-        // What the harness saw with the budget off — the accurate baseline.
-        rlx_ir::env::set("RLX_DEQUANT_CACHE", "0");
-        bench("accurate, RLX_DEQUANT_CACHE=0", &dispatch);
-        // The fused arm the thrash diversion selects: what passes >= 2 used to
-        // do for every scheme, and what still happens wherever its numerics are
-        // unchanged.
-        rlx_ir::env::set("RLX_DEQUANT_CACHE", "1");
-        bench("fused (thrash-diversion target)", &fused);
-        // Q4_K has an accurate fused arm too, behind `RLX_Q4K_EXACT_GEMV` — the
-        // only one whose fused default is lossy, hence the only extra row.
-        if scheme == QuantScheme::GgufQ4K {
-            rlx_ir::env::set("RLX_Q4K_EXACT_GEMV", "1");
-            bench("fused, exact activations (RLX_Q4K_EXACT_GEMV)", &fused);
-            rlx_ir::env::unset("RLX_Q4K_EXACT_GEMV");
+        {
+            let _cache = rlx_ir::env::scoped("RLX_DEQUANT_CACHE", "1");
+            let _budget = rlx_ir::env::scoped("RLX_DEQUANT_CACHE_MAX_BYTES", BUDGET.to_string());
+            bench("accurate, budget < working set (after)", &dispatch);
+        }
+        // What the harness saw with the budget off.
+        {
+            let _cache = rlx_ir::env::scoped("RLX_DEQUANT_CACHE", "0");
+            bench(&format!("{packed}, RLX_DEQUANT_CACHE=0"), &dispatch);
+        }
+        // The arm the thrash diversion selects where its numerics are unchanged,
+        // and what a caller of `gguf_matmul_bt` gets directly.
+        {
+            let _cache = rlx_ir::env::scoped("RLX_DEQUANT_CACHE", "1");
+            let _budget = rlx_ir::env::scoped("RLX_DEQUANT_CACHE_MAX_BYTES", BUDGET.to_string());
+            bench(
+                &format!("{packed}, fused (thrash-diversion target)"),
+                &fused,
+            );
+        }
+        // A rounding arm has an exact counterpart behind an env switch — the row
+        // shows what the rounding buys. (The six-bit switch is read by the aarch64
+        // kernel only, so an x86-64 `int8-gemv` host repeats the row above.)
+        let switch = match scheme {
+            QuantScheme::GgufQ4K => Some("RLX_Q4K_EXACT_GEMV"),
+            QuantScheme::GgufQ6K => Some("RLX_Q6K_EXACT_GEMV"),
+            _ => None,
+        };
+        if let (true, Some(switch)) = (rounds, switch) {
+            let _exact = rlx_ir::env::scoped(switch, "1");
+            bench(&format!("fused, exact activations ({switch})"), &fused);
         }
     }
 
-    rlx_ir::env::unset("RLX_DEQUANT_CACHE_MAX_BYTES");
-    rlx_ir::env::unset("RLX_DEQUANT_CACHE");
     clear_dequant_cache();
 }

@@ -14,6 +14,29 @@ pub fn max_rel_err(got: &[f32], want: &[f32]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+/// The fork's paired-reading figure: the median of the rounds' timings.
+fn median(values: impl IntoIterator<Item = f64>) -> f64 {
+    let mut v: Vec<f64> = values.into_iter().collect();
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// A paired reading at kernel scale: `rounds` rounds, each timing every arm once,
+/// back to back, in alternating order — so a machine that drifts across the run
+/// moves both arms of a round together rather than favouring one. Returns each
+/// arm's median, in arm order.
+#[allow(dead_code)]
+pub fn paired(rounds: usize, arms: usize, mut run: impl FnMut(usize) -> f64) -> Vec<f64> {
+    let mut times = vec![Vec::with_capacity(rounds); arms];
+    for round in 0..rounds {
+        let order = (0..arms).map(|arm| if round % 2 == 0 { arm } else { arms - 1 - arm });
+        for arm in order {
+            times[arm].push(run(arm));
+        }
+    }
+    times.iter().map(|t| median(t.iter().copied())).collect()
+}
+
 /// `k*n` packed weights for tensor `seed`, heavy-tailed: the outliers are where a
 /// quantized activation's per-block absmax scale actually costs accuracy.
 pub fn packed(ggml: GgmlType, k: usize, n: usize, seed: usize) -> Vec<u8> {

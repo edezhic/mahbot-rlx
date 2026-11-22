@@ -34,7 +34,7 @@ const Q8_0_BLOCK_BYTES: usize = 34;
 const Q4_0_BLOCK_BYTES: usize = 18;
 const Q4_1_BLOCK_BYTES: usize = 20;
 
-fn available() -> bool {
+pub(crate) fn available() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| {
         std::is_x86_feature_detected!("avx2")

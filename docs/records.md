@@ -22,11 +22,12 @@ length) in place of the two time columns; its memory columns are the same. The w
 record reports `peak resident`, the resident set's high-water mark for the whole
 run.
 
-`STAND-CPU.md` is the same stand taken on the processor: the same seven rows and the
-same columns. Its graphics cells are `not measured` — not zero, and not the system
-figure repeated — because a processor run allocates nothing for the graphics device.
-The two records' figures are device-relative, so a cell in one is not comparable with
-the same cell in the other.
+`STAND-CPU.md` is the same stand taken on the processor: the same seven rows, without
+the two graphics columns — a processor run allocates nothing for the graphics device, so
+those cells could only ever read `not measured`. Its `resting system` and `peak system`
+are the footprint reading with no GPU half subtracted. The two records'
+figures are device-relative, so a cell in one is not comparable with the same cell in
+the other.
 
 Its memory columns are the **anonymous** footprint, and do not include the model. The
 processor reads its weights from files that are shared between the graphs of one model
@@ -161,9 +162,12 @@ maximum of the same set. The wake bench always measures the resident set —
 `peak resident` is its `getrusage` high-water mark — so its record names `resident`
 on every platform.
 
-The resident set cannot see pages allocated for the GPU, so a resident row's GPU
-cell is not measured — not zero, and not the system figure repeated — and there the
-two do not split one pool.
+The resident set cannot see pages allocated for the GPU. The stand's table drops the
+GPU columns outright when every row is resident, and reads `not measured` in the GPU
+cells of the resident rows of a mixed one — not zero, and not the system figure
+repeated. The wake bench measures the resident set only, so it has no second half to
+drop and its one GPU cell reads `not measured` by construction. There the two do not
+split one pool.
 
 The resident set counts a different thing from the footprint, so these figures are
 not comparable with one taken where the platform supplies it.

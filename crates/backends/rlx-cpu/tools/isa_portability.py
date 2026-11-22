@@ -200,13 +200,15 @@ GATED = re.compile(
     r"|^__aarch64_(cas|swp|ldadd|ldclr|ldeor|ldset)"
     # RustCrypto `aes` (a rlx-ir dependency, for the AES-CTR RNG stream). Its
     # arch backends are named for the ISA, not for a feature, so they look
-    # ungated. Verified in aes 0.9.1 rather than assumed: `lib.rs` selects
-    # `mod armv8; mod autodetect; pub use autodetect::*` on aarch64, and
-    # `autodetect.rs` holds an `arch::features::aes::InitToken`, branching on
-    # `init_get()` / `token.get()` with the `soft` backend as the fallback.
-    # A hit from any OTHER crate's `armv8`/`ni` module needs the same check
-    # before it earns a line here.
-    r"|^aes::(armv8|ni|x86)::)",
+    # ungated. Verified in aes 0.9.4 rather than assumed: `lib.rs`'s
+    # `impl_key_init!` branches on `Token::default().aes.get()` (cpufeatures'
+    # `aes`) before constructing `backends::aarch64_aes::*`, and falls through to
+    # `backends::soft::*` when the feature is absent — so the instructions are
+    # behind a runtime check, just not one inside the symbol. 0.8's module was
+    # `aes::armv8`, hence both spellings. A hit from any OTHER crate's
+    # `armv8`/`ni`/`backends::<arch>_aes` module needs the same check before it
+    # earns a line here.
+    r"|(^|<)aes::(armv8|ni|x86|backends::(aarch64|x86)_aes)::)",
     re.I,
 )
 

@@ -829,13 +829,15 @@ impl ThunderboltTransport {
 mod tests {
     /// A dial to an address that never answers gives up within its
     /// budget: one blocked `connect` took over a minute a try.
+    ///
+    /// `backend-tests`: seconds of wall clock, no product path.
+    #[cfg(feature = "backend-tests")]
     #[test]
     fn a_dial_that_gets_no_answer_ends_within_its_budget() {
-        rlx_ir::env::set("RLX_CONNECT_WAIT", "1");
+        let _wait = rlx_ir::env::scoped("RLX_CONNECT_WAIT", "1");
         let t = std::time::Instant::now();
         // TEST-NET-1 (RFC 5737): routed nowhere.
         let r = super::connect_retry("192.0.2.1:9".parse().unwrap());
-        rlx_ir::env::remove("RLX_CONNECT_WAIT");
         assert!(r.is_err());
         assert!(
             t.elapsed() < std::time::Duration::from_secs(4),

@@ -1871,7 +1871,9 @@ mod tests {
     /// prelude) offline — the toolchain-free structural check in
     /// `c_family_modules_are_well_formed` can't catch a genuine MSL type error.
     /// Skips gracefully if the Metal toolchain isn't installed.
-    #[cfg(target_os = "macos")]
+    ///
+    /// Drives `xcrun metal` for a backend this fork does not ship: `backend-tests`, seconds.
+    #[cfg(all(target_os = "macos", feature = "backend-tests"))]
     #[test]
     fn msl_modules_compile_with_metal() {
         use std::process::Command;
@@ -2022,7 +2024,10 @@ mod tests {
     }
 
     /// Format an f32 as a C++ float literal (round-trippable, with non-finites).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        feature = "backend-tests"
+    ))]
     fn cxx_f32(v: f32) -> String {
         if v.is_nan() {
             "NAN".to_string()
@@ -2038,7 +2043,13 @@ mod tests {
     /// validation from hardware parity tests; CUDA/OpenCL have no GPU here. So
     /// compile the CUDA binary + compare modules **as C++** and *execute* them
     /// against the Rust `eval_*` oracle — a real numeric check with no GPU.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    ///
+    /// A C++ compile of the CUDA emitters, for a backend this fork does not ship: same
+    /// gate and reason as the Metal row above.
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux"),
+        feature = "backend-tests"
+    ))]
     #[test]
     fn cuda_binary_compare_numerically_match_oracle() {
         use rlx_ir::op::{BinaryOp, CmpOp};

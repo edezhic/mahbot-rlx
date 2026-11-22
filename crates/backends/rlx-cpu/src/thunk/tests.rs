@@ -7783,7 +7783,7 @@ fn sgemm_operand_inside_destination_is_not_clobbered() {
 /// The decode attention's lane-split Q·K dots must be bit-identical to the
 /// scalar `dot += q[d] * k[d]` loop they replace — including a short last
 /// group of keys and keys taken out of order.
-#[cfg(target_arch = "x86_64")]
+#[cfg(rlx_cpu_x86)]
 #[test]
 fn decode_attention_lane_dots_are_bit_identical() {
     let (dh, stride, off) = (128usize, 3 * 128usize, 128usize);

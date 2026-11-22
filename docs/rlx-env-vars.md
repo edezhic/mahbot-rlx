@@ -13,14 +13,14 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 830  
+**Registered names:** 832  
 **Unregistered mentions (migration leftovers):** 107
 
 ## Groups
 
 - [compile](#compile) — 32
 - [coreml](#coreml) — 20
-- [cpu](#cpu) — 39
+- [cpu](#cpu) — 40
 - [cuda](#cuda) — 77
 - [debug](#debug) — 21
 - [device](#device) — 4
@@ -29,7 +29,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [gpu](#gpu) — 8
 - [gpu-host](#gpu-host) — 1
 - [metal](#metal) — 210
-- [misc](#misc) — 113
+- [misc](#misc) — 114
 - [mlx](#mlx) — 30
 - [oneapi](#oneapi) — 5
 - [onnx](#onnx) — 6
@@ -143,7 +143,8 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_PAR_THRESHOLD` | Bisect | U64 | Backend(cpu) | Minimum element count before an op dispatches in parallel |
 | `RLX_Q4K_EXACT_GEMV` | Internal | Bool | Backend(cpu) | Q4_K decode GEMV dequantizes to f32 per block instead of quantizing the activation to Q8_K (exact, slower) |
 | `RLX_Q4K_FUSED_MIN_N` | Internal | String | Backend(cpu) | n above which the fused Q4_K kernel is used instead of dequant |
-| `RLX_Q4K_NO_DOTPROD` | Internal | String | Backend(cpu) | Force the baseline Q4_K path instead of the dotprod intrinsics |
+| `RLX_Q4K_NO_DOTPROD` | Internal | String | Backend(cpu) | Force the baseline path instead of the dotprod intrinsics, for both the Q4_K and the Q6_K single-row integer dots |
+| `RLX_Q6K_EXACT_GEMV` | Internal | Bool | Backend(cpu) | aarch64 only: Q6_K decode GEMV dequantizes to f32 per block instead of quantizing the activation to Q8_K (exact, slower). A no-op on x86-64, where that arm is the int8-gemv kernel |
 | `RLX_SDPA_BLOCK_MIN` | Bisect | U64 | Backend(cpu) | Score-matrix size (floats, default 4M) above which CPU attention runs row-blocked |
 | `RLX_SDPA_THRESHOLD` | Bisect | U64 | Backend(cpu) | Sequence length above which SDPA switches from NEON dots to BLAS sgemm |
 | `RLX_VMATH_ACCURATE` | Public | BoolOr | Backend(cpu) | CPU vmath exp/tanh/log/sqrt: use Accelerate/libm accurate path (default 0 = SIMD *_fast) |
@@ -570,6 +571,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_GGUF_GEMV_ELEM` | Bisect | String | Tooling | CUDA/ROCm one-row GGUF matmul: 0 keeps Q4_K / Q6_K on the block-strided kernels and Q5_K on dequant + matmul instead of the element-strided one (Q8_0 always uses it) |
 | `RLX_GGUF_MATMUL_LEGACY` | Bisect | Bool | Tooling | Use the legacy GGUF matmul dispatch instead of gguf_matmul_bt_dispatch |
 | `RLX_GGUF_PACKED_Q4_1` | Internal | Bool | Tooling | Keep GGUF Q4_1 tensors packed for DequantMatMul (CPU, Metal, MLX) instead of expanding them to F32 |
+| `RLX_GGUF_TILED_BLAS` | Bisect | Bool | Tooling | CPU: dequantise a packed weight a tile of rows at a time and hand each tile to the vendor BLAS for every multi-row (m > 1) multiply; 0 keeps the fused dequant-and-dot GEMM |
 | `RLX_GGUF_TRACE` | Bisect | Bool | Tooling | Trace GGUF header and tensor parsing |
 | `RLX_GPU_HANDLE_HOST_MIRROR` | Bisect | Bool | Tooling | Mirror GPU handle outputs to the host on every read |
 | `RLX_GPU_TUNING_CACHE` | Public | Path | Tooling | Path to the persisted GPU dispatch tuning cache (measured kernel-variant + tile winners per arch/op/shape-bucket); unset = under $XDG_CACHE_HOME |

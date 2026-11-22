@@ -112,6 +112,12 @@ impl HwInfo {
     /// logical CPUs.
     /// Elsewhere: ~¾ of logical CPUs — DiT/CNN CPU paths want more outer Rayon
     /// width once BLAS is pinned to 1 thread. Unchanged.
+    ///
+    /// Re-asked on the reference host once the packed multi-row multiply moved off
+    /// the fused kernel onto the tiled BLAS route (`gguf_tiled`), which is the
+    /// work that made the pool busy: `RLX_WORKERS` 5 / 8 / 11 gave 3.59 / 4.17 /
+    /// 3.72 s medians on the 10 s recognition row, nothing outside the noise, so
+    /// the rule stands.
     fn optimal_workers(&self) -> usize {
         let base = if self.perf_cores > 0 {
             self.perf_cores

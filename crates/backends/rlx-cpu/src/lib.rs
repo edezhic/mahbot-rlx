@@ -53,9 +53,14 @@ pub use expand::{NO_THUNK_ARM, expand_cpu_nop_fused, prepare_graph_for_thunks};
 pub use rlx_linux_ref::lapack as numpy_lapack;
 pub use rlx_linux_ref::openblas as numpy_openblas;
 pub mod gdn;
+mod gguf_activation;
 pub mod gguf_matmul;
+mod gguf_q6k;
 pub mod gguf_scheme;
+mod gguf_tiled;
 pub mod iir; // IIR biquad zero-phase Butterworth filtering (filter-bank front-end)
+#[cfg(feature = "backend-tests")]
+pub mod routing;
 pub mod spd; // SPD-manifold Riemannian kernels (logm/expm/sqrtm, AIRM distance, Karcher mean, batched eigh)
 pub mod spd_batched; // batched, differentiable ReEig/LogEig custom ops (f64 LAPACK per matrix, rayon over the batch)
 pub mod spd_kernels; // CpuKernel impls for the core SPDNet ops (BiMap/ReEig/LogEig/SpdBatchNorm)

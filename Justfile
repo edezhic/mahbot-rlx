@@ -354,6 +354,12 @@ test:
 # binaries that execute nothing, and `--features mahbot-inference/hand-run` below
 # is what keeps this whole-set run's coverage where it was.
 #
+# A second one is the reverse: five crates' lib tests sit behind their own
+# `backend-tests` (an AMX benchmark on formats this fork does not ship, an RPC
+# heartbeat, a roster and a dial row, two worker-spawn rows, the Metal/CUDA toolchain
+# compiles). The release gate passes that feature; the `--lib` run below keeps them in
+# THIS gate too.
+#
 # `--skip` matches a test *name*, not a file, which is why the list below is
 # names rather than a target. Each carries what it wants in the comment beside
 # it; run one by hand on a rig that has the prerequisite.
@@ -369,14 +375,19 @@ test-workspace:
     skip="$skip --skip audit_pair_switch_graft_and_answer"
     skip="$skip --skip read_tasks_hide_the_answer_and_score_it"
     skip="$skip --skip steer_task_scores_both_halves"
+    JOBS=$(( CPUS < 4 ? CPUS : 4 ))
     if [[ "$(uname -s)" == Darwin ]]; then
-        JOBS=$(( CPUS < 4 ? CPUS : 4 ))
         cargo test --release -j "$JOBS" --workspace $excl $feat --no-fail-fast -- $skip
     else
         cargo build --release --workspace --tests --keep-going $excl $feat -j "$CPUS"
         cargo test --release -j "$CPUS" --workspace $excl $feat --no-fail-fast -- \
             --test-threads="$CPUS" $skip
     fi
+    # The five crates' lib tests that sit behind their own `backend-tests` (see the
+    # comment above): `--lib` keeps their integration targets out of this run.
+    cargo test --release -j "$JOBS" --lib \
+        -p mahbot-rlx-cpu -p mahbot-rlx-driver -p rlx-distributed -p rlx-check -p mahbot-rlxsl \
+        --features backend-tests
 
 # Run the IR-verifier-bearing tests in a DEBUG profile.
 #

@@ -20,9 +20,9 @@
 //! engine that is up, which is what every request after a daemon's first one costs.
 //! Neither state is inherited from an earlier row or an earlier run — the cold one is made
 //! before its arm and the warm one is checked around it (`cold`) — so a row measures what
-//! it says it measures. The memory columns are a pair — the system's share and the GPU's —
-//! taken after the cold call and before the warm one. Spread is not recorded; diagnostics
-//! go to the console and never enter the file.
+//! it says it measures. The memory columns are the footprint readings — the system's share,
+//! and on the graphics device the GPU's beside it — taken after the cold call and before the
+//! warm one. Spread is not recorded; diagnostics go to the console and never enter the file.
 //!
 //! The cold column's method is this platform's, so a run elsewhere is refused before its
 //! first row rather than given a column that means nothing.
@@ -636,39 +636,48 @@ fn cold_warm(row: &Row, same: bool, what: &str) {
     }
 }
 
+/// Print each row's figures: the record's cells in the record's order, with the
+/// graphics ones left out of a record that carries none, just as the table leaves
+/// them out.
 fn print_rows(readings: &[Reading]) {
     let width = readings
         .iter()
         .map(|reading| label(reading).len())
         .max()
         .unwrap_or(0);
+    let graphics = carries_graphics(readings);
     for reading in readings {
-        let [
-            cold,
-            warm,
-            resting_system,
-            resting_gpu,
-            peak_system,
-            peak_gpu,
-        ] = cells(reading);
         println!(
-            "{:<width$} cold={cold:>8} warm={warm:>8} resting_system={resting_system:>9} \
-             resting_gpu={resting_gpu:>9} peak_system={peak_system:>9} peak_gpu={peak_gpu:>9} {}",
+            "{:<width$} {} {}",
             label(reading),
+            figures_line(reading, graphics),
             reading.diagnostics(),
         );
     }
 }
 
-/// A row's six figures, as its console line and its table entry both state them.
+/// The row's console figures: `key=value` per column, in [`COLUMNS`] order, keyed the
+/// way the corpus report keys the same figures.
+fn figures_line(reading: &Reading, graphics: bool) -> String {
+    kept_cells(&figures(reading), graphics)
+        .map(|(column, cell)| format!("{}={cell:>9}", column.key))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The row's figures in [`COLUMNS`] order.
 ///
-/// The resting columns, and why an anonymous reading moves, are `docs/records.md`'s. One fact
-/// is this cell's own: a resting reading can settle at two levels for the same row with its
-/// peak unmoved — a two-decimal boundary, or an allocator that gave a buffer back on one run
-/// and not another — and neither is a footprint change. It is not a licence either: this
-/// column is where a buffer outliving its call shows up, so a step on another row is a
-/// footprint change until it is explained the same way.
-fn cells(reading: &Reading) -> [String; 6] {
+/// The resting columns, and why an anonymous reading moves, are `docs/records.md`'s. One
+/// fact is this cell's own: a resting reading can settle at two levels for the same row
+/// with its peak unmoved — a two-decimal boundary, or an allocator that gave a buffer back
+/// on one run and not another — and neither is a footprint change. It is not a licence
+/// either: this column is where a buffer outliving its call shows up, so a step on another
+/// row is a footprint change until it is explained the same way.
+///
+/// The fixed size is what ties the two lists together: a column added without a cell, or a
+/// cell without a column, fails to build rather than quietly losing a figure from the
+/// record.
+fn figures(reading: &Reading) -> [String; COLUMNS.len()] {
     [
         report::fmt_ms(reading.cold_ms),
         report::fmt_ms(reading.warm_ms),
@@ -679,30 +688,106 @@ fn cells(reading: &Reading) -> [String; 6] {
     ]
 }
 
+/// The cells of one row that a record of this kind carries, each with its column, in
+/// [`COLUMNS`] order — the one projection the table and the console line share.
+fn kept_cells(
+    cells: &[String; COLUMNS.len()],
+    graphics: bool,
+) -> impl Iterator<Item = (&'static Column, &str)> {
+    cells
+        .iter()
+        .map(String::as_str)
+        .zip(COLUMNS.iter())
+        .filter(move |(_, column)| kept(column, graphics))
+        .map(|(cell, column)| (column, cell))
+}
+
+/// Whether this record carries a graphics figure anywhere.
+///
+/// The rows are measured in processes of their own, so one may have a device's figure
+/// while another does not: the column set comes from the data, because a token on the
+/// first row would drop a cell another row really measured.
+fn carries_graphics(readings: &[Reading]) -> bool {
+    readings
+        .iter()
+        .any(|reading| reading.memory.gpu_now.is_some() || reading.memory.gpu_peak.is_some())
+}
+
+/// Whether a column's cell belongs in a record that carries `graphics` figures: a
+/// graphics column in a record with none could only read "not measured".
+fn kept(column: &Column, graphics: bool) -> bool {
+    graphics || !column.graphics
+}
+
 /// The row's label in the table.
 fn label(reading: &Reading) -> &str {
     row(&reading.row).map_or(reading.row.as_str(), |row| row.label)
 }
 
-/// The record's one table: a row per product shape and the six figures it carries.
+/// One record column: the table's header, the console's key for the same figure, and
+/// whether the cell is a graphics figure.
+struct Column {
+    header: &'static str,
+    key: &'static str,
+    graphics: bool,
+}
+
+/// The record's columns in order. The system columns are the footprint reading minus the
+/// GPU half where the row has one; the processor record has none, so there they are the
+/// whole.
+const COLUMNS: [Column; 6] = [
+    Column {
+        header: "cold",
+        key: "cold",
+        graphics: false,
+    },
+    Column {
+        header: "warm",
+        key: "warm",
+        graphics: false,
+    },
+    Column {
+        header: "resting system",
+        key: "resting_system",
+        graphics: false,
+    },
+    Column {
+        header: "resting GPU",
+        key: "resting_gpu",
+        graphics: true,
+    },
+    Column {
+        header: "peak system",
+        key: "peak_system",
+        graphics: false,
+    },
+    Column {
+        header: "peak GPU",
+        key: "peak_gpu",
+        graphics: true,
+    },
+];
+
+/// The record's one table: a row per product shape and the figures it carries.
 fn table(readings: &[Reading]) -> String {
-    let mut table = String::from(
-        "| row | cold | warm | resting system | resting GPU | peak system | peak GPU |\n\
-         |---|---|---|---|---|---|---|\n",
+    let graphics = carries_graphics(readings);
+    let mut header = vec!["row"];
+    header.extend(
+        COLUMNS
+            .iter()
+            .filter(|column| kept(column, graphics))
+            .map(|column| column.header),
+    );
+    let mut table = format!(
+        "| {} |\n|{}|\n",
+        header.join(" | "),
+        vec!["---"; header.len()].join("|")
     );
     for reading in readings {
-        let [
-            cold,
-            warm,
-            resting_system,
-            resting_gpu,
-            peak_system,
-            peak_gpu,
-        ] = cells(reading);
-        table.push_str(&format!(
-            "| {} | {cold} | {warm} | {resting_system} | {resting_gpu} | {peak_system} | {peak_gpu} |\n",
-            label(reading),
-        ));
+        let cells = figures(reading);
+        let mut row = vec![label(reading)];
+        row.extend(kept_cells(&cells, graphics).map(|(_, cell)| cell));
+        table.push_str(&format!("| {} |\n", row.join(" | ")));
     }
     table
 }
@@ -843,8 +928,8 @@ mod tests {
             )
             .is_err()
         );
-        // No GPU half: a pair that silently lost one side would print a system
-        // figure as the whole footprint.
+        // No GPU half: a graphics row that lost one side would read as a figure
+        // nobody measured rather than as a record that lost a figure.
         assert!(
             Reading::parse(
                 r#"{"row":"wake","cold_ms":1,"warm_ms":2,"resting_bytes":3,"peak_bytes":4,"memory":"footprint"}"#
@@ -903,6 +988,79 @@ mod tests {
         assert_eq!(
             body[1],
             "| recognition 30s | 2.00s | 1.00s | - | not measured | - | not measured |"
+        );
+    }
+
+    /// The column set is the data's, not a token's: a record that measured no graphics
+    /// figure carries the system columns alone — a GPU column could only read "not
+    /// measured" — while one that measured any keeps the column for every row, and the
+    /// row that has none says so. The system columns are the footprint reading, with no
+    /// GPU half subtracted: an anonymous figure that can read a few hundred MiB while the
+    /// row holds a gigabyte of file-backed model.
+    #[test]
+    fn the_graphics_columns_follow_the_data() {
+        let memory = |gpu: bool| report::Memory {
+            now: Some(2 << 30),
+            peak: Some(3 << 30),
+            gpu_now: gpu.then_some(512 << 20),
+            gpu_peak: gpu.then_some(1 << 30),
+            footprint: true,
+        };
+        let lines: Vec<String> = table(&[reading(&ROWS[0], memory(false))])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "| row | cold | warm | resting system | peak system |",
+                "|---|---|---|---|---|",
+                "| recognition 10s | 2.00s | 1.00s | 2.00GiB | 3.00GiB |",
+            ]
+        );
+
+        // One row measured a device figure: the column stays, because dropping it would
+        // drop a cell that was really measured.
+        let lines: Vec<String> = table(&[
+            reading(&ROWS[0], memory(true)),
+            reading(&ROWS[1], memory(false)),
+        ])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(
+            lines[0],
+            "| row | cold | warm | resting system | resting GPU | peak system | peak GPU |"
+        );
+        assert_eq!(
+            lines[3],
+            "| recognition 30s | 2.00s | 1.00s | 2.00GiB | not measured | 3.00GiB | not measured |"
+        );
+    }
+
+    /// The console line is the record's row with `name=` in front of each figure, keyed
+    /// the way the corpus report keys the same figures, and projected the way the table
+    /// projects it.
+    #[test]
+    fn the_console_line_states_the_records_cells() {
+        let row = reading(
+            &ROWS[0],
+            report::Memory {
+                now: Some(2 << 30),
+                peak: Some(3 << 30),
+                gpu_now: Some(512 << 20),
+                gpu_peak: Some(1 << 30),
+                footprint: true,
+            },
+        );
+        assert_eq!(
+            figures_line(&row, true),
+            "cold=    2.00s warm=    1.00s resting_system=  1.50GiB resting_gpu= 512.0MiB \
+             peak_system=  2.00GiB peak_gpu=  1.00GiB"
+        );
+        assert_eq!(
+            figures_line(&row, false),
+            "cold=    2.00s warm=    1.00s resting_system=  1.50GiB peak_system=  2.00GiB"
         );
     }
 }

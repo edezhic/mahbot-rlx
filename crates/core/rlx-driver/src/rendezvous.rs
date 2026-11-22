@@ -593,6 +593,9 @@ mod tests {
 
     /// `WORLD=auto`: whoever registers inside the window joins, and every rank
     /// learns the resulting world size.
+    ///
+    /// `backend-tests`: seconds of wall clock, no product path.
+    #[cfg(feature = "backend-tests")]
     #[test]
     fn open_roster_takes_whoever_joins() {
         for proto in [RendezvousProto::Tcp, RendezvousProto::Udp] {

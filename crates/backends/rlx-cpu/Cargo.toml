@@ -27,7 +27,7 @@ documentation          = "https://docs.rs/mahbot-rlx-cpu"
 name = "rlx_cpu"
 
 [features]
-# Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-cpu --features backend-tests`.
+# Integration suites and the AMX benchmark's lib rows: off by default, `cargo test -p rlx-cpu --features backend-tests`.
 backend-tests = []
 default = ["blas"]
 # Parity with NumPy / SciPy / torch: the accurate f32 tier (`vmath::vv*`
@@ -276,3 +276,10 @@ required-features = ["backend-tests"]
 name = "wave_exec"
 required-features = ["backend-tests"]
 
+[[test]]
+name = "gguf_multi_row_route_perf"
+required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_q6k_row_perf"
+required-features = ["backend-tests"]

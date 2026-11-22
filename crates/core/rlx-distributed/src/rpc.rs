@@ -467,6 +467,8 @@ mod tests {
         c.shutdown().unwrap();
     }
 
+    // `backend-tests`: seven seconds, no product path.
+    #[cfg(feature = "backend-tests")]
     #[test]
     fn a_slow_request_heartbeats_and_a_silent_peer_times_out() {
         // The request outlasts the client's timeout; it succeeds only because the

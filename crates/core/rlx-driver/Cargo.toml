@@ -38,6 +38,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util"
 
 [features]
 default = []
+# The lib tests that cost seconds and exercise no product path.
+backend-tests = []
 # mDNS-SD service discovery for `Node` (advertise/browse `_rlx-coord._udp`).
 mdns = ["dep:mdns-sd"]
 # A TCP link carried over Bluetooth LE L2CAP (`ble::serve` / `ble::bridge`).
