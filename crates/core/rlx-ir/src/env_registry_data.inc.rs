@@ -7195,7 +7195,7 @@
     EnvVarEntry {
         name: "RLX_CONNECT_WAIT",
         group: "runtime",
-        summary: "Seconds a mesh dial to a peer keeps trying (default 10; 0 = until it answers, as a persistent node waiting for its next job)",
+        summary: "Seconds a mesh dial to a peer keeps trying, and a mesh acceptor waits for the ranks it expects (default 10; 0 = no limit — the dial until the peer answers, the acceptor until the ranks arrive)",
         kind: EnvKind::String,
         stability: EnvStability::Public,
         aliases: &[],

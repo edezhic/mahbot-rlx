@@ -767,7 +767,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_BLE_SERVE` | Public | String | Runtime | Advertise this node over Bluetooth LE under this name and accept its mesh connections there too (feature `ble`; set by `cargo rlx dist` for `via = \ |
 | `RLX_COLLECTIVE_TIMEOUT` | Public | U64 | Runtime | Seconds a collective waits on one peer before failing and naming that rank (unset = no limit; a closed peer fails at once) |
 | `RLX_CONFIG` | Public | Path | Runtime | Path to a settings file (KEY = value, [profile.NAME] sections); below explicit env vars |
-| `RLX_CONNECT_WAIT` | Public | String | Runtime | Seconds a mesh dial to a peer keeps trying (default 10; 0 = until it answers, as a persistent node waiting for its next job) |
+| `RLX_CONNECT_WAIT` | Public | String | Runtime | Seconds a mesh dial to a peer keeps trying, and a mesh acceptor waits for the ranks it expects (default 10; 0 = no limit — the dial until the peer answers, the acceptor until the ranks arrive) |
 | `RLX_CPU_PORTABLE` | Public | Bool | Runtime | CPU backend computes with the wasm build's arithmetic (rlx_cpu::config::portable) |
 | `RLX_DEBUG` | Public | String | Runtime | Comma list: each token T sets RLX_T_DEBUG (e.g. rope,lstm) |
 | `RLX_DETERMINISTIC_REDUCE` | Public | Bool | Runtime | Deterministic (non-ring) collective reduce; set on every rank |
