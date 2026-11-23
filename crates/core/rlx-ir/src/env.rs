@@ -7,6 +7,15 @@
 //! Code overrides (via [`set`], [`RlxEnv::apply`], or [`RuntimeOverrides::install`])
 //! take precedence over `std::env` for the same key.
 //!
+//! A change ([`set`], [`remove`], [`unset`], or a [`RuntimeOverrides`] install
+//! or its restore) is atomic per key — an install changes all its keys as one
+//! change; [`reload`] and [`clear_overrides`] are the all-keys changes.
+//! Once one returns, every later read on every thread sees it — except on a
+//! thread holding its own [`scoped`] override for that key, which wins by design.
+//! A read that began before the change never publishes its pre-change value
+//! afterwards, and a panic inside the mechanism does not disable it for the rest
+//! of the process.
+//!
 //! ```rust
 //! use rlx_ir::env::{self, RlxEnv};
 //!
@@ -24,14 +33,41 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::str::FromStr;
-use std::sync::{OnceLock, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-/// Code overrides. `None` is an explicit removal ([`remove`]): the key reads
-/// as unset even when the process environment has it.
-static OVERRIDES: OnceLock<RwLock<HashMap<String, Option<String>>>> = OnceLock::new();
+/// Code overrides, each with the change that wrote it. A `None` value is an
+/// explicit removal ([`remove`]): the key reads as unset even when the process
+/// environment has it.
+static OVERRIDES: OnceLock<RwLock<HashMap<String, Override>>> = OnceLock::new();
 
-fn map() -> &'static RwLock<HashMap<String, Option<String>>> {
+fn map() -> &'static RwLock<HashMap<String, Override>> {
     OVERRIDES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+#[derive(Clone)]
+struct Override {
+    value: Option<String>,
+    /// The [`CHANGE`] value this write claimed — the counter's pre-bump value,
+    /// so a live entry carries `CHANGE - 1`. Compared only against other stored
+    /// versions, never against [`CHANGE`] itself.
+    version: usize,
+}
+
+/// Bumped by every change to [`OVERRIDES`] or to the resolved cache, always
+/// under the cache's write lock. A read that loaded it before resolving
+/// refuses to publish a value it resolved before the change.
+static CHANGE: AtomicUsize = AtomicUsize::new(0);
+
+// Both of the module's locks — this map and the resolved cache — are recovered
+// from poisoning: a panic inside one critical section must not turn every later
+// override into a silent no-op.
+fn map_write() -> RwLockWriteGuard<'static, HashMap<String, Override>> {
+    map().write().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn map_read() -> RwLockReadGuard<'static, HashMap<String, Override>> {
+    map().read().unwrap_or_else(PoisonError::into_inner)
 }
 
 thread_local! {
@@ -116,14 +152,56 @@ fn resolved() -> &'static RwLock<HashMap<String, Option<String>>> {
     RESOLVED.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+fn memo_write() -> RwLockWriteGuard<'static, HashMap<String, Option<String>>> {
+    resolved().write().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn memo_read() -> RwLockReadGuard<'static, HashMap<String, Option<String>>> {
+    resolved().read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Fill the resolved cache with `value` for `key`, unless a change landed since
+/// the read that produced it started — `started` is the counter it loaded.
+/// Checked under the cache's write lock, which every change holds across its own
+/// bump and clear, so a fill and a change are totally ordered: a read that
+/// resolved before a change can never publish its pre-change value after it.
+fn publish(key: String, value: Option<String>, started: usize) {
+    let mut g = memo_write();
+    if CHANGE.load(Ordering::SeqCst) == started {
+        g.insert(key, value);
+    }
+}
+
+/// Replace `key`'s override and empty the resolved cache under one lock, so no
+/// read can publish a value it resolved before the change — see [`publish`].
+/// `value` is `Some(Some(v))` to set, `Some(None)` to remove (the key reads as
+/// unset), `None` to drop the override.
+fn change(key: String, value: Option<Option<String>>) {
+    let mut memo = memo_write();
+    let mut g = map_write();
+    // Inside the map's write lock: a reader that sees the new counter knows the
+    // map already holds the new value.
+    let version = CHANGE.fetch_add(1, Ordering::SeqCst);
+    match value {
+        Some(v) => {
+            g.insert(key, Override { value: v, version });
+        }
+        None => {
+            g.remove(&key);
+        }
+    }
+    drop(g);
+    memo.clear();
+}
+
 /// Forget every resolved value, so the next read sees the process
 /// environment as it is now. For code that changes `RLX_*` variables with
 /// `std::env::set_var` / `remove_var` after they were read; [`set`],
 /// [`remove`], [`unset`] and [`clear_overrides`] do it themselves.
 pub fn reload() {
-    if let Ok(mut g) = resolved().write() {
-        g.clear();
-    }
+    let mut memo = memo_write();
+    CHANGE.fetch_add(1, Ordering::SeqCst);
+    memo.clear();
 }
 
 /// `f` of the value of `key` (an `RLX_*` name, or one without the prefix):
@@ -137,23 +215,26 @@ fn with_value<R>(key: &str, f: impl FnOnce(Option<&str>) -> R) -> R {
     if let Some(v) = scoped_value(key.as_ref()) {
         return f(v.as_deref());
     }
-    if let Ok(g) = resolved().read()
-        && let Some(v) = g.get(key.as_ref())
-    {
+    if let Some(v) = memo_read().get(key.as_ref()) {
         return f(v.as_deref());
     }
     warn_unknown_once();
+    // The counter this read starts from; `publish` refuses a fill a change outran.
+    let started = CHANGE.load(Ordering::SeqCst);
     // An override, else the process environment, by the registry's
     // spelling of the key (canonical, aliases, deprecated replacement).
-    let raw = |k: &str| match map().read().ok().and_then(|g| g.get(k).cloned()) {
-        Some(v) => v,
-        None => std::env::var(k).ok(),
+    let raw = |k: &str| {
+        // Bound before the match: the map's read guard must be released before
+        // the `getenv`, or a writer would wait on it.
+        let code = map_read().get(k).map(|e| e.value.clone());
+        match code {
+            Some(v) => v,
+            None => std::env::var(k).ok(),
+        }
     };
     let value = crate::env_registry::resolve(key.as_ref(), raw);
     let out = f(value.as_deref());
-    if let Ok(mut g) = resolved().write() {
-        g.insert(key.into_owned(), value);
-    }
+    publish(key.into_owned(), value, started);
     out
 }
 
@@ -161,9 +242,13 @@ fn with_value<R>(key: &str, f: impl FnOnce(Option<&str>) -> R) -> R {
 /// (`RLX_DISABLE`/`RLX_TRACE`/`RLX_DEBUG`) rather than explicitly, with their
 /// value and source. Code overrides count as explicit.
 pub fn implied() -> Vec<(&'static str, String, crate::env_registry::Layer)> {
-    let raw = |k: &str| match map().read().ok().and_then(|g| g.get(k).cloned()) {
-        Some(v) => v,
-        None => std::env::var(k).ok(),
+    let raw = |k: &str| {
+        // Bound before the match, as in `with_value`: no lock across `getenv`.
+        let code = map_read().get(k).map(|e| e.value.clone());
+        match code {
+            Some(v) => v,
+            None => std::env::var(k).ok(),
+        }
     };
     crate::env_registry::layered_values(&raw)
 }
@@ -207,39 +292,29 @@ pub fn normalize_key(key: &str) -> String {
 /// Set a code-side override. Pass `"0"` / `"false"` to force a flag off even
 /// when the process environment has it enabled.
 pub fn set(key: impl AsRef<str>, value: impl Into<String>) {
-    let key = normalize_key(key.as_ref());
-    if let Ok(mut g) = map().write() {
-        g.insert(key, Some(value.into()));
-    }
-    reload();
+    change(normalize_key(key.as_ref()), Some(Some(value.into())));
 }
 
 /// Make `key` read as unset — even when the process environment sets it.
 /// The in-process counterpart of `std::env::remove_var`; [`unset`] instead
 /// drops the code override and lets the process value show through again.
 pub fn remove(key: impl AsRef<str>) {
-    let key = normalize_key(key.as_ref());
-    if let Ok(mut g) = map().write() {
-        g.insert(key, None);
-    }
-    reload();
+    change(normalize_key(key.as_ref()), Some(None));
 }
 
 /// Remove a code override for `key`; subsequent reads fall back to process env.
 pub fn unset(key: impl AsRef<str>) {
-    let key = normalize_key(key.as_ref());
-    if let Ok(mut g) = map().write() {
-        g.remove(&key);
-    }
-    reload();
+    change(normalize_key(key.as_ref()), None);
 }
 
 /// Drop every code override.
 pub fn clear_overrides() {
-    if let Ok(mut g) = map().write() {
-        g.clear();
-    }
-    reload();
+    let mut memo = memo_write();
+    let mut g = map_write();
+    CHANGE.fetch_add(1, Ordering::SeqCst);
+    g.clear();
+    drop(g);
+    memo.clear();
 }
 
 /// Read configuration: code override first, then `std::env::var`.
@@ -405,38 +480,79 @@ impl RlxEnv {
     }
 }
 
-/// RAII guard: installs overrides on construction, restores previous values on drop.
+/// RAII guard: installs overrides on construction, restores the previous value
+/// on drop — unless another change to that same key landed in between, which
+/// wins: restoring over it would resurrect a value another thread replaced.
 pub struct RuntimeOverrides {
-    /// Previous override per key: `None` = there was none.
-    saved: Vec<(String, Option<Option<String>>)>,
+    /// Per key: the previous override (`None` = there was none) and the version
+    /// this guard installed, which tells the restore whether its key moved on.
+    saved: Vec<(String, Option<Override>, usize)>,
 }
 
 impl RuntimeOverrides {
-    /// Install `pairs` for the lifetime of the returned guard.
+    /// Install `pairs` for the lifetime of the returned guard. On drop each key
+    /// gets its previous value back, unless another change to that same key
+    /// landed in between — see [`RuntimeOverrides`].
     pub fn install(pairs: impl IntoIterator<Item = (impl AsRef<str>, impl Into<String>)>) -> Self {
-        let mut saved = Vec::new();
-        for (key, value) in pairs {
-            let key = normalize_key(key.as_ref());
-            let prev = map().read().ok().and_then(|g| g.get(&key).cloned());
-            saved.push((key.clone(), prev));
-            set(&key, value);
+        let pairs: Vec<(String, String)> = pairs
+            .into_iter()
+            .map(|(k, v)| (normalize_key(k.as_ref()), v.into()))
+            .collect();
+        if pairs.is_empty() {
+            return Self { saved: Vec::new() };
         }
+        // Snapshot and install under one lock, so another change to a key lands
+        // wholly before (and is restored) or wholly after (and defeats the
+        // restore), never between the snapshot and the install.
+        let mut memo = memo_write();
+        let mut g = map_write();
+        // One version for the whole install: it only has to be unique per change,
+        // and one install is one change.
+        let version = CHANGE.fetch_add(1, Ordering::SeqCst);
+        let mut saved = Vec::with_capacity(pairs.len());
+        for (key, value) in pairs {
+            let prev = g.get(&key).cloned();
+            g.insert(
+                key.clone(),
+                Override {
+                    value: Some(value),
+                    version,
+                },
+            );
+            saved.push((key, prev, version));
+        }
+        drop(g);
+        memo.clear();
         Self { saved }
     }
 }
 
 impl Drop for RuntimeOverrides {
     fn drop(&mut self) {
-        for (key, prev) in self.saved.drain(..) {
-            match prev {
-                Some(v) => {
-                    if let Ok(mut g) = map().write() {
-                        g.insert(key, v);
-                    }
-                    reload();
-                }
-                None => unset(&key),
+        if self.saved.is_empty() {
+            return;
+        }
+        let mut memo = memo_write();
+        let mut g = map_write();
+        let mut restored = false;
+        for (key, prev, version) in self.saved.drain(..) {
+            if g.get(&key).map(|e| e.version) != Some(version) {
+                continue; // another change to this key wins
             }
+            restored = true;
+            match prev {
+                Some(e) => {
+                    g.insert(key, e);
+                }
+                None => {
+                    g.remove(&key);
+                }
+            }
+        }
+        if restored {
+            CHANGE.fetch_add(1, Ordering::SeqCst);
+            drop(g);
+            memo.clear();
         }
     }
 }
@@ -446,11 +562,19 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Env tests share the process-global override map.
+    /// Env tests share the process-global override map. Recovered from
+    /// poisoning like the mechanism's own locks: a test that panics while
+    /// holding it must not disable the rest.
     static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Keys no production code reads; the mechanism's tests own them. They are
+    /// already in the generated doc's unregistered-mentions table, so the
+    /// registry needs no entry for them.
+    const KEY: &str = "RLX_TEST_REMOVE_KEY"; // env-lint: ignore
+    const OTHER: &str = "RLX_TEST_SCOPED_KEY"; // env-lint: ignore
+
     fn with_clean_overrides(f: impl FnOnce()) {
-        let _guard = ENV_TEST_LOCK.lock().expect("env test lock poisoned");
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         clear_overrides();
         f();
         clear_overrides();
@@ -479,14 +603,13 @@ mod tests {
     #[test]
     fn remove_hides_and_unset_restores() {
         with_clean_overrides(|| {
-            const REMOVE_KEY: &str = "RLX_TEST_REMOVE_KEY"; // env-lint: ignore
-            set(REMOVE_KEY, "1");
-            assert_eq!(var_result(REMOVE_KEY).as_deref(), Ok("1"));
-            remove(REMOVE_KEY);
-            assert!(var(REMOVE_KEY).is_none());
-            assert!(var_result(REMOVE_KEY).is_err());
-            unset(REMOVE_KEY);
-            assert!(var(REMOVE_KEY).is_none());
+            set(KEY, "1");
+            assert_eq!(var_result(KEY).as_deref(), Ok("1"));
+            remove(KEY);
+            assert!(var(KEY).is_none());
+            assert!(var_result(KEY).is_err());
+            unset(KEY);
+            assert!(var(KEY).is_none());
         });
     }
 
@@ -510,21 +633,21 @@ mod tests {
     #[test]
     fn scoped_is_per_thread_and_nests() {
         with_clean_overrides(|| {
-            const SCOPED_KEY: &str = "RLX_TEST_SCOPED_KEY"; // env-lint: ignore
-            set(SCOPED_KEY, "global");
+            set(OTHER, "global");
             {
+                // Un-prefixed on purpose: `scoped` normalises the key itself.
                 let _a = scoped("TEST_SCOPED_KEY", "0.25");
-                assert_eq!(var(SCOPED_KEY).as_deref(), Some("0.25"));
+                assert_eq!(var(OTHER).as_deref(), Some("0.25"));
                 // Another thread keeps the global value.
-                let other = std::thread::spawn(|| var(SCOPED_KEY)).join().unwrap();
+                let other = std::thread::spawn(|| var(OTHER)).join().unwrap();
                 assert_eq!(other.as_deref(), Some("global"));
                 {
-                    let _b = scoped_remove(SCOPED_KEY);
-                    assert_eq!(var(SCOPED_KEY), None);
+                    let _b = scoped_remove(OTHER);
+                    assert_eq!(var(OTHER), None);
                 }
-                assert_eq!(var(SCOPED_KEY).as_deref(), Some("0.25"));
+                assert_eq!(var(OTHER).as_deref(), Some("0.25"));
             }
-            assert_eq!(var(SCOPED_KEY).as_deref(), Some("global"));
+            assert_eq!(var(OTHER).as_deref(), Some("global"));
         });
     }
 
@@ -537,6 +660,140 @@ mod tests {
                 .apply();
             assert_eq!(parse_or("RLX_MPSGRAPH_MIN_FLOPS", 0u64), 42);
             assert!(flag("RLX_USE_ICB"));
+        });
+    }
+
+    /// A save-and-restore must not put back a value another change replaced,
+    /// and a change to an unrelated key must not stop it restoring: the
+    /// invalidation is per key.
+    #[test]
+    fn restore_does_not_resurrect_a_changed_value() {
+        with_clean_overrides(|| {
+            let guard = RuntimeOverrides::install([(KEY, "installed")]);
+            set(KEY, "later");
+            drop(guard);
+            assert_eq!(
+                var(KEY).as_deref(),
+                Some("later"),
+                "the guard's drop put back the pre-install value"
+            );
+
+            let guard = RuntimeOverrides::install([(KEY, "again")]);
+            drop(guard);
+            assert_eq!(
+                var(KEY).as_deref(),
+                Some("later"),
+                "an untouched key must still restore"
+            );
+
+            let guard = RuntimeOverrides::install([(KEY, "scoped")]);
+            set(OTHER, "unrelated");
+            drop(guard);
+            assert_eq!(
+                var(KEY).as_deref(),
+                Some("later"),
+                "a change to another key must not suppress the restore"
+            );
+
+            // Several keys in one install, one of them moved on: the restore is
+            // decided per key, so the moved key keeps its new value and the
+            // others still restore. Only the per-key version check makes this
+            // pass — restoring wholesale would put `later` back over `moved`.
+            let guard = RuntimeOverrides::install([(KEY, "a"), (OTHER, "b")]);
+            set(KEY, "moved");
+            drop(guard);
+            assert_eq!(
+                var(KEY).as_deref(),
+                Some("moved"),
+                "the restore put back a value the same key had already replaced"
+            );
+            assert_eq!(
+                var(OTHER).as_deref(),
+                Some("unrelated"),
+                "an untouched key of the same install must still restore"
+            );
+        });
+    }
+
+    /// The ordering this change introduces, asserted in one run with no threads
+    /// and no timing: a cache fill carrying a version older than the current
+    /// change is refused, one carrying the current version is accepted. The
+    /// `before` fill is exactly what a read that resolved before the change
+    /// would try to publish, so removing the guard in `publish` — filling
+    /// unconditionally, as the mechanism did before — fails the first half.
+    #[test]
+    fn an_older_publication_is_refused_and_the_current_one_accepted() {
+        with_clean_overrides(|| {
+            let before = CHANGE.load(Ordering::SeqCst);
+            set(KEY, "current");
+
+            publish(KEY.to_string(), Some("stale".into()), before);
+            assert_eq!(
+                var(KEY).as_deref(),
+                Some("current"),
+                "a publication older than the current change was accepted"
+            );
+
+            publish(
+                KEY.to_string(),
+                Some("fresh".into()),
+                CHANGE.load(Ordering::SeqCst),
+            );
+            assert_eq!(
+                var(KEY).as_deref(),
+                Some("fresh"),
+                "a publication carrying the current version was refused"
+            );
+        });
+    }
+
+    /// The counter is taken before the value is resolved, so a read that starts,
+    /// is overtaken by a change while it runs, and only then publishes, is
+    /// refused. The change below lands in that window — after the read loaded
+    /// its counter, before it fills the cache; a stamp taken at `f` or inside
+    /// `publish` would let the value the read resolved before the change
+    /// through, and this fails.
+    #[test]
+    fn a_read_overtaken_by_a_change_does_not_publish_its_stale_value() {
+        with_clean_overrides(|| {
+            // KEY is deliberately not read first: the change below must be
+            // reached from a read that resolves, and a hit would hold the
+            // cache's read guard across `f`, so `set` there would deadlock
+            // rather than fail.
+            with_value(KEY, |_| set(KEY, "during"));
+            assert_eq!(
+                var(KEY).as_deref(),
+                Some("during"),
+                "a read overtaken by a change published the value it resolved before it"
+            );
+        });
+    }
+
+    /// A panic while a lock is held must not disable the mechanism for the rest
+    /// of the process: the locks are recovered, not read as "already failed".
+    #[test]
+    fn a_panic_while_holding_a_lock_does_not_disable_overrides() {
+        with_clean_overrides(|| {
+            let poisoned = std::thread::spawn(|| {
+                let _memo = resolved().write().unwrap();
+                let _map = map().write().unwrap();
+                panic!("poison both locks");
+            })
+            .join();
+            assert!(poisoned.is_err(), "the thread must have panicked");
+
+            set(KEY, "1");
+            assert_eq!(var(KEY).as_deref(), Some("1"));
+            let guard = RuntimeOverrides::install([(KEY, "2")]);
+            assert_eq!(var(KEY).as_deref(), Some("2"));
+            drop(guard);
+            assert_eq!(var(KEY).as_deref(), Some("1"));
+            unset(OTHER);
+            assert_eq!(var(OTHER), None);
+            // Leave the rest of this binary with healthy locks rather than
+            // every later read paying the recovery path.
+            map().clear_poison();
+            resolved().clear_poison();
         });
     }
 }

@@ -669,9 +669,11 @@ pub fn profile() -> rlx_flow::CompileProfile {
 /// The switch is process-global, so it is installed here, around this compile,
 /// and restored on return. Installing it while the graph is built would leak it
 /// into every later compile in the process, and two compiles of one graph would
-/// then differ in fusion as well as precision. The override map has no atomicity
-/// of its own, so a second compile in the same process would see this one's
-/// install or its restore mid-flight.
+/// then differ in fusion as well as precision. An install and its restore are
+/// atomic per key, but a compile reads its switches over its whole duration and
+/// needs them stable throughout, which per-key atomicity does not give — and a
+/// second compile installing the same key would defeat this one's restore. So a
+/// compile that installs a switch holds `FUSION_SCOPE` for its whole duration.
 pub fn compile_encoder(built: BuiltModel) -> Result<Compiled> {
     static FUSION_SCOPE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // The lock is declared before the override, so the override is restored before

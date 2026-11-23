@@ -7040,10 +7040,17 @@ mod tests {
     /// VJP emitting `Op::GatedDeltaNetBackward`, and unrolling instead costs
     /// ~32x. `RLX_GDN_UNFUSE_FOR_AD=1` restores the unrolled decomposition for
     /// backends without the backward kernel; this pins that fallback's shape.
+    ///
+    /// The switch is process-global and other tests in this binary prepare
+    /// graphs for autodiff at the same time, so the opt-in is scoped to this
+    /// thread rather than set and cleared process-wide.
     #[test]
     fn unfuse_decomposes_gated_delta_net_under_opt_in() {
         let (g, _q, _params) = build_gdn_graph();
-        let kept = rlx_fusion::unfuse_fused_for_autodiff(g.clone());
+        let kept = {
+            let _off = rlx_ir::env::scoped_remove("RLX_GDN_UNFUSE_FOR_AD");
+            rlx_fusion::unfuse_fused_for_autodiff(g.clone())
+        };
         assert!(
             kept.nodes()
                 .iter()
@@ -7051,9 +7058,10 @@ mod tests {
             "Op::GatedDeltaNet should stay fused by default"
         );
 
-        rlx_ir::env::set("RLX_GDN_UNFUSE_FOR_AD", "1");
-        let unfused = rlx_fusion::unfuse_fused_for_autodiff(g);
-        rlx_ir::env::unset("RLX_GDN_UNFUSE_FOR_AD");
+        let unfused = {
+            let _opt_in = rlx_ir::env::scoped("RLX_GDN_UNFUSE_FOR_AD", "1");
+            rlx_fusion::unfuse_fused_for_autodiff(g)
+        };
 
         let has_gdn = unfused
             .nodes()

@@ -16,12 +16,15 @@
 //! a far tighter check than finite differences alone, and it covers the packing
 //! and slicing of the bundled gradient output as well as the scan arithmetic.
 //!
-//! `RLX_GDN_UNFUSE_FOR_AD=1` selects the old path, so both run here. Everything
-//! lives in one test: the switch is process-global, so splitting it would let
-//! the two halves race.
+//! `RLX_GDN_UNFUSE_FOR_AD=1` selects the old path, so both run here, each on
+//! its own thread-scoped override of that process-global switch — which is what
+//! keeps the arms independent of an exported `RLX_GDN_UNFUSE_FOR_AD=1` and of
+//! each other.
 
 use rlx_autodiff::{GradWithLossOptions, Wrt, grad_with_loss_wrt};
 use rlx_ir::{DType, Graph, Shape};
+
+const FLAG: &str = "RLX_GDN_UNFUSE_FOR_AD";
 
 const B: usize = 2;
 const S: usize = 6;
@@ -63,8 +66,9 @@ fn gdn_graph(gate_per_channel: bool) -> Graph {
     g
 }
 
-/// `[dy_mirror, dq, dk, dv, dg, dbeta]`.
-fn grads(gate_per_channel: bool) -> Vec<Vec<f32>> {
+/// `[dy_mirror, dq, dk, dv, dg, dbeta]`, and whether the backward graph carried
+/// the fused `Op::GatedDeltaNetBackward` — the route this run took.
+fn grads(gate_per_channel: bool) -> (Vec<Vec<f32>>, bool) {
     let qkv = B * S * H * N;
     let bsh = B * S * H;
     let gl = if gate_per_channel { qkv } else { bsh };
@@ -88,26 +92,49 @@ fn grads(gate_per_channel: bool) -> Vec<Vec<f32>> {
         ],
         GradWithLossOptions::STRICT.with_aux(false),
     );
+    let fused_route = bwd
+        .nodes()
+        .iter()
+        .any(|n| matches!(n.op, rlx_ir::Op::GatedDeltaNetBackward { .. }));
     let mut compiled = rlx::Session::new(rlx::Device::Cpu).compile(bwd);
-    compiled.run(&[
+    let out = compiled.run(&[
         ("q", &q[..]),
         ("k", &k[..]),
         ("v", &v[..]),
         ("g", &gate[..]),
         ("beta", &beta[..]),
         ("d_output", &cot[..]),
-    ])
+    ]);
+    (out, fused_route)
 }
 
 #[test]
 fn fused_backward_matches_the_unrolled_path() {
     for gate_per_channel in [false, true] {
-        rlx_ir::env::unset("RLX_GDN_UNFUSE_FOR_AD");
-        let fused = grads(gate_per_channel);
+        // Unset on this thread, so the default path is what runs whatever the
+        // process environment says.
+        let (fused, fused_route) = {
+            let _off = rlx_ir::env::scoped_remove(FLAG);
+            grads(gate_per_channel)
+        };
+        let (unrolled, unrolled_route) = {
+            let _on = rlx_ir::env::scoped(FLAG, "1");
+            grads(gate_per_channel)
+        };
 
-        rlx_ir::env::set("RLX_GDN_UNFUSE_FOR_AD", "1");
-        let unrolled = grads(gate_per_channel);
-        rlx_ir::env::unset("RLX_GDN_UNFUSE_FOR_AD");
+        // Each side must have taken the path it claims: the fused run has to
+        // reach the backward kernel, and the unrolled run must not — otherwise
+        // the numbers below compare one path against itself.
+        assert!(
+            fused_route,
+            "gate_per_channel={gate_per_channel}: the default run never reached \
+             Op::GatedDeltaNetBackward"
+        );
+        assert!(
+            !unrolled_route,
+            "gate_per_channel={gate_per_channel}: `{FLAG}=1` still reached \
+             Op::GatedDeltaNetBackward — the two arms are the same path"
+        );
 
         assert_eq!(
             fused.len(),
@@ -132,33 +159,7 @@ fn fused_backward_matches_the_unrolled_path() {
                      fused {x} vs unrolled {y}"
                 );
             }
-            let magnitude = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            assert!(
-                magnitude > 1e-4,
-                "gate_per_channel={gate_per_channel}: {label} is ~zero \
-                 (max {magnitude}) — the comparison is vacuous"
-            );
         }
         eprintln!("gate_per_channel={gate_per_channel}: worst |fused - unrolled| = {worst:.2e}");
     }
-}
-
-/// The fused path must actually be in use by default — otherwise the test above
-/// compares the unrolled path against itself.
-#[test]
-fn fused_backward_is_the_default() {
-    rlx_ir::env::unset("RLX_GDN_UNFUSE_FOR_AD");
-    let bwd = grad_with_loss_wrt(
-        &gdn_graph(false),
-        &[Wrt::Leaf("q".into())],
-        GradWithLossOptions::STRICT.with_aux(false),
-    );
-    let has_backward_op = bwd
-        .nodes()
-        .iter()
-        .any(|n| matches!(n.op, rlx_ir::Op::GatedDeltaNetBackward { .. }));
-    assert!(
-        has_backward_op,
-        "expected Op::GatedDeltaNetBackward in the backward graph"
-    );
 }

@@ -366,8 +366,13 @@ fn gated_delta_net_unfused_before_autodiff() {
     // GatedDeltaNet now keeps its fused form through autodiff preparation: it
     // has a dedicated VJP emitting `Op::GatedDeltaNetBackward`, and unrolling
     // the time loop instead runs ~32x slower. The unrolled decomposition is
-    // still reachable for backends without the backward kernel.
-    let kept = prepare_graph_for_ad(g.clone());
+    // still reachable for backends without the backward kernel. Both arms pin
+    // the switch on this thread, so the process environment cannot decide what
+    // the test is measuring.
+    let kept = {
+        let _off = rlx_ir::env::scoped_remove("RLX_GDN_UNFUSE_FOR_AD");
+        prepare_graph_for_ad(g.clone())
+    };
     assert!(
         kept.nodes()
             .iter()
@@ -375,9 +380,10 @@ fn gated_delta_net_unfused_before_autodiff() {
         "GatedDeltaNet should survive autodiff preparation and use its own VJP"
     );
 
-    rlx_ir::env::set("RLX_GDN_UNFUSE_FOR_AD", "1");
-    let prep = prepare_graph_for_ad(g);
-    rlx_ir::env::unset("RLX_GDN_UNFUSE_FOR_AD");
+    let prep = {
+        let _opt_in = rlx_ir::env::scoped("RLX_GDN_UNFUSE_FOR_AD", "1");
+        prepare_graph_for_ad(g)
+    };
     let has_gdn = prep
         .nodes()
         .iter()
