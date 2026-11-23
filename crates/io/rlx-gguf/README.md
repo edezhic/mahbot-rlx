@@ -1,8 +1,11 @@
 # rlx-gguf
 
 GGUF v1 / v2 / v3 parser, dequantization, **quantization encoders**,
-and a **file writer**. Standalone — no `rlx-*` deps; usable from any
-Rust ML project.
+and a **file writer**. One optional `rlx-*` dependency: the default
+`ir` feature maps GGML types to `rlx-ir`'s `QuantScheme`. Turn default
+features off and it asks for none of its own — usable from any Rust ML
+project, unless another crate in the graph asks for `ir` (cargo unifies
+features).
 
 ## Supported quantizations
 

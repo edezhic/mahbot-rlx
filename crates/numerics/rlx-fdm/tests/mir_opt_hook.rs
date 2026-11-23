@@ -38,6 +38,10 @@ fn custom_fn_grad_q_builds() {
         "loss_grad",
         rlx_ir::Shape::new(&[s.num_free() * 3], rlx_ir::DType::F64),
     );
+    // Small arch must take the dense route. The sparse variant only exists under
+    // `rlx-sparse`, so without it the pattern is irrefutable and this check is
+    // vacuous — with it, the panic is the assertion.
+    #[allow(irrefutable_let_patterns)]
     let FdmEquilibriumGraph::Dense(dense) = &built else {
         panic!("small arch should use dense graph");
     };

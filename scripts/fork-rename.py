@@ -34,10 +34,13 @@ than through a hand edit per manifest:
 Idempotent: running it twice changes nothing. Usage: `python3
 scripts/fork-rename.py [--check | --print-version | --print-upstream-version |
 --selftest]`; `--check` exits 1 when a manifest would change (for a gate) and
-prints what it would rewrite; the two `--print-*` forms print [`FORK_VERSION`]
-and [`UPSTREAM_VERSION`] for the release scripts, whatever state the tree is in;
-`--selftest` asserts the caret arithmetic the publish gate decides on and runs
-the write path over a manifest that needs a rewrite, which `--check` never does.
+prints what it would rewrite, and — before it reads any manifest — when a crate
+in [`IR_DEFAULT`] has lost `ir` from its `default` list, which no rewrite here
+could restore; the two `--print-*` forms print [`FORK_VERSION`] and
+[`UPSTREAM_VERSION`] for the release scripts, whatever state the tree is in;
+`--selftest` asserts the caret arithmetic the publish gate decides on, the
+`default`-list reader the guard uses, and runs the write path over a manifest
+that needs a rewrite, which `--check` never does.
 """
 
 import os
@@ -102,6 +105,14 @@ VERSION_ONLY = {"crates/mahbot-inference"}
 # same set as names, in upload order; its gate fails a scoped crate that depends
 # on a `mahbot-…` member this set does not contain.
 PUBLISHED = set(RENAMED) | VERSION_ONLY
+
+# The crates that carry the `ir` feature — whether they link this tree's compiler
+# and runtime. Upstream keeps it off; this fork keeps it on in all three, so a
+# plain build, test and lint resolve one feature set instead of two. That is a
+# permanent divergence of one line per manifest, on a line upstream owns, so a
+# sync that takes upstream's `default` back has to fail here rather than silently
+# restore the second set.
+IR_DEFAULT = ("crates/io/rlx-gguf", "crates/numerics/rlx-lbm", "crates/numerics/rlx-fdm")
 
 DEP_START = re.compile(r"^([ \t]*)([A-Za-z0-9_.-]+)([ \t]*=[ \t]*)\{", re.M)
 PKG_SECTION = re.compile(r"^\[package\][ \t]*$", re.M)
@@ -322,8 +333,26 @@ CARET_CASES = (
 )
 
 
+def feature_defaults(text):
+    """The items of a manifest's `[features] default` list, or None if it has none."""
+    body = section_text(text, "[features]")
+    m = re.search(r"^[ \t]*default[ \t]*=[ \t]*\[(.*?)\]", body, re.M | re.S)
+    return re.findall(r'"([^"]+)"', m.group(1)) if m else None
+
+
+def ir_defaults_lost(root):
+    """`IR_DEFAULT` members whose `default` no longer lists `ir`."""
+    lost = []
+    for rel in IR_DEFAULT:
+        text = layers.read(os.path.join(root, rel, "Cargo.toml"))
+        if "ir" not in (feature_defaults(text) or []):
+            lost.append(rel)
+    return lost
+
+
 def selftest():
-    """The caret arithmetic the pre-flight decides on, and the write path.
+    """The caret arithmetic the pre-flight decides on, the `default`-list reader
+    the `IR_DEFAULT` guard uses, and the write path.
 
     The write path matters because `--check` compares and never splices: a splice
     that eats the newline after an entry passes every gate in the tree while
@@ -365,8 +394,23 @@ def selftest():
             print(f"fork-rename selftest: {label} produced\n{got!r}\nnot\n{after!r}",
                   file=sys.stderr)
             return 1
-    print("fork-rename selftest: the caret arithmetic holds and a rewrite replaces "
-          "the entry and nothing else")
+    # The defaults guard has to fail on the shape it exists for — a manifest whose
+    # `default` list dropped `ir` — and not on a list that merely mentions it.
+    cases = (
+        ('[features]\ndefault = ["ir"]\n', ["ir"]),
+        ('[features]\ndefault = []\n', []),
+        ('[features]\ndefault = [\n  "reference",\n  "ir",\n]\n', ["reference", "ir"]),
+        ('[features]\nir = ["dep:rlx-ir"]\n', None),
+        ('[dependencies]\ndefault = ["ir"]\n', None),
+    )
+    for text, want in cases:
+        got = feature_defaults(text)
+        if got != want:
+            print(f"fork-rename selftest: feature_defaults({text!r}) is {got!r}, not {want!r}",
+                  file=sys.stderr)
+            return 1
+    print("fork-rename selftest: the caret arithmetic holds, a rewrite replaces "
+          "the entry and nothing else, and the defaults guard reads `default`")
     return 0
 
 
@@ -391,6 +435,14 @@ def main(argv):
               f"{inherited}: a local build would take the registry copy", file=sys.stderr)
         return 1
     check = "--check" in argv[1:]
+    # Fails rather than repairs: the `default` line is upstream's to keep, so a
+    # merge that took it back is a hand re-application, not a rewrite.
+    lost = ir_defaults_lost(root)
+    if lost:
+        print("the `ir` feature is no longer a default for: " + ", ".join(lost)
+              + " — this fork builds the compiler and runtime in every gate "
+              "(see IR_DEFAULT)", file=sys.stderr)
+        return 1
     versions = package_versions(root, inherited)
     upstream = upstream_keys(root, workspace_registry(root))
     changed = 0

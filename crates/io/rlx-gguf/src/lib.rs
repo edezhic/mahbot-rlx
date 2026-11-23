@@ -5,8 +5,11 @@
 //! GGUF (GGML Universal Format) parser, dequantizer, **quantization
 //! encoder**, and **file writer**.
 //!
-//! Standalone: no `rlx-*` dependencies. Higher-level `WeightLoader` /
-//! HF name mapping lives in the separate model-builders repo (see root README).
+//! One `rlx-*` dependency is optional: `ir` (a default feature) adds `rlx-ir`
+//! for the GGML type → `QuantScheme` mapping, and default features off leaves a
+//! parser with none of its own — feature unification can still add it from
+//! elsewhere in the graph. Higher-level `WeightLoader` / HF name mapping lives in the
+//! separate model-builders repo (see root README).
 //!
 //! Supports GGUF v1, v2, v3 (the live formats). Tensor dtypes
 //! decoded today: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1,

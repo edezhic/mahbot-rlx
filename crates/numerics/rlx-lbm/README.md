@@ -43,14 +43,15 @@ plausible-looking flow.
 
 ## Features
 
-- `ir` — build one LBM step as an rlx `Graph` and run it through `Session`.
-  Off by default; the host reference simulator needs no backend.
+- `ir` (default) — build one LBM step as an rlx `Graph` and run it through
+  `Session`. Turn default features off for the host reference simulator alone,
+  which needs no backend.
 
 ## Install
 
 ```toml
 [dependencies]
-rlx-lbm = { version = "0.2", features = ["ir"] }
+rlx-lbm = "0.2"
 ```
 
 ## Quickstart

@@ -591,7 +591,7 @@ backends/  — one crate per hardware target
   rlx-mcu            no_std int8/int4 kernels + in-place model files for speech models on MCUs
 
 io/  — model + weight loading, conversion, packaging
-  rlx-gguf           standalone GGUF v1/2/3 parser + dequant (every llama.cpp scheme)
+  rlx-gguf           GGUF v1/2/3 parser + dequant (every llama.cpp scheme) + QuantScheme map
   rlx-gguf-convert   safetensors / ONNX → GGUF with per-tensor quantization
   rlx-onnx           ONNX inference — native compile by default, optional ORT fallback
   rlx-onnx-import    ONNX → RLX HIR import (protobuf + op lowering)

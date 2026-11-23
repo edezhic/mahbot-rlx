@@ -15,7 +15,11 @@ documentation.workspace = true
 [features]
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-fdm --features backend-tests`.
 backend-tests = []
-default = ["reference", "sparse", "nonlinear"]
+# `ir` is a default here and not upstream: the gates run the graph path, and a
+# second feature set is what you get by forgetting. `--no-default-features` drops
+# these four together, leaving the host-only core; naming the first three again
+# restores them without the compiler and runtime.
+default = ["reference", "sparse", "nonlinear", "ir"]
 
 # Pure-Rust equilibrium reference (dense K, LAPACK-free Gaussian elimination).
 reference = []

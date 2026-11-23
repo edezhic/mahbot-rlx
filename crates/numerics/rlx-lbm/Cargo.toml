@@ -15,10 +15,11 @@ readme                  = "README.md"
 [features]
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-lbm --features backend-tests`.
 backend-tests = []
-default = []
-
 # Build one LBM step as an rlx `Graph` (streaming via `Op::Roll`), so the solver
-# runs on every backend through `Session` instead of only on the host.
+# runs on every backend through `Session` instead of only on the host. Default
+# here and not upstream: the gates run it, and a second feature set is what you
+# get by forgetting. `--no-default-features` is the host-only core.
+default = ["ir"]
 ir = ["dep:rlx-ir", "dep:rlx-runtime"]
 
 [dependencies]

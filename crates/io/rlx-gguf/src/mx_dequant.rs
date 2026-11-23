@@ -14,9 +14,9 @@
 //! | NVFP4  | 16        | E4M3 (1 B)  | 9           |
 //!
 //! The OCP E2M1 LUT, the E4M3 decoder, and the constant `NVFP4_GROUP_SIZE`
-//! already live in `rlx-ir::nvfp4`, but `rlx-gguf` must stay standalone
-//! (no `rlx-*` deps) so the small constants are duplicated here. They
-//! match `rlx-ir`'s implementation byte-for-byte.
+//! already live in `rlx-ir::nvfp4`, but the crate still builds without any
+//! `rlx-*` dependency (`--no-default-features`), so the small constants are
+//! duplicated here. They match `rlx-ir`'s implementation byte-for-byte.
 
 use anyhow::{Result, bail};
 

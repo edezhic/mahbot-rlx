@@ -34,8 +34,13 @@ assert!(eq.xyz[[1, 2]] < 0.0);
 | Feature | Description |
 |---------|-------------|
 | `reference` (default) | Dense CPU FDM solve |
+| `sparse` (default) | CSR stiffness + Jacobi PCG |
+| `nonlinear` (default) | Fixed-point iteration with shape-dependent edge loads |
+| `ir` (default) | Emit `Graph` with `Op::DenseSolve` for RLX autodiff |
 | `io` | Load jax_fdm-style JSON networks |
-| `ir` | Emit `Graph` with `Op::DenseSolve` for RLX autodiff |
+
+Turning default features off leaves the host-only core; naming `reference`,
+`sparse` and `nonlinear` again restores them without `ir`.
 
 ## Sparse + nonlinear
 

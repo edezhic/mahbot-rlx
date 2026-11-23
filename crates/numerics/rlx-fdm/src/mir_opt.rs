@@ -245,16 +245,22 @@ pub fn build_grad_q_custom_fn(
     let nf = sig.num_free;
     let loss_dim = nf * 3;
 
+    // A custom function's own parameters are snapshotted when it compiles, so a
+    // name only the sub-graph declares is accepted and ignored by
+    // `CompiledGraph::set_param_typed`. `fdm_dq` therefore lives on the outer
+    // graph — where [`set_grad_q_param`] sets it — and enters the call as an input.
+    let dq = g.param("fdm_dq", Shape::new(&[ne], DType::F64));
+
     let mut fwd = Graph::new("fdm_grad_q_fwd");
     let _q_in = fwd.input("q", Shape::new(&[ne], DType::F64));
     let _loss_grad_in = fwd.input("loss_grad", Shape::new(&[loss_dim], DType::F64));
-    // Host fills `fdm_dq` via [`FdmMirOptimizer::set_grad_q_param`] before `Session::run`.
-    let dq = fwd.param("fdm_dq", Shape::new(&[ne], DType::F64));
-    fwd.set_outputs(vec![dq]);
+    let dq_in = fwd.input("fdm_dq", Shape::new(&[ne], DType::F64));
+    fwd.set_outputs(vec![dq_in]);
 
     let mut vjp = Graph::new("fdm_grad_q_vjp");
     let _q_in = vjp.input("q", Shape::new(&[ne], DType::F64));
     let _loss_grad_in = vjp.input("loss_grad", Shape::new(&[loss_dim], DType::F64));
+    let _dq_in = vjp.input("fdm_dq", Shape::new(&[ne], DType::F64));
     let _primal_out = vjp.input("primal_output", Shape::new(&[ne], DType::F64));
     let _d_out = vjp.input("d_output", Shape::new(&[ne], DType::F64));
     let zero_q = vjp.add_node(
@@ -274,9 +280,11 @@ pub fn build_grad_q_custom_fn(
         vec![],
         Shape::new(&[loss_dim], DType::F64),
     );
-    vjp.set_outputs(vec![zero_q, zero_l]);
+    // `q` and the injected `dL/dq` are both edge vectors, so one zero serves
+    // their two gradients.
+    vjp.set_outputs(vec![zero_q, zero_l, zero_q]);
 
-    g.custom_fn(vec![q, loss_grad], fwd, Some(vjp), None)
+    g.custom_fn(vec![q, loss_grad, dq], fwd, Some(vjp), None)
 }
 
 /// Inject host-computed `dL/dq` into a graph built with [`build_grad_q_custom_fn`].

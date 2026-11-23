@@ -29,7 +29,10 @@ fn dense_solve_graph_matches_reference() {
 
     let outs = session.run_typed(&[]);
     let z_ir = f64::from_le_bytes(outs[0].0[16..24].try_into().unwrap());
-    let z_ref = ref_eq.xyz[3 * 1 + 2];
+    // The middle node is the free one; `xyz` is indexed by network node, so its
+    // z is the third component of the second triple.
+    let node = 1;
+    let z_ref = ref_eq.xyz[node * 3 + 2];
     assert!((z_ref - z_ir).abs() < 1e-4, "ref z={z_ref} ir z={z_ir}");
 }
 

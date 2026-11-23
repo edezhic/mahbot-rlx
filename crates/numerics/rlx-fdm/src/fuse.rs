@@ -5,7 +5,9 @@
 //! Fused end-to-end form-finding: one compiled MIR equilibrium graph per topology,
 //! host goals + implicit `dL/dq`. With `feature fuse`, MIR autodiff for simple losses.
 
-use rlx_ir::{DType, Graph, GraphExt, NodeId, Op, Shape};
+use rlx_ir::Graph;
+#[cfg(feature = "fuse")]
+use rlx_ir::{DType, GraphExt, NodeId, Op, Shape};
 use rlx_runtime::{CompiledGraph, Device, Session};
 
 use crate::equilibrium::{EquilibriumModel, FdmError};
@@ -170,7 +172,7 @@ pub fn try_constrained_fdm_fused(
         grad_mode: crate::mir_opt::FdmGradMode::Linear,
         sparse_graph_min_free: 8,
     };
-    let Some(mut runner) = FusedEquilibriumRunner::try_new(&mir, network)? else {
+    let Some(runner) = FusedEquilibriumRunner::try_new(&mir, network)? else {
         return Ok(None);
     };
     Ok(Some(constrained_fdm_host(
@@ -192,6 +194,7 @@ pub fn can_fuse_equilibrium(optimizer: &FdmMirOptimizer, network: &Network) -> b
     true
 }
 
+#[cfg(feature = "fuse")]
 fn emit_fused_loss(g: &mut Graph, xyz_free: NodeId, nf: usize, loss: &FusedMirLoss) -> NodeId {
     use rlx_ir::op::ReduceOp;
     match loss {
@@ -214,6 +217,7 @@ fn emit_fused_loss(g: &mut Graph, xyz_free: NodeId, nf: usize, loss: &FusedMirLo
     }
 }
 
+#[cfg(feature = "fuse")]
 fn f64_scalar(g: &mut Graph, v: f64) -> NodeId {
     g.add_node(
         Op::Constant {
@@ -224,6 +228,7 @@ fn f64_scalar(g: &mut Graph, v: f64) -> NodeId {
     )
 }
 
+#[cfg(feature = "fuse")]
 fn find_param(g: &Graph, name: &str) -> Option<NodeId> {
     for node in g.nodes() {
         if let Op::Param { name: n } = &node.op {

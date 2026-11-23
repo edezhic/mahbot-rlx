@@ -3,7 +3,7 @@ name = "mahbot-rlx-gguf"
 version                = "0.2.18-mahbot.4"
 edition.workspace      = true
 rust-version.workspace = true
-description = "GGUF v1/v2/v3 parser + dequantization to f32. Standalone — no rlx-* deps unless the `ir` feature is on."
+description = "GGUF v1/v2/v3 parser + dequantization to f32. The default `ir` feature maps GGML types to RLX `QuantScheme`; with default features off the crate has no rlx-* deps."
 authors.workspace      = true
 license.workspace      = true
 keywords.workspace     = true
@@ -32,7 +32,11 @@ tempfile = "3"
 workspace = true
 
 [features]
-default = []
+# The GGML type → `QuantScheme` mapping is a default here and not upstream: the
+# product and every gate build it, and a second feature set is what you get by
+# forgetting. `--no-default-features` is the parser-only build — no rlx-* deps,
+# unless something else in the graph asks for `ir` (cargo unifies features).
+default = ["ir"]
 ir = ["dep:rlx-ir"]
 # Integration test targets: off by default (fast smoke gate), `cargo test -p rlx-gguf --features backend-tests`.
 backend-tests = []

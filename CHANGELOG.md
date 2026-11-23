@@ -23,8 +23,37 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ## [Unreleased]
 
+### Changed
+
+- `mahbot-rlx-gguf`, `rlx-lbm` and `rlx-fdm` now build their `ir` feature by
+  default, so a plain build, test and lint resolve one feature set instead of
+  two. The feature is unchanged and still optional; its cost differs per crate.
+  `mahbot-rlx-gguf`'s default install now pulls `mahbot-rlx-ir`, and its
+  parser-only build is `--no-default-features` — parser-only only while nothing
+  else in the consumer's graph asks for `ir`, since cargo unifies features.
+  `rlx-lbm` and `rlx-fdm` now pull `mahbot-rlx-runtime` with its `cpu` feature,
+  which brings `mahbot-rlx-cpu` at its own default `blas` feature. For
+  `rlx-fdm`, `--no-default-features` also drops `reference`, `sparse` and
+  `nonlinear`, leaving the host-only core;
+  `--no-default-features --features reference,sparse,nonlinear` restores them
+  without the compiler and runtime. One behaviour changes with the flip:
+  `rlx-fdm`'s `constrained_fdm` takes the fused MIR equilibrium path for
+  `OptimizeConfig::arch_form_finding()`, so each equilibrium solve in the host
+  optimisation loop runs as one compiled CPU graph instead of the host-side
+  iterative solve. Upstream keeps the feature off,
+  so this is a permanent fork divergence of one `default` line per manifest — a
+  line upstream owns — and `scripts/fork-rename.py --check` fails if a sync
+  takes upstream's `default` back.
+
 ### Fixed
 
+- `rlx_fdm::mir_opt::set_grad_q_param` now reaches the graph it sets. `fdm_dq`
+  was a parameter of the `Op::CustomFn` forward body, and a custom function's
+  parameters are snapshotted when it compiles — so `set_param_typed` accepted
+  the name and ignored it, and `custom_fn_grad_q_builds` was asserting a zero.
+  The parameter is declared on the outer graph now and enters the call as an
+  input; the test passes with its assertion unchanged, and the runtime's
+  contract for a name the compiled graph does not know is unchanged.
 - `rlx_libm::reference::*` now honours `platform::use_linux_reference()`.
   Before, on Apple targets with the `libm` feature it chose Apple's libm at
   compile time, so the runtime switch never reached it. A browser/native

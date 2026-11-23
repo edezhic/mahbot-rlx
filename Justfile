@@ -83,13 +83,12 @@ test-mlx:
 test-cerebras:
     cargo test -p rlx-cerebras
 
-# Run rlx-lbm tests INCLUDING the graph path. `ir` is off by default (it pulls
-# rlx-ir + rlx-runtime), so a bare `cargo test -p rlx-lbm` runs only the lib unit
-# tests and silently skips `graph_stream` / `lane_reset` — the two that check the
-# solver as an rlx Graph rather than as host arithmetic. The third integration
-# target (`invariants`) is behind the `backend-tests` gate.
+# Run rlx-lbm tests INCLUDING the graph path and the integration targets.
+# `ir` is a default now, so the graph path is in every build; the three
+# integration targets (`graph_stream`, `lane_reset`, `invariants`) are behind the
+# `backend-tests` gate, which this recipe passes.
 test-lbm:
-    cargo test -p rlx-lbm --features ir,backend-tests
+    cargo test -p rlx-lbm --features backend-tests
 
 # Static graph checker (`cargo rlx check`) — dispatch, fusion, shape/dtype and
 # numeric diagnostics. Device-free: CPU legality + all-target fusion, no GPU.
@@ -300,7 +299,8 @@ test:
     CPUS={{cpus}}
     # Integration test targets across the workspace sit behind
     # `required-features = "backend-tests"` and stay out of this default run —
-    # the fast smoke gate. The per-backend recipes (`just test-gpu`, `test-mlx`,
+    # the fast smoke gate — except for the one crate whose gate below is named
+    # package-qualified. The per-backend recipes (`just test-gpu`, `test-mlx`,
     # `test-rocm`, …) pass the feature explicitly, and `required-features` gates
     # a test *target*, so in those recipes the crates' lib unit tests run too —
     # except `rlx-metal`, whose manifest (fork-local) drops its lib unit tests,
@@ -314,23 +314,24 @@ test:
     # `hand-run` feature rather than `backend-tests`: every test in them is
     # `#[ignore]`d, so ungated this run links and executes sixteen binaries that run
     # nothing. `just test-workspace` and `just lint` enable that feature.
+    # One gate is named package-qualified: `rlx-lbm`'s graph targets sit behind
+    # its `backend-tests`, and a bare `--features backend-tests` here would turn
+    # that gate on for every crate in the contour. It resolves only while
+    # `rlx-lbm` stays in `default-members`.
+    lbm="--features rlx-lbm/backend-tests"
     if [[ "$(uname -s)" == Darwin ]]; then
         # A few parallel test binaries is enough; more contended Apple GPU.
         JOBS=$(( CPUS < 4 ? CPUS : 4 ))
-        cargo test --release -j "$JOBS"
+        cargo test --release -j "$JOBS" $lbm
     else
         # One test target that fails to compile aborts the whole workspace
         # run, `--no-fail-fast` or not — on the Linux rig that was seven
         # ungated Apple-only tests, and zero tests ran. Build every target
-        # first so the report names all of them.
-        cargo build --release --tests --keep-going -j "$CPUS"
-        cargo test --release -j "$CPUS" -- --test-threads="$CPUS"
+        # first so the report names all of them. The feature set has to match
+        # the test run's, or cargo rebuilds every crate for one of them.
+        cargo build --release --tests --keep-going -j "$CPUS" $lbm
+        cargo test --release -j "$CPUS" $lbm -- --test-threads="$CPUS"
     fi
-    # The default run builds each selected crate with its DEFAULT features, so
-    # a test target gated behind a non-default feature (or behind the
-    # `backend-tests` gate) is skipped without saying so. rlx-lbm's graph path
-    # is the case in tree; keep it in the gate.
-    cargo test --release -p rlx-lbm --features ir,backend-tests
     just test-debug-verifier restricted
 
 # Every member but the binding crates, once per upstream sync (see
@@ -358,7 +359,8 @@ test:
 # `backend-tests` (an AMX benchmark on formats this fork does not ship, an RPC
 # heartbeat, a roster and a dial row, two worker-spawn rows, the Metal/CUDA toolchain
 # compiles). The release gate passes that feature; the `--lib` run below keeps them in
-# THIS gate too.
+# THIS gate too. The two solvers are the same shape with their integration targets,
+# and have a row of their own.
 #
 # `--skip` matches a test *name*, not a file, which is why the list below is
 # names rather than a target. Each carries what it wants in the comment beside
@@ -388,6 +390,10 @@ test-workspace:
     cargo test --release -j "$JOBS" --lib \
         -p mahbot-rlx-cpu -p mahbot-rlx-driver -p rlx-distributed -p rlx-check -p mahbot-rlxsl \
         --features backend-tests
+    # The two solvers' graph paths: `ir` is a default, but their test targets sit
+    # behind their own `backend-tests`, which the `--workspace` run above does not
+    # pass (that would turn the gate on for every crate).
+    cargo test --release -j "$JOBS" -p rlx-fdm -p rlx-lbm --features backend-tests
 
 # Run the IR-verifier-bearing tests in a DEBUG profile.
 #
@@ -638,9 +644,12 @@ lint-workspace: lint-features
 lint-features:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Every row also passes `backend-tests`: `required-features` hides those
-    # targets from `--all-targets` too, so without it a row would type-check the
-    # combinations it exists for and silently skip their bodies.
+    # Every row passes `backend-tests` where the crate has it: `required-features`
+    # hides those targets from `--all-targets` too, so without it a row would
+    # type-check the combinations it exists for and silently skip their bodies.
+    # The two `--no-default-features` rows below are the exception: `mahbot-rlx-gguf`
+    # has no such feature, and the solvers' graph targets need the `ir` path those
+    # rows exist to remove.
     checked=(); skipped=()
     lint() {  # lint <label> <cargo args...>
         local label="$1"; shift
@@ -669,6 +678,14 @@ lint-features:
     # Default-off feature gates every host compiles.
     lint "rlx-flow formats"                 -p mahbot-rlx-flow    --features formats,backend-tests
     lint "rlx-cpu int8-gemv,portable-gemm"  -p mahbot-rlx-cpu     --no-default-features --features int8-gemv,portable-gemm
+    # `ir` is a default for these three, so the branches that exist only without
+    # it — the GGUF reader's plain-environment trace switch among them — are
+    # compiled by no other row. Defaults off, or the escape hatch rots. The GGUF
+    # reader needs its own invocation: the solvers' dev-dependencies reach
+    # rlx-cpu, which asks for `gguf/ir`, and feature unification would turn it
+    # back on.
+    lint "rlx-gguf no-default-features"         -p mahbot-rlx-gguf --no-default-features
+    lint "rlx-lbm,rlx-fdm no-default-features"  -p rlx-lbm -p rlx-fdm --no-default-features
     # `rlx-bench`'s frame-slicing harness measures the device path through a
     # `#[cfg(feature = "gpu")]` half that no other row's target set reaches.
     if cargo clippy -p rlx-bench --features gpu --example bench_frame_slicing -- -D warnings; then

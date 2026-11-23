@@ -50,7 +50,7 @@ fn build(nworld: usize) -> Graph {
 /// Fill `nworld` copies of a Taylor–Green field, each with its own amplitude so
 /// the worlds are distinguishable.
 fn initial_state(nworld: usize) -> Vec<Vec<f32>> {
-    let mut fields = vec![Vec::with_capacity(nworld * CELLS); 6];
+    let mut fields: Vec<Vec<f32>> = (0..6).map(|_| Vec::with_capacity(nworld * CELLS)).collect();
     for w in 0..nworld {
         let f = taylor_green(N, 0.02 + 0.01 * w as f64, 0.01);
         for y in 0..N {
