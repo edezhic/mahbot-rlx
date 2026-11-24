@@ -37,9 +37,13 @@
 //! engine exposes NO signal naming which `rlx-cpu` route served a comparison, so
 //! — rather than invent one — the reference is taken in the same process under
 //! identical conditions, with no process-global knob pinned for it (this file
-//! pins no knob at all). Each cell's `repeat_max_abs` re-runs that reference from
-//! a fresh `Session` and compares it element for element, so a reference-route
-//! change inside a cell would surface there rather than pass unnoticed.
+//! pins no knob at all). A one-row cell is the exception —
+//! `common::needs_f32_row_reference` states when and why — and is compared against the
+//! f32 row computed from the packed bytes (`common::f32_row_reference`, or the model
+//! block's host-dequantised twin).
+//! Each cell's `repeat_max_abs` re-runs the CPU session from a fresh `Session` and
+//! compares it element for element, so a reference-route change inside a cell
+//! would surface there rather than pass unnoticed.
 //! Cross-process reproducibility is 3 serial invocations of that same command
 //! with `--test-threads=1`, which a single test cannot observe.
 //!
@@ -130,6 +134,8 @@ struct Measured {
     /// failure dressed up as "input dependence".
     zero: Finiteness,
     max_abs: f32,
+    /// The magnitude of the side `max_abs` was taken against — the CPU session, or
+    /// the explicit f32 reference where the cell has one.
     cpu_max: f32,
     gpu_max: f32,
     zero_max: f32,
@@ -185,12 +191,17 @@ fn finiteness_census_counts_nan_and_both_infinities() {
 /// Real and zero input share ONE compiled graph, so `input_dep` measures the
 /// graph's input dependence rather than two compiles' disagreement; the
 /// in-process repeat check recompiles both backends from scratch.
+///
+/// `reference` replaces the CPU session as the side the device is compared against,
+/// where the session's answer is not the device's (`common::needs_f32_row_reference`).
+/// The session still runs, and `cpu`/`cpu2` still bound its own repeatability.
 fn measure(
     label: &str,
     g: &Graph,
     params: &[(String, Param)],
     x: &[f32],
     out_elems: usize,
+    reference: Option<&[f32]>,
 ) -> Measured {
     let zero = vec![0.0f32; x.len()];
     let mut cg = Session::new(Device::Gpu).compile(g.clone());
@@ -221,36 +232,47 @@ fn measure(
         assert_eq!(v.len(), out_elems, "{label}: {what} output length");
     }
 
+    // The side the device is compared against, and its own finiteness: an explicit
+    // f32 reference where the caller has one, the CPU session otherwise.
+    let reference = reference.unwrap_or(&cpu);
+    assert_eq!(
+        reference.len(),
+        out_elems,
+        "{label}: reference output length"
+    );
+
     // Counted before any fold — see `Finiteness`.
     let gpu_fin = Finiteness::count(&gpu);
     let cpu_fin = Finiteness::count(&cpu);
     let zero_fin = Finiteness::count(&gpu_zero);
     let gpu2_fin = Finiteness::count(&gpu2);
     let cpu2_fin = Finiteness::count(&cpu2);
+    let ref_fin = Finiteness::count(reference);
     assert!(
         gpu_fin.is_clean()
             && cpu_fin.is_clean()
             && zero_fin.is_clean()
             && gpu2_fin.is_clean()
-            && cpu2_fin.is_clean(),
+            && cpu2_fin.is_clean()
+            && ref_fin.is_clean(),
         "{label}: non-finite output — gpu={gpu_fin:?} cpu={cpu_fin:?} zero={zero_fin:?} \
-         gpu2={gpu2_fin:?} cpu2={cpu2_fin:?}"
+         gpu2={gpu2_fin:?} cpu2={cpu2_fin:?} ref={ref_fin:?}"
     );
 
     let measured = Measured {
         gpu: gpu_fin,
         cpu: cpu_fin,
         zero: zero_fin,
-        cpu_max: max_abs(&cpu),
+        cpu_max: max_abs(reference),
         gpu_max: max_abs(&gpu),
         zero_max: max_abs(&gpu_zero),
-        max_abs: max_diff(&cpu, &gpu),
+        max_abs: max_diff(reference, &gpu),
         input_dep: max_diff(&gpu, &gpu_zero),
         repeat_max_abs: max_diff(&gpu, &gpu2).max(max_diff(&cpu, &cpu2)),
     };
     assert!(
         measured.cpu_max.is_finite() && measured.cpu_max > 0.0,
-        "{label}: CPU reference is zero or non-finite (cpu_max={})",
+        "{label}: reference is zero or non-finite (cpu_max={})",
         measured.cpu_max
     );
     measured
@@ -653,8 +675,19 @@ fn run_case(cell: &Cell) -> CaseReport {
     g.set_outputs(vec![y]);
 
     let packed_bytes = packed.len();
+    // A one-row cell's reference is the f32 row rather than a CPU run of the packed
+    // graph — `common::needs_f32_row_reference`.
+    let reference = common::needs_f32_row_reference(m)
+        .then(|| common::f32_row_reference(ggml, &packed, &x, k, n));
     let params = vec![("w".to_string(), Param::U8(packed))];
-    let measured = measure(&label, &g, &params, &x, out_shape.iter().product());
+    let measured = measure(
+        &label,
+        &g,
+        &params,
+        &x,
+        out_shape.iter().product(),
+        reference.as_deref(),
+    );
     // The in-arena slab the planner booked for this graph, asked of the backend so
     // this evidence cannot drift from the route (`backend/compile/lower.rs` sizes
     // the scratch from the same call, on the post-fusion graph). It is zero by
@@ -1181,10 +1214,23 @@ fn print_memory(mem: &MemAcc) {
 /// re-quantize ~55M elements per pass; a name is used for one weight per block.
 type WeightCache = Vec<(String, Vec<u8>)>;
 
-/// Quantize a pseudo-random `[n, k]` weight in memory and register it as a U8
-/// param. `seed` decorrelates the weights so a cross-wired copy cannot pass.
-/// `cache` returns an already-quantized weight for the same name.
-fn add_packed_weight(
+/// Which side a block's projections are built on: the packed weights the device
+/// routes read, or their host-dequantised f32 images.
+///
+/// The f32 form is the reference graph where a CPU run of the packed one is not
+/// (`common::needs_f32_row_reference`).
+#[derive(Clone, Copy, PartialEq)]
+enum Weights {
+    Packed,
+    F32,
+}
+
+/// Quantize a pseudo-random `[n, k]` weight in memory and register it: as a U8 param,
+/// or — under [`Weights::F32`] — as the `[k, n]` f32 param `Op::MatMul` reads, from the
+/// same bytes dequantised. `seed` decorrelates the weights so a cross-wired copy cannot
+/// pass. `cache` returns an already-quantized weight for the same name.
+#[allow(clippy::too_many_arguments)]
+fn add_weight(
     g: &mut Graph,
     params: &mut Vec<(String, Param)>,
     name: &str,
@@ -1194,6 +1240,7 @@ fn add_packed_weight(
     seed: f32,
     mem: &mut MemAcc,
     cache: &mut WeightCache,
+    weights: Weights,
 ) -> rlx_ir::NodeId {
     let packed = match cache.iter().find(|(cached, _)| cached == name) {
         Some((_, bytes)) => bytes.clone(),
@@ -1206,11 +1253,39 @@ fn add_packed_weight(
             bytes
         }
     };
-    mem.packed_resident += packed.len();
     mem.f32_image_total += k * n * 4;
+    if weights == Weights::F32 {
+        let rows = rlx_gguf::dequant_typed(ggml, &packed, n * k, name).expect("dequant weight");
+        let mut t = vec![0f32; k * n];
+        for r in 0..n {
+            for c in 0..k {
+                t[c * n + r] = rows[r * k + c];
+            }
+        }
+        let node = g.param(name, Shape::new(&[k, n], DType::F32));
+        params.push((name.to_string(), Param::F32(t)));
+        return node;
+    }
+    mem.packed_resident += packed.len();
     let node = g.param(name, Shape::new(&[packed.len()], DType::U8));
     params.push((name.to_string(), Param::U8(packed)));
     node
+}
+
+/// One projection: the packed op the device routes read, or the plain f32 multiply the
+/// reference graph uses.
+fn project(
+    g: &mut Graph,
+    x: rlx_ir::NodeId,
+    w: rlx_ir::NodeId,
+    out: Shape,
+    scheme: QuantScheme,
+    weights: Weights,
+) -> rlx_ir::NodeId {
+    match weights {
+        Weights::Packed => g.add_node(Op::DequantMatMul { scheme }, vec![x, w], out),
+        Weights::F32 => g.add_node(Op::MatMul, vec![x, w], out),
+    }
 }
 
 /// A transformer-MLP block graph, the way a decoder layer is actually shaped:
@@ -1227,6 +1302,7 @@ fn build_mlp_block(
     i: usize,
     layers: usize,
     cache: &mut WeightCache,
+    weights: Weights,
 ) -> MlpBlock {
     let mut g = Graph::new("wgpu_gguf_mlp_block");
     // The 1-D `gamma`/`beta` params stay 1-D; everything else carries the batch.
@@ -1254,7 +1330,7 @@ fn build_mlp_block(
             f32_shape(h),
         );
 
-        let wg = add_packed_weight(
+        let wg = add_weight(
             &mut g,
             &mut params,
             &format!("wg{l}"),
@@ -1264,15 +1340,10 @@ fn build_mlp_block(
             l as f32 * 7.0,
             &mut mem,
             cache,
+            weights,
         );
-        let gate = g.add_node(
-            Op::DequantMatMul {
-                scheme: QuantScheme::GgufQ5K,
-            },
-            vec![hn, wg],
-            f32_shape(i),
-        );
-        let wu = add_packed_weight(
+        let gate = project(&mut g, hn, wg, f32_shape(i), QuantScheme::GgufQ5K, weights);
+        let wu = add_weight(
             &mut g,
             &mut params,
             &format!("wu{l}"),
@@ -1282,18 +1353,13 @@ fn build_mlp_block(
             l as f32 * 7.0 + 1.0,
             &mut mem,
             cache,
+            weights,
         );
-        let up = g.add_node(
-            Op::DequantMatMul {
-                scheme: QuantScheme::GgufQ6K,
-            },
-            vec![hn, wu],
-            f32_shape(i),
-        );
+        let up = project(&mut g, hn, wu, f32_shape(i), QuantScheme::GgufQ6K, weights);
         let act = g.add_node(Op::Activation(Activation::Silu), vec![gate], f32_shape(i));
         let a = g.add_node(Op::Binary(BinaryOp::Mul), vec![act, up], f32_shape(i));
 
-        let wd = add_packed_weight(
+        let wd = add_weight(
             &mut g,
             &mut params,
             &format!("wd{l}"),
@@ -1303,15 +1369,10 @@ fn build_mlp_block(
             l as f32 * 7.0 + 2.0,
             &mut mem,
             cache,
+            weights,
         );
-        let d = g.add_node(
-            Op::DequantMatMul {
-                scheme: QuantScheme::GgufQ8_0,
-            },
-            vec![a, wd],
-            f32_shape(h),
-        );
-        let wo = add_packed_weight(
+        let d = project(&mut g, a, wd, f32_shape(h), QuantScheme::GgufQ8_0, weights);
+        let wo = add_weight(
             &mut g,
             &mut params,
             &format!("wo{l}"),
@@ -1321,14 +1382,9 @@ fn build_mlp_block(
             l as f32 * 7.0 + 3.0,
             &mut mem,
             cache,
+            weights,
         );
-        let o = g.add_node(
-            Op::DequantMatMul {
-                scheme: QuantScheme::GgufQ4K,
-            },
-            vec![hn, wo],
-            f32_shape(h),
-        );
+        let o = project(&mut g, hn, wo, f32_shape(h), QuantScheme::GgufQ4K, weights);
         let s = g.add_node(Op::Binary(BinaryOp::Add), vec![d, o], f32_shape(h));
         cur = g.add_node(Op::Binary(BinaryOp::Add), vec![cur, s], f32_shape(h));
     }
@@ -1464,7 +1520,17 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
         (&[][..], 96usize),
         (&[][..], 192usize),
     ] {
-        let block = build_mlp_block(batch, m, H, I, LAYERS, &mut weight_cache);
+        let block = build_mlp_block(batch, m, H, I, LAYERS, &mut weight_cache, Weights::Packed);
+        // The reference for a one-row block: the same graph with every packed weight
+        // expanded to f32 (`common::needs_f32_row_reference`). The Q8_0 down-projection
+        // is what this cell needs it for — 4096 is a whole number of its 32-element
+        // blocks, so the arm takes it.
+        let reference = common::needs_f32_row_reference(m).then(|| {
+            let twin = build_mlp_block(batch, m, H, I, LAYERS, &mut weight_cache, Weights::F32);
+            let mut cc = Session::new(Device::Cpu).compile(twin.graph);
+            set_params(&mut cc, &twin.params);
+            cc.run(&[("x", &twin.x)]).remove(0)
+        });
         let label = format!("model mlp-block {LAYERS}L batch={batch:?} m={m} H={H} I={I}");
         // Q4_K (o-projection, k=H, n=H) and Q6_K (up, k=H, n=I) sit on the change
         // point: m=1 is the decode (per-row GEMV) side, and above one row the route
@@ -1510,6 +1576,7 @@ fn wgpu_gguf_dequant_prefill_route_grid_and_model_matches_cpu() {
             &block.params,
             &block.x,
             block.out_elems,
+            reference.as_deref(),
         );
         // Per-m parity tolerance. The block's residual stream reaches |y| in the
         // low thousands (two un-normalized MLP expansions, no downstream norm), so

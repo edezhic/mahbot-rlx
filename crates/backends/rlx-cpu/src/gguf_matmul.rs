@@ -10,7 +10,6 @@
 //! (llama.cpp-style); other schemes still fold one 256-element super-block
 //! at a time into stack storage.
 
-use crate::gguf_activation::fused_m1_quantizes_activation;
 use rlx_gguf::QK_K;
 use rlx_gguf::q2_dequant::{Q2_0_BLOCK_BYTES, Q8_0_G128_BYTES, QK2_0};
 use rlx_ir::quant::QuantScheme;
@@ -204,22 +203,20 @@ fn gguf_matmul_bt_ex(
     // when an intermediate node carries padding; the caller's k*n then
     // implies one more Q4K block than the GGUF actually stored. Clamp to
     // the bytes we actually have rather than panic in release mode.
-    let blocks_in_bytes = w_bytes.len() / block_bytes;
-    let num_blocks_computed = total_elems / block_elems;
-    if num_blocks_computed != blocks_in_bytes {
-        debug_assert_eq!(
-            w_bytes.len(),
-            num_blocks_computed * block_bytes,
-            "Q4K matmul: caller (k={k}, n={n}) implies {num_blocks_computed} blocks but w_bytes holds {blocks_in_bytes}"
-        );
-    }
-    let num_blocks = num_blocks_computed.min(blocks_in_bytes);
+    let num_blocks = packed_blocks(k, n, w_bytes.len(), scheme);
+    debug_assert_eq!(
+        w_bytes.len() / block_bytes,
+        total_elems / block_elems,
+        "Q4K matmul: caller (k={k}, n={n}) implies {} blocks but w_bytes holds {}",
+        total_elems / block_elems,
+        w_bytes.len() / block_bytes,
+    );
 
     let mut block_f32 = [0f32; QK_K];
 
     if m == 1 {
         let x_row = x;
-        if allow_parallel && num_blocks >= 32 && crate::pool::num_threads() > 1 {
+        if allow_parallel && m1_parallel_takes(num_blocks) {
             gguf_matmul_bt_m1_parallel(
                 x_row,
                 w_bytes,
@@ -402,6 +399,46 @@ fn q4k_fused_decode_min_n() -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// The fewest blocks of weight [`gguf_matmul_bt_ex`] takes its parallel single-row arm
+/// with.
+const M1_PARALLEL_MIN_BLOCKS: usize = 32;
+
+/// The blocks of weight a call of this shape actually holds — clamped to the bytes stored,
+/// as [`gguf_matmul_bt_ex`] needs, so a caller's `k`/`n` that imply more blocks than the
+/// GGUF carries is counted at what is there.
+#[inline]
+pub(crate) fn packed_blocks(k: usize, n: usize, w_len: usize, scheme: QuantScheme) -> usize {
+    (k * n / scheme.gguf_block_size() as usize).min(w_len / scheme.gguf_block_bytes() as usize)
+}
+
+/// Whether [`gguf_matmul_bt_ex`]'s parallel single-row arm takes a call with this many
+/// blocks of weight: a pool of more than one worker and at least
+/// [`M1_PARALLEL_MIN_BLOCKS`]. The single-row integer routes are reached through it rather
+/// than through a copy of its conditions, and a caller that allows no nesting
+/// ([`gguf_matmul_bt_serial`]) never reaches the arm at all.
+#[inline]
+pub(crate) fn m1_parallel_takes(blocks: usize) -> bool {
+    crate::pool::num_threads() > 1 && blocks >= M1_PARALLEL_MIN_BLOCKS
+}
+
+/// Whether an eight-bit single-row call of this shape is taken whatever the dequant cache
+/// holds, so its answer cannot depend on cache state and a harness's oracle is that arm's
+/// activation rather than the cached f32 route's.
+///
+/// True only for the calls [`crate::gguf_q8_0::takes`] names:
+/// [`gguf_matmul_bt_dispatch_at`] sends those to the fused kernel before the cache is
+/// consulted. Q2_0's arm there is the same arrangement but is inline and has a shape gate
+/// of its own, so what it does with a row it refuses is still the cache's to decide.
+#[inline]
+pub(crate) fn q8_0_arm_ignores_cache(
+    k: usize,
+    n: usize,
+    w_len: usize,
+    scheme: QuantScheme,
+) -> bool {
+    scheme == QuantScheme::GgufQ8_0 && crate::gguf_q8_0::takes(k, n, w_len)
+}
+
 #[inline]
 fn prefer_cached_blas(k: usize, n: usize, m: usize, scheme: QuantScheme) -> bool {
     if gguf_matmul_use_legacy() {
@@ -424,14 +461,16 @@ fn prefer_cached_blas(k: usize, n: usize, m: usize, scheme: QuantScheme) -> bool
         return false;
     }
     // Cache pressure skips the cache for every route whose fused arm leaves the numerics
-    // alone: `m > 1`, and every single-row scheme whose arm keeps f32 activations. There
+    // alone: `m > 1`, and every single-row call whose arm keeps f32 activations. There
     // the two routes do the same total dequant work and the fused one skips the
     // bookkeeping. The schemes whose arm rounds the activation
-    // ([`fused_m1_quantizes_activation`]) keep the cached route whatever the budget does:
-    // `cache_thrashing()` is monotone process state that never reverts, so diverting them
-    // would flip one process's answer part-way through — the defect
-    // `tests/gguf_single_row_cache_pressure.rs` pins.
-    if crate::dequant_cache::cache_thrashing() && (m > 1 || !fused_m1_quantizes_activation(scheme))
+    // ([`crate::gguf_activation::fused_m1_quantizes_activation`]) keep the cached route
+    // whatever the budget does: `cache_thrashing()` is monotone process state that never
+    // reverts, so diverting them would flip one process's answer part-way through — the
+    // defect `tests/gguf_single_row_cache_pressure.rs` pins. The eight-bit arm's taken
+    // calls never get here: the dispatch diverts them before the cache is consulted.
+    if crate::dequant_cache::cache_thrashing()
+        && (m > 1 || !crate::gguf_activation::fused_m1_quantizes_activation(scheme))
     {
         return false;
     }
@@ -538,6 +577,16 @@ pub fn gguf_matmul_bt_dispatch_at(
         && crate::pool::num_threads() > 1
         && !rlx_ir::reproducible::reproducible()
     {
+        gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
+        return;
+    }
+    // Q8_0 decode GEMV: the integer dot beats the f32 unpack on every shape the code
+    // predictor has, and it rounds the activation, so it is taken whatever the cache
+    // holds — a route that moved with the cache would answer one call differently from
+    // the next in the same process. Default-on, runtime-detected, aarch64 only;
+    // `RLX_Q8_0_EXACT_GEMV` is the bisect handle that puts the f32 route back. (Q2_0's
+    // arm above is the same arrangement and has already returned.)
+    if m == 1 && q8_0_arm_ignores_cache(k, n, w_bytes.len(), scheme) {
         gguf_matmul_bt(x, w_bytes, out, m, k, n, scheme);
         return;
     }
@@ -1129,7 +1178,16 @@ fn gguf_matmul_bt_m1_parallel(
     {
         return;
     }
-    // Every other scheme (Q5_K / Q2_K / Q3_K / Q8_0 / IQ*): row-parallel,
+    // Q8_0: the code predictor's every multiply, dotted as integers against one
+    // Q8_K-quantised activation row instead of 32 elements at a time through a f32
+    // unpack. aarch64 only; x86-64 reaches the same width through `int8-gemv`.
+    if scheme == QuantScheme::GgufQ8_0
+        && out.len() == n
+        && crate::gguf_q8_0::gemv(x_row, w_bytes, out, k)
+    {
+        return;
+    }
+    // Every other scheme (Q5_K / Q2_K / Q3_K / IQ*): row-parallel,
     // division-free generic GEMV whenever `k` is a whole number of blocks.
     if k.is_multiple_of(block_elems) && block_elems <= QK_K && out.len() == n {
         gguf_matmul_bt_m1_rows_generic(x_row, w_bytes, out, k, scheme, block_bytes, block_elems);
@@ -1465,9 +1523,9 @@ fn q4k_scale_min(j: usize, q: &[u8]) -> (u8, u8) {
 /// Apple Silicon / Graviton2+ / most ARM servers have it; Cortex-A72 (Pi 4)
 /// does not. Detected once; the result is a hot-loop branch predictor's dream.
 ///
-/// The one feature check for the whole crate: [`crate::gguf_q6k`]'s six-bit row
-/// dot asks the same question, and `RLX_Q4K_NO_DOTPROD=1` pins both to the
-/// baseline arm.
+/// The one feature check for the whole crate: Q4_K's group dot, the six-bit and
+/// eight-bit row dots, and the choice between each route's `dotprod` and baseline arms
+/// all ask it, and `RLX_Q4K_NO_DOTPROD=1` pins them all to the baseline.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub(crate) fn aarch64_has_dotprod() -> bool {
@@ -2165,7 +2223,7 @@ mod tests {
         let scheme = QuantScheme::GgufQ8K;
         let block_elems = scheme.gguf_block_size() as usize;
         let block_bytes = scheme.gguf_block_bytes() as usize;
-        let num_blocks = (k * n / block_elems).min(packed.len() / block_bytes);
+        let num_blocks = packed_blocks(k, n, packed.len(), scheme);
         let mut seq = vec![0f32; n];
         let mut par = vec![0f32; n];
         gguf_matmul_bt_m1_sequential(
@@ -2178,7 +2236,7 @@ mod tests {
             block_elems,
             k,
         );
-        if num_blocks >= 32 && crate::pool::num_threads() > 1 {
+        if m1_parallel_takes(num_blocks) {
             gguf_matmul_bt_m1_parallel(
                 &x,
                 &packed,

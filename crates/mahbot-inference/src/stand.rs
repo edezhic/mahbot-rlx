@@ -77,9 +77,11 @@ const SHORT_SAMPLES: usize = 10 * 16_000;
 const TYPICAL_SAMPLES: usize = 30 * 16_000;
 
 /// The two synthesis requests: a greeting and a sentence about a sentence. The
-/// greeting is the short request a read-back harness reads too, so it is named once.
+/// greeting is the short request a read-back harness reads too, so it is named once;
+/// the sentence is the long row's request, which the same harness renders and reads
+/// back to give that row a word gate of its own.
 pub const SHORT_TEXT: &str = "Hello, how are you today?";
-const TYPICAL_TEXT: &str = "The weather this morning is quiet and cool, so I will walk down to \
+pub const TYPICAL_TEXT: &str = "The weather this morning is quiet and cool, so I will walk down to \
      the harbour and watch the boats come in before the shops open.";
 /// The draw seed both requests are synthesised from; the read-back harness reads the
 /// short request with it, so it is named here too.

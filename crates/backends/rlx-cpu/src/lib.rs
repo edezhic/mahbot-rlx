@@ -54,8 +54,10 @@ pub use rlx_linux_ref::lapack as numpy_lapack;
 pub use rlx_linux_ref::openblas as numpy_openblas;
 pub mod gdn;
 mod gguf_activation;
+mod gguf_m1;
 pub mod gguf_matmul;
 mod gguf_q6k;
+mod gguf_q8_0;
 pub mod gguf_scheme;
 mod gguf_tiled;
 pub mod iir; // IIR biquad zero-phase Butterworth filtering (filter-bank front-end)

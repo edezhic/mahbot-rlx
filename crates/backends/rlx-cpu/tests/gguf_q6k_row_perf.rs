@@ -34,7 +34,7 @@ const ROUNDS: usize = 5;
 #[test]
 #[ignore = "manual kernel timing"]
 fn q6k_row_route_perf() {
-    if !rlx_cpu::routing::SIX_BIT_ROUTE_COMPILED {
+    if !rlx_cpu::routing::SINGLE_ROW_ROUTE_COMPILED {
         // The route is aarch64-only and `RLX_Q6K_EXACT_GEMV` is a no-op elsewhere,
         // so both arms would run the same f32 route under two labels.
         eprintln!("six-bit single-row route: not compiled on this target — nothing to compare");

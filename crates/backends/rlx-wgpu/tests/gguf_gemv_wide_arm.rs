@@ -15,12 +15,13 @@
 //!
 //! What it pins, per scheme the arm carries (Q4_K, Q6_K, Q8_0) at `m = 1` and the
 //! widths the model bodies use: the overrides reach the encoder (`gemv_one_row_shape`
-//! records which entry ran), the result matches the CPU reference of the same op, and
-//! no value is non-finite. The bar is not bit identity: the wide arm reduces a column
-//! with `subgroupAdd`, a tree whose shape the subgroup width sets, while the tiled arm's
-//! is a fixed workgroup-memory one, so a different order of the same fp32 sum is
-//! expected. `1e-2` is the bar every packed multiply in this crate is compared at,
-//! these shapes included (`gguf_matmul_route.rs`).
+//! records which entry ran), the result matches the exact f64 row the kernels themselves
+//! multiply (`common::f32_row_reference`) — not a CPU run of the packed graph, whose
+//! single-row arms may round the activation — and no value is non-finite. The bar is not
+//! bit identity: the wide arm reduces a column with `subgroupAdd`, a tree whose shape the
+//! subgroup width sets, while the tiled arm's is a fixed workgroup-memory one, so a
+//! different order of the same fp32 sum is expected. `1e-2` is the bar every packed
+//! multiply in this crate is compared at, these shapes included (`gguf_matmul_route.rs`).
 //!
 //! One `#[test]` on purpose: the override is process-global (`RuntimeOverrides`
 //! installs into one shared map), so a second cell running in parallel in this process
@@ -174,7 +175,8 @@ fn the_subgroup_arm_matches_the_cpu_reference_on_every_scheme_it_carries() {
                          subgroup entry ran"
                     );
                 }
-                let cpu = run(Device::Cpu, g, &packed, &x);
+                // The f32 row, not a CPU run — `common::f32_row_reference`.
+                let cpu = common::f32_row_reference(ggml, &packed, &x, k, n);
                 let max_abs = max_abs_diff(&gpu, &cpu);
                 eprintln!(
                     "[gguf-gemv-wide] knob={label} scheme={scheme:?} m=1 k={k} n={n} \
@@ -187,7 +189,7 @@ fn the_subgroup_arm_matches_the_cpu_reference_on_every_scheme_it_carries() {
                 // for a packed multiply at these shapes.
                 assert!(
                     max_abs <= 1e-2,
-                    "{scheme:?} m=1 k={k} n={n} [{label}]: the arm is {max_abs} from the CPU \
+                    "{scheme:?} m=1 k={k} n={n} [{label}]: the arm is {max_abs} from the \
                      reference"
                 );
                 assert!(

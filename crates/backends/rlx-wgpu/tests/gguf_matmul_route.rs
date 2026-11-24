@@ -613,12 +613,16 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
             // the row slices are invalid and a broken staging would show as a wrong
             // or non-finite value, not as a wrong counter. So are the cells that
             // left the slab for Q8_0's arms — the fused multi-row GEMM's, whose
-            // first evidence against the CPU reference is the grid's own shapes
+            // first evidence in the numeric check below is the grid's own shapes
             // rather than only the packed steps' the throughput block below uses,
             // and the one-row branch's, whose block stride a counter cannot see
             // either.
             if want == (0, 0, 0, 0, 1) || byte_direct || one_row {
-                let cpu = run(Device::Cpu, g, &packed, &x);
+                let cpu = if common::needs_f32_row_reference(m) {
+                    common::f32_row_reference(ggml, &packed, &x, k, n)
+                } else {
+                    run(Device::Cpu, g, &packed, &x)
+                };
                 let max_abs = max_abs_diff(&gpu, &cpu);
                 let tol = packed_bar_at(c.coop > 0, common::magnitude(&cpu));
                 eprintln!(
@@ -1230,7 +1234,8 @@ fn gguf_matmul_routes_are_reported_and_weight_windows_are_chunked() {
                          rows: {shape:?}"
                     );
                 }
-                let cpu = run(Device::Cpu, g, &packed, &x);
+                // The f32 row, not a CPU run — `common::f32_row_reference`.
+                let cpu = common::f32_row_reference(ggml, &packed, &x, k, n);
                 let max_abs = max_abs_diff(&gpu, &cpu);
                 eprintln!(
                     "one-row shape {scheme:?} k={k} n={n} batch={batch:?}: max_abs={max_abs:.6e}"

@@ -22,7 +22,7 @@ mod common;
 use common::{activation, max_rel_err, packed};
 use rlx_cpu::dequant_cache::clear_dequant_cache;
 use rlx_cpu::gguf_matmul::{gguf_matmul_bt, gguf_matmul_bt_dispatch_at};
-use rlx_cpu::routing::quantizes_activation;
+use rlx_cpu::routing::{q8_0_arm_ignores_cache, rounds_to_q8k_at};
 use rlx_gguf::GgmlType;
 use rlx_ir::quant::QuantScheme;
 
@@ -46,10 +46,24 @@ const SCHEMES: [(QuantScheme, GgmlType); 4] = [
 #[test]
 #[ignore = "manual kernel timing"]
 fn single_row_route_perf() {
+    // Mask the ambient knobs that could select a different route, so a shell's
+    // `RLX_REPRODUCIBLE` or `RLX_GGUF_MATMUL_LEGACY` cannot put a cached f32 row
+    // under an arm label. Scoped to this thread, as the sibling harnesses are.
+    let _reproducible = rlx_ir::env::scoped("RLX_REPRODUCIBLE", "0");
+    let _legacy = rlx_ir::env::scoped("RLX_GGUF_MATMUL_LEGACY", "0");
     let x = activation(K);
     eprintln!(
         "m=1 k={K} n={N} x{TENSORS}: {} MiB of f32 per scheme, budget {BUDGET} B",
         (K * N * 4 * TENSORS) >> 20
+    );
+    // What the error column prices, in the output rather than only here: the oracle is the
+    // f32 activation, so an arm that rounds its activation reads order one against it, and
+    // an unexplained 1e0 next to a 1e-4 bound reads like a broken kernel.
+    eprintln!(
+        "    max rel err is against an f64 dot of the dequantised weight and the f32 \
+         activation: an arm that rounds its activation reads ~1e0 there by design — the \
+         rounding, amplified by the dot's cancellation, not a kernel error — and is held to \
+         1e-4 against that rounded activation by gguf_single_row_cache_pressure.rs"
     );
 
     for (scheme, ggml) in SCHEMES {
@@ -100,57 +114,80 @@ fn single_row_route_perf() {
         };
         let fused = |t: usize, out: &mut [f32]| gguf_matmul_bt(&x, &blobs[t], out, 1, K, N, scheme);
         // The packed arm both the cache-off dispatch and the direct fused call
-        // reach. For a scheme whose arm rounds the activation it is the integer
-        // dot, so the row says so and its `max rel err` is that arm's.
-        let rounds = quantizes_activation(scheme);
+        // reach, asked for this call's shape: a one-worker pool or too few blocks
+        // multiplies f32 there, and the row must not call that an int8 arm.
+        let rounds = rounds_to_q8k_at(K, N, blobs[0].len(), scheme);
         let packed = if rounds {
             "packed, int8 activations"
         } else {
             "packed, accurate"
         };
+        // An arm that ignores the cache takes that route under every budget, so the
+        // budget rows are that arm's too rather than the cached f32 route's.
+        let ignores_cache = q8_0_arm_ignores_cache(K, N, blobs[0].len(), scheme);
+        let under = if ignores_cache {
+            "int8 activations"
+        } else {
+            "accurate"
+        };
+        let fits = format!("{under}, working set fits");
+        // "(after)" marks the row that runs once the latch has tripped.
+        let thrashing = format!(
+            "{under}, budget < working set{}",
+            if ignores_cache { "" } else { " (after)" }
+        );
 
         eprintln!("{scheme:?}");
         // Each arm carries its own switches, scoped to it: a process-wide `set` would
         // outlive the arm that asked for it and hand the next one a route it never
         // configured.
-        // The working-set-fits case, unchanged by the routing change.
+        // The working-set-fits case, unchanged by the routing change where the cache
+        // decides the route.
         {
             let _cache = rlx_ir::env::scoped("RLX_DEQUANT_CACHE", "1");
             let _budget = rlx_ir::env::scoped("RLX_DEQUANT_CACHE_MAX_BYTES", UNBOUNDED.to_string());
-            bench("accurate, working set fits", &dispatch);
+            bench(&fits, &dispatch);
         }
         // The harness's case.
         {
             let _cache = rlx_ir::env::scoped("RLX_DEQUANT_CACHE", "1");
             let _budget = rlx_ir::env::scoped("RLX_DEQUANT_CACHE_MAX_BYTES", BUDGET.to_string());
-            bench("accurate, budget < working set (after)", &dispatch);
+            bench(&thrashing, &dispatch);
         }
         // What the harness saw with the budget off.
         {
             let _cache = rlx_ir::env::scoped("RLX_DEQUANT_CACHE", "0");
             bench(&format!("{packed}, RLX_DEQUANT_CACHE=0"), &dispatch);
         }
-        // The arm the thrash diversion selects where its numerics are unchanged,
-        // and what a caller of `gguf_matmul_bt` gets directly.
+        // The arm the thrash diversion selects where its numerics are unchanged, and
+        // what a caller of `gguf_matmul_bt` gets directly.
         {
             let _cache = rlx_ir::env::scoped("RLX_DEQUANT_CACHE", "1");
             let _budget = rlx_ir::env::scoped("RLX_DEQUANT_CACHE_MAX_BYTES", BUDGET.to_string());
-            bench(
-                &format!("{packed}, fused (thrash-diversion target)"),
-                &fused,
-            );
+            let label = if ignores_cache {
+                format!("{packed}, fused (a direct call's arm)")
+            } else {
+                format!("{packed}, fused (thrash-diversion target)")
+            };
+            bench(&label, &fused);
         }
         // A rounding arm has an exact counterpart behind an env switch — the row
-        // shows what the rounding buys. (The six-bit switch is read by the aarch64
-        // kernel only, so an x86-64 `int8-gemv` host repeats the row above.)
+        // shows what the rounding buys. (The six-bit and eight-bit switches are read by
+        // the aarch64 kernels only, so an x86-64 `int8-gemv` host repeats the row above.)
+        // The exact arm is also the route the scheme took before its integer arm existed,
+        // so its row is this harness's "against the previous tree" reading.
         let switch = match scheme {
             QuantScheme::GgufQ4K => Some("RLX_Q4K_EXACT_GEMV"),
             QuantScheme::GgufQ6K => Some("RLX_Q6K_EXACT_GEMV"),
+            QuantScheme::GgufQ8_0 => Some("RLX_Q8_0_EXACT_GEMV"),
             _ => None,
         };
         if let (true, Some(switch)) = (rounds, switch) {
             let _exact = rlx_ir::env::scoped(switch, "1");
-            bench(&format!("fused, exact activations ({switch})"), &fused);
+            bench(
+                &format!("fused, exact activations ({switch}; the previous tree's route)"),
+                &fused,
+            );
         }
     }
 

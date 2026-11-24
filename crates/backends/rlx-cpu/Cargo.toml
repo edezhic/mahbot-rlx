@@ -283,3 +283,7 @@ required-features = ["backend-tests"]
 [[test]]
 name = "gguf_q6k_row_perf"
 required-features = ["backend-tests"]
+
+[[test]]
+name = "gguf_q8_0_row_perf"
+required-features = ["backend-tests"]

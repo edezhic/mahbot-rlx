@@ -235,11 +235,53 @@ fn the_processor_reads_the_recording() {
     );
 }
 
+/// The checks a render must pass whatever its text: finite, inside the PCM range, whole
+/// frames and at least a second of speech. Prints its length and waveform digest under
+/// `label`, and returns the digest for a caller that has something to compare it with.
+fn rendered(label: &str, wave: &[f32]) -> u64 {
+    assert_eq!(
+        report::non_finite(wave),
+        0,
+        "the {label} waveform is finite"
+    );
+    assert!(
+        report::max_abs(wave) <= 1.0,
+        "the {label} waveform leaves the PCM range"
+    );
+    let frame = mahbot_inference::graphs::samples_per_frame();
+    assert!(
+        wave.len() >= SAMPLE_RATE as usize && wave.len().is_multiple_of(frame),
+        "the {label} render is {} samples, not whole {frame}-sample frames and at least a \
+         second of speech",
+        wave.len()
+    );
+    let digest = report::digest(wave);
+    println!(
+        "processor {label} samples={} frames={} seconds={:.2} digest={digest:016x}",
+        wave.len(),
+        wave.len() / frame,
+        wave.len() as f64 / f64::from(SAMPLE_RATE),
+    );
+    digest
+}
+
 /// **Synthesis on the processor, heard back through the same product.** The stand's short request
 /// at the stand's seed, rendered twice — the two calls must agree in length and waveform digest,
 /// because the first call of a process once answered differently from every later one — and then
 /// heard back through the recognition call, which must reach the text's closing words exactly as
-/// the round trip demands of a graphics render.
+/// the round trip demands of a graphics render. The stand's 129-character request is rendered and
+/// heard back too: it is the other row the eight-bit route moved, and the short request's words
+/// alone would not say whether a longer render still reads as asked.
+///
+/// Two ambient switches are masked for the whole check, through the process-wide override and
+/// restored — not thread-scoped: the schedule runs on a pool worker by default
+/// (`RLX_CPU_EXEC_IN_POOL`), so a thread-local override would not be visible where the route
+/// reads it. `RLX_Q8_0_EXACT_GEMV` puts the f32 route back, which renders different words,
+/// and a diagnostic handle must not be able to redden a gate that prices the shipped route.
+/// `RLX_REPRODUCIBLE` stands every single-row integer route down: a supported run mode, not a
+/// handle, and its own long render does not close on the text's last four words today (80 frames,
+/// heard back as "…before the show"). That is a question about the mode's numerics, not about the
+/// route this gate prices; it is recorded here rather than absorbed.
 ///
 /// **What it does not establish.** Nothing about the waveform's agreement with the graphics
 /// device's: the processor's numerics are its own.
@@ -248,59 +290,64 @@ fn the_processor_reads_the_recording() {
 fn the_processor_renders_the_request_and_hears_it_back() {
     let _alone = force_processor();
     support::assert_tail_group_shipped();
-    let Some((dir, body, sound)) = support::pair_paths(Role::Synthesis, &[]) else {
-        return;
-    };
-    let mut engine =
-        Synthesis::new(support::open_pair(&dir, body, sound)).expect("the synthesis path");
-    let wave = engine
-        .synthesize(stand::SHORT_TEXT, stand::SYNTH_SEED)
-        .expect("the processor's synthesis call");
-    assert_settled_on_the_processor();
-    assert_eq!(report::non_finite(&wave), 0, "the waveform is finite");
-    assert!(
-        report::max_abs(&wave) <= 1.0,
-        "the waveform leaves the PCM range"
-    );
-    let frame = mahbot_inference::graphs::samples_per_frame();
-    assert!(
-        wave.len() >= SAMPLE_RATE as usize && wave.len().is_multiple_of(frame),
-        "the render is {} samples, not whole {frame}-sample frames and at least a second of \
-         speech",
-        wave.len()
-    );
-    let digest = report::digest(&wave);
-    println!(
-        "processor render samples={} frames={} seconds={:.2} digest={digest:016x}",
-        wave.len(),
-        wave.len() / frame,
-        wave.len() as f64 / f64::from(SAMPLE_RATE),
-    );
-    // The same text and the same seed must give the same waveform, bit for bit.
-    let again = engine
-        .synthesize(stand::SHORT_TEXT, stand::SYNTH_SEED)
-        .expect("the processor's second synthesis call");
-    assert_eq!(
-        (again.len(), report::digest(&again)),
-        (wave.len(), digest),
-        "the second call of the process rendered a different waveform from the first"
-    );
+    support::with_env("RLX_REPRODUCIBLE", "0", || {
+        support::with_env("RLX_Q8_0_EXACT_GEMV", "0", || {
+            let Some((dir, body, sound)) = support::pair_paths(Role::Synthesis, &[]) else {
+                return;
+            };
+            let mut engine =
+                Synthesis::new(support::open_pair(&dir, body, sound)).expect("the synthesis path");
+            let wave = engine
+                .synthesize(stand::SHORT_TEXT, stand::SYNTH_SEED)
+                .expect("the processor's synthesis call");
+            assert_settled_on_the_processor();
+            let digest = rendered("render", &wave);
+            // The same text and the same seed must give the same waveform, bit for bit.
+            let again = engine
+                .synthesize(stand::SHORT_TEXT, stand::SYNTH_SEED)
+                .expect("the processor's second synthesis call");
+            assert_eq!(
+                (again.len(), report::digest(&again)),
+                (wave.len(), digest),
+                "the second call of the process rendered a different waveform from the first"
+            );
 
-    // The render's weights go back before the recogniser's are asked for, as the round trip
-    // does in the other direction.
-    drop(engine);
-    mahbot_inference::release_process_memory();
-    let Some((dir, body, sound)) = support::pair_paths(Role::Recognition, &[CED_MODEL]) else {
-        return;
-    };
-    let pair = support::open_pair(&dir, body, sound);
-    let tagger = Tagger::open(&dir.join(CED_MODEL))
-        .unwrap_or_else(|error| panic!("{}: {error:#}", dir.join(CED_MODEL).display()));
-    let mut transcriber = Transcriber::open(pair, tagger, support::ceiling_mib())
-        .expect("the transcriber reopens on the processor");
-    let hearing = support::heard(&mut transcriber, "processor render", &wave, SAMPLE_RATE);
-    assert!(
-        reference::check_speak_roundtrip(&hearing, stand::SHORT_TEXT),
-        "the processor's render does not pass the round trip"
-    );
+            // The stand's other synthesis row, rendered once: it is the row the eight-bit route
+            // moved most, and the words are its witness.
+            let long = engine
+                .synthesize(stand::TYPICAL_TEXT, stand::SYNTH_SEED)
+                .expect("the processor's long synthesis call");
+            // Its digest is printed by the check and has nothing here to be compared with.
+            rendered("long render", &long);
+
+            // The render's weights go back before the recogniser's are asked for, as the round trip
+            // does in the other direction.
+            drop(engine);
+            mahbot_inference::release_process_memory();
+            let Some((dir, body, sound)) = support::pair_paths(Role::Recognition, &[CED_MODEL])
+            else {
+                return;
+            };
+            let pair = support::open_pair(&dir, body, sound);
+            let tagger = Tagger::open(&dir.join(CED_MODEL))
+                .unwrap_or_else(|error| panic!("{}: {error:#}", dir.join(CED_MODEL).display()));
+            let mut transcriber = Transcriber::open(pair, tagger, support::ceiling_mib())
+                .expect("the transcriber reopens on the processor");
+            let hearing = support::heard(&mut transcriber, "processor render", &wave, SAMPLE_RATE);
+            assert!(
+                reference::check_speak_roundtrip(&hearing, stand::SHORT_TEXT),
+                "the processor's render does not pass the round trip"
+            );
+            let long_hearing = support::heard(
+                &mut transcriber,
+                "processor long render",
+                &long,
+                SAMPLE_RATE,
+            );
+            assert!(
+                reference::check_speak_roundtrip(&long_hearing, stand::TYPICAL_TEXT),
+                "the processor's long render does not pass the round trip"
+            );
+        });
+    });
 }

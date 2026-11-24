@@ -9,10 +9,17 @@
 //! `pub(crate)` item cannot be re-exported as `pub`, hence the wrappers.
 use rlx_ir::quant::QuantScheme;
 
-/// Whether the six-bit single-row route is compiled in — aarch64 only, so
-/// `RLX_Q6K_EXACT_GEMV` is a no-op everywhere else and a harness measuring that route
-/// must say which host it measured on.
-pub const SIX_BIT_ROUTE_COMPILED: bool = crate::gguf_q6k::COMPILED;
+/// Whether a single-row integer route is compiled in — aarch64 only, so the exact
+/// switches are no-ops elsewhere and a harness measuring one must say which host it
+/// measured on. The same fact the routes themselves read
+/// ([`crate::gguf_m1::COMPILED`]).
+pub const SINGLE_ROW_ROUTE_COMPILED: bool = crate::gguf_m1::COMPILED;
+
+/// Whether an eight-bit single-row call of this shape is taken whatever the dequant cache
+/// holds — the fact an oracle's activation rests on.
+pub fn q8_0_arm_ignores_cache(k: usize, n: usize, w_len: usize, scheme: QuantScheme) -> bool {
+    crate::gguf_matmul::q8_0_arm_ignores_cache(k, n, w_len, scheme)
+}
 
 /// Whether the single-row arm rounds the activation at all.
 pub fn quantizes_activation(scheme: QuantScheme) -> bool {
@@ -25,6 +32,12 @@ pub fn rounds_to_q8k(scheme: QuantScheme) -> bool {
         crate::gguf_activation::activation(scheme),
         crate::gguf_activation::Activation::Q8K
     )
+}
+
+/// [`rounds_to_q8k`] for the call's shape, so a harness's oracle is the arm the call
+/// reaches rather than the one the scheme names.
+pub fn rounds_to_q8k_at(k: usize, n: usize, w_len: usize, scheme: QuantScheme) -> bool {
+    crate::gguf_activation::rounds_to_q8k_at(k, n, w_len, scheme)
 }
 
 /// Why the multi-row tiled route does not take a shape on this host, or `None` when it

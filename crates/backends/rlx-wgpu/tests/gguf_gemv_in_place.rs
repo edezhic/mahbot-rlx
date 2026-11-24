@@ -24,10 +24,11 @@
 //! What this does not claim: that a sharded arena or a truncated window stores in
 //! place (those calls keep the slab by design — `gemv_in_place_out_window` names
 //! them), or anything about timing. The numeric bar is the cell's per-multiply one —
-//! a relative difference of at most 2e-6 of the row's own max |y| against the CPU
-//! arm, whose summation order is the only difference — and it is held at Q8_0 as
-//! well as Q4_K: Q8_0 is the scheme the code predictor stores, so a Q8_0 cell that
-//! drifted to 1e-3 would otherwise pass every numeric gate in this crate.
+//! a relative difference of at most 2e-6 of the row's own max |y| against the f32 row's
+//! own dot ([`common::f32_row_reference`]), which differs from the kernel's in
+//! accumulation width as well as order. It is held on the Q8_0 cell because that is the
+//! scheme the code predictor stores, so a Q8_0 cell that drifted to 1e-3 would otherwise
+//! pass every numeric gate in this crate.
 mod common;
 
 use common::max_abs_diff;
@@ -103,7 +104,8 @@ fn a_one_row_multiply_stores_into_the_arena_and_allocates_no_output_slab() {
     let (kq, nq) = (1024usize, 1024usize);
     let (gq, packedq, xq) = case_q8_0(1, kq, nq);
     let gpuq = run(Device::Gpu, gq.clone(), &packedq, &xq);
-    let cpuq = run(Device::Cpu, gq, &packedq, &xq);
+    // The f32 row, not a CPU run of the packed graph — `common::f32_row_reference`.
+    let cpuq = common::f32_row_reference(rlx_gguf::GgmlType::Q8_0, &packedq, &xq, kq, nq);
     let max_abs_q = max_abs_diff(&gpuq, &cpuq);
     let scale_q = cpuq.iter().fold(0f32, |m, v| m.max(v.abs()));
     let rel_q = max_abs_q / scale_q;
@@ -113,8 +115,8 @@ fn a_one_row_multiply_stores_into_the_arena_and_allocates_no_output_slab() {
         pooled_out_buf_bytes()
     );
     // A relative bar: a 1e-2 absolute one passes a result that has lost five digits
-    // on a small row and fails an exact one on a large row. 2e-6 is the cell's
-    // per-multiply bound, and the summation order is the only thing that differs.
+    // on a small row and fails an exact one on a large row. What it bounds is this
+    // kernel's own summation order against the exact f32 row: it reads 8.553e-7.
     assert!(
         rel_q <= 2e-6,
         "one-row Q8_0 k={kq} n={nq}: |Δ| {max_abs_q:.3e} is {rel_q:.3e} of the row's max |y| \

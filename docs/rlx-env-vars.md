@@ -13,14 +13,14 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 832  
+**Registered names:** 833  
 **Unregistered mentions (migration leftovers):** 107
 
 ## Groups
 
 - [compile](#compile) — 32
 - [coreml](#coreml) — 20
-- [cpu](#cpu) — 40
+- [cpu](#cpu) — 41
 - [cuda](#cuda) — 77
 - [debug](#debug) — 21
 - [device](#device) — 4
@@ -143,8 +143,9 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_PAR_THRESHOLD` | Bisect | U64 | Backend(cpu) | Minimum element count before an op dispatches in parallel |
 | `RLX_Q4K_EXACT_GEMV` | Internal | Bool | Backend(cpu) | Q4_K decode GEMV dequantizes to f32 per block instead of quantizing the activation to Q8_K (exact, slower) |
 | `RLX_Q4K_FUSED_MIN_N` | Internal | String | Backend(cpu) | n above which the fused Q4_K kernel is used instead of dequant |
-| `RLX_Q4K_NO_DOTPROD` | Internal | String | Backend(cpu) | Force the baseline path instead of the dotprod intrinsics, for both the Q4_K and the Q6_K single-row integer dots |
+| `RLX_Q4K_NO_DOTPROD` | Internal | String | Backend(cpu) | Force the baseline path instead of the dotprod intrinsics, for the Q4_K, Q6_K and Q8_0 single-row integer dots |
 | `RLX_Q6K_EXACT_GEMV` | Internal | Bool | Backend(cpu) | aarch64 only: Q6_K decode GEMV dequantizes to f32 per block instead of quantizing the activation to Q8_K (exact, slower). A no-op on x86-64, where that arm is the int8-gemv kernel |
+| `RLX_Q8_0_EXACT_GEMV` | Internal | Bool | Backend(cpu) | aarch64 only: Q8_0 decode GEMV keeps f32 activations instead of quantizing them to Q8_K (exact, slower). A no-op on x86-64, where that arm is the int8-gemv kernel |
 | `RLX_SDPA_BLOCK_MIN` | Bisect | U64 | Backend(cpu) | Score-matrix size (floats, default 4M) above which CPU attention runs row-blocked |
 | `RLX_SDPA_THRESHOLD` | Bisect | U64 | Backend(cpu) | Sequence length above which SDPA switches from NEON dots to BLAS sgemm |
 | `RLX_VMATH_ACCURATE` | Public | BoolOr | Backend(cpu) | CPU vmath exp/tanh/log/sqrt: use Accelerate/libm accurate path (default 0 = SIMD *_fast) |

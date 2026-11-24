@@ -632,6 +632,58 @@ pub fn packed_gguf_weight(quant: rlx_ir::quant::QuantScheme, k: usize, n: usize)
         .collect()
 }
 
+/// `x · dequant(w)ᵀ` for a one-row packed multiply, accumulated in f64: the answer a
+/// device kernel that multiplies the f32 row approximates, with no engine route in
+/// between.
+///
+/// A one-row cell needs it because `rlx-cpu`'s single-row arms may round the activation
+/// to int8 (`rlx-cpu`'s `gguf_activation`), so a CPU run of the packed graph is no longer
+/// the answer the device computes.
+pub fn f32_row_reference(
+    ty: rlx_gguf::GgmlType,
+    packed: &[u8],
+    x: &[f32],
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
+    let rows = rlx_gguf::dequant_typed(ty, packed, k * n, "f32 row reference").expect("dequant");
+    (0..n)
+        .map(|j| {
+            rows[j * k..(j + 1) * k]
+                .iter()
+                .zip(x)
+                .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                .sum::<f64>() as f32
+        })
+        .collect()
+}
+
+/// Whether a one-row cell's reference must be [`f32_row_reference`] rather than a CPU run
+/// of the packed graph: the device kernels multiply the f32 row, while `rlx-cpu`'s
+/// single-row dispatch may multiply an activation it rounded to int8 — Q4_K's fused arm,
+/// and the six- and eight-bit routes where they are compiled — so a CPU run is not the
+/// answer the device approximates, and which route that run took is not these cells'
+/// subject. The same rule `gguf_dequant_matmul_prefill_parity` applies.
+pub fn needs_f32_row_reference(m: usize) -> bool {
+    m == 1
+}
+
+/// [`f32_row_reference`] with the graph's trailing Relu applied — the reference for a
+/// packed multiply whose graph ends in one.
+pub fn f32_row_reference_relu(
+    ty: rlx_gguf::GgmlType,
+    packed: &[u8],
+    x: &[f32],
+    k: usize,
+    n: usize,
+) -> Vec<f32> {
+    let mut want = f32_row_reference(ty, packed, x, k, n);
+    for v in &mut want {
+        *v = v.max(0.0);
+    }
+    want
+}
+
 /// Largest absolute difference between a computed and a reference output, after
 /// a finiteness census.
 ///

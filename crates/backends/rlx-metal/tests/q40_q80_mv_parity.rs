@@ -193,8 +193,20 @@ fn q8_0_mv_matches_cpu_reference() {
         &packed,
         k,
         n,
-        None,
+        // `gguf_matmul_bt` would be the answer only while this shape sits under the CPU
+        // single-row arm's gates; the kernel multiplies the f32 row at every shape.
+        Some(q8_0_mv_row_ref),
     );
+}
+
+/// Reference dot for one Q8_0 row, dequantised by the crate that owns the block layout.
+fn q8_0_mv_row_ref(x: &[f32], row_packed: &[u8], k: usize) -> f32 {
+    let row = rlx_gguf::dequant_typed(rlx_gguf::GgmlType::Q8_0, row_packed, k, "q8_0 row")
+        .expect("dequant Q8_0 row");
+    row.iter()
+        .zip(x)
+        .map(|(&w, &a)| f64::from(w) * f64::from(a))
+        .sum::<f64>() as f32
 }
 
 /// Simdgroup-cooperative GEMV dispatch (threadgroup-per-output-group grid).
@@ -202,6 +214,10 @@ fn q8_0_mv_matches_cpu_reference() {
 /// match the kernel's constants + `encode_q*_mv_f32_sg`. Compares to
 /// `gguf_matmul_bt` with a tolerance loose enough for the simd_sum reduction
 /// order to differ from the scalar CPU reference.
+///
+/// `row_ref` is the f32 row reference for a scheme whose CPU single-row arm rounds
+/// its activation: the kernels here multiply the f32 row, so `gguf_matmul_bt` is
+/// no longer the answer they are approximating.
 fn run_sg_mv(
     pipeline: &rlx_metal::mtl::ComputePipelineState,
     scheme: QuantScheme,
@@ -211,6 +227,7 @@ fn run_sg_mv(
     n: usize,
     nsg: u64,
     nr0: u64,
+    row_ref: Option<fn(&[f32], &[u8], usize) -> f32>,
 ) {
     let device = Device::system_default().expect("no Metal device");
     let cmd_q = device.new_command_queue();
@@ -263,13 +280,21 @@ fn run_sg_mv(
         let src = (arena.contents() as *const u8).add(x_bytes + w_bytes) as *const f32;
         std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
     }
-    let mut cpu_out = vec![0f32; n];
-    rlx_cpu::gguf_matmul::gguf_matmul_bt(x, packed, &mut cpu_out, 1, k, n, scheme);
-    for j in 0..n {
-        let exp = cpu_out[j];
+    let row_bytes = packed.len() / n;
+    let expected: Vec<f32> = match row_ref {
+        Some(f) => (0..n)
+            .map(|j| f(x, &packed[j * row_bytes..(j + 1) * row_bytes], k))
+            .collect(),
+        None => {
+            let mut cpu_out = vec![0f32; n];
+            rlx_cpu::gguf_matmul::gguf_matmul_bt(x, packed, &mut cpu_out, 1, k, n, scheme);
+            cpu_out
+        }
+    };
+    for (j, want) in expected.iter().enumerate() {
         assert!(
-            (out[j] - exp).abs() <= 1e-3 + 1e-3 * exp.abs(),
-            "row {j}: sg={} ref={exp}",
+            (out[j] - want).abs() <= 1e-3 + 1e-3 * want.abs(),
+            "row {j}: sg={} ref={want}",
             out[j]
         );
     }
@@ -307,6 +332,7 @@ fn q8_0_mv_sg_matches_cpu_reference() {
         n,
         2, // Q8_0_NSG
         4, // Q8_0_NR0
+        Some(q8_0_mv_row_ref),
     );
 }
 
@@ -341,6 +367,7 @@ fn q4_0_mv_sg_matches_cpu_reference() {
         n,
         2,
         4,
+        None,
     );
 }
 
@@ -360,6 +387,7 @@ fn q4_1_mv_sg_matches_cpu_reference() {
         n,
         2,
         4,
+        None,
     );
 }
 
@@ -379,6 +407,7 @@ fn q3k_mv_sg_matches_cpu_reference() {
         n,
         4,
         2,
+        None,
     );
 }
 
@@ -399,5 +428,8 @@ fn q6k_mv_sg_matches_cpu_reference() {
         n,
         4, // Q6K_NSG
         1, // one row per simdgroup
+        // 26 blocks (k=512, n=13) is under the parallel single-row arm's 32-block floor,
+        // so the CPU run here is the sequential f32 route these kernels approximate.
+        None,
     );
 }

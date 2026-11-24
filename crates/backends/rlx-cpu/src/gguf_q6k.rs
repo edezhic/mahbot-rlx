@@ -14,10 +14,9 @@
 //! alternating rounds on the processor).
 //!
 //! It is reached from the parallel single-row arm of
-//! [`crate::gguf_matmul::gguf_matmul_bt`] — a pool of more than one worker, a weight
-//! of at least 32 blocks, and a caller that allows parallelism
-//! ([`crate::gguf_matmul::gguf_matmul_bt_serial`] never takes it) — so a one-worker
-//! or serial host keeps the sequential block loop.
+//! [`crate::gguf_matmul::gguf_matmul_bt`], whose gate is
+//! [`crate::gguf_matmul::m1_parallel_takes`]; a host or a caller it refuses keeps the
+//! sequential block loop.
 //!
 //! This is the same arrangement the neighbouring Q4_K arm in
 //! [`crate::gguf_matmul`] uses, and the one llama.cpp uses for both: quantise the
@@ -38,16 +37,17 @@
 //! `int8-gemv` feature (`crate::int8_gemv`), which the single-row arm in
 //! [`crate::gguf_matmul`] consults before this one, so nothing is duplicated and
 //! no other host changes behaviour.
+//!
+//! The dot itself is [`crate::intrinsics::int8`]'s, shared with the eight-bit route; its
+//! header carries why the widening form is grouped to agree with `SDOT` to the last bit,
+//! and what that costs.
 
+#[cfg(target_arch = "aarch64")]
+use crate::gguf_m1::{f16_at, q8k_d};
 #[cfg(target_arch = "aarch64")]
 use rlx_gguf::{Q8K_BLOCK_BYTES, QK_K};
 #[cfg(target_arch = "aarch64")]
 use rlx_ir::quant::QuantScheme;
-
-/// Whether [`gemv`] is compiled in — the one place that fact is written down.
-/// [`crate::gguf_activation::activation`] reads it to decide what a decode's arm
-/// multiplies its activation with.
-pub(crate) const COMPILED: bool = cfg!(target_arch = "aarch64");
 
 /// `RLX_Q6K_EXACT_GEMV=1` — keep the f32-activation route, the way
 /// `RLX_Q4K_EXACT_GEMV` does for the neighbouring width; it is the arm
@@ -68,31 +68,15 @@ const Q6K_BLOCK_BYTES: usize = QuantScheme::GgufQ6K.gguf_block_bytes() as usize;
 /// `tests/gguf_q6k_row_perf.rs` measures this one against.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn gemv(x: &[f32], w: &[u8], out: &mut [f32], k: usize) -> bool {
-    use rayon::prelude::*;
-    if exact_asked() || !k.is_multiple_of(QK_K) || x.len() < k {
+    if exact_asked() || !k.is_multiple_of(QK_K) {
         return false;
     }
-    let blocks_per_row = k / QK_K;
-    let row_bytes = blocks_per_row * Q6K_BLOCK_BYTES;
-    if w.len() < out.len() * row_bytes {
-        return false;
-    }
-    let mut y = vec![0u8; blocks_per_row * Q8K_BLOCK_BYTES];
-    rlx_gguf::quantize_q8_k_row(&x[..k], &mut y);
-    // One indirect call per row rather than one per 16-element group, and the
-    // pointer is named for the feature it needs — which is also what the
-    // instruction-set scan reads: the `sdot` stays inside `dot_row_dotprod`.
-    let dot: unsafe fn(&[u8], &[u8]) -> f32 = if crate::gguf_matmul::aarch64_has_dotprod() {
+    let dot = if crate::gguf_matmul::aarch64_has_dotprod() {
         dot_row_dotprod
     } else {
         dot_row_vmull
     };
-    out.par_iter_mut().enumerate().for_each(|(j, slot)| {
-        // SAFETY: the pointer above was chosen by the runtime feature check, and
-        // both arms read whole blocks out of `w` and `y`.
-        *slot = unsafe { dot(&w[j * row_bytes..(j + 1) * row_bytes], &y) };
-    });
-    true
+    crate::gguf_m1::gemv(x, w, out, k, k / QK_K * Q6K_BLOCK_BYTES, dot)
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -109,7 +93,7 @@ pub(crate) fn gemv(_x: &[f32], _w: &[u8], _out: &mut [f32], _k: usize) -> bool {
 /// most 127, over sixteen groups is 1.3e8 — well inside `i32`.
 #[cfg(target_arch = "aarch64")]
 macro_rules! q6k_row {
-    ($(#[$attr:meta])* fn $name:ident, $dot:ident) => {
+    ($(#[$attr:meta])* fn $name:ident, $dot:path) => {
         $(#[$attr])*
         unsafe fn $name(row: &[u8], y: &[u8]) -> f32 {
             use std::arch::aarch64::*;
@@ -193,101 +177,23 @@ macro_rules! q6k_row {
 }
 
 #[cfg(target_arch = "aarch64")]
-q6k_row!(#[target_feature(enable = "dotprod")] fn dot_row_dotprod, dot_prod);
+q6k_row!(
+    #[target_feature(enable = "dotprod")]
+    fn dot_row_dotprod,
+    crate::intrinsics::int8::dot16_dotprod
+);
 
 #[cfg(target_arch = "aarch64")]
-q6k_row!(fn dot_row_vmull, dot_wide);
-
-/// 16 signed products into four int32 lanes.
-///
-/// `SDOT` is emitted directly rather than through `vdotq_s32`: the intrinsic only
-/// reached stable in 1.98 and this crate's floor is 1.89, the same reason the
-/// Q4_K arm in [`crate::gguf_matmul`] spells it this way. The caller checked the
-/// `dotprod` feature at run time.
-///
-/// Worth 1.33x the widening form below at the head's width — 23.6 against 17.7 GB/s
-/// of packed weight per thread on a 4096-row weight (k = 2048, n = 4096), a shape
-/// that is arithmetic-bound rather than stream-bound, which is where the dot wins.
-/// `tests`' `q6k_dot_width` is the harness.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "dotprod")]
-unsafe fn dot_prod(
-    a: std::arch::aarch64::int8x16_t,
-    b: std::arch::aarch64::int8x16_t,
-) -> std::arch::aarch64::int32x4_t {
-    use std::arch::aarch64::*;
-    let mut acc = vdupq_n_s32(0);
-    unsafe {
-        std::arch::asm!(
-            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
-            acc = inout(vreg) acc,
-            a = in(vreg) a,
-            b = in(vreg) b,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    acc
-}
-
-/// The same 16 products without `dotprod`: two widening multiplies and two
-/// pairwise adds.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn dot_wide(
-    a: std::arch::aarch64::int8x16_t,
-    b: std::arch::aarch64::int8x16_t,
-) -> std::arch::aarch64::int32x4_t {
-    use std::arch::aarch64::*;
-    unsafe {
-        let mut acc = vdupq_n_s32(0);
-        acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(a), vget_low_s8(b)));
-        vpadalq_s16(acc, vmull_s8(vget_high_s8(a), vget_high_s8(b)))
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn f16_at(block: &[u8], off: usize) -> f32 {
-    half::f16::from_le_bytes([block[off], block[off + 1]]).to_f32()
-}
-
-/// A Q8_K block's activation scale.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn q8k_d(block: &[u8]) -> f32 {
-    f32::from_le_bytes([block[0], block[1], block[2], block[3]])
-}
+q6k_row!(fn dot_row_vmull, crate::intrinsics::int8::dot16_wide);
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
+    use crate::gguf_m1::fixture::{activation, max_rel_err, packed, reference_dot};
 
-    /// One packed Q6_K weight of `n` rows, heavy-tailed so a wrong scale index or
-    /// nibble shows up as a large error rather than a rounding difference.
+    /// One packed Q6_K weight of `n` rows.
     fn packed_q6k(k: usize, n: usize) -> Vec<u8> {
-        let w: Vec<f32> = (0..k * n)
-            .map(|i| {
-                let s = (i as f32 * 0.017).sin();
-                if i % 137 == 0 { 9.0 * s } else { s }
-            })
-            .collect();
-        rlx_gguf::quantize(&w, rlx_gguf::GgmlType::Q6K).expect("pack Q6_K")
-    }
-
-    fn activation(k: usize) -> Vec<f32> {
-        (0..k)
-            .map(|i| {
-                let s = (i as f32 * 0.031).cos();
-                if i % 61 == 0 { 12.0 * s } else { s }
-            })
-            .collect()
-    }
-
-    fn max_rel_err(got: &[f32], want: &[f32]) -> f32 {
-        got.iter()
-            .zip(want)
-            .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
-            .fold(0.0, f32::max)
+        packed(rlx_gguf::GgmlType::Q6K, k, n)
     }
 
     /// The integer dot must be exactly the dot of the *quantised* activation: every
@@ -313,20 +219,16 @@ mod tests {
         let mut y = vec![0u8; k / QK_K * Q8K_BLOCK_BYTES];
         rlx_gguf::quantize_q8_k_row(&x, &mut y);
         let row_bytes = k / QK_K * Q6K_BLOCK_BYTES;
-        let mut want = vec![0f32; n];
-        for j in 0..n {
-            let mut acc = 0f64;
-            for b in 0..k / QK_K {
-                let mut wb = [0f32; QK_K];
-                let mut xb = [0f32; QK_K];
-                rlx_gguf::dequant_q6_k_block(&w[j * row_bytes + b * Q6K_BLOCK_BYTES..], &mut wb);
-                rlx_gguf::dequant_q8_k_block(&y[b * Q8K_BLOCK_BYTES..], &mut xb);
-                for t in 0..QK_K {
-                    acc += f64::from(wb[t]) * f64::from(xb[t]);
-                }
-            }
-            want[j] = acc as f32;
-        }
+        let want: Vec<f32> = (0..n)
+            .map(|j| {
+                reference_dot(
+                    rlx_gguf::GgmlType::Q6K,
+                    &w[j * row_bytes..(j + 1) * row_bytes],
+                    &y,
+                    k,
+                )
+            })
+            .collect();
         let err = max_rel_err(&got, &want);
         assert!(
             err < 1e-5,
@@ -341,29 +243,6 @@ mod tests {
             !took,
             "the exact arm must leave the route to the f32 kernel"
         );
-    }
-
-    /// The widening fallback must agree with the `dotprod` arm bit for bit: both
-    /// are integer dots of the same bytes, so anything else is a lane or a scale
-    /// in the wrong place. Skips where the machine has no `dotprod` (there the
-    /// fallback is the only arm and the test above already covers it).
-    #[test]
-    fn the_widening_arm_agrees_with_the_dotprod_arm() {
-        if !crate::gguf_matmul::aarch64_has_dotprod() {
-            return;
-        }
-        let (k, n) = (512usize, 16usize);
-        let w = packed_q6k(k, n);
-        let x = activation(k);
-        let mut y = vec![0u8; k / QK_K * Q8K_BLOCK_BYTES];
-        rlx_gguf::quantize_q8_k_row(&x, &mut y);
-        let row_bytes = k / QK_K * Q6K_BLOCK_BYTES;
-        for j in 0..n {
-            let row = &w[j * row_bytes..(j + 1) * row_bytes];
-            let wide = unsafe { dot_row_vmull(row, &y) };
-            let narrow = unsafe { dot_row_dotprod(row, &y) };
-            assert_eq!(wide, narrow, "row {j}: {wide} vs {narrow}");
-        }
     }
 
     /// The `dotprod` dot against the widening one, at the head's width on a weight

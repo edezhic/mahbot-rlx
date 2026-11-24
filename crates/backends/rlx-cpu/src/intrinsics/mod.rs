@@ -24,6 +24,8 @@
 //! are touched.
 
 #[cfg(target_arch = "aarch64")]
+pub mod int8;
+#[cfg(target_arch = "aarch64")]
 pub mod neon;
 
 /// x86-64 VNNI (`VPDPBUSD`) int8 dot kernels for low-bit quant matmul.

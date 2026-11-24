@@ -17,18 +17,21 @@
 //! times under a budget far below the working set and requires every pass to agree
 //! with the first. The schemes whose arms round
 //! ([`rlx_cpu::routing::quantizes_activation`]) therefore keep the
-//! cached f32 route whatever the budget does; the rest do the same total work on
-//! either route. (A build with no vendor BLAS has no cached slab to keep, so there
-//! the packed arm runs either way and the oracle is that arm's.)
+//! cached f32 route whatever the budget does, and a scheme whose arm never consults
+//! the cache at all ([`rlx_cpu::routing::q8_0_arm_ignores_cache`]) takes that one route
+//! whatever the budget does; the rest do the same total work on either route. (A build
+//! with no vendor BLAS has no cached slab to keep, so there the packed arm runs either
+//! way and the oracle is that arm's.)
 //!
 //! *With the cache switched off* (phase 3), which is the product's own form: the
 //! single-row multiplies are the packed routes, and each is held to [`TOL`]
 //! against an f64 dot of the dequantised weight — with the activation rounded the
 //! way that route rounds it, which pins the route rather than only the size of its
 //! rounding. The rounding this harness can build is Q8_K, which every K-quant arm
-//! uses — `int8-gemv`'s three included — so that kernel's 32-element arms (Q8_0,
-//! Q4_0, Q4_1; x86-64 only, default off), which round to int8 blocks instead, are
-//! named and skipped rather than measured against an oracle they do not compute.
+//! uses — `int8-gemv`'s three included — and the eight-bit arm on the host that
+//! compiles it. `int8-gemv`'s 32-element arms (Q4_0, Q4_1, and Q8_0 where that kernel
+//! takes the width — x86-64 only, default off), which round to int8 blocks instead,
+//! are named and skipped rather than measured against an oracle they do not compute.
 //!
 //! One `#[test]`: the cache budget, the thrash latch and the cache itself are
 //! process-global, and the latch never resets, so a second test in this process
@@ -39,7 +42,9 @@ mod common;
 use common::{activation, max_rel_err, packed};
 use rlx_cpu::dequant_cache::{clear_dequant_cache, gguf_weight_f32};
 use rlx_cpu::gguf_matmul::gguf_matmul_bt_dispatch_at;
-use rlx_cpu::routing::{quantizes_activation, rounds_to_q8k};
+use rlx_cpu::routing::{
+    q8_0_arm_ignores_cache, quantizes_activation, rounds_to_q8k, rounds_to_q8k_at,
+};
 use rlx_gguf::{GgmlType, Q8K_BLOCK_BYTES, QK_K};
 use rlx_ir::quant::QuantScheme;
 
@@ -64,8 +69,8 @@ const TOL: f32 = 1e-4;
 /// one this test ever measures with the latch untripped — the only position from which
 /// a scheme is seen on both sides of the trip, which is what the route-change
 /// assertion needs. Q6_K leads because it is the scheme whose single-row arm rounds on
-/// the reference host (aarch64's integer dot): the class whose route must not change at
-/// all.
+/// the reference host (aarch64's integer dot) and is not the one whose arm ignores the
+/// cache: the class whose route must not change at all.
 const SCHEMES: [(QuantScheme, GgmlType); 5] = [
     (QuantScheme::GgufQ6K, GgmlType::Q6K),
     (QuantScheme::GgufQ4K, GgmlType::Q4K),
@@ -132,6 +137,8 @@ fn single_row_packed_multiply_is_cache_pressure_independent() {
     let _fused_min_n = rlx_ir::env::scoped("RLX_Q4K_FUSED_MIN_N", usize::MAX.to_string());
     let _q4k_exact = rlx_ir::env::scoped("RLX_Q4K_EXACT_GEMV", "0");
     let _q6k_exact = rlx_ir::env::scoped("RLX_Q6K_EXACT_GEMV", "0");
+    let _q8_0_exact = rlx_ir::env::scoped("RLX_Q8_0_EXACT_GEMV", "0");
+    let _reproducible = rlx_ir::env::scoped("RLX_REPRODUCIBLE", "0");
 
     let blobs: Vec<Vec<(usize, Vec<u8>)>> = SCHEMES.iter().map(|(_, g)| tensors(*g)).collect();
     let x = activation(K);
@@ -159,10 +166,12 @@ fn single_row_packed_multiply_is_cache_pressure_independent() {
     // than a quarter of the budget has been evicted.
     //
     // No scheme's answer may move when the budget shrinks — that is the contract, and
-    // the oracle is the f32 dequant route's. A scheme whose arm rounds keeps that route
-    // by design; one whose arm does not diverts to the fused kernel, which is the same
-    // f32 arithmetic over the same `k` in another summation order and lands inside the
-    // same bound.
+    // the oracle is the activation the route that runs multiplies: the cached f32 route
+    // for a scheme whose route is the cache's to decide, and its own arm's rounding for
+    // one whose arm ignores the cache (Q8_0's). A scheme whose arm rounds but keeps the
+    // cached route holds that f32 oracle by design; one whose arm does not round diverts
+    // to the fused kernel, which is the same f32 arithmetic over the same `k` in another
+    // summation order and lands inside the same bound.
     //
     // A build with no vendor BLAS, and a portable run of one that has it, have no
     // cached f32 route for this oracle to be: the first sends the multiply to the fused
@@ -175,10 +184,16 @@ fn single_row_packed_multiply_is_cache_pressure_independent() {
     let _budget = rlx_ir::env::scoped("RLX_DEQUANT_CACHE_MAX_BYTES", BUDGET.to_string());
     clear_dequant_cache();
     for ((scheme, ggml), blobs) in SCHEMES.iter().zip(&blobs) {
+        // A call whose arm ignores the cache multiplies the activation its own arm
+        // rounds, whatever the budget does; every other scheme's route is the cache's
+        // to decide, so its oracle is the cached f32 route. The arm is asked for this
+        // call's shape: it has gates of its own, and a call it refuses is the cache's to
+        // route.
+        let oracle_rounds = q8_0_arm_ignores_cache(K, N, blobs[0].1.len(), *scheme);
         let wants: Vec<Vec<f32>> = if cached {
             blobs
                 .iter()
-                .map(|(_, w)| reference(&x, w, *ggml, 1, false))
+                .map(|(_, w)| reference(&x, w, *ggml, 1, oracle_rounds))
                 .collect()
         } else {
             Vec::new()
@@ -206,12 +221,14 @@ fn single_row_packed_multiply_is_cache_pressure_independent() {
             }
             match &first {
                 // Two classes of scheme here, and the bound differs because the design
-                // does. One whose arm rounds keeps the cached route on both sides of the
-                // latch (`prefer_cached_blas`), so its passes are one route's arithmetic
-                // and the bound only has to separate that from a route that moved under
-                // it — the ~1e-2 class of an activation rounding. One whose arm does not
-                // round diverts to the fused kernel, the same dequant work in another
-                // summation order, and the same bound admits that order.
+                // does. One whose arm rounds cannot have its route move at the latch, so
+                // its passes are one route's arithmetic and the bound only has to separate
+                // that from a route that moved under it — the ~1e-2 class of an activation
+                // rounding. There are two ways to that: the cached route is kept
+                // (`prefer_cached_blas`, Q4_K and Q6_K), or the cache is never consulted
+                // (the eight-bit arm's taken calls). One whose arm does not round diverts
+                // to the fused kernel at the latch, the same dequant work in another
+                // summation order, and `TOL` admits that order.
                 Some(prev) => {
                     let bound = if quantizes_activation(*scheme) {
                         1e-5
@@ -250,7 +267,7 @@ fn single_row_packed_multiply_is_cache_pressure_independent() {
                 );
                 continue;
             }
-            let quantised = rounds_to_q8k(*scheme);
+            let quantised = rounds_to_q8k_at(K, N, blobs[0].1.len(), *scheme);
             for (t, (w_off, bytes)) in blobs.iter().enumerate() {
                 let want = reference(&x, bytes, *ggml, 1, quantised);
                 let mut out = vec![0f32; N];

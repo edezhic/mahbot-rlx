@@ -1370,8 +1370,10 @@ fn a_packed_multiply_shares_the_enclosing_batch_and_the_host_leg_still_reads_bac
 /// compile is served against that compile's arena (keeping it alive), and the
 /// live arena's output slot is never written. Three runs through one executable at
 /// `1, 4, 1` rows: the third binding is the first run's, so its windows are the
-/// first run's and a surviving entry is hit. Each run is compared against the same
-/// graph on `Device::Cpu`, whose deferred executable performs the same rebinds.
+/// first run's and a surviving entry is hit. The two one-row runs are compared
+/// against the f32 row — the device kernel multiplies it, while `rlx-cpu`'s Q8_0
+/// single-row arm rounds it — and the four-row run against the same graph on
+/// `Device::Cpu`, whose deferred executable performs the same rebinds.
 ///
 /// The same three runs pin the deferred param replay: while a graph is unresolved
 /// `set_param_bytes` only buffers, so a replay left buffered would leave every
@@ -1414,7 +1416,11 @@ fn a_packed_multiply_survives_rebinding_the_dynamic_row_axis() {
                 "the one-row multiply must take the tiled arm's per-row route: {routes:?}"
             );
         }
-        let want = cpu.run(&[("x", row)]).remove(0);
+        let want = if common::needs_f32_row_reference(*m) {
+            common::f32_row_reference_relu(rlx_gguf::GgmlType::Q8_0, &packed[0].1, row, K, N)
+        } else {
+            cpu.run(&[("x", row)]).remove(0)
+        };
         let abs = max_abs_diff(&got, &want);
         eprintln!("[rlx-gguf-join] rebind run {label} (m={m}): max_abs={abs:.6e}");
         assert!(
@@ -1440,9 +1446,9 @@ fn a_packed_multiply_survives_rebinding_the_dynamic_row_axis() {
     }
     exe.set_param_bytes("w", &w2);
     let after = exe.run(&[("x", last_row)]).remove(0);
-    let (ref_graph, _) = dynamic_row_packed_multiply(K, N);
-    let mut cpu2 = build(Device::Cpu, &ref_graph, &[("w", w2)], &[]);
-    let want2 = cpu2.run(&[("x", last_row)]).remove(0);
+    // The f32 row again: the device multiplies the f32 activation, while `rlx-cpu`'s
+    // Q8_0 single-row arm rounds it.
+    let want2 = common::f32_row_reference_relu(rlx_gguf::GgmlType::Q8_0, &w2, last_row, K, N);
     let moved = max_abs_diff(&before, &after);
     let abs = max_abs_diff(&after, &want2);
     eprintln!(
