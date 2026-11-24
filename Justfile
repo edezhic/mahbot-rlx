@@ -286,12 +286,17 @@ test-fk:
 # Logical CPUs for cargo `-j` / libtest `--test-threads` (macOS, else Linux).
 cpus := `sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4`
 
-# Run the default fast smoke selection (see the body) at high parallelism.
+# Run the default fast smoke selection (see the body) at full parallelism.
 # Integration targets anywhere in the workspace are opt-in: `--features
 # backend-tests`.
-# On Darwin, Metal / MoltenVK / MLX share one GPU — cap concurrent cargo
-# jobs so crates don't deadlock the device; within a binary, libtest still
-# uses the default (CPU count) thread pool. Linux keeps full -j / threads.
+# `--tests` is the target selection, on both platforms: every target whose
+# manifest leaves `test = true` — the lib unit tests, the bin tests and the
+# integration tests — and no doctest and no example. Those are
+# `test-workspace`'s, once per sync.
+# No `-j` cap, on either platform: cargo runs test binaries strictly one at a
+# time, so a cap cannot keep a device uncontended, it only costs build time. The
+# device-facing knob is the binary's own `--test-threads`, which the Linux
+# branch pins to `$CPUS` and Darwin gets from libtest's default.
 # Keep `--test-threads=1` only on recipes that share a GPU runtime unsafely.
 test:
     #!/usr/bin/env bash
@@ -320,9 +325,7 @@ test:
     # `rlx-lbm` stays in `default-members`.
     lbm="--features rlx-lbm/backend-tests"
     if [[ "$(uname -s)" == Darwin ]]; then
-        # A few parallel test binaries is enough; more contended Apple GPU.
-        JOBS=$(( CPUS < 4 ? CPUS : 4 ))
-        cargo test --release -j "$JOBS" $lbm
+        cargo test --release --tests -j "$CPUS" $lbm
     else
         # One test target that fails to compile aborts the whole workspace
         # run, `--no-fail-fast` or not — on the Linux rig that was seven
@@ -330,7 +333,7 @@ test:
         # first so the report names all of them. The feature set has to match
         # the test run's, or cargo rebuilds every crate for one of them.
         cargo build --release --tests --keep-going -j "$CPUS" $lbm
-        cargo test --release -j "$CPUS" $lbm -- --test-threads="$CPUS"
+        cargo test --release --tests -j "$CPUS" $lbm -- --test-threads="$CPUS"
     fi
     just test-debug-verifier restricted
 
@@ -377,6 +380,7 @@ test-workspace:
     skip="$skip --skip audit_pair_switch_graft_and_answer"
     skip="$skip --skip read_tasks_hide_the_answer_and_score_it"
     skip="$skip --skip steer_task_scores_both_halves"
+    # Compile/link parallelism only, not the device — see `test`.
     JOBS=$(( CPUS < 4 ? CPUS : 4 ))
     if [[ "$(uname -s)" == Darwin ]]; then
         cargo test --release -j "$JOBS" --workspace $excl $feat --no-fail-fast -- $skip
@@ -412,8 +416,11 @@ test-workspace:
 # rather than the whole workspace — the point is to run the checks at all.
 #
 # `mode=restricted` is how the default `test` recipe calls it: the runtime's
-# default selection (lib unit tests plus the pool-width checks). `full` mode adds
-# the gated targets of the four crates below.
+# default selection (lib unit tests plus the pool-width checks) with `--tests`,
+# so no doctest or example is compiled. `full` mode adds the gated targets of
+# the four crates below and keeps both, as the hand-run gate — those three
+# crates' integration targets carry the verifier asserts, which is why they are
+# gated.
 #
 # The runtime line runs this fork's backend only (`cpu,gpu`), and that applies to
 # BOTH modes. Upstream's list — `cpu,gpu,coreml,mlx,vulkan` on an Apple host —
@@ -426,16 +433,15 @@ test-debug-verifier mode="full":
     set -euo pipefail
     # This fork develops wgpu (`gpu`) only, plus the CPU baseline.
     FEATURES="cpu,gpu"
-    # Those three crates' integration targets carry the verifier asserts, so
-    # they are gated too: `restricted` runs their lib unit tests only.
     case "{{mode}}" in
       restricted)
-        cargo test -p mahbot-rlx-ir -p mahbot-rlx-fusion -p mahbot-rlx-compile ;;
+        cargo test -p mahbot-rlx-ir -p mahbot-rlx-fusion -p mahbot-rlx-compile --tests
+        cargo test -p mahbot-rlx-runtime --features "$FEATURES" --tests --no-fail-fast ;;
       *)
         FEATURES="$FEATURES,backend-tests"
-        cargo test -p mahbot-rlx-ir -p mahbot-rlx-fusion -p mahbot-rlx-compile --features backend-tests ;;
+        cargo test -p mahbot-rlx-ir -p mahbot-rlx-fusion -p mahbot-rlx-compile --features backend-tests
+        cargo test -p mahbot-rlx-runtime --features "$FEATURES" --no-fail-fast ;;
     esac
-    cargo test -p mahbot-rlx-runtime --features "$FEATURES" -j 4 --no-fail-fast
 
 # GPU backends + runtime feature tests for the host platform.
 # Darwin: Metal, wgpu, CoreML, third-order.
@@ -454,6 +460,7 @@ test-gpu:
     #!/usr/bin/env bash
     set -euo pipefail
     CPUS={{cpus}}
+    # Compile/link parallelism only, not the device — see `test`.
     JOBS=$(( CPUS < 4 ? CPUS : 4 ))
     # A backend that skips for want of a device must not report `ok` here.
     export RLX_REQUIRE_DEVICE="{{require_device}}"
@@ -496,6 +503,7 @@ test-vulkan:
     #!/usr/bin/env bash
     set -euo pipefail
     CPUS={{cpus}}
+    # Compile/link parallelism only, not the device — see `test`.
     JOBS=$(( CPUS < 4 ? CPUS : 4 ))
     export RLX_REQUIRE_DEVICE="{{require_device}}"
     case "$(uname -s)" in
@@ -580,6 +588,7 @@ test-torch-import:
     set -euo pipefail
     CPUS={{cpus}}
     if [[ "$(uname -s)" == Darwin ]]; then
+        # Compile/link parallelism only, not the device — see `test`.
         JOBS=$(( CPUS < 4 ? CPUS : 4 ))
         cargo test -p rlx-torch-import -j "$JOBS"
     else
@@ -598,6 +607,7 @@ testf FILTER:
     set -euo pipefail
     CPUS={{cpus}}
     if [[ "$(uname -s)" == Darwin ]]; then
+        # Compile/link parallelism only, not the device — see `test`.
         JOBS=$(( CPUS < 4 ? CPUS : 4 ))
         cargo test --release -j "$JOBS" {{FILTER}}
     else
@@ -720,6 +730,7 @@ lint-features:
 # GPU fault — it reads zero, so a kernel whose `len` moved does nothing at all.
 # Off by default (a relaxed atomic load); this turns it on for the suite.
 validate-metal-bindings *ARGS:
+    # Compile/link parallelism only, not the device — see `test`.
     RLX_METAL_VALIDATE_BINDINGS=1 cargo test --release -j 4 -p rlx-metal --features backend-tests --no-fail-fast {{ARGS}}
 
 # Objective-C refcount gate for the Metal backend (macOS; no-ops elsewhere).

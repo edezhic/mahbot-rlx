@@ -25,6 +25,28 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Changed
 
+- The routine test round compiles and runs only `#[test]`s. `just test` (both
+  platforms) and the `restricted` arm of `just test-debug-verifier` pass
+  `--tests`, so the round compiles no doctest and builds no example; both are the
+  once-per-sync whole-set gate's — `just test-workspace` runs the doctests and
+  builds the examples, `just check-readme` the README's doctests — and
+  `scripts/publish.sh`'s before a release. (`just lint`'s `--all-targets` still
+  type-checks the examples; what left the loop is compiling them.) Rustdoc
+  recompiles its doctest targets on every run, so that phase was a per-take
+  cost — run on its own, 25.1 s in the release run and 5.3 s in the two debug
+  runs, 43 targets. Example compilation is post-edit weight instead: 20–24 s
+  after an edit, nothing once warm, and never executed. Same tree, same load, the
+  release phase fell from 47.3–58.5 s to 20.2–39.4 s, and the worst post-edit
+  case — `touch crates/core/rlx-ir/src/lib.rs`, then the round — is 134–242 s
+  depending on host load, at a peak build RSS of 5.1 GiB with no swap growth,
+  measured on a box already holding 4.9 GiB of swap. The round also lost both of
+  its job caps (the Darwin `-j 4` in `just test` and the hard-coded `-j 4` in
+  `test-debug-verifier`): cargo runs test binaries strictly one at a time, so a
+  cap cannot keep a GPU uncontended — ten back-to-back rounds of the new
+  selection showed none of the cross-binary contention recorded against the
+  `rlx-vulkan` target — and it cost 1.53× on a 335-crate build (339.9 s against
+  222.5 s). The `-j` caps that remain, in the whole-set and per-backend recipes,
+  bound compile and link parallelism.
 - `mahbot-rlx-gguf`, `rlx-lbm` and `rlx-fdm` now build their `ir` feature by
   default, so a plain build, test and lint resolve one feature set instead of
   two. The feature is unchanged and still optional; its cost differs per crate.

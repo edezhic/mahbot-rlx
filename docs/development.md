@@ -58,6 +58,10 @@ just build          # build this fork's contour (bare `cargo build`; see Cargo.t
                     # but the binding crates
 just test           # cargo test, fast smoke gate: unit tests + pool-width checks
                     # integration targets: add `--features backend-tests`
+                    # `--tests`: no doctest and no example is compiled —
+                    # `just test-workspace` keeps both, once per sync
+                    # it runs the `restricted` arm of `test-debug-verifier`;
+                    # the bare recipe is the hand-run `full` gate
                     # also the *selection*: a bare `cargo test` here means this
                     # fork's default contour, not every member (Cargo.toml
                     # `default-members`) — the Apple/CUDA/ROCm/NPU backends are

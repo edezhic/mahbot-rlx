@@ -103,7 +103,9 @@ research op — use the stable seams in
   parity/integration coverage over trivial asserts.
 - `just test` runs the default selection — this fork's contour, see
   `default-members` in [`Cargo.toml`](Cargo.toml): those crates' unit tests plus
-  the pool-width checks. The heavy integration suites are opt-in with
+  the pool-width checks. `--tests` keeps doctests and examples out of the
+  routine round; `just test-workspace` compiles both and runs the doctests, once
+  per sync. The heavy integration suites are opt-in with
   `--features backend-tests`; `just test-gpu` adds the host GPU backends and
   runtime feature tests, and the backend-specific recipes (`just test-mlx`,
   `just test-rocm`, `just test-fpga`, …) pass that gate for the targets they

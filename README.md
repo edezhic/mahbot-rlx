@@ -757,7 +757,8 @@ until the kind moves from **common-ir** to **native**.
 
 - **Fast local gate**: `just ci` (the whole-set build, the default-contour test
   run — a fast smoke gate; the heavy integration suites are opt-in with
-  `--features backend-tests` — lint, pyrlx pytest).
+  `--features backend-tests` — lint, pyrlx pytest). Its test step compiles no
+  doctest and no example; `just test-workspace` has both.
 - **Always gate benches on throttle.** `scripts/check-throttle.sh` refuses
   to proceed under thermal pressure (`pmset -g therm`). Silent 10×
   slowdowns are a real failure mode on Macs. `--warn` mode for CI;
