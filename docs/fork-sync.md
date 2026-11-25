@@ -49,9 +49,9 @@ it, `--check` fails on any that disagrees, and `scripts/publish.sh` reads it fro
 the same file rather than restating it. See [fork-publishing.md](fork-publishing.md)
 for what the layer covers.
 
-## 3. The build contour stays narrow
+## 3. The build contour stays narrow, and the round stays on the product
 
-The default build and test set is CPU, wgpu and the non-backend crates. The
+The default build and lint set is CPU, wgpu and the non-backend crates. The
 Apple, NVIDIA, AMD, Intel, TPU and embedded backends are workspace members but
 are not built by default; the two browser-oriented crates and the Python binding
 are excluded outright. Upstream has no `default-members` narrowing at all, and a
@@ -60,13 +60,27 @@ expensive regression in the routine loop rather than in the product.
 
 New upstream members are added to `members` (they are new directories and cannot
 conflict); `default-members` and `exclude` stay exactly as they are, apart from
-the binding block below. The gates follow the same narrowing: `just build` /
-`just test` / `just lint` are bare, and `just build-workspace` /
-`just test-workspace` / `just lint-workspace` are their once-per-sync whole-set
-counterparts. The narrowing is about the members this fork does not build, not
-about the recipes: a gate over a crate that *is* in the contour
-(`check-corpus`, `test-third-order-cpu`, `check-rustdoc-contour`) belongs in the
-routine loop.
+the binding block below. The build, lint, doc and publish gates follow that
+narrowing: `just build` and `just lint` are bare, and `just build-workspace` /
+`just lint-workspace` are their once-per-sync whole-set counterparts. A gate over
+a crate that *is* in the contour (`check-corpus`, `test-third-order-cpu`,
+`check-rustdoc-contour`) belongs in the routine loop.
+
+`just test` is narrower still, and a sync takes that narrowing as it finds it.
+The round runs the **product set** — the default members on `mahbot-inference`'s
+normal dependency closure at the features it builds with, plus `rlx-check` by a
+clause, enumerated once as `product_set` in the Justfile with a clause for every
+default member that leaves. It is a recipe-level selection on purpose: compiling
+test harnesses for crates the product does not link is what made the round too
+expensive, and no cap is raised to fit it. `default-members` is unchanged by it —
+the build, lint, doc and publish paths still cover the whole contour, and
+`just test-workspace` still runs every member. `just check-product-set` (in
+`just ci`) is the gate over the list: every default member on the product's
+closure must be in it, and the round's normal graph must add no workspace crate
+the build step does not compile. An upstream *default* member that lands on the
+closure fails it and the list grows; one that drops off changes nothing, and a
+non-default member on the closure is printed as never covered. A sync that
+reads this narrowing as a violation to revert is reading it wrong.
 
 An excluded crate is out of the build, not out of the tree: nothing compiles it
 and no gate runs its tests, but files inside it are still read. `Cargo.toml`'s
@@ -96,11 +110,11 @@ python3 scripts/fork-test-gating.py --check  # gate: `just check-fork-layers`,
 
 Both gates are wired into `just ci` (through `check-fork-layers`) and into
 `scripts/git-hooks/pre-commit`, so a sync that forgets a layer fails the routine
-loop rather than the next release. `just ci` is the narrow contour. `just
-ci-workspace` *depends on* `ci` and adds the whole-set counterparts —
-`build-workspace`, `test-workspace`, `lint-workspace` — plus the whole-set
-recipes, so it cannot fall behind the routine gate the way a hand-kept parallel
-list does. It runs once, as a sync's own verification.
+loop rather than the next release. `just ci` builds and lints the narrow contour
+and tests the product set. `just ci-workspace` *depends on* `ci` and adds the
+whole-set counterparts — `build-workspace`, `test-workspace`, `lint-workspace` —
+plus the whole-set recipes, so it cannot fall behind the routine gate the way a
+hand-kept parallel list does. It runs once, as a sync's own verification.
 
 Two things that whole-set run does not cover by itself. `test-workspace` is
 `cargo test --workspace` with the `--exclude`s its recipe names, which builds

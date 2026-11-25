@@ -286,13 +286,132 @@ test-fk:
 # Logical CPUs for cargo `-j` / libtest `--test-threads` (macOS, else Linux).
 cpus := `sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4`
 
-# Run the default fast smoke selection (see the body) at full parallelism.
-# Integration targets anywhere in the workspace are opt-in: `--features
-# backend-tests`.
+# The product set — the routine round's selection. It is re-derived from the
+# metadata, not decided here: the default members on `mahbot-inference`'s
+# **normal** dependency closure at the features it builds with (`cargo tree -p
+# mahbot-inference -e normal`), plus the one crate a clause keeps below.
+# Dev-dependencies do not count and an optional feature the product never
+# enables does not count, so a crate reached only that way leaves the round even
+# though it is a default member.
+#
+# On the closure (20): mahbot-inference is the product; rlx-ir the IR; rlx-flow
+# the graph builder; rlx-fusion, rlx-unfuse and rlx-autodiff the passes the
+# compiler runs; rlx-compile the HIR→MIR→LIR pipeline; rlx-opt the optimizer;
+# rlx-driver `Device`; rlx-macros the proc macros; rlx-runtime `Session`;
+# rlx-cpu and rlx-wgpu the two backends one run picks between; rlx-gpu-dispatch
+# and rlx-gpu-host the GPU support the wgpu backend keeps; rlx-gguf the model
+# reader; rlx-pkg, rlx-dduf and rlx-mlx-io the pack and weight-format IO that
+# `model-io` and both backends reach; rlxsl the warm-tier activation kernels'
+# single source, which both backends link.
+#
+# Off the closure, kept by a clause (1): rlx-check — the static graph checker
+# (`cargo rlx check`, named in llms.txt and the README) and the doctor (`cargo
+# rlx doctor`, docs/development.md) are tools the fork's own documents tell a
+# maintainer to run, and this crate's tests are their only coverage (`check-ops`
+# runs its `op_scan` lib tests through a name filter, and is in neither routine
+# gate).
+#
+# Off the closure, and out of the round (34), one clause each:
+#   rlx-tensor          NumPy-style tensor DSL; the product builds on rlx-flow.
+#   rlx-extend          downstream-extension prelude; the product is not one.
+#   rlx-optim           training-step optimizers; the product does not train.
+#                       Still built: `rlx-runtime/training` enables it.
+#   rlx-sparse          sparse LU / CG solvers; no product path. `just test-gpu`
+#                       carries its suite on Darwin only — its Linux arm does not
+#                       select the crate, so there it is uncovered (below). The
+#                       library still builds as rlx-runtime's dev-dependency.
+#   rlx-linalg          LAPACK eigh / svd / qr; no product path, same
+#                       dev-dependency, so its library stays.
+#   rlx                 prelude re-exports; the product names the crates it uses.
+#                       Still built as rlx-autodiff's and rlx-wgpu's
+#                       dev-dependency.
+#   mahbot-rlx-nemo     NeMo checkpoint loader; the product's models are GGUF.
+#                       Still built, through `rlx-pkg/convert`.
+#   mahbot-rlx-torch-ckpt  torch.save reader; likewise GGUF, likewise still
+#                       built.
+#   rlx-bake            offline `*.rlx` weight bake; a build-time step.
+#   rlx-gguf-convert    safetensors / ONNX → GGUF; a build-time tool.
+#   rlx-hub             HuggingFace shard download; the models are pinned locally.
+#   rlx-text            tokenizer / chat-template wrappers; the product has its own.
+#   rlx-onnx            ONNX inference; no product path.
+#   rlx-onnx-import     ONNX → HIR import; no product path.
+#   rlx-onnx-proto      ONNX protobuf types for that import; no product path.
+#   rlx-onnx-conformance  ONNX/ORT parity harness; no product path.
+#   rlx-torch-import    torch.export → HIR import; no product path.
+#   rlx-collectives     in-graph all-reduce; one row runs in one process.
+#   rlx-distributed     multi-node pipeline parallelism; likewise.
+#   rlx-fdm             force-density form-finding; a solver, no product path.
+#   rlx-fem             finite elements on triangles; a solver, no product path.
+#   rlx-geo             Delaunay / Voronoi; a solver, no product path.
+#   rlx-lbm             lattice Boltzmann; a solver, no product path. No gate
+#                       runs its suite, its three graph targets (`graph_stream`,
+#                       `lane_reset`, `invariants`, behind `backend-tests`)
+#                       included: a loss, named below.
+#   rlx-rl              flow-map RL policies; no product path.
+#   rlx-bbo             black-box optimization; no product path.
+#   rlx-umap            parametric UMAP; no product path.
+#   rlx-vq              nearest-codebook kernel; no product path.
+#   rlx-peft            LoRA / IA3 / DoRA adaptation; the product ships fixed
+#                       weights.
+#   rlx-rng             numpy / PyTorch RNG reproductions; the product's noise is
+#                       its own (`report::pseudo_rand`).
+#   rlx-megakernel      standalone MoE composition study; no product path.
+#   rlx-opscope         data-pattern recording harness; a study, no product path.
+#   rlx-hwprofile       host GPU/VRAM profiler; `Device` selection does not read it.
+#   rlx-corpus          named kernel corpus — leaves, and `check-corpus` (in
+#                       `just ci`) carries its coverage.
+#   rlx-bench           benchmark harness; no product path, and no gate runs its
+#                       suite.
+#
+# The only gates that run a departing crate's suite are `check-corpus`
+# (`rlx-corpus`, in `just ci`) and `just test-gpu` (`rlx-sparse`, Darwin only, in
+# `ci-workspace`).
+# Three surfaces therefore have no gate anywhere, named rather than implied:
+# `rlx-bench`'s suite, `rlx-lbm`'s suite, and — on the Linux rig — `rlx-sparse`'s
+# suite. `test-lbm` and `test-workspace` do run the lbm suite, but neither is a
+# gate: the first is hand-run and the development guide does not name it, the
+# second is the whole-set escape hatch. Everything else departing is the whole-set
+# recipe's, run before a sync.
+#
+# `product_features` pins the one feature `just build` resolves and the round
+# would otherwise not: `mahbot-rlx-pkg/zstd-native`, which only a departing crate
+# (`rlx-bake`) asks for, so without it the round compiles a second variant of
+# `rlx-pkg`. The package name is spelled in full rather than through the `rlx-pkg`
+# rename, so the flag does not depend on another crate's dependency edge. Nothing
+# else is needed — `rlx-pkg`'s own defaults (`write`, `convert`, `parallel`) are on
+# because it is a selected root, and `rlx-driver/mdns` arrives through the selected
+# `rlx-check`. Not the union: that would also take `rlx-runtime/training` from
+# `rlx-flow`'s dev-dependency — neither what the build step compiles nor what the
+# product ships, but a variant a test build resolves for the whole round regardless
+# of this selection.
+product_set := "-p mahbot-inference -p mahbot-rlx-autodiff -p mahbot-rlx-compile -p mahbot-rlx-cpu -p mahbot-rlx-dduf -p mahbot-rlx-driver -p mahbot-rlx-flow -p mahbot-rlx-fusion -p mahbot-rlx-gguf -p mahbot-rlx-gpu-dispatch -p mahbot-rlx-gpu-host -p mahbot-rlx-ir -p mahbot-rlx-macros -p mahbot-rlx-mlx-io -p mahbot-rlx-opt -p mahbot-rlx-pkg -p mahbot-rlx-runtime -p mahbot-rlx-unfuse -p mahbot-rlx-wgpu -p mahbot-rlxsl -p rlx-check"
+product_features := "mahbot-rlx-pkg/zstd-native"
+
+# Run the routine round: the product set, in three commands.
+#
+# `product_set` above is the selection and its comment is the definition and the
+# per-crate clause. The round is narrower than `default-members` on purpose — it
+# is what a change to the product's own path has to clear, and compiling test
+# harnesses for crates the product does not link is what made it too expensive.
+#
 # `--tests` is the target selection, on both platforms: every target whose
 # manifest leaves `test = true` — the lib unit tests, the bin tests and the
 # integration tests — and no doctest and no example. Those are
 # `test-workspace`'s, once per sync.
+#
+# Integration targets sit behind `required-features = "backend-tests"` and stay
+# out of this run — the fast smoke gate. The per-backend recipes (`just
+# test-gpu`, `test-mlx`, `test-rocm`, …) pass the feature explicitly, and
+# `required-features` gates a test *target*, so in those recipes the crates' lib
+# unit tests run too — except `rlx-metal`, whose manifest (fork-local) drops its
+# lib unit tests, doctests, examples and auto-discovered test files from every
+# run.
+#
+# `mahbot-inference` gates sixteen more targets behind its own `hand-run`
+# feature rather than `backend-tests`: every test in them is `#[ignore]`d, so
+# ungated this run links and executes sixteen binaries that run nothing. `just
+# test-workspace` and `just lint` enable that feature.
+#
 # No `-j` cap, on either platform: cargo runs test binaries strictly one at a
 # time, so a cap cannot keep a device uncontended, it only costs build time. The
 # device-facing knob is the binary's own `--test-threads`, which the Linux
@@ -302,38 +421,20 @@ test:
     #!/usr/bin/env bash
     set -euo pipefail
     CPUS={{cpus}}
-    # Integration test targets across the workspace sit behind
-    # `required-features = "backend-tests"` and stay out of this default run —
-    # the fast smoke gate — except for the one crate whose gate below is named
-    # package-qualified. The per-backend recipes (`just test-gpu`, `test-mlx`,
-    # `test-rocm`, …) pass the feature explicitly, and `required-features` gates
-    # a test *target*, so in those recipes the crates' lib unit tests run too —
-    # except `rlx-metal`, whose manifest (fork-local) drops its lib unit tests,
-    # doctests, examples and auto-discovered test files from every run.
-    # This run is the *selection*, not just a target filter: a bare `cargo test`
-    # at the root means the fork's default contour, so no Apple backend is
-    # compiled here at all. (Linux x86_64 excepted: rlx-collectives' retained
-    # upstream dev-dependency row still pulls CUDA / ROCm / XDNA into this run.)
-    # `just test-gpu` and the backend recipes below are what build the rest.
-    # `mahbot-inference` gates sixteen more targets this way, behind its own
-    # `hand-run` feature rather than `backend-tests`: every test in them is
-    # `#[ignore]`d, so ungated this run links and executes sixteen binaries that run
-    # nothing. `just test-workspace` and `just lint` enable that feature.
-    # One gate is named package-qualified: `rlx-lbm`'s graph targets sit behind
-    # its `backend-tests`, and a bare `--features backend-tests` here would turn
-    # that gate on for every crate in the contour. It resolves only while
-    # `rlx-lbm` stays in `default-members`.
-    lbm="--features rlx-lbm/backend-tests"
+    # `product_features` is a comma-separated list with no spaces, so word
+    # splitting is safe. Empty means no `--features` at all, not `--features ""`.
+    FEAT=""
+    [[ -z "{{product_features}}" ]] || FEAT="--features {{product_features}}"
     if [[ "$(uname -s)" == Darwin ]]; then
-        cargo test --release --tests -j "$CPUS" $lbm
+        cargo test --release --tests -j "$CPUS" {{product_set}} $FEAT
     else
-        # One test target that fails to compile aborts the whole workspace
-        # run, `--no-fail-fast` or not — on the Linux rig that was seven
-        # ungated Apple-only tests, and zero tests ran. Build every target
-        # first so the report names all of them. The feature set has to match
-        # the test run's, or cargo rebuilds every crate for one of them.
-        cargo build --release --tests --keep-going -j "$CPUS" $lbm
-        cargo test --release --tests -j "$CPUS" $lbm -- --test-threads="$CPUS"
+        # One test target that fails to compile aborts the whole run,
+        # `--no-fail-fast` or not — on the Linux rig that was seven ungated
+        # Apple-only tests, and zero tests ran. Build every target first so the
+        # report names all of them. The feature set has to match the test run's,
+        # or cargo rebuilds every crate for one of them.
+        cargo build --release --tests --keep-going -j "$CPUS" {{product_set}} $FEAT
+        cargo test --release --tests -j "$CPUS" {{product_set}} $FEAT -- --test-threads="$CPUS"
     fi
     just test-debug-verifier restricted
 
@@ -1255,21 +1356,23 @@ android-e2e *ARGS:
 run-verbose CMD:
     RLX_VERBOSE=1 {{CMD}}
 
-# The routine gate: this fork's default contour (`default-members` in
-# Cargo.toml) plus the gates that only exist here. `build`, `test` and `lint`
-# name no package, so they cover the contour and not the twenty-one upstream
-# members this fork deliberately does not build. `check-corpus` and
-# `test-third-order-cpu` stay here because every package they name *is* a default
-# member — narrowing the contour was about the members this fork does not build,
-# and neither drags any of them in. `check-rustdoc-contour` is the same gate over
-# the contour rather than all eighty-four publishable crates. The Python binding
-# is outside all of it: `crates/bindings/pyrlx` is `exclude`d from the workspace,
-# so nothing builds it and no gate runs its tests — though gates do read files
-# inside it, and `just torch-import` runs its pure-Python front-end (the `exclude`
-# comment in Cargo.toml is the list).
+# The routine gate: the contour's build and lint (`default-members` in
+# Cargo.toml), the product set's tests (see `product_set` above), plus the gates
+# that only exist here. `build` and `lint` name no package and `test` names the
+# product set — all three stay inside the contour and none reaches the
+# twenty-one upstream members this fork deliberately does not build.
+# `check-corpus` stays because it is what carries `rlx-corpus`'s coverage now that
+# the round does not. `test-third-order-cpu` stays because every package it names
+# is a default member, so it drags in no member this fork does not build.
+# `check-rustdoc-contour` is the same gate over the contour rather than all
+# eighty-four publishable crates. The Python binding is outside all of it:
+# `crates/bindings/pyrlx` is `exclude`d from the workspace, so nothing builds it
+# and no gate runs its tests — though gates do read files inside it, and `just
+# torch-import` runs its pure-Python front-end (the `exclude` comment in
+# Cargo.toml is the list).
 # `ci-workspace` is the whole-set gate, run once per upstream sync (see
 # `docs/fork-sync.md`).
-ci: build test fmt-check lint check-fork-layers check-rlx-env-vars check-example-names check-doc-links check-license-headers check-wgsl-uniform check-op-coverage check-corpus test-third-order-cpu check-rustdoc-contour
+ci: build check-product-set test fmt-check lint check-fork-layers check-rlx-env-vars check-example-names check-doc-links check-license-headers check-wgsl-uniform check-op-coverage check-corpus test-third-order-cpu check-rustdoc-contour
 # Everything, once per upstream sync: the routine gate above plus every member
 # upstream ships — the Apple/NVIDIA/AMD/Intel/TPU/embedded backends and every
 # other member but the binding crates (`bindings_excl`). The binding block is
@@ -1296,8 +1399,15 @@ ci-workspace: ci build-workspace test-workspace lint-workspace check-readme chec
 # does not name any of them — a gate that cannot pass on the machine it is run on
 # teaches people to ignore gates.
 ci-rig: ci-workspace test-vulkan test-libm test-rocm leak-check validate-metal-bindings
+# Gate the round's selection against the product and the build step, and print
+# the round's three commands at four jobs so a caller that runs the round from
+# outside this workspace takes its command line from the same list. Lists only, no
+# compilation; the script's docstring is the full statement of what it checks.
+check-product-set:
+    python3 scripts/check-product-set.py
+
 # The two layers this fork re-applies on every sync — the package rename and the
-# narrow test contour — checked rather than trusted (see `docs/fork-sync.md` §2/§3).
+# integration-test gating — checked rather than trusted (see `docs/fork-sync.md` §2/§3).
 # `--selftest` runs the rename layer's write path and the caret arithmetic the
 # pre-flight decides on: `--check` only compares, so neither is visible to it.
 check-fork-layers:

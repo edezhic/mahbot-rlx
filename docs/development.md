@@ -56,17 +56,21 @@ it, or wait out the 600 s idle timeout.
 just build          # build this fork's contour (bare `cargo build`; see Cargo.toml
                     # `default-members`) — `just build-workspace` is every member
                     # but the binding crates
-just test           # cargo test, fast smoke gate: unit tests + pool-width checks
-                    # integration targets: add `--features backend-tests`
+just test           # cargo test, fast smoke gate: the product set's unit tests
+                    # + the pool-width checks; integration targets: add
+                    # `--features backend-tests`
                     # `--tests`: no doctest and no example is compiled —
                     # `just test-workspace` keeps both, once per sync
                     # it runs the `restricted` arm of `test-debug-verifier`;
                     # the bare recipe is the hand-run `full` gate
-                    # also the *selection*: a bare `cargo test` here means this
-                    # fork's default contour, not every member (Cargo.toml
-                    # `default-members`) — the Apple/CUDA/ROCm/NPU backends are
-                    # out of it (Linux x86_64 excepted: rlx-collectives' retained
-                    # dev-dependency row still pulls CUDA/ROCm/XDNA in there)
+                    # also the *selection*: the product set — the default
+                    # members on `mahbot-inference`'s normal dependency closure
+                    # plus `rlx-check` by a clause, enumerated in the Justfile's
+                    # `product_set` with a clause for every default member that
+                    # leaves. Narrower than the contour: the Apple/CUDA/ROCm/NPU
+                    # backends were never in it.
+                    # `just check-product-set` fails if a product dependency is
+                    # missing from the list.
 just test-gpu       # Darwin: Metal/wgpu/CoreML + third-order. Linux: wgpu, CUDA
                     # where it builds, and the ROCm rows. Every backend it builds
                     # must have a device (`RLX_REQUIRE_DEVICE=1`)
@@ -76,8 +80,8 @@ just lint           # clippy (-D warnings) over the contour
 just fmt            # rustfmt
 just fmt-check      # rustfmt --check
 just install-git-hooks  # pre-commit auto-fmt + clippy
-just ci             # the routine gate: contour build + tests + fmt-check + clippy
-                    # + the fork-only gates
+just ci             # the routine gate: contour build + product-set tests +
+                    # fmt-check + clippy + the fork-only gates
 just ci-workspace   # the whole-set gate, once per upstream sync (depends on `ci`)
 just ci-rig         # `ci-workspace` plus the rows that need a toolkit of their
                     # own: HIP, `leaks`, `xcrun metal`, musl, a Vulkan ICD

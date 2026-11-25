@@ -50,6 +50,10 @@ Closes #
      `just ci` spans GPU/ROCm; run what your hardware supports, CI covers the rest. -->
 
 - [ ] Ran what my hardware supports locally (at least `just fmt`, `just lint`, `just test`).
+- [ ] If this touches a crate outside the round's **product set** (`just test`'s
+      selection — the Justfile's `product_set`, enumerated there), that crate's
+      own suite (`cargo test -p <crate>`) passed too; the routine round no longer
+      speaks for it, and `just test-workspace` is the whole-set run before a sync.
 - [ ] The change is focused; no unrelated refactors.
 - [ ] Style, comment density, and idioms match the surrounding code.
 - [ ] Tests: added / updated meaningful parity or integration coverage

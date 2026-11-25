@@ -58,13 +58,13 @@ picks between them.
 ## Dev loop
 
 - **Local gate:** `just ci` is the whole-set build, `fmt-check`, lint, and
-  pyrlx pytest suite — and its test step is the **default
-  selection**, a fast smoke gate: the unit tests of the crates in this fork's
-  default contour plus the pool-width checks. That contour is the
-  `default-members` in [`Cargo.toml`](Cargo.toml), not every member — the Apple /
-  CUDA / ROCm / NPU backends are not even compiled by it (on Linux x86_64,
-  rlx-collectives' retained upstream dev-dependency row still pulls CUDA / ROCm /
-  XDNA into the run). The heavy integration
+  pyrlx pytest suite — and its test step is the **product set**, a fast smoke
+  gate: the unit tests of the default members on `mahbot-inference`'s normal
+  dependency closure, plus `rlx-check` by a clause — the graph checker and doctor,
+  whose tests are their only coverage — plus the pool-width checks. That set is
+  the Justfile's `product_set` — a subset of the `default-members` in
+  [`Cargo.toml`](Cargo.toml) and far short of every member — so the Apple / CUDA /
+  ROCm / NPU backends are not even compiled by it. The heavy integration
   suites do real device/graph work and are opt-in with `--features
   backend-tests`, through the recipes that name them (`test-gpu`, `test-rocm`,
   `test-third-order-gpu`). It spans the GPU / ROCm matrix, so run the
@@ -101,15 +101,29 @@ research op — use the stable seams in
 - New backend work needs a **cross-backend parity test** against the CPU
   reference — a numeric match, not a shape-or-compile check. Prefer meaningful
   parity/integration coverage over trivial asserts.
-- `just test` runs the default selection — this fork's contour, see
-  `default-members` in [`Cargo.toml`](Cargo.toml): those crates' unit tests plus
-  the pool-width checks. `--tests` keeps doctests and examples out of the
-  routine round; `just test-workspace` compiles both and runs the doctests, once
-  per sync. The heavy integration suites are opt-in with
-  `--features backend-tests`; `just test-gpu` adds the host GPU backends and
-  runtime feature tests, and the backend-specific recipes (`just test-mlx`,
-  `just test-rocm`, `just test-fpga`, …) pass that gate for the targets they
-  name. They all live in the [`Justfile`](Justfile).
+- `just test` runs the **product set** — the default members on
+  `mahbot-inference`'s normal dependency closure plus `rlx-check` by a clause,
+  listed once as `product_set` in the [`Justfile`](Justfile) with a clause for
+  every default member that leaves: those crates' unit tests plus the pool-width
+  checks. `--tests` keeps doctests and examples out of the routine round;
+  `just test-workspace` compiles both and runs the doctests, once per sync. The
+  heavy integration suites are opt-in with `--features backend-tests`; `just
+  test-gpu` adds the host GPU backends and runtime feature tests, and the
+  backend-specific recipes (`just test-mlx`, `just test-rocm`, `just test-fpga`,
+  …) pass that gate for the targets they name. They all live in the
+  [`Justfile`](Justfile).
+- **Touching a crate the round does not cover** — anything off the product set
+  (`rlx-corpus`, `rlx-bench`, `rlx-lbm`, the solvers, the ONNX / PyTorch
+  importers, …): the routine round no longer speaks for it. The only departing
+  crates any gate runs at all are `rlx-corpus` (`check-corpus`) and `rlx-sparse`
+  (`test-gpu`, macOS); `rlx-bench`'s and `rlx-lbm`'s suites and, on Linux,
+  `rlx-sparse`'s have no gate anywhere. Run that crate's own suite
+  (`cargo test -p <crate>`, with `--features backend-tests` where its targets
+  sit behind that gate), and run `just test-workspace` before a sync — the
+  whole-set recipe still runs every member. `just check-product-set` fails when
+  a crate the product *does* link has fallen out of the round, or when the
+  round's normal graph adds a crate the build step does not compile; it will not
+  tell you about a crate that has left the product path.
 
 ## Before you start
 

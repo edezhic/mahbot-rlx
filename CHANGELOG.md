@@ -25,6 +25,44 @@ release, rename `[Unreleased]` to the new version and add a fresh empty
 
 ### Changed
 
+- The routine test round runs the **product set**, not the whole contour: the
+  default members on `mahbot-inference`'s normal dependency closure at the
+  features the product builds with, plus `rlx-check` — the graph checker and
+  doctor, whose tests are that tool's only coverage. Thirty-four of the
+  fifty-five default members leave, each because the product does not link it
+  rather than because the round wanted fewer tests; `product_set` in the
+  `Justfile` states the selection once with a clause per departing crate, and
+  `default-members` is untouched, so the build, lint, doc and publish paths still
+  cover the whole contour and `just test-workspace` still runs every member. The
+  only gates that run a departing crate's suite are `check-corpus` (`rlx-corpus`,
+  in `just ci`) and `just test-gpu` (`rlx-sparse`, Darwin only, in
+  `ci-workspace`), so three surfaces have no gate anywhere, named as losses:
+  `rlx-bench`'s suite, `rlx-lbm`'s suite (its three graph targets included), and,
+  on the Linux rig, `rlx-sparse`'s suite. Everything else departing is the
+  whole-set recipe's, run before a sync. The round's test list loses 564 entries
+  and gains **none** on one macOS tree, all inside departing crates; on Linux
+  x86_64 one further body leaves for a feature,
+  `hetero::tests::real_cpu_cuda_split_matches_single`: it ran there only because
+  departing `rlx-collectives`' target-specific dev-dependency turned
+  `rlx-runtime`'s `cuda` on, and `just test-gpu`'s Linux arm runs it only where
+  `cargo check -p mahbot-rlx-runtime --features cpu,cuda,gpu` succeeds. The other
+  features the previous round resolved and this one does not —
+  `rlx-runtime/mdns`, `mahbot-rlx-libm/libm` — gate no test body. Apart from the
+  test-only `rlx-runtime/training` variant that `rlx-flow`'s
+  dev-dependency already forced, the kept crates are compiled in the variant the
+  product ships: `mahbot-rlx-pkg/zstd-native` is the one feature the round pins to
+  match `just build`'s resolution. Six of the departing crates still compile as
+  libraries — through `rlx-pkg/convert`, through `rlx-runtime/training`, and as
+  dev-dependencies of kept crates — so the cut is smaller than thirty-four crates
+  implies. At four jobs imposed on all three commands, same tree, same session,
+  after `just build`: the release arm falls from 439 s to 252 s on the heavier
+  edit (`touch crates/core/rlx-ir/src/lib.rs`) and from 34 s to 27 s on the
+  inference-crate edit; the two debug arms do not depend on the selection, so the
+  round as a whole is 291 s where the debug profile is already warm and 367 s
+  where it starts cold — their 102 s cold against 27 s warm is the whole
+  difference — against 554 s before. A second round compiles zero units.
+  `just check-product-set` (in `just ci`) is the drift guard: lists only, no
+  compilation, `--locked`, and it prints the round's three commands paste-ready.
 - The routine test round compiles and runs only `#[test]`s. `just test` (both
   platforms) and the `restricted` arm of `just test-debug-verifier` pass
   `--tests`, so the round compiles no doctest and builds no example; both are the

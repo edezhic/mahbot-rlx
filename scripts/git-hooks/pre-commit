@@ -11,9 +11,10 @@ ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
 # The two layers this fork re-applies on every upstream sync — the package rename
-# and the narrow test contour — are checked whenever a manifest or one of the
+# and the integration-test gating — are checked whenever a manifest or one of the
 # layer scripts is staged (see `docs/fork-sync.md` §2/§3). Cheap, and it is the
-# only thing that notices a sync that forgot to re-apply them.
+# only thing that notices a sync that forgot to re-apply them. The round's own
+# selection (`product_set` in the Justfile) is not one of them.
 if git diff --cached --name-only | grep -qE '(^|/)Cargo\.toml$|^scripts/fork-'; then
   python3 scripts/fork-rename.py --selftest
   python3 scripts/fork-rename.py --check
