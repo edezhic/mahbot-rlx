@@ -464,7 +464,8 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     let thunks = &schedule.thunks;
     let len = thunks.len();
 
-    // Pre-allocate ALL reusable buffers once (zero per-call allocation)
+    // Pre-allocate ALL reusable buffers once (zero per-call allocation, apart from
+    // the head-major attention route's per-task score block)
     let max_h = thunks
         .iter()
         .filter_map(|t| match t {
@@ -503,8 +504,9 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     let (max_batch, max_seq, max_heads, _max_dh) = max_sdpa;
     let _ = (max_batch, max_seq, max_heads);
     // Heads whose score matrix is large run row-blocked with per-worker
-    // buffers (`sdpa_row_blocked`): they need none of this up-front scratch,
-    // which for long sequences would be gigabytes zeroed on every run.
+    // buffers (`sdpa_row_blocked`), and head-major attention gives each task
+    // its own k_s-long block: neither needs this up-front scratch, which for
+    // long sequences would be gigabytes zeroed on every run.
     let sdpa_need = thunks
         .iter()
         .filter_map(|t| match t {
@@ -525,8 +527,9 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     *kv_seq as usize,
                     *heads as usize,
                 );
-                if sdpa_row_blocked(q, k, *mask_kind, *bhsd)
-                    && sdpa_sme_blocks(q, k, *head_dim as usize, *v_head_dim as usize)
+                if *bhsd
+                    || (sdpa_row_blocked(q, k, *mask_kind)
+                        && sdpa_sme_blocks(q, k, *head_dim as usize, *v_head_dim as usize))
                 {
                     Some(0)
                 } else {
@@ -2394,75 +2397,108 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         b * q_s * hs_v
                     };
                     let out_data = sl_mut(*out, base, out_len);
+                    // `sl_mut` answers an empty slice for a node the planner left
+                    // without a slot — its documented contract for a DCE-orphaned
+                    // node, whose writes are then discarded. Every route below
+                    // addresses the output, so the check belongs here once rather
+                    // than in whichever route happens to index it. `plan_memory`
+                    // assigns a slot to everything it schedules today, so this is
+                    // defence in depth rather than a live branch.
+                    if out_data.is_empty() {
+                        continue;
+                    }
 
-                    // ── [B, H, S, D] fallback ──────────────────────
-                    // The NEON / strided-BLAS specializations below
-                    // are written for the [B, S, H, D] layout. When
-                    // the input is head-major ([B, H, S, D] —
-                    // matching rlx-cuda / rlx-rocm / rlx-tpu), bypass
-                    // them and run a simple (correct but slower)
-                    // scalar implementation. Production-CPU inference
-                    // graphs use [B, S, H, D] so they still hit the
-                    // hot path; cross-backend parity tests use
-                    // [B, H, S, D] and land here.
+                    // ── [B, H, S, D]: the same arithmetic, a query row at a time ──
+                    // The routes below serve [B, S, H, D]. They cannot take this
+                    // layout: it is inferred from shape, and a tensor whose second
+                    // axis is the head count is indistinguishable from one whose
+                    // second axis is the sequence (a 16-token, 16-head window).
+                    //
+                    // One query row is the unit of work — its scores, its softmax
+                    // and its output row are one chain — so the result is the
+                    // scalar loop's bit for bit, which a reassociated
+                    // key-dimension sum is not. Each task takes a run of rows and
+                    // allocates one k_s-long score block for them, so the scratch
+                    // follows the pool rather than the graph; `sdpa_need` skips
+                    // this layout for that reason.
                     if bhsd {
-                        let scores = &mut sdpa_scores[..ss];
-                        for bi in 0..b {
-                            for hi in 0..nh {
+                        let o_addr = out_data.as_mut_ptr() as usize;
+                        // A synthetic mask wants the query's own key position.
+                        let q_offset = k_s.saturating_sub(q_s);
+                        let run = |off: usize, cnt: usize| {
+                            let mut scores = vec![0f32; k_s];
+                            for u in off..off + cnt {
+                                let qi = u % q_s;
+                                let bh = u / q_s;
+                                let (bi, hi) = (bh / nh, bh % nh);
                                 let kv_hi = hi / group; // GQA/MQA: shared KV head
-                                let q_head_base = bi * nh * q_s * dh + hi * q_s * dh;
-                                let k_head_base = bi * nkv * k_s * dh + kv_hi * k_s * dh;
+                                let q_base = u * dh; // (bh * q_s + qi) is u
+                                let k_head_base = (bi * nkv + kv_hi) * k_s * dh;
                                 // Q@K^T
-                                for qi in 0..q_s {
-                                    let q_base = q_head_base + qi * dh;
-                                    for ki in 0..k_s {
-                                        let k_base = k_head_base + ki * dh;
-                                        let mut dot = 0f32;
-                                        for d in 0..dh {
-                                            dot += q_data[q_base + d] * k_data[k_base + d];
-                                        }
-                                        scores[qi * k_s + ki] = dot * scale;
-                                        if matches!(mask_kind, rlx_ir::op::MaskKind::Custom)
-                                            && !mask_data.is_empty()
-                                            && mask_data[bi * k_s + ki] < mask_thr
-                                        {
-                                            scores[qi * k_s + ki] = mask_neg;
-                                        }
+                                for ki in 0..k_s {
+                                    let k_base = k_head_base + ki * dh;
+                                    let mut dot = 0f32;
+                                    for d in 0..dh {
+                                        dot += q_data[q_base + d] * k_data[k_base + d];
+                                    }
+                                    scores[ki] = dot * scale;
+                                    if matches!(mask_kind, rlx_ir::op::MaskKind::Custom)
+                                        && !mask_data.is_empty()
+                                        && mask_data[bi * k_s + ki] < mask_thr
+                                    {
+                                        scores[ki] = mask_neg;
                                     }
                                 }
                                 if matches!(mask_kind, rlx_ir::op::MaskKind::Bias) {
-                                    let off = (bi * nh + hi) * q_s * k_s;
-                                    for i in 0..q_s * k_s {
-                                        scores[i] += mask_data[off + i];
+                                    let m_off = u * k_s;
+                                    for ki in 0..k_s {
+                                        scores[ki] += mask_data[m_off + ki];
                                     }
                                 }
-                                apply_synthetic_mask(scores, q_s, k_s, *mask_kind);
+                                apply_synthetic_mask_row(
+                                    scores.as_mut_slice(),
+                                    q_offset + qi,
+                                    mask_neg,
+                                    *mask_kind,
+                                );
                                 // Gemma 2 attention logit soft-cap (post-mask, pre-softmax).
                                 if *softcap > 0.0 {
                                     for s in scores.iter_mut() {
                                         *s = *softcap * (*s / *softcap).tanh();
                                     }
                                 }
-                                crate::kernels::neon_softmax(scores, q_s, k_s);
-                                // score @ V — V and output are dh_v-wide per head.
-                                let o_head_base = bi * nh * q_s * dh_v + hi * q_s * dh_v;
-                                let v_head_base = bi * nkv * k_s * dh_v + kv_hi * k_s * dh_v;
-                                for qi in 0..q_s {
-                                    let o_base = o_head_base + qi * dh_v;
-                                    for d in 0..dh_v {
-                                        out_data[o_base + d] = 0.0;
-                                    }
-                                    for ki in 0..k_s {
-                                        let sc = scores[qi * k_s + ki];
-                                        if sc > score_thr {
-                                            let v_base = v_head_base + ki * dh_v;
-                                            for d in 0..dh_v {
-                                                out_data[o_base + d] += sc * v_data[v_base + d];
-                                            }
+                                crate::kernels::neon_softmax(&mut scores, 1, k_s);
+                                // score @ V — V and the output are dh_v-wide per
+                                // head, and this task owns this output row.
+                                let o = std::slice::from_raw_parts_mut(
+                                    (o_addr as *mut f32).add(u * dh_v),
+                                    dh_v,
+                                );
+                                let v_head_base = (bi * nkv + kv_hi) * k_s * dh_v;
+                                o.fill(0.0);
+                                for ki in 0..k_s {
+                                    let sc = scores[ki];
+                                    if sc > score_thr {
+                                        let v_base = v_head_base + ki * dh_v;
+                                        for d in 0..dh_v {
+                                            o[d] += sc * v_data[v_base + d];
                                         }
                                     }
                                 }
                             }
+                        };
+                        let total = b * nh * q_s;
+                        // `grain_for` rows per task: the finest grain the pool's
+                        // work floor allows, so a light shape (a short decode) stays
+                        // on one thread rather than paying the hand-off.
+                        let grain = crate::pool::grain_for(2 * k_s * dh);
+                        let one_thread = rlx_ir::env::flag("RLX_CPU_ATTN_HEAD_MAJOR_SERIAL");
+                        #[cfg(any(test, feature = "backend-tests"))]
+                        note_head_major_arm(!one_thread);
+                        if one_thread {
+                            run(0, total);
+                        } else {
+                            crate::pool::par_for(total, grain, &run);
                         }
                         continue;
                     }
@@ -2668,7 +2704,7 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                 }
                             }
                         }
-                    } else if sdpa_row_blocked(q_s, k_s, *mask_kind, bhsd)
+                    } else if sdpa_row_blocked(q_s, k_s, *mask_kind)
                         && sdpa_sme_blocks(q_s, k_s, dh, dh_v)
                     {
                         // ── Row-blocked path (long sequences, SME2) ──
@@ -4936,21 +4972,16 @@ pub(crate) fn exec_nop(t: &Thunk) {
 
 /// Score-matrix size above which an attention head runs row-blocked
 /// (`RLX_SDPA_BLOCK_MIN`, default 4M floats = 16 MB): every mask that needs
-/// no query position (none, per-key `Custom`, additive `Bias`), `[B, S, H, D]`.
-pub(crate) fn sdpa_row_blocked(
-    q_s: usize,
-    k_s: usize,
-    mask: rlx_ir::op::MaskKind,
-    bhsd: bool,
-) -> bool {
+/// no query position (none, per-key `Custom`, additive `Bias`). Rows-first
+/// only — the head-major route never reaches it, so it takes no layout flag.
+pub(crate) fn sdpa_row_blocked(q_s: usize, k_s: usize, mask: rlx_ir::op::MaskKind) -> bool {
     static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let min = *MIN.get_or_init(|| {
         rlx_ir::env::var("RLX_SDPA_BLOCK_MIN")
             .and_then(|v| v.parse().ok())
             .unwrap_or(1 << 22)
     });
-    !bhsd
-        && q_s.saturating_mul(k_s) > min
+    q_s.saturating_mul(k_s) > min
         && matches!(
             mask,
             rlx_ir::op::MaskKind::None | rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::Bias

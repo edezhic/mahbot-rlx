@@ -1,9 +1,12 @@
 // RLX — versatile ML compiler + runtime.
 // Copyright (C) 2026 Eugene Hauptmann, Natalya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Fixtures shared by the single-row packed-multiply tests. `tests/common/` is not
-//! a test target of its own; each test binary pulls it in with `mod common;`.
+//! Fixtures shared by the CPU backend's kernel tests. `tests/common/` is not a test
+//! target of its own; each test binary pulls it in with `mod common;`.
+#![allow(dead_code)] // every binary that includes this module uses a subset of it
 use rlx_gguf::GgmlType;
+
+pub mod attn;
 
 /// Max relative error, normalized by `max(1, |want|)` so that an output near zero
 /// cannot dominate the figure.

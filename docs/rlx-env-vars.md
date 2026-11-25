@@ -13,14 +13,14 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 833  
+**Registered names:** 834  
 **Unregistered mentions (migration leftovers):** 107
 
 ## Groups
 
 - [compile](#compile) — 32
 - [coreml](#coreml) — 20
-- [cpu](#cpu) — 41
+- [cpu](#cpu) — 42
 - [cuda](#cuda) — 77
 - [debug](#debug) — 21
 - [device](#device) — 4
@@ -121,6 +121,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_BLAS_SEARCH` | Internal | String | Backend(cpu) | Extra directories searched for the RLX_BLAS_LINK libraries |
 | `RLX_CPU_ARENA_REPORT` | Internal | Bool | Backend(cpu) | Attribute the CPU arena's resident bytes to the nodes holding them |
 | `RLX_CPU_ATTN_BWD_FUSE` | Internal | String | Backend(cpu) | Opt in to the fused CPU attention-backward path (default off) |
+| `RLX_CPU_ATTN_HEAD_MAJOR_SERIAL` | Bisect | Bool | Backend(cpu) | Run head-major attention on one thread instead of the pool (pricing arm; default off) |
 | `RLX_CPU_BNNS_BF16` | Internal | String | Backend(cpu) | Opt in to the BNNS bf16 GEMM path (lossy f32 to bf16 downcast) |
 | `RLX_CPU_BNNS_F16` | Internal | String | Backend(cpu) | Opt in to the BNNS f16 GEMM path (half bandwidth) |
 | `RLX_CPU_DUMP_DIR` | Internal | Path | Backend(cpu) | Directory for RLX_CPU_DUMP_NODE_DATA output |

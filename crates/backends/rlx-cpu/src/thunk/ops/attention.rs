@@ -3,6 +3,30 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::thunk::*;
+#[cfg(any(test, feature = "backend-tests"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Head-major attention calls per arm, `[pooled, one_thread]`. Both arms compute
+/// the same bits by design, so a test that has to tell a live switch from one the
+/// kernel ignores reads them here. Compiled only for test builds: the increments
+/// are two relaxed atomics per call, which the shipped binary does not pay.
+#[cfg(any(test, feature = "backend-tests"))]
+static HEAD_MAJOR_ARM: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+#[cfg(any(test, feature = "backend-tests"))]
+#[inline]
+pub(crate) fn note_head_major_arm(pooled: bool) {
+    HEAD_MAJOR_ARM[if pooled { 0 } else { 1 }].fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(pooled, one_thread)` head-major attention calls so far.
+#[cfg(any(test, feature = "backend-tests"))]
+pub fn head_major_arm_counts() -> (u64, u64) {
+    (
+        HEAD_MAJOR_ARM[0].load(Ordering::Relaxed),
+        HEAD_MAJOR_ARM[1].load(Ordering::Relaxed),
+    )
+}
 
 /// Apply a synthetic (kernel-generated) attention mask to a `[q_seq, k_seq]`
 /// scores matrix. Custom masks are read from a tensor and not handled here.
@@ -16,36 +40,46 @@ pub(crate) fn apply_synthetic_mask(
 ) {
     let neg = crate::config::RuntimeConfig::global().attn_mask_neg_inf;
     let q_offset = k_seq.saturating_sub(q_seq);
+    for qi in 0..q_seq {
+        apply_synthetic_mask_row(&mut scores[qi * k_seq..][..k_seq], q_offset + qi, neg, kind);
+    }
+}
+
+/// [`apply_synthetic_mask`] for one row whose query position is `abs_q`: the key
+/// the row sits at, from which each mask kind derives its own window. The matrix
+/// form derives that position from `k_seq - q_seq`, which a route holding one row
+/// at a time cannot use, so the mask itself lives here and both callers share it.
+/// `neg` is the caller's because the thunk schedule carries its own copy of the
+/// fill value, resolved at compile time, where the matrix form reads the config.
+#[inline]
+pub(crate) fn apply_synthetic_mask_row(
+    row: &mut [f32],
+    abs_q: usize,
+    neg: f32,
+    kind: rlx_ir::op::MaskKind,
+) {
+    let k_seq = row.len();
     match kind {
         rlx_ir::op::MaskKind::None | rlx_ir::op::MaskKind::Custom | rlx_ir::op::MaskKind::Bias => {}
         rlx_ir::op::MaskKind::Causal => {
-            for qi in 0..q_seq {
-                let abs_q = q_offset + qi;
-                for ki in (abs_q + 1)..k_seq {
-                    scores[qi * k_seq + ki] = neg;
-                }
+            for ki in (abs_q + 1)..k_seq {
+                row[ki] = neg;
             }
         }
         rlx_ir::op::MaskKind::SlidingWindow(w) => {
-            for qi in 0..q_seq {
-                let abs_q = q_offset + qi;
-                let lo = abs_q.saturating_sub(w);
-                for ki in 0..k_seq {
-                    if ki < lo || ki > abs_q {
-                        scores[qi * k_seq + ki] = neg;
-                    }
+            let lo = abs_q.saturating_sub(w);
+            for ki in 0..k_seq {
+                if ki < lo || ki > abs_q {
+                    row[ki] = neg;
                 }
             }
         }
         rlx_ir::op::MaskKind::Window(w) => {
-            for qi in 0..q_seq {
-                let abs_q = q_offset + qi;
-                let lo = abs_q.saturating_sub(w);
-                let hi = abs_q + w;
-                for ki in 0..k_seq {
-                    if ki < lo || ki > hi {
-                        scores[qi * k_seq + ki] = neg;
-                    }
+            let lo = abs_q.saturating_sub(w);
+            let hi = abs_q + w;
+            for ki in 0..k_seq {
+                if ki < lo || ki > hi {
+                    row[ki] = neg;
                 }
             }
         }

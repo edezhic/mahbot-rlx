@@ -4878,6 +4878,15 @@
         layer: EnvLayer::Backend("cpu"),
     },
     EnvVarEntry {
+        name: "RLX_CPU_ATTN_HEAD_MAJOR_SERIAL",
+        group: "cpu",
+        summary: "Run head-major attention on one thread instead of the pool (pricing arm; default off)",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Bisect,
+        aliases: &[],
+        layer: EnvLayer::Backend("cpu"),
+    },
+    EnvVarEntry {
         name: "RLX_CPU_BNNS_BF16",
         group: "cpu",
         summary: "Opt in to the BNNS bf16 GEMM path (lossy f32 to bf16 downcast)",
