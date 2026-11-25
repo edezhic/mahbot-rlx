@@ -407,9 +407,9 @@ product_features := "mahbot-rlx-pkg/zstd-native"
 # lib unit tests, doctests, examples and auto-discovered test files from every
 # run.
 #
-# `mahbot-inference` gates sixteen more targets behind its own `hand-run`
+# `mahbot-inference` gates seventeen more targets behind its own `hand-run`
 # feature rather than `backend-tests`: every test in them is `#[ignore]`d, so
-# ungated this run links and executes sixteen binaries that run nothing. `just
+# ungated this run links and executes seventeen binaries that run nothing. `just
 # test-workspace` and `just lint` enable that feature.
 #
 # No `-j` cap, on either platform: cargo runs test binaries strictly one at a
@@ -454,7 +454,7 @@ test:
 # red out of the box is not a gate: a sync reads the red as a regression and
 # chases it.
 #
-# One gated set is reached on purpose: `mahbot-inference`'s sixteen hand-run targets
+# One gated set is reached on purpose: `mahbot-inference`'s seventeen hand-run targets
 # are behind that crate's `hand-run` feature so the routine run does not link
 # binaries that execute nothing, and `--features mahbot-inference/hand-run` below
 # is what keeps this whole-set run's coverage where it was.
@@ -736,7 +736,7 @@ lint: lint-features
     # `backend-tests`: the default test selection is a fast smoke set, and
     # `required-features` hides every gated target from `--all-targets` too —
     # without it they would not be type-checked by `just lint` at all. `hand-run`
-    # is the same for `mahbot-inference`'s sixteen hand-run targets.
+    # is the same for `mahbot-inference`'s seventeen hand-run targets.
     cargo clippy --all-targets --features backend-tests,hand-run -- -D warnings
 
 # Every member but the binding crates (`bindings_excl`), once per upstream sync

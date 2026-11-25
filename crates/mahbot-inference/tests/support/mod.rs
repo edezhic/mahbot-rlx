@@ -185,6 +185,31 @@ pub fn solo(subject: &str) -> std::sync::MutexGuard<'static, ()> {
     }
 }
 
+/// The processor, forced with the product's own switch, alone in this binary.
+///
+/// # Safety
+/// The caller is the only subject running — [`solo`] refuses a second one rather than
+/// serialising it, and the invocation names one test thread — and the product has not read
+/// the switch yet, because its first compile comes after this call.
+pub fn force_processor(subject: &str) -> std::sync::MutexGuard<'static, ()> {
+    let alone = solo(subject);
+    // SAFETY: see above; no other subject is in the process to read the environment.
+    unsafe { std::env::set_var("MAHBOT_DEVICE", "cpu") };
+    alone
+}
+
+/// The subject's device, asserted rather than assumed: a switch that were ignored, or a pin
+/// that had already latched, would let a check measure the graphics device and pass under a
+/// processor heading. Asked after the first compile, because that is where the product
+/// settles its device.
+pub fn assert_settled_on_the_processor() {
+    assert_eq!(
+        mahbot_inference::device::settled(),
+        "cpu",
+        "the check's first graph settled on another device"
+    );
+}
+
 /// Run `body` with the environment `key` at `value`, then put the key back to what it held
 /// (unset if it held nothing): a graph the body builds keeps the route it was built with,
 /// and the key is process-global, so the restore is a guard rather than a trailing line.

@@ -10,6 +10,8 @@
 //! (llama.cpp-style); other schemes still fold one 256-element super-block
 //! at a time into stack storage.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rlx_gguf::QK_K;
 use rlx_gguf::q2_dequant::{Q2_0_BLOCK_BYTES, Q8_0_G128_BYTES, QK2_0};
 use rlx_ir::quant::QuantScheme;
@@ -294,8 +296,21 @@ fn gguf_matmul_bt_ex(
     }
 }
 
-/// Widen one packed weight row into `dst`, one block at a time. `blk` is the
-/// caller's super-block scratch, so a row loop allocates nothing per row.
+/// The arm [`dequant_row`] takes: the direct arrangement only when the switch is on *and*
+/// the block is the whole super-block. The branch and the row accounting share this one
+/// predicate, so a scheme whose block is not the super-block cannot be counted on the arm
+/// it did not take.
+#[inline]
+pub(crate) fn direct_arm(direct: bool, block_elems: usize) -> bool {
+    direct && block_elems == QK_K
+}
+
+/// Widen one packed weight row into `dst`, one block at a time, for both routes that widen a
+/// whole row. `direct` picks the arrangement through [`direct_arm`]. Direct: a scheme whose
+/// block is the whole super-block decodes straight into `dst` (the staging copy below wrote
+/// every weight twice) and the four-bit decode takes [`rlx_gguf::q4k_fast::block`] instead.
+/// Staged: the reference decode through `blk`, which is the caller's scratch, so a row loop
+/// allocates nothing per row.
 pub(crate) fn dequant_row(
     scheme: QuantScheme,
     row: &[u8],
@@ -303,11 +318,55 @@ pub(crate) fn dequant_row(
     block_bytes: usize,
     block_elems: usize,
     blk: &mut [f32; QK_K],
+    direct: bool,
 ) {
-    for (b, out) in dst.chunks_exact_mut(block_elems).enumerate() {
-        dequant_block(scheme, &row[b * block_bytes..(b + 1) * block_bytes], blk);
-        out.copy_from_slice(&blk[..block_elems]);
+    if direct_arm(direct, block_elems) {
+        let four_bit = scheme == QuantScheme::GgufQ4K;
+        for (b, out) in dst.chunks_exact_mut(QK_K).enumerate() {
+            let out: &mut [f32; QK_K] = out.try_into().expect("one super-block");
+            let block = &row[b * block_bytes..][..block_bytes];
+            if four_bit {
+                rlx_gguf::q4k_fast::block(block.try_into().expect("one Q4_K block"), out);
+            } else {
+                dequant_block(scheme, block, out);
+            }
+        }
+    } else {
+        for (b, out) in dst.chunks_exact_mut(block_elems).enumerate() {
+            dequant_block(scheme, &row[b * block_bytes..][..block_bytes], blk);
+            out.copy_from_slice(&blk[..block_elems]);
+        }
     }
+}
+
+/// Whether a packed weight row takes [`dequant_row`]'s direct arrangement:
+/// `RLX_GGUF_ROW_DECODE` (default on), and never under the portable arithmetic,
+/// where the staged reference decode is the arm being validated.
+#[inline]
+pub(crate) fn direct_decode() -> bool {
+    !crate::config::portable() && rlx_ir::env::flag_or("RLX_GGUF_ROW_DECODE", true)
+}
+
+static DIRECT_ROWS: AtomicU64 = AtomicU64::new(0);
+static STAGED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// The weight rows this process has widened each way — `(direct, staged)` — for a harness
+/// that has to prove which arm of `RLX_GGUF_ROW_DECODE` a call took: the two arms write the
+/// same values by construction, so a take cannot tell them apart from its answer. The count
+/// is of rows actually decoded, on the arm the row decode actually took. One relaxed add
+/// per route call (per stripe in the tile route), so a weight-row loop pays it nothing; the
+/// same instrument `rlx-wgpu`'s `route_counts` gives its packed multiply.
+pub fn row_decodes() -> (u64, u64) {
+    (
+        DIRECT_ROWS.load(Ordering::Relaxed),
+        STAGED_ROWS.load(Ordering::Relaxed),
+    )
+}
+
+/// Record `rows` weight rows decoded by the arm `direct` names.
+pub(crate) fn note_rows(direct: bool, rows: usize) {
+    let counter = if direct { &DIRECT_ROWS } else { &STAGED_ROWS };
+    counter.fetch_add(rows as u64, Ordering::Relaxed);
 }
 
 /// `out[mi, j] = x[mi, :] · W[j, :]` with `W` `[n, k]` in GGUF blocks: each
@@ -330,13 +389,23 @@ fn gguf_matmul_bt_rows_dot(
     let row_bytes = blocks_per_row * block_bytes;
     let mut wrow = vec![0f32; k];
     let mut blk = [0f32; QK_K];
+    let direct = direct_decode();
     for j in 0..n {
         let row = &w_bytes[j * row_bytes..(j + 1) * row_bytes];
-        dequant_row(scheme, row, &mut wrow, block_bytes, block_elems, &mut blk);
+        dequant_row(
+            scheme,
+            row,
+            &mut wrow,
+            block_bytes,
+            block_elems,
+            &mut blk,
+            direct,
+        );
         for mi in 0..m {
             out[mi * n + j] = dot_f32(&x[mi * k..(mi + 1) * k], &wrow);
         }
     }
+    note_rows(direct_arm(direct, block_elems), n);
 }
 
 /// A dot product in eight independent lanes, so it vectorizes without
@@ -2390,6 +2459,48 @@ mod rows_dot_tests {
         gguf_matmul_bt_rows_dot(&x, &wq, &mut got, m, k, n, scheme, bb, be);
         for (a, b) in want.iter().zip(&got) {
             assert!((a - b).abs() <= 1e-4 * (1.0 + a.abs()), "{a} vs {b}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod dequant_row_tests {
+    use super::*;
+
+    /// [`dequant_row`]'s direct arrangement against the staged one it replaces, on the
+    /// two whole-super-block schemes the product's model files carry. The values must be
+    /// the same bits rather than the same to a tolerance: the direct form drops a copy,
+    /// not a rounding, and takes the four-bit decode's fixed-size arrangement with it.
+    #[test]
+    fn the_direct_row_decode_is_the_staged_one() {
+        for (ggml, scheme) in [
+            (rlx_gguf::GgmlType::Q4K, QuantScheme::GgufQ4K),
+            (rlx_gguf::GgmlType::Q6K, QuantScheme::GgufQ6K),
+        ] {
+            let (k, n) = (1024usize, 8usize);
+            let w: Vec<f32> = (0..n * k)
+                .map(|i| {
+                    let v = ((i as f32 + 3.0) * 0.011).sin();
+                    if i % 89 == 0 { v * 7.0 } else { v }
+                })
+                .collect();
+            let packed = rlx_gguf::quantize(&w, ggml).expect("encode");
+            let (bb, be) = (
+                scheme.gguf_block_bytes() as usize,
+                scheme.gguf_block_size() as usize,
+            );
+            let row_bytes = k / be * bb;
+            let mut direct = vec![0f32; k];
+            let mut staged = vec![0f32; k];
+            let mut blk = [0f32; QK_K];
+            for j in 0..n {
+                let row = &packed[j * row_bytes..(j + 1) * row_bytes];
+                dequant_row(scheme, row, &mut direct, bb, be, &mut blk, true);
+                dequant_row(scheme, row, &mut staged, bb, be, &mut blk, false);
+                for (a, b) in direct.iter().zip(&staged) {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{ggml:?} row {j}");
+                }
+            }
         }
     }
 }

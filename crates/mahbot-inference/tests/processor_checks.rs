@@ -46,31 +46,6 @@ const ROW_SECONDS: usize = 30;
 /// this machine's processor, so the bound is not near the reading.
 const MAX_SATURATED: usize = 8;
 
-/// The processor, forced with the product's own switch, alone in this binary.
-///
-/// # Safety
-/// The caller is the only check running — `support::solo` refuses a second subject rather than
-/// serialising it, and the invocation names one test thread — and the product has not read the
-/// switch yet, because its first compile is below this call.
-fn force_processor() -> std::sync::MutexGuard<'static, ()> {
-    let alone = support::solo("the processor's three checks");
-    // SAFETY: see above; no other check is in the process to read the environment.
-    unsafe { std::env::set_var("MAHBOT_DEVICE", "cpu") };
-    alone
-}
-
-/// The check's subject, asserted rather than assumed: a switch that were ignored, or a pin that
-/// had already latched, would otherwise let a check measure the graphics device and pass under a
-/// processor heading — the failure the processor path exists to remove. Asked after the first
-/// compile, because that is where the product settles its device.
-fn assert_settled_on_the_processor() {
-    assert_eq!(
-        mahbot_inference::device::settled(),
-        "cpu",
-        "the check's first graph settled on another device"
-    );
-}
-
 /// **The tagger on the processor.** Every other harness here pins the graphics device, so the
 /// product's tagger had only ever been read there — which is how a 527-way head saturating at
 /// exactly 1.0 reached a record, withholding most of the speech from the recogniser, with
@@ -89,7 +64,7 @@ fn assert_settled_on_the_processor() {
 #[test]
 #[ignore = "needs the installed model tree and the pinned corpus; run by hand"]
 fn the_processor_tagger_reads_the_recording_as_speech() {
-    let _alone = force_processor();
+    let _alone = support::force_processor("the processor's three checks");
     support::assert_tail_group_shipped();
     let Some((dir, ..)) = support::pair_paths(Role::Recognition, &[CED_MODEL]) else {
         return;
@@ -118,7 +93,7 @@ fn the_processor_tagger_reads_the_recording_as_speech() {
     let tags = tagger
         .tags(&mel)
         .unwrap_or_else(|error| panic!("the tagger's windows: {error:#}"));
-    assert_settled_on_the_processor();
+    support::assert_settled_on_the_processor();
     let labels: Vec<&str> = tags
         .iter()
         .map(|tag| tagger.labels()[tag.index].as_str())
@@ -189,7 +164,7 @@ fn the_processor_tagger_reads_the_recording_as_speech() {
 #[test]
 #[ignore = "needs the installed model tree and the pinned corpus; run by hand"]
 fn the_processor_reads_the_recording() {
-    let _alone = force_processor();
+    let _alone = support::force_processor("the processor's three checks");
     support::assert_tail_group_shipped();
     let Some((dir, body, sound)) = support::pair_paths(Role::Recognition, &[CED_MODEL]) else {
         return;
@@ -211,7 +186,7 @@ fn the_processor_reads_the_recording() {
     let out = transcriber
         .transcribe(&audio, listen::SAMPLE_RATE)
         .unwrap_or_else(|error| panic!("the processor's reading: {error:#}"));
-    assert_settled_on_the_processor();
+    support::assert_settled_on_the_processor();
     out.check()
         .unwrap_or_else(|error| panic!("the regions do not tile the input: {error:#}"));
     let read: String = out
@@ -288,7 +263,7 @@ fn rendered(label: &str, wave: &[f32]) -> u64 {
 #[test]
 #[ignore = "needs the installed model tree and the pinned corpus; run by hand"]
 fn the_processor_renders_the_request_and_hears_it_back() {
-    let _alone = force_processor();
+    let _alone = support::force_processor("the processor's three checks");
     support::assert_tail_group_shipped();
     support::with_env("RLX_REPRODUCIBLE", "0", || {
         support::with_env("RLX_Q8_0_EXACT_GEMV", "0", || {
@@ -300,7 +275,7 @@ fn the_processor_renders_the_request_and_hears_it_back() {
             let wave = engine
                 .synthesize(stand::SHORT_TEXT, stand::SYNTH_SEED)
                 .expect("the processor's synthesis call");
-            assert_settled_on_the_processor();
+            support::assert_settled_on_the_processor();
             let digest = rendered("render", &wave);
             // The same text and the same seed must give the same waveform, bit for bit.
             let again = engine

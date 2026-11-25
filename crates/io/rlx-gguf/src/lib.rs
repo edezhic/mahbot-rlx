@@ -86,6 +86,7 @@ pub mod mx_quantize;
 pub mod ptq1_dequant;
 pub mod q1_dequant;
 pub mod q2_dequant;
+pub mod q4k_fast;
 pub mod quantize;
 #[cfg(feature = "ir")]
 mod scheme;

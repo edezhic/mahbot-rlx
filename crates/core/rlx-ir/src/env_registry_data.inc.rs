@@ -1533,6 +1533,15 @@
         layer: EnvLayer::Tooling,
     },
     EnvVarEntry {
+        name: "RLX_GGUF_ROW_DECODE",
+        group: "misc",
+        summary: "CPU: decode a packed weight row straight into the destination's f32 slab instead of a per-block staging copy, and decode Q4_K with fixed-size slices, the inlined scale/minimum unpack and a four-lane store; 0 keeps the staged reference decode",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Bisect,
+        aliases: &[],
+        layer: EnvLayer::Tooling,
+    },
+    EnvVarEntry {
         name: "RLX_GGUF_TILED_BLAS",
         group: "misc",
         summary: "CPU: dequantise a packed weight a tile of rows at a time and hand each tile to the vendor BLAS for every multi-row (m > 1) multiply; 0 keeps the fused dequant-and-dot GEMM",

@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 834  
+**Registered names:** 835  
 **Unregistered mentions (migration leftovers):** 107
 
 ## Groups
@@ -29,7 +29,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [gpu](#gpu) — 8
 - [gpu-host](#gpu-host) — 1
 - [metal](#metal) — 210
-- [misc](#misc) — 114
+- [misc](#misc) — 115
 - [mlx](#mlx) — 30
 - [oneapi](#oneapi) — 5
 - [onnx](#onnx) — 6
@@ -573,6 +573,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_GGUF_GEMV_ELEM` | Bisect | String | Tooling | CUDA/ROCm one-row GGUF matmul: 0 keeps Q4_K / Q6_K on the block-strided kernels and Q5_K on dequant + matmul instead of the element-strided one (Q8_0 always uses it) |
 | `RLX_GGUF_MATMUL_LEGACY` | Bisect | Bool | Tooling | Use the legacy GGUF matmul dispatch instead of gguf_matmul_bt_dispatch |
 | `RLX_GGUF_PACKED_Q4_1` | Internal | Bool | Tooling | Keep GGUF Q4_1 tensors packed for DequantMatMul (CPU, Metal, MLX) instead of expanding them to F32 |
+| `RLX_GGUF_ROW_DECODE` | Bisect | Bool | Tooling | CPU: decode a packed weight row straight into the destination's f32 slab instead of a per-block staging copy, and decode Q4_K with fixed-size slices, the inlined scale/minimum unpack and a four-lane store; 0 keeps the staged reference decode |
 | `RLX_GGUF_TILED_BLAS` | Bisect | Bool | Tooling | CPU: dequantise a packed weight a tile of rows at a time and hand each tile to the vendor BLAS for every multi-row (m > 1) multiply; 0 keeps the fused dequant-and-dot GEMM |
 | `RLX_GGUF_TRACE` | Bisect | Bool | Tooling | Trace GGUF header and tensor parsing |
 | `RLX_GPU_HANDLE_HOST_MIRROR` | Bisect | Bool | Tooling | Mirror GPU handle outputs to the host on every read |

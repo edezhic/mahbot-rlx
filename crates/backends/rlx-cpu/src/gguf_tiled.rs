@@ -220,6 +220,9 @@ fn matmul_bt_striped(
     // striped call does not pay a heap trip per tile.
     let mut weights = vec![0f32; stripes * rows * k];
     let mut cols = vec![0f32; stripes * m * rows];
+    // One arm for the whole call: the switch is process-global, so reading it once
+    // here rather than per row in a worker keeps every stripe on the same arm.
+    let direct = crate::gguf_matmul::direct_decode();
     // Each stripe writes a disjoint band of `out`'s columns, so the shared
     // destination is sound even though the closure cannot see that. The bands are
     // `tile * rows` for `tile ≡ stripe (mod stripes)`, which are pairwise disjoint
@@ -232,6 +235,7 @@ fn matmul_bt_striped(
         .enumerate()
         .for_each(|(stripe, (wbuf, obuf))| {
             let mut blk = [0f32; QK_K];
+            let mut widened = 0usize;
             let mut tile = stripe;
             while tile < tiles {
                 let j0 = tile * rows;
@@ -251,7 +255,9 @@ fn matmul_bt_striped(
                         block_bytes,
                         block_elems,
                         &mut blk,
+                        direct,
                     );
+                    widened += 1;
                 }
                 let ot = &mut obuf[..m * jn];
                 crate::blas::sgemm_bt(x, &wbuf[..jn * k], ot, m, k, jn, 1.0);
@@ -271,6 +277,10 @@ fn matmul_bt_striped(
                 }
                 tile += stripes;
             }
+            crate::gguf_matmul::note_rows(
+                crate::gguf_matmul::direct_arm(direct, block_elems),
+                widened,
+            );
         });
 }
 

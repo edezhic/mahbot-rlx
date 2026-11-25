@@ -122,7 +122,7 @@ each member at its *default* features, so a target behind
 `required-features = "backend-tests"` is still skipped — the wgpu integration
 suite among them. `test-gpu` is what builds those, which is why
 `ci-workspace` names it. `test-workspace` names one feature itself —
-`--features mahbot-inference/hand-run` — because that crate's sixteen hand-run
+`--features mahbot-inference/hand-run` — because that crate's seventeen hand-run
 targets were part of the whole-set run before they were gated (its manifest says
 why), and a whole-set run that stopped reaching them would lose coverage without
 saying so.
@@ -257,6 +257,8 @@ merge action.
 - encode chunking, so chunk n+1's host encode overlaps chunk n's execution
 - the row-grouped 8-row packed GEMM and its split-k arm
 - the cooperative-matrix packed GEMM, and its 16-row short last row group
+- the direct row decode and the four-bit block's fixed-size arrangement in
+  `rlx_gguf::q4k_fast` (`RLX_GGUF_ROW_DECODE`, reached by `rlx-cpu`'s `dequant_row` only)
 - the many-row and split decode attention routes
 - broadcast-`Expand` elision in front of binary ops
 - the mel framing fold
