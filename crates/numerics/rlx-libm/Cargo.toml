@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-libm"
-version                = "0.2.18-mahbot.4"
+version                = "0.2.18-mahbot.5"
 edition.workspace      = true
 rust-version.workspace = true
 description = "glibc 2.43's libm (x86_64 FMA variants) reproduced bit-for-bit in pure Rust: exp, log, pow, trig, inverse trig, hyperbolic, erf, gamma, f32 and f64"

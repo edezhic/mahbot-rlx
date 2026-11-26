@@ -1,6 +1,6 @@
 [package]
 name = "mahbot-rlx-gguf"
-version                = "0.2.18-mahbot.4"
+version                = "0.2.18-mahbot.5"
 edition.workspace      = true
 rust-version.workspace = true
 description = "GGUF v1/v2/v3 parser + dequantization to f32. The default `ir` feature maps GGML types to RLX `QuantScheme`; with default features off the crate has no rlx-* deps."
