@@ -99,6 +99,19 @@ active row the first pass's uploads as well. A fire is cheaper than the active
 row, because it starts a cooldown that skips the gate and the scoring; the active
 row measures the common case, the whole time somebody is talking.
 
+These two rows are the table's cheapest, where a stall landing in one sample can be
+several times the measurement, so their `warm` cell is the median of five requests
+rather than one: the middle of five, no interpolation. The five are taken in
+sequence on the one warm listener, each a fresh detection stream over the same
+second of audio, each gated as a single sample is gated, and each dropped before
+the next begins; the five times are printed on the console, and the record and the
+row's diagnostics line carry the middle one, while `warm_reread` states the arm's
+pages summed over the five. `cold` stays a single sample on both devices: a second
+cold sample in the same process would not be cold, because the weight pools and the
+compiled pipelines the column's definition depends on survive the page-cache
+eviction. The memory columns are read as they are for every row — resting before the
+arm and the lifetime peak after it — so these two rows' peak spans five samples.
+
 The enrolment and its calibration are a one-time setup outside the product's
 start-up and are in neither column: the stand's is a pinned prototype
 (`src/enrolment.rs`), loaded as a stored enrolment rather than derived, so no

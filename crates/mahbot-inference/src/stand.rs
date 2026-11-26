@@ -17,7 +17,11 @@
 //! page cache that does not hold the models, so the call loads them — including the
 //! listening rows' bring-up, which maps the pair and compiles the wake graphs. Warm time
 //! is the same call with the models resident and the engine already loaded: a request on an
-//! engine that is up, which is what every request after a daemon's first one costs.
+//! engine that is up, which is what every request after a daemon's first one costs. The two
+//! listening rows are the table's cheapest, so their warm figure is the median of five such
+//! requests — each a fresh stream over the same warm listener, the five printed and the
+//! middle recorded — while their cold figure stays a single sample: a second cold sample in
+//! one process would not be cold.
 //! Neither state is inherited from an earlier row or an earlier run — the cold one is made
 //! before its arm and the warm one is checked around it (`cold`) — so a row measures what
 //! it says it measures. The memory columns are the footprint readings — the system's share,
@@ -96,6 +100,11 @@ pub const WAKE_OFFSET: usize = 16_000;
 /// paired encoder passes.
 const STREAM_SECONDS: usize = 1;
 const STREAM_SAMPLES: usize = STREAM_SECONDS * listen::SAMPLE_RATE as usize;
+
+/// The warm column's samples for the two listening rows, whose warm cell is the middle of five:
+/// the cheapest rows in the table, where a stall in the one sample could be several times the
+/// measurement. Their cold column stays a single sample.
+const WARM_SAMPLES: usize = 5;
 
 /// The background row's microphone floor, as a share of full scale and as a seed: far
 /// below speech, so the voice-activity detector decides on every hop and finds none. The
@@ -275,10 +284,10 @@ fn measure(row: &Row, bounds: Bounds) -> Result<Reading> {
 /// rather than a figure.
 ///
 /// The second is measured and stated on the row, and refused only when it is more than half
-/// the pages the cold arm read: a warm call that re-reads most of the model is priced as a
+/// the pages the cold arm read: a warm arm that re-reads most of the model is priced as a
 /// cold one and would be recorded as a warm figure, so the take is refused and re-taken. The
 /// line is at half rather than at zero because the product releases a call's graphs and the
-/// warm call rebuilds them, so some pages always come back; a row that re-reads most of the
+/// warm arm rebuilds them, so some pages always come back; a row that re-reads most of the
 /// file measured the disk, not the product.
 ///
 /// The loader's record is per thread, which is the shape it needs for two concurrent builds —
@@ -306,7 +315,7 @@ fn warm_checked(row: &Row, cache: &cold::Cache, held: &cold::Held) -> Result<usi
     for (path, fresh, total) in &grown {
         eprintln!(
             "stand: {}: the warm arm re-read {fresh} of {total} page(s) of {} ({pages} of {all} \
-             across the row) — the row's warm figure includes that read",
+             across the row) — the row's warm arm includes that read",
             row.name,
             path.display()
         );
@@ -476,9 +485,9 @@ fn synthesis(row: &Row, text: &str, witness: u64, witness_samples: usize) -> Res
 }
 
 /// One listening session on the product's own loop (`bench::detect`) — the gate, the
-/// spliced windows, the stride, the rolling decision and the flush — cold and then warm
-/// through one listener, which is built once and held: a daemon's form, and the one this
-/// row must not measure a rebuild of.
+/// spliced windows, the stride, the rolling decision and the flush — cold once and then warm
+/// [`WARM_SAMPLES`] times through one listener, which is built once and held: a daemon's
+/// form, and the one this row must not measure a rebuild of.
 fn listening(
     row: &Row,
     audio: Audio,
@@ -505,9 +514,32 @@ fn listening(
     let opened = loader::take_opened();
     let memory = report::Memory::take();
     let held = cache.reading(opened)?;
-    let t = Stopwatch::start();
-    let warm = session(&mut listener, &enrollment, &samples, deadline)?;
-    let warm_ms = t.ms();
+    // The warm arm: the samples in sequence over the one warm listener, each a fresh
+    // detection stream dropped before the next begins, each gated as the single sample was.
+    let mut taken: Vec<(f64, reference::WakeWitness, Option<bool>)> =
+        Vec::with_capacity(WARM_SAMPLES);
+    for _ in 0..WARM_SAMPLES {
+        let t = Stopwatch::start();
+        let warm = session(&mut listener, &enrollment, &samples, deadline)?;
+        let warm_ms = t.ms();
+        listening_gates(row, audio, warm, witness)?;
+        let equal = compared(row, warm == witness, || {
+            format!("the session moved from its witness ({warm} against {witness})")
+        });
+        taken.push((warm_ms, warm, equal));
+    }
+    // The spread, printed as taken; the record carries the middle of the five.
+    eprintln!(
+        "stand: {}: warm samples {}",
+        row.name,
+        taken
+            .iter()
+            .map(|(ms, ..)| report::fmt_ms(*ms))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    taken.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    let (warm_ms, warm, equal) = taken[WARM_SAMPLES / 2];
     let re_read = warm_checked(row, &cache, &held)?;
 
     if cold != warm {
@@ -516,6 +548,30 @@ fn listening(
             row.name, cold, warm,
         );
     }
+    let mut detail = run::detail([
+        ("seconds", json!(STREAM_SECONDS)),
+        ("session", json!(warm.to_string())),
+        ("warm_reread", json!(re_read)),
+    ]);
+    pin(&mut detail, &witness.to_string(), equal);
+    Ok(Reading::new(
+        row.name,
+        cold_ms,
+        warm_ms,
+        memory.finish(),
+        detail,
+    ))
+}
+
+/// What one warm sample must be for the row to be the row it says: a session with no speech
+/// in it for the background row, one that scored and did not fire for the active row, and on
+/// the processor the witness's decisions — no median outvotes a correctness failure.
+fn listening_gates(
+    row: &Row,
+    audio: Audio,
+    warm: reference::WakeWitness,
+    witness: reference::WakeWitness,
+) -> Result<()> {
     match audio {
         Audio::Idle => {
             if warm.vad != 0 {
@@ -560,28 +616,13 @@ fn listening(
         && warm.windows == witness.windows
         && warm.passes == witness.passes
         && warm.fires == witness.fires;
-    let equal = compared(row, warm == witness, || {
-        format!("the session moved from its witness ({warm} against {witness})")
-    });
     if crate::device::of() == rlx_runtime::Device::Cpu && !decided {
         bail!(
             "{}: the session's decisions moved from the witness ({warm} against {witness})",
             row.name
         );
     }
-    let mut detail = run::detail([
-        ("seconds", json!(STREAM_SECONDS)),
-        ("session", json!(warm.to_string())),
-        ("warm_reread", json!(re_read)),
-    ]);
-    pin(&mut detail, &witness.to_string(), equal);
-    Ok(Reading::new(
-        row.name,
-        cold_ms,
-        warm_ms,
-        memory.finish(),
-        detail,
-    ))
+    Ok(())
 }
 
 /// One listening session: the product's detection stream over the row's audio, at the
