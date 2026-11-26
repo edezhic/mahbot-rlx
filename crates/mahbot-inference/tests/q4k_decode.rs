@@ -25,8 +25,6 @@
 use std::time::Instant;
 
 use mahbot_inference::loader::{Class, Model, Role, Store};
-use mahbot_inference::transcribe::Transcriber;
-use mahbot_inference::{host, listen, reference, stand};
 use rlx_gguf::{GgmlType, Q4K_BLOCK_BYTES, QK_K};
 use rlx_ir::quant::QuantScheme;
 
@@ -568,55 +566,27 @@ fn the_recognition_row_on_the_processor() {
     // SAFETY: `force_processor` holds the binary's one subject, so nothing else is reading
     // the environment; the product's first compile is below.
     unsafe { std::env::set_var("MAHBOT_PHASE_SPLIT", "1") };
-    support::assert_tail_group_shipped();
-    let Some(recording) = support::recording(stand::RECOGNITION_RECORDING) else {
+    let Some(mut row) = support::Row::open(None) else {
         return;
     };
-    let audio = host::wav_mono_16k(&recording.display().to_string(), 0, usize::MAX)
-        .unwrap_or_else(|error| panic!("{}: {error:#}", recording.display()));
-    let mut transcriber = Transcriber::open_product(support::ceiling_mib())
-        .expect("the transcriber opens on the processor");
-    let mut answer: Option<String> = None;
-    let mut call = |transcriber: &mut Transcriber, direct: bool| -> f64 {
+    let call = |row: &mut support::Row, direct: bool| -> f64 {
         support::with_env(
             "RLX_GGUF_ROW_DECODE",
             if direct { "1" } else { "0" },
             || {
                 let t = Instant::now();
-                let out = transcriber
-                    .transcribe(&audio, listen::SAMPLE_RATE)
-                    .unwrap_or_else(|error| panic!("the row's reading: {error:#}"));
-                out.check()
-                    .unwrap_or_else(|error| panic!("the regions do not tile the input: {error:#}"));
-                let read: String = out
-                    .regions
-                    .iter()
-                    .filter_map(|region| region.text.as_deref())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                assert!(
-                    !reference::words(&read).is_empty(),
-                    "the row read nothing at all of {}",
-                    stand::RECOGNITION_RECORDING
-                );
-                match &answer {
-                    Some(first) => assert_eq!(
-                        &read, first,
-                        "the decode moved the row's answer, so it is not the reference's"
-                    ),
-                    None => answer = Some(read),
-                }
+                row.call();
                 t.elapsed().as_secs_f64() * 1e3
             },
         )
     };
-    // One warm-up each, so neither arm pays the graph build the other has cached.
-    let warm_direct = call(&mut transcriber, true);
+    // One warm-up each, so the model open and the graph build fall outside the take.
+    let warm_direct = call(&mut row, true);
     support::assert_settled_on_the_processor();
-    let warm_staged = call(&mut transcriber, false);
+    let warm_staged = call(&mut row, false);
     println!("warm-up: direct {warm_direct:.0} ms, staged {warm_staged:.0} ms");
     let (direct, staged) = paired(4, |round, arm| {
-        let ms = call(&mut transcriber, arm);
+        let ms = call(&mut row, arm);
         println!(
             "round {round}: {} {ms:.0} ms",
             if arm { "direct" } else { "staged" }

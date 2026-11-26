@@ -4887,6 +4887,15 @@
         layer: EnvLayer::Backend("cpu"),
     },
     EnvVarEntry {
+        name: "RLX_CPU_ATTN_HEAD_MAJOR_SCALAR",
+        group: "cpu",
+        summary: "Run head-major attention's inner loops one element at a time instead of a lane block (reference arm; default off)",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Bisect,
+        aliases: &[],
+        layer: EnvLayer::Backend("cpu"),
+    },
+    EnvVarEntry {
         name: "RLX_CPU_ATTN_HEAD_MAJOR_SERIAL",
         group: "cpu",
         summary: "Run head-major attention on one thread instead of the pool (pricing arm; default off)",

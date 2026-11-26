@@ -138,6 +138,14 @@ pub fn serial(on: bool) {
     rlx_ir::env::set("RLX_CPU_ATTN_HEAD_MAJOR_SERIAL", if on { "1" } else { "0" });
 }
 
+/// `RLX_CPU_ATTN_HEAD_MAJOR_SCALAR=1` puts the route's two inner loops back on one
+/// element at a time — the reference the lane kernels are compared against, and
+/// the arm this route ran before them. Process-wide for the same reason [`serial`]
+/// is.
+pub fn scalar_body(on: bool) {
+    rlx_ir::env::set("RLX_CPU_ATTN_HEAD_MAJOR_SCALAR", if on { "1" } else { "0" });
+}
+
 /// One compiled attention graph in its own arena, inputs filled once.
 pub struct Run {
     arena: Arena,

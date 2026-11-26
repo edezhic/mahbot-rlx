@@ -268,6 +268,15 @@ merge action.
   probe inside each group's dot. A sync that takes it back reverts this with no compile
   error and no change to any answer
 - the many-row and split decode attention routes
+- the head-major attention route's lane inner loops (`head_major_dots` over eight keys
+  behind a per-call transposed K, `head_major_weights` over a block of the output's
+  columns) in `rlx-cpu`'s `exec_dispatch.rs`: one accumulator per lane, summed in the
+  scalar loop's own order, so both are its bits where a lane per reduced element — the
+  rows-first route's `vfmaq`/`vaddvq` shape, over the head width in the dots and over the
+  keys in the weights — reassociates that sum and moves transcripts.
+  `RLX_CPU_ATTN_HEAD_MAJOR_SCALAR` and the geometry table in
+  `tests/attention_head_major_route.rs` hold the two to the same bits, so a sync that
+  takes the loops back reverts this with no compile error and no change to any answer
 - broadcast-`Expand` elision in front of binary ops
 - the mel framing fold
 - 1×1 pointwise-GEMM and convolution route thresholds

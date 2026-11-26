@@ -2421,32 +2421,64 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                     // allocates one k_s-long score block for them, so the scratch
                     // follows the pool rather than the graph; `sdpa_need` skips
                     // this layout for that reason.
+                    //
+                    // Both inner loops run a block of lanes at a time; the kernels'
+                    // doc comments carry why that keeps the scalar loop's bits, and
+                    // `RLX_CPU_ATTN_HEAD_MAJOR_SCALAR` reaches the scalar arm.
                     if bhsd {
                         let o_addr = out_data.as_mut_ptr() as usize;
                         // A synthetic mask wants the query's own key position.
                         let q_offset = k_s.saturating_sub(q_s);
+                        // A key-lane dot reads a transposed K; `TRANSPOSE_MIN_ROWS`
+                        // and `KEY_LANES` are what a head must clear to earn it.
+                        let lanes = !rlx_ir::env::flag("RLX_CPU_ATTN_HEAD_MAJOR_SCALAR")
+                            && q_s >= TRANSPOSE_MIN_ROWS
+                            && k_s >= KEY_LANES;
+                        let one_thread = rlx_ir::env::flag("RLX_CPU_ATTN_HEAD_MAJOR_SERIAL");
+                        #[cfg(test)]
+                        note_head_major_call(!one_thread, lanes);
+                        // `kt[kv * dh * k_s + d * k_s + ki]`: one transposed K per
+                        // KV head, built here and dropped with the call.
+                        let mut kt = Vec::new();
+                        if lanes {
+                            kt.reserve(b * nkv * dh * k_s);
+                            for h in 0..b * nkv {
+                                let src = &k_data[h * k_s * dh..(h + 1) * k_s * dh];
+                                transpose_keys(src, &mut kt, k_s, dh);
+                            }
+                        }
                         let run = |off: usize, cnt: usize| {
                             let mut scores = vec![0f32; k_s];
                             for u in off..off + cnt {
                                 let qi = u % q_s;
                                 let bh = u / q_s;
                                 let (bi, hi) = (bh / nh, bh % nh);
-                                let kv_hi = hi / group; // GQA/MQA: shared KV head
-                                let q_base = u * dh; // (bh * q_s + qi) is u
-                                let k_head_base = (bi * nkv + kv_hi) * k_s * dh;
-                                // Q@K^T
-                                for ki in 0..k_s {
-                                    let k_base = k_head_base + ki * dh;
-                                    let mut dot = 0f32;
-                                    for d in 0..dh {
-                                        dot += q_data[q_base + d] * k_data[k_base + d];
+                                let kv = bi * nkv + hi / group; // GQA/MQA: shared KV head
+                                let q_base = u * dh;
+                                // Q@K^T, or the pre-lane scalar loop
+                                // `RLX_CPU_ATTN_HEAD_MAJOR_SCALAR` selects.
+                                if lanes {
+                                    let q = &q_data[q_base..q_base + dh];
+                                    let kt_head = &kt[kv * dh * k_s..(kv + 1) * dh * k_s];
+                                    head_major_dots(q, kt_head, scores.as_mut_slice(), scale);
+                                } else {
+                                    let k_head_base = kv * k_s * dh;
+                                    for (ki, s) in scores.iter_mut().enumerate() {
+                                        let k_base = k_head_base + ki * dh;
+                                        let mut dot = 0f32;
+                                        for d in 0..dh {
+                                            dot += q_data[q_base + d] * k_data[k_base + d];
+                                        }
+                                        *s = dot * scale;
                                     }
-                                    scores[ki] = dot * scale;
-                                    if matches!(mask_kind, rlx_ir::op::MaskKind::Custom)
-                                        && !mask_data.is_empty()
-                                        && mask_data[bi * k_s + ki] < mask_thr
-                                    {
-                                        scores[ki] = mask_neg;
+                                }
+                                if matches!(mask_kind, rlx_ir::op::MaskKind::Custom)
+                                    && !mask_data.is_empty()
+                                {
+                                    for (ki, s) in scores.iter_mut().enumerate() {
+                                        if mask_data[bi * k_s + ki] < mask_thr {
+                                            *s = mask_neg;
+                                        }
                                     }
                                 }
                                 if matches!(mask_kind, rlx_ir::op::MaskKind::Bias) {
@@ -2474,14 +2506,18 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                                     (o_addr as *mut f32).add(u * dh_v),
                                     dh_v,
                                 );
-                                let v_head_base = (bi * nkv + kv_hi) * k_s * dh_v;
-                                o.fill(0.0);
-                                for ki in 0..k_s {
-                                    let sc = scores[ki];
-                                    if sc > score_thr {
-                                        let v_base = v_head_base + ki * dh_v;
-                                        for d in 0..dh_v {
-                                            o[d] += sc * v_data[v_base + d];
+                                let v_head_base = kv * k_s * dh_v;
+                                if lanes {
+                                    let v_head = &v_data[v_head_base..v_head_base + k_s * dh_v];
+                                    head_major_weights(scores.as_slice(), v_head, o, score_thr);
+                                } else {
+                                    o.fill(0.0);
+                                    for (ki, &sc) in scores.iter().enumerate() {
+                                        if sc > score_thr {
+                                            let v_base = v_head_base + ki * dh_v;
+                                            for (d, od) in o.iter_mut().enumerate() {
+                                                *od += sc * v_data[v_base + d];
+                                            }
                                         }
                                     }
                                 }
@@ -2492,9 +2528,6 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
                         // work floor allows, so a light shape (a short decode) stays
                         // on one thread rather than paying the hand-off.
                         let grain = crate::pool::grain_for(2 * k_s * dh);
-                        let one_thread = rlx_ir::env::flag("RLX_CPU_ATTN_HEAD_MAJOR_SERIAL");
-                        #[cfg(any(test, feature = "backend-tests"))]
-                        note_head_major_arm(!one_thread);
                         if one_thread {
                             run(0, total);
                         } else {
@@ -4868,6 +4901,100 @@ fn execute_thunks_here(schedule: &ThunkSchedule, arena_buf: &mut [u8]) {
     }
 }
 
+/// Keys per lane group of [`head_major_dots`].
+const KEY_LANES: usize = 8;
+
+/// Query rows a head needs before its K transpose pays for itself: the transpose is per KV
+/// head and the dot work per query head, so it adds `1 / (group · rows)` of the work. At
+/// eight rows the harness reads `tail 16x8` at 0.8-1.7x over runs, the low end on a loaded
+/// machine; a decode step's single row cannot pay for the transpose at all, and nothing
+/// between is measured. Clearing the floor is not on its own a win: `wake 2x10` clears it,
+/// pays less transpose (1/10) and reads 0.8-1.3x at a 0.07 ms call. The two differ in
+/// `k_s` — 8 keys is one lane group exactly, 10 leaves a 2-key scalar tail — which the
+/// harness does not separate from the call's own size at that length.
+const TRANSPOSE_MIN_ROWS: usize = 8;
+
+/// Output columns per lane group of [`head_major_weights`].
+const WEIGHT_BLOCK: usize = 32;
+
+/// Appends one KV head's K with the key axis innermost — `kt[d·k_s + ki] = k[ki·dh + d]`
+/// — so a dot reads [`KEY_LANES`] keys with one load.
+fn transpose_keys(k: &[f32], kt: &mut Vec<f32>, k_s: usize, dh: usize) {
+    for d in 0..dh {
+        for ki in 0..k_s {
+            kt.push(k[ki * dh + d]);
+        }
+    }
+}
+
+/// `out[ki] = scale · Σ_d q[d]·kt[d·k_s + ki]` for every key, with `dh = q.len()`
+/// and `k_s = out.len()`.
+///
+/// [`KEY_LANES`] keys run side by side, one accumulator each: a lane sums its
+/// own key's dot over `d` in the order the scalar loop sums it, one multiply and
+/// one add per term, so the result is that loop's bit for bit. A lane per `d`
+/// instead — the shape the rows-first route's `vfmaq`/`vaddvq` dot takes — does
+/// reassociate that sum, and moves the product's transcripts.
+fn head_major_dots(q: &[f32], kt: &[f32], out: &mut [f32], scale: f32) {
+    let k_s = out.len();
+    let mut ki = 0;
+    while ki + KEY_LANES <= k_s {
+        let mut acc = [0f32; KEY_LANES];
+        for (d, &qd) in q.iter().enumerate() {
+            let row = &kt[d * k_s + ki..d * k_s + ki + KEY_LANES];
+            for (a, &k) in acc.iter_mut().zip(row) {
+                *a += qd * k;
+            }
+        }
+        for (o, a) in out[ki..ki + KEY_LANES].iter_mut().zip(acc) {
+            *o = a * scale;
+        }
+        ki += KEY_LANES;
+    }
+    while ki < k_s {
+        let mut dot = 0f32;
+        for (d, &qd) in q.iter().enumerate() {
+            dot += qd * kt[d * k_s + ki];
+        }
+        out[ki] = dot * scale;
+        ki += 1;
+    }
+}
+
+/// `o[d] = Σ_ki scores[ki]·v[ki·dh_v + d]` over the keys whose score clears
+/// `thr`, one lane per output column, with `dh_v = o.len()`.
+///
+/// The lanes are over `d`, so every accumulator still sums over `ki` in key
+/// order: this is the scalar loop's bit for bit, and the skip stays a comparison
+/// rather than a weight. Columns are taken [`WEIGHT_BLOCK`] at a time.
+fn head_major_weights(scores: &[f32], v: &[f32], o: &mut [f32], thr: f32) {
+    let dh_v = o.len();
+    let mut d0 = 0;
+    while d0 + WEIGHT_BLOCK <= dh_v {
+        let mut acc = [0f32; WEIGHT_BLOCK];
+        for (ki, &sc) in scores.iter().enumerate() {
+            if sc > thr {
+                let row = &v[ki * dh_v + d0..ki * dh_v + d0 + WEIGHT_BLOCK];
+                for (a, &x) in acc.iter_mut().zip(row) {
+                    *a += sc * x;
+                }
+            }
+        }
+        o[d0..d0 + WEIGHT_BLOCK].copy_from_slice(&acc);
+        d0 += WEIGHT_BLOCK;
+    }
+    while d0 < dh_v {
+        let mut acc = 0f32;
+        for (ki, &sc) in scores.iter().enumerate() {
+            if sc > thr {
+                acc += sc * v[ki * dh_v + d0];
+            }
+        }
+        o[d0] = acc;
+        d0 += 1;
+    }
+}
+
 /// `dots[j] = Σ_d q[d]·k[keys[j]·stride + off + d]`, summed in `d` order with
 /// one multiply and one add per term — exactly the scalar loop
 /// `dot += q[d] * k[d]`, so bit-identical to it. The scalar loop is a serial
@@ -5016,6 +5143,160 @@ pub(crate) fn sdpa_sme_blocks(q_s: usize, k_s: usize, dh: usize, dh_v: usize) ->
     {
         let _ = (q_s, k_s, dh, dh_v);
         false
+    }
+}
+
+#[cfg(test)]
+mod head_major_lane_tests {
+    use super::{head_major_dots, head_major_weights, transpose_keys};
+
+    fn val(i: usize) -> f32 {
+        ((i * 2_654_435_761 % 10_007) as f32 / 10_007.0 - 0.5) * 3.0
+    }
+
+    /// Key counts with no short group (8), a short last group (252, 111, 10) and no group
+    /// at all (3), at three head widths (64, 128, 8).
+    #[test]
+    fn key_lane_dots_are_the_scalar_loop() {
+        for &(k_s, dh) in &[(252usize, 64usize), (111, 128), (8, 64), (10, 64), (3, 8)] {
+            let q: Vec<f32> = (0..dh).map(val).collect();
+            let k: Vec<f32> = (0..k_s * dh).map(|i| val(i + 7)).collect();
+            let mut kt = Vec::with_capacity(dh * k_s);
+            transpose_keys(&k, &mut kt, k_s, dh);
+            let scale = 1.0 / (dh as f32).sqrt();
+            let want: Vec<f32> = (0..k_s)
+                .map(|ki| {
+                    let mut dot = 0f32;
+                    for d in 0..dh {
+                        dot += q[d] * k[ki * dh + d];
+                    }
+                    dot * scale
+                })
+                .collect();
+            let mut got = vec![0f32; k_s];
+            head_major_dots(&q, &kt, &mut got, scale);
+            for (ki, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "{k_s}×{dh}: key {ki}: {g} vs {w}");
+            }
+        }
+    }
+
+    /// Column counts that never reach a full block (7), leave no tail (64, 128), and leave
+    /// a tail after one full block (40). Every fourth weight sits at the skip.
+    #[test]
+    fn weight_lanes_are_the_scalar_loop() {
+        let thr = 1e-8;
+        for &(k_s, dh_v) in &[(252usize, 64usize), (111, 128), (10, 64), (10, 40), (5, 7)] {
+            let scores: Vec<f32> = (0..k_s)
+                .map(|i| if i % 4 == 3 { 0.0 } else { val(i).abs() + 0.01 })
+                .collect();
+            let v: Vec<f32> = (0..k_s * dh_v).map(|i| val(i + 11)).collect();
+            let mut want = vec![0f32; dh_v];
+            for (ki, &sc) in scores.iter().enumerate() {
+                if sc > thr {
+                    for (d, w) in want.iter_mut().enumerate() {
+                        *w += sc * v[ki * dh_v + d];
+                    }
+                }
+            }
+            let mut got = vec![0f32; dh_v];
+            head_major_weights(&scores, &v, &mut got, thr);
+            for (d, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "{k_s}×{dh_v}: column {d}: {g} vs {w}"
+                );
+            }
+        }
+    }
+}
+
+/// Both switches on the head-major route, proven live at the dispatch level: the lane
+/// block and the pool split compute the same bits as their alternatives, so a kernel
+/// that ignored either would pass every other test here. `head_major_lane_tests` holds
+/// the kernels to the scalar loop's bits; this holds the switches to their arms.
+///
+/// In the lib binary rather than the `backend-tests` integration target so the routine
+/// `cargo test` round reaches it.
+#[cfg(test)]
+mod head_major_switch_tests {
+    /// The two process-global switches, in the order the arms below name them.
+    const KEYS: [&str; 2] = [
+        "RLX_CPU_ATTN_HEAD_MAJOR_SERIAL",
+        "RLX_CPU_ATTN_HEAD_MAJOR_SCALAR",
+    ];
+
+    /// Every `[pooled, lane]` combination, one per counter cell.
+    const ARMS: [[bool; 2]; 4] = [[true, true], [true, false], [false, true], [false, false]];
+
+    /// Both keys put back where they were, on the success path and on a panic: they are
+    /// process-global, and the rest of the lib binary reads them.
+    struct Restore([(&'static str, Option<String>); 2]);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, previous) in &self.0 {
+                match previous {
+                    Some(value) => rlx_ir::env::set(key, value.clone()),
+                    None => rlx_ir::env::unset(key),
+                }
+            }
+        }
+    }
+
+    /// Each arm of [`ARMS`] must take exactly one call and no other cell may move. The
+    /// deltas are exact, so a head-major call from another test running in this binary
+    /// would land on a second cell and fail here — no lock needed, but no other lib test
+    /// may execute this route either.
+    #[test]
+    fn the_switches_select_their_arms() {
+        use crate::arena::Arena;
+        use rlx_ir::op::MaskKind;
+        use rlx_ir::{DType, Graph, Shape};
+
+        let _restore = Restore(KEYS.map(|key| (key, rlx_ir::env::var(key))));
+        // The tagger's shape: six heads, 252 queries, 64-wide, no mask.
+        let f = DType::F32;
+        let (b, h, s, d) = (1usize, 6usize, 252usize, 64usize);
+        let mut g = Graph::new("head-major");
+        let q = g.input("q", Shape::new(&[b, h, s, d], f));
+        let k = g.input("k", Shape::new(&[b, h, s, d], f));
+        let v = g.input("v", Shape::new(&[b, h, s, d], f));
+        let out = g.attention_kind_opts(
+            q,
+            k,
+            v,
+            h,
+            d,
+            MaskKind::None,
+            Shape::new(&[b, h, s, d], f),
+            None,
+            None,
+        );
+        g.set_outputs(vec![out]);
+        let mut arena = Arena::from_plan(rlx_opt::memory::plan_memory(&g));
+        let sched = super::compile_thunks(&g, &arena);
+        for arms in ARMS {
+            let [pooled, lane] = arms;
+            rlx_ir::env::set(KEYS[0], if pooled { "0" } else { "1" });
+            rlx_ir::env::set(KEYS[1], if lane { "0" } else { "1" });
+            let before = super::head_major_call_counts();
+            super::execute_thunks(&sched, arena.raw_buf_mut());
+            let after = super::head_major_call_counts();
+            let moved: Vec<[bool; 2]> = ARMS
+                .into_iter()
+                .filter(|&[p, lane]| {
+                    let (p, lane) = (usize::from(p), usize::from(lane));
+                    after[p][lane] != before[p][lane]
+                })
+                .collect();
+            assert_eq!(
+                moved,
+                vec![arms],
+                "pooled={pooled} lane={lane}: the call landed on {moved:?}"
+            );
+        }
     }
 }
 

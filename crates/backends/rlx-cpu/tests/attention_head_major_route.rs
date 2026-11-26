@@ -5,29 +5,35 @@
 //! Head-major attention runs the same arithmetic it ran before, a query row at a
 //! time on the pool instead of the whole head on the caller's thread: at each
 //! geometry the MahBot product emits (tagger, ASR encoder tail, decoder prefill,
-//! decode steps, the wake window) the pooled result is compared with the serial
-//! loop's and must be the same bits. Bit-identity is the bar because the product's
+//! decode steps, the wake window) the pooled result is compared with the same route
+//! on one thread, and the lane block with the scalar loop, and each pair must be the
+//! same bits. Bit-identity is the bar because the product's
 //! transcripts are greedy-decoded from these graphs, and the reassociating routes —
 //! measurably faster still — move words on the long recognition row.
 //!
-//! `RLX_CPU_ATTN_HEAD_MAJOR_SERIAL` puts head-major back on one thread, so both arms
-//! are levers in one binary rather than two builds.
+//! The route's inner loops run a block of lanes at a time, and both threading arms
+//! share them, so `the_lane_kernels_are_the_scalar_loops` is what holds the lane
+//! block to the scalar loop's bits; `RLX_CPU_ATTN_HEAD_MAJOR_SCALAR` keeps that
+//! scalar loop reachable as the reference. `RLX_CPU_ATTN_HEAD_MAJOR_SERIAL` puts
+//! head-major back on one thread, so both threading arms are levers in one binary
+//! rather than two builds. That each switch selects its arm is a counter test in the
+//! lib unit tests (`thunk::exec_dispatch::head_major_switch_tests`), not here.
 //!
 //! An f64 reference at two geometries is the independent check: two arms agreeing
 //! cannot hide an offset both of them share.
 //!
-//! Every test here holds [`arm`]: the switch is process-global (see [`serial`]) and
-//! the binary's tests run in parallel, so without the lock one test would flip the
-//! arm under another.
+//! Every test here holds [`arm`]: both switches are process-global (see [`serial`])
+//! and the binary's tests run in parallel, so without the lock one test would flip
+//! an arm under another.
 mod common;
 
 use std::sync::{Mutex, MutexGuard};
 
-use common::attn::{CASES, Case, Run, graph, keyed, serial};
+use common::attn::{CASES, Case, Run, graph, keyed, scalar_body, serial};
 use rlx_ir::op::MaskKind;
 
-/// Held for the duration of every test in this binary: the arm switch is one
-/// process-wide flag, so the tests take turns rather than racing on it.
+/// Held for the duration of every test in this binary: both switches are
+/// process-global, so the tests take turns rather than racing on them.
 fn arm() -> MutexGuard<'static, ()> {
     static ARM: Mutex<()> = Mutex::new(());
     // A one-worker pool runs both arms inline, where the comparison is vacuous.
@@ -38,69 +44,62 @@ fn arm() -> MutexGuard<'static, ()> {
     ARM.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// One head-major call under the arm `one_thread` selects.
-fn run(c: &Case, one_thread: bool) -> Vec<f32> {
+/// One head-major call under the arms `(one_thread, scalar)` select.
+fn run_arms(c: &Case, one_thread: bool, scalar: bool) -> Vec<f32> {
     let g = graph(c, true);
     let mut r = Run::new(&g, keyed);
     serial(one_thread);
+    scalar_body(scalar);
     r.call();
     r.output(&g)
 }
 
-/// Bit-identical, not close: the pooled arm is the serial loop's own arithmetic with
-/// the query rows handed out, so any difference at all is a defect.
+/// Bit-identical, not close: the two arms run one arithmetic, so any difference at all
+/// is a defect.
 fn assert_same_bits(want: &[f32], got: &[f32], name: &str) {
     assert_eq!(want.len(), got.len(), "{name}: output length");
     for (i, (w, g)) in want.iter().zip(got).enumerate() {
         assert_eq!(
             w.to_bits(),
             g.to_bits(),
-            "{name}: element {i} is {g:e}, the serial loop gives {w:e}"
+            "{name}: element {i} is {g:e}, the reference gives {w:e}"
         );
     }
 }
 
 #[test]
-fn head_major_is_the_serial_loop_on_the_pool() {
+fn the_pool_is_the_one_thread_route() {
     let _arm = arm();
     println!("pool width {}", rlx_cpu::pool::num_threads());
     for c in CASES {
-        let one_thread = run(c, true);
-        let pooled = run(c, false);
+        let one_thread = run_arms(c, true, false);
+        let pooled = run_arms(c, false, false);
         assert_same_bits(&one_thread, &pooled, c.name);
         // A second pooled call: a race between tasks would have to land on the same
         // bits twice to get past here.
-        assert_same_bits(&pooled, &run(c, false), c.name);
+        assert_same_bits(&pooled, &run_arms(c, false, false), c.name);
         println!("{:<18} identical over {} elements", c.name, pooled.len());
     }
 }
 
-/// The switch has to select the arm, not merely be read: both arms compute the same
-/// bits, so nothing else in this binary would notice a kernel that ignored it.
+/// The two inner-loop arms must agree bit for bit at every geometry the product
+/// emits. This is the comparison [`the_pool_is_the_one_thread_route`] can
+/// no longer make: once both threading arms share the lane block, a one-bit drift
+/// in it would pass every gate here — the f64 reference is 1e-5 loose and the
+/// product's witnesses are not gates. The two decode rows have a single query row, so
+/// both arms take the scalar gate there and that comparison is the route's, not the
+/// lane block's.
 #[test]
-fn the_switch_selects_the_arm() {
+fn the_lane_kernels_are_the_scalar_loops() {
     let _arm = arm();
-    let c = *CASES
-        .iter()
-        .find(|c| c.name == "tagger 252")
-        .expect("a tagger row in the table");
-    let counts = rlx_cpu::thunk::head_major_arm_counts;
-    let (p0, s0) = counts();
-    run(&c, true);
-    let (p1, s1) = counts();
-    assert_eq!(
-        (p1 - p0, s1 - s0),
-        (0, 1),
-        "the switch did not reach the kernel: the serial arm ran {} call(s)",
-        p1 - p0
-    );
-    run(&c, false);
-    let (p2, s2) = counts();
-    assert_eq!(
-        (p2 - p1, s2 - s1),
-        (1, 0),
-        "the pooled arm ran {} call(s)",
-        s2 - s1
+    for c in CASES {
+        let want = run_arms(c, false, true);
+        let got = run_arms(c, false, false);
+        assert_same_bits(&want, &got, c.name);
+    }
+    println!(
+        "{} geometries identical across the two inner-loop arms",
+        CASES.len()
     );
 }
 
@@ -113,13 +112,13 @@ fn keeps_the_logit_softcap() {
         .iter()
         .find(|c| c.softcap.is_some())
         .expect("a capped row in the table");
-    let one_thread = run(&capped, true);
-    let pooled = run(&capped, false);
+    let one_thread = run_arms(&capped, true, false);
+    let pooled = run_arms(&capped, false, false);
     let uncapped = Case {
         softcap: None,
         ..capped
     };
-    let bites = common::max_rel_err(&pooled, &run(&uncapped, false));
+    let bites = common::max_rel_err(&pooled, &run_arms(&uncapped, false, false));
     println!("{:<18} cap effect {bites:.3e}", capped.name);
     assert_same_bits(&one_thread, &pooled, capped.name);
     assert!(
@@ -137,7 +136,7 @@ fn matches_an_f64_reference() {
         .iter()
         .filter(|c| c.name == "tagger 252" || c.name == "prefill 111")
     {
-        let got = run(c, false);
+        let got = run_arms(c, false, false);
         let (b, s, ks, h, kv, d) = (c.batch, c.seq, c.kv_seq, c.heads, c.kv_heads, c.head_dim);
         let scale = 1.0 / (d as f64).sqrt();
         let q = keyed("q", b * h * s * d);
@@ -236,7 +235,11 @@ fn an_extra_attention_writes_only_its_own_slot() {
          what this test would be exercising"
     );
     r.call();
-    assert_same_bits(&run(&c, false), &r.output(&g), "extra attention");
+    assert_same_bits(
+        &run_arms(&c, false, false),
+        &r.output(&g),
+        "extra attention",
+    );
 }
 
 /// A node the planner left without a slot reaches the dispatcher as an empty

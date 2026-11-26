@@ -3,29 +3,31 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 #![allow(unsafe_op_in_unsafe_fn)]
 use crate::thunk::*;
-#[cfg(any(test, feature = "backend-tests"))]
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Head-major attention calls per arm, `[pooled, one_thread]`. Both arms compute
-/// the same bits by design, so a test that has to tell a live switch from one the
-/// kernel ignores reads them here. Compiled only for test builds: the increments
-/// are two relaxed atomics per call, which the shipped binary does not pay.
-#[cfg(any(test, feature = "backend-tests"))]
-static HEAD_MAJOR_ARM: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Head-major attention calls per arm, `[pooled, one_thread]` × `[lane, scalar]`, indexed
+/// by the two flags themselves. Every combination computes the same bits by design, so a
+/// test that has to tell a live switch from one the kernel ignores reads them here. Test
+/// builds only: the increment is one relaxed atomic per call.
+#[cfg(test)]
+static HEAD_MAJOR_CALLS: [[AtomicU64; 2]; 2] = [
+    [AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0)],
+];
 
-#[cfg(any(test, feature = "backend-tests"))]
+#[cfg(test)]
 #[inline]
-pub(crate) fn note_head_major_arm(pooled: bool) {
-    HEAD_MAJOR_ARM[if pooled { 0 } else { 1 }].fetch_add(1, Ordering::Relaxed);
+pub(crate) fn note_head_major_call(pooled: bool, lane: bool) {
+    HEAD_MAJOR_CALLS[usize::from(pooled)][usize::from(lane)].fetch_add(1, Ordering::Relaxed);
 }
 
-/// `(pooled, one_thread)` head-major attention calls so far.
-#[cfg(any(test, feature = "backend-tests"))]
-pub fn head_major_arm_counts() -> (u64, u64) {
-    (
-        HEAD_MAJOR_ARM[0].load(Ordering::Relaxed),
-        HEAD_MAJOR_ARM[1].load(Ordering::Relaxed),
-    )
+/// `[pooled, one_thread]` × `[lane, scalar]` head-major attention calls so far.
+#[cfg(test)]
+pub(crate) fn head_major_call_counts() -> [[u64; 2]; 2] {
+    HEAD_MAJOR_CALLS
+        .each_ref()
+        .map(|arm| arm.each_ref().map(|n| n.load(Ordering::Relaxed)))
 }
 
 /// Apply a synthetic (kernel-generated) attention mask to a `[q_seq, k_seq]`

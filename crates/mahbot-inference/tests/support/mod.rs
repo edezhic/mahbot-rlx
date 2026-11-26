@@ -89,6 +89,31 @@ pub fn median(samples: &[f64]) -> f64 {
     sorted[sorted.len() / 2]
 }
 
+/// The process's CPU time so far — user plus system, every thread — in seconds.
+///
+/// A paired take on a loaded machine reads this rather than the wall clock: the work is
+/// the same whether or not it waits for a core, so a share of the call that a switch moves
+/// stays visible while the wall clock swings by multiples.
+///
+/// Panics where the platform cannot be asked: a take that priced a call without this would
+/// be pricing the wall clock instead.
+pub fn cpu_seconds() -> f64 {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+            0,
+            "the process's own rusage"
+        );
+        let usage = unsafe { usage.assume_init() };
+        let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
+        seconds(usage.ru_utime) + seconds(usage.ru_stime)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    panic!("the CPU clock is read through getrusage, which this platform has no reader for")
+}
+
 /// One packed weight's bytes, generated rather than quantized: a deterministic
 /// ramp with the f16 scale fields pinned to a finite exponent, the shape
 /// `rlx-wgpu/tests/common/mod.rs::packed_gguf_weight` uses. Only the timing is
@@ -228,6 +253,26 @@ pub fn with_env<T>(key: &str, value: &str, body: impl FnOnce() -> T) -> T {
     rlx_ir::env::set(key, value);
     let _restore = Restore(key.to_string(), previous);
     body()
+}
+
+/// Two arms timed alternately over `rounds` rounds, the arm that runs first swapping each
+/// round so a within-round drift lands on both. `key` is set to `arms[arm]` for the length
+/// of that arm's measurement and each arm's samples come back in round order — a
+/// same-session pair rather than two runs compared across a rebuild.
+pub fn paired_env<T>(
+    rounds: usize,
+    key: &str,
+    arms: [&str; 2],
+    mut measure: impl FnMut() -> T,
+) -> [Vec<T>; 2] {
+    let mut samples: [Vec<T>; 2] = [Vec::with_capacity(rounds), Vec::with_capacity(rounds)];
+    for round in 0..rounds {
+        let order = if round % 2 == 0 { [0, 1] } else { [1, 0] };
+        for arm in order {
+            samples[arm].push(with_env(key, arms[arm], &mut measure));
+        }
+    }
+    samples
 }
 
 /// One role's pair files through the model directory, or the reason a check cannot run — a file
@@ -485,6 +530,69 @@ pub const CELL_FRAMES: usize = 330;
 /// the corpus run use, read through the guard's one parser.
 pub fn ceiling_mib() -> u64 {
     mahbot_inference::guard::max_rss_mib().expect("the resident-set bound")
+}
+
+/// One recognition row on the processor: the stand's pinned recording cut to `seconds` of
+/// it (`None` for all of it), with the product open, and the guards every round of a take
+/// holds — the regions tile the input, the answer carries words, and no round reads text
+/// the first one did not. The caller holds [`force_processor`]'s guard: the device is
+/// process-global and has to be settled before this opens the product.
+pub struct Row {
+    audio: Vec<f32>,
+    transcriber: Transcriber,
+    first: Option<String>,
+}
+
+impl Row {
+    /// `None` when the model tree or the corpus is absent. A tree that is present and does
+    /// not open is a failure, as everywhere else in these takes.
+    pub fn open(seconds: Option<usize>) -> Option<Self> {
+        assert_tail_group_shipped();
+        let recording = recording(mahbot_inference::stand::RECOGNITION_RECORDING)?;
+        let samples = seconds.map_or(usize::MAX, |s| {
+            s * mahbot_inference::listen::SAMPLE_RATE as usize
+        });
+        let audio =
+            mahbot_inference::host::wav_mono_16k(&recording.display().to_string(), 0, samples)
+                .unwrap_or_else(|error| panic!("{}: {error:#}", recording.display()));
+        let transcriber = Transcriber::open_product(ceiling_mib())
+            .expect("the transcriber opens on the processor");
+        Some(Self {
+            audio,
+            transcriber,
+            first: None,
+        })
+    }
+
+    /// One whole call, guarded. A switch that moved the answer fails here rather than being
+    /// averaged into a time: the take prices a route, not a reading.
+    pub fn call(&mut self) {
+        let out = self
+            .transcriber
+            .transcribe(&self.audio, mahbot_inference::listen::SAMPLE_RATE)
+            .unwrap_or_else(|error| panic!("the row's reading: {error:#}"));
+        out.check()
+            .unwrap_or_else(|error| panic!("the regions do not tile the input: {error:#}"));
+        let read: String = out
+            .regions
+            .iter()
+            .filter_map(|region| region.text.as_deref())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !mahbot_inference::reference::words(&read).is_empty(),
+            "the row read nothing at all of {}",
+            mahbot_inference::stand::RECOGNITION_RECORDING
+        );
+        match &self.first {
+            Some(first) => assert_eq!(
+                &read, first,
+                "the row read different text on a later round, so the switch under test is \
+                 not the reference's"
+            ),
+            None => self.first = Some(read),
+        }
+    }
 }
 
 /// One recognition reading, for a harness that prices a decode change.
