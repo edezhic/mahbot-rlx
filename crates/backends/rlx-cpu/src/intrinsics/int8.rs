@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Eugene Hauptmann, Nataliya Kosmyna.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! 16 signed int8 products into four int32 lanes — the primitive every packed
-//! single-row integer arm (`gguf_q6k`, `gguf_q8_0`) accumulates with.
+//! single-row integer arm (`gguf_q6k`, `gguf_q8_0`, and the Q4_K arm in `gguf_matmul`)
+//! accumulates with.
 //!
 //! Two spellings of the same arithmetic: `dot16_dotprod` is one `SDOT`, `dot16_wide` two
 //! widening multiplies, two pairwise accumulates and one pairwise add. The second is
@@ -10,10 +11,10 @@
 //! are interchangeable to the last bit whatever fold the arm applies afterwards, and a
 //! host without the feature renders the same numbers as one with it. Which one runs is a
 //! run-time feature probe (`gguf_matmul::aarch64_has_dotprod`) rather than a build flag.
+//! Each has an `into` form for a caller that already holds the lane set to add to.
 //!
 //! `SDOT` is written as `asm!` rather than through `vdotq_s32`: the intrinsic only
-//! reached stable in 1.98 and this crate's floor is 1.89, the same reason the Q4_K arm
-//! in `gguf_matmul` spells its own this way.
+//! reached stable in 1.98 and this crate's floor is 1.89.
 //!
 //! Worth 1.43x the widening form at a Q6_K head's width — 23.8 against 16.6 GB/s of
 //! packed weight per thread on a 4096-row weight (k = 2048, n = 4096), a shape that is
@@ -29,7 +30,20 @@ use std::arch::aarch64::*;
 #[target_feature(enable = "dotprod")]
 #[inline]
 pub(crate) unsafe fn dot16_dotprod(a: int8x16_t, b: int8x16_t) -> int32x4_t {
-    let mut acc = vdupq_n_s32(0);
+    // SAFETY: the `dotprod` target feature above is the sibling's precondition.
+    unsafe { dot16_into_dotprod(vdupq_n_s32(0), a, b) }
+}
+
+/// [`dot16_dotprod`] accumulated into `acc`: the caller already has a lane set it wants
+/// the products added to, so a group of two 16-element halves costs one zero rather than
+/// two and no separate add.
+#[target_feature(enable = "dotprod")]
+#[inline]
+pub(crate) unsafe fn dot16_into_dotprod(
+    mut acc: int32x4_t,
+    a: int8x16_t,
+    b: int8x16_t,
+) -> int32x4_t {
     // SAFETY: `SDOT` is what the `dotprod` target feature above gates; both operands
     // are whole 16-byte vectors the caller loaded.
     unsafe {
@@ -42,6 +56,14 @@ pub(crate) unsafe fn dot16_dotprod(a: int8x16_t, b: int8x16_t) -> int32x4_t {
         );
     }
     acc
+}
+
+/// [`dot16_wide`] accumulated into `acc`, for the same caller as
+/// [`dot16_into_dotprod`] — so the two arms of an arm pair take one shape.
+#[inline(always)]
+pub(crate) unsafe fn dot16_into_wide(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    // SAFETY: baseline NEON over whole 16-byte vectors the caller loaded.
+    unsafe { vaddq_s32(acc, dot16_wide(a, b)) }
 }
 
 /// The same 16 products without `dotprod`, grouped exactly as `SDOT` groups them — two

@@ -1382,37 +1382,53 @@ fn q4k_gemv_rowmajor_q8(x_q8: &[u8], w_bytes: &[u8], out: &mut [f32], k: usize) 
     }
 }
 
+/// One weight row of `blocks_per_row` Q4_K super-blocks dotted against the Q8_K
+/// activation row, in super-block order.
+///
+/// aarch64 picks its arm once per row rather than eight times per block: the two arms are
+/// the same arithmetic spelled with and without `dotprod`, and the probe behind the choice
+/// is an atomic load that has no business in the row's hot loop.
 #[inline]
 fn q4k_dot_row_q8(row_bytes: &[u8], x_q8: &[u8], blocks_per_row: usize) -> f32 {
-    let bb = rlx_gguf::Q4K_BLOCK_BYTES;
-    let qb = rlx_gguf::Q8K_BLOCK_BYTES;
-    let mut acc = 0.0f32;
-    for b in 0..blocks_per_row {
-        let q4 = &row_bytes[b * bb..(b + 1) * bb];
-        let q8 = &x_q8[b * qb..(b + 1) * qb];
-        acc += q4k_dot_q8_block(q4, q8);
-    }
-    acc
-}
-
-#[inline]
-fn q4k_dot_q8_block(q4: &[u8], q8: &[u8]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     {
-        q4k_dot_q8_block_neon(q4, q8)
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if avx2_available() {
-            // SAFETY: gated on runtime AVX2 detection; slabs are full blocks.
-            return unsafe { q4k_dot_q8_block_avx2(q4, q8) };
+        // The arms read both slices with raw pointers, so the bound they rely on is stated
+        // here rather than re-checked per block.
+        debug_assert!(row_bytes.len() >= blocks_per_row * rlx_gguf::Q4K_BLOCK_BYTES);
+        debug_assert!(x_q8.len() >= blocks_per_row * rlx_gguf::Q8K_BLOCK_BYTES);
+        // SAFETY: both slices hold whole blocks, as just stated, and the probe picks an arm
+        // the host has.
+        unsafe {
+            if aarch64_has_dotprod() {
+                q4k_dot_row_q8_dotprod(row_bytes, x_q8, blocks_per_row)
+            } else {
+                q4k_dot_row_q8_wide(row_bytes, x_q8, blocks_per_row)
+            }
         }
-        rlx_gguf::q4_k_dot_q8_k(q4, q8)
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
-        rlx_gguf::q4_k_dot_q8_k(q4, q8)
+        let bb = rlx_gguf::Q4K_BLOCK_BYTES;
+        let qb = rlx_gguf::Q8K_BLOCK_BYTES;
+        let mut acc = 0.0f32;
+        for b in 0..blocks_per_row {
+            let q4 = &row_bytes[b * bb..(b + 1) * bb];
+            let q8 = &x_q8[b * qb..(b + 1) * qb];
+            acc += q4k_dot_q8_block(q4, q8);
+        }
+        acc
     }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn q4k_dot_q8_block(q4: &[u8], q8: &[u8]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_available() {
+        // SAFETY: gated on runtime AVX2 detection; slabs are full blocks.
+        return unsafe { q4k_dot_q8_block_avx2(q4, q8) };
+    }
+    rlx_gguf::q4_k_dot_q8_k(q4, q8)
 }
 
 // ---------------------------------------------------------------------------
@@ -1421,8 +1437,8 @@ fn q4k_dot_q8_block(q4: &[u8], q8: &[u8]) -> f32 {
 // aarch64 had a hand-written NEON dot while x86 fell through to the pure-scalar
 // `rlx_gguf::q4_k_dot_q8_k` — a nibble-at-a-time loop over every weight. Since
 // Q4_K is ~95% of a K-quant checkpoint's parameters, that scalar loop WAS the
-// x86 decode cost. This mirrors the NEON structure exactly (same scale/min
-// bookkeeping, same group order), so results are bit-comparable.
+// x86 decode cost. It keeps the NEON arm's group order and its i32 sums, so the
+// two are bit-comparable.
 //
 // The inner shape maps cleanly onto AVX2: Q4 nibbles are unsigned 0..15 and Q8
 // activations are signed i8, which is precisely `_mm256_maddubs_epi16`
@@ -1535,66 +1551,163 @@ fn avx2_available() -> bool {
     *OK.get_or_init(|| std::is_x86_feature_detected!("avx2"))
 }
 
-/// NEON-friendly Q4_K × Q8_K block dot (aarch64).
-///
-/// Uses int16/int32 accumulators (no `dotprod` requirement). Falls back to the
-/// scalar reference for the scale/min bookkeeping structure.
+// ---------------------------------------------------------------------------
+// Q4_K x Q8_K, aarch64.
+//
+// A four-bit super-block is asymmetric — each of its eight 32-element groups carries a
+// six-bit minimum as well as a six-bit scale — so the block is
+// `d*yd*Σ scale·(group dot) − dmin*yd*Σ min·(16-element activation sum)`. Both folds ran
+// in scalar code and between them were more than half the block; 16.4 to 6.9 ns per
+// 144-byte block, 2.4x.
+//
+// Exactness is structural: every term is an integer, so re-associating it cannot move a
+// bit, and the block still closes on `d * yd * sumi as f32 - dmin * yd * sumi_min as f32`
+// on the same i32 sums, with no fused multiply-add and nothing widened or narrowed
+// (`q4k_block_dot_is_bit_exact` holds both arms to `rlx_gguf::q4_k_dot_q8_k`).
+// ---------------------------------------------------------------------------
+
+/// The two arms of the block dot differ only in their 16-element dot, so the super-block
+/// arithmetic is written once here. `$dot` accumulates into a lane set the caller holds.
 #[cfg(target_arch = "aarch64")]
-#[inline]
-fn q4k_dot_q8_block_neon(q4: &[u8], q8: &[u8]) -> f32 {
-    // SAFETY: full Q4_K / Q8_K slabs; NEON baseline on our aarch64 targets.
-    unsafe {
-        let d = half::f16::from_le_bytes([q4[0], q4[1]]).to_f32();
-        let dmin = half::f16::from_le_bytes([q4[2], q4[3]]).to_f32();
-        let scales = &q4[4..16];
-        let qs = q4.as_ptr().add(16);
-        let yd = f32::from_le_bytes([q8[0], q8[1], q8[2], q8[3]]);
-        let q8s = q8.as_ptr().add(4) as *const i8;
-        let bsums = q8.as_ptr().add(4 + QK_K);
+macro_rules! q4k_row_q8 {
+    ($(#[$attr:meta])* fn $name:ident, $dot:path) => {
+        $(#[$attr])*
+        /// One weight row dotted against a whole Q8_K activation row.
+        ///
+        /// SAFETY: both slices hold whole super-blocks, and the dot this arm is named for
+        /// is available on the host.
+        unsafe fn $name(row_bytes: &[u8], x_q8: &[u8], blocks_per_row: usize) -> f32 {
+            use std::arch::aarch64::*;
+            // SAFETY: whole blocks, as the caller checked; every load below stays inside
+            // them.
+            unsafe {
+                let mut acc = 0.0f32;
+                for b in 0..blocks_per_row {
+                    let q4 = row_bytes.as_ptr().add(b * rlx_gguf::Q4K_BLOCK_BYTES);
+                    let q8 = x_q8.as_ptr().add(b * rlx_gguf::Q8K_BLOCK_BYTES);
+                    let d = half::f16::from_le_bytes([*q4, *q4.add(1)]).to_f32();
+                    let dmin = half::f16::from_le_bytes([*q4.add(2), *q4.add(3)]).to_f32();
+                    let yd = f32::from_le_bytes([*q8, *q8.add(1), *q8.add(2), *q8.add(3)]);
 
-        let mut sumi_min = 0i32;
-        for j in 0..16 {
-            let (_, m) = q4k_scale_min(j / 2, scales);
-            let bs = i16::from_le_bytes([*bsums.add(j * 2), *bsums.add(j * 2 + 1)]) as i32;
-            sumi_min += m as i32 * bs;
-        }
+                    // The eight six-bit scales and the eight six-bit minimums share the
+                    // twelve bytes at `q4[4..16]`: the first four hold scales 0..3, the next
+                    // four minimums 0..3, and the last four a low nibble per scale and a high
+                    // nibble per minimum for 4..7, whose top two bits sit above the first
+                    // eight. One 16-byte load covers all of it — the four bytes it reads past
+                    // the scales are the head of `qs`, which no lane below uses.
+                    let w = vld1q_u8(q4.add(4));
+                    let tops = vshlq_n_u8::<4>(vshrq_n_u8::<6>(w));
+                    let six = vandq_u8(w, vdupq_n_u8(0x3F));
+                    let scale_hi =
+                        vorrq_u8(vandq_u8(vextq_u8::<8>(w, w), vdupq_n_u8(0x0F)), tops);
+                    let min_hi = vorrq_u8(vshrq_n_u8::<4>(vextq_u8::<4>(w, w)), tops);
+                    let scale8 = vzip1_u32(
+                        vget_low_u32(vreinterpretq_u32_u8(six)),
+                        vget_low_u32(vreinterpretq_u32_u8(scale_hi)),
+                    );
+                    let min8 = vzip2_u32(
+                        vget_low_u32(vreinterpretq_u32_u8(six)),
+                        vget_low_u32(vreinterpretq_u32_u8(min_hi)),
+                    );
+                    let scale16 = vmovl_u8(vreinterpret_u8_u32(scale8));
+                    let scales_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(scale16)));
+                    let scales_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(scale16)));
+                    let mins = vmovl_u8(vreinterpret_u8_u32(min8));
 
-        let mut sumi = 0i32;
-        let mut is = 0usize;
-        let mut yi = 0usize;
-        for j in (0..8).step_by(2) {
-            let (sc0, _) = q4k_scale_min(j, scales);
-            let (sc1, _) = q4k_scale_min(j + 1, scales);
-            sumi += sc0 as i32 * q4k_group32_q8_dot_neon(qs.add(is), q8s.add(yi), false);
-            yi += 32;
-            sumi += sc1 as i32 * q4k_group32_q8_dot_neon(qs.add(is), q8s.add(yi), true);
-            yi += 32;
-            is += 32;
+                    // The minimum correction: one product per group, over the block's own
+                    // 16-element activation sums taken pairwise, so sixteen terms fold to
+                    // eight with nothing narrower than i32 in between.
+                    let bsums = q8.add(4 + QK_K) as *const i16;
+                    let bs_lo = vpadalq_s16(vdupq_n_s32(0), vld1q_s16(bsums));
+                    let bs_hi = vpadalq_s16(vdupq_n_s32(0), vld1q_s16(bsums.add(8)));
+                    let sumi_min = vaddvq_s32(vmlaq_s32(
+                        vmulq_s32(
+                            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(mins))),
+                            bs_lo,
+                        ),
+                        vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(mins))),
+                        bs_hi,
+                    ));
+
+                    // The product: two groups per 32-byte weight run — the low nibbles are
+                    // the even group's, the high nibbles the odd one's — each scaled by its
+                    // own lane of the unpacked scales and folded into one of two
+                    // accumulators so the chain is four deep rather than eight.
+                    let qs = q4.add(16);
+                    let ys = q8.add(4) as *const i8;
+                    let mut sum_lo = vdupq_n_s32(0);
+                    let mut sum_hi = vdupq_n_s32(0);
+                    q4k_group_pair!($dot, qs, ys, scales_lo, sum_lo, 0);
+                    q4k_group_pair!($dot, qs, ys, scales_lo, sum_lo, 1);
+                    q4k_group_pair!($dot, qs, ys, scales_hi, sum_hi, 2);
+                    q4k_group_pair!($dot, qs, ys, scales_hi, sum_hi, 3);
+                    let sumi = vaddvq_s32(vaddq_s32(sum_lo, sum_hi));
+
+                    acc += d * yd * sumi as f32 - dmin * yd * sumi_min as f32;
+                }
+                acc
+            }
         }
-        d * yd * sumi as f32 - dmin * yd * sumi_min as f32
-    }
+    };
+}
+
+/// One 32-byte weight run — two adjacent Q4_K groups — against the two 32-element
+/// activation runs they pair with, each scaled by its own lane of `$scales` and added to
+/// `$acc`. `$pair` is the run's index in the block: run `p` starts at weight byte `32p`,
+/// and its two groups take lanes `2(p % 2)` and `2(p % 2) + 1` of the scale set that
+/// covers them.
+#[cfg(target_arch = "aarch64")]
+macro_rules! q4k_group_pair {
+    ($dot:path, $qs:ident, $ys:ident, $scales:ident, $acc:ident, $pair:literal) => {{
+        const K: usize = 32 * $pair;
+        const LO: i32 = 2 * ($pair % 2);
+        const HI: i32 = LO + 1;
+        let mask = vdupq_n_u8(0x0F);
+        let run0 = vld1q_u8($qs.add(K));
+        let run1 = vld1q_u8($qs.add(K + 16));
+        let even = $dot(
+            $dot(
+                vdupq_n_s32(0),
+                vreinterpretq_s8_u8(vandq_u8(run0, mask)),
+                vld1q_s8($ys.add(K * 2)),
+            ),
+            vreinterpretq_s8_u8(vandq_u8(run1, mask)),
+            vld1q_s8($ys.add(K * 2 + 16)),
+        );
+        let odd = $dot(
+            $dot(
+                vdupq_n_s32(0),
+                vreinterpretq_s8_u8(vshrq_n_u8::<4>(run0)),
+                vld1q_s8($ys.add(K * 2 + 32)),
+            ),
+            vreinterpretq_s8_u8(vshrq_n_u8::<4>(run1)),
+            vld1q_s8($ys.add(K * 2 + 48)),
+        );
+        $acc = vmlaq_laneq_s32($acc, even, $scales, LO);
+        $acc = vmlaq_laneq_s32($acc, odd, $scales, HI);
+    }};
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn q4k_scale_min(j: usize, q: &[u8]) -> (u8, u8) {
-    if j < 4 {
-        (q[j] & 63, q[j + 4] & 63)
-    } else {
-        let d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
-        let m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
-        (d, m)
-    }
-}
+q4k_row_q8!(
+    #[target_feature(enable = "dotprod")]
+    fn q4k_dot_row_q8_dotprod,
+    crate::intrinsics::int8::dot16_into_dotprod
+);
 
-/// Dot 32 Q4 nibbles (lo or hi) with 32 Q8 activations → i32 sum of products.
+#[cfg(target_arch = "aarch64")]
+q4k_row_q8!(
+    fn q4k_dot_row_q8_wide,
+    crate::intrinsics::int8::dot16_into_wide
+);
+
 /// Cached `dotprod` (ARMv8.2-A) availability — Cortex-A76 (Raspberry Pi 5) /
 /// Apple Silicon / Graviton2+ / most ARM servers have it; Cortex-A72 (Pi 4)
 /// does not. Detected once; the result is a hot-loop branch predictor's dream.
 ///
-/// The one feature check for the whole crate: Q4_K's group dot, the six-bit and
-/// eight-bit row dots, and the choice between each route's `dotprod` and baseline arms
-/// all ask it, and `RLX_Q4K_NO_DOTPROD=1` pins them all to the baseline.
+/// The one feature check for the whole crate: Q4_K's row dot, the six-bit and eight-bit
+/// row dots, and the choice between each route's `dotprod` and baseline arms all ask it,
+/// and `RLX_Q4K_NO_DOTPROD=1` pins them all to the baseline.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub(crate) fn aarch64_has_dotprod() -> bool {
@@ -1606,86 +1719,6 @@ pub(crate) fn aarch64_has_dotprod() -> bool {
         rlx_ir::env::var_os("RLX_Q4K_NO_DOTPROD").is_none()
             && std::arch::is_aarch64_feature_detected!("dotprod")
     })
-}
-
-/// Q4_K 32-nibble × int8 dot. Dispatches to the `vdotq_s32` path on ARMv8.2-A
-/// (one dot instruction per 16 lanes vs a widen-multiply + pairwise-accumulate
-/// chain) or the universal baseline. Both compute the identical *integer* dot
-/// (no rounding), so the choice is purely a throughput detail.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn q4k_group32_q8_dot_neon(qs: *const u8, q8: *const i8, high_nibble: bool) -> i32 {
-    if aarch64_has_dotprod() {
-        // SAFETY: guarded by the runtime `dotprod` detection above.
-        unsafe { q4k_group32_q8_dot_dotprod(qs, q8, high_nibble) }
-    } else {
-        // SAFETY: baseline NEON, present on every aarch64 target.
-        unsafe { q4k_group32_q8_dot_vmull(qs, q8, high_nibble) }
-    }
-}
-
-/// Baseline-NEON (ARMv8.0) Q4_K group dot: `vmull_s8` widen-multiply →
-/// `vpadalq_s16` pairwise-accumulate.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn q4k_group32_q8_dot_vmull(qs: *const u8, q8: *const i8, high_nibble: bool) -> i32 {
-    use std::arch::aarch64::*;
-    unsafe {
-        let mut acc = vdupq_n_s32(0);
-        for i in (0..32).step_by(16) {
-            let qbytes = vld1q_u8(qs.add(i));
-            let nibble = if high_nibble {
-                vshrq_n_u8(qbytes, 4)
-            } else {
-                vandq_u8(qbytes, vdupq_n_u8(0x0F))
-            };
-            // u8 nibbles 0..15 → i8 (still non-negative)
-            let q4 = vreinterpretq_s8_u8(nibble);
-            let y = vld1q_s8(q8.add(i));
-            // 8×8 → 16 in low/high halves, then widen-add into i32.
-            let lo = vmull_s8(vget_low_s8(q4), vget_low_s8(y));
-            let hi = vmull_s8(vget_high_s8(q4), vget_high_s8(y));
-            acc = vpadalq_s16(acc, lo);
-            acc = vpadalq_s16(acc, hi);
-        }
-        vaddvq_s32(acc)
-    }
-}
-
-/// `dotprod`-accelerated Q4_K group dot: one `SDOT` accumulates 16 int8
-/// products per 128-bit register, collapsing the widen-multiply chain above.
-/// The `vdotq_s32` intrinsic is still unstable (`stdarch_neon_dotprod`) on the
-/// pinned stable toolchain, so we emit `SDOT` directly — gated by the
-/// `dotprod` target feature (verified at runtime by [`aarch64_has_dotprod`]).
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "dotprod")]
-#[inline]
-unsafe fn q4k_group32_q8_dot_dotprod(qs: *const u8, q8: *const i8, high_nibble: bool) -> i32 {
-    use std::arch::aarch64::*;
-    unsafe {
-        let mut acc = vdupq_n_s32(0);
-        let mask = vdupq_n_u8(0x0F);
-        for i in (0..32).step_by(16) {
-            let qbytes = vld1q_u8(qs.add(i));
-            let nibble = if high_nibble {
-                vshrq_n_u8(qbytes, 4)
-            } else {
-                vandq_u8(qbytes, mask)
-            };
-            // u8 nibbles 0..15 → i8 (still non-negative)
-            let q4 = vreinterpretq_s8_u8(nibble);
-            let y = vld1q_s8(q8.add(i));
-            // acc.4s += dot4(q4.16b, y.16b)
-            std::arch::asm!(
-                "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
-                acc = inout(vreg) acc,
-                a = in(vreg) q4,
-                b = in(vreg) y,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
-        vaddvq_s32(acc)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2393,30 +2426,66 @@ mod tests {
         }
     }
 
-    /// The `dotprod` Q4_K group dot must be BYTE-IDENTICAL to the baseline
-    /// `vmull` path — it's a pure integer dot, so there's no rounding slack.
-    /// Guards the runtime dispatch used by the fused int8 decode GEMV.
+    /// Both aarch64 arms of the Q4_K × Q8_K block dot must be BYTE-IDENTICAL to the
+    /// scalar reference, not merely close: the whole block is integer arithmetic up to its
+    /// final scale, so every re-association in the vectorised form is exact by
+    /// construction and a difference here is a defect.
+    ///
+    /// Raw random bytes rather than quantizer output, so the six-bit scale and minimum
+    /// fields reach every pattern — including the ones a real weight would not produce.
+    /// The two f16 header scales are pinned: random bytes there can be a NaN, and a NaN
+    /// payload is not what this test is about. `d` and `dmin` are distinct so a swapped
+    /// pair cannot cancel.
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn q4k_group32_dotprod_matches_vmull() {
-        if !super::aarch64_has_dotprod() {
-            return; // ARMv8.0 (e.g. Pi 4) — only the vmull path exists.
-        }
-        let mut s: u32 = 0x1234_5678;
-        let mut rng = || {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            s
+    fn q4k_block_dot_is_bit_exact() {
+        let mut seed = 0x1234_5678u32;
+        let mut byte = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 24) as u8
         };
-        for _ in 0..256 {
-            let qs: Vec<u8> = (0..32).map(|_| (rng() & 0xFF) as u8).collect();
-            let q8: Vec<i8> = (0..32).map(|_| rng() as i8).collect();
-            for high in [false, true] {
-                let a = unsafe { super::q4k_group32_q8_dot_vmull(qs.as_ptr(), q8.as_ptr(), high) };
-                let b =
-                    unsafe { super::q4k_group32_q8_dot_dotprod(qs.as_ptr(), q8.as_ptr(), high) };
-                assert_eq!(a, b, "dotprod != vmull (high_nibble={high})");
+        // The dotprod arm is the one the reference machine ships; the widening arm is the
+        // fallback an ARMv8.0 host takes and must render the same numbers.
+        let mut arms: Vec<(&str, unsafe fn(&[u8], &[u8], usize) -> f32)> =
+            vec![("wide", super::q4k_dot_row_q8_wide)];
+        if super::aarch64_has_dotprod() {
+            arms.insert(0, ("dotprod", super::q4k_dot_row_q8_dotprod));
+        }
+        let blocks = 3;
+        for round in 0..1024 {
+            let mut q4: Vec<u8> = (0..blocks * rlx_gguf::Q4K_BLOCK_BYTES)
+                .map(|_| byte())
+                .collect();
+            for b in 0..blocks {
+                let at = b * rlx_gguf::Q4K_BLOCK_BYTES;
+                q4[at..at + 2].copy_from_slice(&half::f16::from_f32(0.0123).to_le_bytes());
+                q4[at + 2..at + 4].copy_from_slice(&half::f16::from_f32(0.0045).to_le_bytes());
+            }
+            // The activation side as the route produces it: a real Q8_K quantisation, so
+            // the 16-element sums are the block's own and inside their i16 bound.
+            let x: Vec<f32> = (0..blocks * QK_K)
+                .map(|_| byte() as f32 / 128.0 - 1.0)
+                .collect();
+            let mut q8 = vec![0u8; blocks * rlx_gguf::Q8K_BLOCK_BYTES];
+            rlx_gguf::quantize_q8_k_row(&x, &mut q8);
+            let want: f32 = (0..blocks)
+                .map(|b| {
+                    rlx_gguf::q4_k_dot_q8_k(
+                        &q4[b * rlx_gguf::Q4K_BLOCK_BYTES..],
+                        &q8[b * rlx_gguf::Q8K_BLOCK_BYTES..],
+                    )
+                })
+                .fold(0.0f32, |acc, v| acc + v);
+            for &(label, arm) in &arms {
+                // SAFETY: whole blocks, and the arm was selected by the host's features.
+                let got = unsafe { arm(&q4, &q8, blocks) };
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "round {round}: {label} arm {got} vs reference {want}"
+                );
             }
         }
     }

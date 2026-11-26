@@ -259,6 +259,14 @@ merge action.
 - the cooperative-matrix packed GEMM, and its 16-row short last row group
 - the direct row decode and the four-bit block's fixed-size arrangement in
   `rlx_gguf::q4k_fast` (`RLX_GGUF_ROW_DECODE`, reached by `rlx-cpu`'s `dequant_row` only)
+- the vectorised four-bit one-row block dot in `rlx-cpu`'s `gguf_matmul` — the twelve
+  scale bytes unpack with lane ops, the minimum correction is two widening
+  multiply-accumulates and the eight group dots fold into two accumulators, which is
+  2.4x on the block and bit-identical to `rlx_gguf::q4_k_dot_q8_k`. Upstream's arm is the
+  same file's older NEON form: a horizontal reduction and a scalar scale multiply per
+  group, a scalar unpack of the packed scale and minimum bytes, and a runtime `dotprod`
+  probe inside each group's dot. A sync that takes it back reverts this with no compile
+  error and no change to any answer
 - the many-row and split decode attention routes
 - broadcast-`Expand` elision in front of binary ops
 - the mel framing fold

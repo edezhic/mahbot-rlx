@@ -289,6 +289,10 @@ name = "gguf_q8_0_row_perf"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "gguf_q4k_row_perf"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "attention_head_major_route"
 required-features = ["backend-tests"]
 

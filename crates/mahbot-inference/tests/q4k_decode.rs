@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The four-bit block decode the row-widening routes call, on the product's own weights:
-//! every Q4_K block of both model files against `rlx_gguf::dequant_q4_k_block`, the route's
-//! answer with and without the change, what the decode costs per weight, whether the
-//! single-worker arm gains too, and whether the saving reaches the recognition row on the
-//! processor.
+//! every Q4_K block of both model files against `rlx_gguf::dequant_q4_k_block`, every
+//! row of the one-row multiply against `rlx_gguf::q4_k_dot_q8_k`, the route's answer with
+//! and without the change, what the decode costs per weight, whether the single-worker arm
+//! gains too, and whether the saving reaches the recognition row on the processor.
 //!
 //! `RLX_GGUF_ROW_DECODE=0` is the change's own arm — each scheme's reference block decode
 //! (`rlx_gguf::dequant_q4_k_block`, `dequant_q6_k_block`) through the staging copy — so
@@ -218,6 +218,87 @@ fn every_real_four_bit_block_is_the_reference_value() {
     );
     assert!(blocks > 0, "the pair carries no packed four-bit weight");
     assert_eq!(differing, 0, "the decode is not the reference's");
+}
+
+/// **Every row dot is the reference's.** Both model files, every packed four-bit linear,
+/// every row: the one-row multiply the processor's decode takes, held against a fold of
+/// `rlx_gguf::q4_k_dot_q8_k` — the arm it replaces — over the product's own weights, on
+/// one Q8_K quantised activation row. Bit for bit, not a tolerance: the block is integer
+/// arithmetic up to its final scale, so the vectorised correction has no licence to move
+/// one.
+///
+/// Three ambient switches are pinned, because each one moves either side of this
+/// comparison off the integer Q8_K arm: `RLX_DEQUANT_CACHE=0` is the product's own run form
+/// and is what routes a single row there at all, `RLX_REPRODUCIBLE` stands every
+/// single-row integer route down (`prefer_cached_blas` reads it before the cache), and
+/// `RLX_Q4K_EXACT_GEMV` is a different kernel on f32 activations. A shell exporting any of
+/// them would report every row as differing — a false number, not a moved bit.
+#[test]
+#[ignore = "needs the installed model tree"]
+fn every_real_four_bit_row_dot_is_the_reference_value() {
+    let _alone = support::solo("the four-bit row dot against the reference");
+    let Some(models) = models() else { return };
+    let (mut rows, mut differing, mut worst) = (0usize, 0usize, 0f32);
+    // Pinned for the whole sweep, process-wide as the route reads them.
+    fn pinned<T>(body: impl FnOnce() -> T) -> T {
+        support::with_env("RLX_REPRODUCIBLE", "0", || {
+            support::with_env("RLX_Q4K_EXACT_GEMV", "0", || {
+                support::with_env("RLX_DEQUANT_CACHE", "0", body)
+            })
+        })
+    }
+    pinned(|| {
+        for model in &models {
+            for plan in &model.plans {
+                if plan.file != GgmlType::Q4K
+                    || plan.store != Store::Packed
+                    || plan.class != Class::Linear2D
+                {
+                    continue;
+                }
+                let (k, n) = (plan.ggml_shape[0], plan.ggml_shape[1]);
+                if !k.is_multiple_of(QK_K) || n == 0 {
+                    continue;
+                }
+                let x = activation(1, k);
+                let mut x_q8 = vec![0u8; k / QK_K * rlx_gguf::Q8K_BLOCK_BYTES];
+                rlx_gguf::quantize_q8_k_row(&x, &mut x_q8);
+                let mut got = vec![0f32; n];
+                model
+                    .with_mapped(&plan.name, |bytes| {
+                        rlx_cpu::gguf_matmul::gguf_matmul_bt_dispatch_at(
+                            &x,
+                            bytes,
+                            &mut got,
+                            1,
+                            k,
+                            n,
+                            QuantScheme::GgufQ4K,
+                            0,
+                        );
+                        let row_bytes = k / QK_K * Q4K_BLOCK_BYTES;
+                        for (j, g) in got.iter().enumerate() {
+                            let row = &bytes[j * row_bytes..(j + 1) * row_bytes];
+                            let want: f32 = row
+                                .chunks_exact(Q4K_BLOCK_BYTES)
+                                .zip(x_q8.chunks_exact(rlx_gguf::Q8K_BLOCK_BYTES))
+                                .fold(0.0f32, |acc, (q4, q8)| {
+                                    acc + rlx_gguf::q4_k_dot_q8_k(q4, q8)
+                                });
+                            rows += 1;
+                            if g.to_bits() != want.to_bits() {
+                                differing += 1;
+                                worst = worst.max((g - want).abs());
+                            }
+                        }
+                    })
+                    .unwrap_or_else(|error| panic!("{}: {error:#}", plan.name));
+            }
+        }
+    });
+    println!("four-bit rows={rows} differing={differing} worst={worst:e}");
+    assert!(rows > 0, "the pair carries no packed four-bit linear");
+    assert_eq!(differing, 0, "the row dot is not the reference's");
 }
 
 /// **The route answers the same either way**, on the widest real weight of each scheme
