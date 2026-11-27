@@ -586,6 +586,9 @@ pub(crate) fn record_run(mode: Mode) {
     // the first recognition row. The cap itself is held by whoever builds the rungs
     // (`Transcriber::open`), which resolves it once and does not read the environment again.
     let tail_arm = tail_arm(label);
+    // The host-width arm, resolved the same way and for the same reason: a value that is not a
+    // boolean stops the run by name, before any work.
+    let host_arm = host_arm(label);
     // Which files this run reads, on stderr: stdout carries the one-JSON-line row
     // protocol and gains nothing.
     eprintln!(
@@ -608,7 +611,7 @@ pub(crate) fn record_run(mode: Mode) {
     // any other, and the record is what it does not write. Saying so before the rows run is
     // half of that; the other half is the device a row actually ran on, which decides which
     // record the take writes once the rows are in.
-    let screened = screening_reasons(bounds, tail_arm);
+    let screened = screening_reasons(bounds, tail_arm, host_arm);
     // A forced processor take of a mode that has no processor record is knowable here, so it is
     // said before the rows rather than after them: screening decides whether a record is written,
     // never whether the run measures, and an operator should not learn it hours in.
@@ -833,12 +836,14 @@ pub(crate) fn bound_reasons(timeout: u64, max_rss: u64, swap_growth: u64) -> Vec
 /// something other than the shipped arrangement. `MAHBOT_TAIL_GROUP` picks the encoder-tail
 /// arm, and a record carries the shipped arrangement's numbers only — a take on the A/B arm
 /// is a take of its own, so the variable being set at all (`tail_arm`, from the same
-/// resolution that validated it) screens the run. The wake bench needs no such rule: its
-/// sweep groups by `GROUP`, which the variable does not touch. The device is not a route
-/// switch: a take writes the record of the device it ran on, which the caller decides once
-/// the rows have run — and a mode with no record for that device says so instead
-/// ([`NO_PROCESSOR_RECORD`]).
-fn screening_reasons(bounds: Bounds, tail_arm: bool) -> Vec<&'static str> {
+/// resolution that validated it) screens the run. `MAHBOT_HOST_F16` is the second
+/// (`host_arm`): it picks between the file's width on the host and the f32 image that arm
+/// replaced. The wake bench reads neither variable this way — its sweep groups by `GROUP`,
+/// which `MAHBOT_TAIL_GROUP` does not touch, and its own `MAHBOT_HOST_F16` rule lives in
+/// `bench::BenchConfig`. The device is not a route switch: a take writes the record of the
+/// device it ran on, which the caller decides once the rows have run — and a mode with no
+/// record for that device says so instead ([`NO_PROCESSOR_RECORD`]).
+fn screening_reasons(bounds: Bounds, tail_arm: bool, host_arm: bool) -> Vec<&'static str> {
     let mut reasons = bound_reasons(
         bounds.timeout_secs,
         bounds.max_rss_mib,
@@ -847,15 +852,18 @@ fn screening_reasons(bounds: Bounds, tail_arm: bool) -> Vec<&'static str> {
     if tail_arm {
         reasons.push("MAHBOT_TAIL_GROUP selects the encoder-tail A/B arm");
     }
+    if host_arm {
+        reasons.push("MAHBOT_HOST_F16 selects the host-width A/B arm");
+    }
     reasons
 }
 
-/// The bounds this process runs under, or the process stopped there: a bound
-/// variable that is set and unparsable must not let the run pass for one held
-/// under the defaults, so the entry point refuses it by name before any work.
-pub(crate) fn bounds(label: &str) -> Bounds {
-    match Bounds::from_env() {
-        Ok(bounds) => bounds,
+/// A variable the run reads before any work, or the process stopped there: a value that is
+/// set and unparsable must not let the run pass for the shipped arrangement's, so it is
+/// refused by name rather than defaulted.
+fn resolved_or_exit<T>(label: &str, resolved: Result<T>) -> T {
+    match resolved {
+        Ok(value) => value,
         Err(error) => {
             eprintln!("{label}: {error:#}");
             std::process::exit(1);
@@ -863,17 +871,19 @@ pub(crate) fn bounds(label: &str) -> Bounds {
     }
 }
 
-/// Whether `MAHBOT_TAIL_GROUP` names the encoder-tail A/B arm, or the process stopped there for
-/// the same reason [`bounds`] refuses: an arm that does not parse must not let a take pass for
-/// the shipped arrangement's.
+/// The bounds this process runs under.
+pub(crate) fn bounds(label: &str) -> Bounds {
+    resolved_or_exit(label, Bounds::from_env())
+}
+
+/// Whether `MAHBOT_TAIL_GROUP` names the encoder-tail A/B arm.
 fn tail_arm(label: &str) -> bool {
-    match crate::listen::tail_group() {
-        Ok((_, named)) => named,
-        Err(error) => {
-            eprintln!("{label}: {error:#}");
-            std::process::exit(1);
-        }
-    }
+    resolved_or_exit(label, crate::listen::tail_group()).1
+}
+
+/// Whether `MAHBOT_HOST_F16` names the host-width A/B arm.
+fn host_arm(label: &str) -> bool {
+    resolved_or_exit(label, crate::host_width::resolved()).1
 }
 
 /// Say why a run is screened, and that it writes nothing.
@@ -949,10 +959,14 @@ mod tests {
             max_rss_mib: crate::guard::DEFAULT_MAX_RSS_MIB,
             swap_growth_mib: crate::guard::MAX_SWAP_GROWTH_MIB,
         };
-        assert!(screening_reasons(shipped, false).is_empty());
+        assert!(screening_reasons(shipped, false, false).is_empty());
         assert_eq!(
-            screening_reasons(shipped, true),
+            screening_reasons(shipped, true, false),
             vec!["MAHBOT_TAIL_GROUP selects the encoder-tail A/B arm"]
+        );
+        assert_eq!(
+            screening_reasons(shipped, false, true),
+            vec!["MAHBOT_HOST_F16 selects the host-width A/B arm"]
         );
     }
 

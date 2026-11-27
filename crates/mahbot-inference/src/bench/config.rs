@@ -166,6 +166,10 @@ pub(crate) struct BenchConfig {
     /// bounds — so a classification never reads a bound the run was not resolved
     /// under.
     pub swap_growth_mib: u64,
+    /// Whether the process names the host-width A/B arm (`crate::host_width`), resolved
+    /// with the other inputs: the arm moves the wake path's own memory, which this record
+    /// carries, so a take under it is not the benchmark's.
+    pub host_arm: bool,
 }
 
 impl BenchConfig {
@@ -184,6 +188,9 @@ impl BenchConfig {
         }
         if self.voices != sets::NUM_VERIFICATION_VOICES {
             reasons.push("a subset of the verification voices is measured");
+        }
+        if self.host_arm {
+            reasons.push("MAHBOT_HOST_F16 selects the host-width A/B arm");
         }
         reasons.extend(crate::run::bound_reasons(
             self.timeout_secs,
@@ -288,6 +295,10 @@ impl BenchConfig {
             None => sets::NUM_VERIFICATION_VOICES,
         };
         let swap_growth_mib = crate::guard::swap_growth_ceiling(&env).map_err(Refused::new)?;
+        // A route switch rather than an input: named at all, and the take is the arm's. A
+        // value that is not a boolean is refused here, with the rest of the run's inputs.
+        let (_, host_arm) =
+            crate::host_width::resolved_of(env("MAHBOT_HOST_F16")).map_err(Refused::new)?;
 
         Ok(Self {
             mode,
@@ -305,6 +316,7 @@ impl BenchConfig {
             phases,
             voices,
             swap_growth_mib,
+            host_arm,
         })
     }
 }
@@ -1010,6 +1022,38 @@ mod tests {
         assert_eq!(
             cfg.screened_reasons(),
             vec!["the swap-growth bound is larger than the default"]
+        );
+    }
+
+    /// A route switch the record's own columns move with screens the take: the host-width arm
+    /// changes the wake path's memory, which this record carries.
+    #[test]
+    fn the_host_width_arm_is_screened() {
+        let fixture = Fixture::new("host-width");
+        let arm = |name: &str| {
+            if name == "MAHBOT_HOST_F16" {
+                Some(OsString::from("0"))
+            } else {
+                test_env(name)
+            }
+        };
+        let cfg = BenchConfig::resolve(fixture.args.clone(), arm, Mode::Measure)
+            .expect("a run on the host-width arm");
+        assert!(cfg.host_arm);
+        assert_eq!(
+            cfg.screened_reasons(),
+            vec!["MAHBOT_HOST_F16 selects the host-width A/B arm"]
+        );
+        let bad = |name: &str| {
+            if name == "MAHBOT_HOST_F16" {
+                Some(OsString::from("banana"))
+            } else {
+                test_env(name)
+            }
+        };
+        assert!(
+            BenchConfig::resolve(fixture.args.clone(), bad, Mode::Measure).is_err(),
+            "a value that is not a boolean is refused with the run's other inputs"
         );
     }
 

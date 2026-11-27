@@ -9,7 +9,9 @@
 //! * **metadata merged with a model config** — the `{arch}.*` keys become a
 //!   typed `Config` (layers, width, heads, eps, RoPE, vocabulary, head variant)
 //!   and the `clip.*` keys a `ClipConfig` instead of a bag of strings;
-//! * **F16 widened on the host** — an F16 tensor is declared F32 on sight;
+//! * **F16 declared F32, widened at the upload** — an F16 tensor is declared F32 on sight,
+//!   and the host keeps the file's own width: the build records where the bytes are and the
+//!   compile widens them as it writes the device (`crate::host_width`);
 //! * **packed weights kept raw** — quantized tensors stay the file's own bytes
 //!   and carry their own dequant, so the backend reserves scratch for them.
 //!
@@ -94,7 +96,8 @@ pub enum Class {
 pub enum Store {
     /// The file already stores F32: bytes go through as they are.
     F32File,
-    /// F16 in the file: widened to F32 on the host.
+    /// F16 in the file: declared F32, widened out of the file's own bytes as the compile
+    /// writes the device, so no f32 image is made on the host.
     F16Widened,
     /// Quantized, kept as the file's own packed bytes; the graph multiplies
     /// through `Op::DequantMatMul` and the backend reserves scratch for it. A
@@ -144,9 +147,9 @@ impl Plan {
             Some(_) => Store::Packed,
             None => match file {
                 GgmlType::F32 => Store::F32File,
-                // F16 is never declared as F16: it is widened on the host. The
-                // file's f16 tensors are convolved or multiplied, never read by
-                // row, so [`row_route`] does not serve them — their shapes are the
+                // F16 is never declared as F16: it is declared F32 and widened at the
+                // upload. The file's f16 tensors are convolved or multiplied, never read
+                // by row, so [`row_route`] does not serve them — their shapes are the
                 // reason, not a missing route.
                 GgmlType::F16 | GgmlType::BF16 => Store::F16Widened,
                 other => bail!("tensor {name} has unhandled type {}", other.name()),
@@ -623,11 +626,12 @@ impl Model {
     ///
     /// The store rule here is the tagger's own: a **rank-2 F16** tensor is kept
     /// as f16 (`Store::F16Linear`), everything F32 stays as the file's bytes, and
-    /// any other F16 goes to the host as f32. The file's rank-2 matrices are `F16`
-    /// and its other tensors are `F32`, which is why the rule exists at all: under
-    /// [`Model::open`]'s rule every one of those matrices would be widened to f32
-    /// and kept that way. What the f16 tag buys is a smaller typed image on the
-    /// host ([`Model::linear_f16`]). The bytes reach the device as they are: the
+    /// any other F16 is declared F32 and widened as its bytes go to the device
+    /// ([`Store::F16Widened`]). The file's rank-2 matrices are `F16` and its other
+    /// tensors are `F32`, which is why the rule exists at all: the f16 tag picks the
+    /// f16 multiply kernels, where [`Model::open`]'s rule would declare those matrices
+    /// F32 and multiply them as f32 — a kernel choice, not a host-image one, since
+    /// neither route keeps an f32 image. The bytes reach the device as they are: the
     /// graphics arena widens them to one f32 lane per element, the processor keeps them
     /// packed and dequantises them on the fly, and which kernel multiplies them is the
     /// backend's per-shape and per-device choice — [`crate::ced`] records the arm this

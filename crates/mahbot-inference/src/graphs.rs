@@ -64,7 +64,7 @@ pub struct BlkSpec {
 /// output rows.
 pub fn block(
     ctx: &mut FlowCtx<'_>,
-    model: &Model,
+    model: &Arc<Model>,
     p: &str,
     b: &BlkSpec,
     x: HirNodeId,
@@ -1451,7 +1451,7 @@ pub struct SpeakerStage {
 
 fn speaker_conv(
     ctx: &mut FlowCtx<'_>,
-    model: &Model,
+    model: &Arc<Model>,
     name: &str,
     x: HirNodeId,
     c_out: usize,
@@ -1909,7 +1909,7 @@ impl LayerStage for DacStage {
 /// where it does not (see [`Model::code_proj_widths`]).
 fn code_proj_in_node(
     ctx: &mut FlowCtx<'_>,
-    model: &Model,
+    model: &Arc<Model>,
     seq: HirNodeId,
     rows: usize,
     d_talker: usize,
@@ -2003,7 +2003,7 @@ struct PredictorBlocks {
 #[allow(clippy::too_many_arguments)]
 fn emit_predictor_blocks(
     ctx: &mut FlowCtx<'_>,
-    model: &Model,
+    model: &Arc<Model>,
     g: &PredictorBlocks,
     x: HirNodeId,
     cos: HirNodeId,
@@ -2535,7 +2535,7 @@ impl LayerStage for WaveTfmStage {
 #[allow(clippy::too_many_arguments)]
 fn wave_block(
     ctx: &mut FlowCtx<'_>,
-    model: &Model,
+    model: &Arc<Model>,
     p: &str,
     d: usize,
     ffn: usize,
@@ -2775,9 +2775,10 @@ fn bump(submits: u64, waits: u64) {
 
 /// Restores the compile's thread-local state when it ends, however it ends: the
 /// weight-sharing scope the next compile must not inherit, and the build records of the
-/// build that just finished (its origins, placeholders, fused plans and bound files). A
-/// compile that failed with a `?` would otherwise leave them behind and change how the next
-/// build behaves.
+/// build that just finished (its origins, placeholders, fused plans, bound files, the
+/// parameters it kept at the file's width and the width it resolved for the host). A compile
+/// that failed with a `?` would otherwise leave them behind and change how the next build
+/// behaves.
 struct DeclaredScope;
 
 impl Drop for DeclaredScope {
@@ -2787,8 +2788,9 @@ impl Drop for DeclaredScope {
     }
 }
 
-/// What the device does with one extent's bytes: a packed parameter written whole, or one
-/// part of a fused projection written at its own offset in the joined parameter.
+/// What the device does with one extent's bytes: a packed parameter written whole, one part of
+/// a fused projection written at its own offset in the joined parameter, or the pieces of a
+/// parameter the host keeps at the file's width.
 ///
 /// The joined bytes never exist on the host — the one joined copy is the device's — so a
 /// fused parameter is bound part by part out of the file's windows, and the parts are claimed
@@ -2799,8 +2801,21 @@ impl Drop for DeclaredScope {
 /// rather than worked around, because the alternative is assembling the joined bytes on the
 /// host: the peak this binding exists to remove.
 enum Write {
-    Whole { name: String, dt: DType },
-    Part { name: String, at: usize },
+    Whole {
+        name: String,
+        dt: DType,
+    },
+    Part {
+        name: String,
+        at: usize,
+    },
+    /// The file's own half-precision bytes, widened a piece at a time as they are written
+    /// (`crate::host_width::pieces`): the f32 image this replaces is never made.
+    Widen {
+        name: String,
+        file: rlx_gguf::GgmlType,
+        layout: crate::host_width::Layout,
+    },
 }
 
 /// The byte length a packed parameter is declared at, from the graph's own shape.
@@ -2850,16 +2865,16 @@ fn zero_length(name: &str) -> anyhow::Error {
 }
 
 /// The declaration must be the file's own tensor length. A shorter one writes the file's
-/// bytes past the parameter's storage, and any other one appends a second placement of the
-/// same tensor to the shared weight pool, which keys a placement by name and byte count —
-/// neither shows in an output, so the equality is checked rather than assumed.
-fn check_declared(model: &Model, name: &str, key: &str, len: usize) -> Result<()> {
-    let file_len = model.raw_len(key)?;
-    if file_len != len {
+/// bytes past the parameter's storage, and a longer one leaves the tail at whatever the arena
+/// held — and a packed tensor's placement is keyed by name and byte count, so a mismatch there
+/// also adds a second placement to the shared weight pool. Neither shows in an output, so the
+/// equality is checked rather than assumed.
+fn check_declared(name: &str, declared: usize, file: usize, path: &std::path::Path) -> Result<()> {
+    if file != declared {
         bail!(
-            "the packed parameter `{name}` is declared {len} bytes and `{key}` is {file_len} \
-             in {}: the declaration must be the file's own tensor length",
-            model.path.display()
+            "the parameter `{name}` is declared {declared} bytes and the file's tensor is \
+             {file} in {}: the declaration must be the file's own tensor length",
+            path.display()
         );
     }
     Ok(())
@@ -2960,6 +2975,11 @@ impl Runner {
         // upload loop, which would otherwise leave the scope installed and the origin
         // record standing for the next, unrelated build.
         let _scope = DeclaredScope;
+        // The parameters the build handed over at the file's width, by name: each is widened
+        // out of its own file as this compile writes the device, so the f32 image the build
+        // used to carry is never made (`crate::host_width`). Taken here because the graph walk
+        // below sizes its element map from them.
+        let host_width = emit::take_host_width();
         // Declare which model these weights belong to, so the backend can skip
         // re-uploading a graph shape's weights when a previous compile of the same
         // file already placed them: a recognition pass runs the ladder's rungs, and
@@ -3007,6 +3027,12 @@ impl Runner {
         // zero-length declaration is recorded too, so the guard can refuse it.
         let mut holds_bytes: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut declared: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        // The element count of each parameter the build handed over at the file's width: what
+        // it is declared at, and therefore the length its read is checked against (`elements *
+        // 2` file bytes) and its write covers (`elements * 4`). Only those names are collected
+        // — every other F32 parameter carries its values.
+        let mut host_width_elems: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(host_width.len());
         for node in graph.nodes() {
             let Op::Param { name } = &node.op else {
                 continue;
@@ -3017,8 +3043,14 @@ impl Runner {
             if elements > 0 {
                 holds_bytes.insert(name.as_str());
             }
-            if node.shape.dtype() == DType::U8 {
-                declared.insert(name.as_str(), elements);
+            match node.shape.dtype() {
+                DType::U8 => {
+                    declared.insert(name.as_str(), elements);
+                }
+                DType::F32 if host_width.contains_key(name.as_str()) => {
+                    host_width_elems.insert(name.as_str(), elements);
+                }
+                _ => {}
             }
         }
         let mut uploaded = 0u64;
@@ -3026,6 +3058,11 @@ impl Runner {
         let upload_start = Stopwatch::start();
         while let Some(name) = built.params.keys().next().cloned() {
             let values = built.params.remove(&name).expect("key just read");
+            // A parameter the host keeps at the file's width is declared at the graph's f32
+            // shape and carries no values: the widen loop below is where its bytes are.
+            if host_width.contains_key(&name) {
+                continue;
+            }
             let kept = emit::host_weight(&origins, &name);
             match bind_route(
                 &values,
@@ -3075,7 +3112,7 @@ impl Runner {
                 }
             } else if let Some((model, key)) = emit::bound_weight(&name) {
                 let len = declared_len(&declared, &name)?;
-                check_declared(&model, &name, &key, len)?;
+                check_declared(&name, len, model.raw_len(&key)?, &model.path)?;
                 if already_held(&mut session, &mut skipped, &name, len) {
                     continue;
                 }
@@ -3105,24 +3142,70 @@ impl Runner {
                 uploaded += bytes.len() as u64;
             }
         }
+        // The parameters the host keeps at the file's width: each is read from its own file
+        // through the upload's window and widened a piece at a time as it is written
+        // (`crate::host_width::pieces`), so the f32 image the build used to carry is never
+        // made — the only staging is one piece and its column. Walked by name, because the
+        // map's own order is arbitrary and the upload's plan is file order.
+        let mut records: Vec<(&String, &emit::HostWidth)> = host_width.iter().collect();
+        records.sort_by_key(|(name, _)| name.as_str());
+        for (name, record) in records {
+            let Some(&elems) = host_width_elems.get(name.as_str()) else {
+                bail!(
+                    "the weight `{name}` was handed over at the file's width and the graph does \
+                     not declare it F32: a widened parameter keeps the declaration the f32 \
+                     image took"
+                );
+            };
+            if elems == 0 {
+                bail!(
+                    "the weight `{name}` is declared at zero values and the host keeps the \
+                     file's width for it: there is no storage to widen the file's bytes into"
+                );
+            }
+            let (start, len) = record.model.file_extent(&record.key)?;
+            // Checked before the residency test, so a warm compile still refuses a file that
+            // is not the parameter's own tensor — the order the packed route above takes.
+            check_declared(name, elems * 2, len as usize, &record.model.path)?;
+            if already_held(&mut session, &mut skipped, name, elems * 4) {
+                continue;
+            }
+            reads.push(readahead::Extent {
+                model: Arc::clone(&record.model),
+                key: record.key.clone(),
+                start,
+                len,
+                tag: Write::Widen {
+                    name: name.clone(),
+                    file: record.file,
+                    layout: record.layout,
+                },
+            });
+        }
         // A fused projection lands in pieces, so it is resident once the last part has been
         // written rather than after each one — and it is the one route the backend cannot mark
-        // itself, since it sees the parts and not the whole. One name per projection, not one
-        // per part: the whole-value routes mark inside `set_param`, which every caller goes
-        // through, and marking a four-part projection four times would re-prepare the session
-        // for nothing.
-        let mut fused_names: Vec<&str> = reads
+        // itself, since it sees the parts and not the whole. A widened parameter is the same
+        // shape of write for the same reason: the backend sees its pieces. One name per
+        // parameter, not one per piece: the whole-value routes mark inside `set_param`, which
+        // every caller goes through, and marking a four-part projection four times would
+        // re-prepare the session for nothing.
+        let mut piece_names: Vec<&str> = reads
             .iter()
             .filter_map(|read| match &read.tag {
-                Write::Part { name, .. } => Some(name.as_str()),
+                Write::Part { name, .. } | Write::Widen { name, .. } => Some(name.as_str()),
                 Write::Whole { .. } => None,
             })
             .collect();
-        fused_names.sort_unstable();
-        fused_names.dedup();
+        piece_names.sort_unstable();
+        piece_names.dedup();
         readahead::read_extents(&reads, |read, bytes| {
-            match &read.tag {
-                Write::Whole { name, dt } => session.set_param_typed(name, bytes, *dt),
+            // What the device receives, which for a widened parameter is the f32 pieces rather
+            // than the file's own two-byte values.
+            let written = match &read.tag {
+                Write::Whole { name, dt } => {
+                    session.set_param_typed(name, bytes, *dt);
+                    bytes.len()
+                }
                 Write::Part { name, at } => {
                     if !session.set_param_range(name, *at, bytes) {
                         bail!(
@@ -3134,12 +3217,34 @@ impl Runner {
                             crate::device::label()
                         );
                     }
+                    bytes.len()
                 }
-            }
-            uploaded += bytes.len() as u64;
+                Write::Widen { name, file, layout } => {
+                    // The pieces are the file's own values widened; a backend that cannot take
+                    // them that way is a named error rather than a fallback to widening the
+                    // whole tensor, which is the peak this route exists to remove.
+                    crate::host_width::pieces(*file, bytes, *layout, |at, values| {
+                        if !session.set_param_range(name, at * 4, bytemuck::cast_slice(values)) {
+                            bail!(
+                                "the weight `{name}` cannot be written at the file's width: the \
+                                 {} backend refused the piece at value {at} (no partial \
+                                 parameter write on this backend, or the parameter is not f32 \
+                                 storage in the compiled schedule) — and the widened tensor is \
+                                 not materialised on the host to hand over whole",
+                                crate::device::label()
+                            );
+                        }
+                        Ok(())
+                    })?;
+                    // The parameter receives the file's values at f32: two bytes each on the
+                    // way in, so the window's length doubled is what the device holds.
+                    bytes.len() * 2
+                }
+            };
+            uploaded += written as u64;
             Ok(())
         })?;
-        for name in &fused_names {
+        for name in &piece_names {
             session.mark_param_written(name);
         }
         let upload = Upload {
@@ -3653,22 +3758,25 @@ pub fn synthesis_sound_group(
 /// a line per window instead of one per build — and a second call at the same length, which
 /// rebuilds every one of these graphs, has to print again rather than go quiet.
 ///
-/// `upload=` is not the bytes the file declares for the tensors bound here: F16 is widened to
-/// f32 on the host and the codec's non-rank-2 quantised weights are dequantised there, so a
-/// line reads more than its tensors occupy in the file — the front group's ~247 MiB against
-/// 196, the middle group's ~30 against 22, the tail's ~1.3 against 0.9 — before the skip below
-/// takes the front's packed rank-2 tensors back out of it.
+/// `upload=` is not the bytes the file declares for the tensors bound here: an F16 tensor is
+/// widened to f32 as its bytes go to the device and the codec's non-rank-2 quantised weights
+/// are dequantised on the host, so a line reads more than its tensors occupy in the file — the
+/// front group's ~247 MiB against 196, the middle group's ~30 against 22, the tail's ~1.3
+/// against 0.9 — before the skip below takes the front's packed rank-2 tensors back out of it.
 ///
 /// `skipped=` is the reading this line exists to make visible, and it says the sound half
 /// skips almost nothing. A sound graph does declare a weight-sharing scope — every parameter
 /// it binds is served from the sound file — so the front group's packed rank-2 tensors are
 /// parked in the shared weight pool and skipped on a rebuild (~56.6 MiB of its ~247). Nothing
-/// else can: the two codec stage groups carry no packed rank-2 tensor at all — their weights
-/// are the codec's convolutions, quantised in the file and dequantised to f32 on the host, and
-/// those f32 parameters are placed in each build's own freshly zeroed arena rather than in the
-/// shared pool. The f32 parameter path never consults residency and is never counted as
-/// skipped, so `skipped=` reads zero for both stage groups on every call, and only the front
-/// group's figure can move.
+/// else can: the two codec stage groups carry no packed rank-2 tensor at all. Their weights
+/// are the codec's convolutions — quantised in the file and dequantised to f32 on the host,
+/// or f16 in the file and widened as they are written — and every one of them is an f32
+/// parameter. On the graphics device such a parameter lives in its own build's freshly zeroed
+/// arena rather than in the shared pool, and the residency test is keyed to the pool, so
+/// `skipped=` reads zero for both stage groups on every call there and only the front group's
+/// figure can move. The dequantised ones never consult residency on either device; the widened
+/// ones do, and the processor holds an f32 parameter across builds, so a processor take skips
+/// them.
 pub fn sound_graph(
     model: &Arc<Model>,
     frames: usize,

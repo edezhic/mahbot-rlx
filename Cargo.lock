@@ -2841,6 +2841,7 @@ name = "mahbot-inference"
 version = "0.2.18-mahbot.5"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "earshot",
  "half",
  "libc",

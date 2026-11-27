@@ -1452,6 +1452,7 @@ mod tests {
             phases: config::Phases::ALL,
             voices: sets::NUM_VERIFICATION_VOICES,
             swap_growth_mib: crate::guard::MAX_SWAP_GROWTH_MIB,
+            host_arm: false,
         }
     }
 

@@ -43,9 +43,10 @@ fn an_unresolvable_weight_fails_and_a_failed_build_leaves_nothing_behind() {
         return;
     }
     let pair = Arc::new(Pair::open(dir.join(body), dir.join(sound)).expect("the ASR pair opens"));
-    // A body graph, not the sound encoder: the encoder's weights are host f16 the build
-    // carries itself, while the body's packed weights are placeholders the compile binds
-    // from the file the build's record names — the case this test is about.
+    // A body graph, not the sound encoder: the encoder's weights are half-precision tensors
+    // the build hands over at the file's width, while the body's packed weights are
+    // placeholders the compile binds from the file the build's record names — the case this
+    // test is about.
     let built =
         graphs::body_new_rows_head_chain(pair.body.clone(), 8, 0, false).expect("the body builds");
     // What a placeholder stands in for: the file the build's record names — the same file's

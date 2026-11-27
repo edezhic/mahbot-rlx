@@ -52,9 +52,10 @@
 //! (codec, wave transformer and DAC; that pair's `mmproj` holds no projector). The recognition
 //! pair's own projector is a few megabytes, a couple of milliseconds that five paired takes
 //! cannot resolve, so it is not a subject. A subject's graph is built once and the file extents
-//! its compile would read are taken from the build ([`plan_extents`]) — a fused projection
-//! contributes one extent per part — and the build is then dropped, so no figure below is
-//! charged for a graph nobody compiles.
+//! its compile would read are taken from the build ([`plan_extents`]): a fused projection
+//! contributes one extent per part, and a half-precision tensor contributes the file bytes its
+//! widening reads. The build is then dropped, so no figure below is charged for a graph nobody
+//! compiles.
 //!
 //! [`ROUNDS`] paired rounds per subject, the three arms' order rotated every round so a
 //! within-round drift lands on all of them rather than on one delta, and each arm's median taken
@@ -128,15 +129,16 @@ const UPLOAD_TAKES: usize = 3;
 /// The file extents a compile of `built` reads, in the order the build declared them: the list
 /// the upload loop walks by file offset once it is planned.
 ///
-/// The two predicates below are the ones `graphs::Runner::compile` routes by, and this must not
-/// quietly grow a third: a name that is neither fused nor bound is a parameter the build carried,
-/// and a carried parameter always carries bytes. A file-backed route the compile adds and this
-/// does not know about leaves the build's bytes empty and fails here, rather than shrinking the
-/// subject without saying so. A route that both carried bytes and read a file would pass this
-/// check; the upload subject's `upload.bytes == bound` assertion is what catches that one.
-fn plan_extents(typed: &[(String, Vec<u8>, rlx_ir::DType)]) -> Vec<readahead::Extent<()>> {
+/// The predicates below are the ones `graphs::Runner::compile` routes by, and this must not
+/// quietly grow another: a name that is neither fused, bound nor kept at the file's width is a
+/// parameter the build carried, and a carried parameter always carries bytes. A file-backed
+/// route the compile adds and this does not know about leaves the build's bytes empty and fails
+/// here, rather than shrinking the subject without saying so. A route that both carried bytes
+/// and read a file would pass this check; the upload subject's `upload.bytes == bound`
+/// assertion is what catches that one.
+fn plan_extents(built: &BuiltModel) -> Vec<readahead::Extent<()>> {
     let mut extents = Vec::new();
-    for (name, bytes, _) in typed {
+    for (name, bytes, _) in &built.typed_params {
         if let Some(fused) = emit::fused_of(name) {
             for part in &fused.parts {
                 let (start, len) = fused.model.file_extent(part).expect("a fused part's bytes");
@@ -165,6 +167,21 @@ fn plan_extents(typed: &[(String, Vec<u8>, rlx_ir::DType)]) -> Vec<readahead::Ex
                  would be smaller than the read"
             );
         }
+    }
+    // The parameters the build handed over at the file's width: their bytes never enter the
+    // build, and the compile widens them out of the file as it writes the device — reads of
+    // this subject like any other.
+    for (_, model, key) in emit::host_width_reads() {
+        let (start, len) = model
+            .file_extent(&key)
+            .expect("a file-width tensor's bytes");
+        extents.push(readahead::Extent {
+            model,
+            key,
+            start,
+            len,
+            tag: (),
+        });
     }
     extents
 }
@@ -497,7 +514,7 @@ fn subject(
     vocab: bool,
     sink: &mut Vec<u8>,
 ) -> Vec<readahead::Extent<()>> {
-    let extents = plan_extents(&built.typed_params);
+    let extents = plan_extents(&built);
     drop(built);
     let path = extents
         .first()

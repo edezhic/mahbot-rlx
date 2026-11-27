@@ -78,8 +78,11 @@ rand = "0.9"
 # the transcription path's segmentation (`vad`).
 earshot = "1.2"
 # The f16 image of a `Store::F16Linear` weight: one rounding per value, written as
-# little-endian bits for `set_param_typed(..., DType::F16)`.
-half = "2"
+# little-endian bits for `set_param_typed(..., DType::F16)`; and the vectorized widening
+# `host_width::pieces` reads a file's half-precision bytes through.
+half = { version = "2", features = ["bytemuck"] }
+# The 2-byte view of those bytes: the same `Pod` cast `rlx-gguf`'s decode reads them through.
+bytemuck = "1"
 
 # The readahead request `Model::with_mapped` issues before each window's bytes are read:
 # `fcntl(F_RDADVISE)` on macOS, `posix_fadvise(WILLNEED)` on Linux. Neither copies into this
@@ -94,10 +97,10 @@ workspace = true
 # The wake-word bench, its corpus build and the transcription corpus run are
 # deliberate, never automatic: without this feature none of them is built.
 bench = []
-# The nineteen hand-run targets below. Every test in them is `#[ignore]`d, so a routine
-# `cargo test` would link and execute nineteen binaries that run nothing and pay each
-# one's first-execution assessment; the contour has 77 test binaries behind
-# this feature and 59 without it (the stand's own is `test = false` above, so it is in
+# The twenty hand-run targets below. Every test in them is `#[ignore]`d, so a routine
+# `cargo test` would link and execute twenty binaries that run nothing and pay each
+# one's first-execution assessment; the contour has 78 test binaries behind
+# this feature and 58 without it (the stand's own is `test = false` above, so it is in
 # neither count). The feature is also what keeps them buildable, type-checked and
 # runnable: `just lint` and `just lint-mahbot` enable it, `just test-workspace`
 # enables it so the whole-set gate still reaches them, and each file's own doc
@@ -135,6 +138,10 @@ required-features = ["hand-run"]
 
 [[test]]
 name = "encoder_qkv"
+required-features = ["hand-run"]
+
+[[test]]
+name = "host_width"
 required-features = ["hand-run"]
 
 [[test]]

@@ -317,8 +317,14 @@ merge action.
 - the sampler's branchless candidate order and its single-pass retained-set assembly
 - the sixteen-window grouped encoder pass
 - capacity-bucketed body planes and plane seeding
-- the tagger's rank-2 `F16` matrices as f16 params — a host-image saving, not a
-  device-side one
+- the tagger's rank-2 `F16` matrices as f16 params — a kernel choice, not a
+  host-image or device-side one
+- the host keeping a file's half-precision tensors at the file's own width: the build records
+  where the bytes are (`emit::take` / `emit::f32_param`) and the compile widens them a piece
+  at a time into the parameter (`graphs::Runner::compile`, `crates/mahbot-inference/src/host_width.rs`).
+  A sync that re-applies upstream's shape of those two emit functions restores 46 MiB on every
+  recognition and wake row and 120 MiB on every synthesis row, with no compile error and no
+  change to any answer
 - the readahead request `loader::request_readahead` issues (`F_RDADVISE` on macOS,
   `POSIX_FADV_WILLNEED` on Linux, a documented no-op elsewhere):
   it is what keeps a cold upload's file read off the page-fault path, and losing it costs
@@ -420,6 +426,14 @@ arrangement's numbers — and a value above the ceiling or outside the whole num
 is refused by name before any work. The wake bench is not screened by it: its sweep
 groups by `GROUP`, which the variable does not touch. The size and the readings
 behind it live in `crates/mahbot-inference/src/listen.rs`'s `TAIL_GROUP`.
+
+`MAHBOT_HOST_F16=0` puts back the f32 image of the tensors a file stores at half
+width, instead of widening them out of the file's own bytes as the compile writes
+the device, so the two arms can be compared on one tree. A run with it set writes
+no record — the wake bench's too, whose peak-resident column this arm moves — and a
+value that is not a boolean is refused by name before any work. The route, the piece
+it widens at and the figures behind it live in
+`crates/mahbot-inference/src/host_width.rs`.
 
 `MAHBOT_DEVICE=<gpu|cpu|auto>` names the device a run compiles for, read before any
 device is probed: `gpu` and `cpu` force the choice, `auto` (or unset) lets the product

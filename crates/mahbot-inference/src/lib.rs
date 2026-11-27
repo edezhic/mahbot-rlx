@@ -27,6 +27,7 @@ mod enrolment;
 pub mod graphs;
 pub mod guard;
 pub mod host;
+mod host_width;
 pub mod listen;
 pub mod loader;
 pub mod measurements;

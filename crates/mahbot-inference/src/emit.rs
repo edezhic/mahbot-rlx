@@ -7,18 +7,23 @@
 //! Every graph in this crate is assembled on `rlx-flow`: `ModelFlow` carries the
 //! topology, a [`LayerStage`](rlx_flow::LayerStage) per graph emits the blocks
 //! through `FlowCtx`'s emission surface and `HirMut`'s op set, and the loader
-//! above supplies the weights. Four weight paths:
+//! above supplies the weights. Five weight paths:
 //!
 //! * **body and sound** rank-2 tensors (`Store::Packed`) — the file's own
 //!   packed bytes through [`WeightSource::take_packed`], so
 //!   `FlowCtx::linear` emits a fused `DequantMatMul`;
-//! * **host** tensors (`Store::HostDequant`, `Store::F16Widened`) — unpacked to
-//!   f32 on the host and multiplied as a plain `MatMul`;
+//! * **host** tensors (`Store::HostDequant`) — unpacked to f32 on the host and
+//!   multiplied as a plain `MatMul`;
+//! * **half-precision** tensors (`Store::F16Widened`) — declared F32 like every other
+//!   parameter, but the host keeps the file's own width: the build records where the
+//!   file's bytes are and the compile widens them a piece at a time as it writes the
+//!   device (`crate::host_width`), so no f32 image is made;
 //! * **f16** linears (`Store::F16Linear`) — a `MatMul` whose weight is an f16
 //!   `Param`, for the tagger's rank-2 `F16` matrices (`crate::ced`), which the
 //!   loader widens to f32, transposes and narrows back ([`Model::linear_f16`]):
-//!   the route buys a smaller typed image on the host, not a widening avoided.
-//!   The packed route is every other file's.
+//!   the declaration is the f16 multiply's, and the build carries the narrowed f16
+//!   image until the session widens it into the parameter's arena. The packed route
+//!   is every other file's.
 //! * **packed row tables** ([`row_table`]) — a table the graph reads a few rows
 //!   at a time keeps the file's own Q8_0 bytes and the rows are gathered and
 //!   dequantised on device; any other scheme is widened to f32 and gathered.
@@ -37,10 +42,12 @@
 //! one part at a time, and a packed one is read from the file only when the device does not
 //! hold it yet. A stacked tensor's step is the exception — it is a slice of a file tensor
 //! rather than a tensor of its own, so the build carries that slice. The host paths carry
-//! their bytes too: what `Store::HostDequant`/`Store::F16Widened` dequantised is kept in
-//! `Kept` and handed over as the build's own param, because a second layout reads it instead
-//! of the file, and an f16 linear's bytes ride in the build too, as the loader narrowed them
-//! rather than as the file stores them ([`Model::linear_f16`]).
+//! their bytes too: what `Store::HostDequant` dequantised is kept in `Kept` and handed over
+//! as the build's own param, because a second layout reads it instead of the file, and an f16
+//! linear's bytes ride in the build too, as the loader narrowed them rather than as the file
+//! stores them ([`Model::linear_f16`]). A half-precision tensor on a convolution's or a
+//! matmul weight's path carries neither: the build keeps its name, file and layout
+//! (`HostWidth`) and the compile reads the file's own bytes, so the f32 image is never made.
 //!
 //! The helpers below also carry the other decisions: 1-D convolutions go
 //! through 2-D with `[k, 1]` (never `[k, k]`, which silently takes the 2-D
@@ -59,6 +66,7 @@ use rlx_ir::hir::{HirGraphExt, HirMut};
 use rlx_ir::op::{Activation, MaskKind, PadMode, ReduceOp};
 use rlx_ir::{DType, Dim, HirNodeId, HirOp, Op, Shape};
 
+use crate::host_width::Layout;
 use crate::loader::{self, Model, Store};
 
 // The build record, one per thread: what the graph being built was served from, and what
@@ -91,6 +99,26 @@ thread_local! {
     /// builds of one file cannot take each other's entry away.
     static BOUND: std::cell::RefCell<Option<std::collections::HashMap<String, Arc<Model>>>> =
         const { std::cell::RefCell::new(None) };
+    /// The parameters the build hands over at the file's width, by tensor name: the file's
+    /// tensor, the width it is stored at and the order the graph's declaration wants them in.
+    /// The compile reads the file and widens the bytes as it writes the device
+    /// (`crate::host_width::pieces`), so the f32 image is never made.
+    static HOST_WIDTH: std::cell::RefCell<Option<HashMap<String, HostWidth>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A parameter whose values the compile widens out of the model file as it writes them: the
+/// file's tensor, the width it is stored at, and the order the graph's declaration wants.
+///
+/// The `Param` is declared F32 — the declaration is what picks the kernel, and it is the same
+/// one the f32 image took — and this stands in for the image the build used to carry. Nothing
+/// is read here: the compile reads the tensor through the upload's window, only when the device
+/// does not already hold it.
+pub(crate) struct HostWidth {
+    pub model: Arc<Model>,
+    pub key: String,
+    pub file: rlx_gguf::GgmlType,
+    pub layout: Layout,
 }
 
 /// A fused projection a build handed over as a placeholder: the file's tensors whose rows
@@ -156,6 +184,47 @@ pub fn is_placeholder(key: &str) -> bool {
             .as_ref()
             .is_some_and(|names| names.contains(bare_name(key)))
     })
+}
+
+/// Record that the build handed `key`'s values over at the file's width.
+fn note_host_width(key: &str, width: HostWidth) {
+    let name = bare_name(key);
+    HOST_WIDTH.with(|cell| {
+        cell.borrow_mut()
+            .get_or_insert_with(HashMap::new)
+            .insert(name.to_string(), width);
+    });
+}
+
+/// The parameters the build being made handed over at the file's width, taken: the compile
+/// widens each out of its file as it writes the device. Taken rather than read, because the
+/// upload it describes happens once.
+pub(crate) fn take_host_width() -> HashMap<String, HostWidth> {
+    HOST_WIDTH
+        .with(|cell| cell.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// The parameters the build being made handed over at the file's width, sorted by name: each
+/// one's file and the tensor in it. Read, not taken — the compile takes them.
+/// `tests/host_width.rs` and `tests/cold_read.rs` read it: which arm a build took, and the
+/// file bytes its compile reads.
+pub fn host_width_reads() -> Vec<(String, Arc<Model>, String)> {
+    let mut reads: Vec<(String, Arc<Model>, String)> = HOST_WIDTH.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|widths| {
+                widths
+                    .iter()
+                    .map(|(name, width)| {
+                        (name.clone(), Arc::clone(&width.model), width.key.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    reads.sort_by(|a, b| a.0.cmp(&b.0));
+    reads
 }
 
 /// The names the build being made handed over as placeholders, sorted: what a compile resolves
@@ -252,6 +321,7 @@ pub fn clear_weight_caches() {
     cached().lock().unwrap_or_else(|e| e.into_inner()).clear();
     FUSED.with(|cell| *cell.borrow_mut() = None);
     BOUND.with(|cell| *cell.borrow_mut() = None);
+    HOST_WIDTH.with(|cell| *cell.borrow_mut() = None);
     SEEN.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -260,14 +330,17 @@ pub fn clear_weight_caches() {
 }
 
 /// Forget the build's origin record, its fused projections, the files its packed
-/// placeholders are bound from and its placeholder record: all four describe the one build
-/// that just finished. Called when a build starts (so nothing an earlier, failed build left
-/// can change it) and again when its compile has bound every parameter.
+/// placeholders are bound from, the parameters it handed over at the file's width, its
+/// placeholder record and the width it resolved for the host: all of them describe the one
+/// build that just finished. Called when a build starts (so nothing an earlier, failed build
+/// left can change it) and again when its compile has bound every parameter.
 pub fn clear_origins() {
     ORIGINS.with(|cell| *cell.borrow_mut() = None);
     FUSED.with(|cell| *cell.borrow_mut() = None);
     BOUND.with(|cell| *cell.borrow_mut() = None);
+    HOST_WIDTH.with(|cell| *cell.borrow_mut() = None);
     PLACEHOLDERS.with(|cell| *cell.borrow_mut() = None);
+    crate::host_width::forget();
 }
 
 /// The weight source of one file: serves both weight paths.
@@ -399,8 +472,9 @@ static SEEN: std::sync::OnceLock<std::sync::Mutex<HashSet<(String, String)>>> =
 /// therefore worth the memory. What is kept lives on the host until [`clear_weight_caches`],
 /// so a process that builds two shapes of one model — the wake bench's single-window and
 /// grouped encoders, a transcription's rung ladder — carries one extra copy per kept weight
-/// in every later footprint reading. Only the host f32 path is kept: a packed tensor and a
-/// fused projection are read from the model file at compile time and hold nothing.
+/// in every later footprint reading. Only the host f32 path is kept: a packed tensor, a fused
+/// projection and a half-precision one are read from the model file at compile time and hold
+/// nothing.
 fn worth_keeping(model: &Model, key: &str) -> bool {
     let entry = (model.path.display().to_string(), key.to_string());
     match SEEN
@@ -489,6 +563,15 @@ fn split_step(key: &str) -> Option<(&str, usize)> {
 impl WeightSource for LoaderWeights {
     fn take(&mut self, key: &str, transpose: bool) -> Result<(Vec<f32>, Vec<usize>)> {
         note_origin(key, &self.model);
+        // The file's own width first, before the kept-copy test: a rank-2 tensor the file
+        // stores at half width keeps no f32 image — the compile widens the file's bytes into
+        // the parameter as it writes them ([`crate::host_width`]) — and an f32 image an
+        // earlier build kept (the other arm of `MAHBOT_HOST_F16`) must not put it back on the
+        // f32 route.
+        if let Some((dims, widened)) = self.at_file_width(key, transpose)? {
+            note_host_width(key, widened);
+            return Ok((Vec::new(), dims));
+        }
         // A weight this process has already read once is served from memory: every layout
         // of the model binds the same bytes, and the ladder's rungs are several layouts of
         // one body. The layout is part of the entry, so a transposed read is its own.
@@ -563,6 +646,26 @@ impl WeightSource for LoaderWeights {
 }
 
 impl LoaderWeights {
+    /// The declaration a rank-2 tensor the file stores at half width takes when the host
+    /// keeps the file's width (`crate::host_width`): the dims its parameter is declared at,
+    /// and the record the compile widens out of the file. `None` leaves the weight on the f32
+    /// route it took before.
+    ///
+    /// Only `MatMul`'s layout is served: a transposed read has no caller in this crate, and a
+    /// step is a slice of a file tensor rather than one.
+    fn at_file_width(&self, key: &str, transpose: bool) -> Result<Option<(Vec<usize>, HostWidth)>> {
+        if transpose || split_step(key).is_some() {
+            return Ok(None);
+        }
+        let p = self.model.plan(key)?;
+        if p.ggml_shape.len() != 2 {
+            return Ok(None);
+        }
+        let (k, n) = p.in_out();
+        Ok(file_width(&self.model, key, p, Layout::MatMul { k, n })?
+            .map(|widened| (vec![k, n], widened)))
+    }
+
     /// The weight as the file hands it over: the f32 layout and values for `key`, read
     /// once per process and served from memory after that ([`serve_f32`]).
     fn take_read(&mut self, key: &str, transpose: bool) -> Result<(Vec<f32>, Vec<usize>)> {
@@ -655,8 +758,10 @@ impl LoaderWeights {
 /// loader's pair check is what makes sure of.
 ///
 /// The two weight paths behave exactly as in [`LoaderWeights`]: body and sound
-/// packed tensors go through `take_packed` (bytes, `DequantMatMul`), host-dequant
-/// and F16 tensors through `take` (host f32, plain `MatMul`).
+/// packed tensors go through `take_packed` (bytes, `DequantMatMul`), and host-dequant
+/// tensors through `take` (host f32, plain `MatMul`). A half-precision tensor goes
+/// through `take` too, but the host keeps the file's width and the compile widens it as
+/// it writes the device (`crate::host_width`).
 pub struct PairWeights {
     pub body: Arc<Model>,
     pub sound: Arc<Model>,
@@ -739,18 +844,28 @@ pub fn zeros(ctx: &mut FlowCtx<'_>, dims: &[usize]) -> HirNodeId {
 /// A tensor of the file, F32, declared at `dims` (its own element order). One
 /// leaf a name: a tensor already in the graph is handed back, file untouched
 /// (see `declared_param`).
+///
+/// A tensor the file stores at half width is declared the same F32 leaf and its values are
+/// widened as the compile writes them, so no f32 image is made (`crate::host_width`).
 pub fn f32_param(
     ctx: &mut FlowCtx<'_>,
-    model: &Model,
+    model: &Arc<Model>,
     name: &str,
     dims: &[usize],
 ) -> Result<HirNodeId> {
     note_origin(name, model);
-    if let Some(id) = declared_param(ctx, name, &Shape::new(dims, DType::F32)) {
+    let shape = Shape::new(dims, DType::F32);
+    if let Some(id) = declared_param(ctx, name, &shape) {
         return Ok(id);
     }
-    let (vals, file_dims) = model.f32_file_order(name)?;
     let want: usize = dims.iter().product();
+    if let Some(widened) = file_width(model, name, model.plan(name)?, Layout::FileOrder)? {
+        // A placeholder like any other: the build carries no values, and the compile binds the
+        // file's bytes (`HostWidth`) — or refuses the parameter if that record never reaches it.
+        note_host_width(name, widened);
+        return Ok(synth_param(ctx, name, Vec::new(), dims));
+    }
+    let (vals, file_dims) = model.f32_file_order(name)?;
     if vals.len() != want {
         bail!(
             "`{name}`: {want} values wanted for {dims:?}, file has {} ({file_dims:?})",
@@ -758,6 +873,30 @@ pub fn f32_param(
         );
     }
     Ok(synth_param(ctx, name, vals, dims))
+}
+
+/// The record a half-precision tensor keeps when the host keeps the file's width, in
+/// `layout`: `None` for a tensor the file stores as f32 and for the arm that puts the f32
+/// image back ([`crate::host_width`]).
+///
+/// The declaration is F32 either way, so the file's tensor must hold the graph's element count
+/// at two bytes each: `graphs::Runner::compile` checks the read against the declaration and
+/// refuses a short one rather than uploading a parameter that is read as zeros.
+fn file_width(
+    model: &Arc<Model>,
+    name: &str,
+    plan: &loader::Plan,
+    layout: Layout,
+) -> Result<Option<HostWidth>> {
+    if plan.store != Store::F16Widened || !crate::host_width::keep()? {
+        return Ok(None);
+    }
+    Ok(Some(HostWidth {
+        model: Arc::clone(model),
+        key: name.to_string(),
+        file: plan.file,
+        layout,
+    }))
 }
 
 /// A prefix of a tensor's values (the first `count` of its own order): how
@@ -790,7 +929,7 @@ pub fn prefix_param(
 /// A convolution kernel as the graph declares it: a rank-4 tensor as it is, a
 /// rank-3 one (a 1-D convolution) with the unit axis inserted before the kernel,
 /// so the kernel stays `[1, k]` and never `[k, k]`.
-pub fn conv_param(ctx: &mut FlowCtx<'_>, model: &Model, name: &str) -> Result<HirNodeId> {
+pub fn conv_param(ctx: &mut FlowCtx<'_>, model: &Arc<Model>, name: &str) -> Result<HirNodeId> {
     note_origin(name, model);
     let p = model.plan(name)?.clone();
     let dims = match p.dims.len() {
@@ -967,7 +1106,12 @@ pub fn qkv(
 }
 
 /// A bias tensor as an NCHW broadcastable `[1, C, 1, 1]`.
-pub fn conv_bias(ctx: &mut FlowCtx<'_>, model: &Model, name: &str, c: usize) -> Result<HirNodeId> {
+pub fn conv_bias(
+    ctx: &mut FlowCtx<'_>,
+    model: &Arc<Model>,
+    name: &str,
+    c: usize,
+) -> Result<HirNodeId> {
     f32_param(ctx, model, name, &[1, c, 1, 1])
 }
 

@@ -38,10 +38,11 @@
 //! biases, the two position tables, the front end's filterbank and window, the
 //! batch-norm statistics and the patch projection, which alone is nearly half of the
 //! file's f32 bytes. [`Store::F16Linear`] declares those 49 as f16 params — the
-//! only plan in this crate that does. It does not avoid a widening: each matrix is
-//! widened to f32, transposed into `MatMul`'s layout and narrowed back, and the
-//! session widens those bytes again into the f32 arena. What it buys is the size of
-//! the typed image the build hands the session — [`Model::linear_f16`] states it.
+//! only plan in this crate that does, and the declaration the f16 multiply is
+//! offered under. It does not avoid a widening: each matrix is widened to f32,
+//! transposed into `MatMul`'s layout and narrowed back, and the session widens those
+//! bytes again into the f32 arena. What it changes is the size of the image the build
+//! hands the session — [`Model::linear_f16`] states it.
 //!
 //! Which kernel serves a multiply is the adapter's answer as much as the shape's.
 //! The cooperative f16 multiply wants whole 64-row output tiles, whole 64-column
