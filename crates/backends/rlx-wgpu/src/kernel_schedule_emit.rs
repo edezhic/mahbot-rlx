@@ -464,7 +464,7 @@ pub fn emit_wgsl(
          \x20   has_bias: u32,\n\
          \x20   bias_off: u32,\n\
          \x20   act_id: u32,\n\
-         \x20   _p0: u32, _p1: u32, _p2: u32,\n\
+         \x20   _p0: u32, c_ld: u32, _p2: u32,\n\
          };\n\n\
          @group(0) @binding(0) var<storage, read_write> arena: array<f32>;\n\
          @group(0) @binding(1) var<uniform>              params: Params;\n\n",
@@ -633,7 +633,7 @@ pub fn emit_wgsl(
          \x20                       v = v + arena[params.bias_off + global_col];\n\
          \x20                   }\n\
          \x20                   v = apply_act(v);\n\
-         \x20                   arena[c_base + global_row * params.n + global_col] = v;\n\
+         \x20                   arena[c_base + global_row * params.c_ld + global_col] = v;\n\
          \x20               }\n\
          \x20           }\n\
          \x20       }\n\
@@ -740,7 +740,7 @@ mod tests {
             "let bz_safe = select(0u, bz, in_batch);",
             "let n_tiles = (params.k + TILE_K - 1u) / TILE_K;",
             "v = v + arena[params.bias_off + global_col];",
-            "arena[c_base + global_row * params.n + global_col] = v;",
+            "arena[c_base + global_row * params.c_ld + global_col] = v;",
         ] {
             assert!(
                 shipping.contains(fragment),

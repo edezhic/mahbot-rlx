@@ -13,6 +13,13 @@ pub struct WgpuRuntimeConfig {
     pub im2col_min_spatial: usize,
     pub im2col_min_k: usize,
     pub im2col_min_cout: usize,
+    /// Most one chunk of the im2col col panel may reserve, in bytes; the panel is cut over the
+    /// output's spatial axis into whole 32-column tiles to fit (`ConvColPanel`), so the
+    /// reservation stops following the conv's extent. A chunk is never narrower than one tile,
+    /// so a reduction wide enough to leave a tile's columns over this budget still reserves the
+    /// tile. `0` lifts the cap — the panel is the whole extent, which is the arm this cut is
+    /// measured against.
+    pub im2col_panel_bytes: usize,
     pub tiled_min_spatial: usize,
     pub dump_nodes: bool,
     pub dump_nodes_limit: usize,
@@ -178,6 +185,10 @@ impl WgpuRuntimeConfig {
             im2col_min_spatial: reg::parse_or("RLX_WGPU_IM2COL_MIN_SPATIAL", 1usize),
             im2col_min_k: reg::parse_or("RLX_WGPU_IM2COL_MIN_K", 256usize),
             im2col_min_cout: reg::parse_or("RLX_WGPU_IM2COL_MIN_COUT", 64usize),
+            im2col_panel_bytes: reg::parse_or(
+                "RLX_WGPU_IM2COL_PANEL_BYTES",
+                crate::backend::CONV_IM2COL_PANEL_BYTES as usize,
+            ),
             tiled_min_spatial: reg::parse_or("RLX_WGPU_TILED_MIN_SPATIAL", 256usize),
             dump_nodes: reg::flag("RLX_WGPU_DUMP_NODES"),
             dump_nodes_limit: reg::parse_or("RLX_WGPU_DUMP_NODES_LIMIT", 40usize),

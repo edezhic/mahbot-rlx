@@ -118,6 +118,14 @@ pub(crate) enum Step {
         m: u32,
         k: u32,
         n: u32,
+        /// The GEMM's column extent when this step dispatches one *chunk* of it: the
+        /// convolution GEMM routes gather and multiply a conv's output columns a chunk at a
+        /// time (`ConvColPanel`), so `n` is the chunk while the output slab is still the
+        /// conv's whole `c_out × spatial`. The kernel pick and the tuning lookup read this —
+        /// a chunk must not move a conv onto another kernel or another tuning bucket — and
+        /// so does C's row stride (`MatmulParams::c_ld`); the dispatch grid and B's row
+        /// stride read `n`. `0` means the step is the whole GEMM and `n` is the geometry.
+        n_geometry: u32,
         a_off_f32: u32,
         b_off_f32: u32,
         c_off_f32: u32,

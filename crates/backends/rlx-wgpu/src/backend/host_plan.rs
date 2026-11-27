@@ -352,6 +352,7 @@ mod tests {
             m: 1,
             k: 1,
             n: 1,
+            n_geometry: 0,
             a_off_f32: 0,
             b_off_f32: 0,
             c_off_f32: 0,

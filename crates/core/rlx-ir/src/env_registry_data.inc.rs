@@ -4364,6 +4364,15 @@
         layer: EnvLayer::Backend("wgpu"),
     },
     EnvVarEntry {
+        name: "RLX_WGPU_IM2COL_PANEL_BYTES",
+        group: "wgpu",
+        summary: "Most one chunk of an im2col col panel may reserve, in bytes; the panel is cut over the output's spatial axis into whole 32-column tiles to fit, so the reservation stops following the conv's extent (default 16 MiB, 0 lifts the cap and books the whole panel)",
+        kind: EnvKind::U64,
+        stability: EnvStability::Bisect,
+        aliases: &[],
+        layer: EnvLayer::Backend("wgpu"),
+    },
+    EnvVarEntry {
         name: "RLX_WGPU_IM2COL_MIN_SPATIAL",
         group: "wgpu",
         summary: "Minimum spatial extent before im2col is used (default 1, so every extent; the K, channel and group floors still gate, and the 1×1 pointwise route has its own bar)",

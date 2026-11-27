@@ -449,10 +449,8 @@ fn a_height_padded_unit_tap_conv_is_not_the_route() {
 /// The class shape declined at lowering while the route is live: a weight parked in
 /// the weight buffer cannot be addressed by the entry (its word offset drops the
 /// tag), so the conv keeps the direct route — with no panel to fall back to, because
-/// the reservation subtracts this class. Two independent terms keep the panel away: the
-/// class books none for this shape, so `col_bytes <= arena.scratch_bytes` refuses the
-/// im2col route, and `use_im2col` carries the parked term as well. The conv runs direct,
-/// to the CPU's answer. (The tail here is the 64 MiB reserve `RLX_WGPU_ALL_PARAMS_WEIGHT`
+/// the reservation subtracts this class. The conv runs direct, to the CPU's answer.
+/// (The tail here is the 64 MiB reserve `RLX_WGPU_ALL_PARAMS_WEIGHT`
 /// keeps for the parked staging path; without that switch a class-only graph books
 /// nothing.) The second arm is the witness that the decline takes no panel away from a
 /// conv that could have had one: the same graph with the class switched off keeps the same
@@ -469,9 +467,7 @@ fn a_class_shape_with_a_parked_weight_falls_to_the_direct_conv() {
         return;
     }
 
-    // The class's own tap shape at extents whose panel is past the parked staging
-    // reserve, so im2col cannot take it either: 32 × 7 × 131 072 × 4 = 117 MB and
-    // 384 × 7 × 8 206 × 4 = 88 MB against that reserve's 64 MiB.
+    // The class's own tap shape at two extents.
     const KW: usize = 7;
     for (c, l, check_against_cpu) in [(32usize, 131_066usize, true), (384, 8_200, false)] {
         let build = || {

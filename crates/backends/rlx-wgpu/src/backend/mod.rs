@@ -203,10 +203,12 @@ fn rnn_gru_scratch_bytes(graph: &rlx_ir::Graph) -> usize {
     max
 }
 
-/// Hard cap on the col scratch matrix (bytes). Convs whose col would exceed
-/// this fall back to the direct conv kernel (keeps the arena well under the
-/// 4 GiB storage-binding limit). The host transposed-conv route reuses the same
-/// cap for its own `col` panel.
+/// Hard cap on the col panel in full (bytes) — the admission test's, not the reservation's:
+/// the panel the route gathers is cut into chunks ([`ConvColPanel`]) and one chunk is what the
+/// arena books, but a conv whose whole panel is past this keeps the direct conv kernel, so the
+/// route set does not move with the cut (keeps the arena well under the 4 GiB
+/// storage-binding limit). The host transposed-conv route reuses the same cap for its own
+/// `col` panel.
 pub(crate) const CONV_IM2COL_MAX_COL_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Largest spatial extent the 1×1 pointwise GEMM may take. The route's `n` is
@@ -250,7 +252,7 @@ fn im2col_min_cout() -> u64 {
 /// the lean arena exactly, which is what keeps a bisect of that flip possible. The
 /// same predicate gates the col-scratch reservation, which is sized from a conv's
 /// *shape* and the implicit route's own two terms (its switch and the adapter's
-/// entry) without reading the graph's schedule (see [`conv_im2col_col_elems`]): a
+/// entry) without reading the graph's schedule (see [`conv_im2col_panel`]): a
 /// graph whose convs qualify for neither reserves nothing, and one whose conv does
 /// pays that reservation even where the route then does not run — a parked weight,
 /// a conv its adapter routes to the host, a sharded arena.
@@ -260,8 +262,10 @@ pub(crate) fn conv_routes_enabled() -> bool {
 
 /// The cooperative implicit-GEMM convolution (`conv1d_implicit.wgsl`), live:
 /// `RLX_WGPU_CONV_IMPLICIT=0` puts every conv back on the im2col/tiled/direct
-/// routing for a bisect. Read at the point of decision rather than frozen in
-/// `WgpuRuntimeConfig`, like the other route switches.
+/// routing for a bisect — where the im2col arm now gathers in many panel chunks
+/// (`RLX_WGPU_IM2COL_PANEL_BYTES=0` restores the whole panel), so that arm is a route
+/// comparison, not a measure of the shipped path. Read at the point of decision rather
+/// than frozen in `WgpuRuntimeConfig`, like the other route switches.
 pub(crate) fn conv_implicit_enabled() -> bool {
     rlx_ir::env::flag_or("RLX_WGPU_CONV_IMPLICIT", true)
 }
@@ -307,22 +311,6 @@ pub(crate) const CONV_IMPLICIT_ROW_ROWS: u64 = 96;
 /// bound of 512 would additionally admit the speaker encoder's five-tap entry conv at
 /// recordings of about 51 seconds and longer, a path with no pinned witness.
 ///
-/// What the width buys is residence, not time. The codec's stage-4..6 group reserves no
-/// im2col panel; with the class taking none of its six convolutions it would book
-/// 309 657 600 B at the stand's 90-frame part, 495 452 160 B at the codec's 144-frame
-/// window and 509 214 720 B at the recurring 148-frame one
-/// (`the_stage_four_to_six_group_reserves_no_panel`). The row's peak is the largest graph
-/// arena a call holds, not this group's, so the group's saving is not the row's: with its
-/// reservation gone the last codec group's arena is the largest, and the row's peak falls
-/// from 372 534 144 B to 311 001 520 B at the 90-frame part (a fall of 61 532 624 B), by
-/// 80 112 080 B at 144 frames and by 81 488 336 B at 148 (`sound_decoder_scratch`'s
-/// `the_row_peaks_on_the_last_group`, which pins both ends of all three). All of it is
-/// Metal-class only: the reservation is subtracted where this class's switch and the
-/// adapter's cooperative-matrix entry agree (`conv_im2col_scratch_bytes`'s `implicit_live`),
-/// so an adapter without the entry books the panel and moves nothing. The stand's 23-frame
-/// part is below the route's extent floor, so the group keeps the panel there and that
-/// row's memory does not move.
-///
 /// The time. Over nine alternating paired rounds the group's six convolutions are 6.6 to
 /// 8.0 ms ahead of the panel route at 90 frames (spread −9.4..−5.2, no round slower in any
 /// take, six takes; 40 to 42 ms ahead at a load average of 6 and above). Per shape, over five
@@ -332,9 +320,13 @@ pub(crate) const CONV_IMPLICIT_ROW_ROWS: u64 = 96;
 /// (spread −7.5..−1.9, three takes). Under load the magnitudes widen and the signs hold
 /// (`conv_implicit_vs_panel_at_the_admitted_widths`). At this width the panel is a small
 /// share of either arm's traffic, and the route's strided gather is less efficient than the
-/// panel's bulk reads — the deficit. The output does not move: both routes accumulate over
-/// the same k order with the same cooperative multiply, and the stand's pinned synthesis
-/// digests are unchanged.
+/// panel's bulk reads — the deficit. Every figure above was taken against a *whole-panel*
+/// reservation, which the cut has since replaced: the panel arm now gathers a chunk at a time
+/// and pays a pass pair and a weight re-read for each, so the same protocol reads the route
+/// about 15 ms ahead at 90 frames (one take, 128.0 against 143.1 ms, on a load average of 8) —
+/// the sign and the mechanism unchanged, the gap wider. The output does not move: both routes
+/// accumulate over the same k order with the same cooperative multiply, and the stand's
+/// pinned synthesis digests are unchanged.
 ///
 /// A class-shaped conv the lowering declines keeps the direct kernel and is counted
 /// (`conv1d_implicit_declines`, printed by `RLX_WGPU_SCHEDULE`). The terms that can decline
@@ -372,7 +364,7 @@ pub(crate) const CONV_IMPLICIT_MIN_C_OUT: u64 = 4;
 ///
 /// The lowering adds the terms the shape does not settle — the route's switches,
 /// the adapter, the weight's placement, the arena's binding — and
-/// [`conv_im2col_col_elems`] subtracts this class, so a conv the route takes
+/// [`conv_im2col_panel`] subtracts this class, so a conv the route takes
 /// reserves no panel and a conv it does not take still gets one.
 pub(crate) struct ConvImplicitShape {
     pub c_in: u64,
@@ -414,22 +406,144 @@ fn conv_tiled_min_spatial() -> u64 {
     rlx_ir::env::parse_or("RLX_WGPU_TILED_MIN_SPATIAL", CONV_TILED_MIN_SPATIAL)
 }
 
-/// Element count of the im2col `col[n][c_in*kh*kw, spatial]` panels if this conv
-/// node qualifies for the im2col+GEMM path (2D / 1D-as-2D NCHW, `groups==1`, real
-/// spatial kernel, spatial ≥ the im2col spatial floor). One panel per image of the
-/// batch: the gather carries the image on its grid's z and the GEMM that follows
-/// carries it on the matmul's own batch axis.
-/// Returns `None` otherwise, and `None` for a conv the cooperative implicit route
-/// takes instead (`implicit_live`, see [`ConvImplicitShape`]). Mirrors the shape
-/// math in the `Op::Conv` compile arm so scratch sizing and lowering agree on
-/// which convs are routed.
-fn conv_im2col_col_elems(
+/// The panel budget: the most one *chunk* of an im2col col panel may reserve — the
+/// reservation's figure, where [`CONV_IM2COL_MAX_COL_BYTES`] bounds the panel in full (the
+/// admission test's). A chunk is never narrower than one [`CONV_IM2COL_CHUNK_COLS`] tile, so a
+/// reduction wide enough to leave a tile's columns over this budget still reserves the tile.
+///
+/// The panel is cut over the output's spatial axis ([`ConvColPanel::chunk_cols`]), so the
+/// reservation stops following the extent: the encoder front's arena is 74 062 464 →
+/// 159 996 544 B across the recognition ladder, against 82 909 824 → 250 681 984 B whole.
+/// `conv_panel_cost` prints both per rung and `the_panel_reservation_stops_scaling_with_the_rung`
+/// pins the ladder; `conv_im2col_chunk_parity` holds the two arms bit-identical.
+///
+/// The trade is memory for time, and it is the only one of its kind here: a chunk is one gather
+/// and one multiply, so the cut adds a pass pair and a re-read of the weight per chunk —
+/// `(chunks − 1) ×` the conv's weight bytes, six re-reads at the ladder's top rung, priced at
+/// 0.1 to 0.2 ms a chunk by `conv_panel_cost`'s paired arms (0.3 % of the first rung's front,
+/// 2 % of the last, a tenth of a percent of a recognition row's own time). The front-level
+/// figure is above the 0.2 % this was approved at, and by construction: fewer chunks need a
+/// larger panel, so this is the cheapest point on the curve the budget allows. Cutting the
+/// *reduction* axis instead would change the summation order and with it every result.
+///
+/// `RLX_WGPU_IM2COL_PANEL_BYTES` overrides it (`0` lifts the cap and restores the whole-panel
+/// reservation), which is how the two arms are priced against each other.
+pub(crate) const CONV_IM2COL_PANEL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// [`CONV_IM2COL_PANEL_BYTES`] as this process was configured; `0` means uncapped.
+fn conv_im2col_panel_bytes() -> u64 {
+    crate::runtime_config().im2col_panel_bytes as u64
+}
+
+/// One chunk's column granularity: every kernel the conv GEMM routes can pick tiles 32
+/// output columns (the `matmul` tile, the cooperative 32×32 store the direct entry writes
+/// unmasked), so a chunk boundary on this multiple never hands a kernel a partial tile it
+/// does not already handle — which is what keeps a conv on the kernel it would have had
+/// at its whole extent. It is also the narrowest chunk there is
+/// ([`ConvColPanel::chunk_cols`]).
+pub(crate) const CONV_IM2COL_CHUNK_COLS: u64 = 32;
+
+/// One conv's col-panel geometry, as the shape decision reads it: the reduction extent
+/// `c_in·kh·kw` (never cut — it is the accumulation axis), the images of the batch (one
+/// panel each: the gather carries the image on its grid's z and the GEMM that follows
+/// carries it on the matmul's own batch axis) and the output's spatial extent, the axis
+/// the panel is cut over.
+pub(crate) struct ConvColPanel {
+    pub(crate) k_total: u64,
+    pub(crate) images: u64,
+    pub(crate) spatial: u64,
+}
+
+impl ConvColPanel {
+    /// The panel in full, as one gather of the whole extent writes it.
+    fn whole_elems(&self) -> u64 {
+        self.images
+            .saturating_mul(self.k_total)
+            .saturating_mul(self.spatial)
+    }
+
+    fn whole_bytes(&self) -> u64 {
+        self.whole_elems().saturating_mul(4)
+    }
+
+    /// Bytes one output column of the panel costs: the images of the batch times the
+    /// reduction, one float each.
+    fn per_col_bytes(&self) -> u64 {
+        self.images.saturating_mul(self.k_total).saturating_mul(4)
+    }
+
+    /// Whether the route may take this conv at all, on any adapter: the panel in full sits
+    /// under [`CONV_IM2COL_MAX_COL_BYTES`] and fits the arena's storage-binding window when
+    /// appended to `arena_size`. Both terms read the panel in full, never a chunk, and the
+    /// reservation ([`conv_im2col_scratch_bytes`]) and the lowering's `use_im2col` read this
+    /// one predicate, so the cut itself neither admits nor refuses a conv.
+    ///
+    /// A conv can still move, in the other direction: the arena-level terms a route also asks
+    /// for — the whole-arena bind (`arena_whole_arena_bind`) and the sharding that refuses it —
+    /// are read off an arena whose tail the cut has shrunk, so an adapter whose binding limit
+    /// (or shard split point) falls between the two arena sizes carries a conv on the panel
+    /// that the larger arena could not. That is a conv moving onto the faster route, and it is
+    /// what the reservation is bought with; none moves the other way.
+    pub(crate) fn admitted(&self, arena_size: u64, max_binding: u64) -> bool {
+        let whole = self.whole_bytes();
+        whole <= CONV_IM2COL_MAX_COL_BYTES && arena_size.saturating_add(whole) <= max_binding
+    }
+
+    /// The output columns one chunk of this panel covers: as many chunks as the widest chunk
+    /// that fits [`CONV_IM2COL_PANEL_BYTES`] needs, each as even as whole
+    /// [`CONV_IM2COL_CHUNK_COLS`] tiles allow, and never more than the whole extent — a panel
+    /// that already fits is one chunk and reserves what it always did.
+    ///
+    /// Even rather than "the widest, then the remainder": a sliver chunk re-reads the whole
+    /// weight with almost nothing to amortise it, and at the small extents a sliver is most of
+    /// the cost of the cut (the encoder front's second conv at the ladder's first rung splits
+    /// 1024 columns as 512 + 512 here and as 960 + 64 the other way). The count is the same
+    /// either way, so the even split is never more chunks — only cheaper ones.
+    ///
+    /// One whole tile is the floor even where a tile's worth of columns does not fit the
+    /// budget: a narrower chunk would hand a kernel that writes a 32×32 tile
+    /// (`matmul_coop_f32_direct`, admitted on the whole extent) a window narrower than the
+    /// tile it stores, so each dispatch would overwrite its neighbour's columns and the last
+    /// would run past the row. Such a conv reserves a tile — still no more than its whole
+    /// panel, which holds at least one.
+    pub(crate) fn chunk_cols(&self) -> u64 {
+        let spatial = self.spatial.max(1);
+        let budget = conv_im2col_panel_bytes();
+        if budget == 0 {
+            return spatial;
+        }
+        let fits = budget.checked_div(self.per_col_bytes()).unwrap_or(0);
+        let widest = ((fits / CONV_IM2COL_CHUNK_COLS) * CONV_IM2COL_CHUNK_COLS)
+            .max(CONV_IM2COL_CHUNK_COLS)
+            .min(spatial);
+        if widest >= spatial {
+            return spatial;
+        }
+        let chunks = spatial.div_ceil(widest);
+        let even =
+            spatial.div_ceil(chunks).div_ceil(CONV_IM2COL_CHUNK_COLS) * CONV_IM2COL_CHUNK_COLS;
+        even.min(widest)
+    }
+
+    /// Bytes one chunk reserves — the figure the reservation books and the lowering's
+    /// `use_im2col` gate reads, so the two cannot drift.
+    pub(crate) fn chunk_bytes(&self) -> u64 {
+        self.per_col_bytes().saturating_mul(self.chunk_cols())
+    }
+}
+
+/// The col-panel geometry of this conv node if it qualifies for the im2col+GEMM path (2D /
+/// 1D-as-2D NCHW, `groups==1`, real spatial kernel, spatial ≥ the im2col spatial floor).
+/// `None` otherwise, and `None` for a conv the cooperative implicit route takes instead
+/// (`implicit_live`, see [`ConvImplicitShape`]). Mirrors the shape math in the `Op::Conv`
+/// compile arm so scratch sizing and lowering agree on which convs are routed.
+fn conv_im2col_panel(
     op: &Op,
     in_shape: &rlx_ir::Shape,
     w_shape: &rlx_ir::Shape,
     out_shape: &rlx_ir::Shape,
     implicit_live: bool,
-) -> Option<u64> {
+) -> Option<ConvColPanel> {
     let Op::Conv {
         kernel_size,
         stride,
@@ -522,13 +636,24 @@ fn conv_im2col_col_elems(
     if implicit_live && implicit_shape.admits() {
         return None;
     }
-    Some(n * k_total * spatial)
+    Some(ConvColPanel {
+        k_total,
+        // The compile arm applies the same floor, so both read one panel per image.
+        images: n.max(1),
+        spatial,
+    })
 }
 
-/// Extra arena scratch (bytes, 256-aligned) needed to hold the largest conv
-/// col matrix that will be routed through im2col+GEMM. Capped so the whole
-/// arena still binds in a single storage-binding window. Returns 0 when no
-/// conv qualifies or none fits.
+/// Extra arena scratch (bytes, 256-aligned) needed to hold the largest conv col panel the
+/// im2col+GEMM route will gather. Capped so the whole arena still binds in a single
+/// storage-binding window. Returns 0 when no conv qualifies or none fits.
+///
+/// The figure booked is one *chunk* of the largest panel ([`ConvColPanel::chunk_bytes`]),
+/// not the panel in full: a chunk is reused by every chunk of every conv, so the tail is
+/// the largest single chunk. Whether a conv is a candidate at all stays what it was —
+/// [`ConvColPanel::admitted`] reads the whole panel, and the lowering's `use_im2col` reads
+/// the same predicate — so the cut moves no conv's route by itself; the arena-level terms
+/// are the ones the smaller arena can turn on (`ConvColPanel::admitted` states which).
 ///
 /// `implicit_live` is the cooperative implicit route's own switch and adapter
 /// capability ([`conv_implicit_enabled`] and `kernels::conv1d_implicit_supported`):
@@ -543,28 +668,24 @@ fn conv_im2col_scratch_bytes(
     max_binding: u64,
     implicit_live: bool,
 ) -> usize {
-    let mut max_col_bytes: u64 = 0;
+    let mut max_chunk_bytes: u64 = 0;
     for node in graph.nodes() {
         if node.inputs.len() < 2 {
             continue;
         }
         let in_shape = &graph.node(node.inputs[0]).shape;
         let w_shape = &graph.node(node.inputs[1]).shape;
-        let Some(elems) =
-            conv_im2col_col_elems(&node.op, in_shape, w_shape, &node.shape, implicit_live)
+        let Some(panel) =
+            conv_im2col_panel(&node.op, in_shape, w_shape, &node.shape, implicit_live)
         else {
             continue;
         };
-        let col_bytes = elems.saturating_mul(4);
-        if col_bytes > CONV_IM2COL_MAX_COL_BYTES {
+        if !panel.admitted(planned_arena_size as u64, max_binding) {
             continue;
         }
-        if (planned_arena_size as u64).saturating_add(col_bytes) > max_binding {
-            continue;
-        }
-        max_col_bytes = max_col_bytes.max(col_bytes);
+        max_chunk_bytes = max_chunk_bytes.max(panel.chunk_bytes());
     }
-    (max_col_bytes.div_ceil(256) * 256) as usize
+    (max_chunk_bytes.div_ceil(256) * 256) as usize
 }
 
 /// Inner-FMA precision for matmul.
@@ -6462,6 +6583,17 @@ mod conv_route_decision_tests {
     use super::*;
     use rlx_ir::{DType, Shape};
 
+    /// Whether this run is a bisect of the panel budget rather than the shipped figure. Every
+    /// row below that pins a reservation or a chunk is derived from it, so such a run measures
+    /// the lever: the row says so and stands down instead of reddening a bisect.
+    fn panel_budget_is_a_lever() -> bool {
+        let Some(value) = rlx_ir::env::var("RLX_WGPU_IM2COL_PANEL_BYTES") else {
+            return false;
+        };
+        eprintln!("skip: RLX_WGPU_IM2COL_PANEL_BYTES={value} is a bisect, not the default");
+        true
+    }
+
     /// The 1×1 admission is its own frozen bar: it must not follow the im2col
     /// spatial floor, which moved under the non-pointwise shapes of the same graphs.
     #[test]
@@ -6482,6 +6614,9 @@ mod conv_route_decision_tests {
     /// an adapter under the arena.
     #[test]
     fn the_col_reservation_follows_the_shape_and_the_binding_window() {
+        if panel_budget_is_a_lever() {
+            return;
+        }
         let (band, col_elems) = band_graph();
         let col_elems = col_elems.expect("the band shape clears the effective floors");
         let col_bytes = col_elems * 4;
@@ -6521,11 +6656,18 @@ mod conv_route_decision_tests {
         assert_eq!(compute_scratch_bytes(&band), 0);
     }
 
-    /// The panel reservation is one panel per image: the batch axis is the panel's
-    /// (the gather's `gid.z` and the GEMM's `batch`), so a batch-2 conv of the same
-    /// geometry is admitted and reserves exactly twice the batch-1 panel.
+    /// The panel is one panel per image: the batch axis is the panel's (the gather's `gid.z`
+    /// and the GEMM's `batch`), so a batch-2 conv of the same geometry gathers the same columns
+    /// once per image and books twice the reservation — while neither panel is cut. The cut is
+    /// what bounds that growth (it reads the per-column cost, so the batch moves the chunk
+    /// width as well as the extent), and this fixture sits under the budget at both batches, so
+    /// the doubling is stated without it; `the_panel_reservation_stops_scaling_with_the_rung`
+    /// pins the wake path's pair, where it does bind.
     #[test]
     fn the_col_reservation_scales_with_the_batch() {
+        if panel_budget_is_a_lever() {
+            return;
+        }
         let side = (im2col_min_spatial() as f64).sqrt().ceil() as usize;
         let c_in = (im2col_min_k().div_ceil(9) as usize).max(64);
         let c_out = im2col_min_cout() as usize;
@@ -6539,9 +6681,105 @@ mod conv_route_decision_tests {
         let bytes2 = conv_im2col_scratch_bytes(&two, 0, u64::MAX, false);
         assert!(bytes2 > 0, "a batch-2 conv reserves its panels");
         assert_eq!(
+            (bytes1 as u64, bytes2 as u64),
+            (elems1 * 4, elems2 * 4),
+            "and both fixtures book their panels in full, so neither is cut"
+        );
+        assert_eq!(
             bytes2,
             2 * bytes1,
-            "the reservation doubles with the batch (the 256-byte alignment is preserved)"
+            "the reservation doubles with the batch while it is one chunk of one panel per \
+             image (the 256-byte alignment is preserved)"
+        );
+    }
+
+    /// The cut itself, at the shapes this fork's largest panels come from: the encoder
+    /// front's conv 2 (`480·3·3` reduction, `32·F₂` output columns) on every rung of the
+    /// recognition ladder, and the wake path's 76-frame window at its single and paired
+    /// batch. What the reservation books is one chunk, and it stops scaling with the extent —
+    /// the whole point of cutting the spatial axis rather than shrinking anything — while a
+    /// panel that already fits the budget is one chunk and books what it did.
+    ///
+    /// The reduction axis is not an argument of the cut: `k_total` only scales the per-column
+    /// cost, so no chunk boundary can land inside it and no summation order moves.
+    #[test]
+    fn the_panel_reservation_stops_scaling_with_the_rung() {
+        if panel_budget_is_a_lever() {
+            return;
+        }
+        // `(F, conv 2's output columns, the reservation the front books at F)`: the ladder's
+        // frame counts, conv 2's `32·F₂` columns and one chunk of them — as many chunks as the
+        // 960-column widest fit needs, split evenly over whole 32-column tiles (2, 3, 4, 5, 6,
+        // 7 chunks of 512, 704, 768, 832, 864 and 896 columns). The last rung's 15 482 880 B is
+        // the largest the ladder books, against 106 168 320 B whole.
+        const LADDER: [(u64, u64, u64); 6] = [
+            (128, 1_024, 8_847_360),
+            (256, 2_048, 12_165_120),
+            (384, 3_072, 13_271_040),
+            (512, 4_096, 14_376_960),
+            (640, 5_120, 14_929_920),
+            (768, 6_144, 15_482_880),
+        ];
+        for (frames, columns, reservation) in LADDER {
+            let panel = ConvColPanel {
+                k_total: 480 * 9,
+                images: 1,
+                spatial: columns,
+            };
+            assert!(
+                panel.whole_bytes() > reservation,
+                "the rung at {frames} frames is past one chunk, or it would prove nothing"
+            );
+            assert_eq!(
+                panel.chunk_bytes(),
+                reservation,
+                "the front's panel books one chunk at {frames} frames"
+            );
+            assert!(
+                panel.chunk_bytes() <= CONV_IM2COL_PANEL_BYTES,
+                "and the chunk fits the budget at {frames} frames"
+            );
+            assert_eq!(
+                panel.chunk_cols() % CONV_IM2COL_CHUNK_COLS,
+                0,
+                "whole tiles"
+            );
+        }
+        // The wake path's 76-frame window: the single front is under the budget and keeps its
+        // own panel; the pair doubles the per-column cost, so it is cut — to the same figure
+        // the single one books, which is half of what the pair reserved before the cut.
+        let single = ConvColPanel {
+            k_total: 480 * 9,
+            images: 1,
+            spatial: 32 * 19,
+        };
+        assert_eq!(single.chunk_cols(), single.spatial, "one chunk, as it was");
+        assert_eq!(single.chunk_bytes(), single.whole_bytes());
+        let pair = ConvColPanel {
+            k_total: 480 * 9,
+            images: 2,
+            spatial: 32 * 19,
+        };
+        // The pair's per-column cost is twice the single window's, so the widest chunk is 480
+        // columns and the 608-column extent splits evenly into 320 + 288: 11 059 200 B against
+        // the 21 012 480 B it booked before the cut.
+        assert_eq!(pair.chunk_bytes(), 11_059_200, "the pair is cut, not grown");
+        // A reduction wide enough that one tile's worth of columns is past the budget keeps a
+        // whole tile rather than a narrower window: the direct entry's unmasked 32×32 store
+        // writes a tile at a time, so a narrower chunk would overlap its neighbour's columns.
+        let huge = ConvColPanel {
+            k_total: CONV_IM2COL_PANEL_BYTES / 4 / CONV_IM2COL_CHUNK_COLS + 1,
+            images: 1,
+            spatial: 4_096,
+        };
+        assert_eq!(
+            huge.chunk_cols(),
+            CONV_IM2COL_CHUNK_COLS,
+            "a tile is the floor"
+        );
+        assert!(
+            huge.chunk_bytes() <= huge.whole_bytes(),
+            "and a tile is still no more than the whole panel"
         );
     }
 
@@ -6683,13 +6921,14 @@ mod conv_route_decision_tests {
         let y = g.conv2d(x, w, [1, 1], [1, 1], [0, 0], [1, 1], 1);
         let node = g.node(y);
         assert_eq!(
-            conv_im2col_col_elems(
+            conv_im2col_panel(
                 &node.op,
                 &g.node(node.inputs[0]).shape,
                 &g.node(node.inputs[1]).shape,
                 &node.shape,
                 false,
-            ),
+            )
+            .map(|panel| panel.whole_elems()),
             None,
             "1×1 taps are not the im2col route's shape"
         );
@@ -6698,16 +6937,28 @@ mod conv_route_decision_tests {
 
     /// A conv the cooperative implicit route takes reserves no panel: its own
     /// `[1, 96, 1, l]` dilated form clears every im2col floor, so the reservation
-    /// would book `k_total · spatial · 4` for a matrix the route never writes —
-    /// and books nothing for it once the route is live.
+    /// would book a chunk of `k_total · spatial · 4` for a matrix the route never
+    /// writes — and books nothing for it once the route is live.
+    ///
+    /// The fixture's whole panel is 96·7·140 000·4 = 376 320 000 B, so it is past one chunk
+    /// and the two ends are distinguishable: the widest chunk the budget fits is 6240 columns
+    /// of 2688 B, which needs 23 chunks, and split evenly over whole tiles that is 6112
+    /// columns — 16 429 056 B.
     #[test]
     fn a_conv_the_implicit_route_takes_reserves_no_panel() {
+        if panel_budget_is_a_lever() {
+            return;
+        }
         let (g, elems) = conv_graph(96, 96, [1, 140_000], [1, 7], [0, 3]);
-        let panel = elems.expect("the class's shape clears the im2col floors") * 4;
+        assert_eq!(
+            elems.map(|elems| elems * 4),
+            Some(376_320_000),
+            "the fixture's panel is the whole extent"
+        );
         assert_eq!(
             conv_im2col_scratch_bytes(&g, 0, u64::MAX, false),
-            panel as usize,
-            "with the implicit route off the panel is booked, as it was"
+            16_429_056,
+            "with the implicit route off one chunk of the panel is booked"
         );
         assert_eq!(
             conv_im2col_scratch_bytes(&g, 0, u64::MAX, true),
@@ -6731,12 +6982,15 @@ mod conv_route_decision_tests {
     /// The product graph's own reservation and step census are the model-dependent
     /// `sound_decoder_scratch`'s, which pins the row's peak arena from the same figures.
     ///
-    /// The last assertion is what the lowering's `col_bytes <= arena.scratch_bytes` reads:
+    /// The last assertion is what the lowering's `chunk_bytes <= arena.scratch_bytes` reads:
     /// with the class taking both widths the group has no im2col candidate at all, so a
     /// conv of it that the lowering then declines has no panel to fall back on — the
     /// fallback the class's own doc states.
     #[test]
     fn the_stage_four_to_six_group_reserves_no_panel() {
+        if panel_budget_is_a_lever() {
+            return;
+        }
         for key in [
             "RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL",
             "RLX_WGPU_IM2COL_MIN_SPATIAL",
@@ -6746,15 +7000,20 @@ mod conv_route_decision_tests {
                 return;
             }
         }
-        // `(dac.blk.1's out_len, dac.blk.2's out_len, the panel the group books without the
+        // `(dac.blk.1's out_len, dac.blk.2's out_len, the panel the group would book without the
         // class)`: the stand's 90-frame part, the codec's 144-frame window, and the
         // recurring window a longer part runs — that window plus its four-frame left
         // margin. `dac.blk.1` is 160 output columns a frame, `dac.blk.2` 640.
-        const LENGTHS: [(usize, usize, usize); 3] = [
+        const LENGTHS: [(usize, usize, u64); 3] = [
             (14_400, 57_600, 309_657_600),
             (23_040, 92_160, 495_452_160),
             (23_680, 94_720, 509_214_720),
         ];
+        // …and the one chunk that stands in for whichever of those panels is the largest. Each
+        // width's panel is cut into even, whole-tile chunks at the 16 MiB budget; the figure is
+        // the larger of the two widths' chunks, which is the 192-channel conv's at the 90-frame
+        // part and at the 148-frame window, with the two widths tied at the 144-frame one.
+        const CHUNKS: [usize; 3] = [16_343_040, 16_515_072, 16_515_072];
         // The group's six residual `conv1`s in the order the block runs them: three at
         // each width, dilations 1/3/9, square in the channels they hand on. The fixture's
         // conv pads symmetrically (`conv2d_spatial_output`'s `in + 2·pad`), so an input of
@@ -6776,12 +7035,32 @@ mod conv_route_decision_tests {
             g.set_outputs(outs);
             g
         }
-        for (len_384, len_192, reservation_off) in LENGTHS {
+        for ((len_384, len_192, panel_off), chunk) in LENGTHS.into_iter().zip(CHUNKS) {
             let g = group_graph(len_384, len_192);
+            let whole = g
+                .nodes()
+                .iter()
+                .filter(|node| node.inputs.len() >= 2)
+                .filter_map(|node| {
+                    conv_im2col_panel(
+                        &node.op,
+                        &g.node(node.inputs[0]).shape,
+                        &g.node(node.inputs[1]).shape,
+                        &node.shape,
+                        false,
+                    )
+                })
+                .map(|panel| panel.whole_bytes())
+                .max()
+                .expect("the group's convs clear the floors");
+            assert_eq!(
+                whole, panel_off,
+                "without the class the 192-channel conv's panel is the largest"
+            );
             assert_eq!(
                 conv_im2col_scratch_bytes(&g, 0, u64::MAX, false),
-                reservation_off,
-                "without the class the 192-channel conv's panel is the largest"
+                chunk,
+                "and what it books is one chunk of it"
             );
             assert_eq!(
                 conv_im2col_scratch_bytes(&g, 0, u64::MAX, true),
@@ -6811,7 +7090,7 @@ mod conv_route_decision_tests {
         assert!(!coop_f32_direct_admitted(0, 0xFFFF, 64, 128, 33, false));
     }
 
-    /// A conv graph, and the col element count `conv_im2col_col_elems` gives its
+    /// A conv graph, and the whole col panel `conv_im2col_panel` gives its
     /// shape (`None` where the shape clears no floor) — the planner's own function,
     /// so these tests and the planner cannot drift apart.
     fn conv_graph(
@@ -6839,13 +7118,14 @@ mod conv_route_decision_tests {
         let w = g.param("w", Shape::new(&[c_out, c_in, k[0], k[1]], DType::F32));
         let y = g.conv2d(x, w, k, [1, 1], p, [1, 1], 1);
         let node = g.node(y);
-        let elems = conv_im2col_col_elems(
+        let elems = conv_im2col_panel(
             &node.op,
             &g.node(node.inputs[0]).shape,
             &g.node(node.inputs[1]).shape,
             &node.shape,
             false,
-        );
+        )
+        .map(|panel| panel.whole_elems());
         (g, elems)
     }
 

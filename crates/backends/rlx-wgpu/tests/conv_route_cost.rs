@@ -391,7 +391,9 @@ const CONV1X1: [BodyConv; 5] = [
 /// of 800, `c_in*kh*kw` 288 just over the K floor, `c_out` on its floor.
 /// `map-3x3-40x40` is the ordinary case (spatial 1600, col 3.7 MB, its whole tail);
 /// `map-5x5-30x30-c1024` carries the same band with a larger col panel
-/// (`c_in*kh*kw*spatial*4` = 92 MB), exactly as any qualifying conv above the floor.
+/// (`c_in*kh*kw*spatial*4` = 92 MB), exactly as any qualifying conv above the floor —
+/// past the 16 MiB budget, so what it reserves is one chunk of it (16 384 000 B, see
+/// `expected_col_delta`).
 const CONV2D: [BodyConv; 4] = [
     BodyConv {
         label: "map-3x3-29x29-c32",
@@ -639,14 +641,23 @@ fn expected_routes(family: &str, label: &str) -> (&'static str, &'static str) {
 /// adapter: without the entry the row is back on the panel, and which panel route it takes
 /// is the binding's to decide — the materialised one where that panel binds beside the
 /// row's arena (`dense-l16000`'s 86 016 000 B does on a 128 MiB binding), the relabel
-/// where it does not (`dense-l48000`'s 129 024 000 B does not) — with the panel's
-/// reservation in the first case and none in the second. Both are the behaviour the
-/// widening took these two rows off, and the reservation is paired with its route here
+/// where it does not (`dense-l48000`'s 129 024 000 B does not) — with one chunk of the
+/// panel's reservation in the first case and none in the second. Both are the behaviour
+/// the widening took these two rows off, and the reservation is paired with its route here
 /// because that is the half the memory pin is about.
 fn without_the_implicit_entry(label: &str) -> &'static [(&'static str, u64)] {
     match label {
-        "dense-l16000" => &[("im2col_gpu", 86_016_000), ("conv2d_tiled", 0)],
-        "dense-l48000" => &[("im2col_gpu", 129_024_000), ("conv2d_tiled", 0)],
+        // 192·1·7·16 000·4 = 86 016 000 B whole panel — what the binding test above reads,
+        // and it binds — cut to six even chunks of 2 688 columns (192·7·2 688·4 =
+        // 14 450 688 B): the widest the budget fits is 3 104, and 16 000 columns over six
+        // chunks of 2 667 round up to 2 688.
+        "dense-l16000" => &[("im2col_gpu", 14_450_688), ("conv2d_tiled", 0)],
+        // 96·1·7·48 000·4 = 129 024 000 B whole panel: past a 128 MiB binding, so on that
+        // adapter no panel is reserved and the whole panel is what refuses the row — the cut
+        // never reaches it. An adapter whose binding takes the whole panel would see the
+        // gather instead, booking one of its eight even chunks of 6 016 columns
+        // (672·6 016·4 = 16 171 008 B).
+        "dense-l48000" => &[("im2col_gpu", 16_171_008), ("conv2d_tiled", 0)],
         other => panic!("{other:?} is not an implicit-class row"),
     }
 }
@@ -703,6 +714,17 @@ fn stand_down_switches() {
     }
     rlx_ir::env::set("RLX_WGPU_SHARD_CAP_MIB", "1048576");
     rlx_ir::env::set("RLX_WGPU_CONV_IMPLICIT", "1");
+}
+
+/// Every row's reservation this file pins is one chunk of the shipped panel budget
+/// (`expected_col_delta`), so a run that exports that budget is measuring the lever rather
+/// than the shipped routing.
+fn panel_budget_is_a_lever() -> bool {
+    let Some(value) = rlx_ir::env::var("RLX_WGPU_IM2COL_PANEL_BYTES") else {
+        return false;
+    };
+    eprintln!("skip: RLX_WGPU_IM2COL_PANEL_BYTES={value} is a bisect, not the default");
+    true
 }
 
 /// One graph measured under both arms of the switch: the medians, each arm's
@@ -878,22 +900,33 @@ fn fmt_delta(d: f32) -> String {
 
 /// The arena bytes each row's col reservation costs, recorded from a run of this
 /// harness rather than recomputed here: the tail is `max(what the graph's own ops
-/// claim, col)`, and each fixture is one conv node with no op that claims a tail, so
-/// a shape-qualifying conv costs exactly its own col, 256-byte aligned. A row that
-/// qualifies for no accelerated route by shape reserves nothing. The reservation's
-/// arithmetic — the col a shape gives and both caps the planner applies to it — is
-/// pinned device-free by `backend::conv_route_decision_tests`; what the numbers
-/// below add is that arithmetic against these exact fixtures. An unlisted label
+/// claim, chunk)`, and each fixture is one conv node with no op that claims a tail, so
+/// a shape-qualifying conv costs exactly one chunk of its own panel, 256-byte aligned.
+/// A row that qualifies for no accelerated route by shape reserves nothing. The
+/// reservation's arithmetic — the col a shape gives, the 16 MiB budget the panel is cut
+/// to over the output's spatial axis, and the two caps the planner applies to the whole
+/// panel — is pinned device-free by `backend::conv_route_decision_tests`; what the
+/// numbers below add is that arithmetic against these exact fixtures. An unlisted label
 /// panics rather than recording a silent zero, so a renamed or added fixture cannot
 /// assert nothing.
 fn expected_col_delta(label: &str) -> u64 {
     match label {
-        // 1024·5·5·900·4 = 92 160 000 B col, the in-band 2-D map.
-        "map-5x5-30x30-c1024" => 92_160_000,
-        // 768·1·7·800·4 = 17 203 200 B col.
-        "dense-l800" => 17_203_200,
-        // 384·1·7·4 000·4 = 43 008 000 B col, the same as `overlap-slot0`.
-        "dense-l4000" | "overlap-slot0" => 43_008_000,
+        // 1024·5·5·900·4 = 92 160 000 B whole panel, past the 16 MiB budget: a column costs
+        // 1024·25·4 = 102 400 B, 163 of which fit it, so the widest chunk is 160 columns
+        // (five whole tiles) and the map's 900 columns need six chunks — which are already
+        // even at 160, so the chunk is 1024·25·160·4 = 16 384 000 B.
+        "map-5x5-30x30-c1024" => 16_384_000,
+        // 768·1·7·800·4 = 17 203 200 B whole panel, past the budget: a column costs
+        // 768·7·4 = 21 504 B, 780 of which fit it, so the widest chunk is 768 columns (24
+        // whole tiles) and the 800 columns need two — split evenly over whole tiles that is
+        // 416, so the chunk is 768·7·416·4 = 8 945 664 B.
+        "dense-l800" => 8_945_664,
+        // 384·1·7·4 000·4 = 43 008 000 B whole panel, past the budget: a column costs
+        // 384·7·4 = 10 752 B, 1 560 of which fit it, so the widest chunk is 1 536 columns (48
+        // whole tiles) and the 4 000 columns need three — split evenly over whole tiles that
+        // is 1 344, so the chunk is 384·7·1 344·4 = 14 450 688 B. `overlap-slot0` is the same
+        // col with the taps in slot 0.
+        "dense-l4000" | "overlap-slot0" => 14_450_688,
         // 1 024·1·7·100·4 = 2 867 200 B col.
         "entry-l100" => 2_867_200,
         // 64·7·1·1 000·4 = 1 792 000 B col.
@@ -911,7 +944,7 @@ fn expected_col_delta(label: &str) -> u64 {
         // Nothing to reserve — the shape's gates leave it off every accelerated
         // route (a depthwise group, a 1×1 tap, a channel count under the floor, or
         // a sub-bar pointwise shape), or the implicit route takes the shape and the
-        // reservation subtracts its class (`conv_im2col_col_elems`), which a class
+        // reservation subtracts its class (`conv_im2col_panel`), which a class
         // row pays nothing for on an adapter that can build the entry (one that
         // cannot is `without_the_implicit_entry`'s).
         "dense-l16000"
@@ -931,14 +964,9 @@ fn expected_col_delta(label: &str) -> u64 {
     }
 }
 
-/// The arena growth the parked arm records. Both arms set
-/// `RLX_WGPU_ALL_PARAMS_WEIGHT`, whose parked staging reserve is the same tail on both
-/// (`max(claim, STAGED_OPERAND_MAX, widest parked parameter)` — one figure for these
-/// fixtures), so the delta is the shape's own col less that tail — the per-shape
-/// table's figure, not a second one.
-fn parked_col_delta(label: &str) -> u64 {
-    expected_col_delta(label).saturating_sub(64 << 20)
-}
+/// The parked arm's staging floor: `buffer::STAGED_OPERAND_MAX`, the reserve both arms'
+/// tail carries for these fixtures.
+const PARKED_STAGING_FLOOR: u64 = 64 << 20;
 
 /// One row of a per-shape table.
 struct ShapeRow {
@@ -1003,6 +1031,9 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         eprintln!("skip: RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL={value} is a bisect, not the default");
         return;
     }
+    if panel_budget_is_a_lever() {
+        return;
+    }
     common::refuse_under_run_report();
     let device = rlx_wgpu::device::adapter_name().unwrap_or_else(|| "wgpu".into());
     eprintln!(
@@ -1054,12 +1085,12 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
             );
             // The memory half of the switch is pinned with the route, against the delta
             // recorded for the row in `expected_col_delta` — nothing is recomputed here. A
-            // shape-qualifying conv costs its own col panel, the whole of the tail now that
-            // no floor sits under it; every other row costs nothing, which is why a 1×1 or
-            // depthwise shape leaves the arena alone while any qualifying col grows it. A
-            // failure here on an adapter whose `max_storage_buffer_binding_size` cannot
-            // take the col says the accelerated routes are off on that adapter — loud, not
-            // silent.
+            // shape-qualifying conv costs one chunk of its own panel, the whole of the tail
+            // now that no floor sits under it; every other row costs nothing, which is why a
+            // 1×1 or depthwise shape leaves the arena alone while any qualifying panel grows
+            // it. A failure here on an adapter whose `max_storage_buffer_binding_size` cannot
+            // take the whole panel says the accelerated routes are off on that adapter —
+            // loud, not silent.
             let on = (conv_route(&pair.on_counts), pair.on_arena - pair.off_arena);
             assert!(
                 on_expected.contains(&on),
@@ -1206,11 +1237,12 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     }
 
     // (4) the shape-decided col reservation, seen where its route does not run: a
-    // parked weight keeps the qualifying conv on the previous `conv2d` route, yet the
-    // arena still holds the reservation the switch grants by *shape* alone — the same
-    // recorded deltas `expected_col_delta` holds (a shape-qualifying col is the whole
-    // of the tail, a non-qualifying one nothing), which is also why the whole Conv1x7
-    // family's arena grows by the largest col alone rather than by the sum of them.
+    // parked weight keeps the qualifying conv on the previous `conv2d` route, and the plan
+    // still books the reservation the switch grants by *shape* alone. What the arm can no
+    // longer show is that reservation's size — the parked staging floor
+    // (`PARKED_STAGING_FLOOR`, 64 MiB) is the tail on both arms and every row's chunk is
+    // under it, so the arena is the same on both arms. What it still holds is that a parked
+    // weight does not grow the arena and keeps the accelerated routes away.
     // This is also the arm where `im2col_fallbacks()` is non-zero; the count is
     // printed here, and `conv_routes_parked_weight.rs` asserts both of its arms.
     //
@@ -1222,7 +1254,7 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
     // default moved, and the band's own 2-D map.
     let moved = row(&CONV1X7, "entry-l100");
     // The band's own parked row — a 2-D map the previous floor move admitted, whose col
-    // panel is the largest of the band — so the combination "parked, in the band, col
+    // panel is the largest of the band — so the combination "parked, in the band, panel
     // reserved" is pinned too rather than only its two halves.
     let in_band = row(&CONV2D, "map-5x5-30x30-c1024");
     let parked_pair = |shape: &BodyConv| {
@@ -1239,14 +1271,26 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         let (off, on) = parked_pair(&shape);
         let (off_counts, on_counts) = (off.exe.step_kind_counts(), on.exe.step_kind_counts());
         let (off_b, on_b) = (off.exe.test_arena_bytes(), on.exe.test_arena_bytes());
+        // Both arms set `RLX_WGPU_ALL_PARAMS_WEIGHT`, whose parked staging reserve is the same
+        // tail on both (`max(claim, STAGED_OPERAND_MAX, widest parked parameter)` — the 64 MiB
+        // floor for these fixtures), so the arena growth the parked arm records is zero: the
+        // panel is cut to one 16 MiB chunk (`backend::CONV_IM2COL_PANEL_BYTES`), the largest
+        // row here books 16 384 000 B, and the floor swallows every one of them. The assertion
+        // on the row's own figure keeps that from passing as a silent zero should a chunk ever
+        // grow past the floor; the reservation itself is asserted where it *is* the tail
+        // (`expected_col_delta`, the on arm).
+        assert!(
+            expected_col_delta(shape.label) <= PARKED_STAGING_FLOOR,
+            "{}: a chunk past the parked staging floor would be visible in the arena again",
+            shape.label
+        );
         eprintln!(
             "  col reservation, {} weight parked: off [{}] arena {off_b} B / on [{}] arena {on_b} B \
-             — on − off = {} B, recorded delta {} B, on-arm im2col fallbacks {}",
+             — on − off = {} B, recorded delta 0 B, on-arm im2col fallbacks {}",
             shape.label,
             fmt_counts(&off_counts),
             fmt_counts(&on_counts),
             on_b - off_b,
-            parked_col_delta(shape.label),
             on.exe.im2col_fallbacks()
         );
         assert_eq!(
@@ -1257,9 +1301,9 @@ fn conv_route_cost_over_the_decoder_body_shapes() {
         );
         assert_eq!(
             on_b - off_b,
-            parked_col_delta(shape.label),
-            "{}: a shape-qualifying conv pays the col reservation even where its route does \
-             not run",
+            0,
+            "{}: a parked weight must not grow the arena — both arms carry the parked \
+             staging floor as their tail, and every row's chunk fits under it",
             shape.label
         );
     }
@@ -1297,6 +1341,9 @@ fn conv_route_cost_over_a_batched_map() {
     // route's kernel can be built at all.
     let implicit_available = rlx_wgpu::device::wgpu_device()
         .is_some_and(|d| rlx_wgpu::kernels::conv1d_implicit_supported(&d.device));
+    if panel_budget_is_a_lever() {
+        return;
+    }
     common::refuse_under_run_report();
     let device = rlx_wgpu::device::adapter_name().unwrap_or_else(|| "wgpu".into());
     eprintln!(

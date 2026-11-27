@@ -93,7 +93,7 @@ struct Params {
     has_bias: u32,
     bias_off: u32,
     act_id: u32,
-    _p0: u32, _p1: u32, _p2: u32,
+    _p0: u32, c_ld: u32, _p2: u32,
 };
 
 const TILE: u32 = 8u;
@@ -167,13 +167,13 @@ fn matmul_coop_f32_portable(
         acc = coopMultiplyAdd(a_tile, b_tile, acc);
     }
 
-    let c_ptr = c_base + tile_row * params.n + tile_col;
-    coopStore(acc, &arena[c_ptr], params.n);
+    let c_ptr = c_base + tile_row * params.c_ld + tile_col;
+    coopStore(acc, &arena[c_ptr], params.c_ld);
 
     let gr = tile_row + lid.y;
     let gc = tile_col + lid.x;
     if (gr >= params.m || gc >= params.n) { return; }
-    let out_idx = c_base + gr * params.n + gc;
+    let out_idx = c_base + gr * params.c_ld + gc;
     var v = arena[out_idx];
     if (params.has_bias != 0u) {
         v = v + arena[params.bias_off + gc];

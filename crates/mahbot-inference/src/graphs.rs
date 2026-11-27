@@ -550,8 +550,10 @@ pub fn asr_encoder(model: Arc<Model>, frames: usize, batch: usize) -> Result<Bui
 }
 
 /// The conv front on its own, one window per call: `mel` → `[tokens, flat]`. A group
-/// pass leaves it at a unit batch on purpose — its im2col panel would be as wide as the
-/// group — and shares the whole group's weight reads in [`asr_encoder_tail`] instead.
+/// pass leaves it at a unit batch on purpose — its im2col panel is cut to a fixed budget over
+/// the output's spatial axis, and a batch shares that budget, so a group's images would narrow
+/// every chunk by the group's factor — and shares the whole group's weight reads in
+/// [`asr_encoder_tail`] instead.
 pub fn asr_encoder_front(model: Arc<Model>, frames: usize) -> Result<BuiltModel> {
     let c = model.clip().clone();
     let mut weights = LoaderWeights::new(model.clone());

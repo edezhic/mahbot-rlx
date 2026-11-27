@@ -1336,7 +1336,7 @@ fn dispatch_matmul_bt(
         bias_off: 0,
         act_id: 0xFFFF,
         _pad0: 0,
-        _pad1: 0,
+        c_ld: n,
         _pad2: 0,
     };
     let u = device.create_buffer(&wgpu::BufferDescriptor {

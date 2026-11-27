@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 836  
+**Registered names:** 837  
 **Unregistered mentions (migration leftovers):** 107
 
 ## Groups
@@ -40,7 +40,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
 - [webgl](#webgl) — 2
-- [wgpu](#wgpu) — 132
+- [wgpu](#wgpu) — 133
 - [xdna](#xdna) — 20
 
 ## compile
@@ -915,6 +915,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_IM2COL_MIN_COUT` | Bisect | U64 | Backend(wgpu) | Minimum output channels before im2col is used (default 64) |
 | `RLX_WGPU_IM2COL_MIN_K` | Bisect | U64 | Backend(wgpu) | Minimum K before im2col is used (default 256) |
 | `RLX_WGPU_IM2COL_MIN_SPATIAL` | Bisect | U64 | Backend(wgpu) | Minimum spatial extent before im2col is used (default 1, so every extent; the K, channel and group floors still gate, and the 1×1 pointwise route has its own bar) |
+| `RLX_WGPU_IM2COL_PANEL_BYTES` | Bisect | U64 | Backend(wgpu) | Most one chunk of an im2col col panel may reserve, in bytes; the panel is cut over the output's spatial axis into whole 32-column tiles to fit, so the reservation stops following the conv's extent (default 16 MiB, 0 lifts the cap and books the whole panel) |
 | `RLX_WGPU_INDEXING_HOST` | Bisect | Bool | Backend(wgpu) | Force ND indexing (GatherND/GatherElements/Scatter*) to the CPU host route |
 | `RLX_WGPU_LARGE_BUFFERS` | Bisect | Bool | Backend(wgpu) | Allow buffers past the conservative wgpu size limit |
 | `RLX_WGPU_MATMUL_F32_ONLY` | Bisect | Bool | Backend(wgpu) | Restrict wgpu matmul to f32, disabling f16 paths |

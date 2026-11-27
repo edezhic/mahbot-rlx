@@ -364,9 +364,11 @@ pub(crate) fn clear_graph_caches() {
 /// CLIP blocks, `post_ln` — runs over the whole group in one pass, which is where a pass's
 /// fixed cost amortises ([`TAIL_GROUP`] carries the readings).
 ///
-/// The conv front is left one window per call on purpose: its im2col panel would be as wide
-/// as the group ([`crate::graphs::asr_encoder_front`] carries that), and the top rung's front
-/// already books 207 MiB for one window.
+/// The conv front is left one window per call on purpose: its im2col panel is cut to a fixed
+/// budget over the output's spatial axis and the batch shares that budget, so a group pass
+/// would narrow every chunk by the group's factor and pay a gather and a multiply for each
+/// ([`crate::graphs::asr_encoder_front`] carries that) — and the top rung's front already books
+/// 153 MiB for one window.
 ///
 /// The projector is one pass per group: at the top rung a window's own pass is 0.76 ms and a
 /// group of four's is 1.61, and the sweep has no per-window arm at all — its flush runs the

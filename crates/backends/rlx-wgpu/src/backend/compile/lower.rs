@@ -3210,6 +3210,7 @@ fn compile_static_with(
                     m,
                     k,
                     n,
+                    n_geometry: 0,
                     batch,
                     a_batch_stride: a_bs,
                     b_batch_stride: b_bs,
@@ -6386,6 +6387,7 @@ fn compile_static_with(
                                 m,
                                 k,
                                 n,
+                                n_geometry: 0,
                                 batch: batch_bh,
                                 a_batch_stride: a_batch,
                                 b_batch_stride: k * n,
@@ -6689,6 +6691,7 @@ fn compile_static_with(
                             m,
                             k,
                             n,
+                            n_geometry: 0,
                             batch: batch_bh,
                             a_batch_stride: m * k,
                             b_batch_stride: k * n,
@@ -8273,6 +8276,7 @@ fn compile_static_with(
                         m,
                         k,
                         n,
+                        n_geometry: 0,
                         batch: 1,
                         a_batch_stride: 0,
                         b_batch_stride: 0,
@@ -8756,10 +8760,17 @@ fn compile_static_with(
                             let spatial = (p2.h_out as u64) * (p2.w_out as u64);
                             let k_total = (p2.c_in as u64) * (p2.kh as u64) * (p2.kw as u64);
                             let images = (p2.n as u64).max(1);
-                            let col_bytes = k_total
-                                .saturating_mul(spatial)
-                                .saturating_mul(images)
-                                .saturating_mul(4);
+                            // The panel this conv would gather, and the one chunk of it that
+                            // the tail reserves and the route is dispatched as. Both come from
+                            // the same figure the reservation books (`ConvColPanel`), so the
+                            // gate and the reservation cannot drift.
+                            let panel = ConvColPanel {
+                                k_total,
+                                images,
+                                spatial,
+                            };
+                            let chunk_cols = panel.chunk_cols();
+                            let chunk_bytes = panel.chunk_bytes();
                             let max_binding = dev.device.limits().max_storage_buffer_binding_size;
                             let whole = arena_whole_arena_bind(&arena, max_binding);
                             // The cooperative implicit-GEMM conv: the direct entry's
@@ -8806,22 +8817,24 @@ fn compile_static_with(
                             }
                             // What a conv has to be for the route, all of it decided
                             // without reading the adapter: one group, real spatial taps, the
-                            // shape floors `conv_im2col_col_elems` mirrors, the hard col cap
-                            // `conv_im2col_scratch_bytes` applies, and the route switch — so
-                            // the col reservation and the lowering agree on which convs the
-                            // route could take, on this adapter or any other. The batch axis
-                            // is the panel's — one panel per image, the GEMM's z — so no batch
-                            // term appears in the test below: a conv at any batch is the same
-                            // shape class. What bounds the batch is the panel's size, which
-                            // scales with the images (`col_bytes` below): a batch past the cap
-                            // or past the reserved scratch keeps the direct/tiled route.
+                            // shape floors `conv_im2col_panel` mirrors, and the panel's own
+                            // admission ([`ConvColPanel::admitted`] — the hard col cap and the
+                            // binding window the planner booked it under, from the planner's
+                            // own `plan_arena_size` and `max_bind`), so the col reservation and
+                            // the lowering agree on which convs the route could take, on this
+                            // adapter or any other. The batch axis is the panel's — one panel
+                            // per image, the GEMM's z — so no batch term appears in the test
+                            // below: a conv at any batch is the same shape class. What bounds
+                            // the batch is the panel's size, which scales with the images: a
+                            // batch past the cap or past the reserved scratch keeps the
+                            // direct/tiled route.
                             let im2col_candidate = accel
                                 && p2.groups == 1
                                 && (p2.kh as u64) * (p2.kw as u64) >= 2
                                 && spatial >= im2col_min_spatial()
                                 && k_total >= im2col_min_k()
                                 && (p2.c_out as u64) >= im2col_min_cout()
-                                && col_bytes <= CONV_IM2COL_MAX_COL_BYTES;
+                                && panel.admitted(plan_arena_size as u64, max_bind);
                             // …and the three terms the shapes alone do not settle, which keep a
                             // candidate conv on the direct/tiled route: a parked weight the
                             // route's raw word offset cannot address, a col panel past the tail
@@ -8832,15 +8845,15 @@ fn compile_static_with(
                             // to the candidate test above can leave the count behind.
                             //
                             // The panel term is not a threshold: the tail holds the largest
-                            // panel `conv_im2col_scratch_bytes` books, 256-aligned, so the
-                            // largest conv sits on it — at equality where its col is already
-                            // aligned. A conv that needs more than the tail has no panel
-                            // reserved and keeps the direct route, which is the fallback the
-                            // planner's own doc states.
+                            // *chunk* `conv_im2col_scratch_bytes` books, 256-aligned, and every
+                            // chunk of every conv is dispatched on it — at equality where the
+                            // chunk is already aligned. A conv whose chunk needs more than the
+                            // tail has no panel reserved and keeps the direct route, which is
+                            // the fallback the planner's own doc states.
                             let use_im2col = im2col_candidate
                                 && !use_implicit
                                 && !parked
-                                && col_bytes <= arena.scratch_bytes as u64
+                                && chunk_bytes <= arena.scratch_bytes as u64
                                 && whole.is_some();
                             if im2col_candidate && !use_im2col && !use_implicit {
                                 im2col_fallbacks += 1;
@@ -8932,6 +8945,7 @@ fn compile_static_with(
                                     m: p2.c_out,
                                     k: p2.c_in,
                                     n: spatial as u32,
+                                    n_geometry: 0,
                                     batch: 1,
                                     a_batch_stride: p2.c_out.saturating_mul(p2.c_in),
                                     b_batch_stride: p2.c_in.saturating_mul(spatial as u32),
@@ -8988,90 +9002,109 @@ fn compile_static_with(
                             } else if use_im2col {
                                 let (base_w, size_w) = whole.expect("whole-arena bind");
                                 // col lives at the reserved scratch tail (free of
-                                // live data); consumed immediately by the GEMM.
+                                // live data); each chunk is consumed immediately by
+                                // the GEMM that follows, then overwritten by the
+                                // next gather.
                                 let col_word_off = (arena.scratch_off / 4) as u32;
-                                let im_params = Im2Col2dParams {
-                                    c_in: p2.c_in,
-                                    h: p2.h,
-                                    w: p2.w,
-                                    h_out: p2.h_out,
-                                    w_out: p2.w_out,
-                                    kh: p2.kh,
-                                    kw: p2.kw,
-                                    sh: p2.sh,
-                                    sw: p2.sw,
-                                    ph: p2.ph,
-                                    pw: p2.pw,
-                                    dh: p2.dh,
-                                    dw: p2.dw,
-                                    in_off: (arena.offset(in_id) / 4) as u32,
-                                    col_off: col_word_off,
-                                    k_total: k_total as u32,
-                                    spatial: spatial as u32,
-                                    _p0: 0,
-                                    _p1: 0,
-                                    _p2: 0,
-                                };
-                                schedule.push(Step::Im2ColGpu {
-                                    params: im_params,
-                                    images: images as u32,
-                                });
-                                let imk = im2col2d_kernel(&dev.device);
-                                let u_im = emit_uniform(std::mem::size_of::<Im2Col2dParams>());
-                                // Static params — write once at compile (the
-                                // active-extent rewrite pass is a no-op here).
-                                dev.queue
-                                    .write_buffer(&u_im, 0, bytemuck::bytes_of(&im_params));
-                                let bg_im = bind_arena_window(
-                                    &dev.device,
-                                    imk,
-                                    &arena,
-                                    base_w,
-                                    size_w,
-                                    &u_im,
-                                );
-                                uniforms.push(u_im);
-                                bind_groups.push(bg_im);
-                                // GEMM: weight[c_out, K] @ col[K, spatial]
-                                //   → out[c_out, spatial], one image per z (NCHW).
-                                // The weight is the same for every image, so its
-                                // batch stride is zero: the pass reads it once per
-                                // image from the same address, which is the L2 hit
-                                // the second image of a pair gets.
                                 let m = p2.c_out;
                                 let kk = k_total as u32;
                                 let nn2 = spatial as u32;
+                                let out_word_off = (arena.offset(node.id) / 4) as u32;
+                                // GEMM: weight[c_out, K] @ col[K, cols] → out[c_out, s0..s0+cols],
+                                // one image per z (NCHW). The weight is the same for every
+                                // image, so its batch stride is zero: the pass reads it once
+                                // per image from the same address, which is the L2 hit the
+                                // second image of a pair gets. Every chunk re-reads it, which
+                                // is the whole of what the cut costs.
+                                //
+                                // The kernel is chosen from the conv's *whole* extent, not the
+                                // chunk's: a chunk may not move a conv onto another kernel or
+                                // another tuning bucket, so each chunk dispatches the kernel
+                                // the whole GEMM would have taken and `n_geometry` carries that
+                                // extent to the run (the grid and B's stride read the chunk).
                                 let (compute_precision, mm) =
                                     conv_gemm(&dev.device, mm_k, mm_coop_f32, m, kk, nn2);
-                                schedule.push(Step::Matmul {
-                                    m,
-                                    k: kk,
-                                    n: nn2,
-                                    batch: images as u32,
-                                    a_batch_stride: 0,
-                                    b_batch_stride: kk.saturating_mul(nn2),
-                                    c_batch_stride: m.saturating_mul(nn2),
-                                    a_off_f32: (arena.offset(w_id) / 4) as u32,
-                                    b_off_f32: col_word_off,
-                                    c_off_f32: (arena.offset(node.id) / 4) as u32,
-                                    has_bias: 0,
-                                    bias_off_f32: 0,
-                                    act_id: 0xFFFF,
-                                    b_is_param: false,
-                                    from_conv1x1: false,
-                                    compute_precision,
-                                });
-                                let u_mm = emit_uniform(std::mem::size_of::<MatmulParams>());
-                                let bg_mm = bind_arena_window(
-                                    &dev.device,
-                                    mm,
-                                    &arena,
-                                    base_w,
-                                    size_w,
-                                    &u_mm,
-                                );
-                                uniforms.push(u_mm);
-                                bind_groups.push(bg_mm);
+                                let mut s0: u64 = 0;
+                                while s0 < spatial {
+                                    let cols = chunk_cols.min(spatial - s0);
+                                    let im_params = Im2Col2dParams {
+                                        c_in: p2.c_in,
+                                        h: p2.h,
+                                        w: p2.w,
+                                        h_out: p2.h_out,
+                                        w_out: p2.w_out,
+                                        kh: p2.kh,
+                                        kw: p2.kw,
+                                        sh: p2.sh,
+                                        sw: p2.sw,
+                                        ph: p2.ph,
+                                        pw: p2.pw,
+                                        dh: p2.dh,
+                                        dw: p2.dw,
+                                        in_off: (arena.offset(in_id) / 4) as u32,
+                                        col_off: col_word_off,
+                                        k_total: kk,
+                                        cols: cols as u32,
+                                        s0: s0 as u32,
+                                        _p1: 0,
+                                        _p2: 0,
+                                    };
+                                    schedule.push(Step::Im2ColGpu {
+                                        params: im_params,
+                                        images: images as u32,
+                                    });
+                                    let imk = im2col2d_kernel(&dev.device);
+                                    let u_im = emit_uniform(std::mem::size_of::<Im2Col2dParams>());
+                                    // Static params — write once at compile (the
+                                    // active-extent rewrite pass is a no-op here).
+                                    dev.queue.write_buffer(
+                                        &u_im,
+                                        0,
+                                        bytemuck::bytes_of(&im_params),
+                                    );
+                                    let bg_im = bind_arena_window(
+                                        &dev.device,
+                                        imk,
+                                        &arena,
+                                        base_w,
+                                        size_w,
+                                        &u_im,
+                                    );
+                                    uniforms.push(u_im);
+                                    bind_groups.push(bg_im);
+                                    let cols32 = cols as u32;
+                                    schedule.push(Step::Matmul {
+                                        m,
+                                        k: kk,
+                                        n: cols32,
+                                        n_geometry: nn2,
+                                        batch: images as u32,
+                                        a_batch_stride: 0,
+                                        b_batch_stride: kk.saturating_mul(cols32),
+                                        c_batch_stride: m.saturating_mul(nn2),
+                                        a_off_f32: (arena.offset(w_id) / 4) as u32,
+                                        b_off_f32: col_word_off,
+                                        c_off_f32: out_word_off + s0 as u32,
+                                        has_bias: 0,
+                                        bias_off_f32: 0,
+                                        act_id: 0xFFFF,
+                                        b_is_param: false,
+                                        from_conv1x1: false,
+                                        compute_precision,
+                                    });
+                                    let u_mm = emit_uniform(std::mem::size_of::<MatmulParams>());
+                                    let bg_mm = bind_arena_window(
+                                        &dev.device,
+                                        mm,
+                                        &arena,
+                                        base_w,
+                                        size_w,
+                                        &u_mm,
+                                    );
+                                    uniforms.push(u_mm);
+                                    bind_groups.push(bg_mm);
+                                    s0 += cols;
+                                }
                             } else {
                                 schedule.push(if use_tiled {
                                     Step::Conv2dTiled { params: p2 }

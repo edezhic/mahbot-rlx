@@ -14,11 +14,12 @@
 //! present but will not open fails. Run with `RLX_ALLOW_THROTTLE=1 cargo test -p
 //! mahbot-inference --release --features hand-run --test sound_decoder_scratch --
 //! --ignored --nocapture <subject>`, **one subject at a time**: the route switch is
-//! process-global, and the largest arena any subject builds is the reservation subject's
-//! class-off arm at the 148-frame window, 846 654 336 B (the group's 337 439 616 B plan plus
-//! 509 214 720 B of panel; its two arms are built in sequence, each dropped before the next),
-//! while the cost subject holds two graphs, 745 068 288 B together, at once — so a second
-//! subject's graphs would cross this machine's memory ceiling.
+//! process-global, and the largest arena any subject builds is the peak subject's
+//! previous-tree arm at the 148-frame window, 592 046 976 B (the group's 337 439 616 B plan
+//! plus the 254 607 360 B panel that tree booked whole; its arms are built in sequence, each
+//! dropped before the next), while the cost subject holds two graphs, 451 753 728 B
+//! together, at once — so a second subject's graphs would cross this machine's memory
+//! ceiling.
 //!
 //! **The reservation.** The graph's arena is its plan plus its scratch, and only the
 //! scratch moves with the route; the built arena is what reports it (`arena_bytes`;
@@ -35,8 +36,11 @@
 //! call runs them at, and the largest is pinned with the group that sets it. The front's
 //! carried chunk and the talker body are argued below the peak rather than built. The peak
 //! the same call held with this group's panel booked is pinned beside it from the previous
-//! tree's arm — the extent floor set between the two widths — which is the graph that tree
-//! built.
+//! tree's arm — the extent floor set between the two widths *and* the panel reservation set
+//! back to whole, which together are the graph that tree built; the floor alone reproduces
+//! its routing, and under this tree's chunked reservation that arm books the 384-channel
+//! width's chunk — at most 16 515 072 B of panel — and no longer reaches the row's peak at
+//! all.
 //!
 //! **The cost.** Both arms are built in one process through the route's own switch, so
 //! the comparison carries no build-to-build scatter: the group at one length compiled
@@ -77,17 +81,18 @@ const GROUP: usize = 1;
 /// previous-tree arm into this tree's, and the peaks below stop being two states of one row.
 const PRE_CHANGE_FLOOR: &str = "30000";
 
-/// The two extent floors, as a skip: each is a bisect lever, and under either the group's
-/// routing is not the shipped one. The route's own switch is not one of them — every subject
-/// pins it around the graph it builds — and the adapter's cooperative-matrix entry is asked
-/// separately below. [`support::pair_of`] has created the device by the time this is asked.
+/// The two extent floors and the panel budget, as a skip: each is a bisect lever, and under
+/// any of them the group's routing or its reservation is not the shipped one. The route's own
+/// switch is not one of them — every subject pins it around the graph it builds — and the
+/// adapter's cooperative-matrix entry is asked separately below. [`support::pair_of`] has
+/// created the device by the time this is asked.
 fn skip_without_the_route() -> bool {
     for key in [
         "RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL",
         "RLX_WGPU_IM2COL_MIN_SPATIAL",
+        "RLX_WGPU_IM2COL_PANEL_BYTES",
     ] {
-        if let Some(value) = rlx_ir::env::var(key) {
-            eprintln!("skip: {key}={value} is a bisect, not the default");
+        if support::skip_on_bisect(key) {
             return true;
         }
     }
@@ -102,7 +107,8 @@ fn skip_without_the_route() -> bool {
 /// 148-frame windows, the census that says which convolutions the reservation is about, and
 /// the panel the same graph books with the class switched off. The stand's 23-frame part is
 /// below the route's extent floor (3 680 output columns against 4 800), so the 384-channel
-/// convs keep their panel there and the short row's memory is not meant to move.
+/// convs keep their panel there and the class leaves that row's graph as it was — the panel
+/// it books is the cut's, not the class's.
 #[test]
 #[ignore = "needs the models; asserts the group's reservation and its step census"]
 fn the_group_reserves_no_panel() {
@@ -116,16 +122,22 @@ fn the_group_reserves_no_panel() {
     // The part's own window, the codec's window, and the span every later window of a
     // longer part runs: the recurring one is `DAC_WINDOW` plus its left margin.
     /// `(frames, the panel the group books without the class)`.
+    ///
+    /// The panel is the group's widest conv's im2col scratch, cut over the output's spatial
+    /// axis into even, whole-tile chunks at the 16 MiB budget (`ConvColPanel`; the split is
+    /// derived in `the_panel_reservation_stops_scaling_with_the_rung`), so it no longer follows
+    /// the extent. The group books the larger of its two widths' chunks — the 192-channel
+    /// conv's at the stand's 90-frame part and at the codec's 148-frame window, the two tied at
+    /// the 144-frame one.
     const PANELS: [(usize, u64); 3] = [
-        (TYPICAL_FRAMES, 309_657_600),
-        (DAC_WINDOW, 495_452_160),
-        (DAC_WINDOW + DAC_MARGIN, 509_214_720),
+        (TYPICAL_FRAMES, 16_343_040),
+        (DAC_WINDOW, 16_515_072),
+        (DAC_WINDOW + DAC_MARGIN, 16_515_072),
     ];
     for (frames, booked) in PANELS {
         // The route's own switch pinned on, so an exported `=0` cannot decide this
-        // subject's figure. The block is a drop: the class-off arm below builds the same group
-        // with up to 510 MB of panel booked, and holding both arenas at once would cross
-        // this machine's ceiling.
+        // subject's figure. The block is a drop: the class-off arm below builds the same
+        // group a second time, and holding both arenas at once would book it twice.
         {
             let graph =
                 support::with_env(ROUTE, "1", || support::codec_group(&pair, frames, GROUP));
@@ -179,10 +191,12 @@ fn the_group_reserves_no_panel() {
         );
     }
 
-    // Below the floor the class does not reach, so the short part's group is the graph it
-    // was: the three 384-channel convs on the panel, the three 192-channel ones on the
-    // route. That is why the stand's short synthesis row's resting GPU has nothing to
-    // move for — its graph does not change.
+    // Below the floor the class does not reach, so the short part's group keeps the routing
+    // it had: the three 384-channel convs on the panel, the three 192-channel ones on the
+    // route. The panel is theirs, so it is their width's cut — 16 777 216 / (384·7·4) =
+    // 1 560 → 1 536 whole columns is the widest, and the 3 680 output columns the three
+    // residuals span need 3 680 / 1 536 = 2.4 → 3 chunks, each 1 227 → 1 248 whole columns
+    // of 10 752 B, `384·7·1 248·4 = 13 418 496 B`, which is what the arena reserves.
     let frames =
         mahbot_inference::reference::STAND_SYNTH_SHORT_SAMPLES / graphs::samples_per_frame();
     let graph = support::with_env(ROUTE, "1", || support::codec_group(&pair, frames, GROUP));
@@ -192,7 +206,7 @@ fn the_group_reserves_no_panel() {
         .expect("the wgpu backend reports the arena's scratch");
     println!("group={GROUP} frames={frames} scratch={scratch} B census={census}");
     assert_eq!(
-        scratch, 39_567_360,
+        scratch, 13_418_496,
         "frames={frames}: below the extent floor the 384-channel convs keep their panel \
          ({census})"
     );
@@ -209,10 +223,12 @@ fn the_group_reserves_no_panel() {
 /// The arena the row peaks on, at the stand's own synthesis length and at both of the
 /// codec's windows: the largest of the three codec groups' built arenas — group 0 at the
 /// length the front runs it, the decoder's two at the part's own — pinned exactly and
-/// attributed to the group that sets it, beside the peak the same call would have held with
-/// the changed group's panel booked. Only that group's arena moves with the route, so the two
-/// peaks are the two states of the same row. The talker body's graph is the one a call holds
-/// without building here: the module doc argues it below every codec group at these lengths.
+/// attributed to the group that sets it, beside the peak the same call holds under the
+/// previous tree's routing (the extent floor restored, so the changed group is on the panel
+/// and the panel is booked whole). Only that group's arena moves with the route and the
+/// reservation, so the two peaks are the two states of the same row. The talker body's graph
+/// is the one a call holds without building here: the module doc argues it below every codec
+/// group at these lengths.
 #[test]
 #[ignore = "needs the models; asserts which codec group sets the row's peak and its size"]
 fn the_row_peaks_on_the_last_group() {
@@ -224,7 +240,8 @@ fn the_row_peaks_on_the_last_group() {
         return;
     }
     let groups = graphs::codec_groups();
-    /// `(frames, the row's peak, the same peak with the changed group's panel booked)`.
+    /// `(frames, the row's peak, the peak under the previous tree's routing — the extent floor
+    /// restored and that group's panel booked whole)`.
     const PEAKS: [(usize, u64, u64); 3] = [
         (TYPICAL_FRAMES, 311_001_520, 372_534_144),
         (DAC_WINDOW, 496_796_080, 576_908_160),
@@ -262,17 +279,23 @@ fn the_row_peaks_on_the_last_group() {
             "frames={frames}: the last group sets the row's peak, not group {peak_group}"
         );
 
-        // The row's peak with the changed group's panel booked: the same three arenas with
-        // that one taken from the previous tree's arm. The route switch is all-or-nothing,
+        // The row's peak under the previous tree's routing: the same three arenas with the
+        // changed group's taken from its arm. The route switch is all-or-nothing,
         // so that tree's routing is reproduced with the extent floor instead — above the
         // 384-channel shapes' own extents and below the 192-channel ones' — which is the
-        // class taking `dac.blk.2` and leaving `dac.blk.1` on the panel.
-        let previous_tree = support::with_env(ROUTE, "1", || {
-            support::with_env(
-                "RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL",
-                PRE_CHANGE_FLOOR,
-                || support::codec_group(&pair, frames, GROUP),
-            )
+        // class taking `dac.blk.2` and leaving `dac.blk.1` on the panel; its reservation is
+        // reproduced with the panel budget uncapped, because the floor alone would leave the
+        // 384-channel panel chunked at 15 482 880 B and the arm at 217 705 344 + 15 482 880 =
+        // 233 188 224 B at this length, below the row's peak — a state no tree ran.
+        // The previous tree's reservation, uncapped: this tree cuts it into chunks.
+        let previous_tree = support::with_panel_budget(Some("0"), || {
+            support::with_env(ROUTE, "1", || {
+                support::with_env(
+                    "RLX_WGPU_CONV_IMPLICIT_MIN_SPATIAL",
+                    PRE_CHANGE_FLOOR,
+                    || support::codec_group(&pair, frames, GROUP),
+                )
+            })
         });
         let mut booked = arenas.clone();
         booked[GROUP].1 = previous_tree
@@ -294,15 +317,19 @@ fn the_row_peaks_on_the_last_group() {
         assert_eq!(peak, peak_pinned, "frames={frames}: the row's peak");
         assert_eq!(
             booked_peak, booked_pinned,
-            "frames={frames}: and the peak with the changed group's panel booked"
+            "frames={frames}: and the peak under the previous tree's routing"
         );
     }
 }
 
 /// The group's six convolutions, against the panel route they replace: paired, alternating,
-/// medians, at the stand's own synthesis length. The figure is the group's, not either
-/// width's — the per-shape figures, and the deliberate asymmetry between the width that is
-/// gated there and the one that is only recorded, are
+/// medians, at the stand's own synthesis length. The panel arm is a bisect arm — the class
+/// forced off, so the group is built the way the previous tree built it — and its cost is the
+/// *chunked* panel's, not the whole panel's that tree booked: each conv's panel is cut into
+/// the chunks the 16 MiB budget allows and its weight is re-read once per chunk. The margin
+/// below is therefore measured against the dearer of the two panel routes. The figure is the
+/// group's, not either width's — the per-shape figures, and the deliberate asymmetry between
+/// the width that is gated there and the one that is only recorded, are
 /// `conv_implicit_vs_panel_at_the_admitted_widths` in `rlx-wgpu`. This is the product path's
 /// own time claim: the group the codec runs must beat the panel route it replaced, or the
 /// width has bought its residence with the call's time. It asserts; no CI gate runs it —

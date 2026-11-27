@@ -968,6 +968,7 @@ impl WgpuExecutable {
                         m,
                         k,
                         n,
+                        n_geometry,
                         a_off_f32,
                         b_off_f32,
                         c_off_f32,
@@ -1003,7 +1004,9 @@ impl WgpuExecutable {
                             act_id: *act_id,
                             // CoopF16Vk only: A's offset in its f16 window.
                             _pad0: self.coop_f16_vk_a_off.get(&step_i).copied().unwrap_or(0),
-                            _pad1: 0,
+                            // C's row stride: the whole column extent when this step is one
+                            // chunk of a convolution GEMM route's, else `n` itself.
+                            c_ld: geometry_extent(*n, *n_geometry),
                             _pad2: 0,
                         };
                         dev.queue
@@ -1986,6 +1989,7 @@ impl WgpuExecutable {
                                 m,
                                 k,
                                 n,
+                                n_geometry,
                                 batch,
                                 b_off_f32,
                                 b_is_param,
@@ -2009,6 +2013,11 @@ impl WgpuExecutable {
                                 // never gets an active extent, so `scale` is the
                                 // identity there.
                                 let m_s = scale(*m);
+                                // A conv GEMM route dispatches one chunk of its columns per
+                                // step, and a chunk must not move the conv onto another kernel
+                                // (or tuning bucket) than its whole extent takes. The grids
+                                // below read `n`, the chunk dispatched.
+                                let n_geom = geometry_extent(*n, *n_geometry);
                                 if m_s == 0 {
                                     if !matches!(step, Step::FftGpu { .. }) {
                                         gpu_bi += 1;
@@ -2024,14 +2033,14 @@ impl WgpuExecutable {
                                 // instead of the step reading B outside the bind window.
                                 let coop_f16_vk = match *compute_precision {
                                     MatmulCompute::CoopF16Vk => {
-                                        matmul_coop_f16_vulkan_active_kernel(&dev.device, *n)
+                                        matmul_coop_f16_vulkan_active_kernel(&dev.device, n_geom)
                                     }
                                     _ => None,
                                 };
                                 let coop_f16_wide = coop_f16_vk.is_some()
                                     && crate::coop_f16_vk::use_wide_matmul(
                                         *b_off_f32,
-                                        *n,
+                                        n_geom,
                                         &self.coop_f16_b_param,
                                         &self.coop_f16_vk_wide_b,
                                     );
@@ -2156,7 +2165,7 @@ impl WgpuExecutable {
                                         *act_id,
                                         m_s,
                                         *k,
-                                        *n,
+                                        n_geom,
                                         *b_is_param,
                                     ) && mm_coop_f32_direct.is_some();
                                     if used_direct {
@@ -2191,7 +2200,7 @@ impl WgpuExecutable {
                                         *batch,
                                     );
                                 } else if m_s <= 4 && !no_gemv {
-                                    let cols = crate::kernels::gemv_cols_for(*n);
+                                    let cols = crate::kernels::gemv_cols_for(n_geom);
                                     let k = if cols == 32 {
                                         mm_gemv
                                     } else {
@@ -2199,7 +2208,7 @@ impl WgpuExecutable {
                                     };
                                     pass.set_pipeline(&k.pipeline);
                                     pass.dispatch_workgroups(n.div_ceil(cols), 1, *batch);
-                                } else if m_s >= 32 && *n >= 64 {
+                                } else if m_s >= 32 && n_geom >= 64 {
                                     // Wide path: whole row tiles, then one remainder tile for the rows
                                     // the tile grid would otherwise round up — so a 96-row node computes
                                     // 96 rows, not 128. Both dispatches share this step's bind group, and
@@ -3805,7 +3814,7 @@ impl WgpuExecutable {
                                 let imk = im2col2d_kernel(&dev.device);
                                 pass.set_pipeline(&imk.pipeline);
                                 pass.set_bind_group(0, &self.bind_groups[gpu_bi], &[]);
-                                let total = params.k_total.saturating_mul(params.spatial);
+                                let total = params.k_total.saturating_mul(params.cols);
                                 let (gx, gy, _) = dispatch_dims(total, 64);
                                 pass.dispatch_workgroups(gx, gy, (*images).max(1));
                             }
@@ -6850,6 +6859,13 @@ fn encode_two_window_copy(
     pass.set_bind_group(0, &bg, &[]);
     let (gx, gy, gz) = dispatch_dims(elems, 64);
     pass.dispatch_workgroups(gx, gy, gz);
+}
+
+/// The column extent a matmul step's kernel selection reads: `n_geometry` when the step is one
+/// chunk of a convolution GEMM route's, else `n` itself (`0` marks an unchunked step). C's row
+/// stride and the kernel pick read it; the dispatch grids read `n`, the chunk dispatched.
+fn geometry_extent(n: u32, n_geometry: u32) -> u32 {
+    if n_geometry == 0 { n } else { n_geometry }
 }
 
 /// A copy of a parked weight into the activation arena (a two-window conv's

@@ -60,7 +60,8 @@ fn params_words(c: &Case) -> [u32; 16] {
         bias_off,
         c.act,
         0,
-        0,
+        // C's row stride: an unchunked multiply's is `n`.
+        n,
         0,
     ]
 }

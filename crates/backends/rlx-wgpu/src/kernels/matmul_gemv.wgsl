@@ -40,7 +40,10 @@ struct Params {
     has_bias: u32,
     bias_off: u32,
     act_id: u32,
-    _p0: u32, _p1: u32, _p2: u32,
+    // C's row stride in f32 elements. The convolution GEMM routes dispatch a conv's
+    // output columns a chunk at a time, so `n` is the chunk while C is the conv's whole
+    // slab and its rows are spaced by the whole extent; an unchunked step has c_ld == n.
+    _p0: u32, c_ld: u32, _p2: u32,
 };
 
 const COLS: u32 = 32u;
@@ -173,7 +176,7 @@ fn matmul_gemv(
                 v = v + arena[params.bias_off + col];
             }
             v = apply_act(v);
-            arena[c_base + i * params.n + col] = v;
+            arena[c_base + i * params.c_ld + col] = v;
         }
     }
 }

@@ -278,6 +278,10 @@ name = "conv_gemm_coop_f32"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "conv_im2col_chunk_parity"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "conv1d_implicit"
 required-features = ["backend-tests"]
 

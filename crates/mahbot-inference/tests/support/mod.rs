@@ -255,6 +255,44 @@ pub fn with_env<T>(key: &str, value: &str, body: impl FnOnce() -> T) -> T {
     body()
 }
 
+/// Run `body` with the im2col panel budget (`RLX_WGPU_IM2COL_PANEL_BYTES`) at `value` — `None`
+/// for the shipped figure — then put the key back and reload the snapshot it is read from.
+/// The budget is read from a cached snapshot, so the reload is part of the lever on both sides
+/// of the body: a panic inside it must not leave the process building under a budget nobody
+/// asked for.
+pub fn with_panel_budget<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
+    const KEY: &str = "RLX_WGPU_IM2COL_PANEL_BYTES";
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(previous) => rlx_ir::env::set(KEY, previous.clone()),
+                None => rlx_ir::env::unset(KEY),
+            }
+            rlx_wgpu::reload_runtime_config();
+        }
+    }
+    let _restore = Restore(rlx_ir::env::var(KEY));
+    match value {
+        Some(value) => rlx_ir::env::set(KEY, value),
+        None => rlx_ir::env::unset(KEY),
+    }
+    rlx_wgpu::reload_runtime_config();
+    body()
+}
+
+/// Whether `key` is exported, naming it as a bisect: a census or a reservation taken under a
+/// lever is the lever's, not the shipped routing's.
+pub fn skip_on_bisect(key: &str) -> bool {
+    match rlx_ir::env::var(key) {
+        Some(value) => {
+            eprintln!("skip: {key}={value} is a bisect, not the default");
+            true
+        }
+        None => false,
+    }
+}
+
 /// Two arms timed alternately over `rounds` rounds, the arm that runs first swapping each
 /// round so a within-round drift lands on both. `key` is set to `arms[arm]` for the length
 /// of that arm's measurement and each arm's samples come back in round order — a
@@ -435,6 +473,33 @@ pub fn frame_once(compiled: &mut graphs::Compiled, inputs: &[(String, Vec<f32>)]
 /// the arm that runs first swaps each round, so a within-round drift lands on both arms
 /// rather than on the delta. Returns the per-round figures in the order the two arms are
 /// given, and `first − second` per round — the paired difference the callers read.
+pub fn paired_rounds_with<A, B>(
+    rounds: usize,
+    mut first: A,
+    mut second: B,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>)
+where
+    A: FnMut() -> f64,
+    B: FnMut() -> f64,
+{
+    first();
+    second();
+    let (mut a_ms, mut b_ms, mut deltas) = (Vec::new(), Vec::new(), Vec::new());
+    for round in 0..rounds {
+        let (a, b) = if round % 2 == 0 {
+            (first(), second())
+        } else {
+            let b = second();
+            (first(), b)
+        };
+        a_ms.push(a);
+        b_ms.push(b);
+        deltas.push(a - b);
+    }
+    (a_ms, b_ms, deltas)
+}
+
+/// [`paired_rounds_with`] over two compiled graphs, one [`frame_once`] a pass.
 pub fn paired_rounds(
     rounds: usize,
     first: &mut graphs::Compiled,
@@ -442,21 +507,11 @@ pub fn paired_rounds(
     second: &mut graphs::Compiled,
     second_in: &[(String, Vec<f32>)],
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    frame_once(first, first_in);
-    frame_once(second, second_in);
-    let (mut a_ms, mut b_ms, mut deltas) = (Vec::new(), Vec::new(), Vec::new());
-    for round in 0..rounds {
-        let (a, b) = if round % 2 == 0 {
-            (frame_once(first, first_in), frame_once(second, second_in))
-        } else {
-            let b = frame_once(second, second_in);
-            (frame_once(first, first_in), b)
-        };
-        a_ms.push(a);
-        b_ms.push(b);
-        deltas.push(a - b);
-    }
-    (a_ms, b_ms, deltas)
+    paired_rounds_with(
+        rounds,
+        || frame_once(first, first_in),
+        || frame_once(second, second_in),
+    )
 }
 
 /// A schedule's `Step::Kind:count+…` census, one entry per step kind the schedule

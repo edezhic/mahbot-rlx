@@ -5,12 +5,19 @@
 // GPU im2col for the NCHW convolution im2col+GEMM path (groups == 1).
 //
 // Gathers the receptive field of every output position into a column matrix
-// `col[k_total, spatial]` laid out **row-major** so it feeds the standard
+// `col[k_total, cols]` laid out **row-major** so it feeds the standard
 // `matmul` kernel directly as the B operand, one panel per image:
 //
 //   A = weight[c_out, c_in*kh*kw]   (row-major, exactly as stored)
-//   B = col[n][c_in*kh*kw, spatial] (this kernel's output)
+//   B = col[n][c_in*kh*kw, cols]    (this kernel's output)
 //   C = out[n][c_out, spatial]      (NCHW: the matmul's z is the image)
+//
+// One dispatch gathers one *chunk* of the panel — output columns `s0 .. s0+cols`
+// of the conv's whole `spatial` extent (`ConvColPanel`, which sizes the tail the
+// chunk lands in). A chunk is the panel's columns only: the reduction axis is
+// never cut, so the GEMM that follows accumulates in the same order as it would
+// over the whole extent, and the values are identical. The GEMM writes those
+// columns into C at their own offset, C's row stride staying the whole extent.
 //
 // Image `i` of the batch is one `gid.z` slice, read from its own NCHW frame and
 // written to its own panel, so a batched conv gathers every window's receptive
@@ -26,7 +33,7 @@
 // accumulation order the tree does not fix — so on those shapes the two routes
 // are held to a tolerance, not to bit-identity.
 //
-// One thread per col element (`k_total * spatial` threads per image).
+// One thread per col element (`k_total * cols` threads per image).
 // Out-of-bounds receptive-field taps (padding / dilation past the edge) store 0.0.
 
 struct Params {
@@ -46,8 +53,8 @@ struct Params {
     in_off: u32,
     col_off: u32,
     k_total: u32,   // c_in * kh * kw
-    spatial: u32,   // h_out * w_out
-    _p0: u32,
+    cols: u32,      // output columns of this chunk (the panel's row stride)
+    s0: u32,        // this chunk's first output column
     _p1: u32,
     _p2: u32,
 };
@@ -57,19 +64,20 @@ struct Params {
 
 @compute @workgroup_size(64)
 fn im2col2d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) ngs: vec3<u32>) {
-    let total = params.k_total * params.spatial;
+    let total = params.k_total * params.cols;
     let idx = gid.x + gid.y * ngs.x * 64u;
     if (idx >= total) { return; }
 
     let img = gid.z;
-    let s = idx % params.spatial;   // output spatial position (ho*w_out + wo)
-    let k = idx / params.spatial;   // flattened (ci, kr, kc)
+    let c = idx % params.cols;      // column within this chunk
+    let k = idx / params.cols;      // flattened (ci, kr, kc)
 
     let kc = k % params.kw;
     let tmp = k / params.kw;
     let kr = tmp % params.kh;
     let ci = tmp / params.kh;
 
+    let s = params.s0 + c;          // output spatial position (ho*w_out + wo)
     let ho = s / params.w_out;
     let wo = s % params.w_out;
 
@@ -83,6 +91,6 @@ fn im2col2d(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
         let in_idx = img * frame + (ci * params.h + u32(in_r)) * params.w + u32(in_c);
         v = arena[params.in_off + in_idx];
     }
-    let panel = params.k_total * params.spatial;
+    let panel = params.k_total * params.cols;
     arena[params.col_off + img * panel + idx] = v;
 }

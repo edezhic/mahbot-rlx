@@ -273,7 +273,7 @@ fn main() {
             bias_off: 0,
             act_id: 0xFFFF,
             _pad0: 0,
-            _pad1: 0,
+            c_ld: n as u32,
             _pad2: 0,
         };
         let pbuf = device.create_buffer(&wgpu::BufferDescriptor {

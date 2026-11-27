@@ -181,7 +181,8 @@ fn params_bytes(m: u32, k: u32, n: u32, a_off: u32, b_off: u32, c_off: u32) -> [
         // The F16Vk kernels read A at `a_off_f16`; the probe binds one buffer
         // from offset 0, so it is `a_off` there. Padding for every other kernel.
         a_off,
-        0,
+        // C's row stride (`c_ld`) — `n` for an unchunked multiply, and the probe is one.
+        n,
         0,
     ];
     let mut out = [0u8; 64];

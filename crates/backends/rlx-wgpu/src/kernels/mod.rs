@@ -442,7 +442,12 @@ pub struct MatmulParams {
     pub bias_off: u32,
     pub act_id: u32, // 0xFFFF = no activation
     pub _pad0: u32,
-    pub _pad1: u32,
+    /// C's row stride, in f32 elements. Equal to `n` for every step but a convolution GEMM
+    /// route's chunk: that route gathers and multiplies the conv's output columns a chunk at
+    /// a time (`ConvColPanel`), so the chunk is the step's `n` while C is still the conv's
+    /// whole `c_out × spatial` slab and its rows are spaced by the whole extent. The run
+    /// writes the step's `n_geometry` here, which is `n` itself when the step is unchunked.
+    pub c_ld: u32,
     pub _pad2: u32,
 }
 
@@ -2042,6 +2047,11 @@ pub struct Conv2dParams {
 }
 
 /// Layout for GPU im2col (NCHW, groups==1, one panel per image). 80 bytes (20 u32).
+///
+/// One dispatch writes one *chunk* of a conv's `col[k_total, spatial]` panel — the panel cut
+/// over the output's spatial axis (`ConvColPanel`) — so `cols` is both the chunk's column
+/// count and the panel's row stride, and `s0` is the chunk's first output column. An
+/// unchunked conv is one chunk at `s0 = 0` with `cols` the whole extent.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Im2Col2dParams {
@@ -2061,8 +2071,8 @@ pub struct Im2Col2dParams {
     pub in_off: u32,
     pub col_off: u32,
     pub k_total: u32,
-    pub spatial: u32,
-    pub _p0: u32,
+    pub cols: u32,
+    pub s0: u32,
     pub _p1: u32,
     pub _p2: u32,
 }
@@ -3732,7 +3742,10 @@ pub fn matmul_gemv_kernel_cols(device: &wgpu::Device, cols: u32) -> &'static Ker
 ///
 /// 64, the in-order form, unless fast math is on
 /// ([`crate::device::set_fast_math`]), which takes the faster 32-column
-/// split-K form. `RLX_WGPU_GEMV_COLS` (64 / 32 / 16 / 8) pins it.
+/// split-K form. `RLX_WGPU_GEMV_COLS` (64 / 32 / 16 / 8) pins it. The width does not
+/// decide it today — the shipped variants are constants — so a chunked conv GEMM step and
+/// its whole extent get the same one; callers pass the extent so that a width-dependent
+/// choice cannot start out reading a chunk.
 pub fn gemv_cols_for(n: u32) -> u32 {
     if let Some(c) = rlx_ir::env::var("RLX_WGPU_GEMV_COLS").and_then(|v| v.parse::<u32>().ok())
         && matches!(c, 8 | 16 | 32 | 64)
@@ -7018,9 +7031,11 @@ mod tests {
     use super::{
         ATTENTION_DECODE_MAX_HEAD_DIM, ATTENTION_WGSL, CONV_TRANSPOSE2D_TILED_WGSL,
         ELEMENTWISE_REGION_WGSL, FRAMES_WGSL, FRAMES_WORKGROUP, FUSED_RESIDUAL_LN_TEE_VEC4_WGSL,
-        LAYERNORM_VEC4_WGSL, MATMUL_WIDE_VEC4_WGSL, NORM_VEC4_LANES, SAMPLE_LANES, SAMPLE_STAGE,
-        SAMPLE_WGSL, SNAKE_BETA_WG, SNAKE_BETA_WGSL, TILED_TILE_CO, TILED_TILE_U, WIDE_TAIL_M,
-        WideGrid, WideVariant, conv_transpose2d_tiled_grid, wide_grid,
+        LAYERNORM_VEC4_WGSL, MATMUL_COOP_F32_DIRECT_WGSL, MATMUL_COOP_F32_EDGE_WGSL,
+        MATMUL_COOP_F32_PORTABLE_WGSL, MATMUL_COOP_F32_WGSL, MATMUL_GEMV_WGSL, MATMUL_WGSL,
+        MATMUL_WIDE_NV_WGSL, MATMUL_WIDE_VEC4_WGSL, MATMUL_WIDE_WGSL, NORM_VEC4_LANES,
+        SAMPLE_LANES, SAMPLE_STAGE, SAMPLE_WGSL, SNAKE_BETA_WG, SNAKE_BETA_WGSL, TILED_TILE_CO,
+        TILED_TILE_U, WIDE_TAIL_M, WideGrid, WideVariant, conv_transpose2d_tiled_grid, wide_grid,
     };
 
     /// Parse one of this crate's kernels exactly as [`super::kernel_module`] builds
@@ -7315,6 +7330,36 @@ mod tests {
             validated > 0,
             "the directory walk found the cooperative shaders"
         );
+    }
+
+    /// Every kernel a `Step::Matmul` can be dispatched with from the conv GEMM routes writes
+    /// C at the step's own row stride (`params.c_ld`), never at its column count: a chunked
+    /// conv step sets `n` to the chunk and `c_ld` to the conv's whole extent, so a kernel
+    /// still storing at `params.n` would stack each chunk's rows onto the first `n` columns of
+    /// C — a wrong answer, not a failed compile. The reachable set is the f32 arm's five
+    /// kernels plus the four cooperative-f32 ones (`conv_gemm` returns only those two
+    /// precisions, and its weight sits in A, so the f16/bf16/cop16 arms are out).
+    #[test]
+    fn every_conv_gemm_kernel_stores_c_at_the_steps_row_stride() {
+        for (name, src) in [
+            ("matmul.wgsl", MATMUL_WGSL),
+            ("matmul_wide.wgsl", MATMUL_WIDE_WGSL),
+            ("matmul_wide_nv.wgsl", MATMUL_WIDE_NV_WGSL),
+            ("matmul_wide_vec4.wgsl", MATMUL_WIDE_VEC4_WGSL),
+            ("matmul_gemv.wgsl", MATMUL_GEMV_WGSL),
+            ("matmul_coop_f32.wgsl", MATMUL_COOP_F32_WGSL),
+            ("matmul_coop_f32_direct.wgsl", MATMUL_COOP_F32_DIRECT_WGSL),
+            (
+                "matmul_coop_f32_portable.wgsl",
+                MATMUL_COOP_F32_PORTABLE_WGSL,
+            ),
+            ("matmul_coop_f32_edge.wgsl", MATMUL_COOP_F32_EDGE_WGSL),
+        ] {
+            assert!(
+                src.contains("* params.c_ld"),
+                "{name} must store C at `params.c_ld`, the step's row stride"
+            );
+        }
     }
 
     /// The refusal contract's other half, on the device this machine has: a module

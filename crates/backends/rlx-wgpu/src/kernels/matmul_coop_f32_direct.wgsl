@@ -39,7 +39,10 @@ struct Params {
     has_bias: u32,
     bias_off: u32,
     act_id: u32,
-    _p0: u32, _p1: u32, _p2: u32,
+    // C's row stride in f32 elements. The convolution GEMM routes dispatch a conv's
+    // output columns a chunk at a time, so `n` is the chunk while C is the conv's whole
+    // slab and its rows are spaced by the whole extent; an unchunked step has c_ld == n.
+    _p0: u32, c_ld: u32, _p2: u32,
 };
 
 // `has_bias`, `bias_off` and `act_id` are part of the record but unread here:
@@ -124,21 +127,21 @@ fn matmul_coop_f32_direct(
         acc_32 = coopMultiplyAdd(a_3, b_2, acc_32);
         acc_33 = coopMultiplyAdd(a_3, b_3, acc_33);
     }
-    let c_row = c_base + row_base * params.n + col_base;
-    coopStoreT(acc_00, &arena[c_row],        params.n);
-    coopStoreT(acc_01, &arena[c_row + 8u ],  params.n);
-    coopStoreT(acc_02, &arena[c_row + 16u],  params.n);
-    coopStoreT(acc_03, &arena[c_row + 24u],  params.n);
-    coopStoreT(acc_10, &arena[c_row + 8u  * params.n], params.n);
-    coopStoreT(acc_11, &arena[c_row + 8u  * params.n + 8u ], params.n);
-    coopStoreT(acc_12, &arena[c_row + 8u  * params.n + 16u], params.n);
-    coopStoreT(acc_13, &arena[c_row + 8u  * params.n + 24u], params.n);
-    coopStoreT(acc_20, &arena[c_row + 16u * params.n], params.n);
-    coopStoreT(acc_21, &arena[c_row + 16u * params.n + 8u ], params.n);
-    coopStoreT(acc_22, &arena[c_row + 16u * params.n + 16u], params.n);
-    coopStoreT(acc_23, &arena[c_row + 16u * params.n + 24u], params.n);
-    coopStoreT(acc_30, &arena[c_row + 24u * params.n], params.n);
-    coopStoreT(acc_31, &arena[c_row + 24u * params.n + 8u ], params.n);
-    coopStoreT(acc_32, &arena[c_row + 24u * params.n + 16u], params.n);
-    coopStoreT(acc_33, &arena[c_row + 24u * params.n + 24u], params.n);
+    let c_row = c_base + row_base * params.c_ld + col_base;
+    coopStoreT(acc_00, &arena[c_row],        params.c_ld);
+    coopStoreT(acc_01, &arena[c_row + 8u ],  params.c_ld);
+    coopStoreT(acc_02, &arena[c_row + 16u],  params.c_ld);
+    coopStoreT(acc_03, &arena[c_row + 24u],  params.c_ld);
+    coopStoreT(acc_10, &arena[c_row + 8u  * params.c_ld], params.c_ld);
+    coopStoreT(acc_11, &arena[c_row + 8u  * params.c_ld + 8u ], params.c_ld);
+    coopStoreT(acc_12, &arena[c_row + 8u  * params.c_ld + 16u], params.c_ld);
+    coopStoreT(acc_13, &arena[c_row + 8u  * params.c_ld + 24u], params.c_ld);
+    coopStoreT(acc_20, &arena[c_row + 16u * params.c_ld], params.c_ld);
+    coopStoreT(acc_21, &arena[c_row + 16u * params.c_ld + 8u ], params.c_ld);
+    coopStoreT(acc_22, &arena[c_row + 16u * params.c_ld + 16u], params.c_ld);
+    coopStoreT(acc_23, &arena[c_row + 16u * params.c_ld + 24u], params.c_ld);
+    coopStoreT(acc_30, &arena[c_row + 24u * params.c_ld], params.c_ld);
+    coopStoreT(acc_31, &arena[c_row + 24u * params.c_ld + 8u ], params.c_ld);
+    coopStoreT(acc_32, &arena[c_row + 24u * params.c_ld + 16u], params.c_ld);
+    coopStoreT(acc_33, &arena[c_row + 24u * params.c_ld + 24u], params.c_ld);
 }

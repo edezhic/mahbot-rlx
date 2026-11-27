@@ -35,7 +35,7 @@ struct Params {
     has_bias: u32,
     bias_off: u32,
     act_id: u32,
-    _p0: u32, _p1: u32, _p2: u32,
+    _p0: u32, c_ld: u32, _p2: u32,
 };
 
 const TILE_M: u32 = 32u;
@@ -251,6 +251,6 @@ fn matmul_coop_f32_edge(
             v = v + arena[params.bias_off + global_col];
         }
         v = apply_act(v);
-        arena[c_base + global_row * params.n + global_col] = v;
+        arena[c_base + global_row * params.c_ld + global_col] = v;
     }
 }
