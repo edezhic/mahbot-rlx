@@ -34,12 +34,15 @@
 // 512-dim heads without spilling on Apple GPUs (private limit ~10 KiB/thread).
 //
 // This module also carries a decode-shaped variant, `attention_decode`: one
-// workgroup per (batch, head) with the key sequence walked across the
-// workgroup's lanes and the lane partials merged in workgroup memory. The
+// workgroup per (batch, head) and key range, the value dims split across the
+// workgroup's lanes and the key range walked in tiles of softmax weights. The
 // serial form above is the wrong shape for a decode step — one query row means
-// one workgroup of 64 lanes of which only batch·heads are live, each walking
-// the whole context alone. The host picks the variant from the extent the run
-// will actually walk (`kernels::attention_decode_eligible`).
+// one workgroup of 64 lanes of which only batch·heads are live, each walking the
+// whole context alone. The host picks the variant from the extent the run will
+// actually walk (`kernels::attention_decode_eligible`), and picks between the
+// variant's two bodies — the weighted one below and `attention_decode_online`,
+// which walks the keys across the lanes — from `attention_route::decode_online()`,
+// a dispatch-time pick the shader itself never sees.
 //
 // The third entry point, `attention_mask`, is the many-row route's masked
 // scale: the same scale, cap and mask the two above apply to a score, over a
@@ -51,11 +54,12 @@
 // reads this is a backstop, not the refusal.
 const MAX_HEAD_DIM: u32 = 512u;
 
-// Decode-shaped variant: workgroup width == key lanes, and the value dims merged
-// per pass. DECODE_LANES * DECODE_DIM_CHUNK f32 is 8 KiB of workgroup storage
-// (8.76 KiB with the merge scratch and the Q row), half of WebGPU's guaranteed
-// 16 KiB `maxComputeWorkgroupStorageSize` — the native backend's equivalent
-// needs 16.75 KiB and is above that floor.
+// Decode-shaped variant: workgroup width. The one-pass body walks the keys across
+// these lanes, the weighted body gives each lane `DECODE_MAX_DIM / DECODE_LANES`
+// value dims. Workgroup storage is counted per entry point, so each body carries
+// only the arrays it reads: 8.76 KiB for the one-pass body and 2.8 KiB for the
+// weighted one, both under WebGPU's guaranteed 16 KiB
+// `maxComputeWorkgroupStorageSize`.
 const DECODE_LANES: u32 = 64u;
 // Depth of the decode entry's contraction and value update: a power of two,
 // because both walks mask with `& ~(DECODE_UNROLL - 1)`, and equal to the
@@ -71,6 +75,19 @@ const DECODE_DIM_CHUNK: u32 = 32u;
 // per-thread stack, which the Metal compiler spills, and every key iteration
 // then pays a thread-local load and store for it.
 const DECODE_MAX_DIM: u32 = 128u;
+// Keys whose softmax weights the weighted body holds in workgroup memory at
+// once. A longer key range is walked in tiles, each with its own max and its own
+// rebase of the running pair, so any extent works; the size only sets how often
+// that rebase happens. One f32 a key, so a full tile is 2 KiB of workgroup storage
+// whatever the head width, and fits inside the decode entry's storage budget.
+const DECODE_KEY_TILE: u32 = 512u;
+// Value dims the weighted body gives each lane: the head width over the lane
+// count, so `DECODE_MAX_DIM` is covered by one pass of the workgroup and the
+// accumulator is that many registers rather than a per-lane array. The body
+// spells exactly two of them (`d0`/`d1` and their unroll accumulators), so a lane
+// count that does not make this 2 needs the body widened with it;
+// `kernels::the_decode_lane_count_is_the_shaders_own` pins the value.
+const DECODE_ACC: u32 = DECODE_MAX_DIM / DECODE_LANES;
 // The binary (kind 2) key-padding mask's pair: the score a dropped key stands for —
 // what `mask_score` writes for it, and what the decode entry's skipped key is scored
 // as instead of its K dot — and the element value below which a key is dropped.
@@ -268,9 +285,15 @@ fn attention(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgro
 var<workgroup> dec_pub: array<f32, 2u>;
 // Per-lane partial, reused: first the lane's running max, then its weighted sum.
 var<workgroup> dec_lane: array<f32, DECODE_LANES>;
-// Per-lane weighted O partials, `[dim * DECODE_LANES + lane]` (dim-major: the
-// writes and the reduction reads are both across consecutive lanes).
+// Per-lane weighted O partials of the one-pass body, `[dim * DECODE_LANES +
+// lane]` (dim-major: the writes and the reduction reads are both across
+// consecutive lanes). Only that body reads it — the weighted body writes its
+// partials straight to the arena — so it is not in the weighted entry's
+// workgroup storage.
 var<workgroup> dec_dims: array<f32, DECODE_DIM_CHUNK * DECODE_LANES>;
+// The weighted body's tile of key weights, `[key - base]`, written by the score
+// walk and read by the value walk of every lane.
+var<workgroup> dec_scores: array<f32, DECODE_KEY_TILE>;
 // One query row per workgroup instead of a copy per lane: filled once and
 // read once per key each lane walks.
 var<workgroup> dec_q: array<f32, DECODE_MAX_DIM>;
@@ -291,13 +314,80 @@ fn decode_geom() -> DecodeGeom {
     return DecodeGeom(hd_v, hd_v_pad, 2u + hd_v_pad);
 }
 
-// One workgroup per (batch, head) and key range: `row` is the (batch, head)
-// pair and `split` picks the `splits`-th of its disjoint key ranges. Every lane
-// keeps its own running (m, l, O[]) over the keys it walks, and the merge at the
-// bottom is the same online-softmax rebase the serial kernel does serially: a
-// lane whose partial sits below the merged max contributes `rlx_exp(m - max)` of its
-// own weighting. Only lane 0's reduction of a 64-lane array differs in shape
-// from the serial form — at this width a barrier tree is not worth it.
+// Everything the two decode bodies derive from a step's addresses before they
+// differ: the head and value widths, the query's absolute position, the split's
+// partial stride and the base addresses of Q, K, V, the output and the mask. A
+// decode step is one query row — `qi` is 0 — so the per-query strides contribute
+// nothing; the rest carry the layout, so a rank-4 [B, S, H, D] step reads the same
+// fields a rank-3 one does.
+struct DecodeAddrs {
+    hd: u32,
+    hd_v: u32,
+    scale: f32,
+    cap: f32,
+    q_abs: u32,
+    part_stride: u32,
+    mask_partial: u32,
+    q_base: u32,
+    k_bh: u32,
+    v_bh: u32,
+    o_base: u32,
+};
+
+fn decode_addrs(row: u32) -> DecodeAddrs {
+    let h = row % params.heads;
+    let b = row / params.heads;
+    // The single query row sits at absolute position seq_k - 1 (past KV preceded
+    // it), so causality compares against that rather than the local position.
+    let q_abs = select(0u, params.seq_k - params.seq_q, params.seq_k >= params.seq_q);
+    // GQA / MQA: several query heads share one KV head. `kv_heads` is always set
+    // (== heads for plain MHA → group 1); the max() guards protect against a
+    // stray 0.
+    let kv_denom = max(params.kv_heads, 1u);
+    let kv_h = h / max(params.heads / kv_denom, 1u);
+    let geom = decode_geom();
+    return DecodeAddrs(
+        params.head_dim,
+        geom.hd_v,
+        bitcast<f32>(params.scale_bits),
+        bitcast<f32>(params.logit_softcap_bits),
+        q_abs,
+        geom.part_stride,
+        params.mask_off + b * params.mask_batch_stride + h * params.mask_head_stride,
+        params.q_off + b * params.q_batch_stride + h * params.q_head_stride,
+        params.k_off + b * params.k_batch_stride + kv_h * params.k_head_stride,
+        params.v_off + b * params.v_batch_stride + kv_h * params.v_head_stride,
+        params.out_off + b * params.o_batch_stride + h * params.o_head_stride,
+    );
+}
+
+// The weighted body: one workgroup per (batch, head) and key range, the key
+// range walked in tiles of `DECODE_KEY_TILE` with each tile's softmax weights
+// kept in workgroup memory, and the value dims split across the lanes
+// (`DECODE_ACC` of them per lane, in registers).
+//
+// This is the shipped form, and what it buys is the per-step constant rather
+// than the walk: the one-pass body below ends by transposing `DECODE_LANES`
+// lane partials of `DECODE_MAX_DIM` value dims through workgroup memory, and
+// carries a `DECODE_MAX_DIM`-wide accumulator per lane in thread memory. Both
+// costs are paid once per step whatever the key count, so they are what a short
+// key range is made of. Here the accumulator is `DECODE_ACC` registers and the
+// only cross-lane reduction is the tile's max: each live lane keeps the tile's
+// weight sum itself, so that sum costs no barrier.
+//
+// A step's key range is split across two workgroups at or above a floor
+// (`attention_route::ATTENTION_DECODE_SPLIT_MIN_KEYS`, 160 keys), one workgroup
+// below it. The floor is a number set from measurement, not a formula, and
+// `tests/attention_decode_step_cost.rs` prints the split depth each extent takes,
+// so the switch is visible there.
+//
+// The softmax is the serial kernel's — max, then `rlx_exp(score - max)`, then a
+// weighted sum — applied per tile with the running pair rebased at the tile
+// boundary exactly as the one-pass body rebases per key. The order the partial
+// sums are combined in therefore differs from that body's (a tile's weights are
+// summed per value dim rather than per key), which is the reassociation a
+// reduction is allowed to make; every transcript, label and score the product
+// emits is unchanged.
 @compute @workgroup_size(DECODE_LANES)
 fn attention_decode(
     @builtin(local_invocation_id) lid3: vec3<u32>,
@@ -311,37 +401,217 @@ fn attention_decode(
     let split = raw % splits;
     let total = params.batch * params.heads * splits;
     if (raw >= total) { return; }
-    let h = row % params.heads;
-    let b = row / params.heads;
-    let hd = params.head_dim;
+    let a = decode_addrs(row);
+    if (a.hd > DECODE_MAX_DIM || a.hd_v > DECODE_MAX_DIM) { return; }
+    for (var d: u32 = lid; d < a.hd; d = d + DECODE_LANES) { dec_q[d] = arena[a.q_base + d]; }
+
+    // This workgroup's key range: `splits` contiguous shares of the walked
+    // extent, so the value walk below reads forward through V. The floor the run
+    // applies keeps every share non-empty.
+    let share = (params.seq_k + splits - 1u) / splits;
+    let k_lo = split * share;
+    let k_hi = min(params.seq_k, k_lo + share);
+
+    // The value dims this lane owns, blocked rather than strided so the pair is
+    // one aligned access and consecutive lanes cover consecutive bytes. A lane
+    // past the value width walks nothing and writes nothing.
+    let d0 = lid * DECODE_ACC;
+    let d1 = d0 + 1u;
+    let d1_in = d1 < a.hd_v;
+    let d1c = min(d1, a.hd_v - 1u);
+    let lane_live = d0 < a.hd_v;
+
+    let hd_unrolled = a.hd & ~(DECODE_UNROLL - 1u);
+    var m: f32 = -3.4e38;
+    var l: f32 = 0.0;
+    var o0: f32 = 0.0;
+    var o1: f32 = 0.0;
+
+    workgroupBarrier();
+    for (var base: u32 = k_lo; base < k_hi; base = base + DECODE_KEY_TILE) {
+        let n = min(DECODE_KEY_TILE, k_hi - base);
+
+        // The tile's scores, this lane's share of them. Same cap, same mask
+        // kinds, same sentinels as the `attention` entry point, and the same
+        // `skip_masked` stand-down of a masked key's K dot; a masked key's score
+        // stays the drop sentinel, and the weight the next pass derives from it
+        // is exactly 0.
+        var lane_m: f32 = -3.4e38;
+        for (var t: u32 = lid; t < n; t = t + DECODE_LANES) {
+            let s = base + t;
+            var mask_v: f32 = 0.0;
+            if (params.mask_kind == 2u || params.mask_kind == 4u) {
+                mask_v = arena[a.mask_partial + s * params.seq_k_stride];
+            }
+            let skip_key =
+                params.skip_masked != 0u && params.mask_kind == 2u && mask_v < BINARY_MASK_KEEP;
+            var score: f32 = BINARY_MASK_DROP;
+            if (!skip_key) {
+                let k_base = a.k_bh + s * params.k_seq_stride;
+                var s0: f32 = 0.0;
+                var s1: f32 = 0.0;
+                var s2: f32 = 0.0;
+                var s3: f32 = 0.0;
+                var s4: f32 = 0.0;
+                var s5: f32 = 0.0;
+                var s6: f32 = 0.0;
+                var s7: f32 = 0.0;
+                var s8: f32 = 0.0;
+                var s9: f32 = 0.0;
+                var s10: f32 = 0.0;
+                var s11: f32 = 0.0;
+                var s12: f32 = 0.0;
+                var s13: f32 = 0.0;
+                var s14: f32 = 0.0;
+                var s15: f32 = 0.0;
+                for (var d: u32 = 0u; d < hd_unrolled; d = d + DECODE_UNROLL) {
+                    s0 = s0 + dec_q[d] * arena[k_base + d];
+                    s1 = s1 + dec_q[d + 1u] * arena[k_base + d + 1u];
+                    s2 = s2 + dec_q[d + 2u] * arena[k_base + d + 2u];
+                    s3 = s3 + dec_q[d + 3u] * arena[k_base + d + 3u];
+                    s4 = s4 + dec_q[d + 4u] * arena[k_base + d + 4u];
+                    s5 = s5 + dec_q[d + 5u] * arena[k_base + d + 5u];
+                    s6 = s6 + dec_q[d + 6u] * arena[k_base + d + 6u];
+                    s7 = s7 + dec_q[d + 7u] * arena[k_base + d + 7u];
+                    s8 = s8 + dec_q[d + 8u] * arena[k_base + d + 8u];
+                    s9 = s9 + dec_q[d + 9u] * arena[k_base + d + 9u];
+                    s10 = s10 + dec_q[d + 10u] * arena[k_base + d + 10u];
+                    s11 = s11 + dec_q[d + 11u] * arena[k_base + d + 11u];
+                    s12 = s12 + dec_q[d + 12u] * arena[k_base + d + 12u];
+                    s13 = s13 + dec_q[d + 13u] * arena[k_base + d + 13u];
+                    s14 = s14 + dec_q[d + 14u] * arena[k_base + d + 14u];
+                    s15 = s15 + dec_q[d + 15u] * arena[k_base + d + 15u];
+                }
+                score = (((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7))) + (((s8 + s9) + (s10 + s11)) + ((s12 + s13) + (s14 + s15)));
+                for (var d: u32 = hd_unrolled; d < a.hd; d = d + 1u) {
+                    score = score + dec_q[d] * arena[k_base + d];
+                }
+                score = score * a.scale;
+                score = mask_score(score, a.cap, s, a.q_abs, params.mask_kind, params.window, mask_v);
+            }
+            dec_scores[t] = score;
+            lane_m = max(lane_m, score);
+        }
+        dec_lane[lid] = lane_m;
+        workgroupBarrier();
+        if (lid == 0u) {
+            var mm: f32 = -3.4e38;
+            for (var i: u32 = 0u; i < DECODE_LANES; i = i + 1u) { mm = max(mm, dec_lane[i]); }
+            dec_pub[0] = mm;
+        }
+        workgroupBarrier();
+
+        // Rebase the running pair onto the tile's max — the one place a tile
+        // boundary moves it — and turn the tile's scores into weights. A tile
+        // that adds no key above the running max leaves `l` and `o` untouched
+        // bit for bit, so the rebase is a no-op there.
+        let m_new = max(m, dec_pub[0]);
+        let e_old = rlx_exp(m - m_new);
+        l = e_old * l;
+        o0 = e_old * o0;
+        o1 = e_old * o1;
+        for (var t: u32 = lid; t < n; t = t + DECODE_LANES) {
+            dec_scores[t] = rlx_exp(dec_scores[t] - m_new);
+        }
+        workgroupBarrier();
+
+        // The value walk: every lane reads every key of the tile, `DECODE_ACC`
+        // value dims of it, so the reads are the tile's V rows and nothing else.
+        // A weight of exactly 0 is a key the mask dropped or the softmax has
+        // out-weighted, and it must add nothing — including a non-finite V there,
+        // the property the one-pass body's `e_cur == 0` early-out has. That is a
+        // `select` rather than a branch: a branch here is one per key and it
+        // costs the loop its load pipelining, which at these extents is the whole
+        // of the walk.
+        if (lane_live) {
+            var o0a = 0.0; var o0b = 0.0; var o0c = 0.0; var o0d = 0.0;
+            var o1a = 0.0; var o1b = 0.0; var o1c = 0.0; var o1d = 0.0;
+            var la = 0.0; var lb = 0.0;
+            var t: u32 = 0u;
+            for (; t + 3u < n; t = t + 4u) {
+                let p0 = dec_scores[t];
+                let p1 = dec_scores[t + 1u];
+                let p2 = dec_scores[t + 2u];
+                let p3 = dec_scores[t + 3u];
+                let w0 = a.v_bh + (base + t) * params.v_seq_stride;
+                let w1 = w0 + params.v_seq_stride;
+                let w2 = w1 + params.v_seq_stride;
+                let w3 = w2 + params.v_seq_stride;
+                la = la + p0 + p1;
+                lb = lb + p2 + p3;
+                o0a = o0a + select(0.0, p0 * arena[w0 + d0], p0 != 0.0);
+                o0b = o0b + select(0.0, p1 * arena[w1 + d0], p1 != 0.0);
+                o0c = o0c + select(0.0, p2 * arena[w2 + d0], p2 != 0.0);
+                o0d = o0d + select(0.0, p3 * arena[w3 + d0], p3 != 0.0);
+                o1a = o1a + select(0.0, p0 * arena[w0 + d1c], (p0 != 0.0) && d1_in);
+                o1b = o1b + select(0.0, p1 * arena[w1 + d1c], (p1 != 0.0) && d1_in);
+                o1c = o1c + select(0.0, p2 * arena[w2 + d1c], (p2 != 0.0) && d1_in);
+                o1d = o1d + select(0.0, p3 * arena[w3 + d1c], (p3 != 0.0) && d1_in);
+            }
+            for (; t < n; t = t + 1u) {
+                let p = dec_scores[t];
+                let w = a.v_bh + (base + t) * params.v_seq_stride;
+                let live = p != 0.0;
+                la = la + p;
+                o0a = o0a + select(0.0, p * arena[w + d0], live);
+                o1a = o1a + select(0.0, p * arena[w + d1c], live && d1_in);
+            }
+            l = l + (la + lb);
+            o0 = o0 + ((o0a + o0b) + (o0c + o0d));
+            o1 = o1 + ((o1a + o1b) + (o1c + o1d));
+        }
+        m = m_new;
+        workgroupBarrier();
+    }
+
+    // Emit: normalised straight into the output row, or unnormalised into this
+    // split's partials for `attention_decode_merge` to rescale onto the merged
+    // max and sum. `l` is the same in every live lane, so lane 0's is the row's.
+    let part_base = (row * splits + split) * a.part_stride;
+    if (splits > 1u) {
+        if (lane_live) {
+            attention_parts[part_base + 2u + d0] = o0;
+            if (d1_in) { attention_parts[part_base + 2u + d1] = o1; }
+        }
+        if (lid == 0u) {
+            attention_parts[part_base] = m;
+            attention_parts[part_base + 1u] = l;
+        }
+    } else if (lane_live) {
+        let inv_l = rlx_div_rn(1.0, select(1.0, l, l > 0.0));
+        arena[a.o_base + d0] = o0 * inv_l;
+        if (d1_in) { arena[a.o_base + d1] = o1 * inv_l; }
+    }
+}
+
+// The one-pass body: every lane keeps its own running (m, l, O[]) over the keys
+// it walks and the lanes are merged at the bottom, which is the same
+// online-softmax rebase the serial kernel does serially — a lane whose partial
+// sits below the merged max contributes `rlx_exp(m - max)` of its own weighting.
+// Only lane 0's reduction of a 64-lane array differs in shape from the serial
+// form — at this width a barrier tree is not worth it.
+//
+// Kept as the A/B arm of the weighted body above and as its escape hatch
+// (`kernels::attention_decode_online_kernel`): it costs a per-step constant the
+// other body does not, and its key walk is a lane per key rather than a lane per
+// value dim.
+@compute @workgroup_size(DECODE_LANES)
+fn attention_decode_online(
+    @builtin(local_invocation_id) lid3: vec3<u32>,
+    @builtin(workgroup_id) wid3: vec3<u32>,
+    @builtin(num_workgroups) ngs: vec3<u32>,
+) {
+    let lid = lid3.x;
+    let splits = params.splits;
+    let raw = wid3.x + wid3.y * ngs.x;
+    let row = raw / splits;
+    let split = raw % splits;
+    let total = params.batch * params.heads * splits;
+    if (raw >= total) { return; }
+    let a = decode_addrs(row);
     let geom = decode_geom();
-    let hd_v = geom.hd_v;
-
-    let scale = bitcast<f32>(params.scale_bits);
-    let cap = bitcast<f32>(params.logit_softcap_bits);
-    // seq_q == 1 on this route, so the single query row is qi = 0, sitting at
-    // absolute position seq_k - 1 — the same `q_abs` the serial kernel derives.
-    let qi = 0u;
-    let q_abs = select(0u, params.seq_k - params.seq_q, params.seq_k >= params.seq_q);
-    let mask_partial = params.mask_off
-        + b  * params.mask_batch_stride
-        + h  * params.mask_head_stride
-        + qi * params.seq_q_stride;
-    let q_base = params.q_off
-        + b * params.q_batch_stride
-        + h * params.q_head_stride
-        + qi * params.q_seq_stride;
-    let kv_denom = max(params.kv_heads, 1u);
-    let kv_h = h / max(params.heads / kv_denom, 1u);
-    let k_bh = params.k_off + b * params.k_batch_stride + kv_h * params.k_head_stride;
-    let v_bh = params.v_off + b * params.v_batch_stride + kv_h * params.v_head_stride;
-    let o_base = params.out_off
-        + b * params.o_batch_stride
-        + h * params.o_head_stride
-        + qi * params.o_seq_stride;
-
-    if (hd > DECODE_MAX_DIM || hd_v > DECODE_MAX_DIM) { return; }
-    for (var d: u32 = lid; d < hd; d = d + DECODE_LANES) { dec_q[d] = arena[q_base + d]; }
+    if (a.hd > DECODE_MAX_DIM || a.hd_v > DECODE_MAX_DIM) { return; }
+    for (var d: u32 = lid; d < a.hd; d = d + DECODE_LANES) { dec_q[d] = arena[a.q_base + d]; }
     workgroupBarrier();
 
     // Running (m, l, O[]) over this lane's share of the keys: lane `lid` takes
@@ -353,18 +623,20 @@ fn attention_decode(
     let hd_v_pad = geom.hd_v_pad;
     for (var d: u32 = 0u; d < hd_v_pad; d = d + 1u) { o[d] = 0.0; }
 
-    // Mirrors the `attention` entry point's key loop — same cap, same mask
-    // kinds, same sentinels, same online-softmax update — with the walk split
-    // across lanes. Keep the two in sync. The key loop itself stays inlined
-    // rather than
-    // factored into a shared helper on purpose: that helper measured ~1.6% on
-    // the prefill path. The mask rule it applies is the shared `mask_score`.
+    // Mirrors the weighted body above — same cap, same mask kinds, same sentinels,
+    // same `skip_masked` stand-down, same online-softmax update — with the walk
+    // split across lanes. This loop, the weighted body's and the serial `attention`
+    // entry's (which carries no stand-down) stay in step by hand, kept inlined
+    // rather than factored into a shared helper on purpose. What bounds the drift is
+    // the parity and CPU-reference digest tests (`tests/attention_decode_digest.rs`,
+    // `tests/attention_mask_skip.rs`), not the compiler. The mask rule all three
+    // apply is the shared `mask_score`.
     // The walks below are DECODE_UNROLL deep, so that many loads are in flight
     // per lane instead of one: a lane would otherwise walk its whole K and V row
     // behind a single dependent accumulate, and 64 lanes is one or two warps
     // depending on the adapter's subgroup width — too few to hide that miss.
-    let hd_unrolled = hd & ~(DECODE_UNROLL - 1u);
-    let hd_v_unrolled = hd_v & ~(DECODE_UNROLL - 1u);
+    let hd_unrolled = a.hd & ~(DECODE_UNROLL - 1u);
+    let hd_v_unrolled = a.hd_v & ~(DECODE_UNROLL - 1u);
     for (var s: u32 = split * DECODE_LANES + lid; s < params.seq_k;
          s = s + splits * DECODE_LANES) {
         // A binary key-padding mask (kind 2) is the one kind whose masked keys
@@ -379,13 +651,13 @@ fn attention_decode(
         // for every mask kind, masked or merely out-weighted.
         var mask_v: f32 = 0.0;
         if (params.mask_kind == 2u || params.mask_kind == 4u) {
-            mask_v = arena[mask_partial + s * params.seq_k_stride];
+            mask_v = arena[a.mask_partial + s * params.seq_k_stride];
         }
         let skip_key =
             params.skip_masked != 0u && params.mask_kind == 2u && mask_v < BINARY_MASK_KEEP;
         var score: f32 = BINARY_MASK_DROP;
         if (!skip_key) {
-            let k_base = k_bh + s * params.k_seq_stride;
+            let k_base = a.k_bh + s * params.k_seq_stride;
             var s0: f32 = 0.0;
             var s1: f32 = 0.0;
             var s2: f32 = 0.0;
@@ -421,11 +693,11 @@ fn attention_decode(
                 s15 = s15 + dec_q[d + 15u] * arena[k_base + d + 15u];
             }
             score = (((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7))) + (((s8 + s9) + (s10 + s11)) + ((s12 + s13) + (s14 + s15)));
-            for (var d: u32 = hd_unrolled; d < hd; d = d + 1u) {
+            for (var d: u32 = hd_unrolled; d < a.hd; d = d + 1u) {
                 score = score + dec_q[d] * arena[k_base + d];
             }
-            score = score * scale;
-            score = mask_score(score, cap, s, q_abs, params.mask_kind, params.window, mask_v);
+            score = score * a.scale;
+            score = mask_score(score, a.cap, s, a.q_abs, params.mask_kind, params.window, mask_v);
         }
         let m_new = max(m, score);
         let e_old = rlx_exp(m - m_new);
@@ -443,7 +715,7 @@ fn attention_decode(
             continue;
         }
         l = e_old * l + e_cur;
-        let v_base = v_bh + s * params.v_seq_stride;
+        let v_base = a.v_bh + s * params.v_seq_stride;
         for (var d: u32 = 0u; d < hd_v_unrolled; d = d + DECODE_UNROLL) {
             o[d] = e_old * o[d] + e_cur * arena[v_base + d];
             o[d + 1u] = e_old * o[d + 1u] + e_cur * arena[v_base + d + 1u];
@@ -462,7 +734,7 @@ fn attention_decode(
             o[d + 14u] = e_old * o[d + 14u] + e_cur * arena[v_base + d + 14u];
             o[d + 15u] = e_old * o[d + 15u] + e_cur * arena[v_base + d + 15u];
         }
-        for (var d: u32 = hd_v_unrolled; d < hd_v; d = d + 1u) {
+        for (var d: u32 = hd_v_unrolled; d < a.hd_v; d = d + 1u) {
             o[d] = e_old * o[d] + e_cur * arena[v_base + d];
         }
         m = m_new;
@@ -493,9 +765,8 @@ fn attention_decode(
 
     // Output: value dims in DECODE_DIM_CHUNK-wide passes. A split writes its
     // `(m, l, O)` partial unnormalised for the merge entry instead of dividing.
-    let part_stride = geom.part_stride;
-    let part_base = (row * splits + split) * part_stride;
-    for (var c: u32 = 0u; c < hd_v; c = c + DECODE_DIM_CHUNK) {
+    let part_base = (row * splits + split) * a.part_stride;
+    for (var c: u32 = 0u; c < a.hd_v; c = c + DECODE_DIM_CHUNK) {
         for (var j: u32 = 0u; j < DECODE_DIM_CHUNK; j = j + 1u) {
             dec_dims[j * DECODE_LANES + lid] = w * o[c + j];
         }
@@ -506,11 +777,11 @@ fn attention_decode(
             for (var i: u32 = 0u; i < DECODE_LANES; i = i + 1u) {
                 acc = acc + dec_dims[lid * DECODE_LANES + i];
             }
-            if (d < hd_v) {
+            if (d < a.hd_v) {
                 if (splits > 1u) {
                     attention_parts[part_base + 2u + d] = acc;
                 } else {
-                    arena[o_base + d] = acc * inv_l;
+                    arena[a.o_base + d] = acc * inv_l;
                 }
             }
         }

@@ -148,12 +148,27 @@ use crate::kernels::{ATTENTION_PARTS_DIM_CHUNK, attention_decode_eligible};
 
 use super::MAX_WORKGROUPS_PER_DIM;
 
-/// Key-range splits one decode attention step runs as: `n` workgroups over
+/// Whether a decode step runs the one-pass body (`attention_decode_online`, a lane
+/// per key with the lane partials transposed at the end) instead of the shipped
+/// weighted one (a lane per value dim, the key weights tiled in workgroup memory),
+/// from `RLX_WGPU_ATTN_DECODE_ONLINE`. Read per run rather than per compile, so one
+/// compiled graph can run either body and a session can alternate them; the lookup
+/// is noise beside a step's tens of microseconds.
+pub(crate) fn decode_online() -> bool {
+    rlx_ir::env::flag("RLX_WGPU_ATTN_DECODE_ONLINE")
+}
+
+/// Key-range splits a decode attention step runs as: `n` workgroups over
 /// disjoint key ranges plus one merge dispatch, or 1 for the single-workgroup
 /// form. The decode form's cost is set by how many workgroups the grid has —
 /// `batch × heads` of them, one or two warps a workgroup depending on the
 /// adapter's subgroup width — so a grid this small leaves the machine idle
 /// while one workgroup walks the whole key range.
+///
+/// The floor's value and provenance are stated once, on `attention_decode` in
+/// `kernels/attention.wgsl`. The talker's 138-key cache bucket is below it and a
+/// recognition rung's plane (193 keys) above it; the readings are
+/// `tests/attention_decode_step_cost.rs`'s.
 ///
 /// Called per run, twice on the same step — once where the uniform write records
 /// the depth and once where the encoder dispatches on it — so the grid, the merge
@@ -188,9 +203,10 @@ pub const ATTENTION_DECODE_SPLITS: u32 = 2;
 /// Above this many rows the grid already fills the machine, so the split buys
 /// nothing and costs a second dispatch.
 pub const ATTENTION_DECODE_SPLIT_MAX_ROWS: u32 = 32;
-/// A split needs keys to give every workgroup a share: below this the
-/// single-workgroup form already covers the range with one pass of its lanes.
-pub const ATTENTION_DECODE_SPLIT_MIN_KEYS: u32 = 256;
+/// Key count at or above which a decode step's range is split across workgroups.
+/// The value is set from measurement; `attention_decode` in
+/// `kernels/attention.wgsl` states it.
+pub const ATTENTION_DECODE_SPLIT_MIN_KEYS: u32 = 160;
 
 /// Bytes the key-range split's partials need: one `[m, l, O[0..pad]]` per
 /// (row, split), the layout both decode entries derive from
@@ -2726,6 +2742,20 @@ mod tests {
         // The partials' layout: two scalars plus a chunk-padded value row.
         assert_eq!(attention_parts_bytes(16, 2, 128), 16 * 2 * 130 * 4);
         assert_eq!(attention_parts_bytes(16, 1, 40), 16 * (2 + 64) * 4);
+        // One key below the floor the single-workgroup form still serves the
+        // step; at the floor the range splits.
+        assert_eq!(
+            attention_decode_key_splits(1, ATTENTION_DECODE_SPLIT_MIN_KEYS - 1, 16, 128, 128),
+            1
+        );
+        assert_eq!(
+            attention_decode_key_splits(1, ATTENTION_DECODE_SPLIT_MIN_KEYS, 16, 128, 128),
+            2
+        );
+        // The floor is a measured number, so it is pinned rather than derived: an
+        // edit here is a change of the route's cost and has to say so. Where the
+        // number comes from is on `attention_decode` in `kernels/attention.wgsl`.
+        assert_eq!(ATTENTION_DECODE_SPLIT_MIN_KEYS, 160);
     }
 
     /// One `Op::Attention` with the two-sided band `w` over rank-4

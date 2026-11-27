@@ -1679,8 +1679,9 @@ pub struct AttentionParams {
     /// Whether a binary key-padding mask (kind 2) may stand a masked key's K dot
     /// product down in the decode entry — the `_pad_k` slot it replaces. `1` is
     /// the shipped behaviour; `RLX_WGPU_NO_ATTN_MASK_SKIP` makes it `0`. The V
-    /// read is not this word's: the entry's `e_cur == 0` early-out stands that
-    /// down for every mask kind, independently of the switch.
+    /// read is not this word's: each body stands a zero-weight key's V down its own
+    /// way — the one-pass body behind an `e_cur == 0` early-out, the weighted body
+    /// behind a `select` — whichever the step runs.
     pub skip_masked: u32,
 
     pub v_batch_stride: u32,
@@ -3601,6 +3602,7 @@ static GATHER_PACKED: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_DECODE_MERGE: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_DECODE: OnceLock<Kernel> = OnceLock::new();
+static ATTENTION_DECODE_ONLINE: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_MASK: OnceLock<Kernel> = OnceLock::new();
 static ATTENTION_BWD: OnceLock<Kernel> = OnceLock::new();
 static ROPE: OnceLock<Kernel> = OnceLock::new();
@@ -5419,9 +5421,14 @@ pub fn attention_kernel(device: &wgpu::Device) -> &'static Kernel {
     })
 }
 /// Decode-shaped attention: one workgroup per (batch, head) and key range, the
-/// sequence walked across the workgroup's lanes. Same WGSL module and same
-/// three-entry bind-group layout as [`attention_kernel`], so the bind group the
-/// lowerer built from that layout drives either pipeline.
+/// value dims split across the workgroup's lanes in the shipped body and the keys
+/// walked across them in the one-pass one. Same WGSL module and same three-entry
+/// bind-group layout as [`attention_kernel`], so the bind group the lowerer built
+/// from that layout drives either pipeline.
+///
+/// Two bodies share the module, and which one a step dispatches is
+/// `attention_route::decode_online()`: this entry is the weighted body,
+/// [`attention_decode_online_kernel`] the one-pass one.
 pub fn attention_decode_kernel(device: &wgpu::Device) -> &'static Kernel {
     ATTENTION_DECODE.get_or_init(|| {
         build_kernel_3_with(
@@ -5429,6 +5436,21 @@ pub fn attention_decode_kernel(device: &wgpu::Device) -> &'static Kernel {
             "rlx-wgpu attention_decode",
             ATTENTION_WGSL,
             "attention_decode",
+            false,
+        )
+    })
+}
+/// The decode entry's one-pass body, the arm the weighted one replaced and the
+/// escape hatch `RLX_WGPU_ATTN_DECODE_ONLINE` selects. Same module, same
+/// bind-group layout and same uniform as [`attention_decode_kernel`]; only the
+/// pipeline differs.
+pub fn attention_decode_online_kernel(device: &wgpu::Device) -> &'static Kernel {
+    ATTENTION_DECODE_ONLINE.get_or_init(|| {
+        build_kernel_3_with(
+            device,
+            "rlx-wgpu attention_decode_online",
+            ATTENTION_WGSL,
+            "attention_decode_online",
             false,
         )
     })
@@ -5985,11 +6007,14 @@ pub const ATTENTION_PARTS_DIM_CHUNK: u32 = 32;
 /// The entry itself also stands a binary-masked key's K dot down (the
 /// `skip_masked` word in its params, `RLX_WGPU_NO_ATTN_MASK_SKIP` to restore
 /// it), which is the body's plane cache: its rows past the written prefix are
-/// exactly the masked keys. The masked key's *V* read is the entry's separate,
-/// ungated `e_cur == 0` early-out, which stands down the value read and the O
-/// update of any key that contributes nothing — every mask kind, on every decode
-/// step — so it is not part of what the switch prices. The step is weight-stream
-/// bound, so a read count moves the cell far less than its bytes do.
+/// exactly the masked keys. A masked key's *V* read is not gated the same way in
+/// the two bodies: the one-pass one stands it down behind an `e_cur == 0`
+/// early-out, while the shipped weighted body reads every key of its tile and
+/// multiplies by the key's weight, which is exactly 0 for a dropped key — a
+/// `select` keeps that 0 from carrying a non-finite V into the sum, so both
+/// bodies give the same answer (`tests/attention_decode_digest.rs` holds them
+/// to it). Either way this is not part of what the switch prices: the step is
+/// weight-stream bound, so a read count moves the cell far less than its bytes do.
 pub fn attention_decode_eligible(seq_q: u32, seq_k: u32, head_dim: u32, v_head_dim: u32) -> bool {
     seq_q == 1
         // Not a floor: a step with no keys has nothing for this form to walk.
@@ -7038,6 +7063,12 @@ mod tests {
         TILED_TILE_U, WIDE_TAIL_M, WideGrid, WideVariant, conv_transpose2d_tiled_grid, wide_grid,
     };
 
+    /// Lanes the decode entry runs, i.e. the shader's `DECODE_LANES`: one key per
+    /// lane in the one-pass body, one share of the value dims per lane in the
+    /// weighted one. A mirror held to the shader by
+    /// [`the_decode_lane_count_is_the_shaders_own`]; no host code reads it.
+    const ATTENTION_DECODE_LANES: u32 = 64;
+
     /// Parse one of this crate's kernels exactly as [`super::kernel_module`] builds
     /// it: with the numeric helpers injected, so a shader that calls `rlx_div_rn` /
     /// `rlx_log` parses here rather than failing on a name the module supplies.
@@ -7687,6 +7718,29 @@ mod tests {
             "the route's decode head ceiling and the shader's `DECODE_MAX_DIM` are one \
              number: a width past the shader's leaves the entry's early return with no \
              output, so the step's slot is written by nobody"
+        );
+    }
+
+    /// The weighted decode body gives each lane `DECODE_MAX_DIM / DECODE_LANES`
+    /// value dims ([`ATTENTION_DECODE_LANES`] is the host's copy of the shader's
+    /// lane count). A lane count that disagrees makes the body cover the head
+    /// width a different number of times, which is a wrong answer rather than a
+    /// slow one.
+    #[test]
+    fn the_decode_lane_count_is_the_shaders_own() {
+        assert!(
+            ATTENTION_WGSL.contains(&format!(
+                "const DECODE_LANES: u32 = {ATTENTION_DECODE_LANES}u;"
+            )),
+            "the weighted body's value-dim split is stated against the shader's \
+             `DECODE_LANES`, so the host's copy and it are one number"
+        );
+        assert_eq!(
+            ATTENTION_DECODE_MAX_HEAD_DIM / ATTENTION_DECODE_LANES,
+            2,
+            "the weighted body spells exactly two value dims per lane (`d0`/`d1`), so a \
+             lane count that gives it more leaves the rest of the head unwritten and \
+             the split merge reading a slot the body never filled"
         );
     }
 

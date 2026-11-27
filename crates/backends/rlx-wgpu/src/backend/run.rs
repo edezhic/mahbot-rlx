@@ -28,21 +28,21 @@ use crate::kernels::{
     activation_backward_kernel, ada_layer_norm_backward_kernel, ada_layer_norm_kernel,
     argmax_kernel, attention_band_kernel, attention_band_rows_for, attention_band_threads,
     attention_bwd_kernel, attention_decode_eligible, attention_decode_kernel,
-    attention_decode_merge_kernel, attention_kernel, attention_mask_kernel, axial_rope2d_kernel,
-    batch_elementwise_region_kernel, batch_norm_inference_bwd_beta_kernel,
-    batch_norm_inference_bwd_gamma_kernel, batch_norm_inference_bwd_input_kernel,
-    batch_norm_inference_kernel, binary_c64_kernel, binary_kernel, cast_f32_to_f16_kernel,
-    cast_kernel, compare_kernel, complex_cast_kernel, complex_norm_sq_backward_kernel,
-    complex_norm_sq_kernel, concat_kernel, concat_many_kernel, concat_vec4_kernel,
-    conjugate_c64_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel, conv1d_implicit_kernel,
-    conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel, conv3d_backward_input_kernel,
-    conv3d_backward_weight_kernel, conv3d_ctile_kernel, conv3d_kernel, copy_kernel,
-    copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel, cumsum_kernel,
-    dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel, double_single_kernel,
-    elementwise_region_kernel, elementwise_region_spatial_kernel, expand_kernel,
-    fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel, fft_butterfly_stage_kernel,
-    fma_kernel, frames_kernel, fused_conv_bias_act_kernel, fused_residual_ln_kernel,
-    fused_residual_ln_tee_kernel, fused_residual_ln_tee_vec4_kernel,
+    attention_decode_merge_kernel, attention_decode_online_kernel, attention_kernel,
+    attention_mask_kernel, axial_rope2d_kernel, batch_elementwise_region_kernel,
+    batch_norm_inference_bwd_beta_kernel, batch_norm_inference_bwd_gamma_kernel,
+    batch_norm_inference_bwd_input_kernel, batch_norm_inference_kernel, binary_c64_kernel,
+    binary_kernel, cast_f32_to_f16_kernel, cast_kernel, compare_kernel, complex_cast_kernel,
+    complex_norm_sq_backward_kernel, complex_norm_sq_kernel, concat_kernel, concat_many_kernel,
+    concat_vec4_kernel, conjugate_c64_kernel, conv_transpose2d_kernel, conv_transpose3d_kernel,
+    conv1d_implicit_kernel, conv1d_kernel, conv1d_tiled_kernel, conv2d_kernel,
+    conv3d_backward_input_kernel, conv3d_backward_weight_kernel, conv3d_ctile_kernel,
+    conv3d_kernel, copy_kernel, copy_sanitize_kernel, cum_scan_kernel, cumsum_backward_kernel,
+    cumsum_kernel, dequant_matmul_kernel, dequant_matmul_mlx_kernel, dequantize_i8_kernel,
+    double_single_kernel, elementwise_region_kernel, elementwise_region_spatial_kernel,
+    expand_kernel, fake_quantize_fixed_kernel, fake_quantize_perbatch_kernel,
+    fft_butterfly_stage_kernel, fma_kernel, frames_kernel, fused_conv_bias_act_kernel,
+    fused_residual_ln_kernel, fused_residual_ln_tee_kernel, fused_residual_ln_tee_vec4_kernel,
     fused_residual_rms_norm_kernel, fused_swiglu_kernel, gated_delta_net_kernel,
     gated_residual_backward_kernel, gated_residual_kernel, gather_axis_kernel,
     gather_backward_acc_kernel, gather_backward_zero_kernel, gather_elements_kernel, gather_kernel,
@@ -880,6 +880,10 @@ impl WgpuExecutable {
                 self.active_extent
             );
         }
+        // The decode entry's body for this run, from `RLX_WGPU_ATTN_DECODE_ONLINE`:
+        // the pipeline the decode step dispatches, read once here rather than per
+        // step.
+        let online = attention_route::decode_online();
         let scale = |full: u32| -> u32 {
             match active {
                 Some((a, u)) if u > 0 => {
@@ -3234,7 +3238,11 @@ impl WgpuExecutable {
                                     // than in the prelude, which would compile
                                     // the shader for graphs that never dispatch
                                     // attention at all.
-                                    attention_decode_kernel(&dev.device)
+                                    if online {
+                                        attention_decode_online_kernel(&dev.device)
+                                    } else {
+                                        attention_decode_kernel(&dev.device)
+                                    }
                                 } else {
                                     attention_kernel(&dev.device)
                                 };

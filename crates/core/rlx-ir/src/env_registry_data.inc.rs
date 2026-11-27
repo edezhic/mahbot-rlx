@@ -4474,7 +4474,16 @@
     EnvVarEntry {
         name: "RLX_WGPU_NO_ATTN_MASK_SKIP",
         group: "wgpu",
-        summary: "Read every key's K dot in the attention decode entry instead of skipping a binary-masked one's (its V read is an unconditional e_cur == 0 early-out)",
+        summary: "Read every key's K dot in the attention decode entry instead of skipping a binary-masked one's (the switch prices the K dot only; a masked key's V read is the body's own)",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Bisect,
+        aliases: &[],
+        layer: EnvLayer::Backend("wgpu"),
+    },
+    EnvVarEntry {
+        name: "RLX_WGPU_ATTN_DECODE_ONLINE",
+        group: "wgpu",
+        summary: "Run the decode attention entry's one-pass body (a lane per key, lane partials transposed at the end) instead of the weighted one (a lane per value dim, key weights tiled in workgroup memory)",
         kind: EnvKind::Bool,
         stability: EnvStability::Bisect,
         aliases: &[],

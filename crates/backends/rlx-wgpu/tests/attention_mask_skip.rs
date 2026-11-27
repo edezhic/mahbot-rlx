@@ -3,19 +3,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The decode entry's masked-key stand-down: a binary key-padding mask (kind 2)
 //! states which keys a row may attend to, and a masked key's score is the
-//! kernel's sentinel whatever its K dot product says. Once the lane's running
-//! max has been set by a valid key, such a key's `e_cur` is exactly 0 and its
-//! `e_old` exactly 1, so its K and V reads cannot reach `m`, `l` or `O` and the
-//! kernel stands them down. (A lane whose *first* key is masked still raises the
-//! max to the sentinel with `e_cur = 1`, so it reads V exactly as before — the
-//! degenerate row's own arithmetic, unchanged.) The body's fixed-capacity plane
-//! cache is the shape this pays on — the rows past the ones the step has written
-//! are exactly those masked keys, and its own query slot is always valid.
-//! `RLX_WGPU_NO_ATTN_MASK_SKIP=1` restores the masked key's K dot; its V read is
-//! stood down either way by the separate, ungated `e_cur == 0` early-out, so the
-//! switch prices the K side only. Both arms compute the CPU reference's numbers,
-//! bit for bit the same: the skipped keys contributed `e_cur = 0` and `0 · V`,
-//! which is what makes the switch safe to hold a frame to.
+//! kernel's sentinel whatever its K dot product says, so its K read can be stood
+//! down (the `skip_masked` word in the entry's params) and its weight is exactly 0
+//! in the value walk. `RLX_WGPU_NO_ATTN_MASK_SKIP=1` restores the masked key's K
+//! dot; the V read is each body's own and not the switch's — the one-pass body
+//! skips a zero-weight key behind an `e_cur == 0` early-out, the weighted body
+//! reads it and multiplies by a weight of exactly 0 behind a `select`, so a
+//! non-finite V there never surfaces either way. Both arms compute the CPU
+//! reference's numbers, bit for bit the same: a masked key's weight is exactly 0 in
+//! either body and `0 · V` is exact, which is what makes the switch safe to hold a
+//! frame to. The body's fixed-capacity plane cache is the shape this pays on — the
+//! rows past the ones the step has written are exactly those masked keys, and its
+//! own query slot is always valid.
 mod common;
 
 use common::{ATTENTION_BAR, data, max_abs_diff};
@@ -25,9 +24,10 @@ use rlx_runtime::{Device, Session};
 
 const HEADS: usize = 8;
 const HEAD_DIM: usize = 64;
-/// More than two passes of the entry's 64 lanes, so a lane walks several keys:
-/// at one key a lane every masked key is a *first* masked key (whose `e_cur` is
-/// 1, not 0), and the V-read stand-down would never be reached.
+/// More than two passes of the entry's 64 lanes, so a lane walks several keys: the
+/// one-pass arm's early-out needs a valid key before the masked ones to reach it
+/// (`e_cur` is 1, not 0, while the lane's max is still the sentinel), and the
+/// plane-cache shape it prices is a written prefix behind a long masked tail.
 const KEYS: usize = 200;
 const WRITTEN: usize = 61;
 
@@ -87,7 +87,7 @@ fn run(g: Graph, inputs: &[(&str, &[f32])]) -> Vec<f32> {
 }
 
 #[test]
-fn a_masked_key_costs_no_read_and_changes_no_value() {
+fn the_mask_skip_switch_reaches_the_step_and_moves_no_value() {
     if rlx_ir::env::skip_unless_device("wgpu", true, rlx_runtime::is_available(Device::Gpu)) {
         return;
     }
@@ -138,8 +138,9 @@ fn a_masked_key_costs_no_read_and_changes_no_value() {
             "{arm}: max_abs {d} against the CPU reference"
         );
     }
-    // `e_cur = 0` and `0 · V` are exact, so the stand-down is a read count and
-    // nothing else — this is the equality the plane-cache digest rests on.
+    // A masked key's weight is exactly 0 and `0 · V` is exact, so the two arms
+    // differ in the K reads they do and in nothing they compute — the equality the
+    // plane-cache digest rests on.
     assert_eq!(
         skipped, read_all,
         "skipping a masked key moved a value the frame computes"

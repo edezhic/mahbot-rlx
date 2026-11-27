@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 837  
+**Registered names:** 838  
 **Unregistered mentions (migration leftovers):** 107
 
 ## Groups
@@ -40,7 +40,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
 - [webgl](#webgl) — 2
-- [wgpu](#wgpu) — 133
+- [wgpu](#wgpu) — 134
 - [xdna](#xdna) — 20
 
 ## compile
@@ -847,6 +847,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_ALL_PARAMS_WEIGHT` | Internal | Bool | Backend(wgpu) | Park every parameter in the weight arena rather than splitting |
 | `RLX_WGPU_ARENA_REPORT` | Internal | Bool | Backend(wgpu) | Report which tensors dominate the activation arena after planning |
 | `RLX_WGPU_ATTENTION_BAND_F32` | Bisect | Bool | Backend(wgpu) | Stage the two-sided band attention kernel's K/V tiles in f32 instead of f16 (the f32 form is also the fallback without SHADER_F16) |
+| `RLX_WGPU_ATTN_DECODE_ONLINE` | Bisect | Bool | Backend(wgpu) | Run the decode attention entry's one-pass body (a lane per key, lane partials transposed at the end) instead of the weighted one (a lane per value dim, key weights tiled in workgroup memory) |
 | `RLX_WGPU_ATTN_DENSE_ONE_ROW` | Bisect | Bool | Backend(wgpu) | Admit the many-row dense attention arrangement from one query row |
 | `RLX_WGPU_COMPILE_REPORT` | Internal | Bool | Backend(wgpu) | Print a compile's phase breakdown: unfuse, plan, arena, init, steps (the schedule and its bind groups), and restarts when the lowering compiled twice |
 | `RLX_WGPU_CONCAT_HOST` | Bisect | Bool | Backend(wgpu) | Run Concat on the host instead of a wgpu kernel |
@@ -922,7 +923,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_MAX_BIND_MB` | Internal | String | Backend(wgpu) | Cap the bind-group size in MiB to exercise the sharding path |
 | `RLX_WGPU_NAN_TRACE` | Bisect | Bool | Backend(wgpu) | Legacy wgpu NaN trace (prefer RLX_DEBUG_NANS) |
 | `RLX_WGPU_NO_ATTN_DECOMPOSE` | Bisect | Bool | Backend(wgpu) | Keep every attention step on its fused one-row-per-workgroup walk instead of the many-row matmul+softmax arrangement |
-| `RLX_WGPU_NO_ATTN_MASK_SKIP` | Bisect | Bool | Backend(wgpu) | Read every key's K dot in the attention decode entry instead of skipping a binary-masked one's (its V read is an unconditional e_cur == 0 early-out) |
+| `RLX_WGPU_NO_ATTN_MASK_SKIP` | Bisect | Bool | Backend(wgpu) | Read every key's K dot in the attention decode entry instead of skipping a binary-masked one's (the switch prices the K dot only; a masked key's V read is the body's own) |
 | `RLX_WGPU_NO_COOP_F16_VK` | Bisect | Bool | Backend(wgpu) | Disable f16 cooperative matrices in the wgpu Vulkan backend |
 | `RLX_WGPU_NO_COOP_F32` | Bisect | Bool | Backend(wgpu) | Disable f32 cooperative matrices |
 | `RLX_WGPU_NO_COOP_F32_EDGE` | Bisect | Bool | Backend(wgpu) | Restore the param-and-aligned-only gate for the f32 cooperative-matrix GEMM |

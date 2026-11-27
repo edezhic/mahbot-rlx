@@ -121,6 +121,10 @@ name = "attention_arm"
 required-features = ["hand-run"]
 
 [[test]]
+name = "attention_decode_form"
+required-features = ["hand-run"]
+
+[[test]]
 name = "body_qk"
 required-features = ["hand-run"]
 

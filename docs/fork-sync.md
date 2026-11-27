@@ -268,6 +268,20 @@ merge action.
   probe inside each group's dot. A sync that takes it back reverts this with no compile
   error and no change to any answer
 - the many-row and split decode attention routes
+- the weighted decode attention body (`attention_decode` in
+  `crates/backends/rlx-wgpu/src/kernels/attention.wgsl`) and the key-range split floor
+  (`attention_route::ATTENTION_DECODE_SPLIT_MIN_KEYS`, 160 keys, was 256; a number set
+  from measurement, stated on `attention_decode` in the shader). The body this fork
+  shipped before it stays as `attention_decode_online`: the A/B arm and the escape hatch
+  `RLX_WGPU_ATTN_DECODE_ONLINE`, picked per run so one compiled graph runs either. The
+  readings are `tests/attention_decode_step_cost.rs` (two arms, paired round by round,
+  each row printing the split depth the run takes) and, on the product's own call,
+  `mahbot-inference`'s `tests/attention_decode_form.rs` (4-6 % off a recognition row,
+  transcripts identical, CPU time flat). `tests/attention_decode_digest.rs` pins the
+  weighted body's output bits, and its
+  `a_masked_key_contributes_nothing_whatever_its_value` holds the dropped-key path to the
+  one-pass body's early-out. A sync that takes the body or the floor back reverts this
+  with no compile error and no change to any answer
 - the head-major attention route's lane inner loops (`head_major_dots` over eight keys
   behind a per-call transposed K, `head_major_weights` over a block of the output's
   columns) in `rlx-cpu`'s `exec_dispatch.rs`: one accumulator per lane, summed in the
