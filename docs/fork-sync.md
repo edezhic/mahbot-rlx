@@ -325,6 +325,24 @@ merge action.
 - the fork-only core surfaces the product calls: the packed gather op in the
   backend's custom lowering, the dequant-guarded memory plan, sample seeds, the
   stream-ceiling probe
+- the graphics planner's elementwise in-place rule
+  (`MemoryPlanOptions::elementwise_in_place`, the `elementwise_in_place` argument of
+  `plan_memory_with_dequant_guard`):
+  an elementwise step writes the buffer it reads, so a chain like `conv → bias-add →
+  activation` holds one block instead of two. It refuses a broadcast or repeated
+  operand, a non-identity view, a boundary tensor and a graph output, and the applied
+  plan is the smaller of the rule's and the ordinary one so no graph's arena can rise.
+  The processor path does not set the flag. Measured on the recognition encoder's
+  compact activation plan: 512 frames 63,176,832 → 39,583,872 B and 768 frames
+  94,765,184 → 59,375,744 B; the wake window's 76-frame encoder 9,377,920 →
+  5,875,840 B (one window) and 18,755,712 → 11,751,552 B (the pair). The whole
+  ladder is in the field's doc. `check_plan` checks that a member's slot *is* its
+  root's block (`PlanFindingKind::InPlaceSlotMismatch`): folding members onto their
+  root would otherwise hide exactly that mistake. The KV row relocation in `buffer.rs`
+  (`place_kv_rows_in_place`) refuses a node that appears in the alias, because moving
+  it off its root's block would break the claim. A sync that re-applies upstream's
+  `memory.rs` without the rule restores the second block on every recognition and
+  wake row with no compile error and no change to any answer
 - `GgufFile::src_handle` in `rlx-gguf` — the one `pread` descriptor the loader's
   split reads share with its single-read route
 - the mel and decode graph caches

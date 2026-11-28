@@ -419,6 +419,7 @@ pub fn plan_f32_uniform_with(graph: &Graph, align: usize, reuse: bool) -> Memory
         arena_size: cursor,
         assignments,
         schedule,
+        in_place: Default::default(),
     }
 }
 

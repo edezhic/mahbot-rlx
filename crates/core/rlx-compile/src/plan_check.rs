@@ -67,6 +67,9 @@ pub enum PlanFindingKind {
     DuplicateSchedule,
     /// A graph output is never produced by the schedule.
     OutputNotScheduled,
+    /// An in-place member's slot is not the block its root occupies, so the
+    /// alias the plan claims is not the one it lays out.
+    InPlaceSlotMismatch,
 }
 
 impl PlanFindingKind {
@@ -76,7 +79,11 @@ impl PlanFindingKind {
     pub const fn is_program_safety(self) -> bool {
         matches!(
             self,
-            Self::LiveOverlap | Self::ReadAfterOverwrite | Self::OutputClobbered | Self::OutOfArena
+            Self::LiveOverlap
+                | Self::ReadAfterOverwrite
+                | Self::OutputClobbered
+                | Self::OutOfArena
+                | Self::InPlaceSlotMismatch
         )
     }
 
@@ -89,6 +96,7 @@ impl PlanFindingKind {
             Self::OrderViolation => "order-violation",
             Self::DuplicateSchedule => "duplicate-schedule",
             Self::OutputNotScheduled => "output-not-scheduled",
+            Self::InPlaceSlotMismatch => "in-place-slot-mismatch",
         }
     }
 }
@@ -116,7 +124,8 @@ pub struct PlanReport {
     pub findings: Vec<PlanFinding>,
     /// Nodes that had an arena assignment and were therefore inspected.
     pub checked_nodes: usize,
-    /// Nodes skipped because they alias another node's storage (views).
+    /// Nodes skipped because they alias another node's storage: views, and the
+    /// elementwise members the planner writes in place.
     pub aliased_nodes: usize,
 }
 
@@ -223,11 +232,12 @@ pub fn check_plan(graph: &Graph, plan: &MemoryPlan) -> PlanReport {
     }
 
     // ── Program safety ──────────────────────────────────────────────────
-    // Views share their parent's bytes by design, so they are not independent
-    // storage and must not be compared against it. Fold each view onto its
-    // root and check roots only.
+    // Views share their parent's bytes by design, and an elementwise step the
+    // planner aliased onto its input (`plan.in_place`) writes the bytes it
+    // read, so neither is independent storage and neither must be compared
+    // against its root. Fold both onto the storage root and check roots only.
     let aliases = collect_view_aliases(graph);
-    let storage_of = |id: NodeId| -> NodeId { aliases.get(&id).map_or(id, |(root, _)| *root) };
+    let storage_of = |id: NodeId| plan.storage_root(id, &aliases);
 
     for (id, slot) in &plan.assignments {
         if slot.offset + slot.size > plan.arena_size {
@@ -243,6 +253,29 @@ pub fn check_plan(graph: &Graph, plan: &MemoryPlan) -> PlanReport {
                 ),
             });
         }
+    }
+
+    // The in-place map asserts that a member's slot *is* its root's block.
+    // Nothing below re-checks it: the scan folds members onto their root, so a
+    // member the plan gave a different slot would simply drop out of it and the
+    // plan would read clean while the step writes bytes another tensor owns.
+    for (&member, &root) in &plan.in_place {
+        let slot = plan.assignments.get(&member);
+        let root_slot = plan.assignments.get(&root);
+        if slot.is_some_and(|s| root_slot.is_some_and(|r| s.offset == r.offset && s.size == r.size))
+        {
+            continue;
+        }
+        findings.push(PlanFinding {
+            kind: PlanFindingKind::InPlaceSlotMismatch,
+            node: member,
+            other: Some(root),
+            detail: format!(
+                "the in-place member's slot {:?} is not its root's {:?}",
+                slot.map(|s| (s.offset, s.size)),
+                root_slot.map(|s| (s.offset, s.size)),
+            ),
+        });
     }
 
     // Liveness, re-derived from the schedule alone (see module docs).

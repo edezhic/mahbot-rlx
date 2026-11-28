@@ -327,20 +327,47 @@ pub struct MemoryPlan {
     /// This field orders the ops; that type describes how one of them drives
     /// the machine.
     pub schedule: Vec<NodeId>,
+    /// Deliberate in-place writes: node → the storage root whose bytes it
+    /// writes. See [`MemoryPlanOptions::elementwise_in_place`]. A member's slot
+    /// is its root's slot by construction, so a consumer of the plan that
+    /// reasons about overlapping live buffers (the plan gate, the arena dump)
+    /// must resolve through this map instead of reporting the overlap as a
+    /// hazard.
+    pub in_place: HashMap<NodeId, NodeId>,
 }
 
 impl MemoryPlan {
-    /// Sum of all assigned buffer sizes (i.e. how much memory the
-    /// plan would use if every node had its own slot). Useful for
-    /// reporting how much the liveness-aware sharing saved.
+    /// Sum of every buffer's own size, with an in-place shared block counted
+    /// once at its chain root — what the plan would use if no two live ranges
+    /// shared bytes. An alias is not an extra buffer, so it adds nothing.
     pub fn total_unshared_bytes(&self) -> usize {
-        self.assignments.values().map(|s| s.size).sum()
+        self.assignments
+            .iter()
+            .filter(|(id, _)| !self.in_place.contains_key(id))
+            .map(|(_, slot)| slot.size)
+            .sum()
     }
 
-    /// Bytes saved vs. naive "every node gets its own slot" — how
-    /// much the liveness analysis bought you.
+    /// Bytes saved vs. that no-sharing plan: the liveness reuse. The in-place
+    /// aliases show in [`Self::arena_size`] itself, not here.
     pub fn bytes_saved(&self) -> usize {
         self.total_unshared_bytes().saturating_sub(self.arena_size)
+    }
+
+    /// The node whose slot holds `id`'s bytes: `id` folded through its view
+    /// parent (`view_aliases`, from [`collect_view_aliases`]) and then through
+    /// [`Self::in_place`]. Both maps point straight at a storage root — views
+    /// resolve to their non-view parent, and an in-place chain records its first
+    /// owner — so one fold of each is complete. Two ids with the same root share
+    /// storage, so a consumer that reasons about overlapping live buffers must
+    /// compare roots rather than the ids themselves.
+    pub fn storage_root(
+        &self,
+        id: NodeId,
+        view_aliases: &HashMap<NodeId, (NodeId, usize)>,
+    ) -> NodeId {
+        let root = view_aliases.get(&id).map_or(id, |(root, _)| *root);
+        self.in_place.get(&root).copied().unwrap_or(root)
     }
 
     /// Render the buffer plan as a one-line-per-node table for
@@ -1469,6 +1496,33 @@ pub struct MemoryPlanOptions {
     /// all small-`m` grouped matmuls — for a backend (Metal) whose transposed
     /// kernel exists only on the decode path.
     pub elide_requires_small_m: bool,
+    /// When true, an elementwise step may write its result into the buffer it
+    /// reads, collapsing a chain like `conv → bias-add → activation` onto one
+    /// block instead of two.
+    ///
+    /// Liveness alone cannot do this: an input dies at its consumer's step, so
+    /// the two live ranges touch there and the allocator must keep them apart.
+    /// The arithmetic does not need it — every elementwise step reads element
+    /// `i` of its input and writes element `i` of its output — so the second
+    /// block is memory bought for nothing. The rule refuses an operand that is
+    /// broadcast or read more than once, a non-identity view between the two
+    /// (only a reshape or an identity cast is followed, even when a narrow
+    /// keeps the index), a boundary tensor, and a graph output; see
+    /// `elementwise_in_place_chains`.
+    ///
+    /// Off by default. The processor path's plans stay as they are; the
+    /// graphics planner turns it on (its elementwise kernels index one arena
+    /// binding by element, so the read and the write are the same bytes).
+    ///
+    /// Measured on the recognition encoder's compact activation plan (M3 Pro,
+    /// 2026-11-27), before → after in bytes: 128 frames 15,794,304 →
+    /// 9,896,064; 256 31,588,480 → 19,792,000; 384 47,382,656 → 29,687,936;
+    /// 512 63,176,832 → 39,583,872; 640 78,971,008 → 49,479,808; 768
+    /// 94,765,184 → 59,375,744. The wake window's 76-frame encoder falls
+    /// 9,377,920 → 5,875,840 B (one window) and 18,755,712 → 11,751,552 B
+    /// (the pair). The applied plan is the smaller of this rule's and the
+    /// ordinary one, so no graph's arena can rise.
+    pub elementwise_in_place: bool,
 }
 
 impl MemoryPlanOptions {
@@ -1484,6 +1538,7 @@ impl MemoryPlanOptions {
             elide_bank_transposes: false,
             fold_conv3d_epilogue: false,
             elide_requires_small_m: false,
+            elementwise_in_place: false,
         }
     }
 
@@ -1500,6 +1555,7 @@ impl MemoryPlanOptions {
             elide_bank_transposes: false,
             fold_conv3d_epilogue: false,
             elide_requires_small_m: false,
+            elementwise_in_place: false,
         }
     }
 }
@@ -1758,18 +1814,25 @@ pub enum GuardedPlanner {
     F32UniformNoParams,
     Native,
     Hybrid,
+    /// [`plan_memory_f32_uniform_no_params`]'s shape under [`plan_memory_hybrid`]'s
+    /// widths: half activations at two bytes, parameters left for the caller to place.
+    HybridNoParams,
 }
 
 impl GuardedPlanner {
     /// The planner's options, apart from the dequant guard the caller derives.
     fn options(self, graph: &Graph, dequant_host_read_deferred: bool) -> MemoryPlanOptions {
         MemoryPlanOptions {
-            allocate_params: !matches!(self, GuardedPlanner::F32UniformNoParams),
+            allocate_params: !matches!(
+                self,
+                GuardedPlanner::F32UniformNoParams | GuardedPlanner::HybridNoParams
+            ),
             pin_output_ancestors: match self {
                 GuardedPlanner::F32Uniform => f32_uniform_output_ancestor_pin(graph),
                 GuardedPlanner::F32UniformNoParams
                 | GuardedPlanner::Native
-                | GuardedPlanner::Hybrid => graph_has_host_indexing(graph),
+                | GuardedPlanner::Hybrid
+                | GuardedPlanner::HybridNoParams => graph_has_host_indexing(graph),
             },
             dequant_host_fallback: dequant_host_read_deferred,
             ..MemoryPlanOptions::default()
@@ -1783,7 +1846,7 @@ impl GuardedPlanner {
                 ArenaWidthPolicy::F32Uniform
             }
             GuardedPlanner::Native => ArenaWidthPolicy::Native,
-            GuardedPlanner::Hybrid => ArenaWidthPolicy::Hybrid,
+            GuardedPlanner::Hybrid | GuardedPlanner::HybridNoParams => ArenaWidthPolicy::Hybrid,
         }
     }
 }
@@ -1804,32 +1867,22 @@ pub fn plan_memory_f32_uniform_no_params(graph: &Graph, alignment: usize) -> Mem
 
 /// [`GuardedPlanner`]'s planners with the deferred-host `DequantMatMul` guard
 /// supplied by the caller rather than inherited from the conservative
-/// [`MemoryPlanOptions::dequant_host_fallback`] default.
+/// [`MemoryPlanOptions::dequant_host_fallback`] default, and
+/// [`MemoryPlanOptions::elementwise_in_place`] from `elementwise_in_place` — the
+/// graphics planner's rule, for a backend whose elementwise kernels read one
+/// arena binding by element and write the same binding by the same index.
 pub fn plan_memory_with_dequant_guard(
     graph: &Graph,
     alignment: usize,
     planner: GuardedPlanner,
     dequant_host_read_deferred: bool,
+    elementwise_in_place: bool,
 ) -> MemoryPlan {
-    plan_memory_with_options_policy(
-        graph,
-        alignment,
-        planner.options(graph, dequant_host_read_deferred),
-        planner.width(),
-    )
-}
-
-/// [`plan_memory_f32_uniform_no_params`] with the [`plan_memory_hybrid`]
-/// widths: f16/bf16 activations at two bytes. For a backend's split arena
-/// over a graph whose half activations it packs (rlx-wgpu's
-/// `pack_half_activations`).
-pub fn plan_memory_hybrid_no_params(graph: &Graph, alignment: usize) -> MemoryPlan {
     let opts = MemoryPlanOptions {
-        pin_output_ancestors: graph_has_host_indexing(graph),
-        allocate_params: false,
-        ..MemoryPlanOptions::default()
+        elementwise_in_place,
+        ..planner.options(graph, dequant_host_read_deferred)
     };
-    plan_memory_aligned_inner(graph, alignment, opts, None, ArenaWidthPolicy::Hybrid)
+    plan_memory_with_options_policy(graph, alignment, opts, planner.width())
 }
 
 /// True when the graph indexes with a **data-dependent** index tensor.
@@ -2113,7 +2166,208 @@ fn with_plan_verify<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Elementwise steps that may write their result into the buffer they read.
+///
+/// Returns `member → storage root`. The caller merges each root's live range
+/// over its members, skips the members when it collects buffers, and points
+/// their slots at the root's. A member's output then occupies the same bytes
+/// its input did, which is the same arithmetic on the same values.
+///
+/// A step qualifies only when its write lands on the element it read:
+///
+/// * the aliased operand is not broadcast: its shape must equal the output's — same
+///   dims and same dtype — and its slot the same size. The shape test alone refuses a
+///   broadcast, which changes the dims, and a dtype change, whose half-width output of
+///   the same dims would cover only half the operand's bytes; the size test catches the
+///   width policy splitting them, a custom kernel's input keeping its declared two
+///   bytes while the f16 activation feeding it is widened to four. Neither subsumes the
+///   other. The backend's dense index is `i`, not `(i / rep) % len`;
+/// * it is read exactly once in the whole graph, so `x + x` and a second view of
+///   the same tensor are refused;
+/// * the path from the storage root to that operand is a reshape or an identity
+///   cast only; any other view — a narrow, a transpose — is refused even when it
+///   happens to keep the index, because the rule does not try to prove that it
+///   does;
+/// * the root is not an input, a parameter, a constant or a graph output;
+/// * a fused region carries no prologue and its `input_modulus` for the operand
+///   is `0` (dense), not a trailing broadcast.
+fn elementwise_in_place_chains(
+    graph: &Graph,
+    width: ArenaWidthPolicy,
+    keep_native: &std::collections::HashSet<NodeId>,
+) -> HashMap<NodeId, NodeId> {
+    // Operand occurrences, not reader nodes: a node that reads the same root
+    // twice (`x + x`) must not qualify, and neither must two readers.
+    let mut reads: HashMap<NodeId, usize> = HashMap::new();
+    for node in graph.nodes() {
+        if is_pure_view(graph, node) {
+            continue;
+        }
+        for &input in &node.inputs {
+            let (root, _) = resolve_view_root(graph, input);
+            *reads.entry(root).or_default() += 1;
+        }
+    }
+    let outputs: std::collections::HashSet<NodeId> = graph
+        .outputs
+        .iter()
+        .map(|&out| resolve_view_root(graph, out).0)
+        .collect();
+
+    let mut in_place: HashMap<NodeId, NodeId> = HashMap::new();
+    for node in graph.nodes() {
+        if is_pure_view(graph, node) || !writes_one_element_per_read(&node.op) {
+            continue;
+        }
+        let node_size = node_slot_bytes(node, width, keep_native.contains(&node.id));
+        let candidate = node.inputs.iter().enumerate().find_map(|(slot, &input)| {
+            let (root, _) = resolve_view_root(graph, input);
+            let root_node = graph.node(root);
+            let size = node_slot_bytes(root_node, width, keep_native.contains(&root));
+            (root != node.id
+                && size > 0
+                && size == node_size
+                && root_node.shape == node.shape
+                && reads.get(&root).copied() == Some(1)
+                && !matches!(
+                    root_node.op,
+                    Op::Param { .. } | Op::Input { .. } | Op::Constant { .. }
+                )
+                && !outputs.contains(&root)
+                && operand_is_dense(node, slot)
+                && reads_same_element(graph, input, root))
+            .then_some(root)
+        });
+        let Some(root) = candidate else { continue };
+        // A chain: the root may itself be a member, and the whole chain shares
+        // the first owner's block.
+        in_place.insert(node.id, in_place.get(&root).copied().unwrap_or(root));
+    }
+    in_place
+}
+
+/// True when the op computes each output element from the input element at the
+/// same linear index, and nothing else — the precondition for overwriting that
+/// input. Fused transform/batch regions are excluded outright; a plain
+/// elementwise region's prologue and per-operand modulus are checked separately.
+fn writes_one_element_per_read(op: &Op) -> bool {
+    match op {
+        Op::ElementwiseRegion { prologue, .. } => *prologue == rlx_ir::op::RegionPrologue::None,
+        // A batch region's lanes are not one element per read.
+        Op::BatchElementwiseRegion { .. } => false,
+        _ => op.is_elementwise(),
+    }
+}
+
+/// True when operand `slot` of `node` is read densely — the same index it is
+/// written at. Only a fused region carries a broadcast modulus; every other op
+/// is held to the shape check in [`elementwise_in_place_chains`].
+fn operand_is_dense(node: &rlx_ir::Node, slot: usize) -> bool {
+    match &node.op {
+        Op::ElementwiseRegion {
+            input_modulus,
+            num_inputs,
+            ..
+        } => slot < *num_inputs as usize && input_modulus.get(slot).copied() == Some(0),
+        _ => true,
+    }
+}
+
+/// True when `input` reaches `root` through the views that keep the element
+/// order — `Reshape` and identity `Cast` — and nothing else. A narrow or a
+/// transpose is refused even when it keeps the index: the rule proves the
+/// identity instead of testing it.
+fn reads_same_element(graph: &Graph, input: NodeId, root: NodeId) -> bool {
+    let mut id = input;
+    while id != root {
+        let node = graph.node(id);
+        match &node.op {
+            Op::Reshape { .. } => id = node.inputs[0],
+            Op::Cast { to } if graph.node(node.inputs[0]).shape.dtype() == *to => {
+                id = node.inputs[0];
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// A scheduled node's live range, or a refusal.
+///
+/// The in-place merge widens a chain's block from its first member's birth to its
+/// last member's death; a node without a range would silently widen it to the
+/// wrong interval, so a missing one is an invariant failure, not a default.
+fn live_range(ranges: &HashMap<NodeId, (usize, usize)>, id: NodeId) -> (usize, usize) {
+    *ranges
+        .get(&id)
+        .unwrap_or_else(|| panic!("in-place merge: {id} has no live range"))
+}
+
+/// Give every member of an in-place chain its block's live range: the union of the
+/// members' own ranges, from the first member's birth to the last one's death.
+fn merge_in_place_ranges(
+    ranges: &mut HashMap<NodeId, (usize, usize)>,
+    in_place: &HashMap<NodeId, NodeId>,
+) {
+    let mut group: HashMap<NodeId, (usize, usize)> = HashMap::new();
+    for (&member, &root) in in_place {
+        let (birth, death) = live_range(ranges, member);
+        let entry = group
+            .entry(root)
+            .or_insert_with(|| live_range(ranges, root));
+        entry.0 = entry.0.min(birth);
+        entry.1 = entry.1.max(death);
+    }
+    for (&member, &root) in in_place {
+        let range = group[&root];
+        ranges.insert(member, range);
+    }
+    for (root, range) in group {
+        ranges.insert(root, range);
+    }
+}
+
 fn plan_memory_aligned_inner(
+    graph: &Graph,
+    alignment: usize,
+    opts: MemoryPlanOptions,
+    weights: Option<&SharedWeightLayout>,
+    width: ArenaWidthPolicy,
+) -> MemoryPlan {
+    let plan = plan_memory_aligned_once(graph, alignment, opts, weights, width);
+    if !opts.elementwise_in_place || plan.in_place.is_empty() {
+        return plan;
+    }
+    // Merging live ranges can in principle pack worse than two touching ones:
+    // an unrelated buffer may have reused the first member's bytes after its
+    // old death. Take the smaller plan, so a graphics graph can only fall.
+    let plain = plan_memory_aligned_once(
+        graph,
+        alignment,
+        MemoryPlanOptions {
+            elementwise_in_place: false,
+            ..opts
+        },
+        weights,
+        width,
+    );
+    let (chosen, rule) = if plain.arena_size < plan.arena_size {
+        (plain, "off")
+    } else {
+        (plan, "on")
+    };
+    // Two plans were laid out, and the dump and the self-check each ran for both.
+    // Name the one the graph is built at, so either output says which block it is.
+    if rlx_ir::env::flag("RLX_ARENA_REPORT") || rlx_ir::env::flag("RLX_MEM_VERIFY") {
+        eprintln!(
+            "[arena-plan] in force: rule={rule} arena_size={}",
+            chosen.arena_size
+        );
+    }
+    chosen
+}
+
+fn plan_memory_aligned_once(
     graph: &Graph,
     alignment: usize,
     opts: MemoryPlanOptions,
@@ -2142,12 +2396,26 @@ fn plan_memory_aligned_inner(
     }
 
     let keep_native = native_width_nodes(graph, width);
+    let in_place = if opts.elementwise_in_place && !opts.arena_no_reuse {
+        elementwise_in_place_chains(graph, width, &keep_native)
+    } else {
+        HashMap::new()
+    };
+    // The block a chain shares is live from the first member's birth to the last
+    // member's death, and every member sits in it.
+    if !in_place.is_empty() {
+        merge_in_place_ranges(&mut ranges, &in_place);
+    }
     let readers = opts.elide_bank_transposes.then(|| ReaderIndex::new(graph));
     let mut buffers: Vec<BufInfo> = Vec::new();
     for node in graph.nodes() {
         // Skip view nodes — they alias their parent's buffer (handled
         // in the post-pass below). Plan #46.
         if pure_view_offset(graph, node).is_some() {
+            continue;
+        }
+        // In-place members take their chain root's slot (assigned below).
+        if in_place.contains_key(&node.id) {
             continue;
         }
         // Folded into its consumers' GEMMs, so never written or read. (The
@@ -2362,6 +2630,24 @@ fn plan_memory_aligned_inner(
         }
     }
 
+    // ── In-place members (write where they read) ──────────────
+    // A member writes into its chain root's block; the root owns the
+    // allocation above and its live range already covers the whole chain.
+    for (&member, &root) in &in_place {
+        let root_slot = assignments.get(&root).cloned().expect(
+            "an in-place root is always allocated: the rule refuses a boundary, \
+             zero-size or output root, and an elementwise reader blocks transpose elision",
+        );
+        let size = node_slot_bytes(graph.node(member), width, keep_native.contains(&member));
+        assignments.insert(
+            member,
+            BufferSlot {
+                offset: root_slot.offset,
+                size,
+            },
+        );
+    }
+
     // ── View aliasing pass (plan #46) ────────────────────────
     // Every view node points at its root buffer's slot, offset by the
     // accumulated view offset. The root has its own allocation above;
@@ -2399,7 +2685,8 @@ fn plan_memory_aligned_inner(
     //     RLX_ARENA_REPORT=1 cargo test ... 2>&1 | grep arena-plan
     //
     // `op` is the producing op kind, `root` the view root for view nodes (which
-    // own no buffer and borrow their root's bytes).
+    // own no buffer and borrow their root's bytes), or the chain root for an
+    // in-place member (which writes the bytes it read).
     if rlx_ir::env::flag("RLX_ARENA_REPORT") {
         let mut rows: Vec<(usize, usize, NodeId)> = assignments
             .iter()
@@ -2407,20 +2694,27 @@ fn plan_memory_aligned_inner(
             .collect();
         rows.sort();
         eprintln!(
-            "[arena-plan] arena_size={arena_size} slots={} buffers={}",
+            "[arena-plan] rule={} arena_size={arena_size} slots={} buffers={} in_place={}",
+            if opts.elementwise_in_place {
+                "on"
+            } else {
+                "off"
+            },
             rows.len(),
-            buffers.len()
+            buffers.len(),
+            in_place.len()
         );
         eprintln!("[arena-plan] offset\tend\tsize\tnode\top\tbirth\tdeath\troot\tinputs");
         for (off, size, id) in rows {
             let node = graph.node(id);
             let (birth, death) = ranges.get(&id).copied().unwrap_or((0, 0));
-            let root = match pure_view_offset(graph, node) {
-                Some(_) => {
+            let root = match (in_place.get(&id), pure_view_offset(graph, node)) {
+                (Some(&root), _) => format!("in place of {root}"),
+                (None, Some(_)) => {
                     let (r, o) = resolve_view_root(graph, id);
                     format!("view of {r}+{o}")
                 }
-                None => String::from("-"),
+                (None, None) => String::from("-"),
             };
             let ins: Vec<String> = node.inputs.iter().map(|i| format!("{i}")).collect();
             eprintln!(
@@ -2536,6 +2830,7 @@ fn plan_memory_aligned_inner(
         arena_size,
         assignments,
         schedule,
+        in_place,
     };
     if let Some(w) = weights {
         w.apply_to_plan(graph, &mut plan);
@@ -3165,5 +3460,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A member the merge cannot place is a broken invariant, not a zero range:
+    /// defaulting it would silently shrink the block's live interval.
+    #[test]
+    #[should_panic(expected = "has no live range")]
+    fn the_in_place_merge_refuses_a_member_without_a_range() {
+        let root = NodeId(1);
+        let member = NodeId(2);
+        let mut ranges: HashMap<NodeId, (usize, usize)> = HashMap::new();
+        ranges.insert(root, (0, 4));
+        let in_place: HashMap<NodeId, NodeId> = [(member, root)].into_iter().collect();
+        merge_in_place_ranges(&mut ranges, &in_place);
     }
 }

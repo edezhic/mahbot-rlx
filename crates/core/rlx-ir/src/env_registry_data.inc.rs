@@ -354,6 +354,15 @@
         layer: EnvLayer::Backend("wgpu"),
     },
     EnvVarEntry {
+        name: "RLX_WGPU_NO_INPLACE",
+        group: "wgpu",
+        summary: "Turn off the graphics memory planner's elementwise in-place rule — a chain like conv → bias-add → activation gets two blocks instead of one; the A/B arm for the rule's exactness and arena reading",
+        kind: EnvKind::Bool,
+        stability: EnvStability::Bisect,
+        aliases: &[],
+        layer: EnvLayer::Backend("wgpu"),
+    },
+    EnvVarEntry {
         name: "RLX_WGPU_SNAPSHOT_FROM",
         group: "gpu",
         summary: "First step RLX_WGPU_SNAPSHOT reports (default 1); the prefix still runs, so values stay real",

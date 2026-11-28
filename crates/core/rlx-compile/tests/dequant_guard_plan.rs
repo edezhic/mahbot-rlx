@@ -305,7 +305,7 @@ fn wgpu_plan(g: &Graph, guard: bool, with_params: bool) -> MemoryPlan {
     } else {
         GuardedPlanner::F32UniformNoParams
     };
-    plan_memory_with_dequant_guard(g, 16, planner, guard)
+    plan_memory_with_dequant_guard(g, 16, planner, guard, false)
 }
 
 /// Every test here reads or writes process-global planner switches (`rlx_ir::env`
@@ -354,7 +354,7 @@ fn the_derived_entry_point_mirrors_every_planner_it_replaces() {
                 ),
             ];
             for (planner, named) in cases {
-                let derived = plan_memory_with_dequant_guard(&g, 16, planner, true);
+                let derived = plan_memory_with_dequant_guard(&g, 16, planner, true, false);
                 let what = format!("override={override_on} planner={planner:?}");
                 assert_eq!(
                     derived.arena_size, named.arena_size,

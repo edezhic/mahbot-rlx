@@ -13,7 +13,7 @@ semantics. Curated Public list: `just env-catalog`.
 | Internal | Bench / tooling |
 | Deprecated | Use replace_with |
 
-**Registered names:** 838  
+**Registered names:** 839  
 **Unregistered mentions (migration leftovers):** 107
 
 ## Groups
@@ -40,7 +40,7 @@ semantics. Curated Public list: `just env-catalog`.
 - [tpu](#tpu) — 4
 - [vulkan](#vulkan) — 19
 - [webgl](#webgl) — 2
-- [wgpu](#wgpu) — 134
+- [wgpu](#wgpu) — 135
 - [xdna](#xdna) — 20
 
 ## compile
@@ -944,6 +944,7 @@ semantics. Curated Public list: `just env-catalog`.
 | `RLX_WGPU_NO_FUSED_SWIGLU` | Bisect | Bool | Backend(wgpu) | Expand FusedSwiGLU into narrow, silu and multiply, so each emits its own step |
 | `RLX_WGPU_NO_GATHER_INDEX_BIAS` | Bisect | Bool | Backend(wgpu) | Disable folding a constant index offset into the gather |
 | `RLX_WGPU_NO_GEMV` | Bisect | Bool | Backend(wgpu) | Use the tiled matmul for m <= 4 too, instead of the decode GEMV kernel |
+| `RLX_WGPU_NO_INPLACE` | Bisect | Bool | Backend(wgpu) | Turn off the graphics memory planner's elementwise in-place rule — a chain like conv → bias-add → activation gets two blocks instead of one; the A/B arm for the rule's exactness and arena reading |
 | `RLX_WGPU_NO_LN_TEE` | Bisect | Bool | Backend(wgpu) | Disable the residual-and-norm tee, so the add and the norm emit their own steps |
 | `RLX_WGPU_NO_NORM_ROPE` | Bisect | Bool | Backend(wgpu) | Disable the norm-plus-rotation fold, so both emit their own steps |
 | `RLX_WGPU_NO_PACKED_BSHD_ATTN` | Bisect | Bool | Backend(wgpu) | Disable the packed BSHD attention kernel on wgpu |

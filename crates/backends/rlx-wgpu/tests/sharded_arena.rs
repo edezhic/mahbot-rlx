@@ -50,6 +50,7 @@ fn fake_plan(arena_size: usize, slots: &[(u32, usize, usize)]) -> MemoryPlan {
         arena_size,
         assignments,
         schedule: Vec::new(),
+        in_place: Default::default(),
     }
 }
 

@@ -1125,6 +1125,7 @@ mod shard_pack_tests {
                 ),
             ]),
             schedule: Vec::new(),
+            in_place: Default::default(),
         };
         snap_plan_to_shards_ex(&mut plan, shard_cap, stage_reserve);
         for a in plan.assignments.values() {
@@ -1154,6 +1155,7 @@ mod shard_pack_tests {
                 },
             )]),
             schedule: Vec::new(),
+            in_place: Default::default(),
         };
         snap_plan_to_shards_ex(&mut plan, shard_cap, stage_reserve);
         assert!(

@@ -892,6 +892,7 @@ pub fn plan_f32_uniform_with_half(
         arena_size,
         assignments,
         schedule,
+        in_place: Default::default(),
     }
 }
 

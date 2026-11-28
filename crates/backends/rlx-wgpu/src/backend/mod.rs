@@ -1256,6 +1256,7 @@ impl WgpuExecutable {
             weight_share: None,
             weight_written: std::sync::Mutex::new(HashSet::new()),
             plan_slots: HashMap::new(),
+            in_place: None,
             param_slots: HashMap::new(),
         };
         Self {

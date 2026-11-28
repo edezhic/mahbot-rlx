@@ -334,6 +334,10 @@ name = "elementwise_broadcast_cost"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "elementwise_in_place"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "empty_tensor_arena_slot"
 required-features = ["backend-tests"]
 

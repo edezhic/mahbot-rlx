@@ -2518,9 +2518,15 @@ fn compile_static_with(
                     // through barrier-ordered workgroup memory. The norm aliasing
                     // an operand EXACTLY (same offset, same length) is therefore
                     // safe: row r's writes land on the lanes those same threads
-                    // have already read. Only a partial or shifted overlap is
-                    // fatal, and it only ever comes from a *different* dispatch,
-                    // which clobbers the bytes before the tee runs.
+                    // have already read. The residual add is not in this scan at
+                    // all (`pos <= add_pos` above): it is fused into this
+                    // dispatch, so no separate step writes its sum — with the
+                    // in-place planner's shape the sum lands where the add read
+                    // `h`, and that block stays live to the norm's step, which is
+                    // what keeps the planner from handing it to anything else.
+                    // Only a partial or shifted overlap is fatal, and it only
+                    // ever comes from a *different* dispatch, which clobbers the
+                    // bytes before the tee runs.
                     let hit = operands.iter().any(|&(os, oe)| {
                         let overlaps = ws < oe && we > os;
                         let exact_self_alias = n.id == **ln_id && ws == os && we == oe;
@@ -15937,8 +15943,12 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
     // producer and the consumer, so it is blind to in-place aliasing — and an
     // in-place kernel that does not read its whole input before writing (or
     // whose lanes are not row-private) corrupts silently. Views are excluded:
-    // aliasing a parent is what a view IS.
+    // aliasing a parent is what a view IS. So is an alias the planner made on
+    // purpose (`plan.in_place`): those are elementwise by construction.
+    let view_roots = rlx_opt::memory::collect_view_aliases(graph);
+    let root_of = |id: NodeId| plan.storage_root(id, &view_roots);
     let mut inplace = 0usize;
+    let mut deliberate = 0usize;
     for (&consumer, &cpos) in &pos {
         let Some(node) = graph.nodes().iter().find(|n| n.id == consumer) else {
             continue;
@@ -15959,6 +15969,10 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
             };
             let (ilo, ihi) = (ir2.off, ir2.end());
             if or.overlaps(&ir2) {
+                if plan.in_place.get(&consumer).copied() == Some(root_of(input)) {
+                    deliberate += 1;
+                    continue;
+                }
                 inplace += 1;
                 if inplace <= 20 {
                     eprintln!(
@@ -15976,7 +15990,7 @@ fn report_slot_hazards(graph: &Graph, plan: &rlx_opt::memory::MemoryPlan) {
         }
     }
     eprintln!(
-        "[rlx-wgpu] hazard scan: {found} write-after-read hazard(s) ({real_hazards} not view-explained), {inplace} in-place          output/input overlap(s) over {} scheduled nodes",
+        "[rlx-wgpu] hazard scan: {found} write-after-read hazard(s) ({real_hazards} not view-explained), {inplace} in-place          output/input overlap(s) over {} scheduled nodes ({deliberate} planned in place)",
         plan.schedule.len()
     );
 }

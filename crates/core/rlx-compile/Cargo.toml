@@ -46,6 +46,10 @@ name = "dynamic"
 required-features = ["backend-tests"]
 
 [[test]]
+name = "elementwise_in_place_plan"
+required-features = ["backend-tests"]
+
+[[test]]
 name = "hardening"
 required-features = ["backend-tests"]
 

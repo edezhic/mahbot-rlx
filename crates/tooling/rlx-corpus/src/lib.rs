@@ -135,12 +135,22 @@ fn planners() -> Vec<Planner> {
     }
     // The two configurations `rlx-wgpu` plans with, mirroring
     // `rlx_wgpu::buffer::plan_f32_uniform` and the `Arena::from_plan_split` re-plan:
-    // align 16, f32-uniform, guard derived off. No other entry here covers wgpu's.
+    // align 16, f32-uniform, guard derived off, and the in-place rule under the same
+    // `RLX_WGPU_NO_INPLACE` arm the backend reads. No other entry here covers wgpu's.
+    fn wgpu_in_place() -> bool {
+        !rlx_ir::env::flag("RLX_WGPU_NO_INPLACE")
+    }
     fn wgpu_dequant_unpinned(g: &Graph) -> MemoryPlan {
-        plan_memory_with_dequant_guard(g, 16, GuardedPlanner::F32Uniform, false)
+        plan_memory_with_dequant_guard(g, 16, GuardedPlanner::F32Uniform, false, wgpu_in_place())
     }
     fn wgpu_dequant_unpinned_no_params(g: &Graph) -> MemoryPlan {
-        plan_memory_with_dequant_guard(g, 16, GuardedPlanner::F32UniformNoParams, false)
+        plan_memory_with_dequant_guard(
+            g,
+            16,
+            GuardedPlanner::F32UniformNoParams,
+            false,
+            wgpu_in_place(),
+        )
     }
     vec![
         ("default", plan_memory),

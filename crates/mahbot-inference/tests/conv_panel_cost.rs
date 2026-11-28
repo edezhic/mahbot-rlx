@@ -20,9 +20,11 @@
 //! was over it, and it runs 8 847 360 → 15 482 880 B across this ladder (2 → 7 even chunks)
 //! against 17 694 720 → 106 168 320 B whole, both pinned by
 //! `backend::conv_route_decision_tests`' ladder — beside both arms' `arena_bytes`, which is
-//! what a row actually holds, and both arms' `im2col_gpu` / `matmul` / `conv2d` counts, which
-//! are the schedule half: a chunk is one gather and one multiply, so the two arms differ by
-//! exactly the chunks the cut added and by nothing else.
+//! what a row actually holds, the compact activation plan the split arena is built from, and
+//! both arms' `im2col_gpu` / `matmul` / `conv2d` counts, which are the schedule half: a chunk
+//! is one gather and one multiply, so the two arms differ by exactly the chunks the cut added
+//! and by nothing else. Both columns of the elementwise in-place ladder are this probe:
+//! `RLX_WGPU_NO_INPLACE=1` plans the plain layout, unset the shipped one.
 //!
 //! The exactness half is the reason the cut is over the spatial axis and not the reduction
 //! one: a column carries no accumulation, so the two arms must produce the same output bit
@@ -235,6 +237,12 @@ fn the_cut_prices_itself_on_the_encoder_front() {
              chunked_arena={chunked_arena} B chunk_columns={chunk_columns} \
              chunks={conv2_chunks}+{conv3_chunks}",
             whole_panel_bytes(frames),
+        );
+        // The activation plan the split arena is built from — the ladder the
+        // elementwise in-place rule is measured on.
+        println!(
+            "frames={frames} compact_plan={} B",
+            rlx_wgpu::buffer::compact_plan(&chunked.runner.graph).arena_size,
         );
         println!(
             "frames={frames} whole_census=im2col_gpu:{} matmul:{} conv2d:{} \

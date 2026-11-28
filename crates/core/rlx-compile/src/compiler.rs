@@ -581,6 +581,8 @@ impl CompilePipeline {
 
 impl From<&MemoryPlan> for LirBufferPlan {
     fn from(plan: &MemoryPlan) -> Self {
+        // `in_place` is not carried: the LIR plan is built from the default
+        // options, which never enable the rule, so there is no alias to record.
         LirBufferPlan {
             arena_size: plan.arena_size,
             assignments: plan
@@ -620,6 +622,9 @@ impl From<&LirBufferPlan> for MemoryPlan {
                 })
                 .collect(),
             schedule: plan.schedule.clone(),
+            // LIR carries no in-place map: the compile pipeline plans with the
+            // rule off, so the offsets it holds are never deliberate aliases.
+            in_place: std::collections::HashMap::new(),
         }
     }
 }

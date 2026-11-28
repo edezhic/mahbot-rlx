@@ -2580,6 +2580,7 @@ fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
         arena_size: cursor.max(align),
         assignments,
         schedule,
+        in_place: Default::default(),
     }
 }
 

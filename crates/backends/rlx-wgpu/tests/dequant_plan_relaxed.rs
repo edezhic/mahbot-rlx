@@ -336,14 +336,16 @@ fn the_relaxed_plan_runs_both_arena_routes_and_matches_cpu() {
         .collect();
 
     // ── Plans ──────────────────────────────────────────────────────────────
-    // The four figures are pinned device-free in
-    // `rlx-compile/tests/dequant_guard_plan.rs`; printed here for the record.
+    // `guarded`/`guarded_act` are pinned device-free in
+    // `rlx-compile/tests/dequant_guard_plan.rs`. `relaxed`/`relaxed_act` are the
+    // shipping plans, which differ from them in two ways — the guard is off and
+    // the elementwise in-place rule is on. Printed here for the record.
     let relaxed = rlx_wgpu::buffer::plan_f32_uniform(&g, 16);
-    let guarded = plan_memory_with_dequant_guard(&g, 16, GuardedPlanner::F32Uniform, true);
+    let guarded = plan_memory_with_dequant_guard(&g, 16, GuardedPlanner::F32Uniform, true, false);
     let guarded_act =
-        plan_memory_with_dequant_guard(&g, 16, GuardedPlanner::F32UniformNoParams, true);
+        plan_memory_with_dequant_guard(&g, 16, GuardedPlanner::F32UniformNoParams, true, false);
     let relaxed_act =
-        plan_memory_with_dequant_guard(&g, 16, GuardedPlanner::F32UniformNoParams, false);
+        plan_memory_with_dequant_guard(&g, 16, GuardedPlanner::F32UniformNoParams, false, true);
     eprintln!(
         "plan bytes: relaxed(full)={} guarded(full)={} guarded(acts)={} relaxed(acts)={}",
         relaxed.arena_size, guarded.arena_size, guarded_act.arena_size, relaxed_act.arena_size

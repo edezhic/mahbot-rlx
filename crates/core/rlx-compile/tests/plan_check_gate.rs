@@ -213,6 +213,7 @@ fn a_clean_report_over_nothing_says_so() {
         arena_size: 0,
         assignments: Default::default(),
         schedule: Vec::new(),
+        in_place: Default::default(),
     };
     let report = check_plan(&g, &plan);
     assert!(report.is_clean());

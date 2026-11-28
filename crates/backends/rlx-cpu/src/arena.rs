@@ -365,6 +365,7 @@ mod tests {
                 m
             },
             schedule: vec![NodeId(0), NodeId(1)],
+            in_place: Default::default(),
         };
 
         let mut arena = Arena::from_plan(plan);
@@ -406,6 +407,7 @@ mod tests {
                 m
             },
             schedule: vec![NodeId(0), NodeId(1)],
+            in_place: Default::default(),
         };
         let arena = Arena::from_plan(plan);
         assert_eq!(arena.raw_buf().as_ptr() as usize % 64, 0);
@@ -431,6 +433,7 @@ mod tests {
                 m
             },
             schedule: vec![NodeId(0)],
+            in_place: Default::default(),
         };
         let mut arena = Arena::from_plan_filled(plan.clone(), true);
         assert!(arena.slice(NodeId(0)).iter().all(|v| v.is_nan()));

@@ -1546,6 +1546,7 @@ mod shard_pack_tests {
                 ),
             ]),
             schedule: Vec::new(),
+            in_place: Default::default(),
         };
         snap_plan_to_shards(&mut plan, shard_cap);
         for a in plan.assignments.values() {
@@ -1579,6 +1580,7 @@ mod shard_pack_tests {
                 },
             )]),
             schedule: Vec::new(),
+            in_place: Default::default(),
         };
         snap_plan_to_shards(&mut plan, shard_cap);
         assert_eq!(
@@ -1610,6 +1612,7 @@ mod shard_pack_tests {
                 },
             )]),
             schedule: Vec::new(),
+            in_place: Default::default(),
         };
         snap_plan_to_shards(&mut plan, shard_cap);
         assert!(
@@ -1807,6 +1810,12 @@ pub struct Arena {
     /// arena was laid out under — after `from_plan`'s physical snap, which re-places and
     /// re-sizes slots — which the caller's plan is not once a snap has happened.
     pub(crate) plan_slots: HashMap<NodeId, usize>,
+    /// The elementwise in-place map of the plan this arena was laid out under —
+    /// member → the storage root whose block it shares — taken from that plan after
+    /// any shard snap, so it always describes the offsets above. [`Self::finish_plan`]
+    /// consumes it, which is why it is an `Option`: that call runs once per arena, and
+    /// a second one would place the KV rows with no alias map at all.
+    pub(crate) in_place: Option<HashMap<NodeId, NodeId>>,
     /// Per byte offset, what a *parameter's* storage holds from that offset on, in
     /// either region — the activation arena's plan slots, the parked weight buffer's own
     /// sizing. What [`Self::param_storage_at`] answers, filled by
@@ -1956,15 +1965,15 @@ fn note_structural_hosting() {
 }
 
 /// Plan memory using f32-sized slots regardless of declared IR dtype, with
-/// liveness-aware slot reuse — `plan_memory_f32_uniform`'s decisions, with the
-/// deferred-host dequant guard derived here (`dequant_route_defers_host_read`).
+/// liveness-aware slot reuse — `plan_memory_f32_uniform`'s decisions, plus the
+/// deferred-host dequant guard derived here (`dequant_route_defers_host_read`)
+/// and this backend's elementwise in-place rule.
 pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
     note_structural_hosting();
-    rlx_compile::memory::plan_memory_with_dequant_guard(
+    plan_guarded(
         graph,
         align,
         rlx_compile::memory::GuardedPlanner::F32Uniform,
-        dequant_route_defers_host_read(),
     )
 }
 
@@ -1973,12 +1982,7 @@ pub fn plan_f32_uniform(graph: &Graph, align: usize) -> MemoryPlan {
 /// all run native dtypes; do NOT use when bool/int activations widen to f32.
 pub fn plan_native(graph: &Graph, align: usize) -> MemoryPlan {
     note_structural_hosting();
-    rlx_compile::memory::plan_memory_with_dequant_guard(
-        graph,
-        align,
-        rlx_compile::memory::GuardedPlanner::Native,
-        dequant_route_defers_host_read(),
-    )
+    plan_guarded(graph, align, rlx_compile::memory::GuardedPlanner::Native)
 }
 
 /// Hybrid sibling of [`plan_f32_uniform`] — packs `Param` weights + F16/BF16
@@ -1987,30 +1991,62 @@ pub fn plan_native(graph: &Graph, align: usize) -> MemoryPlan {
 /// halve those slots while bool/int activations stay f32-safe.
 pub fn plan_hybrid(graph: &Graph, align: usize) -> MemoryPlan {
     note_structural_hosting();
+    plan_guarded(graph, align, rlx_compile::memory::GuardedPlanner::Hybrid)
+}
+
+/// One guarded plan with this backend's elementwise in-place rule, or the plain
+/// one when [`in_place_off`] asks for the old layout (the A/B arm).
+fn plan_guarded(
+    graph: &Graph,
+    align: usize,
+    planner: rlx_compile::memory::GuardedPlanner,
+) -> MemoryPlan {
+    plan_guarded_with(graph, align, planner, dequant_route_defers_host_read())
+}
+
+/// [`plan_guarded`] with the deferred-host dequant guard supplied rather than
+/// derived — the split arena's hybrid plan wants the conservative one.
+fn plan_guarded_with(
+    graph: &Graph,
+    align: usize,
+    planner: rlx_compile::memory::GuardedPlanner,
+    deferred: bool,
+) -> MemoryPlan {
     rlx_compile::memory::plan_memory_with_dequant_guard(
         graph,
         align,
-        rlx_compile::memory::GuardedPlanner::Hybrid,
-        dequant_route_defers_host_read(),
+        planner,
+        deferred,
+        !in_place_off(),
     )
 }
 
+/// True when `RLX_WGPU_NO_INPLACE` asks for the old layout (the A/B arm). The
+/// one place the knob is read.
+fn in_place_off() -> bool {
+    rlx_ir::env::flag("RLX_WGPU_NO_INPLACE")
+}
+
 /// The activations-only plan a split arena is laid out under: every `Op::Param`
-/// left unassigned for [`Arena::from_compact_plan_split`] to place. A half-packed
-/// graph is planned at its own widths; the guarded planner has no no-params hybrid
-/// variant, and its `Hybrid` allocates the params this split arena must place
-/// itself, so the hybrid branch keeps the plain no-params planner (its dequant
-/// fallback is the conservative default).
+/// left unassigned for [`Arena::from_compact_plan_split`] to place, with the
+/// elementwise in-place rule (or the plain layout under [`in_place_off`]). A
+/// half-packed graph is planned at its own widths, with the conservative
+/// deferred-host dequant guard: the guarded planner's `Hybrid` allocates the
+/// params this split arena must place itself.
 pub fn compact_plan(graph: &Graph) -> MemoryPlan {
     note_structural_hosting();
     if crate::unfuse::half_packed() {
-        rlx_compile::memory::plan_memory_hybrid_no_params(graph, 16)
+        plan_guarded_with(
+            graph,
+            16,
+            rlx_compile::memory::GuardedPlanner::HybridNoParams,
+            true,
+        )
     } else {
-        rlx_compile::memory::plan_memory_with_dequant_guard(
+        plan_guarded(
             graph,
             16,
             rlx_compile::memory::GuardedPlanner::F32UniformNoParams,
-            dequant_route_defers_host_read(),
         )
     }
 }
@@ -2394,6 +2430,7 @@ impl Arena {
             weight_share: None,
             weight_written: Mutex::new(HashSet::new()),
             plan_slots,
+            in_place: Some(plan.in_place.clone()),
             param_slots: HashMap::new(),
         }
     }
@@ -3341,7 +3378,13 @@ impl Arena {
                 node.shape.num_elements().unwrap_or(0) * arena_elem_bytes(node.shape.dtype());
             self.set_actual_len(node.id, actual);
         }
-        self.place_kv_rows_in_place(graph, max_binding)
+        // The map this arena was laid out under, not the caller's plan's: a
+        // size-triggered split builds the arena from a fresh compact plan.
+        let in_place = self
+            .in_place
+            .take()
+            .expect("finish_plan runs once, on an arena laid out from a plan");
+        self.place_kv_rows_in_place(graph, max_binding, &in_place)
     }
 
     /// [`Self::finish_plan`]'s placement half — called only from there.
@@ -3370,7 +3413,9 @@ impl Arena {
     /// this byte space), a row whose actual length is not exactly one row of the
     /// cache operand (a shorter one leaves bytes the copy would have moved, a longer
     /// one reaches the next row), a destination outside the cache's storage, two
-    /// appends naming one producer, a node ordered between the producer and the
+    /// appends naming one producer, a node at either end of an in-place alias
+    /// ([`MemoryPlan::in_place`]: moving it would break the plan's claim that the
+    /// member shares its root's block), a node ordered between the producer and the
     /// append that reads the cache's storage root or a view of it (the move puts the
     /// row there in the producer's dispatch, so such a reader would see the row the
     /// copy would have written later), and any other append whose destination
@@ -3384,11 +3429,22 @@ impl Arena {
     /// invariant `Graph` keeps as it is built, and the one `rlx_ir::verify` reports
     /// as "graph is not a DAG" — with the lowering emitting a node's steps where it
     /// stands in that walk, so a lower id writes and reads earlier.
-    fn place_kv_rows_in_place(&mut self, graph: &Graph, max_binding: u64) -> usize {
+    fn place_kv_rows_in_place(
+        &mut self,
+        graph: &Graph,
+        max_binding: u64,
+        in_place: &HashMap<NodeId, NodeId>,
+    ) -> usize {
         if !self.binds_whole_at_base_zero(max_binding) {
             return 0;
         }
         let aliases = rlx_compile::memory::collect_view_aliases(graph);
+        // A node in an in-place chain shares its root's block; moving either end
+        // of that alias here would break the plan's claim, so the copy stays.
+        let aliased: HashSet<NodeId> = in_place
+            .iter()
+            .flat_map(|(&member, &root)| [member, root])
+            .collect();
         // Every append's destination interval — its storage root, start and row
         // width — and every node that reads a cache root: both over the whole graph,
         // before any other term, because an append that keeps its copy writes the
@@ -3449,6 +3505,7 @@ impl Arena {
                 row.op,
                 Op::Input { .. } | Op::Param { .. } | Op::Constant { .. }
             ) || cache.id == row.id
+                || aliased.contains(&row.id)
             {
                 continue;
             }
@@ -4530,6 +4587,7 @@ mod tests {
             arena_size,
             assignments,
             schedule: vec![],
+            in_place: Default::default(),
         }
     }
 }
